@@ -360,8 +360,8 @@ func TestStaticEgressIP_ValidCustomerEgressIPTableDriven(t *testing.T) {
 			t.Errorf("parse %s: %v", tc.ip, err)
 			continue
 		}
-		if got := validCustomerEgressIP(ip); got != tc.want {
-			t.Errorf("validCustomerEgressIP(%s) = %v, want %v", tc.ip, got, tc.want)
+		if err := api.ValidateStaticEgressIP(ip); (err == nil) != tc.want {
+			t.Errorf("ValidateStaticEgressIP(%s) err = %v, want valid=%v", tc.ip, err, tc.want)
 		}
 	}
 }

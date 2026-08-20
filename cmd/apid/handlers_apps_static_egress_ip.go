@@ -111,8 +111,8 @@ func (s *server) setAppStaticEgressIP(w http.ResponseWriter, r *http.Request, ac
 			api.WriteProblem(w, api.ErrAppStaticEgressIPInvalid(req.IP, "IPv6 is not supported in v1"))
 			return
 		}
-		if !validCustomerEgressIP(ip) {
-			api.WriteProblem(w, api.ErrAppStaticEgressIPInvalid(req.IP, "IP is in a reserved range (RFC1918, link-local, multicast, or 0.0.0.0/8)"))
+		if err := api.ValidateStaticEgressIP(ip); err != nil {
+			api.WriteProblem(w, api.ErrAppStaticEgressIPInvalid(req.IP, err.Error()))
 			return
 		}
 		newIP = &ip
@@ -221,44 +221,6 @@ func appStaticEgressIPResponse(app state.App, limits api.Limits) api.AppStaticEg
 	return out
 }
 
-// validCustomerEgressIP rejects the IP ranges we never want
-// aliased on br-tenants. The full deny-set is in pkg/netns; the
-// handler check is a fast-fail before the column write so a
-// misconfigured customer gets the 400 inline rather than waiting
-// for the bridge alias to fail at egress-renderer time.
-func validCustomerEgressIP(ip netip.Addr) bool {
-	if !ip.Is4() {
-		return false
-	}
-	if ip.IsLoopback() {
-		return false
-	}
-	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return false
-	}
-	if ip.IsMulticast() {
-		return false
-	}
-	if ip.IsUnspecified() {
-		return false
-	}
-	// RFC1918: 10/8, 172.16/12, 192.168/16. Plus the
-	// shared-address space 100.64/10 (CGN) which is increasingly
-	// important to block — customers should never BYOIP a
-	// shared-CGN address. Direct prefix check; the netip API
-	// doesn't expose an RFC1918 aggregate.
-	bad := []netip.Prefix{
-		netip.MustParsePrefix("10.0.0.0/8"),
-		netip.MustParsePrefix("172.16.0.0/12"),
-		netip.MustParsePrefix("192.168.0.0/16"),
-		netip.MustParsePrefix("100.64.0.0/10"), // CGN
-		netip.MustParsePrefix("169.254.0.0/16"), // link-local v4
-		netip.MustParsePrefix("224.0.0.0/4"),   // multicast
-	}
-	for _, p := range bad {
-		if p.Contains(ip) {
-			return false
-		}
-	}
-	return true
-}
+// validCustomerEgressIP was the local deny-set copy. It now lives
+// in pkg/api.ValidateStaticEgressIP (the canonical helper) as the
+// single source of truth. The handler calls that directly.

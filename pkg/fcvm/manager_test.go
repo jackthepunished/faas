@@ -2644,3 +2644,291 @@ func TestInstanceByCID_UnknownCID(t *testing.T) {
 		t.Error("InstanceByCID(unknown) = nil, want error")
 	}
 }
+
+// ADR-119: per-app static egress IP path. The full Wake side is
+// covered indirectly by the renderer tests in pkg/netns (the
+// renderer emits the SNAT rule when AccountStaticIP != nil); the
+// tests below pin the vmmd-side Manager surface so a future
+// regression that drops the validation or breaks the live-patch
+// surfaces here without needing a metal box.
+
+// TestWakeRejectsStaticEgressIP_NotV4 pins the IPv6-deferred
+// behaviour. apid gates on family=4 upstream; vmmd defends in
+// depth so a future schema relaxation can't sneak a v6 string
+// into the Wake path. The parse gate trips BEFORE the vmm
+// path so fakeVMM doesn't matter — the request errors at the
+// static-egress-IP block in Wake.
+func TestWakeRejectsStaticEgressIP_NotV4(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	_, err := m.Wake(context.Background(), WakeRequest{
+		Instance:        "vw-static-v6",
+		BaseKey:         "/b.ext4",
+		LayerKey:        "/l.ext4",
+		VcpuCount:       2,
+		MemSizeMiB:      128,
+		Plan:            api.PlanScale,
+		StaticEgressIP:  "::1",
+	})
+	if err == nil {
+		t.Fatal("Wake with IPv6 static IP: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "IPv6 deferred") {
+		t.Errorf("err = %v, want substring `IPv6 deferred`", err)
+	}
+}
+
+// TestWakeRejectsStaticEgressIP_Reserved pins the deny-set gate.
+// The same deny set the apid handler enforces (RFC1918, CGN,
+// link-local, multicast, loopback) is mirrored here so a Wake
+// from a non-apid caller (eg. a future bulk-import path) can't
+// pin a reserved IP.
+func TestWakeRejectsStaticEgressIP_Reserved(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	_, err := m.Wake(context.Background(), WakeRequest{
+		Instance:       "vw-static-rfc1918",
+		BaseKey:        "/b.ext4",
+		LayerKey:       "/l.ext4",
+		VcpuCount:      2,
+		MemSizeMiB:     128,
+		Plan:           api.PlanScale,
+		StaticEgressIP: "10.1.2.3",
+	})
+	if err == nil {
+		t.Fatal("Wake with RFC1918 static IP: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "deny set") {
+		t.Errorf("err = %v, want substring `deny set`", err)
+	}
+}
+
+// TestWakeRejectsStaticEgressIP_Malformed pins the parse gate.
+func TestWakeRejectsStaticEgressIP_Malformed(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	_, err := m.Wake(context.Background(), WakeRequest{
+		Instance:       "vw-static-malformed",
+		BaseKey:        "/b.ext4",
+		LayerKey:       "/l.ext4",
+		VcpuCount:      2,
+		MemSizeMiB:     128,
+		Plan:           api.PlanScale,
+		StaticEgressIP: "not-an-ip",
+	})
+	if err == nil {
+		t.Fatal("Wake with malformed static IP: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid dotted-quad") {
+		t.Errorf("err = %v, want substring `invalid dotted-quad`", err)
+	}
+}
+
+// TestUpdateStaticEgressIP_NoLiveInstancesIsNoop — the empty
+// app is the redelivery / no-live-targets path. No nft commands
+// should fire, no error. The per-app cache is still written so
+// a future Wake for this app picks up the new IP.
+func TestUpdateStaticEgressIP_NoLiveInstancesIsNoop(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-orphan", "203.0.113.42"); err != nil {
+		t.Fatalf("UpdateStaticEgressIP: %v", err)
+	}
+	if run.ran("nft") {
+		t.Error("nft should not run when no live instances match the app")
+	}
+	m.perAppStaticIPMu.RLock()
+	defer m.perAppStaticIPMu.RUnlock()
+	if got := m.perAppStaticIP["app-orphan"]; got == nil || got.String() != "203.0.113.42" {
+		t.Errorf("perAppStaticIP[app-orphan] = %v, want 203.0.113.42", got)
+	}
+}
+
+// TestUpdateStaticEgressIP_AppliesPatch — a seeded live
+// instance with no prior static IP gets the SNAT rule added.
+// The customer IP must appear verbatim in argv.
+func TestUpdateStaticEgressIP_AppliesPatch(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	inst := &Instance{
+		Lease:  Lease{Instance: "i-1", UID: 20001},
+		Net:    nc,
+		Method: WakeColdBoot,
+		AppID:  "app-1",
+	}
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-1", "203.0.113.42"); err != nil {
+		t.Fatalf("UpdateStaticEgressIP: %v", err)
+	}
+	want := "snat to 203.0.113.42"
+	if !run.ran(want) {
+		t.Errorf("missing %q in command stream", want)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	got := m.live["i-1"].Net.AccountStaticIP
+	if got == nil || got.String() != "203.0.113.42" {
+		t.Errorf("cached AccountStaticIP = %v, want 203.0.113.42", got)
+	}
+}
+
+// TestUpdateStaticEgressIP_SameIPNoOp — redelivery. The same
+// IP twice should not run nft at all.
+func TestUpdateStaticEgressIP_SameIPNoOp(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	ip := netip.MustParseAddr("203.0.113.42")
+	inst := &Instance{
+		Lease:  Lease{Instance: "i-1", UID: 20001},
+		Net:    nc,
+		Method: WakeColdBoot,
+		AppID:  "app-1",
+	}
+	inst.Net.AccountStaticIP = &ip
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-1", "203.0.113.42"); err != nil {
+		t.Fatalf("UpdateStaticEgressIP: %v", err)
+	}
+	if run.ran("nft") {
+		t.Errorf("nft should not run when AccountStaticIP already matches; commands: %v", run.commands)
+	}
+}
+
+// TestUpdateStaticEgressIP_ReplacesIP — the rotation path. The
+// per-app IP changes from one customer IP to another; the patch
+// must delete the old rule (by handle) and add the new one.
+// Without the capture runner (the test stub), the patch skips
+// the delete and just adds; production on the EX44 captures
+// the handle and exercises the delete-by-handle half.
+func TestUpdateStaticEgressIP_ReplacesIP(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	ip := netip.MustParseAddr("203.0.113.42")
+	inst := &Instance{
+		Lease:          Lease{Instance: "i-1", UID: 20001},
+		Net:            nc,
+		Method:         WakeColdBoot,
+		AppID:          "app-1",
+		StaticIPHandle: 13, // synthetic prior handle
+	}
+	inst.Net.AccountStaticIP = &ip
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-1", "198.51.100.7"); err != nil {
+		t.Fatalf("UpdateStaticEgressIP: %v", err)
+	}
+	if !run.ran("snat to 198.51.100.7") {
+		t.Errorf("missing new SNAT argv for 198.51.100.7")
+	}
+}
+
+// TestUpdateStaticEgressIP_ClearPath — clearing the IP must
+// delete the live rule and nil the cached pointer. Calling
+// with ip == "" is the public clear signal.
+func TestUpdateStaticEgressIP_ClearPath(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	ip := netip.MustParseAddr("203.0.113.42")
+	inst := &Instance{
+		Lease:          Lease{Instance: "i-1", UID: 20001},
+		Net:            nc,
+		Method:         WakeColdBoot,
+		AppID:          "app-1",
+		StaticIPHandle: 19,
+	}
+	inst.Net.AccountStaticIP = &ip
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-1", ""); err != nil {
+		t.Fatalf("UpdateStaticEgressIP clear: %v", err)
+	}
+	wantDelete := "delete rule ip faas postrouting handle 19"
+	if !run.ran(wantDelete) {
+		t.Errorf("missing %q in clear-path delete", wantDelete)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.live["i-1"].Net.AccountStaticIP != nil {
+		t.Errorf("AccountStaticIP = %v, want nil after clear", m.live["i-1"].Net.AccountStaticIP)
+	}
+	if m.live["i-1"].StaticIPHandle != 0 {
+		t.Errorf("StaticIPHandle = %d, want 0 after clear", m.live["i-1"].StaticIPHandle)
+	}
+}
+
+// TestUpdateStaticEgressIP_RejectsEmptyAppID — defensive. Empty
+// appID is a programmer error, not a customer-facing failure.
+func TestUpdateStaticEgressIP_RejectsEmptyAppID(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	err := m.UpdateStaticEgressIP(context.Background(), "", "203.0.113.42")
+	if err == nil {
+		t.Fatal("expected error for empty app_id")
+	}
+	if !strings.Contains(err.Error(), "empty app_id") {
+		t.Errorf("err = %v, want substring `empty app_id`", err)
+	}
+}
+
+// TestUpdateStaticEgressIP_RejectsReservedIP — same deny set as
+// Wake. A misconfigured upstream caller (eg. a test fixture or
+// a future bulk-import path) cannot pin a reserved IP.
+func TestUpdateStaticEgressIP_RejectsReservedIP(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	err := m.UpdateStaticEgressIP(context.Background(), "app-1", "192.168.1.1")
+	if err == nil {
+		t.Fatal("expected error for reserved IP")
+	}
+	if !strings.Contains(err.Error(), "deny set") {
+		t.Errorf("err = %v, want substring `deny set`", err)
+	}
+}
+
+// TestUpdateStaticEgressIP_FansOutAcrossLiveInstances —
+// multiple live instances for the same app must all be patched.
+// Schedd's redelivery can land while N tenants are awake; the
+// per-app fan-out is the load-bearing property.
+func TestUpdateStaticEgressIP_FansOutAcrossLiveInstances(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	for _, id := range []string{"i-1", "i-2", "i-3"} {
+		nc := netns.NewConfig(id, "fc-"+id, "vh"+id, "vp"+id, netip.MustParseAddr("10.100.0.2"))
+		inst := &Instance{
+			Lease:  Lease{Instance: id, UID: 20000},
+			Net:    nc,
+			Method: WakeColdBoot,
+			AppID:  "app-fanout",
+		}
+		m.mu.Lock()
+		m.live[id] = inst
+		m.mu.Unlock()
+	}
+	if err := m.UpdateStaticEgressIP(context.Background(), "app-fanout", "203.0.113.42"); err != nil {
+		t.Fatalf("UpdateStaticEgressIP: %v", err)
+	}
+	count := 0
+	for _, argv := range run.commands {
+		line := strings.Join(argv, " ")
+		if strings.Contains(line, "snat to 203.0.113.42") {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Errorf("SNAT rule count across live instances = %d, want 3", count)
+	}
+}
