@@ -420,6 +420,16 @@ func RenderSummaryHTML(ss state.StageState, status string, terminalAt time.Time)
 	final.WriteString(rowsHTML.String())
 	final.WriteString(footerHTML)
 	final.WriteString(`</section>`)
+	//nolint:gosec // G203: final.String() is a fixed-shape stage-timeline
+	// block built from operator-owned labels (compile-time constants in
+	// StageLabels()), constant glyphs (Glyph()), numeric durations
+	// rendered via FormatStageDuration(), escaped terminalAt via
+	// time.RFC3339, and an escaped image-side reason slot (imaged
+	// failure messages run through htmlEscape above). No raw
+	// customer-supplied HTML flows through. The template.HTML cast is
+	// load-bearing — it sidesteps html/template escaping for the
+	// pre-rendered block so the dashboard template can inline it via
+	// {{ .BodyHTML }} without Funcmap plumbing.
 	return template.HTML(final.String())
 }
 
