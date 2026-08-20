@@ -207,8 +207,8 @@ type Metrics struct {
 	// store occupancy gauge; entryBytes is the per-entry
 	// distribution (avg over recent entries). Both surface on
 	// the §12 panel so operators can tune the byte ceiling.
-	responseCacheBytes     prometheus.Gauge
-	responseCacheEntries   prometheus.Gauge
+	responseCacheBytes   prometheus.Gauge
+	responseCacheEntries prometheus.Gauge
 	// edgeRuleCompileError (ADR-091 hardening PR-A): counter of
 	// compile-time failures inside the cmd-side loader
 	// (cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs). A

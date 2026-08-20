@@ -52,7 +52,7 @@ type ResponseCache struct {
 	// data maps CacheKey → *list.Element holding *cacheEntry.
 	// list is the LRU; Front = most recently used, Back = LRU.
 	data map[string]*list.Element
-	list  *list.List
+	list *list.List
 	// bytes tracks the current sum of entry.body sizes. Decremented
 	// on evict / drop. Bounded by maxBytes; Put never grows the
 	// store past the ceiling.
@@ -104,8 +104,8 @@ type CacheKey struct {
 // Field order is fixed so two keys with identical fields
 // always encode to the same string:
 //
-//   VaryHash | AppID | ':' | DeploymentID | ':' | RuleID |
-//   ':' | Method | ':' | NormalizedPath | ':' | Query
+//	VaryHash | AppID | ':' | DeploymentID | ':' | RuleID |
+//	':' | Method | ':' | NormalizedPath | ':' | Query
 func (k CacheKey) String() string {
 	// Pre-size: 32 (varyhash) + len(fields) + 5 separators.
 	n := 32 + len(k.AppID) + len(k.DeploymentID) + len(k.RuleID) +
@@ -138,12 +138,12 @@ func (k CacheKey) String() string {
 // serves look at StaleUntil instead. Both captured at Put() time
 // using the cache's now() clock so test code can advance time.
 type cacheEntry struct {
-	key         CacheKey
-	statusCode  int
-	header      map[string][]string
-	body        []byte
-	freshUntil  time.Time
-	staleUntil  time.Time
+	key        CacheKey
+	statusCode int
+	header     map[string][]string
+	body       []byte
+	freshUntil time.Time
+	staleUntil time.Time
 	// ruleAction carries the per-rule knobs that the serve path
 	// needs to know without re-resolving the rule: stale-on-error
 	// served the entry as Warning: 110, and the saved-cost metric

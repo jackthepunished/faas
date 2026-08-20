@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"net/http"
-	"time"
 )
 
 // cacheRuleContextKey is the unexported context-key type the
@@ -158,14 +157,4 @@ func (h *Handler) tryServeStaleOnWakeError(w http.ResponseWriter, r *http.Reques
 	h.metricsIncCacheOutcome("stale_if_error_served")
 	h.observe(r, entry.statusCode, app.ID, string(app.Plan), false, Target{})
 	return true, "stale_if_error_served"
-}
-
-// touchCacheInvalidation is a small no-op helper kept here so
-// the wake-failure branch's metric bookkeeping has a stable
-// call shape for commit 15. The actual invalidation hook lands
-// in commit 14; this stub exists so the wake-failure line
-// references a single function and we don't accumulate inline
-// metric calls as the design evolves.
-func (h *Handler) touchCacheInvalidation(_ time.Time) {
-	// no-op until commit 14
 }

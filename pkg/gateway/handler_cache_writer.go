@@ -56,9 +56,9 @@ import (
 // the Put.
 type cacheWriter struct {
 	http.ResponseWriter
-	inner     *statusRecorder // the next-in-chain recorder (for header copy + status)
-	rule      *EdgeRuleCacheResolved
-	cap       int64
+	inner *statusRecorder // the next-in-chain recorder (for header copy + status)
+	rule  *EdgeRuleCacheResolved
+	cap   int64
 
 	buf       bytes.Buffer
 	header    http.Header
@@ -119,7 +119,7 @@ func (c *cacheWriter) WriteHeader(code int) {
 	// own Header() override (e.g. capWriter). The embedded
 	// ResponseWriter is the lowest-level writer in the
 	// chain — its Header() is the canonical live map.
-	for k, vs := range c.ResponseWriter.Header() {
+	for k, vs := range c.Header() {
 		for _, v := range vs {
 			c.header.Add(k, v)
 		}
