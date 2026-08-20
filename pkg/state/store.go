@@ -1864,6 +1864,66 @@ type Store interface {
 	// schema-agnostic.
 	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
 
+	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
+	// document capture. The surface is paid-only (Free plan
+	// returns 403 from the apid) but the microVM always captures
+	// the body during cold boot — the read cost is one TCP
+	// ReadAll against /openapi.json and is throughput-irrelevant
+	// relative to the 350 ms wake budget. Free customers' docs
+	// are persisted (the per-account quota is 0) but never
+	// exposed via the apid GET; the apid never inserts a Free
+	// row, so the row count for Free plans is always 0.
+	//
+	// The four methods pin the surface with one row per
+	// deployment (PRIMARY KEY on deployment_id). The migration
+	// puts the table behind ON DELETE CASCADE so a deployment
+	// cleanup wipes the doc; the apid audit emit
+	// (app.openapi_doc.deleted) records the lifecycle event.
+	//
+	// IDOR floor: every read and write takes accountID and the
+	// SQL filters by (deployment_id, account_id). The
+	// consumer_keys precedent (pkg/state/pgstore_consumer_keys.go)
+	// applies the same defence-in-depth: the apps row is FK-scoped
+	// to one account so a WHERE on deployment_id alone is
+	// sufficient, but the Store boundary enforces tenancy at the
+	// API surface so a future caller can't probe by
+	// deploymentID without knowing the account.
+	//
+	// GetDeploymentOpenAPIDoc returns the (doc, meta) pair for
+	// one deployment. ErrNotFound when the row is missing OR
+	// when the caller's accountID does not match (the
+	// pgx row.Scan errors on no rows; we map it to ErrNotFound).
+	// The truncated flag is returned in the meta so the apid GET
+	// handler can set X-OpenAPI-Doc-Truncated: 1 on the response.
+	GetDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID string) ([]byte, OpenAPIDocMeta, error)
+	// UpsertDeploymentOpenAPIDoc records (or overwrites) the
+	// captured OpenAPI body for one deployment. doc is the
+	// validated JSON bytes (the apid jsonschema check passes
+	// before this call); source is the closed enum 'cold_boot' or
+	// 'manual_upload'. The row is filtered by (deployment_id,
+	// account_id) at the WHERE clause so a misrouted call from a
+	// different account fails with ErrNotFound (the FK CASCADE in
+	// migration 00330 makes this unreachable in practice, but
+	// the explicit error lets a misuse at the call site fail
+	// closed). Idempotent: a re-delivered cold-boot event
+	// overwrites the same row, not create a second one. The
+	// capture count for the per-account quota is computed via
+	// CountOpenAPIDocsByAccount.
+	UpsertDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID, appID string, doc []byte, source string, truncated bool) error
+	// DeleteDeploymentOpenAPIDoc removes the doc row for one
+	// deployment. ErrNotFound when no row OR the caller's
+	// accountID does not match — same IDOR floor as the read.
+	// The DELETE is idempotent only in the sense that "no row"
+	// and "row deleted" both surface as ErrNotFound (the apid
+	// caller treats a 404 as success after a delete).
+	DeleteDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID string) error
+	// CountOpenAPIDocsByAccount returns the number of doc rows
+	// the account owns. Drives the per-account quota gate
+	// (api.Plan.OpenAPIDocsPerAccount). The count is computed
+	// server-side via a SELECT COUNT(*) so the apid doesn't
+	// load the full body slice.
+	CountOpenAPIDocsByAccount(ctx context.Context, accountID string) (int, error)
+
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
 	// jsonb) stays the contract layer; this is the per-sidecar

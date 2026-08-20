@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -175,6 +176,12 @@ type MemStore struct {
 	// field. Mirroring the read path here means handler tests
 	// can exercise the compile-side merge without a live PG.
 	corsPresets map[string]CorsPreset
+	// openAPIDocs mirrors deployment_openapi_docs (ADR-122 /
+	// issue #975 item #1, migrations/00330). Keyed by
+	// deployment_id. The acctID predicate is checked at the
+	// method boundary so a cross-tenant read returns ErrNotFound
+	// (the same defence-in-depth as consumerKeys below).
+	openAPIDocs map[string]openAPIDocRow
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -576,6 +583,7 @@ func NewMemStore() *MemStore {
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
+		openAPIDocs:          map[string]openAPIDocRow{},
 		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
@@ -4460,6 +4468,123 @@ func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, 
 	d.SecretScannedAt = &scannedAt
 	m.deployments[id] = d
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// openAPIDocRow is the in-memory row mirror of deployment_openapi_docs
+// (migrations/00330). The struct is unexported; the public surface is
+// the four methods below — handler tests reach them through the
+// Store interface.
+// ---------------------------------------------------------------------------
+type openAPIDocRow struct {
+	DeploymentID string
+	AccountID    string
+	AppID        string
+	Doc          []byte
+	Source       string
+	ByteSize     int
+	DocSHA256    []byte
+	Truncated    bool
+	CapturedAt   time.Time
+	UpdatedAt    time.Time
+}
+
+// GetDeploymentOpenAPIDoc mirrors pgstore.GetDeploymentOpenAPIDoc.
+// Returns ErrNotFound when the row is missing OR when the caller's
+// accountID does not match — the IDOR floor is enforced at the
+// method boundary so a future caller can't probe by deploymentID
+// alone. The doc body is defensively copied on the way out so a
+// caller mutating the slice can't corrupt the map's internal copy.
+func (m *MemStore) GetDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID string) ([]byte, OpenAPIDocMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIDocs[deploymentID]
+	if !ok || row.AccountID != accountID {
+		return nil, OpenAPIDocMeta{}, ErrNotFound
+	}
+	return append([]byte(nil), row.Doc...), OpenAPIDocMeta{
+		DeploymentID: row.DeploymentID,
+		AccountID:    row.AccountID,
+		AppID:        row.AppID,
+		Source:       row.Source,
+		ByteSize:     row.ByteSize,
+		DocSHA256:    append([]byte(nil), row.DocSHA256...),
+		Truncated:    row.Truncated,
+		CapturedAt:   row.CapturedAt,
+		UpdatedAt:    row.UpdatedAt,
+	}, nil
+}
+
+// UpsertDeploymentOpenAPIDoc mirrors pgstore. The deployment row
+// must exist (the FK CASCADE in migration 00330 makes this
+// unreachable in practice, but the explicit check lets a misuse
+// at the call site fail closed). Idempotent: a re-delivered
+// cold-boot event overwrites the same row, not create a second.
+// source is the closed enum 'cold_boot' or 'manual_upload'; the
+// caller is responsible for pre-validation (the apid jsonschema
+// check is upstream).
+func (m *MemStore) UpsertDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID, appID string, doc []byte, source string, truncated bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.deployments[deploymentID]; !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := openAPIDocRow{
+		DeploymentID: deploymentID,
+		AccountID:    accountID,
+		AppID:        appID,
+		Doc:          docCopy,
+		Source:       source,
+		ByteSize:     len(docCopy),
+		DocSHA256:    sum[:],
+		Truncated:    truncated,
+	}
+	if existing, ok := m.openAPIDocs[deploymentID]; ok {
+		// Idempotent overwrite: keep the original captured_at so
+		// "first-capture" semantics survive a re-delivered cold-boot
+		// event. updated_at is bumped for the audit trail.
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIDocs[deploymentID] = row
+	return nil
+}
+
+// DeleteDeploymentOpenAPIDoc mirrors pgstore. ErrNotFound when no
+// row OR the caller's accountID does not match — same IDOR floor.
+// The apid caller treats ErrNotFound as "already deleted" so a
+// retry is a no-op.
+func (m *MemStore) DeleteDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIDocs[deploymentID]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.openAPIDocs, deploymentID)
+	return nil
+}
+
+// CountOpenAPIDocsByAccount returns the number of doc rows the
+// account owns. Drives the per-account quota gate. The count is
+// a single pass over the map — the in-memory store holds the
+// entire dataset under m.mu so an O(N) scan is fine.
+func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.openAPIDocs {
+		if r.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
