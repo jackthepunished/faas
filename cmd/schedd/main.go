@@ -766,7 +766,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// `curl /metrics` scrape returns the canonical schedd ops
 		// series; Prometheus hits both paths.
 		mux.Handle(metricsPath+"/fcvm", dashGauges.Handler())
-		httpSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// ADR-122: apply the canonical metrics-listener shape —
+		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
+		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
+		httpSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    int(maxHeaderBytes),
+		}
 		go func() {
 			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("metrics http", "err", err)
