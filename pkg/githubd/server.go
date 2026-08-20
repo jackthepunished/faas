@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -153,11 +154,23 @@ func (s *Server) Start(ctx context.Context) (func(context.Context) error, <-chan
 	s.GRPCServer.Register(gsrv)
 
 	// HTTP loopback listener for /webhooks/github.
+	//
+	// ADR-122: apply the canonical webhook-listener shape. The
+	// webhook variant uses ReadTimeout=30s (not 10s like the
+	// pure-metrics family) to give a slow GitHub webhook client
+	// the budget to upload a 10 MiB body at the readBody cap
+	// (pkg/githubd/server.go:323). The body cap stays; the new
+	// server-level knobs are defence-in-depth against header
+	// smuggling + runaway scrapers holding a connection open.
 	httpHandler := s.WebhookLoopbackHandler()
 	httpSrv := &http.Server{
 		Addr:              httpAddr,
 		Handler:           httpHandler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Duration(api.WebhookReadTimeoutSecondsDefault) * time.Second,
+		WriteTimeout:      time.Duration(api.WebhookWriteTimeoutSecondsDefault) * time.Second,
+		IdleTimeout:       time.Duration(api.WebhookIdleTimeoutSecondsDefault) * time.Second,
+		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
 	}
 	hLis, err := net.Listen("tcp", httpAddr)
 	if err != nil {
