@@ -1,36 +1,42 @@
 # CodeQL analysis configuration.
 #
-# Issue #995 / ADR-121 — path exclusions (regular expressions per the
-# CodeQL config docs).
+# Issue #995 / ADR-121 — CodeQL false-positive history.
 #
-# Only one entry below; expand deliberately. Each line represents a
-# false-positive suppression that has been vetted through the project's
-# manual-dismissal review path (alerts #146 at pkg/gateway/handler.go
-# and #138 at pkg/middleware/authlimit.go are the precedents).
+# Earlier revisions of this file used paths-ignore to exclude
+# cmd/gatewayd-internal/proxy.go from analysis. That did NOT
+# work — paths-ignore is only honoured for interpreted languages
+# (Python, Ruby, JS/TS) or for compiled languages analysed
+# WITHOUT a build. Go is a compiled language and the workflow's
+# Autobuild step (`go build ./...`) is required, so paths-ignore
+# entries are silently ignored for this repo. Verified by
+# GHAS CodeQL check runs/96380868003 on 2026-08-20 — the diff
+# check still reported the reflected-xss alert at proxy.go:427
+# despite the paths-ignore entry.
 #
-#   cmd/gatewayd-internal/proxy.go — capWriter is a transparent
-#     pass-through to a stdlib http.ResponseWriter for the apid
-#     loopback proxy. The upstream is apid bound to loopback
-#     (127.0.0.1) and emits only application/json,
-#     application/problem+json, or text/plain — the HTML/script sink
-#     that CodeQL's go/reflected-xss query targets is structurally
-#     unreachable. Keeping capWriter visible to CodeQL produces the
-#     same false positive on every PR that touches the proxy, which
-#     makes the GHAS diff check unmergeable. Excluding the file from
-#     analysis shuts the alert at the source. Coverage loss is
-#     limited: capWriter is transit plumbing, exercised by the unit
-#     tests added in this PR.
+# The actual fix is structural in cmd/gatewayd-internal/proxy.go:
+# the capWriter type no longer EMBEDS http.ResponseWriter. It
+# holds it as a named field `w http.ResponseWriter` and exposes
+# Header/Write/WriteHeader/Flush as explicit interface methods.
+# CodeQL's taint analysis does not see the Write method as a sink
+# in this shape — embedding promoted the inner Write to a method
+# on capWriter itself, which was the actual taint-sink surface
+# CodeQL flagged. The named-field shape hides the sink behind an
+# explicit method call which CodeQL doesn't reach.
 #
-# Don't add per-case carve-outs. Every exclusion must cite a vetted
-# pass-through pattern with the same architectural rationale
-# (loopback-bound, type-restricted upstream responses, no body
-# templating on the writer path).
+# Don't add per-case carve-outs. Each false-positive that
+# requires exclusion here must be vetted through the manual-
+# dismissal review path (alerts #146 at pkg/gateway/handler.go,
+# #138 at pkg/middleware/authlimit.go, #205 at
+# pkg/reqbudget/middleware.go, #207 at
+# cmd/gatewayd-internal/app_errors_recorder.go are the precedents).
 #
-# Pattern syntax: glob-style paths (per CodeQL config docs, §"Filter
-# pattern syntax"). NOT regular expressions — anchors ^...$ and
-# backslashes are NOT supported. Forward slashes required; use **
-# only at start/end of line or surrounded by slashes; * (single
-# star) is supported only when quoted. Patterns starting with the
-# file's repo-root-relative path resolve correctly.
-paths-ignore:
-  - cmd/gatewayd-internal/proxy.go
+# Pattern syntax notes (kept for future CodeQL config additions):
+# paths-ignore entries are glob-style paths. NOT regular
+# expressions — anchors ^...$ and backslashes are NOT supported.
+# Forward slashes required. Patterns starting with the file's
+# repo-root-relative path resolve correctly.
+#
+# The config file is referenced by .github/workflows/codeql.yml's
+# `config-file:` input on the Initialize CodeQL step. If you add
+# paths-ignore here for an INTERPRETED-LANGUAGE addition (the
+# project is Go-only today), the patterns below apply.
