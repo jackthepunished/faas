@@ -838,8 +838,23 @@ func cmdDeployTarball(args []string) int {
 	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
 	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
 	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
+	// Cluster A (error-explanations, spec §6.4 amendment 1):
+	// run `gregale doctor` first and abort the deploy on any
+	// error-class finding. The doctor runs over the local cwd (or
+	// the auto-pack temp dir) BEFORE any HTTP call, so a
+	// customer who has a top-level data/ directory gets the
+	// stateless_only_violation prose locally rather than
+	// uploading + 422-ing. Warnings remain warn-only (mirrors the
+	// standalone cmdDoctor semantics). Scoped via --doctor-strict
+	// because --strict/--lenient are taken by --diff above.
+	//
+	// v1 only fires on the cwd / auto-pack path. --tarball and
+	// --image skip the doctor (the source isn't a directory the
+	// doctor can scan); the server-side validators still run on
+	// upload.
+	doctorStrict := fs.Bool("doctor-strict", false, "run `gregale doctor` first; abort the deploy on any error-class finding (warnings are warn-only)")
 	if err := fs.Parse(args); err != nil {
-		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
+		PrintUsage(os.Stderr, "usage: gregale deploy [--doctor-strict] --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
 	}
 	// --strict / --lenient mutex. Same rationale as
@@ -1071,6 +1086,30 @@ func cmdDeployTarball(args []string) int {
 		// gregale.yaml fan-out (issue #791 PR-C), so we surface
 		// the error there if needed.
 		cwd = ""
+	}
+	// Cluster A: --doctor-strict pre-upload gate. Runs runDoctorChecks
+	// against the cwd BEFORE any HTTP / pack. Errors exit 1 with the
+	// doctor report printed to stderr (pre-network, no half-state).
+	// Warnings render but don't fail (mirrors the standalone cmdDoctor
+	// exit semantics). v1 scope: only fires when cwd is a real local
+	// directory (the doctor needs a path to scan); --tarball + --image
+	// skip silently — server-side validators catch the same shapes.
+	if *doctorStrict && cwd != "" {
+		rep := runDoctorChecks(cwd)
+		if rep.HasErrors() {
+			if jsonOutput {
+				_ = json.NewEncoder(osStderr).Encode(struct {
+					Doctor doctorReport `json:"doctor"`
+					Exit   int          `json:"exit"`
+				}{rep, 1})
+			} else {
+				renderDoctorHuman(osStderr, rep)
+			}
+			return 1
+		}
+		if rep.HasWarnings() && !jsonOutput {
+			renderDoctorHuman(osStderr, rep)
+		}
 	}
 	if *image == "" && *tarball == "" {
 		if cwdErr != nil {

@@ -73,6 +73,35 @@ type doctorReport struct {
 	Checks []doctorCheck `json:"checks"`
 }
 
+// HasErrors reports whether any check returned status="error".
+// Cluster A wires this into `gregale deploy --doctor-strict` so a
+// pre-upload gate can exit 1 on findings the server would have
+// 422'd on (e.g. stateless_only_violation). Mirrors the
+// standalone cmdDoctor exit semantics — warnings remain warn-only
+// even under --doctor-strict.
+func (r doctorReport) HasErrors() bool {
+	for _, c := range r.Checks {
+		if c.Status == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasWarnings reports whether any check returned status="warn"
+// (without any "error"). Used by the deploy path to decide
+// whether to print the report + continue (warn) or print + exit 1
+// (error). The standalone cmdDoctor keeps the warn-only exit-0
+// default; this helper makes the deploy path's branch explicit.
+func (r doctorReport) HasWarnings() bool {
+	for _, c := range r.Checks {
+		if c.Status == "warn" {
+			return true
+		}
+	}
+	return false
+}
+
 // cmdDoctor implements `gregale doctor [path]` — the customer
 // preflight. Flags:
 //
