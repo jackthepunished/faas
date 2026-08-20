@@ -2,6 +2,7 @@ from typing import Literal
 
 CreateEdgeRuleRequestKind = Literal[
     "budget",
+    "cache",
     "cors",
     "geo",
     "headers",
@@ -18,6 +19,7 @@ CreateEdgeRuleRequestKind = Literal[
 
 CREATE_EDGE_RULE_REQUEST_KIND_VALUES: set[CreateEdgeRuleRequestKind] = {
     "budget",
+    "cache",
     "cors",
     "geo",
     "headers",

@@ -3,10 +3,23 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.deployment_response_deployed_via_type_1 import (
+    DeploymentResponseDeployedViaType1,
+    check_deployment_response_deployed_via_type_1,
+)
+from ..models.deployment_response_deployed_via_type_2_type_1 import (
+    DeploymentResponseDeployedViaType2Type1,
+    check_deployment_response_deployed_via_type_2_type_1,
+)
+from ..models.deployment_response_deployed_via_type_3_type_1 import (
+    DeploymentResponseDeployedViaType3Type1,
+    check_deployment_response_deployed_via_type_3_type_1,
+)
 from ..models.deployment_response_parked_reason_type_1 import (
     DeploymentResponseParkedReasonType1,
     check_deployment_response_parked_reason_type_1,
@@ -134,6 +147,29 @@ class DeploymentResponse:
     build_plan: BuildPlan | None | Unset = UNSET
     """Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`.
     nil for image deploys."""
+    deployed_by_user_id: None | Unset | UUID = UNSET
+    """UUID of the deploying local account (FK → accounts.id, ON DELETE SET NULL). Empty when the deploy came from
+    a non-local source (e.g. a githubd pusher not bound to a local account)."""
+    deployed_via: (
+        DeploymentResponseDeployedViaType1
+        | DeploymentResponseDeployedViaType2Type1
+        | DeploymentResponseDeployedViaType3Type1
+        | None
+        | Unset
+    ) = UNSET
+    """Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer
+    token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema
+    layer by migrations/00303_deployments_actor.sql's CHECK constraint."""
+    deployed_from_ip: None | str | Unset = UNSET
+    """Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract).
+    Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in
+    Postgres' native `inet` type (which canonicalises both families); the OpenAPI schema intentionally omits
+    `format: ipv4` so v6 deployments (which grow as the public gateway picks up AAAA records) do not fail schema
+    validation. v6 is rendered as the bracketed colon-hex form per RFC 5952."""
+    pusher_login: None | str | Unset = UNSET
+    """Raw GitHub login of the pusher when `deployed_via == "github"`. Empty for all other via values. Distinct
+    from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH
+    identity, suitable for downstream GitHub-API correlation."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -292,6 +328,38 @@ class DeploymentResponse:
         else:
             build_plan = self.build_plan
 
+        deployed_by_user_id: None | str | Unset
+        if isinstance(self.deployed_by_user_id, Unset):
+            deployed_by_user_id = UNSET
+        elif isinstance(self.deployed_by_user_id, UUID):
+            deployed_by_user_id = str(self.deployed_by_user_id)
+        else:
+            deployed_by_user_id = self.deployed_by_user_id
+
+        deployed_via: None | str | Unset
+        if isinstance(self.deployed_via, Unset):
+            deployed_via = UNSET
+        elif isinstance(self.deployed_via, str):
+            deployed_via = self.deployed_via
+        elif isinstance(self.deployed_via, str):
+            deployed_via = self.deployed_via
+        elif isinstance(self.deployed_via, str):
+            deployed_via = self.deployed_via
+        else:
+            deployed_via = self.deployed_via
+
+        deployed_from_ip: None | str | Unset
+        if isinstance(self.deployed_from_ip, Unset):
+            deployed_from_ip = UNSET
+        else:
+            deployed_from_ip = self.deployed_from_ip
+
+        pusher_login: None | str | Unset
+        if isinstance(self.pusher_login, Unset):
+            pusher_login = UNSET
+        else:
+            pusher_login = self.pusher_login
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -352,6 +420,14 @@ class DeploymentResponse:
             field_dict["secret_scan"] = secret_scan
         if build_plan is not UNSET:
             field_dict["build_plan"] = build_plan
+        if deployed_by_user_id is not UNSET:
+            field_dict["deployed_by_user_id"] = deployed_by_user_id
+        if deployed_via is not UNSET:
+            field_dict["deployed_via"] = deployed_via
+        if deployed_from_ip is not UNSET:
+            field_dict["deployed_from_ip"] = deployed_from_ip
+        if pusher_login is not UNSET:
+            field_dict["pusher_login"] = pusher_login
 
         return field_dict
 
@@ -623,6 +699,89 @@ class DeploymentResponse:
 
         build_plan = _parse_build_plan(d.pop("build_plan", UNSET))
 
+        def _parse_deployed_by_user_id(data: object) -> None | Unset | UUID:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                deployed_by_user_id_type_0 = UUID(data)
+
+                return deployed_by_user_id_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UUID, data)
+
+        deployed_by_user_id = _parse_deployed_by_user_id(d.pop("deployed_by_user_id", UNSET))
+
+        def _parse_deployed_via(
+            data: object,
+        ) -> (
+            DeploymentResponseDeployedViaType1
+            | DeploymentResponseDeployedViaType2Type1
+            | DeploymentResponseDeployedViaType3Type1
+            | None
+            | Unset
+        ):
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                deployed_via_type_1 = check_deployment_response_deployed_via_type_1(data)
+
+                return deployed_via_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                deployed_via_type_2_type_1 = check_deployment_response_deployed_via_type_2_type_1(data)
+
+                return deployed_via_type_2_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                deployed_via_type_3_type_1 = check_deployment_response_deployed_via_type_3_type_1(data)
+
+                return deployed_via_type_3_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                DeploymentResponseDeployedViaType1
+                | DeploymentResponseDeployedViaType2Type1
+                | DeploymentResponseDeployedViaType3Type1
+                | None
+                | Unset,
+                data,
+            )
+
+        deployed_via = _parse_deployed_via(d.pop("deployed_via", UNSET))
+
+        def _parse_deployed_from_ip(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        deployed_from_ip = _parse_deployed_from_ip(d.pop("deployed_from_ip", UNSET))
+
+        def _parse_pusher_login(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        pusher_login = _parse_pusher_login(d.pop("pusher_login", UNSET))
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -654,6 +813,10 @@ class DeploymentResponse:
             scope=scope,
             secret_scan=secret_scan,
             build_plan=build_plan,
+            deployed_by_user_id=deployed_by_user_id,
+            deployed_via=deployed_via,
+            deployed_from_ip=deployed_from_ip,
+            pusher_login=pusher_login,
         )
 
         deployment_response.additional_properties = d

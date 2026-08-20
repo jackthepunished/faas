@@ -105,6 +105,7 @@ export type { DomainDoctorCheck } from './DomainDoctorCheck.js';
 export type { DomainDoctorReport } from './DomainDoctorReport.js';
 export type { EdgeRuleBudgetAction } from './EdgeRuleBudgetAction.js';
 export type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
+export type { EdgeRuleCacheAction } from './EdgeRuleCacheAction.js';
 export type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 export type { EdgeRuleHeaderOp } from './EdgeRuleHeaderOp.js';
 export type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';

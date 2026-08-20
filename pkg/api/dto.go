@@ -5152,8 +5152,8 @@ func (a *EdgeRuleCacheAction) Validate() *Problem {
 	}
 	// VaryOn must be a closed subset of the non-credential
 	// vocabulary. Authorization / Cookie are deliberately NOT in
-	// edgeRuleCacheVaryOnVocab so even a typo like
-	// "Authorizaton" gives a clearer error than "credentialed
+	// edgeRuleCacheVaryOnVocab so even a typo near
+	// "Authorization" gives a clearer error than "credentialed
 	// requests are a hard bypass" would on its own.
 	for _, h := range a.VaryOn {
 		if _, ok := edgeRuleCacheVaryOnVocab[h]; !ok {

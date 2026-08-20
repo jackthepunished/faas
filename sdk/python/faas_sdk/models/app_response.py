@@ -114,9 +114,9 @@ class AppResponse:
     cors_default_enabled: bool | None | Unset = UNSET
     cors_default_origins: list[str] | Unset = UNSET
     public_auth: PublicAuthStatus | Unset = UNSET
-    """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents
-    without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
-    're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when
+    """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077 + ADR-118). Mirrors the row
+    contents without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077
+    §Decision 're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when
     mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."""
     auth_default_flipped_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
