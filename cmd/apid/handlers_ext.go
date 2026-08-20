@@ -194,6 +194,54 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			req.EgressAllowlist = &rewritten
 		}
 	}
+	// ADR-118: parse + dedup the per-app ingress IP allowlist. Mirrors
+	// the egress loop above in spirit but with three deliberate
+	// differences: (1) NO v4-mapped-v6 rewrite — the DB trigger
+	// rejects families outside {4,6} outright, so a v4-mapped entry
+	// is just an invalid entry; (2) NO /8 floor — ingress is
+	// per-customer-list, no operator-side abuse band to enforce at
+	// the handler; (3) insertion order is first-seen-wins like
+	// egress, but the surviving entry count may differ — the
+	// downstream cap check above already ran against the wire length
+	// so a dedup drop doesn't 400 the request. The slot walks past
+	// 00307 (see ADR-118 §Migration for the pre-flight fence).
+	//
+	// The closed-enum validator in dto.go already rejected
+	// mode='ip_allowlist' + len==0 (422 invalid_public_auth_mode),
+	// so reaching this branch means a non-empty wire list is in
+	// hand. Empty-list mode flip (arm-then-add) is the gateway's
+	// loud 500 posture (operator misconfig), not a handler
+	// concern.
+	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist &&
+		len(req.PublicAuth.IPAllowlist) > 0 {
+		canonicalised := make([]string, 0, len(req.PublicAuth.IPAllowlist))
+		seen := make(map[string]struct{}, len(req.PublicAuth.IPAllowlist))
+		for _, raw := range req.PublicAuth.IPAllowlist {
+			prefix, err := netip.ParsePrefix(raw)
+			if err != nil || prefix.Bits() == 0 {
+				return api.ErrInvalidPublicAuthIPAllowlist(raw,
+					errOrZero("parse failed", err))
+			}
+			// Reject v4-mapped-v6 (RFC 4291 §2.5.5.2). The DB
+			// trigger would 23514 this anyway — catching it here
+			// gives the operator a friendlier error name.
+			if prefix.Addr().Is4In6() {
+				return api.ErrInvalidPublicAuthIPAllowlist(raw,
+					errors.New("v4-mapped prefix not allowed; use the v4 form"))
+			}
+			key := prefix.String()
+			if _, ok := seen[key]; ok {
+				continue // dedup, no dirty-tracking needed at the handler
+			}
+			seen[key] = struct{}{}
+			canonicalised = append(canonicalised, key)
+		}
+		// Always replace the wire form so the audit + downstream
+		// conversion see canonical strings. Even when no dedup
+		// dropped entries, ParsePrefix can canonicalise the
+		// textual form (e.g. 10.0.0.5/8 → 10.0.0.0/8).
+		req.PublicAuth.IPAllowlist = canonicalised
+	}
 	// Issue #169 / #172: per-app reactive scale-up trigger. Plan
 	// gates run first (403 supersedes 422) so a Free account
 	// PATCHing an invalid value surfaces the gate error, not the
@@ -409,18 +457,22 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			}
 		}
 	}
-	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
-	// Plan-gated upstream: apid returns 402
-	// plan_public_auth_{bearer,basic}_not_allowed when the
-	// customer's plan lacks the gate. The bearer path
-	// re-uses the require_authn chain (apps:read scope on
-	// the app's owning account) so the gate is Hobby+;
-	// basic adds a secretbox seal + per-app unseal and is
-	// Pro+. 'open' is always allowed (the pre-#477 default).
+	// Issue #477 / ADR-079 + ADR-118: per-app public_auth
+	// (open|bearer|basic|ip_allowlist). Plan-gated upstream:
+	// apid returns 403 plan_public_auth_{bearer,basic,
+	//ip_allowlist}_not_allowed when the customer's plan
+	// lacks the gate. The bearer path re-uses the
+	// require_authn chain (apps:read scope on the app's
+	// owning account) so the gate is Hobby+; basic adds a
+	// secretbox seal + per-app unseal and is Pro+;
+	// ip_allowlist is a per-app CIDR list (mirrors egress
+	// schema) and is also Pro+ — Hobby/Free use edge rules
+	// (kind='ip') for the abuse-floor posture (ADR-091).
+	// 'open' is always allowed (the pre-#477 default).
 	// Validation runs FIRST (closed-enum + length bounds)
 	// so a Free customer who tries PATCH mode='weird' gets
 	// a 422 invalid_public_auth_mode rather than a
-	// confusing 402 plan_public_auth_bearer_not_allowed.
+	// confusing 403 plan_public_auth_*_not_allowed.
 	if req.PublicAuth != nil {
 		if prob := req.PublicAuth.Validate(); prob != nil {
 			return prob
@@ -433,6 +485,29 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		case api.AppPublicAuthModeBasic:
 			if !acct.Plan.PublicAuthBasicAllowed() {
 				return api.ErrPlanPublicAuthBasicNotAllowed(acct.Plan)
+			}
+		case api.AppPublicAuthModeIPAllowlist:
+			// ADR-118: plan tier first — Free/Hobby + non-pip
+			// cap surfaces 403 even when the rest of the
+			// body looks valid. The closed-enum validator in
+			// dto.go already rejected unknown mode strings
+			// (422 invalid_public_auth_mode) AND
+			// mode='ip_allowlist' with an empty list (422
+			// invalid_public_auth_mode — empty list is
+			// not a valid ip_allowlist body).
+			if !acct.Plan.PublicAuthIPAllowlistAllowed() {
+				return api.ErrPlanPublicAuthIPAllowlistNotAllowed(acct.Plan)
+			}
+			// Per-app size cap: Pro 16, Scale 64 — mirror
+			// egress. Additive per-account budget doesn't
+			// apply here (the per-app cap is the per-app
+			// cap; egress has an account-level additive
+			// override because abuse-floor budgets are
+			// org-scoped, ingress is per-app).
+			maxEntries := acct.Plan.PublicAuthIPAllowlistMaxEntries()
+			if len(req.PublicAuth.IPAllowlist) > maxEntries {
+				return api.ErrPublicAuthIPAllowlistTooLong(
+					len(req.PublicAuth.IPAllowlist), maxEntries)
 			}
 		}
 	}
@@ -565,6 +640,20 @@ func errOrZero(msg string, err error) error {
 		return err
 	}
 	return errors.New(msg)
+}
+
+// countIPAllowlistAudit returns the integer count of CIDR entries
+// after canonicalisation, or 0 when the mode is not ip_allowlist.
+// ADR-118 audit redaction invariant: the audit payload carries this
+// count, NEVER the CIDR strings. Defined here so a future contributor
+// adding a second audit site (gatewayd-internal side, operator CLI
+// replay, etc.) uses the same nil-or-empty shape and doesn't
+// accidentally inline `len(ipAllowlist)` with the wrong context.
+func countIPAllowlistAudit(mode string, ipAllowlist []string) int {
+	if mode != api.AppPublicAuthModeIPAllowlist {
+		return 0
+	}
+	return len(ipAllowlist)
 }
 
 // updateApp is the PATCH /v1/apps/{slug} handler. User-tunable:
@@ -703,6 +792,30 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 		publicAuthSealed = sealed
 	}
+	// ADR-118: parse the canonicalised CIDR list into []netip.Prefix
+	// for the store. Done between the seal step and UpdateAppParams
+	// construction so the store sees []netip.Prefix directly. The
+	// parse-and-dedup loop above already converted the wire form to
+	// canonical strings; this is the second parse into the typed
+	// shape. The closed-enum validator already rejected
+	// len==0 mode='ip_allowlist', so reaching this branch with the
+	// mode set means the wire form is non-empty.
+	var publicAuthIPAllowlist []netip.Prefix
+	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist {
+		publicAuthIPAllowlist = make([]netip.Prefix, 0, len(req.PublicAuth.IPAllowlist))
+		for _, raw := range req.PublicAuth.IPAllowlist {
+			// Already validated above (ParsePrefix succeeded,
+			// Bits() != 0, not v4-mapped). A second parse
+			// error here would mean a write-after-validate
+			// race, which is impossible in a single
+			// goroutine — so we tolerate err != nil as a
+			// defensive fallback (drop the entry, the
+			// canonicalised list is the source of truth).
+			if prefix, err := netip.ParsePrefix(raw); err == nil && prefix.Bits() != 0 {
+				publicAuthIPAllowlist = append(publicAuthIPAllowlist, prefix)
+			}
+		}
+	}
 	params := state.UpdateAppParams{
 		RAMMB:              req.RAMMB,
 		IdleTimeoutS:       req.IdleTimeoutS,
@@ -819,6 +932,21 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// partial-PATCH (e.g. only flips RAM_MB) never
 		// touches the public_auth column.
 		SetPublicAuth: req.PublicAuth != nil,
+		// ADR-118: per-app ingress IP allowlist. The Set bit
+		// fires ONLY when the operator explicitly chose
+		// ip_allowlist mode — a PATCH that flips an app from
+		// 'open' → 'basic' must not silently clear an existing
+		// allowlist that was stored under a previous
+		// ip_allowlist-mode PATCH. The SetPublicAuth bit
+		// above is permissive (any mode flip touches the
+		// column family), but SetPublicAuthIPAllowlist is
+		// narrow: it gates the column write, not the mode
+		// write. The slice is empty-but-non-nil when the
+		// operator PATCHed ip_allowlist with no CIDRs (the
+		// canonical "arm the mode" form); nil when the
+		// operator PATCHed a non-ip_allowlist mode.
+		PublicAuthIPAllowlist:    &publicAuthIPAllowlist,
+		SetPublicAuthIPAllowlist: req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist,
 		// Issue #695 / ADR-080: grand-father clear path. Set
 		// whenever the customer made a deliberate choice on
 		// require_authn OR public_auth — that's the signal
@@ -1050,8 +1178,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"new":    false,
 		})
 	}
-	// Issue #477 / ADR-079: emit app.public_auth_changed on mode
-	// transitions. Same single-purpose, single-keyword-greppable
+	// Issue #477 / ADR-079 + ADR-118: emit app.public_auth_changed on
+	// mode transitions. Same single-purpose, single-keyword-greppable
 	// shape as app.eviction_priority_changed above so operators
 	// can `gregale audit-events --kind-prefix public_auth` and
 	// see every mode flip without parsing the larger app.updated
@@ -1061,13 +1189,24 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	//
 	// Redaction posture (load-bearing — see ADR-079 §Decision
 	// "re-redaction invariant"): the payload carries mode only
-	// (open|bearer|basic) and a `has_basic_creds` bool flag.
-	// Plaintext username / password / sealed blob are NEVER
-	// recorded anywhere on the audit stream — neither this row
-	// nor any future contributor adding logging in the
-	// gatewayd-internal-side path. has_basic_creds answers "did the
-	// customer rotate credentials on this PATCH?" without
+	// (open|bearer|basic|ip_allowlist) and a `has_basic_creds`
+	// bool flag. Plaintext username / password / sealed blob are
+	// NEVER recorded anywhere on the audit stream — neither this
+	// row nor any future contributor adding logging in the
+	// gatewayd-internal-side path. has_basic_creds answers "did
+	// the customer rotate credentials on this PATCH?" without
 	// revealing the value.
+	//
+	// ADR-118: `public_auth_ip_allowlist_entry_count` is the
+	// INTEGER count of CIDRs after canonicalisation + dedup,
+	// NEVER the CIDR strings themselves. Operators can answer
+	// "did the customer change the size of the allowlist?" from
+	// the count without seeing the contents. The CIDR strings
+	// are not PII per se, but the allowlist can reveal
+	// partner-customer ranges (an abuse-floor partner
+	// allowlist like 198.51.100.0/24 + 203.0.113.0/24 would
+	// tell an attacker which customer is behind the app); the
+	// invariant is to record presence + size, never contents.
 	if req.PublicAuth != nil && app.PublicAuthMode != updated.PublicAuthMode {
 		s.audit.Emit(r.Context(), "app.public_auth_changed", &acct.ID, map[string]any{
 			"app_id":          updated.ID,
@@ -1075,6 +1214,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"old":             app.PublicAuthMode,
 			"new":             updated.PublicAuthMode,
 			"has_basic_creds": req.PublicAuth.Mode == api.AppPublicAuthModeBasic,
+			"public_auth_ip_allowlist_entry_count": countIPAllowlistAudit(
+				req.PublicAuth.Mode, req.PublicAuth.IPAllowlist),
 		})
 	}
 	resp := s.appResponse(updated, acct.Plan)
