@@ -4348,7 +4348,7 @@ paths:
                 $ref: '#/components/schemas/DeploymentPreviewURL'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
-          description: Deployment URL row missing or cross-account probe (IDOR-safe; never 403).
+          description: Deployment row missing or cross-account probe (IDOR-safe; never 403).
           content:
             application/problem+json:
               schema:
