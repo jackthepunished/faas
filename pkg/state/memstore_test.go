@@ -5285,6 +5285,9 @@ func TestMemStoreAppendDeploymentStage(t *testing.T) {
 	// returns ErrNotFound (programming-error guard).
 	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
 		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+	}
+}
+
 // TestMemStoreUpdateTrigger_FilterCriteriaPersists is the regression
 // test for REVIEW-FIX MED-1 (PR #993 / issue #757 closure): the
 // UpdateTrigger signature gained a filterCriteria *[]byte argument
