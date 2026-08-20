@@ -1083,14 +1083,17 @@ groups:
 
       - alert: FaasDomainDoctorStretched
         # The doctor loop ran but the cadence has stretched past
-        # 2x the 30s interval (>1m stale). Either the dns_poller
+        # 3x the 30s interval (>1.5m stale). Either the dns_poller
         # goroutine died mid-batch, the MIN(observed_at) query
         # is contending with the per-domain UpsertDoctorObservation
         # writes, or a tenant with thousands of domains is
         # dominating the 50/batch budget. The gauge IS updating
         # (so loop is alive per the stalled rule's semantics)
         # but the cadence is broken — warn-tier operational
-        # signal, not page.
+        # signal, not page. Threshold (90s) was tightened to 3x
+        # the 30s cadence (was: 2x in the comment) so a single
+        # dropped pass doesn't trip the warn tier — review-fix
+        # #5 in PR #1003 caught the comment-vs-threshold drift.
         expr: time() - timestamp(apid_domain_doctor_oldest_observation_seconds) > 90
         for: 30m
         labels:
@@ -1098,8 +1101,8 @@ groups:
           component: apid
           family: domain_doctor
         annotations:
-          summary: "apid domain doctor cadence stretched >1m"
-          description: "The dns_poller doctor pass is alive (gauge IS updating) but the cadence has stretched past 2x the 30 s interval (90 s with 30 s slack). Either the dns_poller goroutine is contending with a slow MIN(observed_at) query, a tenant's batch is starving the loop, or the goroutine crashed mid-pass and the watchdog hasn't restarted it yet. Customers will see 'last check 1-2m ago' instead of the usual 30 s."
+          summary: "apid domain doctor cadence stretched >1.5m"
+          description: "The dns_poller doctor pass is alive (gauge IS updating) but the cadence has stretched past 3x the 30 s interval (90 s). Either the dns_poller goroutine is contending with a slow MIN(observed_at) query, a tenant's batch is starving the loop, or the goroutine crashed mid-pass and the watchdog hasn't restarted it yet. Customers will see 'last check 1-2m ago' instead of the usual 30 s."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasDomainDoctorStalled.md"
 
       - alert: FaasDomainDoctorDisabledByOperator

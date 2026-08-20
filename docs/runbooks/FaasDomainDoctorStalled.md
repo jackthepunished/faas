@@ -36,7 +36,7 @@ row per domain. Three signals stack:
   slack for a Postgres hiccup that delays the next good pass
   by ~50 passes). A second alert at `> 90` (warn,
   `FaasDomainDoctorStretched`) trips when the cadence has
-  stretched past 2x the interval but the gauge IS still
+  stretched past 3x the interval but the gauge IS still
   updating (the loop is alive but degraded — likely a
   contention on the MIN(observed_at) query or a single
   tenant's batch starving the loop).
