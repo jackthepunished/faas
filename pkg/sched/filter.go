@@ -167,25 +167,25 @@ func (f *FilterCriteria) Match(payload []byte, headers map[string]string) (bool,
 // returns both the match outcome and the count of clauses that
 // errored during evaluation.
 //
-//	- matched == true,  clauseErrors == 0  → record passes the
-//	                                       filter cleanly.
-//	- matched == false, clauseErrors == 0  → no clause matched,
-//	                                       but every clause ran
-//	                                       without error.
-//	- matched == false, clauseErrors > 0   → at least one clause
-//	                                       errored; the record is
-//	                                       dropped and the
-//	                                       dispatcher audits as
-//	                                       trigger.filter_error.
-//	- matched == true,  clauseErrors > 0   → OR-with-fallback:
-//	                                       some clauses errored
-//	                                       but a later clause
-//	                                       matched. Still audited
-//	                                       (the operator wants
-//	                                       visibility into clauses
-//	                                       that failed in case the
-//	                                       matched clause was the
-//	                                       fallback).
+//   - matched == true,  clauseErrors == 0  → record passes the
+//     filter cleanly.
+//   - matched == false, clauseErrors == 0  → no clause matched,
+//     but every clause ran
+//     without error.
+//   - matched == false, clauseErrors > 0   → at least one clause
+//     errored; the record is
+//     dropped and the
+//     dispatcher audits as
+//     trigger.filter_error.
+//   - matched == true,  clauseErrors > 0   → OR-with-fallback:
+//     some clauses errored
+//     but a later clause
+//     matched. Still audited
+//     (the operator wants
+//     visibility into clauses
+//     that failed in case the
+//     matched clause was the
+//     fallback).
 //
 // The dispatcher calls MatchCount (not Match) so it can audit the
 // per-record error count. See filterBatch in dispatch_triggers.go.

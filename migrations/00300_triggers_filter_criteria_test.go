@@ -13,26 +13,26 @@
 //
 //     Slot chain audit:
 //
-//       00281_reserve_slot   (PR #978)
-//       00282_reserve_slot   (PR #978)
-//       00283_reserve_slot   (PR #978)
-//       00284_tenant_surfaces_per_host_kind (PR #937, merged)
-//       00285_reserve_slot   (PR #963, fence after merge into #964)
-//       00286_data_upstreams_deployment_scope (PR #964, merged)
-//       00287_pg_ratelimit_add_rule_scope (PR #963, merged)
-//       00288_reserve_slot   (PR #978)
-//       00289_reserve_slot   (PR #978)
-//       00290_reserve_slot   (PR #978)
-//       00291_reserve_slot   (PR #978)
-//       00292_reserve_slot   (PR #978)
-//       00293_validate_mode  (PR #978, merged)
-//       00294_reserve_slot   (PR #979-b CORS presets, future)
-//       00295_reserve_slot   (open)
-//       00296_reserve_slot   (PR #910 round-6 fence)
-//       00297_triggers       (PR #910, merged)
-//       00298_triggers_payload_max (PR #910, merged)
-//       00299_triggers_poison_strategy (PR #910, merged)
-//       00300_triggers_filter_criteria (this PR — ADR-118 / #757 closure)
+//     00281_reserve_slot   (PR #978)
+//     00282_reserve_slot   (PR #978)
+//     00283_reserve_slot   (PR #978)
+//     00284_tenant_surfaces_per_host_kind (PR #937, merged)
+//     00285_reserve_slot   (PR #963, fence after merge into #964)
+//     00286_data_upstreams_deployment_scope (PR #964, merged)
+//     00287_pg_ratelimit_add_rule_scope (PR #963, merged)
+//     00288_reserve_slot   (PR #978)
+//     00289_reserve_slot   (PR #978)
+//     00290_reserve_slot   (PR #978)
+//     00291_reserve_slot   (PR #978)
+//     00292_reserve_slot   (PR #978)
+//     00293_validate_mode  (PR #978, merged)
+//     00294_reserve_slot   (PR #979-b CORS presets, future)
+//     00295_reserve_slot   (open)
+//     00296_reserve_slot   (PR #910 round-6 fence)
+//     00297_triggers       (PR #910, merged)
+//     00298_triggers_payload_max (PR #910, merged)
+//     00299_triggers_poison_strategy (PR #910, merged)
+//     00300_triggers_filter_criteria (this PR — ADR-118 / #757 closure)
 //
 //  2. The triggers.filter_criteria column exists with type JSONB and
 //     is NULLABLE. No default — the absence of a filter means
@@ -85,9 +85,9 @@ func TestMigrations_00300_TriggersFilterCriteria(t *testing.T) {
 
 	// (2) Column shape: JSONB, NULLABLE, no default.
 	var (
-		dataType  string
+		dataType   string
 		isNullable string
-		colDflt   *string
+		colDflt    *string
 	)
 	err := pool.QueryRow(ctx, `
 		SELECT data_type, is_nullable, column_default

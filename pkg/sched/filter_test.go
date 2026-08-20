@@ -596,10 +596,10 @@ func TestFilterCriteriaJSONRoundTrip(t *testing.T) {
 // cases onto a single "no match" semantic. CRIT-3 dispatches on
 // c.Op before consulting the helper:
 //
-//	- neq on missing key  → true  (Lambda ESM documented
-//	                                 behaviour; a missing key
-//	                                 trivially satisfies the
-//	                                 inequality)
+//   - neq on missing key  → true  (Lambda ESM documented
+//     behaviour; a missing key
+//     trivially satisfies the
+//     inequality)
 //
 // The test mirrors the header-slot path: FilterOpNeq on an
 // absent header returns true.
