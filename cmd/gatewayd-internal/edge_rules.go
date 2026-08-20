@@ -131,6 +131,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	geo, geoErrs := compileGeoRules(storeRules)
 	throttle, throttleErrs := compileThrottleRules(storeRules)
 	budget, budgetErrs := compileBudgetRules(storeRules)
+	cache, cacheErrs := compileCacheRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:       route,
 		Rewrite:     rewrite,
@@ -145,6 +146,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		Geo:         geo,
 		Throttle:    throttle,
 		Budget:      budget,
+		Cache:       cache,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -158,6 +160,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, geoErrs...)
 	parseErrs = append(parseErrs, throttleErrs...)
 	parseErrs = append(parseErrs, budgetErrs...)
+	parseErrs = append(parseErrs, cacheErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -553,6 +556,44 @@ func (g *gatewaydEdgeRules) MatchBudget(ctx context.Context, host, requestPath, 
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstBudgetMatch(rules, requestPath, method)
+}
+
+// MatchCache is the ADR-122 matcher for the kind=cache subset.
+// Same shape as MatchBudget: cache hit returns immediately;
+// cache miss triggers loadHost which compiles every kind's
+// slice in one SQL roundtrip. On cache miss with no
+// kind=cache rule the cache still records a nil Cache slice,
+// so a future MatchCache on the same host hits the cache
+// instead of reloading. Returns the highest-priority matching
+// rule or nil on miss; the applier
+// (handler.go::applyEdgeRuleCache) falls back to "no cache
+// rule → cache miss" on nil.
+//
+// The DeploymentID component of the cache key is NOT a
+// per-rule field — the applier reads it from the live routed
+// target at request time and threads it into the CacheKey
+// when calling ResponseCache.Get. This keeps the matcher
+// host-scoped (consistent with the rest of the per-kind
+// matchers) without dragging the deployment picker into the
+// rule cache.
+func (g *gatewaydEdgeRules) MatchCache(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleCacheResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetCache(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Cache
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstCacheMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -1346,6 +1387,83 @@ func compileBudgetRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleBudgetRe
 			Methods:             buildMethodsMap(r.MatchMethods),
 			BudgetMs:            budgetMs,
 			AllowOverrideHeader: r.Action.Budget.AllowOverrideHeader,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileCacheRules mirrors compileBudgetRules for kind=cache
+// (ADR-122 §Decision). The compiled slice carries the
+// MaxAgeSeconds / StaleIfErrorSeconds / VaryOn fields the
+// applier (handler.go::applyEdgeRuleCache) consults on every
+// request to compute a CacheKey and consult the runtime
+// ResponseCache. apid-Validate already enforced the
+// closed-vocab rules on vary_on + methods and clamped
+// max_age_seconds ≤ 3600 and stale_if_error_seconds ≤ 300;
+// this compile step is the defence-in-depth pass — a hot-fix
+// that bypassed apid still fails here, and the rule is dropped
+// from the slice (the customer sees the existing pass-through
+// path, no panic).
+//
+// MaxAgeSeconds / StaleIfErrorSeconds are clamped to the
+// api.ResponseCacheMaxAgeMaxSeconds /
+// ResponseCacheStaleIfErrorMaxSeconds ceilings. A non-positive
+// MaxAgeSeconds is kept as 0 (no fresh hits but stale-on-error
+// still applies); a negative StaleIfErrorSeconds is clamped to
+// 0 (no stale-on-error). The applier treats 0/0 as "fresh
+// hits disabled AND stale-on-error disabled" (cache-miss-only
+// rule — the rule's only effect is to count outcome=miss
+// toward the per-app cache metric).
+//
+// VaryOn is copied verbatim from the row (the closed-vocab
+// check happened at apid-Validate). Methods is built into a set
+// via buildMethodsMap so the applier's method filter is O(1).
+func compileCacheRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCacheResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleCacheResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindCache {
+			continue
+		}
+		if r.Action.Cache == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		maxAge := r.Action.Cache.MaxAgeSeconds
+		if maxAge < 0 {
+			maxAge = 0
+		}
+		if maxAge > api.ResponseCacheMaxAgeMaxSeconds {
+			maxAge = api.ResponseCacheMaxAgeMaxSeconds
+		}
+		stale := r.Action.Cache.StaleIfErrorSeconds
+		if stale < 0 {
+			stale = 0
+		}
+		if stale > api.ResponseCacheStaleIfErrorMaxSeconds {
+			stale = api.ResponseCacheStaleIfErrorMaxSeconds
+		}
+		out = append(out, gateway.EdgeRuleCacheResolved{
+			ID:                  r.ID,
+			AccountID:           r.AccountID,
+			AppID:               r.AppID,
+			Priority:            r.Priority,
+			PathGlob:            r.MatchPath,
+			Methods:             buildMethodsMap(r.MatchMethods),
+			MaxAgeSeconds:       maxAge,
+			StaleIfErrorSeconds: stale,
+			VaryOn:              r.Action.Cache.VaryOn,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

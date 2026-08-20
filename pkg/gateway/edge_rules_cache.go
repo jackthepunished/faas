@@ -47,12 +47,16 @@ import "github.com/onebox-faas/faas/pkg/state"
 // method filter; the loader populates it from the row's
 // MatchMethods slice.
 //
-// DeploymentID is part of the cache key (CacheKey.DeploymentID)
-// so a fresh deploy cannot serve the previous release's
-// bodies. The applier passes the current deployment's ID at
-// apply time; if a rule's row was created under a deployment
-// that no longer exists, the key still binds to the dead
-// deploymentID and the entry is never served (cache miss).
+// DeploymentID is NOT a per-rule field: the cache key binds to
+// the live deployment of the current request (read by the
+// applier from h.backend's resolved target, see
+// pkg/gateway/handler.go::Handler.Port/DeploymentID at PR-B).
+// A rule created under one deployment applies to the next one
+// too — the deploymentID component of the cache key makes
+// sure the previous release's bodies cannot bleed into the
+// new release's window. cmd-side compileCacheRules leaves
+// DeploymentID out of the Resolved struct entirely; the
+// applier pulls it at request time.
 type EdgeRuleCacheResolved struct {
 	ID                  string
 	AccountID           string
@@ -60,7 +64,6 @@ type EdgeRuleCacheResolved struct {
 	Priority            int
 	PathGlob            string          // "" = any path
 	Methods             map[string]bool // nil = any method
-	DeploymentID        string          // bound into the cache key
 	MaxAgeSeconds       int             // fresh window; 0 = no fresh hits
 	StaleIfErrorSeconds int             // post-fresh window; 0 = no stale-on-error
 	VaryOn              []string        // closed subset of {Accept-Language, Accept-Encoding}

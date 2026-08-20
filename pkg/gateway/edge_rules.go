@@ -879,6 +879,14 @@ type EdgeRuleMatcher interface {
 	// + reqbudget.WithRemaining so the per-hop remaining-time
 	// propagation logic stays in one place).
 	MatchBudget(ctx context.Context, host, path, method string) *EdgeRuleBudgetResolved
+	// MatchCache is the ADR-122 matcher for the kind=cache
+	// subset. The applier (handler.go::applyEdgeRuleCache) reads
+	// the matched rule's MaxAgeSeconds / StaleIfErrorSeconds /
+	// VaryOn and consults the in-process ResponseCache; the
+	// matcher itself only resolves the highest-priority matching
+	// rule (the cache key + storage live in handler.go so the
+	// wake-gate interaction stays in one place).
+	MatchCache(ctx context.Context, host, path, method string) *EdgeRuleCacheResolved
 	Reset()
 }
 
@@ -1078,6 +1086,9 @@ func (noOpEdgeRuleMatcher) MatchThrottle(context.Context, string, string, string
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchBudget(context.Context, string, string, string) *EdgeRuleBudgetResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchCache(context.Context, string, string, string) *EdgeRuleCacheResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}

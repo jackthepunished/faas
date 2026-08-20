@@ -709,7 +709,6 @@ func sampleCacheRule(id string, prio int, host string) EdgeRuleCacheResolved {
 		Priority:            prio,
 		PathGlob:            "",
 		Methods:             map[string]bool{"GET": true, "HEAD": true},
-		DeploymentID:        "dep_" + id,
 		MaxAgeSeconds:       60,
 		StaleIfErrorSeconds: 300,
 		VaryOn:              []string{"Accept-Language"},
