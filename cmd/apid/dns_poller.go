@@ -34,12 +34,23 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 		defer t.Stop()
 		// Run once immediately so freshly-added domains don't wait a minute.
 		s.runVerifyOnce(ctx, log)
+		// ADR-120: ride the same 30 s ticker for the per-domain
+		// doctor probe pass. Gated on api.DomainDoctorEnabled()
+		// so an operator can disable the doctor without bouncing
+		// the daemon — same dark-launch pattern as the
+		// tenant-surfaces branch above.
+		if api.DomainDoctorEnabled() {
+			s.runDoctorOnce(ctx, log)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 				s.runVerifyOnce(ctx, log)
+				if api.DomainDoctorEnabled() {
+					s.runDoctorOnce(ctx, log)
+				}
 			}
 		}
 	}()
