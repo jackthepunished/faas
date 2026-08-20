@@ -604,11 +604,11 @@ const testDomain = "apps.test.example"
 // renumber chain, leaving 00313 as the first free slot above all
 // open PR fences). Issue #977 / ADR-116 deployment annotations rebump
 // 00288 → 00314 (00310-00312 fenced by PR #990; 00313 taken by #986;
-// 00314 is the next free above the post-#986 fence line). The discipline
+// 00314 is the next free above the post-#986 fence line (00314 taken by PR #990 ADR-117 env-diff PR-C)). The discipline
 // (memory: cross-pr-slot-gate-fence-pattern) is that the only line a
 // migration land touches in this file is this constant + the doc-comment
 // history above.
-const e2eMigrationTarget = 314
+const e2eMigrationTarget = 315
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
