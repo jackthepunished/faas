@@ -1039,8 +1039,39 @@ func run(ctx context.Context, log *slog.Logger) error {
 			inv.InstanceID = instanceID
 			return synth.forwardInvocation(ctx, target, inv)
 		},
-	}
+	}, log)
+	// Round-4 rebase: re-attach the NewSynthServer construction
+	// line that main's merge had inline (single-line call). The
+	// WithInternalSvcVerifier + WithMetrics + WithAudit +
+	// WithAppModeLookup chain below is the ADR-119 wiring that
+	// landed in this PR — kept intact across the merge.
 	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, synth, log)
+	// ADR-119 — wire the synth-side gate. The same per-service
+	// public-key allowlist (deps.internalSvcVerifier) gates
+	// /v1/synthesize so a forged cron request cannot wake an
+	// internal_only app (synth bypasses Handler.ServeHTTP).
+	// Same Metrics + same audit emitter + same per-app cache
+	// the HTTP-front-door gate uses — single source of truth.
+	// appPublicAuthMode is consulted via the per-app cache
+	// populated by the same hydration path Handler.PublicAuthConfig
+	// reads; nil-safe (nil lookup = every app treated as "open").
+	deps.synth.WithInternalSvcVerifier(deps.internalSvcVerifier)
+	deps.synth.WithMetrics(deps.metrics).
+		WithAudit(deps.requireAuthnAudit.Emit).
+		WithAppModeLookup(func(appID string) string {
+			// ADR-119 — per-app mode lookup for the synth-side
+			// gate. Reads from the per-app cache hydrated by
+			// the same path Handler.PublicAuthConfig reads.
+			// A cache miss returns "" which the gate treats
+			// as "open" (no JWT required). Returns "" on error
+			// so a transient pg failure doesn't 500 every
+			// internal_only cron fire.
+			app, err := pgStore.AppByID(context.Background(), appID)
+			if err != nil {
+				return ""
+			}
+			return app.PublicAuthMode
+		})
 	// Process-local Prometheus registry (spec §12). Constructed here so
 	// every downstream consumer — handler, warm-hint consumer, top-N
 	// sampler — shares the same registry. The registry is exposed via
