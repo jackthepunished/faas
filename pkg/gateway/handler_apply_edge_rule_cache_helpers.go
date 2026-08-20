@@ -59,6 +59,29 @@ func hashStable(s string) [32]byte {
 	return out
 }
 
+// sortQuery returns the canonical "sorted" form of a URL
+// query string suitable for use as the Query dimension of a
+// CacheKey. Two requests with identical key/value pairs in
+// different orders must produce identical cache keys (otherwise
+// a single client switching from ?id=1&id=2 to ?id=2&id=1 would
+// miss the cache and serve two distinct entries back-to-back);
+// the runtime normalises them to a stable lexical form.
+//
+// Implementation: split on '&', sort the pairs, rejoin. Empty
+// input returns "" so a no-query request collapses cleanly into
+// one entry. Duplicates are preserved as-is — the sort is stable
+// but does not dedupe, on the principle that the upstream origin
+// already accepts both orderings and we should mirror that
+// surface.
+func sortQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
+}
+
 // strconvItoa is a thin wrapper to keep the cache applier free
 // of an explicit strconv import at every call site that wants
 // to render an integer into a header value. It exists solely to

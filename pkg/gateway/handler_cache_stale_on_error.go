@@ -29,20 +29,21 @@ type cacheRuleContextKey struct{}
 // the matched rule + the cache key components that were
 // resolved at the top of ServeHTTP.
 type cacheRuleSnapshot struct {
-	Rule    *EdgeRuleCacheResolved
-	AppID   string
-	Method  string
-	Path    string
+	Rule     *EdgeRuleCacheResolved
+	AppID    string
+	Method   string
+	Path     string
+	Query    string
 	VaryHash [32]byte
 }
 
 // withCacheRuleContext stashes the snapshot on ctx.
-func withCacheRuleContext(ctx context.Context, rule *EdgeRuleCacheResolved, appID, method, path string, varyHash [32]byte) context.Context {
+func withCacheRuleContext(ctx context.Context, rule *EdgeRuleCacheResolved, appID, method, path, query string, varyHash [32]byte) context.Context {
 	if rule == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, cacheRuleContextKey{}, &cacheRuleSnapshot{
-		Rule: rule, AppID: appID, Method: method, Path: path, VaryHash: varyHash,
+		Rule: rule, AppID: appID, Method: method, Path: path, Query: query, VaryHash: varyHash,
 	})
 }
 
@@ -81,8 +82,10 @@ func cacheRuleFromContext(ctx context.Context) *cacheRuleSnapshot {
 //     RFC 7234 §5.5.2 — clients with stale-aware caching
 //     (CDNs, SDKs) can opt to revalidate on the next hop
 //   - header "X-From-Cache: stale" — platform-internal
-//     debugging surface (NOT a public-API contract; remove
-//     if customers start grepping it)
+//     debugging surface, ACTUALLY emitted at line 137 below
+//     (the docstring is the contract; a regression that
+//     drops the header would silently break operator
+//     dashboards that grep for it)
 //
 // Returns the outcome string for metrics: "stale_if_error_served"
 // or "" on no-op. The metric increment happens in commit 15;
@@ -115,6 +118,7 @@ func (h *Handler) tryServeStaleOnWakeError(w http.ResponseWriter, r *http.Reques
 		RuleID:         snap.Rule.ID,
 		Method:         snap.Method,
 		NormalizedPath: snap.Path,
+		Query:          snap.Query,
 		VaryHash:       snap.VaryHash,
 	}
 	outcome, entry := h.responseCache.Get(key)
@@ -134,6 +138,12 @@ func (h *Handler) tryServeStaleOnWakeError(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	w.Header().Add("Warning", `110 - "Response is Stale"`)
+	// X-From-Cache: stale is the platform-internal debug surface
+	// the docstring above promises. Operator dashboards grep
+	// for it; a regression that drops this header would
+	// silently break stale-serve alerting. Not part of the
+	// public API contract.
+	w.Header().Set("X-From-Cache", "stale")
 	w.Header().Set("Content-Length", strconvItoa(len(entry.body)))
 	w.WriteHeader(entry.statusCode)
 	_, _ = w.Write(entry.body)

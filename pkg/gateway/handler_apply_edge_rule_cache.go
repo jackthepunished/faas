@@ -44,31 +44,16 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	if h == nil || h.responseCache == nil || h.edgeRules == nil {
 		return false, nil
 	}
-	// Pre-flight: deny-by-default on credentialed requests. The
-	// check runs BEFORE the matcher so we don't even consult the
-	// per-host rule slice for a credentialed request — the cost
-	// is one header/cookie lookup, but the security property is
-	// "authed requests are NEVER cached", which means the cache
-	// store path never sees them either.
-	if r.Header.Get("Authorization") != "" || hasSessionCookie(r) {
-		// ADR-122 §Decision: bypass_authed counter. A non-
-		// zero value here means an app is seeing credentialed
-		// traffic on a cache-rule-matched path — the cache
-		// will never serve them, but the dashboard surfaces
-		// it so operators can confirm the auth bypass is
-		// doing its job.
-		h.metricsIncCacheOutcome("bypass_authed")
-		return false, nil
-	}
-	// Method gate: only {GET, HEAD} are cacheable. POST/PUT/etc.
-	// are method-level uncacheable per ADR-122 D3.
+	// Method gate is a cheap pre-flight: only {GET, HEAD} are
+	// cacheable per ADR-122 D3. We DO NOT count this as
+	// bypass_uncacheable here — that label only fires when a
+	// cache rule actually matched the path AND the verb is
+	// outside {GET, HEAD}, otherwise every POST-heavy app with
+	// no cache rule would inflate the counter (the
+	// counter's load-bearing meaning is "rule matched, wrong
+	// verb mix").
 	method := strings.ToUpper(r.Method)
 	if method != "GET" && method != "HEAD" {
-		// bypass_uncacheable — the path matched a cache rule
-		// but the method isn't cacheable (e.g. POST). The
-		// counter lets operators see whether their rule
-		// matches the customer's actual verb mix.
-		h.metricsIncCacheOutcome("bypass_uncacheable")
 		return false, nil
 	}
 	host := r.Host
@@ -86,23 +71,33 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	// the closed cacheable-method vocab before consulting the
 	// cache.
 	if rule.Methods != nil && !rule.Methods[method] {
+		h.metricsIncCacheOutcome("bypass_uncacheable")
+		return false, nil
+	}
+	// Pre-flight on credentialed requests — runs AFTER the
+	// matcher so bypass_authed means "a cache rule matched this
+	// path AND the request carried credentials", which is the
+	// informative signal the dashboard surfaces. The security
+	// property (authed requests are NEVER cached) is enforced
+	// by the absence of a storage path here, not by the counter.
+	if r.Header.Get("Authorization") != "" || hasSessionCookie(r) {
+		h.metricsIncCacheOutcome("bypass_authed")
 		return false, nil
 	}
 	// Build the cache key. DeploymentID is empty in v1 because
 	// the App value type doesn't carry one — plumbed in a
 	// follow-on commit once applyEdgeRuleCache is wired into
-	// the picker path (then commit 14's
-	// InvalidateByDeployment has the live ID to bind to).
-	// Without per-deployment binding, a deploy bumps via
-	// InvalidateByApp in the same NotifyAppChanged hook
-	// (commit 14) — slightly coarser (whole app flush) but
-	// safe.
+	// the picker path. Without per-deployment binding, a
+	// deploy bumps via InvalidateByApp in the same
+	// NotifyAppChanged hook (commit 14) — slightly coarser
+	// (whole app flush) but safe.
 	key := CacheKey{
 		AppID:          app.ID,
 		DeploymentID:   "",
 		RuleID:         rule.ID,
 		Method:         method,
 		NormalizedPath: path,
+		Query:          sortQuery(r.URL.RawQuery),
 		VaryHash:       computeVaryHash(r, rule.VaryOn),
 	}
 	outcome, entry := h.responseCache.Get(key)

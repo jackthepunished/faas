@@ -52,7 +52,7 @@ func TestStaleOnError_ServesStaleOnWakeFailure(t *testing.T) {
 		rule.toStateEdgeRuleCacheAction(),
 	)
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
-	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", hashStable("")))
+	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", "", hashStable("")))
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
 	served, outcome := h.tryServeStaleOnWakeError(w, req, app, rec)
@@ -86,7 +86,7 @@ func TestStaleOnError_BypassedOnAuth(t *testing.T) {
 	cache.Put(key, 200, http.Header{}, []byte("stale"), now.Add(-1*time.Second), now.Add(300*time.Second), rule.toStateEdgeRuleCacheAction())
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	req.Header.Set("Authorization", "Bearer x")
-	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", hashStable("")))
+	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", "", hashStable("")))
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
 	served, _ := h.tryServeStaleOnWakeError(w, req, app, rec)
@@ -109,7 +109,7 @@ func TestStaleOnError_StaleDisabledOnRule(t *testing.T) {
 	key := CacheKey{AppID: app.ID, RuleID: rule.ID, Method: "GET", NormalizedPath: "/catalog", VaryHash: hashStable("")}
 	cache.Put(key, 200, http.Header{}, []byte("stale"), now.Add(-1*time.Second), now.Add(300*time.Second), rule.toStateEdgeRuleCacheAction())
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
-	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", hashStable("")))
+	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", "", hashStable("")))
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
 	served, _ := h.tryServeStaleOnWakeError(w, req, app, rec)
@@ -129,7 +129,7 @@ func TestStaleOnError_NoEntryNoServe(t *testing.T) {
 	rule := EdgeRuleCacheResolved{ID: "rule-1", PathGlob: "/catalog", MaxAgeSeconds: 60, StaleIfErrorSeconds: 300}
 	app := App{ID: "app-1", Plan: api.PlanPro}
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
-	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", hashStable("")))
+	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", "", hashStable("")))
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
 	served, _ := h.tryServeStaleOnWakeError(w, req, app, rec)
@@ -158,7 +158,7 @@ func TestStaleOnError_FreshEntryStillNoServe(t *testing.T) {
 	key := CacheKey{AppID: app.ID, RuleID: rule.ID, Method: "GET", NormalizedPath: "/catalog", VaryHash: hashStable("")}
 	cache.Put(key, 200, http.Header{}, []byte("fresh"), now.Add(60*time.Second), now.Add(360*time.Second), rule.toStateEdgeRuleCacheAction())
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
-	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", hashStable("")))
+	req = req.WithContext(withCacheRuleContext(req.Context(), &rule, app.ID, "GET", "/catalog", "", hashStable("")))
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
 	served, _ := h.tryServeStaleOnWakeError(w, req, app, rec)

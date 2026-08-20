@@ -58,7 +58,6 @@ func TestResponseCache_NilReceiver_PassThrough(t *testing.T) {
 		t.Error("nil.Put returned true, want false")
 	}
 	c.InvalidateByApp("anything")
-	c.InvalidateByDeployment("anything")
 	c.InvalidateAll()
 	if n := c.Len(); n != 0 {
 		t.Errorf("nil.Len = %d, want 0", n)
@@ -232,24 +231,6 @@ func TestResponseCache_InvalidateByApp_DropsOnlyMatching(t *testing.T) {
 	}
 	if state, _ := c.Get(responseCacheSampleKey(2)); state != "fresh" {
 		t.Errorf("app-2 entry should remain; Get returned %q", state)
-	}
-}
-
-// TestResponseCache_InvalidateByDeployment_DropsOnlyMatching
-// pins the per-deployment invalidation surface (commit 14's
-// deploy-changed handler).
-func TestResponseCache_InvalidateByDeployment_DropsOnlyMatching(t *testing.T) {
-	c := NewResponseCacheWithClock(DefaultResponseCacheMaxBytes, time.Now)
-	now := time.Now()
-	ruleAct := &state.EdgeRuleCacheAction{MaxAgeSeconds: 60}
-	c.Put(responseCacheSampleKey(1), 200, nil, []byte("a"), now.Add(time.Minute), now.Add(2*time.Minute), ruleAct)
-	c.Put(responseCacheSampleKey(2), 200, nil, []byte("b"), now.Add(time.Minute), now.Add(2*time.Minute), ruleAct)
-	c.InvalidateByDeployment("dep-1")
-	if state, _ := c.Get(responseCacheSampleKey(1)); state != "" {
-		t.Errorf("dep-1 entry should be evicted; Get returned %q", state)
-	}
-	if state, _ := c.Get(responseCacheSampleKey(2)); state != "fresh" {
-		t.Errorf("dep-2 entry should remain; Get returned %q", state)
 	}
 }
 

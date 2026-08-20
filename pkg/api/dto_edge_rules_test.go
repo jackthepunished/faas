@@ -1023,23 +1023,37 @@ func TestEdgeRuleCacheAction_Validate_HappyPath(t *testing.T) {
 	}
 }
 
-// TestEdgeRuleCacheAction_Validate_AppliesDefaults pins that an
-// action submitted with MaxAgeSeconds=0 / StaleIfErrorSeconds=0
-// has those fields filled in to the apid-side defaults. This is
-// load-bearing: the state mirror in pkg/state/types.go carries
-// explicit values, not zeros. A future refactor that returns the
-// action without defaulting would leave a 0/0 row and silently
-// disable both fresh hits AND stale-on-error.
+// TestEdgeRuleCacheAction_Validate_AppliesDefaults pins the
+// apid-side default policy:
+//   - MaxAgeSeconds == 0 is silently coerced to the default
+//     (60 s) so a customer who omits max_age_seconds gets the
+//     friendly ADR-ask default. There is no documented
+//     "disable fresh" semantic, so this default is safe.
+//   - StaleIfErrorSeconds == 0 is the documented
+//     "disable stale-on-error" semantic per §4.1.2.15; the
+//     apid MUST NOT default it. CLI callers that omit the
+//     flag apply the default on the client side (see
+//     cmd/gregale/commands_edge_rules.go buildActionByKind);
+//     direct apid callers (dashboard, internal admin tools)
+//     pass through what the user submitted, so a row with
+//     StaleIfErrorSeconds == 0 means "user explicitly opted
+//     out of stale-on-error". This split makes the row
+//     auditable: a 300 in the DB could mean either default
+//     or explicit-300; a 0 can only mean explicit opt-out.
+//
+// This is the B4 regression fence from the medium code
+// review — silently coercing 0 to 300 made the documented
+// disable semantic unreachable through the API.
 func TestEdgeRuleCacheAction_Validate_AppliesDefaults(t *testing.T) {
 	a := EdgeRuleCacheAction{} // all zero
 	if p := a.Validate(); p != nil {
-		t.Fatalf("all-zero action returned %v, want nil (defaults should fill)", p)
+		t.Fatalf("all-zero action returned %v, want nil", p)
 	}
 	if a.MaxAgeSeconds != ResponseCacheDefaultMaxAgeSeconds {
-		t.Errorf("MaxAgeSeconds = %d, want %d", a.MaxAgeSeconds, ResponseCacheDefaultMaxAgeSeconds)
+		t.Errorf("MaxAgeSeconds = %d, want %d (apid default)", a.MaxAgeSeconds, ResponseCacheDefaultMaxAgeSeconds)
 	}
-	if a.StaleIfErrorSeconds != ResponseCacheDefaultStaleIfErrorSeconds {
-		t.Errorf("StaleIfErrorSeconds = %d, want %d", a.StaleIfErrorSeconds, ResponseCacheDefaultStaleIfErrorSeconds)
+	if a.StaleIfErrorSeconds != 0 {
+		t.Errorf("StaleIfErrorSeconds = %d, want 0 (apid MUST NOT default the documented disable semantic)", a.StaleIfErrorSeconds)
 	}
 }
 

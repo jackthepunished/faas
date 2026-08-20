@@ -854,10 +854,19 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			VaryOn:              in.CacheVaryOn,
 			Methods:             in.CacheMethods,
 		}
-		// The server's EdgeRuleCacheAction.Validate handles
-		// defaults; pass-through here so the CLI doesn't
-		// duplicate the default-apply logic (single source
-		// of truth on the server side).
+		// CLI-side defaults for fields the user omitted
+		// (flag == 0). The server's EdgeRuleCacheAction.Validate
+		// intentionally does NOT default these — 0 means
+		// "disable stale-on-error" per the spec, so a server-
+		// side default would make that documented semantic
+		// unreachable. We default here so omitting the flag
+		// still gives the user the friendly 300-s default.
+		if a.MaxAgeSeconds == 0 {
+			a.MaxAgeSeconds = api.ResponseCacheDefaultMaxAgeSeconds
+		}
+		if a.StaleIfErrorSeconds == 0 {
+			a.StaleIfErrorSeconds = api.ResponseCacheDefaultStaleIfErrorSeconds
+		}
 		return marshalAction(a)
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)

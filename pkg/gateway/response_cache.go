@@ -25,13 +25,13 @@ import (
 //     Put needs the headroom. No background sweeper goroutine
 //     — same posture as public_auth_cache.go (allocation-light,
 //     daemon-reload-friendly, no goroutine-leak surface).
-//  3. Per-app + per-deployment invalidation. NewEdgeRuleChanged
-//     triggers InvalidateByApp (cache rules reference appID);
-//     DeployEdgeRuleChanged triggers InvalidateByDeployment so
-//     a new deploy cannot serve the previous release's bodies
-//     from cache (the key already binds to deploymentID, but
-//     the invalidation path is the explicit signal for an
-//     out-of-band flow that bypasses the cache key check).
+//  3. Per-app invalidation. db.NotifyEdgeRuleChanged triggers
+//     InvalidateByApp (cache rules reference appID). A future
+//     PR plumbing CacheKey.DeploymentID from the picker path
+//     will add per-deployment invalidation at that time;
+//     until then, deploy invalidation flows through the same
+//     NotifyAppChanged hook as a coarser (whole-app) flush
+//     (cmd/gatewayd-internal/backend.go::handleInvalidation).
 //
 // The cache is NOT shared across gatewayd-internal instances
 // (ADR-122 D7): it lives in process memory, has no Redis or
@@ -66,8 +66,12 @@ type ResponseCache struct {
 //
 // AppID + DeploymentID + RuleID partition the cache so two apps
 // (or two releases of one app) can never cross-serve. Method +
-// Path discriminate per-route. VaryHash is the sha-256 of the
-// (sorted, lower-cased) vary_on header values, so the same
+// Path + Query discriminate per-route (Query is the SORTED
+// r.URL.RawQuery — sorting is the caller's job because the
+// applier already needs to canonicalise for the rule matcher;
+// without the sort, ?id=1&id=2 and ?id=2&id=1 would collide,
+// silently serving the wrong body). VaryHash is the sha-256 of
+// the (sorted, lower-cased) vary_on header values, so the same
 // (host, path, vary) tuple is a single key.
 //
 // Method is included because a kind=cache rule can target
@@ -77,30 +81,49 @@ type ResponseCache struct {
 // bounded by the rule cardinality so an unbounded per-path
 // attacker can't enumerate.
 type CacheKey struct {
-	AppID         string
-	DeploymentID  string
-	RuleID        string
-	Method        string
+	AppID          string
+	DeploymentID   string
+	RuleID         string
+	Method         string
 	NormalizedPath string
-	VaryHash      [32]byte
+	Query          string
+	VaryHash       [32]byte
 }
 
 // String returns a stable hex form for logging + tests. The
-// hot path does not call String; it indexes by the struct.
+// hot path ALSO calls String (it's the map key for Get/Put),
+// so this MUST be a stable, collision-free encoding of every
+// field — including long NormalizedPath / Query strings. The
+// previous fixed-[404]byte buffer implementation silently
+// truncated fields past 293 bytes, which caused distinct
+// URLs to collide on the same map key. The fix is a dynamic
+// buffer; the hex envelope is 2 bytes per source byte, so
+// the allocation is bounded by the size of the input fields,
+// not by a guessed ceiling.
+//
+// Field order is fixed so two keys with identical fields
+// always encode to the same string:
+//
+//   VaryHash | AppID | ':' | DeploymentID | ':' | RuleID |
+//   ':' | Method | ':' | NormalizedPath | ':' | Query
 func (k CacheKey) String() string {
-	var b [32 + 32 + 36 + 16 + 256 + 32]byte
-	copy(b[:32], k.VaryHash[:])
-	off := 32
-	off += copy(b[off:], k.AppID)
-	off += copy(b[off:], ":")
-	off += copy(b[off:], k.DeploymentID)
-	off += copy(b[off:], ":")
-	off += copy(b[off:], k.RuleID)
-	off += copy(b[off:], ":")
-	off += copy(b[off:], k.Method)
-	off += copy(b[off:], ":")
-	off += copy(b[off:], k.NormalizedPath)
-	return hex.EncodeToString(b[:off])
+	// Pre-size: 32 (varyhash) + len(fields) + 5 separators.
+	n := 32 + len(k.AppID) + len(k.DeploymentID) + len(k.RuleID) +
+		len(k.Method) + len(k.NormalizedPath) + len(k.Query) + 5
+	b := make([]byte, 0, n)
+	b = append(b, k.VaryHash[:]...)
+	b = append(b, k.AppID...)
+	b = append(b, ':')
+	b = append(b, k.DeploymentID...)
+	b = append(b, ':')
+	b = append(b, k.RuleID...)
+	b = append(b, ':')
+	b = append(b, k.Method...)
+	b = append(b, ':')
+	b = append(b, k.NormalizedPath...)
+	b = append(b, ':')
+	b = append(b, k.Query...)
+	return hex.EncodeToString(b)
 }
 
 // cacheEntry is the LRU list element. Body is the cached
@@ -317,33 +340,6 @@ func (c *ResponseCache) InvalidateByApp(appID string) {
 	for k, el := range c.data {
 		entry := el.Value.(*cacheEntry)
 		if entry.key.AppID == appID {
-			c.bytes -= len(entry.body)
-			c.list.Remove(el)
-			delete(c.data, k)
-		}
-	}
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
-}
-
-// InvalidateByDeployment drops every cached entry whose key has
-// the given DeploymentID. Used by the deploy completion handler
-// (cmd/gatewayd-internal) so a fresh deploy cannot serve the
-// previous release's bodies. The key already binds to
-// DeploymentID so a hit shouldn't occur, but the invalidation
-// is the explicit signal for any out-of-band flow (a manual
-// rollback, a mirrored edge-rule update from a different
-// deployment channel) that bypasses the cache key check.
-func (c *ResponseCache) InvalidateByDeployment(deploymentID string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for k, el := range c.data {
-		entry := el.Value.(*cacheEntry)
-		if entry.key.DeploymentID == deploymentID {
 			c.bytes -= len(entry.body)
 			c.list.Remove(el)
 			delete(c.data, k)

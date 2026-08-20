@@ -660,7 +660,7 @@ type Handler struct {
 	// from store). Production wires this from
 	// cmd/gatewayd-internal/run.go via WithResponseCache; unit
 	// tests omit it. The cache's invalidation surface lives on
-	// the cache itself (InvalidateByApp / InvalidateByDeployment
+	// the cache itself (InvalidateByApp
 	// / InvalidateAll) and is wired by the db.Notify handler in
 	// commit 14.
 	responseCache *ResponseCache
@@ -4756,6 +4756,7 @@ haveApp:
 					RuleID:         rule.ID,
 					Method:         r.Method,
 					NormalizedPath: r.URL.Path,
+					Query:          sortQuery(r.URL.RawQuery),
 					VaryHash:       computeVaryHash(r, rule.VaryOn),
 				}
 				cw.finishCacheCapture(h.responseCache, key, time.Now())
@@ -4784,7 +4785,7 @@ haveApp:
 		// re-run the matcher (the rule was already
 		// resolved above, no point doing it twice).
 		if rule != nil {
-			r = r.WithContext(withCacheRuleContext(r.Context(), rule, app.ID, r.Method, r.URL.Path, computeVaryHash(r, rule.VaryOn)))
+			r = r.WithContext(withCacheRuleContext(r.Context(), rule, app.ID, r.Method, r.URL.Path, sortQuery(r.URL.RawQuery), computeVaryHash(r, rule.VaryOn)))
 		}
 		_ = cacheRule
 	}

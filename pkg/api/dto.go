@@ -5104,14 +5104,20 @@ func (a *EdgeRuleCacheAction) Validate() *Problem {
 	// Apply apid-side defaults so the in-memory mirror in
 	// pkg/state/types.go::EdgeRuleCacheAction carries explicit
 	// values. The gateway compile step (commit 10) does NOT
-	// re-default — a zero StaleIfErrorSeconds there is the
+	// re-default — a zero MaxAgeSeconds there is the
 	// apid-submitted value, not "default". This makes "did the
 	// customer ask for stale-on-error" auditable from the row.
+	//
+	// IMPORTANT: stale_if_error_seconds == 0 is the documented
+	// "disable stale-on-error" semantic (per
+	// docs/faas_implementation_spec.md §4.1.2.15); the apid
+	// must NOT silently coerce it to 300. The
+	// ResponseCacheDefaultStaleIfErrorSeconds constant stays
+	// for callers that explicitly opt into the default (CLI
+	// when the flag is absent); see CLI handling in
+	// cmd/gregale/commands_edge_rules.go.
 	if a.MaxAgeSeconds == 0 {
 		a.MaxAgeSeconds = ResponseCacheDefaultMaxAgeSeconds
-	}
-	if a.StaleIfErrorSeconds == 0 {
-		a.StaleIfErrorSeconds = ResponseCacheDefaultStaleIfErrorSeconds
 	}
 	if a.MaxAgeSeconds < 0 {
 		return ErrValidation(fmt.Sprintf(
