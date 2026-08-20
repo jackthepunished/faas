@@ -1,3 +1,4 @@
+-- filename: 00309_apps_public_auth_ip_allowlist.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -20,13 +21,17 @@
 -- API layer (pkg/api/limits.go PublicAuthIPAllowlistMaxEntries)
 -- before SQL. Free/Hobby: 0 (gate closed). Pro: 16. Scale: 64.
 --
--- Slot note: 00308. PRs #997 (ADR-119 Static outbound IP) and
--- #991 (deploy-ux Mega-C) fence slots 00304-00307 on main as of
--- 2026-08-20; 00308 is the next free slot. Migration files are
--- append-only; renumber if a parallel PR claims 00308 first.
--- Per `docs/adr/README.md` "migrations are append-only and
--- contiguous" + the precedent set by PR #984 (issue #977,
--- 8-hop renumber) for collision rebumping.
+-- Slot note: 00309. Renumbered from 00308 after main absorbed
+-- PRs #988 (#979-b cors_presets at slot 00304) and #997 fence
+-- status changed. PR #997 (ADR-119 Static outbound IP) fences
+-- 00305-00306 and lands real at 00307; slot 00308 is bridged by
+-- a reservation fence on this PR (see 00308_reserve_slot.sql)
+-- so the embedded migration set stays contiguous {1..309}.
+-- 00309 is the next free slot above PR #997's 00307_apps_static_
+-- egress_ip.sql. Migration files are append-only; renumber if a
+-- parallel PR claims 00309 first. Per docs/adr/README.md
+-- "migrations are append-only and contiguous" + the precedent set
+-- by PR #984 (issue #977, 8-hop renumber) for collision rebumping.
 
 alter table apps
   add column if not exists public_auth_ip_allowlist cidr[] not null default '{}';
