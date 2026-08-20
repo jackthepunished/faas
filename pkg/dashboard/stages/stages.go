@@ -217,6 +217,13 @@ func assertClosedSet() {
 // row's `deployments.status` string; the dash variants pick the
 // footer branch on "live" / "failed" / anything else.
 //
+// Footer-gate symmetry (review finding C3): the entire footer
+// ("Total: …" plus the status-suffix) is suppressed when
+// totalMs == 0 AND terminalAt is the zero time — the in-flight
+// pre-first-frame case where every stage is still pending. The
+// matching gate in RenderSummaryHTML guarantees the CLI block and
+// the dashboard widget read identically on the same input.
+//
 // The caller should gate on output.Enabled() for TTY vs static —
 // the rows use the same column-aligned format the LiveTicker's
 // ttyLiveTicker emits, so a non-TTY caller that wants the raw text
@@ -287,30 +294,41 @@ func RenderSummaryText(w io.Writer, ss state.StageState, status string, terminal
 		}
 	}
 
-	if _, err := fmt.Fprintf(w, "\n  Total: %s", FormatStageDuration(totalMs, stageStatusCompleted, "")); err != nil {
-		return fmt.Errorf("RenderSummaryText: write total: %w", err)
-	}
-	if !terminalAt.IsZero() {
-		switch status {
-		case "live":
-			if _, err := fmt.Fprintf(w, " · live since %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
-				return fmt.Errorf("RenderSummaryText: write live since: %w", err)
-			}
-		case stageStatusFailed:
-			if _, err := fmt.Fprintf(w, " · failed at %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
-				return fmt.Errorf("RenderSummaryText: write failed at: %w", err)
-			}
-		default:
-			// superseded / cancelled — render the raw status as
-			// a hint so the customer knows why their terminal
-			// row didn't carry the ✓ Deployed line.
-			if _, err := fmt.Fprintf(w, " · %s at %s", status, terminalAt.UTC().Format(time.RFC3339)); err != nil {
-				return fmt.Errorf("RenderSummaryText: write %s at: %w", status, err)
+	// Footer gate (matches RenderSummaryHTML): only emit the
+	// "Total: …" / "<status> at <ts>" line when there's something
+	// meaningful to report. totalMs==0 && terminalAt.IsZero()
+	// means every stage is still pending (in-flight pre-first-frame
+	// or an entirely empty StageState that the caller still
+	// invoked Render* on) — Text and HTML must agree on whether
+	// the footer is suppressed so the two surfaces stay in
+	// lock-step. Keeping the CLI and dashboard reading identically
+	// on the same row.
+	if totalMs > 0 || !terminalAt.IsZero() {
+		if _, err := fmt.Fprintf(w, "\n  Total: %s", FormatStageDuration(totalMs, stageStatusCompleted, "")); err != nil {
+			return fmt.Errorf("RenderSummaryText: write total: %w", err)
+		}
+		if !terminalAt.IsZero() {
+			switch status {
+			case "live":
+				if _, err := fmt.Fprintf(w, " · live since %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
+					return fmt.Errorf("RenderSummaryText: write live since: %w", err)
+				}
+			case stageStatusFailed:
+				if _, err := fmt.Fprintf(w, " · failed at %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
+					return fmt.Errorf("RenderSummaryText: write failed at: %w", err)
+				}
+			default:
+				// superseded / cancelled — render the raw status as
+				// a hint so the customer knows why their terminal
+				// row didn't carry the ✓ Deployed line.
+				if _, err := fmt.Fprintf(w, " · %s at %s", status, terminalAt.UTC().Format(time.RFC3339)); err != nil {
+					return fmt.Errorf("RenderSummaryText: write %s at: %w", status, err)
+				}
 			}
 		}
-	}
-	if _, err := fmt.Fprintln(w); err != nil {
-		return fmt.Errorf("RenderSummaryText: write footer newline: %w", err)
+		if _, err := fmt.Fprintln(w); err != nil {
+			return fmt.Errorf("RenderSummaryText: write footer newline: %w", err)
+		}
 	}
 	return nil
 }
@@ -334,9 +352,16 @@ func RenderSummaryText(w io.Writer, ss state.StageState, status string, terminal
 //	  <span class="duration">1.2s</span>
 //	</div>
 //
-// Footer markup (only when terminalAt is set):
+// Footer markup (only when totalMs > 0 OR terminalAt is set):
 //
 //	<p class="stage-footer">Total: 29.1s · live since 2026-08-19 18:42 UTC</p>
+//
+// Footer-gate symmetry (review finding C3): the entire <p> is
+// suppressed when totalMs == 0 AND terminalAt is the zero time —
+// the in-flight pre-first-frame case where every stage is still
+// pending. The matching gate in RenderSummaryText guarantees the
+// CLI block and the dashboard widget read identically on the same
+// input.
 //
 // Caller is responsible for the surrounding <h2>Stages</h2> heading
 // (the template owns that — this package only emits the content).

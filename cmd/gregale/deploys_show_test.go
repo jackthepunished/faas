@@ -194,6 +194,44 @@ func TestCmdDeploysShow_NoArgs(t *testing.T) {
 	}
 }
 
+// TestCmdDeploysShow_FlagOrder — review finding C4. The natural
+// `gregale deploys show <id> --status` should work the same as
+// `gregale deploys show --status <id>`. Pre-fix, stdlib
+// flag.NewFlagSet stops at the first positional, leaving
+// `--status` unparsed in fs.Args(); the NArg==2 check then
+// returned a confusing usage error. Post-fix, splitFlagArgs
+// reorders argv so flags come first; both forms hit the same
+// happy path.
+func TestCmdDeploysShow_FlagOrder(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	srv := showServerDual(t,
+		stageStateAllCompleted(now),
+		deploymentResponseLive(showTestID, now),
+		showServerHooks{},
+	)
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restoreStdout := swapStdout(t)
+	defer restoreStdout()
+	jsonOutput = false
+	defer func() { jsonOutput = false }()
+
+	// Form A: flags before positional — was working pre-fix.
+	if code := cmdDeploysShow([]string{"--status", showTestID}); code != 0 {
+		t.Fatalf("cmdDeploysShow [--status id] = %d, want 0", code)
+	}
+	// Form B: positional before flag — review finding C4.
+	if code := cmdDeploysShow([]string{showTestID, "--status"}); code != 0 {
+		t.Fatalf("cmdDeploysShow [id --status] = %d, want 0 (review finding C4)", code)
+	}
+	// Both forms must produce equivalent output (the post-stream
+	// block + footer). Spot-check the live footer on form B.
+	if !strings.Contains(stdout.String(), "live since") {
+		t.Errorf("expected 'live since' footer from form B\nfull: %s", stdout.String())
+	}
+}
+
 // TestCmdDeploys_Dispatcher: the verb-level dispatcher routes
 // `show` correctly and rejects unknown subcommands. Pins the
 // main.go switch arm and the cli_meta subcommand entry.
@@ -222,15 +260,29 @@ func TestCmdDeploys_Dispatcher(t *testing.T) {
 var _ = io.Discard
 
 // showServerHooks is the per-path hook struct for showServerDual.
-// Used by the parallel-fetch test to introduce a delay on the
-// deployment-row endpoint so the test can assert the round-trip
-// total < 75ms (proving the two fetches ran in parallel).
+// Used by the parallel-fetch test to introduce per-endpoint
+// delays + payloads so the test can assert the round-trip total
+// is below the sum-of-delays threshold (proving the two fetches
+// ran in parallel, not serially).
+//
+// Two fields, both keyed by URL path:
+//
+//   - Delays: a wall-clock delay (time.Sleep) the handler waits
+//     before responding. Use the same value on both endpoints to
+//     prove the errgroup fan-out is parallel (serial would take
+//     2*delay; parallel takes ~delay).
+//   - Payloads: an explicit per-path response body. When set,
+//     overrides the default stagesPayload/depPayload from the
+//     showServerDual arguments. Empty byte slice falls through
+//     to the default payload.
+//
+// A path that has a Delay but no Payload still uses the default
+// payload — useful for the "delay only" test (e.g. parallel
+// assertions where both endpoints echo the canonical happy-path
+// payload).
 type showServerHooks struct {
-	// Handlers is a path-keyed override map. When a request hits
-	// a path in this map, the matching handler is invoked INSTEAD
-	// of the default dual-endpoint dispatch. Empty handler map
-	// falls through to the standard 200 responses.
-	Handlers map[string]http.HandlerFunc
+	Delays   map[string]time.Duration
+	Payloads map[string][]byte
 }
 
 // showServerDual returns an httptest server that speaks BOTH
@@ -240,33 +292,41 @@ type showServerHooks struct {
 // can construct a "live" or "failed" stub without rebuilding
 // the stage_state.
 //
-// A non-empty hooks.Handlers map lets the test insert delays
-// (for the parallel-fetch assertion) and per-path custom
-// responses. The zero value of hooks is the "happy path"
-// (both endpoints 200, both payloads returned).
+// The hooks struct lets the test insert per-path delays (for
+// the parallel-fetch assertion) and per-path custom responses.
+// The zero value of hooks is the "happy path" (both endpoints
+// 200, both default payloads returned, no delays).
 func showServerDual(t *testing.T, stagesPayload, depPayload []byte, hooks showServerHooks) *httptest.Server {
 	t.Helper()
-	if hooks.Handlers == nil {
-		hooks.Handlers = map[string]http.HandlerFunc{}
+	if hooks.Delays == nil {
+		hooks.Delays = map[string]time.Duration{}
+	}
+	if hooks.Payloads == nil {
+		hooks.Payloads = map[string][]byte{}
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Per-path hook (used by the parallel-fetch test to
-		// introduce a 50ms delay on /v1/deployments/{id}).
-		if h, ok := hooks.Handlers[r.URL.Path]; ok {
-			h(w, r)
-			return
+		// Per-path delay (parallel-fetch test) — Sleep BEFORE
+		// the response so the goroutine truly waits. Two paths
+		// can delay simultaneously, proving the errgroup fan-out
+		// is parallel.
+		if d, ok := hooks.Delays[r.URL.Path]; ok && d > 0 {
+			time.Sleep(d)
 		}
 		// Dispatch the closed-set wire shape based on the
 		// trailing path element (with or without /stages).
 		var payload []byte
-		switch r.URL.Path {
-		case "/v1/deployments/" + showTestID + "/stages":
-			payload = stagesPayload
-		case "/v1/deployments/" + showTestID:
-			payload = depPayload
-		default:
-			http.NotFound(w, r)
-			return
+		if p, ok := hooks.Payloads[r.URL.Path]; ok {
+			payload = p
+		} else {
+			switch r.URL.Path {
+			case "/v1/deployments/" + showTestID + "/stages":
+				payload = stagesPayload
+			case "/v1/deployments/" + showTestID:
+				payload = depPayload
+			default:
+				http.NotFound(w, r)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -320,6 +380,27 @@ func deploymentResponseFailed(id string, createdAt time.Time) []byte {
 	return b
 }
 
+// deploymentResponseSuperseded mirrors deploymentResponseLive
+// with status="superseded". Used by TestCmdDeploysStatus_Superseded
+// (review finding C1) to pin the depCreatedAt footer branch.
+func deploymentResponseSuperseded(id string, createdAt time.Time) []byte {
+	type resp struct {
+		ID        string `json:"id"`
+		AppID     string `json:"app_id"`
+		Kind      string `json:"kind"`
+		Status    string `json:"status"`
+		CreatedAt string `json:"created_at"`
+	}
+	b, _ := json.Marshal(resp{
+		ID:        id,
+		AppID:     "app-1",
+		Kind:      "image",
+		Status:    "superseded",
+		CreatedAt: createdAt.Format(time.RFC3339Nano),
+	})
+	return b
+}
+
 // TestCmdDeploysShow_WithStatusFlag — A1 (ADR-117 v2 follow-on).
 // Pins the --status path on `deploys show <id>`: the CLI must
 // fan-out via errgroup to fetch BOTH /v1/deployments/{id}/stages
@@ -328,10 +409,19 @@ func deploymentResponseFailed(id string, createdAt time.Time) []byte {
 // renders with the "live since <ts>" footer when status="live".
 func TestCmdDeploysShow_WithStatusFlag(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
-	srv := showServer(t, stageStateAllCompleted(now), map[string]bool{
-		"/v1/deployments/" + showTestID + "/stages": true,
-		"/v1/deployments/" + showTestID:             true,
-	})
+	// Use showServerDual so BOTH endpoints respond 200 — the
+	// dep endpoint carries status="live" so deriveTerminalAt
+	// anchors on the first history row's StartedAt (now-30s)
+	// and the render prints "live since <ts>". Pre-fix this
+	// test used the single-payload showServer which only
+	// responded on the stages endpoint; the dep 404 silently
+	// swallowed and the test couldn't actually pin the
+	// footer branch.
+	srv := showServerDual(t,
+		stageStateAllCompleted(now),
+		deploymentResponseLive(showTestID, now),
+		showServerHooks{},
+	)
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
@@ -354,20 +444,12 @@ func TestCmdDeploysShow_WithStatusFlag(t *testing.T) {
 		}
 	}
 	// The footer branch is status-driven (status="live" → "live
-	// since <ts>"). The stub server returns the default
-	// "deployment row" shape, so the status is empty in the
-	// test stub — but the FIRST history row's StartedAt is
-	// 2026-08-19T11:59:30Z (now-30s), so the footer's
-	// deriveTerminalAt(ss, "live") returns it. The renderer's
-	// task is just to print "live since" against the timestamp
-	// the helper derives. Empty-status stub means the footer is
-	// NOT printed (the test pins the absence of the footer
-	// because the stub didn't set status="live"); what we
-	// genuinely pin here is the parallel fetch (both endpoints
-	// were hit) and the closed-set render path.
-	//
-	// The status-driven footer is separately pinned in
-	// TestCmdDeploysStatus_HappyPath (deploys_status_test.go).
+	// since <ts>"). The first history row's StartedAt is
+	// now-30s; the stub server returns status="live" so the
+	// footer's deriveTerminalAt returns *that* row's StartedAt.
+	if !strings.Contains(got, "live since") {
+		t.Errorf("expected 'live since' footer with --status\nfull: %s", got)
+	}
 }
 
 // TestCmdDeploysShow_RejectsBadFlag — A1: flags must be parsed by

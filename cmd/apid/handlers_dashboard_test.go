@@ -988,7 +988,7 @@ func TestAppsListSLOLoop_PointersAreDistinct(t *testing.T) {
 // TestDashboardStagePayload — A2 (ADR-117 v2 follow-on). Pins the
 // dashboard handler's projection of state.Deployment → dashboard.StagePayload.
 //
-// Three branches:
+// Four branches:
 //
 //   - empty stage_state (pre-00302 OR in-flight pre-first-frame)
 //     returns StagePayload{}, nil — the template omits the section.
@@ -997,6 +997,10 @@ func TestAppsListSLOLoop_PointersAreDistinct(t *testing.T) {
 //   - the "live since <ts>" footer.
 //   - non-empty stage_state with a failed row returns the failed
 //     row's footer.
+//   - non-empty stage_state with status="superseded" anchors the
+//     footer on d.CreatedAt (review finding C1; the pre-fix code
+//     returned time.Time{} for superseded, silently dropping the
+//     footer).
 //
 // IDOR posture is owned by the renderDeploymentDetail caller
 // (AppBySlug + AccountID + DeploymentByID + AppID checks); the
@@ -1078,6 +1082,48 @@ func TestDashboardStagePayload(t *testing.T) {
 		}
 		if got.Status != "failed" {
 			t.Errorf("Status = %q, want %q", got.Status, "failed")
+		}
+	})
+
+	// Review finding C1 (mirrors cmd/gregale/deploys_show_test.go):
+	// dashboardStageTerminalAt handles the "superseded" branch by
+	// anchoring on d.CreatedAt. Pre-fix code returned time.Time{}
+	// for any status other than "live"/"failed", leaving the
+	// operator looking at a stage table with no terminal anchor
+	// even though deployments.status said "superseded".
+	t.Run("superseded-anchors-on-created-at", func(t *testing.T) {
+		now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+		ss := state.StageState{
+			History: []state.StageStateItem{
+				{Name: state.StageSourceDownload, StartedAt: &now, EndedAt: tPtr(now.Add(1 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageDependencyRestore, StartedAt: &now, EndedAt: tPtr(now.Add(2 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageImageBuild, StartedAt: &now, EndedAt: tPtr(now.Add(3 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSecurityScan, StartedAt: &now, EndedAt: tPtr(now.Add(4 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSnapshotPrepare, StartedAt: &now, EndedAt: tPtr(now.Add(5 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageReadiness, StartedAt: &now, EndedAt: tPtr(now.Add(6 * time.Second)), DurationMs: 1000, Status: "completed"},
+			},
+		}
+		raw, _ := json.Marshal(ss)
+		d := state.Deployment{
+			ID: "d-3", Status: state.DeploySuperseded,
+			StageState: raw, CreatedAt: now,
+		}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload superseded: %v", err)
+		}
+		wantTs := now.UTC().Format(time.RFC3339)
+		if !strings.Contains(string(got.BodyHTML), "superseded at "+wantTs) {
+			t.Errorf("expected 'superseded at %s' footer\nfull: %s", wantTs, got.BodyHTML)
+		}
+		if strings.Contains(string(got.BodyHTML), "live since") {
+			t.Errorf("superseded render must NOT contain 'live since'\nfull: %s", got.BodyHTML)
+		}
+		if strings.Contains(string(got.BodyHTML), "failed at") {
+			t.Errorf("superseded render must NOT contain 'failed at'\nfull: %s", got.BodyHTML)
+		}
+		if got.Status != "superseded" {
+			t.Errorf("Status = %q, want %q", got.Status, "superseded")
 		}
 	})
 }

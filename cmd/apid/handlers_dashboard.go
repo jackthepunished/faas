@@ -1812,7 +1812,7 @@ func dashboardStagePayload(d state.Deployment) (dashboard.StagePayload, error) {
 		return dashboard.StagePayload{}, err
 	}
 	status := string(d.Status)
-	terminalAt := dashboardStageTerminalAt(ss, status)
+	terminalAt := dashboardStageTerminalAt(ss, status, d.CreatedAt)
 	html := stages.RenderSummaryHTML(ss, status, terminalAt)
 	if html == "" {
 		// Empty history + empty current — caller sees a nil
@@ -1832,7 +1832,15 @@ func dashboardStagePayload(d state.Deployment) (dashboard.StagePayload, error) {
 // row whose StartedAt / EndedAt supplies the "live since" /
 // "failed at" copy. The two paths are physically separate so
 // a future refactor must update both.
-func dashboardStageTerminalAt(ss state.StageState, status string) time.Time {
+//
+// Review finding C1 (closed by this signature widening): the
+// pre-fix version only handled live/failed and silently returned
+// time.Time{} for superseded, leaving the customer looking at a
+// stage table with no terminal anchor even though deployments.status
+// said "superseded". The CLI's deriveTerminalAt has the same fix
+// applied (same depCreatedAt argument) so the two surfaces stay
+// in lock-step.
+func dashboardStageTerminalAt(ss state.StageState, status string, depCreatedAt time.Time) time.Time {
 	switch status {
 	case "live":
 		if len(ss.History) > 0 && ss.History[0].StartedAt != nil {
@@ -1844,6 +1852,13 @@ func dashboardStageTerminalAt(ss state.StageState, status string) time.Time {
 				return *item.EndedAt
 			}
 		}
+	case "superseded":
+		// depCreatedAt is the deployment row's insert
+		// timestamp; for a superseded row this is when the new
+		// deployment that replaced it was created. The zero
+		// value is a safe fallback (caller's terminalAt.IsZero()
+		// gate skips the footer).
+		return depCreatedAt
 	}
 	return time.Time{}
 }

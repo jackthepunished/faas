@@ -164,15 +164,6 @@ const (
 	// /v1/deployments/{id} for the footer timestamp).
 	dispatchDeploys = "deploys"
 
-	// Subcommand name for `gregale deploys status <id>` (the
-	// terminal-status preview). Re-uses statusLiteral (this same
-	// const literal also appears in the account status subcommand
-	// route — goconst requires the constant be reused, not bare
-	// "status"). The const here anchors the dispatch table entry;
-	// the cmdDeploys case arm at deploys_show.go:317 uses
-	// statusLiteral directly so the two paths stay in lock-step.
-	dispatchDeploysStatus = "status"
-
 	// Error-explanations cluster (spec §6.4 amendment 1):
 	// customer preflight that scans the local cwd for the 8
 	// source-side failure modes the cluster's runtime detectors

@@ -208,6 +208,29 @@ func TestRenderSummaryText_NoTerminalAt(t *testing.T) {
 	}
 }
 
+// TestRenderSummaryText_AllPendingNoFooter asserts the CLI/dashboard
+// footer-gate symmetry contract (review finding C3):
+// when totalMs==0 AND terminalAt is zero (every stage still
+// pending, in-flight pre-first-frame) BOTH renderers omit the
+// footer entirely. Without this pin, RenderSummaryText emits
+// "Total: 0.0s" while RenderSummaryHTML omits the <p> — a silent
+// CLI/dashboard drift.
+func TestRenderSummaryText_AllPendingNoFooter(t *testing.T) {
+	ss := state.StageState{} // empty history, empty current — fully pending.
+	var buf bytes.Buffer
+	if err := RenderSummaryText(&buf, ss, "live", time.Time{}); err != nil {
+		t.Fatalf("RenderSummaryText returned error: %v", err)
+	}
+	if strings.Contains(buf.String(), "Total:") {
+		t.Errorf("expected no Total: line for all-pending + zero terminalAt, got %q", buf.String())
+	}
+	// Mirror assertion on the HTML renderer.
+	html := string(RenderSummaryHTML(ss, "live", time.Time{}))
+	if strings.Contains(html, "Total:") {
+		t.Errorf("expected no Total: in HTML for all-pending + zero terminalAt, got %q", html)
+	}
+}
+
 // TestRenderSummaryText_FailedFooter asserts the failed branch
 // picks the "failed at" footer text. Mirrors the customer use
 // case of a deployment that errored mid-build.

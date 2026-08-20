@@ -58,6 +58,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -94,10 +95,21 @@ const deploysStatusUsage = "usage: gregale deploys status <id> [--json]"
 //   - stdout is pipe / NO_COLOR set  → same closed 6-row block
 //     (no ANSI redraw, just plain print); output.Enabled() is
 //     the single source of truth.
+//
+// Flag-position tolerance (review finding C4): stdlib
+// flag.NewFlagSet stops parsing at the first positional, so the
+// natural `gregale deploys show <id> --status` would otherwise
+// leave `--status` unparsed and trip the NArg()==2 usage error.
+// The splitFlagArgs helper reorders the argv so flags come
+// before the positional regardless of input order — the operator
+// sees the same behaviour whether they write
+// `gregale deploys show --status <id>` or
+// `gregale deploys show <id> --status`.
 func cmdDeploysShow(args []string) int {
 	fs := flag.NewFlagSet("deploys show", flag.ContinueOnError)
 	withStatus := fs.Bool("status", false, "include terminal-status footer (live since / failed at)")
-	if err := fs.Parse(args); err != nil {
+	reordered := splitFlagArgs(args)
+	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
 	if fs.NArg() != 1 {
@@ -147,7 +159,18 @@ func cmdDeploysShow(args []string) int {
 	var terminalAt time.Time
 	if *withStatus && dep != nil {
 		status = dep.Status
-		terminalAt = deriveTerminalAt(ss, status)
+		var createdAt time.Time
+		// dep.CreatedAt is wire-formatted (RFC3339Nano); parse
+		// best-effort and fall through to the zero value on a
+		// parse error (caller's terminalAt.IsZero() gate skips
+		// the footer). The string is server-side canonically
+		// formatted so this should not happen in practice.
+		if dep.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, dep.CreatedAt); err == nil {
+				createdAt = t
+			}
+		}
+		terminalAt = deriveTerminalAt(ss, status, createdAt)
 	}
 	if err := renderDeploySummary(osStdout, ss, status, terminalAt); err != nil {
 		// Render failures (closed-set drift, broken pipe) are
@@ -203,7 +226,18 @@ func cmdDeploysStatus(args []string) int {
 		return jsonOut(writeJSON(ss))
 	}
 	status := dep.Status
-	terminalAt := deriveTerminalAt(ss, status)
+	var createdAt time.Time
+	// dep.CreatedAt is wire-formatted (RFC3339Nano); parse
+	// best-effort. The string is server-side canonically
+	// formatted so a parse error is unexpected — fall through
+	// to the zero value on error (caller's terminalAt.IsZero()
+	// gate skips the footer for the superseded branch).
+	if dep.CreatedAt != "" {
+		if t, err := time.Parse(time.RFC3339Nano, dep.CreatedAt); err == nil {
+			createdAt = t
+		}
+	}
+	terminalAt := deriveTerminalAt(ss, status, createdAt)
 	if err := renderDeploySummary(osStdout, ss, status, terminalAt); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "warning: stage summary render failed: %v\n", err)
 	}
@@ -216,6 +250,39 @@ func cmdDeploysStatus(args []string) int {
 // read symmetrically — the helper is a small enough piece that
 // a single boolean is the cleanest contract.
 const wantDeploySummaryFooter = true
+
+// splitFlagArgs reorders argv so every flag (anything starting
+// with "-" or "--") comes before every positional, then any
+// "=value" suffix is preserved. This is the stdlib flag.NewFlagSet
+// idiom for "accept flags anywhere" — without it, fs.Parse stops
+// at the first positional and trailing flags end up in fs.Args()
+// silently, surfacing as a confusing usage error.
+//
+// Examples:
+//
+//	splitFlagArgs([]string{"--status", "<id>"})  → ["--status", "<id>"]
+//	splitFlagArgs([]string{"<id>", "--status"})  → ["--status", "<id>"]
+//	splitFlagArgs([]string{"<id>", "--json"})    → ["--json", "<id>"]
+//	splitFlagArgs([]string{"--status", "<id>", "--json"}) → ["--status", "--json", "<id>"]
+//
+// Used only by cmdDeploysShow — other subcommands either accept
+// no flags (`deploys status`) or use a different parsing shape.
+// Negative numbers (e.g. `-1`) are preserved as positionals by
+// the leading-minus check; `--` itself is treated as a flag (the
+// stdlib also handles it as a "stop parsing" sentinel — the
+// caller can extend if needed).
+func splitFlagArgs(args []string) []string {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	return append(flags, positionals...)
+}
 
 // fetchDeploySummaryInputs fans out the two GETs that the
 // post-stream summary needs:
@@ -281,10 +348,11 @@ func fetchDeploySummaryInputs(ctx context.Context, client *api.Client, id string
 //     StartedAt is the pipeline's go-live moment.
 //   - "failed"    → the EndedAt of the failed row. The customer's
 //     anchor for "when did this break".
-//   - superseded  → the deployment's CreatedAt (set on the
-//     Deployment row the client already fetched). The new
-//     deployment that superseded this one rolled forward at that
-//     timestamp.
+//   - superseded  → depCreatedAt. The new deployment that
+//     superseded this one rolled forward at that timestamp; the
+//     deployment row itself was created at the same instant
+//     (the row insert and the state machine transition to
+//     superseded fire in the same imaged chokepoint).
 //   - default     → zero time. Caller treats this as "footer
 //     omitted"; the safe default when status is unrecognised.
 //
@@ -292,7 +360,13 @@ func fetchDeploySummaryInputs(ctx context.Context, client *api.Client, id string
 // surfaced as-is (zero time). The renderer's terminalAt.IsZero()
 // gate must NOT print a footer for these — see
 // pkg/dashboard/stages.RenderSummaryText.
-func deriveTerminalAt(ss state.StageState, status string) time.Time {
+//
+// Review finding C1 (closed by this signature widening): the
+// pre-fix version only handled live/failed and silently returned
+// time.Time{} for superseded, which left the operator looking at
+// a stage table with no terminal anchor even though the
+// deployment's status column said "superseded".
+func deriveTerminalAt(ss state.StageState, status string, depCreatedAt time.Time) time.Time {
 	switch status {
 	case "live":
 		if len(ss.History) > 0 && ss.History[0].StartedAt != nil {
@@ -304,6 +378,13 @@ func deriveTerminalAt(ss state.StageState, status string) time.Time {
 				return *item.EndedAt
 			}
 		}
+	case "superseded":
+		// depCreatedAt is the deployment row's insert timestamp;
+		// for a superseded row this is when the new deployment
+		// that replaced it was created. The zero value is a
+		// safe fallback (caller's terminalAt.IsZero() gate skips
+		// the footer).
+		return depCreatedAt
 	}
 	return time.Time{}
 }
@@ -330,7 +411,13 @@ func cmdDeploys(args []string) int {
 	switch args[0] {
 	case "show":
 		return cmdDeploysShow(args[1:])
-	case dispatchDeploysStatus:
+	case statusLiteral:
+		// Re-uses statusLiteral (the canonical "status" const
+		// shared with the top-level `gregale status` subcommand
+		// route) so the two paths stay in lock-step. Review
+		// finding C2 closed the pre-fix shape (which had a
+		// parallel dispatchDeploysStatus const that drifted
+		// silently if anyone renamed statusLiteral).
 		return cmdDeploysStatus(args[1:])
 	}
 	PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status)", "deploys")

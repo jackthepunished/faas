@@ -12,7 +12,6 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -124,30 +123,32 @@ func TestCmdDeploysStatus_Failed(t *testing.T) {
 
 // TestCmdDeploysStatus_ParallelFetches — A1: the errgroup fan-out
 // over GetDeployment + GetDeploymentStages runs in parallel.
-// Proves the parallelization by inserting a 50ms delay on the
-// deployment-row endpoint and asserting the total round-trip
-// latency is < 75ms (the stages endpoint should fire
-// concurrently and not wait for the slow one).
+// Proves the parallelization by inserting a 50ms delay on BOTH
+// endpoints and asserting the total round-trip latency is below
+// the sum-of-delays threshold (90ms < 100ms = 2*50ms serial).
 //
-// The threshold is generous (50ms budget vs 75ms gate) so the
-// test is robust to CI scheduler jitter — a serial fan-out
-// would take ~50ms+ and fail the gate, a parallel fan-out
-// takes ~50ms and passes comfortably.
+// Review finding C5: the pre-fix version only delayed ONE
+// endpoint (50ms depPath). A serial fan-out also finishes in
+// ~51ms and the test passes — the assertion was a false
+// positive. Post-fix, both endpoints carry 50ms, so:
+//
+//   - parallel fan-out: ~50ms (max of the two, fired concurrently)
+//   - serial fan-out:   ~100ms (50ms + 50ms sequential)
+//
+// The 90ms gate fails serial cleanly while keeping the test
+// robust to CI scheduler jitter (50ms + 40ms scheduler overhead
+// stays comfortably under).
 func TestCmdDeploysStatus_ParallelFetches(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	stagesPath := "/v1/deployments/" + showTestID + "/stages"
 	depPath := "/v1/deployments/" + showTestID
 	hooks := showServerHooks{
-		Handlers: map[string]http.HandlerFunc{
-			depPath: func(w http.ResponseWriter, r *http.Request) {
-				// 50ms delay on the deployment-row endpoint.
-				time.Sleep(50 * time.Millisecond)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write(deploymentResponseLive(showTestID, now))
-			},
+		Delays: map[string]time.Duration{
+			stagesPath: 50 * time.Millisecond,
+			depPath:    50 * time.Millisecond,
 		},
 	}
-	srv := showServerDual(t, stageStateAllCompleted(now), nil, hooks)
+	srv := showServerDual(t, stageStateAllCompleted(now), deploymentResponseLive(showTestID, now), hooks)
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
@@ -161,17 +162,61 @@ func TestCmdDeploysStatus_ParallelFetches(t *testing.T) {
 		t.Fatalf("cmdDeploysStatus parallel = %d, want 0", code)
 	}
 	elapsed := time.Since(start)
-	// Parallel fan-out: ~50ms (the slow endpoint, in parallel
-	// with the fast one). Serial fan-out: ~50ms + the stages
-	// endpoint latency. Threshold 75ms keeps the test robust
-	// to CI scheduler jitter while still failing serial
-	// fan-outs.
-	if elapsed > 75*time.Millisecond {
-		t.Errorf("parallel fetch took %v, want < 75ms (proves errgroup fan-out)", elapsed)
+	// Parallel fan-out: ~50ms (both endpoints fire concurrently;
+	// the wall clock is the max of the two). Serial fan-out:
+	// ~100ms (50ms + 50ms sequential). Threshold 90ms fails
+	// serial cleanly while tolerating CI scheduler jitter.
+	if elapsed > 90*time.Millisecond {
+		t.Errorf("parallel fetch took %v, want < 90ms (proves errgroup fan-out; serial would be ~100ms)", elapsed)
 	}
 	// Output must still render — the parallel fetch succeeded.
 	if !strings.Contains(stdout.String(), "Source downloaded") {
 		t.Errorf("missing 'Source downloaded' label after parallel fetch\nfull: %s", stdout.String())
+	}
+}
+
+// TestCmdDeploysStatus_Superseded — review finding C1:
+// deriveTerminalAt (cmd/gregale/deploys_show.go) handles the
+// "superseded" branch by anchoring on depCreatedAt (the
+// deployment row's insert timestamp). The pre-fix code returned
+// time.Time{} for any status other than "live"/"failed", which
+// left the operator looking at a stage table with no terminal
+// anchor even though deployments.status said "superseded". This
+// test pins the fix.
+//
+// Pins:
+//   - the footer renders "superseded at <depCreatedAt>"
+//   - the footer does NOT carry "live since" or "failed at"
+//   - the footer anchor matches the dep row's CreatedAt (NOT
+//     any history-row timestamp)
+func TestCmdDeploysStatus_Superseded(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	srv := showServerDual(t,
+		stageStateAllCompleted(now),
+		deploymentResponseSuperseded(showTestID, now),
+		showServerHooks{},
+	)
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restoreStdout := swapStdout(t)
+	defer restoreStdout()
+	jsonOutput = false
+	defer func() { jsonOutput = false }()
+
+	if code := cmdDeploysStatus([]string{showTestID}); code != 0 {
+		t.Fatalf("cmdDeploysStatus superseded = %d, want 0", code)
+	}
+	got := stdout.String()
+	wantTs := now.UTC().Format(time.RFC3339)
+	if !strings.Contains(got, "superseded at "+wantTs) {
+		t.Errorf("expected 'superseded at %s' footer for status=superseded\nfull: %s", wantTs, got)
+	}
+	if strings.Contains(got, "live since") {
+		t.Errorf("superseded render must NOT contain 'live since'\nfull: %s", got)
+	}
+	if strings.Contains(got, "failed at") {
+		t.Errorf("superseded render must NOT contain 'failed at'\nfull: %s", got)
 	}
 }
 
