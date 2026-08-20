@@ -88,11 +88,13 @@ func (r doctorReport) HasErrors() bool {
 	return false
 }
 
-// HasWarnings reports whether any check returned status="warn"
-// (without any "error"). Used by the deploy path to decide
-// whether to print the report + continue (warn) or print + exit 1
-// (error). The standalone cmdDoctor keeps the warn-only exit-0
-// default; this helper makes the deploy path's branch explicit.
+// HasWarnings reports whether any check returned status="warn",
+// regardless of whether any "error" is also present. The deploy
+// path calls HasErrors first and short-circuits on error, so this
+// helper is only consulted when no error was found — but the
+// implementation does not assume that ordering. Standalone
+// cmdDoctor (line 138 below) uses this to render warn findings on
+// a clean run; --strict promotes warn → exit 1.
 func (r doctorReport) HasWarnings() bool {
 	for _, c := range r.Checks {
 		if c.Status == "warn" {
@@ -137,18 +139,13 @@ func cmdDoctor(args []string) int {
 	}
 	report := runDoctorChecks(abs)
 	// Honour --strict: a warn under strict promotes to exit 1.
-	hasError := false
-	hasWarn := false
-	for _, c := range report.Checks {
-		switch c.Status {
-		case "error":
-			hasError = true
-		case "warn":
-			hasWarn = true
-		}
-	}
+	// Use the doctorReport helpers so the standalone cmdDoctor
+	// exit semantics stay in sync with `gregale deploy --doctor-strict`
+	// (commands2.go:1097). A future check that adds a new status
+	// value (e.g. "skipped") only needs to extend the helpers,
+	// not three parallel iteration sites.
 	exit := 0
-	if hasError || (*strict && hasWarn) {
+	if report.HasErrors() || (*strict && report.HasWarnings()) {
 		exit = 1
 	}
 	if *jsonOut {

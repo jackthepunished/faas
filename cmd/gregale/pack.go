@@ -1017,7 +1017,15 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 	// preflight that lifts the cluster's source-side hints via the
 	// whycopy catalog. Hints are printed after the deploy summary by
 	// the caller (cmdDeploy). The preflight does NOT fail the deploy.
-	for _, hint := range runPackPreflight(srcDir) {
+	//
+	// Cluster A: when --doctor-strict already ran runDoctorChecks on
+	// srcDir (commands2.go:1097), the same loopback-bind + arch-mismatch
+	// scans are already in the doctor's report. Skip the second
+	// filepath.Walk per check to avoid ~2× the file-system overhead
+	// on the customer's hot path. The doctor is fail-fast on errors
+	// but still emits warn-only hints for these two — the post-deploy
+	// summary remains useful for callers without --doctor-strict.
+	for _, hint := range runPackPreflight(srcDir, doctorPreflightRan) {
 		PrintWarn(osStderr, "%s", hint)
 	}
 
@@ -1045,6 +1053,13 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 // for hint prose — same path as cmdDoctor and the post-failure
 // renderer.
 //
+// Cluster A: when skipDoctorScan is true, the loopback-bind and
+// arch-mismatch scans are skipped because `gregale deploy --doctor-strict`
+// already ran runDoctorChecks on the same srcDir. The deploy wire-in
+// (commands2.go:1097) sets `doctorPreflightRan = true` before
+// autoPackCwd fires. Saves 2× filepath.Walk traversals on the
+// customer's repo on the --doctor-strict hot path.
+//
 // 2 checks:
 //
 //  1. Loopback bind: app.listen("127.0.0.1"...) or bind("127.0.0.1")
@@ -1065,8 +1080,26 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 // swallowed: a hard error here would block the deploy on noise.
 // The customer already gets the runtime prose from the catalog
 // if the deploy then fails.
-func runPackPreflight(srcDir string) []string {
+// doctorPreflightRan is set by the --doctor-strict deploy wire-in
+// (commands2.go:1097) before autoPackCwd fires, to signal that
+// runDoctorChecks has already walked srcDir. runPackPreflight
+// consults it to skip the loopback-bind and arch-mismatch scans
+// and avoid the double-walk on the --doctor-strict hot path
+// (review finding F7). Defaults to false — callers that don't set
+// it (e.g. older test paths) get the original walk behaviour.
+var doctorPreflightRan bool
+
+func runPackPreflight(srcDir string, skipDoctorScan bool) []string {
 	hints := []string{}
+	if skipDoctorScan {
+		// --doctor-strict already walked srcDir via runDoctorChecks
+		// (commands2.go:1097). The doctor's loopback-bind and arch
+		// checks emit error-class findings that exit 1 before this
+		// point, so any surviving warn-only noise from those two
+		// would be redundant. The remaining preflight paths (none
+		// today; reserved for future checks) would still run below.
+		return hints
+	}
 	if hit := preflightLoopbackBind(srcDir); hit != "" {
 		hints = append(hints, hit)
 	}

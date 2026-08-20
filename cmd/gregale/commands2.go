@@ -1091,9 +1091,13 @@ func cmdDeployTarball(args []string) int {
 	// against the cwd BEFORE any HTTP / pack. Errors exit 1 with the
 	// doctor report printed to stderr (pre-network, no half-state).
 	// Warnings render but don't fail (mirrors the standalone cmdDoctor
-	// exit semantics). v1 scope: only fires when cwd is a real local
-	// directory (the doctor needs a path to scan); --tarball + --image
-	// skip silently — server-side validators catch the same shapes.
+	// exit semantics). The cwd scan fires regardless of --tarball /
+	// --image — the doctor catches source-side failure modes
+	// (stateless_only_violation, app_loopback_bound, env_var_missing)
+	// that the tarball/image bytes alone can't reveal. Only when
+	// cwd itself is unreachable (cwdErr != nil) does the gate
+	// skip — in that case the server-side validators on upload are
+	// the catch.
 	if *doctorStrict && cwd != "" {
 		rep := runDoctorChecks(cwd)
 		if rep.HasErrors() {
@@ -1110,6 +1114,10 @@ func cmdDeployTarball(args []string) int {
 		if rep.HasWarnings() && !jsonOutput {
 			renderDoctorHuman(osStderr, rep)
 		}
+		// Cluster A (F7 perf): doctor already walked cwd. Signal
+		// runPackPreflight to skip its own loopback-bind and
+		// arch-mismatch scans so we don't double-walk the repo.
+		doctorPreflightRan = true
 	}
 	if *image == "" && *tarball == "" {
 		if cwdErr != nil {
