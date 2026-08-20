@@ -1,4 +1,4 @@
--- filename: 00321_edge_rules_kind_cache.sql
+-- filename: 00330_edge_rules_kind_cache.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -72,19 +72,23 @@
 -- to avoid.
 --
 -- A future widening that adds another kind MUST carry all 14
--- values forward. The 00321 test asserts the full union, so a
+-- values forward. The 00330 test asserts the full union, so a
 -- re-narrowing is caught by 23514 on a known kind.
 --
--- Slot choice: 00321 is the lowest slot above every claim in the
--- current merge window. main's highest real slot is 00313
--- (domain_doctor_observations). Open PRs claim 00314-00320:
--- #984 (00314-00315), #990 (00314-00317), #991 (00314),
--- #992 (00314-00319), #999 (00315-00320). Fences 00314-00320
--- accompany this migration per the ADR-041 reservation-fence
--- pattern. Re-verify with `git ls-tree origin/main migrations/`
--- AND an enumeration of open-PR claims (including
--- refs/pull/<N>/head — `git ls-tree origin/main` alone misses
--- open-PR fences) after every rebase.
+-- Slot choice: 00330 is the lowest free slot above main's
+-- current claim (origin/main now carries 00314-00329; #1000
+-- holds 00329 and PR #1001+#1002+#1003+#1005+#1006+#1007 hold
+-- 00324-00328 in the open-PR claims). Fences 00314-00320
+-- accompanying earlier revisions have been dropped: main now
+-- ships its own reserve_slot fences at 00314-00317 + 00320 +
+-- real migrations at 00318 + 00319 (deployments_actor +
+-- actor_validate_fk), and the slot reserved by #1000 (#1000
+-- holds 00329 as a reservation per [[pr-1000-cherry-pick-rebuild-
+-- shipped-2026-08-20]]). Re-verify with `git ls-tree
+-- origin/main migrations/` AND an enumeration of open-PR
+-- claims (including refs/pull/<N>/head — `git ls-tree
+-- origin/main` alone misses open-PR fences) after every
+-- rebase.
 
 ALTER TABLE edge_rules DROP CONSTRAINT IF EXISTS edge_rules_kind_check;
 ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check
@@ -107,7 +111,7 @@ ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check
 -- rather than silently later.
 --
 -- The reverse deliberately KEEPS 'budget'. Restoring the literal
--- pre-00321 state would mean re-dropping 'budget', i.e.
+-- pre-00330 state would mean re-dropping 'budget', i.e.
 -- reintroducing the 00265 regression documented above. A
 -- downgrade should undo this migration's feature (cache), not
 -- resurrect a known bug in a neighbouring one. Every other kind
