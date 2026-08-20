@@ -354,7 +354,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	// explicitly excluded via filter should NOT consume a wake
 	// slot from the rate-limit bucket. The gate sees only the
 	// filtered subset.
-	if t.FilterCriteria != nil && len(t.FilterCriteria) > 0 {
+	if len(t.FilterCriteria) > 0 {
 		filtered, filterErrCount, filterErr := l.filterBatch(ctx, t, batch)
 		if filterErr != nil {
 			// Catastrophic filter decode error (the JSONB on

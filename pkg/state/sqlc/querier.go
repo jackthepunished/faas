@@ -614,7 +614,14 @@ type Querier interface {
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
 	UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error
 	UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error
-	UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (UpdateTriggerRow, error)
+	// Review finding MED-1 (PR #993): the inline SQL at
+	// pkg/state/pgstore.go::UpdateTrigger is the source of truth
+	// (sqlc-generated UpdateTrigger stub is bypassed because sqlc
+	// doesn't model nullable UPDATE parameters); the projection
+	// shape is preserved by mirroring the same column list that
+	// ListEnabledTriggers uses (filter_criteria is part of the
+	// Trigger struct since commit 6 of issue #757 mega-PR).
+	UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error)
 	// ---------------------------------------------------------------------------
 	// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
 	//

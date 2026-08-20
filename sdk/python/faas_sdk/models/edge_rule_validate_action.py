@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.edge_rule_validate_action_validate_mode import (
+    EdgeRuleValidateActionValidateMode,
+    check_edge_rule_validate_action_validate_mode,
+)
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -75,6 +79,15 @@ class EdgeRuleValidateAction:
     platform cap (`api.MaxRequestBodyBytes`). When set, must
     be > 0 and <= the platform cap.
     """
+    validate_mode: EdgeRuleValidateActionValidateMode | Unset = "block"
+    """How the gateway handles a schema mismatch. `block` rejects
+    with 422 (the strictest mode; preserves the pre-2026
+    behaviour). `observe` counts via the metric and proxies
+    normally. `warn` does the same and stamps
+    `X-Validation-Warning: <rule_id>` on the response. An
+    empty / omitted value is coerced to `block` at the
+    gateway-side handler.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,6 +102,10 @@ class EdgeRuleValidateAction:
         reject_on_unknown_fields = self.reject_on_unknown_fields
 
         max_body_bytes = self.max_body_bytes
+
+        validate_mode: str | Unset = UNSET
+        if not isinstance(self.validate_mode, Unset):
+            validate_mode = self.validate_mode
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -105,6 +122,8 @@ class EdgeRuleValidateAction:
             field_dict["reject_on_unknown_fields"] = reject_on_unknown_fields
         if max_body_bytes is not UNSET:
             field_dict["max_body_bytes"] = max_body_bytes
+        if validate_mode is not UNSET:
+            field_dict["validate_mode"] = validate_mode
 
         return field_dict
 
@@ -123,12 +142,20 @@ class EdgeRuleValidateAction:
 
         max_body_bytes = d.pop("max_body_bytes", UNSET)
 
+        _validate_mode = d.pop("validate_mode", UNSET)
+        validate_mode: EdgeRuleValidateActionValidateMode | Unset
+        if isinstance(_validate_mode, Unset):
+            validate_mode = UNSET
+        else:
+            validate_mode = check_edge_rule_validate_action_validate_mode(_validate_mode)
+
         edge_rule_validate_action = cls(
             schema=schema,
             content_types=content_types,
             apply_while_streaming=apply_while_streaming,
             reject_on_unknown_fields=reject_on_unknown_fields,
             max_body_bytes=max_body_bytes,
+            validate_mode=validate_mode,
         )
 
         edge_rule_validate_action.additional_properties = d

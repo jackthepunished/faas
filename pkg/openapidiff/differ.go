@@ -147,6 +147,21 @@ func Compare(baseline, proposed *Spec) []SchemaBreak {
 // map, so a $ref may resolve differently on each side — the
 // differ treats that as a structural break too).
 func diffSchema(path, method, status, ct string, base, prop *Schema, baseSpec, propSpec *Spec) []SchemaBreak {
+	return diffSchemaDepth(path, method, status, ct, base, prop, baseSpec, propSpec, 0)
+}
+
+// diffSchemaDepth is the depth-bounded variant of diffSchema.
+// The OpenAPI schema graph is allowed to be cyclic (FilterCriteria
+// self-references for its $or/$and/payload branches; the schema
+// loader survives the cycle, but the recursive differ does not).
+// depth 0 starts at the initial node; depth 8 mirrors resolveRef's
+// maxDepth and any deeper walk returns no further breaks (the
+// already-recorded break at the cycle edge is what the user reads).
+func diffSchemaDepth(path, method, status, ct string, base, prop *Schema, baseSpec, propSpec *Spec, depth int) []SchemaBreak {
+	const maxDepth = 8
+	if depth >= maxDepth {
+		return nil
+	}
 	_ = ct // ct is already encoded in the breaks; kept in the signature for readability.
 	var breaks []SchemaBreak
 	// $ref resolution. baseSpec / propSpec own their own
@@ -203,14 +218,14 @@ func diffSchema(path, method, status, ct string, base, prop *Schema, baseSpec, p
 	for name, baseChild := range base.Properties {
 		if propChild, ok := prop.Properties[name]; ok {
 			childPathInSchema := "properties." + name
-			for _, b := range diffSchema(path, method, status, ct, baseChild, propChild, baseSpec, propSpec) {
+			for _, b := range diffSchemaDepth(path, method, status, ct, baseChild, propChild, baseSpec, propSpec, depth+1) {
 				b.PathInSchema = joinPath(b.PathInSchema, childPathInSchema)
 				breaks = append(breaks, b)
 			}
 		}
 	}
 	if base.Items != nil && prop.Items != nil {
-		for _, b := range diffSchema(path, method, status, ct, base.Items, prop.Items, baseSpec, propSpec) {
+		for _, b := range diffSchemaDepth(path, method, status, ct, base.Items, prop.Items, baseSpec, propSpec, depth+1) {
 			b.PathInSchema = joinPath(b.PathInSchema, "items")
 			breaks = append(breaks, b)
 		}

@@ -511,7 +511,7 @@ func jsonScalarEqualJSON(got any, want json.RawMessage) bool {
 // jsonValueEqual does a JSON-encoded comparison of two
 // any-typed values. The fast path handles the three cases
 // where one side is already a Go primitive (the common case
-// after evalJSONPath produced a string/number/bool and the
+// after evalJSONPathFromRoot produced a string/number/bool and the
 // other side was decoded from json.RawMessage):
 //
 //   - both sides are the same Go primitive type → compare
@@ -536,7 +536,7 @@ func jsonValueEqual(a, b any) bool {
 		return a == b
 	}
 	// Fast path: same Go type → direct compare. Both sides
-	// arrived through json.Unmarshal in evalJSONPath, so the
+	// arrived through json.Unmarshal in parsePayloadOnce, so the
 	// types are consistent (string, float64, bool).
 	switch av := a.(type) {
 	case string:
@@ -629,41 +629,6 @@ func deepEqualJSONValue(a, b any) bool {
 	return false
 }
 
-// evalJSONPath evaluates a minimal JSONPath expression against
-// a JSON payload. See file-header for the supported forms.
-//
-// Path grammar (this commit's subset):
-//
-//	$                 root
-//	$.key             object key
-//	$.key1.key2       nested
-//	$.key[N]          array index
-//	$.key[N].key2     mixed
-//
-// Any path that doesn't match this grammar returns an error.
-// "Key not found" along the way returns (nil, nil) — the
-// caller (matchPayloadClause) treats nil as a no-match for eq
-// and a match for neq. The validator at
-// pkg/gregalemanifest::checkJSONPathShape does not reject
-// these forms — see ADR-118 §"Jsonpath superset" for the
-// staged-rollout plan.
-func evalJSONPath(payload []byte, path string) (any, error) {
-	if len(payload) == 0 {
-		return nil, errors.New("empty payload")
-	}
-	if path == "" || path[0] != '$' {
-		return nil, fmt.Errorf("path must start with $ (got %q)", path)
-	}
-	if err := validateJSONPathShape(path); err != nil {
-		return nil, err
-	}
-	var root any
-	if err := json.Unmarshal(payload, &root); err != nil {
-		return nil, fmt.Errorf("payload is not valid JSON: %w", err)
-	}
-	return walkJSONPath(root, path)
-}
-
 // evalJSONPathFromRoot is the cache-aware variant: the caller
 // has already parsed the payload once (via parsePayloadOnce)
 // and is walking N payload clauses; passing the pre-parsed
@@ -703,7 +668,8 @@ func walkJSONPath(root any, path string) (any, error) {
 			// parse error.
 			return nil, nil
 		}
-		if rest[0] == '[' {
+		switch rest[0] {
+		case '[':
 			closeIdx := strings.IndexByte(rest, ']')
 			if closeIdx < 0 {
 				return nil, fmt.Errorf("unterminated [ in %q", path)
@@ -725,9 +691,9 @@ func walkJSONPath(root any, path string) (any, error) {
 			if len(rest) > 0 && rest[0] == '.' {
 				rest = rest[1:]
 			}
-		} else if rest[0] == '.' {
+		case '.':
 			rest = rest[1:]
-		} else {
+		default:
 			end := 0
 			for end < len(rest) && rest[end] != '.' && rest[end] != '[' {
 				end++
@@ -755,7 +721,7 @@ func walkJSONPath(root any, path string) (any, error) {
 // caller (dispatch_triggers, commit 6) audits as
 // trigger.filter_error. A path that passes this check but
 // references a missing key returns (nil, nil) from
-// evalJSONPath — i.e. "not matched" — which the caller treats
+// evalJSONPathFromRoot — i.e. "not matched" — which the caller treats
 // as a normal skip, NOT a filter error.
 func validateJSONPathShape(path string) error {
 	// Recursive descent ("$..foo" or "..foo" mid-path).

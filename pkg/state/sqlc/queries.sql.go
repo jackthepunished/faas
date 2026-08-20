@@ -4989,11 +4989,13 @@ update triggers set
   batch_window_ms = coalesce($5, batch_window_ms),
   max_attempts = coalesce($6, max_attempts),
   payload_max_bytes = coalesce($7, payload_max_bytes),
-  broker_poison_strategy = coalesce($8, broker_poison_strategy)
+  broker_poison_strategy = coalesce($8, broker_poison_strategy),
+  filter_criteria = coalesce($9::jsonb, filter_criteria)
 where id = $1
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
           cron_id, source, payload_max_bytes, broker_poison_strategy,
+          filter_criteria,
           created_at, updated_at
 `
 
@@ -5006,28 +5008,17 @@ type UpdateTriggerParams struct {
 	MaxAttempts          int32
 	PayloadMaxBytes      int32
 	BrokerPoisonStrategy string
+	Column9              []byte
 }
 
-type UpdateTriggerRow struct {
-	ID                   pgtype.UUID
-	AccountID            pgtype.UUID
-	AppID                pgtype.UUID
-	Kind                 string
-	Slug                 string
-	Enabled              bool
-	Config               []byte
-	BatchSizeMax         int32
-	BatchWindowMs        int32
-	MaxAttempts          int32
-	CronID               pgtype.UUID
-	Source               pgtype.Text
-	PayloadMaxBytes      int32
-	BrokerPoisonStrategy string
-	CreatedAt            pgtype.Timestamptz
-	UpdatedAt            pgtype.Timestamptz
-}
-
-func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (UpdateTriggerRow, error) {
+// Review finding MED-1 (PR #993): the inline SQL at
+// pkg/state/pgstore.go::UpdateTrigger is the source of truth
+// (sqlc-generated UpdateTrigger stub is bypassed because sqlc
+// doesn't model nullable UPDATE parameters); the projection
+// shape is preserved by mirroring the same column list that
+// ListEnabledTriggers uses (filter_criteria is part of the
+// Trigger struct since commit 6 of issue #757 mega-PR).
+func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error) {
 	row := db.QueryRow(ctx, updateTrigger,
 		arg.ID,
 		arg.Enabled,
@@ -5037,8 +5028,9 @@ func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerP
 		arg.MaxAttempts,
 		arg.PayloadMaxBytes,
 		arg.BrokerPoisonStrategy,
+		arg.Column9,
 	)
-	var i UpdateTriggerRow
+	var i Trigger
 	err := row.Scan(
 		&i.ID,
 		&i.AccountID,
@@ -5054,6 +5046,7 @@ func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerP
 		&i.Source,
 		&i.PayloadMaxBytes,
 		&i.BrokerPoisonStrategy,
+		&i.FilterCriteria,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

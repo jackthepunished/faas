@@ -219,7 +219,11 @@ from .edge_rule_throttle_action import EdgeRuleThrottleAction
 from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
+from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
 from .field_error import FieldError
+from .filter_criteria import FilterCriteria
+from .filter_criteria_clause import FilterCriteriaClause
+from .filter_criteria_op import FilterCriteriaOp
 from .fire_cron_request_response import FireCronRequestResponse
 from .fire_cron_request_response_status import FireCronRequestResponseStatus
 from .fire_cron_response import FireCronResponse
@@ -261,6 +265,10 @@ from .invoke_response import InvokeResponse
 from .invoke_response_result import InvokeResponseResult
 from .invoke_response_status import InvokeResponseStatus
 from .issue_account_credit_body import IssueAccountCreditBody
+from .kafka_sasl_config import KafkaSASLConfig
+from .kafka_sasl_mechanism import KafkaSASLMechanism
+from .kafka_tls_config import KafkaTLSConfig
+from .kafka_trigger_config import KafkaTriggerConfig
 from .list_audit_events_response import ListAuditEventsResponse
 from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
@@ -271,6 +279,9 @@ from .list_secrets_for_account_response import ListSecretsForAccountResponse
 from .list_tenant_surfaces_response import ListTenantSurfacesResponse
 from .list_trigger_dead_letter_response import ListTriggerDeadLetterResponse
 from .list_trigger_records_response import ListTriggerRecordsResponse
+from .log_excerpt import LogExcerpt
+from .log_excerpt_level import LogExcerptLevel
+from .log_excerpt_source import LogExcerptSource
 from .magic_link_signup_request import MagicLinkSignupRequest
 from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
@@ -397,6 +408,8 @@ from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .template_view import TemplateView
+from .template_view_category import TemplateViewCategory
 from .tenant_hostname_response import TenantHostnameResponse
 from .tenant_surface_response import TenantSurfaceResponse
 from .tenant_surface_response_cert_kind import TenantSurfaceResponseCertKind
@@ -675,7 +688,11 @@ __all__ = (
     "EdgeRuleThrottleActionKeyBy",
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
+    "EdgeRuleValidateActionValidateMode",
     "FieldError",
+    "FilterCriteria",
+    "FilterCriteriaClause",
+    "FilterCriteriaOp",
     "FireCronRequestResponse",
     "FireCronRequestResponseStatus",
     "FireCronResponse",
@@ -717,6 +734,10 @@ __all__ = (
     "InvokeResponseResult",
     "InvokeResponseStatus",
     "IssueAccountCreditBody",
+    "KafkaSASLConfig",
+    "KafkaSASLMechanism",
+    "KafkaTLSConfig",
+    "KafkaTriggerConfig",
     "ListAuditEventsResponse",
     "ListAuditLogResponse",
     "ListCronRunsResponse",
@@ -727,6 +748,9 @@ __all__ = (
     "ListTenantSurfacesResponse",
     "ListTriggerDeadLetterResponse",
     "ListTriggerRecordsResponse",
+    "LogExcerpt",
+    "LogExcerptLevel",
+    "LogExcerptSource",
     "MagicLinkSignupRequest",
     "MemberListResponse",
     "MFAConfirmRequest",
@@ -851,6 +875,8 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "TemplateView",
+    "TemplateViewCategory",
     "TenantHostnameResponse",
     "TenantSurfaceResponse",
     "TenantSurfaceResponseCertKind",

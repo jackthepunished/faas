@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ..models.deployment_healthcheck import DeploymentHealthcheck
     from ..models.deployment_liveness_probe import DeploymentLivenessProbe
     from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
+    from ..models.log_excerpt import LogExcerpt
     from ..models.scan_result import ScanResult
     from ..models.secret_scan_result import SecretScanResult
 
@@ -52,6 +53,15 @@ class DeploymentResponse:
     build_id: None | str | Unset = UNSET
     error: None | str | Unset = UNSET
     error_code: None | str | Unset = UNSET
+    error_hint: None | str | Unset = UNSET
+    """One-line next-action lifted from pkg/whycopy catalog."""
+    error_why: None | str | Unset = UNSET
+    """Human-readable cause with observed value."""
+    error_fix: None | str | Unset = UNSET
+    """Prescriptive remediation (1-3 lines)."""
+    error_relevant_logs: list[LogExcerpt] | Unset = UNSET
+    """Per-line log excerpts explaining the failure (error-explanations cluster). Capped at 20 entries × 512 bytes
+    by the CLI tripwire."""
     has_overrides: bool | Unset = UNSET
     """True when this deployment carries a non-null override_* column set."""
     override_entrypoint: list[str] | Unset = UNSET
@@ -162,6 +172,31 @@ class DeploymentResponse:
             error_code = UNSET
         else:
             error_code = self.error_code
+
+        error_hint: None | str | Unset
+        if isinstance(self.error_hint, Unset):
+            error_hint = UNSET
+        else:
+            error_hint = self.error_hint
+
+        error_why: None | str | Unset
+        if isinstance(self.error_why, Unset):
+            error_why = UNSET
+        else:
+            error_why = self.error_why
+
+        error_fix: None | str | Unset
+        if isinstance(self.error_fix, Unset):
+            error_fix = UNSET
+        else:
+            error_fix = self.error_fix
+
+        error_relevant_logs: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.error_relevant_logs, Unset):
+            error_relevant_logs = []
+            for error_relevant_logs_item_data in self.error_relevant_logs:
+                error_relevant_logs_item = error_relevant_logs_item_data.to_dict()
+                error_relevant_logs.append(error_relevant_logs_item)
 
         has_overrides = self.has_overrides
 
@@ -275,6 +310,14 @@ class DeploymentResponse:
             field_dict["error"] = error
         if error_code is not UNSET:
             field_dict["error_code"] = error_code
+        if error_hint is not UNSET:
+            field_dict["error_hint"] = error_hint
+        if error_why is not UNSET:
+            field_dict["error_why"] = error_why
+        if error_fix is not UNSET:
+            field_dict["error_fix"] = error_fix
+        if error_relevant_logs is not UNSET:
+            field_dict["error_relevant_logs"] = error_relevant_logs
         if has_overrides is not UNSET:
             field_dict["has_overrides"] = has_overrides
         if override_entrypoint is not UNSET:
@@ -318,6 +361,7 @@ class DeploymentResponse:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
         from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
+        from ..models.log_excerpt import LogExcerpt
         from ..models.scan_result import ScanResult
         from ..models.secret_scan_result import SecretScanResult
 
@@ -360,6 +404,42 @@ class DeploymentResponse:
             return cast(None | str | Unset, data)
 
         error_code = _parse_error_code(d.pop("error_code", UNSET))
+
+        def _parse_error_hint(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_hint = _parse_error_hint(d.pop("error_hint", UNSET))
+
+        def _parse_error_why(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_why = _parse_error_why(d.pop("error_why", UNSET))
+
+        def _parse_error_fix(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_fix = _parse_error_fix(d.pop("error_fix", UNSET))
+
+        _error_relevant_logs = d.pop("error_relevant_logs", UNSET)
+        error_relevant_logs: list[LogExcerpt] | Unset = UNSET
+        if _error_relevant_logs is not UNSET:
+            error_relevant_logs = []
+            for error_relevant_logs_item_data in _error_relevant_logs:
+                error_relevant_logs_item = LogExcerpt.from_dict(error_relevant_logs_item_data)
+
+                error_relevant_logs.append(error_relevant_logs_item)
 
         has_overrides = d.pop("has_overrides", UNSET)
 
@@ -553,6 +633,10 @@ class DeploymentResponse:
             build_id=build_id,
             error=error,
             error_code=error_code,
+            error_hint=error_hint,
+            error_why=error_why,
+            error_fix=error_fix,
+            error_relevant_logs=error_relevant_logs,
             has_overrides=has_overrides,
             override_entrypoint=override_entrypoint,
             override_cmd=override_cmd,

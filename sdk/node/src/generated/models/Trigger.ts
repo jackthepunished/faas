@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { FilterCriteria } from './FilterCriteria.js';
 import type { TriggerKind } from './TriggerKind.js';
 /**
  * Read shape returned by GET / POST / PATCH on /v1/triggers.
@@ -61,6 +62,17 @@ export type Trigger = {
    *
    */
   broker_poison_strategy: 'commit' | 'seek-to-offset';
+  /**
+   * Optional record-level filter (issue #757 §criterion 4,
+   * ADR-118 §6, migration 00300). Records that fail the
+   * filter are marked state='skipped' on insert and
+   * contribute no audit row. Jsonpath evaluator:
+   * github.com/PaesslerAG/jsonpath (no eval semantics, no
+   * customer-supplied code execution). See the
+   * FilterCriteria schema for the full shape.
+   *
+   */
+  filter_criteria?: FilterCriteria;
   schedule?: string | null;
   path?: string | null;
   cron_id?: string | null;

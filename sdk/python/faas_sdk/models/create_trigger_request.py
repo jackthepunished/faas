@@ -23,6 +23,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.create_trigger_request_config import CreateTriggerRequestConfig
+    from ..models.filter_criteria import FilterCriteria
 
 
 T = TypeVar("T", bound="CreateTriggerRequest")
@@ -58,6 +59,14 @@ class CreateTriggerRequest:
     """Kafka-only poison-record handling strategy. null/omitted
     falls through to the DB default 'commit'. Same semantics
     as the Trigger read shape.
+    """
+    filter_criteria: FilterCriteria | Unset = UNSET
+    """FilterCriteria on a trigger (migration 00300,
+    pkg/sched/filter.go). nil / omitted matches every record.
+    Top-level arrays combine via implicit OR for `$or` and
+    AND for `$and`; nested clauses honour the same shape.
+    Jsonpath implementation: github.com/PaesslerAG/jsonpath —
+    no eval semantics, no customer-supplied code execution.
     """
     schedule: None | str | Unset = UNSET
     path: None | str | Unset = UNSET
@@ -116,6 +125,10 @@ class CreateTriggerRequest:
         else:
             broker_poison_strategy = self.broker_poison_strategy
 
+        filter_criteria: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.filter_criteria, Unset):
+            filter_criteria = self.filter_criteria.to_dict()
+
         schedule: None | str | Unset
         if isinstance(self.schedule, Unset):
             schedule = UNSET
@@ -152,6 +165,8 @@ class CreateTriggerRequest:
             field_dict["payload_max_bytes"] = payload_max_bytes
         if broker_poison_strategy is not UNSET:
             field_dict["broker_poison_strategy"] = broker_poison_strategy
+        if filter_criteria is not UNSET:
+            field_dict["filter_criteria"] = filter_criteria
         if schedule is not UNSET:
             field_dict["schedule"] = schedule
         if path is not UNSET:
@@ -162,6 +177,7 @@ class CreateTriggerRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.create_trigger_request_config import CreateTriggerRequestConfig
+        from ..models.filter_criteria import FilterCriteria
 
         d = dict(src_dict)
         app_id = d.pop("app_id")
@@ -274,6 +290,13 @@ class CreateTriggerRequest:
 
         broker_poison_strategy = _parse_broker_poison_strategy(d.pop("broker_poison_strategy", UNSET))
 
+        _filter_criteria = d.pop("filter_criteria", UNSET)
+        filter_criteria: FilterCriteria | Unset
+        if isinstance(_filter_criteria, Unset):
+            filter_criteria = UNSET
+        else:
+            filter_criteria = FilterCriteria.from_dict(_filter_criteria)
+
         def _parse_schedule(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -303,6 +326,7 @@ class CreateTriggerRequest:
             max_attempts=max_attempts,
             payload_max_bytes=payload_max_bytes,
             broker_poison_strategy=broker_poison_strategy,
+            filter_criteria=filter_criteria,
             schedule=schedule,
             path=path,
         )

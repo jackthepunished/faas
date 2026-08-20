@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { FilterCriteria } from './FilterCriteria.js';
 /**
  * Partial trigger update. nil means "leave unchanged" (same
  * semantics as UpdateCronRequest). Kind is NOT a member — it
@@ -24,6 +25,14 @@ export type UpdateTriggerRequest = {
    *
    */
   broker_poison_strategy?: 'commit' | 'seek-to-offset';
+  /**
+   * Optional record-level filter. nil means "leave
+   * unchanged" — the SQL coalesce() in
+   * pkg/state/pgstore.go::UpdateTrigger keeps the existing
+   * value. Pass {} to clear an existing filter.
+   *
+   */
+  filter_criteria?: FilterCriteria;
   schedule?: string | null;
   path?: string | null;
 };

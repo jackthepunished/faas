@@ -21,6 +21,7 @@ from ..models.update_trigger_request_broker_poison_strategy_type_3_type_1 import
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.filter_criteria import FilterCriteria
     from ..models.update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
 
 
@@ -53,6 +54,14 @@ class UpdateTriggerRequest:
     means "leave unchanged" (the SQL coalesce() in
     pkg/state/pgstore.go::UpdateTrigger keeps the existing
     value). Same semantics as the Trigger read shape.
+    """
+    filter_criteria: FilterCriteria | Unset = UNSET
+    """FilterCriteria on a trigger (migration 00300,
+    pkg/sched/filter.go). nil / omitted matches every record.
+    Top-level arrays combine via implicit OR for `$or` and
+    AND for `$and`; nested clauses honour the same shape.
+    Jsonpath implementation: github.com/PaesslerAG/jsonpath —
+    no eval semantics, no customer-supplied code execution.
     """
     schedule: None | str | Unset = UNSET
     path: None | str | Unset = UNSET
@@ -111,6 +120,10 @@ class UpdateTriggerRequest:
         else:
             broker_poison_strategy = self.broker_poison_strategy
 
+        filter_criteria: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.filter_criteria, Unset):
+            filter_criteria = self.filter_criteria.to_dict()
+
         schedule: None | str | Unset
         if isinstance(self.schedule, Unset):
             schedule = UNSET
@@ -140,6 +153,8 @@ class UpdateTriggerRequest:
             field_dict["payload_max_bytes"] = payload_max_bytes
         if broker_poison_strategy is not UNSET:
             field_dict["broker_poison_strategy"] = broker_poison_strategy
+        if filter_criteria is not UNSET:
+            field_dict["filter_criteria"] = filter_criteria
         if schedule is not UNSET:
             field_dict["schedule"] = schedule
         if path is not UNSET:
@@ -149,6 +164,7 @@ class UpdateTriggerRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.filter_criteria import FilterCriteria
         from ..models.update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
 
         d = dict(src_dict)
@@ -267,6 +283,13 @@ class UpdateTriggerRequest:
 
         broker_poison_strategy = _parse_broker_poison_strategy(d.pop("broker_poison_strategy", UNSET))
 
+        _filter_criteria = d.pop("filter_criteria", UNSET)
+        filter_criteria: FilterCriteria | Unset
+        if isinstance(_filter_criteria, Unset):
+            filter_criteria = UNSET
+        else:
+            filter_criteria = FilterCriteria.from_dict(_filter_criteria)
+
         def _parse_schedule(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -293,6 +316,7 @@ class UpdateTriggerRequest:
             max_attempts=max_attempts,
             payload_max_bytes=payload_max_bytes,
             broker_poison_strategy=broker_poison_strategy,
+            filter_criteria=filter_criteria,
             schedule=schedule,
             path=path,
         )

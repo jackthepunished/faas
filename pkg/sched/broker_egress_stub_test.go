@@ -1,3 +1,5 @@
+//go:build !linux
+
 // broker_egress_test.go — unit tests for the broker egress
 // accounting surface (issue #757 / ADR-118, commit 8).
 //
@@ -71,12 +73,14 @@ func TestBrokerEgressObserver_Accumulates(t *testing.T) {
 }
 
 // TestBrokerTcCommands_NilWhenCapZero_Stub pins the stub
-// counterpart: on non-linux builds BrokerTcCommands returns
-// nil for both zero-cap and non-zero-cap shapes. The
-// build-tag-gated linux file pins the argv shape on linux.
-// This pin documents the cross-build contract so a future
-// refactor that swaps the stub return value from `nil` to
-// `[]string{}` is caught.
+// counterpart: on non-linux builds (this file is gated
+// `//go:build !linux`) BrokerTcCommands returns nil for both
+// zero-cap and non-zero-cap shapes. The build-tag-gated linux
+// file (`broker_egress_linux_test.go::TestBrokerTcCommands_NilWhenCapZero`)
+// pins the linux argv shape (nil only when EgressMbit <= 0 OR
+// InterfaceName == ""). This pin documents the cross-build
+// contract so a future refactor that swaps the stub return
+// value from `nil` to `[]string{}` is caught.
 func TestBrokerTcCommands_NilWhenCapZero_Stub(t *testing.T) {
 	t.Parallel()
 	// Stub contract is "always nil regardless of cap shape",
