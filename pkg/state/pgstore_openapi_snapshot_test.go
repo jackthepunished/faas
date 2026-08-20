@@ -62,8 +62,8 @@ func TestPg_OpenAPISnapshot_RoundTrip(t *testing.T) {
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-rt")
 	var depID string
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO deployments (id, app_id, status, scope)
-		VALUES (gen_random_uuid(), $1, 'live', 'prod')
+		INSERT INTO deployments (id, app_id, image_digest, status, scope)
+		VALUES (gen_random_uuid(), $1, 'sha256:' || encode(gen_random_bytes(32), 'hex'), 'live', 'prod')
 		RETURNING id
 	`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
@@ -123,7 +123,7 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-upsert")
 	var depID string
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id
+		INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:' || encode(gen_random_bytes(32), 'hex'), 'live', 'prod') RETURNING id
 	`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
@@ -200,10 +200,10 @@ func TestPg_OpenAPISnapshot_LatestByScope(t *testing.T) {
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-latest")
 	var olderID, newerID string
-	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&olderID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:' || encode(gen_random_bytes(32), 'hex'), 'live', 'prod') RETURNING id`, appID).Scan(&olderID); err != nil {
 		t.Fatalf("insert older dep: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&newerID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:' || encode(gen_random_bytes(32), 'hex'), 'live', 'prod') RETURNING id`, appID).Scan(&newerID); err != nil {
 		t.Fatalf("insert newer dep: %v", err)
 	}
 	older := state.OpenAPISnapshot{
@@ -248,7 +248,7 @@ func TestPg_OpenAPISnapshot_CascadeOnDeploymentDelete(t *testing.T) {
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-cascade")
 	var depID string
-	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&depID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:' || encode(gen_random_bytes(32), 'hex'), 'live', 'prod') RETURNING id`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
 	if err := s.UpdateDeploymentOpenAPISnapshot(ctx, state.OpenAPISnapshot{
