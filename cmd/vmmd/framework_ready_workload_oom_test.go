@@ -195,21 +195,19 @@ func TestParseFrameworkReadyDatagram_WorkloadOOM_BodyCap(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			// Pad the body with a valid-looking JSON
-			// structure (the cap is enforced BEFORE the
-			// JSON unmarshal, so the actual content
-			// doesn't matter for the over-cap cases).
-			body := []byte(`{"peak_mb":1,"plan_mb":2,"pad":"`)
-			if len(body) > tc.bodyLen {
-				// Shrink the prefix to fit the
-				// test's bodyLen exactly so we
-				// exercise the boundary precisely.
-				body = body[:tc.bodyLen]
-			} else {
-				body = append(body, []byte(strings.Repeat("x", tc.bodyLen-len(body)))...)
-			}
-			body = append(body, '"', '}')
-			packet := append([]byte{VsockFrameworkReadyHostTypeWorkloadOOM}, body...)
+			// Build a body of EXACTLY tc.bodyLen bytes
+			// after the type byte. The cap is enforced
+			// on `len(rest)` where `rest := b[1:]`, so
+			// the wire packet is 1 + tc.bodyLen bytes
+			// total. For the under-cap cases we leave
+			// the JSON malformed (the cap check runs
+			// BEFORE unmarshal, so under-cap is what
+			// matters); for the over-cap cases the
+			// cap-check trips before unmarshal, so
+			// malformed content is fine.
+			packet := make([]byte, 0, 1+tc.bodyLen)
+			packet = append(packet, VsockFrameworkReadyHostTypeWorkloadOOM)
+			packet = append(packet, []byte(strings.Repeat("x", tc.bodyLen))...)
 			_, err := parseFrameworkReadyDatagram(packet)
 			if tc.wantError {
 				if err == nil {
@@ -223,8 +221,22 @@ func TestParseFrameworkReadyDatagram_WorkloadOOM_BodyCap(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("body %d bytes: err = %v, want nil (under cap)", tc.bodyLen, err)
+			// Under-cap cases: the JSON unmarshal will
+			// fail (the body is all 'x' bytes), so we
+			// assert the error is the unmarshal one,
+			// not the body-cap one. The tripwire is
+			// "did the cap check pass" — a future
+			// refactor that bumps the cap or the
+			// payload size below the cap shouldn't
+			// trip the cap guard.
+			if err == nil {
+				t.Fatalf("body %d bytes: err = nil, want unmarshal failure (under-cap path)", tc.bodyLen)
+			}
+			if strings.Contains(err.Error(), "body too large") {
+				t.Errorf("body %d bytes: err = %q, contains 'body too large' (should be under cap)", tc.bodyLen, err.Error())
+			}
+			if !strings.Contains(err.Error(), "workload_oom") {
+				t.Errorf("body %d bytes: err = %q, want substring 'workload_oom'", tc.bodyLen, err.Error())
 			}
 		})
 	}

@@ -415,24 +415,27 @@ func readMemoryMax(leafDir string) (uint64, error) {
 	return strconv.ParseUint(s, 10, 64)
 }
 
-// readCgroupEventsOOMKills is a placeholder helper that
-// reads /sys/fs/cgroup/<leaf>/memory.events for the
-// current oom_kill counter. The cgroup v2 memory.events
-// seqfile is "key value\n" lines; the "oom_kill" field
-// is the cumulative kill count for the leaf + descendants
-// (which includes the workload process).
-func readCgroupEventsOOMKills(leafPath string) (uint64, error) {
-	return readMemoryEventsOOMKills(leafPath)
-}
-
 // readMemoryEventsOOMKills parses the leaf's
 // memory.events file for the "oom_kill" counter. Returns
-// 0 if the field is absent (kernel pre-5.x) or the file
-// is unparseable (a soft warning, the listener stays
-// silent).
+// 0 + nil if the file is absent (kernel pre-5.x or a
+// test fixture that hasn't populated the cgroup events
+// file yet) — the listener stays silent, matching the
+// pre-Fix-1 contract. A parse failure on a present file
+// surfaces as the underlying error so a real bug is
+// visible in the log, not silently swallowed.
 func readMemoryEventsOOMKills(leafDir string) (uint64, error) {
 	b, err := os.ReadFile(filepath.Join(leafDir, "memory.events"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Absent file = silent zero (the kernel
+			// doesn't expose memory.events on pre-5.x,
+			// and a fresh cgroup leaf hasn't populated
+			// the seqfile until the first event lands).
+			// The listener stays quiet; the
+			// WatchOOM baseline stays 0, so no delta
+			// to fire on.
+			return 0, nil
+		}
 		return 0, err
 	}
 	for _, line := range strings.Split(string(b), "\n") {
@@ -449,9 +452,12 @@ func readMemoryEventsOOMKills(leafDir string) (uint64, error) {
 // readMemoryHighOrCurrent prefers memory.events.high
 // (the cgroup v2 high-watermark since the last reset),
 // falls back to memory.current if the high field is
-// absent (kernel pre-6.x). Returns 0 on read failure —
-// the listener treats 0 as "unknown peak" rather than
-// "0 MB peak".
+// absent (kernel pre-6.x). Returns 0 + nil on read
+// failure — the listener treats 0 as "unknown peak"
+// rather than "0 MB peak", and the silent-zero path
+// matches the readMemoryEventsOOMKills contract (a
+// fresh cgroup leaf with no populated events stays
+// quiet rather than erroring out).
 func readMemoryHighOrCurrent(leafDir string) (uint64, error) {
 	if b, err := os.ReadFile(filepath.Join(leafDir, "memory.events")); err == nil {
 		for _, line := range strings.Split(string(b), "\n") {
@@ -465,6 +471,9 @@ func readMemoryHighOrCurrent(leafDir string) (uint64, error) {
 	}
 	b, err := os.ReadFile(filepath.Join(leafDir, "memory.current"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	return strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)

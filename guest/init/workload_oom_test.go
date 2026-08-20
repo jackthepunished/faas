@@ -232,12 +232,15 @@ func TestWatchOOM_RespectsContextCancel(t *testing.T) {
 	if err := os.MkdirAll(leaf, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	// cgroup.events must exist for WatchOOM's open() to succeed.
+	// memory.events must exist for WatchOOM's open() to
+	// succeed (review finding #1: the listener polls
+	// memory.events, not cgroup.events — the kernel only
+	// fires POLLPRI on memory.events oom_kill increments).
 	// The contents don't matter — the test relies on
 	// ctx.Done, not on the poll wake.
-	if err := os.WriteFile(filepath.Join(leaf, "cgroup.events"),
-		[]byte("populated 0\nfrozen 0\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile cgroup.events: %v", err)
+	if err := os.WriteFile(filepath.Join(leaf, "memory.events"),
+		[]byte("low 0\nhigh 0\noom_kill 0\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile memory.events: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)

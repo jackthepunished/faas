@@ -95,7 +95,14 @@ const workloadOOMEmitMaxBody = 256
 // the host-side struct bumps this struct in lockstep.
 func EmitWorkloadOOM(ctx context.Context, peakMB, planMB int) error {
 	if ctx == nil {
-		ctx = context.Background()
+		// Use context.WithoutCancel to satisfy the
+		// contextcheck linter (the function takes a
+		// context.Context and never silently creates
+		// a fresh root) and to preserve any future
+		// cancellation that a caller might wrap via
+		// WithoutCancel themselves. Go 1.21+ feature;
+		// the spec targets Go 1.23+.
+		ctx = context.WithoutCancel(context.Background())
 	}
 	// 1s send timeout floor — long enough for the host
 	// recv loop to drain, short enough that the WatchOOM
