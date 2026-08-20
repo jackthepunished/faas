@@ -13,5 +13,10 @@
 # (CLAUDE.md "load-bearing — DO NOT fix").
 FROM node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848
 # Issue #197 B3.6: mutable tag pinned via images/Dockerfile.lock.
-RUN id app 2>/dev/null || useradd -u 1000 -m app
+# The official image already reserves uid 1000 for `node`; reuse that
+# identity under the platform's canonical `app` name instead of attempting
+# a duplicate uid.
+RUN if id app >/dev/null 2>&1; then :; \
+    elif id node >/dev/null 2>&1; then sed -i 's/^node:/app:/' /etc/passwd; \
+    else useradd -u 1000 -m app; fi
 WORKDIR /app

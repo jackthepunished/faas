@@ -9,8 +9,12 @@ FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac3044
 # shared Debian parent: musl and glibc are not interchangeable, and applying
 # Debian parent layers would produce an image that scans cleanly but cannot
 # boot reliably.
-# Guest runtime user (uid 1000, spec §4.8).
-RUN id app 2>/dev/null || adduser -D -u 1000 app
+# Guest runtime user (uid 1000, spec §4.8). The official Alpine image
+# already reserves uid 1000 for `node`; reuse that identity under the
+# platform's canonical `app` name instead of attempting a duplicate uid.
+RUN if id app >/dev/null 2>&1; then :; \
+    elif id node >/dev/null 2>&1; then sed -i 's/^node:/app:/' /etc/passwd; \
+    else adduser -D -u 1000 app; fi
 # The function runner shim (guest/runners/node22) is layered in for `type:
 # function` deploys at M7; plain Node apps bring their own entrypoint.
 WORKDIR /app

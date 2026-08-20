@@ -21,7 +21,7 @@ COPY --from=build /lib64/ /lib64/
 COPY --from=build /bin/busybox /bin/busybox
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 # The app user every guest execs as (uid 1000, spec §4.8).
-COPY rootfs-skel/ /
+COPY images/rootfs-skel/ /
 # imaged refreshes the arch-matched guest-init as /sbin/init while staging
 # this OCI image into bootable drive0. PID 1 must live on drive0 because Linux
 # executes it before the per-app drive1 overlay is mounted.
