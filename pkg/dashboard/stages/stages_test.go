@@ -402,3 +402,110 @@ func TestClosedSetPanicGuardContract(t *testing.T) {
 		t.Errorf("StageOrderClosedSet = %d, want 6 (closed set drift; any change must update pkg/state.AllStageNames + migrations/00302 CHECK together)", StageOrderClosedSet)
 	}
 }
+
+// TestStageFailureHTML_AllFieldsPopulated — ADR-117
+// §Production-ready follow-on. The dashboard stage row for a
+// failed stage renders a structured block (title + hint + why +
+// fix) alongside the raw reason. The helper is called with the
+// pre-resolved strings from whycopy.Decorate (so this package
+// stays free of pkg/whycopy / pkg/api; the import direction is
+// pkg/dashboard -> pkg/state only). Pins:
+//   - the wrapper carries the `stage-failure-explanation` class
+//     so the dashboard CSS targets the block
+//   - every non-empty input shows up verbatim (the renderer is
+//     not opinionated about wording; whycopy is the source of
+//     truth)
+//   - the reason is the last child so screen readers read
+//     hint → why → fix → reason
+func TestStageFailureHTML_AllFieldsPopulated(t *testing.T) {
+	html := StageFailureHTML(
+		"Image build ran out of memory",
+		"the build VM hit its 2 GB ceiling",
+		"the build VM is sized at 2 vCPU + 2 GB RAM",
+		"• move heavy builds into a CI step",
+		"oom-killer invoked at 2048 MB",
+	)
+	s := string(html)
+	wants := []string{
+		`<div class="stage-failure-explanation">`,
+		`<p class="title">Image build ran out of memory</p>`,
+		`<p class="hint">the build VM hit its 2 GB ceiling</p>`,
+		`<p class="why">the build VM is sized at 2 vCPU + 2 GB RAM</p>`,
+		`<p class="fix">• move heavy builds into a CI step</p>`,
+		`<p class="logs">oom-killer invoked at 2048 MB</p>`,
+		`</div>`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(s, w) {
+			t.Errorf("missing %q in:\n%s", w, s)
+		}
+	}
+	// The reason must be the last child of the wrapper.
+	idxReason := strings.Index(s, `class="logs"`)
+	idxClose := strings.LastIndex(s, `</div>`)
+	if idxReason == -1 || idxClose == -1 || idxReason >= idxClose {
+		t.Errorf("reason must come before </div>; got reason@%d close@%d in:\n%s", idxReason, idxClose, s)
+	}
+}
+
+// TestStageFailureHTML_EmptyDecorationsFallbackToReason — when
+// the whycopy catalog has no row for the failure code (or the
+// caller passes empty decorations), the helper degrades to a
+// plain escaped reason span — the historical "failed: <raw>"
+// path. Pins that no empty <p> shells leak through.
+func TestStageFailureHTML_EmptyDecorationsFallbackToReason(t *testing.T) {
+	html := StageFailureHTML("", "", "", "", "build VM exec failed: signal 9")
+	s := string(html)
+	if strings.Contains(s, "stage-failure-explanation") {
+		t.Errorf("empty decorations must skip the wrapper div, got:\n%s", s)
+	}
+	want := `<span class="stage-failure-reason">build VM exec failed: signal 9</span>`
+	if !strings.Contains(s, want) {
+		t.Errorf("missing reason span %q in:\n%s", want, s)
+	}
+	if strings.Contains(s, "<p ") {
+		t.Errorf("empty decorations must not emit <p> tags, got:\n%s", s)
+	}
+}
+
+// TestStageFailureHTML_AllEmptyReturnsEmpty — when there is no
+// decoration AND no reason, the helper returns the empty string
+// so the template's `{{ if }}` branch skips the block. This is
+// the success-row path; a regression that emitted an empty <div>
+// would add visual whitespace to the timeline.
+func TestStageFailureHTML_AllEmptyReturnsEmpty(t *testing.T) {
+	if got := StageFailureHTML("", "", "", "", ""); got != template.HTML("") {
+		t.Errorf("all-empty inputs must return template.HTML(\"\"), got %q", got)
+	}
+}
+
+// TestStageFailureHTML_EscapesInjection — the title/hint/why/fix
+// fields are passed through htmlEscape before being embedded so a
+// malicious failure reason (e.g. an app name containing <script>)
+// cannot break out of the wrapper. The reason field is also
+// escaped; the cluster-A convention is reason = raw error text
+// from the engine, which is untrusted.
+func TestStageFailureHTML_EscapesInjection(t *testing.T) {
+	html := StageFailureHTML(
+		"<script>alert(1)</script>",
+		"<b>bold</b>",
+		"<i>italic</i>",
+		"<u>under</u>",
+		"<img onerror=alert(2) src=x>",
+	)
+	s := string(html)
+	for _, needle := range []string{
+		"<script>", "<b>bold</b>", "<i>italic</i>", "<u>under</u>", `<img onerror=alert(2) src=x>`,
+	} {
+		if strings.Contains(s, needle) {
+			t.Errorf("unescaped fragment %q leaked through; output:\n%s", needle, s)
+		}
+	}
+	for _, want := range []string{
+		"&lt;script&gt;", "&lt;b&gt;bold&lt;/b&gt;", "&lt;img",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected escaped %q in:\n%s", want, s)
+		}
+	}
+}

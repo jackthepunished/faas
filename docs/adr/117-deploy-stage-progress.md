@@ -593,3 +593,187 @@ fetch.
 new SDK methods. 0 new wire routes. 0 new SSE events. 1 doc
 amendment. 21/21 CI gates must pass per commit (matching PR
 #994's green run).
+
+## Production-ready follow-on (mega-PR after PR #1002)
+
+PR #1002 closed the *read-side* of the closed-6-stage
+vocabulary — `gregale deploys show/status`, `--status`, the
+dashboard deployment-detail widget. The write-side had four
+production-blocking gaps once the read-side shipped:
+
+1. **No history retention.** `AppendDeploymentStage` is open-ended
+   `append`; long-lived Hobby/Pro/Scale apps accumulate stage
+   history forever. `deployments.stage_state` jsonb grows
+   unbounded. Storage bound hit in months, not years.
+2. **No stage error explanations.** Failed stages render as
+   `"failed: <raw reason>"`. Cluster A only covers
+   deployment-level codes — a customer staring at "image_build
+   failed: oom" has no hint/why/fix prose.
+3. **No per-stage retry.** A transient `image_build` OOM forces
+   a full re-run from `source_download`. Wastes builder slots
+   + tenant $$ on retries that should only re-run the failed
+   stage.
+4. **Dashboard stage widget is static.** No SSE wiring; opening
+   `/dashboard/apps/{slug}/deployments/{id}` mid-deploy shows
+   nothing live. Reads as broken on a 2-minute deploy.
+
+This follow-on closes all four. Closed-vocabulary stays closed
+(Go const + sqlc enum + migration 00302 CHECK are unchanged).
+
+### C1 — Retention cap (64 entries)
+
+`pkg/state/types.go::MaxStageHistory = 64` const. FIFO trim
+happens Go-side in `pgstore.AppendDeploymentStage` and
+`memstore.AppendDeploymentStage` at the existing read-modify-
+write site (no SQL CHECK on jsonb_array_length — the nested
+path is fragile across jsonb mutation shapes). Doc-only
+migration at slot 00340 documents the cap; schema unchanged.
+
+Trim is irreversible: rows past the cap are gone. No
+archival. A future PR can change the cap by bumping the const.
+
+### C2 — Per-stage retry
+
+`POST /v1/apps/{slug}/deployments/{id}/retry` taking
+`{from_stage: <StageName>}`. Inserts a fresh `deployments` row
+(new id) with `stage_state.current = from_stage`,
+`stage_state.history = []`. Copies input primitives
+(`image`, `source_url`, `commit_sha`, `overrides`, `sidecars`,
+`scope`, `traffic_percent`) from the failed row. Reuses the
+existing `CreateDeployment` supersede logic at
+`pkg/state/pgstore.go:4187-4244`.
+
+`from_stage` is validated against the closed-6 vocabulary
+before insert (400 on unknown). The CLI gets
+`gregale deploys retry <id> [--from=<stage>]` (default = last
+failed stage). The dashboard gets a per-row "Retry from this
+stage" form button on failed rows (Commit 4).
+
+A `from_stage` of `source_download` re-runs the whole pipeline
+— this is intentional; that's how a user "retry from the top"
+works. CLI help text calls this out.
+
+### C3 — Stage error taxonomy
+
+~10-15 `CodeStage*` constants in `pkg/api/errors.go` (one per
+stage × 1-2 most-common failure modes). Catalog rows in
+`pkg/whycopy/whycopy.go`. The existing tripwire
+`TestEveryCodeHasWhycopyEntry`
+(`cmd/gregale/lint_tripwires_test.go`) pins 1:1 membership
+between constants and catalog rows — a new constant without a
+catalog row fails the build.
+
+The renderer (`pkg/dashboard/stages.StageFailureHTML`) takes
+pre-resolved title/hint/why/fix strings so this package stays
+free of `pkg/whycopy`/`pkg/api` (circular-import hazard via
+`pkg/state` → `pkg/api`). The caller resolves via
+`whycopy.Decorate(&problem, code, observed)` first, then
+composes into the helper's positional args.
+
+Codes shipped:
+
+| Code | Title |
+|------|-------|
+| `stage_source_download_failed` | Source download failed |
+| `stage_dependency_restore_failed` | Dependencies restore failed |
+| `stage_image_build_oom` | Image build ran out of memory |
+| `stage_image_build_timeout` | Image build timed out |
+| `stage_security_scan_findings` | Security scan flagged findings |
+| `stage_snapshot_prepare_timeout` | Snapshot prepare timed out |
+| `stage_readiness_failed` | Readiness probe failed |
+
+Closed-set guard at the detection site mirrors cluster A:
+the imaged handler must stamp one of these codes on the
+`deployments.ErrorCode` column when a stage fails, otherwise
+the renderer degrades to the bare-reason fallback (no
+empty `<p>` shells leak through — pinned by
+`TestStageFailureHTML_EmptyDecorationsFallbackToReason`).
+
+### C4 — SLO histograms
+
+New `*_deploy_stage_duration_seconds{stage=,status=}`
+`HistogramVec` in `pkg/wire/metrics.go` mirroring the
+`wakeLatencyByPhase` pattern at `pkg/gateway/metrics.go:628-639`.
+Buckets: `0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300` (skew to the
+long tail so a stalled `image_build` surfaces as a top-bucket
+observation rather than `+Inf`).
+
+The (stage × status) Cartesian is pre-instantiated at boot so
+`/metrics` surfaces zero on first scrape — the §12 panel
+needs zero-bucket observations to render p95/p99 without
+"no data". Pinned by
+`TestOpsMetrics_ObserveDeployStageDuration`.
+
+Observation sites: end of `transitionWithStage`
+(`pkg/imaged/handler.go:2469`, status=completed) and end of
+`MarkDeploymentStageFailed` (status=failed). The nil-receiver
+guard means the call site is unconditional.
+
+### C5 — Dashboard SSE for live stage updates
+
+The dashboard deployment-detail page subscribes to the
+existing `GET /v1/deployments/{id}/logs` SSE channel
+(`cmd/apid/handlers_ext.go:4350-4416` `emitStageFrame`). New
+`renderDeploymentDetailStagesPartial` handler returns the
+timeline fragment only; HTMX swap-in via
+`hx-trigger="sse:stage"` on the `.stage-timeline` block.
+Same auth chain, same IDOR posture (read-only on the
+authorized row).
+
+SSE backstop: the existing 10-min `streamDeploymentLogs`
+backstop timer means a long-running deploy may disconnect;
+htmx-ext-sse reconnects transparently. A dedicated reconnect
+loop is a follow-up.
+
+### Closed-vocab invariant preserved
+
+The closed-6-stage vocabulary stays closed at all three layers
+(Go const, sqlc enum, migration 00302 CHECK). C3's
+`CodeStage*` codes are a closed set in `pkg/api/errors.go`,
+mirrored 1:1 in `pkg/whycopy/whycopy.go` via the existing
+tripwire.
+
+C2's retry accepts any `from_stage ∈ closed-6` (a `source_download`
+retry re-runs the whole pipeline — see C2 above).
+
+C1's trim is history-cap, not vocabulary-cap.
+
+### IDOR posture
+
+C2/C5 reads/writes go through the same authorized row path.
+The retry handler validates `from_stage ∈ closed-6` before
+insert (400 on unknown). The dashboard SSE partial handler is
+inside the dashboardChain (`cmd/apid/server.go:1539`
+precedent); `dep.AppID != app.ID` guard unchanged.
+
+### Branch
+
+- `worktree-feat-deploys-stages-prod-ready` (single PR,
+  4 atomic commits):
+  - Commit 1: C3 (error taxonomy) + C4 (SLO histogram) + this
+    ADR amendment (doc-only). The metric test pins the
+    pre-instantiation surface.
+  - Commit 2: C1 (retention). Doc-only migration at slot
+    00340; trim happens Go-side at the existing read-modify-
+    write site. pg + memstore tests pin the FIFO trim.
+  - Commit 3: C2 (retry endpoint + CLI). One new apid route +
+    one new SDK method + one new CLI subcommand. Migration
+    slot precheck via the cross-PR fence pattern (slot 00340
+    reservation; main has likely moved past 00330+ per recent
+    slot-dance chains).
+  - Commit 4: C5 (dashboard SSE) + per-row retry button.
+    HTMX swap-in against the existing logs SSE channel.
+
+### Estimated scope
+
+~1000-1300 LOC across ~25 files (4 new files: metric test,
+retry handler, CLI retry, stages-partial handler; +21
+touched files). 1 new migration (slot 00340, doc-only).
+~10-15 new `CodeStage*` constants + matching `pkg/whycopy`
+rows. 1 new Prometheus histogram + label set. 1 new SDK
+method (`RetryDeploymentFromStage`). 1 new apid route
+(`POST /v1/apps/{slug}/deployments/{id}/retry`). 1 new
+dashboard route (`GET .../stages-partial` for HTMX SSE
+swap). 1 new CLI subcommand (`gregale deploys retry`). 1 ADR
+amendment (this section). 25/25 CI gates must pass per
+commit (matching PR #1002's green run).

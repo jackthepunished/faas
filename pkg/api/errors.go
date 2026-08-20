@@ -374,8 +374,30 @@ const (
 	CodeBuildUndetected      = "build_undetected"
 	CodeBuildOOM             = "build_oom"
 	CodeBuildTimeout         = "build_timeout"
-	CodeQuotaExhausted       = "quota_exhausted"
-	CodeBillingPastDue       = "billing_past_due"
+	// CodeStage* (ADR-117 §Production-ready follow-on): per-stage
+	// RFC 7807 stable codes for the closed-6 deploy stage vocabulary.
+	// Distinct from CodeBuildXXX (which mark the whole build VM's
+	// fate) — CodeStageXXX marks which stage tripped. The same code
+	// may surface as the deployment row's error_code (cluster-A
+	// path) AND on the stage row's failure reason (the renderer
+	// path). The renderer (pkg/dashboard/stages.FormatStageDuration
+	// + StageFailureHTML) consults pkg/whycopy for the customer-
+	// facing prose; these constants are the catalog keys.
+	//
+	// Codes are emitted by pkg/imaged.transitionWithStage /
+	// markDeployFailed when they can identify a single stage cause.
+	// A failure that does not map to one of these codes still flows
+	// through the renderer — it just renders the bare "failed:
+	// <reason>" string without the structured Hint/Why/Fix block.
+	CodeStageSourceDownloadFailed    = "stage_source_download_failed"
+	CodeStageDependencyRestoreFailed = "stage_dependency_restore_failed"
+	CodeStageImageBuildOOM           = "stage_image_build_oom"
+	CodeStageImageBuildTimeout       = "stage_image_build_timeout"
+	CodeStageSecurityScanFindings    = "stage_security_scan_findings"
+	CodeStageSnapshotPrepareTimeout  = "stage_snapshot_prepare_timeout"
+	CodeStageReadinessFailed         = "stage_readiness_failed"
+	CodeQuotaExhausted               = "quota_exhausted"
+	CodeBillingPastDue               = "billing_past_due"
 	// CodeBillingNotImplemented is returned when the selected
 	// billing provider (FAAS_BILLING_PROVIDER) does not implement the
 	// requested method (issue #279: Paddle's Refund). Distinct from
