@@ -156,6 +156,13 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// corsPresets mirrors cors_presets (issue #975 item #4 /
+	// Mega-Foundation #979-b). Keyed by presetID. PR-A exposes
+	// only the read path; the write surface lives in PR-B
+	// (#979-c, slot 00295) alongside the per-rule cors.preset_id
+	// field. Mirroring the read path here means handler tests
+	// can exercise the compile-side merge without a live PG.
+	corsPresets map[string]CorsPreset
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -555,6 +562,7 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
+		corsPresets:          map[string]CorsPreset{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
@@ -10750,6 +10758,86 @@ func (m *MemStore) GetEdgeRuleByID(_ context.Context, id string) (EdgeRule, erro
 		return EdgeRule{}, ErrNotFound
 	}
 	return r, nil
+}
+
+// ListCorsPresetsForAccount mirrors the pgstore query: every
+// preset the account owns (both account-wide and app-scoped). The
+// (app_id NULLS FIRST, name) order keeps the compile-side cache
+// key deterministic — see cmd/gatewayd-internal/edge_rules.go.
+func (m *MemStore) ListCorsPresetsForAccount(_ context.Context, accountID string) ([]CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AccountID == accountID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// AppID == "" means account-wide (NULL in pg). The
+		// NULLS FIRST order puts account-wide presets before
+		// app-scoped ones in the returned slice so a stable
+		// "preset defined first wins" override rule has a
+		// defined tiebreak.
+		iWide := out[i].AppID == ""
+		jWide := out[j].AppID == ""
+		if iWide != jWide {
+			return iWide
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// ListCorsPresetsForApp returns the app-scoped presets only,
+// scoped to the caller's account. The compile path unions this
+// with the account-wide result from ListCorsPresetsForAccount.
+// accountID is defense-in-depth (the apps row is FK-scoped to
+// one account, so the appID match alone is sufficient); the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+// Empty appID is rejected so the strict-scope contract cannot
+// be subverted by a caller passing "" (which would otherwise
+// match the AppID="" of every account-wide preset — see the
+// medium-code-review IDOR finding for the historical pg/memstore
+// divergence).
+func (m *MemStore) ListCorsPresetsForApp(_ context.Context, accountID, appID string) ([]CorsPreset, error) {
+	if appID == "" {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AccountID == accountID && p.AppID == appID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// GetCorsPresetByID returns the preset scoped to the caller's
+// account or ErrNotFound. accountID is required so the Store
+// boundary enforces tenancy — the pgstore equivalent pins
+// account_id in the WHERE clause, this mirror keeps the two
+// stores behaviorally aligned.
+func (m *MemStore) GetCorsPresetByID(_ context.Context, accountID, id string) (CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.corsPresets[id]
+	if !ok {
+		return CorsPreset{}, ErrNotFound
+	}
+	if p.AccountID != accountID {
+		// Cross-tenant probe: surface as ErrNotFound so the
+		// wire-side message is stable (matches the pgstore
+		// behavior where a WHERE on account_id returns no rows).
+		return CorsPreset{}, ErrNotFound
+	}
+	return p, nil
 }
 
 // UpdateEdgeRule mirrors the pgstore nil-skip semantics. Action

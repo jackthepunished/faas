@@ -6812,6 +6812,155 @@ func (s *PgStore) GetEdgeRuleByID(ctx context.Context, id string) (EdgeRule, err
 	return scanEdgeRule(row)
 }
 
+// corsPresetSelectCols is the single source of column order for
+// cors_presets. The select clause above is the contract — every
+// SELECT against cors_presets lists these columns in this order, and
+// the SELECT statement binds Scan's positional arguments against
+// this list. A future column add lands here first, in the same
+// commit, so a SELECT-write drift cannot silently swallow a column.
+//
+// Ordering matches the table definition in
+// migrations/00294_cors_presets.sql (column list 1:1). nullable
+// pointers (Description, AppID) come before the NOT NULL fields so
+// Scan can target them.
+const corsPresetSelectCols = `id, account_id, app_id, name, description,
+       allow_origins, allow_methods, allow_headers, expose_headers,
+       allow_credentials, max_age_seconds, created_at, updated_at`
+
+// scanCorsPreset reads a single row. ErrNotFound on no-rows; raw
+// error otherwise. All non-uuid / non-text[] fields are scanned
+// directly; the text[] fields are pulled into []string by pgx's
+// built-in array codec (registered on the pool's AfterConnect
+// hook).
+func scanCorsPreset(row pgx.Row) (CorsPreset, error) {
+	r, err := scanCorsPresetCols(row.Scan)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CorsPreset{}, ErrNotFound
+		}
+		return CorsPreset{}, err
+	}
+	return r, nil
+}
+
+// scanCorsPresets reads every row from a Rows iterator. The caller
+// owns the rows.Close() lifetime — this helper only walks the
+// iterator.
+func scanCorsPresets(rows pgx.Rows) ([]CorsPreset, error) {
+	var out []CorsPreset
+	for rows.Next() {
+		r, err := scanCorsPresetCols(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// scanCorsPresetCols is the column-ordered Scan shared by both the
+// single-row and Rows-iterator paths. Keeping a single function
+// guarantees the SELECT statement, the const above, and the
+// positional Scan arguments can never drift apart.
+func scanCorsPresetCols(scan func(...any) error) (CorsPreset, error) {
+	var (
+		r             CorsPreset
+		appID         *string
+		description   *string
+		allowOrigins  []string
+		allowMethods  []string
+		allowHeaders  []string
+		exposeHeaders []string
+	)
+	if err := scan(
+		&r.ID, &r.AccountID, &appID, &r.Name, &description,
+		&allowOrigins, &allowMethods, &allowHeaders, &exposeHeaders,
+		&r.AllowCredentials, &r.MaxAgeSeconds, &r.CreatedAt, &r.UpdatedAt,
+	); err != nil {
+		return CorsPreset{}, err
+	}
+	if appID != nil {
+		r.AppID = *appID
+	}
+	if description != nil {
+		r.Description = *description
+	}
+	// pgx decodes a DB empty text[] as a Go nil []string. The
+	// merge helper treats len==0 as "take the other side", so a
+	// round-trip of a preset that deliberately shipped no
+	// headers would silently inherit the rule's value. Coalesce
+	// nil to an empty slice so the round-trip is identity.
+	r.AllowOrigins = nilToEmpty(allowOrigins)
+	r.AllowMethods = nilToEmpty(allowMethods)
+	r.AllowHeaders = nilToEmpty(allowHeaders)
+	r.ExposeHeaders = nilToEmpty(exposeHeaders)
+	return r, nil
+}
+
+// nilToEmpty coalesces a Go nil []string to an empty slice. Used
+// at the pgx scan boundary so the round-trip of an empty text[]
+// column is identity (the DB default '{}' reads back as a Go nil
+// slice; callers cannot distinguish nil from [] otherwise).
+func nilToEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// ListCorsPresetsForAccount returns every preset the account owns.
+// Both account-wide (app_id IS NULL) and app-scoped (app_id = $2)
+// presets are returned so the gatewayd compile path can apply the
+// per-app overlay from a single round trip. The (account_id, name)
+// ordering matches the deterministic cache key the compile path
+// hashes — keeping the order stable lets the gatewayd side compute
+// a content hash for "no change since last refresh" without
+// re-sorting.
+func (s *PgStore) ListCorsPresetsForAccount(ctx context.Context, accountID string) ([]CorsPreset, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 order by app_id NULLS FIRST, name asc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCorsPresets(rows)
+}
+
+// ListCorsPresetsForApp returns the app-scoped presets for one
+// app, scoped to the caller's account. (account-wide presets —
+// app_id IS NULL — are not returned here; the compile path merges
+// them via ListCorsPresetsForAccount + ListCorsPresetsForApp.)
+// accountID is defense-in-depth: the apps row is already FK-scoped
+// to one account so a WHERE on app_id alone is sufficient, but the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+func (s *PgStore) ListCorsPresetsForApp(ctx context.Context, accountID, appID string) ([]CorsPreset, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 and app_id = $2 order by name asc`, accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCorsPresets(rows)
+}
+
+// GetCorsPresetByID returns one preset scoped to the caller's
+// account or ErrNotFound. The account_id predicate is in the WHERE
+// clause so a cross-tenant lookup returns ErrNotFound (the
+// pgx row.Scan errors on no rows), never a row from another
+// tenant. The compile path uses this to resolve the preset_id
+// stamped on a kind=cors rule; PR-B's apid CRUD surface also
+// calls this and benefits from the same tenancy-at-the-boundary
+// guarantee.
+func (s *PgStore) GetCorsPresetByID(ctx context.Context, accountID, id string) (CorsPreset, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 and id = $2`, accountID, id)
+	return scanCorsPreset(row)
+}
+
 // UpdateEdgeRule coalesces the optional fields onto edge_rules. The
 // nil-skip pattern is identical to UpdateAlertRule; Action uses the
 // `case when $N then $N+1::jsonb else action end` shape so a nil

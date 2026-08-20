@@ -53,6 +53,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
 			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1,
+			// issue #975 #4 / Mega-Foundation #979-b — Free is the abuse-floor tier;
+			// the abstraction is the upsell. PR-B (#979-c) wires the writer.
+			CorsPresetsPerAccount: 0, CorsPresetsPerApp: 0, CorsPresetMaxOrigins: 0, CorsPresetMaxAllowMethods: 0, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Free is the abuse-floor
 			// tier. The `tenant_surfaces` feature is the upsell; Free
 			// customers carry the single-tenant case via the legacy
@@ -172,6 +175,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
 			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5,
+			// issue #975 #4 / Mega-Foundation #979-b — Hobby is the entry paid tier.
+			CorsPresetsPerAccount: 10, CorsPresetsPerApp: 5, CorsPresetMaxOrigins: 25, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Hobby is the entry
 			// paid tier. 1 surface with up to 10 verified hostnames.
 			// The "single SaaS customer, handful of end-customer
@@ -286,6 +291,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
 			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25,
+			// issue #975 #4 / Mega-Foundation #979-b — Pro is the typical SaaS tier.
+			CorsPresetsPerAccount: 50, CorsPresetsPerApp: 15, CorsPresetMaxOrigins: 100, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
 			// with up to 50 verified hostnames each. Each surface
 			// still binds to one app (the multi-app variant is the
@@ -403,6 +410,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
 			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100,
+			// issue #975 #4 / Mega-Foundation #979-b — Scale is the large-fleet tier.
+			CorsPresetsPerAccount: 250, CorsPresetsPerApp: 50, CorsPresetMaxOrigins: 500, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
 			// with up to 250 verified hostnames each. The 250 cap is
 			// bounded by LE's 100-SAN-per-cert limit (per_host_san
@@ -2209,6 +2218,82 @@ func TestDataPlacementHintsPerApp_MonotonicLadder(t *testing.T) {
 			t.Errorf("%s.DataPlacementHintsPerApp (%d) < %s.DataPlacementHintsPerApp (%d)",
 				ladder[i], currL.DataPlacementHintsPerApp,
 				ladder[i-1], prevL.DataPlacementHintsPerApp)
+		}
+	}
+}
+
+// TestPlanCorsPresetLimits pins the per-plan CORS preset cap ladder
+// (issue #975 item #4 / Mega-Foundation #979-b, slot 00294). The
+// progression matches the documented per-plan posture:
+//
+//	Free  = 0/0/0/0/64      (abuse-floor — abstraction is the upsell)
+//	Hobby = 10/5/25/8/64    (entry paid)
+//	Pro   = 50/15/100/8/64  (typical SaaS)
+//	Scale = 250/50/500/8/64 (large fleet)
+//
+// Field order is per-account, per-app, max-origins, max-methods,
+// max-name-length. Unknown plans fail closed (return 0 for caps,
+// 0 for name length) so a missing plan row never silently unlocks
+// the abstraction. apid-Validate's CreateCorsPreset handler (PR-B,
+// slot 00295) trips the per-plan caps at insert time.
+func TestPlanCorsPresetLimits(t *testing.T) {
+	cases := []struct {
+		plan           Plan
+		wantPerAcct    int
+		wantPerApp     int
+		wantMaxOrigins int
+		wantMaxMethods int
+		wantMaxName    int
+	}{
+		{PlanFree, 0, 0, 0, 0, 64},
+		{PlanHobby, 10, 5, 25, 8, 64},
+		{PlanPro, 50, 15, 100, 8, 64},
+		{PlanScale, 250, 50, 500, 8, 64},
+		{Plan("unknown"), 0, 0, 0, 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.CorsPresetsPerAccount(); got != c.wantPerAcct {
+			t.Errorf("%s.CorsPresetsPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+		if got := c.plan.CorsPresetsPerApp(); got != c.wantPerApp {
+			t.Errorf("%s.CorsPresetsPerApp() = %d, want %d", c.plan, got, c.wantPerApp)
+		}
+		if got := c.plan.CorsPresetMaxOrigins(); got != c.wantMaxOrigins {
+			t.Errorf("%s.CorsPresetMaxOrigins() = %d, want %d", c.plan, got, c.wantMaxOrigins)
+		}
+		if got := c.plan.CorsPresetMaxAllowMethods(); got != c.wantMaxMethods {
+			t.Errorf("%s.CorsPresetMaxAllowMethods() = %d, want %d", c.plan, got, c.wantMaxMethods)
+		}
+		if got := c.plan.CorsPresetMaxNameLength(); got != c.wantMaxName {
+			t.Errorf("%s.CorsPresetMaxNameLength() = %d, want %d", c.plan, got, c.wantMaxName)
+		}
+	}
+}
+
+// TestPlanCorsPresetLimits_MonotonicLadder pins that the per-plan
+// CORS preset cap ladder is non-decreasing across the upgrade
+// curve. A regression where Pro < Hobby or Scale < Pro breaks the
+// upgrade story; a customer who outgrows Hobby should land on a
+// higher Pro number, not a lower one.
+func TestPlanCorsPresetLimits_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.CorsPresetsPerAccount < prevL.CorsPresetsPerAccount {
+			t.Errorf("%s.CorsPresetsPerAccount (%d) < %s.CorsPresetsPerAccount (%d)",
+				ladder[i], currL.CorsPresetsPerAccount,
+				ladder[i-1], prevL.CorsPresetsPerAccount)
+		}
+		if currL.CorsPresetsPerApp < prevL.CorsPresetsPerApp {
+			t.Errorf("%s.CorsPresetsPerApp (%d) < %s.CorsPresetsPerApp (%d)",
+				ladder[i], currL.CorsPresetsPerApp,
+				ladder[i-1], prevL.CorsPresetsPerApp)
+		}
+		if currL.CorsPresetMaxOrigins < prevL.CorsPresetMaxOrigins {
+			t.Errorf("%s.CorsPresetMaxOrigins (%d) < %s.CorsPresetMaxOrigins (%d)",
+				ladder[i], currL.CorsPresetMaxOrigins,
+				ladder[i-1], prevL.CorsPresetMaxOrigins)
 		}
 	}
 }

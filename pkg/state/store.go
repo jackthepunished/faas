@@ -15,6 +15,19 @@ import (
 // ErrNotFound is returned by Store reads when a row does not exist.
 var ErrNotFound = errors.New("state: not found")
 
+// ErrCorsWildcardWithCredentials is returned by
+// MergeCorsPresetIntoRule when the merged AllowOrigins contains
+// the bare "*" wildcard alongside AllowCredentials: true. This is
+// the same footgun EdgeRuleCORSAction.Validate rejects at
+// create-time (ADR-091 D12, pkg/api/dto.go) — a merge can
+// reconstruct the dangerous combination from a rule with
+// AllowCredentials: false and a preset with AllowCredentials:
+// true (or vice versa), so the merge helper re-runs the same
+// guard. The wire-side apid boundary maps this to 422 with the
+// same message shape as the create-time gate so the customer
+// sees one stable error message.
+var ErrCorsWildcardWithCredentials = errors.New("state: cors action cannot combine AllowCredentials: true with AllowOrigins: [\"*\"]")
+
 // ErrInvalidTrafficPercent is returned by UpdateDeploymentTraffic
 // (and the create-deployment range-check backstop) when the
 // requested traffic_percent falls outside [0, 100]. The CHECK
@@ -2243,6 +2256,33 @@ type Store interface {
 	// the full action body.
 	UpdateEdgeRule(ctx context.Context, id string, params UpdateEdgeRuleParams) (EdgeRule, error)
 	DeleteEdgeRule(ctx context.Context, id string) error
+	// ListCorsPresetsForAccount returns every preset the account
+	// owns (both account-wide and app-scoped). The gatewayd cache
+	// refreshes its preset map on pg_notify('cors_preset_changed')
+	// and on boot reads via this path. The ordered-by-name return
+	// keeps the deterministic cache key (per cmd/gatewayd-internal
+	// /edge_rules.go::compileCORSRules).
+	ListCorsPresetsForAccount(ctx context.Context, accountID string) ([]CorsPreset, error)
+	// ListCorsPresetsForApp returns the app-scoped presets for one
+	// app. accountID is required as defense-in-depth so a caller
+	// cannot probe "do I have any preset for this app?" across
+	// tenants — the SQL already pins the row to the app_id (which
+	// is FK-scoped to the account), but passing accountID at the
+	// Store boundary lets the same compile-side IDOR guard the
+	// other read methods use. The compile path in PR-B calls this
+	// to overlay app-scoped presets on top of the account-wide
+	// set returned by ListCorsPresetsForAccount.
+	ListCorsPresetsForApp(ctx context.Context, accountID, appID string) ([]CorsPreset, error)
+	// GetCorsPresetByID returns one preset scoped to the caller's
+	// account or ErrNotFound. accountID is required so the Store
+	// boundary enforces tenancy — PR-B's apid CRUD surface
+	// (GET/PATCH/DELETE by id) calls this directly and cannot
+	// forget the AccountID compare (the previous design pushed the
+	// compare into the merge helper, which is bypassable for any
+	// caller that only wants the row). ErrNotFound is mapped to
+	// 422 at the apid boundary ("preset has been deleted; re-save
+	// the rule") and to 5xx at the gateway compile path.
+	GetCorsPresetByID(ctx context.Context, accountID, id string) (CorsPreset, error)
 	// CountEdgeRulesForApp is the quota check (called by the apid
 	// handler before the insert; the insert itself runs the same
 	// count inside the FOR UPDATE on the apps row).
