@@ -19,7 +19,7 @@ func TestApplyEdgeRuleCache_MissWhenNoRule(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	rec := newTestStatusRecorder(httptest.NewRecorder())
-	got := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
+	got, _ := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
 	if got {
 		t.Fatalf("applyEdgeRuleCache returned true with no rule installed")
 	}
@@ -42,7 +42,7 @@ func TestApplyEdgeRuleCache_BypassOnAuthorization(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	req.Header.Set("Authorization", "Bearer some-token")
 	rec := newTestStatusRecorder(httptest.NewRecorder())
-	got := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
+	got, _ := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
 	if got {
 		t.Fatalf("authed request should bypass cache")
 	}
@@ -68,7 +68,7 @@ func TestApplyEdgeRuleCache_MethodGateOnlyGet(t *testing.T) {
 	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
 		req := httptest.NewRequest(method, "http://jane-api.apps.dom/catalog", nil)
 		rec := newTestStatusRecorder(httptest.NewRecorder())
-		got := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
+		got, _ := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
 		if got {
 			t.Errorf("%s should be method-gated out", method)
 		}
@@ -109,7 +109,7 @@ func TestApplyEdgeRuleCache_HitReplaysBody(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
-	got := h.applyEdgeRuleCache(w, req, app, rec)
+	got, _ := h.applyEdgeRuleCache(w, req, app, rec)
 	if !got {
 		t.Fatalf("applyEdgeRuleCache returned false on a fresh hit")
 	}
@@ -159,7 +159,7 @@ func TestApplyEdgeRuleCache_StaleNotServedOnMiss(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	w := httptest.NewRecorder()
 	rec := newTestStatusRecorder(w)
-	got := h.applyEdgeRuleCache(w, req, app, rec)
+	got, _ := h.applyEdgeRuleCache(w, req, app, rec)
 	if got {
 		t.Fatalf("stale entry must not be served on the normal hit path")
 	}
@@ -174,7 +174,7 @@ func TestApplyEdgeRuleCache_NilCacheReturnsFalse(t *testing.T) {
 	// Don't call WithResponseCache.
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/catalog", nil)
 	rec := newTestStatusRecorder(httptest.NewRecorder())
-	got := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
+	got, _ := h.applyEdgeRuleCache(rec, req, App{ID: "app-1", Plan: api.PlanPro}, rec)
 	if got {
 		t.Fatalf("nil cache must produce false (fall through to wake)")
 	}

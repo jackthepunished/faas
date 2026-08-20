@@ -4733,8 +4733,35 @@ haveApp:
 	// preflight OPTIONS) so preflight responses are never
 	// cached — an OPTIONS cached against the wrong Origin is a
 	// real CORS bypass.
-	if h.applyEdgeRuleCache(w, r, app, rec) {
+	cacheRule := (*EdgeRuleCacheResolved)(nil)
+	if served, rule := h.applyEdgeRuleCache(w, r, app, rec); served {
 		return
+	} else if rule != nil && h.responseCache != nil && r.Header.Get("Authorization") == "" && !hasSessionCookie(r) && (r.Method == "GET" || r.Method == "HEAD") {
+		// Miss path — install the cacheWriter tee so the
+		// upstream response populates the cache. The rule
+		// non-nil + auth-bypass-clear + method-in-vocab
+		// predicate is repeated here (rather than threaded
+		// back through applyEdgeRuleCache) so the security
+		// check is the single chokepoint: an authed request
+		// cannot reach the tee even if applyEdgeRuleCache
+		// itself short-circuited to a miss.
+		cw := newCacheWriter(w, rec, rule, ResponseCachePerEntryMaxBytes)
+		w = cw
+		cacheRule = rule
+		defer func() {
+			if cw.shouldStore() {
+				key := CacheKey{
+					AppID:          app.ID,
+					DeploymentID:   "",
+					RuleID:         rule.ID,
+					Method:         r.Method,
+					NormalizedPath: r.URL.Path,
+					VaryHash:       computeVaryHash(r, rule.VaryOn),
+				}
+				cw.finishCacheCapture(h.responseCache, key, time.Now())
+			}
+		}()
+		_ = cacheRule
 	}
 
 	// Issue #463 / ADR-069 / ADR-071 / PR-C §5: resolve the

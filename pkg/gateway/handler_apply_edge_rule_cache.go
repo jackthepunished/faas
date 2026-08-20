@@ -10,7 +10,9 @@ import (
 // (the caller MUST stop processing — no wake gate, no auth, no
 // metrics increment beyond the cache outcome counter) and false
 // on a miss (the caller falls through to the wake gate as
-// before).
+// before). The third return is the matched rule (nil when no
+// rule matched), reused by the store path so we don't run the
+// matcher twice on the same request.
 //
 // Placement invariant: this function is called AFTER
 // enforceRequireAuthn + enforcePublicAuth (so a cache hit cannot
@@ -38,9 +40,9 @@ import (
 // hit metric, and returns true. The applier is the only
 // writer of the cache outcome counter for the "hit" outcome;
 // commit 15 wires the other outcomes.
-func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app App, rec *statusRecorder) bool {
+func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app App, rec *statusRecorder) (bool, *EdgeRuleCacheResolved) {
 	if h == nil || h.responseCache == nil || h.edgeRules == nil {
-		return false
+		return false, nil
 	}
 	// Pre-flight: deny-by-default on credentialed requests. The
 	// check runs BEFORE the matcher so we don't even consult the
@@ -49,16 +51,16 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	// "authed requests are NEVER cached", which means the cache
 	// store path never sees them either.
 	if r.Header.Get("Authorization") != "" {
-		return false
+		return false, nil
 	}
 	if hasSessionCookie(r) {
-		return false
+		return false, nil
 	}
 	// Method gate: only {GET, HEAD} are cacheable. POST/PUT/etc.
 	// are method-level uncacheable per ADR-122 D3.
 	method := strings.ToUpper(r.Method)
 	if method != "GET" && method != "HEAD" {
-		return false
+		return false, nil
 	}
 	host := r.Host
 	if host == "" {
@@ -67,7 +69,7 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	path := r.URL.Path
 	rule := h.edgeRules.MatchCache(r.Context(), host, path, method)
 	if rule == nil {
-		return false
+		return false, nil
 	}
 	// Apply the rule's method filter as a defence-in-depth pass:
 	// the matcher already filtered by methods, but a rule with
@@ -75,7 +77,7 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	// the closed cacheable-method vocab before consulting the
 	// cache.
 	if rule.Methods != nil && !rule.Methods[method] {
-		return false
+		return false, nil
 	}
 	// Build the cache key. DeploymentID is empty in v1 because
 	// the App value type doesn't carry one — plumbed in a
@@ -129,7 +131,7 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		// gates it; for now we just call observe with the
 		// cached status.
 		h.observe(r, entry.statusCode, app.ID, string(app.Plan), false, Target{})
-		return true
+		return true, rule
 	case "stale_if_error_eligible":
 		// Past fresh, inside stale_if_error window. Per
 		// ADR-122 D5: stale serves ONLY on origin failure
@@ -142,12 +144,12 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		// responsibility of commit 13's
 		// applyEdgeRuleCacheStaleOnError wrapper (called
 		// from the gate-failure branch).
-		return false
+		return false, rule
 	case "":
 		// Miss. Fall through to the wake gate.
-		return false
+		return false, rule
 	}
-	return false
+	return false, rule
 }
 
 // hasSessionCookie reports whether the request carries a session
