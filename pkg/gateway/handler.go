@@ -4402,7 +4402,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// than inside stampRequestBudget itself. This keeps cold-start and proxy
 	// work alive for the allotted budget while still releasing the timer on
 	// every return path.
-	defer func() { cancelStampedRequestBudget(r.Context()) }()
+	defer func(ctx context.Context) { cancelStampedRequestBudget(ctx) }(r.Context())
 
 	// Drain tracker (issue #587 / PR-A): the returned closure fires
 	// on every return path below, including the early-out problem
@@ -4876,6 +4876,7 @@ haveApp:
 	// bridge on transport/liveness failures; ordinary guest 502/503 responses
 	// are therefore left untouched.
 	staleSignal := &staleTargetSignal{}
+	//nolint:contextcheck // withStaleTargetSignal intentionally inherits r.Context.
 	r = r.WithContext(withStaleTargetSignal(r.Context(), staleSignal))
 
 	// Streaming decision (PR-B / ADR-047). Four-way AND: the operator
@@ -5098,6 +5099,7 @@ haveApp:
 		capped := h.setupBufferedCapWriter(w, app, planCap)
 		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
 	}
+	//nolint:contextcheck // staleTargetDetected only reads the marker from r.Context.
 	if staleTargetDetected(r.Context()) {
 		if evictor, ok := h.backend.(interface {
 			EvictInstance(appID, instanceID string)

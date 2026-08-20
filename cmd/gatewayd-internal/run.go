@@ -402,6 +402,9 @@ func (a *synthAdapter) forwardInvocation(ctx context.Context, target gateway.Tar
 	req.Header.Set("x-faas-invocation-source", string(inv.Source))
 	req.Header.Set("x-faas-instance", target.InstanceID)
 	req.Header.Set("x-faas-node", target.NodeID)
+	// The synthetic marker is intentionally attached to this derived request
+	// context so the internal bridge can preserve platform-owned headers.
+	//nolint:contextcheck // gateway.WithSyntheticInvocation inherits req.Context.
 	req = req.WithContext(gateway.WithSyntheticInvocation(req.Context()))
 
 	rec := httptest.NewRecorder()

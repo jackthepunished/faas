@@ -839,6 +839,9 @@ func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 // This is intentionally small rather than a shell parser: deploy-managed
 // files contain KEY=value lines, comments, and optional single/double quotes.
 func readDatabaseEnvFile(path string) (string, bool) {
+	// path is the deploy-managed systemd environment file selected by the
+	// local release-install flow, not a customer upload path.
+	//nolint:forbidigo // vetted deploy-managed environment file.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false

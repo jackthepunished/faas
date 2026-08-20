@@ -931,7 +931,7 @@ func (b *Builderd) materializeSource(ctx context.Context, buildID, path string) 
 		}
 		return fmt.Errorf("builderd: fetch source archive: %w", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o750); err != nil {

@@ -183,11 +183,14 @@ func publishSource(ctx context.Context, be storage.StorageBackend, buildID, path
 	if be == nil {
 		return nil
 	}
+	// SourcePath is a server-created spool path, not customer-supplied input;
+	// the apid upload/github bridge has already validated and materialized it.
+	//nolint:forbidigo // vetted server-created source spool path.
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open source archive: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := be.Put(ctx, "sources/"+buildID+".tar.gz", f); err != nil {
 		return fmt.Errorf("publish source archive: %w", err)
 	}

@@ -337,7 +337,7 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	}
 	for name, vals := range stripHopByHop(r.Header) {
 		if strings.HasPrefix(strings.ToLower(name), "x-faas-") &&
-			!(isSyntheticInvocation(r.Context()) && strings.EqualFold(name, "x-faas-invocation-id")) {
+			(!isSyntheticInvocation(r.Context()) || !strings.EqualFold(name, "x-faas-invocation-id")) {
 			continue
 		}
 		for _, v := range vals {
