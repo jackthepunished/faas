@@ -47,18 +47,10 @@ jobs:
           # 'security-and-quality' adds lint-style checks (unpinned
           # dependencies, etc.) on top of pure security queries.
           queries: security-and-quality
-          # Issue #995 / ADR-121 — capWriter in proxy.go is a
-          # transparent ResponseWriter pass-through for the apid
-          # loopback proxy. The upstream bound to loopback only
-          # emits application/json, application/problem+json, or
-          # text/plain — the HTML/script sink CodeQL's
-          # go/reflected-xss query targets is structurally
-          # unreachable. Excluding the file shuts the recurring
-          # false positive at the source. Mirrors the manual
-          # dismissal precedent at alert #146
-          # (pkg/gateway/handler.go:3932). The full rationale lives
-          # in ./.github/codeql/codeql-config.yml.
-          paths-ignore: cmd/gatewayd-internal/proxy.go
+          # Issue #995 / ADR-121 — paths-ignore lives in the
+          # separate config file referenced below; see the file's
+          # header comment for rationale.
+          config-file: ./.github/codeql/codeql-config.yml
 
       # 'autobuild' detects the build system. For Go: `go build ./...`.
       # For 'actions' (workflow yaml): no build step needed.
