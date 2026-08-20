@@ -290,8 +290,8 @@ func (m *WakePhaseMetrics) ObserveWakePhase(phase string, ms int64) {
 //
 //   - vmmd_guest_liveness_probe_seconds{outcome}: histogram of the
 //     wall-clock duration for one probe (host dial + JSON RTT). Outcomes
-//     are the closed set {ok, non_200, timeout, conn_refused, conn_err}
-//     — the same five classes the host's failure counter tracks.
+//     are the closed set {ok, non_200, unauthorized, timeout, conn_refused,
+//     conn_err} — the same six classes the host's failure counter tracks.
 //   - vmmd_guest_liveness_consecutive_failures{instance}: per-instance
 //     gauge of the current consecutive-failure count. Resets to 0 on
 //     a 2xx response; ticks up on every non-2xx. The

@@ -123,9 +123,9 @@ type livenessProbeLoop struct {
 	count        int // current consecutive-failure count
 	// probeFn is the test seam: production code uses dialAndProbe
 	// (real AF_VSOCK), tests inject a stub that returns the
-	// closed-set outcome string ("ok", "non_200", "timeout",
-	// "conn_refused", "conn_err"). Default = nil → runOne uses
-	// the real dialAndProbe.
+	// closed-set outcome string ("ok", "non_200", "unauthorized",
+	// "timeout", "conn_refused", "conn_err"). Default = nil →
+	// runOne uses the real dialAndProbe.
 	probeFn func(ctx context.Context, timeoutMs int) string
 	// nowFn is the clock seam (issue #554 closure / ADR-078
 	// cooldown gate). Production = time.Now; tests inject a

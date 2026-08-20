@@ -527,7 +527,8 @@ func (e TailFailed) Payload() map[string]any {
 // payload is the closed (instance_id, app_id, deployment_id)
 // tuple + the reason classifier so the dashboard's
 // "liveness: failure cause (5m)" panel can group by
-// {timeout, conn_refused, conn_err, non_200, n_consecutive}.
+// {timeout, conn_refused, conn_err, non_200, unauthorized,
+// n_consecutive}.
 type LivenessFailed struct {
 	EmitAt       time.Time
 	InstanceID   string
