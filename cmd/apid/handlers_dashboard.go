@@ -91,6 +91,19 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 				s.renderDeploymentDetail(w, r, log, acct, dslug, did)
 				return
 			}
+			// Per-domain doctor drill-down (ADR-120 Tier A2):
+			// /dashboard/apps/{slug}/domains/{domain}/doctor
+			// renders the 5-check Render-style report via
+			// pkg/dashboard/templates/domain_doctor.html. Falls
+			// through to renderAppDetail if the suffix doesn't
+			// match the {domain}/doctor shape — same posture as
+			// parseDeployDetailPath above. The IDOR check is the
+			// AppBySlug + AccountID rejection in
+			// renderDomainDoctor.
+			if dslug, domain, ok := parseDomainDoctorPath(slug); ok {
+				s.renderDomainDoctor(w, r, log, acct, dslug, domain)
+				return
+			}
 			s.renderAppDetail(w, r, log, acct, slug)
 		case path == "/dashboard/usage":
 			s.renderUsage(w, r, log, acct)
@@ -2048,4 +2061,101 @@ func projectPreviewItems(rows []state.App, parentSlug, domain string) []dashboar
 		out = append(out, item)
 	}
 	return out
+}
+
+// parseDomainDoctorPath (ADR-120 Tier A2) splits a
+// /dashboard/apps/{slug}/... suffix into (slug, domain, ok)
+// when the suffix matches /domains/{domain}/doctor. Returns
+// ok=false when the suffix doesn't match — caller falls
+// through to renderAppDetail. The match is prefix-based so a
+// future PR can add /domains/{domain}/doctor/{tab} (e.g. a
+// "logs" tab) without breaking the dispatcher. Mirrors
+// parseDeployDetailPath at :1697.
+func parseDomainDoctorPath(rest string) (string, string, bool) {
+	const doctor = "/domains/"
+	i := strings.Index(rest, doctor)
+	if i < 0 {
+		return "", "", false
+	}
+	slug := rest[:i]
+	after := rest[i+len(doctor):]
+	if slug == "" || after == "" {
+		return "", "", false
+	}
+	// Strip the trailing /doctor suffix if present. We use
+	// HasPrefix rather than slicing so a future sub-tab shape
+	// like /domains/{domain}/doctor/logs can be added without
+	// breaking this parser.
+	const doctorTail = "/doctor"
+	if !strings.HasSuffix(after, doctorTail) {
+		return "", "", false
+	}
+	domain := strings.TrimSuffix(after, doctorTail)
+	if domain == "" || strings.Contains(domain, "/") {
+		return "", "", false
+	}
+	return slug, domain, true
+}
+
+// renderDomainDoctor (ADR-120 Tier A2) renders
+// /dashboard/apps/{slug}/domains/{domain}/doctor — the
+// per-domain Render-style drill-down page mirroring the CLI's
+// `gregale domains doctor <domain>` output. The handler reads
+// the same DomainDoctorReport the JSON endpoint returns
+// (cmd/apid/handlers_ext.go::getDomainDoctor) by calling the
+// shared buildDoctorReport helper so the JSON wire shape and
+// the dashboard HTML stay in lockstep — single source of truth
+// for the per-check row + Remediation text.
+//
+// IDOR posture mirrors renderDeploymentDetail: AppBySlug +
+// AccountID rejection (line 1727), then loadDomain (the
+// same ownership check the JSON endpoint uses) to confirm the
+// domain belongs to the same app. Falls through to
+// http.NotFound on either failure so a cross-tenant probe
+// returns 404, not 403 (no signal that the row exists).
+func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug, domain string) {
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		http.NotFound(w, r)
+		return
+	}
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok || d.AppID != app.ID {
+		http.NotFound(w, r)
+		return
+	}
+	report, err := s.buildDoctorReport(ctx, d)
+	if err != nil {
+		log.Warn("dashboard renderDomainDoctor: buildDoctorReport failed", "domain", domain, "err", err)
+		http.Error(w, "doctor unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	view := dashboard.DomainDoctorView{
+		App:        dashboard.AppListItem{Slug: app.Slug},
+		Domain:     report.Domain,
+		AppID:      report.AppID,
+		Healthy:    report.Healthy,
+		Stale:      report.Stale,
+		ObservedAt: report.ObservedAt,
+	}
+	for _, c := range report.Checks {
+		view.Checks = append(view.Checks, dashboard.DashboardDoctorCheck{
+			Name:        c.Name,
+			Status:      c.Status,
+			Detail:      c.Detail,
+			Observed:    c.Observed,
+			Remediation: c.Remediation,
+			CheckedAt:   c.CheckedAt,
+		})
+	}
+	page := dashboard.Page{
+		Title:   "Doctor — " + domain,
+		Body:    "domain_doctor",
+		Account: dashboardAccountView(acct, 0),
+		Data:    view,
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
 }
