@@ -1000,3 +1000,43 @@ func TestWarnIfEmptyAPIKey_TOMLOnlyNoFalsePositive(t *testing.T) {
 		}
 	})
 }
+
+// TestDefaultDeps_MetricsListenAndServe_AppliesCanonicalShape pins the
+// ADR-122 canonical metrics-listener shape at the factory level. The
+// factory binds a real net.Listener (no test stub), inspects the
+// returned *http.Server, then Shutdowns cleanly. The listener timeout
+// values must match cfg.MetricsListener — i.e. the constant fallback
+// path — so a stray edit to either the helper or the api.* family
+// surfaces here.
+//
+// Loopback bind means no port collision with anything else on the
+// test box: the factory picks 127.0.0.1:0 and we never see the port.
+func TestDefaultDeps_MetricsListenAndServe_AppliesCanonicalShape(t *testing.T) {
+	deps := defaultDeps()
+	if deps.metricsListenAndServe == nil {
+		t.Fatal("defaultDeps.metricsListenAndServe is nil")
+	}
+	mux := http.NewServeMux()
+	cfg := &Config{} // all zeros → MetricsListener falls back to constants
+	readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
+	srv, err := deps.metricsListenAndServe("127.0.0.1:0", mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
+	if err != nil {
+		t.Fatalf("metricsListenAndServe: %v", err)
+	}
+	if srv.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %v want %v", srv.ReadTimeout, readTimeout)
+	}
+	if srv.WriteTimeout != writeTimeout {
+		t.Errorf("WriteTimeout = %v want %v", srv.WriteTimeout, writeTimeout)
+	}
+	if srv.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %v want %v", srv.IdleTimeout, idleTimeout)
+	}
+	if int64(srv.MaxHeaderBytes) != maxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d want %d", srv.MaxHeaderBytes, maxHeaderBytes)
+	}
+	// drain so the listener goroutine exits cleanly.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	_ = srv.Shutdown(stopCtx)
+}

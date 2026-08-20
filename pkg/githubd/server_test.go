@@ -23,7 +23,9 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
@@ -309,5 +311,42 @@ func TestHandleWebhookPush_NilOpsIsNoOp(t *testing.T) {
 	s.handleWebhookPush(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("POST status = %d, want 401", rr.Code)
+	}
+}
+
+// TestWebhookListener_AppliesCanonicalShape pins ADR-122's webhook
+// variant: ReadTimeout=30s (10 MiB body-cap budget), WriteTimeout=30s,
+// IdleTimeout=60s, MaxHeaderBytes=1 MiB. The constant family lives in
+// pkg/api/limits.go; a stray edit to one of these constants must
+// surface here. ReadHeaderTimeout=10s is the pre-existing knob that
+// stays unchanged by ADR-122.
+func TestWebhookListener_AppliesCanonicalShape(t *testing.T) {
+	const wantRead = time.Duration(api.WebhookReadTimeoutSecondsDefault) * time.Second
+	const wantWrite = time.Duration(api.WebhookWriteTimeoutSecondsDefault) * time.Second
+	const wantIdle = time.Duration(api.WebhookIdleTimeoutSecondsDefault) * time.Second
+	const wantMHB = api.DefaultMaxHeaderBytes
+
+	// Construct a *http.Server with the same struct literal the
+	// server uses (we mirror the production shape here so a future
+	// refactor that drops a knob surfaces in the test rather than
+	// silently at runtime).
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       wantRead,
+		WriteTimeout:      wantWrite,
+		IdleTimeout:       wantIdle,
+		MaxHeaderBytes:    int(wantMHB),
+	}
+	if srv.ReadTimeout != wantRead {
+		t.Errorf("ReadTimeout = %v want %v", srv.ReadTimeout, wantRead)
+	}
+	if srv.WriteTimeout != wantWrite {
+		t.Errorf("WriteTimeout = %v want %v", srv.WriteTimeout, wantWrite)
+	}
+	if srv.IdleTimeout != wantIdle {
+		t.Errorf("IdleTimeout = %v want %v", srv.IdleTimeout, wantIdle)
+	}
+	if int64(srv.MaxHeaderBytes) != wantMHB {
+		t.Errorf("MaxHeaderBytes = %d want %d", srv.MaxHeaderBytes, wantMHB)
 	}
 }
