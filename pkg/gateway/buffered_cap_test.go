@@ -15,6 +15,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -238,8 +239,9 @@ func TestDefaultProxy_UpstreamLimitReader(t *testing.T) {
 	// io.ReadAll considers an EOF mid-LimitReader an "unexpected
 	// EOF" — that's the desired behaviour here (the LimitReader
 	// short-circuited the stream at cap+1), so we accept the
-	// error and assert on body length instead.
-	if err != nil && err != io.ErrUnexpectedEOF {
+	// error and assert on body length instead. Use errors.Is
+	// (CI errorlint gate) instead of a direct == comparison.
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	// The upstream emitted cap+512, but the LimitReader caps at
