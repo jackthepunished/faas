@@ -60,11 +60,12 @@ func TestPg_OpenAPISnapshot_RoundTrip(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-rt")
-	depID := "dep-rt-" + appID
-	if _, err := pool.Exec(ctx, `
+	var depID string
+	if err := pool.QueryRow(ctx, `
 		INSERT INTO deployments (id, app_id, status, scope)
-		VALUES ($1, $2, 'live', 'prod')
-	`, depID, appID); err != nil {
+		VALUES (gen_random_uuid(), $1, 'live', 'prod')
+		RETURNING id
+	`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
 
@@ -120,10 +121,10 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-upsert")
-	depID := "dep-upsert-" + appID
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO deployments (id, app_id, status, scope) VALUES ($1, $2, 'live', 'prod')
-	`, depID, appID); err != nil {
+	var depID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id
+	`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
 
@@ -160,7 +161,7 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 
 	// Count check: exactly one row for the deployment.
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1`, depID).Scan(&count); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1::uuid`, depID).Scan(&count); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 1 {
@@ -171,13 +172,19 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 // TestPg_OpenAPISnapshot_NotFound pins the ErrNotFound contract
 // for both read paths. The PR-C gate treats "no baseline" as
 // "no break possible" so the first promotion after the flag
-// is flipped is ungated.
+// is flipped is ungated. The deployment_id / app_id columns
+// are uuid (migration 00330), so the "missing" lookups use a
+// well-formed uuid that has no row in the table — a malformed
+// value trips SQLSTATE 22P02 (invalid_text_representation)
+// which is a different gate entirely.
 func TestPg_OpenAPISnapshot_NotFound(t *testing.T) {
 	s, ctx := pgStore(t)
-	if _, err := s.OpenAPISnapshotByDeployment(ctx, "missing-dep-xyz"); !errors.Is(err, state.ErrNotFound) {
+	missingDeployment := "00000000-0000-0000-0000-000000000099"
+	missingApp := "00000000-0000-0000-0000-000000000098"
+	if _, err := s.OpenAPISnapshotByDeployment(ctx, missingDeployment); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("OpenAPISnapshotByDeployment missing: expected ErrNotFound, got %v", err)
 	}
-	if _, err := s.LatestOpenAPISnapshotForScope(ctx, "missing-app-xyz", "prod"); !errors.Is(err, state.ErrNotFound) {
+	if _, err := s.LatestOpenAPISnapshotForScope(ctx, missingApp, "prod"); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("LatestOpenAPISnapshotForScope missing: expected ErrNotFound, got %v", err)
 	}
 }
@@ -192,12 +199,11 @@ func TestPg_OpenAPISnapshot_LatestByScope(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-latest")
-	olderID := "dep-older-" + appID
-	newerID := "dep-newer-" + appID
-	if _, err := pool.Exec(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES ($1, $2, 'live', 'prod')`, olderID, appID); err != nil {
+	var olderID, newerID string
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&olderID); err != nil {
 		t.Fatalf("insert older dep: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES ($1, $2, 'live', 'prod')`, newerID, appID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&newerID); err != nil {
 		t.Fatalf("insert newer dep: %v", err)
 	}
 	older := state.OpenAPISnapshot{
@@ -241,8 +247,8 @@ func TestPg_OpenAPISnapshot_CascadeOnDeploymentDelete(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-cascade")
-	depID := "dep-cascade-" + appID
-	if _, err := pool.Exec(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES ($1, $2, 'live', 'prod')`, depID, appID); err != nil {
+	var depID string
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, status, scope) VALUES (gen_random_uuid(), $1, 'live', 'prod') RETURNING id`, appID).Scan(&depID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
 	if err := s.UpdateDeploymentOpenAPISnapshot(ctx, state.OpenAPISnapshot{
@@ -254,7 +260,7 @@ func TestPg_OpenAPISnapshot_CascadeOnDeploymentDelete(t *testing.T) {
 	}
 	// Sanity: row exists.
 	var n int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1`, depID).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1::uuid`, depID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 1 {
@@ -264,7 +270,7 @@ func TestPg_OpenAPISnapshot_CascadeOnDeploymentDelete(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DELETE FROM deployments WHERE id = $1`, depID); err != nil {
 		t.Fatalf("delete deployment: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1`, depID).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM deployment_openapi_snapshots WHERE deployment_id = $1::uuid`, depID).Scan(&n); err != nil {
 		t.Fatalf("post-cascade count: %v", err)
 	}
 	if n != 0 {

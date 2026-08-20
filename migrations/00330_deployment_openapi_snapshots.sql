@@ -58,9 +58,9 @@
 -- on rollback.
 
 CREATE TABLE IF NOT EXISTS deployment_openapi_snapshots (
-    deployment_id  text        PRIMARY KEY
+    deployment_id  uuid        PRIMARY KEY
                     REFERENCES deployments(id) ON DELETE CASCADE,
-    app_id         text        NOT NULL
+    app_id         uuid        NOT NULL
                     REFERENCES apps(id) ON DELETE CASCADE,
     scope          text        NOT NULL,
     snapshot       jsonb       NOT NULL,

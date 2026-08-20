@@ -5143,7 +5143,7 @@ func (s *PgStore) UpdateDeploymentOpenAPISnapshot(ctx context.Context, snap Open
 	_, err := s.pool.Exec(ctx, `
 		insert into deployment_openapi_snapshots
 			(deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at)
-		values ($1, $2, $3, $4, $5, $6, $7)
+		values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
 		on conflict (deployment_id) do update
 		   set app_id = excluded.app_id,
 		       scope = excluded.scope,
@@ -5169,7 +5169,7 @@ func (s *PgStore) LatestOpenAPISnapshotForScope(ctx context.Context, appID, scop
 	row := s.pool.QueryRow(ctx, `
 		select deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at
 		  from deployment_openapi_snapshots
-		 where app_id = $1 and scope = $2
+		 where app_id = $1::uuid and scope = $2
 		 order by captured_at desc
 		 limit 1
 	`, appID, scope)
@@ -5186,7 +5186,7 @@ func (s *PgStore) OpenAPISnapshotByDeployment(ctx context.Context, deploymentID 
 	row := s.pool.QueryRow(ctx, `
 		select deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at
 		  from deployment_openapi_snapshots
-		 where deployment_id = $1
+		 where deployment_id = $1::uuid
 	`, deploymentID)
 	return scanOpenAPISnapshot(row)
 }

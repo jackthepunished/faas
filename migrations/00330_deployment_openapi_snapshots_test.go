@@ -69,7 +69,10 @@ func TestMigrations_00330_DeploymentOpenAPISnapshots(t *testing.T) {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}
 
-	// (1) Table exists with a PK on `deployment_id`.
+	// (1) Table exists with a PK on `deployment_id` (uuid column, FK
+	// to deployments(id)). The PR-B capture writer
+	// (PgStore.markDeploymentLiveTx) UPSERTs on this column; a
+	// schema drift that drops the PK breaks the upsert.
 	var tableExists bool
 	if err := pool.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -222,12 +225,17 @@ func TestMigrations_00330_DeploymentOpenAPISnapshots(t *testing.T) {
 	// (7) CHECK violations on the three constraints. Each
 	// violates one constraint and triggers SQLSTATE 23514.
 	// We don't seed a deployments or apps row first because the
-	// CHECK fires before the FK check at insert time.
+	// CHECK fires before the FK check at insert time. The
+	// deployment_id and app_id columns are uuid (matching the
+	// parent tables), so the violation-test IDs use uuid
+	// literals; the offending value is the scope / sha256.
 	scopeBad := `
 		INSERT INTO deployment_openapi_snapshots
 			(deployment_id, app_id, scope, snapshot, sha256)
 		VALUES
-			('test-dep-1', 'test-app-1', 'INVALID SCOPE', '{}'::jsonb,
+			('00000000-0000-0000-0000-000000000001',
+			 '00000000-0000-0000-0000-000000000001',
+			 'INVALID SCOPE', '{}'::jsonb,
 			 '0000000000000000000000000000000000000000000000000000000000000000')
 	`
 	_, err = pool.Exec(ctx, scopeBad)
@@ -244,7 +252,9 @@ func TestMigrations_00330_DeploymentOpenAPISnapshots(t *testing.T) {
 		INSERT INTO deployment_openapi_snapshots
 			(deployment_id, app_id, scope, snapshot, sha256)
 		VALUES
-			('test-dep-2', 'test-app-2', 'default', '{}'::jsonb, 'not-hex')
+			('00000000-0000-0000-0000-000000000002',
+			 '00000000-0000-0000-0000-000000000002',
+			 'default', '{}'::jsonb, 'not-hex')
 	`
 	_, err = pool.Exec(ctx, shaBad)
 	if err == nil {
@@ -262,5 +272,8 @@ func TestMigrations_00330_DeploymentOpenAPISnapshots(t *testing.T) {
 	// its own db.MigrateUp'd pool, so the leftover rows
 	// would not collide with replay but would accumulate in
 	// the test schema. Clean up by deleting the test rows.
-	_, _ = pool.Exec(ctx, `DELETE FROM deployment_openapi_snapshots WHERE deployment_id LIKE 'test-%'`)
+	_, _ = pool.Exec(ctx, `DELETE FROM deployment_openapi_snapshots WHERE deployment_id IN (
+		'00000000-0000-0000-0000-000000000001'::uuid,
+		'00000000-0000-0000-0000-000000000002'::uuid
+	)`)
 }
