@@ -1011,6 +1011,15 @@ const (
 	// writer in a custom MaxBytesWriter that emits this code instead.
 	CodeStreamingNotAvailable = "streaming_not_available"
 
+	// CodeResponseTooLarge (issue #995 Phase 2 / ADR-121) — emitted
+	// when the buffered reverse-proxy path exceeds the per-plan
+	// MaxResponseBodyBytes cap. Distinct from CodeStreamingNotAvailable
+	// because the buffered path applies to non-streaming apps
+	// (the streaming code is gated by the streaming opt-in and the
+	// plan_streaming_not_allowed error); 413 + this code so the
+	// buffered-cap surface has its own stable error contract.
+	CodeResponseTooLarge = "response_too_large"
+
 	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
 	// shape as MinInstances: a single plan-locked feature with two
 	// failure modes that warrant distinct codes so the CLI can render

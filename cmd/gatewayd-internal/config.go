@@ -139,6 +139,13 @@ type Config struct {
 	// nanoseconds are NOT accepted (a bare `900` parses as 900 ns).
 	ResponseWriteTimeout time.Duration `toml:"response_write_timeout"`
 
+	// RequestReadTimeout is the http.Server.ReadTimeout override
+	// (issue #995 Phase 3 / ADR-121). Default 0 falls through to
+	// GATEWAYD_INTERNAL_REQUEST_READ_TIMEOUT_DEFAULT (60 s) at the
+	// listener-construction site. Same TOML string-syntax contract as
+	// ResponseWriteTimeout above.
+	RequestReadTimeout time.Duration `toml:"request_read_timeout"`
+
 	// Role is the box shape this gatewayd-internal inhabits
 	// (Gate-B; env override FAAS_GATEWAYD_ROLE wins when set).
 	// gatewayd-internal is a compute-only daemon — it refuses to
