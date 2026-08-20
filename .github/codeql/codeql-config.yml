@@ -27,8 +27,11 @@
 # templating on the writer path).
 #
 # Pattern syntax: CodeQL paths-ignore entries are regular expressions
-# (CodeQL config docs, §"Filter pattern syntax"). Anchor with ^...$
-# and escape literal regex metacharacters (\. for the .) so the match
-# is exact against the file path.
+# (CodeQL config docs, §"Filter pattern syntax"). NO backslash
+# escapes — CodeQL rejects filter patterns that contain a \\ character.
+# Forward slashes are required, even on Windows runners. The . in
+# regex matches any character, so 'proxy.go' will also match a
+# hypothetical 'proxyXgo' — fine here because no such file exists in
+# cmd/gatewayd-internal/. Anchor ^...$ for exact match.
 paths-ignore:
-  - '^cmd/gatewayd-internal/proxy\.go$'
+  - '^cmd/gatewayd-internal/proxy.go$'
