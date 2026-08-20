@@ -58,9 +58,17 @@ type livenessRequestBody struct {
 
 // livenessResponseBody is the JSON body the guest ships back.
 // Mirrors guest/init/livenessResp.
+//
+// WWWAuthenticate is the verbatim WWW-Authenticate response header
+// value when the runner responded 401/403 — see the Cluster A
+// rationale in guest/init/liveness_linux.go. The host reads the
+// field defensively today (empty = no signal); the discriminator
+// becomes load-bearing if/when the platform introduces its own
+// probe-auth round-trip.
 type livenessResponseBody struct {
-	Status int    `json:"status"`
-	Err    string `json:"err"`
+	Status          int    `json:"status"`
+	Err             string `json:"err"`
+	WWWAuthenticate string `json:"www_authenticate,omitempty"`
 }
 
 // livenessProbeOutcomes is the closed set the vmmd
@@ -77,6 +85,13 @@ type livenessResponseBody struct {
 // customer to debug it as a runtime failure. The classify +
 // histogram + downstream app_healthz_unauthorized stamping all
 // flow from this single discriminator.
+//
+// Cluster A: the guest-init's livenessResp now also carries
+// WWWAuthenticate (the verbatim response header on 401/403) so the
+// host can later discriminate customer-app intentional 401 from a
+// platform-side probe auth round-trip. The discriminator is a
+// forward-compat field today (no platform-side probe auth exists);
+// the closed-set is the six values below.
 const (
 	livenessOutcomeOK           = "ok"
 	livenessOutcomeNon200       = "non_200"
