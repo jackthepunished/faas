@@ -68,6 +68,17 @@
     .deployer-field      { display: inline-block; margin-right: 0.75rem; font-size: 0.9rem; }
     .deployer-field.muted { color: #888; }
     p.deployer           { margin-top: 0.25rem; }
+    /* Stage timeline (ADR-117 v2 follow-on, A2): the closed-6-stage
+       post-stream summary the customer sees via `gregale deploys
+       show <id>`. Scoped under .stage-timeline so no global selector
+       bleed. The HTML is rendered at the handler edge into the
+       Stages.BodyHTML pre-rendered block (no FuncMap wiring). */
+    .stage-timeline { font-family: ui-monospace, Menlo, monospace; margin: 1rem 0; }
+    .stage-timeline .stage-row { display: flex; gap: 0.5rem; padding: 0.15rem 0; }
+    .stage-timeline .stage-row .glyph { width: 1.5rem; text-align: center; }
+    .stage-timeline .stage-row .label { flex: 1; }
+    .stage-timeline .stage-row .duration { color: #888; }
+    .stage-timeline .stage-footer { margin: 0.5rem 0 0 0; color: #6b7280; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -136,6 +147,15 @@
           {{if .Data.Deployment.DeployedFromIP}}<span class="deployer-field muted">from <code>{{.Data.Deployment.DeployedFromIP}}</code></span>{{end}}
         </p>
         {{end}}
+
+      {{ with .Data.Stages }}
+      {{ if .BodyHTML }}
+      <h2>Stages</h2>
+      <section class="stage-timeline" data-cluster="stage-timeline">
+        {{ .BodyHTML }}
+      </section>
+      {{ end }}
+      {{ end }}
 
       <h2>Scan</h2>
       {{if .Data.Scan}}

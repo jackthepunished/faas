@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -983,3 +984,151 @@ func TestAppsListSLOLoop_PointersAreDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardStagePayload — A2 (ADR-117 v2 follow-on). Pins the
+// dashboard handler's projection of state.Deployment → dashboard.StagePayload.
+//
+// Four branches:
+//
+//   - empty stage_state (pre-00302 OR in-flight pre-first-frame)
+//     returns StagePayload{}, nil — the template omits the section.
+//   - non-empty stage_state with all 6 stages completed returns
+//     a populated BodyHTML containing the closed-6-stage labels
+//   - the "live since <ts>" footer.
+//   - non-empty stage_state with a failed row returns the failed
+//     row's footer.
+//   - non-empty stage_state with status="superseded" anchors the
+//     footer on d.CreatedAt (review finding C1; the pre-fix code
+//     returned time.Time{} for superseded, silently dropping the
+//     footer).
+//
+// IDOR posture is owned by the renderDeploymentDetail caller
+// (AppBySlug + AccountID + DeploymentByID + AppID checks); the
+// projection helper only reads the already-authorized row.
+func TestDashboardStagePayload(t *testing.T) {
+	t.Run("empty-stage-state-returns-zero-value", func(t *testing.T) {
+		d := state.Deployment{ID: "d-empty", Status: state.DeployLive}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload empty: %v", err)
+		}
+		if got.BodyHTML != "" {
+			t.Errorf("empty stage_state: BodyHTML = %q, want empty", got.BodyHTML)
+		}
+		if got.Status != "" {
+			t.Errorf("empty stage_state: Status = %q, want empty", got.Status)
+		}
+	})
+
+	t.Run("all-completed-returns-rendered-html", func(t *testing.T) {
+		now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+		ss := state.StageState{
+			History: []state.StageStateItem{
+				{Name: state.StageSourceDownload, StartedAt: &now, EndedAt: tPtr(now.Add(1 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageDependencyRestore, StartedAt: &now, EndedAt: tPtr(now.Add(2 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageImageBuild, StartedAt: &now, EndedAt: tPtr(now.Add(3 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSecurityScan, StartedAt: &now, EndedAt: tPtr(now.Add(4 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSnapshotPrepare, StartedAt: &now, EndedAt: tPtr(now.Add(5 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageReadiness, StartedAt: &now, EndedAt: tPtr(now.Add(6 * time.Second)), DurationMs: 1000, Status: "completed"},
+			},
+		}
+		raw, _ := json.Marshal(ss)
+		d := state.Deployment{ID: "d-1", Status: state.DeployLive, StageState: raw}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload all-completed: %v", err)
+		}
+		// The pre-rendered HTML must contain the closed-6-stage
+		// labels and the footer.
+		for _, want := range []string{
+			`<section class="stage-timeline">`,
+			"Source downloaded",
+			"Dependencies restored",
+			"Image built",
+			"Security scan",
+			"Snapshot prepared",
+			"Readiness passed",
+			"live since",
+		} {
+			if !strings.Contains(string(got.BodyHTML), want) {
+				t.Errorf("BodyHTML missing %q\nfull: %s", want, got.BodyHTML)
+			}
+		}
+		if got.Status != "live" {
+			t.Errorf("Status = %q, want %q", got.Status, "live")
+		}
+	})
+
+	t.Run("failed-row-renders-failed-footer", func(t *testing.T) {
+		now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+		ss := state.StageState{
+			History: []state.StageStateItem{
+				{Name: state.StageSourceDownload, StartedAt: &now, EndedAt: tPtr(now.Add(1 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageDependencyRestore, StartedAt: &now, EndedAt: tPtr(now.Add(2 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageImageBuild, StartedAt: &now, EndedAt: tPtr(now.Add(3 * time.Second)), DurationMs: 1000, Status: "failed", Reason: "out of memory"},
+			},
+		}
+		raw, _ := json.Marshal(ss)
+		d := state.Deployment{ID: "d-2", Status: state.DeployFailed, StageState: raw}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload failed: %v", err)
+		}
+		if !strings.Contains(string(got.BodyHTML), "failed: out of memory") {
+			t.Errorf("expected 'failed: out of memory' in BodyHTML, got %q", got.BodyHTML)
+		}
+		if !strings.Contains(string(got.BodyHTML), "failed at") {
+			t.Errorf("expected 'failed at' footer in BodyHTML, got %q", got.BodyHTML)
+		}
+		if got.Status != "failed" {
+			t.Errorf("Status = %q, want %q", got.Status, "failed")
+		}
+	})
+
+	// Review finding C1 (mirrors cmd/gregale/deploys_show_test.go):
+	// dashboardStageTerminalAt handles the "superseded" branch by
+	// anchoring on d.CreatedAt. Pre-fix code returned time.Time{}
+	// for any status other than "live"/"failed", leaving the
+	// operator looking at a stage table with no terminal anchor
+	// even though deployments.status said "superseded".
+	t.Run("superseded-anchors-on-created-at", func(t *testing.T) {
+		now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+		ss := state.StageState{
+			History: []state.StageStateItem{
+				{Name: state.StageSourceDownload, StartedAt: &now, EndedAt: tPtr(now.Add(1 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageDependencyRestore, StartedAt: &now, EndedAt: tPtr(now.Add(2 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageImageBuild, StartedAt: &now, EndedAt: tPtr(now.Add(3 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSecurityScan, StartedAt: &now, EndedAt: tPtr(now.Add(4 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageSnapshotPrepare, StartedAt: &now, EndedAt: tPtr(now.Add(5 * time.Second)), DurationMs: 1000, Status: "completed"},
+				{Name: state.StageReadiness, StartedAt: &now, EndedAt: tPtr(now.Add(6 * time.Second)), DurationMs: 1000, Status: "completed"},
+			},
+		}
+		raw, _ := json.Marshal(ss)
+		d := state.Deployment{
+			ID: "d-3", Status: state.DeploySuperseded,
+			StageState: raw, CreatedAt: now,
+		}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload superseded: %v", err)
+		}
+		wantTs := now.UTC().Format(time.RFC3339)
+		if !strings.Contains(string(got.BodyHTML), "superseded at "+wantTs) {
+			t.Errorf("expected 'superseded at %s' footer\nfull: %s", wantTs, got.BodyHTML)
+		}
+		if strings.Contains(string(got.BodyHTML), "live since") {
+			t.Errorf("superseded render must NOT contain 'live since'\nfull: %s", got.BodyHTML)
+		}
+		if strings.Contains(string(got.BodyHTML), "failed at") {
+			t.Errorf("superseded render must NOT contain 'failed at'\nfull: %s", got.BodyHTML)
+		}
+		if got.Status != "superseded" {
+			t.Errorf("Status = %q, want %q", got.Status, "superseded")
+		}
+	})
+}
+
+// tPtr is a small helper to make the fixture rows less noisy.
+// (Named to avoid colliding with the existing helpers.go::ptrTime
+// which has the inverse signature.)
+func tPtr(t time.Time) *time.Time { return &t }

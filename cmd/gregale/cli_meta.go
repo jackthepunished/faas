@@ -325,7 +325,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    dispatchDeploys,
 		DocSlug: "deploys",
-		Short:   "Read-only deploy drill-downs (deploys show <id>)",
+		Short:   "Read-only deploy drill-downs (deploys show|status <id>)",
 		Subcommands: []cliSub{
 			// ADR-117 companion read surface. Future siblings
 			// (timeline, events, artifacts) land here as new
@@ -333,6 +333,7 @@ var cliCommands = []cliCommand{
 			// `deployment` verb, which is already at three
 			// flag-shaped drill-downs.
 			{Name: "show", Short: "Print the closed 6-stage post-stream summary"},
+			{Name: statusLiteral, Short: "Print the stage summary with terminal-status footer (live since / failed at)"},
 		},
 		Positionals: []string{"<id>"},
 	},
