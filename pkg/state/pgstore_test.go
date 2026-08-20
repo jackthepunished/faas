@@ -3721,14 +3721,14 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	app, err := s.CreateApp(ctx, state.App{
-AccountID: acct.ID, Slug: "actor-app", Type: state.AppTypeApp,
+		AccountID: acct.ID, Slug: "actor-app", Type: state.AppTypeApp,
 		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
 
-// 1. Full actor payload — dashboard / API path with a session
+	// 1. Full actor payload — dashboard / API path with a session
 	//    user, remote IP, and a githubd-stamped pusher login.
 	depFull, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID:            app.ID,
@@ -3747,7 +3747,7 @@ AccountID: acct.ID, Slug: "actor-app", Type: state.AppTypeApp,
 	if err != nil {
 		t.Fatalf("DeploymentByID(full): %v", err)
 	}
-if got.DeployedByUserID != acct.ID {
+	if got.DeployedByUserID != acct.ID {
 		t.Errorf("deployed_by_user_id = %q, want %q", got.DeployedByUserID, acct.ID)
 	}
 	if got.DeployedVia != "github" {
@@ -3781,7 +3781,7 @@ if got.DeployedByUserID != acct.ID {
 	if err != nil {
 		t.Fatalf("DeploymentByID(empty): %v", err)
 	}
-if gotEmpty.DeployedByUserID != "" {
+	if gotEmpty.DeployedByUserID != "" {
 		t.Errorf("empty deployed_by_user_id = %q, want \"\"", gotEmpty.DeployedByUserID)
 	}
 	if gotEmpty.DeployedVia != "api" {
@@ -3921,7 +3921,7 @@ func TestPg_DeploymentAnnotationRoundtrip(t *testing.T) {
 	}
 
 	// 3. Closed-set tag CHECK rejection. The DB-side constraint
-	//    (migrations/00288_deployments_annotation.sql) is the
+	//    (migrations/00321_deployments_annotation.sql) is the
 	//    source of truth; the CLI / handler validators mirror
 	//    it. We drive the rejection directly through the store
 	//    to confirm the constraint is wired (the apid would

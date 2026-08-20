@@ -83,14 +83,14 @@ type BuildSpec struct {
 	// ev.Sender.Login. Zero values on push events map to NULL on
 	// the deployment row via the pgstore nullif(0) collapse +
 	// the bridge's "fall back to Pusher" rule.
-	PRNumber     int32
-	SenderLogin  string
+	PRNumber    int32
+	SenderLogin string
 	// EventKind carries the proto3 EnqueueBuildEventKind enum
 	// (issue #272 / ADR-094) so the bridge can stamp the right
 	// deployments.kind (push → github, pull_request → preview).
 	// Dispatchers set it explicitly per call site; zero ==
 	// EVENT_KIND_UNSPECIFIED == legacy wire == DeploymentKindGitHub.
-	EventKind    githubdpb.EnqueueBuildEventKind
+	EventKind githubdpb.EnqueueBuildEventKind
 }
 
 // BuildEnqueuer is the seam githubd uses to schedule a build

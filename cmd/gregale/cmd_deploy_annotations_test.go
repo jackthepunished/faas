@@ -11,7 +11,7 @@ import (
 )
 
 // TestIsValidDeploymentAnnotationTag pins the closed-set vocabulary
-// mirrored from migrations/00288_deployments_annotation.sql. Any
+// mirrored from migrations/00321_deployments_annotation.sql. Any
 // value NOT in this set is rejected at the CLI layer (and again at
 // the apid handler + DB CHECK). Adding a new tag requires
 // migrations to widen the DB CHECK + ADR update; this list is the

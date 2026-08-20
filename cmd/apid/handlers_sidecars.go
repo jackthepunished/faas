@@ -441,7 +441,7 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// NEVER in the audit payload — only the boolean (ADR-053 §Decision 4
 	// + ADR-045 §Decision 6 mirror: env values never cross the audit sink).
 	hasOverrides := req.Overrides != nil
-// Issue #606 / SAFE-RELEASES-E.1: stamp the per-call actor
+	// Issue #606 / SAFE-RELEASES-E.1: stamp the per-call actor
 	// ("dashboard:<id>" / "cli:<id>" / "api:<id>") onto the
 	// audit row's actor column instead of the constructor-baked
 	// "apid". The resolved actor derives from the same source
