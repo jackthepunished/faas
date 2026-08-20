@@ -5288,6 +5288,152 @@ func TestMemStoreAppendDeploymentStage(t *testing.T) {
 	}
 }
 
+// TestMemStoreAppendDeploymentStage_HistoryTrimmedAtMax — ADR-117
+// §Production-ready follow-on, C1. Pins the FIFO trim: pushing
+// more than MaxStageHistory transitions leaves exactly the last
+// MaxStageHistory entries in history, with state.Current intact.
+// Schema-unchanged; the trim is Go-side at the read-modify-write
+// site in AppendDeploymentStage (no jsonb CHECK).
+//
+// We loop the 6-stage vocabulary (since the closed-6 set's
+// internal cycle is the natural way to push > 64 entries) and
+// assert the resulting history length + boundary entries.
+func TestMemStoreAppendDeploymentStage_HistoryTrimmedAtMax(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	acc, err := s.CreateAccount(ctx, "trim-cap@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "trim-cap-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := s.CreateDeployment(ctx, Deployment{ID: "d-trim-cap", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:trim"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	// Build a long transition sequence that exceeds MaxStageHistory.
+	// The closed-6 vocabulary is forward-only, so we wrap via a
+	// distinct cycle that always has from != to. We use two stages
+	// (source_download -> dependency_restore) as a synthetic ping-
+	// pong; the production pipeline never does this but the trim
+	// is independent of the stage identity.
+	cycle := []StageName{StageSourceDownload, StageDependencyRestore}
+	now := time.Now().UTC()
+	// Number of transitions: we want history length to push past
+	// MaxStageHistory + some headroom (so the trim is exercised).
+	const transitions = MaxStageHistory + 10
+	for i := 0; i < transitions; i++ {
+		from := cycle[i%len(cycle)]
+		to := cycle[(i+1)%len(cycle)]
+		if _, err := s.AppendDeploymentStage(ctx, dep.ID, from, to, now.Add(time.Duration(i)*time.Second), ""); err != nil {
+			t.Fatalf("transition %d (%s -> %s): %v", i, from, to, err)
+		}
+	}
+
+	got, err := s.DeploymentByID(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state: %v", err)
+	}
+	if len(state.History) != MaxStageHistory {
+		t.Errorf("history length after %d transitions: got %d, want %d (FIFO trim)",
+			transitions, len(state.History), MaxStageHistory)
+	}
+	// The oldest retained entry must be the (transitions - MaxStageHistory + 1)-th
+	// transition's `from`. We compute it the same way the loop did.
+	wantOldestIdx := transitions - MaxStageHistory
+	wantOldestFrom := cycle[wantOldestIdx%len(cycle)]
+	if state.History[0].Name != wantOldestFrom {
+		t.Errorf("history[0].Name = %q, want %q (oldest retained after FIFO trim)",
+			state.History[0].Name, wantOldestFrom)
+	}
+	// The newest entry is the most recent append's `from`.
+	wantNewestFrom := cycle[(transitions-1)%len(cycle)]
+	if state.History[len(state.History)-1].Name != wantNewestFrom {
+		t.Errorf("history[last].Name = %q, want %q (most recent)",
+			state.History[len(state.History)-1].Name, wantNewestFrom)
+	}
+	// Current must NOT be trimmed — it's the in-flight stage the
+	// loop just advanced to. Length is 1 entry, not "trimmed".
+	if state.Current == "" {
+		t.Errorf("Current was trimmed; want the in-flight stage to be retained")
+	}
+}
+
+// TestMemStoreAppendDeploymentStage_TrimExactBoundary — pushes
+// exactly MaxStageHistory + 1 transitions and asserts the trim
+// engages at the (cap+1)-th append, not before. This is the
+// off-by-one guard: a regression that trimmed early would silently
+// drop one row of legitimate history.
+func TestMemStoreAppendDeploymentStage_TrimExactBoundary(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	acc, err := s.CreateAccount(ctx, "trim-boundary@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "trim-boundary-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := s.CreateDeployment(ctx, Deployment{ID: "d-trim-boundary", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:trim2"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	cycle := []StageName{StageSourceDownload, StageDependencyRestore}
+	now := time.Now().UTC()
+	// Push exactly MaxStageHistory transitions (boundary: history
+	// length = MaxStageHistory, no trim yet).
+	for i := 0; i < MaxStageHistory; i++ {
+		from := cycle[i%len(cycle)]
+		to := cycle[(i+1)%len(cycle)]
+		if _, err := s.AppendDeploymentStage(ctx, dep.ID, from, to, now.Add(time.Duration(i)*time.Second), ""); err != nil {
+			t.Fatalf("transition %d: %v", i, err)
+		}
+	}
+	got, err := s.DeploymentByID(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID at boundary: %v", err)
+	}
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state at boundary: %v", err)
+	}
+	if len(state.History) != MaxStageHistory {
+		t.Errorf("at exact cap (no trim): history length = %d, want %d", len(state.History), MaxStageHistory)
+	}
+
+	// One more transition → trim engages, dropping the oldest row.
+	from := cycle[MaxStageHistory%len(cycle)]
+	to := cycle[(MaxStageHistory+1)%len(cycle)]
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, from, to, now.Add(time.Duration(MaxStageHistory)*time.Second), ""); err != nil {
+		t.Fatalf("overflow transition: %v", err)
+	}
+	got, err = s.DeploymentByID(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID post-overflow: %v", err)
+	}
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state post-overflow: %v", err)
+	}
+	if len(state.History) != MaxStageHistory {
+		t.Errorf("post-overflow history length = %d, want %d (trim engages)", len(state.History), MaxStageHistory)
+	}
+	// The oldest entry must be the SECOND `from` of the cycle
+	// (cycle[1] = StageDependencyRestore), not the first
+	// (cycle[0] = StageSourceDownload — that one's been trimmed).
+	if state.History[0].Name != cycle[1] {
+		t.Errorf("post-overflow history[0] = %q, want %q (oldest trimmed)", state.History[0].Name, cycle[1])
+	}
+}
+
 // TestMemStore_DeploymentActorRoundtrip (issue #606) pins the
 // four actor-attribution fields on the in-memory Deployment shape.
 // MemStore stores the Deployment struct directly

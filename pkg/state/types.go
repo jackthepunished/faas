@@ -152,6 +152,22 @@ var AllStageNames = []StageName{
 	StageReadiness,
 }
 
+// MaxStageHistory caps the per-deployment stage history. ADR-117
+// §Production-ready follow-on (C1) and migration 00340. The trim
+// is FIFO in AppendDeploymentStage (pgstore + memstore); the
+// current stage (stage_state.current) is never trimmed. Schema-
+// unchanged; the cap is enforced Go-side because a jsonb CHECK
+// on jsonb_array_length(stage_state -> 'history') is fragile
+// across mutation shapes.
+//
+// 64 is the customer-tested sweet spot: Hobby/Pro/Scale apps that
+// deploy 5-10x/day hit ~30 days of history before the trim
+// engages; longer deployments (multi-app monorepos) still keep
+// enough surface to debug a stale row. The const is exported so
+// the migration docblock, the type doc, and the trim sites all
+// reference the same value.
+const MaxStageHistory = 64
+
 // ParkReason is the closed-set label on deployments.parked_reason
 // (issue #554 / ADR-079 follow-up, migration 00157). The schema
 // CHECK constraint deployments_parked_reason_check enforces the

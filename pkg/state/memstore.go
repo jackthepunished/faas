@@ -4213,6 +4213,15 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 	})
 	state.Current = to
 	state.CurrentStartedAt = &startedAt
+	// ADR-117 §Production-ready follow-on, C1 — cap stage history
+	// at MaxStageHistory entries (FIFO). Mirrors pgstore.go. The
+	// trim lives here at the read-modify-write site so future
+	// contributors can't widen the field without seeing the cap.
+	// `state.Current` is never trimmed — only the historical
+	// archive.
+	if len(state.History) > MaxStageHistory {
+		state.History = state.History[len(state.History)-MaxStageHistory:]
+	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
