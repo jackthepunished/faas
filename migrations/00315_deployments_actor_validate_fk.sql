@@ -1,19 +1,19 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00312_deployments_actor_validate_fk.sql
+-- filename: 00315_deployments_actor_validate_fk.sql
 --
--- Companion migration to 00311_deployments_actor.sql (PR #992,
+-- Companion migration to 00314_deployments_actor.sql (PR #992,
 -- issue #606 / SAFE-RELEASES-E.1).
 --
 -- MEDIUM review #3 (PR #992): the FK to accounts(id) was added in
--- 00311 with NOT VALID so the migration didn't full-scan the
+-- 00314 with NOT VALID so the migration didn't full-scan the
 -- production deployments table while holding a SHARE ROW EXCLUSIVE
 -- lock (which blocks every concurrent apid INSERT). This migration
 -- runs the scan, but under SHARE UPDATE EXCLUSIVE — which permits
 -- concurrent INSERTs (apid deployment writes continue) and only
 -- blocks DDL on the same table.
 --
--- Why a separate migration rather than VALIDATE in 00311:
+-- Why a separate migration rather than VALIDATE in 00314:
 --
 --   1. Splitting the apply window is the standard pattern at this
 --      scale (migrations/00053, 00206, 00229, 00287 — the NOT VALID
@@ -32,13 +32,13 @@
 --      platform's quiet hours (cron-driven deploy cadence is
 --      lowest at 03:00 UTC).
 --
---   3. 00311's replay-safety (DROP+ADD NOT VALID) is independent
---      of 00312's replay-safety (VALIDATE on an already-valid
+--   3. 00314's replay-safety (DROP+ADD NOT VALID) is independent
+--      of 00315's replay-safety (VALIDATE on an already-valid
 --      constraint is a catalog no-op). Either migration can be
 --      re-applied on its own without coordination.
 --
 -- The scan is guaranteed safe: pre-#606 deployments never wrote
--- deployed_by_user_id (column was added by 00311 itself), so every
+-- deployed_by_user_id (column was added by 00314 itself), so every
 -- existing row is NULL — which is a valid state for an ON DELETE
 -- SET NULL FK referencing accounts(id). The scan is a no-op in
 -- practice; we still run it so pg_constraint.convalidated=true
@@ -53,9 +53,9 @@ ALTER TABLE deployments
 -- Forward-only by design: re-validating the constraint after the
 -- scan already returned "valid" is a no-op, but the rollback path
 -- for an already-validated FK is the same as the rollback for a
--- NOT VALID FK (DROP CONSTRAINT). Both DOWNs of the 00311 + 00312
+-- NOT VALID FK (DROP CONSTRAINT). Both DOWNs of the 00314 + 00315
 -- pair converge on dropping the column (which cascades the FK in
--- Postgres 12+). See 00311's Down block for the explicit order.
+-- Postgres 12+). See 00314's Down block for the explicit order.
 -- +goose StatementBegin
 SELECT 1;
 -- +goose StatementEnd
