@@ -11,9 +11,10 @@
 // unhealthy observation row.
 //
 // Tests:
-//   TestDomainDoctor_AllOK           — every probe stubbed ok
-//   TestDomainDoctor_CNAMEMismatch   — points_to_gregale fail + remediation
-//   TestDomainDoctor_StaleObservations — old row, stale:true in response
+//
+//	TestDomainDoctor_AllOK           — every probe stubbed ok
+//	TestDomainDoctor_CNAMEMismatch   — points_to_gregale fail + remediation
+//	TestDomainDoctor_StaleObservations — old row, stale:true in response
 //
 // Each test inserts a custom_domains + domain_doctor_observations row,
 // calls the gregale binary as a subprocess against a fake apid wire
