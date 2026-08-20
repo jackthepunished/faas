@@ -66,10 +66,10 @@ const (
 	// doctor check status tokens (ADR-120). Mirrors the stable
 	// `name` enum on pkg/api.DomainDoctorCheck so the CLI's
 	// filter / branch logic doesn't inline raw literals (goconst).
-	doctorCheckOK     = "ok"
-	doctorCheckFail   = "fail"
-	doctorCheckPend   = "pending"
-	doctorCheckNA     = "na"
+	doctorCheckOK   = "ok"
+	doctorCheckFail = "fail"
+	doctorCheckPend = "pending"
+	doctorCheckNA   = "na"
 
 	// service names reused across cmdConnect + the usage hint
 	// (commands2.go) so goconst stops flagging them.

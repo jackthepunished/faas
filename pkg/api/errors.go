@@ -546,10 +546,10 @@ const (
 	CodeDoctorDisabled    = "doctor_disabled"
 	CodeDoctorUnavailable = "doctor_unavailable"
 	CodeCronInvalid       = "cron_invalid"
-	CodeAlertRuleInvalid    = "alert_rule_invalid"
-	CodeHandlerMissing      = "handler_missing"
-	CodeImageRequired       = "image_required"
-	CodeDeployFailed        = "deploy_failed"
+	CodeAlertRuleInvalid  = "alert_rule_invalid"
+	CodeHandlerMissing    = "handler_missing"
+	CodeImageRequired     = "image_required"
+	CodeDeployFailed      = "deploy_failed"
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
