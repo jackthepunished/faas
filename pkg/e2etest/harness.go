@@ -593,18 +593,19 @@ const testDomain = "apps.test.example"
 // before opening the PR per the cross-PR slot precheck pattern.
 //
 // Triggers-mega audit #10: bumped 237 → 275 → 287 → 290 → 296 → 297/298/299
-// → 305 → 308 → 309 across the post-rebase renumber chain. The
+// → 305 → 308 → 309 → 313 across the post-rebase renumber chain. The
 // BrokerPoisonStrategy migration is 00299_triggers_poison_strategy.sql,
 // payload_max is 00298, and the unified triggers schema is 00297.
-// PR #986's ADR-120 domain doctor claims 00309_domain_doctor_observations.sql
-// (rebumped 00296 → 00309 → 00305 → 00308 → 00309 — the cross-PR
-// slot precheck CI caught 00305 colliding with PR #984/992, and
-// 00308 colliding with PR #999 (apps_public_auth_ip_allowlist),
-// leaving 00309 as the first free slot above all open PR fences).
-// The discipline (memory: cross-pr-slot-gate-fence-pattern) is that
-// the only line a migration land touches in this file is this
+// PR #986's ADR-120 domain doctor claims 00313_domain_doctor_observations.sql
+// (rebumped 00296 → 00309 → 00305 → 00308 → 00309 → 00313 — the cross-PR
+// slot precheck CI caught 00305 colliding with PR #984/992, 00308 colliding
+// with PR #999, and 00309 colliding with PR #990 (app_secret_value_hash)
+// + PR #1000 (consumer_keys); PR #990 fences 00310-00312 in its own
+// renumber chain, leaving 00313 as the first free slot above all
+// open PR fences). The discipline (memory: cross-pr-slot-gate-fence-pattern)
+// is that the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
-const e2eMigrationTarget = 309
+const e2eMigrationTarget = 313
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

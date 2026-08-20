@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00309_domain_doctor_observations.sql
+// Migration-apply test for 00313_domain_doctor_observations.sql
 // (ADR-120, issue #961 follow-on).
 //
 // Pins:
@@ -51,7 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00309_DomainDoctorObservations(t *testing.T) {
+func TestMigrations_00313_DomainDoctorObservations(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -71,7 +71,7 @@ func TestMigrations_00309_DomainDoctorObservations(t *testing.T) {
 		t.Fatalf("query domain_doctor_observations existence: %v", err)
 	}
 	if !tableExists {
-		t.Fatalf("domain_doctor_observations missing (00309 must create it)")
+		t.Fatalf("domain_doctor_observations missing (00313 must create it)")
 	}
 
 	// PK is on `domain` (citext) — confirm via
