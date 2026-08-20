@@ -352,7 +352,7 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 		oomCtx, oomCancel := context.WithCancel(context.Background())
 		go func() {
 			defer oomCancel()
-			werr := WatchOOM(oomCtx, mainLeaf, 0 /* planMB — re-read on kill */,
+			werr := WatchOOM(oomCtx, mainLeaf, 0, /* planMB — re-read on kill */
 				func(peakMB, pMB int) {
 					if eerr := EmitWorkloadOOM(oomCtx, peakMB, pMB); eerr != nil {
 						slog.Default().Warn("EmitWorkloadOOM failed",

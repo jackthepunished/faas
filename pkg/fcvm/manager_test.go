@@ -2650,7 +2650,7 @@ func TestInstanceByCID_UnknownCID(t *testing.T) {
 // WorkloadOOMSink with the observed (peakMB, planMB) payload
 // captured at the guest-init cgroup.events listener. The
 // cmd/vmmd wires the relay via WithWorkloadOOMSink; the framework
-//_ready recv dispatcher calls ReportWorkloadOOM when a DGRAM
+// _ready recv dispatcher calls ReportWorkloadOOM when a DGRAM
 // type 0x05 arrives on port 1027.
 //
 // The test is intent-on: a stub relay captures the call and the
