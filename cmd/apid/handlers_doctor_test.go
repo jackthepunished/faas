@@ -151,10 +151,10 @@ func TestGetDomainDoctor_StaleFlagFlipsResponse(t *testing.T) {
 // (defensive — same posture as parseDeployDetailPath).
 func TestParseDomainDoctorPath(t *testing.T) {
 	cases := []struct {
-		in           string
-		wantSlug     string
-		wantDomain   string
-		wantOK       bool
+		in         string
+		wantSlug   string
+		wantDomain string
+		wantOK     bool
 	}{
 		{"api-app/domains/api.example.com/doctor", "api-app", "api.example.com", true},
 		{"app-1/domains/sub.example.com/doctor", "app-1", "sub.example.com", true},
