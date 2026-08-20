@@ -9312,6 +9312,39 @@ components:
             - $ref: '#/components/schemas/BuildPlan'
             - type: 'null'
           description: "Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`. nil for image deploys."
+        # Issue #606 / SAFE-RELEASES-E.1: structured deployer
+        # attribution. All four fields are server-stamped from
+        # the HTTP request context (never client-supplied) and
+        # surface here so the SOC 2 CC7.2 / GDPR audit-trail
+        # question "who deployed v3 at 14:32?" has a one-click
+        # answer. Pre-#606 rows render with all four fields
+        # absent — the schema is `optional` (not `required`)
+        # so wire back-compat is preserved.
+        deployed_by_user_id:
+          type: [string, "null"]
+          format: uuid
+          description: "UUID of the deploying local account (FK → accounts.id, ON DELETE SET NULL). Empty when the deploy came from a non-local source (e.g. a githubd pusher not bound to a local account)."
+          example: "8a2f4e7c-1234-4abc-9def-0123456789ab"
+        deployed_via:
+          type: [string, "null"]
+          enum: [null, api, cli, dashboard, github, operator]
+          description: "Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00303_deployments_actor.sql's CHECK constraint."
+          example: "cli"
+        deployed_from_ip:
+          type: [string, "null"]
+          description: "Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract). Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in Postgres' native `inet` type (which canonicalises both families); the OpenAPI schema intentionally omits `format: ipv4` so v6 deployments (which grow as the public gateway picks up AAAA records) do not fail schema validation. v6 is rendered as the bracketed colon-hex form per RFC 5952."
+          example: "203.0.113.42"
+          examples:
+            ipv4:
+              summary: IPv4 (RFC 791)
+              value: "203.0.113.42"
+            ipv6:
+              summary: IPv6 (RFC 5952 canonical form)
+              value: "2001:db8::1"
+        pusher_login:
+          type: [string, "null"]
+          description: "Raw GitHub login of the pusher when `deployed_via == \"github\"`. Empty for all other via values. Distinct from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH identity, suitable for downstream GitHub-API correlation."
+          example: "poyrazK"
 
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."

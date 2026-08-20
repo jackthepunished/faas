@@ -4288,8 +4288,10 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          status,
 		                          min_instances,
 		                          traffic_percent,
-		                          scope)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'))
+		                          scope,
+		                          deployed_by_user_id, deployed_via, deployed_from_ip, pusher_login)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'),
+		         nullif($21, '')::uuid, coalesce(nullif($22, ''), 'api'), nullif($23, '')::inet, nullif($24, ''))
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -4306,7 +4308,19 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		// Scope is passed through verbatim. Mirrors the handler's
 		// scope-default collapse so pgstore never inserts a literal
 		// '' (which would fail the deployments_scope_shape CHECK).
-		d.Scope)
+		d.Scope,
+		// Issue #606 — actor attribution columns (migration 00303).
+		// Each of the four empty-string Go values collapses to NULL
+		// via nullif() so an "anonymous / pre-FK / GitHub-push"
+		// caller (or a Go-zero struct from a test) never inserts
+		// a literal '' that would trip the deployments_deployed_via
+		// CHECK or the FK's NOT-VALID-UUID parse path. The
+		// coalesce on deployed_via is the backstop for the
+		// NOT NULL DEFAULT 'api' contract — a caller that omits
+		// DeployedVia entirely (empty string after the nullif)
+		// still gets 'api' rather than NULL, so pre-feature rows
+		// stay valid without a backfill.
+		d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -13042,7 +13056,8 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
 	scope,
-	stage_state`
+	stage_state,
+	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,'')`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -13077,7 +13092,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
 	d.scope,
-	d.stage_state`
+	d.stage_state,
+	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,'')`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -13143,7 +13159,23 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.SecretFindings, &d.SecretScannedAt,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope,
-		&d.StageState); err != nil {
+		&d.StageState,
+		// Issue #606 — actor attribution columns (migration 00305).
+		// deployed_by_user_id is coalesced to '' in the SELECT
+		// projection above (UUID NULL → '') so the typed-string
+		// destination stays a string field on the struct; the
+		// empty string is the "anonymous / pre-FK / GitHub-push"
+		// sentinel. deployed_via is NOT NULL DEFAULT 'api' so the
+		// SELECT can hand it straight to a plain string field.
+		// deployed_from_ip is coalesced to '' for the same UUID-
+		// style reason (INET NULL → ''). pusher_login is coalesced
+		// to '' for the nullable text reason. The destinations stay
+		// in lockstep with deploymentSelectColumnsWithRootfs; pgx's
+		// "number of field descriptions must equal number of
+		// destinations" panic fires immediately on the next read
+		// path if these two lists drift apart.
+		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin); err != nil {
+
 		return mapErr(err)
 	}
 	if rootfsPath != nil {

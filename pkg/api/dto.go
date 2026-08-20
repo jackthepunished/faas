@@ -1458,6 +1458,48 @@ type DeploymentResponse struct {
 	// String fields only because pkg/api cannot import pkg/state
 	// (the App.Type enum lives in pkg/state/types.go).
 	BuildPlan *BuildPlan `json:"build_plan,omitempty"`
+	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+	// attribution. All four fields are server-stamped from the
+	// HTTP request context (never client-supplied) and use
+	// `omitempty` so pre-#606 rows render unchanged on the wire
+	// (empty strings drop from the JSON). The closed-set
+	// vocabulary for DeployedVia is enforced at the schema
+	// layer via migrations/00303's CHECK constraint; the FK on
+	// DeployedByUserId is ON DELETE SET NULL so revoking an
+	// account never cascades into a deleted deployment row.
+	//
+	// DeployedByUserId is the deploying account's UUID (FK →
+	// accounts.id, ON DELETE SET NULL). Empty when the deploy
+	// came from a non-local source we couldn't resolve (e.g. a
+	// githubd pusher whose email isn't bound to a local
+	// account — PusherLogin carries the raw GH login in that
+	// case so the deployment row is still attributable on
+	// read-back).
+	DeployedByUserID string `json:"deployed_by_user_id,omitempty"`
+	// DeployedVia is the closed-set classifier of how this
+	// deployment was submitted. One of "api" / "cli" /
+	// "dashboard" / "github" / "operator". Computed at handler
+	// entry by inspecting session cookie vs bearer token vs API
+	// key vs the githubd_bridge call shape; the schema CHECK
+	// constraint (deployments_deployed_via_set_chk) rejects
+	// any value outside this set.
+	DeployedVia string `json:"deployed_via,omitempty"`
+	// DeployedFromIp is the trusted remote IP captured by
+	// pkg/middleware.ClientIP at handler entry. Uses the same
+	// XFF + loopback trust contract as the auth-limit bucket;
+	// diverging from that would silently make a credential-
+	// stuffing burst look like a different (smaller) attack.
+	// Rendered as a string (the Go INET scan path coalesces
+	// empty → "" so pre-#606 rows surface unchanged).
+	DeployedFromIP string `json:"deployed_from_ip,omitempty"`
+	// PusherLogin is the raw GitHub login of the pusher when
+	// DeployedVia == "github". Empty for all other via values
+	// (the handler stamps it from the githubd_bridge req.Pusher
+	// proto field). Distinct from the human-readable DeployedBy
+	// text column that PR #984 / issue #977 adds — PusherLogin
+	// is the unmodified GH identity, suitable for downstream
+	// GitHub-API correlation.
+	PusherLogin string `json:"pusher_login,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source

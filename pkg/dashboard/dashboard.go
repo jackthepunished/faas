@@ -154,6 +154,19 @@ type DeploymentItem struct {
 	Kind      string
 	CreatedAt string
 	Error     string
+	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+	// attribution. All four fields are server-stamped from the
+	// HTTP request context (never client-supplied) and rendered
+	// by deployment_detail.html as a chip row. The dashboard
+	// deploy list (app_detail.html) shows a compact via-only
+	// chip on each row; the drill-down page surfaces the full
+	// triple (user / pusher / IP). Pre-#606 rows carry empty
+	// strings here; the via-chip conditional render keeps the
+	// wire + UI byte-identical for those rows.
+	DeployedByUserID string
+	DeployedVia      string
+	DeployedFromIP   string
+	PusherLogin      string
 	// ScanSummary is the per-deploy grype scan chip rendered
 	// in the deploy list (issue #464 / ADR-055). Nil when no
 	// scan has run yet (the deploy is mid-pipeline or predates

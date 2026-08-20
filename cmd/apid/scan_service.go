@@ -38,6 +38,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid/apidsource"
 	"github.com/onebox-faas/faas/pkg/githubd"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -177,8 +178,17 @@ type appliedBuild = api.AppliedBuild
 // scanDir is the path to the extracted source tree (req.ScanDir from
 // the multipart parse). It must outlive the staging call but is
 // removed by the handler's defer after scanService returns.
+//
+// r is the inbound HTTP request. MEDIUM review #2 (PR #992): the
+// scan-and-apply path was the only HTTP-routed deploy surface
+// that didn't stamp the four actor columns — every
+// customer-triggered project apply landed in deployments with
+// deployed_by_user_id=NULL and deployed_from_ip=NULL. Threading
+// r through keeps cmd/apid/deploy_actor.go as the single source
+// of truth (routeKindForRequest + middleware.ClientIP) rather
+// than forking the actor surface across packages.
 func (s *server) applyBuildsForAddedChanged(
-	ctx context.Context, acct state.Account, project state.Project,
+	ctx context.Context, r *http.Request, acct state.Account, project state.Project,
 	scanDir string, added, changed []state.App,
 ) []appliedBuild {
 	touched := make([]state.App, 0, len(added)+len(changed))
@@ -216,6 +226,20 @@ func (s *server) applyBuildsForAddedChanged(
 			SourceBytes: bytes,
 			LogSpool:    spoolRoot(),
 			Log:         s.log,
+			// MEDIUM review #2 (PR #992): stamp the four
+			// actor columns on every scan-and-apply
+			// deployment. Without these, every
+			// customer-triggered project apply lands in
+			// deployments with deployed_by_user_id=NULL
+			// and deployed_from_ip=NULL — the SOC 2
+			// CC7.2 audit question "who deployed v3 at
+			// 14:32?" has no answer for this entire
+			// surface. routeKindForRequest + ClientIP
+			// are the same single source of truth used by
+			// every other HTTP-routed deploy path.
+			ActorUserID: acct.ID,
+			ActorVia:    routeKindForRequest(r),
+			ActorFromIP: middleware.ClientIP(r),
 		})
 		if enqErr != nil {
 			// Same wire/server split as the stage branch
@@ -723,7 +747,7 @@ func (s *server) scanService(
 	// is what we want. A future refactor that moves the ScanDir
 	// cleanup into this func must keep staging reads ahead of
 	// the cleanup.
-	builds := s.applyBuildsForAddedChanged(r.Context(), acct, project, req.ScanDir, rec.Added, rec.Changed)
+	builds := s.applyBuildsForAddedChanged(r.Context(), r, acct, project, req.ScanDir, rec.Added, rec.Changed)
 	return resp, project, rec.Added, rec.Changed, removedSlugs, builds, nil
 }
 

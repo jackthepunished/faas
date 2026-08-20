@@ -3564,6 +3564,18 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		// column on every pre-PR-D deployment, so the field is
 		// never empty in practice).
 		Scope: d.Scope,
+		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+		// attribution. Mirrored verbatim from state.Deployment
+		// — the four fields are server-stamped at handler entry
+		// (cmd/apid/handlers.go::createDeployment, deploy_inputs.go,
+		// handlers_source_ref.go, handlers_source_tarball.go, and
+		// githubd_bridge.go) and stored via the migrations/00305
+		// column set. The DTO json tags use `omitempty` so
+		// pre-#606 rows render bit-identical JSON to the wire.
+		DeployedByUserID: d.DeployedByUserID,
+		DeployedVia:      d.DeployedVia,
+		DeployedFromIP:   d.DeployedFromIP,
+		PusherLogin:      d.PusherLogin,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint

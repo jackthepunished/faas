@@ -430,6 +430,17 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, sErr)
 		return
 	}
+	// Issue #606 / SAFE-RELEASES-E.1: server-side actor
+	// attribution. Stamped AFTER buildDeploymentForInsert so the
+	// pure-struct helper stays free of HTTP context (the helper
+	// is the single source of truth for "given everything we
+	// validated, what row lands in the store?" — touching it for
+	// every new HTTP-derived field would balloon the function's
+	// signature). The three fields stamped here are
+	// server-resolved and never client-supplied; the
+	// closed-set CHECK on deployed_via (migration 00303) rejects
+	// any out-of-set value the helper chain might emit.
+	stampDeploymentActor(&dep, acct, r)
 	d, err := s.store.CreateDeployment(r.Context(), dep)
 	if err != nil {
 		// ADR-091 / PR-D: per-deployment scope collision. mapErr
