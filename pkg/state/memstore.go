@@ -585,11 +585,11 @@ func NewMemStore() *MemStore {
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
-// ADR-120 / issue #975 item #5 — consumer keys. The map is
+		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
-		consumerKeys: map[string]ConsumerKey{},
-		openAPISnapshots:     map[string]OpenAPISnapshot{},
+		consumerKeys:     map[string]ConsumerKey{},
+		openAPISnapshots: map[string]OpenAPISnapshot{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
