@@ -151,7 +151,12 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 	// goroutine; we record the first positive outcome and move on.
 	// If no bind, every probe is a fast-fail; the report still
 	// tells the host `class=job, exit=...`.
-	classHint := runL7Probes(ctx, args, res.Port)
+	//
+	// ADR-122 §D4: probeHTTP now always runs and may capture an
+	// OpenAPI doc. The tuple carries (class, openapi_doc, truncated).
+	// The doc fields survive the round-trip regardless of which
+	// probe won the class hint.
+	classHint, openAPIDoc, openAPIDocTruncated := runL7Probes(ctx, args, res.Port)
 	res.ObservedClass = classHint
 
 	// 3. Pick a portnorm mode. manifest.Port==0 means DefaultAppPort
@@ -197,6 +202,13 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 		OutboundCount:         countOutboundLinux(args.AppPID()),
 		LogTail:               truncateLog(args.RingBufferTail(), VsockCharacterizationMaxBody),
 		PortNormalizationMode: string(res.Mode),
+		// ADR-122 §D2/D4 — endpoint discovery. ProbeHTTP captures
+		// the OpenAPI doc (if any) and ships it on the wire. The
+		// truncation flag is the customer's signal that the doc
+		// exceeded the 128 KiB cap and was hard-truncated at the
+		// guest (the apid PATCH endpoint is the recovery path).
+		OpenAPIDoc:          openAPIDoc,
+		OpenAPIDocTruncated: openAPIDocTruncated,
 	}
 	if !shipReport(r, args.Log) {
 		res.Shipped = false
@@ -394,21 +406,26 @@ func collectSocketInodes(pid int, depth int, out map[uint64]struct{}, visited ma
 // back to "http" if every probe is inconclusive. The 2 s ctx budget
 // is bounded — a slow / unresponsive listener costs us 2 s of boot,
 // not unbounded hangs.
-func runL7Probes(ctx context.Context, _ RunArgs, port int) string {
+//
+// ADR-122 §D4: probeHTTP now ALWAYS runs (previously it only ran
+// when probeGraphQL + probeGRPC were both empty). The body capture
+// is the load-bearing endpoint discovery path; the class hint logic
+// is unchanged (first non-empty wins).
+func runL7Probes(ctx context.Context, _ RunArgs, port int) (string, []byte, bool) {
 	if port <= 0 {
 		// No bind → can't probe. Engine interprets "no bind, exit 0"
 		// as `job`. We surface that hint, host re-derives.
-		return classJob
+		return classJob, nil, false
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	probes := []func() string{
+	probes := []func() probeResult{
 		probeGraphQL(port),
 		probeGRPC(port),
 		probeHTTP(port),
 	}
-	resCh := make(chan string, len(probes))
+	resCh := make(chan probeResult, len(probes))
 	for _, fn := range probes {
 		fn := fn
 		go func() {
@@ -416,48 +433,79 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) string {
 		}()
 	}
 	collected := 0
+	var openAPIDoc []byte
+	var openAPIDocTruncated bool
 	for collected < len(probes) {
 		select {
 		case <-probeCtx.Done():
-			return classHTTP
+			return classHTTP, openAPIDoc, openAPIDocTruncated
 		case r := <-resCh:
 			collected++
-			if r != "" {
-				return r
+			if r.Class != "" {
+				// First non-empty class wins; the openapi_doc fields
+				// from the probeHTTP result (if any) survive the
+				// round-trip regardless of which probe won.
+				if r.OpenAPIDoc != nil {
+					openAPIDoc = r.OpenAPIDoc
+					openAPIDocTruncated = r.OpenAPIDocTruncated
+				}
+				return r.Class, openAPIDoc, openAPIDocTruncated
+			}
+			// Empty class — keep collecting, but capture the
+			// openapi_doc fields from probeHTTP even though the
+			// class is empty (a non-OpenAPI HTTP service still
+			// runs probeHTTP and may capture a doc).
+			if r.OpenAPIDoc != nil && openAPIDoc == nil {
+				openAPIDoc = r.OpenAPIDoc
+				openAPIDocTruncated = r.OpenAPIDocTruncated
 			}
 		}
 	}
-	return classHTTP
+	return classHTTP, openAPIDoc, openAPIDocTruncated
 }
 
-func probeGraphQL(port int) func() string {
-	return func() string {
+// probeResult is the inner return shape of every probe.
+// Class is the workload-class hint (empty = inconclusive).
+// OpenAPIDoc + OpenAPIDocTruncated are populated by probeHTTP
+// only; the other probes leave them at the zero value.
+type probeResult struct {
+	Class               string
+	OpenAPIDoc          []byte
+	OpenAPIDocTruncated bool
+}
+
+func probeGraphQL(port int) func() probeResult {
+	return func() probeResult {
 		c := &http.Client{Timeout: 1 * time.Second}
 		// GraphQL `__schema` introspection — most servers reply 200
 		// with a body containing "data.__schema". We use a small
 		// POST with a valid query and check the body contains the
 		// canonical field.
+		//
+		// ADR-122 §D4: GraphQL introspection capture is OUT of
+		// scope for this PR — left as a discard. GraphQL schema
+		// capture is issue #975 item #2 (separate ADR).
 		body := strings.NewReader(`{"query":"{__schema{queryType{name}}}"}`)
 		req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/", port), body)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.Do(req)
 		if err != nil {
-			return ""
+			return probeResult{}
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
-			return ""
+			return probeResult{}
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if bytes.Contains(raw, []byte("__schema")) {
-			return classGraphQL
+			return probeResult{Class: classGraphQL}
 		}
-		return ""
+		return probeResult{}
 	}
 }
 
-func probeGRPC(port int) func() string {
-	return func() string {
+func probeGRPC(port int) func() probeResult {
+	return func() probeResult {
 		// gRPC servers respond to a GET with the HTTP/2 SETTINGS
 		// frame and `:status 200`; a generic GET to the port is
 		// mostly going to fail. A more honest check is to dial,
@@ -467,7 +515,7 @@ func probeGRPC(port int) func() string {
 		// gRPC response header "content-type: application/grpc".
 		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 1*time.Second)
 		if err != nil {
-			return ""
+			return probeResult{}
 		}
 		defer func() { _ = c.Close() }()
 		// gRPC reflection protocol — send the bare minimum probe
@@ -478,32 +526,118 @@ func probeGRPC(port int) func() string {
 		n, _ := c.Read(buf)
 		if n > 0 && bytes.Contains(buf[:n], []byte("content-type")) {
 			// Probably gRPC reflection; the engine re-derives.
-			return classGRPC
+			return probeResult{Class: classGRPC}
 		}
-		return ""
+		return probeResult{}
 	}
 }
 
-func probeHTTP(port int) func() string {
-	return func() string {
-		// GET / + check for any HTTP-shaped response. A real GraphQL
-		// or gRPC server usually fails the bare GET; we already
-		// classified those. Anything else with `HTTP/1. 200/300`
-		// counts as `http`.
-		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 1*time.Second)
+func probeHTTP(port int) func() probeResult {
+	return func() probeResult {
+		// GET /openapi.json + body capture. ADR-122 §D4: the body
+		// is the load-bearing endpoint discovery payload. The probe:
+		//
+		//  1. Reads the body up to VsockCharacterizationMaxBody
+		//     (128 KiB after the wire-format bump).
+		//  2. Validates Content-Type is application/json or
+		//     application/openapi+json.
+		//  3. Cheap shape sniff: the body must contain a top-level
+		//     `openapi` (3.0/3.1) or `swagger` key — prevents a
+		//     serving SPA from being mis-classified as an OpenAPI
+		//     doc. The strict Draft-2020-12 validation lives at
+		//     the apid PATCH path, not here.
+		//  4. Sets the OpenAPIDoc + OpenAPIDocTruncated fields on
+		//     the result. The truncation flag is set when the
+		//     read buffer length is exactly 128 KiB AND the
+		//     connection didn't close cleanly (EOF) — i.e. the
+		//     doc was larger than what we captured.
+		c := &http.Client{Timeout: 1 * time.Second}
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/openapi.json", port), nil)
 		if err != nil {
-			return ""
+			return probeResult{}
 		}
-		defer func() { _ = c.Close() }()
-		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
-		_, _ = fmt.Fprintf(c, "GET /openapi.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-		buf := make([]byte, 1024)
-		n, _ := c.Read(buf)
-		if n > 0 && bytes.HasPrefix(buf[:n], []byte("HTTP/1.")) && bytes.Contains(buf[:n], []byte(" 2")) {
-			return classHTTP
+		req.Header.Set("Host", "127.0.0.1")
+		req.Header.Set("Connection", "close")
+		resp, err := c.Do(req)
+		if err != nil {
+			return probeResult{}
 		}
-		return ""
+		defer func() { _ = resp.Body.Close() }()
+		// 200-class status is the only thing that counts as an
+		// http-class hit. 3xx (redirect) falls through to the
+		// class == "" branch; 4xx/5xx likewise.
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return probeResult{}
+		}
+		// Content-Type gate. We accept application/json or
+		// application/openapi+json (the canonical OpenAPI 3.1
+		// type). Anything else is dropped silently.
+		ctype := resp.Header.Get("Content-Type")
+		if !isOpenAPIContentType(ctype) {
+			// Still an http-class hit (we got a 200 OK), but no
+			// doc to capture.
+			return probeResult{Class: classHTTP}
+		}
+		// Read the body up to the cap. We read up to N+1 bytes
+		// (LimitReader caps at N) so we can detect overflow: if
+		// we read N+1 bytes, the doc was larger than what we
+		// captured and the truncation flag MUST be set.
+		const cap = VsockCharacterizationMaxBody
+		body, err := io.ReadAll(io.LimitReader(resp.Body, int64(cap)+1))
+		if err != nil {
+			return probeResult{Class: classHTTP}
+		}
+		truncated := false
+		if len(body) > cap {
+			truncated = true
+			body = body[:cap]
+		}
+		// Shape sniff: top-level `openapi` or `swagger` key.
+		if !looksLikeOpenAPIDoc(body) {
+			return probeResult{Class: classHTTP}
+		}
+		return probeResult{
+			Class:               classHTTP,
+			OpenAPIDoc:          body,
+			OpenAPIDocTruncated: truncated,
+		}
 	}
+}
+
+// isOpenAPIContentType accepts the canonical OpenAPI + JSON
+// content types. Anything else is dropped silently — a
+// text/html response is treated as "no OpenAPI doc served".
+func isOpenAPIContentType(ct string) bool {
+	ct = strings.TrimSpace(strings.ToLower(ct))
+	return strings.HasPrefix(ct, "application/json") ||
+		strings.HasPrefix(ct, "application/openapi+json")
+}
+
+// looksLikeOpenAPIDoc is the cheap shape sniff. The body must
+// contain a top-level `openapi` ("3.0"/"3.1") or `swagger` key.
+// We do a linear scan rather than a full JSON parse — the cap
+// is 128 KiB and the keys are at the head of the doc.
+func looksLikeOpenAPIDoc(body []byte) bool {
+	// Trim leading whitespace.
+	for i, b := range body {
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			continue
+		}
+		// Must start with `{` (top-level object).
+		if b != '{' {
+			return false
+		}
+		// Look for "openapi" or "swagger" within the first 4 KiB.
+		// We bound the search to avoid scanning a 128 KiB body
+		// for a key that should be at the head.
+		head := body[i:]
+		if len(head) > 4096 {
+			head = head[:4096]
+		}
+		return bytes.Contains(head, []byte(`"openapi"`)) ||
+			bytes.Contains(head, []byte(`"swagger"`))
+	}
+	return false
 }
 
 // shipReport dials host CID 2 (VMADDR_CID_HOST) at the char port,

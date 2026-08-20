@@ -54,4 +54,22 @@ type CharacterizationReport struct {
 	// (ADR-051 §"Consequences") so the platform team can monitor
 	// the DNAT-vs-userspace-forwarder mix.
 	PortNormalizationMode string `json:"port_norm_mode,omitempty"`
+
+	// OpenAPIDoc is the captured OpenAPI document body, if any.
+	// Empty when the probe found no JSON document at the canonical
+	// /openapi.json path, when the customer's app is not HTTP-shaped
+	// (e.g. job / grpc-only), or when the discovery doc exceeds the
+	// wire cap (see OpenAPIDocTruncated). Per ADR-122 §D2 this is a
+	// wire-additive field — old receivers ignore it (`encoding/json`
+	// skips unknown keys), and a new receiver treats OpenAPIDoc==nil
+	// as "no doc captured" (the only case an old probe would produce).
+	OpenAPIDoc []byte `json:"openapi_doc,omitempty"`
+	// OpenAPIDocTruncated is true when the captured body was
+	// truncated at VsockCharacterizationMaxBody. The guest hard-
+	// truncates BEFORE json.Marshal so the receiver never sees a
+	// malformed body. Receivers must surface this to the user
+	// (dashboard widget + CLI) so a customer hitting the 128 KiB
+	// cap can opt into the manual-upload PATCH endpoint to upload
+	// a partial-doc of their choice.
+	OpenAPIDocTruncated bool `json:"openapi_doc_truncated,omitempty"`
 }
