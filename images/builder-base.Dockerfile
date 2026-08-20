@@ -42,11 +42,11 @@ ARG BUILDKIT_VERSION=0.31.2
 # workflow) also lets the Lima local-build path stage a multi-arch rootfs
 # via buildx without per-arch file juggling.
 # Note: the version is intentionally baked into the FROM line (no ARG)
-# so images/Dockerfile.lock has a literal "golang:1.25.7" alias to
+# so images/Dockerfile.lock has a literal "golang:1.25.9" alias to
 # match against. Bumping the Go version is a two-step: change this
 # line, run `make images-lock-update` to refresh the lock and digest.
-# We use 1.25.7 (not 1.23.x) because go.mod in this repo declares
-# `go 1.25.7` and a `tool` directive that older Go versions reject
+# We use 1.25.9 (not 1.23.x) because BuildKit v0.31.2 requires
+# Go 1.25.9 and the repo's `tool` directive rejects older Go versions
 # with `unknown directive: tool` (verified during PR #940 review).
 
 # ---- stage 1: build guest-init for the target arch -----------------------
@@ -58,7 +58,7 @@ ARG BUILDKIT_VERSION=0.31.2
 # stable across re-pulls, but the manifest-list digest is).
 # $TARGETPLATFORM is implicit on multi-arch FROM; the explicit
 # `--platform=` would emit a RedundantTargetPlatform warning.
-FROM golang:1.25.7@sha256:5a79b94c34c299ac0361fbb7c7fca6dc552e166b42341050323fa3ab137d7be9 AS guest-init-build
+FROM golang:1.25.9@sha256:8a7adc288b77e9b787cd2695029eb54d10ae80571b21d44fed68d067ad0a9c96 AS guest-init-build
 WORKDIR /src
 # guest-init is a pure-Go binary; no submodule vendoring needed. The
 # repository is the build context, so COPY . picks up the whole tree.
@@ -76,7 +76,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # Build the tiny upstream client with the repository patch that opts into a
 # bounded, longer session interval; buildkitd itself remains the pinned
 # upstream release binary below.
-FROM golang:1.25.7@sha256:5a79b94c34c299ac0361fbb7c7fca6dc552e166b42341050323fa3ab137d7be9 AS buildkit-client-build
+FROM golang:1.25.9@sha256:8a7adc288b77e9b787cd2695029eb54d10ae80571b21d44fed68d067ad0a9c96 AS buildkit-client-build
 WORKDIR /src/buildkit
 ARG BUILDKIT_VERSION
 ARG TARGETOS
