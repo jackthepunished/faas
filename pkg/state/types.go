@@ -2862,9 +2862,10 @@ type AppPublicAuthUpdate struct {
 // (sqlc / state / gateway) all share the same vocabulary;
 // if a fourth is ever added, mirror the constant here.
 const (
-	AppPublicAuthModeOpen   = "open"
-	AppPublicAuthModeBearer = "bearer"
-	AppPublicAuthModeBasic  = "basic"
+	AppPublicAuthModeOpen        = "open"
+	AppPublicAuthModeBearer      = "bearer"
+	AppPublicAuthModeBasic       = "basic"
+	AppPublicAuthModeIPAllowlist = "ip_allowlist"
 )
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

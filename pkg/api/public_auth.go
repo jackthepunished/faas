@@ -75,4 +75,23 @@ const (
 	// unseals the blob at boot via
 	// cmd/gatewayd-internal/public_auth_unsealer.go.
 	AppPublicAuthModeBasic = "basic"
+	// AppPublicAuthModeIPAllowlist restricts the app's
+	// public hostname to client IPs inside the per-app
+	// CIDR list apps.public_auth_ip_allowlist (ADR-118).
+	// Anything else 403s at the request layer in
+	// pkg/gateway/handler.go::applyIngressIPAllowlist
+	// (runs before applyEdgeRuleIP, before wake).
+	// Plan-gated to Pro+; Free/Hobby use edge rules
+	// (kind='ip') for the abuse-floor posture.
+	AppPublicAuthModeIPAllowlist = "ip_allowlist"
 )
+
+// AppPublicAuthIPAllowlistMaxEntries bounds the per-app
+// ingress IP allowlist CIDR count accepted on PATCH.
+// Mirrors EgressAllowlistMaxSize's posture (Pro: 16,
+// Scale: 64) — Free/Hobby return 0 and the apid PATCH
+// handler rejects with 403 plan_public_auth_ip_allowlist_not_allowed.
+// apid's updateApp rejects with 400
+// public_auth_ip_allowlist_too_long when the PATCH
+// body has more entries than the per-plan cap.
+const AppPublicAuthIPAllowlistMaxEntries = 64

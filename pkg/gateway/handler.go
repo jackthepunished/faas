@@ -221,9 +221,10 @@ type PublicAuthConfig struct {
 // must stay in sync with the apps_public_auth_mode_chk
 // CHECK constraint in migrations/00153_apps_public_auth.sql.
 const (
-	publicAuthModeOpen   = "open"
-	publicAuthModeBearer = "bearer"
-	publicAuthModeBasic  = "basic"
+	publicAuthModeOpen        = "open"
+	publicAuthModeBearer      = "bearer"
+	publicAuthModeBasic       = "basic"
+	publicAuthModeIPAllowlist = "ip_allowlist"
 )
 
 // docsTypeBase is the canonical docs path prefix for problem
