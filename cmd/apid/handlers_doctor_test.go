@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,9 +98,6 @@ func TestGetDomainDoctor_IDOR(t *testing.T) {
 	}
 	// Account B probes it.
 	b := setup(t, api.PlanPro)
-	if _, err := b.store.CreateCustomDomain(context.Background(), "victim.example.com", appIDA, "tok"); err != nil {
-		t.Fatalf("seed victim: %v", err)
-	}
 	// Account B's sessionAuth must NOT see account A's domain.
 	rec := b.do(t, "GET", "/v1/domains/shared.example.com/doctor", nil, nil)
 	assertProblem(t, rec, http.StatusNotFound, api.CodeNotFound)
@@ -113,6 +111,20 @@ func TestGetDomainDoctor_StaleFlagFlipsResponse(t *testing.T) {
 	withDomainDoctorEnabled(t)
 	// Force the TTL to 5s so we can build a stale row deterministically.
 	t.Setenv("FAAS_DOMAIN_DOCTOR_TTL_SECONDS", "5")
+	// Inject probe seams (review-fix #3) so the handler's
+	// refreshDoctorObservation path doesn't dial real DNS on a
+	// CI runner. Returning the same values the seeded row
+	// carries keeps the re-probe write idempotent and the
+	// assertion race-free.
+	withSeams(t,
+		func(_ context.Context, _ string) ([]string, error) { return []string{"apps.gregale.dev"}, nil },
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
+		"apps.gregale.dev")
 	e := setup(t, api.PlanPro)
 	appID := mustSeedApp(t, e, "stale-app")
 	if _, err := e.store.CreateCustomDomain(context.Background(), "stale.example.com", appID, "tok"); err != nil {
@@ -126,6 +138,7 @@ func TestGetDomainDoctor_StaleFlagFlipsResponse(t *testing.T) {
 		PointsToGregale: true,
 		IPv6Conflict:    false,
 		CertState:       "issued",
+		ObservedTarget:  "apps.gregale.dev",
 	}
 	if err := e.store.UpsertDoctorObservation(context.Background(), obs); err != nil {
 		t.Fatalf("upsert obs: %v", err)
@@ -166,6 +179,11 @@ func TestParseDomainDoctorPath(t *testing.T) {
 		{"app-1/domains/api.example.com", "", "", false},
 		// Empty slug — defensive fail.
 		{"/domains/api.example.com/doctor", "", "", false},
+		// Sub-tab shape (review-fix #4) — must NOT match so a
+		// future /doctor/{tab} sibling parser can claim it
+		// without touching this function.
+		{"app-1/domains/api.example.com/doctor/logs", "", "", false},
+		{"app-1/domains/api.example.com/doctor/", "", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -186,6 +204,45 @@ func TestParseDomainDoctorPath(t *testing.T) {
 // sessionAuth middleware sees a real faas_sid cookie (the
 // /dashboard/* mount at server.go:1670 short-circuits to
 // /login otherwise).
+//
+// TestRenderDomainDoctor_FlagDisabledReturns503 (review-fix #2)
+// covers the operator-escape-hatch posture: with the flag off,
+// the dashboard route MUST mirror the JSON endpoint's 503
+// doctor_disabled problem — otherwise the two surfaces disagree
+// on the same operator choice (CLI gets a structured error,
+// dashboard renders a stale 5-check report).
+func TestRenderDomainDoctor_FlagDisabledReturns503(t *testing.T) {
+	withDomainDoctorDisabled(t)
+	h, cookie, store, _ := newAuthedDashboardServerFull(t)
+	acct, err := store.AccountByEmail(context.Background(), "alice@example.com")
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "render-doc-off-app",
+	}); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet,
+		"/dashboard/apps/render-doc-off-app/domains/foo.example.com/doctor", nil)
+	r.AddCookie(cookie)
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d; want 503 (flag off). body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q; want application/problem+json", ct)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatalf("unmarshal problem: %v", err)
+	}
+	if code, _ := p["code"].(string); code != api.CodeDoctorDisabled {
+		t.Errorf("problem.code = %q; want %q", code, api.CodeDoctorDisabled)
+	}
+}
+
 func TestRenderDomainDoctor_RouteRegistered(t *testing.T) {
 	withDomainDoctorEnabled(t)
 	h, cookie, store, _ := newAuthedDashboardServerFull(t)
