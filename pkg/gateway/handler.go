@@ -231,12 +231,18 @@ type PublicAuthConfig struct {
 
 // Canonical public-auth mode strings (issue #477). Values
 // must stay in sync with the apps_public_auth_mode_chk
-// CHECK constraint in migrations/00153_apps_public_auth.sql.
+// CHECK constraint in migrations/00153_apps_public_auth.sql
+// (widened in 00326 for ip_allowlist + 00333 for
+// internal_only). Companion drift-guard tests pin the three
+// surfaces equal: pkg/api/public_auth_constants_test.go (api
+// vs state) and pkg/gateway/handler_public_auth_constants_test.go
+// (handler package-local lowercase).
 const (
-	publicAuthModeOpen        = "open"
-	publicAuthModeBearer      = "bearer"
-	publicAuthModeBasic       = "basic"
-	publicAuthModeIPAllowlist = "ip_allowlist"
+	publicAuthModeOpen         = "open"
+	publicAuthModeBearer       = "bearer"
+	publicAuthModeBasic        = "basic"
+	publicAuthModeIPAllowlist  = "ip_allowlist"
+	publicAuthModeInternalOnly = "internal_only"
 )
 
 // docsTypeBase is the canonical docs path prefix for problem
