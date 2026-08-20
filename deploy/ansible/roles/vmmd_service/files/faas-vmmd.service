@@ -54,8 +54,6 @@ ReadWritePaths=/etc/faas/secrets /run/faas /run/netns /srv/fc /var/log/faas /var
 PrivateTmp=no
 ProtectHome=yes
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target

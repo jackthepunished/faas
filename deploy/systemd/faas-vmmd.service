@@ -24,8 +24,6 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=no
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
 ReadWritePaths=/etc/faas/secrets /run/faas /run/netns /srv/fc /var/log/faas /var/lib/faas/cache
 
 [Install]
