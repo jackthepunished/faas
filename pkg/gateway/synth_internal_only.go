@@ -175,7 +175,7 @@ func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Req
 // which is stable per the §3 ADR-119 contract.
 
 func isErrAudience(err error) bool {
-	return err != nil && containsToken(err.Error(), "audience mismatch")
+	return err != nil && containsToken(err.Error(), "aud claim does not match")
 }
 func isErrExpired(err error) bool {
 	return err != nil && containsToken(err.Error(), "token expired")
