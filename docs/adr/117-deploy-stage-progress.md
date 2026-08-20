@@ -459,3 +459,137 @@ SDK method + CLI verb + tests + ADR amendment), no new
 migration slot (the 00302 `stage_state` column is the wire
 shape — the follow-on PR is a read-only surface over it), one
 new HTTP route, one new SDK method, no new deps.
+
+## Post-stream v2 (deploys status + dashboard widget)
+
+Mirrors the `pr-d-cert-engine-real-mint-2026-08-18.md` ADR-amendment
+pattern (doc-only follow-on naming a new surface that consumes
+existing wire contracts). Two surfaces ship together in one
+mega-PR:
+
+### A1 — `gregale deploys status <id>` + `--status` flag
+
+The §Scope deliberately excluded bullet at line 264-265 explicitly
+named the future `deploys status <id>` (or extending this verb)
+as the v2 follow-on. A1 closes it:
+
+- `gregale deploys show <id> --status` — adds the `--status` flag
+  to the existing `show` subcommand. Fans out via
+  `golang.org/x/sync/errgroup` over two wire calls:
+  - `GET /v1/deployments/{id}` (existing) — supplies `Status`
+    + `CreatedAt`.
+  - `GET /v1/deployments/{id}/stages` (existing, PR #994) —
+    supplies the closed-6-stage `state.StageState`.
+- `gregale deploys status <id>` — same fan-out, always with the
+  terminal-status footer. Pinned for ticket parity with the
+  customer-facing "where is my deploy?" question.
+
+Both surfaces pass the resulting `(Status, terminalAt)` to
+`renderDeploySummary` → `pkg/dashboard/stages.RenderSummaryText`
+(no duplication of the renderer). The footer branch is
+status-driven:
+
+- `status == "live"` → `live since <ts>` where `ts` is the
+  first history row's `StartedAt` (all 6 stages completed for a
+  live deployment).
+- `status == "failed"` → `failed at <ts>` where `ts` is the
+  failed row's `EndedAt`.
+- `status == "superseded"` (or anything else) → `<status> at <ts>`
+  where `ts` is the deployment's `CreatedAt` (the moment the
+  replace-deploy landed).
+
+### A2 — Dashboard stage timeline widget
+
+The §Consequences positive bullet at line 279-281 explicitly named
+the `announced` per-connection map as the documented seam for a
+future dashboard. A2 closes it without going through the SSE
+map — the post-stream summary is a static read, not a live
+subscriber, so the same `state.StageState` jsonb column is the
+right source.
+
+- `pkg/dashboard/stages/` (NEW) — the shared renderer that
+  opens the closed-6-stage vocabulary to the dashboard.
+  Exports `StageOrder()`, `StageLabels()`, `Glyph(status)`,
+  `FormatStageDuration()`, `StageOrderClosedSet = 6`,
+  `RenderSummaryText(w, ...)`, `RenderSummaryHTML(...)`. The
+  panic-on-drift guard fires in both Render functions when
+  `len(StageOrder()) != pkg/state.AllStageNames` — same
+  invariant as the live ticker.
+- `pkg/dashboard/dashboard.go::DeploymentDetailData` — gains
+  `Stages *StagePayload` field. `StagePayload.BodyHTML` is
+  pre-rendered at the handler edge (no FuncMap wiring; the
+  template only inlines `{{ with .Data.Stages }}{{ if .BodyHTML }}
+  <section class="stage-timeline">…</section>{{ end }}{{ end }}`).
+- `cmd/apid/handlers_dashboard.go::dashboardStagePayload` —
+  mirrors `dashboardScanPayload` (the existing handler-edge
+  projection pattern). Reads `d.StageState` from the same
+  authorized row returned by `DeploymentByID`; no extra fetch.
+- `pkg/dashboard/templates/deployment_detail.html` — inserts
+  the `<h2>Stages</h2>` + `<section class="stage-timeline">`
+  block between the error-explanation section and the existing
+  `<h2>Scan</h2>` heading. CSS scoped under `.stage-timeline`
+  (mirrors `.error-explanation`).
+
+### What v2 does NOT change
+
+- **No new migration** — the 00302 `stage_state` jsonb column
+  is the wire shape; both surfaces read it.
+- **No new column** — the footer timestamp is derived from
+  `stage_state.history[*].started_at` / `.ended_at` + the
+  existing `deployments.status` field. NO new `live_at` /
+  `failed_at` columns.
+- **No new endpoint** — A1 only consumes existing routes
+  (`GET /v1/deployments/{id}` + `GET /v1/deployments/{id}/stages`).
+- **No new wire vocabulary** — the SSE event names, the
+  closed-6-stage names, and the per-stage status strings are
+  unchanged.
+- **No new SSE events** — the renderer is purely post-stream.
+- **No SDK regen** — no new SDK method (both surfaces reuse
+  the existing `GetDeployment` + `GetDeploymentStages`).
+- **No new quota/limit** — `pkg/api/limits.go` is unchanged.
+
+### Closed-set invariant preserved
+
+The shared `pkg/dashboard/stages` package owns the canonical
+stage order / label map / per-status glyph table / duration
+formatter. The panic-on-drift guard fires at the top of both
+Render functions when `len(StageOrder()) != pkg/state.AllStageNames`
+or the schema CHECK in `migrations/00302` widens. The CLI
+live ticker reuses the same consts via the re-export pattern
+in `cmd/gregale/deploy_stages.go::renderDeploySummary` — the
+dashboard cannot silently drift from the CLI's view.
+
+### IDOR posture
+
+A1: the wire call is 404-symmetric across both endpoints
+(PR #994 review fix). A 404 on either side surfaces as the
+same `printErr("Could not fetch deployment status", err)`
+non-zero exit. The CLI does not distinguish "missing" from
+"cross-account" — the wire is identical.
+
+A2: `d.StageState` is read from the same authorized row
+returned by `DeploymentByID` (AppBySlug + AccountID + AppID
+checks). The dashboard's `http.NotFound` + `dep.AppID !=
+app.ID` guards bound the read at the handler edge. No extra
+fetch.
+
+### Branch
+
+- `worktree-feat-deploys-show-status-dashboard` (single PR,
+  3 atomic commits mirroring the `deploy-ux-mega-a-shipped-2026-08-18.md`
+  Mega-A pattern):
+  - Commit 1: refactor + A1 — extract stage renderer to
+    `pkg/dashboard/stages/` + add `deploys status` + `--status`
+    flag.
+  - Commit 2: A2 — dashboard stage widget on deployment
+    detail page.
+  - Commit 3: this ADR amendment (doc-only).
+
+### Estimated scope
+
+~600-800 LOC across ~12 files (1 new package
+`pkg/dashboard/stages/` + 1 new test file + handler + template
++ 6 touched CLI files + 1 ADR amendment). 0 new migrations. 0
+new SDK methods. 0 new wire routes. 0 new SSE events. 1 doc
+amendment. 21/21 CI gates must pass per commit (matching PR
+#994's green run).
