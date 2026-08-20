@@ -17787,7 +17787,7 @@ func (s *PgStore) CreateConsumerKey(ctx context.Context, accountID, appID, name,
 		return ConsumerKey{}, fmt.Errorf("pgstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
 	}
 	if len(scopes) == 0 {
-		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00305)")
+		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00329)")
 	}
 	row := s.pool.QueryRow(ctx,
 		`insert into consumer_keys
@@ -17891,7 +17891,7 @@ func (s *PgStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) er
 
 // ConsumerKeyByAppAndPrefix is the gateway-side hot-path lookup.
 // (app_id, prefix) is the unique hot-path key — see the
-// consumer_keys_app_prefix_idx UNIQUE index in 00305 (the UNIQUE
+// consumer_keys_app_prefix_idx UNIQUE index in 00329 (the UNIQUE
 // is load-bearing: a non-UNIQUE index would let a birthday-bound
 // ~0.78% collision at Scale cap of 1000 keys/app silently collapse
 // the lookup to "first row found by the planner" and the constant-

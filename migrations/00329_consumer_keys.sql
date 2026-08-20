@@ -1,4 +1,4 @@
--- filename: 00305_consumer_keys.sql
+-- filename: 00329_consumer_keys.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -112,7 +112,7 @@ CREATE TRIGGER consumer_keys_set_updated_at_trg
 -- Forward-only migration. Drop order: trigger first, then the
 -- function, then the table. The composite index and the unique
 -- index are dropped with the table. PR #5-B's
--- apps.consumer_auth_mode column lives in a separate slot (00305)
+-- apps.consumer_auth_mode column lives in a separate slot (00330)
 -- and is NOT dropped here.
 
 DROP TRIGGER IF EXISTS consumer_keys_set_updated_at_trg ON consumer_keys;

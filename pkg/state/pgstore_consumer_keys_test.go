@@ -301,7 +301,7 @@ func TestPgStoreConsumerKeys_VocabularyCheck(t *testing.T) {
 
 	_, err := store.CreateConsumerKey(ctx, accountID, appID, "vocab-test", "dead", makeHash(t, "x"), []string{"superadmin"}, nil)
 	if err == nil {
-		t.Fatal("CreateConsumerKey with scope='superadmin' should fail (closed-set CHECK in 00305)")
+		t.Fatal("CreateConsumerKey with scope='superadmin' should fail (closed-set CHECK in 00329)")
 	}
 }
 

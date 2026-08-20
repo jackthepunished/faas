@@ -12799,7 +12799,7 @@ func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, 
 		return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
 	}
 	if len(scopes) == 0 {
-		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00305)")
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00329)")
 	}
 	// Closed-set vocab: pgstore's consumer_keys_scopes_vocab_chk rejects
 	// anything outside {read, write, admin}. Memstore mirrored the empty
@@ -12812,15 +12812,15 @@ func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, 
 		case "read", "write", "admin":
 			// ok
 		default:
-			return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: scope %q is not in the closed-set {read, write, admin} (00305 vocab CHECK)", s)
+			return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: scope %q is not in the closed-set {read, write, admin} (00329 vocab CHECK)", s)
 		}
 	}
 	if expiresAt != nil && expiresAt.Before(time.Now()) {
-		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00305)")
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00329)")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Mirror the (account_id, app_id, name) UNIQUE from 00305.
+	// Mirror the (account_id, app_id, name) UNIQUE from 00329.
 	for _, k := range m.consumerKeys {
 		if k.AccountID == accountID && k.AppID == appID && k.Name == name {
 			return ConsumerKey{}, ErrConflict

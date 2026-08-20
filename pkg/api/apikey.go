@@ -43,7 +43,7 @@ const (
 	// consumerKeyPrefixBytes is the entropy behind the prefix
 	// segment of the plaintext (32 bits = 4 bytes = 8 hex chars).
 	// 32 bits chosen because the (app_id, prefix) UNIQUE index in
-	// migration 00305 guarantees no two keys share a prefix inside
+	// migration 00329 guarantees no two keys share a prefix inside
 	// one app — see ADR-120 §D2 for the collision-probability math.
 	consumerKeyPrefixBytes = 4
 	// consumerKeySecretBytes is the entropy behind the secret
