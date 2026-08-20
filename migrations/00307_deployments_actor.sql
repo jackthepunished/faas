@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00305_deployments_actor.sql
+-- filename: 00307_deployments_actor.sql
 --
 -- issue #606 — Persist the deployer identity on `public.deployments`.
 -- PR #984 (issue #977 / ADR-116) added the human-readable `deployed_by`
@@ -100,7 +100,7 @@ ALTER TABLE deployments
 -- The NOT VALID + VALIDATE precedent from migrations/00206 +
 -- 00229 lets us split the work:
 --
---   00305 (this migration): ADD CONSTRAINT … NOT VALID — adds
+--   00307 (this migration): ADD CONSTRAINT … NOT VALID — adds
 --     the FK without scanning existing rows. The lock is taken
 --     only long enough to install the trigger metadata;
 --     concurrent INSERTs continue. New rows ARE validated by
@@ -108,7 +108,7 @@ ALTER TABLE deployments
 --     (only existing rows are skipped), so the SOC 2 / GDPR
 --     contract holds for every deployment going forward.
 --
---   00306: VALIDATE CONSTRAINT deployments_deployed_by_user_id_fk
+--   00308: VALIDATE CONSTRAINT deployments_deployed_by_user_id_fk
 --     — takes a SHARE UPDATE EXCLUSIVE lock (concurrent INSERTs
 --     continue, only DDL is blocked) and full-scans to confirm
 --     existing rows are within the bound. The schema layout
@@ -121,12 +121,12 @@ ALTER TABLE deployments
 --     validation in practice but we still run it so the FK is
 --     marked VALID in pg_constraint for future readers.
 --
--- Replay safety: 00305's DROP CONSTRAINT IF EXISTS + ADD
+-- Replay safety: 00307's DROP CONSTRAINT IF EXISTS + ADD
 -- CONSTRAINT pair is idempotent — re-running on a DB that
--- already has the FK (NOT VALID) drops and re-adds. 00306's
+-- already has the FK (NOT VALID) drops and re-adds. 00308's
 -- VALIDATE is also idempotent: re-validating an already-valid
 -- constraint is a single catalog lookup. If a re-run races
--- with 00306's first apply, Postgres serialises the second
+-- with 00308's first apply, Postgres serialises the second
 -- VALIDATE on the row-level ShareUpdateExclusive lock and
 -- both complete successfully.
 ALTER TABLE deployments
@@ -140,8 +140,8 @@ ALTER TABLE deployments
 
 -- +goose Down
 -- +goose StatementBegin
--- Note: VALIDATE in 00306 is forward-only; on full Down we DROP
--- the FK first (in case 00306 was applied) then drop the column.
+-- Note: VALIDATE in 00308 is forward-only; on full Down we DROP
+-- the FK first (in case 00308 was applied) then drop the column.
 -- The order matters: if the column is dropped first, the FK
 -- becomes an orphan reference and the DROP CONSTRAINT below
 -- would fail with a "constraint does not exist" (the FK holds

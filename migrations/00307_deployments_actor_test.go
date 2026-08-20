@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00305 (deployments.deployed_by_user_id +
+// Migration-apply test for 00307 (deployments.deployed_by_user_id +
 // deployments.deployed_via + deployments.deployed_from_ip +
 // deployments.pusher_login + FK + closed-set CHECK).
 // Pins the contract from issue #606.
@@ -29,17 +29,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00305_DeploymentsActor is the per-migration pin
-// for the actor-attribution columns introduced in 00305 (issue
+// TestMigrations_00307_DeploymentsActor is the per-migration pin
+// for the actor-attribution columns introduced in 00307 (issue
 // #606 — orthogonal to PR #984's human-readable deployed_by text
 // column from issue #977 / ADR-116).
-func TestMigrations_00305_DeploymentsActor(t *testing.T) {
+func TestMigrations_00307_DeploymentsActor(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00305 should land last.
+	// (1) Run the full migration set. 00307 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00305)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00307)", err)
 	}
 
 	// (2) Column shape. Scoped to current_schema() per
