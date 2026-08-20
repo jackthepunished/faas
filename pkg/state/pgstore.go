@@ -17077,9 +17077,10 @@ func (s *PgStore) TriggerByID(ctx context.Context, id string) (sqlc.Trigger, err
 }
 
 // UpdateTrigger patches the mutable fields (enabled, config,
-// batch_size_max, batch_window_ms, max_attempts). The kind + slug
-// + cron_id + source fields are immutable after creation; the
-// apid handler rejects PATCHes that touch them with
+// batch_size_max, batch_window_ms, max_attempts,
+// broker_poison_strategy, filter_criteria). The kind + slug +
+// cron_id + source fields are immutable after creation; the apid
+// handler rejects PATCHes that touch them with
 // trigger_immutable_field. The cron_id linkage is set at creation
 // only (kind='cron' is created via the legacy CreateCron path).
 //
@@ -17093,8 +17094,17 @@ func (s *PgStore) TriggerByID(ctx context.Context, id string) (sqlc.Trigger, err
 // safety — net-positive because the alternative would force the
 // handler to send "current values" for unset fields and break the
 // JSON `omitempty` round-trip.
-func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error) {
-	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg any
+//
+// filter_criteria is REVIEW-FIX MED-1 (issue #757 closure PR
+// #993): it was added to the sqlc.Trigger struct in commit 6 of
+// the mega-PR but omitted from this inline UPDATE — meaning a
+// PATCH that flipped filter_criteria was silently dropped on the
+// floor. The pointer is nullable: nil = "leave unchanged",
+// non-nil []byte = "replace the JSONB column" (json.RawMessage
+// shape mirrors the FilterCriteria wire DTO; nil-element means
+// "clear filter to no-op").
+func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error) {
+	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg, filterCriteriaArg any
 	if enabled != nil {
 		enabledArg = *enabled
 	}
@@ -17116,6 +17126,9 @@ func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, c
 	if brokerPoisonStrategy != nil {
 		brokerPoisonArg = *brokerPoisonStrategy
 	}
+	if filterCriteria != nil {
+		filterCriteriaArg = filterCriteria
+	}
 	row := s.pool.QueryRow(ctx,
 		`update triggers set
 		   enabled = coalesce($2, enabled),
@@ -17124,18 +17137,21 @@ func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, c
 		   batch_window_ms = coalesce($5, batch_window_ms),
 		   max_attempts = coalesce($6, max_attempts),
 		   payload_max_bytes = coalesce($7, payload_max_bytes),
-		   broker_poison_strategy = coalesce($8, broker_poison_strategy)
+		   broker_poison_strategy = coalesce($8, broker_poison_strategy),
+		   filter_criteria = coalesce($9::jsonb, filter_criteria)
 		 where id = $1
 		 returning id, account_id, app_id, kind, slug, enabled, config,
 		           batch_size_max, batch_window_ms, max_attempts,
 		           cron_id, source, payload_max_bytes, broker_poison_strategy,
+		           filter_criteria,
 		           created_at, updated_at`,
-		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg)
+		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg, filterCriteriaArg)
 	t := sqlc.Trigger{}
 	if err := row.Scan(
 		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
 		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
 		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.BrokerPoisonStrategy,
+		&t.FilterCriteria,
 		&t.CreatedAt, &t.UpdatedAt,
 	); err != nil {
 		return sqlc.Trigger{}, mapErr(err)

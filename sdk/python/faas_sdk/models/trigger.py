@@ -15,6 +15,7 @@ from ..models.trigger_source_type_3_type_1 import TriggerSourceType3Type1, check
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.filter_criteria import FilterCriteria
     from ..models.trigger_config import TriggerConfig
 
 
@@ -71,6 +72,14 @@ class Trigger:
     updated_at: datetime.datetime
     slug: str | Unset = UNSET
     """Unique-per-app handle. Required for non-cron kinds; ignored on cron."""
+    filter_criteria: FilterCriteria | Unset = UNSET
+    """FilterCriteria on a trigger (migration 00300,
+    pkg/sched/filter.go). nil / omitted matches every record.
+    Top-level arrays combine via implicit OR for `$or` and
+    AND for `$and`; nested clauses honour the same shape.
+    Jsonpath implementation: github.com/PaesslerAG/jsonpath —
+    no eval semantics, no customer-supplied code execution.
+    """
     schedule: None | str | Unset = UNSET
     path: None | str | Unset = UNSET
     cron_id: None | str | Unset = UNSET
@@ -106,6 +115,10 @@ class Trigger:
         updated_at = self.updated_at.isoformat()
 
         slug = self.slug
+
+        filter_criteria: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.filter_criteria, Unset):
+            filter_criteria = self.filter_criteria.to_dict()
 
         schedule: None | str | Unset
         if isinstance(self.schedule, Unset):
@@ -158,6 +171,8 @@ class Trigger:
         )
         if slug is not UNSET:
             field_dict["slug"] = slug
+        if filter_criteria is not UNSET:
+            field_dict["filter_criteria"] = filter_criteria
         if schedule is not UNSET:
             field_dict["schedule"] = schedule
         if path is not UNSET:
@@ -171,6 +186,7 @@ class Trigger:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.filter_criteria import FilterCriteria
         from ..models.trigger_config import TriggerConfig
 
         d = dict(src_dict)
@@ -201,6 +217,13 @@ class Trigger:
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
         slug = d.pop("slug", UNSET)
+
+        _filter_criteria = d.pop("filter_criteria", UNSET)
+        filter_criteria: FilterCriteria | Unset
+        if isinstance(_filter_criteria, Unset):
+            filter_criteria = UNSET
+        else:
+            filter_criteria = FilterCriteria.from_dict(_filter_criteria)
 
         def _parse_schedule(data: object) -> None | str | Unset:
             if data is None:
@@ -279,6 +302,7 @@ class Trigger:
             created_at=created_at,
             updated_at=updated_at,
             slug=slug,
+            filter_criteria=filter_criteria,
             schedule=schedule,
             path=path,
             cron_id=cron_id,

@@ -107,7 +107,7 @@ type Querier interface {
 	// precedent set by ADR-099 PR-C's claim_job_tasks query (issue
 	// tracker 'job-task pull'): concurrent schedd replicas each claim
 	// disjoint row sets with no advisory-lock plumbing.
-	CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (Trigger, error)
+	CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (CreateTriggerRow, error)
 	CronByID(ctx context.Context, db DBTX, id pgtype.UUID) (CronByIDRow, error)
 	// issue #667 / ADR-078 — canonical "tail task reached terminal" path.
 	// Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
@@ -415,6 +415,10 @@ type Querier interface {
 	// query is unfiltered by kind because the dispatch tick reads
 	// triggers.enabled = true regardless of kind and dispatches via the
 	// per-kind poller (pkg/sched/poller.go).
+	//
+	// ADR-118 / issue #757: filter_criteria is included so the dispatch
+	// tick can evaluate per-record predicates without a second round-trip
+	// (the column is JSONB; empty/null means "no filter").
 	ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, error)
 	ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow, error)
 	// issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
@@ -458,6 +462,9 @@ type Querier interface {
 	// Used by GET /v1/triggers/{id}/records (dashboard + apid handler).
 	// Returns records in dispatch-time order with the standard projection.
 	ListTriggerRecordsForTrigger(ctx context.Context, db DBTX, arg ListTriggerRecordsForTriggerParams) ([]TriggerRecord, error)
+	// Same rationale as TriggerByID — full Trigger projection so
+	// sqlc's generated Row type matches the existing pgstore return
+	// type. (commit 6 of the issue #757 mega-PR.)
 	ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]Trigger, error)
 	MarkDeploymentLive(ctx context.Context, db DBTX, id pgtype.UUID) error
 	MarkDeploymentSuperseded(ctx context.Context, db DBTX, id pgtype.UUID) error
@@ -571,6 +578,12 @@ type Querier interface {
 	// window in single-box posture. The instances.node_id lookup
 	// is by PK; the join is O(matches) on the PK.
 	TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error)
+	// ADR-118 / commit 6 of the issue #757 mega-PR: filter_criteria
+	// is projected so pgstore.TriggerByID returns the same shape as
+	// ListEnabledTriggers (sqlc generates identical column sets as
+	// the same Go struct; projections that omit a column produce a
+	// distinct Row type that breaks the existing pgstore return
+	// type).
 	TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Trigger, error)
 	// Audit round 2 finding #1 (PR #910): deadLetterAll() is invoked
 	// with broker-side handles (kafka offset, NATS seq, SQS receipt
@@ -601,6 +614,13 @@ type Querier interface {
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
 	UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error
 	UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error
+	// Review finding MED-1 (PR #993): the inline SQL at
+	// pkg/state/pgstore.go::UpdateTrigger is the source of truth
+	// (sqlc-generated UpdateTrigger stub is bypassed because sqlc
+	// doesn't model nullable UPDATE parameters); the projection
+	// shape is preserved by mirroring the same column list that
+	// ListEnabledTriggers uses (filter_criteria is part of the
+	// Trigger struct since commit 6 of issue #757 mega-PR).
 	UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error)
 	// ---------------------------------------------------------------------------
 	// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.

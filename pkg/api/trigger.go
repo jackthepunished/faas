@@ -130,6 +130,21 @@ type Trigger struct {
 	// the SQL CHECK.
 	BrokerPoisonStrategy string `json:"broker_poison_strategy"`
 
+	// FilterCriteria (ADR-118 / issue #757 closure, migration
+	// 00300) is the per-source record filter tree. nil means
+	// "every record passes through". The shape is evaluated at
+	// runtime by pkg/sched/filter.go::FilterCriteria.Match
+	// (commit 5 of the mega-PR); the apid handler validates
+	// the closed-vocab shape via the same struct.
+	//
+	// The wire type lives in pkg/api (here) and is the
+	// parallel of the manifest type in pkg/gregalemanifest.
+	// They share a closed-vocab contract but the wire type
+	// omits the omitempty-vs-explicit-null distinction
+	// (omitempty is sufficient on the wire — the SDK
+	// round-trip never needs to tell them apart).
+	FilterCriteria *FilterCriteria `json:"filter_criteria,omitempty"`
+
 	// Cron-only: kind=cron rows mirror a crons row via cron_id.
 	// Mutually exclusive with the non-cron fields below (enforced
 	// by SQL CHECK).
@@ -177,6 +192,13 @@ type CreateTriggerRequest struct {
 	// Only meaningful for kind='kafka' triggers; the apid
 	// handler ignores it for every other kind.
 	BrokerPoisonStrategy *string `json:"broker_poison_strategy,omitempty"`
+	// FilterCriteria is the per-source record filter tree.
+	// nil → no filter (every record passes through). See the
+	// Trigger.FilterCriteria field above for the wire-shape
+	// rationale. The apid createTrigger handler validates
+	// the closed-vocab shape (and rejects Hobby + skip_verify
+	// for TLS sub-fields) before the store is touched.
+	FilterCriteria *FilterCriteria `json:"filter_criteria,omitempty"`
 
 	// Cron-only fields.
 	Schedule string `json:"schedule,omitempty"`
@@ -196,6 +218,12 @@ type UpdateTriggerRequest struct {
 	MaxAttempts          *int            `json:"max_attempts,omitempty"`
 	PayloadMaxBytes      *int            `json:"payload_max_bytes,omitempty"`
 	BrokerPoisonStrategy *string         `json:"broker_poison_strategy,omitempty"`
+	// FilterCriteria is a partial update — supplying a non-nil
+	// pointer replaces the stored tree atomically. nil means
+	// "leave unchanged" (same semantics as the other pointer
+	// fields). The apid handler validates the closed-vocab
+	// shape on patch.
+	FilterCriteria *FilterCriteria `json:"filter_criteria,omitempty"`
 
 	// Cron-only patches. Cron kinds accept schedule+path patches
 	// (e.g. updating an existing cron); non-cron kinds reject
@@ -314,4 +342,106 @@ type TriggerMetricsResponse struct {
 	SucceededCount  int    `json:"succeeded_count"`
 	RetryCount      int    `json:"retry_count"`
 	DeadLetterCount int    `json:"dead_letter_count"`
+}
+
+// FilterCriteriaOp is the closed vocabulary of comparison
+// operators a FilterClause may carry on the wire (ADR-118 /
+// issue #757 §criterion 4). Mirrors the manifest type
+// (pkg/gregalemanifest.FilterOp) — adding a new operator
+// requires (a) a constant here, (b) a constant in
+// pkg/gregalemanifest, (c) a switch case in
+// pkg/sched/filter.go::FilterCriteria.Match, and (d) a unit
+// test for the new path.
+//
+// Literal-string constants so the wire shape round-trips
+// through json.Marshal/Unmarshal without a translation hop.
+type FilterCriteriaOp string
+
+const (
+	FilterCriteriaOpEq       FilterCriteriaOp = "eq"
+	FilterCriteriaOpNeq      FilterCriteriaOp = "neq"
+	FilterCriteriaOpExists   FilterCriteriaOp = "exists"
+	FilterCriteriaOpJsonPath FilterCriteriaOp = "jsonpath"
+)
+
+// FilterCriteriaClause is one leaf or branch in a wire-shape
+// FilterCriteria tree. The discriminator is Op:
+//
+//   - Eq / Neq / Exists:  Field carries the header key
+//     (eq/neq against rec.Headers[Field],
+//     exists against presence).
+//   - JsonPath:           Path carries the JSONPath expression;
+//     Value carries the expected match.
+//
+// Clauses is the branch slot for nested $or / $and. A clause
+// with both Op AND non-empty Clauses is malformed; the apid
+// handler rejects the half-wired shape with a typed error.
+//
+// The wire shape mirrors the manifest type
+// (pkg/gregalemanifest.FilterClause) — the closed-vocab
+// contract is shared via ADR-118 §"Spec reconciliation" so the
+// validator and the runtime evaluator see the same shape.
+type FilterCriteriaClause struct {
+	Op      FilterCriteriaOp       `json:"op,omitempty"`
+	Field   string                 `json:"field,omitempty"`
+	Path    string                 `json:"path,omitempty"`
+	Value   json.RawMessage        `json:"value,omitempty"`
+	Clauses []FilterCriteriaClause `json:"clauses,omitempty"`
+}
+
+// FilterCriteria is the wire shape for the per-trigger filter
+// tree (ADR-118 / issue #757 §criterion 4). Three top-level
+// slots, mutually combinable:
+//
+//   - OR:      a record passes if ANY clause matches.
+//   - AND:     a record passes if ALL clauses match.
+//   - Payload: a list of JSONPath predicates against rec.Payload.
+//
+// Nil-or-zero FilterCriteria is "every record passes through" —
+// the runtime short-circuits on the empty tree.
+type FilterCriteria struct {
+	OR      []FilterCriteriaClause `json:"$or,omitempty"`
+	AND     []FilterCriteriaClause `json:"$and,omitempty"`
+	Payload []FilterCriteriaClause `json:"payload,omitempty"`
+}
+
+// KafkaSASLMechanism is the closed vocabulary of SASL mechanisms
+// a Kafka trigger config may specify (ADR-118 §5). The wire value
+// is the string representation — xdg-go/scram library derives
+// SCRAM client keypairs from Username + Password at dial time.
+type KafkaSASLMechanism string
+
+const (
+	KafkaSASLMechanismPlain       KafkaSASLMechanism = "PLAIN"
+	KafkaSASLMechanismScramSHA256 KafkaSASLMechanism = "SCRAM-SHA-256"
+	KafkaSASLMechanismScramSHA512 KafkaSASLMechanism = "SCRAM-SHA-512"
+)
+
+// KafkaSASLConfig is the kafka trigger's per-source SASL material.
+// Required Username + Password for every supported mechanism.
+type KafkaSASLConfig struct {
+	Mechanism KafkaSASLMechanism `json:"mechanism,omitempty"`
+	Username  string             `json:"username,omitempty"`
+	Password  string             `json:"password,omitempty"`
+}
+
+// KafkaTLSConfig is the kafka trigger's per-source TLS material.
+// MinVersion is forced to TLS 1.2 at decoder time regardless of
+// what the wire sends (pkg/sched/poller_kafka.go::buildKafkaTLSConfig).
+type KafkaTLSConfig struct {
+	CACert     string `json:"ca_cert,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"`
+	SkipVerify bool   `json:"skip_verify,omitempty"`
+}
+
+// KafkaTriggerConfig is the decoded `config` for kind=kafka
+// triggers. The wire-level blob lives in Trigger.config; this is
+// the SDK's server-side shape.
+type KafkaTriggerConfig struct {
+	Brokers []string         `json:"brokers,omitempty"`
+	Topic   string           `json:"topic,omitempty"`
+	Group   string           `json:"group,omitempty"`
+	TLS     *KafkaTLSConfig  `json:"tls,omitempty"`
+	SASL    *KafkaSASLConfig `json:"sasl,omitempty"`
 }

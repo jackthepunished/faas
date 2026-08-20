@@ -2108,7 +2108,7 @@ type Store interface {
 	//   - Mark* writers are dispatcher-owned (commit #14): the
 	//     apid-side operator verbs (retry / drop) bypass this seam.
 	TriggerByID(ctx context.Context, id string) (sqlc.Trigger, error)
-	UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error)
+	UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error)
 	DeleteTrigger(ctx context.Context, id, appID string) error
 	ListTriggersForApp(ctx context.Context, appID string) ([]sqlc.Trigger, error)
 	ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error)

@@ -1231,6 +1231,13 @@ returning id, account_id, app_id, kind, slug, enabled, config,
           created_at, updated_at;
 
 -- name: UpdateTrigger :one
+-- Review finding MED-1 (PR #993): the inline SQL at
+-- pkg/state/pgstore.go::UpdateTrigger is the source of truth
+-- (sqlc-generated UpdateTrigger stub is bypassed because sqlc
+-- doesn't model nullable UPDATE parameters); the projection
+-- shape is preserved by mirroring the same column list that
+-- ListEnabledTriggers uses (filter_criteria is part of the
+-- Trigger struct since commit 6 of issue #757 mega-PR).
 update triggers set
   enabled = coalesce($2, enabled),
   config = coalesce($3::jsonb, config),
@@ -1238,27 +1245,40 @@ update triggers set
   batch_window_ms = coalesce($5, batch_window_ms),
   max_attempts = coalesce($6, max_attempts),
   payload_max_bytes = coalesce($7, payload_max_bytes),
-  broker_poison_strategy = coalesce($8, broker_poison_strategy)
+  broker_poison_strategy = coalesce($8, broker_poison_strategy),
+  filter_criteria = coalesce($9::jsonb, filter_criteria)
 where id = $1
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
           cron_id, source, payload_max_bytes, broker_poison_strategy,
+          filter_criteria,
           created_at, updated_at;
 
 -- name: DeleteTrigger :exec
 delete from triggers where id = $1 and app_id = $2;
 
 -- name: TriggerByID :one
+-- ADR-118 / commit 6 of the issue #757 mega-PR: filter_criteria
+-- is projected so pgstore.TriggerByID returns the same shape as
+-- ListEnabledTriggers (sqlc generates identical column sets as
+-- the same Go struct; projections that omit a column produce a
+-- distinct Row type that breaks the existing pgstore return
+-- type).
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where id = $1;
 
 -- name: ListTriggersForApp :many
+-- Same rationale as TriggerByID — full Trigger projection so
+-- sqlc's generated Row type matches the existing pgstore return
+-- type. (commit 6 of the issue #757 mega-PR.)
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where app_id = $1 order by created_at desc;
 
@@ -1267,9 +1287,14 @@ from triggers where app_id = $1 order by created_at desc;
 -- query is unfiltered by kind because the dispatch tick reads
 -- triggers.enabled = true regardless of kind and dispatches via the
 -- per-kind poller (pkg/sched/poller.go).
+--
+-- ADR-118 / issue #757: filter_criteria is included so the dispatch
+-- tick can evaluate per-record predicates without a second round-trip
+-- (the column is JSONB; empty/null means "no filter").
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where enabled = true;
 

@@ -2067,6 +2067,7 @@ CREATE TABLE public.triggers (
     source text,
     payload_max_bytes integer DEFAULT 6291456 NOT NULL,
     broker_poison_strategy text DEFAULT 'commit'::text NOT NULL,
+    filter_criteria jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT triggers_batch_size_max_check CHECK (((batch_size_max >= 1) AND (batch_size_max <= 5000))),

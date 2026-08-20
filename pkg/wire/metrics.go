@@ -14,6 +14,7 @@
 package wire
 
 import (
+	"errors"
 	"math"
 	"net/http"
 	"strconv"
@@ -1207,6 +1208,27 @@ type OpsMetrics struct {
 	// pathological stalls so the §12 panel can page on a
 	// per-phase p99.
 	wakePhaseDur *prometheus.HistogramVec
+	// esmPollsTotal (issue #757 / ADR-118 commit 9): per-broker
+	// poll outcomes, labelled by source ∈ {kafka, nats,
+	// redis_streams, sqs_compat, queue, cron} and outcome ∈
+	// {success, empty, error}. Closed set pre-instantiated in
+	// NewOpsMetrics so the rows surface in /metrics from boot.
+	// Single-registry: registered on every daemon; only schedd
+	// increments via ObserveESMPoll.
+	esmPollsTotal *prometheus.CounterVec
+	// esmRecordsConsumedTotal (issue #757 / ADR-118 commit 9):
+	// per-source record counter incremented after each
+	// closeBatch — the rate is the §12 broker throughput panel.
+	// source ∈ {kafka, nats, redis_streams, sqs_compat, queue, cron}.
+	esmRecordsConsumedTotal *prometheus.CounterVec
+	// esmLagSeconds (issue #757 / ADR-118 commit 9):
+	// per-(source, shard) lag histogram. shard is bounded by the
+	// 32-bucket cap with `_agg` overflow documented in ADR-118
+	// §"Cardinality discipline" — the shard key space is the
+	// topic×partition or stream×shard tuple, capped to keep
+	// the Prometheus series count flat. Closed set pre-instantiated
+	// at boot so the panel surfaces zero from process start.
+	esmLagSeconds *prometheus.HistogramVec
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -2517,6 +2539,45 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	gatewayInflightRequests.WithLabelValues("gatewayd-public", "upgrade")
 	gatewayInflightRequests.WithLabelValues("gatewayd-public", "control")
 	commonCollectors = append(commonCollectors, gatewayDrainWaitSeconds, gatewayInflightRequests)
+	// Issue #757 / ADR-118 commit 9: ESM metric collectors. All
+	// three are pre-instantiated at boot from the closed sets
+	// below so the rows surface in /metrics from process start —
+	// same precedent as rebalanceDecisions + appAtCapacityTotal
+	// (Tier A4 / ADR-087).
+	//
+	// source values are the closed trigger-kind vocabulary
+	// (see pkg/events/trigger.go + pkg/gregalemanifest).
+	esmSourceClosedSet := []string{
+		"kafka", "nats", "redis_streams", "sqs_compat", "queue", "cron",
+	}
+	esmOutcomeClosedSet := []string{"success", "empty", "error"}
+	esmPollsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_esm_polls_total",
+		Help: "Count of broker poll cycles the dispatcher ran, labelled by source and outcome ∈ {success, empty, error}. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveESMPoll. The rate per source is the §12 broker-poll-health panel; a sustained `outcome=\"error\"` rate per source is the operator-debug tripwire for that broker having connectivity issues.",
+	}, []string{"source", "outcome"})
+	esmRecordsConsumedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_esm_records_consumed_total",
+		Help: "Count of broker records the dispatcher accepted past closeBatch, labelled by source. Records that the filter rejected (commit 6) do NOT increment this counter — the byte cost lands in broker_egress (commit 8) but the record was never consumed. Single-registry: registered on every daemon; only schedd increments via ObserveESMRecords. The rate per source is the §12 broker-throughput panel.",
+	}, []string{"source"})
+	esmLagSeconds := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_esm_lag_seconds",
+		Help: "Per-record lag — seconds between ReceivedAt and the dispatch tick — labelled by source and shard. Buckets skewed for the broker envelope (Kafka commit latency + per-partition fetch). Single-registry: registered on every daemon; only schedd increments via ObserveESMLag. shard is bounded by a 32-bucket cap with `_agg` overflow (ADR-118 §Cardinality discipline); the panel selector is `histogram_quantile(0.99, sum by (source, le) (rate(schedd_esm_lag_seconds_bucket[5m])))`.",
+		Buckets: []float64{
+			0.001, 0.005, 0.025, 0.1, 0.25,
+			1.0, 2.5, 5.0, 10.0, 30.0,
+		},
+	}, []string{"source", "shard"})
+	for _, source := range esmSourceClosedSet {
+		for _, outcome := range esmOutcomeClosedSet {
+			esmPollsTotal.WithLabelValues(source, outcome)
+		}
+		esmRecordsConsumedTotal.WithLabelValues(source)
+		// Pre-instantiate the `_agg` bucket so the histogram
+		// surfaces in /metrics from boot. The 32-bucket cap
+		// lives in dispatch_triggers.go (commit 9 wiring).
+		esmLagSeconds.WithLabelValues(source, "_agg")
+	}
+	commonCollectors = append(commonCollectors, esmPollsTotal, esmRecordsConsumedTotal, esmLagSeconds)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -2986,6 +3047,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		githubdPathFilterTotal:             githubdPathFilterTotal,
 		wakePhaseEmitted:                   wakePhaseEmitted,
 		wakePhaseDur:                       wakePhaseDur,
+		esmPollsTotal:                      esmPollsTotal,
+		esmRecordsConsumedTotal:            esmRecordsConsumedTotal,
+		esmLagSeconds:                      esmLagSeconds,
 	}
 }
 
@@ -5542,4 +5606,95 @@ func (s *cpuThrottleLastSeen) add(key string, currMicroseconds float64) float64 
 	deltaMicroseconds := currMicroseconds - prev
 	s.m[key] = currMicroseconds
 	return deltaMicroseconds / 1_000_000
+}
+
+// ---------------------------------------------------------------------------
+// Issue #757 / ADR-118 commit 9 — ESM (event-source mapping) metric observers.
+// Mirrors the prefix-aware single-registry pattern (see
+// wire-opsmetrics-single-registry): the helpers below are no-ops on nil or
+// on daemons that didn't construct the ESM collectors (every daemon
+// pre-instantiates the closed set, so non-schedd daemons see zero values).
+// ---------------------------------------------------------------------------
+
+// ESMPollOutcome is the closed set of outcomes ObserveESMPoll accepts.
+// Matches the closed-set pre-instantiation in NewOpsMetrics.
+const (
+	ESMPollOutcomeSuccess = "success"
+	ESMPollOutcomeEmpty   = "empty"
+	ESMPollOutcomeError   = "error"
+)
+
+// ObserveESMPoll increments schedd_esm_polls_total{source, outcome}.
+// Called from pkg/sched/dispatch_triggers.go::dispatchOneTrigger at the
+// end of every per-trigger poll cycle. Nil receiver is a no-op (matches
+// the rest of the OpsMetrics surface). Unknown outcome / source values
+// are silently ignored — the closed-set guard pre-instantiates the
+// label combinations at boot so an out-of-vocab label would inflate
+// cardinality silently otherwise.
+func (m *OpsMetrics) ObserveESMPoll(source, outcome string) {
+	if m == nil || m.esmPollsTotal == nil {
+		return
+	}
+	switch outcome {
+	case ESMPollOutcomeSuccess, ESMPollOutcomeEmpty, ESMPollOutcomeError:
+		// ok — closed vocab
+	default:
+		return
+	}
+	m.esmPollsTotal.WithLabelValues(source, outcome).Inc()
+}
+
+// ObserveESMRecords increments schedd_esm_records_consumed_total{source}
+// by the supplied count. Called after closeBatch so the count reflects
+// what survived closeBatch (NOT what passed FilterCriteria — that's a
+// different counter; a future "esm_records_filtered_total" can be added
+// in a follow-up if the dashboard needs the breakdown). n <= 0 is a
+// no-op (negative would underflow a Prometheus counter).
+func (m *OpsMetrics) ObserveESMRecords(source string, n int) {
+	if m == nil || m.esmRecordsConsumedTotal == nil || n <= 0 {
+		return
+	}
+	m.esmRecordsConsumedTotal.WithLabelValues(source).Add(float64(n))
+}
+
+// ObserveESMLag records schedd_esm_lag_seconds{source, shard}.seconds
+// for a per-record lag observation. shard is the partition / stream /
+// queue-name identifier; the dispatcher must collapse shards past the
+// 32-bucket cap to "_agg" BEFORE calling this helper (the closed-set
+// pre-instantiation only populates the `_agg` series at boot). lag < 0
+// is a no-op (negative lag is a clock-skew artifact, not a real
+// observation).
+func (m *OpsMetrics) ObserveESMLag(source, shard string, lagSeconds float64) {
+	if m == nil || m.esmLagSeconds == nil || lagSeconds < 0 {
+		return
+	}
+	if shard == "" {
+		shard = "_agg"
+	}
+	m.esmLagSeconds.WithLabelValues(source, shard).Observe(lagSeconds)
+}
+
+// ESMPollCounterForTest returns the pre-instantiated Prometheus
+// counter child for (source, outcome). Test-only accessor (lives in
+// metrics.go because the closed-set pre-instantiation is internal
+// to wire). Returns an error if the requested label pair was not
+// pre-instantiated by NewOpsMetrics (the dispatcher uses the closed
+// vocab so out-of-vocab lookups are a code-path regression).
+//
+// Added for PR #993 / issue #757 review MED-2 regression test:
+// pkg/sched/dispatch_triggers_test.go::TestObserveESM_ForwardsToOpsMetrics.
+func (m *OpsMetrics) ESMPollCounterForTest(source, outcome string) (prometheus.Counter, error) {
+	if m == nil || m.esmPollsTotal == nil {
+		return nil, errors.New("OpsMetrics.esmPollsTotal not initialised")
+	}
+	return m.esmPollsTotal.GetMetricWithLabelValues(source, outcome)
+}
+
+// ESMRecordsCounterForTest returns the pre-instantiated Prometheus
+// counter child for source. Mirrors ESMPollCounterForTest.
+func (m *OpsMetrics) ESMRecordsCounterForTest(source string) (prometheus.Counter, error) {
+	if m == nil || m.esmRecordsConsumedTotal == nil {
+		return nil, errors.New("OpsMetrics.esmRecordsConsumedTotal not initialised")
+	}
+	return m.esmRecordsConsumedTotal.GetMetricWithLabelValues(source)
 }

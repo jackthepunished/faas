@@ -1,0 +1,67 @@
+name: kafka e2e
+
+# Manual-only acceptance job for the Kafka poller e2e
+# (issue #757 / ADR-118, commit 10 of the mega-PR). Runs the
+# whitebox test in pkg/sched/poller_kafka_e2e_test.go against a
+# real broker brought up via testcontainers-go / modules/kafka
+# (confluentinc/confluent-local:7.5.0 by default).
+#
+# The kafka_e2e build tag keeps this off the default `go test
+# ./...` path. The CI workflow is workflow_dispatch only — the
+# GHA shared runners have unreliable Docker access (TCP port
+# 9092 bind races with caching daemons), and Kafka availability
+# must not block merges. Same gating pattern used by
+# paddle-sandbox.yml and stripex-sandbox.yml.
+#
+# Why whitebox (package sched) and not cmd/e2e/trigger_kafka_e2e_test.go:
+# newKafkaPoller is unexported — the test must live in the same
+# package as the poller. The testdata README at
+# cmd/e2e/testdata/trigger-kafka/README.md documents the
+# pipeline-level rationale; the workflow file is the operator
+# surface.
+#
+# Hardening: pin setup-go to v7 (matches ci.yml), pin Go version
+# to 1.25.13 (matches ci.yml — gofmt differs between 1.25.0 and
+# 1.25.13), enable Go module/build cache, set timeout-minutes,
+# add a concurrency cancel-in-progress group.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kafka-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GO_VERSION: "1.25.13"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: check Docker pre-condition
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::warning::docker not available on this runner; skipping kafka e2e"
+            exit 0
+          fi
+          if ! docker info >/dev/null 2>&1; then
+            echo "::warning::docker daemon not reachable; skipping kafka e2e"
+            exit 0
+          fi
+      - name: kafka poller e2e
+        run: |
+          set -euo pipefail
+          # Build tag: kafka_e2e. The test container is
+          # `confluentinc/confluent-local:7.5.0` — the
+          # testcontainers Go module pulls it on first run.
+          go test -tags kafka_e2e -race -count=1 -run TestKafkaPollerE2E -v -timeout=10m ./pkg/sched/...

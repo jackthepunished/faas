@@ -176,50 +176,16 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "app_id is required"))
 		return
 	}
-	// Review finding #6: reject cron-kind POSTs BEFORE the
-	// plan-quota lookup. ADR-090 PR-B wires cron triggers
-	// through the crons table (the dashboard "Add cron" UI is
-	// POST /v1/crons); accepting them here would couple the
-	// two storage paths in this commit. Rejecting early also
-	// avoids the AppByID roundtrip + the per-plan
-	// TriggerLimitPerApp / TriggerLimitPerAccount caps work
-	// for a POST that would have been rejected a few lines
-	// later — a Free-plan customer hitting POST /v1/triggers
-	// with kind=cron gets a clean 400 rather than the 402
-	// "triggers not allowed on plan free" response that
-	// would be misleading.
-	if req.Kind == api.TriggerKindCron {
-		if !validCron(req.Schedule) {
-			api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)"))
-			return
-		}
-		// Path default kept here for parity with the cron table.
-		if req.Path == "" {
-			req.Path = "/"
-		}
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest,
-			"trigger_immutable",
-			"kind=cron not supported on POST /v1/triggers — use POST /v1/crons",
-			""))
-		return
-	}
-	switch req.Kind {
-	case api.TriggerKindKafka, api.TriggerKindNATS, api.TriggerKindRedisStreams, api.TriggerKindSQSCompat, api.TriggerKindQueue:
-		if req.Slug == "" {
-			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "slug is required for non-cron triggers"))
-			return
-		}
-		if len(req.Config) == 0 {
-			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "config is required for non-cron triggers"))
-			return
-		}
-		if err := validateTriggerConfig(req.Kind, req.Config); err != nil {
-			api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "trigger_invalid_config", "Invalid trigger config", err.Error()))
-			return
-		}
-	default:
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
-			"unknown kind: must be one of cron|kafka|nats|redis_streams|sqs_compat|queue"))
+	// PR #993 / issue #757 review MED-5: the original 188-line
+	// createTrigger was a linear early-return chain that mixed
+	// HTTP decode, kind validation, plan-cap application, store
+	// call, and audit emission. CLAUDE.md caps handler bodies at
+	// 50 lines; the review flagged that the chain had grown past
+	// that. Extract two helpers (validateCreateTriggerRequest +
+	// enforceCreateTriggerCaps) so the handler reads as
+	// decode → validate → caps → store → audit.
+	if p := validateCreateTriggerRequest(&req); p != nil {
+		api.WriteProblem(w, p)
 		return
 	}
 	limits, ok := api.LimitsFor(acct.Plan)
@@ -236,57 +202,47 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	batchSizeMax := int32(64)
-	if v := intFrom(req.BatchSizeMax); v > 0 {
-		batchSizeMax = int32(v)
-	}
-	if limits.TriggerBatchSizeMax > 0 && batchSizeMax > int32(limits.TriggerBatchSizeMax) {
-		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "batch_size_max", limits.TriggerBatchSizeMax, int(batchSizeMax)))
+	batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, p := enforceCreateTriggerCaps(&req, acct.Plan, limits)
+	if p != nil {
+		api.WriteProblem(w, p)
 		return
 	}
-	batchWindowMs := int32(1000)
-	if v := intFrom(req.BatchWindowMs); v > 0 {
-		batchWindowMs = int32(v)
-	}
-	maxAttempts := int32(5)
-	if v := intFrom(req.MaxAttempts); v > 0 {
-		maxAttempts = int32(v)
-	}
-	if limits.TriggerMaxAttemptsMax > 0 && maxAttempts > int32(limits.TriggerMaxAttemptsMax) {
-		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts)))
+	t, problem := s.persistCreatedTrigger(w, r.Context(), &req, acct, app.ID, enabled,
+		batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, limits)
+	if problem != nil {
+		api.WriteProblem(w, problem)
 		return
 	}
-	// Audit finding #7 (migration 00278): per-trigger broker payload
-	// size cap. Default 6 MiB when the request omits the field.
-	// Surface a plan-level 403 (rather than letting the SQL CHECK
-	// 422 the request) so the response carries the plan cap + the
-	// observed value, matching the existing batch_size_max /
-	// max_attempts gates above.
-	payloadMaxBytes := int32(6291456)
-	if req.PayloadMaxBytes != nil && *req.PayloadMaxBytes > 0 {
-		payloadMaxBytes = int32(*req.PayloadMaxBytes)
-	}
-	if limits.TriggerPayloadMaxBytes > 0 && payloadMaxBytes > int32(limits.TriggerPayloadMaxBytes) {
-		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "payload_max_bytes", limits.TriggerPayloadMaxBytes, int(payloadMaxBytes)))
-		return
-	}
-	// Audit #10 (migration 00279): kafka-only broker-poison
-	// handling strategy. nil → "commit" default (the previous
-	// hardcoded behaviour; broker offset advances on poison).
-	// The apid handler does not gate this on kind yet — non-kafka
-	// kinds ignore the field; the SQL CHECK rejects malformed
-	// values; the kafka poller is the only consumer.
-	brokerPoisonStrategy := api.BrokerPoisonStrategyCommit
-	if req.BrokerPoisonStrategy != nil && *req.BrokerPoisonStrategy != "" {
-		brokerPoisonStrategy = *req.BrokerPoisonStrategy
-	}
-	// (cron-kind POSTs are rejected earlier in the handler — the
-	// ADR-090 PR-B path. The review finding #6 fix shifts the
-	// rejection above the AppByID roundtrip so a kind=cron POST
-	// never pays for the plan-tier gate or per-record cap
-	// checks below.)
-	t, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
-		app.ID,
+	writeJSON(w, http.StatusCreated, triggerResponse(t))
+}
+
+// persistCreatedTrigger runs the store call + audit emission that
+// closes the createTrigger handler. PR #993 / issue #757 review
+// MED-5: extracted from createTrigger so the handler body stays
+// under the CLAUDE.md 50-line cap (the inline store call + quota-
+// error switch + notify + log + audit emission was the remaining
+// ~30 lines after validateCreateTriggerRequest + enforceCreateTriggerCaps
+// were extracted). Returns the created Trigger + a non-nil Problem
+// on the quota / capacity error paths. The not-found path writes
+// the 404 directly via s.notFound (it owns the writer contract) and
+// returns sqlc.Trigger{} + nil so the caller doesn't double-write.
+//
+// Cron-kind POSTs are rejected earlier in the chain (the ADR-090
+// PR-B path, review finding #6), so persistCreatedTrigger only
+// sees kinds that CreateTriggerIfUnderQuota accepts.
+func (s *server) persistCreatedTrigger(
+	w http.ResponseWriter,
+	ctx context.Context,
+	req *api.CreateTriggerRequest,
+	acct state.Account,
+	appID string,
+	enabled bool,
+	batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32,
+	brokerPoisonStrategy string,
+	limits api.Limits,
+) (sqlc.Trigger, *api.Problem) {
+	t, err := s.store.CreateTriggerIfUnderQuota(ctx,
+		appID,
 		string(req.Kind), req.Slug, enabled, []byte(req.Config),
 		batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes,
 		brokerPoisonStrategy, limits)
@@ -294,27 +250,170 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		var qe *state.TriggerQuotaError
 		switch {
 		case errors.As(err, &qe):
-			api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, string(qe.Scope), qe.Limit, qe.Observed))
+			return sqlc.Trigger{}, api.ErrPlanTriggerQuota(acct.Plan, string(qe.Scope), qe.Limit, qe.Observed)
 		case errors.Is(err, state.ErrNotFound):
 			s.notFound(w, "no such app")
+			return sqlc.Trigger{}, nil
 		default:
-			api.WriteProblem(w, api.ErrCapacity("could not create trigger"))
+			return sqlc.Trigger{}, api.ErrCapacity("could not create trigger")
 		}
-		return
 	}
 	triggerUUID := uuidFromPgtype(t.ID).String()
 	appUUID := uuidFromPgtype(t.AppID).String()
-	_ = s.notif.Notify(r.Context(), db.NotifyTriggerChanged,
+	_ = s.notif.Notify(ctx, db.NotifyTriggerChanged,
 		notifyTriggerChangedJSON("created", appUUID, triggerUUID))
 	s.log.Info("trigger created", "trigger", triggerUUID, "app", appUUID, "account", acct.ID, "kind", req.Kind)
-	s.audit.Emit(r.Context(), "trigger.created", &acct.ID, map[string]any{
+	s.audit.Emit(ctx, "trigger.created", &acct.ID, map[string]any{
 		"trigger_id": triggerUUID,
 		"app_id":     appUUID,
 		"kind":       req.Kind,
 		"slug":       req.Slug,
 		"enabled":    enabled,
 	})
-	writeJSON(w, http.StatusCreated, triggerResponse(t))
+	return t, nil
+}
+
+// validateCreateTriggerRequest walks the request shape + kind
+// vocabulary. Returns nil on accept; an *api.Problem on reject.
+// PR #993 / issue #757 review MED-5: extracted from createTrigger
+// so the cap application (MED-4's two gates + the original four)
+// lives in a separate helper, and the HTTP-shape validation stays
+// in one place. Rejecting cron-kind POSTs early (review finding
+// #6) keeps the AppByID roundtrip off the hot path for the
+// already-rejected case.
+func validateCreateTriggerRequest(req *api.CreateTriggerRequest) *api.Problem {
+	// Review finding #6: reject cron-kind POSTs BEFORE the
+	// plan-quota lookup. ADR-090 PR-B wires cron triggers
+	// through the crons table (the dashboard "Add cron" UI is
+	// POST /v1/crons); accepting them here would couple the
+	// two storage paths in this commit. Rejecting early also
+	// avoids the AppByID roundtrip + the per-plan
+	// TriggerLimitPerApp / TriggerLimitPerAccount caps work
+	// for a POST that would have been rejected a few lines
+	// later — a Free-plan customer hitting POST /v1/triggers
+	// with kind=cron gets a clean 400 rather than the 402
+	// "triggers not allowed on plan free" response that
+	// would be misleading.
+	if req.Kind == api.TriggerKindCron {
+		if !validCron(req.Schedule) {
+			return api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)")
+		}
+		// Path default kept here for parity with the cron table.
+		if req.Path == "" {
+			req.Path = "/"
+		}
+		return api.NewProblem(http.StatusBadRequest,
+			"trigger_immutable",
+			"kind=cron not supported on POST /v1/triggers — use POST /v1/crons",
+			"")
+	}
+	switch req.Kind {
+	case api.TriggerKindKafka, api.TriggerKindNATS, api.TriggerKindRedisStreams, api.TriggerKindSQSCompat, api.TriggerKindQueue:
+		if req.Slug == "" {
+			return api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "slug is required for non-cron triggers")
+		}
+		if len(req.Config) == 0 {
+			return api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "config is required for non-cron triggers")
+		}
+		if err := validateTriggerConfig(req.Kind, req.Config); err != nil {
+			return api.NewProblem(http.StatusUnprocessableEntity, "trigger_invalid_config", "Invalid trigger config", err.Error())
+		}
+		return nil
+	default:
+		return api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
+			"unknown kind: must be one of cron|kafka|nats|redis_streams|sqs_compat|queue")
+	}
+}
+
+// enforceCreateTriggerCaps applies every plan-cap gate the
+// createTrigger handler enforces, in order, and returns the
+// finalised (batchSizeMax, batchWindowMs, maxAttempts,
+// payloadMaxBytes, brokerPoisonStrategy) tuple. A non-nil
+// *api.Problem short-circuits the handler. PR #993 / issue #757
+// review MED-5: extracted from createTrigger so the gate chain
+// reads as a single declarative block. MED-4's BatchWindowMs +
+// TLSSkipVerifyAllowed gates live here alongside the original
+// batch_size_max / max_attempts / payload_max_bytes gates.
+//
+// Field defaults (batch_size_max=64, batch_window_ms=1000,
+// max_attempts=5, payload_max_bytes=6 MiB, broker_poison_strategy
+// ="commit") match the pre-MED-5 handler exactly so behaviour
+// stays unchanged for callers that omit the optional fields.
+func enforceCreateTriggerCaps(req *api.CreateTriggerRequest, plan api.Plan, limits api.Limits) (
+	batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32,
+	brokerPoisonStrategy string,
+	problem *api.Problem,
+) {
+	batchSizeMax = int32(64)
+	if v := intFrom(req.BatchSizeMax); v > 0 {
+		batchSizeMax = int32(v)
+	}
+	if limits.TriggerBatchSizeMax > 0 && batchSizeMax > int32(limits.TriggerBatchSizeMax) {
+		return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+			api.ErrPlanTriggerQuota(plan, "batch_size_max", limits.TriggerBatchSizeMax, int(batchSizeMax))
+	}
+	batchWindowMs = int32(1000)
+	if v := intFrom(req.BatchWindowMs); v > 0 {
+		batchWindowMs = int32(v)
+	}
+	// PR #993 / issue #757 review MED-4: enforce the per-plan
+	// batch_window cap (limits.TriggerBatchWindowMaxSec — Hobby
+	// 30s, Pro/Scale 300s). Pre-MED-4 the field went straight
+	// through to the SQL CHECK (10ms–600s) — a Hobby customer
+	// could legally request 600s and pin 10× the broker dwell
+	// window the per-app rate-limit is sized for.
+	if limits.TriggerBatchWindowMaxSec > 0 {
+		observedSec := int(batchWindowMs / 1000)
+		if observedSec > limits.TriggerBatchWindowMaxSec {
+			return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+				api.ErrTriggerBatchWindowTooLarge(plan, limits.TriggerBatchWindowMaxSec, observedSec)
+		}
+	}
+	// PR #993 / issue #757 review MED-4: tls.skip_verify=true on
+	// a Kafka trigger is gated by the plan's TLSSkipVerifyAllowed
+	// flag (Hobby=false, Pro=true, Scale=true). Pre-MED-4 the
+	// field went straight to the broker — a Hobby customer
+	// could silently weaken hostname + cert verification on the
+	// production broker.
+	if !plan.TLSSkipVerifyAllowed() {
+		skip, err := kafkaSkipVerifyRequested(req.Kind, req.Config)
+		if err != nil {
+			return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+				api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "invalid trigger config: "+err.Error())
+		}
+		if skip {
+			return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+				api.ErrTriggerTLSSkipVerifyNotAllowed(plan)
+		}
+	}
+	maxAttempts = int32(5)
+	if v := intFrom(req.MaxAttempts); v > 0 {
+		maxAttempts = int32(v)
+	}
+	if limits.TriggerMaxAttemptsMax > 0 && maxAttempts > int32(limits.TriggerMaxAttemptsMax) {
+		return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+			api.ErrPlanTriggerQuota(plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts))
+	}
+	// Audit finding #7 (migration 00278): per-trigger broker
+	// payload size cap. Default 6 MiB when the request omits
+	// the field. Surface a plan-level 403 (rather than letting
+	// the SQL CHECK 422 the request) so the response carries
+	// the plan cap + the observed value.
+	payloadMaxBytes = int32(6291456)
+	if req.PayloadMaxBytes != nil && *req.PayloadMaxBytes > 0 {
+		payloadMaxBytes = int32(*req.PayloadMaxBytes)
+	}
+	if limits.TriggerPayloadMaxBytes > 0 && payloadMaxBytes > int32(limits.TriggerPayloadMaxBytes) {
+		return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy,
+			api.ErrPlanTriggerQuota(plan, "payload_max_bytes", limits.TriggerPayloadMaxBytes, int(payloadMaxBytes))
+	}
+	// Audit #10 (migration 00279): kafka-only broker-poison
+	// handling strategy. nil → "commit" default.
+	brokerPoisonStrategy = api.BrokerPoisonStrategyCommit
+	if req.BrokerPoisonStrategy != nil && *req.BrokerPoisonStrategy != "" {
+		brokerPoisonStrategy = *req.BrokerPoisonStrategy
+	}
+	return batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, nil
 }
 
 // --- listTriggers ----------------------------------------------------------
@@ -424,6 +523,36 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 	}
+	// PR #993 / issue #757 review MED-4: mirror createTrigger's
+	// plan gates for PATCH. A Hobby customer upgrading their
+	// batch_window from 5s to 600s after the fact, or flipping
+	// tls.skip_verify=true on an existing trigger, are the two
+	// holes the create-time gate leaves open. LimitsFor returns
+	// the (plan) entry; the unknown-plan fallback is Free which
+	// short-circuits via TriggersAllowed (already enforced on
+	// the lookup above when we AppByIDed).
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok {
+		limits, _ = api.LimitsFor(api.PlanFree)
+	}
+	if req.BatchWindowMs != nil && limits.TriggerBatchWindowMaxSec > 0 {
+		observedSec := int(*req.BatchWindowMs / 1000)
+		if observedSec > limits.TriggerBatchWindowMaxSec {
+			api.WriteProblem(w, api.ErrTriggerBatchWindowTooLarge(acct.Plan, limits.TriggerBatchWindowMaxSec, observedSec))
+			return
+		}
+	}
+	if req.Config != nil && !acct.Plan.TLSSkipVerifyAllowed() {
+		skip, err := kafkaSkipVerifyRequested(api.TriggerKind(t.Kind), req.Config)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "invalid trigger config: "+err.Error()))
+			return
+		}
+		if skip {
+			api.WriteProblem(w, api.ErrTriggerTLSSkipVerifyNotAllowed(acct.Plan))
+			return
+		}
+	}
 	var batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32
 	if req.BatchSizeMax != nil {
 		v := int32(*req.BatchSizeMax)
@@ -456,6 +585,19 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if req.Config != nil {
 		configBytes = []byte(req.Config)
 	}
+	// REVIEW-FIX MED-1 (PR #993 / issue #757 closure):
+	// marshal filter_criteria to JSONB bytes if the customer is
+	// patching it. nil req.FilterCriteria → leave the column
+	// unchanged via the coalesce() in pgstore.UpdateTrigger.
+	var filterCriteriaBytes *[]byte
+	if req.FilterCriteria != nil {
+		b, err := json.Marshal(req.FilterCriteria)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+			return
+		}
+		filterCriteriaBytes = &b
+	}
 	// Review finding #4 (PR #910): for kind=cron rows the
 	// schedule/path columns live on the `crons` table (the
 	// triggers.cron_id FK points at it). The old code accepted
@@ -475,13 +617,13 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 		// Update the non-cron fields on the triggers row.
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, filterCriteriaBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
 		}
 	} else {
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, filterCriteriaBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
@@ -574,7 +716,7 @@ func (s *server) setTriggerEnabled(w http.ResponseWriter, r *http.Request, acct 
 		s.notFound(w, "no such trigger")
 		return
 	}
-	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil, nil)
+	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 		return
@@ -994,6 +1136,44 @@ func validateTriggerConfig(kind api.TriggerKind, raw json.RawMessage) error {
 		probe.Triggers[0].Config = anyMap
 	}
 	return probe.Validate()
+}
+
+// kafkaSkipVerifyRequested returns true iff the trigger Config
+// blob carries a kafka.tls.skip_verify=true leaf. Used by
+// createTrigger + updateTrigger to gate the TLSSkipVerifyAllowed
+// plan flag (PR #993 / issue #757 review MED-4). Non-kafka kinds
+// always return false (the field is meaningless for them). A
+// malformed Config blob returns (false, err) so the caller can
+// surface the validator's error rather than silently allowing the
+// gate to fall through.
+//
+// Mirrors validateTriggerConfig's permissive decode (the same
+// json.Unmarshal into map[string]any), but extracts the single
+// bool we care about. Re-decode rather than re-using
+// gregalemanifest's typed KafkaConfig because we don't want the
+// createTrigger handler to take on a hard dependency on the
+// manifest package's exact field shape — the validator owns the
+// shape contract, this helper just reads one leaf.
+func kafkaSkipVerifyRequested(kind api.TriggerKind, raw json.RawMessage) (bool, error) {
+	if kind != api.TriggerKindKafka {
+		return false, nil
+	}
+	if len(raw) == 0 {
+		return false, nil
+	}
+	var cfg struct {
+		Brokers []string `json:"brokers"`
+		TLS     *struct {
+			SkipVerify bool `json:"skip_verify"`
+		} `json:"tls"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return false, err
+	}
+	if cfg.TLS == nil {
+		return false, nil
+	}
+	return cfg.TLS.SkipVerify, nil
 }
 
 // aggregateTriggerMetrics walks trigger_records for the trigger

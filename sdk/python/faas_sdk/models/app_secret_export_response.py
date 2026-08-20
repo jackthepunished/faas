@@ -19,6 +19,7 @@ class AppSecretExportResponse:
 
     app_id: str
     key: str
+    scope: str
     ciphertext: str
     """base64-encoded age-sealed envelope"""
     created_at: datetime.datetime
@@ -29,6 +30,8 @@ class AppSecretExportResponse:
         app_id = self.app_id
 
         key = self.key
+
+        scope = self.scope
 
         ciphertext = self.ciphertext
 
@@ -42,6 +45,7 @@ class AppSecretExportResponse:
             {
                 "app_id": app_id,
                 "key": key,
+                "scope": scope,
                 "ciphertext": ciphertext,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -57,6 +61,8 @@ class AppSecretExportResponse:
 
         key = d.pop("key")
 
+        scope = d.pop("scope")
+
         ciphertext = d.pop("ciphertext")
 
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
@@ -66,6 +72,7 @@ class AppSecretExportResponse:
         app_secret_export_response = cls(
             app_id=app_id,
             key=key,
+            scope=scope,
             ciphertext=ciphertext,
             created_at=created_at,
             updated_at=updated_at,

@@ -1270,6 +1270,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// surfaces the integration point in one place.
 		WithLivenessWindow(livenessWindow)
 
+	// Issue #757 / ADR-118 (PR #993 review MED-3): attach the
+	// broker-egress shaper to the dispatch loop. Env vars:
+	//
+	//	FAAS_BROKER_EGRESS_MBIT   positive int; 0/unset → noop
+	//	FAAS_BROKER_EGRESS_IFNAME  default "faas-brokerq"
+	//
+	// Pre-MED-3 the BrokerEgressConfig seam existed in
+	// pkg/sched/broker_egress.go and WithBrokerAccountor was on
+	// the WireChain, but cmd/schedd never parsed the env vars,
+	// so every dispatch tick silently fell through to the noop
+	// accountor and the broker egress was effectively unbounded
+	// in prod. A parse error fails boot loudly so a typo can't
+	// silently disable the shaper.
+	if beCfg, ok, err := brokerEgressConfigFromEnv(); err != nil {
+		log.Error("broker egress config: invalid env", "err", err)
+		os.Exit(1)
+	} else if ok {
+		loop = loop.WithBrokerAccountor(sched.NewBrokerAccountor(beCfg))
+		log.Info("broker egress shaper attached",
+			"mbit", beCfg.EgressMbit,
+			"ifname", beCfg.InterfaceName)
+	}
+
 	// ADR-067: Tier A6 migrating-instance watchdog — self-heals
 	// rows stuck in state='migrating' after a new-owner vmmd dies
 	// mid-handoff. 1 s tick (api.MigratingWatchdogIntervalSeconds);
@@ -1680,6 +1703,41 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 // error); run is the subscriber's drain (run blocks until the
 // channel closes or ctx fires).
 //
+// brokerEgressConfigFromEnv is the MED-3 (PR #993 / issue #757
+// closure) env-var seam for the broker egress shaper. The
+// WireChain callsite at main.go:1271+ consumes the returned
+// (cfg, true, nil) pair to attach the BrokerAccountor to the
+// dispatch loop. Returns:
+//
+//   - (zero, false, nil)  → env unset, deploy without a shaper
+//     (noopBrokerAccountor, the pre-MED-3
+//     default; preserves the broker_egress
+//     seam's documented "zero = noop"
+//     semantics).
+//   - (cfg, true, nil)    → env set, attach cfg to the loop.
+//   - (zero, false, err)  → parse error; caller MUST fail boot
+//     loudly so the operator notices the
+//     typo instead of silently running
+//     without a shaper.
+func brokerEgressConfigFromEnv() (sched.BrokerEgressConfig, bool, error) {
+	v := os.Getenv("FAAS_BROKER_EGRESS_MBIT")
+	if v == "" {
+		return sched.BrokerEgressConfig{}, false, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return sched.BrokerEgressConfig{}, false, fmt.Errorf("FAAS_BROKER_EGRESS_MBIT must be a positive integer (got %q)", v)
+	}
+	cfg := sched.BrokerEgressConfig{
+		InterfaceName: os.Getenv("FAAS_BROKER_EGRESS_IFNAME"),
+		EgressMbit:    n,
+	}
+	if cfg.InterfaceName == "" {
+		cfg.InterfaceName = "faas-brokerq"
+	}
+	return cfg, true, nil
+}
+
 // Backoff schedule: linear 1s → 30s on dial failure or drain
 // exit. Reset to 1s after a successful drain that exited
 // cleanly (channel-closed from the producer side, which

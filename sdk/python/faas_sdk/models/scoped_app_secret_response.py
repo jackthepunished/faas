@@ -30,7 +30,8 @@ class ScopedAppSecretResponse:
     updated_at: datetime.datetime
     kid: str | Unset = UNSET
     """age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before
-    migration 00166."""
+    migration 00166. Mirrors the `kid` field on the parent `AppSecretResponse` — see that schema for the cross-
+    reference."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

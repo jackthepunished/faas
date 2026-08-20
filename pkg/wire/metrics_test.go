@@ -1412,3 +1412,100 @@ func TestOpsMetrics_GuestTail_NilSafe(t *testing.T) {
 		t.Errorf("nil.TailCapReached = %v, want nil", got)
 	}
 }
+
+// TestOpsMetrics_ObserveESMPoll (issue #757 / ADR-118 commit 9):
+// observe the schedd_esm_polls_total counter and assert the
+// closed-source/outcome guard rejects out-of-vocab labels without
+// inflating cardinality. Mirrors TestOpsMetrics_ObserveStatelessAdvisory's
+// closed-set pattern.
+func TestOpsMetrics_ObserveESMPoll(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveESMPoll("kafka", wire.ESMPollOutcomeSuccess)
+	m.ObserveESMPoll("kafka", wire.ESMPollOutcomeSuccess)
+	m.ObserveESMPoll("nats", wire.ESMPollOutcomeEmpty)
+	m.ObserveESMPoll("redis_streams", wire.ESMPollOutcomeError)
+	// Out-of-vocab OUTCOME must NOT create a label series. Source
+	// is intentionally open (a future trigger kind extends the
+	// list); the closed-vocab guard on the outcome label is the
+	// cardinality pinch-point.
+	m.ObserveESMPoll("kafka", "yolo")
+
+	body := render(t, m)
+	wantLines := []string{
+		`schedd_esm_polls_total{outcome="success",source="kafka"} 2`,
+		`schedd_esm_polls_total{outcome="empty",source="nats"} 1`,
+		`schedd_esm_polls_total{outcome="error",source="redis_streams"} 1`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `outcome="yolo"`) {
+		t.Errorf(`out-of-vocab outcome="yolo" label must not appear in:\n%s`, body)
+	}
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveESMPoll("kafka", wire.ESMPollOutcomeSuccess) // must not panic
+}
+
+// TestOpsMetrics_ObserveESMRecords pins the records-consumed
+// counter with the additive form. Zero / negative n is a no-op
+// (negative would underflow a Prometheus counter).
+func TestOpsMetrics_ObserveESMRecords(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveESMRecords("kafka", 5)
+	m.ObserveESMRecords("kafka", 3)
+	m.ObserveESMRecords("nats", 0)  // no-op
+	m.ObserveESMRecords("nats", -2) // no-op (negative)
+
+	body := render(t, m)
+	want := []string{
+		`schedd_esm_records_consumed_total{source="kafka"} 8`,
+		`schedd_esm_records_consumed_total{source="nats"} 0`,
+	}
+	for _, w := range want {
+		if !strings.Contains(body, w) {
+			t.Errorf("missing line %q in:\n%s", w, body)
+		}
+	}
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveESMRecords("kafka", 1) // must not panic
+}
+
+// TestOpsMetrics_ObserveESMLag pins the lag histogram with the
+// shard-collapsing rule: empty shard → "_agg"; negative lag is a
+// no-op. The bucket count assertion confirms the histogram is
+// wired up under the supplied prefix.
+func TestOpsMetrics_ObserveESMLag(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveESMLag("kafka", "0", 0.012)
+	m.ObserveESMLag("kafka", "0", 0.250)
+	m.ObserveESMLag("nats", "", 1.500)  // empty shard → "_agg"
+	m.ObserveESMLag("kafka", "0", -0.5) // negative lag → no-op
+
+	body := render(t, m)
+	// Prometheus emits labels in lexical order: shard comes
+	// before source. Two observations land in the same bucket
+	// range (0.005 to 0.025 covers the 0.012 sample; 0.1 to 0.25
+	// covers the 0.250 sample). Aggregated via Prometheus the
+	// histogram bucket count is monotonically cumulative, so we
+	// assert at least one of the buckets is non-zero.
+	wantSamples := []string{
+		`schedd_esm_lag_seconds_bucket{shard="0",source="kafka",le="0.025"} 1`,
+		`schedd_esm_lag_seconds_bucket{shard="_agg",source="nats",le="2.5"} 1`,
+		// Count assertion: exactly 2 kafka/0 samples (the two
+		// positive observations; the -0.5 observation was dropped).
+		`schedd_esm_lag_seconds_count{shard="0",source="kafka"} 2`,
+	}
+	for _, w := range wantSamples {
+		if !strings.Contains(body, w) {
+			t.Errorf("missing histogram line %q in:\n%s", w, body)
+		}
+	}
+
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveESMLag("kafka", "0", 1.0) // must not panic
+}

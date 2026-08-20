@@ -101,6 +101,13 @@ type Loop struct {
 	// lastFloorByApp > effectiveFloor AND ≥1 instance was parked
 	// by ReapIdle for the app this tick.
 	lastFloorByApp map[string]int
+	// brokerAccountor (issue #757 / ADR-118 commit 8) — the
+	// per-tick broker-egress accounting seam. nil opts out
+	// (noop-on-nil semantics; the dispatch hot path guards
+	// against nil because tests + pre-commit-8 wiring never
+	// reaches this surface). Production wires NewBrokerAccountor
+	// via WithBrokerAccountor.
+	brokerAccountor BrokerAccountor
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -235,6 +242,24 @@ func (l *Loop) WithGatewayHTTPClient(client *http.Client, baseURL string) *Loop 
 
 // WithClock swaps the time source. Tests use it to advance through cron
 // boundaries deterministically; production leaves the default.
+// WithBrokerAccountor attaches the per-tick broker-egress
+// accounting seam (issue #757 / ADR-118 commit 8). nil opts
+// out: the dispatch hot path guards against a nil accountor
+// and silently drops the byte count (the noop semantics). The
+// default constructed by NewLoop is noopBrokerAccountor{}; the
+// production wiring is
+//
+//	NewLoop(...).WithBrokerAccountor(
+//	    NewBrokerAccountor(BrokerEgressConfig{...}),
+//	)
+//
+// …called from cmd/schedd after FAAS_BROKER_EGRESS_MBIT is
+// read from the env.
+func (l *Loop) WithBrokerAccountor(b BrokerAccountor) *Loop {
+	l.brokerAccountor = b
+	return l
+}
+
 func (l *Loop) WithClock(now func() time.Time) *Loop {
 	if now != nil {
 		l.now = now

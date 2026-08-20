@@ -218,6 +218,12 @@ var schemaSpecOnly = map[string]bool{
 	"TriggerRoutedTo":         true,
 	"TriggerDeadLetterReason": true,
 	"TemplateView":            true, // issue #961 / Mega-B PR-3: inline {Name, Category, Description string} in cmd/apid/handlers_templates.go
+	// Issue #757 / ADR-118 — typed string DTOs in pkg/api/trigger.go.
+	// Same pattern as TriggerKind above: the DTO scanner walks
+	// struct types only; a `type X string` definition isn't a
+	// struct so it doesn't surface as a scanner name.
+	"FilterCriteriaOp":   true,
+	"KafkaSASLMechanism": true,
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.

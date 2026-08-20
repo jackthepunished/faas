@@ -28,6 +28,8 @@ package sched
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +37,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/segmentio/kafka-go"
+	kafka "github.com/segmentio/kafka-go"
+	kafkaSASL "github.com/segmentio/kafka-go/sasl"
+	kafkaSASLPlain "github.com/segmentio/kafka-go/sasl/plain"
+	kafkaSASLScram "github.com/segmentio/kafka-go/sasl/scram"
 
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -73,20 +78,51 @@ type kafkaPoller struct {
 	inFlight map[string]kafka.Message
 }
 
+// kafkaTLSConfig mirrors pkg/gregalemanifest.TLSConfig for the
+// runtime side. The reason it lives here, not imported from the
+// manifest package: pkg/gregalemanifest imports pkg/sched
+// (sched.ParseSchedule); pkg/sched cannot import
+// pkg/gregalemanifest without a cycle (same rationale as the
+// parallel FilterClause in pkg/sched/filter.go). The validator
+// in pkg/gregalemanifest is the load-time gate; the poller just
+// decodes + builds a *tls.Config at dial time.
+type kafkaTLSConfig struct {
+	CACert     string `json:"ca_cert,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"`
+	SkipVerify bool   `json:"skip_verify,omitempty"`
+}
+
+// kafkaSASLConfig mirrors pkg/gregalemanifest.SASLConfig for the
+// same reason as kafkaTLSConfig (cycle avoidance). The Mechanism
+// string carries the closed-vocab value {PLAIN, SCRAM-SHA-256,
+// SCRAM-SHA-512}; decodeSASLMechanism is the only place that
+// maps the string onto a segmentio/kafka-go sasl.Mechanism.
+type kafkaSASLConfig struct {
+	Mechanism string `json:"mechanism"`
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+}
+
 // kafkaConfig is the per-kind config blob decoded from
 // trigger.Config json.RawMessage.
 //
-// Schema (validated in pkg/gregalemanifest.validateKindConfig):
+// Schema (validated in pkg/gregalemanifest.validateKindConfig,
+// commit 2):
 //
 //	{
 //	  "brokers": ["broker:9092", "broker2:9092"],
 //	  "topic":   "orders.v1",
-//	  "group":   "faas-orders"   // consumer group id
+//	  "group":   "faas-orders",   // consumer group id
+//	  "tls":    { ca_cert: ..., client_cert: ..., client_key: ..., skip_verify: ... }  // optional
+//	  "sasl":   { mechanism: "PLAIN", username: ..., password: ... }                  // optional
 //	}
 type kafkaConfig struct {
-	Brokers []string `json:"brokers"`
-	Topic   string   `json:"topic"`
-	Group   string   `json:"group"`
+	Brokers []string         `json:"brokers"`
+	Topic   string           `json:"topic"`
+	Group   string           `json:"group"`
+	TLS     *kafkaTLSConfig  `json:"tls,omitempty"`
+	SASL    *kafkaSASLConfig `json:"sasl,omitempty"`
 }
 
 func decodeKafkaConfig(t sqlc.Trigger) (kafkaConfig, error) {
@@ -106,7 +142,128 @@ func decodeKafkaConfig(t sqlc.Trigger) (kafkaConfig, error) {
 	if cfg.Group == "" {
 		return cfg, fmt.Errorf("kafka_poller: trigger missing group")
 	}
+	// sasl.mechanism is the customer-facing string. The closed
+	// vocab {PLAIN, SCRAM-SHA-256, SCRAM-SHA-512} mirrors
+	// pkg/gregalemanifest.SASLMechanism; we re-validate here so a
+	// half-shaped SASL block from a non-manifest edit (CLI hot
+	// path, row hand-edit in psql) still surfaces a typed
+	// error at the dispatcher rather than crashing inside
+	// kafka.NewReader.
+	if cfg.SASL != nil {
+		switch cfg.SASL.Mechanism {
+		case "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512":
+			// ok
+		default:
+			return cfg, fmt.Errorf("kafka_poller: sasl.mechanism=%q is not in the closed vocab {PLAIN, SCRAM-SHA-256, SCRAM-SHA-512}",
+				cfg.SASL.Mechanism)
+		}
+		if cfg.SASL.Username == "" {
+			return cfg, fmt.Errorf("kafka_poller: sasl.username is required")
+		}
+		if cfg.SASL.Password == "" {
+			return cfg, fmt.Errorf("kafka_poller: sasl.password is required")
+		}
+	}
 	return cfg, nil
+}
+
+// buildKafkaDialer assembles the kafka.Dialer from the decoded
+// kafkaConfig. A nil TLS field produces a nil *tls.Config (plain
+// TCP), a non-nil SASL field attaches the chosen sasl.Mechanism.
+// Validation of the SASL mechanism closed-vocab happens in
+// decodeKafkaConfig so this function trusts cfg.SASL.Mechanism.
+//
+// Returns (dialer, nil) on success or (nil, err) on a malformed
+// PEM block (the only path that can fail here — segmentio/kafka-go
+// constructors for both PLAIN and SCRAM succeed with non-empty
+// username/password).
+func buildKafkaDialer(cfg kafkaConfig) (*kafka.Dialer, error) {
+	d := &kafka.Dialer{
+		Timeout: 5 * time.Second,
+	}
+	if cfg.TLS != nil {
+		tlsCfg, err := buildKafkaTLSConfig(cfg.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_poller: build tls: %w", err)
+		}
+		d.TLS = tlsCfg
+	}
+	if cfg.SASL != nil {
+		mech, err := kafkaSASLMechanism(cfg.SASL)
+		if err != nil {
+			return nil, err
+		}
+		d.SASLMechanism = mech
+	}
+	return d, nil
+}
+
+// buildKafkaTLSConfig assembles a *tls.Config from the per-trigger
+// kafkaTLSConfig. MinVersion is forced to TLS 1.2 regardless of
+// what the customer wrote (or didn't write) — the financial
+// model forbids TLS 1.0/1.1 downgrades on managed tenants. CACert
+// is appended to the system trust store via x509.NewCertPool;
+// ClientCert + ClientKey become a single tls.Certificate for
+// mTLS. SkipVerify is honoured verbatim — the plan-cap gate on
+// SkipVerify lives in the apid handler (pkg/api/limits.go
+// TLSSkipVerifyAllowed), not here.
+func buildKafkaTLSConfig(t *kafkaTLSConfig) (*tls.Config, error) {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if t.CACert != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(t.CACert)) {
+			return nil, fmt.Errorf("kafka_poller: ca_cert is not a valid PEM block")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	if t.ClientCert != "" || t.ClientKey != "" {
+		// Both must be set together — validator in
+		// pkg/gregalemanifest catches the half-wired case at
+		// load time, but we surface a typed error here too in
+		// case a row reaches the dispatcher outside the
+		// validator path (CLI hot edit, psql).
+		if t.ClientCert == "" || t.ClientKey == "" {
+			return nil, fmt.Errorf("kafka_poller: tls.client_cert + tls.client_key must both be set")
+		}
+		cert, err := tls.X509KeyPair([]byte(t.ClientCert), []byte(t.ClientKey))
+		if err != nil {
+			return nil, fmt.Errorf("kafka_poller: tls X509KeyPair: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+	tlsCfg.InsecureSkipVerify = t.SkipVerify
+	return tlsCfg, nil
+}
+
+// kafkaSASLMechanism maps the customer-facing mechanism string to
+// the segmentio/kafka-go sasl.Mechanism interface. PLAIN is a value
+// struct (no error); SCRAM-SHA-256/512 are constructed via the
+// scram.Mechanism factory which can fail on a malformed
+// username/password (e.g. embedded NUL or unsupported UTF-8 byte
+// pattern in the scram library's preprocessing).
+func kafkaSASLMechanism(s *kafkaSASLConfig) (kafkaSASL.Mechanism, error) {
+	switch s.Mechanism {
+	case "PLAIN":
+		return kafkaSASLPlain.Mechanism{Username: s.Username, Password: s.Password}, nil
+	case "SCRAM-SHA-256":
+		m, err := kafkaSASLScram.Mechanism(kafkaSASLScram.SHA256, s.Username, s.Password)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_poller: scram-sha-256 mechanism: %w", err)
+		}
+		return m, nil
+	case "SCRAM-SHA-512":
+		m, err := kafkaSASLScram.Mechanism(kafkaSASLScram.SHA512, s.Username, s.Password)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_poller: scram-sha-512 mechanism: %w", err)
+		}
+		return m, nil
+	default:
+		// Closed vocab is enforced upstream in decodeKafkaConfig;
+		// this branch is defensive only (CLI hand-edit path).
+		return nil, fmt.Errorf("kafka_poller: unsupported sasl.mechanism=%q", s.Mechanism)
+	}
 }
 
 // newKafkaPoller resolves the trigger's per-kind config and
@@ -124,8 +281,16 @@ func decodeKafkaConfig(t sqlc.Trigger) (kafkaConfig, error) {
 //     so the dispatch tick treats brokers uniformly.
 //   - CommitInterval: 0 — disables auto-commit. We want explicit
 //     CommitMessages only after the function returns 2xx.
+//   - Dialer: carries the per-trigger TLS + SASL config. Plain
+//     TCP + no-SASL is the implicit default — Dialer.TLS nil +
+//     Dialer.SASLMechanism nil triggers the no-auth code path in
+//     kafka-go.
 func newKafkaPoller(t sqlc.Trigger) (triggerSource, error) {
 	cfg, err := decodeKafkaConfig(t)
+	if err != nil {
+		return nil, err
+	}
+	dialer, err := buildKafkaDialer(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +303,7 @@ func newKafkaPoller(t sqlc.Trigger) (triggerSource, error) {
 		MaxBytes:       10e6,
 		MaxWait:        250 * time.Millisecond,
 		CommitInterval: 0, // explicit commits only
+		Dialer:         dialer,
 	})
 	return &kafkaPoller{
 		reader:   reader,

@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { FilterCriteria } from './FilterCriteria.js';
 import type { TriggerKind } from './TriggerKind.js';
 /**
  * Trigger create payload. Kind is immutable after create. Per-kind
@@ -30,6 +31,13 @@ export type CreateTriggerRequest = {
    *
    */
   broker_poison_strategy?: 'commit' | 'seek-to-offset';
+  /**
+   * Optional record-level filter (ADR-118 §6). nil on
+   * create falls through to the DB default NULL — every
+   * record passes the filter.
+   *
+   */
+  filter_criteria?: FilterCriteria;
   schedule?: string | null;
   path?: string | null;
 };

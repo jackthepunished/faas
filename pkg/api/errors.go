@@ -2121,6 +2121,25 @@ const CodePlanTriggersNotAllowed = "plan_triggers_not_allowed"
 // Mirrors CodePlanCronQuota / CodePlanWebhookQuota.
 const CodePlanTriggerQuota = "plan_trigger_quota"
 
+// CodeTriggerBatchWindowTooLarge is the 403 returned when
+// POST/PATCH /v1/triggers carries a batch_window_ms that exceeds the
+// plan cap (limits.TriggerBatchWindowMaxSec — Hobby 30s, Pro/Scale
+// 300s). Mirrors CodePlanTriggerQuota's plan-cap semantic; a
+// distinct code keeps the CLI's batch_window field-specific
+// guidance independent of the count-quota advice.
+// Added for PR #993 / issue #757 review MED-4.
+const CodeTriggerBatchWindowTooLarge = "trigger_batch_window_too_large"
+
+// CodeTriggerTLSSkipVerifyNotAllowed is the 403 returned when a
+// Kafka trigger carries skip_verify=true on a plan whose
+// TLSSkipVerifyAllowed flag is false (Free + Hobby today).
+// skip_verify is dangerous — it disables hostname + cert
+// verification — and we ship it only to plans that have signed off
+// on the operational risk (Pro + Scale today). Mirrors the
+// CodeTenantSurfacesNotAllowed shape (capability not plan-quota).
+// Added for PR #993 / issue #757 review MED-4.
+const CodeTriggerTLSSkipVerifyNotAllowed = "trigger_tls_skip_verify_not_allowed"
+
 // CodePlanLogArchiveNotAllowed is the 402 the customer sees when
 // they request ?archive=1 against an app on a plan whose
 // LogArchiveEnabled() returns false (Free today, issue #562).
@@ -2387,6 +2406,34 @@ func ErrPlanTriggerQuota(plan Plan, scope string, limit, observed int) *Problem 
 		fmt.Sprintf("%s plan caps triggers at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrTriggerBatchWindowTooLarge is returned by createTrigger /
+// updateTrigger when batch_window_ms / 1000 exceeds the plan cap
+// (limits.TriggerBatchWindowMaxSec). Mirror of ErrPlanTriggerQuota
+// for a different limit field. Added for PR #993 / issue #757
+// review MED-4.
+func ErrTriggerBatchWindowTooLarge(plan Plan, limitSec, observedSec int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTriggerBatchWindowTooLarge,
+		"batch_window too large for this plan",
+		fmt.Sprintf("%s plan caps trigger batch_window at %d s; you requested %d s. Lower the value or upgrade to Scale.",
+			plan, limitSec, observedSec)).
+		WithLimit(int64(limitSec), int64(observedSec)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrTriggerTLSSkipVerifyNotAllowed is returned by createTrigger /
+// updateTrigger when the Kafka trigger config carries
+// tls.skip_verify=true but the account's plan does not have
+// TLSSkipVerifyAllowed (Free + Hobby today). 403 because the plan
+// supports triggers, it just doesn't ship the certificate-skip
+// knob — the operator decision the customer has to revisit. Added
+// for PR #993 / issue #757 review MED-4.
+func ErrTriggerTLSSkipVerifyNotAllowed(plan Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTriggerTLSSkipVerifyNotAllowed,
+		"tls.skip_verify unavailable on this plan",
+		fmt.Sprintf("the %s plan does not allow tls.skip_verify on a trigger (the certificate-skip knob is reserved for plans that have signed off on the operational risk). Drop tls.skip_verify or upgrade to Pro.", plan)).
 		WithDocs(docsBase + "/plans#triggers")
 }
 
