@@ -39,6 +39,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -215,4 +216,272 @@ func mountCgroup2() error {
 		return fmt.Errorf("cgroup2 mount %s: %w", cgroupRoot, err)
 	}
 	return nil
+}
+
+// workloadOOMEMitter is the callback the WatchOOM function
+// fires once per detected oom_kill event. The signature is
+// (peakMB, planMB int) — both in MB; planMB is the customer
+// plan cap (what the per-leaf memory.max was set to) and
+// peakMB is the highest watermark of the leaf's current
+// usage before the kill landed (a saner proxy than the
+// post-kill reading, which is 0 because the process is
+// gone). The fan-in from peak to the schedd stamps the
+// whycopy Observed closure's struct{ PeakMB, PlanMB int }
+// template (pkg/whycopy/whycopy.go::CodeAppRuntimeOOM).
+//
+// The emit is best-effort: the workload is dead, the VM is
+// about to be torn down, and a missed signal just means the
+// customer sees the deployment "succeeded then failed" in
+// the dashboard rather than fail-immediate. The shape is
+// intentionally narrow — no ctx, no logger — because the
+// emit (guest/init/framework_ready_emit.go) wires its own
+// send-timeout + logger.
+type workloadOOMEMitter func(peakMB, planMB int)
+
+// WatchOOM (Cluster C / ADR-121) is the per-VM cgroup
+// oom_kill listener. It blocks (in a goroutine) until
+// either:
+//
+//  1. ctx is cancelled — the VM is shutting down, clean
+//     exit.
+//  2. The leaf records a new oom_kill event — the
+//     listener samples the leaf's memory.current (or
+//     memory.high watermark if available), invokes emit
+//     (peakMB, planMB), and returns. The workload is
+//     dead; the host's Manager.ReportWorkloadOOM relay
+//     tears the VM down on its end.
+//
+// Wire protocol (issue #470 / PR #470-FU-B port 1027 +
+// Cluster C type=0x05): the emit is a guest-init
+// vsock DGRAM write — see
+// guest/init/framework_ready_emit.go::EmitWorkloadOOM.
+//
+// Why guest-side, not just host-side cgroup events
+// polling: the host's per-VM cgroup scope is the
+// *firecracker process*, not the workload inside the
+// VM. The in-guest workload cgroup v2 leaf is the only
+// view that sees the per-PID OOM kill (see the file-level
+// doc comment at the top of this file). A host-side
+// memory.events reader would only fire when the FC
+// process itself OOM'd, which is a different failure
+// class.
+//
+// Implementation: poll(2) with POLLPRI on the leaf's
+// memory.events file. The kernel publishes memory.events
+// as a seqfile that supports poll(2) — POLLPRI fires
+// when ANY of its counters (low, high, max, oom, oom_kill,
+// oom_group_kill) increments. We track the oom_kill
+// counter specifically; oom_kill fires when the memory
+// controller kills a child.
+//
+// Why memory.events, NOT cgroup.events (review finding #1):
+// the kernel's cgroup.events file only fires POLLPRI on
+// populated/frozen transitions, NOT on memory.events
+// oom_kill increments. A previous implementation polled
+// cgroup.events and missed every real OOM kill — the
+// listener would only fire when the workload started
+// or exited (populated flips), which is too late: the
+// processes are already torn down by the time the
+// listener wakes. The kernel DOES fire POLLPRI on
+// memory.events (per Linux kernel
+// Documentation/admin-guide/cgroup-v2.rst §5.2 "memory.events"),
+// so we poll that file instead. Each wakeup re-reads
+// the leaf's memory.events file for the oom_kill counter
+// and compares against the delta — the listener tracks
+// the DELTA, not the absolute counter (a leaf with
+// pre-existing kills shouldn't fire on watch start).
+//
+// Short-read tolerance: the kernel may truncate
+// memory.events (it's a seqfile). The poll loop treats
+// any read returning EOS as a re-try; ctx.Done() is the
+// only real exit signal.
+func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMitter, log *slog.Logger) error {
+	if leaf == "" {
+		return errors.New("WatchOOM: empty leaf")
+	}
+	if emit == nil {
+		return errors.New("WatchOOM: nil emitter")
+	}
+	leafDir := leaf
+	eventsPath := filepath.Join(leafDir, "memory.events")
+	// Open the memory.events file (read-only, non-blocking).
+	// The kernel publishes memory.events as a seqfile that
+	// supports poll(2) — POLLPRI fires when any of its
+	// counters (including oom_kill) increments.
+	fd, err := syscall.Open(eventsPath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("WatchOOM: open %s: %w", eventsPath, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+
+	// Track the baseline oom_kill counter so a leaf that
+	// already has kills on watch-start does not fire
+	// spuriously. We re-read on every wakeup and compare
+	// against this baseline.
+	baseline, _ := readMemoryEventsOOMKills(leafDir)
+
+	pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLPRI}}
+	buf := make([]byte, 4096)
+	for {
+		// Honor ctx cancel — the VM shutdown path
+		// expects the listener to exit within one tick.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// 1s poll timeout keeps ctx cancellation
+		// responsive without burning CPU. memory.events
+		// updates don't fire frequently in a healthy
+		// workload, so the wake is event-driven, not
+		// timer-driven.
+		n, perr := unix.Poll(pollFds, 1000)
+		if perr != nil {
+			if errors.Is(perr, unix.EINTR) {
+				continue
+			}
+			return fmt.Errorf("WatchOOM: poll: %w", perr)
+		}
+		if n == 0 {
+			continue
+		}
+		// Drain the seqfile — every read() advances
+		// the kernel's read position. The data itself
+		// is irrelevant (we re-parse memory.events
+		// below); the read clears any POLLPRI
+		// re-arming.
+		if _, rerr := unix.Read(fd, buf); rerr != nil && rerr != unix.EAGAIN {
+			if errors.Is(rerr, unix.EINTR) {
+				continue
+			}
+			// Non-fatal: continue the loop, the
+			// next poll tick will re-check.
+			if log != nil {
+				log.Debug("WatchOOM: memory.events read", "err", rerr)
+			}
+		}
+		// Re-sample the leaf's memory.events for the
+		// current oom_kill counter. Compare against
+		// the baseline; a delta is the trigger.
+		current, currentErr := readMemoryEventsOOMKills(leafDir)
+		if currentErr != nil {
+			if log != nil {
+				log.Debug("WatchOOM: memory.events read", "err", currentErr)
+			}
+			continue
+		}
+		if current <= baseline {
+			// No new kill yet. The memory.events
+			// wakeup may have been a different
+			// event (e.g. memory.low); keep
+			// polling.
+			continue
+		}
+		// delta > 0 — fire the emit. peakMB is the
+		// leaf's current usage at the moment of the
+		// kill (rounded to MB); reading memory.high
+		// would be ideal but it's a "high watermark"
+		// that the leaf may or may not have (it's
+		// emitted under memory.events.high). Fall back
+		// to memory.current (the live usage) if high
+		// is unavailable.
+		peakBytes, _ := readMemoryHighOrCurrent(leafDir)
+		peakMB := int((peakBytes + (1 << 20) - 1) >> 20) // ceil to MB
+		// planMB on the wire signature is the customer's
+		// plan cap. The caller must pass the real
+		// plan MB (mirroring how the schedd stamps
+		// Why / Fix prose); if the caller passes 0
+		// (legacy / unknown plan) we leave it 0 and
+		// the whycopy Observed closure degrades to
+		// the static prose. We intentionally do NOT
+		// re-read the leaf's memory.max — it's a
+		// 1 MiB defense-in-depth floor set by
+		// partitionInto, not the customer's plan cap.
+		// Reading it produces misleading "1 MB plan"
+		// prose. See review finding #2 — a future PR
+		// should inject the real plan cap via a vmmd
+		// boot env var.
+		effectivePlanMB := planMB
+		emit(peakMB, effectivePlanMB)
+		return nil
+	}
+}
+
+// readMemoryMax reads the leaf's memory.max cap (in bytes).
+// Returns 0 + error if the file is absent or unparseable —
+// the caller degrades to the static whycopy prose in that
+// case.
+func readMemoryMax(leafDir string) (uint64, error) {
+	b, err := os.ReadFile(filepath.Join(leafDir, "memory.max"))
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "max" {
+		// Kernel semantics: "max" = unlimited
+		return 0, nil
+	}
+	return strconv.ParseUint(s, 10, 64)
+}
+
+// readMemoryEventsOOMKills parses the leaf's
+// memory.events file for the "oom_kill" counter. Returns
+// 0 + nil if the file is absent (kernel pre-5.x or a
+// test fixture that hasn't populated the cgroup events
+// file yet) — the listener stays silent, matching the
+// pre-Fix-1 contract. A parse failure on a present file
+// surfaces as the underlying error so a real bug is
+// visible in the log, not silently swallowed.
+func readMemoryEventsOOMKills(leafDir string) (uint64, error) {
+	b, err := os.ReadFile(filepath.Join(leafDir, "memory.events"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Absent file = silent zero (the kernel
+			// doesn't expose memory.events on pre-5.x,
+			// and a fresh cgroup leaf hasn't populated
+			// the seqfile until the first event lands).
+			// The listener stays quiet; the
+			// WatchOOM baseline stays 0, so no delta
+			// to fire on.
+			return 0, nil
+		}
+		return 0, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "oom_kill ") || strings.HasPrefix(line, "oom_kill\t") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				return strconv.ParseUint(fields[1], 10, 64)
+			}
+		}
+	}
+	return 0, nil
+}
+
+// readMemoryHighOrCurrent prefers memory.events.high
+// (the cgroup v2 high-watermark since the last reset),
+// falls back to memory.current if the high field is
+// absent (kernel pre-6.x). Returns 0 + nil on read
+// failure — the listener treats 0 as "unknown peak"
+// rather than "0 MB peak", and the silent-zero path
+// matches the readMemoryEventsOOMKills contract (a
+// fresh cgroup leaf with no populated events stays
+// quiet rather than erroring out).
+func readMemoryHighOrCurrent(leafDir string) (uint64, error) {
+	if b, err := os.ReadFile(filepath.Join(leafDir, "memory.events")); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "high ") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					return strconv.ParseUint(fields[1], 10, 64)
+				}
+			}
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(leafDir, "memory.current"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 }

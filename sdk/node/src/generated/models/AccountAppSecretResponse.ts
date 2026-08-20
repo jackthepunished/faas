@@ -7,13 +7,16 @@
  * app (issue #393). Plaintext NEVER appears here: only the
  * age-sealed envelope (base64). `app_id` and `app_slug` let the
  * dashboard render "foo-app / DATABASE_URL" without a parallel
- * `/v1/apps` round-trip.
+ * `/v1/apps` round-trip. `scope` (ADR-092 PR-B) carries the
+ * env-scope the row belongs to; the account-wide list
+ * crosses scopes.
  *
  */
 export type AccountAppSecretResponse = {
   app_id: string;
   app_slug: string;
   key: string;
+  scope: string;
   /**
    * base64 age-sealed envelope. Plaintext NEVER appears on this wire.
    */

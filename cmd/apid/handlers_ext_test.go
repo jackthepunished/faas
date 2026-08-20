@@ -60,6 +60,139 @@ func TestDeploymentLogsSSE_Pagination(t *testing.T) {
 	}
 }
 
+// TestEmitStageDiff_AllSixStages drives emitStageDiff through the
+// full 6-stage progression the customer sees on a cold-cache deploy.
+// Each tick advances the jsonb stage_state one step; we assert:
+//   - tick 1: `event: stage` for source_download, status=in_progress
+//   - tick 2..6: each tick emits BOTH a completed frame for the prior
+//     stage AND an in_progress frame for the new one
+//   - the announced map dedupes a no-op tick (same raw bytes)
+//   - the active row's failure stamp emits status=failed + reason
+//
+// ADR-117 §3.
+func TestEmitStageDiff_AllSixStages(t *testing.T) {
+	order := []state.StageName{
+		state.StageSourceDownload,
+		state.StageDependencyRestore,
+		state.StageImageBuild,
+		state.StageSecurityScan,
+		state.StageSnapshotPrepare,
+		state.StageReadiness,
+	}
+	announced := make(map[state.StageName]string)
+	var lastRaw []byte
+
+	for i, stage := range order {
+		// Build the jsonb row as imaged would: completed row for
+		// every prior stage + current = `stage`, started_at = now.
+		now := time.Now().UTC()
+		history := make([]state.StageStateItem, 0, i)
+		for j := 0; j < i; j++ {
+			startedAt := now.Add(-time.Duration(i-j) * time.Second)
+			endedAt := now.Add(-time.Duration(i-j-1) * time.Second)
+			history = append(history, state.StageStateItem{
+				Name:       order[j],
+				StartedAt:  &startedAt,
+				EndedAt:    &endedAt,
+				DurationMs: 1000,
+				Status:     "completed",
+			})
+		}
+		raw, err := json.Marshal(state.StageState{
+			Current:          stage,
+			CurrentStartedAt: &now,
+			History:          history,
+		})
+		if err != nil {
+			t.Fatalf("tick %d marshal: %v", i, err)
+		}
+
+		buf := httptest.NewRecorder()
+		emitStageDiff(buf, nil, raw, announced, &lastRaw)
+
+		frames := strings.Split(buf.Body.String(), "\n\n")
+		// First tick: 1 in_progress frame. Ticks 2..6: 1 completed
+		// (for prior) + 1 in_progress (for current) = 2 frames. The
+		// trailing empty element from Split is ignored.
+		wantFrames := 1
+		if i > 0 {
+			wantFrames = 2
+		}
+		if got := len(frames) - 1; got != wantFrames {
+			t.Fatalf("tick %d (%s): got %d frames, want %d: %q", i, stage, got, wantFrames, buf.Body.String())
+		}
+
+		// Every frame must be `event: stage\ndata: {...}`.
+		for k, frame := range frames {
+			if frame == "" {
+				continue
+			}
+			if !strings.HasPrefix(frame, "event: stage\ndata: ") {
+				t.Fatalf("tick %d frame %d: bad prefix %q", i, k, frame)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(frame, "event: stage\ndata: ")), &payload); err != nil {
+				t.Fatalf("tick %d frame %d: bad JSON: %v", i, k, err)
+			}
+			if payload["status"] != "in_progress" && payload["status"] != "completed" {
+				t.Fatalf("tick %d frame %d: bad status %v", i, k, payload["status"])
+			}
+		}
+
+		// Idempotent re-poll with same raw bytes must NOT re-emit.
+		buf2 := httptest.NewRecorder()
+		emitStageDiff(buf2, nil, raw, announced, &lastRaw)
+		if buf2.Body.Len() != 0 {
+			t.Fatalf("tick %d idempotent re-poll: expected zero frames, got %q", i, buf2.Body.String())
+		}
+	}
+
+	// Tick 7: flip to failed via builderd path — same from/to.
+	// AppendDeploymentStage stamps the active row with
+	// status=failed + reason; emitStageDiff picks it up on the
+	// next poll and emits one event: stage frame with reason.
+	now := time.Now().UTC()
+	failed := state.StageState{
+		Current:          state.StageReadiness,
+		CurrentStartedAt: &now,
+		History: []state.StageStateItem{
+			{
+				Name: state.StageReadiness, StartedAt: &now,
+				EndedAt: &now, DurationMs: 0, Status: "failed",
+				Reason: "build failed: image_scan 1 error",
+			},
+		},
+	}
+	failedRaw, _ := json.Marshal(failed)
+	announcedFail := make(map[state.StageName]string)
+	// Pre-seed prior stages so only the failed entry for
+	// StageReadiness emits. StageReadiness itself was never
+	// announced — it failed before its in_progress frame was
+	// observed, so the walk must emit exactly one failed frame.
+	for _, s := range order {
+		if s == state.StageReadiness {
+			continue
+		}
+		announcedFail[s] = "completed"
+	}
+	var lastRawFail []byte
+	buf := httptest.NewRecorder()
+	emitStageDiff(buf, nil, failedRaw, announcedFail, &lastRawFail)
+	out := buf.Body.String()
+	if !strings.Contains(out, `"status":"failed"`) {
+		t.Fatalf("failed frame missing status=failed: %q", out)
+	}
+	if !strings.Contains(out, `"reason":"build failed: image_scan 1 error"`) {
+		t.Fatalf("failed frame missing reason: %q", out)
+	}
+	// And a subsequent tick with the same row must be idempotent.
+	buf2 := httptest.NewRecorder()
+	emitStageDiff(buf2, nil, failedRaw, announcedFail, &lastRawFail)
+	if buf2.Body.Len() != 0 {
+		t.Fatalf("failed idempotent re-poll: expected zero frames, got %q", buf2.Body.String())
+	}
+}
+
 // itoa turns small ints into strings without strconv dependency so
 // the test stays self-contained.
 func itoa(n int) string {
@@ -1249,6 +1382,145 @@ func TestRollbackApp_NoTarget(t *testing.T) {
 	}
 	rec := e.do(t, "POST", "/v1/apps/rb-no/rollback", nil, nil)
 	assertProblem(t, rec, 409, api.CodeNoRollbackTarget)
+}
+
+// TestRollbackApp_ExplicitTarget_Specific (SAFE-RELEASES-G, issue #976).
+// With three deployments (v1 superseded, v2 superseded, v3 live),
+// rolling back to v1 promotes v1 to live, supersedes v3, and leaves
+// v2 untouched. Regression test for the headline use case: "skip the
+// intermediate".
+func TestRollbackApp_ExplicitTarget_Specific(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep1 := mustSeedDeployment(t, e, "rb-specific")
+	app, _ := e.store.AppBySlug(context.Background(), "rb-specific")
+	dep2, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("b", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep3, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("c", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dep1 live, dep2 live (supersedes dep1), dep3 live (supersedes dep2).
+	if err := e.store.MarkDeploymentLive(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep3.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	body := api.RollbackRequest{TargetDeploymentID: &dep1.ID}
+	rec := e.do(t, "POST", "/v1/apps/rb-specific/rollback", body, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ID != dep1.ID {
+		t.Errorf("rollback returned id=%s, want %s (explicit target, skipped intermediate)", out.ID, dep1.ID)
+	}
+	if out.Status != string(state.DeployLive) {
+		t.Errorf("post-rollback status = %q, want %q", out.Status, state.DeployLive)
+	}
+	// dep3 must be superseded (was the current live one).
+	fresh, _ := e.store.DeploymentByID(context.Background(), dep3.ID)
+	if fresh.Status != state.DeploySuperseded {
+		t.Errorf("dep3 status = %q, want %q (the previously-live row was not retired)", fresh.Status, state.DeploySuperseded)
+	}
+}
+
+// TestRollbackApp_ExplicitTarget_NotFound confirms the 404 path when
+// the caller names a deployment_id that doesn't exist (or belongs to
+// a different app).
+func TestRollbackApp_ExplicitTarget_NotFound(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "rb-404")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	bogus := "00000000-0000-0000-0000-000000000000"
+	body := api.RollbackRequest{TargetDeploymentID: &bogus}
+	rec := e.do(t, "POST", "/v1/apps/rb-404/rollback", body, nil)
+	assertProblem(t, rec, http.StatusNotFound, api.CodeRollbackTargetNotFound)
+}
+
+// TestRollbackApp_ExplicitTarget_AlreadyLive confirms the 409 path
+// when the caller names a deployment that is currently live (i.e.
+// asking to "rollback" to the already-current deployment is rejected
+// rather than silently no-op'd).
+func TestRollbackApp_ExplicitTarget_AlreadyLive(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "rb-live-target")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	body := api.RollbackRequest{TargetDeploymentID: &dep.ID}
+	rec := e.do(t, "POST", "/v1/apps/rb-live-target/rollback", body, nil)
+	assertProblem(t, rec, http.StatusConflict, api.CodeRollbackTargetAlreadyLive)
+}
+
+// TestRollbackApp_LegacyEmptyBodyUnchanged confirms the back-compat
+// path: POST without a body falls through to "rollback to most-recent
+// superseded deployment". Equivalent to the pre-G behaviour.
+func TestRollbackApp_LegacyEmptyBodyUnchanged(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep1 := mustSeedDeployment(t, e, "rb-legacy")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := e.store.AppBySlug(context.Background(), "rb-legacy")
+	dep2, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("b", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// No body. Legacy path: rollback to most-recent superseded = dep1.
+	rec := e.do(t, "POST", "/v1/apps/rb-legacy/rollback", nil, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ID != dep1.ID {
+		t.Errorf("legacy path returned id=%s, want %s (most-recent superseded)", out.ID, dep1.ID)
+	}
 }
 
 // TestParkApp_HappyPath confirms the app flips to AppEvictedCold.

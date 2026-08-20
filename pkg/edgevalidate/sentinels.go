@@ -32,6 +32,16 @@ import (
 // 1024 is a conservative upper bound: compiled jsonschema/v6 schemas
 // are typically 10–100 KiB each → at most ~100 MiB worst-case. LRU
 // eviction kicks in over the cap (mirrors pkg/edgejwks' MaxKeysPerJWKSURL
+// reasonOther is the overflow bucket for FieldError.Reason() when
+// the schema-side keyword (FieldError.Expected) doesn't map to one
+// of the named reasons (required_missing, type_mismatch,
+// additional_properties_not_allowed, enum_violation,
+// format_violation) AND when the receiver itself is nil. Hoisted
+// from a string literal so goconst stops flagging the 3-occurrence
+// duplication and so a future taxonomy rename is a one-line edit
+// (issue #975 #3 / Mega-Foundation #979-a).
+const reasonOther = "other"
+
 // = 1024). If a customer's deploy fan-out balloons past this, the
 // 1025th compile evicts the LRU — schemas are deterministic so a
 // later miss re-compiles.
@@ -111,4 +121,51 @@ type FieldError struct {
 func FormatValidationError(fe FieldError) error {
 	return fmt.Errorf("%w: field=%q expected=%q got=%q",
 		ErrValidationFailed, fe.Field, fe.Expected, fe.Got)
+}
+
+// ValidateReasonClosedSet is the bounded taxonomy of validation
+// failure reasons exposed to the gateway metric. The set is closed
+// (issue #975 #3 / Mega-Foundation #979-a) — the gateway metric
+// label is one of these strings, never a free-form value from the
+// schema. Adding a new value requires a coordinated apid-side +
+// gateway-side + schema CHECK change so the cardinality stays
+// bounded.
+var ValidateReasonClosedSet = map[string]struct{}{
+	"required_missing":                  {},
+	"type_mismatch":                     {},
+	"additional_properties_not_allowed": {},
+	"enum_violation":                    {},
+	"format_violation":                  {},
+	reasonOther:                         {},
+}
+
+// Reason (issue #975 #3 / Mega-Foundation #979-a) maps a FieldError
+// to the bounded metric reason. The wire-side FieldError is built
+// by jsonschema/v6's ErrorKind.LocalizedString(), so the only
+// pointer we have is the keyword the schema actually rejected
+// (FieldError.Expected). We map the keyword to the closed set; any
+// keyword we don't recognise collapses to "other".
+//
+// The mapping is intentionally narrow — the schema keyword is the
+// only input we trust, not FieldError.Got (which is the
+// localised error string and can vary by library version). Adding
+// a new keyword-to-reason mapping is a one-line change here plus
+// a test in handler_validate_mode_test.go.
+func (fe *FieldError) Reason() string {
+	if fe == nil {
+		return reasonOther
+	}
+	switch fe.Expected {
+	case "required":
+		return "required_missing"
+	case "type":
+		return "type_mismatch"
+	case "additionalProperties":
+		return "additional_properties_not_allowed"
+	case "enum":
+		return "enum_violation"
+	case "format":
+		return "format_violation"
+	}
+	return reasonOther
 }

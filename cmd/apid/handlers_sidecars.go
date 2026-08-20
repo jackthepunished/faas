@@ -424,13 +424,25 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// NEVER in the audit payload — only the boolean (ADR-053 §Decision 4
 	// + ADR-045 §Decision 6 mirror: env values never cross the audit sink).
 	hasOverrides := req.Overrides != nil
-	s.audit.Emit(ctxr, "app.deployed", &acct.ID, map[string]any{
+	// Issue #606 / SAFE-RELEASES-E.1: stamp the per-call actor
+	// ("dashboard:<id>" / "cli:<id>" / "api:<id>") onto the
+	// audit row's actor column instead of the constructor-baked
+	// "apid". The resolved actor derives from the same source
+	// that stamps d.DeployedVia at handler entry — see
+	// cmd/apid/deploy_actor.resolvedActorString. The actor
+	// columns are ALSO folded into the payload via
+	// mergeActorAudit so downstream grep-on-payload queries
+	// (independent of the events.actor column) keep working
+	// without a schema migration. Omit-when-zero rule matches
+	// the PR #984 annotation-merge helper.
+	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
+	s.audit.EmitAs(ctxr, resolvedActor, "app.deployed", &acct.ID, mergeActorAudit(map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": d.ID,
 		"ref":           req.Image,
 		"supersedes":    prev.ID,
 		"has_overrides": hasOverrides,
-	})
+	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 	// Issue #472 / ADR-054: emit app.signed_image_accepted here ONLY
 	// when require_signed is on for this deploy. imaged will later emit
 	// app.signature_invalid / app.signature_missing from its verify hook
@@ -441,11 +453,11 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// keeps the row distinct from the plain app.deployed event
 	// (different `kind`).
 	if app.RequireSigned {
-		s.audit.Emit(ctxr, "app.signed_image_accepted", &acct.ID, map[string]any{
+		s.audit.EmitAs(ctxr, resolvedActor, "app.signed_image_accepted", &acct.ID, mergeActorAudit(map[string]any{
 			"app_id":        app.ID,
 			"deployment_id": d.ID,
 			"ref":           req.Image,
-		})
+		}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 	}
 	// Issue #463 / ADR-068: sidecar audit event (delegated to its
 	// own helper so the sidecar surface is grep-able from one place).
@@ -461,10 +473,10 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// app.deployed + deployment.traffic_percent_set_on_create +
 	// deployment.traffic_percent_changed (PATCH path).
 	if req.TrafficPercent != nil {
-		s.audit.Emit(ctxr, "deployment.traffic_percent_set_on_create", &acct.ID, map[string]any{
+		s.audit.EmitAs(ctxr, resolvedActor, "deployment.traffic_percent_set_on_create", &acct.ID, mergeActorAudit(map[string]any{
 			"app_id":          app.ID,
 			"deployment_id":   d.ID,
 			"traffic_percent": *req.TrafficPercent,
-		})
+		}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 	}
 }

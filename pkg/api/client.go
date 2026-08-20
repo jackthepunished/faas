@@ -537,6 +537,37 @@ func (c *Client) GetDeploymentSecretScan(ctx context.Context, id string) (Secret
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/secret-scan", nil, &out)
 }
 
+// GetDeploymentStages returns the closed-6-stage summary for a
+// deployment (ADR-117 follow-up). Companion to GetDeployment (which
+// returns the typed state.Deployment row) and the /logs SSE stream
+// (which emits `event: stage` frames during a live deploy). This
+// endpoint serves the post-stream summary use case — `gregale
+// deploys show <id>` and the future dashboard widget.
+//
+// Wire shape: the same `state.StageState` JSON already stored on
+// `deployments.stage_state` (migration 00302). The handler does NOT
+// add a typed API DTO — the column's jsonb IS the wire. To avoid
+// pulling the pkg/state import into pkg/api (which would create a
+// cycle: pkg/state/memstore.go imports pkg/api for error codes), the
+// SDK returns the raw jsonb; callers that want the typed view
+// json.Unmarshal into state.StageState themselves. The closed
+// vocabulary (`source_download` / `dependency_restore` / `image_build`
+// / `security_scan` / `snapshot_prepare` / `readiness`) is enforced
+// at the database layer by
+// `deployments_stage_state_current_check`, so a malformed row would
+// never reach the wire.
+//
+// 404 surfaces in three cases — deployment row missing, deployment
+// belongs to a different account (IDOR-safe), or the deployment
+// predates the migration backfill (unreachable in practice; the
+// migration set NOT NULL DEFAULT on every existing row). All three
+// are returned via the same ErrNotFound wrapping callers already
+// branch on with errors.Is(err, api.ErrNotFound).
+func (c *Client) GetDeploymentStages(ctx context.Context, id string) (json.RawMessage, error) {
+	var out json.RawMessage
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/stages", nil, &out)
+}
+
 // PatchDeployment sets the per-deployment cold-wake floor override
 // (issue #557 closure / ADR-072). MinInstances is the only mutable
 // field on a deployment post-create — image / digest / overrides /
@@ -976,6 +1007,27 @@ func (c *Client) Rollback(ctx context.Context, slug string) (DeploymentResponse,
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
 }
 
+// RollbackTo is the SAFE-RELEASES-G (issue #976) variant of Rollback.
+// When targetDeploymentID is empty it degrades to the legacy
+// "rollback to most-recent superseded" path (same as Rollback) and
+// sends no body. When non-empty, the handler validates that the id
+// (a) belongs to the app and (b) has status='superseded', and
+// returns a typed error otherwise. Prefer this over Rollback in any
+// new code so the future-safe shape is the default; Rollback is
+// kept for SDK back-compat (generated SDK consumers don't break).
+func (c *Client) RollbackTo(ctx context.Context, slug, targetDeploymentID string) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	if targetDeploymentID == "" {
+		// Match Rollback: no body for the legacy "most-recent
+		// superseded" path. Avoids wire noise and keeps the
+		// DisallowUnknownFields handler happy when fields are added
+		// to RollbackRequest later.
+		return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
+	}
+	body := RollbackRequest{TargetDeploymentID: &targetDeploymentID}
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", body, &out)
+}
+
 // UpdateDeploymentTraffic stamps the per-deployment traffic-split
 // weight (issue #556 PR-A). percent must be in [0, 100]; the
 // handler enforces the range (422) and the plan gate (403,
@@ -1062,6 +1114,24 @@ func (c *Client) VerifyDomain(ctx context.Context, domain string) (CustomDomainR
 func (c *Client) GetDomain(ctx context.Context, domain string) (CustomDomainResponse, error) {
 	var out CustomDomainResponse
 	return out, c.do(ctx, "GET", "/v1/domains/"+domain, nil, &out)
+}
+
+// DomainDoctor (ADR-120) returns the 5-check doctor report
+// for a domain. Backed by GET /v1/domains/{domain}/doctor.
+// The handler reads the latest observation row from
+// domain_doctor_observations (the dns_poller writes a row
+// every 30s); on a stale or missing row the handler
+// triggers a synchronous re-probe with a 5s budget and
+// returns the refreshed report. Stale=true on the response
+// means the cache was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS
+// when the handler ran.
+//
+// Used by `gregale domains doctor <domain>`. The 503
+// CodeDoctorDisabled error is returned when the operator
+// hasn't set FAAS_DOMAIN_DOCTOR_ENABLED.
+func (c *Client) DomainDoctor(ctx context.Context, domain string) (DomainDoctorReport, error) {
+	var out DomainDoctorReport
+	return out, c.do(ctx, "GET", "/v1/domains/"+domain+"/doctor", nil, &out)
 }
 
 // Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface
@@ -1159,6 +1229,117 @@ func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronReques
 }
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
+}
+
+// --- Triggers (issue #757 / ADR-100) ----------------------------------------
+// Unified event-source-mapping primitive. Method names follow the
+// convention pinned by cmd/sdk-coverage/main.go::methodRouteMap.
+
+// GetTriggers lists every trigger owned by the calling account,
+// optionally filtered by app_id and/or kind. Newest-first by
+// created_at.
+func (c *Client) GetTriggers(ctx context.Context, appID string, kind TriggerKind) ([]Trigger, error) {
+	path := "/v1/triggers"
+	q := url.Values{}
+	if appID != "" {
+		q.Set("app_id", appID)
+	}
+	if kind != "" {
+		q.Set("kind", string(kind))
+	}
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var out []Trigger
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// PostTriggers creates a new trigger. The Idempotency-Key header is
+// auto-minted (TestDo_MutatingCallsCarryIdempotencyKey).
+func (c *Client) PostTriggers(ctx context.Context, req CreateTriggerRequest) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "POST", "/v1/triggers", req, &out)
+}
+
+// GetTriggersId returns one trigger.
+func (c *Client) GetTriggersId(ctx context.Context, id string) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "GET", "/v1/triggers/"+id, nil, &out)
+}
+
+// PatchTriggersId is a partial update.
+func (c *Client) PatchTriggersId(ctx context.Context, id string, req UpdateTriggerRequest) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "PATCH", "/v1/triggers/"+id, req, &out)
+}
+
+// DeleteTriggersId removes the trigger; ON DELETE CASCADE drops the
+// trigger_records and trigger_dead_letter rows.
+func (c *Client) DeleteTriggersId(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/triggers/"+id, nil, nil)
+}
+
+// PostTriggersIdPause sets enabled=false and emits trigger_changed pg_notify.
+func (c *Client) PostTriggersIdPause(ctx context.Context, id string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/pause", nil, nil)
+}
+
+// PostTriggersIdResume sets enabled=true and emits trigger_changed pg_notify.
+func (c *Client) PostTriggersIdResume(ctx context.Context, id string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/resume", nil, nil)
+}
+
+// GetTriggersIdRecords returns records for one trigger.
+func (c *Client) GetTriggersIdRecords(ctx context.Context, id, state string) (ListTriggerRecordsResponse, error) {
+	path := "/v1/triggers/" + id + "/records"
+	if state != "" {
+		path += "?state=" + state
+	}
+	var out ListTriggerRecordsResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// PostTriggersIdRecordsRidRetry moves a single record from retry/
+// dead_letter back to pending. Operator-only scope on the server.
+func (c *Client) PostTriggersIdRecordsRidRetry(ctx context.Context, id, recordID string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/records/"+recordID+"/retry", nil, nil)
+}
+
+// PostTriggersIdRecordsRidDrop marks a dead-letter row routed_to=drop
+// (already the default; this is the explicit acknowledgement).
+func (c *Client) PostTriggersIdRecordsRidDrop(ctx context.Context, id, recordID string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/records/"+recordID+"/drop", nil, nil)
+}
+
+// GetTriggersIdDlq returns rows from trigger_dead_letter for the trigger.
+func (c *Client) GetTriggersIdDlq(ctx context.Context, id, reason string) (ListTriggerDeadLetterResponse, error) {
+	path := "/v1/triggers/" + id + "/dlq"
+	if reason != "" {
+		path += "?reason=" + reason
+	}
+	var out ListTriggerDeadLetterResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetTriggersIdMetrics returns the per-state count roll-up. Not the
+// Prometheus surface; /v1/metrics is.
+func (c *Client) GetTriggersIdMetrics(ctx context.Context, id string) (TriggerMetricsResponse, error) {
+	var out TriggerMetricsResponse
+	return out, c.do(ctx, "GET", "/v1/triggers/"+id+"/metrics", nil, &out)
+}
+
+// PostInvocationsDispatchBatch is the internal route schedd uses to
+// post a closed batch envelope (size / window / 6MB cap). The function
+// under the trigger responds with ReportBatchItemFailures verbatim.
+func (c *Client) PostInvocationsDispatchBatch(ctx context.Context, body map[string]any) error {
+	return c.do(ctx, "POST", "/v1/invocations:dispatch_batch", body, nil)
+}
+
+// PostTriggersBatchCreate applies a gregale.yaml triggers fragment in
+// one transaction (dashboard-only shortcut).
+func (c *Client) PostTriggersBatchCreate(ctx context.Context, req CreateTriggerBatchRequest) (map[string]any, error) {
+	var out map[string]any
+	return out, c.do(ctx, "POST", "/v1/triggers:batch_create", req, &out)
 }
 
 // FireCron manually triggers a cron fire-now (issue #791 PR-C /
@@ -1926,9 +2107,25 @@ func (c *Client) Logout(ctx context.Context) error {
 
 // Secrets (spec §11/G2). Plaintext VALUE never leaves the caller
 // except via SetSecret's body.
+//
+// ADR-092 PR-B: every secrets helper gains an optional scope
+// argument. Pass "" to write to / read from the default scope
+// (same wire shape as pre-PR-B callers — pre-PR-B code paths
+// are preserved by the scope="" branch). Pass a scope name to
+// read or write a specific row; the client appends ?scope=<name>
+// to the path. The pre-PR-B ListSecrets / SetSecret / UnsetSecret /
+// RotateSecret stay as scope="" wrappers for backward-compat.
 func (c *Client) ListSecrets(ctx context.Context, slug string) (AppSecretListResponse, error) {
+	return c.ListSecretsWithScope(ctx, slug, "")
+}
+
+// ListSecretsWithScope is the scope-aware sibling of ListSecrets.
+// scope="" reads from the default scope (flat `secrets` array);
+// scope="__all__" returns the nested `secrets_by_scope` map
+// (ADR-092, mirror of ADR-090 D3's env_by_scope).
+func (c *Client) ListSecretsWithScope(ctx context.Context, slug, scope string) (AppSecretListResponse, error) {
 	var out AppSecretListResponse
-	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/secrets", nil, &out)
+	return out, c.do(ctx, "GET", c.scopeQuery("/v1/apps/"+slug+"/secrets", scope), nil, &out)
 }
 
 // GetSecrets returns every sealed secret across the caller's account
@@ -1957,11 +2154,25 @@ func (c *Client) GetSecrets(ctx context.Context, before string, limit int) (List
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
-	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/secrets/"+key,
+	return c.SetSecretWithScope(ctx, slug, key, value, "")
+}
+
+// SetSecretWithScope is the scope-aware sibling of SetSecret. The
+// reserved sentinel "__all__" is rejected by the server with 400
+// env_scope_reserved; the client doesn't pre-validate so the
+// error envelope reaches the caller verbatim.
+func (c *Client) SetSecretWithScope(ctx context.Context, slug, key, value, scope string) error {
+	return c.do(ctx, "PUT", c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope),
 		PutAppSecretRequest{Value: value}, nil)
 }
 func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
-	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
+	return c.UnsetSecretWithScope(ctx, slug, key, "")
+}
+
+// UnsetSecretWithScope is the scope-aware sibling of UnsetSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) UnsetSecretWithScope(ctx context.Context, slug, key, scope string) error {
+	return c.do(ctx, "DELETE", c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope), nil, nil)
 }
 
 // RotateSecret (ADR-089 PR-B) re-seals the (slug, key) row under
@@ -1970,9 +2181,31 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 // Returns the RotateAppSecretResponse so the CLI can render the
 // rotated_at timestamp and the kid.
 func (c *Client) RotateSecret(ctx context.Context, slug, key, value string) (RotateAppSecretResponse, error) {
+	return c.RotateSecretWithScope(ctx, slug, key, value, "")
+}
+
+// RotateSecretWithScope is the scope-aware sibling of RotateSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) RotateSecretWithScope(ctx context.Context, slug, key, value, scope string) (RotateAppSecretResponse, error) {
 	var out RotateAppSecretResponse
-	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/secrets/"+key+"/rotate",
+	return out, c.do(ctx, "POST",
+		c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key+"/rotate", scope),
 		RotateAppSecretRequest{Value: value}, &out)
+}
+
+// scopeQuery appends "?scope=<name>" to path when scope is
+// non-empty. Empty scope returns the path unchanged (pre-PR-B
+// callers see no behaviour change). url.Values.Encode handles
+// percent-encoding of edge cases (e.g. a future scope name with a
+// reserved char — not currently possible given the
+// api.EnvScopePattern regex, but defensive).
+func (c *Client) scopeQuery(path, scope string) string {
+	if scope == "" {
+		return path
+	}
+	v := url.Values{}
+	v.Set("scope", scope)
+	return path + "?" + v.Encode()
 }
 
 // Per-app private-registry Basic Auth (issue #461 / ADR-062). Password

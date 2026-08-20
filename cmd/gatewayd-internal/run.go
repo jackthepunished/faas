@@ -521,6 +521,12 @@ type runDeps struct {
 	// (PR-B's per-plan cap lift) both flow into the listener. nil in
 	// tests; the test seam injects the bit directly.
 	writeTimeout time.Duration
+	// readTimeout is the http.Server.ReadTimeout override (issue #995
+	// Phase 3 / ADR-121). When 0, gatewayd falls back to
+	// api.GatewaydInternalReadTimeoutSecondsDefault (60s) at the
+	// public-listener site. The control + unix-socket listener uses
+	// a tighter default (30s) set in defaultServer itself.
+	readTimeout time.Duration
 	// nodeCache holds the per-node *grpc.ClientConn cache plus the
 	// compute_node_changed pg_notify subscriber (issue #98 / ADR-028).
 	// nil in tests; production wires it after pgStore opens. PR
@@ -702,6 +708,16 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Issue #995 Phase 3 / ADR-121: tighten the control +
+		// unix-socket listener (small, short-lived requests;
+		// 30 s is plenty for a control-plane RPC, 60 s idle bounds
+		// the keep-alive pool, and 1 MiB header cap keeps a
+		// malformed client from widening the surface beyond
+		// what gatewayd-public already enforces).
+		ReadTimeout:    time.Duration(api.GatewaydInternalControlReadTimeoutSecondsDefault) * time.Second,
+		WriteTimeout:   time.Duration(api.GatewaydInternalControlWriteTimeoutSecondsDefault) * time.Second,
+		IdleTimeout:    time.Duration(api.GatewaydInternalControlIdleTimeoutSecondsDefault) * time.Second,
+		MaxHeaderBytes: int(api.DefaultMaxHeaderBytes),
 	}
 }
 
@@ -826,7 +842,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
 		WithLiveTargetLoader(func(ctx context.Context, appID string) ([]gateway.Target, error) {
 			instances, err := pgStore.ListInstancesForApp(ctx, appID)
@@ -1133,6 +1149,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// scope here). 0 means "spec default"; runWithDeps fills it in.
 	if cfg.ResponseWriteTimeout > 0 {
 		deps.writeTimeout = cfg.ResponseWriteTimeout
+	}
+	// Issue #995 Phase 3 / ADR-121: resolve the http.Server.ReadTimeout
+	// override (matches the ResponseWriteTimeout resolver above).
+	// 0 means "use api.GatewaydInternalReadTimeoutSecondsDefault".
+	if cfg.RequestReadTimeout > 0 {
+		deps.readTimeout = cfg.RequestReadTimeout
 	}
 	// Issue #254 / Move 4 PR-2: pkg/auth.Middleware construction.
 	// AppLogsHandler (cmd/gatewayd-internal/app_logs.go) shares the auth chain
@@ -1464,7 +1486,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			AccountID:        app.AccountID,
 			Slug:             app.Slug,
 			RequireAuthn:     app.RequireAuthn,
-			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
+			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist},
 			StreamingEnabled: app.StreamingEnabled,
 			WebSocketEnabled: app.WebSocketEnabled,
 			// ADR-093: per-route observability opt-in. Mirrors
@@ -2048,6 +2070,26 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// the three routes registered in NewSynthServer.
 		unifiedMux.Handle("/v1/synthesize", deps.synth.Mux())
 		unifiedMux.Handle("/v1/invocations:dispatch", deps.synth.Mux())
+		// Issue #757 / ADR-100 (commit #13): schedd's dispatch tick
+		// posts trigger-driven batches here. SynthServer.handleInvocationDispatchBatch
+		// fans each record through the same Invoke path and aggregates
+		// the AWS Lambda ReportBatchItemFailures response back to the
+		// schedd. The "POST /..." method-routed Handle below is the
+		// route the spec-check AST scanner walks; the inner
+		// unifiedMux.Handle above is the runtime prefix that
+		// actually serves traffic on the unix socket.
+		//
+		// POST-only at the unified-mux level — a future GET surface
+		// for a status read MUST go in the inner sub-mux
+		// (synth.go:99), not here. Registering a bare
+		// "/v1/invocations:dispatch_batch" pattern on top of the
+		// POST-specific one was a copy-paste hazard: a future
+		// maintainer adding GET for a status read would
+		// silently fail because the bare pattern dispatches into
+		// the POST handler's mux, which returns 405, not the
+		// intended GET handler. Audit round 2 finding #3 (PR
+		// #910).
+		unifiedMux.Handle("POST /v1/invocations:dispatch_batch", deps.synth.Mux())
 		unifiedMux.Handle("/healthz", deps.synth.Mux())
 		// Wrap with h2c so the in-process unix-socket hop negotiates
 		// H2C prior knowledge (no TLS). The customer publicHandler
@@ -2087,7 +2129,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		public := srv
 		public.Addr = listenAddr
 		if public.ReadTimeout == 0 {
-			public.ReadTimeout = 60 * time.Second
+			// Issue #995 Phase 3 / ADR-121: honour the TOML
+			// override (cfg.RequestReadTimeout, propagated via
+			// runDeps). 0 means "use api.GatewaydInternalRead
+			// TimeoutSecondsDefault" (60 s — matches the legacy
+			// default that lived here pre-PR).
+			public.ReadTimeout = readTimeoutOrDefault(deps.readTimeout)
 		}
 		if public.WriteTimeout == 0 {
 			// Issue #471 / ADR-047 (PR-A): honour the TOML override
@@ -2098,6 +2145,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// (http.Server.WriteTimeout is global, so the per-app
 			// override can never land at this layer).
 			public.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
+		}
+		if public.MaxHeaderBytes == 0 {
+			// Issue #995 Phase 3 / ADR-121: cap the header block on
+			// the public listener too. gatewayd-public already
+			// enforces 1 MiB, but defence in depth — a
+			// misconfigured upstream that bypasses gatewayd-public
+			// (loopback-only tests, the legacy single-box path)
+			// still hits this cap.
+			public.MaxHeaderBytes = int(api.DefaultMaxHeaderBytes)
 		}
 		addSrv(public)
 		l, lerr := deps.listen("tcp", listenAddr)
@@ -2273,6 +2329,15 @@ func writeTimeoutOrDefault(d time.Duration) time.Duration {
 		return d
 	}
 	return time.Duration(api.ResponseWriteTimeoutDefault) * time.Second
+}
+
+// readTimeoutOrDefault mirrors writeTimeoutOrDefault for the
+// http.Server.ReadTimeout field (issue #995 Phase 3 / ADR-121).
+func readTimeoutOrDefault(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return time.Duration(api.GatewaydInternalReadTimeoutSecondsDefault) * time.Second
 }
 
 // assertLoopbackBind rejects non-loopback control-listener addresses.

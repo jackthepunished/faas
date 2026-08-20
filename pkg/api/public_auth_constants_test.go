@@ -1,9 +1,14 @@
 package api_test
 
 // public_auth_constants_test.go — cross-package pin for
-// the canonical-source rule (issue #477 / ADR-079). The
-// same three mode strings live in pkg/api and pkg/state;
-// a drift surfaces as a runtime SQL CHECK-constraint
+// the canonical-source rule (issue #477 / ADR-079 + ADR-118).
+// The same closed-enum mode strings live in pkg/api,
+// pkg/state, and pkg/gateway (the gateway-local copies
+// are unexported so the third surface is verified via
+// pkg/gateway_test's companion test — see
+// TestPublicAuthGatewayModeConstantsAgree in
+// pkg/gateway/handler_public_auth_constants_test.go).
+// A drift surfaces as a runtime SQL CHECK-constraint
 // failure on a PATCH that the API itself accepted.
 //
 // This test lives in `package api_test` (external test
@@ -23,22 +28,29 @@ import (
 
 // TestPublicAuthModeConstantsAgree pins the
 // pkg/api <-> pkg/state constant alignment. A future
-// contributor adding a fourth mode (e.g. mTLS) MUST
-// add the constant to both halves in the same commit;
-// running this test after only one side is updated
-// fails immediately. The previous-incident pattern
-// (webhook secret namespace drift pre-#476) is the
-// reference for why this tripwire exists.
+// contributor adding a fifth mode (e.g. mTLS) MUST
+// add the constant to all three surfaces in the same
+// commit; running this test after only one side is
+// updated fails immediately. The previous-incident
+// pattern (webhook secret namespace drift pre-#476)
+// is the reference for why this tripwire exists.
+//
+// ADR-118 adds AppPublicAuthModeIPAllowlist ("ip_allowlist").
+// Order matters: open, bearer, basic, ip_allowlist — matches
+// the historical ship order so a future contributor reading
+// the slice knows which mode shipped when.
 func TestPublicAuthModeConstantsAgree(t *testing.T) {
 	apiSet := []string{
 		api.AppPublicAuthModeOpen,
 		api.AppPublicAuthModeBearer,
 		api.AppPublicAuthModeBasic,
+		api.AppPublicAuthModeIPAllowlist,
 	}
 	stateSet := []string{
 		state.AppPublicAuthModeOpen,
 		state.AppPublicAuthModeBearer,
 		state.AppPublicAuthModeBasic,
+		state.AppPublicAuthModeIPAllowlist,
 	}
 	if len(apiSet) != len(stateSet) {
 		t.Fatalf("slice length mismatch: pkg/api has %d modes, pkg/state has %d; "+

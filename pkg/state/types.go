@@ -85,6 +85,73 @@ const (
 	DeploySuperseded   DeploymentStatus = "superseded"
 )
 
+// StageName is the closed set of customer-visible named stages
+// surfaced in the SSE `event: stage` frame and in the CLI's
+// post-stream summary (ADR-117, migration 00302). Distinct from
+// `DeploymentStatus` — the latter drives the state machine
+// (`pending → building → imaging → snapshotting → live | failed |
+// superseded`); the former is the customer-UX projection that maps
+// multiple internal status flips onto one named step.
+//
+// Schema CHECK constraint `deployments_stage_state_current_check`
+// (migrations/00302_deployments_stage_state.sql) enforces the same
+// vocabulary at the storage layer so a typo from a future
+// contributor lands as SQLSTATE 23514 check_violation at write time
+// rather than leaking as a wire-frame typo on `event: stage {name}`.
+type StageName string
+
+const (
+	// StageSourceDownload is entered when the deployment row leaves
+	// DeployPending (the source fetch from the customer tarball /
+	// GitHub ref / registry image). First visible stage.
+	StageSourceDownload StageName = "source_download"
+	// StageDependencyRestore is entered after the cached
+	// dependency layer is restored (cache hit path on
+	// pkg/builderd/builderd.go:394) or, on a cold cache, the
+	// dependency install completes inside the builder VM.
+	StageDependencyRestore StageName = "dependency_restore"
+	// StageImageBuild is entered when builderd/imaged begin the
+	// per-app layer construction (buildImageLayer /
+	// buildFunctionLayer / buildLocalOCIAppLayer). Covers both
+	// `imaging` and `snapshotting` micro-states of the state
+	// machine; the customer sees one step, not two.
+	StageImageBuild StageName = "image_build"
+	// StageSecurityScan is entered when grype + secret-scan run
+	// over the layer (`runDeployScan` at
+	// pkg/imaged/handler.go:797-906). The scan completion stamp
+	// on deployments.scan_status='complete' is the boundary.
+	StageSecurityScan StageName = "security_scan"
+	// StageSnapshotPrepare is entered when imaged posts the
+	// per-app snapshot to the schedd / vmmd side
+	// (`NotifySnapshotPrime` at pkg/imaged/handler.go:2341) and
+	// schedd primes the Firecracker microVM for cold-boot.
+	StageSnapshotPrepare StageName = "snapshot_prepare"
+	// StageReadiness is the final visible stage — entered when
+	// vmmd's first cold-boot returns 2xx at the readiness probe
+	// (cmd/gatewayd-internal/run.go:967 wake.proxy_first_byte +
+	// framework readiness stamp at
+	// instances.framework_ready_at, migration 00122). Closes on
+	// MarkDeploymentLive (pkg/imaged/handler.go:2240); the
+	// `✓ Deployed.` line is owned by the existing terminal-status
+	// branch in streamDeployLogs and is NOT a stage row.
+	StageReadiness StageName = "readiness"
+)
+
+// AllStageNames is the closed vocabulary used by both the
+// migrations/00302 jsonb CHECK constraint AND the wire-shape test
+// in cmd/gregale/commands2_test.go. Adding a new value here
+// without also widening the migration's IN list is a load-bearing
+// failure mode — the wire vocabulary on `event: stage {name}` would
+// silently drift out of step with the schema CHECK.
+var AllStageNames = []StageName{
+	StageSourceDownload,
+	StageDependencyRestore,
+	StageImageBuild,
+	StageSecurityScan,
+	StageSnapshotPrepare,
+	StageReadiness,
+}
+
 // ParkReason is the closed-set label on deployments.parked_reason
 // (issue #554 / ADR-079 follow-up, migration 00157). The schema
 // CHECK constraint deployments_parked_reason_check enforces the
@@ -291,6 +358,51 @@ const (
 	APIKeyStatusRevoked APIKeyStatus = "revoked"
 )
 
+// ConsumerKey is a hashed, per-(account, app) credential for the
+// application's customers (ADR-120 / issue #975 item #5). Distinct
+// from APIKey because it is scoped to a single (AccountID, AppID)
+// pair (a leaked key affects only one app) and exposed to the
+// public internet (every customer of the app sees one — hence 2×
+// the entropy at mint time, see pkg/api/apikey.go).
+//
+// Wire format `ck_<8-hex-prefix>_<64-hex-secret>`. The plaintext is
+// shown to the operator exactly once at mint; only Hash is stored.
+// Prefix is the human-shareable portion used by the
+// (app_id, prefix) hot-path index; the store narrows to one row
+// before the hash compare.
+//
+// RevokedAt is a terminal timestamp; expiry is a soft gate enforced
+// at the read path (cmd/gatewayd-internal/auth_consumer.go — PR
+// #5-C). LastUsedAt is best-effort observability updated via
+// TouchConsumerKeyLastUsed with a 60s debouncer — never a billing
+// signal.
+type ConsumerKey struct {
+	ID         string
+	AccountID  string
+	AppID      string
+	Name       string
+	Prefix     string
+	Hash       []byte
+	Scopes     []string
+	CreatedAt  time.Time
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+// Active reports whether the key is in an authentication-eligible
+// state (not revoked, not expired). The gatewayd-internal
+// middleware reads this on every inbound request.
+func (k ConsumerKey) Active(now time.Time) bool {
+	if k.RevokedAt != nil {
+		return false
+	}
+	if k.ExpiresAt != nil && !k.ExpiresAt.After(now) {
+		return false
+	}
+	return true
+}
+
 type APIKey struct {
 	ID        string
 	AccountID string
@@ -360,6 +472,17 @@ type App struct {
 	// plan_egress_allowlist_not_allowed); Pro max 16 entries; Scale
 	// max 64 entries — see pkg/api/limits.go.
 	EgressAllowlist []netip.Prefix
+	// PublicAuthIPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist consulted at the request layer by
+	// pkg/gateway/handler.go::applyIngressIPAllowlist (runs before
+	// applyEdgeRuleIP, before wake). Empty => no rule (current
+	// behaviour preserved); non-empty with mode='ip_allowlist' =>
+	// every public request must originate from a client IP inside
+	// the allowlist, otherwise 403. Plan-gated to Pro/Scale; Free/Hobby
+	// always read empty (apid rejects with 403
+	// plan_public_auth_ip_allowlist_not_allowed). Pro max 16
+	// entries; Scale max 64 entries — same ladder as EgressAllowlist.
+	PublicAuthIPAllowlist []netip.Prefix
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172). 0 means
 	// "disabled" — the trigger skips this app. Plan-gated upstream
@@ -1028,7 +1151,20 @@ type Deployment struct {
 	// other transition (and for deployments created before the
 	// migrations/00021 column add).
 	ErrorCode string
-	CreatedAt time.Time
+	// ErrorHint / ErrorWhy / ErrorFix / ErrorRelevantLogs are the
+	// customer-facing explanation prose stamped alongside ErrorCode
+	// (spec §6.4 amendment 1). Mirrors the wire-side Problem.Hint /
+	// Problem.Fix / Problem.RelevantLogs fields so post-mortem
+	// retrieval via `gregale deployment <id>` or
+	// `gregale inspect <slug> --errors` surfaces the same 3-5 line
+	// shape that the deploy-time Problem emits. All four are
+	// omitempty in the wire DTO; rows written before the column
+	// additions land leave them empty.
+	ErrorHint         string
+	ErrorWhy          string
+	ErrorFix          string
+	ErrorRelevantLogs []api.LogExcerpt
+	CreatedAt         time.Time
 	// Override columns (issue #460 / ADR-053). Six optional fields
 	// that layer on top of the OCI image config when the customer
 	// redeploys the same digest-pinned image with a different
@@ -1138,6 +1274,118 @@ type Deployment struct {
 	// live row per (app_id, scope)). A scope change requires a
 	// NEW deployment — there is no update-time scope change.
 	Scope string `json:"scope,omitempty"`
+	// StageState (ADR-117, migration 00302) — per-deployment
+	// customer-UX stage projection. Owned entirely by
+	// Store.AppendDeploymentStage — handlers MUST NOT write the
+	// column directly. The 2s SSE polling tick at
+	// cmd/apid/handlers_ext.go:4156-4157 diffs this struct
+	// against a per-connection `announced map` and emits one
+	// `event: stage {name, started_at, duration_ms, status}`
+	// frame per transition. See pkg/state/types.go:89 for the
+	// closed StageName vocabulary.
+	//
+	// Stored as json.RawMessage (NOT a typed StageState struct)
+	// so the pgstore scan path mirrors ScanResult / SecretFindings
+	// — the typed shape is unmarshalled lazily by the SSE
+	// handler that needs it, exactly once per connection.
+	StageState json.RawMessage `json:"stage_state,omitempty"`
+
+	// Actor columns (issue #606). Orthogonal to the human-readable
+	// `DeployedBy` text column from issue #977 / ADR-116 (PR #984):
+	// that column carries the resolved name for the dashboard
+	// ("Poyraz Küçükarslan"), this group carries the
+	// machine-readable attribution needed for SOC 2 CC7.2 / GDPR
+	// ("who deployed v3 of app X at 14:32?"). Migration 00305.
+	//
+	//   DeployedByUserID  — UUID FK to accounts(id). Nullable:
+	//                       (a) anonymous / unauthenticated CLI
+	//                       deploys predate the FK (PR-D cluster,
+	//                       issue #879 PR-D); (b) GitHub-push
+	//                       deploys are not attributable to a
+	//                       local Gregale account. The dashboard
+	//                       renders the resolved name via JOIN.
+	//                       ON DELETE SET NULL on the FK so a
+	//                       GDPR-erased account keeps the row
+	//                       but nulls the attribution.
+	//   DeployedVia       — closed-set: 'api' | 'cli' |
+	//                       'dashboard' | 'github' | 'operator'.
+	//                       NOT NULL DEFAULT 'api' so pre-feature
+	//                       rows stay valid without a backfill
+	//                       (CHECK enforces the vocabulary,
+	//                       migration 00305). The CLI sends 'cli';
+	//                       the dashboard sends 'dashboard';
+	//                       githubd sends 'github'; the API
+	//                       surfaces 'api' by default; the
+	//                       `gregale operator ...` subcommands
+	//                       surface 'operator'.
+	//   DeployedFromIP    — INET, nullable. Stamped from
+	//                       r.RemoteAddr via the same loopback+XFF
+	//                       trust contract the auth-limit bucket
+	//                       uses (pkg/middleware.ClientIP). The
+	//                       column is observability data, not a
+	//                       security gate — the trust contract is
+	//                       documented at the apid handler that
+	//                       stamps it (PR-E1.2).
+	//   PusherLogin       — TEXT, nullable. Distinct from
+	//                       `DeployedBy` (issue #977): that
+	//                       carries the resolved human-readable
+	//                       name, this carries the raw GitHub
+	//                       login string (e.g. `poyrazK`) so the
+	//                       audit reader can disambiguate a
+	//                       renamed / deleted GitHub user from a
+	//                       stale `deployed_by` label.
+	DeployedByUserID string `json:"deployed_by_user_id,omitempty"`
+	DeployedVia      string `json:"deployed_via,omitempty"`
+	DeployedFromIP   string `json:"deployed_from_ip,omitempty"`
+	PusherLogin      string `json:"pusher_login,omitempty"`
+}
+
+// StageState is the typed view of the
+// `deployments.stage_state` jsonb column (ADR-117,
+// migration 00302). Shape:
+//
+//	{
+//	  "current": "<StageName>",
+//	  "current_started_at": "<RFC3339Nano>" | null,
+//	  "history": [
+//	    {"name":"source_download","started_at":"...",
+//	     "ended_at":"...","duration_ms":1203,"status":"completed"},
+//	    ...
+//	  ]
+//	}
+//
+// `Current` lives outside `History` until it closes. The atomic
+// JSONB merge is implemented by `appendDeploymentStage` in
+// pkg/state/queries.sql — read-modify-write at the Go layer is
+// NOT safe (two transitions from concurrent goroutines would race).
+// The pgstore implementation is the only writer; memstore mirrors
+// the shape so unit tests can exercise the read path without
+// spinning Postgres.
+type StageState struct {
+	Current          StageName        `json:"current"`
+	CurrentStartedAt *time.Time       `json:"current_started_at,omitempty"`
+	History          []StageStateItem `json:"history"`
+}
+
+// StageStateItem is one closed stage transition in the
+// `stage_state.history` array. `DurationMs` is measured server-side
+// by `appendDeploymentStage` (now - current_started_at) so the SSE
+// consumer doesn't have to trust a 2s-tick-derived `time.Now()`
+// reconstruction.
+//
+// `StartedAt` is a *time.Time (NOT time.Time) so the JSON wire shape
+// is `null` when the migration seed left it unset — time.Time zero
+// value marshals to the literal string "0001-01-01T00:00:00Z" which
+// is indistinguishable from a real epoch and contradicts the
+// "uninitialized = null" contract the SSE consumer expects. The
+// pointer nil-vs-set distinction preserves that contract.
+type StageStateItem struct {
+	Name       StageName  `json:"name"`
+	StartedAt  *time.Time `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at"`
+	DurationMs int64      `json:"duration_ms"`
+	Status     string     `json:"status"` // "completed" | "failed"
+	Reason     string     `json:"reason,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem
@@ -1231,6 +1479,32 @@ type CustomDomain struct {
 
 // Verified reports whether the TXT challenge has been satisfied.
 func (d CustomDomain) Verified() bool { return !d.VerifiedAt.IsZero() }
+
+// DomainDoctorObservation (ADR-120) is the dns_poller's
+// view of a per-domain probe pass. The struct mirrors the
+// domain_doctor_observations table (migrations/00309) so
+// the apid handler can hand the row straight to the
+// doctor DTO without per-field translation. The
+// nullable-ish fields use *string / *bool / time.Time-zero
+// rather than sql.NullX because the table is hand-rolled
+// pgx and the conversion happens at the store boundary.
+type DomainDoctorObservation struct {
+	Domain          string
+	SurfaceID       string // empty for legacy custom_domains rows
+	ObservedAt      time.Time
+	DNSRecordFound  bool
+	PointsToGregale bool
+	CAAPermits      *bool // nil = no CAA published (allowed by default)
+	IPv6Conflict    bool
+	ObservedTarget  string
+	ObservedAAAA    string
+	CAAObserved     string
+	CertState       string // none|pending|issued|failed|dial_failed
+	CertNotAfter    time.Time
+	LastError       string
+	DNSCheckedAt    time.Time
+	CertCheckedAt   time.Time
+}
 
 // Cron is a scheduled synthetic POST through gatewayd-internal (spec §4.3).
 type Cron struct {
@@ -2405,6 +2679,15 @@ type UpdateAppParams struct {
 	// (the default — see migration 00029).
 	EgressAllowlist    *[]netip.Prefix
 	SetEgressAllowlist bool
+	// PublicAuthIPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist. SetPublicAuthIPAllowlist distinguishes "unset"
+	// from "explicit empty". Same nil-pointer semantics as
+	// EgressAllowlist above. The column is
+	// apps.public_auth_ip_allowlist (migration 00308); the DB
+	// trigger rejects non-v4/v6 families and masklen /0 (defence
+	// in depth on top of the apid parse step).
+	PublicAuthIPAllowlist    *[]netip.Prefix
+	SetPublicAuthIPAllowlist bool
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172). SetAutoscaleTargetRPS
 	// distinguishes "unset" (don't touch the column) from "explicit
@@ -2644,9 +2927,10 @@ type AppPublicAuthUpdate struct {
 // (sqlc / state / gateway) all share the same vocabulary;
 // if a fourth is ever added, mirror the constant here.
 const (
-	AppPublicAuthModeOpen   = "open"
-	AppPublicAuthModeBearer = "bearer"
-	AppPublicAuthModeBasic  = "basic"
+	AppPublicAuthModeOpen        = "open"
+	AppPublicAuthModeBearer      = "bearer"
+	AppPublicAuthModeBasic       = "basic"
+	AppPublicAuthModeIPAllowlist = "ip_allowlist"
 )
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
@@ -2908,11 +3192,19 @@ type AppSecret struct {
 // Ciphertext is the same age-sealed Envelope that AppSecret carries;
 // the handler emits it base64-encoded on the wire (paginated walk
 // orders by (app_slug ASC, key ASC), so the cursor is the pair).
+//
+// Scope is the env-scope identifier attached at write time
+// (ADR-092 PR-B). Always 'default' for legacy rows backfilled via
+// the column DEFAULT (migration 00217, PR-A). The account-wide
+// list crosses scopes — a customer with prod + staging rows
+// needs the scope echoed alongside (app_slug, key) so the
+// dashboard can group by scope without a second GET.
 type AccountAppSecret struct {
 	AccountID  string
 	AppID      string
 	AppSlug    string
 	Key        string
+	Scope      string
 	Ciphertext []byte
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
@@ -3572,6 +3864,12 @@ type EdgeRuleValidateAction struct {
 	ApplyWhileStreaming bool            `json:"apply_while_streaming,omitempty"`
 	RejectOnUnknown     bool            `json:"reject_on_unknown_fields,omitempty"`
 	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
+	// ValidateMode (issue #975 #3 / Mega-Foundation #979-a)
+	// mirrors the wire-side field. Default empty == 'block' to
+	// match the schema-side default at 00293. The state mirror
+	// is intentionally permissive — the closed-set enforcement
+	// lives at the apid write boundary (pkg/api.Validate).
+	ValidateMode string `json:"validate_mode,omitempty"`
 }
 
 // EdgeRuleLimitAction carries the per-rule body caps for kind=limit.
@@ -3781,6 +4079,45 @@ type EdgeRule struct {
 	Action       EdgeRuleAction
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// CorsPreset is the in-memory row mirrored from cors_presets (issue
+// #975 item #4 / Mega-Foundation #979-b). One row = one reusable CORS
+// configuration a customer attaches to a kind=cors edge rule via the
+// per-rule cors.preset_id field (PR-B, slot 00295).
+//
+// Scope: account-scoped when AppID is the empty string, app-scoped
+// when AppID is set. The UNIQUE constraint
+// (account_id, COALESCE(app_id, '00..00'), name) backs both shapes
+// from a single index; the COALESCE-back pattern is documented in
+// migrations/00294_cors_presets.sql.
+//
+// AllowOrigins / AllowMethods / AllowHeaders / ExposeHeaders are
+// stored as Postgres text[] but the wire-side gate in pkg/api/dto.go
+// rejects empty arrays for AllowOrigins and AllowMethods (a CORS rule
+// without any origin allowlist is meaningless and a common footgun).
+// The DB CHECKs in 00294 cover the size + name bounds only.
+//
+// AllowCredentials, MaxAgeSeconds, and AllowHeaders / ExposeHeaders
+// use the rule-field-overrides-preset compile convention
+// (cmd/gatewayd-internal/edge_rules.go::compileCORSRules): the
+// rule's non-zero values win, the preset fills in the rest. A
+// preset that ships only the allowlist is therefore a valid
+// "convention" preset.
+type CorsPreset struct {
+	ID               string
+	AccountID        string
+	AppID            string
+	Name             string
+	Description      string
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // CreateEdgeRuleParams is the input bundle for CreateEdgeRule and

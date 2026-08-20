@@ -641,6 +641,77 @@
         "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "schedd ESM polls / sec by source (ADR-118)",
+      "id": 200,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 112},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (source) (rate(schedd_esm_polls_total{outcome=\"success\"}[5m]))", "legendFormat": "success — {{source}}", "refId": "A"},
+        {"expr": "sum by (source) (rate(schedd_esm_polls_total{outcome=\"error\"}[5m]))", "legendFormat": "error — {{source}}", "refId": "B"},
+        {"expr": "sum by (source) (rate(schedd_esm_polls_total{outcome=\"empty\"}[5m]))", "legendFormat": "empty — {{source}}", "refId": "C"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "polls/s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "stacking": {"mode": "normal"}}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": "^error — .*"},
+            "properties": [
+              {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}},
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "schedd ESM records consumed / sec by source (ADR-118)",
+      "id": 201,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 112},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (source) (rate(schedd_esm_records_consumed_total[5m]))", "legendFormat": "{{source}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rec/s",
+          "custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 60}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "schedd ESM lag p99 by source (ADR-118)",
+      "id": 202,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 120},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum by (source, le) (rate(schedd_esm_lag_seconds_bucket{shard=\"_agg\"}[5m])))", "legendFormat": "p99 — {{source}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ],
   "refresh": "30s",

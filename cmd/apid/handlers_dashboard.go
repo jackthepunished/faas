@@ -28,6 +28,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/dashboard/stages"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -316,6 +317,15 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 			Kind:      string(d.Kind),
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			Error:     d.Error,
+			// Issue #606 / SAFE-RELEASES-E.1: deploy list rows
+			// get a compact via-only chip rendered via the
+			// existing app_detail.html badge palette. The full
+			// triple (user / pusher / IP) is reserved for the
+			// drill-down page (deployment_detail.html).
+			DeployedByUserID: d.DeployedByUserID,
+			DeployedVia:      d.DeployedVia,
+			DeployedFromIP:   d.DeployedFromIP,
+			PusherLogin:      d.PusherLogin,
 		}
 		// Per-deploy grype scan summary (issue #464 / ADR-075).
 		// Populate ScanSummary only when the row carries a
@@ -1742,6 +1752,22 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 		payload := dashboardScanPayload(s.scanResponse(dep))
 		data.Scan = &payload
 	}
+	// A2 (ADR-117 v2 follow-on): render the closed-6-stage
+	// post-stream summary into the page. The projection is
+	// handler-edge so pkg/dashboard stays free of html/template
+	// FuncMap wiring; the template only inlines the pre-rendered
+	// HTML. nil Stages means the jsonb was empty (pre-00302 OR
+	// in-flight pre-first-frame) — the template omits the section.
+	stagePayload, err := dashboardStagePayload(dep)
+	if err != nil {
+		// Bad jsonb shape (CLI/server drift) — fall through with
+		// nil Stages so the page renders, and log to stdout for
+		// the operator. The same fallback posture as
+		// dashboardScanPayload on a nil scan (see above).
+		_ = err
+	} else if stagePayload.BodyHTML != "" {
+		data.Stages = &stagePayload
+	}
 
 	nonce := httpsec.NonceFromContext(r.Context())
 	page := dashboard.Page{
@@ -1754,6 +1780,87 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 	if err := dashboard.Render(w, log, nonce, page); err != nil {
 		renderProblem(w, log, err)
 	}
+}
+
+// dashboardStagePayload projects the typed state.Deployment row
+// into the dashboard-local StagePayload (ADR-117 v2 follow-on
+// A2). The HTML is rendered at the handler edge so the dashboard
+// template only inlines the pre-rendered block via
+// {{ .Data.Stages.BodyHTML }} — no FuncMap wiring, no template
+// divergence. Mirrors cmd/gregale/deploys_show.go::deriveTerminalAt
+// for the footer-timestamp branch: "live" → first history row's
+// StartedAt; "failed" → first failed row's EndedAt; zero when
+// status is unknown / superseded / future.
+//
+// Empty stage_state (pre-00302 OR in-flight pre-first-frame)
+// returns StagePayload{}, nil — the template omits the section
+// entirely on the nil pointer. Non-empty + bad shape (schema
+// drift) returns the unmarshal error so the caller can fall
+// through to renderProblem OR silently no-op (current behaviour:
+// fall through with nil Stages + the warning is logged at WARN
+// by the dashboard scanner).
+//
+// IDOR posture: unchanged. We read d.StageState from the same
+// authorized row returned by DeploymentByID (AccountID check
+// bounds the read at the handler edge). No additional fetch.
+func dashboardStagePayload(d state.Deployment) (dashboard.StagePayload, error) {
+	if len(d.StageState) == 0 {
+		return dashboard.StagePayload{}, nil
+	}
+	var ss state.StageState
+	if err := json.Unmarshal(d.StageState, &ss); err != nil {
+		return dashboard.StagePayload{}, err
+	}
+	status := string(d.Status)
+	terminalAt := dashboardStageTerminalAt(ss, status, d.CreatedAt)
+	html := stages.RenderSummaryHTML(ss, status, terminalAt)
+	if html == "" {
+		// Empty history + empty current — caller sees a nil
+		// pointer at the template level and omits the section.
+		return dashboard.StagePayload{}, nil
+	}
+	return dashboard.StagePayload{
+		BodyHTML:   html,
+		Status:     status,
+		TerminalAt: terminalAt,
+	}, nil
+}
+
+// dashboardStageTerminalAt picks the footer timestamp for the
+// dashboard stage widget. Mirrors cmd/gregale/deploys_show.go::
+// deriveTerminalAt so the dashboard and the CLI agree on the
+// row whose StartedAt / EndedAt supplies the "live since" /
+// "failed at" copy. The two paths are physically separate so
+// a future refactor must update both.
+//
+// Review finding C1 (closed by this signature widening): the
+// pre-fix version only handled live/failed and silently returned
+// time.Time{} for superseded, leaving the customer looking at a
+// stage table with no terminal anchor even though deployments.status
+// said "superseded". The CLI's deriveTerminalAt has the same fix
+// applied (same depCreatedAt argument) so the two surfaces stay
+// in lock-step.
+func dashboardStageTerminalAt(ss state.StageState, status string, depCreatedAt time.Time) time.Time {
+	switch status {
+	case "live":
+		if len(ss.History) > 0 && ss.History[0].StartedAt != nil {
+			return *ss.History[0].StartedAt
+		}
+	case "failed":
+		for _, item := range ss.History {
+			if item.Status == "failed" && item.EndedAt != nil {
+				return *item.EndedAt
+			}
+		}
+	case "superseded":
+		// depCreatedAt is the deployment row's insert
+		// timestamp; for a superseded row this is when the new
+		// deployment that replaced it was created. The zero
+		// value is a safe fallback (caller's terminalAt.IsZero()
+		// gate skips the footer).
+		return depCreatedAt
+	}
+	return time.Time{}
 }
 
 // dashboardScanPayload projects the wire api.ScanResult into the
@@ -1858,13 +1965,36 @@ func severityOrdinal(s string) int {
 // minimal DeploymentItem shape the deployment_detail template
 // needs (ID, Kind, Status, CreatedAt). The full Deployments list
 // uses a richer shape; the detail page only renders a header.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): the 5 new
+// prose columns stamped on the deployments row by SetDeploymentFailedEx
+// flow through verbatim. The deployment_detail template gates the
+// error-explanation section on ErrorCode != "" so pre-cluster rows
+// (and non-failure rows) render unchanged.
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	return dashboard.DeploymentItem{
-		ID:        d.ID,
-		Status:    string(d.Status),
-		Kind:      string(d.Kind),
-		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
-		Error:     d.Error,
+		ID:                d.ID,
+		Status:            string(d.Status),
+		Kind:              string(d.Kind),
+		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
+		Error:             d.Error,
+		ErrorCode:         d.ErrorCode,
+		ErrorHint:         d.ErrorHint,
+		ErrorWhy:          d.ErrorWhy,
+		ErrorFix:          d.ErrorFix,
+		ErrorRelevantLogs: d.ErrorRelevantLogs,
+		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+		// attribution surfaced on the dashboard deploy detail
+		// page. Server-stamped from the HTTP request context
+		// (cmd/apid/handlers.go::createDeployment / handlers_source_*.go
+		// / githubd_bridge.go) — never client-supplied. Pre-#606
+		// rows carry empty strings; the via-chip conditional
+		// render in deployment_detail.html keeps the wire + UI
+		// byte-identical for those rows.
+		DeployedByUserID: d.DeployedByUserID,
+		DeployedVia:      d.DeployedVia,
+		DeployedFromIP:   d.DeployedFromIP,
+		PusherLogin:      d.PusherLogin,
 	}
 }
 

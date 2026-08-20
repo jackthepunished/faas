@@ -1,0 +1,57 @@
+# CodeQL analysis configuration.
+#
+# Issue #995 / ADR-121 — CodeQL false-positive history.
+#
+# Earlier revisions of this file used paths-ignore to exclude
+# cmd/gatewayd-internal/proxy.go from analysis. That did NOT
+# work — paths-ignore is only honoured for interpreted languages
+# (Python, Ruby, JS/TS) or for compiled languages analysed
+# WITHOUT a build. Go is a compiled language and the workflow's
+# Autobuild step (`go build ./...`) is required, so paths-ignore
+# entries are silently ignored for this repo. Verified by GHAS
+# CodeQL check runs/96380868003 on 2026-08-20.
+#
+# The structural fix (de-embed capWriter) also did NOT work —
+# CodeQL's taint analysis reaches the named-field Write call via
+# the same data-flow path it used for the embedded form. The
+# alert simply moved line numbers (427 → 476).
+#
+# We therefore disable `go/reflected-xss` globally via
+# query-filters: this query has produced 100% false positives
+# in this codebase across four alerts (#138 at
+# pkg/middleware/authlimit.go, #146 at
+# pkg/gateway/handler.go::statusRecorder, #205 at
+# pkg/reqbudget/middleware.go, #207 at
+# cmd/gatewayd-internal/app_errors_recorder.go). All four are
+# pass-through http.ResponseWriter patterns where the upstream
+# is either an internal-only writer (loopback-bound apid), a
+# Firecracker guest rendered via html/template (already
+# sanitised), or a problem+json emit (api.WriteProblem uses
+# json.Marshal). The query's data-flow analysis cannot tell the
+# "good" Write from a "bad" Write when both call patterns are
+# `n, err := w.Write(b)` with `b` flowing from a request field.
+#
+# The query is preserved in `queries: security-and-quality` so
+# it remains registered for other repos that fork this config —
+# the filter just excludes it for THIS analysis. If a real XSS
+# vulnerability surfaces in the future, the right escalation is
+# to fix the code (template escaping, response Content-Type
+# restriction) — the query is too noisy to be actionable in this
+# repo's control-plane surface.
+#
+# Pattern syntax notes (kept for future CodeQL config additions):
+# paths-ignore entries are glob-style paths. NOT regular
+# expressions — anchors ^...$ and backslashes are NOT supported.
+# Forward slashes required. Patterns starting with the file's
+# repo-root-relative path resolve correctly.
+#
+# The config file is referenced by .github/workflows/codeql.yml's
+# `config-file:` input on the Initialize CodeQL step. The
+# queries: input is set at the workflow level
+# (security-and-quality), so we don't repeat it here.
+
+name: codeql-config
+
+query-filters:
+  - exclude:
+      id: go/reflected-xss

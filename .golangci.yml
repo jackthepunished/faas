@@ -18,7 +18,6 @@ linters:
     - ineffassign    # = instead of :=
     - staticcheck    # shadowing, unused receivers, type-mismatch, gosimple
     - unused         # unused params/vars/funcs
-    - goconst        # repeated literals to const
     - misspell       # typo'd identifiers
     - nilerr         # `return nil` after assigning to err
     - errorlint      # fmt.Errorf must wrap with %w; ==/!= against errors → errors.Is

@@ -189,6 +189,141 @@ func (x *LivenessFailedAck) GetOk() bool {
 	return false
 }
 
+// ReportWorkloadOOMRequest (Cluster C, ADR-121) is the vmmd → schedd
+// push of a workload OOM-kill detected on the customer's per-VM
+// cgroup v2 leaf. The guest-init emits vsock DGRAM type 0x05 on
+// port 1027 (workloadOOMWire{peak_mb, plan_mb}); vmmd's
+// framework_ready_recv dispatcher unwraps the message and dials
+// this RPC. Persisted on the deployment row as the CodeAppRuntimeOOM
+// observed payload (the whycopy Observed closure templates peak_mb
+// into Why and "at least peak_mb + 8 MB" into Fix).
+//
+// Wire is additive per ADR-016 — pre-Cluster-C schedds reject the
+// RPC with codes.Unimplemented; vmmd tolerates the rejection
+// (the workload is dead; the signal is best-effort).
+type ReportWorkloadOOMRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// instance_id is the instances.id row vmmd observed the OOM
+	// kill on. The schedd engine resolves the parent app +
+	// deployment id before destroying.
+	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	// peak_mb is the observed peak memory (MiB) at the time of the
+	// cgroup killing. Sourced from the cgroup's memory.events
+	// `current` or `high` watermark — the guest-init cannot read
+	// the kernel's OOM-killer decision directly, so it samples
+	// the post-kill state. Templated into the whycopy Why string.
+	PeakMb uint32 `protobuf:"varint,2,opt,name=peak_mb,json=peakMb,proto3" json:"peak_mb,omitempty"`
+	// plan_mb is the plan cap (MiB) the deployment was admitted
+	// under. The host-side cgroup memory.max is plan_mb + 8 MB
+	// (api.PerVMOverheadMB); the comparison is what surfaces the
+	// "your app exceeded the plan's RAM cap" framing on the
+	// dashboard. Templated into the whycopy Fix string.
+	PlanMb        uint32 `protobuf:"varint,3,opt,name=plan_mb,json=planMb,proto3" json:"plan_mb,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReportWorkloadOOMRequest) Reset() {
+	*x = ReportWorkloadOOMRequest{}
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReportWorkloadOOMRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReportWorkloadOOMRequest) ProtoMessage() {}
+
+func (x *ReportWorkloadOOMRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReportWorkloadOOMRequest.ProtoReflect.Descriptor instead.
+func (*ReportWorkloadOOMRequest) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ReportWorkloadOOMRequest) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *ReportWorkloadOOMRequest) GetPeakMb() uint32 {
+	if x != nil {
+		return x.PeakMb
+	}
+	return 0
+}
+
+func (x *ReportWorkloadOOMRequest) GetPlanMb() uint32 {
+	if x != nil {
+		return x.PlanMb
+	}
+	return 0
+}
+
+// ReportWorkloadOOMAck is the typed "I consumed your report"
+// signal vmmd sees after the dial-and-recv completes. ok=true
+// when the schedd engine accepted the report (state-machine
+// guard makes a duplicate report a no-op rather than an error).
+//
+// Additive per ADR-016.
+type ReportWorkloadOOMAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReportWorkloadOOMAck) Reset() {
+	*x = ReportWorkloadOOMAck{}
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReportWorkloadOOMAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReportWorkloadOOMAck) ProtoMessage() {}
+
+func (x *ReportWorkloadOOMAck) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReportWorkloadOOMAck.ProtoReflect.Descriptor instead.
+func (*ReportWorkloadOOMAck) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ReportWorkloadOOMAck) GetOk() bool {
+	if x != nil {
+		return x.Ok
+	}
+	return false
+}
+
 type WakeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// app_id is the apps.id UUID (the gateway resolves host→app before calling).
@@ -222,7 +357,7 @@ type WakeRequest struct {
 
 func (x *WakeRequest) Reset() {
 	*x = WakeRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[2]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -234,7 +369,7 @@ func (x *WakeRequest) String() string {
 func (*WakeRequest) ProtoMessage() {}
 
 func (x *WakeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[2]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -247,7 +382,7 @@ func (x *WakeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WakeRequest.ProtoReflect.Descriptor instead.
 func (*WakeRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{2}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *WakeRequest) GetAppId() string {
@@ -327,7 +462,7 @@ type WakeResponse struct {
 
 func (x *WakeResponse) Reset() {
 	*x = WakeResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[3]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -339,7 +474,7 @@ func (x *WakeResponse) String() string {
 func (*WakeResponse) ProtoMessage() {}
 
 func (x *WakeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[3]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -352,7 +487,7 @@ func (x *WakeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WakeResponse.ProtoReflect.Descriptor instead.
 func (*WakeResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{3}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *WakeResponse) GetInstanceId() string {
@@ -430,7 +565,7 @@ type AdmitInstanceRequest struct {
 
 func (x *AdmitInstanceRequest) Reset() {
 	*x = AdmitInstanceRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[4]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -442,7 +577,7 @@ func (x *AdmitInstanceRequest) String() string {
 func (*AdmitInstanceRequest) ProtoMessage() {}
 
 func (x *AdmitInstanceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[4]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -455,7 +590,7 @@ func (x *AdmitInstanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdmitInstanceRequest.ProtoReflect.Descriptor instead.
 func (*AdmitInstanceRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{4}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AdmitInstanceRequest) GetAppId() string {
@@ -534,7 +669,7 @@ type AdmitInstanceResponse struct {
 
 func (x *AdmitInstanceResponse) Reset() {
 	*x = AdmitInstanceResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[5]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -546,7 +681,7 @@ func (x *AdmitInstanceResponse) String() string {
 func (*AdmitInstanceResponse) ProtoMessage() {}
 
 func (x *AdmitInstanceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[5]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -559,7 +694,7 @@ func (x *AdmitInstanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdmitInstanceResponse.ProtoReflect.Descriptor instead.
 func (*AdmitInstanceResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{5}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *AdmitInstanceResponse) GetInstanceId() string {
@@ -652,7 +787,7 @@ type Touch struct {
 
 func (x *Touch) Reset() {
 	*x = Touch{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[6]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -664,7 +799,7 @@ func (x *Touch) String() string {
 func (*Touch) ProtoMessage() {}
 
 func (x *Touch) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[6]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -677,7 +812,7 @@ func (x *Touch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Touch.ProtoReflect.Descriptor instead.
 func (*Touch) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{6}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Touch) GetInstanceId() string {
@@ -710,7 +845,7 @@ type ReportActivityRequest struct {
 
 func (x *ReportActivityRequest) Reset() {
 	*x = ReportActivityRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[7]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -722,7 +857,7 @@ func (x *ReportActivityRequest) String() string {
 func (*ReportActivityRequest) ProtoMessage() {}
 
 func (x *ReportActivityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[7]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -735,7 +870,7 @@ func (x *ReportActivityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportActivityRequest.ProtoReflect.Descriptor instead.
 func (*ReportActivityRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{7}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReportActivityRequest) GetTouches() []*Touch {
@@ -756,7 +891,7 @@ type ReportActivityResponse struct {
 
 func (x *ReportActivityResponse) Reset() {
 	*x = ReportActivityResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[8]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -768,7 +903,7 @@ func (x *ReportActivityResponse) String() string {
 func (*ReportActivityResponse) ProtoMessage() {}
 
 func (x *ReportActivityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[8]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -781,7 +916,7 @@ func (x *ReportActivityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportActivityResponse.ProtoReflect.Descriptor instead.
 func (*ReportActivityResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{8}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReportActivityResponse) GetApplied() int32 {
@@ -803,7 +938,7 @@ type ParkInstanceRequest struct {
 
 func (x *ParkInstanceRequest) Reset() {
 	*x = ParkInstanceRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[9]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -815,7 +950,7 @@ func (x *ParkInstanceRequest) String() string {
 func (*ParkInstanceRequest) ProtoMessage() {}
 
 func (x *ParkInstanceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[9]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -828,7 +963,7 @@ func (x *ParkInstanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParkInstanceRequest.ProtoReflect.Descriptor instead.
 func (*ParkInstanceRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{9}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ParkInstanceRequest) GetInstanceId() string {
@@ -856,7 +991,7 @@ type ParkInstanceResponse struct {
 
 func (x *ParkInstanceResponse) Reset() {
 	*x = ParkInstanceResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[10]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -868,7 +1003,7 @@ func (x *ParkInstanceResponse) String() string {
 func (*ParkInstanceResponse) ProtoMessage() {}
 
 func (x *ParkInstanceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[10]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -881,7 +1016,7 @@ func (x *ParkInstanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParkInstanceResponse.ProtoReflect.Descriptor instead.
 func (*ParkInstanceResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{10}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ParkInstanceResponse) GetOk() bool {
@@ -937,7 +1072,7 @@ type InstanceStatsRow struct {
 
 func (x *InstanceStatsRow) Reset() {
 	*x = InstanceStatsRow{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[11]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -949,7 +1084,7 @@ func (x *InstanceStatsRow) String() string {
 func (*InstanceStatsRow) ProtoMessage() {}
 
 func (x *InstanceStatsRow) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[11]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -962,7 +1097,7 @@ func (x *InstanceStatsRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstanceStatsRow.ProtoReflect.Descriptor instead.
 func (*InstanceStatsRow) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{11}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *InstanceStatsRow) GetInstanceId() string {
@@ -1029,7 +1164,7 @@ type ListInstanceStatsRequest struct {
 
 func (x *ListInstanceStatsRequest) Reset() {
 	*x = ListInstanceStatsRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[12]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1041,7 +1176,7 @@ func (x *ListInstanceStatsRequest) String() string {
 func (*ListInstanceStatsRequest) ProtoMessage() {}
 
 func (x *ListInstanceStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[12]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1054,7 +1189,7 @@ func (x *ListInstanceStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInstanceStatsRequest.ProtoReflect.Descriptor instead.
 func (*ListInstanceStatsRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{12}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{14}
 }
 
 type ListInstanceStatsResponse struct {
@@ -1066,7 +1201,7 @@ type ListInstanceStatsResponse struct {
 
 func (x *ListInstanceStatsResponse) Reset() {
 	*x = ListInstanceStatsResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[13]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1078,7 +1213,7 @@ func (x *ListInstanceStatsResponse) String() string {
 func (*ListInstanceStatsResponse) ProtoMessage() {}
 
 func (x *ListInstanceStatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[13]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1091,7 +1226,7 @@ func (x *ListInstanceStatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInstanceStatsResponse.ProtoReflect.Descriptor instead.
 func (*ListInstanceStatsResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{13}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ListInstanceStatsResponse) GetRows() []*InstanceStatsRow {
@@ -1165,7 +1300,7 @@ type StreamAppLogsRequest struct {
 
 func (x *StreamAppLogsRequest) Reset() {
 	*x = StreamAppLogsRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[14]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1177,7 +1312,7 @@ func (x *StreamAppLogsRequest) String() string {
 func (*StreamAppLogsRequest) ProtoMessage() {}
 
 func (x *StreamAppLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[14]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1190,7 +1325,7 @@ func (x *StreamAppLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamAppLogsRequest.ProtoReflect.Descriptor instead.
 func (*StreamAppLogsRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{14}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *StreamAppLogsRequest) GetAppId() string {
@@ -1283,7 +1418,7 @@ type StreamAppLogsResponse struct {
 
 func (x *StreamAppLogsResponse) Reset() {
 	*x = StreamAppLogsResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[15]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1295,7 +1430,7 @@ func (x *StreamAppLogsResponse) String() string {
 func (*StreamAppLogsResponse) ProtoMessage() {}
 
 func (x *StreamAppLogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[15]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1308,7 +1443,7 @@ func (x *StreamAppLogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamAppLogsResponse.ProtoReflect.Descriptor instead.
 func (*StreamAppLogsResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{15}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *StreamAppLogsResponse) GetInstanceId() string {
@@ -1381,7 +1516,7 @@ type StreamWarmHintsRequest struct {
 
 func (x *StreamWarmHintsRequest) Reset() {
 	*x = StreamWarmHintsRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1393,7 +1528,7 @@ func (x *StreamWarmHintsRequest) String() string {
 func (*StreamWarmHintsRequest) ProtoMessage() {}
 
 func (x *StreamWarmHintsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1406,7 +1541,7 @@ func (x *StreamWarmHintsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamWarmHintsRequest.ProtoReflect.Descriptor instead.
 func (*StreamWarmHintsRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{16}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{18}
 }
 
 // StreamWarmHintsResponse is one event on the sticky-warm affinity
@@ -1436,7 +1571,7 @@ type StreamWarmHintsResponse struct {
 
 func (x *StreamWarmHintsResponse) Reset() {
 	*x = StreamWarmHintsResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1448,7 +1583,7 @@ func (x *StreamWarmHintsResponse) String() string {
 func (*StreamWarmHintsResponse) ProtoMessage() {}
 
 func (x *StreamWarmHintsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1461,7 +1596,7 @@ func (x *StreamWarmHintsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamWarmHintsResponse.ProtoReflect.Descriptor instead.
 func (*StreamWarmHintsResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{17}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *StreamWarmHintsResponse) GetAppId() string {
@@ -1569,7 +1704,7 @@ type CapacityReport struct {
 
 func (x *CapacityReport) Reset() {
 	*x = CapacityReport{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[18]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1581,7 +1716,7 @@ func (x *CapacityReport) String() string {
 func (*CapacityReport) ProtoMessage() {}
 
 func (x *CapacityReport) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[18]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1594,7 +1729,7 @@ func (x *CapacityReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapacityReport.ProtoReflect.Descriptor instead.
 func (*CapacityReport) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{18}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CapacityReport) GetNodeId() string {
@@ -1674,7 +1809,7 @@ type ReportCapacityAck struct {
 
 func (x *ReportCapacityAck) Reset() {
 	*x = ReportCapacityAck{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[19]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1686,7 +1821,7 @@ func (x *ReportCapacityAck) String() string {
 func (*ReportCapacityAck) ProtoMessage() {}
 
 func (x *ReportCapacityAck) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[19]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1699,7 +1834,7 @@ func (x *ReportCapacityAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportCapacityAck.ProtoReflect.Descriptor instead.
 func (*ReportCapacityAck) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{19}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{21}
 }
 
 // EnsureWakeRequest (ADR-098) is the request shape for the
@@ -1719,7 +1854,7 @@ type EnsureWakeRequest struct {
 
 func (x *EnsureWakeRequest) Reset() {
 	*x = EnsureWakeRequest{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[20]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1731,7 +1866,7 @@ func (x *EnsureWakeRequest) String() string {
 func (*EnsureWakeRequest) ProtoMessage() {}
 
 func (x *EnsureWakeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[20]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1744,7 +1879,7 @@ func (x *EnsureWakeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureWakeRequest.ProtoReflect.Descriptor instead.
 func (*EnsureWakeRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{20}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *EnsureWakeRequest) GetAppId() string {
@@ -1798,7 +1933,7 @@ type EnsureWakeResponse struct {
 
 func (x *EnsureWakeResponse) Reset() {
 	*x = EnsureWakeResponse{}
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[21]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1810,7 +1945,7 @@ func (x *EnsureWakeResponse) String() string {
 func (*EnsureWakeResponse) ProtoMessage() {}
 
 func (x *EnsureWakeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[21]
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1823,7 +1958,7 @@ func (x *EnsureWakeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureWakeResponse.ProtoReflect.Descriptor instead.
 func (*EnsureWakeResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{21}
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *EnsureWakeResponse) GetInstanceId() string {
@@ -1885,6 +2020,13 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"instanceId\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"#\n" +
 	"\x11LivenessFailedAck\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"m\n" +
+	"\x18ReportWorkloadOOMRequest\x12\x1f\n" +
+	"\vinstance_id\x18\x01 \x01(\tR\n" +
+	"instanceId\x12\x17\n" +
+	"\apeak_mb\x18\x02 \x01(\rR\x06peakMb\x12\x17\n" +
+	"\aplan_mb\x18\x03 \x01(\rR\x06planMb\"&\n" +
+	"\x14ReportWorkloadOOMAck\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\"_\n" +
 	"\vWakeRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
@@ -1995,7 +2137,7 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\n" +
 	"WakeMethod\x12\x12\n" +
 	"\x0eWAKE_COLD_BOOT\x10\x00\x12\x10\n" +
-	"\fWAKE_RESTORE\x10\x012\xae\b\n" +
+	"\fWAKE_RESTORE\x10\x012\xa1\t\n" +
 	"\x06Schedd\x12O\n" +
 	"\x04Wake\x12\".onebox.faas.schedd.v1.WakeRequest\x1a#.onebox.faas.schedd.v1.WakeResponse\x12j\n" +
 	"\rAdmitInstance\x12+.onebox.faas.schedd.v1.AdmitInstanceRequest\x1a,.onebox.faas.schedd.v1.AdmitInstanceResponse\x12m\n" +
@@ -2007,7 +2149,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x0eReportCapacity\x12%.onebox.faas.schedd.v1.CapacityReport\x1a(.onebox.faas.schedd.v1.ReportCapacityAck(\x01\x12m\n" +
 	"\x14ReportLivenessFailed\x12+.onebox.faas.schedd.v1.LivenessFailedReport\x1a(.onebox.faas.schedd.v1.LivenessFailedAck\x12a\n" +
 	"\n" +
-	"EnsureWake\x12(.onebox.faas.schedd.v1.EnsureWakeRequest\x1a).onebox.faas.schedd.v1.EnsureWakeResponseBFZDgithub.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpbb\x06proto3"
+	"EnsureWake\x12(.onebox.faas.schedd.v1.EnsureWakeRequest\x1a).onebox.faas.schedd.v1.EnsureWakeResponse\x12q\n" +
+	"\x11ReportWorkloadOOM\x12/.onebox.faas.schedd.v1.ReportWorkloadOOMRequest\x1a+.onebox.faas.schedd.v1.ReportWorkloadOOMAckBFZDgithub.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpbb\x06proto3"
 
 var (
 	file_onebox_faas_schedd_v1_schedd_proto_rawDescOnce sync.Once
@@ -2022,69 +2165,73 @@ func file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP() []byte {
 }
 
 var file_onebox_faas_schedd_v1_schedd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_onebox_faas_schedd_v1_schedd_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_onebox_faas_schedd_v1_schedd_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_onebox_faas_schedd_v1_schedd_proto_goTypes = []any{
 	(WakeMethod)(0),                   // 0: onebox.faas.schedd.v1.WakeMethod
 	(*LivenessFailedReport)(nil),      // 1: onebox.faas.schedd.v1.LivenessFailedReport
 	(*LivenessFailedAck)(nil),         // 2: onebox.faas.schedd.v1.LivenessFailedAck
-	(*WakeRequest)(nil),               // 3: onebox.faas.schedd.v1.WakeRequest
-	(*WakeResponse)(nil),              // 4: onebox.faas.schedd.v1.WakeResponse
-	(*AdmitInstanceRequest)(nil),      // 5: onebox.faas.schedd.v1.AdmitInstanceRequest
-	(*AdmitInstanceResponse)(nil),     // 6: onebox.faas.schedd.v1.AdmitInstanceResponse
-	(*Touch)(nil),                     // 7: onebox.faas.schedd.v1.Touch
-	(*ReportActivityRequest)(nil),     // 8: onebox.faas.schedd.v1.ReportActivityRequest
-	(*ReportActivityResponse)(nil),    // 9: onebox.faas.schedd.v1.ReportActivityResponse
-	(*ParkInstanceRequest)(nil),       // 10: onebox.faas.schedd.v1.ParkInstanceRequest
-	(*ParkInstanceResponse)(nil),      // 11: onebox.faas.schedd.v1.ParkInstanceResponse
-	(*InstanceStatsRow)(nil),          // 12: onebox.faas.schedd.v1.InstanceStatsRow
-	(*ListInstanceStatsRequest)(nil),  // 13: onebox.faas.schedd.v1.ListInstanceStatsRequest
-	(*ListInstanceStatsResponse)(nil), // 14: onebox.faas.schedd.v1.ListInstanceStatsResponse
-	(*StreamAppLogsRequest)(nil),      // 15: onebox.faas.schedd.v1.StreamAppLogsRequest
-	(*StreamAppLogsResponse)(nil),     // 16: onebox.faas.schedd.v1.StreamAppLogsResponse
-	(*StreamWarmHintsRequest)(nil),    // 17: onebox.faas.schedd.v1.StreamWarmHintsRequest
-	(*StreamWarmHintsResponse)(nil),   // 18: onebox.faas.schedd.v1.StreamWarmHintsResponse
-	(*CapacityReport)(nil),            // 19: onebox.faas.schedd.v1.CapacityReport
-	(*ReportCapacityAck)(nil),         // 20: onebox.faas.schedd.v1.ReportCapacityAck
-	(*EnsureWakeRequest)(nil),         // 21: onebox.faas.schedd.v1.EnsureWakeRequest
-	(*EnsureWakeResponse)(nil),        // 22: onebox.faas.schedd.v1.EnsureWakeResponse
-	(*structpb.Struct)(nil),           // 23: google.protobuf.Struct
-	(*timestamppb.Timestamp)(nil),     // 24: google.protobuf.Timestamp
+	(*ReportWorkloadOOMRequest)(nil),  // 3: onebox.faas.schedd.v1.ReportWorkloadOOMRequest
+	(*ReportWorkloadOOMAck)(nil),      // 4: onebox.faas.schedd.v1.ReportWorkloadOOMAck
+	(*WakeRequest)(nil),               // 5: onebox.faas.schedd.v1.WakeRequest
+	(*WakeResponse)(nil),              // 6: onebox.faas.schedd.v1.WakeResponse
+	(*AdmitInstanceRequest)(nil),      // 7: onebox.faas.schedd.v1.AdmitInstanceRequest
+	(*AdmitInstanceResponse)(nil),     // 8: onebox.faas.schedd.v1.AdmitInstanceResponse
+	(*Touch)(nil),                     // 9: onebox.faas.schedd.v1.Touch
+	(*ReportActivityRequest)(nil),     // 10: onebox.faas.schedd.v1.ReportActivityRequest
+	(*ReportActivityResponse)(nil),    // 11: onebox.faas.schedd.v1.ReportActivityResponse
+	(*ParkInstanceRequest)(nil),       // 12: onebox.faas.schedd.v1.ParkInstanceRequest
+	(*ParkInstanceResponse)(nil),      // 13: onebox.faas.schedd.v1.ParkInstanceResponse
+	(*InstanceStatsRow)(nil),          // 14: onebox.faas.schedd.v1.InstanceStatsRow
+	(*ListInstanceStatsRequest)(nil),  // 15: onebox.faas.schedd.v1.ListInstanceStatsRequest
+	(*ListInstanceStatsResponse)(nil), // 16: onebox.faas.schedd.v1.ListInstanceStatsResponse
+	(*StreamAppLogsRequest)(nil),      // 17: onebox.faas.schedd.v1.StreamAppLogsRequest
+	(*StreamAppLogsResponse)(nil),     // 18: onebox.faas.schedd.v1.StreamAppLogsResponse
+	(*StreamWarmHintsRequest)(nil),    // 19: onebox.faas.schedd.v1.StreamWarmHintsRequest
+	(*StreamWarmHintsResponse)(nil),   // 20: onebox.faas.schedd.v1.StreamWarmHintsResponse
+	(*CapacityReport)(nil),            // 21: onebox.faas.schedd.v1.CapacityReport
+	(*ReportCapacityAck)(nil),         // 22: onebox.faas.schedd.v1.ReportCapacityAck
+	(*EnsureWakeRequest)(nil),         // 23: onebox.faas.schedd.v1.EnsureWakeRequest
+	(*EnsureWakeResponse)(nil),        // 24: onebox.faas.schedd.v1.EnsureWakeResponse
+	(*structpb.Struct)(nil),           // 25: google.protobuf.Struct
+	(*timestamppb.Timestamp)(nil),     // 26: google.protobuf.Timestamp
 }
 var file_onebox_faas_schedd_v1_schedd_proto_depIdxs = []int32{
 	0,  // 0: onebox.faas.schedd.v1.WakeResponse.method:type_name -> onebox.faas.schedd.v1.WakeMethod
-	23, // 1: onebox.faas.schedd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
+	25, // 1: onebox.faas.schedd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
 	0,  // 2: onebox.faas.schedd.v1.AdmitInstanceResponse.method:type_name -> onebox.faas.schedd.v1.WakeMethod
-	23, // 3: onebox.faas.schedd.v1.AdmitInstanceResponse.problem:type_name -> google.protobuf.Struct
-	7,  // 4: onebox.faas.schedd.v1.ReportActivityRequest.touches:type_name -> onebox.faas.schedd.v1.Touch
-	12, // 5: onebox.faas.schedd.v1.ListInstanceStatsResponse.rows:type_name -> onebox.faas.schedd.v1.InstanceStatsRow
-	24, // 6: onebox.faas.schedd.v1.StreamAppLogsRequest.since_written_at:type_name -> google.protobuf.Timestamp
-	24, // 7: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
-	24, // 8: onebox.faas.schedd.v1.StreamAppLogsResponse.gap_to_written_at:type_name -> google.protobuf.Timestamp
-	24, // 9: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
+	25, // 3: onebox.faas.schedd.v1.AdmitInstanceResponse.problem:type_name -> google.protobuf.Struct
+	9,  // 4: onebox.faas.schedd.v1.ReportActivityRequest.touches:type_name -> onebox.faas.schedd.v1.Touch
+	14, // 5: onebox.faas.schedd.v1.ListInstanceStatsResponse.rows:type_name -> onebox.faas.schedd.v1.InstanceStatsRow
+	26, // 6: onebox.faas.schedd.v1.StreamAppLogsRequest.since_written_at:type_name -> google.protobuf.Timestamp
+	26, // 7: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
+	26, // 8: onebox.faas.schedd.v1.StreamAppLogsResponse.gap_to_written_at:type_name -> google.protobuf.Timestamp
+	26, // 9: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
 	0,  // 10: onebox.faas.schedd.v1.EnsureWakeResponse.method:type_name -> onebox.faas.schedd.v1.WakeMethod
-	23, // 11: onebox.faas.schedd.v1.EnsureWakeResponse.problem:type_name -> google.protobuf.Struct
-	3,  // 12: onebox.faas.schedd.v1.Schedd.Wake:input_type -> onebox.faas.schedd.v1.WakeRequest
-	5,  // 13: onebox.faas.schedd.v1.Schedd.AdmitInstance:input_type -> onebox.faas.schedd.v1.AdmitInstanceRequest
-	8,  // 14: onebox.faas.schedd.v1.Schedd.ReportActivity:input_type -> onebox.faas.schedd.v1.ReportActivityRequest
-	10, // 15: onebox.faas.schedd.v1.Schedd.ParkInstance:input_type -> onebox.faas.schedd.v1.ParkInstanceRequest
-	13, // 16: onebox.faas.schedd.v1.Schedd.ListInstanceStats:input_type -> onebox.faas.schedd.v1.ListInstanceStatsRequest
-	15, // 17: onebox.faas.schedd.v1.Schedd.StreamAppLogs:input_type -> onebox.faas.schedd.v1.StreamAppLogsRequest
-	17, // 18: onebox.faas.schedd.v1.Schedd.StreamWarmHints:input_type -> onebox.faas.schedd.v1.StreamWarmHintsRequest
-	19, // 19: onebox.faas.schedd.v1.Schedd.ReportCapacity:input_type -> onebox.faas.schedd.v1.CapacityReport
+	25, // 11: onebox.faas.schedd.v1.EnsureWakeResponse.problem:type_name -> google.protobuf.Struct
+	5,  // 12: onebox.faas.schedd.v1.Schedd.Wake:input_type -> onebox.faas.schedd.v1.WakeRequest
+	7,  // 13: onebox.faas.schedd.v1.Schedd.AdmitInstance:input_type -> onebox.faas.schedd.v1.AdmitInstanceRequest
+	10, // 14: onebox.faas.schedd.v1.Schedd.ReportActivity:input_type -> onebox.faas.schedd.v1.ReportActivityRequest
+	12, // 15: onebox.faas.schedd.v1.Schedd.ParkInstance:input_type -> onebox.faas.schedd.v1.ParkInstanceRequest
+	15, // 16: onebox.faas.schedd.v1.Schedd.ListInstanceStats:input_type -> onebox.faas.schedd.v1.ListInstanceStatsRequest
+	17, // 17: onebox.faas.schedd.v1.Schedd.StreamAppLogs:input_type -> onebox.faas.schedd.v1.StreamAppLogsRequest
+	19, // 18: onebox.faas.schedd.v1.Schedd.StreamWarmHints:input_type -> onebox.faas.schedd.v1.StreamWarmHintsRequest
+	21, // 19: onebox.faas.schedd.v1.Schedd.ReportCapacity:input_type -> onebox.faas.schedd.v1.CapacityReport
 	1,  // 20: onebox.faas.schedd.v1.Schedd.ReportLivenessFailed:input_type -> onebox.faas.schedd.v1.LivenessFailedReport
-	21, // 21: onebox.faas.schedd.v1.Schedd.EnsureWake:input_type -> onebox.faas.schedd.v1.EnsureWakeRequest
-	4,  // 22: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
-	6,  // 23: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
-	9,  // 24: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
-	11, // 25: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
-	14, // 26: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
-	16, // 27: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
-	18, // 28: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
-	20, // 29: onebox.faas.schedd.v1.Schedd.ReportCapacity:output_type -> onebox.faas.schedd.v1.ReportCapacityAck
-	2,  // 30: onebox.faas.schedd.v1.Schedd.ReportLivenessFailed:output_type -> onebox.faas.schedd.v1.LivenessFailedAck
-	22, // 31: onebox.faas.schedd.v1.Schedd.EnsureWake:output_type -> onebox.faas.schedd.v1.EnsureWakeResponse
-	22, // [22:32] is the sub-list for method output_type
-	12, // [12:22] is the sub-list for method input_type
+	23, // 21: onebox.faas.schedd.v1.Schedd.EnsureWake:input_type -> onebox.faas.schedd.v1.EnsureWakeRequest
+	3,  // 22: onebox.faas.schedd.v1.Schedd.ReportWorkloadOOM:input_type -> onebox.faas.schedd.v1.ReportWorkloadOOMRequest
+	6,  // 23: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
+	8,  // 24: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
+	11, // 25: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
+	13, // 26: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
+	16, // 27: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
+	18, // 28: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
+	20, // 29: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
+	22, // 30: onebox.faas.schedd.v1.Schedd.ReportCapacity:output_type -> onebox.faas.schedd.v1.ReportCapacityAck
+	2,  // 31: onebox.faas.schedd.v1.Schedd.ReportLivenessFailed:output_type -> onebox.faas.schedd.v1.LivenessFailedAck
+	24, // 32: onebox.faas.schedd.v1.Schedd.EnsureWake:output_type -> onebox.faas.schedd.v1.EnsureWakeResponse
+	4,  // 33: onebox.faas.schedd.v1.Schedd.ReportWorkloadOOM:output_type -> onebox.faas.schedd.v1.ReportWorkloadOOMAck
+	23, // [23:34] is the sub-list for method output_type
+	12, // [12:23] is the sub-list for method input_type
 	12, // [12:12] is the sub-list for extension type_name
 	12, // [12:12] is the sub-list for extension extendee
 	0,  // [0:12] is the sub-list for field type_name
@@ -2101,7 +2248,7 @@ func file_onebox_faas_schedd_v1_schedd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_schedd_v1_schedd_proto_rawDesc), len(file_onebox_faas_schedd_v1_schedd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   22,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

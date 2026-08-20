@@ -690,6 +690,15 @@ func newServerWithDeps(
 	// required); the route is mounted via middleware.AuthLimit
 	// (no requireX chain) in cmd/apid/server.go:870 below.
 	s.oidcHandler = s.buildOIDCHandler()
+	// ADR-120: wire the package-level appsDomainFunc seam (declared at
+	// cmd/apid/dns_probes.go:125) to the server's apps base domain so
+	// checkPointsToGregale has the configured Gregale apex in
+	// production. Tests inject a constant via the same var (see
+	// cmd/apid/dns_probes_test.go:24-38); that assignment is reverted
+	// in t.Cleanup, so the production wire below wins on every real
+	// daemon start (the var is reset to the server's domain, not the
+	// empty default).
+	appsDomainFunc = func() string { return s.domain }
 	return s
 }
 
@@ -992,6 +1001,13 @@ func (s *server) handler() http.Handler {
 	// 404-on-pending drilldown shape.
 	mux.HandleFunc("GET /v1/deployments/{id}/secret-scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentSecretScan))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
+	// Per-deployment closed-stage summary (issue #985 follow-up).
+	// Companion to /logs — same auth chain (authLimited + requireMFA +
+	// read scope), same IDOR posture (cross-account → 404). The body
+	// is the raw deployments.stage_state jsonb re-emitted verbatim;
+	// the closed-6-stage vocabulary is enforced by the migration's
+	// CHECK constraint, so the handler does no Go-side decoding.
+	mux.HandleFunc("GET /v1/deployments/{id}/stages", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentStages))))
 	// Issue #557 closure / ADR-072 — PATCH the per-deployment floor
 	// (MinInstances). Reuses the deploy-write scope (the only mutable
 	// field is the floor; image / digest / overrides / sidecars stay
@@ -1072,6 +1088,16 @@ func (s *server) handler() http.Handler {
 	// show).
 	mux.HandleFunc("POST /v1/domains/{domain}/verify", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.verifyDomain)))))
 	mux.HandleFunc("GET /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomain))))
+	// ADR-120: per-domain doctor surface for `gregale domains doctor`.
+	// Read-only; returns the latest observation row from
+	// domain_doctor_observations plus a synchronous re-probe if
+	// the row is older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS. The
+	// route stays registered when FAAS_DOMAIN_DOCTOR_ENABLED is
+	// unset; the handler returns 503 CodeDoctorDisabled in that
+	// case so the CLI can render a clear "doctor is dark-launched"
+	// message rather than a generic 404 (matches the pre-#911
+	// pattern in api/flags.go).
+	mux.HandleFunc("GET /v1/domains/{domain}/doctor", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomainDoctor))))
 
 	// Crons.
 	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCrons))))
@@ -1094,6 +1120,31 @@ func (s *server) handler() http.Handler {
 	// auth/scope — a duplicate (account, Idempotency-Key) request
 	// returns the stored 202 without inserting a second row.
 	mux.HandleFunc("POST /v1/crons/{id}/run", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.fireCronNow)))))
+
+	// Triggers (issue #757 / ADR-0NN; commit #6). Same authLimited +
+	// requireMFA + requireScope shape as the cron family. POST routes
+	// are idempotent-wrapped so retries are safe (the createTrigger
+	// handler is the only state-mutating POST that needs the wrap;
+	// pause/resume/records/{rid}/{retry,drop} are operator verbs and
+	// run without idempotency — they are tuned for human action, not
+	// at-least-once delivery).
+	mux.HandleFunc("GET /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggers))))
+	mux.HandleFunc("POST /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createTrigger)))))
+	mux.HandleFunc("GET /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTrigger))))
+	mux.HandleFunc("PATCH /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateTrigger))))
+	mux.HandleFunc("DELETE /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteTrigger))))
+	mux.HandleFunc("POST /v1/triggers/{id}/pause", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.pauseTrigger))))
+	mux.HandleFunc("POST /v1/triggers/{id}/resume", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.resumeTrigger))))
+	mux.HandleFunc("GET /v1/triggers/{id}/records", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggerRecords))))
+	mux.HandleFunc("POST /v1/triggers/{id}/records/{rid}/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.retryTriggerRecord))))
+	mux.HandleFunc("POST /v1/triggers/{id}/records/{rid}/drop", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.dropTriggerRecord))))
+	mux.HandleFunc("GET /v1/triggers/{id}/dlq", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggerDeadLetter))))
+	mux.HandleFunc("GET /v1/triggers/{id}/metrics", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTriggerMetrics))))
+	// Batch-create (POST /v1/triggers:batch_create) accepts an inline
+	// gregale.yaml blob. Distinct route path (":batch_create" suffix,
+	// not /v1/triggers/{id} with wildcard id) so the mux pattern
+	// matcher doesn't conflict with the {id} getTrigger route.
+	mux.HandleFunc("POST /v1/triggers:batch_create", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.batchCreateTrigger)))))
 
 	// Projects (ADR-050, Phase 3). Two routes — /scan is dry-run
 	// (no writes), / is the transactional apply. Both are deploy-

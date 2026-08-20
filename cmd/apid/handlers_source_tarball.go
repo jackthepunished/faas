@@ -34,6 +34,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid/apidsource"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -144,6 +145,13 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 		CommitSHA:   commitSHA,
 		LogSpool:    spoolRoot(),
 		Log:         s.log,
+		// Issue #606 / SAFE-RELEASES-E.1: server-stamped actor
+		// attribution (cmd/apid/deploy_actor.go). The local
+		// tarball path is HTTP-routed, so the via classifier is
+		// request-shape-derived.
+		ActorUserID: acct.ID,
+		ActorVia:    routeKindForRequest(r),
+		ActorFromIP: middleware.ClientIP(r),
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
@@ -165,6 +173,14 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 // with the canonical {repo, ref, source_bytes} payload. Distinct
 // from `deploy.source_ref` so the audit log can branch on wire shape
 // without inspecting source URLs.
+//
+// Issue #606 / SAFE-RELEASES-E.1: per-call actor attribution.
+// Re-reads the just-written deployment row (apidsource.Enqueue
+// stamped the four actor columns in its tx) so the audit row
+// carries the resolved "<via>:<id>" actor on events.actor AND
+// the actor_* payload keys (via mergeActorAudit). The
+// constructor-baked "apid" actor only shows up if the
+// DeploymentByID read fails AND the via classifier defaults.
 func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, sidecar sidecarPayload, sourceBytes int64) {
 	s.log.Info("local-tarball deployment enqueued",
 		"deployment", res.DeploymentID,
@@ -173,7 +189,29 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 		"ref", sidecar.Ref,
 		"source_bytes", sourceBytes,
 	)
-	s.audit.Emit(ctx, "deploy.local_tarball", &acct.ID, map[string]any{
+	d, dErr := s.store.DeploymentByID(ctx, res.DeploymentID)
+	if dErr != nil {
+		// MEDIUM review #4: when the read-back fails we must
+		// NOT fall through with a zero Deployment — that would
+		// make resolvedActorString emit ':unknown' (via empty,
+		// '<via>:unknown' branch) and bypass EmitAs's actor==''
+		// fallback. The audit row would land with corrupt
+		// attribution exactly when forensics needs it most.
+		// Early-return without an audit row: the durable
+		// deployment row is already committed (with the
+		// structured actor columns stamped at INSERT time), so
+		// the SOC 2 / GDPR audit-trail question still has an
+		// answer via deployments.deployed_by_user_id /
+		// deployed_via / deployed_from_ip; the events-table
+		// row just doesn't get stamped this time. Operator
+		// can grep by deployment_id and recover attribution
+		// from the row directly.
+		s.log.Warn("auditLocalTarballDeploy: skip audit row, read deployment for actor attribution failed",
+			"deployment", res.DeploymentID, "err", dErr)
+		return
+	}
+	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
+	s.audit.EmitAs(ctx, resolvedActor, "deploy.local_tarball", &acct.ID, mergeActorAudit(map[string]any{
 		auditKeyAppID:        app.ID,
 		auditKeyDeploymentID: res.DeploymentID,
 		auditKeyBuildID:      res.BuildID,
@@ -181,5 +219,5 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 		auditKeyRef:          sidecar.Ref,
 		auditKeySourceBytes:  sourceBytes,
 		auditKeyTrustRoot:    "cli",
-	})
+	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 }

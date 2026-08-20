@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -57,20 +58,47 @@ type livenessRequestBody struct {
 
 // livenessResponseBody is the JSON body the guest ships back.
 // Mirrors guest/init/livenessResp.
+//
+// WWWAuthenticate is the verbatim WWW-Authenticate response header
+// value when the runner responded 401/403 — see the Cluster A
+// rationale in guest/init/liveness_linux.go. The host reads the
+// field defensively today (empty = no signal); the discriminator
+// becomes load-bearing if/when the platform introduces its own
+// probe-auth round-trip.
 type livenessResponseBody struct {
-	Status int    `json:"status"`
-	Err    string `json:"err"`
+	Status          int    `json:"status"`
+	Err             string `json:"err"`
+	WWWAuthenticate string `json:"www_authenticate,omitempty"`
 }
 
 // livenessProbeOutcomes is the closed set the vmmd
 // poll goroutine tracks in the vmmd_guest_liveness_probe_seconds
 // histogram. Each value is the Prometheus label suffix.
+//
+// Error-explanations cluster (spec §6.4 amendment 1):
+// livenessOutcomeUnauthorized discriminates 401/403 from the
+// generic non_200 bucket. A health endpoint that's gated behind
+// auth is a distinct failure ("the app is up but we can't tell
+// because /healthz returns 401") with a distinct remediation
+// (expose /healthz without auth, or move to a separate
+// healthcheck_path) — folding it into non_200 would force the
+// customer to debug it as a runtime failure. The classify +
+// histogram + downstream app_healthz_unauthorized stamping all
+// flow from this single discriminator.
+//
+// Cluster A: the guest-init's livenessResp now also carries
+// WWWAuthenticate (the verbatim response header on 401/403) so the
+// host can later discriminate customer-app intentional 401 from a
+// platform-side probe auth round-trip. The discriminator is a
+// forward-compat field today (no platform-side probe auth exists);
+// the closed-set is the six values below.
 const (
-	livenessOutcomeOK          = "ok"
-	livenessOutcomeNon200      = "non_200"
-	livenessOutcomeTimeout     = "timeout"
-	livenessOutcomeConnRefused = "conn_refused"
-	livenessOutcomeConnErr     = "conn_err"
+	livenessOutcomeOK           = "ok"
+	livenessOutcomeNon200       = "non_200"
+	livenessOutcomeUnauthorized = "unauthorized"
+	livenessOutcomeTimeout      = "timeout"
+	livenessOutcomeConnRefused  = "conn_refused"
+	livenessOutcomeConnErr      = "conn_err"
 )
 
 // livenessProbeConfig aliases the pkg/fcvm.LivenessProbeConfig struct
@@ -95,9 +123,9 @@ type livenessProbeLoop struct {
 	count        int // current consecutive-failure count
 	// probeFn is the test seam: production code uses dialAndProbe
 	// (real AF_VSOCK), tests inject a stub that returns the
-	// closed-set outcome string ("ok", "non_200", "timeout",
-	// "conn_refused", "conn_err"). Default = nil → runOne uses
-	// the real dialAndProbe.
+	// closed-set outcome string ("ok", "non_200", "unauthorized",
+	// "timeout", "conn_refused", "conn_err"). Default = nil →
+	// runOne uses the real dialAndProbe.
 	probeFn func(ctx context.Context, timeoutMs int) string
 	// nowFn is the clock seam (issue #554 closure / ADR-078
 	// cooldown gate). Production = time.Now; tests inject a
@@ -237,6 +265,8 @@ func classifyLivenessOutcome(outcome string) string {
 		return "liveness_conn_refused"
 	case livenessOutcomeConnErr:
 		return "liveness_conn_err"
+	case livenessOutcomeUnauthorized:
+		return "liveness_unauthorized"
 	case livenessOutcomeNon200:
 		return "liveness_non_200"
 	default:
@@ -347,6 +377,15 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 	}
 	if resp.Status >= 200 && resp.Status < 300 {
 		return livenessOutcomeOK
+	}
+	// Error-explanations cluster (spec §6.4 amendment 1):
+	// 401 + 403 are the canonical "health endpoint gated behind
+	// auth" signal. Discriminate them from the generic non_200
+	// bucket so the whycopy catalog can render the right hint
+	// ("expose /healthz without auth") instead of the generic
+	// "the app didn't return 200" line.
+	if resp.Status == http.StatusUnauthorized || resp.Status == http.StatusForbidden {
+		return livenessOutcomeUnauthorized
 	}
 	return livenessOutcomeNon200
 }

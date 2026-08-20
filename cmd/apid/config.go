@@ -21,9 +21,12 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"math"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -121,6 +124,16 @@ type Config struct {
 	// RoleComputeOnly. RoleSingleBox is the default and lets
 	// single-box dev boot unmoved.
 	Role role.Role `toml:"role"`
+
+	// Request timeouts (issue #995 Phase 1 / ADR-121). Default 0
+	// means "use api.APID*SecondsDefault" — see GetRequestReadTimeout
+	// etc. The env overlay pattern matches GetListenAddr / GetMetricsAddr.
+	// Plain integer nanoseconds are NOT accepted (BurntSushi/toml Go
+	// time.Duration string syntax — "60s", "5m", "1h30m").
+	RequestReadTimeout    time.Duration `toml:"request_read_timeout"`
+	RequestWriteTimeout   time.Duration `toml:"request_write_timeout"`
+	RequestIdleTimeout    time.Duration `toml:"request_idle_timeout"`
+	RequestMaxHeaderBytes int64         `toml:"request_max_header_bytes"`
 }
 
 // LoadConfig reads a TOML file at path and returns the parsed Config
@@ -149,6 +162,16 @@ func LoadConfig(path string) (*Config, error) {
 		// / `faas-githubd` doesn't exist in the test container).
 		ListenAddr:    "127.0.0.1:8081",
 		GithubdSocket: "/run/faas/githubd.sock",
+		// Issue #995 Phase 1: seed the timeout / header defaults
+		// so a partial toml still produces the hardened listener.
+		// The GetRequest*Timeout helpers fall back to
+		// api.APID*SecondsDefault when the field is zero, so this
+		// seed is belt-and-braces — the runtime defaults hold even
+		// if these literals drift.
+		RequestReadTimeout:    time.Duration(api.APIDReadTimeoutSecondsDefault) * time.Second,
+		RequestWriteTimeout:   time.Duration(api.APIDWriteTimeoutSecondsDefault) * time.Second,
+		RequestIdleTimeout:    time.Duration(api.APIDIdleTimeoutSecondsDefault) * time.Second,
+		RequestMaxHeaderBytes: api.DefaultMaxHeaderBytes,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -244,6 +267,100 @@ func (c *Config) GetAppsDomain(env func(string) string) string {
 		return v
 	}
 	return c.AppsDomain
+}
+
+// GetRequestReadTimeout returns the http.Server.ReadTimeout with
+// env-var overlay (FAAS_APID_REQUEST_READ_TIMEOUT wins over TOML).
+// Zero falls back to api.APIDReadTimeoutSecondsDefault (60s —
+// slowloris defence on the body arrival window). Issue #995 Phase 1
+// / ADR-121.
+func (c *Config) GetRequestReadTimeout(env func(string) string) time.Duration {
+	if v := env("FAAS_APID_REQUEST_READ_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	if c.RequestReadTimeout > 0 {
+		return c.RequestReadTimeout
+	}
+	return time.Duration(api.APIDReadTimeoutSecondsDefault) * time.Second
+}
+
+// GetRequestWriteTimeout returns the http.Server.WriteTimeout with
+// env-var overlay (FAAS_APID_REQUEST_WRITE_TIMEOUT wins over TOML).
+// Zero falls back to api.APIDWriteTimeoutSecondsDefault (300s —
+// matches gatewayd-internal ResponseWriteTimeoutDefault). Issue #995
+// Phase 1 / ADR-121.
+func (c *Config) GetRequestWriteTimeout(env func(string) string) time.Duration {
+	if v := env("FAAS_APID_REQUEST_WRITE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	if c.RequestWriteTimeout > 0 {
+		return c.RequestWriteTimeout
+	}
+	return time.Duration(api.APIDWriteTimeoutSecondsDefault) * time.Second
+}
+
+// GetRequestIdleTimeout returns the http.Server.IdleTimeout with
+// env-var overlay (FAAS_APID_REQUEST_IDLE_TIMEOUT wins over TOML).
+// Zero falls back to api.APIDIdleTimeoutSecondsDefault (120s — bounds
+// the keep-alive pool). Issue #995 Phase 1 / ADR-121.
+func (c *Config) GetRequestIdleTimeout(env func(string) string) time.Duration {
+	if v := env("FAAS_APID_REQUEST_IDLE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	if c.RequestIdleTimeout > 0 {
+		return c.RequestIdleTimeout
+	}
+	return time.Duration(api.APIDIdleTimeoutSecondsDefault) * time.Second
+}
+
+// GetRequestMaxHeaderBytes returns the http.Server.MaxHeaderBytes with
+// env-var overlay (FAAS_APID_REQUEST_MAX_HEADER_BYTES wins over TOML).
+// Zero falls back to api.DefaultMaxHeaderBytes (1 MiB). Issue #995
+// Phase 1 / ADR-121.
+func (c *Config) GetRequestMaxHeaderBytes(env func(string) string) int64 {
+	if v := env("FAAS_APID_REQUEST_MAX_HEADER_BYTES"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			return n
+		}
+	}
+	if c.RequestMaxHeaderBytes > 0 {
+		return c.RequestMaxHeaderBytes
+	}
+	return api.DefaultMaxHeaderBytes
+}
+
+// parsePositiveInt parses a non-negative integer string. Returns an
+// error on non-digit input or overflow. Issue #995 Phase 1 helper.
+func parsePositiveInt(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("parsePositiveInt: empty")
+	}
+	var n int64
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("parsePositiveInt: %q", s)
+		}
+		// Standard idiomatic overflow check (see Knuth TAOCP §4.3.1,
+		// or the Go strconv.ParseInt source). The pre-multiply bound
+		// uses n > MaxInt64/10 so the case where the next digit is
+		// exactly 7 still admits MaxInt64 (9223372036854775807).
+		// The post-add check catches single-digit wraps when n is
+		// exactly MaxInt64/10 and the next digit pushes it past.
+		if n > math.MaxInt64/10 {
+			return 0, fmt.Errorf("parsePositiveInt: overflow")
+		}
+		n = n*10 + int64(r-'0')
+		if n < 0 {
+			return 0, fmt.Errorf("parsePositiveInt: overflow")
+		}
+	}
+	return n, nil
 }
 
 // LoadAdvisoryTLS returns the server mTLS config apid uses on the

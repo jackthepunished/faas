@@ -5,6 +5,7 @@
 import type { BuildPlan } from './BuildPlan.js';
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
 import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
+import type { LogExcerpt } from './LogExcerpt.js';
 import type { ScanResult } from './ScanResult.js';
 import type { SecretScanResult } from './SecretScanResult.js';
 /**
@@ -19,6 +20,22 @@ export type DeploymentResponse = {
   status: string;
   error?: string | null;
   error_code?: string | null;
+  /**
+   * One-line next-action lifted from pkg/whycopy catalog.
+   */
+  error_hint?: string | null;
+  /**
+   * Human-readable cause with observed value.
+   */
+  error_why?: string | null;
+  /**
+   * Prescriptive remediation (1-3 lines).
+   */
+  error_fix?: string | null;
+  /**
+   * Per-line log excerpts explaining the failure (error-explanations cluster). Capped at 20 entries × 512 bytes by the CLI tripwire.
+   */
+  error_relevant_logs?: Array<LogExcerpt>;
   created_at: string;
   /**
    * True when this deployment carries a non-null override_* column set.
@@ -102,5 +119,21 @@ export type DeploymentResponse = {
    * Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`. nil for image deploys.
    */
   build_plan?: (BuildPlan | null);
+  /**
+   * UUID of the deploying local account (FK → accounts.id, ON DELETE SET NULL). Empty when the deploy came from a non-local source (e.g. a githubd pusher not bound to a local account).
+   */
+  deployed_by_user_id?: string | null;
+  /**
+   * Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00303_deployments_actor.sql's CHECK constraint.
+   */
+  deployed_via?: 'api' | 'cli' | 'dashboard' | 'github' | 'operator';
+  /**
+   * Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract). Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in Postgres' native `inet` type (which canonicalises both families); the OpenAPI schema intentionally omits `format: ipv4` so v6 deployments (which grow as the public gateway picks up AAAA records) do not fail schema validation. v6 is rendered as the bracketed colon-hex form per RFC 5952.
+   */
+  deployed_from_ip?: string | null;
+  /**
+   * Raw GitHub login of the pusher when `deployed_via == "github"`. Empty for all other via values. Distinct from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH identity, suitable for downstream GitHub-API correlation.
+   */
+  pusher_login?: string | null;
 };
 

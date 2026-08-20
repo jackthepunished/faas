@@ -32,21 +32,26 @@ import (
 )
 
 // secretsRotate handles `gregale secrets rotate --app <slug>
-// KEY=VALUE [--from-stdin]`. Single pair (vs `secrets set` which
-// takes a list) — rotation is a deliberate, atomic operation.
-// The handler reads from stdin when --from-stdin is set so the
-// plaintext never touches argv. Failure surfaces apid's Problem
-// envelope as-is (already mapped by client.do).
+// KEY=VALUE [--from-stdin] [--scope <name>]`. Single pair (vs
+// `secrets set` which takes a list) — rotation is a deliberate,
+// atomic operation. The handler reads from stdin when --from-stdin
+// is set so the plaintext never touches argv. Failure surfaces
+// apid's Problem envelope as-is (already mapped by client.do).
+//
+// --scope (ADR-092 PR-B) selects which env-scope the rotation
+// targets; the rotation hint now reads "rotating %s in scope=%q"
+// so the customer knows which (scope, key) pair they're rotating.
 func secretsRotate(args []string) int {
 	fs := flag.NewFlagSet("secrets rotate", flag.ContinueOnError)
 	app := fs.String("app", "", "app slug")
 	fromStdin := fs.Bool("from-stdin", false, "read KEY=VALUE from stdin (one pair)")
+	scope := fs.String(secretsCmdScopeFlag, "", "env scope to rotate (omit for default)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *app == "" {
 		PrintUsage(os.Stderr,
-			"usage: gregale secrets rotate --app <slug> KEY=VALUE [--from-stdin]", "secrets")
+			"usage: gregale secrets rotate --app <slug> KEY=VALUE [--from-stdin] [--scope <name>]", "secrets")
 		return 1
 	}
 
@@ -107,11 +112,11 @@ func secretsRotate(args []string) int {
 	// so the customer doesn't think the new value is live
 	// everywhere.
 	_, _ = fmt.Fprintf(osStdout,
-		"note: rotating %s. Any parked snapshots still hold the previous plaintext until the next wake.\n"+
+		"note: rotating %s in scope=%q. Any parked snapshots still hold the previous plaintext until the next wake.\n"+
 			"  Deploy, or call `gregale wake %s`, to force an overstamp.\n",
-		pair.Key, *app)
+		pair.Key, scopeOrDefault(*scope), *app)
 
-	resp, err := client.RotateSecret(context.Background(), *app, pair.Key, pair.Value)
+	resp, err := client.RotateSecretWithScope(context.Background(), *app, pair.Key, pair.Value, *scope)
 	if err != nil {
 		return printErr("Rotate "+pair.Key+" failed", err)
 	}

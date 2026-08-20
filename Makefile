@@ -245,6 +245,15 @@ e2e-sandbox: ## Live Paddle sandbox walk (operator-only; PR-P3). Reads secrets f
 	# CI runs. The secrets file is gitignored.
 	FAAS_PADDLE_SANDBOX_E2E=1 $(GO) test -tags paddle_sandbox_e2e -race -count=1 -run=PaddleSandbox -timeout=10m ./cmd/e2e/...
 
+.PHONY: e2e-kafka
+e2e-kafka: ## Issue #757 / ADR-118: real-broker Kafka poller e2e (testcontainers). Requires Docker on host.
+	# Build tag: kafka_e2e keeps this out of the default `make test`
+	# surface. The test is in pkg/sched/poller_kafka_e2e_test.go
+	# (whitebox — `newKafkaPoller` is unexported). Runs against a
+	# `confluentinc/confluent-local:7.5.0` container by default;
+	# override with KAFKA_TEST_IMAGE=...
+	$(GO) test -tags kafka_e2e -race -count=1 -run TestKafkaPollerE2E -timeout=5m ./pkg/sched/...
+
 .PHONY: doctor-paddle
 doctor-paddle: ## PR-P4 operator smoke: run `gregale billing status --watch` for 60s + tail faas-apid journal for paddle_webhook.verify_failed lines. Operator-only.
 	@test -x ./bin/gregale || (echo "./bin/gregale missing; run \`make build\` first" ; exit 1)

@@ -145,6 +145,29 @@ type Metrics struct {
 	// one of {success, error} — a 2-element closed set; expanding it
 	// requires a new metric (the apply-error mix is its own surface).
 	edgeRuleApply *prometheus.CounterVec
+	// edgeRuleValidateFailures (issue #975 #3 / Mega-Foundation #979-a):
+	// counter of kind=validate body mismatches, labelled by
+	// {mode, reason}. `mode` is the rule's validate_mode
+	// (observe|warn|block — closed set; the schema enforces the
+	// values at column level). `reason` is the bounded taxonomy
+	// emitted by pkg/edgevalidate (required_missing |
+	// type_mismatch | additional_properties_not_allowed |
+	// enum_violation | format_violation | other — 6 elements, also
+	// closed). The counter increments in every mode — the reject
+	// decision is independent of the count, so the dashboard can
+	// read the same series for "how often does this rule fail?" in
+	// observe mode and for "how often would this rule have failed?"
+	// in block mode. The {app_id, rule_id} pair is NOT a label on
+	// this counter; the per-rule break-out is queryable via the
+	// existing edgeRuleApply{result=error} counter, which is
+	// incremented on the block-mode reject path. Cardinality is
+	// therefore `mode × reason` = 4 × 6 = 24 (modes: observe, warn,
+	// block, other — `other` is the coerce-on-unknown bucket;
+	// reasons: required_missing, type_mismatch,
+	// additional_properties_not_allowed, enum_violation,
+	// format_violation, other), well below the 50-counter budget
+	// any single Metrics instance ships.
+	edgeRuleValidateFailures *prometheus.CounterVec
 	// routeConsumerThrottleDecisions (ADR-104, issue #881 Phase 3):
 	// counter of per-consumer throttle decisions, labelled by
 	// {kind, outcome}. `kind` is the KeyBy dimension
@@ -167,6 +190,14 @@ type Metrics struct {
 	// kinds; the counter surfaces the signal even when the
 	// loader's WARN log is drowned by other gatewayd-internal noise.
 	edgeRuleCompileError *prometheus.CounterVec
+	// envelopeCapWarns (issue #995 Phase 4 / ADR-121): warn
+	// counters for the body-cap surfaces (request, response,
+	// raw-bridge). Labels: {app_id, bucket}; bucket ∈
+	// {near_threshold, exceeded}. The app_id label is bounded by
+	// the platform's per-account app count (~100s) — see ADR-093
+	// §cardinality for the precedent. route_label is intentionally
+	// NOT admitted (could explode per ADR-093 cap of 50 per app).
+	responseBodyWarnTotal *prometheus.CounterVec
 	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
 	// apps.maintenance_mode coarse-gate matches. Distinct from the
 	// edgeRule* family because the coarse gate is not an edge
@@ -485,6 +516,16 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_apply_total",
 			Help: "Edge-rule apply-path outcomes (success|error), labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind", "result"}),
+		// Issue #975 #3 / Mega-Foundation #979-a — kind=validate body
+		// mismatches, labelled by {mode, reason}. The schema-side
+		// counter is the (app, rule_id) tuple from rule load. Tagged
+		// closed sets, so cardinality is bounded by mode × reason =
+		// 4 × 6 = 24 (mode includes `other` as the coerce-on-unknown
+		// bucket; reason is closed at 6).
+		edgeRuleValidateFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_validate_failures_total",
+			Help: "Edge-rule kind=validate body mismatches, labelled by validate_mode (observe|warn|block|other) and reason (required_missing|type_mismatch|additional_properties_not_allowed|enum_violation|format_violation|other). The counter increments in every mode; the reject decision is independent. `other` is the coerce bucket for unknown inputs. Issue #975 #3 / Mega-Foundation #979-a.",
+		}, []string{"mode", "reason"}),
 		// ADR-104 (issue #881 Phase 3) — per-consumer throttle
 		// decisions, distinct from the per-rule edgeRuleApply path.
 		// `kind` ∈ {none, api_key, jwt_subject, jwt_claim} tracks the
@@ -508,6 +549,13 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_compile_error_total",
 			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
+		// Issue #995 Phase 4 / ADR-121 — envelope-cap warn
+		// counter for the response body (used by both the buffered
+		// and streaming capWriter paths).
+		responseBodyWarnTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_response_body_warn_total",
+			Help: "Count of response bodies that approached or exceeded the per-plan MaxResponseBodyBytes cap, labelled by app_id and bucket (near_threshold|exceeded).",
+		}, []string{"app_id", "bucket"}),
 		// ADR-091 amendment — coarse-gate apps.maintenance_mode
 		// short-circuit counter. Distinct from edgeRule* family
 		// because the coarse gate is per-app, not per-rule. Plan
@@ -928,7 +976,7 @@ func NewMetrics() *Metrics {
 	// closed set guarantees the §12 dashboard panel "edge rule
 	// match rate" surfaces every (kind, outcome) tuple from
 	// first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle", "ingress_ip"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -1012,9 +1060,12 @@ func NewMetrics() *Metrics {
 	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
 	// compile errors" surface every tuple from first scrape. Closed
 	// set: {route, rewrite, redirect, headers, cors, jwt, ip, validate,
-	// limit, maintenance, geo, throttle}. Adding a new kind requires
-	// extending this slice — the metric name is stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+	// limit, maintenance, geo, throttle, ingress_ip}. Adding a new
+	// kind requires extending this slice — the metric name is
+	// stable. `ingress_ip` was added by ADR-118 for the per-app
+	// ingress IP allowlist (pkg/gateway/handler.go::
+	// applyIngressIPAllowlist).
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle", "ingress_ip"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}
@@ -1059,7 +1110,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1139,6 +1190,29 @@ func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
 		return
 	}
 	m.responseBytes.WithLabelValues(appID, plan).Add(float64(n))
+}
+
+// ObserveResponseBodyWarn increments the response-body warn counter
+// for issue #995 Phase 4 / ADR-121. Called from capWriter when a
+// response crosses the near-threshold (80%) or exceeded (100%) mark
+// for the per-plan MaxResponseBodyBytes cap. The two flags are
+// mutually exclusive at the call site (exceeded wins); the
+// implementation tolerates both true as a no-op guard, but the
+// contract is "exactly one" so the counter increments in a single
+// bucket. route_label is intentionally NOT admitted (ADR-093 cap of
+// 50 per app); app_id is bounded by the platform's per-account app
+// count (~100s) — same precedent as edgeRuleApply. Nil-receiver
+// safe.
+func (m *Metrics) ObserveResponseBodyWarn(appID string, nearThreshold, exceeded bool) {
+	if m == nil || appID == "" {
+		return
+	}
+	switch {
+	case exceeded:
+		m.responseBodyWarnTotal.WithLabelValues(appID, "exceeded").Inc()
+	case nearThreshold:
+		m.responseBodyWarnTotal.WithLabelValues(appID, "near_threshold").Inc()
+	}
 }
 
 // ObserveStreamFlush increments the per-(app, plan) streaming
@@ -1424,6 +1498,38 @@ func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 		return
 	}
 	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
+}
+
+// ObserveEdgeRuleValidateFailure (issue #975 #3 / Mega-Foundation #979-a)
+// increments the kind=validate failure counter. mode is the rule's
+// validate_mode (observe|warn|block); reason is the bounded taxonomy
+// from pkg/edgevalidate (required_missing | type_mismatch |
+// additional_properties_not_allowed | enum_violation | format_violation
+// | other). The metric is incremented in every mode — the reject
+// decision is independent and handled by the handler. Nil-safe so the
+// Handler hot path doesn't need a nil guard, mirroring
+// ObserveEdgeRuleMatch / ObserveEdgeRuleApply above. Unknown mode
+// values are coerced to "other" so a malformed wire payload cannot
+// add a new label tuple and break the §12 dashboard panel.
+func (m *Metrics) ObserveEdgeRuleValidateFailure(mode, reason string) {
+	if m == nil {
+		return
+	}
+	switch mode {
+	case "observe", "warn", "block":
+	default:
+		mode = reasonOther
+	}
+	switch reason {
+	case "required_missing",
+		"type_mismatch",
+		"additional_properties_not_allowed",
+		"enum_violation",
+		"format_violation":
+	default:
+		reason = reasonOther
+	}
+	m.edgeRuleValidateFailures.WithLabelValues(mode, reason).Inc()
 }
 
 // ObserveRouteConsumerThrottleDecision (ADR-104, issue #881 Phase 3)

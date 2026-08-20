@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -153,6 +154,19 @@ type DeploymentItem struct {
 	Kind      string
 	CreatedAt string
 	Error     string
+	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+	// attribution. All four fields are server-stamped from the
+	// HTTP request context (never client-supplied) and rendered
+	// by deployment_detail.html as a chip row. The dashboard
+	// deploy list (app_detail.html) shows a compact via-only
+	// chip on each row; the drill-down page surfaces the full
+	// triple (user / pusher / IP). Pre-#606 rows carry empty
+	// strings here; the via-chip conditional render keeps the
+	// wire + UI byte-identical for those rows.
+	DeployedByUserID string
+	DeployedVia      string
+	DeployedFromIP   string
+	PusherLogin      string
 	// ScanSummary is the per-deploy grype scan chip rendered
 	// in the deploy list (issue #464 / ADR-055). Nil when no
 	// scan has run yet (the deploy is mid-pipeline or predates
@@ -162,6 +176,16 @@ type DeploymentItem struct {
 	// the dashboard's deploy detail page (deployment_detail.html)
 	// is the drill-down surface for the full CVE list.
 	ScanSummary *ScanSummary
+	// Error-explanations cluster (spec §6.4 amendment 1):
+	// typed prose stamped on the deployments row alongside the
+	// legacy raw Error string. Empty on pre-cluster rows;
+	// the deployment_detail template gates the new section
+	// on ErrorCode != "" so legacy renders unchanged.
+	ErrorCode         string
+	ErrorHint         string
+	ErrorWhy          string
+	ErrorFix          string
+	ErrorRelevantLogs []api.LogExcerpt
 }
 
 // ScanSummary is the per-deploy grype scan summary
@@ -337,10 +361,40 @@ type AppDetailData struct {
 // (cmd/apid/handlers_dashboard.go::renderDeploymentDetail) is
 // the only thing that materialises this struct from the wire
 // types.
+//
+// Stages (ADR-117 v2 follow-on, A2): the closed-6-stage
+// post-stream summary the customer sees via `gregale deploys show
+// <id>`. nil Stages means the row was created before the
+// jsonb column existed (migrations/00302) OR the jsonb is empty
+// for an in-flight deploy — the template omits the section
+// entirely. non-nil Stages carries a pre-rendered HTML block
+// (handler-edge projection via pkg/dashboard/stages) so the
+// template only inlines the result and needs zero FuncMap wiring.
 type DeploymentDetailData struct {
 	App        AppListItem
 	Deployment DeploymentItem
 	Scan       *ScanPayload
+	Stages     *StagePayload
+}
+
+// StagePayload is the dashboard-local mirror of the closed-6-stage
+// post-stream summary (ADR-117 §3, migration 00302). BodyHTML is
+// the pre-rendered `<section class="stage-timeline">…</section>`
+// block the template inlines via {{ .Data.Stages.BodyHTML }} —
+// rendered at the handler edge (cmd/apid/handlers_dashboard.go::
+// dashboardStagePayload) so the template stays a pure renderer
+// and pkg/dashboard stays free of html/template FuncMap wiring.
+//
+// Status / TerminalAt are surfaced as plain fields so the
+// template can branch on the deployment's terminal state (e.g.
+// to render a "live" pill even when the section's footer doesn't
+// include the timestamp). The customer-facing footer copy lives
+// inside BodyHTML so the template can't drift from the CLI's
+// text renderer.
+type StagePayload struct {
+	BodyHTML   template.HTML
+	Status     string
+	TerminalAt time.Time
 }
 
 // ScanPayload is the dashboard-local mirror of the per-deploy

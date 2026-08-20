@@ -409,18 +409,22 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			}
 		}
 	}
-	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
-	// Plan-gated upstream: apid returns 402
-	// plan_public_auth_{bearer,basic}_not_allowed when the
-	// customer's plan lacks the gate. The bearer path
-	// re-uses the require_authn chain (apps:read scope on
-	// the app's owning account) so the gate is Hobby+;
-	// basic adds a secretbox seal + per-app unseal and is
-	// Pro+. 'open' is always allowed (the pre-#477 default).
+	// Issue #477 / ADR-079 + ADR-118: per-app public_auth
+	// (open|bearer|basic|ip_allowlist). Plan-gated upstream:
+	// apid returns 403 plan_public_auth_{bearer,basic,
+	//ip_allowlist}_not_allowed when the customer's plan
+	// lacks the gate. The bearer path re-uses the
+	// require_authn chain (apps:read scope on the app's
+	// owning account) so the gate is Hobby+; basic adds a
+	// secretbox seal + per-app unseal and is Pro+;
+	// ip_allowlist is a per-app CIDR list (mirrors egress
+	// schema) and is also Pro+ — Hobby/Free use edge rules
+	// (kind='ip') for the abuse-floor posture (ADR-091).
+	// 'open' is always allowed (the pre-#477 default).
 	// Validation runs FIRST (closed-enum + length bounds)
 	// so a Free customer who tries PATCH mode='weird' gets
 	// a 422 invalid_public_auth_mode rather than a
-	// confusing 402 plan_public_auth_bearer_not_allowed.
+	// confusing 403 plan_public_auth_*_not_allowed.
 	if req.PublicAuth != nil {
 		if prob := req.PublicAuth.Validate(); prob != nil {
 			return prob
@@ -433,6 +437,78 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		case api.AppPublicAuthModeBasic:
 			if !acct.Plan.PublicAuthBasicAllowed() {
 				return api.ErrPlanPublicAuthBasicNotAllowed(acct.Plan)
+			}
+		case api.AppPublicAuthModeIPAllowlist:
+			// ADR-118: plan tier first — Free/Hobby + non-pip
+			// cap surfaces 403 even when the rest of the
+			// body looks valid. The closed-enum validator in
+			// dto.go already rejected unknown mode strings
+			// (422 invalid_public_auth_mode) AND
+			// mode='ip_allowlist' with an empty list (422
+			// invalid_public_auth_mode — empty list is
+			// not a valid ip_allowlist body).
+			if !acct.Plan.PublicAuthIPAllowlistAllowed() {
+				return api.ErrPlanPublicAuthIPAllowlistNotAllowed(acct.Plan)
+			}
+			// ADR-118 cap: enforce against the WIRE length
+			// BEFORE dedup, in this same switch arm so
+			// plan-gate → cap → parse → dedup run in source
+			// order (a customer cannot submit cap+1 entries
+			// with N-1 duplicates and have the deduped
+			// result bypass the cap). Mirrors
+			// handlers_ext.go:113-116 (egress cap before
+			// egress dedup). Pro 16, Scale 64. Additive
+			// per-account budget does NOT apply (per-app
+			// cap only).
+			maxEntries := acct.Plan.PublicAuthIPAllowlistMaxEntries()
+			if len(req.PublicAuth.IPAllowlist) > maxEntries {
+				return api.ErrPublicAuthIPAllowlistTooLong(
+					len(req.PublicAuth.IPAllowlist), maxEntries)
+			}
+			// ADR-118 parse + dedup. Lives inside the
+			// switch arm (rather than at the bottom of
+			// validateUpdateApp) so the cap check above
+			// runs against the wire form BEFORE this loop
+			// rewrites it. NO v4-mapped-v6 rewrite — the
+			// DB trigger rejects families outside {4,6}
+			// outright. NO /8 floor — ingress is per-
+			// customer-list, no operator-side abuse band
+			// at the handler. Insertion order is first-
+			// seen-wins. Empty-list mode flip (arm-then-
+			// add) is the gateway's loud 500 posture
+			// (operator misconfig), not a handler concern.
+			if len(req.PublicAuth.IPAllowlist) > 0 {
+				canonicalised := make([]string, 0, len(req.PublicAuth.IPAllowlist))
+				seen := make(map[string]struct{}, len(req.PublicAuth.IPAllowlist))
+				for _, raw := range req.PublicAuth.IPAllowlist {
+					prefix, err := netip.ParsePrefix(raw)
+					if err != nil || prefix.Bits() == 0 {
+						return api.ErrInvalidPublicAuthIPAllowlist(raw,
+							errOrZero("parse failed", err))
+					}
+					// Reject v4-mapped-v6 (RFC 4291
+					// §2.5.5.2). The DB trigger would
+					// 23514 this anyway — catching it
+					// here gives the operator a friendlier
+					// error name.
+					if prefix.Addr().Is4In6() {
+						return api.ErrInvalidPublicAuthIPAllowlist(raw,
+							errors.New("v4-mapped prefix not allowed; use the v4 form"))
+					}
+					key := prefix.String()
+					if _, ok := seen[key]; ok {
+						continue
+					}
+					seen[key] = struct{}{}
+					canonicalised = append(canonicalised, key)
+				}
+				// Always replace the wire form so the
+				// audit + downstream conversion see
+				// canonical strings. ParsePrefix can
+				// canonicalise the textual form (e.g.
+				// 10.0.0.5/8 → 10.0.0.0/8) even when
+				// no dedup dropped entries.
+				req.PublicAuth.IPAllowlist = canonicalised
 			}
 		}
 	}
@@ -565,6 +641,20 @@ func errOrZero(msg string, err error) error {
 		return err
 	}
 	return errors.New(msg)
+}
+
+// countIPAllowlistAudit returns the integer count of CIDR entries
+// after canonicalisation, or 0 when the mode is not ip_allowlist.
+// ADR-118 audit redaction invariant: the audit payload carries this
+// count, NEVER the CIDR strings. Defined here so a future contributor
+// adding a second audit site (gatewayd-internal side, operator CLI
+// replay, etc.) uses the same nil-or-empty shape and doesn't
+// accidentally inline `len(ipAllowlist)` with the wrong context.
+func countIPAllowlistAudit(mode string, ipAllowlist []string) int {
+	if mode != api.AppPublicAuthModeIPAllowlist {
+		return 0
+	}
+	return len(ipAllowlist)
 }
 
 // updateApp is the PATCH /v1/apps/{slug} handler. User-tunable:
@@ -703,6 +793,30 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 		publicAuthSealed = sealed
 	}
+	// ADR-118: parse the canonicalised CIDR list into []netip.Prefix
+	// for the store. Done between the seal step and UpdateAppParams
+	// construction so the store sees []netip.Prefix directly. The
+	// parse-and-dedup loop above already converted the wire form to
+	// canonical strings; this is the second parse into the typed
+	// shape. The closed-enum validator already rejected
+	// len==0 mode='ip_allowlist', so reaching this branch with the
+	// mode set means the wire form is non-empty.
+	var publicAuthIPAllowlist []netip.Prefix
+	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist {
+		publicAuthIPAllowlist = make([]netip.Prefix, 0, len(req.PublicAuth.IPAllowlist))
+		for _, raw := range req.PublicAuth.IPAllowlist {
+			// Already validated above (ParsePrefix succeeded,
+			// Bits() != 0, not v4-mapped). A second parse
+			// error here would mean a write-after-validate
+			// race, which is impossible in a single
+			// goroutine — so we tolerate err != nil as a
+			// defensive fallback (drop the entry, the
+			// canonicalised list is the source of truth).
+			if prefix, err := netip.ParsePrefix(raw); err == nil && prefix.Bits() != 0 {
+				publicAuthIPAllowlist = append(publicAuthIPAllowlist, prefix)
+			}
+		}
+	}
 	params := state.UpdateAppParams{
 		RAMMB:              req.RAMMB,
 		IdleTimeoutS:       req.IdleTimeoutS,
@@ -819,6 +933,21 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// partial-PATCH (e.g. only flips RAM_MB) never
 		// touches the public_auth column.
 		SetPublicAuth: req.PublicAuth != nil,
+		// ADR-118: per-app ingress IP allowlist. The Set bit
+		// fires ONLY when the operator explicitly chose
+		// ip_allowlist mode — a PATCH that flips an app from
+		// 'open' → 'basic' must not silently clear an existing
+		// allowlist that was stored under a previous
+		// ip_allowlist-mode PATCH. The SetPublicAuth bit
+		// above is permissive (any mode flip touches the
+		// column family), but SetPublicAuthIPAllowlist is
+		// narrow: it gates the column write, not the mode
+		// write. The slice is empty-but-non-nil when the
+		// operator PATCHed ip_allowlist with no CIDRs (the
+		// canonical "arm the mode" form); nil when the
+		// operator PATCHed a non-ip_allowlist mode.
+		PublicAuthIPAllowlist:    &publicAuthIPAllowlist,
+		SetPublicAuthIPAllowlist: req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist,
 		// Issue #695 / ADR-080: grand-father clear path. Set
 		// whenever the customer made a deliberate choice on
 		// require_authn OR public_auth — that's the signal
@@ -1050,8 +1179,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"new":    false,
 		})
 	}
-	// Issue #477 / ADR-079: emit app.public_auth_changed on mode
-	// transitions. Same single-purpose, single-keyword-greppable
+	// Issue #477 / ADR-079 + ADR-118: emit app.public_auth_changed on
+	// mode transitions. Same single-purpose, single-keyword-greppable
 	// shape as app.eviction_priority_changed above so operators
 	// can `gregale audit-events --kind-prefix public_auth` and
 	// see every mode flip without parsing the larger app.updated
@@ -1061,13 +1190,24 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	//
 	// Redaction posture (load-bearing — see ADR-079 §Decision
 	// "re-redaction invariant"): the payload carries mode only
-	// (open|bearer|basic) and a `has_basic_creds` bool flag.
-	// Plaintext username / password / sealed blob are NEVER
-	// recorded anywhere on the audit stream — neither this row
-	// nor any future contributor adding logging in the
-	// gatewayd-internal-side path. has_basic_creds answers "did the
-	// customer rotate credentials on this PATCH?" without
+	// (open|bearer|basic|ip_allowlist) and a `has_basic_creds`
+	// bool flag. Plaintext username / password / sealed blob are
+	// NEVER recorded anywhere on the audit stream — neither this
+	// row nor any future contributor adding logging in the
+	// gatewayd-internal-side path. has_basic_creds answers "did
+	// the customer rotate credentials on this PATCH?" without
 	// revealing the value.
+	//
+	// ADR-118: `public_auth_ip_allowlist_entry_count` is the
+	// INTEGER count of CIDRs after canonicalisation + dedup,
+	// NEVER the CIDR strings themselves. Operators can answer
+	// "did the customer change the size of the allowlist?" from
+	// the count without seeing the contents. The CIDR strings
+	// are not PII per se, but the allowlist can reveal
+	// partner-customer ranges (an abuse-floor partner
+	// allowlist like 198.51.100.0/24 + 203.0.113.0/24 would
+	// tell an attacker which customer is behind the app); the
+	// invariant is to record presence + size, never contents.
 	if req.PublicAuth != nil && app.PublicAuthMode != updated.PublicAuthMode {
 		s.audit.Emit(r.Context(), "app.public_auth_changed", &acct.ID, map[string]any{
 			"app_id":          updated.ID,
@@ -1075,6 +1215,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"old":             app.PublicAuthMode,
 			"new":             updated.PublicAuthMode,
 			"has_basic_creds": req.PublicAuth.Mode == api.AppPublicAuthModeBasic,
+			"public_auth_ip_allowlist_entry_count": countIPAllowlistAudit(
+				req.PublicAuth.Mode, req.PublicAuth.IPAllowlist),
 		})
 	}
 	resp := s.appResponse(updated, acct.Plan)
@@ -1383,6 +1525,13 @@ func planMaxFor(acct state.Account) int {
 // Implemented as a synchronous status swap; imaged/schedd react via
 // pg_notify and re-prime on their side. The previous "live" deployment is
 // marked superseded; the rolled-back one moves from superseded → live.
+//
+// SAFE-RELEASES-G (issue #976) adds an optional request body field
+// target_deployment_id. When set, the handler validates that the named
+// deployment (a) belongs to this app and (b) has status='superseded', then
+// promotes it. When omitted, the behaviour is unchanged — rollback to the
+// most-recent superseded deployment. The audit emit carries a `mode` field
+// so the dashboard can render "latest" vs "specific" differently.
 func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -1393,11 +1542,66 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 		s.notFound(w, "no deployments")
 		return
 	}
-	target, err := s.store.LatestSupersededDeployment(r.Context(), app.ID)
-	if err != nil {
-		api.WriteProblem(w, api.ErrNoRollbackTarget())
-		return
+
+	// SAFE-RELEASES-G: optionally target a specific deployment by id.
+	// Body is optional (legacy callers POST without a body); decodeJSON
+	// returns an error on malformed input which we treat as 400, but an
+	// empty body is fine (Decodable zero-value + no error).
+	var req api.RollbackRequest
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &req); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid rollback request", err.Error()))
+			return
+		}
 	}
+
+	var (
+		target state.Deployment
+		mode   = "latest_superseded"
+	)
+	if req.TargetDeploymentID != nil && *req.TargetDeploymentID != "" {
+		mode = "explicit"
+		t, err := s.store.GetDeploymentByIDScopedToSuperseded(r.Context(), app.ID, *req.TargetDeploymentID)
+		if err != nil {
+			switch {
+			case errors.Is(err, state.ErrNoRollbackTarget):
+				api.WriteProblem(w, api.ErrRollbackTargetNotFound(
+					fmt.Sprintf("no superseded deployment with id %q belongs to app %q", *req.TargetDeploymentID, app.ID)))
+			case errors.Is(err, state.ErrRollbackTargetAlreadyLive):
+				api.WriteProblem(w, api.ErrRollbackTargetAlreadyLive(
+					fmt.Sprintf("deployment %q exists but is not in 'superseded' state; rollback to current live deployment is rejected", *req.TargetDeploymentID)))
+			default:
+				api.WriteProblem(w, api.ErrCapacity(fmt.Sprintf("lookup rollback target: %v", err)))
+			}
+			return
+		}
+		target = t
+	} else {
+		// Legacy path: most-recent superseded deployment.
+		t, err := s.store.LatestSupersededDeployment(r.Context(), app.ID)
+		if err != nil {
+			api.WriteProblem(w, api.ErrNoRollbackTarget())
+			return
+		}
+		target = t
+	}
+
+	// NOTE: SAFE-RELEASES-G deliberately does NOT add a "snapshot must
+	// exist" gate here. Per ADR-005 "cold boot must always work": if the
+	// rollback target's snapshot is missing (e.g. retention sweep ran,
+	// FC upgrade marked it stale, or it never had one), the wake path
+	// will cold-boot from the deployment's rootfs. Rejecting the
+	// rollback up-front would block a valid operator action and
+	// contradict the spec invariant "An app always has a live snapshot
+	// OR a cold-bootable rootfs — never neither" (CLAUDE.md §Invariants).
+	//
+	// The early-PR draft of this code did gate on HasSnapshotHistory +
+	// LatestSnapshot; /code-review medium (PR #979) flagged that the
+	// gate conflates "all snapshots stale (FC upgrade per ADR-005)" with
+	// "snapshot GC'd", wrongly blocking the rollback on stale scenarios
+	// where cold-boot is the intended fallback.
+
 	if err := s.store.MarkDeploymentSuperseded(r.Context(), current.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not supersede current"))
 		return
@@ -1430,7 +1634,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	_ = s.notif.Notify(r.Context(), db.NotifyDeploymentChanged,
 		fmt.Sprintf(`{"kind":"superseded","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`,
 			app.ID, current.ID, current.ID))
-	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID)
+	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID, "mode", mode)
 	// IAM-4 (issue #291): record the rollback so an operator can
 	// answer "when did this app get rolled back, and to which
 	// deployment?" without joining the gdpr ledger. data.from
@@ -1438,10 +1642,15 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	// deployment_id promoted to live. The pg_notify emit above
 	// (lines 460+) carries the same ids for the live-system
 	// listener; the audit row is the read-only counterpart.
+	// SAFE-RELEASES-G: `mode` is the selector ("latest_superseded" vs
+	// "explicit") so a future audit filter can distinguish "operator
+	// accepted the auto-rollback to most-recent" from "operator pinned
+	// to a specific historical deployment".
 	s.audit.Emit(r.Context(), "app.rolled_back", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"from":   current.ID,
 		"to":     target.ID,
+		"mode":   mode,
 	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(target, app))
 }
@@ -1805,6 +2014,269 @@ func dialFailureReason(err error) string {
 		msg = msg[:96] + "…"
 	}
 	return msg
+}
+
+// --- domain doctor (ADR-120) --------------------------------------------
+
+// getDomainDoctor is the GET /v1/domains/{domain}/doctor handler.
+// Reuses loadDomain for the IDOR-safe load. The handler reads
+// the latest observation row from domain_doctor_observations;
+// if the row is older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS or
+// missing, it triggers a synchronous re-probe with a 5s budget.
+// The re-probe path is the only place a live probe runs on a
+// request — the dns_poller does the work for the 99% case.
+//
+// 503 CodeDoctorDisabled is returned when the operator hasn't
+// set FAAS_DOMAIN_DOCTOR_ENABLED; the route stays registered
+// so the CLI gets a deterministic error code (per the
+// pre-#911 pattern in api/flags.go).
+func (s *server) getDomainDoctor(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if !api.DomainDoctorEnabled() {
+		api.WriteProblem(w, api.ErrDoctorDisabled())
+		return
+	}
+	domain := strings.ToLower(r.PathValue("domain"))
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok {
+		return
+	}
+	report, err := s.buildDoctorReport(r.Context(), d)
+	if err != nil {
+		api.WriteProblem(w, api.ErrDoctorUnavailable(d.Domain, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// doctorTTL returns the FAAS_DOMAIN_DOCTOR_TTL_SECONDS value
+// (default 300s). Read at request time so an operator can
+// tighten / loosen the cache without bouncing apid.
+func doctorTTL() time.Duration {
+	v := strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_TTL_SECONDS"))
+	if v == "" {
+		return 5 * time.Minute
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(n) * time.Second
+}
+
+// buildDoctorReport reads the cached observation row and
+// decides whether to trigger a synchronous re-probe. The
+// report is always rendered from the observation row (not
+// the live re-probe) so the response shape is stable — the
+// re-probe's only job is to refresh the row.
+func (s *server) buildDoctorReport(ctx context.Context, d state.CustomDomain) (api.DomainDoctorReport, error) {
+	obs, err := s.store.GetDoctorObservation(ctx, d.Domain)
+	if err == nil {
+		if time.Since(obs.ObservedAt) < doctorTTL() {
+			return doctorReportFromObs(d, obs, false), nil
+		}
+		// Stale: fall through to a synchronous re-probe so
+		// the next reader gets fresh data. The re-probe
+		// shares the dns_poller's helper path (runDoctorForDomain
+		// is the load-bearing engine).
+		if refreshErr := s.refreshDoctorObservation(ctx, d.Domain); refreshErr == nil {
+			obs, _ = s.store.GetDoctorObservation(ctx, d.Domain)
+		}
+		return doctorReportFromObs(d, obs, true), nil
+	}
+	// ErrNotFound: poller hasn't written yet. Trigger a
+	// synchronous re-probe (bounded by the request ctx so
+	// a slow upstream doesn't blow past the request budget).
+	if refreshErr := s.refreshDoctorObservation(ctx, d.Domain); refreshErr != nil {
+		return api.DomainDoctorReport{}, refreshErr
+	}
+	obs, err = s.store.GetDoctorObservation(ctx, d.Domain)
+	if err != nil {
+		return api.DomainDoctorReport{}, err
+	}
+	return doctorReportFromObs(d, obs, true), nil
+}
+
+// refreshDoctorObservation is the synchronous re-probe
+// path. Calls runProbesParallel + dialCertForDoctor
+// (the same helpers the poller uses) and upserts the
+// result. Errors are returned to the caller; the caller
+// decides whether to fall through (the report's Stale
+// flag is the visible degradation).
+func (s *server) refreshDoctorObservation(ctx context.Context, domain string) error {
+	rctx, cancel := context.WithTimeout(ctx, probeTimeout+2*time.Second)
+	defer cancel()
+	dnsFound, pointsToG, caa, aaaa := runProbesParallel(rctx, domain)
+	obs := state.DomainDoctorObservation{
+		Domain:          domain,
+		ObservedAt:      time.Now().UTC(),
+		DNSRecordFound:  probeToBool(dnsFound.Status, true),
+		PointsToGregale: probeToBool(pointsToG.Status, false),
+		IPv6Conflict:    probeToBool(aaaa.Status, false),
+		ObservedTarget:  pointsToG.Observed,
+		ObservedAAAA:    aaaa.Observed,
+		CAAObserved:     caa.Observed,
+		DNSCheckedAt:    earliest(dnsFound.ObservedAt, pointsToG.ObservedAt, caa.ObservedAt, aaaa.ObservedAt),
+	}
+	switch caa.Status {
+	case probeOK:
+		v := true
+		obs.CAAPermits = &v
+	case probeFail:
+		v := false
+		obs.CAAPermits = &v
+	}
+	if s.store != nil {
+		if surface, sErr := s.store.TenantSurfaceByHostname(rctx, domain); sErr == nil {
+			obs.SurfaceID = surface.ID
+			obs.CertState = string(surface.CertState)
+			obs.CertNotAfter = surface.CertNotAfter
+		}
+	}
+	if obs.CertState == "" {
+		obs.CertState, obs.LastError, obs.CertNotAfter = dialCertForDoctor(rctx, domain)
+		obs.CertCheckedAt = time.Now().UTC()
+	}
+	return s.store.UpsertDoctorObservation(rctx, obs)
+}
+
+// doctorReportFromObs translates the persistence struct
+// into the wire shape. The translation is mechanical
+// (5 checks, each with a stable name + status + detail +
+// observed + remediation + checked_at) so the helper
+// stays small and is exercised by the e2e suite.
+func doctorReportFromObs(d state.CustomDomain, obs state.DomainDoctorObservation, stale bool) api.DomainDoctorReport {
+	report := api.DomainDoctorReport{
+		Domain:     d.Domain,
+		AppID:      d.AppID,
+		Stale:      stale,
+		ObservedAt: obs.ObservedAt.UTC().Format(time.RFC3339),
+		Checks:     []api.DomainDoctorCheck{},
+		Healthy:    true,
+	}
+	// 1. DNS record found.
+	dnsStatus, dnsDetail, dnsRem := probeOK, "A or AAAA records present", ""
+	if !obs.DNSRecordFound {
+		dnsStatus, dnsRem = probeFail, "Publish an A or AAAA record at "+d.Domain
+		report.Healthy = false
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "dns_record", Status: string(dnsStatus), Detail: dnsDetail,
+		Remediation: dnsRem, CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 2. Points to Gregale.
+	ptsStatus, ptsDetail, ptsRem, ptsObs := probeOK, "CNAME → Gregale", "", obs.ObservedTarget
+	if !obs.PointsToGregale {
+		ptsStatus = probeFail
+		report.Healthy = false
+		if ptsObs != "" {
+			ptsDetail = "CNAME does not point at Gregale (observed: " + ptsObs + ")"
+			ptsRem = "Set CNAME " + d.Domain + " → " + ptsObs
+		} else {
+			ptsDetail = "no CNAME at apex; using A/AAAA record instead"
+		}
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "points_to_gregale", Status: string(ptsStatus), Detail: ptsDetail,
+		Observed: ptsObs, Remediation: ptsRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 3. TLS certificate.
+	tlsStatus, tlsDetail, tlsRem := probeOK, "certificate issued", ""
+	switch obs.CertState {
+	case certStatusIssued:
+		if !obs.CertNotAfter.IsZero() {
+			tlsDetail = "certificate issued, expires " + obs.CertNotAfter.UTC().Format(time.RFC3339)
+		}
+	case certStatusPending:
+		tlsStatus = probePending
+		report.Healthy = false
+		tlsDetail = "cert engine has not yet issued"
+		tlsRem = "Wait for cert engine to mint (retry in 30s). If persistent, run `gregale domains show " + d.Domain + "` for cert_not_after + SANs."
+	case certStatusFailed:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "cert engine reported failure: " + obs.LastError
+		tlsRem = "Check the cert engine logs; the renewal loop will retry automatically."
+	case certStatusDialFailed:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "port-443 cert dial failed: " + obs.LastError
+	case certStatusCDN:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "port-443 cert is a CDN cert whose SANs do not include " + d.Domain
+		tlsRem = "Update the edge to use the Gregale-issued cert, or wait for Gregale cert propagation."
+	default:
+		// "none" or empty. Two distinct cases:
+		// (a) d.Verified() is false — the customer never
+		//     published the _faas-verify TXT, so the cert
+		//     engine has not started. Tell them so.
+		// (b) d.Verified() is true but cert_state is still
+		//     "none" — the first poll cycle after verification
+		//     almost always hits this case (cert engine has not
+		//     yet minted). The customer has verified; we
+		//     should not contradict that reality. Tell them
+		//     the cert is pending issuance, not that the
+		//     domain is unverified.
+		tlsStatus = probePending
+		report.Healthy = false
+		if !d.Verified() {
+			tlsDetail = "domain not yet verified; cert not yet issued"
+		} else {
+			tlsDetail = "cert pending issuance; wait for cert engine (next poll cycle)"
+		}
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "tls_certificate", Status: string(tlsStatus), Detail: tlsDetail,
+		Remediation: tlsRem, CheckedAt: obs.CertCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 4. CAA permits. caaStatus starts as ok with the
+	// "no CAA published" detail, then each branch overrides
+	// only when a CAA record is present OR a transient
+	// failure was observed. The non-CAA-published case
+	// (obs.CAAPermits == nil and no transient error) keeps
+	// the initial ok assignment.
+	caaStatus := probeOK
+	caaDetail := "no CAA published (allowed by default)"
+	caaRem := ""
+	caaObs := obs.CAAObserved
+	if obs.CAAPermits != nil {
+		if *obs.CAAPermits {
+			caaDetail = "CAA permits certificate issuance"
+		} else {
+			caaStatus = probeFail
+			report.Healthy = false
+			caaDetail = "CAA denies certificate issuance for this CA"
+			caaRem = "Update CAA record at " + d.Domain + " to permit letsencrypt.org (e.g. '0 issue \"letsencrypt.org\"')"
+		}
+	} else if obs.CAAObserved != "" {
+		// nil permits + observed CAA recordset = the resolver
+		// returned a CAA recordset but the parser couldn't
+		// decide issue vs issuewild. Surface as pending so
+		// the customer sees a transient signal.
+		caaStatus = probePending
+		report.Healthy = false
+		caaDetail = "CAA lookup returned a transient error; re-poll"
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "caa_permits", Status: string(caaStatus), Detail: caaDetail,
+		Observed: caaObs, Remediation: caaRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 5. IPv6 conflict.
+	ipStatus, ipDetail, ipRem, ipObs := probeOK, "no stray AAAA at apex", "", obs.ObservedAAAA
+	if obs.IPv6Conflict {
+		ipStatus = probeFail
+		report.Healthy = false
+		ipDetail = "AAAA record at apex conflicts with CNAME"
+		ipRem = "Remove AAAA record at " + d.Domain
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "ipv6_conflict", Status: string(ipStatus), Detail: ipDetail,
+		Observed: ipObs, Remediation: ipRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	return report
 }
 
 // --- crons -----------------------------------------------------------------
@@ -3205,17 +3677,21 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		d.OverridePort != 0 ||
 		len(d.OverrideHealthcheck) > 0
 	resp := api.DeploymentResponse{
-		ID:           d.ID,
-		AppID:        d.AppID,
-		BuildID:      d.BuildID,
-		ImageDigest:  d.ImageDigest,
-		Kind:         string(d.Kind),
-		Status:       string(d.Status),
-		Error:        d.Error,
-		ErrorCode:    d.ErrorCode,
-		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
-		HasOverrides: hasOverrides,
-		MinInstances: d.MinInstances,
+		ID:                d.ID,
+		AppID:             d.AppID,
+		BuildID:           d.BuildID,
+		ImageDigest:       d.ImageDigest,
+		Kind:              string(d.Kind),
+		Status:            string(d.Status),
+		Error:             d.Error,
+		ErrorCode:         d.ErrorCode,
+		ErrorHint:         d.ErrorHint,
+		ErrorWhy:          d.ErrorWhy,
+		ErrorFix:          d.ErrorFix,
+		ErrorRelevantLogs: d.ErrorRelevantLogs,
+		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
+		HasOverrides:      hasOverrides,
+		MinInstances:      d.MinInstances,
 		// Issue #556 PR-A: traffic_percent echoes the per-deployment
 		// split weight. Σ over live rows for the app is 100 by
 		// construction (CreateDeployment zeros the prior row in the
@@ -3230,6 +3706,18 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		// column on every pre-PR-D deployment, so the field is
 		// never empty in practice).
 		Scope: d.Scope,
+		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+		// attribution. Mirrored verbatim from state.Deployment
+		// — the four fields are server-stamped at handler entry
+		// (cmd/apid/handlers.go::createDeployment, deploy_inputs.go,
+		// handlers_source_ref.go, handlers_source_tarball.go, and
+		// githubd_bridge.go) and stored via the migrations/00305
+		// column set. The DTO json tags use `omitempty` so
+		// pre-#606 rows render bit-identical JSON to the wire.
+		DeployedByUserID: d.DeployedByUserID,
+		DeployedVia:      d.DeployedVia,
+		DeployedFromIP:   d.DeployedFromIP,
+		PusherLogin:      d.PusherLogin,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint
@@ -4156,6 +4644,14 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 	statusTicker := time.NewTicker(2 * time.Second)
 	defer statusTicker.Stop()
 
+	// ADR-117 §3: per-connection set of stages already announced so
+	// the diff on each tick emits `event: stage` exactly once. The
+	// closed 6-stage vocabulary is encoded in pkg/state.StageName
+	// consts; `announced` is keyed by StageName so the jsonb row's
+	// `current` field maps straight through without a string copy.
+	announced := make(map[state.StageName]string)
+	var lastStageStateRaw []byte
+
 	// Move 3: one-shot backstop timer (replaces per-iteration
 	// time.After(10*time.Minute), which was never reaping the timer
 	// on a busy stream — the select arm would re-allocate a fresh
@@ -4190,13 +4686,30 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			// Cheap status poll. Emits `event: status` and exits
 			// when the deployment reaches a terminal state. The
 			// 10-min backstop below still fires if something hangs.
-			if d2, err := s.store.DeploymentByID(r.Context(), id); err == nil &&
-				(d2.Status == state.DeployLive || d2.Status == state.DeployFailed) {
-				_, _ = fmt.Fprintf(w, "event: status\ndata: {\"status\":%q}\n\n", d2.Status)
-				if flusher != nil {
-					flusher.Flush()
+			//
+			// ADR-117 §3: same poll also diffs `stage_state` and
+			// emits `event: stage` for any new entries. The
+			// per-connection `announced` map dedupes across ticks;
+			// the jsonb `current` is read every poll so we never
+			// miss an in-flight stage flip even if the subscriber
+			// raced ahead. The terminal `DeployFailed` flip is
+			// covered by imaged's `markDeployFailed` (handler.go:
+			// 2371) and builderd's `markFailed` (builderd.go:653)
+			// — both call `AppendDeploymentStage(from==to, reason)`
+			// which stamps the active row as failed before this
+			// poll sees it. The terminal `DeployLive` flip is
+			// covered by imaged's `MarkDeploymentLive` (handler.go:
+			// 2240) which appends `snapshot_prepare → readiness`.
+			if d2, err := s.store.DeploymentByID(r.Context(), id); err == nil {
+				if d2.Status == state.DeployLive || d2.Status == state.DeployFailed {
+					emitStageDiff(w, flusher, d2.StageState, announced, &lastStageStateRaw)
+					_, _ = fmt.Fprintf(w, "event: status\ndata: {\"status\":%q}\n\n", d2.Status)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					return
 				}
-				return
+				emitStageDiff(w, flusher, d2.StageState, announced, &lastStageStateRaw)
 			}
 		case <-ticker.C:
 			// heartbeat — keeps idle proxies from dropping the
@@ -4212,6 +4725,110 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			}
 			return
 		}
+	}
+}
+
+// stage emission status enum. Same shape as the wire JSON
+// payload (cmd/apid/handlers_ext.go::emitStageFrame) and the
+// CLI renderer (cmd/gregale/deploy_stages.go::stageStatus*).
+// Local to this file so the goconst tripwire (3+ occurrences)
+// stays under the threshold for the cross-file "completed"
+// literal — every reference here is via the const.
+const (
+	stageStatusInProgress = "in_progress"
+	stageStatusCompleted  = "completed"
+	stageStatusFailed     = "failed"
+)
+
+// emitStageDiff diffs the jsonb stage_state against the per-connection
+// `announced` set and writes one `event: stage` SSE frame for each
+// stage that has not yet been emitted on this connection.
+//
+// ADR-117 §3 wire shape:
+//
+//	event: stage
+//	data: {"name":"<StageName>","started_at":"<RFC3339Nano>","duration_ms":<int64>,"status":"in_progress"|"completed"|"failed"[,"reason":"<string>"]}
+//
+// `announced` is a 3-state tracking set:
+//   - absent: never seen this stage
+//   - "in_progress": emitted the in_progress frame for this stage
+//   - "completed":   emitted the terminal frame (completed/failed) for
+//     this stage
+//
+// We can't fold the two into one boolean — a stage needs both an
+// in_progress frame and a terminal frame across the connection's
+// lifetime, and conflating them drops the terminal one.
+//
+// `lastRaw` is an in-loop scratch buffer that lets us avoid a jsonb
+// re-decode when the row hasn't changed since the last tick. The
+// buffer is intentionally per-connection (not shared across SSE
+// subscribers) because each subscriber needs its own dedup state;
+// shared state would emit one subscriber's frames to all of them.
+func emitStageDiff(w http.ResponseWriter, flusher http.Flusher, raw json.RawMessage, announced map[state.StageName]string, lastRaw *[]byte) {
+	if len(raw) == 0 {
+		return
+	}
+	// Cheap byte-equality short-circuit: identical row, no work.
+	if *lastRaw != nil && string(*lastRaw) == string(raw) {
+		return
+	}
+	*lastRaw = append((*lastRaw)[:0], raw...)
+	var ss state.StageState
+	if err := json.Unmarshal(raw, &ss); err != nil || ss.Current == "" {
+		return
+	}
+	// 1) walk history for any terminal entries we haven't emitted yet.
+	// History is append-only by AppendDeploymentStage so we never
+	// replay an old row; the dedup is purely for late subscribers
+	// who joined mid-deploy and for the case where imaged stamps a
+	// failure after the in_progress frame was already emitted.
+	for _, item := range ss.History {
+		if announced[item.Name] == stageStatusCompleted {
+			continue
+		}
+		st := item.Status
+		if st == "" {
+			st = stageStatusCompleted
+		}
+		emitStageFrame(w, flusher, item, st, item.DurationMs, item.Reason)
+		announced[item.Name] = stageStatusCompleted
+	}
+	// 2) in_progress frame for the active row, only the first time we
+	// see it on this connection. imaged's transitionWithStage
+	// appends the OUTGOING stage to history before flipping current;
+	// the SSE consumer therefore sees the completed frame for the
+	// prior stage AND the in_progress frame for the new stage on the
+	// same tick — that ordering is intentional (the customer reads
+	// "stage X finished 1.2s ago, stage Y is now in flight").
+	if announced[ss.Current] == "" {
+		startedAt := ss.CurrentStartedAt // already *time.Time
+		emitStageFrame(w, flusher, state.StageStateItem{
+			Name:      ss.Current,
+			StartedAt: startedAt,
+		}, "in_progress", 0, "")
+		announced[ss.Current] = "in_progress"
+	}
+}
+
+// emitStageFrame writes one `event: stage` SSE frame. Mirrors the
+// fmt.Fprintf pattern used by the status arm at lines 4218-4221. The
+// hand-format keeps the wire shape grep-able from cmd/gregale/sse
+// decoder tests and avoids pulling in apislogs.WriteEvent (out of
+// scope for ADR-117).
+func emitStageFrame(w http.ResponseWriter, flusher http.Flusher, item state.StageStateItem, status string, durationMs int64, reason string) {
+	payload := map[string]any{
+		"name":        string(item.Name),
+		"started_at":  item.StartedAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms": durationMs,
+		"status":      status,
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	encoded, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(w, "event: stage\ndata: %s\n\n", encoded)
+	if flusher != nil {
+		flusher.Flush()
 	}
 }
 

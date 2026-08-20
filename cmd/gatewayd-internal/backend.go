@@ -248,6 +248,14 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		PublicAuth: gateway.PublicAuthConfig{
 			Mode:        app.PublicAuthMode,
 			BasicSealed: app.PublicAuthBasicSealed,
+			// ADR-118: hydrate the per-app ingress IP
+			// allowlist. The slice is consulted by
+			// applyIngressIPAllowlist ONLY when Mode ==
+			// publicAuthModeIPAllowlist; for other modes
+			// the slice is nil and ignored. Live updates
+			// ride on the existing NotifyAppChanged
+			// channel — no extra RPC.
+			IPAllowlist: app.PublicAuthIPAllowlist,
 		},
 	}, true, nil
 }

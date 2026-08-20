@@ -303,6 +303,22 @@ func (a *auditor) Emit(ctx context.Context, kind string, accountID *string, data
 	a.inner.Emit(ctx, kind, accountID, data)
 }
 
+// EmitAs is the per-call-actor twin of Emit (issue #606 /
+// SAFE-RELEASES-E.1). Used only by the four deployment-path
+// audit emit sites (cmd/apid/handlers_sidecars.go,
+// handlers_source_tarball.go, handlers_source_ref.go,
+// deploy_inputs.go::createDeploymentMultipart). The actor
+// string is the resolved "<via>:<id>" form from
+// cmd/apid/deploy_actor.resolvedActorString. Mirrors
+// pkg/audit.Auditor.EmitAs — same contract, same nil-receiver
+// safety.
+func (a *auditor) EmitAs(ctx context.Context, actor, kind string, accountID *string, data map[string]any) {
+	if a == nil || a.inner == nil {
+		return
+	}
+	a.inner.EmitAs(ctx, actor, kind, accountID, data)
+}
+
 // EmitFailedLogin is the handler-side entry point for the
 // failed-login audit row (issue #286). Non-blocking — the channel
 // write either succeeds or the row is dropped into

@@ -1851,8 +1851,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1874,7 +1874,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		publicAuthMode = AppPublicAuthModeOpen
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), cidrPrefixesToArray(app.PublicAuthIPAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
@@ -3058,7 +3058,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- matches edge_rules_cors.allow_origins
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
-				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end
+				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end,
+			   -- ADR-118: per-app ingress IP allowlist. Same Set-bit
+			   -- pattern as EgressAllowlist above (SetPublicAuthIPAllowlist
+			   -- distinguishes "don't touch" from "explicit empty"). The
+			   -- DB trigger at migrations/00308_apps_public_auth_ip_allowlist.sql
+			   -- rejects non-v4/v6 families and masklen /0 (defence in
+			   -- depth on top of the apid parse step).
+				   public_auth_ip_allowlist = case when $57 then $58::cidr[] else public_auth_ip_allowlist end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -3156,7 +3163,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// explicit-empty-must-mean-something rule as
 		// EgressAllowlist).
 		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
-		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins),
+		// ADR-118: per-app ingress IP allowlist. Same nil-pointer +
+		// Set-bit convention as EgressAllowlist above. cidrPrefixesToArray
+		// renders an empty slice as '{}' (the column DEFAULT) so a
+		// PATCH with an empty IPAllowlist + SetPublicAuthIPAllowlist=true
+		// clears the column, not the Set bit.
+		p.SetPublicAuthIPAllowlist, cidrPrefixesToArray(derefPrefixes(p.PublicAuthIPAllowlist)))
 	return scanApp(row)
 }
 
@@ -3706,15 +3719,15 @@ func (s *PgStore) ApplyProjectPlan(
 		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
-		     status, manifest, min_instances, egress_allowlist,
+		     status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist,
 		     project_id, root_dir, workload_name, workload_class, start_command,
 			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
-		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11::cidr[],
+		        $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
-			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
+			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist), cidrPrefixesToArray(a.PublicAuthIPAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
 			// Issue #272 / ADR-094: preview columns default to
@@ -4288,8 +4301,10 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          status,
 		                          min_instances,
 		                          traffic_percent,
-		                          scope)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'))
+		                          scope,
+		                          deployed_by_user_id, deployed_via, deployed_from_ip, pusher_login)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'),
+		         nullif($21, '')::uuid, coalesce(nullif($22, ''), 'api'), nullif($23, '')::inet, nullif($24, ''))
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -4306,7 +4321,19 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		// Scope is passed through verbatim. Mirrors the handler's
 		// scope-default collapse so pgstore never inserts a literal
 		// '' (which would fail the deployments_scope_shape CHECK).
-		d.Scope)
+		d.Scope,
+		// Issue #606 — actor attribution columns (migration 00303).
+		// Each of the four empty-string Go values collapses to NULL
+		// via nullif() so an "anonymous / pre-FK / GitHub-push"
+		// caller (or a Go-zero struct from a test) never inserts
+		// a literal '' that would trip the deployments_deployed_via
+		// CHECK or the FK's NOT-VALID-UUID parse path. The
+		// coalesce on deployed_via is the backstop for the
+		// NOT NULL DEFAULT 'api' contract — a caller that omits
+		// DeployedVia entirely (empty string after the nullif)
+		// still gets 'api' rather than NULL, so pre-feature rows
+		// stay valid without a backfill.
+		d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -4415,6 +4442,73 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
+}
+
+// GetDeploymentByIDScopedToSuperseded returns the deployment only if it
+// (a) belongs to appID and (b) has status='superseded'. Used by SAFE-RELEASES-G
+// (issue #976, PR-G) to let callers rollback to a specific historical
+// deployment rather than only the most-recent superseded one.
+//
+// Returns ErrNoRollbackTarget if no row matches (deployment missing or
+// belongs to a different app). Returns ErrRollbackTargetAlreadyLive if
+// the row exists and belongs to appID but its status is not 'superseded'
+// (e.g. status='live' means caller is asking to "rollback" to the
+// already-current deployment — rejected explicitly rather than silently
+// no-op'd, per the SAFE-RELEASES-G plan).
+//
+// Uses scanDeploymentWithRootfs (matches DeploymentByID) so the caller has
+// the rootfs_path/key/bytes needed for downstream wake and audit. The
+// rollback handler deliberately does NOT add a "snapshot must exist" gate
+// here — per ADR-005 ("cold boot must always work") and CLAUDE.md invariant
+// #3, the wake path cold-boots from the returned rootfs when the rollback
+// target's snapshot is missing/stale, so this loader is purely a state
+// lookup and intentionally not coupled to snapshot retention.
+func (s *PgStore) GetDeploymentByIDScopedToSuperseded(ctx context.Context, appID, deploymentID string) (Deployment, error) {
+	if appID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty appID")
+	}
+	if deploymentID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty deploymentID")
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments where id = $1 and app_id = $2`,
+		deploymentID, appID)
+	d, scanErr := scanDeploymentWithRootfs(row)
+	if scanErr != nil {
+		if errors.Is(scanErr, ErrNotFound) {
+			return Deployment{}, fmt.Errorf("state: rollback target %q for app %q: %w", deploymentID, appID, ErrNoRollbackTarget)
+		}
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: %w", scanErr)
+	}
+	if d.Status != DeploySuperseded {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q has status %q: %w",
+			deploymentID, appID, d.Status, ErrRollbackTargetAlreadyLive)
+	}
+	return d, nil
+}
+
+// HasSnapshotHistory reports whether the snapshots table contains any
+// row (stale or non-stale) for the deployment. Used by the rollback
+// handler (SAFE-RELEASES-G) to gate the snapshot-GC race check: if the
+// deployment has never had a snapshot (typical for test-only or
+// freshly-created deployments that haven't been snapshotted yet), a
+// "no non-stale snapshot" lookup is not meaningful — the handler skips
+// the race check. If the deployment DOES have snapshot history but no
+// non-stale row remains, the GC race is real and the handler returns
+// ErrRollbackTargetSnapshotGone (409).
+func (s *PgStore) HasSnapshotHistory(ctx context.Context, deploymentID string) (bool, error) {
+	if deploymentID == "" {
+		return false, fmt.Errorf("state: has snapshot history: empty deploymentID")
+	}
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from snapshots where deployment_id = $1)`,
+		deploymentID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("state: has snapshot history: %w", err)
+	}
+	return exists, nil
 }
 
 // ListAllDeployments returns every non-deleted deployment (parent
@@ -4994,6 +5088,275 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return s.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
+// AppendDeploymentStage (ADR-117, migration 00302) atomically
+// appends a stage transition to deployments.stage_state.
+//
+// Shape:
+//   - On entry (from != to): close the previous `current` row into
+//     `history` with `ended_at = at`, `duration_ms = (at - current_started_at)`,
+//     and `status = "completed"`. Then set the new `current` to `to`
+//     with `current_started_at = at`.
+//   - On failure (from == to): overwrite the active `current` row's
+//     `status` to `"failed"` and stamp `reason`. `history` is
+//     untouched — the active row stays active until a future
+//     `from != to` call closes it.
+//
+// Implementation: read-modify-write at the Go layer. The existing
+// `UpdateDeploymentStatus` (and `transition` chokepoint at
+// pkg/imaged/handler.go:2349) is itself a bare UPDATE with no
+// per-deployment mutex — concurrent transitions are "last write
+// wins" by design, so this method preserves that same posture. A
+// future PR could move the merge into a single SQL expression
+// with `jsonb_set + jsonb_build_array`, but the Go-side shape is
+// easier to reason about and matches the codebase's existing
+// transition-write pattern.
+//
+// The from / to StageName vocabulary is enforced at the schema
+// layer via `deployments_stage_state_current_check`
+// (migrations/00302_deployments_stage_state.sql) so a typo from a
+// future contributor lands as SQLSTATE 23514 at the storage layer
+// before it can leak as a wire-frame typo on `event: stage {name}`.
+// Stage-state status enum (ADR-117 §3). Local to this file so the
+// goconst tripwire (3+ occurrences across the codebase) stays under
+// the threshold for "failed" — every reference here is via the
+// const.
+const (
+	stageHistoryStatusCompleted = "completed"
+	stageHistoryStatusFailed    = "failed"
+)
+
+func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error) {
+	existing, err := s.DeploymentByID(ctx, id)
+	if err != nil {
+		return Deployment{}, err
+	}
+	var state StageState
+	if len(existing.StageState) > 0 {
+		if err := json.Unmarshal(existing.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("AppendDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	// Sanity: refuse if the row's `current` doesn't match `from`.
+	// The caller is the transition chokepoint — drift here means a
+	// future transition was queued behind a stale read and the
+	// active row has already moved. Bail with ErrNotFound rather
+	// than silently re-write history with a phantom entry.
+	if state.Current != from {
+		// Schema default for stage_state.current is
+		// "source_download" (migrations/00302). A pre-existing row
+		// that came through CreateDeployment without an explicit
+		// StageState has Current == "" in the decoded view — but
+		// the JSONB column on the Postgres row has the default
+		// applied by the migration's DEFAULT clause. The
+		// read-modify-write unmarshals to "" in our typed view
+		// because the test fixture (memstore) doesn't run the
+		// migration; the production path is fine. We treat the
+		// empty string as the default so first-transition calls
+		// don't surface a spurious ErrNotFound.
+		if state.Current != "" {
+			return Deployment{}, ErrNotFound
+		}
+		if from != StageSourceDownload {
+			return Deployment{}, ErrNotFound
+		}
+		state.Current = StageSourceDownload
+	}
+	// Forward transition vs. failure-stamp. The two cases dispatch
+	// on `from == to` (sentinel). After the review-cluster fix the
+	// failure path is owned by `MarkDeploymentStageFailed` (below);
+	// `from == to` here is a programming error and we surface it
+	// loudly rather than silently mutating history[len-1] (the
+	// previously-closed stage) which the previous version did.
+	if from == to {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: from==to is reserved for MarkDeploymentStageFailed (deployment=%s, stage=%s)", id, from)
+	}
+	// Normal transition: close the active row, advance.
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	startedAt := at
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       from,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = to
+	state.CurrentStartedAt = &startedAt
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
+}
+
+// derefTime dereferences *time.Time to time.Time, returning the
+// zero value when the pointer is nil. Used by
+// AppendDeploymentStage to flatten the optional
+// current_started_at into the history entry's started_at — the
+// first transition writes `started_at` from the migration's seed
+// default. Pair with ptrTime to round-trip back to *time.Time
+// when assigning into StageStateItem.StartedAt so the JSON wire
+// shape emits JSON null (not the literal "0001-01-01T00:00:00Z"
+// string time.Time{}.MarshalJSON would otherwise produce).
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
+// ptrTime returns &t when t is non-zero, nil otherwise. Used to
+// round-trip a derefTime result into the StageStateItem.StartedAt
+// *time.Time field so the JSON wire shape preserves the null-vs-set
+// distinction — time.Time{} would otherwise marshall as the literal
+// "0001-01-01T00:00:00Z" string and break any consumer that treats
+// "no start time" as null.
+func ptrTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// MarkDeploymentStageFailed stamps the in-flight `state.Current`
+// stage with status="failed" and the caller-supplied reason. The
+// active stage is recorded as a NEW history entry (with status
+// "failed") so the SSE consumer emits one final frame for the
+// failing stage rather than overwriting the previously-closed
+// stage (the previous "from == to" overload did the latter, which
+// was the wire-shape bug the review cluster surfaced).
+//
+// Returns ErrNotFound when the deployment row does not exist or
+// when state.Current is the zero value (no stage ever started).
+func (s *PgStore) MarkDeploymentStageFailed(ctx context.Context, id string, at time.Time, reason string) (Deployment, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `select stage_state from deployments where id = $1`, id).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: read stage_state for %s: %w", id, err)
+	}
+	var state StageState
+	if uerr := json.Unmarshal(raw, &state); uerr != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: decode stage_state for %s: %w", id, uerr)
+	}
+	if state.Current == "" {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	// The active stage is moved into history as a "failed" entry so
+	// the wire shape is consistent: every stage that ever ran is in
+	// history; the customer's ticker walks history in order. The
+	// active row is cleared (Current = "") so the deployment row
+	// reflects "no stage in flight" — the status column carries the
+	// DeployFailed terminal value, set by the caller's separate
+	// transition() call.
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusFailed,
+		Reason:     reason,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
+}
+
+// CloseDeploymentStage — pgstore mirror of the Store contract.
+// See pkg/state/store.go::CloseDeploymentStage for the docblock.
+// Closes the in-flight `state.Current` stage into history with
+// status="completed" so the customer-facing wire shape carries a
+// `duration_ms` for the readiness stage on a successful deploy.
+func (s *PgStore) CloseDeploymentStage(ctx context.Context, id string, name StageName, at time.Time) (Deployment, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `select stage_state from deployments where id = $1`, id).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: read stage_state for %s: %w", id, err)
+	}
+	var state StageState
+	if uerr := json.Unmarshal(raw, &state); uerr != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: decode stage_state for %s: %w", id, uerr)
+	}
+	if state.Current == "" || state.Current != name {
+		// Either nothing in flight, or the caller asked to close a
+		// stage that isn't the active one. Both are programming
+		// errors — the caller (imaged.MarkDeploymentLive) drives
+		// the close immediately after the snapshot_prepare →
+		// readiness transition, so the active row is always
+		// `readiness` at this point. Surface ErrNotFound so the
+		// caller logs a warning rather than silently dropping the
+		// stamp.
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
+}
+
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {
 	// Issue #96 / ADR-025 axis 2 (PR #116): rootfs_key is the canonical
 	// StorageBackend key (e.g. "apps/<slug>/<depID>.ext4") schedd carries
@@ -5208,6 +5571,45 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 		  where id = $1
 		  returning `+deploymentSelectColumnsWithRootfs,
 		id, nullString(message), nullString(code))
+	return scanDeploymentWithRootfs(row)
+}
+
+// SetDeploymentFailedEx is the error-explanations cluster (spec §6.4
+// amendment 1) extension of SetDeploymentFailed. It writes the four
+// customer-facing prose fields (error_hint, error_why, error_fix,
+// error_relevant_logs) alongside error_code so post-mortem retrieval
+// via `gregale inspect <slug> --errors` surfaces the same hint/why/
+// fix/relevant_logs block the deploy-time Problem emitted. Empty
+// strings on the prose fields are normalised to NULL via nullString
+// (mirroring the error_code column shape from migration 00021).
+//
+// error_relevant_logs is passed as a jsonb-encoded byte slice via
+// logExcerptsJSON — pgx's jsonb codec writes []api.LogExcerpt
+// cleanly. Empty input maps to NULL so post-migration rows that
+// never wrote explanation prose stay NULL on this column. The
+// SELECT projection in deploymentSelectColumnsWithRootfs does NOT
+// coalesce error_relevant_logs — pgx scans the column into a
+// []api.LogExcerpt slice directly, with NULL → nil.
+//
+// Idempotent on (status='failed') rows: a redeploy after a fix
+// overwrites all four columns. The legacy SetDeploymentFailed
+// (above) stays in place for callers that have only the code +
+// message available (the imaged pre-build hook is the canonical
+// pre-cluster caller).
+func (s *PgStore) SetDeploymentFailedEx(
+	ctx context.Context, id, code, message, hint, why, fix string, logs []api.LogExcerpt,
+) (Deployment, error) {
+	logsJSON := logExcerptsJSON(logs)
+	row := s.pool.QueryRow(ctx,
+		`update deployments
+		    set status = 'failed', error = $2, error_code = $3,
+		        error_hint = $4, error_why = $5, error_fix = $6,
+		        error_relevant_logs = $7
+		  where id = $1
+		  returning `+deploymentSelectColumnsWithRootfs,
+		id, nullString(message), nullString(code),
+		nullString(hint), nullString(why), nullString(fix),
+		logsJSON)
 	return scanDeploymentWithRootfs(row)
 }
 
@@ -5642,6 +6044,190 @@ func (s *PgStore) DeleteCustomDomain(ctx context.Context, domain string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// --- domain_doctor_observations (ADR-120) ----------------------
+
+// UpsertDoctorObservation writes (or refreshes) the
+// per-domain observation row. The poller is the sole
+// writer. ON CONFLICT (domain) DO UPDATE means a second
+// pass overwrites every field; the handler reads the
+// latest row, so "race" between poller and handler
+// is benign (the handler may see a slightly older row
+// or a slightly newer one, both are correct).
+//
+// The COALESCE on $2 keeps the surface_id stable across
+// passes: the poller enumerates both legacy custom_domains
+// (surface_id=NULL) and tenant_hostnames (surface_id set);
+// passing NULL on a row that already has a non-null
+// surface_id would un-anchor the row from its surface.
+// The legacy case (surface_id="" passed in) is translated
+// to nil at the store boundary so the column gets NULL.
+func (s *PgStore) UpsertDoctorObservation(ctx context.Context, obs DomainDoctorObservation) error {
+	var surfaceID any
+	if obs.SurfaceID != "" {
+		surfaceID = obs.SurfaceID
+	}
+	var caaPermits any
+	if obs.CAAPermits != nil {
+		caaPermits = *obs.CAAPermits
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO domain_doctor_observations (
+			domain, surface_id, observed_at,
+			dns_record_found, points_to_gregale, caa_permits, ipv6_conflict,
+			observed_target, observed_aaaa, caa_observed,
+			cert_state, cert_not_after, last_error,
+			dns_checked_at, cert_checked_at
+		) VALUES (
+			$1, $2, $3,
+			$4, $5, $6, $7,
+			$8, $9, $10,
+			$11, $12, $13,
+			$14, $15
+		)
+		ON CONFLICT (domain) DO UPDATE SET
+			surface_id        = COALESCE(EXCLUDED.surface_id, domain_doctor_observations.surface_id),
+			observed_at       = EXCLUDED.observed_at,
+			dns_record_found  = EXCLUDED.dns_record_found,
+			points_to_gregale = EXCLUDED.points_to_gregale,
+			caa_permits       = EXCLUDED.caa_permits,
+			ipv6_conflict     = EXCLUDED.ipv6_conflict,
+			observed_target   = EXCLUDED.observed_target,
+			observed_aaaa     = EXCLUDED.observed_aaaa,
+			caa_observed      = EXCLUDED.caa_observed,
+			cert_state        = EXCLUDED.cert_state,
+			cert_not_after    = EXCLUDED.cert_not_after,
+			last_error        = EXCLUDED.last_error,
+			dns_checked_at    = EXCLUDED.dns_checked_at,
+			cert_checked_at   = EXCLUDED.cert_checked_at
+	`, obs.Domain, surfaceID, obs.ObservedAt,
+		obs.DNSRecordFound, obs.PointsToGregale, caaPermits, obs.IPv6Conflict,
+		nullableStr(obs.ObservedTarget), nullableStr(obs.ObservedAAAA), nullableStr(obs.CAAObserved),
+		obs.CertState, nullableTime(obs.CertNotAfter), nullableStr(obs.LastError),
+		nullableTime(obs.DNSCheckedAt), nullableTime(obs.CertCheckedAt))
+	return err
+}
+
+// GetDoctorObservation reads the latest row for a domain.
+// Returns ErrNotFound when the poller has not yet written
+// one — the handler treats this as stale:true and triggers
+// a synchronous re-probe. Returns the row otherwise; the
+// caller is responsible for the stale-check against
+// observed_at vs FAAS_DOMAIN_DOCTOR_TTL_SECONDS.
+func (s *PgStore) GetDoctorObservation(ctx context.Context, domain string) (DomainDoctorObservation, error) {
+	var obs DomainDoctorObservation
+	var surfaceID, observedTarget, observedAAAA, caaObserved, lastError *string
+	var certNotAfter, dnsCheckedAt, certCheckedAt *time.Time
+	var caaPermits *bool
+	row := s.pool.QueryRow(ctx, `
+		SELECT
+			domain,
+			surface_id::text,
+			observed_at,
+			dns_record_found, points_to_gregale, caa_permits, ipv6_conflict,
+			observed_target, observed_aaaa, caa_observed,
+			cert_state, cert_not_after, last_error,
+			dns_checked_at, cert_checked_at
+		FROM domain_doctor_observations
+		WHERE domain = $1
+	`, domain)
+	err := row.Scan(
+		&obs.Domain, &surfaceID, &obs.ObservedAt,
+		&obs.DNSRecordFound, &obs.PointsToGregale, &caaPermits, &obs.IPv6Conflict,
+		&observedTarget, &observedAAAA, &caaObserved,
+		&obs.CertState, &certNotAfter, &lastError,
+		&dnsCheckedAt, &certCheckedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return obs, ErrNotFound
+		}
+		return obs, err
+	}
+	if surfaceID != nil {
+		obs.SurfaceID = *surfaceID
+	}
+	if observedTarget != nil {
+		obs.ObservedTarget = *observedTarget
+	}
+	if observedAAAA != nil {
+		obs.ObservedAAAA = *observedAAAA
+	}
+	if caaObserved != nil {
+		obs.CAAObserved = *caaObserved
+	}
+	if lastError != nil {
+		obs.LastError = *lastError
+	}
+	if caaPermits != nil {
+		obs.CAAPermits = caaPermits
+	}
+	if certNotAfter != nil {
+		obs.CertNotAfter = *certNotAfter
+	}
+	if dnsCheckedAt != nil {
+		obs.DNSCheckedAt = *dnsCheckedAt
+	}
+	if certCheckedAt != nil {
+		obs.CertCheckedAt = *certCheckedAt
+	}
+	return obs, nil
+}
+
+// ListAllCustomDomainsForDoctor returns the union of
+// custom_domains.domain and tenant_hostnames.hostname
+// so the poller has a single enumeration seam. The poller
+// does NOT need the app_id or surface_id at enumeration
+// time — those are joined lazily inside the per-domain
+// probe pass to avoid carrying app/surface state on the
+// poller goroutine.
+//
+// UNION ALL (not UNION) so Postgres skips the sort+hash
+// dedup pass: the consumer is runDoctorForDomain, which
+// upserts on domain_doctor_observations keyed by citext,
+// so a duplicate row is a no-op. Dedup is the caller's
+// job (the citext PK on the upsert target), not the
+// query's.
+func (s *PgStore) ListAllCustomDomainsForDoctor(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT domain FROM custom_domains
+		UNION ALL
+		SELECT hostname FROM tenant_hostnames
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// nullableStr returns nil for "" so the doctor's empty
+// string columns translate to SQL NULL. A present-but-
+// empty value is functionally equivalent to NULL (the
+// handler treats "" and NULL identically when rendering).
+func nullableStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// nullableTime returns nil for the zero time so the
+// doctor's unset timestamps translate to SQL NULL.
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }
 
 // --- crons -------------------------------------------------------------------
@@ -6435,6 +7021,155 @@ func (s *PgStore) GetEdgeRuleByID(ctx context.Context, id string) (EdgeRule, err
 	row := s.pool.QueryRow(ctx,
 		`select `+edgeRuleSelectCols+` from edge_rules where id = $1`, id)
 	return scanEdgeRule(row)
+}
+
+// corsPresetSelectCols is the single source of column order for
+// cors_presets. The select clause above is the contract — every
+// SELECT against cors_presets lists these columns in this order, and
+// the SELECT statement binds Scan's positional arguments against
+// this list. A future column add lands here first, in the same
+// commit, so a SELECT-write drift cannot silently swallow a column.
+//
+// Ordering matches the table definition in
+// migrations/00294_cors_presets.sql (column list 1:1). nullable
+// pointers (Description, AppID) come before the NOT NULL fields so
+// Scan can target them.
+const corsPresetSelectCols = `id, account_id, app_id, name, description,
+       allow_origins, allow_methods, allow_headers, expose_headers,
+       allow_credentials, max_age_seconds, created_at, updated_at`
+
+// scanCorsPreset reads a single row. ErrNotFound on no-rows; raw
+// error otherwise. All non-uuid / non-text[] fields are scanned
+// directly; the text[] fields are pulled into []string by pgx's
+// built-in array codec (registered on the pool's AfterConnect
+// hook).
+func scanCorsPreset(row pgx.Row) (CorsPreset, error) {
+	r, err := scanCorsPresetCols(row.Scan)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CorsPreset{}, ErrNotFound
+		}
+		return CorsPreset{}, err
+	}
+	return r, nil
+}
+
+// scanCorsPresets reads every row from a Rows iterator. The caller
+// owns the rows.Close() lifetime — this helper only walks the
+// iterator.
+func scanCorsPresets(rows pgx.Rows) ([]CorsPreset, error) {
+	var out []CorsPreset
+	for rows.Next() {
+		r, err := scanCorsPresetCols(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// scanCorsPresetCols is the column-ordered Scan shared by both the
+// single-row and Rows-iterator paths. Keeping a single function
+// guarantees the SELECT statement, the const above, and the
+// positional Scan arguments can never drift apart.
+func scanCorsPresetCols(scan func(...any) error) (CorsPreset, error) {
+	var (
+		r             CorsPreset
+		appID         *string
+		description   *string
+		allowOrigins  []string
+		allowMethods  []string
+		allowHeaders  []string
+		exposeHeaders []string
+	)
+	if err := scan(
+		&r.ID, &r.AccountID, &appID, &r.Name, &description,
+		&allowOrigins, &allowMethods, &allowHeaders, &exposeHeaders,
+		&r.AllowCredentials, &r.MaxAgeSeconds, &r.CreatedAt, &r.UpdatedAt,
+	); err != nil {
+		return CorsPreset{}, err
+	}
+	if appID != nil {
+		r.AppID = *appID
+	}
+	if description != nil {
+		r.Description = *description
+	}
+	// pgx decodes a DB empty text[] as a Go nil []string. The
+	// merge helper treats len==0 as "take the other side", so a
+	// round-trip of a preset that deliberately shipped no
+	// headers would silently inherit the rule's value. Coalesce
+	// nil to an empty slice so the round-trip is identity.
+	r.AllowOrigins = nilToEmpty(allowOrigins)
+	r.AllowMethods = nilToEmpty(allowMethods)
+	r.AllowHeaders = nilToEmpty(allowHeaders)
+	r.ExposeHeaders = nilToEmpty(exposeHeaders)
+	return r, nil
+}
+
+// nilToEmpty coalesces a Go nil []string to an empty slice. Used
+// at the pgx scan boundary so the round-trip of an empty text[]
+// column is identity (the DB default '{}' reads back as a Go nil
+// slice; callers cannot distinguish nil from [] otherwise).
+func nilToEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// ListCorsPresetsForAccount returns every preset the account owns.
+// Both account-wide (app_id IS NULL) and app-scoped (app_id = $2)
+// presets are returned so the gatewayd compile path can apply the
+// per-app overlay from a single round trip. The (account_id, name)
+// ordering matches the deterministic cache key the compile path
+// hashes — keeping the order stable lets the gatewayd side compute
+// a content hash for "no change since last refresh" without
+// re-sorting.
+func (s *PgStore) ListCorsPresetsForAccount(ctx context.Context, accountID string) ([]CorsPreset, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 order by app_id NULLS FIRST, name asc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCorsPresets(rows)
+}
+
+// ListCorsPresetsForApp returns the app-scoped presets for one
+// app, scoped to the caller's account. (account-wide presets —
+// app_id IS NULL — are not returned here; the compile path merges
+// them via ListCorsPresetsForAccount + ListCorsPresetsForApp.)
+// accountID is defense-in-depth: the apps row is already FK-scoped
+// to one account so a WHERE on app_id alone is sufficient, but the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+func (s *PgStore) ListCorsPresetsForApp(ctx context.Context, accountID, appID string) ([]CorsPreset, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 and app_id = $2 order by name asc`, accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCorsPresets(rows)
+}
+
+// GetCorsPresetByID returns one preset scoped to the caller's
+// account or ErrNotFound. The account_id predicate is in the WHERE
+// clause so a cross-tenant lookup returns ErrNotFound (the
+// pgx row.Scan errors on no rows), never a row from another
+// tenant. The compile path uses this to resolve the preset_id
+// stamped on a kind=cors rule; PR-B's apid CRUD surface also
+// calls this and benefits from the same tenancy-at-the-boundary
+// guarantee.
+func (s *PgStore) GetCorsPresetByID(ctx context.Context, accountID, id string) (CorsPreset, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 and id = $2`, accountID, id)
+	return scanCorsPreset(row)
 }
 
 // UpdateEdgeRule coalesces the optional fields onto edge_rules. The
@@ -11491,26 +12226,39 @@ func (s *PgStore) ListAllAppSecrets(ctx context.Context, accountID, appID string
 }
 
 // ListAppSecretsForAccount joins apps + app_secrets on account_id
-// (issue #393). The cursor is the (app_slug, key) pair — the
-// handler emits "<slug>|<key>" and the SQL splits it back via
-// split_part. Order is (app_slug ASC, key ASC) so the cursor walk
-// is monotonic. Each row carries the app_slug the per-app path
-// doesn't (the URL slug is the path parameter there).
+// (issue #393). The cursor is the (app_slug, scope, key) triple —
+// after PR-A's PK widening to (app_id, scope, key), the same
+// (slug, key) at multiple scopes is no longer unique, so the
+// cursor MUST include scope to fence rows that would otherwise
+// be dropped or duplicated (e.g. (foo,default,API_KEY) and
+// (foo,prod,API_KEY) on a limit=2 page).
+//
+// The handler emits "<slug>|<scope>|<key>" and the SQL splits it
+// back via split_part. Order is (app_slug ASC, scope ASC, key ASC)
+// so the cursor walk is monotonic and the row-by-row comparison
+// in the WHERE clause is the same sort key. Each row carries the
+// app_slug the per-app path doesn't (the URL slug is the path
+// parameter there).
 //
 // Cross-account isolation is the JOIN on apps.account_id = $1 — the
 // SQL is the only IDOR guard. Returns nil slice (not error) when
 // the account has no secrets.
+//
+// ADR-092 PR-B: pre-PR-B the cursor was just (slug, key) which
+// silently dropped the trailing rows when a customer had the
+// same key at multiple scopes. The fix widens the cursor model
+// in lockstep with the (slug, scope, key) sort key.
 func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
 	}
 	rows, err := s.pool.Query(ctx,
-		`select s.account_id, s.app_id, a.slug, s.key, s.ciphertext, s.created_at, s.updated_at
+		`select s.account_id, s.app_id, a.slug, s.key, s.scope, s.ciphertext, s.created_at, s.updated_at
 		 from app_secrets s
 		 join apps a on a.id = s.app_id
 		 where s.account_id = $1
-		   and ($2 = '' or (a.slug, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2)))
-		 order by a.slug asc, s.key asc
+		   and ($2 = '' or (a.slug, s.scope, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2), split_part($2, '|', 3)))
+		 order by a.slug asc, s.scope asc, s.key asc
 		 limit $3`, accountID, before, limit)
 	if err != nil {
 		return nil, err
@@ -11519,7 +12267,7 @@ func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string
 	var out []AccountAppSecret
 	for rows.Next() {
 		var r AccountAppSecret
-		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Scope, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -12027,6 +12775,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var typeStr, statusStr string
 	var manifestBytes []byte
 	var allowlistText string
+	var publicAuthIPAllowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
 	// Tier A10 / ADR-088: scratch sink for the overflow_node
@@ -12042,6 +12791,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&publicAuthIPAllowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
 		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
@@ -12145,6 +12895,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
 	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	// ADR-118: per-app ingress IP allowlist. The column projection
+	// is public_auth_ip_allowlist::text (mirroring egress_allowlist
+	// above) so the cidr array round-trips through a stable string
+	// rendering — pgx's native cidr[] decode is fine but the text
+	// projection is consistent with the egress column's treatment
+	// and keeps the scan path single-shape.
+	a.PublicAuthIPAllowlist = cidrTextToPrefixes(publicAuthIPAllowlistText)
 	// scaling_policy: an empty jsonb ('{}'::jsonb, the column
 	// default) round-trips as a non-nil zero-length slice. The
 	// non-empty path is the customer-authored shape from
@@ -12191,6 +12948,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+	public_auth_ip_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
@@ -12304,7 +13062,10 @@ const deploymentSelectColumnsWithRootfs = `
 	id, app_id, coalesce(build_id::text,''), image_digest, kind,
 	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 	coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	status, coalesce(error,''), coalesce(error_code,''),
+	coalesce(error_hint,''), coalesce(error_why,''), coalesce(error_fix,''),
+	error_relevant_logs,
+	created_at,
 	coalesce(source_url,''), coalesce(commit_sha,''),
 	coalesce(override_entrypoint, ARRAY[]::text[]),
 	coalesce(override_cmd, ARRAY[]::text[]),
@@ -12317,7 +13078,9 @@ const deploymentSelectColumnsWithRootfs = `
 	secret_findings, secret_scanned_at,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
-	scope`
+	scope,
+	stage_state,
+	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,'')`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -12335,7 +13098,10 @@ const deploymentSelectColumnsQualified = `
 	d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
 	coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
 	coalesce(d.rootfs_path,''), coalesce(d.rootfs_key,''), coalesce(d.rootfs_bytes,0),
-	d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+	d.status, coalesce(d.error,''), coalesce(d.error_code,''),
+	coalesce(d.error_hint,''), coalesce(d.error_why,''), coalesce(d.error_fix,''),
+	d.error_relevant_logs,
+	d.created_at,
 	coalesce(d.source_url,''), coalesce(d.commit_sha,''),
 	coalesce(d.override_entrypoint, ARRAY[]::text[]),
 	coalesce(d.override_cmd, ARRAY[]::text[]),
@@ -12348,7 +13114,9 @@ const deploymentSelectColumnsQualified = `
 	d.secret_findings, d.secret_scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
-	d.scope`
+	d.scope,
+	d.stage_state,
+	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,'')`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -12400,7 +13168,10 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		rootfsPath, rootfsKey, rootfsBytes,
-		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
+		&statusStr, &d.Error, &d.ErrorCode,
+		&d.ErrorHint, &d.ErrorWhy, &d.ErrorFix,
+		&d.ErrorRelevantLogs,
+		&d.CreatedAt,
 		&d.SourceURL, &d.CommitSHA,
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
@@ -12410,7 +13181,24 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.ScanResult, &scanStatus, &scannedAt,
 		&d.SecretFindings, &d.SecretScannedAt,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
-		&d.Scope); err != nil {
+		&d.Scope,
+		&d.StageState,
+		// Issue #606 — actor attribution columns (migration 00305).
+		// deployed_by_user_id is coalesced to '' in the SELECT
+		// projection above (UUID NULL → '') so the typed-string
+		// destination stays a string field on the struct; the
+		// empty string is the "anonymous / pre-FK / GitHub-push"
+		// sentinel. deployed_via is NOT NULL DEFAULT 'api' so the
+		// SELECT can hand it straight to a plain string field.
+		// deployed_from_ip is coalesced to '' for the same UUID-
+		// style reason (INET NULL → ''). pusher_login is coalesced
+		// to '' for the nullable text reason. The destinations stay
+		// in lockstep with deploymentSelectColumnsWithRootfs; pgx's
+		// "number of field descriptions must equal number of
+		// destinations" panic fires immediately on the next read
+		// path if these two lists drift apart.
+		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin); err != nil {
+
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -12785,6 +13573,19 @@ func scanSnapshot(row pgx.Row) (Snapshot, error) {
 // callers don't need to know about pgerrcode.
 var ErrConflict = errors.New("state: conflict")
 
+// ErrNoRollbackTarget is returned by GetDeploymentByIDScopedToSuperseded when
+// no row matches the (deployment_id, app_id) pair (missing deployment, or
+// deployment belongs to a different app). SAFE-RELEASES-G (issue #976). Maps
+// to API stable code rollback_target_not_found (404).
+var ErrNoRollbackTarget = errors.New("state: no rollback target")
+
+// ErrRollbackTargetAlreadyLive is returned by GetDeploymentByIDScopedToSuperseded
+// when the row exists and belongs to the app but has status != 'superseded'
+// (caller asked to rollback to the already-current deployment). Rejected
+// explicitly rather than silently no-op'd. Maps to API stable code
+// rollback_target_already_live (409).
+var ErrRollbackTargetAlreadyLive = errors.New("state: rollback target is already live")
+
 // ErrInvalidArgument is returned when a Store method receives a
 // required-empty argument (empty account_id, empty hash, etc).
 // Distinct from ErrNotFound so callers can map empty-input bugs to
@@ -12921,6 +13722,35 @@ func nullableOverridePort(p int) any {
 		return nil
 	}
 	return p
+}
+
+// logExcerptsJSON encodes a []api.LogExcerpt as the pgx driver value
+// for the deployments.error_relevant_logs jsonb column. The empty
+// (nil or zero-length) case maps to nil so pgx sends NULL — the
+// column was added by migrations/00290 and pre-cluster rows have no
+// relevant-logs payload. Non-empty slices are JSON-encoded as a
+// compact byte slice so pgx's jsonb codec parses them as a real
+// jsonb array (not as text).
+//
+// Why not notNullEmptyJSONRaw like sidecars: the error_relevant_logs
+// column is jsonb with no NOT NULL constraint (migration 00290), so
+// an empty slice is correctly represented as NULL. The sidecars
+// column has a NOT NULL DEFAULT '[]'::jsonb contract which forces
+// the literal '[]' for empty inputs — different column, different
+// rule.
+func logExcerptsJSON(logs []api.LogExcerpt) any {
+	if len(logs) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(logs)
+	if err != nil {
+		// json.Marshal on a []api.LogExcerpt cannot fail under the
+		// fixed schema (ts/level/source/message are all string), so
+		// this branch is defensive — return nil so the column writes
+		// NULL rather than aborting the deployment-failed path.
+		return nil
+	}
+	return b
 }
 
 // cidrPrefixesToArray renders a Go []netip.Prefix as a pgx driver value
@@ -16168,6 +16998,523 @@ func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff t
 	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
 }
 
+// Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+// The store methods below mirror the cron CreateCronIfUnderQuota /
+// CronByID / UpdateCron / DeleteCron / ListCronsForApp shape so the
+// apid handler can stay symmetric. The schedd-side methods
+// (ClaimTriggerRecords / Mark* / InsertTriggerDeadLetter) live on
+// the same struct and are called by pkg/sched/dispatch_triggers.go
+// (commit #14).
+//
+// Quota enforcement: CreateTriggerIfUnderQuota opens a tx, locks the
+// parent apps row FOR UPDATE, counts existing triggers for app +
+// account under the same lock, and inserts under that lock. The
+// pattern is byte-for-byte the cron CreateCronIfUnderQuota pattern
+// at lines 5431-5511 — same TOCTOU defence, same QuotaError type
+// shape, same per-app + per-account split.
+
+// CreateTriggerIfUnderQuota creates a non-cron trigger (kafka / nats
+// / redis_streams / sqs_compat / queue) under the apps-row FOR
+// UPDATE lock. Returns *TriggerQuotaError when the per-app or
+// per-account cap is reached; ErrNotFound when the app row is gone
+// or already deleted. The cron kind routes through the existing
+// CreateCronIfUnderQuota path because cron needs the crons row + the
+// schedule+path cron-specific schema.
+func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32, brokerPoisonStrategy string, limits api.Limits) (sqlc.Trigger, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent apps row (apps_pkey serves the lock search).
+	var locked int
+	err = tx.QueryRow(ctx,
+		`select 1 from apps where id = $1 and status <> 'deleted' for update`, appID,
+	).Scan(&locked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlc.Trigger{}, ErrNotFound
+		}
+		return sqlc.Trigger{}, fmt.Errorf("state: lock app %s: %w", appID, err)
+	}
+
+	// 2. Per-app count, authoritative under the lock.
+	var appCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from triggers where app_id = $1`, appID,
+	).Scan(&appCount); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: count triggers for app %s: %w", appID, err)
+	}
+	if appCount >= limits.TriggerLimitPerApp {
+		return sqlc.Trigger{}, &TriggerQuotaError{
+			Scope:    TriggerQuotaScopeApp,
+			Limit:    limits.TriggerLimitPerApp,
+			Observed: appCount,
+		}
+	}
+
+	// 3. Per-account count under the same tx. account_id is read off
+	//    the apps row we just locked (no second round-trip).
+	var accountID pgtype.UUID
+	if err := tx.QueryRow(ctx,
+		`select account_id from apps where id = $1`, appID,
+	).Scan(&accountID); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: read account_id for app %s: %w", appID, err)
+	}
+	var accountCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from triggers t
+		 join apps a on a.id = t.app_id
+		 where a.account_id = $1 and a.status <> 'deleted'`,
+		accountID,
+	).Scan(&accountCount); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: count triggers for account %s: %w", accountID, err)
+	}
+	if accountCount >= limits.TriggerLimitPerAccount {
+		return sqlc.Trigger{}, &TriggerQuotaError{
+			Scope:    TriggerQuotaScopeAccount,
+			Limit:    limits.TriggerLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	// 4. Insert under the same lock. cron_id + source are NULL for
+	//    the five non-cron kinds; the SQL CHECK + table-level
+	//    constraint enforces that the cron kind has cron_id set and
+	//    non-cron kinds have it NULL. We default both to NULL here;
+	//    the apid handler routes cron-kind creations through
+	//    CreateCron (the existing path) and this method is for the
+	//    five non-cron kinds only. payload_max_bytes (migration
+	//    00274) defaults to 6291456 (6 MiB) at the DB layer; we
+	//    surface it as a parameter so the apid handler can
+	//    override per-trigger without a follow-up migration.
+	//    broker_poison_strategy (migration 00275) carries the
+	//    audit-#10 poison-record handling flag; "" → DB default
+	//    'commit' so callers that don't yet know about the
+	//    strategy land the previous behaviour byte-for-byte.
+	bps := brokerPoisonStrategy
+	if bps == "" {
+		bps = "commit"
+	}
+	row := tx.QueryRow(ctx,
+		`insert into triggers (account_id, app_id, kind, slug, enabled, config,
+		                       batch_size_max, batch_window_ms, max_attempts,
+		                       cron_id, source, payload_max_bytes,
+		                       broker_poison_strategy)
+		 values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
+		 returning id, account_id, app_id, kind, slug, enabled, config,
+		           batch_size_max, batch_window_ms, max_attempts,
+		           cron_id, source, payload_max_bytes, broker_poison_strategy,
+		           created_at, updated_at`,
+		accountID, appID, kind, slug, enabled, config,
+		batchSizeMax, batchWindowMs, maxAttempts,
+		pgtype.UUID{}, pgtype.Text{}, payloadMaxBytes, bps)
+	t := sqlc.Trigger{}
+	if err := row.Scan(
+		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
+		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
+		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.BrokerPoisonStrategy,
+		&t.CreatedAt, &t.UpdatedAt,
+	); err != nil {
+		return sqlc.Trigger{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: commit create trigger: %w", err)
+	}
+	return t, nil
+}
+
+// TriggerByID returns the trigger with the given ID. Returns
+// ErrNotFound when the row is gone.
+func (s *PgStore) TriggerByID(ctx context.Context, id string) (sqlc.Trigger, error) {
+	return s.triggerQueries().TriggerByID(ctx, s.pool, mustPgUUID(id))
+}
+
+// UpdateTrigger patches the mutable fields (enabled, config,
+// batch_size_max, batch_window_ms, max_attempts,
+// broker_poison_strategy, filter_criteria). The kind + slug +
+// cron_id + source fields are immutable after creation; the apid
+// handler rejects PATCHes that touch them with
+// trigger_immutable_field. The cron_id linkage is set at creation
+// only (kind='cron' is created via the legacy CreateCron path).
+//
+// We bypass the sqlc.UpdateTrigger generated stub because sqlc
+// generated the coalesce() UPDATE with non-nullable parameter
+// types (Enabled bool, Column3 []byte, etc.) which collapses the
+// "absent" / "explicit" distinction the apid handler needs (the
+// cron UpdateCron precedent handles this same coalesce-via-pool
+// pattern at line 5523+). Bypassing sqlc here keeps the PATCH
+// semantics correct at the cost of losing auto-generated type
+// safety — net-positive because the alternative would force the
+// handler to send "current values" for unset fields and break the
+// JSON `omitempty` round-trip.
+//
+// filter_criteria is REVIEW-FIX MED-1 (issue #757 closure PR
+// #993): it was added to the sqlc.Trigger struct in commit 6 of
+// the mega-PR but omitted from this inline UPDATE — meaning a
+// PATCH that flipped filter_criteria was silently dropped on the
+// floor. The pointer is nullable: nil = "leave unchanged",
+// non-nil []byte = "replace the JSONB column" (json.RawMessage
+// shape mirrors the FilterCriteria wire DTO; nil-element means
+// "clear filter to no-op").
+func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error) {
+	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg, filterCriteriaArg any
+	if enabled != nil {
+		enabledArg = *enabled
+	}
+	if config != nil {
+		configArg = config
+	}
+	if batchSizeMax != nil {
+		batchSizeArg = *batchSizeMax
+	}
+	if batchWindowMs != nil {
+		batchWindowArg = *batchWindowMs
+	}
+	if maxAttempts != nil {
+		maxAttemptsArg = *maxAttempts
+	}
+	if payloadMaxBytes != nil {
+		payloadMaxArg = *payloadMaxBytes
+	}
+	if brokerPoisonStrategy != nil {
+		brokerPoisonArg = *brokerPoisonStrategy
+	}
+	if filterCriteria != nil {
+		filterCriteriaArg = filterCriteria
+	}
+	row := s.pool.QueryRow(ctx,
+		`update triggers set
+		   enabled = coalesce($2, enabled),
+		   config = coalesce($3::jsonb, config),
+		   batch_size_max = coalesce($4, batch_size_max),
+		   batch_window_ms = coalesce($5, batch_window_ms),
+		   max_attempts = coalesce($6, max_attempts),
+		   payload_max_bytes = coalesce($7, payload_max_bytes),
+		   broker_poison_strategy = coalesce($8, broker_poison_strategy),
+		   filter_criteria = coalesce($9::jsonb, filter_criteria)
+		 where id = $1
+		 returning id, account_id, app_id, kind, slug, enabled, config,
+		           batch_size_max, batch_window_ms, max_attempts,
+		           cron_id, source, payload_max_bytes, broker_poison_strategy,
+		           filter_criteria,
+		           created_at, updated_at`,
+		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg, filterCriteriaArg)
+	t := sqlc.Trigger{}
+	if err := row.Scan(
+		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
+		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
+		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.BrokerPoisonStrategy,
+		&t.FilterCriteria,
+		&t.CreatedAt, &t.UpdatedAt,
+	); err != nil {
+		return sqlc.Trigger{}, mapErr(err)
+	}
+	return t, nil
+}
+
+// DeleteTrigger removes a trigger + cascades to trigger_records +
+// trigger_dead_letter via the ON DELETE CASCADE FKs. The appID
+// argument is the authz guard — the apid handler must pass the
+// app_id it loaded; the WHERE id=$1 AND app_id=$2 clause refuses to
+// delete a trigger that doesn't belong to the requested app
+// (cross-app tenant bypass defence).
+func (s *PgStore) DeleteTrigger(ctx context.Context, id, appID string) error {
+	return s.triggerQueries().DeleteTrigger(ctx, s.pool, sqlc.DeleteTriggerParams{ID: mustPgUUID(id), AppID: mustPgUUID(appID)})
+}
+
+// ListTriggersForApp is the dashboard read-back (GET /v1/triggers).
+func (s *PgStore) ListTriggersForApp(ctx context.Context, appID string) ([]sqlc.Trigger, error) {
+	return s.triggerQueries().ListTriggersForApp(ctx, s.pool, mustPgUUID(appID))
+}
+
+// ListEnabledTriggers is the schedd-side read on each 1-second
+// cadence. Returns the full enabled-triggers set; the dispatch
+// tick filters by kind to pick the per-kind poller.
+func (s *PgStore) ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error) {
+	return s.triggerQueries().ListEnabledTriggers(ctx, s.pool)
+}
+
+// ClaimTriggerRecords is the schedd-side pull from the per-trigger
+// pending/retry queue. FOR UPDATE SKIP LOCKED (set in queries.sql)
+// lets concurrent schedd replicas each claim disjoint row sets —
+// ADR-099 PR-C precedent for claim_job_tasks.
+func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
+}
+
+// InsertTriggerRecord persists a single broker-delivered record
+// into the trigger_records FSM queue. Returns the persisted (or
+// existing-on-conflict) trigger_records.id so the dispatcher can
+// hold a stable row identity across the per-record FSM transitions.
+//
+// Review finding #1 (PR #910): without this insert, the dispatch
+// tick is structurally dead — ClaimTriggerRecords returns 0 rows
+// because nothing ever writes to trigger_records. This is the
+// seam every per-broker poller calls inside Poll() so a broker
+// message becomes a row BEFORE the dispatch tick can decide what
+// to do with it.
+//
+// ON CONFLICT (trigger_id, item_identifier) DO NOTHING (set in
+// queries.sql) mirrors the broker-side dedupe guarantee (kafka
+// per-partition offset, NATS stream sequence, Redis entry-id, SQS
+// receipt-handle, in-platform invocation_id). A re-poll after a
+// partial commit + Ack timeout therefore never inserts a duplicate
+// row; the existing row's id is returned via the no-rows path
+// (ON CONFLICT suppresses RETURNING, so we read-back the id with a
+// second SELECT only when the INSERT returns zero rows).
+func (s *PgStore) InsertTriggerRecord(ctx context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error) {
+	if payload == nil {
+		payload = []byte("{}")
+	}
+	if headers == nil {
+		headers = []byte("{}")
+	}
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+	id, err := s.triggerQueries().InsertTriggerRecord(ctx, s.pool,
+		sqlc.InsertTriggerRecordParams{
+			TriggerID:      mustPgUUID(triggerID),
+			ItemIdentifier: itemIdentifier,
+			Column3:        payload,
+			Column4:        headers,
+			Column5:        metadata,
+		})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT path — the row already existed (a
+			// previous Poll inserted and the dispatch tick has
+			// not yet Ack'd). Read back the existing id so the
+			// dispatcher can attribute FSM transitions to one
+			// canonical row identity.
+			var existing string
+			if err := s.pool.QueryRow(ctx,
+				`select id::text from trigger_records
+				 where trigger_id = $1 and item_identifier = $2`,
+				mustPgUUID(triggerID), itemIdentifier,
+			).Scan(&existing); err != nil {
+				return "", fmt.Errorf("state: insert trigger_record conflict read-back: %w", err)
+			}
+			return existing, nil
+		}
+		return "", fmt.Errorf("state: insert trigger_record: %w", err)
+	}
+	return pgUUIDString(id), nil
+}
+
+// MarkTriggerRecordSucceeded transitions a claimed record to the
+// succeeded state. Called from the dispatch tick after the runner
+// envelope returns 2xx with no ReportBatchItemFailures entry for
+// this item_identifier.
+func (s *PgStore) MarkTriggerRecordSucceeded(ctx context.Context, id string) error {
+	return s.triggerQueries().MarkTriggerRecordSucceeded(ctx, s.pool, mustPgUUID(id))
+}
+
+// MarkTriggerRecordRetry schedules a retry with exponential
+// backoff. The dispatch tick calls this with attempts < max_attempts.
+func (s *PgStore) MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error {
+	return s.triggerQueries().MarkTriggerRecordRetry(ctx, s.pool, sqlc.MarkTriggerRecordRetryParams{
+		ID:         mustPgUUID(id),
+		LastError:  pgtype.Text{String: lastError, Valid: lastError != ""},
+		NextFireAt: pgtypeFromTime(nextFireAt),
+	})
+}
+
+// MarkTriggerRecordDeadLetter transitions a claimed record to the
+// dead_letter state. Called when the runner envelope returns a
+// batchItemFailures entry AND attempts >= max_attempts OR the
+// record carries a poison_record signature (malformed response
+// JSON, missing item_identifier, etc.).
+func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error {
+	return s.triggerQueries().MarkTriggerRecordDeadLetter(ctx, s.pool, sqlc.MarkTriggerRecordDeadLetterParams{
+		ID:        mustPgUUID(id),
+		LastError: pgtype.Text{String: lastError, Valid: lastError != ""},
+	})
+}
+
+// InsertTriggerDeadLetter writes the closed-vocab failure-routing
+// row that pairs with a dead-lettered record. detail carries any
+// per-reason payload (broker error text, payload size that tripped
+// the 6MB cap, etc.) for the dashboard read-back.
+//
+// Audit round 2 finding #1 (PR #910): the recordID parameter MUST
+// be the trigger_records.id UUID, not a broker-side handle. The
+// trigger_dead_letter.record_id column is a UUID FK into
+// trigger_records.id; passing a kafka offset / NATS seq / SQS
+// receipt handle / Redis entry-id / queue invocation_id trips
+// SQLSTATE 23503, the dead_letter row is silently dropped, and
+// MarkTriggerRecordDeadLetter updates 0 rows. Callers must look
+// up the UUID via TriggerRecordIDByItemIdentifier before invoking
+// this method.
+func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error {
+	var detailArg any = []byte("{}")
+	if detail != nil {
+		detailArg = detail
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
+		 values ($1, $2, $3, $4, $5::jsonb)`,
+		recordID, triggerID, reason, routedTo, detailArg)
+	return err
+}
+
+// ListTriggerDeadLetter reads the per-trigger DLQ rows for the
+// dashboard + GET /v1/triggers/{id}/metrics?include_dlq=true.
+func (s *PgStore) ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error) {
+	return s.triggerQueries().ListTriggerDeadLetter(ctx, s.pool, sqlc.ListTriggerDeadLetterParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
+}
+
+// TriggerRecordIDByItemIdentifier resolves a broker-side handle
+// (kafka offset, NATS seq, SQS receipt handle, Redis entry-id,
+// queue invocation_id) to the durable trigger_records.id UUID
+// the dead_letter FK expects.
+//
+// Audit round 2 finding #1 (PR #910): the dispatcher needs this
+// bridge because the broker side speaks the per-broker handle
+// namespace (a string) while the trigger_records table uses a
+// global UUID identity and the trigger_dead_letter.record_id FK
+// is on the UUID column. Without this lookup every rate-limit
+// denial tripped SQLSTATE 23503.
+//
+// Returns ("", nil) — empty string + nil error — when no row
+// matches. That case fires when the rate-limit gate denies a
+// record BEFORE InsertTriggerRecord has had a chance to persist
+// it (the lookup misses on the very first tick after a fresh
+// broker poll). Callers MUST treat the empty string as "skip the
+// dead_letter insert; the record will be retried on the next
+// dispatch tick". pgx.ErrNoRows is collapsed to a plain
+// ("", nil) for caller convenience.
+//
+// Also collapses malformed triggerID strings to ("", nil) via
+// mustPgUUID — a parse failure means the row simply doesn't
+// exist (the zero UUID never matches anything).
+func (s *PgStore) TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error) {
+	id, err := s.triggerQueries().TriggerRecordIDByItemIdentifier(ctx, s.pool,
+		sqlc.TriggerRecordIDByItemIdentifierParams{
+			TriggerID:      mustPgUUID(triggerID),
+			ItemIdentifier: itemIdentifier,
+		})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if !id.Valid {
+		return "", nil
+	}
+	return id.String(), nil
+}
+
+// ListTriggerRecordsForTrigger reads the records for a trigger in
+// dispatch-time order. Used by GET /v1/triggers/{id}/records.
+func (s *PgStore) ListTriggerRecordsForTrigger(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ListTriggerRecordsForTrigger(ctx, s.pool, sqlc.ListTriggerRecordsForTriggerParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
+}
+
+// triggerQueries returns a fresh sqlc.Queries for the trigger table.
+// Pattern after appErrorsQueries (line 15120) and
+// dataUpstreamsQueries (line 15324): sqlc.Queries carries no state,
+// so a per-call allocation is cheap and avoids a cache invalidation
+// hazard if PgStore ever pools across multiple DB connections in a
+// future scale-out.
+func (s *PgStore) triggerQueries() *sqlc.Queries { return sqlc.New() }
+
+// parsePgUUID decodes a hyphenated hex string UUID into pgtype.UUID.
+// Used at the seam between the Store interface (string-typed) and
+// the typed sqlc.Params structs (pgtype.UUID) for every trigger
+// store method.
+func parsePgUUID(s string) (pgtype.UUID, error) {
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("state: invalid uuid %q: %w", s, err)
+	}
+	var p pgtype.UUID
+	copy(p.Bytes[:], uid[:])
+	p.Valid = true
+	return p, nil
+}
+
+// mustPgUUID is the same as parsePgUUID but elides the error — used
+// when the caller has already validated the input upstream (the
+// apid handler's parseTriggerID rejects malformed UUIDs at the HTTP
+// boundary). On a malformed input here the row simply doesn't exist
+// (we bind the zero uuid, which never matches), so callers see a
+// natural "not found" rather than a 500.
+func mustPgUUID(s string) pgtype.UUID {
+	p, err := parsePgUUID(s)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	return p
+}
+
+// pgUUIDString encodes a pgtype.UUID as the canonical hyphenated
+// hex string form. Used at the seam between sqlc-generated types
+// (pgtype.UUID) and the Store interface's string-typed ids (the
+// apid handlers + sched dispatch path take strings throughout).
+// Returns the empty string for an invalid pgtype.UUID so callers
+// can branch on the empty-string sentinel rather than panicking.
+func pgUUIDString(id pgtype.UUID) string {
+	if !id.Valid {
+		return ""
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		id.Bytes[0:4],
+		id.Bytes[4:6],
+		id.Bytes[6:8],
+		id.Bytes[8:10],
+		id.Bytes[10:16],
+	)
+}
+
+// RetryTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)
+// resets a record's state to 'pending' with attempts=0, last_error
+// cleared, and next_fire_at=NOW(). Distinct from
+// MarkTriggerRecordRetry (which the dispatcher uses with
+// exp-backoff): the operator verb has no exp-backoff and no
+// last_error carry-over — the operator is signalling "re-drive this
+// record from clean". Returns state.ErrNotFound when the row does
+// not exist so the handler can emit a 404.
+func (s *PgStore) RetryTriggerRecordByOperator(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update trigger_records
+		   set state = 'pending',
+		       attempts = 0,
+		       last_error = null,
+		       next_fire_at = now()
+		 where id = $1`,
+		id)
+	if err != nil {
+		return fmt.Errorf("state: retry trigger_record %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DropTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)
+// deletes the record outright — an operator verb for "this row
+// should not be retried". Distinct from the dead_letter transition
+// (which preserves history); this verb preserves no DLQ row. The
+// record's parent trigger is untouched; this is a record-level
+// operation only.
+func (s *PgStore) DropTriggerRecordByOperator(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from trigger_records where id = $1`,
+		id)
+	if err != nil {
+		return fmt.Errorf("state: drop trigger_record %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // AppUpstreamProbeScore is the JOIN-collapsed per-upstream
 // probe summary. One row per (data_upstreams.id, region) with
 // the freshest probe's RTT. Old name: aggregate per
@@ -16378,4 +17725,201 @@ func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUps
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// Consumer keys (ADR-120 / issue #975 item #5).
+//
+// Tenancy-at-the-boundary: every read pins (account_id, ...) in the
+// WHERE; cross-tenant probes collapse to ErrNotFound. The pg path is
+// the floor — memstore matches its strictness (see
+// memstore_consumer_keys.go for the symmetric contract).
+//
+// We deliberately write the SQL by hand (not via sqlc) for v1:
+// consumer_keys is small (Scale cap 1000/app × ~few accounts) and the
+// five methods are pure CRUD. When the surface grows (consumer_id
+// joins in #6/#7/#8), this becomes a sqlc concern; for now the
+// explicit SQL keeps the IDOR-safe predicates visible in one place.
+
+// scanConsumerKeyRow scans a single row selected with the standard
+// consumer_keys column order (see consumerKeySelectCols). Tolerant
+// of NULL on the optional timestamp columns: ExpiresAt / LastUsedAt
+// / RevokedAt come back as pgtype.Timestamptz{} when the row has
+// them unset, and timeFromPgtype returns nil for the zero value.
+func scanConsumerKeyRow(row pgx.Row) (ConsumerKey, error) {
+	var k ConsumerKey
+	var scopes []string
+	var expiresAt, lastUsedAt, revokedAt *time.Time
+	if err := row.Scan(
+		&k.ID,
+		&k.AccountID,
+		&k.AppID,
+		&k.Name,
+		&k.Prefix,
+		&k.Hash,
+		&scopes,
+		&k.CreatedAt,
+		&expiresAt,
+		&lastUsedAt,
+		&revokedAt,
+	); err != nil {
+		return ConsumerKey{}, err
+	}
+	k.Scopes = scopes
+	k.ExpiresAt = expiresAt
+	k.LastUsedAt = lastUsedAt
+	k.RevokedAt = revokedAt
+	return k, nil
+}
+
+// consumerKeySelectCols is the column list every read uses. Keeping
+// the order stable means scanConsumerKeyRow above is the single scan
+// helper, not five copies.
+const consumerKeySelectCols = `id, account_id, app_id, name, prefix, hashed_secret, scopes, created_at, expires_at, last_used_at, revoked_at`
+
+func (s *PgStore) CreateConsumerKey(ctx context.Context, accountID, appID, name, prefix string, hash []byte, scopes []string, expiresAt *time.Time) (ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: empty account_id or app_id")
+	}
+	// pgx requires a non-nil []byte for NOT NULL bytea; nil maps to
+	// SQL NULL and the migration's CHECK would reject. The caller
+	// always supplies a 32-byte SHA-256 hash; this is a defence.
+	if len(hash) != 32 {
+		return ConsumerKey{}, fmt.Errorf("pgstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
+	}
+	if len(scopes) == 0 {
+		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00329)")
+	}
+	row := s.pool.QueryRow(ctx,
+		`insert into consumer_keys
+		   (account_id, app_id, name, prefix, hashed_secret, scopes, expires_at)
+		 values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
+		 returning `+consumerKeySelectCols,
+		accountID, appID, name, prefix, hash, scopes, expiresAt)
+	k, err := scanConsumerKeyRow(row)
+	if err != nil {
+		// 23505 = unique_violation; the (account_id, app_id, name)
+		// UNIQUE tripped. Mirrors the alert_deliveries / CreateAccount
+		// pattern — surface as ErrConflict so callers can use
+		// errors.Is(err, state.ErrConflict) independent of the pg path.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ConsumerKey{}, ErrConflict
+		}
+		return ConsumerKey{}, err
+	}
+	return k, nil
+}
+
+func (s *PgStore) GetConsumerKeyByID(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if accountID == "" || keyID == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where id = $1::uuid and account_id = $2::uuid`,
+		keyID, accountID)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
+}
+
+func (s *PgStore) ListConsumerKeysForApp(ctx context.Context, accountID, appID string) ([]ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return nil, ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where account_id = $1::uuid and app_id = $2::uuid
+		  order by created_at desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConsumerKey
+	for rows.Next() {
+		k, err := scanConsumerKeyRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// RevokeConsumerKey stamps revoked_at = now(). Idempotent: a second
+// call returns the same (already-revoked) row without error. We
+// don't filter on revoked_at IS NULL because the audit-trail
+// semantics demand that revoke-after-revoke still succeeds (the
+// response body carries the original revoke timestamp).
+func (s *PgStore) RevokeConsumerKey(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if accountID == "" || keyID == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`update consumer_keys
+		    set revoked_at = coalesce(revoked_at, now())
+		  where id = $1::uuid and account_id = $2::uuid
+		  returning `+consumerKeySelectCols,
+		keyID, accountID)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
+}
+
+// TouchConsumerKeyLastUsed stamps last_used_at = now(). Called
+// fire-and-forget from the gateway middleware; we don't fail the
+// request if the touch fails (best-effort observability).
+func (s *PgStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) error {
+	if keyID == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`update consumer_keys
+		    set last_used_at = now()
+		  where id = $1::uuid
+		    and revoked_at is null`,
+		keyID)
+	return err
+}
+
+// ConsumerKeyByAppAndPrefix is the gateway-side hot-path lookup.
+// (app_id, prefix) is the unique hot-path key — see the
+// consumer_keys_app_prefix_idx UNIQUE index in 00329 (the UNIQUE
+// is load-bearing: a non-UNIQUE index would let a birthday-bound
+// ~0.78% collision at Scale cap of 1000 keys/app silently collapse
+// the lookup to "first row found by the planner" and the constant-
+// time hash compare would run against the wrong key's bytes).
+//
+// CONTRACT: this method returns the row regardless of revoked_at
+// or expires_at. The caller (gatewayd-internal middleware in PR #5-C)
+// MUST call Active(now) on the returned row before the hash compare.
+// This is intentional — the read path stays passive so the audit
+// trail (revoked_at TIMESTAMPTZ + last_used_at) survives gateway
+// reads; the caller-side Active() is the single source of truth for
+// "is this key still usable right now". TouchConsumerKeyLastUsed
+// stays filtered on revoked_at IS NULL (no observability point in
+// stamping a revoked row's last_used_at).
+func (s *PgStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appID, prefix string) (ConsumerKey, error) {
+	if accountID == "" || appID == "" || prefix == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where app_id = $1::uuid
+		    and account_id = $2::uuid
+		    and prefix = $3`,
+		appID, accountID, prefix)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
 }

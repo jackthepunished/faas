@@ -243,9 +243,25 @@ type DeploymentResponse struct {
 	// api/state.SerializeDeployment knows the column is a string and
 	// that "" is the canonical empty value, so the dashboard /
 	// programmatic consumer can branch on ErrorCode != "".
-	ErrorCode      string `json:"error_code,omitempty"`
-	CreatedAt      string `json:"created_at"`
-	TrafficPercent int    `json:"traffic_percent,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	// ErrorHint / ErrorWhy / ErrorFix are the customer-facing
+	// explanation prose (spec §6.4 amendment 1) stamped alongside
+	// ErrorCode. Mirrors the wire-side Problem.Hint / Why / Fix
+	// fields so third-party Go SDK consumers see the same 3-5 line
+	// shape that the deploy-time Problem emits. Empty for
+	// deployments created before migrations/00290 OR that are not
+	// in a failure state — callers branch on the same
+	// ErrorCode != "" test and render the four together.
+	ErrorHint string `json:"error_hint,omitempty"`
+	ErrorWhy  string `json:"error_why,omitempty"`
+	ErrorFix  string `json:"error_fix,omitempty"`
+	// ErrorRelevantLogs is the last N log lines that explain the
+	// failure, surfaced inline when the deployment row carries
+	// them. Capped at 20 entries × 512 bytes each (CLI tripwire;
+	// see pkg/whycopy.Render for the catalogue row).
+	ErrorRelevantLogs []LogExcerpt `json:"error_relevant_logs,omitempty"`
+	CreatedAt         string       `json:"created_at"`
+	TrafficPercent    int          `json:"traffic_percent,omitempty"`
 }
 
 // UpdateDeploymentTrafficRequest is the body for
@@ -331,6 +347,37 @@ type CustomDomainResponse struct {
 type CreateCustomDomainRequest struct {
 	Domain string `json:"domain"`
 	AppID  string `json:"app_id"`
+}
+
+// DomainDoctorReport (ADR-120) is the wire shape for
+// GET /v1/domains/{domain}/doctor. Five Render-style check
+// lines (dns_record / points_to_gregale / tls_certificate /
+// caa_permits / ipv6_conflict) plus the durable row's app_id
+// and observed_at. Stale=true means the cached observation
+// row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default
+// 300) when the handler ran a synchronous re-probe.
+type DomainDoctorReport struct {
+	Domain     string              `json:"domain"`
+	AppID      string              `json:"app_id"`
+	Stale      bool                `json:"stale,omitempty"`
+	ObservedAt string              `json:"observed_at"`
+	Healthy    bool                `json:"healthy"`
+	Checks     []DomainDoctorCheck `json:"checks"`
+}
+
+// DomainDoctorCheck is one row of the doctor report. Stable
+// Name tokens (dns_record / points_to_gregale /
+// tls_certificate / caa_permits / ipv6_conflict) so the CLI
+// can filter by name without parsing the human Detail field.
+// Remediation is the exact record to change when Status is
+// fail — the load-bearing field for the activation drop-off.
+type DomainDoctorCheck struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail"`
+	Observed    string `json:"observed,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+	CheckedAt   string `json:"checked_at,omitempty"`
 }
 
 // CronResponse mirrors the crons table. LastFiredAt is the most
@@ -1226,4 +1273,126 @@ type AccountEgressAllowlistExtraResponse struct {
 	Extra    int `json:"extra"`
 	PlanCap  int `json:"plan_cap"`
 	MaxExtra int `json:"max_extra"`
+}
+
+// --- Triggers (issue #757 / ADR-100) ----------------------------------------
+// Wire shape for the unified event-source-mapping primitive. The
+// discriminator is TriggerKind. Five non-cron kinds share the same
+// batch/filter/retry/ReportBatchItemFailures machinery; cron keeps
+// (schedule, path) for backward compat with the robfig schedule
+// parser.
+
+// TriggerKind is the closed-vocabulary discriminator.
+type TriggerKind string
+
+const (
+	TriggerKindCron         TriggerKind = "cron"
+	TriggerKindKafka        TriggerKind = "kafka"
+	TriggerKindNATS         TriggerKind = "nats"
+	TriggerKindRedisStreams TriggerKind = "redis_streams"
+	TriggerKindSQSCompat    TriggerKind = "sqs_compat"
+	TriggerKindQueue        TriggerKind = "queue"
+)
+
+// Trigger is the wire shape returned by GET/POST/PATCH /v1/triggers.
+type Trigger struct {
+	ID            string          `json:"id"`
+	AccountID     string          `json:"account_id"`
+	AppID         string          `json:"app_id"`
+	Kind          TriggerKind     `json:"kind"`
+	Slug          string          `json:"slug,omitempty"`
+	Enabled       bool            `json:"enabled"`
+	Config        json.RawMessage `json:"config"`
+	BatchSizeMax  int             `json:"batch_size_max"`
+	BatchWindowMs int             `json:"batch_window_ms"`
+	MaxAttempts   int             `json:"max_attempts"`
+	Schedule      string          `json:"schedule,omitempty"`
+	Path          string          `json:"path,omitempty"`
+	CronID        string          `json:"cron_id,omitempty"`
+	Source        *string         `json:"source,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}
+
+// CreateTriggerRequest creates a new trigger. Kind is immutable.
+type CreateTriggerRequest struct {
+	AppID         string          `json:"app_id"`
+	Kind          TriggerKind     `json:"kind"`
+	Slug          string          `json:"slug,omitempty"`
+	Enabled       *bool           `json:"enabled,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	Schedule      string          `json:"schedule,omitempty"`
+	Path          string          `json:"path,omitempty"`
+}
+
+// UpdateTriggerRequest is a partial update.
+type UpdateTriggerRequest struct {
+	Enabled       *bool           `json:"enabled,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	Schedule      *string         `json:"schedule,omitempty"`
+	Path          *string         `json:"path,omitempty"`
+}
+
+// TriggerRecord is the per-record audit row surfaced via GET
+// /v1/triggers/{id}/records.
+type TriggerRecord struct {
+	ID               string     `json:"id"`
+	TriggerID        string     `json:"trigger_id"`
+	ItemIdentifier   string     `json:"item_identifier"`
+	Payload          string     `json:"payload"`
+	Headers          string     `json:"headers"`
+	Metadata         string     `json:"metadata"`
+	State            string     `json:"state"`
+	Attempts         int        `json:"attempts"`
+	NextFireAt       time.Time  `json:"next_fire_at"`
+	ReceivedAt       time.Time  `json:"received_at"`
+	LastError        *string    `json:"last_error,omitempty"`
+	LastDispatchedAt *time.Time `json:"last_dispatched_at,omitempty"`
+}
+
+// TriggerRecordRetryRequest is the body of POST
+// /v1/triggers/{id}/records/{rid}/retry.
+type TriggerRecordRetryRequest struct{}
+
+// TriggerDeadLetter is the wire shape for one trigger_dead_letter row.
+type TriggerDeadLetter struct {
+	RecordID  string    `json:"record_id"`
+	TriggerID string    `json:"trigger_id"`
+	Reason    string    `json:"reason"`
+	RoutedTo  string    `json:"routed_to"`
+	Detail    string    `json:"detail"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListTriggerRecordsResponse answers GET /v1/triggers/{id}/records.
+type ListTriggerRecordsResponse struct {
+	Records []TriggerRecord `json:"records"`
+}
+
+// ListTriggerDeadLetterResponse answers GET /v1/triggers/{id}/dlq.
+type ListTriggerDeadLetterResponse struct {
+	Records []TriggerDeadLetter `json:"records"`
+}
+
+// CreateTriggerBatchRequest is the body of POST
+// /v1/triggers:batch_create.
+type CreateTriggerBatchRequest struct {
+	AppID        string `json:"app_id"`
+	ManifestYAML string `json:"manifest_yaml"`
+}
+
+// TriggerMetricsResponse is the body of GET /v1/triggers/{id}/metrics.
+type TriggerMetricsResponse struct {
+	TriggerID       string `json:"trigger_id"`
+	PendingCount    int    `json:"pending_count"`
+	ClaimedCount    int    `json:"claimed_count"`
+	SucceededCount  int    `json:"succeeded_count"`
+	RetryCount      int    `json:"retry_count"`
+	DeadLetterCount int    `json:"dead_letter_count"`
 }

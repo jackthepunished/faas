@@ -206,6 +206,7 @@ func TestDo_GETCallsDoNotCarryIdempotencyKey(t *testing.T) {
 		{"GetApp", func(c *Client) error { _, err := c.GetApp(context.Background(), "x"); return err }},
 		{"ListInstances", func(c *Client) error { _, err := c.ListInstances(context.Background(), "x"); return err }},
 		{"ListDomains", func(c *Client) error { _, err := c.ListDomains(context.Background()); return err }},
+		{"DomainDoctor", func(c *Client) error { _, err := c.DomainDoctor(context.Background(), "x"); return err }},
 		{"ListCrons", func(c *Client) error { _, err := c.ListCrons(context.Background(), "x"); return err }},
 		{"ListKeys", func(c *Client) error { _, err := c.ListKeys(context.Background()); return err }},
 		{"ListSecrets", func(c *Client) error { _, err := c.ListSecrets(context.Background(), "x"); return err }},

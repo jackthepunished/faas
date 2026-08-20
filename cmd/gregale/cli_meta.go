@@ -276,6 +276,19 @@ var cliCommands = []cliCommand{
 		Short:   "Open the account dashboard in your browser",
 	},
 	{
+		// Error-explanations cluster (spec §6.4 amendment 1):
+		// customer preflight that scans the cwd for the 8 source-side
+		// failure modes the cluster's runtime detectors catch
+		// post-deploy. Auth not required (local source only).
+		Name:    dispatchDoctor,
+		DocSlug: "doctor",
+		Short:   "Preflight: scan your source for the 8 source-side failure modes (--strict, --json, [path])",
+		Flags: []cliFlag{
+			{Name: "strict", Short: "exit 1 on warn (default: exit 0 on warn)"},
+			{Name: "json", Short: "machine output (default: human prose)"},
+		},
+	},
+	{
 		Name:    "delayed-task",
 		DocSlug: "delayed-task",
 		Short:   "Schedule a deferred invocation (delayed-task add|get|cancel)",
@@ -310,6 +323,21 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    dispatchDeploys,
+		DocSlug: "deploys",
+		Short:   "Read-only deploy drill-downs (deploys show|status <id>)",
+		Subcommands: []cliSub{
+			// ADR-117 companion read surface. Future siblings
+			// (timeline, events, artifacts) land here as new
+			// cliSub entries — NOT as flags on the singular
+			// `deployment` verb, which is already at three
+			// flag-shaped drill-downs.
+			{Name: "show", Short: "Print the closed 6-stage post-stream summary"},
+			{Name: statusLiteral, Short: "Print the stage summary with terminal-status footer (live since / failed at)"},
+		},
+		Positionals: []string{"<id>"},
+	},
+	{
 		Name:    "deploy",
 		DocSlug: "deploy",
 		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)",
@@ -333,6 +361,14 @@ var cliCommands = []cliCommand{
 		Name:    "domains",
 		DocSlug: "domains",
 		Short:   "Manage custom domains",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List custom domain bindings"},
+			{Name: subAdd, Short: "Bind a custom domain to an app"},
+			{Name: subRm, Short: "Remove a custom domain binding"},
+			{Name: subDomainsVerify, Short: "Re-verify DNS + cert for a domain"},
+			{Name: subDomainsShow, Short: "Show a domain's cert details"},
+			{Name: subDomainsDoctor, Short: "5-check doctor report (DNS / CNAME / TLS / CAA / IPv6)"},
+		},
 	},
 	{
 		Name:    "tenant-surfaces",

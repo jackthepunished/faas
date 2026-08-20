@@ -73,6 +73,50 @@ type Problem struct {
 	// Stripe: empty). The dashboard renders this as a confirmation id
 	// after the customer completes checkout. Empty on the Stripe path.
 	TxID string `json:"tx_id,omitempty"`
+	// Hint is the single short next-action line shown on the CLI's
+	// 3-line renderer (spec §6.4 amendment 1). Mirrors SecretHint
+	// shape — a one-line remediation nudge, omitempty so every
+	// other problem+json site keeps its existing flat shape
+	// unchanged. Distinct from Detail: Detail is the platform's
+	// machine-stable message; Hint is the human-readable
+	// one-liner surfaced only on error UX paths.
+	Hint string `json:"hint,omitempty"`
+	// Why is the cause with the observed value. Multi-line ok (e.g.
+	// "bound to 127.0.0.1; guest at 10.0.0.2 only sees requests
+	// proxied via the bridge"). Distinct from Detail: Detail is
+	// the platform's machine-stable message; Why is the
+	// human-readable explanation surfaced only on error UX paths.
+	Why string `json:"why,omitempty"`
+	// Fix is the prescriptive remediation (e.g. "set
+	// `app.listen('0.0.0.0')` or run `gregale env set PORT 8080`").
+	// Distinct from Hint: Hint is a single line, Fix may be 1-3
+	// lines.
+	Fix string `json:"fix,omitempty"`
+	// RelevantLogs are the last N log lines that explain the
+	// failure, surfaced inline by the CLI renderer when the server
+	// attaches them. Capped at 20 entries × 512 bytes each (CLI
+	// tripwire).
+	RelevantLogs []LogExcerpt `json:"relevant_logs,omitempty"`
+}
+
+// LogExcerpt is a single log line attached to an error explanation
+// (spec §6.4 amendment 1). Mirrors pkg/api.LogExcerpt — the SDK
+// is a separate Go module that cannot import the root module's
+// pkg, so the shape is duplicated here. Keep in lock-step with
+// the root module's pkg/api/errors.go (the regen via `make
+// sdk-gen-go` is hand-rolled since the SDK is a separate module).
+//
+// CLI renderer prints this as a fenced block under the 3-5 line
+// explanation. Timestamp is RFC 3339; Level is one of info|warn|error;
+// Source tags the log origin so the customer can attribute the line
+// (build vs vm-init vs app vs gateway); Message is the line content,
+// capped at 512 bytes server-side (CLI tripwire enforces the cap
+// client-side as well).
+type LogExcerpt struct {
+	Timestamp string `json:"ts"`
+	Level     string `json:"level"`
+	Source    string `json:"source,omitempty"`
+	Message   string `json:"message"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.

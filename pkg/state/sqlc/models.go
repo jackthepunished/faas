@@ -118,6 +118,7 @@ type App struct {
 	GithubProductionBranch pgtype.Text
 	MinInstances           int32
 	EgressAllowlist        []netip.Prefix
+	PublicAuthIpAllowlist  []netip.Prefix
 	// Per-instance RPS target. When live_request_count / live_instance_count exceeds this, schedd admits another instance (up to plan max_concurrency). Hobby/Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app).
 	AutoscaleTargetRps pgtype.Int4
 	// Per-instance CPU% target (1..100). Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app). CPU target is unbounded above 100 inside the DB; the apid handler enforces [1, 100] via 422.
@@ -375,6 +376,37 @@ type ComputeNodeKey struct {
 	KeyID         string
 	PublicKeyPem  string
 	CreatedAt     pgtype.Timestamptz
+}
+
+type ConsumerKey struct {
+	ID           pgtype.UUID
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	Name         string
+	Prefix       string
+	HashedSecret []byte
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
+	RevokedAt    pgtype.Timestamptz
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
+type CorsPreset struct {
+	ID               pgtype.UUID
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Name             string
+	Description      pgtype.Text
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int32
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
 }
 
 type CreditLedger struct {
@@ -918,6 +950,50 @@ type TenantSurface struct {
 	CertLastError pgtype.Text
 	CreatedAt     pgtype.Timestamptz
 	UpdatedAt     pgtype.Timestamptz
+}
+
+type Trigger struct {
+	ID                   pgtype.UUID
+	AccountID            pgtype.UUID
+	AppID                pgtype.UUID
+	Kind                 string
+	Slug                 string
+	Enabled              bool
+	Config               []byte
+	BatchSizeMax         int32
+	BatchWindowMs        int32
+	MaxAttempts          int32
+	CronID               pgtype.UUID
+	Source               pgtype.Text
+	PayloadMaxBytes      int32
+	BrokerPoisonStrategy string
+	FilterCriteria       []byte
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+type TriggerDeadLetter struct {
+	RecordID  pgtype.UUID
+	TriggerID pgtype.UUID
+	Reason    string
+	RoutedTo  string
+	Detail    []byte
+	CreatedAt pgtype.Timestamptz
+}
+
+type TriggerRecord struct {
+	ID               pgtype.UUID
+	TriggerID        pgtype.UUID
+	ItemIdentifier   string
+	Payload          []byte
+	Headers          []byte
+	Metadata         []byte
+	State            string
+	Attempts         int32
+	NextFireAt       pgtype.Timestamptz
+	ReceivedAt       pgtype.Timestamptz
+	LastError        pgtype.Text
+	LastDispatchedAt pgtype.Timestamptz
 }
 
 // Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.

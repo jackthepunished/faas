@@ -719,24 +719,28 @@ type ParkedDeploymentRef struct {
 	ParkedAt     *time.Time `json:"parked_at"`
 }
 
-// PublicAuthBlock (issue #477 / ADR-079) is the per-app
-// public-URL auth configuration on a PATCH body. Mode is
-// the canonical 'open'|'bearer'|'basic' string (must match
-// apps_public_auth_mode_chk). BasicUser + BasicPass are
-// only meaningful when Mode='basic'; the apid PATCH
-// handler seals them under the APP_BASIC_AUTH secretbox
-// namespace and stores the ciphertext in
-// apps.public_auth_basic. For Mode='open' or 'bearer' the
-// apid handler ignores them (and clears any existing
-// sealed blob so a stale secretbox row never reaches a
-// fresh request). The wire-shape reflects what the
-// customer PATCHes; the on-disk shape is the
-// public_auth_mode + public_auth_basic columns plus the
-// secretbox seal at PATCH time.
+// PublicAuthBlock (issue #477 / ADR-079 + ADR-118) is the
+// per-app public-URL auth configuration on a PATCH body.
+// Mode is the canonical 'open'|'bearer'|'basic'|'ip_allowlist'
+// string (must match apps_public_auth_mode_chk).
+// BasicUser + BasicPass are only meaningful when
+// Mode='basic'; the apid PATCH handler seals them under
+// the APP_BASIC_AUTH secretbox namespace and stores the
+// ciphertext in apps.public_auth_basic. For Mode='open',
+// 'bearer', or 'ip_allowlist' the apid handler ignores
+// them (and clears any existing sealed blob so a stale
+// secretbox row never reaches a fresh request). For
+// Mode='ip_allowlist' the IPAllowlist slice must be
+// non-empty (ADR-118; the 500-on-misconfig gate in
+// pkg/gateway/handler.go fires otherwise). The wire-shape
+// reflects what the customer PATCHes; the on-disk shape
+// is the public_auth_mode + public_auth_basic +
+// public_auth_ip_allowlist columns plus the secretbox
+// seal at PATCH time.
 type PublicAuthBlock struct {
-	// Mode is the canonical 'open'|'bearer'|'basic'
-	// string. apid rejects unknown values with 422
-	// invalid_public_auth_mode.
+	// Mode is the canonical 'open'|'bearer'|'basic'|
+	// 'ip_allowlist' string. apid rejects unknown values
+	// with 422 invalid_public_auth_mode.
 	Mode string `json:"mode"`
 	// BasicUser is the basic-auth username (plaintext at
 	// PATCH time; sealed before persist). Required when
@@ -748,11 +752,23 @@ type PublicAuthBlock struct {
 	// Mode='basic'; ignored otherwise. Range
 	// [1, 256] bytes.
 	BasicPass string `json:"basic_pass,omitempty"`
+	// IPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist. Required when Mode='ip_allowlist';
+	// ignored otherwise. Plan-gated to Pro+ (apid
+	// returns 403 plan_public_auth_ip_allowlist_not_allowed
+	// for Free/Hobby). Per-plan cap
+	// (pkg/api/limits.go::PublicAuthIPAllowlistMaxEntries)
+	// is enforced upstream of this Validate. The apid
+	// parse step rejects entries that don't net.ParseCIDR
+	// or that have masklen=0 (the same non-/0 contract
+	// the DB trigger at migrations/00308 enforces).
+	IPAllowlist []string `json:"ip_allowlist,omitempty"`
 }
 
 // Validate enforces the canonical PublicAuthBlock shape:
 // Mode is a closed enum; BasicUser + BasicPass are
-// required iff Mode='basic'. Returns a 422-mapped
+// required iff Mode='basic'; IPAllowlist must be
+// non-empty iff Mode='ip_allowlist'. Returns a 422-mapped
 // *Problem on any malformed shape. nil in → nil out
 // (the caller treats nil as "don't touch the column").
 func (b *PublicAuthBlock) Validate() *Problem {
@@ -760,12 +776,23 @@ func (b *PublicAuthBlock) Validate() *Problem {
 		return nil
 	}
 	switch b.Mode {
-	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic:
+	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic,
+		AppPublicAuthModeIPAllowlist:
 	default:
 		return NewProblem(422, CodeValidation, "Invalid public_auth.mode",
-			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', or 'basic'; got %q", b.Mode))
+			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', 'basic', or 'ip_allowlist'; got %q", b.Mode))
 	}
 	if b.Mode != AppPublicAuthModeBasic {
+		// IPAllowlist is required iff Mode='ip_allowlist'.
+		// The plan-gate + size cap + per-entry parse are
+		// enforced upstream of Validate (the apid handler
+		// runs them in that order: closed-enum → plan → size
+		// → parse), so this layer only checks the structural
+		// "non-empty when mode requires it" invariant.
+		if b.Mode == AppPublicAuthModeIPAllowlist && len(b.IPAllowlist) == 0 {
+			return NewProblem(422, CodeValidation, "Invalid public_auth.ip_allowlist",
+				"public_auth.ip_allowlist must contain at least one CIDR when mode='ip_allowlist'")
+		}
 		return nil
 	}
 	if u := strings.TrimSpace(b.BasicUser); u == "" || len(u) > AppPublicAuthBasicUserMaxBytes {
@@ -779,18 +806,26 @@ func (b *PublicAuthBlock) Validate() *Problem {
 	return nil
 }
 
-// PublicAuthStatus (issue #477 / ADR-079) is the
-// read-only per-app public-URL auth surface on
+// PublicAuthStatus (issue #477 / ADR-079 + ADR-118) is
+// the read-only per-app public-URL auth surface on
 // AppResponse. Mode mirrors the apps.public_auth_mode
 // column; HasBasicCreds is true iff the row has a
 // non-null public_auth_basic blob (a mode='basic' app
-// without creds would still 401 every request). The
-// plaintext username/password is NEVER echoed — it lives
-// in app_secrets (ADR-045) and is loopback-mounted to
-// drive1 at boot.
+// without creds would still 401 every request).
+// IPAllowlistEntryCount is the count of CIDRs in the
+// apps.public_auth_ip_allowlist array (mode='ip_allowlist'
+// apps only — 0 otherwise). The CIDR strings themselves
+// are NEVER echoed — they're operator-secret and an
+// operator triaging "why am I getting 403s" can read the
+// raw value from the apid audit log instead (the audit
+// log records the count, not the entries — redaction
+// invariant). The plaintext basic-auth username/password
+// is NEVER echoed — it lives in app_secrets (ADR-045)
+// and is loopback-mounted to drive1 at boot.
 type PublicAuthStatus struct {
-	Mode          string `json:"mode"`
-	HasBasicCreds bool   `json:"has_basic_creds"`
+	Mode                  string `json:"mode"`
+	HasBasicCreds         bool   `json:"has_basic_creds"`
+	IPAllowlistEntryCount int    `json:"ip_allowlist_entry_count"`
 }
 
 // Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`
@@ -1331,7 +1366,24 @@ type DeploymentResponse struct {
 	// that "" is the canonical empty value, so the dashboard /
 	// programmatic consumer can branch on ErrorCode != "".
 	ErrorCode string `json:"error_code,omitempty"`
-	CreatedAt string `json:"created_at"`
+	// ErrorHint / ErrorWhy / ErrorFix are the customer-facing
+	// explanation prose (spec §6.4 amendment 1) stamped alongside
+	// ErrorCode. Mirrors the wire-side Problem.Hint / Why / Fix
+	// fields so post-mortem retrieval via `gregale deployment <id>`
+	// or `gregale inspect <slug> --errors` surfaces the same
+	// 3-5 line shape that the deploy-time Problem emits. Empty for
+	// deployments created before migrations/00290 OR that are not
+	// in a failure state — the dashboard branches on the same
+	// ErrorCode != "" test and renders the four together.
+	ErrorHint string `json:"error_hint,omitempty"`
+	ErrorWhy  string `json:"error_why,omitempty"`
+	ErrorFix  string `json:"error_fix,omitempty"`
+	// ErrorRelevantLogs is the last N log lines that explain the
+	// failure, surfaced inline by the dashboard when the deployment
+	// row carries them. Capped at 20 entries × 512 bytes each (CLI
+	// tripwire; see pkg/whycopy.Render for the catalogue row).
+	ErrorRelevantLogs []LogExcerpt `json:"error_relevant_logs,omitempty"`
+	CreatedAt         string       `json:"created_at"`
 	// HasOverrides is true when the deployment carries an
 	// override_* column set (issue #460 / ADR-053). Lets dashboards
 	// render "this deploy pinned overrides" without re-parsing the
@@ -1441,6 +1493,48 @@ type DeploymentResponse struct {
 	// String fields only because pkg/api cannot import pkg/state
 	// (the App.Type enum lives in pkg/state/types.go).
 	BuildPlan *BuildPlan `json:"build_plan,omitempty"`
+	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+	// attribution. All four fields are server-stamped from the
+	// HTTP request context (never client-supplied) and use
+	// `omitempty` so pre-#606 rows render unchanged on the wire
+	// (empty strings drop from the JSON). The closed-set
+	// vocabulary for DeployedVia is enforced at the schema
+	// layer via migrations/00303's CHECK constraint; the FK on
+	// DeployedByUserId is ON DELETE SET NULL so revoking an
+	// account never cascades into a deleted deployment row.
+	//
+	// DeployedByUserId is the deploying account's UUID (FK →
+	// accounts.id, ON DELETE SET NULL). Empty when the deploy
+	// came from a non-local source we couldn't resolve (e.g. a
+	// githubd pusher whose email isn't bound to a local
+	// account — PusherLogin carries the raw GH login in that
+	// case so the deployment row is still attributable on
+	// read-back).
+	DeployedByUserID string `json:"deployed_by_user_id,omitempty"`
+	// DeployedVia is the closed-set classifier of how this
+	// deployment was submitted. One of "api" / "cli" /
+	// "dashboard" / "github" / "operator". Computed at handler
+	// entry by inspecting session cookie vs bearer token vs API
+	// key vs the githubd_bridge call shape; the schema CHECK
+	// constraint (deployments_deployed_via_set_chk) rejects
+	// any value outside this set.
+	DeployedVia string `json:"deployed_via,omitempty"`
+	// DeployedFromIp is the trusted remote IP captured by
+	// pkg/middleware.ClientIP at handler entry. Uses the same
+	// XFF + loopback trust contract as the auth-limit bucket;
+	// diverging from that would silently make a credential-
+	// stuffing burst look like a different (smaller) attack.
+	// Rendered as a string (the Go INET scan path coalesces
+	// empty → "" so pre-#606 rows surface unchanged).
+	DeployedFromIP string `json:"deployed_from_ip,omitempty"`
+	// PusherLogin is the raw GitHub login of the pusher when
+	// DeployedVia == "github". Empty for all other via values
+	// (the handler stamps it from the githubd_bridge req.Pusher
+	// proto field). Distinct from the human-readable DeployedBy
+	// text column that PR #984 / issue #977 adds — PusherLogin
+	// is the unmodified GH identity, suitable for downstream
+	// GitHub-API correlation.
+	PusherLogin string `json:"pusher_login,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source
@@ -1475,6 +1569,28 @@ type UpdateDeploymentRequest struct {
 // DTOs keeps each handler's contract crisp.
 type UpdateDeploymentTrafficRequest struct {
 	TrafficPercent int `json:"traffic_percent"`
+}
+
+// RollbackRequest is the body for POST /v1/apps/{slug}/rollback.
+//
+// All fields are optional. With an empty body the handler falls back to
+// "rollback to the most recent superseded deployment" (the pre-G
+// behaviour). With TargetDeploymentID set, the handler validates that the
+// deployment belongs to this app AND has status='superseded' — both are
+// hard requirements; rolling back to a deployment that is already live, or
+// that belongs to a different app, is rejected with a typed error rather
+// than silently no-op'd.
+//
+// SAFE-RELEASES-G (issue #976). Forward-compatible with SAFE-RELEASES-C
+// (per-deployment URL): the response carries the same deployment_id so
+// -C can build a hostname off it without a wire-shape change.
+type RollbackRequest struct {
+	// TargetDeploymentID is the UUID of the deployment to promote back
+	// to 'live'. Must belong to the same app as the URL slug, and must
+	// have status='superseded' (rolling back to the already-current
+	// deployment is rejected explicitly). Nil/empty falls back to the
+	// most-recent superseded deployment (legacy behaviour).
+	TargetDeploymentID *string `json:"target_deployment_id,omitempty"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's
@@ -1680,6 +1796,48 @@ type CustomDomainResponse struct {
 type CreateCustomDomainRequest struct {
 	Domain string `json:"domain"`
 	AppID  string `json:"app_id"`
+}
+
+// DomainDoctorReport (ADR-120) is the wire shape for
+// `GET /v1/domains/{domain}/doctor`. The 5-line shape mirrors
+// the Render-style custom-domain check: dns_record_found,
+// points_to_gregale, tls_certificate, caa_permits,
+// ipv6_conflict. Each check carries its own status +
+// remediation so the CLI can render "Set CNAME ... → ..." in
+// the failure path.
+//
+// Stale=true means the cached observation row is older than
+// FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) — the
+// response is still 200, but the customer should re-poll.
+// Healthy is a coarse summary (all checks ok OR na); the
+// per-check Status is the source of truth.
+//
+// Check names use stable tokens (snake_case) so the CLI
+// can grep / filter by name without parsing the human
+// Detail field.
+type DomainDoctorReport struct {
+	Domain     string              `json:"domain"`
+	AppID      string              `json:"app_id"`
+	Stale      bool                `json:"stale,omitempty"`
+	ObservedAt string              `json:"observed_at"` // RFC3339 UTC
+	Healthy    bool                `json:"healthy"`
+	Checks     []DomainDoctorCheck `json:"checks"`
+}
+
+// DomainDoctorCheck is one row of the doctor report.
+// Remediation is the exact record to change when Status
+// is "fail"; it's the load-bearing field for the
+// activation drop-off. Observed carries the raw observed
+// value (e.g. the actual CNAME target or the observed
+// AAAA) so the customer can confirm their DNS state
+// without leaving the CLI.
+type DomainDoctorCheck struct {
+	Name        string `json:"name"`                  // stable token: dns_record | points_to_gregale | tls_certificate | caa_permits | ipv6_conflict
+	Status      string `json:"status"`                // ok | fail | pending | na
+	Detail      string `json:"detail"`                // human-readable
+	Observed    string `json:"observed,omitempty"`    // raw observed value
+	Remediation string `json:"remediation,omitempty"` // exact record to change
+	CheckedAt   string `json:"checked_at,omitempty"`  // RFC3339 UTC
 }
 
 // TenantSurfaceResponse is a tenant surface's wire shape (ADR-100 /
@@ -2453,8 +2611,16 @@ type GdprAuditExportResponse struct {
 // Ciphertext is the age-sealed envelope (base64). Plaintext never
 // lands here — the customer imports the envelope into another faas
 // install (or their own age tool) to unseal.
+//
+// ADR-092 PR-B: the export lists every scope per app (not just
+// default-scope). Scope is required so a customer's import into a
+// fresh install lands each row at the same scope it was sealed at;
+// pre-PR-B this field was missing and on import the row would have
+// collapsed to default scope, silently overwriting any prod/staging
+// rows on the destination.
 type AppSecretExportResponse struct {
 	AppID      string `json:"app_id"`
+	Scope      string `json:"scope"` // ADR-092 PR-B
 	Key        string `json:"key"`
 	Ciphertext string `json:"ciphertext"` // base64
 	CreatedAt  string `json:"created_at"`
@@ -4163,13 +4329,33 @@ var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:
 //     api.MaxRequestBodyBytes (per-plan 25 MB buffered / 100 MB
 //     streaming). Must be > 0 and <= MaxRequestBodyBytes at
 //     create-time.
+//   - ValidateMode: select how the gateway handles a failing body
+//     (issue #975 item #3 / Mega-Foundation #979-a). 'block' (the
+//     default) preserves the v1 behavior — reject with 422.
+//     'observe' counts failures via the gateway_validate_failures_total
+//     metric and never rejects, so an operator can spot noisy
+//     endpoints without breaking their customers. 'warn' also
+//     stamps `X-Validation-Warning: <rule_id>` on the proxied
+//     response (warning only; status still 200/whatever the app
+//     returned). Closed enum; unknown values reject at
+//     create-time.
 type EdgeRuleValidateAction struct {
 	Schema                json.RawMessage `json:"schema"`
 	ContentTypes          []string        `json:"content_types,omitempty"`
 	ApplyWhileStreaming   bool            `json:"apply_while_streaming,omitempty"`
 	RejectOnUnknownFields bool            `json:"reject_on_unknown_fields,omitempty"`
 	MaxBodyBytes          int             `json:"max_body_bytes,omitempty"`
+	ValidateMode          string          `json:"validate_mode,omitempty"`
 }
+
+// ValidateMode values (issue #975 #3 / Mega-Foundation #979-a).
+// The set is small and closed; the gateway defaults to 'block'
+// when the rule row predates the column migration.
+const (
+	ValidateModeBlock   = "block"
+	ValidateModeObserve = "observe"
+	ValidateModeWarn    = "warn"
+)
 
 func (a *EdgeRuleValidateAction) Validate() *Problem {
 	if a == nil {
@@ -4228,6 +4414,19 @@ func (a *EdgeRuleValidateAction) Validate() *Problem {
 		return ErrValidation(fmt.Sprintf(
 			"validate action: max_body_bytes exceeds the platform cap (%d > %d)",
 			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	// ValidateMode: optional; empty == 'block' (the strictest mode,
+	// matches the NOT NULL DEFAULT 'block' the migration adds at
+	// 00293). Any non-empty value must be one of the three closed
+	// strings; an unknown value gets a 422 with the allowed list,
+	// not a 500.
+	if a.ValidateMode != "" &&
+		a.ValidateMode != ValidateModeBlock &&
+		a.ValidateMode != ValidateModeObserve &&
+		a.ValidateMode != ValidateModeWarn {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: validate_mode must be one of %q, %q, %q (got %q)",
+			ValidateModeBlock, ValidateModeObserve, ValidateModeWarn, a.ValidateMode))
 	}
 	return nil
 }

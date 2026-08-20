@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.field_error import FieldError
+    from ..models.log_excerpt import LogExcerpt
     from ..models.secret_finding import SecretFinding
 
 
@@ -90,6 +91,44 @@ class Problem:
     / SDK can render the hint as a one-line footer without
     parsing prose. Optional + omitempty.
     """
+    hint: str | Unset = UNSET
+    """Single short next-action line lifted from the
+    `pkg/whycopy` catalog (error-explanations cluster,
+    spec §6.4 amendment 1). Populated by the 9 cluster-
+    owned RFC 7807 codes (app_not_listening,
+    app_loopback_bound, app_arch_mismatch,
+    env_var_missing, app_healthz_unauthorized,
+    app_runtime_oom, dep_install_failed,
+    app_startup_timeout, stateless_only_violation). The
+    CLI renders this as the first line of the 5-line
+    error shape (`hint: <hint>`). Optional + omitempty
+    so every other problem+json site keeps its existing
+    3-line shape unchanged.
+    """
+    why: str | Unset = UNSET
+    """Human-readable cause with the observed value templated
+    in (error-explanations cluster, spec §6.4 amendment 1).
+    Distinct from `detail`: `detail` is the platform's
+    machine-stable message; `why` is the customer-facing
+    explanation. Multi-line (≤512 bytes per `pkg/whycopy`
+    catalog row). Optional + omitempty.
+    """
+    fix: str | Unset = UNSET
+    """Prescriptive remediation (1-3 lines, error-explanations
+    cluster, spec §6.4 amendment 1). Distinct from `hint`:
+    `hint` is a single line, `fix` is the bulleted
+    remediation list. The CLI renders this as
+    `→ fix: <fix>` with literal newlines preserved so the
+    multi-line shape survives. Optional + omitempty.
+    """
+    relevant_logs: list[LogExcerpt] | Unset = UNSET
+    """Per-line log excerpts that explain the failure (error-
+    explanations cluster, spec §6.4 amendment 1). The
+    detection site attaches the last N log lines that
+    caused the failure (capped at 20 entries × 512 bytes
+    each per CLI tripwire). The CLI renders the first 5
+    inline as a fenced block. Optional + omitempty.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +178,19 @@ class Problem:
 
         secret_hint = self.secret_hint
 
+        hint = self.hint
+
+        why = self.why
+
+        fix = self.fix
+
+        relevant_logs: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.relevant_logs, Unset):
+            relevant_logs = []
+            for relevant_logs_item_data in self.relevant_logs:
+                relevant_logs_item = relevant_logs_item_data.to_dict()
+                relevant_logs.append(relevant_logs_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -170,12 +222,21 @@ class Problem:
             field_dict["secret_findings"] = secret_findings
         if secret_hint is not UNSET:
             field_dict["secret_hint"] = secret_hint
+        if hint is not UNSET:
+            field_dict["hint"] = hint
+        if why is not UNSET:
+            field_dict["why"] = why
+        if fix is not UNSET:
+            field_dict["fix"] = fix
+        if relevant_logs is not UNSET:
+            field_dict["relevant_logs"] = relevant_logs
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.field_error import FieldError
+        from ..models.log_excerpt import LogExcerpt
         from ..models.secret_finding import SecretFinding
 
         d = dict(src_dict)
@@ -235,6 +296,21 @@ class Problem:
 
         secret_hint = d.pop("secret_hint", UNSET)
 
+        hint = d.pop("hint", UNSET)
+
+        why = d.pop("why", UNSET)
+
+        fix = d.pop("fix", UNSET)
+
+        _relevant_logs = d.pop("relevant_logs", UNSET)
+        relevant_logs: list[LogExcerpt] | Unset = UNSET
+        if _relevant_logs is not UNSET:
+            relevant_logs = []
+            for relevant_logs_item_data in _relevant_logs:
+                relevant_logs_item = LogExcerpt.from_dict(relevant_logs_item_data)
+
+                relevant_logs.append(relevant_logs_item)
+
         problem = cls(
             title=title,
             status=status,
@@ -250,6 +326,10 @@ class Problem:
             errors=errors,
             secret_findings=secret_findings,
             secret_hint=secret_hint,
+            hint=hint,
+            why=why,
+            fix=fix,
+            relevant_logs=relevant_logs,
         )
 
         problem.additional_properties = d

@@ -88,6 +88,11 @@ type MemStore struct {
 	keys      map[string]APIKey
 	keyByHash map[string]APIKey
 	apps      map[string]App
+	// consumerKeys is the ADR-120 store. Keyed by ConsumerKey.ID
+	// (UUID, generated at create time). The (appID, prefix) hot-
+	// path index is in-memory only — we walk the map on lookup
+	// (the memstore is a test fixture, not a production path).
+	consumerKeys map[string]ConsumerKey
 	// githubBindings is keyed by appID. Holds the (install_id,
 	// repo_full_name, production_branch) tuple the /oauth/callback
 	// handler writes after verifying the install against api.github.com
@@ -116,7 +121,16 @@ type MemStore struct {
 	// overwrites the same row instead of doubling.
 	buildProvenance map[string]BuildProvenance
 	domains         map[string]CustomDomain
-	crons           map[string]Cron
+	// doctorObs (ADR-120) is the in-memory mirror of the
+	// domain_doctor_observations table. The dns_poller is
+	// the sole writer; the doctor HTTP handler is the sole
+	// reader. Stored separately from `domains` because the
+	// observation row is per-domain but the doctor's pass
+	// enumerates both custom_domains and tenant_hostnames.
+	doctorObs map[string]DomainDoctorObservation
+	crons     map[string]Cron
+	triggers  map[string]sqlc.Trigger
+	records   map[string]sqlc.TriggerRecord
 	// fireNowRequests mirrors cron_fire_now_requests (migrations/00193)
 	// for in-process handler tests. Keyed by request id (UUID);
 	// status transitions follow the production 5-state CHECK (pending
@@ -154,6 +168,13 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// corsPresets mirrors cors_presets (issue #975 item #4 /
+	// Mega-Foundation #979-b). Keyed by presetID. PR-A exposes
+	// only the read path; the write surface lives in PR-B
+	// (#979-c, slot 00295) alongside the per-rule cors.preset_id
+	// field. Mirroring the read path here means handler tests
+	// can exercise the compile-side merge without a live PG.
+	corsPresets map[string]CorsPreset
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -545,6 +566,7 @@ func NewMemStore() *MemStore {
 		// Starts empty; CreateBuildProvenance fills it.
 		buildProvenance:      map[string]BuildProvenance{},
 		domains:              map[string]CustomDomain{},
+		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
 		fireNowRequests:      map[string]FireNowRequest{},
 		alertRules:           map[string]AlertRule{},
@@ -553,6 +575,11 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
+		corsPresets:          map[string]CorsPreset{},
+		// ADR-120 / issue #975 item #5 — consumer keys. The map is
+		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
+		// enforced at the read methods (same as the pg path).
+		consumerKeys: map[string]ConsumerKey{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
@@ -3257,6 +3284,20 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		copy(dst, src)
 		a.EgressAllowlist = dst
 	}
+	// ADR-118: per-app ingress IP allowlist. Same Set-bit convention
+	// as EgressAllowlist above. The DB trigger at
+	// migrations/00308_apps_public_auth_ip_allowlist.sql rejects
+	// non-v4/v6 families and masklen /0 (defence in depth on top of
+	// the apid parse step); the in-memory store trusts the apid
+	// layer to have already validated. Plan-gated upstream — Free/Hobby
+	// never reach this branch (apid returns 403 before the store
+	// is touched).
+	if p.SetPublicAuthIPAllowlist {
+		src := derefPrefixes(p.PublicAuthIPAllowlist)
+		dst := make([]netip.Prefix, len(src))
+		copy(dst, src)
+		a.PublicAuthIPAllowlist = dst
+	}
 	// Issue #169 / #172: per-app reactive scale-up trigger. Set
 	// distinguishes "unset" (don't touch) from "explicit zero"
 	// (disable). Apid already gated the plan and the bounds
@@ -3997,6 +4038,40 @@ func (m *MemStore) LatestSupersededDeployment(_ context.Context, appID string) (
 	return latest, nil
 }
 
+// GetDeploymentByIDScopedToSuperseded mirrors PgStore.GetDeploymentByIDScopedToSuperseded.
+// Returns the deployment only if it belongs to appID AND has status=DeploySuperseded.
+// Returns ErrNoRollbackTarget if the row is missing or belongs to a different app;
+// ErrRollbackTargetAlreadyLive if the row exists but is not superseded. SAFE-RELEASES-G.
+func (m *MemStore) GetDeploymentByIDScopedToSuperseded(_ context.Context, appID, deploymentID string) (Deployment, error) {
+	if appID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty appID")
+	}
+	if deploymentID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty deploymentID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok || d.AppID != appID {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q: %w", deploymentID, appID, ErrNoRollbackTarget)
+	}
+	if d.Status != DeploySuperseded {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q has status %q: %w",
+			deploymentID, appID, d.Status, ErrRollbackTargetAlreadyLive)
+	}
+	return d, nil
+}
+
+// HasSnapshotHistory always returns (false, nil) for the in-process
+// MemStore — the store doesn't model snapshot retention, so the
+// snapshot-GC race check is a no-op against MemStore. This preserves
+// the legacy happy-path test semantics (no seeded snapshot = check
+// skipped) without leaking test-only affordances into the production
+// PgStore path. SAFE-RELEASES-G.
+func (m *MemStore) HasSnapshotHistory(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // ListDeploymentsForApp mirrors PgStore.ListDeploymentsForApp: `limit <= 0`
 // means "no row cap" (every remaining row after offset). F-10: see PgStore
 // doc for the asymmetry that this version already conformed to.
@@ -4077,6 +4152,164 @@ func (m *MemStore) MarkDeploymentSuperseded(ctx context.Context, id string) erro
 
 func (m *MemStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return m.UpdateDeploymentStatus(ctx, id, DeployLive, "")
+}
+
+// AppendDeploymentStage (ADR-117, migration 00302) — memstore
+// mirror of PgStore.AppendDeploymentStage. The in-memory shape
+// round-trips through JSON so the tests that exercise the SSE
+// consumer at handlers_ext_test.go and the deployment lifecycle
+// at imaged tests see the exact same wire bytes as production.
+// See pgstore.go::AppendDeploymentStage for the contract.
+func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("AppendDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current != from {
+		// Schema default for stage_state.current is
+		// "source_download" (migrations/00302). A freshly inserted
+		// row that came through CreateDeployment without an
+		// explicit StageState has Current == "" — treat that as
+		// the default so the first forward transition doesn't
+		// surface a spurious ErrNotFound.
+		if state.Current != "" {
+			return Deployment{}, ErrNotFound
+		}
+		if from != StageSourceDownload {
+			return Deployment{}, ErrNotFound
+		}
+		state.Current = StageSourceDownload
+	}
+	// Forward transition vs. failure-stamp. Same shape as
+	// pgstore.AppendDeploymentStage — see the docblock there. The
+	// failure path is now owned by MarkDeploymentStageFailed
+	// (mirror below); `from == to` here is a programming error.
+	if from == to {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: from==to is reserved for MarkDeploymentStageFailed (deployment=%s, stage=%s)", id, from)
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	startedAt := at
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       from,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = to
+	state.CurrentStartedAt = &startedAt
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
+}
+
+// MarkDeploymentStageFailed — memstore mirror of
+// PgStore.MarkDeploymentStageFailed. See the docblock there for
+// the contract.
+func (m *MemStore) MarkDeploymentStageFailed(_ context.Context, id string, at time.Time, reason string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current == "" {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusFailed,
+		Reason:     reason,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
+}
+
+// CloseDeploymentStage — memstore mirror of PgStore. See
+// pkg/state/store.go::CloseDeploymentStage for the docblock.
+func (m *MemStore) CloseDeploymentStage(_ context.Context, id string, name StageName, at time.Time) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("CloseDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current == "" || state.Current != name {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
 }
 
 func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, bytes int64) error {
@@ -4224,6 +4457,32 @@ func (m *MemStore) SetDeploymentFailed(_ context.Context, id, code, message stri
 	d.Status = DeployFailed
 	d.Error = message
 	d.ErrorCode = code
+	m.deployments[id] = d
+	return d, nil
+}
+
+// SetDeploymentFailedEx is the error-explanations cluster (spec §6.4
+// amendment 1) extension of SetDeploymentFailed. Writes the four
+// customer-facing prose fields alongside the RFC 7807 code so the
+// in-process store mirrors the persistence shape introduced by
+// migration 00290. The unit-test suite that exercises MemStore stays
+// aligned with PgStore.
+func (m *MemStore) SetDeploymentFailedEx(
+	_ context.Context, id, code, message, hint, why, fix string, logs []api.LogExcerpt,
+) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	d.Status = DeployFailed
+	d.Error = message
+	d.ErrorCode = code
+	d.ErrorHint = hint
+	d.ErrorWhy = why
+	d.ErrorFix = fix
+	d.ErrorRelevantLogs = logs
 	m.deployments[id] = d
 	return d, nil
 }
@@ -4702,6 +4961,46 @@ func (m *MemStore) DeleteCustomDomain(_ context.Context, domain string) error {
 	return nil
 }
 
+// --- domain_doctor_observations (ADR-120) ------------------------------------
+
+func (m *MemStore) UpsertDoctorObservation(_ context.Context, obs DomainDoctorObservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.doctorObs[obs.Domain]; ok && obs.SurfaceID == "" {
+		obs.SurfaceID = existing.SurfaceID
+	}
+	m.doctorObs[obs.Domain] = obs
+	return nil
+}
+
+func (m *MemStore) GetDoctorObservation(_ context.Context, domain string) (DomainDoctorObservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obs, ok := m.doctorObs[domain]
+	if !ok {
+		return DomainDoctorObservation{}, ErrNotFound
+	}
+	return obs, nil
+}
+
+func (m *MemStore) ListAllCustomDomainsForDoctor(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{})
+	var out []string
+	for d := range m.domains {
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	for _, h := range m.tenantHostnames {
+		if _, ok := seen[h.Hostname]; !ok {
+			seen[h.Hostname] = struct{}{}
+			out = append(out, h.Hostname)
+		}
+	}
+	return out, nil
+}
+
 // --- Crons ------------------------------------------------------------------
 
 func (m *MemStore) CreateCron(_ context.Context, appID, schedule, path string, enabled bool) (Cron, error) {
@@ -4951,6 +5250,285 @@ func (m *MemStore) ListEnabledCrons(_ context.Context) ([]Cron, error) {
 		}
 	}
 	return out, nil
+}
+
+// --- Triggers (issue #757 / ADR-0NN; commit #6) -------------------------
+//
+// MemStore keeps an in-memory map mirroring the pgstore triggers /
+// trigger_records / trigger_dead_letter tables. The triggers map is
+// keyed by id (uuid); records are keyed by id; the dead-letter
+// queue is keyed by record id. The handlers + schedd tests use the
+// memstore rather than spinning up Postgres.
+//
+// The MemStore triggers implement only the Store-interface surface
+// (CRUD + per-app fan-out + the per-record transition verbs the
+// apid operator actions invoke). The schedd-side dispatch tick
+// (#14) reads from ListEnabledTriggers + ClaimTriggerRecords; both
+// are stubbed here so tests can run without a live Postgres.
+
+func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slug string, enabled bool, _ []byte, _, _, _, payloadMaxBytes int32, brokerPoisonStrategy string, limits api.Limits) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	perApp := 0
+	perAccount := 0
+	for _, t := range m.triggers {
+		if t.AppID.String() == appID {
+			perApp++
+		}
+	}
+	if limits.TriggerLimitPerApp > 0 && perApp >= limits.TriggerLimitPerApp {
+		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeApp, Limit: limits.TriggerLimitPerApp, Observed: perApp}
+	}
+	for range m.triggers {
+		perAccount++ // memstore has no per-account join — single-app single-account default
+	}
+	if limits.TriggerLimitPerAccount > 0 && perAccount >= limits.TriggerLimitPerAccount {
+		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeAccount, Limit: limits.TriggerLimitPerAccount, Observed: perAccount}
+	}
+	if payloadMaxBytes <= 0 {
+		payloadMaxBytes = 6291456
+	}
+	if brokerPoisonStrategy == "" {
+		brokerPoisonStrategy = "commit"
+	}
+	t := sqlc.Trigger{
+		ID:                   pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AccountID:            pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AppID:                pgtype.UUID{Bytes: parseMemUUIDString(appID), Valid: true},
+		Kind:                 kind,
+		Slug:                 slug,
+		Enabled:              enabled,
+		Config:               []byte("{}"),
+		BatchSizeMax:         64,
+		BatchWindowMs:        1000,
+		MaxAttempts:          5,
+		PayloadMaxBytes:      payloadMaxBytes,
+		BrokerPoisonStrategy: brokerPoisonStrategy,
+		CreatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		UpdatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}
+	if m.triggers == nil {
+		m.triggers = map[string]sqlc.Trigger{}
+	}
+	m.triggers[t.ID.String()] = t
+	return t, nil
+}
+
+func (m *MemStore) TriggerByID(_ context.Context, id string) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.triggers[id]
+	if !ok {
+		return sqlc.Trigger{}, ErrNotFound
+	}
+	return t, nil
+}
+
+func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.triggers[id]
+	if !ok {
+		return sqlc.Trigger{}, ErrNotFound
+	}
+	if enabled != nil {
+		t.Enabled = *enabled
+	}
+	if payloadMaxBytes != nil {
+		t.PayloadMaxBytes = *payloadMaxBytes
+	}
+	if brokerPoisonStrategy != nil {
+		t.BrokerPoisonStrategy = *brokerPoisonStrategy
+	}
+	if filterCriteria != nil {
+		// REVIEW-FIX MED-1: nil = "leave unchanged" (mirrors
+		// pgstore coalesce()); non-nil = "replace the JSONB
+		// column". Memstore treats the byte slice as opaque.
+		fc := *filterCriteria
+		t.FilterCriteria = fc
+	}
+	t.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	m.triggers[id] = t
+	return t, nil
+}
+
+func (m *MemStore) DeleteTrigger(_ context.Context, id, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.triggers, id)
+	return nil
+}
+
+func (m *MemStore) ListTriggersForApp(_ context.Context, appID string) ([]sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.Trigger
+	for _, t := range m.triggers {
+		if t.AppID.String() == appID {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ListEnabledTriggers(_ context.Context) ([]sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.Trigger
+	for _, t := range m.triggers {
+		if t.Enabled {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ClaimTriggerRecords(_ context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.TriggerRecord
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.State == "pending" && len(out) < int(limit) {
+			r.State = "claimed"
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// InsertTriggerRecord mirrors PgStore.InsertTriggerRecord for the
+// in-memory store. Returns the persisted (or existing-on-duplicate)
+// record id. Mirrors the ON CONFLICT (trigger_id, item_identifier)
+// DO NOTHING semantics with a Map key probe; on a duplicate the
+// existing row's id is returned so callers don't need a second
+// lookup. Review finding #1 (PR #910).
+func (m *MemStore) InsertTriggerRecord(_ context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Dedup probe — mirrors ON CONFLICT DO NOTHING on the
+	// (trigger_id, item_identifier) unique pair.
+	for id, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return id, nil
+		}
+	}
+	id := uuid.NewString()
+	now := time.Now()
+	if payload == nil {
+		payload = []byte("{}")
+	}
+	if headers == nil {
+		headers = []byte("{}")
+	}
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+	m.records[id] = sqlc.TriggerRecord{
+		ID:             pgtype.UUID{Bytes: parseMemUUIDString(id), Valid: true},
+		TriggerID:      pgtype.UUID{Bytes: parseMemUUIDString(triggerID), Valid: true},
+		ItemIdentifier: itemIdentifier,
+		Payload:        payload,
+		Headers:        headers,
+		Metadata:       metadata,
+		State:          "pending",
+		Attempts:       0,
+		NextFireAt:     pgtypeFromTime(now),
+		ReceivedAt:     pgtypeFromTime(now),
+	}
+	return id, nil
+}
+
+func (m *MemStore) MarkTriggerRecordSucceeded(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "succeeded"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) MarkTriggerRecordRetry(_ context.Context, id, _ string, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "retry"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) MarkTriggerRecordDeadLetter(_ context.Context, id, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "dead_letter"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) InsertTriggerDeadLetter(_ context.Context, _, _, _, _ string, _ []byte) error {
+	return nil
+}
+
+// TriggerRecordIDByItemIdentifier (audit round 2 finding #1,
+// PR #910): the MemStore's InsertTriggerRecord builds a UUID
+// for the row at insert time; the bridge helper walks m.records
+// to find the matching UUID. Returns "" (nil err) when no row
+// matches — callers treat that as "rate-limit fired before
+// insert; skip the dead_letter; record will be retried".
+func (m *MemStore) TriggerRecordIDByItemIdentifier(_ context.Context, triggerID, itemIdentifier string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return r.ID.String(), nil
+		}
+	}
+	return "", nil
+}
+
+func (m *MemStore) ListTriggerDeadLetter(_ context.Context, _ string, _ int32) ([]sqlc.TriggerDeadLetter, error) {
+	return nil, nil
+}
+
+func (m *MemStore) ListTriggerRecordsForTrigger(_ context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.TriggerRecord
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && len(out) < int(limit) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) RetryTriggerRecordByOperator(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if !ok {
+		return ErrNotFound
+	}
+	r.State = "pending"
+	r.Attempts = 0
+	m.records[id] = r
+	return nil
+}
+
+func (m *MemStore) DropTriggerRecordByOperator(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.records[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.records, id)
+	return nil
 }
 
 // --- Invocations (Move 1 event-shaped queue: async_invoke / queue /
@@ -9076,6 +9654,7 @@ func (m *MemStore) ListAppSecretsForAccount(_ context.Context, accountID string,
 			AppID:      s.AppID,
 			AppSlug:    slug,
 			Key:        s.Key,
+			Scope:      s.Scope,
 			Ciphertext: s.Ciphertext,
 			CreatedAt:  s.CreatedAt,
 			UpdatedAt:  s.UpdatedAt,
@@ -9606,6 +10185,15 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	// Snapshots + builds are keyed by deployment_id; resolve the
 	// deployment set first.
 	deletedDeployments := map[string]struct{}{}
+	// consumer_keys (ADR-120 / issue #975 item #5). Mirror the
+	// pgstore ON DELETE CASCADE — when an account is hard-deleted,
+	// every consumer_keys row keyed to that account goes with it.
+	// Mirrors the api_keys cascade pattern immediately below.
+	for kid, k := range m.consumerKeys {
+		if k.AccountID == id {
+			delete(m.consumerKeys, kid)
+		}
+	}
 	for did, d := range m.deployments {
 		if app, ok := m.apps[d.AppID]; ok && app.AccountID == id {
 			deletedDeployments[did] = struct{}{}
@@ -10260,6 +10848,86 @@ func (m *MemStore) GetEdgeRuleByID(_ context.Context, id string) (EdgeRule, erro
 		return EdgeRule{}, ErrNotFound
 	}
 	return r, nil
+}
+
+// ListCorsPresetsForAccount mirrors the pgstore query: every
+// preset the account owns (both account-wide and app-scoped). The
+// (app_id NULLS FIRST, name) order keeps the compile-side cache
+// key deterministic — see cmd/gatewayd-internal/edge_rules.go.
+func (m *MemStore) ListCorsPresetsForAccount(_ context.Context, accountID string) ([]CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AccountID == accountID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// AppID == "" means account-wide (NULL in pg). The
+		// NULLS FIRST order puts account-wide presets before
+		// app-scoped ones in the returned slice so a stable
+		// "preset defined first wins" override rule has a
+		// defined tiebreak.
+		iWide := out[i].AppID == ""
+		jWide := out[j].AppID == ""
+		if iWide != jWide {
+			return iWide
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// ListCorsPresetsForApp returns the app-scoped presets only,
+// scoped to the caller's account. The compile path unions this
+// with the account-wide result from ListCorsPresetsForAccount.
+// accountID is defense-in-depth (the apps row is FK-scoped to
+// one account, so the appID match alone is sufficient); the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+// Empty appID is rejected so the strict-scope contract cannot
+// be subverted by a caller passing "" (which would otherwise
+// match the AppID="" of every account-wide preset — see the
+// medium-code-review IDOR finding for the historical pg/memstore
+// divergence).
+func (m *MemStore) ListCorsPresetsForApp(_ context.Context, accountID, appID string) ([]CorsPreset, error) {
+	if appID == "" {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AccountID == accountID && p.AppID == appID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// GetCorsPresetByID returns the preset scoped to the caller's
+// account or ErrNotFound. accountID is required so the Store
+// boundary enforces tenancy — the pgstore equivalent pins
+// account_id in the WHERE clause, this mirror keeps the two
+// stores behaviorally aligned.
+func (m *MemStore) GetCorsPresetByID(_ context.Context, accountID, id string) (CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.corsPresets[id]
+	if !ok {
+		return CorsPreset{}, ErrNotFound
+	}
+	if p.AccountID != accountID {
+		// Cross-tenant probe: surface as ErrNotFound so the
+		// wire-side message is stable (matches the pgstore
+		// behavior where a WHERE on account_id returns no rows).
+		return CorsPreset{}, ErrNotFound
+	}
+	return p, nil
 }
 
 // UpdateEdgeRule mirrors the pgstore nil-skip semantics. Action
@@ -12103,4 +12771,193 @@ func uuidToPgtype(s string) pgtype.UUID {
 // consistent with pgstore.
 func pgtypeTimestamptzFromTime(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// Consumer keys (ADR-120 / issue #975 item #5).
+//
+// Mirror PgStore semantics exactly: same IDOR-safe WHERE
+// predicates (accountID pinned on every read), same idempotent
+// revoke (revoke-after-revoke returns the same row), same empty-
+// id error mapping. The memstore is a test fixture — if it
+// diverges from pgstore, callers validated against memstore ship
+// bugs when moved to PG. Symmetric strictness is the rule.
+
+// consumerKeyAccountIDOf returns accountID + ok=false if the
+// caller passed an empty keyID. The pg path's pgx.ErrNoRows →
+// ErrNotFound collapse gives the same observable; we mirror it
+// here so handlers don't have to special-case.
+func consumerKeyAccountIDOf(ctx context.Context, accountID, keyID string) (string, bool) {
+	_ = ctx
+	if accountID == "" || keyID == "" {
+		return "", false
+	}
+	return accountID, true
+}
+
+func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, prefix string, hash []byte, scopes []string, expiresAt *time.Time) (ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: empty account_id or app_id")
+	}
+	if len(hash) != 32 {
+		return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
+	}
+	if len(scopes) == 0 {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00329)")
+	}
+	// Closed-set vocab: pgstore's consumer_keys_scopes_vocab_chk rejects
+	// anything outside {read, write, admin}. Memstore mirrored the empty
+	// guard but NOT the vocab — a Store-level test that bypasses the
+	// apid validator (PR #5-B) could seed an out-of-vocab scope and the
+	// memstore would accept it, while the pg path silently rejects with
+	// SQLSTATE 23514. Pin the surface here so pg ↔ memstore agree.
+	for _, s := range scopes {
+		switch s {
+		case "read", "write", "admin":
+			// ok
+		default:
+			return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: scope %q is not in the closed-set {read, write, admin} (00329 vocab CHECK)", s)
+		}
+	}
+	if expiresAt != nil && expiresAt.Before(time.Now()) {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00329)")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Mirror the (account_id, app_id, name) UNIQUE from 00329.
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID && k.Name == name {
+			return ConsumerKey{}, ErrConflict
+		}
+	}
+	k := ConsumerKey{
+		ID:        newID(),
+		AccountID: accountID,
+		AppID:     appID,
+		Name:      name,
+		Prefix:    prefix,
+		Hash:      append([]byte(nil), hash...),
+		Scopes:    append([]string(nil), scopes...),
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: expiresAt,
+	}
+	m.consumerKeys[k.ID] = k
+	return k, nil
+}
+
+func (m *MemStore) GetConsumerKeyByID(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if _, ok := consumerKeyAccountIDOf(ctx, accountID, keyID); !ok {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.AccountID != accountID {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, nil
+}
+
+func (m *MemStore) ListConsumerKeysForApp(ctx context.Context, accountID, appID string) ([]ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return nil, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []ConsumerKey
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID {
+			out = append(out, k)
+		}
+	}
+	// Order by created_at desc to match the pg query. Stable tie-
+	// break by ID so the test fixtures are deterministic.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// RevokeConsumerKey mirrors pgstore: idempotent (revoke-after-
+// revoke returns the same row without error), ErrNotFound only if
+// the key never existed for the account.
+func (m *MemStore) RevokeConsumerKey(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if _, ok := consumerKeyAccountIDOf(ctx, accountID, keyID); !ok {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.AccountID != accountID {
+		return ConsumerKey{}, ErrNotFound
+	}
+	if k.RevokedAt == nil {
+		now := time.Now().UTC()
+		k.RevokedAt = &now
+		m.consumerKeys[k.ID] = k
+	}
+	return k, nil
+}
+
+// TouchConsumerKeyLastUsed mirrors pgstore's WHERE filter on
+// revoked_at IS NULL — best-effort observability, no failure if
+// the key was just killed.
+func (m *MemStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) error {
+	if keyID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.RevokedAt != nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	k.LastUsedAt = &now
+	m.consumerKeys[k.ID] = k
+	return nil
+}
+
+// ConsumerKeyByAppAndPrefix mirrors pgstore: walks the map,
+// matches on (AccountID, AppID, Prefix), collapses misses to
+// ErrNotFound. The (app_id, prefix) composite index is in-memory
+// only — the memstore is a test fixture, not a production path.
+func (m *MemStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appID, prefix string) (ConsumerKey, error) {
+	_ = ctx
+	if accountID == "" || appID == "" || prefix == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID && k.Prefix == prefix {
+			return k, nil
+		}
+	}
+	return ConsumerKey{}, ErrNotFound
+}
+
+// memNewUUID returns a freshly-minted 16-byte UUID for the
+// memstore's trigger-stub helpers (commit #6). Real production
+// code never sees this — the apid's MemStore tests do.
+func memNewUUID() [16]byte {
+	var b [16]byte
+	b[0] = byte(time.Now().UnixNano() & 0xff)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC4122
+	return b
+}
+
+// parseMemUUIDString decodes a hyphenated hex string UUID into a
+// [16]byte for memstore internals.
+func parseMemUUIDString(s string) [16]byte {
+	var b [16]byte
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return b
+	}
+	copy(b[:], uid[:])
+	return b
 }

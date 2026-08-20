@@ -387,3 +387,95 @@ func TestLivenessRecv_CooldownGateEmptyDeploymentIDBypasses(t *testing.T) {
 		t.Errorf("empty deploymentID must bypass cooldown: sink.count = %d, want 1", sink.count())
 	}
 }
+
+// TestLivenessRecv_UnauthorizedCountedClassifies pins Cluster A's
+// discriminator (spec §6.4 amendment 1): 3 consecutive
+// livenessOutcomeUnauthorized outcomes fire the relay with reason
+// "liveness_unauthorized". Pre-Cluster-A this path was only reached
+// under //go:build metal via the schedd's
+// DestroyForLivenessFailure → app_healthz_unauthorized stamping.
+// The unit-level pin lets us catch regressions in the runOne +
+// classifyLivenessOutcome wiring without spinning up a real VM.
+func TestLivenessRecv_UnauthorizedCountedClassifies(t *testing.T) {
+	loop, sink, _ := newTestLoop(t, "inst-unauth-1", 3)
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeUnauthorized
+	}
+	for i := 0; i < 3; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("sink.count = %d, want 1 (3 consecutive unauthorized must fire relay)", sink.count())
+	}
+	// Pin the reason string — sched/engine.go:5038 matches on
+	// reason == "liveness_unauthorized" to stamp
+	// app_healthz_unauthorized on the deployment row. Drift in
+	// the classifyLivenessOutcome switch arm would silently
+	// break the wire-shape mapping.
+	last := sink.calls[len(sink.calls)-1]
+	if last.reason != "liveness_unauthorized" {
+		t.Errorf("relay reason = %q, want %q", last.reason, "liveness_unauthorized")
+	}
+}
+
+// TestLivenessRecv_UnauthorizedResetsOnSuccess mirrors
+// TestLivenessRecv_CounterSurvivesIntermittentSuccess for the
+// unauthorized outcome: the counter must reset on the first 2xx,
+// so 401/401/200/401/401/401 fires exactly once (the third 401
+// in the trailing sequence). Folding unauthorized into non_200
+// would still pass this test (same counter); the discriminator
+// matters for the wire reason, which
+// TestLivenessRecv_UnauthorizedCountedClassifies pins separately.
+func TestLivenessRecv_UnauthorizedResetsOnSuccess(t *testing.T) {
+	loop, sink, _ := newTestLoop(t, "inst-unauth-2", 3)
+	outcomes := []string{
+		livenessOutcomeUnauthorized,
+		livenessOutcomeUnauthorized,
+		livenessOutcomeOK,
+		livenessOutcomeUnauthorized,
+		livenessOutcomeUnauthorized,
+		livenessOutcomeUnauthorized,
+	}
+	loop.probeFn = func(_ context.Context, _ int) string {
+		if len(outcomes) == 0 {
+			return livenessOutcomeOK
+		}
+		out := outcomes[0]
+		outcomes = outcomes[1:]
+		return out
+	}
+	for i := 0; i < 6; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("sink.count = %d, want 1 (200 in the middle must reset counter; trailing 401s then fire)", sink.count())
+	}
+}
+
+// TestLivenessRecv_ForbiddenCountedClassifies is the 403-arm pin:
+// the cmd/vmmd/liveness_recv.go:372 discriminator folds 403 into
+// livenessOutcomeUnauthorized (same as 401). Without this test,
+// a future refactor that splits 401 vs 403 into two outcomes would
+// silently break the wire mapping (the schedd side checks
+// "liveness_unauthorized" reason — drift in the classify switch
+// would orphan the 403 case).
+func TestLivenessRecv_ForbiddenCountedClassifies(t *testing.T) {
+	loop, sink, _ := newTestLoop(t, "inst-forbidden-1", 2)
+	// Same outcome string — the test exercises the
+	// runOne+classifyLivenessOutcome path. The 401 vs 403 split
+	// happens earlier (in dialAndProbe); here we pin that
+	// whatever maps to livenessOutcomeUnauthorized produces the
+	// expected wire reason.
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeUnauthorized
+	}
+	loop.runOne(context.Background(), 2000)
+	loop.runOne(context.Background(), 2000)
+	if sink.count() != 1 {
+		t.Errorf("sink.count = %d, want 1 (2 consecutive unauthorized — including 403-folded — must fire)", sink.count())
+	}
+	last := sink.calls[len(sink.calls)-1]
+	if last.reason != "liveness_unauthorized" {
+		t.Errorf("relay reason = %q, want %q (403 must map to liveness_unauthorized, not its own arm)", last.reason, "liveness_unauthorized")
+	}
+}

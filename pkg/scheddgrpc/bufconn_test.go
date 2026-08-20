@@ -49,6 +49,10 @@ type fakeEngine struct {
 	// (idempotent no-op, mirroring the production engine's
 	// behaviour for a non-RUNNING instance).
 	destroyFn func(ctx context.Context, instanceID, reason string) error
+	// destroyForWorkloadOOMFn (Cluster C / ADR-121) drives the
+	// ReportWorkloadOOM handler tests. Default nil = no-op (mirrors
+	// destroyFn above).
+	destroyForWorkloadOOMFn func(ctx context.Context, instanceID string, peakMB, planMB int) error
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
@@ -157,6 +161,17 @@ func (f *fakeEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
 func (f *fakeEngine) DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error {
 	if f.destroyFn != nil {
 		return f.destroyFn(ctx, instanceID, reason)
+	}
+	return nil
+}
+
+// DestroyForWorkloadOOMFailure (Cluster C / ADR-121) — the default
+// fake returns nil. Tests that exercise the failure classification
+// wire (workload_oom_test.go) inject a custom
+// destroyForWorkloadOOMFn.
+func (f *fakeEngine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID string, peakMB, planMB int) error {
+	if f.destroyForWorkloadOOMFn != nil {
+		return f.destroyForWorkloadOOMFn(ctx, instanceID, peakMB, planMB)
 	}
 	return nil
 }

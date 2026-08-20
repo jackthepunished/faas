@@ -192,6 +192,20 @@ $$;
 
 
 --
+-- Name: cors_presets_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.cors_presets_set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: edge_rules_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -383,6 +397,22 @@ CREATE FUNCTION public.pg_tier_rank(tier text) RETURNS integer
         ELSE 0
     END
 $$;
+
+
+--
+-- Name: trg_notify_trigger_ready(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.trg_notify_trigger_ready() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify('trigger_ready',
+        json_build_object('trigger_id', NEW.trigger_id,
+                          'record_id',  NEW.id,
+                          'item_id',    NEW.item_identifier)::text);
+    RETURN NEW;
+END $$;
 
 
 SET default_table_access_method = heap;
@@ -716,6 +746,7 @@ CREATE TABLE public.apps (
     github_production_branch text,
     min_instances integer DEFAULT 0 NOT NULL,
     egress_allowlist cidr[] DEFAULT '{}'::cidr[] NOT NULL,
+    public_auth_ip_allowlist cidr[] DEFAULT '{}'::cidr[] NOT NULL,
     autoscale_target_rps integer,
     autoscale_target_cpu_pct integer,
     github_install_binding_id text,
@@ -765,7 +796,7 @@ CREATE TABLE public.apps (
     CONSTRAINT apps_node_id_nonempty_chk CHECK ((node_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
     CONSTRAINT apps_overflow_node_chk CHECK (((overflow_node IS NULL) OR (overflow_node <> '00000000-0000-0000-0000-000000000000'::uuid))),
     CONSTRAINT apps_preview_pr_state_chk CHECK (((preview_pr_state = ANY (ARRAY['open'::text, 'closed'::text, 'stale'::text, 'torn_down'::text])) OR (preview_pr_state IS NULL))),
-    CONSTRAINT apps_public_auth_mode_chk CHECK ((public_auth_mode = ANY (ARRAY['open'::text, 'bearer'::text, 'basic'::text]))),
+    CONSTRAINT apps_public_auth_mode_chk CHECK ((public_auth_mode = ANY (ARRAY['open'::text, 'bearer'::text, 'basic'::text, 'ip_allowlist'::text]))),
     CONSTRAINT apps_ram_mb_check CHECK ((ram_mb > 0)),
     CONSTRAINT apps_reassigned_at_chk CHECK (((reassigned_at IS NULL) OR (reassigned_at <= (now() + '00:01:00'::interval)))),
     CONSTRAINT apps_runtime_check CHECK (((runtime IS NULL) OR (runtime = ANY (ARRAY['node22'::text, 'python312'::text, 'go124'::text, 'go124-alpine'::text, 'node24'::text, 'python313'::text])))),
@@ -944,6 +975,32 @@ CREATE TABLE public.compute_node_keys (
 
 
 --
+-- Name: consumer_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.consumer_keys (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    name text NOT NULL,
+    prefix text NOT NULL,
+    hashed_secret bytea NOT NULL,
+    scopes text[] DEFAULT '{}'::text[] NOT NULL,
+    expires_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT consumer_keys_expires_after_created_chk CHECK (((expires_at IS NULL) OR (expires_at > created_at))),
+    CONSTRAINT consumer_keys_hashed_secret_len_chk CHECK ((octet_length(hashed_secret) = 32)),
+    CONSTRAINT consumer_keys_name_len_chk CHECK (((length(name) >= 1) AND (length(name) <= 64))),
+    CONSTRAINT consumer_keys_prefix_len_chk CHECK (((length(prefix) >= 1) AND (length(prefix) <= 16))),
+    CONSTRAINT consumer_keys_revoked_state_chk CHECK (((revoked_at IS NULL) OR (revoked_at >= created_at))),
+    CONSTRAINT consumer_keys_scopes_vocab_chk CHECK ((scopes <@ ARRAY['read'::text, 'write'::text, 'admin'::text]::text[]) AND (cardinality(scopes) > 0))
+);
+
+
+--
 -- Name: compute_nodes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1035,6 +1092,29 @@ COMMENT ON COLUMN public.compute_nodes.role IS 'per-node role label: control-pla
 --
 
 COMMENT ON COLUMN public.compute_nodes.generation IS 'monotonic counter bumped by PR-4 doctor on per-node inconsistency detection (PR-3a). Default 0; never decreases.';
+
+
+--
+-- Name: cors_presets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cors_presets (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid,
+    name text NOT NULL,
+    description text,
+    allow_origins text[] NOT NULL,
+    allow_methods text[] NOT NULL,
+    allow_headers text[] DEFAULT '{}'::text[] NOT NULL,
+    expose_headers text[] DEFAULT '{}'::text[] NOT NULL,
+    allow_credentials boolean DEFAULT false NOT NULL,
+    max_age_seconds integer DEFAULT 600 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cors_presets_name_check CHECK (((length(name) >= 1) AND (length(name) <= 64))),
+    CONSTRAINT cors_presets_max_age_check CHECK (((max_age_seconds >= 0) AND (max_age_seconds <= 86400)))
+);
 
 
 --
@@ -1297,7 +1377,7 @@ CREATE TABLE public.edge_rules (
     action jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT edge_rules_kind_check CHECK ((kind = ANY (ARRAY['route'::text, 'rewrite'::text, 'redirect'::text, 'headers'::text, 'cors'::text, 'jwt'::text, 'ip'::text, 'validate'::text, 'limit'::text, 'geo'::text, 'maintenance'::text, 'throttle'::text]))),
+CONSTRAINT edge_rules_kind_check CHECK ((kind = ANY (ARRAY['route'::text, 'rewrite'::text, 'redirect'::text, 'headers'::text, 'cors'::text, 'jwt'::text, 'ip'::text, 'validate'::text, 'limit'::text, 'geo'::text, 'maintenance'::text, 'throttle'::text]))),
     CONSTRAINT edge_rules_priority_check CHECK (((priority >= 0) AND (priority <= 10000)))
 );
 
@@ -1495,7 +1575,7 @@ CREATE TABLE public.invocations (
     org_id uuid,
     outcome text,
     CONSTRAINT invocations_outcome_check CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['success'::text, 'failed'::text, 'timeout'::text, 'dead_letter'::text])))),
-    CONSTRAINT invocations_source_check CHECK ((source = ANY (ARRAY['async_invoke'::text, 'queue'::text, 'delayed_task'::text, 'cron'::text, 'replay'::text]))),
+    CONSTRAINT invocations_source_check CHECK ((source = ANY (ARRAY['async_invoke'::text, 'queue'::text, 'delayed_task'::text, 'cron'::text, 'replay'::text, 'esm'::text]))),
     CONSTRAINT invocations_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'dispatching'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'dead_letter'::text])))
 );
 
@@ -1951,9 +2031,80 @@ CREATE TABLE public.tenant_surfaces (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tenant_surfaces_app_or_not_chk CHECK ((app_id IS NOT NULL)),
-    CONSTRAINT tenant_surfaces_cert_kind_check CHECK ((cert_kind = ANY (ARRAY['per_host_san'::text, 'shared_wildcard'::text, 'per_host'::text]))),
+CONSTRAINT tenant_surfaces_cert_kind_check CHECK ((cert_kind = ANY (ARRAY['per_host_san'::text, 'shared_wildcard'::text, 'per_host'::text]))),
     CONSTRAINT tenant_surfaces_cert_state_check CHECK ((cert_state = ANY (ARRAY['none'::text, 'pending'::text, 'issued'::text, 'failed'::text]))),
     CONSTRAINT tenant_surfaces_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'suspended'::text, 'deleted'::text])))
+);
+
+
+--
+-- Name: trigger_dead_letter; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.trigger_dead_letter (
+    record_id uuid NOT NULL,
+    trigger_id uuid NOT NULL,
+    reason text NOT NULL,
+    routed_to text NOT NULL,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT trigger_dead_letter_reason_check CHECK ((reason = ANY (ARRAY['rate_limited'::text, 'poison_record'::text, 'max_attempts'::text, 'broker_error'::text, 'plan_quota'::text, 'payload_too_large'::text, 'customer_disabled'::text]))),
+    CONSTRAINT trigger_dead_letter_routed_to_check CHECK ((routed_to = ANY (ARRAY['drop'::text, 'manual_retry'::text, 'customer_dlq'::text])))
+);
+
+
+--
+-- Name: trigger_records; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.trigger_records (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    trigger_id uuid NOT NULL,
+    item_identifier text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    headers jsonb DEFAULT '{}'::jsonb NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_fire_at timestamp with time zone DEFAULT now() NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_error text,
+    last_dispatched_at timestamp with time zone,
+    CONSTRAINT trigger_records_attempts_check CHECK (((attempts >= 0) AND (attempts <= 25))),
+    CONSTRAINT trigger_records_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'succeeded'::text, 'retry'::text, 'dead_letter'::text])))
+);
+
+
+--
+-- Name: triggers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.triggers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    kind text NOT NULL,
+    slug text NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    batch_size_max integer DEFAULT 64 NOT NULL,
+    batch_window_ms integer DEFAULT 1000 NOT NULL,
+    max_attempts integer DEFAULT 5 NOT NULL,
+    cron_id uuid,
+    source text,
+    payload_max_bytes integer DEFAULT 6291456 NOT NULL,
+    broker_poison_strategy text DEFAULT 'commit'::text NOT NULL,
+    filter_criteria jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT triggers_batch_size_max_check CHECK (((batch_size_max >= 1) AND (batch_size_max <= 5000))),
+    CONSTRAINT triggers_batch_window_ms_check CHECK (((batch_window_ms >= 10) AND (batch_window_ms <= 600000))),
+    CONSTRAINT triggers_broker_poison_strategy_check CHECK ((broker_poison_strategy = ANY (ARRAY['commit'::text, 'seek-to-offset'::text]))),
+    CONSTRAINT triggers_check CHECK ((((kind = 'cron'::text) AND (cron_id IS NOT NULL) AND (source IS NULL)) OR ((kind <> 'cron'::text) AND (cron_id IS NULL)))),
+    CONSTRAINT triggers_kind_check CHECK ((kind = ANY (ARRAY['cron'::text, 'kafka'::text, 'nats'::text, 'redis_streams'::text, 'sqs_compat'::text, 'queue'::text]))),
+    CONSTRAINT triggers_max_attempts_check CHECK (((max_attempts >= 1) AND (max_attempts <= 25))),
+    CONSTRAINT triggers_payload_max_bytes_check CHECK (((payload_max_bytes >= 1024) AND (payload_max_bytes <= 67108864))),
+    CONSTRAINT triggers_source_check CHECK (((source IS NULL) OR (source = ANY (ARRAY['queue'::text, 'delayed_task'::text]))))
 );
 
 
@@ -2395,6 +2546,21 @@ ALTER TABLE ONLY public.compute_nodes
 
 
 --
+-- Name: cors_presets cors_presets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: cors_presets_unique_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX cors_presets_unique_name ON public.cors_presets USING btree (account_id, COALESCE(app_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+
+
+--
 -- Name: credit_ledger credit_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2760,6 +2926,54 @@ ALTER TABLE ONLY public.tenant_hostnames
 
 ALTER TABLE ONLY public.tenant_surfaces
     ADD CONSTRAINT tenant_surfaces_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: trigger_dead_letter trigger_dead_letter_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trigger_dead_letter
+    ADD CONSTRAINT trigger_dead_letter_pkey PRIMARY KEY (record_id);
+
+
+--
+-- Name: trigger_records trigger_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trigger_records
+    ADD CONSTRAINT trigger_records_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: trigger_records trigger_records_trigger_id_item_identifier_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trigger_records
+    ADD CONSTRAINT trigger_records_trigger_id_item_identifier_key UNIQUE (trigger_id, item_identifier);
+
+
+--
+-- Name: triggers triggers_app_id_slug_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_app_id_slug_key UNIQUE (app_id, slug);
+
+
+--
+-- Name: triggers triggers_cron_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_cron_id_key UNIQUE (cron_id);
+
+
+--
+-- Name: triggers triggers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_pkey PRIMARY KEY (id);
 
 
 --
@@ -3233,6 +3447,13 @@ CREATE INDEX compute_nodes_active_idx ON public.compute_nodes USING btree (name)
 --
 
 CREATE INDEX compute_nodes_region_zone_idx ON public.compute_nodes USING btree (region, zone) WHERE (active = true);
+
+
+--
+-- Name: cors_presets_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cors_presets_account_idx ON public.cors_presets USING btree (account_id);
 
 
 --
@@ -3922,6 +4143,48 @@ CREATE INDEX tenant_surfaces_cert_expiry_idx ON public.tenant_surfaces USING btr
 
 
 --
+-- Name: trigger_dlq_trigger_reason_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX trigger_dlq_trigger_reason_idx ON public.trigger_dead_letter USING btree (trigger_id, reason);
+
+
+--
+-- Name: trigger_records_dlq_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX trigger_records_dlq_idx ON public.trigger_records USING btree (trigger_id, state) WHERE (state = 'dead_letter'::text);
+
+
+--
+-- Name: trigger_records_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX trigger_records_due_idx ON public.trigger_records USING btree (trigger_id, next_fire_at) WHERE (state = ANY (ARRAY['pending'::text, 'retry'::text]));
+
+
+--
+-- Name: triggers_account_kind_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX triggers_account_kind_idx ON public.triggers USING btree (account_id, kind);
+
+
+--
+-- Name: triggers_app_kind_enabled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX triggers_app_kind_enabled ON public.triggers USING btree (app_id, kind) WHERE enabled;
+
+
+--
+-- Name: triggers_cron_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX triggers_cron_id_idx ON public.triggers USING btree (cron_id) WHERE (cron_id IS NOT NULL);
+
+
+--
 -- Name: usage_daily_account_day_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3992,6 +4255,51 @@ CREATE TRIGGER apps_egress_allowlist_cidr BEFORE INSERT OR UPDATE OF egress_allo
 
 
 --
+-- Name: apps_public_auth_ip_allowlist_cidr_check(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.apps_public_auth_ip_allowlist_cidr_check() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+declare
+  bad cidr;
+begin
+  if new.public_auth_ip_allowlist is null or cardinality(new.public_auth_ip_allowlist) = 0 then
+    return new;
+  end if;
+  for bad in
+    select c
+      from unnest(new.public_auth_ip_allowlist) c
+     where family(c) not in (4, 6)
+     limit 1
+  loop
+    raise exception 'apps_public_auth_ip_allowlist: only v4 or v6 CIDRs (got family % for %)', family(bad), bad
+      using errcode = '23514',
+            constraint = 'apps_public_auth_ip_allowlist_cidr';
+  end loop;
+  for bad in
+    select c
+      from unnest(new.public_auth_ip_allowlist) c
+     where masklen(c) = 0
+     limit 1
+  loop
+    raise exception 'apps_public_auth_ip_allowlist: rejected % (masklen /0; ADR-118 non-/0 contract)', bad
+      using errcode = '23514',
+            constraint = 'apps_public_auth_ip_allowlist_cidr';
+  end loop;
+  return new;
+end;
+$$;
+
+
+--
+-- Name: apps apps_public_auth_ip_allowlist_cidr; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER apps_public_auth_ip_allowlist_cidr BEFORE INSERT OR UPDATE OF public_auth_ip_allowlist ON public.apps FOR EACH ROW EXECUTE FUNCTION public.apps_public_auth_ip_allowlist_cidr_check();
+
+
+--
 -- Name: apps apps_maintenance_mode_notify; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -4010,6 +4318,13 @@ CREATE TRIGGER compute_node_changed_trg AFTER INSERT OR UPDATE ON public.compute
 --
 
 CREATE TRIGGER compute_node_keys_changed_trg AFTER INSERT OR DELETE OR UPDATE ON public.compute_node_keys FOR EACH STATEMENT EXECUTE FUNCTION public.compute_node_keys_notify();
+
+
+--
+-- Name: cors_presets cors_presets_set_updated_at_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER cors_presets_set_updated_at_trg BEFORE UPDATE ON public.cors_presets FOR EACH ROW EXECUTE FUNCTION public.cors_presets_set_updated_at();
 
 
 --
@@ -4087,6 +4402,13 @@ CREATE TRIGGER tenant_hostnames_emit_change AFTER INSERT OR DELETE OR UPDATE ON 
 --
 
 CREATE TRIGGER tenant_surfaces_emit_change AFTER INSERT OR DELETE OR UPDATE ON public.tenant_surfaces FOR EACH ROW EXECUTE FUNCTION public.notify_tenant_surface_changed();
+
+
+--
+-- Name: trigger_records trigger_ready_notify; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trigger_ready_notify AFTER INSERT ON public.trigger_records FOR EACH ROW EXECUTE FUNCTION public.trg_notify_trigger_ready();
 
 
 --
@@ -4415,6 +4737,22 @@ ALTER TABLE ONLY public.compute_node_heartbeats
 
 ALTER TABLE ONLY public.compute_node_keys
     ADD CONSTRAINT compute_node_keys_compute_node_id_fkey FOREIGN KEY (compute_node_id) REFERENCES public.compute_nodes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: cors_presets cors_presets_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: cors_presets cors_presets_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
 
 
 --
@@ -4903,6 +5241,46 @@ ALTER TABLE ONLY public.tenant_surfaces
 
 ALTER TABLE ONLY public.tenant_surfaces
     ADD CONSTRAINT tenant_surfaces_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
+
+
+--
+-- Name: trigger_dead_letter trigger_dead_letter_record_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trigger_dead_letter
+    ADD CONSTRAINT trigger_dead_letter_record_id_fkey FOREIGN KEY (record_id) REFERENCES public.trigger_records(id) ON DELETE CASCADE;
+
+
+--
+-- Name: trigger_records trigger_records_trigger_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trigger_records
+    ADD CONSTRAINT trigger_records_trigger_id_fkey FOREIGN KEY (trigger_id) REFERENCES public.triggers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: triggers triggers_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: triggers triggers_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
+
+
+--
+-- Name: triggers triggers_cron_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.triggers
+    ADD CONSTRAINT triggers_cron_id_fkey FOREIGN KEY (cron_id) REFERENCES public.crons(id) ON DELETE CASCADE;
 
 
 --

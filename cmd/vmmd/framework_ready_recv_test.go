@@ -55,16 +55,16 @@ func TestParseFrameworkReadyDatagram(t *testing.T) {
 			want: want{err: true, errSub: "empty body"},
 		},
 		{
-			name: "unknown type byte (future 0x05 placeholder)",
-			// 0x05 is the next free discriminator byte
-			// after the tail-event class (0x04, issue #667
-			// / ADR-078). The parser must reject anything
-			// outside the closed set with the "unknown msg
-			// sub-type" sentinel — a future event class
-			// picks the next free byte and adds a new
-			// dispatch arm in lockstep.
-			body: []byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 'n'},
-			want: want{err: true, errSub: "unknown msg sub-type 0x05"},
+			name: "unknown type byte (closed-set guard)",
+			// Cluster C / ADR-121 extended the closed set to
+			// {0x01, 0x02, 0x03, 0x04, 0x05}. Anything outside
+			// the closed set is rejected with the
+			// "unknown msg sub-type" sentinel. A future event
+			// class picks the next free byte (0x06+) and adds
+			// a dispatch arm in lockstep. This test pins the
+			// closed-set tripwire.
+			body: []byte{0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 'n'},
+			want: want{err: true, errSub: "unknown msg sub-type 0x06"},
 		},
 		{
 			name: "type-only, no warmup, no runtime",

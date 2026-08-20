@@ -42,6 +42,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid/apidsource"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -137,6 +138,18 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		CommitSHA:   resolvedSHA,
 		LogSpool:    spoolRoot(),
 		Log:         s.log,
+		// Issue #606 / SAFE-RELEASES-E.1: server-stamped actor
+		// attribution. The source-ref path is the dashboard +
+		// CLI flow that streams a GH repo through the apid
+		// pipeline (cmd/apid/handlers_source_ref.go), NOT the
+		// githubd_bridge push-triggered path (which stamps
+		// "github" + pusher at the bridge itself — see
+		// cmd/apid/githubd_bridge.go::EnqueueBuild). This
+		// handler runs over HTTP, so the via classifier routes
+		// through cmd/apid.deploy_actor.routeKindForRequest.
+		ActorUserID: acct.ID,
+		ActorVia:    routeKindForRequest(r),
+		ActorFromIP: middleware.ClientIP(r),
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
@@ -220,6 +233,12 @@ func (s *server) streamSourceTarball(ctx context.Context, acct state.Account, in
 // "deployment created" — slug, deployment id, source SHA. The
 // raw install token is NEVER in the payload (the token stays
 // scoped to the streaming call only).
+//
+// Issue #606 / SAFE-RELEASES-E.1: per-call actor attribution.
+// The deployment row was just stamped with the four actor
+// columns by apidsource.Enqueue — we re-read it here so the
+// audit row carries the resolved "<via>:<id>" actor on
+// events.actor AND the actor_* payload keys (via mergeActorAudit).
 func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, prev state.Deployment, req api.SourceRefDeployRequest, resolvedSHA string, installID int64) {
 	s.log.Info("source-ref deployment enqueued",
 		"deployment", res.DeploymentID,
@@ -228,7 +247,31 @@ func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, a
 		"ref", req.Ref,
 		"source_sha", resolvedSHA,
 	)
-	s.audit.Emit(ctx, "deploy.source_ref", &acct.ID, map[string]any{
+	// Re-read the just-written deployment row to pick up the
+	// actor columns (apidsource.Enqueue stamped them in its tx).
+	d, dErr := s.store.DeploymentByID(ctx, res.DeploymentID)
+	if dErr != nil {
+		// MEDIUM review #4: when the read-back fails we must
+		// NOT fall through with a zero Deployment — that would
+		// make resolvedActorString emit ':unknown' (via empty,
+		// '<via>:unknown' branch) and bypass EmitAs's actor==''
+		// fallback. The audit row would land with corrupt
+		// attribution exactly when forensics needs it most.
+		// Early-return without an audit row: the durable
+		// deployment row is already committed (with the
+		// structured actor columns stamped at INSERT time), so
+		// the SOC 2 / GDPR audit-trail question still has an
+		// answer via deployments.deployed_by_user_id /
+		// deployed_via / deployed_from_ip; the events-table
+		// row just doesn't get stamped this time. Operator
+		// can grep by deployment_id and recover attribution
+		// from the row directly.
+		s.log.Warn("auditSourceRefDeploy: skip audit row, read deployment for actor attribution failed",
+			"deployment", res.DeploymentID, "err", dErr)
+		return
+	}
+	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
+	s.audit.EmitAs(ctx, resolvedActor, "deploy.source_ref", &acct.ID, mergeActorAudit(map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": res.DeploymentID,
 		"build_id":      res.BuildID,
@@ -237,7 +280,7 @@ func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, a
 		"source_sha":    resolvedSHA,
 		"install_id":    installID,
 		"supersedes":    prev.ID,
-	})
+	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 }
 
 // isValidRef is the cheap pre-flight ref-shape guard. Anything

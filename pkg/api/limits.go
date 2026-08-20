@@ -199,20 +199,25 @@ type Limits struct {
 	EgressMbit int // per-instance egress bandwidth cap via tc
 
 	// Secrets (spec §11/G2). Ciphertext quota per app; per-value byte cap.
-	// SecretCountMax bounds the (app_id, key) row count. SecretValueMaxBytes
-	// bounds the plaintext value the customer may PUT — apid rejects larger
-	// values with 413 CodeSecretValueTooLarge before sealing.
-	SecretCountMax      int // max secrets per app (Free 3, Hobby 25, Pro 50, Scale 100)
+	// SecretCountMax bounds the (app_id, scope, key) row count across every
+	// scope the customer has minted — ADR-090 D6 parallel posture for the
+	// secret surface (ADR-092). A Free-tier customer with 2 prod secrets +
+	// 2 staging secrets = 4 total exceeds the cap of 3 and gets 403
+	// CodePlanLimitSecrets on the next PUT. SecretValueMaxBytes bounds the
+	// plaintext value the customer may PUT — apid rejects larger values
+	// with 413 CodeSecretValueTooLarge before sealing.
+	SecretCountMax      int // max secrets per app across all scopes (Free 3, Hobby 25, Pro 50, Scale 100)
 	SecretValueMaxBytes int // per-secret value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
 	// Customer env vars (issue #395 / ADR-045). Plaintext per-app store
 	// for non-sensitive runtime config (LOG_LEVEL, FEATURE_X, etc.). The
 	// quota shape mirrors secrets minus the per-secret seal cost — values
 	// are stored as-is, no ciphertext. EnvVarsMax bounds the (app_id,
-	// key) row count. EnvValueMaxBytes bounds the per-value byte cap.
+	// scope, key) row count across every scope the customer has minted
+	// (ADR-090 D6). EnvValueMaxBytes bounds the per-value byte cap.
 	// Per-plan values are tuned to cover typical 12-factor config
 	// surface without letting one app monopolise the table.
-	EnvVarsMax       int // max env vars per app (Free 8, Hobby 32, Pro 64, Scale 256)
+	EnvVarsMax       int // max env vars per app across all scopes (Free 8, Hobby 32, Pro 64, Scale 256)
 	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
 	// TrustedSignerCountMax bounds the (app_id, signer_name) row count
@@ -533,6 +538,79 @@ type Limits struct {
 	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
 	EdgeRulesThrottlePerApp int
 
+	// CorsPresetsPerAccount caps how many cors_presets rows one
+	// account may own in total (account-wide + app-scoped). The
+	// cap defends against a customer pinning one preset per
+	// partner / per customer-of-customer and inflating the
+	// gateway's per-account preset map. Per-plan: Free 0, Hobby
+	// 10, Pro 50, Scale 250. The Free=0 default keeps the
+	// abuse-floor tier on inline CORS — the upsell is the
+	// abstraction. apid-Validate throws
+	// CodePlanCorsPresetQuotaReached when this trips (PR-B,
+	// #979-c, slot 00295 wires the writer).
+	CorsPresetsPerAccount int
+	// CorsPresetsPerApp caps how many app-scoped cors_presets rows
+	// one app may own. Independent of CorsPresetsPerAccount so a
+	// customer with 5 apps under a Pro account can split 50
+	// presets across the apps without tripping the per-account
+	// cap. Per-plan: Free 0, Hobby 5, Pro 15, Scale 50. The
+	// per-app shape mirrors EdgeRulesPerApp's escalation curve
+	// so the upgrade ladder a customer reasons about is one
+	// number per primitive.
+	CorsPresetsPerApp int
+	// CorsPresetMaxOrigins caps how many entries
+	// cors_presets.allow_origins may hold. The cap defends
+	// against a customer stuffing a 10k-entry wildcard
+	// collection into a preset (the gateway's per-request
+	// allowlist walk is O(AllowOrigins)). Per-plan: Free 0,
+	// Hobby 25, Pro 100, Scale 500. Enforced at the apid write
+	// boundary by api.CorsPreset.Validate in PR-B.
+	CorsPresetMaxOrigins int
+	// CorsPresetMaxAllowMethods caps how many entries
+	// cors_presets.allow_methods may hold. Smaller ceiling
+	// than MaxOrigins because the set is a closed enum
+	// (CORS_ALLOWED_METHODS — GET/POST/PUT/PATCH/DELETE/HEAD/
+	// OPTIONS in current ADR-091 D12). Per-plan: Free 0,
+	// Hobby 8, Pro 8, Scale 8 (the closed-set ceiling is
+	// constant across plans; the per-plan knob here is the
+	// read-side cap a preset can ship, not the closed-set
+	// size). Enforced at the apid write boundary.
+	CorsPresetMaxAllowMethods int
+	// CorsPresetMaxNameLength pins the upper bound on
+	// cors_presets.name (the migration's CHECK in 00304
+	// pins it to 64). Surfaced here so the apid writer
+	// can reject before INSERT. Same value across plans.
+	// NOT the consumer_keys name cap — that lives on
+	// ConsumerKeysPerApp's creator-side apid validator.
+	CorsPresetMaxNameLength int
+
+	// ConsumerKeysPerApp caps how many consumer_keys rows
+	// (ADR-120 / issue #975 item #5) one app may own. The cap
+	// defends against a customer pinning one consumer key per
+	// customer-of-customer and inflating the gateway-side
+	// (app_id, prefix) hot-path lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is 0 because the
+	// abuse-floor tier cannot host multi-tenant consumer surfaces (the
+	// apid CreateConsumerKey handler returns 402 CodeConsumerKeysNotAllowed
+	// before the store is touched). Free switch to 0 mirrors the
+	// CronLimitPerApp/OrgMembersMax 0/0 posture. Same 100-per-app floor
+	// across the lower three tiers because the cardinality
+	// budget per app is a tenant-stability concern, not a
+	// tier-upgrade lever — the per-account cap scales with
+	// the upgrade ladder. apid-Validate throws
+	// CodePlanConsumerKeyQuotaReached when this trips (PR #5-B
+	// wires the writer).
+	ConsumerKeysPerApp int
+	// ConsumerKeysPerAccount caps how many consumer_keys rows
+	// one account may own in total across all its apps.
+	// Independent of ConsumerKeysPerApp so a customer with N
+	// apps under one account can split the per-account cap.
+	// Per-plan: Free 0, Hobby 250, Pro 2500, Scale 25000. Free is 0 — same
+	// abuse-floor gating as ConsumerKeysPerApp; the per-account ceiling is
+	// reached before the per-app ceiling on a typical multi-app Free
+	// customer, but Free is gated off entirely so neither trips.
+	// Same per-app floor + 25× scale ceiling.
+	ConsumerKeysPerAccount int
+
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
 	// defends against a SaaS customer pinning one surface per
@@ -590,6 +668,103 @@ type Limits struct {
 	// pkg/state.CreateAppWebhookIfUnderQuota.
 	WebhookPerAccount int
 
+	// TriggersAllowed (issue #757 / ADR-0NN) gates the unified Trigger
+	// primitive (cron + kafka + nats + redis_streams + sqs_compat +
+	// in-platform queue/delayed_task). Free = false (the abuse-floor
+	// tier doesn't get pull-from-broker primitives; the cron path is
+	// the only synthetic-wake surface Free retains via the existing
+	// CronLimitPerApp cap). Hobby/Pro/Scale = true. apid's
+	// createTrigger / listTriggers handlers reject a POST on Free
+	// with 402 CodePlanTriggersNotAllowed before the store is touched.
+	// Independent of CronLimitPerApp — crons remain free-form on
+	// Hobby with their own per-app budget; triggers cover the
+	// broker-pull path with its own budget.
+	TriggersAllowed bool
+	// TriggerLimitPerApp caps how many triggers a single app may
+	// hold at any moment. 0 for Free; positive for Hobby/Pro/Scale.
+	// Both this and TriggerLimitPerAccount are enforced under the
+	// same apps-row lock in pkg/state.PgStore.CreateTriggerIfUnderQuota,
+	// mirroring CreateCronIfUnderQuota's TOCTOU defence
+	// (pkg/state/pgstore.go:5431-5511).
+	TriggerLimitPerApp int
+	// TriggerLimitPerAccount caps how many triggers an account may
+	// hold across all its apps. Independent of TriggerLimitPerApp —
+	// the per-account cap defends against the N-apps-times-cap-per-app
+	// bypass. Same fail-closed contract as TriggerLimitPerApp.
+	TriggerLimitPerAccount int
+	// TriggerBatchSizeMax caps the per-trigger `batch_size_max` the
+	// customer may set. The migration 00267 SQL CHECK clamps to
+	// [1, 5000]; this plan cap is the per-plan ceiling BELOW that
+	// hard SQL ceiling. 0 for Free (triggers are gated off); Hobby
+	// 50 / Pro 500 / Scale 5000. apid's createTrigger handler reads
+	// both this and the SQL CHECK so a Hobby customer asking for 200
+	// gets 403 trigger_batch_size_too_large with the Hobby cap in the
+	// body, not a 422 from the SQL constraint.
+	TriggerBatchSizeMax int
+	// TriggerBatchWindowMaxSec caps the per-trigger `batch_window_ms`
+	// / 1000 the customer may set. Hobby 30s / Pro 300s / Scale 300s.
+	// The SQL CHECK (10ms–600s) is the hard ceiling; this plan cap
+	// stops Hobby from holding 10-minute windows that the 50-size
+	// cap doesn't justify. 0 with TriggersAllowed=false (Free).
+	TriggerBatchWindowMaxSec int
+	// TriggerMaxAttemptsMax caps the per-trigger `max_attempts`
+	// setting. Hobby 3 / Pro 10 / Scale 25 — the upper bound mirrors
+	// the queue-attempts pattern (per MaxQueueAttempts in
+	// pkg/state/pgstore.go). The SQL CHECK [1, 25] is the hard
+	// ceiling. 0 with TriggersAllowed=false (Free).
+	TriggerMaxAttemptsMax int
+	// TriggerRecordsPerSecondPerApp caps the per-app steady-state
+	// dispatch rate schedd permits to a single trigger. The cap is
+	// enforced by WakeRateLimiter (pkg/sched/rate_limit.go) — the
+	// same bucket the wake path drains. Hobby 100 / Pro 1000 /
+	// Scale 10000. Above the cap, records transition to dead_letter
+	// with reason='rate_limited' rather than back-pressuring the
+	// broker (back-pressure on Kafka consumer groups breaks the
+	// group-rebalance contract). 0 with TriggersAllowed=false (Free).
+	TriggerRecordsPerSecondPerApp int
+	// TriggerPayloadMaxBytes (migration 00274 / audit #7) caps the
+	// per-trigger `payload_max_bytes` the customer may set. SQL
+	// CHECK admits [1024, 67108864] (1 KiB floor, 64 MiB ceiling);
+	// this plan-level cap is below that ceiling so Hobby can't
+	// park 64 MiB records that would balloon trigger_records rows.
+	// Hobby 1 MiB / Pro 6 MiB / Scale 16 MiB. apid's createTrigger
+	// handler rejects a value above the plan cap with
+	// trigger_payload_too_large before the SQL CHECK fires.
+	// MaxESMSourcesPerApp (ADR-118 / issue #757 closure, commit 3
+	// of 11) is the operator-facing ALIAS for TriggerLimitPerApp
+	// surfaced on GET /v1/plans/{slug}/limits under the
+	// "max_esm_sources_per_app" key. Dual-emit per ADR-118
+	// §"Audit vocabulary bridging": trigger.* is canonical,
+	// esm.* is the operator alias. Values mirror
+	// TriggerLimitPerApp exactly (0 / 2 / 10 / 50). The runtime
+	// admission path reads TriggerLimitPerApp — MaxESMSourcesPerApp
+	// exists only so the dashboard can render both labels without
+	// a wire-shape diff.
+	MaxESMSourcesPerApp int
+	// MaxESMRecordsPerSecond (ADR-118) is the operator-facing
+	// alias for TriggerRecordsPerSecondPerApp. Same dual-emit
+	// rationale as MaxESMSourcesPerApp. Values mirror exactly
+	// (0 / 100 / 1000 / 10000).
+	MaxESMRecordsPerSecond int
+	// BrokerEgressMbit (ADR-118 / commit 8 of 11) caps the
+	// per-app broker egress bandwidth in megabits per second
+	// the broker poll goroutines (pkg/sched/broker_egress.go)
+	// may sustain. Enforced via the faas-brokerq.slice cgroup
+	// + tc commands. Hobby 10 / Pro 50 / Scale 200. 0 for Free
+	// (gated off via TriggersAllowed=false). Above the cap,
+	// broker traffic is rate-limited at the host cgroup
+	// boundary — the per-VM cgroup is unaffected.
+	BrokerEgressMbit int
+	// TLSSkipVerifyAllowed (ADR-118 / commit 2 of 11) gates the
+	// `tls.skip_verify=true` flag on KafkaConfig. Hobby=false
+	// (a Hobby customer's plaintext-TLS path doesn't justify
+	// the weakened-verification posture). Pro / Scale = true.
+	// 0 for Free (gated off). The apid createTrigger handler
+	// rejects skip_verify=true on Hobby with
+	// trigger_tls_skip_verify_not_allowed.
+	TLSSkipVerifyAllowed   bool
+	TriggerPayloadMaxBytes int
+
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
 	// allowlist opt-out because the abuse-desk use case is a
@@ -606,6 +781,23 @@ type Limits struct {
 	// (Pro: 16; Scale: 64). apid's updateApp rejects with 400
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
+
+	// PublicAuthIPAllowlistAllowed toggles the per-app ingress IP
+	// allowlist (ADR-118; extends ADR-079's reserved 'ip_allowlist'
+	// enum value). Pro/Scale only — Free/Hobby use edge rules
+	// (kind='ip') for the abuse-floor posture; the per-app
+	// allowlist is the Pro+ feature for SaaS-scale ingress
+	// hygiene, where every CIDR is a deliberate policy decision.
+	// apid's updateApp handler rejects a PATCH with 403
+	// plan_public_auth_ip_allowlist_not_allowed when this is false.
+	PublicAuthIPAllowlistAllowed bool
+	// PublicAuthIPAllowlistMaxEntries is the per-app CIDR-entry
+	// cap. 0 with Allowed=false (Free/Hobby); non-zero with
+	// Allowed=true (Pro: 16; Scale: 64 — mirrors
+	// EgressAllowlistMaxSize exactly). apid's updateApp rejects
+	// with 400 public_auth_ip_allowlist_too_long when the PATCH
+	// body has more entries.
+	PublicAuthIPAllowlistMaxEntries int
 
 	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
 	// default for the per-app two-tier snapshot flag. Free/Hobby =
@@ -997,6 +1189,26 @@ var planLimits = map[Plan]Limits{
 		// upgrade curve from Free → Scale is a single double/triple
 		// progression a customer can predict.
 		EdgeRulesThrottlePerApp: 1,
+		// CORS presets (issue #975 item #4 / Mega-Foundation #979-b,
+		// slot 00294). Free=0 mirrors the tenant_surfaces / alert_rules
+		// posture: the abstraction is the upsell, the abuse-floor tier
+		// stays on inline kind=cors rules. PR-A ships the read path
+		// and the limits; PR-B (#979-c, slot 00295) wires the apid
+		// writer that trips the per-plan caps.
+		CorsPresetsPerAccount:     0,
+		CorsPresetsPerApp:         0,
+		CorsPresetMaxOrigins:      0,
+		CorsPresetMaxAllowMethods: 0,
+		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Free
+		// gets the 100/app floor — every plan does. The
+		// per-account ceiling stays low (250) so an abuse-tier
+		// customer can't pin one consumer key per customer-of-
+		// customer indefinitely. PR-A ships the limits; PR-B
+		// wires the writer.
+		// Free is gated to 0 consumer keys — mirrors CronLimitPerApp/OrgMembersMax 0/0 posture.
+		ConsumerKeysPerApp:     0,
+		ConsumerKeysPerAccount: 0,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1021,6 +1233,26 @@ var planLimits = map[Plan]Limits{
 		// CodePlanWebhooksNotAllowed before the store is touched.
 		WebhookPerApp:     0,
 		WebhookPerAccount: 0,
+		// Trigger primitive (issue #757 / ADR-0NN): Free is the
+		// abuse-floor tier — TriggersAllowed=false so a POST on a
+		// Free account gets 402 CodePlanTriggersNotAllowed before the
+		// store is touched. The 0/0 cap pair is the fail-closed
+		// defence-in-depth value the store still reads.
+		TriggersAllowed:               false,
+		TriggerLimitPerApp:            0,
+		TriggerLimitPerAccount:        0,
+		TriggerBatchSizeMax:           0,
+		TriggerBatchWindowMaxSec:      0,
+		TriggerMaxAttemptsMax:         0,
+		TriggerRecordsPerSecondPerApp: 0,
+		TriggerPayloadMaxBytes:        0,
+		// ADR-118 / issue #757 closure: ESM-alias caps + broker
+		// egress + TLS skip-verify gate. Free is the abuse-floor
+		// tier — every value is 0 / false to fail-closed.
+		MaxESMSourcesPerApp:    0,
+		MaxESMRecordsPerSecond: 0,
+		BrokerEgressMbit:       0,
+		TLSSkipVerifyAllowed:   false,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -1248,6 +1480,22 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 5,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Hobby is the entry paid tier — 10 presets per
+		// account, 5 per app. MaxOrigins 25 covers the typical
+		// "partners + sub-domains" allowlist; 8 AllowMethods is the
+		// closed-set ceiling.
+		CorsPresetsPerAccount:     10,
+		CorsPresetsPerApp:         5,
+		CorsPresetMaxOrigins:      25,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Hobby
+		// keeps the 100/app floor; per-account cap stays at 250
+		// (same as Free — Hobby is the entry paid tier, not a
+		// big-leap on this primitive).
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 250,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1264,6 +1512,34 @@ var planLimits = map[Plan]Limits{
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
 		WebhookPerAccount: 10,
+		// Trigger primitive (issue #757 / ADR-0NN): Hobby is the
+		// entry paid tier — unlocks the in-platform queue kind and
+		// the sqs_compat kind (the two no-external-broker shapes).
+		// Kafka/NATS/Redis-streams kinds land on Pro+ because their
+		// egress policies require the allowlist opt-in. Batch /
+		// window / attempts caps are tight (50 / 30 s / 3) so a
+		// Hobby customer's fan-out can't saturate schedd's per-app
+		// WakeRateLimiter bucket.
+		TriggersAllowed:               true,
+		TriggerLimitPerApp:            2,
+		TriggerLimitPerAccount:        10,
+		TriggerBatchSizeMax:           50,
+		TriggerBatchWindowMaxSec:      30,
+		TriggerMaxAttemptsMax:         3,
+		TriggerRecordsPerSecondPerApp: 100,
+		// Hobby: 10 Mbit broker egress is enough for a 2-source
+		// Hobby fan-out without saturating the shared NIC.
+		// Skip-verify disallowed: Hobby customers don't get a
+		// weakened-TLS posture. ESM aliases mirror the trigger.* caps.
+		MaxESMSourcesPerApp:    2,
+		MaxESMRecordsPerSecond: 100,
+		BrokerEgressMbit:       10,
+		TLSSkipVerifyAllowed:   false,
+		// Hobby payload cap: 1 MiB — keeps trigger_records rows
+		// small enough that Hobby fan-out doesn't bloat Postgres.
+		// The migration-00274 SQL ceiling is 64 MiB so there's
+		// headroom for Pro+ below the hard limit.
+		TriggerPayloadMaxBytes: 1048576,
 		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
@@ -1424,6 +1700,12 @@ var planLimits = map[Plan]Limits{
 		// is the typical Pro-tier reachability graph.
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 16,
+		// PublicAuthIPAllowlist: same shape as egress — paid-only
+		// abuse-desk primitive. 16 entries covers a Pro customer's
+		// "1 office VPN + 1 CI runner + 1 partner API + ~10
+		// regional allowlist ranges" reachability graph.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 16,
 		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
 		// is gated on Pro+ to bound the "scale on CPU without a
 		// min_instances floor" cost shape.
@@ -1481,6 +1763,20 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 25,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Pro is the typical SaaS tier — 50 presets per
+		// account, 15 per app, 100 origins per preset.
+		CorsPresetsPerAccount:     50,
+		CorsPresetsPerApp:         15,
+		CorsPresetMaxOrigins:      100,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Pro
+		// keeps the 100/app floor; per-account cap steps up to
+		// 2500 — a typical SaaS customer with ~25 apps × 100
+		// keys each fits comfortably with headroom.
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 2500,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -1498,6 +1794,28 @@ var planLimits = map[Plan]Limits{
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
 		WebhookPerAccount: 30,
+		// Trigger primitive (issue #757 / ADR-0NN): Pro is the first
+		// tier where the external-broker kinds unlock (Kafka, NATS,
+		// Redis-streams) — the egress-allowlist tier (ADR-031) is
+		// Pro+ and broker pulls require the allowlist. Batch caps
+		// jump to 500 / 5 min / 10 attempts so a Pro customer's
+		// 1k-msg/s Kafka consumer can be drained with one trigger.
+		TriggersAllowed:               true,
+		TriggerLimitPerApp:            10,
+		TriggerLimitPerAccount:        50,
+		TriggerBatchSizeMax:           500,
+		TriggerBatchWindowMaxSec:      300,
+		TriggerMaxAttemptsMax:         10,
+		TriggerRecordsPerSecondPerApp: 1000,
+		// Pro: 50 Mbit broker egress + ESM aliases + skip-verify OK.
+		MaxESMSourcesPerApp:    10,
+		MaxESMRecordsPerSecond: 1000,
+		BrokerEgressMbit:       50,
+		TLSSkipVerifyAllowed:   true,
+		// Pro payload cap: 6 MiB — matches the previous
+		// hardcoded closeBatch byte cap so Pro customers behave
+		// identically pre/post migration 00274.
+		TriggerPayloadMaxBytes: 6291456,
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
@@ -1655,6 +1973,12 @@ var planLimits = map[Plan]Limits{
 		// the Pro budget tracks the doubling in DeployedApps (25 -> 100).
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 64,
+		// PublicAuthIPAllowlist: 4× Pro's budget tracks Scale's
+		// 4× DeployedApps (25 → 100). SaaS-scale customers with
+		// multi-region deployments routinely enumerate per-region
+		// egress IPs in addition to their office VPN ranges.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 64,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,
 		// Cron: Scale gets 100 per-app and 500 per-account. 5× Pro's
@@ -1709,6 +2033,25 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 100,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Scale is the large-fleet tier — 250 presets per
+		// account, 50 per app, 500 origins per preset. Numbers
+		// mirror the AlertRuleLimitPerApp progression
+		// (1/5/25/100 * 5x) so the customer mental model is one
+		// progression across primitives.
+		CorsPresetsPerAccount:     250,
+		CorsPresetsPerApp:         50,
+		CorsPresetMaxOrigins:      500,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Scale
+		// gets the only per-app step-up — 1000 keys per app,
+		// 25000 per account. The per-app step-up mirrors the
+		// EdgeRulesPerApp 100-ceiling for Scale — both
+		// primitives are about "per-customer-of-customer"
+		// cardinality, so the upgrade ladder is one number.
+		ConsumerKeysPerApp:     1000,
+		ConsumerKeysPerAccount: 25000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -1729,6 +2072,33 @@ var planLimits = map[Plan]Limits{
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
 		WebhookPerAccount: 100,
+		// Trigger primitive (issue #757 / ADR-0NN): Scale is the upper
+		// tier — caps align with the SQL CHECK ceilings (5000 records
+		// / 5 min window / 25 attempts) so a Scale customer's
+		// SQS-compatible or Kafka consumer can be drained at full
+		// throughput. Records/sec per app tracks the 10× rule that
+		// the per-app rps tier already follows (500 → 10 000).
+		TriggersAllowed:               true,
+		TriggerLimitPerApp:            50,
+		TriggerLimitPerAccount:        200,
+		TriggerBatchSizeMax:           5000,
+		TriggerBatchWindowMaxSec:      300,
+		TriggerMaxAttemptsMax:         25,
+		TriggerRecordsPerSecondPerApp: 10000,
+		// Scale: 200 Mbit broker egress (the cap is host-NIC-shaped;
+		// Scale customers run the largest fan-outs). ESM aliases
+		// mirror the trigger.* caps; skip-verify OK (paid tier).
+		MaxESMSourcesPerApp:    50,
+		MaxESMRecordsPerSecond: 10000,
+		BrokerEgressMbit:       200,
+		TLSSkipVerifyAllowed:   true,
+		// Scale payload cap: 16 MiB — covers the largest
+		// realistic per-record broker payloads (SQS max 256 KiB,
+		// Kafka default 1 MiB, NATS typically < 8 MiB). Below
+		// the migration-00274 SQL ceiling of 64 MiB so the
+		// column CHECK remains a safety net, not a binding
+		// constraint.
+		TriggerPayloadMaxBytes: 16777216,
 		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
 		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
@@ -1960,6 +2330,31 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// Apid http.Server defaults (issue #995 Phase 1, ADR-121
+	// companion). The customer-facing control plane binds loopback
+	// (gatewayd-public reverse-proxies in front) so the same
+	// shape gatewayd-internal uses (ResponseWriteTimeoutDefault =
+	// 300s) carries over. ReadHeaderTimeout lives separately
+	// (already 10s in cmd/apid/main.go) — slowloris defence is
+	// split between ReadHeaderTimeout (header arrival) and
+	// ReadTimeout (body arrival). IdleTimeout bounds the
+	// keep-alive pool so a half-open client can't park a goroutine.
+	// Values are int seconds to match ResponseWriteTimeoutDefault's
+	// existing precedent at line 2201 — no `time` import added.
+	APIDReadTimeoutSecondsDefault  = 60  // slowloris defence (body arrival)
+	APIDWriteTimeoutSecondsDefault = 300 // matches gatewayd-internal
+	APIDIdleTimeoutSecondsDefault  = 120 // keep-alive cap
+
+	// Gatewayd-internal defaults (issue #995 Phase 3, ADR-121
+	// companion). The public listener carries 60 s ReadTimeout
+	// (matches the legacy default set at run.go:1989-1991), with
+	// tighter caps on the control / unix-socket listener where
+	// requests are smaller and shorter-lived.
+	GatewaydInternalReadTimeoutSecondsDefault         = 60 // public listener slowloris defence
+	GatewaydInternalControlReadTimeoutSecondsDefault  = 30 // control + unix-socket
+	GatewaydInternalControlWriteTimeoutSecondsDefault = 30 // control + unix-socket
+	GatewaydInternalControlIdleTimeoutSecondsDefault  = 60 // control + unix-socket keep-alive
+
 	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
 	// streaming carve-out) is the upper bound on the optional
 	// `max_body_bytes_streaming` field of a kind=limit edge rule.
@@ -2070,6 +2465,15 @@ const (
 	// plan; 0 in those fields falls back to the *Default constants
 	// below so a missing plan row fails closed to the spec baseline
 	// rather than inheriting a paid tier's relaxed cap.
+	//
+	// Enforced at two sites (issue #995 / ADR-121):
+	//   - pkg/gateway/handler.go::setupStreamingWriter (streaming path)
+	//     — 413 streaming_not_available on over-cap.
+	//   - pkg/gateway/handler.go::setupBufferedCapWriter (buffered path)
+	//     — 413 response_too_large on over-cap (or hardened connection
+	//     reset if the upstream's headers already reached the wire).
+	// Inbound body caps are enforced by http.MaxBytesReader at the
+	// ServeHTTP entry (separate from the response cap).
 	MaxResponseBodyBytesDefault   int64 = 25 * 1024 * 1024 // 25 MB (spec §4.1)
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
@@ -3002,6 +3406,38 @@ func (p Plan) EgressAllowlistMaxSize() int {
 	return l.EgressAllowlistMaxSize
 }
 
+// PublicAuthIPAllowlistAllowed reports whether the plan may set a
+// per-app ingress IP allowlist (ADR-118). Pro/Scale only — Free/Hobby
+// use edge rules (kind='ip') for the abuse-floor posture. apid's
+// updateApp handler gates `req.PublicAuthIPAllowlist` on the bool;
+// the handler returns 403 CodePlanPublicAuthIPAllowlistNotAllowed.
+// Unknown plans fail closed (return false) so a missing row never
+// silently unlocks a premium feature — same contract as
+// EgressAllowlistAllowed above.
+func (p Plan) PublicAuthIPAllowlistAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.PublicAuthIPAllowlistAllowed
+}
+
+// PublicAuthIPAllowlistMaxEntries returns the per-plan CIDR-entry
+// cap for the ingress IP allowlist (ADR-118). 0 for Free/Hobby
+// (the gate above rejects before this matters); 16 for Pro; 64
+// for Scale. apid rejects a PATCH whose
+// `req.PublicAuthIPAllowlist` has more entries with 400
+// public_auth_ip_allowlist_too_long. Returning 0 on unknown plans
+// makes a missing plan row a fail-closed denial, not a silent
+// default — same contract as EgressAllowlistMaxSize above.
+func (p Plan) PublicAuthIPAllowlistMaxEntries() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.PublicAuthIPAllowlistMaxEntries
+}
+
 // LivenessAllowed (issue #554 / ADR-078) reports whether the plan
 // may opt-in to per-deployment liveness probes. Free stays off —
 // the §13 M7 free-stop budget already handles abuse-floor paths,
@@ -3530,6 +3966,107 @@ func (p Plan) CronLimitPerAccount() int {
 	return l.CronLimitPerAccount
 }
 
+// CorsPresetsPerAccount returns the per-account CORS preset cap
+// (issue #975 item #4 / Mega-Foundation #979-b, slot 00294).
+// Free=0 (Free is the abuse-floor tier; the abstraction is the
+// upsell — Free customers stay on inline kind=cors rules). Paid
+// tiers: Hobby 10, Pro 50, Scale 250. Unknown plans fail closed
+// (return 0). PR-B (#979-c, slot 00295) reads this in
+// apid-Validate's CreateCorsPreset handler.
+func (p Plan) CorsPresetsPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetsPerAccount
+}
+
+// CorsPresetsPerApp returns the per-app CORS preset cap.
+// Independent of CorsPresetsPerAccount — a customer with N apps
+// can split the per-account budget across the apps without
+// tripping the per-account cap. Per-plan: Free 0, Hobby 5, Pro
+// 15, Scale 50. Same fail-closed contract as
+// CorsPresetsPerAccount.
+func (p Plan) CorsPresetsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetsPerApp
+}
+
+// CorsPresetMaxOrigins returns the per-preset cap on
+// cors_presets.allow_origins entries. The gateway's per-request
+// allowlist walk is O(AllowOrigins), so the cap defends against
+// a customer shipping a 10k-entry wildcard collection. Per-plan:
+// Free 0, Hobby 25, Pro 100, Scale 500. apid-Validate reads this
+// before INSERT (PR-B).
+func (p Plan) CorsPresetMaxOrigins() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxOrigins
+}
+
+// CorsPresetMaxAllowMethods returns the per-preset cap on
+// cors_presets.allow_methods entries. The closed-set ceiling is
+// constant across plans (8 in the current ADR-091 D12 enum);
+// the value here is the read-side cap a preset can ship, not
+// the closed-set size. apid-Validate reads this in PR-B.
+func (p Plan) CorsPresetMaxAllowMethods() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxAllowMethods
+}
+
+// CorsPresetMaxNameLength pins the upper bound on
+// cors_presets.name. The migration's CHECK caps it at 64; this
+// accessor surfaces the same value so the apid writer can
+// reject before INSERT. Same value across plans.
+func (p Plan) CorsPresetMaxNameLength() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxNameLength
+}
+
+// ConsumerKeysPerApp (ADR-120 / issue #975 item #5) returns the
+// per-app cap on consumer_keys rows. The cap defends against a
+// customer pinning one consumer key per customer-of-customer
+// and inflating the gateway-side (app_id, prefix) hot-path
+// lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is gated off
+// entirely (CodeConsumerKeysNotAllowed).
+// Same 100-per-app floor across the lower three tiers — the
+// cardinality budget per app is a tenant-stability concern,
+// not a tier-upgrade lever. Unknown plans fail closed (return
+// 0) so a missing plan row never silently unlocks the
+// primitive.
+func (p Plan) ConsumerKeysPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerApp
+}
+
+// ConsumerKeysPerAccount (ADR-120 / issue #975 item #5) returns
+// the per-account cap on consumer_keys rows across all of the
+// account's apps. Independent of ConsumerKeysPerApp so a
+// customer with N apps under one account can split the
+// per-account budget. Per-plan: Free 0, Hobby 250, Pro 2500,
+// Scale 25000. Same fail-closed contract as ConsumerKeysPerApp.
+func (p Plan) ConsumerKeysPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerAccount
+}
+
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan
 // may opt apps into the reserved eviction tier. Free = false; Hobby+ =
 // true. apid's updateApp handler rejects a `reserved` PATCH on a Free
@@ -3655,6 +4192,166 @@ func (p Plan) WebhookPerAccount() int {
 		return 0
 	}
 	return l.WebhookPerAccount
+}
+
+// TriggersAllowed (issue #757 / ADR-0NN) returns true if the plan
+// may create triggers at all. Free = false; Hobby/Pro/Scale =
+// true. apid's createTrigger handler rejects a POST on a Free
+// plan with 402 CodePlanTriggersNotAllowed BEFORE loadApp so a
+// Free customer posting to a non-existent slug gets the upsell
+// instead of a 404 that would leak the slug's existence (the
+// same PR-review finding F4 mirrored from createAlertRule +
+// createAppWebhook). Unknown plans fail closed (return false) —
+// same contract as CronLimitPerApp above.
+func (p Plan) TriggersAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.TriggersAllowed
+}
+
+// TriggerLimitPerApp returns the per-app trigger cap for the plan
+// (issue #757 / ADR-0NN). 0 for Free (the handler returns 402
+// ErrPlanTriggersNotAllowed before the store is touched) and a
+// positive value for Hobby/Pro/Scale. Unknown plans fail closed
+// (return 0) — same contract as CronLimitPerApp above.
+func (p Plan) TriggerLimitPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerLimitPerApp
+}
+
+// TriggerLimitPerAccount returns the per-account trigger cap for
+// the plan. Independent of TriggerLimitPerApp — defends against
+// the N-apps-times-cap-per-app bypass. 0 for Free; positive for
+// paid tiers. Unknown plans fail closed (return 0) — same
+// contract as TriggerLimitPerApp above.
+func (p Plan) TriggerLimitPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerLimitPerAccount
+}
+
+// TriggerBatchSizeMax returns the per-plan ceiling on
+// `batch_size_max`. Hobby 50 / Pro 500 / Scale 5000 (the SQL
+// CHECK ceiling). The apid createTrigger handler reads both
+// this AND the SQL CHECK so a Hobby customer asking for 200 gets
+// 403 trigger_batch_size_too_large with the Hobby cap in the
+// body, not a 422 from the SQL constraint. Unknown plans fail
+// closed (return 0) — same contract as CronLimitPerApp above.
+func (p Plan) TriggerBatchSizeMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerBatchSizeMax
+}
+
+// TriggerBatchWindowMaxSec returns the per-plan ceiling on
+// `batch_window_ms / 1000`. Hobby 30 s / Pro 300 s / Scale 300 s.
+// The SQL CHECK (10 ms – 600 s) is the hard ceiling; this plan
+// cap stops Hobby from holding 10-minute windows the 50-size
+// cap doesn't justify. Unknown plans fail closed (return 0).
+func (p Plan) TriggerBatchWindowMaxSec() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerBatchWindowMaxSec
+}
+
+// TriggerMaxAttemptsMax returns the per-plan ceiling on
+// `max_attempts`. Hobby 3 / Pro 10 / Scale 25 — the upper
+// bound mirrors the queue-attempts pattern (per MaxQueueAttempts
+// in pkg/state/pgstore.go). Unknown plans fail closed (return 0).
+func (p Plan) TriggerMaxAttemptsMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerMaxAttemptsMax
+}
+
+// TriggerRecordsPerSecondPerApp returns the per-app
+// steady-state dispatch rate schedd permits to a single trigger.
+// The cap is enforced by WakeRateLimiter (pkg/sched/rate_limit.go)
+// — the same bucket the wake path drains. Hobby 100 / Pro 1000
+// / Scale 10 000. Above the cap, records transition to
+// dead_letter with reason='rate_limited' rather than
+// back-pressuring the broker. Unknown plans fail closed
+// (return 0).
+func (p Plan) TriggerRecordsPerSecondPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TriggerRecordsPerSecondPerApp
+}
+
+// MaxESMSourcesPerApp returns the per-app cap on EventSourceMapping
+// sources, surfaced under the operator-facing `max_esm_sources_per_app`
+// alias on GET /v1/plans/{slug}/limits (ADR-118 / issue #757
+// closure, commit 3 of 11). Mirrors TriggerLimitPerApp exactly
+// (Free 0 / Hobby 2 / Pro 10 / Scale 50). The runtime admission
+// path reads TriggerLimitPerApp — this getter exists for the
+// dashboard's dual-emit label only. Unknown plans fail closed
+// (return 0) — same contract as TriggerLimitPerApp above.
+func (p Plan) MaxESMSourcesPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.MaxESMSourcesPerApp
+}
+
+// MaxESMRecordsPerSecond returns the per-app steady-state ESM
+// dispatch rate, surfaced under the operator-facing
+// `max_esm_records_per_second` alias (ADR-118). Mirrors
+// TriggerRecordsPerSecondPerApp exactly (0 / 100 / 1000 / 10000).
+// Unknown plans fail closed (return 0).
+func (p Plan) MaxESMRecordsPerSecond() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.MaxESMRecordsPerSecond
+}
+
+// BrokerEgressMbit returns the per-app broker-egress cap in
+// megabits per second (ADR-118 / commit 8 of 11). The cap is
+// enforced via the faas-brokerq.slice cgroup + tc commands
+// (pkg/sched/broker_egress.go + pkg/sched/broker_egress_linux.go).
+// Hobby 10 / Pro 50 / Scale 200. 0 for Free (gated off via
+// TriggersAllowed=false). Unknown plans fail closed (return 0).
+func (p Plan) BrokerEgressMbit() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.BrokerEgressMbit
+}
+
+// TLSSkipVerifyAllowed reports whether the customer's plan
+// permits the `tls.skip_verify=true` flag on KafkaConfig
+// (ADR-118 / commit 2 of 11). Hobby=false (a Hobby customer's
+// plaintext-TLS path doesn't justify the weakened-verification
+// posture). Pro / Scale = true. Free = false (gated off).
+// The apid createTrigger handler reads this via
+// Plan.TLSSkipVerifyAllowed() and rejects skip_verify=true on
+// Hobby with 403 trigger_tls_skip_verify_not_allowed. Unknown
+// plans fail closed (return false) — same contract as
+// TriggersAllowed().
+func (p Plan) TLSSkipVerifyAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.TLSSkipVerifyAllowed
 }
 
 // TrustedSignerCountMax returns the per-app cosign trusted-publisher

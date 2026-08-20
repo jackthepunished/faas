@@ -2485,6 +2485,17 @@ func (v *JailerVMM) ownChrootRoot(root string, l Lease) error {
 // timeout (bounded by the readyTimeout deadline). On a successful 2xx
 // the body is discarded immediately — the probe is "alive enough to
 // answer", not "shape-conformant".
+//
+// Error-explanations cluster (spec §6.4 amendment 1): when the
+// deadline expires, the returned error is a typed *api.Problem
+// carrying CodeAppNotListening (or CodeAppStartupTimeout for the
+// HTTP-probe case) so schedd's engine can pass it through to
+// gatewayd-internal unchanged and the CLI renderer pulls hint/why/
+// fix from pkg/whycopy without re-classifying. The TCP probe that
+// consistently hits ECONNREFUSED (the kernel-side "no listener")
+// is the canonical app_not_listening detection; the HTTP probe that
+// never returns 2xx is app_startup_timeout (the app may be up but
+// the healthcheck is wrong — distinct failure).
 func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath string) error {
 	deadline := time.Now().Add(v.readyTimeout)
 	addr := net.JoinHostPort(l.HostIP.String(), "8080")
@@ -2497,6 +2508,13 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 	// Legacy TCP-accept — pre-PR-D contract. Byte-identical to the
 	// pre-PR-D loop.
 	if healthcheckPath == "" {
+		// Track ECONNREFUSED specifically across the loop — a
+		// sustained ECONNREFUSED is the kernel's "no listener"
+		// shibboleth for app_not_listening. Other transient
+		// errors (timeout, EHOSTUNREACH) collapse to the generic
+		// "not ready" message so we don't misclassify a slow
+		// boot as a misconfigured listener.
+		connRefusedCount := 0
 		for {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -2507,8 +2525,16 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 				v.emitReadiness200(ctx, l, healthcheckPath, 1)
 				return nil
 			}
+			// ECONNREFUSED on TCP dial = nothing is listening on
+			// the port. Counts as the canonical
+			// app_not_listening signal. Any other error (timeout,
+			// host unreachable) means the network stack itself is
+			// the problem — not the absence of a listener.
+			if isConnRefusedErr(err) {
+				connRefusedCount++
+			}
 			if time.Now().After(deadline) {
-				return fmt.Errorf("guest %s not ready after %s", l.Instance, v.readyTimeout)
+				return v.notReadyProblem(l, healthcheckPath, connRefusedCount)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -2525,7 +2551,9 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 			return err
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("guest %s not ready (healthcheck %s) after %s", l.Instance, healthcheckPath, v.readyTimeout)
+			return api.NewProblem(422, api.CodeAppStartupTimeout,
+				"app did not become ready in time",
+				fmt.Sprintf("guest %s not ready (healthcheck %s) after %s", l.Instance, healthcheckPath, v.readyTimeout))
 		}
 		probeCount++
 		if ok, err := healthcheckProbe(ctx, client, addr, healthcheckPath); err == nil && ok {
@@ -2538,6 +2566,47 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// notReadyProblem shapes the deadline-expired error from the TCP
+// probe path. When every probe hit ECONNREFUSED, the kernel is
+// telling us nothing is listening — the canonical
+// app_not_listening. When a mix of errors occurred (or no probes
+// landed), we fall through to app_startup_timeout (the app may be
+// booting, but we waited the full window).
+//
+// The port literal "8080" mirrors waitReady's hard-coded addr —
+// ADR-009 fixes the readiness probe on 8080 regardless of the
+// deployment's per-app override (the override only affects the
+// HTTP GET path on healthcheckPath != ""). The whycopy catalog's
+// Observed renderer templates the port into the Why field so the
+// customer sees the literal ":8080" in the failure response.
+func (v *JailerVMM) notReadyProblem(l Lease, healthcheckPath string, connRefusedCount int) *api.Problem {
+	if connRefusedCount > 0 {
+		return api.NewProblem(422, api.CodeAppNotListening,
+			"no process listening on $PORT",
+			fmt.Sprintf("readiness probe dialed :8080 and got ECONNREFUSED on every attempt (refused_count=%d, deadline=%s, instance=%s)",
+				connRefusedCount, v.readyTimeout, l.Instance))
+	}
+	return api.NewProblem(422, api.CodeAppStartupTimeout,
+		"app did not become ready in time",
+		fmt.Sprintf("guest %s not ready after %s (no probes connected)", l.Instance, v.readyTimeout))
+}
+
+// isConnRefusedErr returns true when the dial error is the kernel's
+// ECONNREFUSED. The stdlib wraps the underlying syscall errno so we
+// match on the literal string — portable across Linux/macOS, no
+// platform-specific syscall import needed. Other errors (timeout,
+// host unreachable, network unreachable) are deliberately excluded:
+// they don't mean "no listener", they mean "the network path is
+// broken", and classifying them as app_not_listening would mislead
+// the customer into debugging their bind address when the real
+// problem is a broken netns.
+func isConnRefusedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "connection refused")
 }
 
 // emitReadiness200 (issue #517 / PR-C / ADR-064) is the canonical

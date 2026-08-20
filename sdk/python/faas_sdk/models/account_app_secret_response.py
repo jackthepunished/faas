@@ -16,13 +16,16 @@ class AccountAppSecretResponse:
     app (issue #393). Plaintext NEVER appears here: only the
     age-sealed envelope (base64). `app_id` and `app_slug` let the
     dashboard render "foo-app / DATABASE_URL" without a parallel
-    `/v1/apps` round-trip.
+    `/v1/apps` round-trip. `scope` (ADR-092 PR-B) carries the
+    env-scope the row belongs to; the account-wide list
+    crosses scopes.
 
     """
 
     app_id: str
     app_slug: str
     key: str
+    scope: str
     ciphertext: str
     """base64 age-sealed envelope. Plaintext NEVER appears on this wire."""
     created_at: datetime.datetime
@@ -35,6 +38,8 @@ class AccountAppSecretResponse:
         app_slug = self.app_slug
 
         key = self.key
+
+        scope = self.scope
 
         ciphertext = self.ciphertext
 
@@ -49,6 +54,7 @@ class AccountAppSecretResponse:
                 "app_id": app_id,
                 "app_slug": app_slug,
                 "key": key,
+                "scope": scope,
                 "ciphertext": ciphertext,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -66,6 +72,8 @@ class AccountAppSecretResponse:
 
         key = d.pop("key")
 
+        scope = d.pop("scope")
+
         ciphertext = d.pop("ciphertext")
 
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
@@ -76,6 +84,7 @@ class AccountAppSecretResponse:
             app_id=app_id,
             app_slug=app_slug,
             key=key,
+            scope=scope,
             ciphertext=ciphertext,
             created_at=created_at,
             updated_at=updated_at,

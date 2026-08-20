@@ -8,6 +8,7 @@ import type { BuildResponse } from '../models/BuildResponse.js';
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
+import type { RollbackRequest } from '../models/RollbackRequest.js';
 import type { ScanResult } from '../models/ScanResult.js';
 import type { SecretScanResult } from '../models/SecretScanResult.js';
 import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
@@ -213,13 +214,25 @@ export class DeploymentsService {
     });
   }
   /**
-   * Roll back to the previous deployment.
+   * Roll back to the previous deployment, or to a specific historical deployment.
+   * Without a request body, rolls back to the most-recent superseded
+   * deployment (the pre-#976 behaviour).
+   *
+   * With `target_deployment_id` in the body, rolls back to the
+   * named deployment. The id must belong to this app and the row
+   * must have `status='superseded'`. Rolling back to the
+   * already-current live deployment is rejected (409
+   * `rollback_target_already_live`). A target whose snapshot has
+   * been garbage-collected is rejected (409
+   * `rollback_target_snapshot_expired`).
+   *
    * @returns DeploymentResponse The deployment that was created by rolling back to the previous version.
    * @throws ApiError
    */
   public static rollbackApp({
     slug,
     idempotencyKey,
+    requestBody,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -231,6 +244,7 @@ export class DeploymentsService {
      *
      */
     idempotencyKey?: string,
+    requestBody?: RollbackRequest,
   }): CancelablePromise<DeploymentResponse> {
     return __request(OpenAPI, {
       method: 'POST',
@@ -241,9 +255,13 @@ export class DeploymentsService {
       headers: {
         'Idempotency-Key': idempotencyKey,
       },
+      body: requestBody,
+      mediaType: 'application/json',
       errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
-        409: `code: no_rollback_target — there is no superseded deployment to roll back to.`,
+        404: `code: rollback_target_not_found — the named target_deployment_id does not match any deployment of this app (or does not exist).`,
+        409: `code: no_rollback_target | rollback_target_already_live | rollback_target_snapshot_expired — rollback was rejected; see the response body for the specific code and detail.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
@@ -436,6 +454,23 @@ export class DeploymentsService {
    * Server-Sent Events stream of build logs. `follow=1` holds the
    * connection open until the build completes.
    *
+   * ADR-117: the stream also publishes one `event: stage` frame
+   * per named pipeline stage the customer's deploy passes
+   * through. The frame shape is:
+   *
+   * event: stage
+   * data: {"name":"<StageName>","started_at":"<RFC3339Nano>","duration_ms":<int64>,"status":"in_progress"|"completed"|"failed"[,"reason":"<string>"]}
+   *
+   * `name` is one of the closed 6-stage vocabulary:
+   * `source_download`, `dependency_restore`, `image_build`,
+   * `security_scan`, `snapshot_prepare`, `readiness`. The CLI
+   * renders the stream as a live ticker on a TTY (ANSI cursor-up
+   * redraw) with a static one-line-per-frame fallback when
+   * stdout is not a TTY / `--json` is set / `NO_COLOR` is
+   * non-empty. Customers wiring their own consumer should treat
+   * the frame as additive — the existing `event: log` /
+   * `event: status` / `event: end` shapes are unchanged.
+   *
    * @returns any A text/event-stream of build log entries, terminated by an empty SSE frame when the build finishes.
    * @throws ApiError
    */
@@ -587,6 +622,72 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the \`secret_findings\` jsonb has never been written).`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Get per-deploy closed-stage summary (ADR-117 follow-up).
+   * Returns the closed 6-stage summary for a deployment. Companion
+   * to `/v1/deployments/{id}/logs` (which streams `event: stage`
+   * frames during a live deploy) and `/v1/deployments/{id}` (which
+   * returns the typed deployment row). This endpoint serves the
+   * post-stream summary use case — `gregale deploys show <id>` and
+   * the future dashboard widget.
+   *
+   * The body is the same JSON shape already stored on
+   * `deployments.stage_state` (ADR-117, migration 00302). The
+   * handler does NOT add a typed DTO — the column's jsonb IS the
+   * wire. The closed vocabulary (`source_download` /
+   * `dependency_restore` / `image_build` / `security_scan` /
+   * `snapshot_prepare` / `readiness`) is enforced at the
+   * database layer by `deployments_stage_state_current_check`,
+   * so a malformed row would never reach the wire. The
+   * `current` field is the stage the deploy is in right now;
+   * `history` lists the closed rows in transition order
+   * (oldest → newest), each carrying server-measured
+   * `duration_ms` so the CLI / dashboard don't have to trust
+   * a 2s-tick reconstruction.
+   *
+   * A 404 is returned when:
+   * - the deployment row does not exist,
+   * - the deployment belongs to a different account (IDOR-safe;
+   * no account-existence leak).
+   *
+   * @returns any The raw `deployments.stage_state` jsonb. Shape: {current, current_started_at, history: [{name, started_at, ended_at, duration_ms, status, reason}]}.
+   * @throws ApiError
+   */
+  public static getDeploymentStages({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<{
+    current?: 'source_download' | 'dependency_restore' | 'image_build' | 'security_scan' | 'snapshot_prepare' | 'readiness';
+    current_started_at?: string | null;
+    history?: Array<{
+      name?: 'source_download' | 'dependency_restore' | 'image_build' | 'security_scan' | 'snapshot_prepare' | 'readiness';
+      started_at?: string | null;
+      ended_at?: string | null;
+      duration_ms?: number;
+      status?: 'completed' | 'failed';
+      reason?: string;
+    }>;
+  }> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/deployments/{id}/stages',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Deployment row missing or cross-account probe (IDOR-safe; never 403).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

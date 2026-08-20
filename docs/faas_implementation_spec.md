@@ -116,8 +116,9 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 - Records `last_request_at[instance]` (in-memory, flushed to PG every 15 s) — this drives idle parking.
 - Rate limits (token bucket, per app): Free 5 rps burst 20; Hobby 20 rps burst 100; Pro 100 rps burst 500; Scale 500 rps burst 2000. Over-limit → `429`.
 - Request/response size caps (per-plan, ADR-047):
-  - **Default (Free-tier path):** 25 MB body either direction; 60 s upstream response start, 300 s total. This is the legacy buffered path; it serves all Free-tier apps (and Hobby+ apps that have not opted in to streaming via the per-app `streaming_enabled` flag, with an operator opt-in via `FAAS_GATEWAY_STREAMING`).
+  - **Default (Free-tier path):** 25 MB body either direction; 60 s upstream response start, 300 s total. This is the legacy buffered path; it serves all Free-tier apps (and Hobby+ apps that have not opted in to streaming via the per-app `streaming_enabled` flag, with an operator opt-in via `FAAS_GATEWAY_STREAMING`). The cap is enforced by `pkg/gateway.capWriter` (issue #995 / ADR-121): inbound body via `http.MaxBytesReader` (existing); outbound body via `capWriter` on the buffered reverse-proxy dispatch site. On cap-exceeded, `gatewayd-internal` emits a 413 `response_too_large` problem+json (RFC 7807) when the cap trips before the upstream's headers reach the wire; mid-body trips surface as a hardened connection reset (stdlib's `WriteHeader(413)` silently no-ops after the upstream proxy has written 200 — see ADR-121 §2 for the architectural constraint and R2 for the recorder/test surface).
   - **Streaming path (Hobby+ only, ADR-047):** 100 MB body cap; 900 s response deadline. The `gatewayd-internal` handler takes the streaming path iff `FAAS_GATEWAY_STREAMING` is set (operator opt-in) AND the app's `streaming_enabled` flag is true AND the inbound request did not opt out via `Accept: application/json`. The handler wraps `w` with a per-flush `onFlush` callback (`statusRecorder.doFlush`) that attributes egress bytes (per-instance, per-minute) on every `Write`+`Flush` boundary, plus a residual capture on `finalFlush`. The cap is enforced by `pkg/gateway.capWriter`; on cap-exceeded `gatewayd-internal` emits a 413 `streaming_not_available` problem+json (RFC 7807) instead of stdlib's 502.
+  - **Warn-on-approach (issue #995 / ADR-121):** both the buffered and streaming `capWriter` paths emit `gateway_response_body_warn_total{app_id, bucket}` (`bucket ∈ {near_threshold, exceeded}`, threshold crossings at 80% / 95% / 100% of the per-plan cap). The counter is the scrape-friendly signal; a once-per-process `slog.Warn` is emitted for the first hit per `(app_id, bucket)` so a runaway app doesn't flood the log stream. See §17 for the dashboard chip.
   - **Per-request opt-out:** `Accept: application/json` flips a single request to the buffered path. The customer's per-app flag stays unchanged so flipping the flag on later is a config change, not a per-request decision.
   - **Plan gate:** `apid` rejects `streaming_enabled=true` on Free apps with `CodePlanStreamingNotAllowed` (per pkg/api/errors.go) at deploy time. The runtime fallback log `streamingFallbackLog` fires only when `!streaming && plan == Free && SSE` — the operator-toggled `FAAS_GATEWAY_STREAMING` is the operator-side lever, not a per-app misconfiguration.
 - **Multi-node forwarding (ADR-028 + ADR-047):** When schedd has placed an instance on a remote compute_node, `gatewayd-internal` dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's bidi `ForwardHTTPStream` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. The streaming envelope is 100 MB body / 900 s response deadline (the per-plan caps in §4.1 apply on `gatewayd-internal` via `capWriter`; the vmmd bridge runs the streaming cap uniformly). The local-node path (default single-node deploy) skips the bridge and uses the existing direct reverse-proxy path. The legacy unary `ForwardHTTP` RPC was removed in PR-D — `ForwardHTTPStream` is the only bridge today.
@@ -566,6 +567,141 @@ surface.
 
 ---
 
+### 4.10 Triggers and event-source mappings (issue #757 / ADR-100)
+
+The unified Trigger primitive replaces six unrelated invocation surfaces with one resource + one batch envelope + one FSM.
+
+#### Resource model
+
+One row per customer surface in the `triggers` table (migrations/00267_triggers.sql). The discriminator is `kind`:
+
+| Kind | Backend | Library / surface |
+|------|---------|-------------------|
+| `cron` | robfig/cron/v3 schedule parser | pre-existing `crons` table; this kind pins the row via `cron_id` |
+| `kafka` | consumer group | segmentio/kafka-go (commit #10) |
+| `nats` | JetStream durable consumer | nats.go/jetstream (commit #9) |
+| `redis_streams` | XReadGroup + XAck | redis/go-redis/v9 (commit #11) |
+| `sqs_compat` | long-poll HTTP queue | stdlib net/http (commit #12) |
+| `queue` | in-platform unified queue | pgxpool + `invocations` rows where source IN ('queue','delayed_task') (commit #8) |
+
+#### Per-kind config schema
+
+Stored as `config jsonb` on the trigger row. Decoded lazily per kind via `pkg/sched/poller_*.go::decodeXConfig`:
+
+- `kafka`:        `{"brokers":[...], "topic":"...", "group":"..."}`
+- `nats`:         `{"url":"nats://...", "stream":"...", "subject":"...", "durable":"..."}`
+- `redis_streams`: `{"addr":"redis:6379", "stream":"...", "group":"..."}`
+- `sqs_compat`:   `{"queue_url":"http://...", "long_poll_secs":20}`
+- `queue`:        `{"mode":"queue|delayed_task"}` (source discriminator)
+
+#### Batch semantics
+
+Every non-cron kind shares the same envelope:
+
+- `batch_size_max`   1..5000 (per-plan cap; Free 0, Hobby 50, Pro 500, Scale 5000)
+- `batch_window_ms`  10..600000 (per-plan cap; Free 0, Hobby 30000, Pro 300000, Scale 300000)
+- `max_attempts`     1..25 (per-plan cap; Free 0, Hobby 3, Pro 10, Scale 25)
+- 6MB payload cap (Lambda's hard cap; fixed)
+
+A batch closes on ANY of: `len == batch_size_max`, `now >= window_deadline`, `Σ(payload_bytes) >= 6MB`.
+
+#### Wire envelope
+
+`POST /v1/invocations:dispatch_batch` on the gateway synth server. The function receives:
+
+```
+POST /_triggers/<kind>/<trigger_slug>
+x-faas-trigger-id:   <uuid>
+x-faas-trigger-kind: <kind>
+x-faas-batch-size:   <N>
+body_b64: <JSON-array-of-records-b64>
+```
+
+Response shape (stolen verbatim from AWS Lambda):
+
+```json
+{"batchItemFailures":[{"itemIdentifier":"..."}]}
+```
+
+Empty / missing ⇒ full success. `pkg/gateway/synth.go::parseBatchFailures` decodes the response.
+
+#### Per-record FSM
+
+```
+pending ── claim ─▶ claimed ── succeeded
+                            ── retry ─▶ retry (next_fire_at=future)
+                                          └▶ attempts >= max ─▶ dead_letter
+                            ── poison_record ─▶ dead_letter
+```
+
+The `trigger_records` table (migrations/00267_triggers.sql) is the ledger; the `trigger_dead_letter` table is the terminal failure store. `ClaimTriggerRecords` uses `FOR UPDATE SKIP LOCKED` so two schedd instances racing on the same trigger each get a disjoint slice.
+
+#### Plan caps
+
+`pkg/api/limits.go::Limits` (commit #4):
+
+| Cap | Free | Hobby | Pro | Scale |
+|-----|------|-------|-----|-------|
+| TriggersAllowed | false | true | true | true |
+| TriggerLimitPerApp | 0 | 2 | 10 | 50 |
+| TriggerLimitPerAccount | 0 | 10 | 50 | 200 |
+| TriggerBatchSizeMax | 0 | 50 | 500 | 5000 |
+| TriggerBatchWindowMaxSec | 0 | 30 | 300 | 300 |
+| TriggerMaxAttemptsMax | 0 | 3 | 10 | 25 |
+| TriggerRecordsPerSecondPerApp | 0 | 100 | 1000 | 10000 |
+
+#### Audit + wire events
+
+Audit kinds (commit #15):
+
+- `trigger.fired`         per-record: broker delivered + dispatched
+- `trigger.fired.batch`   per-batch: aggregated outcome counts
+- `trigger.retry`         per-record: state → retry, next_fire_at
+- `trigger.dlq`           per-record: state → dead_letter
+
+pg_notify channels (commit #16):
+
+- `NotifyTriggerReady`    schedd wakeup (every broker-delivered record)
+- `NotifyTriggerChanged`  apid → schedd + dashboard SSE (CRUD + pause/resume)
+
+#### Broker adapter behavior
+
+One file per broker (`pkg/sched/poller_*.go`). Each implements:
+
+```go
+type triggerSource interface {
+    Kind() string
+    Poll(ctx, t sqlc.Trigger) PollResult
+    Ack(ctx, t, ids) error
+    Nack(ctx, t, ids, reason) error
+    Close() error
+}
+```
+
+Ack semantics per broker: queue → no-op (rows already in `invocations`); kafka → `CommitMessages`; nats → `Msg.Ack()`; redis → `XAck`; sqs → `POST .../delete`.
+
+Nack semantics: queue → no-op; kafka → `SetOffset` rewind; nats → `NakWithDelay(2s)`; redis → `XClaim` after 30s idle; sqs → `POST .../release`. `poison_record` becomes a broker-side drop on every broker.
+
+#### Failure routing
+
+| Reason | Source | Routing |
+|--------|--------|---------|
+| `rate_limited` | wake rate-limit gate deny | dead_letter, drop |
+| `poison_record` | malformed function response | dead_letter, manual_retry |
+| `max_attempts` | attempts reached per-trigger cap | dead_letter, customer_dlq |
+| `broker_error` | gateway transport failure | retry → max → dead_letter |
+| `payload_too_large` | record exceeds 6MB | dead_letter, drop |
+| `plan_quota` | per-app / per-account cap reached | dead_letter, drop |
+| `customer_disabled` | pause / delete mid-dispatch | dead_letter, drop |
+
+#### Migration safety
+
+- `00267_triggers.sql` is a single transaction; `invocations.source` widening uses `DROP CONSTRAINT … ADD CONSTRAINT` (PG15 has no `CREATE TRIGGER IF NOT EXISTS`, per the trigger-replay-safety precedent).
+- The pg_notify trigger `trg_notify_trigger_ready` fires AFTER INSERT ON trigger_records.
+- Cross-PR slot precheck before PR creation per `migration-gates-collision-and-replay.md`.
+
+---
+
 ## 5. Data model (Postgres, authoritative excerpt)
 
 `sqlc` against this schema; migrations via `goose`, numbered, never edited after merge.
@@ -800,12 +936,215 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 | WakeResponse wire shape reverts (someone re-adds `.addr`) | `pkg/scheddgrpc` proto compile fails; `grep -rn "\.addr" pkg/ cmd/` sweep | Proto compilation is the regression gate; pre-#199 clients fail at unmarshal | ADR-025 v1.1, ADR-028 v1.1, issue #168 |
 | `migration 00024` `default-local` `47600` literal backfilled changed | Admission ceiling would change | Anti-goal: do not touch the literal. Re-backfill requires a new ADR | ADR-025 v1.1 |
 | VM wedged (busy-loop / leaked FD / deadlocked runner), liveness probe fails N consecutive | `RUNNING → STOPPED` | 3 consecutive non-2xx / timeout / conn-refused on vsock 1028 STREAM → `Engine.DestroyForLivenessFailure` eagerly marks snapshot stale → next Wake cold-boots (per ADR-005). 3 destroys in 300 s → `Engine.ParkDeployment` flips parent app to `apps.status='evicted_cold'` + audit kind `instances.parked_liveness_exhausted`. Idle timer resets on destroy. | ADR-079, issue #554 |
+| App did not bind to `$PORT` (no listener on readiness probe) | `pkg/fcvm/vmm.go::waitReady` detects `ECONNREFUSED` over the readiness window | RFC 7807 `app_not_listening` 422 stamped via `SetDeploymentFailedEx`; CLI renders the 5-line shape from `pkg/whycopy` row `app_not_listening` (hint/why/fix/relevant_logs) | error-explanations cluster, amendment 1 |
+| App bound to `127.0.0.1` (loopback) instead of `0.0.0.0` | `pkg/fcvm/vmm.go::waitCharacterization` reads `listening_addrs` from the WakeCharacterizationReport | RFC 7807 `app_loopback_bound` 422 — the per-VM bridge forwards to `10.0.0.2` (ADR-009), so loopback-only binds never receive gateway traffic. CLI hints to bind `0.0.0.0` | error-explanations cluster, amendment 1 |
+| Binary tarball targets a non-linux/amd64 architecture | `pkg/builderd/vm_metal.go::classifyBuildFailure` detects `ENOEXEC` from the kernel + `pkg` discriminator | RFC 7807 `app_arch_mismatch` 422 with `pkg` (npm/pip/go/cargo/etc.) on the wire. CLI recommends `GOOS=linux GOARCH=amd64 go build` for Go, `cargo build --target x86_64-unknown-linux-gnu` for Rust | error-explanations cluster, amendment 1 |
+| Source references `$ENV_VAR` not declared in the app's env config | `pkg/reposcan/scan.go` + `cmd/gregale/commands_doctor.go::doctorCheckEnvRequired` preflight | RFC 7807 `env_var_missing` 422 — the runtime would crash on first access; preflight surfaces the source-side signal via `gregale doctor` so the customer fixes it before deploy | error-explanations cluster, amendment 1 |
+| `/healthz` returns 401 (or 403) | `cmd/vmmd/liveness_recv.go` discriminates 401/403 from the generic `liveness_non_200` path | RFC 7807 `app_healthz_unauthorized` 422 — after 3 consecutive 401s, the engine marks the deployment failed because we can't distinguish "the app is up but the healthz path is gated" from "the app is down". CLI hints to expose `/healthz` without auth or use `healthcheck_path` to point at a public route | error-explanations cluster, amendment 1 |
+| Container OOM (cgroup `memory.events` OOM kill on the workload) | `guest/init/cgroup_partition_linux.go` listens on `cgroup.events`; vsock msg_type=3 surfaces the kill | RFC 7807 `app_runtime_oom` 422 with the plan's RAM cap in the prose. CLI hints to upgrade plan or trim in-memory state | error-explanations cluster, amendment 1 |
+| Dependency install step (npm/pip/go mod/cargo) exited non-zero | `pkg/builderd/vm_metal.go::classifyBuildFailure` extended with the `pkg` discriminator | RFC 7807 `dep_install_failed` 422 with `pkg` (npm/pip/go/cargo) on the wire. CLI recommends `npm install` locally to reproduce | error-explanations cluster, amendment 1 |
+| App boot timeout (readiness probe waited the full `startup_timeout_s` and `/healthz` never returned 200) | `pkg/sched/engine.go::KillStuck` carries `StuckReason` into the typed Problem | RFC 7807 `app_startup_timeout` 422 distinct from idle timeout (which parks). CLI hints to increase `startup_timeout_s` or defer boot work until after the `/healthz` listener is up | error-explanations cluster, amendment 1 |
+| Tarball or base image is a stateful shape (Dockerfile `VOLUME`, top-level `data/` / `db/` / `var/`, or a stateful base image) | `pkg/oci` + G13 stateless-only gate | RFC 7807 `stateless_only_violation` 422 (already shipped pre-cluster). Now flows through the same 5-line renderer from `pkg/whycopy` row `stateless_only_violation` so the prose is uniform with the new codes | error-explanations cluster, amendment 1 |
 
 **Operator runbook pointers:**
 
 - Per-component verification scripts live in `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297 — **TBD**, not yet written) and `docs/runbooks/gate-a.md` (G.1, Gate-A active-passive adoption).
 - Admin surface row-by-row CRUD: `apid GET/POST/DELETE /v1/compute-nodes` (ADR-029 v1.1).
 - Cross-box gRPC dial: `pkg/wire.DialContext` (ADR-025 axis 1).
+
+### 6.4.1 Explanation catalog (error-explanations cluster, amendment 1)
+
+The 9 new rows above all flow through a single static catalog at
+`pkg/whycopy/` so the customer-facing prose is reviewable in one
+place, table-driven tested, and tripwire-protected. Each row
+maps one RFC 7807 stable `Code…` to:
+
+- **Title** — overrides `Problem.Title` when non-empty
+- **Hint** — single short next-action line (≤200 bytes)
+- **Why** — cause with the observed value templated in (≤512 bytes)
+- **Fix** — prescriptive remediation, 1-3 lines (bullets separated by `\n`)
+- **DocsURL** — overrides `Problem.DocsURL` when set
+- **Observed** — optional per-code renderer that templates the observed value into Why/Fix (e.g. `app_not_listening` lifts the actual port the probe dialed)
+
+The catalog is the single source of truth for customer-facing
+prose. Detection sites call `whycopy.Decorate(p, code, observed)`
+after the constructor so the wire `Problem` carries the full
+Hint/Why/Fix/RelevantLogs block on every code path.
+
+**Persistence:** the same prose is stamped onto the
+`deployments` row alongside `error_code` (`migrations/00290`,
+4 new columns: `error_hint`, `error_why`, `error_fix`,
+`error_relevant_logs jsonb`). Post-mortem retrieval via
+`gregale inspect <slug> --errors` lifts the persisted prose
+without re-running the build.
+
+**CLI surfaces:**
+
+- `cmd/gregale/commands.go::renderAPIError` renders the
+  5-line shape (Title / Detail / Hint / Why / Fix / RelevantLogs
+  / DocsURL). Legacy 3-line shape preserved when the cluster
+  didn't stamp any of the new fields.
+- `cmd/gregale/commands_doctor.go` — `gregale doctor [path]`
+  customer preflight that scans the cwd for the source-side
+  failure modes (loopback-bind, env-var, arch, stateless shape).
+- `cmd/gregale/pack.go::runPackPreflight` — warn-only preflight
+  run during `gregale deploy`; surfaces PORT unset + loopback
+  bind + arch mismatch hints after the deploy summary.
+- `cmd/gregale/commands2.go::runLogs --explain` — 4-line
+  summary on stream end (last error, level counts, top patterns).
+- `cmd/gregale/commands_inspect_errors.go` — `gregale inspect
+  <slug> --errors` post-mortem leaf that lifts the persisted
+  prose from the latest failed deployment.
+
+**Tripwires:**
+
+- `cmd/gregale/lint_tripwires_test.go::TestEveryCodeHasWhycopyEntry` —
+  every `Code…` in `pkg/api/errors.go` must have a matching row
+  in `pkg/whycopy`. Build fails on missing rows.
+- `pkg/whycopy/whycopy_test.go::TestDecorate_AllCodesHaveProse` —
+  every catalog row must have non-empty Title/Hint/Fix (and
+  Hint ≤200 bytes, Why ≤512 bytes).
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoGlyphLiteralOutsideOutput` —
+  every customer-facing glyph (`✓ ✗ → ! — 💡 ┌─ │ └─`) is
+  centralised in `cmd/gregale/output.go`; no other file may
+  use them verbatim.
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoLiteralDocsDomainEverywhere` —
+  every docs URL routes through `wire.DocsHost`.
+
+### 6.4.2 Explanation surfaces (error-explanations cluster, amendment 2 — Cluster A)
+
+Amendment 1 (§6.4.1) closed detection → wire → DB → CLI render. Amendment 2
+closes two remaining seams so the cluster is end-to-end visible:
+
+1. **Dashboard rendering of the persisted prose.** The deployment-detail
+   page (`pkg/dashboard/templates/deployment_detail.html`) now renders
+   `ErrorCode / ErrorHint / ErrorWhy / ErrorFix / ErrorRelevantLogs` as
+   a conditional `.error-explanation` section. The section is gated on
+   `{{ if .Data.Deployment.ErrorCode }}` so legacy pre-amendment-1 rows
+   render unchanged (no `.error-explanation` element when the code is
+   empty). The 5 fields are projected from the `state.Deployment` row
+   via `cmd/apid/handlers_dashboard.go::dashboardDeploymentItem`. Test
+   fixtures: `pkg/dashboard/dashboard_test.go::TestRender_DeploymentDetail_StatelessViolation`
+   (asserts the 5 prose blocks render) and `…_LegacyRowRenders` (asserts
+   the conditional section is absent on legacy rows).
+2. **Pre-upload doctor gate.** `gregale deploy --doctor-strict` runs
+   `runDoctorChecks(cwd)` BEFORE any HTTP / pack. Error-class findings
+   (currently `stateless_only_violation` via the top-level `data/`
+   discriminator) exit 1 with the doctor report printed to stderr; the
+   upload never starts, so a customer who runs the flag from CI gets
+   the same prose locally that the server would have 422'd on. Warnings
+   render + continue (mirrors the standalone `gregale doctor` semantics).
+   Scope: `--doctor-strict` (not `--strict` — already taken by the
+   `--diff` deploy-diff cluster). Flag name is guarded by
+   `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_DoctorStrictMutex`,
+   which fails on any new unscoped `--strict` Bool/String declaration
+   outside the two documented call sites.
+
+`app_healthz_unauthorized` forward-compat (amendment 2, sub-task 1):
+the guest-init → vmmd probe wire now carries a `WWWAuthenticate` field
+on `livenessResp` / `livenessResponseBody` (omitempty JSON). Today's
+discriminator is closed-set (any 401/403 → `livenessOutcomeUnauthorized`),
+but the new field lets a future platform-side probe auth PR read the
+realm without another wire-shape bump. Closed-set comment drift fix
+on `pkg/fcvm/metrics.go:324` and `cmd/vmmd/liveness_recv.go:67-87`
+adds the 6th outcome to the listed set. New unit tests in
+`cmd/vmmd/liveness_recv_test.go` cover `livenessOutcomeUnauthorized`
++ `livenessOutcomeUnauthorized` reset-on-success + the 403 arm.
+
+### 6.4.3 Runtime OOM detection (error-explanations cluster, amendment 3 — Cluster C)
+
+Amendment 1 (§6.4.1) shipped the catalog + DB schema + CLI renderer.
+Amendment 2 (§6.4.2, Cluster A) closed the dashboard and `--doctor-strict`
+seams. **Amendment 3 (Cluster C) wires the detection seam** for
+`app_runtime_oom` — the only gap remaining in the audit.
+
+**Detection locus.** Inside the guest, on the per-workload cgroup v2
+leaf (`main-app` leaf, `partitionInto`'s write at
+`guest/init/cgroup_partition_linux.go:135`). The host-side per-VM scope
+(`vmmd/writePlanCgroup`) sees only the firecracker process; the host
+*cannot* see per-PID OOM kills inside the VM. The only detection
+surface is the guest's cgroup v2 memory controller on the workload leaf.
+
+**Wire envelope** — added to the existing closed-set dispatcher on
+framework_ready port 1027 DGRAM:
+
+```
+[1B type=0x05][json:{"peak_mb":N,"plan_mb":N}]
+```
+
+The body is a UTF-8 JSON envelope mirroring the host-side
+`workloadOOMWire` (cmd/vmmd/framework_ready_recv.go). Body cap:
+`VsockWorkloadOOMMaxBody = 256` bytes (the payload is < 32 bytes;
+256 is a future-proof margin mirrored on the guest side at
+`workloadOOMEmitMaxBody`).
+
+The host resolves instance identity from the DGRAM peer CID (same join
+as types 0x01..0x04). The new closed-set member is 0x05, owned by the
+existing dispatcher — no new vsock port, no new listener. Future event
+classes (0x06+) require a byte + a switch case + a test in lockstep;
+the tripwire is `cmd/vmmd/framework_ready_recv.go::TestParseFramework
+ReadyDatagram_TypeClosedSet`.
+
+**Producer chain** (end-to-end):
+
+```
+in-VM workload PIDs (cgroup v2 leaf, memory.max = plan + 8 MB)
+   ↓ poll(2) on leaf's cgroup.events + memory.events oom_kill delta
+guest/init::WatchOOM(ctx, leaf, planMB, emit, log)         ← NEW
+   ↓ samples memory.events.high (or memory.current fallback)
+guest-init::EmitWorkloadOOM(ctx, peakMB, planMB)           ← NEW (vsock DGRAM 0x05)
+cmd/vmmd::framework_ready_recv.go::dispatchWorkloadOOM
+   ↓
+pkg/fcvm::Manager.ReportWorkloadOOM(instanceID, peakMB, planMB)  ← NEW
+   ↓ via WithWorkloadOOMSink (mirrors WithLivenessSink)
+cmd/vmmd/main.go closure → cli.ReportWorkloadOOM gRPC
+   ↓
+pkg/scheddgrpc/server.go::ReportWorkloadOOM                 ← NEW (RPC + handler)
+   ↓
+pkg/sched/engine.go::DestroyForWorkloadOOMFailure(ctx, instanceID, peakMB, planMB)  ← NEW
+   ↓
+whycopy.Decorate(problem, CodeAppRuntimeOOM, struct{PeakMB, PlanMB int}{...})
+   ↓
+store.SetDeploymentFailedEx(deploymentID, CodeAppRuntimeOOM, ...problem.Hint,
+                            problem.why, problem.Fix, nil)
+   ↓
+dashboard .error-explanation  +  CLI inspect --errors  +  gregale doctor
+```
+
+**Whycopy Observed** — the `CodeAppRuntimeOOM` catalog row ships an
+`Observed func(observed any) (why, fix string)` closure that templates
+the (peakMB, planMB) tuple into the customer-facing prose:
+
+- **Why:** "the cgroup memory controller killed the process at
+  `<peak>` MB (plan cap `<plan>` MB + 8 MB overhead); the kernel
+  OOM-killer fired inside the microVM"
+- **Fix:** "• upgrade from a `<plan>` MB plan to a plan with ≥
+  `<peak+8>` MB of RAM\n• trim in-memory state (caches, buffers,
+  large request bodies held in memory)"
+
+The static `Why` / `Fix` strings remain the fallback when `Decorate`
+is called with `observed=nil` (no templating — the existing 6 customer
+fixtures that never set the observed value still see the right prose).
+
+The cross-reference line "if this is a build step, see
+/errors/build/limits#memory instead" was dropped — the build-OOM path
+is `CodeBuildOOM`, not `CodeAppRuntimeOOM`; the cross-reference was
+misleading because the two constructors are distinct.
+
+**Tripwires** stay green: `TestParseFrameworkReadyDatagram_TypeClosedSet`
+(closed-set guard), `TestEveryCodeHasWhycopyEntry` (Observed closure
+presence), `TestObservedRendering` (template parity). The audit moves
+from 9/9 covering-of-named-codes → 9/9 with end-to-end detection
+wired.
+
+**Metal acceptance gate** — `cmd/vmmd/workload_oom_metal_test.go`:
+boots a Hobby-plan guest, places a workload in the per-VM cgroup leaf
+with `memory.max = 256 MiB`, runs
+`python3 -c 'x=[]; [x.append(bytearray(1024*1024)) for _ in range(384)]'`
+to force OOM, asserts the deployment row is stamped `app_runtime_oom`
+with the templated peak MB ≈ 384 + plan cap 256 within the tripwire
+budget. Runs on `make test-metal` (x86_64) or `make metal-lima`
+(M3+ Mac).
 
 ---
 
@@ -818,7 +1157,7 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 - **Per-instance egress metering (ADR-046, telemetry seam only):** vmmd samples the kernel byte counter at `/sys/class/net/<vethHost>/statistics/rx_bytes` for every RUNNING instance (root-side `vethHost`, since customer egress traverses `tap0 → vethPeer → vethHost` and lands as RX on the host side); cumulative readings are converted to regression-safe deltas in `pkg/fcvm/netstats.Cache` and exposed through `vmmd.Stats` → `schedd.ListInstanceStats` → `meterd.Sampler.SampleAndRoll`. The gateway additionally records HTTP response body bytes via `pkg/gateway/handler.go:statusRecorder.Bytes`. Both accumulate additively in `usage_minutes.tx_bytes` (gateway) and `usage_minutes.net_tx_bytes` (vmmd). **No billing change:** Stripe/Paddle push shapes remain `gb_ram_hour`; per-plan shaping is unchanged.
 - **Per-app egress IP allowlist (ADR-031 + ADR-033, M8 tier-2):** operators may pin `apps.egress_allowlist cidr[]` on a v4 or v6 CIDR list (Pro ≤16 entries combined, Scale ≤64 combined; Free/Hobby gate). Empty list = current default-allow behaviour preserved. Non-empty list emits one rule per non-empty family inside the per-netns forward chains — `iifname "tap0" ip daddr { v4 CIDRs… } accept` on `ip faas forward` and/or `iifname "tap0" ip6 daddr { v6 CIDRs… } accept` on `ip6 faas forward` — each placed **after** its chain's lateral-movement deny + SMTP drops so deny > allow on overlap and **before** the chain's default policy so unlisted destinations drop. Live instances keep their old ruleset until the next wake (same contract as `RAMMB` / `MaxConcurrency`). Non-`/0` contract held by the DB trigger `apps_egress_allowlist_cidr` (migration 00033); the apid + vmmd wire layers are defence-in-depth.
 - Egress (builder VMs): allow 443/80/53 to package registries only via a squid allowlist in v1.1; v1 = same as tenant policy. Deny everything inbound always.
-- DNS names: `{slug}.apps.gregale.dev` wildcard A record → host IP. Custom domains: customer CNAMEs to `edge.gregale.dev`, apid verifies via TXT `_faas-verify.{domain}` before `gatewayd-public` will mint a cert.
+- DNS names: `{slug}.apps.gregale.dev` wildcard A record → host IP. Custom domains: customer CNAMEs to `edge.gregale.dev`, apid verifies via TXT `_faas-verify.{domain}` before `gatewayd-public` will mint a cert. **Doctor (ADR-120):** `GET /v1/domains/{domain}/doctor` returns the 5-check Render-style report (DNS found / points to Gregale / TLS / CAA permits / IPv6 conflict) with per-check remediation lines; backed by the persisted `domain_doctor_observations` table the `dns_poller` writes every 30s. See [`docs/domains/doctor.md`](../domains/doctor.md).
 
 ---
 

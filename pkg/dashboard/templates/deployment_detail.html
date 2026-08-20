@@ -40,6 +40,45 @@
     .sev-medium   { color: #f9a825; font-weight: 600; }
     .sev-low      { color: #1565c0; font-weight: 600; }
     .sev-unknown  { color: #888; }
+    /* Error-explanations cluster (spec §6.4 amendment 1):
+       the per-deployment prose block surfaced when a deploy
+       fails with a typed code (e.g. stateless_only_violation).
+       Scoped under .error-explanation so no global selector
+       bleed. Hint yellow, why gray italic, fix green
+       monospace; relevant logs collapsed by default. */
+    .error-explanation {
+      border-left: 3px solid #e74c3c;
+      padding: 0.75rem 1rem;
+      margin: 1rem 0;
+      background: #fef2f2;
+    }
+    .error-explanation .title { margin: 0 0 0.5rem 0; font-family: ui-monospace, Menlo, monospace; }
+    .error-explanation .hint  { color: #b45309; margin: 0.25rem 0; }
+    .error-explanation .why   { color: #6b7280; font-style: italic; margin: 0.25rem 0; white-space: pre-wrap; }
+    .error-explanation .fix   { color: #047857; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; margin: 0.25rem 0; }
+    .error-explanation .logs  { margin-top: 0.5rem; }
+    .error-explanation .docs  { display: inline-block; margin-top: 0.5rem; }
+    /* Issue #606 / SAFE-RELEASES-E.1: deployer attribution chips.
+       The .badge.deployer-via reuses the badge palette with a
+       neutral violet accent so the chip reads as metadata, not
+       status. The .deployer-field is a lightweight text row for
+       the by/pusher/from bits; .muted fades the IP since it's
+       the least-actionable of the four. */
+    .badge.deployer-via  { background: #ede9fe; color: #5b21b6; text-transform: uppercase; letter-spacing: 0.05em; }
+    .deployer-field      { display: inline-block; margin-right: 0.75rem; font-size: 0.9rem; }
+    .deployer-field.muted { color: #888; }
+    p.deployer           { margin-top: 0.25rem; }
+    /* Stage timeline (ADR-117 v2 follow-on, A2): the closed-6-stage
+       post-stream summary the customer sees via `gregale deploys
+       show <id>`. Scoped under .stage-timeline so no global selector
+       bleed. The HTML is rendered at the handler edge into the
+       Stages.BodyHTML pre-rendered block (no FuncMap wiring). */
+    .stage-timeline { font-family: ui-monospace, Menlo, monospace; margin: 1rem 0; }
+    .stage-timeline .stage-row { display: flex; gap: 0.5rem; padding: 0.15rem 0; }
+    .stage-timeline .stage-row .glyph { width: 1.5rem; text-align: center; }
+    .stage-timeline .stage-row .label { flex: 1; }
+    .stage-timeline .stage-row .duration { color: #888; }
+    .stage-timeline .stage-footer { margin: 0.5rem 0 0 0; color: #6b7280; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -67,6 +106,56 @@
         · Kind: <strong>{{.Data.Deployment.Kind}}</strong>
         · Created: <code>{{.Data.Deployment.CreatedAt}}</code>
       </p>
+
+      {{ if .Data.Deployment.ErrorCode }}
+      <section class="error-explanation" data-cluster="error-explanations">
+        <h3 class="title">✗ {{ .Data.Deployment.ErrorCode }}</h3>
+        {{ if .Data.Deployment.Error }}
+          <p class="detail">{{ .Data.Deployment.Error }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorHint }}
+          <p class="hint">💡 {{ .Data.Deployment.ErrorHint }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorWhy }}
+          <p class="why">why: {{ .Data.Deployment.ErrorWhy }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorFix }}
+          <p class="fix">→ {{ .Data.Deployment.ErrorFix }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorRelevantLogs }}
+          <details class="logs">
+            <summary>relevant logs ({{ len .Data.Deployment.ErrorRelevantLogs }})</summary>
+            <pre>{{ range .Data.Deployment.ErrorRelevantLogs }}[{{ .Level }}] {{ .Source }}: {{ .Message }}
+{{ end }}</pre>
+          </details>
+        {{ end }}
+        <a class="docs" href="https://docs.gregale.dev/errors/{{ .Data.Deployment.ErrorCode }}" target="_blank" rel="noopener">docs →</a>
+      </section>
+      {{ end }}
+      {{/* Issue #606 / SAFE-RELEASES-E.1: structured deployer
+          attribution. The four fields are server-stamped from
+          the HTTP request context (never client-supplied) and
+          surface here so the SOC 2 CC7.2 / GDPR audit-trail
+          question "who deployed v3 at 14:32?" has a one-click
+          answer. Each chip is conditional on the field being
+          non-empty — pre-#606 rows render bit-identical. */}}
+        {{if or .Data.Deployment.DeployedVia .Data.Deployment.DeployedByUserID .Data.Deployment.DeployedFromIP .Data.Deployment.PusherLogin}}
+        <p class="deployer">
+          {{if .Data.Deployment.DeployedVia}}<span class="badge deployer-via">{{.Data.Deployment.DeployedVia}}</span>{{end}}
+          {{if .Data.Deployment.DeployedByUserID}}<span class="deployer-field">by <code>{{.Data.Deployment.DeployedByUserID}}</code></span>{{end}}
+          {{if .Data.Deployment.PusherLogin}}<span class="deployer-field">pusher <code>{{.Data.Deployment.PusherLogin}}</code></span>{{end}}
+          {{if .Data.Deployment.DeployedFromIP}}<span class="deployer-field muted">from <code>{{.Data.Deployment.DeployedFromIP}}</code></span>{{end}}
+        </p>
+        {{end}}
+
+      {{ with .Data.Stages }}
+      {{ if .BodyHTML }}
+      <h2>Stages</h2>
+      <section class="stage-timeline" data-cluster="stage-timeline">
+        {{ .BodyHTML }}
+      </section>
+      {{ end }}
+      {{ end }}
 
       <h2>Scan</h2>
       {{if .Data.Scan}}

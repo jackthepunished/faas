@@ -233,6 +233,44 @@ func TestDefaultDeps_ReturnExpected(t *testing.T) {
 	if srv.ReadHeaderTimeout == 0 {
 		t.Error("default server should set ReadHeaderTimeout")
 	}
+	// Issue #995 Phase 3 / ADR-121: hardened defaults for the
+	// control + unix-socket listener (defaultServer).
+	if srv.ReadTimeout == 0 {
+		t.Error("default server should set ReadTimeout (issue #995 Phase 3)")
+	}
+	if srv.WriteTimeout == 0 {
+		t.Error("default server should set WriteTimeout (issue #995 Phase 3)")
+	}
+	if srv.IdleTimeout == 0 {
+		t.Error("default server should set IdleTimeout (issue #995 Phase 3)")
+	}
+	if srv.MaxHeaderBytes == 0 {
+		t.Error("default server should set MaxHeaderBytes (issue #995 Phase 3)")
+	}
+}
+
+// TestReadTimeoutOrDefault verifies the Phase 3 helper falls through
+// to api.GatewaydInternalReadTimeoutSecondsDefault when the override
+// is zero. Issue #995 Phase 3 / ADR-121.
+func TestReadTimeoutOrDefault(t *testing.T) {
+	if got := readTimeoutOrDefault(0); got != time.Duration(api.GatewaydInternalReadTimeoutSecondsDefault)*time.Second {
+		t.Errorf("readTimeoutOrDefault(0) = %v, want %ds", got, api.GatewaydInternalReadTimeoutSecondsDefault)
+	}
+	if got := readTimeoutOrDefault(7 * time.Second); got != 7*time.Second {
+		t.Errorf("readTimeoutOrDefault(7s) = %v, want 7s", got)
+	}
+}
+
+// TestWriteTimeoutOrDefault still passes its existing shape (Phase 3
+// left the WriteTimeout surface unchanged), but add the symmetric
+// guard here so the two helpers move together.
+func TestWriteTimeoutOrDefault(t *testing.T) {
+	if got := writeTimeoutOrDefault(0); got != time.Duration(api.ResponseWriteTimeoutDefault)*time.Second {
+		t.Errorf("writeTimeoutOrDefault(0) = %v, want %ds", got, api.ResponseWriteTimeoutDefault)
+	}
+	if got := writeTimeoutOrDefault(7 * time.Second); got != 7*time.Second {
+		t.Errorf("writeTimeoutOrDefault(7s) = %v, want 7s", got)
+	}
 }
 
 func TestFixedBackend_Delegates(t *testing.T) {

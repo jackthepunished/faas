@@ -290,8 +290,8 @@ func (m *WakePhaseMetrics) ObserveWakePhase(phase string, ms int64) {
 //
 //   - vmmd_guest_liveness_probe_seconds{outcome}: histogram of the
 //     wall-clock duration for one probe (host dial + JSON RTT). Outcomes
-//     are the closed set {ok, non_200, timeout, conn_refused, conn_err}
-//     — the same five classes the host's failure counter tracks.
+//     are the closed set {ok, non_200, unauthorized, timeout, conn_refused,
+//     conn_err} — the same six classes the host's failure counter tracks.
 //   - vmmd_guest_liveness_consecutive_failures{instance}: per-instance
 //     gauge of the current consecutive-failure count. Resets to 0 on
 //     a 2xx response; ticks up on every non-2xx. The
@@ -321,7 +321,7 @@ func NewLivenessMetrics() *LivenessMetrics {
 		reg: reg,
 		probe: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "vmmd_guest_liveness_probe_seconds",
-			Help: "Wall-clock duration for one liveness probe (host dial + JSON RTT) per outcome (issue #554 / ADR-078). Closed outcome set {ok, non_200, timeout, conn_refused, conn_err}.",
+			Help: "Wall-clock duration for one liveness probe (host dial + JSON RTT) per outcome (issue #554 / ADR-078, error-explanations cluster §6.4 amendment 1). Closed outcome set {ok, non_200, unauthorized, timeout, conn_refused, conn_err}.",
 			// Probe budget: 5s default period, 2s default timeout.
 			// 0.001-0.005 captures the healthy 2xx RTT; 0.2-2.0
 			// captures the timeout region; 5+ captures the

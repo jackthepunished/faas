@@ -22,9 +22,11 @@ from ..models.deployment_response_parked_reason_type_3_type_1 import (
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.build_plan import BuildPlan
     from ..models.deployment_healthcheck import DeploymentHealthcheck
     from ..models.deployment_liveness_probe import DeploymentLivenessProbe
     from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
+    from ..models.log_excerpt import LogExcerpt
     from ..models.scan_result import ScanResult
     from ..models.secret_scan_result import SecretScanResult
 
@@ -51,6 +53,15 @@ class DeploymentResponse:
     build_id: None | str | Unset = UNSET
     error: None | str | Unset = UNSET
     error_code: None | str | Unset = UNSET
+    error_hint: None | str | Unset = UNSET
+    """One-line next-action lifted from pkg/whycopy catalog."""
+    error_why: None | str | Unset = UNSET
+    """Human-readable cause with observed value."""
+    error_fix: None | str | Unset = UNSET
+    """Prescriptive remediation (1-3 lines)."""
+    error_relevant_logs: list[LogExcerpt] | Unset = UNSET
+    """Per-line log excerpts explaining the failure (error-explanations cluster). Capped at 20 entries × 512 bytes
+    by the CLI tripwire."""
     has_overrides: bool | Unset = UNSET
     """True when this deployment carries a non-null override_* column set."""
     override_entrypoint: list[str] | Unset = UNSET
@@ -120,9 +131,13 @@ class DeploymentResponse:
     digest the imaged walk ran against; null on legacy
     pre-PR-A rows. See `pkg/imaged/secretscan.go`.
     """
+    build_plan: BuildPlan | None | Unset = UNSET
+    """Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`.
+    nil for image deploys."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.build_plan import BuildPlan
         from ..models.deployment_healthcheck import DeploymentHealthcheck
         from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.scan_result import ScanResult
@@ -157,6 +172,31 @@ class DeploymentResponse:
             error_code = UNSET
         else:
             error_code = self.error_code
+
+        error_hint: None | str | Unset
+        if isinstance(self.error_hint, Unset):
+            error_hint = UNSET
+        else:
+            error_hint = self.error_hint
+
+        error_why: None | str | Unset
+        if isinstance(self.error_why, Unset):
+            error_why = UNSET
+        else:
+            error_why = self.error_why
+
+        error_fix: None | str | Unset
+        if isinstance(self.error_fix, Unset):
+            error_fix = UNSET
+        else:
+            error_fix = self.error_fix
+
+        error_relevant_logs: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.error_relevant_logs, Unset):
+            error_relevant_logs = []
+            for error_relevant_logs_item_data in self.error_relevant_logs:
+                error_relevant_logs_item = error_relevant_logs_item_data.to_dict()
+                error_relevant_logs.append(error_relevant_logs_item)
 
         has_overrides = self.has_overrides
 
@@ -244,6 +284,14 @@ class DeploymentResponse:
         else:
             secret_scan = self.secret_scan
 
+        build_plan: dict[str, Any] | None | Unset
+        if isinstance(self.build_plan, Unset):
+            build_plan = UNSET
+        elif isinstance(self.build_plan, BuildPlan):
+            build_plan = self.build_plan.to_dict()
+        else:
+            build_plan = self.build_plan
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -262,6 +310,14 @@ class DeploymentResponse:
             field_dict["error"] = error
         if error_code is not UNSET:
             field_dict["error_code"] = error_code
+        if error_hint is not UNSET:
+            field_dict["error_hint"] = error_hint
+        if error_why is not UNSET:
+            field_dict["error_why"] = error_why
+        if error_fix is not UNSET:
+            field_dict["error_fix"] = error_fix
+        if error_relevant_logs is not UNSET:
+            field_dict["error_relevant_logs"] = error_relevant_logs
         if has_overrides is not UNSET:
             field_dict["has_overrides"] = has_overrides
         if override_entrypoint is not UNSET:
@@ -294,14 +350,18 @@ class DeploymentResponse:
             field_dict["scope"] = scope
         if secret_scan is not UNSET:
             field_dict["secret_scan"] = secret_scan
+        if build_plan is not UNSET:
+            field_dict["build_plan"] = build_plan
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.build_plan import BuildPlan
         from ..models.deployment_healthcheck import DeploymentHealthcheck
         from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
+        from ..models.log_excerpt import LogExcerpt
         from ..models.scan_result import ScanResult
         from ..models.secret_scan_result import SecretScanResult
 
@@ -344,6 +404,42 @@ class DeploymentResponse:
             return cast(None | str | Unset, data)
 
         error_code = _parse_error_code(d.pop("error_code", UNSET))
+
+        def _parse_error_hint(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_hint = _parse_error_hint(d.pop("error_hint", UNSET))
+
+        def _parse_error_why(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_why = _parse_error_why(d.pop("error_why", UNSET))
+
+        def _parse_error_fix(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        error_fix = _parse_error_fix(d.pop("error_fix", UNSET))
+
+        _error_relevant_logs = d.pop("error_relevant_logs", UNSET)
+        error_relevant_logs: list[LogExcerpt] | Unset = UNSET
+        if _error_relevant_logs is not UNSET:
+            error_relevant_logs = []
+            for error_relevant_logs_item_data in _error_relevant_logs:
+                error_relevant_logs_item = LogExcerpt.from_dict(error_relevant_logs_item_data)
+
+                error_relevant_logs.append(error_relevant_logs_item)
 
         has_overrides = d.pop("has_overrides", UNSET)
 
@@ -510,6 +606,23 @@ class DeploymentResponse:
 
         secret_scan = _parse_secret_scan(d.pop("secret_scan", UNSET))
 
+        def _parse_build_plan(data: object) -> BuildPlan | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                build_plan_type_0 = BuildPlan.from_dict(data)
+
+                return build_plan_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(BuildPlan | None | Unset, data)
+
+        build_plan = _parse_build_plan(d.pop("build_plan", UNSET))
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -520,6 +633,10 @@ class DeploymentResponse:
             build_id=build_id,
             error=error,
             error_code=error_code,
+            error_hint=error_hint,
+            error_why=error_why,
+            error_fix=error_fix,
+            error_relevant_logs=error_relevant_logs,
             has_overrides=has_overrides,
             override_entrypoint=override_entrypoint,
             override_cmd=override_cmd,
@@ -536,6 +653,7 @@ class DeploymentResponse:
             traffic_percent=traffic_percent,
             scope=scope,
             secret_scan=secret_scan,
+            build_plan=build_plan,
         )
 
         deployment_response.additional_properties = d

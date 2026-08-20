@@ -103,6 +103,13 @@ func TestSweep_PlanEgressAllowlist(t *testing.T) {
 	}
 }
 
+func TestSweep_PlanPublicAuthIPAllowlist(t *testing.T) {
+	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		_ = p.PublicAuthIPAllowlistAllowed()
+		_ = p.PublicAuthIPAllowlistMaxEntries()
+	}
+}
+
 func TestSweep_PlanRequireAuthn(t *testing.T) {
 	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
 		_ = p.RequireAuthnAllowed()

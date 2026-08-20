@@ -935,6 +935,111 @@ func TestMemStore_SetDeploymentParked_Idempotent(t *testing.T) {
 // is the load-bearing "app is healthy" branch on the apid
 // surface. The handler maps ErrNotFound → nil ParkedDeploymentRef
 // (no field on the wire).
+
+// TestMemStore_SetDeploymentFailedEx_PersistsExplanationFields locks
+// the MemStore parity surface for the error-explanations cluster
+// (spec §6.4 amendment 1, migrations/00290). The PgStore equivalent
+// runs against a live schema; this test locks the in-process store
+// so the unit-test suite that exercises MemStore stays aligned with
+// the persistence shape. The contract being locked:
+//
+//   - status is pinned to 'failed' regardless of prior status
+//   - error_code carries the RFC 7807 code
+//   - error_hint / error_why / error_fix carry the customer-facing prose
+//   - error_relevant_logs carries the per-line log excerpts
+//
+// A regression here means the wire-side DTO would diverge from the
+// in-process store — pkg/api.DeploymentResponse.ErrorHint is
+// populated from d.ErrorHint at serialise time and the dashboard
+// would render an empty block.
+func TestMemStore_SetDeploymentFailedEx_PersistsExplanationFields(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "expl-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "expl-mem"})
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:e"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	logs := []api.LogExcerpt{
+		{Timestamp: "2026-08-18T19:00:00Z", Level: "error", Source: "vm-init", Message: "dial :8080: connection refused"},
+		{Timestamp: "2026-08-18T19:00:01Z", Level: "error", Source: "app", Message: "panic: listen tcp 127.0.0.1:8080: bind: address already in use"},
+	}
+	got, err := m.SetDeploymentFailedEx(ctx, dep.ID,
+		api.CodeAppNotListening,
+		"wake readiness probe failed",
+		"your app isn't accepting traffic on the port we expect",
+		"the readiness probe dialed :8080 and got no listener",
+		"• bind to 0.0.0.0\n• check `app.listen(process.env.PORT)`",
+		logs,
+	)
+	if err != nil {
+		t.Fatalf("SetDeploymentFailedEx: %v", err)
+	}
+	if got.Status != DeployFailed {
+		t.Errorf("status = %s, want failed", got.Status)
+	}
+	if got.ErrorCode != api.CodeAppNotListening {
+		t.Errorf("error_code = %q, want %q", got.ErrorCode, api.CodeAppNotListening)
+	}
+	if got.ErrorHint != "your app isn't accepting traffic on the port we expect" {
+		t.Errorf("error_hint = %q, want the customer-facing hint", got.ErrorHint)
+	}
+	if got.ErrorWhy != "the readiness probe dialed :8080 and got no listener" {
+		t.Errorf("error_why = %q, want the templated why", got.ErrorWhy)
+	}
+	if got.ErrorFix != "• bind to 0.0.0.0\n• check `app.listen(process.env.PORT)`" {
+		t.Errorf("error_fix = %q, want the multi-line fix", got.ErrorFix)
+	}
+	if len(got.ErrorRelevantLogs) != 2 {
+		t.Fatalf("error_relevant_logs len = %d, want 2", len(got.ErrorRelevantLogs))
+	}
+	if got.ErrorRelevantLogs[0].Source != "vm-init" {
+		t.Errorf("error_relevant_logs[0].source = %q, want vm-init", got.ErrorRelevantLogs[0].Source)
+	}
+	if got.ErrorRelevantLogs[1].Message != "panic: listen tcp 127.0.0.1:8080: bind: address already in use" {
+		t.Errorf("error_relevant_logs[1].message = %q, want the panic line", got.ErrorRelevantLogs[1].Message)
+	}
+}
+
+// TestMemStore_SetDeploymentFailedEx_EmptyFieldsPersistAsEmpty locks
+// the empty-input fallthrough path: a non-sentinel failure (no
+// catalog row) leaves all four prose fields empty strings + nil
+// logs slice. The wire DTO's omitempty tags suppress them so
+// customers on a non-catalog failure see the legacy 3-line shape
+// without an empty hint/why/fix block.
+func TestMemStore_SetDeploymentFailedEx_EmptyFieldsPersistAsEmpty(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "expl-empty-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "expl-empty-mem"})
+	dep, _ := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:em"})
+
+	got, err := m.SetDeploymentFailedEx(ctx, dep.ID, api.CodeAppStartupTimeout, "no boot", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("SetDeploymentFailedEx: %v", err)
+	}
+	if got.ErrorHint != "" || got.ErrorWhy != "" || got.ErrorFix != "" {
+		t.Errorf("prose fields should be empty: hint=%q why=%q fix=%q", got.ErrorHint, got.ErrorWhy, got.ErrorFix)
+	}
+	if got.ErrorRelevantLogs != nil {
+		t.Errorf("error_relevant_logs should be nil, got %v", got.ErrorRelevantLogs)
+	}
+}
+
+// TestMemStore_SetDeploymentFailedEx_UnknownReturnsErrNotFound locks
+// the not-found branch that callers depend on for the post-deploy
+// failure path (a race where the deployment was deleted between
+// CreateDeployment and SetDeploymentFailedEx must surface as
+// ErrNotFound rather than panic on a nil map entry).
+func TestMemStore_SetDeploymentFailedEx_UnknownReturnsErrNotFound(t *testing.T) {
+	m := NewMemStore()
+	_, err := m.SetDeploymentFailedEx(context.Background(), "missing-id", api.CodeAppStartupTimeout, "msg", "hint", "why", "fix", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetDeploymentFailedEx on missing id: got err=%v, want ErrNotFound", err)
+	}
+}
 func TestMemStore_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()
@@ -5065,5 +5170,278 @@ func TestMemStore_ListAllEventsPaged_ValidSubject(t *testing.T) {
 	}
 	if got[0].Subject == nil || got[0].Subject.String() != subjectA {
 		t.Errorf("subject: got %v, want %s", got[0].Subject, subjectA)
+	}
+}
+
+// TestMemStoreAppendDeploymentStage covers the four cases of
+// AppendDeploymentStage + MarkDeploymentStageFailed + CloseDeploymentStage
+// (ADR-117 §3 + PR-A review fixes): forward transition, failure
+// stamp on the in-flight stage, terminal close, and the stale-read
+// guard. The PGStore path is exercised by the JSONB + CHECK migration
+// test (migrations/00302_deployments_stage_state_test.go); the
+// in-memory store mirrors the same shape so the same test contract
+// fits both backends.
+func TestMemStoreAppendDeploymentStage(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	acc, err := s.CreateAccount(ctx, "deploy-stage@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "deploy-stage-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := s.CreateDeployment(ctx, Deployment{ID: "d-stage-test", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:latest"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	now := time.Now().UTC()
+	// Case 1: forward transition source_download -> dependency_restore.
+	got, err := s.AppendDeploymentStage(ctx, dep.ID, StageSourceDownload, StageDependencyRestore, now, "")
+	if err != nil {
+		t.Fatalf("forward transition: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("forward transition flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	// Case 2: from==to is now an error (PR-A review fix F3: the
+	// previous failure-stamp overload mutated history[len-1] which
+	// was the wrong stage). Failure stamps must go through
+	// MarkDeploymentStageFailed.
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, StageDependencyRestore, StageDependencyRestore, now.Add(time.Second), ""); err == nil {
+		t.Errorf("from==to AppendDeploymentStage should error, got nil")
+	}
+	// Case 3: MarkDeploymentStageFailed stamps the in-flight stage
+	// (dependency_restore) and moves it into history with status
+	// "failed". The customer's ticker sees the actual failing
+	// stage, not the previously-closed one.
+	got, err = s.MarkDeploymentStageFailed(ctx, dep.ID, now.Add(time.Second), "build failed: dep foo")
+	if err != nil {
+		t.Fatalf("MarkDeploymentStageFailed: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("failure stamp flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state: %v", err)
+	}
+	if state.Current != "" {
+		t.Errorf("after failure stamp: current = %q, want \"\" (cleared)", state.Current)
+	}
+	// History must contain dependency_restore as the failing stage
+	// (PR-A review fix F3: the previous version stamped history[0]
+	// which was source_download — the previously-closed stage —
+	// instead of the in-flight dependency_restore).
+	if len(state.History) != 2 {
+		t.Fatalf("history length after failure: got %d, want 2: %+v", len(state.History), state.History)
+	}
+	if state.History[1].Name != StageDependencyRestore {
+		t.Errorf("history[1].Name = %q, want %q (the in-flight stage)", state.History[1].Name, StageDependencyRestore)
+	}
+	if state.History[1].Status != "failed" {
+		t.Errorf("history[1].Status = %q, want failed", state.History[1].Status)
+	}
+	if state.History[1].Reason != "build failed: dep foo" {
+		t.Errorf("history[1].Reason = %q, want %q", state.History[1].Reason, "build failed: dep foo")
+	}
+	// Case 4: stale transition (current != from) returns ErrNotFound.
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, StageImageBuild, StageSnapshotPrepare, now, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("stale from: expected ErrNotFound, got %v", err)
+	}
+	// Case 5: CloseDeploymentStage on a fresh row stamps the
+	// in-flight stage as completed and clears Current. Used by
+	// imaged.MarkDeploymentLive to close the readiness stage so
+	// the customer's ticker carries a duration_ms.
+	dep2, err := s.CreateDeployment(ctx, Deployment{ID: "d-stage-test-2", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:latest2"})
+	if err != nil {
+		t.Fatalf("CreateDeployment #2: %v", err)
+	}
+	if _, err := s.AppendDeploymentStage(ctx, dep2.ID, StageSourceDownload, StageReadiness, now, ""); err != nil {
+		t.Fatalf("AppendDeploymentStage readiness: %v", err)
+	}
+	got, err = s.CloseDeploymentStage(ctx, dep2.ID, StageReadiness, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("CloseDeploymentStage: %v", err)
+	}
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state #2: %v", err)
+	}
+	if state.Current != "" {
+		t.Errorf("after CloseDeploymentStage: current = %q, want \"\"", state.Current)
+	}
+	if len(state.History) != 2 {
+		t.Fatalf("history length after close: got %d, want 2: %+v", len(state.History), state.History)
+	}
+	if state.History[1].Name != StageReadiness {
+		t.Errorf("history[1].Name = %q, want %q", state.History[1].Name, StageReadiness)
+	}
+	if state.History[1].Status != "completed" {
+		t.Errorf("history[1].Status = %q, want completed", state.History[1].Status)
+	}
+	// Case 6: CloseDeploymentStage on a row whose Current != name
+	// returns ErrNotFound (programming-error guard).
+	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
+		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+	}
+}
+
+// TestMemStore_DeploymentActorRoundtrip (issue #606) pins the
+// four actor-attribution fields on the in-memory Deployment shape.
+// MemStore stores the Deployment struct directly
+// (m.deployments[d.ID] = d), so the "round-trip" is a write+read
+// of the struct fields themselves — the closed-set CHECK and FK
+// are DB-only and not exercised here. Mirrors the MemStore half
+// of the PR #984 annotation round-trip coverage (the PgStore
+// counterpart at TestPg_DeploymentActorRoundtrip covers the
+// DB-side CHECK + FK contract).
+func TestMemStore_DeploymentActorRoundtrip(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	app, err := m.CreateApp(ctx, App{
+		AccountID: "acct-actor", Slug: "actor-mem", Type: AppTypeApp,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// 1. Full payload — the four actor fields round-trip cleanly
+	//    through the in-memory map.
+	d, err := m.CreateDeployment(ctx, Deployment{
+		AppID:            app.ID,
+		ImageDigest:      "sha256:actor-mem",
+		Kind:             DeploymentKindGitHub,
+		Status:           DeployPending,
+		DeployedByUserID: "11111111-1111-1111-1111-111111111111",
+		DeployedVia:      "github",
+		DeployedFromIP:   "203.0.113.42",
+		PusherLogin:      "octocat",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if d.DeployedByUserID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("deployed_by_user_id = %q, want %q", d.DeployedByUserID, "11111111-1111-1111-1111-111111111111")
+	}
+	if d.DeployedVia != "github" {
+		t.Errorf("deployed_via = %q, want %q", d.DeployedVia, "github")
+	}
+	if d.DeployedFromIP != "203.0.113.42" {
+		t.Errorf("deployed_from_ip = %q, want %q", d.DeployedFromIP, "203.0.113.42")
+	}
+	if d.PusherLogin != "octocat" {
+		t.Errorf("pusher_login = %q, want %q", d.PusherLogin, "octocat")
+	}
+
+	// 2. Zero payload — every field collapses to its Go zero,
+	//    including DeployedVia="". The Go-zero is the
+	//    MemStore-side analogue of the pgstore nullif()/coalesce()
+	//    chain (which produces "" on the read side via
+	//    coalesce(deployed_via, 'api') + scanDeploymentInto's
+	//    plain string destination). The PgStore test asserts
+	//    the deployed_via='api' fallback; here we only assert
+	//    the in-memory shape stays consistent.
+	dEmpty, err := m.CreateDeployment(ctx, Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:actor-mem-empty",
+		Kind:        DeploymentKindImage,
+		Status:      DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(empty): %v", err)
+	}
+	if dEmpty.DeployedByUserID != "" {
+		t.Errorf("empty deployed_by_user_id = %q, want \"\"", dEmpty.DeployedByUserID)
+	}
+	if dEmpty.DeployedVia != "" {
+		t.Errorf("empty deployed_via = %q, want \"\" (MemStore does not apply the coalesce('api') fallback)", dEmpty.DeployedVia)
+	}
+	if dEmpty.DeployedFromIP != "" {
+		t.Errorf("empty deployed_from_ip = %q, want \"\"", dEmpty.DeployedFromIP)
+	}
+	if dEmpty.PusherLogin != "" {
+		t.Errorf("empty pusher_login = %q, want \"\"", dEmpty.PusherLogin)
+	}
+}
+
+// TestMemStoreUpdateTrigger_FilterCriteriaPersists is the regression
+// test for REVIEW-FIX MED-1 (PR #993 / issue #757 closure): the
+// UpdateTrigger signature gained a filterCriteria *[]byte argument
+// and the inline SQL grew a coalesce($9::jsonb, filter_criteria)
+// branch. Pre-fix, a PATCH that flipped filter_criteria was
+// silently dropped on the floor; post-fix, the JSONB column is
+// replaced and TriggerByID reads it back.
+//
+// The memstore path mirrors the pgstore coalesce() semantics:
+// nil pointer → leave column unchanged; non-nil byte slice →
+// replace.
+func TestMemStoreUpdateTrigger_FilterCriteriaPersists(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	// Seed an account + app so the trigger can be created.
+	acct, err := m.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acct.ID,
+		Slug:      "smoke",
+		Runtime:   "node22",
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	// CreateTriggerIfUnderQuota doesn't accept filter_criteria in
+	// the memstore path (the column starts at nil); use the pgtest
+	// path for the seeded filter check, then UpdateTrigger to
+	// install one.
+	trig, err := m.CreateTriggerIfUnderQuota(ctx, app.ID, "kafka", "orders", true, []byte(`{"brokers":["localhost:9092"]}`), 100, 1000, 3, 1024, "commit", api.Limits{})
+	if err != nil {
+		t.Fatalf("CreateTriggerIfUnderQuota: %v", err)
+	}
+	triggerID := uuidFromPgtype(trig.ID).String()
+
+	// Round 1: nil pointer → filter_criteria stays nil.
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("UpdateTrigger nil filterCriteria: %v", err)
+	}
+	got, err := m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after nil patch: %v", err)
+	}
+	if got.FilterCriteria != nil {
+		t.Errorf("after nil filterCriteria patch, got %q, want nil", got.FilterCriteria)
+	}
+
+	// Round 2: non-nil → filter_criteria is replaced.
+	payload := []byte(`{"payload":[{"op":"eq","path":"$.event.type","value":"order.created"}]}`)
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, &payload); err != nil {
+		t.Fatalf("UpdateTrigger with filterCriteria: %v", err)
+	}
+	got, err = m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after set patch: %v", err)
+	}
+	if string(got.FilterCriteria) != string(payload) {
+		t.Errorf("after set filterCriteria patch, got %q, want %q", got.FilterCriteria, payload)
+	}
+
+	// Round 3: a second patch with a different payload replaces
+	// again (not coalesced to the previous one) — proves the
+	// replacement semantics.
+	replacement := []byte(`{"$or":[{"payload":[{"op":"neq","path":"$.x","value":1}]}]}`)
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, &replacement); err != nil {
+		t.Fatalf("UpdateTrigger replacement: %v", err)
+	}
+	got, err = m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after replacement: %v", err)
+	}
+	if string(got.FilterCriteria) != string(replacement) {
+		t.Errorf("after replacement patch, got %q, want %q", got.FilterCriteria, replacement)
 	}
 }

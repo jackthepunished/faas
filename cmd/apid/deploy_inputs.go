@@ -15,6 +15,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid/apidsource"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -182,6 +183,9 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 			Handler:     handler,
 			LogSpool:    spoolRoot(),
 			Log:         s.log,
+			ActorUserID: acct.ID,
+			ActorVia:    routeKindForRequest(r),
+			ActorFromIP: middleware.ClientIP(r),
 		})
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not create deployment"))

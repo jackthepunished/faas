@@ -67,4 +67,17 @@ type BuildOutcome struct {
 	LogTailBytes int64  // bytes guest-init wrote to build-done.json's `log_tail`
 	ExitCode     int    // the in-VM build's exit code (0 = success)
 	FailureClass string // mirrors builderd's FailureClass table; "" on success
+	// FailureCode is the RFC 7807 stable code guest-init stamped on
+	// BuildDone.FailureCode (app_arch_mismatch / dep_install_failed).
+	// Error-explanations cluster (spec §6.4 amendment 1): empty on
+	// legacy builds; populated when guest-init could identify the
+	// root cause at exit time. The orchestrator's ProcessOne
+	// stamps this on the deployment row via SetDeploymentFailedEx
+	// so the customer sees hint/why/fix from pkg/whycopy.
+	FailureCode string
+	// FailurePkg is the package manager discriminator for
+	// dep_install_failed (npm / pip / go / cargo). Empty for
+	// every other code; the orchestrator templates this into
+	// the whycopy Observed renderer's Fix field.
+	FailurePkg string
 }

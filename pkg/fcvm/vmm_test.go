@@ -1897,3 +1897,118 @@ func mustBackendBytes(t *testing.T, be storagedriver.StorageBackend, key string)
 	}
 	return b
 }
+
+// TestIsConnRefusedErr pins the kernel-error classification that
+// the error-explanations cluster relies on for app_not_listening.
+// ECONNREFUSED on TCP dial = "no listener" (the canonical signal).
+// Other transient errors (timeout, host unreachable, network
+// unreachable) are deliberately excluded — classifying them as
+// app_not_listening would mislead the customer into debugging
+// their bind address when the real problem is a broken netns or
+// host firewall.
+func TestIsConnRefusedErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil is not refused", nil, false},
+		{"plain refused string", errors.New("dial tcp 10.100.0.2:8080: connect: connection refused"), true},
+		{"timeout is not refused", errors.New("dial tcp 10.100.0.2:8080: i/o timeout"), false},
+		{"host unreachable is not refused", errors.New("dial tcp 10.100.0.2:8080: connect: no route to host"), false},
+		{"network unreachable is not refused", errors.New("dial tcp 10.100.0.2:8080: connect: network is unreachable"), false},
+		{"unrelated error is not refused", errors.New("dial tcp 10.100.0.2:8080: socket: too many open files"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isConnRefusedErr(tc.err); got != tc.want {
+				t.Errorf("isConnRefusedErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNotReadyProblem_ConnRefusedLocksAppNotListening pins the
+// classification rule for the deadline-expired TCP probe path.
+// When every probe hit ECONNREFUSED, the typed Problem must carry
+// CodeAppNotListening (the catalog row in pkg/whycopy renders the
+// hint/why/fix prose). When no probes hit ECONNREFUSED at all
+// (e.g. every probe timed out), the typed Problem must carry
+// CodeAppStartupTimeout — a different failure with a different
+// remediation.
+func TestNotReadyProblem_ConnRefusedLocksAppNotListening(t *testing.T) {
+	v := &JailerVMM{readyTimeout: 35 * time.Second}
+	l := Lease{Instance: "i-test"}
+
+	p := v.notReadyProblem(l, "", 42)
+	if p.Code != api.CodeAppNotListening {
+		t.Errorf("connRefused=42: code = %q, want %q", p.Code, api.CodeAppNotListening)
+	}
+	if p.Status != 422 {
+		t.Errorf("connRefused=42: status = %d, want 422", p.Status)
+	}
+	if !strings.Contains(p.Detail, "ECONNREFUSED") {
+		t.Errorf("connRefused=42: detail should mention ECONNREFUSED, got %q", p.Detail)
+	}
+
+	p2 := v.notReadyProblem(l, "", 0)
+	if p2.Code != api.CodeAppStartupTimeout {
+		t.Errorf("connRefused=0: code = %q, want %q (no ECONNREFUSED probes → app_startup_timeout, not app_not_listening)", p2.Code, api.CodeAppStartupTimeout)
+	}
+	if p2.Status != 422 {
+		t.Errorf("connRefused=0: status = %d, want 422", p2.Status)
+	}
+}
+
+// TestWaitReady_AllConnRefusedReturnsAppNotListening exercises the
+// waitReady loop's TCP-accept path against a TCP socket with no
+// listener (the kernel reliably returns ECONNREFUSED). The
+// deadline is set to 1s so the test runs in under 2s. Asserts the
+// returned error is a *api.Problem with CodeAppNotListening and
+// 422 status — the typed problem the schedd engine surfaces
+// unchanged.
+func TestWaitReady_AllConnRefusedReturnsAppNotListening(t *testing.T) {
+	// Reserve a TCP port by binding then closing — the kernel
+	// holds the port in TIME_WAIT briefly but reliably returns
+	// ECONNREFUSED for a dial against an unused port on
+	// 127.0.0.1. Using 127.0.0.1 + an ephemeral port keeps the
+	// test self-contained (no netns, no guest VM, no KVM).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	host, _, _ := net.SplitHostPort(ln.Addr().String())
+	ln.Close()
+	addr := netip.AddrFrom4([4]byte{})
+	if err := addr.UnmarshalText([]byte(host)); err != nil {
+		t.Fatalf("parse host %q: %v", host, err)
+	}
+
+	v := &JailerVMM{
+		readyTimeout:       250 * time.Millisecond,
+		readinessStartedAt: time.Now(),
+		// events is nil — emitReadiness200 must tolerate it (the
+		// "not ready" path doesn't emit).
+	}
+	l := Lease{Instance: "i-all-refused", HostIP: addr}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// waitReady hard-codes 8080 — we point the HostIP at a
+	// loopback-shaped address with no listener on :8080 to
+	// guarantee ECONNREFUSED on every dial.
+	err = v.waitReady(ctx, l, "")
+	if err == nil {
+		t.Fatal("waitReady on port with no listener: expected non-nil error, got nil")
+	}
+	var p *api.Problem
+	if !errors.As(err, &p) {
+		t.Fatalf("waitReady error: not a *api.Problem, got %T: %v", err, err)
+	}
+	if p.Code != api.CodeAppNotListening {
+		t.Errorf("waitReady on closed port: code = %q, want %q (the kernel's ECONNREFUSED on every probe must classify as app_not_listening)", p.Code, api.CodeAppNotListening)
+	}
+	if p.Status != 422 {
+		t.Errorf("waitReady on closed port: status = %d, want 422", p.Status)
+	}
+}

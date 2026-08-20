@@ -32,6 +32,22 @@ func TenantSurfacesEnabled() bool {
 	return false
 }
 
+// DomainDoctorEnabled reports whether the per-domain doctor probe
+// engine is live. Reads FAAS_DOMAIN_DOCTOR_ENABLED at every call
+// (mirrors TenantSurfacesEnabled — operator can flip the env var
+// and the next dns_poller tick picks it up without a daemon
+// bounce). Default off; the table + probes + endpoint are wired
+// but the poller branch + GET /v1/domains/{domain}/doctor are
+// gated until the operator sets the env var. ADR-120.
+func DomainDoctorEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_ENABLED")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // CertEngineWired reports whether the per-host cert engine has
 // the env configuration it needs to mint. The engine needs:
 //

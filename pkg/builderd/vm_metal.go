@@ -287,7 +287,7 @@ func (d *VMMDriver) WaitForCompletion(ctx context.Context, h BuildHandle) (Build
 	// Best-effort enrichment from build-done.json. Missing file is OK — the
 	// guest died before guest-init wrote it; fall back to exit-code class.
 	if res.FailureClass == "" {
-		res.FailureClass = classifyBuildFailure(exitCode, h.ExportDir)
+		res.FailureClass, res.FailureCode, res.FailurePkg = classifyBuildFailure(exitCode, h.ExportDir)
 	}
 	return res, nil
 }
@@ -336,23 +336,29 @@ func (d *VMMDriver) runJanitor() {
 // "FailureUserError" / "FailureInfra" / "FailureOOM" / "FailureTimeout".
 // builderd.go's ProcessOne translates these to the column-friendly
 // strings ("oom" etc) at the state.Store boundary.
-func classifyBuildFailure(exitCode int, exportDir string) string {
+//
+// Error-explanations cluster (spec §6.4 amendment 1): the second
+// return value is the RFC 7807 stable code guest-init stamped on
+// BuildDone.FailureCode (app_arch_mismatch / dep_install_failed),
+// plus the package manager discriminator for dep_install_failed
+// (npm / pip / go / cargo). Empty strings when guest-init fell back
+// to the coarse FailureClass only — the caller stamps the legacy
+// CodeDeployFailed path.
+func classifyBuildFailure(exitCode int, exportDir string) (string, string, string) {
 	done := filepath.Join(exportDir, "build-done.json")
 	if data, err := os.ReadFile(done); err == nil {
-		var bd struct {
-			FailureClass string `json:"failure_class"`
-		}
+		var bd api.BuildDone
 		if json.Unmarshal(data, &bd) == nil && bd.FailureClass != "" {
-			return bd.FailureClass
+			return bd.FailureClass, bd.FailureCode, bd.FailurePkg
 		}
 	}
 	switch exitCode {
 	case 137:
-		return "FailureOOM"
+		return "FailureOOM", "", ""
 	case 124:
-		return "FailureTimeout"
+		return "FailureTimeout", "", ""
 	default:
-		return "FailureUserError"
+		return "FailureUserError", "", ""
 	}
 }
 

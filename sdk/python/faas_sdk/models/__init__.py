@@ -13,6 +13,7 @@ from .account_response_plan import AccountResponsePlan
 from .account_response_status import AccountResponseStatus
 from .account_slo_response import AccountSLOResponse
 from .account_slo_response_window import AccountSLOResponseWindow
+from .add_tenant_hostname_request import AddTenantHostnameRequest
 from .add_trusted_signer_request import AddTrustedSignerRequest
 from .admin_set_github_webhook_secret_request import AdminSetGithubWebhookSecretRequest
 from .admin_set_github_webhook_secret_response import AdminSetGithubWebhookSecretResponse
@@ -52,6 +53,7 @@ from .app_routes_response import AppRoutesResponse
 from .app_routes_response_source import AppRoutesResponseSource
 from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
+from .app_secret_list_response_secrets_by_scope import AppSecretListResponseSecretsByScope
 from .app_secret_response import AppSecretResponse
 from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
@@ -94,6 +96,11 @@ from .billing_reconcile_response import BillingReconcileResponse
 from .billing_retry_response import BillingRetryResponse
 from .build_export_response import BuildExportResponse
 from .build_list_response import BuildListResponse
+from .build_plan import BuildPlan
+from .build_plan_class_type_1 import BuildPlanClassType1
+from .build_plan_class_type_2_type_1 import BuildPlanClassType2Type1
+from .build_plan_class_type_3_type_1 import BuildPlanClassType3Type1
+from .build_plan_framework import BuildPlanFramework
 from .build_provenance_response import BuildProvenanceResponse
 from .build_response import BuildResponse
 from .build_response_failure_class import BuildResponseFailureClass
@@ -122,6 +129,7 @@ from .create_custom_domain_request import CreateCustomDomainRequest
 from .create_deployment_files_body import CreateDeploymentFilesBody
 from .create_deployment_files_body_kind import CreateDeploymentFilesBodyKind
 from .create_deployment_files_body_runtime import CreateDeploymentFilesBodyRuntime
+from .create_deployment_from_source_tarball_body import CreateDeploymentFromSourceTarballBody
 from .create_deployment_overrides import CreateDeploymentOverrides
 from .create_deployment_overrides_env import CreateDeploymentOverridesEnv
 from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
@@ -133,6 +141,20 @@ from .create_key_request_scopes_item import CreateKeyRequestScopesItem
 from .create_org_api_key_request import CreateOrgAPIKeyRequest
 from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
+from .create_tenant_surface_request import CreateTenantSurfaceRequest
+from .create_tenant_surface_request_cert_kind import CreateTenantSurfaceRequestCertKind
+from .create_trigger_batch_request import CreateTriggerBatchRequest
+from .create_trigger_batch_response import CreateTriggerBatchResponse
+from .create_trigger_batch_response_created_item import CreateTriggerBatchResponseCreatedItem
+from .create_trigger_request import CreateTriggerRequest
+from .create_trigger_request_broker_poison_strategy_type_1 import CreateTriggerRequestBrokerPoisonStrategyType1
+from .create_trigger_request_broker_poison_strategy_type_2_type_1 import (
+    CreateTriggerRequestBrokerPoisonStrategyType2Type1,
+)
+from .create_trigger_request_broker_poison_strategy_type_3_type_1 import (
+    CreateTriggerRequestBrokerPoisonStrategyType3Type1,
+)
+from .create_trigger_request_config import CreateTriggerRequestConfig
 from .cron_response import CronResponse
 from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
@@ -144,6 +166,10 @@ from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
 from .delayed_task_request import DelayedTaskRequest
+from .domain_doctor_check import DomainDoctorCheck
+from .domain_doctor_check_name import DomainDoctorCheckName
+from .domain_doctor_check_status import DomainDoctorCheckStatus
+from .domain_doctor_report import DomainDoctorReport
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
@@ -169,6 +195,11 @@ from .diff_request import DiffRequest
 from .diff_request_env_by_scope import DiffRequestEnvByScope
 from .diff_response import DiffResponse
 from .diff_response_plan import DiffResponsePlan
+from .dispatch_invocation_batch_body import DispatchInvocationBatchBody
+from .dispatch_invocation_batch_body_records_item import DispatchInvocationBatchBodyRecordsItem
+from .dispatch_invocation_batch_body_records_item_headers import DispatchInvocationBatchBodyRecordsItemHeaders
+from .dispatch_invocation_batch_body_records_item_metadata import DispatchInvocationBatchBodyRecordsItemMetadata
+from .dispatch_invocation_batch_response_200 import DispatchInvocationBatchResponse200
 from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cors_action import EdgeRuleCORSAction
 from .edge_rule_geo_action import EdgeRuleGeoAction
@@ -192,7 +223,11 @@ from .edge_rule_throttle_action import EdgeRuleThrottleAction
 from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
+from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
 from .field_error import FieldError
+from .filter_criteria import FilterCriteria
+from .filter_criteria_clause import FilterCriteriaClause
+from .filter_criteria_op import FilterCriteriaOp
 from .fire_cron_request_response import FireCronRequestResponse
 from .fire_cron_request_response_status import FireCronRequestResponseStatus
 from .fire_cron_response import FireCronResponse
@@ -234,6 +269,10 @@ from .invoke_response import InvokeResponse
 from .invoke_response_result import InvokeResponseResult
 from .invoke_response_status import InvokeResponseStatus
 from .issue_account_credit_body import IssueAccountCreditBody
+from .kafka_sasl_config import KafkaSASLConfig
+from .kafka_sasl_mechanism import KafkaSASLMechanism
+from .kafka_tls_config import KafkaTLSConfig
+from .kafka_trigger_config import KafkaTriggerConfig
 from .list_audit_events_response import ListAuditEventsResponse
 from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
@@ -241,6 +280,12 @@ from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
+from .list_tenant_surfaces_response import ListTenantSurfacesResponse
+from .list_trigger_dead_letter_response import ListTriggerDeadLetterResponse
+from .list_trigger_records_response import ListTriggerRecordsResponse
+from .log_excerpt import LogExcerpt
+from .log_excerpt_level import LogExcerptLevel
+from .log_excerpt_source import LogExcerptSource
 from .magic_link_signup_request import MagicLinkSignupRequest
 from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
@@ -254,6 +299,8 @@ from .mfa_recover_response import MFARecoverResponse
 from .mfa_verify_request import MFAVerifyRequest
 from .mfa_verify_response import MFAVerifyResponse
 from .o_auth_provider_capability import OAuthProviderCapability
+from .oidc_exchange_request import OIDCExchangeRequest
+from .oidc_exchange_response import OIDCExchangeResponse
 from .org_invitation_response import OrgInvitationResponse
 from .org_invitation_response_role import OrgInvitationResponseRole
 from .org_invitation_response_status import OrgInvitationResponseStatus
@@ -321,6 +368,7 @@ from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
+from .rollback_request import RollbackRequest
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_app_secret_request import RotateAppSecretRequest
 from .rotate_app_secret_response import RotateAppSecretResponse
@@ -338,6 +386,7 @@ from .scaling_target_metric import ScalingTargetMetric
 from .scan_result import ScanResult
 from .scan_result_status import ScanResultStatus
 from .scoped_app_env_response import ScopedAppEnvResponse
+from .scoped_app_secret_response import ScopedAppSecretResponse
 from .seat_usage_response import SeatUsageResponse
 from .seat_usage_response_plan import SeatUsageResponsePlan
 from .secret_finding import SecretFinding
@@ -356,12 +405,21 @@ from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
 from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
+from .source_tarball_deploy_request import SourceTarballDeployRequest
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .template_view import TemplateView
+from .template_view_category import TemplateViewCategory
+from .tenant_hostname_response import TenantHostnameResponse
+from .tenant_surface_response import TenantSurfaceResponse
+from .tenant_surface_response_cert_kind import TenantSurfaceResponseCertKind
+from .tenant_surface_response_cert_state import TenantSurfaceResponseCertState
+from .tenant_surface_response_status import TenantSurfaceResponseStatus
+from .throttle_preview_row import ThrottlePreviewRow
 from .throttle_suggestion_row import ThrottleSuggestionRow
 from .throttle_suggestions_response import ThrottleSuggestionsResponse
 from .trace import Trace
@@ -369,6 +427,20 @@ from .trace_span import TraceSpan
 from .trace_span_attributes import TraceSpanAttributes
 from .trace_span_status import TraceSpanStatus
 from .transfer_ownership_request import TransferOwnershipRequest
+from .trigger import Trigger
+from .trigger_broker_poison_strategy import TriggerBrokerPoisonStrategy
+from .trigger_config import TriggerConfig
+from .trigger_dead_letter import TriggerDeadLetter
+from .trigger_dead_letter_detail import TriggerDeadLetterDetail
+from .trigger_dead_letter_reason import TriggerDeadLetterReason
+from .trigger_kind import TriggerKind
+from .trigger_metrics_response import TriggerMetricsResponse
+from .trigger_record import TriggerRecord
+from .trigger_record_state import TriggerRecordState
+from .trigger_routed_to import TriggerRoutedTo
+from .trigger_source_type_1 import TriggerSourceType1
+from .trigger_source_type_2_type_1 import TriggerSourceType2Type1
+from .trigger_source_type_3_type_1 import TriggerSourceType3Type1
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
@@ -386,6 +458,15 @@ from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBo
 from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
+from .update_trigger_request import UpdateTriggerRequest
+from .update_trigger_request_broker_poison_strategy_type_1 import UpdateTriggerRequestBrokerPoisonStrategyType1
+from .update_trigger_request_broker_poison_strategy_type_2_type_1 import (
+    UpdateTriggerRequestBrokerPoisonStrategyType2Type1,
+)
+from .update_trigger_request_broker_poison_strategy_type_3_type_1 import (
+    UpdateTriggerRequestBrokerPoisonStrategyType3Type1,
+)
+from .update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
 from .usage_export_response import UsageExportResponse
 from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
@@ -409,6 +490,7 @@ __all__ = (
     "AccountResponseStatus",
     "AccountSLOResponse",
     "AccountSLOResponseWindow",
+    "AddTenantHostnameRequest",
     "AddTrustedSignerRequest",
     "AdminSetGithubWebhookSecretRequest",
     "AdminSetGithubWebhookSecretResponse",
@@ -451,6 +533,7 @@ __all__ = (
     "AppRoutesResponseSource",
     "AppSecretExportResponse",
     "AppSecretListResponse",
+    "AppSecretListResponseSecretsByScope",
     "AppSecretResponse",
     "AppSecurityRequest",
     "AppSecurityResponse",
@@ -490,6 +573,11 @@ __all__ = (
     "BillingRetryResponse",
     "BuildExportResponse",
     "BuildListResponse",
+    "BuildPlan",
+    "BuildPlanClassType1",
+    "BuildPlanClassType2Type1",
+    "BuildPlanClassType3Type1",
+    "BuildPlanFramework",
     "BuildProvenanceResponse",
     "BuildResponse",
     "BuildResponseFailureClass",
@@ -518,6 +606,7 @@ __all__ = (
     "CreateDeploymentFilesBody",
     "CreateDeploymentFilesBodyKind",
     "CreateDeploymentFilesBodyRuntime",
+    "CreateDeploymentFromSourceTarballBody",
     "CreateDeploymentOverrides",
     "CreateDeploymentOverridesEnv",
     "CreateDeploymentOverridesEnvSecrets",
@@ -529,6 +618,16 @@ __all__ = (
     "CreateOrgAPIKeyRequest",
     "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
+    "CreateTenantSurfaceRequest",
+    "CreateTenantSurfaceRequestCertKind",
+    "CreateTriggerBatchRequest",
+    "CreateTriggerBatchResponse",
+    "CreateTriggerBatchResponseCreatedItem",
+    "CreateTriggerRequest",
+    "CreateTriggerRequestBrokerPoisonStrategyType1",
+    "CreateTriggerRequestBrokerPoisonStrategyType2Type1",
+    "CreateTriggerRequestBrokerPoisonStrategyType3Type1",
+    "CreateTriggerRequestConfig",
     "CronResponse",
     "CronRun",
     "CronRunOutcome",
@@ -542,6 +641,10 @@ __all__ = (
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
+    "DomainDoctorCheck",
+    "DomainDoctorCheckName",
+    "DomainDoctorCheckStatus",
+    "DomainDoctorReport",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
     "DeploymentHealthcheck",
@@ -565,6 +668,11 @@ __all__ = (
     "DiffRequestEnvByScope",
     "DiffResponse",
     "DiffResponsePlan",
+    "DispatchInvocationBatchBody",
+    "DispatchInvocationBatchBodyRecordsItem",
+    "DispatchInvocationBatchBodyRecordsItemHeaders",
+    "DispatchInvocationBatchBodyRecordsItemMetadata",
+    "DispatchInvocationBatchResponse200",
     "EdgeRuleBudgetAction",
     "EdgeRuleCORSAction",
     "EdgeRuleGeoAction",
@@ -588,7 +696,11 @@ __all__ = (
     "EdgeRuleThrottleActionKeyBy",
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
+    "EdgeRuleValidateActionValidateMode",
     "FieldError",
+    "FilterCriteria",
+    "FilterCriteriaClause",
+    "FilterCriteriaOp",
     "FireCronRequestResponse",
     "FireCronRequestResponseStatus",
     "FireCronResponse",
@@ -630,6 +742,10 @@ __all__ = (
     "InvokeResponseResult",
     "InvokeResponseStatus",
     "IssueAccountCreditBody",
+    "KafkaSASLConfig",
+    "KafkaSASLMechanism",
+    "KafkaTLSConfig",
+    "KafkaTriggerConfig",
     "ListAuditEventsResponse",
     "ListAuditLogResponse",
     "ListCronRunsResponse",
@@ -637,6 +753,12 @@ __all__ = (
     "ListInvocationsResponse",
     "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
+    "ListTenantSurfacesResponse",
+    "ListTriggerDeadLetterResponse",
+    "ListTriggerRecordsResponse",
+    "LogExcerpt",
+    "LogExcerptLevel",
+    "LogExcerptSource",
     "MagicLinkSignupRequest",
     "MemberListResponse",
     "MFAConfirmRequest",
@@ -650,6 +772,8 @@ __all__ = (
     "MFAVerifyRequest",
     "MFAVerifyResponse",
     "OAuthProviderCapability",
+    "OIDCExchangeRequest",
+    "OIDCExchangeResponse",
     "OrgInvitationResponse",
     "OrgInvitationResponseRole",
     "OrgInvitationResponseStatus",
@@ -717,6 +841,7 @@ __all__ = (
     "RekeyProgress",
     "RenameAppRequest",
     "RepoResponse",
+    "RollbackRequest",
     "RotateAlertRuleSecretResponse",
     "RotateAppSecretRequest",
     "RotateAppSecretResponse",
@@ -732,6 +857,7 @@ __all__ = (
     "ScanResult",
     "ScanResultStatus",
     "ScopedAppEnvResponse",
+    "ScopedAppSecretResponse",
     "SeatUsageResponse",
     "SeatUsageResponsePlan",
     "SecretFinding",
@@ -750,12 +876,21 @@ __all__ = (
     "SLODuration",
     "SourceRefDeployRequest",
     "SourceRefDeployRequestFormat",
+    "SourceTarballDeployRequest",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "TemplateView",
+    "TemplateViewCategory",
+    "TenantHostnameResponse",
+    "TenantSurfaceResponse",
+    "TenantSurfaceResponseCertKind",
+    "TenantSurfaceResponseCertState",
+    "TenantSurfaceResponseStatus",
+    "ThrottlePreviewRow",
     "ThrottleSuggestionRow",
     "ThrottleSuggestionsResponse",
     "Trace",
@@ -763,6 +898,20 @@ __all__ = (
     "TraceSpanAttributes",
     "TraceSpanStatus",
     "TransferOwnershipRequest",
+    "Trigger",
+    "TriggerBrokerPoisonStrategy",
+    "TriggerConfig",
+    "TriggerDeadLetter",
+    "TriggerDeadLetterDetail",
+    "TriggerDeadLetterReason",
+    "TriggerKind",
+    "TriggerMetricsResponse",
+    "TriggerRecord",
+    "TriggerRecordState",
+    "TriggerRoutedTo",
+    "TriggerSourceType1",
+    "TriggerSourceType2Type1",
+    "TriggerSourceType3Type1",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
     "UpdateAlertRuleRequestComparison",
@@ -780,6 +929,11 @@ __all__ = (
     "UpdateDeploymentRequest",
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
+    "UpdateTriggerRequest",
+    "UpdateTriggerRequestBrokerPoisonStrategyType1",
+    "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",
+    "UpdateTriggerRequestBrokerPoisonStrategyType3Type1",
+    "UpdateTriggerRequestConfigType0",
     "UsageExportResponse",
     "UsageResponse",
     "UsageSummaryResponse",

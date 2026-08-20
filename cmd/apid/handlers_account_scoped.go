@@ -135,6 +135,7 @@ func (s *server) listSecretsForAccount(w http.ResponseWriter, r *http.Request, a
 			AppID:      r.AppID,
 			AppSlug:    r.AppSlug,
 			Key:        r.Key,
+			Scope:      r.Scope,
 			Ciphertext: base64.RawURLEncoding.EncodeToString(r.Ciphertext),
 			CreatedAt:  r.CreatedAt.UTC().Format(time.RFC3339),
 			UpdatedAt:  r.UpdatedAt.UTC().Format(time.RFC3339),
@@ -142,8 +143,16 @@ func (s *server) listSecretsForAccount(w http.ResponseWriter, r *http.Request, a
 	}
 	var nextBefore string
 	if len(out) == limit && len(out) > 0 {
+		// ADR-092 PR-B: cursor is (slug, scope, key) — the
+		// (slug, key) pair is no longer unique post-PR-A because
+		// the same (app, key) can be bound to multiple scopes.
+		// Without scope in the cursor, the next page's WHERE
+		// clause's ">" evaluates to FALSE for rows where
+		// (slug, key) equals the cursor but scope is greater than
+		// the previous page's last-scope — those rows are silently
+		// dropped.
 		last := out[len(out)-1]
-		nextBefore = last.AppSlug + "|" + last.Key
+		nextBefore = last.AppSlug + "|" + last.Scope + "|" + last.Key
 	}
 	writeJSON(w, http.StatusOK, api.ListSecretsForAccountResponse{
 		Secrets:    out,

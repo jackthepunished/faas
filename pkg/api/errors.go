@@ -104,11 +104,55 @@ type Problem struct {
 	// the dashboard / SDK can render the hint as a one-line footer
 	// without parsing prose. Optional + omitempty.
 	SecretHint string `json:"secret_hint,omitempty"`
+	// Hint is the single short next-action line shown on the CLI's
+	// 3-5 line renderer (spec §6.4 amendment 1). Mirrors SecretHint
+	// shape — a one-line remediation nudge. Distinct from SecretHint:
+	// Hint is generic across all error codes, SecretHint is
+	// narrow to the strict secret-scan path. Optional + omitempty so
+	// every other problem+json site keeps its existing flat shape
+	// unchanged.
+	Hint string `json:"hint,omitempty"`
+	// Why is the human-readable explanation of why the failure
+	// happened, including the observed value (e.g. "bound to
+	// 127.0.0.1; guest at 10.0.0.2 only sees requests proxied via
+	// the bridge"). Distinct from Detail: Detail is the platform's
+	// machine-stable message; Why is the customer-facing prose
+	// surfaced only on error UX paths. Multi-line ok (≤ 512 bytes,
+	// CLI tripwire enforces). Optional + omitempty.
+	Why string `json:"why,omitempty"`
+	// Fix is the prescriptive remediation (e.g. "set
+	// `app.listen('0.0.0.0')` or run `gregale env set PORT 8080`").
+	// Distinct from Hint: Hint is a single short line; Fix may be
+	// 1-3 lines. Optional + omitempty.
+	Fix string `json:"fix,omitempty"`
+	// RelevantLogs are the last N log lines that explain the failure,
+	// surfaced inline by the CLI renderer when the server attaches
+	// them. Capped at 20 entries × 512 bytes per Message (CLI
+	// tripwire enforces). Distinct from SecretFindings which is
+	// secret-scan specific. Optional + omitempty so every other
+	// problem+json site keeps its existing flat shape unchanged.
+	RelevantLogs []LogExcerpt `json:"relevant_logs,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
 	// before WriteHeader. nil = no extras.
 	extraHeaders map[string][]string `json:"-"`
+}
+
+// LogExcerpt is one entry of Problem.RelevantLogs — a small,
+// shape-stable slice of a log line that explains the failure inline.
+// Distinct from SecretFinding (which is narrow to secret-scan): the
+// CLI renderer prints this as a fenced block under the 3-5 line
+// explanation. Timestamp is RFC 3339; Level is one of info|warn|error;
+// Source tags the log origin so the customer can attribute the line
+// (build vs vm-init vs app vs gateway); Message is the line content,
+// capped at 512 bytes server-side (CLI tripwire enforces the cap
+// client-side as well).
+type LogExcerpt struct {
+	Timestamp string `json:"ts"`
+	Level     string `json:"level"`
+	Source    string `json:"source,omitempty"`
+	Message   string `json:"message"`
 }
 
 // FieldError is one per-field entry of Problem.Errors. The shape mirrors
@@ -210,6 +254,42 @@ func (p *Problem) WithDocs(url string) *Problem {
 func (p *Problem) WithSecretScan(findings []SecretFinding, hint string) *Problem {
 	p.SecretFindings = findings
 	p.SecretHint = hint
+	return p
+}
+
+// WithHint attaches the single short next-action line shown on the
+// CLI's 3-5 line renderer (spec §6.4 amendment 1). Mirrors
+// SecretHint shape — a one-line remediation nudge. Returns the same
+// pointer for chaining.
+func (p *Problem) WithHint(hint string) *Problem {
+	p.Hint = hint
+	return p
+}
+
+// WithWhy attaches the human-readable explanation of why the failure
+// happened (spec §6.4 amendment 1). Distinct from Detail: Detail is
+// the platform's machine-stable message; Why is the customer-facing
+// prose surfaced only on error UX paths. Multi-line ok (≤ 512 bytes;
+// CLI tripwire enforces). Returns the same pointer for chaining.
+func (p *Problem) WithWhy(why string) *Problem {
+	p.Why = why
+	return p
+}
+
+// WithFix attaches the prescriptive remediation (spec §6.4
+// amendment 1). Distinct from Hint: Hint is a single short line; Fix
+// may be 1-3 lines. Returns the same pointer for chaining.
+func (p *Problem) WithFix(fix string) *Problem {
+	p.Fix = fix
+	return p
+}
+
+// WithRelevantLogs attaches the last N log lines that explain the
+// failure, surfaced inline by the CLI renderer. Capped at 20
+// entries × 512 bytes per Message (CLI tripwire enforces). Returns
+// the same pointer for chaining.
+func (p *Problem) WithRelevantLogs(logs []LogExcerpt) *Problem {
+	p.RelevantLogs = logs
 	return p
 }
 
@@ -457,11 +537,19 @@ const (
 	// customer needs to either wait for Gregale cert propagation
 	// or point the edge at a Gregale-issued cert.
 	CodeDomainCertNotIssued = "domain_cert_not_issued"
-	CodeCronInvalid         = "cron_invalid"
-	CodeAlertRuleInvalid    = "alert_rule_invalid"
-	CodeHandlerMissing      = "handler_missing"
-	CodeImageRequired       = "image_required"
-	CodeDeployFailed        = "deploy_failed"
+	// CodeDoctorDisabled (ADR-120) is returned by the doctor
+	// endpoint when FAAS_DOMAIN_DOCTOR_ENABLED is unset. The
+	// route stays registered so the CLI renders a clear
+	// "doctor is dark-launched" message rather than a generic
+	// 404. Distinct from CodeDoctorUnavailable (which fires
+	// when the flag IS on but a probe pass failed).
+	CodeDoctorDisabled    = "doctor_disabled"
+	CodeDoctorUnavailable = "doctor_unavailable"
+	CodeCronInvalid       = "cron_invalid"
+	CodeAlertRuleInvalid  = "alert_rule_invalid"
+	CodeHandlerMissing    = "handler_missing"
+	CodeImageRequired     = "image_required"
+	CodeDeployFailed      = "deploy_failed"
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
@@ -469,6 +557,19 @@ const (
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
+	// CodeRollbackTargetNotFound is returned when the caller passes an
+	// explicit target_deployment_id that doesn't match any deployment of
+	// this app (or doesn't exist at all). Distinct from
+	// CodeNoRollbackTarget (no superseded deployment exists at all) so
+	// the CLI can render different remediation: "wrong id" vs "deploy
+	// twice first". SAFE-RELEASES-G (issue #976).
+	CodeRollbackTargetNotFound = "rollback_target_not_found"
+	// CodeRollbackTargetAlreadyLive is returned when the caller passes
+	// an explicit target_deployment_id that exists but has status !=
+	// 'superseded' (e.g. status='live' — caller is asking to rollback
+	// to the already-current deployment). Rejected explicitly rather
+	// than silently no-op'd. SAFE-RELEASES-G.
+	CodeRollbackTargetAlreadyLive = "rollback_target_already_live"
 	// CodeDeploySignatureInvalid is returned by apid when the
 	// customer's OCI image deploy is rejected at the accept-time
 	// signature-enforcement gate (issue #472 / ADR-054). Three
@@ -777,6 +878,18 @@ const (
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
 
+	// Issue #477 / ADR-118 — per-app ingress IP allowlist (extends
+	// the reserved 'ip_allowlist' enum value, ADR-079). Same shape
+	// as the egress pair: 403 plan-gate + 400 count cap, distinct
+	// codes so the CLI can render actionable retry guidance.
+	//   * CodePlanPublicAuthIPAllowlistNotAllowed = 403 "your plan
+	//     does not unlock this knob at all" (Free/Hobby).
+	//   * CodePublicAuthIPAllowlistTooLong = 400 "the PATCH carries
+	//     more CIDRs than your plan caps" (Pro/Scale but the slice
+	//     is too long).
+	CodePlanPublicAuthIPAllowlistNotAllowed = "plan_public_auth_ip_allowlist_not_allowed"
+	CodePublicAuthIPAllowlistTooLong        = "public_auth_ip_allowlist_too_long"
+
 	// Issue #679 / PR-B / ADR-082 — per-account egress allowlist
 	// additive budget. Distinct code from CodeEgressAllowlistTooLong
 	// so the CLI can render the "your admin override is too big,
@@ -910,6 +1023,15 @@ const (
 	// writer in a custom MaxBytesWriter that emits this code instead.
 	CodeStreamingNotAvailable = "streaming_not_available"
 
+	// CodeResponseTooLarge (issue #995 Phase 2 / ADR-121) — emitted
+	// when the buffered reverse-proxy path exceeds the per-plan
+	// MaxResponseBodyBytes cap. Distinct from CodeStreamingNotAvailable
+	// because the buffered path applies to non-streaming apps
+	// (the streaming code is gated by the streaming opt-in and the
+	// plan_streaming_not_allowed error); 413 + this code so the
+	// buffered-cap surface has its own stable error contract.
+	CodeResponseTooLarge = "response_too_large"
+
 	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
 	// shape as MinInstances: a single plan-locked feature with two
 	// failure modes that warrant distinct codes so the CLI can render
@@ -926,6 +1048,14 @@ const (
 	// an entry that doesn't ParsePrefix, or a v6 CIDR (v1 is v4
 	// only; v6 mirror is a separate ADR).
 	CodeInvalidEgressAllowlist = "invalid_egress_allowlist"
+
+	// CodeInvalidPublicAuthIPAllowlist (ADR-118) is a 400 for
+	// ingress allowlist shape violations: entries that don't
+	// ParsePrefix as v4/v6 CIDRs, masklen /0, or `ip_allowlist`
+	// mode set with an empty list (the 500-on-misconfig path in
+	// the gateway surfaces a different code; the 400 here covers
+	// the PATCH-time shape checks).
+	CodeInvalidPublicAuthIPAllowlist = "invalid_public_auth_ip_allowlist"
 
 	// Issue #462 / ADR-058 — per-app scaling policy (PR-A). Three
 	// new codes, mirroring the existing autoscale shape (one
@@ -1011,6 +1141,24 @@ const (
 	// identical (bring your own managed state) regardless of where the
 	// violation was caught. The Detail field distinguishes the three.
 	CodeStatelessOnlyViolation = "stateless_only_violation"
+
+	// Error-explanations cluster (spec §6.4 amendment 1, ADR-110
+	// amendment 1). All 9 codes emit status 422 (RFC 7807) and pair
+	// with pkg/whycopy catalog rows that render hint/why/fix/relevant
+	// logs prose on the CLI's 3-5 line renderer. The 422 status keeps
+	// them in the same family as CodeDeployFailed / CodeStatelessOnly
+	// Violation so the dashboard's error-explanation template picks
+	// them up uniformly. Each code's ErrXxx constructor lives next to
+	// its constant; the StatusForCode switch arm below (line ~1267)
+	// adds them to the 422 bucket.
+	CodeAppNotListening        = "app_not_listening"
+	CodeAppLoopbackBound       = "app_loopback_bound"
+	CodeAppArchMismatch        = "app_arch_mismatch"
+	CodeEnvVarMissing          = "env_var_missing"
+	CodeAppHealthzUnauthorized = "app_healthz_unauthorized"
+	CodeAppRuntimeOOM          = "app_runtime_oom"
+	CodeDepInstallFailed       = "dep_install_failed"
+	CodeAppStartupTimeout      = "app_startup_timeout"
 
 	// CLI auth (spec §2.2 device-code flow). Pending is the "user has
 	// not yet approved" signal the CLI's poll loop keys off; the CLI
@@ -1175,14 +1323,17 @@ const MaxOrgSlugLen = 32
 // 500 — a reconstructed Problem is never served without a real status.
 func StatusForCode(code string) int {
 	switch code {
-	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
+	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue,
+		CodePlanPublicAuthIPAllowlistNotAllowed:
 		return http.StatusForbidden
 	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
-		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired:
+		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired,
+		CodeEgressAllowlistTooLong, CodePublicAuthIPAllowlistTooLong,
+		CodeInvalidEgressAllowlist, CodeInvalidPublicAuthIPAllowlist:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm,
 		CodeEdgeRuleMaintenance, CodeAppMaintenance:
@@ -1254,6 +1405,20 @@ func StatusForCode(code string) int {
 		// imaged also lifts this code onto deployments.error_code, so
 		// the GET /v1/deployments/{id} response and the CLI's
 		// `faas deployment <id>` render it identically.
+		return http.StatusUnprocessableEntity
+	case CodeAppNotListening,
+		CodeAppLoopbackBound,
+		CodeAppArchMismatch,
+		CodeEnvVarMissing,
+		CodeAppHealthzUnauthorized,
+		CodeAppRuntimeOOM,
+		CodeDepInstallFailed,
+		CodeAppStartupTimeout:
+		// 422 — error-explanations cluster (spec §6.4 amendment 1).
+		// Same family as CodeStatelessOnlyViolation / CodeDeployFailed:
+		// well-formed request, content policy refuses. The Detail
+		// field distinguishes the 9 failures; the pkg/whycopy catalog
+		// renders hint/why/fix prose on the CLI's 3-5 line renderer.
 		return http.StatusUnprocessableEntity
 	case CodeRequestValidationFailed:
 		// 422 — kind=validate edge rule rejected the request body.
@@ -1711,6 +1876,153 @@ func ErrStatelessOnlyViolation(kind, detail string) *Problem {
 		WithDocs(docsBase + "/storage")
 }
 
+// Error-explanations cluster constructors (spec §6.4 amendment 1,
+// ADR-110 amendment 1). Each constructor returns the canonical Problem
+// shape (status 422, code in the family, Title stable, Detail carries
+// the observed value) WITHOUT hint/why/fix — those are attached later
+// by the detection site via WithHint/WithWhy/WithFix so each failure
+// can carry code-specific prose. The pkg/whycopy catalog is the
+// single source of truth for the prose; constructors here only
+// anchor the code → status → docs URL plumbing.
+//
+// Why this shape: the wire spine (Hint/Why/Fix/RelevantLogs on Problem)
+// is already committed (commit 1); the detection sites (commits 7-13)
+// attach the prose at the point where they have the observed value;
+// the central catalog (commit 3) owns the prose body. Constructors
+// stay minimal so a new code is a 3-line addition.
+
+// ErrAppNotListening is returned when the wake readiness probe finds
+// no process listening on the customer's $PORT (typically ECONNREFUSED
+// on the TCP-accept dial, or a 4xx/5xx on the healthcheck path). The
+// detection site (pkg/fcvm/vmm.go) attaches hint/why/fix prose from
+// pkg/whycopy with the observed port + last-dial-error.
+func ErrAppNotListening(observedPort string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppNotListening,
+		"No process listening on $PORT",
+		fmt.Sprintf("readiness probe found no listener on port %s after the wake timeout.",
+			observedPort)).
+		WithDocs(docsBase + "/errors/app-not-listening")
+}
+
+// ErrAppLoopbackBound is returned when the customer's app binds its
+// listener to 127.0.0.1 (or ::1) — the per-VM bridge proxies from
+// 10.0.0.2, so a loopback bind never receives traffic even though the
+// wake readiness probe passes. The detection site (pkg/fcvm/vmm.go via
+// WaitCharacterizationReport's listening_addrs) attaches prose from
+// pkg/whycopy with the observed bind address.
+func ErrAppLoopbackBound(observedBind string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppLoopbackBound,
+		"Application bound to loopback",
+		fmt.Sprintf("app is listening on %s; the per-VM bridge proxies requests to 10.0.0.2, "+
+			"so loopback-only binds never receive traffic.", observedBind)).
+		WithDocs(docsBase + "/errors/app-loopback-bound")
+}
+
+// ErrAppArchMismatch is returned when the build VM cannot execute the
+// customer's binary because the host/target architecture disagrees
+// (e.g. darwin/arm64 binary on a linux/amd64 control plane). The
+// detection site (pkg/builderd/vm_metal.go::classifyBuildFailure)
+// attaches prose with the observed binary arch + the required target.
+func ErrAppArchMismatch(observedArch, requiredArch string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppArchMismatch,
+		"Unsupported CPU architecture",
+		fmt.Sprintf("binary is %s; this control plane runs %s. "+
+			"rebuild with the matching target.",
+			observedArch, requiredArch)).
+		WithDocs(docsBase + "/errors/app-arch-mismatch")
+}
+
+// ErrEnvVarMissing is returned when a deploy-time preflight detects
+// that the customer's source references an env var (os.Getenv in Go,
+// process.env in Node, os.environ in Python) that is not declared in
+// the app's env config. Preflight is warn-only; this error fires only
+// when --strict is set on `gregale deploy` or when the runtime
+// supervisor observes an execve crash from a missing key. Detection
+// site attaches prose with the observed env var name.
+func ErrEnvVarMissing(envVar string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeEnvVarMissing,
+		"Missing environment variable",
+		fmt.Sprintf("source references $%s but it is not declared in the app's env config.",
+			envVar)).
+		WithDocs(docsBase + "/errors/env-var-missing")
+}
+
+// ErrAppHealthzUnauthorized is returned when the customer's health
+// endpoint returns 401/403 within the liveness window — the host
+// can't distinguish "the app is up but the /healthz path is gated"
+// from "the app is down", so the deployment flips to failed after
+// ConsecutiveFailures consecutive 401s. The detection site
+// (cmd/vmmd/liveness_recv.go) attaches prose with the observed status.
+func ErrAppHealthzUnauthorized(observedStatus int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppHealthzUnauthorized,
+		"Health endpoint returning 401",
+		fmt.Sprintf("/healthz returned %d; consecutive 401s flip the deployment to failed.",
+			observedStatus)).
+		WithDocs(docsBase + "/errors/app-healthz-unauthorized")
+}
+
+// ErrAppRuntimeOOM is returned when the cgroup OOM-killer terminates
+// the customer's main workload inside the microVM (memory.max = plan +
+// 8 MB was exceeded). Distinct from CodeBuildOOM (the *build* VM's
+// OOM, which is a separate code with a different remediation path).
+//
+// Detection chain (Cluster C, ADR-121):
+//
+//	guest/init/cgroup_partition_linux.go::WatchOOM  (cgroup.events
+//	  poll on the per-workload cgroup v2 leaf)
+//	  → guest/init/framework_ready_emit.go::EmitWorkloadOOM
+//	    (AF_VSOCK DGRAM, port 1027, type byte 0x05, JSON body)
+//	  → cmd/vmmd/framework_ready_recv.go::dispatchWorkloadOOM
+//	  → pkg/fcvm/manager.go::ReportWorkloadOOM
+//	  → pkg/scheddgrpc::Server.ReportWorkloadOOM
+//	  → pkg/sched/engine.go::DestroyForWorkloadOOMFailure
+//	    (stamps the deployment row via SetDeploymentFailedEx with
+//	     CodeAppRuntimeOOM + the whycopy Observed payload)
+//
+// The host-side cgroup (which sees only the firecracker process) is
+// NOT a detection source — only the guest can see the workload OOM
+// because the per-VM workload lives under the guest's cgroup
+// namespace, invisible from the host. The constructor receives the
+// observed peak MB and the plan cap MB; the engine handler stamps
+// the deployment detail row with the templated Hint/Why/Fix (see
+// pkg/whycopy/whycopy.go::CodeAppRuntimeOOM.Observed).
+func ErrAppRuntimeOOM(observedPeakMB, planMB int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppRuntimeOOM,
+		"Container out of memory",
+		fmt.Sprintf("cgroup OOM-kill fired at %d MB (plan cap %d MB); upgrade plan or trim in-memory state.",
+			observedPeakMB, planMB)).
+		WithDocs(docsBase + "/errors/app-runtime-oom")
+}
+
+// ErrDepInstallFailed is returned when the build VM's dependency
+// installation step fails (npm install / pip install / go build /
+// etc.). The discriminator (pkg=npm|pip|go|...) is carried in the
+// Detail field and surfaced via pkg/whycopy so the CLI renders
+// per-package prose. Detection site
+// (pkg/builderd/vm_metal.go::classifyBuildFailure) attaches the
+// pkg + the observed exit code + the last 20 lines of build output.
+func ErrDepInstallFailed(pkgManager, observedCmd string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeDepInstallFailed,
+		"Dependency installation failure",
+		fmt.Sprintf("%s install failed: %s — see build log for the failing command.",
+			pkgManager, observedCmd)).
+		WithDocs(docsBase + "/errors/dep-install-failed")
+}
+
+// ErrAppStartupTimeout is returned when the customer's app does not
+// become ready within the wake timeout (35s by default; per-app
+// startup_timeout_s column). Distinct from idle_timeout_s (which is
+// the wake→park timer, not the boot timer). Detection site
+// (pkg/sched/engine.go::StuckReason) carries the observed StuckReason
+// ("waking_timeout" / "cold_boot_timeout") into the prose.
+func ErrAppStartupTimeout(stuckReason, observedDuration string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppStartupTimeout,
+		"Application startup timeout",
+		fmt.Sprintf("app did not become ready after %s (stuck_reason=%s).",
+			observedDuration, stuckReason)).
+		WithDocs(docsBase + "/errors/app-startup-timeout")
+}
+
 // ErrDomainNotVerified is returned when a customer tries to bind a domain
 // whose TXT challenge hasn't been satisfied yet (spec §7).
 func ErrDomainNotVerified(domain string) *Problem {
@@ -1743,6 +2055,32 @@ func ErrDomainCertNotIssued(domain, reason string) *Problem {
 		"Domain cert not issued",
 		fmt.Sprintf("port-443 cert for %q is not Gregale-issued: %s", domain, reason)).
 		WithDocs(docsBase + "/domains/verify")
+}
+
+// ErrDoctorDisabled (ADR-120) is the 503 returned by
+// `GET /v1/domains/{domain}/doctor` when
+// FAAS_DOMAIN_DOCTOR_ENABLED is unset. The route stays
+// registered (per the pre-#911 pattern in api/flags.go) so
+// the CLI gets a deterministic error code rather than a
+// generic 404. The detail line is the operator-facing
+// "set FAAS_DOMAIN_DOCTOR_ENABLED=1" hint.
+func ErrDoctorDisabled() *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeDoctorDisabled,
+		"Domain doctor is dark-launched",
+		"the FAAS_DOMAIN_DOCTOR_ENABLED flag is not set on this cluster; ask the operator to enable it or use `gregale domains verify` for a one-shot check").
+		WithDocs(docsBase + "/domains/doctor")
+}
+
+// ErrDoctorUnavailable (ADR-120) is the 503 returned when
+// the doctor flag IS on but the probe pass failed in a way
+// the doctor handler can't recover from (e.g. a Postgres
+// round-trip error reading the observation row). Distinct
+// from ErrDoctorDisabled (the dark-launch case).
+func ErrDoctorUnavailable(domain, reason string) *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeDoctorUnavailable,
+		"Domain doctor unavailable",
+		fmt.Sprintf("doctor probes for %s failed: %s", domain, reason)).
+		WithDocs(docsBase + "/domains/doctor")
 }
 
 // ErrCronInvalid is returned for malformed cron expressions.
@@ -1779,6 +2117,26 @@ const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
 // the CLI can branch on upsell-vs-delete copy without parsing
 // the body.
 const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
+
+// CodePlanConsumerKeyQuotaReached is the RFC 7807 stable code
+// returned when the per-app or per-account consumer_keys quota is
+// exhausted. The intent is "your plan allows N keys per app (or per
+// account) and you already hold N — revoke one or upgrade before
+// minting another." PR #5-B's apid CreateConsumerKey handler returns
+// 403 with this code on POST attempts.
+// Why stable: the apid sdk-go / sdk-node / sdk-python surfaces map
+// this code to a typed error class so customers can write a
+// one-line handler for the quota-exhausted case without parsing the
+// prose body — same shape as CodePlanAlertRuleQuota.
+const CodePlanConsumerKeyQuotaReached = "plan_consumer_key_quota_reached"
+
+// CodeConsumerKeysNotAllowed is the RFC 7807 stable code returned when
+// the customer's plan is gated off the consumer_keys feature entirely
+// (Free tier today; mirrors CronLimitPerApp posture). The apid handler
+// returns 402 plan_not_allowed with this code on POST attempts.
+// Why stable: mirrors CodePlanAlertRulesNotAllowed shape so SDK
+// authors can write a single switch on plan-gated codes.
+const CodeConsumerKeysNotAllowed = "consumer_keys_not_allowed"
 
 // PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
 // *Quota functions receive in their `scope` argument. Mirrors
@@ -1817,6 +2175,41 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // reached. Distinct from CodePlanWebhooksNotAllowed so the CLI
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
+
+// CodePlanTriggersNotAllowed is the 402 the customer sees when
+// the plan doesn't unlock the unified Trigger primitive at all
+// (Free today, issue #757 / ADR-0NN). Mirrors CodePlanCronsNotAllowed
+// and CodePlanWebhooksNotAllowed. The handler rejects BEFORE loadApp
+// so a Free customer posting to a non-existent slug gets the upsell
+// instead of a 404 that would leak the slug's existence (PR review
+// finding F4 mirrored from createAlertRule / createAppWebhook).
+const CodePlanTriggersNotAllowed = "plan_triggers_not_allowed"
+
+// CodePlanTriggerQuota is the 403 the customer sees when the plan
+// DOES unlock triggers but the per-app or per-account cap was
+// reached. Distinct from CodePlanTriggersNotAllowed so the CLI
+// can branch on upsell-vs-delete copy without parsing the body.
+// Mirrors CodePlanCronQuota / CodePlanWebhookQuota.
+const CodePlanTriggerQuota = "plan_trigger_quota"
+
+// CodeTriggerBatchWindowTooLarge is the 403 returned when
+// POST/PATCH /v1/triggers carries a batch_window_ms that exceeds the
+// plan cap (limits.TriggerBatchWindowMaxSec — Hobby 30s, Pro/Scale
+// 300s). Mirrors CodePlanTriggerQuota's plan-cap semantic; a
+// distinct code keeps the CLI's batch_window field-specific
+// guidance independent of the count-quota advice.
+// Added for PR #993 / issue #757 review MED-4.
+const CodeTriggerBatchWindowTooLarge = "trigger_batch_window_too_large"
+
+// CodeTriggerTLSSkipVerifyNotAllowed is the 403 returned when a
+// Kafka trigger carries skip_verify=true on a plan whose
+// TLSSkipVerifyAllowed flag is false (Free + Hobby today).
+// skip_verify is dangerous — it disables hostname + cert
+// verification — and we ship it only to plans that have signed off
+// on the operational risk (Pro + Scale today). Mirrors the
+// CodeTenantSurfacesNotAllowed shape (capability not plan-quota).
+// Added for PR #993 / issue #757 review MED-4.
+const CodeTriggerTLSSkipVerifyNotAllowed = "trigger_tls_skip_verify_not_allowed"
 
 // CodePlanLogArchiveNotAllowed is the 402 the customer sees when
 // they request ?archive=1 against an app on a plan whose
@@ -2056,6 +2449,65 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 		WithDocs(docsBase + "/plans#webhooks")
 }
 
+// ErrPlanTriggersNotAllowed is returned by apid's createTrigger /
+// listTriggers handlers when the customer's plan has
+// TriggerLimitPerApp == 0 (Free today, issue #757 / ADR-0NN).
+// Fires BEFORE loadApp so a Free customer posting to a non-existent
+// slug gets a clean 402 instead of a 404 (and the reverse — a
+// Free customer on a real slug gets 402, not a 404 masquerading as
+// plan-gating). PR review finding F4 mirrored from createAlertRule
+// and createAppWebhook.
+func ErrPlanTriggersNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanTriggersNotAllowed,
+		"Triggers unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include event-source mappings (Kafka, NATS, Redis Streams, SQS-compatible, in-platform queue); upgrade to Hobby or above to subscribe.", p)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrPlanTriggerQuota is returned when CreateTriggerIfUnderQuota
+// surfaces a *state.TriggerQuotaError. Scope "app" or "account"
+// tells the handler which cap fired so the body can name it. 403
+// (not 402) because the plan DOES unlock triggers — the right
+// copy is "delete a trigger to add another", not "upgrade to
+// Hobby". Mirrors ErrPlanCronQuota / ErrPlanWebhookQuota.
+func ErrPlanTriggerQuota(plan Plan, scope string, limit, observed int) *Problem {
+	scopeName := PlanQuotaScopeDisplayName(scope)
+	return NewProblem(http.StatusForbidden, CodePlanTriggerQuota,
+		"Trigger limit reached",
+		fmt.Sprintf("%s plan caps triggers at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrTriggerBatchWindowTooLarge is returned by createTrigger /
+// updateTrigger when batch_window_ms / 1000 exceeds the plan cap
+// (limits.TriggerBatchWindowMaxSec). Mirror of ErrPlanTriggerQuota
+// for a different limit field. Added for PR #993 / issue #757
+// review MED-4.
+func ErrTriggerBatchWindowTooLarge(plan Plan, limitSec, observedSec int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTriggerBatchWindowTooLarge,
+		"batch_window too large for this plan",
+		fmt.Sprintf("%s plan caps trigger batch_window at %d s; you requested %d s. Lower the value or upgrade to Scale.",
+			plan, limitSec, observedSec)).
+		WithLimit(int64(limitSec), int64(observedSec)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrTriggerTLSSkipVerifyNotAllowed is returned by createTrigger /
+// updateTrigger when the Kafka trigger config carries
+// tls.skip_verify=true but the account's plan does not have
+// TLSSkipVerifyAllowed (Free + Hobby today). 403 because the plan
+// supports triggers, it just doesn't ship the certificate-skip
+// knob — the operator decision the customer has to revisit. Added
+// for PR #993 / issue #757 review MED-4.
+func ErrTriggerTLSSkipVerifyNotAllowed(plan Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTriggerTLSSkipVerifyNotAllowed,
+		"tls.skip_verify unavailable on this plan",
+		fmt.Sprintf("the %s plan does not allow tls.skip_verify on a trigger (the certificate-skip knob is reserved for plans that have signed off on the operational risk). Drop tls.skip_verify or upgrade to Pro.", plan)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
 // ErrAppWebhookInvalid is returned for malformed webhook bodies:
 // missing target_url, invalid retry_policy, out-of-vocabulary event,
 // oversize webhook_secret, etc. Mirrors ErrAlertRuleInvalid.
@@ -2256,6 +2708,32 @@ func ErrNoRollbackTarget() *Problem {
 	return NewProblem(http.StatusConflict, CodeNoRollbackTarget,
 		"No previous deployment",
 		"there's no superseded deployment to roll back to; deploy at least twice.").
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetNotFound is returned by POST /v1/apps/{slug}/rollback when
+// the caller passes an explicit target_deployment_id (SAFE-RELEASES-G) that
+// does not match any deployment of this app, or does not exist. The detail
+// names the bad id so the CLI can echo it back. 404 (not 409) because the
+// resource the caller asked for genuinely doesn't exist — distinct from
+// CodeNoRollbackTarget (409: "no superseded deployment exists at all").
+func ErrRollbackTargetNotFound(detail string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeRollbackTargetNotFound,
+		"Rollback target not found",
+		detail).
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetAlreadyLive is returned when the caller passes an
+// explicit target_deployment_id that exists but has status != 'superseded'
+// (most commonly status='live'). Caller asked to "rollback" to the
+// already-current deployment. Rejected explicitly rather than silently
+// no-op'd per the SAFE-RELEASES-G plan. 409 because the request is
+// well-formed but cannot proceed in current state.
+func ErrRollbackTargetAlreadyLive(detail string) *Problem {
+	return NewProblem(http.StatusConflict, CodeRollbackTargetAlreadyLive,
+		"Rollback target is already live",
+		detail).
 		WithDocs(docsBase + "/deploys#rollback")
 }
 
@@ -2763,6 +3241,20 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 		WithDocs(docsBase + "/apps#egress-allowlist")
 }
 
+// ErrPlanPublicAuthIPAllowlistNotAllowed (ADR-118) is returned when a
+// Free or Hobby account tries to set apps.public_auth_ip_allowlist.
+// Same gate shape as ErrPlanEgressAllowlistNotAllowed: the knob is
+// plan-locked, and Pro/Scale is where the operator surface lives.
+// Free/Hobby use edge rules (kind='ip') for the abuse-floor posture.
+// The plan is named in the body so a CLI prompt can render "upgrade
+// to Pro to unlock this knob" without a second lookup.
+func ErrPlanPublicAuthIPAllowlistNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanPublicAuthIPAllowlistNotAllowed,
+		"Plan doesn't allow a public-auth IP allowlist",
+		fmt.Sprintf("the %s plan cannot pin a public-auth IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
+}
+
 // ErrPlanLivenessProbeNotAllowed (issue #554 / ADR-078) is returned when a
 // Free account tries to pin a per-deployment liveness probe override. The
 // gate is the same shape as ErrPlanEgressAllowlistNotAllowed /
@@ -2789,6 +3281,19 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
 		WithLimit(int64(maxSize), int64(got)).
 		WithDocs(docsBase + "/apps#egress-allowlist")
+}
+
+// ErrPublicAuthIPAllowlistTooLong (ADR-118) is returned when the
+// PATCH carries more CIDRs than the plan's per-app cap. 400 (not
+// 422) because the request shape is well-formed — only the count
+// is over budget. The limit + observed pair rides on the Problem
+// so the CLI can branch on its own copy of the cap (no re-fetch).
+func ErrPublicAuthIPAllowlistTooLong(got, maxEntries int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodePublicAuthIPAllowlistTooLong,
+		"Public-auth IP allowlist too long",
+		fmt.Sprintf("public_auth_ip_allowlist has %d entries; plan caps it at %d.", got, maxEntries)).
+		WithLimit(int64(maxEntries), int64(got)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
 }
 
 // ErrAccountEgressAllowlistExtraOutOfRange (issue #679 / PR-B /
@@ -2819,6 +3324,21 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs(docsBase + "/apps#egress-allowlist")
+}
+
+// ErrInvalidPublicAuthIPAllowlist (ADR-118) is a 400 for ingress
+// allowlist shape violations: an entry that doesn't ParsePrefix as
+// a v4 or v6 CIDR, masklen /0, or `ip_allowlist` mode set with an
+// empty list. The detail names the offending entry so an operator
+// triaging a rejected PATCH sees exactly which line is bad. The
+// non-/0 contract is shared with the DB trigger at
+// migrations/00308_apps_public_auth_ip_allowlist.sql — the apid
+// layer is defence-in-depth, not the primary guard.
+func ErrInvalidPublicAuthIPAllowlist(entry string, reason error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeInvalidPublicAuthIPAllowlist,
+		"Invalid public-auth IP allowlist entry",
+		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by
