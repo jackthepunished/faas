@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -162,6 +163,16 @@ type DeploymentItem struct {
 	// the dashboard's deploy detail page (deployment_detail.html)
 	// is the drill-down surface for the full CVE list.
 	ScanSummary *ScanSummary
+	// Error-explanations cluster (spec §6.4 amendment 1):
+	// typed prose stamped on the deployments row alongside the
+	// legacy raw Error string. Empty on pre-cluster rows;
+	// the deployment_detail template gates the new section
+	// on ErrorCode != "" so legacy renders unchanged.
+	ErrorCode         string
+	ErrorHint         string
+	ErrorWhy          string
+	ErrorFix          string
+	ErrorRelevantLogs []api.LogExcerpt
 }
 
 // ScanSummary is the per-deploy grype scan summary

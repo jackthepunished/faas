@@ -1858,13 +1858,24 @@ func severityOrdinal(s string) int {
 // minimal DeploymentItem shape the deployment_detail template
 // needs (ID, Kind, Status, CreatedAt). The full Deployments list
 // uses a richer shape; the detail page only renders a header.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): the 5 new
+// prose columns stamped on the deployments row by SetDeploymentFailedEx
+// flow through verbatim. The deployment_detail template gates the
+// error-explanation section on ErrorCode != "" so pre-cluster rows
+// (and non-failure rows) render unchanged.
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	return dashboard.DeploymentItem{
-		ID:        d.ID,
-		Status:    string(d.Status),
-		Kind:      string(d.Kind),
-		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
-		Error:     d.Error,
+		ID:                d.ID,
+		Status:            string(d.Status),
+		Kind:              string(d.Kind),
+		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
+		Error:             d.Error,
+		ErrorCode:         d.ErrorCode,
+		ErrorHint:         d.ErrorHint,
+		ErrorWhy:          d.ErrorWhy,
+		ErrorFix:          d.ErrorFix,
+		ErrorRelevantLogs: d.ErrorRelevantLogs,
 	}
 }
 

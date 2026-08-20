@@ -40,6 +40,24 @@
     .sev-medium   { color: #f9a825; font-weight: 600; }
     .sev-low      { color: #1565c0; font-weight: 600; }
     .sev-unknown  { color: #888; }
+    /* Error-explanations cluster (spec §6.4 amendment 1):
+       the per-deployment prose block surfaced when a deploy
+       fails with a typed code (e.g. stateless_only_violation).
+       Scoped under .error-explanation so no global selector
+       bleed. Hint yellow, why gray italic, fix green
+       monospace; relevant logs collapsed by default. */
+    .error-explanation {
+      border-left: 3px solid #e74c3c;
+      padding: 0.75rem 1rem;
+      margin: 1rem 0;
+      background: #fef2f2;
+    }
+    .error-explanation .title { margin: 0 0 0.5rem 0; font-family: ui-monospace, Menlo, monospace; }
+    .error-explanation .hint  { color: #b45309; margin: 0.25rem 0; }
+    .error-explanation .why   { color: #6b7280; font-style: italic; margin: 0.25rem 0; white-space: pre-wrap; }
+    .error-explanation .fix   { color: #047857; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; margin: 0.25rem 0; }
+    .error-explanation .logs  { margin-top: 0.5rem; }
+    .error-explanation .docs  { display: inline-block; margin-top: 0.5rem; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -67,6 +85,32 @@
         · Kind: <strong>{{.Data.Deployment.Kind}}</strong>
         · Created: <code>{{.Data.Deployment.CreatedAt}}</code>
       </p>
+
+      {{ if .Data.Deployment.ErrorCode }}
+      <section class="error-explanation" data-cluster="error-explanations">
+        <h3 class="title">✗ {{ .Data.Deployment.ErrorCode }}</h3>
+        {{ if .Data.Deployment.Error }}
+          <p class="detail">{{ .Data.Deployment.Error }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorHint }}
+          <p class="hint">💡 {{ .Data.Deployment.ErrorHint }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorWhy }}
+          <p class="why">why: {{ .Data.Deployment.ErrorWhy }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorFix }}
+          <p class="fix">→ {{ .Data.Deployment.ErrorFix }}</p>
+        {{ end }}
+        {{ if .Data.Deployment.ErrorRelevantLogs }}
+          <details class="logs">
+            <summary>relevant logs ({{ len .Data.Deployment.ErrorRelevantLogs }})</summary>
+            <pre>{{ range .Data.Deployment.ErrorRelevantLogs }}[{{ .Level }}] {{ .Source }}: {{ .Message }}
+{{ end }}</pre>
+          </details>
+        {{ end }}
+        <a class="docs" href="https://docs.gregale.dev/errors/{{ .Data.Deployment.ErrorCode }}" target="_blank" rel="noopener">docs →</a>
+      </section>
+      {{ end }}
 
       <h2>Scan</h2>
       {{if .Data.Scan}}
