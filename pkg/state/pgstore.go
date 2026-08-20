@@ -17891,8 +17891,21 @@ func (s *PgStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) er
 
 // ConsumerKeyByAppAndPrefix is the gateway-side hot-path lookup.
 // (app_id, prefix) is the unique hot-path key — see the
-// consumer_keys_app_prefix_idx index in 00305. The hash compare
-// happens at the call site.
+// consumer_keys_app_prefix_idx UNIQUE index in 00305 (the UNIQUE
+// is load-bearing: a non-UNIQUE index would let a birthday-bound
+// ~0.78% collision at Scale cap of 1000 keys/app silently collapse
+// the lookup to "first row found by the planner" and the constant-
+// time hash compare would run against the wrong key's bytes).
+//
+// CONTRACT: this method returns the row regardless of revoked_at
+// or expires_at. The caller (gatewayd-internal middleware in PR #5-C)
+// MUST call Active(now) on the returned row before the hash compare.
+// This is intentional — the read path stays passive so the audit
+// trail (revoked_at TIMESTAMPTZ + last_used_at) survives gateway
+// reads; the caller-side Active() is the single source of truth for
+// "is this key still usable right now". TouchConsumerKeyLastUsed
+// stays filtered on revoked_at IS NULL (no observability point in
+// stamping a revoked row's last_used_at).
 func (s *PgStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appID, prefix string) (ConsumerKey, error) {
 	if accountID == "" || appID == "" || prefix == "" {
 		return ConsumerKey{}, ErrNotFound

@@ -12801,6 +12801,20 @@ func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, 
 	if len(scopes) == 0 {
 		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00305)")
 	}
+	// Closed-set vocab: pgstore's consumer_keys_scopes_vocab_chk rejects
+	// anything outside {read, write, admin}. Memstore mirrored the empty
+	// guard but NOT the vocab — a Store-level test that bypasses the
+	// apid validator (PR #5-B) could seed an out-of-vocab scope and the
+	// memstore would accept it, while the pg path silently rejects with
+	// SQLSTATE 23514. Pin the surface here so pg ↔ memstore agree.
+	for _, s := range scopes {
+		switch s {
+		case "read", "write", "admin":
+			// ok
+		default:
+			return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: scope %q is not in the closed-set {read, write, admin} (00305 vocab CHECK)", s)
+		}
+	}
 	if expiresAt != nil && expiresAt.Before(time.Now()) {
 		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00305)")
 	}

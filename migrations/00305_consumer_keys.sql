@@ -65,7 +65,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS consumer_keys_unique_name
 -- `ck_<prefix>_<secret>` header hits `(app_id, prefix)` to narrow
 -- to ~one row before the hash compare. Composite index covers both
 -- columns.
-CREATE INDEX IF NOT EXISTS consumer_keys_app_prefix_idx
+-- consumer_keys_app_prefix_idx is UNIQUE — the gateway's hot-path lookup
+-- (ConsumerKeyByAppAndPrefix) is expected to narrow to exactly one row.
+-- Without UNIQUE, a prefix collision (birthday-bound ~0.78% at Scale's 1000
+-- keys/app for 32-bit prefix entropy) would silently collapse the lookup
+-- to "first row found by the planner" and the constant-time hash compare
+-- would run against the wrong key's bytes — a spurious 401 with no log
+-- signal. UNIQUE forces the INSERT to fail loudly; the apid handler
+-- can retry GenerateConsumerKey on 23505 (or surface a 503 to the
+-- operator — the collision probability is vanishingly rare, but the
+-- invariant is critical so a deterministic guard beats statistical hope).
+CREATE UNIQUE INDEX IF NOT EXISTS consumer_keys_app_prefix_idx
   ON consumer_keys (app_id, prefix);
 
 -- List endpoints: GET /v1/apps/{slug}/consumer-keys filters by

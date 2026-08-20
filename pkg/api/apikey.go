@@ -41,11 +41,14 @@ const (
 	// response without leaking the secret.
 	ConsumerKeyPrefix = "ck_"
 	// consumerKeyPrefixBytes is the entropy behind the prefix
-	// segment of the plaintext (16 bits; 2 hex chars/byte).
+	// segment of the plaintext (32 bits = 4 bytes = 8 hex chars).
+	// 32 bits chosen because the (app_id, prefix) UNIQUE index in
+	// migration 00305 guarantees no two keys share a prefix inside
+	// one app — see ADR-120 §D2 for the collision-probability math.
 	consumerKeyPrefixBytes = 4
 	// consumerKeySecretBytes is the entropy behind the secret
-	// segment of the plaintext (256 bits; 2 hex chars/byte).
-	// Doubled vs apiKeyRandomBytes because consumer keys are
+	// segment of the plaintext (256 bits = 32 bytes = 64 hex chars).
+	// 1.33× apiKeyRandomBytes (24 bytes) because consumer keys are
 	// public-internet-exposed while api_keys only circulate inside
 	// the account operator's CI fleet.
 	consumerKeySecretBytes = 32

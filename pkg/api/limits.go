@@ -577,17 +577,22 @@ type Limits struct {
 	// size). Enforced at the apid write boundary.
 	CorsPresetMaxAllowMethods int
 	// CorsPresetMaxNameLength pins the upper bound on
-	// consumer_keys.name (the migration's CHECK pins it to
-	// 64). Surfaced here so the apid writer can reject
-	// before INSERT. Same value across plans.
+	// cors_presets.name (the migration's CHECK in 00304
+	// pins it to 64). Surfaced here so the apid writer
+	// can reject before INSERT. Same value across plans.
+	// NOT the consumer_keys name cap — that lives on
+	// ConsumerKeysPerApp's creator-side apid validator.
 	CorsPresetMaxNameLength int
 
 	// ConsumerKeysPerApp caps how many consumer_keys rows
 	// (ADR-120 / issue #975 item #5) one app may own. The cap
 	// defends against a customer pinning one consumer key per
 	// customer-of-customer and inflating the gateway-side
-	// (app_id, prefix) hot-path lookup. Per-plan: Free 100,
-	// Hobby 100, Pro 100, Scale 1000. Same 100-per-app floor
+	// (app_id, prefix) hot-path lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is 0 because the
+	// abuse-floor tier cannot host multi-tenant consumer surfaces (the
+	// apid CreateConsumerKey handler returns 402 CodeConsumerKeysNotAllowed
+	// before the store is touched). Free switch to 0 mirrors the
+	// CronLimitPerApp/OrgMembersMax 0/0 posture. Same 100-per-app floor
 	// across the lower three tiers because the cardinality
 	// budget per app is a tenant-stability concern, not a
 	// tier-upgrade lever — the per-account cap scales with
@@ -599,7 +604,10 @@ type Limits struct {
 	// one account may own in total across all its apps.
 	// Independent of ConsumerKeysPerApp so a customer with N
 	// apps under one account can split the per-account cap.
-	// Per-plan: Free 250, Hobby 250, Pro 2500, Scale 25000.
+	// Per-plan: Free 0, Hobby 250, Pro 2500, Scale 25000. Free is 0 — same
+	// abuse-floor gating as ConsumerKeysPerApp; the per-account ceiling is
+	// reached before the per-app ceiling on a typical multi-app Free
+	// customer, but Free is gated off entirely so neither trips.
 	// Same per-app floor + 25× scale ceiling.
 	ConsumerKeysPerAccount int
 
@@ -4018,7 +4026,8 @@ func (p Plan) CorsPresetMaxNameLength() int {
 // per-app cap on consumer_keys rows. The cap defends against a
 // customer pinning one consumer key per customer-of-customer
 // and inflating the gateway-side (app_id, prefix) hot-path
-// lookup. Per-plan: Free 100, Hobby 100, Pro 100, Scale 1000.
+// lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is gated off
+// entirely (CodeConsumerKeysNotAllowed).
 // Same 100-per-app floor across the lower three tiers — the
 // cardinality budget per app is a tenant-stability concern,
 // not a tier-upgrade lever. Unknown plans fail closed (return
@@ -4036,7 +4045,7 @@ func (p Plan) ConsumerKeysPerApp() int {
 // the per-account cap on consumer_keys rows across all of the
 // account's apps. Independent of ConsumerKeysPerApp so a
 // customer with N apps under one account can split the
-// per-account budget. Per-plan: Free 250, Hobby 250, Pro 2500,
+// per-account budget. Per-plan: Free 0, Hobby 250, Pro 2500,
 // Scale 25000. Same fail-closed contract as ConsumerKeysPerApp.
 func (p Plan) ConsumerKeysPerAccount() int {
 	l, ok := LimitsFor(p)

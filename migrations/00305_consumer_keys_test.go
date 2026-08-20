@@ -149,13 +149,67 @@ func TestMigrations_00305_ConsumerKeys(t *testing.T) {
 		}
 	}
 
+	// (4b) The (app_id, prefix) index MUST be UNIQUE — the gateway's
+	// hot-path lookup (ConsumerKeyByAppAndPrefix) expects exactly one
+	// row per (app_id, prefix). A non-UNIQUE index would let a
+	// birthday-bound prefix collision silently collapse the lookup
+	// to "first row found by the planner" and the constant-time hash
+	// compare would run against the wrong key's bytes — a spurious
+	// 401 with no log signal. Code-review finding #1.
+	var isUnique bool
+	err := pool.QueryRow(ctx, `
+		SELECT indisunique
+		  FROM pg_index i
+		  JOIN pg_class c ON c.oid = i.indexrelid
+		 WHERE c.relname = 'consumer_keys_app_prefix_idx'`).Scan(&isUnique)
+	if err != nil {
+		t.Fatalf("query indisunique: %v", err)
+	}
+	if !isUnique {
+		t.Error("consumer_keys_app_prefix_idx is NOT UNIQUE — the gateway's hot-path lookup will silently pick the wrong row on a prefix collision (code-review finding #1)")
+	}
+	// Belt-and-braces: try inserting two rows with the same (app_id, prefix)
+	// and assert the second trips 23505. Skipped if the parent FK floor
+	// isn't satisfiable (the foreach test seed sets up the rows).
+	var dupAccountID = "00000000-0000-0000-0000-0000003308aa"
+	var dupAppID = "00000000-0000-0000-0000-0000003308bb"
+	insertDup := func(prefix string) error {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO consumer_keys (account_id, app_id, name, prefix, hashed_secret, scopes)
+			VALUES ($1::uuid, $2::uuid, 'dup-unique-test-' || $3, $3,
+			        decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'),
+			        ARRAY['read']::text[])`, dupAccountID, dupAppID, prefix)
+		return err
+	}
+	// Insert parent rows for the dup test (the parent's accounts/apps
+	// FK floors must be satisfied — the migration test doesn't seed via
+	// Store, so we INSERT directly).
+	_, _ = pool.Exec(ctx, `INSERT INTO accounts (id, email, plan) VALUES ($1::uuid, 'dup-unique-acct@example.com', 'hobby') ON CONFLICT (id) DO NOTHING`, dupAccountID)
+	_, _ = pool.Exec(ctx, `INSERT INTO apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s) VALUES ($1::uuid, $2::uuid, 'dup-unique-app', 'app', 256, 2, 60) ON CONFLICT (id) DO NOTHING`, dupAppID, dupAccountID)
+	if err := insertDup("dup1234"); err != nil {
+		t.Fatalf("first INSERT (sentinel) failed: %v (need real parent rows for the FK floor)", err)
+	}
+	err = insertDup("dup1234")
+	if err == nil {
+		t.Fatal("duplicate (app_id, prefix) INSERT did NOT trip the UNIQUE index — additive collision, gateway would silently pick wrong row")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected pgconn.PgError on duplicate, got %T: %v", err, err)
+	}
+	if pgErr.Code != "23505" {
+		t.Errorf("expected SQLSTATE 23505 unique_violation on duplicate (app_id, prefix), got %s", pgErr.Code)
+	}
+	// Clean up the sentinel row so the test is idempotent if rerun.
+	_, _ = pool.Exec(ctx, `DELETE FROM consumer_keys WHERE account_id = $1::uuid`, dupAccountID)
+
 	// (6) Closed-vocab scope rejection. INSERT with scope='superadmin'
 	// must fail with SQLSTATE 23514 (check_violation). The CHECK
 	// consumer_keys_scopes_vocab_chk is the floor — apid handlers
 	// validate at the write boundary, but a hand-rolled INSERT must
 	// also be rejected.
-	var accountID = "00000000-0000-0000-0000-000000003308a"
-	var appID = "00000000-0000-0000-0000-000000003308b"
+	var accountID = "00000000-0000-0000-0000-0000003308aa"
+	var appID = "00000000-0000-0000-0000-0000003308bb"
 	dummyErr := error(nil)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO consumer_keys (account_id, app_id, name, prefix, hashed_secret, scopes)
@@ -172,15 +226,15 @@ func TestMigrations_00305_ConsumerKeys(t *testing.T) {
 	if dummyErr == nil {
 		t.Fatal("expected closed-vocab CHECK to reject scope='superadmin' (regression: the CHECK was widened to admit non-vocab scopes)")
 	}
-	var pgErr *pgconn.PgError
-	if !errors.As(dummyErr, &pgErr) {
+	var vocabErr *pgconn.PgError
+	if !errors.As(dummyErr, &vocabErr) {
 		t.Fatalf("expected pgconn.PgError, got %T: %v", dummyErr, dummyErr)
 	}
-	if pgErr.Code != "23514" {
-		t.Errorf("expected SQLSTATE 23514 check_violation, got %s (closed vocabulary contract)", pgErr.Code)
+	if vocabErr.Code != "23514" {
+		t.Errorf("expected SQLSTATE 23514 check_violation, got %s (closed vocabulary contract)", vocabErr.Code)
 	}
-	if !strings.Contains(pgErr.ConstraintName, "consumer_keys_scopes_vocab_chk") {
-		t.Errorf("expected violation of consumer_keys_scopes_vocab_chk, got %q", pgErr.ConstraintName)
+	if !strings.Contains(vocabErr.ConstraintName, "consumer_keys_scopes_vocab_chk") {
+		t.Errorf("expected violation of consumer_keys_scopes_vocab_chk, got %q", vocabErr.ConstraintName)
 	}
 
 	// (7) Replay safety: re-running db.MigrateUp is a no-op.
