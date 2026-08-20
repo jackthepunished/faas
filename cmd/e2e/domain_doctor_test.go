@@ -273,3 +273,72 @@ func uniqueSuffix(t *testing.T) string {
 	t.Helper()
 	return strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000"), ".", "")
 }
+
+// TestDomainDoctor_StrayAAAA (ADR-120 Tier A3) seeds an
+// observation row with ipv6_conflict=true + a stray AAAA in
+// observed_aaaa. Asserts the CLI exits 1 (unhealthy) and prints
+// the stray-AAAA remediation. Mirrors
+// TestDomainDoctor_CNAMEMismatch above; only the failing check
+// + remediation text differ. The ipv6_conflict probe is the
+// Render-style "stray AAAA at apex" check the doctor's
+// 5-line report surfaces; the e2e case ensures the row's
+// remediation string propagates through the JSON wire shape
+// AND the CLI's prose renderer.
+func TestDomainDoctor_StrayAAAA(t *testing.T) {
+	report := `{
+		"dns_record_found": true,
+		"points_to_gregale": true,
+		"caa_permits": true,
+		"ipv6_conflict": true,
+		"cert_state": "issued",
+		"observed_aaaa": "::1",
+		"last_error": "Remove AAAA record at api.example.com"
+	}`
+	fx := newDomainDoctorFixture(t, report)
+	bin := buildGregale(t)
+	stdout, stderr, exit := runGregale(t, bin, []string{"domains", "doctor", fx.domain})
+	if exit != 1 {
+		t.Fatalf("exit = %d, want 1 (unhealthy). stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "✗ ipv6_conflict") {
+		t.Errorf("stdout missing fail glyph for ipv6_conflict:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Remove AAAA") {
+		t.Errorf("stdout missing stray-AAAA remediation line:\n%s", stdout)
+	}
+}
+
+// TestDomainDoctor_CAABlocked (ADR-120 Tier A3) seeds an
+// observation row with caa_permits=false + a CAA record that
+// forbids any issuer. Asserts the CLI exits 1 (unhealthy) and
+// prints the CAA-blocked remediation. The CAA probe is the
+// Render-style "permit letsencrypt.org" check; a customer who
+// publishes 0 issue ";" (or any record that doesn't permit
+// letsencrypt.org) hits this row. The e2e case pins the JSON
+// wire shape AND the CLI's prose renderer so the 5-line
+// doctor's coverage of all 4 Render-style surface checks
+// (DNS / points_to_gregale / CAA / IPv6 — the 5th being TLS)
+// stays end-to-end tested.
+func TestDomainDoctor_CAABlocked(t *testing.T) {
+	report := `{
+		"dns_record_found": true,
+		"points_to_gregale": true,
+		"caa_permits": false,
+		"ipv6_conflict": false,
+		"cert_state": "pending",
+		"caa_observed": "0 issue \"\"",
+		"last_error": "Update CAA record to permit letsencrypt.org"
+	}`
+	fx := newDomainDoctorFixture(t, report)
+	bin := buildGregale(t)
+	stdout, stderr, exit := runGregale(t, bin, []string{"domains", "doctor", fx.domain})
+	if exit != 1 {
+		t.Fatalf("exit = %d, want 1 (unhealthy). stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "✗ caa_permits") {
+		t.Errorf("stdout missing fail glyph for caa_permits:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Update CAA") {
+		t.Errorf("stdout missing CAA-blocked remediation line:\n%s", stdout)
+	}
+}
