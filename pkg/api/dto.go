@@ -823,9 +823,9 @@ func (b *PublicAuthBlock) Validate() *Problem {
 // is NEVER echoed — it lives in app_secrets (ADR-045)
 // and is loopback-mounted to drive1 at boot.
 type PublicAuthStatus struct {
-	Mode                   string `json:"mode"`
-	HasBasicCreds          bool   `json:"has_basic_creds"`
-	IPAllowlistEntryCount  int    `json:"ip_allowlist_entry_count"`
+	Mode                  string `json:"mode"`
+	HasBasicCreds         bool   `json:"has_basic_creds"`
+	IPAllowlistEntryCount int    `json:"ip_allowlist_entry_count"`
 }
 
 // Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`

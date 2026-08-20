@@ -434,7 +434,7 @@ func TestPublicAuthPatch_IPAllowlistPlanGate(t *testing.T) {
 		e := setup(t, api.PlanFree)
 		app := seedAppForAudit(t, e, "pa-ip-free")
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: []string{"10.0.0.0/8"},
 		})
 		if rec.Code != http.StatusForbidden {
@@ -450,7 +450,7 @@ func TestPublicAuthPatch_IPAllowlistPlanGate(t *testing.T) {
 		e := setup(t, api.PlanHobby)
 		app := seedAppForAudit(t, e, "pa-ip-hobby")
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: []string{"10.0.0.0/8"},
 		})
 		if rec.Code != http.StatusForbidden {
@@ -462,7 +462,7 @@ func TestPublicAuthPatch_IPAllowlistPlanGate(t *testing.T) {
 		e := setup(t, api.PlanPro)
 		app := seedAppForAudit(t, e, "pa-ip-pro")
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: []string{"10.0.0.0/8"},
 		})
 		if rec.Code != http.StatusOK {
@@ -479,7 +479,7 @@ func TestPublicAuthPatch_IPAllowlistPlanGate(t *testing.T) {
 			entries[i] = "10.0.0.0/8" // same prefix; dedup drops to 1 entry
 		}
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: entries,
 		})
 		if rec.Code != http.StatusOK {
@@ -506,7 +506,7 @@ func TestPublicAuthPatch_IPAllowlistSizeGate(t *testing.T) {
 			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
 		}
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: entries,
 		})
 		if rec.Code != http.StatusBadRequest {
@@ -525,7 +525,7 @@ func TestPublicAuthPatch_IPAllowlistSizeGate(t *testing.T) {
 			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
 		}
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: entries,
 		})
 		if rec.Code != http.StatusOK {
@@ -549,7 +549,7 @@ func TestPublicAuthPatch_IPAllowlistSizeGate(t *testing.T) {
 		}
 		entries[16] = entries[0] // dup → 16 unique after dedup
 		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-			Mode:       api.AppPublicAuthModeIPAllowlist,
+			Mode:        api.AppPublicAuthModeIPAllowlist,
 			IPAllowlist: entries,
 		})
 		if rec.Code != http.StatusBadRequest {
@@ -574,7 +574,7 @@ func TestPublicAuthPatch_IPAllowlistSlashZeroRejected(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	app := seedAppForAudit(t, e, "pa-ip-slashzero")
 	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-		Mode:       api.AppPublicAuthModeIPAllowlist,
+		Mode:        api.AppPublicAuthModeIPAllowlist,
 		IPAllowlist: []string{"0.0.0.0/0"},
 	})
 	if rec.Code != http.StatusBadRequest {
@@ -610,7 +610,7 @@ func TestPublicAuthPatch_IPAllowlistClosedEnumFirst(t *testing.T) {
 	e := setup(t, api.PlanFree)
 	app := seedAppForAudit(t, e, "pa-ip-enum")
 	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-		Mode:       "weird_mode",
+		Mode:        "weird_mode",
 		IPAllowlist: []string{"10.0.0.0/8"},
 	})
 	if rec.Code != http.StatusUnprocessableEntity {
@@ -700,7 +700,7 @@ func TestPublicAuthPatch_IPAllowlistEntryCountGatedByMode(t *testing.T) {
 
 	// 1. PATCH ip_allowlist with 5 CIDRs.
 	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
-		Mode:       api.AppPublicAuthModeIPAllowlist,
+		Mode: api.AppPublicAuthModeIPAllowlist,
 		IPAllowlist: []string{
 			"10.0.0.0/8",
 			"192.0.2.0/24",

@@ -1660,7 +1660,7 @@ var planLimits = map[Plan]Limits{
 		// abuse-desk primitive. 16 entries covers a Pro customer's
 		// "1 office VPN + 1 CI runner + 1 partner API + ~10
 		// regional allowlist ranges" reachability graph.
-		PublicAuthIPAllowlistAllowed:   true,
+		PublicAuthIPAllowlistAllowed:    true,
 		PublicAuthIPAllowlistMaxEntries: 16,
 		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
 		// is gated on Pro+ to bound the "scale on CPU without a
@@ -1927,7 +1927,7 @@ var planLimits = map[Plan]Limits{
 		// 4× DeployedApps (25 → 100). SaaS-scale customers with
 		// multi-region deployments routinely enumerate per-region
 		// egress IPs in addition to their office VPN ranges.
-		PublicAuthIPAllowlistAllowed:   true,
+		PublicAuthIPAllowlistAllowed:    true,
 		PublicAuthIPAllowlistMaxEntries: 64,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,

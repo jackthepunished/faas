@@ -333,15 +333,15 @@ func TestBasicCredsFromHeader_Pin(t *testing.T) {
 // applyIngressIPAllowlist gate end-to-end through ServeHTTP. The
 // four cases cover the load-bearing branches:
 //
-//   1. Mode=ip_allowlist + client IP in list → 200 pass-through
-//      (the matched metric emits outcome="match" so the §12
-//      dashboard surfaces the allow side too, not only blocked).
-//   2. Mode=ip_allowlist + client IP NOT in list → 403 with
-//      edge_rule.ingress_ip_blocked audit + outcome=blocked.
-//   3. Mode=ip_allowlist + missing/duplicated XFF → 403 with
-//      edge_rule.ingress_ip_forged audit (defense-in-depth).
-//   4. Mode=ip_allowlist + EMPTY allowlist → 500 operator_error
-//      (not 403, not silent pass-through) — the loud posture.
+//  1. Mode=ip_allowlist + client IP in list → 200 pass-through
+//     (the matched metric emits outcome="match" so the §12
+//     dashboard surfaces the allow side too, not only blocked).
+//  2. Mode=ip_allowlist + client IP NOT in list → 403 with
+//     edge_rule.ingress_ip_blocked audit + outcome=blocked.
+//  3. Mode=ip_allowlist + missing/duplicated XFF → 403 with
+//     edge_rule.ingress_ip_forged audit (defense-in-depth).
+//  4. Mode=ip_allowlist + EMPTY allowlist → 500 operator_error
+//     (not 403, not silent pass-through) — the loud posture.
 //
 // Trust chain is identical to applyEdgeRuleIP:
 // clientIPFromTrustedXFF (single XFF entry). Tests inject the
@@ -424,10 +424,12 @@ func TestPublicAuth_IPAllowlist(t *testing.T) {
 		// requires at least one CIDR" and knows to fix
 		// the row.
 		b.app.PublicAuth.IPAllowlist = nil
-		defer func() { b.app.PublicAuth.IPAllowlist = []netip.Prefix{
-			netip.MustParsePrefix("10.0.0.0/8"),
-			netip.MustParsePrefix("192.0.2.0/24"),
-		} }()
+		defer func() {
+			b.app.PublicAuth.IPAllowlist = []netip.Prefix{
+				netip.MustParsePrefix("10.0.0.0/8"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+			}
+		}()
 		req := publicAuthReqFor(t, "")
 		req.Header.Set("X-Forwarded-For", "10.5.5.5")
 		rec := httptest.NewRecorder()
