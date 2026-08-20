@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -4088,5 +4089,88 @@ func TestPg_ReadActiveInstanceForWakeID_ParkedRowHidden(t *testing.T) {
 	_, err = s.ReadActiveInstanceForWakeID(ctx, wakeID)
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("ReadActiveInstanceForWakeID after park: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestPg_DeploymentAuditRoundtrip (issue #976 / ADR-122 /
+// SAFE-RELEASES-E.2) pins the AppendDeploymentAudit + ListDeploymentAudit
+// pgstore surface. Mirrors TestPg_DeploymentActorRoundtrip's shape
+// (write, read back, assert closed-set CHECK rejects, assert
+// cross-deployment filter is honored).
+func TestPg_DeploymentAuditRoundtrip(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	// Generate a deterministic deployment UUID for this test
+	// (the deployment_audit table has no FK to deployments, so
+	// we don't need a real deployment row).
+	deploymentID := uuid.New()
+	otherDeploymentID := uuid.New()
+
+	// 1. Full payload — deploy.created with all fields populated.
+	id1, err := s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: deploymentID,
+		Kind:         state.DeployCreated,
+		Actor:        "apid:dashboard",
+		Data:         json.RawMessage(`{"ref":"sha256:abc","supersedes":""}`),
+	})
+	if err != nil {
+		t.Fatalf("AppendDeploymentAudit: %v", err)
+	}
+	if id1 == 0 {
+		t.Errorf("AppendDeploymentAudit id = 0, want non-zero (Postgres IDENTITY returns)")
+	}
+
+	// 2. Read back via ListDeploymentAudit — exactly one row for
+	// this deployment_id.
+	rows, err := s.ListDeploymentAudit(ctx, deploymentID.String(), 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentAudit: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListDeploymentAudit len = %d, want 1", len(rows))
+	}
+	if rows[0].Kind != state.DeployCreated {
+		t.Errorf("rows[0].Kind = %q, want %q", rows[0].Kind, state.DeployCreated)
+	}
+	if rows[0].Actor != "apid:dashboard" {
+		t.Errorf("rows[0].Actor = %q, want %q", rows[0].Actor, "apid:dashboard")
+	}
+	if rows[0].DeploymentID != deploymentID {
+		t.Errorf("rows[0].DeploymentID = %v, want %v", rows[0].DeploymentID, deploymentID)
+	}
+	if string(rows[0].Data) != `{"ref":"sha256:abc","supersedes":""}` {
+		t.Errorf("rows[0].Data = %q, want verbatim payload", rows[0].Data)
+	}
+
+	// 3. Cross-deployment filter — write a row for a different
+	// deployment_id and assert ListDeploymentAudit does NOT
+	// bleed it in.
+	if _, err := s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: otherDeploymentID,
+		Kind:         state.DeploySourceRef,
+		Actor:        "apid:cli",
+		Data:         json.RawMessage(`{"ref":"refs/heads/main"}`),
+	}); err != nil {
+		t.Fatalf("AppendDeploymentAudit (other): %v", err)
+	}
+	rowsScoped, err := s.ListDeploymentAudit(ctx, deploymentID.String(), 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentAudit (scoped): %v", err)
+	}
+	if len(rowsScoped) != 1 {
+		t.Errorf("ListDeploymentAudit (scoped) len = %d, want 1 (other-deployment row must NOT bleed in)", len(rowsScoped))
+	}
+
+	// 4. Closed-set kind CHECK rejection. Drive the violation
+	// directly through the store to confirm the constraint is
+	// wired (the apid handler is expected to mirror the
+	// vocabulary, but the constraint is the source of truth).
+	_, err = s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: deploymentID,
+		Kind:         "rogue_audit_kind",
+		Actor:        "apid",
+	})
+	if err == nil {
+		t.Errorf("expected CHECK violation on rogue_audit_kind, got nil")
 	}
 }
