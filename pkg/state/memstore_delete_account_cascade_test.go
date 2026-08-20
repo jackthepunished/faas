@@ -328,3 +328,65 @@ func TestMem_RestoreAccount_OnActiveRowReturnsErrConflict(t *testing.T) {
 // production CreateAccount/CreateApp paths to mint ids internally.
 // If a future cascade test needs explicit uuids, add `github.com/google/uuid`
 // back at the top of this file.)
+
+// TestMem_DeleteAccount_CascadesConsumerKeys (ADR-120 / issue #975
+// item #5) confirms that DeleteAccount removes every consumer_keys
+// row owned by the account. Mirrors the pgstore FK CASCADE — the
+// GDPR hard-delete path (§17 G2 lean) requires that the consumer-
+// key surface is purged alongside the parent account. Without this
+// pin, a regression in memstore.go's DeleteAccount cascade leaves
+// orphan consumer keys the pg path would have cleaned up — every
+// pgtest.Open + GDPR scenario would diverge between the two
+// stores.
+func TestMem_DeleteAccount_CascadesConsumerKeys(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acctID := seedMemStoreFullAccount(t, m)
+	appID := m.apps[firstKey(m.apps)].ID
+
+	// Mint three consumer keys under this account + app.
+	for i := 0; i < 3; i++ {
+		_, prefix, hash, err := api.GenerateConsumerKey()
+		if err != nil {
+			t.Fatalf("GenerateConsumerKey[%d]: %v", i, err)
+		}
+		if _, err := m.CreateConsumerKey(ctx, acctID, appID, "ck-cascade-"+fmt.Sprintf("%d", i), prefix, hash, []string{"read"}, nil); err != nil {
+			t.Fatalf("CreateConsumerKey[%d]: %v", i, err)
+		}
+	}
+
+	// Sanity: three rows present.
+	if got := len(m.consumerKeys); got != 3 {
+		t.Fatalf("pre-delete consumerKeys = %d, want 3 (seed failed)", got)
+	}
+
+	// Drive the account into deleted_pending, then DeleteAccount.
+	if err := m.MarkAccountDeletionPending(ctx, acctID); err != nil {
+		t.Fatalf("MarkAccountDeletionPending: %v", err)
+	}
+	if err := m.DeleteAccount(ctx, acctID); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+
+	// Every consumer key must be gone.
+	if got := len(m.consumerKeys); got != 0 {
+		t.Errorf("post-delete consumerKeys = %d, want 0 (GDPR hard-delete must purge consumer_keys — mirrors the FK CASCADE)", got)
+	}
+
+	// The apps must also be gone (sanity — the cascade order is
+	// apps → consumer_keys in the FK contract; the memstore loop
+	// runs consumer_keys first then apps).
+	if got := len(m.apps); got != 0 {
+		t.Errorf("post-delete apps = %d, want 0 (the cascade must drop child apps)", got)
+	}
+}
+
+// firstKey returns any key from a map[string]V. Used to find the
+// sole seeded app from seedMemStoreFullAccount (which seeds exactly
+// one app). Mirrors the helper in pgstore_account_deletion_test.go.
+func firstKey[V any](m map[string]V) string {
+	for k := range m {
+		return k
+	}
+	return ""
+}

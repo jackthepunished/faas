@@ -9192,15 +9192,15 @@ components:
           example: 60
 
     PublicAuthBlock:
-      description: "Per-app public-URL auth write shape (issue #477 / ADR-077). Sent on PATCH /v1/apps/{slug}; apid seals the basic_user + basic_pass into a single APP_BASIC_AUTH secretbox blob before persistence. The plaintext is never echoed on read (see PublicAuthStatus)."
+      description: "Per-app public-URL auth write shape (issue #477 / ADR-077 + ADR-118). Sent on PATCH /v1/apps/{slug}; apid seals the basic_user + basic_pass into a single APP_BASIC_AUTH secretbox blob before persistence. The plaintext is never echoed on read (see PublicAuthStatus). For mode='ip_allowlist' (ADR-118), ip_allowlist carries the per-app CIDR allowlist (Pro 16 max, Scale 64 max — Free/Hobby → 403 plan_public_auth_ip_allowlist_not_allowed)."
       type: object
       additionalProperties: false
       required: [mode]
       properties:
         mode:
-          description: "Auth mode (closed set). 'open' is the pre-#477 default (every request passes). 'bearer' requires Authorization: Bearer (Hobby+; 402 on Free). 'basic' requires HTTP Basic auth with sealed credentials (Pro+; 402 on Free/Hobby). Unknown values → 422 invalid_public_auth_mode."
+          description: "Auth mode (closed set). 'open' is the pre-#477 default (every request passes). 'bearer' requires Authorization: Bearer (Hobby+; 402 on Free). 'basic' requires HTTP Basic auth with sealed credentials (Pro+; 402 on Free/Hobby). 'ip_allowlist' (ADR-118) restricts the app to requests originating from a client IP inside the per-app CIDR allowlist (Pro+; 402 on Free/Hobby). Unknown values → 422 invalid_public_auth_mode."
           type: string
-          enum: [open, bearer, basic]
+          enum: [open, bearer, basic, ip_allowlist]
           example: basic
         basic_user:
           description: "Basic-auth username (RFC 7617 §2). Plaintext at PATCH time; sealed into apps.public_auth_basic under the APP_BASIC_AUTH secretbox namespace. Required when mode='basic'; ignored otherwise. Range [1, 128] bytes after TrimSpace."
@@ -9215,21 +9215,35 @@ components:
           minLength: 1
           maxLength: 256
           example: hunter2
+        ip_allowlist:
+          description: "ADR-118: per-app ingress CIDR allowlist. Required when mode='ip_allowlist' (must be non-empty). Each entry is an RFC 4632 CIDR (e.g. '10.0.0.0/8' or '2001:db8::/32'); masklen /0 is rejected at the wire and by the apps_public_auth_ip_allowlist_cidr trigger. v4-mapped-v6 prefixes are rejected at the handler. After canonicalisation, the cap is plan.PublicAuthIPAllowlistMaxEntries (Pro 16, Scale 64). On the audit row, only the entry count is recorded — never the CIDR strings."
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^([0-9a-fA-F:]+|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/[0-9]+$'
+          example: ["10.0.0.0/8", "2001:db8::/32"]
 
     PublicAuthStatus:
-      description: "Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision 're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."
+      description: "Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077 + ADR-118). Mirrors the row contents without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision 're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."
       type: object
       required: [mode, has_basic_creds]
       properties:
         mode:
-          description: "Active auth mode. One of 'open', 'bearer', 'basic'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request."
+          description: "Active auth mode. One of 'open', 'bearer', 'basic', 'ip_allowlist'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request."
           type: string
-          enum: [open, bearer, basic]
+          enum: [open, bearer, basic, ip_allowlist]
           example: basic
         has_basic_creds:
           description: "True iff the row carries a non-null apps.public_auth_basic blob (i.e. mode='basic' with credentials). A mode='basic' row without creds would 401 every request — has_basic_creds is the operator-greppable signal that the seal succeeded."
           type: boolean
           example: true
+        ip_allowlist_entry_count:
+          description: "ADR-118: integer count of CIDRs in apps.public_auth_ip_allowlist. Returned (not the CIDR strings themselves) so the dashboard can show 'app X has 3 CIDRs configured' without leaking the partner-customer ranges. Always 0 when mode != 'ip_allowlist'."
+          type: integer
+          minimum: 0
+          maximum: 64
+          example: 3
 
     ScalingTarget:
       description: "(metric, value) pair the engine watches for the scale-up trigger. The metric surface is closed; the unset state (null) is the legacy 'engine falls back to autoscale_target_rps' path."

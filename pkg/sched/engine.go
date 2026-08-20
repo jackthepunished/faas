@@ -5103,6 +5103,212 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	return nil
 }
 
+// DestroyForWorkloadOOMFailure (Cluster C / ADR-121) is the
+// workload-OOM-triggered destroy path. The producer chain is:
+//
+//	guest/init/cgroup_partition_linux.go::WatchOOM
+//	  (cgroup.events oom_kill delta on the per-VM cgroup v2 leaf)
+//	  → guest/init/framework_ready_emit.go::EmitWorkloadOOM
+//	    (vsock DGRAM type 0x05 on port 1027)
+//	  → cmd/vmmd/framework_ready_recv.go::dispatchWorkloadOOM
+//	  → pkg/fcvm/manager.go::ReportWorkloadOOM
+//	  → cmd/vmmd main → scheddgrpc::Server.ReportWorkloadOOM
+//	  → here
+//
+// Distinct from DestroyForLivenessFailure:
+//   - The workload is dead by the time the signal arrives (the
+//     kernel killed it; the guest-init process is still alive
+//     enough to emit the DGRAM, but the customer's process is not).
+//   - The observed payload (peakMB, planMB) is carried through;
+//     the whycopy Observed closure templates it into the
+//     deployment row's stored Hint/Why/Fix.
+//   - The audit kind is "workload_oom_failed" (the new
+//     events.WorkloadOOMFailed), not "liveness_failed".
+//   - No liveness-window sliding check (the workload OOM is a
+//     distinctive failure mode — a customer hitting the RAM cap
+//     doesn't necessarily mean the app is misconfigured; they may
+//     just need to upgrade plan).
+//
+// The state-machine lock + re-read shape, snapshot-stale + touch
+// + transition + counter increment are mirrored from
+// DestroyForLivenessFailure because the failure-detection surface
+// is the same (a vmmd-initiated destroy event), only the trigger
+// and the stamping differ.
+//
+// Best-effort: a failure at any step is logged + dropped because
+// the workload is already dead; the destroy + transition is the
+// source of truth, the stamp is the customer-facing UX.
+func (e *Engine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID string, peakMB, planMB int) error {
+	// Two reads: a fresh InstanceByID for the app_id +
+	// deployment_id, then a re-read under the lock to confirm
+	// state hasn't moved.
+	//
+	// Review finding #4: the original shape returned nil on
+	// any InstanceByID error so the gRPC handler's
+	// `errors.Is(err, state.ErrNotFound)` mapping was
+	// unreachable — the handler always saw nil and replied
+	// Ok=true. The fix returns the read error so the handler
+	// can map NotFound → codes.NotFound and Internal →
+	// codes.Internal. DestroyForLivenessFailure uses the
+	// nil-return shape because the liveness poll goroutine
+	// is a retry loop (silent no-op is desired); the
+	// workload-OOM path is a single-shot RPC, so a
+	// NotFound is operationally distinct from a healthy
+	// idempotent no-op (the caller should know the
+	// instance row is gone).
+	fresh, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		// Pass the typed error through with operation context
+		// (pkg/api/errors.go convention: %w + op string). The
+		// gRPC handler at scheddgrpc/server.go::ReportWorkloadOOM
+		// maps state.ErrNotFound → codes.NotFound and any other
+		// error → codes.Internal.
+		return fmt.Errorf("DestroyForWorkloadOOMFailure: initial read instance %s: %w", instanceID, err)
+	}
+	appID := fresh.AppID
+	deploymentID := fresh.DeploymentID
+
+	// Acquire the app lock so a parallel Wake / Park for the
+	// same app observes a consistent state. Mirrors the comment
+	// on DestroyForLivenessFailure.
+	release := e.lockApp(appID)
+	defer release()
+
+	// Re-read under the lock for the state-machine check.
+	freshLocked, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		return fmt.Errorf("DestroyForWorkloadOOMFailure: locked read instance %s: %w", instanceID, err)
+	}
+	if state.State(freshLocked.State) != state.StateRunning {
+		// Race: a Park / Wake / prior watchdog already moved
+		// the row. Mirror the liveness path — release the
+		// reservation in case it leaked, but don't second-guess
+		// the state machine. Return nil so the handler replies
+		// Ok=true (the idempotent no-op the wire contract
+		// promises).
+		e.ledger.Release(instanceID)
+		return nil
+	}
+
+	// Eagerly mark the deployment's latest snapshot stale so the
+	// next Wake cold-boots. ADR-005 invariant — a workload that
+	// OOM'd at the plan cap may have a snap that encoded the
+	// same blast radius; the next cold boot is a fresh chance.
+	// Both warm + init tiers are flipped (mirrors the liveness
+	// path).
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deploymentID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if err := e.store.MarkSnapshotStale(ctx, snap.ID); err != nil {
+			e.log.Warn("workload_oom: mark snapshot stale", "instance", instanceID, "snap_id", snap.ID, "tier", tier, "err", err)
+		}
+	}
+
+	// Reset the idle timer on the destroyed instance so the
+	// replacement cold-boot instance's idle budget starts fresh.
+	now := time.Now().UTC()
+	if _, terr := e.store.TouchInstancesLastSeen(ctx, []state.InstanceTouch{
+		{InstanceID: instanceID, LastRequest: now},
+	}); terr != nil {
+		e.log.Warn("workload_oom: touch instances last seen", "instance", instanceID, "err", terr)
+	}
+
+	// Free the ledger reservation before the destroy so a
+	// parallel Wake for the same app can admit a new instance
+	// immediately. Mirrors the liveness path's ordering.
+	e.ledger.Release(instanceID)
+
+	// Best-effort destroy with the 5s ceiling. A wedged
+	// Firecracker cannot pin the goroutine past the deadline.
+	if err := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second); err != nil {
+		e.log.Warn("workload_oom: destroy failed (best-effort)", "instance", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
+	}
+
+	// Audit row (Cluster C / ADR-121). The audit kind is
+	// `instances.workload_oom_failed` so the customer's
+	// `GET /v1/audit-events?kind_prefix=instances.workload_*`
+	// filter surfaces it; the data JSON carries the observed
+	// (peak_mb, plan_mb) payload for the operator dashboard.
+	//
+	// Review finding #7: the previous shape emitted TWO
+	// audit rows per OOM — this typed event AND the
+	// transitionWithKind call below (which also writes
+	// to audit_events via AppendEvent). The scheduler-side
+	// dashboard panel subscribes to the typed event for
+	// the rich payload (peak_mb, plan_mb); the customer's
+	// `gregale audit` view was double-counting. The fix
+	// keeps the typed event (it carries the rich payload) and
+	// drops the transitionWithKind call in favor of the
+	// direct state-write + SSE notify path. The state
+	// transition is unchanged (RUNNING → STOPPED) but the
+	// audit row is now exactly one.
+	if e.events != nil {
+		e.events.Emit(ctx, events.WorkloadOOMFailed{
+			EmitAt:       now,
+			InstanceID:   instanceID,
+			AppID:        appID,
+			DeploymentID: deploymentID,
+			PeakMB:       peakMB,
+			PlanMB:       planMB,
+		})
+	}
+
+	// RUNNING → STOPPED — state transition without a
+	// second audit row. UpdateInstanceStateToTerminal
+	// stamps terminal_at on the same UPDATE so the §17
+	// retention sweep has a correct age anchor (see the
+	// comment on transitionWithKind at engine.go:5393-5398
+	// for the terminal-state column rationale). The SSE
+	// notification goes through emitInstanceChanged so
+	// subscribers see the column flip on the dashboard.
+	if err := e.store.UpdateInstanceStateToTerminal(ctx, instanceID, string(state.StateStopped), now); err != nil {
+		e.log.Warn("workload_oom: write terminal state",
+			"instance", instanceID, "err", err)
+	}
+	e.emitInstanceChanged(ctx, instanceID, appID, state.StateStopped, "") // wake_id already on the row; the direct-write path doesn't re-load it.
+
+	// Counter emission. Cardinality bounds match LivenessRestarts.
+	// Empty tuples are collapsed to "unknown" inside the metrics
+	// accessor.
+	if e.ops != nil {
+		e.ops.WorkloadOOMKills(appID, deploymentID).Inc()
+	}
+
+	// Error-explanations cluster (spec §6.4 amendment 2,
+	// Cluster C / ADR-121): stamp the deployment as failed with
+	// CodeAppRuntimeOOM + the whycopy Observed payload (peakMB
+	// + planMB). The customer-facing surface is unified with the
+	// rest of the cluster: `gregale inspect <slug> --errors` +
+	// the dashboard's `.error-explanation` section + the
+	// catalogue's Hint/Why/Fix pick up the same prose.
+	//
+	// Unconditional (no reason-gating like the liveness path) —
+	// every workload OOM gets the stamp because the cluster code
+	// is dedicated to this failure mode.
+	if deploymentID != "" {
+		problem := &api.Problem{
+			Code:   api.CodeAppRuntimeOOM,
+			Status: 422,
+			Title:  "Container out of memory",
+		}
+		_ = whycopy.Decorate(problem, api.CodeAppRuntimeOOM,
+			struct{ PeakMB, PlanMB int }{PeakMB: peakMB, PlanMB: planMB})
+		if _, terr := e.store.SetDeploymentFailedEx(ctx,
+			deploymentID,
+			api.CodeAppRuntimeOOM,
+			fmt.Sprintf("cgroup OOM-kill fired at %d MB (plan cap %d MB)", peakMB, planMB),
+			problem.Hint, problem.Why, problem.Fix, nil); terr != nil {
+			e.log.Warn("workload_oom: stamp deployment failed",
+				"instance", instanceID, "deployment_id", deploymentID, "err", terr)
+		}
+	}
+	return nil
+}
+
 // ParkDeployment is the liveness-window-exhausted stop path
 // (issue #554 / ADR-078). It flips the parent app's status to
 // `evicted_cold` (the only non-active, non-deleted app.status

@@ -577,10 +577,39 @@ type Limits struct {
 	// size). Enforced at the apid write boundary.
 	CorsPresetMaxAllowMethods int
 	// CorsPresetMaxNameLength pins the upper bound on
-	// cors_presets.name (the migration's CHECK pins it to
-	// 64). Surfaced here so the apid writer can reject
-	// before INSERT. Same value across plans.
+	// cors_presets.name (the migration's CHECK in 00304
+	// pins it to 64). Surfaced here so the apid writer
+	// can reject before INSERT. Same value across plans.
+	// NOT the consumer_keys name cap — that lives on
+	// ConsumerKeysPerApp's creator-side apid validator.
 	CorsPresetMaxNameLength int
+
+	// ConsumerKeysPerApp caps how many consumer_keys rows
+	// (ADR-120 / issue #975 item #5) one app may own. The cap
+	// defends against a customer pinning one consumer key per
+	// customer-of-customer and inflating the gateway-side
+	// (app_id, prefix) hot-path lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is 0 because the
+	// abuse-floor tier cannot host multi-tenant consumer surfaces (the
+	// apid CreateConsumerKey handler returns 402 CodeConsumerKeysNotAllowed
+	// before the store is touched). Free switch to 0 mirrors the
+	// CronLimitPerApp/OrgMembersMax 0/0 posture. Same 100-per-app floor
+	// across the lower three tiers because the cardinality
+	// budget per app is a tenant-stability concern, not a
+	// tier-upgrade lever — the per-account cap scales with
+	// the upgrade ladder. apid-Validate throws
+	// CodePlanConsumerKeyQuotaReached when this trips (PR #5-B
+	// wires the writer).
+	ConsumerKeysPerApp int
+	// ConsumerKeysPerAccount caps how many consumer_keys rows
+	// one account may own in total across all its apps.
+	// Independent of ConsumerKeysPerApp so a customer with N
+	// apps under one account can split the per-account cap.
+	// Per-plan: Free 0, Hobby 250, Pro 2500, Scale 25000. Free is 0 — same
+	// abuse-floor gating as ConsumerKeysPerApp; the per-account ceiling is
+	// reached before the per-app ceiling on a typical multi-app Free
+	// customer, but Free is gated off entirely so neither trips.
+	// Same per-app floor + 25× scale ceiling.
+	ConsumerKeysPerAccount int
 
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
@@ -769,6 +798,23 @@ type Limits struct {
 	// Bumping to N later is a per-plan int change with no schema
 	// impact. 0 with Allowed=false (Free/Hobby/Pro).
 	StaticEgressIPsPerApp int
+
+	// PublicAuthIPAllowlistAllowed toggles the per-app ingress IP
+	// allowlist (ADR-118; extends ADR-079's reserved 'ip_allowlist'
+	// enum value). Pro/Scale only — Free/Hobby use edge rules
+	// (kind='ip') for the abuse-floor posture; the per-app
+	// allowlist is the Pro+ feature for SaaS-scale ingress
+	// hygiene, where every CIDR is a deliberate policy decision.
+	// apid's updateApp handler rejects a PATCH with 403
+	// plan_public_auth_ip_allowlist_not_allowed when this is false.
+	PublicAuthIPAllowlistAllowed bool
+	// PublicAuthIPAllowlistMaxEntries is the per-app CIDR-entry
+	// cap. 0 with Allowed=false (Free/Hobby); non-zero with
+	// Allowed=true (Pro: 16; Scale: 64 — mirrors
+	// EgressAllowlistMaxSize exactly). apid's updateApp rejects
+	// with 400 public_auth_ip_allowlist_too_long when the PATCH
+	// body has more entries.
+	PublicAuthIPAllowlistMaxEntries int
 
 	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
 	// default for the per-app two-tier snapshot flag. Free/Hobby =
@@ -1171,6 +1217,15 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      0,
 		CorsPresetMaxAllowMethods: 0,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Free
+		// gets the 100/app floor — every plan does. The
+		// per-account ceiling stays low (250) so an abuse-tier
+		// customer can't pin one consumer key per customer-of-
+		// customer indefinitely. PR-A ships the limits; PR-B
+		// wires the writer.
+		// Free is gated to 0 consumer keys — mirrors CronLimitPerApp/OrgMembersMax 0/0 posture.
+		ConsumerKeysPerApp:     0,
+		ConsumerKeysPerAccount: 0,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1452,6 +1507,12 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      25,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Hobby
+		// keeps the 100/app floor; per-account cap stays at 250
+		// (same as Free — Hobby is the entry paid tier, not a
+		// big-leap on this primitive).
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 250,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1661,6 +1722,13 @@ var planLimits = map[Plan]Limits{
 		// (false/0) apply; no explicit assignment needed. The
 		// accessor `Plan.StaticEgressIPAllowed()` fail-closes on
 		// PlanPro, returning false.
+
+		// PublicAuthIPAllowlist: same shape as egress — paid-only
+		// abuse-desk primitive. 16 entries covers a Pro customer's
+		// "1 office VPN + 1 CI runner + 1 partner API + ~10
+		// regional allowlist ranges" reachability graph.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 16,
 		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
 		// is gated on Pro+ to bound the "scale on CPU without a
 		// min_instances floor" cost shape.
@@ -1726,6 +1794,12 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      100,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Pro
+		// keeps the 100/app floor; per-account cap steps up to
+		// 2500 — a typical SaaS customer with ~25 apps × 100
+		// keys each fits comfortably with headroom.
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 2500,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -1930,6 +2004,13 @@ var planLimits = map[Plan]Limits{
 		// no schema impact. IPv4-only in v1.
 		StaticEgressIPAllowed: true,
 		StaticEgressIPsPerApp: 1,
+
+		// PublicAuthIPAllowlist: 4× Pro's budget tracks Scale's
+		// 4× DeployedApps (25 → 100). SaaS-scale customers with
+		// multi-region deployments routinely enumerate per-region
+		// egress IPs in addition to their office VPN ranges.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 64,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,
 		// Cron: Scale gets 100 per-app and 500 per-account. 5× Pro's
@@ -1995,6 +2076,14 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      500,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Scale
+		// gets the only per-app step-up — 1000 keys per app,
+		// 25000 per account. The per-app step-up mirrors the
+		// EdgeRulesPerApp 100-ceiling for Scale — both
+		// primitives are about "per-customer-of-customer"
+		// cardinality, so the upgrade ladder is one number.
+		ConsumerKeysPerApp:     1000,
+		ConsumerKeysPerAccount: 25000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -2261,6 +2350,31 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// Apid http.Server defaults (issue #995 Phase 1, ADR-121
+	// companion). The customer-facing control plane binds loopback
+	// (gatewayd-public reverse-proxies in front) so the same
+	// shape gatewayd-internal uses (ResponseWriteTimeoutDefault =
+	// 300s) carries over. ReadHeaderTimeout lives separately
+	// (already 10s in cmd/apid/main.go) — slowloris defence is
+	// split between ReadHeaderTimeout (header arrival) and
+	// ReadTimeout (body arrival). IdleTimeout bounds the
+	// keep-alive pool so a half-open client can't park a goroutine.
+	// Values are int seconds to match ResponseWriteTimeoutDefault's
+	// existing precedent at line 2201 — no `time` import added.
+	APIDReadTimeoutSecondsDefault  = 60  // slowloris defence (body arrival)
+	APIDWriteTimeoutSecondsDefault = 300 // matches gatewayd-internal
+	APIDIdleTimeoutSecondsDefault  = 120 // keep-alive cap
+
+	// Gatewayd-internal defaults (issue #995 Phase 3, ADR-121
+	// companion). The public listener carries 60 s ReadTimeout
+	// (matches the legacy default set at run.go:1989-1991), with
+	// tighter caps on the control / unix-socket listener where
+	// requests are smaller and shorter-lived.
+	GatewaydInternalReadTimeoutSecondsDefault         = 60 // public listener slowloris defence
+	GatewaydInternalControlReadTimeoutSecondsDefault  = 30 // control + unix-socket
+	GatewaydInternalControlWriteTimeoutSecondsDefault = 30 // control + unix-socket
+	GatewaydInternalControlIdleTimeoutSecondsDefault  = 60 // control + unix-socket keep-alive
+
 	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
 	// streaming carve-out) is the upper bound on the optional
 	// `max_body_bytes_streaming` field of a kind=limit edge rule.
@@ -2371,6 +2485,15 @@ const (
 	// plan; 0 in those fields falls back to the *Default constants
 	// below so a missing plan row fails closed to the spec baseline
 	// rather than inheriting a paid tier's relaxed cap.
+	//
+	// Enforced at two sites (issue #995 / ADR-121):
+	//   - pkg/gateway/handler.go::setupStreamingWriter (streaming path)
+	//     — 413 streaming_not_available on over-cap.
+	//   - pkg/gateway/handler.go::setupBufferedCapWriter (buffered path)
+	//     — 413 response_too_large on over-cap (or hardened connection
+	//     reset if the upstream's headers already reached the wire).
+	// Inbound body caps are enforced by http.MaxBytesReader at the
+	// ServeHTTP entry (separate from the response cap).
 	MaxResponseBodyBytesDefault   int64 = 25 * 1024 * 1024 // 25 MB (spec §4.1)
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
@@ -3336,6 +3459,38 @@ func (p Plan) StaticEgressIPsPerApp() int {
 	return l.StaticEgressIPsPerApp
 }
 
+// PublicAuthIPAllowlistAllowed reports whether the plan may set a
+// per-app ingress IP allowlist (ADR-118). Pro/Scale only — Free/Hobby
+// use edge rules (kind='ip') for the abuse-floor posture. apid's
+// updateApp handler gates `req.PublicAuthIPAllowlist` on the bool;
+// the handler returns 403 CodePlanPublicAuthIPAllowlistNotAllowed.
+// Unknown plans fail closed (return false) so a missing row never
+// silently unlocks a premium feature — same contract as
+// EgressAllowlistAllowed above.
+func (p Plan) PublicAuthIPAllowlistAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.PublicAuthIPAllowlistAllowed
+}
+
+// PublicAuthIPAllowlistMaxEntries returns the per-plan CIDR-entry
+// cap for the ingress IP allowlist (ADR-118). 0 for Free/Hobby
+// (the gate above rejects before this matters); 16 for Pro; 64
+// for Scale. apid rejects a PATCH whose
+// `req.PublicAuthIPAllowlist` has more entries with 400
+// public_auth_ip_allowlist_too_long. Returning 0 on unknown plans
+// makes a missing plan row a fail-closed denial, not a silent
+// default — same contract as EgressAllowlistMaxSize above.
+func (p Plan) PublicAuthIPAllowlistMaxEntries() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.PublicAuthIPAllowlistMaxEntries
+}
+
 // LivenessAllowed (issue #554 / ADR-078) reports whether the plan
 // may opt-in to per-deployment liveness probes. Free stays off —
 // the §13 M7 free-stop budget already handles abuse-floor paths,
@@ -3930,6 +4085,39 @@ func (p Plan) CorsPresetMaxNameLength() int {
 		return 0
 	}
 	return l.CorsPresetMaxNameLength
+}
+
+// ConsumerKeysPerApp (ADR-120 / issue #975 item #5) returns the
+// per-app cap on consumer_keys rows. The cap defends against a
+// customer pinning one consumer key per customer-of-customer
+// and inflating the gateway-side (app_id, prefix) hot-path
+// lookup. Per-plan: Free 0, Hobby 100, Pro 100, Scale 1000. Free is gated off
+// entirely (CodeConsumerKeysNotAllowed).
+// Same 100-per-app floor across the lower three tiers — the
+// cardinality budget per app is a tenant-stability concern,
+// not a tier-upgrade lever. Unknown plans fail closed (return
+// 0) so a missing plan row never silently unlocks the
+// primitive.
+func (p Plan) ConsumerKeysPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerApp
+}
+
+// ConsumerKeysPerAccount (ADR-120 / issue #975 item #5) returns
+// the per-account cap on consumer_keys rows across all of the
+// account's apps. Independent of ConsumerKeysPerApp so a
+// customer with N apps under one account can split the
+// per-account budget. Per-plan: Free 0, Hobby 250, Pro 2500,
+// Scale 25000. Same fail-closed contract as ConsumerKeysPerApp.
+func (p Plan) ConsumerKeysPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerAccount
 }
 
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan

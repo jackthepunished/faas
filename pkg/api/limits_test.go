@@ -126,7 +126,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #562: Free has no archive surface.
 			LogArchiveEnabled: false, LogArchiveRetentionDaysMax: 0,
 			// ADR-096: Free = 1 day retention, 50 fingerprints, 25 request rows.
-			AppErrorsRetentionDays: 1, AppErrorsMaxFingerprintsPerApp: 50, AppErrorsMaxRequestRowsPerFingerprint: 25},
+			AppErrorsRetentionDays: 1, AppErrorsMaxFingerprintsPerApp: 50, AppErrorsMaxRequestRowsPerFingerprint: 25,
+			// ADR-120 / issue #975 item #5: consumer keys — Free gated
+			// to 0 (the abuse-floor tier cannot host multi-tenant
+			// consumer surfaces — mirrors CronLimitPerApp/OrgMembersMax
+			// 0/0 posture). Handler returns 402 CodeConsumerKeysNotAllowed.
+			ConsumerKeysPerApp: 0, ConsumerKeysPerAccount: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -253,7 +258,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #562: Hobby unlocks log archive with 7-day retention.
 			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 7,
 			// ADR-096: Hobby = 7 days, 200 fingerprints, 100 request rows.
-			AppErrorsRetentionDays: 7, AppErrorsMaxFingerprintsPerApp: 200, AppErrorsMaxRequestRowsPerFingerprint: 100},
+			AppErrorsRetentionDays: 7, AppErrorsMaxFingerprintsPerApp: 200, AppErrorsMaxRequestRowsPerFingerprint: 100,
+			// ADR-120 / issue #975 item #5: consumer keys — Hobby gets
+			// 100 per app and 250 per account. Same per-app budget as
+			// Pro (the Hobby customer shape — small SaaS / hobbyist —
+			// is the same one-app-many-keys demand that Pro addresses
+			// at higher concurrency). Account ceiling is the abuse
+			// floor; Hobby's typical 5-app footprint stays well under.
+			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 250},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -275,6 +287,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the "permanently bad payload" worker cost.
 			MaxQueueAttempts:       10,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
+			// Issue #477 / ADR-118: Pro unlocks the per-app ingress
+			// IP allowlist. Same 16-entry cap as the egress
+			// allowlist — symmetric abuse-desk primitives.
+			PublicAuthIPAllowlistAllowed: true, PublicAuthIPAllowlistMaxEntries: 16,
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
@@ -370,7 +386,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #562: Pro extends retention to 30 days.
 			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 30,
 			// ADR-096: Pro = 30 days, 1000 fingerprints, 500 request rows.
-			AppErrorsRetentionDays: 30, AppErrorsMaxFingerprintsPerApp: 1000, AppErrorsMaxRequestRowsPerFingerprint: 500},
+			AppErrorsRetentionDays: 30, AppErrorsMaxFingerprintsPerApp: 1000, AppErrorsMaxRequestRowsPerFingerprint: 500,
+			// ADR-120 / issue #975 item #5: consumer keys — Pro gets
+			// 100 per app and 2500 per account. 25 apps × 100 = 2500
+			// (the per-app ceiling × DeployedApps fits inside the per-
+			// account envelope, so neither side trips first on the
+			// typical Pro customer).
+			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 2500},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, CertExpiryWarningDays: 30, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -397,6 +419,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
 			// ADR-119: Scale unlocks static egress IP (per-app quota=1).
 			StaticEgressIPAllowed: true, StaticEgressIPsPerApp: 1,
+			// Issue #477 / ADR-118: Scale gets a 64-entry cap, 4× Pro
+			// (same ladder as EgressAllowlistMaxSize; SaaS-scale
+			// customers with multi-region deployments enumerate more
+			// per-region ranges than a Pro-tier app).
+			PublicAuthIPAllowlistAllowed: true, PublicAuthIPAllowlistMaxEntries: 64,
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
@@ -493,7 +520,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #562: Scale extends retention to 90 days.
 			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 90,
 			// ADR-096: Scale = 90 days, 5000 fingerprints, 1000 request rows.
-			AppErrorsRetentionDays: 90, AppErrorsMaxFingerprintsPerApp: 5000, AppErrorsMaxRequestRowsPerFingerprint: 1000},
+			AppErrorsRetentionDays: 90, AppErrorsMaxFingerprintsPerApp: 5000, AppErrorsMaxRequestRowsPerFingerprint: 1000,
+			// ADR-120 / issue #975 item #5: consumer keys — Scale gets
+			// 1000 per app and 25000 per account. 100 apps × 1000 =
+			// 100000 if every app maxes out; the 25000-account ceiling
+			// is the abuse-floor — the typical Scale customer
+			// (multi-tenant SaaS broker) uses 25-30% of the budget per
+			// app, well under 100/app and 25000/acct envelopes.
+			ConsumerKeysPerApp: 1000, ConsumerKeysPerAccount: 25000},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -1059,6 +1093,61 @@ func TestPlanStaticEgressIPsPerApp(t *testing.T) {
 		if got := c.plan.StaticEgressIPsPerApp(); got != c.want {
 			t.Errorf("%s.StaticEgressIPsPerApp() = %d, want %d", c.plan, got, c.want)
 		}
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistAllowed pins the per-plan gate that
+// apid's updateApp handler uses for the per-app ingress IP allowlist
+// (ADR-118). Same shape as TestPlanEgressAllowlistAllowed: Free/Hobby
+// → false (no allowlist — abuse-desk hygiene is a Pro+ concern); Pro/Scale
+// → true. Unknown plans must default to false (fail-closed).
+func TestPlanPublicAuthIPAllowlistAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthIPAllowlistAllowed(); got != c.want {
+			t.Errorf("%s.PublicAuthIPAllowlistAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistMaxEntries pins the per-plan CIDR cap
+// (ADR-118). Same shape as TestPlanEgressAllowlistMaxSize: Free/Hobby →
+// 0; Pro → 16; Scale → 64. Unknown plans default to 0 (fail-closed).
+func TestPlanPublicAuthIPAllowlistMaxEntries(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 0},
+		{PlanPro, 16},
+		{PlanScale, 64},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthIPAllowlistMaxEntries(); got != c.want {
+			t.Errorf("%s.PublicAuthIPAllowlistMaxEntries() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistMonotonic pins the Pro→Scale ordering
+// (ADR-118). Pro MaxEntries must be ≤ Scale MaxEntries because Scale
+// is the bigger tier.
+func TestPlanPublicAuthIPAllowlistMonotonic(t *testing.T) {
+	pro := MustLimitsFor(PlanPro).PublicAuthIPAllowlistMaxEntries
+	scale := MustLimitsFor(PlanScale).PublicAuthIPAllowlistMaxEntries
+	if scale < pro {
+		t.Errorf("Scale PublicAuthIPAllowlistMaxEntries=%d < Pro=%d — Scale must keep the larger CIDR budget", scale, pro)
 	}
 }
 
@@ -2450,6 +2539,70 @@ func TestPlanCorsPresetLimits_MonotonicLadder(t *testing.T) {
 			t.Errorf("%s.CorsPresetMaxOrigins (%d) < %s.CorsPresetMaxOrigins (%d)",
 				ladder[i], currL.CorsPresetMaxOrigins,
 				ladder[i-1], prevL.CorsPresetMaxOrigins)
+		}
+	}
+}
+
+// TestPlanConsumerKeysLimits pins the per-plan consumer key cap
+// ladder (ADR-120 / issue #975 item #5). The progression matches
+// the documented per-plan posture:
+//
+//	Free  = 100/app 250/acct    (abuse-floor ceiling — every
+//	                            plan gets the per-app floor;
+//	                            the per-account cap is the
+//	                            abuse-desk ceiling)
+//	Hobby = 100/app 250/acct    (entry paid — same numbers)
+//	Pro   = 100/app 2500/acct   (typical SaaS — per-account
+//	                            step-up, 25× Hobby)
+//	Scale = 1000/app 25000/acct (large fleet — per-app step-up,
+//	                            10× Pro on the per-app floor,
+//	                            10× Pro on the per-account cap)
+//
+// Field order is per-app, per-account. Unknown plans fail closed
+// (return 0 for both caps) so a missing plan row never silently
+// unlocks the primitive. apid-Validate's CreateConsumerKey
+// handler (PR #5-B) trips the per-plan caps at insert time.
+func TestPlanConsumerKeysLimits(t *testing.T) {
+	cases := []struct {
+		plan        Plan
+		wantPerApp  int
+		wantPerAcct int
+	}{
+		{PlanFree, 0, 0},
+		{PlanHobby, 100, 250},
+		{PlanPro, 100, 2500},
+		{PlanScale, 1000, 25000},
+		{Plan("unknown"), 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.ConsumerKeysPerApp(); got != c.wantPerApp {
+			t.Errorf("%s.ConsumerKeysPerApp() = %d, want %d", c.plan, got, c.wantPerApp)
+		}
+		if got := c.plan.ConsumerKeysPerAccount(); got != c.wantPerAcct {
+			t.Errorf("%s.ConsumerKeysPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanConsumerKeysLimits_MonotonicLadder pins that the per-plan
+// consumer key cap ladder is non-decreasing across the upgrade
+// curve. A regression where Pro < Hobby or Scale < Pro breaks the
+// upgrade story; a customer who outgrows Hobby should land on a
+// higher Pro number, not a lower one.
+func TestPlanConsumerKeysLimits_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.ConsumerKeysPerApp < prevL.ConsumerKeysPerApp {
+			t.Errorf("%s.ConsumerKeysPerApp (%d) < %s.ConsumerKeysPerApp (%d)",
+				ladder[i], currL.ConsumerKeysPerApp,
+				ladder[i-1], prevL.ConsumerKeysPerApp)
+		}
+		if currL.ConsumerKeysPerAccount < prevL.ConsumerKeysPerAccount {
+			t.Errorf("%s.ConsumerKeysPerAccount (%d) < %s.ConsumerKeysPerAccount (%d)",
+				ladder[i], currL.ConsumerKeysPerAccount,
+				ladder[i-1], prevL.ConsumerKeysPerAccount)
 		}
 	}
 }

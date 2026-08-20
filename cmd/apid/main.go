@@ -340,11 +340,16 @@ func resolveGithubdStagingRoot(getenv func(string) string) string {
 // runDeps is the DI seam for run — same pattern as vmmd / gatewayd-internal so we can
 // exercise the listener lifecycle without binding :8081 from tests.
 type runDeps struct {
-	listen   func(network, addr string) (net.Listener, error)
-	store    func() state.Store
-	notif    func() Notifier
-	getenv   func(string) string
-	newSrv   func(addr string, h http.Handler) *http.Server
+	listen func(network, addr string) (net.Listener, error)
+	store  func() state.Store
+	notif  func() Notifier
+	getenv func(string) string
+	// newSrv builds the customer-facing http.Server (issue #995
+	// Phase 1 — receives the resolved timeouts via the *Config
+	// argument rather than a bare addr/handler pair so the listener
+	// hardening is applied at construction time, not after the
+	// fact).
+	newSrv   func(addr string, h http.Handler, cfg *Config) *http.Server
 	bgBefore func(ctx context.Context, log *slog.Logger, srv *server) // optional pre-listen hook (e.g. DNS poller)
 	loginTTL time.Duration                                            // dashboard magic-link expiry
 	// mailer is the outbound email sender (gap G4). Nil means "pick
@@ -434,8 +439,25 @@ func defaultDeps() runDeps {
 		store:  func() state.Store { return state.NewMemStore() },
 		notif:  func() Notifier { return noopNotifier{} },
 		getenv: os.Getenv,
-		newSrv: func(addr string, h http.Handler) *http.Server {
-			return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+		// Issue #995 Phase 1: harden the customer-facing http.Server
+		// with ReadTimeout / WriteTimeout / IdleTimeout / MaxHeaderBytes
+		// pulled from the resolved *Config (env overlay wins over TOML
+		// wins over defaults). ReadHeaderTimeout is unchanged (10s — the
+		// legacy defence on header arrival).
+		newSrv: func(addr string, h http.Handler, cfg *Config) *http.Server {
+			env := os.Getenv
+			if cfg == nil {
+				cfg = &Config{}
+			}
+			return &http.Server{
+				Addr:              addr,
+				Handler:           h,
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       cfg.GetRequestReadTimeout(env),
+				WriteTimeout:      cfg.GetRequestWriteTimeout(env),
+				IdleTimeout:       cfg.GetRequestIdleTimeout(env),
+				MaxHeaderBytes:    int(cfg.GetRequestMaxHeaderBytes(env)),
+			}
 		},
 		loginTTL:          15 * time.Minute,
 		configPath:        "/etc/faas/apid.toml",
@@ -1411,7 +1433,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// sync-invoke 5 s / 30 s) become children of the budget via
 	// reqbudget.WithCeiling — the budget tightens the cap, never
 	// loosens it.
-	httpSrv := deps.newSrv(listenBind, budgetCfg.Middleware(srv.handler()))
+	httpSrv := deps.newSrv(listenBind, budgetCfg.Middleware(srv.handler()), cfg)
 
 	l, err := deps.listen("tcp", listenBind)
 	if err != nil {
@@ -1445,7 +1467,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				prometheus.Gatherers{ops.Registry(), budgetReg},
 				promhttp.HandlerOpts{Registry: ops.Registry()},
 			),
+			// Issue #995 Phase 1: tighten the metrics listener.
+			// Loopback-only and no body, so the production defaults
+			// (60s/300s) are looser than needed — a 10s read / 10s
+			// write pair kills stale scrapes fast and bounds a
+			// runaway scraper. MaxHeaderBytes keeps a malformed
+			// scraper from blowing the header cap. ReadHeaderTimeout
+			// is unchanged (10s).
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
 		}
 		mLis, err := net.Listen("tcp", metricsAddr)
 		if err != nil {

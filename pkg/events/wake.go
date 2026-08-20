@@ -118,6 +118,21 @@ const (
 	// panel can filter on instances.liveness_restarted without
 	// also picking up the conn_err / timeout noise.
 	InstanceLivenessRestarted = "instances.liveness_restarted"
+	// InstanceWorkloadOOMFailed (Cluster C / ADR-121) — the
+	// guest-init cgroup.events listener observed an oom_kill on
+	// the per-VM cgroup v2 leaf and the schedd engine (the only
+	// owner of the instance state machine, spec §6.2) destroyed
+	// the instance after stamping CodeAppRuntimeOOM. Distinct
+	// from InstanceLivenessFailed: the workload is dead, not
+	// the liveness probe. The state-machine transition is
+	// RUNNING → STOPPED with reason='workload_oom_failed'. Payload:
+	// {instance_id, app_id, deployment_id, peak_mb, plan_mb}.
+	//
+	// The peak_mb / plan_mb observed values are the same numbers
+	// templated into the whycopy Observed closure (pkg/whycopy).
+	// The dashboard's "OOM kills by deployment (5m)" panel pairs
+	// this with vmm_workload_oom_kills_total from pkg/wire.
+	InstanceWorkloadOOMFailed = "instances.workload_oom_failed"
 	// InstanceParkedLivenessExhausted — the per-deployment
 	// sliding window in pkg/sched/liveness_window.go reached 3
 	// restarts in 300s; Engine.ParkDeployment parked the
@@ -574,6 +589,37 @@ func (e LivenessRestarted) Payload() map[string]any {
 		"app_id":        e.AppID,
 		"deployment_id": e.DeploymentID,
 		"reason":        e.Reason,
+	}
+}
+
+// WorkloadOOMFailed (Cluster C / ADR-121) — the guest-init's
+// cgroup.events listener observed an oom_kill on the per-VM cgroup
+// v2 leaf and the schedd engine destroyed the instance after
+// stamping CodeAppRuntimeOOM. The state-machine transition is
+// RUNNING → STOPPED with reason='workload_oom_failed'.
+// Mirrors LivenessFailed's shape but carries the observed
+// (peak_mb, plan_mb) payload so the dashboard's
+// "workload OOM: peak vs plan (5m)" panel can plot the actual
+// overshoot against the customer's plan cap.
+type WorkloadOOMFailed struct {
+	EmitAt       time.Time
+	InstanceID   string
+	AppID        string
+	DeploymentID string
+	PeakMB       int
+	PlanMB       int
+}
+
+func (e WorkloadOOMFailed) Kind() string     { return InstanceWorkloadOOMFailed }
+func (e WorkloadOOMFailed) At() time.Time    { return e.EmitAt }
+func (e WorkloadOOMFailed) Subject() *string { return nil }
+func (e WorkloadOOMFailed) Payload() map[string]any {
+	return map[string]any{
+		"instance_id":   e.InstanceID,
+		"app_id":        e.AppID,
+		"deployment_id": e.DeploymentID,
+		"peak_mb":       e.PeakMB,
+		"plan_mb":       e.PlanMB,
 	}
 }
 

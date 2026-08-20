@@ -1,12 +1,14 @@
 package dashboard_test
 
 import (
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
@@ -777,5 +779,99 @@ func TestRender_DeploymentDetail_LegacyRowRenders(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
 		}
+	}
+}
+
+// TestRender_DeploymentDetail_StagesPresent — A2 (ADR-117 v2
+// follow-on). Pins the positive path: when Stages is non-nil with
+// a BodyHTML, the deployment_detail template renders the section
+// between the error-explanation block and the Scan heading. The
+// close-6-stage labels are present in the pre-rendered HTML (the
+// handler edge rendered them via pkg/dashboard/stages, and the
+// template only inlines the result).
+func TestRender_DeploymentDetail_StagesPresent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Deployment d-3",
+		Body:  "deployment_detail",
+		Data: dashboard.DeploymentDetailData{
+			App: dashboard.AppListItem{Slug: "myapp"},
+			Deployment: dashboard.DeploymentItem{
+				ID:        "d-3",
+				Status:    "live",
+				Kind:      "function",
+				CreatedAt: "2026-08-19T18:00:00Z",
+			},
+			Stages: &dashboard.StagePayload{
+				BodyHTML: template.HTML(
+					`<section class="stage-timeline">` +
+						`<div class="stage-row"><span class="glyph">✓</span><span class="label">Source downloaded</span><span class="duration">1.2s</span></div>` +
+						`<div class="stage-row"><span class="glyph">✓</span><span class="label">Readiness passed</span><span class="duration">0.4s</span></div>` +
+						`<p class="stage-footer">Total: 29.2s · live since 2026-08-19T18:00:00Z</p>` +
+						`</section>`,
+				),
+				Status:     "live",
+				TerminalAt: time.Date(2026, 8, 19, 18, 0, 0, 0, time.UTC),
+			},
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	// The Stages heading + the inlined BodyHTML must render.
+	for _, want := range []string{
+		// Section root (parent-scoped CSS selector).
+		"stage-timeline",
+		// Stage labels — pins the pre-rendered HTML travelled
+		// through the template unmolested.
+		"Source downloaded",
+		"Readiness passed",
+		// The footer copy is also inlined.
+		"live since 2026-08-19T18:00:00Z",
+		// The <h2>Stages</h2> heading the template emits.
+		"Stages",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+// TestRender_DeploymentDetail_StagesAbsent — A2: the conditional
+// gate. When Stages is nil (pre-00302 row OR in-flight pre-first
+// frame), the section must NOT render. The CSS class names appear
+// in the inline <style> regardless of the conditional — so pin
+// the SECTION element specifically.
+func TestRender_DeploymentDetail_StagesAbsent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Deployment d-4",
+		Body:  "deployment_detail",
+		Data: dashboard.DeploymentDetailData{
+			App: dashboard.AppListItem{Slug: "myapp"},
+			Deployment: dashboard.DeploymentItem{
+				ID:        "d-4",
+				Status:    "live",
+				Kind:      "function",
+				CreatedAt: "2026-08-19T18:00:00Z",
+			},
+			// Stages intentionally nil.
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `<section class="stage-timeline"`) {
+		t.Errorf("legacy row rendered stage-timeline section — gate is broken\n--- body ---\n%s", body)
+	}
+	// The <h2>Stages</h2> heading must also be absent — both the
+	// heading and the section are gated by the same `if .Data.Stages`
+	// test, so they either both render or both are absent.
+	if strings.Contains(body, `<h2>Stages</h2>`) {
+		t.Errorf("legacy row rendered <h2>Stages</h2> heading — gate is broken\n--- body ---\n%s", body)
 	}
 }

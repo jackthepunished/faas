@@ -38,6 +38,7 @@ const (
 	Schedd_ReportCapacity_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
 	Schedd_ReportLivenessFailed_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ReportLivenessFailed"
 	Schedd_EnsureWake_FullMethodName           = "/onebox.faas.schedd.v1.Schedd/EnsureWake"
+	Schedd_ReportWorkloadOOM_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportWorkloadOOM"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -256,6 +257,32 @@ type ScheddClient interface {
 	// Empty WakeMethod in the response means the engine returned the
 	// existing-instance fast path (no new boot happened).
 	EnsureWake(ctx context.Context, in *EnsureWakeRequest, opts ...grpc.CallOption) (*EnsureWakeResponse, error)
+	// ReportWorkloadOOM (Cluster C, ADR-121) is the vmmd-side push
+	// of a per-instance runtime OOM-kill detection on the customer's
+	// workload cgroup. vmmd's framework_ready_recv dispatcher
+	// forwards the guest-init's cgroup.events "oom_kill" signal as
+	// soon as it arrives on AF_VSOCK port 1027 (type byte 0x05);
+	// schedd's Engine.DestroyForWorkloadOOMFailure consumes the
+	// report, eagerly marks the deployment's snapshot stale (ADR-005),
+	// stamps CodeAppRuntimeOOM on the deployment row with the
+	// templated whycopy Observed payload (peak MB + plan cap), and
+	// transitions the instance RUNNING → STOPPED with kind
+	// "workload_oom_failed".
+	//
+	// Distinct from ReportLivenessFailed: the workload is dead
+	// before the kernel can report liveness probe failures (the
+	// listener goroutine inside the microVM is the only path that
+	// sees the workload OOM). peak_mb / plan_mb are the observed
+	// payload; the engine uses them to populate the whycopy
+	// Observed closure.
+	//
+	// Idempotent on the wire: re-reporting the same instance id is
+	// a no-op on the schedd side because the state-machine guard
+	// refuses to destroy a non-RUNNING instance.
+	//
+	// Additive per ADR-016: new RPC + new messages append at the
+	// end; existing field tags are untouched.
+	ReportWorkloadOOM(ctx context.Context, in *ReportWorkloadOOMRequest, opts ...grpc.CallOption) (*ReportWorkloadOOMAck, error)
 }
 
 type scheddClient struct {
@@ -381,6 +408,16 @@ func (c *scheddClient) EnsureWake(ctx context.Context, in *EnsureWakeRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EnsureWakeResponse)
 	err := c.cc.Invoke(ctx, Schedd_EnsureWake_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *scheddClient) ReportWorkloadOOM(ctx context.Context, in *ReportWorkloadOOMRequest, opts ...grpc.CallOption) (*ReportWorkloadOOMAck, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportWorkloadOOMAck)
+	err := c.cc.Invoke(ctx, Schedd_ReportWorkloadOOM_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -603,6 +640,32 @@ type ScheddServer interface {
 	// Empty WakeMethod in the response means the engine returned the
 	// existing-instance fast path (no new boot happened).
 	EnsureWake(context.Context, *EnsureWakeRequest) (*EnsureWakeResponse, error)
+	// ReportWorkloadOOM (Cluster C, ADR-121) is the vmmd-side push
+	// of a per-instance runtime OOM-kill detection on the customer's
+	// workload cgroup. vmmd's framework_ready_recv dispatcher
+	// forwards the guest-init's cgroup.events "oom_kill" signal as
+	// soon as it arrives on AF_VSOCK port 1027 (type byte 0x05);
+	// schedd's Engine.DestroyForWorkloadOOMFailure consumes the
+	// report, eagerly marks the deployment's snapshot stale (ADR-005),
+	// stamps CodeAppRuntimeOOM on the deployment row with the
+	// templated whycopy Observed payload (peak MB + plan cap), and
+	// transitions the instance RUNNING → STOPPED with kind
+	// "workload_oom_failed".
+	//
+	// Distinct from ReportLivenessFailed: the workload is dead
+	// before the kernel can report liveness probe failures (the
+	// listener goroutine inside the microVM is the only path that
+	// sees the workload OOM). peak_mb / plan_mb are the observed
+	// payload; the engine uses them to populate the whycopy
+	// Observed closure.
+	//
+	// Idempotent on the wire: re-reporting the same instance id is
+	// a no-op on the schedd side because the state-machine guard
+	// refuses to destroy a non-RUNNING instance.
+	//
+	// Additive per ADR-016: new RPC + new messages append at the
+	// end; existing field tags are untouched.
+	ReportWorkloadOOM(context.Context, *ReportWorkloadOOMRequest) (*ReportWorkloadOOMAck, error)
 	mustEmbedUnimplementedScheddServer()
 }
 
@@ -642,6 +705,9 @@ func (UnimplementedScheddServer) ReportLivenessFailed(context.Context, *Liveness
 }
 func (UnimplementedScheddServer) EnsureWake(context.Context, *EnsureWakeRequest) (*EnsureWakeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureWake not implemented")
+}
+func (UnimplementedScheddServer) ReportWorkloadOOM(context.Context, *ReportWorkloadOOMRequest) (*ReportWorkloadOOMAck, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportWorkloadOOM not implemented")
 }
 func (UnimplementedScheddServer) mustEmbedUnimplementedScheddServer() {}
 func (UnimplementedScheddServer) testEmbeddedByValue()                {}
@@ -819,6 +885,24 @@ func _Schedd_EnsureWake_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Schedd_ReportWorkloadOOM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportWorkloadOOMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ReportWorkloadOOM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ReportWorkloadOOM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ReportWorkloadOOM(ctx, req.(*ReportWorkloadOOMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Schedd_ServiceDesc is the grpc.ServiceDesc for Schedd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -853,6 +937,10 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EnsureWake",
 			Handler:    _Schedd_EnsureWake_Handler,
+		},
+		{
+			MethodName: "ReportWorkloadOOM",
+			Handler:    _Schedd_ReportWorkloadOOM_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

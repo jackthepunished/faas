@@ -118,3 +118,61 @@ func TestDecorate_CatalogTitleWins(t *testing.T) {
 		t.Errorf("Decorate did not overwrite Title with catalog row: got %q want %q", got.Title, want)
 	}
 }
+
+// TestDecorate_AppRuntimeOOM_TemplatesPeakAndPlan asserts the
+// runtime-OOM Observed renderer templates both the peak MB and
+// plan cap MB into the Why + Fix fields. The catalog row is the
+// load-bearing UX for the existing-but-previously-uncalled
+// CodeAppRuntimeOOM; the templated prose is what the customer
+// sees on the deployment-detail page and `gregale inspect --errors`
+// after the runtime OOM detection chain (Cluster C) fires.
+func TestDecorate_AppRuntimeOOM_TemplatesPeakAndPlan(t *testing.T) {
+	p := api.NewProblem(0, api.CodeAppRuntimeOOM, "title", "detail")
+	observed := struct{ PeakMB, PlanMB int }{PeakMB: 384, PlanMB: 256}
+	Decorate(p, api.CodeAppRuntimeOOM, observed)
+
+	// Why should contain the peak MB and the plan cap + 8 MB
+	// overhead phrasing. The cgroup memory.max is set to plan + 8
+	// (api.PerVMOverheadMB) on the host side.
+	if !strings.Contains(p.Why, "384 MB") {
+		t.Errorf("Why missing peak MB; got %q", p.Why)
+	}
+	if !strings.Contains(p.Why, "256 MB + 8 MB overhead") {
+		t.Errorf("Why missing plan cap + 8 MB overhead; got %q", p.Why)
+	}
+
+	// Fix should mention the source plan and the recommended plan
+	// (peak + 8 MB = 392 MB round-up).
+	if !strings.Contains(p.Fix, "256 MB plan") {
+		t.Errorf("Fix missing source plan; got %q", p.Fix)
+	}
+	if !strings.Contains(p.Fix, "at least 392 MB") {
+		t.Errorf("Fix missing recommended plan; got %q", p.Fix)
+	}
+}
+
+// TestDecorate_AppRuntimeOOM_NilObservedUsesStatic asserts that
+// when observed is nil (or the type doesn't match), the static
+// Why/Fix is used verbatim. The static prose is the fallback
+// for places that stamp CodeAppRuntimeOOM without the runtime
+// OOM detection chain (e.g. legacy code paths, future tests).
+func TestDecorate_AppRuntimeOOM_NilObservedUsesStatic(t *testing.T) {
+	p := api.NewProblem(0, api.CodeAppRuntimeOOM, "title", "detail")
+	Decorate(p, api.CodeAppRuntimeOOM, nil)
+
+	// Static Why mentions "+8 MB" but not an observed peak MB.
+	if strings.Contains(p.Why, "384 MB") {
+		t.Errorf("static Why should not mention peak MB; got %q", p.Why)
+	}
+	// Static Why still describes the runtime OOM mechanism.
+	if !strings.Contains(p.Why, "memory.max") {
+		t.Errorf("static Why should describe the cgroup mechanism; got %q", p.Why)
+	}
+	// Static Fix should NOT carry the templated "at least N MB".
+	if !strings.Contains(p.Fix, "upgrade to a plan with more RAM") {
+		t.Errorf("static Fix should carry the unobserved prose; got %q", p.Fix)
+	}
+	if strings.Contains(p.Fix, "at least") {
+		t.Errorf("static Fix should not contain templated 'at least N MB'; got %q", p.Fix)
+	}
+}

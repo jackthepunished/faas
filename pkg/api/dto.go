@@ -720,24 +720,28 @@ type ParkedDeploymentRef struct {
 	ParkedAt     *time.Time `json:"parked_at"`
 }
 
-// PublicAuthBlock (issue #477 / ADR-079) is the per-app
-// public-URL auth configuration on a PATCH body. Mode is
-// the canonical 'open'|'bearer'|'basic' string (must match
-// apps_public_auth_mode_chk). BasicUser + BasicPass are
-// only meaningful when Mode='basic'; the apid PATCH
-// handler seals them under the APP_BASIC_AUTH secretbox
-// namespace and stores the ciphertext in
-// apps.public_auth_basic. For Mode='open' or 'bearer' the
-// apid handler ignores them (and clears any existing
-// sealed blob so a stale secretbox row never reaches a
-// fresh request). The wire-shape reflects what the
-// customer PATCHes; the on-disk shape is the
-// public_auth_mode + public_auth_basic columns plus the
-// secretbox seal at PATCH time.
+// PublicAuthBlock (issue #477 / ADR-079 + ADR-118) is the
+// per-app public-URL auth configuration on a PATCH body.
+// Mode is the canonical 'open'|'bearer'|'basic'|'ip_allowlist'
+// string (must match apps_public_auth_mode_chk).
+// BasicUser + BasicPass are only meaningful when
+// Mode='basic'; the apid PATCH handler seals them under
+// the APP_BASIC_AUTH secretbox namespace and stores the
+// ciphertext in apps.public_auth_basic. For Mode='open',
+// 'bearer', or 'ip_allowlist' the apid handler ignores
+// them (and clears any existing sealed blob so a stale
+// secretbox row never reaches a fresh request). For
+// Mode='ip_allowlist' the IPAllowlist slice must be
+// non-empty (ADR-118; the 500-on-misconfig gate in
+// pkg/gateway/handler.go fires otherwise). The wire-shape
+// reflects what the customer PATCHes; the on-disk shape
+// is the public_auth_mode + public_auth_basic +
+// public_auth_ip_allowlist columns plus the secretbox
+// seal at PATCH time.
 type PublicAuthBlock struct {
-	// Mode is the canonical 'open'|'bearer'|'basic'
-	// string. apid rejects unknown values with 422
-	// invalid_public_auth_mode.
+	// Mode is the canonical 'open'|'bearer'|'basic'|
+	// 'ip_allowlist' string. apid rejects unknown values
+	// with 422 invalid_public_auth_mode.
 	Mode string `json:"mode"`
 	// BasicUser is the basic-auth username (plaintext at
 	// PATCH time; sealed before persist). Required when
@@ -749,11 +753,23 @@ type PublicAuthBlock struct {
 	// Mode='basic'; ignored otherwise. Range
 	// [1, 256] bytes.
 	BasicPass string `json:"basic_pass,omitempty"`
+	// IPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist. Required when Mode='ip_allowlist';
+	// ignored otherwise. Plan-gated to Pro+ (apid
+	// returns 403 plan_public_auth_ip_allowlist_not_allowed
+	// for Free/Hobby). Per-plan cap
+	// (pkg/api/limits.go::PublicAuthIPAllowlistMaxEntries)
+	// is enforced upstream of this Validate. The apid
+	// parse step rejects entries that don't net.ParseCIDR
+	// or that have masklen=0 (the same non-/0 contract
+	// the DB trigger at migrations/00308 enforces).
+	IPAllowlist []string `json:"ip_allowlist,omitempty"`
 }
 
 // Validate enforces the canonical PublicAuthBlock shape:
 // Mode is a closed enum; BasicUser + BasicPass are
-// required iff Mode='basic'. Returns a 422-mapped
+// required iff Mode='basic'; IPAllowlist must be
+// non-empty iff Mode='ip_allowlist'. Returns a 422-mapped
 // *Problem on any malformed shape. nil in → nil out
 // (the caller treats nil as "don't touch the column").
 func (b *PublicAuthBlock) Validate() *Problem {
@@ -761,12 +777,23 @@ func (b *PublicAuthBlock) Validate() *Problem {
 		return nil
 	}
 	switch b.Mode {
-	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic:
+	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic,
+		AppPublicAuthModeIPAllowlist:
 	default:
 		return NewProblem(422, CodeValidation, "Invalid public_auth.mode",
-			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', or 'basic'; got %q", b.Mode))
+			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', 'basic', or 'ip_allowlist'; got %q", b.Mode))
 	}
 	if b.Mode != AppPublicAuthModeBasic {
+		// IPAllowlist is required iff Mode='ip_allowlist'.
+		// The plan-gate + size cap + per-entry parse are
+		// enforced upstream of Validate (the apid handler
+		// runs them in that order: closed-enum → plan → size
+		// → parse), so this layer only checks the structural
+		// "non-empty when mode requires it" invariant.
+		if b.Mode == AppPublicAuthModeIPAllowlist && len(b.IPAllowlist) == 0 {
+			return NewProblem(422, CodeValidation, "Invalid public_auth.ip_allowlist",
+				"public_auth.ip_allowlist must contain at least one CIDR when mode='ip_allowlist'")
+		}
 		return nil
 	}
 	if u := strings.TrimSpace(b.BasicUser); u == "" || len(u) > AppPublicAuthBasicUserMaxBytes {
@@ -780,18 +807,26 @@ func (b *PublicAuthBlock) Validate() *Problem {
 	return nil
 }
 
-// PublicAuthStatus (issue #477 / ADR-079) is the
-// read-only per-app public-URL auth surface on
+// PublicAuthStatus (issue #477 / ADR-079 + ADR-118) is
+// the read-only per-app public-URL auth surface on
 // AppResponse. Mode mirrors the apps.public_auth_mode
 // column; HasBasicCreds is true iff the row has a
 // non-null public_auth_basic blob (a mode='basic' app
-// without creds would still 401 every request). The
-// plaintext username/password is NEVER echoed — it lives
-// in app_secrets (ADR-045) and is loopback-mounted to
-// drive1 at boot.
+// without creds would still 401 every request).
+// IPAllowlistEntryCount is the count of CIDRs in the
+// apps.public_auth_ip_allowlist array (mode='ip_allowlist'
+// apps only — 0 otherwise). The CIDR strings themselves
+// are NEVER echoed — they're operator-secret and an
+// operator triaging "why am I getting 403s" can read the
+// raw value from the apid audit log instead (the audit
+// log records the count, not the entries — redaction
+// invariant). The plaintext basic-auth username/password
+// is NEVER echoed — it lives in app_secrets (ADR-045)
+// and is loopback-mounted to drive1 at boot.
 type PublicAuthStatus struct {
-	Mode          string `json:"mode"`
-	HasBasicCreds bool   `json:"has_basic_creds"`
+	Mode                  string `json:"mode"`
+	HasBasicCreds         bool   `json:"has_basic_creds"`
+	IPAllowlistEntryCount int    `json:"ip_allowlist_entry_count"`
 }
 
 // Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`

@@ -116,8 +116,9 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 - Records `last_request_at[instance]` (in-memory, flushed to PG every 15 s) — this drives idle parking.
 - Rate limits (token bucket, per app): Free 5 rps burst 20; Hobby 20 rps burst 100; Pro 100 rps burst 500; Scale 500 rps burst 2000. Over-limit → `429`.
 - Request/response size caps (per-plan, ADR-047):
-  - **Default (Free-tier path):** 25 MB body either direction; 60 s upstream response start, 300 s total. This is the legacy buffered path; it serves all Free-tier apps (and Hobby+ apps that have not opted in to streaming via the per-app `streaming_enabled` flag, with an operator opt-in via `FAAS_GATEWAY_STREAMING`).
+  - **Default (Free-tier path):** 25 MB body either direction; 60 s upstream response start, 300 s total. This is the legacy buffered path; it serves all Free-tier apps (and Hobby+ apps that have not opted in to streaming via the per-app `streaming_enabled` flag, with an operator opt-in via `FAAS_GATEWAY_STREAMING`). The cap is enforced by `pkg/gateway.capWriter` (issue #995 / ADR-121): inbound body via `http.MaxBytesReader` (existing); outbound body via `capWriter` on the buffered reverse-proxy dispatch site. On cap-exceeded, `gatewayd-internal` emits a 413 `response_too_large` problem+json (RFC 7807) when the cap trips before the upstream's headers reach the wire; mid-body trips surface as a hardened connection reset (stdlib's `WriteHeader(413)` silently no-ops after the upstream proxy has written 200 — see ADR-121 §2 for the architectural constraint and R2 for the recorder/test surface).
   - **Streaming path (Hobby+ only, ADR-047):** 100 MB body cap; 900 s response deadline. The `gatewayd-internal` handler takes the streaming path iff `FAAS_GATEWAY_STREAMING` is set (operator opt-in) AND the app's `streaming_enabled` flag is true AND the inbound request did not opt out via `Accept: application/json`. The handler wraps `w` with a per-flush `onFlush` callback (`statusRecorder.doFlush`) that attributes egress bytes (per-instance, per-minute) on every `Write`+`Flush` boundary, plus a residual capture on `finalFlush`. The cap is enforced by `pkg/gateway.capWriter`; on cap-exceeded `gatewayd-internal` emits a 413 `streaming_not_available` problem+json (RFC 7807) instead of stdlib's 502.
+  - **Warn-on-approach (issue #995 / ADR-121):** both the buffered and streaming `capWriter` paths emit `gateway_response_body_warn_total{app_id, bucket}` (`bucket ∈ {near_threshold, exceeded}`, threshold crossings at 80% / 95% / 100% of the per-plan cap). The counter is the scrape-friendly signal; a once-per-process `slog.Warn` is emitted for the first hit per `(app_id, bucket)` so a runaway app doesn't flood the log stream. See §17 for the dashboard chip.
   - **Per-request opt-out:** `Accept: application/json` flips a single request to the buffered path. The customer's per-app flag stays unchanged so flipping the flag on later is a config change, not a per-request decision.
   - **Plan gate:** `apid` rejects `streaming_enabled=true` on Free apps with `CodePlanStreamingNotAllowed` (per pkg/api/errors.go) at deploy time. The runtime fallback log `streamingFallbackLog` fires only when `!streaming && plan == Free && SSE` — the operator-toggled `FAAS_GATEWAY_STREAMING` is the operator-side lever, not a per-app misconfiguration.
 - **Multi-node forwarding (ADR-028 + ADR-047):** When schedd has placed an instance on a remote compute_node, `gatewayd-internal` dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's bidi `ForwardHTTPStream` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. The streaming envelope is 100 MB body / 900 s response deadline (the per-plan caps in §4.1 apply on `gatewayd-internal` via `capWriter`; the vmmd bridge runs the streaming cap uniformly). The local-node path (default single-node deploy) skips the bridge and uses the existing direct reverse-proxy path. The legacy unary `ForwardHTTP` RPC was removed in PR-D — `ForwardHTTPStream` is the only bridge today.
@@ -1049,6 +1050,101 @@ on `pkg/fcvm/metrics.go:324` and `cmd/vmmd/liveness_recv.go:67-87`
 adds the 6th outcome to the listed set. New unit tests in
 `cmd/vmmd/liveness_recv_test.go` cover `livenessOutcomeUnauthorized`
 + `livenessOutcomeUnauthorized` reset-on-success + the 403 arm.
+
+### 6.4.3 Runtime OOM detection (error-explanations cluster, amendment 3 — Cluster C)
+
+Amendment 1 (§6.4.1) shipped the catalog + DB schema + CLI renderer.
+Amendment 2 (§6.4.2, Cluster A) closed the dashboard and `--doctor-strict`
+seams. **Amendment 3 (Cluster C) wires the detection seam** for
+`app_runtime_oom` — the only gap remaining in the audit.
+
+**Detection locus.** Inside the guest, on the per-workload cgroup v2
+leaf (`main-app` leaf, `partitionInto`'s write at
+`guest/init/cgroup_partition_linux.go:135`). The host-side per-VM scope
+(`vmmd/writePlanCgroup`) sees only the firecracker process; the host
+*cannot* see per-PID OOM kills inside the VM. The only detection
+surface is the guest's cgroup v2 memory controller on the workload leaf.
+
+**Wire envelope** — added to the existing closed-set dispatcher on
+framework_ready port 1027 DGRAM:
+
+```
+[1B type=0x05][json:{"peak_mb":N,"plan_mb":N}]
+```
+
+The body is a UTF-8 JSON envelope mirroring the host-side
+`workloadOOMWire` (cmd/vmmd/framework_ready_recv.go). Body cap:
+`VsockWorkloadOOMMaxBody = 256` bytes (the payload is < 32 bytes;
+256 is a future-proof margin mirrored on the guest side at
+`workloadOOMEmitMaxBody`).
+
+The host resolves instance identity from the DGRAM peer CID (same join
+as types 0x01..0x04). The new closed-set member is 0x05, owned by the
+existing dispatcher — no new vsock port, no new listener. Future event
+classes (0x06+) require a byte + a switch case + a test in lockstep;
+the tripwire is `cmd/vmmd/framework_ready_recv.go::TestParseFramework
+ReadyDatagram_TypeClosedSet`.
+
+**Producer chain** (end-to-end):
+
+```
+in-VM workload PIDs (cgroup v2 leaf, memory.max = plan + 8 MB)
+   ↓ poll(2) on leaf's cgroup.events + memory.events oom_kill delta
+guest/init::WatchOOM(ctx, leaf, planMB, emit, log)         ← NEW
+   ↓ samples memory.events.high (or memory.current fallback)
+guest-init::EmitWorkloadOOM(ctx, peakMB, planMB)           ← NEW (vsock DGRAM 0x05)
+cmd/vmmd::framework_ready_recv.go::dispatchWorkloadOOM
+   ↓
+pkg/fcvm::Manager.ReportWorkloadOOM(instanceID, peakMB, planMB)  ← NEW
+   ↓ via WithWorkloadOOMSink (mirrors WithLivenessSink)
+cmd/vmmd/main.go closure → cli.ReportWorkloadOOM gRPC
+   ↓
+pkg/scheddgrpc/server.go::ReportWorkloadOOM                 ← NEW (RPC + handler)
+   ↓
+pkg/sched/engine.go::DestroyForWorkloadOOMFailure(ctx, instanceID, peakMB, planMB)  ← NEW
+   ↓
+whycopy.Decorate(problem, CodeAppRuntimeOOM, struct{PeakMB, PlanMB int}{...})
+   ↓
+store.SetDeploymentFailedEx(deploymentID, CodeAppRuntimeOOM, ...problem.Hint,
+                            problem.why, problem.Fix, nil)
+   ↓
+dashboard .error-explanation  +  CLI inspect --errors  +  gregale doctor
+```
+
+**Whycopy Observed** — the `CodeAppRuntimeOOM` catalog row ships an
+`Observed func(observed any) (why, fix string)` closure that templates
+the (peakMB, planMB) tuple into the customer-facing prose:
+
+- **Why:** "the cgroup memory controller killed the process at
+  `<peak>` MB (plan cap `<plan>` MB + 8 MB overhead); the kernel
+  OOM-killer fired inside the microVM"
+- **Fix:** "• upgrade from a `<plan>` MB plan to a plan with ≥
+  `<peak+8>` MB of RAM\n• trim in-memory state (caches, buffers,
+  large request bodies held in memory)"
+
+The static `Why` / `Fix` strings remain the fallback when `Decorate`
+is called with `observed=nil` (no templating — the existing 6 customer
+fixtures that never set the observed value still see the right prose).
+
+The cross-reference line "if this is a build step, see
+/errors/build/limits#memory instead" was dropped — the build-OOM path
+is `CodeBuildOOM`, not `CodeAppRuntimeOOM`; the cross-reference was
+misleading because the two constructors are distinct.
+
+**Tripwires** stay green: `TestParseFrameworkReadyDatagram_TypeClosedSet`
+(closed-set guard), `TestEveryCodeHasWhycopyEntry` (Observed closure
+presence), `TestObservedRendering` (template parity). The audit moves
+from 9/9 covering-of-named-codes → 9/9 with end-to-end detection
+wired.
+
+**Metal acceptance gate** — `cmd/vmmd/workload_oom_metal_test.go`:
+boots a Hobby-plan guest, places a workload in the per-VM cgroup leaf
+with `memory.max = 256 MiB`, runs
+`python3 -c 'x=[]; [x.append(bytearray(1024*1024)) for _ in range(384)]'`
+to force OOM, asserts the deployment row is stamped `app_runtime_oom`
+with the templated peak MB ≈ 384 + plan cap 256 within the tripwire
+budget. Runs on `make test-metal` (x86_64) or `make metal-lima`
+(M3+ Mac).
 
 ---
 

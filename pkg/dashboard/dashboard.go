@@ -361,10 +361,40 @@ type AppDetailData struct {
 // (cmd/apid/handlers_dashboard.go::renderDeploymentDetail) is
 // the only thing that materialises this struct from the wire
 // types.
+//
+// Stages (ADR-117 v2 follow-on, A2): the closed-6-stage
+// post-stream summary the customer sees via `gregale deploys show
+// <id>`. nil Stages means the row was created before the
+// jsonb column existed (migrations/00302) OR the jsonb is empty
+// for an in-flight deploy — the template omits the section
+// entirely. non-nil Stages carries a pre-rendered HTML block
+// (handler-edge projection via pkg/dashboard/stages) so the
+// template only inlines the result and needs zero FuncMap wiring.
 type DeploymentDetailData struct {
 	App        AppListItem
 	Deployment DeploymentItem
 	Scan       *ScanPayload
+	Stages     *StagePayload
+}
+
+// StagePayload is the dashboard-local mirror of the closed-6-stage
+// post-stream summary (ADR-117 §3, migration 00302). BodyHTML is
+// the pre-rendered `<section class="stage-timeline">…</section>`
+// block the template inlines via {{ .Data.Stages.BodyHTML }} —
+// rendered at the handler edge (cmd/apid/handlers_dashboard.go::
+// dashboardStagePayload) so the template stays a pure renderer
+// and pkg/dashboard stays free of html/template FuncMap wiring.
+//
+// Status / TerminalAt are surfaced as plain fields so the
+// template can branch on the deployment's terminal state (e.g.
+// to render a "live" pill even when the section's footer doesn't
+// include the timestamp). The customer-facing footer copy lives
+// inside BodyHTML so the template can't drift from the CLI's
+// text renderer.
+type StagePayload struct {
+	BodyHTML   template.HTML
+	Status     string
+	TerminalAt time.Time
 }
 
 // ScanPayload is the dashboard-local mirror of the per-deploy

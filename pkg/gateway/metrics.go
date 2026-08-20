@@ -190,6 +190,14 @@ type Metrics struct {
 	// kinds; the counter surfaces the signal even when the
 	// loader's WARN log is drowned by other gatewayd-internal noise.
 	edgeRuleCompileError *prometheus.CounterVec
+	// envelopeCapWarns (issue #995 Phase 4 / ADR-121): warn
+	// counters for the body-cap surfaces (request, response,
+	// raw-bridge). Labels: {app_id, bucket}; bucket ∈
+	// {near_threshold, exceeded}. The app_id label is bounded by
+	// the platform's per-account app count (~100s) — see ADR-093
+	// §cardinality for the precedent. route_label is intentionally
+	// NOT admitted (could explode per ADR-093 cap of 50 per app).
+	responseBodyWarnTotal *prometheus.CounterVec
 	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
 	// apps.maintenance_mode coarse-gate matches. Distinct from the
 	// edgeRule* family because the coarse gate is not an edge
@@ -541,6 +549,13 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_compile_error_total",
 			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
+		// Issue #995 Phase 4 / ADR-121 — envelope-cap warn
+		// counter for the response body (used by both the buffered
+		// and streaming capWriter paths).
+		responseBodyWarnTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_response_body_warn_total",
+			Help: "Count of response bodies that approached or exceeded the per-plan MaxResponseBodyBytes cap, labelled by app_id and bucket (near_threshold|exceeded).",
+		}, []string{"app_id", "bucket"}),
 		// ADR-091 amendment — coarse-gate apps.maintenance_mode
 		// short-circuit counter. Distinct from edgeRule* family
 		// because the coarse gate is per-app, not per-rule. Plan
@@ -961,7 +976,7 @@ func NewMetrics() *Metrics {
 	// closed set guarantees the §12 dashboard panel "edge rule
 	// match rate" surfaces every (kind, outcome) tuple from
 	// first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle", "ingress_ip"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -1045,9 +1060,12 @@ func NewMetrics() *Metrics {
 	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
 	// compile errors" surface every tuple from first scrape. Closed
 	// set: {route, rewrite, redirect, headers, cors, jwt, ip, validate,
-	// limit, maintenance, geo, throttle}. Adding a new kind requires
-	// extending this slice — the metric name is stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+	// limit, maintenance, geo, throttle, ingress_ip}. Adding a new
+	// kind requires extending this slice — the metric name is
+	// stable. `ingress_ip` was added by ADR-118 for the per-app
+	// ingress IP allowlist (pkg/gateway/handler.go::
+	// applyIngressIPAllowlist).
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle", "ingress_ip"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}
@@ -1092,7 +1110,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1172,6 +1190,29 @@ func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
 		return
 	}
 	m.responseBytes.WithLabelValues(appID, plan).Add(float64(n))
+}
+
+// ObserveResponseBodyWarn increments the response-body warn counter
+// for issue #995 Phase 4 / ADR-121. Called from capWriter when a
+// response crosses the near-threshold (80%) or exceeded (100%) mark
+// for the per-plan MaxResponseBodyBytes cap. The two flags are
+// mutually exclusive at the call site (exceeded wins); the
+// implementation tolerates both true as a no-op guard, but the
+// contract is "exactly one" so the counter increments in a single
+// bucket. route_label is intentionally NOT admitted (ADR-093 cap of
+// 50 per app); app_id is bounded by the platform's per-account app
+// count (~100s) — same precedent as edgeRuleApply. Nil-receiver
+// safe.
+func (m *Metrics) ObserveResponseBodyWarn(appID string, nearThreshold, exceeded bool) {
+	if m == nil || appID == "" {
+		return
+	}
+	switch {
+	case exceeded:
+		m.responseBodyWarnTotal.WithLabelValues(appID, "exceeded").Inc()
+	case nearThreshold:
+		m.responseBodyWarnTotal.WithLabelValues(appID, "near_threshold").Inc()
+	}
 }
 
 // ObserveStreamFlush increments the per-(app, plan) streaming

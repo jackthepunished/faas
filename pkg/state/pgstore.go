@@ -1851,8 +1851,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1874,7 +1874,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		publicAuthMode = AppPublicAuthModeOpen
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), cidrPrefixesToArray(app.PublicAuthIPAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
@@ -3059,7 +3059,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
 				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end,
-				   -- ADR-119: per-app static egress IP
+-- ADR-119: per-app static egress IP
 				   -- (customer BYOIP). SetStaticEgressIP
 				   -- distinguishes "don't touch" (don't run
 				   -- the SET clause) from "explicit IP"
@@ -3073,7 +3073,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 				   -- contract (IPv4 only, no two apps on
 				   -- the same account pin the same IP).
 				   static_egress_ip = case when $57 then $58::inet else static_egress_ip end,
-				   static_egress_ip_set_at = case when $57 and $58 is not null then NOW() when $57 and $58 is null then NULL else static_egress_ip_set_at end
+				   static_egress_ip_set_at = case when $57 and $58 is not null then NOW() when $57 and $58 is null then NULL else static_egress_ip_set_at end,
+			   -- ADR-118: per-app ingress IP allowlist. Same Set-bit
+			   -- pattern as EgressAllowlist above (SetPublicAuthIPAllowlist
+			   -- distinguishes "don't touch" from "explicit empty"). The
+			   -- DB trigger at migrations/00308_apps_public_auth_ip_allowlist.sql
+			   -- rejects non-v4/v6 families and masklen /0 (defence in
+			   -- depth on top of the apid parse step).
+				   public_auth_ip_allowlist = case when $59 then $60::cidr[] else public_auth_ip_allowlist end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -3180,7 +3187,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// above stamps NOW() on every non-null write so the
 		// audit timestamp is always current when the customer
 		// re-pins.
-		p.SetStaticEgressIP, derefAddr(p.StaticEgressIP))
+		p.SetStaticEgressIP, derefAddr(p.StaticEgressIP),
+		// ADR-118: per-app ingress IP allowlist. Same nil-pointer +
+		// Set-bit convention as EgressAllowlist above. cidrPrefixesToArray
+		// renders an empty slice as '{}' (the column DEFAULT) so a
+		// PATCH with an empty IPAllowlist + SetPublicAuthIPAllowlist=true
+		// clears the column, not the Set bit.
+		p.SetPublicAuthIPAllowlist, cidrPrefixesToArray(derefPrefixes(p.PublicAuthIPAllowlist)))
 	return scanApp(row)
 }
 
@@ -3745,15 +3758,15 @@ func (s *PgStore) ApplyProjectPlan(
 		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
-		     status, manifest, min_instances, egress_allowlist,
+		     status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist,
 		     project_id, root_dir, workload_name, workload_class, start_command,
 			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
-		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11::cidr[],
+		        $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
-			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
+			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist), cidrPrefixesToArray(a.PublicAuthIPAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
 			// Issue #272 / ADR-094: preview columns default to
@@ -12801,6 +12814,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var typeStr, statusStr string
 	var manifestBytes []byte
 	var allowlistText string
+	var publicAuthIPAllowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
 	// Tier A10 / ADR-088: scratch sink for the overflow_node
@@ -12816,6 +12830,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&publicAuthIPAllowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
 		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
@@ -12927,6 +12942,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
 	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	// ADR-118: per-app ingress IP allowlist. The column projection
+	// is public_auth_ip_allowlist::text (mirroring egress_allowlist
+	// above) so the cidr array round-trips through a stable string
+	// rendering — pgx's native cidr[] decode is fine but the text
+	// projection is consistent with the egress column's treatment
+	// and keeps the scan path single-shape.
+	a.PublicAuthIPAllowlist = cidrTextToPrefixes(publicAuthIPAllowlistText)
 	// scaling_policy: an empty jsonb ('{}'::jsonb, the column
 	// default) round-trips as a non-nil zero-length slice. The
 	// non-empty path is the customer-authored shape from
@@ -12973,6 +12995,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+	public_auth_ip_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
@@ -17759,4 +17782,201 @@ func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUps
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// Consumer keys (ADR-120 / issue #975 item #5).
+//
+// Tenancy-at-the-boundary: every read pins (account_id, ...) in the
+// WHERE; cross-tenant probes collapse to ErrNotFound. The pg path is
+// the floor — memstore matches its strictness (see
+// memstore_consumer_keys.go for the symmetric contract).
+//
+// We deliberately write the SQL by hand (not via sqlc) for v1:
+// consumer_keys is small (Scale cap 1000/app × ~few accounts) and the
+// five methods are pure CRUD. When the surface grows (consumer_id
+// joins in #6/#7/#8), this becomes a sqlc concern; for now the
+// explicit SQL keeps the IDOR-safe predicates visible in one place.
+
+// scanConsumerKeyRow scans a single row selected with the standard
+// consumer_keys column order (see consumerKeySelectCols). Tolerant
+// of NULL on the optional timestamp columns: ExpiresAt / LastUsedAt
+// / RevokedAt come back as pgtype.Timestamptz{} when the row has
+// them unset, and timeFromPgtype returns nil for the zero value.
+func scanConsumerKeyRow(row pgx.Row) (ConsumerKey, error) {
+	var k ConsumerKey
+	var scopes []string
+	var expiresAt, lastUsedAt, revokedAt *time.Time
+	if err := row.Scan(
+		&k.ID,
+		&k.AccountID,
+		&k.AppID,
+		&k.Name,
+		&k.Prefix,
+		&k.Hash,
+		&scopes,
+		&k.CreatedAt,
+		&expiresAt,
+		&lastUsedAt,
+		&revokedAt,
+	); err != nil {
+		return ConsumerKey{}, err
+	}
+	k.Scopes = scopes
+	k.ExpiresAt = expiresAt
+	k.LastUsedAt = lastUsedAt
+	k.RevokedAt = revokedAt
+	return k, nil
+}
+
+// consumerKeySelectCols is the column list every read uses. Keeping
+// the order stable means scanConsumerKeyRow above is the single scan
+// helper, not five copies.
+const consumerKeySelectCols = `id, account_id, app_id, name, prefix, hashed_secret, scopes, created_at, expires_at, last_used_at, revoked_at`
+
+func (s *PgStore) CreateConsumerKey(ctx context.Context, accountID, appID, name, prefix string, hash []byte, scopes []string, expiresAt *time.Time) (ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: empty account_id or app_id")
+	}
+	// pgx requires a non-nil []byte for NOT NULL bytea; nil maps to
+	// SQL NULL and the migration's CHECK would reject. The caller
+	// always supplies a 32-byte SHA-256 hash; this is a defence.
+	if len(hash) != 32 {
+		return ConsumerKey{}, fmt.Errorf("pgstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
+	}
+	if len(scopes) == 0 {
+		return ConsumerKey{}, errors.New("pgstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00329)")
+	}
+	row := s.pool.QueryRow(ctx,
+		`insert into consumer_keys
+		   (account_id, app_id, name, prefix, hashed_secret, scopes, expires_at)
+		 values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
+		 returning `+consumerKeySelectCols,
+		accountID, appID, name, prefix, hash, scopes, expiresAt)
+	k, err := scanConsumerKeyRow(row)
+	if err != nil {
+		// 23505 = unique_violation; the (account_id, app_id, name)
+		// UNIQUE tripped. Mirrors the alert_deliveries / CreateAccount
+		// pattern — surface as ErrConflict so callers can use
+		// errors.Is(err, state.ErrConflict) independent of the pg path.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ConsumerKey{}, ErrConflict
+		}
+		return ConsumerKey{}, err
+	}
+	return k, nil
+}
+
+func (s *PgStore) GetConsumerKeyByID(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if accountID == "" || keyID == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where id = $1::uuid and account_id = $2::uuid`,
+		keyID, accountID)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
+}
+
+func (s *PgStore) ListConsumerKeysForApp(ctx context.Context, accountID, appID string) ([]ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return nil, ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where account_id = $1::uuid and app_id = $2::uuid
+		  order by created_at desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConsumerKey
+	for rows.Next() {
+		k, err := scanConsumerKeyRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// RevokeConsumerKey stamps revoked_at = now(). Idempotent: a second
+// call returns the same (already-revoked) row without error. We
+// don't filter on revoked_at IS NULL because the audit-trail
+// semantics demand that revoke-after-revoke still succeeds (the
+// response body carries the original revoke timestamp).
+func (s *PgStore) RevokeConsumerKey(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if accountID == "" || keyID == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`update consumer_keys
+		    set revoked_at = coalesce(revoked_at, now())
+		  where id = $1::uuid and account_id = $2::uuid
+		  returning `+consumerKeySelectCols,
+		keyID, accountID)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
+}
+
+// TouchConsumerKeyLastUsed stamps last_used_at = now(). Called
+// fire-and-forget from the gateway middleware; we don't fail the
+// request if the touch fails (best-effort observability).
+func (s *PgStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) error {
+	if keyID == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`update consumer_keys
+		    set last_used_at = now()
+		  where id = $1::uuid
+		    and revoked_at is null`,
+		keyID)
+	return err
+}
+
+// ConsumerKeyByAppAndPrefix is the gateway-side hot-path lookup.
+// (app_id, prefix) is the unique hot-path key — see the
+// consumer_keys_app_prefix_idx UNIQUE index in 00329 (the UNIQUE
+// is load-bearing: a non-UNIQUE index would let a birthday-bound
+// ~0.78% collision at Scale cap of 1000 keys/app silently collapse
+// the lookup to "first row found by the planner" and the constant-
+// time hash compare would run against the wrong key's bytes).
+//
+// CONTRACT: this method returns the row regardless of revoked_at
+// or expires_at. The caller (gatewayd-internal middleware in PR #5-C)
+// MUST call Active(now) on the returned row before the hash compare.
+// This is intentional — the read path stays passive so the audit
+// trail (revoked_at TIMESTAMPTZ + last_used_at) survives gateway
+// reads; the caller-side Active() is the single source of truth for
+// "is this key still usable right now". TouchConsumerKeyLastUsed
+// stays filtered on revoked_at IS NULL (no observability point in
+// stamping a revoked row's last_used_at).
+func (s *PgStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appID, prefix string) (ConsumerKey, error) {
+	if accountID == "" || appID == "" || prefix == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+consumerKeySelectCols+`
+		   from consumer_keys
+		  where app_id = $1::uuid
+		    and account_id = $2::uuid
+		    and prefix = $3`,
+		appID, accountID, prefix)
+	k, err := scanConsumerKeyRow(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, err
 }

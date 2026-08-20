@@ -329,6 +329,47 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	// Place the forked child into the leaf. Same race
 	// posture as runSidecar — see placeIntoLeaf's doc.
 	placeIntoLeaf(mainLeaf, cmd.Process.Pid, slog.Default())
+	// Cluster C / ADR-121: spawn the per-workload cgroup.events
+	// oom_kill listener (guest/init/cgroup_partition_linux.go::
+	// WatchOOM) for the duration of the main workload's lifetime.
+	// The listener exits on first fire (the workload is dead
+	// when an oom_kill lands) and on the context cancel that
+	// runAppWithEnv inherits from the boot path. This is the
+	// runtime-VM path — the build VM uses a different
+	// classification surface (classify(exitCode=137) →
+	// FailureOOM) and does not need this listener.
+	//
+	// planMB: we can't read the customer's deployment row from
+	// guest-init (the manifest doesn't carry the plan cap and
+	// vmmd doesn't currently inject one). The listener
+	// re-reads the leaf's memory.max on the kill event and
+	// falls back to 0 if the env is missing — the whycopy
+	// Observed closure degrades to the static prose when
+	// planMB=0, which is still a stamp (just less actionable
+	// than the templated text). A future PR wires a VMM cmd-
+	// line / env injection that surfaces the plan cap.
+	if mainLeaf != "" {
+		oomCtx, oomCancel := context.WithCancel(context.Background())
+		go func() {
+			defer oomCancel()
+			werr := WatchOOM(oomCtx, mainLeaf, 0, /* planMB — re-read on kill */
+				func(peakMB, pMB int) {
+					if eerr := EmitWorkloadOOM(oomCtx, peakMB, pMB); eerr != nil {
+						slog.Default().Warn("EmitWorkloadOOM failed",
+							"peak_mb", peakMB, "plan_mb", pMB, "err", eerr)
+					}
+				}, slog.Default())
+			if werr != nil && !errors.Is(werr, context.Canceled) {
+				slog.Default().Debug("WatchOOM listener returned",
+					"err", werr, "leaf", mainLeaf)
+			}
+		}()
+		// Cancel the OOM listener when the workload exits
+		// (graceful or crash). The cmd.Wait() return is the
+		// lifecycle signal; the listener exits within one
+		// 1s poll tick on next wake.
+		defer func() { oomCancel() }()
+	}
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("run %v: %w", argv, err)
 	}

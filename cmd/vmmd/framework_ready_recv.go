@@ -17,6 +17,7 @@
 //	[1B type=0x02][json envelope: sidecar_init_exit]
 //	[1B type=0x03][json envelope: sidecar_restart]
 //	[1B type=0x04][1B outcome][6B reserved][8B elapsed_ms BE uint64]
+//	[1B type=0x05][json envelope: workload_oom]                          ← NEW (Cluster C / ADR-121)
 //
 // The host strips the NUL-terminated runtime and uses the
 // preceding 4 bytes (if present) as the warmup_ms duration for
@@ -25,9 +26,12 @@
 // is the waitUntil(post-response tail) terminal-event channel:
 // a 16-byte fixed-size envelope with the per-task outcome
 // (completed / failed / timeout) and elapsed_ms in
-// milliseconds. Type outside the closed set {0x01, 0x02, 0x03,
-// 0x04} is dropped with a Warn (forward-compatible with future
-// event classes).
+// milliseconds. type=0x05 (Cluster C / ADR-121) is the
+// workload_OOM channel: the guest-init cgroup.events listener
+// emits a JSON envelope {peak_mb, plan_mb} when the per-VM
+// cgroup v2 leaf detects an oom_kill event. Type outside the
+// closed set {0x01, 0x02, 0x03, 0x04, 0x05} is dropped with a
+// Warn (forward-compatible with future event classes).
 //
 // Concurrency: one goroutine reads the DGRAM fd. Each receipt
 // is parsed and dispatched to the Manager synchronously. A
@@ -78,6 +82,20 @@ const (
 	// CID (same join the other three types use); the
 	// elapsed_ms payload feeds the telemetry histogram (PR 5).
 	VsockFrameworkReadyHostTypeTail byte = 0x04
+	// VsockFrameworkReadyHostTypeWorkloadOOM (Cluster C /
+	// ADR-121) is the discriminator byte for the workload-OOM
+	// signal emitted by the guest-init cgroup.events listener
+	// (guest/init/cgroup_partition_linux.go::WatchOOM). Same
+	// DGRAM port 1027 channel as the four closed-set siblings;
+	// the body is a small UTF-8 JSON envelope
+	// {"peak_mb":N,"plan_mb":N}. The host resolves instance
+	// identity from the DGRAM peer CID (same join) and
+	// forwards the (peakMB, planMB) tuple to
+	// Manager.ReportWorkloadOOM → schedd
+	// Engine.DestroyForWorkloadOOMFailure → whycopy
+	// CodeAppRuntimeOOM (templated peak + plan into the
+	// customer's ErrorWhy / ErrorFix prose).
+	VsockFrameworkReadyHostTypeWorkloadOOM byte = 0x05
 )
 
 // Sidecar init-exit status closed enum (issue #463 / ADR-069 /
@@ -244,6 +262,8 @@ func (r *FrameworkReadyReceiver) loop() {
 			r.dispatchSidecarRestart(instance, msg.Restart)
 		case parseFWReadyKindTail:
 			r.dispatchTailEvent(instance, msg.Tail)
+		case parseFWReadyKindWorkloadOOM:
+			r.dispatchWorkloadOOM(instance, msg.WorkloadOOM)
 		}
 	}
 }
@@ -369,12 +389,48 @@ func (r *FrameworkReadyReceiver) dispatchTailEvent(instance string, wire parseFW
 	_ = appID
 }
 
+// dispatchWorkloadOOM (Cluster C / ADR-121) is the type=0x05
+// dispatch path. The guest-init cgroup.events listener
+// detected an oom_kill on the per-VM workload cgroup v2 leaf
+// and emitted the (peakMB, planMB) tuple over DGRAM. The host
+// forwards the tuple to the Manager's optional workload-OOM
+// sink (wired in cmd/vmmd/main.go via fcvm.WithWorkloadOOMSink),
+// which in turn relays it to the schedd via the
+// ReportWorkloadOOM gRPC. The schedd stamps the deployment
+// with CodeAppRuntimeOOM and the whycopy Observed prose
+// (peak_mb + plan_mb templated into Why / Fix).
+//
+// Best-effort delivery: the guest-init exits its listener
+// after one emit (the workload is dead, the VM is about to be
+// torn down); a relay failure is logged at Warn, not Fatal,
+// because the customer's deploy was going to fail anyway.
+// The Manager's ReportWorkloadOOM is nil-safe: if the sink
+// was not wired (e.g. local-dev vmmd without schedd), the
+// call is a no-op.
+func (r *FrameworkReadyReceiver) dispatchWorkloadOOM(instance string, wire workloadOOMWire) {
+	if r.mgr == nil {
+		return
+	}
+	// peak_mb + plan_mb flow verbatim into the schedd; the
+	// whycopy Observed closure signs struct{ PeakMB, PlanMB int }
+	// (pkg/whycopy/whycopy.go::CodeAppRuntimeOOM). Zero values
+	// are tolerated at this boundary — the engine stamps
+	// whatever it gets; templating with peak=0 just degrades
+	// the customer's ErrorWhy to a generic prose (still stamps
+	// the code, doesn't fail the flow).
+	r.mgr.ReportWorkloadOOM(r.ctx, instance, wire.PeakMB, wire.PlanMB)
+	r.log.Debug("workload_oom dispatched", "instance", instance,
+		"peak_mb", wire.PeakMB, "plan_mb", wire.PlanMB)
+}
+
 // parseFWKind is the discriminator for
 // parseFrameworkReadyDatagram (issue #463 / ADR-069 /
 // ADR-071 / PR-C, extended for tail events in issue #667 /
-// ADR-078). Closed set: OK for type=0x01, InitExit for
-// type=0x02, Restart for type=0x03, Tail for type=0x04. A
-// future type=0x05 adds its own enum value here.
+// ADR-078, extended for workload OOM in Cluster C /
+// ADR-121). Closed set: OK for type=0x01, InitExit for
+// type=0x02, Restart for type=0x03, Tail for type=0x04,
+// WorkloadOOM for type=0x05. A future type=0x06 adds its
+// own enum value here.
 type parseFWKind uint8
 
 const (
@@ -385,6 +441,10 @@ const (
 	// parseFWReadyKindTail (issue #667 / ADR-078) — the
 	// waitUntil terminal-event receipt (type=0x04).
 	parseFWReadyKindTail
+	// parseFWReadyKindWorkloadOOM (Cluster C / ADR-121) — the
+	// workload OOM receipt (type=0x05) carrying a small
+	// UTF-8 JSON envelope with peak_mb / plan_mb.
+	parseFWReadyKindWorkloadOOM
 )
 
 // tailEventOutcome (issue #667 / ADR-078) mirrors the
@@ -404,8 +464,10 @@ const (
 // parseFWReadyMsg is the typed return of
 // parseFrameworkReadyDatagram. Type=0x01 fills WarmupMs +
 // Kind; type=0x02/0x03 fill the matching envelope; type=0x04
-// fills the Tail outcome + elapsed_ms. The instance id is NOT
-// on the wire — the host resolves it from the DGRAM peer CID.
+// fills the Tail outcome + elapsed_ms; type=0x05 (Cluster C /
+// ADR-121) fills WorkloadOOM's peak_mb + plan_mb. The
+// instance id is NOT on the wire — the host resolves it from
+// the DGRAM peer CID.
 type parseFWReadyMsg struct {
 	Kind     parseFWKind
 	WarmupMs int64
@@ -419,6 +481,15 @@ type parseFWReadyMsg struct {
 	// ElapsedMs is the wall-clock duration from waitUntil
 	// registration to terminal in milliseconds.
 	Tail parseFWReadyTailWire
+	// WorkloadOOM (Cluster C / ADR-121) carries the peak /
+	// plan MB tuple for type=0x05 only. Both are wall-clock
+	// integers MB units; the host flows them verbatim into
+	// Manager.ReportWorkloadOOM → schedd
+	// Engine.DestroyForWorkloadOOMFailure → whycopy
+	// CodeAppRuntimeOOM Observed closure template. Zero
+	// values are tolerated at the wire (the engine guard
+	// is downstream).
+	WorkloadOOM workloadOOMWire
 }
 
 // parseFWReadyTailWire is the type=0x04 body view (issue #667 /
@@ -430,6 +501,34 @@ type parseFWReadyTailWire struct {
 	Outcome   byte
 	ElapsedMs int64
 }
+
+// workloadOOMWire is the type=0x05 body view (Cluster C /
+// ADR-121). The wire is a small UTF-8 JSON envelope following
+// the type byte; shape:
+//
+//	[1B type=0x05][json:{"peak_mb":N,"plan_mb":N}]
+//
+// Body cap: see VsockWorkloadOOMMaxBody (256 bytes — the JSON
+// envelope of two ints is < 32 bytes; 256 is a generous
+// future-proof margin). The same struct is mirrored on the
+// guest-init emit side at guest/init/framework_ready_emit.go
+// (the values flow end-to-end into the schedd's
+// whycopy.Observed closure). The host does NOT validate the
+// numeric ranges here — payload hygiene is the guest's
+// responsibility; the schedd engine stamps whatever it
+// receives (the typed int conversion at
+// SchedAPI.DestroyForWorkloadOOMFailure is the schema
+// boundary).
+type workloadOOMWire struct {
+	PeakMB int `json:"peak_mb"`
+	PlanMB int `json:"plan_mb"`
+}
+
+// VsockWorkloadOOMMaxBody is the upper bound the host
+// will read for the type=0x05 JSON envelope. The actual
+// payload is < 32 bytes; the 256-byte bound is a
+// future-proof margin that still pinpoints a runaway sender.
+const VsockWorkloadOOMMaxBody uint32 = 256
 
 // TypeLabel returns a human-readable label of the discriminated
 // type, used only for diagnostic logs (Debug level).
@@ -443,6 +542,8 @@ func (m parseFWReadyMsg) TypeLabel() string {
 		return fmt.Sprintf("sidecar_restart(0x%02x)", VsockFrameworkReadyHostTypeRestart)
 	case parseFWReadyKindTail:
 		return fmt.Sprintf("tail_event(0x%02x)", VsockFrameworkReadyHostTypeTail)
+	case parseFWReadyKindWorkloadOOM:
+		return fmt.Sprintf("workload_oom(0x%02x)", VsockFrameworkReadyHostTypeWorkloadOOM)
 	default:
 		return "unknown"
 	}
@@ -516,6 +617,38 @@ func parseFrameworkReadyDatagram(b []byte) (parseFWReadyMsg, error) {
 		// just to discard it.
 		if len(rest) >= 15 {
 			msg.Tail.ElapsedMs = int64(binary.BigEndian.Uint64(rest[7:15]))
+		}
+	case VsockFrameworkReadyHostTypeWorkloadOOM:
+		// Cluster C / ADR-121: workload OOM signal emitted
+		// by the guest-init cgroup.events listener
+		// (guest/init/cgroup_partition_linux.go::WatchOOM).
+		// Wire layout after the type byte is a small
+		// UTF-8 JSON envelope:
+		//   {"peak_mb":<int>,"plan_mb":<int>}
+		// A malformed JSON envelope is rejected here
+		// (the dispatcher never sees it). The numeric
+		// ranges (peak_mb > 0, plan_mb > 0, peak_mb
+		// ≤ plan_mb) are intentionally NOT enforced at the
+		// host — payload hygiene is the guest's
+		// responsibility; the schedd engine is the type
+		// boundary and stamps whatever it receives.
+		//
+		// Review finding #5: the body cap is now enforced
+		// here. The read buffer is frameworkReadyMaxDatagram
+		// = 1024 (a generous margin that bounds ALL types),
+		// but the workload-OOM envelope is ≤ 32 bytes; a
+		// guest emitting > VsockWorkloadOOMMaxBody is a
+		// bug (the guest-side EmitWorkloadOOM clamps to
+		// workloadOOMEmitMaxBody = 256 before the socket
+		// opens). The host-side cap catches a hostile or
+		// buggy guest that bypasses the guest-side clamp.
+		if uint32(len(rest)) > VsockWorkloadOOMMaxBody {
+			return msg, fmt.Errorf("workload_oom: body too large: %d > %d",
+				len(rest), VsockWorkloadOOMMaxBody)
+		}
+		msg.Kind = parseFWReadyKindWorkloadOOM
+		if err := json.Unmarshal(rest, &msg.WorkloadOOM); err != nil {
+			return msg, fmt.Errorf("workload_oom: %w", err)
 		}
 	default:
 		return msg, fmt.Errorf("unknown msg sub-type 0x%02x", b[0])

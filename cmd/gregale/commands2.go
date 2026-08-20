@@ -158,8 +158,10 @@ const (
 	// with --show-scan / --show-secret-scan drill-downs and
 	// set-min-instances) and dispatchDeployments (which is the
 	// paginated list). `deploys` is the noun-form cluster — today
-	// it has one subcommand, `show <id>`, which reads the closed
-	// 6-stage state column via GET /v1/deployments/{id}/stages.
+	// it has two subcommands, `show <id>` and `status <id>`, which
+	// read the closed 6-stage state column via GET
+	// /v1/deployments/{id}/stages (and, for status, GET
+	// /v1/deployments/{id} for the footer timestamp).
 	dispatchDeploys = "deploys"
 
 	// Error-explanations cluster (spec §6.4 amendment 1):
