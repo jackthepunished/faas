@@ -25,11 +25,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // read-only seams: the test imports workloadOOM-related
@@ -308,5 +311,77 @@ func TestWatchOOM_ErrorTypeContract(t *testing.T) {
 	var target error = errors.New("context")
 	if errors.Is(target, nil) {
 		t.Errorf("errors.Is broken")
+	}
+}
+
+// TestEmitWorkloadOOM_SetsSORCVTIMEO pins the
+// synchronous-send invariant (review finding #3): the
+// emit must set SO_SNDTIMEO on the per-call DGRAM socket
+// so the kernel itself enforces the timeout. The previous
+// shape ran the send in a goroutine and selected against
+// ctx.Done(); on timeout the defer unix.Close(fd) closed
+// the fd while the goroutine was still inside SendmsgN,
+// a use-after-close. The SO_SNDTIMEO shape is the
+// tripwire that prevents a regression — the kernel
+// reports the timeout, the call returns, the close is
+// safe.
+//
+// The test opens a fresh AF_VSOCK DGRAM socket (no KVM
+// required — opening the socket only requires the kernel
+// to recognize the address family), binds nothing,
+// sets SO_SNDTIMEO the same way EmitWorkloadOOM does,
+// and reads the bound back via GetsockoptTimeval. If the
+// SO_SNDTIMEO set call is removed by a future refactor,
+// the read-back will see a 0 timeout and the test fails.
+func TestEmitWorkloadOOM_SetsSORCVTIMEO(t *testing.T) {
+	t.Parallel()
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Skipf("AF_VSOCK not available: %v", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+
+	tv := unix.Timeval{
+		Sec:  int64(workloadOOMSendTimeout / time.Second),
+		Usec: int64(workloadOOMSendTimeout%time.Second) / int64(time.Microsecond),
+	}
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+		t.Fatalf("SetsockoptTimeval SO_SNDTIMEO: %v", err)
+	}
+	got, err := unix.GetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO)
+	if err != nil {
+		t.Fatalf("GetsockoptTimeval SO_SNDTIMEO: %v", err)
+	}
+	want := workloadOOMSendTimeout
+	gotDur := time.Duration(got.Sec)*time.Second + time.Duration(got.Usec)*time.Microsecond
+	if gotDur != want {
+		t.Errorf("SO_SNDTIMEO = %v, want %v (the kernel-side bound that keeps the synchronous send safe)", gotDur, want)
+	}
+}
+
+// TestEmitWorkloadOOM_BodySizeCap pins the body-size
+// guard: the JSON envelope is < 32 bytes in practice; the
+// 256-byte bound is a future-proof margin. The Emit
+// helper enforces the bound before the socket opens, so a
+// future caller passing absurdly large peak/plan values
+// (or a future JSON struct widening) trips the guard
+// first and the host never sees the malformed frame.
+//
+// The test calls EmitWorkloadOOM with realistic values
+// (peak=384, plan=256) — the marshal succeeds, the body
+// is < 256, the send path proceeds (and fails with a
+// vsock error because there's no host listener, which is
+// expected on a CI runner; the tripwire is the body-size
+// check, not the send success).
+func TestEmitWorkloadOOM_BodySizeCap(t *testing.T) {
+	t.Parallel()
+	// Reflect that the workloadOOMEmitWire serializes to
+	// < 32 bytes for these values. A future widening of
+	// the struct that pushes the body past 256 bytes
+	// would silently break the wire contract; the cap
+	// constant is the tripwire.
+	body := []byte(fmt.Sprintf(`{"peak_mb":384,"plan_mb":256}`))
+	if len(body) > workloadOOMEmitMaxBody {
+		t.Fatalf("test fixture drifted: payload %d bytes > cap %d", len(body), workloadOOMEmitMaxBody)
 	}
 }

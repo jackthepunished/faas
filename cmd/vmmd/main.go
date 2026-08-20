@@ -1243,27 +1243,61 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// validation is host-local), but the sink is a no-op.
 	if deps.scheddTarget != "" {
 		mgr.WithWorkloadOOMSink(func(ctx context.Context, instanceID string, peakMB, planMB int) {
-			dialCtx, cancel := context.WithTimeout(ctx, ReportWorkloadOOMCtxTimeout)
-			defer cancel()
-			conn, err := wire.DialContext(dialCtx, deps.scheddTarget, deps.scheddClientTLS)
-			if err != nil {
-				log.Warn("vmmd: workload-OOM dial failed; engine will not be notified",
-					"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
-				return
-			}
-			defer func() { _ = conn.Close() }()
-			cli := scheddpb.NewScheddClient(conn)
-			if _, err := cli.ReportWorkloadOOM(dialCtx, &scheddpb.ReportWorkloadOOMRequest{
-				InstanceId: instanceID,
-				PeakMb:     uint32(peakMB),
-				PlanMb:     uint32(planMB),
-			}); err != nil {
-				log.Warn("vmmd: ReportWorkloadOOM RPC failed",
-					"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
-				return
-			}
-			log.Info("vmmd: workload-OOM drained to schedd",
-				"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB)
+			// Review finding #6: spawn the relay in a
+			// goroutine so the framework_ready recv loop
+			// returns immediately. The previous shape ran
+			// the dial + RPC synchronously inside the
+			// dispatchWorkloadOOM call, which is invoked
+			// from the framework_ready recv loop's
+			// single-threaded switch. A wedged schedd (or
+			// a slow TLS handshake) would block the entire
+			// DGRAM loop for the
+			// ReportWorkloadOOMCtxTimeout (3s) ceiling per
+			// OOM — and a fleet-wide OOM storm (10
+			// instances of the same app all hitting the
+			// plan cap) would queue a backlog of VMs
+			// waiting for the loop to drain. The
+			// goroutine shape lets the recv loop keep
+			// polling; each relay runs independently. The
+			// receiver's stored ctx (the closure's `ctx`
+			// here) is long-lived; the goroutine respects
+			// it via the dialCtx cancel propagation.
+			//
+			// Note: the liveness relay above still uses
+			// the synchronous shape — the liveness path
+			// is one-at-a-time per instance (a probe
+			// cycle is ~3s, so the relay throughput is
+			// bounded by the probe schedule). The
+			// workload-OOM path is bursty
+			// (fleet-wide OOMs from a single bad
+			// customer app), so the async shape is the
+			// correct fit here. A future PR can lift
+			// the liveness relay to the same shape if
+			// the operator's dashboard shows an
+			// liveness-driven backlog.
+			go func() {
+				dialCtx, cancel := context.WithTimeout(ctx, ReportWorkloadOOMCtxTimeout)
+				defer cancel()
+				conn, err := wire.DialContext(dialCtx, deps.scheddTarget, deps.scheddClientTLS)
+				if err != nil {
+					log.Warn("vmmd: workload-OOM dial failed; engine will not be notified",
+						"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				cli := scheddpb.NewScheddClient(conn)
+				if _, err := cli.ReportWorkloadOOM(dialCtx, &scheddpb.ReportWorkloadOOMRequest{
+					InstanceId: instanceID,
+					PeakMb:     uint32(peakMB),
+					PlanMb:     uint32(planMB),
+				}); err != nil {
+					log.Warn("vmmd: ReportWorkloadOOM RPC failed",
+						"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
+					return
+				}
+				log.Info("vmmd: workload-OOM drained to schedd",
+					"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB)
+			}()
 		})
 		log.Info("vmmd: workload-OOM relay wired",
 			"target", deps.scheddTarget,

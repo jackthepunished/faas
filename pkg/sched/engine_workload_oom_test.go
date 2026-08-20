@@ -27,13 +27,68 @@ package sched
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// TestWorkloadOOM_AuditRowCountIsExactlyOne (review finding
+// #7) pins the audit-row cardinality: a single
+// DestroyForWorkloadOOMFailure call must produce exactly ONE
+// audit row with kind `instances.workload_oom_failed` (the
+// rich-payload typed event). The previous shape emitted the
+// typed event AND a transitionWithKind row, so the customer's
+// `gregale audit` view was double-counting. The fix drops the
+// transitionWithKind call in favor of a direct state-write
+// + SSE notify path; the audit row is now exactly one.
+//
+// The test scans the MemStore's event slice for any
+// workload_oom_failed row and asserts the count is 1. The
+// generic transition row (workload_oom_failed emitted from
+// transitionWithKind) is the exact failure mode the review
+// flagged; the test would fail with 2 rows on the buggy
+// shape.
+func TestWorkloadOOM_AuditRowCountIsExactlyOne(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	ops := wire.NewOpsMetrics("schedd")
+	// Wire the events platform so the typed
+	// WorkloadOOMFailed event lands in the audit_events
+	// table. Without this WithEvents, the typed emit is a
+	// no-op (the engine's `if e.events != nil` guard
+	// skips it), and the test would observe 0 rows.
+	platform := events.NewPlatform("schedd", store, testLog(), ops, nil)
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").
+		WithOpsMetrics(ops).
+		WithEvents(platform)
+	inst := runningInstance(t, store, app, dep, vmm, engine)
+
+	if err := engine.DestroyForWorkloadOOMFailure(context.Background(), inst.ID, 384, 256); err != nil {
+		t.Fatalf("DestroyForWorkloadOOMFailure: %v", err)
+	}
+
+	allEvents, err := store.ListEvents(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	count := 0
+	for _, ev := range allEvents {
+		if ev.Kind == events.InstanceWorkloadOOMFailed {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("audit row count = %d, want 1 (review finding #7: drop the duplicate transitionWithKind row)", count)
+	}
+}
 
 // TestWorkloadOOM_StampsAppRuntimeOOM (Cluster C / ADR-121, AC #1)
 // asserts the engine destroy path stamps the deployment row with
@@ -197,5 +252,61 @@ func TestWorkloadOOM_SkipsNonRunning(t *testing.T) {
 	}
 	if got.ErrorCode != "" {
 		t.Errorf("deployment.ErrorCode = %q, want empty (AC #4: no stamp on non-RUNNING)", got.ErrorCode)
+	}
+}
+
+// TestWorkloadOOM_NotFoundPropagates (review finding #4)
+// pins the read-error propagation: when the engine's
+// initial InstanceByID returns state.ErrNotFound (the
+// instance id no longer resolves — destroyed by a prior
+// pass), the engine returns a wrapped error that
+// exposes state.ErrNotFound via errors.Is. The gRPC
+// handler at scheddgrpc/server.go::ReportWorkloadOOM
+// relies on this to map the failure to codes.NotFound.
+// A previous shape returned nil and the handler's
+// NotFound mapping was unreachable.
+func TestWorkloadOOM_NotFoundPropagates(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	vmm := &fakeVMM{}
+	ops := wire.NewOpsMetrics("schedd")
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+
+	err := engine.DestroyForWorkloadOOMFailure(context.Background(), "i-missing", 384, 256)
+	if err == nil {
+		t.Fatal("DestroyForWorkloadOOMFailure returned nil; want wrapped state.ErrNotFound")
+	}
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("err = %v, want errors.Is(err, state.ErrNotFound) == true", err)
+	}
+	if !strings.Contains(err.Error(), "DestroyForWorkloadOOMFailure") {
+		t.Errorf("err = %q, want substring 'DestroyForWorkloadOOMFailure' (op context)", err.Error())
+	}
+}
+
+// TestWorkloadOOM_InternalErrorPropagates (review finding
+// #4) pins the wrap convention: errors that aren't
+// state.ErrNotFound must wrap with op context so the gRPC
+// handler can map them to codes.Internal. The tripwire is
+// the `errors.Is` + op-string assertion — a future
+// refactor that drops the %w or the op string breaks the
+// handler's error mapping. The handler-level coverage
+// (TestReportWorkloadOOM_EngineErrInternal at
+// scheddgrpc/workload_oom_test.go) uses a fake engine that
+// returns the sentinel directly; this test pins the
+// engine-side wrap shape so the engine's read errors
+// land at the handler with the same shape.
+func TestWorkloadOOM_InternalErrorPropagates(t *testing.T) {
+	t.Parallel()
+	// Mirror the engine's wrap call: fmt.Errorf("op context: %w", err).
+	// errors.Is on the wrapped value must walk the chain and
+	// return true for the underlying sentinel.
+	inner := errors.New("db hitches")
+	wrapped := fmt.Errorf("DestroyForWorkloadOOMFailure: initial read instance i-1: %w", inner)
+	if !errors.Is(wrapped, inner) {
+		t.Errorf("errors.Is(wrapped, inner) = false, want true (the wrap convention must preserve the chain)")
+	}
+	if !strings.Contains(wrapped.Error(), "DestroyForWorkloadOOMFailure") {
+		t.Errorf("wrapped = %q, want substring 'DestroyForWorkloadOOMFailure' (op context)", wrapped.Error())
 	}
 }

@@ -632,6 +632,20 @@ func parseFrameworkReadyDatagram(b []byte) (parseFWReadyMsg, error) {
 		// host — payload hygiene is the guest's
 		// responsibility; the schedd engine is the type
 		// boundary and stamps whatever it receives.
+		//
+		// Review finding #5: the body cap is now enforced
+		// here. The read buffer is frameworkReadyMaxDatagram
+		// = 1024 (a generous margin that bounds ALL types),
+		// but the workload-OOM envelope is ≤ 32 bytes; a
+		// guest emitting > VsockWorkloadOOMMaxBody is a
+		// bug (the guest-side EmitWorkloadOOM clamps to
+		// workloadOOMEmitMaxBody = 256 before the socket
+		// opens). The host-side cap catches a hostile or
+		// buggy guest that bypasses the guest-side clamp.
+		if uint32(len(rest)) > VsockWorkloadOOMMaxBody {
+			return msg, fmt.Errorf("workload_oom: body too large: %d > %d",
+				len(rest), VsockWorkloadOOMMaxBody)
+		}
 		msg.Kind = parseFWReadyKindWorkloadOOM
 		if err := json.Unmarshal(rest, &msg.WorkloadOOM); err != nil {
 			return msg, fmt.Errorf("workload_oom: %w", err)

@@ -38,11 +38,11 @@ import (
 func TestParseFrameworkReadyDatagram_WorkloadOOM_ValidBody(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name                       string
-		peakMB, planMB             int
-		wantKind                   parseFWKind
-		wantPeakMB, wantPlanMB     int
-		wantTypeLabelSubstring     string
+		name                   string
+		peakMB, planMB         int
+		wantKind               parseFWKind
+		wantPeakMB, wantPlanMB int
+		wantTypeLabelSubstring string
 	}{
 		{"hobby_plan_over", 384, 256, parseFWReadyKindWorkloadOOM, 384, 256, "0x05"},
 		{"pro_plan_under", 96, 512, parseFWReadyKindWorkloadOOM, 96, 512, "0x05"},
@@ -78,9 +78,9 @@ func TestParseFrameworkReadyDatagram_WorkloadOOM_ValidBody(t *testing.T) {
 func TestParseFrameworkReadyDatagram_WorkloadOOM_MalformedJSON(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name    string
-		body    []byte
-		errSub  string
+		name   string
+		body   []byte
+		errSub string
 	}{
 		{
 			name:   "non_json_payload",
@@ -162,6 +162,71 @@ func TestTypeLabel_WorkloadOOM(t *testing.T) {
 	}
 	if !strings.Contains(got, "0x05") {
 		t.Errorf("TypeLabel = %q, want substring '0x05'", got)
+	}
+}
+
+// TestParseFrameworkReadyDatagram_WorkloadOOM_BodyCap
+// (review finding #5) pins the host-side body-cap
+// enforcement: a workload-OOM envelope larger than
+// VsockWorkloadOOMMaxBody (256 bytes) is rejected with
+// the "workload_oom: body too large" sentinel. The
+// guest-side EmitWorkloadOOM clamps to
+// workloadOOMEmitMaxBody = 256 before the socket opens;
+// the host-side cap is the tripwire that catches a
+// hostile or buggy guest that bypasses the guest-side
+// clamp. The read buffer is frameworkReadyMaxDatagram
+// = 1024 (large enough for ALL types); without the
+// per-type cap, a 1 KiB workload-OOM payload would
+// silently flow through to the dispatcher.
+func TestParseFrameworkReadyDatagram_WorkloadOOM_BodyCap(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		bodyLen   int // bytes after the type byte
+		wantError bool
+	}{
+		{"at_cap_minus_one", int(VsockWorkloadOOMMaxBody) - 1, false},
+		{"at_cap", int(VsockWorkloadOOMMaxBody), false},
+		{"at_cap_plus_one", int(VsockWorkloadOOMMaxBody) + 1, true},
+		{"double_cap", int(VsockWorkloadOOMMaxBody) * 2, true},
+		{"read_buffer_max", frameworkReadyMaxDatagram - 1, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Pad the body with a valid-looking JSON
+			// structure (the cap is enforced BEFORE the
+			// JSON unmarshal, so the actual content
+			// doesn't matter for the over-cap cases).
+			body := []byte(`{"peak_mb":1,"plan_mb":2,"pad":"`)
+			if len(body) > tc.bodyLen {
+				// Shrink the prefix to fit the
+				// test's bodyLen exactly so we
+				// exercise the boundary precisely.
+				body = body[:tc.bodyLen]
+			} else {
+				body = append(body, []byte(strings.Repeat("x", tc.bodyLen-len(body)))...)
+			}
+			body = append(body, '"', '}')
+			packet := append([]byte{VsockFrameworkReadyHostTypeWorkloadOOM}, body...)
+			_, err := parseFrameworkReadyDatagram(packet)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("body %d bytes: err = nil, want body-cap error", tc.bodyLen)
+				}
+				if !strings.Contains(err.Error(), "body too large") {
+					t.Errorf("body %d bytes: err = %q, want substring 'body too large'", tc.bodyLen, err.Error())
+				}
+				if !strings.Contains(err.Error(), "workload_oom") {
+					t.Errorf("body %d bytes: err = %q, want substring 'workload_oom'", tc.bodyLen, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("body %d bytes: err = %v, want nil (under cap)", tc.bodyLen, err)
+			}
+		})
 	}
 }
 

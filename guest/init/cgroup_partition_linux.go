@@ -260,16 +260,32 @@ type workloadOOMEMitter func(peakMB, planMB int)
 // class.
 //
 // Implementation: poll(2) with POLLPRI on the leaf's
-// cgroup.events file (a "memory" event file). Each wakeup
-// re-reads the leaf's memory.events file for the
-// oom_kill counter (the field that increments when the
-// memory controller kills a child) and compares against
-// the delta — the listener tracks the DELTA, not the
-// absolute counter (a leaf with pre-existing kills
-// shouldn't fire on watch start).
+// memory.events file. The kernel publishes memory.events
+// as a seqfile that supports poll(2) — POLLPRI fires
+// when ANY of its counters (low, high, max, oom, oom_kill,
+// oom_group_kill) increments. We track the oom_kill
+// counter specifically; oom_kill fires when the memory
+// controller kills a child.
+//
+// Why memory.events, NOT cgroup.events (review finding #1):
+// the kernel's cgroup.events file only fires POLLPRI on
+// populated/frozen transitions, NOT on memory.events
+// oom_kill increments. A previous implementation polled
+// cgroup.events and missed every real OOM kill — the
+// listener would only fire when the workload started
+// or exited (populated flips), which is too late: the
+// processes are already torn down by the time the
+// listener wakes. The kernel DOES fire POLLPRI on
+// memory.events (per Linux kernel
+// Documentation/admin-guide/cgroup-v2.rst §5.2 "memory.events"),
+// so we poll that file instead. Each wakeup re-reads
+// the leaf's memory.events file for the oom_kill counter
+// and compares against the delta — the listener tracks
+// the DELTA, not the absolute counter (a leaf with
+// pre-existing kills shouldn't fire on watch start).
 //
 // Short-read tolerance: the kernel may truncate
-// cgroup.events (it's a seqfile). The poll loop treats
+// memory.events (it's a seqfile). The poll loop treats
 // any read returning EOS as a re-try; ctx.Done() is the
 // only real exit signal.
 func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMitter, log *slog.Logger) error {
@@ -279,14 +295,15 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 	if emit == nil {
 		return errors.New("WatchOOM: nil emitter")
 	}
-	leaf += "/cgroup.events"
-	// Open the cgroup.events file (read-only, non-blocking).
-	// The kernel publishes cgroup.events as a seqfile that
-	// supports poll(2) — POLLPRI fires when the file is
-	// updated (the per-cgroup event counters increment).
-	fd, err := syscall.Open(leaf, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	leafDir := leaf
+	eventsPath := filepath.Join(leafDir, "memory.events")
+	// Open the memory.events file (read-only, non-blocking).
+	// The kernel publishes memory.events as a seqfile that
+	// supports poll(2) — POLLPRI fires when any of its
+	// counters (including oom_kill) increments.
+	fd, err := syscall.Open(eventsPath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return fmt.Errorf("WatchOOM: open %s: %w", leaf, err)
+		return fmt.Errorf("WatchOOM: open %s: %w", eventsPath, err)
 	}
 	defer func() { _ = unix.Close(fd) }()
 
@@ -294,7 +311,7 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 	// already has kills on watch-start does not fire
 	// spuriously. We re-read on every wakeup and compare
 	// against this baseline.
-	baseline, _ := readCgroupEventsOOMKills(leaf)
+	baseline, _ := readMemoryEventsOOMKills(leafDir)
 
 	pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLPRI}}
 	buf := make([]byte, 4096)
@@ -305,7 +322,7 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 			return err
 		}
 		// 1s poll timeout keeps ctx cancellation
-		// responsive without burning CPU. cgroup.events
+		// responsive without burning CPU. memory.events
 		// updates don't fire frequently in a healthy
 		// workload, so the wake is event-driven, not
 		// timer-driven.
@@ -331,13 +348,13 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 			// Non-fatal: continue the loop, the
 			// next poll tick will re-check.
 			if log != nil {
-				log.Debug("WatchOOM: cgroup.events read", "err", rerr)
+				log.Debug("WatchOOM: memory.events read", "err", rerr)
 			}
 		}
 		// Re-sample the leaf's memory.events for the
 		// current oom_kill counter. Compare against
 		// the baseline; a delta is the trigger.
-		current, currentErr := readMemoryEventsOOMKills(filepath.Dir(leaf))
+		current, currentErr := readMemoryEventsOOMKills(leafDir)
 		if currentErr != nil {
 			if log != nil {
 				log.Debug("WatchOOM: memory.events read", "err", currentErr)
@@ -345,7 +362,7 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 			continue
 		}
 		if current <= baseline {
-			// No new kill yet. The cgroup.events
+			// No new kill yet. The memory.events
 			// wakeup may have been a different
 			// event (e.g. memory.low); keep
 			// polling.
@@ -359,20 +376,23 @@ func WatchOOM(ctx context.Context, leaf string, planMB int, emit workloadOOMEMit
 		// emitted under memory.events.high). Fall back
 		// to memory.current (the live usage) if high
 		// is unavailable.
-		peakBytes, _ := readMemoryHighOrCurrent(filepath.Dir(leaf))
+		peakBytes, _ := readMemoryHighOrCurrent(leafDir)
 		peakMB := int((peakBytes + (1 << 20) - 1) >> 20) // ceil to MB
 		// planMB on the wire signature is the customer's
-		// plan cap. If the caller passed 0 (legacy /
-		// unknown plan), re-read the leaf's memory.max
-		// here. The byte count is rounded to MB; a 0
-		// reading (missing file) drops to a static
-		// whycopy prose rather than templated.
+		// plan cap. The caller must pass the real
+		// plan MB (mirroring how the schedd stamps
+		// Why / Fix prose); if the caller passes 0
+		// (legacy / unknown plan) we leave it 0 and
+		// the whycopy Observed closure degrades to
+		// the static prose. We intentionally do NOT
+		// re-read the leaf's memory.max — it's a
+		// 1 MiB defense-in-depth floor set by
+		// partitionInto, not the customer's plan cap.
+		// Reading it produces misleading "1 MB plan"
+		// prose. See review finding #2 — a future PR
+		// should inject the real plan cap via a vmmd
+		// boot env var.
 		effectivePlanMB := planMB
-		if effectivePlanMB == 0 {
-			if maxBytes, merr := readMemoryMax(filepath.Dir(leaf)); merr == nil {
-				effectivePlanMB = int((maxBytes + (1 << 20) - 1) >> 20)
-			}
-		}
 		emit(peakMB, effectivePlanMB)
 		return nil
 	}

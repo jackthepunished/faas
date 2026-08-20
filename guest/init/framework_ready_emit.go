@@ -46,6 +46,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// workloadOOMSendTimeout is the SO_SNDTIMEO we set on the
+// per-call DGRAM socket. The kernel enforces the bound
+// itself (the send returns ETIMEDOUT past the deadline),
+// so the call can be synchronous — no goroutine, no
+// post-cancel use-after-close race. 1s is long enough for
+// the host's framework_ready_recv loop to drain a single
+// datagram (the loop is a hot busy-poll on the vsock fd,
+// so the actual receipt is sub-millisecond), short enough
+// that a wedged host doesn't bleed back into the WatchOOM
+// listener.
+const workloadOOMSendTimeout = 1 * time.Second
+
 // workloadOOMEMitType is the discriminator byte for
 // the workload-OOM DGRAM body on VsockFrameworkReadyPort.
 // MUST stay in sync with
@@ -110,28 +122,45 @@ func EmitWorkloadOOM(ctx context.Context, peakMB, planMB int) error {
 	}
 	defer func() { _ = unix.Close(fd) }()
 
+	// Bound the synchronous send with SO_SNDTIMEO so the
+	// kernel itself returns ETIMEDOUT past the deadline
+	// (this is the standard pattern; the host-side
+	// SOL_SOCKET/SO_RCVTIMEO at cmd/vmmd/liveness_recv.go
+	// is the matching recv bound). Review finding #3:
+	// the previous shape ran the send in a goroutine and
+	// selected against sendCtx.Done(); on timeout the
+	// defer unix.Close(fd) closed the fd while the
+	// goroutine was still inside SendmsgN, a textbook
+	// use-after-close. The SO_SNDTIMEO shape removes the
+	// goroutine entirely — the call is synchronous, the
+	// fd is closed only after the kernel reports the
+	// outcome, and the worst-case latency is bounded by
+	// the socket timeout instead of the goroutine
+	// scheduler.
+	tv := unix.Timeval{
+		Sec:  int64(workloadOOMSendTimeout / time.Second),
+		Usec: int64(workloadOOMSendTimeout%time.Second) / int64(time.Microsecond),
+	}
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+		return fmt.Errorf("EmitWorkloadOOM: setsockopt SO_SNDTIMEO: %w", err)
+	}
+
 	// Honor ctx cancel before the send by short-circuiting
-	// the dial path. The send itself has no native ctx
-	// integration; we run it in a goroutine and select
-	// against ctx.Done().
+	// the dial path. The synchronous send itself is bounded
+	// by SO_SNDTIMEO so a wedged host returns ETIMEDOUT
+	// promptly; the ctx branch is the "VM shutdown before
+	// send" path (the send was never attempted).
+	if err := sendCtx.Err(); err != nil {
+		return fmt.Errorf("EmitWorkloadOOM: send ctx done: %w", err)
+	}
 	dst := &unix.SockaddrVM{
 		CID:  unix.VMADDR_CID_HOST,
 		Port: VsockFrameworkReadyPort,
 	}
-	errCh := make(chan error, 1)
-	go func() {
-		_, serr := unix.SendmsgN(fd, frame, nil, dst, 0)
-		errCh <- serr
-	}()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("EmitWorkloadOOM: send: %w", err)
-		}
-		return nil
-	case <-sendCtx.Done():
-		return fmt.Errorf("EmitWorkloadOOM: send timeout: %w", sendCtx.Err())
+	if _, err := unix.SendmsgN(fd, frame, nil, dst, 0); err != nil {
+		return fmt.Errorf("EmitWorkloadOOM: send: %w", err)
 	}
+	return nil
 }
 
 // workloadOOMEmitWire is the JSON envelope for the type=0x05

@@ -5107,14 +5107,30 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 func (e *Engine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID string, peakMB, planMB int) error {
 	// Two reads: a fresh InstanceByID for the app_id +
 	// deployment_id, then a re-read under the lock to confirm
-	// state hasn't moved. Both reads are best-effort — a missing
-	// row means a Park / Destroy race already cleaned up; we
-	// return nil so the vmmd framework_ready recv loop doesn't
-	// accumulate retries.
+	// state hasn't moved.
+	//
+	// Review finding #4: the original shape returned nil on
+	// any InstanceByID error so the gRPC handler's
+	// `errors.Is(err, state.ErrNotFound)` mapping was
+	// unreachable — the handler always saw nil and replied
+	// Ok=true. The fix returns the read error so the handler
+	// can map NotFound → codes.NotFound and Internal →
+	// codes.Internal. DestroyForLivenessFailure uses the
+	// nil-return shape because the liveness poll goroutine
+	// is a retry loop (silent no-op is desired); the
+	// workload-OOM path is a single-shot RPC, so a
+	// NotFound is operationally distinct from a healthy
+	// idempotent no-op (the caller should know the
+	// instance row is gone).
 	fresh, err := e.store.InstanceByID(ctx, instanceID)
 	if err != nil {
 		e.ledger.Release(instanceID)
-		return nil
+		// Pass the typed error through with operation context
+		// (pkg/api/errors.go convention: %w + op string). The
+		// gRPC handler at scheddgrpc/server.go::ReportWorkloadOOM
+		// maps state.ErrNotFound → codes.NotFound and any other
+		// error → codes.Internal.
+		return fmt.Errorf("DestroyForWorkloadOOMFailure: initial read instance %s: %w", instanceID, err)
 	}
 	appID := fresh.AppID
 	deploymentID := fresh.DeploymentID
@@ -5129,13 +5145,15 @@ func (e *Engine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID st
 	freshLocked, err := e.store.InstanceByID(ctx, instanceID)
 	if err != nil {
 		e.ledger.Release(instanceID)
-		return nil
+		return fmt.Errorf("DestroyForWorkloadOOMFailure: locked read instance %s: %w", instanceID, err)
 	}
 	if state.State(freshLocked.State) != state.StateRunning {
 		// Race: a Park / Wake / prior watchdog already moved
 		// the row. Mirror the liveness path — release the
 		// reservation in case it leaked, but don't second-guess
-		// the state machine.
+		// the state machine. Return nil so the handler replies
+		// Ok=true (the idempotent no-op the wire contract
+		// promises).
 		e.ledger.Release(instanceID)
 		return nil
 	}
@@ -5181,6 +5199,19 @@ func (e *Engine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID st
 	// `GET /v1/audit-events?kind_prefix=instances.workload_*`
 	// filter surfaces it; the data JSON carries the observed
 	// (peak_mb, plan_mb) payload for the operator dashboard.
+	//
+	// Review finding #7: the previous shape emitted TWO
+	// audit rows per OOM — this typed event AND the
+	// transitionWithKind call below (which also writes
+	// to audit_events via AppendEvent). The scheduler-side
+	// dashboard panel subscribes to the typed event for
+	// the rich payload (peak_mb, plan_mb); the customer's
+	// `gregale audit` view was double-counting. The fix
+	// keeps the typed event (it carries the rich payload) and
+	// drops the transitionWithKind call in favor of the
+	// direct state-write + SSE notify path. The state
+	// transition is unchanged (RUNNING → STOPPED) but the
+	// audit row is now exactly one.
 	if e.events != nil {
 		e.events.Emit(ctx, events.WorkloadOOMFailed{
 			EmitAt:       now,
@@ -5192,11 +5223,19 @@ func (e *Engine) DestroyForWorkloadOOMFailure(ctx context.Context, instanceID st
 		})
 	}
 
-	// RUNNING → STOPPED with the workload_oom_failed kind. The
-	// reason field carries the observed (peak, plan) for the
-	// audit row's data JSON.
-	reason := fmt.Sprintf("peak_mb=%d plan_mb=%d", peakMB, planMB)
-	e.transitionWithKind(ctx, instanceID, appID, state.StateStopped, "workload_oom_failed", reason)
+	// RUNNING → STOPPED — state transition without a
+	// second audit row. UpdateInstanceStateToTerminal
+	// stamps terminal_at on the same UPDATE so the §17
+	// retention sweep has a correct age anchor (see the
+	// comment on transitionWithKind at engine.go:5393-5398
+	// for the terminal-state column rationale). The SSE
+	// notification goes through emitInstanceChanged so
+	// subscribers see the column flip on the dashboard.
+	if err := e.store.UpdateInstanceStateToTerminal(ctx, instanceID, string(state.StateStopped), now); err != nil {
+		e.log.Warn("workload_oom: write terminal state",
+			"instance", instanceID, "err", err)
+	}
+	e.emitInstanceChanged(ctx, instanceID, appID, state.StateStopped, "") // wake_id already on the row; the direct-write path doesn't re-load it.
 
 	// Counter emission. Cardinality bounds match LivenessRestarts.
 	// Empty tuples are collapsed to "unknown" inside the metrics
