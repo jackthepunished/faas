@@ -1375,6 +1375,32 @@ type CustomDomain struct {
 // Verified reports whether the TXT challenge has been satisfied.
 func (d CustomDomain) Verified() bool { return !d.VerifiedAt.IsZero() }
 
+// DomainDoctorObservation (ADR-120) is the dns_poller's
+// view of a per-domain probe pass. The struct mirrors the
+// domain_doctor_observations table (migrations/00309) so
+// the apid handler can hand the row straight to the
+// doctor DTO without per-field translation. The
+// nullable-ish fields use *string / *bool / time.Time-zero
+// rather than sql.NullX because the table is hand-rolled
+// pgx and the conversion happens at the store boundary.
+type DomainDoctorObservation struct {
+	Domain          string
+	SurfaceID       string // empty for legacy custom_domains rows
+	ObservedAt      time.Time
+	DNSRecordFound  bool
+	PointsToGregale bool
+	CAAPermits      *bool // nil = no CAA published (allowed by default)
+	IPv6Conflict    bool
+	ObservedTarget  string
+	ObservedAAAA    string
+	CAAObserved     string
+	CertState       string // none|pending|issued|failed|dial_failed
+	CertNotAfter    time.Time
+	LastError       string
+	DNSCheckedAt    time.Time
+	CertCheckedAt   time.Time
+}
+
 // Cron is a scheduled synthetic POST through gatewayd-internal (spec §4.3).
 type Cron struct {
 	ID          string
