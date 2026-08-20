@@ -38,9 +38,14 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 		// doctor probe pass. Gated on api.DomainDoctorEnabled()
 		// so an operator can disable the doctor without bouncing
 		// the daemon — same dark-launch pattern as the
-		// tenant-surfaces branch above.
+		// tenant-surfaces branch above. ADR-120 Tier A1: when the
+		// flag is OFF, bump the skipped_flag_disabled counter so
+		// an operator can correlate a fleet-wide stale-domain alert
+		// with an explicit opt-out.
 		if api.DomainDoctorEnabled() {
 			s.runDoctorOnce(ctx, log)
+		} else {
+			s.emitDoctorSkip(log)
 		}
 		for {
 			select {
@@ -50,6 +55,8 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 				s.runVerifyOnce(ctx, log)
 				if api.DomainDoctorEnabled() {
 					s.runDoctorOnce(ctx, log)
+				} else {
+					s.emitDoctorSkip(log)
 				}
 			}
 		}
@@ -233,6 +240,62 @@ func (s *server) runDoctorOnce(ctx context.Context, log *slog.Logger) {
 		s.runDoctorForDomain(domainCtx, log, domain)
 		cancel()
 	}
+	// ADR-120 Tier A1: refresh the apid_domain_doctor_oldest_
+	// observation_seconds gauge after the pass completes. The
+	// gauge tracks (now − min(observed_at)) over every row, so a
+	// single misbehaving domain can keep the alert quiet; the
+	// dashboard renders per-domain staleness separately. We set
+	// 0 when the row set is empty (cold start) and the wall-clock
+	// age when rows exist. Backs FaasDomainDoctorStalled
+	// (page, 30m) and FaasDomainDoctorStretched (warn, 30m) at
+	// deploy/ansible/roles/prometheus/files/faas.rules.yml.
+	s.emitDoctorOldestObservationGauge(ctx, log)
+}
+
+// emitDoctorOldestObservationGauge (ADR-120 Tier A1) reads
+// every row in domain_doctor_observations, picks the minimum
+// observed_at, and Sets apid_domain_doctor_oldest_observation_seconds
+// to the wall-clock age. On an empty row set (cold start) it
+// Sets 0 so the gauge never returns the stale last value after
+// a deploy. Best-effort — a Store read failure is logged + the
+// gauge is left untouched (the previous value is retained so a
+// transient DB hiccup doesn't false-page on-call).
+func (s *server) emitDoctorOldestObservationGauge(ctx context.Context, log *slog.Logger) {
+	if s.ops == nil {
+		return
+	}
+	oldest, err := s.store.OldestDoctorObservation(ctx)
+	if err != nil {
+		log.Warn("dns_poller: oldest doctor observation read failed", "err", err)
+		return
+	}
+	if oldest.IsZero() {
+		s.ops.DomainDoctorOldestObservationSeconds().Set(0)
+		return
+	}
+	age := time.Since(oldest).Seconds()
+	if age < 0 {
+		// Clock skew between the apid host and Postgres can yield a
+		// negative age; clamp to zero so the gauge never goes
+		// negative (Prometheus doesn't render negative gauges well
+		// and the alert's `time() − timestamp(<gauge>)` expression
+		// would mis-fire).
+		age = 0
+	}
+	s.ops.DomainDoctorOldestObservationSeconds().Set(age)
+}
+
+// emitDoctorSkip (ADR-120 Tier A1) bumps the
+// apid_domain_doctor_skipped_flag_disabled_total counter so an
+// operator can correlate a "doctor stale" alert with an explicit
+// FAAS_DOMAIN_DOCTOR_ENABLED=false opt-out. Called once per
+// dns_poller tick when the flag is off. Best-effort — nil-safe.
+func (s *server) emitDoctorSkip(log *slog.Logger) {
+	if s.ops == nil {
+		return
+	}
+	s.ops.DomainDoctorSkippedFlagDisabled().Inc()
+	log.Debug("doctor pass skipped — FAAS_DOMAIN_DOCTOR_ENABLED off")
 }
 
 func (s *server) runDoctorForDomain(ctx context.Context, log *slog.Logger, domain string) {

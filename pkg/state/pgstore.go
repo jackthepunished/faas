@@ -6230,6 +6230,27 @@ func nullableTime(t time.Time) any {
 	return t
 }
 
+// OldestDoctorObservation (ADR-120 Tier A1) returns
+// MIN(observed_at) across domain_doctor_observations. Returns
+// the zero time.Time on an empty table so the dns_poller can
+// distinguish "cold start" from "stalled loop" — a stale poll
+// yields a non-zero MIN(...) that grows monotonically with
+// time.Since(now) while a fresh cold start yields zero. The
+// query is a single row scan; no transaction needed.
+func (s *PgStore) OldestDoctorObservation(ctx context.Context) (time.Time, error) {
+	var oldest *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select min(observed_at) from domain_doctor_observations`,
+	).Scan(&oldest)
+	if err != nil {
+		return time.Time{}, mapErr(err)
+	}
+	if oldest == nil {
+		return time.Time{}, nil
+	}
+	return *oldest, nil
+}
+
 // --- crons -------------------------------------------------------------------
 
 func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error) {

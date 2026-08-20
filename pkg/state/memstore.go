@@ -5001,6 +5001,23 @@ func (m *MemStore) ListAllCustomDomainsForDoctor(_ context.Context) ([]string, e
 	return out, nil
 }
 
+// OldestDoctorObservation (ADR-120 Tier A1) walks the in-memory
+// doctorObs map and returns the earliest observed_at. Returns the
+// zero time.Time when no observations exist so the dns_poller can
+// distinguish "cold start" from "stalled loop". Mirrors the
+// MIN(observed_at) SQL path in PgStore.OldestDoctorObservation.
+func (m *MemStore) OldestDoctorObservation(_ context.Context) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldest time.Time
+	for _, obs := range m.doctorObs {
+		if oldest.IsZero() || obs.ObservedAt.Before(oldest) {
+			oldest = obs.ObservedAt
+		}
+	}
+	return oldest, nil
+}
+
 // --- Crons ------------------------------------------------------------------
 
 func (m *MemStore) CreateCron(_ context.Context, appID, schedule, path string, enabled bool) (Cron, error) {

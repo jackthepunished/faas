@@ -2020,6 +2020,17 @@ type Store interface {
 	UpsertDoctorObservation(ctx context.Context, obs DomainDoctorObservation) error
 	GetDoctorObservation(ctx context.Context, domain string) (DomainDoctorObservation, error)
 	ListAllCustomDomainsForDoctor(ctx context.Context) ([]string, error)
+	// OldestDoctorObservation (ADR-120 Tier A1) returns the
+	// minimum observed_at across every row in
+	// domain_doctor_observations, or the zero time.Time when the
+	// table is empty (cold start). The dns_poller
+	// (cmd/apid/dns_poller.go::emitDoctorOldestObservationGauge)
+	// converts that to a wall-clock age and Sets
+	// apid_domain_doctor_oldest_observation_seconds so the
+	// FaasDomainDoctorStalled / FaasDomainDoctorStretched alerts
+	// can page on a stalled loop. Hand-rolled (not sqlc) — a
+	// one-line MIN(...) query doesn't justify a generated method.
+	OldestDoctorObservation(ctx context.Context) (time.Time, error)
 
 	// Tenant surfaces (ADR-100; apid is sole writer to tenant_surfaces
 	// and tenant_hostnames). The pg_notify trigger
