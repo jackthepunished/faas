@@ -397,11 +397,25 @@ type AppDetailData struct {
 // entirely. non-nil Stages carries a pre-rendered HTML block
 // (handler-edge projection via pkg/dashboard/stages) so the
 // template only inlines the result and needs zero FuncMap wiring.
+//
+// Retry (ADR-117 §Production-ready follow-on, C4): when the
+// deployment row's status is "failed" AND the customer's plan
+// allows deploy (every paid plan does today; Free gates via a
+// separate CodePlanDeployBlocked), CanRetry flips true and the
+// template renders the "Retry from this stage" form posting to
+// /dashboard/apps/{slug}/deployments/{id}/retry. RetryFromStage
+// carries the failing stage's name (drives the hidden input),
+// and DeploymentRetryCSRF is the sealed token binding
+// (action="retry_deployment", account_id) minted by the renderer
+// (same pattern as dashboardDelete / dashboardFireCron).
 type DeploymentDetailData struct {
-	App        AppListItem
-	Deployment DeploymentItem
-	Scan       *ScanPayload
-	Stages     *StagePayload
+	App                 AppListItem
+	Deployment          DeploymentItem
+	Scan                *ScanPayload
+	Stages              *StagePayload
+	CanRetry            bool
+	RetryFromStage      string
+	DeploymentRetryCSRF string
 }
 
 // StagePayload is the dashboard-local mirror of the closed-6-stage
@@ -418,10 +432,36 @@ type DeploymentDetailData struct {
 // include the timestamp). The customer-facing footer copy lives
 // inside BodyHTML so the template can't drift from the CLI's
 // text renderer.
+//
+// Failure (ADR-117 §Production-ready follow-on, C4) is a
+// handler-edge whycopy projection for failed rows. When the
+// deployment row's ErrorCode is in the CodeStage* set, the
+// handler calls pkg/whycopy.Decorate against the typed
+// api.Problem to lift title/hint/why/fix prose, then renders
+// the cluster-A `.error-explanation` HTML block alongside the
+// timeline. nil Failure omits the section in the template;
+// non-nil Failure carries the pre-rendered, html/template-safe
+// fragment. The seam lives at the handler edge so pkg/dashboard
+// stays free of pkg/whycopy and pkg/api imports.
 type StagePayload struct {
-	BodyHTML   template.HTML
-	Status     string
-	TerminalAt time.Time
+	BodyHTML           template.HTML
+	Status             string
+	TerminalAt         time.Time
+	FailureExplanation *StageFailureExplanation
+}
+
+// StageFailureExplanation is the pre-rendered structured
+// hint/why/fix block for one failed deployment row. Mirrors the
+// cluster-A `.error-explanation` CSS convention
+// (pkg/dashboard/templates/deployment_detail.html). All fields
+// carry html-escaped strings so the template can inline them via
+// {{ .Hint | safeHTML }} without a template.HTML cast (cluster A
+// precedent at pkg/dashboard/views/render.go:274/311).
+type StageFailureExplanation struct {
+	Title string
+	Hint  string
+	Why   string
+	Fix   string
 }
 
 // DomainDoctorView (ADR-120 Tier A2) is the dashboard-facing

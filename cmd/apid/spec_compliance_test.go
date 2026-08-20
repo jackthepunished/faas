@@ -72,7 +72,7 @@ var routeExclude = map[string]bool{
 	// must move together; the SDK does not model operator-only
 	// surfaces, and the public OpenAPI spec does not document
 	// them.
-	"GET /v1/admin/obs/overview":                      true, // ADR-091 — operator-only
+"GET /v1/admin/obs/overview":                      true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/tenants":                       true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/tenants/{id}":                  true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes":                         true, // ADR-091 — operator-only
@@ -98,6 +98,7 @@ var routeExclude = map[string]bool{
 	"GET /dashboard/account/dpa":                      true, // session-auth twin of DPA
 	"POST /dashboard/raise-overage-cap":               true, // HTML form (issue #561)
 	"POST /dashboard/apps/{slug}/crons/{id}/fire-now": true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
+	"POST /dashboard/apps/{slug}/deployments/{id}/retry": true, // HTML form, per-stage retry (ADR-117 §Production-ready follow-on C4); CSRF sealed envelope, no SDK twin
 	"POST /v1/cli-auth/code":                          true, // CLI device-code mint
 	"POST /v1/cli-auth/exchange":                      true, // CLI device-code exchange
 	"GET /cli-auth":                                   true, // dashboard claim form
@@ -105,7 +106,7 @@ var routeExclude = map[string]bool{
 	"GET /status":                                     true, // public HTML status page
 	"GET /status/slo.json":                            true, // public status JSON
 	"GET /healthz":                                    true, // loopback infra probe
-	"GET /readyz":                                     true, // loopback dependency-aware readiness probe
+	"GET /readyz":                                     true, // loopback dependency-aware readiness probe (PR #1038 pre-release-readiness-gates)
 	"GET /v1/orgs/me":                                 true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 	"GET /v1/traces/{trace_id}":                       true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
 	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's

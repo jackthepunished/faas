@@ -1735,6 +1735,16 @@ func (s *server) handler() http.Handler {
 	// (Go 1.22+ mux needs concrete segment counts; the
 	// /crons/{id}/fire-now suffix is the path tail).
 	mux.Handle("POST /dashboard/apps/{slug}/crons/{id}/fire-now", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardFireCron))))
+	// ADR-117 §Production-ready follow-on, C4 — dashboard-side
+	// retry form handler. The form is <form method="POST"> (not
+	// XHR), so the endpoint takes the CSRF sealed-envelope path
+	// instead of the v1 Bearer-key envelope. The handler does the
+	// same two-step IDOR probe as cmd/apid/handlers_retry.go and
+	// calls s.store.RetryDeploymentFromStage; on success it
+	// redirects to /dashboard/apps/{slug}/deployments/<new-id>
+	// so the customer's next page-load sees the live SSE stream
+	// for the fresh row.
+	mux.Handle("POST /dashboard/apps/{slug}/deployments/{id}/retry", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRetryDeployment))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires

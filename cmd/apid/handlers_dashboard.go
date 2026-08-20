@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // dashboardAccountPath is the route served by renderAccount below.
@@ -1821,6 +1822,42 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 	} else if stagePayload.BodyHTML != "" {
 		data.Stages = &stagePayload
 	}
+	// C4 (ADR-117 §Production-ready follow-on): mint a retry-form
+	// CSRF token + flip CanRetry on failed rows that have a known
+	// failing stage in the stage_state jsonb. The token is the
+	// sealed envelope (action="retry_deployment", account_id)
+	// pattern shared with dashboardDelete / dashboardFireCron —
+	// never the bare cookie. When CanRetry is false the template
+	// omits the form entirely; the token stays on the data struct
+	// regardless so a future "expand to all" change requires only
+	// the template gate, not a render path change.
+	if dep.Status == state.DeployFailed {
+		if from := failedStageFromJSON(dep.StageState); from != "" {
+			data.CanRetry = true
+			data.RetryFromStage = from
+			tok, terr := middleware.IssueForAuthenticated(s.sessions, dashboardRetryDeploymentAction, acct.ID)
+			if terr != nil {
+				log.Warn("dashboard: mint retry CSRF failed", "deployment_id", dep.ID, "err", terr)
+			} else {
+				data.DeploymentRetryCSRF = tok
+				// Set the matching faas_csrf sidecar so the form
+				// POST finds the same envelope. Without this the
+				// POST handler's VerifyAuthenticated step fails
+				// with ErrCSRFInvalid and the form submit is
+				// rejected. Same pattern as renderAccount's
+				// delete/restore envelopes (see handlers_dashboard.go:1089).
+				http.SetCookie(w, &http.Cookie{
+					Name:     middleware.CookieNameAuthenticated,
+					Value:    tok,
+					Path:     "/",
+					HttpOnly: true,
+					Secure:   s.domain != "",
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+				})
+			}
+		}
+	}
 
 	nonce := httpsec.NonceFromContext(r.Context())
 	page := dashboard.Page{
@@ -1872,11 +1909,33 @@ func dashboardStagePayload(d state.Deployment) (dashboard.StagePayload, error) {
 		// pointer at the template level and omits the section.
 		return dashboard.StagePayload{}, nil
 	}
-	return dashboard.StagePayload{
+	payload := dashboard.StagePayload{
 		BodyHTML:   html,
 		Status:     status,
 		TerminalAt: terminalAt,
-	}, nil
+	}
+	// Failure decoration (ADR-117 §Production-ready follow-on, C4):
+	// when the row's status is "failed" AND ErrorCode is in the
+	// CodeStage* set, lift the whycopy prose via Decorate so the
+	// template can inline the cluster-A `.error-explanation` block.
+	// The code → title/hint/why/fix mapping lives in pkg/whycopy
+	// (decorated against an *api.Problem stub; the customer-facing
+	// copy comes from the catalog row, not the row's raw reason).
+	if status == string(state.DeployFailed) && d.ErrorCode != "" {
+		problem := &api.Problem{}
+		if decorated := whycopy.Decorate(problem, d.ErrorCode, nil); decorated != nil {
+			if decorated.Title != "" || decorated.Hint != "" ||
+				decorated.Why != "" || decorated.Fix != "" {
+				payload.FailureExplanation = &dashboard.StageFailureExplanation{
+					Title: decorated.Title,
+					Hint:  decorated.Hint,
+					Why:   decorated.Why,
+					Fix:   decorated.Fix,
+				}
+			}
+		}
+	}
+	return payload, nil
 }
 
 // dashboardStageTerminalAt picks the footer timestamp for the
