@@ -791,3 +791,115 @@ func TestEveryCodeHasWhycopyEntry(t *testing.T) {
 			len(deadRows), strings.Join(deadRows, "\n  "))
 	}
 }
+
+// TestLintTripwire_DoctorStrictMutex pins the flag-name scoping
+// rule for the doctor-strict cluster (spec §6.4 amendment 1).
+// Background: --strict / --lenient are already claimed by the
+// deploy-diff cluster (commands2.go:838-839). Re-introducing a bare
+// `--strict` (without a `--doctor-` or `--diff-` scope prefix) on
+// any new deploy path would silently collide with the existing
+// semantics. The tripwire walks every non-test file under cmd/gregale/
+// and fails on any `Bool("strict"` or `String("strict"` declaration
+// outside the documented diff pair (commands2.go:838) and the
+// doctor-strict pair (commands2.go:855, commands_doctor.go:124).
+//
+// If you genuinely need a new strict-style gate, scope it via a
+// prefix (e.g. `--secret-strict`, `--build-strict`). If you need to
+// undo the diff `--strict` flag, that requires an ADR — the rename
+// would break customer scripts.
+func TestLintTripwire_DoctorStrictMutex(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		name := fi.Name()
+		if strings.HasSuffix(name, "_test.go") {
+			return false
+		}
+		if strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "_grpc.pb.go") {
+			return false
+		}
+		return true
+	}, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse cmd/gregale: %v", err)
+	}
+
+	// Allowed call sites — the two scoped strict flags the cluster
+	// introduces, plus the diff strict that was already there. Each
+	// entry is "file:line" so a regression on a specific call site
+	// points at the precise spot.
+	allowed := map[string]bool{
+		"commands2.go:838":   true, // --strict (--diff pair)
+		"commands2.go:855":   true, // --doctor-strict (Cluster A)
+		"commands_doctor.go:124": true, // --strict (gregale doctor)
+	}
+
+	// Disallowed forms: any Bool/String flag whose name is EXACTLY
+	// "strict" (no prefix) and whose file:line isn't in `allowed`.
+	// The check is intentionally a strict-name match — `--diff-strict`
+	// or `--secret-strict` would NOT trip.
+	var violations []string
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			fileName := fset.Position(file.Pos()).Filename
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if sel.Sel.Name != "Bool" && sel.Sel.Name != "String" {
+					return true
+				}
+				if len(call.Args) < 1 {
+					return true
+				}
+				lit, ok := call.Args[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				name := strings.Trim(lit.Value, `"`)
+				if name != "strict" {
+					return true
+				}
+				pos := fset.Position(call.Pos())
+				key := filepath.Base(fileName) + ":" + itoa(pos.Line)
+				if allowed[key] {
+					return true
+				}
+				violations = append(violations, pos.String()+": "+sel.Sel.Name+"(\""+name+"\"...)")
+				return true
+			})
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("found %d unscoped --strict flag declaration(s). --strict is owned by the deploy-diff cluster (commands2.go:838) and the gregale doctor (commands_doctor.go:124). New strict-style gates must be scoped via a prefix (--doctor-strict, --secret-strict, --diff-strict, etc.) to avoid customer-script breakage:\n  %s",
+			len(violations), strings.Join(violations, "\n  "))
+	}
+}
+
+// itoa is a local helper to avoid pulling strconv into a test
+// that's already heavy with ast imports.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
+}
