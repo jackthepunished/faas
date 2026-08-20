@@ -719,28 +719,33 @@ type ParkedDeploymentRef struct {
 	ParkedAt     *time.Time `json:"parked_at"`
 }
 
-// PublicAuthBlock (issue #477 / ADR-079 + ADR-118) is the
-// per-app public-URL auth configuration on a PATCH body.
-// Mode is the canonical 'open'|'bearer'|'basic'|'ip_allowlist'
-// string (must match apps_public_auth_mode_chk).
+// PublicAuthBlock (issue #477 / ADR-079 + ADR-118 + ADR-119)
+// is the per-app public-URL auth configuration on a PATCH body.
+// Mode is the canonical 'open'|'bearer'|'basic'|'ip_allowlist'|
+// 'internal_only' string (must match apps_public_auth_mode_chk).
 // BasicUser + BasicPass are only meaningful when
 // Mode='basic'; the apid PATCH handler seals them under
 // the APP_BASIC_AUTH secretbox namespace and stores the
 // ciphertext in apps.public_auth_basic. For Mode='open',
-// 'bearer', or 'ip_allowlist' the apid handler ignores
-// them (and clears any existing sealed blob so a stale
-// secretbox row never reaches a fresh request). For
-// Mode='ip_allowlist' the IPAllowlist slice must be
+// 'bearer', 'ip_allowlist', or 'internal_only' the apid
+// handler ignores them (and clears any existing sealed blob
+// so a stale secretbox row never reaches a fresh request).
+// For Mode='ip_allowlist' the IPAllowlist slice must be
 // non-empty (ADR-118; the 500-on-misconfig gate in
-// pkg/gateway/handler.go fires otherwise). The wire-shape
-// reflects what the customer PATCHes; the on-disk shape
-// is the public_auth_mode + public_auth_basic +
+// pkg/gateway/handler.go fires otherwise). For
+// Mode='internal_only' (ADR-119) the JWT lives on the
+// request, not the app row — no app-side configuration is
+// required beyond the mode flip; the per-service public-key
+// allowlist is operator-side (FAAS_INTERNAL_SVC_PUBKEYS on
+// gatewayd-internal). The wire-shape reflects what the
+// customer PATCHes; the on-disk shape is the
+// public_auth_mode + public_auth_basic +
 // public_auth_ip_allowlist columns plus the secretbox
 // seal at PATCH time.
 type PublicAuthBlock struct {
 	// Mode is the canonical 'open'|'bearer'|'basic'|
-	// 'ip_allowlist' string. apid rejects unknown values
-	// with 422 invalid_public_auth_mode.
+	// 'ip_allowlist'|'internal_only' string. apid rejects
+	// unknown values with 422 invalid_public_auth_mode.
 	Mode string `json:"mode"`
 	// BasicUser is the basic-auth username (plaintext at
 	// PATCH time; sealed before persist). Required when
@@ -771,16 +776,23 @@ type PublicAuthBlock struct {
 // non-empty iff Mode='ip_allowlist'. Returns a 422-mapped
 // *Problem on any malformed shape. nil in → nil out
 // (the caller treats nil as "don't touch the column").
+//
+// ADR-119 added 'internal_only'. internal_only requires no
+// app-side payload — the JWT lives on the request. Validate
+// simply accepts the mode without checking further fields
+// (the gate at pkg/gateway/handler.go::applyIngressInternalSvc
+// handles the auth; the synth handler gate at
+// pkg/gateway/synth.go::handleSynthesize handles the cron path).
 func (b *PublicAuthBlock) Validate() *Problem {
 	if b == nil {
 		return nil
 	}
 	switch b.Mode {
 	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic,
-		AppPublicAuthModeIPAllowlist:
+		AppPublicAuthModeIPAllowlist, AppPublicAuthModeInternalOnly:
 	default:
 		return NewProblem(422, CodeValidation, "Invalid public_auth.mode",
-			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', 'basic', or 'ip_allowlist'; got %q", b.Mode))
+			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', 'basic', 'ip_allowlist', or 'internal_only'; got %q", b.Mode))
 	}
 	if b.Mode != AppPublicAuthModeBasic {
 		// IPAllowlist is required iff Mode='ip_allowlist'.
