@@ -330,7 +330,7 @@ func cmdDeploys(args []string) int {
 	switch args[0] {
 	case "show":
 		return cmdDeploysShow(args[1:])
-	case statusLiteral:
+	case dispatchDeploysStatus:
 		return cmdDeploysStatus(args[1:])
 	}
 	PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status)", "deploys")

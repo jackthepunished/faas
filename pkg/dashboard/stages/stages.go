@@ -415,10 +415,12 @@ func RenderSummaryHTML(ss state.StageState, status string, terminalAt time.Time)
 		footerHTML = fmt.Sprintf(`<p class="stage-footer">Total: %s%s</p>`, htmlEscape(totalStr), tail)
 	}
 
-	return template.HTML(fmt.Sprintf(
-		`<section class="stage-timeline">%s%s</section>`,
-		rowsHTML.String(), footerHTML,
-	))
+	var final strings.Builder
+	final.WriteString(`<section class="stage-timeline">`)
+	final.WriteString(rowsHTML.String())
+	final.WriteString(footerHTML)
+	final.WriteString(`</section>`)
+	return template.HTML(final.String())
 }
 
 // htmlEscape is the minimal in-this-file escaper. We can't pull in
