@@ -654,6 +654,16 @@ type Handler struct {
 	// db.NotifyKeyChanged both apply. The cache itself lives
 	// in pkg/gateway/public_auth_cache.go.
 	publicAuthCache *PublicAuthCache
+	// responseCache (ADR-122 §Decision) is the in-process cache
+	// the kind=cache applier consults. nil = cache disabled
+	// (every request is a cache miss; the runtime never serves
+	// from store). Production wires this from
+	// cmd/gatewayd-internal/run.go via WithResponseCache; unit
+	// tests omit it. The cache's invalidation surface lives on
+	// the cache itself (InvalidateByApp / InvalidateByDeployment
+	// / InvalidateAll) and is wired by the db.Notify handler in
+	// commit 14.
+	responseCache *ResponseCache
 	// publicAuthUnsealer turns an APP_BASIC_AUTH secretbox
 	// sealed blob into the username/password pair the
 	// request header carries. nil = unseal disabled (unit
@@ -1107,6 +1117,15 @@ func (h *Handler) WithValidator(v Validator) *Handler {
 func (h *Handler) WithPublicAuth(cache *PublicAuthCache, unsealer PublicAuthUnsealer) *Handler {
 	h.publicAuthCache = cache
 	h.publicAuthUnsealer = unsealer
+	return h
+}
+
+// WithResponseCache (ADR-122 §Decision) wires the in-process
+// ResponseCache consulted by applyEdgeRuleCache. The setter
+// returns *Handler for fluent chaining (same shape as every
+// other Handler.With*).
+func (h *Handler) WithResponseCache(cache *ResponseCache) *Handler {
+	h.responseCache = cache
 	return h
 }
 
@@ -4699,6 +4718,22 @@ haveApp:
 	// credential). nil-safe: open / unset modes pass
 	// through (the pre-#477 default is preserved).
 	if !h.enforcePublicAuth(w, r, rec, app) { //nolint:contextcheck // request ctx is the canonical inbound ctx; the helper uses r.Context() internally so passing ctx separately would shadow it.
+		return
+	}
+
+	// ADR-122 §Decision: kind=cache serve path. Consulted AFTER
+	// enforcePublicAuth (so a cache hit cannot bypass the auth
+	// gate) and BEFORE the wake gate (so a hit returns without
+	// calling gate.Wait — no VM, no gb_ram_hour). The applier
+	// returns true when the request was fully served from the
+	// cache (no wake) and false on miss (the caller falls through
+	// to the existing wake path).
+	//
+	// Placement also AFTER CORS (line 4241, which short-circuits
+	// preflight OPTIONS) so preflight responses are never
+	// cached — an OPTIONS cached against the wrong Origin is a
+	// real CORS bypass.
+	if h.applyEdgeRuleCache(w, r, app, rec) {
 		return
 	}
 
