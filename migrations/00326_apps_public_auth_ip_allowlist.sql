@@ -1,4 +1,4 @@
--- filename: 00325_apps_public_auth_ip_allowlist.sql
+-- filename: 00326_apps_public_auth_ip_allowlist.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -21,8 +21,8 @@
 -- API layer (pkg/api/limits.go PublicAuthIPAllowlistMaxEntries)
 -- before SQL. Free/Hobby: 0 (gate closed). Pro: 16. Scale: 64.
 --
--- Slot note: 00325. Renumbered five times — 00308 → 00309 → 00313 →
--- 00314 → 00320 → 00325 — because open/merged PRs claimed slots ahead:
+-- Slot note: 00326. Renumbered six times — 00308 → 00309 → 00313 →
+-- 00314 → 00320 → 00325 → 00326 — because open/merged PRs claimed slots ahead:
 --   - PR #988 (merged): real 00304_cors_presets.sql on main.
 --     PR #999 must not fence slot 00304 (main owns it).
 --   - PR #997 (open): fences 00305-00306, real at 00307.
@@ -43,7 +43,7 @@
 --     Renumbered past 00319 to 00320.
 --   - PR #1004 also has real at 00320-00324 (triggers kind extend).
 --     Cross-PR slot gate would block 00320 against PR #1004.
---     Renumbered past 00324 to 00325, adding reservation fences
+--     Renumbered past 00324 to 00326, adding reservation fences
 --     00320-00324 to bridge the gap. If PR #1004 merges first,
 --     those fences become same-slot duplicates (fence pattern
 --     carve-out, ADR-041): the next rebase drops them. Per
