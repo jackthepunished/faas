@@ -92,10 +92,19 @@ func (h *Handler) WithInternalSvcVerifier(v InternalSvcVerifier) *Handler {
 // is present and well-formed per RFC 6750 §2.1; otherwise
 // returns ("", false). Case-insensitive on the scheme — RFC
 // 7230 §3.2 (case-insensitive token compare) — but the
-// canonical wire form is "Bearer" with capital B. The same
-// helper is used by the applyEdgeRuleJWT path; keeping it
-// package-local here would risk drift, so we export the
-// internal-package shape (lowercase 'b') for the two callers.
+// canonical wire form is "Bearer" with capital B.
+//
+// Round-3 peer-review #8 (bearerFromHeader duplicates):
+// pkg/gateway/handler.go::bearerTokenFromHeader performs the
+// same scheme match but takes the raw header string and
+// returns (token, "") — different shape because that branch
+// treats a missing header and a malformed header identically.
+// This helper now delegates to bearerTokenFromHeader, so the
+// scheme prefix / case-fold / trim-space logic lives in one
+// place. The (token, ok) wrapping is preserved so callers can
+// distinguish "no header" (ok=false) from "malformed header"
+// (ok=false too — same posture, but the caller doesn't care;
+// the gate just wants the token).
 //
 // We deliberately do NOT trim whitespace inside the token —
 // base64 padding is significant and a stray space inside the
@@ -103,18 +112,7 @@ func (h *Handler) WithInternalSvcVerifier(v InternalSvcVerifier) *Handler {
 // precedent: strip hop-by-hop headers in the public→internal
 // hop; here the verifier rejects rather than silently fixes).
 func bearerFromHeader(r *http.Request) (string, bool) {
-	v := r.Header.Get("Authorization")
-	if v == "" {
-		return "", false
-	}
-	const scheme = "Bearer "
-	if len(v) <= len(scheme) {
-		return "", false
-	}
-	if !strings.EqualFold(v[:len(scheme)], scheme) {
-		return "", false
-	}
-	tok := strings.TrimSpace(v[len(scheme):])
+	tok := bearerTokenFromHeader(r.Header.Get("Authorization"))
 	if tok == "" {
 		return "", false
 	}

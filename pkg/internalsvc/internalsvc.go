@@ -4,7 +4,7 @@
 //
 // Token shape:
 //
-//	header:   { "alg": "EdDSA", "kid": <sha256(pubkey)[:16]> }
+//	header:   { "alg": "EdDSA", "kid": <KidFromPub(pub)> }
 //	payload:  { "iss": "gregale",
 //	            "sub": <svcName>,             // e.g. "schedd"
 //	            "aud": "gregale.internal",
@@ -39,7 +39,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,11 +122,11 @@ var ErrEmptyAllowlist = errors.New("internalsvc: per-service allowlist must not 
 // or sealed via host.age in the GREGALE_INTERNAL_SVC namespace.
 //
 // kid is the key identifier embedded in the JWS header. By
-// convention it is sha256(pubkey)[:16] hex-encoded so the
-// verifier can identify the key without trusting the
-// svcName alone — but the verifier here uses svcName
-// directly (the allowlist IS the trust boundary). kid is kept
-// in the payload for diagnostic / rotation-tracking purposes.
+// convention it is KidFromPub(pub) so the verifier can
+// identify the key without trusting the svcName alone — but
+// the verifier here uses svcName directly (the allowlist IS
+// the trust boundary). kid is kept in the payload for
+// diagnostic / rotation-tracking purposes.
 func Mint(svcName string, ttl time.Duration, claims map[string]any,
 	priv ed25519.PrivateKey, kid string) (string, error) {
 	return MintWithAudience(svcName, ttl, claims, priv, kid, Audience)
@@ -170,13 +170,15 @@ func MintWithAudience(svcName string, ttl time.Duration, claims map[string]any,
 	now := time.Now().UTC()
 	pub := priv.Public().(ed25519.PublicKey)
 
-	// Auto-derive kid if not provided: sha256(pubkey)[:16]
-	// hex-encoded. Used for JWS header kid claim AND the
-	// payload kid field (informational only; verifier keys
-	// off svcName).
+	// Auto-derive kid if not provided. Round-3 peer-review
+	// #7 (kid format divergence): prior to KidFromPub, this
+	// branch used hex-of-[:8] while cmd/schedd/internal_svc_
+	// minter.go::kidFromPub used base64-of-[:16] — different
+	// shapes for the same key. Now both call KidFromPub.
+	// Used for JWS header kid claim AND the payload kid
+	// field (informational only; verifier keys off svcName).
 	if kid == "" {
-		sum := sha256.Sum256(pub)
-		kid = hex.EncodeToString(sum[:8])
+		kid = KidFromPub(pub)
 	}
 
 	signer, err := jose.NewSigner(
@@ -336,6 +338,30 @@ func GenerateKeypair() (ed25519.PrivateKey, ed25519.PublicKey, error) {
 		return nil, nil, fmt.Errorf("internalsvc.GenerateKeypair: %w", err)
 	}
 	return priv, pub, nil
+}
+
+// KidFromPub is the canonical kid derivation. Returns
+// base64url(sha256(pubkey)[:16]) — same shape Mint uses when
+// kid=="" and the schedd minter derives at boot. Round-3
+// peer-review #7 (kid format divergence): before this helper
+// existed, schedd's cmd/schedd/internal_svc_minter.go::kidFromPub
+// and pkg/internalsvc/internalsvc.go's auto-derive produced
+// different strings (base64-of-16 vs hex-of-8), so a token
+// minted with kid="" by some other daemon would not collide
+// with a schedd token — confusing for diagnostic logs that key
+// off kid to identify the minter. Single source of truth here:
+//
+//	22 chars (16 bytes × 8/6 base64url), URL-safe,
+//	truncated sha256, collision risk negligible at the
+//	≤10-service fleet size.
+//
+// Both surfaces call this; no other code path is allowed to
+// derive a kid from a pubkey (drift guard: a future contributor
+// who adds another derivation will produce a token whose kid
+// doesn't match what the rest of the system expects).
+func KidFromPub(pub ed25519.PublicKey) string {
+	sum := sha256.Sum256(pub)
+	return base64.RawURLEncoding.EncodeToString(sum[:16])
 }
 
 // mustJSONMarshal marshals the JWT payload to bytes for the

@@ -23,6 +23,8 @@ package internalsvc_test
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -228,6 +230,76 @@ func TestMintRejectsEmptySvcName(t *testing.T) {
 	_, err = internalsvc.Mint("", 30*time.Second, nil, priv, "kid-test-001")
 	if err == nil {
 		t.Fatalf("Mint with empty svcName: expected error, got nil")
+	}
+}
+
+// TestKidFromPubStable pins the kid derivation format (round-3
+// peer-review #7: kid format divergence). A drift here breaks
+// diagnostic logs that key off kid to identify the minter —
+// schedd's boot log would show a kid that no longer matches
+// what the same pubkey produces inside pkg/internalsvc.
+//
+// The contract: KidFromPub returns base64url(sha256(pub)[:16]).
+// Pin the length (22 chars), the alphabet (URL-safe), and the
+// round-trip determinism (same pubkey → same kid). If any of
+// these change, the test fails narratively so a future
+// contributor is forced to acknowledge the kid-format change.
+func TestKidFromPubStable(t *testing.T) {
+	_, pub, err := internalsvc.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+	kid := internalsvc.KidFromPub(pub)
+	if len(kid) != 22 {
+		t.Errorf("kid length = %d, want 22 (base64url of 16 bytes)", len(kid))
+	}
+	// base64.RawURLEncoding alphabet: A-Z a-z 0-9 _ -
+	for _, r := range kid {
+		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-') {
+			t.Errorf("kid contains non-URL-safe char %q (full=%q)", r, kid)
+			break
+		}
+	}
+	// Determinism — same pubkey must produce the same kid.
+	if again := internalsvc.KidFromPub(pub); again != kid {
+		t.Errorf("KidFromPub is non-deterministic: %q vs %q", kid, again)
+	}
+}
+
+// TestMintAutoDerivesKidFromKidFromPub pins the connection
+// between the package helper and the auto-derive path in
+// Mint. If a future contributor changes Mint's auto-derive
+// to a different shape, the test fires. Round-3 #7: this is
+// the load-bearing drift guard for the kid-format
+// unification.
+func TestMintAutoDerivesKidFromKidFromPub(t *testing.T) {
+	priv, pub, err := internalsvc.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+	tok, err := internalsvc.Mint("schedd", 30*time.Second, nil, priv, "")
+	if err != nil {
+		t.Fatalf("Mint with empty kid: %v", err)
+	}
+	// Decode the JWT header and pull the kid claim. The
+	// first segment is base64url-encoded JSON.
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token has %d segments, want 3", len(parts))
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode header: %v", err)
+	}
+	var header struct {
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		t.Fatalf("unmarshal header: %v", err)
+	}
+	if header.Kid != internalsvc.KidFromPub(pub) {
+		t.Errorf("auto-derived kid = %q, want KidFromPub = %q", header.Kid, internalsvc.KidFromPub(pub))
 	}
 }
 

@@ -15,8 +15,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -96,13 +94,20 @@ func (a *testCountingAuthnAuditor) countByKind(kind string) int {
 // helper: mint a JWT with the given keypair. Used by both
 // the positive-path tests (valid token) and the negative
 // tests (expired / wrong-audience / wrong-key).
+//
+// Round-3 peer-review #7: kid comes from internalsvc.KidFromPub
+// — the same derivation cmd/schedd/internal_svc_minter.go uses
+// at boot. A previous version of this helper inlined the
+// base64-of-[:16] derivation, which produced a kid identical to
+// the production minter's but for the wrong reason (drift
+// risk — any change to the package-level KidFromPub would
+// silently miss this test).
 func mintTestToken(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey, audience, svcName string, ttlSec int) string {
 	t.Helper()
-	sum := sha256.Sum256(pub)
-	kid := base64.RawURLEncoding.EncodeToString(sum[:16])
 	if audience == "" {
 		audience = internalsvc.Audience
 	}
+	kid := internalsvc.KidFromPub(pub)
 	tok, err := internalsvc.Mint(svcName, time.Duration(ttlSec)*time.Second, nil, priv, kid)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -273,9 +278,10 @@ func TestApplyIngressInternalSvc_WrongAudience_Returns403(t *testing.T) {
 	// MintWithAudience lets the test inject a non-canonical
 	// audience. Production callers (cmd/schedd) MUST use
 	// internalsvc.Mint, which pins Audience=gregale.internal
-	// at the package level.
-	sum := sha256.Sum256(pub)
-	kid := base64.RawURLEncoding.EncodeToString(sum[:16])
+	// at the package level. Round-3 peer-review #7: the kid
+	// now comes from internalsvc.KidFromPub — single source
+	// of truth shared with cmd/schedd.
+	kid := internalsvc.KidFromPub(pub)
 	tok, err := internalsvc.MintWithAudience("schedd", 30*time.Second, nil, priv, kid, "foo")
 	if err != nil {
 		t.Fatalf("MintWithAudience: %v", err)
