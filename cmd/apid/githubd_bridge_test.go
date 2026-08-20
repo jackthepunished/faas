@@ -850,17 +850,17 @@ func TestEnqueueBuild_AnnotationsFallbackToPusher(t *testing.T) {
 
 	// No SenderLogin, no PullRequestNumber — push-event shape.
 	_, err := g.EnqueueBuild(context.Background(), &githubdpb.EnqueueBuildRequest{
-		AccountId:   accountID,
-		AppId:       appID,
-		CommitSha:   "abc123",
-		SourcePath:  path,
-		SourceUrl:   "https://codeload.example.com/repo/tar.gz/abc123",
-		SourceBytes: size,
+		AccountId:    accountID,
+		AppId:        appID,
+		CommitSha:    "abc123",
+		SourcePath:   path,
+		SourceUrl:    "https://codeload.example.com/repo/tar.gz/abc123",
+		SourceBytes:  size,
 		RepoFullName: "owner/repo",
-		Branch:      "main",
-		Ref:         "refs/heads/main",
-		Pusher:      "octocat",
-		EventKind:   githubdpb.EnqueueBuildEventKind_EVENT_KIND_PUSH,
+		Branch:       "main",
+		Ref:          "refs/heads/main",
+		Pusher:       "octocat",
+		EventKind:    githubdpb.EnqueueBuildEventKind_EVENT_KIND_PUSH,
 	})
 	if err != nil {
 		t.Fatalf("EnqueueBuild: %v", err)

@@ -858,7 +858,7 @@ func cmdDeployTarball(args []string) int {
 	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
 	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
 	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
-// Cluster A (error-explanations, spec §6.4 amendment 1):
+	// Cluster A (error-explanations, spec §6.4 amendment 1):
 	// run `gregale doctor` first and abort the deploy on any
 	// error-class finding. The doctor runs over the local cwd (or
 	// the auto-pack temp dir) BEFORE any HTTP call, so a

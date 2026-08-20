@@ -278,11 +278,11 @@ func TestSourceTarball_HappyPath_WithAnnotations(t *testing.T) {
 	// fields. No file metadata — the validator reads them as
 	// strings/ints.
 	body, ct := multipartUpload(t, map[string]multipartPart{
-		"tarball":      {filename: "src.tar.gz", body: tarBytes},
-		"reason":       {body: []byte("Hotfix: payment retry path")},
-		"tag":          {body: []byte("hotfix")},
-		"deployed_by":  {body: []byte("alice@example.com")},
-		"pr_number":    {body: []byte("4242")},
+		"tarball":     {filename: "src.tar.gz", body: tarBytes},
+		"reason":      {body: []byte("Hotfix: payment retry path")},
+		"tag":         {body: []byte("hotfix")},
+		"deployed_by": {body: []byte("alice@example.com")},
+		"pr_number":   {body: []byte("4242")},
 	})
 	req := httptest.NewRequest("POST", "/v1/apps/annotated/deployments/source-tarball", body)
 	req.Header.Set("Authorization", "Bearer "+e.key)

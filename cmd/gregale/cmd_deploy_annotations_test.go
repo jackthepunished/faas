@@ -31,11 +31,11 @@ func TestIsValidDeploymentAnnotationTag(t *testing.T) {
 		{"", true},
 		// Negative cases — anything outside the set.
 		{"feature_release", false},
-		{"HOTFIX", false},            // case-sensitive
-		{"hot fix", false},           // whitespace
-		{"hotfix\n", false},          // trailing newline
-		{"'hotfix'", false},          // quote-wrapped
-		{"incident_recover", false},  // typo
+		{"HOTFIX", false},           // case-sensitive
+		{"hot fix", false},          // whitespace
+		{"hotfix\n", false},         // trailing newline
+		{"'hotfix'", false},         // quote-wrapped
+		{"incident_recover", false}, // typo
 	}
 	for _, tc := range tests {
 		if got := isValidDeploymentAnnotationTag(tc.in); got != tc.want {
