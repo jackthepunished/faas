@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -91,8 +92,14 @@ func TestPg_OpenAPISnapshot_RoundTrip(t *testing.T) {
 	if got.DeploymentID != snap.DeploymentID || got.AppID != snap.AppID || got.Scope != snap.Scope {
 		t.Errorf("round-trip mismatch: got %+v", got)
 	}
-	if string(got.Snapshot) != string(snap.Snapshot) {
-		t.Errorf("Snapshot bytes round-trip mismatch")
+	// Postgres jsonb normalises key order on storage, so we
+	// compare structurally via canonical unmarshal rather than
+	// raw bytes.
+	var wantShape, gotShape map[string]any
+	_ = json.Unmarshal(snap.Snapshot, &wantShape)
+	_ = json.Unmarshal(got.Snapshot, &gotShape)
+	if !reflect.DeepEqual(gotShape, wantShape) {
+		t.Errorf("Snapshot jsonb round-trip structural mismatch: got %s want %s", got.Snapshot, snap.Snapshot)
 	}
 	if got.SHA256 != snap.SHA256 || got.SchemaVersion != 1 {
 		t.Errorf("metadata round-trip: got %+v", got)
@@ -155,8 +162,12 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 	if got.SHA256 != second.SHA256 {
 		t.Errorf("UPSERT must overwrite sha256; got %q want %q", got.SHA256, second.SHA256)
 	}
-	if string(got.Snapshot) != string(second.Snapshot) {
-		t.Errorf("UPSERT must overwrite snapshot bytes; got %s", got.Snapshot)
+	// Postgres jsonb normalises key order, so compare structurally.
+	var wantShape, gotShape map[string]any
+	_ = json.Unmarshal(second.Snapshot, &wantShape)
+	_ = json.Unmarshal(got.Snapshot, &gotShape)
+	if !reflect.DeepEqual(gotShape, wantShape) {
+		t.Errorf("UPSERT must overwrite snapshot: got %s want %s", got.Snapshot, second.Snapshot)
 	}
 
 	// Count check: exactly one row for the deployment.
@@ -200,7 +211,7 @@ func TestPg_OpenAPISnapshot_LatestByScope(t *testing.T) {
 	}
 	appID := seedOpenAPISnapshotApp(t, s, ctx, "openapi-snapshot-latest")
 	var olderID, newerID string
-	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:test-openapi-snapshot-older', 'live', 'prod') RETURNING id`, appID).Scan(&olderID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:test-openapi-snapshot-older', 'superseded', 'prod') RETURNING id`, appID).Scan(&olderID); err != nil {
 		t.Fatalf("insert older dep: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO deployments (id, app_id, image_digest, status, scope) VALUES (gen_random_uuid(), $1, 'sha256:test-openapi-snapshot-newer', 'live', 'prod') RETURNING id`, appID).Scan(&newerID); err != nil {
