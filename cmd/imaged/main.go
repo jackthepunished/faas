@@ -61,6 +61,14 @@ type runDeps struct {
 	lvUsedPct func(ctx context.Context) (float64, error)
 	detectFC  func(ctx context.Context) (string, error)
 	now       func() time.Time
+	// configPath is the on-disk TOML path; ADR-122 introduces a
+	// minimal cmd/imaged/config.go that LoadConfig reads. Empty
+	// defaults to /etc/faas/imaged.toml in defaultDeps.
+	configPath string
+	// loadConfig is the seam tests use to inject a pre-built
+	// *Config without writing to disk. nil in production →
+	// LoadConfig(configPath).
+	loadConfig func(path string) (*Config, error)
 	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam. nil →
 	// runtimecheck.MustCheckOnBoot(capsDecl, log, nil) which
 	// exits on violation in production. Tests inject
@@ -79,9 +87,11 @@ func defaultDeps() runDeps {
 		migrate: func(ctx context.Context, pool *pgxpool.Pool) error {
 			return db.MigrateUp(ctx, pool)
 		},
-		lvUsedPct: imaged.DefaultLvFcUsedPct(imaged.LvFcName),
-		detectFC:  imaged.DetectFirecrackerVersion,
-		now:       time.Now,
+		lvUsedPct:  imaged.DefaultLvFcUsedPct(imaged.LvFcName),
+		detectFC:   imaged.DetectFirecrackerVersion,
+		now:        time.Now,
+		configPath: "/etc/faas/imaged.toml",
+		loadConfig: LoadConfig,
 	}
 }
 
@@ -106,25 +116,46 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// ADR-122 / follow-on to imaged env-only config (issue #995
+	// post-merge audit): load /etc/faas/imaged.toml with defaults.
+	// Missing file is not an error — the defaults produce a working
+	// daemon. The pre-existing FAAS_IMAGED_METRICS_ADDR env overlay
+	// is honoured by GetMetricsAddr below.
+	loadCfg := d.loadConfig
+	if loadCfg == nil {
+		loadCfg = LoadConfig
+	}
+	cfgPath := d.configPath
+	if cfgPath == "" {
+		cfgPath = "/etc/faas/imaged.toml"
+	}
+	imgCfg, err := loadCfg(cfgPath)
+	if err != nil {
+		return err
+	}
+
 	// Gate-B box-role gate. imaged is a compute-only daemon — it
-	// refuses to start under RoleControlPlane. The role is set
-	// from FAAS_IMAGED_ROLE at deploy time (imaged has no
-	// config.go today; the env is the only source); default is
-	// RoleSingleBox so single-box dev boots unmoved. The gate
-	// runs before d.openDB so a misconfigured boot doesn't waste
-	// a Postgres connection.
-	if err := role.Require("imaged", role.FromConfig("", "FAAS_IMAGED_ROLE"),
+	// refuses to start under RoleControlPlane. The role is resolved
+	// from TOML role (post-ADR-122) with FAAS_IMAGED_ROLE as the
+	// env-overlay (role.FromConfig falls back to the second arg
+	// when the first is empty). Default RoleSingleBox so single-box
+	// dev boots unmoved. The gate runs before d.openDB so a
+	// misconfigured boot doesn't waste a Postgres connection.
+	if err := role.Require("imaged", role.FromConfig(string(imgCfg.Role), "FAAS_IMAGED_ROLE"),
 		role.RoleSingleBox, role.RoleComputeOnly); err != nil {
 		return err
 	}
 
 	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
-	// before any control-plane handshake so the boot log carries the
-	// identity. imaged has no config.go today (env-only); the systemd
-	// drop-in (deploy/ansible/roles/compute_only_service/files/
-	// faas-imaged.service.d/99-faas-node-name.conf) is the only
-	// source. Empty + log.Info("legacy single-box") mirrors the schedd
-	// owner-node line.
+	// before any control-plane handshake so the boot log carries
+	// the identity. imaged has NO TOML NodeName field today — the
+	// env var is read directly here. The systemd drop-in
+	// (deploy/ansible/roles/compute_only_service/files/
+	// faas-imaged.service.d/99-faas-node-name.conf) is the single
+	// source of truth. Empty + log.Info("legacy single-box") mirrors
+	// the schedd owner-node line. (Future improvement: lift
+	// NodeName into cmd/imaged/config.go so it matches the
+	// schedd/meterd/builderd shape — out of scope for ADR-122.)
 	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
 		log.Info("imaged owner node", "node_name", nodeName)
 	} else {
@@ -488,17 +519,38 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// expose the internal registry to the public network — series like
 	// imaged_oci_pull_duration_seconds{op,result} leak per-deploy timing
 	// shape (review finding #1 on PR #132). Loopback bind is safe because
-	// the local Prometheus scrapes from the box itself. Set
-	// FAAS_IMAGED_METRICS_ADDR= to disable the listener (unit tests that
-	// don't want a port reserved).
-	metricsAddr := envOr("FAAS_IMAGED_METRICS_ADDR", "127.0.0.1:9102")
+	// the local Prometheus scrapes from the box itself.
+	//
+	// Disable semantic (ADR-122 follow-on): set `metrics_addr = ""` in
+	// /etc/faas/imaged.toml to disable the listener. The env overlay
+	// (FAAS_IMAGED_METRICS_ADDR) does NOT disable when set to empty
+	// string — both unset and empty env fall through to the TOML
+	// default via GetMetricsAddr's `v != ""` gate (same conflation
+	// the legacy envOr had). The legacy behaviour was already broken
+	// in this respect; ADR-122 propagated it rather than fixing it.
+	// Future improvement: distinguish "unset" from "explicit empty"
+	// in the env overlay (e.g. via os.LookupEnv). Out of scope for
+	// this PR.
+	//
+	// Bind target resolves via cfg.GetMetricsAddr: env wins when
+	// non-empty, else TOML metrics_addr, else the default in
+	// cmd/imaged/config.go::LoadConfig.
+	metricsAddr := imgCfg.GetMetricsAddr(os.Getenv)
 	if metricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
+		// ADR-122: apply the canonical metrics-listener shape —
+		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
+		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := imgCfg.MetricsListener()
 		msrv := &http.Server{
 			Addr:              metricsAddr,
 			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    int(maxHeaderBytes),
 		}
 		mlis, err := net.Listen("tcp", metricsAddr)
 		if err != nil {

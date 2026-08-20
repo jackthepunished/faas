@@ -73,7 +73,7 @@ func writeMeterdConfig(t *testing.T, dir, metricsAddr string) string {
 //
 // env is the env-var reader (FAAS_*_INTERVAL knobs); defaults to a function
 // that returns "". Tests that want sub-second intervals pass a closure.
-func stubMeterdDeps(cfgPath, metricsAddr string, pool *pgxpool.Pool, listenFn func(string, http.Handler) (*http.Server, error), env func(string) string) runDeps {
+func stubMeterdDeps(cfgPath, metricsAddr string, pool *pgxpool.Pool, listenFn func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error), env func(string) string) runDeps {
 	return runDeps{
 		configPath: cfgPath,
 		openDB: func(context.Context, string) (*pgxpool.Pool, error) {
@@ -198,7 +198,7 @@ func TestRun_MetricsAddrEmptySkipsListener(t *testing.T) {
 	pool := testPool(t)
 
 	var invocations int
-	listenFn := func(string, http.Handler) (*http.Server, error) {
+	listenFn := func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error) {
 		invocations++
 		return nil, nil
 	}
@@ -242,7 +242,7 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h
@@ -365,7 +365,7 @@ func TestRun_MetricsAddrDrainsOnCancel(t *testing.T) {
 	cfgPath := writeMeterdConfig(t, dir, "127.0.0.1:0")
 	pool := testPool(t)
 
-	listenFn := func(_ string, _ http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, _ http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		return &http.Server{Handler: http.NewServeMux(), ReadHeaderTimeout: 10 * time.Second}, nil
 	}
 	deps := stubMeterdDeps(cfgPath, "127.0.0.1:0", pool, listenFn, func(string) string { return "" })
@@ -409,7 +409,7 @@ func TestRun_DialScheddPropagatesCancel(t *testing.T) {
 	pool := testPool(t)
 
 	wantErr := errors.New("dial cancelled (test)")
-	listenFn := func(string, http.Handler) (*http.Server, error) {
+	listenFn := func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error) {
 		return nil, nil
 	}
 	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, func(string) string { return "" })
@@ -443,7 +443,7 @@ func TestRun_Healthz_StaleReturns503(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h
@@ -849,7 +849,7 @@ func TestRun_MetricsAddr_StripePushLabels(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h
@@ -999,4 +999,44 @@ func TestWarnIfEmptyAPIKey_TOMLOnlyNoFalsePositive(t *testing.T) {
 			t.Errorf("expected no warn for unknown provider; got: %s", buf.String())
 		}
 	})
+}
+
+// TestDefaultDeps_MetricsListenAndServe_AppliesCanonicalShape pins the
+// ADR-122 canonical metrics-listener shape at the factory level. The
+// factory binds a real net.Listener (no test stub), inspects the
+// returned *http.Server, then Shutdowns cleanly. The listener timeout
+// values must match cfg.MetricsListener — i.e. the constant fallback
+// path — so a stray edit to either the helper or the api.* family
+// surfaces here.
+//
+// Loopback bind means no port collision with anything else on the
+// test box: the factory picks 127.0.0.1:0 and we never see the port.
+func TestDefaultDeps_MetricsListenAndServe_AppliesCanonicalShape(t *testing.T) {
+	deps := defaultDeps()
+	if deps.metricsListenAndServe == nil {
+		t.Fatal("defaultDeps.metricsListenAndServe is nil")
+	}
+	mux := http.NewServeMux()
+	cfg := &Config{} // all zeros → MetricsListener falls back to constants
+	readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
+	srv, err := deps.metricsListenAndServe("127.0.0.1:0", mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
+	if err != nil {
+		t.Fatalf("metricsListenAndServe: %v", err)
+	}
+	if srv.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %v want %v", srv.ReadTimeout, readTimeout)
+	}
+	if srv.WriteTimeout != writeTimeout {
+		t.Errorf("WriteTimeout = %v want %v", srv.WriteTimeout, writeTimeout)
+	}
+	if srv.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %v want %v", srv.IdleTimeout, idleTimeout)
+	}
+	if int64(srv.MaxHeaderBytes) != maxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d want %d", srv.MaxHeaderBytes, maxHeaderBytes)
+	}
+	// drain so the listener goroutine exits cleanly.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	_ = srv.Shutdown(stopCtx)
 }

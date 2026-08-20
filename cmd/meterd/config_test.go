@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // TestLoadConfig_MissingFileReturnsDefaults pins the back-compat
@@ -91,5 +94,46 @@ func TestConfig_LoadEgressTLS(t *testing.T) {
 		t.Errorf("partial (cert only): expected error naming missing fields")
 	} else if !strings.Contains(err.Error(), "egress_tls_key_path") || !strings.Contains(err.Error(), "egress_tls_ca_path") {
 		t.Errorf("err = %q, want both egress_tls_key_path and egress_tls_ca_path named", err.Error())
+	}
+}
+
+// TestConfig_MetricsListener_Defaults — when no TOML fields are set, the
+// helper returns the api.Metrics*SecondsDefault family. ADR-122
+// guarantees every daemon's metrics listener inherits the canonical
+// shape from pkg/api/limits.go, so a stray edit to that constant
+// family must surface here (the api.* tests guard the constants;
+// this test guards the wiring).
+func TestConfig_MetricsListener_Defaults(t *testing.T) {
+	c := &Config{}
+	read, write, idle, mhb := c.MetricsListener()
+	if read != time.Duration(api.MetricsReadTimeoutSecondsDefault)*time.Second {
+		t.Errorf("read=%v want %v", read, api.MetricsReadTimeoutSecondsDefault)
+	}
+	if write != time.Duration(api.MetricsWriteTimeoutSecondsDefault)*time.Second {
+		t.Errorf("write=%v want %v", write, api.MetricsWriteTimeoutSecondsDefault)
+	}
+	if idle != time.Duration(api.MetricsIdleTimeoutSecondsDefault)*time.Second {
+		t.Errorf("idle=%v want %v", idle, api.MetricsIdleTimeoutSecondsDefault)
+	}
+	if mhb != api.DefaultMaxHeaderBytes {
+		t.Errorf("mhb=%v want %v", mhb, api.DefaultMaxHeaderBytes)
+	}
+}
+
+// TestConfig_MetricsListener_OverridesRespected — explicit TOML values
+// must pass through unchanged (no constant fallback when the field is
+// non-zero). This is the operational override path: an operator with a
+// slow scraper bumps cfg.MetricsReadTimeout to 30s without losing the
+// rest of the canonical shape.
+func TestConfig_MetricsListener_OverridesRespected(t *testing.T) {
+	c := &Config{
+		MetricsReadTimeout:    30 * time.Second,
+		MetricsWriteTimeout:   45 * time.Second,
+		MetricsIdleTimeout:    120 * time.Second,
+		MetricsMaxHeaderBytes: 4 << 20, // 4 MiB
+	}
+	read, write, idle, mhb := c.MetricsListener()
+	if read != 30*time.Second || write != 45*time.Second || idle != 120*time.Second || mhb != int64(4<<20) {
+		t.Errorf("override lost: read=%v write=%v idle=%v mhb=%v", read, write, idle, mhb)
 	}
 }

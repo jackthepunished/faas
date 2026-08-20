@@ -35,6 +35,13 @@ type Config struct {
 	CacheDir string `toml:"cache_dir"`
 	// MetricsAddr is the optional bind address for /metrics. Empty disables it.
 	MetricsAddr string `toml:"metrics_addr"`
+	// Metrics listener timeouts (ADR-122). Each knob falls back to
+	// the corresponding api.Metrics*SecondsDefault when zero.
+	// MaxHeaderBytes is int64 to mirror api.DefaultMaxHeaderBytes.
+	MetricsReadTimeout    time.Duration `toml:"metrics_read_timeout"`
+	MetricsWriteTimeout   time.Duration `toml:"metrics_write_timeout"`
+	MetricsIdleTimeout    time.Duration `toml:"metrics_idle_timeout"`
+	MetricsMaxHeaderBytes int64         `toml:"metrics_max_header_bytes"`
 	// DBURL is the Postgres DSN; empty falls back to $DATABASE_URL (db.Open).
 	DBURL string `toml:"db_url"`
 	// BuilderBase is drive0: the read-only shared base rootfs the builder VM
@@ -156,6 +163,31 @@ func (c *Config) ResolveVMMTarget() string {
 // Empty cluster returns (nil, nil); partial cluster is rejected.
 func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
+}
+
+// MetricsListener returns the *http.Server timeouts + MaxHeaderBytes
+// for builderd's metrics listener (ADR-122). Each knob falls back to
+// the corresponding api.Metrics*SecondsDefault when the TOML field is
+// zero. Same shape as cmd/{meterd,schedd,vmmd}/config.go::MetricsListener
+// so a future daemon can lift the helper verbatim.
+func (c *Config) MetricsListener() (read, write, idle time.Duration, maxHeaderBytes int64) {
+	read = c.MetricsReadTimeout
+	if read == 0 {
+		read = time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second
+	}
+	write = c.MetricsWriteTimeout
+	if write == 0 {
+		write = time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second
+	}
+	idle = c.MetricsIdleTimeout
+	if idle == 0 {
+		idle = time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second
+	}
+	maxHeaderBytes = c.MetricsMaxHeaderBytes
+	if maxHeaderBytes == 0 {
+		maxHeaderBytes = api.DefaultMaxHeaderBytes
+	}
+	return
 }
 
 // normalizeConfig prevents the stuck-build reaper from racing a valid build.

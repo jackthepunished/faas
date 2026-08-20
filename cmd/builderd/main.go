@@ -202,7 +202,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
-		httpSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// ADR-122: apply the canonical metrics-listener shape —
+		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
+		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
+		httpSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    int(maxHeaderBytes),
+		}
 		go func() {
 			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Error("builderd: metrics http", "err", err)
@@ -261,6 +273,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// ADR-122 / builderd shutdown fix: drain the
+			// metrics listener so a cancel doesn't leak
+			// an open *http.Server. 5s matches the meterd
+			// precedent at cmd/meterd/main.go:978-983.
+			// net/http Shutdown requires a non-Done parent
+			// ctx — branch off Background here.
+			if httpSrv != nil {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				//nolint:contextcheck // shutdown ctx must outlive the already-cancelled caller ctx.
+				_ = httpSrv.Shutdown(stopCtx)
+				stopCancel()
+			}
 			return nil
 		case n, ok := <-notifCh:
 			if !ok {

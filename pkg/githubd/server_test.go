@@ -23,7 +23,9 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
@@ -309,5 +311,47 @@ func TestHandleWebhookPush_NilOpsIsNoOp(t *testing.T) {
 	s.handleWebhookPush(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("POST status = %d, want 401", rr.Code)
+	}
+}
+
+// TestWebhookServer_AppliesCanonicalShape pins ADR-122's webhook
+// variant against the PRODUCTION listener constructor
+// (NewWebhookHTTPServer in pkg/githubd/server.go). A future edit
+// that drops a knob from the production struct surfaces here — the
+// helper is exported specifically so this test exercises the real
+// code path, not a parallel mirror literal.
+//
+// ReadTimeout=30s (10 MiB body-cap budget), WriteTimeout=30s,
+// IdleTimeout=60s, MaxHeaderBytes=1 MiB. The constant family lives
+// in pkg/api/limits.go; a stray edit to one of these constants
+// also surfaces here. ReadHeaderTimeout=10s is the pre-existing
+// Slowloris guard that stays unchanged by ADR-122.
+func TestWebhookServer_AppliesCanonicalShape(t *testing.T) {
+	const wantRead = time.Duration(api.WebhookReadTimeoutSecondsDefault) * time.Second
+	const wantWrite = time.Duration(api.WebhookWriteTimeoutSecondsDefault) * time.Second
+	const wantIdle = time.Duration(api.WebhookIdleTimeoutSecondsDefault) * time.Second
+	const wantMHB = api.DefaultMaxHeaderBytes
+
+	// Call the production helper — NOT a parallel struct literal.
+	// A regression that drops one of the ADR-122 knobs from
+	// NewWebhookHTTPServer would otherwise go silent (the previous
+	// test constructed its own *http.Server literal that was
+	// independent of the production code).
+	handler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	srv := NewWebhookHTTPServer("127.0.0.1:0", handler)
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v want %v", srv.ReadHeaderTimeout, 10*time.Second)
+	}
+	if srv.ReadTimeout != wantRead {
+		t.Errorf("ReadTimeout = %v want %v", srv.ReadTimeout, wantRead)
+	}
+	if srv.WriteTimeout != wantWrite {
+		t.Errorf("WriteTimeout = %v want %v", srv.WriteTimeout, wantWrite)
+	}
+	if srv.IdleTimeout != wantIdle {
+		t.Errorf("IdleTimeout = %v want %v", srv.IdleTimeout, wantIdle)
+	}
+	if int64(srv.MaxHeaderBytes) != wantMHB {
+		t.Errorf("MaxHeaderBytes = %d want %d", srv.MaxHeaderBytes, wantMHB)
 	}
 }

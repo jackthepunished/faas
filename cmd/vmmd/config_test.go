@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -640,5 +641,37 @@ target_url = "dns:///vmmd-2.faas:50051"
 				t.Errorf("TargetURL = %q, want %q", cfg.ComputeNode.TargetURL, tc.want)
 			}
 		})
+	}
+}
+
+// TestConfig_MetricsListener_Defaults / OverridesRespected — ADR-122
+// canonical shape (mirrors cmd/meterd/config_test.go).
+func TestConfig_MetricsListener_Defaults(t *testing.T) {
+	c := &Config{}
+	read, write, idle, mhb := c.MetricsListener()
+	if read != time.Duration(api.MetricsReadTimeoutSecondsDefault)*time.Second {
+		t.Errorf("read=%v want %v", read, api.MetricsReadTimeoutSecondsDefault)
+	}
+	if write != time.Duration(api.MetricsWriteTimeoutSecondsDefault)*time.Second {
+		t.Errorf("write=%v want %v", write, api.MetricsWriteTimeoutSecondsDefault)
+	}
+	if idle != time.Duration(api.MetricsIdleTimeoutSecondsDefault)*time.Second {
+		t.Errorf("idle=%v want %v", idle, api.MetricsIdleTimeoutSecondsDefault)
+	}
+	if mhb != api.DefaultMaxHeaderBytes {
+		t.Errorf("mhb=%v want %v", mhb, api.DefaultMaxHeaderBytes)
+	}
+}
+
+func TestConfig_MetricsListener_OverridesRespected(t *testing.T) {
+	c := &Config{
+		MetricsReadTimeout:    30 * time.Second,
+		MetricsWriteTimeout:   45 * time.Second,
+		MetricsIdleTimeout:    120 * time.Second,
+		MetricsMaxHeaderBytes: 4 << 20,
+	}
+	read, write, idle, mhb := c.MetricsListener()
+	if read != 30*time.Second || write != 45*time.Second || idle != 120*time.Second || mhb != int64(4<<20) {
+		t.Errorf("override lost: read=%v write=%v idle=%v mhb=%v", read, write, idle, mhb)
 	}
 }

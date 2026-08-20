@@ -1054,10 +1054,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// directly without polluting the main /metrics scrape
 		// (which is the wire-side OpsMetrics registry).
 		mux.Handle(metricsPath+"/wake-phase", wpm.Handler())
+		// ADR-122: apply the canonical metrics-listener shape —
+		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
+		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
 		httpSrv = &http.Server{
 			Addr:              cfg.MetricsAddr,
 			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second, // match schedd; guards the metrics endpoint against Slowloris
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    int(maxHeaderBytes),
 		}
 		go func() {
 			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -89,6 +90,14 @@ type Config struct {
 
 	// MetricsAddr is the optional bind address for /metrics. Empty disables it.
 	MetricsAddr string `toml:"metrics_addr"`
+	// Metrics listener timeouts (ADR-122). Each knob falls back to
+	// the corresponding api.Metrics*SecondsDefault when zero. MaxHeaderBytes
+	// is int64 to mirror api.DefaultMaxHeaderBytes (cast at the
+	// http.Server field which is int).
+	MetricsReadTimeout    time.Duration `toml:"metrics_read_timeout"`
+	MetricsWriteTimeout   time.Duration `toml:"metrics_write_timeout"`
+	MetricsIdleTimeout    time.Duration `toml:"metrics_idle_timeout"`
+	MetricsMaxHeaderBytes int64         `toml:"metrics_max_header_bytes"`
 
 	// DBURL is the Postgres DSN; empty falls back to $DATABASE_URL (db.Open).
 	DBURL string `toml:"db_url"`
@@ -340,6 +349,32 @@ func (c *Config) LoadVMMTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error
 // pain" (stdlib has no per-handshake client RootCAs callback).
 func (c *Config) LoadVMMTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefixAndVerifierAndReload("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath, v, reload)
+}
+
+// MetricsListener returns the *http.Server timeouts + MaxHeaderBytes
+// for schedd's metrics listener (ADR-122). Each knob falls back to
+// the corresponding api.Metrics*SecondsDefault when the TOML field
+// is zero. Same shape as cmd/meterd/config.go::MetricsListener;
+// the listener builds a single struct at one call site
+// (cmd/schedd/main.go:metricsListenAndServe factory).
+func (c *Config) MetricsListener() (read, write, idle time.Duration, maxHeaderBytes int64) {
+	read = c.MetricsReadTimeout
+	if read == 0 {
+		read = time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second
+	}
+	write = c.MetricsWriteTimeout
+	if write == 0 {
+		write = time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second
+	}
+	idle = c.MetricsIdleTimeout
+	if idle == 0 {
+		idle = time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second
+	}
+	maxHeaderBytes = c.MetricsMaxHeaderBytes
+	if maxHeaderBytes == 0 {
+		maxHeaderBytes = api.DefaultMaxHeaderBytes
+	}
+	return
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing file

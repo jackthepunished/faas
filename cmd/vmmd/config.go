@@ -41,6 +41,13 @@ type Config struct {
 	// MetricsAddr is the optional bind address for /metrics.
 	// Empty disables the metrics endpoint.
 	MetricsAddr string `toml:"metrics_addr"`
+	// Metrics listener timeouts (ADR-122). Each knob falls back to
+	// the corresponding api.Metrics*SecondsDefault when zero.
+	// MaxHeaderBytes is int64 to mirror api.DefaultMaxHeaderBytes.
+	MetricsReadTimeout    time.Duration `toml:"metrics_read_timeout"`
+	MetricsWriteTimeout   time.Duration `toml:"metrics_write_timeout"`
+	MetricsIdleTimeout    time.Duration `toml:"metrics_idle_timeout"`
+	MetricsMaxHeaderBytes int64         `toml:"metrics_max_header_bytes"`
 
 	// OwnerUser is the uid that owns the socket file. Defaults to
 	// the daemon's own uid (lookups by name first). Only consulted
@@ -312,6 +319,31 @@ func (c *Config) LoadScheddClientTLSWithPrefixAndVerifierAndReload(v wire.NodeVe
 // (nil, nil); partial cluster is rejected.
 func (c *Config) LoadAdvisoryClientTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("advisory_client_", c.AdvisoryClientCertPath, c.AdvisoryClientKeyPath, c.AdvisoryClientCAPath)
+}
+
+// MetricsListener returns the *http.Server timeouts + MaxHeaderBytes
+// for vmmd's metrics listener (ADR-122). Each knob falls back to the
+// corresponding api.Metrics*SecondsDefault when the TOML field is
+// zero. Same shape as cmd/{meterd,schedd}/config.go::MetricsListener
+// so a future daemon can lift the helper verbatim.
+func (c *Config) MetricsListener() (read, write, idle time.Duration, maxHeaderBytes int64) {
+	read = c.MetricsReadTimeout
+	if read == 0 {
+		read = time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second
+	}
+	write = c.MetricsWriteTimeout
+	if write == 0 {
+		write = time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second
+	}
+	idle = c.MetricsIdleTimeout
+	if idle == 0 {
+		idle = time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second
+	}
+	maxHeaderBytes = c.MetricsMaxHeaderBytes
+	if maxHeaderBytes == 0 {
+		maxHeaderBytes = api.DefaultMaxHeaderBytes
+	}
+	return
 }
 
 // LoadConfig reads a TOML file at path and returns the parsed Config with
