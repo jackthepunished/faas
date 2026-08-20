@@ -5008,6 +5008,157 @@ func (a *EdgeRuleBudgetAction) Validate() *Problem {
 	return nil
 }
 
+// EdgeRuleCacheAction is the wire shape for a kind=cache edge rule
+// (ADR-122 §Decision). Per-route TTL knobs for safe response caching
+// on selected GET/HEAD paths. The state mirror is
+// pkg/state/types.go::EdgeRuleCacheAction; the runtime is
+// pkg/gateway/response_cache.go; the applier is
+// pkg/gateway/handler_apply_edge_rule_cache.go.
+//
+// MaxAgeSeconds is the fresh window in seconds (default 60,
+// allowed range [0, ResponseCacheMaxAgeMaxSeconds]). A zero value
+// disables fresh hits but stale-on-error still applies within
+// StaleIfErrorSeconds.
+//
+// StaleIfErrorSeconds is the post-fresh window during which a
+// stored entry MAY be served ONLY on origin failure (wake gate
+// failure or upstream 5xx/timeout). Hard cap
+// ResponseCacheStaleIfErrorMaxSeconds (300 s). Exceeding the cap
+// trips Validate.
+//
+// VaryOn is the closed set of non-credential header names whose
+// values participate in the cache key. Closed vocabulary is
+// edgeRuleCacheVaryOnVocab = {Accept-Language, Accept-Encoding};
+// Authorization, Cookie, and any credential-bearing header are
+// hard bypasses (never a key dimension). An empty slice means "no
+// vary dimension beyond the URL" and is the default.
+//
+// Methods is the optional method allowlist (default {GET, HEAD}).
+// Only idempotent methods are cacheable. Anything outside
+// edgeRuleCacheMethodVocab trips Validate.
+type EdgeRuleCacheAction struct {
+	MaxAgeSeconds       int      `json:"max_age_seconds"`
+	StaleIfErrorSeconds int      `json:"stale_if_error_seconds"`
+	VaryOn              []string `json:"vary_on,omitempty"`
+	Methods             []string `json:"methods,omitempty"`
+}
+
+// edgeRuleCacheVaryOnVocab is the closed vocabulary of headers that
+// may participate in a kind=cache key. Closed by design: any
+// credential-bearing header (Authorization, Cookie) would make a
+// shared cache a cross-tenant leak. Per ADR-122 D3, authed requests
+// are a hard bypass; vary_on is therefore restricted to
+// non-credential discriminating dimensions.
+var edgeRuleCacheVaryOnVocab = map[string]struct{}{
+	"Accept-Language": {},
+	"Accept-Encoding": {},
+}
+
+// edgeRuleCacheMethodVocab is the closed vocabulary of HTTP methods
+// a kind=cache rule may target. Mirrors the cacheability predicate
+// in pkg/gateway/response_cache.go. POST/PUT/PATCH/DELETE are
+// deliberately absent — caching their responses is either
+// incorrect (idempotency breaks under retry) or unsafe (cross-user
+// state).
+var edgeRuleCacheMethodVocab = map[string]struct{}{
+	"GET":  {},
+	"HEAD": {},
+}
+
+// ResponseCacheMaxAgeMaxSeconds is the absolute upper bound on a
+// kind=cache rule's fresh window. 1 hour: long enough to amortise
+// a wake across a real catalogue page-load session, short enough
+// that a stale price/availability signal clears within a normal
+// customer expectation window. Per-plan ceilings (which would be
+// tighter) are deliberately NOT modelled in v1 — the absolute cap
+// is sufficient to defend the in-process store.
+const ResponseCacheMaxAgeMaxSeconds = 3600
+
+// ResponseCacheStaleIfErrorMaxSeconds is the absolute upper bound
+// on a kind=cache rule's stale-on-error window. 5 minutes matches
+// the original ask; longer windows would let a stale body outlive
+// a customer's reasonable expectation that an outage clears.
+const ResponseCacheStaleIfErrorMaxSeconds = 300
+
+// ResponseCacheDefaultMaxAgeSeconds is the apid-side default when
+// a kind=cache rule omits max_age_seconds. 60 s matches the
+// example in the ADR ask; a longer default would surprise users
+// with stale prices; a shorter default would not pay back the
+// wake-elision economics on a 5-min burst.
+const ResponseCacheDefaultMaxAgeSeconds = 60
+
+// ResponseCacheDefaultStaleIfErrorSeconds is the apid-side
+// default when a kind=cache rule omits stale_if_error_seconds.
+// 5 minutes matches the ADR ask's failure budget.
+const ResponseCacheDefaultStaleIfErrorSeconds = 300
+
+// Validate enforces the kind=cache invariants. The runtime
+// cacheability predicate in pkg/gateway/response_cache.go is the
+// second line of defence (e.g. dropping bodies larger than the
+// per-entry cap); this method's job is to reject malformed
+// configurations BEFORE the rule reaches the database.
+func (a *EdgeRuleCacheAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("cache action is required")
+	}
+	// Apply apid-side defaults so the in-memory mirror in
+	// pkg/state/types.go::EdgeRuleCacheAction carries explicit
+	// values. The gateway compile step (commit 10) does NOT
+	// re-default — a zero StaleIfErrorSeconds there is the
+	// apid-submitted value, not "default". This makes "did the
+	// customer ask for stale-on-error" auditable from the row.
+	if a.MaxAgeSeconds == 0 {
+		a.MaxAgeSeconds = ResponseCacheDefaultMaxAgeSeconds
+	}
+	if a.StaleIfErrorSeconds == 0 {
+		a.StaleIfErrorSeconds = ResponseCacheDefaultStaleIfErrorSeconds
+	}
+	if a.MaxAgeSeconds < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"cache action: max_age_seconds must be ≥ 0 (got %d) — a negative TTL would expire entries before they are stored",
+			a.MaxAgeSeconds))
+	}
+	if a.MaxAgeSeconds > ResponseCacheMaxAgeMaxSeconds {
+		return ErrValidation(fmt.Sprintf(
+			"cache action: max_age_seconds (%d) exceeds the platform ceiling (%d s = 1 h); longer fresh windows amplify staleness risk and pin too much in-process memory",
+			a.MaxAgeSeconds, ResponseCacheMaxAgeMaxSeconds))
+	}
+	if a.StaleIfErrorSeconds < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"cache action: stale_if_error_seconds must be ≥ 0 (got %d)",
+			a.StaleIfErrorSeconds))
+	}
+	if a.StaleIfErrorSeconds > ResponseCacheStaleIfErrorMaxSeconds {
+		return ErrValidation(fmt.Sprintf(
+			"cache action: stale_if_error_seconds (%d) exceeds the hard cap (%d s = 5 min); a longer stale window would outlive a customer's expectation that an outage clears",
+			a.StaleIfErrorSeconds, ResponseCacheStaleIfErrorMaxSeconds))
+	}
+	// Methods defaults to {GET, HEAD} but may be empty (caller
+	// chose not to enumerate). Reject anything outside the closed
+	// vocab so a misconfigured rule cannot reach the gateway with
+	// a method the cacheability predicate will silently drop.
+	for _, m := range a.Methods {
+		if _, ok := edgeRuleCacheMethodVocab[m]; !ok {
+			return ErrValidation(fmt.Sprintf(
+				"cache action: method %q is not in the closed cacheable-method vocabulary (GET, HEAD) — caching POST/PUT/PATCH/DELETE breaks idempotency or leaks state",
+				m))
+		}
+	}
+	// VaryOn must be a closed subset of the non-credential
+	// vocabulary. Authorization / Cookie are deliberately NOT in
+	// edgeRuleCacheVaryOnVocab so even a typo like
+	// "Authorizaton" gives a clearer error than "credentialed
+	// requests are a hard bypass" would on its own.
+	for _, h := range a.VaryOn {
+		if _, ok := edgeRuleCacheVaryOnVocab[h]; !ok {
+			return ErrValidation(fmt.Sprintf(
+				"cache action: vary_on header %q is not in the closed non-credential vocabulary (Accept-Language, Accept-Encoding) — credential-bearing headers are a hard bypass and cannot participate in a cache key",
+				h))
+		}
+	}
+	return nil
+}
+
 // isHeaderToken reports whether s matches the RFC 7230 token
 // production used for HTTP header names: a letter followed by
 // letters, digits, or hyphens. Used by EdgeRuleBudgetAction.Validate
