@@ -537,11 +537,19 @@ const (
 	// customer needs to either wait for Gregale cert propagation
 	// or point the edge at a Gregale-issued cert.
 	CodeDomainCertNotIssued = "domain_cert_not_issued"
-	CodeCronInvalid         = "cron_invalid"
-	CodeAlertRuleInvalid    = "alert_rule_invalid"
-	CodeHandlerMissing      = "handler_missing"
-	CodeImageRequired       = "image_required"
-	CodeDeployFailed        = "deploy_failed"
+	// CodeDoctorDisabled (ADR-120) is returned by the doctor
+	// endpoint when FAAS_DOMAIN_DOCTOR_ENABLED is unset. The
+	// route stays registered so the CLI renders a clear
+	// "doctor is dark-launched" message rather than a generic
+	// 404. Distinct from CodeDoctorUnavailable (which fires
+	// when the flag IS on but a probe pass failed).
+	CodeDoctorDisabled    = "doctor_disabled"
+	CodeDoctorUnavailable = "doctor_unavailable"
+	CodeCronInvalid       = "cron_invalid"
+	CodeAlertRuleInvalid  = "alert_rule_invalid"
+	CodeHandlerMissing    = "handler_missing"
+	CodeImageRequired     = "image_required"
+	CodeDeployFailed      = "deploy_failed"
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
@@ -1996,6 +2004,32 @@ func ErrDomainCertNotIssued(domain, reason string) *Problem {
 		"Domain cert not issued",
 		fmt.Sprintf("port-443 cert for %q is not Gregale-issued: %s", domain, reason)).
 		WithDocs(docsBase + "/domains/verify")
+}
+
+// ErrDoctorDisabled (ADR-120) is the 503 returned by
+// `GET /v1/domains/{domain}/doctor` when
+// FAAS_DOMAIN_DOCTOR_ENABLED is unset. The route stays
+// registered (per the pre-#911 pattern in api/flags.go) so
+// the CLI gets a deterministic error code rather than a
+// generic 404. The detail line is the operator-facing
+// "set FAAS_DOMAIN_DOCTOR_ENABLED=1" hint.
+func ErrDoctorDisabled() *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeDoctorDisabled,
+		"Domain doctor is dark-launched",
+		"the FAAS_DOMAIN_DOCTOR_ENABLED flag is not set on this cluster; ask the operator to enable it or use `gregale domains verify` for a one-shot check").
+		WithDocs(docsBase + "/domains/doctor")
+}
+
+// ErrDoctorUnavailable (ADR-120) is the 503 returned when
+// the doctor flag IS on but the probe pass failed in a way
+// the doctor handler can't recover from (e.g. a Postgres
+// round-trip error reading the observation row). Distinct
+// from ErrDoctorDisabled (the dark-launch case).
+func ErrDoctorUnavailable(domain, reason string) *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeDoctorUnavailable,
+		"Domain doctor unavailable",
+		fmt.Sprintf("doctor probes for %s failed: %s", domain, reason)).
+		WithDocs(docsBase + "/domains/doctor")
 }
 
 // ErrCronInvalid is returned for malformed cron expressions.

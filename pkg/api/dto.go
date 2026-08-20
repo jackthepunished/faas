@@ -1721,6 +1721,48 @@ type CreateCustomDomainRequest struct {
 	AppID  string `json:"app_id"`
 }
 
+// DomainDoctorReport (ADR-120) is the wire shape for
+// `GET /v1/domains/{domain}/doctor`. The 5-line shape mirrors
+// the Render-style custom-domain check: dns_record_found,
+// points_to_gregale, tls_certificate, caa_permits,
+// ipv6_conflict. Each check carries its own status +
+// remediation so the CLI can render "Set CNAME ... → ..." in
+// the failure path.
+//
+// Stale=true means the cached observation row is older than
+// FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) — the
+// response is still 200, but the customer should re-poll.
+// Healthy is a coarse summary (all checks ok OR na); the
+// per-check Status is the source of truth.
+//
+// Check names use stable tokens (snake_case) so the CLI
+// can grep / filter by name without parsing the human
+// Detail field.
+type DomainDoctorReport struct {
+	Domain     string              `json:"domain"`
+	AppID      string              `json:"app_id"`
+	Stale      bool                `json:"stale,omitempty"`
+	ObservedAt string              `json:"observed_at"` // RFC3339 UTC
+	Healthy    bool                `json:"healthy"`
+	Checks     []DomainDoctorCheck `json:"checks"`
+}
+
+// DomainDoctorCheck is one row of the doctor report.
+// Remediation is the exact record to change when Status
+// is "fail"; it's the load-bearing field for the
+// activation drop-off. Observed carries the raw observed
+// value (e.g. the actual CNAME target or the observed
+// AAAA) so the customer can confirm their DNS state
+// without leaving the CLI.
+type DomainDoctorCheck struct {
+	Name        string `json:"name"`                  // stable token: dns_record | points_to_gregale | tls_certificate | caa_permits | ipv6_conflict
+	Status      string `json:"status"`                // ok | fail | pending | na
+	Detail      string `json:"detail"`                // human-readable
+	Observed    string `json:"observed,omitempty"`    // raw observed value
+	Remediation string `json:"remediation,omitempty"` // exact record to change
+	CheckedAt   string `json:"checked_at,omitempty"`  // RFC3339 UTC
+}
+
 // TenantSurfaceResponse is a tenant surface's wire shape (ADR-100 /
 // issue #879). Hostnames carries the full list (verified +
 // unverified) so the dashboard + CLI can render a single

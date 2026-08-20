@@ -58,9 +58,18 @@ const (
 	subDomainsSetDefault = "set-default"
 	subDomainsVerify     = "verify"
 	subDomainsShow       = "show"
+	subDomainsDoctor     = "doctor"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
+
+	// doctor check status tokens (ADR-120). Mirrors the stable
+	// `name` enum on pkg/api.DomainDoctorCheck so the CLI's
+	// filter / branch logic doesn't inline raw literals (goconst).
+	doctorCheckOK   = "ok"
+	doctorCheckFail = "fail"
+	doctorCheckPend = "pending"
+	doctorCheckNA   = "na"
 
 	// service names reused across cmdConnect + the usage hint
 	// (commands2.go) so goconst stops flagging them.
@@ -1568,6 +1577,8 @@ func cmdDomains(args []string) int {
 		return cmdDomainsVerify(args[1:])
 	case subDomainsShow:
 		return cmdDomainsShow(args[1:])
+	case subDomainsDoctor:
+		return cmdDomainsDoctor(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown domains subcommand %q\n", args[0])
 	sug, _ := suggestSubcommand(args[0], parent)

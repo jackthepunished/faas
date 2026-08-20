@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { CreateCustomDomainRequest } from '../models/CreateCustomDomainRequest.js';
 import type { CustomDomainResponse } from '../models/CustomDomainResponse.js';
+import type { DomainDoctorReport } from '../models/DomainDoctorReport.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -173,6 +174,57 @@ export class DomainsService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
+      },
+    });
+  }
+  /**
+   * Run the 5-check domain doctor (ADR-120).
+   * Returns the per-domain doctor report. The five checks map
+   * 1:1 to the Render-style custom-domain check: dns_record,
+   * points_to_gregale, tls_certificate, caa_permits,
+   * ipv6_conflict. Each check carries a Status (ok / fail /
+   * pending / na), Detail, Observed, Remediation, and a
+   * per-probe CheckedAt. Used by `gregale domains doctor
+   * <domain>`.
+   *
+   * The handler reads the latest observation row from
+   * `domain_doctor_observations` (the dns_poller writes a
+   * row every 30s). When the row is older than
+   * FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) or missing,
+   * the handler triggers a synchronous re-probe with a 5s
+   * budget. Stale=true is the visible degradation; the
+   * response is still 200 with the per-check Status.
+   *
+   * 503 CodeDoctorDisabled is returned when the operator
+   * hasn't set FAAS_DOMAIN_DOCTOR_ENABLED. The route stays
+   * registered so the CLI gets a deterministic error code
+   * (matches the pre-#911 pattern in `api/flags.go`).
+   *
+   * @returns DomainDoctorReport The doctor report. `stale:true` means the cached row was older than the TTL when the handler ran a synchronous re-probe.
+   * @throws ApiError
+   */
+  public static getDomainDoctor({
+    domain,
+  }: {
+    /**
+     * The custom domain to diagnose (e.g. `app.example.com`).
+     */
+    domain: string,
+  }): CancelablePromise<DomainDoctorReport> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/domains/{domain}/doctor',
+      path: {
+        'domain': domain,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `Doctor is dark-launched (CodeDoctorDisabled) or the probe pass failed (CodeDoctorUnavailable).`,
       },
     });
   }

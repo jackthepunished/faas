@@ -116,9 +116,16 @@ type MemStore struct {
 	// overwrites the same row instead of doubling.
 	buildProvenance map[string]BuildProvenance
 	domains         map[string]CustomDomain
-	crons           map[string]Cron
-	triggers        map[string]sqlc.Trigger
-	records         map[string]sqlc.TriggerRecord
+	// doctorObs (ADR-120) is the in-memory mirror of the
+	// domain_doctor_observations table. The dns_poller is
+	// the sole writer; the doctor HTTP handler is the sole
+	// reader. Stored separately from `domains` because the
+	// observation row is per-domain but the doctor's pass
+	// enumerates both custom_domains and tenant_hostnames.
+	doctorObs map[string]DomainDoctorObservation
+	crons     map[string]Cron
+	triggers  map[string]sqlc.Trigger
+	records   map[string]sqlc.TriggerRecord
 	// fireNowRequests mirrors cron_fire_now_requests (migrations/00193)
 	// for in-process handler tests. Keyed by request id (UUID);
 	// status transitions follow the production 5-state CHECK (pending
@@ -554,6 +561,7 @@ func NewMemStore() *MemStore {
 		// Starts empty; CreateBuildProvenance fills it.
 		buildProvenance:      map[string]BuildProvenance{},
 		domains:              map[string]CustomDomain{},
+		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
 		fireNowRequests:      map[string]FireNowRequest{},
 		alertRules:           map[string]AlertRule{},
@@ -4928,6 +4936,46 @@ func (m *MemStore) DeleteCustomDomain(_ context.Context, domain string) error {
 	}
 	delete(m.domains, domain)
 	return nil
+}
+
+// --- domain_doctor_observations (ADR-120) ------------------------------------
+
+func (m *MemStore) UpsertDoctorObservation(_ context.Context, obs DomainDoctorObservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.doctorObs[obs.Domain]; ok && obs.SurfaceID == "" {
+		obs.SurfaceID = existing.SurfaceID
+	}
+	m.doctorObs[obs.Domain] = obs
+	return nil
+}
+
+func (m *MemStore) GetDoctorObservation(_ context.Context, domain string) (DomainDoctorObservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obs, ok := m.doctorObs[domain]
+	if !ok {
+		return DomainDoctorObservation{}, ErrNotFound
+	}
+	return obs, nil
+}
+
+func (m *MemStore) ListAllCustomDomainsForDoctor(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{})
+	var out []string
+	for d := range m.domains {
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	for _, h := range m.tenantHostnames {
+		if _, ok := seen[h.Hostname]; !ok {
+			seen[h.Hostname] = struct{}{}
+			out = append(out, h.Hostname)
+		}
+	}
+	return out, nil
 }
 
 // --- Crons ------------------------------------------------------------------

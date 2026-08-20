@@ -473,6 +473,14 @@ func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
 }
 
+// DomainDoctor (ADR-120) returns the 5-check doctor report for a
+// domain — see Client.DomainDoctor in pkg/api/client.go for the
+// full docstring. Backed by GET /v1/domains/{domain}/doctor.
+func (c *Client) DomainDoctor(ctx context.Context, domain string) (DomainDoctorReport, error) {
+	var out DomainDoctorReport
+	return out, c.do(ctx, "GET", "/v1/domains/"+domain+"/doctor", nil, &out)
+}
+
 // ListCrons returns every cron on the account when slug is empty,
 // or every cron for the given app when slug is non-empty. The slug
 // filter is added to the wire only when non-empty so the request

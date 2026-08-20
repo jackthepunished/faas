@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // dnsPoller polls DNS for unverified custom-domain TXT challenges and marks
@@ -32,12 +34,23 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 		defer t.Stop()
 		// Run once immediately so freshly-added domains don't wait a minute.
 		s.runVerifyOnce(ctx, log)
+		// ADR-120: ride the same 30 s ticker for the per-domain
+		// doctor probe pass. Gated on api.DomainDoctorEnabled()
+		// so an operator can disable the doctor without bouncing
+		// the daemon — same dark-launch pattern as the
+		// tenant-surfaces branch above.
+		if api.DomainDoctorEnabled() {
+			s.runDoctorOnce(ctx, log)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 				s.runVerifyOnce(ctx, log)
+				if api.DomainDoctorEnabled() {
+					s.runDoctorOnce(ctx, log)
+				}
 			}
 		}
 	}()
@@ -184,3 +197,159 @@ func checkTXT(ctx context.Context, domain, expected string) bool {
 var txtLookupFunc = func(ctx context.Context, target string) ([]string, error) {
 	return (&net.Resolver{}).LookupTXT(ctx, target)
 }
+
+// --- runDoctorOnce (ADR-120) ----------------------------------
+//
+// runDoctorOnce is the per-tick probe pass that writes
+// domain_doctor_observations rows. It enumerates the union
+// of custom_domains + tenant_hostnames via
+// s.store.ListAllCustomDomainsForDoctor, runs the four DNS
+// probes in parallel per domain, looks up the surface cert
+// state (when known) or falls back to a port-443 dial
+// (legacy custom_domains), and upserts a single row per
+// domain. Errors per-domain are logged + skipped; the loop
+// is best-effort and never aborts the whole pass on a
+// single bad domain.
+//
+// The cert probe is deliberately NOT in the parallel fan-out
+// — port-443 dials are stateful (the dialCertFunc seam
+// already has ctx-cancellation wiring at dns_verify.go:86)
+// and the poller can amortise the 5s budget across the
+// batch by sequencing dials with a 2s per-dial cap.
+//
+// Per-domain ctx: each domain gets a fresh
+// context.WithTimeout(ctx, probeTimeout+2s) so a slow
+// upstream doesn't bleed into the next domain. The poller
+// goroutine itself uses the parent ctx so a daemon shutdown
+// cancels the entire pass cleanly.
+func (s *server) runDoctorOnce(ctx context.Context, log *slog.Logger) {
+	domains, err := s.store.ListAllCustomDomainsForDoctor(ctx)
+	if err != nil {
+		log.Warn("dns_poller: list domains for doctor failed", "err", err)
+		return
+	}
+	for _, domain := range domains {
+		domainCtx, cancel := context.WithTimeout(ctx, probeTimeout+2*time.Second)
+		s.runDoctorForDomain(domainCtx, log, domain)
+		cancel()
+	}
+}
+
+func (s *server) runDoctorForDomain(ctx context.Context, log *slog.Logger, domain string) {
+	dnsFound, pointsToG, caa, aaaa := runProbesParallel(ctx, domain)
+	// Translate probe results into the observation row
+	// shape. probeOK → true, probeFail → false, probePending
+	// → false (we treat "transient" as "not currently
+	// passing" so the dashboard reflects a degraded
+	// posture; the next 30s tick will refresh it). probeNA
+	// → true for dns_found (a CNAME-only setup is healthy
+	// for the DNS check; the points_to_gregale check is
+	// the load-bearing one).
+	obs := state.DomainDoctorObservation{
+		Domain:          domain,
+		ObservedAt:      time.Now().UTC(),
+		DNSRecordFound:  probeToBool(dnsFound.Status, true),
+		PointsToGregale: probeToBool(pointsToG.Status, false),
+		IPv6Conflict:    probeToBool(aaaa.Status, false),
+		ObservedTarget:  pointsToG.Observed,
+		ObservedAAAA:    aaaa.Observed,
+		CAAObserved:     caa.Observed,
+		DNSCheckedAt:    earliest(dnsFound.ObservedAt, pointsToG.ObservedAt, caa.ObservedAt, aaaa.ObservedAt),
+	}
+	// CAA is tri-state. ok = true; fail = false; pending
+	// stays nil (NULL in the column, the handler renders
+	// "transient" in that case so a flaky upstream doesn't
+	// burn the customer's "permits" badge).
+	switch caa.Status {
+	case probeOK:
+		v := true
+		obs.CAAPermits = &v
+	case probeFail:
+		v := false
+		obs.CAAPermits = &v
+	}
+	// Surface-aware cert state. Look up the tenant_surfaces
+	// row via the hostname; if present, read its
+	// cert_state (the cert engine is the SOLE writer per
+	// CLAUDE.md ownership). If absent, the domain is a
+	// legacy custom_domains row; fall back to a live
+	// port-443 dial.
+	if s.store != nil {
+		if surface, err := s.store.TenantSurfaceByHostname(ctx, domain); err == nil {
+			obs.SurfaceID = surface.ID
+			obs.CertState = string(surface.CertState)
+			obs.CertNotAfter = surface.CertNotAfter
+		}
+	}
+	if obs.CertState == "" {
+		// Legacy custom_domains path: live dial.
+		obs.CertState, obs.LastError, obs.CertNotAfter = dialCertForDoctor(ctx, domain)
+		obs.CertCheckedAt = time.Now().UTC()
+	}
+	if err := s.store.UpsertDoctorObservation(ctx, obs); err != nil {
+		log.Warn("dns_poller: upsert doctor observation failed", "domain", domain, "err", err)
+		return
+	}
+}
+
+// probeToBool converts a probeStatus into a bool column
+// value. The defaultForOK parameter controls the
+// interpretation of probeNA: dns_record_found is true on
+// NA (a CNAME-only setup is a healthy DNS posture);
+// points_to_gregale is false on NA (we don't know if
+// they point at us; treat as not-passing so the operator
+// can investigate). This keeps the doctor's 5-line
+// shape boolean-only without losing the na case.
+func probeToBool(s probeStatus, defaultForOK bool) bool {
+	switch s {
+	case probeOK, probeNA:
+		return defaultForOK
+	default:
+		return false
+	}
+}
+
+func earliest(ts ...time.Time) time.Time {
+	var out time.Time
+	for _, t := range ts {
+		if t.IsZero() {
+			continue
+		}
+		if out.IsZero() || t.Before(out) {
+			out = t
+		}
+	}
+	return out
+}
+
+// dialCertForDoctor is a thin wrapper around dialCertFunc
+// that maps the cert-dial outcome into the doctor's
+// (cert_state, last_error, cert_not_after) triple.
+// Reuses the existing dialCertFunc seam from
+// dns_verify.go:86; the live dial + CDN detection + SAN
+// check are all unchanged from the PR-3 verify path.
+func dialCertForDoctor(ctx context.Context, domain string) (string, string, time.Time) {
+	leaf, err := dialCert(ctx, domain)
+	if err == nil {
+		return certStatusIssued, "", leaf.NotAfter
+	}
+	if errors.Is(err, errCDNCert) {
+		return certStatusCDN, err.Error(), time.Time{}
+	}
+	return certStatusDialFailed, err.Error(), time.Time{}
+}
+
+// Cert-state tokens rendered into the doctor's
+// cert_state column. The "issued" / "pending" tokens
+// re-use the existing certStatusIssued / certStatusPending
+// consts at cmd/apid/dns_verify.go:73-74 to keep goconst
+// from tripping on the literal "issued" / "pending" used
+// in handlers_ext.go (PR-3's review fix). The "cdn" and
+// "dial_failed" tokens are the doctor's surface-state
+// mapping for legacy custom_domains where there's no
+// tenant_surfaces row to read.
+const (
+	certStatusCDN        = "cdn"
+	certStatusDialFailed = "dial_failed"
+	certStatusFailed     = "failed"
+)

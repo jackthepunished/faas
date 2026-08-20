@@ -166,6 +166,10 @@ from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
 from .delayed_task_request import DelayedTaskRequest
+from .domain_doctor_check import DomainDoctorCheck
+from .domain_doctor_check_name import DomainDoctorCheckName
+from .domain_doctor_check_status import DomainDoctorCheckStatus
+from .domain_doctor_report import DomainDoctorReport
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
@@ -624,6 +628,10 @@ __all__ = (
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
+    "DomainDoctorCheck",
+    "DomainDoctorCheckName",
+    "DomainDoctorCheckStatus",
+    "DomainDoctorReport",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
     "DeploymentHealthcheck",

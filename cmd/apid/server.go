@@ -690,6 +690,15 @@ func newServerWithDeps(
 	// required); the route is mounted via middleware.AuthLimit
 	// (no requireX chain) in cmd/apid/server.go:870 below.
 	s.oidcHandler = s.buildOIDCHandler()
+	// ADR-120: wire the package-level appsDomainFunc seam (declared at
+	// cmd/apid/dns_probes.go:125) to the server's apps base domain so
+	// checkPointsToGregale has the configured Gregale apex in
+	// production. Tests inject a constant via the same var (see
+	// cmd/apid/dns_probes_test.go:24-38); that assignment is reverted
+	// in t.Cleanup, so the production wire below wins on every real
+	// daemon start (the var is reset to the server's domain, not the
+	// empty default).
+	appsDomainFunc = func() string { return s.domain }
 	return s
 }
 
@@ -1079,6 +1088,16 @@ func (s *server) handler() http.Handler {
 	// show).
 	mux.HandleFunc("POST /v1/domains/{domain}/verify", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.verifyDomain)))))
 	mux.HandleFunc("GET /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomain))))
+	// ADR-120: per-domain doctor surface for `gregale domains doctor`.
+	// Read-only; returns the latest observation row from
+	// domain_doctor_observations plus a synchronous re-probe if
+	// the row is older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS. The
+	// route stays registered when FAAS_DOMAIN_DOCTOR_ENABLED is
+	// unset; the handler returns 503 CodeDoctorDisabled in that
+	// case so the CLI can render a clear "doctor is dark-launched"
+	// message rather than a generic 404 (matches the pre-#911
+	// pattern in api/flags.go).
+	mux.HandleFunc("GET /v1/domains/{domain}/doctor", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomainDoctor))))
 
 	// Crons.
 	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCrons))))

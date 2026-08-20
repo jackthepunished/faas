@@ -360,6 +360,14 @@ var cliCommands = []cliCommand{
 		Name:    "domains",
 		DocSlug: "domains",
 		Short:   "Manage custom domains",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List custom domain bindings"},
+			{Name: subAdd, Short: "Bind a custom domain to an app"},
+			{Name: subRm, Short: "Remove a custom domain binding"},
+			{Name: subDomainsVerify, Short: "Re-verify DNS + cert for a domain"},
+			{Name: subDomainsShow, Short: "Show a domain's cert details"},
+			{Name: subDomainsDoctor, Short: "5-check doctor report (DNS / CNAME / TLS / CAA / IPv6)"},
+		},
 	},
 	{
 		Name:    "tenant-surfaces",

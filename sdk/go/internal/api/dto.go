@@ -349,6 +349,37 @@ type CreateCustomDomainRequest struct {
 	AppID  string `json:"app_id"`
 }
 
+// DomainDoctorReport (ADR-120) is the wire shape for
+// GET /v1/domains/{domain}/doctor. Five Render-style check
+// lines (dns_record / points_to_gregale / tls_certificate /
+// caa_permits / ipv6_conflict) plus the durable row's app_id
+// and observed_at. Stale=true means the cached observation
+// row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default
+// 300) when the handler ran a synchronous re-probe.
+type DomainDoctorReport struct {
+	Domain     string              `json:"domain"`
+	AppID      string              `json:"app_id"`
+	Stale      bool                `json:"stale,omitempty"`
+	ObservedAt string              `json:"observed_at"`
+	Healthy    bool                `json:"healthy"`
+	Checks     []DomainDoctorCheck `json:"checks"`
+}
+
+// DomainDoctorCheck is one row of the doctor report. Stable
+// Name tokens (dns_record / points_to_gregale /
+// tls_certificate / caa_permits / ipv6_conflict) so the CLI
+// can filter by name without parsing the human Detail field.
+// Remediation is the exact record to change when Status is
+// fail — the load-bearing field for the activation drop-off.
+type DomainDoctorCheck struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail"`
+	Observed    string `json:"observed,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+	CheckedAt   string `json:"checked_at,omitempty"`
+}
+
 // CronResponse mirrors the crons table. LastFiredAt is the most
 // recent fire stamp schedd wrote (MarkCronFired). Zero-valued
 // crons serialize as "" — the dashboard only shows the column

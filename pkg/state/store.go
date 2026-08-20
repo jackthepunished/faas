@@ -1945,6 +1945,24 @@ type Store interface {
 	MarkDomainVerified(ctx context.Context, domain string) error
 	DeleteCustomDomain(ctx context.Context, domain string) error
 
+	// Domain doctor observations (ADR-120). The dns_poller
+	// is the sole writer; the doctor HTTP handler is the
+	// sole reader. UpsertDoctorObservation writes (or
+	// refreshes) the per-domain observation row; the
+	// GetDoctorObservation reader returns ErrNotFound when
+	// the poller has not yet written a row for the domain
+	// (the handler treats this as stale:true and triggers
+	// a synchronous re-probe). ListAllCustomDomainsForDoctor
+	// is the poller's enumeration seam — distinct from
+	// ListDomainsForApp so the doctor pass doesn't have to
+	// walk every app+account. Doctor observation methods
+	// are hand-rolled (not sqlc-generated) because the
+	// UPSERT shape and the lack of other consumers mean a
+	// one-line pgx call is clearer than a generated method.
+	UpsertDoctorObservation(ctx context.Context, obs DomainDoctorObservation) error
+	GetDoctorObservation(ctx context.Context, domain string) (DomainDoctorObservation, error)
+	ListAllCustomDomainsForDoctor(ctx context.Context) ([]string, error)
+
 	// Tenant surfaces (ADR-100; apid is sole writer to tenant_surfaces
 	// and tenant_hostnames). The pg_notify trigger
 	// (migrations/00243_tenant_surfaces.sql) bubbles mutations to
