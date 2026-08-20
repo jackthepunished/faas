@@ -511,6 +511,27 @@ type Manager struct {
 	// and started by Manager.bringUp / cancelled by Manager.Park
 	// — same shape as the framework_ready DGRAM listener.
 	livenessRelay LivenessFailedSink
+	// workloadOOMRelay (Cluster C / ADR-121) is the optional
+	// function the vmmd cmd wires via WithWorkloadOOMSink. The
+	// framework_ready_recv dispatcher calls it whenever the
+	// guest-init emits a DGRAM type 0x05 on port 1027
+	// (guest-init's cgroup.events "oom_kill" listener observed
+	// a kill on the per-VM workload cgroup v2 leaf). The relay
+	// is how vmmd plumbs the observed (peakMB, planMB) payload
+	// to schedd's Engine.DestroyForWorkloadOOMFailure — schedd
+	// is the only writer to instances (spec §6), AND the only
+	// component that holds the deployment lock needed to
+	// stamp CodeAppRuntimeOOM via SetDeploymentFailedEx. nil-safe:
+	// the dispatcher guards on nil so a missing wire (a unit
+	// test that doesn't construct a relay) is a no-op.
+	//
+	// The relay is invoked from the framework_ready_recv DGRAM
+	// loop whose lifecycle is owned by the per-instance
+	// manager bringUp — same shape as the liveness poll
+	// goroutine. Best-effort: a failed relay is logged + dropped
+	// because the workload is already dead and the VM is about
+	// to be torn down by the manager's destroy path.
+	workloadOOMRelay WorkloadOOMSink
 	// livenessRegistry (issue #554 / ADR-078 / PR review fix)
 	// is the per-instance poll goroutine registry the cmd/vmmd
 	// main loop wires via WithLivenessProbes. The Manager owns
@@ -871,6 +892,23 @@ func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 // audit event's data JSON.
 type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
 
+// WorkloadOOMSink (Cluster C / ADR-121) is the function signature
+// the vmmd framework_ready_recv dispatcher invokes when the
+// guest-init emits a DGRAM type 0x05 on port 1027 (workload OOM
+// detected on the per-VM cgroup v2 leaf). The relay is the
+// boundary between vmmd (host-side DGRAM loop) and schedd (state
+// machine owner). schedd constructs the closure at daemon startup
+// and passes it via Manager.WithWorkloadOOMSink; the framework_ready
+// recv dispatcher calls it directly.
+//
+// peakMB and planMB are the observed payload — the guest-init
+// samples memory.events for the post-kill `current` (or `high`
+// watermark) and converts to MiB before emission. The schedd
+// Engine.DestroyForWorkloadOOMFailure uses these to populate the
+// whycopy Observed closure (Why + Fix templated with the peak +
+// plan cap). Unit-test-friendly: nil receiver is a no-op.
+type WorkloadOOMSink func(ctx context.Context, instanceID string, peakMB, planMB int)
+
 // LivenessProbeStarter (issue #554 / ADR-078) is the cmd-level
 // goroutine-launcher the cmd/vmmd main loop attaches via
 // WithLivenessProbeStarter. Manager.startLivenessLoop calls it with
@@ -918,6 +956,41 @@ func (m *Manager) WithLivenessMetrics(lm *LivenessMetrics) *Manager {
 func (m *Manager) WithLivenessSink(relay LivenessFailedSink) *Manager {
 	m.livenessRelay = relay
 	return m
+}
+
+// WithWorkloadOOMSink (Cluster C / ADR-121) attaches the relay the
+// vmmd framework_ready_recv dispatcher calls when a guest-init
+// DGRAM type 0x05 arrives on port 1027 (workload OOM-kill detected
+// on the per-VM cgroup v2 leaf). nil-safe: the dispatcher guards
+// on nil so a missing wire (unit tests, default-local vmmd) is a
+// no-op. Returns the *Manager so callers can chain.
+//
+// Mirrors WithLivenessSink's signature shape (ctx + instance id +
+// observed payload); the only difference is the payload shape
+// (peakMB + planMB ints instead of a closed-set reason string).
+func (m *Manager) WithWorkloadOOMSink(relay WorkloadOOMSink) *Manager {
+	m.workloadOOMRelay = relay
+	return m
+}
+
+// ReportWorkloadOOM (Cluster C / ADR-121) is the vmmd-side
+// invocation of the WorkloadOOMSink. Called by the framework_ready
+// DGRAM dispatcher when the guest-init emits a workload OOM
+// signal. Schedd is the consumer
+// (Engine.DestroyForWorkloadOOMFailure); vmmd never touches the
+// DB. Safe on a nil relay — the missing-wire path is a no-op so a
+// unit test that doesn't construct a relay doesn't have to stub
+// one.
+//
+// Best-effort: the workload is dead at the time of the call, so a
+// failed relay is logged + dropped. The relay's own context
+// cancellation (from vmmd shutdown) is honoured by the closing
+// goroutine.
+func (m *Manager) ReportWorkloadOOM(ctx context.Context, instanceID string, peakMB, planMB int) {
+	if m.workloadOOMRelay == nil {
+		return
+	}
+	m.workloadOOMRelay(ctx, instanceID, peakMB, planMB)
 }
 
 // ObserveLivenessProbe records one probe's wall-clock duration with
