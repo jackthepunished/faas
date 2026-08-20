@@ -68,7 +68,7 @@ Issue body requests exactly this:
 | `pr_number`   | int    | yes      | `> 0`                                         | githubd stamps `pull_request.number`; Action defaults to `${{ github.event.pull_request.number }}` when present. Push-to-main with no PR leaves NULL. |
 
 Migration: `migrations/00334_deployments_annotation.sql`, slot 00334
-(next free above 00333 (PR #1005 ingress IP allowlist; 00334 is above #1005 fence line), post-PR #986 ADR-120 domain doctor merge). Replaces the `00288_reserve_slot.sql` fence
+(next free above 00338 (PR #1005 ingress IP allowlist; 00334 is above #1005 fence line), post-PR #986 ADR-120 domain doctor merge). Replaces the `00288_reserve_slot.sql` fence
 when the mega-PR ships.
 
 The CHECK constraints follow the `00157_deployments_parked_reason.sql`
