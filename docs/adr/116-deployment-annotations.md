@@ -67,8 +67,8 @@ Issue body requests exactly this:
 | `deployed_by` | text   | yes      | —                                             | CLI auto-captures `git config user.name`; githubd stamps `pusher.name`; Action stamps `${{ github.actor }}`. Operator can override with `--deployed-by`. |
 | `pr_number`   | int    | yes      | `> 0`                                         | githubd stamps `pull_request.number`; Action defaults to `${{ github.event.pull_request.number }}` when present. Push-to-main with no PR leaves NULL. |
 
-Migration: `migrations/00288_deployments_annotation.sql`, slot 00288
-(next free above 00287). Replaces the `00288_reserve_slot.sql` fence
+Migration: `migrations/00314_deployments_annotation.sql`, slot 00314
+(next free above 00313, post-PR #986 ADR-120 domain doctor merge). Replaces the `00288_reserve_slot.sql` fence
 when the mega-PR ships.
 
 The CHECK constraints follow the `00157_deployments_parked_reason.sql`
@@ -232,7 +232,7 @@ absent. No wire-version bump.
 ## Migration shape
 
 ```sql
--- migrations/00288_deployments_annotation.sql
+-- migrations/00314_deployments_annotation.sql
 ALTER TABLE deployments
     ADD COLUMN IF NOT EXISTS reason      text,
     ADD COLUMN IF NOT EXISTS tag         text,
