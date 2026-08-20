@@ -1925,8 +1925,27 @@ func ErrAppHealthzUnauthorized(observedStatus int) *Problem {
 // the customer's main workload inside the microVM (memory.max = plan +
 // 8 MB was exceeded). Distinct from CodeBuildOOM (the *build* VM's
 // OOM, which is a separate code with a different remediation path).
-// Detection site (guest/init/cgroup_partition_linux.go::cgroup.events
-// listener) attaches prose with the observed peak RSS + the plan cap.
+//
+// Detection chain (Cluster C, ADR-121):
+//
+//	guest/init/cgroup_partition_linux.go::WatchOOM  (cgroup.events
+//	  poll on the per-workload cgroup v2 leaf)
+//	  → guest/init/framework_ready_emit.go::EmitWorkloadOOM
+//	    (AF_VSOCK DGRAM, port 1027, type byte 0x05, JSON body)
+//	  → cmd/vmmd/framework_ready_recv.go::dispatchWorkloadOOM
+//	  → pkg/fcvm/manager.go::ReportWorkloadOOM
+//	  → pkg/scheddgrpc::Server.ReportWorkloadOOM
+//	  → pkg/sched/engine.go::DestroyForWorkloadOOMFailure
+//	    (stamps the deployment row via SetDeploymentFailedEx with
+//	     CodeAppRuntimeOOM + the whycopy Observed payload)
+//
+// The host-side cgroup (which sees only the firecracker process) is
+// NOT a detection source — only the guest can see the workload OOM
+// because the per-VM workload lives under the guest's cgroup
+// namespace, invisible from the host. The constructor receives the
+// observed peak MB and the plan cap MB; the engine handler stamps
+// the deployment detail row with the templated Hint/Why/Fix (see
+// pkg/whycopy/whycopy.go::CodeAppRuntimeOOM.Observed).
 func ErrAppRuntimeOOM(observedPeakMB, planMB int) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeAppRuntimeOOM,
 		"Container out of memory",
