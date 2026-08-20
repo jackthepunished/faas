@@ -975,6 +975,32 @@ CREATE TABLE public.compute_node_keys (
 
 
 --
+-- Name: consumer_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.consumer_keys (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    name text NOT NULL,
+    prefix text NOT NULL,
+    hashed_secret bytea NOT NULL,
+    scopes text[] DEFAULT '{}'::text[] NOT NULL,
+    expires_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT consumer_keys_expires_after_created_chk CHECK (((expires_at IS NULL) OR (expires_at > created_at))),
+    CONSTRAINT consumer_keys_hashed_secret_len_chk CHECK ((octet_length(hashed_secret) = 32)),
+    CONSTRAINT consumer_keys_name_len_chk CHECK (((length(name) >= 1) AND (length(name) <= 64))),
+    CONSTRAINT consumer_keys_prefix_len_chk CHECK (((length(prefix) >= 1) AND (length(prefix) <= 16))),
+    CONSTRAINT consumer_keys_revoked_state_chk CHECK (((revoked_at IS NULL) OR (revoked_at >= created_at))),
+    CONSTRAINT consumer_keys_scopes_vocab_chk CHECK ((scopes <@ ARRAY['read'::text, 'write'::text, 'admin'::text]::text[]) AND (cardinality(scopes) > 0))
+);
+
+
+--
 -- Name: compute_nodes; Type: TABLE; Schema: public; Owner: -
 --
 

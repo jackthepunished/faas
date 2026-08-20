@@ -378,6 +378,21 @@ type ComputeNodeKey struct {
 	CreatedAt     pgtype.Timestamptz
 }
 
+type ConsumerKey struct {
+	ID           pgtype.UUID
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	Name         string
+	Prefix       string
+	HashedSecret []byte
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
+	RevokedAt    pgtype.Timestamptz
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
 type CorsPreset struct {
 	ID               pgtype.UUID
 	AccountID        pgtype.UUID

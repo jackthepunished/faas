@@ -2099,6 +2099,26 @@ const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
 // the body.
 const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
 
+// CodePlanConsumerKeyQuotaReached is the RFC 7807 stable code
+// returned when the per-app or per-account consumer_keys quota is
+// exhausted. The intent is "your plan allows N keys per app (or per
+// account) and you already hold N — revoke one or upgrade before
+// minting another." PR #5-B's apid CreateConsumerKey handler returns
+// 403 with this code on POST attempts.
+// Why stable: the apid sdk-go / sdk-node / sdk-python surfaces map
+// this code to a typed error class so customers can write a
+// one-line handler for the quota-exhausted case without parsing the
+// prose body — same shape as CodePlanAlertRuleQuota.
+const CodePlanConsumerKeyQuotaReached = "plan_consumer_key_quota_reached"
+
+// CodeConsumerKeysNotAllowed is the RFC 7807 stable code returned when
+// the customer's plan is gated off the consumer_keys feature entirely
+// (Free tier today; mirrors CronLimitPerApp posture). The apid handler
+// returns 402 plan_not_allowed with this code on POST attempts.
+// Why stable: mirrors CodePlanAlertRulesNotAllowed shape so SDK
+// authors can write a single switch on plan-gated codes.
+const CodeConsumerKeysNotAllowed = "consumer_keys_not_allowed"
+
 // PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
 // *Quota functions receive in their `scope` argument. Mirrors
 // state.CronQuotaScopeAccount / CronQuotaScopeApp and the alert /

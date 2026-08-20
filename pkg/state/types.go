@@ -358,6 +358,51 @@ const (
 	APIKeyStatusRevoked APIKeyStatus = "revoked"
 )
 
+// ConsumerKey is a hashed, per-(account, app) credential for the
+// application's customers (ADR-120 / issue #975 item #5). Distinct
+// from APIKey because it is scoped to a single (AccountID, AppID)
+// pair (a leaked key affects only one app) and exposed to the
+// public internet (every customer of the app sees one — hence 2×
+// the entropy at mint time, see pkg/api/apikey.go).
+//
+// Wire format `ck_<8-hex-prefix>_<64-hex-secret>`. The plaintext is
+// shown to the operator exactly once at mint; only Hash is stored.
+// Prefix is the human-shareable portion used by the
+// (app_id, prefix) hot-path index; the store narrows to one row
+// before the hash compare.
+//
+// RevokedAt is a terminal timestamp; expiry is a soft gate enforced
+// at the read path (cmd/gatewayd-internal/auth_consumer.go — PR
+// #5-C). LastUsedAt is best-effort observability updated via
+// TouchConsumerKeyLastUsed with a 60s debouncer — never a billing
+// signal.
+type ConsumerKey struct {
+	ID         string
+	AccountID  string
+	AppID      string
+	Name       string
+	Prefix     string
+	Hash       []byte
+	Scopes     []string
+	CreatedAt  time.Time
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+// Active reports whether the key is in an authentication-eligible
+// state (not revoked, not expired). The gatewayd-internal
+// middleware reads this on every inbound request.
+func (k ConsumerKey) Active(now time.Time) bool {
+	if k.RevokedAt != nil {
+		return false
+	}
+	if k.ExpiresAt != nil && !k.ExpiresAt.After(now) {
+		return false
+	}
+	return true
+}
+
 type APIKey struct {
 	ID        string
 	AccountID string
