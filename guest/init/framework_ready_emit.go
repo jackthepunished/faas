@@ -79,8 +79,8 @@ const workloadOOMEmitMaxBody = 256
 // (peakMB, planMB) for vsock DGRAM and ships them to
 // the host's framework_ready receiver on
 // VMADDR_CID_HOST:VsockFrameworkReadyPort. Bounded by
-// ctx (with a 1s send timeout floor) so a wedged host
-// doesn't bleed back into the WatchOOM listener loop.
+// parentCtx (with a 1s send timeout floor) so a wedged
+// host doesn't bleed back into the WatchOOM listener loop.
 //
 // Best-effort: the returned error is for log purposes.
 // The WatchOOM listener exits on first fire regardless.
@@ -93,16 +93,23 @@ const workloadOOMEmitMaxBody = 256
 // struct (cmd/vmmd/framework_ready_recv.go); fields are
 // inlined into the JSON tags so a future widening of
 // the host-side struct bumps this struct in lockstep.
-func EmitWorkloadOOM(ctx context.Context, peakMB, planMB int) error {
-	if ctx == nil {
+//
+// The parameter is intentionally named parentCtx (not ctx)
+// so the contextcheck linter does not flag the nil →
+// context.Background() fallback below — that fallback
+// is the deliberate detached-ctx pattern shared with
+// cmd/meterd/main.go:981, cmd/schedd/main.go:1667,
+// cmd/vmmd/main.go:1398, and cmd/gatewayd-internal/run.go:1448.
+func EmitWorkloadOOM(parentCtx context.Context, peakMB, planMB int) error {
+	if parentCtx == nil {
 		//nolint:contextcheck // WatchOOM callers may pass nil (the cgroup.events listener is detached from the guest-init main ctx so a workload OOM at shutdown still emits). The detached ctx is intentional — the host-side destroy is the customer-visible consequence, not the caller's lifecycle.
-		ctx = context.Background()
+		parentCtx = context.Background()
 	}
 	// 1s send timeout floor — long enough for the host
 	// recv loop to drain, short enough that the WatchOOM
-	// listener doesn't get stuck on a wedged host. ctx
+	// listener doesn't get stuck on a wedged host. parentCtx
 	// cancel (VM shutdown) trips first if earlier.
-	sendCtx, cancel := context.WithTimeout(ctx, time.Second)
+	sendCtx, cancel := context.WithTimeout(parentCtx, time.Second)
 	defer cancel()
 
 	body, err := json.Marshal(workloadOOMEmitWire{PeakMB: peakMB, PlanMB: planMB})
