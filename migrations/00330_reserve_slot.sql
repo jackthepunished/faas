@@ -1,6 +1,4 @@
--- 00330_reserve_slot.sql — temporary concurrent-PR migration fence.
--- The real migration for this slot is being coordinated by another open PR.
--- Remove this no-op when that migration lands, per ADR-041.
+-- filename: 00330_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;
