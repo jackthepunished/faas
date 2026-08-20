@@ -145,6 +145,7 @@ export type { ListSecretsForAccountResponse } from './ListSecretsForAccountRespo
 export type { ListTenantSurfacesResponse } from './ListTenantSurfacesResponse.js';
 export type { ListTriggerDeadLetterResponse } from './ListTriggerDeadLetterResponse.js';
 export type { ListTriggerRecordsResponse } from './ListTriggerRecordsResponse.js';
+export type { LogExcerpt } from './LogExcerpt.js';
 export type { MFAConfirmRequest } from './MFAConfirmRequest.js';
 export type { MFAConfirmResponse } from './MFAConfirmResponse.js';
 export type { MFADisableRequest } from './MFADisableRequest.js';

@@ -104,11 +104,55 @@ type Problem struct {
 	// the dashboard / SDK can render the hint as a one-line footer
 	// without parsing prose. Optional + omitempty.
 	SecretHint string `json:"secret_hint,omitempty"`
+	// Hint is the single short next-action line shown on the CLI's
+	// 3-5 line renderer (spec §6.4 amendment 1). Mirrors SecretHint
+	// shape — a one-line remediation nudge. Distinct from SecretHint:
+	// Hint is generic across all error codes, SecretHint is
+	// narrow to the strict secret-scan path. Optional + omitempty so
+	// every other problem+json site keeps its existing flat shape
+	// unchanged.
+	Hint string `json:"hint,omitempty"`
+	// Why is the human-readable explanation of why the failure
+	// happened, including the observed value (e.g. "bound to
+	// 127.0.0.1; guest at 10.0.0.2 only sees requests proxied via
+	// the bridge"). Distinct from Detail: Detail is the platform's
+	// machine-stable message; Why is the customer-facing prose
+	// surfaced only on error UX paths. Multi-line ok (≤ 512 bytes,
+	// CLI tripwire enforces). Optional + omitempty.
+	Why string `json:"why,omitempty"`
+	// Fix is the prescriptive remediation (e.g. "set
+	// `app.listen('0.0.0.0')` or run `gregale env set PORT 8080`").
+	// Distinct from Hint: Hint is a single short line; Fix may be
+	// 1-3 lines. Optional + omitempty.
+	Fix string `json:"fix,omitempty"`
+	// RelevantLogs are the last N log lines that explain the failure,
+	// surfaced inline by the CLI renderer when the server attaches
+	// them. Capped at 20 entries × 512 bytes per Message (CLI
+	// tripwire enforces). Distinct from SecretFindings which is
+	// secret-scan specific. Optional + omitempty so every other
+	// problem+json site keeps its existing flat shape unchanged.
+	RelevantLogs []LogExcerpt `json:"relevant_logs,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
 	// before WriteHeader. nil = no extras.
 	extraHeaders map[string][]string `json:"-"`
+}
+
+// LogExcerpt is one entry of Problem.RelevantLogs — a small,
+// shape-stable slice of a log line that explains the failure inline.
+// Distinct from SecretFinding (which is narrow to secret-scan): the
+// CLI renderer prints this as a fenced block under the 3-5 line
+// explanation. Timestamp is RFC 3339; Level is one of info|warn|error;
+// Source tags the log origin so the customer can attribute the line
+// (build vs vm-init vs app vs gateway); Message is the line content,
+// capped at 512 bytes server-side (CLI tripwire enforces the cap
+// client-side as well).
+type LogExcerpt struct {
+	Timestamp string `json:"ts"`
+	Level     string `json:"level"`
+	Source    string `json:"source,omitempty"`
+	Message   string `json:"message"`
 }
 
 // FieldError is one per-field entry of Problem.Errors. The shape mirrors
@@ -210,6 +254,42 @@ func (p *Problem) WithDocs(url string) *Problem {
 func (p *Problem) WithSecretScan(findings []SecretFinding, hint string) *Problem {
 	p.SecretFindings = findings
 	p.SecretHint = hint
+	return p
+}
+
+// WithHint attaches the single short next-action line shown on the
+// CLI's 3-5 line renderer (spec §6.4 amendment 1). Mirrors
+// SecretHint shape — a one-line remediation nudge. Returns the same
+// pointer for chaining.
+func (p *Problem) WithHint(hint string) *Problem {
+	p.Hint = hint
+	return p
+}
+
+// WithWhy attaches the human-readable explanation of why the failure
+// happened (spec §6.4 amendment 1). Distinct from Detail: Detail is
+// the platform's machine-stable message; Why is the customer-facing
+// prose surfaced only on error UX paths. Multi-line ok (≤ 512 bytes;
+// CLI tripwire enforces). Returns the same pointer for chaining.
+func (p *Problem) WithWhy(why string) *Problem {
+	p.Why = why
+	return p
+}
+
+// WithFix attaches the prescriptive remediation (spec §6.4
+// amendment 1). Distinct from Hint: Hint is a single short line; Fix
+// may be 1-3 lines. Returns the same pointer for chaining.
+func (p *Problem) WithFix(fix string) *Problem {
+	p.Fix = fix
+	return p
+}
+
+// WithRelevantLogs attaches the last N log lines that explain the
+// failure, surfaced inline by the CLI renderer. Capped at 20
+// entries × 512 bytes per Message (CLI tripwire enforces). Returns
+// the same pointer for chaining.
+func (p *Problem) WithRelevantLogs(logs []LogExcerpt) *Problem {
+	p.RelevantLogs = logs
 	return p
 }
 
@@ -1025,6 +1105,24 @@ const (
 	// violation was caught. The Detail field distinguishes the three.
 	CodeStatelessOnlyViolation = "stateless_only_violation"
 
+	// Error-explanations cluster (spec §6.4 amendment 1, ADR-110
+	// amendment 1). All 9 codes emit status 422 (RFC 7807) and pair
+	// with pkg/whycopy catalog rows that render hint/why/fix/relevant
+	// logs prose on the CLI's 3-5 line renderer. The 422 status keeps
+	// them in the same family as CodeDeployFailed / CodeStatelessOnly
+	// Violation so the dashboard's error-explanation template picks
+	// them up uniformly. Each code's ErrXxx constructor lives next to
+	// its constant; the StatusForCode switch arm below (line ~1267)
+	// adds them to the 422 bucket.
+	CodeAppNotListening        = "app_not_listening"
+	CodeAppLoopbackBound       = "app_loopback_bound"
+	CodeAppArchMismatch        = "app_arch_mismatch"
+	CodeEnvVarMissing          = "env_var_missing"
+	CodeAppHealthzUnauthorized = "app_healthz_unauthorized"
+	CodeAppRuntimeOOM          = "app_runtime_oom"
+	CodeDepInstallFailed       = "dep_install_failed"
+	CodeAppStartupTimeout      = "app_startup_timeout"
+
 	// CLI auth (spec §2.2 device-code flow). Pending is the "user has
 	// not yet approved" signal the CLI's poll loop keys off; the CLI
 	// keeps polling until it sees 200 OK or a different 4xx. The
@@ -1267,6 +1365,20 @@ func StatusForCode(code string) int {
 		// imaged also lifts this code onto deployments.error_code, so
 		// the GET /v1/deployments/{id} response and the CLI's
 		// `faas deployment <id>` render it identically.
+		return http.StatusUnprocessableEntity
+	case CodeAppNotListening,
+		CodeAppLoopbackBound,
+		CodeAppArchMismatch,
+		CodeEnvVarMissing,
+		CodeAppHealthzUnauthorized,
+		CodeAppRuntimeOOM,
+		CodeDepInstallFailed,
+		CodeAppStartupTimeout:
+		// 422 — error-explanations cluster (spec §6.4 amendment 1).
+		// Same family as CodeStatelessOnlyViolation / CodeDeployFailed:
+		// well-formed request, content policy refuses. The Detail
+		// field distinguishes the 9 failures; the pkg/whycopy catalog
+		// renders hint/why/fix prose on the CLI's 3-5 line renderer.
 		return http.StatusUnprocessableEntity
 	case CodeRequestValidationFailed:
 		// 422 — kind=validate edge rule rejected the request body.
@@ -1722,6 +1834,134 @@ func ErrStatelessOnlyViolation(kind, detail string) *Problem {
 		// templates) — until then the URL 404s, consistent
 		// with every other docs URL in the file.
 		WithDocs(docsBase + "/storage")
+}
+
+// Error-explanations cluster constructors (spec §6.4 amendment 1,
+// ADR-110 amendment 1). Each constructor returns the canonical Problem
+// shape (status 422, code in the family, Title stable, Detail carries
+// the observed value) WITHOUT hint/why/fix — those are attached later
+// by the detection site via WithHint/WithWhy/WithFix so each failure
+// can carry code-specific prose. The pkg/whycopy catalog is the
+// single source of truth for the prose; constructors here only
+// anchor the code → status → docs URL plumbing.
+//
+// Why this shape: the wire spine (Hint/Why/Fix/RelevantLogs on Problem)
+// is already committed (commit 1); the detection sites (commits 7-13)
+// attach the prose at the point where they have the observed value;
+// the central catalog (commit 3) owns the prose body. Constructors
+// stay minimal so a new code is a 3-line addition.
+
+// ErrAppNotListening is returned when the wake readiness probe finds
+// no process listening on the customer's $PORT (typically ECONNREFUSED
+// on the TCP-accept dial, or a 4xx/5xx on the healthcheck path). The
+// detection site (pkg/fcvm/vmm.go) attaches hint/why/fix prose from
+// pkg/whycopy with the observed port + last-dial-error.
+func ErrAppNotListening(observedPort string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppNotListening,
+		"No process listening on $PORT",
+		fmt.Sprintf("readiness probe found no listener on port %s after the wake timeout.",
+			observedPort)).
+		WithDocs(docsBase + "/errors/app-not-listening")
+}
+
+// ErrAppLoopbackBound is returned when the customer's app binds its
+// listener to 127.0.0.1 (or ::1) — the per-VM bridge proxies from
+// 10.0.0.2, so a loopback bind never receives traffic even though the
+// wake readiness probe passes. The detection site (pkg/fcvm/vmm.go via
+// WaitCharacterizationReport's listening_addrs) attaches prose from
+// pkg/whycopy with the observed bind address.
+func ErrAppLoopbackBound(observedBind string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppLoopbackBound,
+		"Application bound to loopback",
+		fmt.Sprintf("app is listening on %s; the per-VM bridge proxies requests to 10.0.0.2, "+
+			"so loopback-only binds never receive traffic.", observedBind)).
+		WithDocs(docsBase + "/errors/app-loopback-bound")
+}
+
+// ErrAppArchMismatch is returned when the build VM cannot execute the
+// customer's binary because the host/target architecture disagrees
+// (e.g. darwin/arm64 binary on a linux/amd64 control plane). The
+// detection site (pkg/builderd/vm_metal.go::classifyBuildFailure)
+// attaches prose with the observed binary arch + the required target.
+func ErrAppArchMismatch(observedArch, requiredArch string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppArchMismatch,
+		"Unsupported CPU architecture",
+		fmt.Sprintf("binary is %s; this control plane runs %s. "+
+			"rebuild with the matching target.",
+			observedArch, requiredArch)).
+		WithDocs(docsBase + "/errors/app-arch-mismatch")
+}
+
+// ErrEnvVarMissing is returned when a deploy-time preflight detects
+// that the customer's source references an env var (os.Getenv in Go,
+// process.env in Node, os.environ in Python) that is not declared in
+// the app's env config. Preflight is warn-only; this error fires only
+// when --strict is set on `gregale deploy` or when the runtime
+// supervisor observes an execve crash from a missing key. Detection
+// site attaches prose with the observed env var name.
+func ErrEnvVarMissing(envVar string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeEnvVarMissing,
+		"Missing environment variable",
+		fmt.Sprintf("source references $%s but it is not declared in the app's env config.",
+			envVar)).
+		WithDocs(docsBase + "/errors/env-var-missing")
+}
+
+// ErrAppHealthzUnauthorized is returned when the customer's health
+// endpoint returns 401/403 within the liveness window — the host
+// can't distinguish "the app is up but the /healthz path is gated"
+// from "the app is down", so the deployment flips to failed after
+// ConsecutiveFailures consecutive 401s. The detection site
+// (cmd/vmmd/liveness_recv.go) attaches prose with the observed status.
+func ErrAppHealthzUnauthorized(observedStatus int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppHealthzUnauthorized,
+		"Health endpoint returning 401",
+		fmt.Sprintf("/healthz returned %d; consecutive 401s flip the deployment to failed.",
+			observedStatus)).
+		WithDocs(docsBase + "/errors/app-healthz-unauthorized")
+}
+
+// ErrAppRuntimeOOM is returned when the cgroup OOM-killer terminates
+// the customer's main workload inside the microVM (memory.max = plan +
+// 8 MB was exceeded). Distinct from CodeBuildOOM (the *build* VM's
+// OOM, which is a separate code with a different remediation path).
+// Detection site (guest/init/cgroup_partition_linux.go::cgroup.events
+// listener) attaches prose with the observed peak RSS + the plan cap.
+func ErrAppRuntimeOOM(observedPeakMB, planMB int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppRuntimeOOM,
+		"Container out of memory",
+		fmt.Sprintf("cgroup OOM-kill fired at %d MB (plan cap %d MB); upgrade plan or trim in-memory state.",
+			observedPeakMB, planMB)).
+		WithDocs(docsBase + "/errors/app-runtime-oom")
+}
+
+// ErrDepInstallFailed is returned when the build VM's dependency
+// installation step fails (npm install / pip install / go build /
+// etc.). The discriminator (pkg=npm|pip|go|...) is carried in the
+// Detail field and surfaced via pkg/whycopy so the CLI renders
+// per-package prose. Detection site
+// (pkg/builderd/vm_metal.go::classifyBuildFailure) attaches the
+// pkg + the observed exit code + the last 20 lines of build output.
+func ErrDepInstallFailed(pkgManager, observedCmd string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeDepInstallFailed,
+		"Dependency installation failure",
+		fmt.Sprintf("%s install failed: %s — see build log for the failing command.",
+			pkgManager, observedCmd)).
+		WithDocs(docsBase + "/errors/dep-install-failed")
+}
+
+// ErrAppStartupTimeout is returned when the customer's app does not
+// become ready within the wake timeout (35s by default; per-app
+// startup_timeout_s column). Distinct from idle_timeout_s (which is
+// the wake→park timer, not the boot timer). Detection site
+// (pkg/sched/engine.go::StuckReason) carries the observed StuckReason
+// ("waking_timeout" / "cold_boot_timeout") into the prose.
+func ErrAppStartupTimeout(stuckReason, observedDuration string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeAppStartupTimeout,
+		"Application startup timeout",
+		fmt.Sprintf("app did not become ready after %s (stuck_reason=%s).",
+			observedDuration, stuckReason)).
+		WithDocs(docsBase + "/errors/app-startup-timeout")
 }
 
 // ErrDomainNotVerified is returned when a customer tries to bind a domain

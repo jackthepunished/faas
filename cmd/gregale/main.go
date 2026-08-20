@@ -173,6 +173,11 @@ func run(args []string) int {
 		return cmdConnect(args[1:])
 	case "open":
 		return cmdOpen(args[1:])
+	case dispatchDoctor:
+		// Error-explanations cluster (spec §6.4 amendment 1):
+		// customer preflight that scans the local cwd for the
+		// 8 source-side failure modes. Routes to commands_doctor.go.
+		return cmdDoctor(args[1:])
 	case dispatchApps:
 		// `gregale apps ls` is an alias for the default list action.
 		if len(args) > 1 && args[1] == "ls" {

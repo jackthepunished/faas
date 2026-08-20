@@ -5547,6 +5547,45 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 	return scanDeploymentWithRootfs(row)
 }
 
+// SetDeploymentFailedEx is the error-explanations cluster (spec §6.4
+// amendment 1) extension of SetDeploymentFailed. It writes the four
+// customer-facing prose fields (error_hint, error_why, error_fix,
+// error_relevant_logs) alongside error_code so post-mortem retrieval
+// via `gregale inspect <slug> --errors` surfaces the same hint/why/
+// fix/relevant_logs block the deploy-time Problem emitted. Empty
+// strings on the prose fields are normalised to NULL via nullString
+// (mirroring the error_code column shape from migration 00021).
+//
+// error_relevant_logs is passed as a jsonb-encoded byte slice via
+// logExcerptsJSON — pgx's jsonb codec writes []api.LogExcerpt
+// cleanly. Empty input maps to NULL so post-migration rows that
+// never wrote explanation prose stay NULL on this column. The
+// SELECT projection in deploymentSelectColumnsWithRootfs does NOT
+// coalesce error_relevant_logs — pgx scans the column into a
+// []api.LogExcerpt slice directly, with NULL → nil.
+//
+// Idempotent on (status='failed') rows: a redeploy after a fix
+// overwrites all four columns. The legacy SetDeploymentFailed
+// (above) stays in place for callers that have only the code +
+// message available (the imaged pre-build hook is the canonical
+// pre-cluster caller).
+func (s *PgStore) SetDeploymentFailedEx(
+	ctx context.Context, id, code, message, hint, why, fix string, logs []api.LogExcerpt,
+) (Deployment, error) {
+	logsJSON := logExcerptsJSON(logs)
+	row := s.pool.QueryRow(ctx,
+		`update deployments
+		    set status = 'failed', error = $2, error_code = $3,
+		        error_hint = $4, error_why = $5, error_fix = $6,
+		        error_relevant_logs = $7
+		  where id = $1
+		  returning `+deploymentSelectColumnsWithRootfs,
+		id, nullString(message), nullString(code),
+		nullString(hint), nullString(why), nullString(fix),
+		logsJSON)
+	return scanDeploymentWithRootfs(row)
+}
+
 // --- builds ------------------------------------------------------------------
 
 func (s *PgStore) CreateBuild(ctx context.Context, deploymentID string, kind DeploymentKind, sourceBytes int64, logPath string) (Build, error) {
@@ -12653,7 +12692,10 @@ const deploymentSelectColumnsWithRootfs = `
 	id, app_id, coalesce(build_id::text,''), image_digest, kind,
 	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 	coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	status, coalesce(error,''), coalesce(error_code,''),
+	coalesce(error_hint,''), coalesce(error_why,''), coalesce(error_fix,''),
+	error_relevant_logs,
+	created_at,
 	coalesce(source_url,''), coalesce(commit_sha,''),
 	coalesce(override_entrypoint, ARRAY[]::text[]),
 	coalesce(override_cmd, ARRAY[]::text[]),
@@ -12685,7 +12727,10 @@ const deploymentSelectColumnsQualified = `
 	d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
 	coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
 	coalesce(d.rootfs_path,''), coalesce(d.rootfs_key,''), coalesce(d.rootfs_bytes,0),
-	d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+	d.status, coalesce(d.error,''), coalesce(d.error_code,''),
+	coalesce(d.error_hint,''), coalesce(d.error_why,''), coalesce(d.error_fix,''),
+	d.error_relevant_logs,
+	d.created_at,
 	coalesce(d.source_url,''), coalesce(d.commit_sha,''),
 	coalesce(d.override_entrypoint, ARRAY[]::text[]),
 	coalesce(d.override_cmd, ARRAY[]::text[]),
@@ -12751,7 +12796,10 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		rootfsPath, rootfsKey, rootfsBytes,
-		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
+		&statusStr, &d.Error, &d.ErrorCode,
+		&d.ErrorHint, &d.ErrorWhy, &d.ErrorFix,
+		&d.ErrorRelevantLogs,
+		&d.CreatedAt,
 		&d.SourceURL, &d.CommitSHA,
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
@@ -13286,6 +13334,35 @@ func nullableOverridePort(p int) any {
 		return nil
 	}
 	return p
+}
+
+// logExcerptsJSON encodes a []api.LogExcerpt as the pgx driver value
+// for the deployments.error_relevant_logs jsonb column. The empty
+// (nil or zero-length) case maps to nil so pgx sends NULL — the
+// column was added by migrations/00290 and pre-cluster rows have no
+// relevant-logs payload. Non-empty slices are JSON-encoded as a
+// compact byte slice so pgx's jsonb codec parses them as a real
+// jsonb array (not as text).
+//
+// Why not notNullEmptyJSONRaw like sidecars: the error_relevant_logs
+// column is jsonb with no NOT NULL constraint (migration 00290), so
+// an empty slice is correctly represented as NULL. The sidecars
+// column has a NOT NULL DEFAULT '[]'::jsonb contract which forces
+// the literal '[]' for empty inputs — different column, different
+// rule.
+func logExcerptsJSON(logs []api.LogExcerpt) any {
+	if len(logs) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(logs)
+	if err != nil {
+		// json.Marshal on a []api.LogExcerpt cannot fail under the
+		// fixed schema (ts/level/source/message are all string), so
+		// this branch is defensive — return nil so the column writes
+		// NULL rather than aborting the deployment-failed path.
+		return nil
+	}
+	return b
 }
 
 // cidrPrefixesToArray renders a Go []netip.Prefix as a pgx driver value

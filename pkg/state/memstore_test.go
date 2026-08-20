@@ -935,6 +935,111 @@ func TestMemStore_SetDeploymentParked_Idempotent(t *testing.T) {
 // is the load-bearing "app is healthy" branch on the apid
 // surface. The handler maps ErrNotFound → nil ParkedDeploymentRef
 // (no field on the wire).
+
+// TestMemStore_SetDeploymentFailedEx_PersistsExplanationFields locks
+// the MemStore parity surface for the error-explanations cluster
+// (spec §6.4 amendment 1, migrations/00290). The PgStore equivalent
+// runs against a live schema; this test locks the in-process store
+// so the unit-test suite that exercises MemStore stays aligned with
+// the persistence shape. The contract being locked:
+//
+//   - status is pinned to 'failed' regardless of prior status
+//   - error_code carries the RFC 7807 code
+//   - error_hint / error_why / error_fix carry the customer-facing prose
+//   - error_relevant_logs carries the per-line log excerpts
+//
+// A regression here means the wire-side DTO would diverge from the
+// in-process store — pkg/api.DeploymentResponse.ErrorHint is
+// populated from d.ErrorHint at serialise time and the dashboard
+// would render an empty block.
+func TestMemStore_SetDeploymentFailedEx_PersistsExplanationFields(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "expl-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "expl-mem"})
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:e"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	logs := []api.LogExcerpt{
+		{Timestamp: "2026-08-18T19:00:00Z", Level: "error", Source: "vm-init", Message: "dial :8080: connection refused"},
+		{Timestamp: "2026-08-18T19:00:01Z", Level: "error", Source: "app", Message: "panic: listen tcp 127.0.0.1:8080: bind: address already in use"},
+	}
+	got, err := m.SetDeploymentFailedEx(ctx, dep.ID,
+		api.CodeAppNotListening,
+		"wake readiness probe failed",
+		"your app isn't accepting traffic on the port we expect",
+		"the readiness probe dialed :8080 and got no listener",
+		"• bind to 0.0.0.0\n• check `app.listen(process.env.PORT)`",
+		logs,
+	)
+	if err != nil {
+		t.Fatalf("SetDeploymentFailedEx: %v", err)
+	}
+	if got.Status != DeployFailed {
+		t.Errorf("status = %s, want failed", got.Status)
+	}
+	if got.ErrorCode != api.CodeAppNotListening {
+		t.Errorf("error_code = %q, want %q", got.ErrorCode, api.CodeAppNotListening)
+	}
+	if got.ErrorHint != "your app isn't accepting traffic on the port we expect" {
+		t.Errorf("error_hint = %q, want the customer-facing hint", got.ErrorHint)
+	}
+	if got.ErrorWhy != "the readiness probe dialed :8080 and got no listener" {
+		t.Errorf("error_why = %q, want the templated why", got.ErrorWhy)
+	}
+	if got.ErrorFix != "• bind to 0.0.0.0\n• check `app.listen(process.env.PORT)`" {
+		t.Errorf("error_fix = %q, want the multi-line fix", got.ErrorFix)
+	}
+	if len(got.ErrorRelevantLogs) != 2 {
+		t.Fatalf("error_relevant_logs len = %d, want 2", len(got.ErrorRelevantLogs))
+	}
+	if got.ErrorRelevantLogs[0].Source != "vm-init" {
+		t.Errorf("error_relevant_logs[0].source = %q, want vm-init", got.ErrorRelevantLogs[0].Source)
+	}
+	if got.ErrorRelevantLogs[1].Message != "panic: listen tcp 127.0.0.1:8080: bind: address already in use" {
+		t.Errorf("error_relevant_logs[1].message = %q, want the panic line", got.ErrorRelevantLogs[1].Message)
+	}
+}
+
+// TestMemStore_SetDeploymentFailedEx_EmptyFieldsPersistAsEmpty locks
+// the empty-input fallthrough path: a non-sentinel failure (no
+// catalog row) leaves all four prose fields empty strings + nil
+// logs slice. The wire DTO's omitempty tags suppress them so
+// customers on a non-catalog failure see the legacy 3-line shape
+// without an empty hint/why/fix block.
+func TestMemStore_SetDeploymentFailedEx_EmptyFieldsPersistAsEmpty(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "expl-empty-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "expl-empty-mem"})
+	dep, _ := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:em"})
+
+	got, err := m.SetDeploymentFailedEx(ctx, dep.ID, api.CodeAppStartupTimeout, "no boot", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("SetDeploymentFailedEx: %v", err)
+	}
+	if got.ErrorHint != "" || got.ErrorWhy != "" || got.ErrorFix != "" {
+		t.Errorf("prose fields should be empty: hint=%q why=%q fix=%q", got.ErrorHint, got.ErrorWhy, got.ErrorFix)
+	}
+	if got.ErrorRelevantLogs != nil {
+		t.Errorf("error_relevant_logs should be nil, got %v", got.ErrorRelevantLogs)
+	}
+}
+
+// TestMemStore_SetDeploymentFailedEx_UnknownReturnsErrNotFound locks
+// the not-found branch that callers depend on for the post-deploy
+// failure path (a race where the deployment was deleted between
+// CreateDeployment and SetDeploymentFailedEx must surface as
+// ErrNotFound rather than panic on a nil map entry).
+func TestMemStore_SetDeploymentFailedEx_UnknownReturnsErrNotFound(t *testing.T) {
+	m := NewMemStore()
+	_, err := m.SetDeploymentFailedEx(context.Background(), "missing-id", api.CodeAppStartupTimeout, "msg", "hint", "why", "fix", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetDeploymentFailedEx on missing id: got err=%v, want ErrNotFound", err)
+	}
+}
 func TestMemStore_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

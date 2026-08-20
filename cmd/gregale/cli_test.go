@@ -962,6 +962,89 @@ func TestAPIError_FallbackURLAlwaysThreeLines(t *testing.T) {
 	}
 }
 
+// TestRenderAPIError_FiveLineShape (error-explanations cluster, spec
+// §6.4 amendment 1) locks the extended 5-line shape when the
+// server populates Hint / Why / Fix on the Problem. The legacy
+// 3-line shape (above) must remain unchanged when those fields
+// are empty — adding rows is additive, never subtractive. Each
+// new row is gated on a non-empty value so a code the cluster
+// didn't catalog renders identically to today.
+func TestRenderAPIError_FiveLineShape(t *testing.T) {
+	logs := []api.LogExcerpt{
+		{Timestamp: "2026-08-18T19:00:00Z", Level: "error", Source: "vm-init", Message: "dial :8080: connection refused"},
+	}
+	ae := &APIError{Problem: api.Problem{
+		Title:        "No process listening on $PORT",
+		Detail:       "your app isn't accepting traffic on the port we expect",
+		Hint:         "the readiness probe dialed :8080 and got no listener",
+		Why:          "your code binds to 127.0.0.1 not 0.0.0.0",
+		Fix:          "• bind to 0.0.0.0\n• run `gregale doctor`",
+		Code:         api.CodeAppNotListening,
+		DocsURL:      docsURLPrefix + "/errors/app-not-listening",
+		RelevantLogs: logs,
+	}}
+	var buf bytes.Buffer
+	renderAPIError(&buf, ae)
+	got := strings.TrimRight(buf.String(), "\n")
+	lines := strings.Split(got, "\n")
+
+	// 7 expected lines:
+	//   0: title (✗ No process…)
+	//   1: detail  (  your app…)
+	//   2: hint    (  💡 hint: …)
+	//   3: why     (  why: …)
+	//   4: fix     (  → fix: … — multi-line → at least 1 line here)
+	//   5: relevant logs (  ┌─ relevant logs ─)
+	//   6: relevant log line (  │ 2026-08-18T19:00:00Z error dial…)
+	//   7: relevant logs close (  └─)
+	//   8: docs    (  → https://…)
+	if len(lines) < 8 {
+		t.Fatalf("expected ≥ 8 lines (5 + relevant_logs block + docs), got %d:\n%s", len(lines), got)
+	}
+	if !strings.Contains(lines[2], "hint:") {
+		t.Errorf("line 2 should be the hint row, got %q", lines[2])
+	}
+	if !strings.Contains(lines[3], "why:") {
+		t.Errorf("line 3 should be the why row, got %q", lines[3])
+	}
+	if !strings.Contains(lines[4], "fix:") {
+		t.Errorf("line 4 should be the fix row, got %q", lines[4])
+	}
+	// The Fix field is multi-line ("• bind to 0.0.0.0\n• run ..."),
+	// so the relevant logs block starts 2 lines after line[4].
+	// Indexes: title=0, detail=1, hint=2, why=3, fix_line1=4,
+	//          fix_line2=5, fence=6, log=7, close=8, docs=9.
+	if !strings.Contains(lines[6], "relevant logs") {
+		t.Errorf("line 6 should be the relevant logs fence, got %q", lines[6])
+	}
+	if !strings.HasPrefix(lines[8], "  └─") {
+		t.Errorf("line 8 should be the relevant logs close marker, got %q", lines[8])
+	}
+	if !strings.HasPrefix(lines[len(lines)-1], "  → ") {
+		t.Errorf("last line should be the docs URL, got %q", lines[len(lines)-1])
+	}
+}
+
+// TestMapFailureMessage_GoesThroughCatalog locks the post-cluster
+// mapFailureProblem entry point: a typed Problem with a
+// catalogued code lifts the hint from the whycopy catalog, not
+// the legacy 4-bucket switch.
+func TestMapFailureMessage_GoesThroughCatalog(t *testing.T) {
+	p := api.NewProblem(422, api.CodeAppLoopbackBound, "constructor-title", "constructor-detail")
+	got := mapFailureProblem(p)
+	if got == "" {
+		t.Fatal("mapFailureProblem on a catalogued code returned empty string (catalog lookup must succeed)")
+	}
+	// Catalog's Hint contains "127.0.0.1" — the literal loopback
+	// address that the customer needs to see in the failure
+	// message. The legacy 4-bucket switch never had this string,
+	// so it's the right anchor for "this came from the catalog".
+	wantSubstr := "127.0.0.1"
+	if !strings.Contains(got, wantSubstr) {
+		t.Errorf("mapFailureProblem for app_loopback_bound: got %q, want substring %q", got, wantSubstr)
+	}
+}
+
 // TestRenderAPIError_TTYGatedGlyph locks UX §3.2's interaction with
 // §3.3's three-line contract: the static *APIError.Error() always carries
 // "  → <URL>", but the renderer (renderAPIError) drops the leading "✗"

@@ -28,6 +28,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -521,7 +522,20 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 				fc = state.FailureTimeout
 			}
 		}
-		b.markFailed(ctx, dep.ID, build.ID, fc, fmt.Sprintf("build exited %d", out.ExitCode), buildStart)
+		// Error-explanations cluster (spec §6.4 amendment 1): when
+		// classifyBuildFailure populated a typed RFC 7807 code (the
+		// BuildDone.FailureCode that guest-init stamps on the build
+		// manifest), lift the whycopy prose + persist hint/why/fix
+		// on the deployment row so `gregale inspect <slug> --errors`
+		// surfaces the post-mortem. The legacy markFailed path stays
+		// for the coarse-grained exit-code-only case (no code
+		// emitted) — that's the path the `failure_class` UX copy
+		// already covers; markFailedEx is the typed-code addition.
+		if out.FailureCode != "" {
+			b.markFailedEx(ctx, dep.ID, build.ID, fc, out.FailureCode, out.FailurePkg, fmt.Sprintf("build exited %d", out.ExitCode), buildStart)
+		} else {
+			b.markFailed(ctx, dep.ID, build.ID, fc, fmt.Sprintf("build exited %d", out.ExitCode), buildStart)
+		}
 		return BuildResult{}, fmt.Errorf("builderd: vm exit %d", out.ExitCode)
 	}
 
@@ -680,6 +694,54 @@ func (b *Builderd) markFailed(ctx context.Context, depID, buildID string, fc sta
 	// alongside the legacy audit row. Best-effort: failures
 	// are logged + counter'd, never rolled back.
 	b.emitBuildFailed(ctx, buildID, string(fc), msg)
+}
+
+// markFailedEx is the error-explanations cluster (spec §6.4 amendment 1)
+// counterpart of markFailed. It carries the typed RFC 7807 code that
+// classifyBuildFailure lifted from build-done.json (one of
+// app_arch_mismatch / dep_install_failed) plus the package manager
+// discriminator for dep_install_failed (npm / pip / go / cargo). The
+// whycopy catalog is consulted for hint/why/fix prose and persisted
+// on the deployment row via SetDeploymentFailedEx so `gregale inspect
+// <slug> --errors` surfaces the customer-facing post-mortem.
+//
+// The call still funnels through the legacy markFailed path for the
+// build-row updates (UpdateBuildStatus, UpdateDeploymentStatus,
+// recordBuilderUsage, emitBuildFailed) — those are unaffected by the
+// typed-code addition. The only difference is the deployment row
+// gets error_code + error_hint/why/fix/relevant_logs stamped in
+// place of the bare error text flip.
+//
+// pkg is the package-manager discriminator for dep_install_failed
+// (the only cluster code that has one); empty for all other codes.
+// It flows through as the whycopy.Observed argument so the catalog
+// can render "npm install failed" vs "pip install failed" copy.
+func (b *Builderd) markFailedEx(ctx context.Context, depID, buildID string, fc state.FailureClass, code, pkg, msg string, buildStart time.Time) {
+	// 1. Run the legacy build-row / counters / metering path unchanged
+	// so all downstream observers (metrics, dashboard, build row
+	// table) see the same shape as a non-typed-code failure.
+	b.markFailed(ctx, depID, buildID, fc, msg, buildStart)
+	// 2. Lift the customer-facing prose from the whycopy catalog.
+	// Decorate is a no-op when the catalog has no row for the code —
+	// the legacy deployment row stays with the bare error text flip.
+	problem := &api.Problem{
+		Code:   code,
+		Status: 422,
+		Title:  code,
+		Detail: msg,
+	}
+	var observed any
+	if pkg != "" {
+		observed = pkg
+	}
+	_ = whycopy.Decorate(problem, code, observed)
+	// 3. Persist the prose on the deployment row. Best-effort: a
+	// failure here is logged but does not block the legacy
+	// markFailed counters / metering / events — the deployment row
+	// will be re-synced on the next build attempt over the same row.
+	if _, err := b.store.SetDeploymentFailedEx(ctx, depID, code, msg, problem.Hint, problem.Why, problem.Fix, nil); err != nil {
+		b.log.Warn("builderd: stamp deployment failed (ex)", "deployment", depID, "build", buildID, "code", code, "err", err)
+	}
 }
 
 // emitBuildFailed writes the wake.build_failed row. Mirrors

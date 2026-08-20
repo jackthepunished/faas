@@ -23,8 +23,10 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -167,6 +169,101 @@ func RenderDocsRow(w io.Writer, url string) {
 		return
 	}
 	_, _ = fmt.Fprintf(w, "  %s\n", url)
+}
+
+// RenderHintRow is the error-explanations cluster (spec §6.4
+// amendment 1) hint renderer. Emits a single-line "💡 hint: <hint>"
+// row between Detail and Why in the APIError render. The 💡
+// glyph is in the central glyph table that the tripwire
+// TestLintTripwire_NoGlyphLiteralOutsideOutput pins to output.go
+// (lint_tripwires_test.go:138) — no other file in the package
+// may use 💡 verbatim. When Enabled() is false the row collapses
+// to "  hint: <hint>" so script consumers that grep on the
+// literal "hint:" still match.
+//
+// The hint is the single short next-action line from the
+// pkg/whycopy catalog — one line, ≤200 bytes (the CLI tripwire in
+// whycopy_test.go::TestDecorate_AllCodesHaveProse enforces this
+// ceiling on the catalog side, so this renderer never has to
+// truncate).
+func RenderHintRow(w io.Writer, hint string) {
+	if Enabled() {
+		_, _ = fmt.Fprintf(w, "  💡 hint: %s\n", hint)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  hint: %s\n", hint)
+}
+
+// RenderWhyRow emits the "why: <why>" line between Hint and Fix.
+// Multi-line why content (the catalog rows template the observed
+// value + a sentence or two of cause explanation) is preserved
+// verbatim — pkg/whycopy caps each row at 512 bytes
+// (whycopy_test.go) so a single line is the practical ceiling.
+// The why: glyph is in the central glyph table; no other file
+// may use it verbatim.
+func RenderWhyRow(w io.Writer, why string) {
+	if Enabled() {
+		_, _ = fmt.Fprintf(w, "  why: %s\n", why)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  why: %s\n", why)
+}
+
+// RenderFixRow emits the "→ fix: <fix>" line. The fix may be 1-3
+// lines (the catalog rows use "• ..." bullets separated by \n);
+// the renderer preserves the literal newlines so the customer
+// sees the multi-line shape verbatim. The → glyph is shared with
+// RenderDocsRow (one glyph in the central table serves both).
+func RenderFixRow(w io.Writer, fix string) {
+	if Enabled() {
+		_, _ = fmt.Fprintf(w, "  → fix: %s", fix)
+		// Ensure the trailing newline if the caller didn't
+		// include one (catalog rows always do, but be defensive
+		// so the next row's leading indentation isn't lost).
+		if !strings.HasSuffix(fix, "\n") {
+			_, _ = fmt.Fprint(w, "\n")
+		}
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  fix: %s", fix)
+	if !strings.HasSuffix(fix, "\n") {
+		_, _ = fmt.Fprint(w, "\n")
+	}
+}
+
+// RenderRelevantLogs emits the per-line log excerpts the server
+// attached to the Problem (cap 20 entries, each ≤512 bytes — the
+// CLI tripwire at whycopy_test.go enforces the cap on the
+// catalog side; this renderer enforces the on-screen cap of
+// 5 lines for legibility). The fenced block carries "┌─
+// relevant logs ─" + "│" + "└─" markers so the customer can
+// visually delimit the log block from the surrounding error
+// shape. The glyphs are in the central glyph table.
+func RenderRelevantLogs(w io.Writer, logs []api.LogExcerpt) {
+	max := 5
+	if len(logs) < max {
+		max = len(logs)
+	}
+	if Enabled() {
+		_, _ = fmt.Fprintln(w, "  ┌─ relevant logs ─")
+		for i := 0; i < max; i++ {
+			l := logs[i]
+			_, _ = fmt.Fprintf(w, "  │ %s %s %s\n", l.Timestamp, l.Level, l.Message)
+		}
+		if len(logs) > max {
+			_, _ = fmt.Fprintf(w, "  │ … (%d more)\n", len(logs)-max)
+		}
+		_, _ = fmt.Fprintln(w, "  └─")
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  relevant logs:")
+	for i := 0; i < max; i++ {
+		l := logs[i]
+		_, _ = fmt.Fprintf(w, "    %s %s %s\n", l.Timestamp, l.Level, l.Message)
+	}
+	if len(logs) > max {
+		_, _ = fmt.Fprintf(w, "    … (%d more)\n", len(logs)-max)
+	}
 }
 
 // PrintUsage emits a one-line "usage:" hint followed by a "Docs:" line

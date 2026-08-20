@@ -276,6 +276,19 @@ var cliCommands = []cliCommand{
 		Short:   "Open the account dashboard in your browser",
 	},
 	{
+		// Error-explanations cluster (spec §6.4 amendment 1):
+		// customer preflight that scans the cwd for the 8 source-side
+		// failure modes the cluster's runtime detectors catch
+		// post-deploy. Auth not required (local source only).
+		Name:    dispatchDoctor,
+		DocSlug: "doctor",
+		Short:   "Preflight: scan your source for the 8 source-side failure modes (--strict, --json, [path])",
+		Flags: []cliFlag{
+			{Name: "strict", Short: "exit 1 on warn (default: exit 0 on warn)"},
+			{Name: "json", Short: "machine output (default: human prose)"},
+		},
+	},
+	{
 		Name:    "delayed-task",
 		DocSlug: "delayed-task",
 		Short:   "Schedule a deferred invocation (delayed-task add|get|cancel)",

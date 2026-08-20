@@ -151,6 +151,7 @@ export type { ListSecretsForAccountResponse } from './models/ListSecretsForAccou
 export type { ListTenantSurfacesResponse } from './models/ListTenantSurfacesResponse.js';
 export type { ListTriggerDeadLetterResponse } from './models/ListTriggerDeadLetterResponse.js';
 export type { ListTriggerRecordsResponse } from './models/ListTriggerRecordsResponse.js';
+export type { LogExcerpt } from './models/LogExcerpt.js';
 export type { MagicLinkSignupRequest } from './models/MagicLinkSignupRequest.js';
 export type { MemberListResponse } from './models/MemberListResponse.js';
 export type { MFAConfirmRequest } from './models/MFAConfirmRequest.js';

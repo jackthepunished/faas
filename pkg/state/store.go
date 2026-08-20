@@ -1698,6 +1698,18 @@ type Store interface {
 	// refreshed row. Idempotent — a redeploy after a fix overwrites
 	// both columns.
 	SetDeploymentFailed(ctx context.Context, id, code, message string) (Deployment, error)
+	// SetDeploymentFailedEx is the error-explanations cluster (spec
+	// §6.4 amendment 1) extension of SetDeploymentFailed. Writes the
+	// four customer-facing prose fields (hint/why/fix/relevant_logs)
+	// alongside error_code so post-mortem retrieval via
+	// `gregale inspect <slug> --errors` surfaces the same prose the
+	// deploy-time Problem emitted. Empty inputs map to NULL columns.
+	// Idempotent on (status='failed') rows — a redeploy after a fix
+	// overwrites all four columns. Returns the refreshed row.
+	SetDeploymentFailedEx(
+		ctx context.Context, id, code, message, hint, why, fix string,
+		logs []api.LogExcerpt,
+	) (Deployment, error)
 	// ListDeploymentsForAccount returns deployments across every app the
 	// account owns, cursor-paginated by created_at DESC. before is the
 	// inclusive upper bound — pass the previous response's NextBefore to

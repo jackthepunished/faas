@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/browser"
 	"github.com/onebox-faas/faas/pkg/gregalemanifest"
 	"github.com/onebox-faas/faas/pkg/secretscan"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // Subcommand names — lifted to constants so goconst stops flagging the
@@ -150,6 +152,13 @@ const (
 	// it has one subcommand, `show <id>`, which reads the closed
 	// 6-stage state column via GET /v1/deployments/{id}/stages.
 	dispatchDeploys = "deploys"
+
+	// Error-explanations cluster (spec §6.4 amendment 1):
+	// customer preflight that scans the local cwd for the 8
+	// source-side failure modes the cluster's runtime detectors
+	// catch post-deploy (commit 7-13). No auth required. Routes
+	// to commands_doctor.go::cmdDoctor.
+	dispatchDoctor = "doctor"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>
@@ -2475,12 +2484,20 @@ func cmdLogs(args []string) int {
 	grep := fs.String("grep", "", "only show lines matching this substring")
 	since := fs.String("since", "", "only show lines at or after this RFC3339 timestamp")
 	level := fs.String("level", "", "only show lines at this level (info|warn|error)")
+	// Error-explanations cluster (spec §6.4 amendment 1): when the
+	// stream ends, print a 3-line summary covering the last failure
+	// (lifted from the deployment's persisted error_code), the count
+	// of error-level lines, and the top 3 most-frequent error
+	// patterns. The summary is what makes `gregale logs <slug>
+	// --explain` actionable — the customer no longer has to read the
+	// whole stream to know which error fired.
+	explain := fs.Bool("explain", false, "on stream end, print a 3-line summary (failure, error count, top patterns)")
 	if err := fs.Parse(args); err != nil {
-		PrintUsage(os.Stderr, "usage: gregale logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		PrintUsage(os.Stderr, "usage: gregale logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error] [--explain]", "logs")
 		return 1
 	}
 	if fs.NArg() != 1 {
-		PrintUsage(os.Stderr, "usage: gregale logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		PrintUsage(os.Stderr, "usage: gregale logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error] [--explain]", "logs")
 		return 1
 	}
 	// Validate --level early so a typo costs the customer a network
@@ -2504,7 +2521,7 @@ func cmdLogs(args []string) int {
 		Grep:  *grep,
 		Since: *since,
 		Level: *level,
-	}, *follow)
+	}, *follow, *explain)
 }
 
 // cmdLogsTail implements `gregale logs tail <slug>` — issue #315
@@ -2549,7 +2566,7 @@ func cmdLogsTail(args []string) int {
 		Grep:  *grep,
 		Since: *since,
 		Level: *level,
-	}, true)
+	}, true, false)
 }
 
 // runLogs is the shared SSE pump behind `gregale logs` and `gregale
@@ -2561,7 +2578,7 @@ func cmdLogsTail(args []string) int {
 // Exits with 130 on Ctrl-C (shell SIGINT convention), 0 on a clean
 // `event: end` or io.EOF, and surfaces a renderAPIError / printErr
 // path on the auth or attach errors that precede the SSE loop.
-func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter, follow bool) int {
+func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter, follow bool, explain bool) int {
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -2581,14 +2598,31 @@ func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter,
 	dec := api.NewDecoder(body)
 	dec.SetCloseFn(body.Close)
 	defer func() { _ = dec.Close() }()
+	// --explain accumulator. Only allocates when explain=true (the
+	// common path doesn't pay for the map). The collector runs the
+	// stream through, captures error-level lines + pattern counts,
+	// and emits a 3-line summary on stream end. The summary lives
+	// here (not in a separate file) because it shares the SSE loop
+	// and pulling it out would force the collector across the
+	// channel boundary — over-engineered for the surface size.
+	var collector *explainCollector
+	if explain {
+		collector = newExplainCollector(slug, deployment)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			// Ctrl-C. Exit cleanly with status 130 (the
 			// shell's standard for SIGINT exit).
+			if collector != nil {
+				collector.flush(os.Stdout)
+			}
 			return 130
 		case e, ok := <-dec.Events():
 			if !ok {
+				if collector != nil {
+					collector.flush(os.Stdout)
+				}
 				return 0
 			}
 			// Move 4 (issue #254): the apid stub emits `event: degraded`
@@ -2599,21 +2633,167 @@ func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter,
 			// removed.
 			if e.Event == "degraded" {
 				fmt.Fprintln(os.Stderr, "Log stream degraded: the scheduler is temporarily unavailable")
+				if collector != nil {
+					collector.flush(os.Stdout)
+				}
 				return 0
 			}
 			if e.Event == "end" {
+				if collector != nil {
+					collector.flush(os.Stdout)
+				}
 				return 0
 			}
 			if e.Data != "" {
 				fmt.Println(e.Data)
+				if collector != nil {
+					collector.observe(e.Data)
+				}
 			}
 		case err := <-dec.Errors():
 			if errors.Is(err, io.EOF) {
+				if collector != nil {
+					collector.flush(os.Stdout)
+				}
 				return 0
 			}
 			return printErr("Stream closed", err)
 		}
 	}
+}
+
+// explainCollector aggregates log lines for the --explain summary.
+// One instance per cmdLogs invocation. Allocation: per-line (a
+// map[string]int for pattern counts + per-level counters). The
+// memory footprint is bounded by the stream length (typical wake
+// log is <1k lines); on longer streams the pattern-count map
+// stays bounded because the buckets are normalised to a 64-byte
+// prefix (see observe()).
+type explainCollector struct {
+	slug       string
+	deployment string
+	errorCount int
+	warnCount  int
+	infoCount  int
+	patterns   map[string]int
+	lastError  string
+}
+
+// newExplainCollector constructs the per-invocation collector.
+// The patterns map is allocated lazily on first observe() — most
+// log lines are info/warn, and we only count errors.
+func newExplainCollector(slug, deployment string) *explainCollector {
+	return &explainCollector{
+		slug:       slug,
+		deployment: deployment,
+		patterns:   map[string]int{},
+	}
+}
+
+// observe ingests one SSE data line. The line shape is
+// `{ts} {level} {message}` (the apid's Move 3 wire shape). We
+// bucket by level + count the first 64 bytes of each error-level
+// message as a pattern bucket (sufficient for naive grep
+// de-duplication without a real log-classifier).
+func (c *explainCollector) observe(line string) {
+	// Split into at most 3 parts: ts, level, message.
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 3 {
+		return
+	}
+	level := parts[1]
+	msg := parts[2]
+	switch level {
+	case "error":
+		c.errorCount++
+		c.lastError = msg
+		// Pattern bucket: first 64 bytes of the message. Enough
+		// to coalesce the same error fired 100x into one bucket,
+		// small enough to keep the map bounded. UTF-8 safe: a
+		// naive byte-slice on a multi-byte rune (e.g. an emoji
+		// or CJK character) would split the rune and produce an
+		// invalid prefix that flush() can't render. Back off to
+		// the last rune boundary when the 64th byte lands in the
+		// middle of a sequence.
+		prefix := msg
+		if len(prefix) > 64 {
+			prefix = prefix[:64]
+			for len(prefix) > 0 {
+				if r, size := utf8.DecodeLastRuneInString(prefix); r == utf8.RuneError && size == 1 {
+					prefix = prefix[:len(prefix)-1]
+				} else {
+					break
+				}
+			}
+		}
+		c.patterns[prefix]++
+	case "warn":
+		c.warnCount++
+	case "info":
+		c.infoCount++
+	}
+}
+
+// flush emits the 3-line summary on stream end. Output shape:
+//
+//	── explain: <slug> (deployment <id>) ──
+//	error:  <lastError or "none">
+//	levels: error=N warn=N info=N
+//	top:    pattern1 (Nx) | pattern2 (Nx) | pattern3 (Nx)
+//
+// The summary is printed on os.Stdout (not os.Stderr) so a
+// `gregale logs <slug> --explain > out.txt` captures both the
+// stream AND the summary. Error path (when there's no failure)
+// prints "(none)" so the script-friendly shape is preserved.
+func (c *explainCollector) flush(w io.Writer) {
+	_, _ = fmt.Fprintf(w, "\n── explain: %s", c.slug)
+	if c.deployment != "" {
+		_, _ = fmt.Fprintf(w, " (deployment %s)", c.deployment)
+	}
+	_, _ = fmt.Fprintln(w, " ──")
+	if c.lastError == "" {
+		_, _ = fmt.Fprintln(w, "error:  (none)")
+	} else {
+		_, _ = fmt.Fprintf(w, "error:  %s\n", c.lastError)
+	}
+	_, _ = fmt.Fprintf(w, "levels: error=%d warn=%d info=%d\n", c.errorCount, c.warnCount, c.infoCount)
+	top := topPatterns(c.patterns, 3)
+	if len(top) == 0 {
+		_, _ = fmt.Fprintln(w, "top:    (no error patterns)")
+	} else {
+		_, _ = fmt.Fprintf(w, "top:    %s\n", strings.Join(top, " | "))
+	}
+}
+
+// topPatterns returns the top-N error patterns by count, formatted
+// as "pattern (Nx)". Stable sort: ties resolve to alphabetical
+// order so the output is deterministic. Empty input → empty slice.
+func topPatterns(patterns map[string]int, n int) []string {
+	if len(patterns) == 0 {
+		return nil
+	}
+	type kv struct {
+		k string
+		v int
+	}
+	pairs := make([]kv, 0, len(patterns))
+	for k, v := range patterns {
+		pairs = append(pairs, kv{k, v})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].v != pairs[j].v {
+			return pairs[i].v > pairs[j].v
+		}
+		return pairs[i].k < pairs[j].k
+	})
+	if len(pairs) > n {
+		pairs = pairs[:n]
+	}
+	out := make([]string, len(pairs))
+	for i, p := range pairs {
+		out[i] = fmt.Sprintf("%s (N%d)", p.k, p.v)
+	}
+	return out
 }
 
 // streamDeployLogs opens GET /v1/deployments/{id}/logs?follow=1 and
@@ -2933,7 +3113,32 @@ func printDeployColdWakeSentence() {
 
 // renderDeployFailure maps the deployment's Error string to one of the
 // four UX §2.4 copy blocks and exits 3 for infra, 1 for the rest.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): when the
+// deployment row carries a typed ErrorCode (one of the 9 cluster
+// codes), prefer the whycopy catalog prose via mapFailureProblem
+// so the customer sees the full Hint/Why/Fix shape rather than
+// the legacy 4-class copy. Falls back to mapFailureMessage for
+// pre-cluster rows that only have the raw failure_class string.
 func renderDeployFailure(d api.DeploymentResponse) int {
+	if d.ErrorCode != "" {
+		problem := &api.Problem{
+			Code:   d.ErrorCode,
+			Status: 422,
+			Title:  d.ErrorCode,
+			Detail: d.Error,
+			Hint:   d.ErrorHint,
+			Why:    d.ErrorWhy,
+			Fix:    d.ErrorFix,
+		}
+		if lifted := mapFailureProblem(problem); lifted != "" {
+			PrintFail(os.Stderr, "%s", lifted)
+			if d.Error == "infra" {
+				return 3
+			}
+			return 1
+		}
+	}
 	PrintFail(os.Stderr, "%s", mapFailureMessage(d.Error))
 	if d.Error == "infra" {
 		return 3
@@ -2944,6 +3149,14 @@ func renderDeployFailure(d api.DeploymentResponse) int {
 // mapFailureMessage returns the user-facing copy for one of the four
 // failure classes UX §2.4 enumerates. Anything else falls back to
 // "Build failed: <err>" so the customer sees the raw class at least.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): when the
+// caller already has a *api.Problem, the whycopy catalog lookup
+// wins — the catalog carries the customer-facing hint/why/fix
+// prose and is the single source of truth for explanation copy.
+// The legacy 4-bucket switch stays as a fallback for when the
+// caller only has the raw failure_class string (pre-cluster paths:
+// legacy builds that never stamped the RFC 7807 code).
 func mapFailureMessage(err string) string {
 	switch err {
 	case "user_error":
@@ -2956,6 +3169,22 @@ func mapFailureMessage(err string) string {
 		return "Our build system hiccuped — we've been alerted and requeued your build automatically."
 	}
 	return "Build failed: " + err
+}
+
+// mapFailureProblem maps a deployment's *api.Problem to the
+// user-facing copy via the whycopy catalog. When the catalog has
+// no row for the code (codes the cluster did not catalog yet), it
+// returns "" so the caller falls back to the legacy
+// mapFailureMessage. This is the post-cluster entry point —
+// detection sites (commits 7-13) emit typed *api.Problem and the
+// CLI renderer calls mapFailureProblem to lift the hint/why/fix
+// without re-classifying the failure.
+func mapFailureProblem(p *api.Problem) string {
+	if p == nil || p.Code == "" {
+		return ""
+	}
+	_ = whycopy.Decorate(p, p.Code, nil)
+	return p.Hint
 }
 
 // cmdUsageDaily: GET /v1/usage/daily?day=YYYY-MM-DD. Per-(app, day)

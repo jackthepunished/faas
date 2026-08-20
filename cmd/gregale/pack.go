@@ -16,7 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/secretscan"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // framework is the source kind auto-detected from the current directory when
@@ -1011,6 +1013,14 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 // entirely — used by `gregale deploy --secret-scan=off` and by callers
 // that already vetted the inputs (cmd/e2e harness, pack_test.go).
 func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
+	// Error-explanations cluster (spec §6.4 amendment 1): warn-only
+	// preflight that lifts the cluster's source-side hints via the
+	// whycopy catalog. Hints are printed after the deploy summary by
+	// the caller (cmdDeploy). The preflight does NOT fail the deploy.
+	for _, hint := range runPackPreflight(srcDir) {
+		PrintWarn(osStderr, "%s", hint)
+	}
+
 	f, err := os.CreateTemp("", "gregale-cwd-*.tar.gz")
 	if err != nil {
 		return "", fwUnknown, 0, fmt.Errorf("create temp tarball: %w", err)
@@ -1024,6 +1034,69 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 		return "", fwUnknown, 0, err
 	}
 	return path, detectFramework(srcDir), n, nil
+}
+
+// runPackPreflight scans the cwd for the 2 source-side failure modes
+// the cluster's runtime detectors (commit 7-13) catch post-deploy,
+// returning a slice of warn-only hints. The hints do NOT fail the
+// deploy (per spec §6.4 amendment 1: preflight is warn-only); they're
+// printed after the deploy summary so the customer can fix them
+// before the next deploy. The whycopy catalog is the source of truth
+// for hint prose — same path as cmdDoctor and the post-failure
+// renderer.
+//
+// 2 checks:
+//
+//  1. Loopback bind: app.listen("127.0.0.1"...) or bind("127.0.0.1")
+//     patterns in source — would trip app_loopback_bound post-deploy.
+//  2. Arch mismatch: tarball contains a Mach-O / ARM aarch64 binary
+//     — would trip app_arch_mismatch post-deploy (ENOEXEC in the
+//     build VM's linux/amd64 kernel).
+//
+// The PORT-unset check is intentionally OMITTED: the runtime
+// contract auto-provides PORT=8080, and scanning source for
+// `process.env.PORT` doesn't catch the failure mode (it's a
+// MISSING-listener failure, not a missing-env failure). The
+// runtime detector catches the real case via app_not_listening;
+// preflighting it here would produce false positives for every
+// customer who hardcodes 8080 in their app.
+//
+// Errors during the scan (permission denied, etc.) are silently
+// swallowed: a hard error here would block the deploy on noise.
+// The customer already gets the runtime prose from the catalog
+// if the deploy then fails.
+func runPackPreflight(srcDir string) []string {
+	hints := []string{}
+	if hit := preflightLoopbackBind(srcDir); hit != "" {
+		hints = append(hints, hit)
+	}
+	if hit := preflightArchMismatch(srcDir); hit != "" {
+		hints = append(hints, hit)
+	}
+	return hints
+}
+
+// preflightLoopbackBind surfaces the app_loopback_bound hint before
+// the failed wake. Returns the whycopy hint string when the
+// pattern is found; empty otherwise.
+func preflightLoopbackBind(srcDir string) string {
+	sources := scanSource(srcDir, loopbackBindRegex, 1)
+	if len(sources) == 0 {
+		return ""
+	}
+	p := whycopy.Decorate(&api.Problem{}, api.CodeAppLoopbackBound, nil)
+	return p.Hint
+}
+
+// preflightArchMismatch surfaces the app_arch_mismatch hint when
+// the cwd contains a Mach-O or ARM aarch64 binary.
+func preflightArchMismatch(srcDir string) string {
+	sources := scanSource(srcDir, archMismatchRegex, 1)
+	if len(sources) == 0 {
+		return ""
+	}
+	p := whycopy.Decorate(&api.Problem{}, api.CodeAppArchMismatch, nil)
+	return p.Hint
 }
 
 // envFileBaseNames is the set of file names that count as "env files" for

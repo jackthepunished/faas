@@ -5,6 +5,7 @@
 import type { BuildPlan } from './BuildPlan.js';
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
 import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
+import type { LogExcerpt } from './LogExcerpt.js';
 import type { ScanResult } from './ScanResult.js';
 import type { SecretScanResult } from './SecretScanResult.js';
 /**
@@ -19,6 +20,22 @@ export type DeploymentResponse = {
   status: string;
   error?: string | null;
   error_code?: string | null;
+  /**
+   * One-line next-action lifted from pkg/whycopy catalog.
+   */
+  error_hint?: string | null;
+  /**
+   * Human-readable cause with observed value.
+   */
+  error_why?: string | null;
+  /**
+   * Prescriptive remediation (1-3 lines).
+   */
+  error_fix?: string | null;
+  /**
+   * Per-line log excerpts explaining the failure (error-explanations cluster). Capped at 20 entries × 512 bytes by the CLI tripwire.
+   */
+  error_relevant_logs?: Array<LogExcerpt>;
   created_at: string;
   /**
    * True when this deployment carries a non-null override_* column set.
