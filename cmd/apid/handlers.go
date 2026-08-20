@@ -557,8 +557,9 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// a second round-trip. The plaintext creds NEVER
 		// appear here — they live in app_secrets (ADR-045).
 		PublicAuth: api.PublicAuthStatus{
-			Mode:          a.PublicAuthMode,
-			HasBasicCreds: len(a.PublicAuthBasicSealed) > 0,
+			Mode:                  a.PublicAuthMode,
+			HasBasicCreds:         len(a.PublicAuthBasicSealed) > 0,
+			IPAllowlistEntryCount: len(a.PublicAuthIPAllowlist),
 		},
 		// Issue #695 / ADR-080: grand-father marker. Set by
 		// migration 00155 on every pre-flip row; null on
