@@ -26,12 +26,11 @@
 # (loopback-bound, type-restricted upstream responses, no body
 # templating on the writer path).
 #
-# Pattern syntax: CodeQL paths-ignore entries are regular expressions
-# (CodeQL config docs, §"Filter pattern syntax"). NO backslash
-# escapes — CodeQL rejects filter patterns that contain a \\ character.
-# Forward slashes are required, even on Windows runners. The . in
-# regex matches any character, so 'proxy.go' will also match a
-# hypothetical 'proxyXgo' — fine here because no such file exists in
-# cmd/gatewayd-internal/. Anchor ^...$ for exact match.
+# Pattern syntax: glob-style paths (per CodeQL config docs, §"Filter
+# pattern syntax"). NOT regular expressions — anchors ^...$ and
+# backslashes are NOT supported. Forward slashes required; use **
+# only at start/end of line or surrounded by slashes; * (single
+# star) is supported only when quoted. Patterns starting with the
+# file's repo-root-relative path resolve correctly.
 paths-ignore:
-  - '^cmd/gatewayd-internal/proxy.go$'
+  - cmd/gatewayd-internal/proxy.go
