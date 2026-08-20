@@ -189,9 +189,10 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/account/egress_allowlist_extra":    "SetEgressAllowlistExtra",
 	"GET /v1/apps/{slug}/logs":                    "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":               "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan",       // issue #464 / ADR-055; per-deploy grype CVE drill-down
-	"GET /v1/deployments/{id}/secret-scan":        "GetDeploymentSecretScan", // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
-	"GET /v1/deployments/{id}/stages":             "GetDeploymentStages",     // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
+	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan",        // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/secret-scan":        "GetDeploymentSecretScan",  // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
+	"GET /v1/deployments/{id}/stages":             "GetDeploymentStages",      // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
+	"POST /v1/deployments/{id}/retry":             "RetryDeploymentFromStage", // ADR-117 §Production-ready follow-on C2; per-stage retry
 	"GET /v1/deployments/{id}":                    "GetDeployment",
 	"PATCH /v1/deployments/{id}":                  "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                         "ListDeployments",

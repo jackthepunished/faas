@@ -499,6 +499,32 @@ func (c *Client) Deploy(ctx context.Context, slug string, req CreateDeploymentRe
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/deployments", req, &out)
 }
 
+// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+// C2) inserts a fresh `deployments` row copying the failed
+// deployment's input primitives and seeds the new row's
+// stage_state.current to fromStage. Returns the new row's typed
+// DeploymentResponse.
+//
+// The fromStage value MUST be one of the closed-6 stage
+// vocabulary (source_download | dependency_restore | image_build
+// | security_scan | snapshot_prepare | readiness). A typo or
+// empty value surfaces as a 400 with an api.Problem whose code
+// is api.CodeValidation. Cross-account probes return 404 (the
+// same IDOR posture as GetDeployment / GetDeploymentStages).
+//
+// fromStage=source_download re-runs the entire pipeline
+// (intentional — that's how a user "retry from the top" works).
+//
+// The route is keyed on the deployment id alone — the handler
+// resolves the parent app via deployments.app_id, so the SDK
+// caller (the CLI's `gregale deploys retry <id>`) doesn't need
+// to know the slug.
+func (c *Client) RetryDeploymentFromStage(ctx context.Context, id, fromStage string) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "POST", "/v1/deployments/"+id+"/retry",
+		RetryDeploymentRequest{FromStage: fromStage}, &out)
+}
+
 // GetDeployment returns a deployment by ID.
 func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentResponse, error) {
 	var out DeploymentResponse

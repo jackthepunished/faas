@@ -4321,6 +4321,71 @@ func (m *MemStore) CloseDeploymentStage(_ context.Context, id string, name Stage
 	return d, nil
 }
 
+// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+// C2) memstore mirror of PgStore.RetryDeploymentFromStage. See
+// Store.RetryDeploymentFromStage docblock for the wire contract.
+//
+// Mirrors pgstore: validate against pkg/state.AllStageNames
+// (ErrInvalidArgument on unknown), copy every input primitive
+// from the failed row, seed the new row's stage_state to
+// `{current: fromStage, current_started_at: NULL, history: []}`.
+// The fresh id is allocated by the existing newID() helper.
+func (m *MemStore) RetryDeploymentFromStage(_ context.Context, failedID string, fromStage StageName) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !stageNameClosedSet[fromStage] {
+		return Deployment{}, ErrInvalidArgument
+	}
+	src, ok := m.deployments[failedID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	// Build a new row. The Status field stays DeployPending so
+	// imaged's transition chokepoint picks it up the same way as a
+	// fresh CLI-driven deploy. The id is fresh; the actor
+	// attribution fields are left empty (the apid handler
+	// re-stamps them on the new attempt).
+	newDep := Deployment{
+		ID:                    newID(),
+		AppID:                 src.AppID,
+		ImageDigest:           src.ImageDigest,
+		Kind:                  src.Kind,
+		SourcePath:            src.SourcePath,
+		SourceBytes:           src.SourceBytes,
+		Handler:               src.Handler,
+		SourceURL:             src.SourceURL,
+		CommitSHA:             src.CommitSHA,
+		OverrideEntrypoint:    src.OverrideEntrypoint,
+		OverrideCmd:           src.OverrideCmd,
+		OverrideEnv:           src.OverrideEnv,
+		OverrideEnvSecrets:    src.OverrideEnvSecrets,
+		OverridePort:          src.OverridePort,
+		OverrideHealthcheck:   src.OverrideHealthcheck,
+		OverrideLivenessProbe: src.OverrideLivenessProbe,
+		Sidecars:              src.Sidecars,
+		MinInstances:          src.MinInstances,
+		TrafficPercent:        src.TrafficPercent,
+		Scope:                 src.Scope,
+		Status:                DeployPending,
+	}
+	// Seed stage_state: the new row starts at fromStage with an
+	// empty history. imaged's transitionWithStage will append
+	// the first row (fromStage → next) the same way it does on
+	// a CLI-driven fresh deploy.
+	seed, err := json.Marshal(StageState{
+		Current:          fromStage,
+		CurrentStartedAt: nil,
+		History:          []StageStateItem{},
+	})
+	if err != nil {
+		return Deployment{}, fmt.Errorf("RetryDeploymentFromStage: encode stage_state seed: %w", err)
+	}
+	newDep.StageState = seed
+	newDep.CreatedAt = time.Now()
+	m.deployments[newDep.ID] = newDep
+	return newDep, nil
+}
+
 func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, bytes int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

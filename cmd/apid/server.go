@@ -964,6 +964,15 @@ func (s *server) handler() http.Handler {
 
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
+	// ADR-117 §Production-ready follow-on, C2 — per-stage retry.
+	// Same auth chain as createDeployment (authLimited → requireMFA
+	// → requireScope(ScopesDeployWriteSurface)). NOT wrapped in
+	// s.idempotent: every retry call creates a fresh deployments
+	// row, so idempotency-key collapse would silently mask the
+	// new-row creation. The closed-vocab guard lives in the
+	// handler (state.IsStageName) — invalid from_stage returns 400
+	// with a structured RFC 7807 problem before the storage call.
+	mux.HandleFunc("POST /v1/deployments/{id}/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.retryDeployment))))
 	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref
 	// deploy from CI. Same auth chain as the multipart sibling
 	// (authLimited → requireMFA → requireScope(ScopesDeployWriteSurface)

@@ -224,6 +224,7 @@ export type { RateLimitPlain } from './models/RateLimitPlain.js';
 export type { RekeyProgress } from './models/RekeyProgress.js';
 export type { RenameAppRequest } from './models/RenameAppRequest.js';
 export type { RepoResponse } from './models/RepoResponse.js';
+export type { RetryDeploymentRequest } from './models/RetryDeploymentRequest.js';
 export type { RollbackRequest } from './models/RollbackRequest.js';
 export type { RotateAlertRuleSecretResponse } from './models/RotateAlertRuleSecretResponse.js';
 export type { RotateAppSecretRequest } from './models/RotateAppSecretRequest.js';

@@ -5383,6 +5383,119 @@ func (s *PgStore) CloseDeploymentStage(ctx context.Context, id string, name Stag
 	return s.DeploymentByID(ctx, id)
 }
 
+// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+// C2) inserts a fresh `deployments` row copying every input
+// primitive from `failedID` and seeds `stage_state.current` to
+// `fromStage` with an empty history. See Store.RetryDeploymentFromStage
+// docblock for the wire contract.
+//
+// Implementation:
+//  1. Validate fromStage against pkg/state.AllStageNames
+//     (ErrInvalidArgument on unknown).
+//  2. Read the failed row by DeploymentByID.
+//  3. Build a new Deployment struct copying the input primitives
+//     (ImageDigest, Kind, SourcePath/Bytes, Handler, LogPath,
+//     SourceURL, CommitSHA, Override*, Sidecars, MinInstances,
+//     TrafficPercent, Scope). The actor attribution columns
+//     (DeployedByUserID/Via/FromIP/PusherLogin) get a fresh
+//     stamp at INSERT time — a retry is a new operator action.
+//  4. INSERT a new row at status='pending' with stage_state =
+//     `{current: fromStage, current_started_at: NULL, history: []}`.
+//     The new row's id is uuid.NewString() so the wire SSE channel
+//     can detect the retry as a row-creation event.
+//
+// Reversibility: the failed row is NOT mutated. The retry is a
+// new row, not a status flip. This is intentional — failure
+// history stays observable, and the customer-facing UI shows
+// both the failed attempt and the retry in the same dashboard
+// list.
+func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string, fromStage StageName) (Deployment, error) {
+	// Step 1 — closed-vocab guard. A caller-supplied unknown stage
+	// returns ErrInvalidArgument which the apid handler maps to a
+	// 400 RFC 7807 problem.
+	if !stageNameClosedSet[fromStage] {
+		return Deployment{}, ErrInvalidArgument
+	}
+	// Step 2 — read the failed row.
+	src, err := s.DeploymentByID(ctx, failedID)
+	if err != nil {
+		return Deployment{}, err
+	}
+	// Step 3 — build the new Deployment. The id is fresh; the
+	// actor attribution is left empty (the caller passes through
+	// the same identity columns as CreateDeployment's nil-default
+	// path).
+	newDep := Deployment{
+		ID:                    uuid.NewString(),
+		AppID:                 src.AppID,
+		BuildID:               "",
+		ImageDigest:           src.ImageDigest,
+		Kind:                  src.Kind,
+		SourcePath:            src.SourcePath,
+		SourceBytes:           src.SourceBytes,
+		Handler:               src.Handler,
+		LogPath:               "",
+		SourceURL:             src.SourceURL,
+		CommitSHA:             src.CommitSHA,
+		OverrideEntrypoint:    src.OverrideEntrypoint,
+		OverrideCmd:           src.OverrideCmd,
+		OverrideEnv:           src.OverrideEnv,
+		OverrideEnvSecrets:    src.OverrideEnvSecrets,
+		OverridePort:          src.OverridePort,
+		OverrideHealthcheck:   src.OverrideHealthcheck,
+		OverrideLivenessProbe: src.OverrideLivenessProbe,
+		Sidecars:              src.Sidecars,
+		MinInstances:          src.MinInstances,
+		TrafficPercent:        src.TrafficPercent,
+		Scope:                 src.Scope,
+	}
+	// Step 4 — INSERT with stage_state seeded to the requested
+	// fromStage. We do not call CreateDeployment because that path
+	// supersedes the prior live row (a retry is independent of
+	// the prior row's status — it doesn't replace it). The seed
+	// jsonb is marshalled here so the SQL is a single INSERT.
+	stageSeed, err := json.Marshal(StageState{
+		Current:          fromStage,
+		CurrentStartedAt: nil,
+		History:          []StageStateItem{},
+	})
+	if err != nil {
+		return Deployment{}, fmt.Errorf("RetryDeploymentFromStage: encode stage_state seed: %w", err)
+	}
+	row := s.pool.QueryRow(ctx,
+		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
+		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          override_liveness_probe,
+		                          sidecars,
+		                          status,
+		                          min_instances,
+		                          traffic_percent,
+		                          scope,
+		                          stage_state)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19,
+		         coalesce(nullif($20, ''), 'default'),
+		         $21)
+		 returning `+deploymentSelectColumnsWithRootfs,
+		newDep.AppID, newDep.ImageDigest, string(newDep.Kind),
+		nullString(newDep.SourcePath), newDep.SourceBytes,
+		nullString(newDep.Handler), nullString(newDep.LogPath),
+		nullString(newDep.SourceURL), nullString(newDep.CommitSHA),
+		newDep.OverrideEntrypoint, newDep.OverrideCmd,
+		nullJSONRaw(newDep.OverrideEnv), nullJSONRaw(newDep.OverrideEnvSecrets),
+		nullableOverridePort(newDep.OverridePort), nullJSONRaw(newDep.OverrideHealthcheck),
+		nullJSONRaw(newDep.OverrideLivenessProbe),
+		notNullEmptyJSONRaw(newDep.Sidecars),
+		newDep.MinInstances,
+		newDep.TrafficPercent,
+		newDep.Scope,
+		stageSeed)
+	created, err := scanDeployment(row)
+	if err != nil {
+		return Deployment{}, err
+	}
+	return created, nil
+}
+
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {
 	// Issue #96 / ADR-025 axis 2 (PR #116): rootfs_key is the canonical
 	// StorageBackend key (e.g. "apps/<slug>/<depID>.ext4") schedd carries
