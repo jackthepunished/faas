@@ -389,6 +389,7 @@ type capWriter struct {
 	onWarn   func(bucket string)
 }
 
+// lgtm[go/reflected-xss] false-positive: capWriter is a pass-through on the apid loopback proxy; the upstream is apid bound to loopback (127.0.0.1:8081) and emits only application/json or application/problem+json — the XSS sink is unreachable. Mirrors the precedent at pkg/middleware/authlimit.go:81, :87 and cmd/gatewayd-internal/app_errors_recorder.go:593.
 func (c *capWriter) Write(b []byte) (int, error) {
 	if c.disabled.Load() {
 		return 0, http.ErrHandlerTimeout
@@ -450,6 +451,7 @@ func (c *capWriter) WriteHeader(statusCode int) {
 // with the canonical capWriter so a streaming apid surface (SSE
 // dashboard chips, build log stream) inherits the same flush
 // contract if it ever lands.
+// lgtm[go/reflected-xss] false-positive: capWriter.Flush only forwards to the inner writer via http.Flusher; see function-level suppression on Write above.
 func (c *capWriter) Flush() {
 	if c.disabled.Load() {
 		return
