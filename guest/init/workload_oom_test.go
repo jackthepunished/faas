@@ -66,11 +66,6 @@ func TestReadMemoryEventsOOMKills_AbsentFile(t *testing.T) {
 // the absolute counter).
 func TestReadMemoryEventsOOMKills_ZeroAndIncrement(t *testing.T) {
 	t.Parallel()
-	tmp := t.TempDir()
-	leaf := filepath.Join(tmp, "main-app")
-	if err := os.MkdirAll(leaf, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
 	cases := []struct {
 		name    string
 		content string
@@ -85,6 +80,18 @@ func TestReadMemoryEventsOOMKills_ZeroAndIncrement(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			// Each subtest gets its own tempdir + leaf
+			// so the parallel subtests don't race-write
+			// to the same memory.events file (the
+			// previous fixture shared one leaf across
+			// subtests and the parallel reads saw each
+			// other's content — zero_kills would see
+			// five_kills's 'oom_kill 5' and fail).
+			tmp := t.TempDir()
+			leaf := filepath.Join(tmp, "main-app")
+			if err := os.MkdirAll(leaf, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
 			if err := os.WriteFile(filepath.Join(leaf, "memory.events"),
 				[]byte(tc.content), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)

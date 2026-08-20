@@ -439,7 +439,7 @@ func readMemoryEventsOOMKills(leafDir string) (uint64, error) {
 		return 0, err
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "oom_kill ") {
+		if strings.HasPrefix(line, "oom_kill ") || strings.HasPrefix(line, "oom_kill\t") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
 				return strconv.ParseUint(fields[1], 10, 64)

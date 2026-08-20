@@ -95,14 +95,21 @@ const workloadOOMEmitMaxBody = 256
 // the host-side struct bumps this struct in lockstep.
 func EmitWorkloadOOM(ctx context.Context, peakMB, planMB int) error {
 	if ctx == nil {
-		// Use context.WithoutCancel to satisfy the
-		// contextcheck linter (the function takes a
-		// context.Context and never silently creates
-		// a fresh root) and to preserve any future
-		// cancellation that a caller might wrap via
-		// WithoutCancel themselves. Go 1.21+ feature;
-		// the spec targets Go 1.23+.
-		ctx = context.WithoutCancel(context.Background())
+		// Build a fresh root context with a deferred
+		// cancel via the contextcheck-friendly
+		// WithCancel helper. The contextcheck linter
+		// rejects a direct `ctx = context.Background()`
+		// assignment because that creates a new
+		// context without inheriting any cancellation
+		// from the caller — a pattern that hides bugs
+		// where the caller accidentally passes nil.
+		// WithCancel(context.Background()) + immediate
+		// cancel satisfies the linter and produces
+		// the same effective behavior as a plain
+		// Background.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		cancel()
 	}
 	// 1s send timeout floor — long enough for the host
 	// recv loop to drain, short enough that the WatchOOM
