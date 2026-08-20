@@ -275,6 +275,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the "permanently bad payload" worker cost.
 			MaxQueueAttempts:       10,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
+			// Issue #477 / ADR-118: Pro unlocks the per-app ingress
+			// IP allowlist. Same 16-entry cap as the egress
+			// allowlist — symmetric abuse-desk primitives.
+			PublicAuthIPAllowlistAllowed: true, PublicAuthIPAllowlistMaxEntries: 16,
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
@@ -395,6 +399,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the worker's hourly budget window.
 			MaxQueueAttempts:       25,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
+			// Issue #477 / ADR-118: Scale gets a 64-entry cap, 4× Pro
+			// (same ladder as EgressAllowlistMaxSize; SaaS-scale
+			// customers with multi-region deployments enumerate more
+			// per-region ranges than a Pro-tier app).
+			PublicAuthIPAllowlistAllowed: true, PublicAuthIPAllowlistMaxEntries: 64,
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
@@ -1009,6 +1018,61 @@ func TestPlanEgressAllowlistMonotonic(t *testing.T) {
 	scale := MustLimitsFor(PlanScale).EgressAllowlistMaxSize
 	if scale < pro {
 		t.Errorf("Scale EgressAllowlistMaxSize=%d < Pro=%d — Scale must keep the larger CIDR budget", scale, pro)
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistAllowed pins the per-plan gate that
+// apid's updateApp handler uses for the per-app ingress IP allowlist
+// (ADR-118). Same shape as TestPlanEgressAllowlistAllowed: Free/Hobby
+// → false (no allowlist — abuse-desk hygiene is a Pro+ concern); Pro/Scale
+// → true. Unknown plans must default to false (fail-closed).
+func TestPlanPublicAuthIPAllowlistAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthIPAllowlistAllowed(); got != c.want {
+			t.Errorf("%s.PublicAuthIPAllowlistAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistMaxEntries pins the per-plan CIDR cap
+// (ADR-118). Same shape as TestPlanEgressAllowlistMaxSize: Free/Hobby →
+// 0; Pro → 16; Scale → 64. Unknown plans default to 0 (fail-closed).
+func TestPlanPublicAuthIPAllowlistMaxEntries(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 0},
+		{PlanPro, 16},
+		{PlanScale, 64},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthIPAllowlistMaxEntries(); got != c.want {
+			t.Errorf("%s.PublicAuthIPAllowlistMaxEntries() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthIPAllowlistMonotonic pins the Pro→Scale ordering
+// (ADR-118). Pro MaxEntries must be ≤ Scale MaxEntries because Scale
+// is the bigger tier.
+func TestPlanPublicAuthIPAllowlistMonotonic(t *testing.T) {
+	pro := MustLimitsFor(PlanPro).PublicAuthIPAllowlistMaxEntries
+	scale := MustLimitsFor(PlanScale).PublicAuthIPAllowlistMaxEntries
+	if scale < pro {
+		t.Errorf("Scale PublicAuthIPAllowlistMaxEntries=%d < Pro=%d — Scale must keep the larger CIDR budget", scale, pro)
 	}
 }
 

@@ -878,6 +878,18 @@ const (
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
 
+	// Issue #477 / ADR-118 — per-app ingress IP allowlist (extends
+	// the reserved 'ip_allowlist' enum value, ADR-079). Same shape
+	// as the egress pair: 403 plan-gate + 400 count cap, distinct
+	// codes so the CLI can render actionable retry guidance.
+	//   * CodePlanPublicAuthIPAllowlistNotAllowed = 403 "your plan
+	//     does not unlock this knob at all" (Free/Hobby).
+	//   * CodePublicAuthIPAllowlistTooLong = 400 "the PATCH carries
+	//     more CIDRs than your plan caps" (Pro/Scale but the slice
+	//     is too long).
+	CodePlanPublicAuthIPAllowlistNotAllowed = "plan_public_auth_ip_allowlist_not_allowed"
+	CodePublicAuthIPAllowlistTooLong        = "public_auth_ip_allowlist_too_long"
+
 	// Issue #679 / PR-B / ADR-082 — per-account egress allowlist
 	// additive budget. Distinct code from CodeEgressAllowlistTooLong
 	// so the CLI can render the "your admin override is too big,
@@ -1036,6 +1048,14 @@ const (
 	// an entry that doesn't ParsePrefix, or a v6 CIDR (v1 is v4
 	// only; v6 mirror is a separate ADR).
 	CodeInvalidEgressAllowlist = "invalid_egress_allowlist"
+
+	// CodeInvalidPublicAuthIPAllowlist (ADR-118) is a 400 for
+	// ingress allowlist shape violations: entries that don't
+	// ParsePrefix as v4/v6 CIDRs, masklen /0, or `ip_allowlist`
+	// mode set with an empty list (the 500-on-misconfig path in
+	// the gateway surfaces a different code; the 400 here covers
+	// the PATCH-time shape checks).
+	CodeInvalidPublicAuthIPAllowlist = "invalid_public_auth_ip_allowlist"
 
 	// Issue #462 / ADR-058 — per-app scaling policy (PR-A). Three
 	// new codes, mirroring the existing autoscale shape (one
@@ -1303,14 +1323,17 @@ const MaxOrgSlugLen = 32
 // 500 — a reconstructed Problem is never served without a real status.
 func StatusForCode(code string) int {
 	switch code {
-	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
+	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue,
+		CodePlanPublicAuthIPAllowlistNotAllowed:
 		return http.StatusForbidden
 	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
-		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired:
+		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired,
+		CodeEgressAllowlistTooLong, CodePublicAuthIPAllowlistTooLong,
+		CodeInvalidEgressAllowlist, CodeInvalidPublicAuthIPAllowlist:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm,
 		CodeEdgeRuleMaintenance, CodeAppMaintenance:
@@ -3179,6 +3202,20 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 		WithDocs(docsBase + "/apps#egress-allowlist")
 }
 
+// ErrPlanPublicAuthIPAllowlistNotAllowed (ADR-118) is returned when a
+// Free or Hobby account tries to set apps.public_auth_ip_allowlist.
+// Same gate shape as ErrPlanEgressAllowlistNotAllowed: the knob is
+// plan-locked, and Pro/Scale is where the operator surface lives.
+// Free/Hobby use edge rules (kind='ip') for the abuse-floor posture.
+// The plan is named in the body so a CLI prompt can render "upgrade
+// to Pro to unlock this knob" without a second lookup.
+func ErrPlanPublicAuthIPAllowlistNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanPublicAuthIPAllowlistNotAllowed,
+		"Plan doesn't allow a public-auth IP allowlist",
+		fmt.Sprintf("the %s plan cannot pin a public-auth IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
+}
+
 // ErrPlanLivenessProbeNotAllowed (issue #554 / ADR-078) is returned when a
 // Free account tries to pin a per-deployment liveness probe override. The
 // gate is the same shape as ErrPlanEgressAllowlistNotAllowed /
@@ -3205,6 +3242,19 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
 		WithLimit(int64(maxSize), int64(got)).
 		WithDocs(docsBase + "/apps#egress-allowlist")
+}
+
+// ErrPublicAuthIPAllowlistTooLong (ADR-118) is returned when the
+// PATCH carries more CIDRs than the plan's per-app cap. 400 (not
+// 422) because the request shape is well-formed — only the count
+// is over budget. The limit + observed pair rides on the Problem
+// so the CLI can branch on its own copy of the cap (no re-fetch).
+func ErrPublicAuthIPAllowlistTooLong(got, maxEntries int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodePublicAuthIPAllowlistTooLong,
+		"Public-auth IP allowlist too long",
+		fmt.Sprintf("public_auth_ip_allowlist has %d entries; plan caps it at %d.", got, maxEntries)).
+		WithLimit(int64(maxEntries), int64(got)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
 }
 
 // ErrAccountEgressAllowlistExtraOutOfRange (issue #679 / PR-B /
@@ -3235,6 +3285,21 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs(docsBase + "/apps#egress-allowlist")
+}
+
+// ErrInvalidPublicAuthIPAllowlist (ADR-118) is a 400 for ingress
+// allowlist shape violations: an entry that doesn't ParsePrefix as
+// a v4 or v6 CIDR, masklen /0, or `ip_allowlist` mode set with an
+// empty list. The detail names the offending entry so an operator
+// triaging a rejected PATCH sees exactly which line is bad. The
+// non-/0 contract is shared with the DB trigger at
+// migrations/00308_apps_public_auth_ip_allowlist.sql — the apid
+// layer is defence-in-depth, not the primary guard.
+func ErrInvalidPublicAuthIPAllowlist(entry string, reason error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeInvalidPublicAuthIPAllowlist,
+		"Invalid public-auth IP allowlist entry",
+		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
+		WithDocs(docsBase + "/apps#public-auth-ip-allowlist")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by

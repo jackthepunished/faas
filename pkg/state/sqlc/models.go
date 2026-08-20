@@ -118,6 +118,7 @@ type App struct {
 	GithubProductionBranch pgtype.Text
 	MinInstances           int32
 	EgressAllowlist        []netip.Prefix
+	PublicAuthIpAllowlist  []netip.Prefix
 	// Per-instance RPS target. When live_request_count / live_instance_count exceeds this, schedd admits another instance (up to plan max_concurrency). Hobby/Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app).
 	AutoscaleTargetRps pgtype.Int4
 	// Per-instance CPU% target (1..100). Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app). CPU target is unbounded above 100 inside the DB; the apid handler enforces [1, 100] via 422.

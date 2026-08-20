@@ -32,6 +32,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -418,5 +419,327 @@ func assertNoAuditRow(t *testing.T, e testEnv, kind string) {
 	}
 	if found := findEventByKind(rows, kind); found != nil {
 		t.Fatalf("unexpected %s audit row on rejected PATCH: data=%s", kind, string(found.Data))
+	}
+}
+
+// TestPublicAuthPatch_IPAllowlistPlanGate (ADR-118) pins the
+// Pro/Scale-paid-only ladder for the new ip_allowlist mode.
+// Mirrors TestPublicAuthPatch_BasicPlanGate at L141 — Free + Hobby
+// must return 403 plan_public_auth_ip_allowlist_not_allowed,
+// Pro + Scale must accept a valid 1-entry list with 200. The
+// 403 surface uses a distinct code from bearer/basic so the
+// CLI can branch on plan-specific upgrade copy.
+func TestPublicAuthPatch_IPAllowlistPlanGate(t *testing.T) {
+	t.Run("free_returns_403_ip_allowlist_not_allowed", func(t *testing.T) {
+		e := setup(t, api.PlanFree)
+		app := seedAppForAudit(t, e, "pa-ip-free")
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: []string{"10.0.0.0/8"},
+		})
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("PATCH mode=ip_allowlist on Free: code=%d body=%s; want 403",
+				rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "plan_public_auth_ip_allowlist_not_allowed") {
+			t.Fatalf("body missing code; got %s", rec.Body.String())
+		}
+		assertNoAuditRow(t, e, "app.public_auth_changed")
+	})
+	t.Run("hobby_returns_403_ip_allowlist_not_allowed", func(t *testing.T) {
+		e := setup(t, api.PlanHobby)
+		app := seedAppForAudit(t, e, "pa-ip-hobby")
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: []string{"10.0.0.0/8"},
+		})
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("PATCH mode=ip_allowlist on Hobby: code=%d body=%s; want 403",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("pro_with_one_entry_returns_200", func(t *testing.T) {
+		e := setup(t, api.PlanPro)
+		app := seedAppForAudit(t, e, "pa-ip-pro")
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: []string{"10.0.0.0/8"},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH mode=ip_allowlist on Pro: code=%d body=%s; want 200",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("scale_with_max_entries_returns_200", func(t *testing.T) {
+		e := setup(t, api.PlanScale)
+		app := seedAppForAudit(t, e, "pa-ip-scale")
+		// Scale max is 64 — exactly at the boundary.
+		entries := make([]string, 64)
+		for i := range entries {
+			entries[i] = "10.0.0.0/8" // same prefix; dedup drops to 1 entry
+		}
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: entries,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH 64 dedup entries on Scale: code=%d body=%s; want 200",
+				rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestPublicAuthPatch_IPAllowlistSizeGate (ADR-118) pins the
+// per-app entry cap. Pro 16, Scale 64 — exactly one over
+// surfaces 400 public_auth_ip_allowlist_too_long with both the
+// observed count and the cap in the body so the CLI can render
+// actionable upgrade copy. Mirrors TestEgressAllowlist_SizeGate's
+// shape (the egress path has an additive per-account budget; ingress
+// does not — per-app cap only).
+func TestPublicAuthPatch_IPAllowlistSizeGate(t *testing.T) {
+	t.Run("pro_with_17_entries_returns_400", func(t *testing.T) {
+		e := setup(t, api.PlanPro)
+		app := seedAppForAudit(t, e, "pa-ip-pro-overflow")
+		entries := make([]string, 17)
+		for i := range entries {
+			// Distinct prefixes so dedup doesn't drop them.
+			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
+		}
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: entries,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH 17 entries on Pro: code=%d body=%s; want 400",
+				rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "public_auth_ip_allowlist_too_long") {
+			t.Fatalf("body missing code; got %s", rec.Body.String())
+		}
+	})
+	t.Run("pro_with_16_entries_returns_200", func(t *testing.T) {
+		e := setup(t, api.PlanPro)
+		app := seedAppForAudit(t, e, "pa-ip-pro-max")
+		entries := make([]string, 16)
+		for i := range entries {
+			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
+		}
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: entries,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH 16 entries on Pro: code=%d body=%s; want 200",
+				rec.Code, rec.Body.String())
+		}
+	})
+	// CRIT-2 regression: the cap must run against the WIRE
+	// length BEFORE dedup, so a customer cannot submit
+	// cap+1 entries with N-1 duplicates and have the
+	// deduped result bypass the cap. Pro cap=16: 17 wire
+	// entries where exactly 1 is a duplicate (16 unique
+	// after dedup) must still 400.
+	t.Run("pro_with_17_wire_16_unique_still_returns_400", func(t *testing.T) {
+		e := setup(t, api.PlanPro)
+		app := seedAppForAudit(t, e, "pa-ip-pro-cap-bypass")
+		entries := make([]string, 17)
+		// First 16 distinct; 17th is a duplicate of #0.
+		for i := 0; i < 16; i++ {
+			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
+		}
+		entries[16] = entries[0] // dup → 16 unique after dedup
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:        api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: entries,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH 17 wire/16 unique on Pro (cap-bypass attempt): code=%d body=%s; want 400",
+				rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "public_auth_ip_allowlist_too_long") {
+			t.Fatalf("body missing too-long code; got %s", rec.Body.String())
+		}
+	})
+}
+
+// TestPublicAuthPatch_IPAllowlistSlashZeroRejected (ADR-118) pins
+// the per-entry shape gate. 0.0.0.0/0 is the canonical "match
+// every IPv4 address" form — the egress trigger rejects it as a
+// per-app-shape invariant (a single /0 entry would render the
+// allowlist meaningless). The ingress trigger mirrors the same
+// posture (the DB rejects at write time; the handler catches it
+// upstream for a friendlier error name). This is NOT a plan gate
+// or size gate; it's a per-entry shape gate on Pro.
+func TestPublicAuthPatch_IPAllowlistSlashZeroRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "pa-ip-slashzero")
+	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode:        api.AppPublicAuthModeIPAllowlist,
+		IPAllowlist: []string{"0.0.0.0/0"},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH /0 on Pro: code=%d body=%s; want 400",
+			rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_public_auth_ip_allowlist") {
+		t.Fatalf("body missing code; got %s", rec.Body.String())
+	}
+	// The rejected PATCH must not leave a partial write behind —
+	// the app row's mode must stay at default (open), not flip to
+	// ip_allowlist without a usable list.
+	got, err := e.store.AppByID(context.Background(), app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PublicAuthMode == api.AppPublicAuthModeIPAllowlist {
+		t.Fatalf("app.PublicAuthMode = %q after rejected /0 PATCH; want default",
+			got.PublicAuthMode)
+	}
+	assertNoAuditRow(t, e, "app.public_auth_changed")
+}
+
+// TestPublicAuthPatch_IPAllowlistClosedEnumFirst (ADR-118) pins
+// the load-bearing precedence: an unknown mode string returns
+// 422 invalid_public_auth_mode BEFORE the plan gate fires. Same
+// invariant as the bearer/basic closed-enum test (L344). Without
+// this precedence, a Free customer PATCHing mode='weird' would
+// see a 402 plan_public_auth_ip_allowlist_not_allowed that says
+// "upgrade your plan" — wrong guidance, since 'weird' isn't a
+// real mode on any plan.
+func TestPublicAuthPatch_IPAllowlistClosedEnumFirst(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	app := seedAppForAudit(t, e, "pa-ip-enum")
+	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode:        "weird_mode",
+		IPAllowlist: []string{"10.0.0.0/8"},
+	})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("PATCH unknown mode: code=%d body=%s; want 422",
+			rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "validation_failed") {
+		t.Fatalf("body missing closed-enum code; got %s", rec.Body.String())
+	}
+}
+
+// TestPublicAuthPatch_IPAllowlistAuditEmitsEntryCount (ADR-118)
+// pins the audit redaction invariant for ip_allowlist. The audit
+// payload MUST carry public_auth_ip_allowlist_entry_count (the
+// integer count after canonicalisation + dedup) and MUST NEVER
+// carry any CIDR string — the allowlist can reveal
+// partner-customer ranges, and the redaction invariant is the
+// same shape as has_basic_creds for mode='basic' (L301).
+func TestPublicAuthPatch_IPAllowlistAuditEmitsEntryCount(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "pa-ip-audit")
+	// Submit a 3-entry list with one duplicate so the
+	// canonicalised count is 2.
+	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode: api.AppPublicAuthModeIPAllowlist,
+		IPAllowlist: []string{
+			"10.0.0.0/8",
+			"192.0.2.0/24",
+			"10.0.0.0/8", // dup
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "app.public_auth_changed")
+	if found == nil {
+		t.Fatalf("no app.public_auth_changed row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	// Mode transition: "" → ip_allowlist.
+	if data["new"] != api.AppPublicAuthModeIPAllowlist {
+		t.Errorf("Data.new = %v, want %q", data["new"], api.AppPublicAuthModeIPAllowlist)
+	}
+	// Entry count: 3 wire → 2 after dedup (10.0.0.0/8 dropped).
+	if v, _ := data["public_auth_ip_allowlist_entry_count"].(float64); int(v) != 2 {
+		t.Errorf("Data.public_auth_ip_allowlist_entry_count = %v; want 2 (3 wire, 1 dedup)",
+			data["public_auth_ip_allowlist_entry_count"])
+	}
+	// Redaction: scan raw JSON for the wire-form CIDR strings.
+	// A direct substring check pins this against future
+	// regressions where a contributor adds structured
+	// logging that doubles the audit row.
+	raw, _ := json.Marshal(data)
+	if strings.Contains(string(raw), "10.0.0.0/8") ||
+		strings.Contains(string(raw), "192.0.2.0/24") {
+		t.Fatalf("audit row leaked CIDR string: %s", raw)
+	}
+}
+
+// TestPublicAuthPatch_IPAllowlistEntryCountGatedByMode (ADR-118 /
+// MED-1 review-fix) pins the wire contract that
+// PublicAuthStatus.IPAllowlistEntryCount is 0 when the row's
+// mode is NOT ip_allowlist, even if the column carries stale
+// CIDRs from a prior PATCH. Mirrors how HasBasicCreds is
+// intrinsic to the sealed-blob presence (no extra gate).
+//
+// Scenario: Pro customer PATCHes ip_allowlist with 5 CIDRs,
+// then PATCHes mode='basic'. SetPublicAuthIPAllowlist is
+// false on the basic PATCH (mode != ip_allowlist at L949 in
+// handlers_ext.go), so the column retains the 5 stale CIDRs.
+// GET /v1/apps/{slug} must surface ip_allowlist_entry_count=0
+// (per the OpenAPI docstring at api/openapi.yaml:9010 —
+// "Always 0 when mode != 'ip_allowlist'"). Without the gate,
+// the dashboard would render "app X has 5 CIDRs configured"
+// for a basic-mode app.
+func TestPublicAuthPatch_IPAllowlistEntryCountGatedByMode(t *testing.T) {
+	withPublicAuthTestRecipient(t)
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "pa-ip-entry-count-gate")
+
+	// 1. PATCH ip_allowlist with 5 CIDRs.
+	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode: api.AppPublicAuthModeIPAllowlist,
+		IPAllowlist: []string{
+			"10.0.0.0/8",
+			"192.0.2.0/24",
+			"203.0.113.0/24",
+			"198.51.100.0/24",
+			"2001:db8::/32",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first PATCH: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 2. PATCH mode='basic' — the column retains 5 stale CIDRs
+	//    because SetPublicAuthIPAllowlist only fires for
+	//    mode='ip_allowlist' (handlers_ext.go:949).
+	rec = patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode:      api.AppPublicAuthModeBasic,
+		BasicUser: "editor",
+		BasicPass: "hunter2",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second PATCH: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 3. GET and verify ip_allowlist_entry_count = 0
+	//    (mode='basic' now; the stale column is gated out).
+	rec = e.do(t, "GET", "/v1/apps/"+app.Slug, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.PublicAuth.Mode != api.AppPublicAuthModeBasic {
+		t.Errorf("Mode = %q, want %q", out.PublicAuth.Mode, api.AppPublicAuthModeBasic)
+	}
+	if out.PublicAuth.IPAllowlistEntryCount != 0 {
+		t.Errorf("IPAllowlistEntryCount = %d on basic-mode app; want 0 (gated by mode)",
+			out.PublicAuth.IPAllowlistEntryCount)
 	}
 }

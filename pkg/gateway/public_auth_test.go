@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 
@@ -326,4 +327,116 @@ func TestBasicCredsFromHeader_Pin(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPublicAuth_IPAllowlist (ADR-118) pins the gateway-side
+// applyIngressIPAllowlist gate end-to-end through ServeHTTP. The
+// four cases cover the load-bearing branches:
+//
+//  1. Mode=ip_allowlist + client IP in list → 200 pass-through
+//     (the matched metric emits outcome="match" so the §12
+//     dashboard surfaces the allow side too, not only blocked).
+//  2. Mode=ip_allowlist + client IP NOT in list → 403 with
+//     edge_rule.ingress_ip_blocked audit + outcome=blocked.
+//  3. Mode=ip_allowlist + missing/duplicated XFF → 403 with
+//     edge_rule.ingress_ip_forged audit (defense-in-depth).
+//  4. Mode=ip_allowlist + EMPTY allowlist → 500 operator_error
+//     (not 403, not silent pass-through) — the loud posture.
+//
+// Trust chain is identical to applyEdgeRuleIP:
+// clientIPFromTrustedXFF (single XFF entry). Tests inject the
+// trusted XFF directly because gatewayd-public is a separate
+// daemon; in production the XFF overwrite at pkg/gateway/
+// internal_proxy.go:286-289 makes the test's header shape
+// identical to production.
+func TestPublicAuth_IPAllowlist(t *testing.T) {
+	// Build the handler once; each subtest mutates the
+	// fakeBackend's PublicAuth shape and re-runs ServeHTTP
+	// through the same recorder. The test handler wires
+	// the same fakes as the existing public_auth tests
+	// (authn, unsealer, audit) so the gate's surface
+	// (200/403/500) is observable through the response
+	// recorder without spinning up a real upstream.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello from app"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	b := &fakeBackend{
+		app: App{
+			ID:        "app-1",
+			AccountID: "acct-1",
+			Plan:      api.PlanPro,
+			PublicAuth: PublicAuthConfig{
+				Mode: publicAuthModeIPAllowlist,
+				IPAllowlist: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/8"),
+					netip.MustParsePrefix("192.0.2.0/24"),
+				},
+			},
+		},
+		host:     "jane-api.apps.dom",
+		upstream: upstream.Listener.Addr().String(),
+	}
+	b.setLegacyHot()
+
+	audit := newFakeRequireAuthnAudit()
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.WithRequireAuthn(&fakeRequireAuthnAuthn{accountID: "acct-1", keyID: "key-1"}, audit)
+	h.WithPublicAuth(NewPublicAuthCache(), &fakePublicAuthUnsealer{})
+
+	t.Run("xff_in_allowlist_returns_200", func(t *testing.T) {
+		req := publicAuthReqFor(t, "")
+		req.Header.Set("X-Forwarded-For", "10.5.5.5")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("xff_in_allowlist: code=%d body=%s; want 200",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("xff_not_in_allowlist_returns_403", func(t *testing.T) {
+		req := publicAuthReqFor(t, "")
+		req.Header.Set("X-Forwarded-For", "203.0.113.5") // TEST-NET-3
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("xff_not_in_allowlist: code=%d body=%s; want 403",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("xff_missing_returns_403_forged", func(t *testing.T) {
+		req := publicAuthReqFor(t, "")
+		// No X-Forwarded-For — defense-in-depth must fail closed.
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("xff_missing: code=%d body=%s; want 403",
+				rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("empty_allowlist_returns_500", func(t *testing.T) {
+		// Mutate the fakeBackend to expose the misconfig
+		// posture: mode=ip_allowlist with no CIDRs. This
+		// is the loud-posture arm — 500, not 403, not
+		// pass-through. A reader of the audit row sees
+		// "app is misconfigured: ip_allowlist mode
+		// requires at least one CIDR" and knows to fix
+		// the row.
+		b.app.PublicAuth.IPAllowlist = nil
+		defer func() {
+			b.app.PublicAuth.IPAllowlist = []netip.Prefix{
+				netip.MustParsePrefix("10.0.0.0/8"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+			}
+		}()
+		req := publicAuthReqFor(t, "")
+		req.Header.Set("X-Forwarded-For", "10.5.5.5")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("empty_allowlist: code=%d body=%s; want 500",
+				rec.Code, rec.Body.String())
+		}
+	})
 }

@@ -764,7 +764,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -1370,7 +1370,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			AccountID:        app.AccountID,
 			Slug:             app.Slug,
 			RequireAuthn:     app.RequireAuthn,
-			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
+			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist},
 			StreamingEnabled: app.StreamingEnabled,
 			WebSocketEnabled: app.WebSocketEnabled,
 			// ADR-093: per-route observability opt-in. Mirrors

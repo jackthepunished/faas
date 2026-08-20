@@ -3275,6 +3275,20 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		copy(dst, src)
 		a.EgressAllowlist = dst
 	}
+	// ADR-118: per-app ingress IP allowlist. Same Set-bit convention
+	// as EgressAllowlist above. The DB trigger at
+	// migrations/00308_apps_public_auth_ip_allowlist.sql rejects
+	// non-v4/v6 families and masklen /0 (defence in depth on top of
+	// the apid parse step); the in-memory store trusts the apid
+	// layer to have already validated. Plan-gated upstream — Free/Hobby
+	// never reach this branch (apid returns 403 before the store
+	// is touched).
+	if p.SetPublicAuthIPAllowlist {
+		src := derefPrefixes(p.PublicAuthIPAllowlist)
+		dst := make([]netip.Prefix, len(src))
+		copy(dst, src)
+		a.PublicAuthIPAllowlist = dst
+	}
 	// Issue #169 / #172: per-app reactive scale-up trigger. Set
 	// distinguishes "unset" (don't touch) from "explicit zero"
 	// (disable). Apid already gated the plan and the bounds

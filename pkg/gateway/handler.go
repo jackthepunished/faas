@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -196,17 +197,27 @@ type App struct {
 	CORSDefaultOrigins []string
 }
 
-// PublicAuthConfig (issue #477 / ADR-079) is the per-app
-// public-URL auth mode bundle plumbed onto App. Mode is the
-// canonical text from apps.public_auth_mode CHECK enum
-// ('open'|'bearer'|'basic'); empty Mode is treated as 'open'
-// by enforcePublicAuth so a fakeBackend unit test that
-// doesn't populate the column keeps working. BasicSealed is
-// the secretbox-sealed bytea from apps.public_auth_basic,
-// only set when Mode='basic' (nil for open/bearer). The
-// unsealed shape is {username_env, password_env} env-var
-// reference names; the plaintext credentials live in
-// app_secrets (ADR-045) and are loopback-mounted at boot.
+// PublicAuthConfig (issue #477 / ADR-079 + ADR-118) is the
+// per-app public-URL auth mode bundle plumbed onto App. Mode is
+// the canonical text from apps.public_auth_mode CHECK enum
+// ('open'|'bearer'|'basic'|'ip_allowlist'); empty Mode is
+// treated as 'open' by enforcePublicAuth so a fakeBackend unit
+// test that doesn't populate the column keeps working.
+// BasicSealed is the secretbox-sealed bytea from
+// apps.public_auth_basic, only set when Mode='basic' (nil for
+// open/bearer/ip_allowlist). The unsealed shape is
+// {username_env, password_env} env-var reference names; the
+// plaintext credentials live in app_secrets (ADR-045) and are
+// loopback-mounted at boot.
+//
+// IPAllowlist (ADR-118) is the per-app ingress CIDR allowlist
+// hydrated from apps.public_auth_ip_allowlist cidr[]. Only
+// consulted when Mode=publicAuthModeIPAllowlist; for other
+// modes the slice is left nil and ignored. The handler caches
+// this slice once per app per process — the NotifyAppChanged
+// arm in cmd/gatewayd-internal/backend.go already invalidates
+// the per-app cache on every PATCH, so live-drift fan-out is
+// handled without an extra RPC.
 //
 // The mode check is done with a direct string compare on the
 // constants below — no separate enum type, mirroring the
@@ -215,15 +226,17 @@ type App struct {
 type PublicAuthConfig struct {
 	Mode        string
 	BasicSealed []byte
+	IPAllowlist []netip.Prefix
 }
 
 // Canonical public-auth mode strings (issue #477). Values
 // must stay in sync with the apps_public_auth_mode_chk
 // CHECK constraint in migrations/00153_apps_public_auth.sql.
 const (
-	publicAuthModeOpen   = "open"
-	publicAuthModeBearer = "bearer"
-	publicAuthModeBasic  = "basic"
+	publicAuthModeOpen        = "open"
+	publicAuthModeBearer      = "bearer"
+	publicAuthModeBasic       = "basic"
+	publicAuthModeIPAllowlist = "ip_allowlist"
 )
 
 // docsTypeBase is the canonical docs path prefix for problem
@@ -2135,6 +2148,155 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		h.metrics.ObserveEdgeRuleApply("ip", "success")
 	}
 	return false
+}
+
+// applyIngressIPAllowlist (ADR-118) is the per-app ingress IP
+// allowlist gate. Runs in the per-app request chain BEFORE
+// applyEdgeRuleIP (so an IP-blocked request short-circuits all
+// edge-rule work and never wakes a Firecracker — same invariant
+// as the geo gate at L4269 / ADR-091 D21).
+//
+// Trust chain is identical to applyEdgeRuleIP:
+// clientIPFromTrustedXFF (defense-in-depth guard rejects any
+// request with 0 or >1 XFF entries as `caller_ip_forged`).
+//
+// Empty allowlist + ip_allowlist mode is a HARD misconfig
+// posture: a 500 (operator_error, "app is misconfigured") rather
+// than a 403 (no rule matched). This is deliberate — a silent
+// pass-through would mean every request wakes a Firecracker on
+// an app that's supposed to be filtered, and an app that has
+// been "armed" but not yet populated is the operator-side
+// onboarding hole this loud posture is designed to surface. The
+// apid handler never arms ip_allowlist mode without a list (the
+// closed-enum validator at dto.go L792 rejects len==0 + ip_allowlist
+// at the wire), so reaching the empty-list + ip_allowlist code
+// path implies a SQL row hand-edit or a future regression that
+// surfaced as a missing precondition — both operator errors.
+//
+// Audit vocabulary:
+//   - edge_rule.ingress_ip_blocked — CIDR mismatch (implicit deny)
+//   - edge_rule.ingress_ip_forged  — XFF chain wrong
+//
+// The kind="ingress_ip" metric label is pre-instantiated at
+// pkg/gateway/metrics.go so an idle box renders zero-valued
+// rows for the §12 dashboard chip.
+func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request, app App) bool {
+	if app.PublicAuth.Mode != publicAuthModeIPAllowlist {
+		return false
+	}
+	if len(app.PublicAuth.IPAllowlist) == 0 {
+		// Operator misconfig: ip_allowlist mode without CIDRs.
+		// 500 makes the noise operator-loud — the cold-boot
+		// rate for this app stays low (no Firecracker wakes),
+		// but every request 500s and shows up on the error
+		// dashboard.
+		h.log.Error("app in ip_allowlist mode with empty CIDR list — refusing",
+			slog.String("app_id", app.ID),
+			slog.String("slug", app.Slug))
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeInternal,
+			"app is misconfigured",
+			"ip_allowlist mode requires at least one CIDR; update the app's public_auth ip_allowlist list"))
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): misconfig wrote a 500 —
+			// surface as apply error so the §12
+			// "edge rule apply rate" chip doesn't stay
+			// at 0 under misconfig attacks. Mirror
+			// applyEdgeRuleIP's PR-B call pattern at
+			// L2055.
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
+		}
+		return true
+	}
+	clientIP, ok := clientIPFromTrustedXFF(r)
+	if !ok {
+		// Defense-in-depth: same posture as applyEdgeRuleIP.
+		// gatewayd-public is required to set exactly one XFF
+		// entry before the unix-socket handoff.
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+			api.CodeForbidden, "Caller IP not in trusted set",
+			"X-Forwarded-For did not contain exactly one entry; refusing to evaluate ingress IP allowlist"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.ingress_ip_forged", nil, map[string]any{
+				"app_id":    app.ID,
+				"from_host": r.Host,
+				"xff_count": len(r.Header.Values("X-Forwarded-For")),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): forged XFF wrote a 403.
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
+		}
+		return true
+	}
+	// netip.Prefix.Contains accepts a netip.Addr, not a net.IP —
+	// convert the trusted client IP via the same parsing path
+	// used elsewhere in the package. The conversion is best-
+	// effort; an unparseable client IP is treated as a forge
+	// (defense-in-depth) rather than a pass-through.
+	//
+	// net.ParseIP returns an IPv4 in 16-byte v4-mapped form
+	// (::ffff:a.b.c.d) by default. netip.AddrFromSlice treats
+	// 16-byte slices as IPv6 — without Unmap() a v4 client IP
+	// would never match a v4 prefix in the allowlist. This is
+	// the same convention the egress allowlist handler uses
+	// (cmd/apid/handlers_ext.go:100-195) for the wire→store
+	// parse, mirrored at the request layer.
+	clientAddr, ok := netip.AddrFromSlice(clientIP)
+	if !ok {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+			api.CodeForbidden, "Caller IP not in trusted set",
+			"X-Forwarded-For contained an unparseable client IP"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.ingress_ip_forged", nil, map[string]any{
+				"app_id":    app.ID,
+				"from_host": r.Host,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): unparseable client IP
+			// wrote a 403 (forge path).
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
+		}
+		return true
+	}
+	clientAddr = clientAddr.Unmap()
+	for _, prefix := range app.PublicAuth.IPAllowlist {
+		if prefix.Contains(clientAddr) {
+			// Pass-through. The matched metric emits the
+			// match outcome so the §12 dashboard renders
+			// non-zero "ingress_ip applied" rather than
+			// only "blocked" — operators want to see the
+			// allow side too.
+			if h.metrics != nil {
+				h.metrics.ObserveEdgeRuleMatch("ingress_ip", "match")
+				// CRIT-3 (review): match is the
+				// apply-success outcome for §12.
+				h.metrics.ObserveEdgeRuleApply("ingress_ip", "success")
+			}
+			return false
+		}
+	}
+	// Implicit deny — every CIDR failed to match.
+	api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+		api.CodeForbidden, "client IP not in allowlist",
+		"client IP does not match any allow CIDR on this app's ingress IP allowlist"))
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.ingress_ip_blocked", nil, map[string]any{
+			"app_id":    app.ID,
+			"from_host": r.Host,
+			"client_ip": clientAddr.String(),
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+		// CRIT-3 (review): implicit deny wrote a 403.
+		h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
+	}
+	return true
 }
 
 // applyAppsMaintenanceMode (ADR-091 amendment / §4.1.2.0) is the
@@ -4406,6 +4568,16 @@ haveApp:
 	// already-rejected traffic). Each helper writes the deny
 	// response + audit + metric on its own; caller MUST `return`.
 	if h.applyEdgeRuleJWT(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+	// ADR-118: per-app ingress IP allowlist runs BEFORE applyEdgeRuleIP
+	// (kind=ip) so an IP-blocked request short-circuits all edge-rule
+	// work and never wakes a Firecracker microVM — same invariant as
+	// the geo gate at L4269. The two gates share the
+	// clientIPFromTrustedXFF trust chain so a forged XFF fails closed
+	// in both layers without double-charging the audit stream.
+	if h.applyIngressIPAllowlist(w, r, app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}

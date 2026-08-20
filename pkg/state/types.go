@@ -427,6 +427,17 @@ type App struct {
 	// plan_egress_allowlist_not_allowed); Pro max 16 entries; Scale
 	// max 64 entries — see pkg/api/limits.go.
 	EgressAllowlist []netip.Prefix
+	// PublicAuthIPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist consulted at the request layer by
+	// pkg/gateway/handler.go::applyIngressIPAllowlist (runs before
+	// applyEdgeRuleIP, before wake). Empty => no rule (current
+	// behaviour preserved); non-empty with mode='ip_allowlist' =>
+	// every public request must originate from a client IP inside
+	// the allowlist, otherwise 403. Plan-gated to Pro/Scale; Free/Hobby
+	// always read empty (apid rejects with 403
+	// plan_public_auth_ip_allowlist_not_allowed). Pro max 16
+	// entries; Scale max 64 entries — same ladder as EgressAllowlist.
+	PublicAuthIPAllowlist []netip.Prefix
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172). 0 means
 	// "disabled" — the trigger skips this app. Plan-gated upstream
@@ -2623,6 +2634,15 @@ type UpdateAppParams struct {
 	// (the default — see migration 00029).
 	EgressAllowlist    *[]netip.Prefix
 	SetEgressAllowlist bool
+	// PublicAuthIPAllowlist (ADR-118) is the per-app ingress CIDR
+	// allowlist. SetPublicAuthIPAllowlist distinguishes "unset"
+	// from "explicit empty". Same nil-pointer semantics as
+	// EgressAllowlist above. The column is
+	// apps.public_auth_ip_allowlist (migration 00308); the DB
+	// trigger rejects non-v4/v6 families and masklen /0 (defence
+	// in depth on top of the apid parse step).
+	PublicAuthIPAllowlist    *[]netip.Prefix
+	SetPublicAuthIPAllowlist bool
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172). SetAutoscaleTargetRPS
 	// distinguishes "unset" (don't touch the column) from "explicit
@@ -2862,9 +2882,10 @@ type AppPublicAuthUpdate struct {
 // (sqlc / state / gateway) all share the same vocabulary;
 // if a fourth is ever added, mirror the constant here.
 const (
-	AppPublicAuthModeOpen   = "open"
-	AppPublicAuthModeBearer = "bearer"
-	AppPublicAuthModeBasic  = "basic"
+	AppPublicAuthModeOpen        = "open"
+	AppPublicAuthModeBearer      = "bearer"
+	AppPublicAuthModeBasic       = "basic"
+	AppPublicAuthModeIPAllowlist = "ip_allowlist"
 )
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

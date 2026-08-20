@@ -753,6 +753,23 @@ type Limits struct {
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
 
+	// PublicAuthIPAllowlistAllowed toggles the per-app ingress IP
+	// allowlist (ADR-118; extends ADR-079's reserved 'ip_allowlist'
+	// enum value). Pro/Scale only — Free/Hobby use edge rules
+	// (kind='ip') for the abuse-floor posture; the per-app
+	// allowlist is the Pro+ feature for SaaS-scale ingress
+	// hygiene, where every CIDR is a deliberate policy decision.
+	// apid's updateApp handler rejects a PATCH with 403
+	// plan_public_auth_ip_allowlist_not_allowed when this is false.
+	PublicAuthIPAllowlistAllowed bool
+	// PublicAuthIPAllowlistMaxEntries is the per-app CIDR-entry
+	// cap. 0 with Allowed=false (Free/Hobby); non-zero with
+	// Allowed=true (Pro: 16; Scale: 64 — mirrors
+	// EgressAllowlistMaxSize exactly). apid's updateApp rejects
+	// with 400 public_auth_ip_allowlist_too_long when the PATCH
+	// body has more entries.
+	PublicAuthIPAllowlistMaxEntries int
+
 	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
 	// default for the per-app two-tier snapshot flag. Free/Hobby =
 	// false (warm-tier apps keep both warm.snap + init.snap, which
@@ -1639,6 +1656,12 @@ var planLimits = map[Plan]Limits{
 		// is the typical Pro-tier reachability graph.
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 16,
+		// PublicAuthIPAllowlist: same shape as egress — paid-only
+		// abuse-desk primitive. 16 entries covers a Pro customer's
+		// "1 office VPN + 1 CI runner + 1 partner API + ~10
+		// regional allowlist ranges" reachability graph.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 16,
 		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
 		// is gated on Pro+ to bound the "scale on CPU without a
 		// min_instances floor" cost shape.
@@ -1900,6 +1923,12 @@ var planLimits = map[Plan]Limits{
 		// the Pro budget tracks the doubling in DeployedApps (25 -> 100).
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 64,
+		// PublicAuthIPAllowlist: 4× Pro's budget tracks Scale's
+		// 4× DeployedApps (25 → 100). SaaS-scale customers with
+		// multi-region deployments routinely enumerate per-region
+		// egress IPs in addition to their office VPN ranges.
+		PublicAuthIPAllowlistAllowed:    true,
+		PublicAuthIPAllowlistMaxEntries: 64,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,
 		// Cron: Scale gets 100 per-app and 500 per-account. 5× Pro's
@@ -3305,6 +3334,38 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// PublicAuthIPAllowlistAllowed reports whether the plan may set a
+// per-app ingress IP allowlist (ADR-118). Pro/Scale only — Free/Hobby
+// use edge rules (kind='ip') for the abuse-floor posture. apid's
+// updateApp handler gates `req.PublicAuthIPAllowlist` on the bool;
+// the handler returns 403 CodePlanPublicAuthIPAllowlistNotAllowed.
+// Unknown plans fail closed (return false) so a missing row never
+// silently unlocks a premium feature — same contract as
+// EgressAllowlistAllowed above.
+func (p Plan) PublicAuthIPAllowlistAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.PublicAuthIPAllowlistAllowed
+}
+
+// PublicAuthIPAllowlistMaxEntries returns the per-plan CIDR-entry
+// cap for the ingress IP allowlist (ADR-118). 0 for Free/Hobby
+// (the gate above rejects before this matters); 16 for Pro; 64
+// for Scale. apid rejects a PATCH whose
+// `req.PublicAuthIPAllowlist` has more entries with 400
+// public_auth_ip_allowlist_too_long. Returning 0 on unknown plans
+// makes a missing plan row a fail-closed denial, not a silent
+// default — same contract as EgressAllowlistMaxSize above.
+func (p Plan) PublicAuthIPAllowlistMaxEntries() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.PublicAuthIPAllowlistMaxEntries
 }
 
 // LivenessAllowed (issue #554 / ADR-078) reports whether the plan
