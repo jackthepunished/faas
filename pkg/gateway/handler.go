@@ -4759,6 +4759,22 @@ haveApp:
 					VaryHash:       computeVaryHash(r, rule.VaryOn),
 				}
 				cw.finishCacheCapture(h.responseCache, key, time.Now())
+			} else {
+				// shouldStore() returned false — bump the
+				// store_skipped counter so the dashboard
+				// chip surfaces "why isn't my cache
+				// populating?". The actual reason is opaque
+				// (predicate veto) — a follow-on ADR can
+				// widen the counter with a `reason` label
+				// if operators need finer breakdown.
+				h.metricsIncCacheOutcome("store_skipped")
+			}
+			// Refresh the occupancy gauges regardless of the
+			// store outcome — the gauge is a snapshot, not a
+			// delta.
+			if h.metrics != nil {
+				h.metrics.responseCacheBytes.Set(float64(h.responseCache.Bytes()))
+				h.metrics.responseCacheEntries.Set(float64(h.responseCache.Len()))
 			}
 		}()
 		// Stash the matched rule on the request ctx so the

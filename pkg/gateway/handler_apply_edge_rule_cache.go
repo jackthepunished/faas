@@ -50,16 +50,25 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	// is one header/cookie lookup, but the security property is
 	// "authed requests are NEVER cached", which means the cache
 	// store path never sees them either.
-	if r.Header.Get("Authorization") != "" {
-		return false, nil
-	}
-	if hasSessionCookie(r) {
+	if r.Header.Get("Authorization") != "" || hasSessionCookie(r) {
+		// ADR-122 §Decision: bypass_authed counter. A non-
+		// zero value here means an app is seeing credentialed
+		// traffic on a cache-rule-matched path — the cache
+		// will never serve them, but the dashboard surfaces
+		// it so operators can confirm the auth bypass is
+		// doing its job.
+		h.metricsIncCacheOutcome("bypass_authed")
 		return false, nil
 	}
 	// Method gate: only {GET, HEAD} are cacheable. POST/PUT/etc.
 	// are method-level uncacheable per ADR-122 D3.
 	method := strings.ToUpper(r.Method)
 	if method != "GET" && method != "HEAD" {
+		// bypass_uncacheable — the path matched a cache rule
+		// but the method isn't cacheable (e.g. POST). The
+		// counter lets operators see whether their rule
+		// matches the customer's actual verb mix.
+		h.metricsIncCacheOutcome("bypass_uncacheable")
 		return false, nil
 	}
 	host := r.Host
@@ -108,6 +117,7 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		// response correctly without the platform emitting
 		// Vary. Operators that need Vary on cached responses
 		// can add it via kind=headers.
+		h.metricsIncCacheOutcome("hit")
 		for k, vs := range entry.header {
 			// Skip hop-by-hop headers that don't survive
 			// into the stored body anyway; mirroring
@@ -125,6 +135,17 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		_, _ = w.Write(entry.body)
 		rec.status = entry.statusCode
 		rec.Bytes = int64(len(entry.body))
+		// Cache hit is a saved wake. Count the metric so the
+		// dashboard reflects "wake-elision". The wakes_avoided
+		// counter is gated on HealthyCount == 0 — only a hit
+		// against a cold app genuinely displaced a wake; a
+		// hit against an already-warm app saves latency but
+		// no compute, and is NOT counted as savings.
+		if h.metrics != nil {
+			if h.backend != nil && h.backend.HealthyCount(app.ID) == 0 {
+				h.metrics.responseCacheWakesAvoided.WithLabelValues(app.ID).Inc()
+			}
+		}
 		// Cache hit is a saved wake. Count the metric so the
 		// dashboard reflects "wake-elision". Commit 15 wires
 		// the wakes_avoided counter + the healthy-check that
@@ -144,12 +165,26 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		// responsibility of commit 13's
 		// applyEdgeRuleCacheStaleOnError wrapper (called
 		// from the gate-failure branch).
+		h.metricsIncCacheOutcome("miss")
 		return false, rule
 	case "":
 		// Miss. Fall through to the wake gate.
+		h.metricsIncCacheOutcome("miss")
 		return false, rule
 	}
+	h.metricsIncCacheOutcome("miss")
 	return false, rule
+}
+
+// metricsIncCacheOutcome (ADR-122 §Decision) is the small
+// helper the applier + writer use to bump a closed-set
+// outcome label. nil-safe: a handler with no metrics (the
+// pre-metrics test corpus) is a no-op.
+func (h *Handler) metricsIncCacheOutcome(outcome string) {
+	if h == nil || h.metrics == nil {
+		return
+	}
+	h.metrics.responseCache.WithLabelValues(outcome).Inc()
 }
 
 // hasSessionCookie reports whether the request carries a session

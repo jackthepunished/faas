@@ -181,6 +181,34 @@ type Metrics struct {
 	// edgeRuleApply tracks per-rule bucket denies, this counter
 	// tracks per-consumer denies within the per-rule scope.
 	routeConsumerThrottleDecisions *prometheus.CounterVec
+	// responseCache (ADR-122 §Decision) is the kind=cache outcome
+	// counter, labelled by `outcome` ∈ {hit, miss, bypass_authed,
+	// bypass_uncacheable, stale_if_error_served, store_skipped}.
+	// hit_rate = hit / (hit + miss + bypass_* + stale_*); the
+	// bypass_* + stale_* outcomes are reported separately so an
+	// operator can see when their hit-rate numerator is being
+	// muted by auth bypasses (suggesting traffic that the cache
+	// will never serve) vs. uncacheable-method bypasses
+	// (suggesting a rule that doesn't match the customer's actual
+	// verb mix). store_skipped captures the cacheability
+	// predicate veto (Set-Cookie / Cache-Control / cap overflow)
+	// so a customer seeing "why isn't my cache populating?"
+	// has a dashboard chip to consult.
+	responseCache *prometheus.CounterVec
+	// responseCacheWakesAvoided (ADR-122 §Decision) counts cache
+	// hits that genuinely displaced a cold boot — i.e. a hit
+	// against an app with zero healthy instances at the moment
+	// of the hit. A hit against an already-warm app saves
+	// latency but no compute, and must NOT be counted as savings
+	// (the honesty property behind the saved-cost figure). Per-
+	// app label (closed by appID cardinality).
+	responseCacheWakesAvoided *prometheus.CounterVec
+	// responseCacheBytes (ADR-122 §Decision) is the in-process
+	// store occupancy gauge; entryBytes is the per-entry
+	// distribution (avg over recent entries). Both surface on
+	// the §12 panel so operators can tune the byte ceiling.
+	responseCacheBytes     prometheus.Gauge
+	responseCacheEntries   prometheus.Gauge
 	// edgeRuleCompileError (ADR-091 hardening PR-A): counter of
 	// compile-time failures inside the cmd-side loader
 	// (cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs). A
@@ -540,6 +568,23 @@ func NewMetrics() *Metrics {
 			Name: "route_consumer_throttle_decisions_total",
 			Help: "Per-consumer throttle decisions, labelled by KeyBy kind (none|api_key|jwt_subject|jwt_claim) and outcome (admit|throttle|anonymous). ADR-104, issue #881 Phase 3.",
 		}, []string{"kind", "outcome"}),
+		// ADR-122 §Decision: kind=cache outcome counter.
+		responseCache: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_response_cache_total",
+			Help: "Edge response-cache outcomes, labelled by outcome (hit|miss|bypass_authed|bypass_uncacheable|stale_if_error_served|store_skipped). hit_rate = hit / (hit + miss). bypass_* outcomes are NOT counted in hit_rate. ADR-122.",
+		}, []string{"outcome"}),
+		responseCacheWakesAvoided: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_response_cache_wakes_avoided_total",
+			Help: "Cache hits that genuinely displaced a cold boot (HealthyCount == 0 at hit time). Per-app; saved-cost surface. ADR-122.",
+		}, []string{"app"}),
+		responseCacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gateway_response_cache_bytes",
+			Help: "In-process kind=cache store occupancy in bytes. ADR-122.",
+		}),
+		responseCacheEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gateway_response_cache_entries",
+			Help: "In-process kind=cache store entry count. ADR-122.",
+		}),
 		// ADR-091 hardening PR-A — compile-time errors caught by
 		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
 		// non-zero value here means a rule shipped broken and was
@@ -981,6 +1026,14 @@ func NewMetrics() *Metrics {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
 	}
+	// ADR-122 §Decision: pre-instantiate the closed
+	// `outcome` set on the response-cache counter so the §12
+	// panel surfaces every outcome from boot. Adding a new
+	// outcome is a code + dashboard change (the closed set
+	// is intentional — label cardinality stays bounded).
+	for _, outcome := range []string{"hit", "miss", "bypass_authed", "bypass_uncacheable", "stale_if_error_served", "store_skipped"} {
+		m.responseCache.WithLabelValues(outcome)
+	}
 	// Phase 3 (ADR-104, issue #881): pre-instantiate the closed
 	// (kind, outcome) cross product for the per-consumer throttle
 	// decision counter. `kind` matches the KeyBy dimension
@@ -1110,7 +1163,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces

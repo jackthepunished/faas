@@ -139,6 +139,13 @@ func (h *Handler) tryServeStaleOnWakeError(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(entry.body)
 	rec.status = entry.statusCode
 	rec.Bytes = int64(len(entry.body))
+	// ADR-122 §Decision: stale_if_error_served is its own
+	// outcome label so the hit-rate numerator cannot be
+	// inflated by stale serves. The dashboard surfaces
+	// stale_if_error_served separately so operators see
+	// when their cache is being relied on as a fallback
+	// rather than as a primary serve path.
+	h.metricsIncCacheOutcome("stale_if_error_served")
 	h.observe(r, entry.statusCode, app.ID, string(app.Plan), false, Target{})
 	return true, "stale_if_error_served"
 }
