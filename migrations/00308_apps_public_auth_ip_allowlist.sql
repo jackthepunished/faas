@@ -105,19 +105,33 @@ create trigger apps_public_auth_ip_allowlist_cidr
 -- +goose Down
 -- +goose StatementBegin
 
--- Down-migrate drops the trigger + function, narrows the CHECK
--- back to the pre-ADR-118 enum, and drops the column. Pattern from
--- 00033's Down section. Column drop is intentional — the table
--- has no readers referencing public_auth_ip_allowlist outside the
--- trigger, and a stale empty column is harmless on a clean reverse.
+-- Down-migrate ordering is load-bearing. We must DROP the column
+-- BEFORE narrowing the CHECK constraint: any row with
+-- public_auth_mode='ip_allowlist' (set by a post-Up customer PATCH)
+-- would otherwise fail the new CHECK with SQLSTATE 23514 and abort
+-- the entire Down with the trigger + function already dropped but
+-- the column and the constraint swap half-applied. Pattern from
+-- migrations/00254_edge_rules_kind_budget.sql:124-141 (CHECK
+-- widening follows the same ordering: data → constraint, never
+-- constraint → data).
+--
+-- Step order:
+--   1. drop trigger — no longer needed once the column is gone
+--   2. drop function — paired with the trigger
+--   3. drop column  — clears mode='ip_allowlist' rows AND their
+--                     CIDR data in one shot, so step 4 has no rows
+--                     to fail on
+--   4. drop + re-add CHECK narrowed to the pre-ADR-118 enum
+--
+-- Reverse of the Up section, mirroring migrations/00033's Down.
 
 drop trigger if exists apps_public_auth_ip_allowlist_cidr on apps;
 drop function if exists apps_public_auth_ip_allowlist_cidr_check();
 
+alter table apps drop column if exists public_auth_ip_allowlist;
+
 alter table apps drop constraint if exists apps_public_auth_mode_chk;
 alter table apps add constraint apps_public_auth_mode_chk
   check (public_auth_mode in ('open','bearer','basic'));
-
-alter table apps drop column if exists public_auth_ip_allowlist;
 
 -- +goose StatementEnd

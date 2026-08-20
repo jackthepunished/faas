@@ -2185,6 +2185,13 @@ func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request
 			"ip_allowlist mode requires at least one CIDR; update the app's public_auth ip_allowlist list"))
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): misconfig wrote a 500 —
+			// surface as apply error so the §12
+			// "edge rule apply rate" chip doesn't stay
+			// at 0 under misconfig attacks. Mirror
+			// applyEdgeRuleIP's PR-B call pattern at
+			// L2055.
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
 		}
 		return true
 	}
@@ -2205,6 +2212,8 @@ func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): forged XFF wrote a 403.
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
 		}
 		return true
 	}
@@ -2234,6 +2243,9 @@ func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+			// CRIT-3 (review): unparseable client IP
+			// wrote a 403 (forge path).
+			h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
 		}
 		return true
 	}
@@ -2247,6 +2259,9 @@ func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request
 			// allow side too.
 			if h.metrics != nil {
 				h.metrics.ObserveEdgeRuleMatch("ingress_ip", "match")
+				// CRIT-3 (review): match is the
+				// apply-success outcome for §12.
+				h.metrics.ObserveEdgeRuleApply("ingress_ip", "success")
 			}
 			return false
 		}
@@ -2264,6 +2279,8 @@ func (h *Handler) applyIngressIPAllowlist(w http.ResponseWriter, r *http.Request
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("ingress_ip", "blocked")
+		// CRIT-3 (review): implicit deny wrote a 403.
+		h.metrics.ObserveEdgeRuleApply("ingress_ip", "error")
 	}
 	return true
 }

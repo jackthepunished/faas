@@ -556,10 +556,31 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// so a customer can verify their PATCH landed without
 		// a second round-trip. The plaintext creds NEVER
 		// appear here — they live in app_secrets (ADR-045).
+		//
+		// IPAllowlistEntryCount (ADR-118 / MED-1
+		// review-fix): gated by mode so a stale column
+		// after a flip to a different mode doesn't
+		// mis-render. After PATCH ip_allowlist → basic
+		// the column retains the prior CIDRs (the Set
+		// bit only fires when the new mode is
+		// ip_allowlist) — returning len() unconditionally
+		// would surface "5" on a basic-mode app. The
+		// OpenAPI docstring at api/openapi.yaml
+		// documents "Always 0 when mode != 'ip_allowlist'"
+		// — this matches. HasBasicCreds is the
+		// analogous gating concern: only meaningful in
+		// basic-mode context, but the field is owned by
+		// the secretbox blob presence which is mode-
+		// intrinsic, so no extra gate needed there.
 		PublicAuth: api.PublicAuthStatus{
-			Mode:                  a.PublicAuthMode,
-			HasBasicCreds:         len(a.PublicAuthBasicSealed) > 0,
-			IPAllowlistEntryCount: len(a.PublicAuthIPAllowlist),
+			Mode:          a.PublicAuthMode,
+			HasBasicCreds: len(a.PublicAuthBasicSealed) > 0,
+			IPAllowlistEntryCount: func() int {
+				if a.PublicAuthMode != api.AppPublicAuthModeIPAllowlist {
+					return 0
+				}
+				return len(a.PublicAuthIPAllowlist)
+			}(),
 		},
 		// Issue #695 / ADR-080: grand-father marker. Set by
 		// migration 00155 on every pre-flip row; null on

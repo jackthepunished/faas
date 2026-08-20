@@ -533,6 +533,33 @@ func TestPublicAuthPatch_IPAllowlistSizeGate(t *testing.T) {
 				rec.Code, rec.Body.String())
 		}
 	})
+	// CRIT-2 regression: the cap must run against the WIRE
+	// length BEFORE dedup, so a customer cannot submit
+	// cap+1 entries with N-1 duplicates and have the
+	// deduped result bypass the cap. Pro cap=16: 17 wire
+	// entries where exactly 1 is a duplicate (16 unique
+	// after dedup) must still 400.
+	t.Run("pro_with_17_wire_16_unique_still_returns_400", func(t *testing.T) {
+		e := setup(t, api.PlanPro)
+		app := seedAppForAudit(t, e, "pa-ip-pro-cap-bypass")
+		entries := make([]string, 17)
+		// First 16 distinct; 17th is a duplicate of #0.
+		for i := 0; i < 16; i++ {
+			entries[i] = fmt.Sprintf("10.%d.0.0/16", i)
+		}
+		entries[16] = entries[0] // dup → 16 unique after dedup
+		rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+			Mode:       api.AppPublicAuthModeIPAllowlist,
+			IPAllowlist: entries,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH 17 wire/16 unique on Pro (cap-bypass attempt): code=%d body=%s; want 400",
+				rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "public_auth_ip_allowlist_too_long") {
+			t.Fatalf("body missing too-long code; got %s", rec.Body.String())
+		}
+	})
 }
 
 // TestPublicAuthPatch_IPAllowlistSlashZeroRejected (ADR-118) pins
@@ -647,5 +674,72 @@ func TestPublicAuthPatch_IPAllowlistAuditEmitsEntryCount(t *testing.T) {
 	if strings.Contains(string(raw), "10.0.0.0/8") ||
 		strings.Contains(string(raw), "192.0.2.0/24") {
 		t.Fatalf("audit row leaked CIDR string: %s", raw)
+	}
+}
+
+// TestPublicAuthPatch_IPAllowlistEntryCountGatedByMode (ADR-118 /
+// MED-1 review-fix) pins the wire contract that
+// PublicAuthStatus.IPAllowlistEntryCount is 0 when the row's
+// mode is NOT ip_allowlist, even if the column carries stale
+// CIDRs from a prior PATCH. Mirrors how HasBasicCreds is
+// intrinsic to the sealed-blob presence (no extra gate).
+//
+// Scenario: Pro customer PATCHes ip_allowlist with 5 CIDRs,
+// then PATCHes mode='basic'. SetPublicAuthIPAllowlist is
+// false on the basic PATCH (mode != ip_allowlist at L949 in
+// handlers_ext.go), so the column retains the 5 stale CIDRs.
+// GET /v1/apps/{slug} must surface ip_allowlist_entry_count=0
+// (per the OpenAPI docstring at api/openapi.yaml:9010 —
+// "Always 0 when mode != 'ip_allowlist'"). Without the gate,
+// the dashboard would render "app X has 5 CIDRs configured"
+// for a basic-mode app.
+func TestPublicAuthPatch_IPAllowlistEntryCountGatedByMode(t *testing.T) {
+	withPublicAuthTestRecipient(t)
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "pa-ip-entry-count-gate")
+
+	// 1. PATCH ip_allowlist with 5 CIDRs.
+	rec := patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode:       api.AppPublicAuthModeIPAllowlist,
+		IPAllowlist: []string{
+			"10.0.0.0/8",
+			"192.0.2.0/24",
+			"203.0.113.0/24",
+			"198.51.100.0/24",
+			"2001:db8::/32",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first PATCH: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 2. PATCH mode='basic' — the column retains 5 stale CIDRs
+	//    because SetPublicAuthIPAllowlist only fires for
+	//    mode='ip_allowlist' (handlers_ext.go:949).
+	rec = patchPublicAuth(t, e, app.Slug, &api.PublicAuthBlock{
+		Mode:      api.AppPublicAuthModeBasic,
+		BasicUser: "editor",
+		BasicPass: "hunter2",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second PATCH: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 3. GET and verify ip_allowlist_entry_count = 0
+	//    (mode='basic' now; the stale column is gated out).
+	rec = e.do(t, "GET", "/v1/apps/"+app.Slug, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.PublicAuth.Mode != api.AppPublicAuthModeBasic {
+		t.Errorf("Mode = %q, want %q", out.PublicAuth.Mode, api.AppPublicAuthModeBasic)
+	}
+	if out.PublicAuth.IPAllowlistEntryCount != 0 {
+		t.Errorf("IPAllowlistEntryCount = %d on basic-mode app; want 0 (gated by mode)",
+			out.PublicAuth.IPAllowlistEntryCount)
 	}
 }

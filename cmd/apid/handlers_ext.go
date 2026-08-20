@@ -194,54 +194,6 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			req.EgressAllowlist = &rewritten
 		}
 	}
-	// ADR-118: parse + dedup the per-app ingress IP allowlist. Mirrors
-	// the egress loop above in spirit but with three deliberate
-	// differences: (1) NO v4-mapped-v6 rewrite — the DB trigger
-	// rejects families outside {4,6} outright, so a v4-mapped entry
-	// is just an invalid entry; (2) NO /8 floor — ingress is
-	// per-customer-list, no operator-side abuse band to enforce at
-	// the handler; (3) insertion order is first-seen-wins like
-	// egress, but the surviving entry count may differ — the
-	// downstream cap check above already ran against the wire length
-	// so a dedup drop doesn't 400 the request. The slot walks past
-	// 00307 (see ADR-118 §Migration for the pre-flight fence).
-	//
-	// The closed-enum validator in dto.go already rejected
-	// mode='ip_allowlist' + len==0 (422 invalid_public_auth_mode),
-	// so reaching this branch means a non-empty wire list is in
-	// hand. Empty-list mode flip (arm-then-add) is the gateway's
-	// loud 500 posture (operator misconfig), not a handler
-	// concern.
-	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeIPAllowlist &&
-		len(req.PublicAuth.IPAllowlist) > 0 {
-		canonicalised := make([]string, 0, len(req.PublicAuth.IPAllowlist))
-		seen := make(map[string]struct{}, len(req.PublicAuth.IPAllowlist))
-		for _, raw := range req.PublicAuth.IPAllowlist {
-			prefix, err := netip.ParsePrefix(raw)
-			if err != nil || prefix.Bits() == 0 {
-				return api.ErrInvalidPublicAuthIPAllowlist(raw,
-					errOrZero("parse failed", err))
-			}
-			// Reject v4-mapped-v6 (RFC 4291 §2.5.5.2). The DB
-			// trigger would 23514 this anyway — catching it here
-			// gives the operator a friendlier error name.
-			if prefix.Addr().Is4In6() {
-				return api.ErrInvalidPublicAuthIPAllowlist(raw,
-					errors.New("v4-mapped prefix not allowed; use the v4 form"))
-			}
-			key := prefix.String()
-			if _, ok := seen[key]; ok {
-				continue // dedup, no dirty-tracking needed at the handler
-			}
-			seen[key] = struct{}{}
-			canonicalised = append(canonicalised, key)
-		}
-		// Always replace the wire form so the audit + downstream
-		// conversion see canonical strings. Even when no dedup
-		// dropped entries, ParsePrefix can canonicalise the
-		// textual form (e.g. 10.0.0.5/8 → 10.0.0.0/8).
-		req.PublicAuth.IPAllowlist = canonicalised
-	}
 	// Issue #169 / #172: per-app reactive scale-up trigger. Plan
 	// gates run first (403 supersedes 422) so a Free account
 	// PATCHing an invalid value surfaces the gate error, not the
@@ -498,16 +450,65 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			if !acct.Plan.PublicAuthIPAllowlistAllowed() {
 				return api.ErrPlanPublicAuthIPAllowlistNotAllowed(acct.Plan)
 			}
-			// Per-app size cap: Pro 16, Scale 64 — mirror
-			// egress. Additive per-account budget doesn't
-			// apply here (the per-app cap is the per-app
-			// cap; egress has an account-level additive
-			// override because abuse-floor budgets are
-			// org-scoped, ingress is per-app).
+			// ADR-118 cap: enforce against the WIRE length
+			// BEFORE dedup, in this same switch arm so
+			// plan-gate → cap → parse → dedup run in source
+			// order (a customer cannot submit cap+1 entries
+			// with N-1 duplicates and have the deduped
+			// result bypass the cap). Mirrors
+			// handlers_ext.go:113-116 (egress cap before
+			// egress dedup). Pro 16, Scale 64. Additive
+			// per-account budget does NOT apply (per-app
+			// cap only).
 			maxEntries := acct.Plan.PublicAuthIPAllowlistMaxEntries()
 			if len(req.PublicAuth.IPAllowlist) > maxEntries {
 				return api.ErrPublicAuthIPAllowlistTooLong(
 					len(req.PublicAuth.IPAllowlist), maxEntries)
+			}
+			// ADR-118 parse + dedup. Lives inside the
+			// switch arm (rather than at the bottom of
+			// validateUpdateApp) so the cap check above
+			// runs against the wire form BEFORE this loop
+			// rewrites it. NO v4-mapped-v6 rewrite — the
+			// DB trigger rejects families outside {4,6}
+			// outright. NO /8 floor — ingress is per-
+			// customer-list, no operator-side abuse band
+			// at the handler. Insertion order is first-
+			// seen-wins. Empty-list mode flip (arm-then-
+			// add) is the gateway's loud 500 posture
+			// (operator misconfig), not a handler concern.
+			if len(req.PublicAuth.IPAllowlist) > 0 {
+				canonicalised := make([]string, 0, len(req.PublicAuth.IPAllowlist))
+				seen := make(map[string]struct{}, len(req.PublicAuth.IPAllowlist))
+				for _, raw := range req.PublicAuth.IPAllowlist {
+					prefix, err := netip.ParsePrefix(raw)
+					if err != nil || prefix.Bits() == 0 {
+						return api.ErrInvalidPublicAuthIPAllowlist(raw,
+							errOrZero("parse failed", err))
+					}
+					// Reject v4-mapped-v6 (RFC 4291
+					// §2.5.5.2). The DB trigger would
+					// 23514 this anyway — catching it
+					// here gives the operator a friendlier
+					// error name.
+					if prefix.Addr().Is4In6() {
+						return api.ErrInvalidPublicAuthIPAllowlist(raw,
+							errors.New("v4-mapped prefix not allowed; use the v4 form"))
+					}
+					key := prefix.String()
+					if _, ok := seen[key]; ok {
+						continue
+					}
+					seen[key] = struct{}{}
+					canonicalised = append(canonicalised, key)
+				}
+				// Always replace the wire form so the
+				// audit + downstream conversion see
+				// canonical strings. ParsePrefix can
+				// canonicalise the textual form (e.g.
+				// 10.0.0.5/8 → 10.0.0.0/8) even when
+				// no dedup dropped entries.
+				req.PublicAuth.IPAllowlist = canonicalised
 			}
 		}
 	}
