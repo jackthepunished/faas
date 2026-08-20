@@ -98,6 +98,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"dispatchDeployments":       "deployments",
 		"dispatchDeployment":        "deployment",
 		"dispatchDeploys":           "deploys",
+		"dispatchDeploysStatus":     "status",
 		"dispatchBuild":             "build",
 		"dispatchInspect":           "inspect",
 		"appSlugFallback":           "app",
