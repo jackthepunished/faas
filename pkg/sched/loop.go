@@ -1780,6 +1780,24 @@ type httpGatewaySynth struct {
 	client     *http.Client
 	basePrefix string
 	log        *slog.Logger
+	// appPublicAuthModeLookup (ADR-119) returns the
+	// public_auth_mode for the given appID. nil = every app
+	// is treated as "open" (no JWT attached on the outbound
+	// synth request). Wired by cmd/schedd/main.go via
+	// WithAppPublicAuthModeLookup; tests construct directly.
+	// The lookup is consulted on EVERY SynthesizeRequest call
+	// — the call is rare (cron cadence, not per-request) so a
+	// store round-trip is acceptable.
+	appPublicAuthModeLookup func(appID string) string
+	// mintInternalSvcToken (ADR-119) mints a JWT for outbound
+	// Authorization: Bearer headers on synth requests targeting
+	// apps whose public_auth_mode='internal_only'. Receives the
+	// appID so the JWT can carry an app_id claim (future
+	// per-app key-pinning). nil = the gate would 403 every
+	// internal_only synth — surfaced as a loud error log so an
+	// operator sees the misconfig. Wired by cmd/schedd/main.go
+	// via WithMintInternalSvcToken; tests construct directly.
+	mintInternalSvcToken func(appID string) (string, error)
 }
 
 // DialGatewaySynth opens an HTTP unix-socket client targeting
@@ -1896,6 +1914,32 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 // socket IS the auth; if tcp is the dial the cluster operator
 // wires a sidecar). If a future change adds TLS to the batch
 // endpoint, thread a *tls.Config through this signature.
+
+// WithAppPublicAuthModeLookup (ADR-119) arms the per-app
+// public_auth_mode lookup used by SynthesizeRequest to decide
+// whether to attach an Authorization: Bearer JWT (apps whose
+// public_auth_mode='internal_only'). Returns the receiver for
+// fluent chaining. nil = no lookup (every app treated as
+// "open"; synth requests never carry Authorization — safe in
+// dev + tests where no app is in internal_only mode).
+func (h *httpGatewaySynth) WithAppPublicAuthModeLookup(lookup func(appID string) string) *httpGatewaySynth {
+	h.appPublicAuthModeLookup = lookup
+	return h
+}
+
+// WithMintInternalSvcToken (ADR-119) arms the JWT minter used
+// by SynthesizeRequest when the app is in internal_only mode.
+// The minter is responsible for choosing svcName (today: hard-
+// coded "schedd"), keypair (today: env-loaded at boot), and
+// TTL (today: ≤30s — see plan). Returns the receiver for fluent
+// chaining. nil = the gate 403s every internal_only synth and
+// the loop logs a loud warning so an operator sees the
+// misconfig.
+func (h *httpGatewaySynth) WithMintInternalSvcToken(mint func(appID string) (string, error)) *httpGatewaySynth {
+	h.mintInternalSvcToken = mint
+	return h
+}
+
 func HTTPClientForGatewaySynthTarget(target string) (*http.Client, string, error) {
 	if target == "" {
 		return nil, "", errors.New("sched: gateway synth target is empty")
@@ -1935,6 +1979,29 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 		return fmt.Errorf("sched: synth request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// ADR-119 — if the app's public_auth_mode is 'internal_only',
+	// attach an Authorization: Bearer JWT so the
+	// SynthServer.applyIngressInternalSvc gate (synth.go:~213)
+	// accepts the wake. The minter is set by
+	// cmd/schedd/main.go from the env-loaded Ed25519 keypair;
+	// the mode lookup reads from the per-app cache. Both are
+	// optional (nil-safe): nil mode-lookup = "open" (no
+	// header), nil minter + internal_only mode = loud warn +
+	// the gate 403s on the receiving end (operator-visible).
+	if h.appPublicAuthModeLookup != nil {
+		if mode := h.appPublicAuthModeLookup(appID); mode == "internal_only" {
+			if h.mintInternalSvcToken == nil {
+				h.log.Warn("sched: app in internal_only mode but no minter wired; gate will 403",
+					"app_id", appID)
+			} else {
+				tok, mErr := h.mintInternalSvcToken(appID)
+				if mErr != nil {
+					return fmt.Errorf("sched: synth mint: %w", mErr)
+				}
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
+	}
 	// issue #517: stamp the per-cron-fire request_id on the
 	// synthetic inbound request so gatewayd-internal's middleware picks it
 	// up unchanged and the downstream wake timeline logs share

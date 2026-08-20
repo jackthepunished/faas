@@ -1472,6 +1472,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Warn("gateway synth dial: cron traffic will not flow until gatewayd-internal is up",
 				"target", synthTarget, "err", dialErr)
 		} else {
+			// ADR-119 — wire the per-app public_auth_mode lookup
+			// + JWT minter so cron traffic reaching an
+			// internal_only app carries Authorization: Bearer.
+			// The mode lookup reads the same per-app cache the
+			// dispatcher already populates (no extra SQL). The
+			// minter is the closure below — it loads the
+			// Ed25519 keypair from FAAS_INTERNAL_SVC_KEY_PATH
+			// at boot and mints a fresh JWT per synth request
+			// (TTL 30s; the §15 plan calls out replay-attack
+			// posture). Both are nil-safe: a dev box without
+			// FAAS_INTERNAL_SVC_KEY_PATH leaves the minter nil
+			// and SynthesizeRequest logs a loud warn +
+			// internal_only requests 403.
+			if minter, mErr := newSchedInternalSvcMinter(log); mErr != nil {
+				log.Warn("schedd: internal-svc minter not wired; internal_only cron requests will 403 until corrected",
+					"err", mErr.Error())
+			} else {
+				sched.ConfigureInternalSvcAuth(synth, sched.PublicAuthModeFromStore(store.AppByID), minter)
+			}
 			loop.WithGatewaySynth(synth)
 		}
 	}

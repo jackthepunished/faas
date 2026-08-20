@@ -653,6 +653,17 @@ type runDeps struct {
 	// mode='basic' returns 500 if hit. Production wires
 	// the secretbox.OpenMulti closure below.
 	publicAuthUnsealer gateway.PublicAuthUnsealer
+	// internalSvcVerifier (ADR-119 / issue #477 #4) is the
+	// per-service public-key allowlist consulted by
+	// applyIngressInternalSvc (handler.go) and
+	// SynthServer.applyIngressInternalSvc (synth.go) when an
+	// app's public_auth_mode='internal_only'. nil = the gate
+	// is disabled — an app in internal_only mode without the
+	// verifier wired would 500 (operator_error) per the
+	// loud-misconfig posture in pkg/gateway/internal_svc_auth.go.
+	// Production wires the env-loaded FAAS_INTERNAL_SVC_PUBKEYS
+	// map below; dev boxes + tests leave it nil.
+	internalSvcVerifier gateway.InternalSvcVerifier
 	// scheddClient is the ScheddClient interface (production: a
 	// single *scheddgrpc.Client from the per-node cache) used by
 	// AppLogsHandler (issue #254 / Move 4 PR-2) and the warm hint
@@ -1294,6 +1305,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 		}
 	}
+	// ADR-119 — load FAAS_INTERNAL_SVC_PUBKEYS (JSON document
+	// mapping svcName → PEM-encoded Ed25519 public key). The
+	// env is read once at boot; runtime rotation is a
+	// follow-up (ADR-120 candidate — see plan). nil = no
+	// apps in internal_only mode should be reachable, and
+	// the gate 500s loudly rather than fail-open. Production
+	// wires schedd at minimum; meterd / future daemons add
+	// keys to the same JSON map.
+	if rawPubkeys, ok := os.LookupEnv("FAAS_INTERNAL_SVC_PUBKEYS"); ok && rawPubkeys != "" {
+		var perSvc map[string]string
+		if err := json.Unmarshal([]byte(rawPubkeys), &perSvc); err != nil {
+			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is not valid JSON; internal_only mode will 500 until corrected",
+				"err", err.Error())
+		} else if len(perSvc) == 0 {
+			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is empty; internal_only mode will 500 until corrected")
+		} else {
+			deps.internalSvcVerifier = newInternalSvcVerifierFromPEMs(perSvc)
+			log.Info("gatewayd-internal: internal_only verifier loaded",
+				"svc_count", len(perSvc))
+		}
+	}
 	// The scheddClient reference is needed by AppLogsHandler (PR-2).
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
@@ -1541,6 +1573,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cmd/apid uses). nil-safe: tests + dev boxes that don't
 	// wire either pass through the per-request unseal path.
 	handler.WithPublicAuth(deps.publicAuthCache, deps.publicAuthUnsealer)
+	// ADR-119 — wire the per-service public-key allowlist into
+	// the Handler so applyIngressInternalSvc (handler.go:~4586
+	// area) can validate Authorization: Bearer JWTs on apps
+	// whose public_auth_mode='internal_only'. The same verifier
+	// is consulted by the synth-side gate
+	// (pkg/gateway/synth.go::SynthServer.handleSynthesize) via
+	// the SynthServer dependency wiring — single source of
+	// truth on the verifier.
+	handler.WithInternalSvcVerifier(deps.internalSvcVerifier)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
 	// producer channel. The sink is shared between Handler.recordEgress
 	// (writer) and egressgrpc.Server (drainer-on-cadence reader).

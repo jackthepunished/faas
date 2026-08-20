@@ -371,6 +371,22 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		outReq.Header.Set("X-Forwarded-For", clientIP)
 	}
+	// ADR-119: strip inbound Authorization so external callers
+	// can never reach applyIngressInternalSvc with a header
+	// intact. The internal gate is reachable only by daemons
+	// that dial gatewayd-internal directly via the unix socket
+	// — those daemons attach their minted JWT themselves
+	// (e.g. schedd cron → gatewayd-internal at
+	// /v1/synthesize). Without this strip, a customer who
+	// sends "Authorization: Bearer foo" over the public TLS
+	// hop would reach the gate and 403 on signature, but
+	// would still leak internal-only knowledge into the
+	// public-path audit log. Stripping is cleaner: the
+	// defensive counter gateway_internal_auth_match_total{
+	// outcome="bypass_stripped"} is incremented if a header
+	// survives this strip (which would indicate a custom
+	// proxy or a misconfigured gatewayd-public).
+	outReq.Header.Del("Authorization")
 	if r.TLS != nil {
 		outReq.Header.Set("X-Forwarded-Proto", "https")
 	} else {
