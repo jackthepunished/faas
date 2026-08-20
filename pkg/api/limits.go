@@ -631,6 +631,35 @@ type Limits struct {
 	// Same per-app floor + 25× scale ceiling.
 	ConsumerKeysPerAccount int
 
+	// OpenAPIDocsPerDeployment caps how many captured OpenAPI
+	// docs (ADR-122 / issue #975 item #1) one deployment may own.
+	// The schema is 1 row per deployment (PRIMARY KEY on
+	// deployment_id), so the per-deployment cap is effectively 1
+	// — the field exists for forward-compatibility (issue #975
+	// item #2 may want multiple doc formats per deployment).
+	// Per-plan: Free 0, Hobby 1, Pro 1, Scale 1. Free is 0 — the
+	// apid PATCH handler returns 402 CodePlanOpenAPIDocsNotAllowed
+	// before the store is touched; the microVM still captures the
+	// doc during cold boot but never serves it via apid.
+	OpenAPIDocsPerDeployment int
+	// OpenAPIDocMaxBytes caps the body size of one captured /
+	// uploaded OpenAPI doc. Per-plan: Free 0 (irrelevant), Hobby
+	// 131072, Pro 131072, Scale 131072. The cap layers on top of
+	// the global constant state.OpenAPIDocMaxBytes (128 KiB) — the
+	// guest-init probe hard-truncates at the global cap; the apid
+	// PATCH handler validates against the per-plan cap and
+	// returns 413 CodePlanOpenAPIDocTooLarge on overflow.
+	OpenAPIDocMaxBytes int
+	// OpenAPIDocsPerAccount caps how many captured OpenAPI docs
+	// one account may own across all its deployments. Per-plan:
+	// Free 0, Hobby 100, Pro 1000, Scale 10000. The cap is the
+	// per-account quota that the apid PATCH handler enforces
+	// via Store.CountOpenAPIDocsByAccount (the apid tail-call
+	// arrives when the count == cap, before the INSERT). Scale
+	// gives 10× Pro to mirror the consumer_keys 25× scale ceiling
+	// scaled down by 2.5× (OpenAPI docs are larger + rarer).
+	OpenAPIDocsPerAccount int
+
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
 	// defends against a SaaS customer pinning one surface per
@@ -1234,6 +1263,15 @@ var planLimits = map[Plan]Limits{
 		// Free is gated to 0 consumer keys — mirrors CronLimitPerApp/OrgMembersMax 0/0 posture.
 		ConsumerKeysPerApp:     0,
 		ConsumerKeysPerAccount: 0,
+		// Open API docs (ADR-122 / issue #975 item #1). Free is
+		// gated to 0 — the apid GET / PATCH handlers return 402
+		// CodePlanOpenAPIDocsNotAllowed. The microVM still
+		// captures the doc during cold boot but the row is never
+		// served (the count is 0 so the per-account quota can't
+		// trip either).
+		OpenAPIDocsPerDeployment: 0,
+		OpenAPIDocMaxBytes:       0,
+		OpenAPIDocsPerAccount:    0,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1526,6 +1564,13 @@ var planLimits = map[Plan]Limits{
 		// big-leap on this primitive).
 		ConsumerKeysPerApp:     100,
 		ConsumerKeysPerAccount: 250,
+		// Open API docs (ADR-122 / issue #975 item #1). Hobby
+		// is the entry paid tier — 1 doc per deployment (the
+		// schema's natural shape), 100 docs per account, 128
+		// KiB per doc (the global cap).
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    100,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1812,6 +1857,12 @@ var planLimits = map[Plan]Limits{
 		// keys each fits comfortably with headroom.
 		ConsumerKeysPerApp:     100,
 		ConsumerKeysPerAccount: 2500,
+		// Open API docs (ADR-122 / issue #975 item #1). Pro keeps
+		// the 1/deployment shape; 1000 per account (10× Hobby to
+		// match the consumer_keys 2500-vs-250 ratio).
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    1000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -2093,6 +2144,13 @@ var planLimits = map[Plan]Limits{
 		// cardinality, so the upgrade ladder is one number.
 		ConsumerKeysPerApp:     1000,
 		ConsumerKeysPerAccount: 25000,
+		// Open API docs (ADR-122 / issue #975 item #1). Scale keeps
+		// the 1/deployment shape; 10000 per account (10× Pro, same
+		// 10× ratio as Hobby→Pro). The byte cap stays at 128 KiB —
+		// the global cap is the binding constraint, not the per-plan.
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    10000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -4143,6 +4201,55 @@ func (p Plan) ConsumerKeysPerAccount() int {
 		return 0
 	}
 	return l.ConsumerKeysPerAccount
+}
+
+// OpenAPIDocsPerDeployment (ADR-122 / issue #975 item #1) returns
+// the per-deployment cap on captured OpenAPI docs. The schema
+// is 1 row per deployment (PRIMARY KEY on deployment_id), so the
+// per-deployment cap is effectively 1 across all paid plans.
+// Free returns 0 — the apid PATCH handler returns 402
+// CodePlanOpenAPIDocsNotAllowed before the store is touched.
+// Unknown plans fail closed (return 0) — same contract as
+// ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocsPerDeployment() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocsPerDeployment
+}
+
+// OpenAPIDocMaxBytes (ADR-122 / issue #975 item #1) returns the
+// per-plan byte cap on one captured / uploaded OpenAPI doc.
+// Per-plan: Free 0 (irrelevant), Hobby/Pro/Scale 131072 (the
+// global cap state.OpenAPIDocMaxBytes). The apid PATCH handler
+// validates against this value and returns 413
+// CodePlanOpenAPIDocTooLarge on overflow. Unknown plans fail
+// closed (return 0) — same contract as ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocMaxBytes() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocMaxBytes
+}
+
+// OpenAPIDocsPerAccount (ADR-122 / issue #975 item #1) returns
+// the per-account cap on captured OpenAPI docs across all of
+// the account's deployments. Per-plan: Free 0, Hobby 100, Pro
+// 1000, Scale 10000. The apid PATCH handler enforces via
+// Store.CountOpenAPIDocsByAccount (the count is computed
+// server-side, not by walking the row set). Independent of
+// OpenAPIDocsPerDeployment — the per-account ceiling is reached
+// before the per-deployment ceiling on a typical multi-app
+// customer. Unknown plans fail closed (return 0) — same
+// contract as ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocsPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocsPerAccount
 }
 
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan

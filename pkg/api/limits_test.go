@@ -131,7 +131,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// to 0 (the abuse-floor tier cannot host multi-tenant
 			// consumer surfaces — mirrors CronLimitPerApp/OrgMembersMax
 			// 0/0 posture). Handler returns 402 CodeConsumerKeysNotAllowed.
-			ConsumerKeysPerApp: 0, ConsumerKeysPerAccount: 0},
+			ConsumerKeysPerApp: 0, ConsumerKeysPerAccount: 0,
+			// ADR-122 / issue #975 item #1: endpoint discovery — Free
+			// is gated to 0/0/0 (same fail-closed posture as consumer keys).
+			// apid GET / PATCH return 402 CodePlanOpenAPIDocsNotAllowed.
+			OpenAPIDocsPerDeployment: 0, OpenAPIDocMaxBytes: 0, OpenAPIDocsPerAccount: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -265,7 +269,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// is the same one-app-many-keys demand that Pro addresses
 			// at higher concurrency). Account ceiling is the abuse
 			// floor; Hobby's typical 5-app footprint stays well under.
-			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 250},
+			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 250,
+			// ADR-122 / issue #975 item #1: Hobby is the entry paid
+			// tier — 1/dep, 100/acct, 128 KiB/doc.
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 100},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -392,7 +399,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (the per-app ceiling × DeployedApps fits inside the per-
 			// account envelope, so neither side trips first on the
 			// typical Pro customer).
-			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 2500},
+			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 2500,
+			// ADR-122 / issue #975 item #1: Pro keeps 1/dep
+			// (PK constraint), 1000/acct (10× Hobby).
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 1000},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, CertExpiryWarningDays: 30, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -525,7 +535,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// is the abuse-floor — the typical Scale customer
 			// (multi-tenant SaaS broker) uses 25-30% of the budget per
 			// app, well under 100/app and 25000/acct envelopes.
-			ConsumerKeysPerApp: 1000, ConsumerKeysPerAccount: 25000},
+			ConsumerKeysPerApp: 1000, ConsumerKeysPerAccount: 25000,
+			// ADR-122 / issue #975 item #1: Scale keeps 1/dep,
+			// 10000/acct (10× Pro). Byte cap stays at 128 KiB
+			// (global cap is the binding constraint).
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 10000},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -2620,5 +2634,101 @@ func TestPlanConsumerKeysLimits_MonotonicLadder(t *testing.T) {
 				ladder[i], currL.ConsumerKeysPerAccount,
 				ladder[i-1], prevL.ConsumerKeysPerAccount)
 		}
+	}
+}
+
+// TestPlanOpenAPIDocLimits pins the per-plan OpenAPI doc cap
+// ladder (ADR-122 / issue #975 item #1, migrations/00330). The
+// progression matches the documented per-plan posture:
+//
+//	Free  = 0/dep 0/acct 0 bytes (gated off — apid returns 402
+//	                            CodePlanOpenAPIDocsNotAllowed)
+//	Hobby = 1/dep 100/acct 131072 bytes (entry paid — 128 KiB is
+//	                                     the global cap)
+//	Pro   = 1/dep 1000/acct 131072 bytes (10× Hobby on per-account)
+//	Scale = 1/dep 10000/acct 131072 bytes (10× Pro on per-account)
+//
+// The per-deployment cap is 1 across all paid plans because the
+// schema's PRIMARY KEY is deployment_id. The per-account cap
+// scales 10× across the upgrade ladder — the openapi docs are
+// larger + rarer than consumer keys (which scale 25×), so the
+// 10× number keeps the dollar/GB-h economics balanced. Unknown
+// plans fail closed (return 0 on all three caps) so a missing
+// plan row never silently unlocks the primitive.
+func TestPlanOpenAPIDocLimits(t *testing.T) {
+	cases := []struct {
+		plan       Plan
+		wantPerDep int
+		wantPerAcct int
+		wantBytes  int
+	}{
+		{PlanFree, 0, 0, 0},
+		{PlanHobby, 1, 100, 131072},
+		{PlanPro, 1, 1000, 131072},
+		{PlanScale, 1, 10000, 131072},
+		{Plan("unknown"), 0, 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.OpenAPIDocsPerDeployment(); got != c.wantPerDep {
+			t.Errorf("%s.OpenAPIDocsPerDeployment() = %d, want %d", c.plan, got, c.wantPerDep)
+		}
+		if got := c.plan.OpenAPIDocsPerAccount(); got != c.wantPerAcct {
+			t.Errorf("%s.OpenAPIDocsPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+		if got := c.plan.OpenAPIDocMaxBytes(); got != c.wantBytes {
+			t.Errorf("%s.OpenAPIDocMaxBytes() = %d, want %d", c.plan, got, c.wantBytes)
+		}
+	}
+}
+
+// TestPlanOpenAPIDocLimits_MonotonicLadder pins that the per-plan
+// OpenAPI doc cap ladder is non-decreasing across the upgrade
+// curve. A regression where Pro < Hobby or Scale < Pro breaks the
+// upgrade story; a customer who outgrows Hobby should land on a
+// higher Pro number, not a lower one.
+func TestPlanOpenAPIDocLimits_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.OpenAPIDocsPerDeployment < prevL.OpenAPIDocsPerDeployment {
+			t.Errorf("%s.OpenAPIDocsPerDeployment (%d) < %s.OpenAPIDocsPerDeployment (%d)",
+				ladder[i], currL.OpenAPIDocsPerDeployment,
+				ladder[i-1], prevL.OpenAPIDocsPerDeployment)
+		}
+		if currL.OpenAPIDocsPerAccount < prevL.OpenAPIDocsPerAccount {
+			t.Errorf("%s.OpenAPIDocsPerAccount (%d) < %s.OpenAPIDocsPerAccount (%d)",
+				ladder[i], currL.OpenAPIDocsPerAccount,
+				ladder[i-1], prevL.OpenAPIDocsPerAccount)
+		}
+		// OpenAPIDocMaxBytes is the same across paid plans — the
+		// global cap is the binding constraint. The Free=0 vs
+		// paid=131072 step-up is the only monotonic check needed.
+		if currL.OpenAPIDocMaxBytes < prevL.OpenAPIDocMaxBytes {
+			t.Errorf("%s.OpenAPIDocMaxBytes (%d) < %s.OpenAPIDocMaxBytes (%d)",
+				ladder[i], currL.OpenAPIDocMaxBytes,
+				ladder[i-1], prevL.OpenAPIDocMaxBytes)
+		}
+	}
+}
+
+// TestPlanOpenAPIDocConstants verifies the cross-package constant
+// state.OpenAPIDocMaxBytes matches the per-plan Hobby/Pro/Scale
+// value. A drift between the constant and the per-plan value
+// would mean the guest-init probe truncates at one cap and the
+// apid PATCH validates against another — the customer sees a
+// doc captured at a size the apid refuses to serve.
+func TestPlanOpenAPIDocConstants(t *testing.T) {
+	hobbyCap := PlanHobby.OpenAPIDocMaxBytes()
+	proCap := PlanPro.OpenAPIDocMaxBytes()
+	scaleCap := PlanScale.OpenAPIDocMaxBytes()
+	if got, want := hobbyCap, 131072; got != want {
+		t.Errorf("Hobby.OpenAPIDocMaxBytes = %d, want %d", got, want)
+	}
+	if got, want := proCap, 131072; got != want {
+		t.Errorf("Pro.OpenAPIDocMaxBytes = %d, want %d", got, want)
+	}
+	if got, want := scaleCap, 131072; got != want {
+		t.Errorf("Scale.OpenAPIDocMaxBytes = %d, want %d", got, want)
 	}
 }

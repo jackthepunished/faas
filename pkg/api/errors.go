@@ -2160,6 +2160,78 @@ const CodePlanConsumerKeyQuotaReached = "plan_consumer_key_quota_reached"
 // authors can write a single switch on plan-gated codes.
 const CodeConsumerKeysNotAllowed = "consumer_keys_not_allowed"
 
+// CodePlanOpenAPIDocQuotaReached is the RFC 7807 stable code
+// returned when the per-deployment or per-account deployment_openapi_docs
+// quota is exhausted (ADR-122 / issue #975 item #1). The apid PATCH
+// handler returns 403 with this code on attempts that exceed
+// Plan.OpenAPIDocsPerDeployment or Plan.OpenAPIDocsPerAccount.
+// Why stable: the apid SDK surfaces map this code to a typed
+// error class so customers can write a single handler for the
+// quota-exhausted case without parsing the prose body — same
+// shape as CodePlanConsumerKeyQuotaReached.
+const CodePlanOpenAPIDocQuotaReached = "plan_openapi_doc_quota_reached"
+
+// CodePlanOpenAPIDocTooLarge is the RFC 7807 stable code returned
+// when the customer-uploaded OpenAPI body exceeds the per-plan
+// byte cap (ADR-122 §D4). The apid PATCH handler returns 413 with
+// this code on attempts that exceed Plan.OpenAPIDocMaxBytes.
+// Why stable: the apid SDK surfaces map this code to a typed
+// error class so customers can pre-validate the doc size before
+// attempting the upload — same shape as CodePlanConsumerKeyQuotaReached.
+const CodePlanOpenAPIDocTooLarge = "plan_openapi_doc_too_large"
+
+// CodePlanOpenAPIDocsNotAllowed is the RFC 7807 stable code
+// returned when the customer's plan is gated off the endpoint
+// discovery feature entirely (Free tier; mirrors
+// CodeConsumerKeysNotAllowed). The apid GET / PATCH handlers
+// return 402 plan_not_allowed with this code on attempts.
+// Why stable: mirrors CodeConsumerKeysNotAllowed shape so SDK
+// authors can write a single switch on plan-gated codes.
+const CodePlanOpenAPIDocsNotAllowed = "openapi_docs_not_allowed"
+
+// ErrPlanOpenAPIDocsNotAllowed (ADR-122 / issue #975 item #1) is
+// returned by the apid endpoint-discovery handlers when the
+// customer's plan has OpenAPIDocsPerDeployment == 0 (Free today).
+// Fires BEFORE loadApp so a Free customer posting to a non-existent
+// slug gets a clean 402 instead of a 404 that would leak the slug's
+// existence. Mirrors ErrPlanAlertRulesNotAllowed.
+func ErrPlanOpenAPIDocsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanOpenAPIDocsNotAllowed,
+		"Endpoint discovery unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include endpoint discovery; upgrade to Hobby or above to capture OpenAPI documents.", p)).
+		WithLimit(0, 0).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
+
+// ErrPlanOpenAPIDocQuota (ADR-122 / issue #975 item #1) is returned
+// when the per-account OpenAPI doc quota is reached. 403 because
+// the plan DOES unlock discovery — the right copy is "delete a
+// doc to add another", not "upgrade to Hobby". Mirrors
+// ErrPlanAlertRuleQuota.
+func ErrPlanOpenAPIDocQuota(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanOpenAPIDocQuotaReached,
+		"OpenAPI document limit reached",
+		fmt.Sprintf("%s plan caps OpenAPI documents at %d per account; you have %d. Delete one to add another.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
+
+// ErrPlanOpenAPIDocTooLarge (ADR-122 / issue #975 item #1) is
+// returned when the customer-uploaded OpenAPI body exceeds the
+// per-plan byte cap. 413 (not 422) because the body is a
+// well-formed JSON document that just happens to be too large —
+// the same posture as a request-payload Too Large. Mirrors
+// ErrPlanConsumerKeyQuotaReached.
+func ErrPlanOpenAPIDocTooLarge(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusRequestEntityTooLarge, CodePlanOpenAPIDocTooLarge,
+		"OpenAPI document exceeds the per-plan byte cap",
+		fmt.Sprintf("%s plan caps OpenAPI documents at %d bytes; yours is %d. Trim paths or split the spec.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
+
 // PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
 // *Quota functions receive in their `scope` argument. Mirrors
 // state.CronQuotaScopeAccount / CronQuotaScopeApp and the alert /
