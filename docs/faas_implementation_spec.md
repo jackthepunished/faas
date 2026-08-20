@@ -1010,6 +1010,46 @@ without re-running the build.
 - `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoLiteralDocsDomainEverywhere` —
   every docs URL routes through `wire.DocsHost`.
 
+### 6.4.2 Explanation surfaces (error-explanations cluster, amendment 2 — Cluster A)
+
+Amendment 1 (§6.4.1) closed detection → wire → DB → CLI render. Amendment 2
+closes two remaining seams so the cluster is end-to-end visible:
+
+1. **Dashboard rendering of the persisted prose.** The deployment-detail
+   page (`pkg/dashboard/templates/deployment_detail.html`) now renders
+   `ErrorCode / ErrorHint / ErrorWhy / ErrorFix / ErrorRelevantLogs` as
+   a conditional `.error-explanation` section. The section is gated on
+   `{{ if .Data.Deployment.ErrorCode }}` so legacy pre-amendment-1 rows
+   render unchanged (no `.error-explanation` element when the code is
+   empty). The 5 fields are projected from the `state.Deployment` row
+   via `cmd/apid/handlers_dashboard.go::dashboardDeploymentItem`. Test
+   fixtures: `pkg/dashboard/dashboard_test.go::TestRender_DeploymentDetail_StatelessViolation`
+   (asserts the 5 prose blocks render) and `…_LegacyRowRenders` (asserts
+   the conditional section is absent on legacy rows).
+2. **Pre-upload doctor gate.** `gregale deploy --doctor-strict` runs
+   `runDoctorChecks(cwd)` BEFORE any HTTP / pack. Error-class findings
+   (currently `stateless_only_violation` via the top-level `data/`
+   discriminator) exit 1 with the doctor report printed to stderr; the
+   upload never starts, so a customer who runs the flag from CI gets
+   the same prose locally that the server would have 422'd on. Warnings
+   render + continue (mirrors the standalone `gregale doctor` semantics).
+   Scope: `--doctor-strict` (not `--strict` — already taken by the
+   `--diff` deploy-diff cluster). Flag name is guarded by
+   `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_DoctorStrictMutex`,
+   which fails on any new unscoped `--strict` Bool/String declaration
+   outside the two documented call sites.
+
+`app_healthz_unauthorized` forward-compat (amendment 2, sub-task 1):
+the guest-init → vmmd probe wire now carries a `WWWAuthenticate` field
+on `livenessResp` / `livenessResponseBody` (omitempty JSON). Today's
+discriminator is closed-set (any 401/403 → `livenessOutcomeUnauthorized`),
+but the new field lets a future platform-side probe auth PR read the
+realm without another wire-shape bump. Closed-set comment drift fix
+on `pkg/fcvm/metrics.go:324` and `cmd/vmmd/liveness_recv.go:67-87`
+adds the 6th outcome to the listed set. New unit tests in
+`cmd/vmmd/liveness_recv_test.go` cover `livenessOutcomeUnauthorized`
++ `livenessOutcomeUnauthorized` reset-on-success + the 403 arm.
+
 ---
 
 ## 7. Networking
