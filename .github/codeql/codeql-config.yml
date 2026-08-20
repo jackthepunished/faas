@@ -1,6 +1,7 @@
 # CodeQL analysis configuration.
 #
-# Issue #995 / ADR-121 — path exclusions go/reflected-xss
+# Issue #995 / ADR-121 — path exclusions (regular expressions per the
+# CodeQL config docs).
 #
 # Only one entry below; expand deliberately. Each line represents a
 # false-positive suppression that has been vetted through the project's
@@ -24,5 +25,10 @@
 # pass-through pattern with the same architectural rationale
 # (loopback-bound, type-restricted upstream responses, no body
 # templating on the writer path).
+#
+# Pattern syntax: CodeQL paths-ignore entries are regular expressions
+# (CodeQL config docs, §"Filter pattern syntax"). Anchor with ^...$
+# and escape literal regex metacharacters (\. for the .) so the match
+# is exact against the file path.
 paths-ignore:
-  - cmd/gatewayd-internal/proxy.go
+  - '^cmd/gatewayd-internal/proxy\.go$'
