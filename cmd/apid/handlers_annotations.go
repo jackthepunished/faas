@@ -15,7 +15,7 @@
 //
 // Centralising the seam here keeps the three handlers from drifting
 // on validation rules + audit-key naming. The DB CHECK at
-// migrations/00321_deployments_annotation.sql is the source of
+// migrations/00339_deployments_annotation.sql is the source of
 // truth for length / closed-set / >0; this file mirrors them so
 // a customer gets a clean 422 instead of a 500 from the constraint
 // trip.
@@ -44,12 +44,12 @@ type annotationForm struct {
 
 // annotationTags is the canonical closed-set vocabulary for the
 // annotation tag field (issue #977 / ADR-116). Mirrors the DB CHECK
-// at migrations/00321_deployments_annotation.sql. Hoisted into a
+// at migrations/00339_deployments_annotation.sql. Hoisted into a
 // package-level constant so the validator and the rejection-message
 // builder share the same source of truth (goconst flags the inline
 // literals otherwise).
 //
-// Source of truth: migrations/00321_deployments_annotation.sql.
+// Source of truth: migrations/00339_deployments_annotation.sql.
 // The CLI's DeploymentAnnotationTags list (cmd/gregale/cmd_deploy_
 // annotations.go) is the same vocabulary; drift is caught by the
 // CLI's TestDeploymentAnnotationTags_MirrorsDB.
@@ -129,7 +129,7 @@ func annotationFromRequest(req api.SourceRefDeployRequest) annotationForm {
 }
 
 // validateAnnotationForm checks the annotationForm against the DB
-// CHECKs at migrations/00321_deployments_annotation.sql. Returns
+// CHECKs at migrations/00339_deployments_annotation.sql. Returns
 // an RFC 7807 problem on rejection, nil on success. Empty
 // annotationForm (no fields set) always validates — callers that
 // don't care about annotations stay on the pre-feature wire.

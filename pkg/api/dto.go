@@ -1552,7 +1552,7 @@ type DeploymentResponse struct {
 	// GitHub-API correlation.
 	PusherLogin string `json:"pusher_login,omitempty"`
 	// Annotation echo (issue #977 / ADR-116). Mirrors the four
-	// columns from migration 00334 verbatim onto the wire so the
+	// columns from migration 00339 verbatim onto the wire so the
 	// dashboard, CLI history, and SDK consumers can render the
 	// annotation without an audit round-trip. omitempty on each
 	// so pre-feature rows return the old wire shape with all
