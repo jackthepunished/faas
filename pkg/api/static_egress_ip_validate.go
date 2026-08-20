@@ -10,19 +10,19 @@
 //
 // Four layers consume this gate today:
 //
-//   1. cmd/apid/handlers_apps_static_egress_ip.go (the customer-facing
-//      400 gate at PUT time). Fast-fails before the column write so a
-//      typo'd IP gets surfaced inline rather than at egress-renderer
-//      time.
-//   2. pkg/fcvm/manager.go (wire-side defence at Wake time). apid may
-//      have validated but a vmmd that forgets to re-validate must not
-//      be able to smuggle a bad IP past the bridge alias.
-//   3. cmd/vmmd/egress_static_ip_bundle.go (operator-side defence at
-//      TOML bundle load time). An operator typo in
-//      /etc/faas/egress/static_egress_ips.toml must not pin a reserved
-//      IP.
-//   4. pkg/netns/static_egress_ip_metal_test.go (metal acceptance gate
-//      — test fixture IP must pass).
+//  1. cmd/apid/handlers_apps_static_egress_ip.go (the customer-facing
+//     400 gate at PUT time). Fast-fails before the column write so a
+//     typo'd IP gets surfaced inline rather than at egress-renderer
+//     time.
+//  2. pkg/fcvm/manager.go (wire-side defence at Wake time). apid may
+//     have validated but a vmmd that forgets to re-validate must not
+//     be able to smuggle a bad IP past the bridge alias.
+//  3. cmd/vmmd/egress_static_ip_bundle.go (operator-side defence at
+//     TOML bundle load time). An operator typo in
+//     /etc/faas/egress/static_egress_ips.toml must not pin a reserved
+//     IP.
+//  4. pkg/netns/static_egress_ip_metal_test.go (metal acceptance gate
+//     — test fixture IP must pass).
 //
 // All four used to be near-identical implementations. Drift was a
 // real risk: a future maintainer adding e.g. 198.18.0.0/15
@@ -37,15 +37,15 @@
 // (the SMTP block lives on the host firewall, not the IP choice).
 //
 // Deny set (v1, deliberately narrow):
-//   * IPv4 only (v6 deferred to follow-up ADR)
-//   * RFC1918 (10/8, 172.16/12, 192.168/16)
-//   * CGN (100.64/10)
-//   * Link-local v4 (169.254/16) + IsLinkLocalUnicast + IsLinkLocalMulticast
-//   * Multicast (224/4) + IsMulticast
-//   * Loopback + IsUnspecified (0.0.0.0)
+//   - IPv4 only (v6 deferred to follow-up ADR)
+//   - RFC1918 (10/8, 172.16/12, 192.168/16)
+//   - CGN (100.64/10)
+//   - Link-local v4 (169.254/16) + IsLinkLocalUnicast + IsLinkLocalMulticast
+//   - Multicast (224/4) + IsMulticast
+//   - Loopback + IsUnspecified (0.0.0.0)
 //
 // Deliberately NOT denied:
-//   * TEST-NET-1/2/3 (192.0.2/24, 198.51.100/24, 203.0.113/24) —
+//   - TEST-NET-1/2/3 (192.0.2/24, 198.51.100/24, 203.0.113/24) —
 //     these are public blocks reserved for documentation; a customer
 //     may legitimately BYOIP from them. Denying would reject
 //     "203.0.113.42" even though that's a legal public IP for them

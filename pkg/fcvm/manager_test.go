@@ -2662,13 +2662,13 @@ func TestWakeRejectsStaticEgressIP_NotV4(t *testing.T) {
 	run := &fakeRunner{}
 	m := newTestManager(run, &fakeVMM{})
 	_, err := m.Wake(context.Background(), WakeRequest{
-		Instance:        "vw-static-v6",
-		BaseKey:         "/b.ext4",
-		LayerKey:        "/l.ext4",
-		VcpuCount:       2,
-		MemSizeMiB:      128,
-		Plan:            api.PlanScale,
-		StaticEgressIP:  "::1",
+		Instance:       "vw-static-v6",
+		BaseKey:        "/b.ext4",
+		LayerKey:       "/l.ext4",
+		VcpuCount:      2,
+		MemSizeMiB:     128,
+		Plan:           api.PlanScale,
+		StaticEgressIP: "::1",
 	})
 	if err == nil {
 		t.Fatal("Wake with IPv6 static IP: expected error, got nil")

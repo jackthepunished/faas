@@ -346,9 +346,9 @@ func TestStaticEgressIP_ValidCustomerEgressIPTableDriven(t *testing.T) {
 		{"172.31.255.255", false}, // last RFC1918 172/12
 		{"172.32.0.0", true},      // just outside 172.16/12
 		{"192.168.0.1", false},
-		{"100.64.0.1", false},  // CGN
+		{"100.64.0.1", false},      // CGN
 		{"100.127.255.255", false}, // last CGN
-		{"100.128.0.0", true}, // just outside CGN
+		{"100.128.0.0", true},      // just outside CGN
 		{"169.254.0.1", false},
 		{"224.0.0.1", false},
 		{"127.0.0.1", false},

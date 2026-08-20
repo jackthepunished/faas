@@ -631,7 +631,7 @@ func (c *VMMClient) UpdateEgressAllowlist(ctx context.Context, appID string, all
 // — see netns.Config.AccountStaticIP equality check).
 func (c *VMMClient) UpdateStaticEgressIP(ctx context.Context, appID string, ip string) error {
 	if _, err := c.cli.UpdateStaticEgressIP(ctx, &vmmdpb.UpdateStaticEgressIPRequest{
-		AppId:         appID,
+		AppId:          appID,
 		StaticEgressIp: ip,
 	}); err != nil {
 		return liftErr(err)

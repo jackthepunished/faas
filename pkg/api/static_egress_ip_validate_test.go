@@ -14,12 +14,12 @@ import (
 
 func TestValidateStaticEgressIP_AcceptsPublic(t *testing.T) {
 	cases := []string{
-		"203.0.113.42",  // TEST-NET-3 (public block, allowed by design)
-		"198.51.100.7",  // TEST-NET-2
-		"192.0.2.5",     // TEST-NET-1
-		"8.8.8.8",       // public DNS
-		"1.1.1.1",       // public DNS
-		"104.16.0.1",    // public CDN
+		"203.0.113.42", // TEST-NET-3 (public block, allowed by design)
+		"198.51.100.7", // TEST-NET-2
+		"192.0.2.5",    // TEST-NET-1
+		"8.8.8.8",      // public DNS
+		"1.1.1.1",      // public DNS
+		"104.16.0.1",   // public CDN
 	}
 	for _, ip := range cases {
 		t.Run(ip, func(t *testing.T) {

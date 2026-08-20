@@ -3628,10 +3628,10 @@ type AppSecurityResponse struct {
 // can render "you can use 1 static IP per app" without the CLI
 // round-tripping the plan table.
 type AppStaticEgressIPResponse struct {
-	IP                *netip.Addr `json:"ip"`
-	SetAt             *time.Time  `json:"set_at"`
-	PlanCap           int         `json:"plan_cap"`
-	PlanAllowed       bool        `json:"plan_allowed"`
+	IP          *netip.Addr `json:"ip"`
+	SetAt       *time.Time  `json:"set_at"`
+	PlanCap     int         `json:"plan_cap"`
+	PlanAllowed bool        `json:"plan_allowed"`
 }
 
 // SetAppStaticEgressIPRequest is the body of PUT
