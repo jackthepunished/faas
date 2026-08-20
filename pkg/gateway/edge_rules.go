@@ -417,7 +417,19 @@ type HostEntry struct {
 	// as a plain slice to match the surrounding fields; the cache
 	// primitive is kind-agnostic and the cmd-side loader threads
 	// one slice per kind into the HostEntry.
-	Budget       []EdgeRuleBudgetResolved
+	Budget []EdgeRuleBudgetResolved
+	// Cache carries the kind=cache subset (ADR-122). The applier
+	// (handler.go::applyEdgeRuleCache) consults the matched rule's
+	// MaxAgeSeconds + StaleIfErrorSeconds + VaryOn, computes a
+	// CacheKey from (AppID, DeploymentID, RuleID, Method,
+	// NormalizedPath, VaryHash), and consults the runtime
+	// ResponseCache (pkg/gateway/response_cache.go). A fresh hit
+	// serves the cached body BEFORE the wake gate (no VM, no
+	// gb_ram_hour). Stored as a plain slice to match the
+	// surrounding fields; the cache primitive is kind-agnostic and
+	// the cmd-side loader threads one slice per kind into the
+	// HostEntry.
+	Cache        []EdgeRuleCacheResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -682,6 +694,31 @@ func (c *EdgeRuleCache) GetBudget(host string) ([]EdgeRuleBudgetResolved, bool) 
 	}
 	src := entry.Budget
 	out := make([]EdgeRuleBudgetResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+// GetCache returns the per-host cache-rule slice (ADR-122).
+// nil, false = no entry for host (cmd-side loader needs to
+// populate it via PutEntry); nil, true = entry exists but has
+// no cache rules (applyEdgeRuleCache falls back to "no cache
+// rule" → cache miss); non-nil, true = priority-ordered
+// slice for applyEdgeRuleCache to consult.
+//
+// Same defensive-copy discipline as GetBudget above: the
+// returned slice is a fresh backing array so a racing Put
+// (db.NotifyEdgeRuleChanged) does not mutate the slice the
+// applier is iterating.
+func (c *EdgeRuleCache) GetCache(host string) ([]EdgeRuleCacheResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Cache == nil {
+		return nil, true
+	}
+	src := entry.Cache
+	out := make([]EdgeRuleCacheResolved, len(src))
 	copy(out, src)
 	return out, true
 }

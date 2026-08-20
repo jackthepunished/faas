@@ -6,23 +6,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// sampleCacheRule returns a well-formed EdgeRuleCacheResolved
-// for table-driven tests. i disambiguates the slice element
-// (priority varies); mutate via the test body.
-func sampleCacheRule(id string, prio int, host string) EdgeRuleCacheResolved {
-	return EdgeRuleCacheResolved{
-		ID:                  id,
-		AccountID:           "acct-" + id,
-		AppID:               "app-" + id,
-		Priority:            prio,
-		PathGlob:            "",
-		Methods:             map[string]bool{"GET": true, "HEAD": true},
-		DeploymentID:        "dep-" + id,
-		MaxAgeSeconds:       60,
-		StaleIfErrorSeconds: 300,
-		VaryOn:              []string{"Accept-Language"},
-	}
-}
+// sampleCacheRule is defined in edge_rules_test.go (the
+// canonical location for per-kind sample helpers, alongside
+// sampleBudgetRule and the rest). This file imports it via
+// the package-level name.
 
 // TestPickFirstCacheMatch_HappyPath pins the priority-ASC +
 // methods + path-glob filter. A rule with prio=10 beats a
