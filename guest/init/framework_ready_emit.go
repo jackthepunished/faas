@@ -95,21 +95,8 @@ const workloadOOMEmitMaxBody = 256
 // the host-side struct bumps this struct in lockstep.
 func EmitWorkloadOOM(ctx context.Context, peakMB, planMB int) error {
 	if ctx == nil {
-		// Build a fresh root context with a deferred
-		// cancel via the contextcheck-friendly
-		// WithCancel helper. The contextcheck linter
-		// rejects a direct `ctx = context.Background()`
-		// assignment because that creates a new
-		// context without inheriting any cancellation
-		// from the caller — a pattern that hides bugs
-		// where the caller accidentally passes nil.
-		// WithCancel(context.Background()) + immediate
-		// cancel satisfies the linter and produces
-		// the same effective behavior as a plain
-		// Background.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(context.Background())
-		cancel()
+		//nolint:contextcheck // WatchOOM callers may pass nil (the cgroup.events listener is detached from the guest-init main ctx so a workload OOM at shutdown still emits). The detached ctx is intentional — the host-side destroy is the customer-visible consequence, not the caller's lifecycle.
+		ctx = context.Background()
 	}
 	// 1s send timeout floor — long enough for the host
 	// recv loop to drain, short enough that the WatchOOM
