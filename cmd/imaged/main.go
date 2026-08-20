@@ -87,11 +87,11 @@ func defaultDeps() runDeps {
 		migrate: func(ctx context.Context, pool *pgxpool.Pool) error {
 			return db.MigrateUp(ctx, pool)
 		},
-		lvUsedPct:   imaged.DefaultLvFcUsedPct(imaged.LvFcName),
-		detectFC:    imaged.DetectFirecrackerVersion,
-		now:         time.Now,
-		configPath:  "/etc/faas/imaged.toml",
-		loadConfig:  LoadConfig,
+		lvUsedPct:  imaged.DefaultLvFcUsedPct(imaged.LvFcName),
+		detectFC:   imaged.DetectFirecrackerVersion,
+		now:        time.Now,
+		configPath: "/etc/faas/imaged.toml",
+		loadConfig: LoadConfig,
 	}
 }
 
@@ -148,11 +148,12 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 
 	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
 	// before any control-plane handshake so the boot log carries the
-	// identity. imaged has no config.go today (env-only); the systemd
+	// identity. ADR-122 introduced cmd/imaged/config.go with
+	// NodeName TOML field + FAAS_NODE_NAME env overlay; the systemd
 	// drop-in (deploy/ansible/roles/compute_only_service/files/
-	// faas-imaged.service.d/99-faas-node-name.conf) is the only
-	// source. Empty + log.Info("legacy single-box") mirrors the schedd
-	// owner-node line.
+	// faas-imaged.service.d/99-faas-node-name.conf) remains the
+	// single source of truth. Empty + log.Info("legacy single-box")
+	// mirrors the schedd owner-node line.
 	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
 		log.Info("imaged owner node", "node_name", nodeName)
 	} else {
