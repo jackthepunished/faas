@@ -321,7 +321,7 @@ func (s *SynthServer) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	// The mode lookup consults the per-app cache populated by
 	// the same hydration path Handler.PublicAuthConfig reads.
 	if s.appPublicAuthMode != nil {
-		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID)) {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth") {
 			return
 		}
 	}
@@ -365,6 +365,22 @@ func (s *SynthServer) handleInvocationDispatch(w http.ResponseWriter, r *http.Re
 	if req.AppID == "" || req.InvocationID == "" {
 		http.Error(w, "app_id + invocation_id required", http.StatusBadRequest)
 		return
+	}
+	// ADR-119 — per-app 'internal_only' gate runs BEFORE
+	// dispatcher.Invoke so a forged schedd (or anything else in
+	// the faas group) cannot invoke an internal_only app via
+	// /v1/invocations:dispatch. The same gate lives on
+	// handleSynthesize (the legacy wake-only path) and on
+	// handleInvocationDispatchBatch (the trigger batch path);
+	// closing one surface without the others leaves the gate
+	// bypassable. The mode lookup consults the per-app cache
+	// populated by the same hydration path Handler.PublicAuthConfig
+	// reads. The handler returns 403 + audit + metric; the
+	// dispatcher is never reached.
+	if s.appPublicAuthMode != nil {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth_dispatch") {
+			return
+		}
 	}
 	method := req.Method
 	if method == "" {
@@ -603,6 +619,20 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 	if req.AppID == "" || req.InvocationID == "" {
 		http.Error(w, "app_id + invocation_id required", http.StatusBadRequest)
 		return
+	}
+	// ADR-119 — per-app 'internal_only' gate runs BEFORE the
+	// per-record loop so a forged schedd (or anything else in
+	// the faas group) cannot invoke an internal_only app via
+	// /v1/invocations:dispatch_batch. The batch envelope carries
+	// ONE appID across all records, so the gate is per-batch
+	// (not per-record). Same verifier + same metric + same audit
+	// vocabulary as the HTTP-front-door side; the only
+	// difference is the "from" field is "synth_batch" instead
+	// of "synth" so dashboards can split the two surfaces.
+	if s.appPublicAuthMode != nil {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth_batch") {
+			return
+		}
 	}
 	if len(req.Records) == 0 {
 		w.Header().Set("Content-Type", "application/json")

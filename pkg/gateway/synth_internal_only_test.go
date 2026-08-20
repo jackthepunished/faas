@@ -53,7 +53,7 @@ func TestSynthApplyIngressInternalSvc_MissingHeader(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 
-	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only") {
+	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth") {
 		t.Errorf("gate should deny on missing header")
 	}
 	if rec.Code != http.StatusForbidden {
@@ -79,7 +79,7 @@ func TestSynthApplyIngressInternalSvc_OpenModePassThrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	// No Authorization header — would fail if the gate ran.
 
-	if srv.applyIngressInternalSvc(rec, req, "app-1", "open") {
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "open", "synth") {
 		t.Errorf("gate should be no-op for open mode")
 	}
 	if v.calls != 0 {
@@ -118,7 +118,7 @@ func TestSynthApplyIngressInternalSvc_InvalidSignature(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
-	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only") {
+	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth") {
 		t.Errorf("gate should deny on signature mismatch")
 	}
 	if rec.Code != http.StatusForbidden {
@@ -158,7 +158,7 @@ func TestSynthApplyIngressInternalSvc_ValidTokenPassThrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
-	if srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only") {
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth") {
 		t.Errorf("gate denied a valid token; response body=%q", rec.Body.String())
 	}
 	if len(a.events) != 0 {
@@ -187,7 +187,7 @@ func TestSynthApplyIngressInternalSvc_AuditDoesNotEchoToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
-	srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only")
+	srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth")
 
 	for _, ev := range a.events {
 		for k, v := range ev.data {
@@ -243,3 +243,230 @@ var (
 	_ = api.WriteProblem
 	_ = internalsvc.Audience
 )
+
+// ----------------------------------------------------------------------
+// Round-2 code-review tests (peer-review findings #1, #3, #5).
+// These cover the two NEW synth surfaces the gate now protects
+// (handleInvocationDispatch + handleInvocationDispatchBatch) and
+// the "from" tag split so dashboards can distinguish the three
+// inbound paths.
+// ----------------------------------------------------------------------
+
+// TestSynthApplyIngressInternalSvc_DispatchMissingHeader pins
+// the gate on /v1/invocations:dispatch (peer-review finding #1).
+// Without the gate, a forged schedd that posts to
+// /v1/invocations:dispatch with mode='internal_only' would
+// reach dispatcher.Invoke directly. The gate now 403s.
+//
+// Asserts:
+//   - "from" audit tag = "synth_dispatch" (distinguishes from
+//     the legacy /v1/synthesize path whose tag is "synth")
+//   - 403 returned
+//   - audit kind=instances.public_auth_internal_missing
+func TestSynthApplyIngressInternalSvc_DispatchMissingHeader(t *testing.T) {
+	srv, a, _ := newTestSynthServerForInternalSvc(t, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
+
+	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_dispatch") {
+		t.Errorf("dispatch gate should deny on missing header")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d, want 403", rec.Code)
+	}
+	if got := a.countByKind("instances.public_auth_internal_missing"); got != 1 {
+		t.Errorf("missing-audit count = %d, want 1", got)
+	}
+	for _, ev := range a.events {
+		if from, _ := ev.data["from"].(string); from != "synth_dispatch" {
+			t.Errorf("audit row %s from = %q, want \"synth_dispatch\"", ev.kind, from)
+		}
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_DispatchOpenModePassThrough
+// covers the non-internal_only short-circuit on the dispatch
+// path. The gate is no-op for open mode + no JWT.
+func TestSynthApplyIngressInternalSvc_DispatchOpenModePassThrough(t *testing.T) {
+	srv, a, v := newTestSynthServerForInternalSvc(t, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
+
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "open", "synth_dispatch") {
+		t.Errorf("dispatch gate should be no-op for open mode")
+	}
+	if v.calls != 0 {
+		t.Errorf("verifier.Verify called %d times on open mode; want 0", v.calls)
+	}
+	if len(a.events) != 0 {
+		t.Errorf("audit emitted on open mode; should be no-op")
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_DispatchInvalidSignature
+// covers the signature-failure path on the dispatch surface.
+// sub is in the allowlist but signature is wrong — reason
+// must be "signature_invalid".
+func TestSynthApplyIngressInternalSvc_DispatchInvalidSignature(t *testing.T) {
+	pubA, privA, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("genkey A: %v", err)
+	}
+	pubB, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("genkey B: %v", err)
+	}
+	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
+		"schedd": pubB,
+	})
+	tok := mintTestToken(t, pubA, privA, "", "schedd", 30)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_dispatch") {
+		t.Errorf("dispatch gate should deny on signature mismatch")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d, want 403", rec.Code)
+	}
+	var foundReason string
+	for _, ev := range a.events {
+		if ev.kind == "instances.public_auth_internal_invalid" {
+			if r, ok := ev.data["reason"].(string); ok {
+				foundReason = r
+			}
+		}
+	}
+	if foundReason != "signature_invalid" {
+		t.Errorf("dispatch invalid-audit reason = %q, want \"signature_invalid\"", foundReason)
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_DispatchValidTokenPassThrough
+// covers the happy path on the dispatch surface.
+func TestSynthApplyIngressInternalSvc_DispatchValidTokenPassThrough(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	srv, a, v := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
+		"schedd": pub,
+	})
+	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_dispatch") {
+		t.Errorf("dispatch gate denied a valid token; response body=%q", rec.Body.String())
+	}
+	if len(a.events) != 0 {
+		t.Errorf("audit emitted on pass-through; should be silent (events=%v)", a.events)
+	}
+	if v.calls != 1 {
+		t.Errorf("verifier.Verify calls = %d, want 1", v.calls)
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_BatchMissingHeader pins the
+// gate on /v1/invocations:dispatch_batch (peer-review finding #5).
+// Without the gate, a forged schedd would invoke an
+// internal_only app via the batch endpoint.
+//
+// Asserts:
+//   - "from" audit tag = "synth_batch"
+//   - 403 returned
+//   - audit kind=instances.public_auth_internal_missing
+func TestSynthApplyIngressInternalSvc_BatchMissingHeader(t *testing.T) {
+	srv, a, _ := newTestSynthServerForInternalSvc(t, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
+
+	if !srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_batch") {
+		t.Errorf("batch gate should deny on missing header")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d, want 403", rec.Code)
+	}
+	if got := a.countByKind("instances.public_auth_internal_missing"); got != 1 {
+		t.Errorf("missing-audit count = %d, want 1", got)
+	}
+	for _, ev := range a.events {
+		if from, _ := ev.data["from"].(string); from != "synth_batch" {
+			t.Errorf("audit row %s from = %q, want \"synth_batch\"", ev.kind, from)
+		}
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_BatchOpenModePassThrough
+// covers the non-internal_only short-circuit on the batch
+// path.
+func TestSynthApplyIngressInternalSvc_BatchOpenModePassThrough(t *testing.T) {
+	srv, a, v := newTestSynthServerForInternalSvc(t, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
+
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "open", "synth_batch") {
+		t.Errorf("batch gate should be no-op for open mode")
+	}
+	if v.calls != 0 {
+		t.Errorf("verifier.Verify called %d times on open mode; want 0", v.calls)
+	}
+	if len(a.events) != 0 {
+		t.Errorf("audit emitted on open mode; should be no-op")
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_BatchValidTokenPassThrough
+// covers the happy path on the batch surface.
+func TestSynthApplyIngressInternalSvc_BatchValidTokenPassThrough(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	srv, a, v := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
+		"schedd": pub,
+	})
+	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	if srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_batch") {
+		t.Errorf("batch gate denied a valid token; response body=%q", rec.Body.String())
+	}
+	if len(a.events) != 0 {
+		t.Errorf("audit emitted on pass-through; should be silent (events=%v)", a.events)
+	}
+	if v.calls != 1 {
+		t.Errorf("verifier.Verify calls = %d, want 1", v.calls)
+	}
+}
+
+// TestSynthApplyIngressInternalSvc_BatchAuditDoesNotEchoToken
+// pins the audit redaction invariant on the batch surface.
+// Mirrors the /v1/synthesize redaction test.
+func TestSynthApplyIngressInternalSvc_BatchAuditDoesNotEchoToken(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
+		"schedd": pub,
+	})
+	tok := mintTestToken(t, pub, priv, "", "schedd", -120) // expired
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	srv.applyIngressInternalSvc(rec, req, "app-1", "internal_only", "synth_batch")
+
+	for _, ev := range a.events {
+		for k, v := range ev.data {
+			if s, ok := v.(string); ok && strings.Contains(s, tok) {
+				t.Errorf("batch audit row %s field %q contains JWT substring; redaction invariant violated", ev.kind, k)
+			}
+		}
+	}
+}

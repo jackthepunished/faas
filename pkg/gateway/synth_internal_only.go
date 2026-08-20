@@ -51,9 +51,16 @@ func (s *SynthServer) WithInternalSvcVerifier(v InternalSvcVerifier) {
 // The mode lookup reads from the per-app cache (populated by
 // the same hydration path that feeds Handler.PublicAuthConfig).
 // A cache miss returns "" which is treated as "open" (no gate).
-// The cache is consulted on every /v1/synthesize request;
-// /v1/synthesize is rare (cron cadence, ≤N/day per app) so the
-// cache lookup cost is negligible.
+// The cache is consulted on every /v1/synthesize,
+// /v1/invocations:dispatch, and /v1/invocations:dispatch_batch
+// request.
+//
+// The `from` argument tags the audit payload so dashboards
+// can split the three call surfaces. The three current values:
+//   - "synth"        — handleSynthesize (legacy wake-only path)
+//   - "synth_dispatch" — handleInvocationDispatch (Move 1 single
+//                        invocation envelope)
+//   - "synth_batch"  — handleInvocationDispatchBatch (Move 1 batch)
 //
 // Failure modes are identical to the HTTP-side gate:
 //   - No verifier wired → 500 operator_error
@@ -67,14 +74,14 @@ func (s *SynthServer) WithInternalSvcVerifier(v InternalSvcVerifier) {
 // only the error reason code (audience_mismatch | expired |
 // not_yet_valid | unknown_service | signature_invalid |
 // malformed | empty_allowlist) and app_id flow into the audit.
-func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Request, appID, mode string) bool {
+func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Request, appID, mode, from string) bool {
 	if mode != publicAuthModeInternalOnly {
 		return false
 	}
 	if s.internalSvcVerifier == nil {
 		if s.log != nil {
 			s.log.Error("synth: app in internal_only mode but no InternalSvcVerifier wired — refusing",
-				"app_id", appID)
+				"app_id", appID, "from", from)
 		}
 		if s.metrics != nil {
 			s.metrics.ObserveInternalAuthMatch("blocked")
@@ -90,7 +97,7 @@ func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Req
 		if s.synthAuditEmit != nil {
 			s.synthAuditEmit(r.Context(), "instances.public_auth_internal_missing", nil, map[string]any{
 				"app_id": appID,
-				"from":   "synth",
+				"from":   from,
 				"reason": "missing_authorization_header",
 			})
 		}
@@ -126,10 +133,10 @@ func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Req
 		}
 		if s.synthAuditEmit != nil {
 			s.synthAuditEmit(r.Context(), "instances.public_auth_internal_invalid", nil, map[string]any{
-				"app_id":    appID,
-				"from":      "synth",
-				"reason":    reason,
-				"svc_name":  svcName, // "" on signature failure
+				"app_id":   appID,
+				"from":     from,
+				"reason":   reason,
+				"svc_name": svcName, // "" on signature failure
 			})
 		}
 		if s.metrics != nil {
@@ -145,8 +152,8 @@ func (s *SynthServer) applyIngressInternalSvc(w http.ResponseWriter, r *http.Req
 		s.metrics.ObserveInternalAuthMatch("matched")
 	}
 	_ = svcName // pass-through; the verified svcName is recoverable
-		// from r.Context via InternalSvcFromContext if any
-		// downstream audit code needs it
+	// from r.Context via InternalSvcFromContext if any
+	// downstream audit code needs it
 	return false
 }
 

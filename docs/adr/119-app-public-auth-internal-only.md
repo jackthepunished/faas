@@ -330,6 +330,148 @@ captured in `[[pr-999-public-auth-ip-allowlist-shipped-2026-08-20]]`):
 - **mTLS at the unix-socket layer**: explicitly deferred per
   ADR-052. JWT-on-Authorization is v1.0.
 
+## Deployment requirements (operator-side)
+
+The `internal_only` mode requires explicit key wiring on the
+gatewayd-internal side. Without it, the gate 500s every request
+(operator_error) — the loud posture is deliberate, but the
+deploy step is mandatory.
+
+**Required env vars**:
+
+- `FAAS_INTERNAL_SVC_PUBKEYS` (gatewayd-internal): JSON map
+  `{"<svcName>": "<pem-encoded Ed25519 public key>"}`. e.g.
+  ```json
+  {"schedd": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA...\n-----END PUBLIC KEY-----"}
+  ```
+  The verifier is constructed at boot from this map. If the
+  env is unset, the verifier is nil and the gate returns 500
+  with `instances.public_auth_internal_invalid` audit
+  (reason="empty_allowlist" once the wire surfaces that).
+- `FAAS_INTERNAL_SVC_KEY_PATH` (schedd, only): PKCS#8 PEM
+  file path to the schedd's Ed25519 private key. Default
+  `/etc/faas/secrets/internal-svc/schedd.ed25519`. If the
+  file is missing, schedd auto-generates a fresh keypair
+  with a loud WARN ("schedd: internal-svc keypair generated
+  at runtime — operator MUST provision + publish the public
+  key into FAAS_INTERNAL_SVC_PUBKEYS"). The auto-generated
+  path is dev-only; production deploys MUST provision
+  deterministic keys.
+
+**First-boot deployment procedure**:
+
+1. Generate the schedd keypair:
+   ```bash
+   openssl genpkey -algorithm Ed25519 -out /etc/faas/secrets/internal-svc/schedd.ed25519
+   ```
+2. Extract the matching public key:
+   ```bash
+   openssl pkey -in /etc/faas/secrets/internal-svc/schedd.ed25519 -pubout \
+     -out /etc/faas/secrets/internal-svc/schedd.pub
+   ```
+3. Persist the public key on every gatewayd-internal node
+   (via Ansible or systemd `EnvironmentFile=`):
+   ```
+   FAAS_INTERNAL_SVC_PUBKEYS={"schedd":"$(cat /etc/faas/secrets/internal-svc/schedd.pub)"}
+   ```
+4. Restart both daemons. The verifier is constructed at
+   boot; rotation is a follow-up (see Future work above).
+
+**Future hardening (ADR-120 candidate)**: replace the static
+env-load path with a pg_notify-driven pubkey registry so a
+schedd key-rotation only requires adding the new pubkey to
+the registry, not editing every gatewayd-internal's
+EnvironmentFile.
+
+## Round-2 review follow-ups (2026-08-21)
+
+Closed by an immediate patch on the same PR. Each finding
++ resolution:
+
+### F1 — `/v1/invocations:dispatch` bypass
+
+Peer review surfaced that schedd's cron path calls
+`l.gateway.Invoke` (`pkg/sched/loop.go:2335`) BEFORE the
+fallback `SynthesizeRequest`, and `Invoke` posts to
+`/v1/invocations:dispatch` which has no gate. A forged
+schedd could invoke an internal_only app via this surface.
+
+**Fix**: extended `SynthServer.applyIngressInternalSvc` to
+also gate `handleInvocationDispatch` (mirrors the
+`handleSynthesize` coverage). The single-share `SynthServer`
+already has the per-app `appPublicAuthMode` + the
+`InternalSvcVerifier`; only the call site is new.
+
+### F2 — `/v1/invocations:dispatch_batch` bypass
+
+Symmetric to F1: the trigger batch dispatch tick
+(`pkg/sched/dispatch_triggers.go:784`) posts to
+`/v1/invocations:dispatch_batch` with no JWT, and the
+handler calls `dispatcher.Invoke` per record with no gate.
+
+**Fix**: extended `applyIngressInternalSvc` to also gate
+`handleInvocationDispatchBatch`. The batch envelope carries
+one appID, so the gate is per-batch (not per-record) — much
+cheaper than per-record Verify.
+
+### F3 — `/v1/invocations:dispatch` + dispatch_batch outbound
+from schedd
+
+The first PR attached the JWT only to `SynthesizeRequest`.
+`Invoke` (cron + drain) and `postBatch` (trigger batch)
+also need it.
+
+**Fix**: extracted the per-app auth attachment into the same
+inline pattern across all three call sites. The Loop
+(`pkg/sched/loop.go`) gained two new fields
+(`appPublicAuthModeLookup`, `mintInternalSvcToken`) and the
+matching `WithAppPublicAuthModeLookup` + `WithMintInternalSvcToken`
+setters. `cmd/schedd/main.go` wires them once.
+
+### F4 — fail-open posture on lookup error
+
+`PublicAuthModeFromStore` returned `""` on any DB error, and
+both the schedd-side attachment AND the gateway-side gate
+treat `""` as "open". A transient Postgres outage during a
+cron tick to an internal_only app would omit the JWT, and
+the gateway would also return `open` on the same error —
+invoke succeeds without auth.
+
+**Fix**: changed the lookup signature to
+`func(ctx context.Context, appID string) (PublicAuthModeLookupResult, error)`.
+On error, callers now treat the app as `internal_only` and
+attach the JWT (fail-closed). The gateway-side gate still
+checks the app's actual mode (via its per-app cache), so a
+genuinely-open app doesn't get a JWT for nothing — the
+JWT is harmless in that case.
+
+The exported sentinel `ErrAuthModeLookup` lets a future
+hardening pass abort the request entirely on lookup failure
+without re-plumbing the closure.
+
+### F5 — caller-ctx ignored
+
+`PublicAuthModeFromStore` used `context.Background()` for
+the store round-trip, ignoring the caller's cancellation
+(shutdown signal, tick deadline, etc.).
+
+**Fix**: changed the closure signature to take
+`ctx context.Context` and threaded it through
+`PublicAuthModeLookupFunc`. All three call sites (SynthesizeRequest,
+Invoke, postBatch) now pass their own ctx.
+
+### "from" tag split
+
+The audit row's `from` field was hardcoded to `"synth"`.
+With three gated surfaces (and the HTTP-front-door side
+using `"http"`), the value is now part of the dashboard
+split. The new tags:
+
+- `"synth"` — `handleSynthesize` (legacy wake-only)
+- `"synth_dispatch"` — `handleInvocationDispatch` (move-1 single)
+- `"synth_batch"` — `handleInvocationDispatchBatch` (trigger batch)
+- `"http"` — `Handler.applyIngressInternalSvc` (HTTP-front-door)
+
 ## References
 
 - [[118-app-public-auth-ip-allowlist]] — the sibling ADR for the
