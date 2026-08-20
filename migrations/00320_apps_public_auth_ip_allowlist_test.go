@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00313 (ADR-118 — per-app ingress IP
+// Migration-apply test for 00320 (ADR-118 — per-app ingress IP
 // allowlist, extends apps.public_auth_mode with 'ip_allowlist').
 // Pins the contract:
 //
-//   1. The migration set applies cleanly through 00313.
+//   1. The migration set applies cleanly through 00320.
 //   2. Mixed v4 + v6 CIDRs round-trip (UPDATE / read-back).
 //   3. The closed public_auth_mode enum rejects unknown values
 //      (`'unknown'` fails the widened CHECK).
@@ -31,11 +31,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00313_AppPublicAuthIPAllowlist pins the
+// TestMigrations_00320_AppPublicAuthIPAllowlist pins the
 // ingress-IP-allowlist contract from ADR-118. Six named scenarios:
 //
-//   - ApplyThrough0313: the full migration set applies cleanly
-//     through 00313 (regression: missing slot between 1 and 313
+//   - ApplyThrough0320: the full migration set applies cleanly
+//     through 00320 (regression: missing slot between 1 and 320
 //     surfaces here before we get to the per-assertion pins).
 //   - RoundTripMixed: an UPDATE with v4 + v6 in one UPDATE
 //     reads both back.
@@ -53,13 +53,13 @@ import (
 // `Severity: Message (SQLSTATE Code)` (see
 // github.com/jackc/pgx/v5/pgconn/errors.go:53), so the constraint
 // name is reachable only via the typed fields.
-func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
+func TestMigrations_00320_AppPublicAuthIPAllowlist(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00313.
+	// (1) Apply through 00320.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 313)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 320)", err)
 	}
 
 	// (2) Seed an account + apps row to carry the column. The
@@ -67,7 +67,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	// idempotent; mirrors the 00033 test style for grep-ability.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000313',
+		values ('00000000-0000-0000-0000-000000000320',
 		        'public-auth-ip-allowlist-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -75,8 +75,8 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000313',
-		        '00000000-0000-0000-0000-000000000313',
+		values ('00000000-0000-0000-0000-000000000320',
+		        '00000000-0000-0000-0000-000000000320',
 		        'public-auth-ip-allowlist-test', 512, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -89,7 +89,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update apps
 		   set public_auth_ip_allowlist = array['10.0.0.0/8'::cidr, '2001:db8::/32'::cidr]
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`); err != nil {
 		t.Fatalf("update mixed public_auth_ip_allowlist: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		select public_auth_ip_allowlist::text
 		  from apps
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`).Scan(&asText); err != nil {
 		t.Fatalf("read mixed public_auth_ip_allowlist: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update apps
 		   set public_auth_mode = 'ip_allowlist'
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`); err != nil {
 		t.Fatalf("set public_auth_mode='ip_allowlist': %v (CHECK widening did not apply)", err)
 	}
@@ -123,7 +123,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		select public_auth_mode
 		  from apps
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`).Scan(&mode); err != nil {
 		t.Fatalf("read public_auth_mode: %v", err)
 	}
@@ -138,14 +138,14 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update apps
 		   set public_auth_mode = 'open'
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`); err != nil {
 		t.Fatalf("reset public_auth_mode to 'open': %v", err)
 	}
 	_, err := pool.Exec(ctx, `
 		update apps
 		   set public_auth_mode = 'unknown-mode'
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`)
 	if err == nil {
 		t.Fatalf("UPDATE with public_auth_mode='unknown-mode' unexpectedly succeeded; CHECK widening was too permissive")
@@ -173,7 +173,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	_, err = pool.Exec(ctx, `
 		update apps
 		   set public_auth_ip_allowlist = array['0.0.0.0/0'::cidr]
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`)
 	if err == nil {
 		t.Fatalf("UPDATE with 0.0.0.0/0 unexpectedly succeeded; apps_public_auth_ip_allowlist_cidr TRIGGER did not fire")
@@ -197,7 +197,7 @@ func TestMigrations_00313_AppPublicAuthIPAllowlist(t *testing.T) {
 	_, err = pool.Exec(ctx, `
 		update apps
 		   set public_auth_ip_allowlist = array['::/0'::cidr]
-		 where id = '00000000-0000-0000-0000-000000000313'
+		 where id = '00000000-0000-0000-0000-000000000320'
 	`)
 	if err == nil {
 		t.Fatalf("UPDATE with ::/0 unexpectedly succeeded; apps_public_auth_ip_allowlist_cidr TRIGGER did not fire")

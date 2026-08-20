@@ -1,4 +1,4 @@
--- filename: 00313_apps_public_auth_ip_allowlist.sql
+-- filename: 00320_apps_public_auth_ip_allowlist.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -21,8 +21,8 @@
 -- API layer (pkg/api/limits.go PublicAuthIPAllowlistMaxEntries)
 -- before SQL. Free/Hobby: 0 (gate closed). Pro: 16. Scale: 64.
 --
--- Slot note: 00313. Renumbered twice — 00308 → 00309 → 00313 —
--- because open PRs claimed slots ahead:
+-- Slot note: 00320. Renumbered four times — 00308 → 00309 → 00313 →
+-- 00314 → 00320 — because open/merged PRs claimed slots ahead:
 --   - PR #988 (merged): real 00304_cors_presets.sql on main.
 --     PR #999 must not fence slot 00304 (main owns it).
 --   - PR #997 (open): fences 00305-00306, real at 00307.
@@ -30,10 +30,23 @@
 --   - PR #990 (open, ADR-117 env-diff PR-C): fences
 --     00305-00308, real at 00309_app_secret_value_hash.sql.
 --     Cross-PR slot gate flagged 00309 collision; renumbered
---     past 00309 to 00313, adding reservation fences 00310-00312
---     to bridge the gap. Per docs/adr/README.md "migrations
+--     past 00309 to 00313.
+--   - PR #986 (merged, ADR-120 domain doctor): real
+--     00313_domain_doctor_observations.sql on main. CI
+--     synthetic-merge panicked 'duplicate version 313 detected'
+--     when PR #999's real at 00313 collided with main's 00313.
+--     Renumbered past 00313 to 00314.
+--   - PR #990 also has real at 00314_app_secret_value_hash.sql
+--     (rebound past 00309/00313, itself a 3-hop chain). The
+--     cross-PR slot gate would block 00314 against PR #990.
+--     Renumbered past 00314 to 00320, adding reservation fences
+--     00315-00319 to bridge the gap. Pattern: when an open PR
+--     owns a slot, jump past 00314 + N claimed slots past it
+--     to land on a free slot. Per docs/adr/README.md "migrations
 --     are append-only and contiguous" + the precedent set by
---     PR #984 (issue #977, 8-hop renumber) for collision rebumping.
+--     PR #984 (issue #977, 8-hop renumber), PR #986 itself
+--     (3-hop renumber 00305→00308→00309→00313), and PR #991
+--     (3-hop renumber, 00318/00319 final).
 
 alter table apps
   add column if not exists public_auth_ip_allowlist cidr[] not null default '{}';
