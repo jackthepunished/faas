@@ -914,9 +914,8 @@ func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 // Manager.WithLivenessSink; the vmmd poll goroutine calls it directly.
 //
 // Reason is a stable short string from the closed set {timeout,
-// conn_refused, conn_err, non_200, unauthorized} — the same
-// closed set the vmmd_guest_liveness_probe_seconds histogram
-// emits. The schedd
+// conn_refused, conn_err, non_200} — the same closed set the
+// vmmd_guest_liveness_probe_seconds histogram emits. The schedd
 // Engine.DestroyForLivenessFailure uses the reason to populate the
 // audit event's data JSON.
 type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
@@ -2164,8 +2163,8 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		if !ip.Is4() {
 			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q (IPv6 deferred)", req.Instance, req.StaticEgressIP)
 		}
-		if err := api.ValidateStaticEgressIP(ip); err != nil {
-			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q: %w", req.Instance, req.StaticEgressIP, err)
+		if !validCustomerStaticEgressIP(ip) {
+			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q (in reserved range)", req.Instance, req.StaticEgressIP)
 		}
 		ipCopy := ip
 		nc.AccountStaticIP = &ipCopy
@@ -3467,8 +3466,8 @@ func (m *Manager) UpdateStaticEgressIP(ctx context.Context, appID string, ip str
 		if !parsed.Is4() {
 			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q (IPv6 deferred)", appID, ip)
 		}
-		if err := api.ValidateStaticEgressIP(parsed); err != nil {
-			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q: %w", appID, ip, err)
+		if !validCustomerStaticEgressIP(parsed) {
+			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q (in reserved range)", appID, ip)
 		}
 		next = &parsed
 	}
@@ -4117,8 +4116,33 @@ func layerKeyForColdBoot(req WakeRequest) string {
 	return req.LayerKey
 }
 
-// validCustomerStaticEgressIP was the local deny-set copy. The
-// single source of truth now lives in pkg/netns
-// (api.ValidateStaticEgressIP). The two call sites in this file
-// (the WakeRequest validator + the UpdateStaticEgressIP patcher)
-// route through that helper.
+// validCustomerStaticEgressIP (ADR-119) is the vmmd-side
+// fail-closed gate on the customer-supplied IPv4. The apid
+// handler runs the same check upstream (cmd/apid/
+// handlers_apps_static_egress_ip.go::validCustomerEgressIP);
+// the wire-side defence here ensures a vmmd that forgets to
+// re-validate cannot smuggle a bad IP past apid. The deny
+// set is the same as the apid gate (RFC1918 + link-local +
+// multicast + CGN + 0.0.0.0/8 + loopback).
+func validCustomerStaticEgressIP(ip netip.Addr) bool {
+	if !ip.Is4() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	bad := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("169.254.0.0/16"),
+		netip.MustParsePrefix("224.0.0.0/4"),
+	}
+	for _, p := range bad {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}

@@ -15,7 +15,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
 
@@ -116,7 +115,7 @@ func LoadStaticEgressIPBundle(path string, log *slog.Logger) (StaticEgressIPBund
 				"path", path, "app_id", appID, "ip", ipStr)
 			continue
 		}
-		if err := api.ValidateStaticEgressIP(ip); err != nil {
+		if !validStaticEgressIPAddr(ip) {
 			log.Warn("vmmd: static egress IP bundle: dropping reserved-range IP",
 				"path", path, "app_id", appID, "ip", ipStr)
 			continue
@@ -138,11 +137,42 @@ func LoadStaticEgressIPBundle(path string, log *slog.Logger) (StaticEgressIPBund
 	return StaticEgressIPBundle{Entries: out}, nil
 }
 
-// validStaticEgressIPAddr was the operator-side deny set. The
-// single source of truth now lives in pkg/netns
-// (api.ValidateStaticEgressIP). The bundle loader calls that
-// helper directly so the deny set is identical to apid's and
-// pkg/fcvm's gates.
+// validStaticEgressIPAddr is the operator-side deny set. Mirrors
+// validCustomerStaticEgressIP in pkg/fcvm/manager.go and the
+// deny set the apid handler enforces. Kept in sync by the
+// comment on each of the three call sites — a future PR factors
+// this into pkg/netns/denylist.go. The TEST-NET ranges
+// (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) are
+// deliberately NOT denied here: customers may legitimately
+// BYOIP from a public block that overlaps these — denying
+// would mean a customer asking for "203.0.113.42" gets
+// rejected even though that's a perfectly legal public IP
+// for them to bring.
+func validStaticEgressIPAddr(ip netip.Addr) bool {
+	if !ip.Is4() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, deny := range []string{
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"100.64.0.0/10",  // CGN
+		"169.254.0.0/16", // link-local (defence in depth)
+		"224.0.0.0/4",    // multicast (defence in depth)
+	} {
+		prefix, err := netip.ParsePrefix(deny)
+		if err != nil {
+			continue
+		}
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
 
 // watchStaticEgressIPBundleReload is the SIGHUP-driven reload
 // goroutine for the static-IP TOML (ADR-119). On every hupCh

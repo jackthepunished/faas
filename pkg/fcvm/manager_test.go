@@ -2698,8 +2698,8 @@ func TestWakeRejectsStaticEgressIP_Reserved(t *testing.T) {
 	if err == nil {
 		t.Fatal("Wake with RFC1918 static IP: expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "deny set") {
-		t.Errorf("err = %v, want substring `deny set`", err)
+	if !strings.Contains(err.Error(), "reserved range") {
+		t.Errorf("err = %v, want substring `reserved range`", err)
 	}
 }
 
@@ -2894,8 +2894,8 @@ func TestUpdateStaticEgressIP_RejectsReservedIP(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for reserved IP")
 	}
-	if !strings.Contains(err.Error(), "deny set") {
-		t.Errorf("err = %v, want substring `deny set`", err)
+	if !strings.Contains(err.Error(), "reserved range") {
+		t.Errorf("err = %v, want substring `reserved range`", err)
 	}
 }
 

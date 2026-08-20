@@ -1230,3 +1230,59 @@ func TestNftCommandsChainPolicySwitchesWithAllowlist(t *testing.T) {
 		t.Errorf("populated allowlist: expected 0 `policy accept`, found %d:\n%s", got, ruleset)
 	}
 }
+
+// TestNftCommandsEmitsAccountStaticEgressIPRule pins ADR-119:
+// when Config.AccountStaticIP is non-nil, the renderer emits the
+// sibling SNAT-to-customer rule in `chain postrouting`, anchored
+// on `ip saddr 10.0.0.2` (the ADR-009 identical-inner-world guest
+// identity) and `oifname <VethPeer>`. The rule MUST sit AFTER the
+// existing MASQUERADE so the explicit SNAT wins (nft postrouting
+// is first-match; the explicit rule has the more specific match
+// regardless, but ordering matters for anyone reading the rule
+// list). The customer IP appears verbatim in argv so nftables
+// binds it as the source for outbound packets from this guest.
+func TestNftCommandsEmitsAccountStaticEgressIPRule(t *testing.T) {
+	c := testConfig()
+	ip := netip.MustParseAddr("203.0.113.42")
+	c.AccountStaticIP = &ip
+	ruleset := flatten(c.NftCommands())
+
+	// The exact argv sequence the renderer must emit. nft postrouting
+	// requires the ip saddr qualifier to scope the SNAT to tenant
+	// traffic (without it the rule would clobber host egress too,
+	// since the host IP 10.100.x.y is the MASQUERADE source).
+	want := `add rule ip faas postrouting oifname ` + c.VethPeer +
+		` ip saddr 10.0.0.2 snat to 203.0.113.42`
+	if !strings.Contains(ruleset, want) {
+		t.Fatalf("expected SNAT rule %q in NftCommands, none found:\n%s", want, ruleset)
+	}
+
+	// Must come AFTER the default MASQUERADE. The first-match
+	// semantics make the explicit rule the winner regardless, but
+	// the placement is the documented contract; pin it.
+	masqIdx := strings.Index(ruleset, "oifname "+c.VethPeer+" masquerade")
+	snatIdx := strings.Index(ruleset, "snat to 203.0.113.42")
+	if masqIdx < 0 {
+		t.Fatalf("default MASQUERADE missing:\n%s", ruleset)
+	}
+	if snatIdx < 0 {
+		t.Fatalf("SNAT-to-customer rule missing:\n%s", ruleset)
+	}
+	if masqIdx >= snatIdx {
+		t.Errorf("SNAT-to-customer rule (offset %d) must come AFTER default MASQUERADE (offset %d):\n%s",
+			snatIdx, masqIdx, ruleset)
+	}
+}
+
+// TestNftCommandsOmitsAccountStaticEgressIPRule_WhenNil pins the
+// opt-out: a Config with nil AccountStaticIP emits no `snat to`
+// line anywhere in the ruleset. Default MASQUERADE-only behaviour
+// is preserved byte-identical to pre-119 output for non-pinned
+// apps (the dominant case for Hobby / Pro plans).
+func TestNftCommandsOmitsAccountStaticEgressIPRule_WhenNil(t *testing.T) {
+	c := testConfig() // AccountStaticIP nil
+	ruleset := flatten(c.NftCommands())
+	if strings.Contains(ruleset, "snat to") {
+		t.Errorf("AccountStaticIP=nil but renderer emitted a `snat to` line:\n%s", ruleset)
+	}
+}

@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func TestMetalHostPolicyStaticEgressIPRules(t *testing.T) {
@@ -43,8 +41,8 @@ func TestMetalAccountStaticEgressIPEndToEnd(t *testing.T) {
 		t.Skipf("ip not on PATH: %v", err)
 	}
 	customerIP := netip.MustParseAddr("203.0.113.42")
-	if err := api.ValidateStaticEgressIP(customerIP); err != nil {
-		t.Skipf("test fixture IP %s failed the deny set: %v", customerIP.String(), err)
+	if !validCustomerStaticEgressIPMetal(customerIP) {
+		t.Skipf("test fixture IP %s failed the deny set", customerIP.String())
 	}
 	c := testConfig()
 	c.AccountStaticIP = &customerIP
@@ -89,14 +87,31 @@ func TestMetalAccountStaticEgressIPEndToEnd(t *testing.T) {
 	}
 }
 
-// validCustomerStaticEgressIPMetal was a local deny-set copy. The
-// single source of truth now lives in api.ValidateStaticEgressIP.
-// The fixture check at line ~93 calls that helper directly; this
-// function has been removed.
-//
-// (The TEST-NET-1/2/3 ranges are deliberately NOT in the deny set —
-// a customer may legitimately BYOIP from those public blocks. The
-// pin lives in pkg/netns/static_egress_ip_denylist.go's package doc.)
+func validCustomerStaticEgressIPMetal(ip netip.Addr) bool {
+	if !ip.Is4() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, deny := range []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"100.64.0.0/10",
+		"169.254.0.0/16",
+		"224.0.0.0/4",
+	} {
+		prefix, err := netip.ParsePrefix(deny)
+		if err != nil {
+			continue
+		}
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
 
 func teardownNetns(t *testing.T, netnsName string, c Config) {
 	t.Helper()
