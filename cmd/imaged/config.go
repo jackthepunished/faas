@@ -87,6 +87,17 @@ func LoadConfig(path string) (*Config, error) {
 	c := &Config{
 		MetricsAddr: "127.0.0.1:9102", // matches the legacy env-only default
 		Role:        role.RoleSingleBox,
+		// Seed the canonical shape in the default literal so any
+		// code path that reads cfg.MetricsReadTimeout (etc.)
+		// directly sees the constants rather than zero. Mirrors
+		// cmd/apid/config.go:171-174 (the apid precedent). The
+		// MetricsListener() helper still applies the zero→constant
+		// fallback for callers that bypass the struct (none today;
+		// the helper is the production path).
+		MetricsReadTimeout:    time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second,
+		MetricsWriteTimeout:   time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second,
+		MetricsIdleTimeout:    time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second,
+		MetricsMaxHeaderBytes: api.DefaultMaxHeaderBytes,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

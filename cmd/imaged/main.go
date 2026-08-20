@@ -147,13 +147,15 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
-	// before any control-plane handshake so the boot log carries the
-	// identity. ADR-122 introduced cmd/imaged/config.go with
-	// NodeName TOML field + FAAS_NODE_NAME env overlay; the systemd
-	// drop-in (deploy/ansible/roles/compute_only_service/files/
-	// faas-imaged.service.d/99-faas-node-name.conf) remains the
-	// single source of truth. Empty + log.Info("legacy single-box")
-	// mirrors the schedd owner-node line.
+	// before any control-plane handshake so the boot log carries
+	// the identity. imaged has NO TOML NodeName field today — the
+	// env var is read directly here. The systemd drop-in
+	// (deploy/ansible/roles/compute_only_service/files/
+	// faas-imaged.service.d/99-faas-node-name.conf) is the single
+	// source of truth. Empty + log.Info("legacy single-box") mirrors
+	// the schedd owner-node line. (Future improvement: lift
+	// NodeName into cmd/imaged/config.go so it matches the
+	// schedd/meterd/builderd shape — out of scope for ADR-122.)
 	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
 		log.Info("imaged owner node", "node_name", nodeName)
 	} else {
@@ -517,13 +519,22 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// expose the internal registry to the public network — series like
 	// imaged_oci_pull_duration_seconds{op,result} leak per-deploy timing
 	// shape (review finding #1 on PR #132). Loopback bind is safe because
-	// the local Prometheus scrapes from the box itself. Set
-	// FAAS_IMAGED_METRICS_ADDR= to disable the listener (unit tests that
-	// don't want a port reserved).
-	// ADR-122 follow-on: bind target resolves via cfg.GetMetricsAddr
-	// (env overlay wins, TOML metrics_addr is the default). Empty
-	// disables the listener — same disable semantic as the legacy
-	// env-only path (FAAS_IMAGED_METRICS_ADDR="").
+	// the local Prometheus scrapes from the box itself.
+	//
+	// Disable semantic (ADR-122 follow-on): set `metrics_addr = ""` in
+	// /etc/faas/imaged.toml to disable the listener. The env overlay
+	// (FAAS_IMAGED_METRICS_ADDR) does NOT disable when set to empty
+	// string — both unset and empty env fall through to the TOML
+	// default via GetMetricsAddr's `v != ""` gate (same conflation
+	// the legacy envOr had). The legacy behaviour was already broken
+	// in this respect; ADR-122 propagated it rather than fixing it.
+	// Future improvement: distinguish "unset" from "explicit empty"
+	// in the env overlay (e.g. via os.LookupEnv). Out of scope for
+	// this PR.
+	//
+	// Bind target resolves via cfg.GetMetricsAddr: env wins when
+	// non-empty, else TOML metrics_addr, else the default in
+	// cmd/imaged/config.go::LoadConfig.
 	metricsAddr := imgCfg.GetMetricsAddr(os.Getenv)
 	if metricsAddr != "" {
 		mux := http.NewServeMux()

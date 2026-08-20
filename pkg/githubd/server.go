@@ -102,6 +102,36 @@ func (s *Server) WithOpsMetrics(ops *wire.OpsMetrics) *Server {
 	return s
 }
 
+// NewWebhookHTTPServer returns a *http.Server configured with the
+// ADR-122 canonical webhook-listener shape. Exported so the test
+// suite can inspect the actual struct the production code
+// constructs — a future edit that drops a knob (ReadTimeout,
+// WriteTimeout, IdleTimeout, MaxHeaderBytes) is caught by
+// TestWebhookServer_AppliesCanonicalShape instead of silently
+// shipping a half-hardened listener.
+//
+// Knob set:
+//   - ReadHeaderTimeout=10s (pre-existing Slowloris guard)
+//   - ReadTimeout=30s (webhook variant — 10 MiB upload budget)
+//   - WriteTimeout=30s (mirror)
+//   - IdleTimeout=60s (keep-alive ceiling)
+//   - MaxHeaderBytes=api.DefaultMaxHeaderBytes (1 MiB)
+//
+// The handler is whatever WebhookLoopbackHandler (or a stub in
+// tests) returns. The server is not yet listening; callers must
+// net.Listen + srv.Serve (or use Server.Start which does both).
+func NewWebhookHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Duration(api.WebhookReadTimeoutSecondsDefault) * time.Second,
+		WriteTimeout:      time.Duration(api.WebhookWriteTimeoutSecondsDefault) * time.Second,
+		IdleTimeout:       time.Duration(api.WebhookIdleTimeoutSecondsDefault) * time.Second,
+		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
+	}
+}
+
 // Start binds the gRPC + HTTP listeners, wires the handlers, and
 // returns when both are serving. The returned cleanup func
 // releases both; the returned errc channel reports listener errors
@@ -153,25 +183,19 @@ func (s *Server) Start(ctx context.Context) (func(context.Context) error, <-chan
 	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
 	s.GRPCServer.Register(gsrv)
 
-	// HTTP loopback listener for /webhooks/github.
-	//
-	// ADR-122: apply the canonical webhook-listener shape. The
-	// webhook variant uses ReadTimeout=30s (not 10s like the
-	// pure-metrics family) to give a slow GitHub webhook client
-	// the budget to upload a 10 MiB body at the readBody cap
-	// (pkg/githubd/server.go:323). The body cap stays; the new
-	// server-level knobs are defence-in-depth against header
-	// smuggling + runaway scrapers holding a connection open.
+	// HTTP loopback listener for /webhooks/github. ADR-122: the
+	// listener is built via the exported NewWebhookHTTPServer
+	// helper so a future edit that drops a knob from the canonical
+	// shape surfaces in TestWebhookServer_AppliesCanonicalShape
+	// (pkg/githubd/server_test.go) rather than silently in
+	// production. The webhook variant uses ReadTimeout=30s (not
+	// 10s like the pure-metrics family) to budget a slow GitHub
+	// webhook client uploading a 10 MiB body at the readBody cap
+	// (pkg/githubd/server.go:323). Body cap stays; new server-
+	// level knobs are defence-in-depth against header smuggling
+	// + runaway scrapers holding a connection open.
 	httpHandler := s.WebhookLoopbackHandler()
-	httpSrv := &http.Server{
-		Addr:              httpAddr,
-		Handler:           httpHandler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       time.Duration(api.WebhookReadTimeoutSecondsDefault) * time.Second,
-		WriteTimeout:      time.Duration(api.WebhookWriteTimeoutSecondsDefault) * time.Second,
-		IdleTimeout:       time.Duration(api.WebhookIdleTimeoutSecondsDefault) * time.Second,
-		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
-	}
+	httpSrv := NewWebhookHTTPServer(httpAddr, httpHandler)
 	hLis, err := net.Listen("tcp", httpAddr)
 	if err != nil {
 		_ = gLis.Close()

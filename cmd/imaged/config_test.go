@@ -72,6 +72,32 @@ func TestConfig_GetMetricsAddr_EnvOverlay(t *testing.T) {
 	}
 }
 
+// TestConfig_GetMetricsAddr_DisableViaTOML — setting TOML
+// `metrics_addr = ""` disables the listener (cmd/imaged/main.go's
+// `if metricsAddr != "" { ... }` short-circuits). The legacy
+// env-only path was broken in this respect (envOr's `v != ""`
+// conflated unset with empty); the TOML-disable path is the
+// post-ADR-122 way to opt out. Pins the contract an operator
+// relies on when they don't want a port reserved (e.g. unit
+// tests, containerized sidecars).
+func TestConfig_GetMetricsAddr_DisableViaTOML(t *testing.T) {
+	cfg := &Config{MetricsAddr: ""} // TOML: metrics_addr = ""
+	env := func(string) string { return "" }
+	if got := cfg.GetMetricsAddr(env); got != "" {
+		t.Errorf("TOML empty + env empty: got %q, want \"\" (listener disabled)", got)
+	}
+	// Env overlay does NOT disable — empty env falls through to TOML.
+	env = func(string) string { return "" }
+	if got := cfg.GetMetricsAddr(env); got != "" {
+		t.Errorf("disable-via-empty-env would be a behaviour change; pin it: got %q", got)
+	}
+	// Env non-empty wins over TOML disable (operator override).
+	env = func(string) string { return "127.0.0.1:9202" }
+	if got := cfg.GetMetricsAddr(env); got != "127.0.0.1:9202" {
+		t.Errorf("env override of TOML disable: got %q, want env value", got)
+	}
+}
+
 // TestConfig_MetricsListener_Defaults / OverridesRespected — ADR-122
 // canonical shape (mirrors cmd/meterd/config_test.go).
 func TestConfig_MetricsListener_Defaults(t *testing.T) {
