@@ -2275,6 +2275,43 @@ const (
 	APIDWriteTimeoutSecondsDefault = 300 // matches gatewayd-internal
 	APIDIdleTimeoutSecondsDefault  = 120 // keep-alive cap
 
+	// Metrics-listener defaults (ADR-122 / post-issue-#995 follow-up).
+	// PR #996 hardened apid's customer-facing listener (60/300/120
+	// above) and apid's own /metrics listener (cmd/apid/main.go:1478-
+	// 1481 — 10/10/60). The remaining six daemons (meterd, schedd,
+	// vmmd, builderd, imaged, githubd) only set ReadHeaderTimeout at
+	// the stdlib http.Server layer. These constants apply the apid
+	// /metrics defaults to those daemons; per-daemon override is a
+	// TOML field in each daemon's config.go.
+	//
+	// ReadTimeout=10s is the loopback-scrape cap — Prometheus scrapes
+	// finish in milliseconds; 10s is a runaway-safety net, not a
+	// normal-path knob. WriteTimeout mirrors. IdleTimeout=60s matches
+	// apid's /metrics keep-alive cap. MaxHeaderBytes reused via
+	// api.DefaultMaxHeaderBytes (1 MiB) above — the per-daemon TOML
+	// field `metrics_max_header_bytes` falls back to that constant.
+	//
+	// ADR-122 records these as the canonical metrics-listener shape
+	// for any new daemon added to the platform. Future listeners
+	// should NOT reinvent — pick up the constants.
+	MetricsReadTimeoutSecondsDefault  = 10 // loopback scrape cap
+	MetricsWriteTimeoutSecondsDefault = 10 // mirror
+	MetricsIdleTimeoutSecondsDefault  = 60 // matches apid /metrics keep-alive
+
+	// Webhook-listener defaults (githubd only, ADR-122). Same
+	// shape as Metrics but with body-cap-shaped timeouts — the
+	// webhook handler accepts bodies up to 10 MiB (readBody cap at
+	// pkg/githubd/server.go:323), so ReadTimeout=30s is the budget
+	// for a slow webhook client to upload 10 MiB at the existing
+	// body cap. WriteTimeout mirrors. IdleTimeout matches metrics.
+	//
+	// The existing readBody 10 MiB body cap is the body-size
+	// contract; the new server-level MaxHeaderBytes is the
+	// header cap (defence-in-depth against header smuggling).
+	WebhookReadTimeoutSecondsDefault  = 30 // 10 MiB upload budget at the readBody cap
+	WebhookWriteTimeoutSecondsDefault = 30 // mirror
+	WebhookIdleTimeoutSecondsDefault  = 60 // matches metrics
+
 	// Gatewayd-internal defaults (issue #995 Phase 3, ADR-121
 	// companion). The public listener carries 60 s ReadTimeout
 	// (matches the legacy default set at run.go:1989-1991), with
