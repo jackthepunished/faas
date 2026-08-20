@@ -20,7 +20,11 @@ package state_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+
+	"strings"
+
 	"testing"
 	"time"
 
@@ -30,13 +34,33 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// seedConsumerKeyAccountApp inserts a fresh account + app via the Store
+// path and returns the IDs. Required because the consumer_keys FKs
+// point at accounts + apps — a pgstore test that synthesises UUIDs
+// out of thin air will hit SQLSTATE 23503 on the first CreateConsumerKey.
+// Mirrors the seedFullAccount pattern from pgstore_account_deletion_test.go.
+func seedConsumerKeyAccountApp(t *testing.T, ctx context.Context, st state.Store) (string, string) {
+	t.Helper()
+	email := fmt.Sprintf("cktest+%s@example.com", strings.ReplaceAll(t.Name(), "/", "-"))
+	acct, err := st.CreateAccount(ctx, email, api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := st.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: fmt.Sprintf("ck-%s", strings.ReplaceAll(t.Name(), "/", "-")),
+		Type: state.AppTypeApp, RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	return acct.ID, app.ID
+}
+
 // seedConsumerKeyPg inserts a fresh ConsumerKey via the Store
 // path and returns it. Generates a real plaintext + hash via
 // api.GenerateConsumerKey so the SHA-256 matches what the
-// gateway middleware will compare against. Test isolation is
-// enforced by the random account/app IDs (uuid.NewString per
-// call) — collisions on the (account_id, app_id, name) UNIQUE
-// are impossible across calls.
+// gateway middleware will compare against. The parent account +
+// app row are seeded first (FK floor).
 func seedConsumerKeyPg(t *testing.T, ctx context.Context, st state.Store, accountID, appID, name string, scopes []string) state.ConsumerKey {
 	t.Helper()
 	plaintext, prefix, hash, err := api.GenerateConsumerKey()
@@ -69,8 +93,7 @@ func seedConsumerKeyPg(t *testing.T, ctx context.Context, st state.Store, accoun
 func TestPgStoreConsumerKeys_RoundTrip(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountID := uuid.NewString()
-	appID := uuid.NewString()
+	accountID, appID := seedConsumerKeyAccountApp(t, ctx, store)
 	name := "ck-rt-" + strconv.Itoa(int(time.Now().UnixNano()))
 
 	// Create.
@@ -146,9 +169,8 @@ func TestPgStoreConsumerKeys_RoundTrip(t *testing.T) {
 func TestPgStoreConsumerKeys_IDOR(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountA := uuid.NewString()
-	accountB := uuid.NewString()
-	appA := uuid.NewString()
+	accountA, appA := seedConsumerKeyAccountApp(t, ctx, store)
+	accountB := uuid.NewString() // cross-tenant probe — no parent seeded
 
 	got := seedConsumerKeyPg(t, ctx, store, accountA, appA, "idor-key", []string{"read"})
 
@@ -190,9 +212,16 @@ func TestPgStoreConsumerKeys_IDOR(t *testing.T) {
 func TestPgStoreConsumerKeys_UniqueNameAcrossApps(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountID := uuid.NewString()
-	appA := uuid.NewString()
-	appB := uuid.NewString()
+	accountID, appA := seedConsumerKeyAccountApp(t, ctx, store)
+	// appB shares the same account but is a separate app row.
+	appBapp, err := store.CreateApp(ctx, state.App{
+		AccountID: accountID, Slug: fmt.Sprintf("ck-appB-%s", strings.ReplaceAll(t.Name(), "/", "-")),
+		Type: state.AppTypeApp, RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp appB: %v", err)
+	}
+	appB := appBapp.ID
 	name := "shared-name-" + strconv.Itoa(int(time.Now().UnixNano()))
 
 	// Same name, two different apps — both must succeed.
@@ -217,8 +246,7 @@ func TestPgStoreConsumerKeys_UniqueNameAcrossApps(t *testing.T) {
 func TestPgStoreConsumerKeys_HashPolicyPin(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountID := uuid.NewString()
-	appID := uuid.NewString()
+	accountID, appID := seedConsumerKeyAccountApp(t, ctx, store)
 
 	// Two distinct plaintexts with the same secret bytes — they
 	// MUST hash differently because the prefix is part of the input.
@@ -269,12 +297,11 @@ func TestPgStoreConsumerKeys_HashPolicyPin(t *testing.T) {
 func TestPgStoreConsumerKeys_VocabularyCheck(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountID := uuid.NewString()
-	appID := uuid.NewString()
+	accountID, appID := seedConsumerKeyAccountApp(t, ctx, store)
 
 	_, err := store.CreateConsumerKey(ctx, accountID, appID, "vocab-test", "dead", makeHash(t, "x"), []string{"superadmin"}, nil)
 	if err == nil {
-		t.Fatal("CreateConsumerKey with scope='superadmin' should fail (closed-set CHECK in 00309)")
+		t.Fatal("CreateConsumerKey with scope='superadmin' should fail (closed-set CHECK in 00305)")
 	}
 }
 
@@ -285,8 +312,7 @@ func TestPgStoreConsumerKeys_VocabularyCheck(t *testing.T) {
 func TestPgStoreConsumerKeys_TouchRevokedIsNoop(t *testing.T) {
 	store, _, ctx := pgStoreWithPool(t)
 
-	accountID := uuid.NewString()
-	appID := uuid.NewString()
+	accountID, appID := seedConsumerKeyAccountApp(t, ctx, store)
 	got := seedConsumerKeyPg(t, ctx, store, accountID, appID, "touch-revoked", []string{"read"})
 
 	if _, err := store.RevokeConsumerKey(ctx, accountID, got.ID); err != nil {

@@ -12799,14 +12799,14 @@ func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, 
 		return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
 	}
 	if len(scopes) == 0 {
-		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00309)")
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00305)")
 	}
 	if expiresAt != nil && expiresAt.Before(time.Now()) {
-		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00309)")
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00305)")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Mirror the (account_id, app_id, name) UNIQUE from 00309.
+	// Mirror the (account_id, app_id, name) UNIQUE from 00305.
 	for _, k := range m.consumerKeys {
 		if k.AccountID == accountID && k.AppID == appID && k.Name == name {
 			return ConsumerKey{}, ErrConflict

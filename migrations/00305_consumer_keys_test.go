@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00309_consumer_keys.sql
+// Migration-apply test for 00305_consumer_keys.sql
 // (ADR-120 / issue #975 item #5).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00309 (no goose
-//     duplicate-version panic). Slot 00309 was picked as the next
+//  1. Migration set applies cleanly through 00305 (no goose
+//     duplicate-version panic). Slot 00305 was picked as the next
 //     free slot on origin/main past the open-PR reservations:
 //     - PR #988 (00304 cors_presets — MERGED 2026-08-20)
 //     - PR #984 (00305 deployments_annotation — open)
@@ -14,8 +14,8 @@
 //     - PR #991 (00306 + 00307 — open)
 //     - PR #992 (00305 + 00306 — open)
 //     - PR #997 (00303-00307 — open)
-//     This PR pushes to 00309 (Strategy A — high end, robust
-//     against most merge orders). Fallback renumber 00309 → 00309
+//     This PR pushes to 00305 (Strategy A — high end, robust
+//     against most merge orders). Fallback renumber 00305 → 00305
 //     if PR #984 merges first; re-verify with
 //     scripts/ci/check_migration_slots.sh immediately before push.
 //  2. The table is present with the 12 expected columns (positive
@@ -49,7 +49,7 @@ import (
 )
 
 // consumerKeyExpectedColumns are the 12 columns the migration must
-// add. Adding a column to 00309 without updating this list is a
+// add. Adding a column to 00305 without updating this list is a
 // load-bearing failure mode — downstream consumers (PgStore,
 // MemStore, OpenAPI, SDKs) all key off this shape.
 var consumerKeyExpectedColumns = []string{
@@ -90,13 +90,13 @@ var consumerKeyExpectedIndexes = []string{
 	"consumer_keys_app_idx",
 }
 
-func TestMigrations_00309_ConsumerKeys(t *testing.T) {
+func TestMigrations_00305_ConsumerKeys(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00309.
+	// (1) Apply through 00305.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00304 cors_presets and 00309 consumer_keys)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00304 cors_presets and 00305 consumer_keys)", err)
 	}
 
 	// (2) Positive shape — table present with 12 expected columns.

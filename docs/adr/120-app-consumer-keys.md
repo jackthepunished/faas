@@ -239,14 +239,14 @@ is the canonical getter.
 Three sequential PRs (the cors_presets PR-A → PR-B cadence
 extended with a PR-C for the heavier surface):
 
-- **PR #5-A** — data model + Store interface. Slot **00309** on
+- **PR #5-A** — data model + Store interface. Slot **00305** on
   main. ~700 LOC; ships the table, the `ConsumerKey` struct, six
   Store methods (Create / GetByID / ListForApp / Revoke /
   TouchLastUsed / LookupByAppAndPrefix), pgstore + memstore
   impls, replay-safe migration test, GDPR mirror test, ADR-120
   doc.
 - **PR #5-B** — apid CRUD + audit log + OpenAPI + SDK regen +
-  `apps.consumer_auth_mode` column. Slot **00309**. ~1100 LOC;
+  `apps.consumer_auth_mode` column. Slot **00305**. ~1100 LOC;
   ships 4 handlers, 4 new RFC 7807 problem codes, OpenAPI
   resource, regenerated Go/Node/Python SDKs, audit-log row on
   every create/revoke.
@@ -259,8 +259,8 @@ extended with a PR-C for the heavier surface):
 Slot precheck runs at PR-open time via
 `scripts/ci/check_migration_slots.sh`. If PR #5-A would collide
 with another PR's real migration (currently PR #984 reserves
-00309 for `deployments_annotation`), PR #5-A renumbers to
-**00309** and PR #5-B renumbers to **00310** — fallback is one
+00305 for `deployments_annotation`), PR #5-A renumbers to
+**00305** and PR #5-B renumbers to **00310** — fallback is one
 precheck run away.
 
 ## Security & GDPR notes
