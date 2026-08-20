@@ -5445,6 +5445,7 @@ func TestMemStoreUpdateTrigger_FilterCriteriaPersists(t *testing.T) {
 		t.Errorf("after replacement patch, got %q, want %q", got.FilterCriteria, replacement)
 	}
 }
+
 // TestMemStore_OpenAPISnapshot_RoundTrip (ADR-121, migration 00314)
 // pins the MemStore parity for the contract-diff snapshot store.
 // The PR-C gate reads via LatestOpenAPISnapshotForScope and

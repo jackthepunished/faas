@@ -1,4 +1,4 @@
--- filename: 00314_deployment_openapi_snapshots.sql
+-- filename: 00330_deployment_openapi_snapshots.sql
 -- +goose Up
 -- +goose StatementBegin
 
