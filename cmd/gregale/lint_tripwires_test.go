@@ -791,3 +791,226 @@ func TestEveryCodeHasWhycopyEntry(t *testing.T) {
 			len(deadRows), strings.Join(deadRows, "\n  "))
 	}
 }
+
+// TestLintTripwire_DoctorStrictMutex pins the flag-name scoping
+// rule for the doctor-strict cluster (spec §6.4 amendment 1).
+// Background: --strict / --lenient are already claimed by the
+// deploy-diff cluster (commands2.go:838-839). Re-introducing a bare
+// `--strict` (without a `--doctor-` or `--diff-` scope prefix) on
+// any new deploy path would silently collide with the existing
+// semantics. The tripwire walks every non-test file under cmd/gregale/
+// and fails on any flag.* flag-registration call whose name is
+// EXACTLY "strict" and whose enclosing function is not in the
+// allow-list (cmdDeployTarball for --diff, cmdDoctor for the
+// standalone doctor).
+//
+// Flag-registration call set: Bool / String / Int / Int64 / Uint /
+// Duration / Float64 / Func / Var. The full set is checked so a
+// future `fs.Int("strict", 0, ...)` (e.g. for a numeric counter)
+// is caught with the same severity as the original `fs.Bool`
+// case. customer-script collision semantics are identical across
+// all of them.
+//
+// Allow-list keyed by enclosing *function name* (not line) so a
+// maintainer adding a flag above the documented declaration does
+// not silently shift the legitimate call off the allow-list.
+//
+// If you genuinely need a new strict-style gate, scope it via a
+// prefix (e.g. `--secret-strict`, `--build-strict`). If you need to
+// undo the diff `--strict` flag, that requires an ADR — the rename
+// would break customer scripts.
+func TestLintTripwire_DoctorStrictMutex(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		name := fi.Name()
+		if strings.HasSuffix(name, "_test.go") {
+			return false
+		}
+		if strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "_grpc.pb.go") {
+			return false
+		}
+		return true
+	}, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse cmd/gregale: %v", err)
+	}
+
+	// Allow-list keyed by enclosing function name. Stable across
+	// edits that shift line numbers (the line-anchored version had
+	// a hazard where adding an unrelated flag above the
+	// documented declaration would silently disable the tripwire
+	// on the legitimate --strict).
+	allowedFuncs := map[string]bool{
+		"cmdDeployTarball": true, // --strict (--diff pair, commands2.go:838)
+		"cmdDoctor":        true, // --strict (gregale doctor, commands_doctor.go:124)
+	}
+
+	// flag-registration selector names. The full set is matched
+	// because any of these carries the same customer-script
+	// collision semantics. Adding a new selector (e.g. fs.Text)
+	// requires extending this list AND the test below.
+	flagScreators := map[string]bool{
+		"Bool": true, "String": true, "Int": true, "Int64": true,
+		"Uint": true, "Duration": true, "Float64": true,
+		"Func": true, "Var": true,
+	}
+
+	var violations []string
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if !flagScreators[sel.Sel.Name] {
+					return true
+				}
+				if len(call.Args) < 1 {
+					return true
+				}
+				lit, ok := call.Args[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				name := strings.Trim(lit.Value, `"`)
+				if name != "strict" {
+					return true
+				}
+				if enclosingFuncName(n, file) != "" &&
+					allowedFuncs[enclosingFuncName(n, file)] {
+					return true
+				}
+				pos := fset.Position(call.Pos())
+				violations = append(violations, pos.String()+": "+sel.Sel.Name+"(\""+name+"\"...)")
+				return true
+			})
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("found %d unscoped --strict flag declaration(s). --strict is owned by the deploy-diff cluster (cmdDeployTarball in commands2.go) and the gregale doctor (cmdDoctor in commands_doctor.go). New strict-style gates must be scoped via a prefix (--doctor-strict, --secret-strict, --diff-strict, etc.) to avoid customer-script breakage:\n  %s",
+			len(violations), strings.Join(violations, "\n  "))
+	}
+}
+
+// enclosingFuncName walks up the AST from n (tracking parents
+// explicitly because stdlib ast.Node has no Parent method) and
+// returns the name of the nearest enclosing named function. We do
+// not use file:line keying — adding an unrelated flag above the
+// documented declaration would otherwise shift the legitimate call
+// off the line-anchored key. Function names are stable across
+// edits that add unrelated code.
+// visitor is a single-file ast.Visitor implementation that records
+// the name of the most recently entered FuncDecl. Used by
+// enclosingFuncName to find the enclosing function for a target
+// node. ast.Walk requires a Visit(Node) Visitor method, so we use
+// a struct rather than a bare func.
+type visitor struct {
+	target    ast.Node
+	found     string
+	terminate bool
+}
+
+func (v *visitor) Visit(n ast.Node) ast.Visitor {
+	if v.terminate || n == nil {
+		return nil
+	}
+	if n == v.target {
+		v.terminate = true
+		return nil
+	}
+	fd, ok := n.(*ast.FuncDecl)
+	if ok {
+		v.found = fd.Name.Name
+	}
+	return v
+}
+
+func enclosingFuncName(target ast.Node, file *ast.File) string {
+	v := &visitor{target: target}
+	ast.Walk(v, file)
+	return v.found
+}
+
+// TestLintTripwire_DoctorStrictMutex_SelfTest ensures the tripwire
+// is alive — a synthetic fixture carrying an unscoped
+// `fs.Bool("strict", ...)` outside the allow-list must trip. If
+// this test passes, the walker is broken (false-negative).
+// Mirrors the existing TestLintTripwire_NoLiteralDocsDomainSelfTest
+// pattern at :612.
+func TestLintTripwire_DoctorStrictMutex_SelfTest(t *testing.T) {
+	src := `package tripwiretest
+
+import "flag"
+
+func cmdBadNewFeature(args []string) int {
+	fs := flag.NewFlagSet("bad", flag.ContinueOnError)
+	strict := fs.Bool("strict", false, "unscoped strict — should trip")
+	_ = strict
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	return 0
+}
+`
+	// Parse the synthetic source.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "tripwiretest.go", src, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Walk and apply the same predicate as the live tripwire. We
+	// expect exactly one violation on `fs.Bool("strict", ...)` from
+	// cmdBadNewFeature.
+	allowedFuncs := map[string]bool{
+		"cmdDeployTarball": true,
+		"cmdDoctor":        true,
+	}
+	flagSelectors := map[string]bool{
+		"Bool": true, "String": true, "Int": true, "Int64": true,
+		"Uint": true, "Duration": true, "Float64": true,
+		"Func": true, "Var": true,
+	}
+	var violations []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if !flagSelectors[sel.Sel.Name] {
+			return true
+		}
+		if len(call.Args) < 1 {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		name := strings.Trim(lit.Value, `"`)
+		if name != "strict" {
+			return true
+		}
+		enc := enclosingFuncName(n, f)
+		if allowedFuncs[enc] {
+			return true
+		}
+		pos := fset.Position(call.Pos())
+		violations = append(violations, pos.String()+": "+sel.Sel.Name+"(\""+name+"\"...)")
+		return true
+	})
+	if len(violations) != 1 {
+		t.Fatalf("expected exactly 1 violation, got %d:\n  %s", len(violations), strings.Join(violations, "\n  "))
+	}
+	if !strings.Contains(violations[0], "cmdBadNewFeature") && !strings.Contains(violations[0], "tripwiretest.go") {
+		t.Errorf("violation should mention the offending function or file, got %q", violations[0])
+	}
+}

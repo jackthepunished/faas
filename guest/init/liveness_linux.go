@@ -111,9 +111,19 @@ type livenessReq struct {
 // clean 2xx. The host maps (status, err) to the four outcome
 // classes it tracks in the vmmd_guest_liveness_probe_seconds
 // histogram (ok / non_200 / timeout / conn_refused).
+//
+// WWWAuthenticate is the WWW-Authenticate response header value
+// (verbatim, comma-separated list) when the runner responds with
+// 401 or 403. Cluster A (error-explanations, spec §6.4 amendment 1):
+// forwarded for forward-compat so the host can later discriminate
+// "customer app intentionally gated its /healthz" (realm="customer")
+// from "platform probe auth round-trip" without another wire-shape
+// bump. Empty on any other status. The host reads the field
+// defensively — empty = no signal.
 type livenessResp struct {
-	Status int    `json:"status"`
-	Err    string `json:"err"`
+	Status          int    `json:"status"`
+	Err             string `json:"err"`
+	WWWAuthenticate string `json:"www_authenticate,omitempty"`
 }
 
 // listenLivenessHook opens an AF_VSOCK socket bound to VsockLivenessPort
@@ -246,16 +256,16 @@ func handleLivenessConn(f *os.File, log *slog.Logger) {
 	if timeoutMs > VsockLivenessHardTimeoutMs {
 		timeoutMs = VsockLivenessHardTimeoutMs
 	}
-	status, errStr := runLivenessProbe(req.Path, timeoutMs)
-	writeLivenessResp(f, livenessResp{Status: status, Err: errStr})
+	status, errStr, wwwAuth := runLivenessProbe(req.Path, timeoutMs)
+	writeLivenessResp(f, livenessResp{Status: status, Err: errStr, WWWAuthenticate: wwwAuth})
 }
 
 // runLivenessProbe hits the runner's :8080<path> and returns the
-// status + err classification. The runner's :8080 is the canonical
-// liveness target — every shipped runner (node22, python312) binds
-// :8080 + registers /healthz returning 200 ahead of the customer's
-// HTTP handler so the probe targets the runtime surface, not the
-// customer's app.
+// status + err classification + the WWW-Authenticate response header
+// (verbatim). The runner's :8080 is the canonical liveness target —
+// every shipped runner (node22, python312) binds :8080 + registers
+// /healthz returning 200 ahead of the customer's HTTP handler so the
+// probe targets the runtime surface, not the customer's app.
 //
 // Returns:
 //   - status: the HTTP status code (0 = no response / conn_refused /
@@ -263,7 +273,12 @@ func handleLivenessConn(f *os.File, log *slog.Logger) {
 //   - errStr: one of {"timeout", "conn_refused", "runner_not_ready",
 //     ""} (empty = clean 2xx; the host's failure counter treats
 //     status>=400 or errStr!="" as a probe failure).
-func runLivenessProbe(path string, timeoutMs int) (int, string) {
+//   - wwwAuth: the verbatim WWW-Authenticate header value, only set
+//     when status is 401 or 403 (the only two statuses that
+//     conventionally carry the header per RFC 7235). Empty
+//     otherwise. Cluster A forward-compat — the host reads the
+//     field defensively.
+func runLivenessProbe(path string, timeoutMs int) (int, string, string) {
 	// Build the URL. The runner's :8080 is loopback; the path is
 	// already validated to start with "/". We use the http
 	// package's Get with a per-call Client so the timeout is
@@ -282,19 +297,29 @@ func runLivenessProbe(path string, timeoutMs int) (int, string) {
 		// sentinel). Anything else is conn_err.
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
-			return 0, "timeout"
+			return 0, "timeout", ""
 		}
 		if strings.Contains(err.Error(), "connection refused") {
-			return 0, "conn_refused"
+			return 0, "conn_refused", ""
 		}
-		return 0, "conn_err"
+		return 0, "conn_err", ""
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Capture WWW-Authenticate ONLY for 401/403 (the only statuses
+	// that conventionally carry it per RFC 7235 §4.1). Reading on
+	// any other status would burn cycles on the happy path AND
+	// could leak a customer's auth scheme to the wire envelope
+	// when the runner returns 2xx (none should set the header,
+	// but defensive read is cheaper than an invariant test).
+	var wwwAuth string
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		wwwAuth = resp.Header.Get("WWW-Authenticate")
+	}
 	// Drain + discard the body so the connection can be reused.
 	// The runner's /healthz returns < 100 B; the cap is the
 	// io.DiscardMax.
 	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, ""
+	return resp.StatusCode, "", wwwAuth
 }
 
 // writeLivenessResp serialises the response and writes the wire

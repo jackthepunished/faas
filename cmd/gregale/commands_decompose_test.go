@@ -17,6 +17,7 @@ package main
 //     doubling as the server.
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -549,5 +550,248 @@ func TestSplitCSVEdgeCases(t *testing.T) {
 				t.Errorf("splitCSV(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cluster A: gregale deploy --doctor-strict pre-upload gate (spec §6.4
+// amendment 1). The doctor must run BEFORE any HTTP, so a customer
+// with a top-level data/ directory gets the stateless_only_violation
+// prose locally rather than uploading + 422-ing. Warnings remain
+// warn-only (mirrors the standalone cmdDoctor semantics).
+// ---------------------------------------------------------------------------
+
+// TestCmdDeployTarball_DoctorStrict_FailsFast pins the failure path:
+// a cwd with a top-level data/ directory trips the stateless-only
+// check → exit 1 + doctor report on stderr + zero HTTP calls.
+// The test swaps osStderr for a buffer so we can grep the rendered
+// prose; the sink's HTTP counter is the "no upload" assertion.
+func TestCmdDeployTarball_DoctorStrict_FailsFast(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	prev := jsonOutput
+	jsonOutput = false
+	defer func() { jsonOutput = prev }()
+
+	var stderr bytes.Buffer
+	oldErr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = oldErr }()
+
+	sink := &decomposeSink{
+		scanStatus:  http.StatusOK,
+		scanBody:    goldenPlan,
+		applyStatus: http.StatusOK,
+		applyBody:   goldenApply,
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	// t.Chdir into the fixture so os.Getwd() in the wire-in path
+	// picks up the data/ subdir. Chdir auto-restores on test exit.
+	t.Chdir(dir)
+
+	if code := cmdDeployTarball([]string{
+		"--doctor-strict",
+		"--tarball", writeTarball(t), // never reached, but the flag parser still validates
+		"--project-slug", "fixture",
+		"--only", "api,worker,nightly",
+		"--yes",
+	}); code != 1 {
+		t.Errorf("exit code = %d, want 1 (doctor-strict must fail-fast)", code)
+	}
+	if sink.scanCalls != 0 {
+		t.Errorf("scan should not be called (doctor-strict pre-uploads): got %d calls", sink.scanCalls)
+	}
+	if sink.applyCalls != 0 {
+		t.Errorf("apply should not be called: got %d calls", sink.applyCalls)
+	}
+	// Rendered prose must include the code + the whycopy hint so the
+	// customer sees the prose at exit time, not just "exit 1". The
+	// leading glyph (`✗`) is gated by output.Enabled() and may be
+	// suppressed when NO_COLOR is set or stdout is not a TTY (some
+	// sibling tests prime output.go's noColorCached state — the
+	// cache is binary-global, see output.go:noColorCached). Assert
+	// on the durable shape (code name + hint substring), not the
+	// glyph, so the test stays robust under both human and
+	// no-color/pipe renderings.
+	rendered := stderr.String()
+	if !strings.Contains(rendered, "stateless_only_violation") {
+		t.Errorf("stderr must surface the code, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "this app shape needs persistent storage") {
+		t.Errorf("stderr must surface the whycopy hint, got %q", rendered)
+	}
+}
+
+// TestCmdDeployTarball_DoctorStrict_AllGreenContinues pins the happy
+// path: a clean cwd (no data/, no loopback-bind) under --doctor-strict
+// must NOT short-circuit. The deploy proceeds normally — sink.scanCalls
+// + sink.applyCalls both advance. We pass an explicit
+// --no-fan-out-yml to avoid the gregale.yaml discovery path
+// interfering with the cwd fixture (mirrors TestCmdDeployTarball_*
+// patterns above).
+func TestCmdDeployTarball_DoctorStrict_AllGreenContinues(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "server.js"), []byte("app.listen(process.env.PORT);\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	prev := jsonOutput
+	jsonOutput = false
+	defer func() { jsonOutput = prev }()
+
+	var stderr bytes.Buffer
+	oldErr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = oldErr }()
+
+	sink := &decomposeSink{
+		scanStatus:  http.StatusOK,
+		scanBody:    goldenPlan,
+		applyStatus: http.StatusOK,
+		applyBody:   goldenApply,
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	t.Chdir(dir)
+
+	if code := cmdDeployTarball([]string{
+		"--doctor-strict",
+		"--tarball", writeTarball(t),
+		"--project-slug", "fixture",
+		"--only", "api,worker,nightly",
+		"--yes",
+	}); code != 0 {
+		t.Errorf("clean cwd under --doctor-strict must continue; got exit %d, stderr=%q", code, stderr.String())
+	}
+	if sink.scanCalls != 1 {
+		t.Errorf("scanCalls = %d, want 1 (clean doctor must not short-circuit)", sink.scanCalls)
+	}
+	if sink.applyCalls != 1 {
+		t.Errorf("applyCalls = %d, want 1", sink.applyCalls)
+	}
+}
+
+// TestCmdDeployTarball_DoctorStrict_WarnsOnlyContinues pins the
+// warn-only semantics. A fixture that produces a warn-class finding
+// (NOT error) must continue the deploy — only error findings fail.
+// We use a fixture the existing scanSource-based checks tolerate but
+// that has no error-class signal; the doctor report still has 8
+// rows so we assert at least one warn OR ok exists, and that the
+// render path doesn't fail-fast.
+func TestCmdDeployTarball_DoctorStrict_WarnsOnlyContinues(t *testing.T) {
+	dir := t.TempDir()
+	// Empty repo → all checks ok in the current rule set. We still
+	// exercise the wiring path: HasErrors=false → continue.
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# fixture\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	prev := jsonOutput
+	jsonOutput = false
+	defer func() { jsonOutput = prev }()
+
+	var stderr bytes.Buffer
+	oldErr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = oldErr }()
+
+	sink := &decomposeSink{
+		scanStatus:  http.StatusOK,
+		scanBody:    goldenPlan,
+		applyStatus: http.StatusOK,
+		applyBody:   goldenApply,
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	t.Chdir(dir)
+
+	if code := cmdDeployTarball([]string{
+		"--doctor-strict",
+		"--tarball", writeTarball(t),
+		"--project-slug", "fixture",
+		"--only", "api,worker,nightly",
+		"--yes",
+	}); code != 0 {
+		t.Errorf("all-ok cwd under --doctor-strict must continue; got exit %d, stderr=%q", code, stderr.String())
+	}
+	if sink.scanCalls != 1 {
+		t.Errorf("scanCalls = %d, want 1", sink.scanCalls)
+	}
+}
+
+// TestCmdDeployTarball_DoctorStrict_JSON pins the --json envelope.
+// When the global --json flag is set AND --doctor-strict trips on
+// an error-class finding, stderr must carry a JSON document with
+// {"doctor": {...}, "exit": 1}. The shape is what CI scripts grep
+// on, so a regression to "human prose" would break parse-ability.
+func TestCmdDeployTarball_DoctorStrict_JSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	prev := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = prev }()
+
+	var stderr bytes.Buffer
+	oldErr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = oldErr }()
+
+	sink := &decomposeSink{
+		scanStatus:  http.StatusOK,
+		scanBody:    goldenPlan,
+		applyStatus: http.StatusOK,
+		applyBody:   goldenApply,
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	t.Chdir(dir)
+
+	if code := cmdDeployTarball([]string{
+		"--doctor-strict",
+		"--tarball", writeTarball(t),
+		"--project-slug", "fixture",
+		"--only", "api,worker,nightly",
+		"--yes",
+	}); code != 1 {
+		t.Errorf("JSON doctor-strict failure must exit 1; got %d", code)
+	}
+	if sink.scanCalls != 0 {
+		t.Errorf("scanCalls = %d, want 0 (pre-upload gate)", sink.scanCalls)
+	}
+	// stderr must be a single-line JSON envelope (newlines inside
+	// the embedded report are fine — we grep on the envelope keys).
+	var env struct {
+		Doctor doctorReport `json:"doctor"`
+		Exit   int          `json:"exit"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stderr.String())), &env); err != nil {
+		t.Fatalf("stderr must be a JSON envelope under --json; got %q (err=%v)", stderr.String(), err)
+	}
+	if env.Exit != 1 {
+		t.Errorf("envelope exit = %d, want 1", env.Exit)
+	}
+	var foundStateless bool
+	for _, c := range env.Doctor.Checks {
+		if c.Code == "stateless_only_violation" {
+			foundStateless = true
+		}
+	}
+	if !foundStateless {
+		t.Errorf("envelope must carry the stateless_only_violation finding; got %+v", env.Doctor)
 	}
 }

@@ -864,8 +864,9 @@ func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 // Manager.WithLivenessSink; the vmmd poll goroutine calls it directly.
 //
 // Reason is a stable short string from the closed set {timeout,
-// conn_refused, conn_err, non_200} — the same closed set the
-// vmmd_guest_liveness_probe_seconds histogram emits. The schedd
+// conn_refused, conn_err, non_200, unauthorized} — the same
+// closed set the vmmd_guest_liveness_probe_seconds histogram
+// emits. The schedd
 // Engine.DestroyForLivenessFailure uses the reason to populate the
 // audit event's data JSON.
 type LivenessFailedSink func(ctx context.Context, instanceID, reason string)

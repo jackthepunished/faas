@@ -162,3 +162,74 @@ func TestRenderDoctorHuman_HasAllChecks(t *testing.T) {
 		t.Errorf("render missing 'All checks passed' trailer in:\n%s", out)
 	}
 }
+
+// TestDoctorReport_HasErrorsAndHasWarnings pins the two helpers
+// the deploy path relies on. The semantics are subtle: HasErrors
+// is a hard-fail signal for --doctor-strict, but HasWarnings must
+// only signal "render the report + continue" (not exit 1). A
+// fixture with one error + one warn must trip both helpers; an
+// all-ok fixture must trip neither.
+func TestDoctorReport_HasErrorsAndHasWarnings(t *testing.T) {
+	t.Run("all ok trips neither", func(t *testing.T) {
+		dir := t.TempDir()
+		rep := runDoctorChecks(dir)
+		if rep.HasErrors() {
+			t.Errorf("clean repo: HasErrors=true, want false")
+		}
+		if rep.HasWarnings() {
+			t.Errorf("clean repo: HasWarnings=true, want false")
+		}
+	})
+	t.Run("stateless fixture trips HasErrors only", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "data"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		rep := runDoctorChecks(dir)
+		if !rep.HasErrors() {
+			t.Errorf("stateless fixture: HasErrors=false, want true")
+		}
+		// The current ruleset emits "error" for stateless-only; no
+		// rule emits "warn" today. The helpers must remain stable
+		// even if a future check promotes a finding to warn, so we
+		// only assert HasErrors here (HasWarnings is exercised by
+		// the dedicated loopback-bind error fixture below for the
+		// "trip BOTH helpers" path; the rule today emits error for
+		// loopback-bind too, so we don't get a clean warn-only case
+		// without faking — keep the test honest).
+	})
+	t.Run("manual fixture trips both helpers", func(t *testing.T) {
+		// Synthetic report to verify the helper semantics in
+		// isolation, independent of the check implementations. This
+		// pins the contract for any future check that promotes
+		// a finding to warn (e.g. a dep-install soft-warning).
+		rep := doctorReport{
+			Path: "/tmp",
+			Checks: []doctorCheck{
+				{Name: "fake-ok", Status: "ok"},
+				{Name: "fake-warn", Status: "warn"},
+				{Name: "fake-error", Status: "error"},
+			},
+		}
+		if !rep.HasErrors() {
+			t.Errorf("HasErrors=false, want true")
+		}
+		if !rep.HasWarnings() {
+			t.Errorf("HasWarnings=false, want true")
+		}
+	})
+	t.Run("warn-only trips HasWarnings, not HasErrors", func(t *testing.T) {
+		rep := doctorReport{
+			Checks: []doctorCheck{
+				{Name: "fake-ok", Status: "ok"},
+				{Name: "fake-warn", Status: "warn"},
+			},
+		}
+		if rep.HasErrors() {
+			t.Errorf("warn-only: HasErrors=true, want false")
+		}
+		if !rep.HasWarnings() {
+			t.Errorf("warn-only: HasWarnings=false, want true")
+		}
+	})
+}

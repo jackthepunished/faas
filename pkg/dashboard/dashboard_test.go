@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 )
 
@@ -669,6 +670,112 @@ func TestRender_OrgsPage(t *testing.T) {
 	} {
 		if !strings.Contains(detailBody, want) {
 			t.Errorf("detail body missing %q\n--- body ---\n%s", want, detailBody)
+		}
+	}
+}
+
+// TestRender_DeploymentDetail_StatelessViolation pins Cluster A
+// (error-explanations dashboard rendering, spec §6.4 amendment 1):
+// when a deployment's row carries a typed ErrorCode + the
+// Hint/Why/Fix/RelevantLogs prose, the deployment_detail template
+// renders the new .error-explanation section with all four
+// prose blocks. The check is on substring presence — the dashboard
+// has no separate parser, so a drift in the rendered markup would
+// only surface visually.
+//
+// Why unit-only (no HTTP): the apid handler is exercised by the
+// e2e suite under cmd/e2e/; the dashboard render is a pure
+// html/template Execute.
+func TestRender_DeploymentDetail_StatelessViolation(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Deployment d-1",
+		Body:  "deployment_detail",
+		Data: dashboard.DeploymentDetailData{
+			App: dashboard.AppListItem{Slug: "myapp"},
+			Deployment: dashboard.DeploymentItem{
+				ID:        "d-1",
+				Status:    "failed",
+				Kind:      "function",
+				CreatedAt: "2026-08-19T18:00:00Z",
+				ErrorCode: "stateless_only_violation",
+				Error:     "tarball contains top-level data/ directory",
+				ErrorHint: "this platform is stateless — drop top-level data/ db/ dirs",
+				ErrorWhy:  "the deploy shape is a stateful one this platform does not support in year one",
+				ErrorFix:  "• use a managed service\n• or remove the data/ directory",
+				ErrorRelevantLogs: []api.LogExcerpt{
+					{Level: "error", Source: "build", Message: "VOLUME /data detected"},
+				},
+			},
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		// CSS scoped class — pin the parent selector, not the
+		// child rules (the lint tripwire asserts no global rules).
+		"error-explanation",
+		// 5 prose blocks render in order. The template is
+		// single-pass; a reorder breaks the customer UX.
+		"stateless_only_violation",
+		"💡 this platform is stateless",
+		"why: the deploy shape is a stateful one",
+		"→ • use a managed service",
+		"relevant logs (1)",
+		// The error message is rendered too (the legacy raw Error).
+		"tarball contains top-level data/ directory",
+		// The docs link uses the typed code (NOT a hardcoded URL).
+		`href="https://docs.gregale.dev/errors/stateless_only_violation"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+// TestRender_DeploymentDetail_LegacyRowRenders pins the conditional
+// gate: when ErrorCode is empty (pre-PR-#987 row, or a non-failed
+// deploy), the new .error-explanation section must be absent so the
+// legacy single-column layout doesn't shift.
+func TestRender_DeploymentDetail_LegacyRowRenders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Deployment d-2",
+		Body:  "deployment_detail",
+		Data: dashboard.DeploymentDetailData{
+			App: dashboard.AppListItem{Slug: "myapp"},
+			Deployment: dashboard.DeploymentItem{
+				ID:        "d-2",
+				Status:    "live",
+				Kind:      "function",
+				CreatedAt: "2026-08-19T18:00:00Z",
+				Error:     "no error",
+				// ErrorCode intentionally empty.
+			},
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	// CSS class names appear in the inline <style> regardless of
+	// the conditional — pin the SECTION element specifically so a
+	// drift in the gate is the only thing the test catches.
+	if strings.Contains(body, `<section class="error-explanation"`) {
+		t.Errorf("legacy row rendered error-explanation section — gate is broken\n--- body ---\n%s", body)
+	}
+	// The header line still renders.
+	for _, want := range []string{
+		"d-2",
+		"live",
+		"function",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
 		}
 	}
 }

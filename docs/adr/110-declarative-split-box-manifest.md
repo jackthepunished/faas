@@ -1,6 +1,6 @@
 # ADR-110 · Declarative split-box deployment manifest
 
-- **Status:** **Accepted** (revised 2026-08-16) (PR-0 of the issue #911 PR cluster)
+- **Status:** **Accepted** (revised 2026-08-16, amended 2026-08-20) (PR-0 of the issue #911 PR cluster)
 - **Date:** 2026-08-15
 - **Decision:** Adopt a single, versioned, declarative deployment
   manifest as the source of truth for every host in a multi-box
@@ -258,3 +258,71 @@ mirror PR #910's slot-claim pattern per
   in commits `ac7507e2` and `f0bda4f5` as followups.
 - Per-app custom error templates + i18n — keep the catalog
   platform-side for v1.
+
+## Amendment 2: Error-explanations cluster surfaces (spec §6.4 amendment 2 — Cluster A follow-up to PR #987)
+
+Amendment 1 closed detection → wire → DB → CLI render. The audit
+[`memory/error-explanations-gap-audit-2026-08-18.md`](../memory/error-explanations-gap-audit-2026-08-18.md)
+moved 1.5/9 → 8/9; amendment 2 closes the remaining 1 + 1 to push
+the cluster to 9/9 + wire-shape forward-compat for `app_healthz_unauthorized`.
+
+**Decision:** three targeted seams, no new wire-shape for the
+detection side, no new ADR file (this amendment stays in ADR-110
+to keep customer-facing wire-shape changes in a single canonical doc).
+
+1. **Dashboard rendering of the persisted prose.** `pkg/dashboard/templates/deployment_detail.html`
+   gains a conditional `<section class="error-explanation">` block
+   gated on `{{ if .Data.Deployment.ErrorCode }}`. The block renders
+   the 5 prose fields (`ErrorCode`/`ErrorHint`/`ErrorWhy`/`ErrorFix`/
+   `ErrorRelevantLogs`) plus a docs link. The 5 fields are projected
+   from the `state.Deployment` row in
+   `cmd/apid/handlers_dashboard.go::dashboardDeploymentItem`. Legacy
+   pre-amendment-1 rows render unchanged (the conditional gate is
+   empty). Scoped CSS rules under `.error-explanation` parent
+   selector so no global bleed across pages. Tests:
+   `pkg/dashboard/dashboard_test.go::TestRender_DeploymentDetail_StatelessViolation`
+   + `…_LegacyRowRenders` (the latter asserts the section is absent
+   when `ErrorCode=""`).
+2. **Pre-upload doctor gate.** `cmd/gregale/commands2.go::cmdDeployTarball`
+   adds `--doctor-strict` (NOT `--strict` — already taken by the
+   `--diff` deploy-diff cluster at `commands2.go:838`). The flag
+   runs `runDoctorChecks(cwd)` BEFORE any HTTP / pack call.
+   Error-class findings exit 1 with the doctor report on stderr;
+   warnings render + continue. Implementation uses the
+   `cmd/gregale/commands3.go::osStderr` writer seam so tests can
+   capture the rendered prose. New helpers on `doctorReport`:
+   `HasErrors()` (hard-fail signal) and `HasWarnings()` (render +
+   continue). Flag-name scoping guarded by the new
+   `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_DoctorStrictMutex`
+   tripwire, which fails on any new unscoped `--strict` Bool/String
+   declaration outside the two documented call sites
+   (`commands2.go:838` for `--diff`, `commands_doctor.go:124` for
+   `gregale doctor`).
+3. **`app_healthz_unauthorized` wire-shape forward-compat.** The
+   guest-init → vmmd probe wire (`guest/init/liveness_linux.go::livenessResp`
+   + `cmd/vmmd/liveness_recv.go::livenessResponseBody`) gains a
+   `WWWAuthenticate string` field with `omitempty` JSON. Today's
+   discriminator is closed-set (any 401/403 → `livenessOutcomeUnauthorized`),
+   but the new field lets a future platform-side probe auth PR read
+   the realm without another wire-shape bump. The closed-set
+   comments on `pkg/fcvm/metrics.go:324` and
+   `cmd/vmmd/liveness_recv.go:67-87` are updated from 5 to 6 values.
+   New unit tests in `cmd/vmmd/liveness_recv_test.go` cover
+   `livenessOutcomeUnauthorized` (counted, classified, reset on
+   success, forbidden arm). No production behavior change.
+
+**Migration slot:** no new migration needed. Cluster A is
+wire-shape + UI + CLI gating only; it does not introduce new
+state. The dashboard projection consumes the 5 columns added by
+`migrations/00290` in amendment 1.
+
+**Out of scope (noted as followups):**
+
+- Live-app doctor probes (`--app=SLUG` needs a gateway endpoint — Cluster C).
+- i18n / locale-aware `whycopy` lookup (Cluster B).
+- `pg_get_log_archive(deployment_id, since=failure_ts)` lookup (Cluster B).
+- Build-stream `failure_class` UX coverage (Cluster B).
+- Renaming `--diff --strict` to free up `--strict` (out — would break scripts).
+- `realm="customer"` probe-auth discriminator (Explore agent finding A.1:
+  the platform doesn't auth the guest-init probe, so the collision doesn't
+  exist today; the wire-shape bump is forward-compat only).
