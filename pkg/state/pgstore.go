@@ -17795,7 +17795,19 @@ func (s *PgStore) CreateConsumerKey(ctx context.Context, accountID, appID, name,
 		 values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
 		 returning `+consumerKeySelectCols,
 		accountID, appID, name, prefix, hash, scopes, expiresAt)
-	return scanConsumerKeyRow(row)
+	k, err := scanConsumerKeyRow(row)
+	if err != nil {
+		// 23505 = unique_violation; the (account_id, app_id, name)
+		// UNIQUE tripped. Mirrors the alert_deliveries / CreateAccount
+		// pattern — surface as ErrConflict so callers can use
+		// errors.Is(err, state.ErrConflict) independent of the pg path.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ConsumerKey{}, ErrConflict
+		}
+		return ConsumerKey{}, err
+	}
+	return k, nil
 }
 
 func (s *PgStore) GetConsumerKeyByID(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
