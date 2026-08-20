@@ -239,6 +239,33 @@ service Schedd {
   // Empty WakeMethod in the response means the engine returned the
   // existing-instance fast path (no new boot happened).
   rpc EnsureWake(EnsureWakeRequest) returns (EnsureWakeResponse);
+
+  // ReportWorkloadOOM (Cluster C, ADR-121) is the vmmd-side push
+  // of a per-instance runtime OOM-kill detection on the customer's
+  // workload cgroup. vmmd's framework_ready_recv dispatcher
+  // forwards the guest-init's cgroup.events "oom_kill" signal as
+  // soon as it arrives on AF_VSOCK port 1027 (type byte 0x05);
+  // schedd's Engine.DestroyForWorkloadOOMFailure consumes the
+  // report, eagerly marks the deployment's snapshot stale (ADR-005),
+  // stamps CodeAppRuntimeOOM on the deployment row with the
+  // templated whycopy Observed payload (peak MB + plan cap), and
+  // transitions the instance RUNNING → STOPPED with kind
+  // "workload_oom_failed".
+  //
+  // Distinct from ReportLivenessFailed: the workload is dead
+  // before the kernel can report liveness probe failures (the
+  // listener goroutine inside the microVM is the only path that
+  // sees the workload OOM). peak_mb / plan_mb are the observed
+  // payload; the engine uses them to populate the whycopy
+  // Observed closure.
+  //
+  // Idempotent on the wire: re-reporting the same instance id is
+  // a no-op on the schedd side because the state-machine guard
+  // refuses to destroy a non-RUNNING instance.
+  //
+  // Additive per ADR-016: new RPC + new messages append at the
+  // end; existing field tags are untouched.
+  rpc ReportWorkloadOOM(ReportWorkloadOOMRequest) returns (ReportWorkloadOOMAck);
 }
 
 message LivenessFailedReport {
@@ -257,6 +284,47 @@ message LivenessFailedAck {
   // non-RUNNING instance is also "ok" — the state-machine
   // guard makes the destroy a no-op rather than an error so
   // a re-report doesn't trip the gRPC error path).
+  bool ok = 1;
+}
+
+// ReportWorkloadOOMRequest (Cluster C, ADR-121) is the vmmd → schedd
+// push of a workload OOM-kill detected on the customer's per-VM
+// cgroup v2 leaf. The guest-init emits vsock DGRAM type 0x05 on
+// port 1027 (workloadOOMWire{peak_mb, plan_mb}); vmmd's
+// framework_ready_recv dispatcher unwraps the message and dials
+// this RPC. Persisted on the deployment row as the CodeAppRuntimeOOM
+// observed payload (the whycopy Observed closure templates peak_mb
+// into Why and "at least peak_mb + 8 MB" into Fix).
+//
+// Wire is additive per ADR-016 — pre-Cluster-C schedds reject the
+// RPC with codes.Unimplemented; vmmd tolerates the rejection
+// (the workload is dead; the signal is best-effort).
+message ReportWorkloadOOMRequest {
+  // instance_id is the instances.id row vmmd observed the OOM
+  // kill on. The schedd engine resolves the parent app +
+  // deployment id before destroying.
+  string instance_id = 1;
+  // peak_mb is the observed peak memory (MiB) at the time of the
+  // cgroup killing. Sourced from the cgroup's memory.events
+  // `current` or `high` watermark — the guest-init cannot read
+  // the kernel's OOM-killer decision directly, so it samples
+  // the post-kill state. Templated into the whycopy Why string.
+  uint32 peak_mb     = 2;
+  // plan_mb is the plan cap (MiB) the deployment was admitted
+  // under. The host-side cgroup memory.max is plan_mb + 8 MB
+  // (api.PerVMOverheadMB); the comparison is what surfaces the
+  // "your app exceeded the plan's RAM cap" framing on the
+  // dashboard. Templated into the whycopy Fix string.
+  uint32 plan_mb     = 3;
+}
+
+// ReportWorkloadOOMAck is the typed "I consumed your report"
+// signal vmmd sees after the dial-and-recv completes. ok=true
+// when the schedd engine accepted the report (state-machine
+// guard makes a duplicate report a no-op rather than an error).
+//
+// Additive per ADR-016.
+message ReportWorkloadOOMAck {
   bool ok = 1;
 }
 

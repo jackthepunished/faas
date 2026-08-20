@@ -20,6 +20,8 @@ func TestSweep_MetricsCounters(t *testing.T) {
 	_ = m.WatchdogKills("", "")
 	_ = m.LivenessRestarts("app1", "dep1")
 	_ = m.LivenessRestarts("", "")
+	_ = m.WorkloadOOMKills("app1", "dep1")
+	_ = m.WorkloadOOMKills("", "")
 	_ = m.WarmSnapshotErrors("missing")
 	_ = m.WarmSnapshotErrors("")
 	_ = m.EvictedPriority("normal", "scale_down")

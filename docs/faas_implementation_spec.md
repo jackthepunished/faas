@@ -1051,6 +1051,101 @@ adds the 6th outcome to the listed set. New unit tests in
 `cmd/vmmd/liveness_recv_test.go` cover `livenessOutcomeUnauthorized`
 + `livenessOutcomeUnauthorized` reset-on-success + the 403 arm.
 
+### 6.4.3 Runtime OOM detection (error-explanations cluster, amendment 3 — Cluster C)
+
+Amendment 1 (§6.4.1) shipped the catalog + DB schema + CLI renderer.
+Amendment 2 (§6.4.2, Cluster A) closed the dashboard and `--doctor-strict`
+seams. **Amendment 3 (Cluster C) wires the detection seam** for
+`app_runtime_oom` — the only gap remaining in the audit.
+
+**Detection locus.** Inside the guest, on the per-workload cgroup v2
+leaf (`main-app` leaf, `partitionInto`'s write at
+`guest/init/cgroup_partition_linux.go:135`). The host-side per-VM scope
+(`vmmd/writePlanCgroup`) sees only the firecracker process; the host
+*cannot* see per-PID OOM kills inside the VM. The only detection
+surface is the guest's cgroup v2 memory controller on the workload leaf.
+
+**Wire envelope** — added to the existing closed-set dispatcher on
+framework_ready port 1027 DGRAM:
+
+```
+[1B type=0x05][json:{"peak_mb":N,"plan_mb":N}]
+```
+
+The body is a UTF-8 JSON envelope mirroring the host-side
+`workloadOOMWire` (cmd/vmmd/framework_ready_recv.go). Body cap:
+`VsockWorkloadOOMMaxBody = 256` bytes (the payload is < 32 bytes;
+256 is a future-proof margin mirrored on the guest side at
+`workloadOOMEmitMaxBody`).
+
+The host resolves instance identity from the DGRAM peer CID (same join
+as types 0x01..0x04). The new closed-set member is 0x05, owned by the
+existing dispatcher — no new vsock port, no new listener. Future event
+classes (0x06+) require a byte + a switch case + a test in lockstep;
+the tripwire is `cmd/vmmd/framework_ready_recv.go::TestParseFramework
+ReadyDatagram_TypeClosedSet`.
+
+**Producer chain** (end-to-end):
+
+```
+in-VM workload PIDs (cgroup v2 leaf, memory.max = plan + 8 MB)
+   ↓ poll(2) on leaf's cgroup.events + memory.events oom_kill delta
+guest/init::WatchOOM(ctx, leaf, planMB, emit, log)         ← NEW
+   ↓ samples memory.events.high (or memory.current fallback)
+guest-init::EmitWorkloadOOM(ctx, peakMB, planMB)           ← NEW (vsock DGRAM 0x05)
+cmd/vmmd::framework_ready_recv.go::dispatchWorkloadOOM
+   ↓
+pkg/fcvm::Manager.ReportWorkloadOOM(instanceID, peakMB, planMB)  ← NEW
+   ↓ via WithWorkloadOOMSink (mirrors WithLivenessSink)
+cmd/vmmd/main.go closure → cli.ReportWorkloadOOM gRPC
+   ↓
+pkg/scheddgrpc/server.go::ReportWorkloadOOM                 ← NEW (RPC + handler)
+   ↓
+pkg/sched/engine.go::DestroyForWorkloadOOMFailure(ctx, instanceID, peakMB, planMB)  ← NEW
+   ↓
+whycopy.Decorate(problem, CodeAppRuntimeOOM, struct{PeakMB, PlanMB int}{...})
+   ↓
+store.SetDeploymentFailedEx(deploymentID, CodeAppRuntimeOOM, ...problem.Hint,
+                            problem.why, problem.Fix, nil)
+   ↓
+dashboard .error-explanation  +  CLI inspect --errors  +  gregale doctor
+```
+
+**Whycopy Observed** — the `CodeAppRuntimeOOM` catalog row ships an
+`Observed func(observed any) (why, fix string)` closure that templates
+the (peakMB, planMB) tuple into the customer-facing prose:
+
+- **Why:** "the cgroup memory controller killed the process at
+  `<peak>` MB (plan cap `<plan>` MB + 8 MB overhead); the kernel
+  OOM-killer fired inside the microVM"
+- **Fix:** "• upgrade from a `<plan>` MB plan to a plan with ≥
+  `<peak+8>` MB of RAM\n• trim in-memory state (caches, buffers,
+  large request bodies held in memory)"
+
+The static `Why` / `Fix` strings remain the fallback when `Decorate`
+is called with `observed=nil` (no templating — the existing 6 customer
+fixtures that never set the observed value still see the right prose).
+
+The cross-reference line "if this is a build step, see
+/errors/build/limits#memory instead" was dropped — the build-OOM path
+is `CodeBuildOOM`, not `CodeAppRuntimeOOM`; the cross-reference was
+misleading because the two constructors are distinct.
+
+**Tripwires** stay green: `TestParseFrameworkReadyDatagram_TypeClosedSet`
+(closed-set guard), `TestEveryCodeHasWhycopyEntry` (Observed closure
+presence), `TestObservedRendering` (template parity). The audit moves
+from 9/9 covering-of-named-codes → 9/9 with end-to-end detection
+wired.
+
+**Metal acceptance gate** — `cmd/vmmd/workload_oom_metal_test.go`:
+boots a Hobby-plan guest, places a workload in the per-VM cgroup leaf
+with `memory.max = 256 MiB`, runs
+`python3 -c 'x=[]; [x.append(bytearray(1024*1024)) for _ in range(384)]'`
+to force OOM, asserts the deployment row is stamped `app_runtime_oom`
+with the templated peak MB ≈ 384 + plan cap 256 within the tripwire
+budget. Runs on `make test-metal` (x86_64) or `make metal-lima`
+(M3+ Mac).
+
 ---
 
 ## 7. Networking

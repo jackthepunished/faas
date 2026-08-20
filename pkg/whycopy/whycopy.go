@@ -119,7 +119,27 @@ var catalog = map[string]Render{
 		Title: "Container out of memory",
 		Hint:  "your app exceeded the plan's RAM cap and was killed",
 		Why:   "the cgroup memory controller killed the process because it exceeded memory.max (plan + 8 MB); the kernel OOM-killer fired inside the microVM",
-		Fix:   "• upgrade to a plan with more RAM\n• trim in-memory state (caches, buffers, large request bodies held in memory)\n• if this is a build step, see /errors/build/limits#memory instead",
+		Fix:   "• upgrade to a plan with more RAM\n• trim in-memory state (caches, buffers, large request bodies held in memory)",
+		Observed: func(observed any) (why, fix string) {
+			if observed == nil {
+				return "", ""
+			}
+			// Workspace type for the observed payload: (peak MB, plan
+			// cap MB). Engine.DestroyForWorkloadOOMFailure emits this
+			// struct when stamping the deployment row.
+			//
+			// The +8 MB is api.PerVMOverheadMB — the in-VM cgroup
+			// memory.max is set to planMB + 8 to cover the small
+			// daemon overhead the kernel charges to the same leaf.
+			v, ok := observed.(struct{ PeakMB, PlanMB int })
+			if !ok {
+				return "", ""
+			}
+			return fmt.Sprintf("the cgroup memory controller killed the process at %d MB (plan cap %d MB + 8 MB overhead); the kernel OOM-killer fired inside the microVM",
+					v.PeakMB, v.PlanMB),
+				fmt.Sprintf("• upgrade from a %d MB plan to a plan with at least %d MB of RAM\n• trim in-memory state (caches, buffers, large request bodies held in memory)",
+					v.PlanMB, v.PeakMB+8)
+		},
 	},
 	api.CodeDepInstallFailed: {
 		Title: "Dependency installation failure",

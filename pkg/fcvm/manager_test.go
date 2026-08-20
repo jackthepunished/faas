@@ -2644,3 +2644,71 @@ func TestInstanceByCID_UnknownCID(t *testing.T) {
 		t.Error("InstanceByCID(unknown) = nil, want error")
 	}
 }
+
+// TestManager_ReportWorkloadOOM_CallsRelay (Cluster C / ADR-121)
+// asserts the Manager.ReportWorkloadOOM path invokes the
+// WorkloadOOMSink with the observed (peakMB, planMB) payload
+// captured at the guest-init cgroup.events listener. The
+// cmd/vmmd wires the relay via WithWorkloadOOMSink; the framework
+// _ready recv dispatcher calls ReportWorkloadOOM when a DGRAM
+// type 0x05 arrives on port 1027.
+//
+// The test is intent-on: a stub relay captures the call and the
+// assertions inspect the captured values without booting a guest
+// VM. The Manager's live map is not consulted (the relay is
+// forwarded to schedd before the destroy path runs).
+func TestManager_ReportWorkloadOOM_CallsRelay(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	var (
+		mu          sync.Mutex
+		called      bool
+		gotInstance string
+		gotPeak     int
+		gotPlan     int
+	)
+	m.WithWorkloadOOMSink(func(_ context.Context, instanceID string, peakMB, planMB int) {
+		mu.Lock()
+		defer mu.Unlock()
+		called = true
+		gotInstance = instanceID
+		gotPeak = peakMB
+		gotPlan = planMB
+	})
+
+	m.ReportWorkloadOOM(context.Background(), "inst-1", 384, 256)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !called {
+		t.Fatal("WorkloadOOMSink was not called")
+	}
+	if gotInstance != "inst-1" {
+		t.Errorf("instanceID = %q, want %q", gotInstance, "inst-1")
+	}
+	if gotPeak != 384 {
+		t.Errorf("peakMB = %d, want 384", gotPeak)
+	}
+	if gotPlan != 256 {
+		t.Errorf("planMB = %d, want 256", gotPlan)
+	}
+}
+
+// TestManager_ReportWorkloadOOM_NilRelayNoOp (Cluster C / ADR-121)
+// asserts that ReportWorkloadOOM is a no-op when no relay is wired
+// (a unit test that doesn't construct a relay). The Manager must
+// guard on nil so the missing-wire path doesn't panic — this is
+// the project convention (LivenessFailedSink nil-safe, see
+// cmd/vmmd/liveness_recv_test for the parallel).
+func TestManager_ReportWorkloadOOM_NilRelayNoOp(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+	// Deliberately do NOT call WithWorkloadOOMSink.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("ReportWorkloadOOM with nil relay panicked: %v", r)
+		}
+	}()
+	m.ReportWorkloadOOM(context.Background(), "inst-1", 384, 256)
+}
