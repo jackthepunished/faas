@@ -1,8 +1,8 @@
--- filename: 00305_domain_doctor_observations.sql
+-- filename: 00308_domain_doctor_observations.sql
 -- +goose Up
 -- +goose StatementBegin
 
--- 00305_domain_doctor_observations.sql — ADR-120 (issue #961
+-- 00308_domain_doctor_observations.sql — ADR-120 (issue #961
 -- follow-on). Persist the per-domain probe results that the
 -- `gregale domains doctor` endpoint surfaces. The existing
 -- `dns_poller` writes the rows on its 30 s tick; the doctor
