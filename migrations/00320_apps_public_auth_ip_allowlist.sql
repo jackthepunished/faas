@@ -40,11 +40,14 @@
 --     (rebound past 00309/00313, itself a 3-hop chain). The
 --     cross-PR slot gate would block 00314 against PR #990.
 --     Renumbered past 00314 to 00320, adding reservation fences
---     00315-00319 to bridge the gap. Pattern: when an open PR
+--     00314-00319 to bridge the gap. Pattern: when an open PR
 --     owns a slot, jump past 00314 + N claimed slots past it
---     to land on a free slot. Per docs/adr/README.md "migrations
---     are append-only and contiguous" + the precedent set by
---     PR #984 (issue #977, 8-hop renumber), PR #986 itself
+--     to land on a free slot. PR #999 also adds a 00314 fence
+--     for the synthetic-merge embed's contiguity; if PR #990
+--     merges first, that fence becomes a same-slot duplicate
+--     (fence pattern carve-out, see ADR-041). Per docs/adr/README.md
+--     "migrations are append-only and contiguous" + the precedent
+--     set by PR #984 (issue #977, 8-hop renumber), PR #986 itself
 --     (3-hop renumber 00305→00308→00309→00313), and PR #991
 --     (3-hop renumber, 00318/00319 final).
 
