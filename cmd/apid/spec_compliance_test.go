@@ -186,6 +186,15 @@ var dtoExclude = map[string]bool{
 	// Single-use inline shape — no SDK callers reference it by
 	// name, so no standalone schema.
 	"CreateTriggerBatchResult": true,
+	// Issue #975 item #1 / ADR-122 — the PATCH response shape is
+	// inlined in the OpenAPI spec (api/openapi.yaml PATCH /v1/apps/
+	// {slug}/deployments/{deployment}/openapi 200 response) rather
+	// than $ref'd to a standalone schema, because the inline shape
+	// keeps the response body self-documenting for SDK generators
+	// and avoids a vacuum lint panic on the schema's $ref chain.
+	// The Go DTO is the typed wire shape that the SDK method
+	// unmarshals into.
+	"OpenAPIDocResponse": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
