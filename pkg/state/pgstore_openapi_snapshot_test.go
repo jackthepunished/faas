@@ -1,8 +1,8 @@
 package state_test
 
 // PgStore parity tests for the new OpenAPISnapshot Store methods
-// (ADR-121, migration 00314). The migration-pinned schema is
-// verified by migrations/00314_deployment_openapi_snapshots_test.go;
+// (ADR-121, migration 00330). The migration-pinned schema is
+// verified by migrations/00330_deployment_openapi_snapshots_test.go;
 // this file pins the *hand-written SQL* in pgstore.go
 // (UpdateDeploymentOpenAPISnapshot, LatestOpenAPISnapshotForScope,
 // OpenAPISnapshotByDeployment) against a real cluster.
@@ -185,7 +185,7 @@ func TestPg_OpenAPISnapshot_NotFound(t *testing.T) {
 // TestPg_OpenAPISnapshot_LatestByScope pins that the read
 // picks the most recent captured_at across multiple rows for
 // the same (app_id, scope). The (app_id, scope, captured_at
-// DESC) index added in migration 00314 backs the lookup.
+// DESC) index added in migration 00330 backs the lookup.
 func TestPg_OpenAPISnapshot_LatestByScope(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

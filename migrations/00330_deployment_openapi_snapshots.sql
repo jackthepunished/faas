@@ -2,7 +2,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00314_deployment_openapi_snapshots.sql — ADR-121 (issue: API
+-- 00330_deployment_openapi_snapshots.sql — ADR-121 (issue: API
 -- contract diff). Per-deployment snapshot of the projected customer
 -- OpenAPI surface, captured atomically when a deployment transitions
 -- to status='live'. The PR-C gate (PATCH /v1/deployments/{id} on
