@@ -423,7 +423,8 @@ func (c *capWriter) Write(b []byte) (int, error) {
 			}
 		}
 	}
-	n, err := c.ResponseWriter.Write(b) // lgtm[go/reflected-xss] false-positive: capWriter is a pass-through on the apid loopback proxy; upstream is apid bound to loopback (127.0.0.1:8081) emitting application/json or application/problem+json — XSS sink unreachable. Mirrors pkg/middleware/authlimit.go:88.
+	// lgtm[go/reflected-xss] false-positive: capWriter is a transparent pass-through. The apid upstream at loopback (127.0.0.1) emits only application/json, application/problem+json, or text/plain — CodeQL's XSS sink is unreachable. Mirrors the alert #146 architectural pattern (statusRecorder ResponseWriter pass-through, also dismissed as false positive for the same reason). See pkg/middleware/authlimit.go:88 for the canonical suppression shape. Issue #995 / ADR-121.
+	n, err := c.ResponseWriter.Write(b)
 	if n > 0 {
 		c.written += int64(n)
 	}
