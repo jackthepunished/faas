@@ -1,7 +1,9 @@
 # ADR-117 · Deploy stage progress (typed `event: stage` SSE frame + CLI ticker)
 
-- **Status:** **Proposed**
-- **Date:** 2026-08-18
+- **Status:** **Accepted** (PR #985 merged 2026-08-19; post-stream
+  `gregale deploys show <id>` companion shipped in the follow-on PR
+  on branch `worktree-feat-deploys-show-summary`)
+- **Date:** 2026-08-18 (initial) · 2026-08-19 (post-stream addition)
 - **Decision:** The `/v1/deployments/{id}/logs` SSE stream
   publishes a typed `event: stage` frame for each named pipeline
   stage the customer's deploy passes through. The closed 6-stage
@@ -11,7 +13,12 @@
   cursor-up redraw) with a static fallback for pipes / `--json` /
   `NO_COLOR`. The deploy UX moves from "single spinner" to
   "6-row named progress block with per-stage elapsed time" — the
-  same affordance Render's deploy log exposes.
+  same affordance Render's deploy log exposes. The follow-on
+  companion surface (`gregale deploys show <id>`) re-reads the
+  persisted `stage_state` jsonb via
+  `GET /v1/deployments/{id}/stages` and renders the same 6-row
+  block statically for post-mortem / support hand-off — the
+  closed vocabulary is shared by both surfaces, no parallel DTO.
 
 ## Context
 
@@ -186,6 +193,77 @@ versa).
   chokepoint; add a `transitionWithStage` that calls it after
   the stage append.
 
+## Follow-on: `gregale deploys show <id>` (post-stream summary)
+
+### Context
+
+The live ticker is only visible while `gregale deploy` is running.
+After the SSE stream closes, the only thing left in the operator's
+scrollback is the terminal `✓ Deployed. …` (or `✗ Failed. …`)
+line — the per-stage timing that built confidence during the
+deploy is gone. Customers want to:
+
+- re-render the same 6-row block after the deploy finishes so
+  they can paste it into a post-mortem,
+- script against the closed-set stages (`jq '.history | map(.name)'`)
+  without re-streaming,
+- hand the deployment id to support and have the support engineer
+  see the same thing the customer saw.
+
+### Decision
+
+Add a NEW top-level verb `deploys` (distinct from `deployment` /
+`deployments`) with one subcommand `show <id>`:
+
+```
+gregale deploys show <id>          # human 6-row block
+gregale deploys show <id> --json   # typed stage_state envelope
+```
+
+The verb is a fresh entry in the dispatch table + usage block +
+cli_meta; no shadowing of the existing `deployment` (singular GET
+with `--show-scan` / `--show-secret-scan` / `set-min-instances`)
+or `deployments` (paginated list). Future read-only deploy
+drill-downs (timeline, events, artifacts) land as siblings of
+`show` in this cluster.
+
+Wire shape: `GET /v1/deployments/{id}/stages` returns the raw
+`deployments.stage_state` jsonb verbatim (the column IS the wire
+shape — no Go-side DTO layer on the server). The handler
+re-emits the bytes via `json.RawMessage`; the SDK method
+(`pkg/api.Client.GetDeploymentStages`) also returns
+`json.RawMessage` to avoid a `pkg/api → pkg/state` import cycle
+(`pkg/state/memstore.go` already imports `pkg/api`). The CLI
+unmarshals into `pkg/state.StageState` directly where the
+import direction is allowed.
+
+The renderer is `renderDeploySummary` in `deploy_stages.go` —
+the SAME function the live ticker calls frame-by-frame, so the
+static post-stream block and the live ticker always agree on
+format. Both share `stageOrder`, `stageLabels`, and
+`formatStageDuration`.
+
+### IDOR posture
+
+Cross-account probes return **404 not 403**, mirroring
+`getDeployment` (`handlers_ext.go:1136`) and `getDeploymentScan`
+(`handlers_scan.go:58`). The "deployment doesn't exist" and
+"deployment exists in another account" paths must be
+indistinguishable — same status, same problem code, same body.
+
+### Scope deliberately excluded
+
+- No `--follow` flag on `deploys show`. Live stream lives in
+  `gregale deploy` itself; the static summary is strict by
+  design so `jq` and shell pipelines can rely on a stable
+  shape.
+- No second round-trip to fetch `deployments.status`. The
+  renderer's footer (`live since` / `failed at` / `<status>
+  at`) needs the terminal status + timestamp; for the v1
+  companion we pass empty status so the footer prints just
+  `<ts>`. A future `deploys status <id>` (or extending this
+  verb) can supply the terminal state without re-rendering.
+
 ## Consequences
 
 ### Positive
@@ -243,6 +321,12 @@ versa).
 - `cmd/apid/handlers_ext_test.go::TestEmitStageDiff_AllSixStages`
   — 6 transitions, frame order, JSON shape, `announced` map
   dedup, failure stamp.
+- `cmd/apid/handlers_stages_test.go::TestGetDeploymentStages_HappyPath`
+  — 3 forward transitions through the store, GET /stages
+  returns the exact jsonb the column carries (pass-through,
+  no Go-side re-shape).
+- `cmd/apid/handlers_stages_test.go::TestGetDeploymentStages_CrossAccountReturns404`
+  — IDOR posture: cross-account probe returns 404 (not 403).
 - `cmd/gregale/output_test.go::TestLiveTicker_TTY_RedrawsInPlace`
   — 6 Updates produce exactly 6 row lines + 10 cursor-up escapes
   + a Close flush.
@@ -250,6 +334,22 @@ versa).
   — same input with non-TTY; no ANSI escapes, ≥ 7 newlines.
 - `cmd/gregale/output_test.go::TestStageGlyph_Mapping` — pin the
   per-status glyph table (✓/…/✗/·).
+- `cmd/gregale/deploy_stages_test.go::TestRenderDeploySummary_AllSixCompleted`
+  — happy-path render: every label present, `live since` footer.
+- `cmd/gregale/deploy_stages_test.go::TestRenderDeploySummary_LiveDeployment`
+  — mid-deploy render: no terminal footer, all 6 labels.
+- `cmd/gregale/deploy_stages_test.go::TestRenderDeploySummary_Failed`
+  — failed render: `failed at` footer, no `live since` footer.
+- `cmd/gregale/deploys_show_test.go::TestCmdDeploysShow_HappyPath`
+  — full wire path: httptest stub → SDK method → render → 6
+  labels present.
+- `cmd/gregale/deploys_show_test.go::TestCmdDeploysShow_JSON`
+  — `--json` envelope shape: `current` + `history[]` with 6
+  rows.
+- `cmd/gregale/deploys_show_test.go::TestCmdDeploysShow_NotFoundFromServer`
+  — server 404 surfaces as non-zero exit.
+- `cmd/gregale/deploys_show_test.go::TestCmdDeploys_Dispatcher`
+  — verb-level: empty / unknown / bad-id / no-args all return 1.
 - `cmd/gregale/commands2_test.go::TestStreamDeployLogs_DrivesStageTicker`
   — full CLI path through `cmdDeployTarball` with the stage
   fixture; asserts every human-readable stage label appears in
@@ -269,13 +369,19 @@ versa).
 ### OpenAPI parity (`make spec-check`)
 
 - `pkg/apid/openapi.yaml` must match `api/openapi.yaml` after
-  `make spec-sync`. The new frame is prose-only (the SSE
-  vocabulary isn't in the OpenAPI schema).
+  `make spec-sync`. The new `event: stage` SSE frame is
+  prose-only (the SSE vocabulary isn't in the OpenAPI schema).
+  The follow-on `GET /v1/deployments/{id}/stages` route IS
+  in the OpenAPI schema (closed `current` enum + `history[]`
+  items); both spec copies must match.
 
 ### SDK regen (`make sdk-gen-node && make sdk-check`)
 
-- Both Node and Python SDKs regenerate cleanly. Prose-only SSE
-  vocabulary change so no codegen impact.
+- Both Node and Python SDKs regenerate cleanly. The SSE
+  vocabulary change is prose-only — no codegen impact. The
+  follow-on `GetDeploymentStages` SDK method DOES add a new
+  typed function (`json.RawMessage` return to avoid the
+  `pkg/api → pkg/state` import cycle); SDK regen must succeed.
 
 ### Manual end-to-end
 
@@ -300,6 +406,31 @@ fallback. Then `gregale deploy --repo … --json | jq` to confirm
 the JSON envelope survives (no human-readable ticker, but the
 build completes with exit 0).
 
+After the deploy finishes, `gregale deploys show <id>` re-renders
+the same 6-row block from the persisted `stage_state` jsonb:
+
+```
+$ gregale deploys show 0123456789abcdef0123456789abcdef
+   ✓  Source downloaded         1.2s
+   ✓  Dependencies restored     4.8s
+   ✓  Image built               8.1s
+   ✓  Security scan             2.1s
+   ✓  Snapshot prepared         1.8s
+   ✓  Readiness passed          0.4s
+   Total                        7.8s
+   live since 2026-08-19T12:34:56Z
+
+$ gregale deploys show <id> --json | jq '.history | map(.name)'
+[
+  "source_download",
+  "dependency_restore",
+  "image_build",
+  "security_scan",
+  "snapshot_prepare",
+  "readiness"
+]
+```
+
 ### Metal-lima
 
 **Not required.** This PR does not touch `pkg/fcvm`,
@@ -308,11 +439,23 @@ touched at the pure-Go transition emitters only.
 
 ## Branch
 
-`worktree-feat-deploy-stage-progress` (single PR, single branch
-— mirrors `worktree-feat-deploy-ux-mega-a` pattern).
+- Initial PR (#985, merged 2026-08-19):
+  `worktree-feat-deploy-stage-progress` (single PR, single
+  branch — mirrors `worktree-feat-deploy-ux-mega-a` pattern).
+- Follow-on PR (post-stream summary companion, this ADR
+  amendment): `worktree-feat-deploys-show-summary` (single
+  PR, ~600 LOC, no new migration slot — reuses 00302's
+  `stage_state` column, adds 1 new HTTP route + SDK method +
+  CLI verb + ADR amendment + tests).
 
 ## Estimated scope
 
-~600-700 LOC across ~12 files (migration + state + imaged/builderd
-+ apid SSE + CLI ticker + tests + ADR), one new migration slot
-(00302), no new deps, no SDK breakage.
+Initial PR (~600-700 LOC across ~12 files: migration + state +
+imaged/builderd + apid SSE + CLI ticker + tests + ADR), one new
+migration slot (00302), no new deps, no SDK breakage.
+
+Follow-on PR (~600 LOC across ~6 files: apid handler + tests +
+SDK method + CLI verb + tests + ADR amendment), no new
+migration slot (the 00302 `stage_state` column is the wire
+shape — the follow-on PR is a read-only surface over it), one
+new HTTP route, one new SDK method, no new deps.

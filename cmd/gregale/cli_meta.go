@@ -323,6 +323,20 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    dispatchDeploys,
+		DocSlug: "deploys",
+		Short:   "Read-only deploy drill-downs (deploys show <id>)",
+		Subcommands: []cliSub{
+			// ADR-117 companion read surface. Future siblings
+			// (timeline, events, artifacts) land here as new
+			// cliSub entries — NOT as flags on the singular
+			// `deployment` verb, which is already at three
+			// flag-shaped drill-downs.
+			{Name: "show", Short: "Print the closed 6-stage post-stream summary"},
+		},
+		Positionals: []string{"<id>"},
+	},
+	{
 		Name:    "deploy",
 		DocSlug: "deploy",
 		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)",

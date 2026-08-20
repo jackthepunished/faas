@@ -537,6 +537,37 @@ func (c *Client) GetDeploymentSecretScan(ctx context.Context, id string) (Secret
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/secret-scan", nil, &out)
 }
 
+// GetDeploymentStages returns the closed-6-stage summary for a
+// deployment (ADR-117 follow-up). Companion to GetDeployment (which
+// returns the typed state.Deployment row) and the /logs SSE stream
+// (which emits `event: stage` frames during a live deploy). This
+// endpoint serves the post-stream summary use case — `gregale
+// deploys show <id>` and the future dashboard widget.
+//
+// Wire shape: the same `state.StageState` JSON already stored on
+// `deployments.stage_state` (migration 00302). The handler does NOT
+// add a typed API DTO — the column's jsonb IS the wire. To avoid
+// pulling the pkg/state import into pkg/api (which would create a
+// cycle: pkg/state/memstore.go imports pkg/api for error codes), the
+// SDK returns the raw jsonb; callers that want the typed view
+// json.Unmarshal into state.StageState themselves. The closed
+// vocabulary (`source_download` / `dependency_restore` / `image_build`
+// / `security_scan` / `snapshot_prepare` / `readiness`) is enforced
+// at the database layer by
+// `deployments_stage_state_current_check`, so a malformed row would
+// never reach the wire.
+//
+// 404 surfaces in three cases — deployment row missing, deployment
+// belongs to a different account (IDOR-safe), or the deployment
+// predates the migration backfill (unreachable in practice; the
+// migration set NOT NULL DEFAULT on every existing row). All three
+// are returned via the same ErrNotFound wrapping callers already
+// branch on with errors.Is(err, api.ErrNotFound).
+func (c *Client) GetDeploymentStages(ctx context.Context, id string) (json.RawMessage, error) {
+	var out json.RawMessage
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/stages", nil, &out)
+}
+
 // PatchDeployment sets the per-deployment cold-wake floor override
 // (issue #557 closure / ADR-072). MinInstances is the only mutable
 // field on a deployment post-create — image / digest / overrides /
