@@ -1,8 +1,8 @@
--- filename: 00334_apps_static_egress_ip.sql
+-- filename: 00336_apps_static_egress_ip.sql
 -- +goose Up
 -- +goose StatementBegin
 
--- 00334_apps_static_egress_ip.sql — ADR-119 (static outbound IP per app).
+-- 00336_apps_static_egress_ip.sql — ADR-119 (static outbound IP per app).
 --
 -- Adds two nullable columns to `apps` plus a partial unique index:
 --
