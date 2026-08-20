@@ -746,6 +746,7 @@ CREATE TABLE public.apps (
     github_production_branch text,
     min_instances integer DEFAULT 0 NOT NULL,
     egress_allowlist cidr[] DEFAULT '{}'::cidr[] NOT NULL,
+    public_auth_ip_allowlist cidr[] DEFAULT '{}'::cidr[] NOT NULL,
     autoscale_target_rps integer,
     autoscale_target_cpu_pct integer,
     github_install_binding_id text,
@@ -795,7 +796,7 @@ CREATE TABLE public.apps (
     CONSTRAINT apps_node_id_nonempty_chk CHECK ((node_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
     CONSTRAINT apps_overflow_node_chk CHECK (((overflow_node IS NULL) OR (overflow_node <> '00000000-0000-0000-0000-000000000000'::uuid))),
     CONSTRAINT apps_preview_pr_state_chk CHECK (((preview_pr_state = ANY (ARRAY['open'::text, 'closed'::text, 'stale'::text, 'torn_down'::text])) OR (preview_pr_state IS NULL))),
-    CONSTRAINT apps_public_auth_mode_chk CHECK ((public_auth_mode = ANY (ARRAY['open'::text, 'bearer'::text, 'basic'::text]))),
+    CONSTRAINT apps_public_auth_mode_chk CHECK ((public_auth_mode = ANY (ARRAY['open'::text, 'bearer'::text, 'basic'::text, 'ip_allowlist'::text]))),
     CONSTRAINT apps_ram_mb_check CHECK ((ram_mb > 0)),
     CONSTRAINT apps_reassigned_at_chk CHECK (((reassigned_at IS NULL) OR (reassigned_at <= (now() + '00:01:00'::interval)))),
     CONSTRAINT apps_runtime_check CHECK (((runtime IS NULL) OR (runtime = ANY (ARRAY['node22'::text, 'python312'::text, 'go124'::text, 'go124-alpine'::text, 'node24'::text, 'python313'::text])))),
@@ -4225,6 +4226,51 @@ ALTER INDEX public.data_upstream_probes_pkey ATTACH PARTITION public.data_upstre
 --
 
 CREATE TRIGGER apps_egress_allowlist_cidr BEFORE INSERT OR UPDATE OF egress_allowlist ON public.apps FOR EACH ROW EXECUTE FUNCTION public.apps_egress_allowlist_cidr_check();
+
+
+--
+-- Name: apps_public_auth_ip_allowlist_cidr_check(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.apps_public_auth_ip_allowlist_cidr_check() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+declare
+  bad cidr;
+begin
+  if new.public_auth_ip_allowlist is null or cardinality(new.public_auth_ip_allowlist) = 0 then
+    return new;
+  end if;
+  for bad in
+    select c
+      from unnest(new.public_auth_ip_allowlist) c
+     where family(c) not in (4, 6)
+     limit 1
+  loop
+    raise exception 'apps_public_auth_ip_allowlist: only v4 or v6 CIDRs (got family % for %)', family(bad), bad
+      using errcode = '23514',
+            constraint = 'apps_public_auth_ip_allowlist_cidr';
+  end loop;
+  for bad in
+    select c
+      from unnest(new.public_auth_ip_allowlist) c
+     where masklen(c) = 0
+     limit 1
+  loop
+    raise exception 'apps_public_auth_ip_allowlist: rejected % (masklen /0; ADR-118 non-/0 contract)', bad
+      using errcode = '23514',
+            constraint = 'apps_public_auth_ip_allowlist_cidr';
+  end loop;
+  return new;
+end;
+$$;
+
+
+--
+-- Name: apps apps_public_auth_ip_allowlist_cidr; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER apps_public_auth_ip_allowlist_cidr BEFORE INSERT OR UPDATE OF public_auth_ip_allowlist ON public.apps FOR EACH ROW EXECUTE FUNCTION public.apps_public_auth_ip_allowlist_cidr_check();
 
 
 --
