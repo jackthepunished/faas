@@ -1,6 +1,9 @@
 package openapidiff
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // AdditiveChangeKind is the categorical flavour of an additive
 // (compatible) change. The PR-C gate lists these with severity
@@ -76,8 +79,8 @@ func CompareAdditive(baseline, proposed *Spec) []AdditiveChange {
 	}
 	var out []AdditiveChange
 	// Path level.
-	basePathKeys := sortedKeys(baseline.Paths)
-	propPathKeys := sortedKeys(proposed.Paths)
+	basePathKeys := unionSortedKeys(baseline.Paths)
+	propPathKeys := unionSortedKeys(proposed.Paths)
 	for _, p := range difference(propPathKeys, basePathKeys) {
 		out = append(out, AdditiveChange{
 			Kind:   AdditivePathAdded,
@@ -95,14 +98,14 @@ func CompareAdditive(baseline, proposed *Spec) []AdditiveChange {
 		if baseOp == nil || propOp == nil {
 			continue
 		}
-		baseMethods := sortedKeys(baseOp.Methods)
-		propMethods := sortedKeys(propOp.Methods)
+		baseMethods := unionSortedKeys(baseOp.Methods)
+		propMethods := unionSortedKeys(propOp.Methods)
 		for _, m := range difference(propMethods, baseMethods) {
 			out = append(out, AdditiveChange{
 				Kind:   AdditiveMethodAdded,
 				Path:   p,
 				Method: m,
-				Field:  "endpoint " + mUpper(m) + " " + p,
+				Field:  "endpoint " + strings.ToUpper(m) + " " + p,
 				Status: "",
 			})
 		}
@@ -114,15 +117,15 @@ func CompareAdditive(baseline, proposed *Spec) []AdditiveChange {
 			if bOp == nil || pOp == nil {
 				continue
 			}
-			baseStatuses := sortedKeys(bOp.Responses)
-			propStatuses := sortedKeys(pOp.Responses)
+			baseStatuses := unionSortedKeys(bOp.Responses)
+			propStatuses := unionSortedKeys(pOp.Responses)
 			for _, s := range difference(propStatuses, baseStatuses) {
 				out = append(out, AdditiveChange{
 					Kind:   AdditiveStatusAdded,
 					Path:   p,
 					Method: m,
 					Status: s,
-					Field:  "response " + mUpper(m) + " " + p + " " + s,
+					Field:  "response " + strings.ToUpper(m) + " " + p + " " + s,
 				})
 			}
 			// Status × Content-Type level.
@@ -133,15 +136,15 @@ func CompareAdditive(baseline, proposed *Spec) []AdditiveChange {
 				if bResp == nil || pResp == nil {
 					continue
 				}
-				baseCTs := sortedKeys(bResp.Content)
-				propCTs := sortedKeys(pResp.Content)
+				baseCTs := unionSortedKeys(bResp.Content)
+				propCTs := unionSortedKeys(pResp.Content)
 				for _, ct := range difference(propCTs, baseCTs) {
 					out = append(out, AdditiveChange{
 						Kind:   AdditiveContentTypeAdded,
 						Path:   p,
 						Method: m,
 						Status: s,
-						Field:  "content-type " + ct + " " + mUpper(m) + " " + p + " " + s,
+						Field:  "content-type " + ct + " " + strings.ToUpper(m) + " " + p + " " + s,
 					})
 				}
 				// Content-Type × Properties level.
@@ -217,17 +220,6 @@ func appendAdditiveProperties(out []AdditiveChange, path, method, status, ct, pa
 	return out
 }
 
-// sortedKeys returns the sorted keys of a string-keyed map.
-// nil/empty maps yield an empty (non-nil) slice.
-func sortedKeys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // intersection returns sorted keys present in both a and b.
 func intersection(a, b []string) []string {
 	bSet := make(map[string]struct{}, len(b))
@@ -258,18 +250,4 @@ func difference(a, b []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// mUpper renders an HTTP method upper-case ("GET", "POST").
-// Helper kept tiny — additive-change renderers consume the form.
-func mUpper(method string) string {
-	out := make([]byte, len(method))
-	for i := 0; i < len(method); i++ {
-		if method[i] >= 'a' && method[i] <= 'z' {
-			out[i] = method[i] - 'a' + 'A'
-		} else {
-			out[i] = method[i]
-		}
-	}
-	return string(out)
 }
