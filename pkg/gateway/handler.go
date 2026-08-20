@@ -4761,6 +4761,15 @@ haveApp:
 				cw.finishCacheCapture(h.responseCache, key, time.Now())
 			}
 		}()
+		// Stash the matched rule on the request ctx so the
+		// wake-failure branch further down can consult the
+		// cache for a stale-if-error entry. Without this
+		// stash, the gate-failure path would have to
+		// re-run the matcher (the rule was already
+		// resolved above, no point doing it twice).
+		if rule != nil {
+			r = r.WithContext(withCacheRuleContext(r.Context(), rule, app.ID, r.Method, r.URL.Path, computeVaryHash(r, rule.VaryOn)))
+		}
 		_ = cacheRule
 	}
 
@@ -4864,6 +4873,17 @@ haveApp:
 	//nolint:contextcheck // request ctx at handler boundary.
 	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
 	if err != nil {
+		// ADR-122 §Decision: kind=cache stale-on-error path.
+		// On wake failure (queue full, bootstrap abort, etc.)
+		// consult the cache for a stale entry BEFORE falling
+		// through to writeWakeError. A stale serve on origin
+		// failure is strictly better than a hard 503 — the
+		// body is recent enough that the customer experience
+		// stays smooth, and the alternative (503) loses both
+		// the request AND the wake budget for nothing.
+		if served, _ := h.tryServeStaleOnWakeError(w, r, app, rec); served {
+			return
+		}
 		writeWakeError(w, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
