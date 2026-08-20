@@ -91,15 +91,20 @@ func TestEmitDoctorOldestObservationGauge(t *testing.T) {
 
 	// Clock-skew safety: a row whose observed_at is in the future
 	// (e.g. Postgres clock ahead of the apid host) must clamp to 0
-	// so the alert never sees a negative age.
-	if err := srv.store.UpsertDoctorObservation(ctx, state.DomainDoctorObservation{
+	// so the alert never sees a negative age. Uses a fresh
+	// MemStore so the prior api.example.com row (now-90s, still
+	// the MIN) doesn't dominate — review-fix #7 caught the
+	// prior test seeding a future row on top of an older row,
+	// leaving the clamp branch never entered.
+	futureSrv := &server{store: state.NewMemStore(), ops: wire.NewOpsMetrics("apid_test_clock_skew")}
+	if err := futureSrv.store.UpsertDoctorObservation(ctx, state.DomainDoctorObservation{
 		Domain: "future.example.com", ObservedAt: now.Add(10 * time.Minute),
 	}); err != nil {
 		t.Fatalf("upsert future: %v", err)
 	}
-	srv.emitDoctorOldestObservationGauge(ctx, log)
-	if got := testutil.ToFloat64(srv.ops.DomainDoctorOldestObservationSeconds()); got < 0 {
-		t.Fatalf("future observed_at: want gauge clamped to >=0, got %v", got)
+	futureSrv.emitDoctorOldestObservationGauge(ctx, log)
+	if got := testutil.ToFloat64(futureSrv.ops.DomainDoctorOldestObservationSeconds()); got != 0 {
+		t.Fatalf("future observed_at only: want gauge=0 (clamp), got %v", got)
 	}
 }
 
