@@ -1209,6 +1209,11 @@ var planLimits = map[Plan]Limits{
 		// upgrade curve from Free → Scale is a single double/triple
 		// progression a customer can predict.
 		EdgeRulesThrottlePerApp: 1,
+		// kind='cache' per-app quota (ADR-122 §Decision). Free=0:
+		// the abuse-floor tier stays on cold wake every time; the
+		// upsell is the wake-elision guarantee. Same posture as
+		// tenant_surfaces / alert_rules / cors_presets on Free.
+		EdgeRulesCachePerApp: 0,
 		// CORS presets (issue #975 item #4 / Mega-Foundation #979-b,
 		// slot 00294). Free=0 mirrors the tenant_surfaces / alert_rules
 		// posture: the abstraction is the upsell, the abuse-floor tier
@@ -1500,6 +1505,11 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 5,
+		// kind='cache' per-app quota (ADR-122 §Decision). Hobby=1
+		// gives a single cached route per app (e.g. GET /catalog)
+		// to demonstrate the wake-elision value before the
+		// customer upgrades to Pro.
+		EdgeRulesCachePerApp: 1,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Hobby is the entry paid tier — 10 presets per
 		// account, 5 per app. MaxOrigins 25 covers the typical
@@ -1783,6 +1793,11 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 25,
+		// kind='cache' per-app quota (ADR-122 §Decision). Pro=5 —
+		// enough for a small catalogue: home, list, detail, search,
+		// plus one wildcard. Same five-fold upgrade as throttle and
+		// geo so the upsell curve is single-shape.
+		EdgeRulesCachePerApp: 5,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Pro is the typical SaaS tier — 50 presets per
 		// account, 15 per app, 100 origins per preset.
@@ -2053,6 +2068,12 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 100,
+		// kind='cache' per-app quota (ADR-122 §Decision). Scale=20
+		// covers a full taxonomy of cached catalog endpoints under
+		// one app (search/list/detail/filter/sort per locale,
+		// category, etc.). Pin in limits_test.go so the per-plan
+		// monotonic ladder Free < Hobby < Pro < Scale is enforced.
+		EdgeRulesCachePerApp: 20,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Scale is the large-fleet tier — 250 presets per
 		// account, 50 per app, 500 origins per preset. Numbers

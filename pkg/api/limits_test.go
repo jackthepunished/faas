@@ -52,7 +52,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (route|rewrite|redirect|headers|cors) but jwt/ip stay
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
-			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1,
+			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1, EdgeRulesCachePerApp: 0,
 			// issue #975 #4 / Mega-Foundation #979-b — Free is the abuse-floor tier;
 			// the abstraction is the upsell. PR-B (#979-c) wires the writer.
 			CorsPresetsPerAccount: 0, CorsPresetsPerApp: 0, CorsPresetMaxOrigins: 0, CorsPresetMaxAllowMethods: 0, CorsPresetMaxNameLength: 64,
@@ -179,7 +179,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND the jwt|ip kinds. The plan-kind gate surface
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
-			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5,
+			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5, EdgeRulesCachePerApp: 1,
 			// issue #975 #4 / Mega-Foundation #979-b — Hobby is the entry paid tier.
 			CorsPresetsPerAccount: 10, CorsPresetsPerApp: 5, CorsPresetMaxOrigins: 25, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Hobby is the entry
@@ -306,7 +306,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-089 (planned): edge rules — Pro unlocks 100 rules
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
-			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25,
+			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25, EdgeRulesCachePerApp: 5,
 			// issue #975 #4 / Mega-Foundation #979-b — Pro is the typical SaaS tier.
 			CorsPresetsPerAccount: 50, CorsPresetsPerApp: 15, CorsPresetMaxOrigins: 100, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
@@ -436,7 +436,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (5× Pro) AND jwt|ip. The 500 cap is the practical upper
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
-			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100,
+			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100, EdgeRulesCachePerApp: 20,
 			// issue #975 #4 / Mega-Foundation #979-b — Scale is the large-fleet tier.
 			CorsPresetsPerAccount: 250, CorsPresetsPerApp: 50, CorsPresetMaxOrigins: 500, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
@@ -2362,6 +2362,72 @@ func TestEdgeRulesThrottlePerApp_MonotonicLadder(t *testing.T) {
 			t.Errorf("%s.EdgeRulesThrottlePerApp (%d) < %s.EdgeRulesThrottlePerApp (%d)",
 				ladder[i], currL.EdgeRulesThrottlePerApp, ladder[i-1], prevL.EdgeRulesThrottlePerApp)
 		}
+	}
+}
+
+// TestEdgeRulesCachePerApp_PerPlanMatrix pins the per-plan matrix
+// for EdgeRulesCachePerApp (ADR-122 §Decision). Free 0, Hobby 1,
+// Pro 5, Scale 20. Free=0 mirrors the abuse-floor stance used by
+// tenant_surfaces / alert_rules / cors_presets on Free: the
+// wake-elision guarantee is the upsell, not a baseline amenity.
+//
+// Sanity: cache cap is bounded by total EdgeRulesPerApp. A
+// regression that pushed cache above the per-app total would let
+// a customer pin the gateway's route cardinality to a single
+// kind, breaking the per-app shape.
+func TestEdgeRulesCachePerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  0,
+		PlanHobby: 1,
+		PlanPro:   5,
+		PlanScale: 20,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Errorf("plan %s: missing from LimitsFor", plan)
+			continue
+		}
+		if l.EdgeRulesCachePerApp != expected {
+			t.Errorf("%s: EdgeRulesCachePerApp = %d, want %d", plan, l.EdgeRulesCachePerApp, expected)
+		}
+		if l.EdgeRulesCachePerApp > l.EdgeRulesPerApp {
+			t.Errorf("%s: EdgeRulesCachePerApp (%d) > EdgeRulesPerApp (%d); per-kind cap cannot exceed the per-app total",
+				plan, l.EdgeRulesCachePerApp, l.EdgeRulesPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesCachePerApp_MonotonicLadder pins that the per-plan
+// cache-cap ladder is non-decreasing. Same load-bearing reasoning
+// as the throttle / geo ladders — the upgrade story and the
+// billing model both depend on Free ≤ Hobby ≤ Pro ≤ Scale.
+func TestEdgeRulesCachePerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.EdgeRulesCachePerApp < prevL.EdgeRulesCachePerApp {
+			t.Errorf("%s.EdgeRulesCachePerApp (%d) < %s.EdgeRulesCachePerApp (%d)",
+				ladder[i], currL.EdgeRulesCachePerApp, ladder[i-1], prevL.EdgeRulesCachePerApp)
+		}
+	}
+}
+
+// TestEdgeRulesCachePerApp_FreeZeroIsClosed pins that Free=0 is
+// not a transient gap — the per-kind quota branch in
+// pkg/state/pgstore.go and memstore.go skips the check when the
+// limit is 0, so a Free customer can otherwise create unlimited
+// cache rules if the field ever defaults away. This test makes
+// the "Free cannot cache" promise grep-able in the limits table
+// rather than inferred from the gate's off-by-zero behaviour.
+func TestEdgeRulesCachePerApp_FreeZeroIsClosed(t *testing.T) {
+	l, ok := LimitsFor(PlanFree)
+	if !ok {
+		t.Fatal("PlanFree missing from LimitsFor")
+	}
+	if l.EdgeRulesCachePerApp != 0 {
+		t.Errorf("PlanFree.EdgeRulesCachePerApp = %d, want 0 (Free customers stay on cold wake every time — the wake-elision guarantee is the upsell, not a baseline amenity)", l.EdgeRulesCachePerApp)
 	}
 }
 
