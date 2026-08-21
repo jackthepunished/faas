@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
@@ -227,5 +228,31 @@ func TestControlMuxWithExtraCombinesBothGatherers(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics body missing %q (combined gatherers should serve both)\n--- body ---\n%s", want, string(body))
 		}
+	}
+}
+
+// TestNewControlHTTPServer_AppliesCanonicalShape pins the full
+// envelope of the control-plane listener (ADR-122 / post-merge audit,
+// issue #995 closure). REGRESSION GUARD: a future edit that drops one
+// of the five knobs from NewControlHTTPServer fails this test. The
+// helper is exported so the test can inspect the struct fields
+// directly without binding a real listener (mirrors the
+// pkg/githubd.NewWebhookHTTPServer precedent).
+func TestNewControlHTTPServer_AppliesCanonicalShape(t *testing.T) {
+	srv := NewControlHTTPServer("127.0.0.1:9090", http.NewServeMux())
+	if srv.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("RHT = %v, want 5s", srv.ReadHeaderTimeout)
+	}
+	if srv.ReadTimeout != 10*time.Second {
+		t.Errorf("RT = %v, want 10s", srv.ReadTimeout)
+	}
+	if srv.WriteTimeout != 10*time.Second {
+		t.Errorf("WT = %v, want 10s", srv.WriteTimeout)
+	}
+	if srv.IdleTimeout != 60*time.Second {
+		t.Errorf("IT = %v, want 60s", srv.IdleTimeout)
+	}
+	if srv.MaxHeaderBytes != int(api.DefaultMaxHeaderBytes) {
+		t.Errorf("MHB = %d, want %d", srv.MaxHeaderBytes, int(api.DefaultMaxHeaderBytes))
 	}
 }

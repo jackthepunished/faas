@@ -424,10 +424,25 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 }
 
 // buildServers constructs the plain-HTTP public + loopback control
-// servers. Both pin MaxHeaderBytes to api.DefaultMaxHeaderBytes
-// (1 MiB) so a future stdlib default change cannot widen the
-// attack surface on this listener; the value mirrors stdlib's
-// historical 1 MiB ceiling.
+// servers. Both pin MaxHeaderBytes to api.DefaultMaxHeaderBytes (1 MiB)
+// so a future stdlib default change cannot widen the attack surface
+// on this listener; the value mirrors stdlib's historical 1 MiB ceiling.
+//
+// Knob set (ADR-122 post-merge audit, issue #995 closure):
+//
+//   - publicSrv (customer-facing TLS edge): RHT=10s + RT=60s + WT=300s +
+//     IT=120s + MHB=1 MiB. RT/WT match the customer-facing values from
+//     ADR-121 (kept narrower than the metrics variant because
+//     customer-facing requests are larger than scrapes). IT=120s
+//     matches apid's customer-facing listener at cmd/apid/main.go:452
+//     (APIDIdleTimeoutSecondsDefault=120) — closes the keep-alive
+//     ceiling that was previously unbounded on the edge.
+//   - controlSrv (loopback :9092 healthz/readyz/metrics): the canonical
+//     metrics variant (RHT=10s + RT=10s + WT=10s + IT=60s + MHB=1 MiB)
+//     from pkg/api/limits.go::Metrics*SecondsDefault. RHT is bumped from
+//     the pre-amendment 5s to 10s for consistency with the rest of the
+//     canonical surface; the loopback bind keeps the listener under the
+//     ADR-122 metrics shape regardless of which routes it grows.
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,
@@ -435,13 +450,17 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
 	}
 	controlSrv := &http.Server{
 		Addr:              controlAddr,
 		Handler:           controlMux,
-		ReadHeaderTimeout: 5 * time.Second,
-		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second,
+		WriteTimeout:      time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second,
+		IdleTimeout:       time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second,
+		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
 	}
 	return publicSrv, controlSrv
 }

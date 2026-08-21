@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -76,9 +77,19 @@ type SynthServer struct {
 // customer traffic on the same socket call SetHandler with a wrapping
 // mux that includes the customer publicHandler (issue #675).
 //
-// ReadHeaderTimeout pins the Slowloris attack surface (gosec G112).
-// The unix socket is DAC-gated (ADR-015), but we set the timeout
-// anyway — defense in depth + uniform config.
+// Envelope (ADR-122 / post-merge audit, issue #995 closure): the
+// listener installs the canonical metrics variant — RHT=5s (pre-existing
+// H2C negotiation guard) + RT=10s + WT=10s + IT=60s + MHB=1 MiB. The
+// RHT=5s is one knob tighter than the 10s canonical metrics variant
+// because the unix socket is DAC-gated (ADR-015) and the only
+// legitimate clients (schedd + the unified-mux Tier A7 caller) finish
+// their headers in milliseconds. The remaining four knobs are the
+// canonical metrics shape from pkg/api/limits.go::Metrics*SecondsDefault.
+//
+// The unix socket is DAC-gated (ADR-015), but we set the timeouts
+// anyway — defense in depth + uniform config so a future caller of
+// synth.New() standalone (outside the unified Tier A7 mux) inherits
+// the same envelope.
 //
 // Issue #675 / H2C: the server enables unencrypted HTTP/2 (H2C) on the
 // listener via srv.Protocols.SetUnencryptedHTTP2(true). This is the
@@ -111,6 +122,10 @@ func NewSynthServer(socketPath string, dispatcher SynthDispatcher, log *slog.Log
 	s.srv = &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second,
+		WriteTimeout:      time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second,
+		IdleTimeout:       time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second,
+		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
 	}
 	// Enable H2C + HTTP/1.1 on this listener (issue #675). SetHTTP1
 	// is true by default but we set it explicitly so the intent is

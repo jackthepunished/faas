@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -156,18 +157,19 @@ type ReadyFunc func() bool
 // RunControlServer starts the control-plane listener and blocks until ctx is
 // cancelled, then performs a graceful shutdown bounded by 5 s. Errors other
 // than http.ErrServerClosed are returned.
+//
+// Knob set (ADR-122 / post-merge audit, issue #995 closure): RHT=5s
+// (tight, control-plane probe latency) + RT=10s + WT=10s + IT=60s +
+// MHB=api.DefaultMaxHeaderBytes (1 MiB). The four timeout knobs
+// pre-date this PR; MaxHeaderBytes is the new pin (was 0, relying on
+// stdlib default). RHT stays at 5s rather than the 10s canonical
+// // metrics variant because the control plane only serves /healthz,
+// // /readyz, /metrics — no slow-client body, no slow headers.
 func RunControlServer(ctx context.Context, addr string, mux *http.ServeMux) error {
 	if addr == "" {
 		addr = ControlAddr
 	}
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	srv := NewControlHTTPServer(addr, mux)
 	errc := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -182,6 +184,23 @@ func RunControlServer(ctx context.Context, addr string, mux *http.ServeMux) erro
 		defer cancel()
 		//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx (net/http contract).
 		return srv.Shutdown(sctx)
+	}
+}
+
+// NewControlHTTPServer constructs the *http.Server carrying the
+// canonical metrics variant for the control-plane listener. Mirrors
+// pkg/githubd.NewWebhookHTTPServer — the helper is exported so a
+// test can pin the knob set against the production literal without
+// running a real listener. Used by RunControlServer.
+func NewControlHTTPServer(addr string, mux *http.ServeMux) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    int(api.DefaultMaxHeaderBytes),
 	}
 }
 
