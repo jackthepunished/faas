@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -259,5 +260,34 @@ func TestSynthServer_UnifiedMux_RoutesPathsCorrectly(t *testing.T) {
 				t.Errorf("customerFallback = %d, want %d (path %q did not reach the publicHandler)", got, tc.wantCust, tc.path)
 			}
 		})
+	}
+}
+
+// TestNewSynthServer_AppliesCanonicalShape pins the full envelope of
+// the SynthServer listener (ADR-122 / post-merge audit, issue #995
+// closure). REGRESSION GUARD: a future edit that drops one of the
+// four timeout knobs or MaxHeaderBytes from NewSynthServer's struct
+// literal fails this test. Inspects s.srv directly (same package,
+// private field) so the test runs without binding a unix socket.
+// Mirrors the githubd NewWebhookHTTPServer canonical-shape test.
+func TestNewSynthServer_AppliesCanonicalShape(t *testing.T) {
+	s := NewSynthServer("/tmp/unused.sock", &fakeDispatcher{}, slog.Default())
+	if s.srv == nil {
+		t.Fatal("NewSynthServer must populate s.srv")
+	}
+	if s.srv.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("RHT = %v, want 5s", s.srv.ReadHeaderTimeout)
+	}
+	if got, want := s.srv.ReadTimeout, time.Duration(api.MetricsReadTimeoutSecondsDefault)*time.Second; got != want {
+		t.Errorf("RT = %v, want %v", got, want)
+	}
+	if got, want := s.srv.WriteTimeout, time.Duration(api.MetricsWriteTimeoutSecondsDefault)*time.Second; got != want {
+		t.Errorf("WT = %v, want %v", got, want)
+	}
+	if got, want := s.srv.IdleTimeout, time.Duration(api.MetricsIdleTimeoutSecondsDefault)*time.Second; got != want {
+		t.Errorf("IT = %v, want %v", got, want)
+	}
+	if s.srv.MaxHeaderBytes != int(api.DefaultMaxHeaderBytes) {
+		t.Errorf("MHB = %d, want %d", s.srv.MaxHeaderBytes, int(api.DefaultMaxHeaderBytes))
 	}
 }
