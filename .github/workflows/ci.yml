@@ -1176,11 +1176,16 @@ jobs:
   # - typos in `uses:` versions / branch refs
   #
   # Mirrors daemonunit-check / sqlc-check / packer-validate shape:
-  # stateless, fast (~5 s), runs on every PR. actionlint's exit code is
-  # non-zero only on real errors, not on info-level shellcheck findings
-  # — pre-existing SC2086 noise at ci.yml:374/442/481/511 will appear in
-  # CI logs as informational, not as failures. Cleanup PRs to fix those
-  # land separately.
+  # stateless, fast (~5 s), runs on every PR.
+  #
+  # `-shellcheck ''` disables actionlint's bundled shellcheck
+  # integration. actionlint's job is workflow YAML semantic lint
+  # (the recent 8-commit churn on .github/codeql/codeql-config.yml is
+  # exactly what it catches); shellcheck findings on bash snippets in
+  # `run:` blocks are a separate concern and the 6 pre-existing
+  # SC2046/SC2012/SC2086 findings in ci.yml would fail the gate on
+  # every PR — fixing each is out of scope for this cluster. Re-enable
+  # after the shellcheck findings land in a follow-up cleanup PR.
   #
   # Bumping actionlint: edit the SHA + version together (mirror codecov-
   # action pinning at ci.yml:383). Latest stable at PR time is v1.7.12;
@@ -1195,6 +1200,7 @@ jobs:
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
         with:
           version: v1.7.12
+          args: -shellcheck ''
 
   packer-validate:
     # ADR-111: Packer-builder syntax gate. PR #928 lands

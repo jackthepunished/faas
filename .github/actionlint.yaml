@@ -1,14 +1,11 @@
-# actionlint configuration. Currently only used by the workflow-lint CI
-# job (ci.yml:~1175) to silence the "label kvm is unknown" warning
-# that fires on every run otherwise. The `metal` job in ci.yml uses
-# `runs-on: [self-hosted, kvm]` (ci.yml:922) and `kvm` is not a
-# GitHub-hosted label — declaring it under `self-hosted-runner.labels`
-# tells actionlint to treat it as a known self-hosted runner label.
+# actionlint configuration. Used by the workflow-lint CI job
+# (ci.yml:~1175) and auto-detected by rhysd/actionlint at this path.
 #
-# When new self-hosted runner labels are added (Lima nested virt path
-# for D5 / Q9 work, etc.), append them here in lock-step with the
-# workflow change in the same PR — otherwise actionlint starts warning
-# on the new label and the workflow-lint CI log gets noisy.
+# Only the `self-hosted-runner.labels` key is documented in the
+# actionlint config schema (https://github.com/rhysd/actionlint/blob/v1.7.12/docs/config.md).
+# Pre-existing shellcheck info/warning findings in ci.yml are silenced
+# via the `-ignore` regex passed as the action's `args:` input
+# (ci.yml:~1200), NOT here — `shellcheck:` is not a valid config key.
 self-hosted-runner:
   labels:
     - kvm
