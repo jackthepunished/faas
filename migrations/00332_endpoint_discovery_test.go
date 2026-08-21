@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00330_endpoint_discovery.sql
+// Migration-apply test for 00332_endpoint_discovery.sql
 // (ADR-122 / issue #975 item #1).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00330 (no goose
-//     duplicate-version panic). Slot 00330 was picked as the
+//  1. Migration set applies cleanly through 00332 (no goose
+//     duplicate-version panic). Slot 00332 was picked as the
 //     next free slot on origin/main after PR #1000 (00329).
 //     Re-verify with scripts/ci/check_migration_slots.sh
 //     immediately before push.
@@ -38,7 +38,7 @@ import (
 )
 
 // endpointDiscoveryExpectedColumns are the 9 columns the migration
-// must add. Adding a column to 00330 without updating this list is a
+// must add. Adding a column to 00332 without updating this list is a
 // load-bearing failure mode — downstream consumers (PgStore,
 // MemStore, OpenAPI, SDKs) all key off this shape.
 var endpointDiscoveryExpectedColumns = []string{
@@ -73,13 +73,13 @@ var endpointDiscoveryExpectedIndexes = []string{
 	"deployment_openapi_docs_app_id_idx",
 }
 
-func TestMigrations_00330_EndpointDiscovery(t *testing.T) {
+func TestMigrations_00332_EndpointDiscovery(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00330.
+	// (1) Apply through 00332.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00329 consumer_keys and 00330 endpoint_discovery)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00329 consumer_keys and 00332 endpoint_discovery)", err)
 	}
 
 	// (2) Positive shape — table present with 9 expected columns.
@@ -137,9 +137,9 @@ func TestMigrations_00330_EndpointDiscovery(t *testing.T) {
 	// (OpenAPIDocMaxBytes), but the SQL CHECK is the foundation.
 	seedDeploymentIDSentinel := func(t *testing.T, byteSize int) (string, error) {
 		t.Helper()
-		deploymentID := "00000000-0000-0000-0000-0000003308d1"
-		accountID := "00000000-0000-0000-0000-0000003308a1"
-		appID := "00000000-0000-0000-0000-0000003308b1"
+		deploymentID := "00000000-0000-0000-0000-0000003328d1"
+		accountID := "00000000-0000-0000-0000-0000003328a1"
+		appID := "00000000-0000-0000-0000-0000003328b1"
 		_, _ = pool.Exec(ctx, `INSERT INTO accounts (id, email, plan) VALUES ($1::uuid, 'ediscovery-acct@example.com', 'hobby') ON CONFLICT (id) DO NOTHING`, accountID)
 		_, _ = pool.Exec(ctx, `INSERT INTO apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s) VALUES ($1::uuid, $2::uuid, 'ediscovery-app', 'app', 256, 2, 60) ON CONFLICT (id) DO NOTHING`, appID, accountID)
 		_, err := pool.Exec(ctx, `
@@ -156,8 +156,8 @@ func TestMigrations_00330_EndpointDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed parent rows: %v", err)
 	}
-	accountID := "00000000-0000-0000-0000-0000003308a1"
-	appID := "00000000-0000-0000-0000-0000003308b1"
+	accountID := "00000000-0000-0000-0000-0000003328a1"
+	appID := "00000000-0000-0000-0000-0000003328b1"
 	docJSON := []byte(`{"openapi":"3.1.0","info":{"title":"sentinel","version":"1.0.0"},"paths":{}}`)
 	sha256 := make([]byte, 32)
 	for i := range sha256 {
@@ -217,7 +217,7 @@ func TestMigrations_00330_EndpointDiscovery(t *testing.T) {
 	// IN ('cold_boot', 'manual_upload'); a typo at the apid handler
 	// gate is rejected by the DB if it slips past.
 	// Re-seed parent rows for the bogus-source test.
-	bogusDeploymentID := "00000000-0000-0000-0000-0000003308d2"
+	bogusDeploymentID := "00000000-0000-0000-0000-0000003328d2"
 	_, _ = pool.Exec(ctx, `INSERT INTO deployments (id, app_id, image_digest, status) VALUES ($1::uuid, $3::uuid, 'sha256:0000000000000000000000000000000000000000000000000000000000000000', 'live') ON CONFLICT (id) DO NOTHING`, bogusDeploymentID, accountID, appID)
 	_, err = pool.Exec(ctx, `
 		INSERT INTO deployment_openapi_docs (
