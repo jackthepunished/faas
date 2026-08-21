@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00342_deployments_annotation.sql
+-- filename: 00344_deployments_annotation.sql
 --
 -- issue #977 / ADR-116 — deployment annotations. Adds four columns
 -- to deployments:
