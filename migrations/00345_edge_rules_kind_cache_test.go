@@ -16,6 +16,12 @@
 // its own identical reserve_slot fences at those positions and
 // the slot reserved by #1000 (#1000 holds 00329 as a reservation
 // per [[pr-1000-cherry-pick-rebuild-shipped-2026-08-20]]).
+//
+// Vacated-slot fences at 00342 / 00343 / 00344 ship in this
+// branch to satisfy the local TestMigrationsContiguous check;
+// they are no-op `SELECT 1;` files stripped by the cross-PR
+// precheck's `slots_from_paths` carve-out. See the
+// local-embed-vs-synthetic-merge-contiguity memory entry.
 // Future renumbering must re-verify `git ls-tree origin/main
 // migrations/` AND enumerate open-PR claims including
 // refs/pull/<N>/head — `git ls-tree origin/main` alone misses

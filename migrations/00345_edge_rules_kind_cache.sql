@@ -92,6 +92,24 @@
 -- refs/pull/<N>/head migrations/` for every N in the open-PR
 -- list (the per-PR precheck is the only one that sees open-PR
 -- fences) after every rebase.
+--
+-- This branch carries vacated-slot fences at 00342, 00343 and
+-- 00344 — temporary `-- filename: NNNNN_reserve_slot.sql`
+-- no-op migrations that fill the gap between 00341
+-- (repair_app_secrets_scope, the last contiguous main-side file
+-- after rebase) and 00345. Without them the local
+-- TestMigrationsContiguous check would see a 3-slot hole
+-- (per `local-embed-vs-synthetic-merge-contiguity`). The cross-PR
+-- precheck's `slots_from_paths` carve-out ignores reservations,
+-- so 00342/00343/00344 fences do not count as slot claims here
+-- and the gate stays green. They will be reaped automatically
+-- on the first rebase that lands a real migration at any of the
+-- three slots: if #984 merges first, its 00342
+-- `deployments_annotation.sql` and 00343 fence shadow ours, and
+-- the next rebase drops our equivalents. If #1005 merges
+-- first, its 00344 `deployment_openapi_snapshots.sql` shadows
+-- ours. Either ordering is clean; the local contiguity test is
+-- what the fences exist to satisfy today.
 
 ALTER TABLE edge_rules DROP CONSTRAINT IF EXISTS edge_rules_kind_check;
 ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check
