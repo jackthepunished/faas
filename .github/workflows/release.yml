@@ -241,7 +241,6 @@ jobs:
             --bundle "$OUT_DIR/release.cosign.bundle" \
             --certificate-identity-regexp '^https://github\.com/poyrazK/faas/\.github/workflows/release\.yml@refs/tags/.+$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --insecure-ignore-tlog \
             "$OUT_DIR/release.tar.gz"
           (cd "$OUT_DIR" && sha256sum release.tar.gz release.cosign.bundle release.sbom.json > SHA256SUMS)
 
