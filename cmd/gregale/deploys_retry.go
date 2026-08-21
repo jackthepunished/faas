@@ -85,8 +85,7 @@ func cmdDeploysRetry(args []string) int {
 
 	// Default from_stage to the failing stage on the source row.
 	// Fetching /v1/deployments/{id}/stages is the cheapest way to
-	// read state.Current for the failing row (it's already the
-	// post-stream summary endpoint).
+	// read the stage_state jsonb for the failing row.
 	if fromStage == "" {
 		raw, err := client.GetDeploymentStages(ctx, depID)
 		if err != nil {
@@ -98,11 +97,28 @@ func cmdDeploysRetry(args []string) int {
 			printErr(fmt.Sprintf("decode stage_state: %v", uerr), uerr)
 			return 2
 		}
-		if ss.Current == "" {
-			printErr("source deployment has no current stage; pass --from=<stage> explicitly", errors.New("no current stage"))
+		// Code-review finding #4: production sets state.Current=""
+		// on the failure path (MarkDeploymentStageFailed rolls the
+		// in-flight stage into history with status=failed). Reading
+		// ss.Current here yields "" for the primary use case
+		// (retrying a failed deploy), so we fall through to the
+		// history scan first; only fall back to ss.Current when
+		// the jsonb pre-dates the ADR-117 shape (no history rows).
+		from := state.StageName("")
+		for _, item := range ss.History {
+			if item.Status == "failed" && item.Name != "" {
+				from = item.Name
+				break
+			}
+		}
+		if from == "" && ss.Current != "" {
+			from = ss.Current
+		}
+		if from == "" {
+			printErr("source deployment has no current or failed stage; pass --from=<stage> explicitly", errors.New("no stage hint"))
 			return 1
 		}
-		fromStage = string(ss.Current)
+		fromStage = string(from)
 	}
 
 	// Fire the retry. The new row's id is on the response; we

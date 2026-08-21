@@ -45,12 +45,15 @@ import (
 const dashboardRetryDeploymentAction = "retry_deployment"
 
 // dashboardRetryDeploymentIDRe pins the deployment id shape used
-// in the URL. Same shape as the v1 route / the CLI
-// (deploymentIDPattern). Validated here so the redirect target
-// composed from it can never escape the /dashboard/apps/{slug}
+// in the URL. Accepts either the 32-hex form (memstore's newID
+// fallback for tests) or the 36-char UUID form (uuid.NewString
+// — pgstore production path). Both are produced by uuid helpers
+// in the codebase; the regex matches the canonical lowercase
+// hex / hex-with-dashes shape. Validated here so the redirect
+// target composed from it can never escape the /dashboard/apps/{slug}
 // prefix (the form-post path is a CSRF-bound surface, but a
 // G610 tripwire still demands explicit gating).
-var dashboardRetryDeploymentIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+var dashboardRetryDeploymentIDRe = regexp.MustCompile(`^[0-9a-f]{32}$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // dashboardDeploymentSlugRe is the slug shape (lowercase + dash +
 // digit, ≤ 48 chars; mirrors cmd/apid/handlers_apps.go's

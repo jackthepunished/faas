@@ -5422,9 +5422,15 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 		return Deployment{}, err
 	}
 	// Step 3 — build the new Deployment. The id is fresh; the
-	// actor attribution is left empty (the caller passes through
-	// the same identity columns as CreateDeployment's nil-default
-	// path).
+	// actor attribution columns (DeployedVia / DeployedByUserID /
+	// DeployedFromIP / PusherLogin) carry over from the source
+	// row. The retry represents the same deploy intent — the
+	// operator who triggered the original failure also triggered
+	// the retry (via the dashboard form or `gregale deploys
+	// retry`), and the SOC 2 / GDPR audit-trail queries walk from
+	// the failed row back to the deployer; stripping these
+	// columns would break that linkage. See memstore mirror for
+	// the code-review finding rationale.
 	newDep := Deployment{
 		ID:                    uuid.NewString(),
 		AppID:                 src.AppID,
@@ -5448,6 +5454,10 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 		MinInstances:          src.MinInstances,
 		TrafficPercent:        src.TrafficPercent,
 		Scope:                 src.Scope,
+		DeployedVia:           src.DeployedVia,
+		DeployedByUserID:      src.DeployedByUserID,
+		DeployedFromIP:        src.DeployedFromIP,
+		PusherLogin:           src.PusherLogin,
 	}
 	// Step 4 — INSERT with stage_state seeded to the requested
 	// fromStage. We do not call CreateDeployment because that path
@@ -5471,10 +5481,12 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 		                          min_instances,
 		                          traffic_percent,
 		                          scope,
+		                          deployed_by_user_id, deployed_via, deployed_from_ip, pusher_login,
 		                          stage_state)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19,
 		         coalesce(nullif($20, ''), 'default'),
-		         $21)
+		         nullif($21, '')::uuid, coalesce(nullif($22, ''), 'api'), nullif($23, '')::inet, nullif($24, ''),
+		         $25)
 		 returning `+deploymentSelectColumnsWithRootfs,
 		newDep.AppID, newDep.ImageDigest, string(newDep.Kind),
 		nullString(newDep.SourcePath), newDep.SourceBytes,
@@ -5488,6 +5500,13 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 		newDep.MinInstances,
 		newDep.TrafficPercent,
 		newDep.Scope,
+		// Code-review finding #3: actor attribution columns mirror
+		// the CreateDeployment nullif/coalesce pattern (see
+		// CreateDeployment at this file's earlier site). The retry
+		// carries these from the source row (set above) so the
+		// audit-trail linkage from failed row → deployer chips
+		// survives a retry.
+		newDep.DeployedByUserID, newDep.DeployedVia, newDep.DeployedFromIP, newDep.PusherLogin,
 		stageSeed)
 	created, err := scanDeployment(row)
 	if err != nil {

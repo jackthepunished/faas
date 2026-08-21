@@ -2583,7 +2583,17 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 		if json.Unmarshal(row.StageState, &ss) == nil && len(ss.History) > 0 {
 			last := ss.History[len(ss.History)-1]
 			if last.StartedAt != nil && last.EndedAt != nil {
-				h.ops.ObserveDeployStageDuration(string(ss.Current), "failed", last.EndedAt.Sub(*last.StartedAt))
+				// Code-review finding #2: MarkDeploymentStageFailed
+				// clears state.Current on the way out (the in-flight
+				// stage rolls into history with status=failed), so
+				// reading `ss.Current` here produces stage="". That
+				// falls outside the pre-instantiated closed-6 label
+				// set and corrupts the §12 per-stage SLO panel
+				// (every failed observation lands on an off-panel
+				// time series instead of the row's actual failing
+				// stage). Use the history row's Name — that IS the
+				// stage that failed, by construction.
+				h.ops.ObserveDeployStageDuration(string(last.Name), "failed", last.EndedAt.Sub(*last.StartedAt))
 			}
 		}
 	}

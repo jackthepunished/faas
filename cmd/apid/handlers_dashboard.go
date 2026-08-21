@@ -1833,12 +1833,21 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 	// the template gate, not a render path change.
 	if dep.Status == state.DeployFailed {
 		if from := failedStageFromJSON(dep.StageState); from != "" {
-			data.CanRetry = true
 			data.RetryFromStage = from
 			tok, terr := middleware.IssueForAuthenticated(s.sessions, dashboardRetryDeploymentAction, acct.ID)
 			if terr != nil {
-				log.Warn("dashboard: mint retry CSRF failed", "deployment_id", dep.ID, "err", terr)
+				// Code-review finding #6: a failed mint means the
+				// faas_csrf sidecar can't be set, which means the
+				// matching form POST would be silently rejected
+				// (VerifyAuthenticated returns ErrCSRFInvalid and
+				// the dashboard flash surfaces a generic error).
+				// Rather than render a form that can't submit,
+				// suppress CanRetry so the template omits the form
+				// entirely. Log loudly so the operator sees the
+				// underlying seal failure.
+				log.Warn("dashboard: mint retry CSRF failed; suppressing retry form", "deployment_id", dep.ID, "err", terr)
 			} else {
+				data.CanRetry = true
 				data.DeploymentRetryCSRF = tok
 				// Set the matching faas_csrf sidecar so the form
 				// POST finds the same envelope. Without this the

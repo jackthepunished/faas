@@ -184,54 +184,6 @@ func FormatStageDuration(durationMs int64, status, reason string) string {
 	}
 }
 
-// StageFailureHTML renders a stage-failure row's structured
-// hint/why/fix block as a `template.HTML` fragment that the
-// dashboard template inlines below the duration cell. The
-// caller is the seam that resolves the code → title/hint/why/fix
-// prose (via pkg/whycopy.Decorate against an *api.Problem) so the
-// renderer stays a pure formatter with no pkg/whycopy or pkg/api
-// import (those packages carry circular-import hazards via
-// pkg/state).
-//
-// Empty fields collapse cleanly: a failure row whose whycopy row
-// only carries a Title renders just the title line; a row with
-// no catalog match renders the bare "<reason>" string. The
-// returned fragment is html/template-safe (every dynamic string
-// passes through htmlEscape before concatenation).
-//
-// Mirrors the cluster-A `.error-explanation` template pattern at
-// pkg/dashboard/views/render.go (the same parent-scoped CSS
-// convention; see pkg/dashboard/templates/deployment_detail.html).
-func StageFailureHTML(title, hint, why, fix, reason string) template.HTML {
-	if title == "" && hint == "" && why == "" && fix == "" {
-		// No structured block available — fall back to the bare
-		// reason so the row still renders something useful.
-		if reason == "" {
-			return template.HTML("")
-		}
-		return template.HTML(`<span class="stage-failure-reason">` + htmlEscape(reason) + `</span>`)
-	}
-	var b strings.Builder
-	b.WriteString(`<div class="stage-failure-explanation">`)
-	if title != "" {
-		fmt.Fprintf(&b, `<p class="title">%s</p>`, htmlEscape(title))
-	}
-	if hint != "" {
-		fmt.Fprintf(&b, `<p class="hint">%s</p>`, htmlEscape(hint))
-	}
-	if why != "" {
-		fmt.Fprintf(&b, `<p class="why">%s</p>`, htmlEscape(why))
-	}
-	if fix != "" {
-		fmt.Fprintf(&b, `<p class="fix">%s</p>`, htmlEscape(fix))
-	}
-	if reason != "" {
-		fmt.Fprintf(&b, `<p class="logs">%s</p>`, htmlEscape(reason))
-	}
-	b.WriteString(`</div>`)
-	return template.HTML(b.String())
-}
-
 // assertClosedSet is the panic-on-drift invariant. Both Render
 // functions call this at the top so a future contributor who widens
 // pkg/state.AllStageNames (or the migration 00302 CHECK) without
