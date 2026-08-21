@@ -167,7 +167,7 @@ func TestErrCapacity(t *testing.T) {
 	if p.Detail != "no RAM headroom" {
 		t.Errorf("Detail = %q", p.Detail)
 	}
-	if !strings.Contains(p.DocsURL, "apps.gregale.dev/status") {
+	if !strings.Contains(p.DocsURL, "gregale.dev/status") {
 		t.Errorf("DocsURL = %q", p.DocsURL)
 	}
 }
