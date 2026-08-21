@@ -597,14 +597,14 @@ type AppMetricsView struct {
 // rendered as em-dash per the existing convention for absent
 // fields — pre-ADR-123 fleet rows have no wake.boot_started yet.
 type RecentInstanceItem struct {
-	ID            string // instance row PK (stable across wakes)
-	WakeID        string // per-wake UUIDv7; distinct from ID
-	State         string // wire vocabulary; the template badge maps parked → sleeping
-	StartedAt     string // empty when not yet started
-	LastRequestAt string // empty when no traffic yet
-	Trigger             string // ADR-123 — pkg/sched/triggers.go closed enum
-	QueuedCount         int    // ADR-123 — ledger.Concurrency at admit
-	ConcurrencyAtAdmit  int    // ADR-123 — same reading; 0 = cold start
+	ID                 string // instance row PK (stable across wakes)
+	WakeID             string // per-wake UUIDv7; distinct from ID
+	State              string // wire vocabulary; the template badge maps parked → sleeping
+	StartedAt          string // empty when not yet started
+	LastRequestAt      string // empty when no traffic yet
+	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
+	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
+	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 = cold start
 }
 
 // UsageData is the /dashboard/usage page payload.
