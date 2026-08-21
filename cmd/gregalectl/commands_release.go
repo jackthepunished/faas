@@ -697,9 +697,9 @@ func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
 // loads the canonical triple (tarball + cosign bundle + SBoM) from
 // the on-disk path the operator supplies via --tarball-path, runs
 // the cosign verifier (the load-bearing trust bit from PR-A
-// commit 2), extracts the tarball, writes the SBoM and baseline
-// to <releases-root>/<git-sha>/, and flips the symlink. Returns
-// nil on success.
+// commit 2), extracts the tarball, and writes the verified release
+// triple to <releases-root>/<git-sha>/. The caller performs the final
+// on-disk verification, SBoM gate, role validation, and atomic flip.
 //
 // Review finding #1: this is the production caller of
 // releaseinstall.Tarball.Verify. Without this function the
@@ -809,11 +809,10 @@ func installViaTarballWithVerifier(releasesRoot, gitSHA, tarballPath string, ver
 		}
 	}
 
-	// 6. AtomicFlip. The flip is the load-bearing boundary; all
-	// gates (cosign, SBoM, catalog) have passed.
-	if err := releaseinstall.AtomicFlip(releasesRoot, gitSHA); err != nil {
-		return fmt.Errorf("flip symlink: %w", err)
-	}
+	// The caller performs the final on-disk Verify, SBoM gate, role
+	// validation, and AtomicFlip. Keeping the flip outside this staging
+	// helper is essential: a post-extraction catalog or policy failure must
+	// never activate a partially prepared release.
 	return nil
 }
 
