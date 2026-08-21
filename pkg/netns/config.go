@@ -123,25 +123,6 @@ type Config struct {
 	// single-host dev keeps the legacy "deny wins on RFC1918"
 	// posture.
 	OperatorExceptions []netip.Prefix
-	// AccountStaticIP (ADR-119) is the customer-supplied IPv4 that
-	// every outbound packet from this VM is rewritten to in
-	// postrouting. nil → no static-pin rule emitted (default
-	// MASQUERADE-only behaviour preserved, identical to pre-119
-	// output). Non-nil → NftCommands emits a sibling rule in
-	// `chain postrouting`, AFTER the default MASQUERADE on
-	// `oifname <VethPeer>`, that SNATs matching tenant source
-	// traffic to the customer's IP:
-	//
-	//   add rule ip faas postrouting oifname <VethPeer> \
-	//       ip saddr 10.0.0.2 snat to <CustomerIP>
-	//
-	// The ip saddr 10.0.0.2 anchor is the identical-inner-world
-	// guest identity (ADR-009) — every guest looks identical
-	// inside, which is the property that lets one snapshot
-	// restore as N concurrent instances and the same per-VM
-	// rule apply to every instance regardless of the per-VM
-	// host IP. v6 deferred.
-	AccountStaticIP *netip.Addr
 }
 
 // NewConfig fills the constant fields (tap name, /16) around the allocated names
@@ -315,23 +296,16 @@ func (c Config) NftCommands() [][]string {
 	add("add", "rule", "ip", "faas", "prerouting", "iifname", c.VethPeer, "tcp", "dport", port, "dnat", "to", fmt.Sprintf("%s:%d", GuestIP, AppPort))
 	add("add", "chain", "ip", "faas", "postrouting", "{", "type", "nat", "hook", "postrouting", "priority", "srcnat", ";", "}")
 	add("add", "rule", "ip", "faas", "postrouting", "oifname", c.VethPeer, "masquerade")
-	// ADR-119: per-VM sibling SNAT rule. Placed AFTER the default
-	// MASQUERADE so an explicit snat-to overrides the implicit one
-	// (nftables postrouting is first-match within a chain in our
-	// setup; the explicit rule wins regardless of evaluation order
-	// since it's a more specific match with the source-addr
-	// qualifier — 10.0.0.2 is the unique guest identity per
-	// ADR-009). The ip saddr 10.0.0.2 anchor matters: the host IP
-	// (10.100.x.y) is the per-VM MASQUERADE source, and the guest
-	// itself egresses with src=10.0.0.2 inside the netns. Without
-	// the source-addr qualifier the rule would clobber host
-	// egress too. nil pointer means no rule — defaults preserved.
-	if c.AccountStaticIP != nil {
-		add("add", "rule", "ip", "faas", "postrouting",
-			"oifname", c.VethPeer,
-			"ip", "saddr", GuestIP,
-			"snat", "to", c.AccountStaticIP.String())
-	}
+	// ADR-119 redesign: per-netns SNAT rule was REMOVED. The legacy
+	// shape (a MASQUERADE-sibling SNAT rule with `ip saddr 10.0.0.2
+	// snat to <CustomerIP>`) was dead code — nftables NAT is first-
+	// match + terminal, so the broad MASQUERADE above rewrites the
+	// source before the specific SNAT can apply. The v1 design moves
+	// SNAT authority to the host renderer (pkg/netns/policy.go::
+	// HostPolicy.Render), which emits one
+	// `ip saddr <per-vm-host-ip> oifname <PublicIface> snat to
+	// <CustomerIP>` rule per live VM in the host's `chain
+	// postrouting`. The per-VM renderer stays bare MASQUERADE.
 	// Egress filter (§11): default-accept, deny from the guest side only.
 	add("add", "chain", "ip", "faas", "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", ";", "policy", forwardPolicy, ";", "}")
 	// Accept reply traffic first. The inbound DNAT'd request is published from

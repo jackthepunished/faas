@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // silentStaticIPLogger discards all log output so the bundle
@@ -31,10 +33,12 @@ func TestLoadStaticEgressIPBundle_Valid(t *testing.T) {
 	path := filepath.Join(dir, "static_egress_ips.toml")
 	content := `# ADR-119 — operator static egress IP bundle.
 [[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "shop"
 ip = "203.0.113.42"
 
 [[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "api"
 ip = "198.51.100.7"
 `
@@ -96,7 +100,7 @@ func TestLoadStaticEgressIPBundle_DropsReservedRanges(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "static_egress_ips.toml")
-			content := "[[entries]]\napp_id = \"x\"\nip = \"" + tc.ip + "\"\n"
+			content := "[[entries]]\naccount_id = \"11111111-1111-1111-1111-111111111111\"\napp_id = \"x\"\nip = \"" + tc.ip + "\"\n"
 			if err := os.WriteFile(path, []byte(content), 0o400); err != nil {
 				t.Fatalf("write: %v", err)
 			}
@@ -122,7 +126,7 @@ func TestLoadStaticEgressIPBundle_DropsReservedRanges(t *testing.T) {
 func TestLoadStaticEgressIPBundle_DropsIPv6(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "static_egress_ips.toml")
-	content := "[[entries]]\napp_id = \"x\"\nip = \"2001:db8::1\"\n"
+	content := "[[entries]]\naccount_id = \"11111111-1111-1111-1111-111111111111\"\napp_id = \"x\"\nip = \"2001:db8::1\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o400); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -141,10 +145,12 @@ func TestLoadStaticEgressIPBundle_DropsMalformed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "static_egress_ips.toml")
 	content := `[[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "good"
 ip = "203.0.113.42"
 
 [[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "bad"
 ip = "not-an-ip"
 `
@@ -169,10 +175,12 @@ func TestLoadStaticEgressIPBundle_LastWinsPerApp(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "static_egress_ips.toml")
 	content := `[[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "shop"
 ip = "203.0.113.42"
 
 [[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "shop"
 ip = "198.51.100.7"
 `
@@ -197,10 +205,12 @@ func TestLoadStaticEgressIPBundle_DropsEmptyRows(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "static_egress_ips.toml")
 	content := `[[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = ""
 ip = "203.0.113.42"
 
 [[entries]]
+account_id = "11111111-1111-1111-1111-111111111111"
 app_id = "shop"
 ip = ""
 `
@@ -254,7 +264,7 @@ func (r *staticEgressIPRecording) SetStaticEgressIPAliases(entries []StaticEgres
 func TestWatchStaticEgressIPBundleReload_StartupLoad(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "static_egress_ips.toml")
-	content := "[[entries]]\napp_id = \"shop\"\nip = \"203.0.113.42\"\n"
+	content := "[[entries]]\naccount_id = \"11111111-1111-1111-1111-111111111111\"\napp_id = \"shop\"\nip = \"203.0.113.42\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o400); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -262,7 +272,7 @@ func TestWatchStaticEgressIPBundleReload_StartupLoad(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	hupCh := make(chan os.Signal, 1)
-	watchStaticEgressIPBundleReload(ctx, target, path, silentStaticIPLogger(), hupCh)
+	watchStaticEgressIPBundleReload(ctx, target, state.NewMemStore(), path, silentStaticIPLogger(), hupCh)
 	if target.calls != 1 {
 		t.Errorf("startup calls = %d, want 1", target.calls)
 	}
@@ -278,7 +288,7 @@ func TestWatchStaticEgressIPBundleReload_EmptyPathSkipsWatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	hupCh := make(chan os.Signal, 1)
-	watchStaticEgressIPBundleReload(ctx, target, "", silentStaticIPLogger(), hupCh)
+	watchStaticEgressIPBundleReload(ctx, target, state.NewMemStore(), "", silentStaticIPLogger(), hupCh)
 	if target.calls != 0 {
 		t.Errorf("empty path: target.calls = %d, want 0", target.calls)
 	}

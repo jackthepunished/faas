@@ -129,7 +129,7 @@ func (h *heartbeatFakeVMM) UpdateEgressAllowlist(context.Context, string, []neti
 }
 
 // UpdateStaticEgressIP (ADR-119) is the no-op test fake.
-func (h *heartbeatFakeVMM) UpdateStaticEgressIP(context.Context, string, string) error {
+func (h *heartbeatFakeVMM) UpdateStaticEgressIP(context.Context, string, string, string) error {
 	return nil
 }
 

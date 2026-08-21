@@ -100,7 +100,7 @@ type VMM interface {
 	// (Unavailable / Internal) — the egress_drift subscriber
 	// logs and drops. Mirrors UpdateEgressAllowlist's
 	// contract above.
-	UpdateStaticEgressIP(ctx context.Context, appID string, ip string) error
+	UpdateStaticEgressIP(ctx context.Context, accountID, appID string, ip string) error
 	// Logs (issue #254 / Move 4) opens a server-streaming handle
 	// on the per-instance ring buffer at vmmd. The returned
 	// LogStream is the typed view of vmmdpb.Vmmd_LogsClient; the
@@ -629,7 +629,7 @@ func (c *VMMClient) UpdateEgressAllowlist(ctx context.Context, appID string, all
 // patch never blocks the loop. Idempotent on the vmmd side —
 // redelivered identical IP is a no-op (set-equal short-circuit
 // — see netns.Config.AccountStaticIP equality check).
-func (c *VMMClient) UpdateStaticEgressIP(ctx context.Context, appID string, ip string) error {
+func (c *VMMClient) UpdateStaticEgressIP(ctx context.Context, accountID, appID string, ip string) error {
 	if _, err := c.cli.UpdateStaticEgressIP(ctx, &vmmdpb.UpdateStaticEgressIPRequest{
 		AppId:          appID,
 		StaticEgressIp: ip,

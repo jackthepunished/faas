@@ -138,7 +138,7 @@ type RoutedVMM interface {
 	// nodeID (no target_url to dial), or the wrapped gRPC
 	// error / vmmd-typed problem on patch failure. Mirrors
 	// UpdateEgressAllowlist's contract above.
-	UpdateStaticEgressIP(ctx context.Context, nodeID, appID string, ip string) error
+	UpdateStaticEgressIP(ctx context.Context, nodeID, accountID, appID string, ip string) error
 	// Logs (issue #254 / Move 4) opens a server-streaming handle
 	// on the per-instance ring buffer on the vmmd that owns the
 	// instance. The returned LogStream is the typed view of
@@ -500,12 +500,12 @@ func (r *VMMRouter) UpdateEgressAllowlist(ctx context.Context, nodeID, appID str
 // up; the subscriber logs + drops so a bad patch never
 // blocks the loop. Mirrors UpdateEgressAllowlist's
 // contract above.
-func (r *VMMRouter) UpdateStaticEgressIP(ctx context.Context, nodeID, appID string, ip string) error {
+func (r *VMMRouter) UpdateStaticEgressIP(ctx context.Context, nodeID, accountID, appID string, ip string) error {
 	cli, err := r.resolveFor(ctx, nodeID)
 	if err != nil {
 		return err
 	}
-	return cli.UpdateStaticEgressIP(ctx, appID, ip)
+	return cli.UpdateStaticEgressIP(ctx, accountID, appID, ip)
 }
 
 // Logs (issue #254 / Move 4, issue #517 / PR-B acceptance #3 +

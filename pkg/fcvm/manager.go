@@ -218,14 +218,27 @@ type AdvisoryForwarder interface {
 	Forward(ctx context.Context, instance, appID string, events []AdvisoryEvent) error
 }
 
-// StaticEgressIPEntry (ADR-119) is the canonical (appID, ip)
-// tuple consumed by Manager.SetStaticEgressIPAliases. Defined
-// in pkg/fcvm so cmd/vmmd/egress_static_ip_bundle.go can type-
-// alias it without a circular dependency. Both sides agree on
-// the shape; the TOML loader in cmd/vmmd owns the wire format.
+// StaticEgressIPEntry (ADR-119 redesign) is the canonical
+// (accountID, appID, customerIP, perVMHostIP) tuple consumed by
+// Manager.SetStaticEgressIPAliases and the host renderer.
+//
+// AccountID is the apps.account_id the entry is provisioned for
+// (the Postgres bundle gate is keyed on (account_id, customer_ip));
+// AppID is the apps.id of the pinned app; IP is the customer-
+// supplied IP aliased on br-tenants; PerVMHostIP is the per-VM
+// host IP allocated from the dedicated static-egress pool
+// (10.200.x.y/16, see alloc.go::AcquireStaticEgressIP) — the
+// `ip saddr` in the host renderer's SNAT rule.
+//
+// Defined in pkg/fcvm so cmd/vmmd/egress_static_ip_bundle.go
+// can type-alias it without a circular dependency. Both sides
+// agree on the shape; the TOML loader in cmd/vmmd owns the wire
+// format (last-wins on appID is enforced at the loader layer).
 type StaticEgressIPEntry struct {
-	AppID string
-	IP    netip.Addr
+	AccountID   string
+	AppID       string
+	IP          netip.Addr
+	PerVMHostIP netip.Addr
 }
 
 // Instance is a live (or booting) microVM tracked by the Manager.
@@ -274,6 +287,15 @@ type Instance struct {
 	// schedd-owned app identity.
 	AppID string
 
+	// AccountID is the apps.account_id the instance was woken
+	// for (mirrors AppID). Captured from WakeRequest.AccountID
+	// so the host renderer (ADR-119 redesign) can mint an
+	// `account=` comment in the SNAT rule for audit + nag
+	// dashboards. The Lease intentionally does NOT carry the
+	// account ID — it's allocator-owned and instance-id-keyed;
+	// the Instance carries the schedd-owned app identity.
+	AccountID string
+
 	// DeploymentID (issue #463 / ADR-069 / PR-B AC #1) is the
 	// deployments.id UUID the instance was woken for. Captured at
 	// Wake time from WakeRequest.DeploymentID so the vsock DGRAM
@@ -298,15 +320,6 @@ type Instance struct {
 	// unit suite stubs it out.
 	AllowlistHandleV4 uint64
 	AllowlistHandleV6 uint64
-	// StaticIPHandle (ADR-119) is the nft handle of the per-netns
-	// SNAT-to-customer rule in `chain postrouting`, captured at
-	// Wake time (or at the previous successful
-	// UpdateStaticEgressIP). Zero when the per-VM AccountStaticIP
-	// is nil (no rule was emitted). Used by UpdateStaticEgressIP
-	// to delete the prior rule by handle before inserting a new
-	// one or clearing — same in-place patch shape as the
-	// allowlist handles above. v6 deferred.
-	StaticIPHandle uint64
 
 	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
 	// Stored on the Instance so Destroy (pkg/fcvm/vmm.go) can compute
@@ -680,22 +693,67 @@ type Manager struct {
 	// without the lock the redelivered entries could race with
 	// an in-flight Wake that just aliased a fresh IP.
 	staticEgressAliasesMu sync.Mutex
-	// perAppStaticIP (ADR-119) is the per-app POST/PATCH-
+	// perAppStaticIP (ADR-119 redesign) is the per-app POST/PATCH-
 	// written static egress IP, keyed by appID. The Wake
 	// and UpdateStaticEgressIP paths write here BEFORE the
-	// rendered netns state is touched, so a subsequent
-	// host renderer reload (SIGHUP) can re-emit the SNAT
-	// sibling rule from the authoritative source. The map
-	// is purely an authoritative-read cache; the rendered
-	// / live netns state still lives in
-	// inst.Net.AccountStaticIP. nil pointer = no static
-	// pin for that app.
+	// host renderer is rebuilt, so a subsequent host renderer
+	// reload (SIGHUP) can re-emit the SNAT rule from the
+	// authoritative source. The map is purely an authoritative-
+	// read cache; the rendered / live netns state is now
+	// driven by the per-VM host IP map (perVMHostIP) instead
+	// of per-VM netns patches. nil pointer = no static pin for
+	// that app.
 	perAppStaticIP map[string]*netip.Addr
 	// perAppStaticIPMu guards perAppStaticIP. Held briefly
 	// for read-then-set; the Wake path is the only writer
 	// in the steady-state (UpdateStaticEgressIP also
 	// writes).
 	perAppStaticIPMu sync.RWMutex
+	// perVMHostIP (ADR-119 redesign) is the live per-VM
+	// host IP map keyed by appID. The host renderer
+	// consumes the (perVMHostIP, customerIP) tuple for each
+	// live VM of a static-egress-pinned app. The map is
+	// populated by:
+	//   1. SetStaticEgressIPAliases (operator bundle reload)
+	//   2. RegisterStaticEgressIPForVM (called on Wake)
+	//   3. UnregisterStaticEgressIPForVM (called on Park /
+	//      Destroy, on the customer-clear path)
+	// Source of truth is the pkg/fcvm static-egress pool
+	// (alloc.go::AcquireStaticEgressIP / ReleaseStaticEgressIP);
+	// this map is the vmmd Manager's view of that pool,
+	// updated on every mutation.
+	perVMHostIP map[string]netip.Addr
+	// perVMHostIPMu guards perVMHostIP. Same discipline as
+	// perAppStaticIPMu (brief read-then-set locks).
+	perVMHostIPMu sync.RWMutex
+	// hostRenderer is the seam for vmmd's egress watcher to
+	// push fresh StaticEgressRules into the host renderer.
+	// Set by NewManager via the wire-up path in cmd/vmmd/main.go;
+	// nil for unit tests that don't drive the host renderer.
+	// The watcher path is fire-and-forget — failures log a
+	// Warn and continue (the next cache event will re-trigger
+	// the reload).
+	hostRenderer HostRenderer
+}
+
+// HostRenderer is the narrow seam the vmmd Manager uses to push
+// a fresh static-egress rule list into the host renderer
+// (cmd/vmmd/egress_watcher.go::liveHostPolicy). The interface
+// is the only way the Manager touches the renderer — the actual
+// nftables write is gated through the existing watcher's
+// staging-dir + atomic-replace pipeline.
+type HostRenderer interface {
+	// Render writes the current HostPolicy (including the
+	// freshly-pushed StaticEgressRules) to the staging file,
+	// validates via nft -c -f, atomic-replaces /etc/nftables.conf,
+	// and reloads the kernel ruleset. Returns nil on a clean
+	// reload; non-nil on any step (caller logs + continues).
+	Render(ctx context.Context) error
+	// SetStaticEgressRules replaces the renderer's
+	// StaticEgressRules slice. Cheap (single pointer swap
+	// under a lock); the next Render() picks up the new
+	// rules.
+	SetStaticEgressRules(rules []netns.StaticEgressRule)
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -720,10 +778,138 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		// cidToID field comment for the lifecycle.
 		cidToID:              make(map[uint32]string),
 		cooldownByDeployment: make(map[string]time.Time),
+		// ADR-119 redesign: per-app static-egress caches. The
+		// perAppStaticIP map (per-app pin) stays; perVMHostIP
+		// (per-VM host IP) is the new map that drives the host
+		// renderer.
+		perAppStaticIP:       make(map[string]*netip.Addr),
+		perVMHostIP:          make(map[string]netip.Addr),
 		metrics:              metrics,
 		conntrackCap:         api.ConntrackCapProbe(),
 		characterizationWait: api.CharacterizationHostDeadline,
 	}
+}
+
+// SetHostRenderer attaches the host renderer seam. The vmmd main
+// wiring calls this once at boot, after NewManager, before
+// serving traffic. The Manager calls Render() on every cache
+// mutation (Wake, Teardown, drift, SIGHUP) so the live
+// /etc/nftables.conf reflects the active static-egress pin set.
+func (m *Manager) SetHostRenderer(r HostRenderer) {
+	m.hostRenderer = r
+}
+
+// rebuildHostStaticEgressRules rebuilds the host renderer's
+// StaticEgressRules from the active per-VM host IP map and the
+// per-app customer IP cache, then triggers a host ruleset
+// reload. Called on every cache mutation (Wake, Teardown, drift,
+// SIGHUP).
+//
+// The rule list is the cross-product of perVMHostIP and
+// perAppStaticIP, filtered to apps that have BOTH a non-nil
+// per-VM host IP entry (the host renderer needs a `ip saddr`
+// source) AND a non-nil customer IP (the SNAT target). Apps
+// missing either field are silently dropped — the per-VM host
+// IP is set on Wake, the customer IP is set on the apid PUT.
+//
+// The reload is fire-and-forget: a failure logs a Warn and
+// returns; the next cache event re-triggers the rebuild. The
+// renderer reload is gated through the staging-dir + atomic-
+// replace pipeline in cmd/vmmd/egress_watcher.go, so a failed
+// Render does NOT break the live ruleset.
+func (m *Manager) rebuildHostStaticEgressRules(ctx context.Context) {
+	if m.hostRenderer == nil {
+		return
+	}
+	m.perVMHostIPMu.RLock()
+	perVM := make(map[string]netip.Addr, len(m.perVMHostIP))
+	for k, v := range m.perVMHostIP {
+		perVM[k] = v
+	}
+	m.perVMHostIPMu.RUnlock()
+
+	m.perAppStaticIPMu.RLock()
+	perApp := make(map[string]*netip.Addr, len(m.perAppStaticIP))
+	for k, v := range m.perAppStaticIP {
+		perApp[k] = v
+	}
+	m.perAppStaticIPMu.RUnlock()
+
+	// Look up account IDs by walking live instances. The
+	// account→app mapping is read from the live state; the
+	// reservation table (alloc.go) owns the per-VM host IP
+	// slot but not the account_id (the worker writes it at
+	// acquire time, and SetStaticEgressIPAliases from the
+	// operator bundle re-asserts it on SIGHUP).
+	accountByApp := make(map[string]string, len(perVM))
+	m.mu.Lock()
+	for _, inst := range m.live {
+		if _, ok := perVM[inst.AppID]; ok {
+			accountByApp[inst.AppID] = inst.AccountID
+		}
+	}
+	m.mu.Unlock()
+
+	rules := make([]netns.StaticEgressRule, 0, len(perVM))
+	for appID, perVMHostIP := range perVM {
+		ip := perApp[appID]
+		if ip == nil {
+			continue
+		}
+		rules = append(rules, netns.StaticEgressRule{
+			PerVMHostIP: perVMHostIP,
+			CustomerIP:  *ip,
+			AccountID:   accountByApp[appID],
+			AppID:       appID,
+		})
+	}
+	// Install the rules into the live host policy via
+	// atomic swap. The current pointer is read-then-copied,
+	// the new rules are written into the copy, and the new
+	// pointer is published. The watcher reads the new
+	// pointer on the next Render cycle.
+	cur := netns.ActiveHostPolicyForRender()
+	if cur != nil {
+		next := *cur
+		next.StaticEgressRules = rules
+		netns.SwapActiveHostPolicy(next)
+	} else {
+		m.log.Warn("fcvm: rebuildHostStaticEgressRules: ActiveHostPolicy pointer is nil; rules not installed")
+	}
+	if err := m.hostRenderer.Render(ctx); err != nil {
+		m.log.Warn("fcvm: rebuildHostStaticEgressRules reload failed; live ruleset unchanged",
+			"err", err, "rules", len(rules))
+	}
+}
+
+// RegisterStaticEgressIPForVM is called on Wake to associate the
+// per-VM host IP (allocated by alloc.go::AcquireStaticEgressIP at
+// the customer's apid PUT time) with the appID. Subsequent
+// rebuildHostStaticEgressRules calls surface the (perVMHostIP,
+// customerIP) tuple to the host renderer.
+func (m *Manager) RegisterStaticEgressIPForVM(appID string, perVMHostIP netip.Addr) {
+	if appID == "" || !perVMHostIP.IsValid() {
+		return
+	}
+	m.perVMHostIPMu.Lock()
+	m.perVMHostIP[appID] = perVMHostIP
+	m.perVMHostIPMu.Unlock()
+}
+
+// UnregisterStaticEgressIPForVM is called on the customer-clear
+// path (DELETE /v1/apps/{slug}/static-egress-ip) to remove the
+// per-VM host IP association. A live VM may still be running for
+// the app — the per-VM host IP is NOT released from the alloc.go
+// pool until the customer subsequently clears the pin via the
+// apid API (the alloc.go side Release is driven by the apid
+// handler, not by per-VM teardown).
+func (m *Manager) UnregisterStaticEgressIPForVM(appID string) {
+	if appID == "" {
+		return
+	}
+	m.perVMHostIPMu.Lock()
+	delete(m.perVMHostIP, appID)
+	m.perVMHostIPMu.Unlock()
 }
 
 // SetHostIdentity attaches the unseal key. Only vmmd calls this — the
@@ -2221,13 +2407,25 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			nc.EgressAllowlist = append(nc.EgressAllowlist, prefix)
 		}
 	}
-	// ADR-119: per-app static egress IP. Empty = no static pin
-	// (default behaviour preserved); non-empty → parsed
-	// dotted-quad v4. vmmd parses + validates the same shape
-	// apid gated on (family=4, non-reserved); the apid
-	// family=4 CHECK prevents IPv6 from reaching here. The
-	// parsed address lands on netns.Config.AccountStaticIP
-	// so the per-netns renderer emits a sibling SNAT rule.
+	// ADR-119 (redesign): per-app static egress IP. The
+	// per-netns SNAT was moved to the host renderer (see
+	// pkg/netns/policy.go::HostPolicy.StaticEgressRules + the
+	// `nftables NAT is first-match + terminal` rule). vmmd no
+	// longer writes nc.AccountStaticIP at all — the per-VM
+	// host IP is acquired from the alloc.go pool on the
+	// customer's apid PUT (the (accountID, appID) reservation
+	// lives until the customer clears the pin). The Wake
+	// path only:
+	//
+	//   1. validates the customer IP through the canonical
+	//      api.ValidateStaticEgressIP (failure = wake rejected),
+	//   2. looks up the reservation,
+	//   3. registers the per-VM host IP on the Manager so the
+	//      host renderer emits an `ip saddr <perVMHostIP> snat
+	//      to <customerIP>` rule.
+	//
+	// Empty StaticEgressIP is the default (no pin); the early
+	// branch skips the lookup + register.
 	if req.StaticEgressIP != "" {
 		ip, err := netip.ParseAddr(req.StaticEgressIP)
 		if err != nil {
@@ -2236,11 +2434,32 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		if !ip.Is4() {
 			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q (IPv6 deferred)", req.Instance, req.StaticEgressIP)
 		}
-		if !validCustomerStaticEgressIP(ip) {
-			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q (in reserved range)", req.Instance, req.StaticEgressIP)
+		if err := api.ValidateStaticEgressIP(ip); err != nil {
+			return nil, fmt.Errorf("wake %s: static egress IP: rejected %q: %w", req.Instance, req.StaticEgressIP, err)
 		}
-		ipCopy := ip
-		nc.AccountStaticIP = &ipCopy
+		// Reservation must already exist if the customer has
+		// pinned. The apid PUT path acquires; the Wake path
+		// only reads. If a customer clears their pin between
+		// dispatch and wake, the reservation is gone and the
+		// wake dies here — the gRPC fault is the customer's
+		// signal to drop the request.
+		//
+		// The accountID guard is the wire-side defence against
+		// a malicious or buggy shedder that forwards a
+		// different accountID than the one that acquired the
+		// pin. The reservation is keyed by (accountID, appID) so
+		// the cross-check is one field comparison.
+		res, ok := StaticEgressReservationFor(req.AppID)
+		if !ok {
+			return nil, fmt.Errorf("wake %s: static egress IP: no reservation for app_id=%s", req.Instance, req.AppID)
+		}
+		if res.AccountID != req.AccountID {
+			return nil, fmt.Errorf("wake %s: static egress IP: app_id=%s reserved under account_id=%s, not %s", req.Instance, req.AppID, res.AccountID, req.AccountID)
+		}
+		if res.CustomerIP != ip {
+			return nil, fmt.Errorf("wake %s: static egress IP: app_id=%s reserved with %s, not %s", req.Instance, req.AppID, res.CustomerIP, req.StaticEgressIP)
+		}
+		m.RegisterStaticEgressIPForVM(req.AppID, res.PerVMHostIP)
 	}
 	// Issue #679 / PR-A: cache the per-app slice BEFORE the
 	// operator-bundle merge so SetEgressOperatorBundle can read
@@ -2257,17 +2476,22 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		copy(perAppSnapshot, nc.EgressAllowlist)
 		m.perAppAllowlist[req.AppID] = perAppSnapshot
 		m.perAppAllowlistMu.Unlock()
-		// ADR-119: cache the per-app static IP from the Wake
-		// request. The UpdateStaticEgressIP gRPC path writes
-		// here too. A nil pointer clears the per-app pin.
+		// ADR-119 (redesign): cache the per-app customer IP
+		// from the Wake request. The UpdateStaticEgressIP gRPC
+		// path writes here too. A nil pointer clears the per-app
+		// pin. The address is parsed from the wire payload
+		// (validated above against the canonical deny-set);
+		// the per-VM host IP lives on the alloc.go reservation
+		// — see StaticEgressReservationFor above.
 		m.perAppStaticIPMu.Lock()
 		if m.perAppStaticIP == nil {
 			m.perAppStaticIP = make(map[string]*netip.Addr)
 		}
-		if nc.AccountStaticIP == nil {
+		if req.StaticEgressIP == "" {
 			m.perAppStaticIP[req.AppID] = nil
 		} else {
-			ipCopy := *nc.AccountStaticIP
+			wireIP, _ := netip.ParseAddr(req.StaticEgressIP)
+			ipCopy := wireIP
 			m.perAppStaticIP[req.AppID] = &ipCopy
 		}
 		m.perAppStaticIPMu.Unlock()
@@ -2506,7 +2730,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"observed_port", report.ObservedPort, "exit", report.ExitCode,
 			"port_norm_mode", report.PortNormalizationMode)
 	}
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime, RestoreMs: timings.restoreMs, NetnsTapMs: timings.netnsTapMs, GuestReadyMs: guestReadyMs, RestoreError: timings.restoreError}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, AccountID: req.AccountID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime, RestoreMs: timings.restoreMs, NetnsTapMs: timings.netnsTapMs, GuestReadyMs: guestReadyMs, RestoreError: timings.restoreError}
 	// ADR-098 C11: emit the three vmmd-side wake phases onto the
 	// dedicated histogram. nil-receiver safe. RestoreMs is 0 on
 	// cold boot (no /snapshot/load ran) — the histogram's
@@ -3501,32 +3725,36 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	return nil
 }
 
-// UpdateStaticEgressIP (ADR-119) is the gRPC handler invoked by
-// schedd's pg_notify egress-drift subscriber when an app's
-// `static_egress_ip` column changes. It walks the manager's live
-// instances for `appID`, and for each one patches the per-netns
-// postrouting chain so the sibling SNAT-to-customer rule (added
-// by the renderer when AccountStaticIP != nil) is installed,
-// removed, or replaced with a fresh IP.
+// UpdateStaticEgressIP (ADR-119 redesign) is the gRPC handler
+// invoked by schedd's pg_notify egress-drift subscriber when an
+// app's `static_egress_ip` column changes. The per-VM patch path
+// is gone (the per-netns SNAT is dead code — nftables NAT is
+// first-match + terminal, so the broad MASQUERADE shadows any
+// sibling SNAT). The host renderer is the new authority: this
+// handler updates the per-app cache, then rebuilds the host
+// renderer's StaticEgressRules list and triggers a reload.
 //
-// `ip == ""` is the "clear" path — every matching live instance
-// has its SNAT rule removed and the per-app cache entry dropped.
-// A non-empty IP is validated here the same way Wake validates
-// it (parse + IPv4 + reserved-range deny) so a malformed or
-// reserved value cannot reach the live netns.
+// `ip == ""` is the "clear" path — the per-app cache entry is
+// dropped and the host renderer rebuilds without that app's
+// rule. A non-empty IP is validated here the same way Wake
+// validates it (parse + IPv4 + canonical deny-set) so a
+// malformed or reserved value cannot reach the host ruleset.
 //
 // Idempotent fast-path: when the cached per-app IP equals the
-// incoming IP and every matching live instance's netns.Config
-// already has that AccountStaticIP set, the patch is a no-op.
-// Schedd's redelivery-on-reconnect lands here; without the
-// fast-path the nft sequence would emit delete-then-add the
-// same rule and conntrack churn unnecessarily.
+// incoming IP, the host rebuild is skipped (the ruleset is
+// already correct). Schedd's redelivery-on-reconnect lands
+// here; without the fast-path the host renderer would rewrite
+// the same bytes on every reconnect and atomic-rename the file
+// for nothing.
 //
-// Failure model matches UpdateEgressAllowlist: per-instance
-// revert is best-effort; a failed patch returns the error so
-// schedd can log + retry on its next reconcile. The opposite
-// family half is irrelevant for static IPs (v4 only, v6 deferred).
-func (m *Manager) UpdateStaticEgressIP(ctx context.Context, appID string, ip string) error {
+// Failure model matches UpdateEgressAllowlist: a failed
+// host-renderer reload logs at Warn and returns; the next
+// cache mutation (a Wake, Teardown, SIGHUP, or another drift
+// event) re-triggers the rebuild. The renderer reload is
+// gated through the staging-dir + atomic-replace pipeline in
+// cmd/vmmd/egress_watcher.go (a failed Render does NOT break
+// the live ruleset).
+func (m *Manager) UpdateStaticEgressIP(ctx context.Context, accountID, appID string, ip string) error {
 	if appID == "" {
 		return fmt.Errorf("fcvm: UpdateStaticEgressIP: empty app_id")
 	}
@@ -3539,14 +3767,48 @@ func (m *Manager) UpdateStaticEgressIP(ctx context.Context, appID string, ip str
 		if !parsed.Is4() {
 			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q (IPv6 deferred)", appID, ip)
 		}
-		if !validCustomerStaticEgressIP(parsed) {
-			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q (in reserved range)", appID, ip)
+		if err := api.ValidateStaticEgressIP(parsed); err != nil {
+			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: rejected %q: %w", appID, ip, err)
 		}
 		next = &parsed
 	}
 
-	// Update the per-app cache FIRST so a concurrent Wake that
-	// reads the cache after this point sees the new value
+	// Idempotent fast-path: cached per-app IP already matches
+	// the incoming IP. Skip the cache write + alloc + rebuild.
+	m.perAppStaticIPMu.RLock()
+	cur, exists := m.perAppStaticIP[appID]
+	m.perAppStaticIPMu.RUnlock()
+	if next == nil && cur == nil {
+		return nil
+	}
+	if next != nil && exists && cur.Compare(*next) == 0 {
+		return nil
+	}
+
+	// ADR-119 redesign note: vmmd owns the per-VM host IP
+	// reservation. The set path allocates from the dedicated
+	// 10.200.0.0/16 pool (alloc.go::AcquireStaticEgressIP); the
+	// clear path returns it (alloc.go::ReleaseStaticEgressIP).
+	// The reservation is what makes the Wake path able to look
+	// up the per-VM host IP for the app — without this the host
+	// renderer would have nothing to bind into the rule's `ip
+	// saddr <per-VM-host-IP>` source field.
+	if next != nil {
+		if _, rerr := AcquireStaticEgressIP(accountID, appID, *next); rerr != nil {
+			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s: reserve per-VM host IP: %w", appID, rerr)
+		}
+	} else {
+		if rerr := ReleaseStaticEgressIP(accountID, appID); rerr != nil {
+			// Best-effort release — a release failure does
+			// not block the cache clear. The reservation
+			// will be re-released on the next reconcile
+			// (vmmd restart walks alloc.go's reseed path).
+			m.log.Warn("fcvm: UpdateStaticEgressIP release alloc failed", "app_id", appID, "err", rerr)
+		}
+	}
+
+	// Update the per-app cache. Write the new value BEFORE the
+	// host rebuild so the rebuild reads the consistent value
 	// (matches the UpdateEgressAllowlist ordering invariant).
 	m.perAppStaticIPMu.Lock()
 	if m.perAppStaticIP == nil {
@@ -3560,177 +3822,13 @@ func (m *Manager) UpdateStaticEgressIP(ctx context.Context, appID string, ip str
 	}
 	m.perAppStaticIPMu.Unlock()
 
-	// Snapshot the targets + their cached netns handles under the
-	// manager lock, released before any netns exec. The full
-	// netns.Config is captured so the renderer produces the same
-	// argv as at Wake (Tap name, VethPeer, etc., must match).
-	type patchTarget struct {
-		instanceID string
-		netns      string
-		net        netns.Config
-		hasCurrent bool
-		currentIP  *netip.Addr
-		handle     uint64
-	}
-	var targets []patchTarget
-	m.mu.Lock()
-	for id, inst := range m.live {
-		if inst.AppID != appID {
-			continue
-		}
-		hasCurrent := inst.Net.AccountStaticIP != nil
-		var curCopy *netip.Addr
-		if hasCurrent {
-			ic := *inst.Net.AccountStaticIP
-			curCopy = &ic
-		}
-		targets = append(targets, patchTarget{
-			instanceID: id,
-			netns:      inst.Net.Netns,
-			net:        inst.Net,
-			hasCurrent: hasCurrent,
-			currentIP:  curCopy,
-			handle:     inst.StaticIPHandle,
-		})
-	}
-	m.mu.Unlock()
-	if len(targets) == 0 {
-		return nil // no live instances — cache is the source of truth, Wake will pick up next
-	}
-
-	// Build per-instance argv sequences. The rule shape is
-	// identical to NftCommands' per-VM emit (oifname <VethPeer>
-	// ip saddr 10.0.0.2 snat to <ip>), so we reuse the renderer
-	// by constructing a fresh netns.Config with AccountStaticIP
-	// set and pulling just the SNAT rule argv out. That avoids
-	// drift between the Wake-time render and the live-patch argv.
-	buildSNAT := func(t patchTarget) []string {
-		nc := t.net
-		nc.AccountStaticIP = next
-		full := nc.NftCommands()
-		var snatArgv []string
-		if next == nil {
-			return nil
-		}
-		wantSuffix := "snat to " + next.String()
-		for _, argv := range full {
-			line := strings.Join(argv, " ")
-			if strings.Contains(line, wantSuffix) {
-				snatArgv = argv
-				break
-			}
-		}
-		return snatArgv
-	}
-
-	// Apply per-instance. Same revert semantics as
-	// UpdateEgressAllowlist: a failed patch re-installs the
-	// prior rule (delete the new, re-add the prior). The
-	// single-family shape of the static-IP rule means the
-	// revert is a simple delete-the-new + add-the-prior.
-	newHandles := make(map[string]uint64, len(targets))
-	for _, t := range targets {
-		// Idempotent fast-path: instance already has the
-		// same AccountStaticIP we want. Skip the nft exec.
-		if t.hasCurrent && next != nil && t.currentIP.Compare(*next) == 0 {
-			newHandles[t.instanceID] = t.handle
-			continue
-		}
-		// Clear path with nothing installed: nothing to do.
-		if !t.hasCurrent && next == nil {
-			newHandles[t.instanceID] = 0
-			continue
-		}
-		nextArgv := buildSNAT(t)
-		newH, err := m.applyStaticIPPatch(ctx, t.netns, t.hasCurrent, t.currentIP, nextArgv, t.handle)
-		if err != nil {
-			return fmt.Errorf("fcvm: UpdateStaticEgressIP app=%s netns=%s: %w", appID, t.netns, err)
-		}
-		newHandles[t.instanceID] = newH
-	}
-
-	// Update cached handle + per-netns state so the next patch's
-	// fast-path compares against the new baseline.
-	m.mu.Lock()
-	for id, inst := range m.live {
-		nh, ok := newHandles[id]
-		if !ok {
-			continue
-		}
-		if next == nil {
-			inst.Net.AccountStaticIP = nil
-			inst.StaticIPHandle = 0
-		} else {
-			ic := *next
-			inst.Net.AccountStaticIP = &ic
-			inst.StaticIPHandle = nh
-		}
-	}
-	m.mu.Unlock()
+	// Rebuild the host renderer. If there are no live VMs for
+	// this app, the rebuild still walks the per-VM map and
+	// drops the rule (the alloc.go reservation persists
+	// until the customer clears the pin, so a subsequent Wake
+	// re-adds the rule from the per-VM host IP registration).
+	m.rebuildHostStaticEgressRules(ctx)
 	return nil
-}
-
-// applyStaticIPPatch runs the per-netns delete-then-add sequence
-// for the per-VM SNAT-to-customer rule. When nextArgv is nil the
-// patch is a pure delete (the "clear" path). When `hasPrior` is
-// false the patch is a pure add. Revert semantics match
-// applyOneInstancePatch: on failure the prior rule is re-added
-// (best-effort) and the error is returned.
-func (m *Manager) applyStaticIPPatch(
-	ctx context.Context,
-	netnsName string,
-	hasPrior bool,
-	priorIP *netip.Addr,
-	nextArgv []string,
-	priorHandle uint64,
-) (uint64, error) {
-	nx := func(parts ...string) []string {
-		return append([]string{"ip", "netns", "exec", netnsName, "nft"}, parts...)
-	}
-	var ops [][]string
-	if hasPrior && priorHandle > 0 {
-		ops = append(ops, nx("delete", "rule", "ip", "faas", "postrouting", "handle", fmt.Sprintf("%d", priorHandle)))
-	}
-	if nextArgv != nil {
-		ops = append(ops, nextArgv)
-	}
-	if len(ops) == 0 {
-		return 0, nil
-	}
-	if err := m.runCommands(ctx, ops); err != nil {
-		// Best-effort revert: re-add the prior SNAT rule by
-		// emitting the canonical argv shape (oifname is the
-		// netns's veth peer, but postrouting here operates
-		// inside the netns; the rule's `oifname <VethPeer>`
-		// qualifier — the host-side veth name — is what we
-		// can't reconstruct here without the cached netns
-		// config. We emit the source-addr + snat-to form,
-		// which is sufficient because nft matches on ip saddr
-		// 10.0.0.2 + snat to <priorIP> as the unique
-		// fingerprint. The captureRunner's listChainHandles
-		// will refresh the handle on the next patch.)
-		if hasPrior && priorIP != nil {
-			revertArgv := nx("add", "rule", "ip", "faas", "postrouting",
-				"ip", "saddr", netns.GuestIP, // 10.0.0.2 anchor
-				"snat", "to", priorIP.String())
-			if rerr := m.runCommands(ctx, [][]string{revertArgv}); rerr != nil {
-				m.log.Warn("fcvm: UpdateStaticEgressIP revert failed; live netns may be in undefined state",
-					"netns", netnsName, "patch_err", err, "revert_err", rerr)
-			}
-		}
-		return 0, err
-	}
-	// Capture the kernel-assigned handle for the freshly-added
-	// rule so the next patch's delete-by-handle targets it.
-	// The captureRunner path is exercised on the EX44; unit
-	// tests with a fakeRunner accept handle == 0 (the next
-	// patch picks it up via listChainHandles).
-	if m.captureRunner != nil && nextArgv != nil {
-		if h, herr := listChainHandles(ctx, m.captureRunner, netnsName, "ip", "faas", "postrouting"); herr == nil && h != 0 {
-			return h, nil
-		}
-	}
-	return priorHandle, nil
 }
 
 // applyOneInstancePatch runs the per-family patch sequence for a
@@ -4187,35 +4285,4 @@ func layerKeyForColdBoot(req WakeRequest) string {
 		return ""
 	}
 	return req.LayerKey
-}
-
-// validCustomerStaticEgressIP (ADR-119) is the vmmd-side
-// fail-closed gate on the customer-supplied IPv4. The apid
-// handler runs the same check upstream (cmd/apid/
-// handlers_apps_static_egress_ip.go::validCustomerEgressIP);
-// the wire-side defence here ensures a vmmd that forgets to
-// re-validate cannot smuggle a bad IP past apid. The deny
-// set is the same as the apid gate (RFC1918 + link-local +
-// multicast + CGN + 0.0.0.0/8 + loopback).
-func validCustomerStaticEgressIP(ip netip.Addr) bool {
-	if !ip.Is4() {
-		return false
-	}
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return false
-	}
-	bad := []netip.Prefix{
-		netip.MustParsePrefix("10.0.0.0/8"),
-		netip.MustParsePrefix("172.16.0.0/12"),
-		netip.MustParsePrefix("192.168.0.0/16"),
-		netip.MustParsePrefix("100.64.0.0/10"),
-		netip.MustParsePrefix("169.254.0.0/16"),
-		netip.MustParsePrefix("224.0.0.0/4"),
-	}
-	for _, p := range bad {
-		if p.Contains(ip) {
-			return false
-		}
-	}
-	return true
 }

@@ -115,6 +115,33 @@ func (s *server) setAppStaticEgressIP(w http.ResponseWriter, r *http.Request, ac
 			api.WriteProblem(w, api.ErrAppStaticEgressIPInvalid(req.IP, err.Error()))
 			return
 		}
+		// ADR-119 redesign: operator-bundle gate. The pinned
+		// IP must be in the operator's provisioned set
+		// (the vmmd SIGHUP watcher writes the Postgres gate
+		// table from /etc/faas/egress/static_egress_ips.toml;
+		// this lookup is the read). A missing tuple is the
+		// operator-side "this IP is not on the host's AS"
+		// surface — 404 Not Found, distinct from the
+		// 400 (bad IP) and 403 (plan quota) above. The
+		// appendToAllocPool here is the per-VM host IP
+		// reservation that drives the host renderer.
+		ok, perr := s.store.ProvisionedStaticEgressIPExists(r.Context(), acct.ID, ip)
+		if perr != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not check operator bundle"))
+			return
+		}
+		if !ok {
+			api.WriteProblem(w, api.ErrStaticEgressIPNotProvisioned(req.IP))
+			return
+		}
+		// ADR-119 redesign note: the per-VM host IP allocation
+		// (pkg/fcvm.AcquireStaticEgressIP) is owned by vmmd, not
+		// apid. The schedd egress_drift subscriber (pkg/sched/
+		// egress_drift.go) listens for app_changed and calls
+		// Router.UpdateStaticEgressIP gRPC on the vmmd client;
+		// vmmd's gRPC handler calls AcquireStaticEgressIP. This
+		// keeps the firecracker/jailer layer out of the apid
+		// control-plane binary (CLAUDE.md component ownership).
 		newIP = &ip
 	}
 	updated, err := s.store.UpdateApp(r.Context(), app.ID, state.UpdateAppParams{
@@ -168,6 +195,15 @@ func (s *server) setAppStaticEgressIP(w http.ResponseWriter, r *http.Request, ac
 // clearAppStaticEgressIP drops the per-app static egress IP pin.
 // Convenience wrapper around setAppStaticEgressIP with Set=false.
 // Idempotent — clearing a non-existent pin is a 204.
+//
+// ADR-119 redesign: also releases the per-VM host IP
+// reservation in the alloc.go pool. The Wake path
+// (pkg/fcvm/manager.go) only reads the reservation; the
+// pair is (acquire on PUT, release on DELETE). The release
+// is best-effort — a release failure logs but does not block
+// the column clear (the customer's intent is the priority,
+// and the reservation will be re-released on the next SIGHUP-
+// triggered reconcile).
 func (s *server) clearAppStaticEgressIP(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if !api.StaticEgressIPEnabled() {
 		api.WriteProblem(w, staticEgressIPNotEnabled())
@@ -177,6 +213,14 @@ func (s *server) clearAppStaticEgressIP(w http.ResponseWriter, r *http.Request, 
 	if !ok {
 		return
 	}
+	// ADR-119 redesign note: the per-VM host IP reservation
+	// (pkg/fcvm.ReleaseStaticEgressIP) is owned by vmmd, not
+	// apid. The schedd egress_drift subscriber calls vmmd's
+	// Router.UpdateStaticEgressIP gRPC with clear=true, and
+	// vmmd's handler releases the reservation + rebuilds the
+	// host renderer. The customer's intent (apps.static_egress_ip
+	// = NULL) is the priority; the reservation release is the
+	// vmmd handler's responsibility.
 	if _, err := s.store.UpdateApp(r.Context(), app.ID, state.UpdateAppParams{
 		StaticEgressIP:    nil,
 		SetStaticEgressIP: true,

@@ -115,7 +115,7 @@ func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 // UpdateStaticEgressIP (ADR-119) is the no-op test fake.
 // The drift subscriber tests in pkg/sched/egress_drift_test.go
 // use the RoutedVMM seam, not the gRPC client seam.
-func (f *fakeVMM) UpdateStaticEgressIP(ctx context.Context, appID string, ip string) error {
+func (f *fakeVMM) UpdateStaticEgressIP(ctx context.Context, accountID, appID string, ip string) error {
 	return nil
 }
 

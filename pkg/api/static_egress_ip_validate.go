@@ -42,7 +42,9 @@
 //   - CGN (100.64/10)
 //   - Link-local v4 (169.254/16) + IsLinkLocalUnicast + IsLinkLocalMulticast
 //   - Multicast (224/4) + IsMulticast
-//   - Loopback + IsUnspecified (0.0.0.0)
+//   - Loopback + IsUnspecified (0.0.0.0) + 0.0.0.0/8 (RFC1122 §3.2.1.3
+//     "this network"; the IsUnspecified helper only catches the single
+//     zero address — the full /8 is reserved per RFC6890)
 //
 // Deliberately NOT denied:
 //   - TEST-NET-1/2/3 (192.0.2/24, 198.51.100/24, 203.0.113/24) —
@@ -63,7 +65,17 @@ import (
 // staticEgressIPDenyCIDRs is the v4 CIDR deny set. Adding a new
 // range here automatically extends every gate — that is the whole
 // point of the consolidation.
+//
+// 0.0.0.0/8 (RFC1122 §3.2.1.3 / RFC6890 "this network") is the
+// fix for the pre-redesign gap: the docstring claimed "0.0.0.0/8
+// denied" but the original validator only checked IsUnspecified()
+// (the single zero address). The /8 prefix check catches the
+// whole reserved range (0.0.0.1, 0.1.2.3, 0.255.255.255, etc.)
+// — every address a customer might be tempted to "type a zero"
+// into. Replaces the hand-rolled copies in pkg/fcvm/manager.go,
+// cmd/vmmd/egress_static_ip_bundle.go, and the metal test.
 var staticEgressIPDenyCIDRs = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),      // "this network" (RFC1122 §3.2.1.3)
 	netip.MustParsePrefix("10.0.0.0/8"),     // RFC1918
 	netip.MustParsePrefix("172.16.0.0/12"),  // RFC1918
 	netip.MustParsePrefix("192.168.0.0/16"), // RFC1918

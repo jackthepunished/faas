@@ -46,6 +46,28 @@ func staticEgressIPReq(ip string, set bool) api.SetAppStaticEgressIPRequest {
 	return api.SetAppStaticEgressIPRequest{IP: ip, Set: set}
 }
 
+// mustSeedProvisionedStaticEgressIPs (ADR-119 redesign) marks the
+// (account_id, customer_ip) tuples as operator-bundle-provisioned
+// so the apid PUT path's gate (api.ProvisionedStaticEgressIPExists)
+// passes. Tests that exercise the happy-path PUT call this helper
+// before the request; tests that exercise the 404 not-provisioned
+// path skip it.
+func mustSeedProvisionedStaticEgressIPs(t *testing.T, e testEnv, ips ...string) {
+	t.Helper()
+	parsed := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		a, err := netip.ParseAddr(ip)
+		if err != nil {
+			t.Fatalf("mustSeedProvisionedStaticEgressIPs: invalid ip %q: %v", ip, err)
+		}
+		parsed = append(parsed, a)
+	}
+	mem := e.store
+	if err := mem.ReplaceProvisionedStaticEgressIPs(context.Background(), e.acct.ID, parsed); err != nil {
+		t.Fatalf("seed operator bundle: %v", err)
+	}
+}
+
 // TestStaticEgressIP_FlagOffBlocksAllHandlers pins the dark-launch
 // posture: a misconfigured cluster returns 402 on every verb until
 // FAAS_STATIC_EGRESS_IP_ENABLED is set. The check runs before
@@ -148,6 +170,7 @@ func TestStaticEgressIP_PutScaleAcceptedRoundTrips(t *testing.T) {
 	withStaticEgressIPEnabled(t)
 	e := setup(t, api.PlanScale)
 	mustSeedApp(t, e, "scale-app")
+	mustSeedProvisionedStaticEgressIPs(t, e, "203.0.113.42")
 
 	rec := e.do(t, "PUT", "/v1/apps/scale-app/static-egress-ip",
 		staticEgressIPReq("203.0.113.42", true), nil)
@@ -224,6 +247,7 @@ func TestStaticEgressIP_CrossAppSameAccountQuota(t *testing.T) {
 	e, _ := newTestServerWithCapturingNotifier(t, api.PlanScale)
 	mustSeedApp(t, e, "first-app")
 	mustSeedApp(t, e, "second-app")
+	mustSeedProvisionedStaticEgressIPs(t, e, "203.0.113.42")
 
 	// First app: pin 203.0.113.42.
 	rec := e.do(t, "PUT", "/v1/apps/first-app/static-egress-ip",
@@ -253,6 +277,7 @@ func TestStaticEgressIP_DeleteClears(t *testing.T) {
 	withStaticEgressIPEnabled(t)
 	e := setup(t, api.PlanScale)
 	mustSeedApp(t, e, "delete-app")
+	mustSeedProvisionedStaticEgressIPs(t, e, "203.0.113.42")
 
 	// Pin first.
 	rec := e.do(t, "PUT", "/v1/apps/delete-app/static-egress-ip",
@@ -293,6 +318,7 @@ func TestStaticEgressIP_PutEmitsAppChanged(t *testing.T) {
 	withStaticEgressIPEnabled(t)
 	e, notif := newTestServerWithCapturingNotifier(t, api.PlanScale)
 	appID := mustSeedApp(t, e, "notify-app")
+	mustSeedProvisionedStaticEgressIPs(t, e, "203.0.113.42")
 
 	rec := e.do(t, "PUT", "/v1/apps/notify-app/static-egress-ip",
 		staticEgressIPReq("203.0.113.42", true), nil)

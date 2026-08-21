@@ -336,7 +336,7 @@ func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) er
 // satisfied when schedd's deps.subscribeEgressDrift is left
 // nil (the production subscriber is not started in these tests).
 // Mirrors UpdateEgressAllowlist above.
-func (stubVMM) UpdateStaticEgressIP(context.Context, string, string) error {
+func (stubVMM) UpdateStaticEgressIP(context.Context, string, string, string) error {
 	return nil
 }
 

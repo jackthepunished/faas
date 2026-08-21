@@ -920,6 +920,7 @@ const (
 	CodePlanStaticEgressIPNotAllowed = "plan_static_egress_ip_not_allowed"
 	CodePlanStaticEgressIPQuota      = "plan_static_egress_ip_quota"
 	CodeAppStaticEgressIPInvalid     = "app_static_egress_ip_invalid"
+	CodeStaticEgressIPNotProvisioned = "static_egress_ip_not_provisioned"
 	// CodeStaticEgressIPNotEnabled is the dark-launch 402 — the
 	// cluster has the schema + handlers wired but the operator
 	// has not flipped FAAS_STATIC_EGRESS_IP_ENABLED. Same posture
@@ -1490,6 +1491,8 @@ func StatusForCode(code string) int {
 		return http.StatusForbidden
 	case CodeAppStaticEgressIPInvalid:
 		return http.StatusBadRequest
+	case CodeStaticEgressIPNotProvisioned:
+		return http.StatusNotFound
 	case CodeUpstreamInvalidKind, CodeUpstreamInvalidHost, CodeUpstreamInvalidPort:
 		return http.StatusBadRequest
 	case CodeUpstreamNotFound:
@@ -3417,6 +3420,32 @@ func ErrAppStaticEgressIPInvalid(ip string, reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeAppStaticEgressIPInvalid,
 		"Invalid static egress IP",
 		fmt.Sprintf("static_egress_ip=%q is not accepted: %s.", ip, reason)).
+		WithDocs(docsBase + "/apps#static-egress-ip")
+}
+
+// ErrStaticEgressIPNotProvisioned (ADR-119 redesign) is the 404
+// returned by the apid handler when the customer's pin attempts to
+// attach an IP that isn't in the operator-provisioned bundle
+// (provisioned_static_egress_ips table; migration 00337).
+//
+// The deployment-shape gate: customer-supplied IPs that aren't
+// routed to the host's AS are (a) outbound-spoofed at the switch
+// (no internet path) and (b) inbound replies route to the customer
+// AS (lost). The operator must attach the IP as an additional IP
+// on the host's AS first, then declare it in the operator TOML
+// /etc/faas/egress/static_egress_ips.toml. vmmd writes the
+// (account_id, customer_ip) tuple to the Postgres gate on SIGHUP.
+// A missing tuple means the customer requested an IP that
+// isn't provisioned — the handler must refuse the pin so a
+// customer can never silently route to an unroutable IP.
+//
+// 404 (not 403) is the canonical framing: the IP is not
+// provisioned on this cluster's host. The customer-facing
+// copy directs the customer to the host operator.
+func ErrStaticEgressIPNotProvisioned(ip string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeStaticEgressIPNotProvisioned,
+		"Static egress IP not provisioned on this host",
+		fmt.Sprintf("static_egress_ip=%q is not in the operator bundle; ask the host operator to provision it on the host's AS before pinning.", ip)).
 		WithDocs(docsBase + "/apps#static-egress-ip")
 }
 

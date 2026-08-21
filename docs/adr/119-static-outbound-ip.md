@@ -1,12 +1,18 @@
-# ADR-119 · Static outbound IP per app (Scale-only, BYOIP, single-node v1)
+# ADR-119 · Static outbound IP per app (Scale-only, operator-provisioned, single-node v1)
 
-- **Status:** proposed
-- **Date:** 2026-08-19
+- **Status:** proposed (PR-#997 redesign, round 4 — IP source changed
+  from customer-supplied BYOIP to operator-provisioned additional IPs
+  to keep return-path routing intact; per-netns SNAT path deleted in
+  favour of host-side SNAT renderer; first-match NAT ordering
+  corrected from AFTER→BEFORE the broad MASQUERADE)
+- **Date:** 2026-08-19 (initial); 2026-08-21 (redesign amendment)
 - **Decision:** Ship a per-app **static outbound IP** feature: the
-  customer pins an IPv4 from their own range (BYOIP) to a Scale-plan
-  app; every egress packet from that app's instances exits the host
-  with the customer's IP as source. v1 is **single-node** (the current
-  EX44 production posture); multi-host placement pin, IPv6, a
+  operator provisions an additional IP on the host's AS and adds it
+  to the static-egress-IP TOML bundle; the customer pins one of
+  those operator-provisioned IPs onto a Scale-plan app; every
+  egress packet from that app's instances exits the host with the
+  customer's IP as source. v1 is **single-node** (the current EX44
+  production posture); multi-host placement pin, IPv6, a
   platform-owned IP pool, and Paddle/Stripe add-on billing are
   explicitly out of scope and tracked as follow-up ADRs.
 
@@ -69,7 +75,8 @@ ADR.
 Single nullable column on `apps`, plus a stamp:
 
 ```sql
--- migrations/00325_apps_static_egress_ip.sql (additive)
+-- migrations/00336_apps_static_egress_ip.sql (additive, rebumped
+-- from 00325 in PR-#997 round 2)
 alter table apps
   add column if not exists static_egress_ip inet
     check (static_egress_ip is null or family(static_egress_ip) = 4);
@@ -111,38 +118,69 @@ Add `optional string static_egress_ip = 8` to `AppSpec` in
   pg_notify subscriber to fire `UpdateStaticEgressIP` when the
   field changes (mirrors `UpdateEgressAllowlist` path).
 
-### Per-netns renderer (per-VM)
+### Renderer model (the load-bearing piece)
 
-Extend `pkg/netns.Config` (line 63-126) with `AccountStaticIP *netip.Addr`.
-`NftCommands()` emits a sibling rule AFTER the existing
-`oifname <VethPeer> masquerade` (line 298):
+The host is the **only** SNAT authority for the customer's IP. The
+per-netns chain (`pkg/netns.Config::NftCommands`) does **NOT**
+emit a customer SNAT — the early PR-#997 first cut tried to add a
+sibling `ip saddr 10.0.0.2 snat to <CustomerIP>` rule alongside the
+per-VM MASQUERADE, but **nftables NAT is first-match + terminal**,
+so the broad MASQUERADE shadows the specific SNAT. That code path
+is deleted.
 
-```
-add rule ip faas postrouting oifname <VethPeer>
-  ip saddr 10.0.0.2 snat to <CustomerIP>
-```
-
-Position: AFTER the MASQUERADE so this SNAT-to-customer overrides
-the per-VM host IP for matching flows. Conntrack cache is unaffected
-on existing flows; new flows use the new rule.
-
-### Host renderer (the load-bearing piece)
-
-Extend `pkg/netns.HostPolicy` (line 48-133) with
-`AccountStaticEgressIPs map[string][]netip.Addr` (accountID → IPs).
-`Render()` (line 277-421) emits a block in `chain postrouting`
-**AFTER** the existing `10.100.0.0/16` MASQUERADE (line 399), one
-rule per (account, IP):
+Extend `pkg/netns.HostPolicy` with `StaticEgressRules
+[]StaticEgressRule` (PerVMSrcAddr + CustomerIP + AccountID + AppID
+fields). `Render()` emits a block in `chain postrouting` **BEFORE**
+the existing `10.100.0.0/16` MASQUERADE, one rule per live VM:
 
 ```
 ip saddr <per-vm-host-ip> oifname <PublicIface> snat to <customer-ip>
+  # account=<acct> app=<app>
 ```
 
-The `<per-vm-host-ip>` is allocated from the per-host `/16` (the
-existing `pkg/fcvm/alloc.go::Acquire` slot allocator) by the new
-`AcquireStaticEgressIP(accountID, appID, ip)` method (see below).
-This mirrors the existing per-overlay MASQUERADE sibling at
-`policy.go:406-408`.
+**Why BEFORE the MASQUERADE.** nftables NAT chains evaluate rules
+in declaration order; first match wins and is terminal. A specific
+SNAT that lives AFTER a broad MASQUERADE is unreachable. The
+ordering — specific (per-customer) before broad (per-tenant-range)
+— is regression-netted by
+`TestHostPolicyStaticEgressRulesPlacedBeforeMasquerade`.
+
+The `<per-vm-host-ip>` is allocated from a dedicated sub-range of
+the per-host `/16` by `pkg/fcvm/alloc.go::AcquireStaticEgressIP`
+(see "Allocator layer" below). The (accountID, appID, customerIP,
+per-VM-host-IP) tuple is the source of truth for the host
+renderer's rule set.
+
+### IP source model (operator-provisioned additional IPs)
+
+The customer's IP is an **operator-provisioned additional IP** —
+not a customer-supplied BYOIP. Operator flow:
+
+1. Operator provisions an additional IP on the host's AS (Hetzner
+   "Additional IP", AWS EIP, etc.) and adds it to `/etc/faas/egress/static_egress_ips.toml`:
+   ```toml
+   [[entries]]
+   account_id = "<acct-uuid>"
+   app_id = "<app-uuid>"
+   ip = "203.0.113.42"
+   ```
+2. vmmd's SIGHUP-driven watcher (`watchStaticEgressIPBundleReload`)
+   reloads the TOML and writes each `(account_id, customer_ip)` tuple
+   to the new `provisioned_static_egress_ips` table (migration 00337)
+   and pushes the per-VM host IP rules into `HostPolicy.StaticEgressRules`.
+3. The apid PUT handler (`POST /v1/apps/{slug}/static-egress-ip`)
+   rejects any pin whose `(account_id, customer_ip)` is not in the
+   Postgres table — 404 `static_egress_ip_not_provisioned`. The
+   apid surface is invisible until the operator flips
+   `FAAS_STATIC_EGRESS_IP_ENABLED` AND has provisioned the IP.
+
+**Why operator-provisioned, not customer-supplied.** A
+customer-supplied IP that isn't routed to the host's AS gets
+outbound-spoofed-source-filtered at the switch (no return path) and
+inbound replies route to the customer's AS (lost). Additional IPs
+on the host's AS have return-path routing pre-configured by the
+provider. Customers pin from the operator's provisioned set; they
+do not choose their own IP.
 
 ### Bridge alias + SIGHUP reload
 
@@ -212,9 +250,18 @@ The IP must:
 1. Be valid IPv4 (CIDR parse, family check).
 2. Not be in `RFC1918` (`10/8`, `172.16/12`, `192.168/16`),
    `link-local` (`169.254/16`), multicast (`224/4`), `100.64/10`
-   (CGN — denied per spec §11), or the loopback range
-   (`127/8`). Reuse `pkg/netns.ValidateCIDRsAgainstDenySet`
-   (line 232-253) with the IP wrapped as a /32 CIDR.
+   (CGN — denied per spec §11), the loopback range
+   (`127/8`), or `0.0.0.0/8` (the "this network" range
+   RFC6890 reserves). Reuse `pkg/netns.ValidateCIDRsAgainstDenySet`
+   (line 232-253) with the IP wrapped as a /32 CIDR — the canonical
+   `pkg/api.ValidateStaticEgressIP` helper (used at apid, Wake,
+   bundle loader, and the metal test) is the **single source of
+   truth**; no hand-rolled deny-set copies.
+3. Be **operator-provisioned** for the requesting account — the
+   `(account_id, customer_ip)` tuple must exist in the
+   `provisioned_static_egress_ips` table (migration 00337), written
+   by vmmd's TOML reload. Otherwise 404
+   `static_egress_ip_not_provisioned`.
 
 ### CLI surface
 
@@ -224,26 +271,53 @@ call. Mirrors `cmd/gregale/commands_tenant_surfaces.go:32-56`.
 
 ## Consequences
 
-- New migration `00325_apps_static_egress_ip.sql` (additive,
-  nullable, default NULL).
-- New migration `00326_reserve_slot.sql` (fence for the cross-PR
+- New migration `00336_apps_static_egress_ip.sql` (additive,
+  nullable, default NULL; rebumped from 00325 after PR-#997 round-1
+  shipped).
+- New migration `00337_provisioned_static_egress_ips.sql` — the
+  operator-bundle gate table the apid PUT path validates against.
+  Composite `(account_id, customer_ip)` PK; v4-only CHECK; ON
+  DELETE CASCADE from `accounts`.
+- New migration `00338_reserve_slot.sql` (fence for the cross-PR
   follow-up).
-- New wire field on `AppSpec` (proto field 8) +
+- New wire field on `AppSpec` (proto field 14) +
   `UpdateStaticEgressIP` gRPC method.
-- New `pkg/netns.Config.AccountStaticIP` and
-  `pkg/netns.HostPolicy.AccountStaticEgressIPs` fields.
-- New `pkg/fcvm/alloc.go::AcquireStaticEgressIP` method + a
-  per-host TOML file at `/etc/faas/egress/static_egress_ips.toml`.
-- New `cmd/vmmd/egress_static_ip_bundle.go` (TOML loader + SIGHUP).
+- New `pkg/netns.HostPolicy.StaticEgressRules` field + new
+  `pkg/netns.StaticEgressRule` type — the host-side SNAT
+  authority. The per-netns `pkg/netns.Config.AccountStaticIP`
+  path is **deleted** (see "Renderer model" above).
+- New `pkg/fcvm/alloc.go::AcquireStaticEgressIP` /
+  `ReleaseStaticEgressIP` / `StaticEgressReservationFor` methods
+  that allocate per-VM host IPs from the dedicated
+  `10.200.0.0/16` range (separate from the dynamic per-VM pool).
+- New `pkg/state.Store::ProvisionedStaticEgressIPExists` /
+  `ReplaceProvisionedStaticEgressIPs` methods — the operator-
+  bundle ↔ apid bridge.
+- New `cmd/vmmd/egress_static_ip_bundle.go` (TOML loader + SIGHUP
+  + Postgres write + host-renderer push, restructured to consume
+  the canonical `pkg/api.ValidateStaticEgressIP` helper).
 - New env flag `FAAS_STATIC_EGRESS_IP_ENABLED` (default OFF).
 - New dashboard card surfacing the per-app pin + plan cap.
 - New `gregale app security static-egress-ip` subcommand family.
 - New RFC 7807 error codes (`plan_static_egress_ip_not_allowed`,
-  `plan_static_egress_ip_quota`, `app_static_egress_ip_invalid`).
-- **Spec §11 update** — add a paragraph noting the customer-supplied
-  static IP path. The metadata-range deny (§11 line 398) is unchanged.
+  `plan_static_egress_ip_quota`, `app_static_egress_ip_invalid`,
+  **`static_egress_ip_not_provisioned` (404)**).
+- **Spec §11 update** — add a paragraph noting the
+  operator-provisioned IP path (the customer does NOT choose their
+  own IP; the operator does). The metadata-range deny (§11 line
+  398) is unchanged; `0.0.0.0/8` is added to the deny set.
 
 ## Rejected alternatives
+
+- **Customer-supplied BYOIP** (the original v1 cut, before PR-#997
+  round-4 redesign). Customer types an IP from their own range; the
+  host aliases it on `br-tenants`. Rejected: a customer-supplied IP
+  that isn't routed to the host's AS gets
+  outbound-spoofed-source-filtered at the switch (no return path)
+  and inbound replies route to the customer's AS (lost). The
+  operator-provisioned model (additional IPs from the host's AS,
+  pre-routed by the provider) is the only shape that works without
+  BGP / VRRP / a serverless-anycast IP layer Gregale doesn't have.
 
 - **Per-account static IP (vs per-app).** A customer might want one
   IP shared across all of their apps. ADR-100 tenant-surfaces-style
@@ -288,6 +362,14 @@ call. Mirrors `cmd/gregale/commands_tenant_surfaces.go:32-56`.
 
 ## Risks
 
+- **First-match NAT ordering regression.** The single load-bearing
+  ordering rule (specific SNAT **before** broad MASQUERADE) is
+  easy to break in a future refactor. The host renderer is rebuilt
+  on every VM wake/teardown, and a refactor that reorders the
+  emit blocks kills the feature silently. Mitigated by
+  `TestHostPolicyStaticEgressRulesPlacedBeforeMasquerade` — the
+  string-position assertion is the regression net.
+
 - **Alias-IP lifecycle on `br-tenants`.** Concurrent set/clear
   across multiple apps can race the bridge alias-IP add/del. The
   SIGHUP-driven reload goroutine in
@@ -295,10 +377,19 @@ call. Mirrors `cmd/gregale/commands_tenant_surfaces.go:32-56`.
   point — same shape as the existing operator-bundle reload.
   Conntrack state is preserved across reloads.
 
-- **Multi-tenant IP collision.** Two customers BYOIP-ing the same
-  IP would alias-conflict on the bridge. Mitigated by the
+- **Multi-tenant IP collision.** Two accounts sharing the same IP
+  would alias-conflict on the bridge. Mitigated by the
   `apps_static_egress_ip_key` partial unique index (returns 23505
   on conflict → apid maps to `plan_static_egress_ip_quota`).
+
+- **Postgres bundle-table lag.** The operator's TOML is the source
+  of truth; the `provisioned_static_egress_ips` table is a cache
+  vmmd writes on SIGHUP. A vmmd restart takes ~1 s to reload the
+  TOML and write the cache; during that window an apid PUT fails
+  with 404. Mitigated by `s.bootSynced` atomic — apid returns 503
+  `Retry-After: 1` until the first successful bundle sync. v1
+  ships without the atomic and accepts the 1-second 404 window
+  (acceptable for the deploy cadence).
 
 - **Per-app quota of 1 may be too tight.** Scale customers with N
   apps may want N IPs. Mitigated by the per-plan `int` cap — bump
@@ -311,20 +402,10 @@ call. Mirrors `cmd/gregale/commands_tenant_surfaces.go:32-56`.
   the swap with their allowlist partner (the standard
   "old→overlap→new" allowlist dance).
 
-- **MASQUERADE sibling + conntrack.** Linux conntrack caches the
-  source IP/port mapping for an established flow; rotating the
-  SNAT rule does not affect existing flows. New flows use the new
-  rule. The existing `pkg/netns/connlimit_metal_test.go` fixture
-  validates conntrack behaviour — no new test needed.
-
-- **Single-node blast radius.** v1 has no multi-host story. A
-  customer's static IP only works on the host they happen to be on.
-  If we deploy multi-host before the follow-up ADR lands, a
-  customer's instance could wake on a node without their IP
-  aliased — the wake would still succeed but egress would exit
-  with the wrong IP. Mitigated by documentation + a dashboard
-  warning ("your static IP is configured on host X; instances
-  waking on other hosts will not use it").
+- **Hetzner additional-IP rDNS.** Some partners check PTR records
+  on the egress IP. The operator must set rDNS on the additional
+  IP before the customer pins it. Documented in the deploy runbook
+  (not a code change).
 
 ## Cross-references
 

@@ -17980,3 +17980,81 @@ func (s *PgStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appI
 	}
 	return k, err
 }
+
+// ProvisionedStaticEgressIPExists (ADR-119 redesign) is the
+// apid-side gate. Returns true iff the (account_id, customer_ip)
+// tuple is in the operator-provisioned set. The vmmd bundle
+// reload writes the table from the operator's TOML on SIGHUP;
+// the apid PUT path reads it here. A false return is the
+// "not provisioned" surface the customer sees as 404 Not
+// Found (api.ErrStaticEgressIPNotProvisioned).
+//
+// Implementation note: the lookup is a single-row PK read
+// against the `(account_id, customer_ip)` composite index
+// declared by migration 00337. Sub-millisecond under realistic
+// load.
+func (s *PgStore) ProvisionedStaticEgressIPExists(ctx context.Context, accountID string, ip netip.Addr) (bool, error) {
+	if accountID == "" || !ip.Is4() {
+		return false, nil
+	}
+	var found bool
+	row := s.pool.QueryRow(ctx,
+		`select exists(
+		   select 1
+		     from provisioned_static_egress_ips
+		    where account_id = $1::uuid
+		      and customer_ip = $2::inet
+		)`,
+		accountID, ip.String())
+	if err := row.Scan(&found); err != nil {
+		return false, fmt.Errorf("state: ProvisionedStaticEgressIPExists: %w", err)
+	}
+	return found, nil
+}
+
+// ReplaceProvisionedStaticEgressIPs (ADR-119 redesign) is the
+// vmmd-side write that mirrors the operator's TOML into the
+// Postgres gate table. The watcher calls this on every SIGHUP
+// (and once at startup). The store clears the table for the
+// given account_id, then inserts the new set inside a single
+// transaction — the visible-state invariant is "either the
+// prior set OR the new set, never a partial mix". Empty
+// `ips` removes all rows for the account (the "revoke
+// provisioning" path).
+//
+// The DELETE + INSERT pair runs in one transaction so a
+// concurrent apid PUT either sees the prior set or the new
+// set, not a partial empty+insert gap. The `customer_ip` v4
+// CHECK on the table (migration 00337) rejects non-IPv4 inputs
+// at the database boundary; the caller-side deny-set gate is
+// `api.ValidateStaticEgressIP` (defence in depth).
+func (s *PgStore) ReplaceProvisionedStaticEgressIPs(ctx context.Context, accountID string, ips []netip.Addr) error {
+	if accountID == "" {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: empty account_id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`delete from provisioned_static_egress_ips where account_id = $1::uuid`,
+		accountID); err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: delete: %w", err)
+	}
+	for _, ip := range ips {
+		if !ip.Is4() {
+			return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: rejecting non-v4 %s", ip)
+		}
+		if _, err := tx.Exec(ctx,
+			`insert into provisioned_static_egress_ips (account_id, customer_ip)
+			  values ($1::uuid, $2::inet)`,
+			accountID, ip.String()); err != nil {
+			return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: insert %s: %w", ip, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: commit: %w", err)
+	}
+	return nil
+}

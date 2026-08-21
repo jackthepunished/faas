@@ -93,6 +93,10 @@ type MemStore struct {
 	// path index is in-memory only — we walk the map on lookup
 	// (the memstore is a test fixture, not a production path).
 	consumerKeys map[string]ConsumerKey
+	// provisionedStaticEgressIPs is the ADR-119 redesign gate.
+	// Keyed by (accountID, customerIP) — the same composite PK
+	// as the Postgres table. Test fixture only.
+	provisionedStaticEgressIPs map[string]map[string]netip.Addr // accountID → customerIP → Addr
 	// githubBindings is keyed by appID. Holds the (install_id,
 	// repo_full_name, production_branch) tuple the /oauth/callback
 	// handler writes after verifying the install against api.github.com
@@ -580,6 +584,9 @@ func NewMemStore() *MemStore {
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
 		consumerKeys: map[string]ConsumerKey{},
+		// ADR-119 redesign: empty gate (no provisioned IPs in
+		// unit tests unless a test explicitly seeds them).
+		provisionedStaticEgressIPs: map[string]map[string]netip.Addr{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
@@ -12981,6 +12988,48 @@ func (m *MemStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, app
 		}
 	}
 	return ConsumerKey{}, ErrNotFound
+}
+
+// ProvisionedStaticEgressIPExists (ADR-119 redesign) is the
+// apid-side gate. Mirrors the Postgres implementation
+// (`pkg/state/pgstore.go::ProvisionedStaticEgressIPExists`).
+// The memstore is a test fixture — the in-memory map is keyed
+// by (accountID, customerIP) and the lookup is a single map
+// probe.
+func (m *MemStore) ProvisionedStaticEgressIPExists(_ context.Context, accountID string, ip netip.Addr) (bool, error) {
+	if accountID == "" || !ip.Is4() {
+		return false, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.provisionedStaticEgressIPs[accountID][ip.String()]
+	return ok, nil
+}
+
+// ReplaceProvisionedStaticEgressIPs (ADR-119 redesign) is the
+// vmmd-side write that mirrors the operator's TOML into the
+// Postgres gate table. The memstore mirrors the same shape
+// (clear-then-insert) so the test fixture's invariants match
+// the production path's "either prior OR new, never partial"
+// posture.
+func (m *MemStore) ReplaceProvisionedStaticEgressIPs(_ context.Context, accountID string, ips []netip.Addr) error {
+	if accountID == "" {
+		return fmt.Errorf("state: MemStore.ReplaceProvisionedStaticEgressIPs: empty account_id")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.provisionedStaticEgressIPs == nil {
+		m.provisionedStaticEgressIPs = map[string]map[string]netip.Addr{}
+	}
+	bucket := make(map[string]netip.Addr, len(ips))
+	for _, ip := range ips {
+		if !ip.Is4() {
+			return fmt.Errorf("state: MemStore.ReplaceProvisionedStaticEgressIPs: rejecting non-v4 %s", ip)
+		}
+		bucket[ip.String()] = ip
+	}
+	m.provisionedStaticEgressIPs[accountID] = bucket
+	return nil
 }
 
 // memNewUUID returns a freshly-minted 16-byte UUID for the
