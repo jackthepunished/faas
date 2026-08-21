@@ -3562,7 +3562,7 @@ type PlanWorkload struct {
 	EnvKeys       []string `json:"env_keys,omitempty"`
 	Source        string   `json:"source,omitempty"`
 	Tier          string   `json:"tier,omitempty"`
-	Action        string   `json:"action,omitempty"`         // ADR-124: "create" | "update"
+	Action        string   `json:"action,omitempty"`          // ADR-124: "create" | "update"
 	ExistingAppID string   `json:"existing_app_id,omitempty"` // ADR-124: empty iff Action == "create"
 }
 
@@ -3604,9 +3604,9 @@ type PlanCron struct {
 //	           (manifest config matches app state byte-for-byte). The
 //	           apply path leaves noop rows untouched.
 type PlanAffectedApp struct {
-	Slug           string `json:"slug"`
-	ID             string `json:"id,omitempty"`           // empty iff Action == "create"
-	Action         string `json:"action"`                 // "create" | "update" | "remove" | "noop"
+	Slug            string `json:"slug"`
+	ID              string `json:"id,omitempty"` // empty iff Action == "create"
+	Action          string `json:"action"`       // "create" | "update" | "remove" | "noop"
 	ExistingRootDir string `json:"existing_root_dir,omitempty"`
 }
 

@@ -121,7 +121,7 @@ type scanPlanResponse struct {
 	WillDeploy []api.PlanAffectedApp `json:"will_deploy,omitempty"`
 	Unaffected []api.PlanAffectedApp `json:"unaffected,omitempty"`
 	Skipped    []api.PlanAffectedApp `json:"skipped,omitempty"`
-	Removed    []string               `json:"removed,omitempty"`
+	Removed    []string              `json:"removed,omitempty"`
 }
 
 // toPlanWorkload translates a reposcan.Workload into the wire-
@@ -258,9 +258,9 @@ func computeAffectedPartition(
 			continue
 		}
 		unaff = append(unaff, api.PlanAffectedApp{
-			Slug:           a.Slug,
-			ID:             a.ID,
-			Action:         "noop",
+			Slug:            a.Slug,
+			ID:              a.ID,
+			Action:          "noop",
 			ExistingRootDir: a.RootDir,
 		})
 	}
@@ -689,14 +689,14 @@ func (s *server) scanService(
 		CanApply:      canApply,
 		NotAllowed:    notAllowed,
 		// ADR-124 partition projection. Skipped is the operator --exclude
-	// subset; Unaffected is every account app not in the scan keys;
-	// WillDeploy keeps reposcan's order so the i-alignment with
-	// respWorkloads (one row per post-`--only`/post-`--exclude`
-	// workload) is preserved. Removed is empty on preview (apply=false);
-	// the apply path populates it from removedSlugs.
-	WillDeploy: partition.WillDeploy,
-	Unaffected: partition.Unaffected,
-	Skipped:    partition.Skipped,
+		// subset; Unaffected is every account app not in the scan keys;
+		// WillDeploy keeps reposcan's order so the i-alignment with
+		// respWorkloads (one row per post-`--only`/post-`--exclude`
+		// workload) is preserved. Removed is empty on preview (apply=false);
+		// the apply path populates it from removedSlugs.
+		WillDeploy: partition.WillDeploy,
+		Unaffected: partition.Unaffected,
+		Skipped:    partition.Skipped,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
