@@ -1,4 +1,4 @@
--- filename: 00342_edge_rules_kind_cache.sql
+-- filename: 00345_edge_rules_kind_cache.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -72,23 +72,26 @@
 -- to avoid.
 --
 -- A future widening that adds another kind MUST carry all 14
--- values forward. The 00342 test asserts the full union, so a
+-- values forward. The 00345 test asserts the full union, so a
 -- re-narrowing is caught by 23514 on a known kind.
 --
--- Slot choice: 00342 is the lowest free slot above main's
--- current claim (origin/main now carries 00314-00329; #1000
--- holds 00329 and PR #1001+#1002+#1003+#1005+#1006+#1007 hold
--- 00324-00328 in the open-PR claims). Fences 00314-00320
--- accompanying earlier revisions have been dropped: main now
--- ships its own reserve_slot fences at 00314-00317 + 00320 +
--- real migrations at 00318 + 00319 (deployments_actor +
--- actor_validate_fk), and the slot reserved by #1000 (#1000
--- holds 00329 as a reservation per [[pr-1000-cherry-pick-rebuild-
--- shipped-2026-08-20]]). Re-verify with `git ls-tree
--- origin/main migrations/` AND an enumeration of open-PR
--- claims (including refs/pull/<N>/head — `git ls-tree
--- origin/main` alone misses open-PR fences) after every
--- rebase.
+-- Slot choice: 00345 is the next free slot above every open
+-- claim. Main now carries its own reserve_slot fences at
+-- 00314-00317 + 00320 + 00328-00340 + the real migrations at
+-- 00318 (deployments_actor), 00319 (actor_validate_fk) and
+-- 00341 (repair_app_secrets_scope). Of the open PRs: #984 holds
+-- 00342 (real deployments_annotation) + a 00343 reservation;
+-- #1005 holds reservations at 00342 + a real at 00344
+-- (deployment_openapi_snapshots). 00345 is therefore the lowest
+-- slot that no open PR has claimed. Earlier fences accompanying
+-- this branch (00314-00320, 00330) shadowed main's identical
+-- reserve_slot fences + #1000's 00329 reservation and were
+-- dropped per the cross-PR precheck fence carve-out
+-- (pr-999-merged-fence-contiguity-backfire). Re-verify with
+-- `git ls-tree origin/main migrations/` AND `git ls-tree
+-- refs/pull/<N>/head migrations/` for every N in the open-PR
+-- list (the per-PR precheck is the only one that sees open-PR
+-- fences) after every rebase.
 
 ALTER TABLE edge_rules DROP CONSTRAINT IF EXISTS edge_rules_kind_check;
 ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check
@@ -111,7 +114,7 @@ ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check
 -- rather than silently later.
 --
 -- The reverse deliberately KEEPS 'budget'. Restoring the literal
--- pre-00342 state would mean re-dropping 'budget', i.e.
+-- pre-00345 state would mean re-dropping 'budget', i.e.
 -- reintroducing the 00265 regression documented above. A
 -- downgrade should undo this migration's feature (cache), not
 -- resurrect a known bug in a neighbouring one. Every other kind

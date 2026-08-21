@@ -1,16 +1,21 @@
 //go:build !no_pg
 
-// Migration-apply test for 00342_edge_rules_kind_cache.sql
+// Migration-apply test for 00345_edge_rules_kind_cache.sql
 // (ADR-122). Two concerns are pinned here because the migration
 // carries two: the kind=cache widening, and the restoration of
 // 'budget' that 00265 dropped.
 //
-// Slot: 00342 is the first free slot above main's current claim
-// (main ships 00314-00329 after the mega-merge window that landed
-// PR #1000 / #1001 / #1002 / #1003 / #1005 / #1006 / #1007).
-// Earlier fences at 00314-00320 accompanying this PR have been
-// dropped: main now ships its own reserve_slot fences at
-// 00314-00317 + 00320 + real migrations at 00318 + 00319.
+// Slot: 00345 is the first free slot above main's current claim
+// (main ships reserve_slot fences at 00314-00317 + 00320 +
+// 00328-00340 and real migrations at 00318 (deployments_actor),
+// 00319 (actor_validate_fk), 00341 (repair_app_secrets_scope),
+// plus PR #984 holds 00342 (deployments_annotation) + 00343
+// reservation and PR #1005 holds 00342 reservation + 00344 real
+// (deployment_openapi_snapshots)). Earlier fences at 00314-00320
+// + 00330 accompanying this PR have been dropped: main now ships
+// its own identical reserve_slot fences at those positions and
+// the slot reserved by #1000 (#1000 holds 00329 as a reservation
+// per [[pr-1000-cherry-pick-rebuild-shipped-2026-08-20]]).
 // Future renumbering must re-verify `git ls-tree origin/main
 // migrations/` AND enumerate open-PR claims including
 // refs/pull/<N>/head — `git ls-tree origin/main` alone misses
@@ -18,12 +23,11 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00342 (no goose
-//     duplicate-version panic across the 00314-00320 main-side
-//     reservations nor the 00322-00341 claim range. PR #1005
-//     holds 00330; main has since added 00331-00340 reserves
-//     plus 00341 (repair_app_secrets_scope); the next free
-//     slot above main's 00341 is 00342.
+//  1. Migration set applies cleanly through 00345 (no goose
+//     duplicate-version panic across the 00314-00342 cross-PR
+//     + main claim range — PR #984 holds 00342 real + 00343
+//     reservation, PR #1005 holds 00342 reservation + 00344
+//     real; 00345 is the next free slot above every open claim).
 //  2. edge_rules_kind_check exists under that exact name with all
 //     14 closed-vocabulary values present as quoted literals.
 //  3. REGRESSION PIN: 'budget' is present. 00254 added it; 00265
@@ -57,7 +61,7 @@ import (
 )
 
 // cacheMigrationVocab is the closed vocabulary edge_rules_kind_check
-// must carry after 00342: every shipped kind (13, including the
+// must carry after 00345: every shipped kind (13, including the
 // restored 'budget') plus 'cache'. A future widening MUST carry all
 // 14 forward — see the 00265 regression documented above for what
 // happens when a rewrite drops a value.
@@ -67,11 +71,11 @@ var cacheMigrationVocab = []string{
 	"maintenance", "throttle", "budget", "cache",
 }
 
-func TestMigrations_00342_EdgeRulesKindCache(t *testing.T) {
+func TestMigrations_00345_EdgeRulesKindCache(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00342 should land last.
+	// (1) Run the full migration set. 00345 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (failure mode: a slot collision between main's 00313 and this migration's 00314-00320 fences — re-run the open-PR slot precheck including refs/pull/<N>/head)", err)
 	}
@@ -106,7 +110,7 @@ func TestMigrations_00342_EdgeRulesKindCache(t *testing.T) {
 		t.Errorf("edge_rules_kind_check: 'budget' missing from def %q — 00265's narrowing has been reintroduced. kind=budget is wired end-to-end above the database (apid validate+marshal, CLI vocab, openapi schema); dropping it here makes every kind=budget create fail with SQLSTATE 23514", def)
 	}
 
-	accountID := "00000000-0000-0000-0000-000000003420"
+	accountID := "00000000-0000-0000-0000-000000003450"
 	appID := "00000000-0000-0000-0000-000000013210"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
@@ -178,7 +182,7 @@ func TestMigrations_00342_EdgeRulesKindCache(t *testing.T) {
 	// (5) Positive round-trip for kind='budget'. This is the
 	// behavioural half of the regression fix: pin (3) proves the
 	// literal is in the constraint def, this proves a row actually
-	// inserts. Before 00342 this INSERT failed with 23514 on main.
+	// inserts. Before 00345 this INSERT failed with 23514 on main.
 	budgetRuleID := "00000000-0000-0000-0000-000000033210"
 	budgetAction, err := json.Marshal(map[string]any{"budget": map[string]any{
 		"budget_ms":             3000,
@@ -216,7 +220,7 @@ func TestMigrations_00342_EdgeRulesKindCache(t *testing.T) {
 				                        priority, enabled, kind, action)
 				values ($1, $2, $3, 'probe.example.com', $4, 200, true, $5, '{}'::jsonb)
 			`, probeID, accountID, appID, "/probe/"+k, k); err != nil {
-				t.Errorf("insert kind=%s: %v (00342 must not narrow the pre-existing vocabulary)", k, err)
+				t.Errorf("insert kind=%s: %v (00345 must not narrow the pre-existing vocabulary)", k, err)
 			}
 			t.Cleanup(func() {
 				_, _ = pool.Exec(ctx, `delete from edge_rules where id = $1`, probeID)
@@ -241,7 +245,7 @@ func TestMigrations_00342_EdgeRulesKindCache(t *testing.T) {
 	// on a local re-run or a hot-fix path that bypasses goose's
 	// version table.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp (replay): %v (00342 must be replay-safe — DROP ... IF EXISTS then ADD)", err)
+		t.Fatalf("db.MigrateUp (replay): %v (00345 must be replay-safe — DROP ... IF EXISTS then ADD)", err)
 	}
 }
 
