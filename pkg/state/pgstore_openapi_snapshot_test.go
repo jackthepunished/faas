@@ -1,8 +1,8 @@
 package state_test
 
 // PgStore parity tests for the new OpenAPISnapshot Store methods
-// (ADR-121, migration 00342). The migration-pinned schema is
-// verified by migrations/00342_deployment_openapi_snapshots_test.go;
+// (ADR-121, migration 00347). The migration-pinned schema is
+// verified by migrations/00347_deployment_openapi_snapshots_test.go;
 // this file pins the *hand-written SQL* in pgstore.go
 // (UpdateDeploymentOpenAPISnapshot, LatestOpenAPISnapshotForScope,
 // OpenAPISnapshotByDeployment) against a real cluster.
@@ -184,7 +184,7 @@ func TestPg_OpenAPISnapshot_Upsert(t *testing.T) {
 // for both read paths. The PR-C gate treats "no baseline" as
 // "no break possible" so the first promotion after the flag
 // is flipped is ungated. The deployment_id / app_id columns
-// are uuid (migration 00342), so the "missing" lookups use a
+// are uuid (migration 00347), so the "missing" lookups use a
 // well-formed uuid that has no row in the table — a malformed
 // value trips SQLSTATE 22P02 (invalid_text_representation)
 // which is a different gate entirely.
@@ -203,7 +203,7 @@ func TestPg_OpenAPISnapshot_NotFound(t *testing.T) {
 // TestPg_OpenAPISnapshot_LatestByScope pins that the read
 // picks the most recent captured_at across multiple rows for
 // the same (app_id, scope). The (app_id, scope, captured_at
-// DESC) index added in migration 00342 backs the lookup.
+// DESC) index added in migration 00347 backs the lookup.
 func TestPg_OpenAPISnapshot_LatestByScope(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
