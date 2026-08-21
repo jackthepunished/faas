@@ -52,3 +52,6 @@ vmlinux-*
 # CLIs (build output)
 /gregalectl
 /gregale
+
+# coverage_floor.py bytecode
+.claude/ci/__pycache__/

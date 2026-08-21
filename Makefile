@@ -175,6 +175,55 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 		&& echo "pkg/state coverage: $$total% ✓ (target ≥ 70%, excluding generated pkg/state/sqlc/**)" \
 		|| (echo "pkg/state coverage: $$total% ✗ (target ≥ 70%, excluding generated pkg/state/sqlc/**)"; exit 1)
 
+# coverage-floor: assert per-package coverage ≥ floor for each ship-blocking
+# package. Floors live in the `floors` dict inside the python heredoc below
+# (no separate Make variable — keeping the table adjacent to the verifier
+# keeps edits atomic). Reads every coverage/cover-shard*.out the same way
+# check-state-coverage does. Excludes generated sqlc. Floors are 5pp below
+# the post-PR number; the floor is a fixed line the suite must stay above,
+# not a moving goalpost (mirrors codecov.yml project.default.target).
+# Wired into the unit-tests-pg-2 CI job (see ci.yml).
+.PHONY: coverage-floor
+coverage-floor: ## Assert ship-blocking package floors across all coverage/cover-shard*.out
+	@bash -c 'set -e; COVERDIR="$${COVERDIR:-$(COVERAGE_DIR)}"; \
+	  test -d "$$COVERDIR" || { echo "coverage dir $$COVERDIR not found — run \`make test\` with -coverprofile first"; exit 1; }; \
+	  shopt -s nullglob; \
+	  files=($$COVERDIR/cover-shard*.out); \
+	  if [ $${#files[@]} -eq 0 ]; then echo "coverage-floor: no coverage/cover-shard*.out files; run \`make test\` with -coverprofile first"; exit 1; fi; \
+	  exec python3 .claude/ci/coverage_floor.py "$${files[@]}"'
+
+.PHONY: test-property
+test-property: ## Property-based invariant tests (no KVM, no DB needed). §6.2 invariants land here.
+	$(GO) test -race -count=1 -timeout=10m ./tests/property/...
+
+.PHONY: coverage
+coverage: ## Aggregate coverage/cover-shard*.out and print a sorted table per package.
+	@mkdir -p $(COVERAGE_DIR) ; \
+	shopt -s nullglob ; \
+	files=($${COVERDIR:-$(COVERAGE_DIR)}/cover-shard*.out) ; \
+	if [ $${#files[@]} -eq 0 ]; then echo "no coverage/cover-shard*.out files; run \`make test\` first"; exit 1; fi ; \
+	python3 - "$${files[@]}" <<-'EOF'
+	import re, sys
+	from collections import defaultdict
+	stmts = defaultdict(lambda: [0, 0])
+	re_line = re.compile(r"^github\.com/[^/]+/faas/(\S+):\d+:\s+(\S+)\s+(\d+)(?:\s+(\d+))?$")
+	for path in sys.argv[1:]:
+	    with open(path) as f:
+	        for line in f:
+	            m = re_line.match(line)
+	            if not m: continue
+	            file_, _, count, stmts_str = m.groups()
+	            pkg = file_.split("/", 1)[0]
+	            if "/sqlc/" in file_: continue
+	            stmts[pkg][0] += int(stmts_str or 0)
+	            if int(count) > 0:
+	                stmts[pkg][1] += int(stmts_str or 0)
+	print(f"{'package':<40} {'pct':>6}  hit / stmts")
+	for pkg, (tot, hit) in sorted(stmts.items(), key=lambda kv: -(kv[1][1]*100/max(kv[1][0],1))):
+	    pct = hit * 100 / max(tot, 1)
+	    print(f"{pkg:<40} {pct:>5.1f}%  {hit} / {tot}")
+	EOF
+
 
 .PHONY: migrations-check
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up

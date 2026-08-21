@@ -453,6 +453,13 @@ jobs:
       - name: pkg/state coverage gate
         run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
 
+      - name: coverage floor (ship-blocking packages)
+        # Validates pkg/state ≥ 70% via the new coverage-floor gate
+        # (see Makefile, mirror of check-state-coverage). Packages
+        # not exercised by this shard's PKGS list print
+        # "(no statements — skip)" and don't fail the gate.
+        run: make coverage-floor COVERDIR=coverage
+
       - name: upload to Codecov (pg shard 2)
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
@@ -483,6 +490,13 @@ jobs:
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd-internal|pkg/api)')
           go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard3.out -covermode=atomic $PKGS
 
+      - name: coverage floor (ship-blocking packages)
+        # Validates pkg/fcvm, pkg/sched, pkg/gateway ≥ floors defined in
+        # Makefile (coverage-floor target). Packages not exercised by
+        # this shard's PKGS list print "(no statements — skip)" and
+        # don't fail the gate.
+        run: make coverage-floor COVERDIR=coverage
+
       - name: upload to Codecov (pure Go shard 1)
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
@@ -512,6 +526,20 @@ jobs:
           mkdir -p coverage
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -vE '(cmd/apid|migrations|pkg/meter|pkg/db|pkg/alerts|pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan|pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd-internal|pkg/api)')
           go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard4.out -covermode=atomic $PKGS
+
+      - name: coverage floor (ship-blocking packages)
+        # Validates pkg/vmmdgrpc, pkg/vmmdmount ≥ floors defined in
+        # Makefile (coverage-floor target). Packages not exercised by
+        # this shard's PKGS list print "(no statements — skip)" and
+        # don't fail the gate.
+        run: make coverage-floor COVERDIR=coverage
+
+      # Property-based tests pin the §6.2 invariants in CLAUDE.md.
+      # No KVM/DB needed — pure logic. Lands in this shard because
+      # the package list is `tests/property/...` (everything else
+      # bucket).
+      - name: property-based tests (§6.2 invariants)
+        run: make test-property
 
       - name: upload to Codecov (pure Go shard 2)
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
