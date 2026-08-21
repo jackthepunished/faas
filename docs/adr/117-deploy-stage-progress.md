@@ -627,7 +627,7 @@ happens Go-side in `pgstore.AppendDeploymentStage` and
 `memstore.AppendDeploymentStage` at the existing read-modify-
 write site (no SQL CHECK on jsonb_array_length — the nested
 path is fragile across jsonb mutation shapes). Doc-only
-migration at slot 00330 documents the cap; schema unchanged.
+migration at slot 00348 documents the cap; schema unchanged.
 
 Trim is irreversible: rows past the cap are gone. No
 archival. A future PR can change the cap by bumping the const.
@@ -754,13 +754,16 @@ precedent); `dep.AppID != app.ID` guard unchanged.
     ADR amendment (doc-only). The metric test pins the
     pre-instantiation surface.
   - Commit 2: C1 (retention). Doc-only migration at slot
-    00330; trim happens Go-side at the existing read-modify-
+    00348; trim happens Go-side at the existing read-modify-
     write site. pg + memstore tests pin the FIFO trim.
   - Commit 3: C2 (retry endpoint + CLI). One new apid route +
     one new SDK method + one new CLI subcommand. Migration
-    slot precheck via the cross-PR fence pattern (slot 00340
-    reservation; main has likely moved past 00330+ per recent
-    slot-dance chains).
+    slot precheck via the cross-PR fence pattern (slot 00330
+    reservation; main has likely moved past 00348 per recent
+    slot-dance chains — slot renumbered twice (00330 → 00346
+    → 00348) during rebases as adjacent PRs landed real
+    migrations at 00346 (issue #977 annotation, PR #984) and
+    00347 (PR #1005 api-contract-diff).
   - Commit 4: C5 (dashboard SSE) + per-row retry button.
     HTMX swap-in against the existing logs SSE channel.
 
@@ -768,7 +771,7 @@ precedent); `dep.AppID != app.ID` guard unchanged.
 
 ~1000-1300 LOC across ~25 files (4 new files: metric test,
 retry handler, CLI retry, stages-partial handler; +21
-touched files). 1 new migration (slot 00330, doc-only).
+touched files). 1 new migration (slot 00348, doc-only).
 ~10-15 new `CodeStage*` constants + matching `pkg/whycopy`
 rows. 1 new Prometheus histogram + label set. 1 new SDK
 method (`RetryDeploymentFromStage`). 1 new apid route

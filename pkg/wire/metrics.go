@@ -3122,7 +3122,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		provenanceWrites:                     provenanceWrites,
 		imageScanVulns:                       imageScanVulns,
 		deployScanDuration:                   deployScanDuration,
-		deployStageDuration:                deployStageDuration,
+		deployStageDuration:                  deployStageDuration,
 		deployScanTotal:                      deployScanTotal,
 		deployScanVulns:                      deployScanVulns,
 		liveMigrationDecisions:               liveMigrationDecisions,
