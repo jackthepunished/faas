@@ -34,6 +34,10 @@
     h1 { margin: 0.5rem 0 1rem; }
     h2 { margin-top: 1.5rem; }
     .apply-bar { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #ddd; padding: 0.75rem 0; }
+    .apply-result { border: 1px solid #175c17; background: #eaf7ea; color: #175c17; padding: 0.85rem 1rem; border-radius: 4px; margin: 1rem 0; }
+    .apply-result h2 { margin: 0 0 0.4rem 0; font-size: 1.05rem; }
+    .apply-result .stamp { color: #555; font-size: 0.85rem; }
+    .apply-result ul { margin: 0.4rem 0 0 1.25rem; padding: 0; }
   </style>
 </head>
 <body>
@@ -62,6 +66,19 @@
       <div class="problem">
         <strong>Preview rejected:</strong> {{.Data.PreScanProblem}}
       </div>
+    {{end}}
+
+    {{if .Data.ApplyResult}}
+      <section class="apply-result">
+        <h2>Apply complete at <span class="stamp">{{.Data.ApplyResult.AppliedAt}}</span></h2>
+        <p>
+          {{if .Data.ApplyResult.AddedSlugs}}<strong>Added:</strong> {{range .Data.ApplyResult.AddedSlugs}}<code>{{.}}</code> {{end}}<br>{{end}}
+          {{if .Data.ApplyResult.ChangedSlugs}}<strong>Updated:</strong> {{range .Data.ApplyResult.ChangedSlugs}}<code>{{.}}</code> {{end}}<br>{{end}}
+          {{if .Data.ApplyResult.RemovedSlugs}}<strong>Removed:</strong> {{range .Data.ApplyResult.RemovedSlugs}}<code>{{.}}</code> {{end}}{{end}}
+        </p>
+        <p class="muted">The apply form is locked — to apply again, return to the upload form and re-run the scan.</p>
+        <p><a class="btn" href="/dashboard/projects/{{.Data.ProjectSlug}}/preview">Run another preview</a></p>
+      </section>
     {{end}}
 
     {{if not .Data.Preview}}
@@ -152,13 +169,17 @@
         <form id="apply-form" method="POST" action="/dashboard/projects/{{.Data.ProjectSlug}}/preview/apply">
           <input type="hidden" name="csrf_token" value="{{.Data.PreviewApplyToken}}">
           <input type="hidden" name="plan_token" value="{{.Data.PlanToken}}">
-          <button type="submit" class="btn-cta" {{if not .Data.CanApply}}disabled{{end}}>
-            Apply {{len .Data.WillDeploy}} workload(s){{if gt (len .Data.Skipped) 0}} (excluded: {{range $i, $e := .Data.Skipped}}{{if $i}}, {{end}}{{$e.Slug}}{{end}}){{end}}
-          </button>
-          {{if not .Data.CanApply}}
-            <span class="muted">Apply is blocked by quota or plan limits. See the pre-scan message above.</span>
+          {{if not .Data.ApplyResult}}
+            <button type="submit" class="btn-cta" {{if not .Data.CanApply}}disabled{{end}}>
+              Apply {{len .Data.WillDeploy}} workload(s){{if gt (len .Data.Skipped) 0}} (excluded: {{range $i, $e := .Data.Skipped}}{{if $i}}, {{end}}{{$e.Slug}}{{end}}){{end}}
+            </button>
+            {{if not .Data.CanApply}}
+              <span class="muted">Apply is blocked by quota or plan limits. See the pre-scan message above.</span>
+            {{end}}
+            <a class="btn" href="/dashboard/projects/{{.Data.ProjectSlug}}/preview">Cancel</a>
+          {{else}}
+            <span class="muted">Apply form locked — see the apply-complete banner above.</span>
           {{end}}
-          <a class="btn" href="/dashboard/projects/{{.Data.ProjectSlug}}/preview">Cancel</a>
         </form>
       </div>
     {{end}}

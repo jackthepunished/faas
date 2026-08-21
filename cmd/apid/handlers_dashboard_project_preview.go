@@ -30,7 +30,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
@@ -74,6 +76,30 @@ const projectPreviewAction = "project_preview"
 // is rejected by scanService's plan_token_stale check.
 const projectPreviewApplyAction = "project_preview_apply"
 
+// setDashboardCSRFCookie writes the authenticated CSRF envelope
+// cookie. Centralised so every preview-handler entrypoint mints
+// the cookie with the same Secure/SameSite/MaxAge policy; the
+// inline SetCookie copies previously scattered across the four
+// branches (GET, submit success, submit problem, apply) drifted
+// and made the apply form's cookie binding inconsistent with the
+// apply form's `csrf_token` field.
+//
+// Cookie policy mirrors renderAppNew (handlers_dashboard_apps_new.go:78-94):
+// HttpOnly + SameSite=Lax + Secure iff behind a real domain.
+// MaxAge == DefaultCSRFTTL so the envelope expires on the same
+// schedule middleware.VerifyAuthenticated enforces server-side.
+func setDashboardCSRFCookie(w http.ResponseWriter, s *server, tok string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     middleware.CookieNameAuthenticated,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.domain != "",
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+	})
+}
+
 // renderProjectPreview is the GET handler. Renders the empty
 // form (Preview=false). The plan_token is empty on first GET;
 // the operator uploads a tarball + (optionally) an exclude list
@@ -105,15 +131,12 @@ func (s *server) renderProjectPreview(w http.ResponseWriter, r *http.Request, lo
 		renderProblem(w, log, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     middleware.CookieNameAuthenticated,
-		Value:    tok,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   s.domain != "",
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
-	})
+	// GET only ever posts back to the preview endpoint (multipart
+	// upload), so the cookie binds to the preview action. Once the
+	// populate step runs the cookie is rotated to the apply
+	// envelope (see submitProjectPreview success branch) so the
+	// apply form's csrf_token matches.
+	setDashboardCSRFCookie(w, s, tok)
 	view.PreviewFormToken = tok
 	s.renderProjectPreviewPage(w, log, r, view, acct)
 }
@@ -147,6 +170,8 @@ func (s *server) submitProjectPreview(w http.ResponseWriter, r *http.Request, lo
 		view.PreScanProblem = prob.Detail
 		// Mint a fresh CSRF token + cookie so the re-submit can
 		// pass VerifyAuthenticated. The old envelope is consumed.
+		// Cookie binds to the preview action — the operator is
+		// still in the upload-fix loop, not yet at apply.
 		tok, err := middleware.IssueForAuthenticated(s.sessions, projectPreviewAction, acct.ID)
 		if err != nil {
 			log.Error("dashboard project_preview submit: csrf re-issue",
@@ -154,15 +179,7 @@ func (s *server) submitProjectPreview(w http.ResponseWriter, r *http.Request, lo
 			renderProblem(w, log, err)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     middleware.CookieNameAuthenticated,
-			Value:    tok,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   s.domain != "",
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
-		})
+		setDashboardCSRFCookie(w, s, tok)
 		view.PreviewFormToken = tok
 		s.renderProjectPreviewPage(w, log, r, view, acct)
 		return
@@ -179,7 +196,17 @@ func (s *server) submitProjectPreview(w http.ResponseWriter, r *http.Request, lo
 	view.LimitApps = resp.LimitApps
 	// Two CSRF envelopes for the populated page: the apply form's
 	// token is bound to projectPreviewApplyAction so a leaked
-	// preview-form token cannot authorise apply.
+	// preview-form token cannot authorise apply. The cookie binds
+	// to the MORE sensitive envelope (apply) because the populate
+	// step leaves the operator one click away from the apply
+	// button — the preview-only cookie would 400 the apply
+	// submission with "Invalid CSRF token". IssueForAuthenticated
+	// gives the apply token the same TTL as the preview token, so
+	// the envelope is alive through both endpoints. (Spec §11:
+	// never auto-issue a higher-privilege envelope on the lower-
+	// privilege endpoint — we explicitly cross that boundary here
+	// because the populated page is the operator's decision point
+	// and the apply form's csrf_token field MUST match the cookie.)
 	previewTok, err := middleware.IssueForAuthenticated(s.sessions, projectPreviewAction, acct.ID)
 	if err != nil {
 		log.Error("dashboard project_preview submit: csrf preview re-issue",
@@ -194,99 +221,182 @@ func (s *server) submitProjectPreview(w http.ResponseWriter, r *http.Request, lo
 		renderProblem(w, log, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     middleware.CookieNameAuthenticated,
-		Value:    previewTok,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   s.domain != "",
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
-	})
+	setDashboardCSRFCookie(w, s, applyTok)
 	view.PreviewFormToken = previewTok
 	view.PreviewApplyToken = applyTok
 	s.renderProjectPreviewPage(w, log, r, view, acct)
 }
 
 // applyProjectPreview is the POST handler at
-// /dashboard/projects/{slug}/preview/apply. Re-runs scanService
-// with apply=true and the plan_token from the populated preview
-// form so the source bytes are byte-equivalent to the preview
-// scan. Excluded workloads (via the preview form's checkboxes)
-// ride through as the multipart `exclude` field, which
-// parseScanMultipart already understands.
+// /dashboard/projects/{slug}/preview/apply. The apply form
+// does NOT include a `source` file part (browsers strip file
+// inputs from non-multipart submissions; the operator's UX
+// is the prime directive — they do not re-attach the tarball).
+// The source is replayed from the server-side plan cache
+// (`scan_plan_cache.go`); the SHA-256 in the plan_token keys
+// the lookup and re-validates against the cached entry's
+// account_id.
 //
-// On success the handler 302s to /dashboard/apps/{slug} (the
-// per-app detail page) so the operator lands on the affected
-// workloads' first newly-applied app. On a problem (quota,
-// plan, source-invalid, exclude_unknown_slug) the handler
-// re-renders the populated preview with PreScanProblem populated
-// so the operator can fix and re-submit without losing state.
+// The form is urlencoded (no file input), so r.ParseForm
+// populates r.Form with `csrf_token`, `plan_token`, and one
+// `exclude` value per checked checkbox. We collect every
+// `exclude` value, look up the cache, build a synthetic
+// multipart request, and forward it to scanService with
+// apply=true.
+//
+// On success the handler re-renders the same preview template
+// with view.ApplyResult populated (a confirmation banner
+// listing Added / Changed / Removed). No redirect — the
+// operator's partition was their decision surface and the
+// apply result is part of that surface. The apply form is
+// hidden when ApplyResult is set so a second click is a no-op.
+// On a problem (quota, plan, source-invalid,
+// exclude_unknown_slug, cache-miss) the handler re-renders
+// the populated preview with PreScanProblem populated so the
+// operator can fix and re-submit without losing state.
 func (s *server) applyProjectPreview(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug string) {
 	if err := middleware.VerifyAuthenticated(s.sessions, r, projectPreviewApplyAction, acct.ID); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"Invalid CSRF token", "please reload the page and try again"))
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad form", err.Error()))
+		return
+	}
 	planToken := r.FormValue("plan_token")
+	pt, decErr := decodePlanToken(planToken)
+	if decErr != nil {
+		log.Warn("dashboard project_preview apply: bad plan_token",
+			"account_id", acct.ID, "slug", slug, "err", decErr)
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid plan_token", "re-upload the tarball on /dashboard/projects/{slug}/preview"))
+		return
+	}
+	cachedPath, cacheErr := lookupPlanCache(pt.Hash, acct.ID)
+	if cacheErr != nil {
+		if errors.Is(cacheErr, os.ErrNotExist) {
+			log.Info("dashboard project_preview apply: cache miss",
+				"account_id", acct.ID, "slug", slug, "sha256_prefix", pt.Hash[:min(8, len(pt.Hash))])
+			view := views.ProjectPreviewView{
+				ProjectSlug:    slug,
+				Preview:        true,
+				PreScanProblem: errPlanCacheMiss.Detail,
+			}
+			if tok, err := s.mintAndBindCSRF(w, log, r, slug, acct, projectPreviewAction); err == nil {
+				view.PreviewFormToken = tok
+			}
+			if tok, err := s.mintAndBindCSRF(w, log, r, slug, acct, projectPreviewApplyAction); err == nil {
+				view.PreviewApplyToken = tok
+			}
+			s.renderProjectPreviewPage(w, log, r, view, acct)
+			return
+		}
+		log.Error("dashboard project_preview apply: cache lookup",
+			"account_id", acct.ID, "slug", slug, "err", cacheErr)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal,
+			"Cache lookup failed", cacheErr.Error()))
+		return
+	}
+	// Build synthetic multipart request from cached source +
+	// checked exclude slugs. Each exclude slug becomes its own
+	// multipart part so parseScanMultipart's comma-split /
+	// lowercase / trim normalises identically to the live form.
+	exclude := r.Form["exclude"]
+	synthReq, buildErr := buildCachedSourceRequest(cachedPath, slug, exclude)
+	if buildErr != nil {
+		log.Error("dashboard project_preview apply: build synth req",
+			"account_id", acct.ID, "slug", slug, "err", buildErr)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal,
+			"Apply rebuild failed", buildErr.Error()))
+		return
+	}
 	view := views.ProjectPreviewView{
 		ProjectSlug: slug,
 		Preview:     true,
 	}
-	resp, _, added, changed, _, _, prob := s.scanService(&discardRW{}, r, acct, planToken, true)
+	resp, _, added, changed, removedSlugs, _, prob := s.scanService(&discardRW{}, synthReq, acct, planToken, true)
 	if prob != nil {
 		log.Warn("dashboard project_preview apply: scan problem",
 			"account_id", acct.ID, "slug", slug, "code", prob.Code, "detail", prob.Detail)
 		view.PreScanProblem = prob.Detail
 		// Re-issue CSRF envelopes so the operator can fix + retry.
-		previewTok, err := middleware.IssueForAuthenticated(s.sessions, projectPreviewAction, acct.ID)
-		if err == nil {
-			http.SetCookie(w, &http.Cookie{
-				Name:     middleware.CookieNameAuthenticated,
-				Value:    previewTok,
-				Path:     "/",
-				HttpOnly: true,
-				Secure:   s.domain != "",
-				SameSite: http.SameSiteLaxMode,
-				MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
-			})
-			view.PreviewFormToken = previewTok
+		// The apply envelope binds the cookie so the form's
+		// `csrf_token` field matches after the problem-driven
+		// re-render. The preview envelope is re-minted (its
+		// cookie is overwritten by the apply mint, but the form
+		// field is still needed for the multipart re-upload).
+		if tok, err := s.mintAndBindCSRF(w, log, r, slug, acct, projectPreviewAction); err == nil {
+			view.PreviewFormToken = tok
 		}
-		applyTok, err := middleware.IssueForAuthenticated(s.sessions, projectPreviewApplyAction, acct.ID)
-		if err == nil {
-			view.PreviewApplyToken = applyTok
+		if tok, err := s.mintAndBindCSRF(w, log, r, slug, acct, projectPreviewApplyAction); err == nil {
+			view.PreviewApplyToken = tok
 		}
 		s.renderProjectPreviewPage(w, log, r, view, acct)
 		return
 	}
-	// Pick the redirect target: prefer a created/updated app so the
-	// operator lands on the freshest affected workload. Falls
-	// back to /dashboard/apps (list) if no app rows are
-	// available (a no-op apply can return zero rows when every
-	// workload was excluded).
-	target := "/dashboard/apps"
+	// Success: render the partition with an apply-result banner.
+	// Removed slugs come from the scanService return value (the
+	// destructive subset the operator should see explicitly per
+	// ADR-124 §3). The apply form is hidden by the template when
+	// ApplyResult is non-nil — no second apply possible.
+	addedSlugs := make([]string, 0, len(added))
 	for _, a := range added {
 		if a.Slug != "" {
-			target = "/dashboard/apps/" + a.Slug
-			break
+			addedSlugs = append(addedSlugs, a.Slug)
 		}
 	}
-	if target == "/dashboard/apps" {
-		for _, a := range changed {
-			if a.Slug != "" {
-				target = "/dashboard/apps/" + a.Slug
-				break
-			}
+	changedSlugs := make([]string, 0, len(changed))
+	for _, a := range changed {
+		if a.Slug != "" {
+			changedSlugs = append(changedSlugs, a.Slug)
 		}
 	}
+	view.ApplyResult = &views.ProjectPreviewApplyResult{
+		AddedSlugs:   addedSlugs,
+		ChangedSlugs: changedSlugs,
+		RemovedSlugs: removedSlugs,
+		AppliedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	// Map scanPlanResponse → view (mirror submitProjectPreview
+	// success branch). The partition is the operator's record of
+	// what just changed; rendering it again is the audit trail.
+	view.WillDeploy = toProjectPreviewAffected(resp.WillDeploy, false)
+	view.Skipped = toProjectPreviewAffected(resp.Skipped, true)
+	view.Unaffected = toProjectPreviewAffected(resp.Unaffected, false)
+	view.Removed = resp.Removed
+	view.PlanToken = resp.PlanToken
+	view.CanApply = resp.CanApply
+	view.NotAllowed = resp.NotAllowed
+	view.ObservedApps = resp.ObservedApps
+	view.LimitApps = resp.LimitApps
 	log.Info("dashboard project_preview apply: success",
 		"account_id", acct.ID, "slug", slug,
 		"added", len(added), "changed", len(changed),
+		"removed", len(removedSlugs),
 		"will_deploy", len(resp.WillDeploy),
 		"unaffected", len(resp.Unaffected),
-		"skipped", len(resp.Skipped),
-		"target", target)
-	http.Redirect(w, r, target, http.StatusFound)
+		"skipped", len(resp.Skipped))
+	s.renderProjectPreviewPage(w, log, r, view, acct)
+}
+
+// mintAndBindCSRF mints a CSRF envelope for action and writes
+// the matching cookie. The cookie binds to whichever envelope
+// the caller passes — preview-only renders pass
+// projectPreviewAction; populated renders mint the apply
+// envelope so the apply form's `csrf_token` field matches the
+// cookie after a problem-driven re-render. Returns the token
+// so the caller can populate the matching form field.
+func (s *server) mintAndBindCSRF(w http.ResponseWriter, log *slog.Logger, r *http.Request, slug string, acct state.Account, action string) (string, error) {
+	tok, err := middleware.IssueForAuthenticated(s.sessions, action, acct.ID)
+	if err != nil {
+		log.Error("dashboard project_preview: csrf issue",
+			"account_id", acct.ID, "slug", slug, "action", action, "err", err)
+		return "", err
+	}
+	setDashboardCSRFCookie(w, s, tok)
+	return tok, nil
 }
 
 // renderProjectPreviewPage is the thin page-assembler shared by
@@ -308,13 +418,10 @@ func (s *server) renderProjectPreviewPage(w http.ResponseWriter, log *slog.Logge
 // toProjectPreviewAffected translates api.PlanAffectedApp into
 // the dashboard-only ProjectPreviewAffected shape. The Excluded
 // flag flips on the Skipped rows so the template can render the
-// line-through style without a second switch.
-//
-// Glyph + label per action:
-//   - create → "✓ will create"
-//   - update → "↻ will update"
-//   - remove → "✗ will remove"
-//   - noop   → "— unchanged" (Unaffected) or "— excluded" (Skipped via Excluded=true)
+// line-through style without a second switch. The glyph + label
+// per row come from actionAffordance (kept in this file because
+// the vocabulary is dashboard-local; the wire DTO does not
+// encode it).
 func toProjectPreviewAffected(in []api.PlanAffectedApp, excluded bool) []views.ProjectPreviewAffected {
 	if len(in) == 0 {
 		return nil
@@ -338,7 +445,16 @@ func toProjectPreviewAffected(in []api.PlanAffectedApp, excluded bool) []views.P
 // actionAffordance picks the customer-facing glyph + label for
 // one PlanAffectedApp row. Kept in this file (not in views) so
 // the views package stays pure-data and the i18n / accessibility
-// strings live next to the handler that calls them.
+// strings live next to the handler that calls them. The glyphs
+// are intentionally ASCII so they survive any rendering target
+// without a font-fallback hop (the terminal previews in
+// `gregale scan --show-affected` use the same vocabulary):
+//
+//	create  →  "+ will create"
+//	update  →  "~ will update"
+//	remove  →  "x will remove"
+//	noop    →  "· unchanged"            (Unaffected)
+//	noop    →  "— excluded"             (Skipped — Excluded=true)
 func actionAffordance(action string, excluded bool) (glyph, label string) {
 	switch action {
 	case "create":

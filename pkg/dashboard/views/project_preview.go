@@ -57,14 +57,38 @@ type ProjectPreviewView struct {
 	Unaffected []ProjectPreviewAffected
 	Removed    []string
 
+	// ApplyResult is populated when the apply handler renders a
+	// confirmation page after a successful reconcile. The
+	// dashboard renders a banner above the tables so the operator
+	// sees the destructive subset (Removed) inline; the apply
+	// form is hidden behind the banner so a second click is
+	// impossible. Zero-valued when the page is in preview mode.
+	ApplyResult *ProjectPreviewApplyResult
+
 	// PreScanProblem carries a non-empty detail when the multipart
 	// scan returned a problem (e.g. secret-scan 422, source invalid,
-	// exclude_unknown_slug). The dashboard renders it inline above
-	// the form so the operator can fix the input without leaving
-	// the page.
+	// exclude_unknown_slug, preview_expired cache miss). The
+	// dashboard renders it inline above the form so the operator
+	// can fix the input without leaving the page.
 	PreScanProblem string
 
 	// CSRF token for the multipart POST + apply POST forms.
 	PreviewFormToken  string
 	PreviewApplyToken string
+}
+
+// ProjectPreviewApplyResult is the post-apply summary shown
+// above the partition tables. AddedSlugs / ChangedSlugs are the
+// post-insert state.App rows (per reconcile.ApplyActions);
+// RemovedSlugs is the destructive subset the operator should
+// see explicitly because Removed is the irreversible outcome
+// (ADR-124 §3 warns that --exclude semantics do not equal
+// skip-deploy when an existing app row is matched). Empty
+// AppliedAt renders as a server-side time.Time — populated by
+// the apply handler.
+type ProjectPreviewApplyResult struct {
+	AddedSlugs   []string
+	ChangedSlugs []string
+	RemovedSlugs []string
+	AppliedAt    string
 }

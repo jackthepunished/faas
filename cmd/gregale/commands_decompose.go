@@ -306,6 +306,15 @@ func intersect(a, b []string) (bool, []string) {
 // operator — both surface as malformed output and the CLI exits non-zero
 // on the JSON-parse path below (mirrors commands_builds.go:166).
 //
+// excludeSet is the operator's CLI-side --exclude list. It only
+// flows into printAffectedText (the --show-affected partition
+// view), where it marks WillDeploy entries the operator wanted
+// to exclude but the server didn't (a server bug surface —
+// under normal operation the server's Skipped[] covers the
+// same slugs). The single-section Workloads loop does not need
+// it: plan.Workloads is the post-filter set, so excluded slugs
+// never appear there.
+//
 //nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
 func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, showAffected bool) int {
 	fmt.Fprintf(w, "Project: %s\n", plan.ProjectSlug)
@@ -343,11 +352,13 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 			if wl.Class != "" {
 				classSuffix = "  class=" + wl.Class
 			}
-			excludedMark := ""
-			if excludeIdx[strings.ToLower(wl.Name)] {
-				excludedMark = "  (excluded — see Skipped below)"
-			}
-			fmt.Fprintf(w, "  - %-20s root=%-20s%s%s%s\n", wl.Name, wl.RootDir, schedSuffix, classSuffix, excludedMark)
+			// plan.Workloads is the post-filter set: the scan
+			// service drops --only/--exclude slugs before populating
+			// it (scan_service.go:564-577). So no excluded row ever
+			// appears in this loop, and no "(excluded)" tag is
+			// needed here. The show-affected branch (printAffectedText)
+			// renders the partition including Skipped.
+			fmt.Fprintf(w, "  - %-20s root=%-20s%s%s\n", wl.Name, wl.RootDir, schedSuffix, classSuffix)
 		}
 	}
 	if len(plan.Managed) > 0 {

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -710,6 +711,22 @@ func (s *server) scanService(
 		resp.PlanToken = tok
 	} else {
 		resp.PlanToken = planToken
+	}
+
+	// ADR-124: cache the source under its SHA-256 so the dashboard
+	// apply handler can replay it without re-uploading (browsers
+	// strip file inputs from non-multipart submissions; the operator
+	// never re-attaches the tarball). The defer at the top of
+	// scanService still removes the original spool file — that
+	// cleanup runs AFTER this return, so the cache copy observes a
+	// live source. Best-effort: a copy failure is logged (in
+	// storePlanCache via the returned error) and the dashboard apply
+	// path falls back to "please re-upload". We do NOT fail the
+	// scan on cache miss because the CLI flow doesn't need it.
+	// Plan-token mint already happened; the cache key is the same
+	// SHA-256 the token binds to.
+	if cacheErr := storePlanCache(req.SourceSHA256, req.SourcePath, acct.ID); cacheErr != nil {
+		s.log.Warn("plan_source cache store failed", slog.String("err", cacheErr.Error()))
 	}
 
 	if !apply {
