@@ -200,8 +200,12 @@ expect: `/etc/faas/rclone.conf` mode 0400 root:root, the
 ### 9. Install the release bundle
 
 ```
-# Both boxes
-gregalectl release install --git-sha <git-sha> --node $(hostname)
+# Both boxes. Pass the deployment identity, not the cloud-provider VM name.
+# For a compute-only box, the installer records the canonical <name>.faas key
+# used by vmmd. FAAS_NODE_NAME is normally set by the rendered systemd
+# drop-in; pass it explicitly in a shell if it is not exported here.
+gregalectl release install --git-sha <git-sha> --node "${FAAS_NODE_NAME:-<manifest-host-name>}" \
+    --role "${FAAS_BOX_ROLE}"
 ```
 
 expect: each box flips `/opt/faas/current` to the new SHA, the

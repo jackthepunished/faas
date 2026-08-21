@@ -211,7 +211,7 @@ var cliCommands = []cliCommand{
 				Flags: []cliFlag{
 					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
-					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
+					{Name: "node", Short: "compute_nodes.name to stamp (default: FAAS_NODE_NAME, then hostname; compute-only uses NAME.faas)"},
 					{Name: "role", Short: "box role: control-plane|compute-only (ADR-112); empty = no role templating. Reads /etc/faas/first-boot.env's FAAS_BOX_ROLE when unset.", ClosedSet: []string{"", "control-plane", "compute-only"}},
 				},
 			},
