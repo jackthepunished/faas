@@ -176,7 +176,7 @@ type MemStore struct {
 	// can exercise the compile-side merge without a live PG.
 	corsPresets map[string]CorsPreset
 	// openAPISnapshots mirrors deployment_openapi_snapshots
-	// (ADR-121, migration 00357). Keyed by deployment_id,
+	// (ADR-121, migration 00358). Keyed by deployment_id,
 	// mirroring the table's PK. PR-C's gate reads via
 	// LatestOpenAPISnapshotForScope (linear scan under m.mu)
 	// and OpenAPISnapshotByDeployment (single map lookup).
@@ -4164,7 +4164,7 @@ func (m *MemStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return m.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
-// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00357)
+// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00358)
 // mirrors pgstore's UPSERT: key by deployment_id, overwrite
 // every column on conflict. Validation matches pgstore
 // (err on empty required fields, schema_version >= 1).
