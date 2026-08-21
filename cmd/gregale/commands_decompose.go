@@ -320,6 +320,14 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 		return 0
 	}
 	fmt.Fprintln(w, "can_apply: true")
+	excludeIdx := make(map[string]bool, len(excludeSet))
+	for _, s := range excludeSet {
+		excludeIdx[s] = true
+	}
+	if showAffected {
+		printAffectedText(w, plan, excludeIdx)
+		return 0
+	}
 	if len(plan.Workloads) > 0 {
 		fmt.Fprintln(w, "\nWorkloads:")
 		// sort defensively even though reposcan already sorts — a
@@ -335,7 +343,11 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 			if wl.Class != "" {
 				classSuffix = "  class=" + wl.Class
 			}
-			fmt.Fprintf(w, "  - %-20s root=%-20s%s%s\n", wl.Name, wl.RootDir, schedSuffix, classSuffix)
+			excludedMark := ""
+			if excludeIdx[strings.ToLower(wl.Name)] {
+				excludedMark = "  (excluded — see Skipped below)"
+			}
+			fmt.Fprintf(w, "  - %-20s root=%-20s%s%s%s\n", wl.Name, wl.RootDir, schedSuffix, classSuffix, excludedMark)
 		}
 	}
 	if len(plan.Managed) > 0 {
@@ -354,6 +366,63 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 	return 0
 }
 
+// printAffectedText renders the ADR-124 blast-radius view: WillDeploy
+// + Skipped (operator-excluded) + Unaffected + Removed. Mirrors the
+// dashboard's two-table render so a CLI operator sees the same
+// partition the dashboard would.
+//
+// excludedSlugs is a normalised (lowercased) lookup the renderer
+// uses to mark WillDeploy entries that would have been there but
+// the operator excluded — the row gets a " [excluded locally]" tag
+// so the reader can spot operator overrides without re-running the
+// scan.
+func printAffectedText(w io.Writer, plan api.PlanResponse, excludedSlugs map[string]bool) {
+	wds := append([]api.PlanAffectedApp(nil), plan.WillDeploy...)
+	sort.Slice(wds, func(i, j int) bool { return wds[i].Slug < wds[j].Slug })
+	una := append([]api.PlanAffectedApp(nil), plan.Unaffected...)
+	sort.Slice(una, func(i, j int) bool { return una[i].Slug < una[j].Slug })
+	skp := append([]api.PlanAffectedApp(nil), plan.Skipped...)
+	sort.Slice(skp, func(i, j int) bool { return skp[i].Slug < skp[j].Slug })
+
+	fmt.Fprintln(w, "\nWill deploy:")
+	if len(wds) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	} else {
+		fmt.Fprintln(w, "  ACTION    SLUG                  APP ID                        ROOT_DIR")
+		for _, r := range wds {
+			mark := ""
+			if excludedSlugs[strings.ToLower(r.Slug)] {
+				mark = "  [excluded locally — will be skipped]"
+			}
+			fmt.Fprintf(w, "  %-9s %-20s %-30s %s%s\n", r.Action, r.Slug, r.ID, r.ExistingRootDir, mark)
+		}
+	}
+	if len(skp) > 0 {
+		fmt.Fprintln(w, "\nSkipped (excluded by operator):")
+		fmt.Fprintln(w, "  ACTION    SLUG                  APP ID")
+		for _, r := range skp {
+			fmt.Fprintf(w, "  %-9s %-20s %s\n", r.Action, r.Slug, r.ID)
+		}
+	}
+	fmt.Fprintln(w, "\nUnaffected (apps in your account not touched by this commit):")
+	if len(una) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	} else {
+		fmt.Fprintln(w, "  ACTION    SLUG                  APP ID")
+		for _, r := range una {
+			fmt.Fprintf(w, "  %-9s %-20s %s\n", r.Action, r.Slug, r.ID)
+		}
+	}
+	if len(plan.Removed) > 0 {
+		fmt.Fprintln(w, "\nRemoved (apps the apply path will SoftDeleteAppCascade):")
+		rmv := append([]string(nil), plan.Removed...)
+		sort.Strings(rmv)
+		for _, s := range rmv {
+			fmt.Fprintf(w, "  - %s\n", s)
+		}
+	}
+}
+
 // confirmPlan prints the plan and waits for a y/N confirmation. Reads
 // from r (typically os.Stdin) so tests can stub it. Returns true on
 // 'y' / 'yes' (case-insensitive); false on EOF, 'n', or any other
@@ -362,7 +431,14 @@ func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []s
 	printPlanText(w, plan, excludeSet, false)
 	//nolint:errcheck // same rationale as printPlanText; a failed Fprintln
 	// at the prompt is no different from the read below failing.
-	fmt.Fprintln(w, "\nApply this plan? [y/N] ")
+	prompt := "\nApply this plan? [y/N] "
+	if n := len(excludeSet); n > 0 {
+		prompt = fmt.Sprintf("\nApply %d workload(s) (excluded: %s)? [y/N] ",
+			len(plan.Workloads), strings.Join(excludeSet, ", "))
+	} else if n := len(plan.Workloads); n > 0 {
+		prompt = fmt.Sprintf("\nApply %d workload(s)? [y/N] ", n)
+	}
+	fmt.Fprint(w, prompt)
 	scanner := bufio.NewScanner(r)
 	if !scanner.Scan() {
 		return false
