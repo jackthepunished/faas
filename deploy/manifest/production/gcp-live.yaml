@@ -1,10 +1,16 @@
 # GCP live split-box deployment manifest.
 #
 # This is the deployment-specific counterpart to
-# deploy/manifest/examples/splitbox.example.yaml. It records the private
-# VPC addresses and immutable release tuple for the two-node GCP fleet. The
-# addresses are not portable to bare metal; a new fleet needs its own
-# manifest generated from that fleet's routable private network.
+# deploy/manifest/examples/splitbox.example.yaml. It records the stable
+# private-DNS names and immutable release tuple for the two-node GCP fleet.
+# `fsn-1.gregale.dev` and `fsn-2.gregale.dev` must resolve through the
+# operator's private/split-horizon DNS to the fleet's routable private
+# addresses; they must not be published as public Cloudflare records.
+# The same private DNS view must resolve the mTLS service identities
+# `schedd.faas`, `vmmd.faas`, and `egress.faas`; those names are certificate
+# identities and remain separate from the public app wildcard.
+# The overlay CIDR remains fleet-specific and must be reviewed when moving
+# this manifest to another network.
 #
 # The release tuple is pinned to the merged main commit that will be tagged
 # for the next signed pre-1.0 release. Do not change the bytes after hashing
@@ -16,11 +22,11 @@ fleet:
   hosts:
     - name: fsn-1
       role: control-plane
-      address: 10.156.0.3:9091
+      address: fsn-1.gregale.dev:9091
       tags: ["primary", "gcp-vpc"]
     - name: fsn-2
       role: compute-only
-      address: 10.156.0.5:50051
+      address: fsn-2.gregale.dev:50051
       tags: ["gcp-vpc"]
 
 daemons:
@@ -37,7 +43,7 @@ daemons:
         cert_path: /etc/faas/tls/schedd/vmmd-client.crt
         key_path: /etc/faas/tls/schedd/vmmd-client.key
         ca_path: /etc/faas/tls/ca/ca.crt
-    gateway_synth_target: tcp://10.156.0.5:8080
+    gateway_synth_target: tcp://fsn-2.gregale.dev:8080
   vmmd:
     bind: tcp://0.0.0.0:50051
     tls:
@@ -57,7 +63,7 @@ daemons:
     bind: tcp://0.0.0.0:443
   gatewayd_internal:
     bind: tcp://0.0.0.0:8080
-    apid_loopback: http://10.156.0.3:8081
+    apid_loopback: http://fsn-1.gregale.dev:8081
 
 overlay:
   provider: static
@@ -72,12 +78,12 @@ egress:
     - 10.156.0.0/20
 
 dns:
-  apps_domain: apps.gregale.dev
+  apps_domain: gregale.dev
   mode: cloudflare
 
 postgresql:
   # Credentials remain in host-local secret material, never in this file.
-  dsn: postgres://faas@10.156.0.3:5432/faas?sslmode=disable
+  dsn: postgres://faas@fsn-1.gregale.dev:5432/faas?sslmode=disable
   database: faas
   migration_max_slot: 341
   policy: on-boot

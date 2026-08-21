@@ -13,7 +13,7 @@ gatewayd_route_metrics_enabled: true
 # Shared public wildcard suffix. Operators with a different Cloudflare/public
 # zone override this variable; the split compute gateway must receive the same
 # value as apid and gatewayd-public.
-gatewayd_apps_domain: apps.gregale.dev
+gatewayd_apps_domain: gregale.dev
 
 # Path of the rendered config file on the box. The alertmanager role
 # uses the same shape (am_config_path) for the alertmanager.yml drop.

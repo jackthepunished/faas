@@ -332,7 +332,7 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 	start := time.Now()
 	// PR-B (issue #272 / ADR-095): scope is read from the wire
 	// request — the gateway sets it from the parsed
-	// `pr-{N}.{slug}.apps.<zone>` Host header. Empty scope = legacy
+	// `pr-{N}-{slug}.<zone>` Host header. Empty scope = legacy
 	// prod behaviour, threaded via WithScope at the engine entry.
 	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
 	s.ops.Observe(op, time.Since(start), err)

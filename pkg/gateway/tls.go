@@ -1,7 +1,7 @@
 // TLS seam for gatewayd-internal (spec §4.1, §11). The public listener terminates TLS
 // via CertMagic with:
 //
-//   - wildcard *.apps.gregale.dev via DNS-01 (Hetzner DNS API token from
+//   - wildcard *.<apps_domain> via DNS-01 (Hetzner DNS API token from
 //     /etc/faas/secrets/hetzner-dns.token, sealed at rest per §11/G2)
 //   - on-demand HTTP-01 for customer custom_domains, gated by a Postgres
 //     lookup against the custom_domains allowlist so an attacker can't
@@ -45,7 +45,7 @@ type OnDemandAllowlist func(ctx context.Context, host string) (bool, error)
 // Production:
 //
 //	Disabled:                false
-//	WildcardCertDomain:      "apps.gregale.dev"
+//	WildcardCertDomain:      "gregale.dev"
 //	HetznerDNSAPITokenPath:  "/etc/faas/secrets/hetzner-dns.token"
 //	HetznerZone:             "example.com"
 //	StorageDir:              "/var/lib/faas/certs"
@@ -56,8 +56,8 @@ type TLSConfig struct {
 	// Disabled (or all-empty) → plain HTTP; current e2e-harness behavior.
 	Disabled bool
 
-	// WildcardCertDomain is the *.apps.gregale.dev suffix that DNS-01 mints
-	// the wildcard cert for. Example: "apps.gregale.dev".
+	// WildcardCertDomain is the public suffix that DNS-01 mints the wildcard
+	// cert for. Example: "gregale.dev".
 	WildcardCertDomain string
 
 	// HetznerDNSAPITokenPath is the path to the DNS-01 solver token.

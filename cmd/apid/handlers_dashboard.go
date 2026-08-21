@@ -203,7 +203,7 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 	item := dashboard.AppListItem{
 		Slug:            app.Slug,
 		Status:          string(app.Status),
-		URL:             "https://" + app.Slug + ".apps." + s.domain,
+		URL:             appURLForDomain(app.Slug, s.domain),
 		LastDeployed:    lastStr,
 		StateBadge:      cls,
 		StateBadgeGlyph: glyph,
@@ -225,10 +225,23 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 		IsPreview: app.PreviewOfSlug != "",
 	}
 	if app.PreviewOfSlug != "" && app.PreviewPrNumber > 0 {
-		item.Scope = fmt.Sprintf("pr-%d.%s", app.PreviewPrNumber, app.PreviewOfSlug)
-		item.URL = "https://" + item.Scope + ".apps." + s.domain
+		item.Scope = fmt.Sprintf("pr-%d-%s", app.PreviewPrNumber, app.PreviewOfSlug)
+		item.URL = appURLForDomain(item.Scope, s.domain)
 	}
 	return item
+}
+
+// appURLForDomain joins an app or preview slug to the configured public
+// suffix. The suffix is intentionally opaque: `apps.gregale.dev` remains a
+// valid backwards-compatible value, while `gregale.dev` yields the current
+// wildcard contract (`<slug>.gregale.dev`) without hard-coding an extra
+// `.apps` label into the application.
+func appURLForDomain(slug, domain string) string {
+	domain = strings.Trim(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return "https://" + slug
+	}
+	return "https://" + slug + "." + domain
 }
 
 // renderAppsList renders /dashboard/apps — every deployed app + a
@@ -2019,17 +2032,17 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 // dashboard never round-trips a host header to mint URLs.
 //
 // URL is the FULL https form (e.g.
-// "https://pr-42.myapp.apps.gregale.dev") matching the apps-list
+// "https://pr-42-myapp.gregale.dev") matching the apps-list
 // convention in appListItem above — both the visible link and the
 // Copy-URL button read .URL, and a relative host label would hand
 // the user a non-clickable string.
 //
 // parentSlug is the slug of the page being rendered (used to
 // resolve the preview-app slug back to its host label); domain
-// is the apps-zone ("apps.gregale.dev"). When domain is empty
+// is the configured apps suffix (for example "gregale.dev"). When domain is empty
 // (local dev), the URL falls back to the bare host label so
 // dev-environment renders don't render a broken link to
-// "https://...apps.".
+// a broken link to an incomplete hostname.
 //
 // The result is sorted newest-first because PreviewAppsByParent
 // already orders that way (preview apps are not frequently re-
@@ -2037,11 +2050,9 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 func projectPreviewItems(rows []state.App, parentSlug, domain string) []dashboard.PreviewItem {
 	out := make([]dashboard.PreviewItem, 0, len(rows))
 	for _, a := range rows {
-		scope := fmt.Sprintf("pr-%d.%s", a.PreviewPrNumber, parentSlug)
-		var url string
-		if domain != "" {
-			url = "https://" + scope + ".apps." + domain
-		} else {
+		scope := fmt.Sprintf("pr-%d-%s", a.PreviewPrNumber, parentSlug)
+		url := appURLForDomain(scope, domain)
+		if domain == "" {
 			url = scope
 		}
 		item := dashboard.PreviewItem{

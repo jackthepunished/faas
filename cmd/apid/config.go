@@ -74,11 +74,11 @@ type Config struct {
 	// FAAS_GITHUBD_SOCKET. Defaults to /run/faas/githubd.sock.
 	GithubdSocket string `toml:"githubd_socket"`
 
-	// AppsDomain is the platform wildcard host (e.g. "apps.gregale.dev").
+	// AppsDomain is the platform wildcard suffix (e.g. "gregale.dev").
 	// apid renders the wildcard-aware /login template that lets the
-	// dashboard build <slug>.apps.<domain> links per app. Empty disables
-	// the wildcard UI (custom-domain-only deployments).
-	// Mirrors FAAS_APPS_DOMAIN. No default.
+	// dashboard build <slug>.<domain> links per app. Empty disables
+	// the wildcard UI (custom-domain-only deployments). Mirrors
+	// FAAS_APPS_DOMAIN. The public Gregale default is gregale.dev.
 	AppsDomain string `toml:"apps_domain"`
 
 	// Server-mTLS material for the advisory listener (ADR-052 /
@@ -162,6 +162,7 @@ func LoadConfig(path string) (*Config, error) {
 		// / `faas-githubd` doesn't exist in the test container).
 		ListenAddr:    "127.0.0.1:8081",
 		GithubdSocket: "/run/faas/githubd.sock",
+		AppsDomain:    "gregale.dev",
 		// Issue #995 Phase 1: seed the timeout / header defaults
 		// so a partial toml still produces the hardened listener.
 		// The GetRequest*Timeout helpers fall back to

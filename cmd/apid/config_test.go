@@ -31,6 +31,9 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	if cfg.GithubdSocket != "/run/faas/githubd.sock" {
 		t.Errorf("GithubdSocket = %q, want default", cfg.GithubdSocket)
 	}
+	if cfg.AppsDomain != "gregale.dev" {
+		t.Errorf("AppsDomain = %q, want public default", cfg.AppsDomain)
+	}
 	if cfg.NodeName != "" {
 		t.Errorf("NodeName = %q, want empty (single-box default)", cfg.NodeName)
 	}

@@ -437,7 +437,7 @@ func TestCmdDeploy_HappyPath_PrintsColdWakeSentence(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"✓ Deployed. https://my-app.apps.gregale.dev",
+		"Deployed. https://my-app.gregale.dev",
 		"scales to zero when idle",
 		"~0.3–0.8s to wake",
 		"normal and free",
@@ -1361,7 +1361,7 @@ func TestCmdDeploy_Recovery_PrintsColdWakeSentence(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"✓ Deployed. https://my-app.apps.gregale.dev",
+		"Deployed. https://my-app.gregale.dev",
 		"scales to zero when idle",
 		"~0.3–0.8s to wake",
 		"normal and free",

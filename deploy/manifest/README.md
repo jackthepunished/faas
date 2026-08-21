@@ -11,8 +11,10 @@ CI gate both consume this directory's contents.
   (one control-plane host + one compute-only host). Load it with
   `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
 - `production/gcp-live.yaml` — deployment-specific manifest for the current
-  two-node GCP fleet. Its private VPC addresses and release tuple are not
-  portable; use it only for that fleet and compute its hash before a release.
+  two-node GCP fleet. Its private DNS names, overlay network, and release
+  tuple are fleet-specific; private DNS must resolve `fsn-1.gregale.dev` and
+  `fsn-2.gregale.dev` before applying it, and its hash must be computed before
+  a release.
 
 ## Layout
 
@@ -51,7 +53,11 @@ bootstrap-compute`. The generated `ansible_host` and overlay addresses
 come from `fleet.hosts[].address`. The vmmd target keeps the private mTLS
 identity (`vmmd.faas`) and the manifest port; the generated
 `faas_internal_hosts` entries map that identity to the overlay address in
-`/etc/hosts`. Do not copy an IP into the committed
+`/etc/hosts`. Hostname endpoints are intentionally left to the operator's
+private DNS contract; public Cloudflare DNS is not a substitute for resolving
+these private transport names. That private view must resolve both the
+fleet names (`fsn-1.gregale.dev`, `fsn-2.gregale.dev`) and the mTLS service
+identities (`schedd.faas`, `vmmd.faas`, `egress.faas`). Do not copy a server IP into the committed
 `deploy/ansible/host_vars` files.
 
 The validator fails closed on every missing field, every

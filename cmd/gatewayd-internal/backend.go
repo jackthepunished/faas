@@ -20,9 +20,9 @@ import (
 // domains, schedd owns instances (CLAUDE.md §Component ownership).
 type pgRouter struct {
 	store state.Store
-	// appsSuffix is the ".apps.gregale.dev" suffix (leading dot). A host under it is a
-	// platform subdomain whose label is the app slug; anything else is a custom
-	// domain resolved through the domains table.
+	// appsSuffix is the configured public suffix in leading-dot form. A host
+	// under it is a platform subdomain whose label is the app slug; anything
+	// else is a custom domain resolved through the domains table.
 	appsSuffix string
 }
 
@@ -154,7 +154,7 @@ func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gatewa
 
 // slugFor returns the app slug for a platform-subdomain host, or ok=false when
 // the host is a custom domain (or the suffix is unconfigured). It rejects
-// multi-label prefixes (only "slug.apps.gregale.dev" routes, not "x.slug.apps.…").
+// multi-label prefixes (only one app-slug label under the configured suffix).
 func (r pgRouter) slugFor(host string) (string, bool) {
 	if r.appsSuffix == "" {
 		return "", false
@@ -167,7 +167,7 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 }
 
 // previewScopeFromHost (issue #272 / ADR-095 PR-B) peels a preview-hostname
-// shape `pr-{N}.{parent-slug}.apps.<zone>` into `(number, parent-slug)` so
+// shape `pr-{N}-{parent-slug}.<zone>` into `(number, parent-slug)` so
 // the routing layer can resolve it to the preview app row whose slug is
 // `pr-{N}-{parent-slug}` (the convention the webhook provisioner uses per
 // ADR-094). The parser is shared with pkg/gateway's on-demand cert
@@ -260,8 +260,8 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 	}, true, nil
 }
 
-// appsSuffix normalizes a bare apps domain ("apps.gregale.dev") into the
-// leading-dot suffix form pgRouter/gateway compare against (".apps.gregale.dev").
+// appsSuffix normalizes a bare apps domain ("gregale.dev") into the
+// leading-dot suffix form pgRouter/gateway compare against (".gregale.dev").
 // Empty in → empty out (custom-domain-only routing).
 func appsSuffix(domain string) string {
 	domain = strings.ToLower(strings.TrimSpace(domain))

@@ -22,9 +22,9 @@
 // able against an httptest stub (see dns01_provider_cloudflare_test.go).
 //
 // The challenge TXT record name is "_acme-challenge" prefixed to the
-// host passed in by certmagic. For a wildcard *.apps.gregale.dev
+// host passed in by certmagic. For a wildcard *.gregale.dev
 // challenge the host passed in is already
-// "_acme-challenge.apps.gregale.dev" (certmagic resolves the relative
+// "_acme-challenge.gregale.dev" (certmagic resolves the relative
 // name vs the zone for us); we just write
 // Type=TXT, Name=host, Content=<token>.
 package gateway
@@ -69,7 +69,7 @@ type CloudflareDNSProvider struct {
 // (loaded by the same loadHetznerDNSToken path; the on-disk path stays
 // for backward compat — a generic-token path is PR-9 scope). zone is the
 // zone name (e.g. "example.com") that this provider serves; the wildcard
-// cert *.apps.gregale.dev lives in this zone.
+// cert *.gregale.dev lives in this zone.
 func NewCloudflareDNSProvider(token, zone string) *CloudflareDNSProvider {
 	return &CloudflareDNSProvider{
 		token:  strings.TrimSpace(token),

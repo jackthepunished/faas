@@ -40,8 +40,8 @@ type Config struct {
 	// to 127.0.0.1:9090 (loopback only).
 	ControlAddr string `toml:"control_addr"`
 
-	// AppsDomain is the platform wildcard host (e.g. "apps.gregale.dev").
-	// gatewayd routes <slug>.apps.gregale.dev to the customer's app and
+	// AppsDomain is the platform wildcard suffix (e.g. "gregale.dev").
+	// gatewayd routes <slug>.<apps_domain> to the customer's app and
 	// applies the apps-suffix host guard. Empty disables wildcard routing
 	// (custom-domain-only deployments).
 	AppsDomain string `toml:"apps_domain"`

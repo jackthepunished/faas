@@ -152,7 +152,7 @@ func TestCreateAppSuccess(t *testing.T) {
 	if out.RAMMB != 512 { // Pro default
 		t.Errorf("ram default = %d, want 512", out.RAMMB)
 	}
-	if out.URL != "https://my-api.apps.gregale.dev" {
+	if out.URL != "https://my-api.gregale.dev" {
 		t.Errorf("url = %q", out.URL)
 	}
 }
