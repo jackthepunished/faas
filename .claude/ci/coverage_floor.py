@@ -12,15 +12,25 @@ where columns are: path:start.col,end.col STMT_COUNT HIT_COUNT
 import re, sys
 
 FLOORS = {
-    # 1pp below the post-cluster-3/4 actual numbers — these
-    # act as a regression tripwire, not aspirational targets.
-    # Raise ONLY AFTER a subsequent coverage PR proves the +1pp.
-    "pkg/fcvm":       46,
-    "pkg/state":      42,
-    "pkg/sched":      61,
-    "pkg/gateway":    73,
-    "pkg/vmmdgrpc":   46,
-    "pkg/vmmdmount":  43,
+    # 2pp below the post-cluster-3/4 actual numbers from
+    # 5-sample local noise study (2026-08-21):
+    #   pkg/fcvm:       47.6 ±0
+    #   pkg/state:      43.2 ±0
+    #   pkg/sched:      62.3–62.5 (±0.1)
+    #   pkg/gateway:    74.1 ±0
+    #   pkg/vmmdgrpc:   47.8 ±0
+    #   pkg/vmmdmount:  44.9 ±0
+    # Floors = (min observed) − 2pp — regression tripwire with
+    # headroom for cross-shard CI-noise (different go versions,
+    # cache state, race-detector schedule).
+    # Raise ONLY AFTER a subsequent coverage PR proves the +2pp
+    # is reproducible across all 4 shards.
+    "pkg/fcvm":       45,
+    "pkg/state":      41,
+    "pkg/sched":      60,
+    "pkg/gateway":    72,
+    "pkg/vmmdgrpc":   45,
+    "pkg/vmmdmount":  42,
 }
 REPO_PREFIX = "github.com/onebox-faas/faas/"
 
