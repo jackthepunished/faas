@@ -464,6 +464,30 @@ type OpsMetrics struct {
 	// value reflects the LATEST pass, not a cumulative sum.
 	// ADR-091 D20.3 / PR-B residual.
 	auditEventsRetentionLagSeconds prometheus.Gauge
+	// domainDoctorOldestObservationSeconds (ADR-120 Tier A1): gauge
+	// of (now − min(observed_at)) across every row in
+	// domain_doctor_observations at the moment each doctor pass
+	// completes. A positive value means the loop is keeping up; a
+	// value pinned at 0 with a non-empty row set means rows exist
+	// but the per-domain probe is failing to refresh
+	// observed_at (operator action needed if the per-domain
+	// dashboard "last check Xm ago" timeline is going stale).
+	// Unlabelled — the gauge is a fleet-wide signal, the per-domain
+	// staleness is rendered in the dashboard. The gauge is set (not
+	// Inc) so the value reflects the LATEST pass, not a cumulative
+	// sum. Backs the FaasDomainDoctorStalled / FaasDomainDoctorStretched
+	// alerts (docs/runbooks/FaasDomainDoctorStalled.md).
+	domainDoctorOldestObservationSeconds prometheus.Gauge
+	// domainDoctorSkippedFlagDisabled (ADR-120 Tier A1): counter of
+	// doctor passes skipped because the operator set
+	// FAAS_DOMAIN_DOCTOR_ENABLED=false. Labelled by daemon=apid
+	// (single label, fixed string — the single-registry pattern
+	// demands the field is present on every daemon's OpsMetrics so
+	// dashboards don't lose the series on a fleet roll-out, but
+	// only apid increments since only apid runs the doctor loop).
+	// Operator can correlate a non-zero rate with a customer
+	// "why is my domain not being checked?" ticket.
+	domainDoctorSkippedFlagDisabled prometheus.Counter
 	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
 	// events table by kind prefix (auth.*, key.*, secret.*,
 	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
@@ -1587,6 +1611,28 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	auditEventsRetentionLagSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_audit_events_retention_lag_seconds",
 		Help: "Seconds elapsed between the most recent retention pass and the cutoff it used (pkg/eventretention, ADR-075). Zero means the loop is running but no rows are being deleted. ADR-091 D20.3 / PR-B residual.",
+	})
+	// domainDoctorOldestObservationSeconds (ADR-120 Tier A1):
+	// fleet-wide gauge of (now − min(observed_at)) across every row
+	// in domain_doctor_observations. The dns_poller (cmd/apid/
+	// dns_poller.go::runDoctorOnce) emits Set(0) when the loop runs
+	// but there are no rows (cold start), and Set(<age>) when rows
+	// exist. Backs the FaasDomainDoctorStalled (page) and
+	// FaasDomainDoctorStretched (warn) alerts at
+	// deploy/ansible/roles/prometheus/files/faas.rules.yml.
+	domainDoctorOldestObservationSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_domain_doctor_oldest_observation_seconds",
+		Help: "Seconds elapsed since the oldest row in domain_doctor_observations was refreshed (cmd/apid/dns_poller.go::runDoctorOnce, ADR-120 Tier A1). Zero means the loop just ran against an empty table. Large values mean the poller is stalled. Backs FaasDomainDoctorStalled / FaasDomainDoctorStretched.",
+	})
+	// domainDoctorSkippedFlagDisabled (ADR-120 Tier A1):
+	// counter of doctor passes the poller skipped because the
+	// operator set FAAS_DOMAIN_DOCTOR_ENABLED=false. Unlabelled —
+	// the single-registry pattern requires the field to exist on
+	// every daemon's OpsMetrics, but only apid increments since
+	// only apid runs the doctor loop.
+	domainDoctorSkippedFlagDisabled := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_domain_doctor_skipped_flag_disabled_total",
+		Help: "Doctor passes skipped because FAAS_DOMAIN_DOCTOR_ENABLED was unset/false at the dns_poller tick (cmd/apid/dns_poller.go, ADR-120 Tier A1). Unlabelled — single-registry pattern, only apid increments.",
 	})
 	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
 	// events table by kind prefix (auth.*, key.*, secret.*,
@@ -2951,124 +2997,126 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// before the first sampler tick.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
-		registry:                           reg,
-		ops:                                ops,
-		dur:                                dur,
-		watchdogKills:                      watchdogKills,
-		warmSnapshotErrors:                 warmSnapshotErrors,
-		warmupErrors:                       warmupErrors,
-		writeRedirectTotal:                 writeRedirectTotal,
-		writeRedirectLatency:               writeRedirectLatency,
-		livenessRestarts:                   livenessRestarts,
-		workloadOOMKills:                   workloadOOMKills,
-		guestInitDuration:                  guestInitDuration,
-		wakeRPCDuration:                    wakeRPCDuration,
-		gatewayDrainWaitSeconds:            gatewayDrainWaitSeconds,
-		gatewayInflightRequests:            gatewayInflightRequests,
-		wakeSnapshotTier:                   wakeSnapshotTier,
-		guestTailSeconds:                   guestTailSeconds,
-		guestTailFailedTotal:               guestTailFailedTotal,
-		tailCapReached:                     tailCapReached,
-		evictedPriority:                    evictedPriority,
-		eventsWriteFail:                    eventsWriteFail,
-		auditWriteFail:                     auditWriteFail,
-		auditWriteDur:                      auditWriteDur,
-		accountOrgMismatch:                 accountOrgMismatch,
-		requestFailures:                    requestFailures,
-		requestTotal:                       requestTotal,
-		appErrorsRecorded:                  appErrorsRecorded,
-		appErrorsFingerprintCacheHits:      appErrorsFingerprintCacheHits,
-		appErrorsDedupeMerges:              appErrorsDedupeMerges,
-		appErrorsFlushDuration:             appErrorsFlushDuration,
-		appErrorsPurges:                    appErrorsPurges,
-		previewJanitorOutcomes:             previewJanitorOutcomes,
-		dataUpstreamRTT:                    dataUpstreamRTT,
-		dataUpstreamProbes:                 dataUpstreamProbes,
-		dataUpstreamProbeDuration:          dataUpstreamProbeDuration,
-		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
-		failedLoginTotal:                   failedLoginTotal,
-		failedLoginDropped:                 failedLoginDropped,
-		failedLoginAuditWriteFailures:      failedLoginAuditWriteFailures,
-		auditEventsDeletedTotal:            auditEventsDeletedTotal,
-		auditEventsRetentionLagSeconds:     auditEventsRetentionLagSeconds,
-		auditEventsVolumeTotal:             auditEventsVolumeTotal,
-		alertEvalSkippedDegradedTotal:      alertEvalSkippedDegradedTotal,
-		alertEvalFiredTotal:                alertEvalFiredTotal,
-		alertDeliveryAttemptsTotal:         alertDeliveryAttemptsTotal,
-		paddleWebhookVerifyFailedTotal:     paddleWebhookVerifyFailedTotal,
-		paddleWebhookReplaySuppressedTotal: paddleWebhookReplaySuppressedTotal,
-		alertEvaluatorEnabled:              alertEvaluatorEnabled,
-		pgBackupLastPushed:                 pgBackupLastPushed,
-		ipLabels:                           newIPLabelSet(maxIPLabelValues),
-		topTenantRPS:                       topTenantRPS,
-		topAccounts:                        newTopAccountSet(topAccountSetCap),
-		throttleSecondsTotal:               throttleSecondsTotal,
-		throttleRatio:                      throttleRatio,
-		topApps:                            newTopAppSet(topAppSetCap),
-		throttleSecondsLastSeen:            newCPUThrottleLastSeen(),
-		cpuSecondsLast:                     newCPUSecondsLastSeen(),
-		cronFireNowDispatchDur:             cronFireNowDispatchDur,
-		stripePushDur:                      stripePushDur,
-		paddlePushDur:                      paddlePushDur,
-		buildDur:                           buildDur,
-		buildQueueWait:                     buildQueueWait,
-		residentGBPerCustomer:              residentGBPerCustomer,
-		billingCapExceededTotal:            billingCapExceededTotal,
-		meterdFloorAppliedTotal:            meterdFloorAppliedTotal,
-		auditOrgEvent:                      auditOrgEvent,
-		authzDenied:                        authzDenied,
-		authzAllowed:                       authzAllowed,
-		wakeIDV4Fallback:                   wakeIDV4Fallback,
-		snapshotDiskDrift:                  snapshotDiskDrift,
-		capacitySignatureRejected:          capacitySignatureRejected,
-		imagedOCIPull:                      imagedOCIPull,
-		instanceCPUPct:                     instanceCPUPct,
-		instanceRSSMB:                      instanceRSSMB,
-		instanceInflightReqs:               instanceInflightReqs,
-		instanceCPUSecondsTotal:            instanceCPUSecondsTotal,
-		instanceStatsCollectDur:            instanceStatsCollectDur,
-		instanceStatsPartialErrors:         instanceStatsPartialErrors,
-		sidecarRestartTotal:                sidecarRestartTotal,
-		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
-		scaleUpDecisions:                   scaleUpDecisions,
-		scaleDownDecisions:                 scaleDownDecisions,
-		floorReconcileDecisions:            floorReconcileDecisions,
-		floorReconcileErrors:               floorReconcileErrors,
-		floorInstancesAdmitted:             floorInstancesAdmitted,
-		scaleUpAdmitRPS:                    scaleUpAdmitRPS,
-		sseClients:                         sseClients,
-		egressDeny:                         egressDeny,
-		ociEgressDeny:                      ociEgressDeny,
-		provenanceWrites:                   provenanceWrites,
-		imageScanVulns:                     imageScanVulns,
-		deployScanDuration:                 deployScanDuration,
-		deployScanTotal:                    deployScanTotal,
-		deployScanVulns:                    deployScanVulns,
-		liveMigrationDecisions:             liveMigrationDecisions,
-		rebalanceDecisions:                 rebalanceDecisions,
-		migratingReconcileDecisions:        migratingReconcileDecisions,
-		appAtCapacityTotal:                 appAtCapacityTotal,
-		pressureReassignmentsTotal:         pressureReassignmentsTotal,
-		overflowTargetSpillHitsTotal:       overflowTargetSpillHitsTotal,
-		activePassiveFailoversTotal:        activePassiveFailoversTotal,
-		standbyState:                       standbyState,
-		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
-		deadNodeReconcileDecisions:         deadNodeReconcileDecisions,
-		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
-		storageCacheStaleFallback:          storageCacheStaleFallback,
-		apidLogsEmittedTotal:               apidLogsEmittedTotal,
-		apidLogsDroppedTotal:               apidLogsDroppedTotal,
-		egressSourceErrors:                 egressSourceErrors,
-		oauthDisabledTotal:                 oauthDisabledTotal,
-		advisoryBatchesEmittedTotal:        advisoryBatchesEmittedTotal,
-		apidStatelessAdvisoryEventsTotal:   apidStatelessAdvisoryEventsTotal,
-		apidGithubdBridgeEnqueuedTotal:     apidGithubdBridgeEnqueuedTotal,
-		githubdPathFilterTotal:             githubdPathFilterTotal,
-		wakePhaseEmitted:                   wakePhaseEmitted,
-		wakePhaseDur:                       wakePhaseDur,
-		esmPollsTotal:                      esmPollsTotal,
-		esmRecordsConsumedTotal:            esmRecordsConsumedTotal,
-		esmLagSeconds:                      esmLagSeconds,
+		registry:                             reg,
+		ops:                                  ops,
+		dur:                                  dur,
+		watchdogKills:                        watchdogKills,
+		warmSnapshotErrors:                   warmSnapshotErrors,
+		warmupErrors:                         warmupErrors,
+		writeRedirectTotal:                   writeRedirectTotal,
+		writeRedirectLatency:                 writeRedirectLatency,
+		livenessRestarts:                     livenessRestarts,
+		workloadOOMKills:                     workloadOOMKills,
+		guestInitDuration:                    guestInitDuration,
+		wakeRPCDuration:                      wakeRPCDuration,
+		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
+		gatewayInflightRequests:              gatewayInflightRequests,
+		wakeSnapshotTier:                     wakeSnapshotTier,
+		guestTailSeconds:                     guestTailSeconds,
+		guestTailFailedTotal:                 guestTailFailedTotal,
+		tailCapReached:                       tailCapReached,
+		evictedPriority:                      evictedPriority,
+		eventsWriteFail:                      eventsWriteFail,
+		auditWriteFail:                       auditWriteFail,
+		auditWriteDur:                        auditWriteDur,
+		accountOrgMismatch:                   accountOrgMismatch,
+		requestFailures:                      requestFailures,
+		requestTotal:                         requestTotal,
+		appErrorsRecorded:                    appErrorsRecorded,
+		appErrorsFingerprintCacheHits:        appErrorsFingerprintCacheHits,
+		appErrorsDedupeMerges:                appErrorsDedupeMerges,
+		appErrorsFlushDuration:               appErrorsFlushDuration,
+		appErrorsPurges:                      appErrorsPurges,
+		previewJanitorOutcomes:               previewJanitorOutcomes,
+		dataUpstreamRTT:                      dataUpstreamRTT,
+		dataUpstreamProbes:                   dataUpstreamProbes,
+		dataUpstreamProbeDuration:            dataUpstreamProbeDuration,
+		accountLabels:                        newAccountLabelSet(maxAccountLabelValues),
+		failedLoginTotal:                     failedLoginTotal,
+		failedLoginDropped:                   failedLoginDropped,
+		failedLoginAuditWriteFailures:        failedLoginAuditWriteFailures,
+		auditEventsDeletedTotal:              auditEventsDeletedTotal,
+		auditEventsRetentionLagSeconds:       auditEventsRetentionLagSeconds,
+		domainDoctorOldestObservationSeconds: domainDoctorOldestObservationSeconds,
+		domainDoctorSkippedFlagDisabled:      domainDoctorSkippedFlagDisabled,
+		auditEventsVolumeTotal:               auditEventsVolumeTotal,
+		alertEvalSkippedDegradedTotal:        alertEvalSkippedDegradedTotal,
+		alertEvalFiredTotal:                  alertEvalFiredTotal,
+		alertDeliveryAttemptsTotal:           alertDeliveryAttemptsTotal,
+		paddleWebhookVerifyFailedTotal:       paddleWebhookVerifyFailedTotal,
+		paddleWebhookReplaySuppressedTotal:   paddleWebhookReplaySuppressedTotal,
+		alertEvaluatorEnabled:                alertEvaluatorEnabled,
+		pgBackupLastPushed:                   pgBackupLastPushed,
+		ipLabels:                             newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                         topTenantRPS,
+		topAccounts:                          newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:                 throttleSecondsTotal,
+		throttleRatio:                        throttleRatio,
+		topApps:                              newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:              newCPUThrottleLastSeen(),
+		cpuSecondsLast:                       newCPUSecondsLastSeen(),
+		cronFireNowDispatchDur:               cronFireNowDispatchDur,
+		stripePushDur:                        stripePushDur,
+		paddlePushDur:                        paddlePushDur,
+		buildDur:                             buildDur,
+		buildQueueWait:                       buildQueueWait,
+		residentGBPerCustomer:                residentGBPerCustomer,
+		billingCapExceededTotal:              billingCapExceededTotal,
+		meterdFloorAppliedTotal:              meterdFloorAppliedTotal,
+		auditOrgEvent:                        auditOrgEvent,
+		authzDenied:                          authzDenied,
+		authzAllowed:                         authzAllowed,
+		wakeIDV4Fallback:                     wakeIDV4Fallback,
+		snapshotDiskDrift:                    snapshotDiskDrift,
+		capacitySignatureRejected:            capacitySignatureRejected,
+		imagedOCIPull:                        imagedOCIPull,
+		instanceCPUPct:                       instanceCPUPct,
+		instanceRSSMB:                        instanceRSSMB,
+		instanceInflightReqs:                 instanceInflightReqs,
+		instanceCPUSecondsTotal:              instanceCPUSecondsTotal,
+		instanceStatsCollectDur:              instanceStatsCollectDur,
+		instanceStatsPartialErrors:           instanceStatsPartialErrors,
+		sidecarRestartTotal:                  sidecarRestartTotal,
+		cpuStatsCollectDur:                   cpuStatsCollectDurLocal,
+		scaleUpDecisions:                     scaleUpDecisions,
+		scaleDownDecisions:                   scaleDownDecisions,
+		floorReconcileDecisions:              floorReconcileDecisions,
+		floorReconcileErrors:                 floorReconcileErrors,
+		floorInstancesAdmitted:               floorInstancesAdmitted,
+		scaleUpAdmitRPS:                      scaleUpAdmitRPS,
+		sseClients:                           sseClients,
+		egressDeny:                           egressDeny,
+		ociEgressDeny:                        ociEgressDeny,
+		provenanceWrites:                     provenanceWrites,
+		imageScanVulns:                       imageScanVulns,
+		deployScanDuration:                   deployScanDuration,
+		deployScanTotal:                      deployScanTotal,
+		deployScanVulns:                      deployScanVulns,
+		liveMigrationDecisions:               liveMigrationDecisions,
+		rebalanceDecisions:                   rebalanceDecisions,
+		migratingReconcileDecisions:          migratingReconcileDecisions,
+		appAtCapacityTotal:                   appAtCapacityTotal,
+		pressureReassignmentsTotal:           pressureReassignmentsTotal,
+		overflowTargetSpillHitsTotal:         overflowTargetSpillHitsTotal,
+		activePassiveFailoversTotal:          activePassiveFailoversTotal,
+		standbyState:                         standbyState,
+		standbyStateValue:                    StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
+		deadNodeReconcileDecisions:           deadNodeReconcileDecisions,
+		registryCredentialMarkUsedFailures:   registryCredentialMarkUsedFailures,
+		storageCacheStaleFallback:            storageCacheStaleFallback,
+		apidLogsEmittedTotal:                 apidLogsEmittedTotal,
+		apidLogsDroppedTotal:                 apidLogsDroppedTotal,
+		egressSourceErrors:                   egressSourceErrors,
+		oauthDisabledTotal:                   oauthDisabledTotal,
+		advisoryBatchesEmittedTotal:          advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal:     apidStatelessAdvisoryEventsTotal,
+		apidGithubdBridgeEnqueuedTotal:       apidGithubdBridgeEnqueuedTotal,
+		githubdPathFilterTotal:               githubdPathFilterTotal,
+		wakePhaseEmitted:                     wakePhaseEmitted,
+		wakePhaseDur:                         wakePhaseDur,
+		esmPollsTotal:                        esmPollsTotal,
+		esmRecordsConsumedTotal:              esmRecordsConsumedTotal,
+		esmLagSeconds:                        esmLagSeconds,
 	}
 }
 
@@ -3740,6 +3788,32 @@ func (m *OpsMetrics) AuditEventsRetentionLag() prometheus.Gauge {
 		return nil
 	}
 	return m.auditEventsRetentionLagSeconds
+}
+
+// DomainDoctorOldestObservationSeconds (ADR-120 Tier A1) returns
+// the apid_domain_doctor_oldest_observation_seconds gauge. The
+// dns_poller (cmd/apid/dns_poller.go::emitDoctorOldestObservationGauge)
+// calls Set(age) after every runDoctorOnce pass so the
+// FaasDomainDoctorStalled / FaasDomainDoctorStretched alerts can
+// page on a stalled loop. Safe to call when m is nil — the dns_poller
+// also nil-checks s.ops before calling here.
+func (m *OpsMetrics) DomainDoctorOldestObservationSeconds() prometheus.Gauge {
+	if m == nil {
+		return nil
+	}
+	return m.domainDoctorOldestObservationSeconds
+}
+
+// DomainDoctorSkippedFlagDisabled (ADR-120 Tier A1) returns the
+// apid_domain_doctor_skipped_flag_disabled_total counter so the
+// dns_poller can bump it once per tick when
+// FAAS_DOMAIN_DOCTOR_ENABLED is off. Nil-safe (returns a no-op
+// counter when m is nil — the dns_poller also nil-checks s.ops).
+func (m *OpsMetrics) DomainDoctorSkippedFlagDisabled() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.domainDoctorSkippedFlagDisabled
 }
 
 // AuditEventsVolumeTotal returns the per-kind-prefix counter for

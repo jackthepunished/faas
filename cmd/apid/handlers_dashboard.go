@@ -91,6 +91,19 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 				s.renderDeploymentDetail(w, r, log, acct, dslug, did)
 				return
 			}
+			// Per-domain doctor drill-down (ADR-120 Tier A2):
+			// /dashboard/apps/{slug}/domains/{domain}/doctor
+			// renders the 5-check Render-style report via
+			// pkg/dashboard/templates/domain_doctor.html. Falls
+			// through to renderAppDetail if the suffix doesn't
+			// match the {domain}/doctor shape — same posture as
+			// parseDeployDetailPath above. The IDOR check is the
+			// AppBySlug + AccountID rejection in
+			// renderDomainDoctor.
+			if dslug, domain, ok := parseDomainDoctorPath(slug); ok {
+				s.renderDomainDoctor(w, r, log, acct, dslug, domain)
+				return
+			}
 			s.renderAppDetail(w, r, log, acct, slug)
 		case path == "/dashboard/usage":
 			s.renderUsage(w, r, log, acct)
@@ -2048,4 +2061,138 @@ func projectPreviewItems(rows []state.App, parentSlug, domain string) []dashboar
 		out = append(out, item)
 	}
 	return out
+}
+
+// parseDomainDoctorPath (ADR-120 Tier A2) splits a
+// /dashboard/apps/{slug}/... suffix into (slug, domain, ok)
+// when the suffix matches /domains/{domain}/doctor. Returns
+// ok=false when the suffix doesn't match — caller falls
+// through to renderAppDetail. The match is prefix-based so a
+// future PR can add /domains/{domain}/doctor/{tab} (e.g. a
+// "logs" tab) without breaking the dispatcher. Mirrors
+// parseDeployDetailPath at :1697.
+func parseDomainDoctorPath(rest string) (string, string, bool) {
+	const doctor = "/domains/"
+	i := strings.Index(rest, doctor)
+	if i < 0 {
+		return "", "", false
+	}
+	slug := rest[:i]
+	after := rest[i+len(doctor):]
+	if slug == "" || after == "" {
+		return "", "", false
+	}
+	// Match the /doctor suffix. Three cases land here:
+	//   1. /doctor (exact)                — this parser owns it
+	//   2. /doctor/{tab} (future sub-tab) — fall through to a
+	//      sibling dispatcher (this function stays untouched when
+	//      that lands)
+	//   3. anything else                   — fall through to
+	//      renderAppDetail
+	// We split on /doctor so a sub-tab can claim the part after
+	// /doctor without touching this function. Review-fix #4 caught
+	// the prior HasSuffix-only implementation rejecting sub-tabs
+	// despite the comment promising the opposite.
+	const doctorTail = "/doctor"
+	idx := strings.Index(after, doctorTail)
+	if idx < 0 {
+		return "", "", false
+	}
+	tail := after[idx+len(doctorTail):]
+	if tail != "" {
+		// Sub-tab shape (/doctor/logs, /doctor/...) — leave for
+		// a sibling dispatcher case to claim.
+		return "", "", false
+	}
+	domain := after[:idx]
+	if domain == "" || strings.Contains(domain, "/") {
+		return "", "", false
+	}
+	return slug, domain, true
+}
+
+// renderDomainDoctor (ADR-120 Tier A2) renders
+// /dashboard/apps/{slug}/domains/{domain}/doctor — the
+// per-domain Render-style drill-down page mirroring the CLI's
+// `gregale domains doctor <domain>` output. The handler reads
+// the same DomainDoctorReport the JSON endpoint returns
+// (cmd/apid/handlers_ext.go::getDomainDoctor) by calling the
+// shared buildDoctorReport helper so the JSON wire shape and
+// the dashboard HTML stay in lockstep — single source of truth
+// for the per-check row + Remediation text.
+//
+// IDOR posture mirrors renderDeploymentDetail: AppBySlug +
+// AccountID rejection (line 1727), then loadDomain (the
+// same ownership check the JSON endpoint uses) to confirm the
+// domain belongs to the same app. Falls through to
+// http.NotFound on either failure so a cross-tenant probe
+// returns 404, not 403 (no signal that the row exists).
+func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug, domain string) {
+	// Same dark-launch guard as the JSON endpoint at
+	// handlers_ext.go:1892 — without this, the dashboard renders
+	// a stale 5-check report while the CLI returns 503
+	// doctor_disabled, and the two surfaces disagree on the same
+	// operator choice. The dark-launch was a soak-only construct
+	// per ADR-120's Tier-A3 section; the operator's escape hatch
+	// MUST be visible in BOTH surfaces, not just the CLI.
+	if !api.DomainDoctorEnabled() {
+		api.WriteProblem(w, api.ErrDoctorDisabled())
+		return
+	}
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return
+	}
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok {
+		// loadDomain already wrote the 404 problem JSON; bail
+		// without touching the ResponseWriter again — calling
+		// http.NotFound here would clobber the RFC 7807 body
+		// with text/plain '404 page not found' and change the
+		// Content-Type under the customer's browser.
+		return
+	}
+	if d.AppID != app.ID {
+		// loadDomain passed (domain belongs to acct) but the
+		// {slug} in the URL doesn't match the owning app. Same
+		// 404 posture as cross-tenant: no signal that the row
+		// exists, single write.
+		s.notFound(w, "no such domain")
+		return
+	}
+	report, err := s.buildDoctorReport(ctx, d)
+	if err != nil {
+		log.Warn("dashboard renderDomainDoctor: buildDoctorReport failed", "domain", domain, "err", err)
+		http.Error(w, "doctor unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	view := dashboard.DomainDoctorView{
+		App:        dashboard.AppListItem{Slug: app.Slug},
+		Domain:     report.Domain,
+		AppID:      report.AppID,
+		Healthy:    report.Healthy,
+		Stale:      report.Stale,
+		ObservedAt: report.ObservedAt,
+	}
+	for _, c := range report.Checks {
+		view.Checks = append(view.Checks, dashboard.DashboardDoctorCheck{
+			Name:        c.Name,
+			Status:      c.Status,
+			Detail:      c.Detail,
+			Observed:    c.Observed,
+			Remediation: c.Remediation,
+			CheckedAt:   c.CheckedAt,
+		})
+	}
+	page := dashboard.Page{
+		Title:   "Doctor — " + domain,
+		Body:    "domain_doctor",
+		Account: dashboardAccountView(acct, 0),
+		Data:    view,
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
 }

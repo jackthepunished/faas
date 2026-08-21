@@ -100,3 +100,104 @@
      (`doctorFinding{Check, Severity, Target, Message,
      Detail}` at `commands_doctor.go:128-136`) are borrowed
      as a stylistic reference only.
+
+## Tier A rollout (2026-08-20, post-soak)
+
+The mega-PR shipped the schema, probe engine, poller branch,
+endpoint, and CLI subcommand behind
+`FAAS_DOMAIN_DOCTOR_ENABLED=false`. After a 7-day production
+soak with no regressions, a Tier-A follow-up PR moves the
+doctor from "wired but inert" to "operator observes it on a
+dashboard, an alert fires when it goes stale, default-on."
+The three tiers are individually-revertable so a regression
+in one tier doesn't block the other two.
+
+### Tier A1 — observability
+
+- **New gauge `apid_domain_doctor_oldest_observation_seconds`**
+  (cmd/apid/dns_poller.go::emitDoctorOldestObservationGauge).
+  The dns_poller Sets the wall-clock age of the oldest row
+  in `domain_doctor_observations` after each pass. Cold start
+  (empty table) → 0. Healthy loop → ~30 s. Stalled loop → the
+  value freezes and Prometheus's
+  `time() − timestamp(gauge) > X` expression pages on-call.
+- **New counter `apid_domain_doctor_skipped_flag_disabled_total`**
+  (cmd/apid/dns_poller.go::emitDoctorSkip). Bumped once per
+  dns_poller tick when the operator has set the env var to a
+  falsy value. Backs the FaasDomainDoctorDisabledByOperator
+  info alert so an explicit opt-out surfaces in Alertmanager
+  without paging.
+- **New Store method `OldestDoctorObservation(ctx) (time.Time, error)`**
+  on `state.Store` (PkgStore + MemStore). Hand-rolled (not
+  sqlc) — the SQL is a single MIN(observed_at) scan.
+- **New OpsMetrics getter methods**
+  `DomainDoctorOldestObservationSeconds()` and
+  `DomainDoctorSkippedFlagDisabled()` on `*wire.OpsMetrics`,
+  nil-safe (the dns_poller nil-checks `s.ops` first).
+- **New Prometheus alerts** at
+  deploy/ansible/roles/prometheus/files/faas.rules.yml:
+  - `FaasDomainDoctorStalled` (page, `for: 30m`,
+    `> 1560s` stale)
+  - `FaasDomainDoctorStretched` (warn, `for: 30m`,
+    `> 90s` stale — cadence is broken but the loop is alive)
+  - `FaasDomainDoctorDisabledByOperator` (info,
+    `for: 1h`, `rate(skipped_total[5m]) > 0` — explicit opt-out)
+  Mirrors the canonical "stuck X" precedent at
+  `FaasAuditRetentionLoopStalled` / `Stretched`
+  (deploy/ansible/roles/prometheus/files/faas.rules.yml:413-448).
+- **New operator runbook**
+  docs/runbooks/FaasDomainDoctorStalled.md — 30-second
+  summary, 5-step triage, 4 linked docs (this ADR, flags.go,
+  dns_poller.go, the dashboard template).
+
+### Tier A2 — customer dashboard surface
+
+- **New dashboard route** `GET /dashboard/apps/{slug}/domains/{domain}/doctor`
+  (cmd/apid/handlers_dashboard.go::parseDomainDoctorPath +
+  renderDomainDoctor). IDOR posture mirrors
+  `renderDeploymentDetail` (AppBySlug + AccountID rejection +
+  loadDomain ownership check, 404 not 403 on cross-tenant).
+- **New dashboard template**
+  pkg/dashboard/templates/domain_doctor.html — htmx-loaded
+  + CSP-nonce'd + inline `<style>` (TypeScript-free). Renders
+  the 5-check table with per-row glyph + `observed:` + `→ fix:`
+  lines, a `stale-banner` when the observation row is older
+  than `FAAS_DOMAIN_DOCTOR_TTL_SECONDS`, and a
+  `docs →` link to docs.gregale.dev/domains/doctor.
+- **New dashboard structs**
+  `pkg/dashboard.DomainDoctorView` + `DashboardDoctorCheck`
+  mirror the wire DTO verbatim so a future regen can swap the
+  type without rewriting the template.
+
+### Tier A3 — default-on cutover
+
+- **Default flip**: `pkg/api/flags.go::DomainDoctorEnabled`
+  returns `true` when `FAAS_DOMAIN_DOCTOR_ENABLED` is unset
+  or empty. The explicit-off token set
+  (`0` / `false` / `no` / `off`) keeps the operator escape
+  hatch — the dns_poller's `emitDoctorSkip` bumps the
+  counter so the opt-out is observable via
+  `FaasDomainDoctorDisabledByOperator`.
+- **Unknown tokens default-on**: any token outside the
+  explicit-off set returns true so a typo doesn't silently
+  turn the doctor off. Mirrors `TestCertEngineStagingDefaultsOn`'s
+  safe-default posture.
+- **Test coverage**: `pkg/api/flags_test.go` adds 4 new cases
+  (`TestDomainDoctorEnabledDefaultsOn`,
+  `AcceptsOnTokens`, `AcceptsExplicitOffTokens`,
+  `IgnoresUnknownTokens`); `cmd/apid/handlers_doctor_test.go`
+  adds 6 new cases covering the 503 doctor_disabled path, the
+  happy-path 5-row report, IDOR (cross-tenant 404), stale-row
+  response shape, parser, and the dashboard route render.
+
+### Rollout posture
+
+The cutover is irreversible by feature flag alone — operators
+who want to disable the doctor MUST set
+`FAAS_DOMAIN_DOCTOR_ENABLED=false` (or any other explicit-off
+token). This is the intended Tier-A3 semantics per ADR-120:
+the dark-launch was a soak-only construct, not a permanent
+switch. On-call engineers triaging
+`FaasDomainDoctorDisabledByOperator` should not interpret the
+info alert as a customer-impacting incident — the opt-out is
+operator choice.

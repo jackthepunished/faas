@@ -5,6 +5,68 @@ import (
 	"testing"
 )
 
+// TestDomainDoctorEnabledDefaultsOn (ADR-120 Tier A3) asserts
+// the flag defaults to on (post-soak dark-launch cutover). A
+// test running without FAAS_DOMAIN_DOCTOR_ENABLED set must see
+// the gate ON so the dns_poller's runDoctorOnce branch is
+// reached and the apid_domain_doctor_oldest_observation_seconds
+// gauge surfaces in /metrics. The reverse — the dns_poller
+// gate off-by-default — would silently disable the operator's
+// visibility into the doctor. Mirrors
+// TestCertEngineStagingDefaultsOn's "safe default" semantics.
+func TestDomainDoctorEnabledDefaultsOn(t *testing.T) {
+	t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", "")
+	if !DomainDoctorEnabled() {
+		t.Fatal("DomainDoctorEnabled default = false; want true (default-on after Tier A3 soak)")
+	}
+}
+
+// TestDomainDoctorEnabledAcceptsOnTokens covers the 1/true/yes/on
+// accept set documented in flags.go. Mirrors
+// TestTenantSurfacesEnabledAcceptsOnTokens but inverted — the
+// on-tokens are still recognised (defence in depth for ops that
+// copy-paste the env from a TenantSurfaces-style config).
+func TestDomainDoctorEnabledAcceptsOnTokens(t *testing.T) {
+	for _, v := range []string{"1", "true", "TRUE", "True", "yes", "YES", "on", "ON"} {
+		t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", v)
+		if !DomainDoctorEnabled() {
+			t.Errorf("DomainDoctorEnabled(%q) = false; want true", v)
+		}
+	}
+}
+
+// TestDomainDoctorEnabledAcceptsExplicitOffTokens covers the
+// 0/false/no/off reject set documented in flags.go — the
+// operator's escape hatch for "I want to disable the doctor
+// without code revert" (Tier A3 cutover keeps the override).
+// Mirrors TestCertEngineStagingDefaultsOn's prod-opt-in shape
+// (FAAS_TLS_STAGING=0 flips to prod).
+func TestDomainDoctorEnabledAcceptsExplicitOffTokens(t *testing.T) {
+	for _, v := range []string{"0", "false", "FALSE", "False", "no", "NO", "off", "OFF"} {
+		t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", v)
+		if DomainDoctorEnabled() {
+			t.Errorf("DomainDoctorEnabled(%q) = true; want false (explicit off)", v)
+		}
+	}
+}
+
+// TestDomainDoctorEnabledIgnoresUnknownTokens pins the
+// default-on safety posture: any token outside the
+// explicit-off set returns true so a typo (e.g. "disable"
+// instead of "disabled", or a stray newline) doesn't
+// accidentally turn the doctor off. The dns_poller
+// emitDoctorSkip helper still emits its log line on every
+// tick when the doctor is off, so a misconfigured-off is
+// observable in logs + Alertmanager.
+func TestDomainDoctorEnabledIgnoresUnknownTokens(t *testing.T) {
+	for _, v := range []string{"enabled", "disable", "offish", "1\n", " yes"} {
+		t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", v)
+		if !DomainDoctorEnabled() {
+			t.Errorf("DomainDoctorEnabled(%q) = false; want true (default-on safety)", v)
+		}
+	}
+}
+
 // TestTenantSurfacesEnabledDefaultsOff asserts the flag is opt-in.
 // A test running without FAAS_TENANT_SURFACES_ENABLED set must
 // see the gate off so the surface routes (PR-C) stay 404/503 in

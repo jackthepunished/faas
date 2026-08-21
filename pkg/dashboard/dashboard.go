@@ -397,6 +397,49 @@ type StagePayload struct {
 	TerminalAt time.Time
 }
 
+// DomainDoctorView (ADR-120 Tier A2) is the dashboard-facing
+// payload for the per-domain doctor drill-down at
+// /dashboard/apps/{slug}/domains/{domain}/doctor. Mirrors the
+// wire api.DomainDoctorReport shape (pkg/api/dto.go) so the
+// dashboard renders the same 5 checks the CLI's `gregale
+// domains doctor <domain>` prints. The handler is the
+// per-domain data source — see
+// cmd/apid/handlers_dashboard.go::renderDomainDoctor.
+//
+// Checks carries one row per Render-style probe (DNS record
+// found / points to Gregale / TLS certificate / CAA permits /
+// IPv6 conflict). Status is the closed enum {ok, fail, pending,
+// na} from pkg/api/dto.go::DomainDoctorCheck — the dashboard
+// uses the same vocabulary so the badge classes in
+// domain_doctor.html match the CLI's glyph table without a
+// mapping helper. Healthy is the "all checks OK" boolean the
+// doctor returns; Stale flips on when the observation row is
+// older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS and the handler
+// triggered a synchronous re-probe.
+type DomainDoctorView struct {
+	App        AppListItem
+	Domain     string
+	AppID      string
+	Healthy    bool
+	Stale      bool
+	ObservedAt string
+	Checks     []DashboardDoctorCheck
+}
+
+// DashboardDoctorCheck is one row of the DomainDoctorView.Cheks
+// slice — the dashboard-local mirror of pkg/api.DomainDoctorCheck.
+// The field set is the wire DTO verbatim (Name, Status, Detail,
+// Observed, Remediation, CheckedAt) so a future wire-DTO
+// regen can swap the type without rewriting the template.
+type DashboardDoctorCheck struct {
+	Name        string
+	Status      string
+	Detail      string
+	Observed    string
+	Remediation string
+	CheckedAt   string
+}
+
 // ScanPayload is the dashboard-local mirror of the per-deploy
 // grype scan payload. Status is the closed enum
 // {complete, failed, skipped, pending} — the dashboard reads

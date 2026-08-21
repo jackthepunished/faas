@@ -36,16 +36,23 @@ func TenantSurfacesEnabled() bool {
 // engine is live. Reads FAAS_DOMAIN_DOCTOR_ENABLED at every call
 // (mirrors TenantSurfacesEnabled — operator can flip the env var
 // and the next dns_poller tick picks it up without a daemon
-// bounce). Default off; the table + probes + endpoint are wired
-// but the poller branch + GET /v1/domains/{domain}/doctor are
-// gated until the operator sets the env var. ADR-120.
+// bounce). Default ON (post-ADR-120 Tier A3, after the dark-launch
+// soak window closed) — the table + probes + endpoint + dashboard
+// surface are wired and the dns_poller writes
+// domain_doctor_observations rows on every 30 s tick unless the
+// operator explicitly opts out. To disable, set the env var to one
+// of 0/false/no/off; an empty/unset env var leaves the doctor on.
+// The dns_poller (cmd/apid/dns_poller.go::emitDoctorSkip) bumps
+// apid_domain_doctor_skipped_flag_disabled_total on every tick
+// when the doctor is off so an explicit opt-out surfaces in
+// Alertmanager via FaasDomainDoctorDisabledByOperator (info).
 func DomainDoctorEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_ENABLED")))
 	switch v {
-	case "1", "true", "yes", "on":
-		return true
+	case "0", "false", "no", "off":
+		return false
 	}
-	return false
+	return true
 }
 
 // CertEngineWired reports whether the per-host cert engine has

@@ -43,6 +43,32 @@ func withTenantSurfacesEnabled(t *testing.T) {
 	t.Setenv("FAAS_TENANT_SURFACES_ENABLED", "true")
 }
 
+// withDomainDoctorEnabled (ADR-120 Tier A3) flips the
+// FAAS_DOMAIN_DOCTOR_ENABLED env var to "true" for the duration
+// of one test. Mirror of withTenantSurfacesEnabled — same test
+// pack pattern (default-on in production but tests flip
+// explicitly to a recognised on-token so the test reads as
+// opt-in). Post-Tier-A3 the env var's default is already on
+// (pkg/api/flags.go::DomainDoctorEnabled returns true when the
+// var is unset), but the explicit flip is kept here so a test
+// reads as deterministic against an explicit decision rather
+// than an implicit default.
+func withDomainDoctorEnabled(t *testing.T) {
+	t.Helper()
+	t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", "true")
+}
+
+// withDomainDoctorDisabled flips the FAAS_DOMAIN_DOCTOR_ENABLED
+// env var to an explicit-off token ("false") for the duration
+// of one test. Used to verify the doctor route returns 503
+// doctor_disabled when the operator opts out (the same
+// CodeDoctorDisabled path the JSON endpoint serves). Mirror
+// pattern to withDomainDoctorEnabled.
+func withDomainDoctorDisabled(t *testing.T) {
+	t.Helper()
+	t.Setenv("FAAS_DOMAIN_DOCTOR_ENABLED", "false")
+}
+
 // seedTenantSurface creates a tenant surface (no hostnames) on the
 // test account's seeded app and returns the surface ID. Mirrors
 // mustSeedApp's shape but for the tenant surface primitive.
