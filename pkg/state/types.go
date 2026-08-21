@@ -644,6 +644,16 @@ type App struct {
 	// __route_other__ overflow bound the cardinality regardless of
 	// the customer's traffic shape.
 	RouteMetricsEnabled bool
+	// AppProtocol (ADR-124) is the per-app wire-protocol
+	// selector stored on the apps row as text NOT NULL DEFAULT
+	// 'http1'. Closed set {http1, http2, grpc} enforced by
+	// apps_app_protocol_chk (migration 00347). Plan gate for
+	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
+	// not the SQL CHECK — every pre-existing app reads "http1"
+	// without a migration. The per-app transport-selection seam
+	// (x-faas-protocol header stamp at pkg/gateway/handler.go)
+	// reads this field via pgRouter.toApp.
+	AppProtocol string
 	// MaintenanceMode (ADR-091 amendment, PR-A #???) opts the
 	// whole app into 503 + Retry-After mode — the coarse primitive
 	// for "every route is in maintenance". When true, the gatewayd
@@ -2921,6 +2931,26 @@ type UpdateAppParams struct {
 	// that does not want the per-route cardinality on the box).
 	RouteMetricsEnabled    *bool
 	SetRouteMetricsEnabled bool
+	// AppProtocol (ADR-124) is the per-app wire-protocol
+	// selector stored on the apps row as text NOT NULL DEFAULT
+	// 'http1'. Closed set {http1, http2, grpc} enforced by
+	// apps_app_protocol_chk (migration 00347). Plan gate for
+	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
+	// not the SQL CHECK — every pre-existing app reads "http1"
+	// without a migration. The per-app transport-selection seam
+	// (x-faas-protocol header stamp at pkg/gateway/handler.go)
+	// reads this field via pgRouter.toApp.
+	//
+	// Pointer semantics mirror WebSocketEnabled: nil means "don't
+	// touch" (the SQL keeps the existing value via the
+	// `app_protocol = case when $N then $M else app_protocol end`
+	// pattern at pgstore.go::UpdateApp); non-nil writes the
+	// value verbatim. SetAppProtocol is the boolean that toggles
+	// the SET clause at UpdateApp time so a customer may PATCH
+	// back to "http1" explicitly (the schema's NOT NULL DEFAULT
+	// would otherwise mask the explicit-write intent).
+	AppProtocol    *string
+	SetAppProtocol bool
 	// MaintenanceMode (ADR-091 amendment) opts the whole app
 	// into 503 + Retry-After mode. SetMaintenanceMode
 	// distinguishes "unset" (don't touch) from "explicit false"
@@ -3126,6 +3156,20 @@ const (
 	AppPublicAuthModeBasic        = "basic"
 	AppPublicAuthModeIPAllowlist  = "ip_allowlist"
 	AppPublicAuthModeInternalOnly = "internal_only"
+)
+
+// AppProtocol values for the per-app wire-protocol selector
+// (ADR-124). Mirrors the app_protocol column default at the
+// SQL layer (NOT NULL DEFAULT 'http1' in migration 00347); the
+// Go-side constants exist so handlers, validators, and the
+// INSERT path can avoid hard-coded literals. The closed-set
+// vocabulary lives in pkg/api::api.AppProtocolClosedSet; these
+// constants are the canonical spellings used by the store
+// layer. Adding a fourth value requires a new ADR.
+const (
+	AppProtocolHTTP1 = "http1"
+	AppProtocolHTTP2 = "http2"
+	AppProtocolGRPC  = "grpc"
 )
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
