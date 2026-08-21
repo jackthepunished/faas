@@ -13216,7 +13216,12 @@ func (m *MemStore) ListMirrorResults(_ context.Context, ruleID string, since tim
 		if r.MirrorRuleID != ruleID {
 			continue
 		}
-		if !r.CompletedAt.Before(since) && !r.CompletedAt.Equal(since) {
+		// Boundary is INCLUSIVE (>=). Matches the PgStore SQL
+		// `completed_at >= $2` clause and the docstring contract
+		// on Store.ListMirrorResults. An operator polling with a
+		// previous row's CompletedAt as the new `since` must see
+		// that boundary row, not drop it.
+		if !r.CompletedAt.Before(since) {
 			out = append(out, r)
 		}
 	}

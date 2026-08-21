@@ -18100,14 +18100,29 @@ func scanMirrorRuleCols(scan func(...any) error) (MirrorRule, error) {
 func scanMirrorResult(scan func(...any) error) (MirrorInvocationResult, error) {
 	var r MirrorInvocationResult
 	var statusCode, sourceStatusCode, latencyMs, sourceLatencyMs *int
+	// instance_id / source_instance_id are nullable text columns
+	// (NULL when the mirror wake failed — the customer-facing POST
+	// returned a valid source response but the mirror VM never
+	// came up). Scan into *string helpers and dereference so pgx
+	// can return NULL cleanly; scanning into the non-pointer field
+	// crashes pgx v5 with "cannot scan NULL into *string" on the
+	// first failed-wake row, dropping the entire result set and
+	// 500-ing the customer-facing summary endpoint.
+	var instanceID, sourceInstanceID *string
 	if err := scan(
 		&r.ID, &r.MirrorRuleID, &r.AccountID, &r.AppID,
-		&r.SourceDeploymentID, &r.MirrorDeploymentID, &r.InstanceID, &r.SourceInstanceID,
+		&r.SourceDeploymentID, &r.MirrorDeploymentID, &instanceID, &sourceInstanceID,
 		&statusCode, &sourceStatusCode, &latencyMs, &sourceLatencyMs,
 		&r.BodyHash, &r.SourceBodyHash, &r.SchemaHash, &r.SourceSchemaHash,
 		&r.StatusDiff, &r.SchemaDiff, &r.BodyDiff, &r.Crashed, &r.RequestID, &r.CompletedAt,
 	); err != nil {
 		return MirrorInvocationResult{}, err
+	}
+	if instanceID != nil {
+		r.InstanceID = *instanceID
+	}
+	if sourceInstanceID != nil {
+		r.SourceInstanceID = *sourceInstanceID
 	}
 	if statusCode != nil {
 		r.StatusCode = *statusCode
@@ -18372,23 +18387,22 @@ func (s *PgStore) DeleteMirrorRule(ctx context.Context, id string) error {
 // customer-facing response. Status / latency / body / schema fields
 // are NULL when the mirror wake failed (the customer-facing POST
 // returned a valid source response, but the mirror never came up).
+//
+// NULL contract for the bytea columns (issue #72 / ADR-125): body_hash
+// and source_body_hash are NULL when the rule has include_body=false
+// (the safe-by-default posture — sensitive bodies are explicitly
+// opted in via per-rule). pgx v5 encodes a typed nil `[]byte(nil)` as
+// SQL NULL, but a coerced `[]byte{}` (empty non-nil) as a 0-length
+// bytea. We MUST preserve the typed-nil distinction so downstream
+// tooling (e.g. body_diff skip, schema-evolution audit) can use
+// the column's NULL state to honour include_body=false. Coercing
+// nil → []byte{} collapses "body intentionally not hashed" with
+// "body present but empty" — a silent contract violation.
 func (s *PgStore) InsertMirrorResult(ctx context.Context, r MirrorInvocationResult) error {
-	bodyHash := r.BodyHash
-	if bodyHash == nil {
-		bodyHash = []byte{}
-	}
+	bodyHash := r.BodyHash        // typed-nil preserved on insert
 	srcBodyHash := r.SourceBodyHash
-	if srcBodyHash == nil {
-		srcBodyHash = []byte{}
-	}
 	schemaHash := r.SchemaHash
-	if schemaHash == nil {
-		schemaHash = []byte{}
-	}
 	srcSchemaHash := r.SourceSchemaHash
-	if srcSchemaHash == nil {
-		srcSchemaHash = []byte{}
-	}
 	// Status/latency are nullable because the mirror wake can fail
 	// (StatusCode=0 → NULL), hence the pointer dance. Body/hash
 	// columns are the only other nullable fields.

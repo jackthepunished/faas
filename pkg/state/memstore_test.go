@@ -5725,5 +5725,112 @@ func TestMemStore_MirrorInvocationResults(t *testing.T) {
 // to MirrorRulePatch without `var x = true; patch.Enabled = &x` noise.
 func ptr[T any](v T) *T { return &v }
 
+// TestMemStore_InsertMirrorResult_PreservesByteaNil pins the
+// bytea-NULL contract (issue #72 / ADR-125). When the rule has
+// include_body=false (the safe-by-default posture), body_hash /
+// source_body_hash / schema_hash / source_schema_hash MUST be
+// stored as nil (typed-nil []byte in Go, SQL NULL in pg) — NOT as
+// []byte{} (empty non-nil). Coercing nil → []byte{} collapses
+// "body intentionally not hashed" with "body present but empty",
+// making the include_body flag invisible to downstream tooling
+// (body_diff skip, schema-evolution audit). PgStore used to do
+// this coercion; the test pins the MemStore side of the same
+// contract — both stores must round-trip nil as nil.
+func TestMemStore_InsertMirrorResult_PreservesByteaNil(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
+	limits := api.MustLimitsFor(api.PlanPro)
+	rule, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
+		AccountID: accID, AppID: appID,
+		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
+		Percent: 100, Enabled: true,
+	}, limits)
+	if err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	// Rule has include_body=false; consumer MUST NOT populate any
+	// of the bytea fields.
+	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
+		MirrorRuleID:       rule.ID,
+		AccountID:          accID,
+		AppID:              appID,
+		SourceDeploymentID: srcID,
+		MirrorDeploymentID: mirID,
+		StatusCode:         200,
+		SourceStatusCode:   200,
+		RequestID:          "nil-bytea",
+		CompletedAt:        time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	rows, err := m.ListMirrorResults(ctx, rule.ID, time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.BodyHash != nil {
+		t.Errorf("BodyHash = %v (len=%d), want nil", r.BodyHash, len(r.BodyHash))
+	}
+	if r.SourceBodyHash != nil {
+		t.Errorf("SourceBodyHash = %v, want nil", r.SourceBodyHash)
+	}
+	if r.SchemaHash != nil {
+		t.Errorf("SchemaHash = %v, want nil", r.SchemaHash)
+	}
+	if r.SourceSchemaHash != nil {
+		t.Errorf("SourceSchemaHash = %v, want nil", r.SourceSchemaHash)
+	}
+}
+
+// TestMemStore_ListMirrorResults_BoundaryIsInclusive pins the >=
+// boundary contract (issue #72 / ADR-125). MemStore previously
+// used strict `>` semantics via `!Before && !Equal`, which
+// silently dropped the row whose CompletedAt exactly equals
+// `since` — diverging from PgStore's `completed_at >= $2` SQL.
+// Operators polling with a previous row's CompletedAt as the new
+// `since` must see that boundary row.
+func TestMemStore_ListMirrorResults_BoundaryIsInclusive(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
+	limits := api.MustLimitsFor(api.PlanPro)
+	rule, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
+		AccountID: accID, AppID: appID,
+		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
+		Percent: 100, Enabled: true,
+	}, limits)
+	if err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	boundary := time.Now().UTC()
+	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
+		MirrorRuleID:       rule.ID,
+		AccountID:          accID,
+		AppID:              appID,
+		SourceDeploymentID: srcID,
+		MirrorDeploymentID: mirID,
+		StatusCode:         200,
+		SourceStatusCode:   200,
+		RequestID:          "boundary-row",
+		CompletedAt:        boundary,
+	}); err != nil {
+		t.Fatalf("insert boundary: %v", err)
+	}
+	rows, err := m.ListMirrorResults(ctx, rule.ID, boundary, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (boundary row must be included)", len(rows))
+	}
+	if rows[0].RequestID != "boundary-row" {
+		t.Fatalf("first row = %s, want boundary-row", rows[0].RequestID)
+	}
+}
+
 // --- End of mirror tests -------------------------------------------------
 
