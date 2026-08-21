@@ -346,14 +346,9 @@ func (t *Tarball) Extract(root string) error {
 	}
 	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
+	allowedEntries := trustedArchiveEntries(t.Manifest)
 
 	for {
-		// codeql[go/zipslip] — tr.Next() returns the archive header whose
-		// Name is used below; SafeArchiveRelativeName rejects absolute and
-		// traversal paths before filepath.Join, and the post-join checks
-		// reject symlink escapes before any write. Keep the suppression at
-		// the source call site because CodeQL does not infer this local
-		// sanitizer as a taint barrier.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -373,15 +368,15 @@ func (t *Tarball) Extract(root string) error {
 			// attacker-sized metadata payload into io.Discard here.
 			continue
 		}
-		// Validate the complete archive name through the explicit
-		// SafeArchiveRelativeName barrier before it reaches any filesystem
-		// operation. Keep nested relative paths intact: runtime assets live
-		// at runners/<runtime>/faas-runner and must not collapse to one
-		// shared basename. Keeping this as one direct sanitizer call also
-		// lets CodeQL prove the tainted tar header cannot reach the sink.
-		safe, sErr := SafeArchiveRelativeName(hdr.Name)
-		if sErr != nil {
-			return fmt.Errorf("%w: %w", ErrTarballTampered, sErr)
+		// Never use the archive-controlled name as a filesystem path. The
+		// manifest has already been validated against the fixed daemon,
+		// support-binary, and runtime-asset catalogs; use only the matching
+		// trusted value from that allowlist. This also rejects traversal,
+		// absolute, symlink-shaped, and otherwise unexpected entries before
+		// filepath.Join or any write operation.
+		safe, ok := allowedEntries[hdr.Name]
+		if !ok {
+			return fmt.Errorf("%w: unexpected archive entry %q", ErrTarballTampered, hdr.Name)
 		}
 		// Post-join containment defence: reject a pre-existing
 		// symlinked bin directory and ensure every nested parent
@@ -425,6 +420,27 @@ func (t *Tarball) Extract(root string) error {
 		}
 	}
 	return nil
+}
+
+// trustedArchiveEntries returns the only archive names Extract may write.
+// Values are copied from the validated release catalog and manifest rather
+// than from tar headers, so the archive cannot taint a filesystem path even
+// when it contains an unexpected or malicious entry name.
+func trustedArchiveEntries(m Manifest) map[string]string {
+	entries := make(map[string]string, len(m.DaemonHashes)+len(m.ToolHashes)+len(m.AssetHashes)+len(manifest.SortedHostKeys()))
+	for _, logical := range manifest.SortedHostKeys() {
+		entries[logical] = logical
+		if canonical := executableName(logical); canonical != logical {
+			entries[canonical] = canonical
+		}
+	}
+	for name := range m.ToolHashes {
+		entries[name] = name
+	}
+	for name := range m.AssetHashes {
+		entries[name] = name
+	}
+	return entries
 }
 
 // ReadManifest re-loads the per-release manifest at
