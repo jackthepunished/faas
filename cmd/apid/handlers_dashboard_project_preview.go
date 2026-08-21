@@ -481,7 +481,13 @@ func previewSlugOK(slug string) bool {
 		return false
 	}
 	for _, r := range slug {
-		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' {
+		// De Morgan'd from the literal "if not lowercase and not
+		// digit and not dash" so QF1001 (staticcheck) stays clean.
+		// Equivalent: reject any rune outside [a-z0-9-].
+		isLower := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		isDash := r == '-'
+		if !isLower && !isDigit && !isDash {
 			return false
 		}
 	}

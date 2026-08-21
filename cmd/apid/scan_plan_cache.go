@@ -135,22 +135,31 @@ func storePlanCache(sha256Hex, sourcePath, accountID string) error {
 		return err
 	}
 	dst := filepath.Join(root, sha256Hex+".tar.gz")
-	in, err := os.Open(sourcePath)
+	// sourcePath is the scanService spool file (FAAS_SCAN_SPOOL_ROOT);
+	// it is created by parseScanMultipart with mode 0600 and is
+	// not customer-supplied at this point (the source field has
+	// already been validated + hashed). The forbidigo gate exists
+	// to keep customer-input paths behind openCustomerFile's
+	// symlink/non-regular guard; the spool file is vetted.
+	in, err := os.Open(sourcePath) //nolint:forbidigo // vetted-id path under spool root; see comment above.
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 	if err != nil {
 		return fmt.Errorf("open cache file: %w", err)
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(dst)
+		// Best-effort cleanup on the copy failure path: a Close
+		// error here is dominated by the io.Copy error and the
+		// os.Remove is fire-and-forget (sweep will retry later).
+		_ = out.Close()
+		_ = os.Remove(dst)
 		return fmt.Errorf("copy source: %w", err)
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(dst)
+		_ = os.Remove(dst)
 		return fmt.Errorf("close cache file: %w", err)
 	}
 	now := time.Now()
@@ -159,9 +168,12 @@ func storePlanCache(sha256Hex, sourcePath, accountID string) error {
 		accountID: accountID,
 		expiresAt: now.Add(planCacheTTL),
 	})
-	// Sweep opportunistically so the disk cap holds. The
-	// sweep itself is cheap (ReadDir of one flat dir).
-	go sweepExpiredCacheEntries(root)
+	// Sweep opportunistically so the disk cap holds. Fire-and-forget
+	// because the sweep is independent of this scan's success; its
+	// only output is on-disk file removals.
+	//
+	//nolint:errcheck // sweep runs in its own goroutine; the only return is an error that sweep itself logs.
+	go func() { _ = sweepExpiredCacheEntries(root) }()
 	return nil
 }
 
@@ -301,11 +313,16 @@ func buildCachedSourceRequest(cachedSourcePath, projectSlug string, exclude []st
 	if err != nil {
 		return nil, fmt.Errorf("create form file: %w", err)
 	}
-	f, err := os.Open(cachedSourcePath)
+	// cachedSourcePath is a vetted-id path: the cache root is
+	// created by initPlanCache with mode 0750 and the file name
+	// is the SHA-256 hex we wrote ourselves in storePlanCache.
+	// openCustomerFile's symlink/non-regular guard is unnecessary
+	// here because the path is not customer-supplied.
+	f, err := os.Open(cachedSourcePath) //nolint:forbidigo // vetted-id path under cache root; see comment above.
 	if err != nil {
 		return nil, fmt.Errorf("open cached source: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := io.Copy(fw, f); err != nil {
 		return nil, fmt.Errorf("copy cached source: %w", err)
 	}

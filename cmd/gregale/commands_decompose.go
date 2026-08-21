@@ -387,6 +387,12 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 // the operator excluded — the row gets a " [excluded locally]" tag
 // so the reader can spot operator overrides without re-running the
 // scan.
+//
+// Fprintln at the tab stop is no different from a panic mid-row for the
+// operator — both surface as malformed output and the CLI exits non-zero
+// on the JSON-parse path below (mirrors printPlanText above).
+//
+//nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
 func printAffectedText(w io.Writer, plan api.PlanResponse, excludedSlugs map[string]bool) {
 	wds := append([]api.PlanAffectedApp(nil), plan.WillDeploy...)
 	sort.Slice(wds, func(i, j int) bool { return wds[i].Slug < wds[j].Slug })
@@ -449,6 +455,9 @@ func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []s
 	} else if n := len(plan.Workloads); n > 0 {
 		prompt = fmt.Sprintf("\nApply %d workload(s)? [y/N] ", n)
 	}
+	//nolint:errcheck // prompt write mirrors the Fprintln above; if the
+	// prompt fails to flush the subsequent scanner.Scan() will also fail
+	// (broken pipe surfaces as EOF) and the function returns false.
 	fmt.Fprint(w, prompt)
 	scanner := bufio.NewScanner(r)
 	if !scanner.Scan() {

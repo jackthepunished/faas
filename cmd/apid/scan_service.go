@@ -173,11 +173,6 @@ type affectedPartition struct {
 	// Visible on the dashboard as "excluded by operator". Action
 	// is always "noop" — the apply path skips these entirely.
 	Skipped []api.PlanAffectedApp
-	// removedKey is the (RootDir, Name) set the apply path will
-	// SoftDeleteAppCascade. Populated from rec.Removed post-reconcile
-	// so the preview/apply gap stays small. Used in Stage 4 to
-	// re-render WillDeploy entries whose operator --exclude is set.
-	removedKey map[workloadKey]struct{}
 }
 
 // computeAffectedPartition partitions the post-`--only` filtered scan
