@@ -28,7 +28,11 @@ type ScheddClient interface {
 	// preview scope (`pr-{N}`) forwarded from the gateway's
 	// Host-header parse. Empty = prod (legacy single-deployment
 	// behaviour). Threaded through schedd's AdmitInstanceRequest.
-	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
+	//
+	// trigger (ADR-127): wake-boot trigger enum value forwarded to
+	// schedd's AdmitInstanceRequest.Trigger wire field and stamped
+	// on the emitted wake.boot_started / wake.boot_completed events.
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
 	// Wake (issue #556 / PR-C): deploymentID is the optional
 	// per-deployment wake hint forwarded to schedd. Empty falls
 	// through to the newest live deployment. Return tuple gains
@@ -42,7 +46,7 @@ type ScheddClient interface {
 	// one virtual boot; followers see the leader's outcome. Pre-ADR-098
 	// callers continue to use Wake / AdmitInstance on the legacy wire —
 	// this method is additive per ADR-016.
-	EnsureWake(ctx context.Context, appID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
+	EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
 	// StreamAppLogs (issue #309 / tier-2 DX): level + grep are
@@ -170,8 +174,8 @@ func (c *Client) Wake(ctx context.Context, appID, deploymentID, scope string) (i
 // (wake-fan-out path); empty falls through to the newest live
 // deployment (legacy single-deployment path). Additive per
 // ADR-016.
-func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error) {
-	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID, DeploymentId: deploymentID, Scope: scope})
+func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error) {
+	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID, DeploymentId: deploymentID, Scope: scope, Trigger: trigger})
 	if err != nil {
 		return "", "", "", "", 0, false, 0, liftErr(err)
 	}
@@ -183,8 +187,11 @@ func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID, scope s
 // EnsureWake for the same app into one virtual boot; followers see the
 // leader's outcome. Pre-ADR-098 callers continue to use Wake / AdmitInstance
 // on the legacy wire — this method is additive per ADR-016.
-func (c *Client) EnsureWake(ctx context.Context, appID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error) {
-	resp, err := c.cli.EnsureWake(ctx, &scheddpb.EnsureWakeRequest{AppId: appID})
+//
+// trigger (ADR-127): forwarded to the leader's Engine.Wake call and
+// stamped on the emitted wake.boot_started / wake.boot_completed events.
+func (c *Client) EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error) {
+	resp, err := c.cli.EnsureWake(ctx, &scheddpb.EnsureWakeRequest{AppId: appID, Trigger: trigger})
 	if err != nil {
 		return "", "", "", "", 0, 0, liftErr(err)
 	}

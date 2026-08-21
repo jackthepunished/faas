@@ -10,7 +10,7 @@ import (
 
 func TestFakeSchedulerAdmitInstance(t *testing.T) {
 	s := NewFakeScheduler("node-fake-1").WithInstanceID("i-7").WithWakeID("w-9")
-	instanceID, nodeID, _, wakeID, method, atCap, port, err := s.AdmitInstance(context.Background(), "app-1", "", "")
+	instanceID, nodeID, _, wakeID, method, atCap, port, err := s.AdmitInstance(context.Background(), "app-1", "", "", "")
 	if err != nil {
 		t.Fatalf("AdmitInstance err = %v", err)
 	}
@@ -47,7 +47,7 @@ func TestFakeSchedulerMintsFreshInstanceID(t *testing.T) {
 	s := NewFakeScheduler("node-fake-1")
 	ids := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		id, _, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1", "", "")
+		id, _, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1", "", "", "")
 		if err != nil {
 			t.Fatalf("AdmitInstance: %v", err)
 		}
@@ -61,14 +61,14 @@ func TestFakeSchedulerMintsFreshInstanceID(t *testing.T) {
 func TestFakeSchedulerWithErr(t *testing.T) {
 	want := errors.New("boom")
 	s := NewFakeScheduler("node-fake-1").WithErr(want)
-	_, _, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1", "", "")
+	_, _, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1", "", "", "")
 	if !errors.Is(err, want) {
 		t.Errorf("err = %v, want %v", err, want)
 	}
 }
 
 func TestNoopSchedulerReturnsUnconfigured(t *testing.T) {
-	_, _, _, _, _, _, _, err := NoopScheduler{}.AdmitInstance(context.Background(), "app-1", "", "")
+	_, _, _, _, _, _, _, err := NoopScheduler{}.AdmitInstance(context.Background(), "app-1", "", "", "")
 	if !errors.Is(err, ErrSchedulerUnconfigured) {
 		t.Errorf("err = %v, want ErrSchedulerUnconfigured", err)
 	}

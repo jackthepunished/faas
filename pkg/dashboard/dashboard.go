@@ -615,12 +615,23 @@ type AppMetricsView struct {
 
 // RecentInstanceItem is one row of the Recent Wakes table on the
 // dashboard app-detail page.
+//
+// ADR-123: Trigger / QueuedCount / ConcurrencyAtAdmit surface
+// the wake-boot telemetry from the jsonb `events.data` payload.
+// Source: LEFT JOIN LATERAL against the first wake.boot_started
+// event for the wake_id (gated by the existing events_wake_id_idx
+// partial index from migration 00114). Empty/zero values are
+// rendered as em-dash per the existing convention for absent
+// fields — pre-ADR-123 fleet rows have no wake.boot_started yet.
 type RecentInstanceItem struct {
-	ID            string // instance row PK (stable across wakes)
-	WakeID        string // per-wake UUIDv7; distinct from ID
-	State         string // wire vocabulary; the template badge maps parked → sleeping
-	StartedAt     string // empty when not yet started
-	LastRequestAt string // empty when no traffic yet
+	ID                 string // instance row PK (stable across wakes)
+	WakeID             string // per-wake UUIDv7; distinct from ID
+	State              string // wire vocabulary; the template badge maps parked → sleeping
+	StartedAt          string // empty when not yet started
+	LastRequestAt      string // empty when no traffic yet
+	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
+	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
+	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 = cold start
 }
 
 // UsageData is the /dashboard/usage page payload.

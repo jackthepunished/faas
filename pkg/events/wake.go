@@ -264,28 +264,69 @@ func (e Admitted) Payload() map[string]any {
 // wake method (WAKE_RESTORE / WAKE_COLD_BOOT) as a string so the
 // payload is self-describing without dragging the protobuf package
 // into the wire shape.
+//
+// ADR-123 adds three fields so the wake timeline answers "why did
+// this wake happen, what was queueing, what was the per-app
+// concurrency?" without joining the legacy cron.fired / floor.wake
+// audit rows.
+//
+//   - Trigger is the closed enum (see pkg/sched/triggers.go) for the
+//     caller that drove the wake — "gateway" for a request-driven
+//     cold-boot, "floor" for the per-app floor tick, etc. Empty on
+//     the Phase-1 fast-path return where an existing RUNNING
+//     instance was reused (the trigger field on the *original* boot
+//     row stays; this row's Payload() omits the "trigger" key
+//     because the row itself is not the row the customer timeline
+//     surfaces).
+//
+//   - QueuedCount is the wake queue depth at admit time. Schedd
+//     reads it off e.ledger.Concurrency(app.ID) just before the
+//     admit gate runs (the same reading the gate consults). The
+//     gateway-initiated path (Trigger == "gateway") also uses this
+//     schedd-side value, NOT WakeGate.InflightWaiters — see ADR-123
+//     §"Decision 2" for the rationale (the gateway-side count
+//     reflects "currently-waiting request count" not
+//     "siblings-admitted").
+//
+//   - ConcurrencyAtAdmit is the same ledger.Concurrency reading, so
+//     a downstream reader does not need to know which trigger path
+//     was used to source the value. Always populated (0 is the cold
+//     start case).
 type BootStarted struct {
-	EmitAt      time.Time
-	WakeID      string
-	AppID       string
-	InstanceID  string
-	NodeID      string
-	Method      string
-	RequestedAt time.Time
+	EmitAt             time.Time
+	WakeID             string
+	AppID              string
+	InstanceID         string
+	NodeID             string
+	Method             string
+	RequestedAt        time.Time
+	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
+	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
+	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 is cold start
 }
 
 func (e BootStarted) Kind() string     { return WakeBootStarted }
 func (e BootStarted) At() time.Time    { return e.EmitAt }
 func (e BootStarted) Subject() *string { return nil }
 func (e BootStarted) Payload() map[string]any {
-	return map[string]any{
-		"wake_id":      e.WakeID,
-		"app_id":       e.AppID,
-		"instance_id":  e.InstanceID,
-		"node_id":      e.NodeID,
-		"method":       e.Method,
-		"requested_at": e.RequestedAt.UTC(),
+	p := map[string]any{
+		"wake_id":              e.WakeID,
+		"app_id":               e.AppID,
+		"instance_id":          e.InstanceID,
+		"node_id":              e.NodeID,
+		"method":               e.Method,
+		"requested_at":         e.RequestedAt.UTC(),
+		"queued_count":         e.QueuedCount,
+		"concurrency_at_admit": e.ConcurrencyAtAdmit,
 	}
+	// ADR-123: trigger is absent on the Phase-1 fast-path return
+	// (engine.go:1119) where an existing RUNNING instance was reused
+	// — the original boot row's events.data carries the value, this
+	// row is omitted from the customer-facing timeline anyway.
+	if e.Trigger != "" {
+		p["trigger"] = e.Trigger
+	}
+	return p
 }
 
 // BootCompleted — schedd post-RecordRuntime. Distinct from the
@@ -293,30 +334,45 @@ func (e BootStarted) Payload() map[string]any {
 // request lands; this row fires when the instance enters RUNNING,
 // so the wake timeline is correct even on apps that never receive
 // a request.
+//
+// ADR-123 — same trigger / queued_count / concurrency_at_admit
+// fields as BootStarted (carried via bootInput which is immutable
+// across the unlocked Phase 3 window, so both rows carry the same
+// snapshot). The customer's "wake timeline" surfaces these three
+// fields identically on both rows.
 type BootCompleted struct {
-	EmitAt      time.Time
-	WakeID      string
-	AppID       string
-	InstanceID  string
-	NodeID      string
-	Method      string
-	StartedAt   time.Time
-	CompletedAt time.Time
+	EmitAt             time.Time
+	WakeID             string
+	AppID              string
+	InstanceID         string
+	NodeID             string
+	Method             string
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
+	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
+	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 is cold start
 }
 
 func (e BootCompleted) Kind() string     { return WakeBootCompleted }
 func (e BootCompleted) At() time.Time    { return e.EmitAt }
 func (e BootCompleted) Subject() *string { return nil }
 func (e BootCompleted) Payload() map[string]any {
-	return map[string]any{
-		"wake_id":      e.WakeID,
-		"app_id":       e.AppID,
-		"instance_id":  e.InstanceID,
-		"node_id":      e.NodeID,
-		"method":       e.Method,
-		"started_at":   e.StartedAt.UTC(),
-		"completed_at": e.CompletedAt.UTC(),
+	p := map[string]any{
+		"wake_id":              e.WakeID,
+		"app_id":               e.AppID,
+		"instance_id":          e.InstanceID,
+		"node_id":              e.NodeID,
+		"method":               e.Method,
+		"started_at":           e.StartedAt.UTC(),
+		"completed_at":         e.CompletedAt.UTC(),
+		"queued_count":         e.QueuedCount,
+		"concurrency_at_admit": e.ConcurrencyAtAdmit,
 	}
+	if e.Trigger != "" {
+		p["trigger"] = e.Trigger
+	}
+	return p
 }
 
 // BootFailed — boot path failed. The reason string is the same

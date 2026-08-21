@@ -21,8 +21,8 @@ func TestWakeEvent_AllKindsImplementInterface(t *testing.T) {
 	// compile.
 	var _ WakeEvent = QueueAccepted{EmitAt: now, WakeID: "w", AppID: "a", RequestID: "r"}
 	var _ WakeEvent = Admitted{EmitAt: now, WakeID: "w", AppID: "a", RequestID: "r", AccountID: "acct-1", Plan: "hobby"}
-	var _ WakeEvent = BootStarted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot"}
-	var _ WakeEvent = BootCompleted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot"}
+	var _ WakeEvent = BootStarted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Trigger: "gateway", QueuedCount: 2, ConcurrencyAtAdmit: 3}
+	var _ WakeEvent = BootCompleted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Trigger: "gateway", QueuedCount: 2, ConcurrencyAtAdmit: 3}
 	var _ WakeEvent = BootFailed{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Reason: "stub"}
 	var _ WakeEvent = Readiness200{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", HealthcheckPath: "/healthz", ProbeCount: 1, ElapsedMs: 50}
 	var _ WakeEvent = ProxyFirstByte{EmitAt: now, WakeID: "w", AppID: "a", RequestID: "r", InstanceID: "i", NodeID: "n", LatencyMs: 12}
@@ -154,5 +154,76 @@ func TestSidecarRestart_Shape(t *testing.T) {
 	}
 	if got := ev.Payload()["previous_exit_code"]; got != 137 {
 		t.Errorf("payload.previous_exit_code = %v, want 137", got)
+	}
+}
+
+// TestBootStarted_Shape_IncludesNewFields — ADR-123. The new
+// trigger / queued_count / concurrency_at_admit fields must surface
+// in the payload so the wake timeline endpoint and dashboard see
+// them. A typo on any of the three JSON keys would silently break
+// the dashboard JOIN (`e.data->>'trigger'`) — catch it here.
+func TestBootStarted_Shape_IncludesNewFields(t *testing.T) {
+	ev := BootStarted{
+		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
+		InstanceID: "i-1", NodeID: "n-1", Method: "cold_boot",
+		Trigger: "gateway", QueuedCount: 8, ConcurrencyAtAdmit: 2,
+	}
+	p := ev.Payload()
+	if got := p["trigger"]; got != "gateway" {
+		t.Errorf("payload.trigger = %v, want gateway", got)
+	}
+	if got := p["queued_count"]; got != 8 {
+		t.Errorf("payload.queued_count = %v, want 8", got)
+	}
+	if got := p["concurrency_at_admit"]; got != 2 {
+		t.Errorf("payload.concurrency_at_admit = %v, want 2", got)
+	}
+	if got := p["method"]; got != "cold_boot" {
+		t.Errorf("payload.method = %v, want cold_boot (existing field regression)", got)
+	}
+}
+
+// TestBootStarted_BackCompat_OldLiteralStillEmitsValidPayload —
+// ADR-123 backward-compat. A literal constructed without the new
+// fields (the Phase-1 fast-path return at engine.go:1119, where
+// the trigger is "" because the row is not the customer-facing one)
+// must still emit a valid payload: trigger key absent, but
+// queued_count + concurrency_at_admit present (as 0, the cold start
+// case). Mirrors the `TestQueueAccepted_Shape` rejection-guard
+// pattern for `queue_wait_ms`.
+func TestBootStarted_BackCompat_OldLiteralStillEmitsValidPayload(t *testing.T) {
+	ev := BootStarted{EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1"}
+	p := ev.Payload()
+	if _, present := p["trigger"]; present {
+		t.Errorf("payload.trigger must be absent when Trigger is \"\" (Phase-1 fast-path)")
+	}
+	if got, ok := p["queued_count"]; !ok || got != 0 {
+		t.Errorf("payload.queued_count = %v (ok=%v), want 0 (zero-value, present)", got, ok)
+	}
+	if got, ok := p["concurrency_at_admit"]; !ok || got != 0 {
+		t.Errorf("payload.concurrency_at_admit = %v (ok=%v), want 0 (zero-value, present)", got, ok)
+	}
+}
+
+// TestBootCompleted_Shape_IncludesNewFields — ADR-123. Mirror of
+// TestBootStarted_Shape_IncludesNewFields; both rows carry the same
+// snapshot so the customer timeline can join them on wake_id and
+// see identical trigger / queued / concurrency values.
+func TestBootCompleted_Shape_IncludesNewFields(t *testing.T) {
+	ev := BootCompleted{
+		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
+		InstanceID: "i-1", NodeID: "n-1", Method: "cold_boot",
+		StartedAt: time.Unix(0, 0).UTC(), CompletedAt: time.Unix(1, 0).UTC(),
+		Trigger: "cron.schedule", QueuedCount: 0, ConcurrencyAtAdmit: 1,
+	}
+	p := ev.Payload()
+	if got := p["trigger"]; got != "cron.schedule" {
+		t.Errorf("payload.trigger = %v, want cron.schedule", got)
+	}
+	if got := p["queued_count"]; got != 0 {
+		t.Errorf("payload.queued_count = %v, want 0 (cold start case)", got)
+	}
+	if got := p["concurrency_at_admit"]; got != 1 {
+		t.Errorf("payload.concurrency_at_admit = %v, want 1", got)
 	}
 }

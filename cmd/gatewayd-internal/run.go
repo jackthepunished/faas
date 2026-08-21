@@ -62,6 +62,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/role"
+	schedpkg "github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -998,7 +999,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			instanceID, nodeID, deploymentID, wakeID, _, atCapacity, port, err := cli.AdmitInstance(ctx, appID, "", "")
+			instanceID, nodeID, deploymentID, wakeID, _, atCapacity, port, err := cli.AdmitInstance(ctx, appID, "", "", schedpkg.TriggerGateway)
 			if err == nil && !atCapacity {
 				backend.RecordTarget(appID, gateway.Target{
 					InstanceID:   instanceID,
@@ -2382,7 +2383,7 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
 func (unwiredBackend) HealthyCount(string) int        { return 0 }
-func (unwiredBackend) Admit(context.Context, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Admit(context.Context, string, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 

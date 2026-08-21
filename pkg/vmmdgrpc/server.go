@@ -253,18 +253,29 @@ func (s *Server) emitBootStartedMirror(ctx context.Context, instanceID, method s
 	if s.events == nil {
 		return
 	}
-	var wakeID, appID string
+	var wakeID, appID, trigger string
+	var queued, conc int
 	if fields, ok := wire.FromContext(ctx); ok {
 		wakeID = fields.WakeID
 		appID = fields.AppID
+		// ADR-123 — schedd propagates the wake-boot telemetry
+		// envelope so the mirror carries the same trigger /
+		// queue / concurrency context as the canonical schedd
+		// emit. Pre-ADR-123 schedd peers leave these empty.
+		trigger = fields.Trigger
+		queued = fields.QueuedCount
+		conc = fields.ConcurrencyAtAdmit
 	}
 	s.events.Emit(ctx, events.BootStarted{
-		EmitAt:      time.Now().UTC(),
-		WakeID:      wakeID,
-		AppID:       appID,
-		InstanceID:  instanceID,
-		Method:      method,
-		RequestedAt: time.Now().UTC(), // best-effort stamp (vmmd doesn't have schedd's startedAt)
+		EmitAt:             time.Now().UTC(),
+		WakeID:             wakeID,
+		AppID:              appID,
+		InstanceID:         instanceID,
+		Method:             method,
+		RequestedAt:        time.Now().UTC(), // best-effort stamp (vmmd doesn't have schedd's startedAt)
+		Trigger:            trigger,
+		QueuedCount:        queued,
+		ConcurrencyAtAdmit: conc,
 	})
 }
 

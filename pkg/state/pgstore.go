@@ -10359,6 +10359,49 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 	return out, rows.Err()
 }
 
+// LookupBootStartedForWakes (ADR-123) returns the wake-boot telemetry
+// for each wake_id in the input slice, indexed by wake_id. One SQL
+// round-trip via the events_wake_id_idx jsonb expression index
+// (migrations/00114_events_wake_id_idx.sql) — DISTINCT ON picks the
+// earliest wake.boot_started row per wake_id so a re-wake that emits
+// a second boot_started still maps to the original cause. Empty map
+// when no rows match (pre-ADR-123 fleet or a wake_id mismatch).
+// Nil/empty input returns an empty map without touching the pool.
+func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []string) (map[string]WakeBootMeta, error) {
+	if len(wakeIDs) == 0 {
+		return map[string]WakeBootMeta{}, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT ON (data->>'wake_id')
+		        data->>'wake_id'             AS wake_id,
+		        data->>'trigger'             AS trigger,
+		        (data->>'queued_count')::int        AS queued_count,
+		        (data->>'concurrency_at_admit')::int AS concurrency_at_admit
+		 FROM events
+		 WHERE kind = 'wake.boot_started'
+		   AND data->>'wake_id' = ANY($1)
+		 ORDER BY data->>'wake_id', at ASC`,
+		wakeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("LookupBootStartedForWakes: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]WakeBootMeta, len(wakeIDs))
+	for rows.Next() {
+		var wakeID string
+		var meta WakeBootMeta
+		var trigger *string
+		if err := rows.Scan(&wakeID, &trigger, &meta.QueuedCount, &meta.ConcurrencyAtAdmit); err != nil {
+			return nil, fmt.Errorf("LookupBootStartedForWakes: scan: %w", err)
+		}
+		if trigger != nil {
+			meta.Trigger = *trigger
+		}
+		out[wakeID] = meta
+	}
+	return out, rows.Err()
+}
+
 // ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
 // backend's read-side query for the live events table. Mirrors the
 // SQL in pkg/state/queries.sql::ListAllEventsPaged; the raw-SQL

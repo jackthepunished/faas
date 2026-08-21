@@ -25,6 +25,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -471,7 +472,15 @@ type Backend interface {
 	// path wakeID is empty, method is WakeMethodUnspecified,
 	// and err is nil. On real failure err is a non-nil
 	// *api.Problem and method is WakeMethodUnspecified.
-	Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	// trigger (ADR-127): wake-boot trigger enum value forwarded to
+	// schedd so the emitted wake.boot_started / wake.boot_completed
+	// events stamp "gateway". Other triggers (cron, floor, etc.)
+	// have their own Backend wrappers or wire RPCs; this surface
+	// is the gateway-driven admit path so the trigger is always
+	// "gateway". Kept as a parameter (rather than hard-coded) so
+	// future caller surfaces (synth handler, replay worker) can
+	// pass a distinct closed-enum value without breaking the wire.
+	Admit(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -4959,7 +4968,7 @@ haveApp:
 	// that re-seeds the cache.
 	if !pick.OK && pick.ColdBucket != "" {
 		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
-		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, app.Scope, limits.MaxConcurrency); err != nil {
+		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, app.Scope, sched.TriggerGateway, limits.MaxConcurrency); err != nil {
 			// Log-and-continue: the existing "warmest bucket"
 			// fallback inside Pick already handled the
 			// fallback path. Failure here means the cold
@@ -6103,7 +6112,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID, scope string, maxCo
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
 		if e != nil {
 			return false, "", WakeMethodUnspecified, e
 		}
@@ -6130,7 +6139,7 @@ func (h *Handler) coldStart(ctx context.Context, appID, scope string, maxConcurr
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
 			if e != nil {
 				return e
 			}

@@ -457,6 +457,24 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		log.Warn("dashboard renderAppDetail: list recent instances", "account_id", acct.ID, "app_id", app.ID, "err", err)
 		recentInstances = nil
 	}
+	// ADR-123: batched lookup of the wake-boot telemetry for every
+	// recent wake_id in one SQL round-trip (uses events_wake_id_idx).
+	// Failure is non-fatal — pre-ADR-123 fleet or a transient Postgres
+	// blip on the events table just leaves the new columns blank.
+	wakeIDs := make([]string, 0, len(recentInstances))
+	for _, ins := range recentInstances {
+		if ins.WakeID != "" {
+			wakeIDs = append(wakeIDs, ins.WakeID)
+		}
+	}
+	bootMetas := make(map[string]state.WakeBootMeta)
+	if len(wakeIDs) > 0 {
+		if m, err := s.store.LookupBootStartedForWakes(ctx, wakeIDs); err == nil {
+			bootMetas = m
+		} else {
+			log.Warn("dashboard renderAppDetail: lookup boot started", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		}
+	}
 	recentItems := make([]dashboard.RecentInstanceItem, 0, len(recentInstances))
 	for _, ins := range recentInstances {
 		item := dashboard.RecentInstanceItem{
@@ -469,6 +487,15 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		}
 		if !ins.LastRequestAt.IsZero() {
 			item.LastRequestAt = ins.LastRequestAt.UTC().Format(time.RFC3339)
+		}
+		// ADR-123: stamp trigger / queued_count / concurrency_at_admit
+		// from the wake.boot_started event row. Pre-ADR-123 rows have
+		// no event row, so the fields stay zero/empty — the template
+		// renders an em-dash in that case (existing convention).
+		if meta, ok := bootMetas[ins.WakeID]; ok {
+			item.Trigger = meta.Trigger
+			item.QueuedCount = meta.QueuedCount
+			item.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
 		}
 		recentItems = append(recentItems, item)
 	}

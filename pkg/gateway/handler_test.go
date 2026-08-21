@@ -133,7 +133,7 @@ func (b *fakeBackend) HealthyCount(_ string) int {
 	return 0
 }
 
-func (b *fakeBackend) Admit(_ context.Context, _, _, _ string, maxConcurrency int) (string, WakeMethod, bool, error) {
+func (b *fakeBackend) Admit(_ context.Context, _, _, _, _ string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Issue #168 fan-out invariant: the HealthyCount + addTarget pair
 	// must be serialized. The fakeBackend takes b.mu for the whole
 	// call so concurrent Admit callers cannot collectively exceed

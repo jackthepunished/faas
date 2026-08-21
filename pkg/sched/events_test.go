@@ -48,7 +48,7 @@ func TestEngineTransition_AppendsEvent(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(wire.NewOpsMetrics("schedd"))
 
-	res, err := engine.Wake(context.Background(), app.ID, "", "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestEngineTransition_EventWriteFailureDoesNotRollback(t *testing.T) {
 	ops := wire.NewOpsMetrics("schedd")
 	engine := newEngine(t, wrapped, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
 
-	res, err := engine.Wake(context.Background(), app.ID, "", "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
 	if err != nil {
 		t.Fatalf("Wake returned err (must succeed despite audit failure): %v", err)
 	}
@@ -174,7 +174,7 @@ func TestEngineWake_FailedBoot_AppendsWakeBootError(t *testing.T) {
 	vmm := &fakeVMM{wakeErr: errBoom}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(wire.NewOpsMetrics("schedd"))
 
-	_, err := engine.Wake(context.Background(), app.ID, "", "")
+	_, err := engine.Wake(context.Background(), app.ID, "", "", "")
 	if err == nil {
 		t.Fatal("expected Wake to fail (vmm.wakeErr set)")
 	}
@@ -219,7 +219,7 @@ func TestEnginePark_SnapshotFail_AppendsParkSnapshotError(t *testing.T) {
 	vmm := &fakeVMM{snapErr: errBoom}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(wire.NewOpsMetrics("schedd"))
 
-	res, err := engine.Wake(context.Background(), app.ID, "", "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
