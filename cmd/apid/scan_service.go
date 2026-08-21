@@ -103,6 +103,17 @@ type scanPlanResponse struct {
 	CanApply      bool     `json:"can_apply"`
 	NotAllowed    bool     `json:"crons_not_allowed,omitempty"`
 	PlanToken     string   `json:"plan_token"`
+	// ADR-124 blast-radius partition. WillDeploy + Unaffected
+	// enumerate the scan-workload existence against every non-deleted
+	// app in the account keyed by (RootDir, Name). Skipped is the
+	// operator --exclude subset of WillDeploy (Stage 4). Removed is
+	// populated only on the apply path from rec.Removed (the apps
+	// reconcile will SoftDeleteAppCascade). See
+	// computeAffectedPartition for the partition rule.
+	WillDeploy []api.PlanAffectedApp `json:"will_deploy,omitempty"`
+	Unaffected []api.PlanAffectedApp `json:"unaffected,omitempty"`
+	Skipped    []api.PlanAffectedApp `json:"skipped,omitempty"`
+	Removed    []string               `json:"removed,omitempty"`
 }
 
 // toPlanWorkload translates a reposcan.Workload into the wire-
@@ -122,6 +133,92 @@ func toPlanWorkload(w reposcan.Workload) api.PlanWorkload {
 		EnvKeys:    w.EnvKeys,
 		Source:     w.Source,
 		Tier:       w.Tier.String(),
+	}
+}
+
+// workloadKey is the (RootDir, Name) tuple used to match scan
+// workloads against existing state.App rows. mirrors
+// pkg/reposcan.Workload.Key() — server-side match is authoritative.
+// Two scans producing the same workload name but different
+// root_dir are NOT the same existing app (monorepo service-api vs
+// apps/api).
+type workloadKey struct {
+	RootDir string
+	Name    string
+}
+
+// affectedPartition is the ADR-124 blast-radius projection over the
+// scan workload set vs the account's existing app rows. PlanWorkload
+// already carries (RootDir, Name) in the carrier, but the partition
+// surface lives in api.PlanAffectedApp so the wire DTO can carry
+// Action + ID + ExistingRootDir.
+//
+// Removed is empty for preview (apply=false); the apply path
+// populates it from rec.Removed at the post-reconcile site. This
+// asymmetry is intentional: a preview that hard-predicts project
+// deletions is wrong on the first ever commit (no project yet).
+type affectedPartition struct {
+	WillDeploy []api.PlanAffectedApp
+	Unaffected []api.PlanAffectedApp
+	// removedKey is the (RootDir, Name) set the apply path will
+	// SoftDeleteAppCascade. Populated from rec.Removed post-reconcile
+	// so the preview/apply gap stays small. Used in Stage 4 to
+	// re-render WillDeploy entries whose operator --exclude is set.
+	removedKey map[workloadKey]struct{}
+}
+
+// computeAffectedPartition partitions the post-`--only` filtered scan
+// workloads vs the account's existing app rows. Existing apps are
+// loaded via s.store.ListApps(ctx, acct.ID); the projection is
+// O(len(filteredW) + len(existing)) and the result is keyed
+// consistently with pkg/reconcile.diff.workloadDiff so the wire and
+// the apply engine do not diverge.
+//
+// Action vocabulary (ADR-124):
+//
+//	"create" — scan workload, no existing app.
+//	"update" — scan workload, existing app matches (RootDir, Name).
+//	"noop"   — existing app, no scan workload. Will be left alone.
+//	"remove" — populated post-reconcile from rec.Removed (apply path).
+func computeAffectedPartition(
+	filteredW []reposcan.Workload,
+	existingApps []state.App,
+) affectedPartition {
+	idx := make(map[workloadKey]state.App, len(existingApps))
+	for _, a := range existingApps {
+		idx[workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}] = a
+	}
+	will := make([]api.PlanAffectedApp, 0, len(filteredW))
+	scanKeys := make(map[workloadKey]struct{}, len(filteredW))
+	for _, w := range filteredW {
+		k := workloadKey{RootDir: w.RootDir, Name: w.Name}
+		scanKeys[k] = struct{}{}
+		row := api.PlanAffectedApp{Slug: w.Name, Action: "create"}
+		if a, ok := idx[k]; ok {
+			row.Action = "update"
+			row.ID = a.ID
+			if a.RootDir != w.RootDir {
+				row.ExistingRootDir = a.RootDir
+			}
+		}
+		will = append(will, row)
+	}
+	unaff := make([]api.PlanAffectedApp, 0, len(existingApps))
+	for _, a := range existingApps {
+		k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
+		if _, hit := scanKeys[k]; hit {
+			continue
+		}
+		unaff = append(unaff, api.PlanAffectedApp{
+			Slug:           a.Slug,
+			ID:             a.ID,
+			Action:         "noop",
+			ExistingRootDir: a.RootDir,
+		})
+	}
+	return affectedPartition{
+		WillDeploy: will,
+		Unaffected: unaff,
 	}
 }
 
@@ -446,13 +543,28 @@ func (s *server) scanService(
 		canApply = false
 	}
 
+	// ADR-124 blast-radius partition: load every non-deleted app in
+	// the account and project each (RootDir, Name) against the scan
+	// workload set. ListApps is account-scoped; per-account apps
+	// include rows in other projects (intentional — Unaffected is
+	// the blast-radius view, project-agnostic).
+	acctApps, listErr := s.store.ListApps(r.Context(), acct.ID)
+	if listErr != nil {
+		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
+			fmt.Sprintf("list account apps: %v", listErr))
+	}
+	partition := computeAffectedPartition(filteredW, acctApps)
+
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
 	// pkg/api.PlanWorkload.Tier) instead of the raw int the
 	// reposcan type carries. See toPlanWorkload / toPlanManaged.
 	respWorkloads := make([]api.PlanWorkload, len(filteredW))
 	for i, w := range filteredW {
-		respWorkloads[i] = toPlanWorkload(w)
+		pw := toPlanWorkload(w)
+		pw.Action = partition.WillDeploy[i].Action
+		pw.ExistingAppID = partition.WillDeploy[i].ID
+		respWorkloads[i] = pw
 	}
 	respManaged := make([]api.PlanManaged, len(filteredMc))
 	for i, m := range filteredMc {
@@ -472,6 +584,13 @@ func (s *server) scanService(
 		LimitCrons:    limits.CronLimitPerAccount,
 		CanApply:      canApply,
 		NotAllowed:    notAllowed,
+		// ADR-124 partition projection. Skipped is empty here;
+		// populated in Stage 4 when --exclude filter runs. Removed
+		// is empty on the preview path (apply=false); the apply
+		// handler populates it from removedSlugs (the apps
+		// reconcile will SoftDeleteAppCascade).
+		WillDeploy: partition.WillDeploy,
+		Unaffected: partition.Unaffected,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
@@ -748,6 +867,12 @@ func (s *server) scanService(
 	// cleanup into this func must keep staging reads ahead of
 	// the cleanup.
 	builds := s.applyBuildsForAddedChanged(r.Context(), r, acct, project, req.ScanDir, rec.Added, rec.Changed)
+	// ADR-124: surface the destructive subset on the response so the
+	// apply handler can render Removed in the same blast-radius
+	// envelope the preview offered. SoftDeleteAppCascade runs
+	// inside applyActions (pkg/reconcile/apply.go:242-251), already
+	// audited and idempotent — this is just the wire projection.
+	resp.Removed = removedSlugs
 	return resp, project, rec.Added, rec.Changed, removedSlugs, builds, nil
 }
 
