@@ -36,6 +36,15 @@ env vars the runtime injects at wake.
 | Document        | MongoDB Atlas, Turso (libSQL)         | provider-specific |
 | Queue / scheduler | Upstash QStash, AWS SQS             | `QSTASH_TOKEN`, etc. |
 
+> **Note on platform-owned edge response cache (ADR-122).** Gregale
+> also ships a *bounded, in-process, per-`gatewayd-internal`* response
+> cache gated on a per-app `kind=cache` edge rule. It is **not** a KV
+> replacement — opt-in only, default-off, no persistence, no cross-node
+> sharing, no bodies at rest, no cross-instance consistency. It exists
+> to avoid *wakes* for hot cacheable GET paths, not to give you
+> multi-region cache. For everything else — durable cache, KV with TTL,
+> pub/sub, sessions — bring your own from the table above.
+
 ## Wiring it up
 
 `faas secrets set` writes the value to sealed secrets at rest; at

@@ -166,10 +166,6 @@ from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
 from .delayed_task_request import DelayedTaskRequest
-from .domain_doctor_check import DomainDoctorCheck
-from .domain_doctor_check_name import DomainDoctorCheckName
-from .domain_doctor_check_status import DomainDoctorCheckStatus
-from .domain_doctor_report import DomainDoctorReport
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
@@ -178,6 +174,9 @@ from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
 from .deployment_liveness_probe import DeploymentLivenessProbe
 from .deployment_response import DeploymentResponse
+from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
+from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
+from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
@@ -200,7 +199,14 @@ from .dispatch_invocation_batch_body_records_item import DispatchInvocationBatch
 from .dispatch_invocation_batch_body_records_item_headers import DispatchInvocationBatchBodyRecordsItemHeaders
 from .dispatch_invocation_batch_body_records_item_metadata import DispatchInvocationBatchBodyRecordsItemMetadata
 from .dispatch_invocation_batch_response_200 import DispatchInvocationBatchResponse200
+from .domain_doctor_check import DomainDoctorCheck
+from .domain_doctor_check_name import DomainDoctorCheckName
+from .domain_doctor_check_status import DomainDoctorCheckStatus
+from .domain_doctor_report import DomainDoctorReport
 from .edge_rule_budget_action import EdgeRuleBudgetAction
+from .edge_rule_cache_action import EdgeRuleCacheAction
+from .edge_rule_cache_action_methods_item import EdgeRuleCacheActionMethodsItem
+from .edge_rule_cache_action_vary_on_item import EdgeRuleCacheActionVaryOnItem
 from .edge_rule_cors_action import EdgeRuleCORSAction
 from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
@@ -242,6 +248,11 @@ from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
 from .get_builds_status import GetBuildsStatus
+from .get_deployment_stages_response_200 import GetDeploymentStagesResponse200
+from .get_deployment_stages_response_200_current import GetDeploymentStagesResponse200Current
+from .get_deployment_stages_response_200_history_item import GetDeploymentStagesResponse200HistoryItem
+from .get_deployment_stages_response_200_history_item_name import GetDeploymentStagesResponse200HistoryItemName
+from .get_deployment_stages_response_200_history_item_status import GetDeploymentStagesResponse200HistoryItemStatus
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .grace_window_response import GraceWindowResponse
 from .install_bind_request import InstallBindRequest
@@ -641,16 +652,15 @@ __all__ = (
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
-    "DomainDoctorCheck",
-    "DomainDoctorCheckName",
-    "DomainDoctorCheckStatus",
-    "DomainDoctorReport",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
     "DeploymentHealthcheck",
     "DeploymentListResponse",
     "DeploymentLivenessProbe",
     "DeploymentResponse",
+    "DeploymentResponseDeployedViaType1",
+    "DeploymentResponseDeployedViaType2Type1",
+    "DeploymentResponseDeployedViaType3Type1",
     "DeploymentResponseOverrideEnvSecretRefs",
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
@@ -673,7 +683,14 @@ __all__ = (
     "DispatchInvocationBatchBodyRecordsItemHeaders",
     "DispatchInvocationBatchBodyRecordsItemMetadata",
     "DispatchInvocationBatchResponse200",
+    "DomainDoctorCheck",
+    "DomainDoctorCheckName",
+    "DomainDoctorCheckStatus",
+    "DomainDoctorReport",
     "EdgeRuleBudgetAction",
+    "EdgeRuleCacheAction",
+    "EdgeRuleCacheActionMethodsItem",
+    "EdgeRuleCacheActionVaryOnItem",
     "EdgeRuleCORSAction",
     "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
@@ -715,6 +732,11 @@ __all__ = (
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
     "GetBuildsStatus",
+    "GetDeploymentStagesResponse200",
+    "GetDeploymentStagesResponse200Current",
+    "GetDeploymentStagesResponse200HistoryItem",
+    "GetDeploymentStagesResponse200HistoryItemName",
+    "GetDeploymentStagesResponse200HistoryItemStatus",
     "GetOpenAPISpecJSONResponse200",
     "GraceWindowResponse",
     "InstallBindRequest",

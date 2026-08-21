@@ -41,6 +41,7 @@ import (
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
 	"validate", "limit", "geo", "maintenance", "throttle", "budget",
+	"cache",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -244,6 +245,20 @@ func cmdEdgeRulesCreate(args []string) int {
 	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: refill rate (req/s; >0; <=plan.RateLimitRPS)")
 	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: token-bucket burst (>0; <=plan.RateLimitBurst)")
 
+	// cache (ADR-122 §Decision). Per-route TTL primitive.
+	// max-age-seconds is the fresh window (default 60); stale-
+	// if-error-seconds is the post-fresh window where stale
+	// entries may serve on origin failure (default 300). Both
+	// are server-capped (3600 and 300 respectively — see
+	// pkg/api.ResponseCacheMaxAgeMaxSeconds /
+	// ResponseCacheStaleIfErrorMaxSeconds); the CLI does the
+	// structural checks so the user gets the same error locally.
+	var cacheVaryOn, cacheMethods multiFlag
+	cacheMaxAge := fs.Int("cache-max-age-seconds", 0, "kind=cache: fresh window in seconds (default 60; max 3600)")
+	cacheStaleIfError := fs.Int("cache-stale-if-error-seconds", 0, "kind=cache: stale-on-error window in seconds (default 300; max 300)")
+	fs.Var(&cacheVaryOn, "cache-vary-on", "kind=cache: header to vary on (Accept-Language|Accept-Encoding; repeat)")
+	fs.Var(&cacheMethods, "cache-methods", "kind=cache: cacheable method (GET|HEAD; repeat; default GET,HEAD)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -286,6 +301,10 @@ func cmdEdgeRulesCreate(args []string) int {
 		GeoDeny:                    geoDeny,
 		ThrottleRPS:                *throttleRPS,
 		ThrottleBurst:              *throttleBurst,
+		CacheMaxAgeSeconds:         *cacheMaxAge,
+		CacheStaleIfErrorSeconds:   *cacheStaleIfError,
+		CacheVaryOn:                cacheVaryOn,
+		CacheMethods:               cacheMethods,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -420,6 +439,15 @@ func cmdEdgeRulesUpdate(args []string) int {
 	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: new refill rate (req/s; >0; <=plan.RateLimitRPS)")
 	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: new token-bucket burst (>0; <=plan.RateLimitBurst)")
 
+	// cache (ADR-122 §Decision). Mirror of the create-side
+	// flags. Same closed-set + cap semantics — the CLI does
+	// structural checks, the server enforces the ceiling.
+	var cacheVaryOn, cacheMethods multiFlag
+	cacheMaxAge := fs.Int("cache-max-age-seconds", 0, "kind=cache: new fresh window in seconds (max 3600)")
+	cacheStaleIfError := fs.Int("cache-stale-if-error-seconds", 0, "kind=cache: new stale-on-error window in seconds (max 300)")
+	fs.Var(&cacheVaryOn, "cache-vary-on", "kind=cache: header to vary on (Accept-Language|Accept-Encoding; repeat)")
+	fs.Var(&cacheMethods, "cache-methods", "kind=cache: cacheable method (GET|HEAD; repeat)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -507,6 +535,10 @@ func cmdEdgeRulesUpdate(args []string) int {
 			GeoDeny:                    geoDeny,
 			ThrottleRPS:                *throttleRPS,
 			ThrottleBurst:              *throttleBurst,
+			CacheMaxAgeSeconds:         *cacheMaxAge,
+			CacheStaleIfErrorSeconds:   *cacheStaleIfError,
+			CacheVaryOn:                cacheVaryOn,
+			CacheMethods:               cacheMethods,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -615,6 +647,16 @@ type edgeRuleActionInputs struct {
 	// the server's "0-rps is a leak" message.
 	ThrottleRPS   float64
 	ThrottleBurst int
+	// cache (ADR-122 §Decision). Per-route TTL primitive.
+	// MaxAgeSeconds defaults to 60 server-side when 0 is passed
+	// (the apid validator applies the default in
+	// pkg/api.EdgeRuleCacheAction.Validate). The CLI does the
+	// structural checks (positive, ≤ ResponseCacheMaxAgeMaxSeconds)
+	// so the local error mirrors the server's.
+	CacheMaxAgeSeconds       int
+	CacheStaleIfErrorSeconds int
+	CacheVaryOn              []string
+	CacheMethods             []string
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -775,8 +817,82 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			return nil, errToError(err)
 		}
 		return marshalAction(a)
+	case "cache":
+		// ADR-122 §Decision. Per-route TTL primitive.
+		// Structural checks mirror pkg/api.EdgeRuleCacheAction.Validate:
+		//
+		//   - max_age_seconds: server default 60 when 0;
+		//     ceiling 3600
+		//   - stale_if_error_seconds: server default 300 when
+		//     0; ceiling 300
+		//   - vary_on: closed subset of {Accept-Language,
+		//     Accept-Encoding}; empty list = no vary
+		//   - methods: closed subset of {GET, HEAD}; empty
+		//     list = any method
+		//
+		// The CLI does the cap + closed-set checks so the
+		// user gets the same error locally as the server.
+		if in.CacheMaxAgeSeconds < 0 || in.CacheMaxAgeSeconds > api.ResponseCacheMaxAgeMaxSeconds {
+			return nil, fmt.Errorf("cache action: max_age_seconds must be in [0, %d] (0 = use default 60); got %d", api.ResponseCacheMaxAgeMaxSeconds, in.CacheMaxAgeSeconds)
+		}
+		if in.CacheStaleIfErrorSeconds < 0 || in.CacheStaleIfErrorSeconds > api.ResponseCacheStaleIfErrorMaxSeconds {
+			return nil, fmt.Errorf("cache action: stale_if_error_seconds must be in [0, %d] (0 = use default 300); got %d", api.ResponseCacheStaleIfErrorMaxSeconds, in.CacheStaleIfErrorSeconds)
+		}
+		for _, v := range in.CacheVaryOn {
+			if !isCacheVaryOnVocab(v) {
+				return nil, fmt.Errorf("cache action: vary_on %q not in closed vocabulary (Accept-Language|Accept-Encoding)", v)
+			}
+		}
+		for _, m := range in.CacheMethods {
+			if !isCacheMethodVocab(m) {
+				return nil, fmt.Errorf("cache action: methods %q not in closed vocabulary (GET|HEAD)", m)
+			}
+		}
+		a := api.EdgeRuleCacheAction{
+			MaxAgeSeconds:       in.CacheMaxAgeSeconds,
+			StaleIfErrorSeconds: in.CacheStaleIfErrorSeconds,
+			VaryOn:              in.CacheVaryOn,
+			Methods:             in.CacheMethods,
+		}
+		// CLI-side defaults for fields the user omitted
+		// (flag == 0). The server's EdgeRuleCacheAction.Validate
+		// intentionally does NOT default these — 0 means
+		// "disable stale-on-error" per the spec, so a server-
+		// side default would make that documented semantic
+		// unreachable. We default here so omitting the flag
+		// still gives the user the friendly 300-s default.
+		if a.MaxAgeSeconds == 0 {
+			a.MaxAgeSeconds = api.ResponseCacheDefaultMaxAgeSeconds
+		}
+		if a.StaleIfErrorSeconds == 0 {
+			a.StaleIfErrorSeconds = api.ResponseCacheDefaultStaleIfErrorSeconds
+		}
+		return marshalAction(a)
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
+}
+
+// isCacheVaryOnVocab reports whether v is in the closed cache
+// vary_on vocabulary. Mirrors pkg/api.edgeRuleCacheVaryOnVocab
+// so the CLI surfaces a typo locally.
+func isCacheVaryOnVocab(v string) bool {
+	for _, x := range []string{"Accept-Language", "Accept-Encoding"} {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// isCacheMethodVocab reports whether m is in the closed cache
+// method vocabulary. Mirrors pkg/api.edgeRuleCacheMethodVocab.
+func isCacheMethodVocab(m string) bool {
+	for _, x := range []string{"GET", "HEAD"} {
+		if m == x {
+			return true
+		}
+	}
+	return false
 }
 
 // marshalAction encodes a into json.RawMessage. Errors are

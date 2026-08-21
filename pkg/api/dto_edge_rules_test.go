@@ -991,3 +991,240 @@ func TestIsHeaderToken(t *testing.T) {
 		})
 	}
 }
+
+// ----------------------------------------------------------------------------
+// EdgeRuleCacheAction.Validate (ADR-122 §Decision). Mirrors the
+// budget/throttle shape: happy-path pin, table-driven reject table,
+// nil-receiver pin, plus the closed-vocab walks that prove the
+// kind=cache runtime cannot be widened into a credential-leaking
+// or non-idempotent key dimension.
+
+// happyEdgeRuleCacheAction returns a well-formed kind=cache
+// action: 60 s fresh, 300 s stale-on-error, GET/HEAD only, no
+// vary. Matches the original ask verbatim. Each "Accepts" test
+// mutates one field from this baseline.
+func happyEdgeRuleCacheAction() EdgeRuleCacheAction {
+	return EdgeRuleCacheAction{
+		MaxAgeSeconds:       60,
+		StaleIfErrorSeconds: 300,
+		Methods:             []string{"GET", "HEAD"},
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_HappyPath pins the canonical
+// in-range action. Defaults (ResponseCacheDefaultMaxAgeSeconds = 60,
+// ResponseCacheDefaultStaleIfErrorSeconds = 300) applied explicitly
+// so the state mirror carries them — the gateway compile step
+// (commit 10) does NOT re-default.
+func TestEdgeRuleCacheAction_Validate_HappyPath(t *testing.T) {
+	a := happyEdgeRuleCacheAction()
+	if p := a.Validate(); p != nil {
+		t.Fatalf("happy path returned %v, want nil", p)
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_AppliesDefaults pins the
+// apid-side default policy:
+//   - MaxAgeSeconds == 0 is silently coerced to the default
+//     (60 s) so a customer who omits max_age_seconds gets the
+//     friendly ADR-ask default. There is no documented
+//     "disable fresh" semantic, so this default is safe.
+//   - StaleIfErrorSeconds == 0 is the documented
+//     "disable stale-on-error" semantic per §4.1.2.15; the
+//     apid MUST NOT default it. CLI callers that omit the
+//     flag apply the default on the client side (see
+//     cmd/gregale/commands_edge_rules.go buildActionByKind);
+//     direct apid callers (dashboard, internal admin tools)
+//     pass through what the user submitted, so a row with
+//     StaleIfErrorSeconds == 0 means "user explicitly opted
+//     out of stale-on-error". This split makes the row
+//     auditable: a 300 in the DB could mean either default
+//     or explicit-300; a 0 can only mean explicit opt-out.
+//
+// This is the B4 regression fence from the medium code
+// review — silently coercing 0 to 300 made the documented
+// disable semantic unreachable through the API.
+func TestEdgeRuleCacheAction_Validate_AppliesDefaults(t *testing.T) {
+	a := EdgeRuleCacheAction{} // all zero
+	if p := a.Validate(); p != nil {
+		t.Fatalf("all-zero action returned %v, want nil", p)
+	}
+	if a.MaxAgeSeconds != ResponseCacheDefaultMaxAgeSeconds {
+		t.Errorf("MaxAgeSeconds = %d, want %d (apid default)", a.MaxAgeSeconds, ResponseCacheDefaultMaxAgeSeconds)
+	}
+	if a.StaleIfErrorSeconds != 0 {
+		t.Errorf("StaleIfErrorSeconds = %d, want 0 (apid MUST NOT default the documented disable semantic)", a.StaleIfErrorSeconds)
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_Rejects walks the failure
+// table. Each case mutates the happy action by one field and
+// asserts Validate() returns a *Problem whose Detail carries the
+// expected substring. The substring pinning is the same pattern
+// as TestEdgeRuleBudgetAction_Validate_Rejects: failure messages
+// are user-facing and must stay grep-able.
+func TestEdgeRuleCacheAction_Validate_Rejects(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(a *EdgeRuleCacheAction)
+		wantSub string
+	}{
+		{
+			name: "negative_max_age",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.MaxAgeSeconds = -1
+			},
+			wantSub: "max_age_seconds must be ≥ 0",
+		},
+		{
+			name: "max_age_above_cap",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.MaxAgeSeconds = ResponseCacheMaxAgeMaxSeconds + 1
+			},
+			wantSub: "exceeds the platform ceiling",
+		},
+		{
+			name: "negative_stale",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.StaleIfErrorSeconds = -5
+			},
+			wantSub: "stale_if_error_seconds must be ≥ 0",
+		},
+		{
+			name: "stale_above_cap",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.StaleIfErrorSeconds = ResponseCacheStaleIfErrorMaxSeconds + 1
+			},
+			wantSub: "exceeds the hard cap",
+		},
+		{
+			name: "method_outside_vocab_POST",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.Methods = []string{"POST"}
+			},
+			wantSub: "not in the closed cacheable-method vocabulary",
+		},
+		{
+			name: "method_outside_vocab_DELETE",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.Methods = []string{"GET", "DELETE"}
+			},
+			wantSub: "not in the closed cacheable-method vocabulary",
+		},
+		{
+			name: "vary_on_credential_Authorization",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.VaryOn = []string{"Authorization"}
+			},
+			wantSub: "not in the closed non-credential vocabulary",
+		},
+		{
+			name: "vary_on_credential_Cookie",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.VaryOn = []string{"Cookie"}
+			},
+			wantSub: "not in the closed non-credential vocabulary",
+		},
+		{
+			name: "vary_on_typo",
+			mutate: func(a *EdgeRuleCacheAction) {
+				a.VaryOn = []string{"Accept-Languag"} // truncation
+			},
+			wantSub: "not in the closed non-credential vocabulary",
+		},
+		{
+			name: "vary_on_Accept_must_be_closed",
+			mutate: func(a *EdgeRuleCacheAction) {
+				// Accept (without -Language/-Encoding) is
+				// deliberately not in the vocabulary: a
+				// shared-cache Accept key would multiply
+				// entries by content-type fan-out and has
+				// no canonical normaliser to defend
+				// against a misconfigured rule.
+				a.VaryOn = []string{"Accept"}
+			},
+			wantSub: "not in the closed non-credential vocabulary",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleCacheAction()
+			tc.mutate(&a)
+			p := a.Validate()
+			if p == nil {
+				t.Fatalf("Validate() = nil, want *Problem containing %q", tc.wantSub)
+			}
+			if !strings.Contains(p.Detail, tc.wantSub) {
+				t.Errorf("Detail = %q, want substring %q", p.Detail, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_Accepts walks the closed-vocab
+// positive cases. Each (Methods, VaryOn) tuple is one the runtime
+// actually accepts — pin so a future "be lenient" widening cannot
+// add a new key dimension without bumping this test.
+func TestEdgeRuleCacheAction_Validate_Accepts(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(a *EdgeRuleCacheAction)
+	}{
+		{"empty_methods_runtime_defaults_to_GET_HEAD", func(a *EdgeRuleCacheAction) { a.Methods = nil }},
+		{"methods_GET_only", func(a *EdgeRuleCacheAction) { a.Methods = []string{"GET"} }},
+		{"methods_HEAD_only", func(a *EdgeRuleCacheAction) { a.Methods = []string{"HEAD"} }},
+		{"vary_Accept_Language", func(a *EdgeRuleCacheAction) { a.VaryOn = []string{"Accept-Language"} }},
+		{"vary_Accept_Encoding", func(a *EdgeRuleCacheAction) { a.VaryOn = []string{"Accept-Encoding"} }},
+		{"vary_both_in_vocab", func(a *EdgeRuleCacheAction) { a.VaryOn = []string{"Accept-Language", "Accept-Encoding"} }},
+		{"empty_vary_runtime_uses_URL_only", func(a *EdgeRuleCacheAction) { a.VaryOn = nil }},
+		{"max_age_one_second", func(a *EdgeRuleCacheAction) { a.MaxAgeSeconds = 1 }},
+		{"max_age_zero_means_no_fresh_hits", func(a *EdgeRuleCacheAction) { a.MaxAgeSeconds = 0 }},
+		{"max_age_at_cap", func(a *EdgeRuleCacheAction) { a.MaxAgeSeconds = ResponseCacheMaxAgeMaxSeconds }},
+		{"stale_at_cap", func(a *EdgeRuleCacheAction) { a.StaleIfErrorSeconds = ResponseCacheStaleIfErrorMaxSeconds }},
+		{"stale_zero_means_no_stale_on_error", func(a *EdgeRuleCacheAction) { a.StaleIfErrorSeconds = 0 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleCacheAction()
+			tc.mutate(&a)
+			if p := a.Validate(); p != nil {
+				t.Errorf("Validate() = %v, want nil", p)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_NilReceiver pins the
+// nil-receiver arm. Same posture as budget / validate / limit:
+// the dispatcher checks `a == nil` first because Go's
+// reflect-based dispatch would panic on a nil pointer. Validate()
+// must short-circuit with a 422 problem, not crash.
+func TestEdgeRuleCacheAction_Validate_NilReceiver(t *testing.T) {
+	var a *EdgeRuleCacheAction
+	p := a.Validate()
+	if p == nil {
+		t.Fatal("nil receiver returned nil, want *Problem")
+	}
+	if !strings.Contains(p.Detail, "cache action is required") {
+		t.Errorf("Detail = %q, want substring %q", p.Detail, "cache action is required")
+	}
+}
+
+// TestEdgeRuleCacheAction_Validate_Boundaries pins the
+// edge-of-range cap numbers so a future "let's loosen the cap"
+// refactor is forced to update the test (which lists the user
+// impact in its docstring).
+func TestEdgeRuleCacheAction_Validate_Boundaries(t *testing.T) {
+	if ResponseCacheMaxAgeMaxSeconds != 3600 {
+		t.Errorf("ResponseCacheMaxAgeMaxSeconds = %d, want 3600 (1 h); if you change the cap, update ADR-122 §Decision and the docs/faas_implementation_spec.md §12 table", ResponseCacheMaxAgeMaxSeconds)
+	}
+	if ResponseCacheStaleIfErrorMaxSeconds != 300 {
+		t.Errorf("ResponseCacheStaleIfErrorMaxSeconds = %d, want 300 (5 min); the ADR asks for 5 min and any change would push a customer-visible staleness budget past their expectation", ResponseCacheStaleIfErrorMaxSeconds)
+	}
+	if ResponseCacheDefaultMaxAgeSeconds != 60 {
+		t.Errorf("ResponseCacheDefaultMaxAgeSeconds = %d, want 60; the ADR ask example uses 60 s and any change would surprise customers who copy-pasted the example", ResponseCacheDefaultMaxAgeSeconds)
+	}
+	if ResponseCacheDefaultStaleIfErrorSeconds != 300 {
+		t.Errorf("ResponseCacheDefaultStaleIfErrorSeconds = %d, want 300; the ADR ask example uses 300 s", ResponseCacheDefaultStaleIfErrorSeconds)
+	}
+}

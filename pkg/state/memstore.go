@@ -10799,6 +10799,29 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			}
 		}
 	}
+	// kind='cache' per-app quota (ADR-122 §Decision). Mirror of
+	// the pgstore branch. Same rationale: tighter cap than
+	// EdgeRulesPerApp because per (host, path, vary) cache rules
+	// can pin the in-process store's byte ceiling. memstore is
+	// race-free under m.mu; pgstore relies on the FOR UPDATE on
+	// apps carried by the preceding quota branches.
+	if in.Kind == EdgeRuleKindCache && limits.EdgeRulesCachePerApp > 0 {
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindCache {
+				kindCount++
+			}
+		}
+		if kindCount >= limits.EdgeRulesCachePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesCachePerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindCache),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	if in.MatchMethods == nil {
 		in.MatchMethods = []string{}
 	}

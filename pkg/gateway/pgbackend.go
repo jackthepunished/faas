@@ -339,6 +339,15 @@ type PGBackend struct {
 	// cmd/gatewayd-internal so the 60s TTL + per-key
 	// invalidation through db.NotifyKeyChanged both apply.
 	publicAuthCache *PublicAuthCache
+	// responseCache (ADR-122 §Decision) is the in-process
+	// kind=cache response cache consulted by the Handler on
+	// every request. PGBackend holds a pointer so the cmd-side
+	// invalidator can drop per-app entries on NotifyAppChanged
+	// (a deploy) and wholesale entries on NotifyEdgeRuleChanged
+	// (a cache rule creation / mutation / delete). nil-safe: an
+	// unwired cache short-circuits the invalidation arms so the
+	// notify subscriber doesn't need a wiring branch.
+	responseCache *ResponseCache
 	// edgeRules (ADR-089 / issue #561 PR 3) is the
 	// per-host edge-rule matcher the invalidator drives.
 	// nil = no matcher wired (default; pre-PR-3 behaviour
@@ -1138,6 +1147,26 @@ func (b *PGBackend) WithPublicAuthCache(cache *PublicAuthCache) *PGBackend {
 	return b
 }
 
+// WithResponseCache (ADR-122 §Decision) arms the in-process
+// kind=cache response cache so the cmd-side invalidator can
+// drop entries on db.NotifyAppChanged (deploy → drop that app's
+// entries) and db.NotifyEdgeRuleChanged (cache rule change →
+// drop everything; the cache is per-host keyed and per-rule
+// invalidation would require the notification to carry the
+// rule's match_host, which it doesn't).
+//
+// nil = no caching (the handler's applyEdgeRuleCache short-
+// circuits on a nil cache, so a misconfigured wiring degrades
+// to "no cache" rather than "all requests fail"). Production
+// wires gateway.NewResponseCache() in cmd/gatewayd-internal.
+//
+// Returns *PGBackend for fluent chaining (same shape as
+// every other PGBackend.With*).
+func (b *PGBackend) WithResponseCache(cache *ResponseCache) *PGBackend {
+	b.responseCache = cache
+	return b
+}
+
 // WithEdgeRules (ADR-089 / issue #561 PR 3) arms the
 // per-host edge-rule matcher the invalidator resets on
 // db.NotifyEdgeRuleChanged. matcher may be nil (matcher
@@ -1209,6 +1238,42 @@ func (b *PGBackend) ResetApp(appID string) {
 	b.appsMu.Lock()
 	delete(b.apps, appID)
 	b.appsMu.Unlock()
+}
+
+// InvalidateResponseCacheByApp (ADR-122 §Decision) drops every
+// cached entry whose key has the given appID. Called from
+// cmd/gatewayd-internal on db.NotifyAppChanged when the trigger
+// fires on a per-app column flip — most importantly a deploy
+// (cmd/apid fires NotifyAppChanged post-deploy at
+// cmd/apid/handlers_deployments.go:248; the response cache
+// must NOT serve the previous release's body under the new
+// release's URL, even though the cache key's DeploymentID
+// field is empty in v1).
+//
+// nil-safe: an unwired cache short-circuits so the notify
+// subscriber doesn't need a wiring branch.
+func (b *PGBackend) InvalidateResponseCacheByApp(appID string) {
+	if b == nil || b.responseCache == nil {
+		return
+	}
+	b.responseCache.InvalidateByApp(appID)
+}
+
+// InvalidateResponseCacheAll (ADR-122 §Decision) drops every
+// cached entry. Called from cmd/gatewayd-internal on
+// db.NotifyEdgeRuleChanged when a kind=cache rule is created /
+// updated / deleted (cmd/apid/handlers_edge_rules.go:256/455/511).
+// Wholesale — per-rule invalidation would require the
+// notification payload to carry the rule's match_host (it
+// doesn't), and the cache is advisory so a brief miss-bump is
+// strictly preferable to a stale serve against a deleted rule.
+//
+// nil-safe: same posture as InvalidateResponseCacheByApp.
+func (b *PGBackend) InvalidateResponseCacheAll() {
+	if b == nil || b.responseCache == nil {
+		return
+	}
+	b.responseCache.InvalidateAll()
 }
 
 // RequestCertForSurface (ADR-100 / issue #879) delegates to the

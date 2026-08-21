@@ -1,10 +1,11 @@
 from typing import Literal
 
-PublicAuthStatusMode = Literal["basic", "bearer", "open"]
+PublicAuthStatusMode = Literal["basic", "bearer", "ip_allowlist", "open"]
 
 PUBLIC_AUTH_STATUS_MODE_VALUES: set[PublicAuthStatusMode] = {
     "basic",
     "bearer",
+    "ip_allowlist",
     "open",
 }
 

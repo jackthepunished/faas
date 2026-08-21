@@ -654,6 +654,16 @@ type Handler struct {
 	// db.NotifyKeyChanged both apply. The cache itself lives
 	// in pkg/gateway/public_auth_cache.go.
 	publicAuthCache *PublicAuthCache
+	// responseCache (ADR-122 §Decision) is the in-process cache
+	// the kind=cache applier consults. nil = cache disabled
+	// (every request is a cache miss; the runtime never serves
+	// from store). Production wires this from
+	// cmd/gatewayd-internal/run.go via WithResponseCache; unit
+	// tests omit it. The cache's invalidation surface lives on
+	// the cache itself (InvalidateByApp
+	// / InvalidateAll) and is wired by the db.Notify handler in
+	// commit 14.
+	responseCache *ResponseCache
 	// publicAuthUnsealer turns an APP_BASIC_AUTH secretbox
 	// sealed blob into the username/password pair the
 	// request header carries. nil = unseal disabled (unit
@@ -1107,6 +1117,15 @@ func (h *Handler) WithValidator(v Validator) *Handler {
 func (h *Handler) WithPublicAuth(cache *PublicAuthCache, unsealer PublicAuthUnsealer) *Handler {
 	h.publicAuthCache = cache
 	h.publicAuthUnsealer = unsealer
+	return h
+}
+
+// WithResponseCache (ADR-122 §Decision) wires the in-process
+// ResponseCache consulted by applyEdgeRuleCache. The setter
+// returns *Handler for fluent chaining (same shape as every
+// other Handler.With*).
+func (h *Handler) WithResponseCache(cache *ResponseCache) *Handler {
+	h.responseCache = cache
 	return h
 }
 
@@ -4702,6 +4721,75 @@ haveApp:
 		return
 	}
 
+	// ADR-122 §Decision: kind=cache serve path. Consulted AFTER
+	// enforcePublicAuth (so a cache hit cannot bypass the auth
+	// gate) and BEFORE the wake gate (so a hit returns without
+	// calling gate.Wait — no VM, no gb_ram_hour). The applier
+	// returns true when the request was fully served from the
+	// cache (no wake) and false on miss (the caller falls through
+	// to the existing wake path).
+	//
+	// Placement also AFTER CORS (line 4241, which short-circuits
+	// preflight OPTIONS) so preflight responses are never
+	// cached — an OPTIONS cached against the wrong Origin is a
+	// real CORS bypass.
+	cacheRule := (*EdgeRuleCacheResolved)(nil)
+	if served, rule := h.applyEdgeRuleCache(w, r, app, rec); served {
+		return
+	} else if rule != nil && h.responseCache != nil && r.Header.Get("Authorization") == "" && !hasSessionCookie(r) && (r.Method == "GET" || r.Method == "HEAD") {
+		// Miss path — install the cacheWriter tee so the
+		// upstream response populates the cache. The rule
+		// non-nil + auth-bypass-clear + method-in-vocab
+		// predicate is repeated here (rather than threaded
+		// back through applyEdgeRuleCache) so the security
+		// check is the single chokepoint: an authed request
+		// cannot reach the tee even if applyEdgeRuleCache
+		// itself short-circuited to a miss.
+		cw := newCacheWriter(w, rec, rule, ResponseCachePerEntryMaxBytes)
+		w = cw
+		cacheRule = rule
+		defer func() {
+			if cw.shouldStore() {
+				key := CacheKey{
+					AppID:          app.ID,
+					DeploymentID:   "",
+					RuleID:         rule.ID,
+					Method:         r.Method,
+					NormalizedPath: r.URL.Path,
+					Query:          sortQuery(r.URL.RawQuery),
+					VaryHash:       computeVaryHash(r, rule.VaryOn),
+				}
+				cw.finishCacheCapture(h.responseCache, key, time.Now())
+			} else {
+				// shouldStore() returned false — bump the
+				// store_skipped counter so the dashboard
+				// chip surfaces "why isn't my cache
+				// populating?". The actual reason is opaque
+				// (predicate veto) — a follow-on ADR can
+				// widen the counter with a `reason` label
+				// if operators need finer breakdown.
+				h.metricsIncCacheOutcome("store_skipped")
+			}
+			// Refresh the occupancy gauges regardless of the
+			// store outcome — the gauge is a snapshot, not a
+			// delta.
+			if h.metrics != nil {
+				h.metrics.responseCacheBytes.Set(float64(h.responseCache.Bytes()))
+				h.metrics.responseCacheEntries.Set(float64(h.responseCache.Len()))
+			}
+		}()
+		// Stash the matched rule on the request ctx so the
+		// wake-failure branch further down can consult the
+		// cache for a stale-if-error entry. Without this
+		// stash, the gate-failure path would have to
+		// re-run the matcher (the rule was already
+		// resolved above, no point doing it twice).
+		if rule != nil {
+			r = r.WithContext(withCacheRuleContext(r.Context(), rule, app.ID, r.Method, r.URL.Path, sortQuery(r.URL.RawQuery), computeVaryHash(r, rule.VaryOn)))
+		}
+		_ = cacheRule
+	}
+
 	// Issue #463 / ADR-069 / ADR-071 / PR-C §5: resolve the
 	// sidecar port when sidecarName != "". A sidecarName
 	// that doesn't match the deployment's sidecar roster
@@ -4802,6 +4890,17 @@ haveApp:
 	//nolint:contextcheck // request ctx at handler boundary.
 	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
 	if err != nil {
+		// ADR-122 §Decision: kind=cache stale-on-error path.
+		// On wake failure (queue full, bootstrap abort, etc.)
+		// consult the cache for a stale entry BEFORE falling
+		// through to writeWakeError. A stale serve on origin
+		// failure is strictly better than a hard 503 — the
+		// body is recent enough that the customer experience
+		// stays smooth, and the alternative (503) loses both
+		// the request AND the wake budget for nothing.
+		if served, _ := h.tryServeStaleOnWakeError(w, r, app, rec); served {
+			return
+		}
 		writeWakeError(w, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return

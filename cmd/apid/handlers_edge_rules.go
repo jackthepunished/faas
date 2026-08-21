@@ -173,6 +173,19 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage, plan api.Plan) *ap
 			return api.ErrValidation(fmt.Sprintf("budget action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindCache:
+		var a api.EdgeRuleCacheAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("cache action: %v", err))
+		}
+		// Validate applies apid-side defaults (60 s fresh /
+		// 300 s stale-on-error) and enforces the closed
+		// vary_on / methods vocabulary. The plan-level quota
+		// (Free 0 / Hobby 1 / Pro 5 / Scale 20) is enforced
+		// separately in CreateEdgeRuleIfUnderQuota — see
+		// pkg/state/pgstore.go::CreateEdgeRuleIfUnderQuota
+		// and memstore.go::CreateEdgeRuleIfUnderQuota.
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -515,6 +528,27 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 			out.Budget = &state.EdgeRuleBudgetAction{
 				BudgetMs:            a.BudgetMs,
 				AllowOverrideHeader: a.AllowOverrideHeader,
+			}
+		}
+	case state.EdgeRuleKindCache:
+		var a api.EdgeRuleCacheAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Mirror the budget / limit path's pattern: structural
+			// decode only. Validate (validateEdgeRuleAction above)
+			// already applied apid-side defaults (60 s fresh /
+			// 300 s stale-on-error), so the values carried into
+			// the state mirror are the explicitly-stored ones
+			// the gateway compile step (commit 10) will re-read.
+			// The gateway compile path does NOT re-default — a
+			// zero field at compile time is the apid-submitted
+			// value, not "default", so an audit can ask "did
+			// the customer ask for stale-on-error" by reading
+			// the row.
+			out.Cache = &state.EdgeRuleCacheAction{
+				MaxAgeSeconds:       a.MaxAgeSeconds,
+				StaleIfErrorSeconds: a.StaleIfErrorSeconds,
+				VaryOn:              a.VaryOn,
+				Methods:             a.Methods,
 			}
 		}
 	}

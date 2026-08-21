@@ -2,6 +2,7 @@ from typing import Literal
 
 EdgeRuleResponseKind = Literal[
     "budget",
+    "cache",
     "cors",
     "geo",
     "headers",
@@ -18,6 +19,7 @@ EdgeRuleResponseKind = Literal[
 
 EDGE_RULE_RESPONSE_KIND_VALUES: set[EdgeRuleResponseKind] = {
     "budget",
+    "cache",
     "cors",
     "geo",
     "headers",

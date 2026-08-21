@@ -142,6 +142,14 @@ type fakeInvalidator struct {
 	refreshed     []string // app_ids that received RefreshDeploymentWeights
 	resetCnt      int      // ResetEdgeRules call count (ADR-089 PR 3)
 	resetApps     []string // app_ids that received ResetApp (ADR-091 amendment)
+	// responseCacheByApp (ADR-122 §Decision) records app_ids
+	// that received InvalidateResponseCacheByApp — paired
+	// 1:1 with resetApps in the NotifyAppChanged handler arm
+	// so tests can assert both fire on the same notification.
+	responseCacheByApp []string
+	// responseCacheAll counts InvalidateResponseCacheAll calls
+	// (the NotifyEdgeRuleChanged handler arm fires wholesale).
+	responseCacheAll int
 	// remintSurfaces records the surface_ids that received
 	// RequestCertForSurface (ADR-100 / issue #879). remintErr
 	// makes the call return that error so the test can assert
@@ -176,6 +184,16 @@ func (f *fakeInvalidator) ResetEdgeRules() {
 func (f *fakeInvalidator) ResetApp(appID string) {
 	f.mu.Lock()
 	f.resetApps = append(f.resetApps, appID)
+	f.mu.Unlock()
+}
+func (f *fakeInvalidator) InvalidateResponseCacheByApp(appID string) {
+	f.mu.Lock()
+	f.responseCacheByApp = append(f.responseCacheByApp, appID)
+	f.mu.Unlock()
+}
+func (f *fakeInvalidator) InvalidateResponseCacheAll() {
+	f.mu.Lock()
+	f.responseCacheAll++
 	f.mu.Unlock()
 }
 func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {

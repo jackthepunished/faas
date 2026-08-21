@@ -688,6 +688,33 @@ func sampleBudgetRule(id string, prio int, host string) EdgeRuleBudgetResolved {
 	}
 }
 
+// sampleCacheRule (ADR-122 / kind=cache) is the thirteenth-kind
+// mirror of sampleBudgetRule's shape. MaxAgeSeconds is the
+// per-rule fresh window (60 s = the ADR ask example);
+// StaleIfErrorSeconds is the per-rule stale-on-error window
+// (300 s = the ADR ask example); VaryOn is a closed subset of
+// {Accept-Language, Accept-Encoding}; Methods defaults to
+// {GET, HEAD} per the closed cacheable-method vocab. The
+// cmd-side compileCacheRules clamps out-of-range values to
+// api.ResponseCacheMaxAgeMaxSeconds /
+// ResponseCacheStaleIfErrorMaxSeconds; these samples stay
+// in-range so the resolver-level unit test doesn't have to
+// simulate the clamp path (which has its own cmd-side test
+// in cmd/gatewayd-internal/edge_rules_test.go).
+func sampleCacheRule(id string, prio int, host string) EdgeRuleCacheResolved {
+	return EdgeRuleCacheResolved{
+		ID:                  id,
+		AccountID:           "acc_" + id,
+		AppID:               "app_" + id,
+		Priority:            prio,
+		PathGlob:            "",
+		Methods:             map[string]bool{"GET": true, "HEAD": true},
+		MaxAgeSeconds:       60,
+		StaleIfErrorSeconds: 300,
+		VaryOn:              []string{"Accept-Language"},
+	}
+}
+
 // putEntryAll is the PR 6 widening of putEntry: covers all 12 kinds
 // after the kind=maintenance, kind=geo, and kind=budget extensions
 // (ADR-091 D21 amendment, §4.1.2.13, ADR-093). The validate widening
@@ -714,6 +741,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	maintenance []EdgeRuleMaintenanceResolved,
 	geo []EdgeRuleGeoResolved,
 	budget []EdgeRuleBudgetResolved,
+	cache []EdgeRuleCacheResolved,
 ) {
 	c.Put(host, &HostEntry{
 		Host:        host,
@@ -729,6 +757,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 		Maintenance: maintenance,
 		Geo:         geo,
 		Budget:      budget,
+		Cache:       cache,
 	})
 }
 
@@ -962,6 +991,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTwelveKinds(t *testing.T) {
 		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
 		[]EdgeRuleGeoResolved{sampleGeoRule("geo", 0, []string{"DE"}, nil, "")},
 		[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", 0, host)},
+		[]EdgeRuleCacheResolved{sampleCacheRule("cache", 0, host)},
 	)
 
 	// Sanity: every GetK returns a hit pre-Reset.
@@ -981,6 +1011,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTwelveKinds(t *testing.T) {
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
+		{"GetCache", func() bool { _, ok := c.GetCache(host); return ok }},
 	}
 	for _, c0 := range preChecks {
 		if !c0.f() {
@@ -1006,6 +1037,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTwelveKinds(t *testing.T) {
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
+		{"GetCache", func() bool { _, ok := c.GetCache(host); return ok }},
 	}
 	for _, c0 := range postChecks {
 		if c0.f() {
@@ -1070,6 +1102,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
 						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, []string{"DE"}, nil, "")},
 						[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", j, hostA)},
+						[]EdgeRuleCacheResolved{sampleCacheRule("cache", j, hostA)},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
@@ -1081,12 +1114,13 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 					_, _ = c.GetMaintenance(hostA)
 					_, _ = c.GetGeo(hostA)
 					_, _ = c.GetBudget(hostA)
+					_, _ = c.GetCache(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1147,6 +1181,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
 					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, []string{"DE"}, nil, "")},
 					[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", i, host)},
+					[]EdgeRuleCacheResolved{sampleCacheRule("cache", i, host)},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
@@ -1161,6 +1196,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetMaintenance(host)
 				_, _ = c.GetGeo(host)
 				_, _ = c.GetBudget(host)
+				_, _ = c.GetCache(host)
 			case 2: // Reset
 				c.Reset()
 			}

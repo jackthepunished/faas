@@ -325,6 +325,16 @@ type invalidator interface {
 	// flips are usually isolated to one app; wholesale FlushRoutes
 	// would also evict every other app's entry on every flip.
 	ResetApp(appID string)
+	// InvalidateResponseCacheByApp (ADR-122 §Decision) drops every
+	// kind=cache entry for an app on a per-app column flip (most
+	// importantly a deploy — the previous release's body must
+	// never serve under the new release's URL).
+	InvalidateResponseCacheByApp(appID string)
+	// InvalidateResponseCacheAll (ADR-122 §Decision) drops every
+	// kind=cache entry on a kind=cache rule mutation. Wholesale —
+	// per-rule invalidation would require the rule's match_host
+	// in the notify payload, which it doesn't carry.
+	InvalidateResponseCacheAll()
 	// RequestCertForSurface (ADR-100 / issue #879) is the
 	// cert-remint goroutine's entry point. A
 	// tenant_surface_changed notification (any insert / update /
@@ -463,12 +473,24 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		// resolver wholesale, not per-app.
 		if n.Payload != "" {
 			inv.ResetApp(n.Payload)
+			// ADR-122 §Decision: drop kind=cache entries for
+			// the affected app. A deploy or a per-app column
+			// flip must not let the previous release's body
+			// serve under the new release's URL — the cache
+			// key's DeploymentID is empty in v1, so the only
+			// way to fence deploys is a per-app drop. Per-app
+			// (not wholesale) so an isolated app flip doesn't
+			// evict every other app's entries.
+			inv.InvalidateResponseCacheByApp(n.Payload)
 		} else {
 			// Defensive: a missing payload on the existing
 			// channel (e.g. a row delete or a future trigger
 			// without a NEW.id payload) falls back to wholesale
 			// FlushRoutes — same posture as the legacy arm.
 			inv.FlushRoutes()
+			// Wholesale cache drop on a malformed payload —
+			// safer than guessing the affected app.
+			inv.InvalidateResponseCacheAll()
 		}
 	case db.NotifyDomainChanged:
 		inv.FlushRoutes()
@@ -530,6 +552,14 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		// surgical-evict. Wholesale flush is cheaper and
 		// correct.
 		inv.ResetEdgeRules()
+		// ADR-122 §Decision: drop the kind=cache store on
+		// the same notification. A new rule might apply to
+		// a path the store already populated under a
+		// deleted rule; a deleted rule might have populated
+		// entries that no rule now matches; a mutated rule
+		// might have changed max_age / stale_if_error. All
+		// three are covered by InvalidateAll.
+		inv.InvalidateResponseCacheAll()
 	case db.NotifyTenantSurfaceChanged:
 		// ADR-100 / issue #879: any mutation on
 		// tenant_surfaces or tenant_hostnames (insert /
