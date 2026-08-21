@@ -1,7 +1,6 @@
 -- 00351_reserve_slot.sql — temporary concurrent-PR migration fence.
 -- The real migration for this slot is being coordinated by other
--- open PRs (PR #1017 alert_presets catalog owns 00351 as a real
--- migration). Remove this no-op when that migration lands, per
+-- open PRs. Remove this no-op when those migrations land, per
 -- ADR-041.
 -- +goose Up
 -- +goose StatementBegin
