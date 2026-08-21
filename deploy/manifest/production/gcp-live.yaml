@@ -1,0 +1,113 @@
+# GCP live split-box deployment manifest.
+#
+# This is the deployment-specific counterpart to
+# deploy/manifest/examples/splitbox.example.yaml. It records the private
+# VPC addresses and immutable release tuple for the two-node GCP fleet. The
+# addresses are not portable to bare metal; a new fleet needs its own
+# manifest generated from that fleet's routable private network.
+#
+# The release tuple is pinned to the merged main commit that will be tagged
+# for the next signed pre-1.0 release. Do not change the bytes after hashing
+# them for GREGALE_RELEASE_MANIFEST_HASH.
+
+schema_version: "1.0.0"
+
+fleet:
+  hosts:
+    - name: fsn-1
+      role: control-plane
+      address: 10.156.0.3:9091
+      tags: ["primary", "gcp-vpc"]
+    - name: fsn-2
+      role: compute-only
+      address: 10.156.0.5:50051
+      tags: ["gcp-vpc"]
+
+daemons:
+  schedd:
+    bind: tcp://0.0.0.0:9091
+    tls:
+      cert_path: /etc/faas/tls/schedd/server.crt
+      key_path: /etc/faas/tls/schedd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+    outbound:
+      target: tcp://vmmd.faas:50051
+      tls:
+        cert_path: /etc/faas/tls/schedd/vmmd-client.crt
+        key_path: /etc/faas/tls/schedd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
+    gateway_synth_target: tcp://10.156.0.5:8080
+  vmmd:
+    bind: tcp://0.0.0.0:50051
+    tls:
+      cert_path: /etc/faas/tls/vmmd/server.crt
+      key_path: /etc/faas/tls/vmmd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+    compute_node:
+      host_bridge_cidr: 10.100.0.0/16
+      overlay_cidr: 10.156.0.0/20
+      overlay_interface: ens4
+  apid:
+    bind: unix:///run/faas/apid.sock
+  meterd:
+    bind: unix:///run/faas/meterd.sock
+  gatewayd_public:
+    bind: tcp://0.0.0.0:443
+  gatewayd_internal:
+    bind: tcp://0.0.0.0:8080
+    apid_loopback: http://10.156.0.3:8081
+
+overlay:
+  provider: static
+  cidr: 10.156.0.0/20
+
+# The GCP VPC is RFC1918. These exceptions are intentionally explicit and
+# limited to the VPC overlay used by this fleet; do not copy this block to a
+# different network without reviewing its lateral-movement boundary.
+egress:
+  danger_accept_rfc1918_lateral_movement: true
+  overlay_exceptions:
+    - 10.156.0.0/20
+
+dns:
+  apps_domain: apps.gregale.dev
+  mode: cloudflare
+
+postgresql:
+  # Credentials remain in host-local secret material, never in this file.
+  dsn: postgres://faas@10.156.0.3:5432/faas?sslmode=disable
+  database: faas
+  migration_max_slot: 341
+  policy: on-boot
+
+release:
+  id: pre-1.0-b852d7e
+  git_sha: b852d7eef7cae7f55b27ea3c11da3659dc92693a
+  architecture: x86_64
+  firecracker_version: 1.7.0
+  firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419
+  kernel_digest: 9ee2204edd2162a6d9762bc6e07df00fdad57b83f9bf54bb8de4c9a200106e34
+  builder_base_digest: 56254c9475fe03ed3c485c85c4f86456d1a4206149cfa9ce294a818cdf7a411e
+  runtime_base_digest: 362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143
+
+storage:
+  fast_root: /srv/fc
+  spool_root: /var/spool/faas
+  log_root: /var/log/faas
+  run_dir: /run/faas
+
+cgroups:
+  slice: faas-cp.slice
+  controllers: "memory,cpu,io,pids"
+
+pki:
+  root_dir: /etc/faas/tls
+  ca_fingerprint: ceda4ea9662ceb9ef4c744d6dad7ed04591c6108d7de75f340614de02567162c
+  allowed_sans:
+    - schedd.faas
+    - vmmd.faas
+    - apid.faas
+    - gatewayd-public.faas
+    - gatewayd-internal-public.faas

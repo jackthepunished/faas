@@ -10,6 +10,9 @@ CI gate both consume this directory's contents.
 - `examples/splitbox.example.yaml` — canonical split-box example
   (one control-plane host + one compute-only host). Load it with
   `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
+- `production/gcp-live.yaml` — deployment-specific manifest for the current
+  two-node GCP fleet. Its private VPC addresses and release tuple are not
+  portable; use it only for that fleet and compute its hash before a release.
 
 ## Layout
 
