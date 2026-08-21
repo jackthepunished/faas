@@ -797,6 +797,29 @@ func (l *Loop) postBatch(ctx context.Context, env triggerDispatchRequest) ([]byt
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.ContentLength = int64(len(body))
+	// ADR-119 — attach an Authorization: Bearer JWT when the
+	// target app is in 'internal_only' mode. The trigger batch
+	// envelope carries ONE appID across all records, so the
+	// lookup is per-batch (not per-record). Same nil-safe +
+	// fail-closed posture as SynthesizeRequest + Invoke. The
+	// lookup carries the parent ctx so a shutdown signal
+	// cancels the store round-trip. Without this attachment,
+	// the gate at synth.go::handleInvocationDispatchBatch would
+	// 403 every internal_only batch the schedd posts.
+	if l.appPublicAuthModeLookup != nil {
+		if res, lookupErr := l.appPublicAuthModeLookup(ctx, env.AppID); lookupErr != nil || res.Mode == "internal_only" {
+			if l.mintInternalSvcToken == nil {
+				l.log.Warn("sched: batch path: app in internal_only mode (or lookup failed) but no minter wired; gate will 403",
+					"app_id", env.AppID, "lookup_err", lookupErrStr(lookupErr))
+			} else {
+				tok, mErr := l.mintInternalSvcToken(env.AppID)
+				if mErr != nil {
+					return nil, fmt.Errorf("sched: batch mint: %w", mErr)
+				}
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
+	}
 	resp, err := l.gatewayHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("post: %w", err)

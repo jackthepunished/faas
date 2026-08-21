@@ -231,12 +231,18 @@ type PublicAuthConfig struct {
 
 // Canonical public-auth mode strings (issue #477). Values
 // must stay in sync with the apps_public_auth_mode_chk
-// CHECK constraint in migrations/00153_apps_public_auth.sql.
+// CHECK constraint in migrations/00153_apps_public_auth.sql
+// (widened in 00326 for ip_allowlist + 00333 for
+// internal_only). Companion drift-guard tests pin the three
+// surfaces equal: pkg/api/public_auth_constants_test.go (api
+// vs state) and pkg/gateway/handler_public_auth_constants_test.go
+// (handler package-local lowercase).
 const (
-	publicAuthModeOpen        = "open"
-	publicAuthModeBearer      = "bearer"
-	publicAuthModeBasic       = "basic"
-	publicAuthModeIPAllowlist = "ip_allowlist"
+	publicAuthModeOpen         = "open"
+	publicAuthModeBearer       = "bearer"
+	publicAuthModeBasic        = "basic"
+	publicAuthModeIPAllowlist  = "ip_allowlist"
+	publicAuthModeInternalOnly = "internal_only"
 )
 
 // docsTypeBase is the canonical docs path prefix for problem
@@ -716,6 +722,20 @@ type Handler struct {
 	// pkg/edgejwks.Verifier constructed against the per-URL JWKS
 	// cache; nil = JWT kind disabled (unit tests + pre-PR-5 builds).
 	jwtVerifier JWTVerifier
+
+	// internalSvcVerifier (ADR-119 / issue #477 #4) is the
+	// per-service public-key allowlist consulted by
+	// applyIngressInternalSvc and the parallel
+	// SynthServer.applyIngressInternalSvc (synth.go). It is
+	// wired by cmd/gatewayd-internal/internal_svc_verifier.go
+	// from the env-loaded FAAS_INTERNAL_SVC_PUBKEYS map (a JSON
+	// document mapping svcName→PEM-encoded Ed25519 public key).
+	// nil = internal_only mode disabled — the gate short-circuits
+	// to a 500 "operator_error" if an app is somehow in
+	// internal_only mode without the verifier wired (defence in
+	// depth: a misconfiguration that lets every internal-only
+	// request through is worse than a 500).
+	internalSvcVerifier InternalSvcVerifier
 
 	// validator (PR-B) is the per-rule JSON-Schema validate
 	// handle consulted by applyEdgeRuleValidate. Wired via
@@ -4604,6 +4624,23 @@ haveApp:
 	// clientIPFromTrustedXFF trust chain so a forged XFF fails closed
 	// in both layers without double-charging the audit stream.
 	if h.applyIngressIPAllowlist(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+	// ADR-119: per-app ingress 'internal_only' mode runs AFTER
+	// applyIngressIPAllowlist (so an IP-blocked request short-
+	// circuits first) and BEFORE applyEdgeRuleIP (so a JWT-failed
+	// request never wakes a Firecracker). Trust chain: gatewayd-
+	// public MUST strip inbound Authorization (see
+	// internal_proxy.go:~351 — added in this PR) so external
+	// callers can never reach this gate with an Authorization
+	// header intact. Only daemons that dial gatewayd-internal
+	// directly via /run/faas/gatewayd-internal.sock reach this
+	// gate. The synth-side gate (SynthServer.handleSynthesize,
+	// pkg/gateway/synth.go) is the parallel cron-fired path —
+	// both gates share the same verifier (cmd/gatewayd-internal/
+	// internal_svc_verifier.go).
+	if h.applyIngressInternalSvc(w, r, app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}

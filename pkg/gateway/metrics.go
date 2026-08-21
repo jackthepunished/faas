@@ -226,6 +226,23 @@ type Metrics struct {
 	// §cardinality for the precedent. route_label is intentionally
 	// NOT admitted (could explode per ADR-093 cap of 50 per app).
 	responseBodyWarnTotal *prometheus.CounterVec
+	// internalAuthMatch (ADR-119 / issue #477 #4): counter of
+	// apps.public_auth_mode='internal_only' ingress verifications,
+	// labelled by outcome (matched | blocked). `matched` = a
+	// valid Authorization: Bearer JWT with aud='gregale.internal'
+	// was verified against the per-service public-key allowlist
+	// (pkg/internalsvc.Verify). `blocked` = verification failed
+	// (missing/invalid/expired/unknown svc). Round-2 peer-review
+	// (#6) removed the `bypass_stripped` label that no code path
+	// incremented (the Header.Del on internal_proxy.go was
+	// unconditional, so the strip was never bypassed and the
+	// counter stayed at zero forever). Distinct from edgeRuleMatch
+	// (which counts per-rule edge-rule decisions, not auth events);
+	// re-using edgeRuleMatch would conflate "an edge rule fired"
+	// with "a JWT was verified" and break the §12 dashboard
+	// "internal auth match rate" chip. Closed (outcome) set,
+	// pre-instantiated at boot below.
+	internalAuthMatch *prometheus.CounterVec
 	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
 	// apps.maintenance_mode coarse-gate matches. Distinct from the
 	// edgeRule* family because the coarse gate is not an edge
@@ -601,6 +618,16 @@ func NewMetrics() *Metrics {
 			Name: "gateway_response_body_warn_total",
 			Help: "Count of response bodies that approached or exceeded the per-plan MaxResponseBodyBytes cap, labelled by app_id and bucket (near_threshold|exceeded).",
 		}, []string{"app_id", "bucket"}),
+		// ADR-119 — apps.public_auth_mode='internal_only' ingress
+		// verification outcomes. Closed outcome set; the pre-
+		// instantiation below surfaces every tuple from first
+		// scrape so the §12 dashboard chip "internal auth match
+		// rate" starts at zero (not absent). Bounded to 3 series,
+		// well below the 50-counter budget.
+		internalAuthMatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_internal_auth_match_total",
+			Help: "apps.public_auth_mode='internal_only' ingress verification outcomes (matched|blocked), labelled by outcome. ADR-119.",
+		}, []string{"outcome"}),
 		// ADR-091 amendment — coarse-gate apps.maintenance_mode
 		// short-circuit counter. Distinct from edgeRule* family
 		// because the coarse gate is per-app, not per-rule. Plan
@@ -1069,6 +1096,20 @@ func NewMetrics() *Metrics {
 	for _, reason := range []string{"queue_empty_no_instance", "ttl_expired", "app_deleted"} {
 		m.leaderBootstrapAborts.WithLabelValues(reason)
 	}
+	// ADR-119 — pre-instantiate the closed (outcome) set on the
+	// internal-auth-match counter so the §12 dashboard chip
+	// "internal auth match rate" surfaces from first scrape.
+	// Round-2 peer-review (#6): the previous shape pre-instantiated
+	// a `bypass_stripped` label that no code path incremented —
+	// the Header.Del on internal_proxy.go was unconditional →
+	// the counter stayed at zero forever, wasting 1 of the
+	// 50-counter-per-app budget (ADR-093 cap) and undermining
+	// operator trust in the metric family. The label is removed.
+	// The set is {matched, blocked}; if a future hardening pass
+	// adds a third label, it's a code + dashboard change.
+	for _, outcome := range []string{"matched", "blocked"} {
+		m.internalAuthMatch.WithLabelValues(outcome)
+	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
 	// (result) set on the walk-completeness counter so the §12
 	// dashboard panel surfaces from boot. result="partial" is the
@@ -1163,7 +1204,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.internalAuthMatch, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1603,6 +1644,30 @@ func (m *Metrics) ObserveRouteConsumerThrottleDecision(kind, outcome string) {
 		kind = "none"
 	}
 	m.routeConsumerThrottleDecisions.WithLabelValues(kind, outcome).Inc()
+}
+
+// ObserveInternalAuthMatch (ADR-119) increments the
+// apps.public_auth_mode='internal_only' verification outcome
+// counter. Called from Handler.applyIngressInternalSvc (and the
+// parallel SynthServer.applyIngressInternalSvc at synth.go:300,
+// :340, :617) after the gate runs. outcome is one of
+// {matched, blocked} — the closed set pre-instantiated at boot.
+// Round-2 peer-review (#6) removed the dead `bypass_stripped`
+// label. An unknown outcome is coerced to "blocked" so a future
+// regression that ships a new outcome string does not blow up
+// the §12 dashboard chip on first contact (same fallback
+// posture as ObserveEdgeRuleMatch). Nil-safe.
+func (m *Metrics) ObserveInternalAuthMatch(outcome string) {
+	if m == nil {
+		return
+	}
+	switch outcome {
+	case "matched", "blocked":
+		// known
+	default:
+		outcome = "blocked"
+	}
+	m.internalAuthMatch.WithLabelValues(outcome).Inc()
 }
 
 // ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments the
