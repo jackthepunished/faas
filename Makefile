@@ -190,48 +190,7 @@ coverage-floor: ## Assert ship-blocking package floors across all coverage/cover
 	shopt -s nullglob ; \
 	files=($$COVERDIR/cover-shard*.out) ; \
 	if [ $${#files[@]} -eq 0 ]; then echo "coverage-floor: no coverage/cover-shard*.out files; run \`make test\` with -coverprofile first"; exit 1; fi ; \
-	python3 - "$${files[@]}" <<-'EOF' || exit 1
-	import re, sys
-	floors = {
-	    "pkg/fcvm":       70,
-	    "pkg/state":      70,
-	    "pkg/sched":      65,
-	    "pkg/gateway":    70,
-	    "pkg/vmmdgrpc":   60,
-	    "pkg/vmmdmount":  60,
-	}
-	stmts = {k: [0, 0] for k in floors}  # [stmts, hit]
-	re_pkg = re.compile(r"^github\.com/[^/]+/faas/(\S+):\d+:\s+(\S+)\s+(\d+)(?:\s+(\d+))?$")
-	for path in sys.argv[1:]:
-	    with open(path) as f:
-	        for line in f:
-	            m = re_pkg.match(line)
-	            if not m: continue
-	            file_, _, count, stmts_str = m.groups()
-	            for pkg in floors:
-	                if file_.startswith(pkg + "/") or file_ == pkg:
-	                    if pkg == "pkg/state" and "/sqlc/" in file_:
-	                        continue  # exclude generated sqlc
-	                    stmts[pkg][0] += int(stmts_str or 0)
-	                    if int(count) > 0:
-	                        stmts[pkg][1] += int(stmts_str or 0)
-	                    break
-	ok = True
-	for pkg, floor in floors.items():
-	    tot, hit = stmts[pkg]
-	    if tot == 0:
-	        print(f"  {pkg}: (no statements in any shard — skip)")
-	        continue
-	    pct = hit * 100 / tot
-	    marker = "✓" if pct >= floor else "✗"
-	    if pct < floor:
-	        ok = False
-	    print(f"  {pkg}: {pct:.1f}% (floor ≥ {floor}%) {marker}")
-	if not ok:
-	    print("coverage-floor: at least one package below floor")
-	    sys.exit(1)
-	print("coverage-floor: all ship-blocking packages ≥ floor ✓")
-	EOF
+	python3 .claude/ci/coverage_floor.py "$${files[@]}"
 
 .PHONY: test-property
 test-property: ## Property-based invariant tests (no KVM, no DB needed). §6.2 invariants land here.

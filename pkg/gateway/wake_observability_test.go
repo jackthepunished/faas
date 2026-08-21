@@ -252,7 +252,14 @@ func TestFirstByteRoundTripper_UpstreamErrorStillClean(t *testing.T) {
 		t.Fatalf("NewRequest: %v", err)
 	}
 	rt := newFirstByteRoundTripper(&http.Transport{})
-	_, err = rt.RoundTrip(req)
+	resp, err := rt.RoundTrip(req)
+	// RoundTrip may return a non-nil resp with a non-nil error
+	// (per http.RoundTripper contract). Close any returned body
+	// defensively to satisfy bodyclose; in this test the
+	// unreachable-host path typically leaves resp == nil.
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 	if err == nil {
 		t.Fatal("RoundTrip to unreachable host: err = nil, want non-nil")
 	}
