@@ -85,7 +85,7 @@ func TestPGBackend_AdmitSeedsThenEvictInstance(t *testing.T) {
 		t.Fatal("Pick pre-admit = ok; want empty cache")
 	}
 
-	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	if got := b.HealthyCount("app-1"); got != 1 {
@@ -118,7 +118,7 @@ func TestPGBackend_FanOutAcrossMaxConcurrency(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for _, want := range []string{"i-1", "i-2", "i-3"} {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
 			t.Fatalf("Admit: %v", err)
 		}
 		if got := b.HealthyCount("app-1"); got == 0 {
@@ -171,7 +171,7 @@ func TestPGBackend_AdmitErrorDoesNotSeedTarget(t *testing.T) {
 	sched := gateway.NewFakeScheduler("node-fake-1").WithErr(api.ErrCapacity("full"))
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err == nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err == nil {
 		t.Fatal("expected admit error")
 	}
 	if got := b.HealthyCount("app-1"); got != 0 {
@@ -186,7 +186,7 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 	sched := &atCapScheduler{}
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	wakeID, _, atCap, err := b.Admit(context.Background(), "app-1", "", "", 5)
+	wakeID, _, atCap, err := b.Admit(context.Background(), "app-1", "", "", "", 5)
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestPGBackend_AdmitAtCapacityHydratesLiveTarget(t *testing.T) {
 			return []gateway.Target{{InstanceID: "running-1", NodeID: "node-fake-1"}}, nil
 		})
 
-	_, _, atCap, err := b.Admit(context.Background(), "app-1", "", "", 5)
+	_, _, atCap, err := b.Admit(context.Background(), "app-1", "", "", "", 5)
 	if err != nil || !atCap {
 		t.Fatalf("Admit = atCapacity %v, err %v; want typed at-capacity", atCap, err)
 	}
@@ -225,11 +225,11 @@ func TestPGBackend_AdmitAtCapacityHydratesLiveTarget(t *testing.T) {
 // typed at_capacity=true outcome (issue #168).
 type atCapScheduler struct{}
 
-func (atCapScheduler) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
+func (atCapScheduler) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	return "", "", "", "", 0, true, 0, nil
 }
 
-func (atCapScheduler) EnsureWake(context.Context, string) (string, string, string, string, int32, int, error) {
+func (atCapScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	return "", "", "", "", 0, 0, nil
 }
 
@@ -258,7 +258,7 @@ func TestPGBackend_AdmitForwardsWakeMethod(t *testing.T) {
 			sched := &controllableScheduler{rawMethod: tc.raw}
 			b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-			_, method, atCap, err := b.Admit(context.Background(), "app-1", "", "", 5)
+			_, method, atCap, err := b.Admit(context.Background(), "app-1", "", "", "", 5)
 			if err != nil {
 				t.Fatalf("Admit: %v", err)
 			}
@@ -280,7 +280,7 @@ func TestPGBackend_AdmitAtCapacityLeavesMethodUnspecified(t *testing.T) {
 	sched := &atCapScheduler{}
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	_, method, atCap, err := b.Admit(context.Background(), "app-1", "", "", 5)
+	_, method, atCap, err := b.Admit(context.Background(), "app-1", "", "", "", 5)
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
@@ -299,11 +299,11 @@ type controllableScheduler struct {
 	rawMethod int32
 }
 
-func (c *controllableScheduler) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
+func (c *controllableScheduler) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	return "i-test", "n-test", "", "w-test", c.rawMethod, false, 0, nil
 }
 
-func (c *controllableScheduler) EnsureWake(context.Context, string) (string, string, string, string, int32, int, error) {
+func (c *controllableScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	return "i-test", "n-test", "", "w-test", c.rawMethod, 0, nil
 }
 
@@ -338,7 +338,7 @@ func TestPGBackend_AdmitCarriesOverridePort(t *testing.T) {
 		WithPort(9090)
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	tgt := b.Pick("app-1")
@@ -363,7 +363,7 @@ func TestPGBackend_AdmitPortZeroIsZero(t *testing.T) {
 	sched := gateway.NewFakeScheduler("n-1").WithInstanceID("i-1")
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	tgt := b.Pick("app-1")
@@ -395,12 +395,12 @@ type capturingScheduler struct {
 	admitted int
 }
 
-func (c *capturingScheduler) AdmitInstance(_ context.Context, _, _, _ string) (string, string, string, string, int32, bool, int, error) {
+func (c *capturingScheduler) AdmitInstance(_ context.Context, _, _, _, _ string) (string, string, string, string, int32, bool, int, error) {
 	c.admitted++
 	return "fake-instance-" + c.id, "127.0.0.1", "", "w-1", 8080, true, 0, nil
 }
 
-func (c *capturingScheduler) EnsureWake(_ context.Context, _ string) (string, string, string, string, int32, int, error) {
+func (c *capturingScheduler) EnsureWake(_ context.Context, _, _ string) (string, string, string, string, int32, int, error) {
 	c.admitted++
 	return "fake-instance-" + c.id, "127.0.0.1", "", "w-1", 8080, 0, nil
 }
@@ -429,7 +429,7 @@ func TestPGBackend_ResolveSched_MultiBox_RejectsTransientMiss(t *testing.T) {
 			return nil, false, nil
 		})
 
-	if _, _, _, err := b.Admit(context.Background(), "app-x", "", "", 5); err == nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-x", "", "", "", 5); err == nil {
 		t.Fatal("expected Admit to error on transient miss in multi-box posture, got nil")
 	}
 	if legacySched.Calls() != 0 {
@@ -457,7 +457,7 @@ func TestPGBackend_ResolveSched_MultiBox_RejectsEmptyNodeID(t *testing.T) {
 			return nil, false, nil
 		})
 
-	if _, _, _, err := b.Admit(context.Background(), "app-y", "", "", 5); err == nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-y", "", "", "", 5); err == nil {
 		t.Fatal("expected Admit to error on empty NodeID in multi-box posture, got nil")
 	}
 	if legacySched.Calls() != 0 {
@@ -483,7 +483,7 @@ func TestPGBackend_ResolveSched_LegacySingleBox_FallsBackToBSched(t *testing.T) 
 			return nil, false, nil
 		})
 
-	if _, _, _, err := b.Admit(context.Background(), "app-z", "", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-z", "", "", "", 5); err != nil {
 		t.Fatalf("single-box posture must accept transient miss; got err=%v", err)
 	}
 	if legacySched.Calls() != 1 {
@@ -508,7 +508,7 @@ func TestPGBackend_ResolveSched_MultiBox_HappyPathRoutesToOwner(t *testing.T) {
 			return ownerSched, true, nil
 		})
 
-	if _, _, _, err := b.Admit(context.Background(), "app-ok", "", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-ok", "", "", "", 5); err != nil {
 		t.Fatalf("multi-box happy path Admit: %v", err)
 	}
 	if ownerSched.admitted != 1 {

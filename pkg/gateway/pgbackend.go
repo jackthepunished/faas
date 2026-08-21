@@ -801,7 +801,12 @@ func (b *PGBackend) RecordTarget(appID string, target Target) {
 // configured, Admit first resolves the owning schedd via
 // apps.node_id. Otherwise it falls through to the legacy single
 // b.sched field.
-func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (string, WakeMethod, bool, error) {
+// trigger (ADR-127): wake-boot trigger enum value forwarded to
+// schedd's AdmitInstance RPC and stamped on the emitted
+// wake.boot_started / wake.boot_completed events. The gateway
+// always passes "gateway"; future callers (synth handler, replay
+// worker) can pass a distinct closed-enum value.
+func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Test seam (issue #272 / ADR-095 PR-B): the per-call scope arg
 	// is recorded on the backend so the unit test (TestPGBackend_AdmitScope)
 	// can assert which scope each admit carried. Production code
@@ -835,7 +840,7 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string
 	// live deployment the picker landed on. Empty falls through
 	// to schedd's default (newest live deployment) — the legacy
 	// single-deployment path.
-	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID, scope)
+	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID, scope, trigger)
 	// NOTE: ADR-098's `EnsureWake(ctx, appID)` is the new single-flight
 	// hot-path primitive on the gateway's Wake flow (pkg/gateway/pgbackend.go
 	// Wake method, issue #854 / PR #854 / 93059ff4). EnsureWake does NOT yet
