@@ -19,7 +19,9 @@ func main() {
 	gitSHA := fs.String("git-sha", "", "40-character release commit SHA (required)")
 	manifestHash := fs.String("manifest-hash", "", "deployment manifest hash sha256:<64hex> (required)")
 	outDir := fs.String("out-dir", "out", "artifact output directory")
-	fs.Parse(os.Args[1:])
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		os.Exit(2)
+	}
 	if *root == "" || *gitSHA == "" || *manifestHash == "" {
 		fs.Usage()
 		os.Exit(2)

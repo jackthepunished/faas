@@ -361,9 +361,9 @@ func (t *Tarball) Extract(root string) error {
 		// <release>/bin. Verify already checked its hash and the installer
 		// writes the trusted, signature-stamped manifest separately.
 		if hdr.Name == ManifestName {
-			if _, err := io.Copy(io.Discard, tr); err != nil {
-				return fmt.Errorf("releaseinstall: extract read %s: %w", hdr.Name, err)
-			}
+			// tar.Reader.Next discards unread bytes from the current
+			// member before advancing, so there is no need to copy an
+			// attacker-sized metadata payload into io.Discard here.
 			continue
 		}
 		// Sanitise at the loop head so the unsanitised
@@ -549,7 +549,7 @@ func (t *Tarball) hashWalk() error {
 	}
 	manifestBody, err := encodeTarballManifest(t.Manifest)
 	if err != nil {
-		return fmt.Errorf("%w: encode manifest: %v", ErrTarballTampered, err)
+		return fmt.Errorf("%w: encode manifest: %w", ErrTarballTampered, err)
 	}
 	gotManifest, ok := entryHashes[ManifestName]
 	if !ok {
