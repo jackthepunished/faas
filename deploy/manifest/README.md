@@ -11,10 +11,10 @@ CI gate both consume this directory's contents.
   (one control-plane host + one compute-only host). Load it with
   `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
 - `production/gcp-live.yaml` — deployment-specific manifest for the current
-  two-node GCP fleet. Its private DNS names, overlay network, and release
-  tuple are fleet-specific; private DNS must resolve `fsn-1.gregale.dev` and
-  `fsn-2.gregale.dev` before applying it, and its hash must be computed before
-  a release.
+  two-node fleet. Its private names, overlay network, and release tuple are
+  fleet-specific; its provider-neutral `private_dns: managed_hosts` adapter
+  derives private addresses from Ansible host facts and its hash must be
+  computed before a release.
 
 ## Layout
 
@@ -51,14 +51,14 @@ Use `/tmp/faas-ansible/inventory/hosts.ini` with the bootstrap playbook
 or `make ANSIBLE_INVENTORY=/tmp/faas-ansible/inventory/hosts.ini
 bootstrap-compute`. The generated `ansible_host` and overlay addresses
 come from `fleet.hosts[].address`. The vmmd target keeps the private mTLS
-identity (`vmmd.faas`) and the manifest port; the generated
-`faas_internal_hosts` entries map that identity to the overlay address in
-`/etc/hosts`. Hostname endpoints are intentionally left to the operator's
-private DNS contract; public Cloudflare DNS is not a substitute for resolving
-these private transport names. That private view must resolve both the
-fleet names (`fsn-1.gregale.dev`, `fsn-2.gregale.dev`) and the mTLS service
-identities (`schedd.faas`, `vmmd.faas`, `egress.faas`). Do not copy a server IP into the committed
-`deploy/ansible/host_vars` files.
+identity (`vmmd.faas`) and the manifest port. With `private_dns.mode:
+managed_hosts`, generated `faas_private_hosts` records are rendered into one
+Ansible-managed `/etc/hosts` block on every node. The address is gathered from
+the provider host fact (`ansible_default_ipv4.address` by default), or from
+the provider inventory's `faas_private_address` override when the default
+route is public. This is the portable source of truth; public Cloudflare DNS
+is never used for private transport names. Do not copy a server IP into the
+committed `deploy/ansible/host_vars` files.
 
 The validator fails closed on every missing field, every
 malformed CIDR, every non-octal mode, every non-hex digest, and

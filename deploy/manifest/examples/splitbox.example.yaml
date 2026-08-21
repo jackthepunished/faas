@@ -32,11 +32,10 @@
 # ILLUSTRATIVE ONLY — the addresses below are PLACEHOLDERS, not real operator
 # values. Replace with the actual CIDRs of your overlay before deploying:
 #
-#   fleet.hosts[].address (currently 10.42.0.1:9091, 10.42.0.2:50051):
-#     Replace each `host:port` with the routable dial address other daemons
-#     use to reach that host. This is NOT necessarily the public IP — it
-#     should be the overlay/mesh-routable address (Tailscale 100.64/10 exit
-#     node, WireGuard AllowedIPs, or the operator's VPC peer IP).
+#   fleet.hosts[].address (currently fsn-1.gregale.dev:9091,
+#     fsn-2.gregale.dev:50051): use stable private hostnames. The
+#     provider-neutral Ansible adapter resolves their private addresses from
+#     gathered inventory facts; do not copy provider IPs into daemon config.
 #
 #   overlay.cidr (currently 10.42.0.0/24):
 #     The overlay subnet every host's address must fall inside. Pick a
@@ -64,11 +63,11 @@ fleet:
   hosts:
     - name: fsn-1
       role: control-plane
-      address: 10.42.0.1:9091
+      address: fsn-1.gregale.dev:9091
       tags: ["primary", "vpc-pub"]
     - name: fsn-2
       role: compute-only
-      address: 10.42.0.2:50051
+      address: fsn-2.gregale.dev:50051
       tags: ["vpc-pub"]
 
 # Daemons — per-daemon configuration. The renderer (PR-2) writes
@@ -92,7 +91,7 @@ daemons:
         cert_path: /etc/faas/tls/schedd/vmmd-client.crt
         key_path: /etc/faas/tls/schedd/vmmd-client.key
         ca_path: /etc/faas/tls/ca/ca.crt
-    gateway_synth_target: tcp://10.42.0.2:8080
+    gateway_synth_target: tcp://fsn-2.gregale.dev:8080
   vmmd:
     bind: tcp://0.0.0.0:50051
     tls:
@@ -123,12 +122,11 @@ daemons:
   gatewayd_internal:
     bind: unix:///run/faas/gatewayd-internal.sock
     # Compute gatewayd proxies the apid surface to the control plane.
-    apid_loopback: http://10.42.0.1:8081
+    apid_loopback: http://fsn-1.gregale.dev:8081
 
 # Overlay — per-host overlay network identity. The generated Ansible
-# inventory writes /etc/hosts entries so the private PKI names
-# (schedd.faas, vmmd.faas) resolve to the manifest overlay addresses.
-# The CIDR is the overlay subnet; each host's address must fall within it.
+# inventory writes a managed private endpoint block so the fleet and private
+# PKI names resolve without public DNS. The CIDR remains the overlay subnet.
 overlay:
   provider: wireguard
   cidr: 10.42.0.0/24
@@ -159,14 +157,18 @@ dns:
   apps_domain: gregale.dev
   mode: cloudflare
 
+private_dns:
+  mode: managed_hosts
+  zone: gregale.dev
+
 # PostgreSQL — database cluster configuration. The renderer writes
 # the per-daemon db_url and the faas_map pg ident map. The
 # migration policy is on-boot for multi-box; on-boot-offline is
 # the single-box dev default.
 postgresql:
-  # Use the control-plane mesh address, not 127.0.0.1: compute daemons
+  # Use the control-plane private hostname, not 127.0.0.1: compute daemons
   # consume this same DSN after manifest rendering.
-  dsn: postgres://faas@10.42.0.1:5432/faas?sslmode=disable
+  dsn: postgres://faas@fsn-1.gregale.dev:5432/faas?sslmode=disable
   database: faas
   migration_max_slot: 265
   policy: on-boot
