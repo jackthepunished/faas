@@ -5097,7 +5097,7 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return s.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
-// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00352)
+// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00353)
 // upserts the deployment_openapi_snapshots row for the given
 // deployment. PR-B refactors MarkDeploymentLive to call this
 // method inside the same transaction as the status='live'
@@ -5160,7 +5160,7 @@ func (s *PgStore) UpdateDeploymentOpenAPISnapshot(ctx context.Context, snap Open
 
 // LatestOpenAPISnapshotForScope returns the most recently
 // captured snapshot for (appID, scope). The (app_id, scope,
-// captured_at DESC) index added in migration 00352 makes the
+// captured_at DESC) index added in migration 00353 makes the
 // lookup O(1). Returns state.ErrNotFound when no row exists —
 // the PR-C gate treats that as "no baseline, no break possible"
 // so the first promotion after the flag is flipped is ungated

@@ -60,7 +60,7 @@ func DomainDoctorEnabled() bool {
 // call (mirrors DomainDoctorEnabled / TenantSurfacesEnabled;
 // operator can flip the env var and the next PATCH handler
 // picks it up without a daemon bounce). Default off; the table
-// (migration 00352) + capture path (PR-B) + gate (PR-C) are
+// (migration 00353) + capture path (PR-B) + gate (PR-C) are
 // wired but the PATCH handlers short-circuit and the GET
 // endpoint returns 503 feature_disabled until the operator
 // sets the env var. ADR-121.
