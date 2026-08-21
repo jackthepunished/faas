@@ -1504,7 +1504,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// branch stays on CodePlanLimitConcur (429) — no scale-out
 	// was attempted, the customer's request is asking for a wake
 	// that the floor already satisfies.
-	outcome, obsCents, capCents, concurrency := e.admitGate(ctx, &app, limits)
+	outcome, obsCents, capCents, concurrency, atCapacity := e.admitGate(ctx, &app, limits)
 	if outcome != wakeAdmit {
 		release()
 		switch outcome {
@@ -1898,9 +1898,20 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 		// value for wire-shape clarity. trigger is the closed-enum
 		// value the caller (Engine.Wake / EnsureWake / AdmitInstance)
 		// threaded through.
+		//
+		// PR-A: atCapacity is the bool computed under the same Phase 2
+		// lock at admitGate (true when this admit pushes the ledger
+		// to the plan MaxConcurrency ceiling). Stamped on the same
+		// bundle so the BootStarted emit picks it up unchanged. The
+		// per-deployment path (admitAndDispatchForDeployment, line
+		// 1325) bypasses admitGate by design (its own deployment-
+		// scoped admit semantics) and surfaces AtCapacity=false on
+		// bootInput — the dashboard's recent-wakes view is per-app,
+		// not per-deployment.
 		trigger:            trigger,
 		queuedCount:        concurrency,
 		concurrencyAtAdmit: concurrency,
+		atCapacity:         atCapacity,
 	}
 	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
 	// the boundary between Phase 2 (admit + ledger) and Phase 3
@@ -2018,6 +2029,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 			Trigger:            bootInput.trigger,
 			QueuedCount:        bootInput.queuedCount,
 			ConcurrencyAtAdmit: bootInput.concurrencyAtAdmit,
+			AtCapacity:         bootInput.atCapacity, // PR-A — see bootInput.atCapacity doc
 		})
 	}
 	// ADR-097 (P1B): capture the schedd-side wake-phase boundaries.
@@ -2373,6 +2385,13 @@ type bootInput struct {
 	trigger            string
 	queuedCount        int
 	concurrencyAtAdmit int
+	// atCapacity (PR-A) is the bool returned by admitGate's
+	// wakeAdmit branch — true when the pre-admit ledger reading is
+	// maxConc-1 and this admit pushes the post-admit ledger to the
+	// plan's per-app MaxConcurrency ceiling. Stamped on the
+	// BootStarted emit; BootCompleted intentionally does NOT carry
+	// it (admit-time concept, post-RecordRuntime state is stale).
+	atCapacity bool
 }
 
 // timedDestroy issues a vmm.Destroy bounded by `timeout` and the
@@ -5631,7 +5650,15 @@ const (
 // out-params keep the lock-drop invariant documented at
 // engine.go:172-203 (release the per-app lock before reading the
 // cached values).
-func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limits) (wakeOutcome, int64, int64, int) {
+//
+// PR-A: a final bool — atCapacity — is computed under the same
+// Phase 2 lock. It is true ONLY on the wakeAdmit branch when the
+// pre-admit ledger reading is maxConc-1 (i.e. this admit pushes the
+// ledger to maxConc). Reject branches always return false (no
+// BootStarted row is emitted on rejection, so the value is moot).
+// Computed alongside `concurrency` to keep the lock footprint the
+// same — no extra ledger / Postgres read.
+func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limits) (wakeOutcome, int64, int64, int, bool) {
 	concurrency := e.ledger.Concurrency(app.ID)
 	// Mirror admission.go:149-152: apps created via store.CreateApp
 	// without a subsequent UpdateApp leave MaxConcurrency at 0.
@@ -5646,19 +5673,19 @@ func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limit
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "reject_at_cap")
 		}
-		return wakeRejectAtCap, 0, 0, concurrency
+		return wakeRejectAtCap, 0, 0, concurrency, false
 	}
 	if e.isOnScaleOutCooldown(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "cooldown_held")
 		}
-		return wakeCooldownHeld, 0, 0, concurrency
+		return wakeCooldownHeld, 0, 0, concurrency, false
 	}
 	if e.atMinFloorWithNoSignal(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "min_floor_already")
 		}
-		return wakeMinFloorAlready, 0, 0, concurrency
+		return wakeMinFloorAlready, 0, 0, concurrency, false
 	}
 	// Issue #561: spend cap pause-workload. Nil check tolerates
 	// legacy fixtures (the branch becomes a no-op).
@@ -5673,10 +5700,10 @@ func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limit
 			// refusal, and pkg/sched/loop.go:1249 `reaper_scale_down`
 			// is the precedent for engine-initiated audit writes.
 			e.overage.RecordReached(ctx, app.AccountID, observedCents, capCents)
-			return wakeOverageCapReached, observedCents, capCents, concurrency
+			return wakeOverageCapReached, observedCents, capCents, concurrency, false
 		}
 	}
-	return wakeAdmit, 0, 0, concurrency
+	return wakeAdmit, 0, 0, concurrency, concurrency+1 >= maxConc
 }
 
 // isOnScaleOutCooldown (PR-C, issue #462) returns true when

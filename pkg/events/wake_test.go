@@ -21,7 +21,7 @@ func TestWakeEvent_AllKindsImplementInterface(t *testing.T) {
 	// compile.
 	var _ WakeEvent = QueueAccepted{EmitAt: now, WakeID: "w", AppID: "a", RequestID: "r"}
 	var _ WakeEvent = Admitted{EmitAt: now, WakeID: "w", AppID: "a", RequestID: "r", AccountID: "acct-1", Plan: "hobby"}
-	var _ WakeEvent = BootStarted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Trigger: "gateway", QueuedCount: 2, ConcurrencyAtAdmit: 3}
+	var _ WakeEvent = BootStarted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Trigger: "gateway", QueuedCount: 2, ConcurrencyAtAdmit: 3, AtCapacity: true}
 	var _ WakeEvent = BootCompleted{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Trigger: "gateway", QueuedCount: 2, ConcurrencyAtAdmit: 3}
 	var _ WakeEvent = BootFailed{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", Method: "cold_boot", Reason: "stub"}
 	var _ WakeEvent = Readiness200{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", NodeID: "n", HealthcheckPath: "/healthz", ProbeCount: 1, ElapsedMs: 50}
@@ -167,6 +167,7 @@ func TestBootStarted_Shape_IncludesNewFields(t *testing.T) {
 		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
 		InstanceID: "i-1", NodeID: "n-1", Method: "cold_boot",
 		Trigger: "gateway", QueuedCount: 8, ConcurrencyAtAdmit: 2,
+		AtCapacity: true,
 	}
 	p := ev.Payload()
 	if got := p["trigger"]; got != "gateway" {
@@ -180,6 +181,46 @@ func TestBootStarted_Shape_IncludesNewFields(t *testing.T) {
 	}
 	if got := p["method"]; got != "cold_boot" {
 		t.Errorf("payload.method = %v, want cold_boot (existing field regression)", got)
+	}
+}
+
+// TestBootStarted_AtCapacity — PR-A. The new `at_capacity` field
+// must surface in the payload as a JSON bool (NOT a string "true")
+// so the dashboard's `(data->>'at_capacity')::bool` cast gets the
+// right type. A future contributor who accidentally stringifies
+// the field breaks the recent-instances COALESCE — catch it here.
+// Also pins the always-present contract: at_capacity is unconditional
+// (unlike Trigger which is conditional), so both true and false
+// leaves appear in the jsonb.
+func TestBootStarted_AtCapacity(t *testing.T) {
+	cases := []struct {
+		name string
+		in   bool
+		want bool
+	}{
+		{"at-capacity wake", true, true},
+		{"non-capacity wake", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := BootStarted{
+				EmitAt:     time.Unix(0, 0).UTC(),
+				WakeID:     "w",
+				AppID:      "a",
+				InstanceID: "i",
+				NodeID:     "n",
+				Method:     "cold_boot",
+				AtCapacity: tc.in,
+			}
+			p := ev.Payload()
+			v, present := p["at_capacity"]
+			if !present {
+				t.Fatalf("payload.at_capacity missing (must be unconditional — see PR-A plan §A)")
+			}
+			if v != tc.want {
+				t.Errorf("payload.at_capacity = %v (%T), want %v", v, v, tc.want)
+			}
+		})
 	}
 }
 
