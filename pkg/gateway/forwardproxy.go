@@ -318,7 +318,7 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	if protocol == "" {
 		protocol = "http1"
 	}
-	if log.Enabled(context.Background(), slog.LevelDebug) {
+	if log.Enabled(r.Context(), slog.LevelDebug) {
 		log.Debug("gateway: framing selection",
 			"node", t.NodeID,
 			"app", r.Header.Get("x-faas-app"),
