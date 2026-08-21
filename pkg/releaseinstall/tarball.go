@@ -367,21 +367,16 @@ func (t *Tarball) Extract(root string) error {
 			// attacker-sized metadata payload into io.Discard here.
 			continue
 		}
-		// Sanitise every path component through the established
-		// SafeArchiveEntryName barrier so CodeQL can prove that the
-		// value reaching filepath.Join is safe. Keep nested relative
-		// paths intact: runtime assets live at
-		// runners/<runtime>/faas-runner and must not collapse to one
-		// shared basename.
-		safeParts := make([]string, 0, 3)
-		for _, part := range strings.Split(hdr.Name, "/") {
-			safePart, sErr := SafeArchiveEntryName(part)
-			if sErr != nil {
-				return fmt.Errorf("%w: %w", ErrTarballTampered, sErr)
-			}
-			safeParts = append(safeParts, safePart)
+		// Validate the complete archive name through the explicit
+		// SafeArchiveRelativeName barrier before it reaches any filesystem
+		// operation. Keep nested relative paths intact: runtime assets live
+		// at runners/<runtime>/faas-runner and must not collapse to one
+		// shared basename. Keeping this as one direct sanitizer call also
+		// lets CodeQL prove the tainted tar header cannot reach the sink.
+		safe, sErr := SafeArchiveRelativeName(hdr.Name)
+		if sErr != nil {
+			return fmt.Errorf("%w: %w", ErrTarballTampered, sErr)
 		}
-		safe := strings.Join(safeParts, "/")
 		// Post-join containment defence: reject a pre-existing
 		// symlinked bin directory and ensure every nested parent
 		// resolves to the intended release tree before writing.
