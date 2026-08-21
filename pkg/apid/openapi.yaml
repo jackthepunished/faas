@@ -9342,7 +9342,7 @@ components:
         deployed_via:
           type: [string, "null"]
           enum: [null, api, cli, dashboard, github, operator]
-          description: "Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00303_deployments_actor.sql's CHECK constraint."
+          description: "Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00305_deployments_actor.sql's CHECK constraint."
           example: "cli"
         deployed_from_ip:
           type: [string, "null"]
@@ -9359,6 +9359,29 @@ components:
           type: [string, "null"]
           description: "Raw GitHub login of the pusher when `deployed_via == \"github\"`. Empty for all other via values. Distinct from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH identity, suitable for downstream GitHub-API correlation."
           example: "poyrazK"
+        # Issue #977 / ADR-116 — deployment annotation echo. The four
+        # columns stamped at create time are surfaced verbatim so the
+        # dashboard, CLI history, and SDK consumers can render the
+        # annotation without an audit round-trip. omitempty on each
+        # keeps pre-feature rows byte-identical to the pre-PR wire
+        # shape. The closed-set vocabulary on tag and the length cap
+        # on reason are enforced at the schema layer
+        # (deployments_tag_set_chk / deployments_reason_len_chk).
+        reason:
+          type: string
+          maxLength: 280
+          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+        tag:
+          type: string
+          enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag for grouping/filtering."
+        deployed_by:
+          type: string
+          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+        pr_number:
+          type: integer
+          minimum: 1
+          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
@@ -9400,6 +9423,19 @@ components:
           type: [string, "null"]
           pattern: '^[a-f0-9]{40}$'
           description: "40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA."
+        # Issue #977 / ADR-116 — deployment annotations. Optional;
+        # CLI auto-captures deployed_by from `git config user.name`.
+        reason:
+          type: [string, "null"]
+          maxLength: 280
+        tag:
+          type: [string, "null"]
+          enum: [null, incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+        deployed_by:
+          type: [string, "null"]
+        pr_number:
+          type: [integer, "null"]
+          minimum: 1
 
     UpdateDeploymentRequest:
 
@@ -9917,6 +9953,26 @@ components:
           pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
           description: "Top-level per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
           example: "prod"
+        # Issue #977 / ADR-116 — deployment annotation fields. The
+        # githubd bridge + GitHub Action auto-capture DeployedBy +
+        # PRNumber; the CLI captures DeployedBy from `git config
+        # user.name` when in a repo. Reason + Tag are operator-
+        # supplied. nil/omitted on every field = no annotation.
+        reason:
+          type: [string, "null"]
+          maxLength: 280
+          description: "Free-form operator note (issue #977 / ADR-116). DB CHECK enforces length(reason) <= 280."
+        tag:
+          type: [string, "null"]
+          enum: [null, incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag. DB CHECK (deployments_tag_set_chk) enforces the same vocabulary."
+        deployed_by:
+          type: [string, "null"]
+          description: "Operator label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; Action defaults to ${{ github.actor }}."
+        pr_number:
+          type: [integer, "null"]
+          minimum: 1
+          description: "PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0)."
 
     CreateDeploymentOverrides:
       description: |
@@ -10964,6 +11020,21 @@ components:
           enum: [tarball]
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
+        # Issue #977 / ADR-116 — annotation fields. The GitHub
+        # Action .github/actions/deploy/action.yml passes these
+        # from the action.yml inputs. nil/omitted on every field
+        # = no annotation.
+        reason:
+          type: [string, "null"]
+          maxLength: 280
+        tag:
+          type: [string, "null"]
+          enum: [null, incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+        deployed_by:
+          type: [string, "null"]
+        pr_number:
+          type: [integer, "null"]
+          minimum: 1
 
     DiffRequest:
       description: |

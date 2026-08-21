@@ -355,6 +355,29 @@ var cliCommands = []cliCommand{
 			// The snippet uses --name / cwd as the app slug.
 			{Name: "github", Short: "emit a GitHub Actions workflow snippet for faas-deploy-action"},
 			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: templateNames13},
+			// Issue #977 / ADR-116: deployment annotations surface.
+			// --reason is free text (≤280 chars); --tag is closed-set
+			// (see DeploymentAnnotationTags in cmd_deploy_annotations.go);
+			// --deployed-by auto-resolves to `git config user.name`
+			// when unset and cwd is in a git repo; --pr-number
+			// threads the GitHub PR number through the JSON
+			// CreateDeploymentRequest path (the source-ref path
+			// threads it via the githubd bridge). The manifest is
+			// the source of truth for --tag's vocabulary (goconst
+			// package-wide; reusing the slice keeps completion + docs
+			// in lockstep).
+			//
+			// Review fix CRIT-3 (issue #977 / ADR-116): --pr-number
+			// was added in the cli-flag threading commit but not
+			// registered here, so generated help/docs and the
+			// cli_meta-driven validation surfaces missed it. The
+			// Action path defaults to ${{ github.event.pull_request.number }}
+			// but operators running the CLI directly with a known
+			// PR number need an discoverable way to stamp it.
+			{Name: "reason", Short: "free-text deploy reason (≤280 chars)"},
+			{Name: "tag", Short: "annotation tag", ClosedSet: DeploymentAnnotationTags},
+			{Name: "deployed-by", Short: "operator label (auto-resolved from git config user.name)"},
+			{Name: "pr-number", Short: "GitHub PR number (positive int; 0 = absent). CI paths stamp via the GitHub Action."},
 		},
 	},
 	{

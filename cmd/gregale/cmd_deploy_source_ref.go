@@ -19,6 +19,12 @@
 //	gregale deploy --repo OWNER/NAME --ref $(git rev-parse HEAD)
 //
 // with no GREGALE_INSTALL_TOKEN_* env vars set.
+//
+// Annotations (issue #977 / ADR-116) ride on this path as
+// `--reason` / `--tag` / `--deployed-by` flags (cmdDeployTarball)
+// and are forwarded into the JSON wire. The GitHub Action path
+// runs gregale deploy with explicit values for all three; local CLI
+// invocations resolveDeployedBy() picks the actor label.
 
 package main
 
@@ -46,16 +52,30 @@ import (
 // jsonOutput true → single JSON-encoded DeploymentResponse on
 // osStdout (matches the existing Deploy/DeployTarball wire shape).
 // jsonOutput false → streamDeployLogs tail the SSE build log.
-func cmdDeployRepoSourceRef(slug, repo, ref string) int {
+// cmdDeployRepoSourceRef posts {repo, ref, format:"tarball", annotations...}
+// to the PR-A endpoint and streams the build log. The annotation
+// fields (issue #977 / ADR-116) ride on the JSON wire directly
+// (SourceRefDeployRequest is the JSON body — distinct from the
+// multipart DeployTarball path). The GitHub Action defaults
+// DeployedBy to ${{ github.actor }} and PRNumber to
+// ${{ github.event.pull_request.number }} when present, so the CI
+// path stays zero-friction. Local CLI invocations call this with
+// whatever resolveDeployedBy produced (which may be the auto-
+// captured git config user.name).
+func cmdDeployRepoSourceRef(slug, repo, ref string, ann api.DeployAnnotations) int {
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
 	ctx := context.Background()
 	req := api.SourceRefDeployRequest{
-		Repo:   repo,
-		Ref:    ref,
-		Format: "tarball",
+		Repo:       repo,
+		Ref:        ref,
+		Format:     "tarball",
+		Reason:     ann.Reason,
+		Tag:        ann.Tag,
+		DeployedBy: ann.DeployedBy,
+		PRNumber:   ann.PRNumber,
 	}
 	dep, err := client.DeployFromSourceRef(ctx, slug, req)
 	if err != nil {

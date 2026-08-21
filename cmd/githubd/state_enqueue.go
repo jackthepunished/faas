@@ -122,6 +122,20 @@ func (a *apidEnqueuer) Enqueue(ctx context.Context, spec githubd.BuildSpec) (sta
 		Ref:          spec.Ref,
 		Branch:       spec.Branch,
 		Pusher:       spec.Pusher,
+		// Issue #977 / ADR-116: thread the annotation surface from
+		// the dispatcher. PRNumber is int32 on the wire (the proto3
+		// convention); the bridge converts to int for the apidsource.
+		// SenderLogin takes precedence over Pusher on the bridge
+		// side when present (sender is the actor who opened the
+		// webhook; pusher is the commit author for push events).
+		PullRequestNumber: spec.PRNumber,
+		SenderLogin:       spec.SenderLogin,
+		// EventKind drives the deployments.kind stamp (issue #272 /
+		// ADR-094): push → DeploymentKindGitHub, pull_request →
+		// DeploymentKindPreview. Zero (UNSPECIFIED) is the legacy
+		// fallback that keeps stamping DeploymentKindGitHub so
+		// older dispatchers / test fixtures stay binary-compatible.
+		EventKind: spec.EventKind,
 	}
 
 	resp, err := a.client.EnqueueBuild(ctx, req)

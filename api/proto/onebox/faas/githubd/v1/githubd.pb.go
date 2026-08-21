@@ -1300,7 +1300,19 @@ type EnqueueBuildRequest struct {
 	// Empty / unspecified preserves the pre-PR-A wire shape so an
 	// older githubd (or the existing slice-7 tests) keeps stamping
 	// DeploymentKindGitHub without a behaviour change.
-	EventKind     EnqueueBuildEventKind `protobuf:"varint,11,opt,name=event_kind,json=eventKind,proto3,enum=onebox.faas.githubd.v1.EnqueueBuildEventKind" json:"event_kind,omitempty"`
+	EventKind EnqueueBuildEventKind `protobuf:"varint,11,opt,name=event_kind,json=eventKind,proto3,enum=onebox.faas.githubd.v1.EnqueueBuildEventKind" json:"event_kind,omitempty"`
+	// Issue #977 / ADR-116: pull_request_number carries the GitHub
+	// PR number for pull_request events. apid stamps it onto
+	// deployments.pr_number (NULL for push events). 0 = absent.
+	// Reserved range is positive int32; pre-feature rows / push
+	// events always pass 0.
+	PullRequestNumber int32 `protobuf:"varint,12,opt,name=pull_request_number,json=pullRequestNumber,proto3" json:"pull_request_number,omitempty"`
+	// Issue #977 / ADR-116: sender_login is the GitHub login that
+	// triggered the webhook (vs. pusher, which is the commit author
+	// on push events). For pull_request events sender_login is the
+	// PR opener; apid prefers it over pusher as deployed_by. Empty
+	// when the githubd dispatcher doesn't have it.
+	SenderLogin   string `protobuf:"bytes,13,opt,name=sender_login,json=senderLogin,proto3" json:"sender_login,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1410,6 +1422,20 @@ func (x *EnqueueBuildRequest) GetEventKind() EnqueueBuildEventKind {
 		return x.EventKind
 	}
 	return EnqueueBuildEventKind_EVENT_KIND_UNSPECIFIED
+}
+
+func (x *EnqueueBuildRequest) GetPullRequestNumber() int32 {
+	if x != nil {
+		return x.PullRequestNumber
+	}
+	return 0
+}
+
+func (x *EnqueueBuildRequest) GetSenderLogin() string {
+	if x != nil {
+		return x.SenderLogin
+	}
+	return ""
 }
 
 type EnqueueBuildResponse struct {
@@ -1840,7 +1866,7 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\x05phase\x18\x03 \x01(\x0e2\".onebox.faas.githubd.v1.CheckPhaseR\x05phase\x12\x19\n" +
 	"\blogs_url\x18\x04 \x01(\tR\alogsUrl\x12\x18\n" +
 	"\asummary\x18\x05 \x01(\tR\asummary\"\x14\n" +
-	"\x12WriteCheckResponse\"\x83\x03\n" +
+	"\x12WriteCheckResponse\"\xd6\x03\n" +
 	"\x13EnqueueBuildRequest\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x15\n" +
@@ -1858,7 +1884,9 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\x06pusher\x18\n" +
 	" \x01(\tR\x06pusher\x12L\n" +
 	"\n" +
-	"event_kind\x18\v \x01(\x0e2-.onebox.faas.githubd.v1.EnqueueBuildEventKindR\teventKind\"m\n" +
+	"event_kind\x18\v \x01(\x0e2-.onebox.faas.githubd.v1.EnqueueBuildEventKindR\teventKind\x12.\n" +
+	"\x13pull_request_number\x18\f \x01(\x05R\x11pullRequestNumber\x12!\n" +
+	"\fsender_login\x18\r \x01(\tR\vsenderLogin\"m\n" +
 	"\x14EnqueueBuildResponse\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\x12#\n" +
 	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x15\n" +

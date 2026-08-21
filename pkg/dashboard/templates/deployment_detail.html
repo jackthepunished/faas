@@ -40,7 +40,7 @@
     .sev-medium   { color: #f9a825; font-weight: 600; }
     .sev-low      { color: #1565c0; font-weight: 600; }
     .sev-unknown  { color: #888; }
-    /* Error-explanations cluster (spec §6.4 amendment 1):
+/* Error-explanations cluster (spec §6.4 amendment 1):
        the per-deployment prose block surfaced when a deploy
        fails with a typed code (e.g. stateless_only_violation).
        Scoped under .error-explanation so no global selector
@@ -58,7 +58,7 @@
     .error-explanation .fix   { color: #047857; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; margin: 0.25rem 0; }
     .error-explanation .logs  { margin-top: 0.5rem; }
     .error-explanation .docs  { display: inline-block; margin-top: 0.5rem; }
-    /* Issue #606 / SAFE-RELEASES-E.1: deployer attribution chips.
+/* Issue #606 / SAFE-RELEASES-E.1: deployer attribution chips.
        The .badge.deployer-via reuses the badge palette with a
        neutral violet accent so the chip reads as metadata, not
        status. The .deployer-field is a lightweight text row for
@@ -68,7 +68,7 @@
     .deployer-field      { display: inline-block; margin-right: 0.75rem; font-size: 0.9rem; }
     .deployer-field.muted { color: #888; }
     p.deployer           { margin-top: 0.25rem; }
-    /* Stage timeline (ADR-117 v2 follow-on, A2): the closed-6-stage
+/* Stage timeline (ADR-117 v2 follow-on, A2): the closed-6-stage
        post-stream summary the customer sees via `gregale deploys
        show <id>`. Scoped under .stage-timeline so no global selector
        bleed. The HTML is rendered at the handler edge into the
@@ -79,6 +79,15 @@
     .stage-timeline .stage-row .label { flex: 1; }
     .stage-timeline .stage-row .duration { color: #888; }
     .stage-timeline .stage-footer { margin: 0.5rem 0 0 0; color: #6b7280; }
+    /* Issue #977 / ADR-116 — deploy-annotation chips.
+       The closed tag vocabulary matches the DB CHECK on
+       deployments.tag (migrations/00339). Each tag carries a
+       distinct colour so the list view groups visually. */
+    .badge.incident_recovery     { background: #fee2e2; color: #991b1b; }
+    .badge.hotfix                { background: #ffedd5; color: #9a3412; }
+    .badge.scheduled_maintenance { background: #dbeafe; color: #1e40af; }
+    .badge.compliance_hold       { background: #f3e8ff; color: #6b21a8; }
+    .badge.partner_request       { background: #ecfdf5; color: #065f46; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -107,7 +116,7 @@
         · Created: <code>{{.Data.Deployment.CreatedAt}}</code>
       </p>
 
-      {{ if .Data.Deployment.ErrorCode }}
+{{ if .Data.Deployment.ErrorCode }}
       <section class="error-explanation" data-cluster="error-explanations">
         <h3 class="title">✗ {{ .Data.Deployment.ErrorCode }}</h3>
         {{ if .Data.Deployment.Error }}
@@ -132,7 +141,7 @@
         <a class="docs" href="https://docs.gregale.dev/errors/{{ .Data.Deployment.ErrorCode }}" target="_blank" rel="noopener">docs →</a>
       </section>
       {{ end }}
-      {{/* Issue #606 / SAFE-RELEASES-E.1: structured deployer
+{{/* Issue #606 / SAFE-RELEASES-E.1: structured deployer
           attribution. The four fields are server-stamped from
           the HTTP request context (never client-supplied) and
           surface here so the SOC 2 CC7.2 / GDPR audit-trail
@@ -147,6 +156,30 @@
           {{if .Data.Deployment.DeployedFromIP}}<span class="deployer-field muted">from <code>{{.Data.Deployment.DeployedFromIP}}</code></span>{{end}}
         </p>
         {{end}}
+      {{if or .Data.Deployment.Reason .Data.Deployment.Tag .Data.Deployment.DeployedBy .Data.Deployment.PRNumber}}
+        <!-- Issue #977 / ADR-116 — deploy-annotations block. Suppressed
+             entirely when all four fields are blank (the common case
+             for pre-#977 rows or push-to-main without action input). -->
+        <h2>Annotation</h2>
+        <dl>
+          {{if .Data.Deployment.Tag}}
+            <dt>Tag</dt>
+            <dd><span class="badge {{.Data.Deployment.Tag}}">{{.Data.Deployment.Tag}}</span></dd>
+          {{end}}
+          {{if .Data.Deployment.Reason}}
+            <dt>Reason</dt>
+            <dd><code>{{.Data.Deployment.Reason}}</code></dd>
+          {{end}}
+          {{if .Data.Deployment.DeployedBy}}
+            <dt>Deployed by</dt>
+            <dd><code>{{.Data.Deployment.DeployedBy}}</code></dd>
+          {{end}}
+          {{if .Data.Deployment.PRNumber}}
+            <dt>PR</dt>
+            <dd>#{{.Data.Deployment.PRNumber}}</dd>
+          {{end}}
+        </dl>
+      {{end}}
 
       {{ with .Data.Stages }}
       {{ if .BodyHTML }}

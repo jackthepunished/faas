@@ -331,6 +331,23 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 	} else {
 		dep.Scope = api.DefaultEnvScope
 	}
+	// Issue #977 / ADR-116: stamp the annotation surface from the
+	// JSON wire. Pointer fields let a customer omit a field
+	// (treats as NULL on the row) vs supply an empty string
+	// (would be stored as "" — unusual but legal). pgstore
+	// collapses dep.PRNumber=0 to NULL via nullif(0).
+	if req.Reason != nil {
+		dep.Reason = *req.Reason
+	}
+	if req.Tag != nil {
+		dep.Tag = *req.Tag
+	}
+	if req.DeployedBy != nil {
+		dep.DeployedBy = *req.DeployedBy
+	}
+	if req.PRNumber != nil {
+		dep.PRNumber = *req.PRNumber
+	}
 	if overrides != nil {
 		applyOverridesToDeployment(&dep, overrides)
 	}
@@ -436,13 +453,25 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// without a schema migration. Omit-when-zero rule matches
 	// the PR #984 annotation-merge helper.
 	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
-	s.audit.EmitAs(ctxr, resolvedActor, "app.deployed", &acct.ID, mergeActorAudit(map[string]any{
+	appDeployedData := map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": d.ID,
 		"ref":           req.Image,
 		"supersedes":    prev.ID,
 		"has_overrides": hasOverrides,
-	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
+	}
+	// Issue #977 / ADR-116: mirror the annotation surface into the
+	// app.deployed audit row. Reuses mergeAnnotationAudit so the
+	// three deploy paths (image JSON, source-tarball multipart,
+	// source-ref JSON) all stamp the same keys with the same
+	// "omit when zero" rule. Pre-feature rows stay byte-identical.
+	mergeAnnotationAudit(appDeployedData, annotationForm{
+		Reason:     d.Reason,
+		Tag:        d.Tag,
+		DeployedBy: d.DeployedBy,
+		PRNumber:   d.PRNumber,
+	})
+	s.audit.EmitAs(ctxr, resolvedActor, "app.deployed", &acct.ID, mergeActorAudit(appDeployedData, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 	// Issue #472 / ADR-054: emit app.signed_image_accepted here ONLY
 	// when require_signed is on for this deploy. imaged will later emit
 	// app.signature_invalid / app.signature_missing from its verify hook

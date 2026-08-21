@@ -42,6 +42,14 @@
     .sev-medium   { color: #f9a825; font-weight: 600; }
     .sev-low      { color: #1565c0; font-weight: 600; }
     .sev-unknown  { color: #888; }
+    /* Issue #977 / ADR-116 — deploy-annotation tag chips.
+       Same palette as deployment_detail.html so list and detail
+       pages render the closed tag vocabulary in matching colours. */
+    .badge.incident_recovery     { background: #fee2e2; color: #991b1b; }
+    .badge.hotfix                { background: #ffedd5; color: #9a3412; }
+    .badge.scheduled_maintenance { background: #dbeafe; color: #1e40af; }
+    .badge.compliance_hold       { background: #f3e8ff; color: #6b21a8; }
+    .badge.partner_request       { background: #ecfdf5; color: #065f46; }
     /* Issue #791 PR-E / ADR-090 closure — cron runs panel.
        Glyph palette mirrors .sev-* so a "×" reads as "failed"
        wherever it appears. .enabled-true / .enabled-false
@@ -125,13 +133,26 @@
       <h2>Recent deployments</h2>
       {{if .Data.Deployments}}
         <table>
-          <thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Scan</th><th>Error</th><th>Action</th></tr></thead>
+          <thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Annotation</th><th>Scan</th><th>Error</th><th>Action</th></tr></thead>
           <tbody>
             {{range .Data.Deployments}}
               <tr>
                 <td>{{.CreatedAt}}</td>
                 <td>{{.Kind}}</td>
                 <td>{{.Status}}</td>
+                <td>
+                  {{/* Issue #977 / ADR-116 — annotation column renders
+                       the tag chip + a 40-char reason preview + PR link.
+                       Each sub-field is suppressed independently so a
+                       row carrying only one annotation (e.g. push-to-
+                       main with --reason but no --tag) renders cleanly.
+                       All-empty renders the em-dash the existing dense
+                       list uses. */}}
+                  {{if .Tag}}<span class="badge {{.Tag}}">{{.Tag}}</span>{{end}}
+                  {{if .Reason}} <code title="{{.Reason}}">{{.Reason}}</code>{{end}}
+                  {{if and .PRNumber .RepoFullName}} <a href="https://github.com/{{.RepoFullName}}/pull/{{.PRNumber}}" target="_blank" rel="noopener">#{{.PRNumber}}</a>{{end}}
+                  {{if and (not .Tag) (not .Reason) (not .PRNumber)}}<span style="color:#888">—</span>{{end}}
+                </td>
                 <td>
                   {{if .ScanSummary}}
                     {{/* Issue #464 / ADR-055: per-deploy grype scan chip.

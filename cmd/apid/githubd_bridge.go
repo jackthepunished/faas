@@ -287,6 +287,16 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	// compat and the audit log (g.log.Info below) carries them
 	// on the build_enqueued line.
 	//
+	// Issue #977 / ADR-116: Pusher + SenderLogin + PullRequestNumber
+	// stamp the annotation surface onto the deployment row. We
+	// prefer SenderLogin over Pusher as the deployed_by value when
+	// present (it's the actor who triggered the webhook — for
+	// pull_request events, that's the PR opener). Fall back to
+	// Pusher when SenderLogin is empty (push events, pre-feature
+	// builds, older githubd). PullRequestNumber is forwarded only
+	// when > 0; push events and pre-feature builds pass 0, which
+	// the pgstore nullif(0) collapse maps to NULL.
+	//
 	// Kind dispatch (issue #272 / ADR-094): the proto3 EnqueueBuild
 	// carries an event_kind enum (push vs pull_request). Push events
 	// keep stamping DeploymentKindGitHub (ADR-048 metering keys on
@@ -296,6 +306,10 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	// through to DeploymentKindGitHub so the pre-issue-#272 wire
 	// shape stays binary-compatible (older githubd builds + the
 	// slice-7 test fixtures don't set the field).
+	deployedBy := req.SenderLogin
+	if deployedBy == "" {
+		deployedBy = req.Pusher
+	}
 	kind := eventKindToDeploymentKind(req.EventKind)
 	res, err := apidsource.Enqueue(ctx, g.store, g.notif, apidsource.EnqueueParams{
 		AppID:       app.ID,
@@ -323,6 +337,14 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 		ActorVia:         "github",
 		ActorFromIP:      "127.0.0.1",
 		ActorPusherLogin: req.Pusher,
+		// Issue #977 / ADR-116: annotation surface forwarded onto
+		// the deployment row. DeployedBy prefers SenderLogin (the
+		// actor who triggered the webhook — for pull_request events,
+		// the PR opener) and falls back to Pusher for push events
+		// and pre-feature builds. PRNumber is forwarded as int; the
+		// pgstore nullif(0) collapse maps 0 to NULL.
+		DeployedBy: deployedBy,
+		PRNumber:   int(req.PullRequestNumber),
 	})
 	if err != nil {
 		return nil, g.asGRPC("enqueue", err)

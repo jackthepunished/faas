@@ -101,6 +101,11 @@ func (s *bridgeStubStore) CreateDeployment(_ context.Context, d state.Deployment
 	if d.Status == "" {
 		d.Status = state.DeployPending
 	}
+	// Capture the populated Deployment so the bridge tests can
+	// assert on the annotation fields (issue #977 / ADR-116).
+	// Creation is called once per EnqueueBuild, so no mutex is
+	// required — the bridge is single-threaded.
+	s.createDeploymentReturned = d
 	if s.createDeploymentErr != nil {
 		return state.Deployment{}, s.createDeploymentErr
 	}
@@ -743,5 +748,131 @@ func TestEnqueueBuild_NotifyFailureIsBestEffort(t *testing.T) {
 	}
 	if resp == nil || resp.BuildId == "" {
 		t.Errorf("response should carry the build_id even when notify failed: %+v", resp)
+	}
+}
+
+// TestEnqueueBuild_AnnotationsThreaded (issue #977 / ADR-116) pins the
+// bridge's responsibility for translating the proto's
+// (PullRequestNumber, SenderLogin, EventKind) fields onto the
+// deployment row's annotation columns (PRNumber, DeployedBy, Kind).
+// The bridge is the canonical seam between the githubd push webhook
+// and the deployment row writer — a regression here would silently
+// drop the annotation fields whenever a webhook fires. The bridge
+// prefers SenderLogin over Pusher (the actor who opened the webhook
+// vs. the commit author) for the deployed_by field.
+//
+// Drives the same path as TestEnqueueBuild_HappyPath but with the
+// three new proto fields populated, then asserts the captured
+// Deployment row carries the right values.
+func TestEnqueueBuild_AnnotationsThreaded(t *testing.T) {
+	accountID := "acct-1"
+	appID := "app-1"
+	stagingRoot := t.TempDir()
+	spoolRoot := t.TempDir()
+
+	path, size := stageFixtureFile(t, stagingRoot, filepath.Join(accountID, appID, "abc123"), []byte("tiny-tar"))
+
+	store := &bridgeStubStore{app: state.App{ID: appID, AccountID: accountID, Status: state.AppActive}}
+	notif := &bridgeStubNotifier{}
+	ops := wire.NewOpsMetrics("apid")
+	g := &githubdBridge{
+		store:       store,
+		notif:       notif,
+		log:         discLog(),
+		ops:         ops,
+		spool:       spoolRoot,
+		stagingRoot: stagingRoot,
+		spoolRoot:   spoolRoot,
+	}
+
+	resp, err := g.EnqueueBuild(context.Background(), &githubdpb.EnqueueBuildRequest{
+		AccountId:         accountID,
+		AppId:             appID,
+		CommitSha:         "abc123",
+		SourcePath:        path,
+		SourceUrl:         "https://codeload.example.com/repo/tar.gz/abc123",
+		SourceBytes:       size,
+		RepoFullName:      "owner/repo",
+		Branch:            "feature/ann",
+		Ref:               "refs/heads/feature/ann",
+		Pusher:            "octocat", // commit author; lower priority than SenderLogin
+		PullRequestNumber: 4242,
+		SenderLogin:       "alice", // actor who opened the PR — takes precedence
+		EventKind:         githubdpb.EnqueueBuildEventKind_EVENT_KIND_PULL_REQUEST,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueBuild: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	}
+
+	// Capture the populated Deployment row from the stub store.
+	created := store.createDeploymentReturned
+	if created.PRNumber != 4242 {
+		t.Errorf("dep.PRNumber = %d, want 4242 (PullRequestNumber not threaded)", created.PRNumber)
+	}
+	if created.DeployedBy != "alice" {
+		t.Errorf("dep.DeployedBy = %q, want %q (SenderLogin takes precedence over Pusher)", created.DeployedBy, "alice")
+	}
+	// Kind is derived from EventKind: pull_request → preview_deploy.
+	if created.Kind != state.DeploymentKindPreview {
+		t.Errorf("dep.Kind = %q, want %q (EventKind=pull_request → preview)", created.Kind, state.DeploymentKindPreview)
+	}
+}
+
+// TestEnqueueBuild_AnnotationsFallbackToPusher (issue #977 / ADR-116)
+// pins the SenderLogin-missing fallback: when the proto omits
+// SenderLogin (the push-event path), the bridge must use Pusher
+// (the commit author) as the deployed_by label. Without this
+// fallback, push-event deploys would render an empty DeployedBy
+// chip on the dashboard even though the data is in the wire.
+func TestEnqueueBuild_AnnotationsFallbackToPusher(t *testing.T) {
+	accountID := "acct-1"
+	appID := "app-1"
+	stagingRoot := t.TempDir()
+	spoolRoot := t.TempDir()
+
+	path, size := stageFixtureFile(t, stagingRoot, filepath.Join(accountID, appID, "abc123"), []byte("tiny-tar"))
+
+	store := &bridgeStubStore{app: state.App{ID: appID, AccountID: accountID, Status: state.AppActive}}
+	notif := &bridgeStubNotifier{}
+	ops := wire.NewOpsMetrics("apid")
+	g := &githubdBridge{
+		store:       store,
+		notif:       notif,
+		log:         discLog(),
+		ops:         ops,
+		spool:       spoolRoot,
+		stagingRoot: stagingRoot,
+		spoolRoot:   spoolRoot,
+	}
+
+	// No SenderLogin, no PullRequestNumber — push-event shape.
+	_, err := g.EnqueueBuild(context.Background(), &githubdpb.EnqueueBuildRequest{
+		AccountId:    accountID,
+		AppId:        appID,
+		CommitSha:    "abc123",
+		SourcePath:   path,
+		SourceUrl:    "https://codeload.example.com/repo/tar.gz/abc123",
+		SourceBytes:  size,
+		RepoFullName: "owner/repo",
+		Branch:       "main",
+		Ref:          "refs/heads/main",
+		Pusher:       "octocat",
+		EventKind:    githubdpb.EnqueueBuildEventKind_EVENT_KIND_PUSH,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueBuild: %v", err)
+	}
+	created := store.createDeploymentReturned
+	if created.DeployedBy != "octocat" {
+		t.Errorf("dep.DeployedBy = %q, want %q (Pusher fallback for push events)", created.DeployedBy, "octocat")
+	}
+	if created.PRNumber != 0 {
+		t.Errorf("dep.PRNumber = %d, want 0 (push events leave PRNumber NULL)", created.PRNumber)
+	}
+	if created.Kind != state.DeploymentKindGitHub {
+		t.Errorf("dep.Kind = %q, want %q (push → github)", created.Kind, state.DeploymentKindGitHub)
 	}
 }

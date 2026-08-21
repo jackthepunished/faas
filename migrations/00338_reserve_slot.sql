@@ -1,4 +1,4 @@
--- 00338_reserve_slot.sql — temporary concurrent-PR migration fence.
+-- filename: 00338_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;

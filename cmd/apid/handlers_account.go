@@ -638,6 +638,17 @@ func buildDeploymentsForExport(rows []state.Deployment) ([]api.DeploymentRespons
 			// the SELECT projection in pgstore.DeploymentByID /
 			// ListDeployments*).
 			Scope: d.Scope,
+			// Issue #977 / ADR-116: annotation echo on export
+			// fixtures. The four columns are operator-supplied
+			// metadata (free-text reason, closed-set tag, actor
+			// label, PR number). sanitizeExportString is applied
+			// to reason / tag / deployed_by so a customer who
+			// pasted PII into reason is still covered by the
+			// existing export scrubber.
+			Reason:     sanitizeExportString(d.Reason),
+			Tag:        sanitizeExportString(d.Tag),
+			DeployedBy: sanitizeExportString(d.DeployedBy),
+			PRNumber:   d.PRNumber,
 		})
 	}
 	return out, nil

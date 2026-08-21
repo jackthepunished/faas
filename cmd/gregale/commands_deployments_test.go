@@ -357,6 +357,127 @@ func TestRenderDeploymentRow_PinsColumnLayout(t *testing.T) {
 	}
 }
 
+// TestRenderDeploymentRowWide_PinsColumnLayout mirrors the above for
+// the --wide annotation layout (issue #977 / ADR-116). 9 columns
+// total: id / app / status / kind / by / pr / tag / reason /
+// created. We pin via %-verb count in the format string rather than
+// strings.Fields on the rendered line — the wide format pads each
+// column with spaces so strings.Fields collapses the leading-pad
+// columns into the data column. Format-string count is the canonical
+// tripwire.
+func TestRenderDeploymentRowWide_PinsColumnLayout(t *testing.T) {
+	if got, want := countFormatVerbs(deploymentRowFmtWide), 9; got != want {
+		t.Fatalf("deploymentRowFmtWide has %d %% verbs, want %d", got, want)
+	}
+	var buf bytes.Buffer
+	renderDeploymentRowWide(&buf, api.DeploymentResponse{
+		ID:          "0123456789abcdef0123456789abcdef",
+		AppID:       "fedcba9876543210fedcba9876543210",
+		ImageDigest: "sha256:abc123",
+		Kind:        "app",
+		Status:      "succeeded",
+		DeployedBy:  "poyraz",
+		PRNumber:    977,
+		Tag:         "hotfix",
+		Reason:      "Emergency rollback after payment provider incident",
+		CreatedAt:   "2026-07-23T11:25:00Z",
+	})
+	line := strings.TrimRight(buf.String(), "\n")
+	// Sanity-check the rendered line carries the four annotation
+	// tokens (by / pr / tag / reason).
+	for _, want := range []string{"poyraz", "977", "hotfix", "Emergency rollback after payment provide…"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("rendered line missing %q: %q", want, line)
+		}
+	}
+}
+
+// TestRenderDeploymentRowWide_EmptyAnnotationsRendersDash validates
+// that pre-feature rows render "-" (not empty spaces) in the
+// annotation columns so the table stays aligned when a fleet mixes
+// old and new rows. The 4 dashes are emitted by the renderer for
+// DeployedBy="", PRNumber=0, Tag="", Reason="".
+func TestRenderDeploymentRowWide_EmptyAnnotationsRendersDash(t *testing.T) {
+	var buf bytes.Buffer
+	renderDeploymentRowWide(&buf, api.DeploymentResponse{
+		ID:        "0123456789abcdef0123456789abcdef",
+		AppID:     "fedcba9876543210fedcba9876543210",
+		Kind:      "app",
+		Status:    "succeeded",
+		CreatedAt: "2026-07-23T11:25:00Z",
+	})
+	line := strings.TrimRight(buf.String(), "\n")
+	// Count the literal "-" placeholders in the rendered line.
+	// Each annotation column contributes one dash; columns are
+	// space-padded so the dash rides at the right edge of the pad.
+	dashCount := strings.Count(line, " -")
+	if dashCount < 4 {
+		t.Errorf("expected ≥4 ' -' (annotation dashes), got %d in %q", dashCount, line)
+	}
+}
+
+// countFormatVerbs returns the number of `%`-prefixed format verbs
+// in a printf format string. Used by the layout-pin tests above to
+// tripwire silent column-count drift without depending on the
+// (whitespace-collapsing) shape of the rendered line. Skips the
+// literal `%%` escape (a single `%` in the output).
+func countFormatVerbs(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '%' {
+			i++
+			continue
+		}
+		n++
+		// Skip the verb's optional [-+ #0]* prefix + width + .precision.
+		j := i + 1
+		for j < len(s) && (s[j] == '-' || s[j] == '+' || s[j] == ' ' || s[j] == '#' || s[j] == '0') {
+			j++
+		}
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j < len(s) && s[j] == '.' {
+			j++
+			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+				j++
+			}
+		}
+		i = j
+	}
+	return n
+}
+
+// TestTruncateReason pins the rune-aware truncation helper used by
+// the wide layout. A multi-byte reason must NOT be sliced mid-rune
+// (would render garbled on a UTF-8 terminal); the helper appends
+// "…" when the rune count exceeds the cap. Below-cap strings pass
+// through verbatim; empty passes through as empty (the wide
+// renderer turns "" into "-" downstream).
+func TestTruncateReason(t *testing.T) {
+	tests := []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"", 40, ""},
+		{"short", 40, "short"},
+		{"0123456789012345678901234567890123456789x", 40, "0123456789012345678901234567890123456789…"},
+		// 4-byte rune boundary — len("é")==2 bytes / 1 rune.
+		// Without rune-aware slicing this would slice mid-codepoint
+		// and render as replacement chars.
+		{"éééééééééééééééééééééééééééééééééééééééééééé", 5, "ééééé…"},
+	}
+	for _, tc := range tests {
+		if got := truncateReason(tc.in, tc.max); got != tc.want {
+			t.Errorf("truncateReason(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+		}
+	}
+}
+
 // TestCmdDeployments_NonEmpty_RowsRendered validates that the human
 // output is actually captured through the osStdout seam (PR #202 review
 // found the prior `fmt.Printf` path bypassed the seam; this pins the

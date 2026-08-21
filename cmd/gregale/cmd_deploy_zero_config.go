@@ -59,6 +59,33 @@ func cmdDeployZeroConfig(slug, cwd string) int {
 		PrintOK(osStdout, "Note: working tree has uncommitted changes — deploying HEAD as-is")
 	}
 
+	// Issue #977 / ADR-116: auto-capture `git config user.name` as
+	// the deployment's deployed_by. operator can override with
+	// --deployed-by in the cmdDeployTarball path; the zero-config
+	// path doesn't have flags so we read what the user has
+	// configured. gitUserName swallows ErrNoGitConfigKey to ""
+	// (the "operator never configured git" path) — empty is a
+	// valid deployed_by, the column is nullable.
+	//
+	// Review fix CRIT-2 (issue #977 / ADR-116): non-ErrNoGitConfigKey
+	// errors (config-file parse, permission denied, transient git
+	// hiccup) are also silently swallowed to "" — mirrors the
+	// policy in cmd_deploy_annotations.go:resolveDeployedBy, so a
+	// customer who deploys the same project via either path gets
+	// the same stamp. The audit row simply lacks a deployed_by and
+	// the dashboard renders nothing. Promoting these to a fatal
+	// would break §11 cross-path symmetry: a parse-corrupt
+	// ~/.gitconfig would block the zero-config path but not the
+	// flag path.
+	name, err := gitUserName(root)
+	if err != nil {
+		// log-and-continue: the deployment is still valid, just
+		// unannotated. The slug is the audit anchor.
+		PrintOK(osStdout, fmt.Sprintf("Note: could not read git config user.name (%v); proceeding without deployed_by", err))
+		name = ""
+	}
+	deployedBy := name
+
 	// Pack cwd. We intentionally reuse autoPackCwd (the same helper
 	// the cwd auto-detection branch uses) so the §9 shape invariants
 	// (≤10k files, no symlinks, no ../, etc.) stay aligned across
@@ -78,7 +105,7 @@ func cmdDeployZeroConfig(slug, cwd string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	dep, err := client.DeployFromSourceTarball(ctx, slug, mustOpen(tmpTar), filepath.Base(tmpTar), sourceTarballSidecar(owner, repo, sha))
+	dep, err := client.DeployFromSourceTarball(ctx, slug, mustOpen(tmpTar), filepath.Base(tmpTar), sourceTarballSidecar(owner, repo, sha, deployedBy))
 	if err != nil {
 		return printErr("Deploy failed", err)
 	}
@@ -92,11 +119,15 @@ func cmdDeployZeroConfig(slug, cwd string) int {
 // sourceTarballSidecar builds the optional informational sidecar the
 // apid-side handler records on the build row. Repo + ref are recorded
 // verbatim; the build pipeline does NOT use them to fetch upstream.
-func sourceTarballSidecar(owner, repo, sha string) api.SourceTarballDeployRequest {
+// DeployedBy is the auto-captured `git config user.name` (or ""
+// when unset); the CLI's --deployed-by flag in cmdDeployTarball
+// overrides this when present.
+func sourceTarballSidecar(owner, repo, sha, deployedBy string) api.SourceTarballDeployRequest {
 	// owner + repo are already lowercased by parseGitRemoteURL.
 	return api.SourceTarballDeployRequest{
-		Repo: strings.Join([]string{owner, repo}, "/"),
-		Ref:  sha,
+		Repo:       strings.Join([]string{owner, repo}, "/"),
+		Ref:        sha,
+		DeployedBy: deployedBy,
 	}
 }
 

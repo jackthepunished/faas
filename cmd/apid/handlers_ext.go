@@ -3718,6 +3718,16 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		DeployedVia:      d.DeployedVia,
 		DeployedFromIP:   d.DeployedFromIP,
 		PusherLogin:      d.PusherLogin,
+		// Issue #977 / ADR-116: annotation echo. The four
+		// columns stamped at create time are echoed verbatim so
+		// the dashboard, CLI history, and SDK consumers can
+		// render the annotation without an audit round-trip.
+		// omitempty on each field keeps pre-feature rows
+		// byte-identical to the pre-PR wire shape.
+		Reason:     d.Reason,
+		Tag:        d.Tag,
+		DeployedBy: d.DeployedBy,
+		PRNumber:   d.PRNumber,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint

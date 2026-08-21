@@ -128,8 +128,11 @@ func TestCmdDeployRepoSourceRef(t *testing.T) {
 		// setup mutates the sink in place.
 		setup func(sink *sourceRefSink)
 		// invoke is the CLI call under test. slug/repo/ref match
-		// the sourceRefDeployRequest wire shape.
-		invoke func(slug, repo, ref string) int
+		// the sourceRefDeployRequest wire shape. ann is the
+		// issue #977 / ADR-116 annotation bag — pre-feature
+		// (zero-value) tests pass api.DeployAnnotations{} so
+		// the legacy wire assertions stay valid.
+		invoke func(slug, repo, ref string, ann api.DeployAnnotations) int
 		expect expect
 	}{
 		{
@@ -216,8 +219,8 @@ func TestCmdDeployRepoSourceRef(t *testing.T) {
 		{
 			name:  "no_install_token_env_regression",
 			setup: func(sink *sourceRefSink) {}, // already stripped at parent
-			invoke: func(slug, repo, ref string) int {
-				return cmdDeployRepoSourceRef(slug, repo, ref)
+			invoke: func(slug, repo, ref string, ann api.DeployAnnotations) int {
+				return cmdDeployRepoSourceRef(slug, repo, ref, ann)
 			},
 			expect: expect{
 				exitCode: 0,
@@ -256,7 +259,7 @@ func TestCmdDeployRepoSourceRef(t *testing.T) {
 			stderr, restoreErr := captureStderr(t)
 			defer restoreErr()
 
-			code := tc.invoke(slug, repo, ref)
+			code := tc.invoke(slug, repo, ref, api.DeployAnnotations{})
 			if code != tc.expect.exitCode {
 				t.Errorf("exit = %d, want %d (stderr=%q)", code, tc.expect.exitCode, stderr.String())
 			}

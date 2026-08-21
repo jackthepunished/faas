@@ -188,7 +188,7 @@ func TestClient_DeployTarball_AutoMintsIdempotencyKey(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	if _, err := DeployTarball(c, context.Background(), "x", tar, "", "", false); err != nil {
+	if _, err := DeployTarball(c, context.Background(), "x", tar, "", "", false, api.DeployAnnotations{}); err != nil {
 		t.Fatalf("DeployTarball: %v", err)
 	}
 	if got == "" {
@@ -234,7 +234,7 @@ func TestClient_DeployTarball_RejectsSymlink_NoIdempotencyKeySent(t *testing.T) 
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
 
-	_, err := DeployTarball(c, context.Background(), "x", link, "", "", false)
+	_, err := DeployTarball(c, context.Background(), "x", link, "", "", false, api.DeployAnnotations{})
 	if err == nil {
 		t.Fatal("DeployTarball accepted a symlinked tarball path")
 	}
@@ -273,7 +273,7 @@ func TestClient_DeployTarball_RejectsDanglingSymlink(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
 
-	_, err := DeployTarball(c, context.Background(), "x", link, "", "", false)
+	_, err := DeployTarball(c, context.Background(), "x", link, "", "", false, api.DeployAnnotations{})
 	if err == nil {
 		t.Fatal("DeployTarball accepted a dangling symlinked tarball path")
 	}
@@ -308,7 +308,7 @@ func TestClient_DeployTarball_RejectsDirectoryAsTarball(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
 
-	_, err := DeployTarball(c, context.Background(), "x", subdir, "", "", false)
+	_, err := DeployTarball(c, context.Background(), "x", subdir, "", "", false, api.DeployAnnotations{})
 	if err == nil {
 		t.Fatal("DeployTarball accepted a directory as the tarball path")
 	}
@@ -364,7 +364,7 @@ func TestClient_DeployTarball_HappyPathStillUploads(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
 
-	resp, err := DeployTarball(c, context.Background(), "x", tar, "", "", false)
+	resp, err := DeployTarball(c, context.Background(), "x", tar, "", "", false, api.DeployAnnotations{})
 	if err != nil {
 		t.Fatalf("DeployTarball: %v", err)
 	}

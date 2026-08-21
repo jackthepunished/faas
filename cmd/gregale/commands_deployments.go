@@ -52,6 +52,19 @@ var deploymentIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 // TestRenderDeploymentRow pin on the column count.
 const deploymentRowFmt = "%-32s %-32s %-12s %-10s %s\n"
 
+// deploymentRowFmtWide extends the table with annotation columns
+// (issue #977 / ADR-116). Layout:
+//
+//	id | app | status | kind | by | pr | tag | reason (40c) | created
+//
+// `by` is d.DeployedBy (max 16 chars rendered); `pr` is the PR
+// number or "-"; `tag` is the closed-set enum (≤24 chars) or "-";
+// `reason` is d.Reason truncated to 40 chars + "…" when over.
+// `--wide` (`-w`) toggles this layout in cmdDeployments; the default
+// table stays the old 5-column shape so existing scripts / dashboard
+// scrapers don't break.
+const deploymentRowFmtWide = "%-32s %-32s %-12s %-10s %-16s %-6s %-24s %-41s %s\n"
+
 // renderDeploymentRow writes one deployment row to w. The fmt.Printf
 // inside writes to os.Stdout by default; tests that need the rendered
 // row in a buffer must use the osStdout package seam (see
@@ -62,6 +75,50 @@ func renderDeploymentRow(w io.Writer, d api.DeploymentResponse) {
 	_, _ = fmt.Fprintf(w, deploymentRowFmt, d.ID, d.AppID, d.Status, d.Kind, d.CreatedAt)
 }
 
+// renderDeploymentRowWide writes one deployment row using the wide
+// annotation layout. Empty annotation fields render as "-" so columns
+// stay aligned (a `-` dash, not a space) — the pr_number cell is
+// "-" for the common push-to-main path where the column is NULL.
+func renderDeploymentRowWide(w io.Writer, d api.DeploymentResponse) {
+	by := d.DeployedBy
+	if by == "" {
+		by = "-"
+	}
+	pr := "-"
+	if d.PRNumber > 0 {
+		pr = fmt.Sprintf("%d", d.PRNumber)
+	}
+	tag := d.Tag
+	if tag == "" {
+		tag = "-"
+	}
+	// Reason column also gets the dash treatment so a mixed fleet
+	// (some pre-feature rows, some with annotations) lines up in
+	// the terminal. truncateReason already handles ""→""; we map
+	// that to "-" here so the column is visually present.
+	reason := truncateReason(d.Reason, 40)
+	if reason == "" {
+		reason = "-"
+	}
+	_, _ = fmt.Fprintf(w, deploymentRowFmtWide,
+		d.ID, d.AppID, d.Status, d.Kind, by, pr, tag, reason, d.CreatedAt)
+}
+
+// truncateReason returns s truncated to max runes with "…" appended
+// when the input is longer. Empty string returns "" (the caller
+// renders "-" elsewhere). Operates on runes (not bytes) so a multi-
+// byte reason isn't sliced mid-character.
+func truncateReason(s string, max int) string {
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
+}
+
 // cmdDeployments implements `gregale deployments [--limit N] [--before C] [--all]`.
 // Mirrors cmdApps (commands.go:251) except pagination is exposed.
 // Wire shape: GET /v1/deployments (paginated; cursor=before, limit=limit).
@@ -70,11 +127,19 @@ func cmdDeployments(args []string) int {
 	limit := fs.Int("limit", 50, "page size (1-200)")
 	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
 	all := fs.Bool("all", false, "walk every page (ignores --limit/--before)")
+	// Issue #977 / ADR-116: --wide / -w toggles the annotation columns
+	// (by / pr / tag / reason). Default stays the old 5-column shape so
+	// existing scripts / dashboard scrapers don't break. Single-letter
+	// `-w` because the human-viewable "wide" output is a daily-driver
+	// for ops; matches the awk-flavoured shape other CLI list commands
+	// use (e.g. `kubectl get pods -w` watch flag — semantically
+	// different but the user mental model is "show me more").
+	wide := fs.Bool("wide", false, "include annotation columns (by / pr / tag / reason)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale deployments [--limit N] [--before CURSOR] [--all]", "deployments")
+		PrintUsage(os.Stderr, "usage: gregale deployments [--limit N] [--before CURSOR] [--all] [--wide]", "deployments")
 		return 1
 	}
 	if *limit < 0 || *limit > 200 {
@@ -87,7 +152,7 @@ func cmdDeployments(args []string) int {
 	}
 	ctx := context.Background()
 	if *all {
-		return cmdDeploymentsAll(ctx, client)
+		return cmdDeploymentsAll(ctx, client, *wide)
 	}
 	page, err := client.ListDeployments(ctx, *before, *limit)
 	if err != nil {
@@ -103,7 +168,11 @@ func cmdDeployments(args []string) int {
 		return 0
 	}
 	for _, d := range page.Items {
-		renderDeploymentRow(osStdout, d)
+		if *wide {
+			renderDeploymentRowWide(osStdout, d)
+		} else {
+			renderDeploymentRow(osStdout, d)
+		}
 	}
 	if page.NextBefore != "" {
 		_, _ = fmt.Fprintf(osStdout, "... more — pass --before %s\n", page.NextBefore)
@@ -115,7 +184,7 @@ func cmdDeployments(args []string) int {
 // full list. Refuses to share a single envelope with the one-page path
 // (no `next_before` to surface), so JSON output is the bare slice —
 // matching how apps/crons/keys emit NDJSON for non-paginated lists.
-func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
+func cmdDeploymentsAll(ctx context.Context, client *api.Client, wide bool) int {
 	items, err := client.ListDeploymentsAll(ctx)
 	if err != nil {
 		return printErr("Request failed", err)
@@ -128,7 +197,11 @@ func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
 		return 0
 	}
 	for _, d := range items {
-		renderDeploymentRow(osStdout, d)
+		if wide {
+			renderDeploymentRowWide(osStdout, d)
+		} else {
+			renderDeploymentRow(osStdout, d)
+		}
 	}
 	return 0
 }
@@ -235,6 +308,21 @@ func cmdDeploymentGet(args []string) int {
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "kind:", d.Kind)
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "status:", d.Status)
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "created_at:", d.CreatedAt)
+	// Issue #977 / ADR-116: annotation block. Each field is
+	// conditional on non-empty so pre-feature rows render the
+	// same shape as before (no `-` placeholders for legacy data).
+	if d.DeployedBy != "" {
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "deployed_by:", d.DeployedBy)
+	}
+	if d.Tag != "" {
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "tag:", d.Tag)
+	}
+	if d.PRNumber > 0 {
+		_, _ = fmt.Fprintf(osStdout, "%-14s #%d\n", "pr_number:", d.PRNumber)
+	}
+	if d.Reason != "" {
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "reason:", d.Reason)
+	}
 	if d.Error != "" {
 		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "error:", d.Error)
 	}

@@ -167,6 +167,33 @@ type DeploymentItem struct {
 	DeployedVia      string
 	DeployedFromIP   string
 	PusherLogin      string
+	// Reason / Tag / DeployedBy / PRNumber (issue #977 / ADR-116)
+	// are the deploy-annotation projection. The detail page renders
+	// the full Reason in a `<code>` block; the list view renders a
+	// 40-char preview chip when Reason is non-empty and suppresses
+	// the chip entirely when blank. Tag mirrors the DB CHECK closed
+	// set (incident_recovery|hotfix|scheduled_maintenance|
+	// compliance_hold|partner_request) and renders as a coloured
+	// badge per the existing chip vocabulary (audit_events.html).
+	// DeployedBy carries the operator label (CLI: git config
+	// user.name; githubd: pusher.name; Action: github.actor); the
+	// template renders "—" on empty so the column stays dense.
+	// PRNumber is the GitHub PR number when the deploy came in via
+	// a pull_request event or the Action's --pr-number input;
+	// 0 means absent (push-to-main, local-tarball without PR).
+	Reason     string
+	Tag        string
+	DeployedBy string
+	PRNumber   int
+	// RepoFullName (issue #977 / ADR-116 review fix) is the
+	// "owner/name" string parsed off the deployment's SourceURL
+	// (which carries the github:// scheme for githubd deploys).
+	// Empty when the deploy didn't come through GitHub (local
+	// tarball, image-deploy). The list-view template uses it to
+	// build the PR link target instead of App.Slug (which is the
+	// app slug, not the repo owner/name) so a clickable `#4242`
+	// chip actually lands on GitHub.
+	RepoFullName string
 	// ScanSummary is the per-deploy grype scan chip rendered
 	// in the deploy list (issue #464 / ADR-055). Nil when no
 	// scan has run yet (the deploy is mid-pipeline or predates

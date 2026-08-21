@@ -248,3 +248,198 @@ func TestSourceTarball_OversizeContentLength(t *testing.T) {
 		t.Errorf("body should carry code=source_too_large, got %s", rec.Body)
 	}
 }
+
+// TestSourceTarball_HappyPath_WithAnnotations (issue #977 / ADR-116)
+// pins the deploy-annotation multipart fields end-to-end. A POST
+// that ships reason / tag / deployed-by / pr-number as form fields
+// must:
+//   - land on the deployment row (Kind=tarball, ImageDigest unchanged)
+//   - land on the audit row's data{} map
+//   - surface on the wire DeploymentResponse (Reason/Tag/DeployedBy/
+//     PRNumber) so the dashboard + CLI can render them without an
+//     additional GET.
+//
+// The annotation fields are OPTIONAL — a baseline multipart POST
+// without them must continue to round-trip with all four fields
+// empty (the pre-#977 back-compat pin, mirrors the mergeAnnotationAudit
+// docstring in handlers_annotations.go).
+func TestSourceTarball_HappyPath_WithAnnotations(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "annotated"}, nil)
+
+	entries := []tar.Header{{Name: "index.js"}}
+	bodies := map[string][]byte{"index.js": []byte("ok\n")}
+	tarBytes := buildTestTarGz(t, entries, bodies)
+
+	// Ship the four annotation fields as plain multipart form
+	// fields. No file metadata — the validator reads them as
+	// strings/ints.
+	body, ct := multipartUpload(t, map[string]multipartPart{
+		"tarball":     {filename: "src.tar.gz", body: tarBytes},
+		"reason":      {body: []byte("Hotfix: payment retry path")},
+		"tag":         {body: []byte("hotfix")},
+		"deployed_by": {body: []byte("alice@example.com")},
+		"pr_number":   {body: []byte("4242")},
+	})
+	req := httptest.NewRequest("POST", "/v1/apps/annotated/deployments/source-tarball", body)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (%s)", rec.Code, rec.Body)
+	}
+
+	// Wire response must carry the four fields.
+	var resp api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body)
+	}
+	if resp.Reason != "Hotfix: payment retry path" {
+		t.Errorf("response reason = %q, want %q", resp.Reason, "Hotfix: payment retry path")
+	}
+	if resp.Tag != "hotfix" {
+		t.Errorf("response tag = %q, want %q", resp.Tag, "hotfix")
+	}
+	if resp.DeployedBy != "alice@example.com" {
+		t.Errorf("response deployed_by = %q, want %q", resp.DeployedBy, "alice@example.com")
+	}
+	if resp.PRNumber != 4242 {
+		t.Errorf("response pr_number = %d, want 4242", resp.PRNumber)
+	}
+
+	// Deployment row must carry the same four fields.
+	app, err := e.store.AppBySlug(context.Background(), "annotated")
+	if err != nil {
+		t.Fatalf("AppBySlug(annotated): %v", err)
+	}
+	deps, err := e.store.ListDeploymentsForApp(context.Background(), app.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentsForApp: %v", err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("deployment count = %d, want 1", len(deps))
+	}
+	dep := deps[0]
+	if dep.Reason != "Hotfix: payment retry path" {
+		t.Errorf("dep.reason = %q, want %q", dep.Reason, "Hotfix: payment retry path")
+	}
+	if dep.Tag != "hotfix" {
+		t.Errorf("dep.tag = %q, want %q", dep.Tag, "hotfix")
+	}
+	if dep.DeployedBy != "alice@example.com" {
+		t.Errorf("dep.deployed_by = %q, want %q", dep.DeployedBy, "alice@example.com")
+	}
+	if dep.PRNumber != 4242 {
+		t.Errorf("dep.pr_number = %d, want 4242", dep.PRNumber)
+	}
+
+	// Audit row must carry the four keys.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var row *state.Event
+	for i := range rows {
+		if rows[i].Kind == "deploy.local_tarball" {
+			row = &rows[i]
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("no deploy.local_tarball audit row; events=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(row.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["reason"] != "Hotfix: payment retry path" {
+		t.Errorf("audit reason = %v, want annotation string", data["reason"])
+	}
+	if data["tag"] != "hotfix" {
+		t.Errorf("audit tag = %v, want hotfix", data["tag"])
+	}
+	if data["deployed_by"] != "alice@example.com" {
+		t.Errorf("audit deployed_by = %v, want alice@example.com", data["deployed_by"])
+	}
+	// PRNumber serialises as float64 through json.Unmarshal.
+	if pr, ok := data["pr_number"].(float64); !ok || int(pr) != 4242 {
+		t.Errorf("audit pr_number = %v, want 4242", data["pr_number"])
+	}
+}
+
+// TestSourceTarball_BadTag (issue #977 / ADR-116) pins the 400
+// rejection path for an out-of-set tag value. The closed-set
+// validator mirrors the DB CHECK so a malformed value never reaches
+// the store layer.
+func TestSourceTarball_BadTag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "bad-tag"}, nil)
+
+	entries := []tar.Header{{Name: "index.js"}}
+	tarBytes := buildTestTarGz(t, entries, map[string][]byte{"index.js": []byte("ok\n")})
+
+	body, ct := multipartUpload(t, map[string]multipartPart{
+		"tarball": {filename: "src.tar.gz", body: tarBytes},
+		"tag":     {body: []byte("rogue_tag")},
+	})
+	req := httptest.NewRequest("POST", "/v1/apps/bad-tag/deployments/source-tarball", body)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+	// The handler emits an RFC 7807 problem with a descriptive
+	// code. The body carries the closed-set vocabulary so an
+	// operator reading the error can see which values are
+	// accepted (the rejected value is not echoed — the closed
+	// set of accepted values is the actionable hint).
+	if !strings.Contains(rec.Body.String(), "incident_recovery") {
+		t.Errorf("body should mention closed-set vocabulary, got %s", rec.Body)
+	}
+}
+
+// TestSourceTarball_ReasonTooLong (issue #977 / ADR-116) pins the
+// length cap on the free-text reason field. The 280-char ceiling
+// matches the literal example in the issue body and is enforced
+// server-side (not CLI-side) so the Action path is also covered.
+func TestSourceTarball_ReasonTooLong(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "long-reason"}, nil)
+
+	entries := []tar.Header{{Name: "index.js"}}
+	tarBytes := buildTestTarGz(t, entries, map[string][]byte{"index.js": []byte("ok\n")})
+
+	// 281 ASCII chars → one over the 280-char ceiling.
+	reason := strings.Repeat("x", 281)
+
+	body, ct := multipartUpload(t, map[string]multipartPart{
+		"tarball": {filename: "src.tar.gz", body: tarBytes},
+		"reason":  {body: []byte(reason)},
+	})
+	req := httptest.NewRequest("POST", "/v1/apps/long-reason/deployments/source-tarball", body)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "reason") {
+		t.Errorf("body should mention reason field, got %s", rec.Body)
+	}
+}

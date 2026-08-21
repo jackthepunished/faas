@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"fmt"
 	"mime/multipart"
 )
 
@@ -11,7 +12,12 @@ import (
 // createDeployment), but the server actually keys off the {slug} URL
 // component. The dockerfile flag gates function-runnner vs Dockerfile
 // builds (apid/dispatch).
-func newMultipartWriter(dst *bytes.Buffer, slug string, dockerfile bool, runtime, handler string) *multipart.Writer {
+//
+// Annotation fields (issue #977 / ADR-116): when an annotation is
+// non-zero on `a`, the corresponding multipart form field is emitted
+// (reason / tag / deployed_by / pr_number). nil/zero values skip the
+// field entirely — the server defaults them to NULL on the row.
+func newMultipartWriter(dst *bytes.Buffer, slug string, dockerfile bool, runtime, handler string, a DeployAnnotations) *multipart.Writer {
 	w := multipart.NewWriter(dst)
 	// slug is redundant (URL has it too) but apid accepts it for log
 	// clarity. Don't error if the writer fails — the caller checks
@@ -26,5 +32,31 @@ func newMultipartWriter(dst *bytes.Buffer, slug string, dockerfile bool, runtime
 	if handler != "" {
 		_ = w.WriteField("handler", handler)
 	}
+	if a.Reason != "" {
+		_ = w.WriteField("reason", a.Reason)
+	}
+	if a.Tag != "" {
+		_ = w.WriteField("tag", a.Tag)
+	}
+	if a.DeployedBy != "" {
+		_ = w.WriteField("deployed_by", a.DeployedBy)
+	}
+	if a.PRNumber > 0 {
+		_ = w.WriteField("pr_number", fmt.Sprintf("%d", a.PRNumber))
+	}
 	return w
+}
+
+// DeployAnnotations is the annotation surface shared by every
+// CLI-driven deploy path (issue #977 / ADR-116). Zero values mean
+// "no annotation"; the server treats them as NULL on the row.
+// Pointer fields are intentionally avoided so the multipart writer
+// (which has no notion of nil) stays a single seam; nil-vs-zero is
+// re-derived from the column scan via the coalesce-on-read pattern
+// at pkg/state/pgstore.go.
+type DeployAnnotations struct {
+	Reason     string // free text, ≤280 chars (DB CHECK)
+	Tag        string // closed-set enum (DB CHECK; handler validates too)
+	DeployedBy string // human-readable actor label
+	PRNumber   int    // positive int (DB CHECK; 0 collapses to NULL)
 }

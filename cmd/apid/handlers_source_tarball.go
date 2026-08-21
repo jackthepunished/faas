@@ -122,6 +122,19 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Issue #977 / ADR-116: read the four annotation form fields.
+	// Empty / missing → NULL on the row (pgstore handles the
+	// collapse). The CLI side emits them via pkg/api/multipart.go
+	// newMultipartWriter. Validation mirrors the DB CHECK:
+	//   - reason ≤280 chars (CodeValidation otherwise)
+	//   - tag in closed-set (CodeValidation otherwise)
+	//   - pr_number > 0 when present (CodeValidation otherwise)
+	ann := annotationFormFromRequest(r)
+	if prob := validateAnnotationForm(ann); prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+
 	// Cap the read at the plan limit so a malicious oversize body
 	// trips CodeSourceTooLarge before we spool it to disk. The
 	// outer http.MaxBytesReader above already bounded the request
@@ -152,6 +165,12 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 		ActorUserID: acct.ID,
 		ActorVia:    routeKindForRequest(r),
 		ActorFromIP: middleware.ClientIP(r),
+		// Issue #977 / ADR-116: annotation surface forwarded onto
+		// the deployment row from the request's annotationForm.
+		Reason:     ann.Reason,
+		Tag:        ann.Tag,
+		DeployedBy: ann.DeployedBy,
+		PRNumber:   ann.PRNumber,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
@@ -159,7 +178,7 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 	}
 
 	s.maybeFlipMFAOnDeploy(r.Context(), acct)
-	s.auditLocalTarballDeploy(r.Context(), acct, app, res, sidecar, spoolBytes)
+	s.auditLocalTarballDeploy(r.Context(), acct, app, res, sidecar, spoolBytes, ann)
 
 	d, err := s.store.LatestDeployment(r.Context(), app.ID)
 	if err != nil {
@@ -181,13 +200,20 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 // the actor_* payload keys (via mergeActorAudit). The
 // constructor-baked "apid" actor only shows up if the
 // DeploymentByID read fails AND the via classifier defaults.
-func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, sidecar sidecarPayload, sourceBytes int64) {
+// Issue #977 / ADR-116: the audit data{} map gains 4 keys
+// (reason / tag / deployed_by / pr_number) when present. nil/zero
+// values are omitted from the map so pre-feature rows stay byte-
+// identical at the JSON layer.
+func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, sidecar sidecarPayload, sourceBytes int64, ann annotationForm) {
 	s.log.Info("local-tarball deployment enqueued",
 		"deployment", res.DeploymentID,
 		"app", app.ID,
 		"repo", sidecar.Repo,
 		"ref", sidecar.Ref,
 		"source_bytes", sourceBytes,
+		"deployed_by", ann.DeployedBy,
+		"pr_number", ann.PRNumber,
+		"tag", ann.Tag,
 	)
 	d, dErr := s.store.DeploymentByID(ctx, res.DeploymentID)
 	if dErr != nil {
@@ -211,7 +237,7 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 		return
 	}
 	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
-	s.audit.EmitAs(ctx, resolvedActor, "deploy.local_tarball", &acct.ID, mergeActorAudit(map[string]any{
+	data := map[string]any{
 		auditKeyAppID:        app.ID,
 		auditKeyDeploymentID: res.DeploymentID,
 		auditKeyBuildID:      res.BuildID,
@@ -219,5 +245,10 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 		auditKeyRef:          sidecar.Ref,
 		auditKeySourceBytes:  sourceBytes,
 		auditKeyTrustRoot:    "cli",
-	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
+	}
+	// Issue #977 / ADR-116: mirror the annotation surface into
+	// the deploy.local_tarball audit row. mergeAnnotationAudit
+	// is "omit when zero" so pre-feature rows stay byte-identical.
+	mergeAnnotationAudit(data, ann)
+	s.audit.EmitAs(ctx, resolvedActor, "deploy.local_tarball", &acct.ID, mergeActorAudit(data, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 }

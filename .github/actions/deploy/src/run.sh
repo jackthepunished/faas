@@ -75,11 +75,35 @@ cmd_deploy() {
     #    --json stdout is the canonical DeploymentResponse shape;
     #    stderr in failure mode is the RFC 7807 Problem JSON line
     #    (cmd/gregale/json_flag.go:116-122 writeJSONProblem).
+    #
+    #    Issue #977 / ADR-116: append --reason / --tag /
+    #    --deployed-by / --pr-number only when the input is non-
+    #    empty, so unset inputs (the common case for push events
+    #    or first-time adopters) keep the pre-#977 wire shape byte-
+    #    identical. --deployed-by defaults to ${{ github.actor }} on
+    #    the action.yml side; --pr-number defaults to
+    #    ${{ github.event.pull_request.number }} for PR events.
+    #    The CLI's --tag validator rejects any out-of-set value
+    #    with a clean exit 1 BEFORE the wire is touched.
+    local annotation_args=()
+    if [ -n "${INPUT_REASON:-}" ]; then
+        annotation_args+=(--reason "$INPUT_REASON")
+    fi
+    if [ -n "${INPUT_TAG:-}" ]; then
+        annotation_args+=(--tag "$INPUT_TAG")
+    fi
+    if [ -n "${INPUT_DEPLOYED_BY:-}" ]; then
+        annotation_args+=(--deployed-by "$INPUT_DEPLOYED_BY")
+    fi
+    if [ -n "${INPUT_PR_NUMBER:-}" ]; then
+        annotation_args+=(--pr-number "$INPUT_PR_NUMBER")
+    fi
     local dep_json
     if ! dep_json="$(
         "$BIN" deploy --json \
             --repo "$INPUT_REPO" \
             --ref "$INPUT_REF" \
+            "${annotation_args[@]}" \
             2>&1
     )"; then
         # The CLI exited non-zero. Persist the captured output for
