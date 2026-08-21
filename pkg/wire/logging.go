@@ -78,6 +78,17 @@ type CorrelationFields struct {
 	InvocationID string
 	TraceID      string
 	SpanID       string
+
+	// ADR-123 — wake-boot telemetry fields propagated from schedd to
+	// vmmd so the vmmd-side mirror BootStarted row (issue #517 PR-C)
+	// carries the same trigger / queue / concurrency context as the
+	// canonical schedd emit. Empty values are skipped on the gRPC wire
+	// (see WithCorrelationOutgoing in grpcmetadata.go) — schedd always
+	// stamps these, so a missing value on the wire means the producer
+	// is pre-ADR-123.
+	Trigger            string
+	QueuedCount        int
+	ConcurrencyAtAdmit int
 }
 
 // FromContext returns the correlation fields stored on ctx by the inbound

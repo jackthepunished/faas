@@ -1985,12 +1985,15 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// carries across the schedd → vmmd boundary.
 	inboundCorr, _ := wire.FromContext(ctx)
 	bootCtx = wire.WithContext(bootCtx, wire.CorrelationFields{
-		RequestID:    inboundCorr.RequestID,
-		InvocationID: inboundCorr.InvocationID,
-		AppID:        appID,
-		DeploymentID: bootInput.depID,
-		InstanceID:   bootInput.insID,
-		WakeID:       wakeID,
+		RequestID:          inboundCorr.RequestID,
+		InvocationID:       inboundCorr.InvocationID,
+		AppID:              appID,
+		DeploymentID:       bootInput.depID,
+		InstanceID:         bootInput.insID,
+		WakeID:             wakeID,
+		Trigger:            bootInput.trigger,
+		QueuedCount:        bootInput.queuedCount,
+		ConcurrencyAtAdmit: bootInput.concurrencyAtAdmit,
 	})
 	// issue #517 / PR-C / ADR-064 — emit wake.boot_started at the
 	// entry to Phase 3 (the unlocked vmmd RPC). The customer-facing

@@ -185,14 +185,18 @@ Three surfaces consume the new fields without new endpoints:
    (`cmd/apid/handlers_wake_timeline.go:197-213`). No code change —
    the new keys surface in the existing `--json` path automatically.
 
-3. **Dashboard**: a new `/dashboard/apps/{slug}/wake-timeline` view
-   (`pkg/dashboard/views/wake_timeline.go` NEW + matching template)
-   reuses the SDK `api.WakeTimelineResponse`. The existing
-   `Recent wakes` table on `app_detail.html:186-212` extends with
-   three new columns (Trigger / Queued / Concurrency) backed by a
-   `LEFT JOIN LATERAL` against `events` on `wake_id` — bounded by
-   the existing `events_wake_id_idx` partial index
-   (`migrations/00114_events_wake_id_idx.sql`); no new index.
+3. **Dashboard**: the existing `Recent wakes` table on
+   `app_detail.html:186-212` extends with three new columns
+   (Trigger / Queued / Concurrency) backed by the new batched
+   `Store.LookupBootStartedForWakes` call from
+   `cmd/apid/handlers_dashboard.go` (one SQL round-trip, gated by
+   `events_wake_id_idx` from `migrations/00114_events_wake_id_idx.sql`);
+   no new index. The dedicated `/dashboard/apps/{slug}/wake-timeline`
+   per-wake narrative view (a `pkg/dashboard/views/wake_timeline.go`
+   helper + matching template) is **deferred to a follow-on PR** —
+   this PR ships the table extension because it lands the
+   customer-visible value on the existing surface with zero new
+   routing.
 
 Pre-ADR-123 rows in the dashboard render `—` (the existing convention
 from `app_detail.html` for absent values).
@@ -295,8 +299,8 @@ timeline / dashboard queries get the data with no migration.
 - `pkg/gateway/handler.go:468` + `pkg/gateway/pgbackend.go:795` —
   `Backend.Admit` signature
 - `cmd/gregale/commands_wake_timeline.go:140-145` — CLI renderer
-- `pkg/dashboard/views/wake_timeline.go` — NEW, dashboard table renderer
+- `pkg/dashboard/views/wake_timeline.go` — NEW, dashboard table renderer *(deferred to follow-on PR; see §Surfaces item 3)*
 - `pkg/dashboard/dashboard.go:307-321, 591` — query + `RecentInstanceItem`
 - `pkg/dashboard/templates/app_detail.html:186-212` — recent-wakes columns
-- `pkg/dashboard/templates/app_wake_timeline.html` — NEW
+- `pkg/dashboard/templates/app_wake_timeline.html` — NEW *(deferred to follow-on PR)*
 - `docs/faas_implementation_spec.md` — §17 G17 row + §6/§12 cross-refs
