@@ -93,6 +93,23 @@ token has lost write authority.
 
 ## Other secrets
 
+### Repairing a missing database fingerprint
+
+If a node already has a valid `/etc/faas/secrets/host.age` but its
+`compute_nodes.host_certificate` or `cert_fingerprint` columns are empty,
+use the non-destructive repair leaf:
+
+```sh
+sudo gregalectl secrets stamp \
+  --host <compute_nodes.name> \
+  --pg-dsn "$FAAS_PG_DSN"
+```
+
+`secrets stamp` reads the existing identity, derives the public recipient
+fingerprint, and updates only the two database audit columns. It never
+regenerates or overwrites `host.age`; do not use `secrets init --force` for
+this repair.
+
 - **`/etc/faas/secrets/host.age`** — sealed customer-secret box
   keypair (ADR-020, ADR-057). Rotated only under incident response
   or compliance cadence; the old keypair stays valid for 30 days

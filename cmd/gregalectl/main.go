@@ -11,7 +11,7 @@
 //   - sign-keys init|rotate|status   — cosign sign keypair (local fs)
 //   - node-key init|rotate|status    — per-node CapacityReport keypair
 //   - backup init|unseal-archive-creds|unseal-rclone — backup creds
-//   - secrets init|rotate|status                     — post-bootstrap secrets
+//   - secrets init|rotate|status|stamp               — post-bootstrap secrets
 //   - trusted-publishers stays in `gregale` (admin API surface; see
 //     PR-6.5 deviation note) — NOT shipped here.
 //   - version, completion, man        — internal surface
@@ -51,7 +51,7 @@ Commands:
   sign-keys    Provision the cosign sign keypair (sign-keys init|rotate|status; --sign-key / --verify-key)
   node-key     Provision the per-node CapacityReport signing keypair (node-key init|rotate|status)
   backup       Operator rclone / archive credentials (backup init|unseal-archive-creds|unseal-rclone)
-  secrets      Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)
+  secrets      Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)
   compute-nodes  Compute-node state machine (add|drain|drain-status|activate|force-drain; PR-A / multi-host scale-out)
   deploy        Fleet topology coordinator (deploy add-node; PR-B / multi-host scale-out gap #2)
   version      Print the CLI version

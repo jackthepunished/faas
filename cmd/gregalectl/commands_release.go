@@ -60,6 +60,12 @@ const (
 	subReleaseBundle  = "bundle"
 	subReleaseInstall = "install"
 	subReleaseKGV     = "kgv"
+
+	// Canonical release asset names. These are the names attached to a
+	// GitHub Release and retained under each installed release directory.
+	releaseTarballName = "release.tar.gz"
+	releaseSigName     = "release.cosign.bundle"
+	releaseSBOMName    = "release.sbom.json"
 )
 
 // cmdReleaseDispatch is the parent dispatcher.
@@ -104,7 +110,9 @@ Flags (bundle):
 Flags (install):
   --git-sha SHA         40-char lowercase hex git SHA to install (required).
   --releases-root PATH  Releases root (default: /opt/faas/releases).
-  --node NAME           compute_nodes.name to stamp (default: hostname).
+  --node NAME           compute_nodes.name to stamp (default:
+                        FAAS_NODE_NAME, then hostname; compute-only
+                        installs use NAME.faas).
 
 Exit codes:
   0  success
@@ -496,12 +504,27 @@ func cmdReleaseInstall(args []string) int {
 	}
 	node := *nodeName
 	if node == "" {
-		var herr error
-		node, herr = os.Hostname()
-		if herr != nil {
-			node = "unknown"
+		// The daemon identity is deployment-owned and may differ from
+		// the cloud-provider instance hostname (for example,
+		// faas-compute-node-1 runs as fsn-2). Prefer the same env
+		// contract consumed by vmmd/schedd before falling back to the
+		// kernel hostname.
+		node = strings.TrimSpace(os.Getenv("FAAS_NODE_NAME"))
+		if node == "" {
+			var herr error
+			node, herr = os.Hostname()
+			if herr != nil {
+				node = "unknown"
+			}
 		}
 	}
+	// vmmd self-registration uses the TLS identity namespace and stores
+	// compute-only nodes as <host>.faas (cmd/vmmd/register.go). Keep the
+	// release-install writer on that same canonical key so a split-box
+	// install updates the vmmd row instead of creating a short-name twin.
+	// Control-plane rows are not rewritten: their names are operator-owned
+	// and may describe a non-compute host identity.
+	node = canonicalComputeNodeName(node, roleTemplating.Role(*roleFlag))
 	// ADR-112: after the symlink flip (the load-bearing step),
 	// apply role templating. The drop-ins + daemon-reload are
 	// what materially makes FAAS_BOX_ROLE take effect on the box.
@@ -642,6 +665,16 @@ func cmdReleaseInstall(args []string) int {
 	return 0
 }
 
+// canonicalComputeNodeName returns the database identity used by vmmd for a
+// compute-only box. It is intentionally narrow: control-plane names are
+// operator-owned and must not be rewritten by release installation.
+func canonicalComputeNodeName(name string, role roleTemplating.Role) string {
+	if role != roleTemplating.RoleComputeOnly || strings.HasSuffix(name, ".faas") {
+		return name
+	}
+	return name + ".faas"
+}
+
 // sbomOnDiskPath returns the canonical SBoM-on-disk path for the
 // per-release bundle. Returns a non-nil error when the file does
 // not exist (os.IsNotExist) so the caller can treat absence as
@@ -678,16 +711,28 @@ func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
 // flag's complement is --tarball-path pointing at a pre-staged
 // triple on the operator's media.
 func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
+	return installViaTarballWithVerifier(
+		releasesRoot,
+		gitSHA,
+		tarballPath,
+		releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC()),
+	)
+}
+
+// installViaTarballWithVerifier is split from installViaTarball so the
+// complete extraction + retention path can be tested without weakening the
+// production default, which always uses the strict GitHub OIDC verifier.
+func installViaTarballWithVerifier(releasesRoot, gitSHA, tarballPath string, verifier releaseinstall.CosignVerifier) error {
 	// 1. Read the on-disk triple.
 	tbBody, err := os.ReadFile(tarballPath)
 	if err != nil {
 		return fmt.Errorf("read tarball: %w", err)
 	}
-	sigBody, err := os.ReadFile(tarballPath + ".cosign.bundle")
+	sigBody, err := readCanonicalReleaseAsset(tarballPath, releaseSigName)
 	if err != nil {
 		return fmt.Errorf("read cosign bundle: %w", err)
 	}
-	sbomBody, err := os.ReadFile(tarballPath + ".sbom.json")
+	sbomBody, err := readCanonicalReleaseAsset(tarballPath, releaseSBOMName)
 	if err != nil {
 		return fmt.Errorf("read sbom: %w", err)
 	}
@@ -727,10 +772,13 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	// from PR-A commit 2 (and the line item closing issue #597).
 	// On a successful verify the cert identity is stamped onto
 	// tb.Manifest.Signature for audit trails.
-	verifier := releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC())
 	if _, err := tb.Verify(context.Background(), verifier); err != nil {
 		return fmt.Errorf("tarball verify: %w", err)
 	}
+	// Verify stamps the trusted CI identity onto the manifest. Persist that
+	// identity with the extracted release so `doctor` can audit which CI
+	// workflow authorized the bytes currently installed on the host.
+	m = tb.Manifest
 
 	// 4. Extract the tarball into <releases-root>/<git-sha>/bin/.
 	// On success the on-disk bin tree matches the manifest's
@@ -746,10 +794,19 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	if err := releaseinstall.Write(releasesRoot, m); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
-	if err := os.WriteFile(
-		releaseinstall.BundleRoot(releasesRoot, gitSHA)+"/release.sbom.json",
-		sbomBody, 0o644); err != nil {
-		return fmt.Errorf("write sbom: %w", err)
+	// Retain the exact verified release triple with the extracted
+	// release. Apart from making the install self-describing, this is
+	// what lets `gregalectl doctor --deep` repeat the cosign + SBoM
+	// verification without relying on an operator's staging directory.
+	assets := map[string][]byte{
+		releaseTarballName: tbBody,
+		releaseSigName:     sigBody,
+		releaseSBOMName:    sbomBody,
+	}
+	for name, body := range assets {
+		if err := os.WriteFile(filepath.Join(releaseinstall.BundleRoot(releasesRoot, gitSHA), name), body, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
+		}
 	}
 
 	// 6. AtomicFlip. The flip is the load-bearing boundary; all
@@ -758,6 +815,30 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 		return fmt.Errorf("flip symlink: %w", err)
 	}
 	return nil
+}
+
+// readCanonicalReleaseAsset reads an asset staged next to release.tar.gz,
+// which is the layout emitted by the release workflow. The appended
+// sidecar spelling is accepted as a compatibility path for older air-gap
+// staging scripts that used release.tar.gz.cosign.bundle and
+// release.tar.gz.sbom.json. The canonical sibling name is preferred.
+func readCanonicalReleaseAsset(tarballPath, name string) ([]byte, error) {
+	candidates := []string{
+		filepath.Join(filepath.Dir(tarballPath), name),
+		tarballPath + "." + strings.TrimPrefix(name, "release."),
+	}
+	var lastErr error
+	for _, path := range candidates {
+		body, err := os.ReadFile(path)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+	}
+	return nil, fmt.Errorf("%s (tried %s): %w", name, strings.Join(candidates, ", "), lastErr)
 }
 
 // manifestHashMap converts manifest values from "sha256:<hex>" to the

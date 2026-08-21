@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 )
 
 // doctorFindingsCap caps the number of findings emitted per run.
@@ -1265,6 +1266,28 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			})
 		}
 	}
+	// `secrets init` creates shape-valid placeholders for the two external
+	// backup integrations so provisioning can complete in stages. They are
+	// not usable credentials and must remain visible until the operator
+	// unseals real values from the secret store.
+	rclonePath := storageDir + "/rclone.conf"
+	if data, err := os.ReadFile(rclonePath); err == nil && strings.Contains(string(data), "secrets init stub") {
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityWarn,
+			Message:  "rclone.conf is still the secrets-init placeholder",
+			Detail:   "run 'gregalectl backup unseal-rclone' with a real envelope",
+		})
+	}
+	archiveCredsPath := storageDir + "/archive-creds.json"
+	if data, err := os.ReadFile(archiveCredsPath); err == nil && strings.TrimSpace(string(data)) == "{}" {
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityWarn,
+			Message:  "archive-creds.json is still the secrets-init placeholder",
+			Detail:   "run 'gregalectl backup unseal-archive-creds' with a real envelope",
+		})
+	}
 	// session.key must be exactly 64 hex chars (32 bytes
 	// hex-encoded). The gatewayd loader rejects non-hex or
 	// wrong-length values per
@@ -1309,17 +1332,21 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 		})
 		return findings, fmt.Errorf("list compute_nodes: %w", err)
 	}
-	hostAgeBytes, readErr := os.ReadFile("/etc/faas/secrets/host.age")
-	if readErr != nil {
+	hostAgeID, loadErr := secretbox.LoadHostKey("/etc/faas/secrets/host.age")
+	if loadErr != nil {
 		// Already surfaced above as a "missing host.age"
 		// finding; skip the per-row fingerprint walk because
-		// every row would mismatch. Propagate readErr so
+		// every row would mismatch. Propagate loadErr so
 		// runCheck's existing error→finding synthesis picks
 		// it up (the missing-file finding is also added
 		// above as a side-channel for the operator).
-		return findings, fmt.Errorf("read host.age: %w", readErr)
+		return findings, fmt.Errorf("load host.age: %w", loadErr)
 	}
-	sum := sha256.Sum256(hostAgeBytes)
+	// The DB stores the public host certificate (the age recipient string),
+	// not the private identity file bytes. Hash the same public value that
+	// `secrets init` stamps; hashing host.age's private text made every valid
+	// initialization look drifted.
+	sum := sha256.Sum256([]byte(secretbox.RecipientString(hostAgeID)))
 	got := hex.EncodeToString(sum[:])
 	for _, n := range nodes {
 		if n.CertFingerprint == nil {

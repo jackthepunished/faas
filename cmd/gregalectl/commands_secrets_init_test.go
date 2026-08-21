@@ -207,6 +207,39 @@ func TestSecretsInit_ForceOverwrite(t *testing.T) {
 	}
 }
 
+// TestSecretsStamp_DoesNotRewriteHostAge pins the repair contract: a failed
+// database stamp must leave the existing identity byte-for-byte unchanged.
+func TestSecretsStamp_DoesNotRewriteHostAge(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("test requires root")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.age")
+	if _, err := writeHostAge(path, false); err != nil {
+		t.Fatalf("write host.age: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read host.age before stamp: %v", err)
+	}
+
+	err = stampExistingHostCertificate(&secretsStampFlags{
+		dir:  dir,
+		host: "test-node",
+		dsn:  "postgres://",
+	})
+	if err == nil {
+		t.Fatal("stampExistingHostCertificate returned nil for invalid DSN")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read host.age after stamp: %v", readErr)
+	}
+	if string(after) != string(before) {
+		t.Fatal("secrets stamp changed existing host.age")
+	}
+}
+
 // TestSecretsStatus_PrintsFileModes pins the status leaf shape:
 // one line per file with mode + sha256[:12] + path; missing files
 // print an explicit "missing" line.

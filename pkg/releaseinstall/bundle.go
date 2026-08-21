@@ -202,11 +202,10 @@ func Write(root string, manifest Manifest) error {
 	if err := ValidateManifest(manifest); err != nil {
 		return err
 	}
-	body, err := json.MarshalIndent(manifest, "", "  ")
+	body, err := encodeManifest(manifest)
 	if err != nil {
 		return fmt.Errorf("releaseinstall: marshal manifest: %w", err)
 	}
-	body = append(body, '\n')
 	dir := BundleRoot(root, manifest.GitSHA)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("releaseinstall: mkdir %s: %w", dir, err)
@@ -237,6 +236,27 @@ func Write(root string, manifest Manifest) error {
 		return fmt.Errorf("releaseinstall: publish manifest: %w", err)
 	}
 	return nil
+}
+
+// encodeManifest is the canonical byte representation of the manifest.
+// Both the on-disk release directory and the canonical tarball use these
+// bytes so the installer can compare the embedded and extracted manifests
+// without accepting two different encodings of the same release metadata.
+func encodeManifest(manifest Manifest) ([]byte, error) {
+	body, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(body, '\n'), nil
+}
+
+// encodeTarballManifest returns the immutable manifest representation that is
+// embedded in and signed with the canonical tarball. Signature is deliberately
+// excluded: the installer learns the CI certificate identity only after
+// verifying the tarball and stamps that audit value onto the on-disk manifest.
+func encodeTarballManifest(manifest Manifest) ([]byte, error) {
+	manifest.Signature = ""
+	return encodeManifest(manifest)
 }
 
 // Read loads and validates the manifest at <root>/<git-sha>/release-manifest.json.

@@ -211,7 +211,7 @@ var cliCommands = []cliCommand{
 				Flags: []cliFlag{
 					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
-					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
+					{Name: "node", Short: "compute_nodes.name to stamp (default: FAAS_NODE_NAME, then hostname; compute-only uses NAME.faas)"},
 					{Name: "role", Short: "box role: control-plane|compute-only (ADR-112); empty = no role templating. Reads /etc/faas/first-boot.env's FAAS_BOX_ROLE when unset.", ClosedSet: []string{"", "control-plane", "compute-only"}},
 				},
 			},
@@ -294,11 +294,12 @@ var cliCommands = []cliCommand{
 		// cert_fingerprint}.
 		Name:    dispatchSecrets,
 		DocSlug: "secrets",
-		Short:   "Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)",
+		Short:   "Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)",
 		Subcommands: []cliSub{
 			{Name: subInit, Short: "Initialise the 5 on-disk secrets (host.age, session.key, box-age-key, rclone.conf, archive-creds.json)"},
 			{Name: subRotate, Short: "Rotate host.age (delegates to host-age rotate)"},
 			{Name: subStatus, Short: "Show mode/mtime/sha256 for the 5 secret files"},
+			{Name: subSecretsStamp, Short: "Stamp the existing host.age fingerprint without rotating secrets"},
 		},
 		Flags: []cliFlag{
 			{Name: "dir", Short: "root secrets directory (default /etc/faas/secrets)"},

@@ -1,0 +1,6 @@
+# Production release, deployment, and security controls require explicit
+# review from the repository owner.
+* @poyrazK
+.github/ @poyrazK
+deploy/ @poyrazK
+pkg/releaseinstall/ @poyrazK

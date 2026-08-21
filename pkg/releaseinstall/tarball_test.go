@@ -28,7 +28,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +85,7 @@ func signedTarball(t *testing.T) (*releaseinstall.Tarball, string) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	const identity = "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v1.2.3"
+	const identity = "https://github.com/poyrazK/faas/.github/workflows/release.yml@refs/tags/v1.2.3"
 	tb.Sig = []byte("fake-cosign-bundle-for-" + identity)
 	return tb, identity
 }
@@ -132,11 +134,52 @@ func TestTarball_Build_HashStable(t *testing.T) {
 		t.Fatalf("packed bytes differ:\n  build #1: %s\n  build #2: %s",
 			hex.EncodeToString(h1[:]), hex.EncodeToString(h2[:]))
 	}
-	// Sanity: the embedded manifest's CreatedAt DOES change between
-	// builds (it's part of the manifest, not the tarball bytes),
-	// which is why we compare Packed and not the whole struct.
-	if t1.Manifest.CreatedAt.Equal(t2.Manifest.CreatedAt) {
-		t.Fatalf("manifest CreatedAt must differ between builds — sorted-hosts test is suspect")
+	// The canonical artifact deliberately pins CreatedAt so the embedded
+	// manifest participates in byte-stable reproducible builds.
+	if !t1.Manifest.CreatedAt.Equal(t2.Manifest.CreatedAt) {
+		t.Fatalf("canonical manifest CreatedAt differs between builds")
+	}
+}
+
+func TestTarball_Build_EmbedsManifest(t *testing.T) {
+	_, root, gitSHA, manifestHash := fakeBinDir(t)
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Unix(1_700_000_000, 0).UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(tb.Packed))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	var manifestBody []byte
+	for {
+		hdr, nextErr := tr.Next()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			t.Fatalf("tar next: %v", nextErr)
+		}
+		if hdr.Name == releaseinstall.ManifestName {
+			manifestBody, err = io.ReadAll(tr)
+			if err != nil {
+				t.Fatalf("read manifest: %v", err)
+			}
+			break
+		}
+	}
+	if len(manifestBody) == 0 {
+		t.Fatalf("tarball does not contain %s", releaseinstall.ManifestName)
+	}
+	var embedded releaseinstall.Manifest
+	if err := json.Unmarshal(manifestBody, &embedded); err != nil {
+		t.Fatalf("decode embedded manifest: %v", err)
+	}
+	if embedded.GitSHA != gitSHA || embedded.ManifestHash != manifestHash {
+		t.Fatalf("embedded identity = (%s, %s), want (%s, %s)", embedded.GitSHA, embedded.ManifestHash, gitSHA, manifestHash)
 	}
 }
 
@@ -331,7 +374,7 @@ func TestTarball_ReadManifest_AfterExtract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read disk manifest: %v", err)
 	}
-	diskManifest.Signature = "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v9.9.9"
+	diskManifest.Signature = "https://github.com/poyrazK/faas/.github/workflows/release.yml@refs/tags/v9.9.9"
 	if err := releaseinstall.Write(root, diskManifest); err != nil {
 		t.Fatalf("write disk manifest: %v", err)
 	}
@@ -339,7 +382,7 @@ func TestTarball_ReadManifest_AfterExtract(t *testing.T) {
 	if err := tb.ReadManifest(root); err != nil {
 		t.Fatalf("readmanifest: %v", err)
 	}
-	if tb.Manifest.Signature != "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v9.9.9" {
+	if tb.Manifest.Signature != "https://github.com/poyrazK/faas/.github/workflows/release.yml@refs/tags/v9.9.9" {
 		t.Errorf("ReadManifest did not pick up disk Signature: got %q", tb.Manifest.Signature)
 	}
 	// Sanity: Extract wrote the catalog binaries; they are still
@@ -554,5 +597,19 @@ func TestTarball_Signature_Getter(t *testing.T) {
 	}
 	if got := tb2.Signature(); got != identity {
 		t.Errorf("Tarball.Signature() = %q, want %q (Verify's return)", got, identity)
+	}
+}
+
+// TestTarball_Verify_AllowsStampedSignature proves that the post-verify audit
+// identity is not part of the pre-signature bytes. Doctor reads the stamped
+// on-disk manifest on later runs and must still validate the original bundle.
+func TestTarball_Verify_AllowsStampedSignature(t *testing.T) {
+	tb, identity := signedTarball(t)
+	verifier := &releaseinstall.FixtureCosignVerifier{Identity: identity}
+	if _, err := tb.Verify(context.Background(), verifier); err != nil {
+		t.Fatalf("first verify: %v", err)
+	}
+	if _, err := tb.Verify(context.Background(), verifier); err != nil {
+		t.Fatalf("verify after signature stamp: %v", err)
 	}
 }
