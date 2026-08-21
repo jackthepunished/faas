@@ -48,6 +48,20 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type syntheticInvocationContextKey struct{}
+
+// WithSyntheticInvocation marks an internal scheduler-to-runner request.
+// Platform-owned invocation metadata may cross the vmmd HTTP bridge only for
+// this context; ordinary customer requests keep the x-faas-* strip policy.
+func WithSyntheticInvocation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, syntheticInvocationContextKey{}, true)
+}
+
+func isSyntheticInvocation(ctx context.Context) bool {
+	v, _ := ctx.Value(syntheticInvocationContextKey{}).(bool)
+	return v
+}
+
 // NodeClientLookup resolves a compute_node.id to a cached
 // *grpc.ClientConn dialed to that node's vmmd gRPC server. Implementations
 // must be safe for concurrent use. The gateway owns the cache
@@ -214,6 +228,7 @@ func fwdOnceWithEvents(w http.ResponseWriter, r *http.Request, nodes NodeClientL
 
 	cli, closer, ok := nodes.ClientFor(r.Context(), t.NodeID)
 	if !ok {
+		markStaleTarget(r.Context())
 		http.Error(w, "node unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -284,6 +299,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 
 	stream, err := cli.ForwardHTTPStream(ctx)
 	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+			markStaleTarget(r.Context())
+		}
 		log.Error("gateway: forwarder stream open failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "forwarder stream open failed", http.StatusBadGateway)
@@ -318,7 +336,8 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 		Stream:     true,
 	}
 	for name, vals := range stripHopByHop(r.Header) {
-		if strings.HasPrefix(strings.ToLower(name), "x-faas-") {
+		if strings.HasPrefix(strings.ToLower(name), "x-faas-") &&
+			(!isSyntheticInvocation(r.Context()) || !strings.EqualFold(name, "x-faas-invocation-id")) {
 			continue
 		}
 		for _, v := range vals {
@@ -328,6 +347,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	if err := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
 		Frame: &vmmdpb.ForwardHTTPStreamRequest_Init{Init: init},
 	}); err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+			markStaleTarget(r.Context())
+		}
 		log.Error("gateway: forwarder stream init send failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "forwarder stream init failed", http.StatusBadGateway)
@@ -395,12 +417,14 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			default:
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				markStaleTarget(r.Context())
 				log.Warn("gateway: forwarder stream Unavailable; surfacing 503",
 					"node", t.NodeID)
 				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 				return
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				markStaleTarget(r.Context())
 				http.Error(w, "instance gone", http.StatusServiceUnavailable)
 				return
 			}

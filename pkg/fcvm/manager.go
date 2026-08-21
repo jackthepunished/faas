@@ -1622,6 +1622,24 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 	return mp, nil
 }
 
+// MaterializeParentExt4 mounts the parent artifact, copies its filesystem
+// tree into the shared staging directory, and releases the temporary mount
+// before returning. The explicit copy is required because imaged and vmmd
+// run in separate service mount namespaces; returning a mountpoint alone does
+// not make the mounted view visible to imaged.
+func (m *Manager) MaterializeParentExt4(ctx context.Context, storageKey, targetDir string) error {
+	mountpoint, err := m.MountParentExt4(ctx, storageKey)
+	if err != nil {
+		return err
+	}
+	copyErr := vmmdmount.MaterializeParentExt4(ctx, mountpoint, targetDir)
+	umountErr := m.UmountParentExt4(context.WithoutCancel(ctx), mountpoint)
+	if copyErr != nil || umountErr != nil {
+		return errors.Join(copyErr, umountErr)
+	}
+	return nil
+}
+
 // UmountParentExt4 (ADR-053) releases a parent mount MountParentExt4
 // previously returned. Idempotent on unknown mountpoints — imaged's
 // defer-after-error pattern is safe to call blindly. Returns the
@@ -1850,6 +1868,10 @@ type WakeRequest struct {
 	// and copies build artifacts (build-done.json + /build/out/*) into this host
 	// directory. App VMs leave it empty.
 	ExportDir string
+	// BuildTimeoutSec is the guest build wall-clock budget for a builder VM.
+	// It must match the timeout written by builderd into the build manifest;
+	// vmmd uses it to retain the corresponding export/teardown headroom.
+	BuildTimeoutSec int
 	// Port (issue #460 / ADR-053, PR-C) is the per-deployment override
 	// port the customer's app binds inside the guest. 0 = legacy 8080
 	// (netns.AppPort default). The host's waitReady + DNAT stay fixed
@@ -2095,6 +2117,12 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// Plan is allocator-side state and must follow the lease's
 	// lifetime.
 	lease.Plan = req.Plan
+	lease.IsBuilder = req.ExportDir != ""
+	lease.BuildTimeoutSec = req.BuildTimeoutSec
+	if lease.IsBuilder && lease.BuildTimeoutSec <= 0 {
+		lease.BuildTimeoutSec = api.BuildTimeoutSeconds
+	}
+	lease.MemoryMaxMiB = req.MemSizeMiB
 	// Any failure from this point — Plan validation, wire-side
 	// allowlist checks, bringUp, cgroup write — must fully clean up.
 	// Registering the cleanup BEFORE the validation loop is
@@ -2111,6 +2139,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		}
 	}()
 	nc := netns.NewConfig(lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP)
+	nc.TapUID = lease.UID
 	nc.EgressMbit = req.EgressMbit
 	// Plan validation (issue #301 / ADR-043). An empty / unknown plan
 	// would land the VM under the wrong cgroup sub-slice (or under
@@ -2336,7 +2365,12 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// so snapshot-restore Wake does not need a reset. Failure routes
 	// through the deferred cleanup path — the VM is already up, but
 	// teardown kills it and releases the lease.
-	if err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB); err != nil {
+	if lease.IsBuilder {
+		err = writeBuildCgroup(req.Instance, req.MemSizeMiB)
+	} else {
+		err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB)
+	}
+	if err != nil {
 		// Cgroup fence spec §4.4 but may fail in constrained environments
 		// (cgroup namespace isolation). VM is already up; continue without memory cap.
 		// Useful for local metal testing only.
@@ -2358,7 +2392,11 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// because the VM is already up and leaking a host-side cap is
 	// strictly better than failing the wake.
 	if len(req.Sidecars) > 0 {
-		parentScope := filepath.Join(cgroupRoot, ParentCgroupFor(req.Plan), PerInstanceScope(req.Instance))
+		parentCgroup := ParentCgroupFor(req.Plan)
+		if lease.IsBuilder {
+			parentCgroup = BuilderCgroupParent
+		}
+		parentScope := filepath.Join(cgroupRoot, parentCgroup, PerInstanceScope(req.Instance))
 		// Main workload: matches the per-instance memory.max (the
 		// customer pays for the plan RAM, not the +8 MB overhead).
 		// The +8 MB lives on the parent scope and is shared across
@@ -3487,6 +3525,16 @@ next:
 // exit non-zero on a fresh netns / brand-new veth; those failures are
 // expected and logged at Debug.
 func (m *Manager) setupNetwork(ctx context.Context, nc netns.Config) error {
+	// A crashed vmmd/jailer can leave a regular namespace marker behind even
+	// after `ip netns del` reports an invalid peer. Clear that exact stale
+	// marker before reusing the allocator-derived name; a real mounted netns
+	// is still handled by iproute2, while only a regular file reaches the
+	// filesystem fallback.
+	if err := m.run.Run(ctx, []string{"ip", "netns", "del", nc.Netns}); err != nil {
+		m.log.Debug("stale netns cleanup (best-effort)",
+			"instance", nc.Instance, "netns", nc.Netns, "err", err)
+	}
+	removeStaleNetnsMarker(nc.Netns)
 	if err := m.runCommands(ctx, nc.SetupCommands()); err != nil {
 		return err
 	}
@@ -3517,6 +3565,18 @@ func (m *Manager) setupNetwork(ctx context.Context, nc netns.Config) error {
 		}
 	}
 	return m.runCommands(ctx, nc.NftCommands())
+}
+
+// removeStaleNetnsMarker removes only a regular file in the iproute2 netns
+// directory. It is a recovery path for a partially-created namespace marker;
+// mounted namespaces and other filesystem objects are left to iproute2.
+func removeStaleNetnsMarker(name string) {
+	path := filepath.Join("/run/netns", name)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // runCommands runs each argv in order, stopping at the first error. The argv
@@ -3642,7 +3702,11 @@ func (m *Manager) cleanup(ctx context.Context, lease Lease, nc netns.Config, wor
 	// cleanup. Best-effort: children with EBUSY are logged and
 	// swallowed (same posture as vmm.Kill's parent removal below).
 	if len(workloadNames) > 0 {
-		parentScope := filepath.Join(cgroupRoot, ParentCgroupFor(lease.Plan), PerInstanceScope(lease.Instance))
+		parentCgroup := ParentCgroupFor(lease.Plan)
+		if lease.IsBuilder {
+			parentCgroup = BuilderCgroupParent
+		}
+		parentScope := filepath.Join(cgroupRoot, parentCgroup, PerInstanceScope(lease.Instance))
 		removeWorkloadCgroups(parentScope, workloadNames)
 	}
 	if err := m.vmm.Kill(ctx, lease); err != nil {

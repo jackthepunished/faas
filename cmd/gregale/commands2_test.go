@@ -1572,6 +1572,42 @@ func TestCmdAppsRm_TypedConfirmation_Mismatch(t *testing.T) {
 	}
 }
 
+// TestCmdAppsDispatch_QuietDeletePreservesFlag pins the documented
+// `gregale apps -q <slug>` dispatcher path. The top-level dispatcher must
+// forward -q to cmdAppsRm; otherwise the command unexpectedly enters the
+// interactive typed-confirmation path.
+func TestCmdAppsDispatch_QuietDeletePreservesFlag(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		method string
+		path   string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		method = r.Method
+		path = r.URL.Path
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	pipeStdin(t, "")
+
+	if code := run([]string{"apps", "-q", "myapp"}); code != 0 {
+		t.Fatalf("run(apps -q myapp) = %d, want 0", code)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if method != http.MethodDelete {
+		t.Errorf("method = %q, want DELETE", method)
+	}
+	if path != "/v1/apps/myapp" {
+		t.Errorf("path = %q, want /v1/apps/myapp", path)
+	}
+}
+
 // pollBuildStatus tests (DEPLOY-PROV-6 / ADR-089, issue #741).
 // Whitebox — `package main` so the unexported pollBuildStatus
 // helper is reachable. Test seams:

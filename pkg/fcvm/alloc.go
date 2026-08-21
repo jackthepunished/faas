@@ -103,6 +103,19 @@ type Lease struct {
 	// map lookup. Empty for pre-issue-301 callers (legacy 2-level
 	// hierarchy); see ParentCgroupFor for the empty fallback.
 	Plan api.Plan
+	// IsBuilder selects the dedicated faas-cp-build.slice cgroup for an
+	// ephemeral builder VM. Builder memory must not be charged to vmmd's
+	// supervisor cgroup or to tenant RAM.
+	IsBuilder bool
+	// BuildTimeoutSec is the guest build wall-clock budget carried from
+	// builderd. vmmd uses it to size builder teardown headroom; zero keeps
+	// the platform default for legacy callers and ordinary app VMs.
+	BuildTimeoutSec int
+	// MemoryMaxMiB is the requested VM memory fence carried into the jailer
+	// command. The jailer creates the per-VM cgroup as root, so memory.max is
+	// set there before it drops privileges; vmmd's post-boot CPU fence remains
+	// a separate write.
+	MemoryMaxMiB int
 }
 
 // Allocator hands out unique Leases and recycles slots on release. Safe for

@@ -303,7 +303,7 @@ func cmdManifestRender(args []string) int {
 	// empty host name (single-box dev) skips the write because
 	// compute_nodes.role stays NULL.
 	//
-	// FAAS_PG_DSN missing is logged as a warning, not an error —
+	// A missing database DSN is logged as a warning, not an error —
 	// file-write succeeded, the role-write is a downstream signal
 	// the doctor will detect on the next run.
 	if !*dryRun && report.Host != "" && report.Role != "" {
@@ -335,9 +335,9 @@ func cmdManifestRender(args []string) int {
 // short-lived (one open per call) — the manifest-render workflow
 // is operator-triggered, not load-bearing on a long-lived pool,
 // and the existing openPgPoolFromEnv helper (commands_release.go)
-// is the canonical voice for FAAS_PG_DSN. A missing DSN is a soft
+// is the canonical voice for the operator database DSN. A missing DSN is a soft
 // warning (the render itself succeeded; the operator can re-run
-// with FAAS_PG_DSN set after the next deploy).
+// with FAAS_PG_DSN or DATABASE_URL set after the next deploy).
 func writeComputeNodeRole(name, role string) error {
 	pool, err := openPgPoolFromEnv()
 	if err != nil {

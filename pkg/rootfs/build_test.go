@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -371,6 +372,92 @@ func TestNormalizeFunctionHandler_NodeAlias(t *testing.T) {
 	}
 	if string(got) != "handler" {
 		t.Errorf("node22.js = %q, want handler source", got)
+	}
+}
+
+func TestNormalizeFunctionHandler_NodeExportAdapter(t *testing.T) {
+	staging := t.TempDir()
+	source := filepath.Join(staging, "app", "handler.js")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const handler = "export async function handler(event, ctx) { return { statusCode: 200, body: JSON.stringify(event) }; }"
+	if err := os.WriteFile(source, []byte(handler), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/node22.js"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	gotSource, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("handler.js: %v", err)
+	}
+	if string(gotSource) != handler {
+		t.Fatalf("handler.js was changed: %q", gotSource)
+	}
+	gotAdapter, err := os.ReadFile(filepath.Join(staging, "app", "node22.js"))
+	if err != nil {
+		t.Fatalf("node22.js: %v", err)
+	}
+	if !bytes.Contains(gotAdapter, []byte("handler.js")) || !bytes.Contains(gotAdapter, []byte("body_b64")) {
+		t.Fatalf("node22.js is not a function adapter: %q", gotAdapter)
+	}
+}
+
+func TestNormalizeFunctionHandler_NodeExportAdapterRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not installed")
+	}
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "handler.js"), []byte(`export async function handler(event, ctx) {
+  return { statusCode: 201, headers: { "content-type": "application/json" }, body: JSON.stringify({ id: ctx.invocation_id, body: event.body }) };
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/node22.js"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("node", filepath.Join(appDir, "node22.js"))
+	cmd.Dir = appDir
+	cmd.Stdin = strings.NewReader(`{"method":"POST","path":"/e2e","headers":{"x-faas-invocation-id":"inv-1"},"query":"","body_b64":"eyJ4Ijo3fQ=="}`)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("node adapter: %v", err)
+	}
+	if !strings.Contains(string(out), `"status":201`) || !strings.Contains(string(out), `eyJpZCI6Imludi0xIiwiYm9keSI6eyJ4Ijo3fX0=`) {
+		t.Fatalf("unexpected adapter response: %s", out)
+	}
+}
+
+func TestNormalizeFunctionHandler_PythonExportAdapter(t *testing.T) {
+	staging := t.TempDir()
+	source := filepath.Join(staging, "app", "handler.py")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const handler = "async def handler(event, ctx):\n    return {'statusCode': 200, 'body': 'ok'}\n"
+	if err := os.WriteFile(source, []byte(handler), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/handler.py"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "app", ".faas-handler.py")); err != nil {
+		t.Fatalf("preserved handler implementation: %v", err)
+	}
+	gotAdapter, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("handler.py: %v", err)
+	}
+	if !bytes.Contains(gotAdapter, []byte("faas-handler.py")) || !bytes.Contains(gotAdapter, []byte("body_b64")) {
+		t.Fatalf("handler.py is not a function adapter: %q", gotAdapter)
 	}
 }
 

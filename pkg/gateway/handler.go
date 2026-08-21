@@ -4397,6 +4397,13 @@ func (h *Handler) writeWebSocketNotAllowed(w http.ResponseWriter, appID string, 
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The edge-rule budget is stamped after app resolution, so its timer
+	// cancellation must be deferred against the final request context rather
+	// than inside stampRequestBudget itself. This keeps cold-start and proxy
+	// work alive for the allotted budget while still releasing the timer on
+	// every return path.
+	defer func(ctx context.Context) { cancelStampedRequestBudget(ctx) }(r.Context())
+
 	// Drain tracker (issue #587 / PR-A): the returned closure fires
 	// on every return path below, including the early-out problem
 	// writes. nil-safe via serveHTTPWithDrain — unit tests that
@@ -4862,6 +4869,16 @@ haveApp:
 		w.Header().Set("x-faas-wake-id", wakeID)
 	}
 
+	// The forwarding bridge can detect a terminal vmmd/netns failure after
+	// routing has already selected this target. Evict that one cache entry so
+	// the next request can ask schedd for a fresh instance instead of replaying
+	// the same dead target forever. The signal is internal and only set by the
+	// bridge on transport/liveness failures; ordinary guest 502/503 responses
+	// are therefore left untouched.
+	staleSignal := &staleTargetSignal{}
+	//nolint:contextcheck // withStaleTargetSignal intentionally inherits r.Context.
+	r = r.WithContext(withStaleTargetSignal(r.Context(), staleSignal))
+
 	// Streaming decision (PR-B / ADR-047). Four-way AND: the operator
 	// must have opted the process in (h.streamingEnabled, set via
 	// FAAS_GATEWAY_STREAMING), the per-app apps.streaming_enabled flag
@@ -5081,6 +5098,16 @@ haveApp:
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
 		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
+	}
+	//nolint:contextcheck // staleTargetDetected only reads the marker from r.Context.
+	if staleTargetDetected(r.Context()) {
+		if evictor, ok := h.backend.(interface {
+			EvictInstance(appID, instanceID string)
+		}); ok {
+			evictor.EvictInstance(app.ID, target.InstanceID)
+			h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
+				"instance_id", target.InstanceID, "node_id", target.NodeID)
+		}
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
@@ -5985,13 +6012,15 @@ func (h *Handler) coldStart(ctx context.Context, appID, scope string, maxConcurr
 		// the leader aborts with reason "queue_empty_no_instance"
 		// instead of staying alive for the full TTL. The plan
 		// MaxMinInstances check would require the coldStart path to
-		// re-resolve the app; the gate's own waiter count already
-		// reflects the relevant signal — coldStart only runs when
-		// the picker fast-path found no live instance. onAbort bumps
+		// re-resolve the app; the gate's total waiter count already
+		// reflects the relevant signal — the leader remains a waiter
+		// while its request is waiting and reaches zero only after
+		// the caller has left. coldStart only runs when the picker
+		// fast-path found no live instance. onAbort bumps
 		// the gateway_leader_bootstrap_aborts_total counter and
 		// surfaces the abort reason on the §12 dashboard chip.
 		func() bool {
-			return h.gate.InflightFollowers(appID) == 0 && h.backend.HealthyCount(appID) == 0
+			return h.gate.InflightWaiters(appID) == 0 && h.backend.HealthyCount(appID) == 0
 		},
 		func(reason string) {
 			h.metrics.ObserveLeaderBootstrapAbort(reason)

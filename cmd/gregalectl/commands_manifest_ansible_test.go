@@ -49,11 +49,60 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://vmmd.faas:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)
 	}
+	if !strings.Contains(computeVars, `faas_gateway_listen: "0.0.0.0:8080"`) {
+		t.Errorf("compute host vars missing split gateway listener:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_gatewayd_egress_listen: "tcp://0.0.0.0:9092"`) {
+		t.Errorf("compute host vars missing split egress listener:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_vmmd_schedd_target: "tcp://schedd.faas:7100"`) {
+		t.Errorf("compute host vars missing scheduler target:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_gatewayd_apid_loopback: "http://10.42.0.1:8081"`) {
+		t.Errorf("compute host vars missing control-plane apid target:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `overlay_cidrs: ["10.42.0.0/24"]`) {
+		t.Errorf("compute host vars missing manifest overlay CIDR:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_overlay_provider: "wireguard"`) || !strings.Contains(computeVars, "faas_overlay_iface: wg0") {
+		t.Errorf("compute host vars missing manifest overlay provider/interface:\n%s", computeVars)
+	}
+	var controlVars string
+	for _, file := range files {
+		if strings.HasSuffix(file.Path, "fsn-1.yml") {
+			controlVars = string(file.Body)
+		}
+	}
+	if !strings.Contains(controlVars, `faas_postgres_allowed_cidrs: ["10.42.0.2/32"]`) {
+		t.Errorf("control host vars missing compute PostgreSQL allowlist:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, `faas_compute_allowed_cidrs: ["10.42.0.2/32"]`) {
+		t.Errorf("control host vars missing compute scheduler allowlist:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, `faas_gatewayd_internal_target: "tcp://10.42.0.2:8080"`) {
+		t.Errorf("control host vars missing split gateway target:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://10.42.0.2:8080"`) {
+		t.Errorf("control host vars missing schedd synth target:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, `faas_schedd_gateway_metrics_url: ""`) {
+		t.Errorf("control host vars should disable unreachable remote gateway metrics:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, "faas_meterd_config_managed: true") ||
+		!strings.Contains(controlVars, `faas_meterd_egress_socket: "tcp://egress.faas:9092"`) {
+		t.Errorf("control host vars missing managed meterd egress route:\n%s", controlVars)
+	}
+	if !strings.Contains(computeVars, `faas_control_plane_allowed_cidrs: ["10.42.0.1/32"]`) {
+		t.Errorf("compute host vars missing control-plane service allowlist:\n%s", computeVars)
+	}
 	if !strings.Contains(computeVars, `10.42.0.1"`) || !strings.Contains(computeVars, `schedd.faas`) {
 		t.Errorf("compute host vars missing control-plane private alias:\n%s", computeVars)
 	}
 	if !strings.Contains(computeVars, `10.42.0.2"`) || !strings.Contains(computeVars, `vmmd.faas`) {
 		t.Errorf("compute host vars missing compute private alias:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `egress.faas`) {
+		t.Errorf("compute host vars missing egress private alias:\n%s", computeVars)
 	}
 }
 

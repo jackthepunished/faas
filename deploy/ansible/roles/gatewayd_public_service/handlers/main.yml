@@ -1,0 +1,7 @@
+---
+# gatewayd-public — handlers.
+- name: restart faas-gatewayd-public
+  ansible.builtin.systemd:
+    name: faas-gatewayd-public
+    state: restarted
+  listen: restart faas-gatewayd-public

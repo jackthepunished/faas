@@ -5,7 +5,8 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // UnitGatewaydPublic is the canonical unit for faas-gatewayd-public —
 // the plain-HTTP edge daemon (Tier A7 split, ADR-070). TLS terminates
 // at Caddy upstream; this daemon binds 127.0.0.1:8080 and forwards to
-// gatewayd-internal over a unix socket.
+// gatewayd-internal over a unix socket on one-box installs or a private TCP
+// target on split-box control planes.
 //
 // Wipe-comments-load-bearing rationale:
 //
@@ -20,8 +21,8 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     was launched without --config and gatewayd-internal's TOML config
 //     was never shipped. :9092 is the only port the rest of the platform
 //     doesn't claim.
-//   - RestrictAddressFamilies=AF_UNIX AF_INET: dials gatewayd-internal.sock
-//     (AF_UNIX) + accepts Caddy's reverse-proxy on 127.0.0.1:8080 (AF_INET).
+//   - RestrictAddressFamilies=AF_UNIX AF_INET: accepts Caddy's reverse-proxy
+//     on 127.0.0.1:8080 and dials either the local socket or private TCP.
 //     AF_INET6 dropped because the bind is loopback v4.
 //
 // See ADR-078 for the migration that wiped these from the unit body.
@@ -29,8 +30,8 @@ func UnitGatewaydPublic() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas gatewayd-public — plain-HTTP edge (Tier A7 split, ADR-070; TLS terminates at Caddy upstream)",
 		Documentation: "https://docs.gregale.dev/ops/gatewayd-public",
-		After:         []string{"faas-cp.slice", "network-online.target", "faas-apid.service", "faas-gatewayd-internal.service"},
-		Wants:         []string{"faas-cp.slice", "faas-apid.service", "faas-gatewayd-internal.service"},
+		After:         []string{"faas-cp.slice", "network-online.target", "faas-apid.service"},
+		Wants:         []string{"faas-cp.slice", "faas-apid.service"},
 
 		Type:       "simple",
 		User:       "faas",
@@ -46,6 +47,7 @@ func UnitGatewaydPublic() daemonunit.Unit {
 
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_PUBLIC_CONTROL_ADDR", Value: "127.0.0.1:9092"},
+			{Key: "FAAS_INTERNAL_TARGET", Value: ""},
 		},
 
 		NoNewPrivileges:         true,

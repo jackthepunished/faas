@@ -3,9 +3,11 @@
 # node_exporter_version pins the binary; same precedent as
 # firecracker + prometheus.
 #
-# listen_addr is the bridge IP only — the input chain policy `drop`
-# on the public iface would block Prometheus's scrape. 9100 is the
-# upstream default.
+# listen_addr is loopback-only — Prometheus scrapes locally and the
+# input chain never needs to expose host telemetry on a provider-specific
+# bridge or public interface. 9100 is the upstream default.
 
 node_exporter_version: "1.8.2"
-node_exporter_listen_addr: "10.0.0.1:9100"
+# SHA-256 of node_exporter-1.8.2.linux-amd64.tar.gz from the upstream release.
+node_exporter_release_sha256: "6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66"
+node_exporter_listen_addr: "127.0.0.1:9100"

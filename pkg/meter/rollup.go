@@ -67,7 +67,7 @@ const rollupSQL = `
 INSERT INTO public.usage_daily (
     account_id, app_id, day,
     mb_seconds, requests, cpu_usec, tx_bytes,
-    net_tx_bytes, net_rx_bytes, cold_boots, builder_seconds,
+    net_tx_bytes, net_rx_bytes, cold_boot_count, builder_seconds,
     tail_seconds, rolled_up_at
 )
 SELECT
@@ -88,7 +88,7 @@ ON CONFLICT (account_id, app_id, day) DO UPDATE SET
     tx_bytes        = EXCLUDED.tx_bytes,
     net_tx_bytes    = EXCLUDED.net_tx_bytes,
     net_rx_bytes    = EXCLUDED.net_rx_bytes,
-    cold_boots      = EXCLUDED.cold_boots,
+    cold_boot_count = EXCLUDED.cold_boot_count,
     builder_seconds = EXCLUDED.builder_seconds,
     tail_seconds    = EXCLUDED.tail_seconds,
     rolled_up_at    = EXCLUDED.rolled_up_at

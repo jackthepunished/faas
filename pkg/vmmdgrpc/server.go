@@ -88,6 +88,9 @@ type VmmdAPI interface {
 	// key isn't published (imaged's parent must already be staged via
 	// EnsureBases before any child re-stage fires this).
 	MountParentExt4(ctx context.Context, storageKey string) (string, error)
+	// MaterializeParentExt4 copies a parent ext4 tree into a shared staging
+	// directory while the root-owned vmmd process can still see its mount.
+	MaterializeParentExt4(ctx context.Context, storageKey, targetDir string) error
 	// UmountParentExt4 (ADR-053) releases a mount MountParentExt4
 	// previously returned. Idempotent on unknown mountpoints so
 	// imaged's defer-after-error pattern is safe.
@@ -893,6 +896,48 @@ func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountP
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	return &vmmdpb.MountParentExt4ReadOnlyResponse{Mountpoint: mp}, nil
+}
+
+// MaterializeParentExt4 copies a parent tree into imaged's shared staging
+// directory. vmmd owns the short-lived loopback mount; the caller receives
+// ordinary files, so the handoff is not dependent on mount-namespace sharing.
+func (s *Server) MaterializeParentExt4(ctx context.Context, req *vmmdpb.MaterializeParentExt4Request) (*vmmdpb.MaterializeParentExt4Response, error) {
+	const op = "MaterializeParentExt4"
+	start := time.Now()
+	if req.GetStorageKey() == "" || req.GetTargetDir() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing materialize path", "storage_key and target_dir are required").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#materialize-parent-ext4")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	if !sched.IsParentBaseKey(req.GetStorageKey()) {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"storage_key not in allow-list",
+			"only the canonical parent base ext4 key may be materialized").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#materialize-parent-ext4")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	err := s.vmm.MaterializeParentExt4(ctx, req.GetStorageKey(), req.GetTargetDir())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		if errors.Is(err, vmmdmount.ErrNotFound) {
+			p := api.NewProblem(int(codes.NotFound), api.CodeNotFound,
+				"storage_key not found", "no parent artifact exists under that key").
+				WithDocs("https://" + wire.DocsHost + "/vmmd#materialize-parent-ext4")
+			return nil, grpcerr.ToStatus(p)
+		}
+		if errors.Is(err, vmmdmount.ErrInvalidOverlayPath) {
+			p := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+				"target_dir outside staging root",
+				"target_dir must be under /dev/shm/faas-base-staging/").
+				WithDocs("https://" + wire.DocsHost + "/vmmd#materialize-parent-ext4")
+			return nil, grpcerr.ToStatus(p)
+		}
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.MaterializeParentExt4Response{}, nil
 }
 
 // UmountParentExt4 (ADR-053) releases a parent mount the

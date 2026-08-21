@@ -1,7 +1,7 @@
 # compute_only_service ansible role
 
-Drops the imaged systemd unit + example TOML + FAAS_NODE_NAME/FAAS_IMAGED_ROLE
-drop-ins. Does NOT enable or start imaged — the operator runs
+Drops the imaged systemd unit + example TOML + role/routing drop-ins. Does
+NOT enable or start imaged — the operator runs
 `systemctl enable --now faas-imaged` once `/etc/faas/sealed.env` is populated
 with `DATABASE_URL` (gap G2).
 
@@ -16,6 +16,10 @@ with `DATABASE_URL` (gap G2).
   `role.FromConfig` sentinel. Without this drop-in imaged falls back to
   `RoleSingleBox` on the compute-only box and the cosign sign-keypair path
   assumes single-box assumptions (no per-box PKI subset).
+- `zz-faas-vmmd-client.conf.j2` — owns the split-box imaged → vmmd target and
+  dedicated `imaged/vmmd-client` leaf. The target is always the internal
+  `vmmd.faas` identity, not a provider-specific IP, so moving the compute box
+  does not require editing daemon certificates or hard-coded addresses.
 
 ## Side effects
 

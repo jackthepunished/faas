@@ -12,6 +12,7 @@
 
 faas_box_role: control-plane
 faas_node_name: fsn-1
+gatewayd_apps_domain: apps.gregale.dev
 
 # Ansible connection vars. `ansible_host` is the cross-box addressing
 # target (Layer-3 mesh endpoint: Tailscale/Wireguard IP, internal LAN,

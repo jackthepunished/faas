@@ -59,7 +59,14 @@ func writePlanCgroup(instance string, plan api.Plan, planMB int) error {
 	if !plan.Valid() {
 		return fmt.Errorf("fcvm: cgroup: invalid plan %q (issue #301 / ADR-044)", plan)
 	}
-	scope := filepath.Join(cgroupRoot, ParentCgroupFor(plan), PerInstanceScope(instance))
+	return writePlanCgroupAt(ParentCgroupFor(plan), instance, plan, planMB)
+}
+
+// writePlanCgroupAt applies the plan fence at an already-resolved parent
+// cgroup. Builders use the same memory accounting shape but live under
+// faas-cp-build.slice, so their parent cannot be derived from the tenant plan.
+func writePlanCgroupAt(parent, instance string, plan api.Plan, planMB int) error {
+	scope := filepath.Join(cgroupRoot, parent, PerInstanceScope(instance))
 	if err := writeMemoryMaxTo(scope, planMB); err != nil {
 		return err
 	}
@@ -69,11 +76,31 @@ func writePlanCgroup(instance string, plan api.Plan, planMB int) error {
 	return nil
 }
 
-// writeMemoryMaxTo writes memory.max (in bytes) into the given
-// fully-resolved scope path. Idempotent. Public so the cgroup unit
-// test can exercise it directly without spinning up a Manager.
-func writeMemoryMaxTo(scope string, planMB int) error {
-	bytes := int64(api.BillableRAMMB(planMB)) << 20
+// writeBuildCgroup applies the dedicated builder VM fence. Build VMs are
+// fixed at 2 vCPU / 2048 MiB by the build contract, so their CPU quota is
+// independent of the owning account's tenant plan quota.
+func writeBuildCgroup(instance string, planMB int) error {
+	if planMB < 1 {
+		return fmt.Errorf("fcvm: cgroup: builder planMB %d < 1", planMB)
+	}
+	scope := filepath.Join(cgroupRoot, BuilderCgroupParent, PerInstanceScope(instance))
+	if err := writeMemoryMaxAt(scope, api.BuilderMemoryMaxMB(planMB)); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(scope, "cpu.max"), []byte("200000 100000\n"), 0o644); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("fcvm: cgroup: builder scope %s missing: %w", scope, err)
+		}
+		return fmt.Errorf("fcvm: cgroup: write builder cpu.max: %w", err)
+	}
+	return nil
+}
+
+func writeMemoryMaxAt(scope string, memoryMB int) error {
+	if memoryMB < 1 {
+		return fmt.Errorf("fcvm: cgroup: memoryMB %d < 1", memoryMB)
+	}
+	bytes := int64(memoryMB) << 20
 	path := filepath.Join(scope, "memory.max")
 	body := fmt.Sprintf("%d\n", bytes)
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
@@ -83,6 +110,44 @@ func writeMemoryMaxTo(scope string, planMB int) error {
 		return fmt.Errorf("fcvm: cgroup: write %s: %w", path, err)
 	}
 	return nil
+}
+
+// writeMemoryMaxTo writes memory.max (in bytes) into the given
+// fully-resolved scope path. Idempotent. Public so the cgroup unit
+// test can exercise it directly without spinning up a Manager.
+func writeMemoryMaxTo(scope string, planMB int) error {
+	return writeMemoryMaxAt(scope, api.BillableRAMMB(planMB))
+}
+
+// widenSnapshotMemoryCgroup temporarily raises the app VM's host-side
+// memory.max while Firecracker materialises a full snapshot. A normal app VM
+// is fenced at ram_mb + PerVMOverheadMB, but /snapshot/create briefly needs
+// additional host memory for its snapshot bookkeeping and copy-on-write
+// accounting. Builders never use the app snapshot path and therefore do not
+// receive this exception.
+//
+// The returned restore function is deliberately explicit: callers must keep
+// the widened limit for the complete snapshot/export operation, then restore
+// the ordinary per-VM fence before the VM resumes or is destroyed.
+func widenSnapshotMemoryCgroup(l Lease) (func() error, error) {
+	if l.IsBuilder || l.MemoryMaxMiB < 1 {
+		// Builders are exported and destroyed rather than parked, while zero
+		// memory is the legacy lease shape used by older unit-only callers.
+		return func() error { return nil }, nil
+	}
+
+	scope := filepath.Join(cgroupRoot, ParentCgroupFor(l.Plan), PerInstanceScope(l.Instance))
+	original := api.BillableRAMMB(l.MemoryMaxMiB)
+	if err := writeMemoryMaxAt(scope, api.SnapshotMemoryMaxMB(l.MemoryMaxMiB)); err != nil {
+		return nil, fmt.Errorf("fcvm: widen snapshot memory.max for %s: %w", l.Instance, err)
+	}
+
+	return func() error {
+		if err := writeMemoryMaxAt(scope, original); err != nil {
+			return fmt.Errorf("fcvm: restore snapshot memory.max for %s: %w", l.Instance, err)
+		}
+		return nil
+	}, nil
 }
 
 // writeCPUMaxTo writes cpu.max (in microseconds) into the given

@@ -21,6 +21,8 @@
 # before systemd unit enable.
 
 am_version: "0.27.0"
+# SHA-256 of alertmanager-0.27.0.linux-amd64.tar.gz from the upstream release.
+am_release_sha256: "23c3f5a3c73de91dbaec419f3c492bef636deb02680808e5d842e6553aa16074"
 am_listen_addr: "127.0.0.1:9093"
 am_data_dir: /var/lib/alertmanager
 am_config_path: /etc/alertmanager/alertmanager.yml

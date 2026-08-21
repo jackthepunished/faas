@@ -43,8 +43,14 @@ func UnitImaged() daemonunit.Unit {
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
-		Slice:     "faas-cp.slice",
-		MemoryMax: "1G",
+		Slice: "faas-cp.slice",
+		// Base-image conversion invokes mkfs.ext4 over the OCI layer
+		// tree. The Go runtime base peaks above 2G while its large
+		// compiler tree is materialised, which otherwise turns first
+		// boot into an OOM restart loop. Keep the daemon bounded at
+		// the control-plane slice's 6G ceiling, but leave enough room
+		// for one conversion at a time.
+		MemoryMax: "4G",
 
 		// No AmbientCapabilities — DEPLOY-1 erased cap_sys_admin; the
 		// parent-ref mount is an RPC to vmmd now.
@@ -62,7 +68,11 @@ func UnitImaged() daemonunit.Unit {
 			"cap_sys_chroot",
 		},
 
-		EnvironmentFile: "/etc/faas/sealed.env",
+		// sealed.env is an optional production override. Render the
+		// systemd '-' prefix so an image-seeded compute node can boot
+		// from its rendered TOML and role drop-ins before secrets
+		// provisioning has populated the override file.
+		EnvironmentFile: "-/etc/faas/sealed.env -/etc/faas/compute-db.env",
 		Environment: []daemonunit.KV{
 			// ProtectSystem=strict makes the host /tmp read-only. Keep OCI
 			// layer verification and upload scratch on the writable base disk.
@@ -83,7 +93,7 @@ func UnitImaged() daemonunit.Unit {
 		ReadOnlyPaths: []string{"/etc/faas"},
 		ReadWritePaths: []string{
 			"/srv/fc/snap", "/srv/fc/base", "/srv/fc/base-staging", "/srv/fc/scans", "/srv/fc/sigs",
-			"/var/log/faas", "/var/spool/faas",
+			"/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache",
 			"/dev/shm/faas-base-staging",
 		},
 

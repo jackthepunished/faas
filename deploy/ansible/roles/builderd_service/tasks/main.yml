@@ -61,6 +61,14 @@
     daemon_reload: true
   when: builderd_unit.changed
 
+- name: builderd_service — create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-builderd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the builderd unit so the build_claimed log lines
 # carry the canonical host identity. Mirrors the vmmd / schedd /
@@ -100,19 +108,32 @@
     group: faas
     mode: "0750"
 
+# OCI storage uses the shared read-through cache for source archives and
+# produced layers. builderd is a writer, so the path must exist before
+# ProtectSystem=strict creates the service namespace.
+- name: builderd_service — ensure OCI cache root exists
+  ansible.builtin.file:
+    path: /var/lib/faas/cache
+    state: directory
+    owner: faas-builderd
+    group: faas
+    mode: "0770"
+
 # Spec §11 — ProtectSystem=strict ReadWritePaths= assert. Mirrors
 # the same shape as imaged (compute_only_service/tasks/main.yml) and
 # vmmd (vmmd_service/tasks/main.yml, after Mega-PR-C Commit 10
-# extends it). The list is read from the unit file (not hardcoded)
-# so a unit edit does not silently drift from the role's mkdir
-# list. Fail loud before systemd daemon-reload so a drift on a
-# fresh box never reaches production.
+# extends it). The canonical list mirrors the unit file; the
+# compute_only_service role also checks the union of all three unit
+# files. Fail loud before daemon activation if a required target is
+# absent on a fresh box.
 - name: builderd_service — assert ReadWritePaths= whitelist matches mkdir list
   ansible.builtin.set_fact:
-    builderd_rwpaths: >-
-      {{ (lookup('file', role_path + '/files/faas-builderd.service')
-          | regex_search('ReadWritePaths=([^\\n]+)', '\\1')
-          | first).split() }}
+    builderd_rwpaths:
+      - "{{ builderd_build_staging_root }}"
+      - /srv/fc/base
+      - /var/log/faas
+      - /var/spool/faas
+      - /var/lib/faas/cache
 
 - name: builderd_service — assert every ReadWritePaths= target exists
   ansible.builtin.stat:
@@ -136,28 +157,30 @@
   register: faas_pki_builderd_leaf_stat
   failed_when: not faas_pki_builderd_leaf_stat.stat.exists
 
-# Spec §11 — node-key (ADR-053 slice-3). builderd signs the build
-# artifact with the same node signing key vmmd uses for capacity
-# reports (cmd/builderd/main.go reads loadNodeSigningKey the same
-# way). The 0400 root:root contract is shared; the ansible-side
-# tripwire mirrors the vmmd assert.
-- name: builderd_service — assert node-key mode is 0400 root:root (ADR-053)
+# The PKI writer deliberately emits private keys as root:root 0400. The
+# builderd client leaf is different from a root daemon's key: builderd runs
+# as faas-builderd and must read it to dial vmmd. Normalize this one
+# deployment-owned client key after the bootstrap assert; never loosen the
+# generic PKI writer's policy for unrelated leaves.
+- name: builderd_service — assert vmmd client key exists for non-root daemon
   ansible.builtin.stat:
-    path: /etc/faas/secrets/builderd/node.key
-  register: faas_builderd_node_key_stat
-- name: builderd_service — fail loud if builderd node.key missing or loose (ADR-053)
-  ansible.builtin.fail:
-    msg: >-
-      /etc/faas/secrets/builderd/node.key mode {{ faas_builderd_node_key_stat.stat.mode | default('absent') }}
-      {{ faas_builderd_node_key_stat.stat.pw_name | default('?') }}:{{ faas_builderd_node_key_stat.stat.gr_name | default('?') }} —
-      want 0400 root:root. Re-run `gregalectl node-key init` from the
-      multi-host rollout runbook (docs/runbooks/multi-host-rollout.md
-      §3 "Bootstrap: node signing key").
-  when: >-
-    not faas_builderd_node_key_stat.stat.exists
-    or faas_builderd_node_key_stat.stat.mode != "0400"
-    or faas_builderd_node_key_stat.stat.pw_name != "root"
-    or faas_builderd_node_key_stat.stat.gr_name != "root"
+    path: /etc/faas/tls/builderd/vmmd-client.key
+  register: faas_pki_builderd_client_key_stat
+  failed_when: not faas_pki_builderd_client_key_stat.stat.exists
+
+- name: builderd_service — grant faas group read access to vmmd client key
+  ansible.builtin.file:
+    path: /etc/faas/tls/builderd/vmmd-client.key
+    state: file
+    owner: root
+    group: faas
+    mode: "0440"
+
+# The per-node CapacityReport signing key belongs to vmmd and is
+# asserted by vmmd_service at /etc/faas/secrets/vmmd/node.key. The
+# current builderd binary does not load or sign with a node key; its
+# build attestation is handled by imaged's sign-key material. Do not
+# invent a second /etc/faas/secrets/builderd/node.key contract here.
 
 # Tier 1 — sealed.env presence tripwire. builderd's unit sets
 # EnvironmentFile=/etc/faas/sealed.env so DATABASE_URL is in scope.

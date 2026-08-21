@@ -1,23 +1,43 @@
 # postgres (spec §1, §5).
 #
-# Installs postgres-15 and creates the `faas` system user + DB.
+# Installs the distro-supported PostgreSQL server and creates the `faas`
+# system user + DB.
 # The schema lands in M5 via migrations/00001_init.sql — this role
 # only sets up the cluster trust boundary.
 #
-# Why postgres-15 specifically: spec §Conventions say "SQL via sqlc
-# only", which requires PG ≥ 13 (gen_random_uuid + JSON builders);
-# 15 is the Ubuntu 24.04 default and matches what schedd's ledger
-# JSON queries expect.
-
-- name: postgres — install postgres-15
+# Why the meta-packages: Ubuntu 24.04 ships PostgreSQL 16, while older
+# supported images expose different majors. The application contract is
+# PostgreSQL >= 13, so pinning a package major here makes the role fail on
+# otherwise valid provider images.
+- name: postgres — install distro PostgreSQL server
   ansible.builtin.apt:
     name:
-      - postgresql-15
-      - postgresql-contrib-15
+      - postgresql
+      - postgresql-contrib
       - libpq-dev
     state: present
     update_cache: true
     cache_valid_time: 3600
+
+- name: postgres — discover installed cluster major version
+  ansible.builtin.find:
+    paths: /etc/postgresql
+    file_type: directory
+    recurse: false
+  register: postgres_cluster_dirs
+  changed_when: false
+  failed_when: false
+
+- name: postgres — derive active cluster config directory
+  ansible.builtin.set_fact:
+    postgres_major_version: >-
+      {{ (postgres_cluster_dirs.files | default([])
+          | map(attribute='path') | map('basename') | list | sort | last)
+         | default('15', true) }}
+    postgres_config_dir: >-
+      /etc/postgresql/{{ (postgres_cluster_dirs.files | default([])
+      | map(attribute='path') | map('basename') | list | sort | last)
+      | default('15', true) }}/main
 
 - name: postgres — start + enable
   ansible.builtin.service:
@@ -27,20 +47,38 @@
   register: pg_svc
   failed_when: false  # CI/chroot may not have systemd
 
+- name: postgres — inspect existing system user `faas`
+  ansible.builtin.getent:
+    database: passwd
+    key: faas
+    fail_key: false
+
+- name: postgres — remember whether system user `faas` already exists
+  ansible.builtin.set_fact:
+    faas_user_exists: "{{ 'faas' in (ansible_facts.getent_passwd | default({})) }}"
+
 - name: postgres — ensure system user `faas` exists
   ansible.builtin.user:
     name: faas
     system: true
-    shell: /usr/sbin/nologin
-    home: /var/lib/faas
-    createhome: true
+    shell: "{{ '/usr/sbin/nologin' if not faas_user_exists else omit }}"
+    home: "{{ '/var/lib/faas' if not faas_user_exists else omit }}"
+    createhome: "{{ not faas_user_exists }}"
   register: faas_user
+
+- name: postgres — ensure shared faas runtime directory
+  ansible.builtin.file:
+    path: /var/lib/faas
+    state: directory
+    owner: faas
+    group: faas
+    mode: "0750"
 
 - name: postgres — create postgres role `faas`
   community.postgresql.postgresql_user:
     name: faas
     db: faas
-    password: ""
+    password: "{{ faas_postgres_password | default(omit) }}"
     priv: ALL
     state: present
   become: true
@@ -54,6 +92,17 @@
   changed_when: false
   failed_when: false
   when: pg_role is failed
+
+- name: postgres — require a password for split-box database clients
+  ansible.builtin.assert:
+    that:
+      - faas_postgres_password is defined
+      - faas_postgres_password | string | length > 0
+    fail_msg: >-
+      faas_postgres_password must be provided through Ansible Vault (or an
+      equivalent secret source) when faas_postgres_allowed_cidrs is non-empty;
+      refusing to expose a split-box PostgreSQL listener without host auth.
+  when: (faas_postgres_allowed_cidrs | default([]) | length) > 0
 
 - name: postgres — create database `faas`
   ansible.builtin.command: >
@@ -69,16 +118,18 @@
     group: postgres
     mode: "0755"
 
-# Spec §11 ship-blocker: Postgres must listen on the unix socket ONLY.
-# `listen_addresses = ''` is PGC_POSTMASTER — change requires restart.
+# Spec §11 ship-blocker: Postgres listens on the unix socket ONLY by default.
+# Split-box manifests override `faas_postgres_listen_addresses` with the
+# control-plane mesh address; `listen_addresses` is PGC_POSTMASTER and
+# therefore still requires a restart when the topology changes.
 # `pg_hba.conf` is reload-only. Both handlers in handlers/main.yml fail
 # gracefully on hosts without systemd (CI / chroot) so the role stays
 # idempotent across the bootstrap path.
 - name: postgres — set listen_addresses='' (unix socket only, spec §11)
   ansible.builtin.lineinfile:
-    path: /etc/postgresql/15/main/postgresql.conf
+    path: "{{ postgres_config_dir }}/postgresql.conf"
     regexp: "^#?listen_addresses\\s*="
-    line: "listen_addresses = ''"
+    line: "listen_addresses = '{{ faas_postgres_listen_addresses | default('') }}'"
     create: false
   register: pg_listen
   failed_when: false  # chroot/CI may not have the conf file
@@ -86,7 +137,7 @@
 
 - name: postgres — narrow pg_hba.conf to peer/local auth (spec §11)
   ansible.builtin.copy:
-    dest: /etc/postgresql/15/main/pg_hba.conf
+    dest: "{{ postgres_config_dir }}/pg_hba.conf"
     owner: postgres
     group: postgres
     mode: "0640"
@@ -95,6 +146,14 @@
       # Production clients connect via the local socket in /var/run/postgresql.
       local   all             postgres                                peer
       local   all             faas                                    peer
+      # Split-box daemons use a password-authenticated TCP DSN even when they
+      # are colocated with PostgreSQL. Keep loopback explicit so the same
+      # sealed DATABASE_URL works on the control plane and on compute nodes.
+      host    faas            faas                                    127.0.0.1/32            scram-sha-256
+      host    faas            faas                                    ::1/128                  scram-sha-256
+      {% for cidr in (faas_postgres_allowed_cidrs | default([])) %}
+      host    faas            faas                                    {{ cidr }}                scram-sha-256
+      {% endfor %}
       host    all             all             127.0.0.1/32            reject
       host    all             all             ::1/128                 reject
   register: pg_hba
@@ -117,7 +176,7 @@
 # reload-only. The restart happens exactly once per idleness epoch.
 - name: postgres — set wal_level = replica (restart-needed)
   ansible.builtin.lineinfile:
-    path: /etc/postgresql/15/main/postgresql.conf
+    path: "{{ postgres_config_dir }}/postgresql.conf"
     regexp: "^#?wal_level\\s*="
     line: "wal_level = replica"
     create: false
@@ -127,7 +186,7 @@
 
 - name: postgres — enable archive_mode (reload-only)
   ansible.builtin.lineinfile:
-    path: /etc/postgresql/15/main/postgresql.conf
+    path: "{{ postgres_config_dir }}/postgresql.conf"
     regexp: "^#?archive_mode\\s*="
     line: "archive_mode = on"
     create: false
@@ -157,7 +216,7 @@
 # find it. LoadCredential keeps it tmpfs-only at runtime.
 - name: postgres — set archive_command (reload-only) — issue #250
   ansible.builtin.lineinfile:
-    path: /etc/postgresql/15/main/postgresql.conf
+    path: "{{ postgres_config_dir }}/postgresql.conf"
     regexp: "^#?archive_command\\s*="
     line: "archive_command = 'test ! -f /var/lib/pgsql/archive/%f && cp %p /var/lib/pgsql/archive/%f && rclone copyto %p offhostbox:${off_host_backup_wal_path}/%f --config=%d/faas_off_host_backup_rclone --stats=0 --quiet'"
     create: false
@@ -167,7 +226,7 @@
 
 - name: postgres — bound WAL senders (reload-only, 3 = basebackup + 2 drill slack)
   ansible.builtin.lineinfile:
-    path: /etc/postgresql/15/main/postgresql.conf
+    path: "{{ postgres_config_dir }}/postgresql.conf"
     regexp: "^#?max_wal_senders\\s*="
     line: "max_wal_senders = 3"
     create: false

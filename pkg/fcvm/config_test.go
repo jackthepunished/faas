@@ -230,6 +230,22 @@ func TestJailerCommandMatchesSpec(t *testing.T) {
 	}
 }
 
+func TestJailerCommandIncludesMemoryFenceAtCreation(t *testing.T) {
+	argv := JailerCommand(JailerSpec{
+		Instance:       "build-1",
+		UID:            20000,
+		GID:            20000,
+		Netns:          "fc-build-1",
+		Plan:           api.PlanScale,
+		IsBuilder:      true,
+		MemoryMaxBytes: 2048 << 20,
+	})
+	line := strings.Join(argv, " ")
+	if !strings.Contains(line, "--cgroup memory.max=2147483648") {
+		t.Fatalf("jailer command missing creation-time memory fence: %s", line)
+	}
+}
+
 func indexOf(ss []string, target string) int {
 	for i, s := range ss {
 		if s == target {

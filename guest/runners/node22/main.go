@@ -205,7 +205,10 @@ func invokeHandler(ctx context.Context, handlerPath string, env envelope) (respo
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(timeoutCtx, "node", handlerPath)
+	// guest-init deliberately starts workloads with a minimal environment.
+	// Keep the PATH seam testable, but fall back to the stable runtime-image
+	// path when the guest PATH does not contain the interpreter.
+	cmd := exec.CommandContext(timeoutCtx, nodeBinary(), handlerPath)
 	cmd.Env = append(os.Environ(), "FAAS_RUNTIME=node22")
 
 	var stdin bytes.Buffer
@@ -245,6 +248,13 @@ func invokeHandler(ctx context.Context, handlerPath string, env envelope) (respo
 		return response{}, fmt.Errorf("decode response: %w (stdout=%s)", err, stdout.String())
 	}
 	return resp, nil
+}
+
+func nodeBinary() string {
+	if path, err := exec.LookPath("node"); err == nil {
+		return path
+	}
+	return "/usr/local/bin/node"
 }
 
 // headerMap folds http.Header into the lowercase-string-keyed map the

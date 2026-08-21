@@ -56,7 +56,7 @@ func TestRestartOrder_RespectsLifecycleAfter(t *testing.T) {
 // daemon, a new After edge, a slice reorder). The expected order
 // mirrors the documented dependency graph in registry.go: vmmd and
 // apid are roots; schedd depends on vmmd; gatewayd-internal depends on
-// schedd, apid; gatewayd-public depends on gatewayd-internal; meterd +
+// schedd, apid; gatewayd-public depends on apid; meterd +
 // githubd depend on apid; imaged depends on vmmd; builderd depends on
 // vmmd only (apid runs on the control-plane box only, so on the
 // compute-only box builderd cannot depend on apid — apid is a
@@ -75,7 +75,7 @@ func TestRestartOrder_MatchesExpected(t *testing.T) {
 		"apid",              // root: no After — second
 		"schedd",            // After[vmmd] — second-round ready, idx 2 beats meterd/githubd/imaged
 		"gatewayd-internal", // After[schedd, apid] — both decremented, gatewayd-internal pops
-		"gatewayd-public",   // After[gatewayd-internal]
+		"gatewayd-public",   // After[apid]
 		"meterd",            // After[apid] — Registry idx 5
 		"githubd",           // After[apid] — Registry idx 6
 		"imaged",            // After[vmmd] — Registry idx 7

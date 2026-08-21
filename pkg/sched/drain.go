@@ -349,7 +349,8 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		d.emitDone(ctx, inv)
 		return
 	}
-	if _, err := d.gateway.Invoke(ctx, inv.AppID, inv); err != nil {
+	dispatched, err := d.gateway.Invoke(ctx, inv.AppID, inv)
+	if err != nil {
 		// Permanent invoke errors (4xx) terminal-fail; transient
 		// (network / 5xx) retry. The gateway is the source of
 		// truth — it knows whether the failure is recoverable.
@@ -362,7 +363,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		return
 	}
 	// 6. Complete.
-	if err := d.store.CompleteInvocation(ctx, inv.ID, nil); err != nil {
+	if err := d.store.CompleteInvocation(ctx, inv.ID, dispatched.Result); err != nil {
 		// pgstore.ErrNotFound would mean someone else completed
 		// first; drain does NOT have to retry — the row is in a
 		// terminal state and the meter join will see it.

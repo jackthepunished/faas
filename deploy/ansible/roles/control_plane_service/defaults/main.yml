@@ -1,0 +1,14 @@
+---
+# Managed meterd configuration is enabled by the manifest-generated
+# control-plane host_vars. Existing operator-owned /etc/faas/meterd.toml
+# files remain untouched unless this flag is explicitly true.
+faas_meterd_config_managed: false
+faas_meterd_config_path: /etc/faas/meterd.toml
+faas_meterd_schedd_socket: /run/faas/schedd.sock
+faas_meterd_egress_socket: ""
+faas_meterd_schedd_tls_cert_path: ""
+faas_meterd_schedd_tls_key_path: ""
+faas_meterd_schedd_tls_ca_path: ""
+faas_meterd_egress_tls_cert_path: /etc/faas/tls/meterd/egress-client.crt
+faas_meterd_egress_tls_key_path: /etc/faas/tls/meterd/egress-client.key
+faas_meterd_egress_tls_ca_path: /etc/faas/tls/ca/ca.crt

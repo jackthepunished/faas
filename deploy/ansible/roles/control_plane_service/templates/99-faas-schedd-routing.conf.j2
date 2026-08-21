@@ -1,0 +1,8 @@
+[Service]
+{% if faas_schedd_gateway_synth_target | default('') | length > 0 %}
+# Split-box schedd routes synthetic cron traffic through the compute gateway.
+Environment=FAAS_GATEWAY_SYNTH_TARGET={{ faas_schedd_gateway_synth_target }}
+# gatewayd-internal's control/metrics listener is loopback-only by design;
+# explicitly disable the optional remote scrape until a metrics relay exists.
+Environment=FAAS_GATEWAY_METRICS_URL={{ faas_schedd_gateway_metrics_url | default('') }}
+{% endif %}

@@ -9,7 +9,7 @@ on the 03:00 / 03:30 UTC cadence.
 
 1. Fails-closed if `HETZNER_STORAGE_BOX_USER` / `HETZNER_STORAGE_BOX_HOST`
    are unset (issue #250 acceptance #3).
-2. Installs `rclone` via apt (matches the postgres-15 install pattern;
+2. Installs `rclone` via apt (matches the distro PostgreSQL install pattern;
    no vendored binaries).
 3. Creates `/var/lib/pgsql/basebackup` (postgres-owned, postgres group,
    mode `0750`) — the drill script's `LATEST_BB` parent.

@@ -310,6 +310,15 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	}
 	var artifactReplicator imaged.ArtifactReplicator
 	if helper := os.Getenv("FAAS_ARTIFACT_REPLICATOR"); helper != "" {
+		// The command helper copies a host-local apps/<slug>/<deployment>.ext4
+		// file to the control plane. OCI storage is already the shared artifact
+		// store, and its published layer has no required path under
+		// FAAS_APPS_ROOT. Reject the mixed configuration at boot instead of
+		// allowing every deployment to build successfully and fail during the
+		// later snapshot handoff with "layer not found".
+		if envOr("FAAS_STORAGE_BACKEND", "local") == "oci" {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR is incompatible with FAAS_STORAGE_BACKEND=oci; unset the replicator for OCI-backed deployments")
+		}
 		if !filepath.IsAbs(helper) {
 			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q must be absolute", helper)
 		}
@@ -344,6 +353,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
+		WithRuntimeBaseStaging().
 		WithArtifactReplicator(artifactReplicator).
 		WithOpsMetrics(ops).
 		// Issue #472 / ADR-054: per-app cosign signature-enforcement
@@ -475,17 +485,6 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("imaged: stage builder base %s → %s: %w", baseRef, basePath, err)
 	}
 
-	// PR 2 of Tier 1: auto-stage every runtime base so the operator
-	// recipe ("docker build + mkfs.ext4 + scp to /srv/fc/base/...") is
-	// replaced by a single seeded table at imaged startup. Mirrors the
-	// builder-base loop above; failure aborts imaged — a partial fleet
-	// (some runtimes staged, others skipped mid-loop) silently breaks
-	// the first wake of the missing runtime, so we fail closed instead.
-	baseLoop, err := h.EnsureBases(ctx, arch, imaged.DefaultRuntimeBaseRefs, os.Getenv)
-	if err != nil {
-		return fmt.Errorf("imaged: stage runtime bases: %w", err)
-	}
-
 	loop := imaged.NewLoop(imaged.LoopConfig{
 		Handler:   h,
 		Store:     store,
@@ -509,7 +508,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		"builder_base_ref", baseRef,
 		"builder_base_digest", baseRes.ConfigDigest,
 		"builder_base_skipped", baseRes.Skipped,
-		"runtime_bases", baseLoop,
+		"runtime_bases", "on-demand",
 	)
 
 	// Optional /metrics listener (this PR). Mirrors cmd/apid/main.go

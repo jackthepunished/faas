@@ -19,8 +19,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -28,6 +30,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -142,6 +145,10 @@ type Builderd struct {
 	// ResidencyProbe rig. nil falls back to DecideSlot(b.resid, …)
 	// inside processClaimedBuild.
 	slotDecide func(ResidencyProbe, int) SlotDecision
+	// sourceStorage is the optional remote source handoff used by split-box
+	// deployments. Local/single-box deployments leave it nil and continue to
+	// read the source spool directly.
+	sourceStorage storage.StorageBackend
 }
 
 // New wires a Builderd. vm may be nil in unit tests (the orchestrator still
@@ -191,6 +198,16 @@ func (b *Builderd) WithOpsMetrics(ops *wire.OpsMetrics) *Builderd {
 // unit-test default + pre-PR-C fixtures).
 func (b *Builderd) WithEvents(p *events.Platform) *Builderd {
 	b.events = p
+	return b
+}
+
+// WithSourceStorage attaches the optional source-archive backend used by a
+// split-box deployment and returns the same Builderd for chaining. The
+// backend is consulted only when the local source path is absent; this keeps
+// local deployments on their existing filesystem path and makes retries
+// idempotent after a successful materialization.
+func (b *Builderd) WithSourceStorage(be storage.StorageBackend) *Builderd {
+	b.sourceStorage = be
 	return b
 }
 
@@ -356,6 +373,13 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	// source to appear; if it still hasn't by the deadline, requeue
 	// (same contract as ErrNoSlot: the row stays queued, the durable
 	// worker re-claims it on the next tick).
+	if err := b.materializeSource(ctx, build.ID, dep.SourcePath); err != nil {
+		b.emitBuildLog(ctx, build.ID, fmt.Sprintf("source storage unavailable — requeued (%v)\n", err))
+		if rerr := b.store.RequeueBuild(ctx, build.ID); rerr != nil {
+			b.log.Warn("builderd: requeue on source-storage failure", "build", build.ID, "err", rerr)
+		}
+		return BuildResult{}, err
+	}
 	if b.cfg.SourceWaitTimeout > 0 {
 		if err := b.waitForSource(ctx, dep.SourcePath, b.cfg.SourceWaitTimeout); err != nil {
 			b.emitBuildLog(ctx, build.ID, fmt.Sprintf("source spool lag — requeued (%v)\n", err))
@@ -884,6 +908,56 @@ func (b *Builderd) emitBuildLog(ctx context.Context, buildID, line string) {
 	if err := b.notif.Notify(ctx, db.NotifyBuildLog, payload); err != nil {
 		b.log.Warn("builderd: notify log", "build", buildID, "err", err)
 	}
+}
+
+// materializeSource downloads a split-box source archive into the local
+// source spool when the apid-created path is not present. A missing remote
+// object is intentionally not an error here: waitForSource applies the
+// existing bounded spool-lag/requeue policy, while registry failures are
+// returned so the caller can requeue immediately.
+func (b *Builderd) materializeSource(ctx context.Context, buildID, path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("builderd: stat source: %w", err)
+	}
+	if b.sourceStorage == nil {
+		return nil
+	}
+	rc, err := b.sourceStorage.Get(ctx, "sources/"+buildID+".tar.gz")
+	if err != nil {
+		if storage.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("builderd: fetch source archive: %w", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("builderd: create source spool: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".source-download-*")
+	if err != nil {
+		return fmt.Errorf("builderd: create source temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := io.Copy(tmp, rc); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("builderd: download source archive: %w", err)
+	}
+	if err := tmp.Chmod(0o640); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("builderd: chmod source archive: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("builderd: close source archive: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("builderd: install source archive: %w", err)
+	}
+	return nil
 }
 
 // waitForSource blocks until the source tarball at path exists or the

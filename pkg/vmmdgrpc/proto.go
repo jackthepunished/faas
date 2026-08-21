@@ -227,7 +227,8 @@ func toColdBootRequest(ctx context.Context, req *vmmdpb.CreateColdBootRequest) (
 		// this mapping the Manager records no export dir, builderd's
 		// WaitForCompletion finds no artifacts, and every build fails
 		// after the VM exits.
-		ExportDir: buildSpecExportDir(req.GetBuild()),
+		ExportDir:       buildSpecExportDir(req.GetBuild()),
+		BuildTimeoutSec: buildSpecTimeoutSec(req.GetBuild()),
 	}, nil
 }
 
@@ -239,6 +240,16 @@ func buildSpecExportDir(b *vmmdpb.BuildSpec) string {
 		return ""
 	}
 	return b.GetExportDir()
+}
+
+// buildSpecTimeoutSec extracts the builder's configured guest timeout. Zero
+// preserves the legacy/default path; Manager.Wake applies the platform
+// default for builder VMs before recording the lease.
+func buildSpecTimeoutSec(b *vmmdpb.BuildSpec) int {
+	if b == nil {
+		return 0
+	}
+	return int(b.GetTimeoutSec())
 }
 
 // sealedFromProto converts a slice of vmmdpb.SealedSecret into the fcvm

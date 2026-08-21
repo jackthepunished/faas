@@ -216,7 +216,10 @@ func run(args []string) int {
 		}
 		// `gregale apps -q <slug>` is the delete path.
 		if len(args) > 1 && (args[1] == "-q" || args[1] == "--quiet") {
-			return cmdAppsRm(args[2:])
+			// Preserve the quiet flag for cmdAppsRm. Dropping it here
+			// made the documented `gregale apps -q <slug>` command
+			// unexpectedly enter the typed-confirmation path.
+			return cmdAppsRm(args[1:])
 		}
 		return cmdApps()
 	case dispatchDeployments:

@@ -38,6 +38,14 @@
     daemon_reload: true
   when: vmmd_unit.changed
 
+- name: vmmd_service — create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-vmmd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the vmmd unit so [compute_node].name resolves to the
 # canonical host identity at self-registration. The drop-in mirrors
@@ -64,6 +72,15 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: vmmd_service — install manifest-derived schedd target
+  ansible.builtin.template:
+    src: 99-faas-schedd-target.conf.j2
+    dest: /etc/systemd/system/faas-vmmd.service.d/99-faas-schedd-target.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-vmmd
 
 # Public multi-box release gate: vmmd must receive both routing values from
 # inventory. Without this assertion an operator can bootstrap a compute box

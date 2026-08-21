@@ -3,6 +3,7 @@ package netns
 import (
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 )
 
@@ -61,12 +62,17 @@ func SetDefaultHostBridgeIP(addr netip.Addr) {
 //	                                  │  (veth pair)
 //	netns fc-<instance>:  vethPeer(10.100.x.y/16) ── [route/DNAT] ── tap0(10.0.0.1) ── guest(10.0.0.2)
 type Config struct {
-	Instance     string     // instance id
-	Netns        string     // fc-<instance>
-	Tap          string     // tap0 (identical in every netns)
-	VethHost     string     // root-ns end, enslaved to br-tenants
-	VethPeer     string     // netns end, holds HostIP
-	HostIP       netip.Addr // routable identity, 10.100.x.y
+	Instance string     // instance id
+	Netns    string     // fc-<instance>
+	Tap      string     // tap0 (identical in every netns)
+	VethHost string     // root-ns end, enslaved to br-tenants
+	VethPeer string     // netns end, holds HostIP
+	HostIP   netip.Addr // routable identity, 10.100.x.y
+	// TapUID is the jailer UID that will open the persistent tap device.
+	// When set, SetupCommands assigns tap ownership to that UID so the
+	// unprivileged Firecracker process can attach to the existing device.
+	// Zero preserves the command shape used by legacy direct callers/tests.
+	TapUID       int
 	HostBridgeIP netip.Addr // root-ns bridge IP the netns default-routes through (HostBridgeCIDR/.1). Defaults to DefaultHostBridgeIP (10.100.0.1); multi-host deployments override per-host.
 	HostBits     int        // prefix length for HostIP (16)
 	EgressMbit   int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
@@ -162,6 +168,10 @@ func (c Config) SetupCommands() [][]string {
 	nx := []string{"ip", "netns", "exec", c.Netns} // prefix for in-netns commands
 	cmd := func(parts ...string) []string { return parts }
 	inNetns := func(parts ...string) []string { return append(append([]string{}, nx...), parts...) }
+	tap := []string{"ip", "tuntap", "add", c.Tap, "mode", "tap"}
+	if c.TapUID > 0 {
+		tap = append(tap, "user", strconv.Itoa(c.TapUID))
+	}
 
 	return [][]string{
 		// Namespace + loopback.
@@ -174,8 +184,10 @@ func (c Config) SetupCommands() [][]string {
 		cmd("ip", "link", "set", c.VethPeer, "netns", c.Netns),
 		inNetns("ip", "addr", "add", c.hostCIDR(), "dev", c.VethPeer),
 		inNetns("ip", "link", "set", c.VethPeer, "up"),
-		// tap0 for firecracker; host side of the guest /30.
-		inNetns("ip", "tuntap", "add", c.Tap, "mode", "tap"),
+		// tap0 for firecracker; host side of the guest /30. The jailer
+		// drops Firecracker to the per-instance UID, so persistent tap
+		// ownership must follow that UID or TUNSETIFF fails with EPERM.
+		inNetns(tap...),
 		inNetns("ip", "addr", "add", TapPrefix, "dev", c.Tap),
 		inNetns("ip", "link", "set", c.Tap, "up"),
 		// Route guest traffic; enable forwarding inside the netns only.

@@ -1,0 +1,37 @@
+diff --git a/session/session.go b/session/session.go
+index b67e25e..0f72758 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -3,6 +3,7 @@ package session
+ import (
+ 	"context"
+ 	"net"
++	"os"
+ 	"sync"
+
+ 	"github.com/moby/buildkit/identity"
+@@ -39,6 +40,7 @@ type Session struct {
+ 	mu          sync.Mutex // synchronizes conn run and close
+ 	id          string
+ 	sharedKey   string
++	healthTimeout string
+ 	ctx         context.Context
+ 	cancelCtx   func(error)
+ 	done        chan struct{}
+@@ -67,5 +69,6 @@ func NewSession(ctx context.Context, sharedKey string) (*Session, error) {
+ 	s := &Session{
+ 		id:         id,
+ 		sharedKey:  sharedKey,
++		healthTimeout: os.Getenv("BUILDKIT_SESSION_HEALTH_TIMEOUT_MS"),
+ 		grpcServer: grpc.NewServer(serverOpts...),
+ 	}
+@@ -102,6 +105,9 @@ func (s *Session) Run(ctx context.Context, dialer Dialer) error {
+ 	meta := make(map[string][]string)
+ 	meta[headerSessionID] = []string{s.id}
+ 	meta[headerSessionSharedKey] = []string{s.sharedKey}
++	if s.healthTimeout != "" {
++		meta["X-Buildkit-Session-Health-Custom-Timeout"] = []string{s.healthTimeout}
++	}
+
+ 	for name, svc := range s.grpcServer.GetServiceInfo() {
+ 		for _, method := range svc.Methods {

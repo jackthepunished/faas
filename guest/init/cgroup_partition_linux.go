@@ -205,6 +205,13 @@ func mountCgroup2() error {
 	if err := os.MkdirAll(cgroupRoot, 0o755); err != nil {
 		return fmt.Errorf("cgroup2 mkdir: %w", err)
 	}
+	// Firecracker guests start in the root cgroup namespace without a
+	// delegated hierarchy. Enter a private cgroup namespace before mounting
+	// cgroup2 so the mount is scoped to this VM and cannot block while trying
+	// to attach to the host-side hierarchy.
+	if err := unix.Unshare(unix.CLONE_NEWCGROUP); err != nil {
+		return fmt.Errorf("cgroup2 namespace: %w", err)
+	}
 	if err := syscall.Mount("cgroup2", cgroupRoot, "cgroup2", 0, ""); err != nil {
 		return fmt.Errorf("cgroup2 mount %s: %w", cgroupRoot, err)
 	}

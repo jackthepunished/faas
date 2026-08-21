@@ -281,6 +281,24 @@ type DaemonConfig struct {
 	// `vmmd_target` / `schedd_target` / etc. field.
 	Outbound *OutboundConfig `yaml:"outbound,omitempty"`
 
+	// APIDLoopback is gatewayd-internal's HTTP target for the apid
+	// public surface. It defaults to the local apid listener in a
+	// single-box deployment; split-box manifests set it to the
+	// control-plane address so compute gatewayd does not silently dial
+	// its own loopback.
+	APIDLoopback string `yaml:"apid_loopback,omitempty"`
+
+	// GatewaySynthTarget is schedd's optional remote gatewayd-internal
+	// synthesis endpoint. It is separate from Outbound because schedd has
+	// two remote peers in a split-box fleet: vmmd for placement and
+	// gatewayd-internal for cron/dispatch.
+	GatewaySynthTarget string `yaml:"gateway_synth_target,omitempty"`
+
+	// GatewayMetricsURL is schedd's optional remote gatewayd-internal metrics
+	// endpoint. Empty disables the scale-up scrape instead of silently
+	// scraping a nonexistent loopback listener on the control plane.
+	GatewayMetricsURL string `yaml:"gateway_metrics_url,omitempty"`
+
 	// ComputeNode is the [compute_node] sub-struct consumed by vmmd
 	// only. It carries the per-host bridge CIDR override, the
 	// overlay CIDR the detector prefers, and the optional NIC pin

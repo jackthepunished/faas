@@ -303,6 +303,10 @@ func (f *fakeVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountP
 	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
 }
 
+func (f *fakeVmmdClient) MaterializeParentExt4(context.Context, *vmmdpb.MaterializeParentExt4Request, ...grpc.CallOption) (*vmmdpb.MaterializeParentExt4Response, error) {
+	return &vmmdpb.MaterializeParentExt4Response{}, nil
+}
+
 // UmountParentExt4 (ADR-053) — gateway forwardproxy tests never
 // drive the parent umount path. Returns nil.
 func (f *fakeVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {

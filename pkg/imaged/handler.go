@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -221,6 +222,15 @@ type Handler struct {
 	// Interface (not concrete *VMMClient) so tests can inject a
 	// fakeVMMClient (defined in vmmclient.go) without dialing.
 	vmmClient VMMClientIface
+	// runtimeBaseMu serializes on-demand runtime-base staging. Multiple
+	// deployments can arrive together after a cold start; without this
+	// guard they could concurrently rebuild the same ext4 and race the
+	// StorageBackend publication.
+	runtimeBaseMu sync.Mutex
+	// runtimeBaseStagingEnabled is true only for the production daemon. The
+	// in-memory handler constructors used by unit tests intentionally keep
+	// the build pipeline hermetic and do not need shared ext4 staging.
+	runtimeBaseStagingEnabled bool
 	// secretboxIdentity (issue #461 / ADR-062) is the host age
 	// identity used to TRANSIENTLY unseal per-app private-registry
 	// Basic Auth passwords during the pull path. The plaintext
@@ -507,6 +517,14 @@ func (h *Handler) WithDeployBaseRef(ref string) *Handler {
 // override and falls back to the appsRoot-derived default.
 func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 	h.storage = s
+	return h
+}
+
+// WithRuntimeBaseStaging enables the production on-demand runtime-base
+// staging hook. It is separate from WithStorage so tests that use a local
+// backend do not unexpectedly invoke mkfs or registry pulls.
+func (h *Handler) WithRuntimeBaseStaging() *Handler {
+	h.runtimeBaseStagingEnabled = true
 	return h
 }
 
@@ -1351,6 +1369,11 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	// row within seconds of the layer publish (well inside
 	// the 5-min SLA from AC #1).
 	h.runDeployScan(ctx, app, dep)
+	// Runtime bases are staged on demand so a fresh bare-metal node can
+	// become ready without building every supported runtime at startup.
+	if err := h.ensureDeploymentRuntimeBase(ctx, app); err != nil {
+		return err
+	}
 
 	// ADR-117 PR-A review fix (F1): close the security_scan stage
 	// and open image_build. The 3 transition sites that previously
@@ -2403,6 +2426,9 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	default:
 		return fmt.Errorf("imaged: snapshot_boot: unknown deployment kind %q", dep.Kind)
 	}
+	if err := h.ensureDeploymentRuntimeBase(ctx, app); err != nil {
+		return err
+	}
 	// ADR-117 PR-A review fix (F1): run the scan here too — the
 	// snapshot_boot path doesn't go through handleDeploySourceChanged,
 	// so without an explicit runDeployScan + security_scan→
@@ -2424,6 +2450,22 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	})
 	if err := h.notif.Notify(ctx, db.NotifySnapshotPrime, string(primePayload)); err != nil {
 		return fmt.Errorf("imaged: notify snapshot_prime: %w", err)
+	}
+	return nil
+}
+
+// ensureDeploymentRuntimeBase makes the shared drive0 available before
+// schedd is asked to cold-boot the deployment. Empty runtime means a plain
+// OCI app, whose legacy minimal-base path does not use the runtime matrix.
+func (h *Handler) ensureDeploymentRuntimeBase(ctx context.Context, app state.App) error {
+	// Unit-test handlers without the production routed StorageBackend keep
+	// the historical in-memory build seam; production cmd/imaged always
+	// wires storage before accepting notifications.
+	if app.Runtime == "" || !h.runtimeBaseStagingEnabled {
+		return nil
+	}
+	if _, err := h.EnsureRuntimeBase(ctx, app.Runtime, runtime.GOARCH, os.Getenv); err != nil {
+		return fmt.Errorf("imaged: ensure runtime base %s: %w", app.Runtime, err)
 	}
 	return nil
 }

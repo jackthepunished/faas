@@ -36,6 +36,22 @@
     path: /etc/faas/tls/egress/egress.key
   register: faas_egress_new_key_stat
 
+- name: control_plane_service — create PR-C egress cert directory
+  ansible.builtin.file:
+    path: /etc/faas/tls/egress
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - faas_egress_legacy_cert_stat.stat.exists
+    - not faas_egress_new_key_stat.stat.exists
+
+- name: control_plane_service — stat pre-PR-C tls-san.cnf
+  ansible.builtin.stat:
+    path: /etc/faas/tls/gatewayd/tls-san.cnf
+  register: faas_egress_legacy_san_stat
+
 - name: control_plane_service — migrate pre-PR-C egress cert dir to PR-C layout
   ansible.builtin.command:
     cmd: "mv /etc/faas/tls/gatewayd/egress.{{ item }} /etc/faas/tls/egress/egress.{{ item }}"
@@ -54,6 +70,17 @@
   when:
     - faas_egress_legacy_cert_stat.stat.exists
     - not faas_egress_new_key_stat.stat.exists
+    - faas_egress_legacy_san_stat.stat.exists
+
+- name: control_plane_service — stat PR-C egress cert after migration
+  ansible.builtin.stat:
+    path: /etc/faas/tls/egress/egress.crt
+  register: faas_egress_new_cert_after_stat
+
+- name: control_plane_service — stat PR-C egress key after migration
+  ansible.builtin.stat:
+    path: /etc/faas/tls/egress/egress.key
+  register: faas_egress_new_key_after_stat
 
 - name: control_plane_service — chmod migrated egress cert 0444 root:root
   ansible.builtin.file:
@@ -63,8 +90,7 @@
     mode: "0444"
     state: file
   when:
-    - faas_egress_legacy_cert_stat.stat.exists
-    - not faas_egress_new_key_stat.stat.exists
+    - faas_egress_new_cert_after_stat.stat.exists
 
 - name: control_plane_service — chmod migrated egress key 0400 root:root
   ansible.builtin.file:
@@ -74,8 +100,7 @@
     mode: "0400"
     state: file
   when:
-    - faas_egress_legacy_cert_stat.stat.exists
-    - not faas_egress_new_key_stat.stat.exists
+    - faas_egress_new_key_after_stat.stat.exists
 
 - name: control_plane_service — remove empty pre-PR-C gatewayd cert dir
   ansible.builtin.file:

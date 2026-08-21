@@ -58,8 +58,9 @@
     - role: gatewayd_public_service
     - role: githubd_service
     - role: log_archive
+    # Topology cleanup is safe during image seeding and must also remove
+    # legacy one-box services left on an existing control-plane host.
     - role: role_convergence
-      when: not (faas_image_seed | default(false) | bool)
 
 - name: Bootstrap a Gate-B compute-only node (fsn-2)
   hosts: compute_nodes
@@ -90,4 +91,3 @@
     - role: compute_only_service
     - role: log_archive
     - role: role_convergence
-      when: not (faas_image_seed | default(false) | bool)

@@ -1,0 +1,5 @@
+[Service]
+# The compute-only gatewayd-internal listener is reachable only from the
+# rendered control-plane CIDRs in nftables. Empty/off preserves same-box
+# unix-only operation.
+Environment=FAAS_GATEWAY_LISTEN={{ faas_gateway_listen | default('off') }}

@@ -48,6 +48,19 @@
     - { src: "schedd.toml.example",  dest: "/etc/faas/schedd.toml.example" }
     - { src: "meterd.toml.example",  dest: "/etc/faas/meterd.toml.example" }
 
+# Manifest-generated split-box host_vars opt into a managed meterd routing
+# file. Legacy/operator-owned boxes keep the old example-only contract so an
+# Ansible run cannot overwrite a hand-maintained billing configuration.
+- name: control_plane_service — render managed meterd routing config
+  ansible.builtin.template:
+    src: meterd.toml.j2
+    dest: "{{ faas_meterd_config_path }}"
+    owner: root
+    group: faas
+    mode: "0640"
+  when: faas_meterd_config_managed | default(false) | bool
+  notify: restart faas-meterd
+
 - name: control_plane_service — install systemd units
   ansible.builtin.copy:
     src: "{{ item.src }}"
@@ -101,7 +114,22 @@
 - name: control_plane_service — systemctl daemon-reload (only when unit files changed)
   ansible.builtin.systemd:
     daemon_reload: true
-  when: cp_units.changed
+  when: >-
+    cp_units.changed
+    or (faas_log_archive_dropin.changed | default(false))
+    or (faas_log_archive_dropin_removed.changed | default(false))
+
+- name: control_plane_service — create systemd drop-in directories
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - faas-schedd
+    - faas-apid
+    - faas-meterd
 
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into every control-plane unit so the multi-box identity
@@ -120,9 +148,24 @@
     group: root
     mode: "0644"
   loop:
-    - faas-schedd
     - faas-apid
     - faas-meterd
+
+- name: control_plane_service — install central schedd identity drop-in
+  ansible.builtin.template:
+    src: 99-faas-schedd-node-name.conf.j2
+    dest: /etc/systemd/system/faas-schedd.service.d/99-faas-node-name.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: control_plane_service — install split-box schedd routing drop-in
+  ansible.builtin.template:
+    src: 99-faas-schedd-routing.conf.j2
+    dest: /etc/systemd/system/faas-schedd.service.d/99-faas-routing.conf
+    owner: root
+    group: root
+    mode: "0644"
 
 # Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
 # through to the three control-plane daemons (apid, schedd,
@@ -145,11 +188,11 @@
 
 - name: control_plane_service — create runtime dirs (logs, spool, statuspage)
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ item.path }}"
     state: directory
     owner: "{{ item.user }}"
     group: faas
-    mode: "0750"
+    mode: "0770"
   loop:
     - { path: "/var/log/faas",   user: "faas-apid" }
     - { path: "/var/spool/faas", user: "faas-apid" }
@@ -180,7 +223,7 @@
       FAAS_SCHEDD_ADDR=/run/faas/schedd.sock for meterd — meterd refuses to
       start without FAAS_SCHEDD_ADDR per issue #52's strict-exit rule) and
       the binaries are installed at
-      /opt/faas/bin/{apid,schedd,meterd}.
+      /opt/faas/current/bin/{apid,schedd,meterd}.
       imaged is no longer installed by this role — see
       compute_only_service (Gate-B, issue #297 / ADR-025 §Tier 2).
 
@@ -312,6 +355,14 @@
     group: root
     mode: "0644"
   register: faas_log_archive_dropin
+  when: faas_archive_creds_stat.stat.exists
+
+- name: control_plane_service — remove apid archive drop-in when creds are absent
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-apid.service.d/99-faas-log-archive.conf
+    state: absent
+  register: faas_log_archive_dropin_removed
+  when: not faas_archive_creds_stat.stat.exists
 
 # Issue #472 / ADR-058 — per-app cosign trusted-publisher directory.
 # imaged reads /etc/faas/secrets/trusted-publishers/ at startup and
@@ -386,11 +437,52 @@
       - egress
     faas_pki_leaf_files:
       - server.crt
-      - server.crt
+      - advisory.crt
       - server.crt
       - egress.crt
   register: faas_pki_leaf_stat
   failed_when: not faas_pki_leaf_stat.stat.exists
+
+# The PKI initializer intentionally creates private keys root-only. The
+# control-plane daemons run as dedicated faas-* users, so the two schedd
+# keys it consumes must be readable through the shared faas group while
+# remaining inaccessible to other users. Keep this normalization next to the
+# leaf tripwire so a fresh bare-metal install cannot boot into a TLS restart
+# loop after the certs themselves have been generated.
+- name: control_plane_service — assert schedd private keys exist
+  ansible.builtin.stat:
+    path: "/etc/faas/tls/schedd/{{ item }}"
+  loop:
+    - server.key
+    - vmmd-client.key
+  register: faas_schedd_key_stat
+  failed_when: not faas_schedd_key_stat.stat.exists
+
+- name: control_plane_service — grant schedd group access to private keys
+  ansible.builtin.file:
+    path: "/etc/faas/tls/schedd/{{ item }}"
+    owner: root
+    group: faas
+    mode: "0440"
+  loop:
+    - server.key
+    - vmmd-client.key
+
+# In split-box mode meterd is a TCP client of schedd and gatewayd-internal.
+# Normalize only those optional client leaves when the generated routing
+# config is enabled; single-box installs retain their existing key layout.
+- name: control_plane_service — grant meterd group access to remote client keys
+  ansible.builtin.file:
+    path: "/etc/faas/tls/meterd/{{ item }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  loop:
+    - schedd-client.key
+    - egress-client.key
+  when:
+    - faas_meterd_config_managed | default(false) | bool
 
 # Spec §11 — ProtectSystem=strict ReadWritePaths= assert moved to
 # compute_only_service (Gate-B). imaged now lives on fsn-2; the
@@ -420,6 +512,8 @@
       fi
       echo "Paddle billing provider selected — FAAS_PADDLE_API_KEY present (mode-tripwire deferred to verify-secrets.sh + daemon-level fail-closed)."
     fi
+  args:
+    executable: /bin/bash
   changed_when: false
   register: faas_paddle_soft_assert
 - name: control_plane_service — debug Paddle soft assert

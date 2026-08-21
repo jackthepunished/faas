@@ -69,6 +69,7 @@ func egressGRPCSocketPath() string {
 type egressGRPCListener struct {
 	socketPath string
 	server     *grpc.Server
+	tlsCfg     *tls.Config
 	listener   net.Listener
 	serveDone  chan struct{}
 	sink       *egresssink.EgressSink
@@ -162,6 +163,7 @@ func newEgressGRPCListener(target string, tlsCfg *tls.Config, srv *egressgrpc.Se
 	return &egressGRPCListener{
 		socketPath: target,
 		server:     gs,
+		tlsCfg:     tlsCfg,
 		sink:       nil, // reserved for a future /debug endpoint
 		log:        log,
 	}
@@ -232,7 +234,7 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 		// raw TCP — gRPC's transport will do the TLS handshake
 		// via ServerCreds passed to grpc.NewServer above
 		// (ADR-052 §Handler-layer peer binding).
-		lis, err = wire.Listen(ctx, l.socketPath, nil)
+		lis, err = wire.Listen(ctx, l.socketPath, l.tlsCfg)
 		if err != nil {
 			return fmt.Errorf("egress: listen %s: %w", l.socketPath, err)
 		}

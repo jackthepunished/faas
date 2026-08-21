@@ -49,7 +49,7 @@ func UnitBuilderd() daemonunit.Unit {
 		Slice:     "faas-cp.slice",
 		MemoryMax: "512M",
 
-		EnvironmentFile: "/etc/faas/sealed.env",
+		EnvironmentFile: "-/etc/faas/sealed.env -/etc/faas/compute-db.env",
 
 		NoNewPrivileges:       true,
 		ProtectSystem:         "strict",
@@ -60,7 +60,7 @@ func UnitBuilderd() daemonunit.Unit {
 		ProtectControlGroups:  true,
 
 		ReadOnlyPaths:  []string{"/etc/faas"},
-		ReadWritePaths: []string{"/srv/fc/builder", "/srv/fc/base", "/var/log/faas", "/var/spool/faas"},
+		ReadWritePaths: []string{"/srv/fc/builder", "/srv/fc/base", "/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache"},
 
 		WantedBy: "multi-user.target",
 	}

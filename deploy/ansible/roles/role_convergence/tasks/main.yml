@@ -43,6 +43,14 @@
     label: "{{ item }}"
   failed_when: false
 
+- name: role_convergence — clear stale failed state for forbidden services
+  ansible.builtin.command: "systemctl reset-failed {{ item }}"
+  loop: "{{ faas_role_forbidden_units }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+  failed_when: false
+
 - name: role_convergence — mask opposite-role services even when absent
   ansible.builtin.file:
     src: /dev/null

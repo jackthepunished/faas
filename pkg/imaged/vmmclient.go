@@ -59,10 +59,36 @@ const DefaultVMMSock = "unix:///run/faas/vmmd.sock"
 // AmbientCapabilities= entirely.
 type VMMClientIface interface {
 	MountParentExt4ReadOnly(ctx context.Context, storageKey string) (string, error)
+	MaterializeParentExt4(ctx context.Context, storageKey, targetDir string) error
 	UmountParentExt4(ctx context.Context, mountpoint string) error
 	MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error
 	UmountOverlayParent(ctx context.Context, merged string) error
 	Close() error
+}
+
+// MaterializeParentExt4 asks vmmd to copy the parent tree into a shared
+// staging directory while vmmd owns the temporary loopback mount. This keeps
+// the parent-ref path correct across separate systemd mount namespaces.
+func (c *VMMClient) MaterializeParentExt4(ctx context.Context, storageKey, targetDir string) error {
+	if c == nil {
+		return fmt.Errorf("imaged: vmmclient: nil receiver")
+	}
+	if storageKey == "" || targetDir == "" {
+		return fmt.Errorf("imaged: vmmclient: empty materialize path")
+	}
+	cli, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, defaultVMMDialTimeout)
+	defer cancel()
+	if _, err := cli.MaterializeParentExt4(callCtx, &vmmdpb.MaterializeParentExt4Request{
+		StorageKey: storageKey,
+		TargetDir:  targetDir,
+	}); err != nil {
+		return fmt.Errorf("imaged: vmmclient: materialize parent %q into %q: %w", storageKey, targetDir, err)
+	}
+	return nil
 }
 
 // VMMClient is the imaged-side dialer for the vmmd parent-mount
@@ -336,6 +362,16 @@ func (f *fakeVMMClient) MountParentExt4ReadOnly(_ context.Context, storageKey st
 		return f.mountHook(storageKey)
 	}
 	return "/tmp/faas-parent-fake-" + storageKey, nil
+}
+
+func (f *fakeVMMClient) MaterializeParentExt4(_ context.Context, storageKey, _ string) error {
+	// Keep the existing mountedKeys assertion seam meaningful for the
+	// parent-ref tests: production now performs the mount+copy+umount inside
+	// one vmmd RPC, so the fake records the storage key at this boundary.
+	// The key is supplied by the caller in the real implementation; tests only
+	// need the call count and use the existing slice for compatibility.
+	f.mountedKeys = append(f.mountedKeys, storageKey)
+	return nil
 }
 
 func (f *fakeVMMClient) UmountParentExt4(_ context.Context, mountpoint string) error {

@@ -2218,6 +2218,12 @@ const (
 	// PerVMOverheadMB is added to every instance's ram_mb for admission and
 	// billing (VMM + jailer + TAP slack, spec §1, §4.7).
 	PerVMOverheadMB = 8
+	// SnapshotVMOverheadMB is temporary host-side headroom applied only while
+	// Firecracker creates a full snapshot. The snapshot operation allocates
+	// bookkeeping and copy-on-write pages in the host process in addition to
+	// the guest RAM and ordinary VMM overhead. It is not part of admission or
+	// billing; the tenant-slice ceiling remains the aggregate safety fence.
+	SnapshotVMOverheadMB = 256
 
 	// FloorDecisionIntervalSeconds (issue #557 / ADR-071 §Decision 1)
 	// is the cadence at which the proactive floor trigger in
@@ -2243,7 +2249,13 @@ const (
 
 	// Builder VM (spec §4.5, §1). Builds live in the control-plane slice, never
 	// tenant RAM.
-	BuildVMRAMMB           = 2_048
+	BuildVMRAMMB = 2_048
+	// BuildVMOverheadMB is host-side Firecracker/VMM RSS plus page-cache and
+	// kernel-accounting headroom above the guest RAM allocation. The ordinary
+	// 8 MiB per-VM billing overhead is intentionally not reused here: a builder
+	// fills a 2 GiB guest and BuildKit snapshots keep several hundred MiB
+	// charged to the Firecracker cgroup while a layer is being committed.
+	BuildVMOverheadMB      = 768
 	BuildVMVCPU            = 2
 	BuildTimeoutSeconds    = 900 // 15 min build; cold rootless Railpack export needs headroom
 	BuildE2ETimeoutSeconds = 900 // 15 min end-to-end
@@ -4592,6 +4604,20 @@ func (l Limits) AdmissionMB() int {
 // to the overhead constant updates exactly one place.
 func BillableRAMMB(ramMB int) int {
 	return ramMB + PerVMOverheadMB
+}
+
+// SnapshotMemoryMaxMB returns the temporary per-instance memory.max used for
+// a full Firecracker snapshot. Callers must restore BillableRAMMB(ramMB) as
+// soon as the snapshot request and export path finish.
+func SnapshotMemoryMaxMB(ramMB int) int {
+	return ramMB + PerVMOverheadMB + SnapshotVMOverheadMB
+}
+
+// BuilderMemoryMaxMB returns the creation-time cgroup fence for a builder VM.
+// Builders are charged to faas-cp-build.slice rather than tenant RAM, and
+// need a larger host-side RSS allowance than ordinary app VMs.
+func BuilderMemoryMaxMB(ramMB int) int {
+	return ramMB + BuildVMOverheadMB
 }
 
 // BillableRAMMBWithSidecars is the sidecar-shape variant of

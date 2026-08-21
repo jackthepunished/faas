@@ -13,7 +13,7 @@ SRC_ROOT="${SRC_ROOT:-/tmp/src}"
 GO_VERSION="${GO_VERSION:-1.25.13}"
 
 # guest/init's build matrix — see guest/runners/{node22,python312,…}/main.go
-RUNNERS=(node22 python312 go124 node24 python313)
+RUNNERS=(node22 python312 go124 go124-alpine node24 python313)
 
 if [[ ! -d "${SRC_ROOT}" ]]; then
     echo "compile-runners: SRC_ROOT=${SRC_ROOT} not present" >&2
@@ -29,10 +29,12 @@ mkdir -p /opt/faas/current/bin/runners
 for rt in "${RUNNERS[@]}"; do
     echo "compile-runners: ${rt}"
     mkdir -p "/opt/faas/current/bin/runners/${rt}"
+    source_rt="${rt}"
+    if [[ "${rt}" == "go124-alpine" ]]; then source_rt="go124"; fi
     GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
         go build -trimpath -ldflags='-s -w' \
         -o "/opt/faas/current/bin/runners/${rt}/faas-runner" \
-        "./guest/runners/${rt}"
+        "./guest/runners/${source_rt}"
 done
 
 echo "compile-runners: $(ls /opt/faas/current/bin/runners/ | wc -l) runners installed"

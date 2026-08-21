@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // withFakeCgroupRoot redirects the package-level cgroupRoot var to
@@ -85,6 +87,52 @@ func TestWriteMemoryMaxAppendsNewline(t *testing.T) {
 	}
 	if len(body) == 0 || body[len(body)-1] != '\n' {
 		t.Errorf("memory.max body %q must end with newline (kernel parser expectation)", body)
+	}
+}
+
+func TestWidenSnapshotMemoryCgroupRestoresOrdinaryFence(t *testing.T) {
+	dir := withFakeCgroupRoot(t)
+	inst := "snapshot-headroom"
+	scope := filepath.Join(dir, ParentCgroupFor(api.PlanScale), PerInstanceScope(inst))
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	l := Lease{Instance: inst, Plan: api.PlanScale, MemoryMaxMiB: 1024}
+	if err := writeMemoryMaxAt(scope, api.BillableRAMMB(l.MemoryMaxMiB)); err != nil {
+		t.Fatalf("write ordinary fence: %v", err)
+	}
+
+	restore, err := widenSnapshotMemoryCgroup(l)
+	if err != nil {
+		t.Fatalf("widenSnapshotMemoryCgroup: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(scope, "memory.max"))
+	if err != nil {
+		t.Fatalf("read widened fence: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(body)), itoa(api.SnapshotMemoryMaxMB(l.MemoryMaxMiB)<<20); got != want {
+		t.Errorf("widened memory.max = %q, want %s", got, want)
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore snapshot fence: %v", err)
+	}
+	body, err = os.ReadFile(filepath.Join(scope, "memory.max"))
+	if err != nil {
+		t.Fatalf("read restored fence: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(body)), itoa(api.BillableRAMMB(l.MemoryMaxMiB)<<20); got != want {
+		t.Errorf("restored memory.max = %q, want %s", got, want)
+	}
+}
+
+func TestWidenSnapshotMemoryCgroupSkipsBuilders(t *testing.T) {
+	withFakeCgroupRoot(t)
+	restore, err := widenSnapshotMemoryCgroup(Lease{Instance: "builder", IsBuilder: true, MemoryMaxMiB: api.BuildVMRAMMB})
+	if err != nil {
+		t.Fatalf("builder snapshot headroom: %v", err)
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("builder snapshot restore: %v", err)
 	}
 }
 

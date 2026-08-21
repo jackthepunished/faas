@@ -106,6 +106,16 @@ func TestSetupCreatesTapAndAddressing(t *testing.T) {
 	}
 }
 
+func TestSetupAssignsTapToJailerUID(t *testing.T) {
+	c := testConfig()
+	c.TapUID = 20000
+	setup := flatten(c.SetupCommands())
+	want := "ip netns exec " + c.Netns + " ip tuntap add " + c.Tap + " mode tap user 20000"
+	if !strings.Contains(setup, want) {
+		t.Fatalf("setup missing UID-owned tap command %q\\ngot:\\n%s", want, setup)
+	}
+}
+
 func TestVethPeerMovedIntoNetnsBeforeAddressing(t *testing.T) {
 	// The peer must enter the netns before we address it, or the addr lands in
 	// the root namespace. Assert ordering.

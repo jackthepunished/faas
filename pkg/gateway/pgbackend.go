@@ -312,6 +312,12 @@ type PGBackend struct {
 	// single-sched path.
 	clientForApp func(ctx context.Context, app App) (Scheduler, bool, error)
 
+	// liveTargetLoader hydrates the process-local picker when schedd reports
+	// app-level capacity but this gateway just restarted and missed the
+	// original Admit notification. The narrow hook keeps gateway independent
+	// of pkg/state.
+	liveTargetLoader func(ctx context.Context, appID string) ([]Target, error)
+
 	// legacySingleBox (Phase 2 / Gate A) gates the resolveSched
 	// fallback to the legacy b.sched field. When true, a missing
 	// app row or empty NodeID falls through to b.sched — this is the
@@ -415,6 +421,16 @@ func (b *PGBackend) WithAppResolver(fn AppResolverFunc) *PGBackend {
 // surfaces the error.
 func (b *PGBackend) WithClientForApp(fn ClientForAppFunc) *PGBackend {
 	b.clientForApp = fn
+	return b
+}
+
+// WithLiveTargetLoader installs the restart-reconciliation hook used when a
+// schedd admission is rejected at the app cap. A running instance may already
+// exist in Postgres even though this gateway's process-local picker is empty.
+func (b *PGBackend) WithLiveTargetLoader(fn func(context.Context, string) ([]Target, error)) *PGBackend {
+	if b != nil {
+		b.liveTargetLoader = fn
+	}
 	return b
 }
 
@@ -707,6 +723,43 @@ func (b *PGBackend) HealthyCount(appID string) int {
 	return n
 }
 
+// RecordTarget adds a target returned by an out-of-band wake path to the
+// gateway picker. The normal HTTP admission path calls Admit, which records
+// its own target; synth/cron wakes call schedd directly and must publish the
+// same routing handle or the next public request will see a running VM as
+// unavailable. Re-recording an instance is idempotent.
+func (b *PGBackend) RecordTarget(appID string, target Target) {
+	if b == nil || appID == "" || target.InstanceID == "" || target.NodeID == "" {
+		return
+	}
+	if target.AddedAt.IsZero() {
+		target.AddedAt = time.Now()
+	}
+	b.tgtMu.Lock()
+	defer b.tgtMu.Unlock()
+
+	picker := b.appsPicker[appID]
+	if picker == nil {
+		picker = &appPicker{sets: map[string]*targetSet{}}
+		b.appsPicker[appID] = picker
+	}
+	bucket := target.DeploymentID
+	if bucket == "" {
+		bucket = "_legacy"
+		target.DeploymentID = bucket
+	}
+	set := picker.sets[bucket]
+	if set == nil {
+		set = &targetSet{subCursors: map[string]*atomic.Uint64{}}
+		picker.sets[bucket] = set
+	}
+	if len(picker.weights) == 0 {
+		picker.weights = []deploymentWeight{{DeploymentID: bucket, Percent: 100}}
+		picker.cum = []int{100}
+	}
+	set.add(target)
+}
+
 // Admit asks schedd to admit ONE additional instance for appID
 // (issue #168). On the admitted path the new Target is added to
 // the per-deployment targetSet keyed by deploymentID (PR-B /
@@ -798,6 +851,16 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string
 	// (ADR-098); AdmitInstance's typed at-capacity is the
 	// primary signal here.
 	if atCapacity || nodeID == "" || instanceID == "" {
+		if atCapacity && b.liveTargetLoader != nil {
+			targets, loadErr := b.liveTargetLoader(ctx, appID)
+			if loadErr != nil {
+				b.log.Warn("gateway: live target hydration failed", "app_id", appID, "err", loadErr)
+			} else {
+				for _, target := range targets {
+					b.RecordTarget(appID, target)
+				}
+			}
+		}
 		return "", WakeMethodUnspecified, true, nil
 	}
 	// Pre-PR-B fallback: a pre-PR-B schedd returns deploymentID="".

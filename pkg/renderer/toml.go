@@ -46,12 +46,21 @@ import (
 // fine (writeTOMLKV omits empty values; the daemon's loader uses
 // its built-in default).
 type tomlRenderCtx struct {
-	Daemon      string
-	DC          *manifest.DaemonConfig
+	Daemon string
+	DC     *manifest.DaemonConfig
+	// DBURL is the fleet PostgreSQL endpoint from manifest.postgresql.dsn.
+	// It is rendered into every daemon TOML that declares db_url so a
+	// compute-only host does not silently fall back to its local Unix socket.
+	DBURL       string
 	AppsDomain  string
 	HostSANs    []string
 	HostName    string
 	HostAddress string
+	// HostRole controls whether a rendered TOML may carry the shared
+	// PostgreSQL DSN. Compute-only boxes receive the DSN through their
+	// root-owned systemd EnvironmentFile; embedding it in every daemon
+	// TOML would duplicate a credential into world-readable config.
+	HostRole string
 }
 
 // The flatMap is what ValidateTOMLPlacement walks. The validation
@@ -78,7 +87,11 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 	// by name. The renderer uses the canonical schema names from
 	// HostKeys.PrivateKeys; unknown keys (a renderer bug) are caught
 	// by the validator at the "key not in catalog" check.
-	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
+	dbURL := ctx.DBURL
+	if ctx.HostRole == "compute-only" {
+		dbURL = ""
+	}
+	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, dbURL, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
 		return nil, nil, err
 	}
 
@@ -106,9 +119,9 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 // flatMap under their leaf names. Missing manifest values (e.g. a
 // schedd with no apps_domain) yield an empty value; the validator +
 // daemon-load path handle the absent-key shape.
-func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, appsDomain string, keys []string, flat map[string]string) error {
+func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain string, keys []string, flat map[string]string) error {
 	for _, k := range keys {
-		v, err := privateKeyValue(daemon, dc, appsDomain, k)
+		v, err := privateKeyValue(daemon, dc, dbURL, appsDomain, k)
 		if err != nil {
 			return fmt.Errorf("renderer: %s: %s: %w", daemon, k, err)
 		}
@@ -132,7 +145,7 @@ func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, appsDomain string
 // into their TOML so the daemons can serve tenant requests with
 // the canonical apps_domain. Empty appsDomain is acceptable (the
 // daemon falls back to FAAS_APPS_DOMAIN env var).
-func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key string) (string, error) {
+func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain, key string) (string, error) {
 	switch key {
 	case "socket_path":
 		// unix:///run/faas/<daemon>.sock → /run/faas/<daemon>.sock
@@ -158,12 +171,11 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key s
 		}
 		return defaultMetricsAddrForDaemon(daemon), nil
 	case "db_url":
-		// The renderer's only consumer of the PostgreSQL block is
-		// db_url. The schema pins it; the renderer emits it as-is.
-		// A more ambitious refactor would thread pgsql.DSN through
-		// the manifest's DaemonConfig, but that's PR-X / secrets-init
-		// territory.
-		return "", nil
+		// The manifest is the source of truth for the shared database
+		// endpoint. Leaving this empty makes db.Open fall back to the
+		// local Unix socket, which is correct only for a one-box host
+		// and causes split-box compute daemons to crash-loop.
+		return dbURL, nil
 	case "apps_domain":
 		// schedd + apid + gatewayd-internal carry this. The daemon
 		// loader uses the empty value as a "use the env var" signal
@@ -171,14 +183,45 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key s
 		// DNS.AppsDomain makes the renderer's output deterministic
 		// — no surprise per-host env-var overrides.
 		return appsDomain, nil
-	case "vmmd_socket", "gateway_synth_socket":
-		// schedd-specific dials — the manifest's DaemonConfig.Outbound
-		// carries the vmmd target. The renderer maps
-		// vmmd_socket ← Outbound.Target (stripped).
+	case "apid_loopback":
+		// gatewayd-internal normally reaches apid over loopback. A
+		// compute-only gatewayd must instead use the control-plane
+		// listener rendered by the split-box manifest.
+		return dc.APIDLoopback, nil
+	case "vmmd_socket":
+		// schedd's legacy unix fallback. TCP targets are rendered into
+		// vmmd_target instead so the daemon cannot silently dial its local
+		// socket on a split-box deployment.
 		if dc.Outbound != nil && strings.HasPrefix(dc.Outbound.Target, "unix://") {
 			return strings.TrimPrefix(dc.Outbound.Target, "unix://"), nil
 		}
 		return "", nil
+	case "vmmd_target":
+		if dc.Outbound != nil && !strings.HasPrefix(dc.Outbound.Target, "unix://") {
+			return dc.Outbound.Target, nil
+		}
+		return "", nil
+	case "vmmd_tls_cert_path", "vmmd_tls_key_path", "vmmd_tls_ca_path":
+		if dc.Outbound == nil || dc.Outbound.TLS == nil {
+			return "", nil
+		}
+		switch key {
+		case "vmmd_tls_cert_path":
+			return dc.Outbound.TLS.CertPath, nil
+		case "vmmd_tls_key_path":
+			return dc.Outbound.TLS.KeyPath, nil
+		default:
+			return dc.Outbound.TLS.CAPath, nil
+		}
+	case "gateway_synth_socket":
+		if dc.GatewaySynthTarget == "" && dc.Outbound != nil && strings.HasPrefix(dc.Outbound.Target, "unix://") {
+			return strings.TrimPrefix(dc.Outbound.Target, "unix://"), nil
+		}
+		return "", nil
+	case "gateway_synth_target":
+		return dc.GatewaySynthTarget, nil
+	case "gateway_metrics_url":
+		return dc.GatewayMetricsURL, nil
 	case "owner_user", "kernel_path":
 		// vmmd-only. The renderer does not own these: the vmmd
 		// systemd unit files declare them. They appear in

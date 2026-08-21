@@ -1,0 +1,6 @@
+---
+- name: restart faas-meterd
+  ansible.builtin.systemd:
+    name: faas-meterd
+    state: restarted
+  listen: restart faas-meterd

@@ -233,6 +233,16 @@ service Vmmd {
   // sockets in /run/faas/".
   rpc MountParentExt4ReadOnly(MountParentExt4ReadOnlyRequest) returns (MountParentExt4ReadOnlyResponse);
 
+  // MaterializeParentExt4 (ADR-053) copies the read-only parent ext4 tree
+  // into a shared staging directory and releases the temporary loopback
+  // mount before returning.  The copy is deliberately performed by vmmd:
+  // mount visibility is scoped to vmmd's service namespace, while imaged
+  // must consume ordinary files from its own namespace.  target_dir MUST
+  // live under /dev/shm/faas-base-staging/ and storage_key MUST be the
+  // canonical parent-base key.  Empty/foreign paths are InvalidArgument and
+  // a missing storage key is NotFound.
+  rpc MaterializeParentExt4(MaterializeParentExt4Request) returns (MaterializeParentExt4Response);
+
   // UmountParentExt4 (ADR-053) releases a mount vmmd previously
   // returned from MountParentExt4ReadOnly. Idempotent on an
   // unknown mountpoint — imaged's call-on-error-defer pattern
@@ -658,6 +668,11 @@ message BuildSpec {
   //   <export_dir>/build/out/image.tar  (and any siblings)
   // Required for builder VMs; ignored otherwise. vmmd refuses export > MaxExportedLayerBytes.
   string export_dir = 1;
+  // Guest build wall-clock budget in seconds. Builderd sends the same value
+  // it writes into /etc/faas/build.json so vmmd can retain enough teardown
+  // headroom for a configured timeout rather than falling back to the
+  // compile-time platform default.
+  int32 timeout_sec = 2;
 }
 
 message PauseAndSnapshotRequest {
@@ -1025,6 +1040,17 @@ message MountParentExt4ReadOnlyRequest {
 message MountParentExt4ReadOnlyResponse {
   string mountpoint = 1;
 }
+
+// MaterializeParentExt4Request asks vmmd to copy the parent ext4 contents
+// into target_dir.  target_dir is an existing empty directory in the shared
+// base staging tmpfs; the caller applies child OCI layers there afterwards.
+message MaterializeParentExt4Request {
+  string storage_key = 1;
+  string target_dir = 2;
+}
+
+// MaterializeParentExt4Response is the empty success envelope.
+message MaterializeParentExt4Response {}
 
 // UmountParentExt4Request is the input to UmountParentExt4.
 // mountpoint is the path MountParentExt4ReadOnly previously

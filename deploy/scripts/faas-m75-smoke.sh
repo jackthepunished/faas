@@ -152,8 +152,10 @@ fi
 
 # --- 7. Postgres hardening — unix socket only (spec §11) --------------
 heading "7/7 Postgres hardening — unix socket only (spec §11)"
-PG_CONF=/etc/postgresql/15/main/postgresql.conf
-PG_HBA=/etc/postgresql/15/main/pg_hba.conf
+PG_MAJOR="${PG_MAJOR:-$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tail -1)}"
+PG_MAJOR="${PG_MAJOR:-15}"
+PG_CONF="/etc/postgresql/${PG_MAJOR}/main/postgresql.conf"
+PG_HBA="/etc/postgresql/${PG_MAJOR}/main/pg_hba.conf"
 if [[ ! -f "$PG_CONF" ]]; then
   echo "skip: $PG_CONF absent (CI / chroot bootstrap)"
 elif ! grep -Eq "^listen_addresses = ''" "$PG_CONF"; then

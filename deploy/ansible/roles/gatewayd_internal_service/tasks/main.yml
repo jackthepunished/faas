@@ -18,6 +18,21 @@
     mode: "0644"
   register: gatewayd_internal_unit
 
+- name: gatewayd_internal_service — ensure 'faas' group exists
+  ansible.builtin.group:
+    name: faas
+    state: present
+    system: true
+
+- name: gatewayd_internal_service — ensure 'faas' system user exists
+  ansible.builtin.user:
+    name: faas
+    group: faas
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+    password: "*"
+
 # ADR-093 — drop the per-cluster operator kill-switch. Mirrors the
 # alertmanager role's `alertmanager.yml.j2` template drop (tasks/
 # main.yml:126-134). A toml key change restarts the daemon so the
@@ -42,10 +57,59 @@
     mode: "0640"
   notify: restart faas-gatewayd-internal
 
+# The split-box schedd client leaf is consumed by the unprivileged faas
+# service user. PKI/bootstrap may initially materialise it as root:root
+# 0400; converge the ownership here so a rendered TCP schedd target does
+# not turn into a restart loop while the one-box Unix path continues to
+# work when these paths are overridden empty.
+- name: gatewayd_internal_service — grant faas access to schedd client key
+  ansible.builtin.file:
+    path: "{{ gatewayd_schedd_tls_key_path }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  when: gatewayd_schedd_tls_key_path | default('') | length > 0
+
+- name: gatewayd_internal_service — grant faas access to schedd client certificate
+  ansible.builtin.file:
+    path: "{{ gatewayd_schedd_tls_cert_path }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  when: gatewayd_schedd_tls_cert_path | default('') | length > 0
+
+- name: gatewayd_internal_service — grant faas access to VMMD client key
+  ansible.builtin.file:
+    path: "{{ gatewayd_vmmd_tls_key_path }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  when: gatewayd_vmmd_tls_key_path | default('') | length > 0
+
+- name: gatewayd_internal_service — grant faas access to VMMD client certificate
+  ansible.builtin.file:
+    path: "{{ gatewayd_vmmd_tls_cert_path }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  when: gatewayd_vmmd_tls_cert_path | default('') | length > 0
+
 - name: gatewayd_internal_service — systemctl daemon-reload (idempotent, after new unit file)
   ansible.builtin.systemd:
     daemon_reload: true
   when: gatewayd_internal_unit.changed
+
+- name: gatewayd_internal_service — create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-gatewayd-internal.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the gatewayd-internal unit. Drop-in mirrors
@@ -71,6 +135,24 @@
   ansible.builtin.template:
     src: 99-faas-role.conf.j2
     dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-role.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-internal
+
+- name: gatewayd_internal_service — install split-box public listener drop-in
+  ansible.builtin.template:
+    src: 99-faas-public-listen.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-public-listen.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-internal
+
+- name: gatewayd_internal_service — install config and schedd target drop-in
+  ansible.builtin.template:
+    src: 99-faas-runtime-targets.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-runtime-targets.conf
     owner: root
     group: root
     mode: "0644"

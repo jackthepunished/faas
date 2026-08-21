@@ -237,10 +237,12 @@ func render(opts RenderOptions) (RenderReport, error) {
 		tomlBody, _, err := renderTOML(tomlRenderCtx{
 			Daemon:      d,
 			DC:          dc,
+			DBURL:       m.PostgreSQL.DSN,
 			AppsDomain:  m.DNS.AppsDomain,
 			HostSANs:    hostSANs,
 			HostName:    host.Name,
 			HostAddress: host.Address,
+			HostRole:    host.Role,
 		})
 		if err != nil {
 			return report, err
@@ -250,10 +252,15 @@ func render(opts RenderOptions) (RenderReport, error) {
 
 		// PR-2 (issue #911 / ADR-110): thread host.Name so the
 		// rendered unit carries Environment=FAAS_NODE_NAME=<host>.
-		// Empty host.Name (single-box dev) emits no Environment= line
-		// — the daemon's TOML default applies and the unit boots
-		// without a multi-host identity anchor.
-		systemdBody, err := renderSystemd(d, host.Name)
+		// The control-plane schedd is the central scheduler in a split
+		// deployment, not a per-compute owner; leaving its node identity
+		// empty keeps the ownership guard in legacy-central mode. Other
+		// daemons retain the host identity for their role/verifier gates.
+		nodeName := host.Name
+		if host.Role == "control-plane" && d == "schedd" {
+			nodeName = ""
+		}
+		systemdBody, err := renderSystemd(d, nodeName)
 		if err != nil {
 			return report, err
 		}

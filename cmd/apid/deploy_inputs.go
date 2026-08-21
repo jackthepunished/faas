@@ -239,8 +239,15 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 // caller that forgets the LimitReader wrapper should still trip a
 // CodeSourceTooLarge before spooling.
 func validateAndSpool(r io.Reader, limits api.Limits) (string, int64, *api.Problem) {
-	if err := os.MkdirAll(spoolRoot(), 0o755); err != nil {
+	// The split-box builderd worker materializes the same archive into this
+	// spool path after fetching it from shared storage. Keep the directory
+	// group-writable so apid (faas-apid) and builderd (faas-builderd) can
+	// cooperate through the faas group without a host-specific rsync user.
+	if err := os.MkdirAll(spoolRoot(), 0o770); err != nil {
 		return "", 0, api.ErrCapacity("could not create spool dir")
+	}
+	if err := os.Chmod(spoolRoot(), 0o770); err != nil {
+		return "", 0, api.ErrCapacity("could not prepare spool dir")
 	}
 	id := randomToken(12)
 	dst := filepath.Join(spoolRoot(), id+".tar.gz")

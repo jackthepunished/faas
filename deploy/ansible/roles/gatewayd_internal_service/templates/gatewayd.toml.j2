@@ -7,11 +7,21 @@
 {# cluster-wide with `-e gatewayd_route_metrics_enabled=false` at #}
 {# the playbook call site. #}
 
+# Public wildcard host contract. This must be present on compute-only boxes
+# too: gatewayd-internal owns the final hostname→app lookup after the
+# control-plane gatewayd-public forwards the request.
+apps_domain = "{{ gatewayd_apps_domain }}"
+
 # ADR-093 operator kill-switch. Default-on (true) so the rollout
 # reaches Hobby/Pro/Scale customers who didn't flip the per-app
 # apps.route_metrics_enabled flag at create time. Operators
 # downgrade with -e gatewayd_route_metrics_enabled=false.
 route_metrics_enabled = {{ gatewayd_route_metrics_enabled | default(true) | string | lower }}
+
+# In a single-box deployment this remains apid's loopback listener. The
+# generated split-box inventory overrides it with the control-plane address
+# so compute-only gatewayd-internal does not dial its own box.
+apid_loopback = "{{ faas_gatewayd_apid_loopback | default('http://127.0.0.1:8081') }}"
 
 # Schedd listens on TCP in the multi-box deployment. Keep the client
 # identity in the rendered config so gatewayd-internal cannot silently
@@ -19,3 +29,17 @@ route_metrics_enabled = {{ gatewayd_route_metrics_enabled | default(true) | stri
 schedd_tls_cert_path = "{{ gatewayd_schedd_tls_cert_path }}"
 schedd_tls_key_path = "{{ gatewayd_schedd_tls_key_path }}"
 schedd_tls_ca_path = "{{ gatewayd_schedd_tls_ca_path }}"
+
+# VMMD serves runner traffic over the split-box mTLS transport.
+vmmd_tls_cert_path = "{{ gatewayd_vmmd_tls_cert_path }}"
+vmmd_tls_key_path = "{{ gatewayd_vmmd_tls_key_path }}"
+vmmd_tls_ca_path = "{{ gatewayd_vmmd_tls_ca_path }}"
+
+{% if gatewayd_egress_listen | default('') | length > 0 %}
+# Split-box egress byte stream. The listener target itself is carried in
+# FAAS_EGRESS_SOCKET so the same daemon can keep its Unix default on a
+# single-box host; these fields provide the server-side mTLS material.
+egress_tls_cert_path = "{{ gatewayd_egress_tls_cert_path }}"
+egress_tls_key_path = "{{ gatewayd_egress_tls_key_path }}"
+egress_tls_ca_path = "{{ gatewayd_egress_tls_ca_path }}"
+{% endif %}

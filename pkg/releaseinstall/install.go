@@ -52,9 +52,16 @@ func CurrentGitSHA(releasesRoot string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("releaseinstall: readlink %s: %w", link, err)
 	}
-	// Target is "<git-sha>" or "./<git-sha>" or the absolute path.
+	// Resolve relative targets from the symlink's parent directory. The
+	// sibling layout means AtomicFlip writes `releases/<git-sha>` rather
+	// than just `<git-sha>`; resolving against releasesRoot would turn
+	// that valid target into /opt/faas/releases/releases/<sha>.
+	targetPath := target
+	if !filepath.IsAbs(targetPath) {
+		targetPath = filepath.Join(filepath.Dir(link), targetPath)
+	}
 	// We extract the basename relative to releasesRoot.
-	gitSHA, err := filepath.Rel(releasesRoot, filepath.Join(releasesRoot, target))
+	gitSHA, err := filepath.Rel(releasesRoot, filepath.Clean(targetPath))
 	if err != nil {
 		return "", fmt.Errorf("releaseinstall: rel %s: %w", target, err)
 	}
@@ -108,11 +115,21 @@ func AtomicFlip(releasesRoot, gitSHA string) error {
 
 	link := CurrentSymlink(releasesRoot)
 	staging := filepath.Join(releasesRoot, ".current.tmp")
-	if err := os.Symlink(gitSHA, staging); err != nil {
+	// The symlink is a sibling of releasesRoot, so its relative target must
+	// include the releases directory. A bare gitSHA would resolve to
+	// /opt/faas/<gitSHA> and leave the active release broken.
+	targetFromLink, err := filepath.Rel(filepath.Dir(link), target)
+	if err != nil {
+		return fmt.Errorf("releaseinstall: relative current target: %w", err)
+	}
+	if err := os.Symlink(targetFromLink, staging); err != nil {
 		// If the staging symlink already exists from a prior
-		// failed flip, remove it and retry once.
+		// failed flip, remove it and retry once. Keep the target
+		// relative to the final link's parent: the staging link is
+		// deliberately created under releasesRoot, but it is renamed
+		// atomically to the sibling /opt/faas/current path.
 		_ = os.Remove(staging)
-		if err := os.Symlink(gitSHA, staging); err != nil {
+		if err := os.Symlink(targetFromLink, staging); err != nil {
 			return fmt.Errorf("releaseinstall: create staging symlink: %w", err)
 		}
 	}

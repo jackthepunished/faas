@@ -246,6 +246,9 @@ const ReportLivenessFailedCtxTimeout = 3 * time.Second
 const ReportWorkloadOOMCtxTimeout = 3 * time.Second
 
 func main() {
+	if runMountBindHelper() {
+		return
+	}
 	wire.Daemon("vmmd", run)
 }
 
@@ -592,7 +595,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		cn, err := registerComputeNode(ctx, store, cfg.ComputeNode, targetURL,
 			func(ctx context.Context) (string, error) {
 				return defaultDetectOverlayIP(ctx, cfg.ComputeNode)
-			}, log)
+			}, log, deps.scheddTarget)
 		if err != nil {
 			return err
 		}

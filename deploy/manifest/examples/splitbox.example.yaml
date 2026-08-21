@@ -32,7 +32,7 @@
 # ILLUSTRATIVE ONLY — the addresses below are PLACEHOLDERS, not real operator
 # values. Replace with the actual CIDRs of your overlay before deploying:
 #
-#   fleet.hosts[].address (currently 10.42.0.1:7100, 10.42.0.2:50051):
+#   fleet.hosts[].address (currently 10.42.0.1:9091, 10.42.0.2:50051):
 #     Replace each `host:port` with the routable dial address other daemons
 #     use to reach that host. This is NOT necessarily the public IP — it
 #     should be the overlay/mesh-routable address (Tailscale 100.64/10 exit
@@ -64,7 +64,7 @@ fleet:
   hosts:
     - name: fsn-1
       role: control-plane
-      address: 10.42.0.1:7100
+      address: 10.42.0.1:9091
       tags: ["primary", "vpc-pub"]
     - name: fsn-2
       role: compute-only
@@ -78,12 +78,21 @@ fleet:
 # remote daemons.
 daemons:
   schedd:
-    bind: tcp://0.0.0.0:7100
+    bind: tcp://0.0.0.0:9091
     tls:
       cert_path: /etc/faas/tls/schedd/server.crt
       key_path: /etc/faas/tls/schedd/server.key
       ca_path: /etc/faas/tls/ca/ca.crt
       mode: "0400"
+    # The control-plane scheduler dials the compute vmmd over private mTLS
+    # and sends cron/metrics traffic to the remote gatewayd-internal.
+    outbound:
+      target: tcp://vmmd.faas:50051
+      tls:
+        cert_path: /etc/faas/tls/schedd/vmmd-client.crt
+        key_path: /etc/faas/tls/schedd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
+    gateway_synth_target: tcp://10.42.0.2:8080
   vmmd:
     bind: tcp://0.0.0.0:50051
     tls:
@@ -113,6 +122,8 @@ daemons:
     bind: tcp://0.0.0.0:443
   gatewayd_internal:
     bind: unix:///run/faas/gatewayd-internal.sock
+    # Compute gatewayd proxies the apid surface to the control plane.
+    apid_loopback: http://10.42.0.1:8081
 
 # Overlay — per-host overlay network identity. The generated Ansible
 # inventory writes /etc/hosts entries so the private PKI names
@@ -154,7 +165,9 @@ dns:
 # migration policy is on-boot for multi-box; on-boot-offline is
 # the single-box dev default.
 postgresql:
-  dsn: postgres://faas@127.0.0.1:5432/faas
+  # Use the control-plane mesh address, not 127.0.0.1: compute daemons
+  # consume this same DSN after manifest rendering.
+  dsn: postgres://faas@10.42.0.1:5432/faas?sslmode=disable
   database: faas
   migration_max_slot: 265
   policy: on-boot

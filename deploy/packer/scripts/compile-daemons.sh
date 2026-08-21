@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/compile-daemons.sh — build every Go daemon + CLI into the image at
+# scripts/compile-daemons.sh — build every Go daemon + support executable + CLI into the image at
 # /opt/faas/current/bin/. The image bakes a `current` symlink that the
 # per-daemon systemd units consume; `gregalectl release install --git-sha X`
 # flips current→X at install time.
@@ -21,9 +21,8 @@ SRC_ROOT="${SRC_ROOT:-/tmp/src}"
 GO_VERSION="${GO_VERSION:-1.25.13}"
 
 DAEMONS=(apid gatewayd-public gatewayd-internal schedd vmmd builderd imaged meterd githubd)
-# vmmd-raw-bridge + vmmd-stream-bridge are sub-tools of vmmd, not separate
-# daemons — built into vmmd's package.
 CLIS=(gregale gregalectl)
+TOOLS=(vmmd-raw-bridge vmmd-stream-bridge)
 
 if [[ ! -d "${SRC_ROOT}" ]]; then
     echo "compile-daemons: SRC_ROOT=${SRC_ROOT} not present; expected the repo mounted at this path" >&2
@@ -53,6 +52,13 @@ for c in "${CLIS[@]}"; do
     go build -trimpath -ldflags "${LDFLAGS}" \
         -o "/opt/faas/current/bin/${c}" \
         "./cmd/${c}"
+done
+
+for t in "${TOOLS[@]}"; do
+    echo "compile-daemons: building ${t}"
+    go build -trimpath -ldflags "${LDFLAGS}" \
+        -o "/opt/faas/current/bin/${t}" \
+        "./cmd/${t}"
 done
 
 echo "compile-daemons: $(ls /opt/faas/current/bin/ | wc -l) binaries installed"

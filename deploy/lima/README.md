@@ -44,7 +44,7 @@ Tear down with `limactl delete -f faas-metal`.
 
   To rebuild after a `guest/init` source change:
   `limactl delete -f faas-metal && limactl start deploy/lima/faas-metal.yaml`.
-- **M6 builder base rootfs** staged at `/srv/fc/base/builder-base.ext4`
+- **M6 builder base rootfs** staged at `/srv/fc/base/runner-builder-<arch>.ext4`
   (label `faas-builder-bas`, mkfs `^has_journal` to match the two-drive
   read-only drive0 contract). Built by the third provisioner block from
   `images/builder-base.Dockerfile` via `docker buildx build

@@ -4,11 +4,11 @@
 # of truth (pkg/netns/config.go: TenantBridge, HostBridgeCIDR).
 #
 # Per-host egress (ADR-055). `public_iface` and `masquerade_cidr` are
-# the per-host substitution points. The defaults below match
-# `pkg/netns.DefaultHostPolicy` (the EX44 default-local node shape:
-# eth0 + 10.100.0.0/16). A Hetzner compute node on a different NIC
-# name (e.g. `ens5`) overrides via `host_vars[<compute_node>].public_iface`
-# in the ansible inventory; the Jinja2 template at
+# the per-host substitution points. The interface defaults to the
+# gathered host fact so the same manifest works on GCP (`ens4`), Hetzner
+# (`ens5`), and bare metal (`eth0`) without hand-editing each host. An
+# operator can still override it with `host_vars[<compute_node>].public_iface`
+# when the default route is intentionally not the egress NIC. The Jinja2 template at
 # `templates/policy_nftables.conf.j2` substitutes these values site-for-
 # site. The Go render (`cmd/faas-nft-render` with the matching flags
 # or `FAAS_PUBLIC_IFACE` / `FAAS_MASQUERADE_CIDR` envs) is the
@@ -25,7 +25,24 @@
 # for the per-host bridge).
 tenant_bridge: br-tenants
 bridge_cidr: 10.100.0.1/16
-public_iface: eth0
+public_iface: "{{ ansible_default_ipv4.interface | default('eth0') }}"
 masquerade_cidr: 10.100.0.0/16
 overlay_cidrs: []
 masquerade_cidr_v6: ''
+# Split-box PostgreSQL ingress. The manifest generator sets these only on
+# the control-plane host; an empty list preserves the single-box firewall.
+faas_postgres_allowed_cidrs: []
+# Split-box scheduler ingress. Compute nodes stream capacity to schedd on
+# TCP/9091; keep this separate from PostgreSQL so the firewall contract is
+# explicit even though both lists are currently derived from the same fleet.
+faas_compute_allowed_cidrs: []
+# Control-plane ingress to compute services. The manifest generator sets
+# these only on compute-only hosts; an empty list keeps the one-box policy.
+faas_control_plane_allowed_cidrs: []
+# Compute-side TCP services reached by the control plane. 9092 is the
+# gatewayd-internal egress stream; it is kept in the same explicit allowlist
+# as vmmd and gatewayd so the port is not opened on unrelated hosts.
+faas_control_plane_allowed_ports:
+  - 50051
+  - 8080
+  - 9092

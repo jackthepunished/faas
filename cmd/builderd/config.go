@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -46,14 +47,17 @@ type Config struct {
 	DBURL string `toml:"db_url"`
 	// BuilderBase is drive0: the read-only shared base rootfs the builder VM
 	// boots from. Built once from images/builder-base.Dockerfile by imaged;
-	// staged to /srv/fc/base/builder-base.ext4 (the default).
+	// staged to the canonical per-architecture runner-builder path.
 	BuilderBase string `toml:"builder_base"`
 	// BuildDriveDir hosts the per-VM drive1 tmp files builderd creates at
-	// Spawn time. /var/lib/faas/build-drive (default).
+	// Spawn time. The compute-only systemd unit grants write access to
+	// /srv/fc/builder; keeping the ephemeral drive below that root avoids a
+	// ProtectSystem=strict mismatch on split-box hosts.
 	BuildDriveDir string `toml:"build_drive_dir"`
 	// BuildExportDir is the parent of all per-build export directories. vmmd
 	// writes <dir>/<build_id>/build-done.json + /build/out/* here during
-	// Destroy. /var/lib/faas/build-out (default).
+	// Destroy. It shares the builder staging root for the same systemd
+	// namespace contract.
 	BuildExportDir string `toml:"build_export_dir"`
 	// BuildTimeoutSeconds is the guest build wall-clock budget. Zero keeps
 	// the platform default from pkg/api/limits.go. The host-side export
@@ -210,9 +214,9 @@ func LoadConfig(path string) (*Config, error) {
 	c := &Config{
 		VMMDSocket:       "/run/faas/vmmd.sock",
 		CacheDir:         "/var/cache/faas/builds",
-		BuilderBase:      "/srv/fc/base/builder-base.ext4",
-		BuildDriveDir:    "/var/lib/faas/build-drive",
-		BuildExportDir:   "/var/lib/faas/build-out",
+		BuilderBase:      "/srv/fc/base/runner-builder-" + runtime.GOARCH + ".ext4",
+		BuildDriveDir:    "/srv/fc/builder/drive",
+		BuildExportDir:   "/srv/fc/builder/out",
 		ScheddMetricsURL: "http://127.0.0.1:9090/metrics/fcvm",
 		PollInterval:     2 * time.Second,
 		// B2.2 (issue #196): 30s fairness window — wide enough to

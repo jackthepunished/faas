@@ -21,13 +21,13 @@ import (
 // TOML) so the box can roll a base image ahead of pinned refs and have imaged
 // track it without a code change.
 const (
-	BaseRefNode22      = "ghcr.io/onebox-faas/runner-node22:latest"
-	BaseRefPython312   = "ghcr.io/onebox-faas/runner-python312:latest"
-	BaseRefGo124       = "ghcr.io/onebox-faas/runner-go124:latest"
-	BaseRefGo124Alpine = "ghcr.io/onebox-faas/runner-go124-alpine:latest"
-	BaseRefNode24      = "ghcr.io/onebox-faas/runner-node24:latest"
-	BaseRefPython313   = "ghcr.io/onebox-faas/runner-python313:latest"
-	BaseRefMinimal     = "ghcr.io/onebox-faas/base-minimal:latest"
+	BaseRefNode22      = "ghcr.io/poyrazk/runner-node22:latest"
+	BaseRefPython312   = "ghcr.io/poyrazk/runner-python312:latest"
+	BaseRefGo124       = "ghcr.io/poyrazk/runner-go124:latest"
+	BaseRefGo124Alpine = "ghcr.io/poyrazk/runner-go124-alpine:latest"
+	BaseRefNode24      = "ghcr.io/poyrazk/runner-node24:latest"
+	BaseRefPython313   = "ghcr.io/poyrazk/runner-python313:latest"
+	BaseRefMinimal     = "ghcr.io/poyrazk/base-minimal:latest"
 	BaseRefBuilder     = "ghcr.io/poyrazk/builder-base:latest"
 	// BaseRefDebianParent (ADR-053) is the staging-only parent
 	// runtime — its ext4 carries the shared debian:12-slim userland
@@ -39,7 +39,7 @@ const (
 	// and `oci.LayersAboveBase(parent.DiffIDs, child.DiffIDs)`
 	// succeeds (the chain-composability invariant documented in
 	// ADR-053).
-	BaseRefDebianParent = "ghcr.io/onebox-faas/base-debian-parent:latest"
+	BaseRefDebianParent = "ghcr.io/poyrazk/base-debian-parent:latest"
 
 	// Runtime names are the values stored on state.App.Runtime. They map
 	// 1:1 to the runner shims in

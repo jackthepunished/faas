@@ -58,7 +58,16 @@ func (m *MemStore) CreateTenantSurfaceIfUnderQuota(_ context.Context, in CreateT
 			return TenantSurface{}, ErrConflict
 		}
 	}
-	now := time.Now().UTC()
+	// PostgreSQL's timestamp ordering is stable for sequential inserts, but
+	// time.Now().UTC() can have equal wall-clock values on this in-memory
+	// path. Keep the test double's CreatedAt order deterministic as well.
+	var latestCreatedAt time.Time
+	for _, existing := range m.tenantSurfaces {
+		if existing.CreatedAt.After(latestCreatedAt) {
+			latestCreatedAt = existing.CreatedAt
+		}
+	}
+	now := nextTenantSurfaceTime(latestCreatedAt)
 	surf := TenantSurface{
 		ID:        uuid.NewString(),
 		AccountID: in.AccountID,
@@ -163,7 +172,7 @@ func (m *MemStore) UpdateTenantSurfaceStatus(_ context.Context, id string, statu
 		return ErrNotFound
 	}
 	s.Status = status
-	s.UpdatedAt = time.Now().UTC()
+	s.UpdatedAt = nextTenantSurfaceTime(s.UpdatedAt)
 	m.tenantSurfaces[id] = s
 	return nil
 }
@@ -195,7 +204,7 @@ func (m *MemStore) UpdateTenantSurfaceCert(_ context.Context, in UpdateSurfaceCe
 	s.CertState = in.CertState
 	s.CertNotAfter = in.NotAfter
 	s.CertLastError = in.LastError
-	s.UpdatedAt = time.Now().UTC()
+	s.UpdatedAt = nextTenantSurfaceTime(s.UpdatedAt)
 	m.tenantSurfaces[in.SurfaceID] = s
 	return nil
 }
@@ -275,9 +284,21 @@ func (m *MemStore) TouchTenantSurfaceForRenewal(_ context.Context, id string) er
 	if !ok {
 		return ErrNotFound
 	}
-	s.UpdatedAt = time.Now().UTC()
+	s.UpdatedAt = nextTenantSurfaceTime(s.UpdatedAt)
 	m.tenantSurfaces[id] = s
 	return nil
+}
+
+// nextTenantSurfaceTime preserves strict in-memory ordering when the host
+// clock returns the same wall-clock instant for two consecutive operations.
+// The database is the production source of timestamps; this only keeps the
+// MemStore twin deterministic and faithful to ORDER BY created_at/updated_at.
+func nextTenantSurfaceTime(previous time.Time) time.Time {
+	now := time.Now().UTC()
+	if !previous.IsZero() && !now.After(previous) {
+		return previous.Add(time.Nanosecond)
+	}
+	return now
 }
 
 // TenantSurfaceByHostname — pgRouter.ResolveHost hot path; linear

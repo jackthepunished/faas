@@ -12,6 +12,7 @@
 
 faas_box_role: compute-only
 faas_node_name: fsn-2
+gatewayd_apps_domain: apps.gregale.dev
 
 # Ansible connection vars. See host_vars/faas-fsn-1.yml for the
 # rationale. `ansible_host` is the dial target schedd/gatewayd use
@@ -24,7 +25,7 @@ ansible_python_interpreter: /usr/bin/python3
 # these through a managed systemd drop-in; no post-boot compute_nodes DB patch
 # is required.
 faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"
-faas_vmmd_target_url: "tcp://10.42.0.2:50051"
+faas_vmmd_target_url: "tcp://vmmd.faas:50051"
 
 # Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
 # needs the overlay mesh to reach peer compute boxes (fsn-3+ when

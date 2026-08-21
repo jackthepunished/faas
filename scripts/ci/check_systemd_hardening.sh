@@ -18,7 +18,7 @@ units=(
   "vmmd_service/files/faas-vmmd.service"
 )
 
-required=(NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes ProtectKernelTunables=yes ProtectKernelModules=yes ProtectControlGroups=yes)
+required=(NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes ProtectKernelModules=yes)
 errors=0
 
 for rel in "${units[@]}"; do
@@ -33,7 +33,17 @@ for rel in "${units[@]}"; do
     echo "systemd-hardening-check: ${rel}: User must be non-root" >&2
     errors=$((errors + 1))
   fi
-  for directive in "${required[@]}"; do
+  unit_required=("${required[@]}")
+  if [[ "$rel" != vmmd_service/files/faas-vmmd.service ]]; then
+    unit_required+=(ProtectKernelTunables=yes ProtectControlGroups=yes)
+  else
+    # vmmd is the deliberate exception: Firecracker's jailer manages the
+    # delegated per-VM cgroups and writes their kernel control files. The
+    # canonical daemon spec keeps both protections disabled for that owner;
+    # requiring them here would make vmmd unable to start/manage guests.
+    :
+  fi
+  for directive in "${unit_required[@]}"; do
     if ! grep -Fqx "$directive" "$file"; then
       echo "systemd-hardening-check: ${rel}: missing ${directive}" >&2
       errors=$((errors + 1))

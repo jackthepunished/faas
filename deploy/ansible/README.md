@@ -16,7 +16,7 @@ In order (each role is independent and verifies its own preconditions):
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
 | `nftables` | §7 | `/etc/nftables.conf` | `creates:` + `nft -c` syntax check |
-| `postgres` | §1 (cp slice), §4 | postgres-15, `faas` user | apt idempotent, `creates:` on home |
+| `postgres` | §1 (cp slice), §4 | distro PostgreSQL major, `faas` user | apt idempotent, `creates:` on home |
 
 ## Run it
 
@@ -60,6 +60,13 @@ remains enabled; `/etc/hosts` maps `vmmd.faas` and `schedd.faas` to the
 manifest overlay addresses. The committed
 `host_vars/faas-fsn-{1,2}.yml` files remain checked-in reference fixtures;
 the manifest-generated tree is the deployment source of truth.
+
+For a split-box manifest, the generated control-plane variables also
+declare the database listener address and the compute `/32` allow-list.
+Provide `faas_postgres_password` through Ansible Vault (or another secret
+source) before bootstrapping; the role refuses to expose PostgreSQL without
+that password. The manifest's `postgresql.dsn` must use the same control-plane
+mesh address, not `127.0.0.1` or a local Unix socket.
 
 ## Do NOT run this on a non-bare-metal host without reading this section
 

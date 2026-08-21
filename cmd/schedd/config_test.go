@@ -42,6 +42,22 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_RoutingEnvironmentOverrides(t *testing.T) {
+	t.Setenv("FAAS_GATEWAY_SYNTH_TARGET", "tcp://compute.faas:8080")
+	t.Setenv("FAAS_GATEWAY_METRICS_URL", "http://compute.faas:9090/metrics")
+
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.GatewaySynthTarget != "tcp://compute.faas:8080" {
+		t.Errorf("GatewaySynthTarget = %q", cfg.GatewaySynthTarget)
+	}
+	if cfg.GatewayMetricsURL != "http://compute.faas:9090/metrics" {
+		t.Errorf("GatewayMetricsURL = %q", cfg.GatewayMetricsURL)
+	}
+}
+
 func TestLoadConfig_OverridesFromTOML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "schedd.toml")
 	body := `

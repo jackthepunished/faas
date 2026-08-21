@@ -31,6 +31,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -42,6 +43,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -145,11 +147,7 @@ func cmdReleaseBundle(args []string) int {
 	// Validate git_sha / manifest_hash shape BEFORE touching the
 	// filesystem so a malformed CLI argument surfaces as a usage
 	// error (exit 1), not as a platform/infra error (exit 3).
-	if err := releaseinstall.ValidateManifest(releaseinstall.Manifest{
-		FormatVersion: releaseinstall.FormatVersion,
-		GitSHA:        *gitSHA,
-		ManifestHash:  *manifestHash,
-	}); err != nil {
+	if err := releaseinstall.ValidateBundleInputs(*gitSHA, *manifestHash); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: %v\n", err)
 		return 1
 	}
@@ -221,9 +219,9 @@ func cmdReleaseBundle(args []string) int {
 	return 0
 }
 
-// copyBinIntoRelease copies every regular file in srcDir into
-// <releasesRoot>/<gitSHA>/bin/<basename>. Symlinks and directories
-// are skipped — the bundle is a flat list of daemon binaries.
+// copyBinIntoRelease copies release-catalog regular files in srcDir into
+// <releasesRoot>/<gitSHA>/bin/<basename>. Symlinks and directories are
+// skipped — the current release catalog is flat.
 func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 	bin := releaseinstall.BinDir(releasesRoot, gitSHA)
 	if err := os.MkdirAll(bin, 0o755); err != nil {
@@ -235,6 +233,12 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 	}
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		// The normal build directory also contains CLIs and vmmd support
+		// helpers. Keep only the release catalog; Build will still fail
+		// closed if any daemon is missing.
+		if !releaseinstall.IsReleaseBinaryName(e.Name()) {
 			continue
 		}
 		src := filepath.Join(srcDir, e.Name())
@@ -249,6 +253,22 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 		// always under bin/.
 		if err := os.WriteFile(dst, body, 0o755); err != nil {
 			return fmt.Errorf("write %s: %w", dst, err)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(srcDir, "runners")); err == nil && info.IsDir() {
+		for _, asset := range releaseinstall.RuntimeAssetNames() {
+			src := filepath.Join(srcDir, filepath.FromSlash(asset))
+			body, err := os.ReadFile(src)
+			if err != nil {
+				return fmt.Errorf("read runtime asset %s: %w", asset, err)
+			}
+			dst := filepath.Join(bin, filepath.FromSlash(asset))
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return fmt.Errorf("mkdir runtime asset %s: %w", asset, err)
+			}
+			if err := os.WriteFile(dst, body, 0o755); err != nil {
+				return fmt.Errorf("write runtime asset %s: %w", asset, err)
+			}
 		}
 	}
 	return nil
@@ -570,11 +590,11 @@ func cmdReleaseInstall(args []string) int {
 		if jsonEnabled() {
 			jsonEmit(os.Stdout, releaseInstallReport{
 				GitSHA:      *gitSHA,
-				DBError:     "FAAS_PG_DSN not set",
+				DBError:     "database DSN not set (FAAS_PG_DSN or DATABASE_URL)",
 				SymlinkOnly: true,
 			})
 		} else {
-			_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (DB unreachable: FAAS_PG_DSN not set)\n", *gitSHA)
+			_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (DB unreachable: database DSN not set)\n", *gitSHA)
 		}
 		return 3
 	}
@@ -694,11 +714,13 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 		return fmt.Errorf("manifest git_sha=%s does not match --git-sha=%s", m.GitSHA, gitSHA)
 	}
 	tb := &releaseinstall.Tarball{
-		GitSHA:   gitSHA,
-		Manifest: m,
-		Packed:   tbBody,
-		Sig:      sigBody,
-		SBOM:     sbomBody,
+		GitSHA:     gitSHA,
+		Manifest:   m,
+		Packed:     tbBody,
+		Sig:        sigBody,
+		SBOM:       sbomBody,
+		BinSHA256:  manifestHashMap(m.DaemonHashes),
+		ToolSHA256: manifestHashMap(m.ToolHashes),
 	}
 
 	// 3. Cosign verify-blob. THIS is the load-bearing trust bit
@@ -738,6 +760,18 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	return nil
 }
 
+// manifestHashMap converts manifest values from "sha256:<hex>" to the
+// hashWalk representation used by Tarball. The shape was deliberately kept
+// separate from the on-disk manifest so the verifier never has to infer a
+// digest format from a tar entry.
+func manifestHashMap(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for name, value := range values {
+		out[name] = strings.TrimPrefix(value, "sha256:")
+	}
+	return out
+}
+
 // extractTarballMember pulls one regular-file member out of a
 // tar+gz blob without unpacking the rest. Used by
 // installViaTarball to fetch release-manifest.json before doing
@@ -764,23 +798,79 @@ func extractTarballMember(packed []byte, name string) ([]byte, error) {
 	return nil, fmt.Errorf("member %q not found in tarball", name)
 }
 
-// openPgPoolFromEnv returns a pgxpool.Pool wired from FAAS_PG_DSN
-// (the convention used by cmd/gregale for other DB-touching
-// subcommands). Returns an error if the env var is unset.
+// openPgPoolFromEnv returns a pgxpool.Pool wired from the operator's
+// database environment. FAAS_PG_DSN is the explicit CLI override;
+// DATABASE_URL is the name emitted by the control-plane sealed.env
+// and is therefore the production fallback. Returns an error when
+// neither variable is set.
 func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 	dsn := os.Getenv("FAAS_PG_DSN")
 	if dsn == "" {
-		return nil, fmt.Errorf("FAAS_PG_DSN not set")
+		dsn = os.Getenv("DATABASE_URL")
+	}
+	if dsn == "" {
+		// Split compute boxes deliberately keep DATABASE_URL in a
+		// root-only systemd EnvironmentFile. Make the operator CLI
+		// honor that deployment contract when invoked as root, while
+		// gracefully ignoring the file for ordinary local users.
+		for _, path := range []string{"/etc/faas/compute-db.env", "/etc/faas/sealed.env"} {
+			if v, ok := readDatabaseEnvFile(path); ok {
+				dsn = v
+				break
+			}
+		}
+	}
+	if dsn == "" {
+		return nil, fmt.Errorf("database DSN not set (FAAS_PG_DSN or DATABASE_URL)")
 	}
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse FAAS_PG_DSN: %w", err)
+		return nil, fmt.Errorf("parse database DSN: %w", err)
 	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pgxpool: %w", err)
 	}
 	return pool, nil
+}
+
+// readDatabaseEnvFile reads only DATABASE_URL from a systemd-style env file.
+// The file contents stay in memory; callers receive only the parsed value.
+// This is intentionally small rather than a shell parser: deploy-managed
+// files contain KEY=value lines, comments, and optional single/double quotes.
+func readDatabaseEnvFile(path string) (string, bool) {
+	// path is the deploy-managed systemd environment file selected by the
+	// local release-install flow, not a customer upload path.
+	//nolint:forbidigo // vetted deploy-managed environment file.
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "DATABASE_URL" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			if unquoted, err := strconv.Unquote(value); err == nil {
+				value = unquoted
+			}
+		} else if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+			value = value[1 : len(value)-1]
+		}
+		if value != "" {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 // readFirstBootRole parses /etc/faas/first-boot.env (the file the

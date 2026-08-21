@@ -27,6 +27,14 @@
     daemon_reload: true
   when: gatewayd_public_unit.changed
 
+- name: gatewayd_public_service — create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-gatewayd-public.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the gatewayd-public unit (env-only — no config.go).
 # Drop-in mirrors deploy/ansible/roles/control_plane_service/
@@ -54,3 +62,12 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: gatewayd_public_service — install split-box internal target drop-in
+  ansible.builtin.template:
+    src: 99-faas-internal-target.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-public.service.d/99-faas-internal-target.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-public

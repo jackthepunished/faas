@@ -1,0 +1,4 @@
+[Service]
+# Manifest-derived vmmd → schedd capacity/liveness target. Empty preserves
+# the legacy unix socket path for one-box development.
+Environment=FAAS_VMMD_SCHEDD_TARGET={{ faas_vmmd_schedd_target | default('unix:///run/faas/schedd.sock') }}

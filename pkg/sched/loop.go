@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1962,12 +1963,20 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 // state (dispatched/completed) so the drain can call Store.CompleteInvocation
 // with the result blob. Network errors bubble up so the drain can retry.
 func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
+	var headers map[string]string
+	if len(inv.Headers) > 0 {
+		if err := json.Unmarshal(inv.Headers, &headers); err != nil {
+			return inv, fmt.Errorf("sched: invocation headers: %w", err)
+		}
+	}
 	body, err := json.Marshal(map[string]any{
 		"invocation_id": inv.ID,
 		"app_id":        appID,
 		"source":        string(inv.Source),
 		"method":        inv.Method,
 		"path":          inv.Path,
+		"headers":       headers,
+		"body_b64":      base64.StdEncoding.EncodeToString(inv.Payload),
 	})
 	if err != nil {
 		return inv, fmt.Errorf("sched: invocation marshal: %w", err)
@@ -1983,13 +1992,24 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 		return inv, fmt.Errorf("sched: invocation do: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadGateway {
+	if resp.StatusCode != http.StatusOK {
 		return inv, fmt.Errorf("sched: invocation: gateway returned %d", resp.StatusCode)
 	}
-	// Reset state to dispatched; gateway-set state strings are
-	// "dispatched" today. Persistent failure surfaces to the drain
-	// via the 502 path above.
-	inv.State = state.InvocationDispatching
+	var out struct {
+		State  string          `json:"state"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return inv, fmt.Errorf("sched: invocation response: %w", err)
+	}
+	if out.State != "" {
+		inv.State = state.InvocationState(out.State)
+	} else {
+		inv.State = state.InvocationDispatching
+	}
+	if len(out.Result) > 0 {
+		inv.Result = append(json.RawMessage(nil), out.Result...)
+	}
 	return inv, nil
 }
 

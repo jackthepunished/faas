@@ -164,6 +164,12 @@ func (s *stubVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountP
 	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
 }
 
+// MaterializeParentExt4 is likewise outside the gateway hot path. Keep the
+// generated client stub complete as vmmd's staging surface evolves.
+func (s *stubVmmdClient) MaterializeParentExt4(context.Context, *vmmdpb.MaterializeParentExt4Request, ...grpc.CallOption) (*vmmdpb.MaterializeParentExt4Response, error) {
+	return &vmmdpb.MaterializeParentExt4Response{}, nil
+}
+
 // UmountParentExt4 (ADR-053) — gateway never drives the parent
 // umount path. Returns nil.
 func (s *stubVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {

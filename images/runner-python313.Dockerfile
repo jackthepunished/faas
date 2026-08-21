@@ -11,7 +11,7 @@
 # on the box — per-app cost is just the customer's site-packages +
 # handler. The 130 MB/sandbox accounting is preserved
 # (CLAUDE.md "load-bearing — DO NOT fix").
-FROM python:3.13-slim-bookworm@sha256:00faa2debb87529f9f0764e9491d8ba400a3678976616c3bd7cb193745ac20d1
+FROM python:3.13-slim-bookworm@sha256:0f16c5d35fe6464ee471792ab3bb9116f911b65b3fbf10120c98d2bdc6332f48
 # Issue #197 B3.6: mutable tag pinned via images/Dockerfile.lock.
 RUN id app 2>/dev/null || useradd -u 1000 -m app
 WORKDIR /app

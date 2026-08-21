@@ -61,7 +61,7 @@ import (
 // bind address (the conflation between the two was the load-
 // bearing bug fixed in the second-box cutover PR; see
 // docs/runbooks/multi-host-rollout.md §3.5).
-func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeConfig, targetURL string, detectOverlayIP func(context.Context) (string, error), log *slog.Logger) (state.ComputeNode, error) {
+func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeConfig, targetURL string, detectOverlayIP func(context.Context) (string, error), log *slog.Logger, scheddTargets ...string) (state.ComputeNode, error) {
 	name := strings.TrimSpace(cfg.NodeName)
 	if name == "" {
 		// Empty name = operator chose not to self-register. vmmd
@@ -161,6 +161,10 @@ func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeCon
 		AdmissionCeilingMB: cfg.AdmissionCeilingMB,
 		VCPUBudget:         cfg.VCPUBudget,
 		Active:             true,
+	}
+	if len(scheddTargets) > 0 && strings.TrimSpace(scheddTargets[0]) != "" {
+		scheddTarget := strings.TrimSpace(scheddTargets[0])
+		row.ScheddTargetURL = &scheddTarget
 	}
 	// Issue #938 / PR-A: the migration 00123 CHECK constraint
 	// (vcpu_budget > 0) rejects 0, and the struct-default path leaves

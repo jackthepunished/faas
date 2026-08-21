@@ -56,8 +56,8 @@ func TestStatefulDenyListMatch_KnownStateful(t *testing.T) {
 // segment is the full directory name, not a substring match).
 func TestStatefulDenyListMatch_KnownClean(t *testing.T) {
 	cases := []string{
-		"ghcr.io/onebox-faas/runner-node22:latest", // platform's own base
-		"ghcr.io/onebox-faas/runner-python312:latest",
+		"ghcr.io/poyrazk/runner-node22:latest", // platform's own base
+		"ghcr.io/poyrazk/runner-python312:latest",
 		"node:22-slim",                 // not in the deny-list
 		"ghcr.io/me/postgres-fork:1.0", // postgres-fork is NOT postgres
 		"my-postgres-app",              // hyphenated name does not match "postgres"
@@ -191,7 +191,7 @@ func TestResolveDeployBaseRef_PerRuntimeEnvOverride(t *testing.T) {
 		}
 	})
 	t.Run("env override tag-only ref fails loud", func(t *testing.T) {
-		tagOnly := func(string) string { return "mirror.gcr.io/library/node:22-bookworm-slim" }
+		tagOnly := func(string) string { return "mirror.gcr.io/library/node:22-alpine" }
 		_, err := resolveDeployBaseRef(RuntimeNode22, tagOnly)
 		if err == nil {
 			t.Fatal("expected error for tag-only env override, got nil")
