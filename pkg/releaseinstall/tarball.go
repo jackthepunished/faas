@@ -348,6 +348,12 @@ func (t *Tarball) Extract(root string) error {
 	tr := tar.NewReader(gz)
 
 	for {
+		// codeql[go/zipslip] — tr.Next() returns the archive header whose
+		// Name is used below; SafeArchiveRelativeName rejects absolute and
+		// traversal paths before filepath.Join, and the post-join checks
+		// reject symlink escapes before any write. Keep the suppression at
+		// the source call site because CodeQL does not infer this local
+		// sanitizer as a taint barrier.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
