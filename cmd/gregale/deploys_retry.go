@@ -129,11 +129,11 @@ func cmdDeploysRetry(args []string) int {
 		return 2
 	}
 
-	fmt.Fprintf(osStdout, "Retry queued.\n")
-	fmt.Fprintf(osStdout, "  new deployment id: %s\n", resp.ID)
-	fmt.Fprintf(osStdout, "  starting from:     %s\n", fromStage)
-	fmt.Fprintf(osStdout, "  status:            %s\n", resp.Status)
-	fmt.Fprintf(osStdout, "\nFollow progress:\n  gregale deploys status %s\n", resp.ID)
+	_, _ = fmt.Fprintf(osStdout, "Retry queued.\n")
+	_, _ = fmt.Fprintf(osStdout, "  new deployment id: %s\n", resp.ID)
+	_, _ = fmt.Fprintf(osStdout, "  starting from:     %s\n", fromStage)
+	_, _ = fmt.Fprintf(osStdout, "  status:            %s\n", resp.Status)
+	_, _ = fmt.Fprintf(osStdout, "\nFollow progress:\n  gregale deploys status %s\n", resp.ID)
 	return 0
 }
 
