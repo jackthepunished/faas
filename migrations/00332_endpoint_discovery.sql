@@ -66,8 +66,8 @@ CREATE TABLE IF NOT EXISTS deployment_openapi_docs (
   CONSTRAINT deployment_openapi_docs_sha256_len_chk CHECK (
     octet_length(doc_sha256) = 32
   ),
-  CONSTRAINT deployment_openapi_docs_captured_after_created_chk CHECK (
-    captured_at >= updated_at
+  CONSTRAINT deployment_openapi_docs_captured_before_updated_chk CHECK (
+    updated_at >= captured_at
   )
 );
 

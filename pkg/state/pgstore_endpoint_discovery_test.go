@@ -1,7 +1,7 @@
 package state_test
 
 // Round-trip tests for the deployment_openapi_docs Store surface
-// (ADR-122 / issue #975 item #1, slot 00330). Exercises the four
+// (ADR-122 / issue #975 item #1, slot 00332). Exercises the four
 // methods — Get / Upsert / Delete / Count — plus the load-bearing
 // IDOR guard: a cross-tenant read returns ErrNotFound, not the row.
 //
@@ -19,8 +19,10 @@ package state_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -77,7 +79,19 @@ func TestPgStoreOpenAPIDoc_RoundTrip(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	if string(gotDoc) != string(doc) {
-		t.Errorf("body: got %q, want %q", string(gotDoc), string(doc))
+		// Postgres re-serialises JSONB with whitespace; compare
+		// semantically via json.Unmarshal both sides into map[string]any.
+		var wantMap, gotMap map[string]any
+		if jerr1 := json.Unmarshal(doc, &wantMap); jerr1 != nil {
+			t.Errorf("body: byte-equal mismatch %q vs %q, and input did not parse as JSON: %v",
+				string(gotDoc), string(doc), jerr1)
+		} else if jerr2 := json.Unmarshal(gotDoc, &gotMap); jerr2 != nil {
+			t.Errorf("body: byte-equal mismatch %q vs %q, and Postgres output did not parse as JSON: %v",
+				string(gotDoc), string(doc), jerr2)
+		} else if !reflect.DeepEqual(gotMap, wantMap) {
+			t.Errorf("body: semantic mismatch after Postgres JSONB re-serialisation:\n got=%#v\nwant=%#v",
+				gotMap, wantMap)
+		}
 	}
 	if gotMeta.AccountID != accountID {
 		t.Errorf("Meta.AccountID: got %q, want %q", gotMeta.AccountID, accountID)

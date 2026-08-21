@@ -2657,10 +2657,10 @@ func TestPlanConsumerKeysLimits_MonotonicLadder(t *testing.T) {
 // plan row never silently unlocks the primitive.
 func TestPlanOpenAPIDocLimits(t *testing.T) {
 	cases := []struct {
-		plan       Plan
-		wantPerDep int
+		plan        Plan
+		wantPerDep  int
 		wantPerAcct int
-		wantBytes  int
+		wantBytes   int
 	}{
 		{PlanFree, 0, 0, 0},
 		{PlanHobby, 1, 100, 131072},

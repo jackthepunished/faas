@@ -99,12 +99,12 @@ func openAPIDocHarness(t *testing.T, plan api.Plan) (e testEnv, slug, depID stri
 	e = setup(t, plan)
 	slug = fmt.Sprintf("openapi-doc-%s", strings.ReplaceAll(t.Name(), "/", "-"))
 	app, err := e.store.CreateApp(context.Background(), state.App{
-		AccountID:     acctIDFor(e),
-		Slug:          slug,
-		Type:          state.AppTypeApp,
-		RAMMB:         256,
+		AccountID:      acctIDFor(e),
+		Slug:           slug,
+		Type:           state.AppTypeApp,
+		RAMMB:          256,
 		MaxConcurrency: 1,
-		IdleTimeoutS:  60,
+		IdleTimeoutS:   60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)

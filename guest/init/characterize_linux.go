@@ -57,11 +57,15 @@ const (
 	// Matches pkg/fcvm/vmm.go::VsockCharacterizationMsgResumeRdy. The
 	// host's accept loop filters by msg_type prefix.
 	VsockCharacterizationMsgType uint32 = 3
-	// VsockCharacterizationMaxBody caps the JSON body at 32 KiB.
-	// The typical report is <2 KiB; 32 KiB accommodates a long
+	// VsockCharacterizationMaxBody caps the JSON body at 128 KiB.
+	// The typical report is <2 KiB; 128 KiB accommodates a long
 	// log_tail (the customer-facing deploy-row surface) plus
-	// listening_addrs for a polyglot app.
-	VsockCharacterizationMaxBody = 32 * 1024
+	// listening_addrs for a polyglot app, plus the captured OpenAPI
+	// doc body (issue #975 item #1 / ADR-122 — most real-world docs
+	// are 8-30 KiB, occasional large apps reach 60-100 KiB). Must
+	// mirror pkg/fcvm/vmm.go::VsockCharacterizationMaxBody — drift
+	// triggers guest/init/characterize_linux_test.go::TestWireConstants_MatchHost.
+	VsockCharacterizationMaxBody = 128 * 1024
 	// VsockCharacterizationRetries is the number of attempts to ship
 	// the report — first attempt + 3 retries with the backoff below.
 	VsockCharacterizationRetries = 3

@@ -44,11 +44,11 @@ func openAPIDocFixture(t *testing.T) (m *MemStore, ctx context.Context, accountI
 		t.Fatal(err)
 	}
 	app, err := m.CreateApp(ctx, App{
-		AccountID:    acct.ID,
-		Slug:         "openapi-" + strconv.Itoa(int(time.Now().UnixNano())),
-		RAMMB:        256,
+		AccountID:      acct.ID,
+		Slug:           "openapi-" + strconv.Itoa(int(time.Now().UnixNano())),
+		RAMMB:          256,
 		MaxConcurrency: 1,
-		IdleTimeoutS: 60,
+		IdleTimeoutS:   60,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,11 +200,11 @@ func TestMemStore_OpenAPIDoc_CountByAccount(t *testing.T) {
 	}
 	acct2 := acct2Acct.ID
 	app2App, err := m.CreateApp(ctx, App{
-		AccountID:    acct2,
-		Slug:         "openapi-acct2-" + strconv.Itoa(int(time.Now().UnixNano())),
-		RAMMB:        256,
+		AccountID:      acct2,
+		Slug:           "openapi-acct2-" + strconv.Itoa(int(time.Now().UnixNano())),
+		RAMMB:          256,
 		MaxConcurrency: 1,
-		IdleTimeoutS: 60,
+		IdleTimeoutS:   60,
 	})
 	if err != nil {
 		t.Fatal(err)

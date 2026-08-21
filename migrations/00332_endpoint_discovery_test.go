@@ -62,7 +62,7 @@ var endpointDiscoveryExpectedConstraints = []string{
 	"deployment_openapi_docs_byte_size_chk",
 	"deployment_openapi_docs_source_vocab_chk",
 	"deployment_openapi_docs_sha256_len_chk",
-	"deployment_openapi_docs_captured_after_created_chk",
+	"deployment_openapi_docs_captured_before_updated_chk",
 }
 
 // endpointDiscoveryExpectedIndexes pins the indexes the apid
