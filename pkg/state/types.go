@@ -1368,7 +1368,7 @@ type Deployment struct {
 
 // OpenAPISnapshot is the projected-customer-OpenAPI snapshot
 // captured at a deployment's status='live' transition (ADR-121,
-// migration 00353). One row per deployment; the PR-C gate
+// migration 00357). One row per deployment; the PR-C gate
 // compares the pending deployment's snapshot against the
 // current live deployment's snapshot at the same scope and
 // rejects prod-scope promotions that emit a SeverityError

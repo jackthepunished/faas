@@ -17,7 +17,7 @@ import (
 const SnapshotSchemaVersion = 1
 
 // MarshalSnapshot serializes a [Spec] to the canonical JSON form
-// persisted by the API contract diff feature (migration 00353).
+// persisted by the API contract diff feature (migration 00357).
 // The canonical form is:
 //
 //   - A two-field envelope: {"schema_version": 1, "spec": <Spec>}.
