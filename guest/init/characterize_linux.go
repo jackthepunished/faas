@@ -442,7 +442,9 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) (string, []byte, bool
 	for collected < len(probes) {
 		select {
 		case <-probeCtx.Done():
-			return classHTTP, openAPIDoc, openAPIDocTruncated
+			// Deadline: return whatever openapi_doc we got, no
+			// class hint (the engine re-derives from runtime shape).
+			return "", openAPIDoc, openAPIDocTruncated
 		case r := <-resCh:
 			collected++
 			if r.Class != "" {
@@ -465,7 +467,12 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) (string, []byte, bool
 			}
 		}
 	}
-	return classHTTP, openAPIDoc, openAPIDocTruncated
+	// All probes ran without a class hint. Surface the captured
+	// openapi_doc (if any) but DO NOT default to classHTTP — the
+	// engine re-derives from runtime shape (workload class hint is
+	// a guest best-guess, not authoritative). ADR-051 §"Class hint
+	// fallback": "no probe matched" is itself a signal.
+	return "", openAPIDoc, openAPIDocTruncated
 }
 
 // probeResult is the inner return shape of every probe.
@@ -618,28 +625,60 @@ func isOpenAPIContentType(ct string) bool {
 }
 
 // looksLikeOpenAPIDoc is the cheap shape sniff. The body must
-// contain a top-level `openapi` ("3.0"/"3.1") or `swagger` key.
-// We do a linear scan rather than a full JSON parse — the cap
-// is 128 KiB and the keys are at the head of the doc.
+// contain a top-level `openapi` ("3.0"/"3.1") or `swagger` key —
+// NOT a key nested inside a different root object
+// (`{"data":{"openapi":...}}` is rejected).
+//
+// We do a linear scan of the first 4 KiB rather than a full JSON
+// parse — the cap is 128 KiB and the keys are at the head of the
+// doc. Brace depth tracking separates top-level keys from inner
+// ones: a "openapi"/"swagger" string is matched only at depth == 1
+// (inside the root object but not inside a nested `{...}`).
 func looksLikeOpenAPIDoc(body []byte) bool {
 	// Trim leading whitespace.
-	for i, b := range body {
-		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
-			continue
+	start := 0
+	for start < len(body) {
+		c := body[start]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			break
 		}
-		// Must start with `{` (top-level object).
-		if b != '{' {
-			return false
+		start++
+	}
+	if start >= len(body) || body[start] != '{' {
+		return false
+	}
+	// Scan the first 4 KiB at depth-tracked. depth==1 means inside
+	// the root object; depth>=2 means inside a nested object.
+	head := body[start:]
+	if len(head) > 4096 {
+		head = head[:4096]
+	}
+	depth := 0
+	for j := 0; j < len(head); j++ {
+		switch head[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+			if depth == 0 {
+				// End of root object reached. The rest is
+				// trailing whitespace — nothing more to scan.
+				return false
+			}
+		case '"':
+			// String literal at depth==1 is a top-level key.
+			// Match "openapi" or "swagger" exactly (the JSON
+			// spec requires ASCII letters after the quote).
+			if depth == 1 {
+				rest := head[j:]
+				if bytes.HasPrefix(rest, []byte(`"openapi"`)) ||
+					bytes.HasPrefix(rest, []byte(`"swagger"`)) {
+					return true
+				}
+			}
 		}
-		// Look for "openapi" or "swagger" within the first 4 KiB.
-		// We bound the search to avoid scanning a 128 KiB body
-		// for a key that should be at the head.
-		head := body[i:]
-		if len(head) > 4096 {
-			head = head[:4096]
-		}
-		return bytes.Contains(head, []byte(`"openapi"`)) ||
-			bytes.Contains(head, []byte(`"swagger"`))
 	}
 	return false
 }

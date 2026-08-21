@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -249,8 +250,8 @@ func TestProbeHTTP_BodyCaptured_200OK_8KiB(t *testing.T) {
 	if got.Class != classHTTP {
 		t.Errorf("Class: got %q, want %q", got.Class, classHTTP)
 	}
-	if !got.OpenAPIDocTruncated {
-		t.Errorf("OpenAPIDocTruncated: got false, want false (8 KiB < 128 KiB cap)")
+	if got.OpenAPIDocTruncated {
+		t.Errorf("OpenAPIDocTruncated: got true, want false (8 KiB < 128 KiB cap; should not truncate)")
 	}
 	if string(got.OpenAPIDoc) != string(doc) {
 		t.Errorf("OpenAPIDoc body mismatch: got %d bytes, want %d bytes", len(got.OpenAPIDoc), len(doc))
@@ -416,7 +417,7 @@ func TestRunL7Probes_OpenAPIDocPassthrough(t *testing.T) {
 	// The probe dereferences 127.0.0.1; we passed a port the
 	// httptest server is bound to, so this matches.
 	start := time.Now()
-	gotClass, gotDoc, gotTrunc := runL7Probes(nil, RunArgs{}, port)
+	gotClass, gotDoc, gotTrunc := runL7Probes(context.Background(), RunArgs{}, port)
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("runL7Probes took %v, expected < 5s", d)
 	}
@@ -446,7 +447,7 @@ func TestRunL7Probes_NoHTTPListen_NoCrash(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	gotClass, gotDoc, gotTrunc := runL7Probes(nil, RunArgs{}, port)
+	gotClass, gotDoc, gotTrunc := runL7Probes(context.Background(), RunArgs{}, port)
 	if gotClass != "" || gotDoc != nil || gotTrunc {
 		t.Errorf("runL7Probes on closed port: got (%q, %d bytes, %v), want (\"\", nil, false)",
 			gotClass, len(gotDoc), gotTrunc)
