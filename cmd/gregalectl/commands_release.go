@@ -110,7 +110,9 @@ Flags (bundle):
 Flags (install):
   --git-sha SHA         40-char lowercase hex git SHA to install (required).
   --releases-root PATH  Releases root (default: /opt/faas/releases).
-  --node NAME           compute_nodes.name to stamp (default: hostname).
+  --node NAME           compute_nodes.name to stamp (default:
+                        FAAS_NODE_NAME, then hostname; compute-only
+                        installs use NAME.faas).
 
 Exit codes:
   0  success
@@ -502,12 +504,27 @@ func cmdReleaseInstall(args []string) int {
 	}
 	node := *nodeName
 	if node == "" {
-		var herr error
-		node, herr = os.Hostname()
-		if herr != nil {
-			node = "unknown"
+		// The daemon identity is deployment-owned and may differ from
+		// the cloud-provider instance hostname (for example,
+		// faas-compute-node-1 runs as fsn-2). Prefer the same env
+		// contract consumed by vmmd/schedd before falling back to the
+		// kernel hostname.
+		node = strings.TrimSpace(os.Getenv("FAAS_NODE_NAME"))
+		if node == "" {
+			var herr error
+			node, herr = os.Hostname()
+			if herr != nil {
+				node = "unknown"
+			}
 		}
 	}
+	// vmmd self-registration uses the TLS identity namespace and stores
+	// compute-only nodes as <host>.faas (cmd/vmmd/register.go). Keep the
+	// release-install writer on that same canonical key so a split-box
+	// install updates the vmmd row instead of creating a short-name twin.
+	// Control-plane rows are not rewritten: their names are operator-owned
+	// and may describe a non-compute host identity.
+	node = canonicalComputeNodeName(node, roleTemplating.Role(*roleFlag))
 	// ADR-112: after the symlink flip (the load-bearing step),
 	// apply role templating. The drop-ins + daemon-reload are
 	// what materially makes FAAS_BOX_ROLE take effect on the box.
@@ -646,6 +663,16 @@ func cmdReleaseInstall(args []string) int {
 			*gitSHA, first, node, cnID)
 	}
 	return 0
+}
+
+// canonicalComputeNodeName returns the database identity used by vmmd for a
+// compute-only box. It is intentionally narrow: control-plane names are
+// operator-owned and must not be rewritten by release installation.
+func canonicalComputeNodeName(name string, role roleTemplating.Role) string {
+	if role != roleTemplating.RoleComputeOnly || strings.HasSuffix(name, ".faas") {
+		return name
+	}
+	return name + ".faas"
 }
 
 // sbomOnDiskPath returns the canonical SBoM-on-disk path for the
