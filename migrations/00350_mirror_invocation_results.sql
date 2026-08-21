@@ -87,7 +87,11 @@
 --     Postgres planner handles 7-day pruning fine via the DESC
 --     index.
 
-CREATE TABLE mirror_invocation_results (
+-- Replay-safe posture: every CREATE in this Up block uses IF NOT EXISTS
+-- (same pattern 00348_mirror_rules uses). TestNewMigrationsAreReplaySafe
+-- replays each new migration on a fresh DB; without IF NOT EXISTS the
+-- second run fails with 42P07 relation-already-exists.
+CREATE TABLE IF NOT EXISTS mirror_invocation_results (
     id                      uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     mirror_rule_id          uuid        NOT NULL REFERENCES mirror_rules(id) ON DELETE CASCADE,
     account_id              uuid        NOT NULL,
@@ -112,7 +116,7 @@ CREATE TABLE mirror_invocation_results (
     completed_at            timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX mirror_invocation_results_rule_time_idx
+CREATE INDEX IF NOT EXISTS mirror_invocation_results_rule_time_idx
     ON mirror_invocation_results (mirror_rule_id, completed_at DESC);
 
 -- +goose StatementEnd

@@ -67,7 +67,13 @@
 -- + redactor + comparison surface) lands in the same mega-PR
 -- cluster.
 
-CREATE TABLE mirror_rules (
+-- Replay-safe posture: every CREATE in this Up block uses IF NOT EXISTS
+-- (or DROP TRIGGER IF EXISTS before CREATE TRIGGER) so the migration
+-- is idempotent on re-apply. TestNewMigrationsAreReplaySafe walks
+-- each new migration in isolation on a fresh DB, replays it, and
+-- asserts no 42P07 / 42710 (relation-already-exists) errors — the
+-- same pattern 00304_cors_presets + 00329_consumer_keys use.
+CREATE TABLE IF NOT EXISTS mirror_rules (
     id                   uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id           uuid        NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     app_id               uuid        NOT NULL REFERENCES apps(id)     ON DELETE CASCADE,
@@ -84,11 +90,11 @@ CREATE TABLE mirror_rules (
     CHECK (array_length(redact_headers, 1) IS NULL OR array_length(redact_headers, 1) <= 32)
 );
 
-CREATE INDEX mirror_rules_app_idx
+CREATE INDEX IF NOT EXISTS mirror_rules_app_idx
     ON mirror_rules (app_id)
     WHERE enabled;
 
-CREATE INDEX mirror_rules_source_idx
+CREATE INDEX IF NOT EXISTS mirror_rules_source_idx
     ON mirror_rules (source_deployment_id)
     WHERE enabled;
 
@@ -100,6 +106,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS mirror_rules_set_updated_at_trg ON mirror_rules;
 CREATE TRIGGER mirror_rules_set_updated_at_trg
     BEFORE UPDATE ON mirror_rules
     FOR EACH ROW EXECUTE FUNCTION mirror_rules_set_updated_at();
