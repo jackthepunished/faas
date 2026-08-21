@@ -60,6 +60,12 @@ const (
 	subReleaseBundle  = "bundle"
 	subReleaseInstall = "install"
 	subReleaseKGV     = "kgv"
+
+	// Canonical release asset names. These are the names attached to a
+	// GitHub Release and retained under each installed release directory.
+	releaseTarballName = "release.tar.gz"
+	releaseSigName     = "release.cosign.bundle"
+	releaseSBOMName    = "release.sbom.json"
 )
 
 // cmdReleaseDispatch is the parent dispatcher.
@@ -678,16 +684,28 @@ func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
 // flag's complement is --tarball-path pointing at a pre-staged
 // triple on the operator's media.
 func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
+	return installViaTarballWithVerifier(
+		releasesRoot,
+		gitSHA,
+		tarballPath,
+		releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC()),
+	)
+}
+
+// installViaTarballWithVerifier is split from installViaTarball so the
+// complete extraction + retention path can be tested without weakening the
+// production default, which always uses the strict GitHub OIDC verifier.
+func installViaTarballWithVerifier(releasesRoot, gitSHA, tarballPath string, verifier releaseinstall.CosignVerifier) error {
 	// 1. Read the on-disk triple.
 	tbBody, err := os.ReadFile(tarballPath)
 	if err != nil {
 		return fmt.Errorf("read tarball: %w", err)
 	}
-	sigBody, err := os.ReadFile(tarballPath + ".cosign.bundle")
+	sigBody, err := readCanonicalReleaseAsset(tarballPath, releaseSigName)
 	if err != nil {
 		return fmt.Errorf("read cosign bundle: %w", err)
 	}
-	sbomBody, err := os.ReadFile(tarballPath + ".sbom.json")
+	sbomBody, err := readCanonicalReleaseAsset(tarballPath, releaseSBOMName)
 	if err != nil {
 		return fmt.Errorf("read sbom: %w", err)
 	}
@@ -727,7 +745,6 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	// from PR-A commit 2 (and the line item closing issue #597).
 	// On a successful verify the cert identity is stamped onto
 	// tb.Manifest.Signature for audit trails.
-	verifier := releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC())
 	if _, err := tb.Verify(context.Background(), verifier); err != nil {
 		return fmt.Errorf("tarball verify: %w", err)
 	}
@@ -750,10 +767,19 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	if err := releaseinstall.Write(releasesRoot, m); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
-	if err := os.WriteFile(
-		releaseinstall.BundleRoot(releasesRoot, gitSHA)+"/release.sbom.json",
-		sbomBody, 0o644); err != nil {
-		return fmt.Errorf("write sbom: %w", err)
+	// Retain the exact verified release triple with the extracted
+	// release. Apart from making the install self-describing, this is
+	// what lets `gregalectl doctor --deep` repeat the cosign + SBoM
+	// verification without relying on an operator's staging directory.
+	assets := map[string][]byte{
+		releaseTarballName: tbBody,
+		releaseSigName:     sigBody,
+		releaseSBOMName:    sbomBody,
+	}
+	for name, body := range assets {
+		if err := os.WriteFile(filepath.Join(releaseinstall.BundleRoot(releasesRoot, gitSHA), name), body, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
+		}
 	}
 
 	// 6. AtomicFlip. The flip is the load-bearing boundary; all
@@ -762,6 +788,30 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 		return fmt.Errorf("flip symlink: %w", err)
 	}
 	return nil
+}
+
+// readCanonicalReleaseAsset reads an asset staged next to release.tar.gz,
+// which is the layout emitted by the release workflow. The appended
+// sidecar spelling is accepted as a compatibility path for older air-gap
+// staging scripts that used release.tar.gz.cosign.bundle and
+// release.tar.gz.sbom.json. The canonical sibling name is preferred.
+func readCanonicalReleaseAsset(tarballPath, name string) ([]byte, error) {
+	candidates := []string{
+		filepath.Join(filepath.Dir(tarballPath), name),
+		tarballPath + "." + strings.TrimPrefix(name, "release."),
+	}
+	var lastErr error
+	for _, path := range candidates {
+		body, err := os.ReadFile(path)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+	}
+	return nil, fmt.Errorf("%s (tried %s): %w", name, strings.Join(candidates, ", "), lastErr)
 }
 
 // manifestHashMap converts manifest values from "sha256:<hex>" to the

@@ -202,10 +202,20 @@ jobs:
       - name: Build canonical daemon tarball and SPDX SBOM
         env:
           GIT_SHA: ${{ github.sha }}
-          MANIFEST_HASH: sha256:${{ hashFiles('deploy/manifest/examples/splitbox.example.yaml') }}
+          # This is a repository variable, not the illustrative manifest
+          # in deploy/manifest/examples. Publishing a signed bundle tied to
+          # the example would make the artifact look production-ready while
+          # guaranteeing manifest drift on every real fleet.
+          MANIFEST_HASH: ${{ vars.GREGALE_RELEASE_MANIFEST_HASH }}
           OUT_DIR: ${{ runner.temp }}/gregale-release
           SYFT_BIN: syft
-        run: scripts/build-canonical-tarball.sh
+        run: |
+          set -euo pipefail
+          if [[ ! "${MANIFEST_HASH:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "GREGALE_RELEASE_MANIFEST_HASH must be configured as sha256:<64 lowercase hex> before tagging a release" >&2
+            exit 2
+          fi
+          scripts/build-canonical-tarball.sh
 
       - name: Sign canonical tarball with GitHub OIDC
         env:

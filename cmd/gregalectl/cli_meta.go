@@ -294,11 +294,12 @@ var cliCommands = []cliCommand{
 		// cert_fingerprint}.
 		Name:    dispatchSecrets,
 		DocSlug: "secrets",
-		Short:   "Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)",
+		Short:   "Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)",
 		Subcommands: []cliSub{
 			{Name: subInit, Short: "Initialise the 5 on-disk secrets (host.age, session.key, box-age-key, rclone.conf, archive-creds.json)"},
 			{Name: subRotate, Short: "Rotate host.age (delegates to host-age rotate)"},
 			{Name: subStatus, Short: "Show mode/mtime/sha256 for the 5 secret files"},
+			{Name: subSecretsStamp, Short: "Stamp the existing host.age fingerprint without rotating secrets"},
 		},
 		Flags: []cliFlag{
 			{Name: "dir", Short: "root secrets directory (default /etc/faas/secrets)"},

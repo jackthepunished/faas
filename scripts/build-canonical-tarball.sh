@@ -25,7 +25,7 @@ fi
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/gregale-release.XXXXXX")
 trap 'rm -rf "$work_root"' EXIT
 mkdir -p "$work_root/$git_sha/bin" "$out_dir"
-rm -f "$out_dir/release.tar.gz" "$out_dir/release-manifest.json" "$out_dir/release.sbom.json" "$out_dir/SHA256SUMS"
+rm -f "$out_dir/release.tar.gz" "$out_dir/release-manifest.json" "$out_dir/release.cosign.bundle" "$out_dir/release.sbom.json" "$out_dir/SHA256SUMS"
 
 make -C "$repo_root" \
   BINDIR="$work_root/$git_sha/bin" \

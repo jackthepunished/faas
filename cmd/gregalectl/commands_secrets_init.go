@@ -11,7 +11,7 @@
 // persists compute_nodes.host_certificate + cert_fingerprint via
 // the releaseinstall.Store.
 //
-// The namespace `gregalectl secrets` has three leaves today:
+// The namespace `gregalectl secrets` has four leaves today:
 //
 //   - init   — write host.age/box-age-key/session.key/rclone.conf/
 //              archive-creds as a single batch. Refuses overwrite
@@ -26,6 +26,10 @@
 //   - status — print mode/mtime/sha256 for each of the five files.
 //              Missing files print an explicit "missing" line and
 //              the leaf returns 0 (operator should see all paths).
+//   - stamp — read the existing host.age without changing it and persist
+//             compute_nodes.host_certificate + cert_fingerprint. This is
+//             the repair path for a node that was bootstrapped before the
+//             database row existed; it never rotates or overwrites secrets.
 //
 // All five canonical paths are hard-coded — they match
 // pkg/secretbox/hostkey.go, cmd/gregalectl/commands_backup.go, and
@@ -90,11 +94,11 @@ var (
 // init/rotate/status each fan to a leaf.
 func cmdSecretsDispatch(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregalectl secrets <init|rotate|status> [flags]", "secrets")
+		PrintUsage(os.Stderr, "usage: gregalectl secrets <init|rotate|status|stamp> [flags]", "secrets")
 		return 0
 	}
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl secrets <init|rotate|status> [flags]", "secrets")
+		PrintUsage(os.Stderr, "usage: gregalectl secrets <init|rotate|status|stamp> [flags]", "secrets")
 		return 1
 	}
 	switch args[0] {
@@ -104,11 +108,15 @@ func cmdSecretsDispatch(args []string) int {
 		return cmdSecretsRotate(args[1:])
 	case subStatus:
 		return cmdSecretsStatus(args[1:])
+	case subSecretsStamp:
+		return cmdSecretsStamp(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "gregalectl secrets: unknown subcommand %q (known: init, rotate, status)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl secrets: unknown subcommand %q (known: init, rotate, status, stamp)\n", args[0])
 		return 1
 	}
 }
+
+const subSecretsStamp = "stamp"
 
 // secretsInitFlags is the shared flag struct for the init leaf.
 // host is the PostgreSQL compute_nodes.name lookup key.
@@ -235,7 +243,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	}
 	dsn := f.dsn
 	if dsn == "" {
-		dsn = os.Getenv("FAAS_PG_DSN")
+		dsn = resolveSecretsDSN()
 	}
 	if dsn != "" {
 		if err := writeComputeNodeCert(dsn, host, hostCertPEM, hostCertFP, stdout); err != nil {
@@ -246,6 +254,90 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 		}
 	}
 	return nil
+}
+
+type secretsStampFlags struct {
+	dir  string
+	host string
+	dsn  string
+}
+
+// cmdSecretsStamp is the non-destructive repair path for an already
+// provisioned host. It deliberately does not call secretsInit: that leaf
+// owns key generation and correctly refuses to overwrite existing files.
+func cmdSecretsStamp(args []string) int {
+	fs := flag.NewFlagSet("secrets stamp", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	dir := fs.String("dir", defaultSecretsDir, "root secrets directory (default /etc/faas/secrets)")
+	host := fs.String("host", "", "compute_nodes.name to stamp (default: hostname)")
+	dsn := fs.String("pg-dsn", "", "PostgreSQL DSN (default: $FAAS_PG_DSN, $DATABASE_URL, or deploy env file)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: gregalectl secrets stamp [flags]", "secrets")
+		return 1
+	}
+	if err := stampExistingHostCertificate(&secretsStampFlags{dir: *dir, host: *host, dsn: *dsn}); err != nil {
+		return printErr("stamp failed", err)
+	}
+	hostName := *host
+	if hostName == "" {
+		hostName, _ = os.Hostname()
+	}
+	PrintOK(osStdout, "Stamped existing host.age fingerprint for compute node %s (no secret files changed)\n", hostName)
+	return 0
+}
+
+// stampExistingHostCertificate loads the existing private host.age identity,
+// derives its stable public recipient fingerprint, and writes only the two
+// database audit columns. The host.age bytes are never rewritten.
+func stampExistingHostCertificate(f *secretsStampFlags) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("secrets stamp: requires root to read host.age (run with sudo or as the root user)")
+	}
+	hostAgePath := filepath.Join(f.dir, "host.age")
+	hostAgeID, err := secretbox.LoadHostKey(hostAgePath)
+	if err != nil {
+		return fmt.Errorf("load existing host.age: %w", err)
+	}
+	hostCert := []byte(secretbox.RecipientString(hostAgeID))
+	fingerprint := sha256Hex(hostCert)
+	host := f.host
+	if host == "" {
+		host, err = os.Hostname()
+		if err != nil {
+			return fmt.Errorf("read hostname: %w", err)
+		}
+	}
+	dsn := f.dsn
+	if dsn == "" {
+		dsn = resolveSecretsDSN()
+	}
+	if dsn == "" {
+		return fmt.Errorf("database DSN not set (use --pg-dsn, FAAS_PG_DSN, DATABASE_URL, or a deploy env file)")
+	}
+	if err := writeComputeNodeCert(dsn, host, hostCert, fingerprint, osStdout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveSecretsDSN follows the same precedence as release install. The
+// explicit flag is handled by each caller first; this helper only resolves
+// deployment-provided environment sources.
+func resolveSecretsDSN() string {
+	for _, key := range []string{"FAAS_PG_DSN", "DATABASE_URL"} {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	for _, path := range []string{"/etc/faas/compute-db.env", "/etc/faas/sealed.env"} {
+		if value, ok := readDatabaseEnvFile(path); ok {
+			return value
+		}
+	}
+	return ""
 }
 
 // chownRootPostgres sets the file group to postgres (best-effort —
