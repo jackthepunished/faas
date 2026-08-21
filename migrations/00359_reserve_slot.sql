@@ -1,8 +1,6 @@
 -- 00359_reserve_slot.sql — temporary concurrent-PR migration fence.
--- The real migration for this slot is being coordinated by other
--- open PRs (PR #1006 SAFE-RELEASES deployment_audit owns 00359 as
--- a reservation; real migrations at 00360-00361). Remove this
--- no-op when that migration lands, per ADR-041.
+-- (No sibling-PR real migration at this slot at present; held in
+-- reserve for merge-order coordination per ADR-041.)
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;

@@ -627,7 +627,7 @@ happens Go-side in `pgstore.AppendDeploymentStage` and
 `memstore.AppendDeploymentStage` at the existing read-modify-
 write site (no SQL CHECK on jsonb_array_length — the nested
 path is fragile across jsonb mutation shapes). Doc-only
-migration at slot 00362 documents the cap; schema unchanged.
+migration at slot 00367 documents the cap; schema unchanged.
 
 Trim is irreversible: rows past the cap are gone. No
 archival. A future PR can change the cap by bumping the const.
@@ -754,22 +754,22 @@ precedent); `dep.AppID != app.ID` guard unchanged.
     ADR amendment (doc-only). The metric test pins the
     pre-instantiation surface.
   - Commit 2: C1 (retention). Doc-only migration at slot
-    00362; trim happens Go-side at the existing read-modify-
+    00367; trim happens Go-side at the existing read-modify-
     write site. pg + memstore tests pin the FIFO trim.
   - Commit 3: C2 (retry endpoint + CLI). One new apid route +
     one new SDK method + one new CLI subcommand. Migration
     slot precheck via the cross-PR fence pattern (slot 00330
-    reservation; main has likely moved past 00362 per recent
-    slot-dance chains — slot renumbered seven times
+    reservation; main has likely moved past 00367 per recent
+    slot-dance chains — slot renumbered eight times
     (00330 → 00346 → 00348 → 00352 → 00353 → 00356 → 00358
-    → 00362) during rebases as adjacent PRs landed real
-    migrations at 00346 (issue #977 annotation, PR #984),
-    00352-00356 (PR #1017 alert presets catalog — 5 real
-    migrations), 00357 (PR #990 ADR-117 PR-C
-    app_secret_value_hash), 00358 (PR #1005 api-contract-diff
-    deployment_openapi_snapshots), 00360-00361 (PR #1006
-    SAFE-RELEASES deployment_audit + backfill), and 00362 is
-    the next free slot above all open PRs.
+    → 00362 → 00367) during rebases as adjacent PRs landed
+    real migrations at 00346 (issue #977 annotation, PR #984),
+    00357 (PR #990 ADR-117 PR-C app_secret_value_hash), 00358
+    (PR #1005 api-contract-diff deployment_openapi_snapshots),
+    00360-00361 (PR #1006 SAFE-RELEASES deployment_audit +
+    backfill), 00362-00366 (PR #1017 alert presets catalog —
+    5 real migrations, second rebase), and 00367 is the next
+    free slot above all open PRs.
     00347 (PR #1005 api-contract-diff).
   - Commit 4: C5 (dashboard SSE) + per-row retry button.
     HTMX swap-in against the existing logs SSE channel.
@@ -778,7 +778,7 @@ precedent); `dep.AppID != app.ID` guard unchanged.
 
 ~1000-1300 LOC across ~25 files (4 new files: metric test,
 retry handler, CLI retry, stages-partial handler; +21
-touched files). 1 new migration (slot 00362, doc-only).
+touched files). 1 new migration (slot 00367, doc-only).
 ~10-15 new `CodeStage*` constants + matching `pkg/whycopy`
 rows. 1 new Prometheus histogram + label set. 1 new SDK
 method (`RetryDeploymentFromStage`). 1 new apid route
