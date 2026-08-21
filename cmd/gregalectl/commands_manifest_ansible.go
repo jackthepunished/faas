@@ -22,8 +22,9 @@ type manifestAnsibleFile struct {
 }
 
 type manifestInternalHost struct {
-	Address string
-	Name    string
+	Address       string
+	InventoryHost string
+	Names         []string
 }
 
 const manifestGatewayEgressPort = 9092
@@ -172,7 +173,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -224,22 +225,22 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 		if err != nil {
 			return nil, fmt.Errorf("host %s: internal service address: %w", host.Name, err)
 		}
-		// Literal overlay IPs need an explicit hosts entry because the
-		// private PKI identity is not public Cloudflare DNS. A hostname
-		// endpoint is left to the operator's private DNS contract, which
-		// must resolve both the fleet name and this service identity.
+		entry := manifestInternalHost{Names: []string{serviceName}}
 		if _, err := netip.ParseAddr(address); err == nil {
-			internalHosts = append(internalHosts, manifestInternalHost{
-				Address: address,
-				Name:    serviceName,
-			})
-			if host.Role == roleComputeOnly {
-				internalHosts = append(internalHosts, manifestInternalHost{
-					Address: address,
-					Name:    "egress.faas",
-				})
-			}
+			// Literal endpoint manifests retain their explicit address for
+			// backwards compatibility with local fixtures.
+			entry.Address = address
+		} else {
+			// Hostname manifests are resolved from inventory host facts by
+			// the Ansible adapter. This keeps IPs out of generated config
+			// and avoids depending on a public DNS provider.
+			entry.InventoryHost = host.Name
+			entry.Names = append([]string{address}, entry.Names...)
 		}
+		if host.Role == roleComputeOnly {
+			entry.Names = append(entry.Names, "egress.faas")
+		}
+		internalHosts = append(internalHosts, entry)
 	}
 	return internalHosts, nil
 }
@@ -255,7 +256,7 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
@@ -276,10 +277,20 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayI
 	} else {
 		b.WriteString("overlay_cidrs: []\n")
 	}
+	if privateDNSMode != "" {
+		fmt.Fprintf(&b, "faas_private_dns_mode: %q\n", privateDNSMode)
+		fmt.Fprintf(&b, "faas_private_dns_zone: %q\n", privateDNSZone)
+	}
 	if len(internalHosts) > 0 {
-		b.WriteString("faas_internal_hosts:\n")
+		b.WriteString("faas_private_hosts:\n")
 		for _, internalHost := range internalHosts {
-			fmt.Fprintf(&b, "  - address: %q\n    names: [%q]\n", internalHost.Address, internalHost.Name)
+			b.WriteString("  - ")
+			if internalHost.Address != "" {
+				fmt.Fprintf(&b, "address: %q\n", internalHost.Address)
+			} else {
+				fmt.Fprintf(&b, "inventory_host: %q\n", internalHost.InventoryHost)
+			}
+			fmt.Fprintf(&b, "    names: [%s]\n", quotedYAMLList(internalHost.Names))
 		}
 	}
 	if host.Role == roleComputeOnly {

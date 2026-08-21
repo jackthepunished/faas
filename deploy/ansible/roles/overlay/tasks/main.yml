@@ -33,24 +33,47 @@
     msg: "Using the provider-native network on {{ faas_overlay_iface }}; no overlay daemon will be installed."
   when: faas_overlay_provider == "static"
 
-# The internal PKI is role-based (schedd.faas / vmmd.faas), while the
-# manifest carries the actual overlay address. Keep those concerns
-# separate: the generated inventory supplies this list and every box
-# receives the same deterministic aliases. Public Cloudflare DNS is not
-# involved in this private mTLS path.
-- name: overlay — install manifest private service aliases
+# The private transport names are role-based (schedd.faas / vmmd.faas),
+# while the manifest carries stable fleet hostnames. The generated
+# inventory supplies this list and every box receives the same deterministic
+# aliases. For hostname endpoints, the address is resolved from the
+# provider's gathered host facts; no provider IP is copied into daemon
+# configuration. Public Cloudflare DNS is never used for this private path.
+- name: overlay — install manifest private endpoint aliases
   ansible.builtin.blockinfile:
     path: /etc/hosts
     create: true
     owner: root
     group: root
     mode: "0644"
-    marker: "# {mark} FAAS MANIFEST PRIVATE SERVICES"
+    marker: "# {mark} FAAS MANIFEST PRIVATE ENDPOINTS"
     block: |
-      {% for entry in faas_internal_hosts | default([]) %}
+      {% for entry in faas_private_hosts | default([]) %}
+      {% if entry.address | default('') | length > 0 %}
       {{ entry.address }} {{ entry.names | join(' ') }}
+      {% else %}
+      {{ hostvars[entry.inventory_host].faas_private_dns_address | default(hostvars[entry.inventory_host].faas_private_address | default(hostvars[entry.inventory_host].ansible_facts.default_ipv4.address)) }} {{ entry.names | join(' ') }}
+      {% endif %}
       {% endfor %}
-  when: (faas_internal_hosts | default([]) | length) > 0
+  when:
+    - (faas_private_hosts | default([]) | length) > 0
+    - (faas_private_dns_mode | default('') in ['', 'managed_hosts'])
+  tags: [private-endpoints]
+
+- name: overlay — verify manifest private endpoint resolution
+  ansible.builtin.command:
+    argv:
+      - getent
+      - ahostsv4
+      - "{{ item.1 }}"
+  loop: "{{ query('subelements', faas_private_hosts | default([]), 'names') }}"
+  loop_control:
+    label: "{{ item.1 }}"
+  changed_when: false
+  when:
+    - (faas_private_hosts | default([]) | length) > 0
+    - (faas_private_dns_mode | default('') in ['', 'managed_hosts'])
+  tags: [private-endpoints]
 
 # Cross-provider firewall rule: open the vmmd gRPC port on the
 # overlay interface only. Tailscale ACLs handle auth; this rule

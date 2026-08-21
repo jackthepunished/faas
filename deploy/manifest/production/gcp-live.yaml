@@ -81,6 +81,13 @@ dns:
   apps_domain: gregale.dev
   mode: cloudflare
 
+# Private transport names are managed from gathered host facts by the
+# provider-neutral Ansible adapter. GCP Cloud DNS may still provide a local
+# optimization, but it is not required and must not be the source of truth.
+private_dns:
+  mode: managed_hosts
+  zone: gregale.dev
+
 postgresql:
   # Credentials remain in host-local secret material, never in this file.
   dsn: postgres://faas@fsn-1.gregale.dev:5432/faas?sslmode=disable
