@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,7 +70,14 @@ type scanPlanRequest struct {
 	ProjectSlug string
 	ProdBranch  string
 	InstallID   int64
-	Only        map[string]bool
+	Only        map[string]bool // ADR-050: allowlist filter on scan
+	// Exclude is the ADR-124 inverse-allowlist. Slugs in Exclude
+	// are filtered out of filteredW *before* reconcile runs on the
+	// apply path so the operator choice cannot be overridden by a
+	// stale scan filter. Same case-insensitive name match rule as
+	// Only. intersect(Only, Exclude) is rejected pre-scan with
+	// code="exclude_only_overlap".
+	Exclude map[string]bool
 }
 
 // scanPlanResponse is the body returned by the scan service and
@@ -160,6 +168,10 @@ type workloadKey struct {
 type affectedPartition struct {
 	WillDeploy []api.PlanAffectedApp
 	Unaffected []api.PlanAffectedApp
+	// Skipped is the operator --exclude subset of scan workloads.
+	// Visible on the dashboard as "excluded by operator". Action
+	// is always "noop" — the apply path skips these entirely.
+	Skipped []api.PlanAffectedApp
 	// removedKey is the (RootDir, Name) set the apply path will
 	// SoftDeleteAppCascade. Populated from rec.Removed post-reconcile
 	// so the preview/apply gap stays small. Used in Stage 4 to
@@ -174,25 +186,34 @@ type affectedPartition struct {
 // consistently with pkg/reconcile.diff.workloadDiff so the wire and
 // the apply engine do not diverge.
 //
+// allScanWl is the unfiltered result.Workloads (post-`--only`, but
+// pre-`--exclude`) — Skipped needs every excluded workload even
+// when it would have been dropped by filteredW. exclude is the
+// case-insensitive set from scanPlanRequest.Exclude; an empty map
+// produces no Skipped rows.
+//
 // Action vocabulary (ADR-124):
 //
 //	"create" — scan workload, no existing app.
 //	"update" — scan workload, existing app matches (RootDir, Name).
-//	"noop"   — existing app, no scan workload. Will be left alone.
+//	"noop"   — either (a) existing app, no scan workload, OR (b)
+//	           operator --exclude hit (Skipped, surfaced separately).
 //	"remove" — populated post-reconcile from rec.Removed (apply path).
 func computeAffectedPartition(
 	filteredW []reposcan.Workload,
+	allScanWl []reposcan.Workload,
 	existingApps []state.App,
+	exclude map[string]bool,
 ) affectedPartition {
 	idx := make(map[workloadKey]state.App, len(existingApps))
 	for _, a := range existingApps {
 		idx[workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}] = a
 	}
+	// WillDeploy: filteredW (no excluded) → create or update. Order
+	// preserved so the i-alignment with respWorkloads stays intact.
 	will := make([]api.PlanAffectedApp, 0, len(filteredW))
-	scanKeys := make(map[workloadKey]struct{}, len(filteredW))
 	for _, w := range filteredW {
 		k := workloadKey{RootDir: w.RootDir, Name: w.Name}
-		scanKeys[k] = struct{}{}
 		row := api.PlanAffectedApp{Slug: w.Name, Action: "create"}
 		if a, ok := idx[k]; ok {
 			row.Action = "update"
@@ -202,6 +223,33 @@ func computeAffectedPartition(
 			}
 		}
 		will = append(will, row)
+	}
+	// Skipped: every scan workload (filteredW or dropped by --only)
+	// whose lowercased name is in exclude. Order preserved.
+	skip := make([]api.PlanAffectedApp, 0)
+	if len(exclude) > 0 {
+		for _, w := range allScanWl {
+			if !exclude[strings.ToLower(w.Name)] {
+				continue
+			}
+			k := workloadKey{RootDir: w.RootDir, Name: w.Name}
+			row := api.PlanAffectedApp{Slug: w.Name, Action: "noop"}
+			if a, ok := idx[k]; ok {
+				row.ID = a.ID
+				if a.RootDir != w.RootDir {
+					row.ExistingRootDir = a.RootDir
+				}
+			}
+			skip = append(skip, row)
+		}
+	}
+	// Unaffected: existing apps whose (RootDir, Name) is not in any
+	// scan workload. The "no scan workload" check is across allScanWl
+	// (post-`--only`) so an excluded update doesn't shift an app from
+	// Unaffected to Skipped — it stays in Skipped only.
+	scanKeys := make(map[workloadKey]struct{}, len(allScanWl))
+	for _, w := range allScanWl {
+		scanKeys[workloadKey{RootDir: w.RootDir, Name: w.Name}] = struct{}{}
 	}
 	unaff := make([]api.PlanAffectedApp, 0, len(existingApps))
 	for _, a := range existingApps {
@@ -219,6 +267,7 @@ func computeAffectedPartition(
 	return affectedPartition{
 		WillDeploy: will,
 		Unaffected: unaff,
+		Skipped:    skip,
 	}
 }
 
@@ -420,6 +469,25 @@ func (s *server) scanService(
 	if prob != nil {
 		return nil, state.Project{}, nil, nil, nil, nil, prob
 	}
+	// ADR-124: --only and --exclude are inverse filters and cannot
+	// share a slug. Reject the request pre-scan with a 409 and a
+	// stable code so the CLI / dashboard can branch on it without
+	// guessing. Sorted output keeps the message deterministic.
+	if len(req.Exclude) > 0 && len(req.Only) > 0 {
+		var clash []string
+		for slug := range req.Only {
+			if req.Exclude[slug] {
+				clash = append(clash, slug)
+			}
+		}
+		if len(clash) > 0 {
+			sort.Strings(clash)
+			return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
+				http.StatusConflict, "exclude_only_overlap",
+				"workload is in both --only and --exclude",
+				fmt.Sprintf("duplicate: %s", strings.Join(clash, ", ")))
+		}
+	}
 	// Cleanup the spooled upload. Best-effort: a failure here just
 	// means the original tarball lingers under FAAS_SCAN_SPOOL_ROOT
 	// until the next sweep.
@@ -484,17 +552,53 @@ func (s *server) scanService(
 		return nil, state.Project{}, nil, nil, nil, nil, newSecretScanRejectionProblem(secretFindings)
 	}
 
-	// Filter --only against workload name. Deterministic order
-	// preserved (reposcan already sorts).
+	// Filter --only and --exclude against workload name. Deterministic
+	// order preserved (reposcan already sorts). The Intersection
+	// check (--only ∩ --exclude = ∅) was already enforced pre-scan
+	// after parseScanMultipart returns; the unknown-slug validation
+	// runs here, post-scan, against the resolved scan workload set.
 	var (
 		filteredW  []reposcan.Workload
 		filteredMc []reposcan.Managed
 	)
 	for _, wl := range result.Workloads {
-		if len(req.Only) > 0 && !req.Only[strings.ToLower(wl.Name)] {
+		lname := strings.ToLower(wl.Name)
+		if len(req.Only) > 0 && !req.Only[lname] {
+			continue
+		}
+		// ADR-124: --exclude drops the workload from filteredW (and
+		// therefore from reconcile + builds). The visibility row
+		// still surfaces in resp.Skipped via computeAffectedPartition
+		// running over result.Workloads.
+		if len(req.Exclude) > 0 && req.Exclude[lname] {
 			continue
 		}
 		filteredW = append(filteredW, wl)
+	}
+	// Post-scan exclude-validity check: every entry in req.Exclude
+	// must correspond to a real scan workload. A typo would otherwise
+	// silently survive and confuse the operator about what was
+	// honoured. 400 exclude_unknown_slug codes the failure with the
+	// unknown slug in the message so the dashboard can render it
+	// inline.
+	if len(req.Exclude) > 0 {
+		scanNames := make(map[string]bool, len(result.Workloads))
+		for _, w := range result.Workloads {
+			scanNames[strings.ToLower(w.Name)] = true
+		}
+		var unknown []string
+		for slug := range req.Exclude {
+			if !scanNames[slug] {
+				unknown = append(unknown, slug)
+			}
+		}
+		if len(unknown) > 0 {
+			sort.Strings(unknown)
+			return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
+				http.StatusBadRequest, "exclude_unknown_slug",
+				"exclude slug is not a workload in this commit",
+				fmt.Sprintf("unknown: %s", strings.Join(unknown, ", ")))
+		}
 	}
 	// Managed services (compose image: db, etc.) are not subject to
 	// --only — the customer sees them in the plan either way so they
@@ -553,7 +657,7 @@ func (s *server) scanService(
 		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
 			fmt.Sprintf("list account apps: %v", listErr))
 	}
-	partition := computeAffectedPartition(filteredW, acctApps)
+	partition := computeAffectedPartition(filteredW, result.Workloads, acctApps, req.Exclude)
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
@@ -584,13 +688,15 @@ func (s *server) scanService(
 		LimitCrons:    limits.CronLimitPerAccount,
 		CanApply:      canApply,
 		NotAllowed:    notAllowed,
-		// ADR-124 partition projection. Skipped is empty here;
-		// populated in Stage 4 when --exclude filter runs. Removed
-		// is empty on the preview path (apply=false); the apply
-		// handler populates it from removedSlugs (the apps
-		// reconcile will SoftDeleteAppCascade).
-		WillDeploy: partition.WillDeploy,
-		Unaffected: partition.Unaffected,
+		// ADR-124 partition projection. Skipped is the operator --exclude
+	// subset; Unaffected is every account app not in the scan keys;
+	// WillDeploy keeps reposcan's order so the i-alignment with
+	// respWorkloads (one row per post-`--only`/post-`--exclude`
+	// workload) is preserved. Removed is empty on preview (apply=false);
+	// the apply path populates it from removedSlugs.
+	WillDeploy: partition.WillDeploy,
+	Unaffected: partition.Unaffected,
+	Skipped:    partition.Skipped,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
@@ -893,6 +999,7 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 	var (
 		sourcePath  string
 		onlySet     = map[string]bool{}
+		excludeSet  = map[string]bool{}
 		projectSlug string
 		prodBranch  = "main"
 		installID   int64
@@ -940,6 +1047,16 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 					onlySet[s] = true
 				}
 			}
+		case "exclude":
+			// ADR-124 inverse-allowlist. Same lowercased/trimmed
+			// shape as `only` so the wire contract is symmetric.
+			b, _ := io.ReadAll(io.LimitReader(part, 1024))
+			for _, s := range strings.Split(string(b), ",") {
+				s = strings.ToLower(strings.TrimSpace(s))
+				if s != "" {
+					excludeSet[s] = true
+				}
+			}
 		default:
 			_, _ = io.Copy(io.Discard, part)
 		}
@@ -980,6 +1097,7 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 		ProdBranch:   prodBranch,
 		InstallID:    installID,
 		Only:         onlySet,
+		Exclude:      excludeSet,
 	}, nil
 }
 
