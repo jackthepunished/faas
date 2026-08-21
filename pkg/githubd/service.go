@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -634,9 +635,9 @@ const previewDefaultTTL = 7 * 24 * time.Hour
 // previewHostnameForSlug derives the customer-facing preview URL
 // from the preview app slug. Shape:
 //
-//	pr-{N}-{parent_slug}  →  pr-{N}-{parent_slug}.apps.gregale.dev
+//	pr-{N}-{parent_slug}  →  pr-{N}-{parent_slug}.gregale.dev
 //
-// The wildcard DNS record *.apps.gregale.dev + the wildcard TLS
+// The wildcard DNS record *.gregale.dev + the wildcard TLS
 // cert already cover this hostname (deploy/terraform/wildcard_*);
 // PR-B wires the gateway-internal parser that peels the
 // pr-{N}- prefix back off the slug. Returns "" for empty slugs
@@ -645,7 +646,11 @@ func previewHostnameForSlug(slug string) string {
 	if slug == "" {
 		return ""
 	}
-	return slug + ".apps.gregale.dev"
+	domain := strings.Trim(strings.TrimSpace(os.Getenv("FAAS_APPS_DOMAIN")), ".")
+	if domain == "" {
+		domain = "gregale.dev"
+	}
+	return slug + "." + domain
 }
 
 // previewSlug derives the slug githubd uses for a preview app

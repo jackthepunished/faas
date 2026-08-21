@@ -130,22 +130,18 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 				return nil, fmt.Errorf("host %s postgres address: %w", fleetHost.Name, parseErr)
 			}
 			controlPlaneAPIDLoopback = "http://" + net.JoinHostPort(address, "8081")
-			if _, err := netip.ParseAddr(address); err == nil {
-				postgresListenAddress = address
-				controlPlaneAllowedCIDRs = append(controlPlaneAllowedCIDRs, address+"/32")
-			}
+			postgresListenAddress = address
+			controlPlaneAllowedCIDRs = appendHostCIDR(controlPlaneAllowedCIDRs, address, m.Overlay.CIDR)
 		}
 		if fleetHost.Role == roleComputeOnly {
 			address, _, parseErr := manifest.ParseHostPort(fleetHost.Address)
 			if parseErr != nil {
 				return nil, fmt.Errorf("host %s postgres allow address: %w", fleetHost.Name, parseErr)
 			}
-			if _, err := netip.ParseAddr(address); err == nil {
-				postgresAllowedCIDRs = append(postgresAllowedCIDRs, address+"/32")
-				computeAllowedCIDRs = append(computeAllowedCIDRs, address+"/32")
-				if gatewayInternalTarget == "" {
-					gatewayInternalTarget = "tcp://" + net.JoinHostPort(address, "8080")
-				}
+			postgresAllowedCIDRs = appendHostCIDR(postgresAllowedCIDRs, address, m.Overlay.CIDR)
+			computeAllowedCIDRs = appendHostCIDR(computeAllowedCIDRs, address, m.Overlay.CIDR)
+			if gatewayInternalTarget == "" {
+				gatewayInternalTarget = "tcp://" + net.JoinHostPort(address, "8080")
 			}
 		}
 	}
@@ -195,6 +191,28 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	return files, nil
 }
 
+// appendHostCIDR turns a fleet endpoint into the narrowest firewall source
+// range available. Literal endpoints retain the /32 behavior used by the
+// original generator. Hostname endpoints cannot be resolved safely while
+// rendering, so the manifest's declared overlay CIDR becomes the explicit
+// private-network boundary; this keeps hostname-based fleets functional
+// without copying an address into generated Ansible files.
+func appendHostCIDR(values []string, address, overlayCIDR string) []string {
+	value := overlayCIDR
+	if _, err := netip.ParseAddr(address); err == nil {
+		value = address + "/32"
+	}
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, error) {
 	internalHosts := make([]manifestInternalHost, 0, len(m.Fleet.Hosts))
 	for _, host := range m.Fleet.Hosts {
@@ -208,7 +226,8 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 		}
 		// Literal overlay IPs need an explicit hosts entry because the
 		// private PKI identity is not public Cloudflare DNS. A hostname
-		// endpoint is left to the operator's private DNS contract.
+		// endpoint is left to the operator's private DNS contract, which
+		// must resolve both the fleet name and this service identity.
 		if _, err := netip.ParseAddr(address); err == nil {
 			internalHosts = append(internalHosts, manifestInternalHost{
 				Address: address,

@@ -12,14 +12,14 @@
 
 faas_box_role: control-plane
 faas_node_name: fsn-1
-gatewayd_apps_domain: apps.gregale.dev
+gatewayd_apps_domain: gregale.dev
 
 # Ansible connection vars. `ansible_host` is the cross-box addressing
 # target (Layer-3 mesh endpoint: Tailscale/Wireguard IP, internal LAN,
 # or routable FQDN — operator-supplied per-fleet). The
 # `ansible_python_interpreter` pin matches the Ubuntu 24.04 system
 # python3.12 so we never depend on a venv.
-ansible_host: 10.42.0.1
+ansible_host: fsn-1.gregale.dev
 ansible_python_interpreter: /usr/bin/python3
 
 # Multi-host mesh (ADR-092): fsn-1 is the control-plane box and does

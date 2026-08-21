@@ -63,7 +63,7 @@ const certmagicCertDir = "certificates"
 type CertKind string
 
 const (
-	// CertKindWildcard marks the wildcard *.apps.<zone> certificate
+	// CertKindWildcard marks the wildcard *.<zone> certificate
 	// minted via DNS-01.
 	CertKindWildcard CertKind = "wildcard"
 	// CertKindOnDemand marks a customer custom-domain certificate
@@ -100,7 +100,7 @@ type hostCert struct {
 //
 // wildcardIssuerKey is the certmagic issuer-key glob (e.g.
 // "acme-v02.api.letsencrypt.org-directory") used by the DNS-01 solver
-// for the *.apps.<zone> wildcard. Issuer keys whose name matches this
+// for the *.<zone> wildcard. Issuer keys whose name matches this
 // glob are classified as CertKindWildcard; everything else with a
 // well-known on-demand issuer key is CertKindOnDemand; the rest are
 // CertKindUnknown. An empty wildcardIssuerKey classifies every cert
@@ -381,7 +381,7 @@ func walkCerts(ctx context.Context, certsRoot, wildcardIssuerKey string, log *sl
 
 // classifyByIssuerKey maps a certmagic issuer-key path to a CertKind.
 // The wildcard issuer key (e.g. "acme-v02.api.letsencrypt.org-directory")
-// mints the *.apps.<zone> cert via DNS-01. Anything else with a
+// mints the *.<zone> cert via DNS-01. Anything else with a
 // well-known on-demand issuer pattern is CertKindOnDemand; the rest
 // (future issuer types) are CertKindUnknown so the alert rules can
 // exclude them.

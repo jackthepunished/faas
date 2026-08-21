@@ -23,7 +23,7 @@ import (
 //	socket_path = "/run/faas/schedd.sock"
 //	metrics_addr = "127.0.0.1:9091"
 //	db_url = "postgres://..."
-//	apps_domain = "apps.gregale.dev"
+//	apps_domain = "gregale.dev"
 //
 //	# [compute_node] table-block (vmmd only today).
 //	[compute_node]

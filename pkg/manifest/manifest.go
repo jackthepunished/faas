@@ -102,9 +102,8 @@ type Manifest struct {
 
 	// DNS is the public-facing hostname contract. apps_domain is the
 	// single source of truth — gatewayd-internal, apid, and the CLI
-	// PrintOK paths all read from it (PR-4 replaces the hard-coded
-	// `apps.gregale.dev` literals in cmd/gregale/commands2.go and
-	// cmd/gatewayd-internal/backend.go).
+	// PrintOK paths all read from it; a value of `gregale.dev` produces
+	// `<slug>.gregale.dev`.
 	DNS DNS `yaml:"dns"`
 
 	// PostgreSQL is the database cluster configuration. The renderer
@@ -380,8 +379,8 @@ type Overlay struct {
 // apps_domain disagrees with the rendered gatewayd-internal config
 // (PR-4 enforces this across the running fleet).
 type DNS struct {
-	// AppsDomain is the platform wildcard host (e.g.
-	// `apps.gregale.dev`). The full app URL is
+	// AppsDomain is the platform wildcard suffix (e.g.
+	// `gregale.dev`). The full app URL is
 	// `<slug>.<apps_domain>`. The renderer writes this into every
 	// gatewayd-internal TOML and the doctor (PR-4) enforces
 	// consistency against the gatewayd-internal / apid / CLI
@@ -674,8 +673,9 @@ func TCPURL(raw string) (string, error) {
 
 // ServiceName returns the private mTLS DNS identity for a split-box role.
 // These names are intentionally independent of public Cloudflare DNS: the
-// internal PKI issues role certificates for them and the generated Ansible
-// inventory maps them to the manifest's overlay addresses.
+// internal PKI issues role certificates for them. Literal-IP manifests get
+// generated /etc/hosts mappings; hostname manifests must resolve these names
+// through the operator's private DNS view.
 func ServiceName(role string) (string, error) {
 	switch role {
 	case "control-plane":
@@ -885,7 +885,7 @@ func (d *DNS) validate() Errors {
 		errs = append(errs, Error{"dns.apps_domain", "is required"})
 	} else if !looksLikeHostname(d.AppsDomain) {
 		errs = append(errs, Error{"dns.apps_domain",
-			fmt.Sprintf("apps_domain %q must be a valid hostname (e.g. apps.gregale.dev)", d.AppsDomain)})
+			fmt.Sprintf("apps_domain %q must be a valid hostname (e.g. gregale.dev)", d.AppsDomain)})
 	}
 	if d.Mode == "" {
 		errs = append(errs, Error{"dns.mode", "is required"})

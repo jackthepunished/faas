@@ -17,8 +17,8 @@ import (
 )
 
 // PreviewScopeFromHost peels a preview-hostname shape
-// `pr-{N}.{parent-slug}.apps.<zone>` into (PR number, parent slug).
-// appsSuffix is the leading-dot form (".apps.gregale.dev"); empty
+// `pr-{N}-{parent-slug}.<zone>` into (PR number, parent slug).
+// appsSuffix is the leading-dot form (".gregale.dev"); empty
 // suffix refuses everything. The function returns ok=false for any
 // deviation from the locked shape — prod hosts, uppercase, leading
 // zeros, embedded dots in the parent slug, non-numeric PR numbers,
@@ -64,8 +64,8 @@ func PreviewScopeFromHost(appsSuffix, host string) (number int, slug string, ok 
 	rest := tail[dash+1:]
 	// No inner dots: the parent slug must not contain a separator (the
 	// platform slug charset already excludes dots; this guard rejects
-	// pathological scans like `pr-42.foo.bar.apps.gregale.dev` whose
-	// label is "pr-42.foo.bar" and would otherwise split as slug="foo").
+	// pathological scans like `pr-42-foo.bar.gregale.dev` whose label is
+	// "pr-42-foo.bar" and would otherwise split as slug="foo").
 	if strings.Contains(rest, ".") {
 		return 0, "", false
 	}

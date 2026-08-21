@@ -152,12 +152,11 @@ egress:
   overlay_exceptions: []
 
 # DNS — public-facing hostname contract. apps_domain is the single
-# source of truth consumed by gatewayd-internal, apid, and the
-# CLI's PrintOK paths (PR-4 replaces the hard-coded
-# `apps.gregale.dev` literals in cmd/gregale/commands2.go and
-# cmd/gatewayd-internal/backend.go).
+# source of truth consumed by gatewayd-internal and apid. A value of
+# `gregale.dev` produces `<slug>.gregale.dev`; operators may use a
+# different suffix for another fleet.
 dns:
-  apps_domain: apps.gregale.dev
+  apps_domain: gregale.dev
   mode: cloudflare
 
 # PostgreSQL — database cluster configuration. The renderer writes

@@ -452,8 +452,8 @@ func TestAppListItem_WithLatestInstance(t *testing.T) {
 	if item.StateBadgeLabel == "" {
 		t.Errorf("StateBadgeLabel empty, want a label for state=running")
 	}
-	if item.URL != "https://my-api.apps.gregale.dev" {
-		t.Errorf("URL = %q, want apps.gregale.dev hostname", item.URL)
+	if item.URL != "https://my-api.gregale.dev" {
+		t.Errorf("URL = %q, want gregale.dev hostname", item.URL)
 	}
 }
 

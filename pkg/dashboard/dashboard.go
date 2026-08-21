@@ -236,7 +236,7 @@ type ScanSummary struct {
 // app detail page's preview-environments panel. The panel
 // surfaces every preview app whose preview_of_slug matches the
 // parent (apps.preview_of_slug), with status, the full preview
-// URL ("https://pr-42.acme.apps.gregale.dev"), the underlying
+// URL ("https://pr-42-acme.gregale.dev"), the underlying
 // PR number, and the current PR state (open / closed / stale /
 // torn_down). Pre-format all labels at the handler edge so the
 // template stays a pure renderer.
@@ -254,7 +254,7 @@ type ScanSummary struct {
 // emit a relative href and a non-clickable clipboard copy.
 type PreviewItem struct {
 	Slug       string // preview app slug (e.g. "demo-pr-42")
-	URL        string // full preview URL (e.g. "https://pr-42.demo.apps.gregale.dev")
+	URL        string // full preview URL (e.g. "https://pr-42-demo.gregale.dev")
 	PrNumber   int
 	PrState    string // closed vocab: open / closed / stale / torn_down
 	CreatedAt  string // RFC 3339 UTC

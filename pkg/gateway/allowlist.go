@@ -113,7 +113,7 @@ var ErrNotFound = errors.New("gateway: domain not found in allowlist")
 // own.
 //
 // appsSuffix is the leading-dot suffix of the platform zone
-// (".apps.gregale.dev"). The custom-domain path ignores it; the preview
+// (".gregale.dev"). The custom-domain path ignores it; the preview
 // path uses it to peel pr-{N}.{parent-slug}.{suffix} via
 // PreviewScopeFromHost. Empty appsSuffix disables the preview branch.
 //

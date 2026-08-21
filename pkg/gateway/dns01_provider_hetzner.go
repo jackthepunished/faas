@@ -23,8 +23,8 @@
 // stub.
 //
 // The challenge TXT record name is "_acme-challenge" prefixed to the host
-// passed in by certmagic. For a wildcard *.apps.gregale.dev challenge the
-// host passed in is already "_acme-challenge.apps.gregale.dev" (certmagic
+// passed in by certmagic. For a wildcard *.gregale.dev challenge the
+// host passed in is already "_acme-challenge.gregale.dev" (certmagic
 // resolves the relative name vs the zone for us); we just write
 // Name=host, Type=TXT, Value=<token>.
 package gateway
@@ -61,7 +61,7 @@ type HetznerDNSProvider struct {
 // perm check — the on-disk path stays for backward compat; a future
 // generic-token path is PR-9 scope). zone is the zone name
 // (e.g. "example.com") that this provider serves; the wildcard cert
-// *.apps.gregale.dev lives in this zone.
+// *.gregale.dev lives in this zone.
 func NewHetznerDNSProvider(token, zone string) *HetznerDNSProvider {
 	return &HetznerDNSProvider{
 		token:  strings.TrimSpace(token),

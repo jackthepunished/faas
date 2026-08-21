@@ -14,7 +14,7 @@
 // targets the "configure-cors-and-stop-thinking-about-it" crowd.
 //
 // Match host always defaults to the platform subdomain shape
-// `<slug>.apps.<tenant-host>`. The CLI has no easy way to read the
+// `<slug>.<tenant-host>`. The CLI has no easy way to read the
 // app's verified custom domains (they live on AccountExportResponse,
 // not AppResponse), so the helper falls back unconditionally and
 // documents --host as the override. The placeholder trips the
@@ -43,6 +43,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -117,7 +118,7 @@ func cmdCors(args []string) int {
 // created rule (rare; most CORS APIs run without creds). --max-age
 // accepts the same int the SDK helper does (0 = use default 600;
 // otherwise the server caps at 86400). --host defaults to the
-// platform subdomain shape `<slug>.apps.<host>` (always, since
+// platform subdomain shape `<slug>.<host>` (always, since
 // AppResponse doesn't surface the app's verified custom domains).
 func cmdCorsAllow(args []string) int {
 	flags, positional := splitArgsForFlags(args)
@@ -319,23 +320,15 @@ func cmdCorsShow(args []string) int {
 	return 0
 }
 
-// primaryDomainOrFallback returns the app's first verified custom
-// domain when one is bound; otherwise the platform subdomain
-// `<slug>.apps.<tenant-host>` shape. The placeholder trips the
-// gateway's host-name validator before any rule is persisted -
-// operators see "host not routable" in their audit log if they accept
-// the placeholder, which is the desired fail-loud behaviour. The
-// customer can always override via --host.
+// primaryDomainOrFallback returns the platform hostname from the API's
+// canonical app URL. This keeps the CORS helper aligned with the fleet's
+// configured wildcard suffix instead of baking a second domain contract
+// into the CLI. The customer can always override via --host.
 func primaryDomainOrFallback(app api.AppResponse) string {
-	// Domains live on AccountExportResponse, not AppResponse, so
-	// there is no first-verified-custom-domain field we can read here.
-	// We fall back to the platform subdomain shape always and
-	// document --host as the override. The placeholder trips the
-	// gateway host-name validator before any rule is persisted, so
-	// a customer who accepts the placeholder sees a clear
-	// "host not routable" in their audit log instead of a silent
-	// misroute.
-	return app.Slug + ".apps.example"
+	if parsed, err := url.Parse(app.URL); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	return app.Slug + ".gregale.dev"
 }
 
 // sortedAllowedMethods renders the closed set of HTTP methods the

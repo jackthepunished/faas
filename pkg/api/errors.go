@@ -1674,7 +1674,7 @@ func ErrAppConcurrencyReached(l Limits, observed int) *Problem {
 func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
-		WithDocs("https://apps.gregale.dev/status")
+		WithDocs("https://gregale.dev/status")
 }
 
 // ErrWaitForWarm is returned when a wake is held by the customer's

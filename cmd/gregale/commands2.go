@@ -3020,7 +3020,7 @@ streamLoop:
 				if json.Unmarshal([]byte(e.Data), &status) == nil &&
 					(status.Status == statusLive || status.Status == deploymentStatusFailed) {
 					if status.Status == statusLive {
-						PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", dep.AppID)
+						PrintOK(osStdout, "Deployed. %s", deployedAppURL(dep.AppID))
 						printDeployColdWakeSentence()
 						return 0
 					}
@@ -3202,7 +3202,7 @@ func pollBuildStatus(c *Client, dep api.DeploymentResponse, deadline time.Durati
 // row (which has the canonical Error string from the DB).
 func terminalExitForDeployment(d api.DeploymentResponse) int {
 	if d.Status == statusLive {
-		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", d.AppID)
+		PrintOK(osStdout, "Deployed. %s", deployedAppURL(d.AppID))
 		printDeployColdWakeSentence()
 		return 0
 	}
@@ -3218,7 +3218,7 @@ func terminalExitForDeployment(d api.DeploymentResponse) int {
 // terminalExitForDeployment's renderDeployFailure path).
 func terminalExitForBuild(b api.BuildResponse, appID string) int {
 	if b.Status == buildStatusSucceeded {
-		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", appID)
+		PrintOK(osStdout, "Deployed. %s", deployedAppURL(appID))
 		printDeployColdWakeSentence()
 		return 0
 	}
@@ -3228,6 +3228,18 @@ func terminalExitForBuild(b api.BuildResponse, appID string) int {
 	PrintWarn(os.Stderr, "build %s failed (failure_class=%s); inspect logs with: gregale logs --deployment %s",
 		b.ID, b.FailureClass, b.DeploymentID)
 	return 2
+}
+
+// deployedAppURL builds the customer-facing URL from the same configurable
+// suffix used by the daemons. FAAS_APPS_DOMAIN is intentionally optional for
+// the CLI: the public release defaults to the certificate-backed
+// `*.gregale.dev` contract, while operators can point a CLI at another fleet.
+func deployedAppURL(appID string) string {
+	domain := strings.Trim(strings.TrimSpace(os.Getenv("FAAS_APPS_DOMAIN")), ".")
+	if domain == "" {
+		domain = "gregale.dev"
+	}
+	return "https://" + appID + "." + domain
 }
 
 // printDeployColdWakeSentence emits the UX §2.5 cold-wake honesty
