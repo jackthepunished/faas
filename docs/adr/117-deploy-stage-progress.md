@@ -627,7 +627,7 @@ happens Go-side in `pgstore.AppendDeploymentStage` and
 `memstore.AppendDeploymentStage` at the existing read-modify-
 write site (no SQL CHECK on jsonb_array_length — the nested
 path is fragile across jsonb mutation shapes). Doc-only
-migration at slot 00352 documents the cap; schema unchanged.
+migration at slot 00353 documents the cap; schema unchanged.
 
 Trim is irreversible: rows past the cap are gone. No
 archival. A future PR can change the cap by bumping the const.
@@ -754,17 +754,19 @@ precedent); `dep.AppID != app.ID` guard unchanged.
     ADR amendment (doc-only). The metric test pins the
     pre-instantiation surface.
   - Commit 2: C1 (retention). Doc-only migration at slot
-    00352; trim happens Go-side at the existing read-modify-
+    00353; trim happens Go-side at the existing read-modify-
     write site. pg + memstore tests pin the FIFO trim.
   - Commit 3: C2 (retry endpoint + CLI). One new apid route +
     one new SDK method + one new CLI subcommand. Migration
     slot precheck via the cross-PR fence pattern (slot 00330
-    reservation; main has likely moved past 00352 per recent
-    slot-dance chains — slot renumbered three times
-    (00330 → 00346 → 00348 → 00352) during rebases as adjacent
-    PRs landed real migrations at 00346 (issue #977 annotation,
-    PR #984), 00347-00349 (PR #1006 SAFE-RELEASES audit + backfill,
-    PR #1017 alert presets), and 00350-00351 (PR #1017).
+    reservation; main has likely moved past 00353 per recent
+    slot-dance chains — slot renumbered four times
+    (00330 → 00346 → 00348 → 00352 → 00353) during rebases as
+    adjacent PRs landed real migrations at 00346 (issue #977
+    annotation, PR #984), 00347-00351 (PR #1017 alert presets
+    catalog — 5 real migrations), 00352 (PR #990 ADR-117 PR-C
+    app_secret_value_hash), and now 00353 is the next free
+    slot above all open PRs.
     00347 (PR #1005 api-contract-diff).
   - Commit 4: C5 (dashboard SSE) + per-row retry button.
     HTMX swap-in against the existing logs SSE channel.
@@ -773,7 +775,7 @@ precedent); `dep.AppID != app.ID` guard unchanged.
 
 ~1000-1300 LOC across ~25 files (4 new files: metric test,
 retry handler, CLI retry, stages-partial handler; +21
-touched files). 1 new migration (slot 00352, doc-only).
+touched files). 1 new migration (slot 00353, doc-only).
 ~10-15 new `CodeStage*` constants + matching `pkg/whycopy`
 rows. 1 new Prometheus histogram + label set. 1 new SDK
 method (`RetryDeploymentFromStage`). 1 new apid route
