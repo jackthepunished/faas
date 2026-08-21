@@ -41,7 +41,12 @@ func TenantSurfacesEnabled() bool {
 // is gated until the PR ships — same rollout shape as
 // TenantSurfacesEnabled above.
 func StaticEgressIPEnabled() bool {
-	return envFlagEnabled("FAAS_STATIC_EGRESS_IP_ENABLED")
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_STATIC_EGRESS_IP_ENABLED")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // DomainDoctorEnabled reports whether the per-domain doctor probe
