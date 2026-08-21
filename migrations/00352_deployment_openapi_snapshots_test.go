@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00347_deployment_openapi_snapshots.sql
+// Migration-apply test for 00352_deployment_openapi_snapshots.sql
 // (ADR-121, issue: API contract diff).
 //
 // Pins:
@@ -61,7 +61,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00347_DeploymentOpenAPISnapshots(t *testing.T) {
+func TestMigrations_00352_DeploymentOpenAPISnapshots(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -84,7 +84,7 @@ func TestMigrations_00347_DeploymentOpenAPISnapshots(t *testing.T) {
 		t.Fatalf("query deployment_openapi_snapshots existence: %v", err)
 	}
 	if !tableExists {
-		t.Fatalf("deployment_openapi_snapshots missing (00347 must create it)")
+		t.Fatalf("deployment_openapi_snapshots missing (00352 must create it)")
 	}
 
 	var pkName string
