@@ -41,8 +41,8 @@ func TestCheckSecrets_AllPresentNoDrift(t *testing.T) {
 	writeSecretFile(t, "/etc/faas/secrets/host.age", []byte("placeholder host.age bytes"), "0400")
 	writeSecretFile(t, "/etc/faas/secrets/session.key", []byte(strings.Repeat("a", 64)), "0400")
 	writeSecretFile(t, filepath.Join(storageDir, "box-age-key"), []byte("placeholder box-age-key"), "0440")
-	writeSecretFile(t, filepath.Join(storageDir, "rclone.conf"), []byte(`{"_":"stub"}`), "0440")
-	writeSecretFile(t, filepath.Join(storageDir, "archive-creds.json"), []byte(`{}`), "0400")
+	writeSecretFile(t, filepath.Join(storageDir, "rclone.conf"), []byte("[remote]\ntype = s3\n"), "0440")
+	writeSecretFile(t, filepath.Join(storageDir, "archive-creds.json"), []byte(`{"bucket":"prod-archive"}`), "0400")
 	deps := &doctorDeps{}
 	findings, err := checkSecrets(context.Background(), deps)
 	if err != nil {

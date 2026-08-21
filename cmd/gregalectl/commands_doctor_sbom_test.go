@@ -67,6 +67,13 @@ func sbomStageTriple(t *testing.T, releasesRoot, gitSHA string, baseline *releas
 	if err != nil {
 		t.Fatalf("build tarball: %v", err)
 	}
+	// BuildTarball canonicalises the manifest timestamp because the
+	// manifest is signed inside the reproducible tarball. Stage that same
+	// canonical manifest on disk so the doctor reconstructs the exact
+	// producer output.
+	if err := releaseinstall.Write(releasesRoot, tb.Manifest); err != nil {
+		t.Fatalf("write canonical manifest: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "release.tar.gz"), tb.Packed, 0o644); err != nil {
 		t.Fatalf("write tarball: %v", err)
 	}

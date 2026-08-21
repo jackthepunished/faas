@@ -91,6 +91,11 @@ func BuildTarball(root, gitSHA, manifestHash string, now time.Time) (*Tarball, e
 	if err != nil {
 		return nil, fmt.Errorf("releaseinstall: tarball build manifest: %w", err)
 	}
+	// The manifest is part of the signed tarball, so a wall-clock creation
+	// time would make otherwise identical builds produce different bytes.
+	// Keep the legacy Build API's audit timestamp, but use the canonical
+	// release epoch for the immutable artifact and its on-disk manifest.
+	m.CreatedAt = stableEpoch
 
 	bin := BinDir(root, gitSHA)
 	daemonNames := manifest.SortedHostKeys()
@@ -122,8 +127,12 @@ func BuildTarball(root, gitSHA, manifestHash string, now time.Time) (*Tarball, e
 	}
 	sort.Strings(assetNames)
 	allNames := append(append(append([]string(nil), daemonNames...), toolNames...), assetNames...)
+	manifestBody, err := encodeTarballManifest(m)
+	if err != nil {
+		return nil, fmt.Errorf("releaseinstall: tarball manifest encode: %w", err)
+	}
 
-	packed, err := tarGzBin(bin, allNames)
+	packed, err := tarGzBin(bin, allNames, map[string][]byte{ManifestName: manifestBody})
 	if err != nil {
 		return nil, fmt.Errorf("releaseinstall: tarball pack: %w", err)
 	}
@@ -147,7 +156,7 @@ func BuildTarball(root, gitSHA, manifestHash string, now time.Time) (*Tarball, e
 // daemon-name catalog is IGNORED (matches `Verify`'s "unexpected
 // files" pass at install time — the producer is not the gate; the
 // verifier is).
-func tarGzBin(bin string, daemonNames []string) ([]byte, error) {
+func tarGzBin(bin string, daemonNames []string, extraEntries map[string][]byte) ([]byte, error) {
 	info, err := os.Stat(bin)
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %w", bin, err)
@@ -175,6 +184,30 @@ func tarGzBin(bin string, daemonNames []string) ([]byte, error) {
 			// extracted tree must be runnable by the systemd units.
 			Name:     entryName,
 			Mode:     0o755,
+			Uid:      0,
+			Gid:      0,
+			Size:     int64(len(body)),
+			ModTime:  stableEpoch,
+			Typeflag: tar.TypeReg,
+			Format:   tar.FormatUSTAR,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return nil, fmt.Errorf("tar header %s: %w", name, err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			return nil, fmt.Errorf("tar body %s: %w", name, err)
+		}
+	}
+	extraNames := make([]string, 0, len(extraEntries))
+	for name := range extraEntries {
+		extraNames = append(extraNames, name)
+	}
+	sort.Strings(extraNames)
+	for _, name := range extraNames {
+		body := extraEntries[name]
+		hdr := &tar.Header{
+			Name:     name,
+			Mode:     0o644,
 			Uid:      0,
 			Gid:      0,
 			Size:     int64(len(body)),
@@ -322,6 +355,15 @@ func (t *Tarball) Extract(root string) error {
 			return fmt.Errorf("releaseinstall: extract next: %w", err)
 		}
 		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		// The manifest is a root-level metadata member, not a binary under
+		// <release>/bin. Verify already checked its hash and the installer
+		// writes the trusted, signature-stamped manifest separately.
+		if hdr.Name == ManifestName {
+			if _, err := io.Copy(io.Discard, tr); err != nil {
+				return fmt.Errorf("releaseinstall: extract read %s: %w", hdr.Name, err)
+			}
 			continue
 		}
 		// Sanitise at the loop head so the unsanitised
@@ -505,6 +547,17 @@ func (t *Tarball) hashWalk() error {
 			return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, name, gotHex, wantHex)
 		}
 	}
+	manifestBody, err := encodeTarballManifest(t.Manifest)
+	if err != nil {
+		return fmt.Errorf("%w: encode manifest: %v", ErrTarballTampered, err)
+	}
+	gotManifest, ok := entryHashes[ManifestName]
+	if !ok {
+		return fmt.Errorf("%w: tarball missing %s", ErrTarballTampered, ManifestName)
+	}
+	if gotManifest != sha256Hex(manifestBody) {
+		return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, ManifestName, gotManifest, sha256Hex(manifestBody))
+	}
 	roster := make(map[string]struct{}, len(daemonNames)+len(t.ToolSHA256))
 	for _, n := range daemonNames {
 		roster[n] = struct{}{}
@@ -518,6 +571,7 @@ func (t *Tarball) hashWalk() error {
 	for name := range t.Manifest.AssetHashes {
 		roster[name] = struct{}{}
 	}
+	roster[ManifestName] = struct{}{}
 	var unknown []string
 	for name := range entryHashes {
 		if _, ok := roster[name]; !ok {

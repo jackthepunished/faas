@@ -37,10 +37,16 @@ package releaseinstall
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 )
 
 // CosignVerifier verifies a blob's cosign-signed signature bundle.
@@ -71,7 +77,7 @@ type CosignVerifyConfig struct {
 
 	// IdentityRegexp is the regex that the certificate-identity
 	// field must match. The upstream canonical pin is
-	// "^https://github.com/poyrazK/faas/.github/workflows/build-sha256\\.yml@refs/tags/.*$".
+	// "^https://github.com/poyrazK/faas/.github/workflows/release\\.yml@refs/tags/.*$".
 	// Operators MUST verify both ends — the workflow path AND the
 	// refs/tags/ peg — to defeat ref-based privilege escalation.
 	IdentityRegexp *regexp.Regexp
@@ -88,7 +94,7 @@ type CosignVerifyConfig struct {
 // Use NewExecCosignVerifier(cfg) with this cfg for the production
 // install-time verifier.
 func DefaultGitHubOIDC() CosignVerifyConfig {
-	re := regexp.MustCompile(`^https://github\.com/poyrazK/faas/\.github/workflows/build-sha256\.yml@refs/tags/.+$`)
+	re := regexp.MustCompile(`^https://github\.com/poyrazK/faas/\.github/workflows/release\.yml@refs/tags/.+$`)
 	return CosignVerifyConfig{
 		Issuer:         "https://token.actions.githubusercontent.com",
 		IdentityRegexp: re,
@@ -124,7 +130,7 @@ func NewExecCosignVerifier(cfg CosignVerifyConfig) *ExecCosignVerifier {
 //	cosign verify-blob \
 //	    --certificate-identity-regexp "$RE" \
 //	    --certificate-oidc-issuer "$ISSUER" \
-//	    --signature "$SIG" \
+//	    --bundle "$SIG" \
 //	    --insecure-ignore-tlog          (PR-A: TODO remove with Rekor trust root)
 //	    "$TARBALL"
 //
@@ -139,9 +145,9 @@ type ExecCosignVerifier struct {
 // VerifyBlob runs `cosign verify-blob --certificate-identity-regexp ...`
 // against the tarball. Returns the certificate identity on success.
 //
-// Output parsing: `cosign verify-blob` writes the certificate
-// identity on stdout when verification succeeds. We capture
-// stdout; the trailing newline is trimmed.
+// Output parsing: cosign v2 writes a human-readable success line rather than
+// the certificate identity, so the verified bundle is parsed below for its
+// URI SAN.
 func (v *ExecCosignVerifier) VerifyBlob(ctx context.Context, tarballPath, sigPath string) (string, error) {
 	if tarballPath == "" {
 		return "", errors.New("releaseinstall: cosign: empty tarball path")
@@ -153,31 +159,80 @@ func (v *ExecCosignVerifier) VerifyBlob(ctx context.Context, tarballPath, sigPat
 		"verify-blob",
 		"--certificate-identity-regexp", v.cfg.IdentityRegexp.String(),
 		"--certificate-oidc-issuer", v.cfg.Issuer,
-		"--signature", sigPath,
+		"--bundle", sigPath,
 		"--insecure-ignore-tlog",
 		tarballPath,
 	}
 	cmd := exec.CommandContext(ctx, v.cfg.CosignPath, args...)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("releaseinstall: cosign verify-blob: %w (stderr=%s)", err, stderr.String())
 	}
-	identity := bytes.TrimSpace(stdout.Bytes())
-	if len(identity) == 0 {
-		return "", errors.New("releaseinstall: cosign verify-blob: empty certificate identity on stdout")
+	// cosign prints human-readable verification status, not the certificate
+	// identity. Read the identity from the verified bundle instead; the
+	// command has already enforced the issuer and SAN regexp above.
+	identity, err := bundleCertificateIdentity(sigPath)
+	if err != nil {
+		return "", err
 	}
 	// Re-confirm the identity matches the configured regex. This
 	// is defence-in-depth: if cosign ever changes its output
 	// shape to print, say, "verify OK" instead of the cert
 	// identity, the regex check is the canonical contract.
-	if !v.cfg.IdentityRegexp.Match(identity) {
+	if !v.cfg.IdentityRegexp.MatchString(identity) {
 		return "", fmt.Errorf("releaseinstall: cosign verify-blob: identity %q does not match configured regex %s",
 			identity, v.cfg.IdentityRegexp)
 	}
-	return string(identity), nil
+	return identity, nil
+}
+
+// bundleCertificateIdentity extracts the URI SAN from both the legacy cosign
+// bundle shape and the newer trusted-root bundle shape. Keyless Fulcio
+// certificates carry the GitHub Actions workflow identity as a URI SAN.
+func bundleCertificateIdentity(path string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("releaseinstall: read cosign bundle identity: %w", err)
+	}
+	var b struct {
+		Cert                 string `json:"cert"`
+		VerificationMaterial struct {
+			X509CertificateChain struct {
+				Certificates []struct {
+					RawBytes string `json:"rawBytes"`
+				} `json:"certificates"`
+			} `json:"x509CertificateChain"`
+		} `json:"verificationMaterial"`
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return "", fmt.Errorf("releaseinstall: decode cosign bundle: %w", err)
+	}
+	var certBytes []byte
+	if b.Cert != "" {
+		certBytes, err = base64.StdEncoding.DecodeString(b.Cert)
+		if err != nil {
+			certBytes = []byte(b.Cert)
+		}
+	} else if len(b.VerificationMaterial.X509CertificateChain.Certificates) > 0 {
+		certBytes, err = base64.StdEncoding.DecodeString(b.VerificationMaterial.X509CertificateChain.Certificates[0].RawBytes)
+		if err != nil {
+			return "", fmt.Errorf("releaseinstall: decode cosign certificate: %w", err)
+		}
+	}
+	if block, _ := pem.Decode(certBytes); block != nil {
+		certBytes = block.Bytes
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return "", fmt.Errorf("releaseinstall: parse cosign certificate: %w", err)
+	}
+	for _, uri := range cert.URIs {
+		if uri != nil && strings.TrimSpace(uri.String()) != "" {
+			return uri.String(), nil
+		}
+	}
+	return "", errors.New("releaseinstall: cosign bundle has no URI certificate identity")
 }
 
 // FixtureCosignVerifier is the test seam. Constructor takes the

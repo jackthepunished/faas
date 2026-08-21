@@ -7,16 +7,16 @@
 
   1. `release.tar.gz` — every daemon binary + every function runner +
      the `release-manifest.json` (the existing per-release manifest;
-     PRD-3 shape) + `tools/` (helper scripts the daemons exec).
-     sha256 is the canonical digest.
+     PRD-3 shape) + support tools and runtime assets. sha256 is the
+     canonical digest.
   2. `release.cosign.bundle` — cosign signature bundle over the tarball
      (keyless OIDC, Fulcio + Rekor transparency log). Verifies the
      tarball was signed by the CI identity of the `faas` GitHub repo
      at a given commit.
   3. `release.sbom.json` — SPDX-2.3 SBOM (CycloneDX-equivalent is
      rejected — CycloneDX fields the e2e CVE-baseline does not
-     consume), embedded as a tarball member so the on-host verifier
-     can fetch it without a second HTTP round-trip.
+     consume), published beside the tarball and copied into the
+     per-release directory during install.
 
   The host-side `gregalectl release install` flow becomes:
 
@@ -25,8 +25,8 @@
   via `/etc/faas/release-source.conf` for production, OR
   `--tarball-path` for air-gap)
   cosign verify-blob \
-      --signature release.cosign.bundle \
-      --certificate-identity https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/<tag> \
+      --bundle release.cosign.bundle \
+      --certificate-identity https://github.com/poyrazK/faas/.github/workflows/release.yml@refs/tags/<tag> \
       --certificate-identity-regexp "https://github.com/poyrazK/faas" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       release.tar.gz
@@ -36,14 +36,10 @@
   pkg/releaseinstall.AtomicFlip (unchanged)
   ```
 
-  The Packer `image-build-canary` (PR #929, deploy/packer/) **is the
-  producer**, not just the consumer. The tarball is built ONCE, in the
-  canary's CI runner, after `make build-sha256`. The image bakes the
-  tarball itself (so a freshly-installed image can run from local
-  artifact if the production source is unreachable), and an OCI
-  artifact (`oci://ghcr.io/poyrazk/faas/release@sha256:<digest>`) is
-  pushed in parallel as the canonical reference. Day-2 upgrades pull
-  from OCI by default; operators can pin `--tarball-path` for air-gap.
+  The `.github/workflows/release.yml` daemon-bundle job is the producer.
+  It builds the bytes once, signs the tarball with GitHub OIDC, emits the
+  SPDX document, and publishes the complete install triple as release
+  assets. Day-2 upgrades can pin `--tarball-path` for air-gap installs.
 
   The old `cmd/gregalectl/releaseinstall/copyBinIntoRelease` is
   retired. The new `pkg/releaseinstall/Tarball.{Build,Verify,Extract}`
@@ -60,8 +56,8 @@
   2. **Issue #601 (security, needs-ADR):** "Add CVE-vs-SBOM diff job
      in CI; alert when a new vuln affects a runtime dep." Today
      nothing knows which CVEs a given Gregale release ships with.
-     SBoM embedded in the tarball closes the audit gap AND enables
-     a host-side regression gate that does not need internet.
+     The published SBoM closes the audit gap AND enables a host-side
+     regression gate that does not need internet.
   3. **Operational:** `copyBinIntoRelease` is a host-side walk of a
      bin-dir the operator hands to the bundle subcommand. It is the
      last unscheduled day-1 piece that still trusts the operator's
@@ -76,11 +72,9 @@
   ships the tarball + cosign + SBoM together.
 
 - **Consequences:**
-  - **Packer `image-build-canary` must learn to publish.**
-    `deploy/packer/image-build-canary.pkr.hcl` runs the canary build,
-    then a `post-process` step pushes the tarball to
-    `oci://ghcr.io/poyrazk/faas/release` (skipped on local dev;
-    gated on `CI=true`).
+  - **The release workflow owns publication.**
+    `.github/workflows/release.yml` builds, signs, and publishes the
+    canonical tarball, bundle, SBoM, manifest, and checksums.
   - **`pkg/releaseinstall` gains three types.**
     `Tarball{Spec, Build, Verify, Extract}`, `CosignVerifier`
     (interface; production impl wraps `cosign verify-blob` via exec,
@@ -99,9 +93,9 @@
     regressed vs the KGV (Known Good Version) recorded at last
     install. Drift surfaces as `severity=warn`.
   - **Build-time fail-closed:**
-    `make build-sha256` MUST `cosign sign-blob` + `syft` SBoM-emit
-    after the daemon binaries are built. If either fails, the build
-    fails; `release bundle` is not allowed to ship a partial triple.
+    the daemon-bundle job MUST `cosign sign-blob` + `syft` SBoM-emit
+    after the daemon binaries are built. If either fails, the workflow
+    fails; no partial triple is published.
   - **Backwards compat:**
     PRD-3 release bundles stay readable: a `--legacy-bundle-dir` flag
     on `release install` consumes the old `git_sha/` directory shape
@@ -132,7 +126,7 @@
 
 - **Cross-PR dependencies:**
   - **ADR-111 (Gregale Compute Image) — merged.** Provides the
-    Packer runner ADR-113 publishes from.
+    build/runtime contract consumed by the release workflow.
   - **PR #929 (image-build-canary + deploy/packer) — merged.**
     Provides `deploy/packer/image-build-canary.pkr.hcl`. ADR-113
     adds a `post-process` step to that runner.
@@ -152,10 +146,10 @@
 - **Verification gates (per-PR):**
 
   **PR-A:**
-  - [ ] `make build-sha256` produces `release.tar.gz`,
-        `release.cosign.bundle`, `release.sbom.json`; the
-        `cosign verify-blob` round-trip passes against the CI OIDC
-        issuer.
+  - [ ] `.github/workflows/release.yml` produces
+        `release.tar.gz`, `release.cosign.bundle`, and
+        `release.sbom.json`; the `cosign verify-blob` round-trip passes
+        against the CI OIDC issuer.
   - [ ] `pkg/releaseinstall/Tarball_Build_HashStable` —
         byte-identical tarball across rebuilds (modulo mtimes
         normalized).

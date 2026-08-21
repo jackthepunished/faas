@@ -731,6 +731,10 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 	if _, err := tb.Verify(context.Background(), verifier); err != nil {
 		return fmt.Errorf("tarball verify: %w", err)
 	}
+	// Verify stamps the trusted CI identity onto the manifest. Persist that
+	// identity with the extracted release so `doctor` can audit which CI
+	// workflow authorized the bytes currently installed on the host.
+	m = tb.Manifest
 
 	// 4. Extract the tarball into <releases-root>/<git-sha>/bin/.
 	// On success the on-disk bin tree matches the manifest's

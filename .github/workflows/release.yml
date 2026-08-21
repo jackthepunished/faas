@@ -9,9 +9,10 @@
 # attaches a GitHub Release via softprops/action-gh-release (SHA-pinned
 # to match .github/workflows/cd-controlplane.yml:99-110).
 #
-# Cosign signing is OPTIONAL in v1 (per ADR-093 R5 mitigation). The
-# SHA256SUMS file is the deterministic verification surface for v1;
-# v2 will add cosign keypair signing.
+# The CLI compatibility asset remains in the first job. The daemon bundle
+# job below is the production release surface: it builds the immutable
+# multi-daemon tarball, signs it with GitHub OIDC, emits an SPDX SBOM, and
+# publishes all of the install-time verification material together.
 #
 # Tag strategy: every release commits to a `release/v<tag>` branch AND
 # force-updates the MAJOR moving tag (vN from vN.M.P) so that
@@ -30,6 +31,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -173,3 +175,67 @@ jobs:
             ```yaml
             - uses: poyrazK/faas/.github/actions/deploy@${{ github.ref_name }}
             ```
+
+  daemon-bundle:
+    name: Build and sign canonical daemon bundle
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install pinned release tooling
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          GOBIN="$RUNNER_TEMP/release-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+          GOBIN="$RUNNER_TEMP/release-tools" go install github.com/anchore/syft/cmd/syft@v1.49.0
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+
+      - name: Build canonical daemon tarball and SPDX SBOM
+        env:
+          GIT_SHA: ${{ github.sha }}
+          MANIFEST_HASH: sha256:${{ hashFiles('deploy/manifest/examples/splitbox.example.yaml') }}
+          OUT_DIR: ${{ runner.temp }}/gregale-release
+          SYFT_BIN: syft
+        run: scripts/build-canonical-tarball.sh
+
+      - name: Sign canonical tarball with GitHub OIDC
+        env:
+          OUT_DIR: ${{ runner.temp }}/gregale-release
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle "$OUT_DIR/release.cosign.bundle" \
+            "$OUT_DIR/release.tar.gz"
+          cosign verify-blob \
+            --bundle "$OUT_DIR/release.cosign.bundle" \
+            --certificate-identity-regexp '^https://github\.com/poyrazK/faas/\.github/workflows/release\.yml@refs/tags/.+$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --insecure-ignore-tlog \
+            "$OUT_DIR/release.tar.gz"
+          (cd "$OUT_DIR" && sha256sum release.tar.gz release.cosign.bundle release.sbom.json > SHA256SUMS)
+
+      - name: Upload canonical release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gregale-daemon-release-${{ github.sha }}
+          path: ${{ runner.temp }}/gregale-release/
+          if-no-files-found: error
+
+      - name: Attach canonical release artifacts
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            ${{ runner.temp }}/gregale-release/release.tar.gz
+            ${{ runner.temp }}/gregale-release/release.cosign.bundle
+            ${{ runner.temp }}/gregale-release/release.sbom.json
+            ${{ runner.temp }}/gregale-release/release-manifest.json
+            ${{ runner.temp }}/gregale-release/SHA256SUMS

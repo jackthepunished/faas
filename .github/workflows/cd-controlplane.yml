@@ -21,7 +21,9 @@ on:
 
 concurrency:
   group: cd-cp-${{ github.ref }}
-  cancel-in-progress: true
+  # A production deployment must finish or fail visibly; cancelling it
+  # midway can leave binaries, migrations, and systemd state out of sync.
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,6 +31,7 @@ permissions:
 jobs:
   deploy:
     name: Deploy to Control Plane Host
+    environment: production
     runs-on: ubuntu-latest
     env:
       CP_HOST: ${{ secrets.CP_HOST || secrets.DO_HOST }}
