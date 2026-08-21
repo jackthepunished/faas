@@ -1856,6 +1856,14 @@ func (s *server) handler() http.Handler {
 	// so the customer's next page-load sees the live SSE stream
 	// for the fresh row.
 	mux.Handle("POST /dashboard/apps/{slug}/deployments/{id}/retry", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRetryDeployment))))
+	// Issue #1233 / ADR-123 — alert-preset enable from the
+	// dashboard's preset grid. Same CSRF-envelope shape as
+	// dashboardFireCron (form-encoded body, action=
+	// "enable_alert_preset"). The handler delegates to
+	// enableAlertPresetFromForm after CSRF + auth so the JSON
+	// path (POST /v1/apps/{slug}/alert-presets/{name}/enable)
+	// and the dashboard path share a single guard order.
+	mux.Handle("POST /dashboard/apps/{slug}/alert-presets/{name}/enable", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardEnablePreset))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires
