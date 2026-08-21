@@ -185,12 +185,12 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 # Wired into the unit-tests-pg-2 CI job (see ci.yml).
 .PHONY: coverage-floor
 coverage-floor: ## Assert ship-blocking package floors across all coverage/cover-shard*.out
-	@COVERDIR="$${COVERDIR:-$(COVERAGE_DIR)}" ; \
-	test -d "$$COVERDIR" || (echo "coverage dir $$COVERDIR not found — run \`make test\` with -coverprofile first" ; exit 1) ; \
-	shopt -s nullglob ; \
-	files=($$COVERDIR/cover-shard*.out) ; \
-	if [ $${#files[@]} -eq 0 ]; then echo "coverage-floor: no coverage/cover-shard*.out files; run \`make test\` with -coverprofile first"; exit 1; fi ; \
-	python3 .claude/ci/coverage_floor.py "$${files[@]}"
+	@bash -c 'set -e; COVERDIR="$${COVERDIR:-$(COVERAGE_DIR)}"; \
+	  test -d "$$COVERDIR" || { echo "coverage dir $$COVERDIR not found — run \`make test\` with -coverprofile first"; exit 1; }; \
+	  shopt -s nullglob; \
+	  files=($$COVERDIR/cover-shard*.out); \
+	  if [ $${#files[@]} -eq 0 ]; then echo "coverage-floor: no coverage/cover-shard*.out files; run \`make test\` with -coverprofile first"; exit 1; fi; \
+	  exec python3 .claude/ci/coverage_floor.py "$${files[@]}"'
 
 .PHONY: test-property
 test-property: ## Property-based invariant tests (no KVM, no DB needed). §6.2 invariants land here.
