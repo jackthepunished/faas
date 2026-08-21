@@ -52,11 +52,19 @@ func cmdScan(args []string) int {
 	repo := fs.String("repo", "", "github owner/name to fetch tarball for")
 	ref := fs.String("ref", "main", "git ref for --repo")
 	only := fs.String("only", "", "comma-separated workload names")
+	// ADR-124 inverse-allowlist. Mutex with --only (overlap rejected
+	// server-side with code='exclude_only_overlap').
+	exclude := fs.String("exclude", "", "comma-separated workload names to omit (ADR-124)")
+	// ADR-124 two-section render toggle. Default keeps the legacy
+	// single-section plan; operators running the new blast-radius
+	// preview opt in explicitly so the default behaviour for scripts
+	// and CI is unchanged.
+	showAffected := fs.Bool("show-affected", false, "render the WillDeploy + Unaffected tables (ADR-124)")
 	projectSlug := fs.String("project-slug", "", "kebab slug; default = repo dir basename")
 	installID := fs.Int64("install-id", 0, "GitHub install id (with --repo)")
 	prodBranch := fs.String("production-branch", "main", "production branch for the project")
 	if err := fs.Parse(args); err != nil {
-		PrintUsage(os.Stderr, "usage: gregale scan [--tarball P] [--path DIR] [--repo OWNER/NAME]", "scan")
+		PrintUsage(os.Stderr, "usage: gregale scan [--tarball P] [--path DIR] [--repo OWNER/NAME] [--show-affected] [--exclude NAME,…]", "scan")
 		return 1
 	}
 
@@ -78,6 +86,16 @@ func cmdScan(args []string) int {
 	}
 	ctx := context.Background()
 	onlyList := splitCSV(*only)
+	excludeList := splitCSV(*exclude)
+	// Client-side mirror of the server's mutex validation. The
+	// server is still authoritative (returns 409 on overlap); this
+	// avoids a needless round-trip when the operator typos both
+	// flags. intersect(empty) short-circuits on either side.
+	if ok, clash := intersect(onlyList, excludeList); ok {
+		return printErr("Invalid flags", fmt.Errorf(
+			"--only and --exclude share workload(s): %s",
+			strings.Join(clash, ", ")))
+	}
 	// srcPath was either customer-supplied (--tarball / --path) or
 	// resoled by the CLI (autoPackCwd tmp / curl repo tmp). Both pass
 	// through openCustomerFile so the lint tripwire's symlink-follow
@@ -87,14 +105,14 @@ func cmdScan(args []string) int {
 		return printErr("Could not open source", err)
 	}
 	defer func() { _ = src.Close() }()
-	plan, err := client.ScanProject(ctx, src, sourceName, *projectSlug, *prodBranch, *installID, onlyList)
+	plan, err := client.ScanProject(ctx, src, sourceName, *projectSlug, *prodBranch, *installID, onlyList, excludeList)
 	if err != nil {
 		return printErr("Scan failed", err)
 	}
 	if jsonOutput {
 		return jsonOut(writeJSON(plan))
 	}
-	return printPlanText(osStdout, plan)
+	return printPlanText(osStdout, plan, excludeList, *showAffected)
 }
 
 // resolveScanSource normalises the three input shapes (--tarball /
@@ -252,6 +270,33 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// intersect reports whether a and b share an element. Used by
+// cmdScan / cmdDeployTarball to short-circuit --only ∩ --exclude
+// overlaps before a server round-trip — server is still the
+// authoritative gate (409 exclude_only_overlap), this is a UX
+// guard. Returns (true, sorted-slice) on hit, (false, nil) on miss.
+// Caller passes already-normalised (lowercased/trimmed) slices.
+func intersect(a, b []string) (bool, []string) {
+	if len(a) == 0 || len(b) == 0 {
+		return false, nil
+	}
+	idx := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		idx[s] = struct{}{}
+	}
+	var clash []string
+	for _, s := range a {
+		if _, ok := idx[s]; ok {
+			clash = append(clash, s)
+		}
+	}
+	if len(clash) == 0 {
+		return false, nil
+	}
+	sort.Strings(clash)
+	return true, clash
+}
+
 // printPlanText renders the plan as a human-readable table. Two
 // sections: Workloads (sorted by name asc) and Managed (stateful
 // services we won't provision). Cron rows appear under Workloads with
@@ -262,7 +307,7 @@ func splitCSV(s string) []string {
 // on the JSON-parse path below (mirrors commands_builds.go:166).
 //
 //nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
-func printPlanText(w io.Writer, plan api.PlanResponse) int {
+func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, showAffected bool) int {
 	fmt.Fprintf(w, "Project: %s\n", plan.ProjectSlug)
 	fmt.Fprintf(w, "Scan source: %s   tier: %s\n", plan.ScanSource, plan.Tier)
 	fmt.Fprintf(w, "Quota: %d/%d apps   %d/%d crons\n",
@@ -313,8 +358,8 @@ func printPlanText(w io.Writer, plan api.PlanResponse) int {
 // from r (typically os.Stdin) so tests can stub it. Returns true on
 // 'y' / 'yes' (case-insensitive); false on EOF, 'n', or any other
 // input — git does the same.
-func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse) bool {
-	printPlanText(w, plan)
+func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []string) bool {
+	printPlanText(w, plan, excludeSet, false)
 	//nolint:errcheck // same rationale as printPlanText; a failed Fprintln
 	// at the prompt is no different from the read below failing.
 	fmt.Fprintln(w, "\nApply this plan? [y/N] ")
