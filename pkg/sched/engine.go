@@ -1029,7 +1029,7 @@ type WakeResult struct {
 // shared admitAndDispatch runs Phase 2-4. AdmitInstance (issue #168)
 // skips Phase 1 explicitly so a gateway can demand a new instance
 // even when others are already RUNNING.
-func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope, trigger string) (WakeResult, error) {
 	// PR-B (issue #272 / ADR-095): scope-aware Wake. Stamp the
 	// scope on the ctx so every downstream helper (resolveApp,
 	// loadAPIEnv, LiveDeployment lookup, ledger admit) threads the
@@ -1126,7 +1126,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope string) (W
 	// as *api.Problem{Code: CodePlanLimitConcur}. The ledger's
 	// capacity refusal happens INSIDE admitAndDispatch; we forward
 	// rather than lift into the typed AtCapacity result.
-	return e.admitAndDispatch(ctx, appID, false)
+	return e.admitAndDispatch(ctx, appID, trigger, false)
 }
 
 // EnsureWake (ADR-098) is the single-flight-safe wake entry point.
@@ -1158,7 +1158,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope string) (W
 //   - ctx.Err(): the caller's ctx was cancelled before the leader finished.
 //   - leader's *api.Problem: ledger / chooser / store error.
 //   - nil: the wake succeeded; Outcome.Instance is populated.
-func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, error) {
+func (e *Engine) EnsureWake(ctx context.Context, appID, trigger string) (CoordOutcome, error) {
 	if e == nil || e.wakeCoord == nil {
 		return CoordOutcome{}, fmt.Errorf("sched: EnsureWake: engine not fully constructed")
 	}
@@ -1197,7 +1197,7 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 	// This is the load-bearing single-flight coalescing invariant (spec
 	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
 	// goroutine detach.
-	res, err := e.Wake(leaderCtx, appID, "", "")
+	res, err := e.Wake(leaderCtx, appID, "", "", trigger)
 	if err != nil {
 		out.Err = err
 		return out, err
@@ -1254,10 +1254,10 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 // gateway derived from the inbound Host header. Empty = prod
 // (legacy single-deployment behaviour). Stamped on the ctx via
 // WithScope so resolveApp / loadAPIEnv read the same value.
-func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (WakeResult, error) {
 	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
-		return e.admitAndDispatch(ctx, appID, true)
+		return e.admitAndDispatch(ctx, appID, trigger, true)
 	}
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }
@@ -1282,10 +1282,17 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope s
 // AdmitInstance; the floor trigger's scope is derived from the
 // app it's reconciling and must match the per-app scope ledger so
 // an over-cap prod app cannot drain a preview (or vice versa).
-func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope, trigger string) (WakeResult, error) {
 	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
-		return e.AdmitInstance(ctx, appID, "", scope)
+		// ADR-123: thread the trigger through to AdmitInstance so the
+		// empty-deploymentID branch (which routes through
+		// admitAndDispatch and emits BootStarted/BootCompleted) carries
+		// the caller's closed-enum value. The deploymentID-set branch
+		// below uses admitAndDispatchForDeployment, which is a
+		// lightweight ledger admission that does NOT emit BootStarted —
+		// the trigger is captured for API symmetry but not consumed.
+		return e.AdmitInstance(ctx, appID, "", scope, trigger)
 	}
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }
@@ -1421,7 +1428,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 //     as *api.Problem so the existing wake contract is preserved
 //     bit-for-bit. The row falls back to the legacy "transition to
 //     FAILED, return problem" path.
-func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacityToResult bool) (WakeResult, error) {
+func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
 	app, acct, limits, dep, err := e.resolveApp(ctx, appID)
@@ -1497,7 +1504,8 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// branch stays on CodePlanLimitConcur (429) — no scale-out
 	// was attempted, the customer's request is asking for a wake
 	// that the floor already satisfies.
-	if outcome, obsCents, capCents := e.admitGate(ctx, &app, limits); outcome != wakeAdmit {
+	outcome, obsCents, capCents, concurrency := e.admitGate(ctx, &app, limits)
+	if outcome != wakeAdmit {
 		release()
 		switch outcome {
 		case wakeRejectAtCap:
@@ -1882,6 +1890,17 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// stamped it); this is the value the caller observes.
 		wakeID:    wakeID,
 		startedAt: startedAt,
+		// ADR-123: stamp trigger / queued_count / concurrency_at_admit
+		// on the bootInput bundle so both the BootStarted and
+		// BootCompleted events emit the same snapshot. `concurrency`
+		// is the ledger.Concurrency reading returned by admitGate
+		// (single read under lock); queuedCount re-reads the same
+		// value for wire-shape clarity. trigger is the closed-enum
+		// value the caller (Engine.Wake / EnsureWake / AdmitInstance)
+		// threaded through.
+		trigger:            trigger,
+		queuedCount:        concurrency,
+		concurrencyAtAdmit: concurrency,
 	}
 	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
 	// the boundary between Phase 2 (admit + ledger) and Phase 3
@@ -1986,13 +2005,16 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	}
 	if e.events != nil {
 		e.events.Emit(bootCtx, events.BootStarted{
-			EmitAt:      time.Now().UTC(),
-			WakeID:      bootInput.wakeID,
-			AppID:       bootInput.appID,
-			InstanceID:  bootInput.insID,
-			NodeID:      bootInput.nodeID,
-			Method:      method,
-			RequestedAt: bootInput.startedAt, // best-effort stamp
+			EmitAt:             time.Now().UTC(),
+			WakeID:             bootInput.wakeID,
+			AppID:              bootInput.appID,
+			InstanceID:         bootInput.insID,
+			NodeID:             bootInput.nodeID,
+			Method:             method,
+			RequestedAt:        bootInput.startedAt, // best-effort stamp
+			Trigger:            bootInput.trigger,
+			QueuedCount:        bootInput.queuedCount,
+			ConcurrencyAtAdmit: bootInput.concurrencyAtAdmit,
 		})
 	}
 	// ADR-097 (P1B): capture the schedd-side wake-phase boundaries.
@@ -2269,14 +2291,17 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	if e.events != nil {
 		now := time.Now().UTC()
 		e.events.Emit(ctx, events.BootCompleted{
-			EmitAt:      now,
-			WakeID:      bootInput.wakeID,
-			AppID:       bootInput.appID,
-			InstanceID:  bootInput.insID,
-			NodeID:      bootInput.nodeID,
-			Method:      completedMethod,
-			StartedAt:   bootInput.startedAt,
-			CompletedAt: now,
+			EmitAt:             now,
+			WakeID:             bootInput.wakeID,
+			AppID:              bootInput.appID,
+			InstanceID:         bootInput.insID,
+			NodeID:             bootInput.nodeID,
+			Method:             completedMethod,
+			StartedAt:          bootInput.startedAt,
+			CompletedAt:        now,
+			Trigger:            bootInput.trigger,
+			QueuedCount:        bootInput.queuedCount,
+			ConcurrencyAtAdmit: bootInput.concurrencyAtAdmit,
 		})
 	}
 
@@ -2323,6 +2348,28 @@ type bootInput struct {
 	// §6.1 anchor uses instances.started_at separately, so this
 	// drift is bounded by 1 row read.
 	startedAt time.Time
+
+	// ADR-123: trigger / queued_count / concurrency_at_admit
+	// snapshot at admit time. Captured at bootInput construction
+	// under the Phase 2 lock and consumed by both the BootStarted
+	// (Phase 3 entry, engine.go:1987) and BootCompleted (Phase 4
+	// commit, engine.go:2269) emits. The values are immutable
+	// across the unlocked Phase 3 window so both rows carry the
+	// same snapshot — the customer-facing wake timeline joins them
+	// on wake_id and sees identical trigger / queued / concurrency
+	// values.
+	//
+	// queued_count and concurrency_at_admit are both sourced from
+	// e.ledger.Concurrency(app.ID) (single read, under lock).
+	// The two names reflect "what was the per-app concurrency
+	// when this wake admitted" — the names map to the two
+	// Cloud-Run fields in the user's reference line. WakeGate.
+	// InflightWaiters is NOT stamped (see ADR-123 §Decision 2 —
+	// the gateway-side count reflects "currently-waiting request
+	// count", not "siblings-admitted").
+	trigger            string
+	queuedCount        int
+	concurrencyAtAdmit int
 }
 
 // timedDestroy issues a vmm.Destroy bounded by `timeout` and the
@@ -5581,7 +5628,7 @@ const (
 // out-params keep the lock-drop invariant documented at
 // engine.go:172-203 (release the per-app lock before reading the
 // cached values).
-func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limits) (wakeOutcome, int64, int64) {
+func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limits) (wakeOutcome, int64, int64, int) {
 	concurrency := e.ledger.Concurrency(app.ID)
 	// Mirror admission.go:149-152: apps created via store.CreateApp
 	// without a subsequent UpdateApp leave MaxConcurrency at 0.
@@ -5596,19 +5643,19 @@ func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limit
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "reject_at_cap")
 		}
-		return wakeRejectAtCap, 0, 0
+		return wakeRejectAtCap, 0, 0, concurrency
 	}
 	if e.isOnScaleOutCooldown(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "cooldown_held")
 		}
-		return wakeCooldownHeld, 0, 0
+		return wakeCooldownHeld, 0, 0, concurrency
 	}
 	if e.atMinFloorWithNoSignal(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "min_floor_already")
 		}
-		return wakeMinFloorAlready, 0, 0
+		return wakeMinFloorAlready, 0, 0, concurrency
 	}
 	// Issue #561: spend cap pause-workload. Nil check tolerates
 	// legacy fixtures (the branch becomes a no-op).
@@ -5623,10 +5670,10 @@ func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limit
 			// refusal, and pkg/sched/loop.go:1249 `reaper_scale_down`
 			// is the precedent for engine-initiated audit writes.
 			e.overage.RecordReached(ctx, app.AccountID, observedCents, capCents)
-			return wakeOverageCapReached, observedCents, capCents
+			return wakeOverageCapReached, observedCents, capCents, concurrency
 		}
 	}
-	return wakeAdmit, 0, 0
+	return wakeAdmit, 0, 0, concurrency
 }
 
 // isOnScaleOutCooldown (PR-C, issue #462) returns true when

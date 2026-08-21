@@ -2243,7 +2243,14 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 	// same parked app) coalesces into one virtual boot. The detached
 	// leader ctx means a cancelled triggering cron doesn't kill the
 	// boot the next follow-on caller still needs.
-	if _, err := l.engine.EnsureWake(ctx, c.AppID); err != nil {
+	// ADR-123: translate the internal CronDispatchTrigger enum to
+	// the external wake-boot trigger enum. Schedule is "60s tick",
+	// Manual is "POST /v1/crons/{id}/run (ADR-090)".
+	wakeBootTrigger := TriggerCronSched
+	if trigger == TriggerManual {
+		wakeBootTrigger = TriggerCronManual
+	}
+	if _, err := l.engine.EnsureWake(ctx, c.AppID, wakeBootTrigger); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

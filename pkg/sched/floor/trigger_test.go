@@ -80,7 +80,7 @@ type fakeEngine struct {
 	errs    map[string]error
 }
 
-func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
@@ -99,7 +99,7 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitRes
 // Honours canned results (instance_id echo) so tests that pre-load
 // a specific InstanceID — e.g. TestTick_AuditorEmitsFloorWake
 // pinning "iid-xyz" — keep working unchanged.
-func (e *fakeEngine) EnsureWake(_ context.Context, appID string) (WakeOutcome, error) {
+func (e *fakeEngine) EnsureWake(_ context.Context, appID, _ string) (WakeOutcome, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
@@ -117,7 +117,7 @@ func (e *fakeEngine) EnsureWake(_ context.Context, appID string) (WakeOutcome, e
 // trigger's per-deployment walk calls this; the per-app walk still
 // calls AdmitInstance. The fake records both with the same
 // `appID|deploymentID` shape so the tests can assert either path.
-func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID, _ string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID, _, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID+"|"+deploymentID)

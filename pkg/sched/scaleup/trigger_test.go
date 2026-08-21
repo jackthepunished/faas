@@ -58,7 +58,7 @@ type fakeEngine struct {
 	errs    map[string]error
 }
 
-func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
@@ -74,7 +74,7 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitRes
 // EnsureWake (ADR-098): scaleup's trigger-local WakeOutcome mirrors
 // the canned AdmitResult. The fake records a parallel call so tests
 // that need to count EnsureWake vs AdmitInstance calls can do so.
-func (e *fakeEngine) EnsureWake(_ context.Context, appID string) (WakeOutcome, error) {
+func (e *fakeEngine) EnsureWake(_ context.Context, appID, _ string) (WakeOutcome, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
