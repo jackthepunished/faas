@@ -32,6 +32,7 @@ from ..models.deployment_response_parked_reason_type_3_type_1 import (
     DeploymentResponseParkedReasonType3Type1,
     check_deployment_response_parked_reason_type_3_type_1,
 )
+from ..models.deployment_response_tag import DeploymentResponseTag, check_deployment_response_tag
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -159,7 +160,7 @@ class DeploymentResponse:
     ) = UNSET
     """Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer
     token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema
-    layer by migrations/00303_deployments_actor.sql's CHECK constraint."""
+    layer by migrations/00305_deployments_actor.sql's CHECK constraint."""
     deployed_from_ip: None | str | Unset = UNSET
     """Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract).
     Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in
@@ -170,6 +171,16 @@ class DeploymentResponse:
     """Raw GitHub login of the pusher when `deployed_via == "github"`. Empty for all other via values. Distinct
     from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH
     identity, suitable for downstream GitHub-API correlation."""
+    reason: str | Unset = UNSET
+    """Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."""
+    tag: DeploymentResponseTag | Unset = UNSET
+    """Closed-set annotation tag for grouping/filtering."""
+    deployed_by: str | Unset = UNSET
+    """Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the
+    GitHub Action defaults to ${{ github.actor }}."""
+    pr_number: int | Unset = UNSET
+    """Pull-request number when the wire offers it (githubd pull_request.number; Action ${{
+    github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -360,6 +371,16 @@ class DeploymentResponse:
         else:
             pusher_login = self.pusher_login
 
+        reason = self.reason
+
+        tag: str | Unset = UNSET
+        if not isinstance(self.tag, Unset):
+            tag = self.tag
+
+        deployed_by = self.deployed_by
+
+        pr_number = self.pr_number
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -428,6 +449,14 @@ class DeploymentResponse:
             field_dict["deployed_from_ip"] = deployed_from_ip
         if pusher_login is not UNSET:
             field_dict["pusher_login"] = pusher_login
+        if reason is not UNSET:
+            field_dict["reason"] = reason
+        if tag is not UNSET:
+            field_dict["tag"] = tag
+        if deployed_by is not UNSET:
+            field_dict["deployed_by"] = deployed_by
+        if pr_number is not UNSET:
+            field_dict["pr_number"] = pr_number
 
         return field_dict
 
@@ -782,6 +811,19 @@ class DeploymentResponse:
 
         pusher_login = _parse_pusher_login(d.pop("pusher_login", UNSET))
 
+        reason = d.pop("reason", UNSET)
+
+        _tag = d.pop("tag", UNSET)
+        tag: DeploymentResponseTag | Unset
+        if isinstance(_tag, Unset):
+            tag = UNSET
+        else:
+            tag = check_deployment_response_tag(_tag)
+
+        deployed_by = d.pop("deployed_by", UNSET)
+
+        pr_number = d.pop("pr_number", UNSET)
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -817,6 +859,10 @@ class DeploymentResponse:
             deployed_via=deployed_via,
             deployed_from_ip=deployed_from_ip,
             pusher_login=pusher_login,
+            reason=reason,
+            tag=tag,
+            deployed_by=deployed_by,
+            pr_number=pr_number,
         )
 
         deployment_response.additional_properties = d

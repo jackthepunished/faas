@@ -1,10 +1,11 @@
 from typing import Literal
 
-PublicAuthBlockMode = Literal["basic", "bearer", "ip_allowlist", "open"]
+PublicAuthBlockMode = Literal["basic", "bearer", "internal_only", "ip_allowlist", "open"]
 
 PUBLIC_AUTH_BLOCK_MODE_VALUES: set[PublicAuthBlockMode] = {
     "basic",
     "bearer",
+    "internal_only",
     "ip_allowlist",
     "open",
 }
