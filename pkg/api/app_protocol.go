@@ -52,16 +52,20 @@ var AppProtocolClosedSet = []string{
 
 // IsValidAppProtocol reports whether the value is in the closed
 // set. Used by apid's request validators (handlers.go::buildApp
-// and handlers_ext.go::updateApp) before the value reaches SQL
-// — the SQL layer also enforces the check via
-// apps_app_protocol_chk, but pinning the validation in Go keeps
-// the apid problem code (CodeAppProtocolInvalid) deterministic
-// before SQL is touched.
+// and handlers_ext.go::updateApp), the CLI flag validator
+// (commands2.go::cmdApp + commands5.go::cmdAppScale), and the
+// deploydiff quota gate before the value reaches SQL — the SQL
+// layer also enforces the check via apps_app_protocol_chk, but
+// pinning the validation in Go keeps the apid problem code
+// (CodeAppProtocolInvalid) deterministic before SQL is touched.
+// Iterates AppProtocolClosedSet rather than enumerating the cases
+// here so a future closed-set widening (new ADR) only touches the
+// slice.
 func IsValidAppProtocol(protocol string) bool {
-	switch protocol {
-	case AppProtocolHTTP1, AppProtocolHTTP2, AppProtocolGRPC:
-		return true
-	default:
-		return false
+	for _, v := range AppProtocolClosedSet {
+		if v == protocol {
+			return true
+		}
 	}
+	return false
 }

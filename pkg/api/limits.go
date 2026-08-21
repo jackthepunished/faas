@@ -3945,16 +3945,18 @@ func (p Plan) AppProtocolAllowed(protocol string) bool {
 	}
 }
 
-// AppProtocolDefault (ADR-124 §Decision 1) returns the value
-// apid writes when the customer omits AppProtocol on create.
-// Always "http1" per plan-approved decision — no per-plan
-// differentiation. The closed-set literal is the canonical
-// default declared at the column level (NOT NULL DEFAULT 'http1'
-// in migration 00347) so handlers can fall back to the SQL default
-// rather than relying on this helper for the empty-string case.
-func (p Plan) AppProtocolDefault() string {
-	return "http1"
-}
+// DefaultAppProtocol (ADR-124 §Decision 1) is the value apid
+// writes when the customer omits AppProtocol on create. Universal
+// "http1" — no per-plan differentiation per the ADR. The closed-
+// set literal is also the canonical default declared at the column
+// level (NOT NULL DEFAULT 'http1' in migration 00347) so handlers
+// can fall back to the SQL default rather than relying on this
+// constant for the empty-string case. Declared as a package
+// constant (not a Plan receiver method) because the value is
+// plan-independent — every Plan returns the same thing and a
+// per-plan branch would just confuse a reader about whether
+// defaults vary across tiers.
+const DefaultAppProtocol = AppProtocolHTTP1
 
 // TrafficSplitAllowed reports whether the plan permits a customer to
 // set a non-default traffic_percent on a deployment (issue #556).

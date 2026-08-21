@@ -328,21 +328,18 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 	// customer PATCHing nil is a no-op (the Set bit is unset
 	// in updateApp's UpdateAppParams call below).
 	if req.AppProtocol != nil {
-		switch *req.AppProtocol {
-		case "http1", "http2":
-			// universal — no plan gate
-		case "grpc":
-			if !acct.Plan.AppProtocolAllowed("grpc") {
-				return api.NewProblem(http.StatusForbidden,
-					api.CodePlanAppProtocolGrpcNotAllowed,
-					"Per-app gRPC wire protocol is not allowed on this plan",
-					"Free tier does not support app_protocol='grpc'; upgrade to Hobby or higher.")
-			}
-		default:
+		if !api.IsValidAppProtocol(*req.AppProtocol) {
 			return api.NewProblem(http.StatusBadRequest,
 				api.CodeAppProtocolInvalid,
 				"Invalid app_protocol",
 				"app_protocol must be one of: http1, http2, grpc")
+		}
+		if *req.AppProtocol == api.AppProtocolGRPC &&
+			!acct.Plan.AppProtocolAllowed(api.AppProtocolGRPC) {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanAppProtocolGrpcNotAllowed,
+				"Per-app gRPC wire protocol is not allowed on this plan",
+				"Free tier does not support app_protocol='grpc'; upgrade to Hobby or higher.")
 		}
 	}
 	if req.WarmSnapshotMinRequests != nil {

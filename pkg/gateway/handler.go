@@ -2951,14 +2951,15 @@ func decideStreaming(h *Handler, r *http.Request, app App) (streamingDecision, b
 	return streamingDecision{Status: api.StreamingStatusStreaming, Cap: cap, CapKind: capKind}, true
 }
 
-// decideProtocol (ADR-124) is the per-app wire-protocol selector
-// gate. Returns the validated protocol enum to stamp on
+// decideProtocol (ADR-124) is the per-app wire-protocol selector.
+// Returns the validated protocol enum to stamp on
 // x-faas-protocol for the per-app forward proxy
 // (pkg/gateway/forwardproxy.go) to read. The closed set
 // {http1, http2, grpc} is enforced upstream by apid (the
 // buildApp + updateApp gates), so this helper's only job is to
 // (a) default to "http1" when the app carries an empty value
-// (hand-built App{}s from internal callers) and (b) reflect the
+// (hand-built App{}s from internal callers and the pre-ADR-124
+// in-memory fixtures in handler_test.go) and (b) reflect the
 // app's configured value into the request header for the
 // downstream proxy leg.
 //
@@ -2970,13 +2971,16 @@ func decideStreaming(h *Handler, r *http.Request, app App) (streamingDecision, b
 // value outside the closed set is treated as "http1" so the
 // forwarder never sees an unrecognised framing selector.
 //
-// Unlike decideStreaming, this helper does not consult the
-// request shape — the customer's protocol choice is per-app, not
-// per-request. A request that arrives over H1 framing to an
-// app with app_protocol=grpc is still routed through the gRPC
-// code path; the customer's client (or the inner H2C bridge)
-// is responsible for the framing conversion.
-func decideProtocol(h *Handler, r *http.Request, app App) string {
+// Unlike decideStreaming, this helper does NOT consult the
+// request shape or any Handler config — the customer's
+// protocol choice is per-app, not per-request, so the
+// (h *Handler, r *http.Request) signature of decideStreaming
+// would only mislead a future reader. A request that arrives
+// over H1 framing to an app with app_protocol=grpc is still
+// routed through the gRPC code path; the customer's client
+// (or the inner H2C bridge) is responsible for the framing
+// conversion.
+func decideProtocol(app App) string {
 	switch app.AppProtocol {
 	case api.AppProtocolHTTP1, "":
 		return api.AppProtocolHTTP1
@@ -5168,13 +5172,20 @@ haveApp:
 		r.Header.Set("x-faas-stream", "true")
 		// ADR-124: per-app wire-protocol selector stamp. Same
 		// internal-header contract as x-faas-stream above —
-		// the forwarder reads x-faas-protocol to choose the
-		// right framing selector (H1 vs H2 vs gRPC trailer
-		// path). Set unconditionally on the streaming path so
-		// a streaming gRPC call carries both the stream flag
-		// and the protocol flag; the forwarder reads both
-		// before choosing the right gRPC channel.
-		r.Header.Set("x-faas-protocol", decideProtocol(h, r, app))
+		// the forwarder reads x-faas-protocol as
+		// observability (slog.Debug "framing selection" line
+		// at forwardproxy.go::fwdStreamOnceWithEvents) and as
+		// the framing knob for any future bridge-side
+		// consumer (filed in spec §17 G19). Set
+		// unconditionally on the streaming path so a
+		// streaming gRPC call carries both the stream flag
+		// and the protocol flag. Note: the actual framing
+		// switch (so `grpc` actually reaches the guest's
+		// `:8080` as gRPC trailers) is G19 — today the
+		// bridge re-frames to H1+chunked on the guest side
+		// per PR #750, so the per-app selector is metadata-
+		// only on the read side.
+		r.Header.Set("x-faas-protocol", decideProtocol(app))
 		// ADR-047 PR-D: bookend the streaming concurrency gauge.
 		// setupStreamingWriter installs the per-flush onFlush hook
 		// that increments streamFlushes; this Inc opens the
@@ -5296,15 +5307,17 @@ haveApp:
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
 		// ADR-124: per-app wire-protocol selector on the
-		// buffered path. The forwarder reads x-faas-protocol
-		// to pick the framing selector for the inner gRPC
-		// channel — http2 / grpc framing survives the
-		// ForwardHTTPStream RPC the same way streaming does,
-		// but the framing helper is a separate code path
-		// inside the proxy factory. Set unconditionally so a
-		// buffered HTTP/2 request still hits the H2 framing
-		// selector on the inner leg.
-		r.Header.Set("x-faas-protocol", decideProtocol(h, r, app))
+		// buffered path. Same observability-only contract as
+		// the streaming stamp above — the forwarder reads
+		// x-faas-protocol as observability (slog.Debug) and
+		// as the framing knob for the future bridge-side
+		// consumer (G19). Set unconditionally so a buffered
+		// HTTP/2 / gRPC request still carries the header for
+		// the forwarder to log. The actual framing switch on
+		// the inner leg is a separate file (the bridge today
+		// re-frames to H1+chunked on the guest side per
+		// PR #750).
+		r.Header.Set("x-faas-protocol", decideProtocol(app))
 		h.proxyByNode(target).ServeHTTP(capped, r)
 	} else {
 		// Legacy addr-based path. Target.NodeID is treated as a

@@ -1888,7 +1888,7 @@ insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle
 	// this floor, a hand-built App{} would trip 23514.
 	appProtocol := app.AppProtocol
 	if appProtocol == "" {
-		appProtocol = AppProtocolHTTP1
+		appProtocol = api.AppProtocolHTTP1
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), cidrPrefixesToArray(app.PublicAuthIPAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
@@ -2095,7 +2095,7 @@ insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle
 	// an App by hand.
 	appProtocol := app.AppProtocol
 	if appProtocol == "" {
-		appProtocol = AppProtocolHTTP1
+		appProtocol = api.AppProtocolHTTP1
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),

@@ -3158,20 +3158,6 @@ const (
 	AppPublicAuthModeInternalOnly = "internal_only"
 )
 
-// AppProtocol values for the per-app wire-protocol selector
-// (ADR-124). Mirrors the app_protocol column default at the
-// SQL layer (NOT NULL DEFAULT 'http1' in migration 00347); the
-// Go-side constants exist so handlers, validators, and the
-// INSERT path can avoid hard-coded literals. The closed-set
-// vocabulary lives in pkg/api::api.AppProtocolClosedSet; these
-// constants are the canonical spellings used by the store
-// layer. Adding a fourth value requires a new ADR.
-const (
-	AppProtocolHTTP1 = "http1"
-	AppProtocolHTTP2 = "http2"
-	AppProtocolGRPC  = "grpc"
-)
-
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
 //
 // imaged is the only writer; schedd reads the latest non-stale row per

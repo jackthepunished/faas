@@ -334,24 +334,24 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// error message would never reach the customer. Mirrors the
 	// streaming_enabled / require_authn shape above.
 	if req.AppProtocol != nil {
-		switch *req.AppProtocol {
-		case "http1", "http2":
-			// universal — no plan gate
-		case "grpc":
-			if !acct.Plan.AppProtocolAllowed("grpc") {
-				return state.App{}, api.NewProblem(http.StatusForbidden,
-					api.CodePlanAppProtocolGrpcNotAllowed,
-					"Per-app gRPC wire protocol is not allowed on this plan",
-					"Free tier does not support app_protocol='grpc'; upgrade to Hobby or higher.")
-			}
-		default:
+		if !api.IsValidAppProtocol(*req.AppProtocol) {
 			return state.App{}, api.NewProblem(http.StatusBadRequest,
 				api.CodeAppProtocolInvalid,
 				"Invalid app_protocol",
 				"app_protocol must be one of: http1, http2, grpc")
 		}
+		if *req.AppProtocol == api.AppProtocolGRPC &&
+			!acct.Plan.AppProtocolAllowed(api.AppProtocolGRPC) {
+			return state.App{}, api.NewProblem(http.StatusForbidden,
+				api.CodePlanAppProtocolGrpcNotAllowed,
+				"Per-app gRPC wire protocol is not allowed on this plan",
+				"Free tier does not support app_protocol='grpc'; upgrade to Hobby or higher.")
+		}
 	}
-	appProtocol := acct.Plan.AppProtocolDefault()
+	appProtocol := api.AppProtocolHTTP1
+	if req.AppProtocol != nil {
+		appProtocol = *req.AppProtocol
+	}
 	if req.AppProtocol != nil {
 		appProtocol = *req.AppProtocol
 	}

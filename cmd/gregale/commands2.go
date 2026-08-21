@@ -427,10 +427,7 @@ func cmdApp(args []string) int {
 	// per-plan default applies).
 	if explicit["app-protocol"] {
 		v := *appProtocol
-		switch v {
-		case "http1", "http2", "grpc":
-			// closed set — OK
-		default:
+		if !api.IsValidAppProtocol(v) {
 			return printErr("Invalid --app-protocol",
 				fmt.Errorf("must be 'http1', 'http2', or 'grpc'; got %q", v))
 		}
