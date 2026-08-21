@@ -603,12 +603,12 @@ const testDomain = "apps.test.example"
 // + PR #1000 (consumer_keys); PR #990 fences 00310-00312 in its own
 // renumber chain, leaving 00313 as the first free slot above all
 // open PR fences). Issue #977 / ADR-116 deployment annotations rebump
-// 00288 → 00344 (00310-00312 fenced by PR #990; 00313 taken by #986;
+// 00288 → 00346 (00310-00312 fenced by PR #990; 00313 taken by #986;
 // 00314 + 00315 taken by #990/#991; PR #999 fences 00326 (apps_public_auth_ip_allowlist; merged to main); 00329 taken by #1000 consumer_keys; 00333 fence by #1005; PR #1004 kinesis/documentdb 00334; PR #1010 repair_app_secrets_scope 00341; 00342 is the first free slot above #1010 repair's 00338 fence line). The discipline
 // (memory: cross-pr-slot-gate-fence-pattern) is that the only line a
 // migration land touches in this file is this constant + the doc-comment
 // history above.
-const e2eMigrationTarget = 344
+const e2eMigrationTarget = 346
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
