@@ -61,6 +61,7 @@ advisory_sock = "/run/faas/apid-other.sock"
 githubd_bridge_sock = "/run/faas/apid-githubd-other.sock"
 githubd_socket = "/run/faas/githubd-other.sock"
 apps_domain = "apps.example.com"
+db_url = "postgres:///faas?host=/run/postgresql&user=faas"
 advisory_tls_cert_path = "/etc/faas/tls/apid/advisory.crt"
 advisory_tls_key_path = "/etc/faas/tls/apid/advisory.key"
 advisory_tls_ca_path = "/etc/faas/tls/ca.pem"
@@ -97,6 +98,9 @@ role = "control-plane"
 	}
 	if cfg.AppsDomain != "apps.example.com" {
 		t.Errorf("AppsDomain = %q", cfg.AppsDomain)
+	}
+	if cfg.DBURL != "postgres:///faas?host=/run/postgresql&user=faas" {
+		t.Errorf("DBURL = %q", cfg.DBURL)
 	}
 	if cfg.AdvisoryTLSCertPath == "" || cfg.AdvisoryTLSKeyPath == "" || cfg.AdvisoryTLSCAPath == "" {
 		t.Errorf("advisory TLS path overrides not all set: %+v", cfg)

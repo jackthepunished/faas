@@ -145,10 +145,13 @@
       # one-box FaaS security baseline (spec §11): unix-socket only.
       # Production clients connect via the local socket in /var/run/postgresql.
       local   all             postgres                                peer
-      local   all             faas                                    peer
-      # Split-box daemons use a password-authenticated TCP DSN even when they
-      # are colocated with PostgreSQL. Keep loopback explicit so the same
-      # sealed DATABASE_URL works on the control plane and on compute nodes.
+      # Control-plane services run as dedicated OS users but connect as the
+      # single faas database role. The ident map keeps peer auth local and
+      # avoids placing the database password in sealed.env on the control box.
+      local   all             faas                                    peer map=faas_map
+      # Split-box compute daemons use a password-authenticated TCP DSN. Keep
+      # loopback explicit for operator diagnostics and legacy migrations; the
+      # control-plane services use the peer-mapped Unix socket above.
       host    faas            faas                                    127.0.0.1/32            scram-sha-256
       host    faas            faas                                    ::1/128                  scram-sha-256
       {% for cidr in (faas_postgres_allowed_cidrs | default([])) %}
@@ -157,6 +160,24 @@
       host    all             all             127.0.0.1/32            reject
       host    all             all             ::1/128                 reject
   register: pg_hba
+  failed_when: false
+  notify: reload postgresql
+
+- name: postgres — map control-plane service users to database role faas
+  ansible.builtin.blockinfile:
+    path: "{{ postgres_config_dir }}/pg_ident.conf"
+    create: true
+    owner: postgres
+    group: postgres
+    mode: "0640"
+    marker: "# {mark} faas control-plane peer map"
+    block: |
+      faas_map faas         faas
+      faas_map faas-apid    faas
+      faas_map faas-schedd  faas
+      faas_map faas-meterd  faas
+      faas_map faas-githubd faas
+  register: pg_ident
   failed_when: false
   notify: reload postgresql
 

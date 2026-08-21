@@ -81,6 +81,13 @@ type Config struct {
 	// FAAS_APPS_DOMAIN. The public Gregale default is gregale.dev.
 	AppsDomain string `toml:"apps_domain"`
 
+	// DBURL is apid's Postgres DSN. An empty value preserves the
+	// containerised-deploys path and lets db.Open resolve DATABASE_URL or
+	// its local Unix-socket default. Manifest-rendered control-plane TOML
+	// carries the local socket DSN so an old TCP environment value cannot
+	// silently override the topology.
+	DBURL string `toml:"db_url"`
+
 	// Server-mTLS material for the advisory listener (ADR-052 /
 	// issue #95). All three paths empty => no TLS, single-box unix
 	// socket path; all three set => RequireAndVerifyClientCert for
