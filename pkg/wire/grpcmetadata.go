@@ -54,9 +54,9 @@ const (
 	// (pkg/vmmdgrpc/server.go:emitBootStartedMirror) carries the same
 	// context as the canonical schedd emit. Empty values are skipped
 	// — a producer that doesn't know ADR-123 sends no keys at all.
-	mdKeyWakeBootTrigger  = "x-faas-wake-boot-trigger"
-	mdKeyWakeBootQueued   = "x-faas-wake-boot-queued"
-	mdKeyWakeBootConc     = "x-faas-wake-boot-conc"
+	mdKeyWakeBootTrigger = "x-faas-wake-boot-trigger"
+	mdKeyWakeBootQueued  = "x-faas-wake-boot-queued"
+	mdKeyWakeBootConc    = "x-faas-wake-boot-conc"
 )
 
 // WithCorrelationOutgoing attaches fields to ctx as gRPC outgoing

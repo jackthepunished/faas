@@ -227,8 +227,8 @@ func TestWithCorrelationOutgoing_ADR123_WakeBootEnvelope(t *testing.T) {
 func TestCorrelationFromIncoming_ADR123_WakeBootEnvelope(t *testing.T) {
 	md := metadata.New(map[string]string{
 		"x-faas-wake-boot-trigger": "cron.schedule",
-		"x-faas-wake-boot-queued":   "8",
-		"x-faas-wake-boot-conc":     "5",
+		"x-faas-wake-boot-queued":  "8",
+		"x-faas-wake-boot-conc":    "5",
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 	fields, ok := wire.CorrelationFromIncoming(ctx)
