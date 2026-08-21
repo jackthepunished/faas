@@ -38,11 +38,11 @@ import (
 //
 // WaitForNotification's guard ordering is:
 //
-//   1. pool == nil
-//   2. channel == ""
-//   3. predicate == nil
-//   4. timeout <= 0
-//   5. → pool.Acquire (DB-bound)
+//  1. pool == nil
+//  2. channel == ""
+//  3. predicate == nil
+//  4. timeout <= 0
+//  5. → pool.Acquire (DB-bound)
 //
 // A typed-nil pool stops at guard #1; the rest can't run
 // without spinning up Postgres.

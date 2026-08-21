@@ -1,8 +1,8 @@
 // snapshot_or_rootfs_test.go — §6.2 invariant #3:
 //
-//   An app always has a live snapshot OR a cold-bootable
-//   rootfs — never neither (ADR-005: snapshots are cache, not
-//   truth; the rootfs is the load-bearing artefact).
+//	An app always has a live snapshot OR a cold-bootable
+//	rootfs — never neither (ADR-005: snapshots are cache, not
+//	truth; the rootfs is the load-bearing artefact).
 //
 // Property-driven test: random walks through the canonical
 // state transitions never leave the (snapshot, rootfs)

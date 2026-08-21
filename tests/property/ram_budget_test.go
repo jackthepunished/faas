@@ -1,7 +1,7 @@
 // ram_budget_test.go — §6.2 invariant #2:
 //
-//   Σ(ram_mb + 8) over live instances ≤ 47,600 MB (85% of
-//   56 GB tenant budget).
+//	Σ(ram_mb + 8) over live instances ≤ 47,600 MB (85% of
+//	56 GB tenant budget).
 //
 // Property-driven test: random admit/release cycles across
 // multiple apps + multiple nodes keep the fleet-wide Σ and
@@ -54,15 +54,15 @@ func TestSchedProperty_FleetRAMBudget(t *testing.T) {
 			node := nodes[rng.Intn(len(nodes))]
 			ram := []int{128, 256, 512, 1024}[rng.Intn(4)]
 			err := l.Admit(sched.Request{
-				Instance:        inst,
-				AppID:           app,
-				NodeID:          node,
-				RAMMB:           ram,
-				VCPU:            1,
-				Plan:            api.PlanHobby,
-				NodeCeilingMB:   100000, // per-node: well above cap so global is the gate
-				VCPUBudget:      160,
-				MaxConcurrency:  100, // disable per-app gate for this test
+				Instance:       inst,
+				AppID:          app,
+				NodeID:         node,
+				RAMMB:          ram,
+				VCPU:           1,
+				Plan:           api.PlanHobby,
+				NodeCeilingMB:  100000, // per-node: well above cap so global is the gate
+				VCPUBudget:     160,
+				MaxConcurrency: 100, // disable per-app gate for this test
 			})
 			if err == nil {
 				live = append(live, admit{inst, app, node, ram})
@@ -111,29 +111,29 @@ func TestSchedProperty_PerNodeRAMCeiling(t *testing.T) {
 	// admit would push to 1088 MB > 1024 → rejected.
 	for i := 0; i < 7; i++ {
 		if err := l.Admit(sched.Request{
-			Instance:        "vm-n" + strconv.Itoa(i),
-			AppID:           "n-app",
-			NodeID:          "node-x",
-			RAMMB:           128,
-			VCPU:            1,
-			Plan:            api.PlanScale,
-			NodeCeilingMB:   nodeCeilingMB,
-			VCPUBudget:      160,
-			MaxConcurrency:  100,
+			Instance:       "vm-n" + strconv.Itoa(i),
+			AppID:          "n-app",
+			NodeID:         "node-x",
+			RAMMB:          128,
+			VCPU:           1,
+			Plan:           api.PlanScale,
+			NodeCeilingMB:  nodeCeilingMB,
+			VCPUBudget:     160,
+			MaxConcurrency: 100,
 		}); err != nil {
 			t.Fatalf("Admit #%d: %v", i, err)
 		}
 	}
 	err := l.Admit(sched.Request{
-		Instance:        "vm-n-overflow",
-		AppID:           "n-app",
-		NodeID:          "node-x",
-		RAMMB:           128,
-		VCPU:            1,
-		Plan:            api.PlanScale,
-		NodeCeilingMB:   nodeCeilingMB,
-		VCPUBudget:      160,
-		MaxConcurrency:  100,
+		Instance:       "vm-n-overflow",
+		AppID:          "n-app",
+		NodeID:         "node-x",
+		RAMMB:          128,
+		VCPU:           1,
+		Plan:           api.PlanScale,
+		NodeCeilingMB:  nodeCeilingMB,
+		VCPUBudget:     160,
+		MaxConcurrency: 100,
 	})
 	if err == nil {
 		t.Fatal("8th admit on 1024 MB ceiling: want ErrCapacity, got nil — §6.2-2 per-node invariant violated")

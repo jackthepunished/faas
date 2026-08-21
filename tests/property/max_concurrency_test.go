@@ -1,7 +1,7 @@
 // max_concurrency_test.go — §6.2 invariant #1:
 //
-//   ≤ `max_concurrency(plan)` instances of an app in {WAKING,
-//     COLD_BOOTING, RUNNING}.
+//	≤ `max_concurrency(plan)` instances of an app in {WAKING,
+//	  COLD_BOOTING, RUNNING}.
 //
 // Property-driven test: random admit/release cycles per plan
 // never lift Concurrency(app) past the catalog's MaxConcurrency.
@@ -42,9 +42,9 @@ import (
 //     reject by iteration 2; Scale's cap=20 by iteration 21).
 func TestSchedProperty_MaxConcurrencyPerApp(t *testing.T) {
 	const (
-		seed       = 42
-		iters      = 200
-		appName    = "test-app"
+		seed    = 42
+		iters   = 200
+		appName = "test-app"
 	)
 	caps := map[api.Plan]int{
 		api.PlanFree:  1,
@@ -69,15 +69,15 @@ func TestSchedProperty_MaxConcurrencyPerApp(t *testing.T) {
 					// Admit: choose a fresh instance id.
 					inst := "vm-" + strconv.Itoa(i)
 					err := l.Admit(sched.Request{
-						Instance:        inst,
-						AppID:           appName,
-						NodeID:          "node-a",
-						RAMMB:           128,
-						VCPU:            1,
-						Plan:            plan,
-						NodeCeilingMB:   100000,
-						VCPUBudget:      160,
-						MaxConcurrency:  cap,
+						Instance:       inst,
+						AppID:          appName,
+						NodeID:         "node-a",
+						RAMMB:          128,
+						VCPU:           1,
+						Plan:           plan,
+						NodeCeilingMB:  100000,
+						VCPUBudget:     160,
+						MaxConcurrency: cap,
 					})
 					if err == nil {
 						liveAdmissions = append(liveAdmissions, inst)
@@ -124,30 +124,30 @@ func TestSchedProperty_MaxConcurrencyHobbyExactCap(t *testing.T) {
 	l := sched.NewNodeLedger()
 	for i := 0; i < cap; i++ {
 		if err := l.Admit(sched.Request{
-			Instance:        "vm-h" + strconv.Itoa(i),
-			AppID:           "hobby-app",
-			NodeID:          "node-a",
-			RAMMB:           128,
-			VCPU:            1,
-			Plan:            api.PlanHobby,
-			NodeCeilingMB:   100000,
-			VCPUBudget:      160,
-			MaxConcurrency:  cap,
+			Instance:       "vm-h" + strconv.Itoa(i),
+			AppID:          "hobby-app",
+			NodeID:         "node-a",
+			RAMMB:          128,
+			VCPU:           1,
+			Plan:           api.PlanHobby,
+			NodeCeilingMB:  100000,
+			VCPUBudget:     160,
+			MaxConcurrency: cap,
 		}); err != nil {
 			t.Fatalf("Admit #%d: %v", i, err)
 		}
 	}
 	// The (cap+1)-th admission MUST fail.
 	err := l.Admit(sched.Request{
-		Instance:        "vm-h-overflow",
-		AppID:           "hobby-app",
-		NodeID:          "node-a",
-		RAMMB:           128,
-		VCPU:            1,
-		Plan:            api.PlanHobby,
-		NodeCeilingMB:   100000,
-		VCPUBudget:      160,
-		MaxConcurrency:  cap,
+		Instance:       "vm-h-overflow",
+		AppID:          "hobby-app",
+		NodeID:         "node-a",
+		RAMMB:          128,
+		VCPU:           1,
+		Plan:           api.PlanHobby,
+		NodeCeilingMB:  100000,
+		VCPUBudget:     160,
+		MaxConcurrency: cap,
 	})
 	if err == nil {
 		t.Fatal("3rd Hobby admit: want ErrPlanLimitConcurrency, got nil — §6.2-1 invariant violated")

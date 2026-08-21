@@ -1,7 +1,7 @@
 // parked_zero_ram_test.go — §6.2 invariant #4:
 //
-//   A parked app consumes zero resident RAM (its cgroup must
-//   be gone).
+//	A parked app consumes zero resident RAM (its cgroup must
+//	be gone).
 //
 // Property-driven test: random admit/release cycles on
 // pkg/sched.NewNodeLedger keep ResidentRAMForNode(node) = 0
@@ -55,15 +55,15 @@ func TestSchedProperty_ParkedZeroRAM(t *testing.T) {
 			node := nodes[rng.Intn(len(nodes))]
 			ram := []int{128, 256, 512}[rng.Intn(3)]
 			err := l.Admit(sched.Request{
-				Instance:        inst,
-				AppID:           app,
-				NodeID:          node,
-				RAMMB:           ram,
-				VCPU:            1,
-				Plan:            api.PlanScale,
-				NodeCeilingMB:   100000,
-				VCPUBudget:      160,
-				MaxConcurrency:  100,
+				Instance:       inst,
+				AppID:          app,
+				NodeID:         node,
+				RAMMB:          ram,
+				VCPU:           1,
+				Plan:           api.PlanScale,
+				NodeCeilingMB:  100000,
+				VCPUBudget:     160,
+				MaxConcurrency: 100,
 			})
 			if err == nil {
 				admissions = append(admissions, live{inst, app, node, ram})
@@ -117,15 +117,15 @@ func TestSchedProperty_ReleaseAllDropsRAMToZero(t *testing.T) {
 	l := sched.NewNodeLedger()
 	for i := 0; i < 5; i++ {
 		if err := l.Admit(sched.Request{
-			Instance:        "z-" + strconv.Itoa(i),
-			AppID:           "z-app",
-			NodeID:          "node-z",
-			RAMMB:           128,
-			VCPU:            1,
-			Plan:            api.PlanScale,
-			NodeCeilingMB:   100000,
-			VCPUBudget:      160,
-			MaxConcurrency:  100,
+			Instance:       "z-" + strconv.Itoa(i),
+			AppID:          "z-app",
+			NodeID:         "node-z",
+			RAMMB:          128,
+			VCPU:           1,
+			Plan:           api.PlanScale,
+			NodeCeilingMB:  100000,
+			VCPUBudget:     160,
+			MaxConcurrency: 100,
 		}); err != nil {
 			t.Fatalf("Admit %d: %v", i, err)
 		}

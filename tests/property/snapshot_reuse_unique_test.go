@@ -1,7 +1,7 @@
 // snapshot_reuse_unique_test.go — §6.2 invariant #5:
 //
-//   Two instances restored from one snapshot never share IP,
-//   netns, jail uid, or RNG stream.
+//	Two instances restored from one snapshot never share IP,
+//	netns, jail uid, or RNG stream.
 //
 // Property-driven test: under random acquire/release on a
 // fresh pkg/fcvm.Allocator, no two leases share UID, host IP,
