@@ -9,6 +9,3 @@
 self-hosted-runner:
   labels:
     - kvm
-    - lima
-    - lima-arm64
-    - metal

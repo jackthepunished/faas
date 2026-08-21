@@ -183,11 +183,11 @@ jobs:
       # this; CI never did. On ubuntu-latest, nft is not pre-installed
       # (lives in apt: nftables) — apt-get it before invoking the target
       # so the `nft -c -f` kernel-syntax check actually runs (the
-      # Makefile self-skips that sub-step when nft is absent, but the
-      # apt precedent at ci.yml:1167/1216/1265/1314 already exists in
-      # cd-controlplane.yml for grype/syft). On macOS dev the kernel
-      # sub-step self-skips; bridge-name guard + Go cross-check still
-      # run.
+      # Makefile self-skips that sub-step when nft is absent, and also
+      # self-skips the `Operation not permitted` sandbox failure on
+      # GitHub-hosted runners — bridge-name guard + Go cross-check
+      # still run in both cases). On macOS dev the kernel sub-step
+      # self-skips; bridge-name guard + Go cross-check still run.
       - name: install nftables
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
       - name: egress check (Go renderer ↔ Jinja2 + nft syntax + bridge-name guard)
@@ -725,9 +725,12 @@ jobs:
       # cost, so the second regen is ~3 s. Wall cost fits the 5-min
       # job budget.
       - name: regen determinism (twice)
+        # Each `npm run gen:check` already ends with `git diff --exit-code
+        # -- src/generated` (sdk/node/package.json:30); chaining it twice
+        # is the determinism invariant (clean regen → clean regen → still
+        # clean). Two regens, two diffs — no third trailing diff needed.
         working-directory: sdk/node
-        run: |
-          npm run gen:check && npm run gen:check && git diff --exit-code -- sdk/node/src/generated
+        run: npm run gen:check && npm run gen:check
       - name: smoke test
         working-directory: sdk/node
         run: npm run test:smoke
@@ -774,9 +777,9 @@ jobs:
       # `sdk/python/.venv/bin/python` (Makefile:797) and CI's
       # sdk-python job installs deps system-wide (line 758-761), not
       # into a venv — the Makefile target would fail with "no such
-      # file or directory". The pre-existing line 771 step name
-      # claimed "regen determinism" but only ran pytest; this split
-      # makes the contract honest.
+      # file or directory". The pre-existing single step in this job
+      # was named "smoke + unit + regen determinism" but only ran
+      # pytest; this split makes the contract honest.
       - name: regen determinism (twice)
         working-directory: sdk/python
         run: |
