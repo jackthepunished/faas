@@ -2439,10 +2439,29 @@ type Event struct {
 // Used by the dashboard's "Recent wakes" table and the per-app
 // wake-timeline view to render "why did this instance start?"
 // without a separate client-side join.
+//
+// PR-A extends the projection with two more fields that close the
+// user's "2/2 at concurrency limit" + "Ready in: 112 ms" reference
+// lines:
+//
+//   - AtCapacity is the bool stamped on wake.boot_started by
+//     pkg/sched.Engine.admitGate's wakeAdmit branch (true when the
+//     pre-admit ledger reading was maxConc-1). Always populated in
+//     PR-A fleet rows; defaults to false for pre-PR-A rows via the
+//     pgstore's COALESCE.
+//
+//   - ReadyInMS is the wall-clock duration between boot_started.at
+//     and the matching boot_completed.at, computed in SQL with
+//     EXTRACT(MILLISECONDS …). Zero when no boot_completed row
+//     exists yet (wake still booting or rejected); the template
+//     renders em-dash on zero per the existing absent-value
+//     convention.
 type WakeBootMeta struct {
 	Trigger            string // pkg/sched/triggers.go closed enum; "" if absent
 	QueuedCount        int    // ledger.Concurrency at admit; 0 if absent
 	ConcurrencyAtAdmit int    // same reading; 0 is the cold-start case
+	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
+	ReadyInMS          int    // PR-A — derived from boot_completed.at - boot_started.at; 0 if still booting or rejected
 }
 
 // AuditLog is one row of the FK-free, immutable post-deletion evidence

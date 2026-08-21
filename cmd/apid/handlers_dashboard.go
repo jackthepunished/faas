@@ -104,6 +104,17 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 				s.renderDomainDoctor(w, r, log, acct, dslug, domain)
 				return
 			}
+			// PR-A (ADR-123 follow-on) — per-app wake timeline
+			// drill-down. /dashboard/apps/{slug}/wake-timeline
+			// renders a 24h trigger-histogram + at-cap count
+			// summary card and a 50-row recent-wakes table
+			// mirroring the recent-wakes columns on app_detail.
+			// Falls through to renderAppDetail when the suffix
+			// doesn't match.
+			if tslug, ok := parseWakeTimelinePath(slug); ok {
+				s.renderAppWakeTimeline(w, r, log, acct, tslug)
+				return
+			}
 			s.renderAppDetail(w, r, log, acct, slug)
 		case path == "/dashboard/usage":
 			s.renderUsage(w, r, log, acct)
@@ -475,14 +486,21 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		if !ins.LastRequestAt.IsZero() {
 			item.LastRequestAt = ins.LastRequestAt.UTC().Format(time.RFC3339)
 		}
-		// ADR-123: stamp trigger / queued_count / concurrency_at_admit
-		// from the wake.boot_started event row. Pre-ADR-123 rows have
-		// no event row, so the fields stay zero/empty — the template
-		// renders an em-dash in that case (existing convention).
+		// ADR-123 + PR-A: stamp trigger / queued_count /
+		// concurrency_at_admit / at_capacity / ready_in_ms from the
+		// wake.boot_started (+ boot_completed, for ready_in_ms) event
+		// rows. Pre-ADR-123 rows have no event row, so the fields stay
+		// zero/empty — the template renders an em-dash in that case
+		// (existing convention). For at_capacity and ready_in_ms
+		// specifically: pre-PR-A rows still lack the at_capacity field
+		// on the boot_started jsonb; pgstore.LookupBootStartedForWakes
+		// defaults to (false, 0) via COALESCE.
 		if meta, ok := bootMetas[ins.WakeID]; ok {
 			item.Trigger = meta.Trigger
 			item.QueuedCount = meta.QueuedCount
 			item.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
+			item.AtCapacity = meta.AtCapacity
+			item.ReadyInMS = meta.ReadyInMS
 		}
 		recentItems = append(recentItems, item)
 	}
@@ -2216,6 +2234,158 @@ func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log 
 	page := dashboard.Page{
 		Title:   "Doctor — " + domain,
 		Body:    "domain_doctor",
+		Account: dashboardAccountView(acct, 0),
+		Data:    view,
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// parseWakeTimelinePath (PR-A / ADR-123 follow-on) splits a
+// /dashboard/apps/{slug}/... suffix into (slug, ok) when the suffix
+// matches /wake-timeline exactly. Returns ok=false when the suffix
+// doesn't match — caller falls through to renderAppDetail. Mirrors
+// parseDomainDoctorPath at :2108 (prefix match + exact-tail match).
+// The exact-tail match posture is intentional — a future sub-tab
+// (/wake-timeline/{day|trigger|state}) would land with its own
+// parser without disturbing this one.
+func parseWakeTimelinePath(rest string) (string, bool) {
+	const tail = "/wake-timeline"
+	idx := strings.Index(rest, tail)
+	if idx < 0 {
+		return "", false
+	}
+	after := rest[idx+len(tail):]
+	if after != "" {
+		// Sub-tab shape (/wake-timeline/{tab}) — leave for a
+		// sibling dispatcher to claim when one lands.
+		return "", false
+	}
+	slug := rest[:idx]
+	if slug == "" || strings.Contains(slug, "/") {
+		return "", false
+	}
+	return slug, true
+}
+
+// renderAppWakeTimeline (PR-A / ADR-123 follow-on) renders
+// /dashboard/apps/{slug}/wake-timeline — the per-app wake-narrative
+// drill-down. Composed of three blocks:
+//
+//  1. Page header (app name + slug + back-link to app detail).
+//  2. 24h summary card: total wakes + trigger histogram +
+//     at-cap count + at-cap pct. All aggregation happens at the
+//     handler edge so the template stays FuncMap-free (the
+//     stages pattern).
+//  3. Recent wakes table (up to 50 rows) — the same column
+//     set the app-detail recent-wakes table exposes, with
+//     AtCapacity + ReadyInMS added by PR-A. Rows with no
+//     matching wake.boot_started event (pre-ADR-123 fleet)
+//     still appear; the view renders em-dash for missing
+//     fields per the existing convention.
+//
+// IDOR posture mirrors renderDomainDoctor / renderDeploymentDetail:
+// AppBySlug + AccountID rejection first, then render. Falls through
+// to http.NotFound on a cross-tenant probe.
+func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug string) {
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return
+	}
+	// Recent wakes for this app: capped at 50 (vs 10 on
+	// app_detail) since the per-app page is the dedicated
+	// wake-narrative surface. Bounded at the SQL layer
+	// (LIMIT 50 in ListLatestInstancesForApp) so a long-lived
+	// app never pulls its full history on every dashboard
+	// render. Failure is non-fatal — the section silently
+	// renders empty.
+	instances, err := s.store.ListLatestInstancesForApp(ctx, app.ID, 50)
+	if err != nil {
+		log.Warn("dashboard renderAppWakeTimeline: list recent instances", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		instances = nil
+	}
+	// Batched lookup of the wake-boot telemetry for every wake_id
+	// in one SQL round-trip (uses events_wake_id_idx). Failure
+	// is non-fatal — pre-ADR-123 fleet or a transient Postgres
+	// blip on the events table leaves the new columns blank
+	// (em-dash at the view layer).
+	wakeIDs := make([]string, 0, len(instances))
+	for _, ins := range instances {
+		if ins.WakeID != "" {
+			wakeIDs = append(wakeIDs, ins.WakeID)
+		}
+	}
+	bootMetas := make(map[string]state.WakeBootMeta)
+	if len(wakeIDs) > 0 {
+		if m, err := s.store.LookupBootStartedForWakes(ctx, wakeIDs); err == nil {
+			bootMetas = m
+		} else {
+			log.Warn("dashboard renderAppWakeTimeline: lookup boot started", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		}
+	}
+	// 24h summary card. TriggerHistogram is built from the
+	// wake.boot_started metas of the rows returned (which are
+	// the 50 most-recent instance rows — a 24h upper bound
+	// for any sane customer workload; the dashboard never
+	// claims "true" 24h since it would need a separate SQL
+	// scan). AtCapacityCount mirrors that scope. Documented
+	// on the template: "the 50 most recent wakes (≤24h for
+	// any sane workload)".
+	triggerHist := make(map[string]int)
+	atCapCount := 0
+	rows := make([]views.WakeTimelineRow, 0, len(instances))
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, ins := range instances {
+		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
+			// Skip rows older than 24h — instances are
+			// returned in DESC order so the moment we see
+			// one before the cutoff we can break.
+			continue
+		}
+		meta, hasMeta := bootMetas[ins.WakeID]
+		row := views.WakeTimelineRow{
+			Kind:  "wake.boot_started",
+			State: ins.State,
+		}
+		if !ins.StartedAt.IsZero() {
+			row.At = ins.StartedAt.UTC().Format(time.RFC3339)
+		}
+		if hasMeta {
+			row.Trigger = meta.Trigger
+			row.QueuedCount = meta.QueuedCount
+			row.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
+			row.AtCapacity = meta.AtCapacity
+			row.ReadyInMS = meta.ReadyInMS
+			if meta.Trigger != "" {
+				triggerHist[meta.Trigger]++
+			}
+			if meta.AtCapacity {
+				atCapCount++
+			}
+		}
+		rows = append(rows, row)
+	}
+	wakeCount24h := len(rows)
+	atCapPct := 0.0
+	if wakeCount24h > 0 {
+		atCapPct = float64(atCapCount) / float64(wakeCount24h) * 100
+	}
+	view := dashboard.WakeTimelinePageData{
+		App: dashboard.AppListItem{
+			Slug: app.Slug,
+		},
+		WakeCount24h:         wakeCount24h,
+		AtCapacityCount:      atCapCount,
+		AtCapacityPct:        atCapPct,
+		TriggerHistogramHTML: views.RenderTriggerHistogram(triggerHist),
+		RenderTable:          views.RenderWakeTimelineTable(rows),
+	}
+	page := dashboard.Page{
+		Title:   "Wake timeline — " + app.Slug,
+		Body:    "app_wake_timeline",
 		Account: dashboardAccountView(acct, 0),
 		Data:    view,
 	}

@@ -10362,16 +10362,44 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 	if len(wakeIDs) == 0 {
 		return map[string]WakeBootMeta{}, nil
 	}
+	// PR-A: extended SQL adds (a) at_capacity from the boot_started
+	// jsonb (COALESCE false for pre-PR-A rows) and (b) ready_in_ms
+	// computed as EXTRACT(MILLISECONDS FROM (bc.at - bs.at)) via a
+	// LEFT JOIN LATERAL against the matching boot_completed row.
+	// Both LATERAL subqueries hit the existing events_wake_id_idx
+	// partial index from migration 00114 — no new index, no new
+	// migration. The DISTINCT ON still prefers the earliest
+	// wake.boot_started row (canonical) over the vmmd mirror
+	// fallback (pkg/vmmdgrpc/server.go:emitBootStartedMirror).
 	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT ON (data->>'wake_id')
-		        data->>'wake_id'             AS wake_id,
-		        data->>'trigger'             AS trigger,
-		        (data->>'queued_count')::int        AS queued_count,
-		        (data->>'concurrency_at_admit')::int AS concurrency_at_admit
-		 FROM events
-		 WHERE kind = 'wake.boot_started'
-		   AND data->>'wake_id' = ANY($1)
-		 ORDER BY data->>'wake_id', at ASC`,
+		`SELECT DISTINCT ON (bs.wake_id)
+		        bs.wake_id                       AS wake_id,
+		        bs.trigger                       AS trigger,
+		        bs.queued_count                  AS queued_count,
+		        bs.concurrency_at_admit          AS concurrency_at_admit,
+		        bs.at_capacity                   AS at_capacity,
+		        COALESCE(EXTRACT(MILLISECONDS FROM (bc.completed_at - bs.started_at))::int, 0) AS ready_in_ms
+		 FROM (
+		   SELECT DISTINCT ON (data->>'wake_id')
+		          data->>'wake_id'             AS wake_id,
+		          data->>'trigger'             AS trigger,
+		          (data->>'queued_count')::int        AS queued_count,
+		          (data->>'concurrency_at_admit')::int AS concurrency_at_admit,
+		          COALESCE((data->>'at_capacity')::bool, false) AS at_capacity,
+		          at                                     AS started_at
+		     FROM events
+		    WHERE kind = 'wake.boot_started'
+		      AND data->>'wake_id' = ANY($1)
+		    ORDER BY data->>'wake_id', at ASC
+		 ) bs
+		 LEFT JOIN LATERAL (
+		   SELECT at AS completed_at
+		     FROM events
+		    WHERE kind = 'wake.boot_completed'
+		      AND data->>'wake_id' = bs.wake_id
+		    ORDER BY at ASC LIMIT 1
+		 ) bc ON true
+		 ORDER BY bs.wake_id`,
 		wakeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("LookupBootStartedForWakes: %w", err)
@@ -10382,7 +10410,7 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 		var wakeID string
 		var meta WakeBootMeta
 		var trigger *string
-		if err := rows.Scan(&wakeID, &trigger, &meta.QueuedCount, &meta.ConcurrencyAtAdmit); err != nil {
+		if err := rows.Scan(&wakeID, &trigger, &meta.QueuedCount, &meta.ConcurrencyAtAdmit, &meta.AtCapacity, &meta.ReadyInMS); err != nil {
 			return nil, fmt.Errorf("LookupBootStartedForWakes: scan: %w", err)
 		}
 		if trigger != nil {
