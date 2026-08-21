@@ -44,6 +44,7 @@ was red on `unit tests (pg shard 2)`).
 | `sdk-python (gen-check + smoke + unit)`                     | sdk/python drift                          | `ci.yml:~580`     |
 | `proto-check`                                               | checked-in `*.pb.go` matches protoc       | `ci.yml:200-208`  |
 | `load (1k rps hot-path)`                                    | p50 regression under load (issue #266)    | `ci.yml:~700`     |
+| `workflow-lint (actionlint)`                                | Workflow YAML semantic lint               | `ci.yml:~1175`    |
 
 `metal (KVM + root, manual)` is intentionally **not** a required
 check — it is manual-only via `workflow_dispatch`.

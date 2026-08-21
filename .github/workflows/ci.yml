@@ -146,6 +146,53 @@ jobs:
       - name: build
         run: make build
 
+      # CI quick-wins cluster — wire missing local gates into `test` job.
+      # Each target self-documents as "CI gate" in its Makefile comment
+      # (Makefile:147 / :184 / :537 / :707) but `make build` (the only
+      # target `test` runs today) doesn't pull them in. The `make test`
+      # local aggregator wires grafana-mirror-check as a prereq, and
+      # `make pre-pr` aggregates the regenerate-and-diff gates — neither
+      # runs in CI. Adding them here catches drift at PR time instead
+      # of at the operator's first deploy on the live host.
+
+      # images-lock-check (Makefile:707, issue #197 B3.5/B3.6): every
+      # images/*.Dockerfile FROM must be digest-pinned via
+      # images/Dockerfile.lock. A failed `images-lock-update` leaves
+      # sha256:REPLACE_ME_AT_MERGE_TIME placeholders that this gate
+      # catches before the PR reaches main. Operator runs
+      # `make images-lock-update` to resolve real digests.
+      - name: images lock check (FROM digest-pinned)
+        run: make images-lock-check
+
+      # grafana-jq-check (Makefile:184, PR #837): validates every
+      # dashboard JSON parses cleanly (jq -e .). `[ -f "$$f" ]` guard
+      # in the target handles the asymmetry between deploy/grafana/
+      # (6 files) and deploy/ansible/roles/grafana/files/ (5 files;
+      # warm-snapshot has no mirror copy).
+      - name: grafana dashboard JSON parse (jq -e)
+        run: make grafana-jq-check
+
+      # grafana-mirror-check (Makefile:191, PR #837): byte-identity
+      # check between deploy/grafana/ and the ansible-role mirror.
+      # Catches dashboard drift between the dashboard source tree and
+      # what the ansible role actually deploys.
+      - name: grafana mirror byte-identity
+        run: make grafana-mirror-check
+
+      # egress-check (Makefile:537): the local aggregator pre-pr runs
+      # this; CI never did. On ubuntu-latest, nft is not pre-installed
+      # (lives in apt: nftables) — apt-get it before invoking the target
+      # so the `nft -c -f` kernel-syntax check actually runs (the
+      # Makefile self-skips that sub-step when nft is absent, but the
+      # apt precedent at ci.yml:1167/1216/1265/1314 already exists in
+      # cd-controlplane.yml for grype/syft). On macOS dev the kernel
+      # sub-step self-skips; bridge-name guard + Go cross-check still
+      # run.
+      - name: install nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: egress check (Go renderer ↔ Jinja2 + nft syntax + bridge-name guard)
+        run: make egress-check
+
       - name: systemd hardening gate
         run: make systemd-hardening-check
 
@@ -670,6 +717,17 @@ jobs:
             echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
             exit 1
           }
+      # Determinism gate (Makefile:771 sdk-gen-node-twice): regen twice
+      # and assert zero diff. A flaky codegen can pass a single-shot
+      # gen:check (output stable across one regen) but produce
+      # different files on the second run — breaking customer pins.
+      # npm ci + the gen:check above already paid the cache warmup
+      # cost, so the second regen is ~3 s. Wall cost fits the 5-min
+      # job budget.
+      - name: regen determinism (twice)
+        working-directory: sdk/node
+        run: |
+          npm run gen:check && npm run gen:check && git diff --exit-code -- sdk/node/src/generated
       - name: smoke test
         working-directory: sdk/node
         run: npm run test:smoke
@@ -710,7 +768,20 @@ jobs:
             echo "::error::Run 'make sdk-gen-python-check' locally and commit the result."
             exit 1
           }
-      - name: smoke + unit + regen determinism
+      # Determinism gate (Makefile:795 sdk-gen-python-twice): regen
+      # twice and assert zero diff. Inline form (not `make
+      # sdk-gen-python-twice`) because the Makefile target hard-codes
+      # `sdk/python/.venv/bin/python` (Makefile:797) and CI's
+      # sdk-python job installs deps system-wide (line 758-761), not
+      # into a venv — the Makefile target would fail with "no such
+      # file or directory". The pre-existing line 771 step name
+      # claimed "regen determinism" but only ran pytest; this split
+      # makes the contract honest.
+      - name: regen determinism (twice)
+        working-directory: sdk/python
+        run: |
+          python scripts/gen.py && python scripts/gen.py && git diff --exit-code -- sdk/python/faas_sdk/
+      - name: smoke + unit
         working-directory: sdk/python
         run: python -m pytest tests/ --ignore=tests/debug_chain.py -v
 
@@ -1094,6 +1165,36 @@ jobs:
           cache-dependency-path: go.sum
       - name: generate-check
         run: make generate-check
+
+  # Workflow YAML semantic lint. Recent 8-commit churn on
+  # .github/codeql/codeql-config.yml (worktree-issue-995-edge-protection
+  # series) is exactly the kind of regression actionlint catches in <5 s:
+  # - shellcheck SC2086/SC2046/SC2012 inside `run:` blocks
+  # - unknown self-hosted runner labels
+  # - missing `jobs:` / `on:` sections when a non-workflow YAML is
+  #   accidentally scanned
+  # - typos in `uses:` versions / branch refs
+  #
+  # Mirrors daemonunit-check / sqlc-check / packer-validate shape:
+  # stateless, fast (~5 s), runs on every PR. actionlint's exit code is
+  # non-zero only on real errors, not on info-level shellcheck findings
+  # — pre-existing SC2086 noise at ci.yml:374/442/481/511 will appear in
+  # CI logs as informational, not as failures. Cleanup PRs to fix those
+  # land separately.
+  #
+  # Bumping actionlint: edit the SHA + version together (mirror codecov-
+  # action pinning at ci.yml:383). Latest stable at PR time is v1.7.12;
+  # SHA `914e7df21a07ef503a81201c76d2b11c789d3fca` matches tag v1.7.12.
+  workflow-lint:
+    name: workflow-lint (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+        with:
+          version: v1.7.12
 
   packer-validate:
     # ADR-111: Packer-builder syntax gate. PR #928 lands
