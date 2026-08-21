@@ -1039,12 +1039,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 			inv.InstanceID = instanceID
 			return synth.forwardInvocation(ctx, target, inv)
 		},
-	}, log)
-	// Round-4 rebase: re-attach the NewSynthServer construction
-	// line that main's merge had inline (single-line call). The
-	// WithInternalSvcVerifier + WithMetrics + WithAudit +
-	// WithAppModeLookup chain below is the ADR-119 wiring that
-	// landed in this PR — kept intact across the merge.
+	}
+	// Construct the SynthServer before wiring the gate — the
+	// WithInternalSvcVerifier / WithMetrics / WithAudit /
+	// WithAppModeLookup chain below mutates deps.synth in place.
+	// Round-4 rebase: the previous round had this on a separate
+	// line in main; the merge put it on the closing-brace line
+	// of the synthAdapter struct literal, which broke the compile.
+	// Restoring the off-the-brace call keeps both sides readable.
 	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, synth, log)
 	// ADR-119 — wire the synth-side gate. The same per-service
 	// public-key allowlist (deps.internalSvcVerifier) gates
