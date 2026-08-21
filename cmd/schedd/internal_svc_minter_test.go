@@ -202,10 +202,10 @@ func TestLooksLikeAgeBlob(t *testing.T) {
 		want bool
 	}{
 		{"-----BEGIN AGE ENCRYPTED FILE-----\n...\n-----END AGE ENCRYPTED FILE-----", true},
-		{"aGVsbG8=", false},                                // valid base64, not age
-		{"short", false},                                   // too short
-		{"-----BEGIN AGE-----\nx", false},                  // wrong suffix
-		{"-----BEGIN AGE ENCRYPTED FILE-----", true},       // just the header
+		{"aGVsbG8=", false},                          // valid base64, not age
+		{"short", false},                             // too short
+		{"-----BEGIN AGE-----\nx", false},            // wrong suffix
+		{"-----BEGIN AGE ENCRYPTED FILE-----", true}, // just the header
 	}
 	for _, c := range cases {
 		if got := looksLikeAgeBlob([]byte(c.in)); got != c.want {

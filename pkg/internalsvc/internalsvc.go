@@ -196,14 +196,14 @@ func MintWithAudience(svcName string, ttl time.Duration, claims map[string]any,
 	// library expects callers to construct the payload
 	// themselves when they need custom claim merging.
 	payload := map[string]any{
-		"iss":   Issuer,
-		"sub":   svcName,
-		"aud":   audience,
-		"exp":   jwt.NewNumericDate(now.Add(ttl)),
-		"iat":   jwt.NewNumericDate(now),
-		"nbf":   jwt.NewNumericDate(now),
-		"jti":   uuid.NewString(),
-		"kid":   kid,
+		"iss": Issuer,
+		"sub": svcName,
+		"aud": audience,
+		"exp": jwt.NewNumericDate(now.Add(ttl)),
+		"iat": jwt.NewNumericDate(now),
+		"nbf": jwt.NewNumericDate(now),
+		"jti": uuid.NewString(),
+		"kid": kid,
 	}
 	for k, v := range claims {
 		// Defensive: do not allow callers to override the
@@ -254,7 +254,7 @@ func Verify(token string, allowedSvc map[string]ed25519.PublicKey) (string, erro
 	// to use the public key as the HMAC secret).
 	jws, err := jose.ParseSigned(token, []jose.SignatureAlgorithm{jose.EdDSA})
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrMalformed, err)
+		return "", fmt.Errorf("%w: parse: %w", ErrMalformed, err)
 	}
 
 	// Two-pass verification: parse the unverified claims to
@@ -272,7 +272,7 @@ func Verify(token string, allowedSvc map[string]ed25519.PublicKey) (string, erro
 	}
 	parsed := jwt.Claims{}
 	if err := json.Unmarshal(unverified, &parsed); err != nil {
-		return "", fmt.Errorf("%w: claims parse: %v", ErrMalformed, err)
+		return "", fmt.Errorf("%w: claims parse: %w", ErrMalformed, err)
 	}
 	if parsed.Subject == "" {
 		return "", fmt.Errorf("%w: empty sub", ErrUnknownService)
@@ -289,11 +289,11 @@ func Verify(token string, allowedSvc map[string]ed25519.PublicKey) (string, erro
 	// validity (signature is the root of trust).
 	payload, err := jws.Verify(pub)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrSignatureInvalid, err)
+		return "", fmt.Errorf("%w: %w", ErrSignatureInvalid, err)
 	}
 	finalClaims := jwt.Claims{}
 	if err := json.Unmarshal(payload, &finalClaims); err != nil {
-		return "", fmt.Errorf("%w: final claims parse: %v", ErrMalformed, err)
+		return "", fmt.Errorf("%w: final claims parse: %w", ErrMalformed, err)
 	}
 
 	// Audience check (the gate's primary contract: the token

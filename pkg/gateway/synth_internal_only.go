@@ -59,7 +59,7 @@ func (s *SynthServer) WithInternalSvcVerifier(v InternalSvcVerifier) {
 // can split the three call surfaces. The three current values:
 //   - "synth"        — handleSynthesize (legacy wake-only path)
 //   - "synth_dispatch" — handleInvocationDispatch (Move 1 single
-//                        invocation envelope)
+//     invocation envelope)
 //   - "synth_batch"  — handleInvocationDispatchBatch (Move 1 batch)
 //
 // Failure modes are identical to the HTTP-side gate:

@@ -45,7 +45,13 @@ func (c capturedRequest) authHeader() string {
 
 // captureServer is the test-side HTTP handler that captures
 // every inbound request so tests can assert on it. Returns
-// 200 OK to keep the SynthesizeRequest call path happy.
+// 200 OK + a minimal JSON envelope so both SynthesizeRequest
+// (which doesn't read the body) and Invoke (which decodes a
+// {state,result} pair) are happy. Round-6 follow-up: before
+// this fix, /v1/invocations:dispatch received an empty 200,
+// and Invoke's json.NewDecoder hit EOF decoding the empty
+// body. SynthesizeRequest doesn't decode, so it slipped past
+// earlier rounds.
 func captureServer(captured *atomic.Value) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -56,7 +62,9 @@ func captureServer(captured *atomic.Value) http.Handler {
 			Body:   body,
 		}
 		captured.Store(cp)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"state":"dispatching","result":null}`))
 	})
 }
 
@@ -298,8 +306,8 @@ func TestInvoke_InternalOnlyAttachesJWT(t *testing.T) {
 	hg, captured := newTestHTTPGatewaySynth(t, "http://example.invalid", modeLookup, mintFn(t, pub, priv, "schedd"))
 
 	inv := state.Invocation{
-		ID:    "inv-x",
-		AppID: "app-internal",
+		ID:     "inv-x",
+		AppID:  "app-internal",
 		Method: http.MethodPost,
 		Path:   "/",
 	}

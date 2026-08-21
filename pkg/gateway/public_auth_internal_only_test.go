@@ -93,7 +93,10 @@ func (a *testCountingAuthnAuditor) countByKind(kind string) int {
 
 // helper: mint a JWT with the given keypair. Used by both
 // the positive-path tests (valid token) and the negative
-// tests (expired / wrong-audience / wrong-key).
+// tests (expired / wrong-key). The audience is hardcoded to
+// internalsvc.Audience — tests that need a non-canonical
+// audience call internalsvc.MintWithAudience directly
+// (TestApplyIngressInternalSvc_WrongAudience_Returns403).
 //
 // Round-3 peer-review #7: kid comes from internalsvc.KidFromPub
 // — the same derivation cmd/schedd/internal_svc_minter.go uses
@@ -102,11 +105,13 @@ func (a *testCountingAuthnAuditor) countByKind(kind string) int {
 // the production minter's but for the wrong reason (drift
 // risk — any change to the package-level KidFromPub would
 // silently miss this test).
-func mintTestToken(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey, audience, svcName string, ttlSec int) string {
+//
+// Round-6 golangci-lint ineffassign: the previous shape took
+// an `audience` parameter that was set but never read — the
+// Mint call uses the package-level constant. Removed; tests
+// that need a different audience use MintWithAudience.
+func mintTestToken(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey, svcName string, ttlSec int) string {
 	t.Helper()
-	if audience == "" {
-		audience = internalsvc.Audience
-	}
 	kid := internalsvc.KidFromPub(pub)
 	tok, err := internalsvc.Mint(svcName, time.Duration(ttlSec)*time.Second, nil, priv, kid)
 	if err != nil {
@@ -122,7 +127,7 @@ func mintTestToken(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey,
 func newTestHandlerForInternalSvc(t *testing.T, allowedSvc map[string]ed25519.PublicKey) (*Handler, *testCountingAuthnAuditor, *testInternalSvcVerifier) {
 	t.Helper()
 	h := &Handler{
-		log:    slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		log:     slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
 		metrics: NewMetrics(),
 	}
 	v := &testInternalSvcVerifier{allowed: allowedSvc}
@@ -137,9 +142,9 @@ func newTestHandlerForInternalSvc(t *testing.T, allowedSvc map[string]ed25519.Pu
 // them).
 func internalOnlyApp() App {
 	return App{
-		ID:    "00000000-0000-0000-0000-00000000abcd",
-		Slug:  "test-internal-only",
-		Plan:  "scale",
+		ID:   "00000000-0000-0000-0000-00000000abcd",
+		Slug: "test-internal-only",
+		Plan: "scale",
 		PublicAuth: PublicAuthConfig{
 			Mode: publicAuthModeInternalOnly,
 		},
@@ -162,7 +167,7 @@ func TestApplyIngressInternalSvc_ValidToken_PassThrough(t *testing.T) {
 		"schedd": pub,
 	})
 	app := internalOnlyApp()
-	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	tok := mintTestToken(t, pub, priv, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -243,7 +248,7 @@ func TestApplyIngressInternalSvc_InvalidSignature_Returns403(t *testing.T) {
 		"schedd": pubB,
 	})
 	app := internalOnlyApp()
-	tok := mintTestToken(t, pubA, privA, "", "schedd", 30)
+	tok := mintTestToken(t, pubA, privA, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -330,7 +335,7 @@ func TestApplyIngressInternalSvc_ExpiredToken_Returns403(t *testing.T) {
 		"schedd": pub,
 	})
 	app := internalOnlyApp()
-	tok := mintTestToken(t, pub, priv, "", "schedd", -120)
+	tok := mintTestToken(t, pub, priv, "schedd", -120)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -387,9 +392,9 @@ func TestApplyIngressInternalSvc_OtherModePassThrough(t *testing.T) {
 //     audit vocabulary is for runtime auth events)
 func TestApplyIngressInternalSvc_NoVerifierWired_Returns500(t *testing.T) {
 	h := &Handler{
-		log:                  slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
-		metrics:              NewMetrics(),
-		internalSvcVerifier:  nil, // critical: misconfig
+		log:                 slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		metrics:             NewMetrics(),
+		internalSvcVerifier: nil, // critical: misconfig
 	}
 	app := internalOnlyApp()
 	rec := httptest.NewRecorder()
@@ -417,7 +422,7 @@ func TestApplyIngressInternalSvc_AuditDoesNotEchoToken(t *testing.T) {
 		"schedd": pub,
 	})
 	app := internalOnlyApp()
-	tok := mintTestToken(t, pub, priv, "", "schedd", -120) // expired → invalid-audit path (TTL -120s exceeds 1-min leeway)
+	tok := mintTestToken(t, pub, priv, "schedd", -120) // expired → invalid-audit path (TTL -120s exceeds 1-min leeway)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)

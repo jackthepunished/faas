@@ -97,8 +97,10 @@ type SynthServer struct {
 	// for a given appID. nil = every app treated as "open"
 	// (no gate, no JWT check). Wired by SynthServer.WithAppModeLookup;
 	// production wires the same per-app cache the Handler
-	// consults (cmd/gatewayd-internal/run.go).
-	appPublicAuthMode func(appID string) string
+	// consults (cmd/gatewayd-internal/run.go). The lookup
+	// takes a context so the request's ctx (with timeout /
+	// cancel chain) flows into the per-app store call.
+	appPublicAuthMode func(ctx context.Context, appID string) string
 }
 
 // NewSynthServer wires the unix-socket listener on socketPath with the
@@ -259,7 +261,23 @@ func (s *SynthServer) WithAudit(emit func(ctx context.Context, kind string, subj
 // the synth-side gate consults on every /v1/synthesize
 // request. nil = no mode lookup, every app treated as
 // "open" (the gate is a no-op for non-internal_only apps).
-func (s *SynthServer) WithAppModeLookup(lookup func(appID string) string) *SynthServer {
+//
+// The lookup signature takes a context.Context so the gate
+// can pass the inbound request's ctx (with the canonical
+// timeout / cancel chain) into the per-app store call. Round-3
+// golangci-lint contextcheck hooked the closure in
+// cmd/gatewayd-internal/run.go::WithAppModeLookup — the lint
+// flagged that the closure builds a fresh context.Background()
+// instead of receiving the request's context. The fix surfaces
+// here: the wired callback now receives ctx.
+//
+// A cache miss (or transient pg error) returns "" which the
+// gate treats as "open" (no JWT required). Returning "" on
+// error is the same posture as the HTTP-front-door gate's
+// fail-closed-on-Verify-error behavior — but at the lookup
+// layer we treat "I don't know" as "open" so a transient pg
+// blip doesn't 500 every internal_only cron fire.
+func (s *SynthServer) WithAppModeLookup(lookup func(ctx context.Context, appID string) string) *SynthServer {
 	s.appPublicAuthMode = lookup
 	return s
 }
@@ -321,7 +339,7 @@ func (s *SynthServer) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	// The mode lookup consults the per-app cache populated by
 	// the same hydration path Handler.PublicAuthConfig reads.
 	if s.appPublicAuthMode != nil {
-		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth") {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth") {
 			return
 		}
 	}
@@ -378,7 +396,7 @@ func (s *SynthServer) handleInvocationDispatch(w http.ResponseWriter, r *http.Re
 	// reads. The handler returns 403 + audit + metric; the
 	// dispatcher is never reached.
 	if s.appPublicAuthMode != nil {
-		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth_dispatch") {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth_dispatch") {
 			return
 		}
 	}
@@ -630,7 +648,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 	// difference is the "from" field is "synth_batch" instead
 	// of "synth" so dashboards can split the two surfaces.
 	if s.appPublicAuthMode != nil {
-		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(req.AppID), "synth_batch") {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth_batch") {
 			return
 		}
 	}

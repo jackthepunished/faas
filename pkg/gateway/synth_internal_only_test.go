@@ -32,8 +32,8 @@ func newTestSynthServerForInternalSvc(t *testing.T, allowedSvc map[string]ed2551
 	v := &testInternalSvcVerifier{allowed: allowedSvc}
 	a := &testCountingAuthnAuditor{}
 	srv := &SynthServer{
-		log:                slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
-		metrics:            NewMetrics(),
+		log:                 slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		metrics:             NewMetrics(),
 		internalSvcVerifier: v,
 		synthAuditEmit:      a.Emit,
 	}
@@ -113,7 +113,7 @@ func TestSynthApplyIngressInternalSvc_InvalidSignature(t *testing.T) {
 	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pubB,
 	})
-	tok := mintTestToken(t, pubA, privA, "", "schedd", 30)
+	tok := mintTestToken(t, pubA, privA, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -153,7 +153,7 @@ func TestSynthApplyIngressInternalSvc_ValidTokenPassThrough(t *testing.T) {
 	srv, a, v := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	tok := mintTestToken(t, pub, priv, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -182,7 +182,7 @@ func TestSynthApplyIngressInternalSvc_AuditDoesNotEchoToken(t *testing.T) {
 	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	tok := mintTestToken(t, pub, priv, "", "schedd", -120) // expired
+	tok := mintTestToken(t, pub, priv, "schedd", -120) // expired
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/synthesize", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -319,7 +319,7 @@ func TestSynthApplyIngressInternalSvc_DispatchInvalidSignature(t *testing.T) {
 	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pubB,
 	})
-	tok := mintTestToken(t, pubA, privA, "", "schedd", 30)
+	tok := mintTestToken(t, pubA, privA, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -353,7 +353,7 @@ func TestSynthApplyIngressInternalSvc_DispatchValidTokenPassThrough(t *testing.T
 	srv, a, v := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	tok := mintTestToken(t, pub, priv, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -428,7 +428,7 @@ func TestSynthApplyIngressInternalSvc_BatchValidTokenPassThrough(t *testing.T) {
 	srv, a, v := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	tok := mintTestToken(t, pub, priv, "", "schedd", 30)
+	tok := mintTestToken(t, pub, priv, "schedd", 30)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -455,7 +455,7 @@ func TestSynthApplyIngressInternalSvc_BatchAuditDoesNotEchoToken(t *testing.T) {
 	srv, a, _ := newTestSynthServerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	tok := mintTestToken(t, pub, priv, "", "schedd", -120) // expired
+	tok := mintTestToken(t, pub, priv, "schedd", -120) // expired
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/invocations:dispatch_batch", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)

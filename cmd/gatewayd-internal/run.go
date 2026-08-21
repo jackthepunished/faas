@@ -1060,15 +1060,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.synth.WithInternalSvcVerifier(deps.internalSvcVerifier)
 	deps.synth.WithMetrics(deps.metrics).
 		WithAudit(deps.requireAuthnAudit.Emit).
-		WithAppModeLookup(func(appID string) string {
+		WithAppModeLookup(func(ctx context.Context, appID string) string {
 			// ADR-119 — per-app mode lookup for the synth-side
 			// gate. Reads from the per-app cache hydrated by
 			// the same path Handler.PublicAuthConfig reads.
 			// A cache miss returns "" which the gate treats
 			// as "open" (no JWT required). Returns "" on error
 			// so a transient pg failure doesn't 500 every
-			// internal_only cron fire.
-			app, err := pgStore.AppByID(context.Background(), appID)
+			// internal_only cron fire. Round-3 golangci-lint
+			// contextcheck: now uses the inbound request's ctx
+			// (with timeout / cancel chain) instead of a
+			// fresh context.Background().
+			app, err := pgStore.AppByID(ctx, appID)
 			if err != nil {
 				return ""
 			}

@@ -174,13 +174,13 @@ func (v *internalSvcVerifier) AllowedSvcNames() []string {
 // alias, not on the chain — duplicate reason strings are
 // fine for the audit row.
 
-func gatewayAudienceMismatch() error   { return errors.New(internalsvc.ErrAudienceMismatch.Error()) }
-func gatewayExpired() error            { return errors.New(internalsvc.ErrExpired.Error()) }
-func gatewayNotYetValid() error        { return errors.New(internalsvc.ErrNotYetValid.Error()) }
-func gatewayUnknownService() error     { return errors.New(internalsvc.ErrUnknownService.Error()) }
-func gatewaySignatureInvalid() error   { return errors.New(internalsvc.ErrSignatureInvalid.Error()) }
-func gatewayMalformed() error          { return errors.New(internalsvc.ErrMalformed.Error()) }
-func gatewayEmptyAllowlist() error     { return errors.New(internalsvc.ErrEmptyAllowlist.Error()) }
+func gatewayAudienceMismatch() error { return errors.New(internalsvc.ErrAudienceMismatch.Error()) }
+func gatewayExpired() error          { return errors.New(internalsvc.ErrExpired.Error()) }
+func gatewayNotYetValid() error      { return errors.New(internalsvc.ErrNotYetValid.Error()) }
+func gatewayUnknownService() error   { return errors.New(internalsvc.ErrUnknownService.Error()) }
+func gatewaySignatureInvalid() error { return errors.New(internalsvc.ErrSignatureInvalid.Error()) }
+func gatewayMalformed() error        { return errors.New(internalsvc.ErrMalformed.Error()) }
+func gatewayEmptyAllowlist() error   { return errors.New(internalsvc.ErrEmptyAllowlist.Error()) }
 
 // Compile-time assertion: internalSvcVerifier satisfies the
 // pkg/gateway.InternalSvcVerifier interface. If a future
