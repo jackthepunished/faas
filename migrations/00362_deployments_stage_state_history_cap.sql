@@ -1,4 +1,4 @@
--- filename: 00358_deployments_stage_state_history_cap.sql
+-- filename: 00362_deployments_stage_state_history_cap.sql
 -- +goose Up
 -- +goose StatementBegin
 -- +goose StatementEnd
