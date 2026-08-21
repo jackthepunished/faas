@@ -2450,18 +2450,32 @@ type Event struct {
 //     PR-A fleet rows; defaults to false for pre-PR-A rows via the
 //     pgstore's COALESCE.
 //
+//   - AtCapacityPresent distinguishes "jsonb key absent" (pre-PR-A
+//     fleet row that lacks the at_capacity key entirely) from "jsonb
+//     key present and explicitly false" (PR-A row that was admitted
+//     below the cap). The dashboard's em-dash-on-absent convention
+//     (render.go / wake_timeline.go) requires this distinction so a
+//     pre-PR-A row renders "—" (we don't know) instead of "No" (we
+//     know it wasn't at the cap). Source: pgstore's
+//     `data ? 'at_capacity'` jsonb contains operator (NULL when the
+//     key is absent). Defaults to false when nil (treat as absent).
+//
 //   - ReadyInMS is the wall-clock duration between boot_started.at
 //     and the matching boot_completed.at, computed in SQL with
-//     EXTRACT(MILLISECONDS …). Zero when no boot_completed row
-//     exists yet (wake still booting or rejected); the template
-//     renders em-dash on zero per the existing absent-value
-//     convention.
+//     EXTRACT(EPOCH FROM (delta)) * 1000 (NOT EXTRACT(MILLISECONDS …)
+//     — that's silently wrong for >=60s deltas because PostgreSQL
+//     intervals are stored as months/days/seconds; EXTRACT(MILLISECONDS
+//     …) returns only the seconds-field milliseconds). Zero when no
+//     boot_completed row exists yet (wake still booting or rejected);
+//     the template renders em-dash on zero per the existing
+//     absent-value convention.
 type WakeBootMeta struct {
 	Trigger            string // pkg/sched/triggers.go closed enum; "" if absent
 	QueuedCount        int    // ledger.Concurrency at admit; 0 if absent
 	ConcurrencyAtAdmit int    // same reading; 0 is the cold-start case
 	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
-	ReadyInMS          int    // PR-A — derived from boot_completed.at - boot_started.at; 0 if still booting or rejected
+	AtCapacityPresent  bool   // PR-A — true when the at_capacity key was present in jsonb (false = absent; em-dash)
+	ReadyInMS          int    // PR-A — wall-clock boot_started → boot_completed delta in ms; 0 if still booting or rejected
 }
 
 // AuditLog is one row of the FK-free, immutable post-deletion evidence

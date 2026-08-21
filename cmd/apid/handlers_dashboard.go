@@ -500,6 +500,7 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 			item.QueuedCount = meta.QueuedCount
 			item.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
 			item.AtCapacity = meta.AtCapacity
+			item.AtCapacityPresent = meta.AtCapacityPresent
 			item.ReadyInMS = meta.ReadyInMS
 		}
 		recentItems = append(recentItems, item)
@@ -2334,16 +2335,33 @@ func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, l
 	// scan). AtCapacityCount mirrors that scope. Documented
 	// on the template: "the 50 most recent wakes (≤24h for
 	// any sane workload)".
+	//
+	// PR-A review cluster (PR #1031 finding #5): the histogram
+	// and at-cap% previously diverged from wakeCount24h because
+	// they only counted rows where hasMeta was true AND the
+	// field was non-zero. A customer reading "24 wakes" and a
+	// histogram totaling 20 was left wondering where the other
+	// 4 went. The fix: track wakeCountWithMeta as the
+	// denominator for the at-cap% and label the histogram
+	// header so the customer understands "of N known wakes".
+	// The body table still renders all 24h rows so the per-row
+	// audit trail isn't lossy.
 	triggerHist := make(map[string]int)
 	atCapCount := 0
+	wakeCountWithMeta := 0
 	rows := make([]views.WakeTimelineRow, 0, len(instances))
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	for _, ins := range instances {
 		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
-			// Skip rows older than 24h — instances are
-			// returned in DESC order so the moment we see
-			// one before the cutoff we can break.
-			continue
+			// Instances are returned in DESC order so the
+			// moment we see one before the cutoff we can
+			// break — no further iteration needed. The
+			// prior continue-only implementation walked
+			// the full slice even after every row was
+			// older than the cutoff (PR-A review
+			// finding #4 — comment promised a break but
+			// the code didn't deliver it).
+			break
 		}
 		meta, hasMeta := bootMetas[ins.WakeID]
 		row := views.WakeTimelineRow{
@@ -2354,15 +2372,17 @@ func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, l
 			row.At = ins.StartedAt.UTC().Format(time.RFC3339)
 		}
 		if hasMeta {
+			wakeCountWithMeta++
 			row.Trigger = meta.Trigger
 			row.QueuedCount = meta.QueuedCount
 			row.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
 			row.AtCapacity = meta.AtCapacity
+			row.AtCapacityPresent = meta.AtCapacityPresent
 			row.ReadyInMS = meta.ReadyInMS
 			if meta.Trigger != "" {
 				triggerHist[meta.Trigger]++
 			}
-			if meta.AtCapacity {
+			if meta.AtCapacityPresent && meta.AtCapacity {
 				atCapCount++
 			}
 		}
@@ -2370,14 +2390,15 @@ func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, l
 	}
 	wakeCount24h := len(rows)
 	atCapPct := 0.0
-	if wakeCount24h > 0 {
-		atCapPct = float64(atCapCount) / float64(wakeCount24h) * 100
+	if wakeCountWithMeta > 0 {
+		atCapPct = float64(atCapCount) / float64(wakeCountWithMeta) * 100
 	}
 	view := dashboard.WakeTimelinePageData{
 		App: dashboard.AppListItem{
 			Slug: app.Slug,
 		},
 		WakeCount24h:         wakeCount24h,
+		WakeCountWithMeta:    wakeCountWithMeta,
 		AtCapacityCount:      atCapCount,
 		AtCapacityPct:        atCapPct,
 		TriggerHistogramHTML: views.RenderTriggerHistogram(triggerHist),

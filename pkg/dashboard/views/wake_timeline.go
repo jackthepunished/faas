@@ -31,9 +31,18 @@ import (
 //
 // Trigger is the closed-enum string from pkg/sched/triggers.go
 // ("" = absent, dashboard renders em-dash). QueuedCount /
-// ConcurrencyAtAdmit / AtCapacity / ReadyInMS mirror the
-// events.WakeBootMeta surface; zero values render em-dash so
-// pre-PR-A fleet rows look identical to "field absent" rows.
+// ConcurrencyAtAdmit / ReadyInMS mirror the events.WakeBootMeta
+// surface; zero values render em-dash so pre-PR-A fleet rows look
+// identical to "field absent" rows.
+//
+// AtCapacityPresent distinguishes "jsonb key absent" (pre-PR-A fleet
+// row that lacks the at_capacity key entirely) from "jsonb key
+// present and explicitly false" (PR-A row that was admitted below
+// the cap). The dashboard renders em-dash when AtCapacityPresent
+// is false (we don't know), Yes when AtCapacity is true (at the
+// cap), and No when AtCapacity is false and AtCapacityPresent is
+// true (definitely not at the cap). This is the em-dash-on-absent
+// convention for the rest of the row's fields.
 type WakeTimelineRow struct {
 	At                 string // pre-formatted RFC 3339 at the handler
 	Kind               string // wake.boot_started | wake.boot_completed | wake.boot_failed | …
@@ -41,7 +50,8 @@ type WakeTimelineRow struct {
 	Trigger            string // "" if absent
 	QueuedCount        int    // 0 if absent
 	ConcurrencyAtAdmit int    // 0 if absent
-	AtCapacity         bool   // false if absent
+	AtCapacity         bool   // present value; only meaningful when AtCapacityPresent is true
+	AtCapacityPresent  bool   // true when the at_capacity key was in jsonb; false = absent
 	ReadyInMS          int    // 0 if no boot_completed row
 }
 
@@ -78,7 +88,7 @@ func RenderWakeTimelineTable(rows []WakeTimelineRow) template.HTML {
 		b.WriteString(`<td><code>` + template.HTMLEscapeString(trigger) + `</code></td>`)
 		b.WriteString(`<td>` + renderCellInt(r.QueuedCount) + `</td>`)
 		b.WriteString(`<td>` + renderCellInt(r.ConcurrencyAtAdmit) + `</td>`)
-		b.WriteString(`<td>` + renderCellAtCap(r.AtCapacity) + `</td>`)
+		b.WriteString(`<td>` + renderCellAtCap(r.AtCapacity, r.AtCapacityPresent) + `</td>`)
 		b.WriteString(`<td>` + renderCellReadyMS(r.ReadyInMS) + `</td>`)
 		b.WriteString(`</tr>`)
 	}
@@ -122,13 +132,20 @@ func renderCellInt(n int) string {
 	return fmt.Sprintf(`%d`, n)
 }
 
-// renderCellAtCap renders the At cap boolean cell — green "Yes"
-// badge / grey "No" badge. Reuses the badge-yes / badge-no CSS
-// tokens from the recent-wakes table (app_detail.html). When the
-// pre-PR-A fleet has no at_capacity stamp the bool defaults to
-// false → renders as "No", matching what the jsonb COALESCE(…
-// false) returns from pgstore.
-func renderCellAtCap(b bool) string {
+// renderCellAtCap renders the At cap boolean cell — em-dash on
+// absent (pre-PR-A fleet row that lacks the at_capacity key;
+// AtCapacityPresent=false), green "Yes" badge on at-cap
+// (AtCapacity=true), grey "No" badge on explicitly-not-at-cap
+// (AtCapacity=false AND AtCapacityPresent=true). Reuses the
+// badge-yes / badge-no CSS tokens from the recent-wakes table
+// (app_detail.html). The em-dash-on-absent branch is the
+// dashboard's em-dash convention for "we don't know" — the
+// PR-A review cluster (PR #1031) flagged the prior Yes/No-only
+// implementation as misleading for pre-PR-A fleet rows.
+func renderCellAtCap(b, present bool) string {
+	if !present {
+		return `<span class="cell-empty">—</span>`
+	}
 	if b {
 		return `<span class="badge-yes">Yes</span>`
 	}

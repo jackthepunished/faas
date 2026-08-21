@@ -614,7 +614,8 @@ type RecentInstanceItem struct {
 	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
 	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 = cold start
 	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
-	ReadyInMS          int    // PR-A — derived from boot_completed.at - boot_started.at; 0 = still booting or rejected
+	AtCapacityPresent  bool   // PR-A — true when the at_capacity key was present in jsonb (false = absent; em-dash)
+	ReadyInMS          int    // PR-A — wall-clock boot_started → boot_completed delta in ms; 0 if still booting or rejected
 }
 
 // WakeTimelinePageData is the /dashboard/apps/{slug}/wake-timeline
@@ -640,9 +641,18 @@ type RecentInstanceItem struct {
 // AtCapacityPct is rounded to 0 decimals at the template edge
 // ("{{printf \"%.0f\" .Data.AtCapacityPct}}") — the dashboard
 // never needs a finer-grained number for an at-cap readout.
+//
+// WakeCountWithMeta is the denominator the at-cap% uses (vs
+// WakeCount24h which includes pre-ADR-123 fleet rows that lack a
+// boot_started event). When WakeCountWithMeta < WakeCount24h the
+// template renders "of {N} known wakes" alongside the at-cap count
+// so a customer sees the divergence explicitly (PR-A review cluster
+// finding #5 — wakeCount24h and the histogram were previously
+// inconsistent with no label).
 type WakeTimelinePageData struct {
 	App                  AppListItem
 	WakeCount24h         int
+	WakeCountWithMeta    int
 	AtCapacityCount      int
 	AtCapacityPct        float64
 	TriggerHistogramHTML template.HTML // pre-rendered at the handler

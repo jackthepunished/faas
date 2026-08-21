@@ -29,10 +29,11 @@
         <li>
           <strong>24h trigger mix:</strong>
           <span class="trigger-histogram">{{.Data.TriggerHistogramHTML}}</span>
+          {{if lt .Data.WakeCountWithMeta .Data.WakeCount24h}}<em>(of {{.Data.WakeCountWithMeta}} known wakes)</em>{{end}}
         </li>
         <li>
           <strong>At-cap wakes (PR-A):</strong>
-          {{.Data.AtCapacityCount}} of {{.Data.WakeCount24h}}
+          {{.Data.AtCapacityCount}} of {{.Data.WakeCountWithMeta}} known
           ({{printf "%.0f" .Data.AtCapacityPct}}%)
         </li>
       </ul>

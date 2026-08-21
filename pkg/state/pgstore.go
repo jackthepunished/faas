@@ -10364,8 +10364,29 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 	}
 	// PR-A: extended SQL adds (a) at_capacity from the boot_started
 	// jsonb (COALESCE false for pre-PR-A rows) and (b) ready_in_ms
-	// computed as EXTRACT(MILLISECONDS FROM (bc.at - bs.at)) via a
-	// LEFT JOIN LATERAL against the matching boot_completed row.
+	// computed as the total elapsed milliseconds between the
+	// boot_started row's `at` and the matching boot_completed row's
+	// `at` via a LEFT JOIN LATERAL against the events table.
+	//
+	// ready_in_ms uses EXTRACT(EPOCH FROM (bc.completed_at -
+	// bs.started_at)) * 1000 NOT EXTRACT(MILLISECONDS FROM …)
+	// because PostgreSQL intervals are stored as months/days/seconds
+	// and EXTRACT(MILLISECONDS FROM interval) returns ONLY the
+	// seconds-field milliseconds (verified via psql: an interval of
+	// '65.5 seconds' extracts as 5500 ms, not 65500 ms). EXTRACT(EPOCH
+	// …) returns total elapsed seconds as numeric and multiplying by
+	// 1000 yields the wall-clock millisecond delta — accurate for any
+	// duration. This is the spec §14 V6 "wake latency must be wall-
+	// clock accurate" invariant; ready_in_ms is the customer-facing
+	// counterpart.
+	//
+	// at_capacity_present distinguishes pre-PR-A fleet rows (jsonb
+	// key absent) from PR-A rows that explicitly stamped false — the
+	// dashboard's em-dash-on-absent convention depends on this.
+	// Computed inline via `data ? 'at_capacity'` (jsonb contains
+	// operator), NULL on the outermost SELECT when the boot_started
+	// row has no at_capacity key.
+	//
 	// Both LATERAL subqueries hit the existing events_wake_id_idx
 	// partial index from migration 00114 — no new index, no new
 	// migration. The DISTINCT ON still prefers the earliest
@@ -10378,7 +10399,8 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 		        bs.queued_count                  AS queued_count,
 		        bs.concurrency_at_admit          AS concurrency_at_admit,
 		        bs.at_capacity                   AS at_capacity,
-		        COALESCE(EXTRACT(MILLISECONDS FROM (bc.completed_at - bs.started_at))::int, 0) AS ready_in_ms
+		        bs.at_capacity_present           AS at_capacity_present,
+		        COALESCE((EXTRACT(EPOCH FROM (bc.completed_at - bs.started_at)) * 1000)::int, 0) AS ready_in_ms
 		 FROM (
 		   SELECT DISTINCT ON (data->>'wake_id')
 		          data->>'wake_id'             AS wake_id,
@@ -10386,6 +10408,7 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 		          (data->>'queued_count')::int        AS queued_count,
 		          (data->>'concurrency_at_admit')::int AS concurrency_at_admit,
 		          COALESCE((data->>'at_capacity')::bool, false) AS at_capacity,
+		          (data ? 'at_capacity')             AS at_capacity_present,
 		          at                                     AS started_at
 		     FROM events
 		    WHERE kind = 'wake.boot_started'
@@ -10410,11 +10433,15 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 		var wakeID string
 		var meta WakeBootMeta
 		var trigger *string
-		if err := rows.Scan(&wakeID, &trigger, &meta.QueuedCount, &meta.ConcurrencyAtAdmit, &meta.AtCapacity, &meta.ReadyInMS); err != nil {
+		var atCapPresent *bool
+		if err := rows.Scan(&wakeID, &trigger, &meta.QueuedCount, &meta.ConcurrencyAtAdmit, &meta.AtCapacity, &atCapPresent, &meta.ReadyInMS); err != nil {
 			return nil, fmt.Errorf("LookupBootStartedForWakes: scan: %w", err)
 		}
 		if trigger != nil {
 			meta.Trigger = *trigger
+		}
+		if atCapPresent != nil {
+			meta.AtCapacityPresent = *atCapPresent
 		}
 		out[wakeID] = meta
 	}

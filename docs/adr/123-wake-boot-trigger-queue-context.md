@@ -343,11 +343,27 @@ tails:
   observed `concurrency+1 >= maxConc` (the per-app plan ceiling).
   Always stamped on PR-A fleet rows; pre-PR-A rows default to `false`
   via SQL `COALESCE((data->>'at_capacity')::bool, false)`.
-- `ready_in_ms` (int) — `EXTRACT(MILLISECONDS FROM
-  (boot_completed.at - boot_started.at))` via `LEFT JOIN LATERAL`
-  against the matching `wake.boot_completed` row. Zero when no
-  boot_completed exists (still booting or rejected); the template
-  renders em-dash per the existing absent-value convention.
+- `ready_in_ms` (int) — `EXTRACT(EPOCH FROM (boot_completed.at -
+  boot_started_at)) * 1000` via `LEFT JOIN LATERAL` against the
+  matching `wake.boot_completed` row. PR-A review-cluster fix: the
+  initial `EXTRACT(MILLISECONDS FROM …)` implementation was
+  silently wrong for any delta ≥ 60 s because PostgreSQL intervals
+  are stored as months/days/seconds and `EXTRACT(MILLISECONDS …)`
+  returns ONLY the seconds-field milliseconds (verified via psql:
+  an interval of `65.5 seconds` extracted to 5500 ms, not 65500).
+  `EXTRACT(EPOCH …)` returns total elapsed seconds and `* 1000`
+  yields the wall-clock millisecond delta — accurate for any
+  duration. Zero when no boot_completed exists (still booting or
+  rejected); the template renders em-dash per the existing
+  absent-value convention.
+- `at_capacity_present` (bool) — distinguishes "jsonb key absent"
+  (pre-PR-A fleet row that lacks the at_capacity key entirely)
+  from "jsonb key present and explicitly false" (PR-A row that
+  was admitted below the cap). Source: pgstore's
+  `data ? 'at_capacity'` jsonb contains operator (NULL when the
+  key is absent). The dashboard's em-dash-on-absent convention
+  depends on this — a pre-PR-A fleet row renders "—" (we don't
+  know) instead of "No" (we know it wasn't at the cap).
 
 Both flow through the existing wire (`events.data` jsonb,
 additive) and surface in the dashboard's "Recent wakes" table

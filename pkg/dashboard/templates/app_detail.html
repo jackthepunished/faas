@@ -220,7 +220,7 @@
                 <td>{{if .Trigger}}{{.Trigger}}{{else}}—{{end}}</td>
                 <td>{{if .QueuedCount}}{{.QueuedCount}}{{else}}—{{end}}</td>
                 <td>{{if .ConcurrencyAtAdmit}}{{.ConcurrencyAtAdmit}}{{else}}—{{end}}</td>
-                <td>{{if .AtCapacity}}<span class="badge-yes">Yes</span>{{else}}<span class="badge-no">No</span>{{end}}</td>
+                <td>{{if not .AtCapacityPresent}}<span class="cell-empty">—</span>{{else if .AtCapacity}}<span class="badge-yes">Yes</span>{{else}}<span class="badge-no">No</span>{{end}}</td>
                 <td>{{if .ReadyInMS}}{{.ReadyInMS}} ms{{else}}—{{end}}</td>
               </tr>
             {{end}}
