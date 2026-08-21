@@ -170,12 +170,14 @@ func TestAdmit_PreferredNodeIDIsRecordedNotEnforced(t *testing.T) {
 	}
 }
 
-// TestAdmit_ZeroRAMRejectedEdge pins the zero-RAM boundary. A
-// caller that builds a Request with RAMMB=0 would consume
-// admission headroom without contributing to the billable
-// shutter. The Admit path currently accepts 0 (it treats it
-// as a free admit) — this test pins the current behaviour so
-// any future tightening is a deliberate contract change.
+// TestAdmit_ZeroRAMBehavior pins the zero-RAM boundary as the
+// ledger treats it today. A caller that builds a Request with
+// RAMMB=0 still consumes the per-VM overhead MB (8) for
+// ResidentRAM/ResidentRAMForNode accounting — zero-RAM is
+// accepted. This test pins the current ACCEPTED contract so
+// any future tightening (rejecting 0 RAM, or treating 0 as "no
+// accounting") is a deliberate contract change rather than a
+// silent behaviour drift.
 func TestAdmit_ZeroRAMBehavior(t *testing.T) {
 	l := NewNodeLedger()
 	err := l.Admit(Request{

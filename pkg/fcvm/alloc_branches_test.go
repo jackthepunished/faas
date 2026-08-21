@@ -227,10 +227,11 @@ func contains(s, substr string) bool {
 	return false
 }
 
-// setHostIPBaseForTest swaps hostIPBase to addr for the duration
-// of t, and returns a cleanup that swaps it back to addr. Used by
-// the SetHostIPBase test to restore the global after the assertion
-// runs.
+// setHostIPBaseForTest sets hostIPBase to addr for the duration
+// of t, and returns a cleanup that restores the previous value
+// (preserves whatever state preceded the call — does NOT enforce
+// a baseline). Used by the SetHostIPBase test to restore the
+// global after the assertion runs.
 //
 // Usage: defer setHostIPBaseForTest(t, want)()
 func setHostIPBaseForTest(t *testing.T, want netip.Addr) func() {

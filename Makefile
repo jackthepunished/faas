@@ -176,10 +176,12 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 		|| (echo "pkg/state coverage: $$total% ✗ (target ≥ 70%, excluding generated pkg/state/sqlc/**)"; exit 1)
 
 # coverage-floor: assert per-package coverage ≥ floor for each ship-blocking
-# package listed in coverage-floor-pkgs. Reads every coverage/cover-shard*.out
-# the same way check-state-coverage does. Excludes generated sqlc. Floors are
-# 5pp below the post-PR number; the floor is a fixed line the suite must stay
-# above, not a moving goalpost (mirrors codecov.yml project.default.target).
+# package. Floors live in the `floors` dict inside the python heredoc below
+# (no separate Make variable — keeping the table adjacent to the verifier
+# keeps edits atomic). Reads every coverage/cover-shard*.out the same way
+# check-state-coverage does. Excludes generated sqlc. Floors are 5pp below
+# the post-PR number; the floor is a fixed line the suite must stay above,
+# not a moving goalpost (mirrors codecov.yml project.default.target).
 # Wired into the unit-tests-pg-2 CI job (see ci.yml).
 .PHONY: coverage-floor
 coverage-floor: ## Assert ship-blocking package floors across all coverage/cover-shard*.out

@@ -23,7 +23,6 @@ package gateway
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -106,11 +105,15 @@ func TestDNSHandoff_DeadlineElapsedAfterAttempts(t *testing.T) {
 	}
 }
 
-// TestDNSHandoff_BackoffClampedAt30s walks the backoff sequence
-// (1s → 2s → 4s → 8s → 16s → 30s cap). We exercise this with a
-// huge budget so the backoff actually runs. Verifies the
-// `if backoff > 30s { backoff = 30s }` clamp on the 5th retry.
-func TestDNSHandoff_BackoffClampedAt30s(t *testing.T) {
+// TestDNSHandoff_CtxCancelDuringBackoff pins the contract that
+// a ctx-cancel while the orchestrator is blocked in its first
+// backoff sleep returns OutcomeDNSStale after exactly 1 DNS
+// attempt. The cap on the backoff formula itself (1s → 2s →
+// 4s → 8s → 16s → 30s ceiling) is exercised separately by
+// TestBackoffClampedAt30s below, which calls the production
+// helper directly rather than re-implementing the formula in
+// the test.
+func TestDNSHandoff_CtxCancelDuringBackoff(t *testing.T) {
 	fl := newFakeInFlight(0)
 	p := &fakeDNSProvider{err: errors.New("transient 500")}
 
@@ -127,39 +130,50 @@ func TestDNSHandoff_BackoffClampedAt30s(t *testing.T) {
 		// 1 hour budget → no deadline-elapsed bailouts.
 		Budget: func() *time.Duration { d := time.Hour; return &d }(),
 	}
-	// Avoid actually sleeping 1+2+4+8+16 = 31s of test wall-clock.
-	// Instead, we use the package's own backoff formula in our
-	// fake: assert the formula's last value would have been 30s.
-	// The cleanest way: assert call count after ctx-cancel.
+	// Cancel mid-first-sleep so we exit the backoff loop with
+	// exactly 1 DNS attempt recorded. (Verifying the cap ceiling
+	// requires a separate test that drives the formula directly
+	// — see TestBackoffClampedAt30s below.)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		// Cancel after a brief moment — the backoff loop will be
-		// blocked in its first sleep.
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
 	out := d.Run(ctx)
-	// The orchestrator should have made 1 DNS call before sleeping
-	// (attempt 0), then ctx.Done() fired during the 1s sleep, and
-	// we returned OutcomeDNSStale (from deleteRecordWithRetry).
 	if out != OutcomeDNSStale {
 		t.Errorf("ctx-cancel during backoff: out = %q, want %q", out, OutcomeDNSStale)
 	}
 	if got := p.CallCount(); got != 1 {
 		t.Errorf("expected exactly 1 DNS call before sleep, got %d", got)
 	}
+}
 
-	// Now exercise the backoff formula via direct inspection:
-	// the formula is backoff *= 2 capped at 30s.
-	var b time.Duration = time.Second
-	for i := 0; i < 5; i++ {
-		b *= 2
-		if b > 30*time.Second {
-			b = 30 * time.Second
-		}
+// TestBackoffClampedAt30s pins the production formula via
+// direct whitebox call: nextBackoff doubles the input and caps
+// it at 30s. Drives the sequence 1s → 2s → 4s → 8s → 16s →
+// 30s → 30s and asserts each step. A future change that drops
+// the cap (or pushes it past 30s) trips here immediately.
+//
+// Unlike TestDNSHandoff_CtxCancelDuringBackoff (which cancels
+// out of the loop after attempt 0), this test exercises the
+// formula directly — no real-time sleep, no ctx-cancel trick.
+func TestBackoffClampedAt30s(t *testing.T) {
+	steps := []struct {
+		in, want time.Duration
+	}{
+		{time.Second, 2 * time.Second},
+		{2 * time.Second, 4 * time.Second},
+		{4 * time.Second, 8 * time.Second},
+		{8 * time.Second, 16 * time.Second},
+		{16 * time.Second, 30 * time.Second}, // 32s → clamped
+		{30 * time.Second, 30 * time.Second}, // 60s → clamped at cap
+		{30 * time.Second, 30 * time.Second}, // stays
 	}
-	if b != 30*time.Second {
-		t.Errorf("backoff after 5 iterations = %v, want 30s (cap)", b)
+	for i, s := range steps {
+		got := nextBackoff(s.in)
+		if got != s.want {
+			t.Errorf("step %d: nextBackoff(%v) = %v, want %v", i, s.in, got, s.want)
+		}
 	}
 }
 
@@ -314,11 +328,12 @@ func standbyStateGaugeForTest(t *testing.T, m *wire.OpsMetrics) float64 {
 
 // countingDNS wraps fakeDNSProvider to expose the call counter.
 // Used by the retries-exhausted test so the test can read both
-// the per-instance counter and the wrapped counter.
+// the per-instance counter and the wrapped counter. The call
+// counter is atomic; no further locking is needed (the inner
+// fake's mutations are visibly published by the atomic.Add).
 type countingDNS struct {
 	inner *fakeDNSProvider
 	calls *atomic.Int64
-	mu    sync.Mutex
 }
 
 func (c *countingDNS) UpsertRecord(ctx context.Context, name, ip string) error {
