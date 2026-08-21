@@ -39,7 +39,7 @@ func TestMigrations_00288_DeploymentAnnotation(t *testing.T) {
 
 	// (1) Run the full migration set. 00288 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00338 and 00339)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00341 and 00342)", err)
 	}
 
 	// (2) Column shape. Scoped to current_schema() per

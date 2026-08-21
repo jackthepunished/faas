@@ -3921,7 +3921,7 @@ func TestPg_DeploymentAnnotationRoundtrip(t *testing.T) {
 	}
 
 	// 3. Closed-set tag CHECK rejection. The DB-side constraint
-	//    (migrations/00339_deployments_annotation.sql) is the
+	//    (migrations/00342_deployments_annotation.sql) is the
 	//    source of truth; the CLI / handler validators mirror
 	//    it. We drive the rejection directly through the store
 	//    to confirm the constraint is wired (the apid would

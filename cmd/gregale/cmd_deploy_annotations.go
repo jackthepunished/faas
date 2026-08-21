@@ -29,7 +29,7 @@ import (
 
 // DeploymentAnnotationTags is the canonical closed-set vocabulary
 // for the --tag flag (issue #977 / ADR-116). The DB CHECK
-// (migrations/00339_deployments_annotation.sql) is the source of
+// (migrations/00342_deployments_annotation.sql) is the source of
 // truth; this list mirrors it byte-for-byte. Any change here must
 // land as a new migration that widens the CHECK (and ship with a
 // new ADR).
