@@ -191,10 +191,15 @@
           <code>x-faas-wake-id</code> response header to correlate the
           gateway request that woke the app with the operator log line
           (<code>journalctl -u faas-schedd</code>) and the request that
-          followed.
+          followed. <strong>ADR-123:</strong> the <em>Trigger</em>,
+          <em>Queued</em>, and <em>Concurrency</em> columns surface the
+          wake-boot telemetry (closed trigger enum, queue depth, and
+          siblings-already-admitted at admit time). Em-dash means the
+          field is absent — either pre-ADR-123 fleet or a wake_id
+          without a corresponding <code>wake.boot_started</code> event row.
         </p>
         <table>
-          <thead><tr><th>Started</th><th>State</th><th>Last request</th><th>Instance</th><th>Wake ID</th></tr></thead>
+          <thead><tr><th>Started</th><th>State</th><th>Last request</th><th>Instance</th><th>Wake ID</th><th>Trigger</th><th>Queued</th><th>Concurrency</th></tr></thead>
           <tbody>
             {{range .Data.RecentInstances}}
               <tr>
@@ -203,6 +208,9 @@
                 <td>{{.LastRequestAt}}</td>
                 <td><code>{{.ID}}</code></td>
                 <td><code>{{.WakeID}}</code></td>
+                <td>{{if .Trigger}}{{.Trigger}}{{else}}—{{end}}</td>
+                <td>{{if .QueuedCount}}{{.QueuedCount}}{{else}}—{{end}}</td>
+                <td>{{if .ConcurrencyAtAdmit}}{{.ConcurrencyAtAdmit}}{{else}}—{{end}}</td>
               </tr>
             {{end}}
           </tbody>

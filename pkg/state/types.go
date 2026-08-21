@@ -2433,6 +2433,18 @@ type Event struct {
 	Data    json.RawMessage
 }
 
+// WakeBootMeta (ADR-123) is the typed projection of the wake-boot
+// telemetry stamped on wake.boot_started / wake.boot_completed event
+// rows (events.data jsonb). Source: pkg/events.BootStarted.Payload().
+// Used by the dashboard's "Recent wakes" table and the per-app
+// wake-timeline view to render "why did this instance start?"
+// without a separate client-side join.
+type WakeBootMeta struct {
+	Trigger            string // pkg/sched/triggers.go closed enum; "" if absent
+	QueuedCount        int    // ledger.Concurrency at admit; 0 if absent
+	ConcurrencyAtAdmit int    // same reading; 0 is the cold-start case
+}
+
 // AuditLog is one row of the FK-free, immutable post-deletion evidence
 // table (migrations/00163_audit_log.sql, issue #755 / PR-5). The row
 // outlives the account it relates to so a DPO / regulator can re-derive

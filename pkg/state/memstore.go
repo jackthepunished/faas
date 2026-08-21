@@ -6296,6 +6296,48 @@ func (m *MemStore) ListLatestInstancesForApp(ctx context.Context, appID string, 
 	return all, nil
 }
 
+// LookupBootStartedForWakes (ADR-123) returns the wake-boot telemetry
+// for each wake_id in the input slice. memstore implementation walks
+// the in-memory events slice (test-only path) — production read
+// goes through PgStore.LookupBootStartedForWakes.
+func (m *MemStore) LookupBootStartedForWakes(_ context.Context, wakeIDs []string) (map[string]WakeBootMeta, error) {
+	out := make(map[string]WakeBootMeta, len(wakeIDs))
+	wanted := make(map[string]struct{}, len(wakeIDs))
+	for _, id := range wakeIDs {
+		wanted[id] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.events {
+		if e.Kind != "wake.boot_started" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		wakeID, _ := payload["wake_id"].(string)
+		if _, ok := wanted[wakeID]; !ok {
+			continue
+		}
+		if _, dup := out[wakeID]; dup {
+			continue // keep earliest (events appended in at-ASC order)
+		}
+		meta := WakeBootMeta{}
+		if t, ok := payload["trigger"].(string); ok {
+			meta.Trigger = t
+		}
+		if q, ok := payload["queued_count"].(float64); ok {
+			meta.QueuedCount = int(q)
+		}
+		if c, ok := payload["concurrency_at_admit"].(float64); ok {
+			meta.ConcurrencyAtAdmit = int(c)
+		}
+		out[wakeID] = meta
+	}
+	return out, nil
+}
+
 // ListAllInstances returns every instance whose state is one schedd's
 // idle reaper considers live (running, waking, cold_booting,
 // snapshotting). Sorted DESC by StartedAt to match the partial index

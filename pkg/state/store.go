@@ -2585,6 +2585,13 @@ type Store interface {
 	// N per-app ListInstancesForApp calls (PR #48 follow-up). Result is
 	// keyed by app ID; callers must handle the "no row" case explicitly.
 	ListLatestInstancePerApp(ctx context.Context, accountID string) (map[string]Instance, error)
+	// LookupBootStartedForWakes (ADR-123) returns the wake-boot
+	// telemetry (trigger / queued_count / concurrency_at_admit) for
+	// each wake_id in the input slice. Batched in one SQL round-trip
+	// (uses the events_wake_id_idx jsonb expression index) so the
+	// dashboard's "Recent wakes" table doesn't fan out per row.
+	// Empty map when no rows match (pre-ADR-123 fleet).
+	LookupBootStartedForWakes(ctx context.Context, wakeIDs []string) (map[string]WakeBootMeta, error)
 	// ListAllInstances returns every instance on the box, ordered newest
 	// first. schedd's G7 reaper warm-passes this slice to the conntrack
 	// reader (pkg/sched/flowcount) once per tick — a single bulk read is
