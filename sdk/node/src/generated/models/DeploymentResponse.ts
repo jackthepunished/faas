@@ -124,7 +124,7 @@ export type DeploymentResponse = {
    */
   deployed_by_user_id?: string | null;
   /**
-   * Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00305_deployments_actor.sql's CHECK constraint.
+   * Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00303_deployments_actor.sql's CHECK constraint.
    */
   deployed_via?: 'api' | 'cli' | 'dashboard' | 'github' | 'operator';
   /**
