@@ -18399,7 +18399,7 @@ func (s *PgStore) DeleteMirrorRule(ctx context.Context, id string) error {
 // nil → []byte{} collapses "body intentionally not hashed" with
 // "body present but empty" — a silent contract violation.
 func (s *PgStore) InsertMirrorResult(ctx context.Context, r MirrorInvocationResult) error {
-	bodyHash := r.BodyHash        // typed-nil preserved on insert
+	bodyHash := r.BodyHash // typed-nil preserved on insert
 	srcBodyHash := r.SourceBodyHash
 	schemaHash := r.SchemaHash
 	srcSchemaHash := r.SourceSchemaHash

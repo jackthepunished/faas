@@ -92,9 +92,17 @@ CREATE INDEX mirror_rules_source_idx
     ON mirror_rules (source_deployment_id)
     WHERE enabled;
 
-CREATE TRIGGER mirror_rules_set_updated_at
+CREATE OR REPLACE FUNCTION mirror_rules_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER mirror_rules_set_updated_at_trg
     BEFORE UPDATE ON mirror_rules
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE FUNCTION mirror_rules_set_updated_at();
 
 -- +goose StatementEnd
 
@@ -108,7 +116,8 @@ CREATE TRIGGER mirror_rules_set_updated_at
 -- one. The goose Down sequence runs migrations in reverse apply
 -- order so 00349 + 00350 are already gone by the time this Down
 -- fires.
-DROP TRIGGER IF EXISTS mirror_rules_set_updated_at ON mirror_rules;
+DROP TRIGGER IF EXISTS mirror_rules_set_updated_at_trg ON mirror_rules;
+DROP FUNCTION IF EXISTS mirror_rules_set_updated_at();
 DROP INDEX  IF EXISTS mirror_rules_source_idx;
 DROP INDEX  IF EXISTS mirror_rules_app_idx;
 DROP TABLE IF EXISTS mirror_rules;

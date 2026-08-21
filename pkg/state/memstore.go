@@ -576,12 +576,12 @@ func NewMemStore() *MemStore {
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
-		buildProvenance:      map[string]BuildProvenance{},
+		buildProvenance: map[string]BuildProvenance{},
 		// issue #72 / ADR-125: mirror-rules and mirror-results
 		// stores. Empty until the first create; the per-app count
 		// in CreateMirrorRuleIfUnderQuota walks the map.
-		mirrorRules:   map[string]MirrorRule{},
-		mirrorResults: map[string]MirrorInvocationResult{},
+		mirrorRules:          map[string]MirrorRule{},
+		mirrorResults:        map[string]MirrorInvocationResult{},
 		domains:              map[string]CustomDomain{},
 		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
@@ -13090,17 +13090,17 @@ func (m *MemStore) CreateMirrorRuleIfUnderQuota(_ context.Context, in CreateMirr
 	}
 	now := time.Now().UTC()
 	r := MirrorRule{
-		ID:                  uuid.NewString(),
-		AccountID:           in.AccountID,
-		AppID:               in.AppID,
-		SourceDeploymentID:  in.SourceDeploymentID,
-		MirrorDeploymentID:  in.MirrorDeploymentID,
-		Percent:             in.Percent,
-		Enabled:             in.Enabled,
-		IncludeBody:         in.IncludeBody,
-		RedactHeaders:       in.RedactHeaders,
-		CreatedAt:           now,
-		UpdatedAt:           now,
+		ID:                 uuid.NewString(),
+		AccountID:          in.AccountID,
+		AppID:              in.AppID,
+		SourceDeploymentID: in.SourceDeploymentID,
+		MirrorDeploymentID: in.MirrorDeploymentID,
+		Percent:            in.Percent,
+		Enabled:            in.Enabled,
+		IncludeBody:        in.IncludeBody,
+		RedactHeaders:      in.RedactHeaders,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if r.RedactHeaders == nil {
 		r.RedactHeaders = []string{}

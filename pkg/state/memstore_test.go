@@ -5656,22 +5656,22 @@ func TestMemStore_MirrorInvocationResults(t *testing.T) {
 	now := time.Now().UTC()
 	// Two rows: one matching, one with status_diff + body_diff.
 	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
-		MirrorRuleID:        rule.ID,
-		AccountID:           accID,
-		AppID:               appID,
-		SourceDeploymentID:  srcID,
-		MirrorDeploymentID:  mirID,
-		StatusCode:          200,
-		SourceStatusCode:    200,
-		LatencyMs:           120,
-		SourceLatencyMs:     100,
-		BodyHash:            []byte("mirror-body"),
-		SourceBodyHash:      []byte("source-body"),
-		SchemaHash:          []byte("mirror-schema"),
-		SourceSchemaHash:    []byte("source-schema"),
-		BodyDiff:            true, // different body bytes
-		RequestID:           "req-1",
-		CompletedAt:         now,
+		MirrorRuleID:       rule.ID,
+		AccountID:          accID,
+		AppID:              appID,
+		SourceDeploymentID: srcID,
+		MirrorDeploymentID: mirID,
+		StatusCode:         200,
+		SourceStatusCode:   200,
+		LatencyMs:          120,
+		SourceLatencyMs:    100,
+		BodyHash:           []byte("mirror-body"),
+		SourceBodyHash:     []byte("source-body"),
+		SchemaHash:         []byte("mirror-schema"),
+		SourceSchemaHash:   []byte("source-schema"),
+		BodyDiff:           true, // different body bytes
+		RequestID:          "req-1",
+		CompletedAt:        now,
 	}); err != nil {
 		t.Fatalf("insert 1: %v", err)
 	}
@@ -5833,4 +5833,3 @@ func TestMemStore_ListMirrorResults_BoundaryIsInclusive(t *testing.T) {
 }
 
 // --- End of mirror tests -------------------------------------------------
-

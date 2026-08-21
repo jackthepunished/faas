@@ -2305,17 +2305,17 @@ const (
 // deployment_changed pg_notify payload's `kind="mirror"`
 // discriminant.
 type MirrorRule struct {
-	ID                  string
-	AccountID           string
-	AppID               string
-	SourceDeploymentID  string
-	MirrorDeploymentID  string
-	Percent             int
-	Enabled             bool
-	IncludeBody         bool
-	RedactHeaders       []string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                 string
+	AccountID          string
+	AppID              string
+	SourceDeploymentID string
+	MirrorDeploymentID string
+	Percent            int
+	Enabled            bool
+	IncludeBody        bool
+	RedactHeaders      []string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // MirrorRulePatch (issue #72 / ADR-125) is the partial-update
@@ -2362,28 +2362,28 @@ type CreateMirrorRuleParams struct {
 // `body_hash` columns are the only ones that can be nil — the
 // schema_hash columns are always populated for JSON responses).
 type MirrorInvocationResult struct {
-	ID                  string
-	MirrorRuleID        string
-	AccountID           string
-	AppID               string
-	SourceDeploymentID  string
-	MirrorDeploymentID  string
-	InstanceID          string
-	SourceInstanceID    string
-	StatusCode          int
-	SourceStatusCode    int
-	LatencyMs           int
-	SourceLatencyMs     int
-	BodyHash            []byte
-	SourceBodyHash      []byte
-	SchemaHash          []byte
-	SourceSchemaHash    []byte
-	StatusDiff          bool
-	SchemaDiff          bool
-	BodyDiff            bool
-	Crashed             bool
-	RequestID           string
-	CompletedAt         time.Time
+	ID                 string
+	MirrorRuleID       string
+	AccountID          string
+	AppID              string
+	SourceDeploymentID string
+	MirrorDeploymentID string
+	InstanceID         string
+	SourceInstanceID   string
+	StatusCode         int
+	SourceStatusCode   int
+	LatencyMs          int
+	SourceLatencyMs    int
+	BodyHash           []byte
+	SourceBodyHash     []byte
+	SchemaHash         []byte
+	SourceSchemaHash   []byte
+	StatusDiff         bool
+	SchemaDiff         bool
+	BodyDiff           bool
+	Crashed            bool
+	RequestID          string
+	CompletedAt        time.Time
 }
 
 // MirrorSummary (issue #72 / ADR-125) is the aggregate the
