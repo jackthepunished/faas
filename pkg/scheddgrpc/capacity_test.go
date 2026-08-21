@@ -68,10 +68,10 @@ type capturingEngine struct {
 	seen map[string]bool
 }
 
-func (c *capturingEngine) Wake(_ context.Context, _, _, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) Wake(_ context.Context, _, _, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (c *capturingEngine) AdmitInstance(_ context.Context, _, _, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) AdmitInstance(_ context.Context, _, _, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 
@@ -80,7 +80,7 @@ func (c *capturingEngine) AdmitInstance(_ context.Context, _, _, _ string) (sche
 // with nil Instance triggers the defensive nil-instance branch in the
 // handler only on success; no capacity test relies on a non-nil
 // Instance, so the zero value is sufficient.
-func (c *capturingEngine) EnsureWake(_ context.Context, _ string) (sched.CoordOutcome, error) {
+func (c *capturingEngine) EnsureWake(_ context.Context, _, _ string) (sched.CoordOutcome, error) {
 	return sched.CoordOutcome{}, nil
 }
 func (c *capturingEngine) ReportActivity(_ context.Context, _ []state.InstanceTouch) (int, error) {

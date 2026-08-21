@@ -127,7 +127,13 @@ type SchedAPI interface {
 	// the gateway parsed from the inbound Host header. Empty =
 	// prod (legacy single-deployment behaviour). Threaded through
 	// WithScope into the engine's resolveApp / loadAPIEnv.
-	Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
+	//
+	// trigger (ADR-127): the wake-boot trigger enum value stamped
+	// on the emitted wake.boot_started / wake.boot_completed events.
+	// gateway wires "gateway", cron handler wires "cron.schedule" or
+	// "cron.manual", the schedd-internal floor/scaleup/targets
+	// triggers wire their own constants. Forwarded as-is.
+	Wake(ctx context.Context, appID, deploymentID, scope, trigger string) (sched.WakeResult, error)
 	// AdmitInstance is the schedule scale-out primitive (issue #168).
 	// Bypasses the Phase-1 fast-path so a gateway can demand a new
 	// instance even when others are already RUNNING. Returns a typed
@@ -146,18 +152,25 @@ type SchedAPI interface {
 	// that specific live deployment. Additive per ADR-016.
 	//
 	// scope (PR-B / issue #272): the preview scope (`pr-{N}`).
-	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
+	//
+	// trigger (ADR-127): see Wake.
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (sched.WakeResult, error)
 	// EnsureWake (ADR-098) is the single-flight-safe wake RPC. The engine
 	// coalesces every concurrent EnsureWake call for the same app into one
 	// virtual boot; followers see the leader's outcome. The leader runs
 	// on a detached ctx (context.Background + WakeQueueTTLSeconds); only
 	// followers see the caller's ctx.
 	//
+	// trigger (ADR-127) is forwarded to the leader's Engine.Wake call and
+	// stamped on the emitted wake.boot_started / wake.boot_completed
+	// events. Followers inherit the leader's trigger via the wire so the
+	// per-wake event row reflects the original cause.
+	//
 	// Returns sched.ErrQueueFull when the per-app follower cap is exceeded
 	// (handlers map to ResourceExhausted / wake_queue_full) and
 	// sched.ErrAppDeleted when the app was deleted while a wake was in
 	// flight (Forget route; C6 wires the pg-notify channel).
-	EnsureWake(ctx context.Context, appID string) (sched.CoordOutcome, error)
+	EnsureWake(ctx context.Context, appID, trigger string) (sched.CoordOutcome, error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	// ParkWithReason is the meterd-triggered variant (M7, spec §4.7).
 	// The reason string is for the audit log; the park semantics are
@@ -334,7 +347,7 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 	// request — the gateway sets it from the parsed
 	// `pr-{N}.{slug}.apps.<zone>` Host header. Empty scope = legacy
 	// prod behaviour, threaded via WithScope at the engine entry.
-	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
+	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope(), req.GetTrigger())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -374,7 +387,7 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 	// PR-B (issue #272): scope threaded through AdmitInstance the
 	// same way as Wake. Empty scope = legacy prod; the engine's
 	// resolveApp then reads the LiveDeployment row by appID only.
-	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
+	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope(), req.GetTrigger())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -412,7 +425,7 @@ func (s *Server) EnsureWake(ctx context.Context, req *scheddpb.EnsureWakeRequest
 		return nil, err
 	}
 	start := time.Now()
-	out, err := s.engine.EnsureWake(ctx, req.GetAppId())
+	out, err := s.engine.EnsureWake(ctx, req.GetAppId(), req.GetTrigger())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		// Per-app queue-full is a 503; the engine returns the typed
