@@ -647,7 +647,7 @@ type App struct {
 	// AppProtocol (ADR-124) is the per-app wire-protocol
 	// selector stored on the apps row as text NOT NULL DEFAULT
 	// 'http1'. Closed set {http1, http2, grpc} enforced by
-	// apps_app_protocol_chk (migration 00360). Plan gate for
+	// apps_app_protocol_chk (migration 00347). Plan gate for
 	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
 	// not the SQL CHECK — every pre-existing app reads "http1"
 	// without a migration. The per-app transport-selection seam
@@ -2934,7 +2934,7 @@ type UpdateAppParams struct {
 	// AppProtocol (ADR-124) is the per-app wire-protocol
 	// selector stored on the apps row as text NOT NULL DEFAULT
 	// 'http1'. Closed set {http1, http2, grpc} enforced by
-	// apps_app_protocol_chk (migration 00360). Plan gate for
+	// apps_app_protocol_chk (migration 00347). Plan gate for
 	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
 	// not the SQL CHECK — every pre-existing app reads "http1"
 	// without a migration. The per-app transport-selection seam

@@ -2966,7 +2966,7 @@ func decideStreaming(h *Handler, r *http.Request, app App) (streamingDecision, b
 // The plan gate (Free + grpc → 403 plan_app_protocol_grpc_not_allowed)
 // is enforced at apid and not re-checked here — by the time a
 // request reaches the gateway, the row is already gated. The
-// closed-set CHECK apps_app_protocol_chk (migration 00360) is
+// closed-set CHECK apps_app_protocol_chk (migration 00347) is
 // the schema-level guard; a stale row that somehow carries a
 // value outside the closed set is treated as "http1" so the
 // forwarder never sees an unrecognised framing selector.

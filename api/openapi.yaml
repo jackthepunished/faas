@@ -8919,7 +8919,7 @@ components:
         # ADR-124: per-app wire-protocol selector. Closed set
         # {http1, http2, grpc}; http1 is the universal default
         # (apps.app_protocol NOT NULL DEFAULT 'http1' per
-        # migration 00360). Surfaced so dashboards can render
+        # migration 00347). Surfaced so dashboards can render
         # "PROTOCOL: http1/http2/grpc" alongside the streaming/
         # websocket pills and so a customer can verify their
         # PATCH landed without a second round-trip.

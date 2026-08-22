@@ -746,11 +746,11 @@ universal; `http2` universal; `grpc` Hobby+/Pro/Scale only.
 Closes issue #67 (Cloud Run parity for k8s/Cloud-Run migrators
 carrying gRPC services).
 
-- **Schema** — migration `00360_apps_app_protocol.sql`
+- **Schema** — migration `00347_apps_app_protocol.sql`
   (`ADD COLUMN IF NOT EXISTS app_protocol text NOT NULL DEFAULT
   'http1'` + `apps_app_protocol_chk` CHECK mirroring the
   `eviction_priority` precedent at `00346_deployments_annotation.sql:54-60`).
-  Round-trip + replay-safety pinned at `00360_apps_app_protocol_test.go`
+  Round-trip + replay-safety pinned at `00347_apps_app_protocol_test.go`
   (replay-safe ADD COLUMN IF NOT EXISTS + DROP/ADD CONSTRAINT IF
   EXISTS pattern from the streaming migration).
 - **Plan gate** — `pkg/api/limits.go::Plan.AppProtocolAllowed(protocol)`
