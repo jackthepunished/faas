@@ -1108,6 +1108,11 @@ func checkVerifyTarballSBOM(ctx context.Context, deps *doctorDeps) ([]doctorFind
 			hex := strings.TrimPrefix(h, "sha256:")
 			tb.BinSHA256[name] = hex
 		}
+		tb.ToolSHA256 = make(map[string]string, len(m.ToolHashes))
+		for name, h := range m.ToolHashes {
+			hex := strings.TrimPrefix(h, "sha256:")
+			tb.ToolSHA256[name] = hex
+		}
 		identity, err := tb.Verify(ctx, deps.verifier)
 		if err != nil {
 			findings = append(findings, doctorFinding{
