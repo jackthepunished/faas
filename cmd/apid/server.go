@@ -1789,6 +1789,8 @@ func (s *server) handler() http.Handler {
 	// asserting; richer readiness semantics (DB ping, etc.) belong
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)
+	// Dependency-aware readiness probe (testing PostgreSQL pool ping).
+	mux.HandleFunc("GET /readyz", s.readyz)
 
 	// Spec hosting (anonymous; see pkg/apid/openapi_handler.go).
 	// /v1/openapi.yaml and /v1/openapi.json let SDK codegen and
