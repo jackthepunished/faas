@@ -179,12 +179,12 @@ var methodRouteMap = map[string]string{
 	// uses ResourceVerb — pin to DestroyPreview so the wire +
 	// SDK verb surface stays uniform with Rollback/Park/Wake.
 	"POST /v1/preview/{slug}/destroy": "DestroyPreview",
-	"GET /v1/account/export":                      "ExportAccount",
-	"DELETE /v1/account":                          "DeleteAccount",
-	"PATCH /v1/account/plan":                      "ChangePlan",
-	"GET /v1/account":                             "Whoami",
-	"POST /v1/account/restore":                    "RestoreAccount",
-	"POST /v1/account/overage-cap":                "RaiseOverageCap", // issue #561 spend cap
+	"GET /v1/account/export":          "ExportAccount",
+	"DELETE /v1/account":              "DeleteAccount",
+	"PATCH /v1/account/plan":          "ChangePlan",
+	"GET /v1/account":                 "Whoami",
+	"POST /v1/account/restore":        "RestoreAccount",
+	"POST /v1/account/overage-cap":    "RaiseOverageCap", // issue #561 spend cap
 	// Issue #679 / PR-B / ADR-082 — per-account additive budget on
 	// top of the plan's apps.egress_allowlist cap. The auto-derivation
 	// would concat "Account" + "Egress_allowlist_extra" (the literal
