@@ -1,4 +1,4 @@
--- filename: 00332_endpoint_discovery.sql
+-- filename: 00375_endpoint_discovery.sql
 -- +goose Up
 -- +goose StatementBegin
 
