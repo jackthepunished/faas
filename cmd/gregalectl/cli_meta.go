@@ -56,18 +56,21 @@ type cliFlag struct {
 // command in main.go's run() switch.
 //
 // Operator-side surface (PR-6.5):
-//   - manifest  (validate | render)
-//   - release   (bundle | install)
-//   - host-age  (init | rotate | status | prune-previous)
-//   - pki       (init | status | rotate)
-//   - sign-keys (init | rotate | status)
-//   - node-key  (init | rotate | status)
-//   - backup    (unseal-rclone | unseal-archive-creds)
-//   - secrets   (init | rotate | status)
-//   - trusted-publishers (add | remove | list)
-//   - version   (internal)
-//   - completion (bash | zsh | fish | powershell) (internal)
-//   - man       (<command>) (internal)
+//   - manifest        (validate | render | ansible)
+//   - release         (bundle | install | kgv rotate | kgv init [alias])
+//   - doctor          (read-only cluster diagnostic)
+//   - host-age        (init | rotate | status | prune-previous)
+//   - pki             (init | status | rotate | list)
+//   - sign-keys       (init | rotate | status)
+//   - node-key        (init | rotate | status)
+//   - backup          (init | unseal-rclone | unseal-archive-creds)
+//   - secrets         (init | rotate | status | stamp)
+//   - compute-nodes   (add | list | show | drain | drain-status | activate | force-drain)
+//   - deploy          (add-node)
+//   - trusted-publishers (add | remove | list) — see ADR-058 deviation note in main.go:15
+//   - version         (internal)
+//   - completion      (bash | zsh | fish | powershell) (internal)
+//   - man             (<command>) (internal)
 //
 // Customer-side commands (rollback, secrets, registry, deploy, init,
 // apps, deploy, etc.) stay in cmd/gregale/cli_meta.go. The drift
@@ -166,7 +169,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "manifest",
 		DocSlug: "manifest",
-		Short:   "Operator split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)",
+		Short:   "Operator split-box deployment manifest (manifest validate|render|ansible; issue #911 / ADR-110)",
 		Subcommands: []cliSub{
 			{
 				Name:  subValidate,
@@ -186,6 +189,17 @@ var cliCommands = []cliCommand{
 					{Name: "cgroup-root", Short: "cgroup v2 mount root (default /sys/fs/cgroup)"},
 					{Name: "host-san-file", Short: "optional JSON file with per-host SANs"},
 					{Name: "dry-run", Short: "compute outputs but do not write"},
+				},
+			},
+			{
+				Name:  subAnsible,
+				Short: "Generate Ansible inventory + host_vars tree from the validated manifest (canonical path: pkg/manifest.AnsibleRender; consumed by `make manifest-ansible` and the deployctl bootstrap)",
+				Flags: []cliFlag{
+					{Name: "manifest-file", Short: "path to the manifest YAML file (required)", Req: true},
+					{Name: "output-dir", Short: "directory to write inventory + host_vars/ under (default: deploy/ansible/.generated/)"},
+					{Name: "force", Short: "overwrite existing files under --output-dir (refuse by default — re-running on a dirty tree is operator error)"},
+					{Name: "dry-run", Short: "compute outputs but do not write"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
 				},
 			},
 		},

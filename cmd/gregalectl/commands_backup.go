@@ -5,7 +5,23 @@
 // /etc/faas/secrets/storage-box/ paths (or caller-supplied
 // --in / --out flags). No authedClient() call, no API hit.
 //
-// The namespace is `gregalectl backup` with one leaf today:
+// The namespace is `gregalectl backup` with three leaves today:
+//
+//   - init   — create /etc/faas/secrets/storage-box/ (0700 root:root)
+//     and write the two known-placeholder stub files the doctor
+//     detects (commands_doctor.go:1274,1283,1292): rclone.conf
+//     (0440 root:postgres) and archive-creds.json (0400 root:root).
+//     Refuses to overwrite an existing layout unless --force is
+//     passed (the storage-box dir carries the box-age-key that
+//     identities the operator-laptop unseal path; silently
+//     clobbering it strands every sealed envelope). Does NOT
+//     write host.age / session.key (those live in `secrets init`,
+//     which is the canonical first-boot path for a control-plane
+//     node); does NOT write the box-age-key itself (the operator
+//     provides their own age identity). The intent is "operator
+//     can land the storage-box side of the layout without a full
+//     secrets init" — e.g. a compute-only box that already has
+//     host.age shipped from the control plane.
 //
 //   - unseal-rclone  — decrypt a host.age-sealed `rclone.conf` envelope
 //     using the on-box age identity (box-age-key) and write the
@@ -14,6 +30,10 @@
 //     read it). Refuses to overwrite an existing plaintext unless
 //     --force is passed (re-unsealing is a deliberate rotation
 //     step, not a bootstrap-time side effect).
+//
+//   - unseal-archive-creds — same shape as unseal-rclone but for the
+//     log-archive S3 credentials. Mirrors the JSON-shape sanity
+//     check on the decrypted plaintext (issue #562 PR-A).
 //
 // The age identity path defaults to
 // /etc/faas/secrets/storage-box/box-age-key (the canonical install
@@ -57,22 +77,27 @@ const (
 
 const dispatchBackup = "backup"
 
-const subUnsealRclone = "unseal-rclone"
+const (
+	subUnsealRclone = "unseal-rclone"
+	subBackupInit   = "init"
+)
 
 func cmdBackup(args []string) int {
 	parent, _ := lookupCliCommand("backup")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl backup <subcommand> [flags]\n  known subcommands: unseal-rclone, unseal-archive-creds", "backup")
+		PrintUsage(os.Stderr, "usage: gregalectl backup <subcommand> [flags]\n  known subcommands: init, unseal-rclone, unseal-archive-creds", "backup")
 		return 1
 	}
 	switch args[0] {
+	case subBackupInit:
+		return cmdBackupInit(args[1:])
 	case subUnsealRclone:
 		return cmdBackupUnsealRclone(args[1:])
 	case subUnsealArchiveCreds:
 		return cmdBackupUnsealArchiveCreds(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregalectl backup: unknown subcommand %q (known: unseal-rclone, unseal-archive-creds)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl backup: unknown subcommand %q (known: init, unseal-rclone, unseal-archive-creds)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -206,6 +231,154 @@ func unsealRclone(f *unsealRcloneFlags) error {
 	}
 	if err := os.Rename(tmpName, f.out); err != nil {
 		return fmt.Errorf("rename into place: %w", err)
+	}
+	return nil
+}
+
+// backupInitFlags is the flag surface for `backup init`. Mirrors the
+// secrets-init flag set (commands_secrets_init.go:secretsInitFlags) so
+// the operator learns one shape across both namespaces. The
+// canonical install path is /etc/faas/secrets/storage-box; --dir
+// exists only so an operator can lay the layout down on a non-root
+// dev box (the chmod + chown calls in writeBackupInitStub go
+// best-effort on a non-root caller; tests run as uid 1000 and pin
+// the on-disk shape).
+type backupInitFlags struct {
+	dir   string
+	force bool
+}
+
+func newBackupInitFlags(name string) (*flag.FlagSet, *backupInitFlags) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	f := &backupInitFlags{}
+	fs.StringVar(&f.dir, "dir", defaultStorageBoxDir,
+		"storage-box directory (canonical: "+defaultStorageBoxDir+")")
+	fs.BoolVar(&f.force, "force", false,
+		"overwrite existing stub files (refuse by default — the storage-box dir carries the box-age-key that identities the unseal path)")
+	return fs, f
+}
+
+// cmdBackupInit creates the storage-box layout: the directory itself
+// at 0700 root:root and the two known-placeholder stub files the
+// doctor already detects (commands_doctor.go:1274,1283,1292). After
+// init, the operator runs `backup unseal-rclone` + `backup
+// unseal-archive-creds` to replace the placeholders with the real
+// plaintext.
+//
+// Refuses to overwrite existing files unless --force is passed. The
+// default posture mirrors `secrets init` (commands_secrets_init.go:
+// ErrSecretsInitRefuseOverwrite) — silently clobbering a populated
+// storage-box dir strands every sealed envelope the operator has
+// previously scp'd in.
+func cmdBackupInit(args []string) int {
+	fs, f := newBackupInitFlags("backup init")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: gregalectl backup init [--dir DIR] [--force]", "backup")
+		return 1
+	}
+	if err := backupInit(f, osStdout); err != nil {
+		return printErr("backup init failed", err)
+	}
+	PrintOK(osStdout, "Wrote storage-box layout under %s\n  Next: scp <rclone.conf.age> to %s and run `gregalectl backup unseal-rclone`\n  Next: scp <archive-creds.json.age> to %s and run `gregalectl backup unseal-archive-creds`\n  Tip: on a control-plane node, prefer `gregalectl secrets init` (writes host.age/session.key/box-age-key + the same stubs in one batch).",
+		f.dir,
+		defaultRcloneAgeIn, f.dir,
+		defaultRcloneAgeIn, f.dir)
+	return 0
+}
+
+// backupInit is the package-private worker. Splitting it from
+// cmdBackupInit lets tests exercise the file-write side without the
+// flag-parse boilerplate — mirrors the secretsInit split at
+// commands_secrets_init.go:166.
+func backupInit(f *backupInitFlags, stdout io.Writer) error {
+	if err := os.MkdirAll(f.dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir storage-box dir %s: %w", f.dir, err)
+	}
+	// Stub 1: rclone.conf placeholder (0440 root:postgres).
+	// Mirrors commands_secrets_init.go:writeRcloneStub but lives in
+	// backup's namespace because backup init is the canonical
+	// storage-box-only path (no host.age / session.key side).
+	if err := writeBackupRcloneStub(filepath.Join(f.dir, "rclone.conf"), f.force); err != nil {
+		return err
+	}
+	// Stub 2: archive-creds.json placeholder (0400 root:root).
+	// Mirrors commands_secrets_init.go:writeArchiveStub for the
+	// same reason. The mandatory-on-disk shape is `{}` so the
+	// log-archive's LoadCredential parses cleanly before the
+	// operator unseals real creds.
+	if err := writeBackupArchiveStub(filepath.Join(f.dir, "archive-creds.json"), f.force); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeBackupRcloneStub writes the doctor-detected rclone.conf
+// placeholder. Single-line JSON marker so the ansible stat-assert
+// (postgres_backup/tasks/main.yml:198) passes pre-unseal. Mirrors
+// commands_secrets_init.go:writeRcloneStub (the secrets-init
+// version) but lives here so `backup init` is self-contained.
+//
+// force=true requires the file to be writable. The on-disk file
+// lives at 0440, so a plain WriteFile would EPERM on the second
+// init. We chmod 0644 first (when force=true and the file
+// exists), then chmod back to 0440 after the write — same
+// dance commands_secrets_init.go:writeHostAge uses via
+// enforceFileMode.
+func writeBackupRcloneStub(path string, force bool) error {
+	exists := false
+	if _, err := os.Stat(path); err == nil {
+		exists = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if exists && !force {
+		return fmt.Errorf("refusing to overwrite existing %s (use --force for re-init)", path)
+	}
+	if exists && force {
+		if err := os.Chmod(path, 0o644); err != nil {
+			return fmt.Errorf("chmod 0644 %s (for force re-init): %w", path, err)
+		}
+	}
+	stub := []byte(`{"_":"backup init stub — replace via 'gregalectl backup unseal-rclone'"}`)
+	if err := os.WriteFile(path, stub, 0o440); err != nil {
+		return fmt.Errorf("write rclone.conf stub %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o440); err != nil {
+		return fmt.Errorf("chmod 0440 %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeBackupArchiveStub writes the empty archive-creds envelope.
+// Mandatory shape is `{}` so the log-archive LoadCredential parses
+// before the operator unseals real creds. Mirrors
+// commands_secrets_init.go:writeArchiveStub. Same force-rewrite
+// dance as writeBackupRcloneStub.
+func writeBackupArchiveStub(path string, force bool) error {
+	exists := false
+	if _, err := os.Stat(path); err == nil {
+		exists = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if exists && !force {
+		return fmt.Errorf("refusing to overwrite existing %s (use --force for re-init)", path)
+	}
+	if exists && force {
+		if err := os.Chmod(path, 0o644); err != nil {
+			return fmt.Errorf("chmod 0644 %s (for force re-init): %w", path, err)
+		}
+	}
+	stub := []byte(`{}`)
+	if err := os.WriteFile(path, stub, 0o400); err != nil {
+		return fmt.Errorf("write archive-creds.json stub %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o400); err != nil {
+		return fmt.Errorf("chmod 0400 %s: %w", path, err)
 	}
 	return nil
 }
