@@ -880,6 +880,17 @@ func (c *Client) DeleteApp(ctx context.Context, slug string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug, nil, nil)
 }
 
+// DestroyPreview tears down a preview app (issue #961 Mega-C
+// PR-1, leaf 3). Distinct from DeleteApp because the preview
+// teardown also stamps apps.preview_pr_state='torn_down' so the
+// janitor doesn't re-process the row, and emits a distinct audit
+// kind (preview.destroyed_by_customer vs app.deleted). The slug
+// must identify a preview app (PreviewOfSlug != "") — a
+// production slug returns 404, not 204.
+func (c *Client) DestroyPreview(ctx context.Context, slug string) error {
+	return c.do(ctx, "POST", "/v1/preview/"+slug+"/destroy", nil, nil)
+}
+
 // ScanProject ships a source tarball to the dry-run endpoint. The
 // response carries the discovered workloads, managed services,
 // derived scan_source, and a plan_token that ApplyProjectPlan can

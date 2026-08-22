@@ -234,6 +234,39 @@ func (r ParkReason) IsValid() bool {
 	}
 }
 
+// AutoRollbackReason tags the trigger that fired the most recent
+// auto-rollback (Mega-C PR-2 / issue #961 leaf 8). Closed-set
+// vocabulary enforced at the schema layer via
+// deployments_last_auto_rollback_reason_check (migration 00315).
+type AutoRollbackReason string
+
+const (
+	// AutoRollbackReasonThresholdExceeded is stamped when schedd's
+	// per-deploy 5xx counter crosses the plan threshold inside the
+	// first wake window (5 min by default; see
+	// pkg/api/limits.go::RollbackOn5xxWindowMinutes).
+	AutoRollbackReasonThresholdExceeded AutoRollbackReason = "threshold_exceeded"
+	// AutoRollbackReasonFirstWindowExpired is reserved for a
+	// future "deploy landed but the first wake never arrived"
+	// fallback that supersedes the deploy before its window
+	// closes. Not wired yet; the schema CHECK accepts it so the
+	// caller can stamp it without a migration.
+	AutoRollbackReasonFirstWindowExpired AutoRollbackReason = "first_window_expired"
+)
+
+// IsValidAutoRollbackReason reports whether r is one of the
+// closed-set AutoRollbackReason constants. Mirrors
+// ParkReason.IsValid. Used by the schedd emit path to fail fast
+// on a stray value before the SQL UPDATE surfaces a 23514.
+func (r AutoRollbackReason) IsValid() bool {
+	switch r {
+	case AutoRollbackReasonThresholdExceeded, AutoRollbackReasonFirstWindowExpired:
+		return true
+	default:
+		return false
+	}
+}
+
 // BuildStatus tracks the build row's lifecycle (spec §9).
 type BuildStatus string
 
@@ -845,6 +878,16 @@ type App struct {
 	// customer so they can pin a preview they want to keep. NULL
 	// on production apps.
 	PreviewExpiresAt *time.Time
+	// PreviewDestroyCommentedAt is the dedupe carrier for the
+	// one-click PR comment destroy surface (Mega-C PR-1 / issue
+	// #961 leaf 3). githubd's previewCommentOnce writes now() to
+	// this column after a successful POST to
+	// api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments;
+	// subsequent events for the same (app, PR) tuple skip the
+	// post. NULL on rows where the dispatcher has never
+	// commented (the common case for production apps and for
+	// previews provisioned before this migration landed).
+	PreviewDestroyCommentedAt *time.Time
 	// CORSDefaultEnabled is the per-app default CORS opt-in
 	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
 	// false (the default for every pre-PR app), the gateway
@@ -1405,6 +1448,43 @@ type Deployment struct {
 	Tag        string `json:"tag,omitempty"`
 	DeployedBy string `json:"deployed_by,omitempty"`
 	PRNumber   int    `json:"pr_number,omitempty"`
+
+	// RollbackOn5xx (Mega-C PR-2 / issue #961 leaf 8): when
+	// true, schedd subscribes to wake.response_5xx events on
+	// this deployment and fires the apid-internal
+	// /v1/internal/auto-rollback-on-5xx endpoint when the
+	// per-plan 5xx threshold is crossed inside the first-wake
+	// window. Pro+ only; Free/Hobby customers get a 403 on the
+	// create-deployment request (ErrPlanRollbackOn5xxNotAllowed).
+	// Default false; the column is BOOLEAN NOT NULL DEFAULT
+	// false (migration 00354).
+	RollbackOn5xx bool `json:"rollback_on_5xx,omitempty"`
+	// FirstWakeAt + First5xxWindowEndsAt stamp the start of the
+	// first-wake window (anchored at the first
+	// wake.proxy_first_byte event). Both nullable; the window
+	// ends at FirstWakeAt + 5 min, controlled by
+	// pkg/api.RollbackOn5xxWindowMinutes (5 min). Both nullable;
+	// the auto-rollback only fires inside this window.
+	FirstWakeAt          *time.Time `json:"first_wake_at,omitempty"`
+	First5xxWindowEndsAt *time.Time `json:"first_5xx_window_ends_at,omitempty"`
+	// First5xxCount is the running tally of wake.response_5xx
+	// events on this deployment. Incremented atomically by the
+	// BumpFirst5xxCount pgstore method on every wake.response_5xx
+	// event; schedd's AutoRollbackWatcher checks it against the
+	// per-plan threshold (plan.RollbackOn5xxThreshold()) inside the
+	// First5xxWindowEndsAt window. NOT NULL DEFAULT 0 (migration
+	// 00354); pre-feature rows backfill to 0.
+	First5xxCount int `json:"first_5xx_count,omitempty"`
+	// LastAutoRollbackAt + LastAutoRollbackReason record the
+	// most-recent auto-rollback (Mega-C PR-2). Stamped by
+	// pgstore.AutoRollbackDeploymentsTx; idempotent on subsequent
+	// passes (re-stamping with the same reason does NOT shift
+	// the timestamp). LastAutoRollbackReason uses the closed-set
+	// vocabulary {threshold_exceeded, first_window_expired},
+	// enforced at the schema layer via
+	// deployments_last_auto_rollback_reason_check.
+	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
+	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
 }
 
 // StageState is the typed view of the

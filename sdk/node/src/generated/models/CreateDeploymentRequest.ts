@@ -48,5 +48,9 @@ export type CreateDeploymentRequest = {
    * PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0).
    */
   pr_number?: number | null;
+  /**
+   * Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false.
+   */
+  rollback_on_5xx?: boolean | null;
 };
 

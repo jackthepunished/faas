@@ -403,6 +403,14 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    "preview",
+		DocSlug: "preview",
+		Short:   "Manage preview environments (Mega-C PR-1 / issue #961 leaf 3)",
+		Subcommands: []cliSub{
+			{Name: "destroy", Short: "Tear down a preview app (POST /v1/preview/{slug}/destroy)"},
+		},
+	},
+	{
 		Name:    "tenant-surfaces",
 		DocSlug: "tenant-surfaces",
 		Short:   "Manage tenant surfaces (multi-hostname SAN bundle per app)",

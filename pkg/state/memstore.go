@@ -2478,6 +2478,44 @@ func (m *MemStore) SetPreviewPrState(_ context.Context, appID, prState string) (
 	return a, nil
 }
 
+// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961 leaf 3)
+// is the MemStore mirror of PgStore.StampPreviewDestroyCommentedAt.
+// Preview-only by construction; production rows return
+// ErrNotFound. Idempotent: re-stamping the same timestamp is a
+// no-op (the column value is the dedupe key, not the row identity).
+func (m *MemStore) StampPreviewDestroyCommentedAt(_ context.Context, appID string, when time.Time) (App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok || a.PreviewOfSlug == "" {
+		return App{}, ErrNotFound
+	}
+	t := when
+	a.PreviewDestroyCommentedAt = &t
+	m.apps[appID] = a
+	return a, nil
+}
+
+// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) is the
+// MemStore mirror of PgStore.ListPreviewsForAccount. Returns every
+// non-deleted preview row for the account across all parents;
+// production apps (PreviewOfSlug == "") are filtered out.
+func (m *MemStore) ListPreviewsForAccount(_ context.Context, accountID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.AccountID != accountID || a.PreviewOfSlug == "" || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4410,6 +4448,129 @@ func (m *MemStore) RetryDeploymentFromStage(_ context.Context, failedID string, 
 	newDep.CreatedAt = time.Now()
 	m.deployments[newDep.ID] = newDep
 	return newDep, nil
+}
+
+// StampFirstWake mirrors PgStore.StampFirstWake for the in-memory
+// store used by unit tests (cmd/apid/handlers_*_test.go) and
+// cmd/e2e. Idempotent: the coalesce on the PG side is mirrored by
+// the explicit nil-check here. windowMinutes defaults to 5 when
+// non-positive.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) StampFirstWake(_ context.Context, deploymentID string, windowMinutes int) (Deployment, error) {
+	if windowMinutes <= 0 {
+		windowMinutes = 5
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	if d.FirstWakeAt == nil {
+		d.FirstWakeAt = &now
+	}
+	if d.First5xxWindowEndsAt == nil {
+		end := now.Add(time.Duration(windowMinutes) * time.Minute)
+		d.First5xxWindowEndsAt = &end
+	}
+	m.deployments[deploymentID] = d
+	return d, nil
+}
+
+// BumpFirst5xxCount mirrors PgStore.BumpFirst5xxCount. The mutex
+// serializes increments so concurrent calls are still atomic — same
+// post-condition as the PG UPDATE ... RETURNING.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) BumpFirst5xxCount(_ context.Context, deploymentID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	d.First5xxCount++
+	m.deployments[deploymentID] = d
+	return d.First5xxCount, nil
+}
+
+// MarkAutoRollback mirrors PgStore.MarkAutoRollback. Idempotent on
+// the (id, reason) pair: re-stamping with the same reason is a no-op
+// because the field is already non-nil. reason must be non-empty
+// (the closed-set check happens at the PG layer; here we just guard
+// against a typo before the caller can poison the in-memory state).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) MarkAutoRollback(_ context.Context, deploymentID, reason string, when time.Time) (Deployment, error) {
+	if reason == "" {
+		return Deployment{}, fmt.Errorf("pkgstate: MarkAutoRollback reason required")
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	if d.LastAutoRollbackReason == "" {
+		d.LastAutoRollbackAt = &when
+		d.LastAutoRollbackReason = reason
+		m.deployments[deploymentID] = d
+	}
+	return d, nil
+}
+
+// AutoRollbackDeploymentsTx mirrors PgStore.AutoRollbackDeploymentsTx
+// for the in-memory store. The mutex plays the role of the PG
+// transaction. Returns the new live deployment ID, or "" if no
+// superseded deploy exists (the rollback is a no-op). Returns
+// ErrNotFound when the current deployment row does not exist or is
+// not live.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) AutoRollbackDeploymentsTx(_ context.Context, appID, currentDeploymentID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.deployments[currentDeploymentID]
+	if !ok || cur.AppID != appID || cur.Status != DeployLive {
+		return "", ErrNotFound
+	}
+	// Find the latest superseded deploy on this app.
+	var targetID string
+	var latestCreated time.Time
+	for id, d := range m.deployments {
+		if id == currentDeploymentID {
+			continue
+		}
+		if d.AppID != appID || d.Status != DeploySuperseded {
+			continue
+		}
+		if latestCreated.IsZero() || d.CreatedAt.After(latestCreated) {
+			targetID = id
+			latestCreated = d.CreatedAt
+		}
+	}
+	if targetID == "" {
+		// No rollback target — succeed as a no-op (mirrors PG path).
+		return "", nil
+	}
+	cur.Status = DeploySuperseded
+	target := m.deployments[targetID]
+	target.Status = DeployLive
+	now := time.Now().UTC()
+	if cur.LastAutoRollbackAt == nil {
+		cur.LastAutoRollbackAt = &now
+	}
+	if cur.LastAutoRollbackReason == "" {
+		cur.LastAutoRollbackReason = "threshold_exceeded"
+	}
+	m.deployments[currentDeploymentID] = cur
+	m.deployments[targetID] = target
+	return targetID, nil
 }
 
 func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, bytes int64) error {

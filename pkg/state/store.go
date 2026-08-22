@@ -1159,6 +1159,17 @@ type Store interface {
 	// Soft-deleted rows are filtered out — the teardown janitor's
 	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
 	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) lists
+	// every non-deleted preview row for the account, across all
+	// parents. Backs the new /dashboard/previews page (a global
+	// "all open PRs" view that complements the per-app preview
+	// panel). Ordered by created_at DESC so the dashboard's
+	// newest-first display is free.
+	//
+	// Returns an empty slice (not an error) when the account has
+	// no previews. Production apps (preview_of_slug IS NULL) are
+	// filtered out — this is a preview-only view.
+	ListPreviewsForAccount(ctx context.Context, accountID string) ([]App, error)
 	// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns
 	// preview rows the teardown janitor should consider this tick:
 	// every non-torn_down preview that is either in a terminal-ish
@@ -1190,6 +1201,51 @@ type Store interface {
 	// production app id is ErrNotFound, so a bug in the janitor's
 	// query can never relabel a customer's live app.
 	SetPreviewPrState(ctx context.Context, appID, prState string) (App, error)
+	// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961
+	// leaf 3) records that the one-click PR comment destroy hint
+	// was posted to GitHub for this preview row. githubd's
+	// previewCommentOnce helper calls this after a successful
+	// POST so a closed → reopen → closed cycle does not spam
+	// the customer with duplicate comments.
+	//
+	// Only preview rows (preview_of_slug <> '') are eligible; a
+	// production app id is ErrNotFound. The stamp is idempotent:
+	// re-stamping the same timestamp is a no-op (the column value
+	// is the dedupe key, not the row identity).
+	StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error)
+	// StampFirstWake (Mega-C PR-2 / issue #961 leaf 8) sets
+	// first_wake_at + first_5xx_window_ends_at on the
+	// deployment iff both are NULL. The window ends_at is
+	// derived as now + windowMinutes (constant
+	// pkg/api.RollbackOn5xxWindowMinutes). Idempotent: a
+	// second call within the window leaves the values
+	// unchanged. Returns ErrNotFound when the deployment does
+	// not exist.
+	StampFirstWake(ctx context.Context, deploymentID string, windowMinutes int) (Deployment, error)
+	// BumpFirst5xxCount atomically increments the per-deploy
+	// first_5xx_count and returns the new value. Atomic via
+	// UPDATE ... RETURNING first_5xx_count (PG) / mutex-guarded
+	// map mutation (MemStore). schedd's threshold check is
+	// post-increment: caller compares the returned count to
+	// plan.RollbackOn5xxThreshold().
+	BumpFirst5xxCount(ctx context.Context, deploymentID string) (int, error)
+	// MarkAutoRollback stamps last_auto_rollback_at + the
+	// closed-set reason (see deployments_last_auto_rollback_reason_check
+	// from migration 00297). Called by the apid-internal
+	// auto-rollback handler after the deployments status swap
+	// commits. The two writes (status swap + this stamp) live
+	// in the same transaction; the audit row that carries
+	// trigger="auto_5xx" is the customer-visible signal.
+	MarkAutoRollback(ctx context.Context, deploymentID, reason string, when time.Time) (Deployment, error)
+	// AutoRollbackDeploymentsTx wraps the deployments status
+	// swap in a tx: (a) current live → superseded, (b) most
+	// recent superseded → live, (c) markAutoRollback on the
+	// rolled-back id. Returns the new live deployment id (the
+	// one schedd needs to park instances for). The instances
+	// mutation belongs to schedd per CLAUDE.md — this tx
+	// does NOT touch instances; schedd does that in a
+	// sibling call after this returns.
+	AutoRollbackDeploymentsTx(ctx context.Context, appID, currentDeploymentID string) (newLiveDeploymentID string, err error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and

@@ -5754,3 +5754,139 @@ func TestIsStageName(t *testing.T) {
 		}
 	}
 }
+
+// TestMemStore_StampFirstWake covers the wake-window stamp on
+// the deployments row (Mega-C PR-2 / issue #961 leaf 8). The
+// stamp is idempotent — a second wake must NOT shift the window
+// boundary. windowMinutes defaults to 5 when non-positive.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_StampFirstWake(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "first-wake", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:fw"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	// (1) First wake stamps both fields. windowMinutes defaults to 5.
+	got, err := m.StampFirstWake(ctx, dep.ID, 0)
+	if err != nil {
+		t.Fatalf("StampFirstWake 1st: %v", err)
+	}
+	if got.FirstWakeAt == nil {
+		t.Fatal("FirstWakeAt: nil after first stamp")
+	}
+	if got.First5xxWindowEndsAt == nil {
+		t.Fatal("First5xxWindowEndsAt: nil after first stamp")
+	}
+	firstEnd := *got.First5xxWindowEndsAt
+	firstStart := *got.FirstWakeAt
+	if !firstEnd.After(firstStart) {
+		t.Errorf("window end %v not after start %v", firstEnd, firstStart)
+	}
+
+	// (2) Second wake is idempotent: same start, same end.
+	got2, err := m.StampFirstWake(ctx, dep.ID, 5)
+	if err != nil {
+		t.Fatalf("StampFirstWake 2nd: %v", err)
+	}
+	if got2.FirstWakeAt == nil || !got2.FirstWakeAt.Equal(firstStart) {
+		t.Errorf("Second stamp shifted FirstWakeAt: got %v, want %v", got2.FirstWakeAt, firstStart)
+	}
+	if got2.First5xxWindowEndsAt == nil || !got2.First5xxWindowEndsAt.Equal(firstEnd) {
+		t.Errorf("Second stamp shifted First5xxWindowEndsAt: got %v, want %v", got2.First5xxWindowEndsAt, firstEnd)
+	}
+
+	// (3) Unknown deployment → ErrNotFound.
+	if _, err := m.StampFirstWake(ctx, "no-such", 5); !errors.Is(err, ErrNotFound) {
+		t.Errorf("StampFirstWake unknown: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_BumpFirst5xxCount covers the atomic 5xx-counter
+// bump on the deployments row. Returns the post-increment count
+// so schedd can do the threshold check immediately.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_BumpFirst5xxCount(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "bump-5xx", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:bump"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	for want := 1; want <= 5; want++ {
+		got, err := m.BumpFirst5xxCount(ctx, dep.ID)
+		if err != nil {
+			t.Fatalf("BumpFirst5xxCount #%d: %v", want, err)
+		}
+		if got != want {
+			t.Errorf("BumpFirst5xxCount #%d = %d, want %d", want, got, want)
+		}
+	}
+
+	if _, err := m.BumpFirst5xxCount(ctx, "no-such"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("BumpFirst5xxCount unknown: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_AutoRollbackDeploymentsTx covers the §6.2-1
+// invariant guard inside AutoRollbackDeploymentsTx. A non-live
+// current deployment must surface ErrNotFound; a live current
+// deployment with no prior superseded must surface ErrNotFound
+// too (no candidate to swap to).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_AutoRollbackDeploymentsTx(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("not_live_current_returns_NotFound", func(t *testing.T) {
+		m := NewMemStore()
+		acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+		if err != nil {
+			t.Fatalf("CreateAccount: %v", err)
+		}
+		app, err := m.CreateApp(ctx, App{
+			AccountID: acc.ID, Slug: "ar-notlive", Type: AppTypeApp,
+			RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+			Status: AppActive,
+		})
+		if err != nil {
+			t.Fatalf("CreateApp: %v", err)
+		}
+		dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:nl"})
+		if err != nil {
+			t.Fatalf("CreateDeployment: %v", err)
+		}
+		// dep is in 'pending' (default), not 'live'.
+		if _, err := m.AutoRollbackDeploymentsTx(ctx, app.ID, dep.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("AutoRollbackDeploymentsTx on non-live: err = %v, want ErrNotFound", err)
+		}
+	})
+}

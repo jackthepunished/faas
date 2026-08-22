@@ -173,12 +173,18 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/deployments":            "Deploy",
 	"POST /v1/apps/{slug}/deployments/source-ref": "DeployFromSourceRef", // issue #739 / DEPLOY-PROV-4 / ADR-092; headless CI deploy
 	"POST /v1/apps/{slug}/diff":                   "Diff",                // PR-1 of deploy-diff cluster; CI gate input
-	"GET /v1/account/export":                      "ExportAccount",
-	"DELETE /v1/account":                          "DeleteAccount",
-	"PATCH /v1/account/plan":                      "ChangePlan",
-	"GET /v1/account":                             "Whoami",
-	"POST /v1/account/restore":                    "RestoreAccount",
-	"POST /v1/account/overage-cap":                "RaiseOverageCap", // issue #561 spend cap
+	// Issue #961 / Mega-C PR-1 / leaf 3 — preview-destroy route.
+	// Auto-derivation would produce "PostPreviewSlugDestroy" (the
+	// Swagger-style verb+resource concat), but the SDK convention
+	// uses ResourceVerb — pin to DestroyPreview so the wire +
+	// SDK verb surface stays uniform with Rollback/Park/Wake.
+	"POST /v1/preview/{slug}/destroy": "DestroyPreview",
+	"GET /v1/account/export":          "ExportAccount",
+	"DELETE /v1/account":              "DeleteAccount",
+	"PATCH /v1/account/plan":          "ChangePlan",
+	"GET /v1/account":                 "Whoami",
+	"POST /v1/account/restore":        "RestoreAccount",
+	"POST /v1/account/overage-cap":    "RaiseOverageCap", // issue #561 spend cap
 	// Issue #679 / PR-B / ADR-082 — per-account additive budget on
 	// top of the plan's apps.egress_allowlist cap. The auto-derivation
 	// would concat "Account" + "Egress_allowlist_extra" (the literal

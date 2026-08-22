@@ -1859,8 +1859,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, preview_destroy_commented_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1897,6 +1897,12 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		// the canonical "all four columns are NULL" producer.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
 		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier.
+		// nullableTimestamptzPtr coerces a nil *time.Time to SQL
+		// NULL, which is the correct shape for both production
+		// rows (never commented) and freshly-provisioned
+		// preview rows (comment post happens AFTER CreateApp).
+		nullableTimestamptzPtr(app.PreviewDestroyCommentedAt),
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag (apps.maintenance_mode). Written
 		// explicitly so the App struct's value (default false)
@@ -2047,8 +2053,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, preview_destroy_commented_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -2079,6 +2085,12 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		// this path) never carry preview metadata.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
 		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier.
+		// nullableTimestamptzPtr coerces a nil *time.Time to SQL
+		// NULL, which is the correct shape for both production
+		// rows (never commented) and freshly-provisioned
+		// preview rows (comment post happens AFTER CreateApp).
+		nullableTimestamptzPtr(app.PreviewDestroyCommentedAt),
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag. Same explicit-write posture as
 		// CreateApp above — the schema DEFAULT would yield
@@ -2129,6 +2141,31 @@ func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug
 	if err != nil {
 		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
 	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) is the
+// global "all my open PRs" view that backs the new
+// /dashboard/previews page. Same shape as PreviewAppsByParent but
+// no parent_slug filter — returns every non-deleted preview row
+// for the account. The query plan uses the same
+// apps_preview_of_slug_idx partial index because every row in the
+// result set satisfies preview_of_slug IS NOT NULL (production
+// apps are filtered out).
+//
+// Soft-deleted previews are excluded (matching the per-parent
+// pane's contract — "torn down" rows live in the janitor's
+// sweep, not the customer-facing list). The account_id predicate
+// is the same defence-in-depth as PreviewAppsByParent.
+func (s *PgStore) ListPreviewsForAccount(ctx context.Context, accountID string) ([]App, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+appsSelectColumns+` from apps where account_id = $1 and preview_of_slug is not null and status <> 'deleted' order by created_at desc`,
+		accountID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list previews for account %q: %w", accountID, err)
+	}
+	defer rows.Close()
 	return scanApps(rows)
 }
 
@@ -2195,6 +2232,35 @@ func (s *PgStore) SetPreviewPrState(ctx context.Context, appID, prState string) 
 		update apps set preview_pr_state = $2
 		where id = $1 and preview_of_slug is not null
 		returning `+appsSelectColumns, appID, prState)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
+}
+
+// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961 leaf 3)
+// records that the one-click PR comment destroy hint was posted
+// to GitHub for this preview row. githubd's previewCommentOnce
+// helper calls this after every successful POST so a closed →
+// reopen → closed cycle does not spam the customer.
+//
+// The WHERE preview_of_slug IS NOT NULL guard mirrors
+// SetPreviewPrState above: a buggy caller cannot stamp a
+// production app's dedupe column. Returns ErrNotFound when the
+// row is missing OR when the row is a production app — same
+// code path because both are zero-rows-updated.
+//
+// Idempotent: re-stamping the column with the same timestamp is
+// a no-op (the column value is the dedupe key, not the row
+// identity). The githubd caller's invariant is "stamp exactly
+// once per (app, PR) tuple"; the column carries the audit row
+// for that single post.
+func (s *PgStore) StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error) {
+	var a App
+	row := s.pool.QueryRow(ctx, `
+		update apps set preview_destroy_commented_at = $2
+		where id = $1 and preview_of_slug is not null
+		returning `+appsSelectColumns, appID, when)
 	if err := scanAppInto(&a, row); err != nil {
 		return App{}, mapErr(err)
 	}
@@ -5513,6 +5579,174 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 		return Deployment{}, err
 	}
 	return created, nil
+}
+
+// StampFirstWake sets first_wake_at + first_5xx_window_ends_at if
+// both are NULL. Idempotent: a second wake (the dashboard healthz
+// probe waking the same deploy) is a no-op; only the first wake
+// opens the 5xx window. Returns the post-stamp Deployment so the
+// caller can decide whether to subscribe wake.response_5xx for
+// this deployment. The window is anchored at first_wake_at +
+// windowMinutes (default 5; RollbackOn5xxWindowMinutes).
+//
+// If the deploy has rollback_on_5xx=false (default), we still
+// stamp the columns — schedd might query them later when the
+// customer flips the flag (mid-window upgrades Hobby → Pro, see
+// ADR-118 risk (g)).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) StampFirstWake(ctx context.Context, deploymentID string, windowMinutes int) (Deployment, error) {
+	if windowMinutes <= 0 {
+		windowMinutes = 5
+	}
+	row := s.pool.QueryRow(ctx, `
+		update deployments
+		   set first_wake_at = coalesce(first_wake_at, now()),
+		       first_5xx_window_ends_at = coalesce(first_5xx_window_ends_at, now() + ($2::text || ' minutes')::interval)
+		 where id = $1
+		 returning `+deploymentSelectColumnsWithRootfs, deploymentID, windowMinutes)
+	d, err := scanDeploymentWithRootfs(row)
+	if err != nil {
+		return Deployment{}, mapErr(err)
+	}
+	return d, nil
+}
+
+// BumpFirst5xxCount atomically increments deployments.first_5xx_count
+// and returns the post-increment count. The schedd-side threshold
+// check happens after this returns. Atomic via UPDATE ... RETURNING,
+// so concurrent wake.response_5xx events on the same deploy can never
+// lose an increment. Replay-safety is built-in: re-emitting the same
+// event bumps the counter again, which is the conservative direction
+// (it can trigger a no-op auto-rollback but cannot miss one).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) BumpFirst5xxCount(ctx context.Context, deploymentID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`update deployments
+		    set first_5xx_count = first_5xx_count + 1
+		  where id = $1
+		  returning first_5xx_count`, deploymentID).Scan(&n)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return n, nil
+}
+
+// MarkAutoRollback stamps last_auto_rollback_at + last_auto_rollback_reason
+// on the current (failed) deploy. Idempotent on the (id, reason) pair;
+// re-stamping with the same reason is a no-op via the WHERE clause,
+// so a duplicated auto-rollback signal from schedd does not double-write.
+// reason MUST be 'threshold_exceeded' or 'first_window_expired' —
+// the CHECK constraint deployments_last_auto_rollback_reason_check
+// rejects anything else.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) MarkAutoRollback(ctx context.Context, deploymentID, reason string, when time.Time) (Deployment, error) {
+	if reason == "" {
+		return Deployment{}, fmt.Errorf("pkgstate: MarkAutoRollback reason required")
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	row := s.pool.QueryRow(ctx, `
+		update deployments
+		   set last_auto_rollback_at = $2,
+		       last_auto_rollback_reason = $3
+		 where id = $1
+		   and last_auto_rollback_reason is null
+		 returning `+deploymentSelectColumnsWithRootfs, deploymentID, when, reason)
+	d, err := scanDeploymentWithRootfs(row)
+	if err != nil {
+		return Deployment{}, mapErr(err)
+	}
+	return d, nil
+}
+
+// AutoRollbackDeploymentsTx performs the §6.2-1-safe rollback inside
+// a single tx: supersede the current (failed) deploy and promote the
+// latest superseded deploy back to live, stamping last_auto_rollback_at
+// + last_auto_rollback_reason on the failed row. The instances-park
+// belongs to schedd (the ONLY writer to instances per CLAUDE.md);
+// this method mutates deployments only.
+//
+// Returns the new live deployment ID, or (empty, nil) if no
+// superseded deploy exists (the rollback is a no-op — the failed
+// deploy was the only one). Returns ErrNotFound when the current
+// deployment row does not exist.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) AutoRollbackDeploymentsTx(ctx context.Context, appID, currentDeploymentID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// (1) Verify current row exists and is live. Prevents a stale
+	// auto-rollback signal from schedd from rolling back an already-
+	// superseded deploy (which would leave the previous live row
+	// unstamped).
+	var currentExists bool
+	if err := tx.QueryRow(ctx,
+		`select exists(select 1 from deployments where id = $1 and app_id = $2 and status = 'live')`,
+		currentDeploymentID, appID).Scan(&currentExists); err != nil {
+		return "", mapErr(err)
+	}
+	if !currentExists {
+		return "", ErrNotFound
+	}
+
+	// (2) Find the latest superseded deploy on this app (the rollback
+	// target). ORDER BY created_at DESC mirrors LatestSupersededDeployment
+	// in cmd/apid so the manual + auto-rollback paths agree on the same
+	// target.
+	var targetID string
+	err = tx.QueryRow(ctx, `
+		select id from deployments
+		 where app_id = $1 and status = 'superseded' and id <> $2
+		 order by created_at desc
+		 limit 1`, appID, currentDeploymentID).Scan(&targetID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No rollback target — succeed as a no-op so schedd does
+			// not retry forever. The failed deploy is left in place;
+			// §6.2-1 is preserved because we did not promote a new
+			// live row.
+			return "", nil
+		}
+		return "", mapErr(err)
+	}
+
+	// (3) Status swap. The order matches the manual rollback path:
+	// supersede current THEN promote target. Both are conditional on
+	// the source status to keep the path idempotent against a
+	// concurrent rollback signal.
+	if _, err := tx.Exec(ctx,
+		`update deployments set status = 'superseded' where id = $1 and status = 'live'`,
+		currentDeploymentID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx,
+		`update deployments set status = 'live' where id = $1 and status = 'superseded'`,
+		targetID); err != nil {
+		return "", err
+	}
+
+	// (4) Stamp the audit anchor on the failed deploy.
+	if _, err := tx.Exec(ctx, `
+		update deployments
+		   set last_auto_rollback_at = coalesce(last_auto_rollback_at, now()),
+		       last_auto_rollback_reason = coalesce(last_auto_rollback_reason, 'threshold_exceeded')
+		 where id = $1`, currentDeploymentID); err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return targetID, nil
 }
 
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {
@@ -13114,6 +13348,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// EgressAllowlist handles the empty case). No helper
 		// normalisation needed.
 		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier for
+		// the one-click PR comment destroy surface. Nullable
+		// timestamptz scanned into *time.Time directly (pgx
+		// handles SQL NULL → Go nil natively — same shape as
+		// PreviewExpiresAt above).
+		&a.PreviewDestroyCommentedAt,
 		&corsDefaultEnabled, &a.CORSDefaultOrigins,
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag (apps.maintenance_mode). NOT NULL
@@ -13246,6 +13486,13 @@ const appsSelectColumns = `
 	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at,
+	-- Mega-C PR-1 / issue #961 leaf 3: dedupe carrier for the
+	-- one-click PR comment destroy surface. Nullable
+	-- timestamptz; preview_destroy_commented_at IS NULL means
+	-- "githubd has never posted a destroy hint comment for this
+	-- preview row". pgx scans nullable timestamptz → *time.Time
+	-- natively; no coalesce needed.
+	preview_destroy_commented_at,
 	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
 	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00224);
 	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
@@ -13329,7 +13576,10 @@ const deploymentSelectColumnsWithRootfs = `
 	scope,
 	stage_state,
 	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,''),
-	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number`
+	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number,
+	rollback_on_5xx,
+	first_wake_at, first_5xx_window_ends_at, first_5xx_count,
+	last_auto_rollback_at, coalesce(last_auto_rollback_reason,'')`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -13366,7 +13616,10 @@ const deploymentSelectColumnsQualified = `
 	d.scope,
 	d.stage_state,
 	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,''),
-	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number`
+	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number,
+	d.rollback_on_5xx,
+	d.first_wake_at, d.first_5xx_window_ends_at, d.first_5xx_count,
+	d.last_auto_rollback_at, coalesce(d.last_auto_rollback_reason,'')`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -13398,6 +13651,16 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	// closed-set vocabulary on `tag` is enforced at the schema layer
 	// via deployments_tag_set_chk, not on the scan side.
 	var prNumber *int
+	// Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: nullable
+	// timestamps + a non-nullable counter scanned directly into
+	// the struct. first_wake_at and first_5xx_window_ends_at are
+	// NULL until the gateway stamps the first customer-visible
+	// response; last_auto_rollback_at is NULL until schedd fires
+	// the rollback. last_auto_rollback_reason is coalesced to ''
+	// in the SELECT projection so it reads into a plain string
+	// field (the closed-set is enforced at the schema layer via
+	// deployments_last_auto_rollback_reason_check).
+	var firstWakeAt, first5xxWindowEndsAt, lastAutoRollbackAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so
 	// the SELECT projections in DeploymentByID / LatestDeployment /
 	// etc. match. The scan order matches the column order in the
@@ -13440,28 +13703,12 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope,
 		&d.StageState,
-		// Issue #606 — actor attribution columns (migration 00305).
-		// deployed_by_user_id is coalesced to '' in the SELECT
-		// projection above (UUID NULL → '') so the typed-string
-		// destination stays a string field on the struct; the
-		// empty string is the "anonymous / pre-FK / GitHub-push"
-		// sentinel. deployed_via is NOT NULL DEFAULT 'api' so the
-		// SELECT can hand it straight to a plain string field.
-		// deployed_from_ip is coalesced to '' for the same UUID-
-		// style reason (INET NULL → ''). pusher_login is coalesced
-		// to '' for the nullable text reason. The destinations stay
-		// in lockstep with deploymentSelectColumnsWithRootfs; pgx's
-		// "number of field descriptions must equal number of
-		// destinations" panic fires immediately on the next read
-		// path if these two lists drift apart.
 		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin,
-		// Issue #977 / ADR-116: annotation columns. reason / tag /
-		// deployed_by are coalesced to '' in the SELECT projection
-		// (nullable text NULL → ''), so the typed-string destinations
-		// stay plain string fields. pr_number is NULLIF($N, 0) on
-		// the INSERT side and a plain int column on the SELECT side,
-		// scanned via the *int local returned as nil for NULL.
-		&d.Reason, &d.Tag, &d.DeployedBy, &prNumber); err != nil {
+		&d.Reason, &d.Tag, &d.DeployedBy, &prNumber,
+		&d.RollbackOn5xx,
+		&firstWakeAt, &first5xxWindowEndsAt, &d.First5xxCount,
+		&lastAutoRollbackAt, &d.LastAutoRollbackReason,
+	); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -13485,6 +13732,9 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	if prNumber != nil {
 		d.PRNumber = *prNumber
 	}
+	d.FirstWakeAt = firstWakeAt
+	d.First5xxWindowEndsAt = first5xxWindowEndsAt
+	d.LastAutoRollbackAt = lastAutoRollbackAt
 	return nil
 }
 

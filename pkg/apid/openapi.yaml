@@ -40,6 +40,17 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: previews
+    description: |
+      Preview environments (issue #961 / ADR-095). A preview is a
+      per-PR child app created by the githubd bridge; the customer
+      wakes the preview URL to exercise the change before merge.
+      This tag groups the customer-facing destroy route
+      (POST /v1/preview/{slug}/destroy) — the dashboard surface is
+      under `apps` (the preview panel) and the build-pipeline
+      surface is under `deployments` (preview kind deployments).
+      Cross-tagged with `apps` so a tag filter of `apps` surfaces
+      preview-destroy alongside the parent-app lifecycle.
   - name: deploydiff
     description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
@@ -1435,6 +1446,34 @@ paths:
         '204': { description: No body. The resource was removed. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/preview/{slug}/destroy:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [previews]
+      operationId: destroyPreview
+      summary: Tear down a preview app.
+      description: |
+        One-click destroy of a preview app row (issue #961 Mega-C PR-1,
+        leaf 3). Typically fired from a "Tear down this preview" link
+        posted to the GitHub PR by `pkg/githubd`. Distinct from
+        `DELETE /v1/apps/{slug}` because the preview teardown also
+        stamps `apps.preview_pr_state='torn_down'` so the janitor
+        doesn't re-process the row on a subsequent tick, and emits a
+        distinct audit kind (`preview.destroyed_by_customer` vs
+        `app.deleted`).
+      responses:
+        '204': { description: No body. The preview was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '404 — slug does not identify a preview app. Use DELETE /v1/apps/{slug} to destroy a production app.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+                example: {"type":"https://docs.gregale.dev/errors/preview-not-found","code":"preview_not_found","title":"Preview not found","detail":"the slug does not identify a preview app; use DELETE /v1/apps/{slug} to destroy a production app","status":404}
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/apps/{slug}/metrics:
@@ -9555,6 +9594,42 @@ components:
           type: integer
           minimum: 1
           description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
+        # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
+        # auto-rollback echo. The migration 00354 column shape is
+        # mirrored verbatim onto the wire so the dashboard, CLI
+        # history, and SDK consumers can render the auto-rollback
+        # counters without an audit round-trip. rollback_on_5xx
+        # is always present (NOT NULL DEFAULT false); the four
+        # counters / timestamps are omitempty so pre-PR-2 rows
+        # render with all four absent (byte-identical to the
+        # pre-PR-2 wire shape). The closed-set vocabulary on
+        # last_auto_rollback_reason is enforced at the schema
+        # layer via deployments_last_auto_rollback_reason_check.
+        rollback_on_5xx:
+          type: boolean
+          default: false
+          description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Customer sets this at create time (Pro+ only); schedd fires the rollback when first_5xx_count crosses the per-plan threshold inside first_5xx_window_ends_at."
+        first_wake_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp of the first customer-visible wake response (anchor for the auto-rollback window). NULL until the gateway stamps it on the first wake.proxy_first_byte event."
+        first_5xx_window_ends_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp the auto-rollback window closes (first_wake_at + 5 min). NULL until the gateway stamps it on the first wake. The schedd scan checks `now() < first_5xx_window_ends_at` before firing the rollback."
+        first_5xx_count:
+          type: integer
+          minimum: 0
+          default: 0
+          description: "Atomic 5xx counter incremented by schedd on every wake.response_5xx event for this row. Default 0; NOT NULL DEFAULT 0 enforced at the schema layer."
+        last_auto_rollback_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp the most recent auto-rollback fired (idempotent across retries; updated by schedd when the rollback tx commits). NULL until the first auto-rollback."
+        last_auto_rollback_reason:
+          type: [string, "null"]
+          enum: [null, threshold_exceeded, first_window_expired]
+          description: "Closed-set classifier for the most recent auto-rollback trigger. `threshold_exceeded` = first_5xx_count crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing the threshold (clean wake window). Closed-set is enforced at the schema layer via deployments_last_auto_rollback_reason_check."
 
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
@@ -10146,6 +10221,14 @@ components:
           type: [integer, "null"]
           minimum: 1
           description: "PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0)."
+        # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
+        # auto-rollback opt-in. Pro+ only (Hobby/Free get 403
+        # plan_rollback_on_5xx_not_allowed at handler validation).
+        # nil/omitted = server default false (no auto-rollback).
+        rollback_on_5xx:
+          type: [boolean, "null"]
+          description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false."
+          example: true
 
     CreateDeploymentOverrides:
       description: |
