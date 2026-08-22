@@ -53,29 +53,6 @@ func (s *streamSvc) StreamSourceRef(_ context.Context, _ string, _ int64, _, _ s
 	return io.NopCloser(strings.NewReader(s.streamBody)), s.streamTrunc, s.streamTotal, nil
 }
 
-// nopReader is an io.ReadCloser whose Read returns a single chunk then
-// io.EOF. Used to drive the server-streaming pump through a specific
-// byte pattern without allocating a full archive fixture.
-type nopReader struct {
-	data []byte
-	off  int
-	done bool
-}
-
-func (r *nopReader) Read(p []byte) (int, error) {
-	if r.done || r.off >= len(r.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.off:])
-	r.off += n
-	if r.off >= len(r.data) {
-		r.done = true
-	}
-	return n, nil
-}
-
-func (r *nopReader) Close() error { return nil }
-
 // newStreamServer wires streamSvc into a bufconn listener and returns
 // both the proto client and the high-level Client for round-trip tests.
 func newStreamServer(t *testing.T, svc *streamSvc) (githubdpb.GithubdClient, *githubdgrpc.Client) {
@@ -249,7 +226,7 @@ func TestStreamSourceRef_HappyPath(t *testing.T) {
 	}
 
 	got, rerr := io.ReadAll(res.Body)
-	if rerr != nil && rerr != io.EOF {
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		t.Fatalf("read: %v", rerr)
 	}
 	if string(got) != payload {
@@ -296,7 +273,7 @@ func TestStreamSourceRef_TruncatedFlag(t *testing.T) {
 		t.Fatalf("stream: %v", err)
 	}
 	got, rerr := io.ReadAll(res.Body)
-	if rerr != nil && rerr != io.EOF {
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		t.Fatalf("read: %v", rerr)
 	}
 	if string(got) != "A" {
@@ -340,7 +317,7 @@ func TestStreamSourceRef_StreamLoopRunsChunkPath(t *testing.T) {
 		t.Fatalf("stream: %v", err)
 	}
 	got, rerr := io.ReadAll(res.Body)
-	if rerr != nil && rerr != io.EOF {
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		t.Fatalf("read: %v", rerr)
 	}
 	if string(got) != "A" {

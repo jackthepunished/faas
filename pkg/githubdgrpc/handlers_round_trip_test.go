@@ -672,7 +672,7 @@ func TestClient_LiftErr_PlainErrorPassesThrough(t *testing.T) {
 	// Non-status error returns from gRPC pass through liftErr unchanged.
 	c := githubdgrpc.NewClient(nil)
 	err := errors.New("non-status")
-	if got := liftErrForTest(c, err); got != err {
+	if got := liftErrForTest(c, err); !errors.Is(got, err) {
 		t.Errorf("expected pass-through, got %v", got)
 	}
 }

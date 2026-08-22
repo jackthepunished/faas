@@ -10,7 +10,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/releasebundle"
@@ -84,29 +83,12 @@ func TestDeploy_PreflightFailure(t *testing.T) {
 
 // --- rollback branch ---------------------------------------------------
 
-// rollbackRuntime triggers the rollback path: Healthy returns an
-// error on first call, Migrate succeeds, Activate succeeds.
-type rollbackRuntime struct {
-	fakeRuntime
-}
-
-func (r *rollbackRuntime) Healthy(_ context.Context, _ releasebundle.Manifest) error {
-	r.calls = append(r.calls, "healthy")
-	if len(r.calls) == 1 {
-		return errors.New("not healthy")
-	}
-	return nil
-}
-
+// The rollback() function is private and only called by Deploy.
 // We can't easily inject a healthy error AND verify the rollback
-// path because the rollback function depends on actual FS state
-// (the symlink at CurrentPath). The rollback() function is
-// private and only called by Deploy. Skip the rollback test —
-// the existing controller_test.go covers rollback at the
-// integration level.
-//
-// (See controller.go:91 rollback branch — covered indirectly by
-// the rollbackRuntime's Healthy error path above.)
+// path because rollback depends on actual FS state (the symlink
+// at CurrentPath). Skip the rollback test — the existing
+// controller_test.go covers rollback at the integration level
+// (controller.go:91 rollback branch).
 
 // --- IsControllerStagingEntry ------------------------------------------
 
@@ -234,58 +216,3 @@ func TestActivatePointer_FSError(t *testing.T) {
 	// destination in a sandbox — skip.
 	t.Skip("activatePointer FS error branch is exercised by metal tests; hard to inject in non-root sandbox")
 }
-
-// --- helper: stubDirEntry builds a minimal os.DirEntry ----------
-
-// stubDirEntry returns a minimal os.DirEntry whose Name() comes
-// from path's basename and whose IsDir() is isDir. Implemented
-// via fs.FileInfoToDirEntry (Go 1.20+) — but simpler is to use
-// the os.ReadDir + index pattern. We use the helper
-// fs.FileInfoToDirEntry to avoid leaking types here.
-
-func stubDirEntry(t *testing.T, path string, isDir bool) osDirEntry {
-	t.Helper()
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat %s: %v", path, err)
-	}
-	// If the fixture doesn't match isDir, override.
-	if fi.IsDir() != isDir {
-		t.Fatalf("stat %s: isDir mismatch (want %v, got %v)", path, isDir, fi.IsDir())
-	}
-	return osDirEntryFromInfo(fi)
-}
-
-// osDirEntry is a local alias so we don't pull the entire
-// io/fs package into the test file's surface.
-type osDirEntry = dirEntry
-
-// dirEntry is the minimal interface the isControllerStagingEntry
-// uses: Name() + IsDir().
-type dirEntry interface {
-	Name() string
-	IsDir() bool
-}
-
-// osDirEntryFromInfo builds a dirEntry from an os.FileInfo. The
-// standard library's fs.FileInfoToDirEntry returns *fs.DirEntry
-// but the function is internal; use a tiny shim instead.
-
-type stubDirEntryImpl struct {
-	name  string
-	isDir bool
-}
-
-func (s stubDirEntryImpl) Name() string { return s.name }
-func (s stubDirEntryImpl) IsDir() bool  { return s.isDir }
-
-func osDirEntryFromInfo(fi os.FileInfo) dirEntry {
-	return stubDirEntryImpl{name: fi.Name(), isDir: fi.IsDir()}
-}
-
-// silence unused import in this file
-var _ = strings.Split
-
-// drop stubDirEntry / stubDirEntryImpl helpers — replaced by
-// real os.ReadDir entries above.
-var _ = stubDirEntryImpl{}

@@ -302,4 +302,6 @@ var procSelfStatusPath = "/proc/self/status"
 // procOpen is the file-open function Check uses for the
 // `opts.PID > 0` branch (runtimecheck.go:84-89). Defaults to
 // os.Open; tests override to inject open errors.
+//
+//nolint:forbidigo // seam for test-only fault injection; production reads /proc/{PID}/status, not a customer-supplied path, so the openCustomerFile guard does not apply.
 var procOpen = os.Open
