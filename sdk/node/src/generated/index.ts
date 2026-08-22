@@ -313,6 +313,7 @@ export { KeysService } from './services/KeysService.js';
 export { MetaService } from './services/MetaService.js';
 export { MfaService } from './services/MfaService.js';
 export { ObservabilityService } from './services/ObservabilityService.js';
+export { OpenapiDiscoveryService } from './services/OpenapiDiscoveryService.js';
 export { OrgsService } from './services/OrgsService.js';
 export { ProjectsService } from './services/ProjectsService.js';
 export { QueuesService } from './services/QueuesService.js';

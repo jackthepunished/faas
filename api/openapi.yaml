@@ -46,6 +46,8 @@ tags:
     description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo) per app.
   - name: deployments
     description: Deployments & build status.
+  - name: openapi_discovery
+    description: Captured OpenAPI documents per deployment (ADR-122 / issue #975 item #1).
   - name: instances
     description: Read-only instance view.
   - name: domains
@@ -1955,6 +1957,101 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '413': { $ref: '#/components/responses/SourceTooLarge' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ADR-122 — endpoint discovery. Captured OpenAPI doc per deployment.
+  /v1/apps/{slug}/deployments/{deployment}/openapi:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: deployment
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Deployment UUID.
+    get:
+      tags: [openapi_discovery]
+      operationId: getDeploymentOpenAPIDoc
+      summary: Read the captured OpenAPI document for a deployment.
+      description: "Returns the OpenAPI document the cold-boot probe captured from the customer's app (issue #975 item #1, ADR-122). The probe runs unconditionally during cold boot; the apid surfaces the doc only on paid plans (Hobby/Pro/Scale). Free customers receive 402 + openapi_docs_not_allowed. Cache-Control: 5 min. Response headers: X-OpenAPI-Doc-Source (cold_boot or manual_upload), X-OpenAPI-Doc-Truncated (1 if clipped at 128 KiB), X-OpenAPI-Doc-Byte-Size."
+      responses:
+        '200':
+          description: The OpenAPI document.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: "The captured OpenAPI document, body unchanged. The customer's /openapi.json is returned verbatim — no rewriting, no field normalisation."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: "Free plan cannot access endpoint discovery. MicroVM captures the doc, but the apid refuses to expose it."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: "No document captured for this deployment, or the deployment id is not owned by the caller (IDOR floor)."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    patch:
+      tags: [openapi_discovery]
+      operationId: updateDeploymentOpenAPIDoc
+      summary: Manually upload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: The updated row.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: The stored OpenAPI doc with its metadata envelope.
+                required: [deployment_id, account_id, app_id, source, byte_size, captured_at, updated_at]
+                properties:
+                  deployment_id: { type: string, format: uuid }
+                  account_id:    { type: string, format: uuid }
+                  app_id:        { type: string, format: uuid }
+                  source:
+                    type: string
+                    enum: [cold_boot, manual_upload]
+                  byte_size:     { type: integer, minimum: 1, maximum: 131072 }
+                  doc_sha256:    { type: string, description: Lower-case hex SHA-256 of the stored body. }
+                  truncated:     { type: boolean }
+                  captured_at:   { type: string, format: date-time }
+                  updated_at:    { type: string, format: date-time }
+                  doc:
+                    type: object
+                    description: The OpenAPI document body.
+        '400': { description: Bad request. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: "Two distinct 402 reasons: openapi_docs_not_allowed (Free plan cannot use endpoint discovery), plan_openapi_doc_quota_reached (per-account Plan.OpenAPIDocsPerAccount() cap reached)."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: "code: plan_openapi_doc_too_large. Body exceeds Plan.OpenAPIDocMaxBytes() (Hobby 100 KiB, Pro 100 KiB, Scale 100 KiB)."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      tags: [openapi_discovery]
+      operationId: deleteDeploymentOpenAPIDoc
+      summary: Delete the captured OpenAPI document for a deployment.
+      description: "Companion to PATCH — explicitly wipes the captured doc (re-applied on next cold boot of the deployment)."
+      responses:
+        '204': { description: Deleted (row gone). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: "Free plan cannot use endpoint discovery."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/apps/{slug}/diff:
     parameters:

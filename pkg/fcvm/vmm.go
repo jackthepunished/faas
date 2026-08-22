@@ -2714,11 +2714,18 @@ const VsockCharacterizationHostPort = 1026
 // guest/init/characterize_linux.go::VsockCharacterizationMsgType (=3).
 const VsockCharacterizationMsgType uint32 = 3
 
-// VsockCharacterizationMaxBody caps the JSON body at 32 KiB.
-// The typical report is <2 KiB; 32 KiB accommodates a long log_tail
-// plus listening_addrs for a polyglot app. Matches the guest's
+// VsockCharacterizationMaxBody caps the JSON body at 128 KiB.
+// The typical report is <2 KiB; 128 KiB accommodates a long log_tail
+// plus listening_addrs for a polyglot app AND an OpenAPI doc capture
+// (ADR-122 §D2). Real-world OpenAPI docs typically run 8-30 KiB;
+// complex apps (Stripe-scale: ~700 operations, deep
+// components.schemas) exceed the previous 32 KiB cap. 128 KiB leaves
+// 4× headroom for path-count inflation. The guest hard-truncates
+// BEFORE json.Marshal so the receiver never sees a malformed body,
+// and the OpenAPIDocTruncated field on the report surfaces the
+// truncation to the customer. Matches the guest's
 // VsockCharacterizationMaxBody.
-const VsockCharacterizationMaxBody = 32 * 1024
+const VsockCharacterizationMaxBody = 128 * 1024
 
 // WaitCharacterizationReport accepts the FIRST guest-initiated
 // AF_VSOCK STREAM connection on VsockCharacterizationHostPort and

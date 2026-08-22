@@ -1004,6 +1004,19 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
+	// document discovery surface. Three routes (GET, PATCH,
+	// DELETE) under /v1/apps/{slug}/deployments/{deployment}/openapi.
+	// The plan-tier gate lives in the handler (free → 402
+	// CodePlanOpenAPIDocsNotAllowed) so a Free customer posting
+	// to a non-existent slug still gets a clean 402, not a 404
+	// slug leak (same pattern as createEdgeRule /
+	// createAlertRule). The microVM captures the doc during
+	// cold boot on every plan; the apid only SERVES the doc
+	// on paid plans.
+	mux.HandleFunc("GET /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getOpenAPIDoc))))
+	mux.HandleFunc("PATCH /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.patchOpenAPIDoc))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.openAPIDocDelete))))
 	// PR-A: per-deploy image-layer secret-scan audit surface.
 	// Mirrors /scan — same auth chain (authLimited + requireMFA +
 	// read scope), same IDOR posture (cross-account → 404), same

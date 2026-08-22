@@ -5512,3 +5512,27 @@ type AppErrorSampleResponse struct {
 type RetryDeploymentRequest struct {
 	FromStage string `json:"from_stage"`
 }
+
+// OpenAPIDocResponse is the typed wire envelope for the OpenAPI doc
+// stored per-deployment (issue #975 item #1 / ADR-122). The probe
+// runs unconditionally during cold boot; the apid surfaces the doc
+// only on paid plans (Hobby/Pro/Scale). Free plans return 402
+// + openapi_docs_not_allowed from the handler.
+//
+// Doc is the raw OpenAPI document body, returned verbatim from the
+// customer's /openapi.json — the server does no rewriting. Source is
+// the closed enum (cold_boot | manual_upload); ByteSize is what the
+// handler enforces against Plan.OpenAPIDocMaxBytes(); Truncated is
+// true when the cold-boot probe clipped the body at 128 KiB.
+type OpenAPIDocResponse struct {
+	DeploymentID string         `json:"deployment_id"`
+	AccountID    string         `json:"account_id"`
+	AppID        string         `json:"app_id"`
+	Source       string         `json:"source"`
+	ByteSize     int            `json:"byte_size"`
+	DocSHA256    string         `json:"doc_sha256,omitempty"`
+	Truncated    bool           `json:"truncated"`
+	CapturedAt   string         `json:"captured_at"`
+	UpdatedAt    string         `json:"updated_at"`
+	Doc          map[string]any `json:"doc"`
+}

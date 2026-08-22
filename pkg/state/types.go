@@ -4582,3 +4582,64 @@ func (e OIDCExchangedToken) ToAPIKey() APIKey {
 		Status:    string(APIKeyStatusActive),
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR-122 / issue #975 item #1: per-deployment OpenAPI document pin.
+// ---------------------------------------------------------------------------
+
+// OpenAPIDocMeta is the metadata slice returned alongside the captured
+// document body. The doc bytes travel separately so the read path can
+// short-circuit the JSON unmarshal on a Cache-Control hit (the CORS
+// preset precedent applies the same way: the body is 128 KiB and the
+// meta is a fixed-size struct). The fields are the columns of
+// deployment_openapi_docs (migrations/00330_endpoint_discovery.sql)
+// minus the doc payload itself.
+//
+// Source is the closed enum value 'cold_boot' or 'manual_upload'
+// (matches the migrations/00330 CHECK constraint). Truncated is
+// true when the guest-init probe read VSockCharacterizationMaxBody
+// bytes and the body was longer; the apid PATCH surface treats it
+// as a 200 with a warning header, not an error (the doc IS saved —
+// the customer can replace it via PATCH).
+//
+// DocSHA256 is the canonical SHA-256 of the stored bytes — the
+// migrations/00330 CHECK constraint pins it to exactly 32 bytes.
+// Surface parity with the consumer_keys table: a column that carries
+// the hash in the row, not derived-at-read, so the pgstore-side
+// consistency check is a no-op (computed once at Upsert).
+type OpenAPIDocMeta struct {
+	DeploymentID string
+	AccountID    string
+	AppID        string
+	Source       string
+	ByteSize     int
+	DocSHA256    []byte
+	Truncated    bool
+	CapturedAt   time.Time
+	UpdatedAt    time.Time
+}
+
+// OpenAPIDocMaxBytes is the hard cap on the captured body. The
+// guest-init probe hard-truncates at this size (ADR-122 §D4); the
+// apid PATCH surface validates against the same constant. The
+// per-plan cap is layered on top of this global constant via
+// api.Plan.OpenAPIDocMaxBytes() (limits.go).
+//
+// The constant lives here (not in pkg/api/limits.go) because the
+// guest-init probe reads it through the wire-vsock boundary and
+// has no dependency on the api package's plan tables. The plan
+// accessors fail-closed to 0 on unknown plans — the per-plan cap
+// is a layer over the global cap, not a replacement.
+const OpenAPIDocMaxBytes = 128 * 1024
+
+// OpenAPIDocSource values mirror the migrations/00330 CHECK
+// constraint. Centralised here so the pgstore and the apid handler
+// agree on the enum without a string-literal drift. The
+// consumer_keys equivalent is api.ConsumerKeyScope* (a closed set
+// declared in the api package); we follow the same pattern but
+// inline-declare these because the table is hidden behind the
+// Store interface.
+const (
+	OpenAPIDocSourceColdBoot     = "cold_boot"
+	OpenAPIDocSourceManualUpload = "manual_upload"
+)

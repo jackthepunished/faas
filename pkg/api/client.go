@@ -3274,3 +3274,38 @@ func (c *Client) CreateAppDataUpstream(ctx context.Context, slug string, req Put
 func (c *Client) DeleteAppDataUpstream(ctx context.Context, slug, id string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/upstreams/"+id, nil, nil)
 }
+
+// GetAppsDeploymentOpenAPIDoc returns the OpenAPI document the
+// cold-boot probe captured for a deployment (issue #975 item #1 /
+// ADR-122). The probe runs unconditionally; this endpoint surfaces
+// the captured body only on paid plans — Free returns 402 +
+// openapi_docs_not_allowed. The handler returns 404 when no doc has
+// been captured yet (probe hasn't completed) OR when the deployment
+// is owned by a different account (IDOR floor), so callers branch
+// on errors.Is(err, api.ErrNotFound).
+func (c *Client) GetAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string) (OpenAPIDocResponse, error) {
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", nil, &out)
+}
+
+// PatchAppsDeploymentOpenAPIDoc manually uploads (or overwrites) the
+// OpenAPI document for a deployment. Body is the raw OpenAPI
+// document — the server validates shape against Draft 2020-12 +
+// OpenAPI 3.1 schema (vendored jsonschema v6.0.2) before persisting.
+// Source must be the closed enum value "manual_upload". Returns 413
+// if the doc exceeds Plan.OpenAPIDocMaxBytes() and 402 if the
+// per-account Plan.OpenAPIDocsPerAccount() cap has been reached.
+func (c *Client) PatchAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string, doc map[string]any, source string) (OpenAPIDocResponse, error) {
+	body := map[string]any{"doc": doc, "source": source}
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", body, &out)
+}
+
+// DeleteAppsDeploymentOpenAPIDoc wipes the captured OpenAPI doc for
+// a deployment. The next cold boot of the deployment re-captures a
+// fresh body (the probe always runs). 402 on Free plan; 404 when
+// the deployment has no captured doc or is owned by a different
+// account.
+func (c *Client) DeleteAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", nil, nil)
+}

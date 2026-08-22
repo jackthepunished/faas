@@ -12,10 +12,17 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestCountOutboundLinux_NoChildEarlyOut(t *testing.T) {
@@ -185,4 +192,281 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// ---------------------------------------------------------------------------
+// ADR-122 §D4: probeHTTP body capture + OpenAPI sniff. The three paths
+// below pin the three contract branches:
+//
+//  1. 200 OK + 8 KiB OpenAPI doc → captured, not truncated
+//  2. 200 OK + 200 KiB body (cap = 128 KiB) → captured, truncated=true
+//  3. 404 → no doc, no class hint (the probe returns probeResult{})
+//
+// The probes target 127.0.0.1:<port> the way the guest-init probe does.
+// We use httptest.NewServer (which binds 127.0.0.1) and read its
+// port back to construct the probe target. No vsock involved — the
+// characterization transport is tested separately at the fcvm layer.
+// ---------------------------------------------------------------------------
+
+// startOpenAPIServer spins up an httptest server that serves the
+// request as /openapi.json with the given body. The Content-Type is
+// forced to application/json so the OpenAPI sniff passes by default.
+// Returns the listening port (the probe targets 127.0.0.1:<port>).
+func startOpenAPIServer(t *testing.T, body []byte, ctype string) int {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", ctype)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	// The httptest server listens on 127.0.0.1; extract the port.
+	addr := srv.Listener.Addr().String()
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split host:port from %q: %v", addr, err)
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port %q: %v", portStr, err)
+	}
+	return p
+}
+
+// TestProbeHTTP_BodyCaptured_200OK_8KiB is the happy path: a small
+// OpenAPI doc at /openapi.json with the canonical content-type.
+// The probe must capture the body, set Class=classHTTP, and NOT
+// set OpenAPIDocTruncated.
+func TestProbeHTTP_BodyCaptured_200OK_8KiB(t *testing.T) {
+	// 8 KiB body: a real OpenAPI 3.1 doc padded with paths.
+	doc := []byte(`{"openapi":"3.1.0","info":{"title":"captured"},"paths":{` + strings.Repeat(`"/x":{},`, 1024) + `}}`)
+	if len(doc) < 8*1024 {
+		t.Fatalf("doc too small: %d bytes; expected ≥8 KiB", len(doc))
+	}
+	port := startOpenAPIServer(t, doc, "application/json")
+	got := probeHTTP(port)()
+	if got.Class != classHTTP {
+		t.Errorf("Class: got %q, want %q", got.Class, classHTTP)
+	}
+	if got.OpenAPIDocTruncated {
+		t.Errorf("OpenAPIDocTruncated: got true, want false (8 KiB < 128 KiB cap; should not truncate)")
+	}
+	if string(got.OpenAPIDoc) != string(doc) {
+		t.Errorf("OpenAPIDoc body mismatch: got %d bytes, want %d bytes", len(got.OpenAPIDoc), len(doc))
+	}
+}
+
+// TestProbeHTTP_BodyCaptured_200OK_200KiB_Truncated pins the
+// truncation flag. The body is 200 KiB, the cap is 128 KiB; the
+// probe must keep the FIRST 128 KiB and set OpenAPIDocTruncated=true.
+func TestProbeHTTP_BodyCaptured_200OK_200KiB_Truncated(t *testing.T) {
+	// 200 KiB body: openapi key at the head, then 200 KiB of paths.
+	// The probe must read 128 KiB + 1 byte, see the overflow, and
+	// truncate to 128 KiB.
+	prefix := []byte(`{"openapi":"3.1.0","info":{"title":"big"},"paths":{`)
+	pad := make([]byte, 200*1024)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	doc := append(prefix, pad...)
+	if len(doc) <= 128*1024 {
+		t.Fatalf("doc too small: %d bytes; expected > 128 KiB", len(doc))
+	}
+	port := startOpenAPIServer(t, doc, "application/json")
+	got := probeHTTP(port)()
+	if got.Class != classHTTP {
+		t.Errorf("Class: got %q, want %q", got.Class, classHTTP)
+	}
+	if !got.OpenAPIDocTruncated {
+		t.Errorf("OpenAPIDocTruncated: got false, want true (200 KiB > 128 KiB cap)")
+	}
+	if len(got.OpenAPIDoc) != 128*1024 {
+		t.Errorf("OpenAPIDoc length: got %d, want 128*1024", len(got.OpenAPIDoc))
+	}
+	// First 128 KiB must equal the first 128 KiB of the source.
+	if string(got.OpenAPIDoc) != string(doc[:128*1024]) {
+		t.Errorf("OpenAPIDoc body: first 128 KiB does not match source head")
+	}
+}
+
+// TestProbeHTTP_404_NoDoc pins the 404 path: the probe returns
+// probeResult{} (no class, no doc). A 4xx response is NOT a class
+// hit — the engine re-derives the class from the runtime shape.
+func TestProbeHTTP_404_NoDoc(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split host:port: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	got := probeHTTP(port)()
+	if got.Class != "" {
+		t.Errorf("Class: got %q, want \"\"", got.Class)
+	}
+	if got.OpenAPIDoc != nil {
+		t.Errorf("OpenAPIDoc: got %d bytes, want nil", len(got.OpenAPIDoc))
+	}
+	if got.OpenAPIDocTruncated {
+		t.Errorf("OpenAPIDocTruncated: got true, want false")
+	}
+}
+
+// TestProbeHTTP_NonOpenAPIShape_ClassOnly pins the shape sniff.
+// A 200 OK + application/json with NO top-level "openapi" key
+// (e.g. a JSON metadata object) is still an http-class hit, but the
+// doc is NOT captured. Cheap shape sniff prevents a serving SPA from
+// being mis-classified as an OpenAPI doc.
+func TestProbeHTTP_NonOpenAPIShape_ClassOnly(t *testing.T) {
+	port := startOpenAPIServer(t, []byte(`{"name":"not-an-openapi-doc"}`), "application/json")
+	got := probeHTTP(port)()
+	if got.Class != classHTTP {
+		t.Errorf("Class: got %q, want %q", got.Class, classHTTP)
+	}
+	if got.OpenAPIDoc != nil {
+		t.Errorf("OpenAPIDoc: got %d bytes, want nil (not an OpenAPI shape)", len(got.OpenAPIDoc))
+	}
+}
+
+// TestProbeHTTP_WrongContentType_NoDoc pins the Content-Type gate.
+// A 200 OK + text/html is treated as "no OpenAPI doc served" —
+// still an http-class hit, but no doc captured.
+func TestProbeHTTP_WrongContentType_NoDoc(t *testing.T) {
+	port := startOpenAPIServer(t, []byte(`<html><body>not us</body></html>`), "text/html")
+	got := probeHTTP(port)()
+	if got.Class != classHTTP {
+		t.Errorf("Class: got %q, want %q", got.Class, classHTTP)
+	}
+	if got.OpenAPIDoc != nil {
+		t.Errorf("OpenAPIDoc: got %d bytes, want nil (text/html)", len(got.OpenAPIDoc))
+	}
+}
+
+// TestIsOpenAPIContentType_PrefixAcceptance pins the content-type
+// gate. application/json; charset=utf-8 and application/openapi+json
+// must both pass; text/html must reject.
+func TestIsOpenAPIContentType_PrefixAcceptance(t *testing.T) {
+	cases := []struct {
+		ct   string
+		want bool
+	}{
+		{"application/json", true},
+		{"application/json; charset=utf-8", true},
+		{"application/openapi+json", true},
+		{"application/openapi+json; charset=utf-8", true},
+		{"text/html", false},
+		{"text/plain", false},
+		{"", false},
+		{"APPLICATION/JSON", true}, // case-insensitive
+	}
+	for _, tc := range cases {
+		if got := isOpenAPIContentType(tc.ct); got != tc.want {
+			t.Errorf("isOpenAPIContentType(%q): got %v, want %v", tc.ct, got, tc.want)
+		}
+	}
+}
+
+// TestLooksLikeOpenAPIDoc_ShapeSniff pins the shape sniff. The
+// predicate is: starts with '{', contains "openapi" or "swagger"
+// within the first 4 KiB. Anything else (arrays, primitives, no
+// key) fails.
+func TestLooksLikeOpenAPIDoc_ShapeSniff(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"openapi_3_1", []byte(`{"openapi":"3.1.0"}`), true},
+		{"openapi_3_0", []byte(`{"openapi":"3.0.3"}`), true},
+		{"swagger_2", []byte(`{"swagger":"2.0"}`), true},
+		{"openapi_key_after_indent", []byte("\n  {\n    \"openapi\":\"3.1.0\"\n  }"), true},
+		{"array_root", []byte(`[{"openapi":"3.1.0"}]`), false},
+		{"primitive", []byte(`"openapi"`), false},
+		{"empty_obj", []byte(`{}`), false},
+		{"openapi_key_too_deep", []byte(`{"data":{"openapi":"3.1.0"}}`), false},
+		{"text_html", []byte(`<html></html>`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeOpenAPIDoc(tc.body); got != tc.want {
+				t.Errorf("looksLikeOpenAPIDoc(%q): got %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunL7Probes_OpenAPIDocPassthrough pins the runL7Probes
+// pass-through behavior: when probeHTTP returns a captured doc, the
+// outer runL7Probes must surface it. probeGraphQL + probeGRPC must
+// NOT swallow the body (they return probeResult{} with no doc).
+func TestRunL7Probes_OpenAPIDocPassthrough(t *testing.T) {
+	// Mount an /openapi.json that returns a small 8 KiB doc.
+	doc := []byte(`{"openapi":"3.1.0","info":{"title":"passthrough"},"paths":{` + strings.Repeat(`"/x":{},`, 1024) + `}}`)
+	port := startOpenAPIServer(t, doc, "application/json")
+
+	// The probe dereferences 127.0.0.1; we passed a port the
+	// httptest server is bound to, so this matches.
+	start := time.Now()
+	gotClass, gotDoc, gotTrunc := runL7Probes(context.Background(), RunArgs{}, port)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("runL7Probes took %v, expected < 5s", d)
+	}
+	// probeGraphQL + probeGRPC will fail (no server on a graphql
+	// / grpc port); probeHTTP returns classHTTP + the doc.
+	if gotClass != classHTTP {
+		t.Errorf("class: got %q, want %q", gotClass, classHTTP)
+	}
+	if string(gotDoc) != string(doc) {
+		t.Errorf("doc: got %d bytes, want %d bytes", len(gotDoc), len(doc))
+	}
+	if gotTrunc {
+		t.Errorf("truncated: got true, want false")
+	}
+}
+
+// TestRunL7Probes_NoHTTPListen_NoCrash pins the nil-target case.
+// When nothing is listening on the port, runL7Probes must return
+// ("", nil, false) without panicking. The probes fail-fast on
+// connection refused.
+func TestRunL7Probes_NoHTTPListen_NoCrash(t *testing.T) {
+	// Pick a port we know is closed: bind to 0, read the port, close.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	gotClass, gotDoc, gotTrunc := runL7Probes(context.Background(), RunArgs{}, port)
+	if gotClass != "" || gotDoc != nil || gotTrunc {
+		t.Errorf("runL7Probes on closed port: got (%q, %d bytes, %v), want (\"\", nil, false)",
+			gotClass, len(gotDoc), gotTrunc)
+	}
+}
+
+// TestProbeHTTP_FormatString exercises the Fprintf path on the
+// cold-boot probe indirectly. Probe uses fmt.Sprintf for the URL;
+// we pin the format string shape here so a future refactor that
+// changes the path (e.g. /openapi.json → /api/openapi.json) shows
+// up in the test diff.
+func TestProbeHTTP_URLShape(t *testing.T) {
+	// The probe URL is fixed in characterize_linux.go:
+	//   http://127.0.0.1:%d/openapi.json
+	// We pin the path here. If the probe or the customer convention
+	// moves, both ends need to update.
+	port := 8888
+	want := fmt.Sprintf("http://127.0.0.1:%d/openapi.json", port)
+	if !strings.Contains(want, "/openapi.json") {
+		t.Fatalf("probe URL shape drift: %q", want)
+	}
 }

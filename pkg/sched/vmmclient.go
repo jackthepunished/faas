@@ -928,6 +928,17 @@ func characterizationFromStruct(s *structpb.Struct) api.CharacterizationReport {
 	if v, ok := m["port_norm_mode"].(string); ok {
 		r.PortNormalizationMode = v
 	}
+	// ADR-122 §D2 — endpoint discovery. Mirrors the vmmdgrpc
+	// emit shape (proto.go). The OpenAPIDoc field arrives as a
+	// string (the JSON body the structpb path base64-encodes from
+	// the []byte). Old reports without the field are unmarshalled
+	// to the zero value (no doc captured).
+	if v, ok := m["openapi_doc"].(string); ok {
+		r.OpenAPIDoc = []byte(v)
+	}
+	if v, ok := m["openapi_doc_truncated"].(bool); ok {
+		r.OpenAPIDocTruncated = v
+	}
 	if v, ok := m["listening_addrs"].([]any); ok {
 		for _, a := range v {
 			if sa, ok := a.(string); ok {
