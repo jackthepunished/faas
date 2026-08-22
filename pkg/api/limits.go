@@ -3928,7 +3928,7 @@ func (p Plan) RequireAuthnAllowed() bool {
 // (anything other than http1|http2|grpc) return false so
 // apid's validation branch surfaces 400 app_protocol_invalid
 // rather than letting the value reach SQL. The migration
-// (00347) default is 'http1' so every pre-existing app
+// (00360) default is 'http1' so every pre-existing app
 // continues on the legacy H1 path regardless of plan.
 func (p Plan) AppProtocolAllowed(protocol string) bool {
 	switch protocol {
@@ -3949,7 +3949,7 @@ func (p Plan) AppProtocolAllowed(protocol string) bool {
 // writes when the customer omits AppProtocol on create. Universal
 // "http1" — no per-plan differentiation per the ADR. The closed-
 // set literal is also the canonical default declared at the column
-// level (NOT NULL DEFAULT 'http1' in migration 00347) so handlers
+// level (NOT NULL DEFAULT 'http1' in migration 00360) so handlers
 // can fall back to the SQL default rather than relying on this
 // constant for the empty-string case. Declared as a package
 // constant (not a Plan receiver method) because the value is

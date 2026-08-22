@@ -43,7 +43,7 @@ const (
 
 // AppProtocolClosedSet is the canonical {http1, http2, grpc}
 // enumeration. Order matches the SQL CHECK constraint
-// apps_app_protocol_chk in migrations/00347.
+// apps_app_protocol_chk in migrations/00360.
 var AppProtocolClosedSet = []string{
 	AppProtocolHTTP1,
 	AppProtocolHTTP2,
