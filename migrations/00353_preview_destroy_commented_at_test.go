@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00347_preview_destroy_commented_at.sql
+// Migration-apply test for 00353_preview_destroy_commented_at.sql
 // (Mega-C PR-1 / issue #961 leaf 3).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00296 (no goose
-//     duplicate-version panic). Slot 00296 was picked as the
+//  1. Migration set applies cleanly through 00353 (no goose
+//     duplicate-version panic). Slot 00353 was picked as the
 //     next free slot past:
 //       - 00287 (origin/main, pg_ratelimit rule-scope)
 //       - 00288-00295 (PR #978 / issue #975 mega-foundation fences)
@@ -42,16 +42,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00296_PreviewDestroyCommentedAt(t *testing.T) {
+func TestMigrations_00353_PreviewDestroyCommentedAt(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00296. Pins slot hygiene — if a
+	// (1) Apply through 00353. Pins slot hygiene — if a
 	// cross-PR collision sneaks past the precheck (a fence
 	// from PR #978 was re-claimed by a different PR, etc.)
 	// this is the line that catches it.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: 00296 must apply cleanly; check open-PR fences via scripts/ci/check_migration_slots.sh)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: 00353 must apply cleanly; check open-PR fences via scripts/ci/check_migration_slots.sh)", err)
 	}
 
 	// (2) Column exists + accepts a timestamp. The PG
@@ -71,7 +71,7 @@ func TestMigrations_00296_PreviewDestroyCommentedAt(t *testing.T) {
 		t.Fatalf("query information_schema.columns: %v", err)
 	}
 	if !exists {
-		t.Fatal("apps.preview_destroy_commented_at missing after 00296 (column add failed silently — likely a replay-safety regression)")
+		t.Fatal("apps.preview_destroy_commented_at missing after 00353 (column add failed silently — likely a replay-safety regression)")
 	}
 
 	// (3) Nullable, no default. The PG catalog confirms the
@@ -110,6 +110,6 @@ func TestMigrations_00296_PreviewDestroyCommentedAt(t *testing.T) {
 	// ADD COLUMN IF NOT EXISTS short-circuits on a second
 	// apply; the column catalog stays unchanged.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("replay db.MigrateUp: %v (00296 must be replay-safe via ADD COLUMN IF NOT EXISTS)", err)
+		t.Fatalf("replay db.MigrateUp: %v (00353 must be replay-safe via ADD COLUMN IF NOT EXISTS)", err)
 	}
 }

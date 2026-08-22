@@ -1,4 +1,4 @@
--- filename: 00347_preview_destroy_commented_at.sql
+-- filename: 00353_preview_destroy_commented_at.sql
 -- +goose Up
 -- +goose StatementBegin
 

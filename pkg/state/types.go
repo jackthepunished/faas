@@ -1457,7 +1457,7 @@ type Deployment struct {
 	// window. Pro+ only; Free/Hobby customers get a 403 on the
 	// create-deployment request (ErrPlanRollbackOn5xxNotAllowed).
 	// Default false; the column is BOOLEAN NOT NULL DEFAULT
-	// false (migration 00348).
+	// false (migration 00354).
 	RollbackOn5xx bool `json:"rollback_on_5xx,omitempty"`
 	// FirstWakeAt + First5xxWindowEndsAt stamp the start of the
 	// first-wake window (anchored at the first
@@ -1473,7 +1473,7 @@ type Deployment struct {
 	// event; schedd's AutoRollbackWatcher checks it against the
 	// per-plan threshold (plan.RollbackOn5xxThreshold()) inside the
 	// First5xxWindowEndsAt window. NOT NULL DEFAULT 0 (migration
-	// 00348); pre-feature rows backfill to 0.
+	// 00354); pre-feature rows backfill to 0.
 	First5xxCount int `json:"first_5xx_count,omitempty"`
 	// LastAutoRollbackAt + LastAutoRollbackReason record the
 	// most-recent auto-rollback (Mega-C PR-2). Stamped by
