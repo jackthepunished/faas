@@ -337,6 +337,46 @@ func TestTarball_Extract_Idempotent(t *testing.T) {
 	}
 }
 
+func TestTarball_Extract_PreservesRuntimeAssetPaths(t *testing.T) {
+	bin, root, gitSHA, manifestHash := fakeBinDir(t)
+	for _, name := range releaseinstall.RuntimeAssetNames() {
+		path := filepath.Join(bin, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir runtime asset %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, deterministicBody(name), 0o755); err != nil {
+			t.Fatalf("write runtime asset %s: %v", name, err)
+		}
+	}
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for _, name := range catalogDaemons() {
+		if err := os.Remove(filepath.Join(bin, name)); err != nil {
+			t.Fatalf("clear daemon %s: %v", name, err)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(bin, "runners")); err != nil {
+		t.Fatalf("clear runners: %v", err)
+	}
+	if err := tb.Extract(root); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if err := releaseinstall.Verify(root, tb.Manifest); err != nil {
+		t.Fatalf("verify after extract: %v", err)
+	}
+	for _, name := range releaseinstall.RuntimeAssetNames() {
+		got, err := os.ReadFile(filepath.Join(bin, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read runtime asset %s: %v", name, err)
+		}
+		if string(got) != string(deterministicBody(name)) {
+			t.Fatalf("runtime asset %s changed during extract", name)
+		}
+	}
+}
+
 // TestTarball_Extract_RefusesNilTarball defends against the trivial
 // misuse path (pointer-deref panics) — Verify / Extract are
 // public methods; a nil receiver is the most common mistake callers
