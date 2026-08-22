@@ -427,10 +427,20 @@ func ApplyFilesystem(r Role) error {
 	// ship-blocker (the role is not in effect); surface it as an
 	// error so cmdReleaseInstall can exit 4 (runtime error, per
 	// releaseinstall convention).
-	if _, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+	if err := systemctlDaemonReload(); err != nil {
 		return fmt.Errorf("roleTemplating: systemctl daemon-reload: %w", err)
 	}
 	return nil
+}
+
+// systemctlDaemonReload is the test seam for ApplyFilesystem's
+// systemd reload. Production invokes `systemctl daemon-reload`
+// synchronously; tests override this var to inject errors without
+// touching the host's systemd. Default shim mirrors the
+// production call exactly.
+var systemctlDaemonReload = func() error {
+	_, err := exec.Command("systemctl", "daemon-reload").CombinedOutput()
+	return err
 }
 
 // Mutate transitions a box from role `from` to role `to`. Computes
