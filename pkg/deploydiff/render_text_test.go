@@ -259,12 +259,12 @@ func TestIsHeadlineScalar(t *testing.T) {
 
 func TestOtherScalars_Exclusions(t *testing.T) {
 	changes := []Change{
-		{Field: "memory"},                       // headline, exclude
-		{Field: "autoscale_target_rps"},         // non-headline, keep
-		{Field: "environment.X"},                // env prefix, exclude
-		{Field: "cron[a]"},                      // cron prefix, exclude
-		{Field: "edge_rule[r]"},                 // edge_rule prefix, exclude
-		{Field: "require_signed"},               // non-headline, keep
+		{Field: "memory"},               // headline, exclude
+		{Field: "autoscale_target_rps"}, // non-headline, keep
+		{Field: "environment.X"},        // env prefix, exclude
+		{Field: "cron[a]"},              // cron prefix, exclude
+		{Field: "edge_rule[r]"},         // edge_rule prefix, exclude
+		{Field: "require_signed"},       // non-headline, keep
 	}
 	got := otherScalars(changes)
 	if len(got) != 2 {
