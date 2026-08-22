@@ -581,6 +581,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if len(spec.Workloads) == 0 && spec.LayerKey == "" {
 		return fmt.Errorf("vmm: restore spec missing layer: %+v", spec)
 	}
+	t0 := time.Now()
 	kernelSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.KernelKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
@@ -616,6 +617,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 			}
 		}
 	}
+	tResolve := time.Now()
 	if _, err := v.stageReadOnlyAs(root, kernelSrc, stableReadOnlyName(kernelSrc, kernelImageName), l.Instance); err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
 	}
@@ -639,6 +641,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 			return fmt.Errorf("vmm: stage sidecar %d: %w", i-1, err)
 		}
 	}
+	tStageDrives := time.Now()
 
 	// Snapshot files are read-only inputs shared across the N instances a single
 	// snapshot may restore (invariant §6.2-5): hardlink them in and widen for read
@@ -674,6 +677,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 		return err
 	}
+	tJailer := time.Now()
 	body := map[string]any{
 		"snapshot_path": stateName,
 		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memName},
@@ -682,6 +686,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.apiPut(ctx, l.Instance, "/snapshot/load", body); err != nil {
 		return fmt.Errorf("vmm: load snapshot: %w", err)
 	}
+	tLoad := time.Now()
 	// Vsock is in the config-file (set at config-write time before
 	// startJailer), so the UDS is live by the time /snapshot/load
 	// completes. Trigger the resume hook now to re-seed entropy and step
@@ -689,9 +694,21 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.TriggerResumeHook(ctx, l, time.Now().UnixNano()); err != nil {
 		return fmt.Errorf("vmm: resume hook: %w", err)
 	}
+	tResume := time.Now()
 	if err = v.waitReady(ctx, l, spec.HealthcheckPath); err != nil {
 		return fmt.Errorf("vmm: readiness after restore: %w", err)
 	}
+	tReady := time.Now()
+	slog.Default().Info("restore timing breakdown",
+		"instance", l.Instance,
+		"resolve_ms", tResolve.Sub(t0).Milliseconds(),
+		"stage_drives_ms", tStageDrives.Sub(tResolve).Milliseconds(),
+		"jailer_ms", tJailer.Sub(tStageDrives).Milliseconds(),
+		"load_snap_ms", tLoad.Sub(tJailer).Milliseconds(),
+		"resume_hook_ms", tResume.Sub(tLoad).Milliseconds(),
+		"wait_ready_ms", tReady.Sub(tResume).Milliseconds(),
+		"total_ms", tReady.Sub(t0).Milliseconds(),
+	)
 	return nil
 }
 
@@ -824,16 +841,33 @@ func (v *JailerVMM) TriggerResumeHook(ctx context.Context, l Lease, hostTimeUnix
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		var c net.Conn
 		var err error
-		conn, err = net.DialTimeout("unix", sock, 200*time.Millisecond)
+		c, err = net.DialTimeout("unix", sock, 20*time.Millisecond)
 		if err == nil {
-			break
+			_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			// Step 1: FC CONNECT-port handshake. "CONNECT <port>\n" — ASCII,
+			// newline-terminated. Guest listens on port VsockResumePort (1024).
+			connectCmd := fmt.Sprintf("CONNECT %d\n", resumeHookGuestPort)
+			if _, err = c.Write([]byte(connectCmd)); err == nil {
+				// Step 2: read "OK <hostside_port>\n". FC prefixes the host-assigned
+				// ephemeral port with "OK ". We don't care about the value (it's
+				// for connection-multiplexing bookkeeping on the FC side), only
+				// that the response starts with "OK ".
+				var connectAck string
+				connectAck, err = readConnectAck(c)
+				if err == nil && connectAck == "OK" {
+					conn = c
+					break
+				}
+			}
+			_ = c.Close()
 		}
 		lastErr = err
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(resumeHookDialStep):
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	if conn == nil {
@@ -842,25 +876,6 @@ func (v *JailerVMM) TriggerResumeHook(ctx context.Context, l Lease, hostTimeUnix
 	defer func() { _ = conn.Close() }()
 
 	_ = conn.SetDeadline(time.Now().Add(resumeHookDialDeadline))
-
-	// Step 1: FC CONNECT-port handshake. "CONNECT <port>\n" — ASCII,
-	// newline-terminated. Guest listens on port VsockResumePort (1024).
-	connectCmd := fmt.Sprintf("CONNECT %d\n", resumeHookGuestPort)
-	if _, err := conn.Write([]byte(connectCmd)); err != nil {
-		return fmt.Errorf("vmm: write CONNECT %d: %w", resumeHookGuestPort, err)
-	}
-
-	// Step 2: read "OK <hostside_port>\n". FC prefixes the host-assigned
-	// ephemeral port with "OK ". We don't care about the value (it's
-	// for connection-multiplexing bookkeeping on the FC side), only
-	// that the response starts with "OK ".
-	connectAck, err := readConnectAck(conn)
-	if err != nil {
-		return fmt.Errorf("vmm: read CONNECT ack: %w", err)
-	}
-	if connectAck != "OK" {
-		return fmt.Errorf("vmm: CONNECT rejected: %q", connectAck)
-	}
 
 	// Step 3: write the resume-hook payload. 4-byte BE msg type + 4-byte BE
 	// body length + JSON body. The length prefix lets the guest read exactly
@@ -2563,7 +2578,7 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }
@@ -2921,7 +2936,7 @@ func (v *JailerVMM) apiCallWithClient(ctx context.Context, client *http.Client, 
 	// later. On a slow nested-KVM guest (Lima arm64) the first POST
 	// races the socket creation; retry briefly before giving up so the
 	// snapshot-restore path isn't held hostage to the boot timing.
-	const maxAttempts = 20
+	const maxAttempts = 100
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
 		if ctx.Err() != nil {
@@ -3226,7 +3241,8 @@ func copyFile(src, dst string) (err error) {
 			err = cErr
 		}
 	}()
-	_, err = io.Copy(out, in)
+	buf := make([]byte, 4*1024*1024)
+	_, err = io.CopyBuffer(out, in, buf)
 	return err
 }
 
