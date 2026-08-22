@@ -3535,6 +3535,12 @@ func (m *Manager) setupNetwork(ctx context.Context, nc netns.Config) error {
 			"instance", nc.Instance, "netns", nc.Netns, "err", err)
 	}
 	removeStaleNetnsMarker(nc.Netns)
+	if nc.VethHost != "" {
+		if err := m.run.Run(ctx, []string{"ip", "link", "del", nc.VethHost}); err != nil {
+			m.log.Debug("stale veth cleanup (best-effort)",
+				"instance", nc.Instance, "veth", nc.VethHost, "err", err)
+		}
+	}
 	if err := m.runCommands(ctx, nc.SetupCommands()); err != nil {
 		return err
 	}

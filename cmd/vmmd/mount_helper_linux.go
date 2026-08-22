@@ -20,6 +20,51 @@ func runMountBindHelper() bool {
 		return false
 	}
 	switch os.Args[1] {
+	case "--setup-jail":
+		if len(os.Args) != 8 {
+			fmt.Fprintln(os.Stderr, "vmmd: --setup-jail requires devTarget hostTunSrc tunTarget kvmPath uid gid")
+			os.Exit(2)
+		}
+		devTarget := os.Args[2]
+		hostTunSrc := os.Args[3]
+		tunTarget := os.Args[4]
+		kvmPath := os.Args[5]
+		uid, uidErr := strconv.Atoi(os.Args[6])
+		gid, gidErr := strconv.Atoi(os.Args[7])
+		if uidErr != nil || gidErr != nil || uid < 0 || gid < 0 {
+			fmt.Fprintln(os.Stderr, "vmmd: --setup-jail uid/gid must be non-negative integers")
+			os.Exit(2)
+		}
+		if err := syscall.Mount("tmpfs", devTarget, "tmpfs", 0, "mode=0755"); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: mount device tmpfs: %v\n", err)
+			os.Exit(1)
+		}
+		devNet := filepath.Join(devTarget, "net")
+		if err := os.MkdirAll(devNet, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: create device net directory: %v\n", err)
+			os.Exit(1)
+		}
+		if err := unix.Mknod(tunTarget, unix.S_IFCHR|0660, int(unix.Mkdev(10, 200))); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: create TUN target: %v\n", err)
+			os.Exit(1)
+		}
+		if err := syscall.Mount(hostTunSrc, tunTarget, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: mount bind tun: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.Remove(kvmPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "vmmd: remove kvm device: %v\n", err)
+			os.Exit(1)
+		}
+		if err := unix.Mknod(kvmPath, unix.S_IFCHR|0660, int(unix.Mkdev(10, 232))); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: mknod kvm: %v\n", err)
+			os.Exit(1)
+		}
+		if err := unix.Chown(kvmPath, uid, gid); err != nil {
+			fmt.Fprintf(os.Stderr, "vmmd: chown kvm: %v\n", err)
+			os.Exit(1)
+		}
+		return true
 	case "--mount-dev":
 		if len(os.Args) != 3 {
 			fmt.Fprintln(os.Stderr, "vmmd: --mount-dev requires a target")
