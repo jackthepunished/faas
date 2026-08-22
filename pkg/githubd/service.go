@@ -706,6 +706,13 @@ func (s *Service) previewCommentOnce(ctx context.Context, appID string) (firstTi
 	}
 	current, err := s.Reconcile.Store.AppByID(ctx, appID)
 	if err != nil {
+		// Best-effort dedupe: an unreadable AppByID must NOT
+		// block the close-arm — the customer's intent ("don't
+		// spam my PR thread") is already satisfied by the
+		// Store.StampPreviewDestroyCommentedAt being a no-op
+		// when the row is missing, and a re-attempt on a later
+		// trigger can refresh the comment.
+		//nolint:nilerr
 		return false, nil
 	}
 	if current.PreviewDestroyCommentedAt != nil {

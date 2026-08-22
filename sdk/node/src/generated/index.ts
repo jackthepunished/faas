@@ -314,6 +314,7 @@ export { MetaService } from './services/MetaService.js';
 export { MfaService } from './services/MfaService.js';
 export { ObservabilityService } from './services/ObservabilityService.js';
 export { OrgsService } from './services/OrgsService.js';
+export { PreviewsService } from './services/PreviewsService.js';
 export { ProjectsService } from './services/ProjectsService.js';
 export { QueuesService } from './services/QueuesService.js';
 export { RegistryService } from './services/RegistryService.js';

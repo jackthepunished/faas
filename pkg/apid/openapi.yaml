@@ -40,6 +40,17 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: previews
+    description: |
+      Preview environments (issue #961 / ADR-095). A preview is a
+      per-PR child app created by the githubd bridge; the customer
+      wakes the preview URL to exercise the change before merge.
+      This tag groups the customer-facing destroy route
+      (POST /v1/preview/{slug}/destroy) — the dashboard surface is
+      under `apps` (the preview panel) and the build-pipeline
+      surface is under `deployments` (preview kind deployments).
+      Cross-tagged with `apps` so a tag filter of `apps` surfaces
+      preview-destroy alongside the parent-app lifecycle.
   - name: deploydiff
     description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules

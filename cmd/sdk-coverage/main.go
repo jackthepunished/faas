@@ -173,6 +173,12 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/deployments":            "Deploy",
 	"POST /v1/apps/{slug}/deployments/source-ref": "DeployFromSourceRef", // issue #739 / DEPLOY-PROV-4 / ADR-092; headless CI deploy
 	"POST /v1/apps/{slug}/diff":                   "Diff",                // PR-1 of deploy-diff cluster; CI gate input
+	// Issue #961 / Mega-C PR-1 / leaf 3 — preview-destroy route.
+	// Auto-derivation would produce "PostPreviewSlugDestroy" (the
+	// Swagger-style verb+resource concat), but the SDK convention
+	// uses ResourceVerb — pin to DestroyPreview so the wire +
+	// SDK verb surface stays uniform with Rollback/Park/Wake.
+	"POST /v1/preview/{slug}/destroy": "DestroyPreview",
 	"GET /v1/account/export":                      "ExportAccount",
 	"DELETE /v1/account":                          "DeleteAccount",
 	"PATCH /v1/account/plan":                      "ChangePlan",

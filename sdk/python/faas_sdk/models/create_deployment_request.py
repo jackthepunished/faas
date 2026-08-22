@@ -73,6 +73,9 @@ class CreateDeploymentRequest:
     to ${{ github.actor }}."""
     pr_number: int | None | Unset = UNSET
     """PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0)."""
+    rollback_on_5xx: bool | None | Unset = UNSET
+    """Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server
+    default false."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +146,12 @@ class CreateDeploymentRequest:
         else:
             pr_number = self.pr_number
 
+        rollback_on_5xx: bool | None | Unset
+        if isinstance(self.rollback_on_5xx, Unset):
+            rollback_on_5xx = UNSET
+        else:
+            rollback_on_5xx = self.rollback_on_5xx
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -166,6 +175,8 @@ class CreateDeploymentRequest:
             field_dict["deployed_by"] = deployed_by
         if pr_number is not UNSET:
             field_dict["pr_number"] = pr_number
+        if rollback_on_5xx is not UNSET:
+            field_dict["rollback_on_5xx"] = rollback_on_5xx
 
         return field_dict
 
@@ -305,6 +316,15 @@ class CreateDeploymentRequest:
 
         pr_number = _parse_pr_number(d.pop("pr_number", UNSET))
 
+        def _parse_rollback_on_5xx(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        rollback_on_5xx = _parse_rollback_on_5xx(d.pop("rollback_on_5xx", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
@@ -316,6 +336,7 @@ class CreateDeploymentRequest:
             tag=tag,
             deployed_by=deployed_by,
             pr_number=pr_number,
+            rollback_on_5xx=rollback_on_5xx,
         )
 
         create_deployment_request.additional_properties = d
