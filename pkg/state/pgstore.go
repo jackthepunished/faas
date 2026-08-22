@@ -5578,6 +5578,9 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 	if err != nil {
 		return Deployment{}, err
 	}
+	return created, nil
+}
+
 // StampFirstWake sets first_wake_at + first_5xx_window_ends_at if
 // both are NULL. Idempotent: a second wake (the dashboard healthz
 // probe waking the same deploy) is a no-op; only the first wake

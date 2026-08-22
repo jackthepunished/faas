@@ -4439,6 +4439,9 @@ func (m *MemStore) RetryDeploymentFromStage(_ context.Context, failedID string, 
 	newDep.StageState = seed
 	newDep.CreatedAt = time.Now()
 	m.deployments[newDep.ID] = newDep
+	return newDep, nil
+}
+
 // StampFirstWake mirrors PgStore.StampFirstWake for the in-memory
 // store used by unit tests (cmd/apid/handlers_*_test.go) and
 // cmd/e2e. Idempotent: the coalesce on the PG side is mirrored by
