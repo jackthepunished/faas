@@ -281,10 +281,11 @@ var cliCommands = []cliCommand{
 	{
 		Name:    dispatchPKI,
 		DocSlug: "pki",
-		Short:   "Operator local-dev PKI bootstrap (pki init|status|rotate)",
+		Short:   "Operator local-dev PKI bootstrap (pki init|status|list|rotate)",
 		Subcommands: []cliSub{
 			{Name: subPKIInit, Short: "Initialise the local PKI"},
 			{Name: subPKIStatus, Short: "Show PKI status"},
+			{Name: subPKIList, Short: "List PKI leaves + CA (--json; --daemon NAME; --box-role ROLE)"},
 			{Name: subPKIRotate, Short: "Rotate the PKI"},
 		},
 	},
