@@ -754,6 +754,17 @@ func TestEveryCodeHasWhycopyEntry(t *testing.T) {
 		api.CodeDepInstallFailed,
 		api.CodeAppStartupTimeout,
 		api.CodeStatelessOnlyViolation,
+		// ADR-117 §Production-ready follow-on: per-stage failure
+		// codes. The renderer (pkg/dashboard/stages.StageFailureHTML)
+		// reads these via whycopy.Decorate; the catalog is the
+		// single source of truth for the customer-facing prose.
+		api.CodeStageSourceDownloadFailed,
+		api.CodeStageDependencyRestoreFailed,
+		api.CodeStageImageBuildOOM,
+		api.CodeStageImageBuildTimeout,
+		api.CodeStageSecurityScanFindings,
+		api.CodeStageSnapshotPrepareTimeout,
+		api.CodeStageReadinessFailed,
 	}
 
 	// Forward direction: every cluster-owned Code must have a

@@ -5501,3 +5501,14 @@ type AppErrorSampleResponse struct {
 	HeadersSample     map[string]string `json:"headers_sample"`
 	RedactionsApplied []string          `json:"redactions_applied"`
 }
+
+// RetryDeploymentRequest (ADR-117 §Production-ready follow-on, C2)
+// is the body of POST /v1/apps/{slug}/deployments/{id}/retry.
+// FromStage MUST be one of the closed-6 stage vocabulary
+// (pkg/state.AllStageNames); the apid handler validates via
+// state.IsStageName before the storage call. The CLI's
+// `gregale deploys retry <id> --from=<stage>` builds this
+// payload verbatim.
+type RetryDeploymentRequest struct {
+	FromStage string `json:"from_stage"`
+}

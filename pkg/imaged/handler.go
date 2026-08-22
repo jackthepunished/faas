@@ -2512,7 +2512,8 @@ func (h *Handler) transitionWithStage(ctx context.Context, depID string, from, t
 	if err := h.transition(ctx, depID, status, errMsg); err != nil {
 		return err
 	}
-	if _, err := h.store.AppendDeploymentStage(ctx, depID, from, to, time.Now(), ""); err != nil {
+	row, err := h.store.AppendDeploymentStage(ctx, depID, from, to, time.Now(), "")
+	if err != nil {
 		// Stage projection is best-effort: a failed append logs
 		// but does NOT roll back the status flip. The SSE consumer
 		// will simply miss one frame for this transition. The
@@ -2520,6 +2521,25 @@ func (h *Handler) transitionWithStage(ctx context.Context, depID string, from, t
 		// state machine on `status` is the source of truth.
 		h.log.Warn("transitionWithStage: append stage failed (status flip preserved)",
 			"deployment_id", depID, "from", from, "to", to, "err", err)
+		return nil
+	}
+	// SLO histogram (ADR-117 §Production-ready follow-on). One
+	// observation per closed stage: the duration is the just-
+	// appended row's `ended_at - started_at` so the metric
+	// agrees with the customer-facing stage timeline to the
+	// millisecond. Status label tracks the deployment's terminal
+	// state at write time — a "live" close observes status=completed;
+	// the failure path is observed separately by the caller via
+	// MarkDeploymentStageFailed (see markDeployFailed). Safe on a
+	// nil h.ops (unit tests that don't wire the registry).
+	if h.ops != nil && len(row.StageState) > 0 {
+		var ss state.StageState
+		if json.Unmarshal(row.StageState, &ss) == nil && len(ss.History) > 0 {
+			last := ss.History[len(ss.History)-1]
+			if last.StartedAt != nil && last.EndedAt != nil {
+				h.ops.ObserveDeployStageDuration(string(from), "completed", last.EndedAt.Sub(*last.StartedAt))
+			}
+		}
 	}
 	return nil
 }
@@ -2551,8 +2571,31 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 	// flight). Best-effort — the state-machine flip on `status`
 	// is the source of truth; the stage projection is the
 	// customer-UX surface.
-	if _, serr := h.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), prefix+": "+err.Error()); serr != nil {
+	if row, serr := h.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), prefix+": "+err.Error()); serr != nil {
 		h.log.Warn("markDeployFailed: stamp failed stage", "deployment_id", depID, "err", serr)
+	} else if h.ops != nil && len(row.StageState) > 0 {
+		// SLO histogram (ADR-117 §Production-ready follow-on).
+		// Observe the failed stage's wall-clock duration under
+		// status=failed so the per-stage p99 panel surfaces
+		// failure-stall tails distinctly from success tails.
+		// Same row-derived duration contract as transitionWithStage.
+		var ss state.StageState
+		if json.Unmarshal(row.StageState, &ss) == nil && len(ss.History) > 0 {
+			last := ss.History[len(ss.History)-1]
+			if last.StartedAt != nil && last.EndedAt != nil {
+				// Code-review finding #2: MarkDeploymentStageFailed
+				// clears state.Current on the way out (the in-flight
+				// stage rolls into history with status=failed), so
+				// reading `ss.Current` here produces stage="". That
+				// falls outside the pre-instantiated closed-6 label
+				// set and corrupts the §12 per-stage SLO panel
+				// (every failed observation lands on an off-panel
+				// time series instead of the row's actual failing
+				// stage). Use the history row's Name — that IS the
+				// stage that failed, by construction.
+				h.ops.ObserveDeployStageDuration(string(last.Name), "failed", last.EndedAt.Sub(*last.StartedAt))
+			}
+		}
 	}
 	return nil
 }

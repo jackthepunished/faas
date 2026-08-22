@@ -152,6 +152,47 @@ var AllStageNames = []StageName{
 	StageReadiness,
 }
 
+// stageNameClosedSet is the lookup-table mirror of AllStageNames.
+// Built once at package init so per-call validation is O(1) and
+// there is no string-literal coupling between call sites and the
+// vocabulary. Exported via IsStageName below for apid-side handler
+// guards (RetryDeploymentFromStage's handler validates the
+// wire-supplied from_stage against this set before the storage
+// call).
+var stageNameClosedSet = func() map[StageName]bool {
+	m := make(map[StageName]bool, len(AllStageNames))
+	for _, n := range AllStageNames {
+		m[n] = true
+	}
+	return m
+}()
+
+// IsStageName reports whether name is one of the closed-6 stage
+// vocabulary values (pkg/state.AllStageNames). Returns false for
+// the empty string and any caller-supplied typo. Used by the apid
+// retry handler (cmd/apid/handlers_retry.go) to validate the
+// wire-supplied from_stage before calling
+// Store.RetryDeploymentFromStage.
+func IsStageName(name StageName) bool {
+	return stageNameClosedSet[name]
+}
+
+// MaxStageHistory caps the per-deployment stage history. ADR-117
+// §Production-ready follow-on (C1) and migration 00340. The trim
+// is FIFO in AppendDeploymentStage (pgstore + memstore); the
+// current stage (stage_state.current) is never trimmed. Schema-
+// unchanged; the cap is enforced Go-side because a jsonb CHECK
+// on jsonb_array_length(stage_state -> 'history') is fragile
+// across mutation shapes.
+//
+// 64 is the customer-tested sweet spot: Hobby/Pro/Scale apps that
+// deploy 5-10x/day hit ~30 days of history before the trim
+// engages; longer deployments (multi-app monorepos) still keep
+// enough surface to debug a stale row. The const is exported so
+// the migration docblock, the type doc, and the trim sites all
+// reference the same value.
+const MaxStageHistory = 64
+
 // ParkReason is the closed-set label on deployments.parked_reason
 // (issue #554 / ADR-079 follow-up, migration 00157). The schema
 // CHECK constraint deployments_parked_reason_check enforces the
