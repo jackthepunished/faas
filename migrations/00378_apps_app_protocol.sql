@@ -1,4 +1,4 @@
--- filename: 00347_apps_app_protocol.sql
+-- filename: 00378_apps_app_protocol.sql
 -- +goose Up
 -- Per-app wire-protocol selector (ADR-124). Lets the customer pick
 -- http1, http2, or grpc at the public edge. Default 'http1' keeps every

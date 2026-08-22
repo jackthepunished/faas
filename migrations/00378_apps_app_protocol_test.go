@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00347 (per-app app_protocol wire-protocol
+// Migration-apply test for 00378 (per-app app_protocol wire-protocol
 // selector, ADR-124). Pins the new column + closed-set CHECK constraint:
 //
-//  1. The migration set applies cleanly through 00347.
+//  1. The migration set applies cleanly through 00378.
 //  2. The column accepts the canonical text shape and round-trips.
 //  3. Default is 'http1' (regression check — pre-PR rows land on the
 //     legacy H1 path with zero behavior change).
@@ -16,12 +16,19 @@
 //     EXISTS / ADD CONSTRAINT makes a second MigrateUp a no-op
 //     (PR #377 / ADR-041 + 00346_deployments_annotation.sql precedent).
 //
-// Slot note: HEAD on origin/main is at 00346 (deployments annotation).
-// 00347 is the next free slot at branch creation time. The migration is
-// slot-agnostic — only the filename and the test function name carry
-// the literal slot. If a sibling PR grabs 00347 first, renumber per
-// `migrations/README.md` and update this test's filename + ApplyUp
-// range.
+// Slot note: renumbered 00347 → 00373 → 00375 → 00378 (seventh hop).
+// PR #1034 (ADR-124 PR-2 — cmd/migrate -leader mode) owns a real
+// migration at 00347 (`00347_migration_notify.sql`); PR #1006's
+// deployment_audit chain previously occupied 00373 + 00374; PR
+// #1006's stages-prod-ready PR-A cluster holds slots 00375
+// (endpoint_discovery on main) indirectly. Per
+// `cross-pr-slot-precheck-pr-867-collision-2026-08-13.md`,
+// 00378 is the first free slot above all open PR claims + main's
+// 00375_endpoint_discovery.sql. Fence bridges added at 00376 +
+// 00377 (above PR #1036's `00376_compute_nodes_active_unique.sql`
+// + `00377_instances_wake_attempt_active_unique.sql` claims). The
+// migration is slot-agnostic — only the filename and the test
+// function name carry the literal slot.
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -35,17 +42,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
+func TestMigrations_00378_AppsAppProtocol(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000347`,
-	// `...000447`) so a reader scanning the test fixtures can pin each
+	// Seed UUIDs carry the slot number in the last group (`...000378`,
+	// `...000478`) so a reader scanning the test fixtures can pin each
 	// row to this migration without grepping the file name. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00347 first.
+	// `migrations/README.md` if a sibling PR grabs 00378 first.
 
-	// (1) Apply through 00347. A regression that drops a slot between
+	// (1) Apply through 00378. A regression that drops a slot between
 	// 1 and 347 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 347)", err)
@@ -58,7 +65,7 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	// test.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000347',
+		values ('00000000-0000-0000-0000-000000000378',
 		        'app-protocol-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -66,8 +73,8 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000447',
-		        '00000000-0000-0000-0000-000000000347',
+		values ('00000000-0000-0000-0000-000000000478',
+		        '00000000-0000-0000-0000-000000000378',
 		        'app-protocol-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -80,7 +87,7 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	// without an explicit PATCH.
 	var defaultVal string
 	if err := pool.QueryRow(ctx, `
-		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000447'
+		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000478'
 	`).Scan(&defaultVal); err != nil {
 		t.Fatalf("read default app_protocol: %v", err)
 	}
@@ -107,7 +114,7 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	// (4b) CHECK rejects an out-of-set value. A 'h2c' value would
 	// fall through to the apid-default path silently otherwise.
 	_, err := pool.Exec(ctx, `
-		update apps set app_protocol = 'h2c' where id = '00000000-0000-0000-0000-000000000447'
+		update apps set app_protocol = 'h2c' where id = '00000000-0000-0000-0000-000000000478'
 	`)
 	if err == nil {
 		t.Errorf("CHECK rejected nothing: 'h2c' must be rejected (regression: closed set widened without an ADR)")
@@ -117,13 +124,13 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	// reads back 'http2'. Mirrors the apid updateApp handler path so
 	// a future regression in the write side surfaces here.
 	if _, err := pool.Exec(ctx, `
-		update apps set app_protocol = 'http2' where id = '00000000-0000-0000-0000-000000000447'
+		update apps set app_protocol = 'http2' where id = '00000000-0000-0000-0000-000000000478'
 	`); err != nil {
 		t.Fatalf("update app_protocol http2: %v", err)
 	}
 	var optedIn string
 	if err := pool.QueryRow(ctx, `
-		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000447'
+		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000478'
 	`).Scan(&optedIn); err != nil {
 		t.Fatalf("read opted-in app_protocol: %v", err)
 	}
@@ -134,13 +141,13 @@ func TestMigrations_00347_AppsAppProtocol(t *testing.T) {
 	// (5b) Opt-in to grpc round-trips (plan gate is at apid, the SQL
 	// layer accepts it on this Hobby fixture).
 	if _, err := pool.Exec(ctx, `
-		update apps set app_protocol = 'grpc' where id = '00000000-0000-0000-0000-000000000447'
+		update apps set app_protocol = 'grpc' where id = '00000000-0000-0000-0000-000000000478'
 	`); err != nil {
 		t.Fatalf("update app_protocol grpc: %v", err)
 	}
 	var optedGrpc string
 	if err := pool.QueryRow(ctx, `
-		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000447'
+		select app_protocol from apps where id = '00000000-0000-0000-0000-000000000478'
 	`).Scan(&optedGrpc); err != nil {
 		t.Fatalf("read opted-in grpc: %v", err)
 	}

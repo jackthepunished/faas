@@ -13467,7 +13467,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// appsSelectColumns above.
 		&a.MaintenanceMode,
 		// ADR-124: per-app wire-protocol selector. NOT NULL
-		// DEFAULT 'http1' (migration 00347); the schema-default
+		// DEFAULT 'http1' (migration 00378); the schema-default
 		// 'http1' guarantee means a plain string scan is safe
 		// (no coalesce needed). Closed-set
 		// apps_app_protocol_chk rejects any value outside
@@ -13617,7 +13617,7 @@ const appsSelectColumns = `
 	-- positional and must match scanApp below.
 	maintenance_mode,
 	-- ADR-124: per-app wire-protocol selector. NOT NULL
-	-- DEFAULT 'http1' (migration 00347); closed-set CHECK
+	-- DEFAULT 'http1' (migration 00378); closed-set CHECK
 	-- apps_app_protocol_chk admits {http1, http2, grpc}.
 	-- Text NOT NULL with constant default — plain string
 	-- scan is safe (no coalesce needed). Positional last so

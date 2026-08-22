@@ -319,7 +319,7 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 	// ADR-124: per-app wire-protocol selector. Same plan-gate
 	// shape as the streaming / require_authn gates above — Free +
 	// "grpc" = 403 plan_app_protocol_grpc_not_allowed. The
-	// closed-set CHECK apps_app_protocol_chk (migration 00347)
+	// closed-set CHECK apps_app_protocol_chk (migration 00378)
 	// catches out-of-set values at the SQL layer; the apid
 	// layer returns 400 app_protocol_invalid so the customer
 	// sees a clean validation error before any SQL write.
@@ -887,7 +887,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// `app_protocol = case when $N then $M else
 		// app_protocol end` pattern at pgstore.go); non-nil
 		// pointer writes the value verbatim. The closed-set
-		// CHECK apps_app_protocol_chk (migration 00347) admits
+		// CHECK apps_app_protocol_chk (migration 00378) admits
 		// only {http1, http2, grpc}; the apid validator above
 		// has already returned 400 app_protocol_invalid on any
 		// other value, so the SQL never sees an illegal value.
