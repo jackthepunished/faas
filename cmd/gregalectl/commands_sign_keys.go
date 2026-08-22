@@ -205,7 +205,7 @@ func cmdSignKeysRotate(args []string) int {
 			f.signKey, f.verify, f.force, keptPath)
 		return 0
 	}
-	PrintOK(os.Stdout, "Rotated %s and %s (force=%t)\n  Restart: systemctl restart gregale-imaged gregale-schedd",
+	PrintOK(osStdout, "Rotated %s and %s (force=%t)\n  Restart: systemctl restart gregale-imaged gregale-schedd",
 		f.signKey, f.verify, f.force)
 	return 0
 }
