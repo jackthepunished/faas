@@ -40,7 +40,6 @@ type fakeAppErrorsServer struct {
 
 	mu      sync.Mutex
 	recvd   []*apidpb.IncrementAppErrorRequest
-	closes  int
 	outcome string // per-record outcome stamped on each response
 }
 
@@ -64,14 +63,6 @@ func (f *fakeAppErrorsServer) IncrementAppError(stream grpc.BidiStreamingServer[
 			return err
 		}
 	}
-}
-
-// closingCounterServer tracks CloseSend half-close events. The bidi
-// client never calls server-side CloseSend but observing Recv → EOF
-// triggers the close counter on the server.
-type closingCounterServer struct {
-	apidpb.UnimplementedAppErrorsServer
-	*fakeAppErrorsServer
 }
 
 // --- bufconn harness -----------------------------------------------
