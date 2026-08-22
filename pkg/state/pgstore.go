@@ -47,6 +47,14 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
+// Ping tests database connectivity through the underlying connection pool.
+func (s *PgStore) Ping(ctx context.Context) error {
+	if s.pool == nil {
+		return errors.New("state: pgstore has nil pool")
+	}
+	return s.pool.Ping(ctx)
+}
+
 // Compile-time check.
 var _ Store = (*PgStore)(nil)
 

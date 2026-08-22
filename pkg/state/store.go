@@ -364,6 +364,9 @@ type AppErrorSampleRow struct {
 // narrow keeps the ownership rules enforceable — apid only touches
 // customer-intent tables through the methods it is given.
 type Store interface {
+	// Ping tests store/database connectivity.
+	Ping(ctx context.Context) error
+
 	// Accounts & auth.
 	CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error)
 	// CreateAccountWithPersonalOrg is the PR 3 canonical

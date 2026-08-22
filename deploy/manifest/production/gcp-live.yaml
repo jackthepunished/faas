@@ -96,8 +96,8 @@ postgresql:
   policy: on-boot
 
 release:
-  id: pre-1.0-51da5137
-  git_sha: 51da51372f65cee83831db7548efd432847b0f2c
+  id: pre-1.0-ba15d836
+  git_sha: ba15d8365108cab4a98df821a8746d624e72e2c4
   architecture: x86_64
   firecracker_version: 1.7.0
   firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419

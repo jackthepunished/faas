@@ -105,6 +105,7 @@ var routeExclude = map[string]bool{
 	"GET /status":                                     true, // public HTML status page
 	"GET /status/slo.json":                            true, // public status JSON
 	"GET /healthz":                                    true, // loopback infra probe
+	"GET /readyz":                                     true, // loopback dependency-aware readiness probe
 	"GET /v1/orgs/me":                                 true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 	"GET /v1/traces/{trace_id}":                       true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
 	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's

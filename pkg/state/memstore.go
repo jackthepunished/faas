@@ -11793,6 +11793,11 @@ func (m *MemStore) TouchSessionLastSeen(_ context.Context, id string) error {
 	return nil
 }
 
+// Ping implements Store.Ping for in-memory testing.
+func (m *MemStore) Ping(ctx context.Context) error {
+	return nil
+}
+
 // compile-time check that MemStore satisfies Store.
 var _ Store = (*MemStore)(nil)
 
