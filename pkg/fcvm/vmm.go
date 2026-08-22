@@ -1504,8 +1504,8 @@ const layerImageName = "layer.ext4"
 const (
 	kernelImageName     = "vmlinux"
 	baseImageName       = "base.ext4"
-	memSnapshotName     = "mem"
-	vmstateSnapshotName = "vmstate"
+	memSnapshotName     = "snap-in-mem"
+	vmstateSnapshotName = "snap-in-vmstate"
 )
 
 func stableReadOnlyName(src, fallback string) string {
