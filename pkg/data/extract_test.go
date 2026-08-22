@@ -15,9 +15,9 @@ import (
 
 func TestKindFromEnvKey_FullSet(t *testing.T) {
 	cases := []struct {
-		key     string
-		kind    string
-		wantOK  bool
+		key    string
+		kind   string
+		wantOK bool
 	}{
 		// postgres family
 		{"DATABASE_URL", "postgres", true},

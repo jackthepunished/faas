@@ -20,8 +20,8 @@ import (
 
 func TestNew_IncompleteConfig(t *testing.T) {
 	cases := []Config{
-		{},                                                    // all zero
-		{ReleasesRoot: "/tmp", CurrentPath: ""},                // missing CurrentPath + LockPath
+		{},                                      // all zero
+		{ReleasesRoot: "/tmp", CurrentPath: ""}, // missing CurrentPath + LockPath
 		{ReleasesRoot: "", CurrentPath: "/tmp", LockPath: ""}, // missing ReleasesRoot + LockPath
 	}
 	for i, cfg := range cases {

@@ -230,7 +230,7 @@ func TestVerify_HotPath_SkipsRegister(t *testing.T) {
 func TestVerify_BadSignature(t *testing.T) {
 	priv1, pub1 := rs256Key(t, "k3")
 	priv2, _ := rs256Key(t, "k3") // different key, same kid
-	_ = pub1 // unused after this point
+	_ = pub1                      // unused after this point
 	jwksURL := jwksServerURL(t, jose.JSONWebKey{
 		Key:       &priv1.PublicKey,
 		KeyID:     "k3",

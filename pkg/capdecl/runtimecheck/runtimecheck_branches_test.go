@@ -374,7 +374,7 @@ func TestMustCheckOnBoot_FailLogs_TriggersExit(t *testing.T) {
 // first Read.
 type errAfterReader struct {
 	remain int
-	err   error
+	err    error
 }
 
 func (r *errAfterReader) Read(p []byte) (int, error) {
