@@ -185,14 +185,14 @@ var methodRouteMap = map[string]string{
 	// underscore survives title-case), so the explicit map drops the
 	// underscore and aligns with the SDK's Get*EgressAllowlistExtra
 	// method names.
-	"GET /v1/account/egress_allowlist_extra":      "GetEgressAllowlistExtra",
-	"PATCH /v1/account/egress_allowlist_extra":    "SetEgressAllowlistExtra",
-	"GET /v1/apps/{slug}/logs":                    "StreamAppLogs",
-	"GET /v1/deployments/{id}/logs":               "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan",        // issue #464 / ADR-055; per-deploy grype CVE drill-down
-	"GET /v1/deployments/{id}/secret-scan":        "GetDeploymentSecretScan",  // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
-	"GET /v1/deployments/{id}/stages":             "GetDeploymentStages",      // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
-	"POST /v1/deployments/{id}/retry":             "RetryDeploymentFromStage", // ADR-117 §Production-ready follow-on C2; per-stage retry
+	"GET /v1/account/egress_allowlist_extra":                  "GetEgressAllowlistExtra",
+	"PATCH /v1/account/egress_allowlist_extra":                "SetEgressAllowlistExtra",
+	"GET /v1/apps/{slug}/logs":                                "StreamAppLogs",
+	"GET /v1/deployments/{id}/logs":                           "StreamDeploymentLogs",
+	"GET /v1/deployments/{id}/scan":                           "GetDeploymentScan",              // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/secret-scan":                    "GetDeploymentSecretScan",        // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
+	"GET /v1/deployments/{id}/stages":                         "GetDeploymentStages",            // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
+	"POST /v1/deployments/{id}/retry":                         "RetryDeploymentFromStage",       // ADR-117 §Production-ready follow-on C2; per-stage retry
 	"GET /v1/apps/{slug}/deployments/{deployment}/openapi":    "GetAppsDeploymentOpenAPIDoc",    // issue #975 item #1 / ADR-122 — captured OpenAPI doc per deployment
 	"PATCH /v1/apps/{slug}/deployments/{deployment}/openapi":  "PatchAppsDeploymentOpenAPIDoc",  // manual upload; same store as cold-boot capture
 	"DELETE /v1/apps/{slug}/deployments/{deployment}/openapi": "DeleteAppsDeploymentOpenAPIDoc", // wipe the captured doc; re-captures on next cold boot
