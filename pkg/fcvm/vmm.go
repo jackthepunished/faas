@@ -654,6 +654,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err != nil {
 		return fmt.Errorf("vmm: stage vmstate: %w", err)
 	}
+	tMemState := time.Now()
 	// firecracker (as the jailer uid) writes the API socket and, later, snapshot
 	// output into the chroot root — it must own that directory.
 	if err = v.ownChrootRoot(root, l); err != nil {
@@ -665,6 +666,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.bindTunSource(root, l.Instance); err != nil {
 		return err
 	}
+	tHelper := time.Now()
 
 	// Start firecracker with only the API socket, then load + resume.
 	// Move 4 (issue #254): register the per-instance ring BEFORE
@@ -674,10 +676,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.startJailer(ctx, l); err != nil {
 		return err
 	}
+	tStartJailer := time.Now()
 	if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 		return err
 	}
-	tJailer := time.Now()
+	tBindTun := time.Now()
 	body := map[string]any{
 		"snapshot_path": stateName,
 		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memName},
@@ -703,8 +706,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		"instance", l.Instance,
 		"resolve_ms", tResolve.Sub(t0).Milliseconds(),
 		"stage_drives_ms", tStageDrives.Sub(tResolve).Milliseconds(),
-		"jailer_ms", tJailer.Sub(tStageDrives).Milliseconds(),
-		"load_snap_ms", tLoad.Sub(tJailer).Milliseconds(),
+		"mem_state_ms", tMemState.Sub(tStageDrives).Milliseconds(),
+		"helper_ms", tHelper.Sub(tMemState).Milliseconds(),
+		"start_jailer_ms", tStartJailer.Sub(tHelper).Milliseconds(),
+		"bind_tun_ms", tBindTun.Sub(tStartJailer).Milliseconds(),
+		"load_snap_ms", tLoad.Sub(tBindTun).Milliseconds(),
 		"resume_hook_ms", tResume.Sub(tLoad).Milliseconds(),
 		"wait_ready_ms", tReady.Sub(tResume).Milliseconds(),
 		"total_ms", tReady.Sub(t0).Milliseconds(),
@@ -2327,6 +2333,11 @@ func stageMountHelper(root string) error {
 		return fmt.Errorf("vmm: locate mount helper: %w", err)
 	}
 	dst := filepath.Join(root, "faas-mount-helper")
+	_ = os.Remove(dst)
+	if err := os.Link(exe, dst); err == nil {
+		_ = os.Chmod(dst, 0o755)
+		return nil
+	}
 	if err := copyFile(exe, dst); err != nil {
 		return fmt.Errorf("vmm: stage mount helper: %w", err)
 	}
@@ -2435,19 +2446,21 @@ func (v *JailerVMM) bindTunDeviceInJailer(root, instance string, uid, gid int) e
 		select {
 		case <-deadline.C:
 			return fmt.Errorf("vmm: jailer did not create a private mount namespace")
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(1 * time.Millisecond):
 		}
 	}
-	// nsenter keeps the mount operations inside jailer's private namespace;
-	// both paths are visible below the pivoted jail root.
-	if output, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-dev", "/dev").CombinedOutput(); err != nil {
-		return fmt.Errorf("vmm: prepare jail device tree: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	if output, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-bind", "/faas-host-tun", source).CombinedOutput(); err != nil {
-		return fmt.Errorf("vmm: bind TUN device: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	if output, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mknod-kvm", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); err != nil {
-		return fmt.Errorf("vmm: provision KVM device: %w (%s)", err, strings.TrimSpace(string(output)))
+	// Single-pass setup: prepare /dev tmpfs, bind TUN, and mknod KVM in one nsenter invocation.
+	if _, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--setup-jail", "/dev", "/faas-host-tun", "/dev/net/tun", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); err != nil {
+		// Fallback to legacy 3-step sequence if the mounted helper doesn't support --setup-jail yet
+		if outDev, errDev := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-dev", "/dev").CombinedOutput(); errDev != nil {
+			return fmt.Errorf("vmm: prepare jail device tree: %w (%s)", errDev, strings.TrimSpace(string(outDev)))
+		}
+		if outTun, errTun := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-bind", "/faas-host-tun", source).CombinedOutput(); errTun != nil {
+			return fmt.Errorf("vmm: bind TUN device: %w (%s)", errTun, strings.TrimSpace(string(outTun)))
+		}
+		if outKvm, errKvm := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mknod-kvm", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); errKvm != nil {
+			return fmt.Errorf("vmm: provision KVM device: %w (%s)", errKvm, strings.TrimSpace(string(outKvm)))
+		}
 	}
 	_ = os.Remove(filepath.Join(root, "faas-mount-helper"))
 	v.mu.Lock()
@@ -3241,8 +3254,7 @@ func copyFile(src, dst string) (err error) {
 			err = cErr
 		}
 	}()
-	buf := make([]byte, 4*1024*1024)
-	_, err = io.CopyBuffer(out, in, buf)
+	_, err = io.Copy(out, in)
 	return err
 }
 
