@@ -193,10 +193,9 @@ Three surfaces consume the new fields without new endpoints:
    `events_wake_id_idx` from `migrations/00114_events_wake_id_idx.sql`);
    no new index. The dedicated `/dashboard/apps/{slug}/wake-timeline`
    per-wake narrative view (a `pkg/dashboard/views/wake_timeline.go`
-   helper + matching template) is **deferred to a follow-on PR** —
-   this PR ships the table extension because it lands the
-   customer-visible value on the existing surface with zero new
-   routing.
+   helper + matching template) lands in the **PR-A follow-on** —
+   the §PR-A follow-on subsection below describes the dedicated view
+   + the two additional wake-boot fields it surfaces.
 
 Pre-ADR-123 rows in the dashboard render `—` (the existing convention
 from `app_detail.html` for absent values).
@@ -299,8 +298,131 @@ timeline / dashboard queries get the data with no migration.
 - `pkg/gateway/handler.go:468` + `pkg/gateway/pgbackend.go:795` —
   `Backend.Admit` signature
 - `cmd/gregale/commands_wake_timeline.go:140-145` — CLI renderer
-- `pkg/dashboard/views/wake_timeline.go` — NEW, dashboard table renderer *(deferred to follow-on PR; see §Surfaces item 3)*
+- `pkg/dashboard/views/wake_timeline.go` — NEW, dashboard table renderer
 - `pkg/dashboard/dashboard.go:307-321, 591` — query + `RecentInstanceItem`
 - `pkg/dashboard/templates/app_detail.html:186-212` — recent-wakes columns
-- `pkg/dashboard/templates/app_wake_timeline.html` — NEW *(deferred to follow-on PR)*
+- `pkg/dashboard/templates/app_wake_timeline.html` — NEW, per-app wake-narrative page
+- `cmd/apid/handlers_dashboard.go` — `parseWakeTimelinePath` +
+  `renderAppWakeTimeline` + dashboardHandler route branch
+- `pkg/state/pgstore.go::LookupBootStartedForWakes` — SQL widened with
+  `at_capacity` (COALESCE) + `ready_in_ms` (LEFT JOIN LATERAL against
+  `wake.boot_completed`)
+- `pkg/state/types.go::WakeBootMeta` — extended with `AtCapacity` + `ReadyInMS`
+- `pkg/sched/engine.go` — `admitGate` return tuple widens with
+  `atCapacity bool`; stamped on `BootStarted` via `bootInput.atCapacity`
+- `pkg/events/wake.go` — `BootStarted.AtCapacity` + `Payload()` addition
+
+## PR-A follow-on (closed 2026-08-21)
+
+This ADR originally deferred three items to a follow-on PR. They
+shipped in **PR-A**, branch `feat-adr-123-pr-a-wake-narrative`
+(head `b6f5fc5f4`), 4 atomic commits. Net change: +482 / -18 across
+7 files (dashboard / state / sched packages).
+
+### A1. Dedicated `/dashboard/apps/{slug}/wake-timeline` page
+
+A new handler `renderAppWakeTimeline` in
+`cmd/apid/handlers_dashboard.go` (paired with `parseWakeTimelinePath`
+that mirrors `parseDomainDoctorPath`) renders a per-app page with:
+
+- 24h summary card: total wakes + trigger histogram (stable sorted
+  via `views.RenderTriggerHistogram`) + at-capacity count + at-cap %.
+- Recent wakes table (up to 50 rows) pre-rendered at the handler
+  edge via `views.RenderWakeTimelineTable` (FuncMap-free, stages
+  pattern). All values escaped via `template.HTMLEscapeString`
+  before the chassis cast; the G203 gosec annotation mirrors the
+  precedent at `pkg/dashboard/views/render.go:274/311`.
+
+### A2. Two new wake-boot fields
+
+Two additional fields close the Cloud-Run reference line's
+"Existing instances: 2/2 at concurrency limit" + "Ready in: 112 ms"
+tails:
+
+- `at_capacity` (bool) — true when `admitGate`'s `wakeAdmit` branch
+  observed `concurrency+1 >= maxConc` (the per-app plan ceiling).
+  Always stamped on PR-A fleet rows; pre-PR-A rows default to `false`
+  via SQL `COALESCE((data->>'at_capacity')::bool, false)`.
+- `ready_in_ms` (int) — `EXTRACT(EPOCH FROM (boot_completed.at -
+  boot_started_at)) * 1000` via `LEFT JOIN LATERAL` against the
+  matching `wake.boot_completed` row. PR-A review-cluster fix: the
+  initial `EXTRACT(MILLISECONDS FROM …)` implementation was
+  silently wrong for any delta ≥ 60 s because PostgreSQL intervals
+  are stored as months/days/seconds and `EXTRACT(MILLISECONDS …)`
+  returns ONLY the seconds-field milliseconds (verified via psql:
+  an interval of `65.5 seconds` extracted to 5500 ms, not 65500).
+  `EXTRACT(EPOCH …)` returns total elapsed seconds and `* 1000`
+  yields the wall-clock millisecond delta — accurate for any
+  duration. Zero when no boot_completed exists (still booting or
+  rejected); the template renders em-dash per the existing
+  absent-value convention.
+- `at_capacity_present` (bool) — distinguishes "jsonb key absent"
+  (pre-PR-A fleet row that lacks the at_capacity key entirely)
+  from "jsonb key present and explicitly false" (PR-A row that
+  was admitted below the cap). Source: pgstore's
+  `data ? 'at_capacity'` jsonb contains operator (NULL when the
+  key is absent). The dashboard's em-dash-on-absent convention
+  depends on this — a pre-PR-A fleet row renders "—" (we don't
+  know) instead of "No" (we know it wasn't at the cap).
+
+Both flow through the existing wire (`events.data` jsonb,
+additive) and surface in the dashboard's "Recent wakes" table
+plus the new wake-timeline view.
+
+### A3. New tests (3)
+
+- `pkg/sched/floor/trigger_lockstep_test.go` +
+  `pkg/sched/scaleup/trigger_lockstep_test.go` +
+  `pkg/sched/targets/trigger_lockstep_test.go` — external-test
+  packages (`package floor_test` etc.) with `export_test.go`
+  surfaces that pin `pkg/sched/floor.WakeBootTriggerFloor` /
+  `WakeBootTriggerFloorDep` etc. against the canonical
+  `sched.TriggerFloor` enum. Closes the lockstep audit finding
+  flagged in PR #1015 review #4. The cross-package import
+  (`floor_test → floor + pkg/sched`) is test-time only; no
+  production cycle because production `pkg/sched → floor`
+  via `loop.go` doesn't import `_test`.
+- `pkg/state/lookup_boot_started_test.go` — `pgtest.Open()`-gated
+  round-trip test that inserts a canonical + mirror row for one
+  wake_id and asserts `LookupBootStartedForWakes` returns the
+  canonical one (`trigger='gateway'`, not `'mirror'`) via the
+  `DISTINCT ON (bs.wake_id) … ORDER BY bs.wake_id` canonical-row
+  preference. Closes PR #1015 review #3.
+- `pkg/events/wake_test.go::TestBootStarted_AtCapacity` — table-driven
+  shape test asserting `at_capacity` is always present (unconditional,
+  not gated by `if e.AtCapacity`) and typed as `bool` not `string`.
+
+### A4. Migration slot
+
+**No new migration.** The `at_capacity` + `ready_in_ms` fields
+land on the existing jsonb payload (additive, ADR-064 compat
+clause). The dashboard's `LEFT JOIN LATERAL` against
+`wake.boot_completed` is bounded by the existing
+`events_wake_id_idx` partial index from migration 00114. PR-A
+deliberately follows the "no migration strictly required"
+posture the original ADR settled on.
+
+### A5. Risk
+
+- The `atCapacity bool` widening on `admitGate`'s return tuple
+  touches 6 call sites in `pkg/sched/engine_test.go` and 1 in
+  `engine.go`. Compile-time force.
+- The `ready_in_ms` SQL adds a LATERAL JOIN — sub-millisecond
+  per query at the dashboard's per-page batch (≤50 wake_ids);
+  no observability delta.
+- Pre-PR-A fleet rows render `false` / `0` / em-dash on the new
+  fields via the COALESCE + view-layer conventions; no historical
+  data is lost or hidden.
+
+## Audit follow-on items (closed by PR-A)
+
+The three deferred items below were originally captured in this
+ADR's "open follow-on" subsection. PR-A resolves all three:
+
+1. ~~Dedicated `/dashboard/apps/{slug}/wake-timeline` page~~ → A1.
+2. ~~Trigger-constants lockstep test~~ → A3.
+3. ~~pgstore round-trip test for `LookupBootStartedForWakes`~~ → A3.
+
+Two additional items (AtCapacity + ReadyInMS) were added to PR-A's
+scope after the PR-A plan was approved; both ship in A2.
 - `docs/faas_implementation_spec.md` — §17 G17 row + §6/§12 cross-refs

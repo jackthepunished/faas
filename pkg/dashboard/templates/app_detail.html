@@ -215,12 +215,21 @@
           followed. <strong>ADR-123:</strong> the <em>Trigger</em>,
           <em>Queued</em>, and <em>Concurrency</em> columns surface the
           wake-boot telemetry (closed trigger enum, queue depth, and
-          siblings-already-admitted at admit time). Em-dash means the
-          field is absent — either pre-ADR-123 fleet or a wake_id
-          without a corresponding <code>wake.boot_started</code> event row.
+          siblings-already-admitted at admit time). <strong>PR-A:</strong>
+          <em>At cap</em> is <code>true</code> when the wake admitted at
+          the plan's per-app <code>MaxConcurrency</code> ceiling (closes
+          the customer's "2/2 at concurrency limit" reference);
+          <em>Ready</em> is wall-clock milliseconds from
+          <code>wake.boot_started.at</code> to <code>wake.boot_completed.at</code>
+          (closes the customer's "Ready in: 112 ms" reference). Em-dash
+          means the field is absent — either pre-ADR-123 fleet or a
+          wake_id without a corresponding event row.
+        </p>
+        <p>
+          <a href="/dashboard/apps/{{.Data.App.Slug}}/wake-timeline">Open wake timeline →</a>
         </p>
         <table>
-          <thead><tr><th>Started</th><th>State</th><th>Last request</th><th>Instance</th><th>Wake ID</th><th>Trigger</th><th>Queued</th><th>Concurrency</th></tr></thead>
+          <thead><tr><th>Started</th><th>State</th><th>Last request</th><th>Instance</th><th>Wake ID</th><th>Trigger</th><th>Queued</th><th>Concurrency</th><th>At cap</th><th>Ready</th></tr></thead>
           <tbody>
             {{range .Data.RecentInstances}}
               <tr>
@@ -232,6 +241,8 @@
                 <td>{{if .Trigger}}{{.Trigger}}{{else}}—{{end}}</td>
                 <td>{{if .QueuedCount}}{{.QueuedCount}}{{else}}—{{end}}</td>
                 <td>{{if .ConcurrencyAtAdmit}}{{.ConcurrencyAtAdmit}}{{else}}—{{end}}</td>
+                <td>{{if not .AtCapacityPresent}}<span class="cell-empty">—</span>{{else if .AtCapacity}}<span class="badge-yes">Yes</span>{{else}}<span class="badge-no">No</span>{{end}}</td>
+                <td>{{if .ReadyInMS}}{{.ReadyInMS}} ms{{else}}—{{end}}</td>
               </tr>
             {{end}}
           </tbody>

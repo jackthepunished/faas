@@ -292,6 +292,16 @@ func (e Admitted) Payload() map[string]any {
 //     a downstream reader does not need to know which trigger path
 //     was used to source the value. Always populated (0 is the cold
 //     start case).
+//
+//   - AtCapacity (PR-A) is true when this wake was admitted at the
+//     plan's per-app MaxConcurrency ceiling — i.e. the pre-admit
+//     ledger reading was maxConc-1 and the post-admit reading became
+//     maxConc. Closes the user's "2/2 at concurrency limit" reference
+//     line. NOTE: this is emitted ONLY on the admit path; rejections
+//     do not produce a BootStarted row. BootCompleted intentionally
+//     does NOT carry AtCapacity — it's an admit-time concept, and the
+//     boot_completed row reflects the post-RecordRuntime state where
+//     the cap concept is stale.
 type BootStarted struct {
 	EmitAt             time.Time
 	WakeID             string
@@ -303,6 +313,7 @@ type BootStarted struct {
 	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
 	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
 	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 is cold start
+	AtCapacity         bool   // PR-A — true when post-admit ledger == plan MaxConcurrency
 }
 
 func (e BootStarted) Kind() string     { return WakeBootStarted }
@@ -318,6 +329,7 @@ func (e BootStarted) Payload() map[string]any {
 		"requested_at":         e.RequestedAt.UTC(),
 		"queued_count":         e.QueuedCount,
 		"concurrency_at_admit": e.ConcurrencyAtAdmit,
+		"at_capacity":          e.AtCapacity,
 	}
 	// ADR-123: trigger is absent on the Phase-1 fast-path return
 	// (engine.go:1119) where an existing RUNNING instance was reused

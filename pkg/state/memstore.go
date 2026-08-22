@@ -6678,6 +6678,14 @@ func (m *MemStore) ListLatestInstancesForApp(ctx context.Context, appID string, 
 // for each wake_id in the input slice. memstore implementation walks
 // the in-memory events slice (test-only path) — production read
 // goes through PgStore.LookupBootStartedForWakes.
+//
+// PR-A: parses at_capacity + ready_in_ms in lockstep with the pgstore
+// contract so test fixtures (and any injectable-Store callers) see
+// the same WakeBootMeta shape production surfaces. ready_in_ms is
+// computed by scanning the events slice a second time for the
+// earliest wake.boot_completed row with the same wake_id; absent
+// completion rows leave ReadyInMS at the zero default (em-dash at
+// the view layer).
 func (m *MemStore) LookupBootStartedForWakes(_ context.Context, wakeIDs []string) (map[string]WakeBootMeta, error) {
 	out := make(map[string]WakeBootMeta, len(wakeIDs))
 	wanted := make(map[string]struct{}, len(wakeIDs))
@@ -6686,6 +6694,27 @@ func (m *MemStore) LookupBootStartedForWakes(_ context.Context, wakeIDs []string
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// First pass: build a wake_id → earliest boot_completed timestamp
+	// map. Single forward scan; events appended in at-ASC order.
+	completedAt := make(map[string]time.Time)
+	for _, e := range m.events {
+		if e.Kind != "wake.boot_completed" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		wakeID, _ := payload["wake_id"].(string)
+		if _, ok := wanted[wakeID]; !ok {
+			continue
+		}
+		if _, have := completedAt[wakeID]; !have {
+			completedAt[wakeID] = e.At
+		}
+	}
+	// Second pass: stamp WakeBootMeta from the earliest
+	// wake.boot_started row per wake_id.
 	for _, e := range m.events {
 		if e.Kind != "wake.boot_started" {
 			continue
@@ -6710,6 +6739,27 @@ func (m *MemStore) LookupBootStartedForWakes(_ context.Context, wakeIDs []string
 		}
 		if c, ok := payload["concurrency_at_admit"].(float64); ok {
 			meta.ConcurrencyAtAdmit = int(c)
+		}
+		// at_capacity: distinguish "key absent" (pre-PR-A fleet) from
+		// "key present and explicitly false". The dashboard's
+		// em-dash-on-absent convention depends on AtCapacityPresent.
+		if _, ok := payload["at_capacity"]; ok {
+			meta.AtCapacityPresent = true
+			if v, ok := payload["at_capacity"].(bool); ok {
+				meta.AtCapacity = v
+			}
+		}
+		// ready_in_ms: total elapsed milliseconds between boot_started.at
+		// and the matching boot_completed.at. Mirrors pgstore's
+		// EXTRACT(EPOCH …) * 1000 — NOT EXTRACT(MILLISECONDS …)
+		// because PostgreSQL intervals are stored as months/days/
+		// seconds and EXTRACT(MILLISECONDS) is silently wrong for
+		// deltas >= 60s.
+		if cat, ok := completedAt[wakeID]; ok && !cat.IsZero() {
+			delta := cat.Sub(e.At)
+			if delta > 0 {
+				meta.ReadyInMS = int(delta / time.Millisecond)
+			}
 		}
 		out[wakeID] = meta
 	}

@@ -680,6 +680,14 @@ type AppMetricsView struct {
 // partial index from migration 00114). Empty/zero values are
 // rendered as em-dash per the existing convention for absent
 // fields — pre-ADR-123 fleet rows have no wake.boot_started yet.
+//
+// PR-A extends the row with AtCapacity (the bool stamped by
+// pkg/sched.Engine.admitGate's wakeAdmit branch — closes the
+// "2/2 at concurrency limit" reference line) and ReadyInMS
+// (millisecond delta between boot_started.at and boot_completed.at
+// — closes the "Ready in: 112 ms" reference line). Both surface
+// naturally as columns in the dashboard table; em-dash on zero
+// for pre-PR-A fleet rows.
 type RecentInstanceItem struct {
 	ID                 string // instance row PK (stable across wakes)
 	WakeID             string // per-wake UUIDv7; distinct from ID
@@ -689,6 +697,50 @@ type RecentInstanceItem struct {
 	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
 	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
 	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 = cold start
+	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
+	AtCapacityPresent  bool   // PR-A — true when the at_capacity key was present in jsonb (false = absent; em-dash)
+	ReadyInMS          int    // PR-A — wall-clock boot_started → boot_completed delta in ms; 0 if still booting or rejected
+}
+
+// WakeTimelinePageData is the /dashboard/apps/{slug}/wake-timeline
+// page payload (PR-A follow-on to ADR-123, per the spec §17 G17
+// follow-on subsection). Renders one page per app with a 24h summary
+// card (wake count + trigger histogram + at-capacity count/%) plus a
+// "Recent wakes" body table — the same column set the app-detail
+// recent-wakes table exposes, but with up to 50 rows instead of 10
+// and a summary header pre-aggregated at the handler edge.
+//
+// The dashboard does NOT use html/template FuncMap
+// (pkg/dashboard/dashboard.go:903 — templates parsed via
+// template.New("").ParseFS). Following the stages pattern, every
+// HTML block is pre-rendered at the handler edge:
+//
+//   - RenderTable is the views.RenderWakeTimelineTable output
+//     (one static <table> chassis, all values escaped via
+//     template.HTMLEscapeString before the chassis cast).
+//   - TriggerHistogramHTML is the views.RenderTriggerHistogram
+//     output, pre-sorted by trigger key so the rendered text is
+//     stable across requests (snapshot diff = nil).
+//
+// AtCapacityPct is rounded to 0 decimals at the template edge
+// ("{{printf \"%.0f\" .Data.AtCapacityPct}}") — the dashboard
+// never needs a finer-grained number for an at-cap readout.
+//
+// WakeCountWithMeta is the denominator the at-cap% uses (vs
+// WakeCount24h which includes pre-ADR-123 fleet rows that lack a
+// boot_started event). When WakeCountWithMeta < WakeCount24h the
+// template renders "of {N} known wakes" alongside the at-cap count
+// so a customer sees the divergence explicitly (PR-A review cluster
+// finding #5 — wakeCount24h and the histogram were previously
+// inconsistent with no label).
+type WakeTimelinePageData struct {
+	App                  AppListItem
+	WakeCount24h         int
+	WakeCountWithMeta    int
+	AtCapacityCount      int
+	AtCapacityPct        float64
+	TriggerHistogramHTML template.HTML // pre-rendered at the handler
+	RenderTable          template.HTML // pre-rendered at the handler
 }
 
 // UsageData is the /dashboard/usage page payload.
