@@ -134,6 +134,9 @@ from .create_deployment_overrides import CreateDeploymentOverrides
 from .create_deployment_overrides_env import CreateDeploymentOverridesEnv
 from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
 from .create_deployment_request import CreateDeploymentRequest
+from .create_deployment_request_tag_type_1 import CreateDeploymentRequestTagType1
+from .create_deployment_request_tag_type_2_type_1 import CreateDeploymentRequestTagType2Type1
+from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequestTagType3Type1
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_key_request import CreateKeyRequest
@@ -181,6 +184,7 @@ from .deployment_response_override_env_secret_refs import DeploymentResponseOver
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
 from .diff_app_config_patch_eviction_priority import DiffAppConfigPatchEvictionPriority
 from .diff_break import DiffBreak
@@ -416,7 +420,13 @@ from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
 from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
+from .source_ref_deploy_request_tag_type_1 import SourceRefDeployRequestTagType1
+from .source_ref_deploy_request_tag_type_2_type_1 import SourceRefDeployRequestTagType2Type1
+from .source_ref_deploy_request_tag_type_3_type_1 import SourceRefDeployRequestTagType3Type1
 from .source_tarball_deploy_request import SourceTarballDeployRequest
+from .source_tarball_deploy_request_tag_type_1 import SourceTarballDeployRequestTagType1
+from .source_tarball_deploy_request_tag_type_2_type_1 import SourceTarballDeployRequestTagType2Type1
+from .source_tarball_deploy_request_tag_type_3_type_1 import SourceTarballDeployRequestTagType3Type1
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
@@ -622,6 +632,9 @@ __all__ = (
     "CreateDeploymentOverridesEnv",
     "CreateDeploymentOverridesEnvSecrets",
     "CreateDeploymentRequest",
+    "CreateDeploymentRequestTagType1",
+    "CreateDeploymentRequestTagType2Type1",
+    "CreateDeploymentRequestTagType3Type1",
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
     "CreateKeyRequest",
@@ -665,6 +678,7 @@ __all__ = (
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DeploymentResponseTag",
     "DiffAppConfigPatch",
     "DiffAppConfigPatchEvictionPriority",
     "DiffBreak",
@@ -898,7 +912,13 @@ __all__ = (
     "SLODuration",
     "SourceRefDeployRequest",
     "SourceRefDeployRequestFormat",
+    "SourceRefDeployRequestTagType1",
+    "SourceRefDeployRequestTagType2Type1",
+    "SourceRefDeployRequestTagType3Type1",
     "SourceTarballDeployRequest",
+    "SourceTarballDeployRequestTagType1",
+    "SourceTarballDeployRequestTagType2Type1",
+    "SourceTarballDeployRequestTagType3Type1",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",

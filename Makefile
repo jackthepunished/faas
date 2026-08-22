@@ -594,6 +594,9 @@ egress-check: egress-render-cross-check ## Cross-check the Go render against the
 	  if command -v nft >/dev/null 2>&1; then \
 	    if go run ./cmd/faas-nft-render > /tmp/faas-egress-check.conf && nft -c -f /tmp/faas-egress-check.conf 2>/tmp/faas-egress.stderr; then \
 	      echo "egress-check: nft -c -f OK"; \
+	    elif grep -Eq "Could not process rule:.*(Operation not permitted|Permission denied)" /tmp/faas-egress.stderr 2>/dev/null; then \
+	      echo "egress-check: nft -c -f SKIPPED: kernel sandbox rejected rules (sandboxed CI runner)"; \
+	      echo "(Go cross-check + bridge-name guard still run; live kernel check skipped)"; \
 	    else \
 	      echo "egress-check: nft -c -f FAILED:"; \
 	      cat /tmp/faas-egress.stderr; \
