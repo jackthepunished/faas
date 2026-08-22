@@ -109,7 +109,7 @@ var cliCommands = []cliCommand{
 		// tier-1-scaleout pair).
 		Name:    dispatchComputeNodes,
 		DocSlug: "compute-nodes",
-		Short:   "Compute-node state machine (compute-nodes add|drain|drain-status|activate|force-drain)",
+		Short:   "Compute-node state machine (compute-nodes add|list|show|drain|drain-status|activate|force-drain)",
 		Subcommands: []cliSub{
 			{
 				Name:  "add",
@@ -122,6 +122,22 @@ var cliCommands = []cliCommand{
 					{Name: "max-concurrency", Short: "max concurrent live instances"},
 					{Name: "admission-ceiling-mb", Short: "tenant RAM admission ceiling (85% of mem-mb for production nodes)"},
 					{Name: "from-file", Short: "JSON payload matching computeNodePayload (PR-B bridge)"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
+			{
+				Name:  "list",
+				Short: "List every registered compute node (default; --active-only filters; --json emits wire-shape)",
+				Flags: []cliFlag{
+					{Name: "active-only", Short: "filter to active=true rows only"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
+			{
+				Name:  "show",
+				Short: "Show one compute node's full row + live_instance_count (--node <fqdn>; --json emits wire-shape)",
+				Flags: []cliFlag{
+					{Name: "node", Short: "fqdn / short-hostname of the node to show (required)"},
 					{Name: "json", Short: "emit structured JSON to stdout"},
 				},
 			},

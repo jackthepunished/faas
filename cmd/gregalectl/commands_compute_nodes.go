@@ -38,8 +38,8 @@ import (
 const dispatchComputeNodes = "compute-nodes"
 
 // cmdComputeNodesDispatch fans to add / drain / drain-status /
-// activate / force-drain. Matches the (args []string) int signature
-// every other dispatch* arm uses (see commands_release.go:cmdReleaseDispatch).
+// activate / force-drain / list / show. Matches the (args []string) int
+// signature every other dispatch* arm uses (see commands_release.go:cmdReleaseDispatch).
 //
 // `add` is the operator-side pre-registration path: it POSTs a row to
 // compute_nodes before vmmd has booted on the new box. The runbook's
@@ -47,14 +47,24 @@ const dispatchComputeNodes = "compute-nodes"
 // order load-bearing — vmmd's self-registration UPSERT preserves the
 // operator's POSTed target_url via UpsertComputeNodeFromVmmd's
 // COALESCE, so the operator must land the row first.
+//
+// `list` / `show` are the read-only introspection pair (Cluster C of
+// the gregalectl mega-PR). Mirrors the `compute-nodes` admin API
+// surface (cmd/apid/compute_nodes.go) but goes through state.Store
+// directly so the operator can sanity-check the cluster without
+// standing up apid + auth.
 func cmdComputeNodesDispatch(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes: missing subcommand; want add|drain|drain-status|activate|force-drain")
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes: missing subcommand; want add|list|show|drain|drain-status|activate|force-drain")
 		return 2
 	}
 	switch args[0] {
 	case "add":
 		return cmdComputeNodesAdd(args[1:])
+	case "list":
+		return cmdComputeNodesList(args[1:])
+	case "show":
+		return cmdComputeNodesShow(args[1:])
 	case "drain":
 		return cmdComputeNodesDrain(args[1:])
 	case "drain-status":
@@ -241,6 +251,278 @@ func cmdComputeNodesForceDrain(args []string) int {
 		return 1
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "force-drained %s\n", *node)
+	return 0
+}
+
+// cmdComputeNodesList is the read-only introspection entry. Walks
+// every row in compute_nodes (or just the active ones with
+// --active-only) and emits a one-line summary per node. --json
+// emits a structured report for CI gates that need to assert on
+// fleet shape (e.g. "exactly 3 active nodes" in a smoke test).
+//
+// The exit code is 0 when the query succeeds, regardless of row
+// count (an empty fleet is not an error condition — it just means
+// no nodes have been registered yet). The read path uses the same
+// openComputeNodesStore seam the write paths use, so tests can
+// swap in a MemStore via setComputeNodesStoreOpener.
+func cmdComputeNodesList(args []string) int {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	activeOnly := fs.Bool("active-only", false, "filter to active=true rows (default: every row regardless of drain state)")
+	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes list: unexpected positional args")
+		return 2
+	}
+	st, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeFn()
+
+	nodes, err := st.ListComputeNodes(context.Background(), !*activeOnly)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes list: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		return emitComputeNodesListJSON(osStdout, nodes)
+	}
+	reportComputeNodesList(osStdout, nodes, *activeOnly)
+	return 0
+}
+
+// reportComputeNodesList prints one line per node in a fixed-width
+// table. Empty fleet prints a single "(no compute nodes)" line so
+// the operator can tell at a glance that the query succeeded but
+// no rows match (rather than a blank screen that looks like the
+// command hung).
+func reportComputeNodesList(w io.Writer, nodes []state.ComputeNode, activeOnly bool) {
+	if len(nodes) == 0 {
+		fmt.Fprintf(w, "(no compute nodes%s)\n", activeOnlyString(activeOnly))
+		return
+	}
+	fmt.Fprintf(w, "%-32s  %-15s  %-7s  %-7s  %-7s  %-7s  %s\n", "NAME", "ROLE", "VPCPUS", "MEM_MB", "MAXCON", "ACTIVE", "TARGET_URL")
+	for _, n := range nodes {
+		role := ""
+		if n.Role != nil {
+			role = *n.Role
+		}
+		fmt.Fprintf(w, "%-32s  %-15s  %-7d  %-7d  %-7d  %-7t  %s\n",
+			n.Name, role, n.VPCPUs, n.MemMB, n.MaxConcurrency, n.Active, n.TargetURL)
+	}
+}
+
+func activeOnlyString(activeOnly bool) string {
+	if activeOnly {
+		return " (active-only)"
+	}
+	return ""
+}
+
+// computeNodesListJSON is the wire shape for `compute-nodes list --json`.
+// Field set pinned by json_parity_test so CI gates can rely on the
+// schema. count + nodes mirror the on-disk row count + the rows
+// themselves so a gate can assert "count == 3" without walking the
+// array.
+type computeNodesListJSON struct {
+	Count int                `json:"count"`
+	Nodes []computeNodeBrief `json:"nodes"`
+}
+
+// computeNodeBrief is the per-node JSON shape. We deliberately
+// drop the heavy pointer fields (HostCertificate, CertFingerprint,
+// ReleaseID, ManifestHash, Generation) that the cmd-line show
+// path exposes; the list is meant for fleet-level assertions
+// ("which boxes are registered, what's their role / capacity /
+// dial target") not for per-node audit. The show subcommand is
+// the place that surfaces the heavy fields.
+type computeNodeBrief struct {
+	Name               string  `json:"name"`
+	ID                 string  `json:"id"`
+	Role               *string `json:"role,omitempty"`
+	VPCPUs             int     `json:"vpcpus"`
+	MemMB              int     `json:"mem_mb"`
+	MaxConcurrency     int     `json:"max_concurrency"`
+	AdmissionCeilingMB int     `json:"admission_ceiling_mb"`
+	Active             bool    `json:"active"`
+	TargetURL          string  `json:"target_url"`
+}
+
+func emitComputeNodesListJSON(w io.Writer, nodes []state.ComputeNode) int {
+	out := computeNodesListJSON{
+		Count: len(nodes),
+		Nodes: make([]computeNodeBrief, 0, len(nodes)),
+	}
+	for _, n := range nodes {
+		out.Nodes = append(out.Nodes, computeNodeBrief{
+			Name: n.Name, ID: n.ID, Role: n.Role,
+			VPCPUs: n.VPCPUs, MemMB: n.MemMB,
+			MaxConcurrency: n.MaxConcurrency, AdmissionCeilingMB: n.AdmissionCeilingMB,
+			Active: n.Active, TargetURL: n.TargetURL,
+		})
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes list: marshal json: %v\n", err)
+		return 1
+	}
+	if _, err := w.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes list: write json: %v\n", err)
+		return 1
+	}
+	_, _ = w.Write([]byte("\n"))
+	return 0
+}
+
+// cmdComputeNodesShow is the per-node introspection leaf. Mirrors
+// the cmd-line dump from the `add` JSON shape but for an
+// already-registered row, plus live_instance_count (the count of
+// instances in {WAKING, COLD_BOOTING, RUNNING} on the node).
+// --json emits the full ComputeNode + the live count.
+//
+// Missing node is exit 3 (the "row not found" convention that
+// state.Store.ComputeNodeByName returns ErrNotFound for, distinct
+// from the "DB unreachable" exit 1).
+func cmdComputeNodesShow(args []string) int {
+	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	node := fs.String("node", "", "fqdn / short-hostname of the node to show (required)")
+	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *node == "" {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes show: --node required")
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes show: unexpected positional args")
+		return 2
+	}
+	st, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeFn()
+
+	ctx := context.Background()
+	row, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes show: no compute_node with name=%q\n", *node)
+			return 3
+		}
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes show: %v\n", err)
+		return 1
+	}
+	insts, err := st.ListInstancesByNodeID(ctx, *node)
+	if err != nil {
+		// Live-instance count is informational (drives the
+		// drain-status UX); a query failure must NOT hide the
+		// row data. Emit a WARN to stderr and continue with
+		// live=0 so the operator still sees the node.
+		fmt.Fprintf(os.Stderr, "warn: ListInstancesByNodeID(%q): %v (live_instance_count reported as 0)\n", *node, err)
+		insts = nil
+	}
+	live := 0
+	for _, inst := range insts {
+		switch inst.State {
+		case "WAKING", "COLD_BOOTING", "RUNNING":
+			live++
+		}
+	}
+	if *jsonOut {
+		return emitComputeNodeShowJSON(osStdout, row, live)
+	}
+	reportComputeNodeShow(os.Stdout, row, live)
+	return 0
+}
+
+// reportComputeNodeShow dumps the row as a multi-line key=value
+// listing. We use the same output shape as `add` (so an operator
+// who just registered a box can grep both outputs into the same
+// record), plus the live_instance_count footer.
+func reportComputeNodeShow(w io.Writer, n state.ComputeNode, live int) {
+	role := ""
+	if n.Role != nil {
+		role = *n.Role
+	}
+	fmt.Fprintf(w, "name=%s\n", n.Name)
+	fmt.Fprintf(w, "id=%s\n", n.ID)
+	fmt.Fprintf(w, "role=%s\n", role)
+	fmt.Fprintf(w, "target_url=%s\n", n.TargetURL)
+	fmt.Fprintf(w, "vpcpus=%d\n", n.VPCPUs)
+	fmt.Fprintf(w, "mem_mb=%d\n", n.MemMB)
+	fmt.Fprintf(w, "max_concurrency=%d\n", n.MaxConcurrency)
+	fmt.Fprintf(w, "admission_ceiling_mb=%d\n", n.AdmissionCeilingMB)
+	fmt.Fprintf(w, "active=%t\n", n.Active)
+	if n.Region != nil {
+		fmt.Fprintf(w, "region=%s\n", *n.Region)
+	}
+	if n.Zone != nil {
+		fmt.Fprintf(w, "zone=%s\n", *n.Zone)
+	}
+	if n.ReleaseID != nil {
+		fmt.Fprintf(w, "release_id=%s\n", *n.ReleaseID)
+	}
+	if n.ManifestHash != nil {
+		fmt.Fprintf(w, "manifest_hash=%s\n", *n.ManifestHash)
+	}
+	if n.CertFingerprint != nil {
+		fmt.Fprintf(w, "cert_fingerprint=%s\n", *n.CertFingerprint)
+	}
+	if n.Generation != nil {
+		fmt.Fprintf(w, "generation=%d\n", *n.Generation)
+	}
+	fmt.Fprintf(w, "live_instance_count=%d\n", live)
+}
+
+// computeNodeShowJSON is the wire shape for `compute-nodes show --json`.
+// Fields mirror the read-only set on the row + live_instance_count.
+type computeNodeShowJSON struct {
+	Name               string  `json:"name"`
+	ID                 string  `json:"id"`
+	Role               *string `json:"role,omitempty"`
+	TargetURL          string  `json:"target_url"`
+	VPCPUs             int     `json:"vpcpus"`
+	MemMB              int     `json:"mem_mb"`
+	MaxConcurrency     int     `json:"max_concurrency"`
+	AdmissionCeilingMB int     `json:"admission_ceiling_mb"`
+	Active             bool    `json:"active"`
+	Region             *string `json:"region,omitempty"`
+	Zone               *string `json:"zone,omitempty"`
+	ReleaseID          *string `json:"release_id,omitempty"`
+	ManifestHash       *string `json:"manifest_hash,omitempty"`
+	CertFingerprint    *string `json:"cert_fingerprint,omitempty"`
+	Generation         *int    `json:"generation,omitempty"`
+	LiveInstanceCount  int     `json:"live_instance_count"`
+}
+
+func emitComputeNodeShowJSON(w io.Writer, n state.ComputeNode, live int) int {
+	body, err := json.Marshal(computeNodeShowJSON{
+		Name: n.Name, ID: n.ID, Role: n.Role,
+		TargetURL: n.TargetURL, VPCPUs: n.VPCPUs, MemMB: n.MemMB,
+		MaxConcurrency: n.MaxConcurrency, AdmissionCeilingMB: n.AdmissionCeilingMB,
+		Active: n.Active, Region: n.Region, Zone: n.Zone,
+		ReleaseID: n.ReleaseID, ManifestHash: n.ManifestHash,
+		CertFingerprint: n.CertFingerprint, Generation: n.Generation,
+		LiveInstanceCount: live,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes show: marshal json: %v\n", err)
+		return 1
+	}
+	if _, err := w.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes show: write json: %v\n", err)
+		return 1
+	}
+	_, _ = w.Write([]byte("\n"))
 	return 0
 }
 
