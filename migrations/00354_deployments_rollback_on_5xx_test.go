@@ -52,10 +52,10 @@ func TestMigrations_00354_DeploymentsRollbackOn5xx(t *testing.T) {
 
 	// (2) Six columns exist with the expected shape.
 	cols := []struct {
-		col       string
-		wantNull  bool
-		wantType  string
-		wantDef   string // substring match against column_default
+		col      string
+		wantNull bool
+		wantType string
+		wantDef  string // substring match against column_default
 	}{
 		{"rollback_on_5xx", false, "boolean", "false"},
 		{"first_wake_at", true, "timestamp with time zone", ""},

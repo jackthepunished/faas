@@ -1588,12 +1588,12 @@ type DeploymentResponse struct {
 	// at the schema layer via deployments_last_auto_rollback_reason_check;
 	// the wire projection coalesces NULL → '' so pre-rollback rows
 	// omit the field.
-	RollbackOn5xx bool `json:"rollback_on_5xx"`
-	FirstWakeAt              *time.Time `json:"first_wake_at,omitempty"`
-	First5xxWindowEndsAt     *time.Time `json:"first_5xx_window_ends_at,omitempty"`
-	First5xxCount            int        `json:"first_5xx_count"`
-	LastAutoRollbackAt       *time.Time `json:"last_auto_rollback_at,omitempty"`
-	LastAutoRollbackReason   string     `json:"last_auto_rollback_reason,omitempty"`
+	RollbackOn5xx          bool       `json:"rollback_on_5xx"`
+	FirstWakeAt            *time.Time `json:"first_wake_at,omitempty"`
+	First5xxWindowEndsAt   *time.Time `json:"first_5xx_window_ends_at,omitempty"`
+	First5xxCount          int        `json:"first_5xx_count"`
+	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
+	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source

@@ -3697,4 +3697,3 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 // fields that PR-3a widens. Kept private to this file.
 func ptrStr(s string) *string { return &s }
 func ptrInt(i int) *int       { return &i }
-
