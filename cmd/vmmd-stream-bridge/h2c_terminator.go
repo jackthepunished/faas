@@ -333,8 +333,8 @@ func newGuestH2CTransport(guestIP string, guestPort uint16) *http2.Transport {
 		PingTimeout:     15 * time.Second,
 		// ADR-127 §D2 (Layer 9) — security pins. See const block
 		// above for the rationale of each value.
-		MaxReadFrameSize:          h2cMaxReadFrameSize,
-		MaxHeaderListSize:         h2cMaxHeaderListSize,
+		MaxReadFrameSize:           h2cMaxReadFrameSize,
+		MaxHeaderListSize:          h2cMaxHeaderListSize,
 		StrictMaxConcurrentStreams: true,
 	}
 }

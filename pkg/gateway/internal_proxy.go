@@ -271,8 +271,8 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 		// newStreamBridgeH2CTransport in
 		// pkg/vmmdgrpc/forward.go). See those sites for
 		// per-field rationale.
-		MaxReadFrameSize:          1 << 20, // 1 MiB
-		MaxHeaderListSize:         1 << 20, // 1 MiB
+		MaxReadFrameSize:           1 << 20, // 1 MiB
+		MaxHeaderListSize:          1 << 20, // 1 MiB
 		StrictMaxConcurrentStreams: true,
 	}
 	return t

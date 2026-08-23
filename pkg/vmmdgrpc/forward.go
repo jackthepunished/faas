@@ -1935,8 +1935,8 @@ func newStreamBridgeH2CTransport(sockPath string) *http2.Transport {
 		// newInternalProxyH2CTransport in
 		// pkg/gateway/internal_proxy.go). See those sites for
 		// per-field rationale.
-		MaxReadFrameSize:          1 << 20,        // 1 MiB
-		MaxHeaderListSize:         1 << 20,        // 1 MiB
+		MaxReadFrameSize:           1 << 20, // 1 MiB
+		MaxHeaderListSize:          1 << 20, // 1 MiB
 		StrictMaxConcurrentStreams: true,
 	}
 }

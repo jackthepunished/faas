@@ -749,9 +749,9 @@ func TestNewHandler_FramingSlog(t *testing.T) {
 // the h2c branch is the default-after-promotion shape.
 func TestNewHandler_BridgeFramingHeader(t *testing.T) {
 	cases := []struct {
-		name  string
-		env   string
-		want  string
+		name string
+		env  string
+		want string
 	}{
 		{name: "h1_default", env: "h1", want: "h1"},
 		{name: "h2c_promoted", env: "h2c", want: "h2c"},
