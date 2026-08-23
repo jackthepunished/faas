@@ -145,6 +145,7 @@ from .create_deployment_request_tag_type_2_type_1 import CreateDeploymentRequest
 from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequestTagType3Type1
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
+from .create_edge_rule_request_validate_mode import CreateEdgeRuleRequestValidateMode
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
 from .create_org_api_key_request import CreateOrgAPIKeyRequest
@@ -244,6 +245,7 @@ from .edge_rule_redirect_action_headers import EdgeRuleRedirectActionHeaders
 from .edge_rule_redirect_action_status_code import EdgeRuleRedirectActionStatusCode
 from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
+from .edge_rule_response_validate_mode import EdgeRuleResponseValidateMode
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
 from .edge_rule_suggestion import EdgeRuleSuggestion
@@ -521,6 +523,7 @@ from .update_deployment_open_api_doc_response_200_source import UpdateDeployment
 from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
+from .update_edge_rule_request_validate_mode import UpdateEdgeRuleRequestValidateMode
 from .update_trigger_request import UpdateTriggerRequest
 from .update_trigger_request_broker_poison_strategy_type_1 import UpdateTriggerRequestBrokerPoisonStrategyType1
 from .update_trigger_request_broker_poison_strategy_type_2_type_1 import (
@@ -685,6 +688,7 @@ __all__ = (
     "CreateDeploymentRequestTagType3Type1",
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
+    "CreateEdgeRuleRequestValidateMode",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
     "CreateOrgAPIKeyRequest",
@@ -776,6 +780,7 @@ __all__ = (
     "EdgeRuleRedirectActionStatusCode",
     "EdgeRuleResponse",
     "EdgeRuleResponseKind",
+    "EdgeRuleResponseValidateMode",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
     "EdgeRuleSuggestion",
@@ -1051,6 +1056,7 @@ __all__ = (
     "UpdateDeploymentRequest",
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
+    "UpdateEdgeRuleRequestValidateMode",
     "UpdateTriggerRequest",
     "UpdateTriggerRequestBrokerPoisonStrategyType1",
     "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",

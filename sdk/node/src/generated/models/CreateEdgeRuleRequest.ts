@@ -26,6 +26,12 @@ export type CreateEdgeRuleRequest = {
   enabled?: boolean;
   kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget';
   /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Omitted == 'block' (the SQL-side default).
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
+  /**
    * Kind-tagged action body — shape depends on `kind`.
    */
   action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);

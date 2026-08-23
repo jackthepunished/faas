@@ -8,6 +8,11 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.edge_rule_response_kind import EdgeRuleResponseKind, check_edge_rule_response_kind
+from ..models.edge_rule_response_validate_mode import (
+    EdgeRuleResponseValidateMode,
+    check_edge_rule_response_validate_mode,
+)
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
@@ -68,6 +73,11 @@ class EdgeRuleResponse:
     updated_at: datetime.datetime
     priority: int = 100
     enabled: bool = True
+    validate_mode: EdgeRuleResponseValidateMode | Unset = "block"
+    """Top-level source of truth for kind=validate (ADR-128).
+    Resolved mode; always present on read. Empty on read
+    would be a database invariant violation.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -137,6 +147,10 @@ class EdgeRuleResponse:
 
         updated_at = self.updated_at.isoformat()
 
+        validate_mode: str | Unset = UNSET
+        if not isinstance(self.validate_mode, Unset):
+            validate_mode = self.validate_mode
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -155,6 +169,8 @@ class EdgeRuleResponse:
                 "updated_at": updated_at,
             }
         )
+        if validate_mode is not UNSET:
+            field_dict["validate_mode"] = validate_mode
 
         return field_dict
 
@@ -328,6 +344,13 @@ class EdgeRuleResponse:
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
+        _validate_mode = d.pop("validate_mode", UNSET)
+        validate_mode: EdgeRuleResponseValidateMode | Unset
+        if isinstance(_validate_mode, Unset):
+            validate_mode = UNSET
+        else:
+            validate_mode = check_edge_rule_response_validate_mode(_validate_mode)
+
         edge_rule_response = cls(
             id=id,
             account_id=account_id,
@@ -341,6 +364,7 @@ class EdgeRuleResponse:
             action=action,
             created_at=created_at,
             updated_at=updated_at,
+            validate_mode=validate_mode,
         )
 
         edge_rule_response.additional_properties = d

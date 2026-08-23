@@ -41,6 +41,13 @@ export type EdgeRuleResponse = {
   enabled: boolean;
   kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget';
   /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Resolved mode; always present on read. Empty on read
+   * would be a database invariant violation.
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
+  /**
    * Kind-tagged union — shape varies by `kind`.
    */
   action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);
