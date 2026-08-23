@@ -588,3 +588,93 @@ func TestBuildFakeGit_BehaviorIsCallable(t *testing.T) {
 var _ = exec.Command
 var _ = context.Background
 var _ = json.Unmarshal
+
+// TestCmdDeployDispatch_Routing pins the dispatcher routing for
+// the known verb (add-node) and the missing-arg / unknown-subcommand
+// branches (commands_deploy.go:69-81).
+func TestCmdDeployDispatch_Routing(t *testing.T) {
+	t.Run("add_node_routed", func(t *testing.T) {
+		// Drives the leaf with a known-bad flag set so the leaf
+		// exits 2 via flag.Parse, proving routing reached cmdDeployAddNode.
+		resetComputeNodesStore(t)
+		stderr := captureStderrComputeNodes(t, func() {
+			if code := cmdDeployDispatch([]string{"add-node", "--not-a-flag"}); code != 2 {
+				t.Errorf("dispatch(add-node --not-a-flag) = %d, want 2", code)
+			}
+		})
+		if !strings.Contains(stderr, "flag provided but not defined") {
+			t.Errorf("dispatch stderr missing flag.Parse error (got %q)", stderr)
+		}
+	})
+	t.Run("no_subcommand", func(t *testing.T) {
+		stderr := captureStderrComputeNodes(t, func() {
+			if code := cmdDeployDispatch(nil); code != 2 {
+				t.Errorf("dispatch(nil) = %d, want 2", code)
+			}
+		})
+		if !strings.Contains(stderr, "missing subcommand") {
+			t.Errorf("dispatch(nil) stderr missing 'missing subcommand' hint (got %q)", stderr)
+		}
+	})
+	t.Run("unknown_subcommand", func(t *testing.T) {
+		stderr := captureStderrComputeNodes(t, func() {
+			if code := cmdDeployDispatch([]string{"remove-node"}); code != 2 {
+				t.Errorf("dispatch(remove-node) = %d, want 2", code)
+			}
+		})
+		if !strings.Contains(stderr, `unknown subcommand "remove-node"`) {
+			t.Errorf("dispatch(remove-node) stderr missing unknown marker (got %q)", stderr)
+		}
+	})
+}
+
+// TestDefaultRepoRoot pins the bootstrap.yml walker
+// (commands_deploy.go:482) — given a cwd where the bootstrap.yml
+// marker is reachable, defaultRepoRoot returns that directory. When
+// the marker is unreachable within 5 ascents, the function returns
+// the original cwd (the documented "fall back to where we started"
+// behaviour at line 498).
+//
+// The helper walks cwd (NOT os.Args[0]) looking for
+// deploy/ansible/bootstrap.yml. macOS resolves /tmp → /private/tmp
+// so we compare against os.Getwd() (the symlink-resolved form) to
+// avoid the t.TempDir() vs os.Getwd() mismatch.
+func TestDefaultRepoRoot(t *testing.T) {
+	t.Run("found_in_cwd", func(t *testing.T) {
+		repo := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(repo, "deploy/ansible"), 0o755); err != nil {
+			t.Fatalf("mkdir deploy/ansible: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/bootstrap.yml"), []byte("---\n"), 0o644); err != nil {
+			t.Fatalf("write bootstrap.yml: %v", err)
+		}
+		oldCwd, _ := os.Getwd()
+		t.Cleanup(func() { _ = os.Chdir(oldCwd) })
+		if err := os.Chdir(repo); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		// Use the symlink-resolved cwd (os.Getwd) since macOS
+		// rewrites /tmp → /private/tmp but the chdir target is
+		// the symlink form.
+		wantCwd, _ := os.Getwd()
+		got := defaultRepoRoot()
+		if got != wantCwd {
+			t.Errorf("defaultRepoRoot() = %q, want %q (cwd has the marker)", got, wantCwd)
+		}
+	})
+	t.Run("not_found_returns_cwd", func(t *testing.T) {
+		empty := t.TempDir()
+		oldCwd, _ := os.Getwd()
+		t.Cleanup(func() { _ = os.Chdir(oldCwd) })
+		if err := os.Chdir(empty); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		// No marker within 5 ascents → function returns cwd
+		// (commands_deploy.go:498). We pin the symlink-resolved
+		// form to avoid the /tmp → /private/tmp mismatch.
+		wantCwd, _ := os.Getwd()
+		if got := defaultRepoRoot(); got != wantCwd {
+			t.Errorf("defaultRepoRoot() = %q, want %q (no marker within 5 ascents → return cwd)", got, wantCwd)
+		}
+	})
+}

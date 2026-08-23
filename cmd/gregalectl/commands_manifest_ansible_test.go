@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,5 +196,80 @@ func TestWriteGeneratedAnsibleFile_RefusesDrift(t *testing.T) {
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "first\n" {
 		t.Fatalf("file after refused overwrite = %q, err=%v", got, err)
+	}
+}
+
+// TestCmdManifestAnsible_MissingFlags pins the --manifest-file /
+// --output-dir required-flag check (exit 2, usage error).
+func TestCmdManifestAnsible_MissingFlags(t *testing.T) {
+	prevStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = prevStderr })
+	code := cmdManifestAnsible([]string{})
+	_ = w.Close()
+	var buf bytes.Buffer
+	tmp := make([]byte, 1024)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = r.Close()
+	if code != 2 {
+		t.Errorf("cmdManifestAnsible(no flags) = %d, want 2 (usage)", code)
+	}
+	if !strings.Contains(buf.String(), "--manifest-file and --output-dir are required") {
+		t.Errorf("stderr missing required-flag diagnostic: %q", buf.String())
+	}
+}
+
+// TestCmdManifestAnsible_InvalidFlag pins the flag.Parse failure
+// path (exit 2, "flag provided but not defined").
+func TestCmdManifestAnsible_InvalidFlag(t *testing.T) {
+	if code := cmdManifestAnsible([]string{"--bogus"}); code != 2 {
+		t.Errorf("cmdManifestAnsible(--bogus) = %d, want 2 (parse error)", code)
+	}
+}
+
+// TestCmdManifestAnsible_NonexistentManifest pins the load-error
+// path (exit 3, "load:" prefix).
+func TestCmdManifestAnsible_NonexistentManifest(t *testing.T) {
+	prevStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = prevStderr })
+	code := cmdManifestAnsible([]string{
+		"--manifest-file=/nonexistent/manifest.yaml",
+		"--output-dir=" + t.TempDir(),
+	})
+	_ = w.Close()
+	var buf bytes.Buffer
+	tmp := make([]byte, 1024)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = r.Close()
+	if code != 3 {
+		t.Errorf("cmdManifestAnsible(bad manifest) = %d, want 3 (load error)", code)
+	}
+	if !strings.Contains(buf.String(), "manifest ansible: load:") {
+		t.Errorf("stderr missing load diagnostic: %q", buf.String())
 	}
 }
