@@ -1,28 +1,30 @@
--- filename: 00347_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
-
--- 00347_reserve_slot.sql — reservation fence.
+-- filename: 00347_reserve_slot.sql
 --
--- This slot is fenced by Mega-C (issue #961, PR-1 + PR-2). The
--- Mega-C work needs slots 00353 (PR-1 preview_destroy_commented_at)
--- and 00354 (PR-2 deployments_rollback_on_5xx), which already live
--- on this branch. Slots 00347-00352 are fenced here with distinct
--- comment blocks pointing to issue #961 so the cross-PR slot gate
--- (memory: cross-pr-slot-gate-reservation-fence-pattern) and the
--- fence-deletion hazard (memory: cross-pr-rebase-fence-deletion-hazard)
--- do not delete the wrong copy on merge — fences with distinct
--- comment blocks survive a cherry-pick. PRs #1030/#1034/#1036 each
--- claim 00347 on their own branches with their own comment blocks;
--- the merge-order gate handles the dedupe.
+-- Slot fence (issue #72 / ADR-125 traffic mirroring, PR-A1).
+-- Reserve slot 00347 so this PR's first real migration (00348_mirror_rules)
+-- stays contiguous with main's 00346_deployments_annotation (PR #984)
+-- and 00349..00351 below land as a single contiguous block. Without
+-- this fence, TestMigrationsContiguous at migrations/embed_test.go
+-- would fail with "migration slot 347 is missing" on this PR's CI.
+--
+-- Why we can't use the upstream 00347 slot: a non-main PR (per-service
+-- wire-protocol selector, ADR-124 on a different branch) holds that
+-- slot for `apps.app_protocol`. If that PR merges before this one,
+-- the slot will be claimed by their real migration and this fence
+-- will fail CI's uniqueness check. In that case the rebase recipe
+-- is: drop 00347_reserve_slot.sql + renumber 00348→00347. The
+-- same 00348_absorb_main_00347 fence pattern is documented in
+-- memory: cross-pr-slot-precheck-fence-blindspot.
+--
+-- This file is intentionally a no-op: no schema, no rows, no
+-- triggers. The goose embed_test counts it by filename prefix only.
+-- +goose StatementEnd
 
-SELECT 1;
-
+-- +goose StatementBegin
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-
-SELECT 1;
-
 -- +goose StatementEnd
