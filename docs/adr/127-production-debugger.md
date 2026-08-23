@@ -21,7 +21,7 @@ Cloud Run ships `request_log` + `traces` for the same diagnosis. The data plane 
 
 ### 1. New `request_telemetry` table
 
-Migration `00387_request_telemetry.sql`. Schema:
+Migration `00411_request_telemetry.sql`. Schema:
 
 ```sql
 CREATE TABLE public.request_telemetry (
@@ -167,7 +167,7 @@ Issue #517 closed the wake timeline. Issue #477 closed consumer_keys. The mirror
 - **Negative**: cardinality on the latency histogram. Mitigated by `deploymentLabelSet` cap. Scale plan can hit the cap; overflow collapses to `__other__`, surfaces in a panel.
 - **Negative**: customer OTel ingest opens a new auth surface (`/v1/otel/v1/traces`). Mitigated by `api_keys` validation via loopback RPC; per-account rate limit; span count cap.
 - **Compatibility**: additive — no existing endpoint, table, or wire field changes. The recorder hot path is one extra call at `Handler.observe`; the histogram label set widens (Prometheus rollups for `{app, class}` continue to work as `deployment="*"` aggregates).
-- **Migration**: one new table (`00387_request_telemetry.sql`), replay-safe. Slot 387 confirmed unowned (only PR #1024 and PR #1049 hold reservations at that slot; reservations carve-out per `scripts/ci/check_migration_slots.sh`).
+- **Migration**: one new table (`00411_request_telemetry.sql`), replay-safe. Slot 387 confirmed unowned (only PR #1024 and PR #1049 hold reservations at that slot; reservations carve-out per `scripts/ci/check_migration_slots.sh`).
 - **Tests**: recorder unit tests (`pkg/gateway/request_telemetry_test.go`); apid handler tests (`cmd/apid/handlers_debug_telemetry_test.go`) using `state.MemStore` per `handlers_invocations_test.go:42-72`; cardinality invariant test (`metrics_cardinality_test.go` extension); sqlc partition pruning test.
 
 ## Rejected alternatives
@@ -191,7 +191,7 @@ Issue #517 closed the wake timeline. Issue #477 closed consumer_keys. The mirror
 
 ## Critical files
 
-- `migrations/00387_request_telemetry.sql` — NEW
+- `migrations/00411_request_telemetry.sql` — NEW
 - `pkg/api/limits.go` — extend with `DebugTelemetryEnabled`, `DebugTelemetryRetentionDays`, `DebugTelemetryRequestsPerMinute`, `DebugTelemetryDeploymentsPerApp`, `DebugTelemetrySpansPerTrace`
 - `pkg/api/errors.go` — extend with `CodeDebugQuotaReached`, `CodeDebugFeatureGated`, `CodeDebugReplayUnsupported`
 - `pkg/api/debug_telemetry.go` — NEW, request/response DTOs

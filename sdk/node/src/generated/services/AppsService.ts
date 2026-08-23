@@ -12,6 +12,7 @@ import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
 import type { AppStreamingStatus } from '../models/AppStreamingStatus.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
+import type { DebugTelemetryListResponse } from '../models/DebugTelemetryListResponse.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
 import type { UpdateAppRequest } from '../models/UpdateAppRequest.js';
 import type { WakeTimelineResponse } from '../models/WakeTimelineResponse.js';
@@ -549,6 +550,64 @@ export class AppsService {
       },
       errors: {
         401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app request telemetry (ADR-127 / PR-A).
+   * Recent request rows for an app — status, latency_ms, route,
+   * method, deployment_id, cold_boot, trace_id, received_at.
+   * PR-A ships the read endpoint only; the write-side (publisher
+   * → gRPC IncrementRequestTelemetry → apid receiver → sqlc
+   * INSERT) lands in PR-B. The endpoint is plan-gated by
+   * `DebugTelemetryEnabled` (Free off; Hobby/Pro/Scale on).
+   * The window is clamped to `DebugTelemetryRetentionDays`
+   * (Hobby 3d, Pro 7d, Scale 14d). When the clamp fires, the
+   * effective `since` is returned in the response so the
+   * dashboard can render a "you widened past the cap" tile.
+   * Returns 200 with `requests: []` when no rows exist in the
+   * window — never 404. Cross-account slug is 404 (IDOR-safe;
+   * byte-identical to "no such app").
+   *
+   * @returns DebugTelemetryListResponse Page of recent request telemetry rows.
+   * @throws ApiError
+   */
+  public static listAppDebugRequests({
+    slug,
+    since,
+    limit,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Duration or 'Nd' alias. Defaults to `24h`. Clamped to plan's `DebugTelemetryRetentionDays`.
+     */
+    since?: string | null,
+    /**
+     * Page size, default 20, max 200.
+     */
+    limit?: number | null,
+  }): CancelablePromise<DebugTelemetryListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/debug/requests',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'since': since,
+        'limit': limit,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
         404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).

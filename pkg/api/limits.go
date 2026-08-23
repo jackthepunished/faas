@@ -1522,11 +1522,11 @@ var planLimits = map[Plan]Limits{
 		// handler returns 402 ErrPlanFeatureGated before the store
 		// is touched; the 0/0/0/0 here is the fail-closed
 		// defence-in-depth value the store still reads.
-		DebugTelemetryEnabled:                false,
-		DebugTelemetryRetentionDays:          0,
-		DebugTelemetryRequestsPerMinute:      0,
-		DebugTelemetryDeploymentsPerApp:      0,
-		DebugTelemetrySpansPerTrace:          0,
+		DebugTelemetryEnabled:           false,
+		DebugTelemetryRetentionDays:     0,
+		DebugTelemetryRequestsPerMinute: 0,
+		DebugTelemetryDeploymentsPerApp: 0,
+		DebugTelemetrySpansPerTrace:     0,
 	},
 	PlanHobby: {
 		Plan:                  PlanHobby,
@@ -1854,11 +1854,11 @@ var planLimits = map[Plan]Limits{
 		// trace. The Hobby customer is debugging a single Hobby
 		// app — the 3-day cap matches the log-archive retention
 		// (spec §4.7).
-		DebugTelemetryEnabled:                true,
-		DebugTelemetryRetentionDays:          3,
-		DebugTelemetryRequestsPerMinute:      1000,
-		DebugTelemetryDeploymentsPerApp:      10,
-		DebugTelemetrySpansPerTrace:          50,
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     3,
+		DebugTelemetryRequestsPerMinute: 1000,
+		DebugTelemetryDeploymentsPerApp: 10,
+		DebugTelemetrySpansPerTrace:     50,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,
@@ -2156,11 +2156,11 @@ var planLimits = map[Plan]Limits{
 		// in the histogram, 200 spans per trace. The 7-day
 		// retention matches the spec §4.7 "incident window"
 		// for the Pro plan.
-		DebugTelemetryEnabled:                true,
-		DebugTelemetryRetentionDays:          7,
-		DebugTelemetryRequestsPerMinute:      10000,
-		DebugTelemetryDeploymentsPerApp:      50,
-		DebugTelemetrySpansPerTrace:          200,
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     7,
+		DebugTelemetryRequestsPerMinute: 10000,
+		DebugTelemetryDeploymentsPerApp: 50,
+		DebugTelemetrySpansPerTrace:     200,
 	},
 	PlanScale: {
 		Plan:                  PlanScale,
@@ -2488,11 +2488,11 @@ var planLimits = map[Plan]Limits{
 		// deploymentLabelSet discipline load-bearing (without the
 		// cap a fleet with thousands of historical deployments
 		// would blow up Prometheus cardinality).
-		DebugTelemetryEnabled:                true,
-		DebugTelemetryRetentionDays:          14,
-		DebugTelemetryRequestsPerMinute:      50000,
-		DebugTelemetryDeploymentsPerApp:      200,
-		DebugTelemetrySpansPerTrace:          1000,
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     14,
+		DebugTelemetryRequestsPerMinute: 50000,
+		DebugTelemetryDeploymentsPerApp: 200,
+		DebugTelemetrySpansPerTrace:     1000,
 	},
 }
 

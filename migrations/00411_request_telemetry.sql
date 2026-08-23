@@ -1,4 +1,4 @@
--- filename: 00387_request_telemetry.sql
+-- filename: 00411_request_telemetry.sql
 -- +goose Up
 -- +goose StatementBegin
 --

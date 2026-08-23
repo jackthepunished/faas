@@ -96,6 +96,8 @@ export type { DailyUsageListResponse } from './models/DailyUsageListResponse.js'
 export type { DailyUsageResponse } from './models/DailyUsageResponse.js';
 export type { DataUpstreamListResponse } from './models/DataUpstreamListResponse.js';
 export type { DataUpstreamResponse } from './models/DataUpstreamResponse.js';
+export type { DebugTelemetryListResponse } from './models/DebugTelemetryListResponse.js';
+export type { DebugTelemetryRequestItem } from './models/DebugTelemetryRequestItem.js';
 export type { DelayedTaskRequest } from './models/DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './models/DelayedTaskResponse.js';
 export type { DeploymentHealthcheck } from './models/DeploymentHealthcheck.js';
