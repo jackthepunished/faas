@@ -1,4 +1,4 @@
--- filename: 00387_openapi_import.sql
+-- filename: 00409_openapi_import.sql
 -- +goose Up
 -- +goose StatementBegin
 

@@ -1,7 +1,7 @@
 package main
 
 // Handler tests for the per-app OpenAPI Import + Auto-Generation
-// surface (ADR-126 / issue #975 item #2, slot 00387). The
+// surface (ADR-126 / issue #975 item #2, slot 00409). The
 // surface:
 //
 //   GET    /v1/apps/{slug}/openapi?source=manual_import|auto
