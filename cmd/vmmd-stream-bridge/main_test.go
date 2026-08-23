@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -663,5 +665,74 @@ func TestMain_ServerHardeners(t *testing.T) {
 	}
 	if srv.WriteTimeout != 0 {
 		t.Errorf("srv.WriteTimeout = %v, want 0 (streaming SSE/long-poll requires no write deadline)", srv.WriteTimeout)
+	}
+}
+
+// TestNewHandler_FramingSlog (ADR-127 §D3, Layer 7) pins the
+// per-request framing-selection slog line at Info level. The
+// test swaps slog's default JSON handler for a bytes.Buffer
+// capture, dispatches a synthetic request to newHandler, and
+// asserts the buffer contains a single line with the expected
+// framing + method + path fields.
+//
+// Why Info (not Debug): the framing selection IS the operator's
+// primary rollback signal (docs/ops/h2c-rollback.md references
+// this log line in the surgical-rollback steps). An operator
+// running `journalctl -u vmmd | grep framing selected` while
+// reacting to the FaasBridgeFramingMismatch alert needs the
+// line to surface in journald's default level (info).
+func TestNewHandler_FramingSlog(t *testing.T) {
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+	defer func() { slog.SetDefault(origLogger) }()
+
+	// Force the h2c framing path so the test asserts the h2c
+	// branch of the slog line. The h1 branch is symmetrical
+	// (same fields, different framing value) and not worth a
+	// second test.
+	t.Setenv("FAAS_BRIDGE_PROTOCOL", "h2c")
+
+	// newHandler captures the framing + writes the slog line
+	// before dispatching. The dispatch would normally hit
+	// handleH2CStream which dials the guest — to keep the
+	// test deterministic, we run the handler against a closed
+	// TCP port (the dial fails, the handler returns, but the
+	// slog line has already been written).
+	h := newHandler("127.0.0.1", 1, time.Now().Add(time.Minute))
+	req := httptest.NewRequest("GET", "/foo?bar=1", nil)
+	rw := &httptest.ResponseRecorder{}
+	h.ServeHTTP(rw, req)
+
+	// Parse the JSON log line + assert the framing-related
+	// fields. slog emits one line per call; buf should have
+	// exactly one.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly one slog line, got %d (buf = %q)", len(lines), buf.String())
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("parse slog JSON: %v (line = %q)", err, lines[0])
+	}
+	if msg, _ := rec["msg"].(string); msg != "vmmd-stream-bridge: framing selected" {
+		t.Errorf("msg = %q, want %q", msg, "vmmd-stream-bridge: framing selected")
+	}
+	if framing, _ := rec["framing"].(string); framing != "h2c" {
+		t.Errorf("framing = %q, want %q (FAAS_BRIDGE_PROTOCOL=h2c dispatch)", framing, "h2c")
+	}
+	if method, _ := rec["method"].(string); method != "GET" {
+		t.Errorf("method = %q, want %q", method, "GET")
+	}
+	if path, _ := rec["path"].(string); path != "/foo" {
+		t.Errorf("path = %q, want %q (raw request path, no querystring)", path, "/foo")
+	}
+	if appProtoEnv, _ := rec["app_protocol_env"].(string); appProtoEnv != "h2c" {
+		t.Errorf("app_protocol_env = %q, want %q", appProtoEnv, "h2c")
+	}
+	if guest, _ := rec["guest"].(string); guest != "127.0.0.1:1" {
+		t.Errorf("guest = %q, want %q", guest, "127.0.0.1:1")
 	}
 }

@@ -33,6 +33,13 @@ const (
 	framingH2C bridgeFraming = "h2c"
 )
 
+// String implements fmt.Stringer so structured-log fields carry
+// the operator-facing name (ADR-127 §D3 Layer 7 — the
+// framing-selection slog line in main.go::newHandler). Returning
+// the underlying string is intentional: the type's primitive
+// representation IS the operator-facing representation.
+func (f bridgeFraming) String() string { return string(f) }
+
 // currentBridgeFraming returns the per-stream framing selection
 // from FAAS_BRIDGE_PROTOCOL. The lookup is per-request, NOT
 // captured at package init, mirroring the FAAS_STREAM_BRIDGE_VERSION

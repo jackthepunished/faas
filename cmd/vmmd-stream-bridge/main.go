@@ -93,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -273,6 +274,24 @@ func main() {
 func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		framing := currentBridgeFraming()
+		// ADR-127 §D3 (Layer 7) — framing-selection slog line.
+		// One Info-level line per request so an operator can
+		// confirm the FAAS_BRIDGE_PROTOCOL env flip + the
+		// bridge's gatewayd-internal upstream agreed on the
+		// wire shape. Promoted from Debug to Info because the
+		// framing selection IS the operator's primary rollback
+		// signal (docs/ops/h2c-rollback.md references this
+		// log line in the surgical-rollback steps). Captured at
+		// INFO rather than per-request by the structured-log
+		// dispatch, so high-volume traffic does not flood
+		// journald.
+		slog.Info("vmmd-stream-bridge: framing selected",
+			"framing", framing.String(),
+			"app_protocol_env", os.Getenv("FAAS_BRIDGE_PROTOCOL"),
+			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
+			"method", r.Method,
+			"path", r.URL.Path,
+		)
 		switch framing {
 		case framingH2C:
 			handleH2CStream(w, r, guestIP, guestPort, deadline)
