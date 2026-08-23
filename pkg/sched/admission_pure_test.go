@@ -1,0 +1,94 @@
+// admission_pure_test.go — fill pkg/sched/admission.go coverage of
+// the pure / no-store-required helper surface. Targets
+// ConcurrencyForDeployment (0% in baseline) and the
+// empty/non-empty/negative-clamp branches of HeadroomMB.
+//
+// Whitebox `package sched`.
+
+package sched
+
+import (
+	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
+)
+
+// newTestLedger constructs a NodeLedger with the maps initialized
+// so the helpers under test don't have to handle nil maps.
+func newTestLedger() *NodeLedger {
+	return &NodeLedger{
+		resident:         map[string]*nodeReservation{},
+		perApp:           map[string]int{},
+		perAppDeployment: map[string]int{},
+		entries:          map[string]*reservation{},
+	}
+}
+
+func TestNodeLedger_ConcurrencyForDeployment_EmptyIDs(t *testing.T) {
+	l := newTestLedger()
+	if got := l.ConcurrencyForDeployment("", ""); got != 0 {
+		t.Errorf("both empty: got %d, want 0", got)
+	}
+	if got := l.ConcurrencyForDeployment("app-1", ""); got != 0 {
+		t.Errorf("empty dep: got %d, want 0", got)
+	}
+	if got := l.ConcurrencyForDeployment("", "dep-1"); got != 0 {
+		t.Errorf("empty app: got %d, want 0", got)
+	}
+}
+
+func TestNodeLedger_ConcurrencyForDeployment_Hit(t *testing.T) {
+	l := newTestLedger()
+	// Reach into the unexported field directly (whitebox).
+	l.perAppDeployment["app-1\x00dep-1"] = 3
+	if got := l.ConcurrencyForDeployment("app-1", "dep-1"); got != 3 {
+		t.Errorf("got %d, want 3", got)
+	}
+}
+
+func TestNodeLedger_ConcurrencyForDeployment_Miss(t *testing.T) {
+	l := newTestLedger()
+	if got := l.ConcurrencyForDeployment("app-1", "dep-1"); got != 0 {
+		t.Errorf("miss: got %d, want 0", got)
+	}
+}
+
+// --- HeadroomMB ----------------------------------------------------
+
+func TestNodeLedger_HeadroomMB_EmptyReturnsCeiling(t *testing.T) {
+	l := newTestLedger()
+	// Empty resident map → back-compat branch returns the
+	// global ceiling.
+	if got := l.HeadroomMB(); got != api.RAMAdmissionCeilingMB {
+		t.Errorf("empty: got %d, want %d", got, api.RAMAdmissionCeilingMB)
+	}
+}
+
+func TestNodeLedger_HeadroomMB_NonEmptySumsNodeHeadroom(t *testing.T) {
+	l := newTestLedger()
+	// ceiling for one node, with 100 MB resident → head = ceiling - 100.
+	const nodeID = "node-A"
+	l.resident[nodeID] = &nodeReservation{residentRAM: 100, usedVCPU: 2}
+	got := l.HeadroomMB()
+	// Compute the expected ceiling via the unexported helper and
+	// subtract the resident.
+	want := l.ceilingForNode_locked(nodeID, api.Limits{}) - 100
+	if got != want {
+		t.Errorf("got %d, want %d", got, want)
+	}
+	if got < 0 {
+		t.Error("got negative headroom")
+	}
+}
+
+func TestNodeLedger_HeadroomMB_ClampsNegativeToZero(t *testing.T) {
+	// Pin the defensive clamp at zero: the per-node view can go
+	// negative if a Release races ahead of the resident accounting.
+	// HeadroomMB clamps it.
+	l := newTestLedger()
+	l.resident["node-A"] = &nodeReservation{residentRAM: 1 << 30, usedVCPU: 1}
+	got := l.HeadroomMB()
+	if got != 0 {
+		t.Errorf("got %d, want 0 (clamped)", got)
+	}
+}
