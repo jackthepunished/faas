@@ -746,7 +746,7 @@ export class DeploymentsService {
         403: `\`403 Forbidden\` — the caller's MFA factor or scope
         does not satisfy the deploy-write surface.
         `,
-        404: `Deployment row missing or cross-account probe (IDOR-safe; never 403).`,
+        404: `Retry requested on a missing or cross-account deployment (IDOR-safe; never 403).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
@@ -799,7 +799,7 @@ export class DeploymentsService {
       },
       errors: {
         401: `code: unauthorized`,
-        404: `Deployment row missing or cross-account probe (IDOR-safe; never 403).`,
+        404: `Deployment row missing or cross-account probe on the preview URL seam (IDOR-safe; never 403).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
