@@ -61,13 +61,13 @@ func TestPg_CountFailedDeploymentsSince_OnlyFailedCount(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	acctID, appID := seedTestAccount(t, s, ctx, "fdep-count")
 
-	// One failed + one successful + one queued in the last hour.
+	// One failed + one live + one pending in the last hour.
 	// Only the failed one must count.
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, source, image, status, manifest, created_at)
-		values (gen_random_uuid(), $1, 'tarball', 'img@sha256:0', 'failed', '{}'::jsonb, now() - interval '5 minutes'),
-		       (gen_random_uuid(), $1, 'tarball', 'img@sha256:0', 'succeeded', '{}'::jsonb, now() - interval '5 minutes'),
-		       (gen_random_uuid(), $1, 'tarball', 'img@sha256:0', 'queued',    '{}'::jsonb, now() - interval '5 minutes')`,
+		insert into deployments (id, app_id, image_digest, status, created_at)
+		values (gen_random_uuid(), $1, 'img@sha256:0', 'failed',  now() - interval '5 minutes'),
+		       (gen_random_uuid(), $1, 'img@sha256:0', 'live',    now() - interval '5 minutes'),
+		       (gen_random_uuid(), $1, 'img@sha256:0', 'pending', now() - interval '5 minutes')`,
 		appID); err != nil {
 		t.Fatalf("insert deployments: %v", err)
 	}
@@ -85,8 +85,8 @@ func TestPg_CountFailedDeploymentsSince_EmptyAppArgMeansAccountScope(t *testing.
 	acctID, appID := seedTestAccount(t, s, ctx, "fdep-account")
 
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, source, image, status, manifest, created_at)
-		values (gen_random_uuid(), $1, 'tarball', 'img@sha256:0', 'failed', '{}'::jsonb, now() - interval '5 minutes')`,
+		insert into deployments (id, app_id, image_digest, status, created_at)
+		values (gen_random_uuid(), $1, 'img@sha256:0', 'failed', now() - interval '5 minutes')`,
 		appID); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
@@ -119,8 +119,8 @@ func TestPg_WasInvokedSuccessfullySince_TrueOnSuccess(t *testing.T) {
 	acctID, appID := seedTestAccount(t, s, ctx, "wiss-true")
 
 	if _, err := pool.Exec(ctx, `
-		insert into invocations (id, account_id, app_id, state, request_id, created_at)
-		values (gen_random_uuid(), $1, $2, 'succeeded', gen_random_uuid(), now() - interval '5 minutes')`,
+		insert into invocations (id, account_id, app_id, source, state, created_at)
+		values (gen_random_uuid(), $1, $2, 'async_invoke', 'completed', now() - interval '5 minutes')`,
 		acctID, appID); err != nil {
 		t.Fatalf("insert invocation: %v", err)
 	}

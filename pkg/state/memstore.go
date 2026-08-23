@@ -617,28 +617,28 @@ func NewMemStore() *MemStore {
 		// issue #72 / ADR-125: mirror-rules and mirror-results
 		// stores. Empty until the first create; the per-app count
 		// in CreateMirrorRuleIfUnderQuota walks the map.
-		mirrorRules:          map[string]MirrorRule{},
-		mirrorResults:        map[string]MirrorInvocationResult{},
-		domains:              map[string]CustomDomain{},
-		doctorObs:            map[string]DomainDoctorObservation{},
-		crons:                map[string]Cron{},
-		fireNowRequests:      map[string]FireNowRequest{},
-		alertRules:           map[string]AlertRule{},
-		alertDeliveries:      map[string]AlertDelivery{},
-		appWebhooks:          map[string]AppWebhook{},
-		appWebhookDeliveries: map[string]AppWebhookDelivery{},
-		alertClaimKeys:       map[string]time.Time{},
-		edgeRules:            map[string]EdgeRule{},
-		corsPresets:          map[string]CorsPreset{},
-		openAPIDocs:          map[string]openAPIDocRow{},
+		mirrorRules:                   map[string]MirrorRule{},
+		mirrorResults:                 map[string]MirrorInvocationResult{},
+		domains:                       map[string]CustomDomain{},
+		doctorObs:                     map[string]DomainDoctorObservation{},
+		crons:                         map[string]Cron{},
+		fireNowRequests:               map[string]FireNowRequest{},
+		alertRules:                    map[string]AlertRule{},
+		alertDeliveries:               map[string]AlertDelivery{},
+		appWebhooks:                   map[string]AppWebhook{},
+		appWebhookDeliveries:          map[string]AppWebhookDelivery{},
+		alertClaimKeys:                map[string]time.Time{},
+		edgeRules:                     map[string]EdgeRule{},
+		corsPresets:                   map[string]CorsPreset{},
+		openAPIDocs:                   map[string]openAPIDocRow{},
 		// ADR-126 / issue #975 item #2 — per-app OpenAPI imports.
 		// Keyed by app_id (one row per app, last-write-wins via
 		// the existing overwrite-not-insert contract). Same IDOR
 		// floor at the read methods as the pg path.
-		openAPIImports: map[string]appOpenAPIImportRow{},
-		alertPresets:                     map[string]AlertPreset{},
-		accountSpendSnapshots:            map[string]AccountSpendSnapshot{},
-		tenantSurfaceCertExpiryStates:    map[string]TenantSurfaceCertExpiryState{},
+		openAPIImports:                map[string]appOpenAPIImportRow{},
+		alertPresets:                  map[string]AlertPreset{},
+		accountSpendSnapshots:         map[string]AccountSpendSnapshot{},
+		tenantSurfaceCertExpiryStates: map[string]TenantSurfaceCertExpiryState{},
 		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
