@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AppOpenAPIImportDryRunResponse } from '../models/AppOpenAPIImportDryRunResponse.js';
+import type { AppOpenAPIImportResponse } from '../models/AppOpenAPIImportResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -79,7 +81,7 @@ export class OpenapiImportService {
    * cap state.OpenAPIImportMaxEndpoints (50). Per-account
    * row cap is Plan.OpenAPIImportsPerAccount.
    *
-   * @returns any Stored.
+   * @returns AppOpenAPIImportResponse Stored.
    * @throws ApiError
    */
   public static importAppOpenApi({
@@ -98,15 +100,7 @@ export class OpenapiImportService {
       info: Record<string, any>;
       paths: Record<string, any>;
     },
-  }): CancelablePromise<{
-    app_id: string;
-    source: 'manual_import';
-    openapi_version: string;
-    endpoint_count: number;
-    byte_size: number;
-    captured_at: string;
-    updated_at: string;
-  }> {
+  }): CancelablePromise<AppOpenAPIImportResponse> {
     return __request(OpenAPI, {
       method: 'POST',
       url: '/v1/apps/{slug}/openapi',
@@ -166,7 +160,7 @@ export class OpenapiImportService {
    * + Action back into the existing create-edge-rule endpoint
    * (item #2 D3). Does NOT persist; does NOT emit pg_notify.
    *
-   * @returns any Dry-run suggestions.
+   * @returns AppOpenAPIImportDryRunResponse Dry-run suggestions.
    * @throws ApiError
    */
   public static dryRunAppOpenApi({
@@ -182,17 +176,7 @@ export class OpenapiImportService {
       info: Record<string, any>;
       paths: Record<string, any>;
     },
-  }): CancelablePromise<{
-    app_id: string;
-    openapi_version: string;
-    endpoint_count: number;
-    suggestions: Array<{
-      path: string;
-      methods: Array<'get' | 'post' | 'put' | 'patch' | 'delete'>;
-      kind: 'validate';
-      action: Record<string, any>;
-    }>;
-  }> {
+  }): CancelablePromise<AppOpenAPIImportDryRunResponse> {
     return __request(OpenAPI, {
       method: 'POST',
       url: '/v1/apps/{slug}/openapi/dry-run',

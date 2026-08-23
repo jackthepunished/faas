@@ -6,30 +6,38 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.dry_run_app_open_api_response_200_suggestions_item_kind import (
-    DryRunAppOpenAPIResponse200SuggestionsItemKind,
-    check_dry_run_app_open_api_response_200_suggestions_item_kind,
-)
-from ..models.dry_run_app_open_api_response_200_suggestions_item_methods_item import (
-    DryRunAppOpenAPIResponse200SuggestionsItemMethodsItem,
-    check_dry_run_app_open_api_response_200_suggestions_item_methods_item,
+from ..models.edge_rule_suggestion_kind import EdgeRuleSuggestionKind, check_edge_rule_suggestion_kind
+from ..models.edge_rule_suggestion_methods_item import (
+    EdgeRuleSuggestionMethodsItem,
+    check_edge_rule_suggestion_methods_item,
 )
 
 if TYPE_CHECKING:
-    from ..models.dry_run_app_open_api_response_200_suggestions_item_action import (
-        DryRunAppOpenAPIResponse200SuggestionsItemAction,
-    )
+    from ..models.edge_rule_suggestion_action import EdgeRuleSuggestionAction
 
 
-T = TypeVar("T", bound="DryRunAppOpenAPIResponse200SuggestionsItem")
+T = TypeVar("T", bound="EdgeRuleSuggestion")
 
 
 @_attrs_define
-class DryRunAppOpenAPIResponse200SuggestionsItem:
+class EdgeRuleSuggestion:
+    """Single read-only candidate row in the dry-run response
+    (issue #975 item #2 D3 / ADR-126). Mirrors the
+    create-edge-rule request body fields so the customer can
+    copy-paste the suggestion into the existing endpoint.
+    `kind` + `action` union shape matches the existing
+    `EdgeRule*Action` types in `pkg/api/dto.go`.
+
+    """
+
     path: str
-    methods: list[DryRunAppOpenAPIResponse200SuggestionsItemMethodsItem]
-    kind: DryRunAppOpenAPIResponse200SuggestionsItemKind
-    action: DryRunAppOpenAPIResponse200SuggestionsItemAction
+    """Operation path (e.g. `/users/{id}`)."""
+    methods: list[EdgeRuleSuggestionMethodsItem]
+    """HTTP methods the suggestion applies to."""
+    kind: EdgeRuleSuggestionKind
+    """Edge-rule kind the suggestion produces."""
+    action: EdgeRuleSuggestionAction
+    """Action payload (matches EdgeRule*Action types)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,9 +67,7 @@ class DryRunAppOpenAPIResponse200SuggestionsItem:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.dry_run_app_open_api_response_200_suggestions_item_action import (
-            DryRunAppOpenAPIResponse200SuggestionsItemAction,
-        )
+        from ..models.edge_rule_suggestion_action import EdgeRuleSuggestionAction
 
         d = dict(src_dict)
         path = d.pop("path")
@@ -69,23 +75,23 @@ class DryRunAppOpenAPIResponse200SuggestionsItem:
         methods = []
         _methods = d.pop("methods")
         for methods_item_data in _methods:
-            methods_item = check_dry_run_app_open_api_response_200_suggestions_item_methods_item(methods_item_data)
+            methods_item = check_edge_rule_suggestion_methods_item(methods_item_data)
 
             methods.append(methods_item)
 
-        kind = check_dry_run_app_open_api_response_200_suggestions_item_kind(d.pop("kind"))
+        kind = check_edge_rule_suggestion_kind(d.pop("kind"))
 
-        action = DryRunAppOpenAPIResponse200SuggestionsItemAction.from_dict(d.pop("action"))
+        action = EdgeRuleSuggestionAction.from_dict(d.pop("action"))
 
-        dry_run_app_open_api_response_200_suggestions_item = cls(
+        edge_rule_suggestion = cls(
             path=path,
             methods=methods,
             kind=kind,
             action=action,
         )
 
-        dry_run_app_open_api_response_200_suggestions_item.additional_properties = d
-        return dry_run_app_open_api_response_200_suggestions_item
+        edge_rule_suggestion.additional_properties = d
+        return edge_rule_suggestion
 
     @property
     def additional_keys(self) -> list[str]:

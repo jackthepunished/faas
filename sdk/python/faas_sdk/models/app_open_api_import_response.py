@@ -8,23 +8,45 @@ from uuid import UUID
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.import_app_open_api_response_200_source import (
-    ImportAppOpenAPIResponse200Source,
-    check_import_app_open_api_response_200_source,
+from ..models.app_open_api_import_response_openapi_version import (
+    AppOpenAPIImportResponseOpenapiVersion,
+    check_app_open_api_import_response_openapi_version,
+)
+from ..models.app_open_api_import_response_source import (
+    AppOpenAPIImportResponseSource,
+    check_app_open_api_import_response_source,
 )
 
-T = TypeVar("T", bound="ImportAppOpenAPIResponse200")
+T = TypeVar("T", bound="AppOpenAPIImportResponse")
 
 
 @_attrs_define
-class ImportAppOpenAPIResponse200:
+class AppOpenAPIImportResponse:
+    """Response body for `POST /v1/apps/{slug}/openapi` (issue #975
+    item #2 / ADR-126). One row per app in `app_openapi_docs`,
+    last-write-wins. Source is always `manual_import` — cold-
+    boot captures go to `deployment_openapi_docs` (item #1).
+    `endpoint_count` is the number of HTTP operations in the
+    imported doc's `paths.*`; `byte_size` is the raw body size
+    the handler enforced against
+    `state.OpenAPIImportMaxDocBytes` (256 KiB).
+
+    """
+
     app_id: UUID
-    source: ImportAppOpenAPIResponse200Source
-    openapi_version: str
+    """App UUID the import row is bound to."""
+    source: AppOpenAPIImportResponseSource
+    """Row source. Always `manual_import` for this endpoint."""
+    openapi_version: AppOpenAPIImportResponseOpenapiVersion
+    """OpenAPI spec version the imported doc declares."""
     endpoint_count: int
+    """Number of HTTP operations in the imported doc."""
     byte_size: int
+    """Raw body size in bytes (state.OpenAPIImportMaxDocBytes = 256 KiB)."""
     captured_at: datetime.datetime
+    """First-import timestamp; preserved across re-imports."""
     updated_at: datetime.datetime
+    """Most-recent write timestamp; bumped on every import."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,7 +54,7 @@ class ImportAppOpenAPIResponse200:
 
         source: str = self.source
 
-        openapi_version = self.openapi_version
+        openapi_version: str = self.openapi_version
 
         endpoint_count = self.endpoint_count
 
@@ -63,9 +85,9 @@ class ImportAppOpenAPIResponse200:
         d = dict(src_dict)
         app_id = UUID(d.pop("app_id"))
 
-        source = check_import_app_open_api_response_200_source(d.pop("source"))
+        source = check_app_open_api_import_response_source(d.pop("source"))
 
-        openapi_version = d.pop("openapi_version")
+        openapi_version = check_app_open_api_import_response_openapi_version(d.pop("openapi_version"))
 
         endpoint_count = d.pop("endpoint_count")
 
@@ -75,7 +97,7 @@ class ImportAppOpenAPIResponse200:
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
-        import_app_open_api_response_200 = cls(
+        app_open_api_import_response = cls(
             app_id=app_id,
             source=source,
             openapi_version=openapi_version,
@@ -85,8 +107,8 @@ class ImportAppOpenAPIResponse200:
             updated_at=updated_at,
         )
 
-        import_app_open_api_response_200.additional_properties = d
-        return import_app_open_api_response_200
+        app_open_api_import_response.additional_properties = d
+        return app_open_api_import_response
 
     @property
     def additional_keys(self) -> list[str]:

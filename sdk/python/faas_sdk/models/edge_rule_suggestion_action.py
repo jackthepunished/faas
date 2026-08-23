@@ -6,11 +6,13 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="DryRunAppOpenAPIResponse200SuggestionsItemAction")
+T = TypeVar("T", bound="EdgeRuleSuggestionAction")
 
 
 @_attrs_define
-class DryRunAppOpenAPIResponse200SuggestionsItemAction:
+class EdgeRuleSuggestionAction:
+    """Action payload (matches EdgeRule*Action types)."""
+
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -23,10 +25,10 @@ class DryRunAppOpenAPIResponse200SuggestionsItemAction:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        dry_run_app_open_api_response_200_suggestions_item_action = cls()
+        edge_rule_suggestion_action = cls()
 
-        dry_run_app_open_api_response_200_suggestions_item_action.additional_properties = d
-        return dry_run_app_open_api_response_200_suggestions_item_action
+        edge_rule_suggestion_action.additional_properties = d
+        return edge_rule_suggestion_action
 
     @property
     def additional_keys(self) -> list[str]:

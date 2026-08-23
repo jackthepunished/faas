@@ -33,6 +33,8 @@ export type { AppliedBuild } from './models/AppliedBuild.js';
 export type { ApplyResponse } from './models/ApplyResponse.js';
 export type { AppManifest } from './models/AppManifest.js';
 export type { AppMetricsResponse } from './models/AppMetricsResponse.js';
+export type { AppOpenAPIImportDryRunResponse } from './models/AppOpenAPIImportDryRunResponse.js';
+export type { AppOpenAPIImportResponse } from './models/AppOpenAPIImportResponse.js';
 export type { AppRegistryCredentialListResponse } from './models/AppRegistryCredentialListResponse.js';
 export type { AppRegistryCredentialResponse } from './models/AppRegistryCredentialResponse.js';
 export type { AppResponse } from './models/AppResponse.js';
@@ -123,6 +125,7 @@ export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js'
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
+export type { EdgeRuleSuggestion } from './models/EdgeRuleSuggestion.js';
 export type { EdgeRuleThrottleAction } from './models/EdgeRuleThrottleAction.js';
 export type { EdgeRuleValidateAction } from './models/EdgeRuleValidateAction.js';
 export type { EnvDiffCell } from './models/EnvDiffCell.js';

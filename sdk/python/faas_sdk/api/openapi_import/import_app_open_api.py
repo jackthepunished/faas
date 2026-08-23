@@ -6,8 +6,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.app_open_api_import_response import AppOpenAPIImportResponse
 from ...models.import_app_open_api_body import ImportAppOpenAPIBody
-from ...models.import_app_open_api_response_200 import ImportAppOpenAPIResponse200
 from ...models.problem import Problem
 from ...types import Response
 
@@ -36,9 +36,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | ImportAppOpenAPIResponse200 | Problem | None:
+) -> Any | AppOpenAPIImportResponse | Problem | None:
     if response.status_code == 200:
-        response_200 = ImportAppOpenAPIResponse200.from_dict(response.json())
+        response_200 = AppOpenAPIImportResponse.from_dict(response.json())
 
         return response_200
 
@@ -71,7 +71,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | ImportAppOpenAPIResponse200 | Problem]:
+) -> Response[Any | AppOpenAPIImportResponse | Problem]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -85,7 +85,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: ImportAppOpenAPIBody,
-) -> Response[Any | ImportAppOpenAPIResponse200 | Problem]:
+) -> Response[Any | AppOpenAPIImportResponse | Problem]:
     """Import an OpenAPI document for an app.
 
      Customer-facing import (ADR-126 / issue #975 item #2).
@@ -114,7 +114,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ImportAppOpenAPIResponse200 | Problem]
+        Response[Any | AppOpenAPIImportResponse | Problem]
     """
 
     kwargs = _get_kwargs(
@@ -134,7 +134,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: ImportAppOpenAPIBody,
-) -> Any | ImportAppOpenAPIResponse200 | Problem | None:
+) -> Any | AppOpenAPIImportResponse | Problem | None:
     """Import an OpenAPI document for an app.
 
      Customer-facing import (ADR-126 / issue #975 item #2).
@@ -163,7 +163,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ImportAppOpenAPIResponse200 | Problem
+        Any | AppOpenAPIImportResponse | Problem
     """
 
     return sync_detailed(
@@ -178,7 +178,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: ImportAppOpenAPIBody,
-) -> Response[Any | ImportAppOpenAPIResponse200 | Problem]:
+) -> Response[Any | AppOpenAPIImportResponse | Problem]:
     """Import an OpenAPI document for an app.
 
      Customer-facing import (ADR-126 / issue #975 item #2).
@@ -207,7 +207,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ImportAppOpenAPIResponse200 | Problem]
+        Response[Any | AppOpenAPIImportResponse | Problem]
     """
 
     kwargs = _get_kwargs(
@@ -225,7 +225,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: ImportAppOpenAPIBody,
-) -> Any | ImportAppOpenAPIResponse200 | Problem | None:
+) -> Any | AppOpenAPIImportResponse | Problem | None:
     """Import an OpenAPI document for an app.
 
      Customer-facing import (ADR-126 / issue #975 item #2).
@@ -254,7 +254,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ImportAppOpenAPIResponse200 | Problem
+        Any | AppOpenAPIImportResponse | Problem
     """
 
     return (
