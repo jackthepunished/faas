@@ -741,3 +741,53 @@ func TestNewHandler_FramingSlog(t *testing.T) {
 		t.Errorf("guest = %q, want %q", guest, "127.0.0.1:1")
 	}
 }
+
+// TestNewHandler_BridgeFramingHeader (ADR-127 §D3, Layer 7) pins
+// the X-Faas-Bridge-Framing response header that vmmd's
+// forwardHTTPStreamV2 reads to increment
+// vmmd_bridge_framing_total. The header is set BEFORE dispatch so
+// both handleH1Stream's http.Error BadGateway path and
+// handleH2CStream's http.Error BadGateway path inherit it
+// (stdlib commits w.Header() at WriteHeader time). The test uses a
+// closed TCP port (port 1) so the inner dial fails and the
+// path returns deterministically without writing further.
+//
+// Cross-product: FAAS_BRIDGE_PROTOCOL∈{h1, h2c} × {
+// header-set path }. The h1 branch is the operator's
+// surgical-rollback switch (docs/ops/h2c-rollback.md Switch 1) and
+// the h2c branch is the default-after-promotion shape.
+func TestNewHandler_BridgeFramingHeader(t *testing.T) {
+	cases := []struct {
+		name  string
+		env   string
+		want  string
+	}{
+		{name: "h1_default", env: "h1", want: "h1"},
+		{name: "h2c_promoted", env: "h2c", want: "h2c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FAAS_BRIDGE_PROTOCOL", tc.env)
+			h := newHandler("127.0.0.1", 1, time.Now().Add(time.Minute))
+			req := httptest.NewRequest("GET", "/probe", nil)
+			rw := &httptest.ResponseRecorder{}
+			h.ServeHTTP(rw, req)
+
+			got := rw.Header().Get("X-Faas-Bridge-Framing")
+			if got != tc.want {
+				t.Errorf("X-Faas-Bridge-Framing = %q, want %q (FAAS_BRIDGE_PROTOCOL=%s dispatch)",
+					got, tc.want, tc.env)
+			}
+			// 502 BadGateway is the expected response from both
+			// handleH1Stream and handleH2CStream when the guest
+			// dial at port 1 fails — the dial-failure path
+			// commits the response head but the X-Faas-Bridge-Framing
+			// header we set in newHandler must survive to the
+			// committed head (stdlib snapshots w.Header() at
+			// WriteHeader time, not earlier).
+			if rw.Code != http.StatusBadGateway {
+				t.Errorf("status code = %d, want %d (closed-port dial-fail path)", rw.Code, http.StatusBadGateway)
+			}
+		})
+	}
+}

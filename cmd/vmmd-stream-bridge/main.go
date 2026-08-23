@@ -281,6 +281,20 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 			"method", r.Method,
 			"path", r.URL.Path,
 		)
+		// ADR-127 §D3 (Layer 7) — bridge frames its own framing
+		// decision into the response head so vmmd can increment
+		// vmmd_bridge_framing_total on the read side. The header
+		// is set BEFORE the dispatch to handleH1Stream /
+		// handleH2CStream so both paths inherit it (stdlib honours
+		// pre-write w.Header().Set calls). vmmd's
+		// ForwardHTTPStream v2 path extracts this header on the
+		// other end and computes match/mismatch against
+		// reqInit.AppProtocol via appProtocolToBridgeProtocol. The
+		// header is dropped from the initHeaders sent down the
+		// gRPC stream (it is a control-plane signal, not a guest
+		// response header); see pkg/vmmdgrpc/forward.go loop at
+		// the response-header mirror site.
+		w.Header().Set("X-Faas-Bridge-Framing", framing.String())
 		switch framing {
 		case framingH2C:
 			handleH2CStream(w, r, guestIP, guestPort, deadline)
