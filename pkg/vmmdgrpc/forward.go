@@ -1549,6 +1549,14 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// 8. Mirror guest response headers into the gRPC init frame.
 	initHeaders := make([]*vmmdpb.Header, 0, len(httpResp.Header))
 	for k, vs := range httpResp.Header {
+		// Bridge-side control-plane header (ADR-127 §D3 Layer 7).
+		// The bridge frames its own framing decision here so vmmd
+		// can compute match/mismatch for vmmd_bridge_framing_total.
+		// Stripped from the gRPC init frame — this is a vmmd↔bridge
+		// signal, not a guest response header.
+		if strings.EqualFold(k, "X-Faas-Bridge-Framing") {
+			continue
+		}
 		if strings.EqualFold(k, "Transfer-Encoding") {
 			continue
 		}
@@ -1559,6 +1567,34 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		for _, v := range vs {
 			initHeaders = append(initHeaders, &vmmdpb.Header{Name: k, Value: v})
 		}
+	}
+
+	// 8a. Bridge framing telemetry (ADR-127 §D3 Layer 7). The
+	// bridge writes X-Faas-Bridge-Framing into the response head
+	// (cmd/vmmd-stream-bridge/main.go::newHandler); we read it here
+	// to increment vmmd_bridge_framing_total with the closed
+	// cross-product (app_protocol, bridge_protocol, framing) where
+	// framing ∈ {match, mismatch}. mismatch means
+	// bridge_protocol ≠ appProtocolToBridgeProtocol(app_protocol) —
+	// the operator-forced surgical-rollback signal. This is the
+	// only producer of the counter on the vmmd side; the bridge is
+	// a stand-alone process that doesn't import pkg/wire (counter
+	// lifecycle is owned by vmmd's NewOpsMetrics at boot, commit 9
+	// of PR #1051). Falls back to "unknown" / "h1" if the header
+	// is absent — the guard is defence-in-depth against a bridge
+	// regression that drops the header.
+	appProtocol := reqInit.GetAppProtocol()
+	bridgeProtocol := httpResp.Header.Get("X-Faas-Bridge-Framing")
+	if bridgeProtocol == "" {
+		bridgeProtocol = "unknown"
+	}
+	expected := appProtocolToBridgeProtocol(appProtocol)
+	framingLabel := "match"
+	if bridgeProtocol != expected {
+		framingLabel = "mismatch"
+	}
+	if s.ops != nil {
+		s.ops.BridgeFramingTotal(appProtocol, bridgeProtocol, framingLabel).Inc()
 	}
 	// 8b. Trailers (ADR-126 / G19). For the H1+chunked bridge path
 	// (app_protocol=http1), the guest's H1 `Trailer:` headers arrive
