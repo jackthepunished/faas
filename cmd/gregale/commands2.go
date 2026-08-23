@@ -1758,7 +1758,7 @@ func cmdCrons(args []string) int {
 // cronIDPattern is the 32-hex shape used by the API for cron ids
 // (CronResponse.ID, the path segment of /v1/crons/{id}). Mirrors
 // deploymentIDPattern — same 32-hex convention across the platform.
-var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // renderCronState writes the human multi-line state block for one
 // cron. Routes through io.Writer so tests can capture the body via

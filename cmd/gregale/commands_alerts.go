@@ -402,7 +402,7 @@ func cmdAlertRotateSecret(args []string) int {
 
 // alertIDPattern matches the 32-hex shape apid uses for alert rule
 // ids. Same convention as webhookIDPattern (commands_webhooks.go:342).
-var alertIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var alertIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // formatThreshold renders a float threshold without scientific
 // notation for the table view. Avoids the "%g" default which would

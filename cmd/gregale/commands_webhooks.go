@@ -390,7 +390,7 @@ func cmdWebhookRotateSecret(args []string) int {
 
 // webhookIDPattern matches the 32-hex shape apid uses for webhook
 // ids. Same convention as deploymentIDPattern / cronIDPattern.
-var webhookIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var webhookIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // validAppWebhookEvents is the closed vocabulary accepted by the
 // --event flag. Mirrors the CHECK constraint at

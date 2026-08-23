@@ -1483,7 +1483,11 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, "POST", "http://unix"+reqInit.GetRequestUri(), bodyPr)
+	method := reqInit.GetMethod()
+	if method == "" {
+		method = "POST"
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, method, "http://unix"+reqInit.GetRequestUri(), bodyPr)
 	if err != nil {
 		return status.Errorf(codes.Internal, "build H2C request: %v", err)
 	}
