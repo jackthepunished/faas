@@ -106,7 +106,7 @@ func TestPgReconcile_FullCycle(t *testing.T) {
 		},
 		Tier: reposcan.TierCompose,
 	}
-	out, err := svc.Reconcile(ctx, proj, scan, "sha-pg-1", "main")
+	out, err := svc.Reconcile(ctx, proj, scan, "sha-pg-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestPgReconcile_Quota_BlocksCreateSet(t *testing.T) {
 		},
 		Tier: reposcan.TierCompose,
 	}
-	out, err := svc.Reconcile(ctx, proj, scan, "sha-pg-2", "main")
+	out, err := svc.Reconcile(ctx, proj, scan, "sha-pg-2", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestPgReconcile_ScanSourceUpgrade(t *testing.T) {
 		},
 		Tier: reposcan.TierCompose,
 	}
-	_, err := svc.Reconcile(ctx, proj, scan, "sha-pg-3", "main")
+	_, err := svc.Reconcile(ctx, proj, scan, "sha-pg-3", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

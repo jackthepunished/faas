@@ -18,10 +18,20 @@ import (
 // audit-event allow-list (none today — kinds are plain text per
 // migrations/00001_init.sql:129-136) group on these values.
 const (
-	KindReconcileStarted      = "project.reconcile.started"
-	KindWorkloadAdded         = "project.workload.added"
-	KindWorkloadChanged       = "project.workload.changed"
-	KindWorkloadRemoved       = "project.workload.removed"
+	KindReconcileStarted = "project.reconcile.started"
+	KindWorkloadAdded    = "project.workload.added"
+	KindWorkloadChanged  = "project.workload.changed"
+	KindWorkloadRemoved  = "project.workload.removed"
+	// KindWorkloadSkipped fires once per operator --exclude row at
+	// preview time (cmd/apid.scan_service.emitWorkloadSkippedRow).
+	// The apply path runs the same scan partition so re-emitting
+	// would double-count; preview is the source of truth. SOC 2
+	// CC7.2 ("who deployed v3 and what did they skip?") needs a
+	// durable row per skip — slog alone is not auditable. The
+	// kind sits in the project.workload.<verb> shape so the
+	// audit-events table group-by keeps KindWorkload{Added,
+	// Changed, Removed, Skipped} as a closed set.
+	KindWorkloadSkipped       = "project.workload.skipped"
 	KindReconcileAlert        = "project.reconcile.alert"
 	KindReconcileQuotaBlocked = "project.reconcile.quota_blocked"
 	KindScanSourceChanged     = "project.scan_source_changed"

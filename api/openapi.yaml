@@ -11849,6 +11849,19 @@ components:
         can_apply: { type: boolean }
         crons_not_allowed: { type: boolean }
         plan_token: { type: string, description: "base64-JSON plan token; pass back as ?plan_token= on /v1/projects to skip the second extract." }
+        # ADR-124 can_apply rescue signal (PR-followup ship-blocker
+        # #3). can_apply_pre_exclude mirrors the gate evaluated on the
+        # full scan (pre-`--only`/pre-`--exclude`); gate_rescued_by_
+        # exclude is the diff between pre and post — true when
+        # --exclude flipped a blocked gate to allowed. can_apply_
+        # reasons is the human-readable failure list for the post-
+        # exclude state. All three are omitempty on the wire so
+        # existing --json consumers stay stable.
+        can_apply_pre_exclude: { type: boolean }
+        gate_rescued_by_exclude: { type: boolean }
+        can_apply_reasons:
+          type: array
+          items: { type: string }
         # ADR-124 blast-radius partition. will_deploy + unaffected
         # together enumerate every existing app in the account plus the
         # scan's proposed creates. skipped is the operator-excluded
@@ -11895,6 +11908,12 @@ components:
         can_apply: { type: boolean }
         crons_not_allowed: { type: boolean }
         plan_token: { type: string }
+        # ADR-124 can_apply rescue signal (mirrors PlanResponse).
+        can_apply_pre_exclude: { type: boolean }
+        gate_rescued_by_exclude: { type: boolean }
+        can_apply_reasons:
+          type: array
+          items: { type: string }
         # ADR-124 blast-radius partition (mirrors PlanResponse).
         will_deploy:
           type: array

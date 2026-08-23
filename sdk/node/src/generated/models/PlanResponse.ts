@@ -28,6 +28,9 @@ export type PlanResponse = {
    * base64-JSON plan token; pass back as ?plan_token= on /v1/projects to skip the second extract.
    */
   plan_token: string;
+  can_apply_pre_exclude?: boolean;
+  gate_rescued_by_exclude?: boolean;
+  can_apply_reasons?: Array<string>;
   will_deploy?: Array<PlanAffectedApp>;
   unaffected?: Array<PlanAffectedApp>;
   skipped?: Array<PlanAffectedApp>;

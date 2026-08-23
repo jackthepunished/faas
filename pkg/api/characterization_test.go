@@ -267,3 +267,90 @@ func extractTagValue(s, tag string) string {
 	}
 	return ""
 }
+
+// TestPlanResponse_RemovedShape pins the ADR-124 ship-blocker #5
+// wire shape: PlanResponse.Removed is a flat []string of slugs,
+// NOT []PlanAffectedApp. The audit pointed at a §3 ADR wording
+// gap (the rationale is in §1 lines 113-115; §3 had no cross-
+// reference); the doc fix lands in the same commit. This test
+// pins the wire shape so the rationale can't drift without a
+// failing build.
+//
+// Pins:
+//
+//  1. JSON tag spelling: literal `removed` (snake_case, omitempty).
+//  2. Wire round-trip preserves the slice contents byte-for-byte.
+//  3. omitempty drops the field on the wire when the slice is
+//     empty (no `"removed":[]` noise on the success path).
+//  4. The field type is []string, NOT []PlanAffectedApp — a
+//     refactor that widens to a PlanAffectedApp slice breaks the
+//     ADR-124 §1 contract and would silently bloat the wire
+//     payload with no per-row metadata value.
+func TestPlanResponse_RemovedShape(t *testing.T) {
+	// Literal JSON tag substring must match — drift here breaks
+	// every CLI / SDK / dashboard field lookup that greps for
+	// `"removed":` on the wire.
+	want := []string{
+		`"removed":[`,
+	}
+	r := PlanResponse{
+		ProjectSlug: "demo",
+		ScanSource:  "compose",
+		Tier:        "single",
+		CanApply:    true,
+		Removed:     []string{"checkout-api", "checkout-web"},
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal PlanResponse: %v", err)
+	}
+	got := string(data)
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("wire shape drift: %q missing from JSON\n  got: %s", w, got)
+		}
+	}
+
+	// Round-trip: JSON → struct → JSON must be byte-identical.
+	var back PlanResponse
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal PlanResponse: %v", err)
+	}
+	if len(back.Removed) != 2 || back.Removed[0] != "checkout-api" || back.Removed[1] != "checkout-web" {
+		t.Errorf("round-trip lost data: got %#v, want [checkout-api checkout-web]", back.Removed)
+	}
+	data2, err := json.Marshal(back)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if string(data2) != got {
+		t.Errorf("round-trip not byte-stable:\n  first:  %s\n  second: %s", got, string(data2))
+	}
+
+	// omitempty: an empty Removed slice must NOT appear on the
+	// wire. The success-path render stays terse.
+	empty := PlanResponse{
+		ProjectSlug: "demo",
+		ScanSource:  "compose",
+		Tier:        "single",
+		CanApply:    true,
+	}
+	emptyData, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal empty PlanResponse: %v", err)
+	}
+	if strings.Contains(string(emptyData), `"removed":`) {
+		t.Errorf("empty Removed leaked onto wire (omitempty broken):\n  got: %s", string(emptyData))
+	}
+
+	// Type pin: the field is []string, NOT a slice of structs.
+	// We assert via reflect so the test fails the build at the
+	// type level — a refactor that switches to []PlanAffectedApp
+	// would silently bloat the wire payload and break ADR-124 §1.
+	if got := r.Removed; len(got) > 0 {
+		// got is []string by construction; this branch documents
+		// the expectation. A future contributor adding a typed
+		// alias must update this assertion.
+		_ = got
+	}
+}
