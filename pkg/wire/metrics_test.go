@@ -1208,11 +1208,12 @@ func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
 // TestOpsMetrics_WakeFailurePreinstantiated (issue #1059 / ADR-127)
 // pins the closed (box, app, reason) cartesian for the wake-failure
 // counter at boot (commit 2 of the platform-observability mega-PR
-// extended the counter from {box, reason} to {box, app, reason}).
-// The constructor pre-instantiates every (box, app, reason) tuple
-// for the reserved boxes (labelLocal, otherBoxLabel) × the reserved
+// extended the counter from {box, reason} to {box, app, reason};
+// commit 3 added the 2 schedd-side audit-reason strings). The
+// constructor pre-instantiates every (box, app, reason) tuple for
+// the reserved boxes (labelLocal, otherBoxLabel) × the reserved
 // apps (labelAppUnknown == "", otherAppLabel == "__other__") × every
-// closed reason = 2 × 2 × 8 = 32 series, so the §12 "Wake failures
+// closed reason = 2 × 2 × 10 = 40 series, so the §12 "Wake failures
 // by reason (24h)" dashboard panel surfaces a non-zero baseline
 // from t=0 — the regression that drops the pre-instantiation loop
 // trips here, not in a downstream "missing series" alert.
@@ -1228,6 +1229,8 @@ func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
 		"vsock_fail",
 		"snapshot_restore_err",
 		"mem_backend_err",
+		"vmm_boot_failed",
+		"record_runtime_failed",
 	} {
 		for _, box := range []string{`local`, `__other__`} {
 			for _, app := range []string{``, `__other__`} {
@@ -1308,16 +1311,15 @@ func TestOpsMetrics_WakeFailureNilSafe(t *testing.T) {
 // TestWakeFailure_ClosedCartesian_PreInstantiated (issue #1059 /
 // ADR-127 §3.5 — cluster A commit 2 of the platform-observability
 // mega-PR) pins the (box, app, reason) cartesian at boot. After
-// the per-app wake-failure split, the metric ships 2 reserved
-// boxes × {labelAppUnknown, otherAppLabel} × 8 reasons = 32 series
-// on an idle daemon. The §12 "Wake failures by reason (24h)"
-// dashboard panel depends on the cartesian being complete at t=0
-// — a regression that drops the inner for-loop trips here before
-// it surfaces as a "missing series" alert at 03:00. One
-// representative tuple per (box, app) pair is asserted by line
-// (the per-reason loop is the dimension the dashboard cares
-// about; the cartesian shape is asserted by the COUNT marker
-// below).
+// the per-app wake-failure split and the schedd-side audit-reason
+// addition (cluster A commit 3), the metric ships 2 reserved boxes
+// × {labelAppUnknown, otherAppLabel} × 10 reasons = 40 series on an
+// idle daemon. The §12 "Wake failures by reason (24h)" dashboard
+// panel depends on the cartesian being complete at t=0 — a
+// regression that drops the inner for-loop trips here before it
+// surfaces as a "missing series" alert at 03:00. The COUNT marker
+// below pins the cartesian shape; the per-tuple loop pins the
+// (box, app, reason) ordering.
 func TestWakeFailure_ClosedCartesian_PreInstantiated(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
@@ -1326,6 +1328,7 @@ func TestWakeFailure_ClosedCartesian_PreInstantiated(t *testing.T) {
 	reasons := []string{
 		`snapshot_stale`, `disk_full`, `jailer_fail`, `netns_fail`,
 		`cgroup_fail`, `vsock_fail`, `snapshot_restore_err`, `mem_backend_err`,
+		`vmm_boot_failed`, `record_runtime_failed`,
 	}
 	wantCount := len(boxes) * len(apps) * len(reasons)
 	gotCount := 0

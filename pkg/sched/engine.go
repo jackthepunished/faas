@@ -136,7 +136,18 @@ type Engine struct {
 	notif  Notifier
 	fcVer  string // running Firecracker version — snapshots load only on a match (ADR-005)
 	log    *slog.Logger
-	ops    *wire.OpsMetrics // nil is tolerated by KillStuck (skip the counter increment)
+	// ops is the per-daemon Prometheus registry (issue #1059 /
+	// ADR-127). e.ops.WakeFailure is the schedd-side emitter for
+	// the wake-failure observability surface (cluster A commit 3
+	// of the platform-observability mega-PR) — schedd emits
+	// schedd_wake_failure_total{box, app, reason} from the
+	// audit-reason strings on the vmm_boot_failed (engine.go:2123)
+	// and record_runtime_failed (:2194) error branches. The
+	// closed reason union lives at pkg/wire/metrics.go. ops is
+	// nil-safe — nil is tolerated by KillStuck (skip the
+	// counter increment) and by WakeFailure (nil receiver returns
+	// nil, see pkg/wire/metrics.go).
+	ops *wire.OpsMetrics
 
 	// wakeLimiter is the per-app + per-account admission-rate
 	// throttle (ADR-099 PR-0 / ADR-080 Risk #1). nil is a no-op —
@@ -2124,6 +2135,23 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 				FailedAt:   time.Now().UTC(),
 			})
 		}
+		// issue #1059 / ADR-127 §3.6 — schedd-side parity
+		// (cluster A commit 3 of the platform-observability
+		// mega-PR). The schedd emits schedd_wake_failure_total
+		// with reason="vmm_boot_failed" alongside the events
+		// emit above. The reason literal is from the closed
+		// wakeFailureReasons union (pkg/wire/metrics.go) — the
+		// schedd-side audit-reason vocabulary joins the
+		// vmmd-side classifier vocabulary so a single dashboard
+		// legend covers both. bootInput.appID is the actual app
+		// slug — schedd has the app identifier in scope here
+		// (the audit-reason emit also references it). e.ops is
+		// nil-safe per the field doc comment at engine.go:139 —
+		// the guard skips the metric increment in unit tests
+		// that don't wire an OpsMetrics.
+		if e.ops != nil {
+			e.ops.WakeFailure("local", bootInput.appID, "vmm_boot_failed").Inc()
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "vmm_boot_failed")
 		return WakeResult{}, err
 	}
@@ -2194,6 +2222,17 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 				Reason:     "record_runtime_failed",
 				FailedAt:   time.Now().UTC(),
 			})
+		}
+		// issue #1059 / ADR-127 §3.6 — schedd-side parity
+		// (cluster A commit 3). Same WakeFailure increment as
+		// the vmm_boot_failed branch above; only the reason
+		// literal changes (post-boot SetInstanceRuntime DB write
+		// failed instead of pre-boot vmm.* RPC failed). e.ops
+		// is nil-safe per the field doc comment at
+		// engine.go:139 — the guard skips the metric increment
+		// in unit tests that don't wire an OpsMetrics.
+		if e.ops != nil {
+			e.ops.WakeFailure("local", bootInput.appID, "record_runtime_failed").Inc()
 		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)

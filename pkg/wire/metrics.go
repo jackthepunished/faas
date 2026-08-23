@@ -1504,6 +1504,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// cartesian — same precedent as warmSnapshotErrors above and
 	// writeRedirectTotal's outcome × auth_kind cross product.
 	wakeFailureReasons := []string{
+		// vmmd-side closed vocab (issue #1059 / ADR-127). The
+		// classifier at pkg/fcvm/wake_classify.go maps every
+		// vmmd wake-failure hook site to exactly one of these
+		// eight reasons.
 		"snapshot_stale",
 		"disk_full",
 		"jailer_fail",
@@ -1512,6 +1516,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"vsock_fail",
 		"snapshot_restore_err",
 		"mem_backend_err",
+		// schedd-side audit-reason strings (issue #1059 / ADR-127
+		// §3.6 — schedd parity, cluster A commit 3 of the
+		// platform-observability mega-PR). The schedd's Engine
+		// emits `vmm_boot_failed` from the vmm.Create{Restore,ColdBoot}
+		// RPC error branch and `record_runtime_failed` from the
+		// post-boot SetInstanceRuntime DB-write branch. Both
+		// literals come straight off the events.BootFailed.Reason
+		// field at pkg/sched/engine.go:2123 / :2194 — they are the
+		// existing audit-reason strings, the metric just gains a
+		// counter surface. schedd emits on its own
+		// schedd_wake_failure_total registry (single-registry per
+		// daemon); the cross-daemon reason union is intentional so
+		// dashboards can use a single legend across the fleet.
+		"vmm_boot_failed",
+		"record_runtime_failed",
 	}
 	wakeFailureBoxes := []string{labelLocal, otherBoxLabel}
 	// wakeFailureApps: the per-app pre-instantiation set (issue
@@ -1526,7 +1545,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	wakeFailureApps := []string{labelAppUnknown, otherAppLabel}
 	wakeFailure := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_failure_total",
-		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__), app (admission-bounded, overflow collapses to __other__), and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}. The closed reason set is enforced by pkg/fcvm/wake_classify.go — every wake-failure site maps to exactly one reason. The box label is bounded by maxBoxLabelValues (64) and resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain). The app label is bounded by maxAppLabelValues (256) and resolves to the call site's req.AppSlug — empty input collapses to labelAppUnknown (\"\") to distinguish missing-app-slug calls from real app slugs that hit the admission cap (which collapse to otherAppLabel).",
+		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__), app (admission-bounded, overflow collapses to __other__), and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err, vmm_boot_failed, record_runtime_failed}. The first 8 reasons are the vmmd-side closed vocabulary enforced by pkg/fcvm/wake_classify.go — every vmmd wake-failure hook site maps to exactly one of these. The last 2 reasons (vmm_boot_failed, record_runtime_failed) are schedd-side audit-reason strings emitted from the schedd's Engine wake-error branches at pkg/sched/engine.go:2123 / :2194 — cluster A commit 3 of the platform-observability mega-PR added schedd parity (ADR-127 §3.6). vmmd emits only the first 8; schedd emits only the last 2; the union is pre-instantiated in the constructor so /metrics surfaces zero rows from idle fleet regardless of which daemon hosts the registry. The box label is bounded by maxBoxLabelValues (64) and resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain). The app label is bounded by maxAppLabelValues (256) and resolves to the call site's app identifier — empty input collapses to labelAppUnknown (\"\") to distinguish missing-app-slug calls from real app slugs that hit the admission cap (which collapse to otherAppLabel).",
 	}, []string{"box", "app", "reason"})
 	for _, box := range wakeFailureBoxes {
 		for _, app := range wakeFailureApps {
