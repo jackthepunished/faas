@@ -1366,6 +1366,24 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateEdgeRule))))
 	mux.HandleFunc("DELETE /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteEdgeRule))))
 
+	// Traffic mirroring (issue #72 / ADR-125 PR-A2). Six routes
+	// under /v1/apps/{slug}/mirrors. The path is slug-scoped (not
+	// deployment-id-scoped) so the IDOR guard is the cheaper
+	// s.loadApp path — loadApp resolves to (app, true) only when
+	// app.AccountID == acct.ID. The {id} segment is the mirror
+	// rule's UUID; loadMirrorRuleIfOwned applies the second
+	// cross-account check so a stolen API key cannot probe rule
+	// existence across accounts. PR-A2 ships CRUD only; the
+	// runtime mirror goroutine (PR-A3) listens on the
+	// deployment_changed pg_notify channel for the kind="mirror"
+	// discriminant.
+	mux.HandleFunc("POST /v1/apps/{slug}/mirrors", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.createMirrorRule))))
+	mux.HandleFunc("GET /v1/apps/{slug}/mirrors", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listMirrorRules))))
+	mux.HandleFunc("GET /v1/apps/{slug}/mirrors/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getMirrorRule))))
+	mux.HandleFunc("PATCH /v1/apps/{slug}/mirrors/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateMirrorRule))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/mirrors/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteMirrorRule))))
+	mux.HandleFunc("GET /v1/apps/{slug}/mirrors/{id}/summary", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getMirrorRuleSummary))))
+
 	// Outbound webhooks (issue #476 / ADR-076). CRUD surface under
 	// /v1/apps/{slug}/webhooks mirrors /v1/apps/{slug}/alerts: same
 	// plan-tier gate (Free → 402 plan_webhooks_not_allowed), same
