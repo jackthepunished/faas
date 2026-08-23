@@ -8060,8 +8060,8 @@ func (s *PgStore) ListCertExpiryStateForWalker(ctx context.Context, staleCutoff 
 		select tenant_surface_id, account_id, app_id, hostname,
 		       last_observed_cert_not_after, last_walk_status, last_refreshed_at
 		  from meterd_tenant_surface_cert_expiry_state
-		 where last_refreshed_at >= now() - ($2 || ' seconds')::interval`,
-		staleCutoff)
+		 where last_refreshed_at >= now() - make_interval(secs => $1)`,
+		staleCutoff.Seconds())
 	if err != nil {
 		return nil, err
 	}
