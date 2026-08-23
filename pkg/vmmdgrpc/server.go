@@ -338,7 +338,12 @@ func (s *Server) incWakeFailure(_ context.Context, reason string) {
 	if s == nil || s.ops == nil {
 		return
 	}
-	s.ops.WakeFailure("local", reason).Inc()
+	// app="" collapses to labelAppUnknown via the appLabelSet
+	// admission; commit 4 of the platform-observability mega-PR
+	// threads the actual req.AppSlug through (gRPC handlers don't
+	// carry an app slug at this gRPC-error layer, so the empty
+	// placeholder is correct here).
+	s.ops.WakeFailure("local", "", reason).Inc()
 }
 
 // Register binds s to a gRPC server.

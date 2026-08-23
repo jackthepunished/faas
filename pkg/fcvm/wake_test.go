@@ -144,7 +144,7 @@ func TestWakeTotalFailureNoLeak(t *testing.T) {
 	srv := httptest.NewServer(wireOps.Handler())
 	defer srv.Close()
 	body := getScrapeBody(t, srv.URL)
-	want := `vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 2`
+	want := `vmmd_wake_failure_total{app="",box="local",reason="snapshot_restore_err"} 2`
 	if !strings.Contains(body, want) {
 		t.Errorf("missing %q in metrics scrape body:\n%s", want, body)
 	}

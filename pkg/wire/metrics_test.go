@@ -1206,13 +1206,16 @@ func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
 }
 
 // TestOpsMetrics_WakeFailurePreinstantiated (issue #1059 / ADR-127)
-// pins the closed (box, reason) cartesian for the wake-failure counter
-// at boot. The constructor pre-instantiates every (box, reason) pair
-// for the reserved boxes (labelLocal, otherBoxLabel) × every closed
-// reason, so the §12 "Wake failures by reason (24h)" dashboard panel
-// surfaces a non-zero baseline from t=0 — the regression that drops
-// the pre-instantiation loop trips here, not in a downstream
-// "missing series" alert.
+// pins the closed (box, app, reason) cartesian for the wake-failure
+// counter at boot (commit 2 of the platform-observability mega-PR
+// extended the counter from {box, reason} to {box, app, reason}).
+// The constructor pre-instantiates every (box, app, reason) tuple
+// for the reserved boxes (labelLocal, otherBoxLabel) × the reserved
+// apps (labelAppUnknown == "", otherAppLabel == "__other__") × every
+// closed reason = 2 × 2 × 8 = 32 series, so the §12 "Wake failures
+// by reason (24h)" dashboard panel surfaces a non-zero baseline
+// from t=0 — the regression that drops the pre-instantiation loop
+// trips here, not in a downstream "missing series" alert.
 func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
@@ -1227,37 +1230,40 @@ func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
 		"mem_backend_err",
 	} {
 		for _, box := range []string{`local`, `__other__`} {
-			want := fmt.Sprintf(`vmmd_wake_failure_total{box=%q,reason=%q} 0`, box, reason)
-			if !strings.Contains(body, want) {
-				t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+			for _, app := range []string{``, `__other__`} {
+				want := fmt.Sprintf(`vmmd_wake_failure_total{app=%q,box=%q,reason=%q} 0`, app, box, reason)
+				if !strings.Contains(body, want) {
+					t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+				}
 			}
 		}
 	}
 }
 
 // TestOpsMetrics_WakeFailureIncrement (issue #1059 / ADR-127) pins
-// the per-(box, reason) counter flow. Three increments on the same
-// (box, reason) tuple must surface as `3` in the scrape body; two
-// increments on a different (box, reason) tuple must surface as `2`;
-// the reserved (__other__) bucket must remain at `0` until a real box
-// crosses the admission cap. The Prometheus Exposer reports the
-// current value per series, not the running total — the test fires
-// the increments via the accessor, not by hand-rolling the metric.
+// the per-(box, app, reason) counter flow. Three increments on the
+// same (box, app, reason) tuple must surface as `3` in the scrape
+// body; two increments on a different tuple must surface as `2`;
+// the reserved (__other__) buckets must remain at `0` until a real
+// box / app crosses the admission cap. The Prometheus Exposer
+// reports the current value per series, not the running total —
+// the test fires the increments via the accessor, not by
+// hand-rolling the metric.
 func TestOpsMetrics_WakeFailureIncrement(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "netns_fail").Inc()
-	m.WakeFailure("local", "netns_fail").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "netns_fail").Inc()
+	m.WakeFailure("local", "my-app", "netns_fail").Inc()
 
 	body := render(t, m)
 	for _, want := range []string{
-		`vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 3`,
-		`vmmd_wake_failure_total{box="local",reason="netns_fail"} 2`,
-		// Reserved overflow bucket stays at 0 until a real box crosses
-		// the cap (see TestWakeFailure_OverflowCollapsesToOtherSlow).
-		`vmmd_wake_failure_total{box="__other__",reason="snapshot_restore_err"} 0`,
+		`vmmd_wake_failure_total{app="my-app",box="local",reason="snapshot_restore_err"} 3`,
+		`vmmd_wake_failure_total{app="my-app",box="local",reason="netns_fail"} 2`,
+		// Reserved overflow buckets stay at 0 until a real box / app
+		// crosses the cap.
+		`vmmd_wake_failure_total{app="__other__",box="__other__",reason="snapshot_restore_err"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
@@ -1266,18 +1272,20 @@ func TestOpsMetrics_WakeFailureIncrement(t *testing.T) {
 }
 
 // TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap (issue
-// #1059 / ADR-127) — the two reserved box labels ("local" and
-// "__other__") are admitted at boot without consuming capacity, so
-// they surface in /metrics as `0`-valued series on an idle daemon.
-// The metric-reader relies on this for "no data" detection — a
-// regression that admitted reserved labels against the cap would
-// leave a quiet fleet invisible to the §12 panel.
+// #1059 / ADR-127) — the reserved box labels (labelLocal,
+// otherBoxLabel) and reserved app labels (labelAppUnknown == "",
+// otherAppLabel == "__other__") are admitted at boot without
+// consuming capacity, so they surface in /metrics as `0`-valued
+// series on an idle daemon. The metric-reader relies on this for
+// "no data" detection — a regression that admitted reserved labels
+// against the cap would leave a quiet fleet invisible to the §12
+// panel.
 func TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
 	for _, want := range []string{
-		`vmmd_wake_failure_total{box="local",reason="snapshot_stale"} 0`,
-		`vmmd_wake_failure_total{box="__other__",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="",box="local",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="__other__",box="__other__",reason="snapshot_stale"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing reserved-label series %q in:\n%s", want, body)
@@ -1292,8 +1300,49 @@ func TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap(t *testing.T) {
 // return nil`.
 func TestOpsMetrics_WakeFailureNilSafe(t *testing.T) {
 	var m *wire.OpsMetrics
-	if got := m.WakeFailure("local", "netns_fail"); got != nil {
+	if got := m.WakeFailure("local", "", "netns_fail"); got != nil {
 		t.Errorf("nil.WakeFailure = %v, want nil", got)
+	}
+}
+
+// TestWakeFailure_ClosedCartesian_PreInstantiated (issue #1059 /
+// ADR-127 §3.5 — cluster A commit 2 of the platform-observability
+// mega-PR) pins the (box, app, reason) cartesian at boot. After
+// the per-app wake-failure split, the metric ships 2 reserved
+// boxes × {labelAppUnknown, otherAppLabel} × 8 reasons = 32 series
+// on an idle daemon. The §12 "Wake failures by reason (24h)"
+// dashboard panel depends on the cartesian being complete at t=0
+// — a regression that drops the inner for-loop trips here before
+// it surfaces as a "missing series" alert at 03:00. One
+// representative tuple per (box, app) pair is asserted by line
+// (the per-reason loop is the dimension the dashboard cares
+// about; the cartesian shape is asserted by the COUNT marker
+// below).
+func TestWakeFailure_ClosedCartesian_PreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	boxes := []string{`local`, `__other__`}
+	apps := []string{``, `__other__`}
+	reasons := []string{
+		`snapshot_stale`, `disk_full`, `jailer_fail`, `netns_fail`,
+		`cgroup_fail`, `vsock_fail`, `snapshot_restore_err`, `mem_backend_err`,
+	}
+	wantCount := len(boxes) * len(apps) * len(reasons)
+	gotCount := 0
+	for _, box := range boxes {
+		for _, app := range apps {
+			for _, reason := range reasons {
+				needle := fmt.Sprintf(`vmmd_wake_failure_total{app=%q,box=%q,reason=%q}`, app, box, reason)
+				if !strings.Contains(body, needle) {
+					t.Errorf("missing cartesian entry %q in:\n%s", needle, body)
+					continue
+				}
+				gotCount++
+			}
+		}
+	}
+	if gotCount != wantCount {
+		t.Errorf("cartesian series count = %d, want %d (the (box, app, reason) cartesian is incomplete)", gotCount, wantCount)
 	}
 }
 

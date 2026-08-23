@@ -1514,13 +1514,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"mem_backend_err",
 	}
 	wakeFailureBoxes := []string{labelLocal, otherBoxLabel}
+	// wakeFailureApps: the per-app pre-instantiation set (issue
+	// #1059 / ADR-127 §3.5). We pre-instantiate the RESERVED
+	// app labels (labelAppUnknown == "", otherAppLabel ==
+	// "__other__") so /metrics surfaces zero rows from an idle
+	// fleet, and rely on the appLabelSet admission (max
+	// maxAppLabelValues = 256) to admit real app slugs as wake
+	// failures land. The appLabel() accessor collapses overflow
+	// to otherAppLabel so the Prometheus TSDB series set stays
+	// bounded over the daemon's lifetime.
+	wakeFailureApps := []string{labelAppUnknown, otherAppLabel}
 	wakeFailure := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_failure_total",
-		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__) and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}. The closed reason set is enforced by pkg/fcvm/wake_classify.go — every wake-failure site maps to exactly one reason. The box label is bounded by maxBoxLabelValues (64) and is set by the host; today it resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain).",
-	}, []string{"box", "reason"})
+		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__), app (admission-bounded, overflow collapses to __other__), and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}. The closed reason set is enforced by pkg/fcvm/wake_classify.go — every wake-failure site maps to exactly one reason. The box label is bounded by maxBoxLabelValues (64) and resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain). The app label is bounded by maxAppLabelValues (256) and resolves to the call site's req.AppSlug — empty input collapses to labelAppUnknown (\"\") to distinguish missing-app-slug calls from real app slugs that hit the admission cap (which collapse to otherAppLabel).",
+	}, []string{"box", "app", "reason"})
 	for _, box := range wakeFailureBoxes {
-		for _, reason := range wakeFailureReasons {
-			wakeFailure.WithLabelValues(box, reason)
+		for _, app := range wakeFailureApps {
+			for _, reason := range wakeFailureReasons {
+				wakeFailure.WithLabelValues(box, app, reason)
+			}
 		}
 	}
 	// wakeLatency (issue #1059 / ADR-127) — see OpsMetrics.wakeLatency
@@ -3534,25 +3546,33 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 	return m.wakeSnapshotTier.WithLabelValues(tier)
 }
 
-// WakeFailure returns the per-(box, reason) counter the wake-failure
-// hook sites increment on every wake failure (issue #1059 / ADR-127).
-// reason MUST be one of {snapshot_stale, disk_full, jailer_fail,
-// netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err,
+// WakeFailure returns the per-(box, app, reason) counter the
+// wake-failure hook sites increment on every wake failure
+// (issue #1059 / ADR-127, §3.5 per-app split). reason MUST be
+// one of {snapshot_stale, disk_full, jailer_fail, netns_fail,
+// cgroup_fail, vsock_fail, snapshot_restore_err,
 // mem_backend_err} — the closed vocabulary is enforced by
-// pkg/fcvm/wake_classify.go and the wake-failure call sites hardcode
-// the literal reason string. box is resolved through the boxLabelSet
-// admission (maxBoxLabelValues = 64); overflow collapses to
-// "__other__". The (box, reason) cartesian is pre-instantiated in
-// the constructor for every (box, reason) pair so the §12
-// "Wake failures by reason (24h)" dashboard panel surfaces zero rows
-// from idle fleet. nil-safe — returns nil if m is nil so unit tests
-// without metrics keep building (same nil-safe posture as
-// WarmSnapshotErrors).
-func (m *OpsMetrics) WakeFailure(box, reason string) prometheus.Counter {
+// pkg/fcvm/wake_classify.go and the wake-failure call sites
+// hardcode the literal reason string. box is resolved through
+// the boxLabelSet admission (maxBoxLabelValues = 64);
+// overflow collapses to "__other__". app is resolved through
+// the appLabelSet admission (maxAppLabelValues = 256); empty
+// input collapses to labelAppUnknown ("") to distinguish a
+// missing-app-slug path from a real app slug that hit the
+// admission cap (which collapses to otherAppLabel). The
+// (box, app, reason) cartesian is pre-instantiated in the
+// constructor for every pair in the closed set (the reserved
+// {labelLocal, otherBoxLabel} × {labelAppUnknown, otherAppLabel}
+// × 8 reasons matrix — 32 series from idle fleet) so the §12
+// "Wake failures by reason (24h)" dashboard panel surfaces
+// zero rows from an idle fleet. nil-safe — returns nil if m
+// is nil so unit tests without metrics keep building (same
+// nil-safe posture as WarmSnapshotErrors).
+func (m *OpsMetrics) WakeFailure(box, app, reason string) prometheus.Counter {
 	if m == nil {
 		return nil
 	}
-	return m.wakeFailure.WithLabelValues(m.boxLabel(box), reason)
+	return m.wakeFailure.WithLabelValues(m.boxLabel(box), m.appLabel(app), reason)
 }
 
 // WakeLatency returns the per-(box, phase) histogram observer the
