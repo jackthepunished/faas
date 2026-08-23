@@ -244,6 +244,11 @@ from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
 from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
+from .env_diff_cell import EnvDiffCell
+from .env_diff_kind import EnvDiffKind
+from .env_diff_response import EnvDiffResponse
+from .env_diff_row import EnvDiffRow
+from .env_diff_row_cells import EnvDiffRowCells
 from .field_error import FieldError
 from .filter_criteria import FilterCriteria
 from .filter_criteria_clause import FilterCriteriaClause
@@ -755,6 +760,11 @@ __all__ = (
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
     "EdgeRuleValidateActionValidateMode",
+    "EnvDiffCell",
+    "EnvDiffKind",
+    "EnvDiffResponse",
+    "EnvDiffRow",
+    "EnvDiffRowCells",
     "FieldError",
     "FilterCriteria",
     "FilterCriteriaClause",
