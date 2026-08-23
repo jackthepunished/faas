@@ -26,7 +26,6 @@ package gateway
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -266,9 +265,3 @@ func collapseRequestTelemetry(rows []RequestTelemetryRow) []RequestTelemetryRow 
 	// PR-A: pass-through. PR-B will replace with aggregate.
 	return rows
 }
-
-// errRequestTelemetryPublishDisabled is the sentinel returned by
-// callers that need to detect "the publisher is disabled" without
-// introspecting the config struct. Currently unused; kept for the
-// metric readers + future admin RPC.
-var errRequestTelemetryPublishDisabled = errors.New("gateway: request telemetry publisher is disabled")
