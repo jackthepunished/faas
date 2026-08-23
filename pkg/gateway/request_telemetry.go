@@ -38,7 +38,7 @@ import (
 
 // RequestTelemetryRow is the unit of work shared between recorder +
 // publisher + apid receiver. Field names match the
-// request_telemetry table columns in migrations/00411_ verbatim so
+// request_telemetry table columns in migrations/00427_ verbatim so
 // the apid gRPC handler can pass them straight to sqlc params.
 type RequestTelemetryRow struct {
 	AccountID    uuid.UUID

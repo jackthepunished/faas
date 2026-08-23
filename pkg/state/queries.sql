@@ -1528,7 +1528,7 @@ delete from oidc_exchanged_tokens where id = $1;
 -- read pattern. trace_id links the row to the in-process TraceRing and
 -- to customer-emitted OTel spans.
 --
--- Schema is in migrations/00411_request_telemetry.sql (partitioned by
+-- Schema is in migrations/00427_request_telemetry.sql (partitioned by
 -- RANGE(received_at) so the per-plan retention sweep drops whole monthly
 -- partitions rather than per-row DELETEs). Indexes are pinned in the
 -- migration; sqlc only generates the typed query surface here.
