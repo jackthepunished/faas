@@ -1494,6 +1494,45 @@ func TestOpsMetrics_WakeLatencyIncrement(t *testing.T) {
 	}
 }
 
+// TestRecordDaemonRestart_PreInstantiationCartesian pins the
+// (daemon, version) cartesian pre-instantiated by the constructor
+// (issue #573 / ADR-128 / cluster B commit 6 of the platform-
+// observability mega-PR). The constructor instantiates every
+// closed-daemon-name × wire.Version row so /metrics surfaces zero
+// rows from idle fleet; the "other" overflow bucket is also
+// pre-instantiated so an unexpected daemon name doesn't trip the
+// "missing series" alert path at boot.
+//
+// Cardinality: 10 daemons × 1 version = 10 series per OpsMetrics
+// instance. Across the 9 daemons that construct their own
+// OpsMetrics = 90 series fleet-wide, all with the same
+// {daemon, version} label set. Well below the Prometheus
+// "tens of thousands" guideline.
+func TestRecordDaemonRestart_PreInstantiationCartesian(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, daemon := range []string{
+		"apid", "gatewayd-public", "gatewayd-internal", "schedd",
+		"vmmd", "imaged", "meterd", "builderd", "gregale", "other",
+	} {
+		want := fmt.Sprintf(`vmmd_daemon_restart_count{daemon=%q,version=%q} 0`, daemon, wire.Version)
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-instantiated row %q in:\n%s", want, body)
+		}
+	}
+	// Add(1) at boot reflects the systemd restart count for THIS
+	// process — see RecordDaemonRestart field doc. After two
+	// increments the vmmd row should be at 1 (RecordDaemonRestart
+	// subtracts 1 to model "n-1 transitions" rather than "n
+	// increments across n processes"). Operators see "this is
+	// process N" rather than "N increments happened".
+	m.RecordDaemonRestart("vmmd", wire.Version, 2)
+	body = render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`vmmd_daemon_restart_count{daemon="vmmd",version=%q} 1`, wire.Version)) {
+		t.Errorf("missing vmmd row at count=1 after RecordDaemonRestart(vmmd, 2) in:\n%s", body)
+	}
+}
+
 // TestOpsMetrics_WakeLatencyNilSafe (issue #1059 / ADR-127) — the
 // accessor must be no-op on a nil receiver so vmmd / schedd unit
 // tests without metrics keep working (same nil-safe posture as

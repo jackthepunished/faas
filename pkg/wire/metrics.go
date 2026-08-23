@@ -141,6 +141,26 @@ type OpsMetrics struct {
 	// path issues. Cardinality bounds match livenessRestarts (per-app
 	// deployment count).
 	workloadOOMKills *prometheus.CounterVec
+	// daemonRestartCount (issue #573 / ADR-128) is the per-(daemon,
+	// version) counter that records how many times systemd has
+	// restarted THIS process in its lifetime. The producer is the
+	// wire.Daemon() boot path, which reads the
+	// $SYSTEMD_RESTARTS_ON_FAILURE env var (set by the systemd unit
+	// Restart=on-failure + RestartCountExport logic) and calls
+	// RecordDaemonRestart(name, Version) once at startup. The
+	// counter's purpose is to backstop node_exporter's
+	// node_systemd_restart_count{name=~"faas-.*\\.service"} metric
+	// in environments where the systemd collector isn't running
+	// (operator disabled --collector.systemd, or scrape is broken) —
+	// the alert rules in faas.rules.yml (FaasRestartLoop /
+	// FaasRepeatedRestart) prefer the node_exporter metric but
+	// fall back to daemon_restart_count{daemon} with a longer
+	// for-window. Labels are bounded by the closed daemon set
+	// (apid, gatewayd-public, gatewayd-internal, schedd, vmmd,
+	// imaged, meterd, builderd, gregale) × the wire.Version
+	// string, so the cartesian is pre-instantiated at boot to
+	// surface zero rows from idle.
+	daemonRestartCount *prometheus.CounterVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -1456,6 +1476,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of workload OOM-kill detections on the customer's per-VM cgroup v2 leaf (Cluster C / ADR-121), labelled by (app, deployment). The producer chain is guest-init cgroup.events listener → vsock DGRAM type 0x05 → Manager.ReportWorkloadOOM → Engine.DestroyForWorkloadOOMFailure. The dashboard panel pairs this with liveness_restarts_total to distinguish 'healthz is bad' (liveness) from 'RAM cap is too low' (workload OOM). Per-deployment cardinality is bounded by the plan's deployed_apps cap (same as livenessRestarts).",
 	}, []string{"app", "deployment"})
 	workloadOOMKills.WithLabelValues("other", "other")
+	// Issue #573 / ADR-128: per-(daemon, version) restart counter.
+	// Closed daemon set mirrors the cmd/ tree (Tier A7 split kept
+	// gatewayd-public and gatewayd-internal as distinct units per
+	// ADR-070). The version label is the current wire.Version —
+	// the pre-instantiation runs once per NewOpsMetrics call so
+	// each daemon exposes its own (daemon, thisVersion) row from
+	// boot, plus an "other" overflow row for any daemon name we
+	// might add later (defensive — operator shouldn't see this in
+	// the closed set, but the pre-instantiation guarantees the
+	// label set renders even before the first RecordDaemonRestart
+	// call).
+	daemonRestartCount := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_daemon_restart_count",
+		Help: "Count of systemd-driven restarts of THIS daemon process (issue #573 / ADR-128), labelled by (daemon, version). Producer is wire.Daemon() reading $SYSTEMD_RESTARTS_ON_FAILURE at boot; alert rules prefer node_exporter's node_systemd_restart_count{name=~'faas-.*\\.service'} when the systemd collector is enabled (commit 6 of the cluster B mega-PR added --collector.systemd to the node_exporter unit). This counter is the backstop for environments where the systemd collector is disabled. Closed daemon set: apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged, meterd, builderd, gregale.",
+	}, []string{"daemon", "version"})
+	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
+		daemonRestartCount.WithLabelValues(daemon, Version)
+	}
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -2383,7 +2421,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3176,6 +3214,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		writeRedirectLatency:                 writeRedirectLatency,
 		livenessRestarts:                     livenessRestarts,
 		workloadOOMKills:                     workloadOOMKills,
+		daemonRestartCount:                   daemonRestartCount,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
@@ -3372,6 +3411,41 @@ func (m *OpsMetrics) WorkloadOOMKills(app, deployment string) prometheus.Counter
 		deployment = labelUnknown
 	}
 	return m.workloadOOMKills.WithLabelValues(app, deployment)
+}
+
+// RecordDaemonRestart (issue #573 / ADR-128) records the systemd
+// restart count for the calling daemon. The wire.Daemon() boot
+// path reads $SYSTEMD_RESTARTS_ON_FAILURE (set by the systemd
+// unit's Restart=on-failure + RestartCountExport logic — see
+// deploy/ansible/roles/<daemon>/files/<daemon>.service) and calls
+// this accessor once at startup. Add(1) is called n-1 times where
+// n is the systemd restart count, so the counter ends at n minus
+// the increment at the boot immediately after — operators see
+// "this process is the Nth incarnation" rather than "N+1
+// increments happened across N processes". A "this process" read
+// is also what the FaasRestartLoop alert wants (it's wired off
+// the per-process delta).
+//
+// The daemon label is normalised through the closed set
+// (apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged,
+// meterd, builderd, gregale) — anything else collapses to "other"
+// so the label cardinality stays bounded across the daemon's
+// lifetime. nil-receiver guard mirrors LivenessRestarts /
+// WorkloadOOMKills so unit tests without metrics keep working.
+func (m *OpsMetrics) RecordDaemonRestart(daemon, version string, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	if version == "" {
+		version = Version
+	}
+	m.daemonRestartCount.WithLabelValues(daemon, version).Add(float64(n - 1))
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier

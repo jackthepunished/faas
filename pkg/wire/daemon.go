@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -20,6 +21,28 @@ import (
 
 // Version is stamped at build time via -ldflags "-X .../pkg/wire.Version=...".
 var Version = "dev"
+
+// defaultOps is the package-level OpsMetrics registered by the
+// current daemon process via RegisterDefaultOps. Daemon() reads
+// it to call RecordDaemonRestart without each daemon having to
+// pass its *OpsMetrics through the RunFunc signature (issue #573
+// / ADR-128). Nil-safe on read — Daemon() skips the call when
+// no daemon has registered yet (cmd/<daemon>/main.go calls
+// RegisterDefaultOps right after wire.NewOpsMetrics). The pointer
+// is process-local; concurrent reads from Daemon() are safe
+// because registration is a one-time write at startup, before
+// any goroutine other than the boot path is running.
+var defaultOps *OpsMetrics
+
+// RegisterDefaultOps stores ops as the package-level default so
+// Daemon() can call RecordDaemonRestart on it. Call this once at
+// the top of cmd/<daemon>/main.go, immediately after
+// wire.NewOpsMetrics(name). Passing nil clears the registration
+// (used by tests). Subsequent calls overwrite — the daemon boot
+// path is single-threaded so this is safe.
+func RegisterDefaultOps(ops *OpsMetrics) {
+	defaultOps = ops
+}
 
 // EnvLogLevel is the operator-facing env var that controls the slog.Level
 // every daemon's JSON handler emits (issue #518 PR-A). It defaults to
@@ -159,12 +182,39 @@ func Daemon(name string, fn RunFunc) {
 
 	go watchLogLevelReload(ctx, log, hupCh, os.Getenv)
 
-	log.Info("starting", "config", *configPath)
+	// Issue #573 / ADR-128: record systemd-driven restart count.
+	// The systemd unit (deploy/ansible/roles/<daemon>/files/<daemon>.service)
+	// sets Environment=SYSTEMD_RESTARTS_ON_FAILURE=<n> via the
+	// RestartCountExport pattern (systemd 254+); when that env
+	// var is unset (older systemd, dev runs without a unit, etc.)
+	// SystemdRestartCount returns 0 and the counter stays at 0.
+	// The alert rules fall back to node_exporter's
+	// node_systemd_restart_count in that case.
+	defaultOps.RecordDaemonRestart(name, Version, SystemdRestartCount())
+
+	log.Info("starting", "config", *configPath, "restart_count", SystemdRestartCount())
 	if err := fn(ctx, log); err != nil {
 		log.Error("exited with error", "err", err)
 		os.Exit(1)
 	}
 	log.Info("shutdown complete")
+}
+
+// SystemdRestartCount returns the systemd-driven restart count
+// for the current process, or 0 if the env var
+// $SYSTEMD_RESTARTS_ON_FAILURE is unset / unparseable. The systemd
+// unit's Restart=on-failure + RestartCountExport pattern (systemd
+// 254+) sets this env var on every restart; absence is a benign
+// signal of either an older systemd or a dev run without a unit.
+// Callers use the value to populate OpsMetrics.daemonRestartCount
+// at boot — see cmd/vmmd/main.go and the other cmd/<daemon>/main.go
+// files for the call sites (issue #573 / ADR-128).
+func SystemdRestartCount() int {
+	n, err := strconv.Atoi(os.Getenv("SYSTEMD_RESTARTS_ON_FAILURE"))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // StubRun is a placeholder body for daemons whose real logic lands in a later
