@@ -110,11 +110,11 @@ func (vmmStubBase) DestroyWithExport(_ context.Context, _, _ string) (int, error
 func (vmmStubBase) UpdateEgressAllowlist(_ context.Context, _ string, _ []netip.Prefix) error {
 	return nil
 }
-func (vmmStubBase) LiveCount() int                              { return 0 }
-func (vmmStubBase) LeasedCount() int                            { return 0 }
-func (vmmStubBase) InstancePID(_ string) (int, bool)            { return 0, false }
-func (vmmStubBase) LogRing(_ string) *logbuf.Ring               { return nil }
-func (vmmStubBase) NetnsFor(_ string) (string, bool)            { return "", false }
+func (vmmStubBase) LiveCount() int                   { return 0 }
+func (vmmStubBase) LeasedCount() int                 { return 0 }
+func (vmmStubBase) InstancePID(_ string) (int, bool) { return 0, false }
+func (vmmStubBase) LogRing(_ string) *logbuf.Ring    { return nil }
+func (vmmStubBase) NetnsFor(_ string) (string, bool) { return "", false }
 func (vmmStubBase) MountParentExt4(_ context.Context, _ string) (string, error) {
 	return "", nil
 }

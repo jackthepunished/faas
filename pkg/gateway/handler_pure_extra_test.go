@@ -363,16 +363,16 @@ func TestClientIPFromTrustedXFF_V6Valid(t *testing.T) {
 
 func TestBearerTokenFromHeader(t *testing.T) {
 	cases := map[string]string{
-		"":                "",
-		"abc":             "",
-		"Bearer ":         "",
-		"Bearer abc":      "abc",
-		"bearer abc":      "abc",
-		"BEARER abc":      "abc",
-		"BeArEr abc":      "abc",
-		"Bearer  abc ":    "abc", // trim space
-		"Bearer":          "",
-		"Basic abc":       "",
+		"":             "",
+		"abc":          "",
+		"Bearer ":      "",
+		"Bearer abc":   "abc",
+		"bearer abc":   "abc",
+		"BEARER abc":   "abc",
+		"BeArEr abc":   "abc",
+		"Bearer  abc ": "abc", // trim space
+		"Bearer":       "",
+		"Basic abc":    "",
 	}
 	for in, want := range cases {
 		if got := bearerTokenFromHeader(in); got != want {
@@ -443,15 +443,15 @@ func TestApplyHeaderOp_UnknownActionAppends(t *testing.T) {
 
 func TestIsAcceptJSON(t *testing.T) {
 	cases := map[string]bool{
-		"":                                  false,
-		"text/html":                         false,
-		"application/json":                  true,
-		"application/json; charset=utf-8":   true,
-		"text/html, application/json":       true,
-		"text/html,application/json":        true,
-		"APPLICATION/JSON":                  true,
-		"application/json , text/html":      true,
-		"text/event-stream":                 false,
+		"":                                false,
+		"text/html":                       false,
+		"application/json":                true,
+		"application/json; charset=utf-8": true,
+		"text/html, application/json":     true,
+		"text/html,application/json":      true,
+		"APPLICATION/JSON":                true,
+		"application/json , text/html":    true,
+		"text/event-stream":               false,
 	}
 	for in, want := range cases {
 		if got := isAcceptJSON(in); got != want {
@@ -864,7 +864,7 @@ func TestStatusRecorder_MaybeFlush_BytesThreshold(t *testing.T) {
 		flushBytes:     10,
 		flushInterval:  time.Hour, // never time-based
 	}
-	rec.firstFlush = false // ensure threshold branch
+	rec.firstFlush = false          // ensure threshold branch
 	rec.Write([]byte("0123456789")) // 10 bytes
 	rec.Write([]byte("extra"))      // 15 total
 	if flusher.flushed < 1 {

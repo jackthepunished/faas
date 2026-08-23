@@ -185,9 +185,9 @@ func TestFrameworkConstants_Stable(t *testing.T) {
 // denied platform call.
 type errorFS struct{ err error }
 
-func (errorFS) Open(_ string) (fs.File, error)             { return nil, nil }
-func (e errorFS) ReadDir(_ string) ([]fs.DirEntry, error)  { return nil, e.err }
-func (e errorFS) Glob(_ string) ([]string, error)          { return nil, e.err }
-func (e errorFS) Stat(_ string) (fs.FileInfo, error)       { return nil, e.err }
-func (e errorFS) ReadFile(_ string) ([]byte, error)        { return nil, e.err }
-func (e errorFS) Sub(_ string) (fs.FS, error)              { return nil, e.err }
+func (errorFS) Open(_ string) (fs.File, error)            { return nil, nil }
+func (e errorFS) ReadDir(_ string) ([]fs.DirEntry, error) { return nil, e.err }
+func (e errorFS) Glob(_ string) ([]string, error)         { return nil, e.err }
+func (e errorFS) Stat(_ string) (fs.FileInfo, error)      { return nil, e.err }
+func (e errorFS) ReadFile(_ string) ([]byte, error)       { return nil, e.err }
+func (e errorFS) Sub(_ string) (fs.FS, error)             { return nil, e.err }

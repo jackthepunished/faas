@@ -306,11 +306,11 @@ func TestLoadLocalOCIArchive_HappyTwoLayers(t *testing.T) {
 	index := minimalIndexBytes(manifestDigest)
 
 	archive := buildLocalOCIArchive(t, map[string][]byte{
-		"index.json":               index,
-		blobPath(manifestDigest):   manifest,
-		blobPath(cfgDigest):        cfg,
-		blobPath(layer0Digest):     layer0,
-		blobPath(layer1Digest):     layer1,
+		"index.json":             index,
+		blobPath(manifestDigest): manifest,
+		blobPath(cfgDigest):      cfg,
+		blobPath(layer0Digest):   layer0,
+		blobPath(layer1Digest):   layer1,
 	})
 
 	config, readers, cleanup, err := loadLocalOCIArchive(archive)

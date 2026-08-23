@@ -22,15 +22,15 @@ import (
 
 func TestValidGitSHA(t *testing.T) {
 	cases := map[string]bool{
-		"":                                                          false, // empty
-		strings.Repeat("a", 40):                                     true,  // full SHA-1
-		strings.Repeat("A", 40):                                     false, // uppercase rejected
-		"1234567":                                                   false, // too short
-		strings.Repeat("g", 40):                                     false, // non-hex
-		strings.Repeat("a", 39):                                     false, // off by one
-		strings.Repeat("a", 41):                                     false, // off by one
-		strings.Repeat("0", 40):                                     true,  // all-zeros is a valid SHA
-		"deadbeef" + strings.Repeat("a", 32):                       true,  // mixed
+		"":                                   false, // empty
+		strings.Repeat("a", 40):              true,  // full SHA-1
+		strings.Repeat("A", 40):              false, // uppercase rejected
+		"1234567":                            false, // too short
+		strings.Repeat("g", 40):              false, // non-hex
+		strings.Repeat("a", 39):              false, // off by one
+		strings.Repeat("a", 41):              false, // off by one
+		strings.Repeat("0", 40):              true,  // all-zeros is a valid SHA
+		"deadbeef" + strings.Repeat("a", 32): true,  // mixed
 	}
 	for in, want := range cases {
 		if got := ValidGitSHA(in); got != want {
@@ -127,12 +127,12 @@ func TestRuntimeAssetNames_NonEmptyAndStable(t *testing.T) {
 
 func TestIsRuntimeAssetName(t *testing.T) {
 	cases := map[string]bool{
-		"":                                            false,
-		"runners/go124/faas-runner":                   true,
-		"runners/python312/faas-runner":               true,
-		"runners/not-a-runner/faas-runner":            false, // unknown runtime
-		"runners/node22/faas-runner-shim":             false, // not exactly the asset name
-		"vmmd-raw-bridge":                             false, // a daemon, not a runner
+		"":                                 false,
+		"runners/go124/faas-runner":        true,
+		"runners/python312/faas-runner":    true,
+		"runners/not-a-runner/faas-runner": false, // unknown runtime
+		"runners/node22/faas-runner-shim":  false, // not exactly the asset name
+		"vmmd-raw-bridge":                  false, // a daemon, not a runner
 	}
 	for in, want := range cases {
 		if got := IsRuntimeAssetName(in); got != want {
@@ -145,13 +145,13 @@ func TestIsRuntimeAssetName(t *testing.T) {
 
 func TestIsCatalogBinaryName(t *testing.T) {
 	cases := map[string]bool{
-		"":                          false,
-		"apid":                      true,  // logical name
-		"vmmd":                      true,  // logical name
-		"schedd":                    true,  // logical name
-		"gatewayd-internal":         true,  // canonical gateway filename
-		"gatewayd-internal-extra":   false, // not a catalog name
-		"some-other-tool":           false,
+		"":                        false,
+		"apid":                    true,  // logical name
+		"vmmd":                    true,  // logical name
+		"schedd":                  true,  // logical name
+		"gatewayd-internal":       true,  // canonical gateway filename
+		"gatewayd-internal-extra": false, // not a catalog name
+		"some-other-tool":         false,
 	}
 	for in, want := range cases {
 		if got := IsCatalogBinaryName(in); got != want {

@@ -222,7 +222,7 @@ func TestComputeRetryBackoff_AttemptsRange(t *testing.T) {
 	// 100 trials × 9 attempt values — every observed duration must
 	// fall in the documented band.
 	bands := map[int32][2]float64{
-		1: {0.8, 1.2},  // base 1s, ±20%
+		1: {0.8, 1.2}, // base 1s, ±20%
 		2: {1.6, 2.4},
 		3: {3.2, 4.8},
 		4: {6.4, 9.6},

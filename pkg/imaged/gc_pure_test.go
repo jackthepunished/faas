@@ -29,17 +29,17 @@ import (
 // FCVersion="1.10") match what existing loop_test.go tests construct.
 func row(id, app, dep, account, slug, tier string, warmEnabled bool, createdAt time.Time, mem, disk int64) state.SnapshotForGC {
 	return state.SnapshotForGC{
-		ID:                    id,
-		DeploymentID:          dep,
-		AppID:                 app,
-		AccountID:             account,
-		AppSlug:               slug,
-		FCVersion:             "1.10",
-		MemBytes:              mem,
-		DiskBytes:             disk,
-		Tier:                  tier,
+		ID:                     id,
+		DeploymentID:           dep,
+		AppID:                  app,
+		AccountID:              account,
+		AppSlug:                slug,
+		FCVersion:              "1.10",
+		MemBytes:               mem,
+		DiskBytes:              disk,
+		Tier:                   tier,
 		AppWarmSnapshotEnabled: warmEnabled,
-		CreatedAt:             createdAt,
+		CreatedAt:              createdAt,
 	}
 }
 

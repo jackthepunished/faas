@@ -160,8 +160,8 @@ func (f *flusherWriter) Header() http.Header {
 }
 
 func (f *flusherWriter) Write(b []byte) (int, error) { return f.body.Write(b) }
-func (f *flusherWriter) WriteHeader(code int)         { f.code = code }
-func (f *flusherWriter) Flush()                       { f.flushed++ }
+func (f *flusherWriter) WriteHeader(code int)        { f.code = code }
+func (f *flusherWriter) Flush()                      { f.flushed++ }
 
 func TestFlushSafe_WiredFlusherIncrements(t *testing.T) {
 	w := &flusherWriter{}
@@ -393,6 +393,6 @@ func newHtRecorder() http.ResponseWriter { return &httptestRecorderShim{} }
 
 type httptestRecorderShim struct{}
 
-func (h *httptestRecorderShim) Header() http.Header        { return http.Header{} }
+func (h *httptestRecorderShim) Header() http.Header         { return http.Header{} }
 func (h *httptestRecorderShim) Write(b []byte) (int, error) { return len(b), nil }
-func (h *httptestRecorderShim) WriteHeader(_ int)         {}
+func (h *httptestRecorderShim) WriteHeader(_ int)           {}

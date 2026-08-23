@@ -128,12 +128,12 @@ func TestEngine_BudgetForWake_OverrideWins(t *testing.T) {
 
 func TestPlanAllowsWarm(t *testing.T) {
 	cases := map[string]bool{
-		string(api.PlanFree):   false,
-		string(api.PlanHobby):  false,
-		string(api.PlanPro):    true,
-		string(api.PlanScale):  true,
-		"unknown_plan":         false,
-		"":                     false,
+		string(api.PlanFree):  false,
+		string(api.PlanHobby): false,
+		string(api.PlanPro):   true,
+		string(api.PlanScale): true,
+		"unknown_plan":        false,
+		"":                    false,
 	}
 	for plan, want := range cases {
 		if got := planAllowsWarm(plan); got != want {

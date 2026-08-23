@@ -174,19 +174,24 @@ type plainPuller struct {
 }
 
 func (p *plainPuller) PullDigest(_ context.Context, _ string) (string, error) {
-	p.used = append(p.used, "PullDigest"); return *p.a.digest, nil
+	p.used = append(p.used, "PullDigest")
+	return *p.a.digest, nil
 }
 func (p *plainPuller) PullImageConfig(_ context.Context, _ string) (oci.ImageConfig, error) {
-	p.used = append(p.used, "PullImageConfig"); return oci.ImageConfig{}, nil
+	p.used = append(p.used, "PullImageConfig")
+	return oci.ImageConfig{}, nil
 }
 func (p *plainPuller) PullLayers(_ context.Context, _ string) (oci.PullLayersResult, error) {
-	p.used = append(p.used, "PullLayers"); return oci.PullLayersResult{}, nil
+	p.used = append(p.used, "PullLayers")
+	return oci.PullLayersResult{}, nil
 }
 func (p *plainPuller) PullManifest(_ context.Context, _ string) (oci.Manifest, error) {
-	p.used = append(p.used, "PullManifest"); return oci.Manifest{}, nil
+	p.used = append(p.used, "PullManifest")
+	return oci.Manifest{}, nil
 }
 func (p *plainPuller) PullBlob(_ context.Context, _, _ string) (io.ReadCloser, error) {
-	p.used = append(p.used, "PullBlob"); return io.NopCloser(nil), nil
+	p.used = append(p.used, "PullBlob")
+	return io.NopCloser(nil), nil
 }
 
 func TestPullDispatch_AuthCapableUsesAuthMethod(t *testing.T) {
@@ -333,15 +338,15 @@ func TestIsSlugSafe(t *testing.T) {
 
 func TestIsDeploymentIDSafe(t *testing.T) {
 	cases := map[string]bool{
-		"":                  false,
-		"abc":               true,
-		strings.Repeat("a", 64): true,
-		strings.Repeat("a", 65): false,
-		"abc/def":           false, // slash
-		"abc\\def":          false, // backslash
-		"abc.def":           false, // dot
-		"abc\x00def":        false, // null
-		"00000000-0000-0000-0000-000000000000": true, // uuid shape
+		"":                                     false,
+		"abc":                                  true,
+		strings.Repeat("a", 64):                true,
+		strings.Repeat("a", 65):                false,
+		"abc/def":                              false, // slash
+		"abc\\def":                             false, // backslash
+		"abc.def":                              false, // dot
+		"abc\x00def":                           false, // null
+		"00000000-0000-0000-0000-000000000000": true,  // uuid shape
 	}
 	for in, want := range cases {
 		if got := isDeploymentIDSafe(in); got != want {
