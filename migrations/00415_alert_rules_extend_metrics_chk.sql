@@ -1,4 +1,4 @@
--- filename: 00413_alert_rules_extend_metrics_chk.sql
+-- filename: 00415_alert_rules_extend_metrics_chk.sql
 -- +goose Up
 -- +goose StatementBegin
 

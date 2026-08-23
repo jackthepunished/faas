@@ -1,4 +1,4 @@
--- filename: 00415_meterd_tenant_surface_cert_expiry_state.sql
+-- filename: 00417_meterd_tenant_surface_cert_expiry_state.sql
 -- +goose Up
 -- +goose StatementBegin
 
