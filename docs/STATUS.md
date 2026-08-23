@@ -1060,3 +1060,76 @@ on PR-C telemetry showing customer misuse), apps_list "warnings
 detected: N" badge (deferred — backend count endpoint not in
 this PR's scope), and vmmd-side `vmmd_node_id` stamp on the
 audit row for traceability (currently `actor='apid'`).
+
+## M8 — Wire-protocol selector: bridge-side H2C terminator (ADR-126). ✅
+
+Closes spec §17 G19. PR #1023 / ADR-124 landed the customer-facing
+`apps.app_protocol ∈ {http1, http2, grpc}` knob (closed-set
+validation, default `http1`), and `gatewayd-internal` stamps
+`x-faas-protocol` for downstream observability, but the framing
+the guest's `:8080` actually received was still HTTP/1.1 + chunked
+regardless of the customer's choice. This PR closes the wire-shape
+follow-on: every `app_protocol ∈ {http2, grpc}` customer now
+reaches their guest's `:8080` as native H2 frames with native gRPC
+trailers — no bridge-side re-framing, no H1 downgrade inside the VM.
+
+- **Bridge-side framing switch (ADR-126 §Decision 1).** New
+  `cmd/vmmd-stream-bridge/h2c_terminator.go::handleH2CStream`
+  originates HTTP/2 prior-knowledge frames to the guest via
+  `golang.org/x/net/http2.Transport{AllowHTTP:true}`; HPACK state
+  owned by the transport, no hand-rolled framing. The legacy
+  `writeH1RequestHead` + `writeChunkedBody` path stays verbatim as
+  `handleH1Stream` — zero behavior change for `app_protocol=http1`.
+  Per-stream dispatch via `FAAS_BRIDGE_PROTOCOL ∈ {h1, h2c}` env
+  var (read per-request in `framing.go::currentBridgeFraming()`,
+  mirrors the per-request `FAAS_STREAM_BRIDGE_VERSION` pattern).
+
+- **Guest-side listener opt-in.** Every shipped runner
+  (`go124`, `node22`, `node24`, `python312`, `python313`) routes
+  through the shared `guest/runners/internal/h2c_listener.go::ListenAndServeH2C`
+  helper. The helper opts into H2C via stdlib
+  `srv.Protocols.SetUnencryptedHTTP2(true)` (Go 1.24+; replaces the
+  deprecated `golang.org/x/net/http2/h2c.NewHandler`) AND
+  `SetHTTP1(true)` — the latter is load-bearing because stdlib's
+  `Protocols` struct starts with NO protocols set, so calling only
+  `SetUnencryptedHTTP2(true)` breaks every H1 caller with
+  `connection reset by peer`. Caught by
+  `TestH2CListener_H1Fallback`.
+
+- **Wire-additive proto bump (ADR-016).** `ForwardHTTPRequestInit.app_protocol = string`
+  (new field 7) carries the per-app protocol from vmmd to the
+  bridge; `ForwardHTTPResponseInit.trailers` (new repeated field 7)
+  carries gRPC trailer HEADERS forward. No SQL migration; the vmmd
+  closed-set validation lives at the customer-intent layer
+  (`apid` rejects out-of-set values with
+  `400 app_protocol_invalid` before the gRPC frame leaves apid).
+
+- **Two rollback switches (ADR-126 §Decision 7).**
+  `FAAS_BRIDGE_PROTOCOL=h1` on the bridge process (per-vmmd
+  surgical, forces legacy H1+chunked for any app_protocol), and
+  `FAAS_STREAM_BRIDGE_VERSION=v1` on vmmd (wholesale shell-bridge
+  fallback, pre-existing ADR-028 amendment). Both are env-var
+  only, no restart of unrelated processes.
+
+- **Snapshot invalidation is contained.** Every app adopting
+  `app_protocol ∈ {http2, grpc}` must adopt the new h2c-capable
+  base image (via the next `make images-push` cycle); the
+  `app_protocol=http1` slice stays valid forever (ADR-005 cold-boot
+  fallback handles the rebuild transparently).
+
+- **Coverage:** `pkg/vmmdgrpc/forward_v2_internal_test.go` (closed-
+  set translator + env-var derivation, 6 sub-tests); `cmd/vmmd-stream-bridge/framing_test.go`
+  (per-stream env lookup + shared helpers + hop-by-hop trim);
+  `cmd/vmmd-stream-bridge/h2c_terminator_test.go` (unary + gRPC
+  trailers + dial-failure + dispatch); `guest/runners/internal/h2c_listener_test.go`
+  (H2 prior-knowledge + H1 fallback + PORT env override);
+  `cmd/e2e/bridge_h2c_terminator_e2e_test.go` (real bridge binary
+  against a loopback H2C guest listener); metal sibling at
+  `cmd/e2e/bridge_h2c_terminator_metal_test.go` documents the
+  §14 M8 row 5 acceptance gates for `make test-metal`.
+
+- **Operator-facing changes:** zero. The closed-set validation,
+  per-app opt-in, and per-stream framing dispatch are all
+  transparent to existing customers — `app_protocol=http1` rides
+  the legacy path verbatim; `app_protocol ∈ {http2, grpc}` opts
+  into the new wire shape by changing one customer-side CLI flag.
