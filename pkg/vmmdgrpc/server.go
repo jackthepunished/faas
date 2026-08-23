@@ -334,15 +334,23 @@ func (s *Server) ForgetActivity(instance string) {
 // pass hardcoded literals per the ADR §3 "call site hardcodes
 // the literal" rule, never a bare-string derived from the
 // wrapped error.
+//
+// The app value passed to WakeFailure is the empty string here:
+// the gRPC proto (CreateFromSnapshotRequest / CreateColdBootRequest)
+// does NOT carry an app_id at the wire level — only an AppSpec
+// (the runtime shape: base_key, layer_key, vcpu_count, mem_size_mib).
+// The app identifier lives on the WakeRequest the schedd-side
+// derives from the gRPC envelope; that's where the per-app
+// WakeFailure increment lands (pkg/fcvm/manager.go — the 6
+// wake-failure hook sites threaded with req.AppID in commit 4
+// of the platform-observability mega-PR). The gRPC parse-failure
+// path therefore collapses to labelAppUnknown ("") via the
+// appLabelSet admission, which is observable distinctly from a
+// real app slug that hit the admission cap (otherAppLabel).
 func (s *Server) incWakeFailure(_ context.Context, reason string) {
 	if s == nil || s.ops == nil {
 		return
 	}
-	// app="" collapses to labelAppUnknown via the appLabelSet
-	// admission; commit 4 of the platform-observability mega-PR
-	// threads the actual req.AppSlug through (gRPC handlers don't
-	// carry an app slug at this gRPC-error layer, so the empty
-	// placeholder is correct here).
 	s.ops.WakeFailure("local", "", reason).Inc()
 }
 
