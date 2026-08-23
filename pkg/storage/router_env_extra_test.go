@@ -23,7 +23,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"testing"
 )
@@ -201,27 +200,15 @@ func TestBackendFromEnv_UnknownBackendValue(t *testing.T) {
 // validateKey). Cover via the public BackendFromEnv path.
 
 // TestBackendFromEnv_LocalStorageRootInvalid covers the
-// FAAS_STORAGE_ROOT validation failure at env.go:204. A root
-// containing ".." trips NewLocalStorageBackend's validateKey path
-// (the same one Put/Get/Delete keys go through); we set the env
-// directly via os.Setenv because t.Setenv is a no-op for empty
-// strings (and ".." alone would be the cleanup of a prior key).
+// FAAS_STORAGE_ROOT validation failure at env.go:204. The root
+// "/srv/bad\\root" trips NewLocalStorageBackend's validateKey
+// branch on ContainsAny("\\") (storage.go:125). t.Setenv is used
+// directly — it has no special-casing for backslashes (the
+// earlier os.Setenv dance was unnecessary; t.Setenv calls
+// os.Setenv under the hood).
 func TestBackendFromEnv_LocalStorageRootInvalid(t *testing.T) {
 	t.Setenv("FAAS_STORAGE_BACKEND", "local")
-	// Use os.Setenv with a backslash that survives t.Setenv's
-	// validation but trips the storage validateKey's
-	// ContainsAny("\\") branch.
-	prevRoot, ok := os.LookupEnv("FAAS_STORAGE_ROOT")
-	if err := os.Setenv("FAAS_STORAGE_ROOT", "/srv/bad\\root"); err != nil {
-		t.Fatalf("setenv: %v", err)
-	}
-	t.Cleanup(func() {
-		if ok {
-			_ = os.Setenv("FAAS_STORAGE_ROOT", prevRoot)
-		} else {
-			_ = os.Unsetenv("FAAS_STORAGE_ROOT")
-		}
-	})
+	t.Setenv("FAAS_STORAGE_ROOT", "/srv/bad\\root")
 	t.Setenv("FAAS_APPS_ROOT", "/var/lib/faas/apps")
 
 	_, err := BackendFromEnv()
@@ -239,17 +226,7 @@ func TestBackendFromEnv_LocalStorageRootInvalid(t *testing.T) {
 func TestBackendFromEnv_LocalAppsRootInvalid(t *testing.T) {
 	t.Setenv("FAAS_STORAGE_BACKEND", "local")
 	t.Setenv("FAAS_STORAGE_ROOT", "/srv/fc")
-	prev, ok := os.LookupEnv("FAAS_APPS_ROOT")
-	if err := os.Setenv("FAAS_APPS_ROOT", "/var/lib/bad\\apps"); err != nil {
-		t.Fatalf("setenv: %v", err)
-	}
-	t.Cleanup(func() {
-		if ok {
-			_ = os.Setenv("FAAS_APPS_ROOT", prev)
-		} else {
-			_ = os.Unsetenv("FAAS_APPS_ROOT")
-		}
-	})
+	t.Setenv("FAAS_APPS_ROOT", "/var/lib/bad\\apps")
 
 	_, err := BackendFromEnv()
 	if err == nil {
@@ -278,9 +255,11 @@ func TestBackendFromEnv_OCIInvalidTimeout(t *testing.T) {
 	}
 }
 
-// TestBackendFromEnv_OCIInvalidTimeoutNegative covers the negative
-// branch of the timeout validation (same code path, different input).
-func TestBackendFromEnv_OCIInvalidTimeoutNegative(t *testing.T) {
+// TestBackendFromEnv_OCIInvalidTimeoutParseError covers the
+// strconv.Atoi failure branch at env.go:262-265. A non-integer
+// value for FAAS_OCI_TIMEOUT_SECONDS must fail loud with a
+// "must be a positive integer" message.
+func TestBackendFromEnv_OCIInvalidTimeoutParseError(t *testing.T) {
 	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
 	t.Setenv("FAAS_OCI_REGISTRY", "https://ghcr.io/onebox-faas")
 	t.Setenv("FAAS_OCI_TIMEOUT_SECONDS", "not-a-number")

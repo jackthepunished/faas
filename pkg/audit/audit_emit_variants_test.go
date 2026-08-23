@@ -18,8 +18,6 @@ package audit_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"log/slog"
 	"testing"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -319,10 +317,3 @@ func decodeJSON(t *testing.T, raw []byte, dst any) error {
 // and AuditWriteFailureDuration); a raw chan/map/func/slice cannot
 // satisfy it. The four Kind branches in isTypedNilAuditOps are
 // defensive and not exercised through the public API.
-
-// _ = errors.New is referenced below for go vet; the unused-import
-// pattern keeps the file self-contained.
-var _ = errors.New
-
-// Pull in slog for any future logger-only tests in this file.
-var _ = slog.Default

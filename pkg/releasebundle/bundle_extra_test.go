@@ -29,20 +29,13 @@ import (
 	"time"
 )
 
-// --- writeFile helper (matches bundle_test.go pattern) ------------
-
-func writeBundleFile(t *testing.T, path, contents string, mode os.FileMode) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(contents), mode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, mode); err != nil {
-		t.Fatal(err)
-	}
-}
+// --- writeFile helper (in bundle_test.go:140) ---------------------
+//
+// The shared helper now re-applies the requested mode bits via
+// os.Chmod so Verify's mode-mismatch branch can be exercised
+// deterministically regardless of the test process umask. All
+// callers (the original Build/Read tests plus the new Validate /
+// Verify / mode-mismatch tests) reuse the single helper.
 
 // --- ValidateManifest additional error branches ------------------
 
@@ -141,7 +134,7 @@ func TestValidateManifest_HappyPath(t *testing.T) {
 // trips Build.
 func TestBuild_RejectsForbiddenFilePath(t *testing.T) {
 	root := t.TempDir()
-	writeBundleFile(t, filepath.Join(root, "bin", "faas-tunnel"), "stub\n", 0o644)
+	writeFile(t, filepath.Join(root, "bin", "faas-tunnel"), "stub\n", 0o644)
 	if _, err := Build(root, "r-1", "deadbeef0000000000000000000000000000000", "linux/amd64", time.Now()); err == nil ||
 		!strings.Contains(err.Error(), "forbidden path") {
 		t.Errorf("forbidden-path file: got %v, want 'forbidden path'", err)
@@ -194,25 +187,31 @@ func TestRead_MalformedManifestJSON(t *testing.T) {
 
 // --- Verify additional error branches ---------------------------
 
-// Size mismatch (manifest claims X bytes, file has Y).
+// Size mismatch (manifest claims X bytes, file has Y). The Verify
+// error path emits "releasebundle: <path> size <actual>, want <expected>"
+// where <actual> is the on-disk file size (5 for "hello") and
+// <expected> is the manifest's Size field (999). We pin the
+// substring that disambiguates this branch from the sha256 / mode
+// branches — without the size discriminator the test would pass
+// for any non-nil error.
 func TestVerify_FileSizeMismatch(t *testing.T) {
 	root := t.TempDir()
-	writeBundleFile(t, filepath.Join(root, "data.txt"), "hello", 0o644)
+	writeFile(t, filepath.Join(root, "data.txt"), "hello", 0o644)
 	m := validManifestWithSingleFile("data.txt", "hello")
 	m.Files[0].Size = 999
-	if err := Verify(root, m); err == nil || !strings.Contains(err.Error(), "size 999, want 999") {
-		// digest of size mismatch: actual size wins; we only need
-		// non-nil to verify the branch fires.
-		if err == nil {
-			t.Errorf("size mismatch: want error, got nil")
-		}
+	err := Verify(root, m)
+	if err == nil {
+		t.Fatal("size mismatch: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "size 5, want 999") {
+		t.Errorf("size mismatch: err = %v; want 'size 5, want 999' substring", err)
 	}
 }
 
 // Mode mismatch (different perm bits).
 func TestVerify_FileModeMismatch(t *testing.T) {
 	root := t.TempDir()
-	writeBundleFile(t, filepath.Join(root, "bin.sh"), "#!/bin/sh\n", 0o644)
+	writeFile(t, filepath.Join(root, "bin.sh"), "#!/bin/sh\n", 0o644)
 	m := validManifestWithSingleFile("bin.sh", "#!/bin/sh\n")
 	m.Files[0].Mode = 0o755
 	if err := Verify(root, m); err == nil {
@@ -221,16 +220,20 @@ func TestVerify_FileModeMismatch(t *testing.T) {
 }
 
 // SHA256 mismatch (claims a hash different from the file content).
+// The Verify error path emits "releasebundle: <path> sha256 <actual>,
+// want <expected>"; the discriminator word "sha256" pins the branch.
 func TestVerify_SHA256Mismatch(t *testing.T) {
 	root := t.TempDir()
-	writeBundleFile(t, filepath.Join(root, "data.txt"), "hello", 0o644)
+	writeFile(t, filepath.Join(root, "data.txt"), "hello", 0o644)
 	m := validManifestWithSingleFile("data.txt", "hello")
 	// Override SHA with a valid-shape hex string of the wrong hash.
 	m.Files[0].SHA256 = hex.EncodeToString(make([]byte, sha256.Size))
-	if err := Verify(root, m); err == nil || !strings.Contains(err.Error(), "sha256") {
-		if err == nil {
-			t.Errorf("sha256 mismatch: want error, got nil")
-		}
+	err := Verify(root, m)
+	if err == nil {
+		t.Fatal("sha256 mismatch: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("sha256 mismatch: err = %v; want 'sha256' substring", err)
 	}
 }
 
