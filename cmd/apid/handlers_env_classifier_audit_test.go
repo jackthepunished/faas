@@ -7,9 +7,9 @@
 // record must fire for the failure mode. Before this PR, only a
 // slog.Warn line fired.
 //
-// This file pins the audit-emit contract for the silent-skip branch
-// (host_hash_failed) — the path where the classifier drops the row
-// on the floor before reaching the caller's err return.
+// This file pins the audit-emit contract for the host_hash_failed
+// branch — the path where the classifier drops the row on the floor
+// before reaching the caller's err return.
 //
 //   - TestSetEnv_ClassifierFailure_HostHashFailed_EmitsAuditEvent
 //     drives the silent-skip branch (handlers_env.go::runEnvClassifier
@@ -19,7 +19,8 @@
 //       (a) 200 partial-success contract preserved.
 //       (b) env row persisted.
 //       (c) env.classifier_failed audit row fires with
-//           error_class=host_hash_failed, silent_skip=true.
+//           error_class=host_hash_failed, silent_skip=true
+//           (silent_skip=true because no INSERT was attempted).
 //       (d) env.set also fires (no double-emit / no missing emit).
 //       (e) data_upstream.inferred MUST NOT fire (host-hash stub
 //           means the classifier silently skipped before the
@@ -27,18 +28,17 @@
 //       (f) account-attribution invariant (Subject is the account
 //           UUID).
 //
-// Tests for the port_out_of_range and insert_data_upstream
-// failure branches live in pkg/state/pgstore_* — they require a
-// real Postgres (pgtest) because state.MemStore's ADR-098
-// data_upstreams methods are Postgres-only stubs (see
-// pkg/state/memstore_data_upstreams.go:33). The audit-emit
-// payload shape for those branches is pinned by the typed-
-// sentinel table-test in
-// handlers_env_classifier_sentinel_table_test.go — the
-// error_class + silent_skip dispatch at handlers_env.go:340-356
-// is the same code path for every branch, so unit-pinning the
-// sentinels + integration-pinning the silent-skip branch is
-// sufficient.
+// Tests for the port_out_of_range, uuid_parse, classifier_internal,
+// and insert_data_upstream failure branches live in pkg/state/
+// pgstore_* — they require a real Postgres (pgtest) because
+// state.MemStore's ADR-098 data_upstreams methods are Postgres-only
+// stubs (see pkg/state/memstore_data_upstreams.go:33). The
+// audit-emit payload shape for those branches is pinned by the
+// typed-sentinel table-test in
+// handlers_env_classifier_sentinel_table_test.go — the error_class
+// + silent_skip dispatch at handlers_env.go:340-358 is the same
+// code path for every branch, so unit-pinning the sentinels +
+// integration-pinning the host_hash_failed branch is sufficient.
 
 package main
 

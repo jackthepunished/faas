@@ -342,7 +342,17 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 			var ec *errEnvClassifier
 			if errors.As(err, &ec) {
 				errorClass = ec.Kind
-				silentSkip = ec.Kind == errClassifierHostHashFailed.Kind
+				// silent_skip is true iff the failure bailed
+				// before any data_upstreams INSERT was
+				// attempted. Only `insert_data_upstream` is
+				// the post-INSERT failure (the INSERT ran,
+				// collided, and we observed the error); every
+				// other Kind fails before reaching
+				// InsertDataUpstream at runEnvClassifier
+				// (uuid_parse at L570/L574, classifier.Run
+				// at L610, CountDataUpstreamsByApp at L634,
+				// HostHashOK at L624, port bounds at L666).
+				silentSkip = ec.Kind != errClassifierInsert.Kind
 			}
 			s.audit.Emit(r.Context(), "env.classifier_failed", &acct.ID, map[string]any{
 				"app_id":      app.ID,

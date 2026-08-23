@@ -3,19 +3,25 @@
 // handlers_env.go::runEnvClassifier returns *errEnvClassifier
 // sentinels at every failure site; setEnv's audit emit uses
 // errors.As to read the Kind discriminator and stamp the
-// silent_skip boolean for host_hash_failed.
+// silent_skip boolean.
+//
+// silent_skip semantic: true iff the failure bailed BEFORE any
+// data_upstreams INSERT was attempted. Only Kind="insert_data_upstream"
+// is the post-INSERT failure case; every other Kind fails before
+// reaching InsertDataUpstream at runEnvClassifier (uuid_parse at
+// L570/L574, classifier.Run at L610, CountDataUpstreamsByApp at
+// L634, HostHashOK at L624, port bounds at L666). Consumers that
+// key off silent_skip to mean "no DB write happened" now get the
+// correct answer for every branch in the closed-vocab.
 //
 // The integration seam (TestSetEnv_ClassifierFailure_HostHashFailed_
-// EmitsAuditEvent) covers only the silent-skip branch — the
+// EmitsAuditEvent) covers the silent-skip branch end-to-end; the
 // remaining branches (uuid_parse, port_out_of_range,
 // classifier_internal, insert_data_upstream) require pgtest
 // (state.MemStore's data_upstreams methods are Postgres-only
-// stubs; see pkg/state/memstore_data_upstreams.go:33).
-//
-// This file pins the table directly: each sentinel's Kind +
-// Unwrap target is asserted against a fixed expected value so a
-// future refactor that drifts the closed-vocab trips the gate
-// silently otherwise.
+// stubs; see pkg/state/memstore_data_upstreams.go:33). This file
+// pins the table directly so a future refactor that drifts the
+// closed-vocab trips the gate silently otherwise.
 
 package main
 
@@ -33,10 +39,13 @@ func TestErrEnvClassifier_Sentinels(t *testing.T) {
 		wantSilentSkip bool // silent_skip = (Kind == "host_hash_failed")
 	}{
 		{
-			name:           "uuid_parse",
-			sentinel:       errClassifierUUIDParse,
-			wantKind:       "uuid_parse",
-			wantSilentSkip: false,
+			name:     "uuid_parse",
+			sentinel: errClassifierUUIDParse,
+			wantKind: "uuid_parse",
+			// silent_skip = (Kind != insert_data_upstream).
+			// uuid_parse fails BEFORE InsertDataUpstream
+			// (runEnvClassifier L570/L574) → silent_skip=true.
+			wantSilentSkip: true,
 		},
 		{
 			name:           "host_hash_failed",
@@ -45,22 +54,28 @@ func TestErrEnvClassifier_Sentinels(t *testing.T) {
 			wantSilentSkip: true,
 		},
 		{
-			name:           "insert_data_upstream",
-			sentinel:       errClassifierInsert,
-			wantKind:       "insert_data_upstream",
+			name:     "insert_data_upstream",
+			sentinel: errClassifierInsert,
+			wantKind: "insert_data_upstream",
+			// INSERT was attempted (runEnvClassifier L691
+			// returns the error from InsertDataUpstream).
+			// silent_skip=false: the row DID touch the DB.
 			wantSilentSkip: false,
 		},
 		{
-			name:           "port_out_of_range",
-			sentinel:       errClassifierPortRange,
-			wantKind:       "port_out_of_range",
-			wantSilentSkip: false,
+			name:     "port_out_of_range",
+			sentinel: errClassifierPortRange,
+			wantKind: "port_out_of_range",
+			// Bounds check at L666 trips BEFORE INSERT.
+			wantSilentSkip: true,
 		},
 		{
-			name:           "classifier_internal",
-			sentinel:       errClassifierInternal,
-			wantKind:       "classifier_internal",
-			wantSilentSkip: false,
+			name:     "classifier_internal",
+			sentinel: errClassifierInternal,
+			wantKind: "classifier_internal",
+			// Both L610 (classifier.Run) and L634
+			// (CountDataUpstreamsByApp) bail BEFORE INSERT.
+			wantSilentSkip: true,
 		},
 	}
 	for _, tc := range cases {
@@ -83,8 +98,12 @@ func TestErrEnvClassifier_Sentinels(t *testing.T) {
 			if ec.Kind != tc.wantKind {
 				t.Errorf("after As: ec.Kind = %q, want %q", ec.Kind, tc.wantKind)
 			}
-			// silent_skip dispatch mirrors setEnv's audit emit.
-			gotSilentSkip := ec.Kind == errClassifierHostHashFailed.Kind
+			// silent_skip dispatch mirrors setEnv's audit emit:
+			// true iff the failure bailed before
+			// InsertDataUpstream was attempted. Only
+			// insert_data_upstream is the post-INSERT
+			// failure case.
+			gotSilentSkip := ec.Kind != errClassifierInsert.Kind
 			if gotSilentSkip != tc.wantSilentSkip {
 				t.Errorf("silent_skip dispatch = %v, want %v (Kind=%q)",
 					gotSilentSkip, tc.wantSilentSkip, ec.Kind)
