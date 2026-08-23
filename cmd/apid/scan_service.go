@@ -324,6 +324,55 @@ func computeAffectedPartition(
 	}
 }
 
+// auditEmitterAs is the minimal *auditor surface needed to emit
+// per-row audit events at preview time. Defined as an interface so
+// the helper is unit-testable without standing up a real pgxpool
+// (the audit_async_test pattern). *auditor (cmd/apid/audit.go:315)
+// already satisfies this signature; the production wiring is
+// unchanged.
+type auditEmitterAs interface {
+	EmitAs(ctx context.Context, actor, kind string, accountID *string, data map[string]any)
+}
+
+// emitWorkloadSkippedRow fires one project.workload.skipped row
+// per operator --exclude entry. Called from scanService right after
+// computeAffectedPartition so each partition.Skipped row gets a
+// durable audit row before the response is marshalled.
+//
+// The apply path runs the same scan partition so re-emitting on
+// apply would double-count; preview-time emission is the source of
+// truth (per pkg/reconcile.KindWorkloadSkipped doc).
+//
+// sourceSHA is the SHA-256 of the uploaded source tarball (req.
+// SourceSHA256) — a stable identifier the audit-events table can
+// group on with the deploy/apply rows.
+//
+// Tests pass a stub auditEmitterAs; production wiring uses *auditor.
+// nil-receiver safe (mirrors cmd/apid/audit.go:316-317).
+func emitWorkloadSkippedRow(
+	ctx context.Context,
+	auditor auditEmitterAs,
+	actor string,
+	accountID string,
+	projectID string,
+	appID string,
+	workloadName string,
+	sourceSHA string,
+) {
+	if auditor == nil {
+		return
+	}
+	acctID := accountID
+	data := map[string]any{
+		"project_id":    projectID,
+		"app_id":        appID,
+		"workload_name": workloadName,
+		"reason":        "unchanged via exclude",
+		"commit_sha":    sourceSHA,
+	}
+	auditor.EmitAs(ctx, actor, reconcile.KindWorkloadSkipped, &acctID, data)
+}
+
 // toPlanManaged translates a reposcan.Managed into the wire-shape
 // DTO. Pure field copy — the reposcan and DTO fields align
 // one-to-one; this helper exists so the carrier conversion is
@@ -726,6 +775,38 @@ func (s *server) scanService(
 	}
 
 	partition := computeAffectedPartition(filteredW, result.Workloads, acctApps, req.Exclude, projectID)
+
+	// Emit one project.workload.skipped audit row per operator
+	// --exclude entry (SOC 2 CC7.2 "who deployed v3 and what did
+	// they skip?"). Preview-time emission is the source of truth;
+	// the apply path runs the same partition so re-emitting there
+	// would double-count. The slug→app lookup uses acctApps which
+	// ListApps returned above; we keep the map local to this
+	// handler invocation so concurrent scans don't share state.
+	actor := resolvedActorString(routeKindForRequest(r), acct.ID, "")
+	sourceSHA := req.SourceSHA256
+	slugToApp := make(map[string]state.App, len(acctApps))
+	for _, a := range acctApps {
+		slugToApp[a.Slug] = a
+	}
+	for _, row := range partition.Skipped {
+		app, ok := slugToApp[row.Slug]
+		if !ok {
+			// Defensive: a Skipped row whose Slug doesn't resolve
+			// in acctApps would silently skip the audit emit.
+			// Should never happen (computeAffectedPartition
+			// builds Skipped from acctApps), but a nil WorkloadName
+			// would still emit a row with workload_name="" which
+			// would break SOC 2 grep-by-name. Log + skip.
+			s.log.Warn("partition skipped slug not in acctApps",
+				"slug", row.Slug,
+				"project_slug", req.ProjectSlug,
+				"account_id", acct.ID,
+			)
+			continue
+		}
+		emitWorkloadSkippedRow(r.Context(), s.audit, actor, acct.ID, projectID, row.ID, app.WorkloadName, sourceSHA)
+	}
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
