@@ -145,6 +145,14 @@ func writeFile(t *testing.T, path, body string, mode os.FileMode) {
 	if err := os.WriteFile(path, []byte(body), mode); err != nil {
 		t.Fatal(err)
 	}
+	// Re-apply the requested mode bits. os.WriteFile's mode argument
+	// is filtered by the process umask, so without an explicit Chmod
+	// tests that compare info.Mode().Perm() against a manifest's
+	// expected Mode (see Verify's mode-mismatch branch) would see
+	// different bits than the test author intended.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // PR-5 / issue #911 — defensive no-faas-tunnel bundle guard.
