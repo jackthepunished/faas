@@ -53,7 +53,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -284,7 +286,7 @@ func copyStreaming(dst http.ResponseWriter, src interface{ Read(p []byte) (int, 
 			}
 		}
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return total, nil
 			}
 			return total, err
@@ -298,14 +300,21 @@ func copyStreaming(dst http.ResponseWriter, src interface{ Read(p []byte) (int, 
 // to see only end-to-end semantics. Comment-each for reviewer
 // legibility (mirrors pkg/gateway/internal_proxy.go:142-178).
 var hopByHopHeaders = map[string]struct{}{
+	// RFC 7230 §6.1 hop-by-hop registry.
 	"Connection":          {},
 	"Keep-Alive":          {},
 	"Proxy-Authenticate":  {},
 	"Proxy-Authorization": {},
 	"Te":                  {}, // RFC 7540 §8.1.2.2: TE only valid with trailers=trailers
 	"Trailer":             {},
-	"Transfer-Encoding":   {}, // HTTP/2 frames manage framing
-	"Upgrade":             {}, // prior-knowledge skips Upgrade dance
+	// HTTP/2 frame-control headers (RFC 9113 §8.3). The x/net/http2
+	// transport strips them today via EncodeHeaders, but we drop them
+	// at the bridge filter too so the outbound envelope is correct
+	// by construction — a future transport change can't accidentally
+	// leak Content-Length onto the H2 wire.
+	"Content-Length":    {},
+	"Transfer-Encoding":  {}, // HTTP/2 frames manage framing
+	"Upgrade":           {}, // prior-knowledge skips Upgrade dance
 }
 
 func isHopByHopHeader(k string) bool {

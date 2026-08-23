@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1829,10 +1830,13 @@ func appProtocolToBridgeProtocol(appProtocol string) string {
 		// out-of-set values with 400 app_protocol_invalid before
 		// the gRPC frame leaves apid). Fall back to h1 so a
 		// misconfigured operator gets the legacy path instead of
-		// a crash. The unknown value is logged via the bridge's
-		// framing-selection slog.Debug line for operator
-		// correlation; apid-side rejection prevents this from
-		// being reachable from a customer request.
+		// a crash. The unknown value is logged here as a Warn
+		// (CLAUDE.md mandates slog JSON; the package convention
+		// is slog.Default() for free functions in this file).
+		slog.Warn("vmmdgrpc: unknown app_protocol from ForwardHTTPRequestInit; falling back to legacy h1+chunked bridge path",
+			"app_protocol", appProtocol,
+			"fallback", "h1",
+		)
 		return "h1"
 	}
 }
