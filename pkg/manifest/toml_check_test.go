@@ -167,26 +167,26 @@ func TestCoverageTOMLPlacement_HappyPath(t *testing.T) {
 	// nil error.
 	good := map[string]string{
 		// Top-level private cluster (vmmd's own listener + TLS).
-		"socket_path":      "/run/vmmd.sock",
-		"metrics_addr":     ":9090",
-		"db_url":           "postgres://...",
-		"owner_user":       "vmmd",
-		"kernel_path":      "/var/lib/faas/vmlinux",
-		"listen_addr":      ":8080",
-		"tls_cert_path":    "/etc/faas/vmmd/cert.pem",
-		"tls_key_path":     "/etc/faas/vmmd/key.pem",
-		"tls_ca_path":      "/etc/faas/vmmd/ca.pem",
+		"socket_path":   "/run/vmmd.sock",
+		"metrics_addr":  ":9090",
+		"db_url":        "postgres://...",
+		"owner_user":    "vmmd",
+		"kernel_path":   "/var/lib/faas/vmlinux",
+		"listen_addr":   ":8080",
+		"tls_cert_path": "/etc/faas/vmmd/cert.pem",
+		"tls_key_path":  "/etc/faas/vmmd/key.pem",
+		"tls_ca_path":   "/etc/faas/vmmd/ca.pem",
 		// [compute_node] public cluster (self-registration identity).
-		"compute_node.name":                "vmmd-1",
-		"compute_node.target_url":          "https://10.0.0.1:8080",
-		"compute_node.overlay_ip":          "10.0.0.1",
-		"compute_node.vpcpus":              "4",
-		"compute_node.mem_mb":              "2048",
-		"compute_node.max_concurrency":     "20",
+		"compute_node.name":                 "vmmd-1",
+		"compute_node.target_url":           "https://10.0.0.1:8080",
+		"compute_node.overlay_ip":           "10.0.0.1",
+		"compute_node.vpcpus":               "4",
+		"compute_node.mem_mb":               "2048",
+		"compute_node.max_concurrency":      "20",
 		"compute_node.admission_ceiling_mb": "47600",
-		"compute_node.host_bridge_cidr":    "10.99.0.0/16",
-		"compute_node.overlay_cidr":        "10.100.0.0/16",
-		"compute_node.overlay_interface":   "eth0",
+		"compute_node.host_bridge_cidr":     "10.99.0.0/16",
+		"compute_node.overlay_cidr":         "10.100.0.0/16",
+		"compute_node.overlay_interface":    "eth0",
 	}
 	errs := ValidateTOMLPlacement("vmmd", good)
 	if errs != nil {
@@ -199,10 +199,10 @@ func TestCoverageTOMLPlacement_MixedErrorsReportedTogether(t *testing.T) {
 	// call (renderer emits multiple bad keys at once → one
 	// publish aborted).
 	mixed := map[string]string{
-		"compute_node.tls_cert_path": "x",            // tombstone + private-in-table
-		"compute_node.schedd_client_cert_path": "y",  // tombstone
-		"target_url": "z",                            // cn-block-key-at-top-level
-		"good": "v",                                  // fine
+		"compute_node.tls_cert_path":           "x", // tombstone + private-in-table
+		"compute_node.schedd_client_cert_path": "y", // tombstone
+		"target_url":                           "z", // cn-block-key-at-top-level
+		"good":                                 "v", // fine
 	}
 	errs := ValidateTOMLPlacement("vmmd", mixed)
 	if len(errs) != 3 {

@@ -203,8 +203,8 @@ func TestConfigFromEnv_ParseFailureBranches(t *testing.T) {
 		value string
 	}{
 		{EnvInterval, "not-a-duration"},
-		{EnvInterval, "0s"},      // non-positive
-		{EnvInterval, "-5s"},     // non-positive (parsed but d<=0)
+		{EnvInterval, "0s"},  // non-positive
+		{EnvInterval, "-5s"}, // non-positive (parsed but d<=0)
 		{EnvRetentionDays, "NaN"},
 		{EnvLocalBytesMax, "ten"},
 	}
@@ -279,7 +279,7 @@ func TestNewMetrics_NilRegistryReturnsNoop(t *testing.T) {
 	}
 	// Pin noop branches don't panic.
 	m.IncFilesUploaded("ok")
-	m.IncFilesUploaded("weird")    // unknown label must be rejected silently
+	m.IncFilesUploaded("weird") // unknown label must be rejected silently
 	m.IncFailure(FailureReasonNetwork)
 	m.IncFailure("not-a-reason")
 	m.AddBytesUploaded(123)
@@ -307,10 +307,10 @@ func TestNewMetrics_NonNilRegistryRegistersAndPreTouches(t *testing.T) {
 		t.Fatalf("Gather: %v", err)
 	}
 	wantNames := map[string]bool{
-		metricFilesUploadedTotal: false,
-		metricBytesUploadedTotal: false,
-		metricFailuresTotal:      false,
-		metricLocalBytes:         false,
+		metricFilesUploadedTotal:    false,
+		metricBytesUploadedTotal:    false,
+		metricFailuresTotal:         false,
+		metricLocalBytes:            false,
 		metricFlushDurationSeconds:  false,
 		metricUploadDurationSeconds: false,
 	}

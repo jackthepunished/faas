@@ -43,17 +43,17 @@ func TestErrors_EmptyErrorString(t *testing.T) {
 
 func TestParseHostPort_ErrorBranches(t *testing.T) {
 	cases := []struct {
-		raw     string
+		raw      string
 		contains string // expected substring in err.Error()
 	}{
 		{"unix:///run/foo.sock", "unix endpoint is only valid for a single-box host"},
 		{"", "endpoint is empty"},
 		{"hostonly", "must be host:port"}, // no port → net.SplitHostPort error
 		{":1234", "empty host"},
-		{"host:0", "invalid port"}, // port < 1
-		{"host:99999", "invalid port"}, // port > 65535
-		{"host:notanumber", "invalid port"}, // non-numeric port
-		{"0.0.0.0:8080", "unspecified host"}, // unspecified IP
+		{"host:0", "invalid port"},                 // port < 1
+		{"host:99999", "invalid port"},             // port > 65535
+		{"host:notanumber", "invalid port"},        // non-numeric port
+		{"0.0.0.0:8080", "unspecified host"},       // unspecified IP
 		{"!!nope@not-a-host:1234", "invalid host"}, // bad hostname
 	}
 	for _, c := range cases {
