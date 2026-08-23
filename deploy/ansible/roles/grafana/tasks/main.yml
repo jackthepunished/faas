@@ -225,6 +225,24 @@
     - restart grafana-server
     - reload grafana provisioning
 
+# ADR-127 §D3 / G19 — bridge wire-protocol framing protection
+# dashboard. Byte-identical copy of deploy/grafana/
+# bridge-protection.json (Makefile:172-185 grafana-mirror-check
+# enforces identity). Companion alerts live at
+# deploy/ansible/roles/prometheus/files/bridge.rules.yml
+# (FaasBridgeFramingMismatch warn + FaasBridgeRollbackStuck page).
+# Runbook: docs/ops/h2c-rollback.md.
+- name: grafana — drop bridge-protection dashboard JSON (ADR-127 §D3)
+  ansible.builtin.copy:
+    src: bridge-protection.json
+    dest: "{{ gv_dashboards_dir }}/bridge-protection.json"
+    owner: grafana
+    group: grafana
+    mode: "0640"
+  notify:
+    - restart grafana-server
+    - reload grafana provisioning
+
 - name: grafana — install systemd unit
   ansible.builtin.copy:
     src: grafana-server.service
