@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1555,11 +1556,37 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 			initHeaders = append(initHeaders, &vmmdpb.Header{Name: k, Value: v})
 		}
 	}
+	// 8b. Trailers (ADR-126 / G19). For the H1+chunked bridge path
+	// (app_protocol=http1), the guest's H1 `Trailer:` headers arrive
+	// in httpResp.Trailer after body EOF. Stdlib populates this map
+	// when the guest declares a `Trailer:` response header naming the
+	// trailer fields; for H2C terminator paths (app_protocol in
+	// {http2, grpc}), this map is empty because trailers ride HTTP/2
+	// HEADERS frames instead — the bridge's H2C terminator forwards
+	// those frames verbatim and a future bridge-side revision will
+	// populate httpResp.Trailer from the trailer HEADERS frame. For
+	// now (PR-A, this commit), the H1+chunked path is the only
+	// populated branch; legacy callers (no Tra proto field) observe
+	// byte-identical behavior because Trailers defaults to nil.
+	//
+	// We only forward trailers once the body has been fully read,
+	// which is true by the time we reach this code path — the
+	// bridge's H1+chunked reader (httputil.NewChunkedReader) blocks
+	// on httpResp.Body until EOF before unblocking
+	// httpResp.Body.Close() above, and httpResp.Trailer is populated
+	// at that EOF.
+	initTrailers := make([]*vmmdpb.Header, 0)
+	for k, vs := range httpResp.Trailer {
+		for _, v := range vs {
+			initTrailers = append(initTrailers, &vmmdpb.Header{Name: k, Value: v})
+		}
+	}
 	if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
 		Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
 			Init: &vmmdpb.ForwardHTTPResponseInit{
-				Status:  int32(httpResp.StatusCode),
-				Headers: initHeaders,
+				Status:   int32(httpResp.StatusCode),
+				Headers:  initHeaders,
+				Trailers: initTrailers,
 			},
 		},
 	}); err != nil {
@@ -1723,6 +1750,14 @@ func streamBridgeSockPath(instance string) string {
 // The bridge writes FAAS_BRIDGE_HOST before any Host: line in
 // FAAS_BRIDGE_HEADERS, and the bridge-side Host: lines in
 // FAAS_BRIDGE_HEADERS overwrite the env value if present.
+//
+// FAAS_BRIDGE_PROTOCOL (ADR-126, issue / G19) carries the
+// per-stream framing selection: `h1` for the legacy H1+chunked
+// path (app_protocol=http1, default), `h2c` for the new H2C
+// terminator (app_protocol in {http2, grpc}). Derived from
+// reqInit.AppProtocol via appProtocolToBridgeProtocol which
+// validates the closed-set; unknown / empty values fall back
+// to `h1` so legacy callers (no AppProtocol field) keep working.
 func streamBridgeEnv(reqInit *vmmdpb.ForwardHTTPRequestInit) []string {
 	var host string
 	headers := make([]string, 0, len(reqInit.GetHeaders()))
@@ -1758,6 +1793,10 @@ func streamBridgeEnv(reqInit *vmmdpb.ForwardHTTPRequestInit) []string {
 		// inject a header — the bridge also strips CR/LF as
 		// defense-in-depth (cmd/vmmd-stream-bridge main.go).
 		"FAAS_BRIDGE_HEADERS=" + strings.Join(headers, "\n"),
+		// Per-stream framing selector (ADR-126). Closed-set
+		// translation happens in appProtocolToBridgeProtocol
+		// below; the bridge just reads the literal string.
+		"FAAS_BRIDGE_PROTOCOL=" + appProtocolToBridgeProtocol(reqInit.GetAppProtocol()),
 		// Env passed to cmd.Env is non-additive with the parent's
 		// env — only the keys present below are visible. The
 		// bridge does no further exec, but PATH is set to a sane
@@ -1765,6 +1804,41 @@ func streamBridgeEnv(reqInit *vmmdpb.ForwardHTTPRequestInit) []string {
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
 	return env
+}
+
+// appProtocolToBridgeProtocol translates the customer's app_protocol
+// (PR #1023 / ADR-124 closed-set `{http1, http2, grpc}`) into the
+// per-stream bridge framing selector (ADR-126 closed-set `{h1, h2c}`).
+// Unknown / empty values fall back to `h1` so legacy callers (no
+// AppProtocol field set) keep working — the H1+chunked path is
+// the default and the load-bearing zero-behavior-change baseline.
+//
+// Closed-set validation belongs here, not in the bridge — the bridge
+// is a stand-alone binary with no DB / no app row access; the
+// authoritative closed-set check is at apid (pkg/api/limits.go
+// AppProtocol validator) + the column-level CHECK constraint
+// `apps_app_protocol_chk` (migrations/00382_apps_app_protocol.sql).
+// This function is the per-request translate, not a validator.
+func appProtocolToBridgeProtocol(appProtocol string) string {
+	switch appProtocol {
+	case "http2", "grpc":
+		return "h2c"
+	case "http1", "":
+		return "h1"
+	default:
+		// Unknown value (should never reach here — apid rejects
+		// out-of-set values with 400 app_protocol_invalid before
+		// the gRPC frame leaves apid). Fall back to h1 so a
+		// misconfigured operator gets the legacy path instead of
+		// a crash. The unknown value is logged here as a Warn
+		// (CLAUDE.md mandates slog JSON; the package convention
+		// is slog.Default() for free functions in this file).
+		slog.Warn("vmmdgrpc: unknown app_protocol from ForwardHTTPRequestInit; falling back to legacy h1+chunked bridge path",
+			"app_protocol", appProtocol,
+			"fallback", "h1",
+		)
+		return "h1"
+	}
 }
 
 // sanitizeHeaderValue strips CR and LF bytes from a string destined

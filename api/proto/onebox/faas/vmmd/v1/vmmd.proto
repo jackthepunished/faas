@@ -1177,6 +1177,15 @@ message ForwardHTTPRequestInit {
   // Lives on the init frame so a single message carries both
   // "what to bridge" and "how to bound it" — no second RPC.
   bool stream = 6;
+  // app_protocol (ADR-126, issue / G19) is the per-app wire-protocol
+  // selector from PR #1023 (ADR-124). Closed set `{http1, http2, grpc}`
+  // validated upstream by apid + the column-level CHECK constraint
+  // `apps_app_protocol_chk` (migration 00382). vmmd translates this to
+  // the per-stream bridge framing: `http1` → H1+chunked (legacy v2 path),
+  // `http2|grpc` → H2C terminator on the bridge (prior-knowledge). Wire-
+  // additive per ADR-016; legacy callers (no field set → "") default to
+  // H1+chunked so behavior is preserved.
+  string app_protocol = 7;
 }
 
 // ForwardHTTPStreamResponse is one frame on the server→client
@@ -1207,6 +1216,16 @@ message ForwardHTTPResponseInit {
   // in the X-Faas-Forward-Error header (operator-only; not
   // customer-visible).
   string error = 3;
+  // trailers (ADR-126, issue / G19) carries HTTP/2 trailer HEADERS
+  // (RFC 9113 §8.1) for `app_protocol=grpc` requests where the guest
+  // sends gRPC trailers (`grpc-status: 0`, `grpc-message: ""`, custom
+  // metadata) as a HEADERS frame with END_STREAM. Distinct from
+  // `headers` so the gateway forwarder can preserve HTTP/2 trailer
+  // semantics end-to-end without confusing them with initial response
+  // headers. Wire-additive per ADR-016; legacy callers (no trailers
+  // field → []) get an empty slice and the H1+chunked path keeps
+  // working unchanged.
+  repeated Header trailers = 7;
 }
 
 // PrepareLiveMigrationRequest (Tier A5 / ADR-065) is the input

@@ -141,6 +141,76 @@ func TestStreamBridgeEnv_SanitizesCRLF(t *testing.T) {
 	}
 }
 
+// TestStreamBridgeEnv_AppProtocolWiring pins the FAAS_BRIDGE_PROTOCOL
+// derivation in streamBridgeEnv (ADR-126 §Decision 1, Atomic 4).
+// The closed-set `{h1, h2c}` must mirror app_protocol ∈ {http1, http2,
+// grpc}; unknown / empty values fall back to h1 so legacy callers
+// keep working. The test exercises the full env-var projection so a
+// future refactor that drops FAAS_BRIDGE_PROTOCOL fires loud here.
+func TestStreamBridgeEnv_AppProtocolWiring(t *testing.T) {
+	cases := []struct {
+		name        string
+		appProtocol string // ForwardHTTPRequestInit.AppProtocol
+		wantProto   string // expected FAAS_BRIDGE_PROTOCOL value
+	}{
+		{name: "empty-defaults-h1", appProtocol: "", wantProto: "h1"},
+		{name: "http1-stays-h1", appProtocol: "http1", wantProto: "h1"},
+		{name: "http2-promotes-h2c", appProtocol: "http2", wantProto: "h2c"},
+		{name: "grpc-promotes-h2c", appProtocol: "grpc", wantProto: "h2c"},
+		{name: "unknown-falls-through-h1", appProtocol: "websocket", wantProto: "h1"},
+		{name: "garbage-falls-through-h1", appProtocol: "HTTP2", wantProto: "h1"}, // case-sensitive closed-set
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := &vmmdpb.ForwardHTTPRequestInit{
+				Method:      "GET",
+				RequestUri:  "/",
+				AppProtocol: c.appProtocol,
+			}
+			env := streamBridgeEnv(req)
+
+			got := map[string]string{}
+			for _, kv := range env {
+				if i := strings.IndexByte(kv, '='); i > 0 {
+					got[kv[:i]] = kv[i+1:]
+				}
+			}
+			if got["FAAS_BRIDGE_PROTOCOL"] != c.wantProto {
+				t.Errorf("FAAS_BRIDGE_PROTOCOL for app_protocol=%q = %q, want %q",
+					c.appProtocol, got["FAAS_BRIDGE_PROTOCOL"], c.wantProto)
+			}
+		})
+	}
+}
+
+// appProtocolToBridgeProtocol_RoundTripTable is the closed-set
+// exhaustive sweep for the translator itself. StreamBridgeEnv's test
+// above pins the env-var projection; this one pins the translator
+// function in isolation so a future refactor that swaps the
+// switch-statement for a map can be reviewed for closed-set equality.
+func TestAppProtocolToBridgeProtocol_ClosedSet(t *testing.T) {
+	cases := map[string]string{
+		"":      "h1", // legacy callers (no AppProtocol field)
+		"http1": "h1",
+		"http2": "h2c",
+		"grpc":  "h2c",
+		// Anything outside the closed-set falls through to h1 —
+		// apid rejects these at the customer-intent layer
+		// (pkg/api/limits.go::AppProtocol validator), so this
+		// path is the defense-in-depth rather than the
+		// load-bearing check.
+		"http3":       "h1",
+		"HTTP2":       "h1", // case-sensitive
+		"GRPC":        "h1",
+		" websocket ": "h1",
+	}
+	for in, want := range cases {
+		if got := appProtocolToBridgeProtocol(in); got != want {
+			t.Errorf("appProtocolToBridgeProtocol(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestSanitizeHeaderValue_EmptyAndWhitespace pins the corner
 // cases of sanitizeHeaderValue (empty, no-control, only-CRLF,
 // only-NUL). Combined with TestSanitizeCRLF in
