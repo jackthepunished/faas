@@ -77,6 +77,60 @@ func TestNewCorrelationLogger_EmitsCanonicalFields(t *testing.T) {
 	}
 }
 
+// TestCorrelationLogger_StampsVersion (issue #586 / ADR-129 /
+// cluster C commit 10 of the platform-observability mega-PR) pins
+// the version propagation contract: every slog record emitted
+// through a NewCorrelationLogger constructed on top of a
+// base.With("daemon", ..., "version", ...) MUST carry both
+// "daemon" and "version" attributes. wire.Daemon() relies on this
+// to surface the binary identity from journalctl — a regression
+// that drops version from the With chain would mean operators
+// can't tell which commit SHA produced a panic stack trace.
+//
+// The test mimics Daemon()'s pattern: base.With("daemon", name,
+// "version", Version), then NewCorrelationLogger(...). The
+// output JSON must carry "version" on every record, including
+// ones emitted from a child logger derived via WithCorrelationFields.
+func TestCorrelationLogger_StampsVersion(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	daemonName := "vmmd"
+	version := "1.2.3-test"
+
+	// Daemon() constructs the base with version before handing off
+	// to NewCorrelationLogger — mirror that pattern.
+	log := wire.NewCorrelationLogger(
+		base.With("daemon", daemonName, "version", version),
+		wire.CorrelationFields{RequestID: "req-1"},
+		daemonName,
+	)
+	log.Info("starting")
+
+	// Child logger (e.g. per-app handler logs) must still carry version.
+	child := wire.WithCorrelationFields(log, wire.CorrelationFields{AppID: "app-1"})
+	child.Info("wake admit", "wake_id", "wake-1")
+
+	recs := decodeLines(t, &buf)
+	if len(recs) != 2 {
+		t.Fatalf("got %d records, want 2", len(recs))
+	}
+	for i, rec := range recs {
+		if got, _ := rec["version"].(string); got != version {
+			t.Errorf("record[%d] version = %q, want %q (every log line must carry version)", i, got, version)
+		}
+		if got, _ := rec["daemon"].(string); got != daemonName {
+			t.Errorf("record[%d] daemon = %q, want %q", i, got, daemonName)
+		}
+	}
+	// Child logger inherits the envelope.
+	if got, _ := recs[1]["app_id"].(string); got != "app-1" {
+		t.Errorf("child record missing app_id = %q, want 'app-1'", got)
+	}
+	if got, _ := recs[1]["version"].(string); got != version {
+		t.Errorf("child record version = %q, want %q (child logger must inherit envelope version)", got, version)
+	}
+}
+
 func TestNewCorrelationLogger_DropsEmptyFields(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))

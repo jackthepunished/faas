@@ -239,6 +239,7 @@ func Daemon(name string, fn RunFunc) {
 	// line. DefaultOps.MarkReady is nil-safe, so a daemon that
 	// never registered its OpsMetrics doesn't panic.
 	defaultOps.MarkReady(name)
+	log.Info("ready", "daemon", name, "version", Version, "ready", true)
 	log.Info("shutdown complete")
 }
 
