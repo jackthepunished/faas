@@ -203,6 +203,10 @@ type MemStore struct {
 	// — the contract is the same Map+slice-walk the production
 	// PgStore implements with an index.
 	openAPISnapshots map[string]OpenAPISnapshot
+	// openAPIImports mirrors the per-app app_openapi_docs table
+	// from migrations/00416 (issue #975 item #2 / ADR-126).
+	// Keyed by app_id (one row per app, last-write-wins).
+	openAPIImports map[string]appOpenAPIImportRow
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -610,6 +614,11 @@ func NewMemStore() *MemStore {
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
 		openAPIDocs:          map[string]openAPIDocRow{},
+		// ADR-126 / issue #975 item #2 — per-app OpenAPI imports.
+		// Keyed by app_id (one row per app, last-write-wins via
+		// the existing overwrite-not-insert contract). Same IDOR
+		// floor at the read methods as the pg path.
+		openAPIImports: map[string]appOpenAPIImportRow{},
 		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
@@ -4802,7 +4811,16 @@ func (m *MemStore) UpsertDeploymentOpenAPIDoc(_ context.Context, deploymentID, a
 	if existing, ok := m.openAPIDocs[deploymentID]; ok {
 		// Idempotent overwrite: keep the original captured_at so
 		// "first-capture" semantics survive a re-delivered cold-boot
-		// event. updated_at is bumped for the audit trail.
+		// event. updated_at is bumped for the audit trail. Preserve
+		// the original AccountID + AppID too — mirrors pgstore's
+		// ON CONFLICT DO UPDATE clause, which intentionally omits
+		// those columns so a cold-boot re-delivery can't flip a
+		// row's tenant binding or re-parent it to a different app
+		// (which would be a §11 IDOR hole). MemStore would otherwise
+		// silently "correct" the row on every overwrite and drift
+		// away from PG in any test asserting equality.
+		row.AccountID = existing.AccountID
+		row.AppID = existing.AppID
 		row.CapturedAt = existing.CapturedAt
 		row.UpdatedAt = now
 	} else {
@@ -4842,6 +4860,195 @@ func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string
 		}
 	}
 	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// appOpenAPIImportRow is the in-memory row mirror of app_openapi_docs
+// (migrations/00416). The struct is unexported; the public surface
+// is the four methods below — handler tests reach them through the
+// Store interface.
+// ---------------------------------------------------------------------------
+type appOpenAPIImportRow struct {
+	AppID          string
+	AccountID      string
+	Doc            []byte
+	Source         string
+	OpenAPIVersion string
+	EndpointCount  int
+	ByteSize       int
+	DocSHA256      []byte
+	CapturedAt     time.Time
+	UpdatedAt      time.Time
+}
+
+// GetAppOpenAPIDoc mirrors pgstore.GetAppOpenAPIDoc. Returns
+// ErrNotFound when the row is missing OR when the caller's
+// accountID does not match — the IDOR floor is enforced at the
+// method boundary so a future caller can't probe by appID alone.
+// The doc body is defensively copied on the way out so a caller
+// mutating the slice can't corrupt the map's internal copy.
+func (m *MemStore) GetAppOpenAPIDoc(_ context.Context, appID, accountID string) ([]byte, AppOpenAPIDocMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIImports[appID]
+	if !ok || row.AccountID != accountID {
+		return nil, AppOpenAPIDocMeta{}, ErrNotFound
+	}
+	return append([]byte(nil), row.Doc...), AppOpenAPIDocMeta{
+		AppID:          row.AppID,
+		AccountID:      row.AccountID,
+		Source:         row.Source,
+		OpenAPIVersion: row.OpenAPIVersion,
+		EndpointCount:  row.EndpointCount,
+		ByteSize:       row.ByteSize,
+		DocSHA256:      append([]byte(nil), row.DocSHA256...),
+		CapturedAt:     row.CapturedAt,
+		UpdatedAt:      row.UpdatedAt,
+	}, nil
+}
+
+// UpsertAppOpenAPIDoc mirrors pgstore. The app row must exist AND
+// belong to the caller's account (defence-in-depth — the apid
+// loadApp boundary already gates this, but the store layer must
+// enforce the IDOR floor so a future caller that bypasses the
+// handler — admin tool, test harness, internal API — cannot
+// write a row into a foreign tenant's app_id and then read it
+// back via GetAppOpenAPIDoc). FK CASCADE in migration 00416 makes
+// the parent-existence check unreachable in practice but the
+// explicit check keeps the error surface predictable. Idempotent:
+// a re-delivered import overwrites the same row, not creates a
+// second. openapiVersion is one of ValidOpenAPIVersions (closed
+// enum); the caller is responsible for pre-validation (the apid
+// openapiimport.ValidateImport check is upstream).
+func (m *MemStore) UpsertAppOpenAPIDoc(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
+		return ErrNotFound
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := appOpenAPIImportRow{
+		AppID:          appID,
+		AccountID:      accountID,
+		Doc:            docCopy,
+		Source:         OpenAPIImportSourceManualImport,
+		OpenAPIVersion: openapiVersion,
+		EndpointCount:  endpointCount,
+		ByteSize:       len(docCopy),
+		DocSHA256:      sum[:],
+	}
+	if existing, ok := m.openAPIImports[appID]; ok {
+		// Idempotent overwrite: keep the original captured_at so
+		// "first-imported" semantics survive a re-delivered import
+		// event. updated_at is bumped for the audit trail. Preserve
+		// the original AccountID too — this matches pgstore's
+		// `ON CONFLICT (app_id) DO UPDATE` clause, which lists
+		// doc/doc_sha256/byte_size/endpoint_count/source/openapi_version/
+		// captured_at/updated_at but intentionally omits account_id
+		// so the original row's tenant binding survives a re-import.
+		// Mirroring that omission here keeps MemStore and PgStore
+		// byte-identical for any test that asserts equality, and
+		// prevents an IDOR drift where a future caller passing a
+		// stale accountID could silently flip the row's tenant.
+		row.AccountID = existing.AccountID
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIImports[appID] = row
+	return nil
+}
+
+// DeleteAppOpenAPIDoc mirrors pgstore. ErrNotFound when no row
+// OR the caller's accountID does not match — same IDOR floor.
+// The apid caller treats ErrNotFound as "already deleted" so a
+// retry is a no-op (idempotent 204).
+func (m *MemStore) DeleteAppOpenAPIDoc(_ context.Context, appID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIImports[appID]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.openAPIImports, appID)
+	return nil
+}
+
+// CountOpenAPIImportsByAccount returns the number of import rows
+// the account owns. Drives the per-account quota gate
+// (api.Plan.OpenAPIImportsPerAccount). The count is a single pass
+// over the map — the in-memory store holds the entire dataset
+// under m.mu so an O(N) scan is fine.
+func (m *MemStore) CountOpenAPIImportsByAccount(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.openAPIImports {
+		if r.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// UpsertAppOpenAPIDocIfUnderQuota mirrors PgStore's transactional
+// count+lock+upsert. The MemStore is single-threaded under m.mu
+// so the atomicity is implicit (the PgStore tx's purpose is to
+// serialise concurrent imports; MemStore achieves the same via
+// the mutex). The Plan.Max=0 path is fail-closed.
+func (m *MemStore) UpsertAppOpenAPIDocIfUnderQuota(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error {
+	if planMax <= 0 {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: 0, NotAllowed: true}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
+		return ErrNotFound
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return ErrNotFound
+	}
+	observed := 0
+	for _, r := range m.openAPIImports {
+		if r.AccountID == accountID {
+			observed++
+		}
+	}
+	if observed >= planMax {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: observed}
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := appOpenAPIImportRow{
+		AppID:          appID,
+		AccountID:      accountID,
+		Doc:            docCopy,
+		Source:         OpenAPIImportSourceManualImport,
+		OpenAPIVersion: openapiVersion,
+		EndpointCount:  endpointCount,
+		ByteSize:       len(docCopy),
+		DocSHA256:      sum[:],
+	}
+	if existing, ok := m.openAPIImports[appID]; ok {
+		// Same idempotent-overwrite contract as UpsertAppOpenAPIDoc
+		// — see the rationale there. The original AccountID +
+		// CapturedAt survive a re-import; UpdatedAt bumps.
+		row.AccountID = existing.AccountID
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIImports[appID] = row
+	return nil
 }
 
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /

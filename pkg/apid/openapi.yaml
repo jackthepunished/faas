@@ -59,6 +59,8 @@ tags:
     description: Deployments & build status.
   - name: openapi_discovery
     description: Captured OpenAPI documents per deployment (ADR-122 / issue #975 item #1).
+  - name: openapi_import
+    description: Imported OpenAPI documents per app + auto-generated merged spec (ADR-126 / issue #975 item #2).
   - name: instances
     description: Read-only instance view.
   - name: domains
@@ -2091,6 +2093,174 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/openapi:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [openapi_import]
+      operationId: getAppOpenAPI
+      summary: Read the imported (or auto-generated) OpenAPI document for an app.
+      description: |
+        Two source modes (selected via `?source=`):
+
+        - `manual_import` (default): returns the customer's uploaded
+          doc verbatim. Mirrors item #1's /deployments/{dep}/openapi
+          but on the app-keyed `app_openapi_docs` table (ADR-126 D1).
+
+        - `auto`: runs pkg/openapidiff.GenerateFromApp with the
+          imported doc + observed routes (ADR-093 bridge) +
+          existing edge rules; the merged spec is cached for 5 min
+          per (app_id, sha(doc), sha(routes), sha(rules)). Cache
+          headers: X-Faas-Cache: hit|miss, X-OpenAPI-Doc-Source:
+          "auto" | "degraded: routes_unavailable" |
+          "degraded: rules_unavailable" | "empty: no_import_no_rules".
+
+        Limits are abuse-surface, not plan-tier — every plan
+        including Free can import. Per-account row cap is
+        Plan.OpenAPIImportsPerAccount (Free 100, Hobby 1000,
+        Pro 10000, Scale 10000). Plan-tier gate is intentionally
+        absent on this surface (ADR-126 D6).
+      parameters:
+        - name: source
+          in: query
+          required: false
+          description: "Source mode. `manual_import` (default) returns the persisted customer doc verbatim. `auto` returns the platform-merged spec (imported doc ∪ observed routes ∪ existing edge rules)."
+          schema:
+            type: string
+            enum: [manual_import, auto]
+            default: manual_import
+      responses:
+        '200':
+          description: The OpenAPI document (imported or auto-generated).
+          headers:
+            X-OpenAPI-Doc-Source:
+              schema: { type: string }
+              description: "Provenance marker: manual_import, auto, degraded: routes_unavailable, degraded: rules_unavailable, empty: no_import_no_rules."
+            X-OpenAPI-Doc-Version:
+              schema: { type: string }
+              description: "OpenAPI version declared by the imported doc (3.0.x / 3.1.x)."
+            X-OpenAPI-Doc-Byte-Size:
+              schema: { type: integer }
+              description: "Raw byte size of the persisted doc body."
+            X-Faas-Cache:
+              schema: { type: string, enum: [hit, miss] }
+              description: "Cache hit/miss on the `?source=auto` path. Omitted on `?source=manual_import`."
+            X-OpenAPI-Doc-Annotations-Count:
+              schema: { type: integer }
+              description: "Count of `x-faas-edge-rules` annotations on the auto-gen spec (zero on manual_import)."
+          content:
+            application/json:
+              schema:
+                type: object
+                description: "The OpenAPI document body. manual_import returns the persisted doc verbatim; auto returns the merged spec (imported doc ∪ observed routes ∪ `x-faas-edge-rules` annotations)."
+        '400':
+          description: "code: invalid_source. `source` query value is not in the enum."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "code: not_found. No imported doc exists for this app (manual_import mode), or the app slug is cross-tenant."
+        '405':
+          description: "code: dry_run_requires_post. `?source=dry_run` is GET-only 405; dry-run is POST-only."
+    post:
+      tags: [openapi_import]
+      operationId: importAppOpenAPI
+      summary: Import an OpenAPI document for an app.
+      description: |
+        Customer-facing import (ADR-126 / issue #975 item #2).
+        Reads the body, validates via
+        pkg/openapiimport.ValidateImport (structural-minimum
+        OpenAPI 3.0 / 3.1 check), enforces size + endpoint
+        caps, persists via UpsertAppOpenAPIDoc, emits
+        app.openapi_import.replaced audit + pg_notify on
+        NotifyAppOpenAPIDocChanged. The auto-gen cache
+        (NotifyAppOpenAPIDocChanged + NotifyEdgeRuleChanged
+        fan-in) is flushed per-app so the next `?source=auto`
+        read recomputes.
+
+        Limits (abuse-surface, not plan-tier): body cap
+        state.OpenAPIImportMaxDocBytes (256 KiB), endpoint
+        cap state.OpenAPIImportMaxEndpoints (50). Per-account
+        row cap is Plan.OpenAPIImportsPerAccount.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: "OpenAPI 3.0/3.1 document. The validator only requires openapi, info, paths to be present + object-shaped; everything else is passthrough."
+              required: [openapi, info, paths]
+              properties:
+                openapi: { type: string, description: "OpenAPI version (3.0.x / 3.1.x)." }
+                info:    { type: object }
+                paths:   { type: object }
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppOpenAPIImportResponse' }
+        '400':
+          description: "code: empty_body. Body is zero bytes."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "code: openapi_import_quota_reached. Plan.OpenAPIImportsPerAccount() cap reached."
+        '413':
+          description: "code: openapi_import_too_large. Body exceeds state.OpenAPIImportMaxDocBytes (256 KiB) on the import endpoint."
+        '422':
+          description: "code: openapi_import_invalid or openapi_import_too_many_endpoints. Doc fails the structural-minimum validator or declares more than state.OpenAPIImportMaxEndpoints (50) endpoints on the import endpoint."
+    delete:
+      tags: [openapi_import]
+      operationId: deleteAppOpenAPI
+      summary: Delete the imported OpenAPI document for an app.
+      description: |
+        Idempotent: returns 204 even if no row existed.
+        Emits app.openapi_import.deleted audit + pg_notify
+        on NotifyAppOpenAPIDocChanged so the auto-gen cache
+        flushes.
+      responses:
+        '204': { description: Deleted (row gone from app_openapi_docs). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/apps/{slug}/openapi/dry-run:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [openapi_import]
+      operationId: dryRunAppOpenAPI
+      summary: Read-only preview of edge-rule suggestions for an imported doc.
+      description: |
+        POST-only (the body IS the import body). Same auth chain
+        as the GET surface minus the MFA requirement (read-only).
+        Validates the doc and walks paths, emitting one
+        EdgeRuleSuggestion per (path, method) pair NOT already
+        covered by an existing validate edge rule. Empty array
+        when the doc is fully covered.
+
+        Customer pastes each suggestion's Path + Methods + Kind
+        + Action back into the existing create-edge-rule endpoint
+        (item #2 D3). Does NOT persist; does NOT emit pg_notify.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [openapi, info, paths]
+              properties:
+                openapi: { type: string }
+                info:    { type: object }
+                paths:   { type: object }
+      responses:
+        '200':
+          description: Dry-run suggestions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppOpenAPIImportDryRunResponse' }
+        '400': { description: "code: empty_body." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: "code: openapi_import_too_large. Body exceeds state.OpenAPIImportMaxDocBytes (256 KiB) on the dry-run endpoint." }
+        '422':
+          description: "code: openapi_import_invalid or openapi_import_too_many_endpoints. Doc fails the structural-minimum validator or declares more than state.OpenAPIImportMaxEndpoints (50) endpoints on the dry-run endpoint."
 
   /v1/apps/{slug}/diff:
     parameters:
@@ -13507,6 +13677,139 @@ components:
           description: "Share of [45]xx requests with this route in the window."
           x-since: "2026-08"
           x-issue: "273"
+
+    AppOpenAPIImportResponse:
+      description: |
+        Response body for `POST /v1/apps/{slug}/openapi` (issue #975
+        item #2 / ADR-126). One row per app in `app_openapi_docs`,
+        last-write-wins. Source is always `manual_import` — cold-
+        boot captures go to `deployment_openapi_docs` (item #1).
+        `endpoint_count` is the number of HTTP operations in the
+        imported doc's `paths.*`; `byte_size` is the raw body size
+        the handler enforced against
+        `state.OpenAPIImportMaxDocBytes` (256 KiB).
+      type: object
+      required:
+        - app_id
+        - source
+        - openapi_version
+        - endpoint_count
+        - byte_size
+        - captured_at
+        - updated_at
+      properties:
+        app_id:
+          type: string
+          format: uuid
+          description: "App UUID the import row is bound to."
+          x-since: "2026-08"
+          x-issue: "975"
+        source:
+          type: string
+          enum: ["manual_import"]
+          description: "Row source. Always `manual_import` for this endpoint."
+          x-since: "2026-08"
+          x-issue: "975"
+        openapi_version:
+          type: string
+          enum: ["3.0.0","3.0.1","3.0.2","3.0.3","3.0.4","3.1.0","3.1.1"]
+          description: "OpenAPI spec version the imported doc declares."
+          x-since: "2026-08"
+          x-issue: "975"
+        endpoint_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: "Number of HTTP operations in the imported doc."
+          x-since: "2026-08"
+          x-issue: "975"
+        byte_size:
+          type: integer
+          minimum: 1
+          maximum: 262144
+          description: "Raw body size in bytes (state.OpenAPIImportMaxDocBytes = 256 KiB)."
+          x-since: "2026-08"
+          x-issue: "975"
+        captured_at:
+          type: string
+          format: date-time
+          description: "First-import timestamp; preserved across re-imports."
+          x-since: "2026-08"
+          x-issue: "975"
+        updated_at:
+          type: string
+          format: date-time
+          description: "Most-recent write timestamp; bumped on every import."
+          x-since: "2026-08"
+          x-issue: "975"
+
+    EdgeRuleSuggestion:
+      description: |
+        Single read-only candidate row in the dry-run response
+        (issue #975 item #2 D3 / ADR-126). Mirrors the
+        create-edge-rule request body fields so the customer can
+        copy-paste the suggestion into the existing endpoint.
+        `kind` + `action` union shape matches the existing
+        `EdgeRule*Action` types in `pkg/api/dto.go`.
+      type: object
+      required:
+        - path
+        - methods
+        - kind
+        - action
+      properties:
+        path:
+          type: string
+          description: "Operation path (e.g. `/users/{id}`)."
+          x-since: "2026-08"
+          x-issue: "975"
+        methods:
+          type: array
+          items: { type: string, enum: ["get","put","post","delete","options","head","patch","trace"] }
+          description: "HTTP methods the suggestion applies to."
+          x-since: "2026-08"
+          x-issue: "975"
+        kind:
+          type: string
+          enum: ["validate","cors","throttle","jwt","headers","cache","redirect","rewrite"]
+          description: "Edge-rule kind the suggestion produces."
+          x-since: "2026-08"
+          x-issue: "975"
+        action:
+          type: object
+          additionalProperties: true
+          description: "Action payload (matches EdgeRule*Action types)."
+          x-since: "2026-08"
+          x-issue: "975"
+
+    AppOpenAPIImportDryRunResponse:
+      description: |
+        Response body for `POST /v1/apps/{slug}/openapi/dry-run`
+        (issue #975 item #2 D3 / ADR-126). Read-only; no persist,
+        no `pg_notify`, no MFA. Empty `suggestions` array when the
+        doc is fully covered by existing validate edge rules.
+      type: object
+      required:
+        - suggestions
+        - openapi_version
+        - endpoint_count
+      properties:
+        suggestions:
+          type: array
+          items: { $ref: '#/components/schemas/EdgeRuleSuggestion' }
+          description: "Suggested EdgeRuleSuggestion rows."
+          x-since: "2026-08"
+          x-issue: "975"
+        openapi_version:
+          type: string
+          description: "OpenAPI version declared by the dry-run doc."
+          x-since: "2026-08"
+          x-issue: "975"
+        endpoint_count:
+          type: integer
+          description: "Number of operations in the dry-run doc."
+          x-since: "2026-08"
+          x-issue: "975"
 
     AppRoutesResponse:
       description: |

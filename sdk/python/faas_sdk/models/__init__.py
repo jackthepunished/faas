@@ -43,6 +43,10 @@ from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
 from .app_metrics_response import AppMetricsResponse
 from .app_metrics_response_range import AppMetricsResponseRange
+from .app_open_api_import_dry_run_response import AppOpenAPIImportDryRunResponse
+from .app_open_api_import_response import AppOpenAPIImportResponse
+from .app_open_api_import_response_openapi_version import AppOpenAPIImportResponseOpenapiVersion
+from .app_open_api_import_response_source import AppOpenAPIImportResponseSource
 from .app_registry_credential_list_response import AppRegistryCredentialListResponse
 from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
@@ -217,6 +221,9 @@ from .domain_doctor_check import DomainDoctorCheck
 from .domain_doctor_check_name import DomainDoctorCheckName
 from .domain_doctor_check_status import DomainDoctorCheckStatus
 from .domain_doctor_report import DomainDoctorReport
+from .dry_run_app_open_api_body import DryRunAppOpenAPIBody
+from .dry_run_app_open_api_body_info import DryRunAppOpenAPIBodyInfo
+from .dry_run_app_open_api_body_paths import DryRunAppOpenAPIBodyPaths
 from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cache_action import EdgeRuleCacheAction
 from .edge_rule_cache_action_methods_item import EdgeRuleCacheActionMethodsItem
@@ -239,6 +246,10 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .edge_rule_suggestion import EdgeRuleSuggestion
+from .edge_rule_suggestion_action import EdgeRuleSuggestionAction
+from .edge_rule_suggestion_kind import EdgeRuleSuggestionKind
+from .edge_rule_suggestion_methods_item import EdgeRuleSuggestionMethodsItem
 from .edge_rule_throttle_action import EdgeRuleThrottleAction
 from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
@@ -263,6 +274,8 @@ from .gdpr_audit_export_response_data import GdprAuditExportResponseData
 from .gdpr_audit_export_response_source import GdprAuditExportResponseSource
 from .get_account_slo_window import GetAccountSLOWindow
 from .get_app_metrics_range import GetAppMetricsRange
+from .get_app_open_api_response_200 import GetAppOpenAPIResponse200
+from .get_app_open_api_source import GetAppOpenAPISource
 from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
@@ -275,6 +288,9 @@ from .get_deployment_stages_response_200_history_item_name import GetDeploymentS
 from .get_deployment_stages_response_200_history_item_status import GetDeploymentStagesResponse200HistoryItemStatus
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .grace_window_response import GraceWindowResponse
+from .import_app_open_api_body import ImportAppOpenAPIBody
+from .import_app_open_api_body_info import ImportAppOpenAPIBodyInfo
+from .import_app_open_api_body_paths import ImportAppOpenAPIBodyPaths
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
 from .instance_response import InstanceResponse
@@ -570,6 +586,10 @@ __all__ = (
     "AppManifestEnvSecrets",
     "AppMetricsResponse",
     "AppMetricsResponseRange",
+    "AppOpenAPIImportDryRunResponse",
+    "AppOpenAPIImportResponse",
+    "AppOpenAPIImportResponseOpenapiVersion",
+    "AppOpenAPIImportResponseSource",
     "AppRegistryCredentialListResponse",
     "AppRegistryCredentialResponse",
     "AppResponse",
@@ -733,6 +753,9 @@ __all__ = (
     "DomainDoctorCheckName",
     "DomainDoctorCheckStatus",
     "DomainDoctorReport",
+    "DryRunAppOpenAPIBody",
+    "DryRunAppOpenAPIBodyInfo",
+    "DryRunAppOpenAPIBodyPaths",
     "EdgeRuleBudgetAction",
     "EdgeRuleCacheAction",
     "EdgeRuleCacheActionMethodsItem",
@@ -755,6 +778,10 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "EdgeRuleSuggestion",
+    "EdgeRuleSuggestionAction",
+    "EdgeRuleSuggestionKind",
+    "EdgeRuleSuggestionMethodsItem",
     "EdgeRuleThrottleAction",
     "EdgeRuleThrottleActionKeyBy",
     "EdgeRuleValidateAction",
@@ -779,6 +806,8 @@ __all__ = (
     "GdprAuditExportResponseSource",
     "GetAccountSLOWindow",
     "GetAppMetricsRange",
+    "GetAppOpenAPIResponse200",
+    "GetAppOpenAPISource",
     "GetAppSLOWindow",
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
@@ -791,6 +820,9 @@ __all__ = (
     "GetDeploymentStagesResponse200HistoryItemStatus",
     "GetOpenAPISpecJSONResponse200",
     "GraceWindowResponse",
+    "ImportAppOpenAPIBody",
+    "ImportAppOpenAPIBodyInfo",
+    "ImportAppOpenAPIBodyPaths",
     "InstallBindRequest",
     "InstallBindResponse",
     "InstanceResponse",
