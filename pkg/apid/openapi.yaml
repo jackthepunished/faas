@@ -10036,18 +10036,18 @@ components:
         reason:
           type: string
           maxLength: 280
-          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+          description: "Free-form operator note on the source-ref deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
         tag:
           type: string
           enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
-          description: "Closed-set annotation tag for grouping/filtering."
+          description: "Closed-set annotation tag on the source-ref deploy request for grouping/filtering."
         deployed_by:
           type: string
-          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+          description: "Human-readable actor label on the source-ref deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
         pr_number:
           type: integer
           minimum: 1
-          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
+          description: "Pull-request number that drove this source-ref deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
         # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
         # auto-rollback echo. The migration 00354 column shape is
         # mirrored verbatim onto the wire so the dashboard, CLI
@@ -10136,18 +10136,18 @@ components:
         reason:
           type: string
           maxLength: 280
-          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+          description: "Free-form operator note on the tarball deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
         tag:
           type: string
           enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
-          description: "Closed-set annotation tag for grouping/filtering."
+          description: "Closed-set annotation tag on the tarball deploy request for grouping/filtering."
         deployed_by:
           type: string
-          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+          description: "Human-readable actor label on the tarball deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
         pr_number:
           type: integer
           minimum: 1
-          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
+          description: "Pull-request number that drove this tarball deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     UpdateDeploymentRequest:
 
