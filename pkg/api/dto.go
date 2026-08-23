@@ -3706,6 +3706,17 @@ type PlanResponse struct {
 	CanApply        bool           `json:"can_apply"`
 	CronsNotAllowed bool           `json:"crons_not_allowed,omitempty"`
 	PlanToken       string         `json:"plan_token"`
+	// ADR-124 can_apply rescue signal. PreExclude is the gate
+	// evaluated on the full scan (pre-`--only`/pre-`--exclude`).
+	// Rescued is true when --exclude flipped a blocked gate to
+	// allowed. Reasons is the human-readable failure list for
+	// the post-exclude state; the dashboard renders it verbatim
+	// in the gate card so the operator sees why a still-blocked
+	// gate is blocked. omitempty drops these on the success
+	// path so existing --json consumers stay stable.
+	CanApplyPreExclude   bool     `json:"can_apply_pre_exclude,omitempty"`
+	GateRescuedByExclude bool     `json:"gate_rescued_by_exclude,omitempty"`
+	CanApplyReasons      []string `json:"can_apply_reasons,omitempty"`
 	// ADR-124: blast-radius partition. WillDeploy + Unaffected
 	// together enumerate every non-deleted app in the account plus
 	// the scan's proposed creates. Skipped is the operator-excluded

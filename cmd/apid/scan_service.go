@@ -111,7 +111,18 @@ type scanPlanResponse struct {
 	LimitCrons    int      `json:"limit_crons"`
 	CanApply      bool     `json:"can_apply"`
 	NotAllowed    bool     `json:"crons_not_allowed,omitempty"`
-	PlanToken     string   `json:"plan_token"`
+	// ADR-124 can_apply rescue signal. PreExclude is the gate
+	// evaluated on the full scan (result.Workloads, pre-`--only`/
+	// pre-`--exclude`); Rescued is the diff between pre and post
+	// — true when --exclude flipped a blocked gate to allowed.
+	// Reasons is the human-readable failure list for the post-
+	// exclude state; the dashboard renders it verbatim in the
+	// gate card so the operator sees why a still-blocked gate
+	// is blocked.
+	CanApplyPreExclude   bool     `json:"can_apply_pre_exclude,omitempty"`
+	GateRescuedByExclude bool     `json:"gate_rescued_by_exclude,omitempty"`
+	CanApplyReasons      []string `json:"can_apply_reasons,omitempty"`
+	PlanToken            string   `json:"plan_token"`
 	// ADR-124 blast-radius partition. WillDeploy + Unaffected
 	// enumerate the scan-workload existence against every non-deleted
 	// app in the account keyed by (RootDir, Name). Skipped is the
@@ -386,6 +397,72 @@ func toPlanManaged(m reposcan.Managed) api.PlanManaged {
 		Source:  m.Source,
 		Image:   m.Image,
 	}
+}
+
+// evaluateQuotaGate computes the can_apply triple for the given
+// (workloads, limits, observedApps, observedCrons). The function
+// derives the cron count from workloads (any workload with a
+// non-empty Schedule is also a cron — see scan_service.go:714-727
+// for the equivalent inline loop) so callers can evaluate the gate
+// on both pre-filter and post-filter workloads without sharing
+// scan-internal state.
+//
+// Returns:
+//
+//	canApply    — true when the plan fits under the plan caps AND
+//	               crons are allowed by the plan.
+//	notAllowed  — true when crons are forbidden by the plan (the
+//	               special hard-block Free plan sees on Hobby/Pro/
+//	               Scale cron workloads). The flag is independent
+//	               of canApply: a Free-plan operator who uploaded
+//	               a cron sees both canApply=false AND
+//	               notAllowed=true.
+//	reasons     — human-readable list of why can_apply is false.
+//	               Empty when can_apply is true. The dashboard
+//	               renders these verbatim in the gate card;
+//	               CanApplyReasons on PlanResponse carries this
+//	               same slice.
+//	cronCount   — the count derived from workloads (returned so
+//	               the caller can size the partition's
+//	               observed_crons wire field without re-walking
+//	               workloads).
+//
+// Pure function; no I/O. Tests pin the three failure-mode shapes
+// (apps-over, crons-not-allowed, crons-over) plus the rescue
+// invariant (preCanApply=false → postCanApply=true after exclude).
+func evaluateQuotaGate(
+	workloads []reposcan.Workload,
+	limits api.Limits,
+	observedApps int,
+	observedCrons int,
+) (canApply bool, notAllowed bool, reasons []string, cronCount int) {
+	for _, wl := range workloads {
+		if wl.Schedule != "" {
+			cronCount++
+		}
+	}
+
+	canApply = true
+	if observedApps+len(workloads) > limits.DeployedApps {
+		canApply = false
+		reasons = append(reasons, fmt.Sprintf(
+			"apps over plan limit: %d + %d > %d",
+			observedApps, len(workloads), limits.DeployedApps,
+		))
+	}
+	if cronCount > 0 && limits.CronLimitPerAccount == 0 {
+		canApply = false
+		notAllowed = true
+		reasons = append(reasons, "crons not allowed on this plan")
+	}
+	if observedCrons+cronCount > limits.CronLimitPerAccount {
+		canApply = false
+		reasons = append(reasons, fmt.Sprintf(
+			"crons over plan limit: %d + %d > %d",
+			observedCrons, cronCount, limits.CronLimitPerAccount,
+		))
+	}
+	return
 }
 
 // planCron is the cron shape returned by the scan service. We keep
@@ -738,15 +815,35 @@ func (s *server) scanService(
 
 	canApply := true
 	notAllowed := false
-	if observedApps+len(filteredW) > limits.DeployedApps {
-		canApply = false
-	}
-	if len(crons) > 0 && limits.CronLimitPerAccount == 0 {
-		canApply = false
-		notAllowed = true
-	}
-	if observedCrons+len(crons) > limits.CronLimitPerAccount {
-		canApply = false
+	// ADR-124 can_apply rescue signal: evaluate the gate twice.
+	// preExclude uses result.Workloads (post-`--only`, pre-`--exclude`),
+	// the same set the operator would have scanned without
+	// excluding anything. canApply uses filteredW (post-`--only`
+	// AND post-`--exclude`). The diff surfaces the rescue: a
+	// blocked gate flipped to allowed only because --exclude
+	// shrunk the workload set below the plan cap. evaluateQuotaGate
+	// derives the cron count from workloads internally so both
+	// calls are self-contained (no shared scan state).
+	preCanApply, preNotAllowed, _, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
+	var reasons []string
+	canApply, notAllowed, reasons, _ = evaluateQuotaGate(filteredW, limits, observedApps, observedCrons)
+
+	// gateRescuedByExclude fires the slog seam when --exclude
+	// flipped a blocked gate to allowed. The slog key follows the
+	// §12 metrics naming convention; a Prometheus counter for
+	// this signal is filed as a follow-up (the slog line is the
+	// observable today, the metric is one-line addition once the
+	// rescue pattern is confirmed on real operator flows).
+	gateRescuedByExclude := !preCanApply && canApply
+	if gateRescuedByExclude {
+		s.log.Info("plan_gate_rescued_by_exclude",
+			slog.String("project_slug", req.ProjectSlug),
+			slog.String("account_id", acct.ID),
+			slog.Bool("pre_exclude_can_apply", preCanApply),
+			slog.Bool("post_exclude_can_apply", canApply),
+			slog.Bool("pre_exclude_not_allowed", preNotAllowed),
+			slog.Any("reasons", reasons),
+		)
 	}
 
 	// ADR-124 blast-radius partition: load every non-deleted app in
@@ -837,6 +934,14 @@ func (s *server) scanService(
 		LimitCrons:    limits.CronLimitPerAccount,
 		CanApply:      canApply,
 		NotAllowed:    notAllowed,
+		// ADR-124 can_apply rescue signal. PreExclude + Rescued
+		// are the operator-facing knobs the dashboard renders in
+		// the gate card; CanApplyReasons is the human-readable
+		// post-exclude failure list (empty on success — omitempty
+		// drops the wire shape).
+		CanApplyPreExclude:   preCanApply,
+		GateRescuedByExclude: gateRescuedByExclude,
+		CanApplyReasons:      reasons,
 		// ADR-124 partition projection. Skipped is the operator --exclude
 		// subset; Unaffected is every account app not in the scan keys;
 		// WillDeploy keeps reposcan's order so the i-alignment with
