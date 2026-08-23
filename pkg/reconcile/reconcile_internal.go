@@ -8,6 +8,7 @@ package reconcile
 
 import (
 	"context"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -36,6 +37,7 @@ func (s *Service) reconcile(
 	scan reposcan.Result,
 	commitSHA string,
 	branch string,
+	exclude []string,
 ) (Result, error) {
 	var out Result
 
@@ -65,8 +67,21 @@ func (s *Service) reconcile(
 		return out, err
 	}
 
-	// 4. Diff.
-	actions := workloadDiff(scan, project, existing)
+	// 4. Diff. exclude is the operator --exclude set (already
+	// lowercased + trimmed at the handler boundary, but we
+	// defensively re-normalize here so a direct pkg caller
+	// can't smuggle mixed-case names past the filter). The
+	// workloadDiff filter drops existing apps whose lowercased
+	// WorkloadName is in excludeSet so the removes loop never
+	// emits a remove Action for an operator-excluded app —
+	// closing the code-review finding #1 contradiction where
+	// `--exclude=foo` silently soft-deleted existing app foo
+	// via applyActions.applyRemove → SoftDeleteAppCascade.
+	excludeSet := make(map[string]bool, len(exclude))
+	for _, name := range exclude {
+		excludeSet[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	actions := workloadDiff(scan, project, existing, excludeSet)
 
 	// 5. Apply. applyActions may emit a quota_blocked alert and
 	// return out with no error; it returns a real error only on

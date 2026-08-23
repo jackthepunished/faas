@@ -44,8 +44,16 @@ type Action struct {
 // workloadDiff produces the create/update/remove set for a
 // reconcile. existing is the result of store.AppsForProject —
 // already filtered to status <> 'deleted' by the store layer
-// (store.go:608-612). The order of the returned slice is stable:
-// creates first (sorted by workload.Name), then updates (sorted by
+// (store.go:608-612). exclude is the operator --exclude set,
+// keyed by lowercased WorkloadName; any existing app whose
+// lowercased WorkloadName is in exclude is DROPPED before the
+// removes loop, so the diff never emits a remove Action for an
+// operator-excluded app. Code-review finding #1 (PR #1065): the
+// earlier version didn't honor exclude, so `--exclude=foo` for an
+// existing app silently soft-deleted the app via workloadDiff's
+// removes loop + applyActions.applyRemove → SoftDeleteAppCascade.
+// The order of the returned slice is stable: creates first
+// (sorted by workload.Name), then updates (sorted by
 // app.WorkloadName), then removes (sorted by app.WorkloadName).
 // Stable ordering is testable and, more importantly, makes the
 // audit log deterministic across retries.
@@ -60,7 +68,24 @@ func workloadDiff(
 	scan reposcan.Result,
 	_ state.Project,
 	existing []state.App,
+	exclude map[string]bool,
 ) []Action {
+	// Filter existing apps whose WorkloadName is in exclude.
+	// Without this filter, the removes loop below would emit a
+	// remove Action for every existing app that the scan
+	// (already --exclude-filtered upstream) doesn't carry, and
+	// applyActions.applyRemove would SoftDeleteAppCascade the
+	// app the operator explicitly asked to leave alone.
+	if len(exclude) > 0 {
+		filtered := make([]state.App, 0, len(existing))
+		for _, a := range existing {
+			if exclude[strings.ToLower(a.WorkloadName)] {
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		existing = filtered
+	}
 	// Build the (RootDir, Name) index of existing apps.
 	existingByKey := make(map[workloadKey]state.App, len(existing))
 	for _, a := range existing {

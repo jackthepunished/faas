@@ -20,6 +20,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 )
 
@@ -207,5 +208,146 @@ func TestEmitWorkloadSkippedRow_KindConstIsStable(t *testing.T) {
 	wantPrefix := "project.workload."
 	if got := reconcile.KindWorkloadSkipped; len(got) <= len(wantPrefix) || got[:len(wantPrefix)] != wantPrefix {
 		t.Errorf("KindWorkloadSkipped %q does not start with %q (closed-set shape broken)", got, wantPrefix)
+	}
+}
+
+// TestEmitSkippedAuditRows_BrandNewExcluded pins the brand-new
+// exclude fix (code-review finding #4): the loop MUST emit an
+// audit row for a Skipped entry whose Slug has no corresponding
+// app (ID == ""). The earlier code looked the row up in
+// `slugToApp` and silently dropped it, leaving a SOC 2 trail
+// gap for every brand-new excluded workload. The pin:
+//
+//  1. A row with ID == "" still emits an audit row.
+//  2. workload_name uses row.Slug (the scan workload's Name),
+//     NOT a stale `slugToApp` value.
+//  3. app_id is empty for brand-new (the audit-events schema
+//     allows null; the dashboard renders the row by
+//     workload_name).
+//  4. The mixed case (existing + brand-new in the same Skipped
+//     slice) emits one row per entry — the loop is independent
+//     of whether the app already exists.
+func TestEmitSkippedAuditRows_BrandNewExcluded(t *testing.T) {
+	stub := &skippedStubAudit{}
+	rows := []api.PlanAffectedApp{
+		// Brand-new: scan emits `payments-api`, no app with that
+		// slug has been deployed yet, operator excludes it. row.ID
+		// is empty by construction (computeAffectedPartition only
+		// sets ID when an app exists at the same key).
+		{Slug: "payments-api", Action: "noop"},
+		// Existing: scan emits `inventory`, an app with that slug
+		// is already deployed, operator excludes it. row.ID is
+		// populated.
+		{Slug: "inventory", ID: "app-uuid-inventory", Action: "noop"},
+		// Brand-new with a hyphen — guards against any future
+		// slug-normalization refactor that mangles the name.
+		{Slug: "checkout-web", Action: "noop"},
+	}
+	emitSkippedAuditRows(
+		context.Background(),
+		stub,
+		"dashboard:user-z",
+		"acct-uuid-aaaa",
+		"proj-uuid-bbbb",
+		"sha-feedface",
+		rows,
+	)
+
+	if got := len(stub.calls); got != 3 {
+		t.Fatalf("calls: got %d, want 3 (brand-new rows must NOT be silently skipped)", got)
+	}
+
+	// Call 0: brand-new payments-api.
+	c0 := stub.calls[0]
+	if c0.Data["workload_name"] != "payments-api" {
+		t.Errorf("call[0] workload_name: got %v, want %q", c0.Data["workload_name"], "payments-api")
+	}
+	if c0.Data["app_id"] != "" {
+		t.Errorf("call[0] app_id: got %v, want empty (brand-new has no app_id)", c0.Data["app_id"])
+	}
+	if c0.Data["project_id"] != "proj-uuid-bbbb" {
+		t.Errorf("call[0] project_id: got %v, want %q", c0.Data["project_id"], "proj-uuid-bbbb")
+	}
+	if c0.Data["commit_sha"] != "sha-feedface" {
+		t.Errorf("call[0] commit_sha: got %v, want %q", c0.Data["commit_sha"], "sha-feedface")
+	}
+	if c0.Data["reason"] != "unchanged via exclude" {
+		t.Errorf("call[0] reason: got %v, want %q", c0.Data["reason"], "unchanged via exclude")
+	}
+
+	// Call 1: existing inventory (regression — make sure the fix
+	// didn't break the existing-app case).
+	c1 := stub.calls[1]
+	if c1.Data["workload_name"] != "inventory" {
+		t.Errorf("call[1] workload_name: got %v, want %q", c1.Data["workload_name"], "inventory")
+	}
+	if c1.Data["app_id"] != "app-uuid-inventory" {
+		t.Errorf("call[1] app_id: got %v, want %q", c1.Data["app_id"], "app-uuid-inventory")
+	}
+
+	// Call 2: brand-new checkout-web (guarding slug normalization).
+	c2 := stub.calls[2]
+	if c2.Data["workload_name"] != "checkout-web" {
+		t.Errorf("call[2] workload_name: got %v, want %q", c2.Data["workload_name"], "checkout-web")
+	}
+	if c2.Data["app_id"] != "" {
+		t.Errorf("call[2] app_id: got %v, want empty (brand-new has no app_id)", c2.Data["app_id"])
+	}
+}
+
+// TestEmitSkippedAuditRows_NilAuditorIsSafe pins nil-receiver
+// safety at the loop level (the per-row helper already has this
+// test; the loop must inherit it). A nil auditor + a non-empty
+// Skipped slice must NOT panic — the audit emit is a side-effect
+// that must never break the preview render.
+func TestEmitSkippedAuditRows_NilAuditorIsSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil auditor panicked: %v", r)
+		}
+	}()
+	emitSkippedAuditRows(
+		context.Background(),
+		nil,
+		"dashboard:any",
+		"acct",
+		"proj",
+		"sha",
+		[]api.PlanAffectedApp{
+			{Slug: "a", Action: "noop"},
+			{Slug: "b", Action: "noop"},
+		},
+	)
+}
+
+// TestEmitSkippedAuditRows_EmptySliceIsNoop pins the trivial
+// invariant: an empty Skipped slice (no --exclude entries) emits
+// zero rows. A regression that always emitted one row would
+// pollute the audit-events table on every preview scan.
+func TestEmitSkippedAuditRows_EmptySliceIsNoop(t *testing.T) {
+	stub := &skippedStubAudit{}
+	emitSkippedAuditRows(
+		context.Background(),
+		stub,
+		"dashboard:user-q",
+		"acct",
+		"proj",
+		"sha",
+		nil,
+	)
+	if got := len(stub.calls); got != 0 {
+		t.Fatalf("calls on nil rows: got %d, want 0", got)
+	}
+	emitSkippedAuditRows(
+		context.Background(),
+		stub,
+		"dashboard:user-q",
+		"acct",
+		"proj",
+		"sha",
+		[]api.PlanAffectedApp{},
+	)
+	if got := len(stub.calls); got != 0 {
+		t.Fatalf("calls on empty rows: got %d, want 0", got)
 	}
 }

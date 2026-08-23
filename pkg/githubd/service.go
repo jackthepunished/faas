@@ -300,7 +300,9 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("githubd: scan: %w", err)
 	}
-	result, err := s.Reconcile.Reconcile(ctx, project, scan, ev.After, branch)
+	// githubd is push-driven (no --exclude analog on the webhook
+	// path); pass nil so workloadDiff's exclude filter is a no-op.
+	result, err := s.Reconcile.Reconcile(ctx, project, scan, ev.After, branch, nil)
 	if err != nil {
 		if errors.Is(err, reconcile.ErrIgnored) {
 			// Defensive: ErrIgnored is the Plan-side sentinel;

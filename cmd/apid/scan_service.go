@@ -345,6 +345,31 @@ type auditEmitterAs interface {
 	EmitAs(ctx context.Context, actor, kind string, accountID *string, data map[string]any)
 }
 
+// emitSkippedAuditRows is the loop body extracted from
+// scanService so a regression test can drive the call site
+// directly (without standing up a full scanService server). It
+// emits one project.workload.skipped row per partition.Skipped
+// entry. `row.Slug` IS the scan workload's `Name` — for a
+// brand-new excluded workload (row.ID == "", the common case
+// when the scan emits a workload that hasn't been deployed
+// yet), `row.Slug` carries the name we need to stamp the audit
+// row. Earlier versions looked `slugToApp[row.Slug]` in the
+// app table and silently skipped them, leaving the SOC 2 trail
+// incomplete.
+func emitSkippedAuditRows(
+	ctx context.Context,
+	auditor auditEmitterAs,
+	actor string,
+	accountID string,
+	projectID string,
+	sourceSHA string,
+	rows []api.PlanAffectedApp,
+) {
+	for _, row := range rows {
+		emitWorkloadSkippedRow(ctx, auditor, actor, accountID, projectID, row.ID, row.Slug, sourceSHA)
+	}
+}
+
 // emitWorkloadSkippedRow fires one project.workload.skipped row
 // per operator --exclude entry. Called from scanService right after
 // computeAffectedPartition so each partition.Skipped row gets a
@@ -879,33 +904,17 @@ func (s *server) scanService(
 	// --exclude entry (SOC 2 CC7.2 "who deployed v3 and what did
 	// they skip?"). Preview-time emission is the source of truth;
 	// the apply path runs the same partition so re-emitting there
-	// would double-count. The slug→app lookup uses acctApps which
-	// ListApps returned above; we keep the map local to this
-	// handler invocation so concurrent scans don't share state.
+	// would double-count. `partition.Skipped` rows are scan workloads
+	// (`reposcan.Workload`s emitted by the scanner), NOT apps —
+	// `row.Slug` IS the scan workload's `Name`. For a brand-new
+	// excluded workload (the common case where no app with that
+	// Slug exists yet), `row.ID == ""` and `row.Slug` carries the
+	// workload name we need to stamp the audit row. Earlier code
+	// looked `slugToApp[row.Slug]` in the app table and silently
+	// skipped brand-new excludes — fixing the SOC 2 trail gap.
 	actor := resolvedActorString(routeKindForRequest(r), acct.ID, "")
 	sourceSHA := req.SourceSHA256
-	slugToApp := make(map[string]state.App, len(acctApps))
-	for _, a := range acctApps {
-		slugToApp[a.Slug] = a
-	}
-	for _, row := range partition.Skipped {
-		app, ok := slugToApp[row.Slug]
-		if !ok {
-			// Defensive: a Skipped row whose Slug doesn't resolve
-			// in acctApps would silently skip the audit emit.
-			// Should never happen (computeAffectedPartition
-			// builds Skipped from acctApps), but a nil WorkloadName
-			// would still emit a row with workload_name="" which
-			// would break SOC 2 grep-by-name. Log + skip.
-			s.log.Warn("partition skipped slug not in acctApps",
-				"slug", row.Slug,
-				"project_slug", req.ProjectSlug,
-				"account_id", acct.ID,
-			)
-			continue
-		}
-		emitWorkloadSkippedRow(r.Context(), s.audit, actor, acct.ID, projectID, row.ID, app.WorkloadName, sourceSHA)
-	}
+	emitSkippedAuditRows(r.Context(), s.audit, actor, acct.ID, projectID, sourceSHA, partition.Skipped)
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
@@ -1159,10 +1168,43 @@ func (s *server) scanService(
 		Tier:      result.Tier,
 		Warnings:  result.Warnings,
 	}
+
+	// preRemoveIdToSlug maps each app's ID to its pre-remove slug.
+	// Built BEFORE reconcile runs because reconcile's applyRemove
+	// calls SoftDeleteAppCascade (which sets status='deleted'),
+	// and AppsForProject filters `status<>'deleted'`
+	// (pgstore.go:3593, memstore.go:2061) — a post-reconcile read
+	// would miss every just-removed app. Code-review finding #2:
+	// the earlier version called AppsForProject AFTER reconcile,
+	// so resp.Removed was always empty even when reconcile
+	// correctly soft-deleted the apps. The dashboard ApplyResult
+	// banner + CLI `faas apply` JSON both lied to operators about
+	// what was deleted.
+	preRemoveApps, preLoadErr := s.store.AppsForProject(r.Context(), acct.ID, project.ID)
+	if preLoadErr != nil {
+		prob := api.ErrInternal(fmt.Sprintf("load existing apps: %v", preLoadErr))
+		capturedProb = prob
+		return resp, state.Project{}, nil, nil, nil, nil, prob
+	}
+	preRemoveIdToSlug := make(map[string]string, len(preRemoveApps))
+	for _, a := range preRemoveApps {
+		preRemoveIdToSlug[a.ID] = a.Slug
+	}
+
 	reconcileInputs := toReconcileInputs(*req, project, filteredScan)
+	// req.Exclude is map[string]bool (slug-set on the wire
+	// boundary); reconcile.Service.Reconcile takes []string.
+	// Convert at the call site so the engine signature stays
+	// ordered/dupe-tolerant (the wire side is a set, the engine
+	// is a list — pkg/reconcile dedupes via the map filter).
+	excludeList := make([]string, 0, len(req.Exclude))
+	for slug := range req.Exclude {
+		excludeList = append(excludeList, slug)
+	}
 	rec, recErr := s.reconcileSvc.Reconcile(
 		r.Context(), project, filteredScan,
-		reconcileInputs.CommitSHA, reconcileInputs.Branch)
+		reconcileInputs.CommitSHA, reconcileInputs.Branch,
+		excludeList)
 	if recErr != nil {
 		// Map reconcile-package errors into the existing RFC 7807
 		// problem shapes so the handler can use a single dispatch
@@ -1191,31 +1233,13 @@ func (s *server) scanService(
 	// (workloads dropped from the scan no longer appear in
 	// resp.Crons so the slug→ID lookup in handlers_decompose.go
 	// returns empty — without removedSlugs the handler would 500
-	// on a removed workload that previously had a cron). We
-	// resolve slug from the (now-deleted) rec.Added ∪ rec.Changed
-	// maps via the inverse map below.
+	// on a removed workload that previously had a cron). The
+	// `preRemoveIdToSlug` map is built BEFORE reconcile (see
+	// above); here we just resolve each removed ID through it.
 	removedSlugs := make([]string, 0, len(rec.Removed))
-	if len(rec.Removed) > 0 {
-		// removedSlugByID is keyed by the pre-remove app ID.
-		// Build it BEFORE reconcile so we capture the slug of
-		// every app that the scan dropped. The state.App rows
-		// we look at are the project's pre-reconcile member
-		// list (read-only); reconcile's removal happens
-		// downstream of this lookup.
-		existingApps, lerr := s.store.AppsForProject(r.Context(), acct.ID, project.ID)
-		if lerr != nil {
-			prob := api.ErrInternal(fmt.Sprintf("load existing apps: %v", lerr))
-			capturedProb = prob
-			return resp, state.Project{}, nil, nil, nil, nil, prob
-		}
-		idToSlug := make(map[string]string, len(existingApps))
-		for _, a := range existingApps {
-			idToSlug[a.ID] = a.Slug
-		}
-		for _, id := range rec.Removed {
-			if slug, ok := idToSlug[id]; ok {
-				removedSlugs = append(removedSlugs, slug)
-			}
+	for _, id := range rec.Removed {
+		if slug, ok := preRemoveIdToSlug[id]; ok {
+			removedSlugs = append(removedSlugs, slug)
 		}
 	}
 

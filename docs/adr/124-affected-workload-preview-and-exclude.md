@@ -144,6 +144,17 @@ notes:
   `"noop"`, and they appear in a new `Skipped []PlanAffectedApp` field
   on the response so the dashboard can render "excluded by operator."
 
+  `pkg/reconcile.workloadDiff` itself takes the `exclude` set as a
+  parameter (added in the post-#1026 audit fix). The handler threads
+  `req.Exclude` through `Reconcile(..., excludeList)`; the engine
+  builds `excludeSet[strings.ToLower(TrimSpace(name))]` and filters
+  `existing` before the removes loop. Without this filter, an
+  operator `--exclude=foo` for an EXISTING app foo would still
+  emit a remove Action — `applyActions.applyRemove` would call
+  `SoftDeleteAppCascade(foo)` and silently override the operator's
+  intent. The post-#1065 audit pinned this contract at
+  `pkg/reconcile/reconcile_test.go::TestReconcile_ExcludePreventsRemove`.
+
 `Removed` is the **destructive** subset and is **project-scoped**
 (the project being previewed) rather than account-scoped, while
 `Unaffected` is account-scoped (blast-radius view). The shape
