@@ -96,10 +96,17 @@ func main() {
 		port = "8080"
 	}
 	addr := ":" + port
-	log.Printf("python313 runner: listening on %s (handler=%s)", addr, *handlerPath)
-	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // bind-all is intentional inside the guest
-		log.Fatalf("python313 runner: listen: %v", err)
-	}
+	log.Printf("python313 runner: serving on %s (handler=%s, h2c-capable for app_protocol∈{http2,grpc})", addr, *handlerPath)
+	// ADR-126 / G19: the runner's :8080 listener opts into H2C
+	// prior-knowledge via the shared internal helper. H1 callers
+	// (app_protocol=http1, today's default) continue to work
+	// unchanged — stdlib selects HTTP/1.1 when the client doesn't
+	// open an H2 preface. See guest/runners/internal/h2c_listener.go.
+	internal.ListenAndServeH2C(internal.H2CListenerConfig{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	})
 }
 
 func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
