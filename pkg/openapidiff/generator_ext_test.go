@@ -328,6 +328,8 @@ func TestHashRules_Stable(t *testing.T) {
 }
 
 // TestHashRoutes_Stable pins the canonical-routes-hash contract.
+// Route labels are the cache-key input — observation counters
+// (Count) are intentionally NOT folded in (see HashRoutes).
 func TestHashRoutes_Stable(t *testing.T) {
 	r1 := []RouteRow{
 		{Route: "GET /users", Count: 10},
@@ -337,14 +339,34 @@ func TestHashRoutes_Stable(t *testing.T) {
 		{Route: "GET /healthz", Count: 5},
 		{Route: "GET /users", Count: 10},
 	}
+	// Same routes, different counts — the cache key must remain
+	// stable so a per-restart observation-counter refresh doesn't
+	// bust the auto-gen cache.
 	r3 := []RouteRow{
-		{Route: "GET /users", Count: 11}, // count differs
+		{Route: "GET /users", Count: 11},
+		{Route: "GET /healthz", Count: 6},
+	}
+	r4 := []RouteRow{
+		{Route: "GET /users"},
+		{Route: "GET /healthz"},
 	}
 	if HashRoutes(r1) != HashRoutes(r2) {
 		t.Error("reorder changed the hash; canonical sort should normalise")
 	}
-	if HashRoutes(r1) == HashRoutes(r3) {
-		t.Error("count change did not change the hash")
+	if HashRoutes(r1) != HashRoutes(r3) {
+		t.Error("count change busted the hash; observation counters must not affect the cache key")
+	}
+	if HashRoutes(r1) != HashRoutes(r4) {
+		t.Error("count=0 vs count>0 should hash identically")
+	}
+	// A label change must still bust the cache.
+	r5 := []RouteRow{
+		{Route: "GET /users"},
+		{Route: "GET /healthz"},
+		{Route: "POST /login"},
+	}
+	if HashRoutes(r4) == HashRoutes(r5) {
+		t.Error("adding a route did not change the hash")
 	}
 }
 

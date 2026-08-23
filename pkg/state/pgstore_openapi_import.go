@@ -174,6 +174,104 @@ func (s *PgStore) DeleteAppOpenAPIDoc(ctx context.Context, appID, accountID stri
 	return nil
 }
 
+// UpsertAppOpenAPIDocIfUnderQuota bundles the per-account quota
+// gate (count + lock + check) with the upsert so two concurrent
+// imports under the same account cannot both observe count<N
+// before either INSERT lands and bypass the per-account cap.
+//
+// The planMax argument is the resolved plan tier cap (api.Plan
+// .OpenAPIImportsPerAccount()). The handler resolves it before
+// calling so the store stays plan-tier-agnostic. planMax==0 is
+// the fail-closed path (unknown plan or a tier-down that set 0):
+// the call rejects with a NotAllowed QuotaError before the
+// count fires.
+//
+// Atomicity recipe (ADR-126 + general store pattern from
+// CreateEdgeRuleIfUnderQuota):
+//
+//  1. BEGIN tx
+//  2. SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE  — row
+//     lock on the account so a second concurrent import on
+//     the same account blocks until our tx commits.
+//  3. SELECT count(*) FROM app_openapi_docs WHERE
+//     account_id=$1 — observed count under the lock.
+//  4. If observed >= planMax → ROLLBACK + return *QuotaError
+//     {Kind: openapi_imports, NotAllowed: planMax==0,
+//     Limit: planMax, Observed: observed}.
+//  5. SELECT id FROM apps WHERE id=$1 AND account_id=$2 —
+//     parent existence + IDOR floor in one go.
+//  6. INSERT INTO app_openapi_docs ... ON CONFLICT DO UPDATE
+//     (same upsert as UpsertAppOpenAPIDoc).
+//  7. COMMIT.
+//
+// Note: an existing row at the same app_id counts against the
+// quota (the upsert path keeps the row, doesn't free a slot).
+// The per-app cap of 1 makes this symmetric — an overwrite
+// reuses the slot, it doesn't add a new one.
+func (s *PgStore) UpsertAppOpenAPIDocIfUnderQuota(ctx context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error {
+	if planMax <= 0 {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: 0, NotAllowed: true}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("state: openapi import quota tx begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Lock the account row. If the account doesn't exist this
+	// returns ErrNoRows and we bail with ErrNotFound — the apid
+	// caller treats that as a generic load failure (the loadApp
+	// path will have already validated, but defence-in-depth).
+	var acctOK string
+	if err := tx.QueryRow(ctx,
+		`select id from accounts where id = $1 for update`, accountID,
+	).Scan(&acctOK); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: openapi import quota lock account: %w", err)
+	}
+	var observed int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from app_openapi_docs where account_id = $1`, accountID,
+	).Scan(&observed); err != nil {
+		return fmt.Errorf("state: openapi import quota count: %w", err)
+	}
+	if observed >= planMax {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: observed}
+	}
+	var appOK string
+	if err := tx.QueryRow(ctx,
+		`select id from apps where id = $1 and account_id = $2`, appID, accountID,
+	).Scan(&appOK); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: openapi import parent check: %w", err)
+	}
+	sum := sha256.Sum256(doc)
+	if _, err := tx.Exec(ctx, `
+		insert into app_openapi_docs
+		    (app_id, account_id, doc, doc_sha256, byte_size,
+		     endpoint_count, source, openapi_version, captured_at, updated_at)
+		values ($1, $2, $3, $4, $5, $6, 'manual_import', $7, now(), now())
+		on conflict (app_id) do update
+		set doc             = excluded.doc,
+		    doc_sha256      = excluded.doc_sha256,
+		    byte_size       = excluded.byte_size,
+		    endpoint_count  = excluded.endpoint_count,
+		    source          = excluded.source,
+		    openapi_version = excluded.openapi_version,
+		    captured_at     = app_openapi_docs.captured_at,
+		    updated_at      = now()
+	`, appID, accountID, doc, sum[:], len(doc), endpointCount, openapiVersion); err != nil {
+		return fmt.Errorf("state: openapi import upsert: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: openapi import quota tx commit: %w", err)
+	}
+	return nil
+}
+
 // CountOpenAPIImportsByAccount returns the number of import rows
 // the account owns. Drives the per-account quota gate
 // (api.Plan.OpenAPIImportsPerAccount). The count is computed

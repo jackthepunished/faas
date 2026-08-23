@@ -3375,10 +3375,15 @@ func (c *Client) GetAppOpenAPI(ctx context.Context, slug, source string) ([]byte
 // timestamps). 413 if the doc exceeds Plan.OpenAPIImportMaxDocBytes
 // (state constant 256 KiB), 422 on validation / endpoint-cap
 // failure, 403 on per-account quota.
+//
+// Wire format is the raw OpenAPI doc (no envelope) — the apid
+// handler reads r.Body bytes verbatim and feeds them to
+// openapiimport.ValidateImport. Wrapping in {"doc":...} would
+// fail the meta-schema compile because the top-level shape
+// would no longer be the OAI doc itself.
 func (c *Client) ImportAppOpenAPI(ctx context.Context, slug string, doc map[string]any) (AppOpenAPIImportResponse, error) {
 	var out AppOpenAPIImportResponse
-	body := map[string]any{"doc": doc}
-	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi", body, &out)
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi", doc, &out)
 }
 
 // DryRunAppOpenAPI previews edge-rule suggestions for a candidate
@@ -3387,10 +3392,12 @@ func (c *Client) ImportAppOpenAPI(ctx context.Context, slug string, doc map[stri
 // per (path, method) pair NOT already covered by an existing
 // validate edge rule. Empty array when the doc is fully covered.
 // Read-only — no pg_notify, no audit emit, no MFA requirement.
+//
+// Wire format mirrors ImportAppOpenAPI: raw OpenAPI doc, no
+// envelope.
 func (c *Client) DryRunAppOpenAPI(ctx context.Context, slug string, doc map[string]any) (AppOpenAPIImportDryRunResponse, error) {
 	var out AppOpenAPIImportDryRunResponse
-	body := map[string]any{"doc": doc}
-	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi/dry-run", body, &out)
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi/dry-run", doc, &out)
 }
 
 // DeleteAppOpenAPI wipes the imported OpenAPI document for an app.

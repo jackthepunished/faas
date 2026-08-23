@@ -29,11 +29,12 @@ package openapidiff
 // The simpler algorithm wins because the cache is small.
 
 import (
-	"container/list"
 	"crypto/sha256"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/lruutil"
 )
 
 // specCacheTTL is the freshness window for cached entries. 5
@@ -75,21 +76,24 @@ type SpecCacheEntry struct {
 }
 
 // SpecCache is the in-process LRU. Safe for concurrent use.
+//
+// The LRU primitive lives in pkg/lruutil (shared with
+// pkg/edgevalidate — both caches previously re-implemented the
+// same container/list + map-index MRU/evict recipe). This struct
+// layers TTL + InvalidateByApp on top of the shared primitive;
+// a future fix to eviction ordering lands in one place.
+//
+// InvalidateByApp is wholesale because the cache payload (the
+// db.NotifyEdgeRuleChanged / NotifyAppOpenAPIDocChanged payload)
+// doesn't carry the affected IDs and the cache is bounded at
+// 256 entries so a wholesale delete is cheap. TTL=5min
+// guarantees freshness even if a notify is missed.
 type SpecCache struct {
-	mu      sync.Mutex
-	cap     int
-	ttl     time.Duration
-	entries map[string]*list.Element // key -> list element
-	lru     *list.List               // front = most recently used
-	clock   func() time.Time         // injectable for tests
-}
-
-// cacheListEntry is the list element value. Holds the cache
-// key so InvalidateByApp can scan the LRU and remove matching
-// entries without a separate map reverse-lookup.
-type cacheListEntry struct {
-	key   string
-	value *SpecCacheEntry
+	mu    sync.Mutex
+	cap   int
+	ttl   time.Duration
+	lru   *lruutil.LRU[string, *SpecCacheEntry]
+	clock func() time.Time // injectable for tests
 }
 
 // NewSpecCache returns a fresh SpecCache with the default
@@ -114,11 +118,10 @@ func NewSpecCacheWithClock(cap int, ttl time.Duration, clock func() time.Time) *
 		clock = time.Now
 	}
 	return &SpecCache{
-		cap:     cap,
-		ttl:     ttl,
-		entries: make(map[string]*list.Element, cap),
-		lru:     list.New(),
-		clock:   clock,
+		cap:   cap,
+		ttl:   ttl,
+		lru:   lruutil.New[string, *SpecCacheEntry](cap),
+		clock: clock,
 	}
 }
 
@@ -138,21 +141,18 @@ func (c *SpecCache) Get(appID string, docSHA, routesSHA, rulesSHA [32]byte) (*Sp
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := CacheKey(appID, docSHA, routesSHA, rulesSHA)
-	el, ok := c.entries[key]
+	entry, ok := c.lru.Get(key)
 	if !ok {
 		return nil, false
 	}
-	// Move-to-front: refresh LRU position.
-	c.lru.MoveToFront(el)
-	entry := el.Value.(*cacheListEntry)
 	// TTL check. An expired entry is treated as a miss and
 	// evicted from the cache so subsequent Get calls return
 	// miss cleanly without us keeping dead weight.
-	if c.clock().Sub(entry.value.GeneratedAt) > c.ttl {
-		c.removeElement(el)
+	if c.clock().Sub(entry.GeneratedAt) > c.ttl {
+		c.lru.Delete(key)
 		return nil, false
 	}
-	return entry.value, true
+	return entry, true
 }
 
 // Put inserts (or overwrites) a cache entry. body is the
@@ -164,29 +164,12 @@ func (c *SpecCache) Put(appID string, docSHA, routesSHA, rulesSHA [32]byte, body
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := CacheKey(appID, docSHA, routesSHA, rulesSHA)
-	entry := &SpecCacheEntry{
+	c.lru.Put(key, &SpecCacheEntry{
 		Body:             body,
 		Source:           source,
 		AnnotationsCount: annotationsCount,
 		GeneratedAt:      generatedAt,
-	}
-	if el, ok := c.entries[key]; ok {
-		// Overwrite: refresh value + LRU position.
-		el.Value.(*cacheListEntry).value = entry
-		c.lru.MoveToFront(el)
-		return
-	}
-	// Insert: front-of-list for LRU.
-	el := c.lru.PushFront(&cacheListEntry{key: key, value: entry})
-	c.entries[key] = el
-	// Evict from the back if we're over cap.
-	for c.lru.Len() > c.cap {
-		oldest := c.lru.Back()
-		if oldest == nil {
-			break
-		}
-		c.removeElement(oldest)
-	}
+	})
 }
 
 // InvalidateByApp removes all cache entries for the given appID.
@@ -196,17 +179,10 @@ func (c *SpecCache) InvalidateByApp(appID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	prefix := appID + "/"
-	for el := c.lru.Front(); el != nil; {
-		next := el.Next()
-		entry, ok := el.Value.(*cacheListEntry)
-		if !ok {
-			el = next
-			continue
+	for _, k := range c.lru.Keys() {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			c.lru.Delete(k)
 		}
-		if len(entry.key) >= len(prefix) && entry.key[:len(prefix)] == prefix {
-			c.removeElement(el)
-		}
-		el = next
 	}
 }
 
@@ -216,13 +192,6 @@ func (c *SpecCache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lru.Len()
-}
-
-// removeElement is the un-locked helper for the LRU + map
-// removal. Caller must hold c.mu.
-func (c *SpecCache) removeElement(el *list.Element) {
-	c.lru.Remove(el)
-	delete(c.entries, el.Value.(*cacheListEntry).key)
 }
 
 // SumSHA256 is the small helper that hashes a byte slice into

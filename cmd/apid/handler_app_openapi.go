@@ -144,27 +144,43 @@ func (s *server) serveOpenAPIDocManualImport(w http.ResponseWriter, r *http.Requ
 // source string are written verbatim and the heavy pipeline
 // is skipped entirely (issue #975 item #2 D4 +
 // pre-rendered-payload review-fix).
-func (s *server) serveOpenAPIDocAuto(w http.ResponseWriter, r *http.Request, app state.App) {
-	doc, _, docErr := s.store.GetAppOpenAPIDoc(r.Context(), app.ID, app.AccountID)
+// writeAutoSpecHeaders is the shared response-header recipe for
+// the auto-gen path (cache hit + cache miss + empty-import). The
+// three arms all set the same Content-Type, Cache-Control, and
+// X-OpenAPI-Doc-Source fields; only the X-Faas-Cache value (hit
+// vs miss) and the annotations-count string differ.
+func writeAutoSpecHeaders(w http.ResponseWriter, source, cacheState string, annotationsCount int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Faas-Cache", cacheState)
+	w.Header().Set("X-OpenAPI-Doc-Source", source)
+	w.Header().Set("X-OpenAPI-Doc-Annotations-Count", fmt.Sprintf("%d", annotationsCount))
+}
+
+// loadAutoGenInputs gathers (doc, observed, rules, SHAs) for the
+// auto-gen path. Returns ok=false with a problem written to w on
+// failure. The cache-key SHAs are computed O(n) over the raw
+// inputs so a cache hit can skip parse + merge + render;
+// GenerateFromApp recomputes the same SHAs internally and
+// equality is pinned by pkg/openapidiff tests.
+func (s *server) loadAutoGenInputs(w http.ResponseWriter, r *http.Request, app state.App) (
+	doc []byte, observed []openapidiff.RouteRow, rules []state.EdgeRule,
+	docSHA, routesSHA, rulesSHA [32]byte, ok bool,
+) {
+	var docErr error
+	doc, _, docErr = s.store.GetAppOpenAPIDoc(r.Context(), app.ID, app.AccountID)
 	if docErr != nil && !errors.Is(docErr, state.ErrNotFound) {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
 			"failed to read imported doc", docErr.Error()))
-		return
+		return nil, nil, nil, [32]byte{}, [32]byte{}, [32]byte{}, false
 	}
-	observed := s.fetchObservedRoutes(r.Context(), app.ID)
-	rules, rulesErr := s.store.ListEdgeRulesForApp(r.Context(), app.ID)
+	observed = s.fetchObservedRoutes(r.Context(), app.ID)
+	var rulesErr error
+	rules, rulesErr = s.store.ListEdgeRulesForApp(r.Context(), app.ID)
 	if rulesErr != nil {
 		s.log.Debug("getAppOpenAPI ListEdgeRulesForApp", "err", rulesErr.Error())
 		rules = nil
 	}
-
-	// Compute the cache-key SHAs from the raw inputs. These
-	// are O(n) over (doc bytes, routes rows, rules rows) and
-	// run before the heavy pipeline so a cache hit can skip
-	// parse + merge + render. GenerateFromApp will recompute
-	// the same SHAs internally — equality is pinned by the
-	// pkg/openapidiff tests.
-	var docSHA, routesSHA, rulesSHA [32]byte
 	if len(doc) > 0 {
 		docSHA = openapidiff.SumSHA256(doc)
 	}
@@ -174,17 +190,19 @@ func (s *server) serveOpenAPIDocAuto(w http.ResponseWriter, r *http.Request, app
 	if len(rules) > 0 {
 		rulesSHA = openapidiff.HashRules(rules)
 	}
+	return doc, observed, rules, docSHA, routesSHA, rulesSHA, true
+}
 
+func (s *server) serveOpenAPIDocAuto(w http.ResponseWriter, r *http.Request, app state.App) {
+	doc, observed, rules, docSHA, routesSHA, rulesSHA, ok := s.loadAutoGenInputs(w, r, app)
+	if !ok {
+		return
+	}
 	// Cheap path: cache hit. Skip parse + merge + render
 	// entirely; write the pre-rendered body and headers.
 	if s.specCache != nil {
 		if hit, ok := s.specCache.Get(app.ID, docSHA, routesSHA, rulesSHA); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Faas-Cache", "hit")
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("X-OpenAPI-Doc-Source", hit.Source)
-			w.Header().Set("X-OpenAPI-Doc-Annotations-Count",
-				fmt.Sprintf("%d", hit.AnnotationsCount))
+			writeAutoSpecHeaders(w, hit.Source, "hit", hit.AnnotationsCount)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(hit.Body)
 			return
@@ -200,11 +218,7 @@ func (s *server) serveOpenAPIDocAuto(w http.ResponseWriter, r *http.Request, app
 	})
 	if genErr != nil {
 		if errors.Is(genErr, openapidiff.ErrImportMissing) {
-			// 200 with empty paths + source marker so the
-			// dashboard can render the "no spec yet" state.
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("X-OpenAPI-Doc-Source", openapidiff.SourceEmptyImportRules)
+			writeAutoSpecHeaders(w, openapidiff.SourceEmptyImportRules, "miss", 0)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"openapi":"3.1.0","info":{"title":"","version":""},"paths":{}}`))
 			return
@@ -214,22 +228,11 @@ func (s *server) serveOpenAPIDocAuto(w http.ResponseWriter, r *http.Request, app
 		return
 	}
 	rendered := renderOpenAPISpecJSON(genSpec, genMeta, app)
-	// Fill the cache with the pre-rendered body so a
-	// follow-up hit returns verbatim. The Source string is
-	// recorded at fill time — it must be the same string the
-	// handler would emit on a fresh miss (i.e. genMeta.Source),
-	// NOT a degraded fallback the handler later rewrites
-	// (review-fix: cache hit must surface the degraded source
-	// string verbatim).
 	if s.specCache != nil {
 		s.specCache.Put(app.ID, genMeta.DocSHA256, genMeta.RoutesSHA256, genMeta.RulesSHA256,
 			rendered, genMeta.Source, len(genMeta.Annotations), time.Now())
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Faas-Cache", "miss")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-OpenAPI-Doc-Source", genMeta.Source)
-	w.Header().Set("X-OpenAPI-Doc-Annotations-Count", fmt.Sprintf("%d", len(genMeta.Annotations)))
+	writeAutoSpecHeaders(w, genMeta.Source, "miss", len(genMeta.Annotations))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(rendered)
 }
@@ -357,72 +360,63 @@ func (s *server) fetchObservedRoutes(ctx context.Context, appID string) []openap
 	return rows
 }
 
+// readAndValidateImportBody is the shared body-read + size-cap +
+// meta-schema-validate + endpoint-cap helper used by both the
+// import and dry-run handlers. On any reject path it writes the
+// RFC 7807 problem to w and returns ok=false; the caller bails.
+// Returns the validated raw doc, the parsed openapi_version, and
+// the endpoint count on success.
+func (s *server) readAndValidateImportBody(w http.ResponseWriter, r *http.Request) (raw []byte, version string, endpointCount int, ok bool) {
+	maxRead := int64(state.OpenAPIImportMaxDocBytes) + 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxRead)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
+			"imported doc exceeds size cap",
+			fmt.Sprintf("limit=%d", state.OpenAPIImportMaxDocBytes)))
+		return nil, "", 0, false
+	}
+	if len(body) == 0 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "empty_body",
+			"request body is empty", ""))
+		return nil, "", 0, false
+	}
+	if len(body) > state.OpenAPIImportMaxDocBytes {
+		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
+			"imported doc exceeds size cap",
+			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxDocBytes, len(body))))
+		return nil, "", 0, false
+	}
+	v, n, vErr := openapiimport.ValidateImport(body)
+	if vErr != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_invalid",
+			"imported OpenAPI doc failed validation", vErr.Error()))
+		return nil, "", 0, false
+	}
+	if n > state.OpenAPIImportMaxEndpoints {
+		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_too_many_endpoints",
+			"imported doc declares too many endpoints",
+			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxEndpoints, n)))
+		return nil, "", 0, false
+	}
+	return body, v, n, true
+}
+
 // postAppOpenAPIImport handles POST /v1/apps/{slug}/openapi.
-// Reads the body, validates (size + endpoint count + schema),
-// checks per-account quota, persists via UpsertAppOpenAPIDoc,
-// emits audit + pg_notify, returns 200.
+// Reads the body, validates, runs the per-account quota gate
+// (atomic count+lock+upsert at the store), emits audit +
+// pg_notify, returns 200.
 func (s *server) postAppOpenAPIImport(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	slug := r.PathValue("slug")
 	app, ok := s.loadApp(w, r, acct, slug)
 	if !ok {
 		return
 	}
-	maxRead := int64(state.OpenAPIImportMaxDocBytes) + 1024
-	r.Body = http.MaxBytesReader(w, r.Body, maxRead)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
-			"imported doc exceeds size cap",
-			fmt.Sprintf("limit=%d", state.OpenAPIImportMaxDocBytes)))
+	raw, openapiVersion, endpointCount, ok := s.readAndValidateImportBody(w, r)
+	if !ok {
 		return
 	}
-	if len(raw) == 0 {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "empty_body",
-			"request body is empty", ""))
-		return
-	}
-	if len(raw) > state.OpenAPIImportMaxDocBytes {
-		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
-			"imported doc exceeds size cap",
-			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxDocBytes, len(raw))))
-		return
-	}
-	openapiVersion, endpointCount, validateErr := openapiimport.ValidateImport(raw)
-	if validateErr != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_invalid",
-			"imported OpenAPI doc failed validation", validateErr.Error()))
-		return
-	}
-	if endpointCount > state.OpenAPIImportMaxEndpoints {
-		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_too_many_endpoints",
-			"imported doc declares too many endpoints",
-			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxEndpoints, endpointCount)))
-		return
-	}
-	count, err := s.store.CountOpenAPIImportsByAccount(r.Context(), acct.ID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
-			"failed to count imports", err.Error()))
-		return
-	}
-	planMax := acct.Plan.OpenAPIImportsPerAccount()
-	if planMax == 0 {
-		// Fail-closed: unknown plans (or plans explicitly set
-		// to 0 — e.g., a tier-down migration) cannot import.
-		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "openapi_import_quota_reached",
-			"per-account OpenAPI import quota reached",
-			fmt.Sprintf("limit=%d observed=%d", planMax, count)))
-		return
-	}
-	if count >= planMax {
-		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "openapi_import_quota_reached",
-			"per-account OpenAPI import quota reached",
-			fmt.Sprintf("limit=%d observed=%d", planMax, count)))
-		return
-	}
-	if err := s.store.UpsertAppOpenAPIDoc(r.Context(), app.ID, acct.ID, raw, endpointCount, openapiVersion); err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
-			"failed to persist import", err.Error()))
+	if err := s.enforceOpenAPIImportQuota(w, r, acct, app, raw, endpointCount, openapiVersion); err != nil {
 		return
 	}
 	s.audit.Emit(r.Context(), "app.openapi_import.replaced", &acct.ID, map[string]any{
@@ -452,9 +446,57 @@ func (s *server) postAppOpenAPIImport(w http.ResponseWriter, r *http.Request, ac
 	})
 }
 
+// enforceOpenAPIImportQuota runs the per-account quota gate +
+// atomic upsert. The Count+check+Upsert triplet is bundled
+// inside UpsertAppOpenAPIDocIfUnderQuota so a TOCTOU race
+// between two concurrent imports can't slip past the cap; the
+// upfront Count here is a fast-feedback pre-check that lets us
+// return the 403 BEFORE the JSONB INSERT round-trip. Writes the
+// RFC 7807 problem to w on any reject path. Returns nil on
+// success.
+func (s *server) enforceOpenAPIImportQuota(w http.ResponseWriter, r *http.Request, acct state.Account, app state.App, raw []byte, endpointCount int, openapiVersion string) error {
+	count, err := s.store.CountOpenAPIImportsByAccount(r.Context(), acct.ID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
+			"failed to count imports", err.Error()))
+		return err
+	}
+	planMax := acct.Plan.OpenAPIImportsPerAccount()
+	if planMax == 0 {
+		// Fail-closed: unknown plans (or plans explicitly set
+		// to 0 — e.g., a tier-down migration) cannot import.
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "openapi_import_quota_reached",
+			"per-account OpenAPI import quota reached",
+			fmt.Sprintf("limit=%d observed=%d", planMax, count)))
+		return state.ErrQuotaExceeded
+	}
+	if count >= planMax {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "openapi_import_quota_reached",
+			"per-account OpenAPI import quota reached",
+			fmt.Sprintf("limit=%d observed=%d", planMax, count)))
+		return state.ErrQuotaExceeded
+	}
+	if err := s.store.UpsertAppOpenAPIDocIfUnderQuota(r.Context(), app.ID, acct.ID, raw, endpointCount, openapiVersion, planMax); err != nil {
+		var qe *state.QuotaError
+		switch {
+		case errors.As(err, &qe) && qe.Kind == state.QuotaErrorKindOpenAPIImports:
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "openapi_import_quota_reached",
+				"per-account OpenAPI import quota reached",
+				fmt.Sprintf("limit=%d observed=%d", qe.Limit, qe.Observed)))
+		case errors.Is(err, state.ErrNotFound):
+			s.notFound(w, "no such app")
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
+				"failed to persist import", err.Error()))
+		}
+		return err
+	}
+	return nil
+}
+
 // postAppOpenAPIImportDryRun handles POST
 // /v1/apps/{slug}/openapi/dry-run. Read-only; no persist.
-// Reads the body, validates, returns EdgeRuleSuggestion rows
+// Reads + validates the body, returns EdgeRuleSuggestion rows
 // for (path, method) pairs not already covered by an existing
 // validate edge rule.
 func (s *server) postAppOpenAPIImportDryRun(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -463,39 +505,19 @@ func (s *server) postAppOpenAPIImportDryRun(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	maxRead := int64(state.OpenAPIImportMaxDocBytes) + 1024
-	r.Body = http.MaxBytesReader(w, r.Body, maxRead)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
-			"imported doc exceeds size cap", ""))
-		return
-	}
-	if len(raw) == 0 {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "empty_body",
-			"request body is empty", ""))
-		return
-	}
-	if len(raw) > state.OpenAPIImportMaxDocBytes {
-		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, "openapi_import_too_large",
-			"imported doc exceeds size cap",
-			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxDocBytes, len(raw))))
-		return
-	}
-	_, endpointCount, validateErr := openapiimport.ValidateImport(raw)
-	if validateErr != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_invalid",
-			"imported OpenAPI doc failed validation", validateErr.Error()))
-		return
-	}
-	if endpointCount > state.OpenAPIImportMaxEndpoints {
-		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "openapi_import_too_many_endpoints",
-			"imported doc declares too many endpoints",
-			fmt.Sprintf("limit=%d observed=%d", state.OpenAPIImportMaxEndpoints, endpointCount)))
+	raw, _, _, ok := s.readAndValidateImportBody(w, r)
+	if !ok {
 		return
 	}
 	existing, rulesErr := s.store.ListEdgeRulesForApp(r.Context(), app.ID)
 	if rulesErr != nil {
+		// The dry-run path is best-effort: a missing rules view
+		// shouldn't block the preview, but a silent swallow
+		// (pre-fix) left failures invisible. Surface at Debug
+		// so the tripwire (slog JSON → log shipper) catches a
+		// future regression — mirror of the sibling
+		// serveOpenAPIDocAuto path above.
+		s.log.Debug("postAppOpenAPIImportDryRun ListEdgeRulesForApp", "err", rulesErr.Error())
 		existing = nil
 	}
 	dryRun, dryErr := openapidiff.ComputeDryRun(raw, existing)

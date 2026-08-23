@@ -126,10 +126,17 @@ const (
 	// handler can stamp both on the RFC 7807 problem without
 	// re-running the count.
 	QuotaErrorKindMirror QuotaErrorKind = "mirror"
+	// QuotaErrorKindOpenAPIImports (issue #975 item #2 / ADR-126)
+	// trips when an account exceeds Plan.OpenAPIImportsPerAccount
+	// for per-app OpenAPI doc imports. The store's
+	// UpsertAppOpenAPIDocIfUnderQuota runs count + lock + upsert
+	// inside the same critical section so a TOCTOU race can't slip
+	// past the cap.
+	QuotaErrorKindOpenAPIImports QuotaErrorKind = "openapi_imports"
 )
 
 type QuotaError struct {
-	Kind       QuotaErrorKind // "apps" | "crons" | "memory"
+	Kind       QuotaErrorKind // "apps" | "crons" | "memory" | "mirror" | "openapi_imports"
 	Limit      int            // caps at the time of the call
 	Observed   int            // count(*) observed inside the same critical section
 	NotAllowed bool           // true when the plan tier forbids the entity entirely (e.g. Free cron)
@@ -142,6 +149,11 @@ func (e *QuotaError) Error() string {
 			return "state: crons not allowed on this plan"
 		}
 		return fmt.Sprintf("state: cron quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+	case QuotaErrorKindOpenAPIImports:
+		if e.NotAllowed {
+			return "state: openapi_imports not allowed on this plan"
+		}
+		return fmt.Sprintf("state: openapi_imports quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
 	default:
 		return fmt.Sprintf("state: deployed-app quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
 	}
@@ -2150,10 +2162,24 @@ type Store interface {
 	// row is filtered by (app_id, account_id) at the WHERE clause
 	// so a misrouted call from a different account fails with
 	// ErrNotFound. Idempotent: a re-delivered import overwrites
-	// the same row, not creates a second one. The per-account
-	// quota gate is upstream — the apid calls
-	// CountOpenAPIImportsByAccount before this call.
+	// the same row, not creates a second one.
+	//
+	// The per-account quota gate is upstream — prefer
+	// UpsertAppOpenAPIDocIfUnderQuota which bundles count+lock+upsert
+	// into a single atomic store call. This raw method is kept
+	// for callers that have already taken the lock (admin tool,
+	// test harness, internal API).
 	UpsertAppOpenAPIDoc(ctx context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string) error
+	// UpsertAppOpenAPIDocIfUnderQuota bundles the per-account quota
+	// gate (count + lock + check) with the upsert so a TOCTOU race
+	// between two concurrent imports under the same account can't
+	// slip past the cap. The PgStore impl runs the count + upsert
+	// inside a transaction with a row lock on the account; the
+	// MemStore impl serialises under m.mu. Returns
+	// ErrOpenAPIImportsPerAccountQuotaReached when count>=limit;
+	// ErrNotFound when the parent app row is missing or the
+	// caller's accountID does not match.
+	UpsertAppOpenAPIDocIfUnderQuota(ctx context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error
 	// DeleteAppOpenAPIDoc removes the import row for one app.
 	// ErrNotFound when no row OR the caller's accountID does not
 	// match — same IDOR floor as the read. The apid caller

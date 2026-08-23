@@ -4907,18 +4907,24 @@ func (m *MemStore) GetAppOpenAPIDoc(_ context.Context, appID, accountID string) 
 	}, nil
 }
 
-// UpsertAppOpenAPIDoc mirrors pgstore. The app row must exist (the
-// FK CASCADE in migration 00409 makes this unreachable in
-// practice, but the explicit check lets a misuse at the call site
-// fail closed). Idempotent: a re-delivered import overwrites the
-// same row, not creates a second. openapiVersion is one of
-// ValidOpenAPIVersions (closed enum); the caller is responsible
-// for pre-validation (the apid openapiimport.ValidateImport check
-// is upstream).
+// UpsertAppOpenAPIDoc mirrors pgstore. The app row must exist AND
+// belong to the caller's account (defence-in-depth — the apid
+// loadApp boundary already gates this, but the store layer must
+// enforce the IDOR floor so a future caller that bypasses the
+// handler — admin tool, test harness, internal API — cannot
+// write a row into a foreign tenant's app_id and then read it
+// back via GetAppOpenAPIDoc). FK CASCADE in migration 00409 makes
+// the parent-existence check unreachable in practice but the
+// explicit check keeps the error surface predictable. Idempotent:
+// a re-delivered import overwrites the same row, not creates a
+// second. openapiVersion is one of ValidOpenAPIVersions (closed
+// enum); the caller is responsible for pre-validation (the apid
+// openapiimport.ValidateImport check is upstream).
 func (m *MemStore) UpsertAppOpenAPIDoc(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.apps[appID]; !ok {
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
 		return ErrNotFound
 	}
 	now := time.Now()
@@ -4988,6 +4994,61 @@ func (m *MemStore) CountOpenAPIImportsByAccount(_ context.Context, accountID str
 		}
 	}
 	return n, nil
+}
+
+// UpsertAppOpenAPIDocIfUnderQuota mirrors PgStore's transactional
+// count+lock+upsert. The MemStore is single-threaded under m.mu
+// so the atomicity is implicit (the PgStore tx's purpose is to
+// serialise concurrent imports; MemStore achieves the same via
+// the mutex). The Plan.Max=0 path is fail-closed.
+func (m *MemStore) UpsertAppOpenAPIDocIfUnderQuota(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error {
+	if planMax <= 0 {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: 0, NotAllowed: true}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
+		return ErrNotFound
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return ErrNotFound
+	}
+	observed := 0
+	for _, r := range m.openAPIImports {
+		if r.AccountID == accountID {
+			observed++
+		}
+	}
+	if observed >= planMax {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: observed}
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := appOpenAPIImportRow{
+		AppID:          appID,
+		AccountID:      accountID,
+		Doc:            docCopy,
+		Source:         OpenAPIImportSourceManualImport,
+		OpenAPIVersion: openapiVersion,
+		EndpointCount:  endpointCount,
+		ByteSize:       len(docCopy),
+		DocSHA256:      sum[:],
+	}
+	if existing, ok := m.openAPIImports[appID]; ok {
+		// Same idempotent-overwrite contract as UpsertAppOpenAPIDoc
+		// — see the rationale there. The original AccountID +
+		// CapturedAt survive a re-import; UpdatedAt bumps.
+		row.AccountID = existing.AccountID
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIImports[appID] = row
+	return nil
 }
 
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /

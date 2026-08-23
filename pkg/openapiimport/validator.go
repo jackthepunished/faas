@@ -41,10 +41,9 @@ import (
 	"errors"
 	"fmt"
 
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
-
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
+
+	"github.com/onebox-faas/faas/pkg/jsonschemautil"
 )
 
 // openapiImportSchema is the structural-minimum schema embedded
@@ -55,11 +54,14 @@ import (
 //go:embed schemas/openapi-import-check.json
 var openapiImportSchema []byte
 
-// defaultPrinter mirrors pkg/edgevalidate/jsonschema.go's
-// defaultPrinter. LocalizedString panics on nil printer (per
-// jsonschema/v6 output.go); we keep a private English printer
-// so the wire shape is stable across locale env.
-var defaultPrinter = message.NewPrinter(language.English)
+// defaultPrinter aliases the shared jsonschemautil.DefaultPrinter
+// so the existing call sites stay unchanged. LocalizedString
+// panics on nil printer (per jsonschema/v6 output.go); the shared
+// instance is an English printer so the wire shape is stable
+// across locale env. Factored into pkg/jsonschemautil so a future
+// regression in the printer setup (e.g., a Locale-aware printer
+// for the dashboard) lands in one place.
+var defaultPrinter = jsonschemautil.DefaultPrinter
 
 // metaSchemaURL is the canonical resource URL the meta-schema
 // is loaded at. The URL is referenced by the schema's $id and
@@ -227,9 +229,9 @@ func firstLeafCause(verr *jsonschema.ValidationError) (path, reason string) {
 		current = current.Causes[0]
 	}
 	// Build the JSON Pointer-style path.
-	path = joinInstanceLocation(current.InstanceLocation)
+	path = jsonschemautil.JoinInstanceLocation(current.InstanceLocation)
 	if path == "" {
-		path = joinInstanceLocation(verr.InstanceLocation)
+		path = jsonschemautil.JoinInstanceLocation(verr.InstanceLocation)
 	}
 	// Get the human-readable reason via ErrorKind.
 	if current.ErrorKind != nil {
@@ -244,27 +246,11 @@ func firstLeafCause(verr *jsonschema.ValidationError) (path, reason string) {
 	return path, reason
 }
 
-// joinInstanceLocation joins an InstanceLocation []string into
-// a slash-separated JSON Pointer-style path. Mirrors the
-// helper in pkg/edgevalidate/jsonschema.go; inlined here so
-// this package has no dependency on pkg/edgevalidate (the
-// validator runs at the apid boundary, edgevalidate runs at
-// the gatewayd-internal boundary — different layers).
-func joinInstanceLocation(loc []string) string {
-	if len(loc) == 0 {
-		return ""
-	}
-	var sz int
-	for _, s := range loc {
-		sz += 1 + len(s)
-	}
-	out := make([]byte, 0, sz)
-	for _, s := range loc {
-		out = append(out, '/')
-		out = append(out, s...)
-	}
-	return string(out)
-}
+// joinInstanceLocation was previously inlined here. It now lives
+// in pkg/jsonschemautil so pkg/edgevalidate and this package can
+// share the canonical JSON Pointer shape. The original copy was
+// identical to the edgevalidate version; the dedup lands here as
+// part of the #975-item-2 review-fix cluster (Fix #8).
 
 // countOperations walks the parsed doc and counts HTTP
 // operations under paths.*. Recognised methods are the 8 in the

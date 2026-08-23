@@ -349,11 +349,23 @@ func HashRules(rules []state.EdgeRule) [32]byte {
 	return sum
 }
 
-// HashRoutes returns sha256 of the canonical (route + count)
-// row concatenation. Used as one half of the cache key for
-// the observed-routes layer. Exported so the apid handler can
+// HashRoutes returns sha256 of the canonical (route-only) row
+// concatenation. Used as one half of the cache key for the
+// observed-routes layer. Exported so the apid handler can
 // compute the cache key half without running the full
 // GenerateFromApp pipeline.
+//
+// Count is intentionally NOT folded into the hash. The
+// observed-routes path goes through the apid bridge that
+// synthesises RouteRow{Route: label} (Count=0) — a Count-0
+// marker on the read side. Folding Count into the cache key
+// would couple the cache to per-restart observation counters,
+// not to the routes' shape, and a label-only bridge would
+// silently never hit the cache once a future gateway endpoint
+// populates Count > 0. Pinning the hash to the route labels
+// keeps the cache stable across observation-counter
+// fluctuations. The dashboard Count/P50/P95 fields live in
+// RouteRow only for the metrics surface (not the cache key).
 func HashRoutes(rows []RouteRow) [32]byte {
 	sorted := make([]RouteRow, len(rows))
 	copy(sorted, rows)
@@ -361,16 +373,6 @@ func HashRoutes(rows []RouteRow) [32]byte {
 	h := sha256.New()
 	for _, r := range sorted {
 		h.Write([]byte(r.Route))
-		h.Write([]byte{0})
-		// Count is a uint64; little-endian encoding is
-		// stable across apid restarts.
-		var countBuf [8]byte
-		count := r.Count
-		for i := 7; i >= 0; i-- {
-			countBuf[i] = byte(count)
-			count >>= 8
-		}
-		h.Write(countBuf[:])
 		h.Write([]byte{0})
 	}
 	var sum [32]byte
