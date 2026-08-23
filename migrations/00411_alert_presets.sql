@@ -1,4 +1,4 @@
--- filename: 00347_alert_presets.sql
+-- filename: 00411_alert_presets.sql
 -- +goose Up
 -- +goose StatementBegin
 

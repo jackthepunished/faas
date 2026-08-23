@@ -1,4 +1,4 @@
--- filename: 00348_alert_presets_seed.sql
+-- filename: 00412_alert_presets_seed.sql
 -- +goose Up
 -- +goose StatementBegin
 
