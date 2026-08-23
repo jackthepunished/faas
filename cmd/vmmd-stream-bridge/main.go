@@ -169,46 +169,7 @@ func main() {
 		os.Exit(3)
 	}
 
-	srv := &http.Server{
-		// ADR-127 §D2 (Layer 9): the inner Handler is wrapped with
-		// h2c.NewHandler so the listener negotiates H2C prior-
-		// knowledge AND we get to pin per-protocol http2.Server
-		// knobs that stdlib's Protocols.SetUnencryptedHTTP2 API
-		// (Go 1.24+) does not expose. The handler argument is
-		// the newHandler closure constructed at the line below;
-		// the http2.Server is config-only — the runtime server
-		// is the one stdlib builds inside h2c.NewHandler and
-		// attaches to the wrapped handler.
-		Handler: h2c.NewHandler(newHandler(guestIP, uint16(port), deadline), &http2.Server{
-			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
-			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
-			// MaxHeaderListSize is a client-side SETTINGS capability
-			// (SETTINGS_MAX_HEADER_LIST_SIZE) and isn't an
-			// x/net/http2.Server field. The stdlib http.Server's
-			// MaxHeaderBytes above is the server-side equivalent
-			// — caps the per-request header list at 1 MiB and is
-			// applied before HPACK decode allocates per-name
-			// memory.
-			IdleTimeout:      60 * time.Second,
-			ReadIdleTimeout:  30 * time.Second,
-			PingTimeout:      15 * time.Second,
-			// WriteByteTimeout is intentionally UNSET (default 0 = unbounded). A 30s cap would terminate SSE responses, long-poll responses, and gRPC server-streaming responses whose DATA frames are spaced >30s apart — the canonical H2C use case. The bridge is the host-side proxy; the guest's per-request context bounds end-of-stream, not us.
-		}),
-		// ReadHeaderTimeout is the H2C connection preface budget;
-		// 10s is generous on a same-host unix socket.
-		ReadHeaderTimeout: 10 * time.Second,
-		// ADR-127 §D2 (Layer 9) — stdlib listener hardeners.
-		// Mirrors the client transport pins in
-		// h2c_terminator.go::h2cMax*; caps the per-request
-		// header list, bounds the connection idle lifetime, and
-		// bounds the headline read so a Slowloris-style attacker
-		// can't pin a bridge process indefinitely.
-		MaxHeaderBytes: api.DefaultMaxHeaderBytes, // 1 MiB
-		IdleTimeout:    120 * time.Second,
-		// ReadTimeout is intentionally UNSET. stdlib's ReadTimeout caps the ENTIRE request lifetime (headers + body), not just the headers; a 30s cap would regress slow H1 uploads (Hobby+ plans allow up to 100 MB streaming body) and any H2C request whose body takes >30s. The ReadHeaderTimeout above is the Slowloris defence; the per-request ctx deadline bounds the in-flight request lifetime. WriteTimeout is also UNSET — streaming (SSE / long-poll / H2 DATA frames past the deadline) is the supported shape for both H1 and H2C paths.
-	}
-
-	// SIGTERM/SIGINT → graceful shutdown. vmmd sends SIGTERM after
+	srv := buildServer(guestIP, uint16(port), deadline)
 	// the gRPC ForwardHTTPStream returns; the bridge exits cleanly
 	// without truncating an in-flight stream.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -235,6 +196,81 @@ func main() {
 			fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 			os.Exit(4)
 		}
+	}
+}
+
+// buildServer constructs the stdlib http.Server the bridge
+// listens on for FAAS_BRIDGE_PROTOCOL=h2c traffic.
+//
+// ADR-127 §D2 (Layer 9) — the inner Handler is wrapped with
+// h2c.NewHandler so the listener negotiates H2C prior-knowledge
+// AND we get to pin per-protocol http2.Server knobs that
+// stdlib's Protocols.SetUnencryptedHTTP2 API (Go 1.24+) does
+// not expose. The handler argument is the newHandler closure;
+// the http2.Server is config-only — the runtime server is the
+// one stdlib builds inside h2c.NewHandler and attaches to the
+// wrapped handler.
+//
+// This function is the test seam for the listener-level
+// hardeners (TestMain_ServerHardeners). A refactor of the
+// h2c.MaxConcurrentStreams / h2cMaxReadFrameSize / IdleTimeout /
+// ReadIdleTimeout / PingTimeout block must update both sites
+// (this function and any sibling test) in lockstep; the comment
+// block at h2c_terminator.go::h2cMax* holds the constant
+// rationale.
+//
+// Pin rationale (the canonical location is here, not in tests):
+//   - MaxConcurrentStreams = 100 — matches gatewayd-public cap
+//     (pkg/gateway/internal_proxy.go).
+//   - MaxReadFrameSize     = 1 MiB — matches h2cMaxReadFrameSize
+//     on the client transport (symmetry contract).
+//   - IdleTimeout          = 60s — connection idle cap.
+//   - ReadIdleTimeout      = 30s — half of IdleTimeout; stdlib
+//     will Ping at this point.
+//   - PingTimeout          = 15s — response budget for the
+//     PING/PINGACK round-trip.
+//   - WriteByteTimeout     = 0 (UNSET) — see inline rationale.
+//     Capping DATA-frame pacing would break SSE / long-poll /
+//     gRPC server-streaming whose DATA frames span >30s. The
+//     guest's per-request context bounds end-of-stream, not us.
+//
+// Outer http.Server pins:
+//   - ReadHeaderTimeout  = 10s — H2C connection preface budget,
+//     generous on a same-host unix socket.
+//   - MaxHeaderBytes     = api.DefaultMaxHeaderBytes (1 MiB) —
+//     prevents HPACK-decode allocation attacks on a 1 MiB
+//     header list.
+//   - IdleTimeout        = 120s — connection idle lifetime cap.
+//   - ReadTimeout        = 0 (UNSET) — stdlib's ReadTimeout
+//     caps the ENTIRE request lifetime (headers + body), not
+//     just headers; a 30s cap would regress H1 streaming
+//     uploads (Hobby+ allows 100 MB) and any H2C request whose
+//     body takes >30s. ReadHeaderTimeout above is the
+//     Slowloris defence.
+//   - WriteTimeout       = 0 (UNSET) — streaming (SSE /
+//     long-poll / H2 DATA frames past the deadline) is the
+//     supported shape for both H1 and H2C paths.
+func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Server {
+	return &http.Server{
+		Handler: h2c.NewHandler(newHandler(guestIP, guestPort, deadline), &http2.Server{
+			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
+			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
+			// MaxHeaderListSize is a client-side SETTINGS capability
+			// (SETTINGS_MAX_HEADER_LIST_SIZE) and isn't an
+			// x/net/http2.Server field. The stdlib http.Server's
+			// MaxHeaderBytes above is the server-side equivalent
+			// — caps the per-request header list at 1 MiB and is
+			// applied before HPACK decode allocates per-name
+			// memory.
+			IdleTimeout:     60 * time.Second,
+			ReadIdleTimeout: 30 * time.Second,
+			PingTimeout:     15 * time.Second,
+			// WriteByteTimeout is intentionally UNSET (default 0 = unbounded). A 30s cap would terminate SSE responses, long-poll responses, and gRPC server-streaming responses whose DATA frames are spaced >30s apart — the canonical H2C use case. The bridge is the host-side proxy; the guest's per-request context bounds end-of-stream, not us.
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes, // 1 MiB
+		IdleTimeout:       120 * time.Second,
+		// ReadTimeout is intentionally UNSET. stdlib's ReadTimeout caps the ENTIRE request lifetime (headers + body), not just the headers; a 30s cap would regress slow H1 uploads (Hobby+ plans allow up to 100 MB streaming body) and any H2C request whose body takes >30s. The ReadHeaderTimeout above is the Slowloris defence; the per-request ctx deadline bounds the in-flight request lifetime. WriteTimeout is also UNSET — streaming (SSE / long-poll / H2 DATA frames past the deadline) is the supported shape for both H1 and H2C paths.
 	}
 }
 

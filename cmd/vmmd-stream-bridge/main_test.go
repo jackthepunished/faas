@@ -17,9 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
@@ -602,49 +599,38 @@ var _ = httptest.NewServer
 // TestMain_ServerHardeners (ADR-127 §D2, Layer 9) pins the
 // listener-level hardeners on the stdlib http.Server that the
 // bridge uses. The bridge binary is a stand-alone process spawned
-// per instance by vmmd; the listener config is set once in main()
-// and never mutated. Verifying the pins here keeps a future
-// refactor from accidentally dropping one of them.
+// per instance by vmmd; the listener config is set once in
+// buildServer() and never mutated. Verifying the pins here keeps
+// a future refactor from accidentally dropping one of them.
+//
+// The test calls buildServer() (not main()) so the assertions
+// always reflect what main() actually configures — a previous
+// version of this test replicated the srv literal and fell out
+// of sync with main() when the review-fix commits R2/R3 dropped
+// ReadTimeout (stdlib defaults to 0) and WriteByteTimeout
+// (http2.Server default 0 = unbounded). The test seam is the
+// buildServer() helper; do not duplicate the construction inline.
 //
 // The bridge wraps the per-request handler with
 // h2c.NewHandler(handler, &http2.Server{...}) — we cannot reach
 // inside the wrapper to verify the inner http2.Server fields
 // without an H2C roundtrip, so this test pins the stdlib-side
-// fields (which are public on *http.Server) and the http2.Server
-// *config* is verified via its construction site (main.go:181).
-// See TestNewGuestH2CTransport_SecurityPins for the client-side
+// fields (which are public on *http.Server). See
+// TestNewGuestH2CTransport_SecurityPins for the client-side
 // transport pins.
 //
 // Pinned values (must match the h2cMax* const block in
 // h2c_terminator.go so the symmetry contract holds):
 //   - MaxHeaderBytes     = 1 MiB (api.DefaultMaxHeaderBytes)
 //   - IdleTimeout        = 120s
-//   - ReadTimeout        = 30s
+//   - ReadTimeout        = 0   (UNSET — stdlib default; was 30s in PR #1050)
 //   - ReadHeaderTimeout  = 10s
-//   - WriteTimeout       = 0   (streaming)
+//   - WriteTimeout       = 0   (UNSET — streaming; was 0 in PR #1050)
 func TestMain_ServerHardeners(t *testing.T) {
-	// We can't run main() because it spawns a socket and signal
-	// handler. Instead, replicate the srv construction here
-	// verbatim and assert the field values. A future refactor
-	// that touches the main() srv literal MUST keep both sites
-	// in sync — this is the test seam that enforces it.
-	srv := &http.Server{
-		Handler: h2c.NewHandler(
-			newHandler("10.0.0.2", 8080, time.Now().Add(time.Minute)),
-			&http2.Server{
-				MaxConcurrentStreams: h2cMaxConcurrentStreams,
-				MaxReadFrameSize:     h2cMaxReadFrameSize,
-				IdleTimeout:          60 * time.Second,
-				ReadIdleTimeout:      30 * time.Second,
-				PingTimeout:          15 * time.Second,
-				WriteByteTimeout:     30 * time.Second,
-			},
-		),
-		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
-		IdleTimeout:       120 * time.Second,
-		ReadTimeout:       30 * time.Second,
-	}
+	// buildServer() is the test seam. Calling it pins main()'s
+	// actual srv literal — see the package docstring for
+	// buildServer() at main.go for the canonical pin rationale.
+	srv := buildServer("10.0.0.2", 8080, time.Now().Add(time.Minute))
 
 	if srv.MaxHeaderBytes != api.DefaultMaxHeaderBytes {
 		t.Errorf("srv.MaxHeaderBytes = %d, want %d (1 MiB per ADR-127 §D2)",
@@ -657,8 +643,13 @@ func TestMain_ServerHardeners(t *testing.T) {
 	if srv.IdleTimeout != 120*time.Second {
 		t.Errorf("srv.IdleTimeout = %v, want 120s (caps per-conn idle lifetime)", srv.IdleTimeout)
 	}
-	if srv.ReadTimeout != 30*time.Second {
-		t.Errorf("srv.ReadTimeout = %v, want 30s (Slowloris defense)", srv.ReadTimeout)
+	// ReadTimeout is intentionally UNSET (PR #1051 review-fix R2).
+	// stdlib's ReadTimeout caps the ENTIRE request lifetime; the
+	// bridge supports streaming uploads (Hobby+ plans: 100 MB)
+	// so a 30s cap would regress them. ReadHeaderTimeout below
+	// is the Slowloris defense.
+	if srv.ReadTimeout != 0 {
+		t.Errorf("srv.ReadTimeout = %v, want 0 (UNSET — was 30s pre-review-fix; stdlib default 0 permits streaming uploads)", srv.ReadTimeout)
 	}
 	if srv.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("srv.ReadHeaderTimeout = %v, want 10s (H2C preface budget)", srv.ReadHeaderTimeout)
