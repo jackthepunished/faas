@@ -161,6 +161,37 @@ type OpsMetrics struct {
 	// string, so the cartesian is pre-instantiated at boot to
 	// surface zero rows from idle.
 	daemonRestartCount *prometheus.CounterVec
+	// daemonBuildInfo (issue #586 / ADR-129) is the per-(daemon,
+	// version, git_sha, build_time) gauge that exposes the
+	// identity of the running binary. Always 1 (the gauge's value
+	// is meaningless — the labels carry the signal). Operator
+	// dashboards query this metric for the "Daemon versions
+	// fleet-wide" heatmap panel. The label set is bounded at 9
+	// daemon names × the wire.Version × git_sha × build_time
+	// cartesian, but in practice git_sha and build_time are
+	// constant per binary so the realistic cardinality is 9 (one
+	// row per daemon, all sharing the same version+git_sha
+	// tuple). Pre-instantiated at boot — see SetDaemonBuildInfo.
+	daemonBuildInfo *prometheus.GaugeVec
+	// daemonUptimeSeconds (issue #586 / ADR-129) is the per-daemon
+	// gauge that exposes process uptime in seconds. Updated every
+	// 1s by a goroutine spawned from wire.Daemon() (see
+	// recordUptime for the contract). The gauge is set, not
+	// accumulated, so a daemon restart drops the value to a
+	// small number and operators can read the value directly as
+	// "seconds since this process started". Pre-instantiated at
+	// the closed daemon set with an initial 0.
+	daemonUptimeSeconds *prometheus.GaugeVec
+	// daemonReady (issue #586 / ADR-129) is the per-daemon gauge
+	// that flips 0 → 1 when the daemon has completed all
+	// initialization (TLS handshake, DB pool warm-up, listener
+	// open) and is serving traffic. Until the daemon's run
+	// function signals readiness (via MarkReady, see issue #571
+	// for the /readyz implementation), the gauge reads 0.
+	// Pre-instantiated at 0 for every daemon so the §12
+	// dashboard's "Fleet readiness" panel surfaces a zero row
+	// from boot. MarkReady(id) flips to 1.
+	daemonReady *prometheus.GaugeVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -1494,6 +1525,34 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
 		daemonRestartCount.WithLabelValues(daemon, Version)
 	}
+	// Issue #586 / ADR-129: per-daemon build info + uptime + ready.
+	// Closed daemon set mirrors daemonRestartCount above (9 closed
+	// + "other" overflow = 10). Pre-instantiated with the
+	// current wire.Version, GitSHA, BuildTime so /metrics surfaces
+	// the daemon identity from boot — the operator dashboard
+	// "Daemon versions fleet-wide" panel renders a non-empty
+	// row immediately after the daemon starts, not after the
+	// first SetDaemonBuildInfo call (which only happens on the
+	// ready line). Uptime starts at 0; the goroutine spawned
+	// by wire.Daemon() updates it every 1s. Ready starts at 0;
+	// wire.Daemon().MarkReady flips it to 1.
+	daemonBuildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_build_info",
+		Help: "Always-1 gauge that exposes the running binary's identity (issue #586 / ADR-129), labelled by (daemon, version, git_sha, build_time). The labels carry the signal — the gauge value is meaningless. Operator dashboards query this metric for the 'Daemon versions fleet-wide' heatmap panel. The closed daemon set (apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged, meterd, builderd, gregale) is pre-instantiated at boot so /metrics surfaces the identity from process start.",
+	}, []string{"daemon", "version", "git_sha", "build_time"})
+	daemonUptimeSeconds := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_uptime_seconds",
+		Help: "Process uptime in seconds (issue #586 / ADR-129), labelled by daemon. Updated every 1s by the wire.Daemon() boot goroutine. Operator dashboards query this for the 'Daemon uptime (1h)' timeseries panel. The closed daemon set is pre-instantiated at 0 so /metrics surfaces zero rows from idle.",
+	}, []string{"daemon"})
+	daemonReady := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_ready",
+		Help: "Readiness gauge (issue #586 / ADR-129), labelled by daemon. 0 = initializing / not yet serving traffic; 1 = ready. wire.Daemon() flips the gauge to 1 after the run function returns from the readiness barrier (see issue #571 for the /readyz implementation; until then MarkReady is a no-op stub defaulting to ready on boot). Operator dashboards query this for the 'Fleet readiness' panel.",
+	}, []string{"daemon"})
+	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
+		daemonBuildInfo.WithLabelValues(daemon, Version, GitSHA, BuildTime).Set(1)
+		daemonUptimeSeconds.WithLabelValues(daemon).Set(0)
+		daemonReady.WithLabelValues(daemon).Set(0)
+	}
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -2421,7 +2480,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3215,6 +3274,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		livenessRestarts:                     livenessRestarts,
 		workloadOOMKills:                     workloadOOMKills,
 		daemonRestartCount:                   daemonRestartCount,
+		daemonBuildInfo:                      daemonBuildInfo,
+		daemonUptimeSeconds:                  daemonUptimeSeconds,
+		daemonReady:                          daemonReady,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
@@ -3446,6 +3508,69 @@ func (m *OpsMetrics) RecordDaemonRestart(daemon, version string, n int) {
 		version = Version
 	}
 	m.daemonRestartCount.WithLabelValues(daemon, version).Add(float64(n - 1))
+}
+
+// SetDaemonBuildInfo (issue #586 / ADR-129) re-stamps the build
+// info gauge for a daemon. The constructor already pre-instantiates
+// every (daemon, thisVersion, thisGitSHA, thisBuildTime) row with
+// value=1, so this accessor is only useful when the daemon's
+// identity changes mid-process (e.g. a hot-reload that re-reads
+// ldflags-injected values, or a /v1/internal/reload-build-info
+// handler that's out of scope here). nil-receiver guard mirrors
+// RecordDaemonRestart so unit tests without metrics keep working.
+func (m *OpsMetrics) SetDaemonBuildInfo(daemon, version, gitSHA, buildTime string) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	if version == "" {
+		version = Version
+	}
+	if gitSHA == "" {
+		gitSHA = GitSHA
+	}
+	m.daemonBuildInfo.WithLabelValues(daemon, version, gitSHA, buildTime).Set(1)
+}
+
+// SetDaemonUptime (issue #586 / ADR-129) updates the per-daemon
+// uptime gauge. Called once per second by the goroutine spawned
+// from wire.Daemon() (see recordUptime). nil-receiver guard
+// mirrors RecordDaemonRestart.
+func (m *OpsMetrics) SetDaemonUptime(daemon string, seconds float64) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	m.daemonUptimeSeconds.WithLabelValues(daemon).Set(seconds)
+}
+
+// MarkReady (issue #586 / ADR-129) flips the per-daemon readiness
+// gauge from 0 to 1. Called once by wire.Daemon() after the
+// daemon's run function returns from the readiness barrier (see
+// issue #571 for the /readyz implementation; until then MarkReady
+// is a no-op stub defaulting to ready on boot). nil-receiver guard
+// mirrors RecordDaemonRestart.
+func (m *OpsMetrics) MarkReady(daemon string) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	m.daemonReady.WithLabelValues(daemon).Set(1)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier

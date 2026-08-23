@@ -15,12 +15,27 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
 // Version is stamped at build time via -ldflags "-X .../pkg/wire.Version=...".
 var Version = "dev"
+
+// GitSHA is the abbreviated commit SHA the binary was built from.
+// Stamped at build time via -ldflags "-X .../pkg/wire.GitSHA=...";
+// default "unknown" for dev builds. Used by the daemon_build_info
+// metric (issue #586 / ADR-129) so the operator can answer "what
+// version is running on this box" without ssh'ing in.
+var GitSHA = "unknown"
+
+// BuildTime is the RFC3339 timestamp the binary was built at.
+// Stamped at build time via -ldflags "-X .../pkg/wire.BuildTime=...";
+// default empty for dev builds. The daemon_build_info metric
+// surfaces it as a label so fleet-wide panels can show when
+// different daemons were last rebuilt.
+var BuildTime = ""
 
 // defaultOps is the package-level OpsMetrics registered by the
 // current daemon process via RegisterDefaultOps. Daemon() reads
@@ -192,12 +207,59 @@ func Daemon(name string, fn RunFunc) {
 	// node_systemd_restart_count in that case.
 	defaultOps.RecordDaemonRestart(name, Version, SystemdRestartCount())
 
-	log.Info("starting", "config", *configPath, "restart_count", SystemdRestartCount())
+	// Issue #586 / ADR-129: stamp the build info gauge so the
+	// "Daemon versions fleet-wide" dashboard panel surfaces the
+	// current binary's identity from process start. The
+	// constructor already pre-instantiates the row at
+	// (daemon, Version, GitSHA, BuildTime); this re-stamp is
+	// idempotent and covers the edge case where ldflags inject
+	// a different value mid-process (rare, but cheap to handle).
+	defaultOps.SetDaemonBuildInfo(name, Version, GitSHA, BuildTime)
+
+	// Issue #586 / ADR-129: 1-second uptime goroutine. Updates
+	// daemon_uptime_seconds{daemon} every 1s until ctx.Done().
+	// Cheap — one Prometheus gauge Set per tick per daemon, no
+	// allocations beyond the time.Time. Goroutine exits on
+	// shutdown; the gauge freezes at the last value (which is
+	// the right thing — operators want to see "uptime at the
+	// moment of shutdown" rather than a zero).
+	startedAt := time.Now()
+	go recordUptime(ctx, name, startedAt)
+
+	log.Info("starting", "config", *configPath, "restart_count", SystemdRestartCount(), "git_sha", GitSHA, "build_time", BuildTime)
 	if err := fn(ctx, log); err != nil {
 		log.Error("exited with error", "err", err)
 		os.Exit(1)
 	}
+	// Issue #586 / ADR-129: flip daemon_ready{daemon} to 1 once
+	// the run function returns successfully (i.e. the daemon
+	// reached its steady-state path). Until /readyz lands
+	// (issue #571), the run function returning IS the readiness
+	// barrier — a daemon that's serving traffic has called this
+	// line. DefaultOps.MarkReady is nil-safe, so a daemon that
+	// never registered its OpsMetrics doesn't panic.
+	defaultOps.MarkReady(name)
 	log.Info("shutdown complete")
+}
+
+// recordUptime (issue #586 / ADR-129) ticks daemon_uptime_seconds
+// every 1s. Lives in the goroutine spawned from wire.Daemon();
+// exits when ctx is cancelled. Uses defaultOps so the daemon's
+// main.go only needs to register its OpsMetrics once (see
+// RegisterDefaultOps) and doesn't have to thread the metric
+// through every goroutine. Time-since-start is computed locally
+// each tick so a clock-slew doesn't accumulate error.
+func recordUptime(ctx context.Context, name string, startedAt time.Time) {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			defaultOps.SetDaemonUptime(name, time.Since(startedAt).Seconds())
+		}
+	}
 }
 
 // SystemdRestartCount returns the systemd-driven restart count

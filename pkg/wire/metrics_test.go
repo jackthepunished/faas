@@ -1533,6 +1533,62 @@ func TestRecordDaemonRestart_PreInstantiationCartesian(t *testing.T) {
 	}
 }
 
+// TestDaemon_BuildInfo_Uptime_Ready pins the three new daemon-side
+// observability gauges (issue #586 / ADR-129 / cluster C commit 9
+// of the platform-observability mega-PR):
+//
+//   - daemon_build_info{daemon, version, git_sha, build_time} — 1
+//     per closed daemon name, pre-instantiated at boot.
+//   - daemon_uptime_seconds{daemon} — starts at 0, SetDaemonUptime
+//     updates per tick.
+//   - daemon_ready{daemon} — 0 until MarkReady, 1 after.
+//
+// The constructor pre-instantiates every row at value=1 (for
+// build_info) / 0 (for uptime + ready). The test verifies the
+// shape and the accessors' effect on the body.
+func TestDaemon_BuildInfo_Uptime_Ready(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, daemon := range []string{
+		"apid", "gatewayd-public", "gatewayd-internal", "schedd",
+		"vmmd", "imaged", "meterd", "builderd", "gregale", "other",
+	} {
+		// Build info: 1 per closed daemon.
+		wantInfo := fmt.Sprintf(`vmmd_daemon_build_info{build_time=%q,daemon=%q,git_sha=%q,version=%q} 1`,
+			wire.BuildTime, daemon, wire.GitSHA, wire.Version)
+		if !strings.Contains(body, wantInfo) {
+			t.Errorf("missing pre-instantiated build-info row %q in:\n%s", wantInfo, body)
+		}
+		// Uptime: 0 per closed daemon.
+		wantUptime := fmt.Sprintf(`vmmd_daemon_uptime_seconds{daemon=%q} 0`, daemon)
+		if !strings.Contains(body, wantUptime) {
+			t.Errorf("missing pre-instantiated uptime row %q in:\n%s", wantUptime, body)
+		}
+		// Ready: 0 per closed daemon (MarkReady flips to 1).
+		wantReady := fmt.Sprintf(`vmmd_daemon_ready{daemon=%q} 0`, daemon)
+		if !strings.Contains(body, wantReady) {
+			t.Errorf("missing pre-instantiated ready row %q in:\n%s", wantReady, body)
+		}
+	}
+	// SetDaemonUptime + MarkReady update the body.
+	m.SetDaemonUptime("vmmd", 12.5)
+	m.MarkReady("vmmd")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="vmmd"} 12.5`) {
+		t.Errorf("missing uptime update at 12.5 in:\n%s", body)
+	}
+	if !strings.Contains(body, `vmmd_daemon_ready{daemon="vmmd"} 1`) {
+		t.Errorf("missing ready=1 after MarkReady in:\n%s", body)
+	}
+	// Unknown daemon name collapses to "other" (closed-set contract).
+	m.SetDaemonUptime("unknown-daemon", 1.0)
+	m.MarkReady("unknown-daemon")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="other"} 1`) {
+		t.Errorf("unknown daemon did not collapse to other in:\n%s", body)
+	}
+}
+
 // TestOpsMetrics_WakeLatencyNilSafe (issue #1059 / ADR-127) — the
 // accessor must be no-op on a nil receiver so vmmd / schedd unit
 // tests without metrics keep working (same nil-safe posture as
