@@ -141,7 +141,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-122 / issue #975 item #1: endpoint discovery — Free
 			// is gated to 0/0/0 (same fail-closed posture as consumer keys).
 			// apid GET / PATCH return 402 CodePlanOpenAPIDocsNotAllowed.
-OpenAPIDocsPerDeployment: 0, OpenAPIDocMaxBytes: 0, OpenAPIDocsPerAccount: 0, OpenAPIImportsPerAccount: 100,
+			OpenAPIDocsPerDeployment: 0, OpenAPIDocMaxBytes: 0, OpenAPIDocsPerAccount: 0, OpenAPIImportsPerAccount: 100,
 			// ADR-127: Free stays off the debugger surface — the
 			// abuse-floor tier carries no per-request telemetry,
 			// no retention, no rate budget. Handler returns 402
@@ -288,7 +288,7 @@ OpenAPIDocsPerDeployment: 0, OpenAPIDocMaxBytes: 0, OpenAPIDocsPerAccount: 0, Op
 			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 250,
 			// ADR-122 / issue #975 item #1: Hobby is the entry paid
 			// tier — 1/dep, 100/acct, 128 KiB/doc.
-OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 100,
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 100,
 			// ADR-127: Hobby = "last week" debugger surface — 3-day
 			// retention (matches log-archive retention), 1000
 			// req/min ingest, 10 deployments max in the histogram
@@ -432,7 +432,7 @@ OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 
 			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 2500,
 			// ADR-122 / issue #975 item #1: Pro keeps 1/dep
 			// (PK constraint), 1000/acct (10× Hobby).
-OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 1000,
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 1000,
 			// ADR-127: Pro = "this month" debugger surface — 7-day
 			// retention, 10000 req/min ingest, 50 deployments in
 			// the histogram, 200 spans per trace.
@@ -582,7 +582,7 @@ OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 
 			// ADR-122 / issue #975 item #1: Scale keeps 1/dep,
 			// 10000/acct (10× Pro). Byte cap stays at 128 KiB
 			// (global cap is the binding constraint).
-OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 10000,
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 10000,
 			// ADR-127: Scale = "this quarter" debugger surface —
 			// 14-day retention, 50000 req/min ingest, 200
 			// deployments in the histogram (the deploymentLabelSet

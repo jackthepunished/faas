@@ -5711,5 +5711,4 @@ type DebugTelemetryRequestItem struct {
 type DebugTelemetryListResponse struct {
 	Since    string                      `json:"since"`
 	Requests []DebugTelemetryRequestItem `json:"requests"`
-
 }
