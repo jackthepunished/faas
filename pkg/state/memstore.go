@@ -194,7 +194,7 @@ type MemStore struct {
 	// method boundary so a cross-tenant read returns ErrNotFound
 	// (the same defence-in-depth as consumerKeys below).
 	openAPIDocs map[string]openAPIDocRow
-// openAPISnapshots mirrors deployment_openapi_snapshots
+	// openAPISnapshots mirrors deployment_openapi_snapshots
 	// (ADR-121, migration 00358). Keyed by deployment_id,
 	// mirroring the table's PK. PR-C's gate reads via
 	// LatestOpenAPISnapshotForScope (linear scan under m.mu)
