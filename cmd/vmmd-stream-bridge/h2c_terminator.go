@@ -112,9 +112,9 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	if method == "" {
 		method = "GET"
 	}
-	url := r.URL.RequestURI()
-	if url == "" {
-		url = "/"
+	uri := r.URL.RequestURI()
+	if uri == "" {
+		uri = "/"
 	}
 	host := r.Host
 	if host == "" {
@@ -138,7 +138,15 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	// Body is consumed synchronously during the call; for
 	// streaming, we set the request's body to a net.Pipe-style
 	// channel and bridge r.Body via io.Copy in a goroutine.
-	outboundReq, err := http.NewRequestWithContext(ctx, method, url, r.Body)
+	//
+	// PRIOR-KNOWLEDGE H2C scheme: the outbound URL must be
+	// `http://<guest-ip>[:<port>]` — x/net/http2.Transport with
+	// AllowHTTP=true reads the scheme and Host off the URL and
+	// derives :scheme (h2c) + :authority (host). An empty or
+	// non-http scheme surfaces as `unsupported scheme` (tested
+	// by h2c_terminator_test.go::TestHandleH2CStream_UnaryRequest).
+	outboundURL := "http://" + net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)) + uri
+	outboundReq, err := http.NewRequestWithContext(ctx, method, outboundURL, r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("build outbound request: %v", err), http.StatusBadGateway)
 		return
@@ -194,19 +202,33 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 			w.Header().Add(k, v)
 		}
 	}
-	// Trailers live on resp.Trailer (the Go-side demux of the
-	// HTTP/2 trailer HEADERS frame); mirror them into the inbound
-	// trailer block. Stdlib's server transport will emit a
-	// trailer HEADERS frame with END_STREAM when the body io.Copy
-	// finishes — no application-level translation. ADR-126
-	// §Decision 5: preserve trailer framing 1:1.
-	for k, vs := range resp.Trailer {
-		for _, v := range vs {
-			w.Header().Add(http.TrailerPrefix+k, v)
-		}
+	// Pre-declare the trailer keys we expect so stdlib's
+	// server transport emits them as a trailer HEADERS frame
+	// (END_STREAM) rather than folding them into the regular
+	// response HEADERS frame. Without this declaration, the
+	// TrailerPrefix entries below land on the response HEADERS,
+	// which gRPC clients tolerate but the load-bearing invariant
+	// for grpc per ADR-126 §Decision 5 is that trailers ride
+	// trailer HEADERS. (Go stdlib strips the `Trailer:` literal
+	// on H2 transport — the declaration is process-state, not
+	// wire-state.)
+	for k := range resp.Trailer {
+		w.Header().Add("Trailer", k)
 	}
 	w.WriteHeader(resp.StatusCode)
+	// Drain the body BEFORE writing the trailers — stdlib's H2
+	// server transport needs the body fully consumed (or EOF) to
+	// know that DATA frames are exhausted and a trailer HEADERS
+	// frame may now be appended. If we trailer-set before the
+	// io.Copy finished, the trailer HEADERS would close the
+	// stream prematurely.
 	_, _ = copyStreaming(w, resp.Body)
+	// Now write the trailers after the body has been drained.
+	for k, vs := range resp.Trailer {
+		for _, v := range vs {
+			w.Header().Set(http.TrailerPrefix+k, v)
+		}
+	}
 }
 
 // newGuestH2CTransport builds the guest-side H2C client transport
