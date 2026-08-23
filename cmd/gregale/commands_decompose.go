@@ -321,6 +321,18 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 	fmt.Fprintf(w, "Scan source: %s   tier: %s\n", plan.ScanSource, plan.Tier)
 	fmt.Fprintf(w, "Quota: %d/%d apps   %d/%d crons\n",
 		plan.ObservedApps, plan.LimitApps, plan.ObservedCrons, plan.LimitCrons)
+	// ADR-124 ship-blocker #4 (PR-followup). When --exclude
+	// produced a destructive subset (plan.Removed non-empty) AND
+	// the operator didn't ask for the full partition view
+	// (showAffected=false), surface a one-line warning so the
+	// soft-delete isn't invisible. The full Removed list is
+	// opt-in via --show-affected — the warning is the nudge, not
+	// the data (per ADR-124 §3: warning + show-affected opt-in,
+	// not auto-promote).
+	if len(excludeSet) > 0 && len(plan.Removed) > 0 && !showAffected {
+		PrintWarn(w, "Applying will soft-delete %d app(s); rerun with --show-affected to see the Removed partition",
+			len(plan.Removed))
+	}
 	if plan.CronsNotAllowed {
 		fmt.Fprintln(w, "(Crons unavailable on this plan — upgrade to Hobby or above.)")
 	}
@@ -444,8 +456,14 @@ func printAffectedText(w io.Writer, plan api.PlanResponse, excludedSlugs map[str
 // from r (typically os.Stdin) so tests can stub it. Returns true on
 // 'y' / 'yes' (case-insensitive); false on EOF, 'n', or any other
 // input — git does the same.
-func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []string) bool {
-	printPlanText(w, plan, excludeSet, false)
+//
+// showAffected is threaded through to printPlanText so the operator
+// who typed --show-affected at the apply prompt sees the same
+// partition view as on the scan. The default (false) keeps the
+// confirm-prompt terse; the destructive --exclude warning lives
+// inside printPlanText and fires regardless of showAffected.
+func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []string, showAffected bool) bool {
+	printPlanText(w, plan, excludeSet, showAffected)
 	//nolint:errcheck // same rationale as printPlanText; a failed Fprintln
 	// at the prompt is no different from the read below failing.
 	prompt := "\nApply this plan? [y/N] "

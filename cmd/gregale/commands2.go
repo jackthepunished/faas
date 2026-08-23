@@ -832,6 +832,15 @@ func cmdDeployTarball(args []string) int {
 	// overlap with code='exclude_only_overlap' but the CLI short-
 	// circuits so the operator gets the error pre-flight).
 	deployExclude := fs.String("exclude", "", "comma-separated workload names to omit from the apply set (ADR-124)")
+	// ADR-124 ship-blocker #4 (PR-followup): when --exclude
+	// produced a destructive subset (Removed non-empty), print a
+	// one-line warning before the plan view. The full WillDeploy /
+	// Skipped / Unaffected / Removed partition is opt-in via
+	// --show-affected so the default render stays terse; the warn
+	// is the nudge that drives the operator to re-run with the
+	// flag when a soft-delete is in play. ADR §3 documents this
+	// as "warning + show-affected opt-in" (not auto-promote).
+	deployShowAffected := fs.Bool("show-affected", false, "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
@@ -1353,11 +1362,11 @@ func cmdDeployTarball(args []string) int {
 			if jsonOutput {
 				return jsonOut(writeJSONProblem(planProblem(plan)))
 			}
-			printPlanText(osStdout, plan, excludeList, false)
+			printPlanText(osStdout, plan, excludeList, *deployShowAffected)
 			return printErr("Plan is not applicable on this plan", errors.New("over-quota or unsupported configuration"))
 		}
 		if !*yes && !jsonOutput && stdoutIsTTY() && stdinIsTTY() {
-			if !confirmPlan(osStdout, os.Stdin, plan, excludeList) {
+			if !confirmPlan(osStdout, os.Stdin, plan, excludeList, *deployShowAffected) {
 				return printErr("Aborted by user", errors.New("user declined at the confirm prompt"))
 			}
 		}
