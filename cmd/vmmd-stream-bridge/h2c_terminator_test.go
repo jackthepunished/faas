@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -415,5 +416,84 @@ func TestNewGuestH2CTransport_SecurityPins(t *testing.T) {
 	}
 	if !tr.StrictMaxConcurrentStreams {
 		t.Errorf("transport.StrictMaxConcurrentStreams = false, want true (block on server cap, don't dial new conn)")
+	}
+}
+
+// captureResponseWriter is a minimal http.ResponseWriter for the
+// panic-recovery test. It captures the status code + body so the
+// test can assert handleH2CStream recovered and wrote a 500.
+type captureResponseWriter struct {
+	mu      sync.Mutex
+	status  int
+	body    []byte
+	headers http.Header
+	wrote   bool
+}
+
+func (c *captureResponseWriter) Header() http.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.headers == nil {
+		c.headers = make(http.Header)
+	}
+	return c.headers
+}
+func (c *captureResponseWriter) WriteHeader(status int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status = status
+	c.wrote = true
+}
+func (c *captureResponseWriter) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.wrote {
+		c.status = http.StatusOK
+		c.wrote = true
+	}
+	c.body = append(c.body, b...)
+	return len(b), nil
+}
+
+// TestHandleH2CStream_PanicRecovers (ADR-127 §D2, Layer 9) pins
+// the defer-recover contract in handleH2CStream. The test calls
+// the recovered function directly: a panic on the caller
+// goroutine is observable from a defer on that same goroutine,
+// while a panic injected via the http2.Transport's dial runs
+// on a SEPARATE goroutine spawned by RoundTrip and is not
+// observable from handleH2CStream's defer. The h2cRecoverPanic
+// helper at h2c_terminator.go is the load-bearing implementation
+// that handleH2CStream defers; the test exercises it directly
+// (deferred function call + panic-on-caller-goroutine) rather
+// than reaching through handleH2CStream's transport layer.
+//
+// Asserts:
+//  1. The panic was caught (this function returned normally).
+//  2. The captureResponseWriter received a 500 status.
+//  3. The body contains "bridge panic" prefix so an operator can
+//     debug from a wire-level capture.
+func TestHandleH2CStream_PanicRecovers(t *testing.T) {
+	rw := &captureResponseWriter{}
+
+	// Simulate handleH2CStream's defer-recover on a caller
+	// goroutine that panics. If h2cRecoverPanic is removed,
+	// the panic propagates and `go test` flags the test as
+	// failed (the test crashes; the assert never runs).
+	func() {
+		defer h2cRecoverPanic(rw, "127.0.0.1", 8080)()
+		panic("synthetic panic for ADR-127 §D2 defer-recover contract")
+	}()
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d (defer-recover must convert panic into 500)",
+			rw.status, http.StatusInternalServerError)
+	}
+	if len(rw.body) == 0 {
+		t.Errorf("body empty; defer-recover must write a body so the operator sees the panic string")
+	}
+	if !strings.Contains(string(rw.body), "bridge panic") {
+		t.Errorf("body does not contain 'bridge panic' prefix; got %q", string(rw.body))
 	}
 }

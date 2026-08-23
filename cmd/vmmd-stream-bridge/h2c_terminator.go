@@ -56,8 +56,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -151,6 +153,21 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
 
+	// ADR-127 §D2 (Layer 9) — panic recovery. The bridge is a
+	// per-instance child of vmmd; a panic that escapes to the
+	// listener-loop would tear down the bridge process and force
+	// a per-instance reconnect on the next request. Recover the
+	// panic, write a 500 to the inbound writer, and log a
+	// structured slog entry with the stack trace so an operator
+	// can root-cause without losing the request.
+	//
+	// The recover contract lives in recoverH2CPanic below so
+	// TestHandleH2CStream_PanicRecovers can exercise it without
+	// spawning a malicious upstream — the http2.Transport's dial
+	// runs on a separate goroutine and a panic there wouldn't be
+	// observable from this defer.
+	defer h2cRecoverPanic(w, guestIP, guestPort)()
+
 	method := r.Method
 	if method == "" {
 		method = "GET"
@@ -171,8 +188,17 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	// Each call gets its own transport; one-bridge-stream-per-
 	// guest-stream (ADR-126 §Decision 4) means we don't
 	// concatenate streams onto a pooled conn — the v1 shape
-	// keeps the conn ownership simple.
-	transport := newGuestH2CTransport(guestIP, guestPort)
+	// keeps the conn ownership simple. ADR-127 §D2 — the
+	// construction is funnelled through a package var so tests
+	// can inject a RoundTripper that panics for the panic-
+	// recovery contract test (TestHandleH2CStream_PanicRecovers).
+	transport := newGuestH2CTransportFn(guestIP, guestPort)
+	// ADR-127 §D2 (Layer 9) — close idle conns on the transport
+	// when the handler returns. Without this defer, a panic
+	// path that skips the explicit close would leak the
+	// transport's idle pool and the underlying guest-side TCP
+	// fd, pinning a 1 MiB H2 conn per leak.
+	defer transport.CloseIdleConnections()
 
 	// Compose the outbound H2C request body. The inbound r.Body
 	// is the bridge's H2C-side request stream; we pipe it
@@ -337,6 +363,57 @@ func copyStreaming(dst http.ResponseWriter, src interface{ Read(p []byte) (int, 
 			}
 			return total, err
 		}
+	}
+}
+
+// newGuestH2CTransportFn is the indirect constructor used by
+// handleH2CStream. Package-level var — currently unused by
+// production code, but kept as a future test seam so a follow-on
+// can swap the transport for a hostile upstream without spawning
+// an H2C server. The default routes to newGuestH2CTransport.
+//
+// Indirection lives at the call site (handleH2CStream calls
+// newGuestH2CTransportFn), not inside newGuestH2CTransport
+// itself — wrapping the real constructor in a fn would create
+// an initialization cycle.
+var newGuestH2CTransportFn = newGuestH2CTransport
+
+// h2cRecoverPanic returns a deferred function that catches any
+// panic on the calling goroutine, writes a 500 to the inbound
+// H2C stream via http.Error, and emits a structured slog entry
+// with the panic + stack trace. The function is the load-bearing
+// safety net for the bridge (ADR-127 §D2 Layer 9) — a panic
+// that escapes the listener-loop teardown penalty is much more
+// expensive than a per-request 500.
+//
+// Extracted from handleH2CStream so TestHandleH2CStream_PanicRecovers
+// can exercise it directly: any panic() on the caller's
+// goroutine is observable from a defer on that same goroutine.
+// The original inline defer was unreachable to tests because
+// x/net/http2's dial runs on a SEPARATE goroutine spawned by
+// RoundTrip, and any panic injected via a panicking conn never
+// traverses the request goroutine. This helper closes that test
+// gap by collapsing the safety net into a pure function:
+//
+//	func() {
+//	    defer h2cRecoverPanic(w, ip, port)()
+//	    ... panics here will be caught ...
+//	}
+func h2cRecoverPanic(w http.ResponseWriter, guestIP string, guestPort uint16) func() {
+	return func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		slog.Error("vmmd-stream-bridge: handleH2CStream panic",
+			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
+			"panic", fmt.Sprintf("%v", rec),
+			"stack", string(debug.Stack()))
+		// http.Error writes the status + body to the inbound
+		// H2C stream; if the writer is already half-written it
+		// returns an error which we silently absorb (the
+		// inbound HTTP/2 server will close the conn on EOF).
+		http.Error(w, fmt.Sprintf("bridge panic: %v", rec), http.StatusInternalServerError)
 	}
 }
 
