@@ -249,11 +249,11 @@ func TestValidOIDCKeyFormat_RejectsOtherPrefixFamilies(t *testing.T) {
 	}
 }
 
-// TestConstantTimeEqualHash_AppProtocolFile covers the
-// subtle.ConstantTimeCompare wrapper. Renamed from the base
-// TestConstantTimeEqualHash to avoid collision with the existing
-// apikey_test.go:82.
-func TestConstantTimeEqualHash_AppProtocolFile(t *testing.T) {
+// TestConstantTimeEqualHash_Mega3 covers the subtle.ConstantTimeCompare
+// wrapper around ConstantTimeEqualHash (pkg/api/apikey.go:196). Renamed
+// from TestConstantTimeEqualHash to avoid collision with the existing
+// apikey_test.go:82 baseline test.
+func TestConstantTimeEqualHash_Mega3(t *testing.T) {
 	if !ConstantTimeEqualHash([]byte{}, []byte{}) {
 		t.Error("empty/empty: want true")
 	}

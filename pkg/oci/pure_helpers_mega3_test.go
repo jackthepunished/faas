@@ -20,6 +20,7 @@ package oci
 
 import (
 	"context"
+	"os"
 	"testing"
 )
 
@@ -112,8 +113,19 @@ func TestEgressAllowLoopbackFromEnv_Mega3(t *testing.T) {
 		{"", false, false},
 	}
 	for _, c := range cases {
+		c := c
 		t.Run(c.envVal+"/set="+boolStrMega3(c.setEnv), func(t *testing.T) {
-			t.Setenv("FAAS_EGRESS_ALLOW_LOOPBACK", c.envVal)
+			if c.setEnv {
+				t.Setenv("FAAS_EGRESS_ALLOW_LOOPBACK", c.envVal)
+			} else {
+				// Real unset-env path: t.Setenv always sets, so we
+				// must use os.Unsetenv to exercise the os.LookupEnv
+				// returning-false branch.
+				if err := os.Unsetenv("FAAS_EGRESS_ALLOW_LOOPBACK"); err != nil {
+					t.Fatalf("unsetenv: %v", err)
+				}
+				t.Cleanup(func() { _ = os.Unsetenv("FAAS_EGRESS_ALLOW_LOOPBACK") })
+			}
 			if got := EgressAllowLoopbackFromEnv(); got != c.want {
 				t.Errorf("EgressAllowLoopbackFromEnv() = %v, want %v (env=%q setEnv=%v)",
 					got, c.want, c.envVal, c.setEnv)

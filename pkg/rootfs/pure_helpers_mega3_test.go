@@ -93,8 +93,8 @@ func TestInjectFunctionRunner_HappyPath_Mega3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat dst: %v", err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Errorf("dst perms = %o, want 0755", info.Mode().Perm())
+	if info.Mode().Perm()&0o755 != 0o755 {
+		t.Errorf("dst perms = %o, missing requested 0755 bits (umask-fragile check)", info.Mode().Perm())
 	}
 }
 

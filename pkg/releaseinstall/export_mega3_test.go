@@ -76,6 +76,8 @@ func TestFromManifest_LosslessConversion(t *testing.T) {
 			t.Errorf("DaemonHashes[%q] = %q, want %q", k, b.DaemonHashes[k], v)
 		}
 	}
+	assertStringMapEqual(t, "ToolHashes", b.ToolHashes, m.ToolHashes)
+	assertStringMapEqual(t, "AssetHashes", b.AssetHashes, m.AssetHashes)
 }
 
 // TestToManifest_LosslessConversion mirrors TestFromManifest for
@@ -87,6 +89,8 @@ func TestToManifest_LosslessConversion(t *testing.T) {
 		GitSHA:        "0123456789abcdef0123456789abcdef01234567",
 		ManifestHash:  "fedcba9876543210fedcba9876543210fedcba98",
 		DaemonHashes:  map[string]string{"apid": "sha256-apid"},
+		ToolHashes:    map[string]string{"jq": "sha256-jq"},
+		AssetHashes:   map[string]string{"kernel": "sha256-kernel"},
 		CreatedAt:     time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
 	}
 	m := ToManifest(b)
@@ -102,6 +106,21 @@ func TestToManifest_LosslessConversion(t *testing.T) {
 	}
 	if len(m.DaemonHashes) != len(b.DaemonHashes) {
 		t.Errorf("DaemonHashes len = %d, want %d", len(m.DaemonHashes), len(b.DaemonHashes))
+	}
+	assertStringMapEqual(t, "ToolHashes", m.ToolHashes, b.ToolHashes)
+	assertStringMapEqual(t, "AssetHashes", m.AssetHashes, b.AssetHashes)
+}
+
+func assertStringMapEqual(t *testing.T, name string, got, want map[string]string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("%s len = %d, want %d", name, len(got), len(want))
+		return
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s[%q] = %q, want %q", name, k, got[k], v)
+		}
 	}
 }
 
@@ -185,11 +204,11 @@ func TestValidGitSHA_RejectsUppercase(t *testing.T) {
 	cases := []string{
 		"0123456789ABCDEF0123456789abcdef01234567",
 		"FEDCBA9876543210FEDCBA9876543210FEDCBA98",
-		"0123456789abcdef0123456789abcdef0123456G",
+		"0123456789abcdef0123456789abcdef0123456A",
 	}
 	for _, c := range cases {
 		if ValidGitSHA(c) {
-			t.Errorf("ValidGitSHA(%q) = true, want false (uppercase / non-hex)", c)
+			t.Errorf("ValidGitSHA(%q) = true, want false (uppercase)", c)
 		}
 	}
 }
@@ -199,6 +218,7 @@ func TestValidGitSHA_RejectsNonHex(t *testing.T) {
 	cases := []string{
 		"x123456789abcdef0123456789abcdef01234567",
 		"0123456789abcdef0123456789abcdef0123456z",
+		"0123456789abcdef0123456789abcdef0123456G",
 		"0123456789abcdef-123456789abcdef-1234567",
 		"0123456789abcdef 123456789abcdef01234567",
 	}
