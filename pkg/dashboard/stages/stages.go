@@ -157,6 +157,16 @@ func Glyph(status string) string {
 // customer sees a sub-second measurement rather than a blank
 // cell — builds that resolve in under one tick of the 2s
 // statusTicker are common (cache hits, cached snapshots).
+//
+// ADR-117 §Production-ready follow-on: when called for a failed
+// stage, the caller MAY prepend the whycopy-catalogued Title
+// (e.g. "Build VM killed (build_oom)") by resolving the
+// deployment row's ErrorCode via pkg/whycopy.Decorate BEFORE
+// passing the result into this helper. This function takes the
+// raw reason string verbatim and does not consult pkg/whycopy —
+// keeping pkg/dashboard/stages free of the pkg/whycopy → pkg/api
+// import chain (the renderer is the shared formatter and the
+// cluster-A seam lives in the caller).
 func FormatStageDuration(durationMs int64, status, reason string) string {
 	switch status {
 	case stageStatusFailed:

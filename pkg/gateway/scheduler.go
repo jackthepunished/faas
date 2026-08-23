@@ -198,7 +198,14 @@ type Scheduler interface {
 	// (`pr-{N}`) the gateway parsed from the inbound Host header.
 	// Empty = prod (legacy single-deployment behaviour). Threaded
 	// through schedd's WakeRequest.scope wire field.
-	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
+	//
+	// trigger (ADR-127): the wake-boot trigger enum value forwarded
+	// to schedd's AdmitInstance RPC and stamped on the emitted
+	// wake.boot_started / wake.boot_completed events. The gateway
+	// always passes "gateway" (pkg/sched.TriggerGateway); future
+	// gateway-side caller surfaces (synth handler, replay worker)
+	// can pass a distinct closed-enum value.
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
 	// EnsureWake (ADR-098) is the schedd-side single-flight wake
 	// entry. Schedd coalesces every concurrent EnsureWake for the
 	// same app into one virtual boot; followers see the leader's
@@ -209,7 +216,11 @@ type Scheduler interface {
 	// row pointing at the last live slot; the WakeGate pre-filter
 	// above (an in-process cache) keeps the RPC from firing when
 	// the gateway already has a live instance cached for the app.
-	EnsureWake(ctx context.Context, appID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
+	//
+	// trigger (ADR-127): forwarded to schedd's leader so the
+	// emitted wake.boot_started / wake.boot_completed events stamp
+	// the cause (gateway / floor / cron / scaleup / etc.).
+	EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -220,11 +231,11 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
+func (NoopScheduler) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	return "", "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
-func (NoopScheduler) EnsureWake(context.Context, string) (string, string, string, string, int32, int, error) {
+func (NoopScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	return "", "", "", "", 0, 0, ErrSchedulerUnconfigured
 }
 
@@ -362,7 +373,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHint, scope string) (string, string, string, string, int32, bool, int, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHint, scope, trigger string) (string, string, string, string, int32, bool, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond
@@ -423,7 +434,7 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHi
 // on the Engine side). The Scheduler interface keeps the WakeGate
 // pre-filter layer intact, so concurrent handler calls still
 // coalesce in-process.
-func (f *FakeScheduler) EnsureWake(ctx context.Context, appID string) (string, string, string, string, int32, int, error) {
+func (f *FakeScheduler) EnsureWake(ctx context.Context, appID, trigger string) (string, string, string, string, int32, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond

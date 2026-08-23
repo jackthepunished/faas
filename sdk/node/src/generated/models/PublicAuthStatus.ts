@@ -7,9 +7,9 @@
  */
 export type PublicAuthStatus = {
   /**
-   * Active auth mode. One of 'open', 'bearer', 'basic', 'ip_allowlist'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request.
+   * Active auth mode. One of 'open', 'bearer', 'basic', 'ip_allowlist', 'internal_only'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request. 'internal_only' (ADR-119) requires an Authorization: Bearer JWT with aud='gregale.internal' signed by a Gregale daemon's Ed25519 key — see PublicAuthBlock.mode for the write-side description.
    */
-  mode: 'open' | 'bearer' | 'basic' | 'ip_allowlist';
+  mode: 'open' | 'bearer' | 'basic' | 'ip_allowlist' | 'internal_only';
   /**
    * True iff the row carries a non-null apps.public_auth_basic blob (i.e. mode='basic' with credentials). A mode='basic' row without creds would 401 every request — has_basic_creds is the operator-greppable signal that the seal succeeded.
    */

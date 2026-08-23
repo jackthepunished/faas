@@ -72,36 +72,37 @@ var routeExclude = map[string]bool{
 	// must move together; the SDK does not model operator-only
 	// surfaces, and the public OpenAPI spec does not document
 	// them.
-	"GET /v1/admin/obs/overview":                      true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants":                       true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants/{id}":                  true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes":                         true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/{name}/heartbeats":       true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/events":                  true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
-	"GET /v1/admin/obs/nodes/wake-latency":            true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
-	"GET /v1/admin/obs/anomalies":                     true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/admin/obs/audit-log/search":              true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/events":                        true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/rate-limits":                   true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/events":                                  true, // SSE (cookie+Bearer, not s.auth)
-	"GET /login":                                      true, // dashboard magic-link GET (HTML form, browser-only)
-	"POST /logout":                                    true, // dashboard logout (HTML form, browser-only)
-	"GET /auth/verify":                                true, // magic-link consume (legacy; PR #1 closed; kept for compat)
-	"GET /oauth/callback":                             true, // GitHub App install callback
-	"GET /oauth/code-callback":                        true, // GitHub App user-to-server OAuth callback (PR-C)
-	"POST /dashboard/install/connect":                 true, // GitHub App "Connect GitHub" button (PR-C)
-	"GET /dashboard":                                  true, // HTML dashboard
-	"GET /dashboard/":                                 true, // HTML dashboard
-	"POST /dashboard/account/delete":                  true, // HTML form
-	"POST /dashboard/account/restore":                 true, // HTML form
-	"GET /dashboard/account/export":                   true, // session-auth twin of /v1/account/export
-	"GET /dashboard/account/dpa":                      true, // session-auth twin of DPA
-	"POST /dashboard/raise-overage-cap":               true, // HTML form (issue #561)
-	"POST /dashboard/apps/{slug}/crons/{id}/fire-now": true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
+	"GET /v1/admin/obs/overview":                         true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants":                          true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}":                     true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes":                            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/heartbeats":          true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/events":                     true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":               true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/anomalies":                        true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":                 true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                           true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/rate-limits":                      true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/events":                                     true, // SSE (cookie+Bearer, not s.auth)
+	"GET /login":                                         true, // dashboard magic-link GET (HTML form, browser-only)
+	"POST /logout":                                       true, // dashboard logout (HTML form, browser-only)
+	"GET /auth/verify":                                   true, // magic-link consume (legacy; PR #1 closed; kept for compat)
+	"GET /oauth/callback":                                true, // GitHub App install callback
+	"GET /oauth/code-callback":                           true, // GitHub App user-to-server OAuth callback (PR-C)
+	"POST /dashboard/install/connect":                    true, // GitHub App "Connect GitHub" button (PR-C)
+	"GET /dashboard":                                     true, // HTML dashboard
+	"GET /dashboard/":                                    true, // HTML dashboard
+	"POST /dashboard/account/delete":                     true, // HTML form
+	"POST /dashboard/account/restore":                    true, // HTML form
+	"GET /dashboard/account/export":                      true, // session-auth twin of /v1/account/export
+	"GET /dashboard/account/dpa":                         true, // session-auth twin of DPA
+	"POST /dashboard/raise-overage-cap":                  true, // HTML form (issue #561)
+	"POST /dashboard/apps/{slug}/crons/{id}/fire-now":    true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
+	"POST /dashboard/apps/{slug}/deployments/{id}/retry": true, // HTML form, per-stage retry (ADR-117 §Production-ready follow-on C4); CSRF sealed envelope, no SDK twin
 	// ADR-124 affected-workloads preview. Dashboard HTML form endpoints
-	// parallel to the cron fire-now entry. The /preview POST re-renders
-	// the preview; /preview/apply commits. Both share the multipart
-	// envelope + CSRF posture of the cron handler.
+	// parallel to the cron fire-now + retry entries. The /preview POST
+	// re-renders the preview; /preview/apply commits. Both share the
+	// multipart envelope + CSRF posture of the cron/retry handlers.
 	"POST /dashboard/projects/{slug}/preview":       true, // ADR-124 HTML form, preview re-render
 	"POST /dashboard/projects/{slug}/preview/apply": true, // ADR-124 HTML form, apply-with-exclude
 	"POST /v1/cli-auth/code":                        true, // CLI device-code mint
@@ -111,6 +112,7 @@ var routeExclude = map[string]bool{
 	"GET /status":                                   true, // public HTML status page
 	"GET /status/slo.json":                          true, // public status JSON
 	"GET /healthz":                                  true, // loopback infra probe
+	"GET /readyz":                                   true, // loopback dependency-aware readiness probe (PR #1038 pre-release-readiness-gates)
 	"GET /v1/orgs/me":                               true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 	"GET /v1/traces/{trace_id}":                     true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
 	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's
@@ -190,6 +192,15 @@ var dtoExclude = map[string]bool{
 	// Single-use inline shape — no SDK callers reference it by
 	// name, so no standalone schema.
 	"CreateTriggerBatchResult": true,
+	// Issue #975 item #1 / ADR-122 — the PATCH response shape is
+	// inlined in the OpenAPI spec (api/openapi.yaml PATCH /v1/apps/
+	// {slug}/deployments/{deployment}/openapi 200 response) rather
+	// than $ref'd to a standalone schema, because the inline shape
+	// keeps the response body self-documenting for SDK generators
+	// and avoids a vacuum lint panic on the schema's $ref chain.
+	// The Go DTO is the typed wire shape that the SDK method
+	// unmarshals into.
+	"OpenAPIDocResponse": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the

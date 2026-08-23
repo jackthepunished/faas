@@ -84,6 +84,19 @@ const (
 	// Plan-gated to Pro+; Free/Hobby use edge rules
 	// (kind='ip') for the abuse-floor posture.
 	AppPublicAuthModeIPAllowlist = "ip_allowlist"
+	// AppPublicAuthModeInternalOnly restricts the app's
+	// public hostname to requests carrying an
+	// `Authorization: Bearer <JWT>` token with
+	// `aud='gregale.internal'` signed by a Gregale
+	// daemon's Ed25519 key (ADR-119). Anything else 403s
+	// at pkg/gateway/handler.go::applyIngressInternalSvc
+	// (runs after applyIngressIPAllowlist, before
+	// applyEdgeRuleIP) AND at the synth-server path
+	// (pkg/gateway/synth.go::handleSynthesize, so cron
+	// cannot bypass the gate). Available on all plans;
+	// the trust boundary is operator-side, not
+	// human-side, so no plan gate applies.
+	AppPublicAuthModeInternalOnly = "internal_only"
 )
 
 // AppPublicAuthIPAllowlistMaxEntries bounds the per-app

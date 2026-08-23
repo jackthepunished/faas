@@ -200,3 +200,83 @@ func TestCorrelationRoundTrip_SanitizesAtLift(t *testing.T) {
 		t.Errorf("expected sanitized wake_id with middle dot, got %q", line)
 	}
 }
+
+// ADR-123 — wake-boot telemetry envelope (trigger + queued +
+// concurrency-at-admit). Schedd propagates these on the schedd → vmmd
+// gRPC wire so the vmmd-side mirror BootStarted row (issue #517 PR-C)
+// carries the same context as the canonical schedd emit.
+
+func TestWithCorrelationOutgoing_ADR123_WakeBootEnvelope(t *testing.T) {
+	ctx := wire.WithCorrelationOutgoing(context.Background(), wire.CorrelationFields{
+		Trigger:            "gateway",
+		QueuedCount:        3,
+		ConcurrencyAtAdmit: 2,
+	})
+	md := mustOutgoingMD(t, ctx)
+	if got := md.Get("x-faas-wake-boot-trigger"); len(got) != 1 || got[0] != "gateway" {
+		t.Errorf("trigger metadata not stamped: %v", got)
+	}
+	if got := md.Get("x-faas-wake-boot-queued"); len(got) != 1 || got[0] != "3" {
+		t.Errorf("queued metadata not stamped: %v", got)
+	}
+	if got := md.Get("x-faas-wake-boot-conc"); len(got) != 1 || got[0] != "2" {
+		t.Errorf("concurrency metadata not stamped: %v", got)
+	}
+}
+
+func TestCorrelationFromIncoming_ADR123_WakeBootEnvelope(t *testing.T) {
+	md := metadata.New(map[string]string{
+		"x-faas-wake-boot-trigger": "cron.schedule",
+		"x-faas-wake-boot-queued":  "8",
+		"x-faas-wake-boot-conc":    "5",
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+	fields, ok := wire.CorrelationFromIncoming(ctx)
+	if !ok {
+		t.Fatal("lift returned ok=false")
+	}
+	if fields.Trigger != "cron.schedule" {
+		t.Errorf("trigger lift mismatch: got %q want cron.schedule", fields.Trigger)
+	}
+	if fields.QueuedCount != 8 {
+		t.Errorf("queued lift mismatch: got %d want 8", fields.QueuedCount)
+	}
+	if fields.ConcurrencyAtAdmit != 5 {
+		t.Errorf("concurrency lift mismatch: got %d want 5", fields.ConcurrencyAtAdmit)
+	}
+}
+
+func TestCorrelationFromIncoming_ADR123_MalformedIntDropsField(t *testing.T) {
+	// A malformed wire value (proxy truncation) must NOT panic the
+	// vmmd RPC handler — the zero value is silently dropped at the
+	// BootStarted emit by the `if e.Trigger != ""` guard.
+	md := metadata.New(map[string]string{
+		"x-faas-wake-boot-trigger": "scaleup",
+		"x-faas-wake-boot-queued":  "not-an-int",
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+	fields, ok := wire.CorrelationFromIncoming(ctx)
+	if !ok {
+		t.Fatal("lift returned ok=false")
+	}
+	if fields.Trigger != "scaleup" {
+		t.Errorf("trigger should still lift: got %q", fields.Trigger)
+	}
+	if fields.QueuedCount != 0 {
+		t.Errorf("malformed queued must drop to zero, got %d", fields.QueuedCount)
+	}
+}
+
+func TestWithCorrelationOutgoing_ADR123_NoTriggerOmitsIntKeys(t *testing.T) {
+	// Empty Trigger is the pre-ADR-123 producer signal — the int keys
+	// must NOT be emitted (no orphan metadata cluttering the wire).
+	// The helper's empty-pairs early-return also means the MD layer is
+	// not created at all, matching the existing TestWithCorrelationOutgoing_NoFieldsNoOp contract.
+	ctx := wire.WithCorrelationOutgoing(context.Background(), wire.CorrelationFields{
+		QueuedCount:        3,
+		ConcurrencyAtAdmit: 2,
+	})
+	if _, ok := metadata.FromOutgoingContext(ctx); ok {
+		t.Error("outgoing MD layer created when only ADR-123 ints are set without trigger")
+	}
+}

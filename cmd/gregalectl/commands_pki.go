@@ -41,6 +41,7 @@ package main
 import (
 	"crypto/ecdsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -59,6 +60,7 @@ const (
 	subPKIInit   = "init"
 	subPKIStatus = "status"
 	subPKIRotate = "rotate"
+	subPKIList   = "list"
 )
 
 // cmdPKI is the parent dispatcher. With zero args it prints usage;
@@ -67,7 +69,7 @@ const (
 func cmdPKI(args []string) int {
 	parent, _ := lookupCliCommand("pki")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl pki <init|status|rotate> [flags]", "pki")
+		PrintUsage(os.Stderr, "usage: gregalectl pki <init|status|list|rotate> [flags]", "pki")
 		return 1
 	}
 	switch args[0] {
@@ -75,11 +77,13 @@ func cmdPKI(args []string) int {
 		return cmdPKIInit(args[1:])
 	case subPKIStatus:
 		return cmdPKIStatus(args[1:])
+	case subPKIList:
+		return cmdPKIList(args[1:])
 	case subPKIRotate:
 		return cmdPKIRotate(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregalectl pki: unknown subcommand %q (known: init, status, rotate)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl pki: unknown subcommand %q (known: init, status, list, rotate)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -123,6 +127,10 @@ func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
 		"rotate only the leaves in this directory (rotate path; e.g. --daemon egress to reissue just the egress server + meterd client leaves)")
 	fs.StringVar(&f.boxRole, "box-role", "",
 		"per-box PKI subset (Gate-B PR-3): '', 'single-box' = full Roles(); 'control-plane' = fsn-1 leaves; 'compute-only' = fsn-2 leaves")
+	// --json is wired in the leaf-specific cmd functions so the
+	// help text is colocated with the per-leaf intent; the
+	// newPKIFlags helper is shared by the destructive leaves
+	// (init / rotate) which don't accept --json.
 	return fs, f
 }
 
@@ -456,4 +464,185 @@ func anyExpiringSoon(rootDir string, threshold time.Duration) bool {
 // here because the sentinel's text is stable.
 func isErrLeafNotExpiringSoon(err error) bool {
 	return err != nil && strings.Contains(err.Error(), pki.ErrLeafNotExpiringSoon.Error())
+}
+
+// cmdPKIList is the read-only introspection leaf (Cluster C2 of
+// the gregalectl mega-PR). Mirrors `status` but emits the wire
+// shape that CI gates + ad-hoc jq pipelines want:
+//
+//	{box_role, daemon, leaves:[{directory, filename, mode,
+//	  serial, not_after, cn, sans, present, path}],
+//	 ca:{path, mode, serial, not_after, present}}
+//
+// Missing leaves / CA stay present=false (other fields zero) so
+// the pre-init wire shape is stable. --daemon narrows the leaves
+// list to one directory (with the egress cross-directory carve-out,
+// identical to the rotate path) so operators can dump a single
+// subsystem without churning through the 9+ directory list. The
+// leaf never writes (--force is ignored); an exit-1 gate on
+// expiry belongs to status, not list.
+func cmdPKIList(args []string) int {
+	fs := flag.NewFlagSet("pki list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	f := &pkiFlags{}
+	fs.StringVar(&f.rootDir, "root-dir", pki.DefaultRootDir,
+		"directory under which CA + per-daemon leaves live (canonical: "+pki.DefaultRootDir+")")
+	fs.StringVar(&f.daemon, "daemon", "",
+		"narrow to one directory (e.g. --daemon egress incl. the meterd/client cross-dir carve-out)")
+	fs.StringVar(&f.boxRole, "box-role", "",
+		"per-box PKI subset ('' = full Roles(); 'single-box'/'control-plane'/'compute-only' per Gate-B)")
+	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "gregalectl pki list [--daemon NAME] [--box-role ROLE] [--root-dir DIR] [--json]", "pki")
+		return 1
+	}
+	rep := inspectPKI(f.rootDir, f.daemon, f.boxRole)
+	if *jsonOut {
+		return emitPKIListJSON(osStdout, rep)
+	}
+	reportCAStatus(os.Stdout, f.rootDir)
+	reportLeafStatusFiltered(os.Stdout, f.rootDir, f.daemon, f.boxRole)
+	return 0
+}
+
+// pkiListReport is the wire shape for `pki list --json`. The
+// fields are pinned by json_parity_test so CI gates can rely on
+// the schema. daemon is "" when no filter is set (mirror the
+// CLI shape; gates can branch on daemon == "" vs. != "").
+type pkiListReport struct {
+	BoxRole string         `json:"box_role"`
+	Daemon  string         `json:"daemon"`
+	CA      pkiFileStatus  `json:"ca"`
+	Leaves  []pkiLeafShape `json:"leaves"`
+}
+
+// pkiFileStatus is the per-file shape used by both the CA and
+// every leaf entry. present=false on missing files; otherwise
+// mode / serial / not_after are populated and the path echoes
+// the on-disk location for diagnostic purposes.
+type pkiFileStatus struct {
+	Present  bool   `json:"present"`
+	Path     string `json:"path"`
+	Mode     string `json:"mode,omitempty"`
+	Serial   string `json:"serial,omitempty"`
+	NotAfter string `json:"not_after,omitempty"`
+}
+
+// pkiLeafShape adds the role identity (directory + filename) +
+// the parsed cert's CN + SANs on top of pkiFileStatus. The CA
+// entry uses pkiFileStatus directly (no role identity).
+type pkiLeafShape struct {
+	Directory string `json:"directory"`
+	Filename  string `json:"filename"`
+	pkiFileStatus
+	CN   string `json:"cn,omitempty"`
+	SANs string `json:"sans,omitempty"`
+}
+
+// inspectPKI builds the read-only report. daemon=="" means
+// every leaf for the boxRole subset; daemon=="<dir>" uses the
+// same carve-out the rotate path uses (roleMatchesDaemon
+// below) so list and rotate agree on "what does --daemon X
+// cover?". Missing files are reported present=false (other
+// fields zero) so the pre-init wire shape is stable.
+func inspectPKI(rootDir, daemon, boxRole string) pkiListReport {
+	rep := pkiListReport{BoxRole: boxRole, Daemon: daemon}
+
+	// CA
+	caCertPath, _ := pki.CARoot(rootDir)
+	rep.CA = inspectPKIFile(caCertPath)
+
+	// Leaves
+	for _, role := range pki.RolesForBox(boxRole) {
+		if daemon != "" && !roleMatchesDaemon(role, daemon) {
+			continue
+		}
+		certPath, _ := pki.LeafPaths(rootDir, role)
+		leaf := pkiLeafShape{Directory: role.Directory, Filename: role.Filename}
+		leaf.pkiFileStatus = inspectPKIFile(certPath)
+		if leaf.Present {
+			// Re-parse the bytes already loaded so we can
+			// surface CN + SANs in the JSON shape. We
+			// re-read once more rather than threading the
+			// bytes through inspectPKIFile so the helper
+			// stays narrowly typed for the missing-file
+			// shape.
+			if data, err := os.ReadFile(certPath); err == nil {
+				if block, _ := pem.Decode(data); block != nil {
+					if cert, certErr := x509.ParseCertificate(block.Bytes); certErr == nil {
+						leaf.CN = cert.Subject.CommonName
+						leaf.SANs = formatSANs(cert.DNSNames, cert.IPAddresses)
+					}
+				}
+			}
+		}
+		rep.Leaves = append(rep.Leaves, leaf)
+	}
+	return rep
+}
+
+// inspectPKIFile reads mode + serial + not_after for one
+// cert file. Missing files return present=false (other fields
+// zero). The shape is mirrored by reportOneStatus for the text
+// renderer so the two paths never disagree on what's on disk.
+func inspectPKIFile(path string) pkiFileStatus {
+	info, err := os.Stat(path)
+	if err != nil {
+		return pkiFileStatus{Path: path}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return pkiFileStatus{Path: path, Mode: fmt.Sprintf("%#o", info.Mode().Perm())}
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return pkiFileStatus{Path: path, Mode: fmt.Sprintf("%#o", info.Mode().Perm()), Present: true}
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return pkiFileStatus{Path: path, Mode: fmt.Sprintf("%#o", info.Mode().Perm()), Present: true}
+	}
+	return pkiFileStatus{
+		Present:  true,
+		Path:     path,
+		Mode:     fmt.Sprintf("%#o", info.Mode().Perm()),
+		Serial:   cert.SerialNumber.String(),
+		NotAfter: cert.NotAfter.Format(time.RFC3339),
+	}
+}
+
+// emitPKIListJSON writes the report to w. Kept as a free
+// function so tests can drive it with a buffer rather than
+// osStdout. The exit code is the function's return value so
+// the caller can branch on json.Marshal failure (mirrors the
+// other emit*JSON helpers in this package).
+func emitPKIListJSON(w io.Writer, rep pkiListReport) int {
+	body, err := json.Marshal(rep)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl pki list: marshal json: %v\n", err)
+		return 1
+	}
+	if _, err := w.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl pki list: write json: %v\n", err)
+		return 1
+	}
+	_, _ = w.Write([]byte("\n"))
+	return 0
+}
+
+// reportLeafStatusFiltered is the text counterpart to
+// inspectPKI's leaves walk; same --daemon / --box-role
+// filter so the two renderers never disagree.
+func reportLeafStatusFiltered(w io.Writer, rootDir, daemon, boxRole string) {
+	for _, role := range pki.RolesForBox(boxRole) {
+		if daemon != "" && !roleMatchesDaemon(role, daemon) {
+			continue
+		}
+		certPath, _ := pki.LeafPaths(rootDir, role)
+		label := fmt.Sprintf("%-9s %s", role.Directory, role.Filename)
+		reportOneStatus(w, label, certPath)
+	}
 }

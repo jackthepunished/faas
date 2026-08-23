@@ -109,6 +109,21 @@ type Loop struct {
 	// reaches this surface). Production wires NewBrokerAccountor
 	// via WithBrokerAccountor.
 	brokerAccountor BrokerAccountor
+	// appPublicAuthModeLookup (ADR-119) is the Loop-level sibling
+	// of httpGatewaySynth.appPublicAuthModeLookup. The trigger
+	// dispatch tick (postBatch) does NOT go through
+	// httpGatewaySynth — it uses l.gatewayHTTPClient directly —
+	// so the auth-state lookup + minter are wired here too.
+	// nil = every app is treated as "open" (no Authorization
+	// header attached). Same nil-safe posture as the synth
+	// version; the cmd-side wiring (cmd/schedd/main.go) sets
+	// both via WithAppPublicAuthModeLookup + WithMintInternalSvcToken.
+	appPublicAuthModeLookup PublicAuthModeLookupFunc
+	// mintInternalSvcToken (ADR-119) Loop-level sibling of
+	// httpGatewaySynth.mintInternalSvcToken. Same nil-safe
+	// posture; nil + internal_only mode = loud warn + the gate
+	// 403s on the receiving end.
+	mintInternalSvcToken func(appID string) (string, error)
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -238,6 +253,31 @@ func (l *Loop) WithGatewaySynth(g GatewaySynth) *Loop {
 func (l *Loop) WithGatewayHTTPClient(client *http.Client, baseURL string) *Loop {
 	l.gatewayHTTPClient = client
 	l.gatewayBaseURL = baseURL
+	return l
+}
+
+// WithAppPublicAuthModeLookup (ADR-119) arms the Loop-level
+// mode lookup that postBatch consults before posting the
+// trigger batch envelope. Mirror of
+// httpGatewaySynth.WithAppPublicAuthModeLookup (loop.go:1925);
+// the trigger dispatch path uses gatewayHTTPClient directly
+// rather than the GatewaySynth interface, so the lookup lives
+// on Loop too. nil = every app treated as "open".
+func (l *Loop) WithAppPublicAuthModeLookup(lookup PublicAuthModeLookupFunc) *Loop {
+	l.appPublicAuthModeLookup = lookup
+	return l
+}
+
+// WithMintInternalSvcToken (ADR-119) arms the Loop-level JWT
+// minter that postBatch calls when the app is in
+// 'internal_only' mode. Mirror of
+// httpGatewaySynth.WithMintInternalSvcToken; the trigger
+// dispatch path is the third outbound surface that needs the
+// JWT (after SynthesizeRequest + Invoke). nil = the gate would
+// 403 every internal_only batch — surfaced as a loud warn so
+// an operator sees the misconfig.
+func (l *Loop) WithMintInternalSvcToken(mint func(appID string) (string, error)) *Loop {
+	l.mintInternalSvcToken = mint
 	return l
 }
 
@@ -1780,6 +1820,29 @@ type httpGatewaySynth struct {
 	client     *http.Client
 	basePrefix string
 	log        *slog.Logger
+	// appPublicAuthModeLookup (ADR-119) returns the
+	// public_auth_mode for the given appID. nil = every app
+	// is treated as "open" (no JWT attached on the outbound
+	// synth request). Wired by cmd/schedd/main.go via
+	// WithAppPublicAuthModeLookup; tests construct directly.
+	// The lookup is consulted on EVERY SynthesizeRequest call
+	// — the call is rare (cron cadence, not per-request) so a
+	// store round-trip is acceptable.
+	//
+	// Round-2 follow-up: the lookup carries (result, error) so
+	// a transient lookup failure degrades to "assume
+	// internal_only" (fail-closed) rather than "open"
+	// (fail-open). See pkg/sched/configure_internal_svc.go.
+	appPublicAuthModeLookup PublicAuthModeLookupFunc
+	// mintInternalSvcToken (ADR-119) mints a JWT for outbound
+	// Authorization: Bearer headers on synth requests targeting
+	// apps whose public_auth_mode='internal_only'. Receives the
+	// appID so the JWT can carry an app_id claim (future
+	// per-app key-pinning). nil = the gate would 403 every
+	// internal_only synth — surfaced as a loud error log so an
+	// operator sees the misconfig. Wired by cmd/schedd/main.go
+	// via WithMintInternalSvcToken; tests construct directly.
+	mintInternalSvcToken func(appID string) (string, error)
 }
 
 // DialGatewaySynth opens an HTTP unix-socket client targeting
@@ -1870,6 +1933,16 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 	}
 }
 
+// lookupErrStr renders a lookup error for the warn log. nil
+// returns "". audit-redaction invariant companion: the JWT
+// token is never included; only the error reason code.
+func lookupErrStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 // HTTPClientForGatewaySynthTarget (issue #757 / ADR-100, commit #14)
 // returns the http.Client + base URL the trigger dispatch tick uses
 // to POST batch envelopes at the gateway's
@@ -1896,6 +1969,32 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 // socket IS the auth; if tcp is the dial the cluster operator
 // wires a sidecar). If a future change adds TLS to the batch
 // endpoint, thread a *tls.Config through this signature.
+
+// WithAppPublicAuthModeLookup (ADR-119) arms the per-app
+// public_auth_mode lookup used by SynthesizeRequest to decide
+// whether to attach an Authorization: Bearer JWT (apps whose
+// public_auth_mode='internal_only'). Returns the receiver for
+// fluent chaining. nil = no lookup (every app treated as
+// "open"; synth requests never carry Authorization — safe in
+// dev + tests where no app is in internal_only mode).
+func (h *httpGatewaySynth) WithAppPublicAuthModeLookup(lookup PublicAuthModeLookupFunc) *httpGatewaySynth {
+	h.appPublicAuthModeLookup = lookup
+	return h
+}
+
+// WithMintInternalSvcToken (ADR-119) arms the JWT minter used
+// by SynthesizeRequest when the app is in internal_only mode.
+// The minter is responsible for choosing svcName (today: hard-
+// coded "schedd"), keypair (today: env-loaded at boot), and
+// TTL (today: ≤30s — see plan). Returns the receiver for fluent
+// chaining. nil = the gate 403s every internal_only synth and
+// the loop logs a loud warning so an operator sees the
+// misconfig.
+func (h *httpGatewaySynth) WithMintInternalSvcToken(mint func(appID string) (string, error)) *httpGatewaySynth {
+	h.mintInternalSvcToken = mint
+	return h
+}
+
 func HTTPClientForGatewaySynthTarget(target string) (*http.Client, string, error) {
 	if target == "" {
 		return nil, "", errors.New("sched: gateway synth target is empty")
@@ -1935,6 +2034,36 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 		return fmt.Errorf("sched: synth request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// ADR-119 — attach an Authorization: Bearer JWT when the app
+	// is in 'internal_only' mode. Same helper as Invoke + postBatch
+	// consult the same per-app mode lookup and mint the same JWT.
+	// The mode lookup is nil-safe (nil = every app treated as
+	// "open"); the minter is nil-safe (nil + internal_only mode =
+	// loud warn + the gate 403s on the receiving end).
+	//
+	// Fail-closed posture (round-2): a transient lookup
+	// failure (Postgres outage, missing appID, etc.) returns
+	// err != nil from the lookup. We treat that as "the app
+	// is in internal_only mode" — i.e. attach the JWT
+	// (fail-closed). The gateway-side gate (synth.go) checks
+	// the app's actual mode; if the app is genuinely open,
+	// the JWT is harmless (the gate only enforces on
+	// internal_only). If the app is genuinely internal_only,
+	// the JWT is required. Either way, fail-closed paths.
+	if h.appPublicAuthModeLookup != nil {
+		if res, lookupErr := h.appPublicAuthModeLookup(ctx, appID); lookupErr != nil || res.Mode == "internal_only" {
+			if h.mintInternalSvcToken == nil {
+				h.log.Warn("sched: app in internal_only mode (or lookup failed) but no minter wired; gate will 403",
+					"app_id", appID, "lookup_err", lookupErrStr(lookupErr))
+			} else {
+				tok, mErr := h.mintInternalSvcToken(appID)
+				if mErr != nil {
+					return fmt.Errorf("sched: synth mint: %w", mErr)
+				}
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
+	}
 	// issue #517: stamp the per-cron-fire request_id on the
 	// synthetic inbound request so gatewayd-internal's middleware picks it
 	// up unchanged and the downstream wake timeline logs share
@@ -1987,6 +2116,28 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 		return inv, fmt.Errorf("sched: invocation request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// ADR-119 — schedd's move-1 dial is now gated by the same
+	// internal_only mode check SynthesizeRequest uses. Without
+	// this attachment, a forged schedd (or anything else in the
+	// faas group) could invoke an internal_only app via
+	// /v1/invocations:dispatch — the gate at synth.go::handleInvocationDispatch
+	// would 403 the request, but the cheap-prevention is
+	// attaching the JWT here so the gate accepts. Same
+	// nil-safe + fail-closed posture as SynthesizeRequest.
+	if h.appPublicAuthModeLookup != nil {
+		if res, lookupErr := h.appPublicAuthModeLookup(ctx, appID); lookupErr != nil || res.Mode == "internal_only" {
+			if h.mintInternalSvcToken == nil {
+				h.log.Warn("sched: invoke path: app in internal_only mode (or lookup failed) but no minter wired; gate will 403",
+					"app_id", appID, "lookup_err", lookupErrStr(lookupErr))
+			} else {
+				tok, mErr := h.mintInternalSvcToken(appID)
+				if mErr != nil {
+					return inv, fmt.Errorf("sched: invocation mint: %w", mErr)
+				}
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
+	}
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return inv, fmt.Errorf("sched: invocation do: %w", err)
@@ -2243,7 +2394,14 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 	// same parked app) coalesces into one virtual boot. The detached
 	// leader ctx means a cancelled triggering cron doesn't kill the
 	// boot the next follow-on caller still needs.
-	if _, err := l.engine.EnsureWake(ctx, c.AppID); err != nil {
+	// ADR-123: translate the internal CronDispatchTrigger enum to
+	// the external wake-boot trigger enum. Schedule is "60s tick",
+	// Manual is "POST /v1/crons/{id}/run (ADR-090)".
+	wakeBootTrigger := TriggerCronSched
+	if trigger == TriggerManual {
+		wakeBootTrigger = TriggerCronManual
+	}
+	if _, err := l.engine.EnsureWake(ctx, c.AppID, wakeBootTrigger); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

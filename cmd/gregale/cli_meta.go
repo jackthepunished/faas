@@ -325,7 +325,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    dispatchDeploys,
 		DocSlug: "deploys",
-		Short:   "Read-only deploy drill-downs (deploys show|status <id>)",
+		Short:   "Read-only deploy drill-downs (deploys show|status|retry <id>)",
 		Subcommands: []cliSub{
 			// ADR-117 companion read surface. Future siblings
 			// (timeline, events, artifacts) land here as new
@@ -334,6 +334,15 @@ var cliCommands = []cliCommand{
 			// flag-shaped drill-downs.
 			{Name: "show", Short: "Print the closed 6-stage post-stream summary"},
 			{Name: statusLiteral, Short: "Print the stage summary with terminal-status footer (live since / failed at)"},
+			// ADR-117 §Production-ready follow-on, C2 — per-stage
+			// retry. The verb is `retry` (NOT a `--retry` flag on
+			// show/status) because the action mutates state — a
+			// subcommand is the CLI convention for write-side
+			// verbs. The --from flag accepts a closed-6 stage name
+			// (default = the failing stage on the row, fetched
+			// via the existing GET /v1/deployments/{id}/stages
+			// read surface).
+			{Name: "retry", Short: "Retry a failed deployment from a specific stage (--from=<stage>)"},
 		},
 		Positionals: []string{"<id>"},
 	},
@@ -391,6 +400,14 @@ var cliCommands = []cliCommand{
 			{Name: subDomainsVerify, Short: "Re-verify DNS + cert for a domain"},
 			{Name: subDomainsShow, Short: "Show a domain's cert details"},
 			{Name: subDomainsDoctor, Short: "5-check doctor report (DNS / CNAME / TLS / CAA / IPv6)"},
+		},
+	},
+	{
+		Name:    "preview",
+		DocSlug: "preview",
+		Short:   "Manage preview environments (Mega-C PR-1 / issue #961 leaf 3)",
+		Subcommands: []cliSub{
+			{Name: "destroy", Short: "Tear down a preview app (POST /v1/preview/{slug}/destroy)"},
 		},
 	},
 	{

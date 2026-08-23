@@ -404,6 +404,16 @@ func characterizationToStruct(r api.CharacterizationReport) (*structpb.Struct, b
 		}
 		m["listening_addrs"] = l
 	}
+	// ADR-122 §D2 — endpoint discovery. The OpenAPIDoc field is
+	// wire-additive; structpb.NewStruct accepts []byte as a base64
+	// string when the underlying MapValue is marshalled to JSON,
+	// matching the characterization_test.go round-trip. The
+	// truncation flag is a bool (no omitempty on the vmmdgrpc side
+	// because the structpb path always materialises the key).
+	if len(r.OpenAPIDoc) > 0 {
+		m["openapi_doc"] = r.OpenAPIDoc
+	}
+	m["openapi_doc_truncated"] = r.OpenAPIDocTruncated
 	s, err := structpb.NewStruct(m)
 	if err != nil {
 		return nil, false

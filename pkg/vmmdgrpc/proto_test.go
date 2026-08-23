@@ -6,10 +6,12 @@ package vmmdgrpc
 
 import (
 	"context"
+	"encoding/base64"
 	"net/netip"
 	"testing"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/netns"
 )
@@ -604,5 +606,90 @@ func TestToColdBootRequest_WithSidecars(t *testing.T) {
 	}
 	if wr.Sidecars[0].Name != "migrator" || wr.Sidecars[0].DriveID != "layer-sidecar-0" {
 		t.Errorf("entry 0: got %+v", wr.Sidecars[0])
+	}
+}
+
+// TestCharacterizationToStruct_OpenAPIDoc (ADR-122 §D2) pins the
+// vmmdgrpc-side wire shape for the OpenAPIDoc field. The proto.go
+// path mirrors pkg/api/characterization_test.go::TestCharacterizationReport_JSONRoundTrip
+// via a structpb.MapValue. The string-literal key
+// `"openapi_doc"` is the load-bearing contract — sched/vmmclient.go
+// reads against the same key.
+func TestCharacterizationToStruct_OpenAPIDoc(t *testing.T) {
+	r := api.CharacterizationReport{
+		ObservedClass:       "http",
+		ObservedPort:        8080,
+		ExitCode:            0,
+		OutboundCount:       3,
+		OpenAPIDoc:          []byte(`{"openapi":"3.1.0","info":{"title":"captured"}}`),
+		OpenAPIDocTruncated: true,
+	}
+	s, ok := characterizationToStruct(r)
+	if !ok {
+		t.Fatal("characterizationToStruct returned !ok")
+	}
+	m := s.AsMap()
+	// The OpenAPIDoc field is non-empty so the proto.go path
+	// materialises it on the map. structpb.NewStruct stores
+	// []byte as the raw bytes; the wire body that gRPC sends
+	// base64-encodes it (google.protobuf.Value's string_value),
+	// but the AsMap() view exposes the raw bytes for type
+	// assertions on the byte slice.
+	docRaw, ok := m["openapi_doc"]
+	if !ok {
+		t.Fatal("openapi_doc key missing from structpb map (regression: proto.go forgot to mirror the new field)")
+	}
+	// structpb.NewStruct interprets a []byte as a base64-decoded
+	// string at the wire boundary. The AsMap() view here is the
+	// type returned by value.AsInterface() — for a string-typed
+	// Value, this is the raw string. We accept either []byte or
+	// string (the proto.go path stores the []byte; the gRPC
+	// transport re-encodes as base64 at the wire).
+	switch v := docRaw.(type) {
+	case string:
+		// base64-encoded form (the gRPC wire shape).
+		decoded, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			t.Fatalf("openapi_doc base64 decode: %v", err)
+		}
+		if string(decoded) != `{"openapi":"3.1.0","info":{"title":"captured"}}` {
+			t.Errorf("openapi_doc decoded: got %q, want %q", string(decoded), `{"openapi":"3.1.0","info":{"title":"captured"}}`)
+		}
+	case []byte:
+		if string(v) != `{"openapi":"3.1.0","info":{"title":"captured"}}` {
+			t.Errorf("openapi_doc raw: got %q, want %q", string(v), `{"openapi":"3.1.0","info":{"title":"captured"}}`)
+		}
+	default:
+		t.Fatalf("openapi_doc: unexpected type %T", v)
+	}
+	if got, want := m["openapi_doc_truncated"], true; got != want {
+		t.Errorf("openapi_doc_truncated: got %v, want %v", got, want)
+	}
+}
+
+// TestCharacterizationToStruct_OpenAPIDocAbsent (ADR-122 §D2) pins
+// the absence contract: a zero-value OpenAPIDoc must NOT surface
+// a key on the structpb map (the proto.go path uses `if len(...) > 0`
+// to gate the assignment). Sched/vmmclient.go relies on the absence
+// to mean "no doc captured".
+func TestCharacterizationToStruct_OpenAPIDocAbsent(t *testing.T) {
+	r := api.CharacterizationReport{
+		ObservedClass: "http",
+		ObservedPort:  8080,
+		ExitCode:      0,
+	}
+	s, ok := characterizationToStruct(r)
+	if !ok {
+		t.Fatal("characterizationToStruct returned !ok")
+	}
+	m := s.AsMap()
+	if _, ok := m["openapi_doc"]; ok {
+		t.Errorf("openapi_doc key should be absent when the struct is empty (regression: proto.go is unconditionally materialising the field)")
+	}
+	// The truncation flag is a bool — the proto.go path always
+	// materialises it (zero value = false). Verify the wire still
+	// carries the key with the right value.
+	if got, want := m["openapi_doc_truncated"], false; got != want {
+		t.Errorf("openapi_doc_truncated: got %v, want %v", got, want)
 	}
 }

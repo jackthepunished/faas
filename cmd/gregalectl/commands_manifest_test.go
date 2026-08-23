@@ -24,6 +24,9 @@ overlay:
 dns:
   apps_domain: apps.gregale.dev
   mode: cloudflare
+private_dns:
+  mode: managed_hosts
+  zone: gregale.dev
 postgresql:
   dsn: postgres://faas@127.0.0.1:5432/faas
   database: faas

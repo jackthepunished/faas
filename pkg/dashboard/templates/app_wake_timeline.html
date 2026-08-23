@@ -1,0 +1,49 @@
+{{define "app_wake_timeline.html"}}
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{.Data.App.Slug}} — wake timeline</title>
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+</head>
+<body class="dashboard">
+  {{template "nav" .}}
+  <main class="app-wake-timeline">
+    <header class="page-header">
+      <h1>{{.Data.App.Slug}} — wake timeline</h1>
+      <p class="page-subtitle">
+        Recent wakes of <code>{{.Data.App.Slug}}</code> with the
+        closed-8-value <em>Trigger</em> enum, queue depth, siblings-
+        admitted, at-capacity stamp, and ready-in-ms. Em-dash means
+        the field is absent — either pre-PR-A fleet (no
+        <code>at_capacity</code> stamp) or a wake without a
+        corresponding event row. Navigate back to
+        <a href="/dashboard/apps/{{.Data.App.Slug}}">app detail →</a>.
+      </p>
+    </header>
+
+    <section class="wake-timeline-summary">
+      <h2>Summary</h2>
+      <ul>
+        <li><strong>{{.Data.WakeCount24h}}</strong> wakes in the last 24h</li>
+        <li>
+          <strong>24h trigger mix:</strong>
+          <span class="trigger-histogram">{{.Data.TriggerHistogramHTML}}</span>
+          {{if lt .Data.WakeCountWithMeta .Data.WakeCount24h}}<em>(of {{.Data.WakeCountWithMeta}} known wakes)</em>{{end}}
+        </li>
+        <li>
+          <strong>At-cap wakes (PR-A):</strong>
+          {{.Data.AtCapacityCount}} of {{.Data.WakeCountWithMeta}} known
+          ({{printf "%.0f" .Data.AtCapacityPct}}%)
+        </li>
+      </ul>
+    </section>
+
+    <section class="wake-timeline-body">
+      <h2>Recent wakes</h2>
+      {{.Data.RenderTable}}
+    </section>
+  </main>
+</body>
+</html>
+{{end}}

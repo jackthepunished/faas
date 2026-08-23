@@ -9,6 +9,7 @@ package wire_test
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1508,4 +1509,69 @@ func TestOpsMetrics_ObserveESMLag(t *testing.T) {
 	// Nil-receiver parity.
 	var nilM *wire.OpsMetrics
 	nilM.ObserveESMLag("kafka", "0", 1.0) // must not panic
+}
+
+// TestOpsMetrics_ObserveDeployStageDuration — ADR-117
+// §Production-ready follow-on. Pins:
+//
+//   - the histogram name is "<prefix>_deploy_stage_duration_seconds"
+//     so dashboards on the §12 panel can find it from any daemon
+//   - the {stage, status} label set is the closed-6 stage vocabulary
+//     × {completed, failed} (the catalogued label set is pre-
+//     instantiated in NewOpsMetrics so /metrics surfaces zero on
+//     boot)
+//   - Observe on a nil receiver is a no-op (the imaged
+//     transitionWithStage caller can call it unconditionally)
+//   - a non-nil receiver increments the histogram count for the
+//     matching {stage, status} tuple
+func TestOpsMetrics_ObserveDeployStageDuration(t *testing.T) {
+	const prefix = "imaged"
+	m := wire.NewOpsMetrics(prefix)
+	m.ObserveDeployStageDuration("image_build", "completed", 8*time.Second)
+	m.ObserveDeployStageDuration("image_build", "completed", 12*time.Second)
+	m.ObserveDeployStageDuration("image_build", "failed", 3*time.Second)
+
+	// Nil-receiver parity — imaged transitionWithStage calls this
+	// unconditionally on the hot path.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveDeployStageDuration("image_build", "completed", time.Second) // must not panic
+
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	body := string(bodyBytes)
+
+	// Histogram name + label set pin (the §12 panel queries this).
+	// We anchor on the _count line — the histogram bucket lines carry a
+	// trailing le="…" label that would shift the closing brace, so the
+	// _count line is the label-terminated surface that pins the
+	// {stage, status} tuple alone.
+	wantPrefix := prefix + "_deploy_stage_duration_seconds_count"
+	if !strings.Contains(body, wantPrefix+`{stage="image_build",status="completed"}`) {
+		t.Errorf("missing completed row for image_build in:\n%s", body)
+	}
+	if !strings.Contains(body, wantPrefix+`{stage="image_build",status="failed"}`) {
+		t.Errorf("missing failed row for image_build in:\n%s", body)
+	}
+	// Pre-instantiated label set (the boot-zero surface): every
+	// (stage, status) tuple must surface in /metrics from the
+	// first request even before any Observe fires. The §12
+	// panel relies on this so p95/p99 query a non-empty time
+	// series from the moment the daemon boots.
+	for _, stage := range []string{"source_download", "dependency_restore", "image_build", "security_scan", "snapshot_prepare", "readiness"} {
+		for _, status := range []string{"completed", "failed"} {
+			needle := fmt.Sprintf(`%s{stage=%q,status=%q} `, wantPrefix, stage, status)
+			if !strings.Contains(body, needle) {
+				t.Errorf("missing pre-instantiated row %q in:\n%s", needle, body)
+			}
+		}
+	}
 }

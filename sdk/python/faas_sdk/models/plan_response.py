@@ -10,6 +10,7 @@ from ..models.plan_response_scan_source import PlanResponseScanSource, check_pla
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.plan_affected_app import PlanAffectedApp
     from ..models.plan_cron import PlanCron
     from ..models.plan_managed import PlanManaged
     from ..models.plan_workload import PlanWorkload
@@ -38,6 +39,10 @@ class PlanResponse:
     repo_full_name: str | Unset = UNSET
     warnings: list[str] | Unset = UNSET
     crons_not_allowed: bool | Unset = UNSET
+    will_deploy: list[PlanAffectedApp] | Unset = UNSET
+    unaffected: list[PlanAffectedApp] | Unset = UNSET
+    skipped: list[PlanAffectedApp] | Unset = UNSET
+    removed: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +87,31 @@ class PlanResponse:
 
         crons_not_allowed = self.crons_not_allowed
 
+        will_deploy: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.will_deploy, Unset):
+            will_deploy = []
+            for will_deploy_item_data in self.will_deploy:
+                will_deploy_item = will_deploy_item_data.to_dict()
+                will_deploy.append(will_deploy_item)
+
+        unaffected: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.unaffected, Unset):
+            unaffected = []
+            for unaffected_item_data in self.unaffected:
+                unaffected_item = unaffected_item_data.to_dict()
+                unaffected.append(unaffected_item)
+
+        skipped: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.skipped, Unset):
+            skipped = []
+            for skipped_item_data in self.skipped:
+                skipped_item = skipped_item_data.to_dict()
+                skipped.append(skipped_item)
+
+        removed: list[str] | Unset = UNSET
+        if not isinstance(self.removed, Unset):
+            removed = self.removed
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -106,11 +136,20 @@ class PlanResponse:
             field_dict["warnings"] = warnings
         if crons_not_allowed is not UNSET:
             field_dict["crons_not_allowed"] = crons_not_allowed
+        if will_deploy is not UNSET:
+            field_dict["will_deploy"] = will_deploy
+        if unaffected is not UNSET:
+            field_dict["unaffected"] = unaffected
+        if skipped is not UNSET:
+            field_dict["skipped"] = skipped
+        if removed is not UNSET:
+            field_dict["removed"] = removed
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.plan_affected_app import PlanAffectedApp
         from ..models.plan_cron import PlanCron
         from ..models.plan_managed import PlanManaged
         from ..models.plan_workload import PlanWorkload
@@ -161,6 +200,35 @@ class PlanResponse:
 
         crons_not_allowed = d.pop("crons_not_allowed", UNSET)
 
+        _will_deploy = d.pop("will_deploy", UNSET)
+        will_deploy: list[PlanAffectedApp] | Unset = UNSET
+        if _will_deploy is not UNSET:
+            will_deploy = []
+            for will_deploy_item_data in _will_deploy:
+                will_deploy_item = PlanAffectedApp.from_dict(will_deploy_item_data)
+
+                will_deploy.append(will_deploy_item)
+
+        _unaffected = d.pop("unaffected", UNSET)
+        unaffected: list[PlanAffectedApp] | Unset = UNSET
+        if _unaffected is not UNSET:
+            unaffected = []
+            for unaffected_item_data in _unaffected:
+                unaffected_item = PlanAffectedApp.from_dict(unaffected_item_data)
+
+                unaffected.append(unaffected_item)
+
+        _skipped = d.pop("skipped", UNSET)
+        skipped: list[PlanAffectedApp] | Unset = UNSET
+        if _skipped is not UNSET:
+            skipped = []
+            for skipped_item_data in _skipped:
+                skipped_item = PlanAffectedApp.from_dict(skipped_item_data)
+
+                skipped.append(skipped_item)
+
+        removed = cast(list[str], d.pop("removed", UNSET))
+
         plan_response = cls(
             project_slug=project_slug,
             scan_source=scan_source,
@@ -177,6 +245,10 @@ class PlanResponse:
             repo_full_name=repo_full_name,
             warnings=warnings,
             crons_not_allowed=crons_not_allowed,
+            will_deploy=will_deploy,
+            unaffected=unaffected,
+            skipped=skipped,
+            removed=removed,
         )
 
         plan_response.additional_properties = d

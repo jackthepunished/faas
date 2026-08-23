@@ -44,6 +44,7 @@ was red on `unit tests (pg shard 2)`).
 | `sdk-python (gen-check + smoke + unit)`                     | sdk/python drift                          | `ci.yml:~580`     |
 | `proto-check`                                               | checked-in `*.pb.go` matches protoc       | `ci.yml:200-208`  |
 | `load (1k rps hot-path)`                                    | p50 regression under load (issue #266)    | `ci.yml:~700`     |
+| `workflow-lint (actionlint)`                                | Workflow YAML semantic lint               | `ci.yml:~1175`    |
 
 `metal (KVM + root, manual)` is intentionally **not** a required
 check — it is manual-only via `workflow_dispatch`.
@@ -72,3 +73,33 @@ gh api repos/poyrazK/faas/rulesets/19061133 | jq '.rules[] | select(.type=="requ
 locally, in this order: `spec-check` → `proto-check` → `sqlc-check`
 → `egress-check` → `sdk-gen`. Does NOT cover CI-only jobs that need
 Postgres service containers.
+
+## `gregalectl` checks (issue #911 / ADR-110 PR-6.5)
+
+The operator CLI (`cmd/gregalectl/`) is referenced by Makefile, 5
+ansible roles, deployctl, and 4 e2e suites. CI pins its surface +
+behaviour through these checks. None of these is currently required
+on the ruleset (the `unit tests (pg shard N)` jobs cover them by
+transitive invocation: every `_test.go` under `cmd/gregalectl/` runs
+under one of the shards). They are listed here so a future rename or
+split does not silently lose a load-bearing gate.
+
+| Check                                          | Protects                                                                 | Where it lives                                        |
+|------------------------------------------------|--------------------------------------------------------------------------|-------------------------------------------------------|
+| `make build-clis`                              | Both `gregale` + `gregalectl` compile cleanly                            | `Makefile:16-19`                                      |
+| `make manifest-ansible`                        | `gregalectl manifest ansible` renders the inventory + host_vars tree    | `Makefile:497-498`                                    |
+| `make metal-lima-splitbox`                     | End-to-end smoke: validate → render → release install → doctor --deep    | `Makefile:367`                                        |
+| `commands_completion_test.go::TestCompletion_ManifestDrift` | `main.go` dispatcher ↔ `cli_meta.go` ↔ `commands_completion_test.go` tri-way drift | `cmd/gregalectl/commands_completion_test.go:23` |
+| `json_parity_test.go::TestJSONOutputHonored`   | Every `cmdXxx` that references `jsonOutput`/`jsonEnabled` is exercised by a test (Tier A8.2) | `cmd/gregalectl/json_parity_test.go:38`     |
+| `cmd/e2e/manifest_render_test.go`              | e2e golden path: manifest validate → render → daemon reload              | `cmd/e2e/manifest_render_test.go`                     |
+| `cmd/e2e/release_install_test.go`              | e2e golden path: release bundle → install → UPSERT compute_nodes        | `cmd/e2e/release_install_test.go`                     |
+| `cmd/e2e/image_role_mutation_test.go`          | e2e golden path: PR-B role mutation (drain → mutate → UPSERT)           | `cmd/e2e/image_role_mutation_test.go`                 |
+| `cmd/e2e/doctor_test.go`                       | e2e golden path: doctor finds expected drift findings on poisoned fixtures | `cmd/e2e/doctor_test.go`                         |
+
+When a future PR adds a new top-level command to `gregalectl`, the
+`TestCompletion_ManifestDrift` guard catches missing dispatch ↔
+manifest entries immediately. When a new `--json` arm is added, the
+`json_parity_test` extractor catches a missing `_test.go` exercise of
+that arm immediately. Both gates are intentional tripwires, not
+primary enforcement — the primary enforcement is the unit-test
+shards' failure when the new code does not compile or test.

@@ -499,6 +499,32 @@ func (c *Client) Deploy(ctx context.Context, slug string, req CreateDeploymentRe
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/deployments", req, &out)
 }
 
+// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+// C2) inserts a fresh `deployments` row copying the failed
+// deployment's input primitives and seeds the new row's
+// stage_state.current to fromStage. Returns the new row's typed
+// DeploymentResponse.
+//
+// The fromStage value MUST be one of the closed-6 stage
+// vocabulary (source_download | dependency_restore | image_build
+// | security_scan | snapshot_prepare | readiness). A typo or
+// empty value surfaces as a 400 with an api.Problem whose code
+// is api.CodeValidation. Cross-account probes return 404 (the
+// same IDOR posture as GetDeployment / GetDeploymentStages).
+//
+// fromStage=source_download re-runs the entire pipeline
+// (intentional — that's how a user "retry from the top" works).
+//
+// The route is keyed on the deployment id alone — the handler
+// resolves the parent app via deployments.app_id, so the SDK
+// caller (the CLI's `gregale deploys retry <id>`) doesn't need
+// to know the slug.
+func (c *Client) RetryDeploymentFromStage(ctx context.Context, id, fromStage string) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "POST", "/v1/deployments/"+id+"/retry",
+		RetryDeploymentRequest{FromStage: fromStage}, &out)
+}
+
 // GetDeployment returns a deployment by ID.
 func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentResponse, error) {
 	var out DeploymentResponse
@@ -852,6 +878,17 @@ func (c *Client) RenameApp(ctx context.Context, oldSlug, newSlug string) (AppRes
 // DeleteApp removes an app.
 func (c *Client) DeleteApp(ctx context.Context, slug string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug, nil, nil)
+}
+
+// DestroyPreview tears down a preview app (issue #961 Mega-C
+// PR-1, leaf 3). Distinct from DeleteApp because the preview
+// teardown also stamps apps.preview_pr_state='torn_down' so the
+// janitor doesn't re-process the row, and emits a distinct audit
+// kind (preview.destroyed_by_customer vs app.deleted). The slug
+// must identify a preview app (PreviewOfSlug != "") — a
+// production slug returns 404, not 204.
+func (c *Client) DestroyPreview(ctx context.Context, slug string) error {
+	return c.do(ctx, "POST", "/v1/preview/"+slug+"/destroy", nil, nil)
 }
 
 // ScanProject ships a source tarball to the dry-run endpoint. The
@@ -3255,4 +3292,39 @@ func (c *Client) CreateAppDataUpstream(ctx context.Context, slug string, req Put
 }
 func (c *Client) DeleteAppDataUpstream(ctx context.Context, slug, id string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/upstreams/"+id, nil, nil)
+}
+
+// GetAppsDeploymentOpenAPIDoc returns the OpenAPI document the
+// cold-boot probe captured for a deployment (issue #975 item #1 /
+// ADR-122). The probe runs unconditionally; this endpoint surfaces
+// the captured body only on paid plans — Free returns 402 +
+// openapi_docs_not_allowed. The handler returns 404 when no doc has
+// been captured yet (probe hasn't completed) OR when the deployment
+// is owned by a different account (IDOR floor), so callers branch
+// on errors.Is(err, api.ErrNotFound).
+func (c *Client) GetAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string) (OpenAPIDocResponse, error) {
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", nil, &out)
+}
+
+// PatchAppsDeploymentOpenAPIDoc manually uploads (or overwrites) the
+// OpenAPI document for a deployment. Body is the raw OpenAPI
+// document — the server validates shape against Draft 2020-12 +
+// OpenAPI 3.1 schema (vendored jsonschema v6.0.2) before persisting.
+// Source must be the closed enum value "manual_upload". Returns 413
+// if the doc exceeds Plan.OpenAPIDocMaxBytes() and 402 if the
+// per-account Plan.OpenAPIDocsPerAccount() cap has been reached.
+func (c *Client) PatchAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string, doc map[string]any, source string) (OpenAPIDocResponse, error) {
+	body := map[string]any{"doc": doc, "source": source}
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", body, &out)
+}
+
+// DeleteAppsDeploymentOpenAPIDoc wipes the captured OpenAPI doc for
+// a deployment. The next cold boot of the deployment re-captures a
+// fresh body (the probe always runs). 402 on Free plan; 404 when
+// the deployment has no captured doc or is owned by a different
+// account.
+func (c *Client) DeleteAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", nil, nil)
 }

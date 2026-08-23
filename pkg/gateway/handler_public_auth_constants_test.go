@@ -27,22 +27,25 @@ import (
 // TestPublicAuthGatewayModeConstantsAgree pins the
 // pkg/gateway package-local constants against the canonical
 // pkg/api constants. ADR-118 adds publicAuthModeIPAllowlist
-// ("ip_allowlist"). Order matters: open, bearer, basic,
-// ip_allowlist — matches the historical ship order so a
-// future contributor reading the slice knows which mode
-// shipped when.
+// ("ip_allowlist"); ADR-119 adds publicAuthModeInternalOnly
+// ("internal_only"). Order matters: open, bearer, basic,
+// ip_allowlist, internal_only — matches the historical
+// ship order so a future contributor reading the slice
+// knows which mode shipped when.
 func TestPublicAuthGatewayModeConstantsAgree(t *testing.T) {
 	gatewaySet := map[string]string{
-		"open":         publicAuthModeOpen,
-		"bearer":       publicAuthModeBearer,
-		"basic":        publicAuthModeBasic,
-		"ip_allowlist": publicAuthModeIPAllowlist,
+		"open":          publicAuthModeOpen,
+		"bearer":        publicAuthModeBearer,
+		"basic":         publicAuthModeBasic,
+		"ip_allowlist":  publicAuthModeIPAllowlist,
+		"internal_only": publicAuthModeInternalOnly,
 	}
 	apiSet := map[string]string{
-		"open":         api.AppPublicAuthModeOpen,
-		"bearer":       api.AppPublicAuthModeBearer,
-		"basic":        api.AppPublicAuthModeBasic,
-		"ip_allowlist": api.AppPublicAuthModeIPAllowlist,
+		"open":          api.AppPublicAuthModeOpen,
+		"bearer":        api.AppPublicAuthModeBearer,
+		"basic":         api.AppPublicAuthModeBasic,
+		"ip_allowlist":  api.AppPublicAuthModeIPAllowlist,
+		"internal_only": api.AppPublicAuthModeInternalOnly,
 	}
 	if len(gatewaySet) != len(apiSet) {
 		t.Fatalf("set size mismatch: pkg/gateway has %d modes, pkg/api has %d; "+

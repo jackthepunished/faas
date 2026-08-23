@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -137,9 +139,80 @@ func cmdWakeTimelineAll(ctx context.Context, client *api.Client, slug, wakeID st
 // labelled-block convention of cmdAlertInfo (commands_alerts.go:195)
 // rather than a fixed-width table because the `data` column carries
 // heterogeneous JSON.
+//
+// ADR-123: each wake.boot_started / wake.boot_completed row gains a
+// trailing `trigger=… q=N c=N` context line (only when the fields are
+// present) so operators can answer "why did this instance start?"
+// without leaving the CLI. Pre-ADR-123 events render as before.
 func renderWakeTimelinePage(w io.Writer, p api.WakeTimelineResponse) {
 	_, _ = fmt.Fprintf(w, "wake %s app %s limit %d:\n", p.WakeID, p.AppID, p.Limit)
+	renderSummaryHeader(w, p.Events)
 	for _, ev := range p.Events {
 		_, _ = fmt.Fprintf(w, "  %s  %-9s  %s\n", ev.At, ev.Actor, ev.Kind)
+		if ctx := renderContextSuffix(ev); ctx != "" {
+			_, _ = fmt.Fprintf(w, "        %s\n", ctx)
+		}
 	}
+}
+
+// renderSummaryHeader emits a single-line trigger histogram for the
+// wake.boot_started events in this slice. ADR-123: operators want a
+// quick "what woke this app?" answer before reading the per-event
+// rows. Stable trigger order via sort.Strings so output is
+// deterministic across runs (matters for golden-file tests).
+func renderSummaryHeader(w io.Writer, events []api.WakeTimelineEvent) {
+	counts := make(map[string]int)
+	for _, ev := range events {
+		if ev.Kind != "wake.boot_started" {
+			continue
+		}
+		t, _ := ev.Data["trigger"].(string)
+		if t == "" {
+			continue
+		}
+		counts[t]++
+	}
+	if len(counts) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, counts[k]))
+	}
+	_, _ = fmt.Fprintf(w, "  triggers: %s\n", strings.Join(parts, " "))
+}
+
+// renderContextSuffix returns the trailing context line for one
+// event — the wake-boot trigger, queue depth, and concurrency at
+// admit (the three ADR-123 fields). Empty string when none are
+// present (legacy or non-boot events). JSON numbers from the SDK
+// surface as float64; coerce to int before printing.
+func renderContextSuffix(ev api.WakeTimelineEvent) string {
+	trigger, _ := ev.Data["trigger"].(string)
+	var queued, conc int
+	if q, ok := ev.Data["queued_count"].(float64); ok {
+		queued = int(q)
+	}
+	if c, ok := ev.Data["concurrency_at_admit"].(float64); ok {
+		conc = int(c)
+	}
+	if trigger == "" && queued == 0 && conc == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	if trigger != "" {
+		parts = append(parts, "trigger="+trigger)
+	}
+	if queued != 0 {
+		parts = append(parts, fmt.Sprintf("q=%d", queued))
+	}
+	if conc != 0 {
+		parts = append(parts, fmt.Sprintf("c=%d", conc))
+	}
+	return strings.Join(parts, " ")
 }

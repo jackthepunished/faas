@@ -1472,6 +1472,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Warn("gateway synth dial: cron traffic will not flow until gatewayd-internal is up",
 				"target", synthTarget, "err", dialErr)
 		} else {
+			// ADR-119 — wire the per-app public_auth_mode lookup
+			// + JWT minter so cron traffic reaching an
+			// internal_only app carries Authorization: Bearer.
+			// The mode lookup reads the same per-app cache the
+			// dispatcher already populates (no extra SQL). The
+			// minter is the closure below — it loads the
+			// Ed25519 keypair from FAAS_INTERNAL_SVC_KEY_PATH
+			// at boot and mints a fresh JWT per synth request
+			// (TTL 30s; the §15 plan calls out replay-attack
+			// posture). Both are nil-safe: a dev box without
+			// FAAS_INTERNAL_SVC_KEY_PATH leaves the minter nil
+			// and SynthesizeRequest logs a loud warn +
+			// internal_only requests 403.
+			if minter, mErr := newSchedInternalSvcMinter(log); mErr != nil {
+				log.Warn("schedd: internal-svc minter not wired; internal_only cron requests will 403 until corrected",
+					"err", mErr.Error())
+			} else {
+				modeLookup := sched.PublicAuthModeFromStore(store.AppByID)
+				sched.ConfigureInternalSvcAuth(synth, modeLookup, minter)
+				// The trigger batch path (postBatch) does NOT
+				// route through httpGatewaySynth — it uses
+				// l.gatewayHTTPClient directly. Wire the same
+				// lookup + minter on the Loop so the batch
+				// endpoint carries the JWT for internal_only
+				// apps. Without this, the gate at
+				// synth.go::handleInvocationDispatchBatch would
+				// 403 every internal_only batch the schedd posts.
+				loop.WithAppPublicAuthModeLookup(modeLookup)
+				loop.WithMintInternalSvcToken(minter)
+			}
 			loop.WithGatewaySynth(synth)
 		}
 	}
@@ -1824,9 +1854,11 @@ type schedScaleUpEngine struct {
 
 // AdmitInstance implements scaleup.Engine: delegates to the wrapped
 // engine and lifts the relevant fields into the thinned
-// scaleup.AdmitResult.
-func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope string) (scaleup.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
+// scaleup.AdmitResult. trigger (ADR-127) is forwarded so the emitted
+// wake.boot_started / wake.boot_completed events stamp the scaleup
+// trigger enum value.
+func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope, trigger string) (scaleup.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope, trigger)
 	if err != nil {
 		return scaleup.AdmitResult{}, err
 	}
@@ -1837,9 +1869,10 @@ func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope stri
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned scaleup.WakeOutcome. AtCapacity is dropped
 // because the leader's ledger closes the at-cap loop; the trigger
-// observes the path via the bus, not the return value.
-func (s schedScaleUpEngine) EnsureWake(ctx context.Context, appID string) (scaleup.WakeOutcome, error) {
-	r, err := s.engine.EnsureWake(ctx, appID)
+// observes the path via the bus, not the return value. trigger
+// (ADR-127) is forwarded to the leader's Engine.Wake call.
+func (s schedScaleUpEngine) EnsureWake(ctx context.Context, appID, trigger string) (scaleup.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID, trigger)
 	if err != nil {
 		return scaleup.WakeOutcome{}, err
 	}
@@ -1873,8 +1906,8 @@ type schedTargetsEngine struct {
 // the re-observe branch is dead code and the metric loses the
 // per-tick AtCapacity signal that the dashboard's "would have
 // scaled but cap reached" pane depends on.
-func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope string) (targets.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
+func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope, trigger string) (targets.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope, trigger)
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
@@ -1884,9 +1917,10 @@ func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope stri
 // EnsureWake (ADR-098) implements targets.Engine: delegates to the
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned targets.WakeOutcome. AtCapacity is dropped
-// because the leader's ledger closes the at-cap loop.
-func (s schedTargetsEngine) EnsureWake(ctx context.Context, appID string) (targets.WakeOutcome, error) {
-	r, err := s.engine.EnsureWake(ctx, appID)
+// because the leader's ledger closes the at-cap loop. trigger
+// (ADR-127) is forwarded to the leader's Engine.Wake call.
+func (s schedTargetsEngine) EnsureWake(ctx context.Context, appID, trigger string) (targets.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID, trigger)
 	if err != nil {
 		return targets.WakeOutcome{}, err
 	}
@@ -1912,8 +1946,8 @@ type schedFloorEngine struct {
 }
 
 // AdmitInstance implements floor.Engine.
-func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID, scope string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
+func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID, scope, trigger string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope, trigger)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}
@@ -1921,9 +1955,11 @@ func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID, scope string
 }
 
 // AdmitInstanceForDeployment implements floor.Engine (issue #557
-// closure / ADR-074 — per-deployment floor wake).
-func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID, scope)
+// closure / ADR-074 — per-deployment floor wake). trigger (ADR-127)
+// is forwarded so the emitted wake.boot_started / wake.boot_completed
+// events stamp the floor.deployment trigger enum value.
+func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope, trigger string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID, scope, trigger)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}
@@ -1934,9 +1970,10 @@ func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID,
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned floor.WakeOutcome. AtCapacity is dropped
 // because the leader's ledger closes the at-cap loop; the trigger
-// observes the path via the bus, not the return value.
-func (s schedFloorEngine) EnsureWake(ctx context.Context, appID string) (floor.WakeOutcome, error) {
-	r, err := s.engine.EnsureWake(ctx, appID)
+// observes the path via the bus, not the return value. trigger
+// (ADR-127) is forwarded to the leader's Engine.Wake call.
+func (s schedFloorEngine) EnsureWake(ctx context.Context, appID, trigger string) (floor.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID, trigger)
 	if err != nil {
 		return floor.WakeOutcome{}, err
 	}

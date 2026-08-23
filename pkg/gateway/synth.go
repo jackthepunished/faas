@@ -69,6 +69,38 @@ type SynthServer struct {
 	srv        *http.Server
 	mux        *http.ServeMux
 	calls      atomic.Int64
+	// internalSvcVerifier (ADR-119) is the per-service
+	// public-key allowlist consulted by the synth-side gate
+	// (synth_internal_only.go). nil = gate disabled; an
+	// internal_only cron request with no verifier wired 500s
+	// (operator_error). Wired by
+	// SynthServer.WithInternalSvcVerifier (cmd/gatewayd-internal/
+	// run.go) — same bridge as the HTTP-side gate.
+	internalSvcVerifier InternalSvcVerifier
+	// metrics (ADR-119) is the gateway-wide Metrics instance.
+	// The synth-side gate increments
+	// gateway_internal_auth_match_total{outcome} via the
+	// same ObserveInternalAuthMatch the HTTP-side gate uses
+	// — single counter, both gates write to it. nil = silent
+	// (unit tests). Wired by SynthServer.WithMetrics.
+	metrics *Metrics
+	// synthAuditEmit (ADR-119) emits the
+	// instances.public_auth_internal_* audit rows for cron-
+	// fired wake attempts. nil = audit-disabled (unit tests);
+	// the gate still increments the metric and writes the
+	// 403 problem. Production wires the same auditor the
+	// Handler uses (cmd/gatewayd-internal/edge_rules.go
+	// constructs the gatewaydAuditor and passes it to both
+	// Handler.WithEdgeRules and SynthServer.WithAudit).
+	synthAuditEmit func(ctx context.Context, kind string, subject *string, data map[string]any)
+	// appPublicAuthMode (ADR-119) returns the public_auth_mode
+	// for a given appID. nil = every app treated as "open"
+	// (no gate, no JWT check). Wired by SynthServer.WithAppModeLookup;
+	// production wires the same per-app cache the Handler
+	// consults (cmd/gatewayd-internal/run.go). The lookup
+	// takes a context so the request's ctx (with timeout /
+	// cancel chain) flows into the per-app store call.
+	appPublicAuthMode func(ctx context.Context, appID string) string
 }
 
 // NewSynthServer wires the unix-socket listener on socketPath with the
@@ -209,6 +241,47 @@ func (s *SynthServer) Stop(ctx context.Context) error {
 // schedd knows where to dial.
 func (s *SynthServer) SocketPath() string { return s.socketPath }
 
+// WithMetrics (ADR-119) arms the synth-side gate's metric
+// increments. Same Metrics instance the Handler uses (single
+// gateway_internal_auth_match_total counter, two writers).
+func (s *SynthServer) WithMetrics(m *Metrics) *SynthServer {
+	s.metrics = m
+	return s
+}
+
+// WithAudit (ADR-119) arms the synth-side gate's audit emit.
+// Closure signature matches RequireAuthnAuditor.Emit so
+// production can wire the same auditor the Handler uses.
+func (s *SynthServer) WithAudit(emit func(ctx context.Context, kind string, subject *string, data map[string]any)) *SynthServer {
+	s.synthAuditEmit = emit
+	return s
+}
+
+// WithAppModeLookup (ADR-119) arms the per-app mode lookup
+// the synth-side gate consults on every /v1/synthesize
+// request. nil = no mode lookup, every app treated as
+// "open" (the gate is a no-op for non-internal_only apps).
+//
+// The lookup signature takes a context.Context so the gate
+// can pass the inbound request's ctx (with the canonical
+// timeout / cancel chain) into the per-app store call. Round-3
+// golangci-lint contextcheck hooked the closure in
+// cmd/gatewayd-internal/run.go::WithAppModeLookup — the lint
+// flagged that the closure builds a fresh context.Background()
+// instead of receiving the request's context. The fix surfaces
+// here: the wired callback now receives ctx.
+//
+// A cache miss (or transient pg error) returns "" which the
+// gate treats as "open" (no JWT required). Returning "" on
+// error is the same posture as the HTTP-front-door gate's
+// fail-closed-on-Verify-error behavior — but at the lookup
+// layer we treat "I don't know" as "open" so a transient pg
+// blip doesn't 500 every internal_only cron fire.
+func (s *SynthServer) WithAppModeLookup(lookup func(ctx context.Context, appID string) string) *SynthServer {
+	s.appPublicAuthMode = lookup
+	return s
+}
+
 // Calls returns the number of synthesize requests served. Metric-only;
 // tests assert on it to confirm a fake-clock advance produced exactly
 // one cron fire.
@@ -257,6 +330,19 @@ func (s *SynthServer) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	logAppID := logsanitize.Field(req.AppID)
 	logMethod := logsanitize.Field(method)
 	logPath := logsanitize.Field(req.Path)
+	// ADR-119 — per-app 'internal_only' gate runs BEFORE
+	// dispatcher.Wake so a forged schedd (or anything else in
+	// the faas group) cannot wake an internal_only app. Same
+	// verifier + same metric + same audit vocabulary as the
+	// HTTP-front-door side; the only difference is the
+	// "from" field is "synth" instead of a from_host string.
+	// The mode lookup consults the per-app cache populated by
+	// the same hydration path Handler.PublicAuthConfig reads.
+	if s.appPublicAuthMode != nil {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth") {
+			return
+		}
+	}
 	s.log.Debug("gateway synth: dispatched", "app_id", logAppID, "method", logMethod, "path", logPath)
 	if err := s.dispatcher.Wake(r.Context(), req.AppID); err != nil {
 		s.log.Warn("gateway synth: wake", "app_id", logAppID, "path", logPath, "err", err)
@@ -297,6 +383,22 @@ func (s *SynthServer) handleInvocationDispatch(w http.ResponseWriter, r *http.Re
 	if req.AppID == "" || req.InvocationID == "" {
 		http.Error(w, "app_id + invocation_id required", http.StatusBadRequest)
 		return
+	}
+	// ADR-119 — per-app 'internal_only' gate runs BEFORE
+	// dispatcher.Invoke so a forged schedd (or anything else in
+	// the faas group) cannot invoke an internal_only app via
+	// /v1/invocations:dispatch. The same gate lives on
+	// handleSynthesize (the legacy wake-only path) and on
+	// handleInvocationDispatchBatch (the trigger batch path);
+	// closing one surface without the others leaves the gate
+	// bypassable. The mode lookup consults the per-app cache
+	// populated by the same hydration path Handler.PublicAuthConfig
+	// reads. The handler returns 403 + audit + metric; the
+	// dispatcher is never reached.
+	if s.appPublicAuthMode != nil {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth_dispatch") {
+			return
+		}
 	}
 	method := req.Method
 	if method == "" {
@@ -535,6 +637,20 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 	if req.AppID == "" || req.InvocationID == "" {
 		http.Error(w, "app_id + invocation_id required", http.StatusBadRequest)
 		return
+	}
+	// ADR-119 — per-app 'internal_only' gate runs BEFORE the
+	// per-record loop so a forged schedd (or anything else in
+	// the faas group) cannot invoke an internal_only app via
+	// /v1/invocations:dispatch_batch. The batch envelope carries
+	// ONE appID across all records, so the gate is per-batch
+	// (not per-record). Same verifier + same metric + same audit
+	// vocabulary as the HTTP-front-door side; the only
+	// difference is the "from" field is "synth_batch" instead
+	// of "synth" so dashboards can split the two surfaces.
+	if s.appPublicAuthMode != nil {
+		if s.applyIngressInternalSvc(w, r, req.AppID, s.appPublicAuthMode(r.Context(), req.AppID), "synth_batch") {
+			return
+		}
 	}
 	if len(req.Records) == 0 {
 		w.Header().Set("Content-Type", "application/json")

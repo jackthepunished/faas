@@ -56,11 +56,11 @@ type fakeEngine struct {
 	destroyForWorkloadOOMFn func(ctx context.Context, instanceID string, peakMB, planMB int) error
 }
 
-func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
+func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope, _ string) (sched.WakeResult, error) {
 	return f.wakeFn(ctx, appID, deploymentID, scope)
 }
 
-func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
+func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, _ string) (sched.WakeResult, error) {
 	if f.admitInstanceFn != nil {
 		return f.admitInstanceFn(ctx, appID, scope)
 	}
@@ -75,8 +75,8 @@ func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, sco
 
 // EnsureWake (ADR-098): the bufconn tests don't exercise single-flight,
 // so this delegates to the underlying Wake so legacy tests keep passing.
-func (f *fakeEngine) EnsureWake(ctx context.Context, appID string) (sched.CoordOutcome, error) {
-	res, err := f.Wake(ctx, appID, "", "")
+func (f *fakeEngine) EnsureWake(ctx context.Context, appID, _ string) (sched.CoordOutcome, error) {
+	res, err := f.Wake(ctx, appID, "", "", "")
 	if err != nil {
 		return sched.CoordOutcome{}, err
 	}

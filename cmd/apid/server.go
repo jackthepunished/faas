@@ -913,6 +913,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/account/slo", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getAccountSLO))))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
+	// Mega-C PR-1 / issue #961 leaf 3: one-click preview destroy
+	// from a PR comment. Distinct URL from DELETE /v1/apps/{slug}
+	// so production apps do not collide with the preview-specific
+	// path. Same auth chain (authLimited → requireMFA →
+	// requireScope(DeployWriteSurface)) as the production delete
+	// — destroying a preview is just as destructive as destroying
+	// a production app from the customer's POV.
+	mux.HandleFunc("POST /v1/preview/{slug}/destroy", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.destroyPreview))))
 	// Issue #472 / ADR-054 — admin-only signature-enforcement toggle.
 	// Mounted with the admin+MFA chain (mirrors PATCH /v1/account/plan
 	// at server.go:516) so a customer cannot self-onboard signature
@@ -964,6 +972,15 @@ func (s *server) handler() http.Handler {
 
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
+	// ADR-117 §Production-ready follow-on, C2 — per-stage retry.
+	// Same auth chain as createDeployment (authLimited → requireMFA
+	// → requireScope(ScopesDeployWriteSurface)). NOT wrapped in
+	// s.idempotent: every retry call creates a fresh deployments
+	// row, so idempotency-key collapse would silently mask the
+	// new-row creation. The closed-vocab guard lives in the
+	// handler (state.IsStageName) — invalid from_stage returns 400
+	// with a structured RFC 7807 problem before the storage call.
+	mux.HandleFunc("POST /v1/deployments/{id}/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.retryDeployment))))
 	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref
 	// deploy from CI. Same auth chain as the multipart sibling
 	// (authLimited → requireMFA → requireScope(ScopesDeployWriteSurface)
@@ -995,6 +1012,19 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
+	// document discovery surface. Three routes (GET, PATCH,
+	// DELETE) under /v1/apps/{slug}/deployments/{deployment}/openapi.
+	// The plan-tier gate lives in the handler (free → 402
+	// CodePlanOpenAPIDocsNotAllowed) so a Free customer posting
+	// to a non-existent slug still gets a clean 402, not a 404
+	// slug leak (same pattern as createEdgeRule /
+	// createAlertRule). The microVM captures the doc during
+	// cold boot on every plan; the apid only SERVES the doc
+	// on paid plans.
+	mux.HandleFunc("GET /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getOpenAPIDoc))))
+	mux.HandleFunc("PATCH /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.patchOpenAPIDoc))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/deployments/{deployment}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.openAPIDocDelete))))
 	// PR-A: per-deploy image-layer secret-scan audit surface.
 	// Mirrors /scan — same auth chain (authLimited + requireMFA +
 	// read scope), same IDOR posture (cross-account → 404), same
@@ -1726,6 +1756,16 @@ func (s *server) handler() http.Handler {
 	// (Go 1.22+ mux needs concrete segment counts; the
 	// /crons/{id}/fire-now suffix is the path tail).
 	mux.Handle("POST /dashboard/apps/{slug}/crons/{id}/fire-now", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardFireCron))))
+	// ADR-117 §Production-ready follow-on, C4 — dashboard-side
+	// retry form handler. The form is <form method="POST"> (not
+	// XHR), so the endpoint takes the CSRF sealed-envelope path
+	// instead of the v1 Bearer-key envelope. The handler does the
+	// same two-step IDOR probe as cmd/apid/handlers_retry.go and
+	// calls s.store.RetryDeploymentFromStage; on success it
+	// redirects to /dashboard/apps/{slug}/deployments/<new-id>
+	// so the customer's next page-load sees the live SSE stream
+	// for the fresh row.
+	mux.Handle("POST /dashboard/apps/{slug}/deployments/{id}/retry", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRetryDeployment))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires
@@ -1803,6 +1843,8 @@ func (s *server) handler() http.Handler {
 	// asserting; richer readiness semantics (DB ping, etc.) belong
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)
+	// Dependency-aware readiness probe (testing PostgreSQL pool ping).
+	mux.HandleFunc("GET /readyz", s.readyz)
 
 	// Spec hosting (anonymous; see pkg/apid/openapi_handler.go).
 	// /v1/openapi.yaml and /v1/openapi.json let SDK codegen and

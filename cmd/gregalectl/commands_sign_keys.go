@@ -12,9 +12,13 @@
 // has no business in that namespace; this is a separate top-level
 // command `gregalectl sign-keys` with three leaves:
 //   - init   — write a fresh keypair (refuses overwrite)
-//   - rotate — write a fresh keypair with --force (overwrite allowed
-//     after archiving the old public key)
+//   - rotate — write a fresh keypair with --force (overwrite allowed;
+//     --keep-old-pub archives the prior pub file at
+//     sign-pub.pem.<unix-ts> so verifiers rolling back
+//     can re-pin the old public key mid-rotation)
 //   - status — print mode + fingerprint + paths for both files
+//     (--json emits a structured report for CI gates and
+//     the json_parity_test discipline)
 //
 // All three leaves share the same flag surface (--sign-key,
 // --verify-key, --force). The default paths are the cosign
@@ -32,6 +36,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/cosign"
 )
@@ -88,9 +94,11 @@ func cmdSignKeys(args []string) int {
 // contradiction has been in this file since PR #322. The asymmetry
 // is load-bearing — TestSignKeyFlagDefaults pins it.
 type signKeyFlags struct {
-	signKey string
-	verify  string
-	force   bool
+	signKey    string
+	verify     string
+	force      bool
+	keepOldPub bool
+	jsonOut    bool
 }
 
 func newSignKeyFlags(name string, defaultForce bool) (*flag.FlagSet, *signKeyFlags) {
@@ -102,6 +110,10 @@ func newSignKeyFlags(name string, defaultForce bool) (*flag.FlagSet, *signKeyFla
 		"path to the public key (mode 0444, world-readable)")
 	fs.BoolVar(&f.force, "force", defaultForce,
 		"overwrite an existing keypair (rotate only)")
+	fs.BoolVar(&f.keepOldPub, "keep-old-pub", false,
+		"on rotate, archive the existing sign-pub.pem to <path>.<unix-ts> before writing the new keypair (lets verifiers re-pin the old pub mid-rotation)")
+	fs.BoolVar(&f.jsonOut, "json", false,
+		"emit structured JSON to stdout")
 	return fs, f
 }
 
@@ -152,12 +164,22 @@ func cmdSignKeysInit(args []string) int {
 
 // cmdSignKeysRotate is the documented operator flow for replacing
 // the keypair (compromise, scheduled rotation). Default force=true
-// because rotate without overwrite is a no-op. The operator is
-// expected to have archived the old pub key before running this
-// (the verifier side has no rollback path; once schedd loads the
-// new pub, old signatures won't verify). A `--keep-old-pub` flag
-// for archive-and-rotate is a future patch; for now the operator
-// `cp`s the pub file before running rotate.
+// because rotate without overwrite is a no-op.
+//
+// --keep-old-pub archives the existing sign-pub.pem to
+// <path>.<unix-ts> BEFORE the new keypair is generated. The
+// archived copy lets a verifier mid-rotation re-pin the old pub
+// without re-running rotate; without it, once schedd / imaged
+// load the new pub, old signatures won't verify (verifier side
+// has no rollback path). The flag is a no-op when the pub file
+// does not exist (first rotation - nothing to archive).
+//
+// --json emits the {old, kept, new} report so CI gates can
+// reason about the rotation lineage without parsing the human
+// output. The kept_old_pub boolean is the audit trail signal:
+// true iff --keep-old-pub was set AND the rename actually
+// landed (a missing prior pub returns kept_old_pub=false, not an
+// error - first-rotation is the common case).
 func cmdSignKeysRotate(args []string) int {
 	fs, f := newSignKeyFlags("sign-keys rotate", true)
 	if err := fs.Parse(args); err != nil {
@@ -167,8 +189,21 @@ func cmdSignKeysRotate(args []string) int {
 		PrintUsage(os.Stderr, "usage: gregalectl sign-keys rotate [flags]", "sign-keys")
 		return 1
 	}
+	keptPath, keptOldPub, keepErr := archiveOldPubIfRequested(f.keepOldPub, f.verify)
+	if keepErr != nil {
+		return printErr("rotate failed", keepErr)
+	}
 	if err := writeKeyPair(f.force, f.signKey, f.verify); err != nil {
 		return printErr("rotate failed", err)
+	}
+	if f.jsonOut {
+		jsonEmit(osStdout, inspectSignKeysRotateReport(f.signKey, f.verify, keptPath, keptOldPub))
+		return 0
+	}
+	if keptOldPub {
+		PrintOK(osStdout, "Rotated %s and %s (force=%t)\n  Archived prior pub: %s\n  Restart: systemctl restart gregale-imaged gregale-schedd",
+			f.signKey, f.verify, f.force, keptPath)
+		return 0
 	}
 	PrintOK(osStdout, "Rotated %s and %s (force=%t)\n  Restart: systemctl restart gregale-imaged gregale-schedd",
 		f.signKey, f.verify, f.force)
@@ -177,19 +212,23 @@ func cmdSignKeysRotate(args []string) int {
 
 // cmdSignKeysStatus reports the mode + fingerprint for both files.
 // Used by ansible stat-asserts at deploy time and by the operator
-// during incident response. Output is line-oriented (no --json
-// path; this is operator-only and the JSON case is a future
-// patch). Missing files print an explicit "missing" line and
-// return 0 — the operator should see both paths even if one is
-// absent, so they can run `init` once.
+// during incident response. Output is line-oriented by default;
+// --json emits a structured report for CI gates. Missing files
+// print an explicit "missing" line and the leaf returns 0 - the
+// operator should see both paths even if one is absent, so they
+// can run `init` once.
 func cmdSignKeysStatus(args []string) int {
 	fs, f := newSignKeyFlags("sign-keys status", false)
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl sign-keys status [flags]", "sign-keys")
+		PrintUsage(os.Stderr, "usage: gregalectl sign-keys status [--json]", "sign-keys")
 		return 1
+	}
+	if f.jsonOut {
+		jsonEmit(osStdout, inspectSignKeysStatus(f.signKey, f.verify))
+		return 0
 	}
 	for _, p := range []struct {
 		path  string
@@ -227,4 +266,126 @@ func reportSignKeyStatus(w io.Writer, label, path string) {
 	}
 	sum := sha256.Sum256(data)
 	_, _ = fmt.Fprintf(w, "%s  %#o  sha256:%s  %s\n", label, info.Mode().Perm(), hex.EncodeToString(sum[:6]), path)
+}
+
+// archiveOldPubIfRequested renames pubPath to <pubPath>.<unix-ts>
+// when keep is true AND the file exists. Returns the archived
+// path (empty if not archived) and the boolean that lands in
+// the JSON report. First rotation (no prior pub) is a no-op:
+// returns ("", false, nil) so the rotate path stays unchanged
+// for the common case.
+func archiveOldPubIfRequested(keep bool, pubPath string) (string, bool, error) {
+	if !keep {
+		return "", false, nil
+	}
+	info, err := os.Stat(pubPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("stat prior pub %s: %w", pubPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", false, fmt.Errorf("prior pub %s is not a regular file (mode %s); refusing to archive", pubPath, info.Mode())
+	}
+	archived := pubPath + "." + strconv.FormatInt(time.Now().Unix(), 10)
+	if err := os.Rename(pubPath, archived); err != nil {
+		return "", false, fmt.Errorf("archive prior pub %s -> %s: %w", pubPath, archived, err)
+	}
+	return archived, true, nil
+}
+
+// signKeysRotateReport is the JSON shape for
+// `sign-keys rotate --json`. The fields are pinned by
+// json_parity_test so CI gates can rely on the schema. The
+// old/new sha256s are the post-rotation values; the old pub
+// sha256 is empty when kept_old_pub=false (no prior pub to
+// fingerprint).
+type signKeysRotateReport struct {
+	SignKey    string `json:"sign_key"`
+	VerifyKey  string `json:"verify_key"`
+	KeepOldPub bool   `json:"keep_old_pub"`
+	KeptOldPub string `json:"kept_old_pub,omitempty"` // path to archived prior pub (empty when not kept)
+	OldPubSHA  string `json:"old_pub_sha256,omitempty"`
+	NewPubSHA  string `json:"new_pub_sha256"`
+	KeyID      string `json:"key_id"` // sha256[:16] of the new pub bytes; short fingerprint for audit logs
+}
+
+// inspectSignKeysRotateReport hashes the post-rotation files
+// and (if kept) the archived prior pub, then composes the
+// report struct. The function reads file bytes (not the
+// cosign loader) so the same path-status logic as status /
+// reportSignKeyStatus applies - a misconfigured mode still
+// surfaces a hash, not a hard failure.
+//
+// sha256Hex is the package-shared helper (commands_secrets_init.go)
+// which returns []byte; we convert to string at the assignment
+// sites so the JSON struct fields stay typed.
+func inspectSignKeysRotateReport(signKey, verifyKey, keptOldPubPath string, keptOldPub bool) signKeysRotateReport {
+	rep := signKeysRotateReport{
+		SignKey:    signKey,
+		VerifyKey:  verifyKey,
+		KeepOldPub: keptOldPub,
+		KeptOldPub: keptOldPubPath,
+	}
+	if keptOldPub {
+		if data, err := os.ReadFile(keptOldPubPath); err == nil {
+			rep.OldPubSHA = string(sha256Hex(data))
+		}
+	}
+	if data, err := os.ReadFile(verifyKey); err == nil {
+		sum := string(sha256Hex(data))
+		rep.NewPubSHA = sum
+		rep.KeyID = sum[:16]
+	}
+	return rep
+}
+
+// signKeyFileStatus is the per-file inspection shape used by
+// both renderers (text + JSON). present=false means the file
+// does not exist (pre-init / post-rotate before next init);
+// mode + sha256 are zero-valued in the absent case so JSON
+// consumers can rely on `present` as the existence gate.
+type signKeyFileStatus struct {
+	Present bool   `json:"present"`
+	Path    string `json:"path"`
+	Mode    string `json:"mode,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+}
+
+// signKeysStatusReport is the JSON shape for
+// `sign-keys status --json`. Field set is pinned by
+// json_parity_test so CI gates can rely on the schema.
+type signKeysStatusReport struct {
+	SignKey signKeyFileStatus `json:"sign_key"`
+	PubKey  signKeyFileStatus `json:"pub_key"`
+}
+
+// inspectSignKeysStatus reads mode + sha256 for both files.
+// Mirrors reportSignKeyStatus byte-for-byte so the text + JSON
+// renderers never disagree on what's on disk.
+func inspectSignKeysStatus(signKey, verifyKey string) signKeysStatusReport {
+	return signKeysStatusReport{
+		SignKey: inspectSignKeyFile(signKey),
+		PubKey:  inspectSignKeyFile(verifyKey),
+	}
+}
+
+// inspectSignKeyFile reads mode + sha256 for one file. Missing
+// files return present=false (other fields zero).
+func inspectSignKeyFile(path string) signKeyFileStatus {
+	info, err := os.Stat(path)
+	if err != nil {
+		return signKeyFileStatus{Path: path}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return signKeyFileStatus{Path: path, Mode: fmt.Sprintf("%#o", info.Mode().Perm())}
+	}
+	return signKeyFileStatus{
+		Present: true,
+		Path:    path,
+		Mode:    fmt.Sprintf("%#o", info.Mode().Perm()),
+		SHA256:  string(sha256Hex(data)),
+	}
 }

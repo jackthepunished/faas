@@ -107,16 +107,21 @@ func newPreviewService(t *testing.T, rig *previewTestRig) (*Service, *previewRec
 	rec := &previewRecorder{}
 	svc.WritePreviewCheck = rec.writeCheck
 	svc.WritePreviewCheckForkRefused = rec.writeForkRefused
+	svc.WritePreviewDestroyComment = rec.writeDestroyComment
 	return svc, rec
 }
 
 // previewRecorder captures the (repo, sha, phase, previewURL,
 // summary) tuples the handler writes back to GitHub. The
 // fork-refused path records separately so the test can assert
-// the two paths independently.
+// the two paths independently. The destroy-comment path records
+// separately too so the close-arm test can pin the (repo,
+// pr_number, body) tuple without conflating with the check-run
+// calls.
 type previewRecorder struct {
-	checks []recordedCheck
-	forks  []recordedFork
+	checks   []recordedCheck
+	forks    []recordedFork
+	destroys []recordedDestroyComment
 }
 
 type recordedCheck struct {
@@ -130,6 +135,11 @@ type recordedFork struct {
 	repo, sha, summary string
 }
 
+type recordedDestroyComment struct {
+	repo, body string
+	prNumber   int
+}
+
 func (p *previewRecorder) writeCheck(_ context.Context, repo, sha string, phase githubdgrpc.CheckPhase, previewURL, summary string) error {
 	p.checks = append(p.checks, recordedCheck{repo: repo, sha: sha, phase: phase, previewURL: previewURL, summary: summary})
 	return nil
@@ -137,6 +147,11 @@ func (p *previewRecorder) writeCheck(_ context.Context, repo, sha string, phase 
 
 func (p *previewRecorder) writeForkRefused(_ context.Context, repo, sha, summary string) error {
 	p.forks = append(p.forks, recordedFork{repo: repo, sha: sha, summary: summary})
+	return nil
+}
+
+func (p *previewRecorder) writeDestroyComment(_ context.Context, repo string, prNumber int, body string) error {
+	p.destroys = append(p.destroys, recordedDestroyComment{repo: repo, body: body, prNumber: prNumber})
 	return nil
 }
 
@@ -435,6 +450,81 @@ func TestHandlePullRequest_Closed_StampsClosedState(t *testing.T) {
 	}
 	if got := previews[0].PreviewPrState; got != state.PreviewPrStateOpen {
 		t.Errorf("PreviewPrState after reopened = %q, want %q", got, state.PreviewPrStateOpen)
+	}
+}
+
+// TestHandlePullRequest_Closed_PostsDestroyComment covers the
+// new Mega-C PR-1 surface: the close-arm writes a one-time
+// PR-thread destroy hint (issue #961 leaf 3). The body must
+// include the dashboard's one-click destroy URL so the PR
+// author can click through without navigating away from the
+// thread. The first close posts the comment; the second close
+// (reopen → close cycle) is suppressed by the dedupe carrier
+// apps.preview_destroy_commented_at.
+func TestHandlePullRequest_Closed_PostsDestroyComment(t *testing.T) {
+	rig := newPreviewRig(t)
+	svc, rec := newPreviewService(t, rig)
+
+	// First: open the PR so the preview row exists.
+	if _, err := svc.handlePullRequest(context.Background(),
+		pullRequestOpenedBody(42, "deadbeef00000000000000000000000000000000")); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// First close: the handler MUST write exactly one destroy
+	// comment with the dashboard URL embedded.
+	_, err := svc.handlePullRequest(context.Background(),
+		pullRequestClosedBody(42, "deadbeef00000000000000000000000000000000"))
+	if err != nil {
+		t.Fatalf("closed #1: %v", err)
+	}
+	if got := len(rec.destroys); got != 1 {
+		t.Fatalf("destroys after closed #1 = %d, want 1", got)
+	}
+	d := rec.destroys[0]
+	if d.repo != "octo/api" {
+		t.Errorf("destroy repo = %q, want octo/api", d.repo)
+	}
+	if d.prNumber != 42 {
+		t.Errorf("destroy pr_number = %d, want 42", d.prNumber)
+	}
+	if !strings.Contains(d.body, "demo-app") {
+		t.Errorf("destroy body = %q, want it to reference the parent slug", d.body)
+	}
+	if !strings.Contains(d.body, "/dashboard/apps/demo-app/preview/") {
+		t.Errorf("destroy body = %q, want it to embed the dashboard destroy URL", d.body)
+	}
+
+	// Open → close → reopen → close: the second close must NOT
+	// post a duplicate comment (dedupe carrier).
+	if _, err := svc.handlePullRequest(context.Background(),
+		pullRequestReopenedBody(42, "deadbeef00000000000000000000000000000000")); err != nil {
+		t.Fatalf("reopened: %v", err)
+	}
+	_, err = svc.handlePullRequest(context.Background(),
+		pullRequestClosedBody(42, "deadbeef00000000000000000000000000000000"))
+	if err != nil {
+		t.Fatalf("closed #2: %v", err)
+	}
+	if got := len(rec.destroys); got != 1 {
+		t.Errorf("destroys after close→reopen→close = %d, want 1 (dedupe carrier must collapse the second post)", got)
+	}
+}
+
+// TestHandlePullRequest_Opened_NoDestroyComment confirms the
+// open-arm does NOT post a destroy hint — the comment is the
+// close-arm's surface, posted only when the PR author/maintainer
+// has explicitly asked for the preview to be torn down.
+func TestHandlePullRequest_Opened_NoDestroyComment(t *testing.T) {
+	rig := newPreviewRig(t)
+	svc, rec := newPreviewService(t, rig)
+
+	if _, err := svc.handlePullRequest(context.Background(),
+		pullRequestOpenedBody(42, "deadbeef00000000000000000000000000000000")); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got := len(rec.destroys); got != 0 {
+		t.Errorf("destroys after open = %d, want 0 (open-arm must not post a destroy comment)", got)
 	}
 }
 

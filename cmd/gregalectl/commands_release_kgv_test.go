@@ -55,6 +55,52 @@ func TestCmdReleaseKGV_Unknown(t *testing.T) {
 	}
 }
 
+// TestCmdReleaseKGV_InitIsAliasForRotateFromZero pins the alias
+// contract: `release kgv init` must (a) exit 0 (NOT 2 like a
+// genuine unknown subcommand would), (b) emit the deprecation
+// note on stderr, (c) write a KGVZero baseline (the same one
+// `release kgv rotate --from-zero` writes). Catches the
+// "folded keyword forgotten" regression where the PR-B alias
+// path silently starts exiting 2 again.
+func TestCmdReleaseKGV_InitIsAliasForRotateFromZero(t *testing.T) {
+	root := t.TempDir()
+	// Capture stderr to assert the deprecation note surfaces.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	code := cmdReleaseKGV([]string{
+		"init",
+		"--git-sha=" + kgvTestGitSHA,
+		"--releases-root=" + root,
+	})
+	_ = w.Close()
+	os.Stderr = origStderr
+
+	if code != 0 {
+		t.Fatalf("cmdReleaseKGV(init) = %d, want 0", code)
+	}
+	buf := make([]byte, 4096)
+	n, _ := r.Read(buf)
+	got := string(buf[:n])
+	if !strings.Contains(got, "alias for 'release kgv rotate --from-zero'") {
+		t.Errorf("deprecation note missing on stderr: %q", got)
+	}
+	// Baseline must be written by the rotate path.
+	b, err := releaseinstall.ReadBaseline(root, kgvTestGitSHA)
+	if err != nil {
+		t.Fatalf("ReadBaseline: %v", err)
+	}
+	if b.GitSHA != kgvTestGitSHA {
+		t.Errorf("baseline.GitSHA = %q, want %q", b.GitSHA, kgvTestGitSHA)
+	}
+	if b.Counts.CriticalN != 0 || b.Counts.HighN != 0 {
+		t.Errorf("baseline counts nonzero (alias path should force --from-zero): %+v", b.Counts)
+	}
+}
+
 // TestCmdReleaseKGV_HelpLong_OnRotate asserts `--help` on the
 // rotate leaf exits 0 (the inner handler short-circuits before
 // any flag-parsing).

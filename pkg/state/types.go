@@ -152,6 +152,47 @@ var AllStageNames = []StageName{
 	StageReadiness,
 }
 
+// stageNameClosedSet is the lookup-table mirror of AllStageNames.
+// Built once at package init so per-call validation is O(1) and
+// there is no string-literal coupling between call sites and the
+// vocabulary. Exported via IsStageName below for apid-side handler
+// guards (RetryDeploymentFromStage's handler validates the
+// wire-supplied from_stage against this set before the storage
+// call).
+var stageNameClosedSet = func() map[StageName]bool {
+	m := make(map[StageName]bool, len(AllStageNames))
+	for _, n := range AllStageNames {
+		m[n] = true
+	}
+	return m
+}()
+
+// IsStageName reports whether name is one of the closed-6 stage
+// vocabulary values (pkg/state.AllStageNames). Returns false for
+// the empty string and any caller-supplied typo. Used by the apid
+// retry handler (cmd/apid/handlers_retry.go) to validate the
+// wire-supplied from_stage before calling
+// Store.RetryDeploymentFromStage.
+func IsStageName(name StageName) bool {
+	return stageNameClosedSet[name]
+}
+
+// MaxStageHistory caps the per-deployment stage history. ADR-117
+// §Production-ready follow-on (C1) and migration 00340. The trim
+// is FIFO in AppendDeploymentStage (pgstore + memstore); the
+// current stage (stage_state.current) is never trimmed. Schema-
+// unchanged; the cap is enforced Go-side because a jsonb CHECK
+// on jsonb_array_length(stage_state -> 'history') is fragile
+// across mutation shapes.
+//
+// 64 is the customer-tested sweet spot: Hobby/Pro/Scale apps that
+// deploy 5-10x/day hit ~30 days of history before the trim
+// engages; longer deployments (multi-app monorepos) still keep
+// enough surface to debug a stale row. The const is exported so
+// the migration docblock, the type doc, and the trim sites all
+// reference the same value.
+const MaxStageHistory = 64
+
 // ParkReason is the closed-set label on deployments.parked_reason
 // (issue #554 / ADR-079 follow-up, migration 00157). The schema
 // CHECK constraint deployments_parked_reason_check enforces the
@@ -187,6 +228,39 @@ const (
 func (r ParkReason) IsValid() bool {
 	switch r {
 	case ParkReasonLivenessExhausted, ParkReasonLifecyclePark, ParkReasonAdminPark:
+		return true
+	default:
+		return false
+	}
+}
+
+// AutoRollbackReason tags the trigger that fired the most recent
+// auto-rollback (Mega-C PR-2 / issue #961 leaf 8). Closed-set
+// vocabulary enforced at the schema layer via
+// deployments_last_auto_rollback_reason_check (migration 00315).
+type AutoRollbackReason string
+
+const (
+	// AutoRollbackReasonThresholdExceeded is stamped when schedd's
+	// per-deploy 5xx counter crosses the plan threshold inside the
+	// first wake window (5 min by default; see
+	// pkg/api/limits.go::RollbackOn5xxWindowMinutes).
+	AutoRollbackReasonThresholdExceeded AutoRollbackReason = "threshold_exceeded"
+	// AutoRollbackReasonFirstWindowExpired is reserved for a
+	// future "deploy landed but the first wake never arrived"
+	// fallback that supersedes the deploy before its window
+	// closes. Not wired yet; the schema CHECK accepts it so the
+	// caller can stamp it without a migration.
+	AutoRollbackReasonFirstWindowExpired AutoRollbackReason = "first_window_expired"
+)
+
+// IsValidAutoRollbackReason reports whether r is one of the
+// closed-set AutoRollbackReason constants. Mirrors
+// ParkReason.IsValid. Used by the schedd emit path to fail fast
+// on a stray value before the SQL UPDATE surfaces a 23514.
+func (r AutoRollbackReason) IsValid() bool {
+	switch r {
+	case AutoRollbackReasonThresholdExceeded, AutoRollbackReasonFirstWindowExpired:
 		return true
 	default:
 		return false
@@ -570,6 +644,16 @@ type App struct {
 	// __route_other__ overflow bound the cardinality regardless of
 	// the customer's traffic shape.
 	RouteMetricsEnabled bool
+	// AppProtocol (ADR-124) is the per-app wire-protocol
+	// selector stored on the apps row as text NOT NULL DEFAULT
+	// 'http1'. Closed set {http1, http2, grpc} enforced by
+	// apps_app_protocol_chk (migration 00382). Plan gate for
+	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
+	// not the SQL CHECK — every pre-existing app reads "http1"
+	// without a migration. The per-app transport-selection seam
+	// (x-faas-protocol header stamp at pkg/gateway/handler.go)
+	// reads this field via pgRouter.toApp.
+	AppProtocol string
 	// MaintenanceMode (ADR-091 amendment, PR-A #???) opts the
 	// whole app into 503 + Retry-After mode — the coarse primitive
 	// for "every route is in maintenance". When true, the gatewayd
@@ -804,6 +888,16 @@ type App struct {
 	// customer so they can pin a preview they want to keep. NULL
 	// on production apps.
 	PreviewExpiresAt *time.Time
+	// PreviewDestroyCommentedAt is the dedupe carrier for the
+	// one-click PR comment destroy surface (Mega-C PR-1 / issue
+	// #961 leaf 3). githubd's previewCommentOnce writes now() to
+	// this column after a successful POST to
+	// api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments;
+	// subsequent events for the same (app, PR) tuple skip the
+	// post. NULL on rows where the dispatcher has never
+	// commented (the common case for production apps and for
+	// previews provisioned before this migration landed).
+	PreviewDestroyCommentedAt *time.Time
 	// CORSDefaultEnabled is the per-app default CORS opt-in
 	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
 	// false (the default for every pre-PR app), the gateway
@@ -1364,6 +1458,43 @@ type Deployment struct {
 	Tag        string `json:"tag,omitempty"`
 	DeployedBy string `json:"deployed_by,omitempty"`
 	PRNumber   int    `json:"pr_number,omitempty"`
+
+	// RollbackOn5xx (Mega-C PR-2 / issue #961 leaf 8): when
+	// true, schedd subscribes to wake.response_5xx events on
+	// this deployment and fires the apid-internal
+	// /v1/internal/auto-rollback-on-5xx endpoint when the
+	// per-plan 5xx threshold is crossed inside the first-wake
+	// window. Pro+ only; Free/Hobby customers get a 403 on the
+	// create-deployment request (ErrPlanRollbackOn5xxNotAllowed).
+	// Default false; the column is BOOLEAN NOT NULL DEFAULT
+	// false (migration 00354).
+	RollbackOn5xx bool `json:"rollback_on_5xx,omitempty"`
+	// FirstWakeAt + First5xxWindowEndsAt stamp the start of the
+	// first-wake window (anchored at the first
+	// wake.proxy_first_byte event). Both nullable; the window
+	// ends at FirstWakeAt + 5 min, controlled by
+	// pkg/api.RollbackOn5xxWindowMinutes (5 min). Both nullable;
+	// the auto-rollback only fires inside this window.
+	FirstWakeAt          *time.Time `json:"first_wake_at,omitempty"`
+	First5xxWindowEndsAt *time.Time `json:"first_5xx_window_ends_at,omitempty"`
+	// First5xxCount is the running tally of wake.response_5xx
+	// events on this deployment. Incremented atomically by the
+	// BumpFirst5xxCount pgstore method on every wake.response_5xx
+	// event; schedd's AutoRollbackWatcher checks it against the
+	// per-plan threshold (plan.RollbackOn5xxThreshold()) inside the
+	// First5xxWindowEndsAt window. NOT NULL DEFAULT 0 (migration
+	// 00354); pre-feature rows backfill to 0.
+	First5xxCount int `json:"first_5xx_count,omitempty"`
+	// LastAutoRollbackAt + LastAutoRollbackReason record the
+	// most-recent auto-rollback (Mega-C PR-2). Stamped by
+	// pgstore.AutoRollbackDeploymentsTx; idempotent on subsequent
+	// passes (re-stamping with the same reason does NOT shift
+	// the timestamp). LastAutoRollbackReason uses the closed-set
+	// vocabulary {threshold_exceeded, first_window_expired},
+	// enforced at the schema layer via
+	// deployments_last_auto_rollback_reason_check.
+	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
+	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
 }
 
 // StageState is the typed view of the
@@ -2459,6 +2590,51 @@ type Event struct {
 	Data    json.RawMessage
 }
 
+// WakeBootMeta (ADR-123) is the typed projection of the wake-boot
+// telemetry stamped on wake.boot_started / wake.boot_completed event
+// rows (events.data jsonb). Source: pkg/events.BootStarted.Payload().
+// Used by the dashboard's "Recent wakes" table and the per-app
+// wake-timeline view to render "why did this instance start?"
+// without a separate client-side join.
+//
+// PR-A extends the projection with two more fields that close the
+// user's "2/2 at concurrency limit" + "Ready in: 112 ms" reference
+// lines:
+//
+//   - AtCapacity is the bool stamped on wake.boot_started by
+//     pkg/sched.Engine.admitGate's wakeAdmit branch (true when the
+//     pre-admit ledger reading was maxConc-1). Always populated in
+//     PR-A fleet rows; defaults to false for pre-PR-A rows via the
+//     pgstore's COALESCE.
+//
+//   - AtCapacityPresent distinguishes "jsonb key absent" (pre-PR-A
+//     fleet row that lacks the at_capacity key entirely) from "jsonb
+//     key present and explicitly false" (PR-A row that was admitted
+//     below the cap). The dashboard's em-dash-on-absent convention
+//     (render.go / wake_timeline.go) requires this distinction so a
+//     pre-PR-A row renders "—" (we don't know) instead of "No" (we
+//     know it wasn't at the cap). Source: pgstore's
+//     `data ? 'at_capacity'` jsonb contains operator (NULL when the
+//     key is absent). Defaults to false when nil (treat as absent).
+//
+//   - ReadyInMS is the wall-clock duration between boot_started.at
+//     and the matching boot_completed.at, computed in SQL with
+//     EXTRACT(EPOCH FROM (delta)) * 1000 (NOT EXTRACT(MILLISECONDS …)
+//     — that's silently wrong for >=60s deltas because PostgreSQL
+//     intervals are stored as months/days/seconds; EXTRACT(MILLISECONDS
+//     …) returns only the seconds-field milliseconds). Zero when no
+//     boot_completed row exists yet (wake still booting or rejected);
+//     the template renders em-dash on zero per the existing
+//     absent-value convention.
+type WakeBootMeta struct {
+	Trigger            string // pkg/sched/triggers.go closed enum; "" if absent
+	QueuedCount        int    // ledger.Concurrency at admit; 0 if absent
+	ConcurrencyAtAdmit int    // same reading; 0 is the cold-start case
+	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
+	AtCapacityPresent  bool   // PR-A — true when the at_capacity key was present in jsonb (false = absent; em-dash)
+	ReadyInMS          int    // PR-A — wall-clock boot_started → boot_completed delta in ms; 0 if still booting or rejected
+}
+
 // AuditLog is one row of the FK-free, immutable post-deletion evidence
 // table (migrations/00163_audit_log.sql, issue #755 / PR-5). The row
 // outlives the account it relates to so a DPO / regulator can re-derive
@@ -2755,6 +2931,26 @@ type UpdateAppParams struct {
 	// that does not want the per-route cardinality on the box).
 	RouteMetricsEnabled    *bool
 	SetRouteMetricsEnabled bool
+	// AppProtocol (ADR-124) is the per-app wire-protocol
+	// selector stored on the apps row as text NOT NULL DEFAULT
+	// 'http1'. Closed set {http1, http2, grpc} enforced by
+	// apps_app_protocol_chk (migration 00382). Plan gate for
+	// 'grpc' is at the apid boundary (Plan.AppProtocolAllowed),
+	// not the SQL CHECK — every pre-existing app reads "http1"
+	// without a migration. The per-app transport-selection seam
+	// (x-faas-protocol header stamp at pkg/gateway/handler.go)
+	// reads this field via pgRouter.toApp.
+	//
+	// Pointer semantics mirror WebSocketEnabled: nil means "don't
+	// touch" (the SQL keeps the existing value via the
+	// `app_protocol = case when $N then $M else app_protocol end`
+	// pattern at pgstore.go::UpdateApp); non-nil writes the
+	// value verbatim. SetAppProtocol is the boolean that toggles
+	// the SET clause at UpdateApp time so a customer may PATCH
+	// back to "http1" explicitly (the schema's NOT NULL DEFAULT
+	// would otherwise mask the explicit-write intent).
+	AppProtocol    *string
+	SetAppProtocol bool
 	// MaintenanceMode (ADR-091 amendment) opts the whole app
 	// into 503 + Retry-After mode. SetMaintenanceMode
 	// distinguishes "unset" (don't touch) from "explicit false"
@@ -2951,12 +3147,15 @@ type AppPublicAuthUpdate struct {
 // migrations/00153_apps_public_auth.sql AND with the
 // pkg/gateway's package-local copies. The three layers
 // (sqlc / state / gateway) all share the same vocabulary;
-// if a fourth is ever added, mirror the constant here.
+// if a fifth is ever added, mirror the constant here.
+// ADR-119 added 'internal_only' — see also the drift-guard
+// test pkg/api/public_auth_constants_test.go.
 const (
-	AppPublicAuthModeOpen        = "open"
-	AppPublicAuthModeBearer      = "bearer"
-	AppPublicAuthModeBasic       = "basic"
-	AppPublicAuthModeIPAllowlist = "ip_allowlist"
+	AppPublicAuthModeOpen         = "open"
+	AppPublicAuthModeBearer       = "bearer"
+	AppPublicAuthModeBasic        = "basic"
+	AppPublicAuthModeIPAllowlist  = "ip_allowlist"
+	AppPublicAuthModeInternalOnly = "internal_only"
 )
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
@@ -4526,3 +4725,64 @@ func (e OIDCExchangedToken) ToAPIKey() APIKey {
 		Status:    string(APIKeyStatusActive),
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR-122 / issue #975 item #1: per-deployment OpenAPI document pin.
+// ---------------------------------------------------------------------------
+
+// OpenAPIDocMeta is the metadata slice returned alongside the captured
+// document body. The doc bytes travel separately so the read path can
+// short-circuit the JSON unmarshal on a Cache-Control hit (the CORS
+// preset precedent applies the same way: the body is 128 KiB and the
+// meta is a fixed-size struct). The fields are the columns of
+// deployment_openapi_docs (migrations/00330_endpoint_discovery.sql)
+// minus the doc payload itself.
+//
+// Source is the closed enum value 'cold_boot' or 'manual_upload'
+// (matches the migrations/00330 CHECK constraint). Truncated is
+// true when the guest-init probe read VSockCharacterizationMaxBody
+// bytes and the body was longer; the apid PATCH surface treats it
+// as a 200 with a warning header, not an error (the doc IS saved —
+// the customer can replace it via PATCH).
+//
+// DocSHA256 is the canonical SHA-256 of the stored bytes — the
+// migrations/00330 CHECK constraint pins it to exactly 32 bytes.
+// Surface parity with the consumer_keys table: a column that carries
+// the hash in the row, not derived-at-read, so the pgstore-side
+// consistency check is a no-op (computed once at Upsert).
+type OpenAPIDocMeta struct {
+	DeploymentID string
+	AccountID    string
+	AppID        string
+	Source       string
+	ByteSize     int
+	DocSHA256    []byte
+	Truncated    bool
+	CapturedAt   time.Time
+	UpdatedAt    time.Time
+}
+
+// OpenAPIDocMaxBytes is the hard cap on the captured body. The
+// guest-init probe hard-truncates at this size (ADR-122 §D4); the
+// apid PATCH surface validates against the same constant. The
+// per-plan cap is layered on top of this global constant via
+// api.Plan.OpenAPIDocMaxBytes() (limits.go).
+//
+// The constant lives here (not in pkg/api/limits.go) because the
+// guest-init probe reads it through the wire-vsock boundary and
+// has no dependency on the api package's plan tables. The plan
+// accessors fail-closed to 0 on unknown plans — the per-plan cap
+// is a layer over the global cap, not a replacement.
+const OpenAPIDocMaxBytes = 128 * 1024
+
+// OpenAPIDocSource values mirror the migrations/00330 CHECK
+// constraint. Centralised here so the pgstore and the apid handler
+// agree on the enum without a string-literal drift. The
+// consumer_keys equivalent is api.ConsumerKeyScope* (a closed set
+// declared in the api package); we follow the same pattern but
+// inline-declare these because the table is hidden behind the
+// Store interface.
+const (
+	OpenAPIDocSourceColdBoot     = "cold_boot"
+	OpenAPIDocSourceManualUpload = "manual_upload"
+)

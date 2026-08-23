@@ -45,12 +45,14 @@ func TestPublicAuthModeConstantsAgree(t *testing.T) {
 		api.AppPublicAuthModeBearer,
 		api.AppPublicAuthModeBasic,
 		api.AppPublicAuthModeIPAllowlist,
+		api.AppPublicAuthModeInternalOnly,
 	}
 	stateSet := []string{
 		state.AppPublicAuthModeOpen,
 		state.AppPublicAuthModeBearer,
 		state.AppPublicAuthModeBasic,
 		state.AppPublicAuthModeIPAllowlist,
+		state.AppPublicAuthModeInternalOnly,
 	}
 	if len(apiSet) != len(stateSet) {
 		t.Fatalf("slice length mismatch: pkg/api has %d modes, pkg/state has %d; "+

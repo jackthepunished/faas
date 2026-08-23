@@ -38,24 +38,39 @@ import (
 // kgv subcommands.
 const (
 	subReleaseKGVRotate = "rotate"
+	// subReleaseKGVInit is a deliberate alias for `rotate --from-zero`.
+	// The PR-A sketch named this leaf `init`; PR-B folded it into
+	// `rotate --from-zero` (one keyword + flag is the same surface as
+	// two keywords; see this file's header). Operators who muscle-
+	// memory-type `release kgv init` get the alias + a deprecation
+	// note on stderr instead of exit-2. Will be removed in PR-7.
+	subReleaseKGVInit = "init"
 )
 
 // cmdReleaseKGV is the inner dispatcher for `gregalectl release kgv`.
-// Only one leaf lands today (rotate); unknown leaves exit 2 with a
-// usage pointer so the operator can `help` rather than guess.
+// Two leaves land today (rotate + init); unknown leaves exit 2 with
+// a usage pointer so the operator can `help` rather than guess.
 func cmdReleaseKGV(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl release kgv <subcommand> [flags]\n\nSubcommands:\n  rotate    Refresh sbom-baseline.json from the on-disk release SBoM.\n", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release kgv <subcommand> [flags]\n\nSubcommands:\n  rotate    Refresh sbom-baseline.json from the on-disk release SBoM.\n  init      Alias for `rotate --from-zero` (deprecated fold; will be removed in PR-7).\n", "release")
 		return 1
 	}
 	switch args[0] {
 	case subReleaseKGVRotate:
 		return cmdReleaseKGVRotate(args[1:])
+	case subReleaseKGVInit:
+		// Alias path: force --from-zero and emit a deprecation note
+		// to stderr so operators running `kgv init` get the same
+		// baseline-write semantics without the surprise of an
+		// unknown-subcommand exit-2. The note goes to stderr (not
+		// stdout) so --json consumers aren't polluted.
+		_, _ = fmt.Fprintln(os.Stderr, "note: 'release kgv init' is an alias for 'release kgv rotate --from-zero' (will be removed in PR-7)")
+		return cmdReleaseKGVRotate(append([]string{"--from-zero"}, args[1:]...))
 	case flagHelpShort, flagHelpLong:
-		PrintUsage(os.Stderr, "usage: gregalectl release kgv <subcommand> [flags]\n\nSubcommands:\n  rotate    Refresh sbom-baseline.json from the on-disk release SBoM.\n", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release kgv <subcommand> [flags]\n\nSubcommands:\n  rotate    Refresh sbom-baseline.json from the on-disk release SBoM.\n  init      Alias for `rotate --from-zero` (deprecated fold; will be removed in PR-7).\n", "release")
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregalectl release kgv: unknown subcommand %q (expected: rotate)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl release kgv: unknown subcommand %q (expected: rotate, init)\n", args[0])
 		return 2
 	}
 }

@@ -323,6 +323,21 @@ linters:
       - path: "cmd/deployctl/main\\.go$"
         linters:
           - gosec
+      # cmd/schedd/internal_svc_minter.go: gosec G703 (path-
+      # traversal via taint) fires on os.ReadFile / os.MkdirAll /
+      # os.WriteFile calls in loadOrGenerateSchedKey. Every path
+      # here derives from FAAS_INTERNAL_SVC_KEY_PATH (operator-
+      # controlled env, default /etc/faas/secrets/internal-svc/
+      # schedd.ed25519), not a network listener. The file is
+      # written only by the schedd process itself at first boot.
+      # Same threat-model carve-out as cmd/deployctl above —
+      # minter is invoked by schedd at boot, not from a customer-
+      # facing surface. Keeping the exemption path-scoped to this
+      # one file so an unrelated G703 elsewhere in cmd/schedd/
+      # would still trip (e.g. a future cron-driven path opener).
+      - path: "cmd/schedd/internal_svc_minter\\.go$"
+        linters:
+          - gosec
       # DEPLOY-1 / ADR-075 (review finding M6): the mount/umount forbidigo
       # rule above only blocks new call sites; the legitimate owners
       # stay allowlisted here. Adding a new file outside these three

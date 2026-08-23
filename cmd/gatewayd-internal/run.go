@@ -62,6 +62,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/role"
+	schedpkg "github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -653,6 +654,17 @@ type runDeps struct {
 	// mode='basic' returns 500 if hit. Production wires
 	// the secretbox.OpenMulti closure below.
 	publicAuthUnsealer gateway.PublicAuthUnsealer
+	// internalSvcVerifier (ADR-119 / issue #477 #4) is the
+	// per-service public-key allowlist consulted by
+	// applyIngressInternalSvc (handler.go) and
+	// SynthServer.applyIngressInternalSvc (synth.go) when an
+	// app's public_auth_mode='internal_only'. nil = the gate
+	// is disabled — an app in internal_only mode without the
+	// verifier wired would 500 (operator_error) per the
+	// loud-misconfig posture in pkg/gateway/internal_svc_auth.go.
+	// Production wires the env-loaded FAAS_INTERNAL_SVC_PUBKEYS
+	// map below; dev boxes + tests leave it nil.
+	internalSvcVerifier gateway.InternalSvcVerifier
 	// scheddClient is the ScheddClient interface (production: a
 	// single *scheddgrpc.Client from the per-node cache) used by
 	// AppLogsHandler (issue #254 / Move 4 PR-2) and the warm hint
@@ -987,7 +999,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			instanceID, nodeID, deploymentID, wakeID, _, atCapacity, port, err := cli.AdmitInstance(ctx, appID, "", "")
+			instanceID, nodeID, deploymentID, wakeID, _, atCapacity, port, err := cli.AdmitInstance(ctx, appID, "", "", schedpkg.TriggerGateway)
 			if err == nil && !atCapacity {
 				backend.RecordTarget(appID, gateway.Target{
 					InstanceID:   instanceID,
@@ -1029,7 +1041,43 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return synth.forwardInvocation(ctx, target, inv)
 		},
 	}
+	// Construct the SynthServer before wiring the gate — the
+	// WithInternalSvcVerifier / WithMetrics / WithAudit /
+	// WithAppModeLookup chain below mutates deps.synth in place.
+	// Round-4 rebase: the previous round had this on a separate
+	// line in main; the merge put it on the closing-brace line
+	// of the synthAdapter struct literal, which broke the compile.
+	// Restoring the off-the-brace call keeps both sides readable.
 	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, synth, log)
+	// ADR-119 — wire the synth-side gate. The same per-service
+	// public-key allowlist (deps.internalSvcVerifier) gates
+	// /v1/synthesize so a forged cron request cannot wake an
+	// internal_only app (synth bypasses Handler.ServeHTTP).
+	// Same Metrics + same audit emitter + same per-app cache
+	// the HTTP-front-door gate uses — single source of truth.
+	// appPublicAuthMode is consulted via the per-app cache
+	// populated by the same hydration path Handler.PublicAuthConfig
+	// reads; nil-safe (nil lookup = every app treated as "open").
+	deps.synth.WithInternalSvcVerifier(deps.internalSvcVerifier)
+	deps.synth.WithMetrics(deps.metrics).
+		WithAudit(deps.requireAuthnAudit.Emit).
+		WithAppModeLookup(func(ctx context.Context, appID string) string {
+			// ADR-119 — per-app mode lookup for the synth-side
+			// gate. Reads from the per-app cache hydrated by
+			// the same path Handler.PublicAuthConfig reads.
+			// A cache miss returns "" which the gate treats
+			// as "open" (no JWT required). Returns "" on error
+			// so a transient pg failure doesn't 500 every
+			// internal_only cron fire. Round-3 golangci-lint
+			// contextcheck: now uses the inbound request's ctx
+			// (with timeout / cancel chain) instead of a
+			// fresh context.Background().
+			app, err := pgStore.AppByID(ctx, appID)
+			if err != nil {
+				return ""
+			}
+			return app.PublicAuthMode
+		})
 	// Process-local Prometheus registry (spec §12). Constructed here so
 	// every downstream consumer — handler, warm-hint consumer, top-N
 	// sampler — shares the same registry. The registry is exposed via
@@ -1294,6 +1342,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 		}
 	}
+	// ADR-119 — load FAAS_INTERNAL_SVC_PUBKEYS (JSON document
+	// mapping svcName → PEM-encoded Ed25519 public key). The
+	// env is read once at boot; runtime rotation is a
+	// follow-up (ADR-120 candidate — see plan). nil = no
+	// apps in internal_only mode should be reachable, and
+	// the gate 500s loudly rather than fail-open. Production
+	// wires schedd at minimum; meterd / future daemons add
+	// keys to the same JSON map.
+	if rawPubkeys, ok := os.LookupEnv("FAAS_INTERNAL_SVC_PUBKEYS"); ok && rawPubkeys != "" {
+		var perSvc map[string]string
+		if err := json.Unmarshal([]byte(rawPubkeys), &perSvc); err != nil {
+			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is not valid JSON; internal_only mode will 500 until corrected",
+				"err", err.Error())
+		} else if len(perSvc) == 0 {
+			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is empty; internal_only mode will 500 until corrected")
+		} else {
+			deps.internalSvcVerifier = newInternalSvcVerifierFromPEMs(perSvc)
+			log.Info("gatewayd-internal: internal_only verifier loaded",
+				"svc_count", len(perSvc))
+		}
+	}
 	// The scheddClient reference is needed by AppLogsHandler (PR-2).
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
@@ -1541,6 +1610,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cmd/apid uses). nil-safe: tests + dev boxes that don't
 	// wire either pass through the per-request unseal path.
 	handler.WithPublicAuth(deps.publicAuthCache, deps.publicAuthUnsealer)
+	// ADR-119 — wire the per-service public-key allowlist into
+	// the Handler so applyIngressInternalSvc (handler.go:~4586
+	// area) can validate Authorization: Bearer JWTs on apps
+	// whose public_auth_mode='internal_only'. The same verifier
+	// is consulted by the synth-side gate
+	// (pkg/gateway/synth.go::SynthServer.handleSynthesize) via
+	// the SynthServer dependency wiring — single source of
+	// truth on the verifier.
+	handler.WithInternalSvcVerifier(deps.internalSvcVerifier)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
 	// producer channel. The sink is shared between Handler.recordEgress
 	// (writer) and egressgrpc.Server (drainer-on-cadence reader).
@@ -2305,7 +2383,7 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
 func (unwiredBackend) HealthyCount(string) int        { return 0 }
-func (unwiredBackend) Admit(context.Context, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Admit(context.Context, string, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 
