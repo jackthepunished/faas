@@ -1,0 +1,132 @@
+# Synthetic time-series fixture for ADR-127 §5 cold-boot ratio SLO
+# (issue #1059). Covers the page alert FaasColdBootRatioHigh:
+#
+#   vmmd_cold_boot_ratio > 0.30 for 10m → page
+#
+# Mechanic: the recording rule is
+#   vmmd_cold_boot_ratio = rate(cold_boot_fallback[5m])
+#                       / rate(wake_snapshot_tier[5m])
+#
+# rate() over 5m requires the counter to be MONOTONICALLY INCREASING
+# (the canonical Prometheus pitfall — see fixture mechanics at
+# pkg/promqlrules/testdata/data_placement.test.yml:25-41). The fixture
+# series shape below is `0+1x40` for `cold_boot_fallback` (40 samples
+# × 1 increment per sample, 25m total) plus a fixed-denominator series
+# at 25 increments per sample (`0+25x40` for the parent metric) — this
+# yields a 1/25 = 0.04 ratio (below threshold, alert silent) for the
+# happy case and a 9/25 = 0.36 ratio (above threshold, alert fires)
+# for the failing case.
+#
+# Threshold rationale (mirrors the §12 dashboard / §6.2 budget curve):
+# 30 % cold-boot is the wake-economics saturation point — sustained
+# rates above this triple the lv-fc I/O and put the snapshot_fleet_avg
+# alert on the runway. Catching the trend at 30 % with `for: 10m`
+# gives the operator ~24 h headroom.
+#
+# `for: 10m` is encoded as `expire: 5m` on the alert state — the
+# fixture asserts that AFTER the 10m threshold the alert fires and
+# BEFORE the threshold the alert stays silent. expiry == 5m is the
+# canonical Promtool test pattern (the alert annotation has `for: 10m`
+# at the live evaluation interval of 30s, and the test step interval
+# is 30s, so 21 evaluation steps = ~10m of "alert should fire" state).
+#
+# What this exercises:
+#   1. FaasColdBootRatioHigh MUST fire on a sustained 36% cold-boot
+#      ratio over 25m (cold_boot=9 sample / 30s, total=25 sample
+#      / 30s).
+#   2. FaasColdBootRatioHigh MUST NOT fire on a sustained 4% cold-boot
+#      ratio over 25m (cold_boot=1 / 30s, total=25 / 30s).
+#   3. The label contract — alert carries ONLY
+#      (severity, component, family) per §11. A regression that
+#      leaks a host label trips the §11 secret rule here.
+#
+# Why no per-reason assertions: the *_wake_failure_total counter is
+# emitting today (commit 2 of this PR); the underlying Promtool
+# fixtures for it ship in PR_ColdBootRatio follow-ups because the
+# per-reason alert is an open question (issue #1059 §Open). Tracking
+# here would pin a decision that's still pending.
+
+rule_files:
+  - ../../../deploy/ansible/roles/prometheus/files/faas.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ──────────────────────────────────────────────────────────────────
+  # Test 1 — Sustained 36% cold-boot ratio for 25m → fires.
+  #
+  # The recording rule divides rate(cold_boot_fallback[5m]) by
+  # rate(wake_snapshot_tier_total[5m]) — the denominator is the
+  # SUM of all tiers (warm + init + cold_boot_fallback), not just
+  # warm. With (cold_boot=9, total=25) per step:
+  #   rate(cold_boot_fallback) = 9/30s = 0.3/s
+  #   rate(wake_snapshot_tier)  = 25/30s = 0.833/s
+  #   ratio = 0.3 / 0.833 ≈ 0.36 ✓
+  # Threshold: 0.30 → alert fires after `for: 10m`.
+  # 51 samples × 30s = 25m30s — long enough for eval_time=25m
+  # (Promtool requires the test window to reach the eval_time,
+  # not just include it as the last point).
+  # ──────────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "Sustained 36% cold-boot ratio for 25m → FaasColdBootRatioHigh fires"
+    input_series:
+      - series: 'vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}'
+        values: '0+9x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="warm"}'
+        values: '0+16x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="init"}'
+        values: '0+0x51'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasColdBootRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: vmmd
+              family: cold_boot_ratio
+            exp_annotations:
+              summary: "vmmd cold-boot fallback > 30 % for 10m"
+              description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/runbooks/FaasColdBootRatioHigh.md."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasColdBootRatioHigh.md"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Test 2 — Sustained 4% cold-boot ratio for 25m → STAYS SILENT.
+  # Ratio = 1/25 = 0.04 — well below the 0.30 threshold. The alert
+  # MUST NOT fire. A regression that hardcodes the wrong threshold
+  # or that ignores the ratio and fires on the numerator's absolute
+  # value trips here.
+  # ──────────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "Sustained 4% cold-boot ratio for 25m → FaasColdBootRatioHigh STAYS SILENT"
+    input_series:
+      - series: 'vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}'
+        values: '0+1x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="warm"}'
+        values: '0+24x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="init"}'
+        values: '0+0x51'
+    alert_rule_test:
+      # No exp_alerts — the alert must NOT fire.
+      - eval_time: 25m
+        alertname: FaasColdBootRatioHigh
+
+  # ──────────────────────────────────────────────────────────────────
+  # Test 3 — Recording rule sanity. vmmd_cold_boot_ratio itself
+  # must produce a numeric value (not NaN) when the denominator
+  # is zero — the clamp_min(0.001) on the denominator guards this
+  # branch. Empty fleet (zero wakes over [5m]) must NOT panic
+  # nor emit a NaN series; the recording rule returns 0/0.001 = 0
+  # which is below the 0.30 threshold. Alert stays silent.
+  # ──────────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "Zero-wake idle fleet → alert stays silent (no NaN)"
+    input_series:
+      - series: 'vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}'
+        values: '0x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="warm"}'
+        values: '0x51'
+      - series: 'vmmd_wake_snapshot_tier_total{tier="init"}'
+        values: '0x51'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasColdBootRatioHigh

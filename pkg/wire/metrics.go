@@ -187,6 +187,52 @@ type OpsMetrics struct {
 	// Pre-instantiated at boot so the wake-tier-mix panel has zero
 	// rows from idle fleet, non-zero as soon as production wakes happen.
 	wakeSnapshotTier *prometheus.CounterVec
+	// wakeFailure (issue #1059 / ADR-127) — operator-facing wake
+	// failure-mode counter. Labelled by (box, reason). The closed
+	// reason vocabulary is
+	// {snapshot_stale, disk_full, jailer_fail, netns_fail,
+	// cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}
+	// — every wake-failure site maps to exactly one of these (see
+	// pkg/fcvm/wake_classify.go). The box label is bounded by the
+	// boxLabelSet admission (maxBoxLabelValues = 64); overflow
+	// collapses to otherBoxLabel ("__other__"). Pre-instantiated at
+	// the closed (box, reason) cartesian so the §12
+	// "Wake failures by reason (24h)" panel surfaces zero rows from
+	// idle fleet. vmmd and schedd each emit their own
+	// prefix_wake_failure_total from the same OpsMetrics — schedd
+	// stamps record_runtime_failed from the audit-reason string at
+	// pkg/sched/engine.go:2198; vmmd stamps the eight failure-reasons
+	// from the wake-failure hook sites at pkg/fcvm/manager.go.
+	wakeFailure *prometheus.CounterVec
+	// wakeLatency (issue #1059 / ADR-127) — operator-facing per-box
+	// per-phase wake-latency histogram. Labelled by (box, phase).
+	// The closed phase set
+	// {restore_ms, netns_tap_ms, guest_ready_ms} mirrors the
+	// existing fleet-level vmmd_wake_phase_duration_seconds{phase}
+	// (pkg/fcvm/metrics.go) so the §12 dashboard panel can swap
+	// fleet → per-box without a legend change. The box label is
+	// bounded by the boxLabelSet admission (same contract as
+	// wakeFailure above). Bucket set reuses the existing per-phase
+	// histogram's spec §6.3 envelope {0.05, 0.1, 0.2, 0.3, 0.35,
+	// 0.5, 0.8, 1, 1.5, 3, 5, 10} — the 0.3/0.35 pair gives tight
+	// resolution near the 350 ms warm-wake budget per ADR-074
+	// §3.5. wake_id is attached as a prometheus.Exemplar on each
+	// observation (matching the wakeRPCDuration precedent at
+	// metrics.go:1421) so operators can join to the events table
+	// (BootStarted / BootCompleted rows) on wake_id.
+	wakeLatency *prometheus.HistogramVec
+	// boxLabels: the bounded admission set shared by wakeFailure and
+	// wakeLatency (issue #1059 / ADR-127). Same shape and contract
+	// as accountLabelSet / ipLabelSet (fixed-capacity, non-evicting,
+	// __other__ collapse) but a distinct type so the three sets do
+	// not share capacity. The cap is maxBoxLabelValues (64) — sized
+	// for the Tier A multi-host rollout (ADR-062 / ADR-066 chain);
+	// the single-box production reality today resolves box to the
+	// literal "local". Constructed once per OpsMetrics in
+	// NewOpsMetrics; the mutex is the only synchronisation
+	// primitive and is held only across the lookup/insert path.
+	// Prometheus increments happen outside the critical section.
+	boxLabels *boxLabelSet
 	// guestTailSeconds (issue #667 / ADR-078) — histogram of the
 	// per-tail-task wall-clock duration from registration (a
 	// waitUntil(promise) call inside the handler) to terminal
@@ -1434,6 +1480,49 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	wakeSnapshotTier.WithLabelValues("warm")
 	wakeSnapshotTier.WithLabelValues("init")
 	wakeSnapshotTier.WithLabelValues("cold_boot_fallback")
+	// wakeFailure (issue #1059 / ADR-127) — see OpsMetrics.wakeFailure
+	// field doc comment for the closed reason vocabulary. The box
+	// label is resolved through boxLabel() at the call site (the
+	// accessor returns the admission-set value); the constructor
+	// here pre-instantiates every (box, reason) pair in the closed
+	// cartesian — same precedent as warmSnapshotErrors above and
+	// writeRedirectTotal's outcome × auth_kind cross product.
+	wakeFailureReasons := []string{
+		"snapshot_stale",
+		"disk_full",
+		"jailer_fail",
+		"netns_fail",
+		"cgroup_fail",
+		"vsock_fail",
+		"snapshot_restore_err",
+		"mem_backend_err",
+	}
+	wakeFailureBoxes := []string{labelLocal, otherBoxLabel}
+	wakeFailure := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_wake_failure_total",
+		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__) and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}. The closed reason set is enforced by pkg/fcvm/wake_classify.go — every wake-failure site maps to exactly one reason. The box label is bounded by maxBoxLabelValues (64) and is set by the host; today it resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain).",
+	}, []string{"box", "reason"})
+	for _, box := range wakeFailureBoxes {
+		for _, reason := range wakeFailureReasons {
+			wakeFailure.WithLabelValues(box, reason)
+		}
+	}
+	// wakeLatency (issue #1059 / ADR-127) — see OpsMetrics.wakeLatency
+	// field doc comment for the closed phase set. Bucket set reuses
+	// the existing vmmd_wake_phase_duration_seconds{phase} envelope
+	// (spec §6.3 verbatim, ADR-074 §3.5) so the §12 dashboard panel
+	// can swap fleet → per-box without changing the bucketing.
+	wakeLatencyPhases := []string{"restore_ms", "netns_tap_ms", "guest_ready_ms"}
+	wakeLatency := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_wake_latency_seconds",
+		Help:    "Wall-clock seconds for each per-box vmmd-side wake phase (issue #1059 / ADR-127). phase ∈ {restore_ms, netns_tap_ms, guest_ready_ms}; box label is admission-bounded (overflow → __other__). Per-box sibling of the fleet <prefix>_wake_phase_duration_seconds{phase} (pkg/fcvm/metrics.go) — same bucket set, same phase vocabulary. wake_id is attached as a prometheus.Exemplar on each observation. Bucket set is spec §6.3 verbatim with the 0.3/0.35 pair (ADR-074 §3.5).",
+		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5, 10},
+	}, []string{"box", "phase"})
+	for _, box := range wakeFailureBoxes {
+		for _, phase := range wakeLatencyPhases {
+			wakeLatency.WithLabelValues(box, phase)
+		}
+	}
 	// Issue #667 / ADR-078: waitUntil tail histograms + counters.
 	// Pre-instantiated at boot so the §12 tail-watchdog panel has
 	// zero rows from idle fleet and non-zero as soon as production
@@ -2246,7 +2335,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3044,6 +3133,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
 		gatewayInflightRequests:              gatewayInflightRequests,
 		wakeSnapshotTier:                     wakeSnapshotTier,
+		wakeFailure:                          wakeFailure,
+		wakeLatency:                          wakeLatency,
+		boxLabels:                            newBoxLabelSet(maxBoxLabelValues),
 		guestTailSeconds:                     guestTailSeconds,
 		guestTailFailedTotal:                 guestTailFailedTotal,
 		tailCapReached:                       tailCapReached,
@@ -3423,6 +3515,47 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 		return nil
 	}
 	return m.wakeSnapshotTier.WithLabelValues(tier)
+}
+
+// WakeFailure returns the per-(box, reason) counter the wake-failure
+// hook sites increment on every wake failure (issue #1059 / ADR-127).
+// reason MUST be one of {snapshot_stale, disk_full, jailer_fail,
+// netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err,
+// mem_backend_err} — the closed vocabulary is enforced by
+// pkg/fcvm/wake_classify.go and the wake-failure call sites hardcode
+// the literal reason string. box is resolved through the boxLabelSet
+// admission (maxBoxLabelValues = 64); overflow collapses to
+// "__other__". The (box, reason) cartesian is pre-instantiated in
+// the constructor for every (box, reason) pair so the §12
+// "Wake failures by reason (24h)" dashboard panel surfaces zero rows
+// from idle fleet. nil-safe — returns nil if m is nil so unit tests
+// without metrics keep building (same nil-safe posture as
+// WarmSnapshotErrors).
+func (m *OpsMetrics) WakeFailure(box, reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.wakeFailure.WithLabelValues(m.boxLabel(box), reason)
+}
+
+// WakeLatency returns the per-(box, phase) histogram observer the
+// per-box wake-path hook sites call to record wake-phase latency
+// (issue #1059 / ADR-127). phase MUST be one of {restore_ms,
+// netns_tap_ms, guest_ready_ms} — the closed vocabulary mirrors the
+// existing fleet-level vmmd_wake_phase_duration_seconds{phase}
+// histogram so the §12 dashboard panel can swap fleet → per-box
+// without a legend change. box is resolved through the boxLabelSet
+// admission (same contract as WakeFailure above). The (box, phase)
+// cartesian is pre-instantiated in the constructor for every pair so
+// the "Per-box p99 wake latency (24h)" dashboard panel surfaces zero
+// rows from idle fleet. wake_id is attached as a
+// prometheus.Exemplar at the call site (matching the wakeRPCDuration
+// precedent at metrics.go:1421). nil-safe — returns nil if m is nil.
+func (m *OpsMetrics) WakeLatency(box, phase string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.wakeLatency.WithLabelValues(m.boxLabel(box), phase)
 }
 
 // EvictedPriority returns the per-(priority, reason) counter the
@@ -5487,6 +5620,45 @@ const anonymousAccountLabel = "anonymous"
 // the metric label is intentionally lossy.
 const otherAccountLabel = "__other__"
 
+// maxBoxLabelValues caps the per-OpsMetrics box-label admission
+// set (issue #1059 / ADR-127). Sized at 64 — covers the
+// single-control-plane reality today (N=1) and gives headroom
+// for the Tier A multi-host rollout (ADR-062 / ADR-066 chain).
+// The cap is far below the "tens of thousands of series per
+// metric" Prometheus guideline so a hostile config can never
+// exhaust TSDB cardinality on this label — the operator can
+// always rely on the closed (box, reason) and (box, phase)
+// cartesian being bounded. Above the cap, new box identifiers
+// collapse to otherBoxLabel ("__other__") so the Prometheus TSDB
+// series set stays bounded over the daemon's lifetime. The cap
+// is shared across every box-labelled metric (wakeFailure and
+// wakeLatency today) so a box is either represented by its real
+// identifier in both, or by "__other__" in both.
+//
+// Distinct from maxAccountLabelValues and maxIPLabelValues so the
+// three sets do not share capacity — a sudden signup surge could
+// affect account labels while box cardinality stays low, and
+// vice versa.
+const maxBoxLabelValues = 64
+
+// labelLocal is the reserved box identifier for the
+// single-control-plane reality (issue #1059 / ADR-127 §3.4).
+// Today vmmd / schedd always resolve box to this literal —
+// there's no compute_nodes.id lookup yet. Always admitted without
+// consuming capacity, and always re-admitted on collision-free
+// lookups so boxLabelSet is free to reset across a restart. When
+// the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain),
+// a follow-up commit replaces this placeholder with the
+// compute_nodes.id lookup at boot.
+const labelLocal = "local"
+
+// otherBoxLabel is the reserved box identifier for traffic whose
+// box identifier exceeded the admission cap. Same contract as
+// otherAccountLabel — operators must check the daemon slog for
+// the original box identifier when a box lands here; the metric
+// label is intentionally lossy.
+const otherBoxLabel = "__other__"
+
 // accountLabelSet is the bounded admission set that backs every
 // account_id-labelled metric in OpsMetrics (issue #278). The set is
 // deliberately a plain map+mutex, not an LRU: an evicting LRU would
@@ -5691,6 +5863,111 @@ func (m *OpsMetrics) ipLabel(ip string) string {
 		return ip
 	}
 	return m.ipLabels.admit(ip)
+}
+
+// boxLabelSet is the bounded admission set that backs the box-labelled
+// metrics on OpsMetrics (issue #1059 / ADR-127). Same shape and contract
+// as accountLabelSet and ipLabelSet above — plain map + mutex, fixed
+// capacity, non-evicting — but a distinct type so the three sets do not
+// share capacity (a credential-stuffing burst on ipLabelSet must not
+// steal slots from the box admission set, and vice versa). The cap is
+// maxBoxLabelValues (64). Above the cap, new box identifiers collapse to
+// otherBoxLabel ("__other__") so the Prometheus TSDB series set stays
+// bounded over the daemon's lifetime. The map is initialised once per
+// OpsMetrics in NewOpsMetrics; the mutex is the only synchronisation
+// primitive and is held only across the lookup/insert path. Prometheus
+// Counter / Histogram increments happen outside the critical section.
+//
+// Reserved values (labelLocal, otherBoxLabel) are admitted at boot
+// without consuming capacity and are always re-admitted on collision-
+// free lookups. labelLocal is the single-control-plane placeholder used
+// by vmmd / schedd today — the multi-host rollout replaces this with a
+// compute_nodes.id lookup. Real box identifiers consume capacity once
+// and are never evicted in process — the daemon restart is the only
+// path that resets the set.
+type boxLabelSet struct {
+	mu       sync.Mutex
+	admitted map[string]struct{}
+	cap      int
+}
+
+// newBoxLabelSet constructs an admission set with the given capacity.
+// capacity must be > 0; the call panics otherwise to fail loud at boot
+// rather than silently allow unbounded admission.
+//
+// Returns a pointer because boxLabelSet contains a sync.Mutex;
+// returning by value would copy the lock (govet copylocks).
+func newBoxLabelSet(capacity int) *boxLabelSet {
+	if capacity <= 0 {
+		panic("wire: boxLabelSet capacity must be positive")
+	}
+	s := &boxLabelSet{
+		admitted: make(map[string]struct{}, capacity),
+		cap:      capacity,
+	}
+	// Reserved values don't count against the cap, but pre-admitting
+	// them at construction means boxLabel() doesn't need a special
+	// branch for them — the lookup short-circuits through the same map.
+	s.admitted[labelLocal] = struct{}{}
+	s.admitted[otherBoxLabel] = struct{}{}
+	return s
+}
+
+// admit resolves a box identifier to its label value (issue #1059 /
+// ADR-127). Empty input normalises to labelLocal so a missing box value
+// (pathological — the host always supplies one) is observable distinctly
+// from a real multi-host rollout that crossed the admission cap (which
+// collapses to otherBoxLabel). Reserved values (labelLocal, otherBoxLabel)
+// are always admitted without consuming capacity. Real box identifiers
+// are admitted up to the capacity; further identifiers collapse to
+// otherBoxLabel without ever consuming capacity, and the underlying
+// map is never resized past cap.
+//
+// Concurrency: holds mu across the lookup+insert. The hot path is
+// the "already admitted" lookup, which is O(1) and never inserts.
+// The Prometheus increment happens at the call site AFTER admit
+// returns, so it is outside the critical section.
+//
+// Pointer receiver: the type contains a sync.Mutex, so copying the
+// value would duplicate the lock. boxLabelSet is constructed once
+// per OpsMetrics in NewOpsMetrics and held as a pointer field.
+func (s *boxLabelSet) admit(box string) string {
+	switch box {
+	case "":
+		return labelLocal
+	case labelLocal, otherBoxLabel:
+		return box
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.admitted[box]; ok {
+		return box
+	}
+	// Reserved labels (labelLocal, otherBoxLabel) are pre-admitted at
+	// construction (see newBoxLabelSet) and consume map entries but
+	// NOT user-facing capacity. The user-facing cap of `s.cap`
+	// distinct REAL box identifiers must hold. The check is therefore
+	// "real boxes admitted = (len - reserved) >= s.cap", not
+	// "len >= s.cap" — the same bug-fix shape as
+	// ipLabelSet.admit (TestFailedLoginTotal_OverflowCollapsesToOtherSlow).
+	const reservedCount = 2
+	realAdmitted := len(s.admitted) - reservedCount
+	if realAdmitted >= s.cap {
+		return otherBoxLabel
+	}
+	s.admitted[box] = struct{}{}
+	return box
+}
+
+// boxLabel exposes the admission set as an OpsMetrics method so callers
+// don't need to know the underlying type. Safe on a nil receiver —
+// returns the input unchanged for the daemon paths that don't wire an
+// OpsMetrics (unit tests, see sched / vmmd test fixtures).
+func (m *OpsMetrics) boxLabel(box string) string {
+	if m == nil || m.boxLabels == nil {
+		return box
+	}
+	return m.boxLabels.admit(box)
 }
 
 // RenderSeconds is a tiny helper for callers that want to hand-format a

@@ -1124,3 +1124,50 @@ groups:
           summary: "apid domain doctor disabled via FAAS_DOMAIN_DOCTOR_ENABLED"
           description: "The dns_poller is skipping every doctor pass because FAAS_DOMAIN_DOCTOR_ENABLED is set to a falsy value on this apid host. Customers will see `gregale domains doctor` return 503 doctor_disabled. This is an operator choice (issue #986 dark-launch default-off pre-Tier-A3; the post-Tier-A3 default is on). To re-enable, unset the env var (or set it to 1/true/yes/on) and bounce the apid."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasDomainDoctorStalled.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Cold-boot ratio SLO (issue #1059 / ADR-127).
+      # The wake-economics curve saturates once cold-boot crosses 30 %
+      # on the §6.2 budget (47,600 MB / 56 GB). Landing this alert
+      # early gives ~24 h headroom before the
+      # snapshot_fleet_avg_mb > 160 alert fires (per CLAUDE.md "fleet
+      # snapshot average target: 130 MB — alerts at 160"). Ratio uses
+      # the existing ADR-074 series
+      # vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"} /
+      # vmmd_wake_snapshot_tier_total; recording rule is the [5m]
+      # rate so the alert's `for: 10m` rides a stable ratio, not a
+      # per-second instantaneous. clamp_min(0.001) on the
+      # denominator guards against /0 when a node has had zero
+      # recent wakes (the small floor keeps the ratio numeric
+      # instead of NaN). No warn tier: the ratio has no integer
+      # floor that's a meaningful "early warning"; the SLO is
+      # "operator paged at 30 %, recover before 50 %" — at 50 % the
+      # fleet snapshot avg crosses 200 MB.
+      # ─────────────────────────────────────────────────────────────────
+      - record: vmmd_cold_boot_ratio
+        expr: |
+          sum without (tier) (
+              clamp_min(
+                  rate(vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}[5m]),
+                  0
+              )
+          )
+          /
+          sum without (tier) (
+              clamp_min(
+                  rate(vmmd_wake_snapshot_tier_total[5m]),
+                  0.001
+              )
+          )
+
+      - alert: FaasColdBootRatioHigh
+        expr: vmmd_cold_boot_ratio > 0.30
+        for: 10m
+        labels:
+          severity: page
+          component: vmmd
+          family: cold_boot_ratio
+        annotations:
+          summary: "vmmd cold-boot fallback > 30 % for 10m"
+          description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/runbooks/FaasColdBootRatioHigh.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasColdBootRatioHigh.md"

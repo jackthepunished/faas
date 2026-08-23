@@ -1205,6 +1205,161 @@ func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_WakeFailurePreinstantiated (issue #1059 / ADR-127)
+// pins the closed (box, reason) cartesian for the wake-failure counter
+// at boot. The constructor pre-instantiates every (box, reason) pair
+// for the reserved boxes (labelLocal, otherBoxLabel) × every closed
+// reason, so the §12 "Wake failures by reason (24h)" dashboard panel
+// surfaces a non-zero baseline from t=0 — the regression that drops
+// the pre-instantiation loop trips here, not in a downstream
+// "missing series" alert.
+func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, reason := range []string{
+		"snapshot_stale",
+		"disk_full",
+		"jailer_fail",
+		"netns_fail",
+		"cgroup_fail",
+		"vsock_fail",
+		"snapshot_restore_err",
+		"mem_backend_err",
+	} {
+		for _, box := range []string{`local`, `__other__`} {
+			want := fmt.Sprintf(`vmmd_wake_failure_total{box=%q,reason=%q} 0`, box, reason)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+			}
+		}
+	}
+}
+
+// TestOpsMetrics_WakeFailureIncrement (issue #1059 / ADR-127) pins
+// the per-(box, reason) counter flow. Three increments on the same
+// (box, reason) tuple must surface as `3` in the scrape body; two
+// increments on a different (box, reason) tuple must surface as `2`;
+// the reserved (__other__) bucket must remain at `0` until a real box
+// crosses the admission cap. The Prometheus Exposer reports the
+// current value per series, not the running total — the test fires
+// the increments via the accessor, not by hand-rolling the metric.
+func TestOpsMetrics_WakeFailureIncrement(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	m.WakeFailure("local", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "netns_fail").Inc()
+	m.WakeFailure("local", "netns_fail").Inc()
+
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 3`,
+		`vmmd_wake_failure_total{box="local",reason="netns_fail"} 2`,
+		// Reserved overflow bucket stays at 0 until a real box crosses
+		// the cap (see TestWakeFailure_OverflowCollapsesToOtherSlow).
+		`vmmd_wake_failure_total{box="__other__",reason="snapshot_restore_err"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap (issue
+// #1059 / ADR-127) — the two reserved box labels ("local" and
+// "__other__") are admitted at boot without consuming capacity, so
+// they surface in /metrics as `0`-valued series on an idle daemon.
+// The metric-reader relies on this for "no data" detection — a
+// regression that admitted reserved labels against the cap would
+// leave a quiet fleet invisible to the §12 panel.
+func TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_wake_failure_total{box="local",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{box="__other__",reason="snapshot_stale"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing reserved-label series %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_WakeFailureNilSafe (issue #1059 / ADR-127) — the
+// accessor must be no-op on a nil receiver so vmmd / schedd unit
+// tests without metrics keep working (same nil-safe posture as
+// WarmSnapshotErrors / EgressDeny). The convention is `nil →
+// return nil`.
+func TestOpsMetrics_WakeFailureNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WakeFailure("local", "netns_fail"); got != nil {
+		t.Errorf("nil.WakeFailure = %v, want nil", got)
+	}
+}
+
+// TestOpsMetrics_WakeLatencyPreinstantiated (issue #1059 / ADR-127)
+// pins the closed (box, phase) cartesian for the per-box wake-latency
+// histogram. The constructor pre-instantiates every (box, phase) pair
+// for the reserved boxes (labelLocal, otherBoxLabel) × every closed
+// phase, so the §12 "Per-box p99 wake latency (24h)" panel renders
+// empty subplots for an idle fleet (no "no data" gaps). A regression
+// that drops the pre-instantiation loop trips here, not in a
+// downstream "missing series" alert.
+func TestOpsMetrics_WakeLatencyPreinstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, phase := range []string{"restore_ms", "netns_tap_ms", "guest_ready_ms"} {
+		for _, box := range []string{`local`, `__other__`} {
+			// The histogram exposes `count` and `sum` series plus
+			// the bucket boundaries — we pin the count to keep the
+			// assertion tight (the bucket boundaries would surface
+			// even without the pre-instantiation loop via the
+			// HELP/TYPE line, but count would not).
+			want := fmt.Sprintf(`vmmd_wake_latency_seconds_count{box=%q,phase=%q} 0`, box, phase)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated histogram count %q in:\n%s", want, body)
+			}
+		}
+	}
+}
+
+// TestOpsMetrics_WakeLatencyIncrement (issue #1059 / ADR-127) pins
+// the per-(box, phase) histogram flow. Two observes on the same
+// (box, phase) tuple must surface as `count=2` in the scrape body;
+// one observe on a different (box, phase) tuple must surface as
+// `count=1`. The Prometheus Exposer reports the running count per
+// series — the test fires the observes via the accessor.
+func TestOpsMetrics_WakeLatencyIncrement(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	m.WakeLatency("local", "restore_ms").Observe(0.123)
+	m.WakeLatency("local", "restore_ms").Observe(0.456)
+	m.WakeLatency("local", "netns_tap_ms").Observe(0.078)
+
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_wake_latency_seconds_count{box="local",phase="restore_ms"} 2`,
+		`vmmd_wake_latency_seconds_count{box="local",phase="netns_tap_ms"} 1`,
+		// Reserved overflow bucket stays at 0 until a real box crosses
+		// the cap (see TestWakeFailure_OverflowCollapsesToOtherSlow).
+		`vmmd_wake_latency_seconds_count{box="__other__",phase="restore_ms"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_WakeLatencyNilSafe (issue #1059 / ADR-127) — the
+// accessor must be no-op on a nil receiver so vmmd / schedd unit
+// tests without metrics keep working (same nil-safe posture as
+// WakeRPCDuration / WakeSnapshotTier).
+func TestOpsMetrics_WakeLatencyNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WakeLatency("local", "restore_ms"); got != nil {
+		t.Errorf("nil.WakeLatency = %v, want nil", got)
+	}
+}
+
 // TestOpsMetrics_ObserveSidecarRestartNilSafe pins the nil-
 // receiver contract (issue #463 / ADR-069 / ADR-071 / PR-C §4).
 // vmmd's dispatchSidecarRestart ALWAYS calls

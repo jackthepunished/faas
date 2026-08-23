@@ -595,6 +595,20 @@ type Manager struct {
 	// registers the counter (single-registry pattern, see
 	// pkg/wire/metrics.go: imageScanVulns on commonCollectors).
 	imageScanMetrics *wire.OpsMetrics
+	// wakeFailureMetrics (issue #1059 / ADR-127) holds the
+	// OpsMetrics handle that backs the *_wake_failure_total{box,
+	// reason} counter and the *_wake_latency_seconds{box, phase}
+	// histogram — the operator-facing wake-failure surface. Like
+	// imageScanMetrics this is the per-daemon handle (vmmd
+	// producers; schedd / builderd consumers), pre-instantiated at
+	// the closed (box × reason) and (box × phase) sets in
+	// pkg/wire/metrics.go. nil-safe: the Wake hook sites guard
+	// the increment behind a method-receiver check so a unit
+	// test that doesn't wire ops keeps working. The
+	// single-registry pattern means this field is unique to
+	// vmmd's OpsMetrics and builderd's / schedd's handles hold
+	// their own (no cross-daemon sharing).
+	wakeFailureMetrics *wire.OpsMetrics
 	// advisoryClient is the vmmd-side forwarder that ships
 	// guest-init fanotify batches to apid (Wave 0 PR-C /
 	// ADR-047). nil means "no apid.sock to dial" —
@@ -741,6 +755,21 @@ func (m *Manager) VMM() VMM {
 // only producer in production but every daemon can hold the field.
 func (m *Manager) SetImageScanMetrics(ops *wire.OpsMetrics) {
 	m.imageScanMetrics = ops
+}
+
+// SetWakeFailureMetrics wires the OpsMetrics handle the wake-failure
+// hook sites feed into (issue #1059 / ADR-127). The shape mirrors
+// SetImageScanMetrics verbatim — nil-safe, single-registry, and
+// required-at-startup-but-deferred on the wire so unit tests that
+// don't wire ops keep passing. The handle registers the
+// *_wake_failure_total{box, reason} counter and the
+// *_wake_latency_seconds{box, phase} histogram at NewOpsMetrics time
+// (pre-instantiation loop, pkg/wire/metrics.go); the Manager
+// invocation is the only producer for `box = "local"` in production —
+// schedd uses its own. NOT safe to call concurrently with Wake;
+// cmd/vmmd wires it once at startup before serving traffic.
+func (m *Manager) SetWakeFailureMetrics(ops *wire.OpsMetrics) {
+	m.wakeFailureMetrics = ops
 }
 
 // SetAdvisoryClient wires the vmmd-side forwarder that ships
@@ -2224,6 +2253,21 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// sudden spike is a host-level signal not a workload signal.
 	netnsStart := time.Now()
 	if err = m.setupNetwork(ctx, nc); err != nil {
+		// Issue #1059 / ADR-127: closed-reason counter on the
+		// setupNetwork path. The error wrap "network setup: %w"
+		// surfaces every netns / TAP / nft failure under one
+		// umbrella, so per ADR §3 we hardcode reason="netns_fail"
+		// rather than rely on inner-error typed-sentinel matching
+		// (which would require pkg/netns/config.go callers to
+		// wrap with %w ErrNetnsFail — a follow-up extension). The
+		// reason literal is load-bearing for the §12
+		// "vmmd_wake_failure_total" panel legend — operators
+		// triaging a netns_fail spike do not need to know which
+		// inner step (netns add, TAP create, nft apply) failed.
+		// nil-safe: the receiver guards on m.wakeFailureMetrics.
+		if m.wakeFailureMetrics != nil {
+			m.wakeFailureMetrics.WakeFailure("local", WakeReasonNetnsFail).Inc()
+		}
 		return nil, fmt.Errorf("wake %s: network setup: %w", req.Instance, err)
 	}
 	timings.netnsTapMs = time.Since(netnsStart).Milliseconds()
@@ -2376,6 +2420,14 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		// Useful for local metal testing only.
 		m.log.Warn("cgroup fence: writePlanCgroup failed, continuing",
 			"instance", req.Instance, "plan", req.Plan, "err", err)
+		// Issue #1059 / ADR-127: closed-reason counter. Hardcoded
+		// reason="cgroup_fail" per ADR §3 — the wrap already names
+		// the surface, and the §11 invariant "cgroups v2 with
+		// memory.max = plan + 8 MB" makes any sustained
+		// cgroup_fail rate an operator action item. nil-safe.
+		if m.wakeFailureMetrics != nil {
+			m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+		}
 	}
 
 	// Issue #463 / ADR-069 / PR-B: per-workload cgroup scopes. The
@@ -2404,11 +2456,23 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		if wErr := writeWorkloadCgroup(parentScope, WorkloadNameMain, req.MemSizeMiB); wErr != nil {
 			m.log.Warn("cgroup fence: writeWorkloadCgroup main failed, continuing",
 				"instance", req.Instance, "err", wErr)
+			// Issue #1059 / ADR-127: hardcoded reason="cgroup_fail"
+			// on the per-workload cgroup warn-and-continue paths.
+			// Same posture as writePlanCgroup above — leaks the
+			// warn-and-continue through the metric so the
+			// operator-facing surface can spot the sustained case
+			// without grepping slog.
+			if m.wakeFailureMetrics != nil {
+				m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+			}
 		}
 		for _, sc := range req.Sidecars {
 			if wErr := writeWorkloadCgroup(parentScope, sc.Name, sc.RamMB); wErr != nil {
 				m.log.Warn("cgroup fence: writeWorkloadCgroup sidecar failed, continuing",
 					"instance", req.Instance, "sidecar", sc.Name, "err", wErr)
+				if m.wakeFailureMetrics != nil {
+					m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+				}
 			}
 		}
 	}
@@ -2457,6 +2521,24 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		m.wakePhaseMetrics.ObserveWakePhase("restore_ms", timings.restoreMs)
 		m.wakePhaseMetrics.ObserveWakePhase("netns_tap_ms", timings.netnsTapMs)
 		m.wakePhaseMetrics.ObserveWakePhase("guest_ready_ms", guestReadyMs)
+	}
+	// Issue #1059 / ADR-127: per-box phase observe on the new
+	// *_wake_latency_seconds{box, phase} histogram. The fleet
+	// aggregate above (wakePhaseMetrics) is preserved for §12
+	// dashboard back-compat; this sibling is the
+	// operator-facing per-box view. The `box = "local"`
+	// placeholder is replaced by a compute_nodes.id lookup
+	// before the multi-host rollout — ADR-127 §3.4.
+	// Times are observed as time.Duration so the histogram's
+	// prometheus.DefBuckets bounds apply (the existing
+	// fleet histogram uses ObserveMicroseconds so we
+	// explicitly use seconds here to keep the two histograms
+	// dimensionally aligned for the alert at
+	// docs/runbooks/FaasColdBootRatioHigh.md).
+	if m.wakeFailureMetrics != nil {
+		m.wakeFailureMetrics.WakeLatency("local", "restore_ms").Observe(float64(timings.restoreMs) / 1000.0)
+		m.wakeFailureMetrics.WakeLatency("local", "netns_tap_ms").Observe(float64(timings.netnsTapMs) / 1000.0)
+		m.wakeFailureMetrics.WakeLatency("local", "guest_ready_ms").Observe(float64(guestReadyMs) / 1000.0)
 	}
 	// tailSecondsAccum (issue #667 / ADR-078) starts at 0 on
 	// every Wake; MarkInstanceTailTerminal accumulates into it
@@ -2609,6 +2691,17 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 				timings.restoreError = rErr.Error()
 			}
 			m.metrics.ObserveFallback()
+			// Issue #1059 / ADR-127: closed-reason counter on the
+			// restore-fallback path. Classifies via the typed
+			// sentinel + ENOSPC substring match. Note the counter
+			// fires for EVERY restore failure regardless of
+			// fallback success — operators triaging an
+			// ObservedFallback hot-spot need the reason split, not
+			// only the cold-boot-fallback rate. nil-safe.
+			if m.wakeFailureMetrics != nil {
+				reason := ClassifyWakeError(rErr, WakeContext{Snapshot: req.Snapshot, FCVersion: m.fcVersion})
+				m.wakeFailureMetrics.WakeFailure("local", reason).Inc()
+			}
 			_ = m.vmm.Kill(ctx, lease)
 		}
 	}
@@ -2642,6 +2735,20 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		Workloads: buildWorkloadsForColdBoot(req),
 	}
 	if err := m.vmm.BootColdBoot(ctx, lease, spec); err != nil {
+		// Issue #1059 / ADR-127: terminal cold-boot failure
+		// counter. Distinct from the restore-fallback
+		// IncrementAbove because BootColdBoot is reached only
+		// after the restore path already failed and fell back
+		// — a sustained terminal-cold-boot rate implies the
+		// host can't cold-boot at all (lv-fc exhaustion,
+		// kernel arg change, jailer chroot corruption). The
+		// counter is incremented ONCE per cold-boot terminal,
+		// not once per restore-fallback. The classifier gets
+		// the same call shape (Snapshot may be nil here).
+		if m.wakeFailureMetrics != nil {
+			reason := ClassifyWakeError(err, WakeContext{FCVersion: m.fcVersion})
+			m.wakeFailureMetrics.WakeFailure("local", reason).Inc()
+		}
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)
 	}
 	return WakeColdBoot, nil

@@ -314,6 +314,33 @@ func (s *Server) ForgetActivity(instance string) {
 	s.activity.Forget(instance)
 }
 
+// incWakeFailure (issue #1059 / ADR-127) bumps the vmmd
+// wake-failure counter on the gRPC parse-failure paths only.
+// Manager.Wake already increments the counter at every internal
+// failure site (see pkg/fcvm/manager.go hook sites: netns_fail,
+// cgroup_fail, restore-fallback, cold-boot terminal); the gRPC
+// side only adds increments for envelope-validation failures
+// that never reach Manager. This avoids double-counting on the
+// Manager-failure path (the wire surface would otherwise emit
+// for every internal hook site's reason, fragmenting the series
+// across (gRPC, Manager) origins).
+//
+// box is hardcoded to "local" per ADR §3.4 — single-control-plane
+// placeholder, replaced by compute_nodes.id in the Tier A
+// multi-host rollout.
+//
+// reason is the closed-vocabulary reason string from
+// pkg/wire/metrics.go's wakeFailureReasons set; the call sites
+// pass hardcoded literals per the ADR §3 "call site hardcodes
+// the literal" rule, never a bare-string derived from the
+// wrapped error.
+func (s *Server) incWakeFailure(_ context.Context, reason string) {
+	if s == nil || s.ops == nil {
+		return
+	}
+	s.ops.WakeFailure("local", reason).Inc()
+}
+
 // Register binds s to a gRPC server.
 func (s *Server) Register(g *grpc.Server) {
 	vmmdpb.RegisterVmmdServer(g, s)
@@ -328,6 +355,17 @@ func (s *Server) CreateFromSnapshot(ctx context.Context, req *vmmdpb.CreateFromS
 	wr, err := toWakeRequest(ctx, req)
 	if err != nil {
 		s.ops.Observe(op, time.Since(start), err)
+		// Issue #1059 / ADR-127: emit the wake-failure counter on
+		// the parse-failure path ONLY (the Manager.Wake path
+		// below already increments via its hook sites — adding
+		// a second increment here would double-count). The
+		// parse-failure path is the wired call from schedd that
+		// fails envelope validation before vmmd ever sees the
+		// instance; reason="snapshot_restore_err" is the ADR §3
+		// hardcoded literal for the gRPC surface because the
+		// envelope shape mirrors the snapshot-restore request
+		// (the cold-boot endpoint is a sibling).
+		s.incWakeFailure(ctx, "snapshot_restore_err")
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	// issue #517 / PR-C / ADR-064 — mirror wake.boot_started at
@@ -356,6 +394,16 @@ func (s *Server) CreateColdBoot(ctx context.Context, req *vmmdpb.CreateColdBootR
 	wr, err := toColdBootRequest(ctx, req)
 	if err != nil {
 		s.ops.Observe(op, time.Since(start), err)
+		// Issue #1059 / ADR-127: parse-failure path on the
+		// cold-boot endpoint. Hardcoded reason="mem_backend_err"
+		// per ADR §3 — the cold-boot envelope carries the
+		// mem-file locator so a parse failure is functionally
+		// "I couldn't read the mem backend descriptor" even
+		// though today the only backend_type is "File". When
+		// hugetlbfs lands (Issue future), this counter
+		// already exists for the new failure mode without
+		// requiring a label-value migration.
+		s.incWakeFailure(ctx, "mem_backend_err")
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	// issue #517 / PR-C / ADR-064 — mirror wake.boot_started at

@@ -31,13 +31,20 @@ package vmmdgrpc
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // TestAdoptMigratedInstance_LeaseMismatch pins the
@@ -317,4 +324,162 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- issue #1059 / ADR-127: gRPC wire path wake-failure counter ---
+
+// TestWakeFailure_GRPCParseFailure_CreateFromSnapshot pins the
+// gRPC-level counter on the CreateFromSnapshot parse-failure path.
+// A CreateFromSnapshotRequest with no Instance triggers the
+// toWakeRequest validation branch (which errors with
+// codes.InvalidArgument + "Missing instance"). The handler must
+// emit the closed-vocabulary counter with reason="snapshot_restore_err"
+// — the ADR §3 hardcoded literal for the gRPC surface — before
+// returning the error. The Manager is NOT called on this path, so
+// the only expected increment is from the gRPC layer itself
+// (avoiding double-count with pkg/fcvm/manager.go's restore-fallback
+// and cold-boot terminal hook sites).
+func TestWakeFailure_GRPCParseFailure_CreateFromSnapshot(t *testing.T) {
+	ops := wire.NewOpsMetrics("vmmd")
+	s := New(stubVMM{}, ops, "1.10.0", nil)
+	// Empty Instance triggers the validation branch at
+	// proto.go:toWakeRequest:41.
+	if _, err := s.CreateFromSnapshot(context.Background(), &vmmdpb.CreateFromSnapshotRequest{
+		Instance: "",
+	}); err == nil {
+		t.Fatal("CreateFromSnapshot(empty instance): want validation error, got nil")
+	}
+	body := scrapeOps(t, ops)
+	want := `vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 1`
+	if !contains(body, want) {
+		t.Errorf("missing %q in scrape body:\n%s", want, body)
+	}
+}
+
+// TestWakeFailure_GRPCParseFailure_CreateColdBoot mirrors the
+// CreateColdBoot hook. A request with no App triggers the
+// toColdBootRequest validation branch; the handler must emit
+// the closed-vocabulary counter with reason="mem_backend_err"
+// — the ADR §3 hardcoded literal for the cold-boot gRPC surface.
+// Today only backend_type="File" exists, so this counter is
+// unreachable in production; pre-instantiating it now keeps the
+// vocabulary closed for the day hugetlbfs lands (no label-value
+// migration needed).
+func TestWakeFailure_GRPCParseFailure_CreateColdBoot(t *testing.T) {
+	ops := wire.NewOpsMetrics("vmmd")
+	s := New(stubVMM{}, ops, "1.10.0", nil)
+	// CreateColdBoot with no App triggers validation; the App
+	// check lives at proto.go:toColdBootRequest and looks up
+	// `req.GetApp()` first (mirror of toWakeRequest).
+	if _, err := s.CreateColdBoot(context.Background(), &vmmdpb.CreateColdBootRequest{
+		Instance: "i-cold-nil-app",
+	}); err == nil {
+		t.Fatal("CreateColdBoot(no app): want validation error, got nil")
+	}
+	body := scrapeOps(t, ops)
+	want := `vmmd_wake_failure_total{box="local",reason="mem_backend_err"} 1`
+	if !contains(body, want) {
+		t.Errorf("missing %q in scrape body:\n%s", want, body)
+	}
+}
+
+// TestWakeFailure_NilOpsSafe pins the nil-safe receiver on
+// incWakeFailure: a Server constructed with no OpsMetrics must
+// not panic on the parse-failure path. The handler uses the
+// `s.ops == nil` guard rather than a nil-receiver check on
+// WakeFailure itself, so an unwired wire (the unit-test default)
+// emits nothing while still returning the validation error to
+// the caller.
+func TestWakeFailure_NilOpsSafe(t *testing.T) {
+	s := New(stubVMM{}, nil, "1.10.0", nil)
+	// Should not panic. The error is the validation
+	// confirmation we're after.
+	if _, err := s.CreateFromSnapshot(context.Background(), &vmmdpb.CreateFromSnapshotRequest{
+		Instance: "",
+	}); err == nil {
+		t.Fatal("CreateFromSnapshot(empty instance): want validation error, got nil")
+	}
+}
+
+// stubVMM (issue #1059 / ADR-127) is a VmmdAPI stub. The
+// parse-failure test paths above never call into the Manager —
+// toWakeRequest / toColdBootRequest return before the vmm
+// receiver is touched. The stub's "must-not-reach" methods all
+// panic, which is the intended "this is a test fault" signal —
+// if any of them ever run, the test fixture is broken (we'd
+// mistakenly be exercising the success path with a stub that
+// doesn't know how to fake it). The read-only accessors
+// (LiveCount / LeasedCount / NetnsFor / InstancePID / LogRing)
+// return the no-information defaults; the metrics path doesn't
+// reach them.
+type stubVMM struct{}
+
+func (stubVMM) Wake(context.Context, fcvm.WakeRequest) (*fcvm.Instance, error) {
+	panic("stubVMM.Wake: parse-failure test must not reach Manager")
+}
+func (stubVMM) Park(context.Context, string, fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error) {
+	panic("stubVMM.Park: parse-failure test must not reach Manager")
+}
+func (stubVMM) Destroy(context.Context, string) error {
+	panic("stubVMM.Destroy: parse-failure test must not reach Manager")
+}
+func (stubVMM) DestroyWithExport(context.Context, string, string) (int, error) {
+	panic("stubVMM.DestroyWithExport: parse-failure test must not reach Manager")
+}
+func (stubVMM) LiveCount() int                 { return 0 }
+func (stubVMM) LeasedCount() int               { return 0 }
+func (stubVMM) NetnsFor(string) (string, bool) { return "", false }
+func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
+	return nil
+}
+func (stubVMM) InstancePID(string) (int, bool) { return 0, false }
+func (stubVMM) LogRing(string) *logbuf.Ring    { return nil }
+func (stubVMM) MountParentExt4(context.Context, string) (string, error) {
+	panic("stubVMM.MountParentExt4: parse-failure test must not reach Manager")
+}
+func (stubVMM) MaterializeParentExt4(context.Context, string, string) error {
+	panic("stubVMM.MaterializeParentExt4: parse-failure test must not reach Manager")
+}
+func (stubVMM) UmountParentExt4(context.Context, string) error {
+	panic("stubVMM.UmountParentExt4: parse-failure test must not reach Manager")
+}
+func (stubVMM) MountOverlayParent(context.Context, string, string, string, string) error {
+	panic("stubVMM.MountOverlayParent: parse-failure test must not reach Manager")
+}
+func (stubVMM) UmountOverlayParent(context.Context, string) error {
+	panic("stubVMM.UmountOverlayParent: parse-failure test must not reach Manager")
+}
+func (stubVMM) MarkInstanceFrameworkReady(context.Context, string, int64) (bool, string, string, error) {
+	panic("stubVMM.MarkInstanceFrameworkReady: parse-failure test must not reach Manager")
+}
+func (stubVMM) WarmSnapshot(context.Context, string, fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error) {
+	panic("stubVMM.WarmSnapshot: parse-failure test must not reach Manager")
+}
+
+// scrapeOps (issue #1059 / ADR-127) returns the wire-rendered
+// /metrics body for an OpsMetrics handle. Mirrors the
+// pkg/wire/metrics_test.go::render helper but kept package-local
+// in vmmdgrpc because the wire helper is package-private to wire.
+// httptest.NewServer is the tested path because the underlying
+// promhttp handler is a real http.Handler; the
+// httptest.NewRecorder equivalent would short-circuit the wire
+// shape and a regression there would let the test pass while
+// prod emits something different.
+func scrapeOps(t *testing.T, ops *wire.OpsMetrics) string {
+	t.Helper()
+	srv := httptest.NewServer(ops.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("scrape: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("scrape body: %v", err)
+	}
+	return string(body)
 }
