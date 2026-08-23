@@ -1,21 +1,24 @@
 //go:build !no_pg
 
-// Migration-apply test for 00383_openapi_import.sql
+// Migration-apply test for 00387_openapi_import.sql
 // (ADR-126 / issue #975 item #2).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00383 (no goose
-//     duplicate-version panic). Slot 00383 was picked as the
-//     next free slot on origin/main after PR #1023's
+//  1. Migration set applies cleanly through 00387 (no goose
+//     duplicate-version panic). Slot 00387 was picked as the
+//     next free slot on origin/main after PR #1019's
+//     mirror_invocation_results (00386), PR #1023's
 //     apps_app_protocol (00382), PR #1030's
 //     apps_public_auth_members_only (00378), PR #1006's
 //     deployment_audit (00380-00381), and PR #1036's
 //     compute_nodes_active_unique (00376) +
 //     instances_wake_attempt_active_unique (00377). Fences
-//     at 00378, 00379, 00380, 00381, 00382 hold the slots claimed
-//     by those PRs while we land at 00383. Re-verify with
-//     scripts/ci/check_migration_slots.sh immediately before push.
+//     at 00378, 00379, 00380, 00381, 00382 plus the
+//     00383_reserve_slot.sql leftover from PR #1019 hold the
+//     slots claimed by those PRs while we land at 00387.
+//     Re-verify with scripts/ci/check_migration_slots.sh
+//     immediately before push.
 //  2. The table is present with the 10 expected columns
 //     (positive shape — ADR-126 §D1).
 //  3. All 6 CHECK constraints landed with the expected names
@@ -49,7 +52,7 @@ import (
 )
 
 // openapiImportExpectedColumns are the 10 columns the migration
-// must add. Adding a column to 00383 without updating this list
+// must add. Adding a column to 00387 without updating this list
 // is a load-bearing failure mode — downstream consumers
 // (PgStore, MemStore, OpenAPI, SDKs) all key off this shape.
 var openapiImportExpectedColumns = []string{
@@ -84,13 +87,13 @@ var openapiImportExpectedIndexes = []string{
 	"app_openapi_docs_account_id_idx",
 }
 
-func TestMigrations_00383_OpenAPIImport(t *testing.T) {
+func TestMigrations_00387_OpenAPIImport(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00383.
+	// (1) Apply through 00387.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00382 apps_app_protocol and 00383 openapi_import)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00386 mirror_invocation_results and 00387 openapi_import)", err)
 	}
 
 	// (2) Positive shape — table present with 10 expected columns.

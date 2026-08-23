@@ -4864,7 +4864,7 @@ func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string
 
 // ---------------------------------------------------------------------------
 // appOpenAPIImportRow is the in-memory row mirror of app_openapi_docs
-// (migrations/00383). The struct is unexported; the public surface
+// (migrations/00387). The struct is unexported; the public surface
 // is the four methods below — handler tests reach them through the
 // Store interface.
 // ---------------------------------------------------------------------------
@@ -4908,7 +4908,7 @@ func (m *MemStore) GetAppOpenAPIDoc(_ context.Context, appID, accountID string) 
 }
 
 // UpsertAppOpenAPIDoc mirrors pgstore. The app row must exist (the
-// FK CASCADE in migration 00383 makes this unreachable in
+// FK CASCADE in migration 00387 makes this unreachable in
 // practice, but the explicit check lets a misuse at the call site
 // fail closed). Idempotent: a re-delivered import overwrites the
 // same row, not creates a second. openapiVersion is one of

@@ -46,8 +46,8 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
-	"github.com/onebox-faas/faas/pkg/openapiimport"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
+	"github.com/onebox-faas/faas/pkg/openapiimport"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 

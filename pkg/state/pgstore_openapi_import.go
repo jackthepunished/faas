@@ -27,7 +27,7 @@ import (
 // in the same commit, so a SELECT-write drift cannot silently
 // swallow a column.
 //
-// Ordering matches migrations/00383_openapi_import.sql (column
+// Ordering matches migrations/00387_openapi_import.sql (column
 // list 1:1).
 const appOpenAPIDocSelectCols = `app_id, account_id, doc,
        doc_sha256, byte_size, endpoint_count, source,
@@ -38,12 +38,12 @@ const appOpenAPIDocSelectCols = `app_id, account_id, doc,
 // only walks the args.
 func scanAppOpenAPIDocCols(scan func(...any) error) ([]byte, AppOpenAPIDocMeta, error) {
 	var (
-		doc          []byte
-		docSHA256    []byte
-		source       string
-		openapiVer   string
-		endpointCt   int
-		meta         AppOpenAPIDocMeta
+		doc        []byte
+		docSHA256  []byte
+		source     string
+		openapiVer string
+		endpointCt int
+		meta       AppOpenAPIDocMeta
 	)
 	if err := scan(
 		&meta.AppID, &meta.AccountID, &doc, &docSHA256,
@@ -98,7 +98,7 @@ func (s *PgStore) GetAppOpenAPIDoc(ctx context.Context, appID, accountID string)
 //
 // The app row must exist (defence-in-depth pre-check) so a misuse
 // at the call site fails with ErrNotFound BEFORE Postgres raises
-// 23503 on the FK. The FK CASCADE in migration 00383 makes this
+// 23503 on the FK. The FK CASCADE in migration 00387 makes this
 // unreachable in practice but the explicit check keeps the error
 // surface predictable.
 //

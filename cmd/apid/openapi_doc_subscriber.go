@@ -7,15 +7,15 @@
 // pkg/openapidiff.SpecCache. Three event sources mutate those
 // three inputs:
 //
-//   1. NotifyAppOpenAPIDocChanged (NEW, item #2 D5) — fired
-//      by postAppOpenAPIImport / deleteAppOpenAPIImport on
-//      create / replace / delete. Payload: {"app_id":..., "op":...}.
+//  1. NotifyAppOpenAPIDocChanged (NEW, item #2 D5) — fired
+//     by postAppOpenAPIImport / deleteAppOpenAPIImport on
+//     create / replace / delete. Payload: {"app_id":..., "op":...}.
 //
-//   2. NotifyEdgeRuleChanged (EXISTING, item #1 / ADR-091) —
-//      fired by the createEdgeRule / updateEdgeRule /
-//      deleteEdgeRule paths on create / update / delete.
-//      Payload shape matches the existing
-//      NotifyEdgeRuleChanged decoder in pkg/state.
+//  2. NotifyEdgeRuleChanged (EXISTING, item #1 / ADR-091) —
+//     fired by the createEdgeRule / updateEdgeRule /
+//     deleteEdgeRule paths on create / update / delete.
+//     Payload shape matches the existing
+//     NotifyEdgeRuleChanged decoder in pkg/state.
 //
 // The subscriber listens to BOTH channels and flushes
 // InvalidateByApp(appID) on every notification. Wholesale

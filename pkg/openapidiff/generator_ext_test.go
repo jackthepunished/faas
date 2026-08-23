@@ -33,9 +33,9 @@ const importedDoc3Users = `{
 // for matching rules.
 func TestGenerateFromApp_AllInputsPresent(t *testing.T) {
 	in := GenerateFromAppInputs{
-		AppID:        "app-1",
-		AccountID:    "acct-1",
-		ImportedDoc:  []byte(importedDoc3Users),
+		AppID:       "app-1",
+		AccountID:   "acct-1",
+		ImportedDoc: []byte(importedDoc3Users),
 		ObservedRoutes: []RouteRow{
 			{Route: "GET /v2/internal/metrics", Count: 7},
 		},
@@ -150,10 +150,10 @@ func TestGenerateFromApp_DegradedRoutes(t *testing.T) {
 // "degraded: rules_unavailable".
 func TestGenerateFromApp_DegradedRules(t *testing.T) {
 	in := GenerateFromAppInputs{
-		AppID:           "app-1",
-		AccountID:       "acct-1",
-		ImportedDoc:     []byte(importedDoc3Users),
-		ObservedRoutes:  []RouteRow{{Route: "GET /v2/x", Count: 1}},
+		AppID:          "app-1",
+		AccountID:      "acct-1",
+		ImportedDoc:    []byte(importedDoc3Users),
+		ObservedRoutes: []RouteRow{{Route: "GET /v2/x", Count: 1}},
 	}
 	_, meta, err := GenerateFromApp(in)
 	if err != nil {
@@ -228,9 +228,9 @@ func TestMergeObservedRoutes_SkipsMalformed(t *testing.T) {
 	spec := &Spec{Paths: map[string]*PathItem{}}
 	rows := []RouteRow{
 		{Route: "GET /v1/good"},
-		{Route: "__route_other__"},          // missing space → drop
-		{Route: ""},                          // empty → drop
-		{Route: " /v1/missing-method"},       // empty method → drop
+		{Route: "__route_other__"},     // missing space → drop
+		{Route: ""},                    // empty → drop
+		{Route: " /v1/missing-method"}, // empty method → drop
 	}
 	mergeObservedRoutes(spec, rows)
 	if len(spec.Paths) != 1 {
