@@ -75,6 +75,47 @@ const h2cIdleConnTimeout = 30 * time.Second
 // round-trip for the Upgrade dance (prior-knowledge saves it).
 const h2cDialTimeout = 30 * time.Second
 
+// ADR-127 §D2 (Layer 9) — outbound H2C client transport pins.
+// These values are intentionally identical across the three H2C
+// transports on the platform (newGuestH2CTransport here +
+// newStreamBridgeH2CTransport in pkg/vmmdgrpc/forward.go +
+// newInternalProxyH2CTransport in pkg/gateway/internal_proxy.go).
+// Co-located per-transport so each file is self-contained (no
+// shared import cycle risk); a future widening needs to touch
+// all three sites.
+//
+// The per-CONN concurrent-stream cap (MaxConcurrentStreams on
+// http2.Server) is a server-side knob and lands in commit 6
+// (srv listener hardeners); the client transport's
+// StrictMaxConcurrentStreams BELOW just controls whether the
+// client's RoundTrip blocks when the server's SETTINGS cap is
+// reached vs. opening a new TCP conn.
+const (
+	// h2cMaxReadFrameSize is the SETTINGS_MAX_FRAME_SIZE the
+	// client advertises — the largest frame (HEADERS, DATA,
+	// etc.) this transport is willing to receive from the
+	// peer. Default is 16384 (per RFC 7540 §6.5.2). Pinning
+	// to 1 MiB caps per-frame memory for the longest DoS
+	// scenario; values are bounded to [16k, 16M] by the
+	// http2 library.
+	h2cMaxReadFrameSize = 1 << 20 // 1 MiB
+	// h2cMaxHeaderListSize is the SETTINGS_MAX_HEADER_LIST_SIZE
+	// the client advertises — caps the HPACK-decoded header
+	// list this transport will accept from the peer. Default
+	// is 10 MiB; pinning to 1 MiB caps request-header memory
+	// for a malicious peer.
+	h2cMaxHeaderListSize = 1 << 20 // 1 MiB
+	// h2cMaxConcurrentStreams is the per-conn stream cap
+	// enforced on the inbound http2.Server (commit 6) AND
+	// mirrored here so the SETTINGS frame the client emits is
+	// well-formed. Setting it on the client transport directly
+	// isn't possible (the transport's only knob is
+	// StrictMaxConcurrentStreams, which is a bool flag) — the
+	// pin value is the symmetry contract, the per-conn cap
+	// lives on the server.
+	h2cMaxConcurrentStreams = 100
+)
+
 // handleH2CStream is the bridge-side prior-knowledge H2C
 // terminator (ADR-126 §Decision 1). The function is the per-
 // stream handler closure dispatched from newHandler when
@@ -264,6 +305,11 @@ func newGuestH2CTransport(guestIP string, guestPort uint16) *http2.Transport {
 		IdleConnTimeout: h2cIdleConnTimeout,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
+		// ADR-127 §D2 (Layer 9) — security pins. See const block
+		// above for the rationale of each value.
+		MaxReadFrameSize:          h2cMaxReadFrameSize,
+		MaxHeaderListSize:         h2cMaxHeaderListSize,
+		StrictMaxConcurrentStreams: true,
 	}
 }
 

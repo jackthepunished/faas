@@ -370,3 +370,50 @@ func TestNewHandler_DispatchesToH2COnEnv(t *testing.T) {
 	}
 	fmt.Println("dispatch: OK")
 }
+
+// TestNewGuestH2CTransport_SecurityPins (ADR-127 §D2, Layer 9) pins
+// the three const values used by newGuestH2CTransport so a future
+// widening touches this one place. The values are intentionally
+// identical across all three H2C transports on the platform:
+//
+//   - cmd/vmmd-stream-bridge/h2c_terminator.go::newGuestH2CTransport
+//   - pkg/vmmdgrpc/forward.go::newStreamBridgeH2CTransport
+//   - pkg/gateway/internal_proxy.go::newInternalProxyH2CTransport
+//
+// The per-CONN concurrent-stream cap (server-side
+// MaxConcurrentStreams on http2.Server) is wired in commit 6 on
+// the inbound listener. The client transport's
+// StrictMaxConcurrentStreams BELOW controls whether the client's
+// RoundTrip blocks when the server's SETTINGS cap is reached
+// vs. opening a new TCP conn (per x/net/http2 docs).
+func TestNewGuestH2CTransport_SecurityPins(t *testing.T) {
+	// The three pin values match x/net/http2.Transport's field
+	// constraints; bumping them is a deliberate operator action
+	// and lands in a future ADR. The test asserts the pinned
+	// values match the const block + the same values appear on
+	// the constructed transport.
+	if h2cMaxReadFrameSize != 1<<20 {
+		t.Errorf("h2cMaxReadFrameSize = %d, want %d (1 MiB per ADR-127 §D2)", h2cMaxReadFrameSize, 1<<20)
+	}
+	if h2cMaxHeaderListSize != 1<<20 {
+		t.Errorf("h2cMaxHeaderListSize = %d, want %d (1 MiB per ADR-127 §D2)", h2cMaxHeaderListSize, 1<<20)
+	}
+	if h2cMaxConcurrentStreams != 100 {
+		t.Errorf("h2cMaxConcurrentStreams = %d, want 100 (symmetry contract with server-side cap in commit 6)", h2cMaxConcurrentStreams)
+	}
+
+	// Build a real transport and confirm the consts land on its
+	// fields. x/net/http2.Transport pin fields are public; reading
+	// them back is the strongest possible invariant short of a
+	// wire-level capture.
+	tr := newGuestH2CTransport("10.0.0.2", 8080)
+	if tr.MaxReadFrameSize != h2cMaxReadFrameSize {
+		t.Errorf("transport.MaxReadFrameSize = %d, want %d", tr.MaxReadFrameSize, h2cMaxReadFrameSize)
+	}
+	if tr.MaxHeaderListSize != h2cMaxHeaderListSize {
+		t.Errorf("transport.MaxHeaderListSize = %d, want %d", tr.MaxHeaderListSize, h2cMaxHeaderListSize)
+	}
+	if !tr.StrictMaxConcurrentStreams {
+		t.Errorf("transport.StrictMaxConcurrentStreams = false, want true (block on server cap, don't dial new conn)")
+	}
+}
