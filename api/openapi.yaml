@@ -55,6 +55,13 @@ tags:
     description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
     description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo) per app.
+  - name: mirror
+    description: |
+      Traffic mirroring rules (issue #72 / ADR-124 / ADR-125). Each rule
+      pins a source deployment to a mirror deployment; the gateway
+      fans out a percentage of live traffic to the mirror VM without
+      influencing the source response. Plan caps: Pro = 1, Scale = 3,
+      Free/Hobby = 0.
   - name: deployments
     description: Deployments & build status.
   - name: openapi_discovery
@@ -5789,6 +5796,201 @@ paths:
   # shape on the wire is open-ended: the kind-specific schema
   # under components/schemas documents the per-kind shape; an
   # unknown property is rejected with 422.
+  /v1/apps/{slug}/mirrors:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [mirror]
+      operationId: listMirrorRules
+      summary: List every mirror rule for an app.
+      description: |
+        Per-app listing (issue #72 / ADR-124 PR-A2). At most
+        `Limits.MirrorTargetsPerApp` rows are returned (Free/Hobby = 0
+        blocked at the plan gate before reaching this surface; Pro = 1;
+        Scale = 3) — no pagination cursor in A2.
+      responses:
+        '200':
+          description: Mirror rules for this app, ordered by created_at ASC.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MirrorRuleListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [mirror]
+      operationId: createMirrorRule
+      summary: Create a mirror rule on an app.
+      description: |
+        Binds a source deployment to a mirror deployment for canary-shadow
+        comparison (issue #72 / ADR-125 / ADR-124 PR-A2). Both
+        deployments must be `live` and belong to the same app. Plan gate
+        fires 403 `plan_mirror_not_allowed` for Free/Hobby (cost: 1
+        mirror VM per request, billed per running second, capped at
+        `MirrorMaxLifetimeSeconds=5`). Per-app quota returns 422
+        `mirror_rule_quota_exceeded` once `Limits.MirrorTargetsPerApp`
+        is reached. The runtime dispatch (gateway goroutine, redaction,
+        schedd stamping) lands in PR-A3 — A2 stores the rule + emits
+        `mirror_rule.created` audit + pg_notify `kind="mirror"` so PR-A3
+        picks up the change within ~1s.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMirrorRuleRequest' }
+            example:
+              source_deployment_id: "0123456789abcdef0123456789abcdef"
+              mirror_deployment_id: "0123456789abcdef0123456789abcdf0"
+              percent: 100
+              include_body: false
+              redact_headers: [X-Tenant-Id]
+      responses:
+        '201':
+          description: Mirror rule created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MirrorRuleResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — Free/Hobby plan; mirror is Pro/Scale only.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `409 Conflict` — source or mirror deployment is not `live`.
+            Code `mirror_deployment_not_live`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — `percent` out of [0, 100]
+            (`invalid_mirror_percent`); source == mirror
+            (`mirror_source_target_same`); source/mirror on different
+            apps (`mirror_cross_app_mismatch`); per-app quota
+            exhausted (`mirror_rule_quota_exceeded`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/mirrors/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [mirror]
+      operationId: getMirrorRule
+      summary: Fetch one mirror rule by id.
+      description: |
+        Cross-account access returns 404 (silent), never 403 — the
+        IDOR posture matches traffic-split's deployment-id surface.
+      responses:
+        '200':
+          description: The mirror rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MirrorRuleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [mirror]
+      operationId: updateMirrorRule
+      summary: Patch a mirror rule.
+      description: |
+        Patch semantics — pointer fields distinguish "absent" from
+        "set to zero". `percent=0` is a legal value (disable-without-
+        removing); a missing `percent` keeps the existing value. The
+        plan gate is intentionally NOT enforced on update: a Pro
+        customer's existing rule survives an upgrade to Hobby; the
+        reaper disables the rule on the next read window so the mirror
+        VM doesn't keep waking.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMirrorRuleRequest' }
+            example:
+              percent: 25
+              enabled: false
+      responses:
+        '200':
+          description: The updated mirror rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MirrorRuleResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — `percent` out of [0, 100]
+            (`invalid_mirror_percent`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [mirror]
+      operationId: deleteMirrorRule
+      summary: Delete a mirror rule.
+      description: |
+        Idempotent at the wire level — second DELETE returns 404.
+        Cascades to `mirror_invocation_results` rows via FK ON DELETE
+        CASCADE (PR-A1 migration 00384_mirror_rules.sql). Emits
+        `mirror_rule.deleted` audit + pg_notify `kind="mirror"`.
+      responses:
+        '204':
+          description: Rule deleted (no body).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/mirrors/{id}/summary:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+      - in: query
+        name: window
+        required: false
+        schema:
+          type: string
+          enum: [1h, 24h, 7d]
+          default: 1h
+        description: "Summary window. Defaults to 1h. Window is the inclusive trailing seconds the comparison ledger is aggregated over."
+    get:
+      tags: [mirror]
+      operationId: getMirrorRuleSummary
+      summary: Aggregate mirror drift counts over a window.
+      description: |
+        Read-only aggregate. Source: `mirror_invocation_results` rows
+        whose `completed_at >= now - window_seconds`. Returns:
+        total invocations, status diff count, schema diff count, body
+        diff count, mean/p99 latency delta, crash count. PR-A2 returns
+        zeros (PR-A1's ledger has no writers until A3 ships the
+        runtime); post-A3 this is the dashboard widget's data source.
+      responses:
+        '200':
+          description: Aggregated drift counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MirrorSummaryResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — `window` is not one of
+            `1h | 24h | 7d` (`invalid_mirror_window`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/edge-rules:
     get:
       tags: [edge_rules]
@@ -14028,6 +14230,177 @@ components:
           maxLength: 128
           pattern: '^[A-Za-z][A-Za-z0-9-]*$'
           description: "Optional RFC 7230 token header name for per-request override (default `x-faas-budget-ms`). Empty = no override."
+
+    # ─── Mirror (issue #72 / ADR-125 / ADR-124 PR-A2) ──────────────────────
+
+    CreateMirrorRuleRequest:
+      description: |
+        Body for POST /v1/apps/{slug}/mirrors. Both deployments must
+        be `live` and belong to the same app. `include_body` defaults
+        to `false` (sensitive headers + bodies must be redacted or
+        disabled by default per spec hint). `redact_headers` is the
+        customer's additive list on top of the always-stripped list
+        (Authorization, Cookie, Set-Cookie, X-API-Key, Proxy-Authorization,
+        WWW-Authenticate — applied by PR-A3's redaction layer, NOT by
+        A2's storage layer).
+      type: object
+      required: [source_deployment_id, mirror_deployment_id]
+      properties:
+        source_deployment_id:
+          type: string
+          format: uuid
+          description: "Source deployment id (live; must belong to the slug's app)."
+          example: "0123456789abcdef0123456789abcdef"
+        mirror_deployment_id:
+          type: string
+          format: uuid
+          description: "Mirror deployment id (live; must belong to the slug's app; must differ from source)."
+          example: "0123456789abcdef0123456789abcdf0"
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 100
+          description: "Fan-out percent. 100 = mirror every customer request; lower = sampled shadow."
+          example: 100
+        include_body:
+          type: boolean
+          default: false
+          description: "If true, the comparison ledger captures request/response bodies (heaviest storage cost). Off by default."
+        redact_headers:
+          type: array
+          description: "Customer-supplied additional header names to redact on top of the always-stripped list (Authorization, Cookie, Set-Cookie, X-API-Key, Proxy-Authorization, WWW-Authenticate)."
+          items: { type: string }
+          default: []
+
+    UpdateMirrorRuleRequest:
+      description: |
+        Body for PATCH /v1/apps/{slug}/mirrors/{id}. All fields are
+        optional; pointer-style patches mean an absent key keeps the
+        existing value, while an explicit zero/empty overrides. Setting
+        `redact_headers` to `[]` clears the customer's list (leaving
+        only the always-stripped list).
+      type: object
+      properties:
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: "New fan-out percent in [0, 100]. 0 = rule stays but doesn't fire."
+        enabled:
+          type: boolean
+          description: "Set false to pause the rule without removing it."
+        include_body:
+          type: boolean
+          description: "Toggle body capture in the comparison ledger."
+        redact_headers:
+          type: array
+          description: "Replace the customer's redact list. Empty array clears it."
+          items: { type: string }
+
+    MirrorRuleResponse:
+      description: |
+        A persisted mirror rule (issue #72 / ADR-125 / ADR-124 PR-A2).
+        `always_stripped_headers` is rendered so the customer can audit
+        what the gateway guarantees regardless of their
+        `redact_headers` setting.
+      type: object
+      required:
+        - id
+        - account_id
+        - app_id
+        - source_deployment_id
+        - mirror_deployment_id
+        - percent
+        - enabled
+        - include_body
+        - redact_headers
+        - always_stripped_headers
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        source_deployment_id:
+          type: string
+          format: uuid
+        mirror_deployment_id:
+          type: string
+          format: uuid
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        enabled: { type: boolean }
+        include_body: { type: boolean }
+        redact_headers:
+          type: array
+          items: { type: string }
+        always_stripped_headers:
+          type: array
+          description: "Headers the gateway ALWAYS strips regardless of the customer's redact_headers setting."
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    MirrorRuleListResponse:
+      description: |
+        Wrapper for GET /v1/apps/{slug}/mirrors. Bounded by
+        `Limits.MirrorTargetsPerApp` (1-3) — no cursor in A2.
+      type: object
+      required: [rules, count]
+      properties:
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/MirrorRuleResponse' }
+        count:
+          type: integer
+          minimum: 0
+
+    MirrorSummaryResponse:
+      description: |
+        Aggregated mirror drift counts over a trailing window. PR-A2
+        returns zeros (PR-A1's ledger has no writers until A3 ships
+        the runtime dispatch); post-A3 this is the dashboard widget's
+        data source.
+      type: object
+      required:
+        - total_invocations
+        - status_diff_count
+        - schema_diff_count
+        - body_diff_count
+        - mean_latency_diff_ms
+        - p99_latency_diff_ms
+        - crash_count
+        - window_seconds
+      properties:
+        total_invocations:
+          type: integer
+          format: int64
+        status_diff_count:
+          type: integer
+          format: int64
+        schema_diff_count:
+          type: integer
+          format: int64
+        body_diff_count:
+          type: integer
+          format: int64
+        mean_latency_diff_ms:
+          type: integer
+          format: int64
+          description: "Signed: mirror - source. Positive = mirror slower."
+        p99_latency_diff_ms:
+          type: integer
+          format: int64
+        crash_count:
+          type: integer
+          format: int64
+        window_seconds:
+          type: integer
+          minimum: 1
+          description: "The window's length in seconds. Matches the requested `?window=` value."
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
