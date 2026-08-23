@@ -4627,10 +4627,26 @@ haveApp:
 	if h.requestTelemetry != nil {
 		var accountUUID, appUUID uuid.UUID
 		if app.AccountID != "" {
-			accountUUID, _ = uuid.Parse(app.AccountID)
+			if u, err := uuid.Parse(app.AccountID); err == nil {
+				accountUUID = u
+			} else if h.log != nil {
+				// Malformed account UUID is a backend bug — the
+				// recorder drops the row silently when the parse
+				// fails, so the only observable symptom is an
+				// empty telemetry table for the affected app.
+				// Warn so operators see the data plane is
+				// running but missing rows for this app.
+				h.log.Warn("request_telemetry: app.AccountID is not a valid UUID; row will be dropped",
+					"app_id", app.ID, "host", r.Host, "account_id_raw", app.AccountID)
+			}
 		}
 		if app.ID != "" {
-			appUUID, _ = uuid.Parse(app.ID)
+			if u, err := uuid.Parse(app.ID); err == nil {
+				appUUID = u
+			} else if h.log != nil {
+				h.log.Warn("request_telemetry: app.ID is not a valid UUID; row will be dropped",
+					"host", r.Host, "app_id_raw", app.ID)
+			}
 		}
 		r = withAppAndAccount(r, accountUUID, appUUID)
 	}

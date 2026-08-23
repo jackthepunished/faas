@@ -67,15 +67,60 @@ func (s *server) debugTelemetryListHandler(w http.ResponseWriter, r *http.Reques
 	if rows == nil {
 		rows = []sqlc.ListRequestTelemetryByAppRow{}
 	}
-	writeJSON(w, http.StatusOK, debugTelemetryListResponse{Requests: rows, Since: sinceDur.String()})
+	items := make([]api.DebugTelemetryRequestItem, len(rows))
+	for i, row := range rows {
+		items[i] = debugTelemetryRowToItem(row)
+	}
+	writeJSON(w, http.StatusOK, api.DebugTelemetryListResponse{
+		Requests: items,
+		Since:    sinceDur.String(),
+	})
 }
 
-// debugTelemetryListResponse — handler-local wire shape. Mirrors
-// invocationListResponse at handlers_invocations.go:473 — lives in
-// cmd/apid/ (not pkg/api/) because pkg/api can't import pkg/state.
-type debugTelemetryListResponse struct {
-	Requests []sqlc.ListRequestTelemetryByAppRow `json:"requests"`
-	Since    string                              `json:"since"`
+// debugTelemetryRowToItem maps a sqlc-generated row to the wire
+// DTO. Lives in cmd/apid/ because pkg/api cannot import pkg/state
+// (import cycle). The mapping handles pgtype.UUID → string
+// (hyphenated hex), pgtype.Timestamptz → RFC3339Nano, and
+// pgtype.Text (nullable trace_id) → *string.
+func debugTelemetryRowToItem(row sqlc.ListRequestTelemetryByAppRow) api.DebugTelemetryRequestItem {
+	item := api.DebugTelemetryRequestItem{
+		// pgtype.UUID -> hyphenated hex string. Falls back to "" when
+		// Valid=false so the JSON renders "" rather than the driver's
+		// base64 zero-bytes shape.
+		ID:           uuidFromPg(row.ID),
+		DeploymentID: uuidFromPg(row.DeploymentID),
+		Route:        row.Route,
+		Method:       row.Method,
+		Status:       int(row.Status),
+		LatencyMS:    int(row.LatencyMs),
+		ColdBoot:     row.ColdBoot,
+		ReceivedAt:   timeFromPg(row.ReceivedAt),
+	}
+	if row.TraceID.Valid {
+		s := row.TraceID.String
+		item.TraceID = &s
+	}
+	return item
+}
+
+// uuidFromPg renders a pgtype.UUID as the canonical hyphenated-hex
+// string. Empty when !Valid so the wire shows "" rather than the
+// driver's zero-bytes encoding.
+func uuidFromPg(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	return uuid.UUID(u.Bytes).String()
+}
+
+// timeFromPg renders a pgtype.Timestamptz as an RFC3339Nano string
+// (matches the format the rest of the apid surface uses for
+// timestamps). Empty when !Valid.
+func timeFromPg(t pgtype.Timestamptz) string {
+	if !t.Valid {
+		return ""
+	}
+	return t.Time.UTC().Format(time.RFC3339Nano)
 }
 
 // parseDebugSince parses the ?since= query param. Accepts Go

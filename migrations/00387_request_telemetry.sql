@@ -90,8 +90,17 @@ CREATE TABLE IF NOT EXISTS request_telemetry (
     account_id      uuid         NOT NULL,
     app_id          uuid         NOT NULL,
     deployment_id   uuid         NOT NULL,
-    route           text         NOT NULL,
-    method          text         NOT NULL,
+    -- route is the closed-enum route label admitted via routeLabelSet
+    -- (pkg/gateway/handler.go:4613-4626). The 256-char cap mirrors the
+    -- longest routeLabelSet admit format: method(3-7) + space +
+    -- path(<=248) — the bound prevents a misconfigured / hostile
+    -- upstream from blowing up the index with arbitrarily long strings.
+    route           text         NOT NULL CHECK (length(route) BETWEEN 1 AND 256),
+    -- method is the closed HTTP verb enum. Anything outside the set
+    -- is a writer bug — the recorder never emits verbs outside the
+    -- set; the CHECK is the last line of defense before the row lands
+    -- in the index.
+    method          text         NOT NULL CHECK (method IN ('GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS')),
     status          int          NOT NULL CHECK (status BETWEEN 100 AND 599),
     latency_ms      int          NOT NULL CHECK (latency_ms >= 0),
     cold_boot       boolean      NOT NULL DEFAULT false,

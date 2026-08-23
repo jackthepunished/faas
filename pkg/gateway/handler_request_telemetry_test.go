@@ -26,7 +26,7 @@ import (
 // makeTestRecorder constructs a production-shaped recorder with the
 // kill-switch off + a quiet logger.
 func makeTestRecorder() *requestTelemetryRecorder {
-	return NewRequestTelemetryRecorder(requestTelemetryConfig{
+	return NewRequestTelemetryRecorder(RequestTelemetryConfig{
 		Enabled:  true,
 		RingSize: 64,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
