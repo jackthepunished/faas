@@ -104,6 +104,16 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	//nolint:staticcheck // golang.org/x/net/http2/h2c is deprecated by the
+	// stdlib's http.Protocols.SetUnencryptedHTTP2 (Go 1.24+), but the
+	// bitfield-only Protocols API does not expose a way to pin
+	// per-protocol http2.Server knobs (MaxConcurrentStreams,
+	// MaxReadFrameSize, IdleTimeout, ReadIdleTimeout, PingTimeout).
+	// ADR-127 §D2 (Layer 9) is load-bearing on those knobs matching the
+	// client-side transport pins; dropping the wrapper would silently
+	// regress Layer 9. See the buildServer() docstring for the
+	// canonical rationale. Once stdlib exposes a Protocols.Get-style
+	// indirection, this annotation can be removed.
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -252,6 +262,16 @@ func main() {
 //     supported shape for both H1 and H2C paths.
 func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Server {
 	return &http.Server{
+		//nolint:staticcheck // ADR-127 §D2 (Layer 9) — the inner Handler is wrapped with
+		// h2c.NewHandler so the listener negotiates H2C prior-knowledge
+		// AND we get to pin per-protocol http2.Server knobs that
+		// stdlib's Protocols.SetUnencryptedHTTP2 API (Go 1.24+) does
+		// not expose. The handler argument is the newHandler closure;
+		// the http2.Server is config-only — the runtime server is the
+		// one stdlib builds inside h2c.NewHandler and attaches to the
+		// wrapped handler. See the import-block comment for the same
+		// rationale; once stdlib exposes a Protocols.Get indirection,
+		// both annotations can be removed in lockstep.
 		Handler: h2c.NewHandler(newHandler(guestIP, guestPort, deadline), &http2.Server{
 			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
 			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
