@@ -7528,6 +7528,94 @@ func (m *MemStore) MarkAllSnapshotsStaleByFCVersion(_ context.Context, currentVe
 	return n, nil
 }
 
+// MarkAllSnapshotsStaleByAppProtocol mirrors the SQL UPDATE: every
+// non-stale snapshot whose deployment's app.app_protocol ∈
+// appProtocols is flipped stale. ADR-127 §D1, Layer 6 (imaged F3
+// sweep). app_protocol=http1 snapshots are never affected. Empty
+// appProtocols is a no-op (matches the SQL behaviour: the UPDATE
+// runs against an empty set which matches nothing).
+func (m *MemStore) MarkAllSnapshotsStaleByAppProtocol(_ context.Context, appProtocols []string) (int64, error) {
+	if len(appProtocols) == 0 {
+		return 0, nil
+	}
+	allowed := make(map[string]struct{}, len(appProtocols))
+	for _, p := range appProtocols {
+		allowed[p] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	for i := range m.snapshots {
+		snap := m.snapshots[i]
+		if snap.Stale {
+			continue
+		}
+		dep, ok := m.deployments[snap.DeploymentID]
+		if !ok {
+			continue
+		}
+		app, ok := m.apps[dep.AppID]
+		if !ok {
+			continue
+		}
+		if _, match := allowed[app.AppProtocol]; match {
+			m.snapshots[i].Stale = true
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MarkSnapshotStaleByAppProtocol is the single-row mirror of
+// MarkAllSnapshotsStaleByAppProtocol. Returns ErrNotFound when no
+// snapshot matches the id AND the deployment's app.app_protocol
+// ∈ appProtocols. Empty inputs are errors (caller bug).
+func (m *MemStore) MarkSnapshotStaleByAppProtocol(_ context.Context, snapshotID string, appProtocols []string) error {
+	if len(appProtocols) == 0 {
+		return errors.New("memstore: MarkSnapshotStaleByAppProtocol: empty appProtocols set")
+	}
+	if snapshotID == "" {
+		return errors.New("memstore: MarkSnapshotStaleByAppProtocol: empty snapshotID")
+	}
+	allowed := make(map[string]struct{}, len(appProtocols))
+	for _, p := range appProtocols {
+		allowed[p] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.snapshots {
+		snap := m.snapshots[i]
+		if snap.ID != snapshotID {
+			continue
+		}
+		dep, ok := m.deployments[snap.DeploymentID]
+		if !ok {
+			return ErrNotFound
+		}
+		app, ok := m.apps[dep.AppID]
+		if !ok {
+			return ErrNotFound
+		}
+		if _, match := allowed[app.AppProtocol]; !match {
+			return ErrNotFound
+		}
+		if snap.Stale {
+			// Already stale — caller asked to mark stale, but it's
+			// already stale; treat as success (idempotent). The PgStore
+			// version behaves the same: the UPDATE flips no rows
+			// when stale=false predicate fails but RowsAffected=0
+			// returns ErrNotFound; the bulk path is different — see
+			// the bulk version's comment. For the single-row
+			// mirror we mirror the bulk behaviour: an already-stale
+			// row is still "found" by id.
+			return nil
+		}
+		m.snapshots[i].Stale = true
+		return nil
+	}
+	return ErrNotFound
+}
+
 // MarkOldSnapshotsStale flips the given IDs to stale=true (no-op if absent).
 // Used by the per-app "current + previous" enforcement in the GC.
 func (m *MemStore) MarkOldSnapshotsStale(_ context.Context, beforeSnapshotIDs []string) (int64, error) {
