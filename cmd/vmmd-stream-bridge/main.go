@@ -5,8 +5,8 @@
 // pkg/vmmdgrpc/forward.go:989) shell-scripts a `/dev/tcp` dial and
 // hard-codes HTTP/1.1 on the wire (forward.go:998). With the
 // gatewayd-public → gatewayd-internal hop now running H2C
-// (ADR-070 + PR #713/#719), the inner leg is the only plaintext
-// H1 hop in the chain. vmmd-stream-bridge replaces the shell
+// (ADR-070 + PR #713/#719), the inner leg is the last plaintext
+// hop in the chain. vmmd-stream-bridge replaces the shell
 // bridge with a small Go binary that:
 //
 //  1. Listens on a unix socket inside the host netns (the binary
@@ -14,11 +14,28 @@
 //     per-instance netns; ADR-009's strict-netns invariant is
 //     preserved by the spawn shape, not the binary itself).
 //  2. Speaks H2C on that socket (cleartext HTTP/2, no TLS).
-//  3. For each inbound H2C request, opens an HTTP/1.1 connection to
-//     the guest at 10.0.0.2:<port>, writes the request line +
-//     headers + chunked transfer encoding from env-supplied
-//     `FAAS_BRIDGE_*` vars, bridges the body bidirectionally, and
-//     reads back the chunked-encoded response.
+//  3. For each inbound H2C request, opens a fresh TCP connection
+//     to the guest at 10.0.0.2:<port> and bridges the envelope:
+//
+//     - app_protocol=http1 (default) →
+//
+//     HTTP/1.1 + chunked transfer encoding (legacy v1 contract,
+//     matches the shell bridge so guest-side net/http sees the
+//     same envelope). See handleH1Stream in main.go.
+//
+//     - app_protocol ∈ {http2, grpc} (ADR-126, G19) →
+//
+//     HTTP/2 prior-knowledge frames end-to-end. The bridge opens
+//     a guest-side H2 connection, sends HEADERS + DATA frames
+//     mirroring the inbound request, and forwards response H2
+//     frames (including trailers for gRPC) verbatim. See
+//     h2c_terminator.go::handleH2CStream.
+//
+//     The framing selection is per-stream via the
+//     FAAS_BRIDGE_PROTOCOL env var (read in framing.go).
+//     Operators can force H1 for any app with
+//     FAAS_BRIDGE_PROTOCOL=h1 (the surgical rollback per
+//     ADR-126 §Decision 7).
 //
 // v2 vs v1: v1 (the shell bridge) is the production default until
 // `make metal-lima` confirms H2C end-to-end via the e2e test
@@ -201,137 +218,163 @@ func main() {
 //	FAAS_BRIDGE_METHOD  + FAAS_BRIDGE_URL form the request line
 //	FAAS_BRIDGE_HOST    is the Host header
 //	FAAS_BRIDGE_HEADERS contributes the rest (Content-Length dropped)
+//	FAAS_BRIDGE_PROTOCOL selects the per-stream framing (ADR-126)
+//	                    → "h1" (legacy, default) or "h2c" (new)
+//
+// Per-stream framing dispatch (ADR-126 §Decision 1):
+//
+//   - FAAS_BRIDGE_PROTOCOL=h1 (default; app_protocol=http1) →
+//     handleH1Stream — unchanged from the v2 cutover (PR #750).
+//   - FAAS_BRIDGE_PROTOCOL=h2c (app_protocol in {http2, grpc}) →
+//     handleH2CStream — new H2C terminator (h2c_terminator.go)
+//     that originates HTTP/2 prior-knowledge frames to the guest.
 //
 // We do NOT keep a long-lived guest conn per H2C stream. The
-// guest at 10.0.0.2:<port> is HTTP/1.1 and a long-lived conn
+// guest at 10.0.0.2:<port> is either HTTP/1.1 (legacy) or
+// HTTP/2 prior-knowledge (new H2C path) and a long-lived conn
 // would have to serialize requests through it; the simpler shape
 // is "one H2C request = one guest dial." A future optimisation
-// (HTTP/1.1 keep-alive multiplexing on the guest side) is out of
-// scope for the cutover.
+// (HTTP/2 stream multiplexing across N guest streams on one conn)
+// is out of scope for the cutover.
 func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithDeadline(r.Context(), deadline)
-		defer cancel()
-
-		method := os.Getenv("FAAS_BRIDGE_METHOD")
-		if method == "" {
-			method = "GET"
-		}
-		url := os.Getenv("FAAS_BRIDGE_URL")
-		if url == "" {
-			url = "/"
-		}
-		host := os.Getenv("FAAS_BRIDGE_HOST")
-		extraHeaders := parseHeaders(os.Getenv("FAAS_BRIDGE_HEADERS"))
-
-		// Defense-in-depth CR/LF sanitization. vmmd already strips
-		// CR/LF in streamBridgeEnv (pkg/vmmdgrpc/forward.go), but
-		// the bridge is a stand-alone binary that may be invoked
-		// from other surfaces (tests, future operator override,
-		// `FAAS_BRIDGE_*=value` env-set on a misconfigured host).
-		// Stripping again here means a hostile or buggy caller
-		// cannot smuggle a header line into the trusted inner
-		// envelope via FAAS_BRIDGE_HOST / FAAS_BRIDGE_HEADERS.
-		// CR/LF are illegal in HTTP/1.1 field-values (RFC 9110
-		// §5.5); stripping is lossless for legitimate input.
-		method = sanitizeCRLF(method)
-		url = sanitizeCRLF(url)
-		host = sanitizeCRLF(host)
-		for i := range extraHeaders {
-			extraHeaders[i].Name = sanitizeCRLF(extraHeaders[i].Name)
-			extraHeaders[i].Value = sanitizeCRLF(extraHeaders[i].Value)
-		}
-
-		d := net.Dialer{Timeout: dialTimeout}
-		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("dial guest: %v", err), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		// ctx.Done() watcher: close the guest conn when the H2C
-		// request is cancelled so the in-flight io.Copy(s) unblock
-		// with `use of closed network connection` rather than
-		// hanging on a dead guest. The deferred conn.Close() above
-		// is the safety net; this goroutine is the eager path.
-		stopWatch := make(chan struct{})
-		defer func() { close(stopWatch) }()
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = conn.Close()
-			case <-stopWatch:
-			}
-		}()
-
-		// Write the H1 request line + headers + chunked framing
-		// before the body. Mirrors the v1 shell script output
-		// (forward.go:998-1024) byte-for-byte modulo path-style
-		// differences; the guest's net/http must see the same
-		// envelope to handle the request correctly.
-		if err := writeH1RequestHead(conn, method, url, host, guestIP, guestPort, extraHeaders); err != nil {
-			http.Error(w, fmt.Sprintf("write request head: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		// Bridge request body → guest, in chunked-encoded chunks.
-		// The bridge writes the chunk-size line, then the bytes,
-		// then a CRLF, repeating until r.Body returns EOF, then a
-		// final "0\r\n\r\n" terminator. The guest's net/http
-		// stack decodes the encoding transparently.
-		bodyErr := make(chan error, 1)
-		go func() {
-			bodyErr <- writeChunkedBody(conn, r.Body)
-		}()
-
-		// Bound ONLY the response-head read at readHeaderTimeout so
-		// a wedged guest doesn't hang the H2C stream waiting for the
-		// first byte. The streaming body io.Copy below MUST run with
-		// no conn deadline so SSE / WS / long-poll responses can
-		// stream past 30 s; that bound is the ctx deadline (24 h by
-		// default) which the watcher goroutine respects via Close.
-		_ = conn.SetReadDeadline(time.Now().Add(readHeaderTimeout))
-		br := newBufioReader(conn)
-		resp, err := http.ReadResponse(br, r)
-		_ = conn.SetReadDeadline(time.Time{})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("read guest response: %v", err), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		// Mirror guest response headers back to the H2C caller.
-		// Chunked-decoded on the way out so the H2C client sees
-		// the same body semantics as the v1 forward.go path.
-		for k, vs := range resp.Header {
-			for _, v := range vs {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-
-		// Drain the body goroutine best-effort. The handler is
-		// returning; if writeChunkedBody hasn't finished (e.g.
-		// the guest stopped reading the request body and r.Body
-		// never reaches EOF), don't block here — the ctx watcher
-		// has already closed conn, which will unblock r.Body.Read
-		// with `use of closed network connection` and the body
-		// goroutine will exit on its own. We only wait briefly
-		// so a clean finish logs any encoding error to stderr.
-		select {
-		case err := <-bodyErr:
-			if err != nil && !errors.Is(err, io.EOF) {
-				// Best-effort: the response is already written,
-				// so we can't change the status. Log to stderr.
-				fmt.Fprintf(os.Stderr, "writeChunkedBody: %v\n", err)
-			}
-		case <-ctx.Done():
-			// Body goroutine still running; the ctx watcher
-			// already closed conn — let it finish on its own.
+		framing := currentBridgeFraming()
+		switch framing {
+		case framingH2C:
+			handleH2CStream(w, r, guestIP, guestPort, deadline)
+		default:
+			handleH1Stream(w, r, guestIP, guestPort, deadline)
 		}
 	})
+}
+
+// handleH1Stream is the legacy H1+chunked framing path (today's
+// contract verbatim, refactored from newHandler per ADR-126 §Decision 1).
+// app_protocol=http1 (default) rides this path; setting
+// FAAS_BRIDGE_PROTOCOL=h1 on the bridge process forces it for
+// any app_protocol (the surgical rollback switch).
+func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, guestPort uint16, deadline time.Time) {
+	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	defer cancel()
+
+	method := os.Getenv("FAAS_BRIDGE_METHOD")
+	if method == "" {
+		method = "GET"
+	}
+	url := os.Getenv("FAAS_BRIDGE_URL")
+	if url == "" {
+		url = "/"
+	}
+	host := os.Getenv("FAAS_BRIDGE_HOST")
+	extraHeaders := parseHeaders(os.Getenv("FAAS_BRIDGE_HEADERS"))
+
+	// Defense-in-depth CR/LF sanitization. vmmd already strips
+	// CR/LF in streamBridgeEnv (pkg/vmmdgrpc/forward.go), but
+	// the bridge is a stand-alone binary that may be invoked
+	// from other surfaces (tests, future operator override,
+	// `FAAS_BRIDGE_*=value` env-set on a misconfigured host).
+	// Stripping again here means a hostile or buggy caller
+	// cannot smuggle a header line into the trusted inner
+	// envelope via FAAS_BRIDGE_HOST / FAAS_BRIDGE_HEADERS.
+	// CR/LF are illegal in HTTP/1.1 field-values (RFC 9110
+	// §5.5); stripping is lossless for legitimate input.
+	method = sanitizeCRLF(method)
+	url = sanitizeCRLF(url)
+	host = sanitizeCRLF(host)
+	for i := range extraHeaders {
+		extraHeaders[i].Name = sanitizeCRLF(extraHeaders[i].Name)
+		extraHeaders[i].Value = sanitizeCRLF(extraHeaders[i].Value)
+	}
+
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("dial guest: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	// ctx.Done() watcher: close the guest conn when the H2C
+	// request is cancelled so the in-flight io.Copy(s) unblock
+	// with `use of closed network connection` rather than
+	// hanging on a dead guest. The deferred conn.Close() above
+	// is the safety net; this goroutine is the eager path.
+	stopWatch := make(chan struct{})
+	defer func() { close(stopWatch) }()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
+
+	// Write the H1 request line + headers + chunked framing
+	// before the body. Mirrors the v1 shell script output
+	// (forward.go:998-1024) byte-for-byte modulo path-style
+	// differences; the guest's net/http must see the same
+	// envelope to handle the request correctly.
+	if err := writeH1RequestHead(conn, method, url, host, guestIP, guestPort, extraHeaders); err != nil {
+		http.Error(w, fmt.Sprintf("write request head: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	// Bridge request body → guest, in chunked-encoded chunks.
+	// The bridge writes the chunk-size line, then the bytes,
+	// then a CRLF, repeating until r.Body returns EOF, then a
+	// final "0\r\n\r\n" terminator. The guest's net/http
+	// stack decodes the encoding transparently.
+	bodyErr := make(chan error, 1)
+	go func() {
+		bodyErr <- writeChunkedBody(conn, r.Body)
+	}()
+
+	// Bound ONLY the response-head read at readHeaderTimeout so
+	// a wedged guest doesn't hang the H2C stream waiting for the
+	// first byte. The streaming body io.Copy below MUST run with
+	// no conn deadline so SSE / WS / long-poll responses can
+	// stream past 30 s; that bound is the ctx deadline (24 h by
+	// default) which the watcher goroutine respects via Close.
+	_ = conn.SetReadDeadline(time.Now().Add(readHeaderTimeout))
+	br := newBufioReader(conn)
+	resp, err := http.ReadResponse(br, r)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read guest response: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Mirror guest response headers back to the H2C caller.
+	// Chunked-decoded on the way out so the H2C client sees
+	// the same body semantics as the v1 forward.go path.
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+
+	// Drain the body goroutine best-effort. The handler is
+	// returning; if writeChunkedBody hasn't finished (e.g.
+	// the guest stopped reading the request body and r.Body
+	// never reaches EOF), don't block here — the ctx watcher
+	// has already closed conn, which will unblock r.Body.Read
+	// with `use of closed network connection` and the body
+	// goroutine will exit on its own. We only wait briefly
+	// so a clean finish logs any encoding error to stderr.
+	select {
+	case err := <-bodyErr:
+		if err != nil && !errors.Is(err, io.EOF) {
+			// Best-effort: the response is already written,
+			// so we can't change the status. Log to stderr.
+			fmt.Fprintf(os.Stderr, "writeChunkedBody: %v\n", err)
+		}
+	case <-ctx.Done():
+		// Body goroutine still running; the ctx watcher
+		// already closed conn — let it finish on its own.
+	}
 }
 
 // writeH1RequestHead writes the HTTP/1.1 request line + headers
@@ -426,44 +469,10 @@ func writeChunkedBody(dst io.Writer, src io.Reader) error {
 	}
 }
 
-// headerEntry is one (name, value) pair from FAAS_BRIDGE_HEADERS.
-type headerEntry struct {
-	Name  string
-	Value string
-}
-
-// parseHeaders splits a newline-separated `k=v\nk=v` string into
-// header entries. Newline is the separator because HTTP/1.1 field-
-// values may not contain CR or LF (RFC 9110 §5.5 — obs-fold was
-// removed by the obsoletion of RFC 7230). Comma is NOT a safe
-// separator: real headers like `Accept: text/html, application/json`
-// and `Cache-Control: no-cache, no-store` carry commas in their
-// VALUES. Split on the FIRST `=` so values may also contain `=`.
-// Empty names are dropped. Names are returned verbatim (the
-// vmmd caller already lower-cased or canon-cased them via the
-// original `textproto.MIMEHeader`); we pass through unchanged
-// since the H1 wire is case-insensitive on header names.
-func parseHeaders(s string) []headerEntry {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, "\n")
-	out := make([]headerEntry, 0, len(parts))
-	for _, p := range parts {
-		if p == "" {
-			continue
-		}
-		eq := strings.IndexByte(p, '=')
-		if eq <= 0 {
-			continue
-		}
-		out = append(out, headerEntry{
-			Name:  p[:eq],
-			Value: p[eq+1:],
-		})
-	}
-	return out
-}
+// headerEntry + parseHeaders + sanitizeCRLF moved to framing.go
+// (ADR-126 §Decision 1) so the h1 and h2c framing paths share one
+// parser + one CR/LF strip — single source of truth for the
+// trusted inner envelope sanitization.
 
 // newBufioReader is a tiny indirection so future tuning of the
 // buffer size (currently stdlib default 4096) is one edit. The
@@ -471,32 +480,6 @@ func parseHeaders(s string) []headerEntry {
 // small bodies per request; stdlib default is fine.
 func newBufioReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
-}
-
-// sanitizeCRLF strips CR, LF, and NUL bytes from a string destined
-// for the H1 wire. Defense-in-depth: vmmd already strips these in
-// streamBridgeEnv (pkg/vmmdgrpc/forward.go), but the bridge is a
-// stand-alone binary that may be invoked from other surfaces (tests,
-// future operator override, misconfigured host env). CR/LF in a
-// field-value would terminate the header line and smuggle a new
-// header into the trusted inner envelope (CRLF injection); NUL
-// truncates env-var values at the OS level so the bridge would
-// silently see only the prefix. Lossless for legitimate input —
-// CR/LF/NUL are illegal in HTTP/1.1 field-values (RFC 9110 §5.5).
-func sanitizeCRLF(s string) string {
-	if s == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\r' || c == '\n' || c == 0 {
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
 }
 
 // parseDeadline accepts either an RFC3339 timestamp or a Go
