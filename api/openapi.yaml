@@ -12436,7 +12436,15 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          default: block
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Resolved mode; always present on read. Empty on read
+            would be a database invariant violation.
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -12470,7 +12478,14 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          default: block
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Omitted == 'block' (the SQL-side default).
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -12499,6 +12514,12 @@ components:
           items: { type: string }
         priority: { type: integer, minimum: 0, maximum: 10000 }
         enabled: { type: boolean }
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Omit (do not send) to leave the column untouched.
         action:
           description: 'Replaces the jsonb column whole.'
           oneOf:
@@ -12712,13 +12733,19 @@ components:
           type: string
           enum: [block, observe, warn]
           default: block
+          deprecated: true
           description: |
-            How the gateway handles a schema mismatch. `block` rejects
-            with 422 (the strictest mode; preserves the pre-2026
-            behaviour). `observe` counts via the metric and proxies
-            normally. `warn` does the same and stamps
-            `X-Validation-Warning: <rule_id>` on the response. An
-            empty / omitted value is coerced to `block` at the
+            DEPRECATED (ADR-128 D2). Moved to top-level
+            `EdgeRuleResponse.validate_mode` /
+            `CreateEdgeRuleRequest.validate_mode` /
+            `UpdateEdgeRuleRequest.validate_mode`. Retained on
+            the action body for the back-compat read window.
+            How the gateway handles a schema mismatch. `block`
+            rejects with 422 (the strictest mode; preserves the
+            pre-2026 behaviour). `observe` counts via the metric
+            and proxies normally. `warn` does the same and stamps
+            `X-Validation-Warning: <rule_id>` on the response.
+            An empty / omitted value is coerced to `block` at the
             gateway-side handler.
 
     EdgeRuleCacheAction:

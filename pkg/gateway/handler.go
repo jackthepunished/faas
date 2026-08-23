@@ -2709,7 +2709,14 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 			reason = reasonOther
 		}
 		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleValidateFailure(mode, reason)
+			// ADR-128 §5: pass appID + ruleID so the
+			// gateway_validate_failures_total counter can
+			// localize failures to a specific rule on a
+			// specific app. The rule_id label is admitted
+			// through ruleLabelSet (cap 256 per app;
+			// overflow → "__other__") so the Prometheus
+			// series set stays bounded.
+			h.metrics.ObserveEdgeRuleValidateFailure(rule.AppID, rule.ID, mode, reason)
 		}
 		switch mode {
 		case api.ValidateModeObserve:
