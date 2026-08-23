@@ -36,15 +36,28 @@ Everything else is mechanical.
   query, swap `column_name` for `constraint_name` and table for
   `table_constraints`. A `failed app_protocol` row in the bridge
   log line is the warning sign the CHECK did not run.
-- **Base image at `FAAS_BASE_IMAGE_VERSION = "v1"`.** Confirm with:
+- **Base image at `FAAS_BASE_IMAGE_VERSION = "v1"`.** The constant
+  lives at `pkg/fcvm/snapshot.go::FAAS_BASE_IMAGE_VERSION` — it is a
+  Go const, **not** a database row, so there is no
+  `apid_settings.FAAS_BASE_IMAGE_VERSION` to query. Confirm via one
+  of:
   ```sh
-  psql -tA "$FAAS_DATABASE_URL" \
-    -c "select value from apid_settings where key='FAAS_BASE_IMAGE_VERSION';"
-  # expect: v1
+  # Option A — grep the deployed vmmd binary (Go consts are encoded
+  # in the binary data section as ASCII strings).
+  strings /usr/bin/faas-vmmd | grep -F 'FAAS_BASE_IMAGE_VERSION = "'
+  # expect: FAAS_BASE_IMAGE_VERSION = "v1"
+
+  # Option B — read the source bundle if the operator has it.
+  grep -r 'FAAS_BASE_IMAGE_VERSION =' pkg/fcvm/snapshot.go
+  # expect: const FAAS_BASE_IMAGE_VERSION = "v1"
+
+  # Option C — check the deb/rpm package version. Tag >= 0.7.7-faas-
+  # g19.1-bridge-hardening ships "v1"; pre-v1 tags ship "" or omit
+  # the const entirely.
+  dpkg -l faas-vmmd | awk '/^ii/ {print $3}'
   ```
-  The constant lives at `pkg/fcvm/snapshot.go::FAAS_BASE_IMAGE_VERSION`.
   Pre-v1 images speak H1 only; promoting the bridge default with
-  pre-v1 images leaves `app_protocol ∈ {http2, grpc}` apps with a
+  pre-v1 images leaves `app_protocol in {http2, grpc}` apps with a
   wire-shape downgrade.
 - **Grafana + Prometheus provisioning live.** `FaasBridgeFramingMismatch`
   alert rule must be in `deploy/ansible/roles/prometheus/files/bridge.rules.yml`

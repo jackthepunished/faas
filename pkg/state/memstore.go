@@ -7601,13 +7601,18 @@ func (m *MemStore) MarkSnapshotStaleByAppProtocol(_ context.Context, snapshotID 
 		}
 		if snap.Stale {
 			// Already stale — caller asked to mark stale, but it's
-			// already stale; treat as success (idempotent). The PgStore
-			// version behaves the same: the UPDATE flips no rows
-			// when stale=false predicate fails but RowsAffected=0
-			// returns ErrNotFound; the bulk path is different — see
-			// the bulk version's comment. For the single-row
-			// mirror we mirror the bulk behaviour: an already-stale
-			// row is still "found" by id.
+			// already stale; treat as success (idempotent). The
+			// PgStore version (pkg/state/pgstore.go:9807) behaves
+			// the same: its UPDATE has no `s.stale = false`
+			// predicate, so a no-op flip still reports
+			// RowsAffected=1 and returns nil; the ErrNotFound path
+			// fires only when no row matches the id + app_protocol
+			// triple. The bulk path (MarkAllSnapshotsStaleByAppProtocol)
+			// DOES carry `and s.stale = false` so its row-count is
+			// the count of *newly* stale-marked rows; the single-row
+			// mirror here matches MemStore semantics, not bulk
+			// semantics, because the bulk return is a count and
+			// the single-row return is a found/not-found bool.
 			return nil
 		}
 		m.snapshots[i].Stale = true
