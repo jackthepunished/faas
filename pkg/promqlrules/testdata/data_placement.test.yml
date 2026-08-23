@@ -245,3 +245,73 @@ tests:
               summary: "Data-placement probe p95 wall-clock > 1s for 10m"
               description: "Aggregate per-probe wall-clock (TCP+TLS handshake) exceeded 1s p95 for 10m. GLOBAL signal — `meterd_data_upstream_probe_duration_seconds` is an unlabelled Histogram (pkg/wire/metrics.go:2349-2353), so the alert does not distinguish which region or kind is degraded. Cross-reference the per-(kind, region) `FaasUpstreamRttDegraded` alerts for the same window to localize; if those are quiet, the slowness is not connectivity-bound. The handshake payload is bounded by the customer's CA chain, not our control — a slow probe is overwhelmingly a network condition, not a customer cert issue. If the ratio of tls_handshake outcomes also rises, treat it as a TLS regression and escalate."
               runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
+
+  # ──────────────────────────────────────────────────────────────────
+  # issue #955 — closes the gap left by
+  # FaasUpstreamProbeHighFailureRate (5% over 10m, timeout/refused
+  # subvocab). Two new alerts across the FULL outcome vocabulary:
+  #   - FaasUpstreamProbeOutcomeDegraded (page, 50% non-ok over 5m)
+  #   - FaasUpstreamProbeOutcomeSilent (info, 0 ok over 30m)
+  #
+  # Synthetic-fixture mechanics: outcome is a closed vocab
+  # {ok, timeout, refused, tls_handshake, dns, unreachable}
+  # (ADR-098 §9.A). The metric has NO host_redacted_hash label
+  # (§11 invariant — only the rtt histogram carries host identity).
+  # Outcome is the ONLY label; firing multiplies across that label
+  # set (Prometheus's `sum without (outcome)` aggregator).
+  # ──────────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "60% non-ok probes for 6m → FaasUpstreamProbeOutcomeDegraded fires"
+    input_series:
+      # 30 ok + 60 timeout per 30s step over 50 steps (25m).
+      # ratio = 60 / 90 = 0.667 > 0.5 → fires after `for: 5m`.
+      - series: 'meterd_data_upstream_probes_total{outcome="ok"}'
+        values: '0+30x51'
+      - series: 'meterd_data_upstream_probes_total{outcome="timeout"}'
+        values: '0+60x51'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasUpstreamProbeOutcomeDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: meterd
+              family: probe_outcome
+            exp_annotations:
+              summary: "Data-placement probe non-ok ratio > 50 % for 5m"
+              description: "More than 50 % of the data-placement probe loop's outcomes are non-ok for 5m — across all outcome values (timeout, refused, tls_handshake, dns, unreachable). The chooser bias is losing signal; the legacy fallthrough may be sending customer traffic to a degraded upstream. Cross-reference FaasUpstreamProbeHighFailureRate for the timeout/refused subvocab only, and FaasUpstreamRttDegraded for the per-(kind, region) localization."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamProbeOutcomeDegraded.md"
+
+  - interval: 30s
+    name: "ok rate 0 for 30m → FaasUpstreamProbeOutcomeSilent fires (fleet-wide)"
+    input_series:
+      # The counter is fleet-wide — only `outcome` is a label
+      # (pkg/wire/metrics.go:2554). ok=0 means the probe loop
+      # has stopped producing successful outcomes for 30m. Other
+      # outcomes keep rising so the poller is alive — distinguishes
+      # Path A (poller alive, all probes fail) from Path B (poller
+      # stalled — would have all outcomes at 0).
+      - series: 'meterd_data_upstream_probes_total{outcome="ok"}'
+        # 128 samples × 30s = 64m — long enough for the [30m]
+        # rate window to fill by eval_time=30m AND for the alert's
+        # `for: 30m` clause to be satisfied (expr must be true for
+        # the entire 30m window before eval_time).
+        values: '0x80'
+      - series: 'meterd_data_upstream_probes_total{outcome="timeout"}'
+        # Poller alive — non-ok probes still landing.
+        values: '0+3x80'
+      - series: 'meterd_data_upstream_probes_total{outcome="refused"}'
+        values: '0+2x80'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: FaasUpstreamProbeOutcomeSilent
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              component: meterd
+              family: probe_outcome
+              outcome: ok
+            exp_annotations:
+              summary: "Data-placement probe loop silent for 30m"
+              description: "Zero ok-probes landed over 30m. The probe loop has gone silent — typically a stalled meterd poller, a missing upstream manifest, or a complete outbound network partition. Per-(kind, region) localization is not possible here because the counter is fleet-wide (the canonical cardinality-bounded shape — pkg/wire/metrics.go:2554). To localize, cross-reference `FaasUpstreamRttDegraded` for the per-(kind, region) connectivity view (the histogram carries the labels the counter doesn't). This is informational (severity info) until the silent condition chains with `FaasUpstreamRttDegraded`; at that point the degradation is connectivity-bound rather than poller-bound. Runbook at docs/runbooks/FaasUpstreamProbeOutcomeSilent.md."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamProbeOutcomeSilent.md"
