@@ -1146,14 +1146,18 @@ groups:
       # ─────────────────────────────────────────────────────────────────
       - record: vmmd_cold_boot_ratio
         expr: |
-          clamp_min(
-              rate(vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}[5m]),
-              0
+          sum without (tier) (
+              clamp_min(
+                  rate(vmmd_wake_snapshot_tier_total{tier="cold_boot_fallback"}[5m]),
+                  0
+              )
           )
           /
-          clamp_min(
-              rate(vmmd_wake_snapshot_tier_total[5m]),
-              0.001
+          sum without (tier) (
+              clamp_min(
+                  rate(vmmd_wake_snapshot_tier_total[5m]),
+                  0.001
+              )
           )
 
       - alert: FaasColdBootRatioHigh
