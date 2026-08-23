@@ -35,6 +35,18 @@ run. A box running tailscale today can switch to wireguard by
 re-running the role with `-e faas_overlay_provider=wireguard`
 once the operator has provisioned keys + peers.
 
+## Private endpoint names
+
+The manifest's `private_dns.mode: managed_hosts` adapter is provider-neutral.
+The bootstrap discovery play gathers `faas_private_dns_address` for every
+inventory host from `faas_private_address` or, by default,
+`ansible_default_ipv4.address`. The role then writes the generated fleet and
+mTLS aliases into the managed `FAAS MANIFEST PRIVATE ENDPOINTS` block in
+`/etc/hosts` and verifies that each name resolves. A provider with a public
+default route supplies `faas_private_address` in its generated inventory; no
+daemon configuration or committed manifest IPs need to change. Public DNS is
+not consulted for this path.
+
 ## Files
 
 ```

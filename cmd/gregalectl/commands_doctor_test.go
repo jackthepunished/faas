@@ -29,9 +29,12 @@ func makeTempSecretsDir(t *testing.T) string {
 
 func writeSecretFile(t *testing.T, path string, body []byte, mode string) {
 	t.Helper()
-	perm := mustParsePerm(mode)
-	if err := os.WriteFile(path, body, perm); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	perm, err := parsePerm(mode)
+	if err != nil {
+		t.Fatalf("parse mode %q: %v", mode, err)
+	}
+	if werr := os.WriteFile(path, body, perm); werr != nil {
+		t.Fatalf("write %s: %v", path, werr)
 	}
 }
 
@@ -150,5 +153,69 @@ func TestCheckSecrets_SessionKeyWrongLength(t *testing.T) {
 	}
 	if !gotLengthErr {
 		t.Errorf("session.key wrong-length finding not emitted (got: %+v)", findings)
+	}
+}
+
+// TestParsePerm_NeverPanics pins the load-bearing contract that
+// replaced the literal panics at commands_doctor.go:1534,1538
+// (Cluster E1 of the gregalectl mega-PR). The doctor's
+// "never panic, always emit a finding" discipline depends on
+// parsePerm returning (mode, err) so a malformed TOML config or
+// a typo'd --want flag cannot signal-kill the process.
+//
+// The test runs each input in a recover() guard so a regression
+// to a panic fails the test loudly rather than crashing the
+// whole test binary.
+func TestParsePerm_NeverPanics(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"too_short_3", "040"},
+		{"too_long_5", "04400"},
+		{"non_octal_digit", "0499"},
+		{"non_octal_letter", "040a"},
+		{"all_letters", "abcd"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parsePerm(%q) PANICKED with %v; the doctor must not panic on bad perm input", c.in, r)
+				}
+			}()
+			got, err := parsePerm(c.in)
+			if err == nil {
+				t.Errorf("parsePerm(%q) returned mode=%o with err=nil, want non-nil err", c.in, got)
+			}
+		})
+	}
+}
+
+// TestParsePerm_HappyPath pins the success path that the WARN
+// finding emission at commands_doctor.go:checkSecrets depends
+// on. A regression that returned zero on every input would
+// silently bypass the doctor's mode check entirely.
+func TestParsePerm_HappyPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want os.FileMode
+	}{
+		{"0400", 0o400},
+		{"0440", 0o440},
+		{"0644", 0o644},
+		{"0700", 0o700},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, err := parsePerm(c.in)
+			if err != nil {
+				t.Fatalf("parsePerm(%q) err = %v, want nil", c.in, err)
+			}
+			if got != c.want {
+				t.Errorf("parsePerm(%q) = %o, want %o", c.in, got, c.want)
+			}
+		})
 	}
 }

@@ -131,13 +131,13 @@ func NewExecCosignVerifier(cfg CosignVerifyConfig) *ExecCosignVerifier {
 //	    --certificate-identity-regexp "$RE" \
 //	    --certificate-oidc-issuer "$ISSUER" \
 //	    --bundle "$SIG" \
-//	    --insecure-ignore-tlog          (PR-A: TODO remove with Rekor trust root)
 //	    "$TARBALL"
 //
-// PR-A's cosign call uses --insecure-ignore-tlog: the operator's
-// host doesn't yet trust Rekor's transparency-log public key. That
-// trust root is PR-B + the spec-side SBoM audit. Today the
-// signature alone is the trust bit; the tlog check is a follow-up.
+// Verification deliberately keeps Rekor transparency-log checking enabled.
+// A keyless Fulcio certificate is short-lived; the signed Rekor timestamp is
+// what lets a host revalidate an otherwise-expired certificate after the
+// release was published. Disabling tlog verification would make installs
+// depend on the verifier clock being within the certificate's validity window.
 type ExecCosignVerifier struct {
 	cfg CosignVerifyConfig
 }
@@ -160,7 +160,6 @@ func (v *ExecCosignVerifier) VerifyBlob(ctx context.Context, tarballPath, sigPat
 		"--certificate-identity-regexp", v.cfg.IdentityRegexp.String(),
 		"--certificate-oidc-issuer", v.cfg.Issuer,
 		"--bundle", sigPath,
-		"--insecure-ignore-tlog",
 		tarballPath,
 	}
 	cmd := exec.CommandContext(ctx, v.cfg.CosignPath, args...)

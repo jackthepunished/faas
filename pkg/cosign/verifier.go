@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/storage"
@@ -21,8 +22,9 @@ import (
 // invokes Verify on the two wake sites (engine.go:481 + :823) —
 // cold-boot + prime — before handing the AppSpec to vmmd.
 type LocalVerifier struct {
-	pub  *ecdsa.PublicKey
-	stor storage.StorageBackend
+	pub      *ecdsa.PublicKey
+	stor     storage.StorageBackend
+	verified sync.Map
 }
 
 // NewLocalVerifier parses the SPKI PEM at path (mode ≤ 0o444
@@ -49,6 +51,10 @@ func NewLocalVerifier(path string, stor storage.StorageBackend) (*LocalVerifier,
 func (v *LocalVerifier) Verify(ctx context.Context, layerKey, sigKey string) error {
 	if layerKey == "" || sigKey == "" {
 		return errors.New("cosign: Verify: empty layerKey or sigKey")
+	}
+	cacheKey := layerKey + "\x00" + sigKey
+	if _, ok := v.verified.Load(cacheKey); ok {
+		return nil
 	}
 
 	// Hash the layer (streamed — ext4s can be 1-2 GB).
@@ -100,5 +106,6 @@ func (v *LocalVerifier) Verify(ctx context.Context, layerKey, sigKey string) err
 			fmt.Sprintf("signature does not match ext4: ECDSA P-256 verification failed for layer %q against sig %q; refusing to boot tampered ext4",
 				layerKey, sigKey))
 	}
+	v.verified.Store(cacheKey, struct{}{})
 	return nil
 }

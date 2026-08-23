@@ -38,6 +38,9 @@ overlay:
 dns:
   apps_domain: apps.gregale.dev
   mode: cloudflare
+private_dns:
+  mode: managed_hosts
+  zone: apps.gregale.dev
 postgresql:
   dsn: postgres://faas@127.0.0.1:5432/faas
   database: faas
@@ -153,6 +156,19 @@ func TestValidate_MultiHostEndpointContract(t *testing.T) {
 				t.Fatalf("Validate = %v, want substring %q", errs, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidate_HostnameFleetRequiresPrivateResolver(t *testing.T) {
+	body := strings.Replace(validManifest, "      address: 10.42.0.1:7100", "      address: fsn-1.gregale.dev:7100", 1)
+	body = strings.Replace(body, "      address: 10.42.0.2:50051", "      address: fsn-2.gregale.dev:50051", 1)
+	body = strings.Replace(body, "private_dns:\n  mode: managed_hosts\n  zone: apps.gregale.dev\n", "", 1)
+	m, err := Parse([]byte(body))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if errs := m.Validate(); errs == nil || !strings.Contains(errs.Error(), "private_dns.mode") {
+		t.Fatalf("Validate = %v, want private_dns.mode error", errs)
 	}
 }
 
@@ -561,8 +577,8 @@ func TestHostKeys_DaemonsStructReference(t *testing.T) {
 //  2. The example file contains the ILLUSTRATIVE ONLY marker
 //     introduced in Mega-PR-B Commit 5 — future edits that drop
 //     the illustrative header fail here. An operator reading the
-//     file MUST be alerted that the addresses (10.42.0.1, 10.42.0.2,
-//     overlay.cidr 10.42.0.0/24) are PLACEHOLDERS, not real
+//     file MUST be alerted that the overlay CIDR 10.42.0.0/24 is a
+//     PLACEHOLDER, not a real
 //     operator values, before they `gregalectl manifest apply`.
 //     The marker also cross-references the §11 deny-list trap
 //     RFC1918/CGNAT overlayers fall into (separate from the
@@ -581,7 +597,7 @@ func TestSplitboxExample_ValidatesAndIllustratesOverlay(t *testing.T) {
 		t.Fatalf("Validate: %v", errs)
 	}
 	if !strings.Contains(string(raw), "ILLUSTRATIVE ONLY") {
-		t.Errorf("splitbox.example.yaml missing the ILLUSTRATIVE ONLY marker — operators will read the placeholder addresses (10.42.0.x) as a real deployable config. Add the marker before `schema_version: \"1.0.0\"`.")
+		t.Errorf("splitbox.example.yaml missing the ILLUSTRATIVE ONLY marker — operators may read the placeholder overlay CIDR as a real deployable config. Add the marker before `schema_version: \"1.0.0\"`.")
 	}
 }
 

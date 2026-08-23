@@ -46,6 +46,7 @@ from .app_metrics_response_range import AppMetricsResponseRange
 from .app_registry_credential_list_response import AppRegistryCredentialListResponse
 from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
+from .app_response_app_protocol import AppResponseAppProtocol
 from .app_response_eviction_priority import AppResponseEvictionPriority
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
@@ -118,6 +119,7 @@ from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFail
 from .create_alert_rule_request_metric import CreateAlertRuleRequestMetric
 from .create_alert_rule_request_window_spec import CreateAlertRuleRequestWindowSpec
 from .create_app_request import CreateAppRequest
+from .create_app_request_app_protocol import CreateAppRequestAppProtocol
 from .create_app_request_eviction_priority import CreateAppRequestEvictionPriority
 from .create_app_request_runtime import CreateAppRequestRuntime
 from .create_app_request_type import CreateAppRequestType
@@ -134,6 +136,9 @@ from .create_deployment_overrides import CreateDeploymentOverrides
 from .create_deployment_overrides_env import CreateDeploymentOverridesEnv
 from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
 from .create_deployment_request import CreateDeploymentRequest
+from .create_deployment_request_tag_type_1 import CreateDeploymentRequestTagType1
+from .create_deployment_request_tag_type_2_type_1 import CreateDeploymentRequestTagType2Type1
+from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequestTagType3Type1
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_key_request import CreateKeyRequest
@@ -177,11 +182,20 @@ from .deployment_response import DeploymentResponse
 from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
+from .deployment_response_last_auto_rollback_reason_type_1 import DeploymentResponseLastAutoRollbackReasonType1
+from .deployment_response_last_auto_rollback_reason_type_2_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType2Type1,
+)
+from .deployment_response_last_auto_rollback_reason_type_3_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType3Type1,
+)
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
+from .diff_app_config_patch_app_protocol import DiffAppConfigPatchAppProtocol
 from .diff_app_config_patch_eviction_priority import DiffAppConfigPatchEvictionPriority
 from .diff_break import DiffBreak
 from .diff_break_severity import DiffBreakSeverity
@@ -416,7 +430,13 @@ from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
 from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
+from .source_ref_deploy_request_tag_type_1 import SourceRefDeployRequestTagType1
+from .source_ref_deploy_request_tag_type_2_type_1 import SourceRefDeployRequestTagType2Type1
+from .source_ref_deploy_request_tag_type_3_type_1 import SourceRefDeployRequestTagType3Type1
 from .source_tarball_deploy_request import SourceTarballDeployRequest
+from .source_tarball_deploy_request_tag_type_1 import SourceTarballDeployRequestTagType1
+from .source_tarball_deploy_request_tag_type_2_type_1 import SourceTarballDeployRequestTagType2Type1
+from .source_tarball_deploy_request_tag_type_3_type_1 import SourceTarballDeployRequestTagType3Type1
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
@@ -458,6 +478,7 @@ from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparis
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
 from .update_app_request import UpdateAppRequest
+from .update_app_request_app_protocol import UpdateAppRequestAppProtocol
 from .update_app_request_eviction_priority_type_1 import UpdateAppRequestEvictionPriorityType1
 from .update_app_request_eviction_priority_type_2_type_1 import UpdateAppRequestEvictionPriorityType2Type1
 from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequestEvictionPriorityType3Type1
@@ -537,6 +558,7 @@ __all__ = (
     "AppRegistryCredentialListResponse",
     "AppRegistryCredentialResponse",
     "AppResponse",
+    "AppResponseAppProtocol",
     "AppResponseEvictionPriority",
     "AppResponseRuntime",
     "AppResponseType",
@@ -606,6 +628,7 @@ __all__ = (
     "CreateAlertRuleRequestMetric",
     "CreateAlertRuleRequestWindowSpec",
     "CreateAppRequest",
+    "CreateAppRequestAppProtocol",
     "CreateAppRequestEvictionPriority",
     "CreateAppRequestRuntime",
     "CreateAppRequestType",
@@ -622,6 +645,9 @@ __all__ = (
     "CreateDeploymentOverridesEnv",
     "CreateDeploymentOverridesEnvSecrets",
     "CreateDeploymentRequest",
+    "CreateDeploymentRequestTagType1",
+    "CreateDeploymentRequestTagType2Type1",
+    "CreateDeploymentRequestTagType3Type1",
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
     "CreateKeyRequest",
@@ -661,11 +687,16 @@ __all__ = (
     "DeploymentResponseDeployedViaType1",
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
+    "DeploymentResponseLastAutoRollbackReasonType1",
+    "DeploymentResponseLastAutoRollbackReasonType2Type1",
+    "DeploymentResponseLastAutoRollbackReasonType3Type1",
     "DeploymentResponseOverrideEnvSecretRefs",
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DeploymentResponseTag",
     "DiffAppConfigPatch",
+    "DiffAppConfigPatchAppProtocol",
     "DiffAppConfigPatchEvictionPriority",
     "DiffBreak",
     "DiffBreakSeverity",
@@ -898,7 +929,13 @@ __all__ = (
     "SLODuration",
     "SourceRefDeployRequest",
     "SourceRefDeployRequestFormat",
+    "SourceRefDeployRequestTagType1",
+    "SourceRefDeployRequestTagType2Type1",
+    "SourceRefDeployRequestTagType3Type1",
     "SourceTarballDeployRequest",
+    "SourceTarballDeployRequestTagType1",
+    "SourceTarballDeployRequestTagType2Type1",
+    "SourceTarballDeployRequestTagType3Type1",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",
@@ -940,6 +977,7 @@ __all__ = (
     "UpdateAlertRuleRequestMetric",
     "UpdateAlertRuleRequestWindowSpec",
     "UpdateAppRequest",
+    "UpdateAppRequestAppProtocol",
     "UpdateAppRequestEvictionPriorityType1",
     "UpdateAppRequestEvictionPriorityType2Type1",
     "UpdateAppRequestEvictionPriorityType3Type1",

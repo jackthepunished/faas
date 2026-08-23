@@ -1,4 +1,4 @@
--- filename: 00349_instances_mode.sql
+-- filename: 00385_instances_mode.sql
 -- +goose Up
 -- +goose StatementBegin
 --

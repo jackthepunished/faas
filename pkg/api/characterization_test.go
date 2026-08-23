@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -32,11 +33,15 @@ func TestCharacterizationReport_JSONRoundTrip(t *testing.T) {
 		`"outbound_count":`,
 		`"log_tail":`,
 		`"port_norm_mode":`,
+		`"openapi_doc":`,
+		`"openapi_doc_truncated":`,
 	}
 	// All seven fields must be present (omitempty doesn't drop them
 	// for a populated report). Future-proofing: when a new field is
 	// added to CharacterizationReport, append a tag here.
-	const minFieldCount = 7
+	// ADR-122 §D2 added `openapi_doc` + `openapi_doc_truncated` for
+	// issue #975 item #1 (endpoint discovery). 7 → 9 fields.
+	const minFieldCount = 9
 
 	r := CharacterizationReport{
 		ObservedClass:         "http",
@@ -46,6 +51,8 @@ func TestCharacterizationReport_JSONRoundTrip(t *testing.T) {
 		OutboundCount:         3,
 		LogTail:               "listening on :8080\n",
 		PortNormalizationMode: "none",
+		OpenAPIDoc:            []byte(`{"openapi":"3.1.0","info":{"title":"captured"}}`),
+		OpenAPIDocTruncated:   true, // populate so the tag survives omitempty
 	}
 	b, err := json.Marshal(r)
 	if err != nil {
@@ -64,6 +71,15 @@ func TestCharacterizationReport_JSONRoundTrip(t *testing.T) {
 	if !strings.Contains(s, `"port_norm_mode":"none"`) {
 		t.Errorf("wire shape drift: port_norm_mode value not as expected in %s", s)
 	}
+	// OpenAPIDoc is a []byte — encoding/json base64-encodes it on the
+	// wire. The decoded form must match the original doc.
+	decDoc, err := base64.StdEncoding.DecodeString(extractTagValue(s, "openapi_doc"))
+	if err != nil {
+		t.Fatalf("openapi_doc base64 decode: %v", err)
+	}
+	if got, want := string(decDoc), `{"openapi":"3.1.0","info":{"title":"captured"}}`; got != want {
+		t.Errorf("openapi_doc: got %q, want %q", got, want)
+	}
 
 	// Verify the optional fields' omitempty contract: when the field
 	// is empty, the JSON body must NOT include the tag. This catches
@@ -80,7 +96,7 @@ func TestCharacterizationReport_JSONRoundTrip(t *testing.T) {
 		// ListeningAddrs + LogTail + PortNormalizationMode are omitempty
 		// — the zero value must NOT appear in the wire body.
 		switch tag {
-		case `"listening_addrs":`, `"log_tail":`, `"port_norm_mode":`:
+		case `"listening_addrs":`, `"log_tail":`, `"port_norm_mode":`, `"openapi_doc":`, `"openapi_doc_truncated":`:
 			if strings.Contains(es, tag) {
 				t.Errorf("omitempty drift: tag %s appeared in zero-value wire body %s", tag, es)
 			}
@@ -121,6 +137,8 @@ func TestCharacterizationReport_FieldTypes(t *testing.T) {
 		OutboundCount:         7,
 		LogTail:               "panic: runtime error",
 		PortNormalizationMode: "dnat",
+		OpenAPIDoc:            []byte(`{"openapi":"3.1.0","info":{"title":"gql-echo"}}`),
+		OpenAPIDocTruncated:   true,
 	}
 	// Decode into a generic map[string]any so we can probe the
 	// underlying JSON types without committing to a fixed shape.
@@ -146,6 +164,23 @@ func TestCharacterizationReport_FieldTypes(t *testing.T) {
 	}
 	if got, want := m["port_norm_mode"], "dnat"; got != want {
 		t.Errorf("port_norm_mode: got %v (%T), want %v", got, got, want)
+	}
+	// OpenAPIDoc is a []byte — base64-encoded in JSON (standard encoding/json
+	// behavior). Decode and round-trip to verify the wire carries the doc
+	// intact. ADR-122 §D2: the field is wire-additive.
+	docRaw, ok := m["openapi_doc"].(string)
+	if !ok {
+		t.Fatalf("openapi_doc: not a JSON string (got %T)", m["openapi_doc"])
+	}
+	docBytes, err := base64.StdEncoding.DecodeString(docRaw)
+	if err != nil {
+		t.Fatalf("openapi_doc: base64 decode: %v", err)
+	}
+	if got, want := string(docBytes), `{"openapi":"3.1.0","info":{"title":"gql-echo"}}`; got != want {
+		t.Errorf("openapi_doc: got %q, want %q", got, want)
+	}
+	if got, want := m["openapi_doc_truncated"], true; got != want {
+		t.Errorf("openapi_doc_truncated: got %v (%T), want %v", got, got, want)
 	}
 	addrs, ok := m["listening_addrs"].([]any)
 	if !ok {
@@ -181,6 +216,17 @@ func TestCharacterizationReport_ZeroValueNoObservedClass(t *testing.T) {
 	if len(r.LogTail) != 0 {
 		t.Errorf("zero-value LogTail must be empty, got %q", r.LogTail)
 	}
+	// ADR-122 §D2: the new fields are omitempty, so the zero value
+	// must NOT carry a captured doc or a truncation flag. These
+	// guards match the "no signal" contract — a zero-value report is
+	// the "no probe result" signal that the schedd wheel treats as
+	// `class=job, exit=0`.
+	if r.OpenAPIDoc != nil {
+		t.Errorf("zero-value OpenAPIDoc must be nil, got %q", r.OpenAPIDoc)
+	}
+	if r.OpenAPIDocTruncated != false {
+		t.Errorf("zero-value OpenAPIDocTruncated must be false, got %v", r.OpenAPIDocTruncated)
+	}
 }
 
 // mustMarshal is a tiny helper to keep the field-type test linear.
@@ -194,4 +240,30 @@ func mustMarshal(t *testing.T, v any) []byte {
 		t.Fatalf("marshal: %v", err)
 	}
 	return b
+}
+
+// extractTagValue is a small helper that pulls the JSON value for a
+// given key out of a Marshal result. The wire body is well-formed
+// (we just produced it) so a flat bytes.Contains + brace-trim is
+// sufficient. Used by the OpenAPIDoc round-trip assertion where the
+// value is base64-encoded.
+func extractTagValue(s, tag string) string {
+	// Find `"<tag>":"` and read until the closing `"` (with the
+	// usual JSON-escape handling scoped to the smallest possible
+	// shape — the doc is well-formed and the only escapes are
+	// the base64 alphabet).
+	needle := `"` + tag + `":"`
+	i := strings.Index(s, needle)
+	if i < 0 {
+		return ""
+	}
+	start := i + len(needle)
+	// Walk forward; track the closing quote (no escapes inside the
+	// base64 alphabet).
+	for j := start; j < len(s); j++ {
+		if s[j] == '"' {
+			return s[start:j]
+		}
+	}
+	return ""
 }

@@ -25,6 +25,31 @@
 # off_host_backup_* vars are read from /etc/faas/sealed.env at
 # ansible-run time and are not box-shape-conditional themselves.
 
+# Resolve the provider's private transport address once for every host before
+# either role-specific play starts. The overlay role then uses these facts to
+# render the same private endpoint map on every box. Providers with a public
+# default route can set `faas_private_address` in generated inventory; the
+# manifest and daemon configuration remain hostname-only.
+- name: Discover provider-neutral private transport addresses
+  hosts: control_plane:compute_nodes
+  gather_facts: true
+  become: false
+  tasks:
+    - name: Require a usable private transport address
+      ansible.builtin.assert:
+        that:
+          - (faas_private_address | default(ansible_facts.default_ipv4.address, true) | default('')) | length > 0
+        fail_msg: >-
+          No private transport address was discovered for {{ inventory_hostname }}.
+          Set faas_private_address in the provider inventory or ensure the
+          host has a default IPv4 address.
+      tags: [private-endpoints]
+
+    - name: Publish private transport address to later plays
+      ansible.builtin.set_fact:
+        faas_private_dns_address: "{{ faas_private_address | default(ansible_facts.default_ipv4.address, true) }}"
+      tags: [private-endpoints]
+
 - name: Bootstrap a Gate-B control-plane node (fsn-1)
   hosts: control_plane
   gather_facts: true

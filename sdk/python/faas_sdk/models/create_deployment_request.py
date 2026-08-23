@@ -6,6 +6,18 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.create_deployment_request_tag_type_1 import (
+    CreateDeploymentRequestTagType1,
+    check_create_deployment_request_tag_type_1,
+)
+from ..models.create_deployment_request_tag_type_2_type_1 import (
+    CreateDeploymentRequestTagType2Type1,
+    check_create_deployment_request_tag_type_2_type_1,
+)
+from ..models.create_deployment_request_tag_type_3_type_1 import (
+    CreateDeploymentRequestTagType3Type1,
+    check_create_deployment_request_tag_type_3_type_1,
+)
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -46,6 +58,24 @@ class CreateDeploymentRequest:
     scope: None | str | Unset = UNSET
     """Top-level per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no
     leading/trailing dash. nil/omitted = `default`."""
+    reason: None | str | Unset = UNSET
+    """Free-form operator note (issue #977 / ADR-116). DB CHECK enforces length(reason) <= 280."""
+    tag: (
+        CreateDeploymentRequestTagType1
+        | CreateDeploymentRequestTagType2Type1
+        | CreateDeploymentRequestTagType3Type1
+        | None
+        | Unset
+    ) = UNSET
+    """Closed-set annotation tag. DB CHECK (deployments_tag_set_chk) enforces the same vocabulary."""
+    deployed_by: None | str | Unset = UNSET
+    """Operator label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; Action defaults
+    to ${{ github.actor }}."""
+    pr_number: int | None | Unset = UNSET
+    """PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0)."""
+    rollback_on_5xx: bool | None | Unset = UNSET
+    """Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server
+    default false."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,6 +116,42 @@ class CreateDeploymentRequest:
         else:
             scope = self.scope
 
+        reason: None | str | Unset
+        if isinstance(self.reason, Unset):
+            reason = UNSET
+        else:
+            reason = self.reason
+
+        tag: None | str | Unset
+        if isinstance(self.tag, Unset):
+            tag = UNSET
+        elif isinstance(self.tag, str):
+            tag = self.tag
+        elif isinstance(self.tag, str):
+            tag = self.tag
+        elif isinstance(self.tag, str):
+            tag = self.tag
+        else:
+            tag = self.tag
+
+        deployed_by: None | str | Unset
+        if isinstance(self.deployed_by, Unset):
+            deployed_by = UNSET
+        else:
+            deployed_by = self.deployed_by
+
+        pr_number: int | None | Unset
+        if isinstance(self.pr_number, Unset):
+            pr_number = UNSET
+        else:
+            pr_number = self.pr_number
+
+        rollback_on_5xx: bool | None | Unset
+        if isinstance(self.rollback_on_5xx, Unset):
+            rollback_on_5xx = UNSET
+        else:
+            rollback_on_5xx = self.rollback_on_5xx
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -101,6 +167,16 @@ class CreateDeploymentRequest:
             field_dict["traffic_percent"] = traffic_percent
         if scope is not UNSET:
             field_dict["scope"] = scope
+        if reason is not UNSET:
+            field_dict["reason"] = reason
+        if tag is not UNSET:
+            field_dict["tag"] = tag
+        if deployed_by is not UNSET:
+            field_dict["deployed_by"] = deployed_by
+        if pr_number is not UNSET:
+            field_dict["pr_number"] = pr_number
+        if rollback_on_5xx is not UNSET:
+            field_dict["rollback_on_5xx"] = rollback_on_5xx
 
         return field_dict
 
@@ -165,6 +241,90 @@ class CreateDeploymentRequest:
 
         scope = _parse_scope(d.pop("scope", UNSET))
 
+        def _parse_reason(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        reason = _parse_reason(d.pop("reason", UNSET))
+
+        def _parse_tag(
+            data: object,
+        ) -> (
+            CreateDeploymentRequestTagType1
+            | CreateDeploymentRequestTagType2Type1
+            | CreateDeploymentRequestTagType3Type1
+            | None
+            | Unset
+        ):
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                tag_type_1 = check_create_deployment_request_tag_type_1(data)
+
+                return tag_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                tag_type_2_type_1 = check_create_deployment_request_tag_type_2_type_1(data)
+
+                return tag_type_2_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                tag_type_3_type_1 = check_create_deployment_request_tag_type_3_type_1(data)
+
+                return tag_type_3_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                CreateDeploymentRequestTagType1
+                | CreateDeploymentRequestTagType2Type1
+                | CreateDeploymentRequestTagType3Type1
+                | None
+                | Unset,
+                data,
+            )
+
+        tag = _parse_tag(d.pop("tag", UNSET))
+
+        def _parse_deployed_by(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        deployed_by = _parse_deployed_by(d.pop("deployed_by", UNSET))
+
+        def _parse_pr_number(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        pr_number = _parse_pr_number(d.pop("pr_number", UNSET))
+
+        def _parse_rollback_on_5xx(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        rollback_on_5xx = _parse_rollback_on_5xx(d.pop("rollback_on_5xx", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
@@ -172,6 +332,11 @@ class CreateDeploymentRequest:
             sidecars=sidecars,
             traffic_percent=traffic_percent,
             scope=scope,
+            reason=reason,
+            tag=tag,
+            deployed_by=deployed_by,
+            pr_number=pr_number,
+            rollback_on_5xx=rollback_on_5xx,
         )
 
         create_deployment_request.additional_properties = d

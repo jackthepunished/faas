@@ -48,12 +48,8 @@ func TestInstallViaTarball_RetainsVerifiedTriple(t *testing.T) {
 	if verifier.CallCount != 1 {
 		t.Fatalf("cosign calls = %d, want 1", verifier.CallCount)
 	}
-	gotSHA, err := releaseinstall.CurrentGitSHA(installRoot)
-	if err != nil {
-		t.Fatalf("CurrentGitSHA: %v", err)
-	}
-	if gotSHA != gitSHA {
-		t.Fatalf("current release = %q, want %q", gotSHA, gitSHA)
+	if gotSHA, err := releaseinstall.CurrentGitSHA(installRoot); err != nil || gotSHA != "" {
+		t.Fatalf("installViaTarballWithVerifier changed current before final install gates: sha=%q err=%v", gotSHA, err)
 	}
 	for _, name := range []string{releaseTarballName, releaseSigName, releaseSBOMName, releaseinstall.ManifestName} {
 		if _, err := os.Stat(filepath.Join(releaseinstall.BundleRoot(installRoot, gitSHA), name)); err != nil {

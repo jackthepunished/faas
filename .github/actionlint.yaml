@@ -1,0 +1,11 @@
+# actionlint configuration. Used by the workflow-lint CI job
+# (ci.yml:~1175) and auto-detected by rhysd/actionlint at this path.
+#
+# Only the `self-hosted-runner.labels` key is documented in the
+# actionlint config schema (https://github.com/rhysd/actionlint/blob/v1.7.12/docs/config.md).
+# Pre-existing shellcheck info/warning findings in ci.yml are silenced
+# via the `-ignore` regex passed as the action's `args:` input
+# (ci.yml:~1200), NOT here — `shellcheck:` is not a valid config key.
+self-hosted-runner:
+  labels:
+    - kvm

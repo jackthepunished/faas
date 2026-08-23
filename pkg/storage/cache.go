@@ -225,11 +225,16 @@ func (c *LocalCacheBackend) Root() string { return c.root }
 // they do not scan a stale compatibility file or copy the whole image again.
 // Remote parents intentionally return ok=false through this delegation.
 func (c *LocalCacheBackend) LocalPath(key string) (string, bool, error) {
-	resolver, ok := c.parent.(LocalPathResolver)
-	if !ok {
-		return "", false, nil
+	if resolver, ok := c.parent.(LocalPathResolver); ok {
+		if p, local, err := resolver.LocalPath(key); err == nil && local {
+			return p, true, nil
+		}
 	}
-	return resolver.LocalPath(key)
+	cacheFile, _ := c.cacheFileFor(key)
+	if fi, err := os.Stat(cacheFile); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		return cacheFile, true, nil
+	}
+	return "", false, nil
 }
 
 // cacheFileFor hashes the storage key into a path-safe
@@ -561,6 +566,7 @@ func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, sr
 	if err := os.Rename(tmpPath, path); err != nil {
 		return nil, fmt.Errorf("cache install %q: %w", path, err)
 	}
+	_ = os.Chmod(path, 0o664)
 	keep = true
 	if err := os.WriteFile(metaPath, []byte(key), 0o644); err != nil {
 		// The blob remains usable; without its sidecar it is simply

@@ -405,7 +405,7 @@ func deriveTerminalAt(ss state.StageState, status string, depCreatedAt time.Time
 // set-min-instances and would otherwise grow a third surface.
 func cmdDeploys(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status)", "deploys")
+		PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status, retry)", "deploys")
 		return 1
 	}
 	switch args[0] {
@@ -419,7 +419,12 @@ func cmdDeploys(args []string) int {
 		// parallel dispatchDeploysStatus const that drifted
 		// silently if anyone renamed statusLiteral).
 		return cmdDeploysStatus(args[1:])
+	case "retry":
+		// ADR-117 §Production-ready follow-on, C2 — per-stage
+		// retry. Verb is a sibling to show/status (not a flag
+		// on either) because the action mutates state.
+		return cmdDeploysRetry(args[1:])
 	}
-	PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status)", "deploys")
+	PrintUsage(os.Stderr, "usage: gregale deploys <subcommand> [flags]   (subcommands: show, status, retry)", "deploys")
 	return 1
 }

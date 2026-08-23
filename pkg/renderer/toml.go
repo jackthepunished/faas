@@ -49,8 +49,9 @@ type tomlRenderCtx struct {
 	Daemon string
 	DC     *manifest.DaemonConfig
 	// DBURL is the fleet PostgreSQL endpoint from manifest.postgresql.dsn.
-	// It is rendered into every daemon TOML that declares db_url so a
-	// compute-only host does not silently fall back to its local Unix socket.
+	// Control-plane TOMLs use the local socket override below, while
+	// compute-only TOMLs leave this key empty and receive the shared endpoint
+	// through the root-owned environment file.
 	DBURL       string
 	AppsDomain  string
 	HostSANs    []string
@@ -62,6 +63,12 @@ type tomlRenderCtx struct {
 	// TOML would duplicate a credential into world-readable config.
 	HostRole string
 }
+
+// controlPlanePostgresSocketDSN is intentionally credential-free. The
+// control plane hosts PostgreSQL and uses peer authentication over the local
+// socket; only compute-only boxes receive the password-authenticated TCP DSN
+// through their root-owned compute-db.env.
+const controlPlanePostgresSocketDSN = "postgres:///faas?host=/run/postgresql&user=faas"
 
 // The flatMap is what ValidateTOMLPlacement walks. The validation
 // happens BEFORE the renderer returns to its caller — a tombstone
@@ -88,6 +95,9 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 	// HostKeys.PrivateKeys; unknown keys (a renderer bug) are caught
 	// by the validator at the "key not in catalog" check.
 	dbURL := ctx.DBURL
+	if ctx.HostRole == "control-plane" {
+		dbURL = controlPlanePostgresSocketDSN
+	}
 	if ctx.HostRole == "compute-only" {
 		dbURL = ""
 	}

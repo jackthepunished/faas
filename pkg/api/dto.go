@@ -73,6 +73,16 @@ type CreateAppRequest struct {
 	// streaming pattern from issue #471 — same fail-closed
 	// contract, same Plan.WebSocketEnabled() accessor.
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// AppProtocol (ADR-124) is the per-app wire-protocol selector
+	// (closed-set {http1, http2, grpc}). nil → apid applies the
+	// universal default "http1" (Create) / "don't touch" (Update).
+	// http2 is universally opt-in. grpc is Hobby/Pro/Scale only —
+	// Free customers who set "grpc" are rejected by apid with 403
+	// plan_app_protocol_grpc_not_allowed. Out-of-set values are
+	// rejected with 400 app_protocol_invalid. See
+	// pkg/api/limits.go::Plan.AppProtocolAllowed for the gate and
+	// ADR-124 §Plan gating for the closed-set rationale.
+	AppProtocol *string `json:"app_protocol,omitempty"`
 	// RouteMetricsEnabled (ADR-093) opts the brand-new app into the
 	// per-route observability surface (gatewayd-internal emits
 	// `gateway_request_duration_seconds{app,route,class}` etc. plus
@@ -173,6 +183,16 @@ type UpdateAppRequest struct {
 	// does not want long-poll pinning). Pointer distinguishes
 	// "don't touch" (nil) from "explicit false" (*bool=false).
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// AppProtocol (ADR-124) is the per-app wire-protocol selector
+	// (closed-set {http1, http2, grpc}). nil → apid applies the
+	// universal default "http1" (Create) / "don't touch" (Update).
+	// http2 is universally opt-in. grpc is Hobby/Pro/Scale only —
+	// Free customers who set "grpc" are rejected by apid with 403
+	// plan_app_protocol_grpc_not_allowed. Out-of-set values are
+	// rejected with 400 app_protocol_invalid. See
+	// pkg/api/limits.go::Plan.AppProtocolAllowed for the gate and
+	// ADR-124 §Plan gating for the closed-set rationale.
+	AppProtocol *string `json:"app_protocol,omitempty"`
 	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
 	// observability surface. When true (or unset on a plan where
 	// the default is true), gatewayd-internal emits the per-route
@@ -545,6 +565,15 @@ type AppResponse struct {
 	// explicitly opted out via PATCH. Surfaced so dashboards can
 	// show "websocket on / off" alongside the streaming pill.
 	WebSocketEnabled bool `json:"websocket_enabled"`
+	// AppProtocol (ADR-124) is the wire-protocol selector stored on
+	// the apps row. Always "http1" on a Free-or-above app that
+	// didn't set the field — the universal default. Set to "http2"
+	// or "grpc" by the customer via PATCH /v1/apps/{slug} or
+	// manifest. Surfaced so dashboards can show a protocol pill
+	// alongside the streaming/WS pills; the column is NOT NULL
+	// DEFAULT 'http1' in schema.sql so the empty-string fallback
+	// is impossible.
+	AppProtocol string `json:"app_protocol"`
 	// RouteMetricsEnabled (ADR-093) reflects the per-app
 	// route_metrics_enabled flag stored on the apps row. False
 	// on Free (the plan default and the only legal state — apid
@@ -1575,6 +1604,25 @@ type DeploymentResponse struct {
 	Tag        string `json:"tag,omitempty"`
 	DeployedBy string `json:"deployed_by,omitempty"`
 	PRNumber   int    `json:"pr_number,omitempty"`
+	// Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
+	// auto-rollback echo. rollback_on_5xx is always present on
+	// the wire (false for pre-PR-2 rows; the column has a NOT
+	// NULL DEFAULT false so pgx scans it cleanly into the bool).
+	// first_wake_at / first_5xx_window_ends_at / last_auto_rollback_at
+	// are nullable timestamps, stamped by schedd when the gateway
+	// emits the corresponding wake kind; omitempty keeps pre-PR-2
+	// rows byte-identical to the old wire shape. first_5xx_count
+	// is a non-nullable counter (default 0 in the schema). The
+	// closed-set vocabulary on last_auto_rollback_reason is enforced
+	// at the schema layer via deployments_last_auto_rollback_reason_check;
+	// the wire projection coalesces NULL → '' so pre-rollback rows
+	// omit the field.
+	RollbackOn5xx          bool       `json:"rollback_on_5xx"`
+	FirstWakeAt            *time.Time `json:"first_wake_at,omitempty"`
+	First5xxWindowEndsAt   *time.Time `json:"first_5xx_window_ends_at,omitempty"`
+	First5xxCount          int        `json:"first_5xx_count"`
+	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
+	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source
@@ -5500,4 +5548,39 @@ type AppErrorSampleResponse struct {
 	AppErrorRequestItem
 	HeadersSample     map[string]string `json:"headers_sample"`
 	RedactionsApplied []string          `json:"redactions_applied"`
+}
+
+// RetryDeploymentRequest (ADR-117 §Production-ready follow-on, C2)
+// is the body of POST /v1/apps/{slug}/deployments/{id}/retry.
+// FromStage MUST be one of the closed-6 stage vocabulary
+// (pkg/state.AllStageNames); the apid handler validates via
+// state.IsStageName before the storage call. The CLI's
+// `gregale deploys retry <id> --from=<stage>` builds this
+// payload verbatim.
+type RetryDeploymentRequest struct {
+	FromStage string `json:"from_stage"`
+}
+
+// OpenAPIDocResponse is the typed wire envelope for the OpenAPI doc
+// stored per-deployment (issue #975 item #1 / ADR-122). The probe
+// runs unconditionally during cold boot; the apid surfaces the doc
+// only on paid plans (Hobby/Pro/Scale). Free plans return 402
+// + openapi_docs_not_allowed from the handler.
+//
+// Doc is the raw OpenAPI document body, returned verbatim from the
+// customer's /openapi.json — the server does no rewriting. Source is
+// the closed enum (cold_boot | manual_upload); ByteSize is what the
+// handler enforces against Plan.OpenAPIDocMaxBytes(); Truncated is
+// true when the cold-boot probe clipped the body at 128 KiB.
+type OpenAPIDocResponse struct {
+	DeploymentID string         `json:"deployment_id"`
+	AccountID    string         `json:"account_id"`
+	AppID        string         `json:"app_id"`
+	Source       string         `json:"source"`
+	ByteSize     int            `json:"byte_size"`
+	DocSHA256    string         `json:"doc_sha256,omitempty"`
+	Truncated    bool           `json:"truncated"`
+	CapturedAt   string         `json:"captured_at"`
+	UpdatedAt    string         `json:"updated_at"`
+	Doc          map[string]any `json:"doc"`
 }

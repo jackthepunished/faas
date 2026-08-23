@@ -136,6 +136,23 @@ type AppListItem struct {
 	Scope string
 }
 
+// PreviewListItem is one row on /dashboard/previews (issue #961
+// Mega-C PR-1 leaf 3). The shape mirrors AppListItem for the
+// columns the customer expects (slug, parent, pr, state,
+// expires) plus a Hostname (the customer-facing preview URL)
+// and a DestroyAction (the dashboard's CSRF-wrapped POST target
+// for the new destroy endpoint).
+type PreviewListItem struct {
+	Slug          string
+	ParentSlug    string
+	PRNumber      int
+	PRState       string
+	ExpiresAt     *time.Time
+	CreatedAt     time.Time
+	Hostname      string
+	DestroyAction string
+}
+
 // ManifestView is the runner-scaffold snapshot shown on the app detail
 // page. Names are JSONish to avoid a second copy of pkg/api.AppManifest.
 type ManifestView struct {
@@ -397,11 +414,25 @@ type AppDetailData struct {
 // entirely. non-nil Stages carries a pre-rendered HTML block
 // (handler-edge projection via pkg/dashboard/stages) so the
 // template only inlines the result and needs zero FuncMap wiring.
+//
+// Retry (ADR-117 §Production-ready follow-on, C4): when the
+// deployment row's status is "failed" AND the customer's plan
+// allows deploy (every paid plan does today; Free gates via a
+// separate CodePlanDeployBlocked), CanRetry flips true and the
+// template renders the "Retry from this stage" form posting to
+// /dashboard/apps/{slug}/deployments/{id}/retry. RetryFromStage
+// carries the failing stage's name (drives the hidden input),
+// and DeploymentRetryCSRF is the sealed token binding
+// (action="retry_deployment", account_id) minted by the renderer
+// (same pattern as dashboardDelete / dashboardFireCron).
 type DeploymentDetailData struct {
-	App        AppListItem
-	Deployment DeploymentItem
-	Scan       *ScanPayload
-	Stages     *StagePayload
+	App                 AppListItem
+	Deployment          DeploymentItem
+	Scan                *ScanPayload
+	Stages              *StagePayload
+	CanRetry            bool
+	RetryFromStage      string
+	DeploymentRetryCSRF string
 }
 
 // StagePayload is the dashboard-local mirror of the closed-6-stage
@@ -418,10 +449,36 @@ type DeploymentDetailData struct {
 // include the timestamp). The customer-facing footer copy lives
 // inside BodyHTML so the template can't drift from the CLI's
 // text renderer.
+//
+// Failure (ADR-117 §Production-ready follow-on, C4) is a
+// handler-edge whycopy projection for failed rows. When the
+// deployment row's ErrorCode is in the CodeStage* set, the
+// handler calls pkg/whycopy.Decorate against the typed
+// api.Problem to lift title/hint/why/fix prose, then renders
+// the cluster-A `.error-explanation` HTML block alongside the
+// timeline. nil Failure omits the section in the template;
+// non-nil Failure carries the pre-rendered, html/template-safe
+// fragment. The seam lives at the handler edge so pkg/dashboard
+// stays free of pkg/whycopy and pkg/api imports.
 type StagePayload struct {
-	BodyHTML   template.HTML
-	Status     string
-	TerminalAt time.Time
+	BodyHTML           template.HTML
+	Status             string
+	TerminalAt         time.Time
+	FailureExplanation *StageFailureExplanation
+}
+
+// StageFailureExplanation is the pre-rendered structured
+// hint/why/fix block for one failed deployment row. Mirrors the
+// cluster-A `.error-explanation` CSS convention
+// (pkg/dashboard/templates/deployment_detail.html). All fields
+// carry html-escaped strings so the template can inline them via
+// {{ .Hint | safeHTML }} without a template.HTML cast (cluster A
+// precedent at pkg/dashboard/views/render.go:274/311).
+type StageFailureExplanation struct {
+	Title string
+	Hint  string
+	Why   string
+	Fix   string
 }
 
 // DomainDoctorView (ADR-120 Tier A2) is the dashboard-facing
@@ -615,12 +672,75 @@ type AppMetricsView struct {
 
 // RecentInstanceItem is one row of the Recent Wakes table on the
 // dashboard app-detail page.
+//
+// ADR-123: Trigger / QueuedCount / ConcurrencyAtAdmit surface
+// the wake-boot telemetry from the jsonb `events.data` payload.
+// Source: LEFT JOIN LATERAL against the first wake.boot_started
+// event for the wake_id (gated by the existing events_wake_id_idx
+// partial index from migration 00114). Empty/zero values are
+// rendered as em-dash per the existing convention for absent
+// fields — pre-ADR-123 fleet rows have no wake.boot_started yet.
+//
+// PR-A extends the row with AtCapacity (the bool stamped by
+// pkg/sched.Engine.admitGate's wakeAdmit branch — closes the
+// "2/2 at concurrency limit" reference line) and ReadyInMS
+// (millisecond delta between boot_started.at and boot_completed.at
+// — closes the "Ready in: 112 ms" reference line). Both surface
+// naturally as columns in the dashboard table; em-dash on zero
+// for pre-PR-A fleet rows.
 type RecentInstanceItem struct {
-	ID            string // instance row PK (stable across wakes)
-	WakeID        string // per-wake UUIDv7; distinct from ID
-	State         string // wire vocabulary; the template badge maps parked → sleeping
-	StartedAt     string // empty when not yet started
-	LastRequestAt string // empty when no traffic yet
+	ID                 string // instance row PK (stable across wakes)
+	WakeID             string // per-wake UUIDv7; distinct from ID
+	State              string // wire vocabulary; the template badge maps parked → sleeping
+	StartedAt          string // empty when not yet started
+	LastRequestAt      string // empty when no traffic yet
+	Trigger            string // ADR-123 — pkg/sched/triggers.go closed enum
+	QueuedCount        int    // ADR-123 — ledger.Concurrency at admit
+	ConcurrencyAtAdmit int    // ADR-123 — same reading; 0 = cold start
+	AtCapacity         bool   // PR-A — true when admitted at the plan's per-app MaxConcurrency ceiling
+	AtCapacityPresent  bool   // PR-A — true when the at_capacity key was present in jsonb (false = absent; em-dash)
+	ReadyInMS          int    // PR-A — wall-clock boot_started → boot_completed delta in ms; 0 if still booting or rejected
+}
+
+// WakeTimelinePageData is the /dashboard/apps/{slug}/wake-timeline
+// page payload (PR-A follow-on to ADR-123, per the spec §17 G17
+// follow-on subsection). Renders one page per app with a 24h summary
+// card (wake count + trigger histogram + at-capacity count/%) plus a
+// "Recent wakes" body table — the same column set the app-detail
+// recent-wakes table exposes, but with up to 50 rows instead of 10
+// and a summary header pre-aggregated at the handler edge.
+//
+// The dashboard does NOT use html/template FuncMap
+// (pkg/dashboard/dashboard.go:903 — templates parsed via
+// template.New("").ParseFS). Following the stages pattern, every
+// HTML block is pre-rendered at the handler edge:
+//
+//   - RenderTable is the views.RenderWakeTimelineTable output
+//     (one static <table> chassis, all values escaped via
+//     template.HTMLEscapeString before the chassis cast).
+//   - TriggerHistogramHTML is the views.RenderTriggerHistogram
+//     output, pre-sorted by trigger key so the rendered text is
+//     stable across requests (snapshot diff = nil).
+//
+// AtCapacityPct is rounded to 0 decimals at the template edge
+// ("{{printf \"%.0f\" .Data.AtCapacityPct}}") — the dashboard
+// never needs a finer-grained number for an at-cap readout.
+//
+// WakeCountWithMeta is the denominator the at-cap% uses (vs
+// WakeCount24h which includes pre-ADR-123 fleet rows that lack a
+// boot_started event). When WakeCountWithMeta < WakeCount24h the
+// template renders "of {N} known wakes" alongside the at-cap count
+// so a customer sees the divergence explicitly (PR-A review cluster
+// finding #5 — wakeCount24h and the histogram were previously
+// inconsistent with no label).
+type WakeTimelinePageData struct {
+	App                  AppListItem
+	WakeCount24h         int
+	WakeCountWithMeta    int
+	AtCapacityCount      int
+	AtCapacityPct        float64
+	TriggerHistogramHTML template.HTML // pre-rendered at the handler
+	RenderTable          template.HTML // pre-rendered at the handler
 }
 
 // UsageData is the /dashboard/usage page payload.

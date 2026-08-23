@@ -266,6 +266,21 @@ func (d *DNSHandoff) waitInFlightZero(ctx context.Context, deadline time.Time, i
 	}
 }
 
+// nextBackoff doubles the supplied backoff, clamping the result
+// to 30s. The 30s ceiling matches HADNSRecordStaleSeconds and
+// keeps a single bounded retry pass under the operator's drain
+// budget (5 attempts × max ~30s = 2.5 minutes worst case; see
+// deleteRecordWithRetry for the loop bounds). Extracted so the
+// cap is testable independently of the real-time sleep — the
+// run path can't fake the wall clock.
+func nextBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > 30*time.Second {
+		next = 30 * time.Second
+	}
+	return next
+}
+
 // deleteRecordWithRetry calls DNSProvider.DeleteRecord with
 // exponential backoff (1s → 2s → 4s → 8s → 16s, capped at
 // deadline). 5 retries total.
@@ -322,10 +337,7 @@ func (d *DNSHandoff) deleteRecordWithRetry(ctx context.Context, deadline time.Ti
 				return OutcomeDNSStale, ctx.Err()
 			case <-time.After(sleep):
 			}
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
+			backoff = nextBackoff(backoff)
 			continue
 		}
 		return OutcomeDNSFlipped, nil

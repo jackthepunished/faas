@@ -2357,12 +2357,16 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	// as an error so the caller logs it loudly and the operator
 	// sees the regression rather than a customer's ticker stuck
 	// on "Source downloaded" forever.
+	fromStage := state.StageDependencyRestore
 	if len(dep.StageState) > 0 {
 		var ss state.StageState
-		if uerr := json.Unmarshal(dep.StageState, &ss); uerr == nil && ss.Current != "" && ss.Current != state.StageDependencyRestore {
-			h.log.Warn("imaged: snapshot_boot precondition violated — stage_state.current is not dependency_restore",
-				"deployment", p.DeploymentID, "current_stage", ss.Current, "status", dep.Status)
-			return fmt.Errorf("imaged: snapshot_boot precondition violated (current=%q, want dependency_restore)", ss.Current)
+		if uerr := json.Unmarshal(dep.StageState, &ss); uerr == nil && ss.Current != "" {
+			if ss.Current != state.StageDependencyRestore && ss.Current != state.StageSourceDownload {
+				h.log.Warn("imaged: snapshot_boot precondition violated — stage_state.current is not dependency_restore or source_download",
+					"deployment", p.DeploymentID, "current_stage", ss.Current, "status", dep.Status)
+				return fmt.Errorf("imaged: snapshot_boot precondition violated (current=%q, want dependency_restore or source_download)", ss.Current)
+			}
+			fromStage = ss.Current
 		}
 	}
 	if dep.RootfsPath == "" {
@@ -2391,13 +2395,13 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	// ADR-117: handleSnapshotBoot enters when the row is already in
 	// DeployBuilding (the caller at builderd's notifySnapshotBoot
 	// path set the status upstream). The active StageName is
-	// dependency_restore. PR-A review fix (F1): open
-	// security_scan here; the snapshot_boot path also calls
-	// runDeployScan below (line ~1353) so security_scan→image_build
-	// closes at the same place as the source_changed path. Same
-	// from→to pair as sites 1551 + 1928 except `to` is now
-	// security_scan instead of image_build.
-	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageSecurityScan, state.DeployImaging, ""); err != nil {
+	// dependency_restore (or source_download for direct builds).
+	// PR-A review fix (F1): open security_scan here; the snapshot_boot
+	// path also calls runDeployScan below (line ~1353) so
+	// security_scan→image_build closes at the same place as the
+	// source_changed path. Same from→to pair as sites 1551 + 1928 except
+	// `to` is now security_scan instead of image_build.
+	if err := h.transitionWithStage(ctx, dep.ID, fromStage, state.StageSecurityScan, state.DeployImaging, ""); err != nil {
 		return err
 	}
 	// Dispatch on the deploy kind — builderd stamps the OCI tarball
@@ -2512,7 +2516,8 @@ func (h *Handler) transitionWithStage(ctx context.Context, depID string, from, t
 	if err := h.transition(ctx, depID, status, errMsg); err != nil {
 		return err
 	}
-	if _, err := h.store.AppendDeploymentStage(ctx, depID, from, to, time.Now(), ""); err != nil {
+	row, err := h.store.AppendDeploymentStage(ctx, depID, from, to, time.Now(), "")
+	if err != nil {
 		// Stage projection is best-effort: a failed append logs
 		// but does NOT roll back the status flip. The SSE consumer
 		// will simply miss one frame for this transition. The
@@ -2520,6 +2525,25 @@ func (h *Handler) transitionWithStage(ctx context.Context, depID string, from, t
 		// state machine on `status` is the source of truth.
 		h.log.Warn("transitionWithStage: append stage failed (status flip preserved)",
 			"deployment_id", depID, "from", from, "to", to, "err", err)
+		return nil
+	}
+	// SLO histogram (ADR-117 §Production-ready follow-on). One
+	// observation per closed stage: the duration is the just-
+	// appended row's `ended_at - started_at` so the metric
+	// agrees with the customer-facing stage timeline to the
+	// millisecond. Status label tracks the deployment's terminal
+	// state at write time — a "live" close observes status=completed;
+	// the failure path is observed separately by the caller via
+	// MarkDeploymentStageFailed (see markDeployFailed). Safe on a
+	// nil h.ops (unit tests that don't wire the registry).
+	if h.ops != nil && len(row.StageState) > 0 {
+		var ss state.StageState
+		if json.Unmarshal(row.StageState, &ss) == nil && len(ss.History) > 0 {
+			last := ss.History[len(ss.History)-1]
+			if last.StartedAt != nil && last.EndedAt != nil {
+				h.ops.ObserveDeployStageDuration(string(from), "completed", last.EndedAt.Sub(*last.StartedAt))
+			}
+		}
 	}
 	return nil
 }
@@ -2551,8 +2575,31 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 	// flight). Best-effort — the state-machine flip on `status`
 	// is the source of truth; the stage projection is the
 	// customer-UX surface.
-	if _, serr := h.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), prefix+": "+err.Error()); serr != nil {
+	if row, serr := h.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), prefix+": "+err.Error()); serr != nil {
 		h.log.Warn("markDeployFailed: stamp failed stage", "deployment_id", depID, "err", serr)
+	} else if h.ops != nil && len(row.StageState) > 0 {
+		// SLO histogram (ADR-117 §Production-ready follow-on).
+		// Observe the failed stage's wall-clock duration under
+		// status=failed so the per-stage p99 panel surfaces
+		// failure-stall tails distinctly from success tails.
+		// Same row-derived duration contract as transitionWithStage.
+		var ss state.StageState
+		if json.Unmarshal(row.StageState, &ss) == nil && len(ss.History) > 0 {
+			last := ss.History[len(ss.History)-1]
+			if last.StartedAt != nil && last.EndedAt != nil {
+				// Code-review finding #2: MarkDeploymentStageFailed
+				// clears state.Current on the way out (the in-flight
+				// stage rolls into history with status=failed), so
+				// reading `ss.Current` here produces stage="". That
+				// falls outside the pre-instantiated closed-6 label
+				// set and corrupts the §12 per-stage SLO panel
+				// (every failed observation lands on an off-panel
+				// time series instead of the row's actual failing
+				// stage). Use the history row's Name — that IS the
+				// stage that failed, by construction.
+				h.ops.ObserveDeployStageDuration(string(last.Name), "failed", last.EndedAt.Sub(*last.StartedAt))
+			}
+		}
 	}
 	return nil
 }

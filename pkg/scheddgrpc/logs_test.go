@@ -272,6 +272,7 @@ func TestStreamAppLogs_GapForwardedOverSchedd(t *testing.T) {
 // and the caller asserts only warn+error arrive AND the
 // filter_level counter has the expected delta.
 func TestStreamAppLogs_FilterLevelDropsAndCounts(t *testing.T) {
+	fedAll := make(chan struct{})
 	cl, metrics := newServerWithMetrics(t, &fakeEngine{
 		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 			lines := []sched.LogFrame{
@@ -285,6 +286,7 @@ func TestStreamAppLogs_FilterLevelDropsAndCounts(t *testing.T) {
 					return err
 				}
 			}
+			close(fedAll)
 			<-ctx.Done()
 			return nil
 		},
@@ -309,6 +311,12 @@ func TestStreamAppLogs_FilterLevelDropsAndCounts(t *testing.T) {
 		if got := resp.GetLine(); got != want {
 			t.Errorf("frame[%d].Line = %q, want %q", i, got, want)
 		}
+	}
+	// Wait for all lines to be fed into the sink before canceling
+	select {
+	case <-fedAll:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for engine to finish feeding lines")
 	}
 	// One more Recv should block (no more frames), then cancel
 	// unblocks the engine. After cancel the stream returns EOF.
@@ -342,6 +350,7 @@ func TestStreamAppLogs_FilterLevelDropsAndCounts(t *testing.T) {
 // keeps the per-reason counter coverage split so a future
 // regression that confuses the two reasons trips both tests.
 func TestStreamAppLogs_FilterGrepDropsAndCounts(t *testing.T) {
+	fedAll := make(chan struct{})
 	cl, metrics := newServerWithMetrics(t, &fakeEngine{
 		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 			lines := []sched.LogFrame{
@@ -355,6 +364,7 @@ func TestStreamAppLogs_FilterGrepDropsAndCounts(t *testing.T) {
 					return err
 				}
 			}
+			close(fedAll)
 			<-ctx.Done()
 			return nil
 		},
@@ -377,6 +387,12 @@ func TestStreamAppLogs_FilterGrepDropsAndCounts(t *testing.T) {
 		if got := resp.GetLine(); got != want {
 			t.Errorf("frame[%d].Line = %q, want %q", i, got, want)
 		}
+	}
+	// Wait for all lines to be fed into the sink before canceling
+	select {
+	case <-fedAll:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for engine to finish feeding lines")
 	}
 	cancel()
 	if _, err := stream.Recv(); err == nil {

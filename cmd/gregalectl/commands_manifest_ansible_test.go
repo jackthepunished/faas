@@ -151,8 +151,21 @@ func TestRenderManifestAnsibleFiles_HostnameEndpointsUseOverlayBoundary(t *testi
 			t.Errorf("compute host vars missing %q:\n%s", want, computeVars)
 		}
 	}
-	if strings.Contains(computeVars, "faas_internal_hosts:") {
-		t.Fatalf("hostname endpoints must use private DNS instead of an IP-based /etc/hosts map:\n%s", computeVars)
+	for _, want := range []string{
+		`faas_private_dns_mode: "managed_hosts"`,
+		`faas_private_dns_zone: "gregale.dev"`,
+		`faas_private_hosts:`,
+		`- inventory_host: "fsn-1"`,
+		`names: ["fsn-1.gregale.dev", "schedd.faas"]`,
+		`- inventory_host: "fsn-2"`,
+		`names: ["fsn-2.gregale.dev", "vmmd.faas", "egress.faas"]`,
+	} {
+		if !strings.Contains(computeVars, want) {
+			t.Fatalf("hostname endpoints missing generated private resolver record %q:\n%s", want, computeVars)
+		}
+	}
+	if strings.Contains(computeVars, "10.42.0.2") || strings.Contains(computeVars, "faas_internal_hosts:") {
+		t.Fatalf("hostname endpoints leaked a provider IP or legacy private-host variable:\n%s", computeVars)
 	}
 }
 

@@ -16,8 +16,9 @@ share the database without opening it to the public interface.
 3. Creates the `faas` system user (home `/var/lib/faas`, nologin shell).
 4. Creates the `faas` postgres role + database, with `createuser`
    fallback for hosts missing the `community.postgresql` collection.
-5. Fixes `/run/postgresql` ownership to `postgres:postgres` so peer
-   auth works for the `faas` user.
+5. Fixes `/run/postgresql` ownership to `postgres:postgres` and installs
+   an explicit `faas_map` so dedicated control-plane service users can use
+   peer auth as the `faas` database role.
 6. **§11 hardening**: `listen_addresses=''` (restart), then a local-peer
    `pg_hba.conf` (reload) that rejects all TCP auth. In split-box mode the
    generated compute `/32` entries use `scram-sha-256`; the role requires

@@ -83,7 +83,7 @@ func Check(decl capdecl.Declaration, opts Options) error {
 		}
 	case opts.PID > 0:
 		//nolint:forbidigo // DEPLOY-1 / ADR-075: /proc/<pid>/status is kernel-controlled, not customer-supplied; the openCustomerFile path is for CLI tarball ingestion, not runtime capability introspection.
-		f, err := os.Open(fmt.Sprintf("/proc/%d/status", opts.PID))
+		f, err := procOpen(fmt.Sprintf("/proc/%d/status", opts.PID))
 		if err != nil {
 			return fmt.Errorf("runtimecheck: open /proc/%d/status: %w", opts.PID, err)
 		}
@@ -222,14 +222,14 @@ func (v *Violation) Error() string {
 // readSelfStatus.
 func readSelfStatus() (capdecl.CapMasks, error) {
 	//nolint:forbidigo // DEPLOY-1 / ADR-075: /proc/self/status is kernel-controlled; the openCustomerFile path is for CLI tarball ingestion, not runtime capability introspection.
-	f, err := os.Open("/proc/self/status")
+	f, err := procOpen(procSelfStatusPath)
 	if err != nil {
-		return capdecl.CapMasks{}, fmt.Errorf("open /proc/self/status: %w", err)
+		return capdecl.CapMasks{}, fmt.Errorf("open %s: %w", procSelfStatusPath, err)
 	}
 	defer func() { _ = f.Close() }()
 	buf, err := io.ReadAll(f)
 	if err != nil {
-		return capdecl.CapMasks{}, fmt.Errorf("read /proc/self/status: %w", err)
+		return capdecl.CapMasks{}, fmt.Errorf("read %s: %w", procSelfStatusPath, err)
 	}
 	mask := capdecl.ParseStatus(buf)
 	// A zero mask is plausible for an unprivileged daemon on a
@@ -239,7 +239,7 @@ func readSelfStatus() (capdecl.CapMasks, error) {
 	// surface that as a parse error so the boot fails loud
 	// instead of silently passing.
 	if mask == (capdecl.CapMasks{}) {
-		return capdecl.CapMasks{}, errors.New("parse /proc/self/status: no cap lines found (kernel too old or non-Linux)")
+		return capdecl.CapMasks{}, errors.New("parse " + procSelfStatusPath + ": no cap lines found (kernel too old or non-Linux)")
 	}
 	return mask, nil
 }
@@ -291,3 +291,17 @@ func ComposeFixture(inh, prm, eff, bnd, amb uint64) []byte {
 	fmt.Fprintf(&buf, "CapAmb:\t%016x\n", amb)
 	return buf.Bytes()
 }
+
+// procSelfStatusPath is the file readSelfStatus opens. Tests
+// override to a t.TempDir() fixture so the macOS dev path can
+// exercise the open/read error branches of readSelfStatus and
+// the per-PID open branch of Check. Production keeps the
+// default of /proc/self/status.
+var procSelfStatusPath = "/proc/self/status"
+
+// procOpen is the file-open function Check uses for the
+// `opts.PID > 0` branch (runtimecheck.go:84-89). Defaults to
+// os.Open; tests override to inject open errors.
+//
+//nolint:forbidigo // seam for test-only fault injection; production reads /proc/{PID}/status, not a customer-supplied path, so the openCustomerFile guard does not apply.
+var procOpen = os.Open

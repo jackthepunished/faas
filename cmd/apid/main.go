@@ -471,12 +471,14 @@ func main() {
 }
 
 func run(ctx context.Context, log *slog.Logger) error {
+	deps := defaultDeps()
+
 	// DEPLOY-1 / ADR-075 capdecl gate. apid's capsDecl is
 	// cap_net_bind_service (HTTPS listener). A misconfigured
 	// AmbientCapabilities line fails fast at boot. The
 	// capCheck seam lets tests stub the live /proc/self/status
 	// check (review finding M2 — every daemon now has this).
-	capCheck := defaultDeps().capCheck
+	capCheck := deps.capCheck
 	if capCheck == nil {
 		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
 	}
@@ -484,19 +486,29 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	// Gate-B box-role gate. apid is a control-plane daemon — it
-	// refuses to start under RoleComputeOnly. The role is set
-	// from FAAS_APID_ROLE at deploy time (apid has no config.go
-	// today; the env is the only source); default is
-	// RoleSingleBox so single-box dev boots unmoved. The gate
-	// runs before db.Open so a misconfigured boot doesn't waste
-	// a Postgres connection.
-	if err := role.Require("apid", role.FromConfig("", "FAAS_APID_ROLE"),
+	// Load the same TOML that supplies the listener and TLS settings before
+	// opening Postgres. This is important on split-box control planes: the
+	// renderer writes a local Unix-socket db_url, while compute boxes keep
+	// their password-authenticated TCP DSN in compute-db.env.
+	cfg := deps.preLoadedConfig
+	var err error
+	if cfg == nil {
+		cfg, err = deps.loadConfig(deps.configPath)
+		if err != nil {
+			return fmt.Errorf("apid: load config: %w", err)
+		}
+	}
+
+	// Gate-B box-role gate. apid is a control-plane daemon — it refuses to
+	// start under RoleComputeOnly. LoadConfig applies the TOML/env role
+	// precedence before this check; default is RoleSingleBox so single-box
+	// dev boots unmoved. The gate still runs before db.Open.
+	if err := role.Require("apid", cfg.Role,
 		role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
 
-	pool, err := db.Open(ctx, "")
+	pool, err := db.Open(ctx, cfg.DBURL)
 	if err != nil {
 		return fmt.Errorf("apid: open db: %w", err)
 	}
@@ -549,22 +561,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// back listener confuses operators reading the headers.
 	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(os.Getenv))
 
-	deps := defaultDeps()
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
-	// PR-0 (issue #678): load the apid Config from the same
-	// /etc/faas/apid.toml file the [billing] loader already reads.
-	// Behaviour-preserving: every legacy FAAS_APID_* / FAAS_GITHUBD_*
-	// env var continues to win over TOML because Get* helpers are
-	// called from main.go after this LoadConfig, and the env-overlay
-	// pattern (env first, TOML fallback) is preserved verbatim.
-	cfg := deps.preLoadedConfig
-	if cfg == nil {
-		cfg, err = deps.loadConfig(deps.configPath)
-		if err != nil {
-			closePool()
-			return fmt.Errorf("apid: load config: %w", err)
-		}
-	}
 	deps.config = cfg
 	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
 	// multi-box identity so an operator reading the systemd journal

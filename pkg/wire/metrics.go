@@ -1031,6 +1031,19 @@ type OpsMetrics struct {
 	// top bucket is a SLO miss and the dashboard's "scan overdue"
 	// chip will surface it (ADR-055 §3).
 	deployScanDuration *prometheus.HistogramVec
+	// deployStageDuration: per-deploy closed-6-stage histogram,
+	// labelled by {stage, status} (ADR-117 §Production-ready
+	// follow-on). One Observe per `transitionWithStage` write
+	// (pkg/imaged/handler.go) — the duration is the wall-clock
+	// between from and to (the row's started_at → ended_at delta
+	// already on the jsonb row, surfaced via the
+	// pkg/imaged.transitionWithStage seam). Buckets skew to the
+	// long tail (up to 300s) so a stalled `image_build` shows up
+	// as a top-bucket observation rather than getting dropped into
+	// the +Inf bin. Pre-instantiated in NewOpsMetrics below for
+	// every (stage, status) tuple so /metrics surfaces zero on
+	// boot; only imaged increments via ObserveDeployStageDuration.
+	deployStageDuration *prometheus.HistogramVec
 	// deployScanTotal: scanned-deploy counter, labelled by
 	// result ∈ {complete, failed, skipped}. The complete/failed
 	// labels increment once per scan after the 1-retry backoff;
@@ -2327,6 +2340,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{1, 5, 10, 30, 60, 120, 180, 240, 300, 420, 600},
 	}, []string{"app"})
 	commonCollectors = append(commonCollectors, deployScanDuration)
+	// ADR-117 §Production-ready follow-on: per-deploy stage
+	// duration histogram, labelled by {stage, status}. The
+	// closed-6 stage vocabulary mirrors pkg/state.AllStageNames;
+	// status ∈ {completed, failed}. Pre-instantiated below so
+	// every (stage, status) row surfaces in /metrics from boot
+	// (the customer-facing panel needs zero-bucket observations
+	// to render the p95/p99 panels without a "no data" state).
+	// Only imaged increments via ObserveDeployStageDuration.
+	deployStageDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_deploy_stage_duration_seconds",
+		Help:    "Per-deploy stage wall-clock duration in seconds (ADR-117 §Production-ready follow-on). One observation per `transitionWithStage` write (pkg/imaged/handler.go). stage ∈ {source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness}; status ∈ {completed, failed}. Buckets skew to the long tail (300s) so a stalled image_build surfaces as a top-bucket observation rather than +Inf.",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
+	}, []string{"stage", "status"})
+	commonCollectors = append(commonCollectors, deployStageDuration)
+	for _, stage := range []string{"source_download", "dependency_restore", "image_build", "security_scan", "snapshot_prepare", "readiness"} {
+		for _, status := range []string{"completed", "failed"} {
+			deployStageDuration.WithLabelValues(stage, status)
+		}
+	}
 	deployScanTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_deploy_scan_total",
 		Help: "Per-deploy grype scan outcomes, labelled by result ∈ {complete, failed, skipped} (issue #464 / ADR-055). One increment per deploy after the 1-retry backoff; skipped comes from the pre-feature backfill or a feature-flag-off imaged build.",
@@ -3090,6 +3122,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		provenanceWrites:                     provenanceWrites,
 		imageScanVulns:                       imageScanVulns,
 		deployScanDuration:                   deployScanDuration,
+		deployStageDuration:                  deployStageDuration,
 		deployScanTotal:                      deployScanTotal,
 		deployScanVulns:                      deployScanVulns,
 		liveMigrationDecisions:               liveMigrationDecisions,
@@ -4573,6 +4606,22 @@ func (m *OpsMetrics) ObserveDeployScanVulns(app, severity string, count int) {
 		return
 	}
 	m.deployScanVulns.WithLabelValues(app, severity).Add(float64(count))
+}
+
+// ObserveDeployStageDuration records one stage's wall-clock duration
+// in <daemon>_deploy_stage_duration_seconds{stage, status}
+// (ADR-117 §Production-ready follow-on). Stage is the closed-6
+// vocabulary from pkg/state.AllStageNames; status is the closed set
+// {completed, failed}. The caller passes the row's own ended_at −
+// started_at delta (already on the jsonb row) so the metric agrees
+// with the customer-facing stage timeline to the millisecond. Safe
+// on a nil receiver so imaged's transitionWithStage can call it
+// unconditionally.
+func (m *OpsMetrics) ObserveDeployStageDuration(stage, status string, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	m.deployStageDuration.WithLabelValues(stage, status).Observe(dur.Seconds())
 }
 
 // ObserveBuildDuration records one build's wall-clock duration in the

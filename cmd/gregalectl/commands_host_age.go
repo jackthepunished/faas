@@ -13,11 +13,15 @@
 //     30-day overlap window
 //   - status          — print mode + fingerprint + mtime for both
 //     files (current / previous) so the operator
-//     sees the overlap countdown
+//     sees the overlap countdown. --json
+//     emits a structured report for CI gates.
 //   - prune-previous  — remove .previous once the overlap ends
 //     (default refuses if .previous is < 30 days
 //     old; --force / --promote are the documented
-//     escape hatches)
+//     escape hatches; --dry-run previews
+//     the prune without mutating; --json
+//     emits the would-prune decision + the
+//     audit fields)
 //
 // The "rotate" leaf is the security primitive: the old key is kept
 // decryptable (via age's native multi-recipient fallback across the
@@ -353,8 +357,8 @@ func hostAgeRotate(dir string, force bool) (newRecipient, prevRecipient string, 
 // cmdHostAgeStatus prints mode + fingerprint + mtime for both
 // files. Used by ansible stat-asserts at deploy time, by the
 // runbook's pre-flight checks, and by the operator during incident
-// response. Output is line-oriented (no --json path; this is
-// operator-only and the JSON case is a future patch).
+// response. Output is line-oriented; --json emits a structured
+// report for CI gates (the json_parity_test discipline).
 //
 // Missing files print an explicit "missing" line and the leaf
 // returns 0 — the operator should see both paths even if one is
@@ -367,17 +371,101 @@ func hostAgeRotate(dir string, force bool) (newRecipient, prevRecipient string, 
 // prune-previous window).
 func cmdHostAgeStatus(args []string) int {
 	fs, f := newHostAgeFlags("host-age status", false)
+	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl host-age status [flags]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age status [--json]", "host-age")
 		return 1
 	}
 	paths := hostAgePaths(f.dir)
-	reportHostAgeStatus(osStdout, "current  ", paths.current)
-	reportHostAgeStatus(osStdout, "previous ", paths.previous)
+	if *jsonOut {
+		rep := inspectHostAgeStatus(f.dir)
+		jsonEmit(os.Stdout, rep)
+		return 0
+	}
+	reportHostAgeStatus(os.Stdout, "current  ", paths.current)
+	reportHostAgeStatus(os.Stdout, "previous ", paths.previous)
 	return 0
+}
+
+// hostAgeFileStatus is the per-file inspection shape. present=false
+// means the file does not exist (pre-init / post-prune). mode +
+// sha256 + mtime + age_days are zero-valued in the absent case so
+// JSON consumers can rely on `present` for the existence gate
+// instead of probing zero sha256 / mtime sentinel values.
+type hostAgeFileStatus struct {
+	Present bool   `json:"present"`
+	Path    string `json:"path"`
+	Mode    string `json:"mode,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+	MTime   string `json:"mtime,omitempty"`
+	AgeDays int    `json:"age_days,omitempty"`
+}
+
+// hostAgeStatusReport is the JSON shape for `host-age status --json`.
+// `current` and `previous` mirror the on-disk pair; either may be
+// absent (present=false). `overlap_remaining_days` is the
+// prune-previous countdown signal: positive when .previous is
+// younger than the 30-day window, negative or zero when pruning
+// is safe. The struct is stable across PRs (json_parity_test
+// pins the field set).
+type hostAgeStatusReport struct {
+	Dir                  string            `json:"dir"`
+	Current              hostAgeFileStatus `json:"current"`
+	Previous             hostAgeFileStatus `json:"previous"`
+	OverlapRemainingDays int               `json:"overlap_remaining_days"`
+	PruneSafe            bool              `json:"prune_safe"`
+}
+
+// inspectHostAgeStatus builds the hostAgeStatusReport from the
+// canonical on-disk pair. Mirrors the printf path's behaviour so
+// the two renderers never disagree on what's on disk.
+func inspectHostAgeStatus(dir string) hostAgeStatusReport {
+	paths := hostAgePaths(dir)
+	rep := hostAgeStatusReport{Dir: dir}
+	rep.Current = inspectHostAgeFile(paths.current)
+	rep.Previous = inspectHostAgeFile(paths.previous)
+	rep.OverlapRemainingDays = overlapRemainingDays(rep.Previous, defaultMinOverlapDays)
+	rep.PruneSafe = rep.Previous.Present && rep.OverlapRemainingDays <= 0
+	return rep
+}
+
+// inspectHostAgeFile reads mode + sha256 + mtime + age for one
+// file. Missing files return present=false (other fields zero).
+// Mirrors the printf helper reportHostAgeStatus so the JSON and
+// line outputs agree on every observed byte.
+func inspectHostAgeFile(path string) hostAgeFileStatus {
+	info, err := os.Stat(path)
+	if err != nil {
+		return hostAgeFileStatus{Path: path}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return hostAgeFileStatus{Path: path, Mode: fmt.Sprintf("%#o", info.Mode().Perm())}
+	}
+	sum := sha256.Sum256(data)
+	mtime := info.ModTime().UTC()
+	return hostAgeFileStatus{
+		Present: true,
+		Path:    path,
+		Mode:    fmt.Sprintf("%#o", info.Mode().Perm()),
+		SHA256:  hex.EncodeToString(sum[:]),
+		MTime:   mtime.Format(time.RFC3339),
+		AgeDays: int(time.Since(mtime).Hours() / 24),
+	}
+}
+
+// overlapRemainingDays is the prune countdown helper. Positive
+// means the overlap window is still open (refuse prune without
+// --force); zero or negative means the window has elapsed
+// (prune is safe). Only meaningful when .previous is present.
+func overlapRemainingDays(prev hostAgeFileStatus, minOverlapDays int) int {
+	if !prev.Present {
+		return 0
+	}
+	return minOverlapDays - prev.AgeDays
 }
 
 // reportHostAgeStatus prints one line per file: <label>  <mode>
@@ -427,72 +515,177 @@ func reportHostAgeStatus(w io.Writer, label, path string) {
 // exists (would silently overwrite; the operator must remove it
 // first).
 //
+// --dry-run previews the prune without mutating (lets CI gates
+// validate prune safety before the operator actually invokes it).
+// --json emits the decision (pruned / promoted / refused / no-op)
+// + the .previous snapshot so the gate can reason about whether
+// to proceed.
+//
 // Logs to journalctl via the `gregale` syslog identifier (set by
 // the systemd unit) so the prune action shows up in the audit
 // trail. The action log line does NOT include the recipient
-// material — only the timestamp and the path. A future patch
-// could add --dry-run + --json for CI gates; v1 is operator-only
-// and the manual eyeball is the right shape.
+// material — only the timestamp and the path.
 func cmdHostAgePrunePrevious(args []string) int {
 	fs := flag.NewFlagSet("host-age prune-previous", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
 	f := &hostAgeFlags{}
 	minOverlap := fs.Int("min-overlap-days", defaultMinOverlapDays,
 		"refuse if host.age.previous is younger than this many days (set to 0 with --force for an unconditional prune)")
 	promote := fs.Bool("promote", false,
 		"rename host.age.previous → host.age instead of removing (manual escape hatch when current was lost)")
+	dryRun := fs.Bool("dry-run", false,
+		"compute the decision (prune / promote / refuse) without mutating on disk")
+	jsonOut := fs.Bool("json", false,
+		"emit structured JSON to stdout (decision + .previous snapshot)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregalectl host-age prune-previous [--min-overlap-days N] [--force] [--promote]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age prune-previous [--min-overlap-days N] [--force] [--promote] [--dry-run] [--json]", "host-age")
 		return 1
 	}
 	dir := f.dir
 	if dir == "" {
 		dir = "/etc/faas/secrets"
 	}
-	if err := hostAgePrunePrevious(dir, *minOverlap, f.force, *promote); err != nil {
-		return printErr("prune-previous failed", err)
+	rep := hostAgePruneTo(dir, *minOverlap, f.force, *promote, *dryRun)
+	if *jsonOut {
+		jsonEmit(os.Stdout, rep)
+		if !rep.Applied && !rep.WouldApply {
+			// JSON consumers want the exit code to reflect the
+			// decision: refused / no-op → exit 1; applied or
+			// would-apply → exit 0. Matches the operator's
+			// eyeball of the human-readable line ("removed" vs
+			// "refusing").
+			return 1
+		}
+		return 0
 	}
-	action := "removed"
-	if *promote {
-		action = "promoted (renamed → host.age)"
+	if rep.Error != "" {
+		return printErr("prune-previous failed", errors.New(rep.Error))
 	}
-	PrintOK(osStdout, "host-age prune-previous: %s (overlap=%dd, force=%t)\n  Next: restart the daemons only if you also --promoted (the rename changes the current identity)",
-		action, *minOverlap, f.force)
+	action := rep.Decision
+	if *dryRun && rep.WouldApply {
+		action += " (dry-run)"
+	}
+	PrintOK(osStdout, "host-age prune-previous: %s (overlap=%dd, force=%t, dry_run=%t)\n  Next: restart the daemons only if you also --promoted (the rename changes the current identity)",
+		action, *minOverlap, f.force, *dryRun)
 	return 0
 }
 
+// hostAgePruneReport is the JSON shape for `host-age
+// prune-previous --json`. Field set is pinned by json_parity_test.
+// Decision is one of "pruned" / "promoted" / "no-op" / "refused-too-recent" / "refused-missing".
+// Applied is true when the worker actually mutated on disk;
+// WouldApply is the dry-run mirror (what WOULD happen).
+type hostAgePruneReport struct {
+	Dir        string            `json:"dir"`
+	Decision   string            `json:"decision"`
+	Applied    bool              `json:"applied"`
+	WouldApply bool              `json:"would_apply"`
+	DryRun     bool              `json:"dry_run"`
+	Force      bool              `json:"force"`
+	Promote    bool              `json:"promote"`
+	MinOverlap int               `json:"min_overlap_days"`
+	Previous   hostAgeFileStatus `json:"previous"`
+	Error      string            `json:"error,omitempty"`
+}
+
+// hostAgePrunePrevious is the legacy worker surface — preserved
+// for the existing test file (commands_host_age_test.go) and for
+// any caller that wants the binary "applied or refused" signal
+// without the report struct. New code should call hostAgePruneTo
+// directly so it can render the JSON shape.
 func hostAgePrunePrevious(dir string, minOverlapDays int, force, promote bool) error {
+	rep := hostAgePruneTo(dir, minOverlapDays, force, promote, false)
+	if rep.Error == "" {
+		return nil
+	}
+	switch rep.Decision {
+	case "refused-too-recent":
+		return fmt.Errorf("%w: .previous is %d days old (min %d); use --force, --min-overlap-days=%d, or --promote",
+			ErrPruneTooRecent, rep.Previous.AgeDays, minOverlapDays, rep.Previous.AgeDays)
+	case "no-op":
+		return fmt.Errorf("%w: missing %s", ErrPruneMissingPrevious, dir+"/host.age.previous")
+	default:
+		return fmt.Errorf("%s", rep.Error)
+	}
+}
+
+// hostAgePruneTo is the package-private worker. It computes the
+// decision, applies the mutation (unless dry-run), and returns a
+// report struct that both renderers consume — the printf path
+// picks .Decision + .Applied/WouldApply, the JSON path emits the
+// full struct.
+//
+// Refusal paths set Decision + Error and return a zero-valued
+// error (the caller decides whether to surface exit 1 or 0). The
+// Applied / WouldApply booleans let a CI gate distinguish "I
+// pruned" (exit 0) from "I refused" (exit 1) from "I'd prune if
+// you'd let me" (exit 0 in dry-run).
+func hostAgePruneTo(dir string, minOverlapDays int, force, promote, dryRun bool) hostAgePruneReport {
 	paths := hostAgePaths(dir)
+	rep := hostAgePruneReport{
+		Dir:        dir,
+		DryRun:     dryRun,
+		Force:      force,
+		Promote:    promote,
+		MinOverlap: minOverlapDays,
+		Previous:   inspectHostAgeFile(paths.previous),
+	}
 
 	info, err := os.Stat(paths.previous)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: missing %s", ErrPruneMissingPrevious, paths.previous)
+			rep.Decision = "no-op"
+			rep.Error = ErrPruneMissingPrevious.Error() + ": missing " + paths.previous
+			return rep
 		}
-		return fmt.Errorf("stat %s: %w", paths.previous, err)
+		rep.Decision = "refused-stat-error"
+		rep.Error = fmt.Sprintf("stat %s: %v", paths.previous, err)
+		return rep
 	}
 
 	if promote {
 		// Promotion ignores the age check (the operator is making
 		// an explicit choice to discard the current identity and
 		// restore the previous one). PromotePreviousToCurrent
-		// refuses if a current exists, so we don't need a separate
-		// guard here.
-		return secretbox.PromotePreviousToCurrent(dir)
+		// refuses if a current exists; surface that as a refused
+		// decision rather than a generic error.
+		rep.Decision = "promoted"
+		rep.WouldApply = true
+		if dryRun {
+			return rep
+		}
+		if err := secretbox.PromotePreviousToCurrent(dir); err != nil {
+			rep.Decision = "refused-promote-failed"
+			rep.Error = err.Error()
+			return rep
+		}
+		rep.Applied = true
+		return rep
 	}
 
 	if !force {
 		ageDays := int(time.Since(info.ModTime()).Hours() / 24)
 		if ageDays < minOverlapDays {
-			return fmt.Errorf("%w: .previous is %d days old (min %d); use --force, --min-overlap-days=%d, or --promote",
-				ErrPruneTooRecent, ageDays, minOverlapDays, ageDays)
+			rep.Decision = "refused-too-recent"
+			rep.Error = fmt.Sprintf("%s: .previous is %d days old (min %d); use --force, --min-overlap-days=%d, or --promote",
+				ErrPruneTooRecent.Error(), ageDays, minOverlapDays, ageDays)
+			return rep
 		}
 	}
 
-	if err := os.Remove(paths.previous); err != nil {
-		return fmt.Errorf("remove %s: %w", paths.previous, err)
+	rep.Decision = "pruned"
+	rep.WouldApply = true
+	if dryRun {
+		return rep
 	}
-	return nil
+	if err := os.Remove(paths.previous); err != nil {
+		rep.Decision = "refused-remove-failed"
+		rep.Error = fmt.Sprintf("remove %s: %v", paths.previous, err)
+		return rep
+	}
+	rep.Applied = true
+	return rep
 }

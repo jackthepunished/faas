@@ -1069,7 +1069,7 @@ func TestDashboardStagePayload(t *testing.T) {
 			},
 		}
 		raw, _ := json.Marshal(ss)
-		d := state.Deployment{ID: "d-2", Status: state.DeployFailed, StageState: raw}
+		d := state.Deployment{ID: "d-2", Status: state.DeployFailed, StageState: raw, ErrorCode: api.CodeStageImageBuildOOM}
 		got, err := dashboardStagePayload(d)
 		if err != nil {
 			t.Fatalf("dashboardStagePayload failed: %v", err)
@@ -1082,6 +1082,44 @@ func TestDashboardStagePayload(t *testing.T) {
 		}
 		if got.Status != "failed" {
 			t.Errorf("Status = %q, want %q", got.Status, "failed")
+		}
+		// C4 (ADR-117 §Production-ready follow-on): the
+		// FailureExplanation block must populate from
+		// pkg/whycopy.Decorate against the typed
+		// CodeStage* set. Pins the wiring that connects the
+		// cluster-A hint/why/fix prose to the dashboard
+		// widget for failed rows.
+		if got.FailureExplanation == nil {
+			t.Fatalf("FailureExplanation is nil; expected a populated block for CodeStageImageBuildOOM")
+		}
+		if !strings.Contains(got.FailureExplanation.Title, "Image build") {
+			t.Errorf("FailureExplanation.Title = %q, want it to mention 'Image build'", got.FailureExplanation.Title)
+		}
+		if got.FailureExplanation.Hint == "" || got.FailureExplanation.Fix == "" || got.FailureExplanation.Why == "" {
+			t.Errorf("FailureExplanation fields not all populated: %+v", got.FailureExplanation)
+		}
+	})
+
+	// C4 — failed-row payload MUST NOT populate the
+	// explanation when ErrorCode is outside the CodeStage*
+	// set (the catalog returns "no row" → no decoration).
+	// Mirrors the cluster-A pattern: every code has a whycopy
+	// row OR the dashboard renders a bare "Failed" pill.
+	t.Run("failed-no-code-no-explanation", func(t *testing.T) {
+		now := time.Now()
+		ss := state.StageState{
+			History: []state.StageStateItem{
+				{Name: state.StageImageBuild, StartedAt: &now, EndedAt: tPtr(now.Add(3 * time.Second)), DurationMs: 1000, Status: "failed", Reason: "out of memory"},
+			},
+		}
+		raw, _ := json.Marshal(ss)
+		d := state.Deployment{ID: "d-2b", Status: state.DeployFailed, StageState: raw}
+		got, err := dashboardStagePayload(d)
+		if err != nil {
+			t.Fatalf("dashboardStagePayload failed: %v", err)
+		}
+		if got.FailureExplanation != nil {
+			t.Errorf("FailureExplanation must be nil when ErrorCode empty; got %+v", got.FailureExplanation)
 		}
 	})
 

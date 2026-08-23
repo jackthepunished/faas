@@ -1,4 +1,4 @@
--- filename: 00348_mirror_rules.sql
+-- filename: 00384_mirror_rules.sql
 -- +goose Up
 -- +goose StatementBegin
 --

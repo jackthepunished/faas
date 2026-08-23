@@ -365,6 +365,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				webhookSvc.WriteCheck = func(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase) error {
 					return githubd.WriteCheckCoalesced(ctx, checks, repoFullName, commitSHA, phase, "", "")
 				}
+				// PR-A's preview Check Run seams were
+				// declared on Service but never wired to the
+				// live ChecksAPI — every preview event
+				// posted `status=queued` but the Check Run
+				// never reached GitHub. Issue #961 Mega-C
+				// PR-1 leaf 3 closes the gap (and adds the
+				// new destroy-comment seam alongside).
+				webhookSvc.WritePreviewCheck = checks.WritePreviewCheck
+				webhookSvc.WritePreviewCheckForkRefused = checks.WritePreviewCheckForkRefused
+				webhookSvc.WritePreviewDestroyComment = checks.WritePreviewDestroyComment
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}

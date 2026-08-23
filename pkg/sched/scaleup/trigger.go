@@ -12,6 +12,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// wakeBootTriggerScaleup mirrors sched.TriggerScaleup (ADR-123).
+// Defined locally to avoid the scaleup → sched import cycle (see
+// AdmitResult below). The string value is the canonical wake-boot
+// trigger enum entry; if pkg/sched/triggers.go ever changes the
+// value, this constant must be updated in lockstep.
+const wakeBootTriggerScaleup = "scaleup"
+
 // AdmitResult is the typed wake-subset the trigger needs from the
 // engine. It mirrors sched.WakeResult's AtCapacity / InstanceID
 // fields without importing the sched package (which would create a
@@ -81,12 +88,13 @@ type Engine interface {
 	// AdmitInstance (PR-B / issue #272): scope is the preview
 	// scope (`pr-{N}`) forwarded to the underlying sched.Engine.
 	// Empty = prod (legacy).
-	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	AdmitInstance(ctx context.Context, appID, scope, trigger string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. Routes
 	// through this so a scaleup tick racing the gateway, cron, floor,
 	// or targets triggers on the same parked app coalesces into one
-	// virtual boot.
-	EnsureWake(ctx context.Context, appID string) (WakeOutcome, error)
+	// virtual boot. trigger (ADR-127) is stamped on the emitted
+	// wake.boot_started / wake.boot_completed events.
+	EnsureWake(ctx context.Context, appID, trigger string) (WakeOutcome, error)
 }
 
 // PromScraper is the per-app RPS signal source. Production impl
@@ -403,7 +411,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// app coalesces into one virtual boot. The detached leader ctx
 		// means a cancelled triggering tick doesn't kill an in-flight
 		// boot other callers still need.
-		result, err := t.engine.EnsureWake(ctx, app.ID)
+		result, err := t.engine.EnsureWake(ctx, app.ID, wakeBootTriggerScaleup)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err

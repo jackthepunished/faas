@@ -79,9 +79,10 @@ type Manifest struct {
 	SchemaVersion string `yaml:"schema_version"`
 
 	// Fleet is the list of hosts in the deployment. Each host has a
-	// role from `pkg/role.AllRoles` and a name that shows up in
-	// /etc/hosts as the canonical nameserver target. Single-box
-	// deployments declare a single host with role `single-box`.
+	// role from `pkg/role.AllRoles` and a stable transport endpoint. In
+	// hostname-based fleets the private_dns adapter maps that name to the
+	// provider's gathered private address. Single-box deployments declare
+	// a single host with role `single-box`.
 	Fleet Fleet `yaml:"fleet"`
 
 	// Daemons is the per-daemon configuration. Keys are daemon names
@@ -95,9 +96,9 @@ type Manifest struct {
 	Daemons Daemons `yaml:"daemons"`
 
 	// Overlay is the per-host overlay network (Wireguard/Tailscale)
-	// identity. The manifest Ansible generator uses each host's Address
-	// to populate the private service aliases in /etc/hosts; the renderer
-	// uses the same endpoint port for per-daemon target_url entries.
+	// identity. The manifest Ansible generator uses the fleet endpoint
+	// names and private_dns adapter to populate private aliases; the
+	// renderer uses the same endpoint port for per-daemon target_url entries.
 	Overlay Overlay `yaml:"overlay"`
 
 	// DNS is the public-facing hostname contract. apps_domain is the
@@ -105,6 +106,15 @@ type Manifest struct {
 	// PrintOK paths all read from it; a value of `gregale.dev` produces
 	// `<slug>.gregale.dev`.
 	DNS DNS `yaml:"dns"`
+
+	// PrivateDNS is the provider-neutral name-resolution contract for
+	// split-box transport names. It is deliberately separate from DNS:
+	// the latter describes public application URLs, while this section
+	// describes how the deployment keeps fleet and mTLS names private.
+	// The current managed_hosts implementation is rendered by Ansible
+	// from gathered host facts, so moving between GCP, Hetzner, or
+	// another bare-metal provider does not require changing daemon URLs.
+	PrivateDNS PrivateDNS `yaml:"private_dns,omitempty"`
 
 	// PostgreSQL is the database cluster configuration. The renderer
 	// needs the role names, the database name, and the migration
@@ -358,15 +368,12 @@ type OutboundConfig struct {
 	TLS *TLSMaterial `yaml:"tls,omitempty"`
 }
 
-// Overlay is the per-host overlay network identity. The renderer
-// populates /etc/hosts so the canonical nameserver targets (e.g.
-// `schedd.faas`) resolve to the control-plane VPC address. The
-// overlay provider is one of the supported overlay kinds; the
-// renderer maps this to the per-box /etc/hosts entries.
+// Overlay is the per-host overlay network identity. The Ansible overlay
+// role populates the provider-neutral private endpoint map; the overlay
+// provider is one of the supported overlay kinds.
 type Overlay struct {
 	// Provider is the overlay implementation ("wireguard",
-	// "tailscale", "static"). The renderer emits provider-specific
-	// /etc/hosts hints and validator-side asserts the provider is
+	// "tailscale", "static"). The validator asserts the provider is
 	// supported.
 	Provider string `yaml:"provider"`
 	// CIDR is the overlay subnet (e.g. "10.42.0.0/24"). The renderer
@@ -389,6 +396,23 @@ type DNS struct {
 	// Mode is the DNS provider ("cloudflare", "manual", "nip_io").
 	// The validator rejects values outside the supported set.
 	Mode string `yaml:"mode"`
+}
+
+// PrivateDNS is the private transport-name resolution contract. The
+// managed_hosts mode is provider-neutral: Ansible derives the address for
+// each inventory host from its private/default interface and writes one
+// generated block to /etc/hosts on every node. Operators with a separate
+// private DNS service may keep the same manifest names and replace the
+// resolver adapter later without changing daemon configuration.
+type PrivateDNS struct {
+	// Mode selects the private resolver adapter. managed_hosts is the
+	// built-in adapter and is the portable default for small fleets.
+	Mode string `yaml:"mode,omitempty"`
+	// Zone is the private hostname suffix used for fleet endpoint names.
+	// It is normally the same suffix as dns.apps_domain, but remains an
+	// explicit field so a future private DNS adapter can use a separate
+	// split-horizon zone without changing the manifest shape.
+	Zone string `yaml:"zone,omitempty"`
 }
 
 // PostgreSQL is the database cluster configuration. The renderer needs
@@ -616,6 +640,8 @@ func (m *Manifest) Validate() Errors {
 	errs = append(errs, m.Daemons.validate()...)
 	errs = append(errs, m.Overlay.validate()...)
 	errs = append(errs, m.DNS.validate()...)
+	errs = append(errs, m.PrivateDNS.validate()...)
+	errs = append(errs, m.validatePrivateResolution()...)
 	errs = append(errs, m.PostgreSQL.validate()...)
 	errs = append(errs, m.Release.validate()...)
 	errs = append(errs, m.Storage.validate()...)
@@ -675,7 +701,7 @@ func TCPURL(raw string) (string, error) {
 // These names are intentionally independent of public Cloudflare DNS: the
 // internal PKI issues role certificates for them. Literal-IP manifests get
 // generated /etc/hosts mappings; hostname manifests must resolve these names
-// through the operator's private DNS view.
+// through the manifest's private resolver adapter.
 func ServiceName(role string) (string, error) {
 	switch role {
 	case "control-plane":
@@ -732,6 +758,35 @@ func (m *Manifest) validateFleetEndpoints() Errors {
 		}
 	}
 	return errs
+}
+
+// validatePrivateResolution makes hostname-based split-box manifests
+// declare an explicit private resolver adapter. Without this gate a typo in
+// the deployment shape can silently fall through to public DNS, which is
+// especially dangerous when the public zone is managed by Cloudflare.
+func (m *Manifest) validatePrivateResolution() Errors {
+	if len(m.Fleet.Hosts) <= 1 {
+		return nil
+	}
+	for _, h := range m.Fleet.Hosts {
+		host, _, err := ParseHostPort(h.Address)
+		if err != nil {
+			continue
+		}
+		if _, ipErr := netip.ParseAddr(host); ipErr != nil && m.PrivateDNS.Mode == "" {
+			return Errors{{"private_dns.mode",
+				fmt.Sprintf("is required for hostname endpoint %q; declare the provider-neutral managed_hosts adapter", host)}}
+		}
+		if _, ipErr := netip.ParseAddr(host); ipErr != nil && m.PrivateDNS.Mode == "managed_hosts" && m.PrivateDNS.Zone != "" {
+			zone := strings.TrimSuffix(strings.ToLower(m.PrivateDNS.Zone), ".")
+			lowerHost := strings.ToLower(strings.TrimSuffix(host, "."))
+			if lowerHost != zone && !strings.HasSuffix(lowerHost, "."+zone) {
+				return Errors{{"fleet.hosts",
+					fmt.Sprintf("hostname endpoint %q is outside private_dns.zone %q", host, m.PrivateDNS.Zone)}}
+			}
+		}
+	}
+	return nil
 }
 
 // =====================================================================
@@ -892,6 +947,26 @@ func (d *DNS) validate() Errors {
 	} else if !contains([]string{"cloudflare", "manual", "nip_io"}, d.Mode) {
 		errs = append(errs, Error{"dns.mode",
 			fmt.Sprintf("unsupported %q (allowed: cloudflare|manual|nip_io)", d.Mode)})
+	}
+	return errs
+}
+
+func (d *PrivateDNS) validate() Errors {
+	var errs Errors
+	if d.Mode == "" {
+		// Literal endpoint manifests do not need a private resolver
+		// adapter. Hostname fleets are checked by validatePrivateResolution.
+		return nil
+	}
+	if d.Mode != "managed_hosts" {
+		errs = append(errs, Error{"private_dns.mode",
+			fmt.Sprintf("unsupported %q (allowed: managed_hosts)", d.Mode)})
+	}
+	if d.Zone == "" {
+		errs = append(errs, Error{"private_dns.zone", "is required when private_dns.mode is set"})
+	} else if !looksLikeHostname(d.Zone) {
+		errs = append(errs, Error{"private_dns.zone",
+			fmt.Sprintf("zone %q must be a valid hostname (e.g. gregale.dev)", d.Zone)})
 	}
 	return errs
 }
