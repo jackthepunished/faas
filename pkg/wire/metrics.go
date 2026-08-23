@@ -233,6 +233,22 @@ type OpsMetrics struct {
 	// primitive and is held only across the lookup/insert path.
 	// Prometheus increments happen outside the critical section.
 	boxLabels *boxLabelSet
+	// appLabels: the bounded admission set that backs the
+	// app-labelled metrics on OpsMetrics (issue #1059 / ADR-127
+	// §3.5 deferred work). Same shape and contract as boxLabels /
+	// accountLabels / ipLabels (fixed-capacity, non-evicting,
+	// __other__ collapse via otherAppLabel) but a distinct type
+	// so the four sets do not share capacity. The cap is
+	// maxAppLabelValues (256) — sized for the Scale plan budget
+	// (100 deployed apps) plus Tier A multi-region fan-out
+	// headroom. The reserved "" label surfaces a missing-app-slug
+	// path (a hook site fired before app_id was resolved) distinctly
+	// from a real app slug that hit the admission cap (which
+	// collapses to otherAppLabel). Constructed once per OpsMetrics
+	// in NewOpsMetrics; the mutex is the only synchronisation
+	// primitive and is held only across the lookup/insert path.
+	// Prometheus increments happen outside the critical section.
+	appLabels *appLabelSet
 	// guestTailSeconds (issue #667 / ADR-078) — histogram of the
 	// per-tail-task wall-clock duration from registration (a
 	// waitUntil(promise) call inside the handler) to terminal
@@ -3136,6 +3152,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		wakeFailure:                          wakeFailure,
 		wakeLatency:                          wakeLatency,
 		boxLabels:                            newBoxLabelSet(maxBoxLabelValues),
+		appLabels:                            newAppLabelSet(maxAppLabelValues),
 		guestTailSeconds:                     guestTailSeconds,
 		guestTailFailedTotal:                 guestTailFailedTotal,
 		tailCapReached:                       tailCapReached,
@@ -5659,6 +5676,53 @@ const labelLocal = "local"
 // label is intentionally lossy.
 const otherBoxLabel = "__other__"
 
+// maxAppLabelValues caps the per-OpsMetrics app-label admission
+// set (issue #1059 / ADR-127 §3.5 deferred work, shipped in the
+// platform-observability mega-PR alongside the per-app wake-
+// failure split). Sized at 256 — covers the single-region Scale
+// plan budget (100 deployed apps per pkg/api/limits.go) plus
+// headroom for Tier A multi-region fan-out and per-account
+// per-region app replication. The cap is far below the "tens of
+// thousands of series per metric" Prometheus guideline so a
+// hostile config can never exhaust TSDB cardinality on this
+// label. Above the cap, new app slugs collapse to otherAppLabel
+// ("__other__") so the Prometheus TSDB series set stays bounded
+// over the daemon's lifetime.
+//
+// Distinct from maxBoxLabelValues, maxAccountLabelValues, and
+// maxIPLabelValues so the four sets do not share capacity —
+// an account-surge affects account labels while app cardinality
+// stays low, and vice versa.
+//
+// Per-plan budget reference (pkg/api/limits.go):
+//
+//	Free   →  1 deployed app
+//	Hobby  →  5 deployed apps
+//	Pro    → 25 deployed apps
+//	Scale  → 100 deployed apps
+//
+// 256 covers Scale headroom (100 apps × 2.5× = ~250) plus a
+// small fleet-of-fleets fudge factor for a future multi-region
+// rollout (ADR-066 chain).
+const maxAppLabelValues = 256
+
+// labelAppUnknown is the reserved app identifier for callsites
+// that do not have an app slug in scope (issue #1059 / ADR-127
+// §3.5). Always admitted without consuming capacity, and always
+// re-admitted on collision-free lookups so appLabelSet is free
+// to reset across a restart. The literal "" distinguishes a
+// "no app in scope" call from a real app slug that hit the
+// admission cap (which collapses to otherAppLabel) — the two
+// failure modes mean different things on a triage panel.
+const labelAppUnknown = ""
+
+// otherAppLabel is the reserved app identifier for traffic whose
+// app slug exceeded the admission cap. Same contract as
+// otherAccountLabel / otherBoxLabel — operators must check the
+// daemon slog for the original app slug when an app lands here;
+// the metric label is intentionally lossy.
+const otherAppLabel = "__other__"
+
 // accountLabelSet is the bounded admission set that backs every
 // account_id-labelled metric in OpsMetrics (issue #278). The set is
 // deliberately a plain map+mutex, not an LRU: an evicting LRU would
@@ -5968,6 +6032,120 @@ func (m *OpsMetrics) boxLabel(box string) string {
 		return box
 	}
 	return m.boxLabels.admit(box)
+}
+
+// appLabelSet is the bounded admission set that backs the
+// app-labelled metrics on OpsMetrics (issue #1059 / ADR-127 §3.5
+// deferred work, shipped in the platform-observability mega-PR).
+// Same shape and contract as boxLabelSet / accountLabelSet /
+// ipLabelSet — plain map + mutex, fixed capacity, non-evicting —
+// but a distinct type so the four sets do not share capacity
+// (an account-surge must not steal slots from the app admission
+// set, and vice versa). The cap is maxAppLabelValues (256). Above
+// the cap, new app slugs collapse to otherAppLabel ("__other__")
+// so the Prometheus TSDB series set stays bounded over the
+// daemon's lifetime. The map is initialised once per OpsMetrics
+// in NewOpsMetrics; the mutex is the only synchronisation
+// primitive and is held only across the lookup/insert path.
+// Prometheus Counter / Histogram increments happen outside the
+// critical section.
+//
+// Reserved values (labelAppUnknown, otherAppLabel) are admitted
+// at boot without consuming capacity and are always re-admitted
+// on collision-free lookups. labelAppUnknown ("") is the
+// missing-app-slug placeholder used by hook sites that fire
+// before app_id is resolved — it is observable distinctly from a
+// real app slug that hit the admission cap (which collapses to
+// otherAppLabel). Real app slugs consume capacity once and are
+// never evicted in process — the daemon restart is the only path
+// that resets the set.
+type appLabelSet struct {
+	mu       sync.Mutex
+	admitted map[string]struct{}
+	cap      int
+}
+
+// newAppLabelSet constructs an admission set with the given
+// capacity. capacity must be > 0; the call panics otherwise to
+// fail loud at boot rather than silently allow unbounded
+// admission.
+//
+// Returns a pointer because appLabelSet contains a sync.Mutex;
+// returning by value would copy the lock (govet copylocks).
+func newAppLabelSet(capacity int) *appLabelSet {
+	if capacity <= 0 {
+		panic("wire: appLabelSet capacity must be positive")
+	}
+	s := &appLabelSet{
+		admitted: make(map[string]struct{}, capacity),
+		cap:      capacity,
+	}
+	// Reserved values don't count against the cap, but pre-admitting
+	// them at construction means appLabel() doesn't need a special
+	// branch for them — the lookup short-circuits through the same
+	// map. labelAppUnknown is the empty string; pre-admitting it is
+	// a no-op for the empty-string case but documents the contract.
+	s.admitted[labelAppUnknown] = struct{}{}
+	s.admitted[otherAppLabel] = struct{}{}
+	return s
+}
+
+// admit resolves an app slug to its label value (issue #1059 /
+// ADR-127 §3.5). Empty input stays as labelAppUnknown ("") so a
+// missing app slug (pathological — the host usually supplies
+// one) is observable distinctly from a real app slug that hit
+// the admission cap (which collapses to otherAppLabel). Reserved
+// values (labelAppUnknown, otherAppLabel) are always admitted
+// without consuming capacity. Real app slugs are admitted up to
+// the capacity; further slugs collapse to otherAppLabel without
+// ever consuming capacity, and the underlying map is never
+// resized past cap.
+//
+// Concurrency: holds mu across the lookup+insert. The hot path
+// is the "already admitted" lookup, which is O(1) and never
+// inserts. The Prometheus increment happens at the call site
+// AFTER admit returns, so it is outside the critical section.
+//
+// Pointer receiver: the type contains a sync.Mutex, so copying
+// the value would duplicate the lock. appLabelSet is constructed
+// once per OpsMetrics in NewOpsMetrics and held as a pointer
+// field.
+func (s *appLabelSet) admit(app string) string {
+	switch app {
+	case labelAppUnknown, otherAppLabel:
+		return app
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.admitted[app]; ok {
+		return app
+	}
+	// Reserved labels (labelAppUnknown, otherAppLabel) are
+	// pre-admitted at construction (see newAppLabelSet) and consume
+	// map entries but NOT user-facing capacity. The user-facing cap
+	// of `s.cap` distinct REAL app slugs must hold. The check is
+	// therefore "real app slugs admitted = (len - reserved) >= s.cap",
+	// not "len >= s.cap" — the same bug-fix shape as
+	// boxLabelSet.admit (TestWakeFailure_OverflowCollapsesToOther).
+	const reservedCount = 2
+	realAdmitted := len(s.admitted) - reservedCount
+	if realAdmitted >= s.cap {
+		return otherAppLabel
+	}
+	s.admitted[app] = struct{}{}
+	return app
+}
+
+// appLabel exposes the admission set as an OpsMetrics method so
+// callers don't need to know the underlying type. Safe on a nil
+// receiver — returns the input unchanged for the daemon paths
+// that don't wire an OpsMetrics (unit tests, see sched / vmmd
+// test fixtures).
+func (m *OpsMetrics) appLabel(app string) string {
+	if m == nil || m.appLabels == nil {
+		return app
+	}
+	return m.appLabels.admit(app)
 }
 
 // RenderSeconds is a tiny helper for callers that want to hand-format a
