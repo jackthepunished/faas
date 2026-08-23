@@ -2,15 +2,23 @@
 // publisher (ADR-127).
 //
 // Covers:
-//   - Middleware kill-switch pass-through when Enabled=false
+//   - RecordFromObserve kill-switch pass-through when Enabled=false
 //   - Ringbuffer FIFO order under non-overflowing load
 //   - Ringbuffer overflow → oldest row overwritten
-//   - Pre-picker (no account/app/route) requests silently dropped
-//   - Context-stamped status, latency, cold_boot, trace_id flow through
+//   - Concurrent enqueue preserves all rows
+//   - DrainBatch nil-when-empty + zero-max guards
 //   - Publisher ship-success increments shippedTotal
 //   - Publisher ship-error retries with backoff then drops, increments droppedTotal
 //   - Publisher Wake() drains immediately (no flush-interval wait)
 //   - Publisher Stop drains the final batch synchronously
+//   - Publisher nil ship drops rows + counts them
+//   - collapseRequestTelemetry pass-through (PR-A contract)
+//
+// The Handler.observe → Recorder.RecordFromObserve path is
+// covered end-to-end by handler_request_telemetry_test.go
+// (TestHandlerObserveEnqueuesRow + TestHandlerObserveDropsPrePicker).
+// This file exercises the recorder + publisher in isolation so the
+// ringbuffer / goroutine state machine is independently testable.
 //
 // Tests live in package gateway so they can exercise the
 // unexported ring buffer + drain plumbing directly.
@@ -22,8 +30,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,47 +57,25 @@ func makeRow() RequestTelemetryRow {
 	}
 }
 
-// requestContextWithRequestTelemetry stamps the request context with
-// the keys the recorder reads in enqueueFromContext. Mirrors what
-// the gateway's auth + observe middleware will stamp in production.
-func requestContextWithRequestTelemetry(ctx context.Context, row RequestTelemetryRow) context.Context {
-	ctx = context.WithValue(ctx, accountIDContextKey{}, row.AccountID)
-	ctx = context.WithValue(ctx, appIDContextKey{}, row.AppID)
-	ctx = context.WithValue(ctx, deploymentIDContextKey{}, row.DeploymentID)
-	ctx = context.WithValue(ctx, routeTemplateKey{}, row.Route)
-	ctx = context.WithValue(ctx, statusCodeContextKey{}, row.Status)
-	ctx = context.WithValue(ctx, latencyMSContextKey{}, row.LatencyMS)
-	ctx = context.WithValue(ctx, coldBootContextKey{}, row.ColdBoot)
-	ctx = context.WithValue(ctx, traceIDContextKey{}, row.TraceID)
-	return ctx
-}
-
 // --- recorder tests ---
 
-func TestRequestTelemetryRecorder_MiddlewareDisabled_PassThrough(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: false}, nopLog())
-	calls := 0
-	h := rec.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusOK)
-	}))
-	for i := 0; i < 5; i++ {
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
-	}
-	if calls != 5 {
-		t.Fatalf("expected downstream handler called 5 times, got %d", calls)
-	}
+func TestRequestTelemetryRecorder_RecordFromObserve_DisabledIsNoOp(t *testing.T) {
+	// Kill-switch path: when Enabled=false, RecordFromObserve must
+	// not enqueue. Mirrors the FAAS_REQUEST_TELEMETRY_ENABLED=false
+	// boot posture.
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: false}, nopLog())
+	rec.RecordFromObserve(makeRow())
 	if rec.PendingCount() != 0 {
-		t.Fatalf("expected zero enqueued rows when disabled, got %d", rec.PendingCount())
+		t.Fatalf("expected 0 pending when disabled, got %d", rec.PendingCount())
 	}
 }
 
 func TestRequestTelemetryRecorder_RingFIFOOrder(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 8}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 8}, nopLog())
 	for i := 0; i < 5; i++ {
 		row := makeRow()
 		row.LatencyMS = i // encode ordinal in latency for assertion
-		rec.enqueue(row)
+		rec.RecordFromObserve(row)
 	}
 	if rec.PendingCount() != 5 {
 		t.Fatalf("expected 5 pending, got %d", rec.PendingCount())
@@ -111,18 +95,18 @@ func TestRequestTelemetryRecorder_RingFIFOOrder(t *testing.T) {
 }
 
 func TestRequestTelemetryRecorder_RingOverflowOverwritesOldest(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 4}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 4}, nopLog())
 	// Fill with latency 0..3 (4 rows == capacity).
 	for i := 0; i < 4; i++ {
 		row := makeRow()
 		row.LatencyMS = i
-		rec.enqueue(row)
+		rec.RecordFromObserve(row)
 	}
 	// Overflow: 3 more rows (4..6) push out the oldest.
 	for i := 4; i < 7; i++ {
 		row := makeRow()
 		row.LatencyMS = i
-		rec.enqueue(row)
+		rec.RecordFromObserve(row)
 	}
 	batch := rec.DrainBatch(8)
 	if len(batch) != 4 {
@@ -137,88 +121,11 @@ func TestRequestTelemetryRecorder_RingOverflowOverwritesOldest(t *testing.T) {
 	}
 }
 
-func TestRequestTelemetryRecorder_PrePickerDropsSilently(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 8}, nopLog())
-	calls := 0
-	h := rec.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusOK)
-	}))
-	// Three flavours of pre-picker requests:
-	//   1. no context keys at all
-	//   2. only account_id (no app_id)
-	//   3. account_id + app_id but no route_template
-	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		switch i {
-		case 1:
-			req = req.WithContext(context.WithValue(req.Context(), accountIDContextKey{}, uuid.New()))
-		case 2:
-			ctx := context.WithValue(req.Context(), accountIDContextKey{}, uuid.New())
-			ctx = context.WithValue(ctx, appIDContextKey{}, uuid.New())
-			req = req.WithContext(ctx)
-		}
-		h.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	if calls != 3 {
-		t.Fatalf("expected downstream handler called 3 times, got %d", calls)
-	}
-	if rec.PendingCount() != 0 {
-		t.Fatalf("expected zero pending (all pre-picker dropped), got %d", rec.PendingCount())
-	}
-}
-
-func TestRequestTelemetryRecorder_StampsFlowThroughMiddleware(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 8}, nopLog())
-	row := makeRow()
-	row.Status = 503
-	row.LatencyMS = 191
-	row.ColdBoot = true
-	row.TraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
-
-	h := rec.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// Stamp context as the gateway auth + observe would.
-		stamped := requestContextWithRequestTelemetry(req.Context(), row)
-		// Replace request context so the middleware sees the stamps.
-		*req = *req.WithContext(stamped)
-		w.WriteHeader(row.Status)
-	}))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
-
-	batch := rec.DrainBatch(8)
-	if len(batch) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(batch))
-	}
-	got := batch[0]
-	if got.Status != row.Status {
-		t.Errorf("Status: got %d, want %d", got.Status, row.Status)
-	}
-	if got.LatencyMS != row.LatencyMS {
-		t.Errorf("LatencyMS: got %d, want %d", got.LatencyMS, row.LatencyMS)
-	}
-	if got.ColdBoot != row.ColdBoot {
-		t.Errorf("ColdBoot: got %v, want %v", got.ColdBoot, row.ColdBoot)
-	}
-	if got.TraceID != row.TraceID {
-		t.Errorf("TraceID: got %q, want %q", got.TraceID, row.TraceID)
-	}
-	if got.Route != row.Route {
-		t.Errorf("Route: got %q, want %q", got.Route, row.Route)
-	}
-	if got.Method != http.MethodGet {
-		t.Errorf("Method: got %q, want GET", got.Method)
-	}
-	if got.AccountID != row.AccountID || got.AppID != row.AppID || got.DeploymentID != row.DeploymentID {
-		t.Errorf("IDs mismatch: account=%v/%v app=%v/%v deployment=%v/%v",
-			got.AccountID, row.AccountID, got.AppID, row.AppID, got.DeploymentID, row.DeploymentID)
-	}
-}
-
 func TestRequestTelemetryRecorder_ConcurrentEnqueuePreservesAllRows(t *testing.T) {
 	// Stress: 100 goroutines × 50 enqueues = 5000 rows. Ring is
 	// sized larger than the workload so all rows should survive
 	// (the drain only fires from the publisher, not here).
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 8192}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 8192}, nopLog())
 	const goroutines = 100
 	const perGoroutine = 50
 	var wg sync.WaitGroup
@@ -228,7 +135,7 @@ func TestRequestTelemetryRecorder_ConcurrentEnqueuePreservesAllRows(t *testing.T
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				rec.enqueue(makeRow())
+				rec.RecordFromObserve(makeRow())
 				enqueued.Add(1)
 			}
 		}()
@@ -243,15 +150,15 @@ func TestRequestTelemetryRecorder_ConcurrentEnqueuePreservesAllRows(t *testing.T
 }
 
 func TestRequestTelemetryRecorder_DrainBatchEmptyReturnsNil(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true}, nopLog())
 	if got := rec.DrainBatch(64); got != nil {
 		t.Fatalf("expected nil batch from empty ring, got %v", got)
 	}
 }
 
 func TestRequestTelemetryRecorder_DrainBatchZeroMaxReturnsNil(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true}, nopLog())
-	rec.enqueue(makeRow())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true}, nopLog())
+	rec.RecordFromObserve(makeRow())
 	if got := rec.DrainBatch(0); got != nil {
 		t.Fatalf("expected nil batch when max=0, got %v", got)
 	}
@@ -297,9 +204,9 @@ func (f *fakeShip) TotalRows() int {
 }
 
 func TestRequestTelemetryPublisher_ShipSuccessIncrementsCounter(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
 	ship := &fakeShip{}
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Millisecond,
 		FlushBatchSize: 8,
@@ -309,7 +216,7 @@ func TestRequestTelemetryPublisher_ShipSuccessIncrementsCounter(t *testing.T) {
 	defer pub.Stop()
 
 	for i := 0; i < 5; i++ {
-		rec.enqueue(makeRow())
+		rec.RecordFromObserve(makeRow())
 	}
 	// Give the goroutine one tick to drain.
 	deadline := time.Now().Add(2 * time.Second)
@@ -334,9 +241,9 @@ func TestRequestTelemetryPublisher_ShipSuccessIncrementsCounter(t *testing.T) {
 }
 
 func TestRequestTelemetryPublisher_RetriesOnTransientErrorThenSucceeds(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
 	ship := &flakyShip{failuresBeforeSuccess: 2}
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Millisecond,
 		FlushBatchSize: 8,
@@ -345,7 +252,7 @@ func TestRequestTelemetryPublisher_RetriesOnTransientErrorThenSucceeds(t *testin
 	pub.Start(context.Background())
 	defer pub.Stop()
 
-	rec.enqueue(makeRow())
+	rec.RecordFromObserve(makeRow())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if pub.ShippedTotal() == 1 {
@@ -362,9 +269,9 @@ func TestRequestTelemetryPublisher_RetriesOnTransientErrorThenSucceeds(t *testin
 }
 
 func TestRequestTelemetryPublisher_ExhaustsRetriesThenDrops(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
 	ship := &alwaysFailShip{err: errors.New("apid unreachable")}
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Millisecond,
 		FlushBatchSize: 8,
@@ -374,7 +281,7 @@ func TestRequestTelemetryPublisher_ExhaustsRetriesThenDrops(t *testing.T) {
 	defer pub.Stop()
 
 	for i := 0; i < 3; i++ {
-		rec.enqueue(makeRow())
+		rec.RecordFromObserve(makeRow())
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -394,9 +301,9 @@ func TestRequestTelemetryPublisher_ExhaustsRetriesThenDrops(t *testing.T) {
 func TestRequestTelemetryPublisher_WakeDrainsImmediately(t *testing.T) {
 	// Set a deliberately long flush interval so the only way the
 	// rows ship before the test deadline is via Wake().
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
 	ship := &fakeShip{}
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Second, // 10s — Wake must shortcut
 		FlushBatchSize: 8,
@@ -405,7 +312,7 @@ func TestRequestTelemetryPublisher_WakeDrainsImmediately(t *testing.T) {
 	pub.Start(context.Background())
 	defer pub.Stop()
 
-	rec.enqueue(makeRow())
+	rec.RecordFromObserve(makeRow())
 	pub.Wake()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -423,9 +330,9 @@ func TestRequestTelemetryPublisher_WakeDrainsImmediately(t *testing.T) {
 func TestRequestTelemetryPublisher_StopDrainsFinalBatch(t *testing.T) {
 	// Long flush interval + enqueue + Stop. The final drain in
 	// run() must ship the rows synchronously before doneCh closes.
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
 	ship := &fakeShip{}
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Second,
 		FlushBatchSize: 8,
@@ -434,7 +341,7 @@ func TestRequestTelemetryPublisher_StopDrainsFinalBatch(t *testing.T) {
 	pub.Start(context.Background())
 
 	for i := 0; i < 4; i++ {
-		rec.enqueue(makeRow())
+		rec.RecordFromObserve(makeRow())
 	}
 	pub.Stop() // synchronous: must ship before returning
 
@@ -447,8 +354,8 @@ func TestRequestTelemetryPublisher_StopDrainsFinalBatch(t *testing.T) {
 }
 
 func TestRequestTelemetryPublisher_NilShipDropsRows(t *testing.T) {
-	rec := NewRequestTelemetryRecorder(requestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
-	pub := NewRequestTelemetryPublisher(requestTelemetryPublisherConfig{
+	rec := NewRequestTelemetryRecorder(RequestTelemetryConfig{Enabled: true, RingSize: 16}, nopLog())
+	pub := NewRequestTelemetryPublisher(RequestTelemetryPublisherConfig{
 		Enabled:        true,
 		FlushInterval:  10 * time.Millisecond,
 		FlushBatchSize: 8,
@@ -458,7 +365,7 @@ func TestRequestTelemetryPublisher_NilShipDropsRows(t *testing.T) {
 	defer pub.Stop()
 
 	for i := 0; i < 3; i++ {
-		rec.enqueue(makeRow())
+		rec.RecordFromObserve(makeRow())
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -496,7 +403,7 @@ type flakyShip struct {
 	calls                 int
 }
 
-func (f *flakyShip) Ship(_ context.Context, rows []RequestTelemetryRow) error {
+func (f *flakyShip) Ship(_ context.Context, _ []RequestTelemetryRow) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++

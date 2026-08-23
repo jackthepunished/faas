@@ -32,9 +32,9 @@ import (
 	"time"
 )
 
-// requestTelemetryPublisherConfig bundles the knobs the publisher
+// RequestTelemetryPublisherConfig bundles the knobs the publisher
 // reads at boot. Defaults set via setPublisherDefaults.
-type requestTelemetryPublisherConfig struct {
+type RequestTelemetryPublisherConfig struct {
 	// Enabled is the kill-switch. Mirrors the recorder's Enabled
 	// (they're tied — both flip on FAAS_REQUEST_TELEMETRY_ENABLED).
 	// When false, the publisher goroutine does not start.
@@ -57,7 +57,7 @@ type requestTelemetryPublisherConfig struct {
 	Now func() time.Time
 }
 
-func (c *requestTelemetryPublisherConfig) setDefaults() {
+func (c *RequestTelemetryPublisherConfig) setDefaults() {
 	if c.FlushInterval == 0 {
 		c.FlushInterval = 5 * time.Second
 	}
@@ -88,7 +88,7 @@ type ShipFn func(ctx context.Context, rows []RequestTelemetryRow) error
 // to launch the goroutine and Stop to halt it (Stop drains any
 // pending rows synchronously).
 type requestTelemetryPublisher struct {
-	cfg      requestTelemetryPublisherConfig
+	cfg      RequestTelemetryPublisherConfig
 	recorder *requestTelemetryRecorder
 	ship     ShipFn
 	log      *slog.Logger
@@ -120,7 +120,7 @@ type requestTelemetryPublisher struct {
 // NewRequestTelemetryPublisher wires a publisher. The recorder +
 // ship callback must already be constructed; the publisher takes
 // references and starts the goroutine in Start.
-func NewRequestTelemetryPublisher(cfg requestTelemetryPublisherConfig, recorder *requestTelemetryRecorder, ship ShipFn, log *slog.Logger) *requestTelemetryPublisher {
+func NewRequestTelemetryPublisher(cfg RequestTelemetryPublisherConfig, recorder *requestTelemetryRecorder, ship ShipFn, log *slog.Logger) *requestTelemetryPublisher {
 	cfg.setDefaults()
 	return &requestTelemetryPublisher{
 		cfg:      cfg,

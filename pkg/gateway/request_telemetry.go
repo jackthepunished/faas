@@ -1,11 +1,11 @@
 // request_telemetry.go — the request-hot-path component of the
 // production debugger (ADR-127).
 //
-// Sits alongside the gateway's Handler.observe exit funnel
-// (pkg/gateway/handler.go:5456) and enqueues one row per
-// gateway-served request. Unlike app_errors_recorder.go (which only
-// fires on 4xx/5xx), every request lands here — the data plane that
-// backs "did v81 make it slow?".
+// The gateway's Handler.observe exit funnel (handler.go:5456)
+// calls Recorder.RecordFromObserve on every gateway-served
+// request — unlike app_errors_recorder.go (which only fires on
+// 4xx/5xx), every request lands here so the data plane can answer
+// "did v81 make it slow?".
 //
 // Cardinality discipline is NOT the recorder's job in PR-A — the
 // publisher (request_telemetry_publisher.go) is where the
@@ -21,8 +21,8 @@
 //
 // Concurrency: every method is safe under concurrent calls from
 // many request goroutines. ringMu guards ring + head + len. The
-// lock is held for O(1) work per row on the hot path (enqueue) and
-// O(max) on the publisher drain path (DrainBatch).
+// lock is held for O(1) work per row on the hot path (RecordFromObserve)
+// and O(max) on the publisher drain path (DrainBatch).
 
 package gateway
 
@@ -53,12 +53,12 @@ type RequestTelemetryRow struct {
 	ReceivedAt   time.Time
 }
 
-// requestTelemetryConfig bundles the knobs the recorder reads at
-// boot. Defaults set via setRequestTelemetryDefaults.
-type requestTelemetryConfig struct {
+// RequestTelemetryConfig bundles the knobs the recorder reads at
+// boot. Defaults set via setDefaults.
+type RequestTelemetryConfig struct {
 	// Enabled is the kill-switch (FAAS_REQUEST_TELEMETRY_ENABLED).
-	// When false, the middleware is a no-op pass-through and the
-	// publisher goroutine does not start.
+	// When false, RecordFromObserve is a no-op and the publisher
+	// goroutine does not start.
 	Enabled bool
 
 	// RingSize caps the in-process ringbuffer. Past the cap,
@@ -71,7 +71,7 @@ type requestTelemetryConfig struct {
 	Now func() time.Time
 }
 
-func (c *requestTelemetryConfig) setDefaults() {
+func (c *RequestTelemetryConfig) setDefaults() {
 	if c.RingSize == 0 {
 		c.RingSize = 4096
 	}
@@ -81,11 +81,12 @@ func (c *requestTelemetryConfig) setDefaults() {
 }
 
 // requestTelemetryRecorder is the in-process hot-path component.
-// Construct via NewRequestTelemetryRecorder, install as middleware
-// via Middleware, and have the publisher call DrainBatch on its
-// tick (5s default per app_errors_publisher.go:50).
+// Construct via NewRequestTelemetryRecorder and have the publisher
+// call DrainBatch on its tick (5s default per
+// app_errors_publisher.go:50). Handler.observe calls
+// RecordFromObserve to enqueue rows.
 type requestTelemetryRecorder struct {
-	cfg requestTelemetryConfig
+	cfg RequestTelemetryConfig
 	log *slog.Logger
 
 	// ringMu guards ring + head + len. The recorder holds the
@@ -101,7 +102,7 @@ type requestTelemetryRecorder struct {
 // NewRequestTelemetryRecorder wires the recorder. The publisher
 // obtains a reference to this struct and calls DrainBatch on its
 // tick (see request_telemetry_publisher.go).
-func NewRequestTelemetryRecorder(cfg requestTelemetryConfig, log *slog.Logger) *requestTelemetryRecorder {
+func NewRequestTelemetryRecorder(cfg RequestTelemetryConfig, log *slog.Logger) *requestTelemetryRecorder {
 	cfg.setDefaults()
 	return &requestTelemetryRecorder{
 		cfg:  cfg,
@@ -110,66 +111,17 @@ func NewRequestTelemetryRecorder(cfg requestTelemetryConfig, log *slog.Logger) *
 	}
 }
 
-// Middleware returns the http.Handler middleware the gateway
-// installs in front of (or alongside) the request handler. When
-// cfg.Enabled is false, the middleware is a pass-through (the
-// kill-switch path).
+// RecordFromObserve is the seam Handler.observe uses to enqueue
+// a row at the gateway's single exit funnel (handler.go:5456).
+// The caller (observe) has already resolved the status + elapsed +
+// cold + target from its arguments, so it passes the row in
+// pre-built rather than reading from request context.
 //
-// Reads the (account_id, app_id, deployment_id, route_template)
-// context keys populated by the gateway's auth middleware — same
-// keys app_errors_recorder.go:475-478 uses. When any of the four
-// are absent (e.g. a request that failed before the picker
-// resolved the app), the recorder silently drops the row.
-func (r *requestTelemetryRecorder) Middleware(next http.Handler) http.Handler {
+// Safe under concurrent calls — goes through enqueue() under
+// ringMu, same path as any future publisher-side append.
+func (r *requestTelemetryRecorder) RecordFromObserve(row RequestTelemetryRow) {
 	if !r.cfg.Enabled {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		next.ServeHTTP(w, req)
-		// After the handler returns, enqueue the row from the
-		// resolved context. The Handler.observe funnel (line
-		// 5456) is the canonical exit — but the observe funnel
-		// already captures status + elapsed + app + deployment;
-		// the middleware path is the fallback for handlers
-		// that don't go through observe (e.g. control-plane
-		// /healthz).
-		r.enqueueFromContext(req.Context(), req)
-	})
-}
-
-// enqueueFromContext builds a row from the resolved request
-// context and appends to the ringbuffer. Errors are silent
-// (logged at debug) — the request hot path cannot fail.
-func (r *requestTelemetryRecorder) enqueueFromContext(ctx context.Context, req *http.Request) {
-	accountID, _ := reqContextUUID(ctx, accountIDContextKey{})
-	appID, _ := reqContextUUID(ctx, appIDContextKey{})
-	deploymentID, _ := reqContextUUID(ctx, deploymentIDContextKey{})
-	route, _ := ctx.Value(routeTemplateKey{}).(string)
-	if accountID == uuid.Nil || appID == uuid.Nil || route == "" {
-		// Pre-picker path (auth failure, healthz, 404 before
-		// app resolution). Drop silently — there's no app to
-		// attribute the row to.
 		return
-	}
-	// deploymentID stays uuid.Nil when not resolved; the column
-	// is NOT NULL but allows the zero UUID (no SQL constraint
-	// beyond that).
-	status, _ := ctx.Value(statusCodeContextKey{}).(int)
-	latencyMS, _ := ctx.Value(latencyMSContextKey{}).(int)
-	coldBoot, _ := ctx.Value(coldBootContextKey{}).(bool)
-	traceID, _ := ctx.Value(traceIDContextKey{}).(string)
-
-	row := RequestTelemetryRow{
-		AccountID:    accountID,
-		AppID:        appID,
-		DeploymentID: deploymentID,
-		Route:        route,
-		Method:       req.Method,
-		Status:       status,
-		LatencyMS:    latencyMS,
-		ColdBoot:     coldBoot,
-		TraceID:      traceID,
-		ReceivedAt:   r.cfg.Now(),
 	}
 	r.enqueue(row)
 }
@@ -237,31 +189,27 @@ func (r *requestTelemetryRecorder) RingCapacity() int {
 	return len(r.ring)
 }
 
-// RecordFromObserve is the seam Handler.observe uses to enqueue
-// a row at the gateway's single exit funnel
-// (pkg/gateway/handler.go:5456). It is the explicit-row variant of
-// the Middleware path: the caller (observe) has already resolved
-// the status + elapsed + cold + target from its arguments, so it
-// passes the row in pre-built rather than letting enqueueFromContext
-// re-read context keys.
-//
-// Safe under concurrent calls — goes through the same enqueue() as
-// the middleware path.
-func (r *requestTelemetryRecorder) RecordFromObserve(row RequestTelemetryRow) {
-	r.enqueue(row)
-}
-
 // --- context-key helpers for the ServeHTTP-side stamping ---
 
-// withAppAndAccount stamps account_id + app_id onto ctx. Called
-// once per request from Handler.ServeHTTP at the `haveApp:`
-// label (handler.go:4601) so observe can read both via the
-// accountIDContextKey / appIDContextKey keys below. Mirrors
-// withRouteLabel's pattern in observability.go.
+// accountIDContextKey / appIDContextKey are the typed context keys
+// that ServeHTTP uses (via withAppAndAccount below) to thread the
+// resolved account_id + app_id from the haveApp: label to
+// Handler.observe. Both values are uuid.UUID; the zero UUID is the
+// "not stamped" sentinel.
+type (
+	accountIDContextKey struct{}
+	appIDContextKey     struct{}
+)
+
+// withAppAndAccount stamps account_id + app_id onto r's context.
+// Called once per request from Handler.ServeHTTP at the haveApp:
+// label (handler.go:4620) so observe can read both via
+// accountIDFromContext / appIDFromContext.
 //
-// Returns the original ctx when both ids are empty — pre-picker
-// paths (auth failure, no host) do not stamp anything, so observe
-// sees an absent key and skips the row.
+// Returns the original request unchanged when either id is the
+// zero UUID — pre-picker paths (auth failure, no host) skip the
+// stamp so observe sees an absent key and drops the row silently
+// (the same pre-picker posture app_errors_recorder.go uses).
 func withAppAndAccount(r *http.Request, accountID, appID uuid.UUID) *http.Request {
 	if r == nil {
 		return r
@@ -274,67 +222,22 @@ func withAppAndAccount(r *http.Request, accountID, appID uuid.UUID) *http.Reques
 	return r.WithContext(ctx)
 }
 
-// withRouteTemplate stamps the route template onto ctx so observe
-// can stamp a closed-enum route label into the row. Mirrors
-// withAppAndAccount. Used by the post-pick rule that derives the
-// per-request route label (handler.go:4613-4617).
-func withRouteTemplate(r *http.Request, template string) *http.Request {
-	if r == nil || template == "" {
-		return r
-	}
-	return r.WithContext(context.WithValue(r.Context(), routeTemplateKey{}, template))
-}
-
 // accountIDFromContext reads the account_id stamped on ctx.
-// Returns uuid.Nil when absent.
+// Returns uuid.Nil when absent (pre-picker paths).
 func accountIDFromContext(ctx context.Context) uuid.UUID {
 	v, _ := reqContextUUID(ctx, accountIDContextKey{})
 	return v
 }
 
 // appIDFromContext reads the app_id stamped on ctx.
-// Returns uuid.Nil when absent.
+// Returns uuid.Nil when absent (pre-picker paths).
 func appIDFromContext(ctx context.Context) uuid.UUID {
 	v, _ := reqContextUUID(ctx, appIDContextKey{})
 	return v
 }
 
-// routeTemplateFromContext reads the route template stamped on ctx.
-// Returns "" when absent.
-func routeTemplateFromContext(ctx context.Context) string {
-	v, _ := ctx.Value(routeTemplateKey{}).(string)
-	return v
-}
-
-// --- context keys for the request-side metadata ---
-
-// The gateway's existing auth middleware populates these context
-// keys for the request_telemetry hot path. Mirrors the keys
-// populated for app_errors_recorder.go (cmd/gatewayd-internal/
-// app_errors_recorder.go:475-478).
-//
-// accountIDContextKey / appIDContextKey / deploymentIDContextKey
-// are uuid.UUID; routeTemplateKey is string; statusCodeContextKey /
-// latencyMSContextKey are int; coldBootContextKey is bool;
-// traceIDContextKey is string.
-//
-// The Handler.observe exit funnel (pkg/gateway/handler.go:5456) is
-// the canonical site that populates statusCodeContextKey +
-// latencyMSContextKey + coldBootContextKey. PR-A's
-// handler-observe wiring lands the stamping.
-type (
-	accountIDContextKey    struct{}
-	appIDContextKey        struct{}
-	deploymentIDContextKey struct{}
-	routeTemplateKey       struct{}
-	statusCodeContextKey   struct{}
-	latencyMSContextKey    struct{}
-	coldBootContextKey     struct{}
-	traceIDContextKey      struct{}
-)
-
-// reqContextUUID reads a uuid.UUID from req.Context() by the given
-// key. Returns uuid.Nil + false when absent.
+// reqContextUUID reads a uuid.UUID from ctx by the given key.
+// Returns uuid.Nil + false when absent.
 func reqContextUUID(ctx context.Context, key any) (uuid.UUID, bool) {
 	v, ok := ctx.Value(key).(uuid.UUID)
 	return v, ok
