@@ -15,19 +15,19 @@ export type SourceTarballDeployRequest = {
    */
   ref?: string | null;
   /**
-   * Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'.
+   * Free-form operator note on the tarball deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'.
    */
   reason?: string;
   /**
-   * Closed-set annotation tag for grouping/filtering.
+   * Closed-set annotation tag on the tarball deploy request for grouping/filtering.
    */
   tag?: 'incident_recovery' | 'hotfix' | 'scheduled_maintenance' | 'compliance_hold' | 'partner_request';
   /**
-   * Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}.
+   * Human-readable actor label on the tarball deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}.
    */
   deployed_by?: string;
   /**
-   * Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR.
+   * Pull-request number that drove this tarball deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR.
    */
   pr_number?: number;
 };
