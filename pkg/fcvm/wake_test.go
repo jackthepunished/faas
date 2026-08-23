@@ -3,9 +3,14 @@ package fcvm
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 func wakeReq(id string, snap *Snapshot) WakeRequest {
@@ -109,6 +114,18 @@ func TestWakeTotalFailureNoLeak(t *testing.T) {
 	run := &fakeRunner{}
 	vmm := &fakeVMM{restoreErr: fmt.Errorf("bad snapshot"), bootErr: fmt.Errorf("no kvm")}
 	m := newTestManager(run, vmm)
+	// Issue #1059 / ADR-127: wire the wake-failure counter so the
+	// test can assert the metric surfaces on the operator-facing
+	// surface. The fixture below never reaches the
+	// setupNetwork / cgroup hook sites — restore fails first, so
+	// netns_fail and cgroup_fail fire 0; the cold-boot terminal
+	// + restore-fallback both classify as snapshot_restore_err
+	// (default branch — neither error carries a typed sentinel
+	// nor matches ENOSPC). Expectation: the counter increments
+	// TWICE for snapshot_restore_err (once at restore-fallback,
+	// once at cold-boot terminal).
+	wireOps := wire.NewOpsMetrics("vmmd")
+	m.SetWakeFailureMetrics(wireOps)
 
 	if _, err := m.Wake(context.Background(), wakeReq("i1", usableSnapshot())); err == nil {
 		t.Fatal("expected terminal error when both restore and cold boot fail")
@@ -118,6 +135,18 @@ func TestWakeTotalFailureNoLeak(t *testing.T) {
 	}
 	if !run.ran("netns del fc-i1") {
 		t.Error("network should be torn down on total wake failure")
+	}
+	// Scrape the handler and assert the closed-vocabulary reason
+	// is on the wire. Per ADR-127 §3.1 the label value MUST be one
+	// of the 8 closed reasons; "snapshot_restore_err" is the
+	// fallback bucket for any non-sentinel / non-substring error
+	// chain, which matches the fakeVMM fixtures above.
+	srv := httptest.NewServer(wireOps.Handler())
+	defer srv.Close()
+	body := getScrapeBody(t, srv.URL)
+	want := `vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 2`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing %q in metrics scrape body:\n%s", want, body)
 	}
 }
 
@@ -169,4 +198,29 @@ func TestParkUnknownInstanceErrors(t *testing.T) {
 	if _, err := m.Park(context.Background(), "ghost", SnapshotSpec{VMStatePath: "/s", StorageKey: "snap/ghost/mem"}); err == nil {
 		t.Error("parking an unknown instance should error")
 	}
+}
+
+// getScrapeBody (issue #1059 / ADR-127) fetches the /metrics
+// endpoint body via httptest the same way pkg/wire/metrics_test.go's
+// render helper does — but kept as a local in-package helper because
+// the wire package's render is package-private. Uses
+// http.Get on the httptest URL because the underlying promhttp
+// handler is a real http.Handler; httptest.NewRecorder would
+// short-circuit the wire shape and a regression there would let the
+// test pass while prod emits something different.
+func getScrapeBody(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("scrape: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(body)
 }
