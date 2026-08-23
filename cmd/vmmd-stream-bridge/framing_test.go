@@ -39,6 +39,14 @@ func TestCurrentBridgeFraming_PerRequestRollback(t *testing.T) {
 			if got := currentBridgeFraming(); got != c.want {
 				t.Errorf("currentBridgeFraming() with env=%q = %q, want %q", c.env, got, c.want)
 			}
+			// currentBridgeFramingFrom is the pure-function seam
+			// (no env, no syscall). Review-fix R8 wired the slog line
+			// in main.go::newHandler to call this directly so the
+			// per-request env read happens once and feeds both the
+			// dispatch and the log line.
+			if got := currentBridgeFramingFrom(c.env); got != c.want {
+				t.Errorf("currentBridgeFramingFrom(%q) = %q, want %q", c.env, got, c.want)
+			}
 		})
 	}
 }

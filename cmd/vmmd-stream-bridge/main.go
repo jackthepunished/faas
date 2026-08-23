@@ -192,7 +192,7 @@ func main() {
 			IdleTimeout:      60 * time.Second,
 			ReadIdleTimeout:  30 * time.Second,
 			PingTimeout:      15 * time.Second,
-			WriteByteTimeout: 30 * time.Second,
+			// WriteByteTimeout is intentionally UNSET (default 0 = unbounded). A 30s cap would terminate SSE responses, long-poll responses, and gRPC server-streaming responses whose DATA frames are spaced >30s apart — the canonical H2C use case. The bridge is the host-side proxy; the guest's per-request context bounds end-of-stream, not us.
 		}),
 		// ReadHeaderTimeout is the H2C connection preface budget;
 		// 10s is generous on a same-host unix socket.
@@ -205,10 +205,7 @@ func main() {
 		// can't pin a bridge process indefinitely.
 		MaxHeaderBytes: api.DefaultMaxHeaderBytes, // 1 MiB
 		IdleTimeout:    120 * time.Second,
-		ReadTimeout:    30 * time.Second,
-		// WriteTimeout: 0 = streaming (SSE / long-poll / H2 DATA
-		// frames past the deadline are the supported shape; the
-		// per-request ctx controls end-of-stream).
+		// ReadTimeout is intentionally UNSET. stdlib's ReadTimeout caps the ENTIRE request lifetime (headers + body), not just the headers; a 30s cap would regress slow H1 uploads (Hobby+ plans allow up to 100 MB streaming body) and any H2C request whose body takes >30s. The ReadHeaderTimeout above is the Slowloris defence; the per-request ctx deadline bounds the in-flight request lifetime. WriteTimeout is also UNSET — streaming (SSE / long-poll / H2 DATA frames past the deadline) is the supported shape for both H1 and H2C paths.
 	}
 
 	// SIGTERM/SIGINT → graceful shutdown. vmmd sends SIGTERM after
@@ -273,21 +270,13 @@ func main() {
 // is out of scope for the cutover.
 func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		framing := currentBridgeFraming()
-		// ADR-127 §D3 (Layer 7) — framing-selection slog line.
-		// One Info-level line per request so an operator can
-		// confirm the FAAS_BRIDGE_PROTOCOL env flip + the
-		// bridge's gatewayd-internal upstream agreed on the
-		// wire shape. Promoted from Debug to Info because the
-		// framing selection IS the operator's primary rollback
-		// signal (docs/ops/h2c-rollback.md references this
-		// log line in the surgical-rollback steps). Captured at
-		// INFO rather than per-request by the structured-log
-		// dispatch, so high-volume traffic does not flood
-		// journald.
-		slog.Info("vmmd-stream-bridge: framing selected",
+		// Read FAAS_BRIDGE_PROTOCOL once per request: currentBridgeFraming uses the same value for dispatch, and the slog line below logs the raw string verbatim (operator correlation with FAAS_BRIDGE_PROTOCOL env flips). One syscall beats two.
+		bridgeProtoEnv := os.Getenv("FAAS_BRIDGE_PROTOCOL")
+		framing := currentBridgeFramingFrom(bridgeProtoEnv)
+		// ADR-127 §D3 (Layer 7) — framing-selection slog line. Captured at DEBUG, not Info: at Scale plan (5000 rps/account × N accounts × many bridge processes), per-request Info emission generates tens of thousands of JSON lines/sec/box and buries operator queries under journald's rate limit. Debug is the right level — the operator opts in via FAAS_LOG_LEVEL=debug (the canonical env flag, parsed at pkg/wire/ParseLevel) when investigating a framing question. The counter vmmd_bridge_framing_total carries the same information as a queryable metric; the dashboard panel 1 (bridge-protection deploy/grafana/bridge-protection.json) is the operator's primary view.
+		slog.Debug("vmmd-stream-bridge: framing selected",
 			"framing", framing.String(),
-			"app_protocol_env", os.Getenv("FAAS_BRIDGE_PROTOCOL"),
+			"app_protocol_env", bridgeProtoEnv,
 			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
 			"method", r.Method,
 			"path", r.URL.Path,

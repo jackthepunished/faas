@@ -48,8 +48,23 @@ func (f bridgeFraming) String() string { return string(f) }
 // RPC). Empty / unknown values fall back to h1 — the load-bearing
 // zero-behavior-change baseline for legacy callers and the
 // "unknown app_protocol → fall through to legacy" defense.
+//
+// Thin wrapper around currentBridgeFramingFrom so callers that
+// already read FAAS_BRIDGE_PROTOCOL for their own purposes (the
+// framing-selection slog line in main.go::newHandler) can pass the
+// already-read value rather than triggering a second syscall. The
+// default-zero call shape stays available for tests + the dispatch
+// sites that don't need the raw env.
 func currentBridgeFraming() bridgeFraming {
-	switch os.Getenv("FAAS_BRIDGE_PROTOCOL") {
+	return currentBridgeFramingFrom(os.Getenv("FAAS_BRIDGE_PROTOCOL"))
+}
+
+// currentBridgeFramingFrom is the testable seam — the dispatch table
+// is small enough to live next to the lookup, but pulling it out
+// lets a test assert the h2c / h1 / fallback matrix without poking
+// the process env (which is host-global and breaks parallel tests).
+func currentBridgeFramingFrom(env string) bridgeFraming {
+	switch env {
 	case "h2c":
 		return framingH2C
 	default:

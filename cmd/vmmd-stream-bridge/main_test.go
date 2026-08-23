@@ -685,7 +685,12 @@ func TestNewHandler_FramingSlog(t *testing.T) {
 	var buf bytes.Buffer
 	origLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		// LevelDebug: the framing-selection slog line was demoted from
+		// Info to Debug in the review-fix commit (R3 — Scale-plan
+		// per-request Info flood). The test asserts the line is
+		// emitted at the right level, so the handler must accept
+		// Debug entries.
+		Level: slog.LevelDebug,
 	})))
 	defer func() { slog.SetDefault(origLogger) }()
 
