@@ -107,11 +107,28 @@ func TestRuleLabel_AlreadyAdmittedIsStable(t *testing.T) {
 // set is race-free under N parallel goroutines admitting
 // overlapping (appID, ruleID) pairs. Property: the final
 // admitted set is a subset of the input set, and no panic.
+//
+// The shared IDs are pre-admitted serially before the concurrent
+// flood so the post-flood "re-admit verbatim" assertion at the
+// bottom is meaningful — the shared IDs occupy guaranteed slots
+// in the per-app set so concurrent goroutines can't race them
+// past the cap and into __other__. (Without pre-admission, a
+// heavy flood of goroutine-unique IDs could fill the per-app
+// cap and force the shared IDs to collapse — which would be the
+// correct admission behaviour, not a race.)
 func TestRuleLabel_ConcurrentAdmission(t *testing.T) {
 	s := newRuleLabelSet()
 	const app = "00000000-0000-0000-0000-000000000004"
 	const goroutines = 32
 	const perGoroutine = 64
+	// Pre-admit the shared IDs serially so they own their
+	// per-app slots before the concurrent flood starts.
+	for i := 0; i < perGoroutine; i += 2 {
+		ruleID := fmt.Sprintf("shared-%04d", i)
+		if got := s.admit(app, ruleID); got != ruleID {
+			t.Fatalf("pre-admit shared rule %q: got %q, want verbatim", ruleID, got)
+		}
+	}
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for g := 0; g < goroutines; g++ {
