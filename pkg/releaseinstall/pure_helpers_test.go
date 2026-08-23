@@ -45,6 +45,7 @@ func TestValidGitSHA(t *testing.T) {
 // carry identical field sets — FromManifest / ToManifest must
 // be exact identity conversions in both directions.
 func TestFromManifest_ToManifest_RoundTrip(t *testing.T) {
+	createdAt := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	m := Manifest{
 		FormatVersion: 1,
 		GitSHA:        "abcdef1234567890abcdef1234567890abcdef12",
@@ -52,7 +53,7 @@ func TestFromManifest_ToManifest_RoundTrip(t *testing.T) {
 		DaemonHashes:  map[string]string{"apid": "sha256:" + strings.Repeat("b", 64)},
 		ToolHashes:    map[string]string{"cosign": "sha256:" + strings.Repeat("c", 64)},
 		AssetHashes:   map[string]string{"runners/go124/faas-runner": "sha256:" + strings.Repeat("d", 64)},
-		CreatedAt:     now,
+		CreatedAt:     createdAt,
 		Signature:     "sig",
 	}
 	b := FromManifest(m)
@@ -178,4 +179,5 @@ func TestIsReleaseBinaryName(t *testing.T) {
 
 // --- helpers --------------------------------------------------
 
-var now = time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+// (no package-level test fixtures; see TestFromManifest_ToManifest_RoundTrip
+// for the literal timestamp.)

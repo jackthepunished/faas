@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/oci"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 )
 
 // --- cloneEnv ----------------------------------------------------
@@ -72,7 +73,7 @@ func TestLayersAsReaders_EmptySlice(t *testing.T) {
 	}
 }
 
-func TestLayersAsReaders_BorrowsReadKeepsClose(t *testing.T) {
+func TestLayersAsReaders_IdentityPerElement(t *testing.T) {
 	rc1 := &nopReadCloser{}
 	rc2 := &nopReadCloser{}
 	in := []io.ReadCloser{rc1, rc2}
@@ -281,23 +282,25 @@ func TestWithArtifactReplicator_SetsAndReturnsReceiver(t *testing.T) {
 	}
 }
 
-func TestWithSecretScanRun_SetsField(t *testing.T) {
+func TestWithSecretScanRun_SetsFieldAndReturnsReceiver(t *testing.T) {
 	h := &Handler{}
-	calls := 0
-	fn := func(_ context.Context, _, _ string) ([]struct{ ID int }, error) {
-		// We can't easily type-assert []secretscan.Finding here
-		// without an extra import; the field assignment is the
-		// thing we want to pin.
+	var calls int
+	fn := func(_ context.Context, _, _ string) ([]secretscan.Finding, error) {
 		calls++
 		return nil, nil
 	}
-	// We can't construct a real secretscan.Finding-bound closure
-	// without importing secretscan in the test; the field-write
-	// is the load-bearing assertion. Use a closure whose signature
-	// the package accepts, then assert callsite hits it.
-	_ = fn
-	if h.secretScanRun != nil {
-		t.Error("default: secretScanRun non-nil")
+	if got := h.WithSecretScanRun(fn); got != h {
+		t.Error("WithSecretScanRun did not return receiver")
+	}
+	if h.secretScanRun == nil {
+		t.Fatal("secretScanRun not set after WithSecretScanRun")
+	}
+	// Pin dispatch — the wired closure must be the one called.
+	if _, err := h.secretScanRun(context.Background(), "/tmp/build", "layer-1"); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("wired closure invocations = %d, want 1", calls)
 	}
 }
 
