@@ -5709,7 +5709,7 @@ type DebugTelemetryRequestItem struct {
 // the dashboard can surface a "you widened past the cap" tile when
 // a customer asks for a longer window than their plan permits.
 type DebugTelemetryListResponse struct {
-	Since    string                    `json:"since"`
+	Since    string                      `json:"since"`
 	Requests []DebugTelemetryRequestItem `json:"requests"`
 
 }
