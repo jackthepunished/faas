@@ -191,7 +191,7 @@ var methodRouteMap = map[string]string{
 	// underscore survives title-case), so the explicit map drops the
 	// underscore and aligns with the SDK's Get*EgressAllowlistExtra
 	// method names.
-"GET /v1/account/egress_allowlist_extra":                  "GetEgressAllowlistExtra",
+	"GET /v1/account/egress_allowlist_extra":                  "GetEgressAllowlistExtra",
 	"PATCH /v1/account/egress_allowlist_extra":                "SetEgressAllowlistExtra",
 	"GET /v1/apps/{slug}/logs":                                "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":                           "StreamDeploymentLogs",
