@@ -134,12 +134,12 @@ func guestAddr(t *testing.T, ln net.Listener) uint16 {
 
 // guestObservations captures what the guest saw.
 type guestObservations struct {
-	method   string
-	path     string
-	query    string
-	headers  http.Header
-	trailer  http.Header
-	body     string
+	method  string
+	path    string
+	query   string
+	headers http.Header
+	trailer http.Header
+	body    string
 	// For trailer assertions, the guest may also surface
 	// trailerPrefix fields through r.Trailer — captured above.
 }

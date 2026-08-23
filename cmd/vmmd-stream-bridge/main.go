@@ -13,7 +13,9 @@
 //     is spawned via `ip netns exec <netns> …` so it inherits the
 //     per-instance netns; ADR-009's strict-netns invariant is
 //     preserved by the spawn shape, not the binary itself).
+//
 //  2. Speaks H2C on that socket (cleartext HTTP/2, no TLS).
+//
 //  3. For each inbound H2C request, opens a fresh TCP connection
 //     to the guest at 10.0.0.2:<port> and bridges the envelope:
 //

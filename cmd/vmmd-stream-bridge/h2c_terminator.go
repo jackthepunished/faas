@@ -313,7 +313,7 @@ var hopByHopHeaders = map[string]struct{}{
 	// by construction — a future transport change can't accidentally
 	// leak Content-Length onto the H2 wire.
 	"Content-Length":    {},
-	"Transfer-Encoding":  {}, // HTTP/2 frames manage framing
+	"Transfer-Encoding": {}, // HTTP/2 frames manage framing
 	"Upgrade":           {}, // prior-knowledge skips Upgrade dance
 }
 

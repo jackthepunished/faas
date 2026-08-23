@@ -26,12 +26,12 @@ func TestCurrentBridgeFraming_PerRequestRollback(t *testing.T) {
 		env  string
 		want bridgeFraming
 	}{
-		{"", framingH1},        // legacy default
-		{"h1", framingH1},      // explicit legacy
-		{"h2c", framingH2C},    // ADR-126 path
-		{"h3c", framingH1},     // unknown falls through to h1
-		{"HTTP/2", framingH1},  // case-sensitive
-		{"H2C", framingH1},     // case-sensitive
+		{"", framingH1},       // legacy default
+		{"h1", framingH1},     // explicit legacy
+		{"h2c", framingH2C},   // ADR-126 path
+		{"h3c", framingH1},    // unknown falls through to h1
+		{"HTTP/2", framingH1}, // case-sensitive
+		{"H2C", framingH1},    // case-sensitive
 	}
 	for _, c := range cases {
 		t.Run(c.env, func(t *testing.T) {

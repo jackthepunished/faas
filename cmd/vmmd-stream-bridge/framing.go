@@ -3,11 +3,11 @@
 // sanitization + header parsing so the vmmd→guest envelope stays
 // consistent across both:
 //   - h1  : legacy H1+chunked path (today's writeH1RequestHead +
-//           writeChunkedBody). app_protocol=http1 (default) or
-//           explicit rollback via FAAS_BRIDGE_PROTOCOL=h1.
+//     writeChunkedBody). app_protocol=http1 (default) or
+//     explicit rollback via FAAS_BRIDGE_PROTOCOL=h1.
 //   - h2c : new H2C terminator path (h2c_terminator.go). Prior-
-//           knowledge HTTP/2 frames to the guest. app_protocol in
-//           {http2, grpc}.
+//     knowledge HTTP/2 frames to the guest. app_protocol in
+//     {http2, grpc}.
 //
 // The framing decision is per-stream (per inbound H2C request),
 // not per-bridge-process: each handler invocation reads its own

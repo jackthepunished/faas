@@ -163,8 +163,8 @@ func TestStreamBridgeEnv_AppProtocolWiring(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			req := &vmmdpb.ForwardHTTPRequestInit{
-				Method:     "GET",
-				RequestUri: "/",
+				Method:      "GET",
+				RequestUri:  "/",
 				AppProtocol: c.appProtocol,
 			}
 			env := streamBridgeEnv(req)
@@ -190,18 +190,18 @@ func TestStreamBridgeEnv_AppProtocolWiring(t *testing.T) {
 // switch-statement for a map can be reviewed for closed-set equality.
 func TestAppProtocolToBridgeProtocol_ClosedSet(t *testing.T) {
 	cases := map[string]string{
-		"":          "h1", // legacy callers (no AppProtocol field)
-		"http1":     "h1",
-		"http2":     "h2c",
-		"grpc":      "h2c",
+		"":      "h1", // legacy callers (no AppProtocol field)
+		"http1": "h1",
+		"http2": "h2c",
+		"grpc":  "h2c",
 		// Anything outside the closed-set falls through to h1 —
 		// apid rejects these at the customer-intent layer
 		// (pkg/api/limits.go::AppProtocol validator), so this
 		// path is the defense-in-depth rather than the
 		// load-bearing check.
-		"http3":     "h1",
-		"HTTP2":     "h1", // case-sensitive
-		"GRPC":      "h1",
+		"http3":       "h1",
+		"HTTP2":       "h1", // case-sensitive
+		"GRPC":        "h1",
 		" websocket ": "h1",
 	}
 	for in, want := range cases {
