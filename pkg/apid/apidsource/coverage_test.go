@@ -91,9 +91,9 @@ func (e *errStore) CreateBuild(ctx context.Context, deploymentID string, kind st
 // memBackend is a StorageBackend that records Puts in memory. Used
 // to drive the publishSource non-nil branch.
 type memBackend struct {
-	mu        sync.Mutex
-	puts      map[string][]byte
-	putErr    error
+	mu     sync.Mutex
+	puts   map[string][]byte
+	putErr error
 }
 
 func newMemBackend() *memBackend {
@@ -565,7 +565,7 @@ func (s *selectiveErrNotifier) Notify(_ context.Context, _, _ string) error {
 
 // --- TestEnqueue_FirstDeploySourceOmitted confirms that on the
 // FIRST deploy (no prev), no superseded notify fires — pins the
-// "prev.ID == ''" skip path at line 374.
+// "prev.ID == ”" skip path at line 374.
 func TestEnqueue_FirstDeploySourceOmitted_NoSupersede(t *testing.T) {
 	st := state.NewMemStore()
 	app := mustSeedApp(t, st)

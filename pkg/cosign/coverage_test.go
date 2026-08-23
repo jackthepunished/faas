@@ -71,19 +71,6 @@ func TestSigKeyFor_WireShape(t *testing.T) {
 
 // --- TrustListFromDir (verify.go:267) --------------------------------
 
-// trustWritePEM writes the public PEM at name (no app prefix — for
-// the single-app TrustedPublishersFromDir tests).
-func trustWritePEM(t *testing.T, dir, name string) {
-	t.Helper()
-	_, pubPEM, err := GenerateKeyPair()
-	if err != nil {
-		t.Fatalf("GenerateKeyPair: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, name+".pem"), pubPEM, 0o444); err != nil {
-		t.Fatalf("write %s: %v", name, err)
-	}
-}
-
 // trustWriteAppPEM writes a per-app trust file at the apid-side
 // filename shape: <uuid>--<signer>.pem. Returns the app_id used.
 func trustWriteAppPEM(t *testing.T, dir, appID, signer string) {
@@ -832,6 +819,7 @@ func (w *wrapStorage) Get(_ context.Context, key string) (io.ReadCloser, error) 
 	if err, ok := w.getErrors[key]; ok {
 		return nil, err
 	}
+	//nolint:contextcheck // override seam: caller-supplied ctx is intentionally bypassed so the underlying memStorage read isn't tied to a test-only timeout.
 	return w.memStorage.Get(context.Background(), key)
 }
 
