@@ -9883,6 +9883,70 @@ func (s *PgStore) MarkOldSnapshotsStale(ctx context.Context, beforeSnapshotIDs [
 	return tag.RowsAffected(), nil
 }
 
+// MarkAllSnapshotsStaleByAppProtocol flips every non-stale snapshot
+// whose deployment's app.app_protocol ∈ appProtocols stale
+// (ADR-127 §D1, Layer 6, the imaged F3 sweep). Idempotent.
+//
+// This is the app-protocol dimension of the F2/F3 split: F2
+// (MarkAllSnapshotsStaleByFCVersion above) handles Firecracker-
+// version mismatch (ADR-005); F3 handles base-image mismatch for
+// the wire-protocol-capable slice. app_protocol=http1 snapshots
+// are never affected — they ride the unchanged H1+chunked bridge
+// path (ADR-126 §Decision 6).
+//
+// A 0-row result on a stable box is the expected steady state;
+// ops monitors snapshot_fleet_avg_mb to detect the cold-boot spike
+// during an FAAS_BASE_IMAGE_VERSION bump.
+func (s *PgStore) MarkAllSnapshotsStaleByAppProtocol(ctx context.Context, appProtocols []string) (int64, error) {
+	if len(appProtocols) == 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update snapshots s
+		    set stale = true
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where s.deployment_id = d.id
+		    and a.app_protocol = any($1::text[])
+		    and s.stale = false`,
+		appProtocols)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// MarkSnapshotStaleByAppProtocol is the single-row mirror of
+// MarkAllSnapshotsStaleByAppProtocol (mirrors MarkSnapshotStale
+// above). Returns ErrNotFound when no snapshot matches the id
+// AND the deployment's app.app_protocol ∈ appProtocols — so the
+// caller can distinguish "row doesn't exist" from "row exists but
+// is on http1 (wrong protocol for this sweep)".
+func (s *PgStore) MarkSnapshotStaleByAppProtocol(ctx context.Context, snapshotID string, appProtocols []string) error {
+	if len(appProtocols) == 0 {
+		return errors.New("pgstore: MarkSnapshotStaleByAppProtocol: empty appProtocols set")
+	}
+	if snapshotID == "" {
+		return errors.New("pgstore: MarkSnapshotStaleByAppProtocol: empty snapshotID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update snapshots s
+		    set stale = true
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where s.id = $1::uuid
+		    and s.deployment_id = d.id
+		    and a.app_protocol = any($2::text[])`,
+		snapshotID, appProtocols)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // DeleteSnapshotsStaleOlderThan removes stale snapshots past the
 // retention window. Used by imaged's F2 startup sweep after the
 // mark-stale step — keeps stale rows restorable for a grace period

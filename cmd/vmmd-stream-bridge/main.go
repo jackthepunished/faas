@@ -93,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -101,6 +102,21 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/http2"
+	//nolint:staticcheck // golang.org/x/net/http2/h2c is deprecated by the
+	// stdlib's http.Protocols.SetUnencryptedHTTP2 (Go 1.24+), but the
+	// bitfield-only Protocols API does not expose a way to pin
+	// per-protocol http2.Server knobs (MaxConcurrentStreams,
+	// MaxReadFrameSize, IdleTimeout, ReadIdleTimeout, PingTimeout).
+	// ADR-127 §D2 (Layer 9) is load-bearing on those knobs matching the
+	// client-side transport pins; dropping the wrapper would silently
+	// regress Layer 9. See the buildServer() docstring for the
+	// canonical rationale. Once stdlib exposes a Protocols.Get-style
+	// indirection, this annotation can be removed.
+	"golang.org/x/net/http2/h2c"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // dialTimeout caps the inner-leg TCP dial against the guest.
@@ -163,22 +179,7 @@ func main() {
 		os.Exit(3)
 	}
 
-	srv := &http.Server{
-		Handler: newHandler(guestIP, uint16(port), deadline),
-		// ReadHeaderTimeout is the H2C connection preface budget;
-		// 10s is generous on a same-host unix socket.
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	// Enable cleartext HTTP/2 (H2C) on this listener via the stdlib
-	// Protocols API (Go 1.24+). Replaces the deprecated
-	// golang.org/x/net/http2/h2c.NewHandler wrapper; the vmmd client
-	// now sets its transport to AllowHTTP=true and dials the unix
-	// socket directly. The Protocols struct must be non-nil before
-	// calling SetUnencryptedHTTP2 (Go 1.26 panics on nil).
-	srv.Protocols = new(http.Protocols)
-	srv.Protocols.SetUnencryptedHTTP2(true)
-
-	// SIGTERM/SIGINT → graceful shutdown. vmmd sends SIGTERM after
+	srv := buildServer(guestIP, uint16(port), deadline)
 	// the gRPC ForwardHTTPStream returns; the bridge exits cleanly
 	// without truncating an in-flight stream.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -205,6 +206,91 @@ func main() {
 			fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 			os.Exit(4)
 		}
+	}
+}
+
+// buildServer constructs the stdlib http.Server the bridge
+// listens on for FAAS_BRIDGE_PROTOCOL=h2c traffic.
+//
+// ADR-127 §D2 (Layer 9) — the inner Handler is wrapped with
+// h2c.NewHandler so the listener negotiates H2C prior-knowledge
+// AND we get to pin per-protocol http2.Server knobs that
+// stdlib's Protocols.SetUnencryptedHTTP2 API (Go 1.24+) does
+// not expose. The handler argument is the newHandler closure;
+// the http2.Server is config-only — the runtime server is the
+// one stdlib builds inside h2c.NewHandler and attaches to the
+// wrapped handler.
+//
+// This function is the test seam for the listener-level
+// hardeners (TestMain_ServerHardeners). A refactor of the
+// h2c.MaxConcurrentStreams / h2cMaxReadFrameSize / IdleTimeout /
+// ReadIdleTimeout / PingTimeout block must update both sites
+// (this function and any sibling test) in lockstep; the comment
+// block at h2c_terminator.go::h2cMax* holds the constant
+// rationale.
+//
+// Pin rationale (the canonical location is here, not in tests):
+//   - MaxConcurrentStreams = 100 — matches gatewayd-public cap
+//     (pkg/gateway/internal_proxy.go).
+//   - MaxReadFrameSize     = 1 MiB — matches h2cMaxReadFrameSize
+//     on the client transport (symmetry contract).
+//   - IdleTimeout          = 60s — connection idle cap.
+//   - ReadIdleTimeout      = 30s — half of IdleTimeout; stdlib
+//     will Ping at this point.
+//   - PingTimeout          = 15s — response budget for the
+//     PING/PINGACK round-trip.
+//   - WriteByteTimeout     = 0 (UNSET) — see inline rationale.
+//     Capping DATA-frame pacing would break SSE / long-poll /
+//     gRPC server-streaming whose DATA frames span >30s. The
+//     guest's per-request context bounds end-of-stream, not us.
+//
+// Outer http.Server pins:
+//   - ReadHeaderTimeout  = 10s — H2C connection preface budget,
+//     generous on a same-host unix socket.
+//   - MaxHeaderBytes     = api.DefaultMaxHeaderBytes (1 MiB) —
+//     prevents HPACK-decode allocation attacks on a 1 MiB
+//     header list.
+//   - IdleTimeout        = 120s — connection idle lifetime cap.
+//   - ReadTimeout        = 0 (UNSET) — stdlib's ReadTimeout
+//     caps the ENTIRE request lifetime (headers + body), not
+//     just headers; a 30s cap would regress H1 streaming
+//     uploads (Hobby+ allows 100 MB) and any H2C request whose
+//     body takes >30s. ReadHeaderTimeout above is the
+//     Slowloris defence.
+//   - WriteTimeout       = 0 (UNSET) — streaming (SSE /
+//     long-poll / H2 DATA frames past the deadline) is the
+//     supported shape for both H1 and H2C paths.
+func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Server {
+	return &http.Server{
+		//nolint:staticcheck // ADR-127 §D2 (Layer 9) — the inner Handler is wrapped with
+		// h2c.NewHandler so the listener negotiates H2C prior-knowledge
+		// AND we get to pin per-protocol http2.Server knobs that
+		// stdlib's Protocols.SetUnencryptedHTTP2 API (Go 1.24+) does
+		// not expose. The handler argument is the newHandler closure;
+		// the http2.Server is config-only — the runtime server is the
+		// one stdlib builds inside h2c.NewHandler and attaches to the
+		// wrapped handler. See the import-block comment for the same
+		// rationale; once stdlib exposes a Protocols.Get indirection,
+		// both annotations can be removed in lockstep.
+		Handler: h2c.NewHandler(newHandler(guestIP, guestPort, deadline), &http2.Server{
+			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
+			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
+			// MaxHeaderListSize is a client-side SETTINGS capability
+			// (SETTINGS_MAX_HEADER_LIST_SIZE) and isn't an
+			// x/net/http2.Server field. The stdlib http.Server's
+			// MaxHeaderBytes above is the server-side equivalent
+			// — caps the per-request header list at 1 MiB and is
+			// applied before HPACK decode allocates per-name
+			// memory.
+			IdleTimeout:     60 * time.Second,
+			ReadIdleTimeout: 30 * time.Second,
+			PingTimeout:     15 * time.Second,
+			// WriteByteTimeout is intentionally UNSET (default 0 = unbounded). A 30s cap would terminate SSE responses, long-poll responses, and gRPC server-streaming responses whose DATA frames are spaced >30s apart — the canonical H2C use case. The bridge is the host-side proxy; the guest's per-request context bounds end-of-stream, not us.
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes, // 1 MiB
+		IdleTimeout:       120 * time.Second,
+		// ReadTimeout is intentionally UNSET. stdlib's ReadTimeout caps the ENTIRE request lifetime (headers + body), not just the headers; a 30s cap would regress slow H1 uploads (Hobby+ plans allow up to 100 MB streaming body) and any H2C request whose body takes >30s. The ReadHeaderTimeout above is the Slowloris defence; the per-request ctx deadline bounds the in-flight request lifetime. WriteTimeout is also UNSET — streaming (SSE / long-poll / H2 DATA frames past the deadline) is the supported shape for both H1 and H2C paths.
 	}
 }
 
@@ -240,7 +326,31 @@ func main() {
 // is out of scope for the cutover.
 func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		framing := currentBridgeFraming()
+		// Read FAAS_BRIDGE_PROTOCOL once per request: currentBridgeFraming uses the same value for dispatch, and the slog line below logs the raw string verbatim (operator correlation with FAAS_BRIDGE_PROTOCOL env flips). One syscall beats two.
+		bridgeProtoEnv := os.Getenv("FAAS_BRIDGE_PROTOCOL")
+		framing := currentBridgeFramingFrom(bridgeProtoEnv)
+		// ADR-127 §D3 (Layer 7) — framing-selection slog line. Captured at DEBUG, not Info: at Scale plan (5000 rps/account × N accounts × many bridge processes), per-request Info emission generates tens of thousands of JSON lines/sec/box and buries operator queries under journald's rate limit. Debug is the right level — the operator opts in via FAAS_LOG_LEVEL=debug (the canonical env flag, parsed at pkg/wire/ParseLevel) when investigating a framing question. The counter vmmd_bridge_framing_total carries the same information as a queryable metric; the dashboard panel 1 (bridge-protection deploy/grafana/bridge-protection.json) is the operator's primary view.
+		slog.Debug("vmmd-stream-bridge: framing selected",
+			"framing", framing.String(),
+			"app_protocol_env", bridgeProtoEnv,
+			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
+			"method", r.Method,
+			"path", r.URL.Path,
+		)
+		// ADR-127 §D3 (Layer 7) — bridge frames its own framing
+		// decision into the response head so vmmd can increment
+		// vmmd_bridge_framing_total on the read side. The header
+		// is set BEFORE the dispatch to handleH1Stream /
+		// handleH2CStream so both paths inherit it (stdlib honours
+		// pre-write w.Header().Set calls). vmmd's
+		// ForwardHTTPStream v2 path extracts this header on the
+		// other end and computes match/mismatch against
+		// reqInit.AppProtocol via appProtocolToBridgeProtocol. The
+		// header is dropped from the initHeaders sent down the
+		// gRPC stream (it is a control-plane signal, not a guest
+		// response header); see pkg/vmmdgrpc/forward.go loop at
+		// the response-header mirror site.
+		w.Header().Set("X-Faas-Bridge-Framing", framing.String())
 		switch framing {
 		case framingH2C:
 			handleH2CStream(w, r, guestIP, guestPort, deadline)

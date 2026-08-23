@@ -3154,6 +3154,17 @@ type Store interface {
 	// the Firecracker version that made them). Returns the number of rows
 	// affected. Idempotent.
 	MarkAllSnapshotsStaleByFCVersion(ctx context.Context, currentVersion string) (int64, error)
+	// MarkAllSnapshotsStaleByAppProtocol flips every non-stale snapshot
+	// whose deployment's app.app_protocol ∈ appProtocols stale
+	// (ADR-127 §D1, Layer 6 — imaged F3 sweep, the app-protocol
+	// dimension of the F2/F3 split). app_protocol=http1 snapshots are
+	// never affected. Idempotent.
+	MarkAllSnapshotsStaleByAppProtocol(ctx context.Context, appProtocols []string) (int64, error)
+	// MarkSnapshotStaleByAppProtocol is the single-row mirror of
+	// MarkAllSnapshotsStaleByAppProtocol. Returns ErrNotFound when no
+	// snapshot matches the id AND the deployment's app.app_protocol
+	// ∈ appProtocols. Empty appProtocols is an error (caller bug).
+	MarkSnapshotStaleByAppProtocol(ctx context.Context, snapshotID string, appProtocols []string) error
 	// MarkOldSnapshotsStale marks the given snapshot IDs stale (per-app
 	// "current + previous" enforcement, run before DeleteSnapshotsByID).
 	MarkOldSnapshotsStale(ctx context.Context, beforeSnapshotIDs []string) (int64, error)

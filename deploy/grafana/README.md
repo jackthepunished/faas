@@ -3,6 +3,20 @@
 Grafana 11 export. Panels cover all 7 of the spec §12 dashboard rows
 that are scorable today; one row remains deferred (rationale below).
 
+## `bridge-protection.json` (ADR-127 §D3 / G19)
+
+Four-panel dashboard for the bridge wire-protocol framing protection
+surface: framing rate by (app_protocol, bridge_protocol, framing) / 5m
+(`vmmd_bridge_framing_total`), framing MISMATCH rate (the alert source
+for `FaasBridgeFramingMismatch` in `bridge.rules.yml`), active
+bridge_protocol=h1 count on http2/grpc apps (the surgical-rollback
+indicator), and bridge H2C handshake latency p99
+(`vmmd_op_duration_seconds_bucket{op="bridge_h2c_roundtrip"}` — the
+histogram lands with a follow-on). UID `faas-bridge-protection-adr-127`.
+Companion alerts at `deploy/ansible/roles/prometheus/files/bridge.rules.yml`
+under `family: bridge` (FaasBridgeFramingMismatch + FaasBridgeRollbackStuck).
+Runbook: `docs/ops/h2c-rollback.md`.
+
 ## `warm-snapshot.json` (issue #470 / PR C / ADR-074)
 
 Four-panel dashboard for the warm-snapshot tier ops surface: warm-capture

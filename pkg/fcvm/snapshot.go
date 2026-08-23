@@ -1,5 +1,26 @@
 package fcvm
 
+// FAAS_BASE_IMAGE_VERSION is the per-image-version stamp the
+// h2c-capable base rootfs image is published under. Mirrors
+// Snapshot.FCVersion (ADR-005) but for the wire-protocol-capable
+// base image rather than Firecracker itself.
+//
+// Apps adopting app_protocol ∈ {http2, grpc} must adopt this version
+// of the base image (the H2C-capable runner listener — stdlib
+// srv.Protocols.SetUnencryptedHTTP2(true) — is part of the image);
+// apps staying on app_protocol=http1 ride the unchanged H1+chunked
+// bridge path and are unaffected.
+//
+// The imaged F3 sweep in pkg/imaged/handler.go::MarkAppProtocolSnapshotsStale
+// (ADR-127 §D1) flips every non-stale snapshot whose deployment's
+// app.app_protocol ∈ {http2, grpc} when this constant is bumped.
+// Lazy re-snapshot per ADR-005 handles the cold-boot spike
+// transparently.
+//
+// Version history:
+//   - v1 (2026-08-23): initial value post PR #1050 (ADR-126).
+const FAAS_BASE_IMAGE_VERSION = "v1"
+
 // Snapshot park/wake (ADR-005). A snapshot is a *cache*, never the truth:
 // Firecracker only guarantees a snapshot loads on the exact version that made it,
 // so every snapshot is pinned to its `fc_version`. On a Firecracker upgrade all

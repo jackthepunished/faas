@@ -1133,3 +1133,93 @@ trailers — no bridge-side re-framing, no H1 downgrade inside the VM.
   transparent to existing customers — `app_protocol=http1` rides
   the legacy path verbatim; `app_protocol ∈ {http2, grpc}` opts
   into the new wire shape by changing one customer-side CLI flag.
+
+## M8.6 — Wire-protocol selector hardening (ADR-127 / G19.1). 🚧
+
+Hardening follow-on to ADR-126 / G19 (the wire-shape shipped in
+PR #1050). The post-merge audit run the same day surfaced four
+production-readiness gaps that the shippable surface did not
+address; this PR closes three of them and ships the docs + ops
+material for the fourth. **Layer 12 (metal acceptance) is
+deliberately out of scope** and lands in two follow-on issues
+(G19.2 un-stub `cmd/e2e/bridge_h2c_terminator_metal_test.go`; G19.3
+add `deploy/ansible/roles/metal-h2c-acceptance/`).
+
+- **Layer 6 — snapshot invalidation on `app_protocol ∈ {http2, grpc}`
+  adoption.** New `pkg/fcvm.FAAS_BASE_IMAGE_VERSION = "v1"` stamps the
+  h2c-capable base rootfs (mirrors `Snapshot.FCVersion` per ADR-005;
+  apps adopting the new wire-shape must adopt the new image). New
+  `pkg/state.PgStore.MarkAllSnapshotsStaleByAppProtocol` + `MarkSnapshotStaleByAppProtocol`
+  (mirror the F2 bulk + single-row patterns at `pkg/state/pgstore.go:9739`
+  and `:9654` respectively). New `pkg/imaged.Handler.MarkAppProtocolSnapshotsStale`
+  caller, invoked by `pkg/imaged/loop.go::runFCSweep` after F2 (the
+  existing FC-version sweep); emits `warm_snapshot_stale` audit kind
+  with subject `"app_protocol:v1"`. `app_protocol=http1` rows stay
+  valid forever.
+
+- **Layer 9 — bridge listener + transport security pins.** Three
+  outbound transports (`cmd/vmmd-stream-bridge/h2c_terminator.go::newGuestH2CTransport`,
+  `pkg/vmmdgrpc/forward.go::newStreamBridgeH2CTransport`,
+  `pkg/gateway/internal_proxy.go::newInternalProxyH2CTransport`)
+  carry `MaxReadFrameSize=1 MiB` + `MaxHeaderListSize=1 MiB` +
+  `StrictMaxConcurrentStreams=true`. Inbound bridge listener
+  (`cmd/vmmd-stream-bridge/main.go::srv`) wraps the handler with
+  `golang.org/x/net/http2/h2c.NewHandler` (stdlib `Protocols.Get("h2")`
+  has no per-protocol knob exposure; the wrapper is the canonical way
+  to set per-protocol server limits) and pins
+  `MaxConcurrentStreams=100` + `MaxReadFrameSize=1 MiB` +
+  `IdleTimeout=60s` + `ReadIdleTimeout=30s` + `PingTimeout=15s` +
+  `WriteByteTimeout=30s`; server-side `MaxHeaderBytes=1 MiB` via
+  `api.DefaultMaxHeaderBytes`. `handleH2CStream` now has two
+  `defer`s at the top of its body: `defer recover()` (logs the
+  panic with stack + writes `500 bridge panic: ...` so a guest-side
+  bug cannot crash the bridge) and `defer transport.CloseIdleConnections()`
+  (so transport leaks do not pin guest-side fds).
+
+- **Layer 7 — bridge observability.** New
+  `pkg/wire.OpsMetrics.bridgeFramingTotal *prometheus.CounterVec`
+  registered as `vmmd_bridge_framing_total{app_protocol, bridge_protocol, framing}`;
+  pre-instantiated across the closed cross-product (3 × 2 × 2 = 12
+  series) at boot so the dashboard renders a zero row from idle
+  fleet (`TestOpsMetrics_BridgeFramingTotal_PreInstantiated`).
+  `framing ∈ {match, mismatch}` where `mismatch` means
+  `bridge_protocol` ≠ the canonical `appProtocolToBridgeProtocol`
+  translation — the operator-forced surgical-rollback signal.
+  `cmd/vmmd-stream-bridge/main.go::newHandler` now emits an
+  `slog.Info` framing-selection line on every request with
+  fields `framing`, `app_protocol_env`, `guest`, `method`, `path`
+  (Info not Debug because `FAAS_BRIDGE_PROTOCOL` env flip is the
+  operator's primary rollback signal). New dashboard
+  `deploy/grafana/bridge-protection.json` (UID
+  `faas-bridge-protection-adr-127`, schemaVersion 39) with four
+  panels: framing rate by (app_protocol, bridge_protocol, framing),
+  MISMATCH rate with red threshold 0.1 ops, active
+  `bridge_protocol=h1` count on `http2|grpc` apps, and bridge H2C
+  handshake latency p99. Companion Prometheus alerts at
+  `deploy/ansible/roles/prometheus/files/bridge.rules.yml` under
+  `family: bridge`: `FaasBridgeFramingMismatch` (warn, `> 0.1 ops`
+  for `1h`) + `FaasBridgeRollbackStuck` (page, mismatch rate sustained
+  for `4h`). Runbook at `docs/ops/h2c-rollback.md`.
+
+- **Layer 11 — docs parity.** Spec §4.1 line 115 above this row is
+  rewritten to drop the pre-ADR-126 "filed in §17 G19 as a multi-week
+  follow-on ADR" language and surface both ADR-126 (wire-shape in
+  fleet) and ADR-127 (hardening follow-on) as the load-bearing pair.
+  §17 G19 row stays `RESOLVED` — ADR-126 is the close, ADR-127 is
+  the hardening overlay. `docs/ops/h2c-rollout.md` + `docs/ops/h2c-rollback.md`
+  shipped next to `docs/ops/secrets-rotation.md` cover the rollout
+  + two-switch rollback + escalation policy.
+
+- **Out of scope (filed as follow-on issues).**
+  - **G19.2** — `cmd/e2e/bridge_h2c_terminator_metal_test.go`: un-stub
+    5 metal tests. Replace unconditional `t.Skip(...)` lines with
+    `metalAvailable(t)` gates using the canonical pattern at
+    `cmd/e2e/deploy_override_port_metal_test.go:165`. Build tag
+    `//go:build metal` preserved. Depends on G19.1 + G19.3.
+  - **G19.3** — `deploy/ansible/roles/metal-h2c-acceptance/`. Mirrors
+    `deploy/ansible/roles/control_plane_service/` shape;
+    `defaults/main.yml` exposes a 5-app fixture set
+    (`app_http1_default`, `app_http2_prior_knowledge`,
+    `app_grpc_unary`, `app_grpc_server_streaming`,
+    `app_surgical_rollback_target`); `tasks/main.yml` runs the 5
+    §14 M8 row 5 acceptance gates. Depends on G19.1 + G19.2.

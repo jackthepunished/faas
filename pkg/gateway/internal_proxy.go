@@ -264,6 +264,16 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 		IdleConnTimeout: 90 * time.Second,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
+		// ADR-127 §D2 (Layer 9) — outbound H2C client transport
+		// pins. Mirrors the same pins on the other two H2C
+		// transports (newGuestH2CTransport in
+		// cmd/vmmd-stream-bridge/h2c_terminator.go and
+		// newStreamBridgeH2CTransport in
+		// pkg/vmmdgrpc/forward.go). See those sites for
+		// per-field rationale.
+		MaxReadFrameSize:           1 << 20, // 1 MiB
+		MaxHeaderListSize:          1 << 20, // 1 MiB
+		StrictMaxConcurrentStreams: true,
 	}
 	return t
 }
