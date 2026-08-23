@@ -3407,3 +3407,29 @@ func (c *Client) DryRunAppOpenAPI(ctx context.Context, slug string, doc map[stri
 func (c *Client) DeleteAppOpenAPI(ctx context.Context, slug string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/openapi", nil, nil)
 }
+
+// ListAppDebugRequests returns the recent per-app request-telemetry
+// rows (status, latency_ms, route, deployment_id, trace_id,
+// received_at) for slug (ADR-127 / PR-A). The endpoint is the
+// read-side of the production-debugger data plane; the write-side
+// (gateway publisher → apid gRPC IncrementRequestTelemetry →
+// sqlc INSERT) lands in PR-B.
+//
+// since is a duration or 'Nd' alias (e.g. "30m", "24h", "3d") and
+// is clamped server-side to the plan's DebugTelemetryRetentionDays
+// (Free=off / 402; Hobby=3d; Pro=7d; Scale=14d). Empty falls
+// back to the server's default (24h). The response envelope's
+// `since` echoes the effective window applied, so a customer who
+// asks for 30d on Hobby gets 3d back with the same payload.
+//
+// 402 when the plan gates the feature (DebugTelemetryEnabled=false);
+// 404 when the app is owned by a different account (IDOR-safe
+// byte-identical-404).
+func (c *Client) ListAppDebugRequests(ctx context.Context, slug, since string) (DebugTelemetryListResponse, error) {
+	var out DebugTelemetryListResponse
+	path := "/v1/apps/" + slug + "/debug/requests"
+	if since != "" {
+		path += "?since=" + url.QueryEscape(since)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
