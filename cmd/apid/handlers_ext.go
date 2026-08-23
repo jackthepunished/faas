@@ -2312,7 +2312,6 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	if err != nil || app.AccountID != acct.ID {
 		if a, aerr := s.store.AppBySlug(r.Context(), req.AppID); aerr == nil && a.AccountID == acct.ID {
 			app = a
-			err = nil
 		} else {
 			s.notFound(w, "no such app")
 			return

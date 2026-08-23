@@ -1462,11 +1462,11 @@ func cmdRollback(args []string) int {
 		a := rest[i]
 		switch {
 		case a == "--to":
-			if i+1 >= len(rest) {
+			i++
+			if i >= len(rest) {
 				return printErr("Missing value", fmt.Errorf("--to requires a deployment_id"))
 			}
-			to = rest[i+1]
-			i++ // consume the value
+			to = rest[i] //nolint:gosec // G602: bounds checked immediately above
 		case strings.HasPrefix(a, "--to="):
 			to = a[len("--to="):]
 		default:
