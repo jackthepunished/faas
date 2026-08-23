@@ -927,6 +927,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// satisfies the retentionExecer contract.
 	go meter.RetentionLoop(ctx, poolAdapter{pool}, mc.RetentionInterval, log)
 
+	// ADR-127: per-request telemetry retention sweep. Runs on a
+	// shorter cadence (hourly default) than the usage_minutes
+	// sweep because Hobby's retention cap is 3 days — a daily
+	// sweep would let the table accumulate several extra days
+	// of rows between ticks.
+	go meter.RetentionLoopRequestTelemetry(ctx, poolAdapter{pool}, meter.RequestTelemetryRetentionInterval, log)
+
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
