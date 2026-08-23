@@ -38,6 +38,15 @@ curl -fsS http://127.0.0.1:9104/metrics | grep -E 'vmmd_wake_snapshot_tier_total
 
 ## Check
 
+> **Note on counter semantics** — `vmmd_wake_failure_total` is a
+> *per-step* counter (ADR-127 §3.5). The restore-fallback hook fires
+> for every restore failure regardless of whether the subsequent
+> cold-boot succeeds. A healthy fleet during a transient snapshot-
+> stale window can show `snapshot_restore_err` increments without any
+> customer-visible wake failures. Use `FaasColdBootRatioHigh` (this
+> alert) for customer-visible degradation; use the failure-reason
+> panel for per-step triage.
+
 ```bash
 # Per-reason failure breakdown — the §4.6 / §11 clues that tell us WHY
 # the snapshot stopped loading. A {reason="disk_full"} spike is the

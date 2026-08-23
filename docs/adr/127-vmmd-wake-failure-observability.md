@@ -87,8 +87,12 @@ collapses to `__other__`. This mirrors the existing precedent at
 64 covers the single-control-plane reality today (N=1) and gives
 headroom for the Tier A multi-host rollout (ADR-062, ADR-064, ADR-066
 chain). When `ComputeNodesGauge` lands as a fleet cardinality
-indicator, the cap moves to `pkg/api/limits.go` per the "new quota /
-limit → add to `pkg/api/limits.go` + docs" rule in CLAUDE.md.
+indicator, the cap stays in `pkg/wire/metrics.go` — system-level
+metric-label cardinality caps are owned by the metrics package per the
+sibling precedent of `maxAccountLabelValues` and `maxIPLabelValues`
+(also in `pkg/wire/metrics.go`). `pkg/api/limits.go` is reserved for
+*per-plan quotas* (deployed/concurrent/RAM), not fleet-cardinality
+caps.
 
 For now `box` resolves to the literal string `"local"` on vmmd and
 `schedd` (single-control-plane placeholder); the multi-host rollout
@@ -122,6 +126,41 @@ Hook sites:
 exists at `pkg/fcvm/vmm.go:684-688`). Including it now keeps the
 vocabulary closed and avoids a label-value migration later when
 hugetlbfs lands.
+
+### 3.5. What `vmmd_wake_failure_total` counts (per-step, not per-wake)
+
+The counter name is the most-precise label that still fits the
+existing §12 dashboard legend (`wake_failure`), but its semantic is
+**per-step**, not per-wake: the counter increments once per wake-step
+that fails, regardless of whether the wake ultimately returns success.
+
+Concretely:
+
+- The **restore-fallback hook** fires when the snapshot-restore step
+  fails. BootColdBoot is then attempted; if it succeeds, the wake
+  returns success to the customer, but `wake_failure_total` still
+  incremented (the operator sees `cold_boot_fallback` plus
+  `snapshot_restore_err` for that wake). The metric is the per-step
+  reason split, not the customer-visible outcome.
+- The **cold-boot terminal hook** fires only when BootColdBoot itself
+  fails — i.e. the wake returns an error to the customer.
+- The **setupNetwork hook** fires before `bringUp` is reached; if the
+  wake returns an error to the customer, this counter is the reason.
+- The **cgroup hooks** are warn-and-continue; they fire on the
+  warn path but the wake still returns success. They surface a
+  sustained silent regression that operators must catch from a panel.
+
+Operators cross-referencing the cold-boot-ratio alert against this
+counter should expect the counter to be *equal to or higher than* the
+ratio × wake volume: every cold-boot fallback implies at least one
+`snapshot_restore_err` increment, even when the wake ultimately
+succeeds via the cold-boot path. The runbook at
+`docs/runbooks/FaasColdBootRatioHigh.md` §Check documents this
+relationship.
+
+A future rename to `vmmd_wake_step_failure_total` is the cleanest
+fix for the ambiguity, but it's a §12 dashboard-legend migration
+deferred to a follow-up PR — see §6.
 
 ### 4. `box` value plumbing — `box = "local"` placeholder
 
