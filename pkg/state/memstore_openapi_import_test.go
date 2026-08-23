@@ -265,3 +265,80 @@ func TestMemStore_OpenAPIImport_DefensiveCopy(t *testing.T) {
 		t.Errorf("storage corrupted after caller mutation: got %q, want %q", string(got2), string(doc))
 	}
 }
+
+// TestMemStore_OpenAPIImport_IfUnderQuota exercises the three branches
+// of MemStore.UpsertAppOpenAPIDocIfUnderQuota (sibling of the
+// pgstore path tested in pgstore_openapi_import_test.go):
+//
+//  1. planMax <= 0  — fail-closed: QuotaError with NotAllowed=true,
+//     before any store lookup.
+//  2. observed >= planMax — quota-exceeded branch: a second upsert
+//     after the first row lands must return *QuotaError
+//     {Kind: openapi_imports, Limit: planMax, Observed: planMax,
+//     NotAllowed: false}.
+//  3. happy path — under quota, with valid (app, account) ownership:
+//     INSERT lands.
+//
+// Pins the MemStore mutex-then-map scan contract that mirrors the
+// pgstore tx's atomicity (the MemStore has no race; the pgstore
+// tx replaces the mutex).
+func TestMemStore_OpenAPIImport_IfUnderQuota(t *testing.T) {
+	m, ctx, acct, app := openAPIImportFixture(t)
+	doc := []byte(`{"openapi":"3.1.0","info":{"title":"quota"}}`)
+
+	// --- Branch 1: planMax <= 0 — fail-closed path.
+	for _, planMax := range []int{0, -1} {
+		err := m.UpsertAppOpenAPIDocIfUnderQuota(ctx, app, acct, doc, 1, "3.1.0", planMax)
+		if err == nil {
+			t.Fatalf("planMax=%d: expected QuotaError(NotAllowed=true), got nil", planMax)
+		}
+		var qe *QuotaError
+		if !errors.As(err, &qe) {
+			t.Fatalf("planMax=%d: expected *QuotaError, got %T: %v", planMax, err, err)
+		}
+		if qe.Kind != QuotaErrorKindOpenAPIImports {
+			t.Errorf("planMax=%d: Kind = %q, want %q", planMax, qe.Kind, QuotaErrorKindOpenAPIImports)
+		}
+		if !qe.NotAllowed {
+			t.Errorf("planMax=%d: NotAllowed = false, want true", planMax)
+		}
+		if qe.Limit != planMax {
+			t.Errorf("planMax=%d: Limit = %d, want %d", planMax, qe.Limit, planMax)
+		}
+	}
+
+	// --- Branch 3: happy path at planMax=1 — first upsert lands.
+	if err := m.UpsertAppOpenAPIDocIfUnderQuota(ctx, app, acct, doc, 1, "3.1.0", 1); err != nil {
+		t.Fatalf("first upsert at planMax=1: %v", err)
+	}
+
+	// --- Branch 2: quota-exceeded — second upsert at planMax=1
+	// trips the observed >= planMax branch.
+	err := m.UpsertAppOpenAPIDocIfUnderQuota(ctx, app, acct, doc, 1, "3.1.0", 1)
+	if err == nil {
+		t.Fatal("second upsert at planMax=1: expected QuotaError, got nil")
+	}
+	var qe *QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("second upsert: expected *QuotaError, got %T: %v", err, err)
+	}
+	if qe.Kind != QuotaErrorKindOpenAPIImports {
+		t.Errorf("Kind = %q, want %q", qe.Kind, QuotaErrorKindOpenAPIImports)
+	}
+	if qe.Limit != 1 {
+		t.Errorf("Limit = %d, want 1", qe.Limit)
+	}
+	if qe.Observed != 1 {
+		t.Errorf("Observed = %d, want 1", qe.Observed)
+	}
+	if qe.NotAllowed {
+		t.Errorf("NotAllowed = true on observed>=planMax path, want false")
+	}
+
+	// --- Branch 4: missing parent (foreign account) — IDOR
+	// floor rejects with ErrNotFound even when planMax is
+	// generous.
+	if err := m.UpsertAppOpenAPIDocIfUnderQuota(ctx, app, "ghost-acct", doc, 1, "3.1.0", 5); !errors.Is(err, ErrNotFound) {
+		t.Errorf("foreign-account upsert: got %v, want ErrNotFound", err)
+	}
+}
