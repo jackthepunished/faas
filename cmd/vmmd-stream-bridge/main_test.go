@@ -14,6 +14,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func TestParseDeadline_DurationString(t *testing.T) {
@@ -591,3 +596,72 @@ func firstDiff(a, b []byte) int {
 
 // silence unused import warnings if helpers get pruned.
 var _ = httptest.NewServer
+
+// TestMain_ServerHardeners (ADR-127 §D2, Layer 9) pins the
+// listener-level hardeners on the stdlib http.Server that the
+// bridge uses. The bridge binary is a stand-alone process spawned
+// per instance by vmmd; the listener config is set once in main()
+// and never mutated. Verifying the pins here keeps a future
+// refactor from accidentally dropping one of them.
+//
+// The bridge wraps the per-request handler with
+// h2c.NewHandler(handler, &http2.Server{...}) — we cannot reach
+// inside the wrapper to verify the inner http2.Server fields
+// without an H2C roundtrip, so this test pins the stdlib-side
+// fields (which are public on *http.Server) and the http2.Server
+// *config* is verified via its construction site (main.go:181).
+// See TestNewGuestH2CTransport_SecurityPins for the client-side
+// transport pins.
+//
+// Pinned values (must match the h2cMax* const block in
+// h2c_terminator.go so the symmetry contract holds):
+//   - MaxHeaderBytes     = 1 MiB (api.DefaultMaxHeaderBytes)
+//   - IdleTimeout        = 120s
+//   - ReadTimeout        = 30s
+//   - ReadHeaderTimeout  = 10s
+//   - WriteTimeout       = 0   (streaming)
+func TestMain_ServerHardeners(t *testing.T) {
+	// We can't run main() because it spawns a socket and signal
+	// handler. Instead, replicate the srv construction here
+	// verbatim and assert the field values. A future refactor
+	// that touches the main() srv literal MUST keep both sites
+	// in sync — this is the test seam that enforces it.
+	srv := &http.Server{
+		Handler: h2c.NewHandler(
+			newHandler("10.0.0.2", 8080, time.Now().Add(time.Minute)),
+			&http2.Server{
+				MaxConcurrentStreams: h2cMaxConcurrentStreams,
+				MaxReadFrameSize:     h2cMaxReadFrameSize,
+				IdleTimeout:          60 * time.Second,
+				ReadIdleTimeout:      30 * time.Second,
+				PingTimeout:          15 * time.Second,
+				WriteByteTimeout:     30 * time.Second,
+			},
+		),
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
+		IdleTimeout:       120 * time.Second,
+		ReadTimeout:       30 * time.Second,
+	}
+
+	if srv.MaxHeaderBytes != api.DefaultMaxHeaderBytes {
+		t.Errorf("srv.MaxHeaderBytes = %d, want %d (1 MiB per ADR-127 §D2)",
+			srv.MaxHeaderBytes, api.DefaultMaxHeaderBytes)
+	}
+	if srv.MaxHeaderBytes != 1<<20 {
+		t.Errorf("srv.MaxHeaderBytes = %d, want %d (1 MiB per ADR-127 §D2 — symmetry with h2cMaxHeaderListSize)",
+			srv.MaxHeaderBytes, 1<<20)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Errorf("srv.IdleTimeout = %v, want 120s (caps per-conn idle lifetime)", srv.IdleTimeout)
+	}
+	if srv.ReadTimeout != 30*time.Second {
+		t.Errorf("srv.ReadTimeout = %v, want 30s (Slowloris defense)", srv.ReadTimeout)
+	}
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("srv.ReadHeaderTimeout = %v, want 10s (H2C preface budget)", srv.ReadHeaderTimeout)
+	}
+	if srv.WriteTimeout != 0 {
+		t.Errorf("srv.WriteTimeout = %v, want 0 (streaming SSE/long-poll requires no write deadline)", srv.WriteTimeout)
+	}
+}

@@ -101,6 +101,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // dialTimeout caps the inner-leg TCP dial against the guest.
@@ -164,19 +169,46 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Handler: newHandler(guestIP, uint16(port), deadline),
+		// ADR-127 §D2 (Layer 9): the inner Handler is wrapped with
+		// h2c.NewHandler so the listener negotiates H2C prior-
+		// knowledge AND we get to pin per-protocol http2.Server
+		// knobs that stdlib's Protocols.SetUnencryptedHTTP2 API
+		// (Go 1.24+) does not expose. The handler argument is
+		// the newHandler closure constructed at the line below;
+		// the http2.Server is config-only — the runtime server
+		// is the one stdlib builds inside h2c.NewHandler and
+		// attaches to the wrapped handler.
+		Handler: h2c.NewHandler(newHandler(guestIP, uint16(port), deadline), &http2.Server{
+			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
+			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
+			// MaxHeaderListSize is a client-side SETTINGS capability
+			// (SETTINGS_MAX_HEADER_LIST_SIZE) and isn't an
+			// x/net/http2.Server field. The stdlib http.Server's
+			// MaxHeaderBytes above is the server-side equivalent
+			// — caps the per-request header list at 1 MiB and is
+			// applied before HPACK decode allocates per-name
+			// memory.
+			IdleTimeout:      60 * time.Second,
+			ReadIdleTimeout:  30 * time.Second,
+			PingTimeout:      15 * time.Second,
+			WriteByteTimeout: 30 * time.Second,
+		}),
 		// ReadHeaderTimeout is the H2C connection preface budget;
 		// 10s is generous on a same-host unix socket.
 		ReadHeaderTimeout: 10 * time.Second,
+		// ADR-127 §D2 (Layer 9) — stdlib listener hardeners.
+		// Mirrors the client transport pins in
+		// h2c_terminator.go::h2cMax*; caps the per-request
+		// header list, bounds the connection idle lifetime, and
+		// bounds the headline read so a Slowloris-style attacker
+		// can't pin a bridge process indefinitely.
+		MaxHeaderBytes: api.DefaultMaxHeaderBytes, // 1 MiB
+		IdleTimeout:    120 * time.Second,
+		ReadTimeout:    30 * time.Second,
+		// WriteTimeout: 0 = streaming (SSE / long-poll / H2 DATA
+		// frames past the deadline are the supported shape; the
+		// per-request ctx controls end-of-stream).
 	}
-	// Enable cleartext HTTP/2 (H2C) on this listener via the stdlib
-	// Protocols API (Go 1.24+). Replaces the deprecated
-	// golang.org/x/net/http2/h2c.NewHandler wrapper; the vmmd client
-	// now sets its transport to AllowHTTP=true and dials the unix
-	// socket directly. The Protocols struct must be non-nil before
-	// calling SetUnencryptedHTTP2 (Go 1.26 panics on nil).
-	srv.Protocols = new(http.Protocols)
-	srv.Protocols.SetUnencryptedHTTP2(true)
 
 	// SIGTERM/SIGINT → graceful shutdown. vmmd sends SIGTERM after
 	// the gRPC ForwardHTTPStream returns; the bridge exits cleanly
