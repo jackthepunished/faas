@@ -453,34 +453,34 @@ func reportComputeNodeShow(w io.Writer, n state.ComputeNode, live int) {
 	if n.Role != nil {
 		role = *n.Role
 	}
-	fmt.Fprintf(w, "name=%s\n", n.Name)
-	fmt.Fprintf(w, "id=%s\n", n.ID)
-	fmt.Fprintf(w, "role=%s\n", role)
-	fmt.Fprintf(w, "target_url=%s\n", n.TargetURL)
-	fmt.Fprintf(w, "vpcpus=%d\n", n.VPCPUs)
-	fmt.Fprintf(w, "mem_mb=%d\n", n.MemMB)
-	fmt.Fprintf(w, "max_concurrency=%d\n", n.MaxConcurrency)
-	fmt.Fprintf(w, "admission_ceiling_mb=%d\n", n.AdmissionCeilingMB)
-	fmt.Fprintf(w, "active=%t\n", n.Active)
+	_, _ = fmt.Fprintf(w, "name=%s\n", n.Name)
+	_, _ = fmt.Fprintf(w, "id=%s\n", n.ID)
+	_, _ = fmt.Fprintf(w, "role=%s\n", role)
+	_, _ = fmt.Fprintf(w, "target_url=%s\n", n.TargetURL)
+	_, _ = fmt.Fprintf(w, "vpcpus=%d\n", n.VPCPUs)
+	_, _ = fmt.Fprintf(w, "mem_mb=%d\n", n.MemMB)
+	_, _ = fmt.Fprintf(w, "max_concurrency=%d\n", n.MaxConcurrency)
+	_, _ = fmt.Fprintf(w, "admission_ceiling_mb=%d\n", n.AdmissionCeilingMB)
+	_, _ = fmt.Fprintf(w, "active=%t\n", n.Active)
 	if n.Region != nil {
-		fmt.Fprintf(w, "region=%s\n", *n.Region)
+		_, _ = fmt.Fprintf(w, "region=%s\n", *n.Region)
 	}
 	if n.Zone != nil {
-		fmt.Fprintf(w, "zone=%s\n", *n.Zone)
+		_, _ = fmt.Fprintf(w, "zone=%s\n", *n.Zone)
 	}
 	if n.ReleaseID != nil {
-		fmt.Fprintf(w, "release_id=%s\n", *n.ReleaseID)
+		_, _ = fmt.Fprintf(w, "release_id=%s\n", *n.ReleaseID)
 	}
 	if n.ManifestHash != nil {
-		fmt.Fprintf(w, "manifest_hash=%s\n", *n.ManifestHash)
+		_, _ = fmt.Fprintf(w, "manifest_hash=%s\n", *n.ManifestHash)
 	}
 	if n.CertFingerprint != nil {
-		fmt.Fprintf(w, "cert_fingerprint=%s\n", *n.CertFingerprint)
+		_, _ = fmt.Fprintf(w, "cert_fingerprint=%s\n", *n.CertFingerprint)
 	}
 	if n.Generation != nil {
-		fmt.Fprintf(w, "generation=%d\n", *n.Generation)
+		_, _ = fmt.Fprintf(w, "generation=%d\n", *n.Generation)
 	}
-	fmt.Fprintf(w, "live_instance_count=%d\n", live)
+	_, _ = fmt.Fprintf(w, "live_instance_count=%d\n", live)
 }
 
 // computeNodeShowJSON is the wire shape for `compute-nodes show --json`.
