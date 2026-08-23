@@ -1139,6 +1139,43 @@ type Limits struct {
 	// rows beyond the cap are deleted first on the retention
 	// purge. Free=25, Hobby=100, Pro=500, Scale=1000.
 	AppErrorsMaxRequestRowsPerFingerprint int
+
+	// DebugTelemetryEnabled (ADR-127 / production debugger) gates
+	// whether the per-request telemetry plane is on for an
+	// account. Free=false (the abuse-floor tier carries no
+	// debugger surface; the upsell is the wake-elision / rollback
+	// guarantee). Hobby/Pro/Scale=true. Surfaced at
+	// cmd/apid/handlers_debug_telemetry.go via
+	// api.ErrPlanFeatureGated.
+	DebugTelemetryEnabled bool
+	// DebugTelemetryRetentionDays (ADR-127) is the per-plan cap
+	// on how long a request_telemetry row is queryable. The
+	// RetentionOnceRequestTelemetry sweep in
+	// pkg/meter/retention.go drops the oldest monthly partition
+	// whose max(received_at) is older than this bound. Free=0
+	// (off), Hobby=3, Pro=7, Scale=14.
+	DebugTelemetryRetentionDays int
+	// DebugTelemetryRequestsPerMinute (ADR-127) is the per-account
+	// rate cap on the IncrementRequestTelemetry ingest RPC. The
+	// recorder publisher reads this at startup; per-record
+	// overflow returns outcome {code: RATE_LIMITED, retry_after}
+	// rather than dropping silently. Hobby=1000, Pro=10000,
+	// Scale=50000.
+	DebugTelemetryRequestsPerMinute int
+	// DebugTelemetryDeploymentsPerApp (ADR-127 §Decision 4) is
+	// the per-app ceiling on distinct deployment_id labels the
+	// gateway_request_duration_seconds histogram admits. Past the
+	// cap the deploymentLabelSet (pkg/gateway/deployment_label_set.go)
+	// collapses the label to "__other__" — same discipline as
+	// accountLabelSet (pkg/wire/metrics.go:256, 312). Hobby=10,
+	// Pro=50, Scale=200.
+	DebugTelemetryDeploymentsPerApp int
+	// DebugTelemetrySpansPerTrace (ADR-127 §Decision 5) caps the
+	// number of customer OTel spans the platform retains per
+	// request_telemetry row's spans_summary jsonb. Past the cap
+	// the slowest N are kept and the rest truncated. Hobby=50,
+	// Pro=200, Scale=1000.
+	DebugTelemetrySpansPerTrace int
 }
 
 // UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
@@ -1480,6 +1517,16 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                1,
 		AppErrorsMaxFingerprintsPerApp:        50,
 		AppErrorsMaxRequestRowsPerFingerprint: 25,
+		// ADR-127 production debugger. Free is gated off: no
+		// debugger surface, no rate budget, no retention. The
+		// handler returns 402 ErrPlanFeatureGated before the store
+		// is touched; the 0/0/0/0 here is the fail-closed
+		// defence-in-depth value the store still reads.
+		DebugTelemetryEnabled:                false,
+		DebugTelemetryRetentionDays:          0,
+		DebugTelemetryRequestsPerMinute:      0,
+		DebugTelemetryDeploymentsPerApp:      0,
+		DebugTelemetrySpansPerTrace:          0,
 	},
 	PlanHobby: {
 		Plan:                  PlanHobby,
@@ -1801,6 +1848,17 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                7,
 		AppErrorsMaxFingerprintsPerApp:        200,
 		AppErrorsMaxRequestRowsPerFingerprint: 100,
+		// ADR-127 production debugger. Hobby gets the small-tier
+		// debugger surface: 3-day retention, 1000 req/min, up to
+		// 10 distinct deployments in the histogram, 50 spans per
+		// trace. The Hobby customer is debugging a single Hobby
+		// app — the 3-day cap matches the log-archive retention
+		// (spec §4.7).
+		DebugTelemetryEnabled:                true,
+		DebugTelemetryRetentionDays:          3,
+		DebugTelemetryRequestsPerMinute:      1000,
+		DebugTelemetryDeploymentsPerApp:      10,
+		DebugTelemetrySpansPerTrace:          50,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,
@@ -2093,6 +2151,16 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                30,
 		AppErrorsMaxFingerprintsPerApp:        1000,
 		AppErrorsMaxRequestRowsPerFingerprint: 500,
+		// ADR-127 production debugger. Pro = "this month"
+		// retention, 10000 req/min, up to 50 distinct deployments
+		// in the histogram, 200 spans per trace. The 7-day
+		// retention matches the spec §4.7 "incident window"
+		// for the Pro plan.
+		DebugTelemetryEnabled:                true,
+		DebugTelemetryRetentionDays:          7,
+		DebugTelemetryRequestsPerMinute:      10000,
+		DebugTelemetryDeploymentsPerApp:      50,
+		DebugTelemetrySpansPerTrace:          200,
 	},
 	PlanScale: {
 		Plan:                  PlanScale,
@@ -2412,6 +2480,19 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                90,
 		AppErrorsMaxFingerprintsPerApp:        5000,
 		AppErrorsMaxRequestRowsPerFingerprint: 1000,
+		// ADR-127 production debugger. Scale = "this quarter"
+		// retention, 50000 req/min, up to 200 distinct deployments
+		// in the histogram, 1000 spans per trace. The 14-day cap
+		// matches the scale tier's incident-window expectations;
+		// the deployment-label cap of 200 is what makes the
+		// deploymentLabelSet discipline load-bearing (without the
+		// cap a fleet with thousands of historical deployments
+		// would blow up Prometheus cardinality).
+		DebugTelemetryEnabled:                true,
+		DebugTelemetryRetentionDays:          14,
+		DebugTelemetryRequestsPerMinute:      50000,
+		DebugTelemetryDeploymentsPerApp:      200,
+		DebugTelemetrySpansPerTrace:          1000,
 	},
 }
 
@@ -3788,6 +3869,73 @@ func (p Plan) AppErrorsMaxRequestRowsPerFingerprint() int {
 		return 25
 	}
 	return l.AppErrorsMaxRequestRowsPerFingerprint
+}
+
+// DebugTelemetryEnabled (ADR-127) returns whether the per-request
+// telemetry plane is on for the account. Used by the apid handler
+// in cmd/apid/handlers_debug_telemetry.go to fail-closed before the
+// store is touched (api.ErrPlanFeatureGated). Returns false on
+// unknown plans (Free-tier floor — debug telemetry is a paid-only
+// surface, same posture as the per-plan *Allowed fields above).
+func (p Plan) DebugTelemetryEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.DebugTelemetryEnabled
+}
+
+// DebugTelemetryRetentionDays (ADR-127) returns the per-plan cap on
+// how long a request_telemetry row is queryable. Read by
+// RetentionOnceRequestTelemetry in pkg/meter/retention.go to decide
+// which monthly partition to drop. Returns 0 on unknown plans (Free
+// floor — debug telemetry is off, retention is 0).
+func (p Plan) DebugTelemetryRetentionDays() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryRetentionDays
+}
+
+// DebugTelemetryRequestsPerMinute (ADR-127) returns the per-account
+// rate cap on the IncrementRequestTelemetry ingest RPC. Read by the
+// publisher at startup; per-record overflow returns outcome
+// {code: RATE_LIMITED, retry_after}. Returns 0 on unknown plans.
+func (p Plan) DebugTelemetryRequestsPerMinute() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryRequestsPerMinute
+}
+
+// DebugTelemetryDeploymentsPerApp (ADR-127 §Decision 4) returns the
+// per-app ceiling on distinct deployment_id labels the
+// gateway_request_duration_seconds histogram admits. Read by
+// deploymentLabelSet (pkg/gateway/deployment_label_set.go) at
+// histogram-emission time; overflow collapses to "__other__". Returns
+// 0 on unknown plans — fail-closed, same posture as the deployment-cap
+// fields above.
+func (p Plan) DebugTelemetryDeploymentsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryDeploymentsPerApp
+}
+
+// DebugTelemetrySpansPerTrace (ADR-127 §Decision 5) returns the cap
+// on customer OTel spans retained per request_telemetry row's
+// spans_summary jsonb. Read by the OTel ingest path; past the cap
+// the slowest N are kept and the rest truncated. Returns 0 on unknown
+// plans.
+func (p Plan) DebugTelemetrySpansPerTrace() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetrySpansPerTrace
 }
 
 // LivenessPeriodSeconds returns the per-plan default poll cadence
