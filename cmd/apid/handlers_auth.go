@@ -36,8 +36,11 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -293,12 +296,35 @@ func looksLikeEmail(s string) bool {
 var _ = context.Background
 
 // loadSessionManager is the boot-time helper cmd/apid/main.go uses
-// to wire the session.Manager. It reads FAAS_SESSION_KEY as a
-// hex-encoded 32-byte string; empty in dev = ephemeral key + a
-// warning string the caller can log.
+// to wire the session.Manager. It reads FAAS_SESSION_KEY under one of
+// two shapes — see ADR-127 / env-var-shape-content-vs-path-systemd-
+// loadcredential memory for the canonical rule:
 //
-// Production MUST set FAAS_SESSION_KEY to the hex contents of
-// /etc/faas/secrets/session.key (root:root 0400, spec §11).
+//   - **PATH-shaped** (production default): the env var holds a
+//     tmpfs path produced by systemd `LoadCredential=faas_session_key`
+//
+//   - `Environment=FAAS_SESSION_KEY=%d/faas_session_key`. systemd
+//     copies /etc/faas/secrets/session.key (root:root 0400, spec §11)
+//     to $CREDENTIALS_DIRECTORY and exposes the tmpfs copy via %d/.
+//     We os.ReadFile the path, then hex-decode the file content.
+//
+//   - **CONTENT-shaped** (e2e tests, dev, operator muscle memory):
+//     the env var holds the raw 64-hex-char string directly.
+//     Compatible with the historical "FAAS_SESSION_KEY=<hex>" form
+//     in /etc/faas/sealed.env (still legal for operators who don't
+//     migrate to LoadCredential — but verify-secrets.sh asserts this
+//     shape is NOT in sealed.env on production boxes; see
+//     deploy/scripts/verify-secrets.sh:39-50).
+//
+// If the env value starts with '/' AND stat()s to a regular file,
+// PATH-shaped wins (the env var IS the path). Otherwise we treat the
+// value as raw content.
+//
+// Empty value → ephemeral manager + warning (dev fallback).
+// Both shapes must produce a 32-byte hex key or the loader refuses to
+// boot. Fail-closed: a broken key surfaces as a log.Error rather than
+// a silent fallback to ephemeral mode (the A5 silent-degradation bug
+// that motivated issue #585 / ADR-127 review-fix R1+R2).
 func loadSessionManager(getenv func(string) string, log *slog.Logger) (*session.Manager, string) {
 	raw := strings.TrimSpace(getenv("FAAS_SESSION_KEY"))
 	if raw == "" {
@@ -309,12 +335,35 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) (*session.
 		}
 		return m, "FAAS_SESSION_KEY unset; ephemeral key in use"
 	}
+	// Shape detection: a leading "/" plus an existing regular file is
+	// the canonical PATH-shaped contract (systemd %d/faas_session_key
+	// resolves to $CREDENTIALS_DIRECTORY/faas_session_key, owned by
+	// the unit's uid, mode 0600). Anything else (a hex string, a
+	// missing file, a non-path value) falls through to the
+	// CONTENT-shaped decoder for back-compat.
+	if strings.HasPrefix(raw, "/") {
+		if info, err := os.Stat(raw); err == nil && info.Mode().IsRegular() {
+			data, readErr := os.ReadFile(raw)
+			if readErr != nil {
+				log.Error("FAAS_SESSION_KEY path read failed",
+					"path", raw, "err", readErr)
+				return nil, "FAAS_SESSION_KEY path read failed"
+			}
+			raw = strings.TrimSpace(string(data))
+			log.Info("FAAS_SESSION_KEY loaded via LoadCredential path",
+				"path", raw, "mode", info.Mode().String())
+		}
+	}
 	key, err := hex.DecodeString(raw)
 	if err != nil || len(key) != 32 {
-		log.Error("FAAS_SESSION_KEY must be 64 hex chars (32 bytes)", "got_len", len(raw))
+		log.Error("FAAS_SESSION_KEY must be 64 hex chars (32 bytes)",
+			"got_len", len(raw), "hex_err", decodeErr(err))
 		// Fail closed: refuse to boot with a broken key. Operators
 		// notice; dev gets a clear error rather than a silently
-		// invalid manager.
+		// invalid manager. The previous version logged got_len but
+		// swallowed the underlying parse error which made "FAAS_SESSION_KEY
+		// is set to a path" indistinguishable from a "wrong-byte-length
+		// truncation" in the operator runbook.
 		return nil, "FAAS_SESSION_KEY invalid"
 	}
 	m, err := session.NewManager(key, 7*24*time.Hour)
@@ -324,3 +373,25 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) (*session.
 	}
 	return m, ""
 }
+
+// decodeErr returns a short error string for the slog log; nil means
+// "no error to decode". Lifted out so the call site reads cleaner
+// against the multi-source raw (path-read vs env-direct).
+func decodeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	// Truncate to keep the JSON log line bounded; the operator can
+	// always re-run with `journalctl -u faas-apid -o cat` to see the
+	// full hex error.
+	if len(err.Error()) > 120 {
+		return err.Error()[:120] + "..."
+	}
+	return err.Error()
+}
+
+// isNotExist is a tiny fs.ErrNotExist wrapper for tests that want
+// to assert the path-stat branch fell through to the content
+// decoder. Lifted out so the test imports don't need to know the
+// stdlib shape.
+func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }

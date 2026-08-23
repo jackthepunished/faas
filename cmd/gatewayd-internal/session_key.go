@@ -13,24 +13,38 @@
 // AEAD keys are per-process, and a shared helper would imply a
 // shared key path, which crosses the per-daemon secret boundary
 // (spec §11).
+//
+// The cmd/apid loader (cmd/apid/handlers_auth.go::loadSessionManager)
+// supports BOTH the PATH-shaped env-var contract (systemd
+// LoadCredential + Environment=KEY=%d/<id> → os.ReadFile on the path)
+// and the CONTENT-shaped contract (raw hex in the env). gatewayd-internal
+// delivers FAAS_SESSION_KEY via per-daemon EnvironmentFile= (issue
+// #585 / ADR-127) so CONTENT-shaped is the canonical contract here;
+// the PATH-shaped branch is a defense-in-depth mirror of the apid
+// loader's behaviour so a misconfigured systemd unit doesn't silently
+// fall through to ephemeral mode (the A5 silent-degradation bug
+// closed by PR #1075 review-fix R1+R2).
 package main
 
 import (
 	"encoding/hex"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/session"
 )
 
 // loadSessionManager matches cmd/apid/handlers_auth.go::loadSessionManager
-// verbatim (the two daemons share the same env contract; the
-// repetition is the per-daemon secret boundary). Empty env value
-// → ephemeral manager + a warning the caller logs. Production
-// sets FAAS_SESSION_KEY to the hex contents of /etc/faas/secrets/
-// session.key (root:root 0400, spec §11).
+// for the env contract — both daemons read FAAS_SESSION_KEY the same
+// way so a misconfigured unit gets caught loud instead of silently
+// falling back to ephemeral mode. Empty env value → ephemeral manager
+// + warning (dev fallback). PATH-shaped input (leading "/" + existing
+// regular file) is read via os.ReadFile; CONTENT-shaped input (raw
+// hex) is decoded in place.
 func loadSessionManager(getenv func(string) string, log *slog.Logger) *session.Manager {
-	raw := getenv("FAAS_SESSION_KEY")
+	raw := strings.TrimSpace(getenv("FAAS_SESSION_KEY"))
 	if raw == "" {
 		m, err := session.NewEphemeralManager(7 * 24 * time.Hour)
 		if err != nil {
@@ -39,6 +53,22 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) *session.M
 		}
 		log.Warn("FAAS_SESSION_KEY unset; ephemeral session key in use (dev only)")
 		return m
+	}
+	// PATH-shaped branch — mirrors cmd/apid/handlers_auth.go so a
+	// future migration of gatewayd-internal to LoadCredential stays
+	// a one-line unit change without an apid-side ripple.
+	if strings.HasPrefix(raw, "/") {
+		if info, err := os.Stat(raw); err == nil && info.Mode().IsRegular() {
+			data, readErr := os.ReadFile(raw)
+			if readErr != nil {
+				log.Error("FAAS_SESSION_KEY path read failed",
+					"path", raw, "err", readErr)
+				return nil
+			}
+			raw = strings.TrimSpace(string(data))
+			log.Info("FAAS_SESSION_KEY loaded via LoadCredential path",
+				"path", raw, "mode", info.Mode().String())
+		}
 	}
 	key, err := hex.DecodeString(raw)
 	if err != nil {
