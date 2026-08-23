@@ -303,16 +303,16 @@ func cmdComputeNodesList(args []string) int {
 // command hung).
 func reportComputeNodesList(w io.Writer, nodes []state.ComputeNode, activeOnly bool) {
 	if len(nodes) == 0 {
-		fmt.Fprintf(w, "(no compute nodes%s)\n", activeOnlyString(activeOnly))
+		_, _ = fmt.Fprintf(w, "(no compute nodes%s)\n", activeOnlyString(activeOnly))
 		return
 	}
-	fmt.Fprintf(w, "%-32s  %-15s  %-7s  %-7s  %-7s  %-7s  %s\n", "NAME", "ROLE", "VPCPUS", "MEM_MB", "MAXCON", "ACTIVE", "TARGET_URL")
+	_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7s  %-7s  %-7s  %-7s  %s\n", "NAME", "ROLE", "VPCPUS", "MEM_MB", "MAXCON", "ACTIVE", "TARGET_URL")
 	for _, n := range nodes {
 		role := ""
 		if n.Role != nil {
 			role = *n.Role
 		}
-		fmt.Fprintf(w, "%-32s  %-15s  %-7d  %-7d  %-7d  %-7t  %s\n",
+		_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7d  %-7d  %-7d  %-7t  %s\n",
 			n.Name, role, n.VPCPUs, n.MemMB, n.MaxConcurrency, n.Active, n.TargetURL)
 	}
 }

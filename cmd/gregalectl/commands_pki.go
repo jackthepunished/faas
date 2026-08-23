@@ -134,16 +134,6 @@ func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
 	return fs, f
 }
 
-// newPKIListFlags builds the flag set for the read-only `list`
-// leaf. Adds --json to the surface newPKIFlags exposes and
-// defaults --force to false (list never writes).
-func newPKIListFlags(name string) (*flag.FlagSet, *pkiFlags) {
-	fs, f := newPKIFlags(name, false)
-	fs.BoolVar(&f.force, "force", false,
-		"ignored; the read-only list leaf never writes")
-	return fs, f
-}
-
 // cmdPKIInit issues the CA + every per-daemon leaf. Idempotent: leaves
 // with NotAfter >= ReissueThreshold are skipped silently so re-running
 // `gregalectl pki init` after a partial failure doesn't churn the rest of
