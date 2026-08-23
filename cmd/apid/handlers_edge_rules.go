@@ -313,6 +313,14 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		Enabled:      enabled,
 		Kind:         state.EdgeRuleKind(req.Kind),
 		Action:       actionFromBody(req.Kind, req.Action),
+		// ValidateMode (ADR-128): top-level source of truth
+		// for kind=validate. Extracted from the action JSON
+		// when kind=validate (actionFromBody returns a typed
+		// state.EdgeRuleAction with the Validate substruct
+		// populated); empty for non-validate kinds (the
+		// column is irrelevant but NOT NULL forces 'block'
+		// anyway).
+		ValidateMode: validateModeFromAction(req.Kind, req.Action),
 	}, limits)
 	if err != nil {
 		var qe *state.EdgeRuleQuotaError
@@ -676,8 +684,40 @@ func edgeRuleUpdateParamsFrom(req api.UpdateEdgeRuleRequest, kind state.EdgeRule
 	if req.Action != nil {
 		decoded := actionFromBody(string(kind), *req.Action)
 		out.Action = &decoded
+		// ValidateMode (ADR-128): top-level column is the
+		// source of truth. Empty string from the wire is
+		// coerced to 'block' by the SQL coalesce — matches
+		// the strictest-mode default. A nil pointer on the
+		// wire (request body has no action.validate_mode
+		// field) translates to a nil pointer here, which
+		// the pgstore Update coalesces to "leave alone".
+		mode := validateModeFromAction(string(kind), *req.Action)
+		out.ValidateMode = &mode
 	}
 	return out
+}
+
+// validateModeFromAction extracts the kind=validate mode from
+// a wire action JSON, returning "" for non-validate kinds or
+// for validate kinds without the field set. The pgstore
+// INSERT coalesces '' to 'block' (the SQL-side default at 00293
+// is also 'block') so empty is the right sentinel for "use
+// the strictest mode".
+func validateModeFromAction(kind string, raw json.RawMessage) string {
+	if kind != string(state.EdgeRuleKindValidate) {
+		return ""
+	}
+	var a api.EdgeRuleValidateAction
+	if err := json.Unmarshal(raw, &a); err != nil {
+		// actionFromBody would have already surfaced this
+		// error path; reaching here means the body decoded
+		// at least syntactically. Treat malformed fragments
+		// as "use the default" rather than 500ing on the
+		// re-decode — the primary decode already cleared
+		// the validateEdgeRuleAction gate.
+		return ""
+	}
+	return a.ValidateMode
 }
 
 // --- delete ----------------------------------------------------------------
