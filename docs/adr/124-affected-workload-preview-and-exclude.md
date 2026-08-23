@@ -144,6 +144,20 @@ notes:
   `"noop"`, and they appear in a new `Skipped []PlanAffectedApp` field
   on the response so the dashboard can render "excluded by operator."
 
+`Removed` is the **destructive** subset and is **project-scoped**
+(the project being previewed) rather than account-scoped, while
+`Unaffected` is account-scoped (blast-radius view). The shape
+itself — `[]string` of slugs, not `[]PlanAffectedApp` — is fixed
+in §1 (lines 113-115): removal is a one-way action with no
+per-row editable metadata worth surfacing. The preview path stamps
+`Removed` from the partition (project-scoped apps whose key isn't
+in the scan set); the apply path stamps it from the canonical
+`pkg/reconcile.diff.workloadDiff` result. The two paths must agree
+on the set, or the operator sees one set pre-apply and a different
+set on the apply response — a contradiction that would silently
+break the trust contract. Pin at `TestPlanResponse_RemovedShape`
+in `pkg/api/characterization_test.go`.
+
 ### 4. New request field: `exclude` (multipart)
 
 Mirror the `only` form field (`pkg/api/client.go:947` and
