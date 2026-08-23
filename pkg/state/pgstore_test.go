@@ -4233,8 +4233,12 @@ func TestPg_DeploymentOrdinal(t *testing.T) {
 
 	insert := func(id string, appID string, at time.Time) {
 		t.Helper()
+		// Status 'building' instead of 'live' — the deployments_app_scope_live_uniq
+		// partial unique index (migration 00213) caps each (app_id, scope) at one
+		// live row. The ordinal query doesn't depend on status; we only need
+		// distinct rows for the test.
 		mustExec(`insert into deployments (id, app_id, status, image_digest, created_at)
-		          values ($1, $2, 'live', 'sha256:ord', $3)`,
+		          values ($1, $2, 'building', 'sha256:ord', $3)`,
 			id, appID, at)
 	}
 	// Insert out-of-order to exercise (created_at, id) sort.
