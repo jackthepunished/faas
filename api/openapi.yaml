@@ -10125,6 +10125,29 @@ components:
           type: [string, "null"]
           pattern: '^[a-f0-9]{40}$'
           description: "40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA."
+        # Issue #977 / ADR-116 — deployment annotation echo. The four
+        # columns stamped at create time are surfaced verbatim so the
+        # dashboard, CLI history, and SDK consumers can render the
+        # annotation without an audit round-trip. omitempty on each
+        # keeps pre-feature rows byte-identical to the pre-PR wire
+        # shape. The closed-set vocabulary on tag and the length cap
+        # on reason are enforced at the schema layer
+        # (deployments_tag_set_chk / deployments_reason_len_chk).
+        reason:
+          type: string
+          maxLength: 280
+          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+        tag:
+          type: string
+          enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag for grouping/filtering."
+        deployed_by:
+          type: string
+          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+        pr_number:
+          type: integer
+          minimum: 1
+          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     UpdateDeploymentRequest:
 
@@ -11717,6 +11740,29 @@ components:
           enum: [tarball]
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
+        # Issue #977 / ADR-116 — deployment annotation echo. The four
+        # columns stamped at create time are surfaced verbatim so the
+        # dashboard, CLI history, and SDK consumers can render the
+        # annotation without an audit round-trip. omitempty on each
+        # keeps pre-feature rows byte-identical to the pre-PR wire
+        # shape. The closed-set vocabulary on tag and the length cap
+        # on reason are enforced at the schema layer
+        # (deployments_tag_set_chk / deployments_reason_len_chk).
+        reason:
+          type: string
+          maxLength: 280
+          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+        tag:
+          type: string
+          enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag for grouping/filtering."
+        deployed_by:
+          type: string
+          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+        pr_number:
+          type: integer
+          minimum: 1
+          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     DiffRequest:
       description: |
@@ -12674,6 +12720,81 @@ components:
             `X-Validation-Warning: <rule_id>` on the response. An
             empty / omitted value is coerced to `block` at the
             gateway-side handler.
+
+    EdgeRuleCacheAction:
+      description: |
+        Edge-cache control primitive (ADR-122, kind=cache). Wraps the
+        response body in a per-route freshness window so a wake-elision
+        cache absorbs repeat traffic without paying a cold-boot cost.
+
+        Field-by-field:
+          * `max_age_seconds` — required. Fresh window in seconds. The
+            apid-side default is 60; the absolute platform cap is 3600
+            (`api.ResponseCacheMaxAgeMaxSeconds`). The runtime cache
+            layer in `pkg/gateway/response_cache.go` re-checks this
+            cap as defence-in-depth.
+          * `stale_if_error_seconds` — required. Stale-on-error window
+            in seconds. Default 300; absolute cap 300
+            (`api.ResponseCacheStaleIfErrorMaxSeconds`). During an
+            upstream error the gateway returns the cached body within
+            this window instead of 502/504.
+          * `vary_on` — optional closed vocabulary of non-credential
+            request headers that participate in the cache key.
+            Allowed values: `Accept-Language`, `Accept-Encoding`.
+            Credential-bearing headers (Authorization, Cookie) are
+            deliberately excluded — authed requests bypass the cache
+            entirely (ADR-122 D3).
+          * `methods` — optional closed vocabulary of HTTP methods
+            eligible for caching. Allowed values: `GET`, `HEAD`.
+            POST/PUT/PATCH/DELETE are deliberately excluded —
+            caching their responses is either incorrect (idempotency
+            breaks under retry) or unsafe (cross-user state).
+      type: object
+      required: [max_age_seconds, stale_if_error_seconds]
+      properties:
+        max_age_seconds:
+          type: integer
+          minimum: 0
+          maximum: 3600
+          default: 60
+          description: |
+            Fresh window in seconds. 0 = inherit the apid-side default
+            (60s). Positive values are clamped to the platform cap
+            (3600s = 1 hour).
+        stale_if_error_seconds:
+          type: integer
+          minimum: 0
+          maximum: 300
+          default: 300
+          description: |
+            Stale-on-error window in seconds. 0 = no stale-on-error
+            (errors return 502/504 directly). Positive values are
+            clamped to the platform cap (300s = 5 minutes).
+        vary_on:
+          type: array
+          description: |
+            Non-credential request headers that participate in the
+            cache key. Closed vocabulary:
+              - `Accept-Language`
+              - `Accept-Encoding`
+            Empty array (default) collapses to no extra key
+            dimensions; the URL path + query alone drives cache
+            identity.
+          items:
+            type: string
+            enum: [Accept-Language, Accept-Encoding]
+        methods:
+          type: array
+          description: |
+            HTTP methods eligible for caching. Closed vocabulary:
+              - `GET`
+              - `HEAD`
+            Empty array (default) collapses to the runtime's
+            cacheability predicate (GET + HEAD). POST/PUT/PATCH/DELETE
+            are deliberately absent.
+          items:
+            type: string
+            enum: [GET, HEAD]
 
     EdgeRuleLimitAction:
       description: |
