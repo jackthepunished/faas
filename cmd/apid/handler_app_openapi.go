@@ -52,16 +52,22 @@ import (
 )
 
 // openAPIImportDialTimeout bounds the apid→gatewayd-internal
-// route-rows hop. Matches the existing routesDialTimeout
+// observed-routes hop. Matches the existing routesDialTimeout
 // contract (in-box, single-machine, fast).
 const openAPIImportDialTimeout = 2 * time.Second
 
-// openAPIImportEndpoint is the route-rows URL the auto-gen
-// reads observed routes from. The slug is the app's UUID,
-// not the human slug, so the bridge can skip the apps
-// table round-trip.
+// openAPIImportEndpoint is the observed-routes URL the auto-gen
+// reads from. Uses the existing /v1/internal/apps/{slug}/routes
+// endpoint (cmd/gatewayd-internal/routes_handler.go) which
+// returns the bounded route label set, not the
+// pkg/gateway/control_routes.go shape from the pre-merge PR #1011
+// draft (item #2 review-fix: the separate file was dropped on the
+// rebuild branch because the production endpoint already serves
+// the data apid needs; Count/P50MS/etc. fields default to zero
+// for the auto-gen annotation since the per-route histogram
+// surface lives in a separate /metrics scrape).
 func openAPIImportEndpoint(gatewaydControlURL, appID string) string {
-	return gatewaydControlURL + "/v1/internal/apps/" + appID + "/route-rows"
+	return gatewaydControlURL + "/v1/internal/apps/" + appID + "/routes"
 }
 
 // getAppOpenAPI handles GET /v1/apps/{slug}/openapi.
@@ -304,9 +310,14 @@ func renderOperationJSON(op *openapidiff.Operation) map[string]any {
 }
 
 // fetchObservedRoutes calls out to the gatewayd-internal
-// /v1/internal/apps/{appID}/route-rows bridge. Returns nil
+// /v1/internal/apps/{appID}/routes bridge (the production
+// endpoint added in PR #1026, item #2 review-fix). Returns nil
 // on any failure so GenerateFromApp degrades gracefully
-// (Source: "degraded: routes_unavailable").
+// (Source: "degraded: routes_unavailable"). The wire shape
+// is {Slug, AppID, Routes []string, CapHit bool}; we synthesise
+// RouteRow from each label with Count/P50/P95/P99/ErrorPct
+// zero (the per-route histogram surface lives in a separate
+// /metrics scrape, not on this control-listener endpoint).
 func (s *server) fetchObservedRoutes(ctx context.Context, appID string) []openapidiff.RouteRow {
 	if s.gatewaydControlURL == "" {
 		return nil
@@ -320,7 +331,7 @@ func (s *server) fetchObservedRoutes(ctx context.Context, appID string) []openap
 	client := &http.Client{Timeout: openAPIImportDialTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		s.log.Debug("apid→gatewayd route-rows dial failed", "err", err.Error(), "app_id", appID)
+		s.log.Debug("apid→gatewayd observed-routes dial failed", "err", err.Error(), "app_id", appID)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -332,14 +343,18 @@ func (s *server) fetchObservedRoutes(ctx context.Context, appID string) []openap
 		return nil
 	}
 	var env struct {
-		Slug   string                 `json:"slug"`
-		AppID  string                 `json:"app_id"`
-		Routes []openapidiff.RouteRow `json:"routes"`
+		Slug   string   `json:"slug"`
+		AppID  string   `json:"app_id"`
+		Routes []string `json:"routes"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil
 	}
-	return env.Routes
+	rows := make([]openapidiff.RouteRow, 0, len(env.Routes))
+	for _, label := range env.Routes {
+		rows = append(rows, openapidiff.RouteRow{Route: label})
+	}
+	return rows
 }
 
 // postAppOpenAPIImport handles POST /v1/apps/{slug}/openapi.
