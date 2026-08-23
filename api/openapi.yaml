@@ -4308,6 +4308,10 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ADR-117 production-ready follow-on (issue #976 / SAFE-RELEASES-E.2
+  # retry seam). Same 404 IDOR-safe posture as the sibling endpoints
+  # but a tailored copy keeps vacuum's description-duplication rule
+  # at zero on this branch.
   /v1/deployments/{id}/retry:
     parameters:
       - $ref: '#/components/parameters/Id32'
@@ -4364,7 +4368,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
         '404':
-          description: Deployment row missing or cross-account probe (IDOR-safe; never 403).
+          description: Retry requested on a missing or cross-account deployment (IDOR-safe; never 403).
           content:
             application/problem+json:
               schema:
@@ -4411,7 +4415,7 @@ paths:
                 $ref: '#/components/schemas/DeploymentPreviewURL'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
-          description: Deployment row missing or cross-account probe (IDOR-safe; never 403).
+          description: Deployment row missing or cross-account probe on the preview URL seam (IDOR-safe; never 403).
           content:
             application/problem+json:
               schema:
