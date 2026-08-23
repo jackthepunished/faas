@@ -421,13 +421,13 @@ func cmdComputeNodesShow(args []string) int {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes show: %v\n", err)
 		return 1
 	}
-	insts, err := st.ListInstancesByNodeID(ctx, *node)
+	insts, err := st.ListInstancesByNodeID(ctx, row.ID)
 	if err != nil {
 		// Live-instance count is informational (drives the
 		// drain-status UX); a query failure must NOT hide the
 		// row data. Emit a WARN to stderr and continue with
 		// live=0 so the operator still sees the node.
-		fmt.Fprintf(os.Stderr, "warn: ListInstancesByNodeID(%q): %v (live_instance_count reported as 0)\n", *node, err)
+		fmt.Fprintf(os.Stderr, "warn: ListInstancesByNodeID(%q): %v (live_instance_count reported as 0)\n", row.ID, err)
 		insts = nil
 	}
 	live := 0

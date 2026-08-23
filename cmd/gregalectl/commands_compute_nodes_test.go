@@ -602,6 +602,72 @@ func TestCmdComputeNodesShow_JSON_HappyPath(t *testing.T) {
 	}
 }
 
+// TestCmdComputeNodesShow_JSON_LiveInstanceCount pins the load-bearing
+// contract that --json reports the right live_instance_count for a
+// node that actually has live instances. The naïve implementation
+// (cmdComputeNodesShow passing *node to ListInstancesByNodeID, which
+// expects the row's ID column) returns 0 because the lookup
+// predicate is `apps.NodeID == nodeID` and nodeID is a UUID, not the
+// user-supplied fqdn. Caught by /code-review medium on PR #1044.
+func TestCmdComputeNodesShow_JSON_LiveInstanceCount(t *testing.T) {
+	resetMemStore(t)
+	seedNode(t, "alpha", "unix:///run/faas/alpha.sock")
+
+	// Seed one app + two instances on alpha (one live, one parked)
+	// so live_instance_count must be exactly 1.
+	st := getSeededStore(t)
+	nodeRow, err := st.ComputeNodeByName(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName: %v", err)
+	}
+	app, err := st.CreateApp(context.Background(), state.App{
+		AccountID: "test-acct",
+		Slug:      "alpha-app",
+		Type:      state.AppTypeFunction,
+		Runtime:   "node22",
+		RAMMB:     256,
+		NodeID:    nodeRow.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	deployment, err := st.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		BuildID:     "",
+		ImageDigest: "img:tag",
+		Kind:        state.DeploymentKindImage,
+		SourcePath:  "",
+		SourceBytes: 0,
+		Handler:     "",
+		LogPath:     "",
+		SourceURL:   "",
+		CommitSHA:   "",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if _, err := st.CreateInstance(context.Background(), app.ID, deployment.ID, "RUNNING", 256, nodeRow.ID, "wake-1"); err != nil {
+		t.Fatalf("CreateInstance(running): %v", err)
+	}
+	if _, err := st.CreateInstance(context.Background(), app.ID, deployment.ID, "PARKED", 256, nodeRow.ID, "wake-2"); err != nil {
+		t.Fatalf("CreateInstance(parked): %v", err)
+	}
+
+	stdout, restore := captureOsStdoutComputeNodes(t)
+	code := cmdComputeNodesShow([]string{"--node=alpha", "--json"})
+	restore()
+	if code != 0 {
+		t.Fatalf("cmdComputeNodesShow(--json) = %d, want 0", code)
+	}
+	var out computeNodeShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v (raw: %q)", err, stdout.String())
+	}
+	if out.LiveInstanceCount != 1 {
+		t.Errorf("live_instance_count = %d, want 1 (one RUNNING + one PARKED; only RUNNING counts)", out.LiveInstanceCount)
+	}
+}
+
 // seedNode registers one fresh compute node through the public
 // cmdComputeNodesAdd path so the list / show tests exercise the
 // same wire the operator would. The MemStore seam treats the
