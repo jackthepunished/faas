@@ -38,24 +38,24 @@ import (
 // (Commit 2 of this PR), and every wake-failure hook site MUST
 // pass one of these literals to OpsMetrics.WakeFailure. Adding a
 // new value requires:
-//   1. extend the closed-set slice in pkg/wire/metrics.go's
-//      wakeFailureReasons array (Commit 2),
-//   2. add a sentinel error here if the value maps to a typed
-//      error (not strictly required — substring classification
-//      also works),
-//   3. extend ClassifyWakeError's switch with the new branch,
-//   4. extend pkg/fcvm/wake_classify_test.go's table-driven
-//      coverage,
-//   5. update the §12 dashboard panel legend.
+//  1. extend the closed-set slice in pkg/wire/metrics.go's
+//     wakeFailureReasons array (Commit 2),
+//  2. add a sentinel error here if the value maps to a typed
+//     error (not strictly required — substring classification
+//     also works),
+//  3. extend ClassifyWakeError's switch with the new branch,
+//  4. extend pkg/fcvm/wake_classify_test.go's table-driven
+//     coverage,
+//  5. update the §12 dashboard panel legend.
 const (
-	WakeReasonSnapshotStale        = "snapshot_stale"
-	WakeReasonDiskFull             = "disk_full"
-	WakeReasonJailerFail           = "jailer_fail"
-	WakeReasonNetnsFail            = "netns_fail"
-	WakeReasonCgroupFail           = "cgroup_fail"
-	WakeReasonVSockFail            = "vsock_fail"
-	WakeReasonSnapshotRestoreErr   = "snapshot_restore_err"
-	WakeReasonMemBackendErr        = "mem_backend_err"
+	WakeReasonSnapshotStale      = "snapshot_stale"
+	WakeReasonDiskFull           = "disk_full"
+	WakeReasonJailerFail         = "jailer_fail"
+	WakeReasonNetnsFail          = "netns_fail"
+	WakeReasonCgroupFail         = "cgroup_fail"
+	WakeReasonVSockFail          = "vsock_fail"
+	WakeReasonSnapshotRestoreErr = "snapshot_restore_err"
+	WakeReasonMemBackendErr      = "mem_backend_err"
 )
 
 // Sentinel errors for typed classification (issue #1059 / ADR-127).

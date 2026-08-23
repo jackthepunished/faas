@@ -2253,20 +2253,20 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// sudden spike is a host-level signal not a workload signal.
 	netnsStart := time.Now()
 	if err = m.setupNetwork(ctx, nc); err != nil {
-		// Issue #1059 / ADR-127: emit a closed-reason counter for
-		// operators before the wake returns. The error wrap
-		// "network setup: %w" is the surface the classifier
-		// inspects — the underlying netns / TAP / nft error
-		// matches the typed ErrNetnsFail sentinel only when the
-		// caller at pkg/netns/config.go wraps with %w. Until that
-		// lands, the hook site hardcodes the reason literal per
-		// the ADR §3 "call site hardcodes the literal" rule, so
-		// netns_fail fires for every setupNetwork failure
-		// regardless of inner classification. nil-safe: the
-		// receiver guards on m.wakeFailureMetrics == nil.
+		// Issue #1059 / ADR-127: closed-reason counter on the
+		// setupNetwork path. The error wrap "network setup: %w"
+		// surfaces every netns / TAP / nft failure under one
+		// umbrella, so per ADR §3 we hardcode reason="netns_fail"
+		// rather than rely on inner-error typed-sentinel matching
+		// (which would require pkg/netns/config.go callers to
+		// wrap with %w ErrNetnsFail — a follow-up extension). The
+		// reason literal is load-bearing for the §12
+		// "vmmd_wake_failure_total" panel legend — operators
+		// triaging a netns_fail spike do not need to know which
+		// inner step (netns add, TAP create, nft apply) failed.
+		// nil-safe: the receiver guards on m.wakeFailureMetrics.
 		if m.wakeFailureMetrics != nil {
-			reason := ClassifyWakeError(err, WakeContext{FCVersion: m.fcVersion})
-			m.wakeFailureMetrics.WakeFailure("local", reason).Inc()
+			m.wakeFailureMetrics.WakeFailure("local", WakeReasonNetnsFail).Inc()
 		}
 		return nil, fmt.Errorf("wake %s: network setup: %w", req.Instance, err)
 	}
