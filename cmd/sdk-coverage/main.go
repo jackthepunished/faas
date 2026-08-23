@@ -125,6 +125,17 @@ var routeExclude = map[string]bool{
 	// don't need a typed wrapper. Mirrors the dashboard-auth
 	// exclusion above.
 	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
+
+	// ADR-123 — alert-preset catalog dashboard form post. The
+	// dashboard's preset-enable card on app_detail.html renders
+	// `action="/apps/{slug}/alert-presets/{name}/enable"` and posts
+	// x-www-form-urlencoded body to /dashboard/apps/{slug}/alert-
+	// presets/{name}/enable. The SDK does not model the
+	// session-cookie-only dashboard auth surface (mirrors /logout
+	// above) — programatic enablement goes through
+	// POST /v1/apps/{slug}/alert-presets/{name}/enable which the
+	// SDK exposes as EnableAlertPreset.
+	"POST /dashboard/apps/{slug}/alert-presets/{name}/enable": true,
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire
@@ -243,6 +254,15 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
+
+	// Issue #1233 / ADR-123 — alert-preset catalog. Auto-derivation
+	// would produce Swagger-style names ("GetAlert-presets",
+	// "PostAppsSlugAlert-presetsNameEnable") because the path uses
+	// a literal hyphen; the SDK names methods after the resource
+	// noun (AlertPreset) — same convention as edge-rules and
+	// throttle-suggestions above.
+	"GET /v1/alert-presets":                            "ListAlertPresets",
+	"POST /v1/apps/{slug}/alert-presets/{name}/enable": "EnableAlertPreset",
 
 	// ADR-089 (planned) — edge rules. The auto-derivation would
 	// produce Swagger-style names ("GetAppsSlugEdge-rules",
