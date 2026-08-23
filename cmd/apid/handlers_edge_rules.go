@@ -762,11 +762,11 @@ func resolveValidateMode(kind string, topLevel string, actionRaw json.RawMessage
 }
 
 // validateModeFromAction extracts the kind=validate mode from
-// a wire action JSON, returning "" for non-validate kinds or
-// for validate kinds without the field set. The pgstore
-// INSERT coalesces '' to 'block' (the SQL-side default at 00293
-// is also 'block') so empty is the right sentinel for "use
-// the strictest mode".
+// a wire action JSON, returning an empty string for non-validate
+// kinds or for validate kinds without the field set. The pgstore
+// INSERT coalesces an empty value to 'block' (the SQL-side
+// default at 00293 is also 'block') so empty is the right
+// sentinel for "use the strictest mode".
 func validateModeFromAction(kind string, raw json.RawMessage) string {
 	if kind != string(state.EdgeRuleKindValidate) {
 		return ""

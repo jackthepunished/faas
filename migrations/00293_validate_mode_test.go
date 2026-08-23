@@ -62,8 +62,8 @@ func TestMigrations_00293_ValidateMode(t *testing.T) {
 	// migration dropped the default — every pre-existing rule
 	// would now violate NOT NULL.
 	var (
-		dataType    string
-		isNullable  string
+		dataType      string
+		isNullable    string
 		columnDefault *string
 	)
 	if err := pool.QueryRow(ctx, `
