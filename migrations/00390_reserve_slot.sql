@@ -1,4 +1,4 @@
--- filename: 00349_no_op_slot_reservation.sql
+-- filename: 00390_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;

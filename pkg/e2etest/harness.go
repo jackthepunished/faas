@@ -620,23 +620,22 @@ const testDomain = "apps.test.example"
 // migration land touches in this file is this constant + the doc-comment
 // history above.
 //
-// PR #990 (ADR-117 PR-C, env-diff matrix) bumped 313 → 327 → 340 → 347 → 352 → 356 → 357
-// across twelve rebump rounds. The value_hash column lands at
-// 00357_app_secret_value_hash.sql (HMAC-SHA256 of plaintext, truncated
+// PR #990 (ADR-117 PR-C, env-diff matrix) bumped 313 → 327 → 340 → 347 → 352 → 356 → 357 → 387 → 410
+// across fourteen rebump rounds. The value_hash column lands at
+// 00410_app_secret_value_hash.sql (HMAC-SHA256 of plaintext, truncated
 // to 16 hex — the trustworthy value-equality discriminator for the
 // GET /v1/apps/{slug}/env-diff matrix). Slot rebump chain
-// 291 → 296 → 303 → 309 → 314 → 321 → 322 → 327 → 340 → 347 → 352 → 356 → 357,
-// with alt-name reservations (NNNNN_no_op_slot_reservation.sql, ADR-041
-// carve-out) at slots 347-356 to bridge contiguity past PR #999's
-// 00326 + PR #1004's 00322-00324 + PR #1000's 00329 + PR #1009's
-// 00333 + PR #1010's 00341 + PR #1008's 00345 + PR #984's 00346 +
-// PR #1017's 00347-00351 + PR #1012's 00352 + PR #1005's 00353 +
-// PR #1006's 00354-00355 + PR #1012's 00356. Round 12 forced by
-// PR #1012 also claiming 00356 (in addition to 00352 as a fence).
-// The cross-PR precheck filters reservations so my fences are invisible
-// to those PRs' precheck; whichever of us merges second will need to
-// drop the conflicting fence at merge time.
-const e2eMigrationTarget = 357
+// 291 → 296 → 303 → 309 → 314 → 321 → 322 → 327 → 340 → 347 → 352 →
+// 356 → 357 → 387 → 410. Round 14 forced by open PRs claiming real
+// schemas at 00387 (PR #1036 compute_nodes_active_unique), 00388-00390
+// (PR #1036 instances_wake_attempt_active_unique / migration_notify /
+// cluster_signing_keys) and 00409 (PR #1049 openapi_import) — even
+// though slots_from_paths filters reservations, a real schema at
+// the same slot as my real would collide on main merge. Past 00409
+// is currently clear of real claims. Round 14 added 23 fences at
+// 00387-00409 (every gap slot) to bridge alphasort positions387-409
+// to versions 387-409; my real lands at position 410 = version 410.
+const e2eMigrationTarget = 410
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
