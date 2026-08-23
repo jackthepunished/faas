@@ -217,6 +217,16 @@ from .domain_doctor_check import DomainDoctorCheck
 from .domain_doctor_check_name import DomainDoctorCheckName
 from .domain_doctor_check_status import DomainDoctorCheckStatus
 from .domain_doctor_report import DomainDoctorReport
+from .dry_run_app_open_api_body import DryRunAppOpenAPIBody
+from .dry_run_app_open_api_body_info import DryRunAppOpenAPIBodyInfo
+from .dry_run_app_open_api_body_paths import DryRunAppOpenAPIBodyPaths
+from .dry_run_app_open_api_response_200 import DryRunAppOpenAPIResponse200
+from .dry_run_app_open_api_response_200_suggestions_item import DryRunAppOpenAPIResponse200SuggestionsItem
+from .dry_run_app_open_api_response_200_suggestions_item_action import DryRunAppOpenAPIResponse200SuggestionsItemAction
+from .dry_run_app_open_api_response_200_suggestions_item_kind import DryRunAppOpenAPIResponse200SuggestionsItemKind
+from .dry_run_app_open_api_response_200_suggestions_item_methods_item import (
+    DryRunAppOpenAPIResponse200SuggestionsItemMethodsItem,
+)
 from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cache_action import EdgeRuleCacheAction
 from .edge_rule_cache_action_methods_item import EdgeRuleCacheActionMethodsItem
@@ -263,6 +273,8 @@ from .gdpr_audit_export_response_data import GdprAuditExportResponseData
 from .gdpr_audit_export_response_source import GdprAuditExportResponseSource
 from .get_account_slo_window import GetAccountSLOWindow
 from .get_app_metrics_range import GetAppMetricsRange
+from .get_app_open_api_response_200 import GetAppOpenAPIResponse200
+from .get_app_open_api_source import GetAppOpenAPISource
 from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
@@ -275,6 +287,11 @@ from .get_deployment_stages_response_200_history_item_name import GetDeploymentS
 from .get_deployment_stages_response_200_history_item_status import GetDeploymentStagesResponse200HistoryItemStatus
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .grace_window_response import GraceWindowResponse
+from .import_app_open_api_body import ImportAppOpenAPIBody
+from .import_app_open_api_body_info import ImportAppOpenAPIBodyInfo
+from .import_app_open_api_body_paths import ImportAppOpenAPIBodyPaths
+from .import_app_open_api_response_200 import ImportAppOpenAPIResponse200
+from .import_app_open_api_response_200_source import ImportAppOpenAPIResponse200Source
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
 from .instance_response import InstanceResponse
@@ -733,6 +750,14 @@ __all__ = (
     "DomainDoctorCheckName",
     "DomainDoctorCheckStatus",
     "DomainDoctorReport",
+    "DryRunAppOpenAPIBody",
+    "DryRunAppOpenAPIBodyInfo",
+    "DryRunAppOpenAPIBodyPaths",
+    "DryRunAppOpenAPIResponse200",
+    "DryRunAppOpenAPIResponse200SuggestionsItem",
+    "DryRunAppOpenAPIResponse200SuggestionsItemAction",
+    "DryRunAppOpenAPIResponse200SuggestionsItemKind",
+    "DryRunAppOpenAPIResponse200SuggestionsItemMethodsItem",
     "EdgeRuleBudgetAction",
     "EdgeRuleCacheAction",
     "EdgeRuleCacheActionMethodsItem",
@@ -779,6 +804,8 @@ __all__ = (
     "GdprAuditExportResponseSource",
     "GetAccountSLOWindow",
     "GetAppMetricsRange",
+    "GetAppOpenAPIResponse200",
+    "GetAppOpenAPISource",
     "GetAppSLOWindow",
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
@@ -791,6 +818,11 @@ __all__ = (
     "GetDeploymentStagesResponse200HistoryItemStatus",
     "GetOpenAPISpecJSONResponse200",
     "GraceWindowResponse",
+    "ImportAppOpenAPIBody",
+    "ImportAppOpenAPIBodyInfo",
+    "ImportAppOpenAPIBodyPaths",
+    "ImportAppOpenAPIResponse200",
+    "ImportAppOpenAPIResponse200Source",
     "InstallBindRequest",
     "InstallBindResponse",
     "InstanceResponse",
