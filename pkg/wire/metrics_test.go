@@ -1349,6 +1349,99 @@ func TestWakeFailure_ClosedCartesian_PreInstantiated(t *testing.T) {
 	}
 }
 
+// TestBoxHostname_AdmissionSet pins the multi-host box-resolver
+// contract from cluster A commit 5 of the platform-observability
+// mega-PR (issue #1059 / ADR-127 §3.4 follow-up). The test
+// covers three guarantees:
+//
+//  1. BoxHostname() returns a non-empty, hostname-shaped label
+//     — operators get a real per-host Prometheus row, not a
+//     flat "local" series for every box in the fleet.
+//  2. OpsMetrics.WakeFailure with box="" resolves to BoxHostname()
+//     (the accessor-level fallback added in commit 5). The
+//     emitted series carries the host's hostname under the
+//     `box` label.
+//  3. Overflow collapses — once more than maxBoxLabelValues
+//     distinct box labels are admitted, new boxes land in
+//     otherBoxLabel ("__other__") per the existing boxLabelSet
+//     contract.
+//
+// The TODO(multi-host/ADR-066) comment block on BoxHostname()
+// documents the follow-up: replace os.Hostname() with
+// pkg/state/pkgstore.ComputeNodeIDForSelf() once the
+// compute_nodes table lands.
+//
+// The test deliberately runs (1)/(2) and (3) on TWO INDEPENDENT
+// registries so the hostname admission in (2) doesn't deplete
+// the cap for (3). Joining them on one registry would couple
+// the host's os.Hostname() to the overflow count, which is
+// flaky across CI machines.
+func TestBoxHostname_AdmissionSet(t *testing.T) {
+	// ─── Part A: hostname resolver (1)+(2) ────────────────────
+
+	// (1) BoxHostname() returns a non-empty, hostname-shaped label.
+	got := wire.BoxHostname()
+	if got == "" {
+		t.Fatalf("BoxHostname() returned empty string; want non-empty hostname")
+	}
+	// The fallback contract says an empty hostname collapses to
+	// labelLocal ("local") — anything else is a real os.Hostname()
+	// return, which must be non-empty and not the literal
+	// "__other__" reserved value (otherwise the helper would
+	// collide with the otherBoxLabel admission bucket).
+	if got == "__other__" {
+		t.Errorf("BoxHostname() returned reserved __other__ value %q; want hostname or labelLocal", got)
+	}
+
+	// (2) OpsMetrics.WakeFailure with box="" resolves to
+	// BoxHostname(). The emitted series carries the host's
+	// hostname under the `box` label, not the placeholder
+	// "local". Fresh registry — the hostname admission does NOT
+	// deplete the cap for the overflow part below.
+	mA := wire.NewOpsMetrics("vmmd")
+	c := mA.WakeFailure("", "", "snapshot_restore_err")
+	if c == nil {
+		t.Fatal("WakeFailure returned nil counter")
+	}
+	bodyA := render(t, mA)
+	wantA := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="snapshot_restore_err"} 0`, got)
+	if !strings.Contains(bodyA, wantA) {
+		t.Errorf("missing %q in:\n%s", wantA, bodyA)
+	}
+
+	// ─── Part B: overflow collapses (3) ───────────────────────
+	// Fresh registry. Admit maxBoxLabelValues distinct synthetic
+	// box labels, then drive a (cap+1)th distinct box. The
+	// (cap+1)th must collapse to otherBoxLabel.
+	mB := wire.NewOpsMetrics("vmmd")
+	for i := 0; i < 64; i++ {
+		label := fmt.Sprintf("box-%02d.example.test", i+1)
+		c := mB.WakeFailure(label, "", "snapshot_restore_err")
+		if c == nil {
+			t.Fatalf("WakeFailure returned nil counter at i=%d", i)
+		}
+		c.Inc()
+	}
+	// (cap+1)th distinct box — must collapse to otherBoxLabel.
+	overflow := mB.WakeFailure("box-overflow.example.test", "", "snapshot_restore_err")
+	if overflow == nil {
+		t.Fatal("WakeFailure returned nil counter at overflow")
+	}
+	overflow.Inc()
+	bodyB := render(t, mB)
+	// Overflow collapses: the literal "box-overflow.example.test"
+	// label MUST NOT surface in the body — admit must have
+	// returned otherBoxLabel for this (cap+1)th distinct real box.
+	if strings.Contains(bodyB, `vmmd_wake_failure_total{app="",box="box-overflow.example.test",reason="snapshot_restore_err"}`) {
+		t.Errorf("overflow box unexpectedly admitted (should collapse to __other__):\n%s", bodyB)
+	}
+	// And the __other__ bucket MUST surface at count=1 — the
+	// overflow's Inc lands on the collapsed series.
+	if !strings.Contains(bodyB, `vmmd_wake_failure_total{app="",box="__other__",reason="snapshot_restore_err"} 1`) {
+		t.Errorf("missing __other__ bucket for overflow box in:\n%s", bodyB)
+	}
+}
+
 // TestOpsMetrics_WakeLatencyPreinstantiated (issue #1059 / ADR-127)
 // pins the closed (box, phase) cartesian for the per-box wake-latency
 // histogram. The constructor pre-instantiates every (box, phase) pair

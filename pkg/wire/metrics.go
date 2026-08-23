@@ -17,6 +17,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -3574,15 +3575,19 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 // pkg/fcvm/wake_classify.go and the wake-failure call sites
 // hardcode the literal reason string. box is resolved through
 // the boxLabelSet admission (maxBoxLabelValues = 64);
-// overflow collapses to "__other__". app is resolved through
-// the appLabelSet admission (maxAppLabelValues = 256); empty
+// overflow collapses to "__other__". An empty box argument
+// resolves to BoxHostname() so call sites can pass "" to
+// inherit the hostname-derived label (issue #1059 / ADR-127
+// §3.4 follow-up — cluster A commit 5 of the platform-
+// observability mega-PR). app is resolved through the
+// appLabelSet admission (maxAppLabelValues = 256); empty
 // input collapses to labelAppUnknown ("") to distinguish a
 // missing-app-slug path from a real app slug that hit the
 // admission cap (which collapses to otherAppLabel). The
 // (box, app, reason) cartesian is pre-instantiated in the
 // constructor for every pair in the closed set (the reserved
 // {labelLocal, otherBoxLabel} × {labelAppUnknown, otherAppLabel}
-// × 8 reasons matrix — 32 series from idle fleet) so the §12
+// × 10 reasons matrix — 40 series from idle fleet) so the §12
 // "Wake failures by reason (24h)" dashboard panel surfaces
 // zero rows from an idle fleet. nil-safe — returns nil if m
 // is nil so unit tests without metrics keep building (same
@@ -3590,6 +3595,9 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 func (m *OpsMetrics) WakeFailure(box, app, reason string) prometheus.Counter {
 	if m == nil {
 		return nil
+	}
+	if box == "" {
+		box = BoxHostname()
 	}
 	return m.wakeFailure.WithLabelValues(m.boxLabel(box), m.appLabel(app), reason)
 }
@@ -3601,15 +3609,21 @@ func (m *OpsMetrics) WakeFailure(box, app, reason string) prometheus.Counter {
 // existing fleet-level vmmd_wake_phase_duration_seconds{phase}
 // histogram so the §12 dashboard panel can swap fleet → per-box
 // without a legend change. box is resolved through the boxLabelSet
-// admission (same contract as WakeFailure above). The (box, phase)
-// cartesian is pre-instantiated in the constructor for every pair so
-// the "Per-box p99 wake latency (24h)" dashboard panel surfaces zero
-// rows from idle fleet. wake_id is attached as a
-// prometheus.Exemplar at the call site (matching the wakeRPCDuration
-// precedent at metrics.go:1421). nil-safe — returns nil if m is nil.
+// admission (same contract as WakeFailure above); an empty box
+// argument resolves to BoxHostname() (issue #1059 / ADR-127 §3.4
+// follow-up — cluster A commit 5 of the platform-observability
+// mega-PR). The (box, phase) cartesian is pre-instantiated in the
+// constructor for every pair so the "Per-box p99 wake latency
+// (24h)" dashboard panel surfaces zero rows from idle fleet.
+// wake_id is attached as a prometheus.Exemplar at the call site
+// (matching the wakeRPCDuration precedent at metrics.go:1421).
+// nil-safe — returns nil if m is nil.
 func (m *OpsMetrics) WakeLatency(box, phase string) prometheus.Observer {
 	if m == nil {
 		return nil
+	}
+	if box == "" {
+		box = BoxHostname()
 	}
 	return m.wakeLatency.WithLabelValues(m.boxLabel(box), phase)
 }
@@ -5714,6 +5728,40 @@ const labelLocal = "local"
 // the original box identifier when a box lands here; the metric
 // label is intentionally lossy.
 const otherBoxLabel = "__other__"
+
+// BoxHostname returns the canonical box label for the current
+// control-plane host — the os.Hostname() value, falling back to
+// labelLocal ("local") if the hostname lookup fails or returns
+// empty. Wire callers should pass "" rather than the literal
+// "local" so the accessors resolve to BoxHostname(); the
+// existing literal "local" call sites remain valid for now and
+// will be migrated in a follow-up commit when the Tier A
+// multi-host rollout (ADR-062 / ADR-066 chain) lands.
+//
+// The function is pure and side-effect-free — it does not touch
+// the boxLabelSet admission set, which is the accessor's job.
+// Callers must still funnel the result through m.boxLabel(box)
+// (OpsMetrics.WakeFailure and OpsMetrics.WakeLatency do this
+// internally when the caller passes ""). The hostname is
+// read on every call, not cached — a rare codepath and the
+// underlying syscall is cheap.
+//
+// TODO(multi-host/ADR-066): replace os.Hostname() lookup with
+// compute_nodes.id once the compute_nodes table lands (Tier A
+// multi-host rollout). At that point BoxHostname() becomes a
+// pkg/state/pkgstore.ComputeNodeIDForSelf() call and the call
+// sites in pkg/fcvm/manager.go and pkg/vmmdgrpc/server.go stop
+// passing the literal "local". Until then the literal stays in
+// place because compute_nodes doesn't exist yet, and the host
+// hostname is a reasonable stand-in for "this box's box" —
+// operators get per-host Prometheus rows from an idle fleet.
+func BoxHostname() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return labelLocal
+	}
+	return host
+}
 
 // maxAppLabelValues caps the per-OpsMetrics app-label admission
 // set (issue #1059 / ADR-127 §3.5 deferred work, shipped in the
