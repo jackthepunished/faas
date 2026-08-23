@@ -4141,6 +4141,18 @@ func TestPg_DeploymentAuditRoundtrip(t *testing.T) {
 	if string(rows[0].Data) != `{"ref":"sha256:abc","supersedes":""}` {
 		t.Errorf("rows[0].Data = %q, want verbatim payload", rows[0].Data)
 	}
+	// Postgres jsonb canonicalises whitespace ("ref": "v" not "ref":"v")
+	// so the literal byte-equal compare above would break under the
+	// jsonb driver; compare structurally so the test pins the
+	// payload shape rather than the storage form.
+	var got map[string]any
+	if err := json.Unmarshal(rows[0].Data, &got); err != nil {
+		t.Fatalf("Data unmarshal: %v", err)
+	}
+	want := map[string]any{"ref": "sha256:abc", "supersedes": ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rows[0].Data = %v, want %v (jsonb round-trip canonicalises whitespace; compare structurally)", got, want)
+	}
 
 	// 3. Cross-deployment filter — write a row for a different
 	// deployment_id and assert ListDeploymentAudit does NOT
@@ -4216,9 +4228,9 @@ func TestPg_DeploymentOrdinal(t *testing.T) {
 			t.Fatalf("exec %q args=%v: %v", stmt, args, err)
 		}
 	}
-	mustExec(`insert into accounts (id, plan) values ($1, 'free')`, uuid.New())
+	mustExec(`insert into accounts (id, email, plan) values ($1, $2, 'free')`, uuid.New(), uuid.New().String()+"@example.com")
 	acctID := uuid.New()
-	mustExec(`insert into accounts (id, plan) values ($1, 'free')`, acctID)
+	mustExec(`insert into accounts (id, email, plan) values ($1, $2, 'free')`, acctID, acctID.String()+"@example.com")
 	mustExec(`insert into apps (id, account_id, slug, status) values ($1, $2, 'ordinal-app', 'active')`, a, acctID)
 	mustExec(`insert into apps (id, account_id, slug, status) values ($1, $2, 'ordinal-app-other', 'active')`, b, acctID)
 
