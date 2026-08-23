@@ -5681,7 +5681,6 @@ func TestMemStoreUpdateTrigger_FilterCriteriaPersists(t *testing.T) {
 	}
 }
 
-
 //   - closed-vocab guard (unknown fromStage → ErrInvalidArgument)
 //   - the original row is NOT mutated (failure history stays
 //     observable alongside the retry)
