@@ -426,14 +426,14 @@ func (stubVMM) Destroy(context.Context, string) error {
 func (stubVMM) DestroyWithExport(context.Context, string, string) (int, error) {
 	panic("stubVMM.DestroyWithExport: parse-failure test must not reach Manager")
 }
-func (stubVMM) LiveCount() int                    { return 0 }
-func (stubVMM) LeasedCount() int                  { return 0 }
-func (stubVMM) NetnsFor(string) (string, bool)    { return "", false }
+func (stubVMM) LiveCount() int                 { return 0 }
+func (stubVMM) LeasedCount() int               { return 0 }
+func (stubVMM) NetnsFor(string) (string, bool) { return "", false }
 func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
 	return nil
 }
-func (stubVMM) InstancePID(string) (int, bool)               { return 0, false }
-func (stubVMM) LogRing(string) *logbuf.Ring                   { return nil }
+func (stubVMM) InstancePID(string) (int, bool) { return 0, false }
+func (stubVMM) LogRing(string) *logbuf.Ring    { return nil }
 func (stubVMM) MountParentExt4(context.Context, string) (string, error) {
 	panic("stubVMM.MountParentExt4: parse-failure test must not reach Manager")
 }

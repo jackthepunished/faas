@@ -1514,8 +1514,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// can swap fleet → per-box without changing the bucketing.
 	wakeLatencyPhases := []string{"restore_ms", "netns_tap_ms", "guest_ready_ms"}
 	wakeLatency := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: prefix + "_wake_latency_seconds",
-		Help: "Wall-clock seconds for each per-box vmmd-side wake phase (issue #1059 / ADR-127). phase ∈ {restore_ms, netns_tap_ms, guest_ready_ms}; box label is admission-bounded (overflow → __other__). Per-box sibling of the fleet <prefix>_wake_phase_duration_seconds{phase} (pkg/fcvm/metrics.go) — same bucket set, same phase vocabulary. wake_id is attached as a prometheus.Exemplar on each observation. Bucket set is spec §6.3 verbatim with the 0.3/0.35 pair (ADR-074 §3.5).",
+		Name:    prefix + "_wake_latency_seconds",
+		Help:    "Wall-clock seconds for each per-box vmmd-side wake phase (issue #1059 / ADR-127). phase ∈ {restore_ms, netns_tap_ms, guest_ready_ms}; box label is admission-bounded (overflow → __other__). Per-box sibling of the fleet <prefix>_wake_phase_duration_seconds{phase} (pkg/fcvm/metrics.go) — same bucket set, same phase vocabulary. wake_id is attached as a prometheus.Exemplar on each observation. Bucket set is spec §6.3 verbatim with the 0.3/0.35 pair (ADR-074 §3.5).",
 		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5, 10},
 	}, []string{"box", "phase"})
 	for _, box := range wakeFailureBoxes {
