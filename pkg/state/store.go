@@ -4468,6 +4468,48 @@ type Store interface {
 	// age out orphaned request rows.
 	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
 
+	// --- ADR-127 production debugger (§Decision 1) ---
+	//
+	// The writer methods (InsertRequestTelemetry) are called by
+	// the apid gRPC server-side handler in
+	// cmd/apid/grpc_server_request_telemetry.go; gatewayd-internal
+	// dials apid over a unix socket and never touches the Store
+	// directly. Same ownership pattern as the AppError writes
+	// above (cmd/gatewayd-internal/app_errors_recorder.go:17-21).
+	// The reader methods back the
+	// /v1/apps/{slug}/debug/requests/* handlers in PR-A.
+
+	// InsertRequestTelemetry is the per-request INSERT called by
+	// grpc_server_request_telemetry.go. One row per gateway-served
+	// request; no ON CONFLICT — every request gets its own row.
+	// The recorder's in-process LRU dedupe at minute granularity
+	// is the upstream tripwire; the unique-index absence here is
+	// intentional (request_id is the natural dedupe, but the
+	// recorder doesn't carry it).
+	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
+
+	// ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
+	// Time-windowed (since, until) with hard limit; cursor pagination
+	// is by (received_at DESC, id) tuple, matching the
+	// request_telemetry_app_received_idx index direction. limit MUST
+	// be pre-clamped to api.DebugTelemetryMaxLimit by the handler.
+	ListRequestTelemetryByApp(ctx context.Context, arg sqlc.ListRequestTelemetryByAppParams) ([]sqlc.ListRequestTelemetryByAppRow, error)
+
+	// RequestTelemetryByDeployment backs the per-deployment
+	// drilldown and the regression detector (PR-B cron). Uses
+	// request_telemetry_app_dep_received_idx. Same limit contract
+	// as ListRequestTelemetryByApp.
+	RequestTelemetryByDeployment(ctx context.Context, arg sqlc.RequestTelemetryByDeploymentParams) ([]sqlc.RequestTelemetryByDeploymentRow, error)
+
+	// RequestTelemetryBaselineP95ByRoute backs the regression
+	// detector's per-route p95 baseline lookup. PR-B's cron calls
+	// this per-deployment, then composes the result with
+	// RequestTelemetryByDeployment in Go (the CTE-on-CTE shape
+	// that would back a single-round-trip regression query trips
+	// sqlc v1.31's "ambiguous column" parser; PR-B documents the
+	// Go-side composition in pkg/state/pgstore.go).
+	RequestTelemetryBaselineP95ByRoute(ctx context.Context, arg sqlc.RequestTelemetryBaselineP95ByRouteParams) ([]sqlc.RequestTelemetryBaselineP95ByRouteRow, error)
+
 	// --- ADR-098 connection-aware execution (§9.A) ---
 	//
 	// Writer methods (InsertDataUpstream / DeleteDataUpstreamByID

@@ -17684,6 +17684,40 @@ func (s *PgStore) DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID
 }
 
 // ----------------------------------------------------------------------------
+// ADR-127 production debugger (§Decision 1) — pgstore wrappers for the
+// request_telemetry query surface. Reuses the same sqlc.Queries accessor
+// as the app_errors block above (no per-feature helper needed; the
+// queries live in the same sqlc package). Same tx-handling contract:
+// caller wraps N calls in a pgx transaction (the apid gRPC receiver
+// uses pgxpool.BeginTx per stream batch).
+// ----------------------------------------------------------------------------
+
+// InsertRequestTelemetry writes one row per gateway-served request.
+// Called by the apid gRPC IncrementRequestTelemetry handler.
+func (s *PgStore) InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error {
+	return s.appErrorsQueries().InsertRequestTelemetry(ctx, s.pool, arg)
+}
+
+// ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
+// The returned rows are the sqlc.Row struct; handlers convert to the
+// domain DebugTelemetryRow at the boundary.
+func (s *PgStore) ListRequestTelemetryByApp(ctx context.Context, arg sqlc.ListRequestTelemetryByAppParams) ([]sqlc.ListRequestTelemetryByAppRow, error) {
+	return s.appErrorsQueries().ListRequestTelemetryByApp(ctx, s.pool, arg)
+}
+
+// RequestTelemetryByDeployment backs the per-deployment drilldown
+// and the regression detector (PR-B cron).
+func (s *PgStore) RequestTelemetryByDeployment(ctx context.Context, arg sqlc.RequestTelemetryByDeploymentParams) ([]sqlc.RequestTelemetryByDeploymentRow, error) {
+	return s.appErrorsQueries().RequestTelemetryByDeployment(ctx, s.pool, arg)
+}
+
+// RequestTelemetryBaselineP95ByRoute backs the regression detector's
+// per-route p95 baseline lookup.
+func (s *PgStore) RequestTelemetryBaselineP95ByRoute(ctx context.Context, arg sqlc.RequestTelemetryBaselineP95ByRouteParams) ([]sqlc.RequestTelemetryBaselineP95ByRouteRow, error) {
+	return s.appErrorsQueries().RequestTelemetryBaselineP95ByRoute(ctx, s.pool, arg)
+}
+
+// ----------------------------------------------------------------------------
 // ADR-098 connection-aware execution (§9.A). pgstore wrappers for the
 // sqlc-generated data_upstreams + data_upstream_probes query surface
 // (queries.sql ADR-098 block). Per-call helper mirrors
