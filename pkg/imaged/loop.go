@@ -20,6 +20,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
@@ -251,9 +252,23 @@ func (l *Loop) runGCTick(ctx context.Context, now time.Time) {
 // open so the next tick retries the detect call (F-08). Errors are
 // logged, never returned — FC detection failure must not block imaged
 // startup (a degraded box still serves traffic).
+//
+// ADR-127 §D1 (Layer 6) extends this body with an F3 step:
+// MarkAppProtocolSnapshotsStale, the app-protocol dimension of the
+// F2/F3 stale-mark split. F3 runs at the tail of runFCSweep — after
+// the F2 mark-stale + retention-eviction — and operates on the
+// wire-protocol-capable close-set {http2, grpc} (ADR-126 §Decision
+// 6). F3 returns the F2 result on partial failure so F2's success
+// is preserved even if F3 hits a transient error.
 func (l *Loop) runFCSweep(ctx context.Context) bool {
 	if l.detectFC == nil {
 		l.log.Warn("imaged: fc sweep skipped: no detectFC wired")
+		// F3 (Layer 6) is independent of FC detection — run it
+		// regardless of the F2 detect call so an FAAS_BASE_IMAGE_VERSION
+		// bump gets swept on a box with no firecracker binary on PATH
+		// (e.g. a remote storage-only node). Detect is the F2 trigger,
+		// not the sweep body.
+		l.runAppProtocolSweep(ctx)
 		return false
 	}
 	ver, err := l.detectFC(ctx)
@@ -263,11 +278,15 @@ func (l *Loop) runFCSweep(ctx context.Context) bool {
 		// produces repeated Warn logs; the daemon stays up so the
 		// operator notices and fixes the path.
 		l.log.Warn("imaged: fc detect", "err", err)
+		// F3 still runs — see above.
+		l.runAppProtocolSweep(ctx)
 		return false
 	}
 	n, err := l.handler.MarkFCSnapshotsStale(ctx, ver)
 	if err != nil {
 		l.log.Warn("imaged: fc sweep mark", "err", err)
+		// F3 still runs.
+		l.runAppProtocolSweep(ctx)
 		return false
 	}
 	// F-07: also evict stale snapshots past the retention window. The
@@ -276,11 +295,45 @@ func (l *Loop) runFCSweep(ctx context.Context) bool {
 	evicted, err := l.store.DeleteSnapshotsStaleOlderThan(ctx, api.SnapshotStaleRetention)
 	if err != nil {
 		l.log.Warn("imaged: fc sweep evict", "err", err)
-		return true // mark-stale succeeded; partial eviction still counts as progress
+		// mark-stale succeeded; partial eviction still counts as progress.
+		// F3 still runs.
+		l.runAppProtocolSweep(ctx)
+		return true
+	}
+	// F3 (Layer 6): app-protocol stale-mark sweep. ADR-127 §D1 —
+	// flips every non-stale snapshot whose deployment's
+	// app.app_protocol ∈ {http2, grpc}. Operates on the base-image
+	// version stamp, not the FC version; F3 returns success/failure
+	// is logged but does NOT roll back F2's success.
+	apN, apErr := l.handler.MarkAppProtocolSnapshotsStale(ctx)
+	if apErr != nil {
+		l.log.Warn("imaged: app_protocol sweep mark", "err", apErr)
+	} else if apN > 0 {
+		l.log.Info("imaged: app_protocol sweep marked stale",
+			"base_image_version", fcvm.FAAS_BASE_IMAGE_VERSION,
+			"marked_stale", apN)
 	}
 	l.log.Info("imaged: fc sweep done",
-		"fc_version", ver, "marked_stale", n, "evicted", evicted)
+		"fc_version", ver, "marked_stale", n, "evicted", evicted,
+		"app_protocol_marked_stale", apN)
 	return true
+}
+
+// runAppProtocolSweep is the F3 standalone entry point — runs
+// without F2 context. Used when F2 is skipped (no firecracker
+// binary on PATH) or when F2 fails before its tail. Errors are
+// logged, never returned; F3 is best-effort.
+func (l *Loop) runAppProtocolSweep(ctx context.Context) {
+	apN, apErr := l.handler.MarkAppProtocolSnapshotsStale(ctx)
+	if apErr != nil {
+		l.log.Warn("imaged: app_protocol sweep mark (standalone)", "err", apErr)
+		return
+	}
+	if apN > 0 {
+		l.log.Info("imaged: app_protocol sweep marked stale (standalone)",
+			"base_image_version", fcvm.FAAS_BASE_IMAGE_VERSION,
+			"marked_stale", apN)
+	}
 }
 
 // deleteSnapshotsAndFiles is the shared cleanup helper. Takes the tuples
