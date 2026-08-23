@@ -39,6 +39,9 @@ class PlanResponse:
     repo_full_name: str | Unset = UNSET
     warnings: list[str] | Unset = UNSET
     crons_not_allowed: bool | Unset = UNSET
+    can_apply_pre_exclude: bool | Unset = UNSET
+    gate_rescued_by_exclude: bool | Unset = UNSET
+    can_apply_reasons: list[str] | Unset = UNSET
     will_deploy: list[PlanAffectedApp] | Unset = UNSET
     unaffected: list[PlanAffectedApp] | Unset = UNSET
     skipped: list[PlanAffectedApp] | Unset = UNSET
@@ -86,6 +89,14 @@ class PlanResponse:
             warnings = self.warnings
 
         crons_not_allowed = self.crons_not_allowed
+
+        can_apply_pre_exclude = self.can_apply_pre_exclude
+
+        gate_rescued_by_exclude = self.gate_rescued_by_exclude
+
+        can_apply_reasons: list[str] | Unset = UNSET
+        if not isinstance(self.can_apply_reasons, Unset):
+            can_apply_reasons = self.can_apply_reasons
 
         will_deploy: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.will_deploy, Unset):
@@ -136,6 +147,12 @@ class PlanResponse:
             field_dict["warnings"] = warnings
         if crons_not_allowed is not UNSET:
             field_dict["crons_not_allowed"] = crons_not_allowed
+        if can_apply_pre_exclude is not UNSET:
+            field_dict["can_apply_pre_exclude"] = can_apply_pre_exclude
+        if gate_rescued_by_exclude is not UNSET:
+            field_dict["gate_rescued_by_exclude"] = gate_rescued_by_exclude
+        if can_apply_reasons is not UNSET:
+            field_dict["can_apply_reasons"] = can_apply_reasons
         if will_deploy is not UNSET:
             field_dict["will_deploy"] = will_deploy
         if unaffected is not UNSET:
@@ -200,6 +217,12 @@ class PlanResponse:
 
         crons_not_allowed = d.pop("crons_not_allowed", UNSET)
 
+        can_apply_pre_exclude = d.pop("can_apply_pre_exclude", UNSET)
+
+        gate_rescued_by_exclude = d.pop("gate_rescued_by_exclude", UNSET)
+
+        can_apply_reasons = cast(list[str], d.pop("can_apply_reasons", UNSET))
+
         _will_deploy = d.pop("will_deploy", UNSET)
         will_deploy: list[PlanAffectedApp] | Unset = UNSET
         if _will_deploy is not UNSET:
@@ -245,6 +268,9 @@ class PlanResponse:
             repo_full_name=repo_full_name,
             warnings=warnings,
             crons_not_allowed=crons_not_allowed,
+            can_apply_pre_exclude=can_apply_pre_exclude,
+            gate_rescued_by_exclude=gate_rescued_by_exclude,
+            can_apply_reasons=can_apply_reasons,
             will_deploy=will_deploy,
             unaffected=unaffected,
             skipped=skipped,

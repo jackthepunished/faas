@@ -26,6 +26,9 @@ export type ApplyResponse = {
   can_apply: boolean;
   crons_not_allowed?: boolean;
   plan_token: string;
+  can_apply_pre_exclude?: boolean;
+  gate_rescued_by_exclude?: boolean;
+  can_apply_reasons?: Array<string>;
   will_deploy?: Array<PlanAffectedApp>;
   unaffected?: Array<PlanAffectedApp>;
   skipped?: Array<PlanAffectedApp>;

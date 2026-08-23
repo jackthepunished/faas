@@ -813,8 +813,11 @@ func (s *server) scanService(
 	}
 	observedCrons := countAccountCrons(r.Context(), s, acct.ID)
 
-	canApply := true
-	notAllowed := false
+	var (
+		canApply   bool
+		notAllowed bool
+		reasons    []string
+	)
 	// ADR-124 can_apply rescue signal: evaluate the gate twice.
 	// preExclude uses result.Workloads (post-`--only`, pre-`--exclude`),
 	// the same set the operator would have scanned without
@@ -825,7 +828,6 @@ func (s *server) scanService(
 	// derives the cron count from workloads internally so both
 	// calls are self-contained (no shared scan state).
 	preCanApply, preNotAllowed, _, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
-	var reasons []string
 	canApply, notAllowed, reasons, _ = evaluateQuotaGate(filteredW, limits, observedApps, observedCrons)
 
 	// gateRescuedByExclude fires the slog seam when --exclude
