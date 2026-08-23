@@ -211,6 +211,15 @@ type server struct {
 	// from it. Wired via WithDataPlacement from
 	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
 	dataPlacementEnabled bool
+	// hostHashFunc (issue #957) is the test seam for forcing
+	// the env-classifier into the silent-skip branch. Nil in
+	// production (cmd/apid/main.go does NOT call
+	// WithHostHashFunc); runEnvClassifier falls through to
+	// secretbox.HashHost. The seam exists only so the
+	// handlers_env_classifier_audit_test.go can drive the
+	// host_hash_failed audit emit without touching the
+	// host_hash_salt on disk.
+	hostHashFunc func(host string) (string, error)
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -449,6 +458,19 @@ func (s *server) WithEventsPlatform(p *events.Platform) *server {
 // existing positional call sites in tests don't need editing.
 func (s *server) WithDataPlacement(enabled bool) *server {
 	s.dataPlacementEnabled = enabled
+	return s
+}
+
+// WithHostHashFunc (issue #957) attaches a stub for the env-
+// classifier's host-hash seam. Production wiring does NOT call
+// this method — s.hostHashFunc stays nil and runEnvClassifier
+// falls through to the canonical secretbox.HashHost (cmd/apid/
+// handlers_env.go). The seam exists so handlers_env_classifier
+// _audit_test.go can force the silent-skip branch
+// (host_hash_failed) and assert that env.classifier_failed
+// fires, without touching /etc/faas/host_hash_salt on disk.
+func (s *server) WithHostHashFunc(fn func(host string) (string, error)) *server {
+	s.hostHashFunc = fn
 	return s
 }
 

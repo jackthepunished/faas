@@ -268,14 +268,30 @@ func (c *Classifier) classifyOne(envKey, kind, host string, port int, scope stri
 	hash, err := c.HashHost(host)
 	if err != nil {
 		// Salt file missing → fatal §11 tripwire. The
-		// classifier logs the error and skips the row
-		// (better to skip than to leak a plaintext host).
+		// classifier logs the error and returns a
+		// HostHashOK=false sentinel so the caller (Run)
+		// propagates it into result.Rows. The apid-side
+		// handler (handlers_env.go::runEnvClassifier)
+		// inspects HostHashOK and surfaces the typed
+		// errClassifierHostHashFailed sentinel — which
+		// setEnv maps to an env.classifier_failed audit
+		// row (issue #957, SOC 2 CC7.2). Returning nil
+		// here would skip the row silently and lose the
+		// audit trail. Host stays empty (no plaintext
+		// leak); HostHash stays empty (NOT NULL would
+		// trip 23502 on INSERT, but the caller checks
+		// HostHashOK and skips the INSERT for this row).
 		c.Logger.Error("host hash failed; skipping row",
 			slog.String("app_id", c.AppID),
 			slog.String("env_key", envKey),
 			slog.String("kind", kind),
 			slog.String("err", err.Error()))
-		return nil
+		return &InferredUpstream{
+			Kind:       kind,
+			Scope:      scope,
+			EnvKey:     envKey,
+			HostHashOK: false,
+		}
 	}
 	return &InferredUpstream{
 		Kind:       kind,
