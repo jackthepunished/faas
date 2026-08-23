@@ -5684,3 +5684,32 @@ type EdgeRuleSuggestion struct {
 	Kind    string         `json:"kind"`
 	Action  map[string]any `json:"action"`
 }
+
+// DebugTelemetryRequestItem is one row of per-app request telemetry
+// returned by GET /v1/apps/{slug}/debug/requests (ADR-127 / PR-A).
+// The fields are 1:1 with the request_telemetry table columns; the
+// apid handler maps sqlc-generated rows to this wire DTO (cmd/apid
+// uses the sqlc row directly because pkg/api cannot import
+// pkg/state/sqlc without an import cycle).
+type DebugTelemetryRequestItem struct {
+	ID           string  `json:"id"`
+	DeploymentID string  `json:"deployment_id"`
+	Route        string  `json:"route"`
+	Method       string  `json:"method"`
+	Status       int     `json:"status"`
+	LatencyMS    int     `json:"latency_ms"`
+	ColdBoot     bool    `json:"cold_boot"`
+	TraceID      *string `json:"trace_id"`
+	ReceivedAt   string  `json:"received_at"`
+}
+
+// DebugTelemetryListResponse is the wire envelope for the debug
+// requests list endpoint. `Since` echoes the effective window
+// applied (after the plan's DebugTelemetryRetentionDays clamp) so
+// the dashboard can surface a "you widened past the cap" tile when
+// a customer asks for a longer window than their plan permits.
+type DebugTelemetryListResponse struct {
+	Since    string                    `json:"since"`
+	Requests []DebugTelemetryRequestItem `json:"requests"`
+
+}
