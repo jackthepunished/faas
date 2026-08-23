@@ -5681,403 +5681,7 @@ func TestMemStoreUpdateTrigger_FilterCriteriaPersists(t *testing.T) {
 	}
 }
 
-// --- Mirror rules (issue #72 / ADR-125) --------------------------------------
 
-// makeMirrorTestFixture seeds an account, an app, and two live
-// deployments on the same app. Returns the IDs; the test then
-// exercises CreateMirrorRuleIfUnderQuota against the pair.
-//
-// CreateDeployment auto-supersedes any prior live row on the same
-// app — same pattern as memstoreSeedLiveSibling above. We restore
-// the prior to DeployLive after creating the sibling so both rows
-// are live at the same time (the mirror rule validation requires
-// status=DeployLive for BOTH source and mirror; a superseded row
-// trips ErrMirrorDeploymentNotLive).
-func makeMirrorTestFixture(t *testing.T, m *MemStore, plan api.Plan) (acc, app, sourceDep, mirrorDep string) {
-	t.Helper()
-	ctx := context.Background()
-	account, err := m.CreateAccount(ctx, fmt.Sprintf("mirror-%s@x.com", uuid.NewString()), plan)
-	if err != nil {
-		t.Fatalf("CreateAccount: %v", err)
-	}
-	a, err := m.CreateApp(ctx, App{AccountID: account.ID, Slug: "mirror-" + uuid.NewString()})
-	if err != nil {
-		t.Fatalf("CreateApp: %v", err)
-	}
-	src, err := m.CreateDeployment(ctx, Deployment{AppID: a.ID, ImageDigest: "sha256:src"})
-	if err != nil {
-		t.Fatalf("CreateDeployment source: %v", err)
-	}
-	if err := m.MarkDeploymentLive(ctx, src.ID); err != nil {
-		t.Fatalf("MarkDeploymentLive source: %v", err)
-	}
-	mir, err := m.CreateDeployment(ctx, Deployment{AppID: a.ID, ImageDigest: "sha256:mirror"})
-	if err != nil {
-		t.Fatalf("CreateDeployment mirror: %v", err)
-	}
-	// Re-promote source back to live — the second CreateDeployment
-	// above auto-superseded it.
-	if err := m.MarkDeploymentLive(ctx, src.ID); err != nil {
-		t.Fatalf("MarkDeploymentLive source (restore): %v", err)
-	}
-	if err := m.MarkDeploymentLive(ctx, mir.ID); err != nil {
-		t.Fatalf("MarkDeploymentLive mirror: %v", err)
-	}
-	return account.ID, a.ID, src.ID, mir.ID
-}
-
-// TestMemStore_MirrorRules_CreateListUpdateDelete round-trips the
-// CRUD surface for mirror_rules. The same test pattern is used
-// against pgstore (TestPg_MirrorRules_CreateListUpdateDelete in the
-// pg test file) — these two suites are the parity guard.
-func TestMemStore_MirrorRules_CreateListUpdateDelete(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-
-	created, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID:          accID,
-		AppID:              appID,
-		SourceDeploymentID: srcID,
-		MirrorDeploymentID: mirID,
-		Percent:            100,
-		Enabled:            true,
-		IncludeBody:        false,
-		RedactHeaders:      []string{"X-Customer-Token"},
-	}, limits)
-	if err != nil {
-		t.Fatalf("create mirror rule: %v", err)
-	}
-	if created.ID == "" {
-		t.Fatal("created.ID is empty")
-	}
-	if created.SourceDeploymentID != srcID || created.MirrorDeploymentID != mirID {
-		t.Fatalf("created rule has wrong deployment ids: %+v", created)
-	}
-	if len(created.RedactHeaders) != 1 || created.RedactHeaders[0] != "X-Customer-Token" {
-		t.Fatalf("redact headers round-trip wrong: %+v", created.RedactHeaders)
-	}
-
-	listed, err := m.ListMirrorRules(ctx, appID)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(listed) != 1 || listed[0].ID != created.ID {
-		t.Fatalf("list returned %+v, want single match", listed)
-	}
-
-	// Patch: disable the rule + flip include_body.
-	updated, err := m.UpdateMirrorRule(ctx, created.ID, MirrorRulePatch{
-		Enabled:     ptr(false),
-		IncludeBody: ptr(true),
-	})
-	if err != nil {
-		t.Fatalf("update: %v", err)
-	}
-	if updated.Enabled {
-		t.Fatal("enabled did not flip to false")
-	}
-	if !updated.IncludeBody {
-		t.Fatal("include_body did not flip to true")
-	}
-
-	if err := m.DeleteMirrorRule(ctx, created.ID); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, err := m.GetMirrorRuleByID(ctx, created.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetMirrorRuleByID after delete: %v, want ErrNotFound", err)
-	}
-}
-
-// TestMemStore_MirrorRules_QuotaEnforced asserts the per-app cap
-// (Limits.MirrorTargetsPerApp; Pro=1, Scale=3) trips before the
-// second insert. The quota error carries the kind so the apid
-// handler can render the plan-appropriate 403.
-func TestMemStore_MirrorRules_QuotaEnforced(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-
-	// First insert succeeds.
-	if _, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID: accID, AppID: appID,
-		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-		Percent: 100, Enabled: true,
-	}, limits); err != nil {
-		t.Fatalf("first insert: %v", err)
-	}
-	// Second insert must trip the quota (Pro=1).
-	_, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID: accID, AppID: appID,
-		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-		Percent: 100, Enabled: true,
-	}, limits)
-	if err == nil {
-		t.Fatal("second insert must trip quota")
-	}
-	var qe *QuotaError
-	if !errors.As(err, &qe) || qe.Kind != QuotaErrorKindMirror {
-		t.Fatalf("err = %v, want QuotaError{Kind:mirror}", err)
-	}
-	if qe.Limit != limits.MirrorTargetsPerApp {
-		t.Fatalf("QuotaError.Limit = %d, want %d", qe.Limit, limits.MirrorTargetsPerApp)
-	}
-}
-
-// TestMemStore_MirrorRules_Validation asserts the sentinels
-// produce the right errors: invalid percent, same source/mirror,
-// non-live deployment. These are the handler→HTTP mappings in
-// api.errors.go (issue #72 / ADR-125).
-func TestMemStore_MirrorRules_Validation(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-
-	p := func() CreateMirrorRuleParams {
-		return CreateMirrorRuleParams{
-			AccountID: accID, AppID: appID,
-			SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-			Percent: 100, Enabled: true,
-		}
-	}
-	if _, err := m.CreateMirrorRuleIfUnderQuota(ctx, func() CreateMirrorRuleParams {
-		pp := p()
-		pp.Percent = -1
-		return pp
-	}(), limits); !errors.Is(err, ErrInvalidMirrorPercent) {
-		t.Fatalf("Percent=-1: err = %v, want ErrInvalidMirrorPercent", err)
-	}
-	if _, err := m.CreateMirrorRuleIfUnderQuota(ctx, func() CreateMirrorRuleParams {
-		pp := p()
-		pp.SourceDeploymentID = pp.MirrorDeploymentID
-		return pp
-	}(), limits); !errors.Is(err, ErrMirrorSourceTargetSame) {
-		t.Fatalf("source==mirror: err = %v, want ErrMirrorSourceTargetSame", err)
-	}
-	// Non-live deployment: create a third deployment in pending state.
-	dep, err := m.CreateDeployment(ctx, Deployment{AppID: appID, ImageDigest: "sha256:pending"})
-	if err != nil {
-		t.Fatalf("CreateDeployment pending: %v", err)
-	}
-	if _, err := m.CreateMirrorRuleIfUnderQuota(ctx, func() CreateMirrorRuleParams {
-		pp := p()
-		pp.MirrorDeploymentID = dep.ID
-		return pp
-	}(), limits); !errors.Is(err, ErrMirrorDeploymentNotLive) {
-		t.Fatalf("non-live mirror: err = %v, want ErrMirrorDeploymentNotLive", err)
-	}
-}
-
-// TestMemStore_MirrorInvocationResults exercises InsertMirrorResult,
-// ListMirrorResults, and MirrorSummary. The summary's MeanLatencyDiff
-// is the signed mean((mirror_ms - source_ms)) — the operator's
-// drift signal.
-func TestMemStore_MirrorInvocationResults(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-	rule, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID: accID, AppID: appID,
-		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-		Percent: 100, Enabled: true,
-	}, limits)
-	if err != nil {
-		t.Fatalf("create rule: %v", err)
-	}
-	now := time.Now().UTC()
-	// Two rows: one matching, one with status_diff + body_diff.
-	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
-		MirrorRuleID:       rule.ID,
-		AccountID:          accID,
-		AppID:              appID,
-		SourceDeploymentID: srcID,
-		MirrorDeploymentID: mirID,
-		StatusCode:         200,
-		SourceStatusCode:   200,
-		LatencyMs:          120,
-		SourceLatencyMs:    100,
-		BodyHash:           []byte("mirror-body"),
-		SourceBodyHash:     []byte("source-body"),
-		SchemaHash:         []byte("mirror-schema"),
-		SourceSchemaHash:   []byte("source-schema"),
-		BodyDiff:           true, // different body bytes
-		RequestID:          "req-1",
-		CompletedAt:        now,
-	}); err != nil {
-		t.Fatalf("insert 1: %v", err)
-	}
-	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
-		MirrorRuleID:       rule.ID,
-		AccountID:          accID,
-		AppID:              appID,
-		SourceDeploymentID: srcID,
-		MirrorDeploymentID: mirID,
-		StatusCode:         500,
-		SourceStatusCode:   200,
-		LatencyMs:          200,
-		SourceLatencyMs:    100,
-		RequestID:          "req-2",
-		StatusDiff:         true,
-		Crashed:            true,
-		CompletedAt:        now.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("insert 2: %v", err)
-	}
-	rows, err := m.ListMirrorResults(ctx, rule.ID, now.Add(-time.Minute), 0)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(rows) != 2 {
-		t.Fatalf("rows = %d, want 2", len(rows))
-	}
-	// DESC ordering: req-2 first.
-	if rows[0].RequestID != "req-2" {
-		t.Fatalf("first row = %s, want req-2", rows[0].RequestID)
-	}
-	summary, err := m.MirrorSummary(ctx, rule.ID, now.Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("summary: %v", err)
-	}
-	if summary.TotalInvocations != 2 {
-		t.Fatalf("TotalInvocations = %d, want 2", summary.TotalInvocations)
-	}
-	if summary.StatusDiffCount != 1 {
-		t.Fatalf("StatusDiffCount = %d, want 1", summary.StatusDiffCount)
-	}
-	if summary.BodyDiffCount != 1 {
-		t.Fatalf("BodyDiffCount = %d, want 1", summary.BodyDiffCount)
-	}
-	if summary.CrashCount != 1 {
-		t.Fatalf("CrashCount = %d, want 1", summary.CrashCount)
-	}
-}
-
-// ptr is a small helper so the test table can pass typed literals
-// to MirrorRulePatch without `var x = true; patch.Enabled = &x` noise.
-func ptr[T any](v T) *T { return &v }
-
-// TestMemStore_InsertMirrorResult_PreservesByteaNil pins the
-// bytea-NULL contract (issue #72 / ADR-125). When the rule has
-// include_body=false (the safe-by-default posture), body_hash /
-// source_body_hash / schema_hash / source_schema_hash MUST be
-// stored as nil (typed-nil []byte in Go, SQL NULL in pg) — NOT as
-// []byte{} (empty non-nil). Coercing nil → []byte{} collapses
-// "body intentionally not hashed" with "body present but empty",
-// making the include_body flag invisible to downstream tooling
-// (body_diff skip, schema-evolution audit). PgStore used to do
-// this coercion; the test pins the MemStore side of the same
-// contract — both stores must round-trip nil as nil.
-func TestMemStore_InsertMirrorResult_PreservesByteaNil(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-	rule, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID: accID, AppID: appID,
-		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-		Percent: 100, Enabled: true,
-	}, limits)
-	if err != nil {
-		t.Fatalf("create rule: %v", err)
-	}
-	// Rule has include_body=false; consumer MUST NOT populate any
-	// of the bytea fields.
-	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
-		MirrorRuleID:       rule.ID,
-		AccountID:          accID,
-		AppID:              appID,
-		SourceDeploymentID: srcID,
-		MirrorDeploymentID: mirID,
-		StatusCode:         200,
-		SourceStatusCode:   200,
-		RequestID:          "nil-bytea",
-		CompletedAt:        time.Now().UTC(),
-	}); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-	rows, err := m.ListMirrorResults(ctx, rule.ID, time.Time{}, 0)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(rows))
-	}
-	r := rows[0]
-	if r.BodyHash != nil {
-		t.Errorf("BodyHash = %v (len=%d), want nil", r.BodyHash, len(r.BodyHash))
-	}
-	if r.SourceBodyHash != nil {
-		t.Errorf("SourceBodyHash = %v, want nil", r.SourceBodyHash)
-	}
-	if r.SchemaHash != nil {
-		t.Errorf("SchemaHash = %v, want nil", r.SchemaHash)
-	}
-	if r.SourceSchemaHash != nil {
-		t.Errorf("SourceSchemaHash = %v, want nil", r.SourceSchemaHash)
-	}
-}
-
-// TestMemStore_ListMirrorResults_BoundaryIsInclusive pins the >=
-// boundary contract (issue #72 / ADR-125). MemStore previously
-// used strict `>` semantics via `!Before && !Equal`, which
-// silently dropped the row whose CompletedAt exactly equals
-// `since` — diverging from PgStore's `completed_at >= $2` SQL.
-// Operators polling with a previous row's CompletedAt as the new
-// `since` must see that boundary row.
-func TestMemStore_ListMirrorResults_BoundaryIsInclusive(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	accID, appID, srcID, mirID := makeMirrorTestFixture(t, m, api.PlanPro)
-	limits := api.MustLimitsFor(api.PlanPro)
-	rule, err := m.CreateMirrorRuleIfUnderQuota(ctx, CreateMirrorRuleParams{
-		AccountID: accID, AppID: appID,
-		SourceDeploymentID: srcID, MirrorDeploymentID: mirID,
-		Percent: 100, Enabled: true,
-	}, limits)
-	if err != nil {
-		t.Fatalf("create rule: %v", err)
-	}
-	boundary := time.Now().UTC()
-	if err := m.InsertMirrorResult(ctx, MirrorInvocationResult{
-		MirrorRuleID:       rule.ID,
-		AccountID:          accID,
-		AppID:              appID,
-		SourceDeploymentID: srcID,
-		MirrorDeploymentID: mirID,
-		StatusCode:         200,
-		SourceStatusCode:   200,
-		RequestID:          "boundary-row",
-		CompletedAt:        boundary,
-	}); err != nil {
-		t.Fatalf("insert boundary: %v", err)
-	}
-	rows, err := m.ListMirrorResults(ctx, rule.ID, boundary, 0)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1 (boundary row must be included)", len(rows))
-	}
-	if rows[0].RequestID != "boundary-row" {
-		t.Fatalf("first row = %s, want boundary-row", rows[0].RequestID)
-	}
-}
-
-// --- End of mirror tests -------------------------------------------------
-
-// TestMemStoreRetryDeploymentFromStage (ADR-117 §Production-ready
-// follow-on, C2). Pins:
-//   - the input-primitive copy (every field on the new row matches
-//     the failed row; a missed field silently re-deploys with
-//     different inputs)
-//   - the fresh-id contract (the new row's id != failedID)
-//   - the stage_state seed (current = fromStage, history = [])
-//   - status reset to DeployPending so imaged's transition chokepoint
-//     picks up the retry exactly like a fresh CLI-driven deploy
 //   - closed-vocab guard (unknown fromStage → ErrInvalidArgument)
 //   - the original row is NOT mutated (failure history stays
 //     observable alongside the retry)
@@ -6087,6 +5691,287 @@ func TestMemStoreRetryDeploymentFromStage(t *testing.T) {
 	acc, err := s.CreateAccount(ctx, "retry@example.com", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "retry-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	// Create a failed deployment with non-default input primitives
+	// so we can pin the copy. The status here is terminal (failed),
+	// the input primitives are what the retry path must copy.
+	sidecarsJSON := json.RawMessage(`[{"name":"redis","image":"redis:7"}]`)
+	overrideEnv := json.RawMessage(`{"LOG_LEVEL":"debug"}`)
+	failed, err := s.CreateDeployment(ctx, Deployment{
+		ID:                 "d-failed-retry",
+		AppID:              app.ID,
+		Status:             DeployFailed,
+		ImageDigest:        "sha256:orig",
+		Kind:               DeploymentKindTarball,
+		SourceURL:          "https://github.com/example/repo",
+		CommitSHA:          "abc1234",
+		Sidecars:           sidecarsJSON,
+		OverrideEnv:        overrideEnv,
+		OverridePort:       9090,
+		TrafficPercent:     50,
+		MinInstances:       1,
+		Scope:              "staging",
+		OverrideEntrypoint: []string{"node", "server.js"},
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	// Happy path: retry from snapshot_prepare.
+	got, err := s.RetryDeploymentFromStage(ctx, failed.ID, StageSnapshotPrepare)
+	if err != nil {
+		t.Fatalf("RetryDeploymentFromStage: %v", err)
+	}
+	if got.ID == failed.ID {
+		t.Errorf("retry returned same id %q; want a fresh id", failed.ID)
+	}
+	if got.AppID != failed.AppID {
+		t.Errorf("AppID not copied: got %q, want %q", got.AppID, failed.AppID)
+	}
+	if got.ImageDigest != failed.ImageDigest {
+		t.Errorf("ImageDigest not copied: got %q, want %q", got.ImageDigest, failed.ImageDigest)
+	}
+	if got.Kind != failed.Kind {
+		t.Errorf("Kind not copied: got %q, want %q", got.Kind, failed.Kind)
+	}
+	if got.SourceURL != failed.SourceURL {
+		t.Errorf("SourceURL not copied: got %q, want %q", got.SourceURL, failed.SourceURL)
+	}
+	if got.CommitSHA != failed.CommitSHA {
+		t.Errorf("CommitSHA not copied: got %q, want %q", got.CommitSHA, failed.CommitSHA)
+	}
+	if string(got.Sidecars) != string(failed.Sidecars) {
+		t.Errorf("Sidecars not copied: got %s, want %s", got.Sidecars, failed.Sidecars)
+	}
+	if string(got.OverrideEnv) != string(failed.OverrideEnv) {
+		t.Errorf("OverrideEnv not copied: got %s, want %s", got.OverrideEnv, failed.OverrideEnv)
+	}
+	if got.OverridePort != failed.OverridePort {
+		t.Errorf("OverridePort not copied: got %d, want %d", got.OverridePort, failed.OverridePort)
+	}
+	if got.TrafficPercent != failed.TrafficPercent {
+		t.Errorf("TrafficPercent not copied: got %d, want %d", got.TrafficPercent, failed.TrafficPercent)
+	}
+	if got.MinInstances != failed.MinInstances {
+		t.Errorf("MinInstances not copied: got %d, want %d", got.MinInstances, failed.MinInstances)
+	}
+	if got.Scope != failed.Scope {
+		t.Errorf("Scope not copied: got %q, want %q", got.Scope, failed.Scope)
+	}
+	if len(got.OverrideEntrypoint) != len(failed.OverrideEntrypoint) {
+		t.Errorf("OverrideEntrypoint not copied: got %v, want %v", got.OverrideEntrypoint, failed.OverrideEntrypoint)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("Status = %q, want %q (reset for imaged pickup)", got.Status, DeployPending)
+	}
+	// Stage-state seed.
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode new stage_state: %v", err)
+	}
+	if state.Current != StageSnapshotPrepare {
+		t.Errorf("new stage_state.Current = %q, want %q", state.Current, StageSnapshotPrepare)
+	}
+	if state.CurrentStartedAt != nil {
+		t.Errorf("new stage_state.CurrentStartedAt = %v, want nil", state.CurrentStartedAt)
+	}
+	if len(state.History) != 0 {
+		t.Errorf("new stage_state.History length = %d, want 0", len(state.History))
+	}
+	// Original row not mutated.
+	original, err := s.DeploymentByID(ctx, failed.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID (failed): %v", err)
+	}
+	if original.Status != DeployFailed {
+		t.Errorf("original.Status flipped: got %q, want %q", original.Status, DeployFailed)
+	}
+
+	// Closed-vocab guard: unknown fromStage → ErrInvalidArgument.
+	if _, err := s.RetryDeploymentFromStage(ctx, failed.ID, StageName("not_a_stage")); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("unknown fromStage: got %v, want ErrInvalidArgument", err)
+	}
+	// Empty fromStage → ErrInvalidArgument.
+	if _, err := s.RetryDeploymentFromStage(ctx, failed.ID, StageName("")); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("empty fromStage: got %v, want ErrInvalidArgument", err)
+	}
+	// Unknown failedID → ErrNotFound.
+	if _, err := s.RetryDeploymentFromStage(ctx, "d-does-not-exist", StageSourceDownload); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown failedID: got %v, want ErrNotFound", err)
+	}
+
+	// Retry-from-top: fromStage=source_download re-runs the whole
+	// pipeline. Intentional — that's how a user "retry from the top"
+	// works.
+	top, err := s.RetryDeploymentFromStage(ctx, failed.ID, StageSourceDownload)
+	if err != nil {
+		t.Fatalf("retry from source_download: %v", err)
+	}
+	var topState StageState
+	if err := json.Unmarshal(top.StageState, &topState); err != nil {
+		t.Fatalf("decode top retry stage_state: %v", err)
+	}
+	if topState.Current != StageSourceDownload {
+		t.Errorf("top retry stage_state.Current = %q, want %q", topState.Current, StageSourceDownload)
+	}
+}
+
+// TestIsStageName covers the closed-vocab lookup helper. Used by
+// the apid retry handler to validate wire-supplied from_stage
+// values before the storage call.
+func TestIsStageName(t *testing.T) {
+	for _, n := range AllStageNames {
+		if !IsStageName(n) {
+			t.Errorf("IsStageName(%q) = false, want true (closed-6 vocabulary)", n)
+		}
+	}
+	for _, n := range []StageName{"", "not_a_stage", "SOURCE_DOWNLOAD", "Source_Download"} {
+		if IsStageName(n) {
+			t.Errorf("IsStageName(%q) = true, want false", n)
+		}
+	}
+}
+
+// TestMemStore_StampFirstWake covers the wake-window stamp on
+// the deployments row (Mega-C PR-2 / issue #961 leaf 8). The
+// stamp is idempotent — a second wake must NOT shift the window
+// boundary. windowMinutes defaults to 5 when non-positive.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_StampFirstWake(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "first-wake", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:fw"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	// (1) First wake stamps both fields. windowMinutes defaults to 5.
+	got, err := m.StampFirstWake(ctx, dep.ID, 0)
+	if err != nil {
+		t.Fatalf("StampFirstWake 1st: %v", err)
+	}
+	if got.FirstWakeAt == nil {
+		t.Fatal("FirstWakeAt: nil after first stamp")
+	}
+	if got.First5xxWindowEndsAt == nil {
+		t.Fatal("First5xxWindowEndsAt: nil after first stamp")
+	}
+	firstEnd := *got.First5xxWindowEndsAt
+	firstStart := *got.FirstWakeAt
+	if !firstEnd.After(firstStart) {
+		t.Errorf("window end %v not after start %v", firstEnd, firstStart)
+	}
+
+	// (2) Second wake is idempotent: same start, same end.
+	got2, err := m.StampFirstWake(ctx, dep.ID, 5)
+	if err != nil {
+		t.Fatalf("StampFirstWake 2nd: %v", err)
+	}
+	if got2.FirstWakeAt == nil || !got2.FirstWakeAt.Equal(firstStart) {
+		t.Errorf("Second stamp shifted FirstWakeAt: got %v, want %v", got2.FirstWakeAt, firstStart)
+	}
+	if got2.First5xxWindowEndsAt == nil || !got2.First5xxWindowEndsAt.Equal(firstEnd) {
+		t.Errorf("Second stamp shifted First5xxWindowEndsAt: got %v, want %v", got2.First5xxWindowEndsAt, firstEnd)
+	}
+
+	// (3) Unknown deployment → ErrNotFound.
+	if _, err := m.StampFirstWake(ctx, "no-such", 5); !errors.Is(err, ErrNotFound) {
+		t.Errorf("StampFirstWake unknown: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_BumpFirst5xxCount covers the atomic 5xx-counter
+// bump on the deployments row. Returns the post-increment count
+// so schedd can do the threshold check immediately.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_BumpFirst5xxCount(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "bump-5xx", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:bump"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	for want := 1; want <= 5; want++ {
+		got, err := m.BumpFirst5xxCount(ctx, dep.ID)
+		if err != nil {
+			t.Fatalf("BumpFirst5xxCount #%d: %v", want, err)
+		}
+		if got != want {
+			t.Errorf("BumpFirst5xxCount #%d = %d, want %d", want, got, want)
+		}
+	}
+
+	if _, err := m.BumpFirst5xxCount(ctx, "no-such"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("BumpFirst5xxCount unknown: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_AutoRollbackDeploymentsTx covers the §6.2-1
+// invariant guard inside AutoRollbackDeploymentsTx. A non-live
+// current deployment must surface ErrNotFound; a live current
+// deployment with no prior superseded must surface ErrNotFound
+// too (no candidate to swap to).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func TestMemStore_AutoRollbackDeploymentsTx(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("not_live_current_returns_NotFound", func(t *testing.T) {
+		m := NewMemStore()
+		acc, err := m.CreateAccount(ctx, "p@p", api.PlanPro)
+		if err != nil {
+			t.Fatalf("CreateAccount: %v", err)
+		}
+		app, err := m.CreateApp(ctx, App{
+			AccountID: acc.ID, Slug: "ar-notlive", Type: AppTypeApp,
+			RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+			Status: AppActive,
+		})
+		if err != nil {
+			t.Fatalf("CreateApp: %v", err)
+		}
+		dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:nl"})
+		if err != nil {
+			t.Fatalf("CreateDeployment: %v", err)
+		}
+		// dep is in 'pending' (default), not 'live'.
+		if _, err := m.AutoRollbackDeploymentsTx(ctx, app.ID, dep.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("AutoRollbackDeploymentsTx on non-live: err = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // TestDeployment_DeploymentPreviewActive (issue #976 / ADR-122 /
 // SAFE-RELEASES-C) pins the predicate the cert allowlist consults
 // for the deployment-preview branch. The method lives on state.Deployment
@@ -6117,76 +6002,4 @@ func TestDeployment_DeploymentPreviewActive(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestMemStore_DeploymentOrdinal (issue #976 / ADR-122 /
-// SAFE-RELEASES-C.2) pins the per-app 1-based ordinal the
-// deployment-preview URL surface stamps. The round-trip is
-// stable: ordinal(N) == N regardless of how many later deploys
-// are inserted (the rank is recomputed across the whole window).
-//
-// Five assertions per app:
-//   - The first deployment (by created_at) is ordinal 1.
-//   - The third deployment is ordinal 3.
-//   - The second deployment is ordinal 2.
-//   - A deployment in a different app is ordinal 1 in that app.
-//   - A missing deployment_id for the app is ErrNotFound.
-//
-// MemStore mirrors the pg-side row_number() — both implementations
-// MUST agree (the memstore test is the regression pin for the
-// pgstore test under TestPg_DeploymentOrdinal). Drift between
-// the two impls corrupts every existing deployment-preview URL
-// the moment a new deploy lands.
-func TestMemStore_DeploymentOrdinal(t *testing.T) {
-	ctx := context.Background()
-	m := NewMemStore()
-
-	a := uuid.NewString()
-	b := uuid.NewString()
-	d1 := uuid.NewString()
-	d2 := uuid.NewString()
-	d3 := uuid.NewString()
-	dX := uuid.NewString()
-	now := time.Now()
-	// Insert out-of-order to exercise the (created_at, id) sort.
-	mustInsertDeployment(t, m, Deployment{
-		ID: d3, AppID: a, Status: DeployLive, CreatedAt: now.Add(2 * time.Second),
-	})
-	mustInsertDeployment(t, m, Deployment{
-		ID: d1, AppID: a, Status: DeployLive, CreatedAt: now,
-	})
-	mustInsertDeployment(t, m, Deployment{
-		ID: d2, AppID: a, Status: DeployLive, CreatedAt: now.Add(1 * time.Second),
-	})
-	mustInsertDeployment(t, m, Deployment{
-		ID: dX, AppID: b, Status: DeployLive, CreatedAt: now,
-	})
-
-	if got, _ := m.DeploymentOrdinal(ctx, a, d1); got != 1 {
-		t.Errorf("ord(d1) = %d, want 1", got)
-	}
-	if got, _ := m.DeploymentOrdinal(ctx, a, d2); got != 2 {
-		t.Errorf("ord(d2) = %d, want 2", got)
-	}
-	if got, _ := m.DeploymentOrdinal(ctx, a, d3); got != 3 {
-		t.Errorf("ord(d3) = %d, want 3", got)
-	}
-	if got, _ := m.DeploymentOrdinal(ctx, b, dX); got != 1 {
-		t.Errorf("ord(dX in app b) = %d, want 1 (separate counter)", got)
-	}
-	if _, err := m.DeploymentOrdinal(ctx, a, uuid.NewString()); !errors.Is(err, ErrNotFound) {
-		t.Errorf("missing deployment: err = %v, want ErrNotFound", err)
-	}
-}
-
-// mustInsertDeployment is a thin helper for the ordinal test;
-// mirrors the production CreateDeployment stub pattern but inserts
-// directly into the memstore map (CreateDeployment is heavier
-// than necessary — for the ordinal query we only need the {id,
-// app_id, status, created_at} columns on a single tenant).
-func mustInsertDeployment(t *testing.T, m *MemStore, d Deployment) {
-	t.Helper()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.deployments[d.ID] = d
 }
