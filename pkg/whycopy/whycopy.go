@@ -170,6 +170,54 @@ var catalog = map[string]Render{
 		Why:   "the deploy shape (or resolved base image) is a stateful one this platform does not support in year one — a Dockerfile with VOLUME, a top-level data/ or db/ directory, or a known stateful base image (postgres/redis/etc.)",
 		Fix:   "• use a managed service (Neon, Upstash, S3, R2, MongoDB Atlas) and wire credentials via `gregale secrets`\n• if you need a quick start, `gregale init --template=s3-uploader` shows the pattern",
 	},
+	// ADR-117 §Production-ready follow-on: per-stage failure
+	// codes. The renderer (pkg/dashboard/stages.StageFailureHTML)
+	// reads these via Decorate when a stage row is failed AND the
+	// deployment row's ErrorCode is one of the CodeStage* set.
+	// Cluster-A tripwire (TestEveryCodeHasWhycopyEntry) covers
+	// these via the clusterCodes slice in cmd/gregale/lint_tripwires_test.go.
+	api.CodeStageSourceDownloadFailed: {
+		Title: "Source download failed",
+		Hint:  "the build VM could not fetch your repository tarball",
+		Why:   "the source_ref / image-source fetch from your git provider or OCI registry returned a non-2xx after the configured retries; the build VM never started",
+		Fix:   "• verify the repo / image is public or the install token is valid (`gregale deploys status <id>` shows the full error)\n• for private repos, re-authorize the GitHub App installation\n• if your git provider is having an incident, retry after a few minutes",
+	},
+	api.CodeStageDependencyRestoreFailed: {
+		Title: "Dependencies restore failed",
+		Hint:  "your package manager install step exited non-zero inside the build VM",
+		Why:   "the build VM's `npm ci` / `pip install -r requirements.txt` / `go mod download` / equivalent failed; this is distinct from CodeDepInstallFailed (which surfaces as a top-level problem) because the failure happened inside the closed stage pipeline",
+		Fix:   "• read the build log via `gregale deploys status <id>` (the failing command is on the last 30 lines)\n• if a lockfile pins an incompatible version, update it\n• for private registries, confirm credentials are in `gregale secrets`",
+	},
+	api.CodeStageImageBuildOOM: {
+		Title: "Image build ran out of memory",
+		Hint:  "the build VM hit its 2 GB memory ceiling during image_build",
+		Why:   "the build VM is sized at 2 vCPU + 2 GB RAM (ADR-003). A dependency tree, monorepo build, or webpack/vite compilation step exceeded that envelope; this is the most common image_build failure",
+		Fix:   "• move heavy builds into a CI step that produces a pre-built artifact, then deploy via `gregale deploy --image=...`\n• for monorepos, deploy a sub-package's Dockerfile rather than the root\n• if the build genuinely needs more RAM, file a ticket — the build VM envelope is on the roadmap to be configurable per plan",
+	},
+	api.CodeStageImageBuildTimeout: {
+		Title: "Image build timed out",
+		Hint:  "the build VM exceeded the 10-minute build-time ceiling",
+		Why:   "the build VM has a hard 10-minute wall-clock ceiling (ADR-003 §SLO). Cold-cache dependency restores, large monorepo clones, or stuck network calls trip this; the build VM is forcibly killed",
+		Fix:   "• warm the dependency cache first (`gregale deploy` will reuse a recent cache hit within 24 h)\n• split a monolithic build into smaller, parallelized CI jobs\n• if the build is genuinely large, file a ticket — the ceiling is on the roadmap to be plan-tiered",
+	},
+	api.CodeStageSecurityScanFindings: {
+		Title: "Security scan flagged findings",
+		Hint:  "grype found CVEs at or above the plan's severity threshold",
+		Why:   "the security_scan stage runs grype against the built image and refuses to advance to snapshot_prepare when the CVE severity threshold is breached (CRITICAL/HIGH on Pro+, MEDIUM on Scale). The plan's threshold is documented in pkg/api/limits.go",
+		Fix:   "• run `gregale deploys status <id>` and read the CVE list in the build log\n• update the affected base image or dependency to a patched version\n• if a finding is a known-acceptable risk, file an exception via support (the per-account CVE allowlist is on the roadmap)",
+	},
+	api.CodeStageSnapshotPrepareTimeout: {
+		Title: "Snapshot prepare timed out",
+		Hint:  "the snapshot_prepare stage exceeded its wall-clock ceiling",
+		Why:   "snapshot_prepare walks the build VM's rootfs and assembles the per-app overlay layer; a large layer or a stall on the Firecracker PUT MMDS path trips this",
+		Fix:   "• check `gregale deploys status <id>` for the snapshot_prepare row's wall-clock\n• a layer > 1 GB (above the plan's app_layer cap) is the most common cause — slim the image\n• transient stalls are retried automatically on the next deploy; if persistent, file a ticket",
+	},
+	api.CodeStageReadinessFailed: {
+		Title: "Readiness probe failed",
+		Hint:  "the deployed VM's /healthz never returned 200",
+		Why:   "the readiness stage boots the VM and polls /healthz on the plan's readiness timeout (default 35s). The VM reached the snapshot boot but the application inside did not become ready in time — distinct from CodeAppStartupTimeout which is the wake-side counterpart",
+		Fix:   "• check `gregale logs <slug>` for the boot sequence inside the guest\n• defer heavy init work until after /healthz starts listening\n• if your app genuinely needs more time, set `startup_timeout_s` higher in the app config",
+	},
 }
 
 // Decorate copies the catalog row for code onto p, returning p for

@@ -403,3 +403,478 @@ func extractIDFromOK(line string) string {
 
 // _ pins the context import; harmless if unused.
 var _ = context.Background
+
+// TestCmdComputeNodesList_Empty pins the no-rows path: a fresh
+// MemStore (after removing the synthetic default-local row) must
+// report "(no compute nodes)" rather than print nothing (which
+// looks like a hang). The --json variant would emit
+// {"count":0,"nodes":[]} so CI gates can rely on a stable
+// contract. We don't pin --json here because the empty case is
+// the only one where we drop the synthetic default-local row,
+// and keeping the contract single-shape keeps the assertion
+// simpler.
+func TestCmdComputeNodesList_Empty(t *testing.T) {
+	resetMemStore(t)
+	st := getSeededStore(t)
+	defaultRow, err := st.ComputeNodeByName(context.Background(), "default-local")
+	if err != nil {
+		t.Fatalf("look up default-local: %v", err)
+	}
+	if err := st.DeleteComputeNode(context.Background(), defaultRow.ID); err != nil {
+		t.Fatalf("delete default-local: %v", err)
+	}
+
+	stdout, restore := captureOsStdoutComputeNodes(t)
+	code := cmdComputeNodesList([]string{})
+	restore()
+	if code != 0 {
+		t.Fatalf("cmdComputeNodesList(empty) = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "(no compute nodes)") {
+		t.Errorf("empty-list text = %q, want contains %q", stdout.String(), "(no compute nodes)")
+	}
+}
+
+// TestCmdComputeNodesList_JSON_HappyPath pins the wire shape
+// for the common case (two registered nodes, after removing the
+// synthetic default-local). count==2, the nodes array carries
+// both, ordered by name (the pgstore contract is ORDER BY name).
+func TestCmdComputeNodesList_JSON_HappyPath(t *testing.T) {
+	resetMemStore(t)
+	st := getSeededStore(t)
+	defaultRow, err := st.ComputeNodeByName(context.Background(), "default-local")
+	if err != nil {
+		t.Fatalf("look up default-local: %v", err)
+	}
+	if err := st.DeleteComputeNode(context.Background(), defaultRow.ID); err != nil {
+		t.Fatalf("delete default-local: %v", err)
+	}
+	seedNode(t, "alpha", "unix:///run/faas/alpha.sock")
+	seedNode(t, "bravo", "unix:///run/faas/bravo.sock")
+
+	stdout, restore := captureOsStdoutComputeNodes(t)
+	code := cmdComputeNodesList([]string{"--json"})
+	restore()
+	if code != 0 {
+		t.Fatalf("cmdComputeNodesList(--json) = %d, want 0", code)
+	}
+	var out computeNodesListJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v (raw: %q)", err, stdout.String())
+	}
+	if out.Count != 2 {
+		t.Errorf("count = %d, want 2", out.Count)
+	}
+	if len(out.Nodes) != 2 {
+		t.Fatalf("len(nodes) = %d, want 2", len(out.Nodes))
+	}
+	if out.Nodes[0].Name != "alpha" || out.Nodes[1].Name != "bravo" {
+		t.Errorf("name order: got [%s, %s], want [alpha, bravo]", out.Nodes[0].Name, out.Nodes[1].Name)
+	}
+	for _, n := range out.Nodes {
+		if n.TargetURL == "" {
+			t.Errorf("node %s target_url empty", n.Name)
+		}
+		if !n.Active {
+			t.Errorf("node %s active = false, fresh seed should default active=true", n.Name)
+		}
+		if n.VPCPUs <= 0 || n.MemMB <= 0 || n.MaxConcurrency <= 0 || n.AdmissionCeilingMB <= 0 {
+			t.Errorf("node %s has zero capacity field: vpcpus=%d mem=%d max=%d adm=%d", n.Name, n.VPCPUs, n.MemMB, n.MaxConcurrency, n.AdmissionCeilingMB)
+		}
+	}
+}
+
+// TestCmdComputeNodesList_ActiveOnly pins the --active-only filter.
+// A drained node must be excluded; the default list path must
+// include it. Without the filter, the drain / drain-status UX
+// can't distinguish "node drained, ready to upgrade" from
+// "node registered, never been touched". The synthetic
+// default-local row is dropped at setup so the counts below are
+// deterministic (default-local counts as active=true on a fresh
+// MemStore — keeping it would add a constant +1 to each count).
+func TestCmdComputeNodesList_ActiveOnly(t *testing.T) {
+	resetMemStore(t)
+	st := getSeededStore(t)
+	defaultRow, err := st.ComputeNodeByName(context.Background(), "default-local")
+	if err != nil {
+		t.Fatalf("look up default-local: %v", err)
+	}
+	if err := st.DeleteComputeNode(context.Background(), defaultRow.ID); err != nil {
+		t.Fatalf("delete default-local: %v", err)
+	}
+	seedNode(t, "alpha", "unix:///run/faas/alpha.sock")
+	seedNode(t, "bravo", "unix:///run/faas/bravo.sock")
+	bravo, err := st.ComputeNodeByName(context.Background(), "bravo")
+	if err != nil {
+		t.Fatalf("look up bravo: %v", err)
+	}
+	if err := st.MarkComputeNodeInactive(context.Background(), bravo.ID); err != nil {
+		t.Fatalf("drain bravo: %v", err)
+	}
+
+	// Default path: both visible (alpha + bravo; bravo is drained
+	// but still in compute_nodes with active=false).
+	stdoutAll, restoreAll := captureOsStdoutComputeNodes(t)
+	if code := cmdComputeNodesList([]string{"--json"}); code != 0 {
+		t.Fatalf("list default = %d, want 0", code)
+	}
+	restoreAll()
+	var all computeNodesListJSON
+	if err := json.Unmarshal(stdoutAll.Bytes(), &all); err != nil {
+		t.Fatalf("unmarshal all: %v (raw: %q)", err, stdoutAll.String())
+	}
+	if all.Count != 2 {
+		t.Errorf("default list count = %d, want 2 (drained node should be included)", all.Count)
+	}
+
+	// --active-only: bravo excluded.
+	stdoutActive, restoreActive := captureOsStdoutComputeNodes(t)
+	if code := cmdComputeNodesList([]string{"--active-only", "--json"}); code != 0 {
+		t.Fatalf("list --active-only = %d, want 0", code)
+	}
+	restoreActive()
+	var active computeNodesListJSON
+	if err := json.Unmarshal(stdoutActive.Bytes(), &active); err != nil {
+		t.Fatalf("unmarshal active: %v (raw: %q)", err, stdoutActive.String())
+	}
+	if active.Count != 1 {
+		t.Errorf("active-only count = %d, want 1 (drained node should be excluded)", active.Count)
+	}
+	if active.Nodes[0].Name != "alpha" {
+		t.Errorf("active-only name = %q, want alpha", active.Nodes[0].Name)
+	}
+}
+
+// TestCmdComputeNodesShow_Missing pins the not-found exit code:
+// an unknown --node value must exit 3 (the "row not found"
+// convention that state.Store.ComputeNodeByName surfaces), NOT
+// exit 1 (which would conflate "node missing" with "DB
+// unreachable" and confuse the upgrade orchestrator's loop).
+func TestCmdComputeNodesShow_Missing(t *testing.T) {
+	resetMemStore(t)
+	code := cmdComputeNodesShow([]string{"--node=ghost"})
+	if code != 3 {
+		t.Errorf("cmdComputeNodesShow(ghost) = %d, want 3", code)
+	}
+}
+
+// TestCmdComputeNodesShow_JSON_HappyPath pins the per-node wire
+// shape. --json on a freshly-registered node must surface {name,
+// id, target_url, vpcpus, mem_mb, max_concurrency,
+// admission_ceiling_mb, active, live_instance_count}. role /
+// region / zone / release_id / cert_fingerprint / generation
+// are nil on a fresh seed (omitempty hides them) — the wire
+// shape distinguishes "field absent because not yet stamped"
+// from "field absent because typo".
+func TestCmdComputeNodesShow_JSON_HappyPath(t *testing.T) {
+	resetMemStore(t)
+	// Use a fresh name so the synthetic default-local row doesn't
+	// shadow the assertion below.
+	seedNode(t, "alpha", "unix:///run/faas/alpha.sock")
+
+	stdout, restore := captureOsStdoutComputeNodes(t)
+	code := cmdComputeNodesShow([]string{"--node=alpha", "--json"})
+	restore()
+	if code != 0 {
+		t.Fatalf("cmdComputeNodesShow(--json) = %d, want 0", code)
+	}
+	var out computeNodeShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v (raw: %q)", err, stdout.String())
+	}
+	if out.Name != "alpha" {
+		t.Errorf("name = %q, want alpha", out.Name)
+	}
+	if out.TargetURL != "unix:///run/faas/alpha.sock" {
+		t.Errorf("target_url = %q, want unix:///run/faas/alpha.sock", out.TargetURL)
+	}
+	if out.LiveInstanceCount != 0 {
+		t.Errorf("live_instance_count = %d, want 0 (fresh node has no instances)", out.LiveInstanceCount)
+	}
+	if !out.Active {
+		t.Errorf("active = false, want true on fresh seed")
+	}
+	if out.Role != nil {
+		t.Errorf("role = %v, want nil on fresh seed (omitempty)", *out.Role)
+	}
+	if out.CertFingerprint != nil {
+		t.Errorf("cert_fingerprint = %v, want nil on fresh seed", *out.CertFingerprint)
+	}
+}
+
+// TestCmdComputeNodesShow_JSON_LiveInstanceCount pins the load-bearing
+// contract that --json reports the right live_instance_count for a
+// node that actually has live instances. The naïve implementation
+// (cmdComputeNodesShow passing *node to ListInstancesByNodeID, which
+// expects the row's ID column) returns 0 because the lookup
+// predicate is `apps.NodeID == nodeID` and nodeID is a UUID, not the
+// user-supplied fqdn. Caught by /code-review medium on PR #1044.
+func TestCmdComputeNodesShow_JSON_LiveInstanceCount(t *testing.T) {
+	resetMemStore(t)
+	seedNode(t, "alpha", "unix:///run/faas/alpha.sock")
+
+	// Seed one app + two instances on alpha (one live, one parked)
+	// so live_instance_count must be exactly 1.
+	st := getSeededStore(t)
+	nodeRow, err := st.ComputeNodeByName(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName: %v", err)
+	}
+	app, err := st.CreateApp(context.Background(), state.App{
+		AccountID: "test-acct",
+		Slug:      "alpha-app",
+		Type:      state.AppTypeFunction,
+		Runtime:   "node22",
+		RAMMB:     256,
+		NodeID:    nodeRow.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	deployment, err := st.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		BuildID:     "",
+		ImageDigest: "img:tag",
+		Kind:        state.DeploymentKindImage,
+		SourcePath:  "",
+		SourceBytes: 0,
+		Handler:     "",
+		LogPath:     "",
+		SourceURL:   "",
+		CommitSHA:   "",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if _, err := st.CreateInstance(context.Background(), app.ID, deployment.ID, "RUNNING", 256, nodeRow.ID, "wake-1"); err != nil {
+		t.Fatalf("CreateInstance(running): %v", err)
+	}
+	if _, err := st.CreateInstance(context.Background(), app.ID, deployment.ID, "PARKED", 256, nodeRow.ID, "wake-2"); err != nil {
+		t.Fatalf("CreateInstance(parked): %v", err)
+	}
+
+	stdout, restore := captureOsStdoutComputeNodes(t)
+	code := cmdComputeNodesShow([]string{"--node=alpha", "--json"})
+	restore()
+	if code != 0 {
+		t.Fatalf("cmdComputeNodesShow(--json) = %d, want 0", code)
+	}
+	var out computeNodeShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v (raw: %q)", err, stdout.String())
+	}
+	if out.LiveInstanceCount != 1 {
+		t.Errorf("live_instance_count = %d, want 1 (one RUNNING + one PARKED; only RUNNING counts)", out.LiveInstanceCount)
+	}
+}
+
+// seedNode registers one fresh compute node through the public
+// cmdComputeNodesAdd path so the list / show tests exercise the
+// same wire the operator would. The MemStore seam treats the
+// upsert as the source of truth.
+func seedNode(t *testing.T, name, targetURL string) {
+	t.Helper()
+	if code := cmdComputeNodesAdd([]string{
+		"--name=" + name,
+		"--target-url=" + targetURL,
+		"--vpcpus=8",
+		"--mem-mb=4096",
+		"--max-concurrency=20",
+		"--admission-ceiling-mb=3500",
+	}); code != 0 {
+		t.Fatalf("seedNode(%s): add returned %d", name, code)
+	}
+}
+
+// getSeededStore returns the MemStore wrapped by the current
+// computeNodesStoreOpener. Used by TestComputeNodesList_ActiveOnly
+// to call MarkComputeNodeInactive without re-wiring the seam.
+func getSeededStore(t *testing.T) state.Store {
+	t.Helper()
+	st, _, err := computeNodesStoreOpener()
+	if err != nil {
+		t.Fatalf("open seeded store: %v", err)
+	}
+	return st
+}
+
+// _ pins the encoding/json import; the show / list tests use it.
+var _ = json.Marshal
+
+// captureOsStdoutComputeNodes swaps the package-level osStdout for
+// a buffer so the show / list subcommands (which write via the
+// osStdout package var, not os.Stdout) can be asserted without
+// letting their JSON pollute the test runner's stdout. Returns
+// a restore() closure that swaps osStdout back.
+//
+// Buffer type is commands_sign_keys_test.go's `buffer` (same
+// package); both files import nothing extra because the type
+// is defined here too.
+func captureOsStdoutComputeNodes(t *testing.T) (*captureBuffer, func()) {
+	t.Helper()
+	old := osStdout
+	buf := &captureBuffer{}
+	osStdout = buf
+	return buf, func() { osStdout = old }
+}
+
+// captureBuffer is the io.Writer returned by
+// captureOsStdoutComputeNodes; mirrored here for self-containedness
+// (commands_sign_keys_test.go has the same shape under the name
+// `buffer`).
+type captureBuffer struct {
+	data []byte
+}
+
+func (b *captureBuffer) Write(p []byte) (int, error) {
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *captureBuffer) Bytes() []byte  { return b.data }
+func (b *captureBuffer) String() string { return string(b.data) }
+
+// TestCmdComputeNodesDispatch_Routing pins the dispatcher routing
+// for every sibling verb under `gregalectl compute-nodes <verb>`.
+// Each subtest asserts the dispatcher forwards args[1:] to the
+// correct leaf verb. The leaf verbs' happy paths hit Postgres
+// (openComputeNodesStore), so the subtests only assert the
+// exit-2 error-path that fires when --node is missing — that's
+// the early exit that doesn't touch the store.
+//
+// The "no subcommand" and "unknown subcommand" branches are
+// covered separately (they exit 2 with a diagnostic) below.
+func TestCmdComputeNodesDispatch_Routing(t *testing.T) {
+	cases := []struct {
+		name    string
+		verb    string
+		wantErr string // expected stderr substring
+	}{
+		{name: "drain", verb: "drain", wantErr: "--node required"},
+		{name: "drain_status", verb: "drain-status", wantErr: "--node required"},
+		{name: "activate", verb: "activate", wantErr: "--node required"},
+		{name: "force_drain", verb: "force-drain", wantErr: "--node required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stderr := captureStderrComputeNodes(t, func() {
+				if code := cmdComputeNodesDispatch([]string{tc.verb}); code != 2 {
+					t.Errorf("dispatch(%s) -> leaf exit %d, want 2 (--node required)", tc.verb, code)
+				}
+			})
+			if !strings.Contains(stderr, tc.wantErr) {
+				t.Errorf("dispatch(%s) stderr missing %q (got %q)", tc.verb, tc.wantErr, stderr)
+			}
+		})
+	}
+}
+
+// TestCmdComputeNodesDispatch_NoSubcommand pins the missing-arg
+// branch (commands_compute_nodes.go:57-60) — exit 2 with a
+// diagnostic listing all known subcommands.
+func TestCmdComputeNodesDispatch_NoSubcommand(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDispatch(nil); code != 2 {
+			t.Errorf("dispatch(nil) = %d, want 2", code)
+		}
+	})
+	for _, want := range []string{"missing subcommand", "add", "list", "show", "drain", "activate"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("dispatch(nil) stderr missing %q (got %q)", want, stderr)
+		}
+	}
+}
+
+// TestCmdComputeNodesDispatch_UnknownSubcommand pins the default
+// branch of the dispatch switch (commands_compute_nodes.go:76-79).
+func TestCmdComputeNodesDispatch_UnknownSubcommand(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDispatch([]string{"reboot"}); code != 2 {
+			t.Errorf("dispatch(reboot) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, `unknown subcommand "reboot"`) {
+		t.Errorf("dispatch(reboot) stderr missing unknown-subcommand marker (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesDrain_MissingNode pins the --node-required
+// branch of cmdComputeNodesDrain (commands_compute_nodes.go:125-128)
+// — exit 2 with a diagnostic, no Postgres touched.
+func TestCmdComputeNodesDrain_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDrain(nil); code != 2 {
+			t.Errorf("drain(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("drain(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesDrainStatus_MissingNode pins the --node-required
+// branch of cmdComputeNodesDrainStatus (commands_compute_nodes.go:160-163).
+func TestCmdComputeNodesDrainStatus_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDrainStatus(nil); code != 2 {
+			t.Errorf("drain-status(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("drain-status(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesActivate_MissingNode pins the --node-required
+// branch of cmdComputeNodesActivate (commands_compute_nodes.go:202-205).
+func TestCmdComputeNodesActivate_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesActivate(nil); code != 2 {
+			t.Errorf("activate(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("activate(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_RequiresYes pins the loud-warning
+// branch (commands_compute_nodes.go:238-241) — exit 2 with a
+// diagnostic that NAMES --yes so the operator can copy-paste.
+// The --node check runs first, so a test that omits both --node
+// and --yes should see the --node-required diagnostic (covered by
+// TestCmdComputeNodesDrain_MissingNode above). Here we omit --yes
+// but provide --node; the early exit fires on the --yes check.
+func TestCmdComputeNodesForceDrain_RequiresYes(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesForceDrain([]string{"--node=alpha"}); code != 2 {
+			t.Errorf("force-drain(--node=alpha, no --yes) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--yes required") {
+		t.Errorf("force-drain stderr missing --yes required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_MissingNode pins the --node-required
+// branch (commands_compute_nodes.go:234-237) — runs BEFORE the
+// --yes check so this fires first even when --yes is also missing.
+func TestCmdComputeNodesForceDrain_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesForceDrain(nil); code != 2 {
+			t.Errorf("force-drain(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("force-drain(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_InvalidFlag pins the flag.Parse
+// error branch (commands_compute_nodes.go:231-233) — exit 2 via
+// flag.ContinueOnError when an unknown flag is passed.
+func TestCmdComputeNodesForceDrain_InvalidFlag(t *testing.T) {
+	if code := cmdComputeNodesForceDrain([]string{"--not-a-flag"}); code != 2 {
+		t.Errorf("force-drain(--not-a-flag) = %d, want 2", code)
+	}
+}

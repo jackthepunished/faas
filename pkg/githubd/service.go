@@ -92,6 +92,13 @@ type WritePreviewCheck = WritePreviewCheckFunc
 // nil-safe.
 type WritePreviewCheckForkRefused = WritePreviewCheckForkRefusedFunc
 
+// WritePreviewDestroyComment is the seam githubd uses to push a
+// one-time PR-thread comment carrying the dashboard's one-click
+// destroy link (issue #961 Mega-C PR-1, leaf 3). Wired by
+// cmd/githubd/main.go to ChecksAPI.WritePreviewDestroyComment;
+// nil-safe (handlePullRequest logs + proceeds when nil).
+type WritePreviewDestroyComment = WritePreviewDestroyCommentFunc
+
 // Service is the business-logic object shared across the HTTP
 // webhook handler and the gRPC server. nil fields fall back to
 // safe no-ops (so partial deployments degrade gracefully until
@@ -141,6 +148,14 @@ type Service struct {
 	// neutral Check Run writer. Same nil-safe posture as
 	// WritePreviewCheck.
 	WritePreviewCheckForkRefused WritePreviewCheckForkRefused
+	// WritePreviewDestroyComment is the one-time PR-thread
+	// destroy-hint writer (issue #961 Mega-C PR-1, leaf 3).
+	// Same nil-safe posture as WritePreviewCheck. The dedupe
+	// carrier is apps.preview_destroy_commented_at — set
+	// BEFORE the POST so a duplicate enqueue (e.g. close +
+	// reopen in the same webhook burst) collapses to a
+	// single comment.
+	WritePreviewDestroyComment WritePreviewDestroyComment
 	// WorkDir is the root directory under which githubd
 	// stages the per-app source tarballs that the apid
 	// bridge passes to builderd. Defaults to /var/lib/faas/
@@ -653,6 +668,62 @@ func previewHostnameForSlug(slug string) string {
 	return slug + "." + domain
 }
 
+// dashboardDestroyPreviewURL derives the customer-facing dashboard
+// one-click destroy URL from the parent app's slug + the preview
+// slug (issue #961 Mega-C PR-1, leaf 3). Shape:
+//
+//	/dashboard/apps/{parent_slug}/preview/{preview_slug}/destroy
+//
+// The route is mounted by cmd/apid/server.go as
+// POST /dashboard/apps/{slug}/preview/{previewSlug}/destroy (a
+// future PR-2 commit); githubd's job is to compose the URL and
+// embed it in the PR-thread comment Markdown so the author can
+// click through to the dashboard action.
+func dashboardDestroyPreviewURL(parentSlug, previewSlug string) string {
+	if parentSlug == "" || previewSlug == "" {
+		return ""
+	}
+	return "/dashboard/apps/" + parentSlug + "/preview/" + previewSlug + "/destroy"
+}
+
+// previewCommentOnce stamps apps.preview_destroy_commented_at
+// (the dedupe carrier from migration 00296) and returns true
+// only on the first call per preview row. Subsequent calls
+// return false so the caller can short-circuit the GitHub POST.
+//
+// The stamp runs BEFORE the POST so a duplicate enqueue (e.g.
+// PR close + reopen within the same webhook burst) collapses
+// to a single comment. A failed POST does NOT clear the stamp
+// — the customer's intent ("don't spam my PR thread") is
+// already satisfied by the dedupe, and a re-attempt on a later
+// trigger can refresh the comment.
+//
+// Returns false (no-op) when the Store seam is missing — the
+// close-arm should never block on dedupe state.
+func (s *Service) previewCommentOnce(ctx context.Context, appID string) (firstTime bool, stampErr error) {
+	if s.Reconcile == nil || s.Reconcile.Store == nil {
+		return false, nil
+	}
+	current, err := s.Reconcile.Store.AppByID(ctx, appID)
+	if err != nil {
+		// Best-effort dedupe: an unreadable AppByID must NOT
+		// block the close-arm — the customer's intent ("don't
+		// spam my PR thread") is already satisfied by the
+		// Store.StampPreviewDestroyCommentedAt being a no-op
+		// when the row is missing, and a re-attempt on a later
+		// trigger can refresh the comment.
+		//nolint:nilerr
+		return false, nil
+	}
+	if current.PreviewDestroyCommentedAt != nil {
+		return false, nil
+	}
+	if _, err := s.Reconcile.Store.StampPreviewDestroyCommentedAt(ctx, appID, time.Now().UTC()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // previewSlug derives the slug githubd uses for a preview app
 // row from the parent app's slug + the PR number (issue #272 /
 // ADR-094 D2). The shape is `pr-{N}-{parent_slug}`, e.g. a
@@ -719,6 +790,12 @@ type WritePreviewCheckFunc func(ctx context.Context, repoFullName, commitSHA str
 // uses for the D3 fork-refused neutral Check Run. Same func-
 // typed shape as WritePreviewCheckFunc.
 type WritePreviewCheckForkRefusedFunc func(ctx context.Context, repoFullName, commitSHA, summary string) error
+
+// WritePreviewDestroyCommentFunc is the seam HandlePullRequest
+// uses for the one-time PR-comment destroy hint (issue #961
+// Mega-C PR-1, leaf 3). Body is a Markdown fragment; the caller
+// composes the dashboard URL prefix.
+type WritePreviewDestroyCommentFunc func(ctx context.Context, repoFullName string, prNumber int, body string) error
 
 // handlePullRequest is the HTTP webhook entry point for the
 // pull_request event family (issue #272 / ADR-094). It provisions
@@ -964,6 +1041,31 @@ func (s *Service) handlePullRequest(ctx context.Context, body []byte) (reconcile
 	if err := s.stampPreviewPrState(ctx, created.ID, previewState); err != nil {
 		s.Log.Warn("githubd: stamp preview_pr_state",
 			"err", err, "app_id", created.ID, "state", previewState)
+	}
+
+	// 5c. On a closed PR, post a one-time destroy-hint comment
+	//     on the PR thread (issue #961 Mega-C PR-1, leaf 3).
+	//     previewCommentOnce dedupes via the new
+	//     apps.preview_destroy_commented_at column so close →
+	//     reopen → close cycles do not spam the PR thread with
+	//     duplicate comments. The seam is nil-safe — when
+	//     githubd's main.go doesn't wire a writer (e.g. tests,
+	//     or a deployment where we want to disable the surface
+	//     temporarily), this block short-circuits cleanly.
+	if ev.Action == PullRequestActionClosed && s.WritePreviewDestroyComment != nil {
+		firstTime, _ := s.previewCommentOnce(ctx, created.ID)
+		if firstTime {
+			destroyURL := dashboardDestroyPreviewURL(parentApp.Slug, previewSlugVal)
+			body := fmt.Sprintf(
+				"Preview `%s` is open against `%s`. [Tear it down from the dashboard](%s).",
+				previewSlugVal, parentApp.Slug, destroyURL)
+			if werr := s.WritePreviewDestroyComment(ctx,
+				ev.Repository.FullName, ev.Number, body); werr != nil {
+				s.Log.Warn("githubd: write preview destroy comment", "err", werr,
+					"repo", ev.Repository.FullName, "pr", ev.Number,
+					"preview_slug", previewSlugVal)
+			}
+		}
 	}
 
 	// 6. Write the queued Check Run with the preview URL. The

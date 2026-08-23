@@ -420,6 +420,64 @@ func phaseTitle(p githubdgrpc.CheckPhase) string {
 // unused-token usage doesn't drop it prematurely.
 var _ = time.Time{}
 
+// WritePreviewDestroyComment posts a one-time comment on the PR
+// thread the preview was opened against (issue #961 Mega-C PR-1,
+// leaf 3). The comment carries a Markdown link to the
+// dashboard's one-click destroy action so the PR author (or any
+// maintainer with repo access) can tear down the preview without
+// having to navigate to the dashboard by hand.
+//
+// Dedupe is the caller's responsibility — pass a Store seam and
+// stamp preview_destroy_commented_at BEFORE posting (mirrors the
+// existing previewCheckOnce pattern). Re-posts within a single
+// PR's lifetime are silent no-ops; the only reason to re-post is
+// a PR close+reopen cycle, and that's intentional — the
+// author/maintainer has asked for a fresh state.
+//
+// Same auth shape as WritePreviewCheck (Tokens + Bindings),
+// distinct endpoint: POST /repos/{owner}/{repo}/issues/{n}/comments
+// (the issue-comment surface, not the check-run surface).
+//
+// body is the Markdown body; caller composes it with the
+// dashboard URL prefix.
+func (c *ChecksAPI) WritePreviewDestroyComment(ctx context.Context, repoFullName string, prNumber int, body string) error {
+	if repoFullName == "" || prNumber <= 0 {
+		return fmt.Errorf("githubd: repo and pr_number required for preview destroy comment")
+	}
+	tokens, err := c.tokensForRepo(ctx, repoFullName)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(struct {
+		Body string `json:"body"`
+	}{Body: body})
+	if err != nil {
+		return fmt.Errorf("githubd: marshal preview destroy comment: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/issues/%d/comments", GitHubAPI, repoFullName, prNumber)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tokens)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "faas-githubd/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubd: write preview destroy comment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return fmt.Errorf("githubd: write preview destroy comment: status=%d body=%s",
+			resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 // WriteCheckCoalesced is the rate-limit defensive wrapper around
 // ChecksAPI.WriteCheck (PR-D / ADR-012 §6 closure). GitHub's
 // Checks API caps each install at 1000 calls/hour (100 req/min

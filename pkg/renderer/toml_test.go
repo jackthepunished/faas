@@ -301,6 +301,27 @@ func TestRenderTOML_DBURLFlowsThrough(t *testing.T) {
 	}
 }
 
+func TestRenderTOML_ControlPlaneUsesLocalPostgresSocket(t *testing.T) {
+	const sharedDSN = "postgres://faas@fsn-1.gregale.dev:5432/faas?sslmode=disable"
+	for _, d := range []string{"apid", "schedd", "meterd", "githubd"} {
+		body, flat, err := renderTOML(tomlRenderCtx{
+			Daemon:   d,
+			DC:       fixtureTOML(d),
+			DBURL:    sharedDSN,
+			HostRole: "control-plane",
+		})
+		if err != nil {
+			t.Fatalf("%s: renderTOML: %v", d, err)
+		}
+		if got := flat["db_url"]; got != controlPlanePostgresSocketDSN {
+			t.Errorf("%s flat db_url = %q, want local socket DSN", d, got)
+		}
+		if !strings.Contains(string(body), `db_url = "`+controlPlanePostgresSocketDSN+`"`) {
+			t.Errorf("%s body missing local socket db_url\nbody:\n%s", d, body)
+		}
+	}
+}
+
 func TestRenderTOML_ComputeDoesNotEmbedDatabaseCredential(t *testing.T) {
 	const dsn = "postgres://faas:secret@10.156.0.3:5432/faas?sslmode=disable"
 	for _, d := range []string{"vmmd", "imaged", "builderd"} {

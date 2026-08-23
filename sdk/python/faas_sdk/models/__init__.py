@@ -46,6 +46,7 @@ from .app_metrics_response_range import AppMetricsResponseRange
 from .app_registry_credential_list_response import AppRegistryCredentialListResponse
 from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
+from .app_response_app_protocol import AppResponseAppProtocol
 from .app_response_eviction_priority import AppResponseEvictionPriority
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
@@ -118,6 +119,7 @@ from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFail
 from .create_alert_rule_request_metric import CreateAlertRuleRequestMetric
 from .create_alert_rule_request_window_spec import CreateAlertRuleRequestWindowSpec
 from .create_app_request import CreateAppRequest
+from .create_app_request_app_protocol import CreateAppRequestAppProtocol
 from .create_app_request_eviction_priority import CreateAppRequestEvictionPriority
 from .create_app_request_runtime import CreateAppRequestRuntime
 from .create_app_request_type import CreateAppRequestType
@@ -134,6 +136,9 @@ from .create_deployment_overrides import CreateDeploymentOverrides
 from .create_deployment_overrides_env import CreateDeploymentOverridesEnv
 from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
 from .create_deployment_request import CreateDeploymentRequest
+from .create_deployment_request_tag_type_1 import CreateDeploymentRequestTagType1
+from .create_deployment_request_tag_type_2_type_1 import CreateDeploymentRequestTagType2Type1
+from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequestTagType3Type1
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_key_request import CreateKeyRequest
@@ -177,11 +182,20 @@ from .deployment_response import DeploymentResponse
 from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
+from .deployment_response_last_auto_rollback_reason_type_1 import DeploymentResponseLastAutoRollbackReasonType1
+from .deployment_response_last_auto_rollback_reason_type_2_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType2Type1,
+)
+from .deployment_response_last_auto_rollback_reason_type_3_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType3Type1,
+)
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
+from .diff_app_config_patch_app_protocol import DiffAppConfigPatchAppProtocol
 from .diff_app_config_patch_eviction_priority import DiffAppConfigPatchEvictionPriority
 from .diff_break import DiffBreak
 from .diff_break_severity import DiffBreakSeverity
@@ -248,6 +262,7 @@ from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
 from .get_builds_status import GetBuildsStatus
+from .get_deployment_open_api_doc_response_200 import GetDeploymentOpenAPIDocResponse200
 from .get_deployment_stages_response_200 import GetDeploymentStagesResponse200
 from .get_deployment_stages_response_200_current import GetDeploymentStagesResponse200Current
 from .get_deployment_stages_response_200_history_item import GetDeploymentStagesResponse200HistoryItem
@@ -337,11 +352,14 @@ from .password_signup_request import PasswordSignupRequest
 from .patch_org_request import PatchOrgRequest
 from .patch_org_request_plan import PatchOrgRequestPlan
 from .payment_method_summary import PaymentMethodSummary
+from .plan_affected_app import PlanAffectedApp
+from .plan_affected_app_action import PlanAffectedAppAction
 from .plan_cron import PlanCron
 from .plan_managed import PlanManaged
 from .plan_response import PlanResponse
 from .plan_response_scan_source import PlanResponseScanSource
 from .plan_workload import PlanWorkload
+from .plan_workload_action import PlanWorkloadAction
 from .plan_workload_class import PlanWorkloadClass
 from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
@@ -379,6 +397,8 @@ from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
+from .retry_deployment_request import RetryDeploymentRequest
+from .retry_deployment_request_from_stage import RetryDeploymentRequestFromStage
 from .rollback_request import RollbackRequest
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_app_secret_request import RotateAppSecretRequest
@@ -416,7 +436,13 @@ from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
 from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
+from .source_ref_deploy_request_tag_type_1 import SourceRefDeployRequestTagType1
+from .source_ref_deploy_request_tag_type_2_type_1 import SourceRefDeployRequestTagType2Type1
+from .source_ref_deploy_request_tag_type_3_type_1 import SourceRefDeployRequestTagType3Type1
 from .source_tarball_deploy_request import SourceTarballDeployRequest
+from .source_tarball_deploy_request_tag_type_1 import SourceTarballDeployRequestTagType1
+from .source_tarball_deploy_request_tag_type_2_type_1 import SourceTarballDeployRequestTagType2Type1
+from .source_tarball_deploy_request_tag_type_3_type_1 import SourceTarballDeployRequestTagType3Type1
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
@@ -458,6 +484,7 @@ from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparis
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
 from .update_app_request import UpdateAppRequest
+from .update_app_request_app_protocol import UpdateAppRequestAppProtocol
 from .update_app_request_eviction_priority_type_1 import UpdateAppRequestEvictionPriorityType1
 from .update_app_request_eviction_priority_type_2_type_1 import UpdateAppRequestEvictionPriorityType2Type1
 from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequestEvictionPriorityType3Type1
@@ -466,6 +493,10 @@ from .update_app_webhook_request_event_filter_item import UpdateAppWebhookReques
 from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetryPolicy
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
+from .update_deployment_open_api_doc_body import UpdateDeploymentOpenAPIDocBody
+from .update_deployment_open_api_doc_response_200 import UpdateDeploymentOpenAPIDocResponse200
+from .update_deployment_open_api_doc_response_200_doc import UpdateDeploymentOpenAPIDocResponse200Doc
+from .update_deployment_open_api_doc_response_200_source import UpdateDeploymentOpenAPIDocResponse200Source
 from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
@@ -537,6 +568,7 @@ __all__ = (
     "AppRegistryCredentialListResponse",
     "AppRegistryCredentialResponse",
     "AppResponse",
+    "AppResponseAppProtocol",
     "AppResponseEvictionPriority",
     "AppResponseRuntime",
     "AppResponseType",
@@ -606,6 +638,7 @@ __all__ = (
     "CreateAlertRuleRequestMetric",
     "CreateAlertRuleRequestWindowSpec",
     "CreateAppRequest",
+    "CreateAppRequestAppProtocol",
     "CreateAppRequestEvictionPriority",
     "CreateAppRequestRuntime",
     "CreateAppRequestType",
@@ -622,6 +655,9 @@ __all__ = (
     "CreateDeploymentOverridesEnv",
     "CreateDeploymentOverridesEnvSecrets",
     "CreateDeploymentRequest",
+    "CreateDeploymentRequestTagType1",
+    "CreateDeploymentRequestTagType2Type1",
+    "CreateDeploymentRequestTagType3Type1",
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
     "CreateKeyRequest",
@@ -661,11 +697,16 @@ __all__ = (
     "DeploymentResponseDeployedViaType1",
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
+    "DeploymentResponseLastAutoRollbackReasonType1",
+    "DeploymentResponseLastAutoRollbackReasonType2Type1",
+    "DeploymentResponseLastAutoRollbackReasonType3Type1",
     "DeploymentResponseOverrideEnvSecretRefs",
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DeploymentResponseTag",
     "DiffAppConfigPatch",
+    "DiffAppConfigPatchAppProtocol",
     "DiffAppConfigPatchEvictionPriority",
     "DiffBreak",
     "DiffBreakSeverity",
@@ -732,6 +773,7 @@ __all__ = (
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
     "GetBuildsStatus",
+    "GetDeploymentOpenAPIDocResponse200",
     "GetDeploymentStagesResponse200",
     "GetDeploymentStagesResponse200Current",
     "GetDeploymentStagesResponse200HistoryItem",
@@ -821,11 +863,14 @@ __all__ = (
     "PatchOrgRequest",
     "PatchOrgRequestPlan",
     "PaymentMethodSummary",
+    "PlanAffectedApp",
+    "PlanAffectedAppAction",
     "PlanCron",
     "PlanManaged",
     "PlanResponse",
     "PlanResponseScanSource",
     "PlanWorkload",
+    "PlanWorkloadAction",
     "PlanWorkloadClass",
     "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
@@ -863,6 +908,8 @@ __all__ = (
     "RekeyProgress",
     "RenameAppRequest",
     "RepoResponse",
+    "RetryDeploymentRequest",
+    "RetryDeploymentRequestFromStage",
     "RollbackRequest",
     "RotateAlertRuleSecretResponse",
     "RotateAppSecretRequest",
@@ -898,7 +945,13 @@ __all__ = (
     "SLODuration",
     "SourceRefDeployRequest",
     "SourceRefDeployRequestFormat",
+    "SourceRefDeployRequestTagType1",
+    "SourceRefDeployRequestTagType2Type1",
+    "SourceRefDeployRequestTagType3Type1",
     "SourceTarballDeployRequest",
+    "SourceTarballDeployRequestTagType1",
+    "SourceTarballDeployRequestTagType2Type1",
+    "SourceTarballDeployRequestTagType3Type1",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",
@@ -940,6 +993,7 @@ __all__ = (
     "UpdateAlertRuleRequestMetric",
     "UpdateAlertRuleRequestWindowSpec",
     "UpdateAppRequest",
+    "UpdateAppRequestAppProtocol",
     "UpdateAppRequestEvictionPriorityType1",
     "UpdateAppRequestEvictionPriorityType2Type1",
     "UpdateAppRequestEvictionPriorityType3Type1",
@@ -948,6 +1002,10 @@ __all__ = (
     "UpdateAppWebhookRequestRetryPolicy",
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
+    "UpdateDeploymentOpenAPIDocBody",
+    "UpdateDeploymentOpenAPIDocResponse200",
+    "UpdateDeploymentOpenAPIDocResponse200Doc",
+    "UpdateDeploymentOpenAPIDocResponse200Source",
     "UpdateDeploymentRequest",
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",

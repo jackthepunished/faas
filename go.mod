@@ -18,14 +18,18 @@ require (
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/libdns/libdns v1.1.1
+	github.com/nats-io/nats.go v1.53.1
 	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/pquerna/otp v1.5.0
 	github.com/pressly/goose/v3 v3.27.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
+	github.com/segmentio/kafka-go v0.4.51
 	github.com/stripe/stripe-go v70.15.0+incompatible
+	github.com/testcontainers/testcontainers-go/modules/kafka v0.44.0
 	github.com/zalando/go-keyring v0.2.8
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.69.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0
@@ -198,7 +202,6 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
-	github.com/mdelapenya/tlscert v0.2.0 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/mgechev/revive v1.11.0 // indirect
 	github.com/mholt/acmez/v3 v3.1.6 // indirect
@@ -218,7 +221,6 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nakabonne/nestif v0.3.1 // indirect
-	github.com/nats-io/nats.go v1.53.1 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/nishanths/exhaustive v0.12.0 // indirect
@@ -240,7 +242,6 @@ require (
 	github.com/quasilyte/regex/syntax v0.0.0-20210819130434-b3f0c404a727 // indirect
 	github.com/quasilyte/stdinfo v0.0.0-20220114132959-f7386bf02567 // indirect
 	github.com/raeperd/recvcheck v0.2.0 // indirect
-	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/ryancurrah/gomodguard v1.4.1 // indirect
@@ -249,7 +250,6 @@ require (
 	github.com/sashamelentyev/interfacebloat v1.1.0 // indirect
 	github.com/sashamelentyev/usestdlibvars v1.29.0 // indirect
 	github.com/securego/gosec/v2 v2.22.7 // indirect
-	github.com/segmentio/kafka-go v0.4.51 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
@@ -269,9 +269,6 @@ require (
 	github.com/subosito/gotenv v1.4.1 // indirect
 	github.com/tdakkota/asciicheck v0.4.1 // indirect
 	github.com/testcontainers/testcontainers-go v0.44.0 // indirect
-	github.com/testcontainers/testcontainers-go/modules/kafka v0.44.0 // indirect
-	github.com/testcontainers/testcontainers-go/modules/nats v0.44.0 // indirect
-	github.com/testcontainers/testcontainers-go/modules/redis v0.44.0 // indirect
 	github.com/tetafro/godot v1.5.1 // indirect
 	github.com/timakin/bodyclose v0.0.0-20241222091800-1db5c5ca4d67 // indirect
 	github.com/timonwong/loggercheck v0.11.0 // indirect

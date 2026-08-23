@@ -1356,6 +1356,16 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// behaviour bit-for-bit (the empty-string fallback
 				// in the sort comparator handles pre-PR rows).
 				EvictionPriority: a.EvictionPriority,
+				// Issue #72 / ADR-125: instance mode is the
+				// reaper-exempt predicate for mirror VMs. The
+				// reaper's ReapIdle consults Mode and skips
+				// mode='mirror' rows; the sampler mirrors the
+				// same skip on the biller side. Sourced from
+				// state.Instance.Mode; pre-feature rows carry
+				// 'normal' so this is a no-op for every existing
+				// customer until a mirror goroutine wakes a
+				// mode='mirror' VM via Engine.AdmitInstance.
+				Mode: ins.Mode,
 			})
 		}
 	}
@@ -2394,7 +2404,14 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 	// same parked app) coalesces into one virtual boot. The detached
 	// leader ctx means a cancelled triggering cron doesn't kill the
 	// boot the next follow-on caller still needs.
-	if _, err := l.engine.EnsureWake(ctx, c.AppID); err != nil {
+	// ADR-123: translate the internal CronDispatchTrigger enum to
+	// the external wake-boot trigger enum. Schedule is "60s tick",
+	// Manual is "POST /v1/crons/{id}/run (ADR-090)".
+	wakeBootTrigger := TriggerCronSched
+	if trigger == TriggerManual {
+		wakeBootTrigger = TriggerCronManual
+	}
+	if _, err := l.engine.EnsureWake(ctx, c.AppID, wakeBootTrigger); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

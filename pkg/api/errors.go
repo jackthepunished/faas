@@ -374,8 +374,30 @@ const (
 	CodeBuildUndetected      = "build_undetected"
 	CodeBuildOOM             = "build_oom"
 	CodeBuildTimeout         = "build_timeout"
-	CodeQuotaExhausted       = "quota_exhausted"
-	CodeBillingPastDue       = "billing_past_due"
+	// CodeStage* (ADR-117 §Production-ready follow-on): per-stage
+	// RFC 7807 stable codes for the closed-6 deploy stage vocabulary.
+	// Distinct from CodeBuildXXX (which mark the whole build VM's
+	// fate) — CodeStageXXX marks which stage tripped. The same code
+	// may surface as the deployment row's error_code (cluster-A
+	// path) AND on the stage row's failure reason (the renderer
+	// path). The renderer (pkg/dashboard/stages.FormatStageDuration
+	// + StageFailureHTML) consults pkg/whycopy for the customer-
+	// facing prose; these constants are the catalog keys.
+	//
+	// Codes are emitted by pkg/imaged.transitionWithStage /
+	// markDeployFailed when they can identify a single stage cause.
+	// A failure that does not map to one of these codes still flows
+	// through the renderer — it just renders the bare "failed:
+	// <reason>" string without the structured Hint/Why/Fix block.
+	CodeStageSourceDownloadFailed    = "stage_source_download_failed"
+	CodeStageDependencyRestoreFailed = "stage_dependency_restore_failed"
+	CodeStageImageBuildOOM           = "stage_image_build_oom"
+	CodeStageImageBuildTimeout       = "stage_image_build_timeout"
+	CodeStageSecurityScanFindings    = "stage_security_scan_findings"
+	CodeStageSnapshotPrepareTimeout  = "stage_snapshot_prepare_timeout"
+	CodeStageReadinessFailed         = "stage_readiness_failed"
+	CodeQuotaExhausted               = "quota_exhausted"
+	CodeBillingPastDue               = "billing_past_due"
 	// CodeBillingNotImplemented is returned when the selected
 	// billing provider (FAAS_BILLING_PROVIDER) does not implement the
 	// requested method (issue #279: Paddle's Refund). Distinct from
@@ -933,6 +955,25 @@ const (
 	// (kind constants live next to the call sites) — the plan
 	// gate and the request gate are distinct failure modes.
 	CodePlanRequireAuthnNotAllowed = "plan_require_authn_not_allowed"
+
+	// ADR-124 §Plan gating — per-app app_protocol=grpc gate.
+	// Free apps cannot opt-in to gRPC framing at the customer
+	// edge; Hobby+/Pro/Scale may freely PATCH app_protocol=grpc.
+	// 403 mirrors the streaming / warm-snapshot / require-authn /
+	// public-auth / traffic-split gate family — a deliberate
+	// plan-tier choice that requires customer action (upgrade),
+	// not a retry. The literal carries observed value (always
+	// "grpc") + docs URL (/docs/app-protocol#plan-gating).
+	CodePlanAppProtocolGrpcNotAllowed = "plan_app_protocol_grpc_not_allowed"
+
+	// ADR-124 §Decision 1 — closed-set validator. Any value
+	// outside {http1, http2, grpc} surfaces as 400 with this
+	// code. Carry observed value + docs URL
+	// (/docs/app-protocol#closed-set) so the CLI can render
+	// "the value 'h2c' is not in the closed set http1|http2|grpc"
+	// alongside the existing 400 copy without conflating in
+	// telemetry.
+	CodeAppProtocolInvalid = "app_protocol_invalid"
 
 	// Issue #477 / ADR-079 — public-URL auth mode gate. Free apps
 	// stay on the no-signup-friction path (open-only); Hobby unlocks
@@ -2137,6 +2178,78 @@ const CodePlanConsumerKeyQuotaReached = "plan_consumer_key_quota_reached"
 // Why stable: mirrors CodePlanAlertRulesNotAllowed shape so SDK
 // authors can write a single switch on plan-gated codes.
 const CodeConsumerKeysNotAllowed = "consumer_keys_not_allowed"
+
+// CodePlanOpenAPIDocQuotaReached is the RFC 7807 stable code
+// returned when the per-deployment or per-account deployment_openapi_docs
+// quota is exhausted (ADR-122 / issue #975 item #1). The apid PATCH
+// handler returns 403 with this code on attempts that exceed
+// Plan.OpenAPIDocsPerDeployment or Plan.OpenAPIDocsPerAccount.
+// Why stable: the apid SDK surfaces map this code to a typed
+// error class so customers can write a single handler for the
+// quota-exhausted case without parsing the prose body — same
+// shape as CodePlanConsumerKeyQuotaReached.
+const CodePlanOpenAPIDocQuotaReached = "plan_openapi_doc_quota_reached"
+
+// CodePlanOpenAPIDocTooLarge is the RFC 7807 stable code returned
+// when the customer-uploaded OpenAPI body exceeds the per-plan
+// byte cap (ADR-122 §D4). The apid PATCH handler returns 413 with
+// this code on attempts that exceed Plan.OpenAPIDocMaxBytes.
+// Why stable: the apid SDK surfaces map this code to a typed
+// error class so customers can pre-validate the doc size before
+// attempting the upload — same shape as CodePlanConsumerKeyQuotaReached.
+const CodePlanOpenAPIDocTooLarge = "plan_openapi_doc_too_large"
+
+// CodePlanOpenAPIDocsNotAllowed is the RFC 7807 stable code
+// returned when the customer's plan is gated off the endpoint
+// discovery feature entirely (Free tier; mirrors
+// CodeConsumerKeysNotAllowed). The apid GET / PATCH handlers
+// return 402 plan_not_allowed with this code on attempts.
+// Why stable: mirrors CodeConsumerKeysNotAllowed shape so SDK
+// authors can write a single switch on plan-gated codes.
+const CodePlanOpenAPIDocsNotAllowed = "openapi_docs_not_allowed"
+
+// ErrPlanOpenAPIDocsNotAllowed (ADR-122 / issue #975 item #1) is
+// returned by the apid endpoint-discovery handlers when the
+// customer's plan has OpenAPIDocsPerDeployment == 0 (Free today).
+// Fires BEFORE loadApp so a Free customer posting to a non-existent
+// slug gets a clean 402 instead of a 404 that would leak the slug's
+// existence. Mirrors ErrPlanAlertRulesNotAllowed.
+func ErrPlanOpenAPIDocsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanOpenAPIDocsNotAllowed,
+		"Endpoint discovery unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include endpoint discovery; upgrade to Hobby or above to capture OpenAPI documents.", p)).
+		WithLimit(0, 0).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
+
+// ErrPlanOpenAPIDocQuota (ADR-122 / issue #975 item #1) is returned
+// when the per-account OpenAPI doc quota is reached. 403 because
+// the plan DOES unlock discovery — the right copy is "delete a
+// doc to add another", not "upgrade to Hobby". Mirrors
+// ErrPlanAlertRuleQuota.
+func ErrPlanOpenAPIDocQuota(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanOpenAPIDocQuotaReached,
+		"OpenAPI document limit reached",
+		fmt.Sprintf("%s plan caps OpenAPI documents at %d per account; you have %d. Delete one to add another.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
+
+// ErrPlanOpenAPIDocTooLarge (ADR-122 / issue #975 item #1) is
+// returned when the customer-uploaded OpenAPI body exceeds the
+// per-plan byte cap. 413 (not 422) because the body is a
+// well-formed JSON document that just happens to be too large —
+// the same posture as a request-payload Too Large. Mirrors
+// ErrPlanConsumerKeyQuotaReached.
+func ErrPlanOpenAPIDocTooLarge(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusRequestEntityTooLarge, CodePlanOpenAPIDocTooLarge,
+		"OpenAPI document exceeds the per-plan byte cap",
+		fmt.Sprintf("%s plan caps OpenAPI documents at %d bytes; yours is %d. Trim paths or split the spec.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#endpoint-discovery")
+}
 
 // PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
 // *Quota functions receive in their `scope` argument. Mirrors

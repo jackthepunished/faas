@@ -395,3 +395,51 @@ func TestClientSweep2_BearerHeaderSet(t *testing.T) {
 		t.Errorf("Authorization = %q, want token fp_test_secret", gotAuth)
 	}
 }
+
+// TestClient_DestroyPreview pins the new SDK method
+// (issue #961 Mega-C PR-1, leaf 3). The fake server records the
+// (method, path) tuple; we assert the SDK hits the preview
+// destroy route — POST /v1/preview/{slug}/destroy — and returns
+// nil on 204 No Content. The path carries the slug verbatim
+// so the customer can grep their dashboard URL → SDK call.
+func TestClient_DestroyPreview(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, "fp_test_secret")
+	if err := c.DestroyPreview(context.Background(), "pr-42-acme"); err != nil {
+		t.Fatalf("DestroyPreview: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v1/preview/pr-42-acme/destroy" {
+		t.Errorf("path = %q, want /v1/preview/pr-42-acme/destroy", gotPath)
+	}
+}
+
+// TestClient_DestroyPreview_ProductionAppReturns404 confirms
+// the SDK surfaces the apid's 404 preview_not_found error
+// rather than silently succeeding — the customer must see
+// "this slug is not a preview app" rather than a misleading
+// "Destroyed" message.
+func TestClient_DestroyPreview_ProductionAppReturns404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"code":"preview_not_found","title":"Preview not found","detail":"the slug does not identify a preview app; use DELETE /v1/apps/{slug} to destroy a production app","status":404}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, "fp_test_secret")
+	err := c.DestroyPreview(context.Background(), "prod-app")
+	if err == nil {
+		t.Fatal("DestroyPreview on production slug: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "preview_not_found") {
+		t.Errorf("err = %v, want it to carry the preview_not_found problem code", err)
+	}
+}

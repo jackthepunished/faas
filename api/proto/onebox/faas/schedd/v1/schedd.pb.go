@@ -348,7 +348,16 @@ type WakeRequest struct {
 	// wake lands on the preview's own deployment row, not the
 	// parent app's. Additive per ADR-016 — pre-PR-B callers omit
 	// the field and observe the same wire behaviour as before.
-	Scope         string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	Scope string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	// trigger (ADR-127) is the wake-boot trigger enum value stamped
+	// on the emitted wake.boot_started / wake.boot_completed events
+	// (pkg/sched/triggers.go). gateway wires "gateway", cron handler
+	// wires "cron.schedule" or "cron.manual", the schedd-internal
+	// floor/scaleup/targets triggers wire their own constants.
+	// Empty = legacy Phase-1 fast path on an already-RUNNING instance
+	// (no new BootStarted row is emitted — the existing row's
+	// events.data.trigger is untouched). Additive per ADR-016.
+	Trigger       string `protobuf:"bytes,4,opt,name=trigger,proto3" json:"trigger,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -400,6 +409,13 @@ func (x *WakeRequest) GetDeploymentId() string {
 func (x *WakeRequest) GetScope() string {
 	if x != nil {
 		return x.Scope
+	}
+	return ""
+}
+
+func (x *WakeRequest) GetTrigger() string {
+	if x != nil {
+		return x.Trigger
 	}
 	return ""
 }
@@ -556,7 +572,10 @@ type AdmitInstanceRequest struct {
 	// (`pr-{N}`) the gateway derived from the inbound Host
 	// header. Empty = prod (legacy single-deployment behaviour).
 	// See WakeRequest.scope for the full semantics.
-	Scope         string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	Scope string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	// trigger (ADR-127) mirrors WakeRequest.trigger. See that field
+	// for the closed-enum contract. Additive per ADR-016.
+	Trigger       string `protobuf:"bytes,4,opt,name=trigger,proto3" json:"trigger,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -608,6 +627,13 @@ func (x *AdmitInstanceRequest) GetDeploymentId() string {
 func (x *AdmitInstanceRequest) GetScope() string {
 	if x != nil {
 		return x.Scope
+	}
+	return ""
+}
+
+func (x *AdmitInstanceRequest) GetTrigger() string {
+	if x != nil {
+		return x.Trigger
 	}
 	return ""
 }
@@ -1844,8 +1870,13 @@ func (*ReportCapacityAck) Descriptor() ([]byte, []int) {
 //
 // Additive per ADR-016.
 type EnsureWakeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AppId         string                 `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	AppId string                 `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	// trigger (ADR-127) is forwarded to the leader's Engine.Wake
+	// call and stamped on the emitted wake.boot_started /
+	// wake.boot_completed events. See WakeRequest.trigger for the
+	// closed-enum contract. Additive per ADR-016.
+	Trigger       string `protobuf:"bytes,2,opt,name=trigger,proto3" json:"trigger,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1883,6 +1914,13 @@ func (*EnsureWakeRequest) Descriptor() ([]byte, []int) {
 func (x *EnsureWakeRequest) GetAppId() string {
 	if x != nil {
 		return x.AppId
+	}
+	return ""
+}
+
+func (x *EnsureWakeRequest) GetTrigger() string {
+	if x != nil {
+		return x.Trigger
 	}
 	return ""
 }
@@ -2025,11 +2063,12 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\apeak_mb\x18\x02 \x01(\rR\x06peakMb\x12\x17\n" +
 	"\aplan_mb\x18\x03 \x01(\rR\x06planMb\"&\n" +
 	"\x14ReportWorkloadOOMAck\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"_\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"y\n" +
 	"\vWakeRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
 	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x14\n" +
-	"\x05scope\x18\x03 \x01(\tR\x05scope\"\x88\x02\n" +
+	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x18\n" +
+	"\atrigger\x18\x04 \x01(\tR\atrigger\"\x88\x02\n" +
 	"\fWakeResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -2038,11 +2077,12 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\aproblem\x18\x04 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x17\n" +
 	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
 	"\x04port\x18\x06 \x01(\x05R\x04port\x12#\n" +
-	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"h\n" +
+	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"\x82\x01\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
 	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x14\n" +
-	"\x05scope\x18\x03 \x01(\tR\x05scope\"\xd7\x02\n" +
+	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x18\n" +
+	"\atrigger\x18\x04 \x01(\tR\atrigger\"\xd7\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -2120,9 +2160,10 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\tvcpu_busy\x18\a \x01(\x05R\bvcpuBusy\x12%\n" +
 	"\x0enode_signature\x18\b \x01(\fR\rnodeSignature\x12\x1e\n" +
 	"\vnode_key_id\x18\t \x01(\tR\tnodeKeyId\"\x13\n" +
-	"\x11ReportCapacityAck\"*\n" +
+	"\x11ReportCapacityAck\"D\n" +
 	"\x11EnsureWakeRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\x8e\x02\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x18\n" +
+	"\atrigger\x18\x02 \x01(\tR\atrigger\"\x8e\x02\n" +
 	"\x12EnsureWakeResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +

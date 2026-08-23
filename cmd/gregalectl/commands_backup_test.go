@@ -30,6 +30,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,5 +318,85 @@ func TestUnsealArchiveCreds_BadJSONShape(t *testing.T) {
 	}
 	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
 		t.Fatalf("output file should not exist on bad-JSON failure: stat err = %v", statErr)
+	}
+}
+
+// TestBackupInit_CreatesLayout pins the layout `gregalectl backup
+// init` lands: the directory at 0700 and the two doctor-detected
+// stub files at 0440 root:root (rclone.conf) + 0400 root:root
+// (archive-creds.json). Runs the package-private worker so the
+// flag-parse boilerplate doesn't pollute the assertion; mirrors
+// TestUnsealRclone_HappyPath's seam strategy.
+func TestBackupInit_CreatesLayout(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "storage-box")
+	f := &backupInitFlags{
+		dir:   dir,
+		force: false,
+	}
+	if err := backupInit(f, io.Discard); err != nil {
+		t.Fatalf("backupInit: %v", err)
+	}
+
+	// Stub 1: rclone.conf placeholder (0440)
+	rclonePath := filepath.Join(dir, "rclone.conf")
+	st, err := os.Stat(rclonePath)
+	if err != nil {
+		t.Fatalf("stat rclone.conf: %v", err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o440 {
+		t.Fatalf("rclone.conf mode: got %#o want 0440", mode)
+	}
+	got, err := os.ReadFile(rclonePath)
+	if err != nil {
+		t.Fatalf("read rclone.conf: %v", err)
+	}
+	if !strings.Contains(string(got), "backup init stub") {
+		t.Fatalf("rclone.conf stub body should self-identify for doctor detection; got %q", string(got))
+	}
+
+	// Stub 2: archive-creds.json envelope (0400, `{}`)
+	archivePath := filepath.Join(dir, "archive-creds.json")
+	st, err = os.Stat(archivePath)
+	if err != nil {
+		t.Fatalf("stat archive-creds.json: %v", err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o400 {
+		t.Fatalf("archive-creds.json mode: got %#o want 0400", mode)
+	}
+	got, err = os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read archive-creds.json: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "{}" {
+		t.Fatalf("archive-creds.json stub: got %q want `{}`", strings.TrimSpace(string(got)))
+	}
+}
+
+// TestBackupInit_RefuseOverwrite pins the refuse-by-default contract
+// for `backup init`. Re-running init silently overwrites a
+// populated storage-box would strand every sealed envelope the
+// operator has previously scp'd in (the box-age-key on disk is the
+// identity the unseal path uses; nuking the stub doesn't change
+// that, but silently nuking the dir while an unseal is in flight
+// races against a tmpfile rename). --force is the escape hatch.
+func TestBackupInit_RefuseOverwrite(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "storage-box")
+	f := &backupInitFlags{dir: dir, force: false}
+	if err := backupInit(f, io.Discard); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	err := backupInit(f, io.Discard)
+	if err == nil {
+		t.Fatal("second init without --force should refuse, got nil error")
+	}
+	if !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("refusal error: got %q, want substring 'refusing to overwrite'", err.Error())
+	}
+
+	// --force path lands the layout a second time.
+	f.force = true
+	if err := backupInit(f, io.Discard); err != nil {
+		t.Fatalf("forced re-init: %v", err)
 	}
 }

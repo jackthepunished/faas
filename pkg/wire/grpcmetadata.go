@@ -21,6 +21,7 @@ package wire
 
 import (
 	"context"
+	"strconv"
 
 	"google.golang.org/grpc/metadata"
 )
@@ -47,6 +48,15 @@ const (
 	mdKeyInvocationID = "x-faas-invocation-id"
 	mdKeyTraceID      = "x-faas-trace-id"
 	mdKeySpanID       = "x-faas-span-id"
+	// ADR-123 — wake-boot telemetry fields (closed trigger enum +
+	// ledger.Concurrency snapshot). Threaded from schedd to vmmd via
+	// the gRPC metadata envelope so the vmmd-side BootStarted mirror
+	// (pkg/vmmdgrpc/server.go:emitBootStartedMirror) carries the same
+	// context as the canonical schedd emit. Empty values are skipped
+	// — a producer that doesn't know ADR-123 sends no keys at all.
+	mdKeyWakeBootTrigger = "x-faas-wake-boot-trigger"
+	mdKeyWakeBootQueued  = "x-faas-wake-boot-queued"
+	mdKeyWakeBootConc    = "x-faas-wake-boot-conc"
 )
 
 // WithCorrelationOutgoing attaches fields to ctx as gRPC outgoing
@@ -91,6 +101,19 @@ func WithCorrelationOutgoing(ctx context.Context, fields CorrelationFields) cont
 	}
 	if fields.SpanID != "" {
 		pairs = append(pairs, mdKeySpanID, fields.SpanID)
+	}
+	// ADR-123 — wake-boot telemetry. The int fields are emitted only
+	// when non-zero (and even then only when paired with a Trigger)
+	// so the wire stays tight on legacy callers that don't know
+	// about the ADR-123 wake-boot envelope.
+	if fields.Trigger != "" {
+		pairs = append(pairs, mdKeyWakeBootTrigger, fields.Trigger)
+		if fields.QueuedCount > 0 {
+			pairs = append(pairs, mdKeyWakeBootQueued, strconv.Itoa(fields.QueuedCount))
+		}
+		if fields.ConcurrencyAtAdmit > 0 {
+			pairs = append(pairs, mdKeyWakeBootConc, strconv.Itoa(fields.ConcurrencyAtAdmit))
+		}
 	}
 	if len(pairs) == 0 {
 		return ctx
@@ -162,6 +185,26 @@ func CorrelationFromIncoming(ctx context.Context) (CorrelationFields, bool) {
 	if v := md.Get(mdKeySpanID); len(v) > 0 && v[0] != "" {
 		out.SpanID = v[0]
 		any = true
+	}
+	// ADR-123 — wake-boot envelope (see WithCorrelationOutgoing above).
+	// Parsed with strconv.Atoi so a malformed wire value (e.g. a proxy
+	// that duplicated or truncated a header) does NOT panic the vmmd
+	// RPC handler — the resulting zero-valued field is silently
+	// dropped at the BootStarted emit by the `if e.Trigger != ""`
+	// guard in pkg/events/wake.go:Payload.
+	if v := md.Get(mdKeyWakeBootTrigger); len(v) > 0 && v[0] != "" {
+		out.Trigger = v[0]
+		any = true
+		if v := md.Get(mdKeyWakeBootQueued); len(v) > 0 && v[0] != "" {
+			if n, err := strconv.Atoi(v[0]); err == nil {
+				out.QueuedCount = n
+			}
+		}
+		if v := md.Get(mdKeyWakeBootConc); len(v) > 0 && v[0] != "" {
+			if n, err := strconv.Atoi(v[0]); err == nil {
+				out.ConcurrencyAtAdmit = n
+			}
+		}
 	}
 	return out, any
 }

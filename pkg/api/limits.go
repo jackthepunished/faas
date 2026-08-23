@@ -631,6 +631,35 @@ type Limits struct {
 	// Same per-app floor + 25× scale ceiling.
 	ConsumerKeysPerAccount int
 
+	// OpenAPIDocsPerDeployment caps how many captured OpenAPI
+	// docs (ADR-122 / issue #975 item #1) one deployment may own.
+	// The schema is 1 row per deployment (PRIMARY KEY on
+	// deployment_id), so the per-deployment cap is effectively 1
+	// — the field exists for forward-compatibility (issue #975
+	// item #2 may want multiple doc formats per deployment).
+	// Per-plan: Free 0, Hobby 1, Pro 1, Scale 1. Free is 0 — the
+	// apid PATCH handler returns 402 CodePlanOpenAPIDocsNotAllowed
+	// before the store is touched; the microVM still captures the
+	// doc during cold boot but never serves it via apid.
+	OpenAPIDocsPerDeployment int
+	// OpenAPIDocMaxBytes caps the body size of one captured /
+	// uploaded OpenAPI doc. Per-plan: Free 0 (irrelevant), Hobby
+	// 131072, Pro 131072, Scale 131072. The cap layers on top of
+	// the global constant state.OpenAPIDocMaxBytes (128 KiB) — the
+	// guest-init probe hard-truncates at the global cap; the apid
+	// PATCH handler validates against the per-plan cap and
+	// returns 413 CodePlanOpenAPIDocTooLarge on overflow.
+	OpenAPIDocMaxBytes int
+	// OpenAPIDocsPerAccount caps how many captured OpenAPI docs
+	// one account may own across all its deployments. Per-plan:
+	// Free 0, Hobby 100, Pro 1000, Scale 10000. The cap is the
+	// per-account quota that the apid PATCH handler enforces
+	// via Store.CountOpenAPIDocsByAccount (the apid tail-call
+	// arrives when the count == cap, before the INSERT). Scale
+	// gives 10× Pro to mirror the consumer_keys 25× scale ceiling
+	// scaled down by 2.5× (OpenAPI docs are larger + rarer).
+	OpenAPIDocsPerAccount int
+
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
 	// defends against a SaaS customer pinning one surface per
@@ -870,10 +899,49 @@ type Limits struct {
 	// gate only fires when a Free/Hobby customer tries to
 	// opt-in to a non-100 traffic_percent (which is denied).
 	TrafficSplit bool
+
+	// MirrorRuleAllowed (issue #72 / ADR-125) is the plan gate
+	// for the per-deployment traffic-mirroring opt-in. Pro/Scale
+	// = true; Free/Hobby = false. Same Hobby-locked rationale
+	// as TrafficSplit: a mirror VM wakes for every customer
+	// request, billed per running second. Hobby is the
+	// near-Free-with-a-floor tier where every additional wake
+	// is cost-shaped against the cheap monthly bill; mirror's
+	// 1:1 wake ratio is too expensive to unlock there. Apid's
+	// createMirrorRule + PATCH-mirror handlers reject
+	// Free/Hobby with 403 plan_mirror_not_allowed. Distinct
+	// from TrafficSplit: even if the customer could unlock
+	// traffic split on Hobby, mirror stays locked — the wake
+	// cost shape is stricter than split's (1 wake per request
+	// for mirror vs N-wakes-per-second-burst for split).
+	MirrorRuleAllowed bool
+	// MirrorTargetsPerApp (issue #72 / ADR-125) is the per-app
+	// mirror-rule cap, enforced inside
+	// CreateMirrorRuleIfUnderQuota's FOR UPDATE lock on apps
+	// (mirrors CreateEdgeRuleIfUnderQuota's per-kind count
+	// precedent). Free = 0 (gated off, see MirrorRuleAllowed);
+	// Hobby = 0 (same gate); Pro = 1 (single canary target);
+	// Scale = 3 (multi-shard rollout). The cap is per-app, not
+	// per-account: a Scale customer running 10 apps can hold up
+	// to 30 mirror rules total. QuotaErrorKindMirror carries
+	// the Limit + Observed so the apid handler stamps both on
+	// the 403 envelope via api.ErrMirrorRuleQuotaExceeded.
+	MirrorTargetsPerApp int
 	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
 	// 2000 (matches Node.js Express / Flask framework startup).
+	// AppProtocolGrpcAllowed (ADR-124 §Plan gating) is the plan
+	// gate for the per-app app_protocol=grpc opt-in. Hobby/Pro/
+	// Scale = true (Cloud Run analogue: gRPC framing is a paid-tier
+	// feature). Free = false (no business case for gRPC traffic at
+	// the free tier; the universal default 'http1' keeps every
+	// pre-existing app on the buffered H1 path regardless). Apid's
+	// createApp + updateApp handlers reject Free PATCH-grpc with
+	// 403 plan_app_protocol_grpc_not_allowed. http1 and http2
+	// are universally allowed (no per-plan gate) and validated
+	// via the same accessor below.
+	AppProtocolGrpcAllowed bool
 	// Range [100, 60000] (migration 00109 CHECK).
 	WarmSnapshotMinMsDefault int
 
@@ -1234,6 +1302,15 @@ var planLimits = map[Plan]Limits{
 		// Free is gated to 0 consumer keys — mirrors CronLimitPerApp/OrgMembersMax 0/0 posture.
 		ConsumerKeysPerApp:     0,
 		ConsumerKeysPerAccount: 0,
+		// Open API docs (ADR-122 / issue #975 item #1). Free is
+		// gated to 0 — the apid GET / PATCH handlers return 402
+		// CodePlanOpenAPIDocsNotAllowed. The microVM still
+		// captures the doc during cold boot but the row is never
+		// served (the count is 0 so the per-account quota can't
+		// trip either).
+		OpenAPIDocsPerDeployment: 0,
+		OpenAPIDocMaxBytes:       0,
+		OpenAPIDocsPerAccount:    0,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1333,6 +1410,12 @@ var planLimits = map[Plan]Limits{
 		// default (false) keeps every existing customer
 		// public-by-default.
 		RequireAuthn: false,
+		// AppProtocolGrpcAllowed (ADR-124): Free does not
+		// unlock gRPC framing at the customer edge. The
+		// universal default 'http1' keeps every Free app on
+		// the legacy H1 path regardless; the gate only fires
+		// if a Free customer tries PATCH app_protocol=grpc.
+		AppProtocolGrpcAllowed: false,
 		// TrafficSplit (issue #556): Free does not unlock
 		// per-deployment traffic splitting. The column
 		// default (100) keeps today's behaviour — 100% to the
@@ -1341,6 +1424,13 @@ var planLimits = map[Plan]Limits{
 		// passes a non-100 traffic_percent on create (403
 		// plan_traffic_split_not_allowed).
 		TrafficSplit: false,
+		// Mirror (issue #72 / ADR-125): Free stays locked — see
+		// the Limits.MirrorRuleAllowed comment for the cost
+		// rationale. MirrorTargetsPerApp = 0 keeps the field
+		// shaped for the QuotaError tripwire (the per-app count
+		// is what CreateMirrorRuleIfUnderQuota compares against).
+		MirrorRuleAllowed:   false,
+		MirrorTargetsPerApp: 0,
 		// Tail primitive (issue #667 / ADR-078): Free enables with
 		// the floor timeout (5 s) and the floor concurrency cap (4).
 		// Customers on Free get the primitive, just tightly bounded —
@@ -1526,6 +1616,13 @@ var planLimits = map[Plan]Limits{
 		// big-leap on this primitive).
 		ConsumerKeysPerApp:     100,
 		ConsumerKeysPerAccount: 250,
+		// Open API docs (ADR-122 / issue #975 item #1). Hobby
+		// is the entry paid tier — 1 doc per deployment (the
+		// schema's natural shape), 100 docs per account, 128
+		// KiB per doc (the global cap).
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    100,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1628,6 +1725,12 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
+		// AppProtocolGrpcAllowed (ADR-124): Hobby unlocks
+		// gRPC framing — gRPC server-streaming is a paid-tier
+		// feature consistent with Hobby's "near-Free with a
+		// floor" value-prop. Customers on Hobby may PATCH
+		// app_protocol=grpc freely.
+		AppProtocolGrpcAllowed: true,
 		// TrafficSplit (issue #556): Hobby does not unlock
 		// per-deployment traffic splitting. Hobby's value-prop
 		// is "near-Free with a floor" (MinInstancesAllowed
@@ -1638,6 +1741,13 @@ var planLimits = map[Plan]Limits{
 		// plan_traffic_split_not_allowed when they try to
 		// pass a non-100 traffic_percent on create or PATCH.
 		TrafficSplit: false,
+		// Mirror (issue #72 / ADR-125): Free stays locked — see
+		// the Limits.MirrorRuleAllowed comment for the cost
+		// rationale. MirrorTargetsPerApp = 0 keeps the field
+		// shaped for the QuotaError tripwire (the per-app count
+		// is what CreateMirrorRuleIfUnderQuota compares against).
+		MirrorRuleAllowed:   false,
+		MirrorTargetsPerApp: 0,
 		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
 		// the 15 s timeout + 16 per-instance concurrent tails.
 		// Matches the issue's "send a confirmation email"
@@ -1812,6 +1922,12 @@ var planLimits = map[Plan]Limits{
 		// keys each fits comfortably with headroom.
 		ConsumerKeysPerApp:     100,
 		ConsumerKeysPerAccount: 2500,
+		// Open API docs (ADR-122 / issue #975 item #1). Pro keeps
+		// the 1/deployment shape; 1000 per account (10× Hobby to
+		// match the consumer_keys 2500-vs-250 ratio).
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    1000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -1906,6 +2022,12 @@ var planLimits = map[Plan]Limits{
 		// recommendation. The column default is still
 		// false — the customer must explicitly PATCH true.
 		RequireAuthn: true,
+		// AppProtocolGrpcAllowed (ADR-124): Pro unlocks gRPC
+		// framing — paired with internal-only ingress + traffic
+		// splitting + canary as the production-tier go-fast
+		// stack. gRPC server-streaming is a paid-tier feature
+		// consistently across Hobby/Pro/Scale.
+		AppProtocolGrpcAllowed: true,
 		// TrafficSplit (issue #556): Pro unlocks
 		// per-deployment traffic splitting. The issue
 		// title says "Pro+ canary"; the migration
@@ -1913,6 +2035,16 @@ var planLimits = map[Plan]Limits{
 		// traffic_percent=100 by default, so customers
 		// who never opt-in see no behavioural change.
 		TrafficSplit: true,
+		// Mirror (issue #72 / ADR-125): Pro/Scale unlock the
+		// per-deployment mirroring surface. MirrorTargetsPerApp
+		// is 1 on Pro (single canary target — the canonical use
+		// case) and 3 on Scale (multi-shard rollout). The
+		// per-app cap is enforced inside
+		// CreateMirrorRuleIfUnderQuota's FOR UPDATE lock; a
+		// quota-exceeded attempt emits 403 mirror_rule_quota_exceeded
+		// via QuotaErrorKindMirror.
+		MirrorRuleAllowed:   true,
+		MirrorTargetsPerApp: 1,
 		// Tail primitive (issue #667 / ADR-078): Pro unlocks
 		// the 30 s timeout + 64 per-instance concurrent tails.
 		// Matches the issue's per-plan matrix value; covers
@@ -2093,6 +2225,13 @@ var planLimits = map[Plan]Limits{
 		// cardinality, so the upgrade ladder is one number.
 		ConsumerKeysPerApp:     1000,
 		ConsumerKeysPerAccount: 25000,
+		// Open API docs (ADR-122 / issue #975 item #1). Scale keeps
+		// the 1/deployment shape; 10000 per account (10× Pro, same
+		// 10× ratio as Hobby→Pro). The byte cap stays at 128 KiB —
+		// the global cap is the binding constraint, not the per-plan.
+		OpenAPIDocsPerDeployment: 1,
+		OpenAPIDocMaxBytes:       131072,
+		OpenAPIDocsPerAccount:    10000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -2198,12 +2337,26 @@ var planLimits = map[Plan]Limits{
 		// Customers on the largest plan who want
 		// token-gating still set it per-deployment.
 		RequireAuthn: true,
+		// AppProtocolGrpcAllowed (ADR-124): Scale unlocks gRPC
+		// framing — mirroring Pro as the production-tier
+		// go-fast stack.
+		AppProtocolGrpcAllowed: true,
 		// TrafficSplit (issue #556): Scale unlocks
 		// per-deployment traffic splitting — the
 		// revenue-protecting feature for the Scale
 		// tier (5/25/100% staged rollout to defend
 		// against bad deploys on a checkout API).
 		TrafficSplit: true,
+		// Mirror (issue #72 / ADR-125): Pro/Scale unlock the
+		// per-deployment mirroring surface. MirrorTargetsPerApp
+		// is 1 on Pro (single canary target — the canonical use
+		// case) and 3 on Scale (multi-shard rollout). The
+		// per-app cap is enforced inside
+		// CreateMirrorRuleIfUnderQuota's FOR UPDATE lock; a
+		// quota-exceeded attempt emits 403 mirror_rule_quota_exceeded
+		// via QuotaErrorKindMirror.
+		MirrorRuleAllowed:   true,
+		MirrorTargetsPerApp: 3,
 		// Tail primitive (issue #667 / ADR-078): Scale unlocks
 		// the 60 s timeout + 256 per-instance concurrent tails —
 		// the ceiling per the issue's per-plan matrix. The 60 s
@@ -2370,6 +2523,22 @@ const (
 	MaxRequestBodyBytes = 25 * 1024 * 1024 // 25 MB either direction
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
+
+	// MirrorMaxLifetimeSeconds (issue #72 / ADR-125) is the hard
+	// upper bound on how long a single mirror goroutine can run.
+	// The gateway derives a per-request context via
+	// context.WithoutCancel(r.Context()) + WithTimeout(mirrorMaxLifetime)
+	// so the mirror outlives a customer disconnect, but cannot run
+	// forever. 5s is the empirical envelope: cold-boot
+	// (~250ms) + serve (~50ms) + buffer drain (~100ms) + JCS
+	// canonicalization (~50ms) + safety margin. A sustained
+	// production request (p99 ~200ms) sits comfortably under this;
+	// a wedged mirror VM is bounded at 5s before the goroutine
+	// returns and the deferred ParkInstance runs. Larger values
+	// waste wake-bill on a hung VM; smaller values truncate a
+	// slow-but-correct response. Bumping this is a
+	// spec-amendment-grade change (ADR-125 §Decision).
+	MirrorMaxLifetimeSeconds = 5
 
 	// Apid http.Server defaults (issue #995 Phase 1, ADR-121
 	// companion). The customer-facing control plane binds loopback
@@ -3828,6 +3997,45 @@ func (p Plan) RequireAuthnAllowed() bool {
 	return l.RequireAuthn
 }
 
+// AppProtocolAllowed (ADR-124 §Plan gating) reports whether the
+// plan admits the given protocol value. http1 and http2 are
+// universally allowed (a customer on any plan may opt-in to H2
+// framing). grpc is Hobby/Pro/Scale only — Free returns false so
+// apid's createApp + updateApp handlers surface 403
+// plan_app_protocol_grpc_not_allowed. Out-of-set values
+// (anything other than http1|http2|grpc) return false so
+// apid's validation branch surfaces 400 app_protocol_invalid
+// rather than letting the value reach SQL. The migration
+// (00360) default is 'http1' so every pre-existing app
+// continues on the legacy H1 path regardless of plan.
+func (p Plan) AppProtocolAllowed(protocol string) bool {
+	switch protocol {
+	case "http1", "http2":
+		return true
+	case "grpc":
+		l, ok := LimitsFor(p)
+		if !ok {
+			return false // fail-closed
+		}
+		return l.AppProtocolGrpcAllowed
+	default:
+		return false
+	}
+}
+
+// DefaultAppProtocol (ADR-124 §Decision 1) is the value apid
+// writes when the customer omits AppProtocol on create. Universal
+// "http1" — no per-plan differentiation per the ADR. The closed-
+// set literal is also the canonical default declared at the column
+// level (NOT NULL DEFAULT 'http1' in migration 00382) so handlers
+// can fall back to the SQL default rather than relying on this
+// constant for the empty-string case. Declared as a package
+// constant (not a Plan receiver method) because the value is
+// plan-independent — every Plan returns the same thing and a
+// per-plan branch would just confuse a reader about whether
+// defaults vary across tiers.
+const DefaultAppProtocol = AppProtocolHTTP1
+
 // TrafficSplitAllowed reports whether the plan permits a customer to
 // set a non-default traffic_percent on a deployment (issue #556).
 // Pro/Scale return true; Free/Hobby return false so apid's
@@ -3847,6 +4055,25 @@ func (p Plan) TrafficSplitAllowed() bool {
 		return false // fail-closed
 	}
 	return l.TrafficSplit
+}
+
+// MirrorRuleAllowed reports whether the plan permits a customer to
+// create a mirror_rule (issue #72 / ADR-125). Pro/Scale return
+// true; Free/Hobby return false so apid's createMirrorRule + PATCH-
+// mirror handlers surface 403 plan_mirror_not_allowed. The per-app
+// count cap (Limits.MirrorTargetsPerApp) is enforced separately
+// inside CreateMirrorRuleIfUnderQuota's FOR UPDATE lock; this
+// method is the plan-level gate, not the quota gate. Hobby stays
+// locked for the same cost-shape rationale as TrafficSplit: a
+// mirror VM wakes for every customer request. Unknown plans fail
+// closed (return false), matching the TrafficSplitAllowed contract
+// above and the broader plan-gate discipline in this file.
+func (p Plan) MirrorRuleAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false // fail-closed
+	}
+	return l.MirrorRuleAllowed
 }
 
 // RequireAuthnDefault (issue #695 / ADR-080) returns the default
@@ -4143,6 +4370,55 @@ func (p Plan) ConsumerKeysPerAccount() int {
 		return 0
 	}
 	return l.ConsumerKeysPerAccount
+}
+
+// OpenAPIDocsPerDeployment (ADR-122 / issue #975 item #1) returns
+// the per-deployment cap on captured OpenAPI docs. The schema
+// is 1 row per deployment (PRIMARY KEY on deployment_id), so the
+// per-deployment cap is effectively 1 across all paid plans.
+// Free returns 0 — the apid PATCH handler returns 402
+// CodePlanOpenAPIDocsNotAllowed before the store is touched.
+// Unknown plans fail closed (return 0) — same contract as
+// ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocsPerDeployment() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocsPerDeployment
+}
+
+// OpenAPIDocMaxBytes (ADR-122 / issue #975 item #1) returns the
+// per-plan byte cap on one captured / uploaded OpenAPI doc.
+// Per-plan: Free 0 (irrelevant), Hobby/Pro/Scale 131072 (the
+// global cap state.OpenAPIDocMaxBytes). The apid PATCH handler
+// validates against this value and returns 413
+// CodePlanOpenAPIDocTooLarge on overflow. Unknown plans fail
+// closed (return 0) — same contract as ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocMaxBytes() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocMaxBytes
+}
+
+// OpenAPIDocsPerAccount (ADR-122 / issue #975 item #1) returns
+// the per-account cap on captured OpenAPI docs across all of
+// the account's deployments. Per-plan: Free 0, Hobby 100, Pro
+// 1000, Scale 10000. The apid PATCH handler enforces via
+// Store.CountOpenAPIDocsByAccount (the count is computed
+// server-side, not by walking the row set). Independent of
+// OpenAPIDocsPerDeployment — the per-account ceiling is reached
+// before the per-deployment ceiling on a typical multi-app
+// customer. Unknown plans fail closed (return 0) — same
+// contract as ConsumerKeysPerApp.
+func (p Plan) OpenAPIDocsPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIDocsPerAccount
 }
 
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan

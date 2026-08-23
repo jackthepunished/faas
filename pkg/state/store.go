@@ -60,6 +60,48 @@ var ErrInvalidPreviewPrState = errors.New("state: invalid preview_pr_state")
 // api.ErrTrafficPercentSumInvalid (409 Conflict).
 var ErrTrafficPercentSumInvalid = errors.New("state: traffic_percent sum != 100")
 
+// ErrInvalidMirrorPercent is returned by CreateMirrorRule /
+// UpdateMirrorRule when the requested percent falls outside
+// [0, 100]. The CHECK constraint on mirror_rules.percent
+// (migration 00348) is the schema-layer guard; this sentinel
+// surfaces the same range violation when the store is the one
+// running the backstop. Translated at the handler boundary to
+// api.ErrInvalidMirrorPercent (422). Mirrors ErrInvalidTrafficPercent's
+// contract exactly so the apid surface can lift the traffic-split
+// range-check verbatim.
+var ErrInvalidMirrorPercent = errors.New("state: invalid mirror_rules.percent")
+
+// ErrMirrorSourceTargetSame is returned by CreateMirrorRule when
+// the caller passes the same deployment id for source and mirror.
+// The migrations/00348 SQL CHECK prevents the row from being
+// inserted at the schema layer; this sentinel surfaces the same
+// condition at the store layer so the handler can produce a
+// stable RFC 7807 problem without a Postgres round-trip. Distinct
+// from ErrInvalidMirrorPercent because the customer-facing problem
+// code is different (422 mirror_source_target_same vs 422
+// invalid_mirror_percent).
+var ErrMirrorSourceTargetSame = errors.New("state: mirror_rules source_deployment_id == mirror_deployment_id")
+
+// ErrMirrorDeploymentNotLive is returned by CreateMirrorRule /
+// UpdateMirrorRule when one or both of the referenced deployments
+// is not in status='live' (a superseded / failed / pending row
+// cannot mirror — operators mirror against live rows, same as the
+// traffic-split POST handler). Translated at the handler boundary
+// to api.ErrMirrorDeploymentNotLive (409). The caller is
+// responsible for passing the ids; the store does not infer them
+// from the app.
+var ErrMirrorDeploymentNotLive = errors.New("state: mirror_rules source/mirror deployment is not live")
+
+// ErrMirrorCrossAppMismatch is returned by CreateMirrorRule when
+// the source_deployment_id and mirror_deployment_id resolve to
+// different apps (a single mirror_rule is app-scoped; cross-app
+// mirroring is a follow-on ADR-125 §follow-on 4). Translated at
+// the handler boundary to api.ErrMirrorCrossAppMismatch (422).
+// Distinct from ErrMirrorDeploymentNotLive because the customer
+// problem code is different (422 mirror_cross_app_mismatch vs
+// 409 mirror_deployment_not_live).
+var ErrMirrorCrossAppMismatch = errors.New("state: mirror_rules source/mirror deployment belong to different apps")
+
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
@@ -74,6 +116,16 @@ const (
 	QuotaErrorKindApps   QuotaErrorKind = "apps"
 	QuotaErrorKindCrons  QuotaErrorKind = "crons"
 	QuotaErrorKindMemory                = "memory" // reserved for ADR-046 follow-on
+	// QuotaErrorKindMirror (issue #72 / ADR-125) trips when a
+	// Pro/Scale customer tries to create more than
+	// limits.MirrorTargetsPerApp mirror rules on one app. Free /
+	// Hobby customers hit the plan-gate one layer up
+	// (api.Plan.MirrorRuleAllowed returns false → apid returns 403
+	// plan_mirror_not_allowed before the store ever sees the
+	// request). The QuotaError carries Observed + Limit so the
+	// handler can stamp both on the RFC 7807 problem without
+	// re-running the count.
+	QuotaErrorKindMirror QuotaErrorKind = "mirror"
 )
 
 type QuotaError struct {
@@ -364,6 +416,9 @@ type AppErrorSampleRow struct {
 // narrow keeps the ownership rules enforceable — apid only touches
 // customer-intent tables through the methods it is given.
 type Store interface {
+	// Ping tests store/database connectivity.
+	Ping(ctx context.Context) error
+
 	// Accounts & auth.
 	CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error)
 	// CreateAccountWithPersonalOrg is the PR 3 canonical
@@ -1156,6 +1211,17 @@ type Store interface {
 	// Soft-deleted rows are filtered out — the teardown janitor's
 	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
 	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) lists
+	// every non-deleted preview row for the account, across all
+	// parents. Backs the new /dashboard/previews page (a global
+	// "all open PRs" view that complements the per-app preview
+	// panel). Ordered by created_at DESC so the dashboard's
+	// newest-first display is free.
+	//
+	// Returns an empty slice (not an error) when the account has
+	// no previews. Production apps (preview_of_slug IS NULL) are
+	// filtered out — this is a preview-only view.
+	ListPreviewsForAccount(ctx context.Context, accountID string) ([]App, error)
 	// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns
 	// preview rows the teardown janitor should consider this tick:
 	// every non-torn_down preview that is either in a terminal-ish
@@ -1187,6 +1253,51 @@ type Store interface {
 	// production app id is ErrNotFound, so a bug in the janitor's
 	// query can never relabel a customer's live app.
 	SetPreviewPrState(ctx context.Context, appID, prState string) (App, error)
+	// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961
+	// leaf 3) records that the one-click PR comment destroy hint
+	// was posted to GitHub for this preview row. githubd's
+	// previewCommentOnce helper calls this after a successful
+	// POST so a closed → reopen → closed cycle does not spam
+	// the customer with duplicate comments.
+	//
+	// Only preview rows (preview_of_slug <> '') are eligible; a
+	// production app id is ErrNotFound. The stamp is idempotent:
+	// re-stamping the same timestamp is a no-op (the column value
+	// is the dedupe key, not the row identity).
+	StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error)
+	// StampFirstWake (Mega-C PR-2 / issue #961 leaf 8) sets
+	// first_wake_at + first_5xx_window_ends_at on the
+	// deployment iff both are NULL. The window ends_at is
+	// derived as now + windowMinutes (constant
+	// pkg/api.RollbackOn5xxWindowMinutes). Idempotent: a
+	// second call within the window leaves the values
+	// unchanged. Returns ErrNotFound when the deployment does
+	// not exist.
+	StampFirstWake(ctx context.Context, deploymentID string, windowMinutes int) (Deployment, error)
+	// BumpFirst5xxCount atomically increments the per-deploy
+	// first_5xx_count and returns the new value. Atomic via
+	// UPDATE ... RETURNING first_5xx_count (PG) / mutex-guarded
+	// map mutation (MemStore). schedd's threshold check is
+	// post-increment: caller compares the returned count to
+	// plan.RollbackOn5xxThreshold().
+	BumpFirst5xxCount(ctx context.Context, deploymentID string) (int, error)
+	// MarkAutoRollback stamps last_auto_rollback_at + the
+	// closed-set reason (see deployments_last_auto_rollback_reason_check
+	// from migration 00297). Called by the apid-internal
+	// auto-rollback handler after the deployments status swap
+	// commits. The two writes (status swap + this stamp) live
+	// in the same transaction; the audit row that carries
+	// trigger="auto_5xx" is the customer-visible signal.
+	MarkAutoRollback(ctx context.Context, deploymentID, reason string, when time.Time) (Deployment, error)
+	// AutoRollbackDeploymentsTx wraps the deployments status
+	// swap in a tx: (a) current live → superseded, (b) most
+	// recent superseded → live, (c) markAutoRollback on the
+	// rolled-back id. Returns the new live deployment id (the
+	// one schedd needs to park instances for). The instances
+	// mutation belongs to schedd per CLAUDE.md — this tx
+	// does NOT touch instances; schedd does that in a
+	// sibling call after this returns.
+	AutoRollbackDeploymentsTx(ctx context.Context, appID, currentDeploymentID string) (newLiveDeploymentID string, err error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
@@ -1761,6 +1872,70 @@ type Store interface {
 	// makes the rebalance race-free against CreateDeployment.
 	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error)
 
+	// MirrorRules (issue #72 / ADR-125) — per-deployment traffic-
+	// mirroring CRUD + comparison ledger reads.
+	//
+	// CreateMirrorRuleIfUnderQuota inserts a new mirror_rule after
+	// holding FOR UPDATE on the apps row to serialise against
+	// concurrent creators. The cap is limits.MirrorTargetsPerApp
+	// (Free 0 / Hobby 0 / Pro 1 / Scale 3 per ADR-125 §Decision);
+	// the gate fires before the INSERT, returning a *QuotaError
+	// when tripped (the same shape CreateAppIfUnderQuota /
+	// CreateEdgeRuleIfUnderQuota use, with Kind=QuotaErrorKindMirror
+	// added to the QuotaErrorKind enum so the apid handler can map
+	// it to a stable RFC 7807 code). Range-check on percent ∈
+	// [0, 100] is layered: handler validates first (422), this
+	// method re-validates as defence-in-depth. Source / mirror
+	// distinctness is the migrations/00348 SQL CHECK; this method
+	// surfaces ErrMirrorSourceTargetSame at the Go layer so the
+	// handler doesn't have to inspect the SQL error. Source /
+	// mirror must both be status='live' deployments of the same
+	// app — returns ErrMirrorDeploymentNotLive / ErrMirrorCrossAppMismatch
+	// respectively when either invariant trips.
+	//
+	// ListMirrorRules returns every rule for the app (enabled or
+	// not), ordered by created_at ASC. The gateway picker reads
+	// from this in the deployment_changed pg_notify refresh path;
+	// MemStore's in-memory mirror makes it testable without a DB.
+	//
+	// GetMirrorRuleByID returns a single rule by id. IDOR safety
+	// is the caller's responsibility (apid's loadApp + AccountID
+	// check); this method scopes the read by id alone.
+	//
+	// UpdateMirrorRule applies a partial update via MirrorRulePatch.
+	// Pointer fields let the caller distinguish "absent" from
+	// "zero" (Percent=0 disables the rule without removing it).
+	// Same FOR UPDATE discipline as CreateMirrorRuleIfUnderQuota so
+	// concurrent writers serialise.
+	//
+	// DeleteMirrorRule removes a rule. ON DELETE CASCADE on
+	// mirror_invocation_results.mirror_rule_id cleans up the
+	// comparison ledger; ON DELETE CASCADE on the deployments FKs
+	// means deleting a deployment cascades to its rules.
+	//
+	// InsertMirrorResult appends one row to mirror_invocation_results
+	// after a mirror goroutine completes. Best-effort: the gateway
+	// logs the error but doesn't roll back the customer-facing
+	// response. Caller stamps CompletedAt; the column default is
+	// now() for direct SQL inserts but the Go side sets it
+	// explicitly so the audit + ledger timestamps agree.
+	//
+	// ListMirrorResults returns up to `limit` rows for a rule with
+	// completed_at >= `since`, ordered DESC. limit <= 0 means "no
+	// cap" (matches the same contract ListDeploymentsForApp uses).
+	//
+	// MirrorSummary aggregates the rows in the same window via SQL
+	// aggregates — never client-side. The apid handler renders the
+	// result as MirrorSummaryResponse.
+	CreateMirrorRuleIfUnderQuota(ctx context.Context, in CreateMirrorRuleParams, limits api.Limits) (MirrorRule, error)
+	ListMirrorRules(ctx context.Context, appID string) ([]MirrorRule, error)
+	GetMirrorRuleByID(ctx context.Context, id string) (MirrorRule, error)
+	UpdateMirrorRule(ctx context.Context, id string, patch MirrorRulePatch) (MirrorRule, error)
+	DeleteMirrorRule(ctx context.Context, id string) error
+	InsertMirrorResult(ctx context.Context, r MirrorInvocationResult) error
+	ListMirrorResults(ctx context.Context, ruleID string, since time.Time, limit int) ([]MirrorInvocationResult, error)
+	MirrorSummary(ctx context.Context, ruleID string, since time.Time) (MirrorSummary, error)
+
 	// SetDeploymentFailed is the failure-specific helper ADR-021 introduced
 	// alongside the deployments.error_code column. Status is pinned to
 	// 'failed'; code is the RFC 7807 code pkg/api.SentinelToCode lifted
@@ -1892,6 +2067,66 @@ type Store interface {
 	// apid-side caller passes that status so the pgstore stays
 	// schema-agnostic.
 	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
+
+	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
+	// document capture. The surface is paid-only (Free plan
+	// returns 403 from the apid) but the microVM always captures
+	// the body during cold boot — the read cost is one TCP
+	// ReadAll against /openapi.json and is throughput-irrelevant
+	// relative to the 350 ms wake budget. Free customers' docs
+	// are persisted (the per-account quota is 0) but never
+	// exposed via the apid GET; the apid never inserts a Free
+	// row, so the row count for Free plans is always 0.
+	//
+	// The four methods pin the surface with one row per
+	// deployment (PRIMARY KEY on deployment_id). The migration
+	// puts the table behind ON DELETE CASCADE so a deployment
+	// cleanup wipes the doc; the apid audit emit
+	// (app.openapi_doc.deleted) records the lifecycle event.
+	//
+	// IDOR floor: every read and write takes accountID and the
+	// SQL filters by (deployment_id, account_id). The
+	// consumer_keys precedent (pkg/state/pgstore_consumer_keys.go)
+	// applies the same defence-in-depth: the apps row is FK-scoped
+	// to one account so a WHERE on deployment_id alone is
+	// sufficient, but the Store boundary enforces tenancy at the
+	// API surface so a future caller can't probe by
+	// deploymentID without knowing the account.
+	//
+	// GetDeploymentOpenAPIDoc returns the (doc, meta) pair for
+	// one deployment. ErrNotFound when the row is missing OR
+	// when the caller's accountID does not match (the
+	// pgx row.Scan errors on no rows; we map it to ErrNotFound).
+	// The truncated flag is returned in the meta so the apid GET
+	// handler can set X-OpenAPI-Doc-Truncated: 1 on the response.
+	GetDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID string) ([]byte, OpenAPIDocMeta, error)
+	// UpsertDeploymentOpenAPIDoc records (or overwrites) the
+	// captured OpenAPI body for one deployment. doc is the
+	// validated JSON bytes (the apid jsonschema check passes
+	// before this call); source is the closed enum 'cold_boot' or
+	// 'manual_upload'. The row is filtered by (deployment_id,
+	// account_id) at the WHERE clause so a misrouted call from a
+	// different account fails with ErrNotFound (the FK CASCADE in
+	// migration 00330 makes this unreachable in practice, but
+	// the explicit error lets a misuse at the call site fail
+	// closed). Idempotent: a re-delivered cold-boot event
+	// overwrites the same row, not create a second one. The
+	// capture count for the per-account quota is computed via
+	// CountOpenAPIDocsByAccount.
+	UpsertDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID, appID string, doc []byte, source string, truncated bool) error
+	// DeleteDeploymentOpenAPIDoc removes the doc row for one
+	// deployment. ErrNotFound when no row OR the caller's
+	// accountID does not match — same IDOR floor as the read.
+	// The DELETE is idempotent only in the sense that "no row"
+	// and "row deleted" both surface as ErrNotFound (the apid
+	// caller treats a 404 as success after a delete).
+	DeleteDeploymentOpenAPIDoc(ctx context.Context, deploymentID, accountID string) error
+	// CountOpenAPIDocsByAccount returns the number of doc rows
+	// the account owns. Drives the per-account quota gate
+	// (api.Plan.OpenAPIDocsPerAccount). The count is computed
+	// server-side via a SELECT COUNT(*) so the apid doesn't
+	// load the full body slice.
+	CountOpenAPIDocsByAccount(ctx context.Context, accountID string) (int, error)
 
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
@@ -2617,6 +2852,13 @@ type Store interface {
 	// N per-app ListInstancesForApp calls (PR #48 follow-up). Result is
 	// keyed by app ID; callers must handle the "no row" case explicitly.
 	ListLatestInstancePerApp(ctx context.Context, accountID string) (map[string]Instance, error)
+	// LookupBootStartedForWakes (ADR-123) returns the wake-boot
+	// telemetry (trigger / queued_count / concurrency_at_admit) for
+	// each wake_id in the input slice. Batched in one SQL round-trip
+	// (uses the events_wake_id_idx jsonb expression index) so the
+	// dashboard's "Recent wakes" table doesn't fan out per row.
+	// Empty map when no rows match (pre-ADR-123 fleet).
+	LookupBootStartedForWakes(ctx context.Context, wakeIDs []string) (map[string]WakeBootMeta, error)
 	// ListAllInstances returns every instance on the box, ordered newest
 	// first. schedd's G7 reaper warm-passes this slice to the conntrack
 	// reader (pkg/sched/flowcount) once per tick — a single bulk read is
@@ -2675,6 +2917,13 @@ type Store interface {
 	// routes here when the target state is STOPPED or FAILED; every other
 	// transition still uses UpdateInstanceState / UpdateInstanceStateWithTimestamp.
 	UpdateInstanceStateToTerminal(ctx context.Context, id, state string, terminalAt time.Time) error
+	// SetInstanceMode (issue #72 / ADR-125) flips instances.mode
+	// from 'normal' to 'mirror' (or back). Used by the schedd
+	// admission path when admitting a mirror instance under a
+	// mirror_rule, and by tests that need to plant a mirror
+	// instance without going through the full wake-coord loop.
+	// Idempotent. ErrNotFound when the instance row is missing.
+	SetInstanceMode(ctx context.Context, id string, mode InstanceMode) error
 	// SetInstanceFrameworkReadyAt stamps the column added by
 	// migrations/00112_instances_framework_ready_at.sql — the wall-clock
 	// time the vmmd received the guest-init "framework ready" vsock
@@ -3169,6 +3418,34 @@ type Store interface {
 	// Returns ErrNotFound when the deployment row does not exist or
 	// when state.Current is the zero value.
 	CloseDeploymentStage(ctx context.Context, id string, name StageName, at time.Time) (Deployment, error)
+
+	// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+	// C2) inserts a fresh `deployments` row copying every input
+	// primitive from `failedID` (image / source_url / commit_sha /
+	// overrides / sidecars / scope / traffic_percent) and seeds the
+	// new row's `stage_state` to `{current: fromStage,
+	// current_started_at: NULL, history: []}`. The original row is
+	// NOT mutated; the new row carries a new ID so SSE consumers
+	// (the dashboard stages-partial handler in commit 4) can detect
+	// the retry via the row-creation event.
+	//
+	// `fromStage` MUST be one of AllStageNames — implementations
+	// validate against the closed-6 vocabulary before insert (a
+	// caller-supplied unknown stage returns ErrInvalidArgument).
+	// The caller (apid handlers_retry.go) maps a wire-level 400 on
+	// unknown stage to a structured RFC 7807 problem.
+	//
+	// The new row's status starts at DeployPending so imaged's
+	// transition chokepoint picks it up the same way as a CLI-driven
+	// `gregale deploy`. The `failedID` row's status remains at its
+	// terminal value (DeployFailed / DeployLive) — the retry is a
+	// new row, not a status flip on the old one.
+	//
+	// Implementation note: reuses the existing CreateDeployment
+	// supersede step at pgstore.go:4187-4244 (which handles the
+	// pending-vs-parked row dance on the same app). The retry path
+	// doesn't supersede anything — the new row just inserts.
+	RetryDeploymentFromStage(ctx context.Context, failedID string, fromStage StageName) (Deployment, error)
 
 	// ListAuditLog (issue #755 / PR-6) is the dashboard read path
 	// for the audit_log table. The filter struct drives every

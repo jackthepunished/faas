@@ -11,6 +11,12 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// wakeBootTriggerTargets mirrors sched.TriggerTargets (ADR-123).
+// Defined locally to avoid a sched import; the value is the canonical
+// wake-boot trigger enum entry and must stay in lockstep with
+// pkg/sched/triggers.go.
+const wakeBootTriggerTargets = "targets"
+
 // AdmitResult is the typed wake-subset the trigger needs from the
 // engine. Mirrors pkg/sched/scaleup.AdmitResult exactly; we re-
 // declare it locally so the targets package does not import scaleup
@@ -79,12 +85,13 @@ type Engine interface {
 	// AdmitInstance (PR-B / issue #272): scope is the preview scope
 	// (`pr-{N}`) forwarded to the underlying sched.Engine.
 	// Empty = prod (legacy single-deployment behaviour).
-	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	AdmitInstance(ctx context.Context, appID, scope, trigger string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. Routes
 	// through this so a targets tick racing the gateway, cron, floor,
 	// or scaleup triggers on the same parked app coalesces into one
-	// virtual boot.
-	EnsureWake(ctx context.Context, appID string) (WakeOutcome, error)
+	// virtual boot. trigger (ADR-127) is stamped on the emitted
+	// wake.boot_started / wake.boot_completed events.
+	EnsureWake(ctx context.Context, appID, trigger string) (WakeOutcome, error)
 }
 
 // InstatsReader is the per-instance in-flight signal source (PR-C,
@@ -325,7 +332,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// ADR-098: route through EnsureWake so a targets tick racing the
 		// gateway, cron, floor, or scaleup triggers on the same parked
 		// app coalesces into one virtual boot.
-		result, err := t.engine.EnsureWake(ctx, app.ID)
+		result, err := t.engine.EnsureWake(ctx, app.ID, wakeBootTriggerTargets)
 		if err != nil {
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
 			continue

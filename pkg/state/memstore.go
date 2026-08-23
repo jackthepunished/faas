@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -168,6 +169,18 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// mirrorRules mirrors mirror_rules for handler tests (issue #72
+	// / ADR-125). Keyed by MirrorRule.ID; the (app_id, enabled) and
+	// (source_deployment_id, enabled) lookup hot paths walk the map
+	// — fine for tests, matches the partial-index plan on the
+	// pgstore side. The m.mu lock serialises count + insert in
+	// CreateMirrorRuleIfUnderQuota, mirroring the pgstore FOR
+	// UPDATE discipline. mirrorResults is the per-invocation
+	// ledger (mirror_invocation_results table) keyed by result ID;
+	// InsertMirrorResult is best-effort, the apid path doesn't
+	// observe it, only the gateway does.
+	mirrorRules   map[string]MirrorRule
+	mirrorResults map[string]MirrorInvocationResult
 	// corsPresets mirrors cors_presets (issue #975 item #4 /
 	// Mega-Foundation #979-b). Keyed by presetID. PR-A exposes
 	// only the read path; the write surface lives in PR-B
@@ -175,6 +188,12 @@ type MemStore struct {
 	// field. Mirroring the read path here means handler tests
 	// can exercise the compile-side merge without a live PG.
 	corsPresets map[string]CorsPreset
+	// openAPIDocs mirrors deployment_openapi_docs (ADR-122 /
+	// issue #975 item #1, migrations/00330). Keyed by
+	// deployment_id. The acctID predicate is checked at the
+	// method boundary so a cross-tenant read returns ErrNotFound
+	// (the same defence-in-depth as consumerKeys below).
+	openAPIDocs map[string]openAPIDocRow
 	// openAPISnapshots mirrors deployment_openapi_snapshots
 	// (ADR-121, migration 00358). Keyed by deployment_id,
 	// mirroring the table's PK. PR-C's gate reads via
@@ -573,7 +592,12 @@ func NewMemStore() *MemStore {
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
-		buildProvenance:      map[string]BuildProvenance{},
+		buildProvenance: map[string]BuildProvenance{},
+		// issue #72 / ADR-125: mirror-rules and mirror-results
+		// stores. Empty until the first create; the per-app count
+		// in CreateMirrorRuleIfUnderQuota walks the map.
+		mirrorRules:          map[string]MirrorRule{},
+		mirrorResults:        map[string]MirrorInvocationResult{},
 		domains:              map[string]CustomDomain{},
 		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
@@ -585,6 +609,7 @@ func NewMemStore() *MemStore {
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
+		openAPIDocs:          map[string]openAPIDocRow{},
 		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
@@ -2480,6 +2505,44 @@ func (m *MemStore) SetPreviewPrState(_ context.Context, appID, prState string) (
 	return a, nil
 }
 
+// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961 leaf 3)
+// is the MemStore mirror of PgStore.StampPreviewDestroyCommentedAt.
+// Preview-only by construction; production rows return
+// ErrNotFound. Idempotent: re-stamping the same timestamp is a
+// no-op (the column value is the dedupe key, not the row identity).
+func (m *MemStore) StampPreviewDestroyCommentedAt(_ context.Context, appID string, when time.Time) (App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok || a.PreviewOfSlug == "" {
+		return App{}, ErrNotFound
+	}
+	t := when
+	a.PreviewDestroyCommentedAt = &t
+	m.apps[appID] = a
+	return a, nil
+}
+
+// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) is the
+// MemStore mirror of PgStore.ListPreviewsForAccount. Returns every
+// non-deleted preview row for the account across all parents;
+// production apps (PreviewOfSlug == "") are filtered out.
+func (m *MemStore) ListPreviewsForAccount(_ context.Context, accountID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.AccountID != accountID || a.PreviewOfSlug == "" || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4292,6 +4355,15 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 	})
 	state.Current = to
 	state.CurrentStartedAt = &startedAt
+	// ADR-117 §Production-ready follow-on, C1 — cap stage history
+	// at MaxStageHistory entries (FIFO). Mirrors pgstore.go. The
+	// trim lives here at the read-modify-write site so future
+	// contributors can't widen the field without seeing the cap.
+	// `state.Current` is never trimmed — only the historical
+	// archive.
+	if len(state.History) > MaxStageHistory {
+		state.History = state.History[len(state.History)-MaxStageHistory:]
+	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
@@ -4391,6 +4463,212 @@ func (m *MemStore) CloseDeploymentStage(_ context.Context, id string, name Stage
 	return d, nil
 }
 
+// RetryDeploymentFromStage (ADR-117 §Production-ready follow-on,
+// C2) memstore mirror of PgStore.RetryDeploymentFromStage. See
+// Store.RetryDeploymentFromStage docblock for the wire contract.
+//
+// Mirrors pgstore: validate against pkg/state.AllStageNames
+// (ErrInvalidArgument on unknown), copy every input primitive
+// from the failed row, seed the new row's stage_state to
+// `{current: fromStage, current_started_at: NULL, history: []}`.
+// The fresh id is allocated by the existing newID() helper.
+func (m *MemStore) RetryDeploymentFromStage(_ context.Context, failedID string, fromStage StageName) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !stageNameClosedSet[fromStage] {
+		return Deployment{}, ErrInvalidArgument
+	}
+	src, ok := m.deployments[failedID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	// Build a new row. The Status field stays DeployPending so
+	// imaged's transition chokepoint picks it up the same way as a
+	// fresh CLI-driven deploy. The id is fresh; every input
+	// primitive from the source row carries over so the new
+	// attempt is byte-equivalent to re-running the same pipeline.
+	//
+	// Code-review finding #3: actor attribution columns
+	// (DeployedVia / DeployedByUserID / DeployedFromIP /
+	// PusherLogin) must also carry over — they describe WHO
+	// triggered the original deploy, and the SOC 2 / GDPR audit
+	// trail ("who deployed v3 at 14:32?") is keyed on these
+	// columns. A retry that strips them produces a row whose
+	// deployer chips are blank, breaking audit-trail queries that
+	// walk from the failed row back to the operator. The columns
+	// here describe the *retry's* triggering actor in the new
+	// row's terms — copying the source primitives reflects
+	// "this row was created from the same intent as that row",
+	// which is the same posture that the input-primitive copy
+	// above takes for non-actor fields.
+	newDep := Deployment{
+		ID:                    newID(),
+		AppID:                 src.AppID,
+		ImageDigest:           src.ImageDigest,
+		Kind:                  src.Kind,
+		SourcePath:            src.SourcePath,
+		SourceBytes:           src.SourceBytes,
+		Handler:               src.Handler,
+		SourceURL:             src.SourceURL,
+		CommitSHA:             src.CommitSHA,
+		OverrideEntrypoint:    src.OverrideEntrypoint,
+		OverrideCmd:           src.OverrideCmd,
+		OverrideEnv:           src.OverrideEnv,
+		OverrideEnvSecrets:    src.OverrideEnvSecrets,
+		OverridePort:          src.OverridePort,
+		OverrideHealthcheck:   src.OverrideHealthcheck,
+		OverrideLivenessProbe: src.OverrideLivenessProbe,
+		Sidecars:              src.Sidecars,
+		MinInstances:          src.MinInstances,
+		TrafficPercent:        src.TrafficPercent,
+		Scope:                 src.Scope,
+		DeployedVia:           src.DeployedVia,
+		DeployedByUserID:      src.DeployedByUserID,
+		DeployedFromIP:        src.DeployedFromIP,
+		PusherLogin:           src.PusherLogin,
+		Status:                DeployPending,
+	}
+	// Seed stage_state: the new row starts at fromStage with an
+	// empty history. imaged's transitionWithStage will append
+	// the first row (fromStage → next) the same way it does on
+	// a CLI-driven fresh deploy.
+	seed, err := json.Marshal(StageState{
+		Current:          fromStage,
+		CurrentStartedAt: nil,
+		History:          []StageStateItem{},
+	})
+	if err != nil {
+		return Deployment{}, fmt.Errorf("RetryDeploymentFromStage: encode stage_state seed: %w", err)
+	}
+	newDep.StageState = seed
+	newDep.CreatedAt = time.Now()
+	m.deployments[newDep.ID] = newDep
+	return newDep, nil
+}
+
+// StampFirstWake mirrors PgStore.StampFirstWake for the in-memory
+// store used by unit tests (cmd/apid/handlers_*_test.go) and
+// cmd/e2e. Idempotent: the coalesce on the PG side is mirrored by
+// the explicit nil-check here. windowMinutes defaults to 5 when
+// non-positive.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) StampFirstWake(_ context.Context, deploymentID string, windowMinutes int) (Deployment, error) {
+	if windowMinutes <= 0 {
+		windowMinutes = 5
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	if d.FirstWakeAt == nil {
+		d.FirstWakeAt = &now
+	}
+	if d.First5xxWindowEndsAt == nil {
+		end := now.Add(time.Duration(windowMinutes) * time.Minute)
+		d.First5xxWindowEndsAt = &end
+	}
+	m.deployments[deploymentID] = d
+	return d, nil
+}
+
+// BumpFirst5xxCount mirrors PgStore.BumpFirst5xxCount. The mutex
+// serializes increments so concurrent calls are still atomic — same
+// post-condition as the PG UPDATE ... RETURNING.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) BumpFirst5xxCount(_ context.Context, deploymentID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	d.First5xxCount++
+	m.deployments[deploymentID] = d
+	return d.First5xxCount, nil
+}
+
+// MarkAutoRollback mirrors PgStore.MarkAutoRollback. Idempotent on
+// the (id, reason) pair: re-stamping with the same reason is a no-op
+// because the field is already non-nil. reason must be non-empty
+// (the closed-set check happens at the PG layer; here we just guard
+// against a typo before the caller can poison the in-memory state).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) MarkAutoRollback(_ context.Context, deploymentID, reason string, when time.Time) (Deployment, error) {
+	if reason == "" {
+		return Deployment{}, fmt.Errorf("pkgstate: MarkAutoRollback reason required")
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	if d.LastAutoRollbackReason == "" {
+		d.LastAutoRollbackAt = &when
+		d.LastAutoRollbackReason = reason
+		m.deployments[deploymentID] = d
+	}
+	return d, nil
+}
+
+// AutoRollbackDeploymentsTx mirrors PgStore.AutoRollbackDeploymentsTx
+// for the in-memory store. The mutex plays the role of the PG
+// transaction. Returns the new live deployment ID, or "" if no
+// superseded deploy exists (the rollback is a no-op). Returns
+// ErrNotFound when the current deployment row does not exist or is
+// not live.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (m *MemStore) AutoRollbackDeploymentsTx(_ context.Context, appID, currentDeploymentID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.deployments[currentDeploymentID]
+	if !ok || cur.AppID != appID || cur.Status != DeployLive {
+		return "", ErrNotFound
+	}
+	// Find the latest superseded deploy on this app.
+	var targetID string
+	var latestCreated time.Time
+	for id, d := range m.deployments {
+		if id == currentDeploymentID {
+			continue
+		}
+		if d.AppID != appID || d.Status != DeploySuperseded {
+			continue
+		}
+		if latestCreated.IsZero() || d.CreatedAt.After(latestCreated) {
+			targetID = id
+			latestCreated = d.CreatedAt
+		}
+	}
+	if targetID == "" {
+		// No rollback target — succeed as a no-op (mirrors PG path).
+		return "", nil
+	}
+	cur.Status = DeploySuperseded
+	target := m.deployments[targetID]
+	target.Status = DeployLive
+	now := time.Now().UTC()
+	if cur.LastAutoRollbackAt == nil {
+		cur.LastAutoRollbackAt = &now
+	}
+	if cur.LastAutoRollbackReason == "" {
+		cur.LastAutoRollbackReason = "threshold_exceeded"
+	}
+	m.deployments[currentDeploymentID] = cur
+	m.deployments[targetID] = target
+	return targetID, nil
+}
+
 func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, bytes int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4447,6 +4725,123 @@ func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, 
 	d.SecretScannedAt = &scannedAt
 	m.deployments[id] = d
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// openAPIDocRow is the in-memory row mirror of deployment_openapi_docs
+// (migrations/00330). The struct is unexported; the public surface is
+// the four methods below — handler tests reach them through the
+// Store interface.
+// ---------------------------------------------------------------------------
+type openAPIDocRow struct {
+	DeploymentID string
+	AccountID    string
+	AppID        string
+	Doc          []byte
+	Source       string
+	ByteSize     int
+	DocSHA256    []byte
+	Truncated    bool
+	CapturedAt   time.Time
+	UpdatedAt    time.Time
+}
+
+// GetDeploymentOpenAPIDoc mirrors pgstore.GetDeploymentOpenAPIDoc.
+// Returns ErrNotFound when the row is missing OR when the caller's
+// accountID does not match — the IDOR floor is enforced at the
+// method boundary so a future caller can't probe by deploymentID
+// alone. The doc body is defensively copied on the way out so a
+// caller mutating the slice can't corrupt the map's internal copy.
+func (m *MemStore) GetDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID string) ([]byte, OpenAPIDocMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIDocs[deploymentID]
+	if !ok || row.AccountID != accountID {
+		return nil, OpenAPIDocMeta{}, ErrNotFound
+	}
+	return append([]byte(nil), row.Doc...), OpenAPIDocMeta{
+		DeploymentID: row.DeploymentID,
+		AccountID:    row.AccountID,
+		AppID:        row.AppID,
+		Source:       row.Source,
+		ByteSize:     row.ByteSize,
+		DocSHA256:    append([]byte(nil), row.DocSHA256...),
+		Truncated:    row.Truncated,
+		CapturedAt:   row.CapturedAt,
+		UpdatedAt:    row.UpdatedAt,
+	}, nil
+}
+
+// UpsertDeploymentOpenAPIDoc mirrors pgstore. The deployment row
+// must exist (the FK CASCADE in migration 00330 makes this
+// unreachable in practice, but the explicit check lets a misuse
+// at the call site fail closed). Idempotent: a re-delivered
+// cold-boot event overwrites the same row, not create a second.
+// source is the closed enum 'cold_boot' or 'manual_upload'; the
+// caller is responsible for pre-validation (the apid jsonschema
+// check is upstream).
+func (m *MemStore) UpsertDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID, appID string, doc []byte, source string, truncated bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.deployments[deploymentID]; !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := openAPIDocRow{
+		DeploymentID: deploymentID,
+		AccountID:    accountID,
+		AppID:        appID,
+		Doc:          docCopy,
+		Source:       source,
+		ByteSize:     len(docCopy),
+		DocSHA256:    sum[:],
+		Truncated:    truncated,
+	}
+	if existing, ok := m.openAPIDocs[deploymentID]; ok {
+		// Idempotent overwrite: keep the original captured_at so
+		// "first-capture" semantics survive a re-delivered cold-boot
+		// event. updated_at is bumped for the audit trail.
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIDocs[deploymentID] = row
+	return nil
+}
+
+// DeleteDeploymentOpenAPIDoc mirrors pgstore. ErrNotFound when no
+// row OR the caller's accountID does not match — same IDOR floor.
+// The apid caller treats ErrNotFound as "already deleted" so a
+// retry is a no-op.
+func (m *MemStore) DeleteDeploymentOpenAPIDoc(_ context.Context, deploymentID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIDocs[deploymentID]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.openAPIDocs, deploymentID)
+	return nil
+}
+
+// CountOpenAPIDocsByAccount returns the number of doc rows the
+// account owns. Drives the per-account quota gate. The count is
+// a single pass over the map — the in-memory store holds the
+// entire dataset under m.mu so an O(N) scan is fine.
+func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.openAPIDocs {
+		if r.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
@@ -6375,6 +6770,98 @@ func (m *MemStore) ListLatestInstancesForApp(ctx context.Context, appID string, 
 	return all, nil
 }
 
+// LookupBootStartedForWakes (ADR-123) returns the wake-boot telemetry
+// for each wake_id in the input slice. memstore implementation walks
+// the in-memory events slice (test-only path) — production read
+// goes through PgStore.LookupBootStartedForWakes.
+//
+// PR-A: parses at_capacity + ready_in_ms in lockstep with the pgstore
+// contract so test fixtures (and any injectable-Store callers) see
+// the same WakeBootMeta shape production surfaces. ready_in_ms is
+// computed by scanning the events slice a second time for the
+// earliest wake.boot_completed row with the same wake_id; absent
+// completion rows leave ReadyInMS at the zero default (em-dash at
+// the view layer).
+func (m *MemStore) LookupBootStartedForWakes(_ context.Context, wakeIDs []string) (map[string]WakeBootMeta, error) {
+	out := make(map[string]WakeBootMeta, len(wakeIDs))
+	wanted := make(map[string]struct{}, len(wakeIDs))
+	for _, id := range wakeIDs {
+		wanted[id] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// First pass: build a wake_id → earliest boot_completed timestamp
+	// map. Single forward scan; events appended in at-ASC order.
+	completedAt := make(map[string]time.Time)
+	for _, e := range m.events {
+		if e.Kind != "wake.boot_completed" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		wakeID, _ := payload["wake_id"].(string)
+		if _, ok := wanted[wakeID]; !ok {
+			continue
+		}
+		if _, have := completedAt[wakeID]; !have {
+			completedAt[wakeID] = e.At
+		}
+	}
+	// Second pass: stamp WakeBootMeta from the earliest
+	// wake.boot_started row per wake_id.
+	for _, e := range m.events {
+		if e.Kind != "wake.boot_started" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		wakeID, _ := payload["wake_id"].(string)
+		if _, ok := wanted[wakeID]; !ok {
+			continue
+		}
+		if _, dup := out[wakeID]; dup {
+			continue // keep earliest (events appended in at-ASC order)
+		}
+		meta := WakeBootMeta{}
+		if t, ok := payload["trigger"].(string); ok {
+			meta.Trigger = t
+		}
+		if q, ok := payload["queued_count"].(float64); ok {
+			meta.QueuedCount = int(q)
+		}
+		if c, ok := payload["concurrency_at_admit"].(float64); ok {
+			meta.ConcurrencyAtAdmit = int(c)
+		}
+		// at_capacity: distinguish "key absent" (pre-PR-A fleet) from
+		// "key present and explicitly false". The dashboard's
+		// em-dash-on-absent convention depends on AtCapacityPresent.
+		if _, ok := payload["at_capacity"]; ok {
+			meta.AtCapacityPresent = true
+			if v, ok := payload["at_capacity"].(bool); ok {
+				meta.AtCapacity = v
+			}
+		}
+		// ready_in_ms: total elapsed milliseconds between boot_started.at
+		// and the matching boot_completed.at. Mirrors pgstore's
+		// EXTRACT(EPOCH …) * 1000 — NOT EXTRACT(MILLISECONDS …)
+		// because PostgreSQL intervals are stored as months/days/
+		// seconds and EXTRACT(MILLISECONDS) is silently wrong for
+		// deltas >= 60s.
+		if cat, ok := completedAt[wakeID]; ok && !cat.IsZero() {
+			delta := cat.Sub(e.At)
+			if delta > 0 {
+				meta.ReadyInMS = int(delta / time.Millisecond)
+			}
+		}
+		out[wakeID] = meta
+	}
+	return out, nil
+}
+
 // ListAllInstances returns every instance whose state is one schedd's
 // idle reaper considers live (running, waking, cold_booting,
 // snapshotting). Sorted DESC by StartedAt to match the partial index
@@ -6565,6 +7052,24 @@ func (m *MemStore) SetInstanceFrameworkReadyAt(_ context.Context, id string, rea
 	}
 	ts := readyAt
 	ins.FrameworkReadyAt = &ts
+	m.instances[id] = ins
+	return nil
+}
+
+// SetInstanceMode (issue #72 / ADR-125) mirrors pgstore.SetInstanceMode.
+// Flips instances.mode to the supplied value (InstanceModeNormal or
+// InstanceModeMirror). Idempotent. Used by the schedd mirror
+// admission path and by tests that plant a mirror instance without
+// going through the full wake-coord loop. Returns ErrNotFound when
+// the row is missing.
+func (m *MemStore) SetInstanceMode(_ context.Context, id string, mode InstanceMode) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	ins.Mode = string(mode)
 	m.instances[id] = ins
 	return nil
 }
@@ -11830,6 +12335,11 @@ func (m *MemStore) TouchSessionLastSeen(_ context.Context, id string) error {
 	return nil
 }
 
+// Ping implements Store.Ping for in-memory testing.
+func (m *MemStore) Ping(ctx context.Context) error {
+	return nil
+}
+
 // compile-time check that MemStore satisfies Store.
 var _ Store = (*MemStore)(nil)
 
@@ -13079,4 +13589,252 @@ func parseMemUUIDString(s string) [16]byte {
 	}
 	copy(b[:], uid[:])
 	return b
+}
+
+// CreateMirrorRuleIfUnderQuota mirrors pgstore.CreateMirrorRuleIfUnderQuota
+// (issue #72 / ADR-125). The MemStore version runs under m.mu so a
+// concurrent CreateMirrorRuleIfUnderQuota call serialises behind us
+// — same race-free contract the pgstore's FOR UPDATE provides.
+//
+// Range-check matches pgstore (handler already validates, this is
+// defence in depth). Source/mirror distinctness check matches the
+// SQL CHECK (migration 00348). Both-deployments-live + cross-app
+// validation matches the pgstore's pre-insert queries.
+func (m *MemStore) CreateMirrorRuleIfUnderQuota(_ context.Context, in CreateMirrorRuleParams, limits api.Limits) (MirrorRule, error) {
+	if in.Percent < 0 || in.Percent > 100 {
+		return MirrorRule{}, ErrInvalidMirrorPercent
+	}
+	if in.SourceDeploymentID == in.MirrorDeploymentID {
+		return MirrorRule{}, ErrMirrorSourceTargetSame
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	app, ok := m.apps[in.AppID]
+	if !ok || app.Status == AppDeleted {
+		return MirrorRule{}, ErrNotFound
+	}
+	// Per-app count gate (Limits.MirrorTargetsPerApp; Free 0 /
+	// Hobby 0 / Pro 1 / Scale 3). The plan gate (Free/Hobby lock)
+	// is the handler's job — MirrorRuleAllowed returns false at
+	// the Plan.MirrorRuleAllowed() boundary so we never see a
+	// Free/Hobby request here.
+	var appCount int
+	for _, r := range m.mirrorRules {
+		if r.AppID == in.AppID {
+			appCount++
+		}
+	}
+	if appCount >= limits.MirrorTargetsPerApp {
+		return MirrorRule{}, &QuotaError{
+			Kind:     QuotaErrorKindMirror,
+			Limit:    limits.MirrorTargetsPerApp,
+			Observed: appCount,
+		}
+	}
+	// Validate source + mirror deployments. Both must be live
+	// (operators mirror against live rows, same as traffic split)
+	// AND belong to the same app (a single mirror_rule is
+	// app-scoped; cross-app is ADR-125 §follow-on 4).
+	for _, depID := range []string{in.SourceDeploymentID, in.MirrorDeploymentID} {
+		d, ok := m.deployments[depID]
+		if !ok || d.AppID != in.AppID || d.Status != DeployLive {
+			return MirrorRule{}, ErrMirrorDeploymentNotLive
+		}
+	}
+	now := time.Now().UTC()
+	r := MirrorRule{
+		ID:                 uuid.NewString(),
+		AccountID:          in.AccountID,
+		AppID:              in.AppID,
+		SourceDeploymentID: in.SourceDeploymentID,
+		MirrorDeploymentID: in.MirrorDeploymentID,
+		Percent:            in.Percent,
+		Enabled:            in.Enabled,
+		IncludeBody:        in.IncludeBody,
+		RedactHeaders:      in.RedactHeaders,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if r.RedactHeaders == nil {
+		r.RedactHeaders = []string{}
+	}
+	m.mirrorRules[r.ID] = r
+	return r, nil
+}
+
+// ListMirrorRules returns every mirror_rule for the app, ordered by
+// created_at ASC. The gateway picker reads from this in the
+// deployment_changed pg_notify refresh path; MemStore's in-memory
+// mirror makes it testable without a DB.
+func (m *MemStore) ListMirrorRules(_ context.Context, appID string) ([]MirrorRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []MirrorRule
+	for _, r := range m.mirrorRules {
+		if r.AppID == appID {
+			out = append(out, r)
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		return out[a].CreatedAt.Before(out[b].CreatedAt)
+	})
+	return out, nil
+}
+
+// GetMirrorRuleByID returns a single rule by id. IDOR safety is the
+// caller's responsibility (apid's loadApp + AccountID check); this
+// method scopes the read by id alone.
+func (m *MemStore) GetMirrorRuleByID(_ context.Context, id string) (MirrorRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.mirrorRules[id]
+	if !ok {
+		return MirrorRule{}, ErrNotFound
+	}
+	return r, nil
+}
+
+// UpdateMirrorRule applies a partial update via MirrorRulePatch.
+// Pointer fields let the caller distinguish "absent" from "zero"
+// (Percent=0 disables the rule without removing it). Same m.mu
+// discipline as CreateMirrorRuleIfUnderQuota so concurrent writers
+// serialise.
+func (m *MemStore) UpdateMirrorRule(_ context.Context, id string, patch MirrorRulePatch) (MirrorRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.mirrorRules[id]
+	if !ok {
+		return MirrorRule{}, ErrNotFound
+	}
+	if patch.Percent != nil {
+		if *patch.Percent < 0 || *patch.Percent > 100 {
+			return MirrorRule{}, ErrInvalidMirrorPercent
+		}
+		r.Percent = *patch.Percent
+	}
+	if patch.Enabled != nil {
+		r.Enabled = *patch.Enabled
+	}
+	if patch.IncludeBody != nil {
+		r.IncludeBody = *patch.IncludeBody
+	}
+	if patch.RedactHeaders != nil {
+		r.RedactHeaders = *patch.RedactHeaders
+	}
+	r.UpdatedAt = time.Now().UTC()
+	m.mirrorRules[id] = r
+	return r, nil
+}
+
+// DeleteMirrorRule removes a rule. MemStore does not cascade to
+// mirror_invocation_results (the in-process map keeps rows around
+// until the next test teardown); the pgstore's ON DELETE CASCADE
+// handles production cleanup.
+func (m *MemStore) DeleteMirrorRule(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mirrorRules[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.mirrorRules, id)
+	return nil
+}
+
+// InsertMirrorResult appends one row to the mirror ledger. Best-
+// effort: the caller logs the error but doesn't roll back the
+// customer-facing response. MemStore does NOT enforce the schema
+// NOT NULLs (the caller must pass non-empty IDs / non-nil hashes
+// where the SQL column requires them).
+func (m *MemStore) InsertMirrorResult(_ context.Context, r MirrorInvocationResult) error {
+	if r.ID == "" {
+		r.ID = uuid.NewString()
+	}
+	if r.CompletedAt.IsZero() {
+		r.CompletedAt = time.Now().UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mirrorResults[r.ID] = r
+	return nil
+}
+
+// ListMirrorResults returns up to `limit` rows for a rule with
+// completed_at >= `since`, ordered DESC. limit <= 0 means "no
+// cap" (matches the same contract ListDeploymentsForApp uses).
+func (m *MemStore) ListMirrorResults(_ context.Context, ruleID string, since time.Time, limit int) ([]MirrorInvocationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []MirrorInvocationResult
+	for _, r := range m.mirrorResults {
+		if r.MirrorRuleID != ruleID {
+			continue
+		}
+		// Boundary is INCLUSIVE (>=). Matches the PgStore SQL
+		// `completed_at >= $2` clause and the docstring contract
+		// on Store.ListMirrorResults. An operator polling with a
+		// previous row's CompletedAt as the new `since` must see
+		// that boundary row, not drop it.
+		if !r.CompletedAt.Before(since) {
+			out = append(out, r)
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		return out[a].CompletedAt.After(out[b].CompletedAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// MirrorSummary aggregates the rows in the same window via Go-side
+// iteration. The pgstore uses SQL aggregates (COUNT/SUM/AVG/
+// p99_cont) — both stores return the same shape so the apid
+// handler can render either.
+func (m *MemStore) MirrorSummary(_ context.Context, ruleID string, since time.Time) (MirrorSummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var s MirrorSummary
+	var latencyDiffs []int
+	for _, r := range m.mirrorResults {
+		if r.MirrorRuleID != ruleID {
+			continue
+		}
+		if r.CompletedAt.Before(since) {
+			continue
+		}
+		s.TotalInvocations++
+		if r.StatusDiff {
+			s.StatusDiffCount++
+		}
+		if r.SchemaDiff {
+			s.SchemaDiffCount++
+		}
+		if r.BodyDiff {
+			s.BodyDiffCount++
+		}
+		if r.Crashed {
+			s.CrashCount++
+		}
+		if r.LatencyMs > 0 && r.SourceLatencyMs > 0 {
+			latencyDiffs = append(latencyDiffs, r.LatencyMs-r.SourceLatencyMs)
+		}
+	}
+	if len(latencyDiffs) > 0 {
+		var sum int
+		for _, d := range latencyDiffs {
+			sum += d
+		}
+		s.MeanLatencyDiffMs = sum / len(latencyDiffs)
+		// p99 ≈ last element after sort (small N; for production
+		// the pgstore uses percentile_cont).
+		sort.Ints(latencyDiffs)
+		p99Idx := len(latencyDiffs) * 99 / 100
+		if p99Idx >= len(latencyDiffs) {
+			p99Idx = len(latencyDiffs) - 1
+		}
+		s.P99LatencyDiffMs = latencyDiffs[p99Idx]
+	}
+	return s, nil
 }

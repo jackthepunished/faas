@@ -13,6 +13,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// wakeBootTrigger* mirror sched.TriggerFloor / TriggerFloorDep
+// (ADR-123). Defined locally to avoid the floor → sched import
+// cycle (see AdmitResult below). The string values are the canonical
+// wake-boot trigger enum entries and must stay in lockstep with
+// pkg/sched/triggers.go.
+const (
+	wakeBootTriggerFloor    = "floor"
+	wakeBootTriggerFloorDep = "floor.deployment"
+)
+
 // AdmitResult is the typed wake-subset the trigger needs from the
 // engine. Mirrors sched.WakeResult's AtCapacity / InstanceID fields
 // without importing the sched package (which would create a cycle:
@@ -121,16 +131,19 @@ type Ledger interface {
 type Engine interface {
 	// AdmitInstance / AdmitInstanceForDeployment (PR-B / issue #272):
 	// scope is the preview scope (`pr-{N}`) forwarded to the
-	// underlying sched.Engine. Empty = prod (legacy).
-	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
-	AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (AdmitResult, error)
+	// underlying sched.Engine. Empty = prod (legacy). trigger
+	// (ADR-127) is the wake-boot trigger enum value stamped on the
+	// emitted wake.boot_started / wake.boot_completed events.
+	AdmitInstance(ctx context.Context, appID, scope, trigger string) (AdmitResult, error)
+	AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope, trigger string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. The trigger
 	// routes through this so a floor tick racing the gateway, cron,
 	// scaleup, or targets triggers on the same parked app coalesces
 	// into one virtual boot. The WakeOutcome is the trigger's local
 	// projection of sched.CoordOutcome (kept in this package so we
 	// don't import pkg/sched from pkg/sched/floor — would be a cycle).
-	EnsureWake(ctx context.Context, appID string) (WakeOutcome, error)
+	// trigger (ADR-127) is forwarded to the leader's Engine.Wake call.
+	EnsureWake(ctx context.Context, appID, trigger string) (WakeOutcome, error)
 }
 
 // Auditor is the seam the trigger uses to emit `floor.wake` audit
@@ -522,7 +535,7 @@ func (t *Trigger) tickPerDeployment(ctx context.Context) error {
 		if !decision.AdmitNow {
 			continue
 		}
-		result, err := t.engine.AdmitInstanceForDeployment(ctx, d.AppID, d.ID, "")
+		result, err := t.engine.AdmitInstanceForDeployment(ctx, d.AppID, d.ID, "", wakeBootTriggerFloorDep)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -637,7 +650,7 @@ func (t *Trigger) tickPerApp(ctx context.Context) error {
 		if !decision.AdmitNow {
 			continue
 		}
-		result, err := t.engine.EnsureWake(ctx, app.ID)
+		result, err := t.engine.EnsureWake(ctx, app.ID, wakeBootTriggerFloor)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err

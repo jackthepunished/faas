@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -345,6 +346,7 @@ func (t *Tarball) Extract(root string) error {
 	}
 	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
+	allowedEntries := trustedArchiveEntries(t.Manifest)
 
 	for {
 		hdr, err := tr.Next()
@@ -366,42 +368,79 @@ func (t *Tarball) Extract(root string) error {
 			// attacker-sized metadata payload into io.Discard here.
 			continue
 		}
-		// Sanitise at the loop head so the unsanitised
-		// hdr.Name is NEVER referenced past this point —
-		// CodeQL's go/zipslip sink stops at the regex match
-		// inside safeArchiveEntryName. After the helper
-		// returns successfully, only `safe` (the returned
-		// string) is used in any filepath.Join or
-		// os.WriteFile call, severing the taint flow that
-		// the previous version left open.
-		safe, sErr := SafeArchiveEntryName(hdr.Name)
-		if sErr != nil {
-			return fmt.Errorf("%w: %w", ErrTarballTampered, sErr)
+		// Never use the archive-controlled name as a filesystem path. The
+		// manifest has already been validated against the fixed daemon,
+		// support-binary, and runtime-asset catalogs; use only the matching
+		// trusted value from that allowlist. This also rejects traversal,
+		// absolute, symlink-shaped, and otherwise unexpected entries before
+		// filepath.Join or any write operation.
+		safe, ok := allowedEntries[hdr.Name]
+		if !ok {
+			return fmt.Errorf("%w: unexpected archive entry %q", ErrTarballTampered, hdr.Name)
 		}
-		// Post-join containment defence: even a sanitised
-		// basename could escape bin/ if the bin dir is a
-		// symlink itself. EvalSymlinks + filepath.Rel
-		// guarantees outReal stays inside binReal.
+		// Post-join containment defence: reject a pre-existing
+		// symlinked bin directory and ensure every nested parent
+		// resolves to the intended release tree before writing.
+		binInfo, lstatErr := os.Lstat(bin)
+		if lstatErr != nil {
+			return fmt.Errorf("releaseinstall: lstat bin: %w", lstatErr)
+		}
+		if binInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: bin directory is a symlink", ErrTarballTampered)
+		}
 		binReal, evalErr := filepath.EvalSymlinks(bin)
 		if evalErr != nil {
 			return fmt.Errorf("releaseinstall: eval bin symlinks: %w", evalErr)
-		}
-		outReal := filepath.Join(binReal, safe)
-		rel, relErr := filepath.Rel(binReal, outReal)
-		if relErr != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-			return fmt.Errorf("%w: tarball entry %q escapes bin dir (%s)",
-				ErrTarballTampered, hdr.Name, rel)
 		}
 		body, err := io.ReadAll(tr)
 		if err != nil {
 			return fmt.Errorf("releaseinstall: extract read %s: %w", hdr.Name, err)
 		}
-		outPath := filepath.Join(bin, safe)
+		outPath := filepath.Join(bin, filepath.FromSlash(safe))
+		parent := filepath.Dir(outPath)
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return fmt.Errorf("releaseinstall: extract mkdir %s: %w", parent, err)
+		}
+		parentReal, evalErr := filepath.EvalSymlinks(parent)
+		if evalErr != nil {
+			return fmt.Errorf("releaseinstall: eval extract parent: %w", evalErr)
+		}
+		expectedParent := filepath.Join(binReal, filepath.Dir(filepath.FromSlash(safe)))
+		if parentReal != filepath.Clean(expectedParent) {
+			return fmt.Errorf("%w: tarball entry %q escapes bin dir (%s)",
+				ErrTarballTampered, hdr.Name, parentReal)
+		}
+		if info, err := os.Lstat(outPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: tarball entry %q targets a symlink", ErrTarballTampered, hdr.Name)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("releaseinstall: lstat extract path %s: %w", outPath, err)
+		}
 		if err := os.WriteFile(outPath, body, 0o755); err != nil {
 			return fmt.Errorf("releaseinstall: extract write %s: %w", outPath, err)
 		}
 	}
 	return nil
+}
+
+// trustedArchiveEntries returns the only archive names Extract may write.
+// Values are copied from the validated release catalog and manifest rather
+// than from tar headers, so the archive cannot taint a filesystem path even
+// when it contains an unexpected or malicious entry name.
+func trustedArchiveEntries(m Manifest) map[string]string {
+	entries := make(map[string]string, len(m.DaemonHashes)+len(m.ToolHashes)+len(m.AssetHashes)+len(manifest.SortedHostKeys()))
+	for _, logical := range manifest.SortedHostKeys() {
+		entries[logical] = logical
+		if canonical := executableName(logical); canonical != logical {
+			entries[canonical] = canonical
+		}
+	}
+	for name := range m.ToolHashes {
+		entries[name] = name
+	}
+	for name := range m.AssetHashes {
+		entries[name] = name
+	}
+	return entries
 }
 
 // ReadManifest re-loads the per-release manifest at
@@ -446,32 +485,27 @@ func (t *Tarball) Signature() string {
 	return t.Manifest.Signature
 }
 
-// SafeArchiveEntryName validates a tar.Header.Name and returns a
-// path-safe basename. The returned string is the ONLY value the
-// caller may pass to filepath.Join / os.WriteFile.
+// SafeArchiveRelativeName validates a tar.Header.Name and returns a
+// path-safe, slash-separated relative path. The returned string is
+// the ONLY value the caller may pass to filepath.Join / os.WriteFile.
 //
 // CodeQL (go/zipslip, CWE-22) recognises the explicit string-prefix
 // + substring guards below as taint barriers: the data flow from
 // hdr.Name to a filesystem sink is severed at this function's
-// return value. Returning `base` only when every guard passes
+// return value. Returning `clean` only when every guard passes
 // (and returning an error otherwise) is the canonical CodeQL
-// "sanitize-then-use" pattern — the older version of this code
-// performed the same checks inline but the data flow still
-// reached the sink because Go's filepath.Base is not a
-// recognised sanitizer.
+// "sanitize-then-use" pattern.
 //
 // Rules (defence in depth, all must pass):
 //
 //  1. Name is non-empty.
 //  2. Name does not start with '/' or a Windows drive letter.
 //  3. Name contains no parent-traversal segment ("..").
-//  4. filepath.Base(Name) yields a non-empty, non-root string.
+//  4. The cleaned path is non-empty, non-root, and relative.
 //
-// Exported (rather than unexported) so callers building canary-side
-// tar validators can reuse the same CodeQL-recognised barrier; the
-// helper is the documented public seam for "give me a tar header
-// name that's safe to feed to filepath.Join".
-func SafeArchiveEntryName(name string) (string, error) {
+// Exported so callers building canary-side tar validators can reuse
+// the same CodeQL-recognised barrier.
+func SafeArchiveRelativeName(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("archive entry has empty name")
 	}
@@ -481,9 +515,7 @@ func SafeArchiveEntryName(name string) (string, error) {
 	// resolve to absolute on Windows even though filepath.Base
 	// silently strips them on Linux/macOS).
 	if strings.HasPrefix(name, "/") ||
-		strings.HasPrefix(name, `\`) ||
-		strings.HasPrefix(name, "..") ||
-		strings.Contains(name, "..") ||
+		strings.Contains(name, `\`) ||
 		// Windows drive letter: a single ASCII letter followed
 		// by ':'. CodeQL's go/zipslip flags this pattern on
 		// cross-platform analysis; the regex is the
@@ -492,7 +524,28 @@ func SafeArchiveEntryName(name string) (string, error) {
 			((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z'))) {
 		return "", fmt.Errorf("archive entry %q contains path-traversal segment", name)
 	}
-	base := filepath.Base(name)
+	clean := path.Clean(name)
+	if clean == "." || clean == "" || path.IsAbs(clean) {
+		return "", fmt.Errorf("archive entry %q has unsafe relative path", name)
+	}
+	for _, segment := range strings.Split(clean, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("archive entry %q contains path-traversal segment", name)
+		}
+	}
+	return clean, nil
+}
+
+// SafeArchiveEntryName is the legacy basename-only view of
+// SafeArchiveRelativeName. Keep it for callers that only accept flat
+// catalog names; extraction uses SafeArchiveRelativeName so nested runtime
+// assets retain their directory structure.
+func SafeArchiveEntryName(name string) (string, error) {
+	relative, err := SafeArchiveRelativeName(name)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(filepath.FromSlash(relative))
 	if base == "." || base == "/" || base == `\` || base == "" {
 		return "", fmt.Errorf("archive entry %q has unsafe basename", name)
 	}

@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // dashboardAccountPath is the route served by renderAccount below.
@@ -81,6 +82,14 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// callback redirects here with ?install=…&branch=….
 			// ADR-116 documents the trust-root split.
 			s.renderAppNew(w, r, log, acct)
+		case path == "/dashboard/previews":
+			// Mega-C PR-1 / issue #961 leaf 3: global previews
+			// page. Every preview across the account, with a
+			// "Tear down" link that POSTs to the new
+			// /v1/preview/{slug}/destroy endpoint (via the
+			// dashboard's CSRF envelope — wired in a follow-up
+			// commit if/when the form gets JS).
+			s.renderPreviewsList(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
 			// Per-deploy drill-down (issue #464 / ADR-075):
@@ -102,6 +111,17 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// renderDomainDoctor.
 			if dslug, domain, ok := parseDomainDoctorPath(slug); ok {
 				s.renderDomainDoctor(w, r, log, acct, dslug, domain)
+				return
+			}
+			// PR-A (ADR-123 follow-on) — per-app wake timeline
+			// drill-down. /dashboard/apps/{slug}/wake-timeline
+			// renders a 24h trigger-histogram + at-cap count
+			// summary card and a 50-row recent-wakes table
+			// mirroring the recent-wakes columns on app_detail.
+			// Falls through to renderAppDetail when the suffix
+			// doesn't match.
+			if tslug, ok := parseWakeTimelinePath(slug); ok {
+				s.renderAppWakeTimeline(w, r, log, acct, tslug)
 				return
 			}
 			s.renderAppDetail(w, r, log, acct, slug)
@@ -155,6 +175,32 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderOrgDetail(w, r, log, acct, slug)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
+		case len(path) > len("/dashboard/projects/") &&
+			path[:len("/dashboard/projects/")] == "/dashboard/projects/":
+			// ADR-124 affected-workloads preview. The dispatcher
+			// peeks the suffix to extract the slug; the preview
+			// template lives behind GET (form) only — the POST
+			// routes for this surface are registered directly in
+			// server.go (POST /preview, POST /preview/apply) so the
+			// multipart body is parsed by Go's stdlib rather than
+			// by a method-switch here.
+			slug := path[len("/dashboard/projects/"):]
+			// Only the bare slug + "/preview" subpath is GET-routed
+			// through this dispatcher; deeper paths fall through to
+			// 404 so a future /dashboard/projects/{slug}/audit
+			// landing gets a clean seam without colliding with
+			// /dashboard/projects/{slug}/preview/apply.
+			const previewSuffix = "/preview"
+			if slug == "" || !strings.HasSuffix(slug, previewSuffix) {
+				http.NotFound(w, r)
+				return
+			}
+			pslug := strings.TrimSuffix(slug, previewSuffix)
+			if pslug == "" || !previewSlugOK(pslug) {
+				http.NotFound(w, r)
+				return
+			}
+			s.renderProjectPreview(w, r, log, acct, pslug)
 		default:
 			http.NotFound(w, r)
 		}
@@ -457,6 +503,24 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		log.Warn("dashboard renderAppDetail: list recent instances", "account_id", acct.ID, "app_id", app.ID, "err", err)
 		recentInstances = nil
 	}
+	// ADR-123: batched lookup of the wake-boot telemetry for every
+	// recent wake_id in one SQL round-trip (uses events_wake_id_idx).
+	// Failure is non-fatal — pre-ADR-123 fleet or a transient Postgres
+	// blip on the events table just leaves the new columns blank.
+	wakeIDs := make([]string, 0, len(recentInstances))
+	for _, ins := range recentInstances {
+		if ins.WakeID != "" {
+			wakeIDs = append(wakeIDs, ins.WakeID)
+		}
+	}
+	bootMetas := make(map[string]state.WakeBootMeta)
+	if len(wakeIDs) > 0 {
+		if m, err := s.store.LookupBootStartedForWakes(ctx, wakeIDs); err == nil {
+			bootMetas = m
+		} else {
+			log.Warn("dashboard renderAppDetail: lookup boot started", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		}
+	}
 	recentItems := make([]dashboard.RecentInstanceItem, 0, len(recentInstances))
 	for _, ins := range recentInstances {
 		item := dashboard.RecentInstanceItem{
@@ -469,6 +533,23 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		}
 		if !ins.LastRequestAt.IsZero() {
 			item.LastRequestAt = ins.LastRequestAt.UTC().Format(time.RFC3339)
+		}
+		// ADR-123 + PR-A: stamp trigger / queued_count /
+		// concurrency_at_admit / at_capacity / ready_in_ms from the
+		// wake.boot_started (+ boot_completed, for ready_in_ms) event
+		// rows. Pre-ADR-123 rows have no event row, so the fields stay
+		// zero/empty — the template renders an em-dash in that case
+		// (existing convention). For at_capacity and ready_in_ms
+		// specifically: pre-PR-A rows still lack the at_capacity field
+		// on the boot_started jsonb; pgstore.LookupBootStartedForWakes
+		// defaults to (false, 0) via COALESCE.
+		if meta, ok := bootMetas[ins.WakeID]; ok {
+			item.Trigger = meta.Trigger
+			item.QueuedCount = meta.QueuedCount
+			item.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
+			item.AtCapacity = meta.AtCapacity
+			item.AtCapacityPresent = meta.AtCapacityPresent
+			item.ReadyInMS = meta.ReadyInMS
 		}
 		recentItems = append(recentItems, item)
 	}
@@ -1794,6 +1875,51 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 	} else if stagePayload.BodyHTML != "" {
 		data.Stages = &stagePayload
 	}
+	// C4 (ADR-117 §Production-ready follow-on): mint a retry-form
+	// CSRF token + flip CanRetry on failed rows that have a known
+	// failing stage in the stage_state jsonb. The token is the
+	// sealed envelope (action="retry_deployment", account_id)
+	// pattern shared with dashboardDelete / dashboardFireCron —
+	// never the bare cookie. When CanRetry is false the template
+	// omits the form entirely; the token stays on the data struct
+	// regardless so a future "expand to all" change requires only
+	// the template gate, not a render path change.
+	if dep.Status == state.DeployFailed {
+		if from := failedStageFromJSON(dep.StageState); from != "" {
+			data.RetryFromStage = from
+			tok, terr := middleware.IssueForAuthenticated(s.sessions, dashboardRetryDeploymentAction, acct.ID)
+			if terr != nil {
+				// Code-review finding #6: a failed mint means the
+				// faas_csrf sidecar can't be set, which means the
+				// matching form POST would be silently rejected
+				// (VerifyAuthenticated returns ErrCSRFInvalid and
+				// the dashboard flash surfaces a generic error).
+				// Rather than render a form that can't submit,
+				// suppress CanRetry so the template omits the form
+				// entirely. Log loudly so the operator sees the
+				// underlying seal failure.
+				log.Warn("dashboard: mint retry CSRF failed; suppressing retry form", "deployment_id", dep.ID, "err", terr)
+			} else {
+				data.CanRetry = true
+				data.DeploymentRetryCSRF = tok
+				// Set the matching faas_csrf sidecar so the form
+				// POST finds the same envelope. Without this the
+				// POST handler's VerifyAuthenticated step fails
+				// with ErrCSRFInvalid and the form submit is
+				// rejected. Same pattern as renderAccount's
+				// delete/restore envelopes (see handlers_dashboard.go:1089).
+				http.SetCookie(w, &http.Cookie{
+					Name:     middleware.CookieNameAuthenticated,
+					Value:    tok,
+					Path:     "/",
+					HttpOnly: true,
+					Secure:   s.domain != "",
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+				})
+			}
+		}
+	}
 
 	nonce := httpsec.NonceFromContext(r.Context())
 	page := dashboard.Page{
@@ -1845,11 +1971,33 @@ func dashboardStagePayload(d state.Deployment) (dashboard.StagePayload, error) {
 		// pointer at the template level and omits the section.
 		return dashboard.StagePayload{}, nil
 	}
-	return dashboard.StagePayload{
+	payload := dashboard.StagePayload{
 		BodyHTML:   html,
 		Status:     status,
 		TerminalAt: terminalAt,
-	}, nil
+	}
+	// Failure decoration (ADR-117 §Production-ready follow-on, C4):
+	// when the row's status is "failed" AND ErrorCode is in the
+	// CodeStage* set, lift the whycopy prose via Decorate so the
+	// template can inline the cluster-A `.error-explanation` block.
+	// The code → title/hint/why/fix mapping lives in pkg/whycopy
+	// (decorated against an *api.Problem stub; the customer-facing
+	// copy comes from the catalog row, not the row's raw reason).
+	if status == string(state.DeployFailed) && d.ErrorCode != "" {
+		problem := &api.Problem{}
+		if decorated := whycopy.Decorate(problem, d.ErrorCode, nil); decorated != nil {
+			if decorated.Title != "" || decorated.Hint != "" ||
+				decorated.Why != "" || decorated.Fix != "" {
+				payload.FailureExplanation = &dashboard.StageFailureExplanation{
+					Title: decorated.Title,
+					Hint:  decorated.Hint,
+					Why:   decorated.Why,
+					Fix:   decorated.Fix,
+				}
+			}
+		}
+	}
+	return payload, nil
 }
 
 // dashboardStageTerminalAt picks the footer timestamp for the
@@ -2263,6 +2411,178 @@ func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log 
 	page := dashboard.Page{
 		Title:   "Doctor — " + domain,
 		Body:    "domain_doctor",
+		Account: dashboardAccountView(acct, 0),
+		Data:    view,
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// parseWakeTimelinePath (PR-A / ADR-123 follow-on) splits a
+// /dashboard/apps/{slug}/... suffix into (slug, ok) when the suffix
+// matches /wake-timeline exactly. Returns ok=false when the suffix
+// doesn't match — caller falls through to renderAppDetail. Mirrors
+// parseDomainDoctorPath at :2108 (prefix match + exact-tail match).
+// The exact-tail match posture is intentional — a future sub-tab
+// (/wake-timeline/{day|trigger|state}) would land with its own
+// parser without disturbing this one.
+func parseWakeTimelinePath(rest string) (string, bool) {
+	const tail = "/wake-timeline"
+	idx := strings.Index(rest, tail)
+	if idx < 0 {
+		return "", false
+	}
+	after := rest[idx+len(tail):]
+	if after != "" {
+		// Sub-tab shape (/wake-timeline/{tab}) — leave for a
+		// sibling dispatcher to claim when one lands.
+		return "", false
+	}
+	slug := rest[:idx]
+	if slug == "" || strings.Contains(slug, "/") {
+		return "", false
+	}
+	return slug, true
+}
+
+// renderAppWakeTimeline (PR-A / ADR-123 follow-on) renders
+// /dashboard/apps/{slug}/wake-timeline — the per-app wake-narrative
+// drill-down. Composed of three blocks:
+//
+//  1. Page header (app name + slug + back-link to app detail).
+//  2. 24h summary card: total wakes + trigger histogram +
+//     at-cap count + at-cap pct. All aggregation happens at the
+//     handler edge so the template stays FuncMap-free (the
+//     stages pattern).
+//  3. Recent wakes table (up to 50 rows) — the same column
+//     set the app-detail recent-wakes table exposes, with
+//     AtCapacity + ReadyInMS added by PR-A. Rows with no
+//     matching wake.boot_started event (pre-ADR-123 fleet)
+//     still appear; the view renders em-dash for missing
+//     fields per the existing convention.
+//
+// IDOR posture mirrors renderDomainDoctor / renderDeploymentDetail:
+// AppBySlug + AccountID rejection first, then render. Falls through
+// to http.NotFound on a cross-tenant probe.
+func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug string) {
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return
+	}
+	// Recent wakes for this app: capped at 50 (vs 10 on
+	// app_detail) since the per-app page is the dedicated
+	// wake-narrative surface. Bounded at the SQL layer
+	// (LIMIT 50 in ListLatestInstancesForApp) so a long-lived
+	// app never pulls its full history on every dashboard
+	// render. Failure is non-fatal — the section silently
+	// renders empty.
+	instances, err := s.store.ListLatestInstancesForApp(ctx, app.ID, 50)
+	if err != nil {
+		log.Warn("dashboard renderAppWakeTimeline: list recent instances", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		instances = nil
+	}
+	// Batched lookup of the wake-boot telemetry for every wake_id
+	// in one SQL round-trip (uses events_wake_id_idx). Failure
+	// is non-fatal — pre-ADR-123 fleet or a transient Postgres
+	// blip on the events table leaves the new columns blank
+	// (em-dash at the view layer).
+	wakeIDs := make([]string, 0, len(instances))
+	for _, ins := range instances {
+		if ins.WakeID != "" {
+			wakeIDs = append(wakeIDs, ins.WakeID)
+		}
+	}
+	bootMetas := make(map[string]state.WakeBootMeta)
+	if len(wakeIDs) > 0 {
+		if m, err := s.store.LookupBootStartedForWakes(ctx, wakeIDs); err == nil {
+			bootMetas = m
+		} else {
+			log.Warn("dashboard renderAppWakeTimeline: lookup boot started", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		}
+	}
+	// 24h summary card. TriggerHistogram is built from the
+	// wake.boot_started metas of the rows returned (which are
+	// the 50 most-recent instance rows — a 24h upper bound
+	// for any sane customer workload; the dashboard never
+	// claims "true" 24h since it would need a separate SQL
+	// scan). AtCapacityCount mirrors that scope. Documented
+	// on the template: "the 50 most recent wakes (≤24h for
+	// any sane workload)".
+	//
+	// PR-A review cluster (PR #1031 finding #5): the histogram
+	// and at-cap% previously diverged from wakeCount24h because
+	// they only counted rows where hasMeta was true AND the
+	// field was non-zero. A customer reading "24 wakes" and a
+	// histogram totaling 20 was left wondering where the other
+	// 4 went. The fix: track wakeCountWithMeta as the
+	// denominator for the at-cap% and label the histogram
+	// header so the customer understands "of N known wakes".
+	// The body table still renders all 24h rows so the per-row
+	// audit trail isn't lossy.
+	triggerHist := make(map[string]int)
+	atCapCount := 0
+	wakeCountWithMeta := 0
+	rows := make([]views.WakeTimelineRow, 0, len(instances))
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, ins := range instances {
+		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
+			// Instances are returned in DESC order so the
+			// moment we see one before the cutoff we can
+			// break — no further iteration needed. The
+			// prior continue-only implementation walked
+			// the full slice even after every row was
+			// older than the cutoff (PR-A review
+			// finding #4 — comment promised a break but
+			// the code didn't deliver it).
+			break
+		}
+		meta, hasMeta := bootMetas[ins.WakeID]
+		row := views.WakeTimelineRow{
+			Kind:  "wake.boot_started",
+			State: ins.State,
+		}
+		if !ins.StartedAt.IsZero() {
+			row.At = ins.StartedAt.UTC().Format(time.RFC3339)
+		}
+		if hasMeta {
+			wakeCountWithMeta++
+			row.Trigger = meta.Trigger
+			row.QueuedCount = meta.QueuedCount
+			row.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
+			row.AtCapacity = meta.AtCapacity
+			row.AtCapacityPresent = meta.AtCapacityPresent
+			row.ReadyInMS = meta.ReadyInMS
+			if meta.Trigger != "" {
+				triggerHist[meta.Trigger]++
+			}
+			if meta.AtCapacityPresent && meta.AtCapacity {
+				atCapCount++
+			}
+		}
+		rows = append(rows, row)
+	}
+	wakeCount24h := len(rows)
+	atCapPct := 0.0
+	if wakeCountWithMeta > 0 {
+		atCapPct = float64(atCapCount) / float64(wakeCountWithMeta) * 100
+	}
+	view := dashboard.WakeTimelinePageData{
+		App: dashboard.AppListItem{
+			Slug: app.Slug,
+		},
+		WakeCount24h:         wakeCount24h,
+		WakeCountWithMeta:    wakeCountWithMeta,
+		AtCapacityCount:      atCapCount,
+		AtCapacityPct:        atCapPct,
+		TriggerHistogramHTML: views.RenderTriggerHistogram(triggerHist),
+		RenderTable:          views.RenderWakeTimelineTable(rows),
+	}
+	page := dashboard.Page{
+		Title:   "Wake timeline — " + app.Slug,
+		Body:    "app_wake_timeline",
 		Account: dashboardAccountView(acct, 0),
 		Data:    view,
 	}

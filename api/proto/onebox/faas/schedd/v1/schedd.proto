@@ -354,6 +354,15 @@ message WakeRequest {
   // parent app's. Additive per ADR-016 — pre-PR-B callers omit
   // the field and observe the same wire behaviour as before.
   string scope = 3;
+  // trigger (ADR-127) is the wake-boot trigger enum value stamped
+  // on the emitted wake.boot_started / wake.boot_completed events
+  // (pkg/sched/triggers.go). gateway wires "gateway", cron handler
+  // wires "cron.schedule" or "cron.manual", the schedd-internal
+  // floor/scaleup/targets triggers wire their own constants.
+  // Empty = legacy Phase-1 fast path on an already-RUNNING instance
+  // (no new BootStarted row is emitted — the existing row's
+  // events.data.trigger is untouched). Additive per ADR-016.
+  string trigger = 4;
 }
 
 // WakeMethod reports whether the wake was a snapshot restore or a cold boot.
@@ -434,6 +443,9 @@ message AdmitInstanceRequest {
   // header. Empty = prod (legacy single-deployment behaviour).
   // See WakeRequest.scope for the full semantics.
   string scope = 3;
+  // trigger (ADR-127) mirrors WakeRequest.trigger. See that field
+  // for the closed-enum contract. Additive per ADR-016.
+  string trigger = 4;
 }
 
 // AdmitInstanceResponse is the typed result of Engine.AdmitInstance.
@@ -811,6 +823,11 @@ message ReportCapacityAck {
 // Additive per ADR-016.
 message EnsureWakeRequest {
   string app_id = 1;
+  // trigger (ADR-127) is forwarded to the leader's Engine.Wake
+  // call and stamped on the emitted wake.boot_started /
+  // wake.boot_completed events. See WakeRequest.trigger for the
+  // closed-enum contract. Additive per ADR-016.
+  string trigger = 2;
 }
 
 // EnsureWakeResponse (ADR-098) is the typed result of

@@ -26,9 +26,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,6 +271,247 @@ func TestHostAgeStatus_PrintsMissing(t *testing.T) {
 	}
 }
 
+// TestHostAgeStatus_JSON pins the --json shape. Mirrors the
+// PrintBothFingerprints test but pipes stdout so we can decode
+// the JSON and assert the field set. The field set is the
+// json_parity_test contract — adding/removing a field fires the
+// parity guard at the json_parity_test.go level, not here. This
+// test pins the per-leaf correctness (decodes cleanly, has the
+// expected decision booleans for the 2-file state).
+func TestHostAgeStatus_JSON(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
+	dir := t.TempDir()
+	if err := hostAgeInit(dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	// Pipe stdout to capture the JSON blob.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	rc := cmdHostAgeStatus([]string{"--dir", dir, "--json"})
+	_ = w.Close()
+	os.Stdout = origStdout
+
+	if rc != 0 {
+		t.Fatalf("cmdHostAgeStatus --json rc=%d, want 0", rc)
+	}
+	body := make([]byte, 8192)
+	n, _ := r.Read(body)
+	var rep hostAgeStatusReport
+	if jerr := json.Unmarshal(body[:n], &rep); jerr != nil {
+		t.Fatalf("decode status JSON: %v\nbody: %s", jerr, string(body[:n]))
+	}
+	if rep.Dir != dir {
+		t.Errorf("rep.Dir = %q, want %q", rep.Dir, dir)
+	}
+	if !rep.Current.Present {
+		t.Error("current file should be present post-init+rotate")
+	}
+	if !rep.Previous.Present {
+		t.Error("previous file should be present post-rotate")
+	}
+	if rep.Current.SHA256 == "" {
+		t.Error("current.sha256 must be populated (not zero-sentinel)")
+	}
+	if rep.Previous.SHA256 == "" {
+		t.Error("previous.sha256 must be populated (not zero-sentinel)")
+	}
+	// Post-rotate (just-now): overlap countdown is positive.
+	if rep.OverlapRemainingDays <= 0 {
+		t.Errorf("rep.OverlapRemainingDays = %d, want > 0 (just rotated)", rep.OverlapRemainingDays)
+	}
+}
+
+// TestHostAgeStatus_JSON_Missing pins the absent-file shape: both
+// present=false, overlap_remaining_days=0, prune_safe=false.
+// Catches the regression where the JSON path returns zero-valued
+// Sentinels (which would make a CI gate think prune is safe).
+func TestHostAgeStatus_JSON_Missing(t *testing.T) {
+	dir := t.TempDir()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	rc := cmdHostAgeStatus([]string{"--dir", dir, "--json"})
+	_ = w.Close()
+	os.Stdout = origStdout
+
+	if rc != 0 {
+		t.Fatalf("rc=%d, want 0", rc)
+	}
+	body := make([]byte, 8192)
+	n, _ := r.Read(body)
+	var rep hostAgeStatusReport
+	if jerr := json.Unmarshal(body[:n], &rep); jerr != nil {
+		t.Fatalf("decode: %v", jerr)
+	}
+	if rep.Current.Present || rep.Previous.Present {
+		t.Errorf("present flags should both be false on a fresh dir: current=%v previous=%v",
+			rep.Current.Present, rep.Previous.Present)
+	}
+	if rep.PruneSafe {
+		t.Error("PruneSafe must be false when no .previous file exists")
+	}
+}
+
+// TestHostAgePrune_DryRun pins the dry-run contract: a prune that
+// WOULD refuse on a too-recent .previous returns WouldApply=false
+// + exit 1 (matches the operator's eyeball on the human-readable
+// output) WITHOUT mutating on disk. The load-bearing detail is the
+// "without mutating" part: a regression that drops the --dry-run
+// gate strands the file and breaks the CI gate that depends on it.
+func TestHostAgePrune_DryRun_RefusesButDoesNotMutate(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
+	dir := t.TempDir()
+	if err := hostAgeInit(dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	prevPath := filepath.Join(dir, "host.age.previous")
+
+	// Just-rotated → .previous is ~0 days old → prune refuses.
+	rep := hostAgePruneTo(dir, defaultMinOverlapDays, false, false, true)
+	if rep.WouldApply {
+		t.Errorf("WouldApply=true on too-recent .previous; want false")
+	}
+	if rep.Applied {
+		t.Errorf("Applied=true under dry-run; want false")
+	}
+	if rep.Decision != "refused-too-recent" {
+		t.Errorf("Decision=%q, want 'refused-too-recent'", rep.Decision)
+	}
+	if _, err := os.Stat(prevPath); err != nil {
+		t.Errorf(".previous should still exist after dry-run refuse: stat err = %v", err)
+	}
+}
+
+// TestHostAgePrune_DryRun_AppliesBackdate pins the dry-run +
+// backdate path: a too-old .previous gets WouldApply=true +
+// Applied=false (dry-run), and the file is still on disk after.
+func TestHostAgePrune_DryRun_AppliesBackdate(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root")
+	}
+	dir := t.TempDir()
+	if err := hostAgeInit(dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	prevPath := filepath.Join(dir, "host.age.previous")
+	if err := os.Chtimes(prevPath, time.Now().Add(-31*24*time.Hour), time.Now().Add(-31*24*time.Hour)); err != nil {
+		t.Fatalf("chtimes 31d: %v", err)
+	}
+
+	rep := hostAgePruneTo(dir, defaultMinOverlapDays, false, false, true)
+	if !rep.WouldApply {
+		t.Errorf("WouldApply=false on backdated .previous; want true")
+	}
+	if rep.Applied {
+		t.Errorf("Applied=true under dry-run; want false")
+	}
+	if rep.Decision != "pruned" {
+		t.Errorf("Decision=%q, want 'pruned'", rep.Decision)
+	}
+	if _, err := os.Stat(prevPath); err != nil {
+		t.Errorf(".previous should still exist after dry-run: stat err = %v", err)
+	}
+}
+
+// TestHostAgePrune_DryRun_ActuallyMutates pins the dry-run=false
+// path: WouldApply=true AND Applied=true AND the file is gone.
+// Catches the "dry-run always on" regression where a CI gate
+// thinks it ran the prune but the production state never moved.
+func TestHostAgePrune_DryRun_ActuallyMutates(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root")
+	}
+	dir := t.TempDir()
+	if err := hostAgeInit(dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	prevPath := filepath.Join(dir, "host.age.previous")
+	if err := os.Chtimes(prevPath, time.Now().Add(-31*24*time.Hour), time.Now().Add(-31*24*time.Hour)); err != nil {
+		t.Fatalf("chtimes 31d: %v", err)
+	}
+
+	rep := hostAgePruneTo(dir, defaultMinOverlapDays, false, false, false)
+	if !rep.WouldApply || !rep.Applied {
+		t.Errorf("non-dry-run should set both WouldApply and Applied; got %+v", rep)
+	}
+	if _, err := os.Stat(prevPath); !os.IsNotExist(err) {
+		t.Errorf(".previous should be gone after non-dry-run prune: stat err = %v", err)
+	}
+}
+
+// TestHostAgePrune_JSON pins the prune --json shape. Runs the
+// leaf function so the JSON emit path is exercised end-to-end.
+// Exit-code contract: refused → 1, applied → 0 (so a CI gate
+// can `if prune_status --json ...; then ...`).
+func TestHostAgePrune_JSON(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root")
+	}
+	dir := t.TempDir()
+	if err := hostAgeInit(dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	rc := cmdHostAgePrunePrevious([]string{"--dir", dir, "--json", "--dry-run"})
+	_ = w.Close()
+	os.Stdout = origStdout
+
+	if rc != 1 { // just-rotated → refused
+		t.Errorf("rc=%d, want 1 (just-rotated is too recent)", rc)
+	}
+	body := make([]byte, 8192)
+	n, _ := r.Read(body)
+	var rep hostAgePruneReport
+	if jerr := json.Unmarshal(body[:n], &rep); jerr != nil {
+		t.Fatalf("decode: %v\nbody: %s", jerr, string(body[:n]))
+	}
+	if !rep.DryRun {
+		t.Error("rep.DryRun should be true (--dry-run passed)")
+	}
+	if rep.Decision != "refused-too-recent" {
+		t.Errorf("rep.Decision=%q, want 'refused-too-recent'", rep.Decision)
+	}
+	if rep.WouldApply || rep.Applied {
+		t.Errorf("applied/would_apply should be false on refused: %+v", rep)
+	}
+	if !rep.Previous.Present {
+		t.Error("previous file should be present (just rotated)")
+	}
+}
+
 // TestHostAgePrunePrevious_RefuseTooRecent pins the 30-day overlap
 // guard. A freshly-rotated .previous must NOT be prunable until
 // 30 days have passed; --force / --min-overlap-days are the
@@ -403,4 +646,103 @@ func TestHostAgeDispatch_UsageString(t *testing.T) {
 	// Pin the error message text — the operator-facing hint.
 	// (We don't pipe stderr; we just check rc=1 is the contract
 	// for unknown subcommands.)
+}
+
+// TestCmdHostAgeInit_InvalidFlag pins the flag.Parse error branch
+// of cmdHostAgeInit (commands_host_age.go:200-202) — exit 1 via
+// flag.ContinueOnError. No root required: the leaf is never called
+// because flag.Parse fails first.
+func TestCmdHostAgeInit_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgeInit([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgeInit(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgeInit_ExtraPositional pins the NArg != 0 branch
+// (commands_host_age.go:203-206) — exit 1 with a usage hint. No
+// root required: the positional check fires before hostAgeInit is
+// invoked.
+func TestCmdHostAgeInit_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgeInit([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgeInit(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgeInit stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdHostAgeRotate_InvalidFlag pins the flag.Parse error
+// branch of cmdHostAgeRotate (commands_host_age.go:263-265).
+func TestCmdHostAgeRotate_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgeRotate([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgeRotate(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgeRotate_ExtraPositional pins the NArg != 0 branch
+// (commands_host_age.go:266-269). No root required.
+func TestCmdHostAgeRotate_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgeRotate([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgeRotate(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgeRotate stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdHostAgePrunePrevious_InvalidFlag pins the flag.Parse
+// error branch of cmdHostAgePrunePrevious (commands_host_age.go).
+func TestCmdHostAgePrunePrevious_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgePrunePrevious([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgePrunePrevious(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgePrunePrevious_ExtraPositional pins the NArg != 0
+// branch of cmdHostAgePrunePrevious. No root required: the
+// positional check fires before the leaf is invoked, and prune
+// (unlike init) does not write 0400 root:root files.
+func TestCmdHostAgePrunePrevious_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgePrunePrevious([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgePrunePrevious(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgePrunePrevious stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// captureStderrHostAge is a file-local stderr capture helper. Mirrors
+// the precedent at commands_compute_nodes_test.go:63-79 but scoped
+// to this file (no shared testutil package — see commands_pki_test.go:46-51
+// comment for the rationale).
+func captureStderrHostAge(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	_ = w.Close()
+	var out []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			out = append(out, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = r.Close()
+	return string(out)
 }

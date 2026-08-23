@@ -188,6 +188,38 @@
         {{ .BodyHTML }}
       </section>
       {{ end }}
+      {{/* Stage failure decoration (ADR-117 §Production-ready
+          follow-on, C4). Pre-rendered by dashboardStagePayload
+          via pkg/whycopy.Decorate — fields are html-escaped
+          strings, so {{ }} inlining is XSS-safe without a
+          template.HTML cast. Mirror of the cluster-A
+          `.error-explanation` CSS in app_detail.html / the
+          generic Error* projection on DeploymentItem. */}}
+      {{ with .FailureExplanation }}
+      <div class="error-explanation" data-cluster="stage-failure-explanation">
+        {{ if .Title }}<p class="title">{{ .Title }}</p>{{ end }}
+        {{ if .Hint }}<p class="hint">{{ .Hint }}</p>{{ end }}
+        {{ if .Why }}<p class="why">{{ .Why }}</p>{{ end }}
+        {{ if .Fix }}<p class="fix">{{ .Fix }}</p>{{ end }}
+      </div>
+      {{ end }}
+      {{ end }}
+
+      {{/* Per-stage retry form (ADR-117 §Production-ready
+          follow-on, C4). The dashboard-side mirror of
+          POST /v1/deployments/{id}/retry — same CSRF sealed
+          envelope pattern as dashboardDelete / dashboardFireCron
+          (action="retry_deployment", account_id). Hidden input
+          drives the from_stage query param; the handler
+          re-validates against pkg/state.IsStageName so a
+          tampered form slips only to a redirect-with-flash.
+          Visible only when the deployment is failed AND a
+          failing stage is recoverable from the jsonb. */}}
+      {{ if .Data.CanRetry }}
+      <form method="POST" action="/dashboard/apps/{{ .Data.App.Slug }}/deployments/{{ .Data.Deployment.ID }}/retry?from={{ .Data.RetryFromStage }}" class="deploy-retry-form" data-cluster="deploy-retry-form">
+        <input type="hidden" name="csrf_token" value="{{ .Data.DeploymentRetryCSRF }}">
+        <button type="submit" class="btn retry">Retry from {{ .Data.RetryFromStage }}</button>
+      </form>
       {{ end }}
 
       <h2>Scan</h2>
