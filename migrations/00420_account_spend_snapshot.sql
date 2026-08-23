@@ -1,4 +1,4 @@
--- filename: 00416_account_spend_snapshot.sql
+-- filename: 00420_account_spend_snapshot.sql
 -- +goose Up
 -- +goose StatementBegin
 
