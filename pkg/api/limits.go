@@ -3949,7 +3949,7 @@ func (p Plan) AppProtocolAllowed(protocol string) bool {
 // writes when the customer omits AppProtocol on create. Universal
 // "http1" — no per-plan differentiation per the ADR. The closed-
 // set literal is also the canonical default declared at the column
-// level (NOT NULL DEFAULT 'http1' in migration 00378) so handlers
+// level (NOT NULL DEFAULT 'http1' in migration 00382) so handlers
 // can fall back to the SQL default rather than relying on this
 // constant for the empty-string case. Declared as a package
 // constant (not a Plan receiver method) because the value is

@@ -326,7 +326,7 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// PATCH round-trip; Free defaults to "http1" via the
 	// Plan.AppProtocolDefault() accessor (the only legal value
 	// on Free). The closed-set CHECK apps_app_protocol_chk
-	// (migration 00378) is the schema-level guard; the apid
+	// (migration 00382) is the schema-level guard; the apid
 	// gate is the customer-visible 403 surface that mirrors the
 	// PATCH-time gate (handlers_ext.go). Without the apid gate
 	// a Free customer's create request would silently land as

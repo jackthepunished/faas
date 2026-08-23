@@ -9,7 +9,7 @@
 // Free customers get 403 plan_app_protocol_grpc_not_allowed),
 // invalid-value rejection (400 app_protocol_invalid), and the
 // apps.app_protocol column + apps_app_protocol_chk CHECK
-// constraint (migration 00378). PR-B / G19 ships the bridge-side
+// constraint (migration 00382). PR-B / G19 ships the bridge-side
 // framing switch on top of this flag (out of scope here, filed
 // in spec §17 G19).
 //
@@ -156,7 +156,7 @@ func TestE2E_AppProtocol_HobbyPlanDefaultIsHTTP1(t *testing.T) {
 // (universal — both Hobby and Free permit http2) and the row
 // reflects the explicit value, not the default. This pins the
 // closed-set persistence path end-to-end (apid → sqlc → pgstore
-// → migration 00378 column → GET /v1/apps/{slug} response).
+// → migration 00382 column → GET /v1/apps/{slug} response).
 func TestE2E_AppProtocol_HobbyPlanPersistence(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
@@ -208,7 +208,7 @@ func TestE2E_AppProtocol_HobbyPlanPersistence(t *testing.T) {
 // validator emits 400 app_protocol_invalid with the structured
 // error envelope. This pin guards against anyone widening the
 // closed set silently — a regression here means the column's
-// CHECK constraint (migration 00378) is the only thing
+// CHECK constraint (migration 00382) is the only thing
 // preventing bogus values from landing on disk.
 //
 // Note: the test deliberately exercises PATCH (not POST) so
