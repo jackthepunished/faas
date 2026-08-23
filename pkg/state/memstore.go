@@ -194,7 +194,7 @@ type MemStore struct {
 	// method boundary so a cross-tenant read returns ErrNotFound
 	// (the same defence-in-depth as consumerKeys below).
 	openAPIDocs map[string]openAPIDocRow
-// openAPISnapshots mirrors deployment_openapi_snapshots
+	// openAPISnapshots mirrors deployment_openapi_snapshots
 	// (ADR-121, migration 00358). Keyed by deployment_id,
 	// mirroring the table's PK. PR-C's gate reads via
 	// LatestOpenAPISnapshotForScope (linear scan under m.mu)
@@ -4864,7 +4864,7 @@ func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string
 
 // ---------------------------------------------------------------------------
 // appOpenAPIImportRow is the in-memory row mirror of app_openapi_docs
-// (migrations/00409). The struct is unexported; the public surface
+// (migrations/00416). The struct is unexported; the public surface
 // is the four methods below — handler tests reach them through the
 // Store interface.
 // ---------------------------------------------------------------------------
@@ -4913,7 +4913,7 @@ func (m *MemStore) GetAppOpenAPIDoc(_ context.Context, appID, accountID string) 
 // enforce the IDOR floor so a future caller that bypasses the
 // handler — admin tool, test harness, internal API — cannot
 // write a row into a foreign tenant's app_id and then read it
-// back via GetAppOpenAPIDoc). FK CASCADE in migration 00409 makes
+// back via GetAppOpenAPIDoc). FK CASCADE in migration 00416 makes
 // the parent-existence check unreachable in practice but the
 // explicit check keeps the error surface predictable. Idempotent:
 // a re-delivered import overwrites the same row, not creates a

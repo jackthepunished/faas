@@ -203,10 +203,10 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/deployments/{deployment}/openapi":  "PatchAppsDeploymentOpenAPIDoc",  // manual upload; same store as cold-boot capture
 	"DELETE /v1/apps/{slug}/deployments/{deployment}/openapi": "DeleteAppsDeploymentOpenAPIDoc", // wipe the captured doc; re-captures on next cold boot
 	"GET /v1/apps/{slug}/env-diff":                            "GetAppEnvDiff",                  // ADR-117 PR-C: env vars + secrets × scopes matrix; matches operationId `getAppEnvDiff` (auto-derivation would produce `GetAppsSlugEnv-diff` because of the literal hyphen in the path segment — the explicit map drops the slug placeholder + the hyphen for Go SDK hygiene, mirroring the `GetAppMetrics` / `GetAppSLO` / `GetAppDataUpstream` precedent above)
-	"GET /v1/apps/{slug}/openapi":                             "GetAppOpenAPI",                 // issue #975 item #2 / ADR-126 — imported or auto-generated OpenAPI doc per app
-	"POST /v1/apps/{slug}/openapi":                            "ImportAppOpenAPI",              // manual upload (item #2 D2/D6); persists via UpsertAppOpenAPIDoc
-	"DELETE /v1/apps/{slug}/openapi":                          "DeleteAppOpenAPI",              // idempotent wipe of the imported doc (item #2 D5 emits pg_notify)
-	"POST /v1/apps/{slug}/openapi/dry-run":                    "DryRunAppOpenAPI",              // read-only edge-rule suggestions (item #2 D3)
+	"GET /v1/apps/{slug}/openapi":                             "GetAppOpenAPI",                  // issue #975 item #2 / ADR-126 — imported or auto-generated OpenAPI doc per app
+	"POST /v1/apps/{slug}/openapi":                            "ImportAppOpenAPI",               // manual upload (item #2 D2/D6); persists via UpsertAppOpenAPIDoc
+	"DELETE /v1/apps/{slug}/openapi":                          "DeleteAppOpenAPI",               // idempotent wipe of the imported doc (item #2 D5 emits pg_notify)
+	"POST /v1/apps/{slug}/openapi/dry-run":                    "DryRunAppOpenAPI",               // read-only edge-rule suggestions (item #2 D3)
 	"GET /v1/deployments/{id}":                                "GetDeployment",
 	"PATCH /v1/deployments/{id}":                              "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                                     "ListDeployments",

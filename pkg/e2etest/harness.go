@@ -626,16 +626,18 @@ const testDomain = "apps.test.example"
 // to 16 hex — the trustworthy value-equality discriminator for the
 // GET /v1/apps/{slug}/env-diff matrix). Slot rebump chain
 // 291 → 296 → 303 → 309 → 314 → 321 → 322 → 327 → 340 → 347 → 352 →
-// 356 → 357 → 387 → 410. Round 14 forced by open PRs claiming real
-// schemas at 00387 (PR #1036 compute_nodes_active_unique), 00388-00390
-// (PR #1036 instances_wake_attempt_active_unique / migration_notify /
-// cluster_signing_keys) and 00409 (PR #1049 openapi_import) — even
-// though slots_from_paths filters reservations, a real schema at
-// the same slot as my real would collide on main merge. Past 00409
-// is currently clear of real claims. Round 14 added 23 fences at
-// 00387-00409 (every gap slot) to bridge alphasort positions387-409
-// to versions 387-409; my real lands at position 410 = version 410.
-const e2eMigrationTarget = 410
+// 356 → 357 → 387 → 410 → 416. Round 15 forced by open PRs claiming
+// real schemas at 00387 (PR #1036 compute_nodes_active_unique),
+// 00388-00390 (PR #1036 instances_wake_attempt_active_unique /
+// migration_notify / cluster_signing_keys), 00409 (origin/main's
+// 00409_reserve_slot.sql fence from PR-C rebump), 00411-00412
+// (PR #1017 alert_presets, PR #1024 deployments_priority, PR #1064
+// deployment_audit), 00413-00415 (PR #1017 alert_presets), and 00416
+// (PR #1049 openapi_import rebump). Round 15 added 5 fences at
+// 00411-00415 to bridge alphasort positions 411-415; my real lands at
+// position 416 = version 416. Past 00416 is currently clear of real
+// claims.
+const e2eMigrationTarget = 416
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
