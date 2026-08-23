@@ -229,4 +229,3 @@ func TestGlyphConstants(t *testing.T) {
 		})
 	}
 }
-
