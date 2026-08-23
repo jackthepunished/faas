@@ -12121,13 +12121,13 @@ func (m *MemStore) RefreshCertExpiryStates(_ context.Context) (int, error) {
 			}
 		}
 		m.tenantSurfaceCertExpiryStates[ts.ID] = TenantSurfaceCertExpiryState{
-			TenantSurfaceID:         ts.ID,
-			AccountID:               ts.AccountID,
-			AppID:                   ts.AppID,
-			Hostname:                hostname,
+			TenantSurfaceID:          ts.ID,
+			AccountID:                ts.AccountID,
+			AppID:                    ts.AppID,
+			Hostname:                 hostname,
 			LastObservedCertNotAfter: notAfter,
-			LastWalkStatus:          status,
-			LastRefreshedAt:         now,
+			LastWalkStatus:           status,
+			LastRefreshedAt:          now,
 		}
 		n++
 	}
