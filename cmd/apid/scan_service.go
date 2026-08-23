@@ -116,8 +116,10 @@ type scanPlanResponse struct {
 	// enumerate the scan-workload existence against every non-deleted
 	// app in the account keyed by (RootDir, Name). Skipped is the
 	// operator --exclude subset of WillDeploy (Stage 4). Removed is
-	// populated only on the apply path from rec.Removed (the apps
-	// reconcile will SoftDeleteAppCascade). See
+	// the destructive subset reconcile will SoftDeleteAppCascade:
+	// preview stamps it from partition.Removed (project-scoped),
+	// apply stamps it from removedSlugs (the canonical reconcile
+	// engine result). The two paths must agree on the set; see
 	// computeAffectedPartition for the partition rule.
 	WillDeploy []api.PlanAffectedApp `json:"will_deploy,omitempty"`
 	Unaffected []api.PlanAffectedApp `json:"unaffected,omitempty"`
@@ -162,10 +164,15 @@ type workloadKey struct {
 // surface lives in api.PlanAffectedApp so the wire DTO can carry
 // Action + ID + ExistingRootDir.
 //
-// Removed is empty for preview (apply=false); the apply path
-// populates it from rec.Removed at the post-reconcile site. This
-// asymmetry is intentional: a preview that hard-predicts project
-// deletions is wrong on the first ever commit (no project yet).
+// Removed is the destructive subset reconcile will
+// SoftDeleteAppCascade on apply. Project-scoped (projectID parameter)
+// so a multi-project account doesn't see its other projects' apps
+// in the destructive preview. The preview and apply paths produce
+// the same Removed set because both honor (RootDir, Name) +
+// --exclude + project scope — pkg/reconcile.diff.workloadDiff is
+// the canonical implementation; computeAffectedPartition mirrors
+// it for the wire projection so the operator sees what will
+// actually be deleted before clicking Apply.
 type affectedPartition struct {
 	WillDeploy []api.PlanAffectedApp
 	Unaffected []api.PlanAffectedApp
@@ -173,6 +180,11 @@ type affectedPartition struct {
 	// Visible on the dashboard as "excluded by operator". Action
 	// is always "noop" — the apply path skips these entirely.
 	Skipped []api.PlanAffectedApp
+	// Removed is the destructive subset (project-scoped). Action
+	// vocabulary "remove" is not stamped here — the wire shape is
+	// []string per ADR-124 §1; the dashboard renders the same
+	// shape. See TestPlanResponse_RemovedShape for the pin.
+	Removed []string
 }
 
 // computeAffectedPartition partitions the post-`--only` filtered scan
@@ -194,12 +206,18 @@ type affectedPartition struct {
 //	"update" — scan workload, existing app matches (RootDir, Name).
 //	"noop"   — either (a) existing app, no scan workload, OR (b)
 //	           operator --exclude hit (Skipped, surfaced separately).
-//	"remove" — populated post-reconcile from rec.Removed (apply path).
+//	"remove" — surfaced on the Removed []string slice (preview and
+//	           apply paths agree on the set; see type comment above).
+//
+// projectID is the unique ID of the project being previewed. Empty
+// (brand-new project, not yet inserted) makes the Removed loop a
+// no-op because no existing app can have a matching ProjectID.
 func computeAffectedPartition(
 	filteredW []reposcan.Workload,
 	allScanWl []reposcan.Workload,
 	existingApps []state.App,
 	exclude map[string]bool,
+	projectID string,
 ) affectedPartition {
 	idx := make(map[workloadKey]state.App, len(existingApps))
 	for _, a := range existingApps {
@@ -260,10 +278,49 @@ func computeAffectedPartition(
 			ExistingRootDir: a.RootDir,
 		})
 	}
+	// Removed (ADR-124 PR-followup gap #1): the destructive subset
+	// reconcile will SoftDeleteAppCascade on apply. Three filters:
+	//
+	//  1. ProjectID == projectID — multi-project accounts must
+	//     not see their other projects' apps in the destructive
+	//     preview. Unaffected stays account-scoped (blast-radius
+	//     view); Removed is project-scoped (the destructive view).
+	//  2. (RootDir, WorkloadName) NOT in scanKeys — same-key apps
+	//     are matched (WillDeploy), not removed. Mirrors
+	//     pkg/reconcile.diff.workloadDiff:106-115 (the `removes`
+	//     loop).
+	//  3. WorkloadName NOT in exclude — operator wants this app
+	//     left alone, not soft-deleted. Without this filter, an
+	//     excluded existing app would silently appear in Removed
+	//     and be soft-deleted on apply despite the operator's
+	//     --exclude intent.
+	//
+	// Stable order (alphabetical) matches the CLI's
+	// printAffectedText sort and the dashboard's ApplyResult
+	// banner order, so all three surfaces render the same set
+	// the same way.
+	removed := make([]string, 0)
+	if projectID != "" {
+		for _, a := range existingApps {
+			if a.ProjectID != projectID {
+				continue
+			}
+			if exclude[strings.ToLower(a.WorkloadName)] {
+				continue
+			}
+			k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
+			if _, hit := scanKeys[k]; hit {
+				continue
+			}
+			removed = append(removed, a.Slug)
+		}
+		sort.Strings(removed)
+	}
 	return affectedPartition{
 		WillDeploy: will,
 		Unaffected: unaff,
 		Skipped:    skip,
+		Removed:    removed,
 	}
 }
 
@@ -653,7 +710,22 @@ func (s *server) scanService(
 		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
 			fmt.Sprintf("list account apps: %v", listErr))
 	}
-	partition := computeAffectedPartition(filteredW, result.Workloads, acctApps, req.Exclude)
+
+	// Load the project so the partition's Removed loop is project-
+	// scoped (matches what reconcile will SoftDeleteAppCascade).
+	// ErrNotFound is fine — brand-new project means no apps to
+	// remove and Removed is the empty slice. Other errors fail
+	// the scan (an unreadable project means the rest of the
+	// scan path's project-aware decisions would also be wrong).
+	var projectID string
+	if proj, projErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug); projErr == nil {
+		projectID = proj.ID
+	} else if !errors.Is(projErr, state.ErrNotFound) {
+		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
+			fmt.Sprintf("load project for partition: %v", projErr))
+	}
+
+	partition := computeAffectedPartition(filteredW, result.Workloads, acctApps, req.Exclude, projectID)
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
@@ -688,11 +760,15 @@ func (s *server) scanService(
 		// subset; Unaffected is every account app not in the scan keys;
 		// WillDeploy keeps reposcan's order so the i-alignment with
 		// respWorkloads (one row per post-`--only`/post-`--exclude`
-		// workload) is preserved. Removed is empty on preview (apply=false);
-		// the apply path populates it from removedSlugs.
+		// workload) is preserved. Removed is the destructive subset —
+		// populated from the partition on preview (project-scoped
+		// apps whose key isn't in the scan set), and from removedSlugs
+		// on apply (the canonical reconcile-engine result overrides
+		// the partition projection below at the apply-path tail).
 		WillDeploy: partition.WillDeploy,
 		Unaffected: partition.Unaffected,
 		Skipped:    partition.Skipped,
+		Removed:    partition.Removed,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
