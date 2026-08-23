@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -495,5 +496,89 @@ func TestHandleH2CStream_PanicRecovers(t *testing.T) {
 	}
 	if !strings.Contains(string(rw.body), "bridge panic") {
 		t.Errorf("body does not contain 'bridge panic' prefix; got %q", string(rw.body))
+	}
+}
+
+// TestHandleH2CStream_DeferRecoversPanicOnCallerGoroutine (ADR-127
+// §D2, Layer 9 — review-fix R4) pins the defer wiring inside
+// handleH2CStream itself, not just h2cRecoverPanic in isolation.
+// A previous version of TestHandleH2CStream_PanicRecovers only
+// exercised the helper directly: that test would still PASS if a
+// future refactor removed the defer from handleH2CStream (the
+// helper itself might still be load-bearing elsewhere).
+//
+// Why we don't inject via RoundTrip / DialTLSContext: x/net/http2's
+// dial (Transport.dialClientConn → dialCall.dial → Transport.dialTLS)
+// runs on a SEPARATE goroutine spawned by clientConnPool.
+// RoundTrip on the caller goroutine waits for that goroutine via
+// a request channel; a panic on the dial goroutine escapes the
+// process by default (it does NOT propagate to the caller's
+// defer). So a RoundTrip-injected panic cannot be caught by
+// handleH2CStream's defer — it would be a panic recovered nowhere.
+//
+// The defer does catch panics that originate on handleH2CStream's
+// OWN caller goroutine — between the `defer h2cRecoverPanic(w,
+// guestIP, guestPort)()` line and the close of handleH2CStream.
+// The setup paths (outboundReq construction, header propagation,
+// host fall-back) all run synchronously on the caller goroutine
+// and are reachable via the defer. The static-pin test below
+// asserts the defer is wired at the right line; the dynamic
+// test (TestHandleH2CStream_PanicRecovers) asserts the helper
+// works in isolation. Together they cover both ends of the
+// deferred-recover contract.
+func TestHandleH2CStream_DeferRecoversPanicOnCallerGoroutine(t *testing.T) {
+	// Static pin: the defer inside handleH2CStream that catches
+	// panics MUST appear between the start of the function (the
+	// ctx, cancel + helper vars) and any code that runs on the
+	// caller goroutine after the defer registration. The defer
+	// pattern is unique — a future refactor that drops it would
+	// render the bridge single-panic brittle (every per-instance
+	// reconnect on the bridge process restart path).
+	//
+	// Read the source file and assert the defer is present at a
+	// line within the handleH2CStream function body (line 152 to
+	// some line before the closing brace). The exact line number
+	// shifts under refactor; the assertion is "present somewhere
+	// inside handleH2CStream, BEFORE transport.RoundTrip is
+	// called, AFTER the ctx/deadline setup."
+	const src = "../../cmd/vmmd-stream-bridge/h2c_terminator.go"
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read source: %v (run from repo root)", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	inBody := false
+	deferLine := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "func handleH2CStream(") {
+			inBody = true
+			continue
+		}
+		if inBody && ln == "}" {
+			break
+		}
+		if inBody && strings.Contains(ln, "h2cRecoverPanic(w, guestIP, guestPort)()") {
+			deferLine = i + 1
+		}
+	}
+	if deferLine < 0 {
+		t.Fatalf("defer h2cRecoverPanic(w, guestIP, guestPort)() not found inside handleH2CStream body — ADR-127 §D2 wiring is gone")
+	}
+	// RoundTrip call site must come AFTER the defer line so the
+	// panic-recovery is wired before the call. Search for
+	// "transport.RoundTrip(outboundReq)" relative to deferLine.
+	// Window: defer at line 169 + ~80 lines of header propagation
+	// + outboundReq construction before the call at line 254 in
+	// the source today; allow up to 150 lines to be tolerant of
+	// future inline comments.
+	foundRoundTrip := false
+	for i := deferLine; i < len(lines) && i < deferLine+150; i++ {
+		if strings.Contains(lines[i], "transport.RoundTrip(outboundReq)") {
+			foundRoundTrip = true
+			break
+		}
+	}
+	if !foundRoundTrip {
+		t.Fatalf("transport.RoundTrip(outboundReq) not found within 150 lines after defer h2cRecoverPanic (line %d) — defer order is wrong", deferLine)
 	}
 }
