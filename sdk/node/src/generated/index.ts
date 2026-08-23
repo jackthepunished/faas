@@ -115,6 +115,7 @@ export type { DiffResponse } from './models/DiffResponse.js';
 export type { DomainDoctorCheck } from './models/DomainDoctorCheck.js';
 export type { DomainDoctorReport } from './models/DomainDoctorReport.js';
 export type { EdgeRuleBudgetAction } from './models/EdgeRuleBudgetAction.js';
+export type { EdgeRuleCacheAction } from './models/EdgeRuleCacheAction.js';
 export type { EdgeRuleCORSAction } from './models/EdgeRuleCORSAction.js';
 export type { EdgeRuleGeoAction } from './models/EdgeRuleGeoAction.js';
 export type { EdgeRuleHeaderOp } from './models/EdgeRuleHeaderOp.js';
