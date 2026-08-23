@@ -55,13 +55,14 @@
 -- EXISTS. No trigger (rows are walker-owned).
 
 CREATE TABLE IF NOT EXISTS meterd_tenant_surface_cert_expiry_state (
-    tenant_surface_id        uuid PRIMARY KEY REFERENCES tenant_surfaces(id) ON DELETE CASCADE,
+    tenant_surface_id        uuid NOT NULL REFERENCES tenant_surfaces(id) ON DELETE CASCADE,
     account_id               uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     app_id                   uuid NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
     hostname                 text NOT NULL,
     last_observed_cert_not_after timestamptz,
     last_walk_status         text NOT NULL DEFAULT 'ok',
     last_refreshed_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_surface_id, hostname),
     CONSTRAINT meterd_tenant_surface_cert_expiry_status_chk CHECK (
         last_walk_status IN ('ok', 'stale_parent', 'cert_unissued', 'error')
     )

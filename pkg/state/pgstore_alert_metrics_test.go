@@ -11,9 +11,10 @@
 //
 // These methods sit on the alert-evaluator hot path; the migration
 // floor (check-state-coverage ≥ 70%) requires them to be exercised
-// end-to-end against the schema. TestPg_CountFailedDeploymentsSince_*,
-// TestPg_WasInvokedSuccessfullySince_*, etc., each insert a fresh
-// fixture row tagged with the same UUIDs the methods filter on.
+// end-to-end against the schema. Each test inserts a fresh fixture
+// row tagged with the same UUIDs the methods filter on, against
+// the live tables (deployments, invocations, account_spend_snapshot,
+// tenant_surfaces + tenant_hostnames, meterd_tenant_surface_cert_expiry_state).
 package state_test
 
 import (
@@ -21,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -62,7 +64,9 @@ func TestPg_CountFailedDeploymentsSince_OnlyFailedCount(t *testing.T) {
 	acctID, appID := seedTestAccount(t, s, ctx, "fdep-count")
 
 	// One failed + one live + one pending in the last hour.
-	// Only the failed one must count.
+	// Only the failed one must count. deployments.status CHECK
+	// is {pending,building,imaging,snapshotting,live,failed,superseded}
+	// per migrations/00001_init.sql:52.
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, created_at)
 		values (gen_random_uuid(), $1, 'img@sha256:0', 'failed',  now() - interval '5 minutes'),
@@ -118,6 +122,8 @@ func TestPg_WasInvokedSuccessfullySince_TrueOnSuccess(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	acctID, appID := seedTestAccount(t, s, ctx, "wiss-true")
 
+	// invocations.source CHECK is {async_invoke,queue,delayed_task,cron};
+	// invocations.state CHECK is {pending,dispatching,completed,failed,cancelled}.
 	if _, err := pool.Exec(ctx, `
 		insert into invocations (id, account_id, app_id, source, state, created_at)
 		values (gen_random_uuid(), $1, $2, 'async_invoke', 'completed', now() - interval '5 minutes')`,
@@ -137,8 +143,12 @@ func TestPg_UpsertAccountSpendSnapshot_InsertAndUpsert(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	acctID, _ := seedTestAccount(t, s, ctx, "spend")
 
+	// account_spend_snapshot.source CHECK is
+	// {running_seconds,overage,build_seconds,snapshot_storage}
+	// per migrations/00407.
+	const src = "running_seconds"
 	now := time.Now().UTC()
-	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 12.5, 12345, "meterd"); err != nil {
+	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 12.5, 12345, src); err != nil {
 		t.Fatalf("UpsertAccountSpendSnapshot (insert): %v", err)
 	}
 	// Verify row landed.
@@ -152,7 +162,7 @@ func TestPg_UpsertAccountSpendSnapshot_InsertAndUpsert(t *testing.T) {
 
 	// ON CONFLICT (account_id, source, period_end) DO UPDATE —
 	// the same period_end with a fresh eur_cents must overwrite.
-	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 12.5, 99999, "meterd"); err != nil {
+	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 12.5, 99999, src); err != nil {
 		t.Fatalf("UpsertAccountSpendSnapshot (upsert): %v", err)
 	}
 	if err := pool.QueryRow(ctx, `select eur_cents from account_spend_snapshot where account_id = $1`, acctID).Scan(&eur); err != nil {
@@ -168,11 +178,13 @@ func TestPg_MTDSpendEurCents_SumsAcrossSources(t *testing.T) {
 	acctID, _ := seedTestAccount(t, s, ctx, "mtd")
 
 	now := time.Now().UTC()
-	// Two sources, two periods, both inside the MTD window.
-	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 1.0, 100, "meterd"); err != nil {
+	// Two closed-set sources, two periods, both inside the MTD
+	// window. The MTD aggregator walks SUM(eur_cents) across
+	// every source, so 'running_seconds' + 'overage' both count.
+	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(time.Minute), 1.0, 100, "running_seconds"); err != nil {
 		t.Fatalf("UpsertAccountSpendSnapshot (a): %v", err)
 	}
-	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(2*time.Minute), 2.0, 250, "manual"); err != nil {
+	if err := s.UpsertAccountSpendSnapshot(ctx, acctID, now, now.Add(2*time.Minute), 2.0, 250, "overage"); err != nil {
 		t.Fatalf("UpsertAccountSpendSnapshot (b): %v", err)
 	}
 	got, err := s.MTDSpendEurCents(ctx, acctID)
@@ -208,33 +220,55 @@ func TestPg_MinCertExpiryForApp_NoSurfacesReturnsMinusOne(t *testing.T) {
 	}
 }
 
-func TestPg_MinCertExpiryForApp_PicksMinAcrossRows(t *testing.T) {
-	s, pool, ctx := pgStoreWithPool(t)
-	acctID, appID := seedTestAccount(t, s, ctx, "cert-min")
-
-	// Insert two surfaces with different last_observed_cert_not_after
-	// values; the store must return the smaller remaining-seconds.
+// seedCertStateRow inserts a parent tenant_surfaces + tenant_hostnames
+// row so the meterd_tenant_surface_cert_expiry_state FK is satisfiable,
+// then inserts a mirror row directly. Mirrors the schema-level
+// (surface, hostname) pair invariant from migrations/00408.
+func seedCertStateRow(t *testing.T, pool *pgxpool.Pool, ctx context.Context, acctID, appID, hostname string, certNotAfter *time.Time, refreshedAt time.Time) (surfaceID string) {
+	t.Helper()
+	if err := pool.QueryRow(ctx, `
+		insert into tenant_surfaces (id, account_id, app_id, name, cert_state, cert_not_after)
+		values (gen_random_uuid(), $1, $2, $3, 'issued', $4)
+		returning id`,
+		acctID, appID, hostname+"_surface", certNotAfter).Scan(&surfaceID); err != nil {
+		t.Fatalf("insert tenant_surface: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into tenant_hostnames (id, surface_id, hostname, verified_at)
+		values (gen_random_uuid(), $1, $2, now())
+	`, surfaceID, hostname); err != nil {
+		t.Fatalf("insert tenant_hostnames: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		insert into meterd_tenant_surface_cert_expiry_state
 			(tenant_surface_id, account_id, app_id, hostname,
 			 last_observed_cert_not_after, last_walk_status, last_refreshed_at)
-		values (gen_random_uuid(), $1, $2, 'a.example',
-		        now() + interval '30 days', 'ok', now()),
-		       (gen_random_uuid(), $1, $2, 'b.example',
-		        now() + interval '7 days',  'ok', now())`,
-		acctID, appID); err != nil {
-		t.Fatalf("insert cert states: %v", err)
+		values ($1, $2, $3, $4, $5, 'ok', $6)
+	`, surfaceID, acctID, appID, hostname, certNotAfter, refreshedAt); err != nil {
+		t.Fatalf("insert cert state: %v", err)
 	}
+	return surfaceID
+}
+
+func TestPg_MinCertExpiryForApp_PicksMinAcrossRows(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	acctID, appID := seedTestAccount(t, s, ctx, "cert-min")
+
+	thirtyDays := time.Now().Add(30 * 24 * time.Hour)
+	sevenDays := time.Now().Add(7 * 24 * time.Hour)
+	seedCertStateRow(t, pool, ctx, acctID, appID, "a.example", &thirtyDays, time.Now())
+	seedCertStateRow(t, pool, ctx, acctID, appID, "b.example", &sevenDays, time.Now())
+
 	got, err := s.MinCertExpiryForApp(ctx, acctID, appID)
 	if err != nil {
 		t.Fatalf("MinCertExpiryForApp: %v", err)
 	}
-	// 7 days = 604800 seconds, 30 days = 2592000. The min must
-	// land in the 7-day ballpark (allow ±5 min slack for clock
-	// drift between insert and read).
-	const sevenDays = int64(7 * 24 * 60 * 60)
-	if got < sevenDays-300 || got > sevenDays+300 {
-		t.Errorf("min = %d seconds; want ~%d (7 days, ±5min)", got, sevenDays)
+	// 7 days = 604800 seconds. The min must land in the 7-day
+	// ballpark (allow ±5 min slack for clock drift between
+	// insert and read).
+	const sevenDaysSec = int64(7 * 24 * 60 * 60)
+	if got < sevenDaysSec-300 || got > sevenDaysSec+300 {
+		t.Errorf("min = %d seconds; want ~%d (7 days, ±5min)", got, sevenDaysSec)
 	}
 }
 
@@ -242,14 +276,21 @@ func TestPg_RefreshCertExpiryStates_UpsertsFromTenantSurfaces(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
 	acctID, appID := seedTestAccount(t, s, ctx, "cert-refresh")
 
-	// Insert one tenant_surface with cert_state='issued'. The
-	// refresher must mirror it into meterd_tenant_surface_cert_expiry_state.
+	// Insert one tenant_surface with cert_state='issued' + a
+	// tenant_hostnames row so RefreshCertExpiryStates can JOIN
+	// and emit a per-hostname mirror row.
 	var surfaceID string
 	if err := pool.QueryRow(ctx, `
-		insert into tenant_surfaces (id, account_id, app_id, hostname, cert_state, cert_not_after)
-		values (gen_random_uuid(), $1, $2, 'r.example', 'issued', now() + interval '14 days')
+		insert into tenant_surfaces (id, account_id, app_id, name, cert_state, cert_not_after)
+		values (gen_random_uuid(), $1, $2, 'refresh_surface', 'issued', now() + interval '14 days')
 		returning id`, acctID, appID).Scan(&surfaceID); err != nil {
 		t.Fatalf("insert tenant_surface: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into tenant_hostnames (id, surface_id, hostname, verified_at)
+		values (gen_random_uuid(), $1, 'r.example', now())
+	`, surfaceID); err != nil {
+		t.Fatalf("insert tenant_hostnames: %v", err)
 	}
 
 	n, err := s.RefreshCertExpiryStates(ctx)
@@ -260,7 +301,10 @@ func TestPg_RefreshCertExpiryStates_UpsertsFromTenantSurfaces(t *testing.T) {
 		t.Errorf("rows upserted = %d; want 1", n)
 	}
 	var lastWalk string
-	if err := pool.QueryRow(ctx, `select last_walk_status from meterd_tenant_surface_cert_expiry_state where tenant_surface_id = $1`, surfaceID).Scan(&lastWalk); err != nil {
+	if err := pool.QueryRow(ctx, `
+		select last_walk_status from meterd_tenant_surface_cert_expiry_state
+		 where tenant_surface_id = $1 and hostname = 'r.example'`,
+		surfaceID).Scan(&lastWalk); err != nil {
 		t.Fatalf("query mirrored row: %v", err)
 	}
 	if lastWalk != "ok" {
@@ -273,20 +317,28 @@ func TestPg_RefreshCertExpiryStates_CertUnissuedWhenNotAfterIsNull(t *testing.T)
 	acctID, appID := seedTestAccount(t, s, ctx, "cert-unissued")
 
 	// Defensive path: cert_state='issued' but cert_not_after is
-	// NULL (CHECK in 00243 should prevent but the refresher must
-	// not crash). Status must land as 'cert_unissued'.
+	// NULL. Status must land as 'cert_unissued'.
 	var surfaceID string
 	if err := pool.QueryRow(ctx, `
-		insert into tenant_surfaces (id, account_id, app_id, hostname, cert_state, cert_not_after)
-		values (gen_random_uuid(), $1, $2, 'u.example', 'issued', null)
+		insert into tenant_surfaces (id, account_id, app_id, name, cert_state, cert_not_after)
+		values (gen_random_uuid(), $1, $2, 'unissued_surface', 'issued', null)
 		returning id`, acctID, appID).Scan(&surfaceID); err != nil {
 		t.Fatalf("insert tenant_surface: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into tenant_hostnames (id, surface_id, hostname, verified_at)
+		values (gen_random_uuid(), $1, 'u.example', now())
+	`, surfaceID); err != nil {
+		t.Fatalf("insert tenant_hostnames: %v", err)
 	}
 	if _, err := s.RefreshCertExpiryStates(ctx); err != nil {
 		t.Fatalf("RefreshCertExpiryStates: %v", err)
 	}
 	var lastWalk string
-	if err := pool.QueryRow(ctx, `select last_walk_status from meterd_tenant_surface_cert_expiry_state where tenant_surface_id = $1`, surfaceID).Scan(&lastWalk); err != nil {
+	if err := pool.QueryRow(ctx, `
+		select last_walk_status from meterd_tenant_surface_cert_expiry_state
+		 where tenant_surface_id = $1 and hostname = 'u.example'`,
+		surfaceID).Scan(&lastWalk); err != nil {
 		t.Fatalf("query mirrored row: %v", err)
 	}
 	if lastWalk != "cert_unissued" {
@@ -299,17 +351,11 @@ func TestPg_ListCertExpiryStateForWalker_StaleCutoffFilters(t *testing.T) {
 	acctID, appID := seedTestAccount(t, s, ctx, "cert-walker")
 
 	// Two rows: one fresh, one stale (last_refreshed_at = 1h ago).
-	if _, err := pool.Exec(ctx, `
-		insert into meterd_tenant_surface_cert_expiry_state
-			(tenant_surface_id, account_id, app_id, hostname,
-			 last_observed_cert_not_after, last_walk_status, last_refreshed_at)
-		values (gen_random_uuid(), $1, $2, 'fresh.example',
-		        now() + interval '14 days', 'ok', now()),
-		       (gen_random_uuid(), $1, $2, 'stale.example',
-		        now() + interval '14 days', 'ok', now() - interval '1 hour')`,
-		acctID, appID); err != nil {
-		t.Fatalf("insert cert states: %v", err)
-	}
+	// Each must be backed by a parent tenant_surfaces +
+	// tenant_hostnames row to satisfy the FK.
+	notAfter := time.Now().Add(14 * 24 * time.Hour)
+	seedCertStateRow(t, pool, ctx, acctID, appID, "fresh.example", &notAfter, time.Now())
+	seedCertStateRow(t, pool, ctx, acctID, appID, "stale.example", &notAfter, time.Now().Add(-1*time.Hour))
 
 	got, err := s.ListCertExpiryStateForWalker(ctx, 5*time.Minute)
 	if err != nil {
