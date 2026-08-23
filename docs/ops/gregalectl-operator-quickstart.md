@@ -10,6 +10,7 @@ since PR-6.5). For the full first-time cutover, see
 > - The cutover runbook (covers the per-host bootstrap chain + the
 >   PR-X `secrets init` gap): [`docs/runbooks/manifest-renderer-cutover.md`](../runbooks/manifest-renderer-cutover.md).
 > - The cluster architecture: [`docs/adr/110-declarative-split-box-manifest.md`](../adr/110-declarative-split-box-manifest.md).
+> - The PR-6.5 atomic split: [`docs/adr/110-declarative-split-box-manifest.md#pr-65-atomic-split`](../adr/110-declarative-split-box-manifest.md).
 
 ## 1. Install `gregalectl`
 
@@ -27,81 +28,257 @@ artifact published by `cd-controlplane.yml` (PR-1 rewired CD). The
 artifact is bit-identical to the per-release `bin/gregalectl` under
 `/opt/faas/releases/<sha>/bin/`.
 
-## 2. Write and validate the manifest
+## 2. First-boot narrative (one verb per concern)
 
-Copy the cluster-shipped example and replace the illustrative host
-endpoints with the routable address of each box. The endpoint is the
-single source for SSH/Ansible reachability and the overlay address. The
-generated compute target keeps the private PKI identity (`vmmd.faas`) and
-uses the endpoint port; the generator maps literal mesh IPs to the
-`vmmd.faas` / `schedd.faas` aliases in `/etc/hosts`.
-
-```
-cp deploy/manifest/examples/splitbox.example.yaml deploy/manifest/splitbox.yaml
-$EDITOR deploy/manifest/splitbox.yaml
-gregalectl manifest validate --file deploy/manifest/splitbox.yaml
-```
-
-## 3. Generate the Ansible inventory and bootstrap the boxes
+Once the binary is on `$PATH` and the manifest is rendered, the
+**bootstrap chain** seeds every on-disk credential in a fixed sequence so
+later steps can assume their inputs exist. Each verb is independent —
+an operator re-running any of them out of order is almost always a
+mistake (init refuses overwrite by default; the rotate variant is the
+intended replacement path).
 
 ```
-make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
+# 1. Local PKI (per-box CA + 9+ per-daemon leaves)
+sudo gregalectl pki init --root-dir /etc/faas/tls
+
+# 2. cosign keypair (image signing; PR-3 image-rollout gate)
+sudo gregalectl sign-keys init \
+    --sign-key /etc/faas/secrets/sign.key \
+    --verify-key /etc/faas/secrets/sign-pub.pem
+
+# 3. Per-node CapacityReport signing keypair (ADR-053)
+sudo gregalectl node-key init
+
+# 4. host.age keypair (session encryption; sealed at rest)
+sudo gregalectl host-age init
+
+# 5. Backup-credentials stub (operator-side rclone.conf + archive-creds.json)
+sudo gregalectl backup init
+
+# 6. Unseal rclone + archive credentials (one-shot; reads from ansible-vault-encrypted bundle)
+sudo gregalectl backup unseal-rclone --bundle <vault-bundle.tar.age>
+sudo gregalectl backup unseal-archive-creds --bundle <vault-bundle.tar.age>
+
+# 7. Post-bootstrap secrets batch (5 files; PR-X / issue #911)
+sudo gregalectl secrets init --pg-dsn "$FAAS_PG_DSN"
+
+# 8. Install the release bundle on the local box
+sudo gregalectl release install --git-sha $(git rev-parse HEAD) --role control-plane
 ```
 
-The generated inventory owns `ansible_host`, node identity, private
-service aliases, and `faas_vmmd_target_url`. A new bare-metal host
-therefore requires a manifest change and regeneration, not a hand-edited
-IP in the repository. Public Cloudflare DNS remains separate from this
-private mTLS path; hostname endpoints require an operator-managed private
-DNS entry for the role alias.
+The order is load-bearing:
 
-## 4. Bootstrap the box
+- `pki init` must precede `manifest render` (the renderer writes per-box PKI leaves under `/etc/faas/tls/<dir>/`).
+- `sign-keys init` must precede `release install` (the install path's `Verify` re-hashes the cosign pub into the `release_bundles.sign_pub_sha256` column).
+- `secrets init` must precede the first `gregale deploy` (the gateway refuses to start with `host.age` missing).
+- `backup unseal-*` reads the bundle the ansible role dropped at `/var/lib/faas/vault/`; running it before `backup init` fails with `ErrVaultBundleMissing`.
+
+Each verb has a `--json` flag (where applicable) so CI gates can assert
+the bootstrap chain ran end-to-end without parsing human output.
+
+## 3. Manifest workflow
+
+The manifest is the declarative source of truth for the cluster.
+`gregalectl` ships three verbs that read or render it.
+
+### `manifest validate --file <yaml>`
+
+Schema + cross-key checks. Run before every commit that touches the
+manifest and inside the CI gate `make manifest-validate`. Exit 0 on
+success, exit 3 on schema violation (the report names the field).
+
+### `manifest render --manifest-file <yaml> --host $(hostname)`
+
+Materialises `/etc/faas/*.toml`, systemd units, cgroup subtree_control,
+and the per-box PKI leaves. `--dry-run` prints the planned writes
+without touching disk (use this for `make metal-lima-splitbox`).
+
+### `manifest ansible --manifest-file <yaml> [--output-dir DIR]`
+
+Generates `deploy/ansible/.generated/inventory/hosts.ini` + the
+`host_vars/<fqdn>.yml` tree. Consumed by:
+
+- `make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml`
+- `make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane`
+- `make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute`
+
+The `--force` flag is refused by default — a re-run on a dirty tree
+is operator error. The generated inventory owns `ansible_host`, node
+identity, private service aliases, and `faas_vmmd_target_url`; a new
+bare-metal host therefore requires a manifest change and regeneration,
+not a hand-edited IP in the repository.
+
+## 4. Release workflow
+
+### `release bundle --bin-dir <dir> --git-sha <sha> --manifest-hash sha256:<hex>`
+
+Materialises a release bundle from a pre-built `bin/` directory and
+INSERTs the `release_bundles` row. Run by CI on every tag (the
+`release.yml` workflow).
+
+### `release install --git-sha <sha> [--role control-plane|compute-only]`
+
+Installs a release on the local box. Flips `/opt/faas/current` to the
+new SHA, lands the daemons under `/opt/faas/releases/<sha>/bin/`,
+writes the `release_bundles` row, and UPSERTs `compute_nodes.release_id`.
+
+`--role` is dual-purpose:
+
+- **First-boot**: templates drop-ins + starts the role subset.
+- **Day-2 mutation** (PR-B / ADR-113): triggers drain-gate →
+  `Mutate(stop+start)` → role UPSERT on a running box with a
+  different existing role.
+
+Reads `/etc/faas/first-boot.env`'s `FAAS_BOX_ROLE` when `--role` is
+unset.
+
+### `release kgv rotate --git-sha <sha> [--from-zero]`
+
+Refreshes the `sbom-baseline.json` (operator escape hatch from
+ADR-113's fail-closed SBoM gate). The KGV is the "known good version"
+baseline the install path compares against; `rotate` re-stamps it from
+the on-disk release SBoM. `--from-zero` writes `KGVZero` (zero
+CRITICAL/HIGH) without parsing the on-disk SBoM.
+
+### `release kgv init`
+
+Alias for `release kgv rotate --from-zero`. Prints a deprecation line
+on stdout. Will be removed once operators stop muscle-memorying the
+old name; the dispatcher refuses new code paths to call it.
+
+## 5. Day-2 fleet ops
+
+### Compute node state machine
 
 ```
-# control-plane box (fsn-1)
-sudo make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
+# Pre-register a new compute-only box
+gregalectl compute-nodes add \
+    --name fsn-2 \
+    --target-url tcp://vmmd-2.faas:50051 \
+    --vpcpus 32 --mem-mb 65536 --max-concurrency 200
 
-# compute-only box (fsn-2)
-sudo make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
+# List every registered node (--json for CI gates)
+gregalectl compute-nodes list [--active-only] [--json]
+
+# Show one node's row + live_instance_count
+gregalectl compute-nodes show --node fsn-2 [--json]
+
+# Drain before a reboot
+gregalectl compute-nodes drain --node fsn-2
+gregalectl compute-nodes drain-status --node fsn-2   # exit 1 if live instances remain
+
+# Re-activate
+gregalectl compute-nodes activate --node fsn-2
+
+# Force-drain a stuck node (operator-acknowledged)
+gregalectl compute-nodes force-drain --node fsn-2 --yes
 ```
 
-These targets run `deploy/ansible/bootstrap.yml` against the
-manifest-generated split-box inventory. There is no combined `[box]`
-target: production hosts must be assigned exactly one role.
+`list` / `show` are read-only introspection added in Cluster C1
+(gregalectl mega-PR). The state package owns the underlying
+`ListComputeNodes` / `ComputeNodeByName` calls; the dispatcher never
+bypasses the schema.
 
-The schema docs are at
-[`docs/adr/110-declarative-split-box-manifest.md`](../adr/110-declarative-split-box-manifest.md).
-
-## 5. Validate + render
+### Fleet topology coordinator
 
 ```
-# Schema + cross-key validation
-gregalectl manifest validate --file deploy/manifest/splitbox.yaml
-
-# Dry-run — prints the planned writes without touching disk
-gregalectl manifest render \
-    --manifest-file deploy/manifest/splitbox.yaml \
-    --host $(hostname) \
-    --dry-run
-
-# For-real — writes /etc/faas/*.toml, systemd units, cgroup scopes,
-# and the per-box PKI subset
-gregalectl manifest render \
-    --manifest-file deploy/manifest/splitbox.yaml \
-    --host $(hostname)
+# Add a node to the fleet: write host_vars + hosts.ini + git commit +
+# ssh bootstrap + POST compute_nodes
+gregalectl deploy add-node \
+    --role compute-only \
+    --ansible-host fsn-2.example.com \
+    --public-iface eth0 \
+    --masquerade-cidr 10.244.2.0/24 \
+    --target-url tcp://vmmd-2.faas:50051 \
+    --yes
 ```
 
-## 6. Install the release bundle
+Closes multi-host scale-out gap #2 (companion to `compute-nodes add`
+which closes gap #1). The pre-flight prompt lists every side-effect;
+`--yes` is the unattended-mode acknowledgement.
+
+### host.age rotation
 
 ```
-gregalectl release install --git-sha <git-sha>
+gregalectl host-age rotate           # rotates current → previous, generates a new current
+gregalectl host-age status --json    # current: {path, mode, mtime, sha256, key_id}; previous: {…|null}
+gregalectl host-age prune-previous [--dry-run] [--json]  # removes the previous file when safe
 ```
 
-Flips `/opt/faas/current` to the new SHA, lands the daemons under
-`/opt/faas/releases/<sha>/bin/`, writes the `release_bundles` row,
-and upsersts `compute_nodes.release_id` for the local box.
+`prune-previous` is the load-bearing CI gate for `make metal-lima-splitbox`
+— the `--dry-run` lets CI validate prune safety without mutating. The
+JSON shape includes `would_prune: <bool>` + a `kept: [{path, reason}]`
+array so gates can branch on individual kept siblings.
 
-## 7. Doctor
+### PKI introspection + rotation
+
+```
+gregalectl pki init --root-dir /etc/faas/tls
+gregalectl pki status
+gregalectl pki list [--daemon <name>] [--box-role <role>] [--json]
+gregalectl pki rotate --daemon <name> [--box-role <role>] [--root-dir DIR] [--force]
+```
+
+`pki list` (added in Cluster C2) emits a stable wire shape
+`{box_role, daemon, ca:{present,path,mode,serial,not_after}, leaves:[{directory,filename,cn,sans,…}]}`
+so CI gates can introspect without parsing the human renderer. Missing
+files report `present=false`; paths are always echoed so operators can
+see WHAT would be inspected.
+
+### cosign keypair (sign-keys)
+
+```
+gregalectl sign-keys init --sign-key <p> --verify-key <p>
+gregalectl sign-keys status [--json]
+gregalectl sign-keys rotate [--keep-old-pub] [--json] [--force]
+```
+
+`--keep-old-pub` archives the existing pub to `<path>.<unix-ts>` BEFORE
+the new keypair is generated — let verifier-side mid-rotation re-pin
+the old pub without re-running rotate. The `--json` report includes
+`kept_old_pub`, `old_pub_sha256`, `new_pub_sha256`, `key_id` (the
+first 16 hex chars of the new pub's SHA-256) so audit logs can quote
+a short fingerprint.
+
+### Per-node keypair (node-key)
+
+```
+gregalectl node-key init
+gregalectl node-key rotate
+gregalectl node-key status
+```
+
+Used by `vmmd` to sign per-node CapacityReports (ADR-053). Path
+defaults to `/etc/faas/secrets/node-{priv,pub}.pem`.
+
+## 6. Backup / secrets ops
+
+### Backup credentials
+
+```
+gregalectl backup init                  # create /etc/faas/secrets/storage-box/ stub (0700 root:root)
+gregalectl backup unseal-rclone --bundle <vault-bundle.tar.age>
+gregalectl backup unseal-archive-creds --bundle <vault-bundle.tar.age>
+```
+
+`init` creates the directory stub the unseal verbs expect and emits
+the two known placeholders that `doctor` already detects. Refuses
+overwrite unless `--force`.
+
+### Post-bootstrap secrets batch
+
+```
+gregalectl secrets init --pg-dsn "$FAAS_PG_DSN"   # 5 files: host.age, session.key, box-age-key, rclone.conf, archive-creds.json
+gregalectl secrets stamp --host <fqdn>            # stamp the existing host.age fingerprint without rotating
+gregalectl secrets rotate --host <fqdn>           # delegates to host-age rotate
+gregalectl secrets status --json                  # mode/mtime/sha256 for all 5
+```
+
+The 5-file batch replaces v1 `bootstrap.sh` step 11d (RETIRED
+2026-08-15). `--no-db` skips the `compute_nodes.cert_fingerprint`
+write (use only when secrets init runs ahead of `apid`).
+
+## 7. Diagnostic
 
 ```
 gregalectl doctor
@@ -126,7 +303,39 @@ Flags:
   `error`).
 - `--json` — machine-readable report.
 
-## 7. Where to go next
+**Never panics on bad input.** A malformed TOML or unreadable file
+emits a WARN finding and continues with the defensive default; exit
+3 reflects accumulated findings, not a signal-killed process.
+
+## 8. Shell integration
+
+```
+# Generate a shell completion script and source it
+gregalectl completion bash > /etc/bash_completion.d/gregalectl
+gregalectl completion zsh  > "${fpath[1]}/_gregalectl"
+
+# Generate the man page (or per-command page)
+gregalectl man                  # gregalectl(1)
+gregalectl man pki              # gregalectl-pki(1)
+gregalectl man host-age rotate  # gregalectl-host-age-rotate(1)
+```
+
+The completion script is generated from `cli_meta.go` (Cluster A3
+fixes a long-standing drift between the comment header and the
+`cliCommands` slice). The manifest-drift guard
+`commands_completion_test.go::TestCompletion_ManifestDrift` fails CI
+when `main.go`'s dispatcher diverges from `cli_meta.go`.
+
+## Trusted-publishers (note)
+
+`trusted-publishers add|remove|list` is dispatched by `gregalectl` per
+ADR-058 deviation note in `main.go:15`, but the on-disk
+`/etc/faas/secrets/trusted-publishers/<name>.pem` writes still happen
+from the customer-side `gregale` binary. The ADR-058 follow-up
+("operator-vs-customer split") is filed separately and out of scope for
+this PR.
+
+## Where to go next
 
 - **First-time cutover from a legacy single-box?** Read
   [`docs/runbooks/manifest-renderer-cutover.md`](../runbooks/manifest-renderer-cutover.md).
@@ -135,3 +344,9 @@ Flags:
 - **Troubleshooting drift?** Run `gregalectl doctor --deep` and
   read the JSON report; the `target` field on each finding points
   at the object (node name, git_sha, daemon name).
+- **host-age rotation details?** Read
+  [`docs/ops/host-age-rotation.md`](host-age-rotation.md).
+- **Release-bundle anchor (PR-3 / ADR-113)?** Read
+  [`docs/ops/release-manifest-anchor.md`](release-manifest-anchor.md).
+- **Per-secret rotation cadence?** Read
+  [`docs/ops/secrets-rotation.md`](secrets-rotation.md).

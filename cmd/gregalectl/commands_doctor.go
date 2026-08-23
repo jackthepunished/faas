@@ -1261,7 +1261,16 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 		// over-strict: a 0o000 mode (rare but valid for an
 		// un-read file) wouldn't match 0o400.
 		got := info.Mode().Perm()
-		want := mustParsePerm(s.want)
+		want, permErr := parsePerm(s.want)
+		if permErr != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityWarn,
+				Message:  fmt.Sprintf("%s wanted-mode unparseable, skipping mode check", s.label),
+				Detail:   permErr.Error(),
+			})
+			continue
+		}
 		if got&(0o077) != 0 || got&0o700 > want&0o700 {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckSecrets,
@@ -1525,21 +1534,25 @@ func checkBuilderBaseExt4(ctx context.Context, deps *doctorDeps) ([]doctorFindin
 	}}, nil
 }
 
-// mustParsePerm returns the perm bits for a 4-digit octal string
-// like "0400" or "0440". Panics on bad input — the call sites
-// are hard-coded constants; failure means a typo.
-func mustParsePerm(s string) os.FileMode {
+// parsePerm returns the perm bits for a 4-digit octal string
+// like "0400" or "0440". Returns an error on bad input — the
+// caller (commands_doctor.go:checkSecrets) emits a WARN finding
+// and continues with a defensive mode rather than panicking, so
+// a malformed TOML config or a typo'd --want flag does not kill
+// the doctor's "never panic, always emit a finding" discipline
+// (mirrors the DB-down warn paths at lines 585, 692).
+func parsePerm(s string) (os.FileMode, error) {
 	n := 0
 	if len(s) != 4 {
-		panic("mustParsePerm: want 4-digit octal, got " + s)
+		return 0, fmt.Errorf("want 4-digit octal, got %q", s)
 	}
 	for _, ch := range s {
 		if ch < '0' || ch > '7' {
-			panic("mustParsePerm: bad octal " + s)
+			return 0, fmt.Errorf("bad octal %q", s)
 		}
 		n = n*8 + int(ch-'0')
 	}
-	return os.FileMode(n)
+	return os.FileMode(n), nil
 }
 
 // dispatchDoctor is the const name referenced by main.go +
