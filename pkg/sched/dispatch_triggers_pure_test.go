@@ -10,6 +10,7 @@
 package sched
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -181,7 +182,7 @@ func TestByteReadCloser_ReadAll(t *testing.T) {
 		t.Errorf("second read: n=%d err=%v buf=%q", n, err, buf[:n])
 	}
 	n, err = r.Read(buf)
-	if n != 0 || err != io.EOF {
+	if n != 0 || !errors.Is(err, io.EOF) {
 		t.Errorf("EOF: n=%d err=%v, want 0 io.EOF", n, err)
 	}
 }

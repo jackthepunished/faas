@@ -9,6 +9,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,8 +101,8 @@ func TestClient_Do_CookieOnlyPathReturns403(t *testing.T) {
 	if err == nil {
 		t.Fatal("cookie-only path: err = nil, want 403")
 	}
-	p, ok := err.(*Problem)
-	if !ok {
+	var p *Problem
+	if !errors.As(err, &p) {
 		t.Fatalf("not a *Problem: %T %v", err, err)
 	}
 	if p.Code != CodeUnsupportedByCLI {
@@ -119,8 +120,8 @@ func TestClient_Do_CookieOnlyPathSubpathAlsoRejected(t *testing.T) {
 	// /v1/auth/capabilities/foo must also match.
 	c := NewClient("https://api.example.com", "tok")
 	err := c.do(context.Background(), "GET", "/v1/auth/capabilities/foo", nil, nil)
-	p, ok := err.(*Problem)
-	if !ok {
+	var p *Problem
+	if !errors.As(err, &p) {
 		t.Fatalf("not a *Problem: %T %v", err, err)
 	}
 	if p.Code != CodeUnsupportedByCLI {
@@ -133,7 +134,8 @@ func TestClient_Do_CookieOnlyPathBareSessionsRejected(t *testing.T) {
 	// (the regex's optional subpath group captures both).
 	c := NewClient("https://api.example.com", "tok")
 	err := c.do(context.Background(), "GET", "/v1/auth/sessions", nil, nil)
-	if _, ok := err.(*Problem); !ok {
+	var p *Problem
+	if !errors.As(err, &p) {
 		t.Fatalf("not a *Problem: %T %v", err, err)
 	}
 }
@@ -353,8 +355,8 @@ func TestClient_Do_ServerErrorReturnsAPIErrorWithProblem(t *testing.T) {
 	if err == nil {
 		t.Fatal("403: err = nil, want APIError")
 	}
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %T, want *APIError", err)
 	}
 	if apiErr.Problem.Code != "test_code" {
@@ -380,8 +382,8 @@ func TestClient_Do_RetryAfterHeaderSurfacesOn429(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "")
 	err := c.do(context.Background(), "GET", "/v1/x", nil, nil)
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %T, want *APIError", err)
 	}
 	if v := apiErr.Problem.HasHeader("Retry-After"); len(v) == 0 || v[0] != "42" {
@@ -404,8 +406,8 @@ func TestClient_Do_RetryAfterHeaderSurfacesOn503(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "")
 	err := c.do(context.Background(), "GET", "/v1/x", nil, nil)
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %T, want *APIError", err)
 	}
 	if v := apiErr.Problem.HasHeader("Retry-After"); len(v) == 0 || v[0] != "7" {
@@ -427,7 +429,8 @@ func TestClient_Do_ProblemDecodeFailureFallsBackToGenericError(t *testing.T) {
 	if err == nil {
 		t.Fatal("err = nil, want generic API error")
 	}
-	if _, ok := err.(*APIError); ok {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
 		t.Errorf("non-Problem body surfaced as *APIError; want generic error")
 	}
 	if !strings.Contains(err.Error(), "500") {
