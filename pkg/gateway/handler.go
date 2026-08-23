@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
@@ -595,6 +596,14 @@ type Handler struct {
 	topNSample func(appID string)
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
+	// requestTelemetry (ADR-127) is the in-process recorder that
+	// captures one row per gateway-served request at Handler.observe
+	// (line 5456). Set via WithRequestTelemetryRecorder from
+	// cmd/gatewayd-internal/main.go; nil in unit tests + older
+	// call paths. observe nil-checks before enqueueing. The recorder
+	// never opens a Postgres connection itself — the publisher
+	// (request_telemetry_publisher.go) ships drained rows to apid.
+	requestTelemetry *requestTelemetryRecorder
 
 	// streamingEnabled gates the per-app streaming response path
 	// (issue #471 / ADR-047). When false (the default), every app is
@@ -4455,6 +4464,16 @@ func (h *Handler) SetTopNSample(sample func(appID string)) {
 	h.topNSample = sample
 }
 
+// WithRequestTelemetryRecorder (ADR-127) wires the in-process
+// request-telemetry recorder (pkg/gateway/request_telemetry.go)
+// into the Handler. Call once at daemon boot from
+// cmd/gatewayd-internal/main.go alongside SetTopNSample. nil
+// disables the data plane (every observe call no-ops the enqueue
+// step — the same posture as the unit-test seam).
+func (h *Handler) WithRequestTelemetryRecorder(r *requestTelemetryRecorder) {
+	h.requestTelemetry = r
+}
+
 // Metrics exposes the Prometheus bundle (used by the control listener to mount
 // /metrics). May be nil if NewHandler was used and nothing initialized one.
 func (h *Handler) Metrics() *Metrics { return h.metrics }
@@ -4599,6 +4618,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	app = lookedApp
 haveApp:
+	// ADR-127: stamp account_id + app_id onto the request context
+	// so the recorder can build a row at Handler.observe without
+	// observe's signature changing. nil-safe on accountID (the
+	// gateway can't resolve an account for an app that was
+	// substituted by an edge rule without an owner — those rows
+	// are pre-picker and observe drops them).
+	if h.requestTelemetry != nil {
+		var accountUUID, appUUID uuid.UUID
+		if app.AccountID != "" {
+			accountUUID, _ = uuid.Parse(app.AccountID)
+		}
+		if app.ID != "" {
+			appUUID, _ = uuid.Parse(app.ID)
+		}
+		r = withAppAndAccount(r, accountUUID, appUUID)
+	}
 	// ADR-093: derive the per-request route label and stash it
 	// on the request context so Handler.observe can read it on
 	// the single exit funnel. The label is method + raw path
@@ -5520,6 +5555,38 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 	// instance with 401s forever and we'd never park it).
 	if h.lastSeen != nil && status >= 200 && status < 300 && target.InstanceID != "" {
 		h.lastSeen.Touch(target.InstanceID, time.Now())
+	}
+	// ADR-127: enqueue a request-telemetry row at the single
+	// exit funnel. nil-safe — the recorder is wired at boot in
+	// cmd/gatewayd-internal/main.go; unit tests + older paths
+	// leave it nil and the enqueue is skipped. The row drops
+	// silently when accountID is unset (pre-picker path: no
+	// haveApp: stamp landed). DeploymentID is parsed from the
+	// resolved target; empty when the picker fell back to the
+	// legacy single-targetSet behavior (Target.DeploymentID ""
+	// — see handler.go:407-410). The Publisher's dedupe
+	// (request_telemetry_publisher.go) collapses the burst later.
+	if h.requestTelemetry != nil {
+		acctUUID := accountIDFromContext(r.Context())
+		appUUID := appIDFromContext(r.Context())
+		if acctUUID != uuid.Nil && appUUID != uuid.Nil {
+			var deploymentUUID uuid.UUID
+			if target.DeploymentID != "" {
+				deploymentUUID, _ = uuid.Parse(target.DeploymentID)
+			}
+			h.requestTelemetry.RecordFromObserve(RequestTelemetryRow{
+				AccountID:    acctUUID,
+				AppID:        appUUID,
+				DeploymentID: deploymentUUID,
+				Route:        routeLabel,
+				Method:       r.Method,
+				Status:       status,
+				LatencyMS:    int(elapsed / time.Millisecond),
+				ColdBoot:     cold,
+				TraceID:      requestID,
+				ReceivedAt:   time.Now(),
+			})
+		}
 	}
 }
 

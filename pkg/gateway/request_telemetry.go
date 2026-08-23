@@ -237,6 +237,75 @@ func (r *requestTelemetryRecorder) RingCapacity() int {
 	return len(r.ring)
 }
 
+// RecordFromObserve is the seam Handler.observe uses to enqueue
+// a row at the gateway's single exit funnel
+// (pkg/gateway/handler.go:5456). It is the explicit-row variant of
+// the Middleware path: the caller (observe) has already resolved
+// the status + elapsed + cold + target from its arguments, so it
+// passes the row in pre-built rather than letting enqueueFromContext
+// re-read context keys.
+//
+// Safe under concurrent calls — goes through the same enqueue() as
+// the middleware path.
+func (r *requestTelemetryRecorder) RecordFromObserve(row RequestTelemetryRow) {
+	r.enqueue(row)
+}
+
+// --- context-key helpers for the ServeHTTP-side stamping ---
+
+// withAppAndAccount stamps account_id + app_id onto ctx. Called
+// once per request from Handler.ServeHTTP at the `haveApp:`
+// label (handler.go:4601) so observe can read both via the
+// accountIDContextKey / appIDContextKey keys below. Mirrors
+// withRouteLabel's pattern in observability.go.
+//
+// Returns the original ctx when both ids are empty — pre-picker
+// paths (auth failure, no host) do not stamp anything, so observe
+// sees an absent key and skips the row.
+func withAppAndAccount(r *http.Request, accountID, appID uuid.UUID) *http.Request {
+	if r == nil {
+		return r
+	}
+	if accountID == uuid.Nil || appID == uuid.Nil {
+		return r
+	}
+	ctx := context.WithValue(r.Context(), accountIDContextKey{}, accountID)
+	ctx = context.WithValue(ctx, appIDContextKey{}, appID)
+	return r.WithContext(ctx)
+}
+
+// withRouteTemplate stamps the route template onto ctx so observe
+// can stamp a closed-enum route label into the row. Mirrors
+// withAppAndAccount. Used by the post-pick rule that derives the
+// per-request route label (handler.go:4613-4617).
+func withRouteTemplate(r *http.Request, template string) *http.Request {
+	if r == nil || template == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), routeTemplateKey{}, template))
+}
+
+// accountIDFromContext reads the account_id stamped on ctx.
+// Returns uuid.Nil when absent.
+func accountIDFromContext(ctx context.Context) uuid.UUID {
+	v, _ := reqContextUUID(ctx, accountIDContextKey{})
+	return v
+}
+
+// appIDFromContext reads the app_id stamped on ctx.
+// Returns uuid.Nil when absent.
+func appIDFromContext(ctx context.Context) uuid.UUID {
+	v, _ := reqContextUUID(ctx, appIDContextKey{})
+	return v
+}
+
+// routeTemplateFromContext reads the route template stamped on ctx.
+// Returns "" when absent.
+func routeTemplateFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(routeTemplateKey{}).(string)
+	return v
+}
+
 // --- context keys for the request-side metadata ---
 
 // The gateway's existing auth middleware populates these context
