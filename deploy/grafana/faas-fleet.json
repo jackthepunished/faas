@@ -712,6 +712,78 @@
         "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Wake failures by reason (24h)",
+      "id": 130,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 128},
+      "description": "Rate of *_wake_failure_total{reason=...} (issue #1059 / ADR-127). Stacked by reason to surface the dominant failure mode at a glance; legend doubles as the triage table (cross-reference with docs/runbooks/FaasColdBootRatioHigh.md). `mem_backend_err` is pre-instantiated today even though unreachable in production — the row should read 0.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (reason) (rate(vmmd_wake_failure_total[5m]))", "legendFormat": "{{reason}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "bars", "lineWidth": 0, "fillOpacity": 60, "stacking": {"mode": "normal", "group": "A"}}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cold-boot ratio (24h)",
+      "id": 131,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 128},
+      "description": "vmmd_cold_boot_ratio (recording rule — issue #1059 / ADR-127 §5). Threshold 0.30 (yellow) gates FaasColdBootRatioHigh page alert; 0.50 (red) is the fleet-snapshot-saturation point (matches the §12 snapshot_fleet_avg_mb > 200 alert). Sibling of the existing 'Cold-boot fallback rate (5m)' panel (id: 3) which uses the older vmmd_cold_boot_fallback_total counter; this one uses the §6.1 tier split (ADR-074) for the canonical ratio.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "vmmd_cold_boot_ratio", "legendFormat": "cold-boot ratio", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.30},
+              {"color": "red", "value": 0.50}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": false},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-box p99 wake latency (24h)",
+      "id": 132,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 136},
+      "description": "p99 wake latency per box — derived from vmmd_wake_latency_seconds_bucket{box,phase} (issue #1059 / ADR-127 §1). With single-control-plane the box label resolves to 'local'; the multi-host rollout replaces this with compute_nodes.id. The aggregated fleet histogram (vmmd_wake_phase_duration_seconds{phase}) is preserved as a sibling for §12 dashboard back-compat — this panel is the operator-facing per-box view.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum by (le, box) (rate(vmmd_wake_latency_seconds_bucket[5m])))", "legendFormat": "{{box}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ],
   "refresh": "30s",
