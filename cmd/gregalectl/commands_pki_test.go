@@ -26,6 +26,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -33,6 +34,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -377,4 +380,196 @@ func TestCmdPKIDispatch_ListsNewVerb(t *testing.T) {
 	if !strings.Contains(got, "init, status, list, rotate") {
 		t.Errorf("dispatcher hint = %q, want it to contain %q", got, "init, status, list, rotate")
 	}
+}
+
+// TestCmdPKI_NoArgs pins the empty-args branch (commands_pki.go:71-74) —
+// exit 1 with a usage hint.
+func TestCmdPKI_NoArgs(t *testing.T) {
+	if rc := cmdPKI(nil); rc != 1 {
+		t.Errorf("cmdPKI(nil) = %d, want 1 (usage error)", rc)
+	}
+}
+
+// TestCmdPKIDispatch_Routing pins the dispatcher's routing for
+// every known verb. Each subtest feeds an invalid flag into the
+// routed leaf — flag.Parse fails BEFORE the leaf touches the FS,
+// so the test exercises only the dispatch + flag-parse path.
+func TestCmdPKIDispatch_Routing(t *testing.T) {
+	cases := []struct {
+		name string
+		verb string
+	}{
+		{name: "init", verb: "init"},
+		{name: "status", verb: "status"},
+		{name: "list", verb: "list"},
+		{name: "rotate", verb: "rotate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code := cmdPKI([]string{tc.verb, "--not-a-flag"})
+			if code != 1 {
+				t.Errorf("cmdPKI(%s --not-a-flag) = %d, want 1 (flag.Parse error)", tc.verb, code)
+			}
+		})
+	}
+}
+
+// TestCmdPKIInit_InvalidFlag pins the flag.Parse error branch
+// of cmdPKIInit (commands_pki.go:143-145) — exit 1.
+func TestCmdPKIInit_InvalidFlag(t *testing.T) {
+	if code := cmdPKIInit([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdPKIInit(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdPKIInit_ExtraPositional pins the NArg != 0 branch
+// (commands_pki.go:146-149) — exit 1 with a usage hint.
+func TestCmdPKIInit_ExtraPositional(t *testing.T) {
+	stderr := captureStderrPKI(t, func() {
+		if code := cmdPKIInit([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdPKIInit(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdPKIInit stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdPKIStatus_InvalidFlag pins the flag.Parse error branch
+// of cmdPKIStatus (commands_pki.go:173-175).
+func TestCmdPKIStatus_InvalidFlag(t *testing.T) {
+	if code := cmdPKIStatus([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdPKIStatus(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdPKIStatus_ExtraPositional pins the NArg != 0 branch
+// (commands_pki.go:176-179).
+func TestCmdPKIStatus_ExtraPositional(t *testing.T) {
+	stderr := captureStderrPKI(t, func() {
+		if code := cmdPKIStatus([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdPKIStatus(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdPKIStatus stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdPKIRotate_InvalidFlag pins the flag.Parse error branch
+// of cmdPKIRotate (commands_pki.go:209-211).
+func TestCmdPKIRotate_InvalidFlag(t *testing.T) {
+	if code := cmdPKIRotate([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdPKIRotate(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdPKIRotate_ExtraPositional pins the NArg != 0 branch
+// (commands_pki.go:212-215).
+func TestCmdPKIRotate_ExtraPositional(t *testing.T) {
+	stderr := captureStderrPKI(t, func() {
+		if code := cmdPKIRotate([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdPKIRotate(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdPKIRotate stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestRotateRestartHint pins the per-daemon restart hint
+// (commands_pki.go:260-287) — exit 0 of the rotation has the
+// right systemctl invocation for every known daemon. The
+// empty-daemon branch emits the whole-fleet hint.
+func TestRotateRestartHint(t *testing.T) {
+	cases := []struct {
+		daemon string
+		want   string
+	}{
+		{daemon: "", want: "systemctl kill -s HUP"},
+		{daemon: "egress", want: "systemctl reload faas-gatewayd-internal"},
+		{daemon: "meterd", want: "systemctl reload faas-meterd"},
+		{daemon: "schedd", want: "systemctl kill -s HUP faas-schedd"},
+		{daemon: "vmmd", want: "systemctl kill -s HUP faas-vmmd"},
+		{daemon: "apid", want: "systemctl kill -s HUP faas-apid"},
+		{daemon: "githubd", want: "systemctl reload faas-githubd"},
+		{daemon: "builderd", want: "systemctl reload faas-builderd"},
+		{daemon: "unknown-daemon", want: "systemctl kill -s HUP faas-{schedd,vmmd,apid}"}, // fallthrough
+	}
+	for _, tc := range cases {
+		t.Run(tc.daemon, func(t *testing.T) {
+			got := rotateRestartHint(tc.daemon)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("rotateRestartHint(%q) = %q, want substring %q", tc.daemon, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsErrLeafNotExpiringSoon pins the sentinel-matcher helper
+// (commands_pki.go:465-467) — string-compare without errors.Is
+// because the sentinel may be wrapped by EnsureLeaf.
+func TestIsErrLeafNotExpiringSoon(t *testing.T) {
+	if !isErrLeafNotExpiringSoon(pki.ErrLeafNotExpiringSoon) {
+		t.Errorf("bare sentinel should match")
+	}
+	if !isErrLeafNotExpiringSoon(fmt.Errorf("wrap: %w", pki.ErrLeafNotExpiringSoon)) {
+		t.Errorf("wrapped sentinel should match")
+	}
+	if isErrLeafNotExpiringSoon(nil) {
+		t.Errorf("nil should NOT match")
+	}
+	if isErrLeafNotExpiringSoon(errors.New("other error")) {
+		t.Errorf("unrelated error should NOT match")
+	}
+}
+
+// TestReportLeafStatusFiltered_DaemonFilter pins the text-path
+// counterpart of inspectPKI's daemon narrowing — every printed
+// row's directory label should match the --daemon filter (with
+// the egress cross-directory carve-out).
+func TestReportLeafStatusFiltered_DaemonFilter(t *testing.T) {
+	rootDir := seedPKIRootDir(t)
+	var buf bytes.Buffer
+	reportLeafStatusFiltered(&buf, rootDir, "apid", "")
+	out := buf.String()
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "apid ") {
+			t.Errorf("expected every row to start with 'apid ', got %q", line)
+		}
+	}
+}
+
+// captureStderrPKI is the file-local stderr capture helper. Mirrors
+// the precedent at commands_release_sbom_gate_test.go:107-123 and
+// commands_compute_nodes_test.go:63-79. Kept local to this file so
+// the buffer type stays in the test author's namespace (no shared
+// testutil package — see commands_pki_test.go:46-51 comment).
+func captureStderrPKI(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	_ = w.Close()
+	var out []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			out = append(out, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = r.Close()
+	return string(out)
 }

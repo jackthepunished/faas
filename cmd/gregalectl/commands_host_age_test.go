@@ -30,6 +30,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -645,4 +646,103 @@ func TestHostAgeDispatch_UsageString(t *testing.T) {
 	// Pin the error message text — the operator-facing hint.
 	// (We don't pipe stderr; we just check rc=1 is the contract
 	// for unknown subcommands.)
+}
+
+// TestCmdHostAgeInit_InvalidFlag pins the flag.Parse error branch
+// of cmdHostAgeInit (commands_host_age.go:200-202) — exit 1 via
+// flag.ContinueOnError. No root required: the leaf is never called
+// because flag.Parse fails first.
+func TestCmdHostAgeInit_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgeInit([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgeInit(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgeInit_ExtraPositional pins the NArg != 0 branch
+// (commands_host_age.go:203-206) — exit 1 with a usage hint. No
+// root required: the positional check fires before hostAgeInit is
+// invoked.
+func TestCmdHostAgeInit_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgeInit([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgeInit(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgeInit stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdHostAgeRotate_InvalidFlag pins the flag.Parse error
+// branch of cmdHostAgeRotate (commands_host_age.go:263-265).
+func TestCmdHostAgeRotate_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgeRotate([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgeRotate(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgeRotate_ExtraPositional pins the NArg != 0 branch
+// (commands_host_age.go:266-269). No root required.
+func TestCmdHostAgeRotate_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgeRotate([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgeRotate(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgeRotate stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// TestCmdHostAgePrunePrevious_InvalidFlag pins the flag.Parse
+// error branch of cmdHostAgePrunePrevious (commands_host_age.go).
+func TestCmdHostAgePrunePrevious_InvalidFlag(t *testing.T) {
+	if code := cmdHostAgePrunePrevious([]string{"--not-a-flag"}); code != 1 {
+		t.Errorf("cmdHostAgePrunePrevious(--not-a-flag) = %d, want 1", code)
+	}
+}
+
+// TestCmdHostAgePrunePrevious_ExtraPositional pins the NArg != 0
+// branch of cmdHostAgePrunePrevious. No root required: the
+// positional check fires before the leaf is invoked, and prune
+// (unlike init) does not write 0400 root:root files.
+func TestCmdHostAgePrunePrevious_ExtraPositional(t *testing.T) {
+	stderr := captureStderrHostAge(t, func() {
+		if code := cmdHostAgePrunePrevious([]string{"extra-positional"}); code != 1 {
+			t.Errorf("cmdHostAgePrunePrevious(extra) = %d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("cmdHostAgePrunePrevious stderr missing usage hint (got %q)", stderr)
+	}
+}
+
+// captureStderrHostAge is a file-local stderr capture helper. Mirrors
+// the precedent at commands_compute_nodes_test.go:63-79 but scoped
+// to this file (no shared testutil package — see commands_pki_test.go:46-51
+// comment for the rationale).
+func captureStderrHostAge(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	_ = w.Close()
+	var out []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			out = append(out, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = r.Close()
+	return string(out)
 }

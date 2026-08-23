@@ -733,3 +733,148 @@ func (b *captureBuffer) Write(p []byte) (int, error) {
 
 func (b *captureBuffer) Bytes() []byte  { return b.data }
 func (b *captureBuffer) String() string { return string(b.data) }
+
+// TestCmdComputeNodesDispatch_Routing pins the dispatcher routing
+// for every sibling verb under `gregalectl compute-nodes <verb>`.
+// Each subtest asserts the dispatcher forwards args[1:] to the
+// correct leaf verb. The leaf verbs' happy paths hit Postgres
+// (openComputeNodesStore), so the subtests only assert the
+// exit-2 error-path that fires when --node is missing — that's
+// the early exit that doesn't touch the store.
+//
+// The "no subcommand" and "unknown subcommand" branches are
+// covered separately (they exit 2 with a diagnostic) below.
+func TestCmdComputeNodesDispatch_Routing(t *testing.T) {
+	cases := []struct {
+		name    string
+		verb    string
+		wantErr string // expected stderr substring
+	}{
+		{name: "drain", verb: "drain", wantErr: "--node required"},
+		{name: "drain_status", verb: "drain-status", wantErr: "--node required"},
+		{name: "activate", verb: "activate", wantErr: "--node required"},
+		{name: "force_drain", verb: "force-drain", wantErr: "--node required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stderr := captureStderrComputeNodes(t, func() {
+				if code := cmdComputeNodesDispatch([]string{tc.verb}); code != 2 {
+					t.Errorf("dispatch(%s) -> leaf exit %d, want 2 (--node required)", tc.verb, code)
+				}
+			})
+			if !strings.Contains(stderr, tc.wantErr) {
+				t.Errorf("dispatch(%s) stderr missing %q (got %q)", tc.verb, tc.wantErr, stderr)
+			}
+		})
+	}
+}
+
+// TestCmdComputeNodesDispatch_NoSubcommand pins the missing-arg
+// branch (commands_compute_nodes.go:57-60) — exit 2 with a
+// diagnostic listing all known subcommands.
+func TestCmdComputeNodesDispatch_NoSubcommand(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDispatch(nil); code != 2 {
+			t.Errorf("dispatch(nil) = %d, want 2", code)
+		}
+	})
+	for _, want := range []string{"missing subcommand", "add", "list", "show", "drain", "activate"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("dispatch(nil) stderr missing %q (got %q)", want, stderr)
+		}
+	}
+}
+
+// TestCmdComputeNodesDispatch_UnknownSubcommand pins the default
+// branch of the dispatch switch (commands_compute_nodes.go:76-79).
+func TestCmdComputeNodesDispatch_UnknownSubcommand(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDispatch([]string{"reboot"}); code != 2 {
+			t.Errorf("dispatch(reboot) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, `unknown subcommand "reboot"`) {
+		t.Errorf("dispatch(reboot) stderr missing unknown-subcommand marker (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesDrain_MissingNode pins the --node-required
+// branch of cmdComputeNodesDrain (commands_compute_nodes.go:125-128)
+// — exit 2 with a diagnostic, no Postgres touched.
+func TestCmdComputeNodesDrain_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDrain(nil); code != 2 {
+			t.Errorf("drain(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("drain(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesDrainStatus_MissingNode pins the --node-required
+// branch of cmdComputeNodesDrainStatus (commands_compute_nodes.go:160-163).
+func TestCmdComputeNodesDrainStatus_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesDrainStatus(nil); code != 2 {
+			t.Errorf("drain-status(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("drain-status(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesActivate_MissingNode pins the --node-required
+// branch of cmdComputeNodesActivate (commands_compute_nodes.go:202-205).
+func TestCmdComputeNodesActivate_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesActivate(nil); code != 2 {
+			t.Errorf("activate(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("activate(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_RequiresYes pins the loud-warning
+// branch (commands_compute_nodes.go:238-241) — exit 2 with a
+// diagnostic that NAMES --yes so the operator can copy-paste.
+// The --node check runs first, so a test that omits both --node
+// and --yes should see the --node-required diagnostic (covered by
+// TestCmdComputeNodesDrain_MissingNode above). Here we omit --yes
+// but provide --node; the early exit fires on the --yes check.
+func TestCmdComputeNodesForceDrain_RequiresYes(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesForceDrain([]string{"--node=alpha"}); code != 2 {
+			t.Errorf("force-drain(--node=alpha, no --yes) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--yes required") {
+		t.Errorf("force-drain stderr missing --yes required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_MissingNode pins the --node-required
+// branch (commands_compute_nodes.go:234-237) — runs BEFORE the
+// --yes check so this fires first even when --yes is also missing.
+func TestCmdComputeNodesForceDrain_MissingNode(t *testing.T) {
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdComputeNodesForceDrain(nil); code != 2 {
+			t.Errorf("force-drain(nil) = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(stderr, "--node required") {
+		t.Errorf("force-drain(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesForceDrain_InvalidFlag pins the flag.Parse
+// error branch (commands_compute_nodes.go:231-233) — exit 2 via
+// flag.ContinueOnError when an unknown flag is passed.
+func TestCmdComputeNodesForceDrain_InvalidFlag(t *testing.T) {
+	if code := cmdComputeNodesForceDrain([]string{"--not-a-flag"}); code != 2 {
+		t.Errorf("force-drain(--not-a-flag) = %d, want 2", code)
+	}
+}
