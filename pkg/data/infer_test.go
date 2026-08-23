@@ -274,12 +274,22 @@ func TestClassifier_DefaultPortStamps(t *testing.T) {
 	}
 }
 
-// TestClassifier_HashSaltFailureSkipsRow exercises the §11 tripwire
-// path: when the host-hash salt file is missing or wrong-sized, the
-// classifier MUST skip the row rather than INSERT a row without a
-// hash (which would crash the migration CHECK). Better to skip than
-// to leak a plaintext host.
-func TestClassifier_HashSaltFailureSkipsRow(t *testing.T) {
+// TestClassifier_HashSaltFailureSurfacesHostHashOKFalse exercises
+// the §11 tripwire path: when the host-hash salt file is missing
+// or wrong-sized, the classifier MUST NOT leak a plaintext host
+// (Host stays empty) and MUST NOT compute a hash (HostHash stays
+// empty), but it MUST surface a row with HostHashOK=false so the
+// apid handler (handlers_env.go::runEnvClassifier) can route the
+// failure through the silent-skip branch and emit the SOC 2
+// CC7.2 env.classifier_failed audit row (issue #957).
+//
+// Pre-#957 behaviour was: classifyOne returned nil, result.Rows
+// stayed empty, result.Skipped was incremented, and the failure
+// left no audit trace. Post-#957: classifyOne returns a sentinel
+// InferredUpstream{HostHashOK:false}; the row enters result.Rows;
+// the handler skips the INSERT (§11 invariant) and emits the
+// audit row.
+func TestClassifier_HashSaltFailureSurfacesHostHashOKFalse(t *testing.T) {
 	// Point the salt path at a nonexistent file so every
 	// HashHost call returns an error.
 	secretbox.SetHostHashSaltPath("/nonexistent/path/for/test/" + t.Name())
@@ -297,11 +307,30 @@ func TestClassifier_HashSaltFailureSkipsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(result.Rows) != 0 {
-		t.Errorf("got %d rows on hash failure, want 0 (must skip)", len(result.Rows))
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows on hash failure, want 1 (HostHashOK=false sentinel for audit routing)", len(result.Rows))
 	}
-	if result.Skipped != 1 {
-		t.Errorf("skipped = %d, want 1", result.Skipped)
+	row := result.Rows[0]
+	if row.HostHashOK {
+		t.Errorf("row.HostHashOK = true, want false (salt missing → hash failed)")
+	}
+	// §11 invariant: no plaintext host, no hash, but the
+	// classifier DID walk the row (kind + scope + env_key are
+	// stamped so the handler can route the audit emit).
+	if row.Host != "" {
+		t.Errorf("row.Host = %q, want empty (no plaintext leak on salt failure)", row.Host)
+	}
+	if row.HostHash != "" {
+		t.Errorf("row.HostHash = %q, want empty (NOT NULL would trip 23502 on INSERT; handler skips INSERT on HostHashOK=false)", row.HostHash)
+	}
+	if row.Kind != "postgres" {
+		t.Errorf("row.Kind = %q, want postgres", row.Kind)
+	}
+	if row.Scope != "default" {
+		t.Errorf("row.Scope = %q, want default", row.Scope)
+	}
+	if row.EnvKey != "DATABASE_URL" {
+		t.Errorf("row.EnvKey = %q, want DATABASE_URL", row.EnvKey)
 	}
 }
 

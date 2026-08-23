@@ -324,6 +324,43 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 				"account", acct.ID,
 				"err", err.Error(),
 			)
+			// Issue #957: SOC 2 CC7.2 wants a traceable
+			// record of the failure mode independent of the
+			// operator log. The audit row carries a
+			// closed-vocab error_class discriminator so an
+			// operator can triage without log-spelunking.
+			// silent_skip=true means the classifier dropped
+			// the row on the floor (host_hash_failed);
+			// silent_skip=false means we got far enough to
+			// attempt an insert that failed. The
+			// underlying err.Error() is intentionally NOT
+			// surfaced on the audit row (see
+			// errEnvClassifier doc on handlers_env.go
+			// above the sentinel type).
+			errorClass := errClassifierInternal.Kind
+			silentSkip := false
+			var ec *errEnvClassifier
+			if errors.As(err, &ec) {
+				errorClass = ec.Kind
+				// silent_skip is true iff the failure bailed
+				// before any data_upstreams INSERT was
+				// attempted. Only `insert_data_upstream` is
+				// the post-INSERT failure (the INSERT ran,
+				// collided, and we observed the error); every
+				// other Kind fails before reaching
+				// InsertDataUpstream at runEnvClassifier
+				// (uuid_parse at L570/L574, classifier.Run
+				// at L610, CountDataUpstreamsByApp at L634,
+				// HostHashOK at L624, port bounds at L666).
+				silentSkip = ec.Kind != errClassifierInsert.Kind
+			}
+			s.audit.Emit(r.Context(), "env.classifier_failed", &acct.ID, map[string]any{
+				"app_id":      app.ID,
+				"scope":       scope,
+				"name":        key,
+				"error_class": errorClass,
+				"silent_skip": silentSkip,
+			})
 		}
 	}
 	// Audit + log. VALUE never reaches slog. logsanitize.RedactValue is
@@ -468,6 +505,50 @@ func (s *server) envExistsInScope(c stdctxEnv, accountID, appID, scope, key stri
 	return false, nil
 }
 
+// errEnvClassifier is the typed error wrapper returned from
+// runEnvClassifier. The Kind field is the closed-vocab discriminator
+// written to the env.classifier_failed audit row (issue #957) so an
+// operator can triage the failure mode without log-spelunking. The
+// underlying Err is intentionally NOT surfaced on the audit row —
+// secretbox.HostHashSaltError can carry salt-path material, and
+// future error classes could carry plaintext-adjacent context. SOC 2
+// CC6.1 confidential logging. The discriminator is sufficient.
+//
+// Use errors.As(err, &ec) to unwrap; ec.Kind is the audit payload's
+// `error_class` value.
+type errEnvClassifier struct {
+	Kind string
+	Err  error
+}
+
+func (e *errEnvClassifier) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Err == nil {
+		return "env-classifier: " + e.Kind
+	}
+	return "env-classifier: " + e.Kind + ": " + e.Err.Error()
+}
+
+func (e *errEnvClassifier) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// Closed-vocab sentinels for the audit row's `error_class` value.
+// Any new failure site in runEnvClassifier MUST wrap with one of these
+// (or errClassifierInternal as the catch-all default).
+var (
+	errClassifierUUIDParse      = &errEnvClassifier{Kind: "uuid_parse"}
+	errClassifierHostHashFailed = &errEnvClassifier{Kind: "host_hash_failed"}
+	errClassifierInsert         = &errEnvClassifier{Kind: "insert_data_upstream"}
+	errClassifierPortRange      = &errEnvClassifier{Kind: "port_out_of_range"}
+	errClassifierInternal       = &errEnvClassifier{Kind: "classifier_internal"}
+)
+
 // runEnvClassifier (ADR-098 PR-B / C4 + amendment issue #954) ingests
 // one env mutation through the env-classifier and upserts the resulting
 // rows into data_upstreams. The classifier (pkg/data/infer.go) walks
@@ -496,11 +577,11 @@ func (s *server) envExistsInScope(c stdctxEnv, accountID, appID, scope, key stri
 func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app state.App, scope, key, value string) error {
 	acctUUID, err := uuid.Parse(acct.ID)
 	if err != nil {
-		return fmt.Errorf("parse account uuid: %w", err)
+		return &errEnvClassifier{Kind: errClassifierUUIDParse.Kind, Err: fmt.Errorf("parse account uuid: %w", err)}
 	}
 	appUUID, err := uuid.Parse(app.ID)
 	if err != nil {
-		return fmt.Errorf("parse app uuid: %w", err)
+		return &errEnvClassifier{Kind: errClassifierUUIDParse.Kind, Err: fmt.Errorf("parse app uuid: %w", err)}
 	}
 	// Resolve the deployment ONCE per classifier run. The env-
 	// scope is fixed for the whole run (one mutation, one scope),
@@ -519,7 +600,16 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		deploymentScope = defaultEnvScope
 	}
 	classifier := data.NewClassifier(s.log, app.ID)
-	classifier.HashHost = secretbox.HashHost
+	// hostHashFunc is the test seam (issue #957 / cmd/apid/server.go).
+	// Production wiring (cmd/apid/main.go) does not call
+	// WithHostHashFunc, so s.hostHashFunc stays nil and we fall
+	// through to the canonical secretbox.HashHost — byte-for-byte
+	// pre-PR-C behaviour.
+	if s.hostHashFunc != nil {
+		classifier.HashHost = s.hostHashFunc
+	} else {
+		classifier.HashHost = secretbox.HashHost
+	}
 	classifier.ResolveDefaultPort = func(kind string) (int, bool) {
 		return api.DefaultPortForKind(api.DataUpstreamKind(kind))
 	}
@@ -527,17 +617,21 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		{Key: key, Value: value, Scope: scope},
 	})
 	if err != nil {
-		return err
+		return &errEnvClassifier{Kind: errClassifierInternal.Kind, Err: err}
 	}
 	for _, row := range result.Rows {
 		if !row.HostHashOK {
-			// HashHost failed (e.g. salt missing). Skip
-			// this row — the data_upstreams schema
-			// enforces NOT NULL on host_redacted_hash,
-			// so an INSERT with the empty hash would
-			// trip 23502. Already logged at the
-			// classifier level.
-			continue
+			// HashHost failed (e.g. salt missing). The
+			// data_upstreams schema enforces NOT NULL on
+			// host_redacted_hash, so an INSERT with the
+			// empty hash would trip 23502. Issue #957:
+			// instead of a silent `continue` (which
+			// leaves no SOC 2 trace), return a typed
+			// sentinel so setEnv emits
+			// env.classifier_failed with
+			// silent_skip=true. The env row IS already
+			// persisted — the customer still gets 200.
+			return errClassifierHostHashFailed
 		}
 		// Per-plan quota check (DataPlacementHintsPerApp).
 		// The classifier returns ALL rows that match the
@@ -547,7 +641,7 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		limits := api.MustLimitsFor(acct.Plan)
 		current, err := s.store.CountDataUpstreamsByApp(ctx, acct.ID, app.ID)
 		if err != nil {
-			return err
+			return &errEnvClassifier{Kind: errClassifierInternal.Kind, Err: err}
 		}
 		if limits.DataPlacementHintsPerApp > 0 && current >= limits.DataPlacementHintsPerApp {
 			// Quota reached — log + skip. The Free-plan
@@ -579,7 +673,7 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		// CodeQL's `go/incorrect-integer-conversion` query.
 		var port32 int32
 		if row.Port < 0 || row.Port > 65535 {
-			return fmt.Errorf("apid: inferred port %d out of [1, 65535] range", row.Port)
+			return &errEnvClassifier{Kind: errClassifierPortRange.Kind, Err: fmt.Errorf("apid: inferred port %d out of [1, 65535] range", row.Port)}
 		}
 		// codeql[go/incorrect-integer-conversion]
 		port32 = int32(row.Port)
@@ -604,7 +698,7 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 			LastProbedAt:     state.Timestamptz{},
 		})
 		if err != nil {
-			return err
+			return &errEnvClassifier{Kind: errClassifierInsert.Kind, Err: err}
 		}
 		s.log.Info("data_upstream inferred",
 			"app", app.Slug,
