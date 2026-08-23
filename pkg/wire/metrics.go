@@ -288,6 +288,21 @@ type OpsMetrics struct {
 	// counter after every successful park (idle / aggressive /
 	// RAM-pressure).
 	evictedPriority *prometheus.CounterVec
+	// bridgeFramingTotal (ADR-127 §D3, Layer 7) — closed-set
+	// counter for the per-request framing decision at the bridge.
+	// Labels:
+	//   app_protocol     ∈ {http1, http2, grpc}
+	//   bridge_protocol  ∈ {h1, h2c}
+	//   framing          ∈ {match, mismatch}
+	// Pre-instantiates the full 3×2×2 = 12-series cross-product at
+	// boot so the §12 bridge-protection dashboard surfaces a zero
+	// row from idle fleet. The "mismatch" row is the operator-
+	// facing surgical-rollback signal — when bridge_protocol=h1
+	// but app_protocol ∈ {http2, grpc} (an operator forced the
+	// rollback per docs/ops/h2c-rollback.md), framing=mismatch so
+	// the FaasBridgeFramingMismatch alert (pkg/api/alerts.go) can
+	// trip a non-zero rate and page on-call.
+	bridgeFramingTotal *prometheus.CounterVec
 	// eventsWriteFail: introduced in commit 4 for the audit-log
 	// emission. A non-zero rate indicates that transitions are
 	// succeeding but the events row isn't being written — the state
@@ -1439,6 +1454,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of workload OOM-kill detections on the customer's per-VM cgroup v2 leaf (Cluster C / ADR-121), labelled by (app, deployment). The producer chain is guest-init cgroup.events listener → vsock DGRAM type 0x05 → Manager.ReportWorkloadOOM → Engine.DestroyForWorkloadOOMFailure. The dashboard panel pairs this with liveness_restarts_total to distinguish 'healthz is bad' (liveness) from 'RAM cap is too low' (workload OOM). Per-deployment cardinality is bounded by the plan's deployed_apps cap (same as livenessRestarts).",
 	}, []string{"app", "deployment"})
 	workloadOOMKills.WithLabelValues("other", "other")
+	// ADR-127 §D3 (Layer 7) — bridgeFramingTotal. Three closed
+	// label sets; pre-instantiate the full cross-product so the
+	// bridge-protection dashboard panel renders a zero row from
+	// boot (the §12 panel-at-day-1 contract).
+	//
+	// app_protocol    ∈ {http1, http2, grpc}     (pkg/api/app_protocol.go)
+	// bridge_protocol ∈ {h1, h2c}
+	// framing         ∈ {match, mismatch}        (the alert source)
+	bridgeFramingTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_bridge_framing_total",
+		Help: "Count of inbound bridge requests by (app_protocol, bridge_protocol, framing), where framing=mismatch means the operator's FAAS_BRIDGE_PROTOCOL env value does not match the app's app_protocol setting (the surgical-rollback signal per docs/ops/h2c-rollback.md). All three label sets are closed; the 12-series cross-product is pre-instantiated at boot so the bridge-protection Grafana dashboard (deploy/grafana/bridge-protection.json, ADR-127 §D3) renders from boot. Source: cmd/vmmd-stream-bridge::newHandler slog-line emission (paired with the bridge_framing_total counter increment in the per-request defer). Producer is vmmd-stream-bridge; the metric is exported by vmmd's /metrics handler.",
+	}, []string{"app_protocol", "bridge_protocol", "framing"})
+	for _, ap := range api.AppProtocolClosedSet {
+		for _, bp := range []string{"h1", "h2c"} {
+			for _, fr := range []string{"match", "mismatch"} {
+				bridgeFramingTotal.WithLabelValues(ap, bp, fr)
+			}
+		}
+	}
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -2335,7 +2369,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3128,6 +3162,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		writeRedirectLatency:                 writeRedirectLatency,
 		livenessRestarts:                     livenessRestarts,
 		workloadOOMKills:                     workloadOOMKills,
+		bridgeFramingTotal:                   bridgeFramingTotal,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
@@ -3323,6 +3358,27 @@ func (m *OpsMetrics) WorkloadOOMKills(app, deployment string) prometheus.Counter
 		deployment = labelUnknown
 	}
 	return m.workloadOOMKills.WithLabelValues(app, deployment)
+}
+
+// BridgeFramingTotal (ADR-127 §D3, Layer 7) returns the per-
+// (app_protocol, bridge_protocol, framing) counter that the
+// vmmd-stream-bridge's newHandler closure increments on every
+// inbound request. The "mismatch" label is the operator-facing
+// signal for the surgical-rollback path: a sustained mismatch
+// rate > 0.1 rps triggers FaasBridgeFramingMismatch (see
+// pkg/api/alerts.go).
+//
+// All three label values are validated against closed sets in
+// the producer (cmd/vmmd-stream-bridge::newHandler); invalid
+// labels surface as Prometheus label-validation errors at boot
+// rather than silently extending the time-series set. nil-
+// receiver guard matches the OpsMetrics accessors above so unit
+// tests without metrics keep working.
+func (m *OpsMetrics) BridgeFramingTotal(appProtocol, bridgeProtocol, framing string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.bridgeFramingTotal.WithLabelValues(appProtocol, bridgeProtocol, framing)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier

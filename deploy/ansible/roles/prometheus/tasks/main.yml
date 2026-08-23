@@ -153,6 +153,22 @@
     mode: "0644"
   notify: reload prometheus
 
+# ADR-127 §D3 / G19 — bridge wire-protocol framing alerts
+# (FaasBridgeFramingMismatch + FaasBridgeRollbackStuck). The
+# prometheus role owns this drop so the rules file lives next to
+# the scrape config that references it (single source of truth per
+# CLAUDE.md Component ownership). Without this task the alert
+# never evaluates on the box even though prometheus.yml.j2
+# references the path.
+- name: prometheus — drop bridge.rules.yml (ADR-127 §D3 Layer 7)
+  ansible.builtin.copy:
+    src: bridge.rules.yml
+    dest: /etc/prometheus/bridge.rules.yml
+    owner: prometheus
+    group: prometheus
+    mode: "0644"
+  notify: reload prometheus
+
 # ADR-098 §9.A meterd data-upstream alerts (issue #951). Source lives
 # at pkg/promqlrules/data_placement.yaml (canonical, per the C8 plan
 # from ADR-098's PR-cluster outline — colocated with the fixture +
