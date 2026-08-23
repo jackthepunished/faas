@@ -50,14 +50,22 @@ const (
 // verbatim — the kind-specific struct has already been validated
 // and round-tripped through jsonb on the read path.
 //
-// ValidateMode is surfaced at the top level (ADR-128 D1) —
-// state.EdgeRule.ValidateMode is the resolved value (NOT NULL
-// DEFAULT 'block'). The action-level field is also re-emitted
-// for the back-compat window (ADR-128 D2) so older clients
-// reading action.validate_mode still see the same value.
+// ValidateMode is surfaced at the top level (ADR-128 D1).
+// The SQL column is NOT NULL DEFAULT 'block', so a pgstore
+// round-trip always carries a value; the memstore preserves
+// empty verbatim (memstore.go:CreateEdgeRule). We default to
+// 'block' here so the wire response always carries a resolved
+// value regardless of backing store. The action-level field is
+// also re-emitted for the back-compat window (ADR-128 D2) so
+// older clients reading action.validate_mode still see the
+// same value.
 func edgeRuleResponse(r state.EdgeRule) api.EdgeRuleResponse {
 	actionBytes, _ := json.Marshal(r.Action)
-	resp := api.EdgeRuleResponse{
+	mode := r.ValidateMode
+	if mode == "" {
+		mode = api.ValidateModeBlock
+	}
+	return api.EdgeRuleResponse{
 		ID:           r.ID,
 		AccountID:    r.AccountID,
 		AppID:        r.AppID,
@@ -67,12 +75,11 @@ func edgeRuleResponse(r state.EdgeRule) api.EdgeRuleResponse {
 		Priority:     r.Priority,
 		Enabled:      r.Enabled,
 		Kind:         string(r.Kind),
-		ValidateMode: r.ValidateMode,
+		ValidateMode: mode,
 		Action:       actionBytes,
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
 	}
-	return resp
 }
 
 // validateEdgeRuleAction dispatches the kind-specific Validate()
