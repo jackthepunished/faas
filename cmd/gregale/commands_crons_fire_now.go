@@ -40,7 +40,7 @@ import (
 // stripped — same generator as cron ids). Validated locally BEFORE the
 // network round-trip so a bad id returns 1 with zero server calls,
 // matching cmdCronsRuns / cmdCronsRun / cmdCronsUpdate.
-var fireNowRequestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var fireNowRequestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // fire-now row status constants. Mirrors state.FireNowStatus
 // (pkg/state/types.go:1067-1076) byte-for-byte; pkg/state is not

@@ -2352,8 +2352,12 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	}
 	app, err := s.store.AppByID(r.Context(), req.AppID)
 	if err != nil || app.AccountID != acct.ID {
-		s.notFound(w, "no such app")
-		return
+		if a, aerr := s.store.AppBySlug(r.Context(), req.AppID); aerr == nil && a.AccountID == acct.ID {
+			app = a
+		} else {
+			s.notFound(w, "no such app")
+			return
+		}
 	}
 	enabled := true
 	if req.Enabled != nil {
@@ -2363,7 +2367,7 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	if path == "" {
 		path = "/"
 	}
-	c, err := s.store.CreateCronIfUnderQuota(r.Context(), req.AppID, req.Schedule, path, enabled, limits)
+	c, err := s.store.CreateCronIfUnderQuota(r.Context(), app.ID, req.Schedule, path, enabled, limits)
 	if err != nil {
 		var qe *state.CronQuotaError
 		switch {

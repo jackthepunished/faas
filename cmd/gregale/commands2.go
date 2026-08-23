@@ -1512,11 +1512,11 @@ func cmdRollback(args []string) int {
 		a := rest[i]
 		switch {
 		case a == "--to":
-			if i+1 >= len(rest) {
+			i++
+			if i >= len(rest) {
 				return printErr("Missing value", fmt.Errorf("--to requires a deployment_id"))
 			}
-			to = rest[i+1]
-			i++ // consume the value
+			to = rest[i] //nolint:gosec // G602: bounds checked immediately above
 		case strings.HasPrefix(a, "--to="):
 			to = a[len("--to="):]
 		default:
@@ -1808,7 +1808,7 @@ func cmdCrons(args []string) int {
 // cronIDPattern is the 32-hex shape used by the API for cron ids
 // (CronResponse.ID, the path segment of /v1/crons/{id}). Mirrors
 // deploymentIDPattern — same 32-hex convention across the platform.
-var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // renderCronState writes the human multi-line state block for one
 // cron. Routes through io.Writer so tests can capture the body via

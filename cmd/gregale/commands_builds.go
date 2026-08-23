@@ -23,7 +23,7 @@ import (
 // form; the dashboard / CLI tooling expects the compact shape so
 // customers can paste a row id from the dashboard into `gregale build
 // provenance <id>` without manual fixing-up.
-var buildIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var buildIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // dispatchBuild is the registered parent command name. Mirrors the
 // dispatchDeployments / dispatchDeployment convention; main.go

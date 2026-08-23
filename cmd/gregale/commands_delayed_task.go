@@ -43,7 +43,7 @@ import (
 // commands_alerts.go:402). The delayed-task id is a 32-hex UUID per
 // the handler (handlers_delayed_task.go); local validation lets the
 // CLI return a clean 1-exit error instead of a 404 round-trip.
-var delayedTaskIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var delayedTaskIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // cmdDelayedTask dispatches `gregale delayed-task <add|get|cancel>`
 // to the three leaves. Mirrors cmdCrons (commands_crons.go:40) for

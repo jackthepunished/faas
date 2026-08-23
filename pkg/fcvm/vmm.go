@@ -2059,8 +2059,11 @@ func (v *JailerVMM) mkChroot(instance string) (string, error) {
 	if err := os.RemoveAll(root); err != nil {
 		return "", fmt.Errorf("vmm: wipe stale chroot: %w", err)
 	}
-	if err := os.MkdirAll(root, 0o750); err != nil {
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", fmt.Errorf("vmm: mkdir chroot: %w", err)
+	}
+	for dir := root; dir != v.chrootBase && dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+		_ = os.Chmod(dir, 0o755)
 	}
 	return root, nil
 }
@@ -2488,6 +2491,8 @@ func (v *JailerVMM) unmountBindMounts(instance string) {
 // firecracker — which chroots into it and then runs unprivileged — can create the
 // API socket there and, on Snapshot, write the mem/vmstate files it later exports.
 func (v *JailerVMM) ownChrootRoot(root string, l Lease) error {
+	parent := filepath.Dir(root)
+	_ = os.Chmod(parent, 0o755)
 	if err := chownJail(root, l.UID, l.GID); err != nil {
 		return fmt.Errorf("vmm: chown chroot root: %w", err)
 	}
@@ -3241,6 +3246,8 @@ func (v *JailerVMM) sweepMaterialised(instanceID string) {
 	}
 }
 
+const ficloneIoctl = 0x40049409
+
 //nolint:forbidigo // src/dst are vetted slot/instance-id paths under /srv/fc — vmmd is the sole writer of this directory; the tmpfs jail root means symlink-attack would require root (which vmmd already has, by spec §11). Copy is an internal migration helper, not a customer-path surface.
 func copyFile(src, dst string) (err error) {
 	in, err := os.Open(src)
@@ -3261,6 +3268,10 @@ func copyFile(src, dst string) (err error) {
 			err = cErr
 		}
 	}()
+	// Fast path: attempt copy-on-write clone (FICLONE ioctl, ~0.05ms on XFS/Btrfs/reflink-ext4).
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, out.Fd(), ficloneIoctl, in.Fd()); errno == 0 {
+		return nil
+	}
 	_, err = io.Copy(out, in)
 	return err
 }
