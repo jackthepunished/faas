@@ -262,6 +262,7 @@ from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
 from .get_builds_status import GetBuildsStatus
+from .get_deployment_open_api_doc_response_200 import GetDeploymentOpenAPIDocResponse200
 from .get_deployment_stages_response_200 import GetDeploymentStagesResponse200
 from .get_deployment_stages_response_200_current import GetDeploymentStagesResponse200Current
 from .get_deployment_stages_response_200_history_item import GetDeploymentStagesResponse200HistoryItem
@@ -351,11 +352,14 @@ from .password_signup_request import PasswordSignupRequest
 from .patch_org_request import PatchOrgRequest
 from .patch_org_request_plan import PatchOrgRequestPlan
 from .payment_method_summary import PaymentMethodSummary
+from .plan_affected_app import PlanAffectedApp
+from .plan_affected_app_action import PlanAffectedAppAction
 from .plan_cron import PlanCron
 from .plan_managed import PlanManaged
 from .plan_response import PlanResponse
 from .plan_response_scan_source import PlanResponseScanSource
 from .plan_workload import PlanWorkload
+from .plan_workload_action import PlanWorkloadAction
 from .plan_workload_class import PlanWorkloadClass
 from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
@@ -393,6 +397,8 @@ from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
+from .retry_deployment_request import RetryDeploymentRequest
+from .retry_deployment_request_from_stage import RetryDeploymentRequestFromStage
 from .rollback_request import RollbackRequest
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_app_secret_request import RotateAppSecretRequest
@@ -487,6 +493,10 @@ from .update_app_webhook_request_event_filter_item import UpdateAppWebhookReques
 from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetryPolicy
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
+from .update_deployment_open_api_doc_body import UpdateDeploymentOpenAPIDocBody
+from .update_deployment_open_api_doc_response_200 import UpdateDeploymentOpenAPIDocResponse200
+from .update_deployment_open_api_doc_response_200_doc import UpdateDeploymentOpenAPIDocResponse200Doc
+from .update_deployment_open_api_doc_response_200_source import UpdateDeploymentOpenAPIDocResponse200Source
 from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
@@ -763,6 +773,7 @@ __all__ = (
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
     "GetBuildsStatus",
+    "GetDeploymentOpenAPIDocResponse200",
     "GetDeploymentStagesResponse200",
     "GetDeploymentStagesResponse200Current",
     "GetDeploymentStagesResponse200HistoryItem",
@@ -852,11 +863,14 @@ __all__ = (
     "PatchOrgRequest",
     "PatchOrgRequestPlan",
     "PaymentMethodSummary",
+    "PlanAffectedApp",
+    "PlanAffectedAppAction",
     "PlanCron",
     "PlanManaged",
     "PlanResponse",
     "PlanResponseScanSource",
     "PlanWorkload",
+    "PlanWorkloadAction",
     "PlanWorkloadClass",
     "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
@@ -894,6 +908,8 @@ __all__ = (
     "RekeyProgress",
     "RenameAppRequest",
     "RepoResponse",
+    "RetryDeploymentRequest",
+    "RetryDeploymentRequestFromStage",
     "RollbackRequest",
     "RotateAlertRuleSecretResponse",
     "RotateAppSecretRequest",
@@ -986,6 +1002,10 @@ __all__ = (
     "UpdateAppWebhookRequestRetryPolicy",
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
+    "UpdateDeploymentOpenAPIDocBody",
+    "UpdateDeploymentOpenAPIDocResponse200",
+    "UpdateDeploymentOpenAPIDocResponse200Doc",
+    "UpdateDeploymentOpenAPIDocResponse200Source",
     "UpdateDeploymentRequest",
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",

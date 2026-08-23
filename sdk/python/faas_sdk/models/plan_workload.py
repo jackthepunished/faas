@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.plan_workload_action import PlanWorkloadAction, check_plan_workload_action
 from ..models.plan_workload_class import PlanWorkloadClass, check_plan_workload_class
 from ..models.plan_workload_tier import PlanWorkloadTier, check_plan_workload_tier
 from ..types import UNSET, Unset
@@ -30,6 +31,11 @@ class PlanWorkload:
     source: str | Unset = UNSET
     """detector provenance, e.g. compose.yaml: api"""
     tier: PlanWorkloadTier | Unset = UNSET
+    action: PlanWorkloadAction | Unset = UNSET
+    """ADR-124 blast-radius projection. create = workload is new to the account; update = existing app matches
+    (root_dir, name)."""
+    existing_app_id: str | Unset = UNSET
+    """ADR-124: app row ID the update targets. Empty iff action == create."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +65,12 @@ class PlanWorkload:
         if not isinstance(self.tier, Unset):
             tier = self.tier
 
+        action: str | Unset = UNSET
+        if not isinstance(self.action, Unset):
+            action = self.action
+
+        existing_app_id = self.existing_app_id
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -81,6 +93,10 @@ class PlanWorkload:
             field_dict["source"] = source
         if tier is not UNSET:
             field_dict["tier"] = tier
+        if action is not UNSET:
+            field_dict["action"] = action
+        if existing_app_id is not UNSET:
+            field_dict["existing_app_id"] = existing_app_id
 
         return field_dict
 
@@ -117,6 +133,15 @@ class PlanWorkload:
         else:
             tier = check_plan_workload_tier(_tier)
 
+        _action = d.pop("action", UNSET)
+        action: PlanWorkloadAction | Unset
+        if isinstance(_action, Unset):
+            action = UNSET
+        else:
+            action = check_plan_workload_action(_action)
+
+        existing_app_id = d.pop("existing_app_id", UNSET)
+
         plan_workload = cls(
             name=name,
             root_dir=root_dir,
@@ -128,6 +153,8 @@ class PlanWorkload:
             env_keys=env_keys,
             source=source,
             tier=tier,
+            action=action,
+            existing_app_id=existing_app_id,
         )
 
         plan_workload.additional_properties = d
