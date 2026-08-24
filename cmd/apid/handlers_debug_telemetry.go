@@ -45,7 +45,10 @@ func (s *server) debugTelemetryListHandler(w http.ResponseWriter, r *http.Reques
 	// since is a duration string ("3h", "24h", "7d"); we clamp to
 	// the plan's retention cap so a Free user passing ?since=90d
 	// is silently rounded down to DebugTelemetryRetentionDays.
-	sinceDur := parseDebugSince(r, 24*time.Hour)
+	// The raw form is captured separately so the response can
+	// echo it verbatim — round-trip safe (see echoDebugSince).
+	sinceRaw := r.URL.Query().Get("since")
+	sinceDur := parseDebugSinceFromString(sinceRaw, 24*time.Hour)
 	cap := time.Duration(limits.DebugTelemetryRetentionDays) * 24 * time.Hour
 	if cap > 0 && sinceDur > cap {
 		sinceDur = cap
@@ -76,7 +79,7 @@ func (s *server) debugTelemetryListHandler(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, api.DebugTelemetryListResponse{
 		Requests: items,
-		Since:    sinceDur.String(),
+		Since:    echoDebugSince(sinceRaw, sinceDur),
 	})
 }
 
@@ -126,28 +129,30 @@ func timeFromPg(t pgtype.Timestamptz) string {
 	return t.Time.UTC().Format(time.RFC3339Nano)
 }
 
-// parseDebugSince parses the ?since= query param. Accepts Go
-// duration syntax ("3h", "90m") plus a short alias "Nd" for
-// days. Returns def when empty or invalid. Negative durations
-// collapse to def so a malicious client can't pull rows from the
-// future.
-func parseDebugSince(r *http.Request, def time.Duration) time.Duration {
-	raw := r.URL.Query().Get("since")
-	if raw == "" {
-		return def
+// echoDebugSince produces a wire-stable echo of a `since` request
+// parameter so that customer automation can feed the response
+// straight back into a follow-up request without re-parsing.
+// When the customer supplied a parseable value AND the effective
+// duration matches (no clamp), the original raw form is returned
+// verbatim — round-trip safe (`?since=5d` → `"5d"`, not
+// `120h0m0s` which parseDebugSinceFromString would accept but
+// downstream tooling rarely normalizes to). When the effective
+// duration was clamped by the plan cap, or when no raw value
+// was supplied, the effective duration is rendered in the
+// canonical `Nh` or `Nd` form so the customer can detect the
+// discrepancy (or supply a default that round-trips).
+func echoDebugSince(raw string, eff time.Duration) string {
+	if raw != "" && parseDebugSinceFromString(raw, -1) == eff {
+		return raw
 	}
-	// Try Go duration first ("3h", "90m", "15s").
-	if d, err := time.ParseDuration(raw); err == nil {
-		if d <= 0 {
-			return def
-		}
-		return d
+	if eff <= 0 {
+		return ""
 	}
-	// Try the "Nd" alias.
-	if n, err := strconv.Atoi(raw[:len(raw)-1]); err == nil && raw[len(raw)-1] == 'd' && n > 0 {
-		return time.Duration(n) * 24 * time.Hour
+	if eff%(24*time.Hour) == 0 {
+		n := int(eff / (24 * time.Hour))
+		return strconv.Itoa(n) + "d"
 	}
-	return def
+	return eff.String()
 }
 
 // stringToPgUUID converts a hyphenated-hex UUID string into the
@@ -182,7 +187,8 @@ func (s *server) debugRegressionsHandler(w http.ResponseWriter, r *http.Request,
 		api.WriteProblem(w, api.ErrPlanFeatureGated("debugger", acct.Plan))
 		return
 	}
-	sinceDur := parseDebugSince(r, 1*time.Hour)
+	sinceRaw := r.URL.Query().Get("since")
+	sinceDur := parseDebugSinceFromString(sinceRaw, 1*time.Hour)
 	cap := time.Duration(limits.DebugTelemetryRetentionDays) * 24 * time.Hour
 	if cap > 0 && sinceDur > cap {
 		sinceDur = cap
@@ -206,7 +212,7 @@ func (s *server) debugRegressionsHandler(w http.ResponseWriter, r *http.Request,
 		items[i] = debugRegressionRowToItem(row)
 	}
 	writeJSON(w, http.StatusOK, api.DebugRegressionsResponse{
-		Since:       sinceDur.String(),
+		Since:       echoDebugSince(sinceRaw, sinceDur),
 		Regressions: items,
 	})
 }
