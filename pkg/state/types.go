@@ -5002,3 +5002,56 @@ const (
 	OpenAPIDocSourceColdBoot     = "cold_boot"
 	OpenAPIDocSourceManualUpload = "manual_upload"
 )
+
+// StatusIncident (issue #599 / ADR-130 / cluster D commit 14 of
+// the platform-observability mega-PR) is the in-memory mirror of
+// the status_incidents table. The public status page
+// (deploy/statuspage/index.html) reads this via the
+// gatewayd-internal /v1/internal/slo.json endpoint, which
+// fetches the open subset via ListOpenStatusIncidents. Operators
+// create + resolve rows via the gregalectl CLI (`gregale status
+// incident post|resolve`).
+//
+// Closed-set vocabulary at the schema layer (migrations/00412):
+//   - component ∈ {apid, schedd, vmmd, gatewayd, meterd, imaged,
+//     builderd, faas-control-plane}
+//   - severity  ∈ {degraded, partial_outage, full_outage, maintenance}
+//   - message ≤ 1024 chars (CHECK length cap so a paste of a 50
+//     KB stack trace can't bloat the response).
+//
+// The component / severity strings are also defined as named
+// constants below so the CLI surface can range-check before
+// hitting the SQL CHECK.
+type StatusIncident struct {
+	ID         int64
+	Component  string
+	Severity   string
+	Message    string
+	PostedAt   time.Time
+	ResolvedAt *time.Time
+}
+
+// StatusIncidentComponent* are the closed-set vocabulary for the
+// status_incidents.component column (migrations/00412). Add a
+// new component by appending a constant + extending the SQL CHECK
+// (canonical DROP+ADD pair mirrors the migrations/00412 pattern).
+const (
+	StatusIncidentComponentApid             = "apid"
+	StatusIncidentComponentSchedd           = "schedd"
+	StatusIncidentComponentVmmd             = "vmmd"
+	StatusIncidentComponentGatewayd         = "gatewayd"
+	StatusIncidentComponentMeterd           = "meterd"
+	StatusIncidentComponentImaged           = "imaged"
+	StatusIncidentComponentBuilderd         = "builderd"
+	StatusIncidentComponentFaasControlPlane = "faas-control-plane"
+)
+
+// StatusIncidentSeverity* are the closed-set vocabulary for the
+// status_incidents.severity column (migrations/00412). Same
+// migration-extension pattern as the component constants above.
+const (
+	StatusIncidentSeverityDegraded      = "degraded"
+	StatusIncidentSeverityPartialOutage = "partial_outage"
+	StatusIncidentSeverityFullOutage    = "full_outage"
+	StatusIncidentSeverityMaintenance   = "maintenance"
+)

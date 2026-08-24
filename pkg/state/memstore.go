@@ -114,7 +114,13 @@ type MemStore struct {
 	// the row back without a second query.
 	githubWebhookSecretMeta map[int64]webhookSecretMeta
 	deployments             map[string]Deployment
-	builds                  map[string]Build
+	// statusIncidents (issue #599 / ADR-130) is the in-memory
+	// mirror of the status_incidents table (migrations/00412).
+	// Append-only + resolved_at-stamped; the partial-index read
+	// (status_incidents_open WHERE resolved_at IS NULL) is mirrored
+	// by the ListOpenStatusIncidents loop filter.
+	statusIncidents []StatusIncident
+	builds          map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
 	// build_id (mirrors build_provenance.build_id UNIQUE). MemStore
 	// holds the same idempotent-replace semantics as PgStore's
@@ -4743,6 +4749,73 @@ func (m *MemStore) RecordRestart(_ context.Context, id string) error {
 	d.LivenessRestartCount++
 	m.deployments[id] = d
 	return nil
+}
+
+// InsertStatusIncident (issue #599 / ADR-130 / cluster D commit 14)
+// is the in-memory mirror of PgStore.InsertStatusIncident.
+// Closed-set vocabulary is enforced via switch rather than CHECK
+// (the in-memory store is dev-mode / unit-test only; production
+// runs against PgStore).
+func (m *MemStore) InsertStatusIncident(_ context.Context, component, severity, message string) (StatusIncident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch component {
+	case StatusIncidentComponentApid, StatusIncidentComponentSchedd,
+		StatusIncidentComponentVmmd, StatusIncidentComponentGatewayd,
+		StatusIncidentComponentMeterd, StatusIncidentComponentImaged,
+		StatusIncidentComponentBuilderd, StatusIncidentComponentFaasControlPlane:
+	default:
+		return StatusIncident{}, ErrNotFound // closed-set enforcement
+	}
+	switch severity {
+	case StatusIncidentSeverityDegraded, StatusIncidentSeverityPartialOutage,
+		StatusIncidentSeverityFullOutage, StatusIncidentSeverityMaintenance:
+	default:
+		return StatusIncident{}, ErrNotFound
+	}
+	if len(message) > 1024 {
+		return StatusIncident{}, ErrNotFound
+	}
+	inc := StatusIncident{
+		ID:        int64(len(m.statusIncidents) + 1),
+		Component: component,
+		Severity:  severity,
+		Message:   message,
+		PostedAt:  time.Now(),
+	}
+	m.statusIncidents = append(m.statusIncidents, inc)
+	return inc, nil
+}
+
+// ResolveStatusIncident (issue #599 / ADR-130) — in-memory mirror.
+// Idempotent on already-resolved rows (mirrors PgStore).
+func (m *MemStore) ResolveStatusIncident(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.statusIncidents {
+		if m.statusIncidents[i].ID == id {
+			if m.statusIncidents[i].ResolvedAt == nil {
+				now := time.Now()
+				m.statusIncidents[i].ResolvedAt = &now
+			}
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
+// ListOpenStatusIncidents (issue #599 / ADR-130) — in-memory mirror.
+// Returns the open subset (resolved_at == nil), most-recent first.
+func (m *MemStore) ListOpenStatusIncidents(_ context.Context) ([]StatusIncident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []StatusIncident
+	for i := len(m.statusIncidents) - 1; i >= 0; i-- {
+		if m.statusIncidents[i].ResolvedAt == nil {
+			out = append(out, m.statusIncidents[i])
+		}
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

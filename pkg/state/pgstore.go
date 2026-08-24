@@ -6031,6 +6031,75 @@ func (s *PgStore) RecordRestart(ctx context.Context, deploymentID string) error 
 	return nil
 }
 
+// InsertStatusIncident (issue #599 / ADR-130 / cluster D commit 14)
+// appends an open row to the status_incidents table. The CHECK
+// constraints on component + severity enforce the closed-set
+// vocabulary at the SQL layer so a typo at the CLI surface fails
+// closed (23514). The id is BIGSERIAL; we RETURN it for the CLI
+// to render ("incident <id> posted").
+func (s *PgStore) InsertStatusIncident(ctx context.Context, component, severity, message string) (StatusIncident, error) {
+	var inc StatusIncident
+	inc.Component = component
+	inc.Severity = severity
+	inc.Message = message
+	err := s.pool.QueryRow(ctx,
+		`insert into status_incidents (component, severity, message)
+		 values ($1, $2, $3)
+		 returning id, posted_at`,
+		component, severity, message,
+	).Scan(&inc.ID, &inc.PostedAt)
+	if err != nil {
+		return StatusIncident{}, err
+	}
+	return inc, nil
+}
+
+// ResolveStatusIncident (issue #599 / ADR-130) stamps resolved_at
+// on the row identified by id. Idempotent: a second call on an
+// already-resolved row returns nil so the CLI can re-issue a
+// resolve without surfacing 23514 / not-found. ErrNotFound when
+// the id doesn't exist.
+func (s *PgStore) ResolveStatusIncident(ctx context.Context, id int64) error {
+	tag, err := s.pool.Exec(ctx,
+		`update status_incidents
+		    set resolved_at = coalesce(resolved_at, now())
+		  where id = $1`,
+		id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListOpenStatusIncidents (issue #599 / ADR-130) reads the partial
+// index (status_incidents_open WHERE resolved_at IS NULL) sorted
+// by posted_at DESC. The /v1/internal/slo.json endpoint composes
+// its response from this list.
+func (s *PgStore) ListOpenStatusIncidents(ctx context.Context) ([]StatusIncident, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, component, severity, message, posted_at, resolved_at
+		   from status_incidents
+		  where resolved_at is null
+		  order by posted_at desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StatusIncident
+	for rows.Next() {
+		var inc StatusIncident
+		if err := rows.Scan(&inc.ID, &inc.Component, &inc.Severity,
+			&inc.Message, &inc.PostedAt, &inc.ResolvedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, inc)
+	}
+	return out, rows.Err()
+}
+
 // SetDeploymentSidecarLayer is the per-workload filesystem handle
 // for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
 // keyed by (deployment_id, sidecar_name). The whole row is

@@ -2083,6 +2083,33 @@ type Store interface {
 	// braces against a buggy caller.
 	RecordRestart(ctx context.Context, deploymentID string) error
 
+	// Issue #599 / ADR-130 / cluster D commit 14 of the
+	// platform-observability mega-PR — status-page incidents
+	// table (migrations/00412). Three methods on the Store
+	// interface:
+	//
+	//   InsertStatusIncident   appends an open row (resolved_at
+	//                          NULL). The status page surfaces
+	//                          this verbatim.
+	//   ResolveStatusIncident  stamps resolved_at on the row
+	//                          identified by id. Idempotent: a
+	//                          second call on an already-resolved
+	//                          row returns nil (no error) — the
+	//                          CLI can re-issue a resolve without
+	//                          surfacing 23514.
+	//   ListOpenStatusIncidents
+	//                          reads the partial-index
+	//                          (status_incidents_open WHERE
+	//                          resolved_at IS NULL) sorted by
+	//                          posted_at DESC. The
+	//                          /v1/internal/slo.json endpoint
+	//                          composes its response from this
+	//                          list plus meterd's loopback
+	//                          Prometheus exporter.
+	InsertStatusIncident(ctx context.Context, component, severity, message string) (StatusIncident, error)
+	ResolveStatusIncident(ctx context.Context, id int64) error
+	ListOpenStatusIncidents(ctx context.Context) ([]StatusIncident, error)
+
 	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
 	// document capture. The surface is paid-only (Free plan
 	// returns 403 from the apid) but the microVM always captures
