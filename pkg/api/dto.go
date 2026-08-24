@@ -5416,9 +5416,11 @@ type CreateEdgeRuleRequest struct {
 // UpdateEdgeRuleRequest is the wire shape for PATCH /v1/edge-rules/{id}.
 // All fields are optional; nil = "leave alone".
 //
-// ValidateMode is *string so nil = "leave alone" (no row update)
-// while an explicit empty string "" would coerce to 'block' via
-// the SQL coalesce — same shape as Priority / Enabled.
+// ValidateMode is *string so nil = "leave alone" (no row update).
+// An explicit empty string is a no-op — the pgstore UPDATE runs
+// coalesce(nullif($9, empty), validate_mode), which keeps the
+// existing column value. Customers who want to reset to 'block'
+// must send the explicit string "block".
 type UpdateEdgeRuleRequest struct {
 	MatchHost    *string          `json:"match_host,omitempty"`
 	MatchPath    *string          `json:"match_path,omitempty"`

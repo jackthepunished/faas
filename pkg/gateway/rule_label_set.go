@@ -8,13 +8,12 @@
 // cap of 256 distinct real rule IDs; overflow collapses to the
 // reserved "__other__" bucket.
 //
-// This is the in-package mirror of pkg/wire/rule_label_set.go
-// (the cross-daemon contract) and pkg/gateway/account_label_set.go
-// / pkg/gateway/hostname_label_set.go / pkg/gateway/route_label_set.go
-// (the existing per-package mirrors). pkg/gateway cannot import
-// pkg/wire (cycle, documented at cmd/gatewayd-internal/topn.go:14-21),
-// so each label-set family has its own copy with the same
-// contract.
+// This is the in-package mirror (mirrors pkg/gateway/account_label_set.go
+// / pkg/gateway/hostname_label_set.go / pkg/gateway/route_label_set.go)
+// of the cross-daemon label-set contract pattern. pkg/gateway
+// cannot import pkg/wire (cycle, documented at
+// cmd/gatewayd-internal/topn.go:14-21), so each label-set family
+// has its own copy with the same contract.
 //
 // Behavioural contract:
 //
@@ -42,7 +41,7 @@ import "sync"
 // mode, reason}. Sized for the realistic 95th-percentile
 // customer (most apps have <50 rules; apps with >256 rules are
 // unusual but possible). Worst-case per-app cardinality is
-// (256 rules + 1 __other__) × 3 modes × 6 reasons = 4638 series
+// (256 rules + 1 __other__) × 4 modes × 6 reasons = 6168 series
 // per app, well under Prometheus' per-instance label budget.
 const ruleLabelSetCap = 256
 

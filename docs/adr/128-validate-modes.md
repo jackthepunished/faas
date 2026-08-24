@@ -115,8 +115,10 @@ the Prometheus label budget. Mirror PR #1070's `boxLabelSet` pattern
 - Property test: 10k fuzzed `(appID, ruleID)` pairs per app → ≤ 257
   distinct labels per app.
 
-**Cardinality budget:** per app, ≤ (256 rules + 1 `__other__`) × 3 modes
-× 6 reasons = 4638 series worst case. Well under Prometheus per-instance
+**Cardinality budget:** per app, ≤ (256 rules + 1 `__other__`) × 4 modes
+× 6 reasons = 6168 series worst case (modes: observe, warn, block,
+other — `other` is the coerce-on-unknown bucket per the closed
+vocab). Well under Prometheus per-instance
 label budget.
 
 ### 4. Wire-format change
