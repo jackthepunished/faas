@@ -158,3 +158,188 @@ func TestPrintPlanText_WarnCountReflectsPlanRemoved(t *testing.T) {
 		t.Fatalf("warning count drift: got output %q, want substring %q", out, "3 app(s)")
 	}
 }
+
+// rescuePlan returns the wire shape the server emits when the
+// gate was blocked pre-exclude and --exclude rescued it. The
+// wire invariant (cmd/apid/scan_service.go:864) is
+// `gateRescuedByExclude := !preCanApply && canApply`, so
+// CanApply=true + GateRescuedByExclude=true is the rescue case.
+// Reasons carry the pre-exclude blocker list so the operator
+// sees what would have failed without --exclude.
+func rescuePlan() api.PlanResponse {
+	p := basePlan()
+	p.CanApplyPreExclude = false
+	p.GateRescuedByExclude = true
+	p.CanApplyReasons = []string{"plan_apps_over_limit"}
+	p.Workloads = []api.PlanWorkload{{Name: "api", RootDir: "/api", Class: "http"}}
+	return p
+}
+
+// TestPrintPlanText_RendersRescueLine pins ADR-124 follow-up #1:
+// when the gate was blocked pre-exclude and --exclude rescued
+// it, the operator sees the rescue line + the pre-exclude
+// reason list BEFORE the can_apply: true line. A refactor that
+// moved the rescue render to after can_apply would bury the
+// signal in a workloads table the operator isn't reading yet.
+func TestPrintPlanText_RendersRescueLine(t *testing.T) {
+	var buf bytes.Buffer
+	exit := printPlanText(&buf, rescuePlan(), []string{"checkout-api"}, false)
+	if exit != 0 {
+		t.Fatalf("printPlanText exit code: got %d, want 0", exit)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Gate rescued by --exclude") {
+		t.Fatalf("missing rescue header; output:\n%s", out)
+	}
+	if !strings.Contains(out, "plan_apps_over_limit") {
+		t.Fatalf("missing pre-exclude reason; output:\n%s", out)
+	}
+	// The rescue line must appear BEFORE the can_apply: true line so
+	// the operator sees it before reading the workloads table.
+	rescueIdx := strings.Index(out, "Gate rescued by --exclude")
+	canApplyIdx := strings.Index(out, "can_apply: true")
+	if rescueIdx < 0 || canApplyIdx < 0 {
+		t.Fatalf("missing one of the markers; got:\n%s", out)
+	}
+	if rescueIdx > canApplyIdx {
+		t.Fatalf("rescue header appeared after can_apply: true (rescue=%d, can_apply=%d); output:\n%s",
+			rescueIdx, canApplyIdx, out)
+	}
+}
+
+// TestPrintPlanText_NoRescueLineWhenCanApplyFalseButNotRescued is
+// the REGRESSION GUARD for the early-return preservation. The
+// PR-A followup is constrained to render the rescue line ONLY
+// when GateRescuedByExclude=true; the !CanApply && !Rescued
+// path (still-blocked gate) must NOT emit the rescue header —
+// the operator sees "can_apply: false" + the existing partition
+// view instead. A refactor that "simplified" the branch and
+// rendered rescue info on any !CanApply path would surface
+// confusing lines for non-rescue failures.
+func TestPrintPlanText_NoRescueLineWhenCanApplyFalseButNotRescued(t *testing.T) {
+	plan := basePlan()
+	plan.CanApply = false             // post-exclude gate also blocks
+	plan.CanApplyPreExclude = false   // pre-exclude gate was also blocked
+	plan.GateRescuedByExclude = false // --exclude did NOT rescue
+	plan.CanApplyReasons = []string{"plan_apps_over_limit"}
+
+	var buf bytes.Buffer
+	exit := printPlanText(&buf, plan, []string{"checkout-api"}, false)
+	if exit != 0 {
+		t.Fatalf("printPlanText exit code: got %d, want 0", exit)
+	}
+	out := buf.String()
+	if strings.Contains(out, "Gate rescued by --exclude") {
+		t.Fatalf("unexpected rescue line on still-blocked plan; output:\n%s", out)
+	}
+	if !strings.Contains(out, "can_apply: false") {
+		t.Fatalf("missing can_apply: false; output:\n%s", out)
+	}
+}
+
+// TestPrintPlanText_NoEarlyReturnWhenRescued pins the wire-
+// invariant contract: when --exclude rescues the gate, CanApply
+// is true (server: !preCanApply && canApply). printPlanText
+// must NOT take the !CanApply early-return path on a rescued
+// plan, or the operator sees an empty render. The workloads
+// table is the post-rescue fingerprint of "render continued".
+func TestPrintPlanText_NoEarlyReturnWhenRescued(t *testing.T) {
+	var buf bytes.Buffer
+	exit := printPlanText(&buf, rescuePlan(), []string{"checkout-api"}, false)
+	if exit != 0 {
+		t.Fatalf("printPlanText exit code: got %d, want 0", exit)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Workloads:") {
+		t.Fatalf("rescued plan did not reach the workloads table (early-return leaked); output:\n%s", out)
+	}
+}
+
+// TestPrintPlanText_NoRescueLineOnHappyPath pins the negative
+// case for the rescue render: a normal can_apply=true plan
+// (no rescue, no warning) must NOT emit "Gate rescued by
+// --exclude". This is the script-grep / CI-output stability
+// test — every can_apply=true scan on the common path should
+// produce identical output shape.
+func TestPrintPlanText_NoRescueLineOnHappyPath(t *testing.T) {
+	var buf bytes.Buffer
+	exit := printPlanText(&buf, basePlan(), nil, false)
+	if exit != 0 {
+		t.Fatalf("printPlanText exit code: got %d, want 0", exit)
+	}
+	out := buf.String()
+	if strings.Contains(out, "Gate rescued by --exclude") {
+		t.Fatalf("rescue line appeared on a non-rescued plan; output:\n%s", out)
+	}
+}
+
+// TestPlanProblem_GateBlocked pins the ADR-124 follow-up #1 4th
+// branch of planProblem: when the gate was blocked pre-exclude
+// AND post-exclude did not rescue, the wire code is
+// CodePlanGateBlocked (a new constant) carrying the full
+// can_apply_reasons list. A refactor that reused
+// CodePlanLimitApps / CodePlanCronQuota for this case would
+// silently break the dashboard's upsell-vs-quota copy because
+// those codes drive specific render templates. The Test
+// covers:
+//  1. The 403 status is preserved (gate blocks at apply).
+//  2. Code is CodePlanGateBlocked (the new constant).
+//  3. Title + Detail carry the operator-visible signal.
+//  4. Multi-reason join uses "; " between entries (matches
+//     the textual convention of the server-side wire).
+func TestPlanProblem_GateBlocked(t *testing.T) {
+	plan := basePlan()
+	plan.CanApply = false
+	plan.CanApplyPreExclude = false
+	plan.GateRescuedByExclude = false
+	plan.CanApplyReasons = []string{"plan_apps_over_limit", "plan_crons_over_limit"}
+
+	p := planProblem(plan)
+	if p.Status != 403 {
+		t.Errorf("planProblem Status: got %d, want 403", p.Status)
+	}
+	if p.Code != api.CodePlanGateBlocked {
+		t.Errorf("planProblem Code: got %q, want %q", p.Code, api.CodePlanGateBlocked)
+	}
+	if !strings.Contains(p.Detail, "plan_apps_over_limit") {
+		t.Errorf("planProblem Detail missing first reason; got %q", p.Detail)
+	}
+	if !strings.Contains(p.Detail, "plan_crons_over_limit") {
+		t.Errorf("planProblem Detail missing second reason; got %q", p.Detail)
+	}
+	if !strings.Contains(p.Detail, "; ") {
+		t.Errorf("planProblem Detail missing reason separator '; '; got %q", p.Detail)
+	}
+}
+
+// TestPlanProblem_PreservesExistingOrdering pins the regression-
+// guard ordering of the 4 branches: CronsNotAllowed wins over
+// OverApps wins over GateBlocked (the new 4th branch) wins over
+// the CronQuota fallback. A refactor that re-ordered these
+// would change wire behaviour on the existing 3 code paths;
+// existing dashboards key off the specific codes.
+func TestPlanProblem_PreservesExistingOrdering(t *testing.T) {
+	// CronsNotAllowed still wins, even with GateBlocked conditions.
+	plan := basePlan()
+	plan.CronsNotAllowed = true
+	plan.CanApplyPreExclude = false
+	plan.CanApplyReasons = []string{"some_other_reason"}
+
+	p := planProblem(plan)
+	if p.Code != api.CodePlanCronsNotAllowed {
+		t.Errorf("CronsNotAllowed branch lost to GateBlocked; got code %q, want %q",
+			p.Code, api.CodePlanCronsNotAllowed)
+	}
+
+	// OverApps still wins over GateBlocked.
+	plan = basePlan()
+	plan.ObservedApps = plan.LimitApps + 1
+	plan.CanApplyPreExclude = false
+	plan.CanApplyReasons = []string{"some_other_reason"}
+
+	p = planProblem(plan)
+	if p.Code != api.CodePlanLimitApps {
+		t.Errorf("OverApps branch lost to GateBlocked; got code %q, want %q",
+			p.Code, api.CodePlanLimitApps)
+	}
+}

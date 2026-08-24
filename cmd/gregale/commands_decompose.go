@@ -336,6 +336,29 @@ func printPlanText(w io.Writer, plan api.PlanResponse, excludeSet []string, show
 	if plan.CronsNotAllowed {
 		fmt.Fprintln(w, "(Crons unavailable on this plan — upgrade to Hobby or above.)")
 	}
+	// ADR-124 follow-up #1: when the gate was blocked pre-exclude
+	// AND --exclude rescued it (server invariant: gateRescuedByExclude
+	// => canApply=true), surface the rescue BEFORE the can_apply:true
+	// line so the operator sees "your --exclude saved you". The wire
+	// invariant means the early-return below cannot fire on a rescued
+	// plan — CanApply is true whenever GateRescuedByExclude is true.
+	// The CanApplyReasons slice carries the pre-exclude blocker list
+	// (what would have failed without --exclude); we render it as a
+	// bulleted set so a single-problem case and a multi-problem case
+	// look the same. Do NOT remove the !CanApply early-return — that
+	// path is the operator-visible "this plan failed" surface and
+	// planProblem (below) carries the wire code; changing it would
+	// silently break script grep on "can_apply: false".
+	if plan.CanApply && plan.GateRescuedByExclude {
+		PrintWarn(w, "Gate rescued by --exclude (pre-exclude gate was blocked):")
+		if len(plan.CanApplyReasons) == 0 {
+			fmt.Fprintln(w, "    (no pre-exclude reasons reported)")
+		} else {
+			for _, r := range plan.CanApplyReasons {
+				fmt.Fprintf(w, "    pre-exclude reason: %s\n", r)
+			}
+		}
+	}
 	if !plan.CanApply {
 		fmt.Fprintln(w, "can_apply: false")
 		return 0
@@ -489,6 +512,23 @@ func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse, excludeSet []s
 // RFC 7807 problem shape the apid handler emits. Used by the --json
 // path so a CLI consumer sees the same wire shape as a direct
 // httptest call would produce.
+//
+// ADR-124 follow-up #1: a 4th branch handles the pre-exclude gate
+// block. The wire invariant (scan_service.go:864) is
+// `gateRescuedByExclude := !preCanApply && canApply`, so the
+// over-quota exit (`!plan.CanApply`) means either:
+//   - the gate was blocked pre-exclude AND post-exclude --exclude
+//     did NOT rescue it; OR
+//   - a wire bug (planProblem is defensive — uses !CanApplyPreExclude
+//     rather than CanApplyPreExclude truth value as the discriminator).
+//
+// The first two branches (CronsNotAllowed + OverApps) keep their
+// specific codes so dashboards can still surface the upsell-vs-quota
+// copy they already render. The new branch carries the full
+// can_apply_reasons list so the operator sees every blocker, not
+// just the first — a deliberate "single problem + tail" ugly
+// message is worse than the joined string in the rare multi-block
+// case.
 func planProblem(plan api.PlanResponse) api.Problem {
 	if plan.CronsNotAllowed {
 		return api.Problem{
@@ -504,6 +544,28 @@ func planProblem(plan api.PlanResponse) api.Problem {
 			Code:   api.CodePlanLimitApps,
 			Title:  "App limit reached",
 			Detail: fmt.Sprintf("plan caps apps at %d; you have %d.", plan.LimitApps, plan.ObservedApps),
+		}
+	}
+	if !plan.CanApplyPreExclude {
+		// The OLD test invariant: when ObservedCrons > LimitCrons
+		// (the implicit cron-quota case that fell through to the
+		// CronQuota fallback), the wire code stays plan_cron_quota.
+		// The GateBlocked path catches every other gate-block
+		// case — typically a future gate type that doesn't have a
+		// specific wire code yet, or a multi-reason block where
+		// cron-quota is not the primary reason. Without the
+		// ObservedCrons <= LimitCrons guard we would re-route the
+		// `cron-limit` case (TestPlanProblem_Mapping/cron-limit in
+		// commands_decompose_test.go) onto CodePlanGateBlocked,
+		// breaking the wire-shape parity test that ADRs pin.
+		if plan.ObservedCrons <= plan.LimitCrons {
+			return api.Problem{
+				Status: 403,
+				Code:   api.CodePlanGateBlocked,
+				Title:  "Plan gate blocked",
+				Detail: fmt.Sprintf("gate was blocked pre-exclude; reasons: %s",
+					strings.Join(plan.CanApplyReasons, "; ")),
+			}
 		}
 	}
 	return api.Problem{

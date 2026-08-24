@@ -2300,6 +2300,19 @@ const CodePlanCronsNotAllowed = "plan_crons_not_allowed"
 // upsell-vs-delete copy without parsing the body.
 const CodePlanCronQuota = "plan_cron_quota"
 
+// CodePlanGateBlocked is the 403 the operator sees when a scan
+// project's plan gate was blocked pre-exclude AND the post-exclude
+// --exclude filter did not rescue it. ADR-124 follow-up #1
+// (cmd/gregale/commands_decompose.go::planProblem 4th branch);
+// distinct from CodePlanLimitApps/CodePlanCronQuota because the
+// rejection carries the full can_apply_reasons list (one or more
+// of the gate's pre-exclude evaluations) so the operator sees
+// every blocker, not just the first one. The wire sets this only
+// when gateRescuedByExclude is false (otherwise CanApply is true
+// and the apply path is reachable). Mirrors the rescue info
+// printPlanText renders on can_apply: true.
+const CodePlanGateBlocked = "plan_gate_blocked"
+
 // CodePlanAlertRulesNotAllowed is the 402 the customer sees when
 // the plan doesn't unlock alert rules at all (Free today; the
 // plan-tier gate fires before loadApp so the slug's existence is
