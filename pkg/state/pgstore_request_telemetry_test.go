@@ -178,24 +178,22 @@ func TestPgStoreRequestTelemetry_BaselineP95(t *testing.T) {
 	if rows[0].Route != "GET /p95" {
 		t.Errorf("BaselineP95.Route = %q, want %q", rows[0].Route, "GET /p95")
 	}
-	// percentile_cont(0.95) is a continuous interpolation; for 3
-	// samples (10, 50, 200) the formula is:
-	//   p95 = 10 + 0.95*(200-10) = 10 + 180.5 → 190
-	// Cast to int rounds toward zero; Postgres actual returned 185
-	// in the test run (the ORDER BY semantics + double precision
-	// rounding push it a few units below the float-math prediction).
-	// Pin the LOOSE invariant: p95 must be at least the max sample
-	// (it's a high-percentile aggregate, must not under-estimate).
-	// This pins the regression-detector floor: a future change that
-	// silently swaps percentile_cont → percentile_disc must NOT
-	// trip a max-sample violation here.
-	if rows[0].P95Ms < 200 {
-		t.Errorf("BaselineP95.P95Ms = %d, want >= 200 (must not under-estimate max sample 200)", rows[0].P95Ms)
-	}
-	if rows[0].P95Ms > 200 {
-		// Acceptable if a future migration changes the percentile
-		// function (e.g. percentile_disc rounds UP), but flag it.
-		t.Logf("BaselineP95.P95Ms = %d, exceeds max sample 200 (acceptable if percentile_disc swaps in)", rows[0].P95Ms)
+	// percentile_cont(0.95) is a continuous interpolation between the
+	// two surrounding sorted samples. For 3 samples (10, 50, 200):
+	//   ordinal position = 0.95 * (3-1) = 1.9
+	//   row 1.9 falls between index 1 (value 50) and index 2 (value 200)
+	//   fractional offset = 0.9
+	//   p95 = 50 + 0.9*(200-50) = 50 + 135 = 185
+	// Cast to int rounds toward zero. Postgres returns 185 — the
+	// expected, correct value for percentile_cont at 0.95 over 3
+	// samples. Pinning this exact value catches a future change that
+	// silently swaps percentile_cont → percentile_disc (which would
+	// return 200 = the nearest-rank sample) or percentile_cont → a
+	// different quantile (e.g. 0.99 would skew the regression baseline
+	// higher). The regression detector's math depends on this exact
+	// 185; if it drifts, the canary baseline drifts too.
+	if rows[0].P95Ms != 185 {
+		t.Errorf("BaselineP95.P95Ms = %d, want 185 (percentile_cont(0.95) over [10,50,200] = 50 + 0.9*(200-50))", rows[0].P95Ms)
 	}
 }
 
