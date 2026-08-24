@@ -45,6 +45,21 @@ check "/etc/faas/secrets/host.hmac.key exists with mode 0400 root:root" bash -c 
     && [[ "$(stat -c "%U:%G" /etc/faas/secrets/host.hmac.key)" == "root:root" ]]
 '
 
+# 1c. The session key file content must be exactly 64 hex chars
+#     (32 raw bytes; the loader at cmd/apid/handlers_auth.go:325
+#     hex.DecodeString's it on boot). The verify-secrets.sh "file is
+#     there + 0400" check above doesn't catch a hand-edited 32-char
+#     file that would silently fall back to the ephemeral manager —
+#     the A5 silent-degradation bug closed by PR #1078. Content is
+#     trimmed of trailing newline (the canonical `gregale secrets
+#     init` output emits 64 chars; a hand edit with echo often
+#     appends `\n`).
+check "/etc/faas/secrets/session.key content is 64 hex chars (32 raw bytes)" bash -c '
+  content="$(tr -d "\n" < /etc/faas/secrets/session.key)"
+  [[ "${#content}" -eq 64 ]] \
+    && [[ "${content}" =~ ^[0-9a-fA-F]{64}$ ]]
+'
+
 # 2. sealed.env MUST NOT carry FAAS_SESSION_KEY any more — that
 #    was the A4 leak. Operators migrating from a pre-A4 install need
 #    to re-run the v2 secrets init (PR-X `gregale secrets init`, pending)
@@ -60,9 +75,20 @@ check "sealed.env does NOT contain FAAS_SESSION_KEY" bash -c '
 '
 
 # 3. faas-apid's environment carries FAAS_SESSION_KEY (systemd
-#    LoadCredential → Environment= substitution).
-check "faas-apid loads FAAS_SESSION_KEY" bash -c '
-  systemctl show faas-apid -p Environment 2>/dev/null | grep -q "FAAS_SESSION_KEY"
+#    LoadCredential → Environment= substitution). The shape of the
+#    value (PATH-shaped: starts with /run/credentials/, OR
+#    CONTENT-shaped: exactly 64 hex chars) is what matters — without
+#    the shape match the loader either fail-closes (close, but boot
+#    is broken) or silently falls back to NewEphemeralManager (the
+#    A5 silent-degradation bug). The unit source at
+#    /etc/systemd/system/faas-apid.service MUST declare
+#    FAAS_SESSION_KEY=%d/faas_session_key (PATH-shaped) AND a matching
+#    LoadCredential=faas_session_key:<src-path>; otherwise the
+#    systemd expansion writes a literal "%d" into the env var.
+check "faas-apid loads FAAS_SESSION_KEY (PATH-shaped)" bash -c '
+  unit=/etc/systemd/system/faas-apid.service
+  grep -q "^Environment=FAAS_SESSION_KEY=%d/faas_session_key" "$unit" \
+    && grep -q "^LoadCredential=faas_session_key:" "$unit"
 '
 
 # 3b. The per-host value-hash HMAC key must be scoped to apid through
