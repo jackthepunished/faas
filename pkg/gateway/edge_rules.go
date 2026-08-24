@@ -213,6 +213,13 @@ type EdgeRuleCORSResolved struct {
 	ExposeHeaders    []string
 	AllowCredentials bool
 	MaxAgeSeconds    int
+	// PresetID (issue #975 #4 PR-B / ADR-129 D3) is the
+	// resolved preset's id when the rule stamped a
+	// cors_preset_id; empty when the rule is inline-only.
+	// Stamped at compile time so the runtime applier
+	// (handler.go::applyEdgeRuleCORS) can stamp the
+	// Access-Control-* headers without a second lookup.
+	PresetID string
 }
 
 // EdgeRuleJWTResolved is the kind=jwt subset (ADR-091). PR 5 calls
