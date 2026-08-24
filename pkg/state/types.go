@@ -1348,6 +1348,21 @@ type Deployment struct {
 	SecretFindings  []byte     `json:"secret_findings,omitempty"`
 	SecretScannedAt *time.Time `json:"secret_scanned_at,omitempty"`
 
+	// LivenessRestartCount (issue #586 / ADR-129 / cluster C
+	// commit 12) is the persisted lifetime restart counter for
+	// this deployment. pkg/state.pgstore.RecordRestart bumps it
+	// alongside the in-memory LivenessWindow.RecordRestart call
+	// (migrations/00411). On schedd startup the LivenessWindow
+	// seeds from this column so a fresh process inherits the
+	// prior count instead of starting at zero — closing the
+	// "schedd restart resets the restart-loop signal" gap. The
+	// column is monotonic in the application code; the
+	// deployments_liveness_restart_count_nonneg_chk CHECK is a
+	// belt-and-braces SQL-level guard. Dashboard surfaces query
+	// this column for the "Restart count (lifetime)" stat on
+	// /v1/deployments/{id}.
+	LivenessRestartCount int `json:"liveness_restart_count,omitempty"`
+
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping
 	// apps.status to `evicted_cold`; the apid GET /v1/apps/{slug}
@@ -5085,6 +5100,59 @@ const OpenAPIDocMaxBytes = 128 * 1024
 const (
 	OpenAPIDocSourceColdBoot     = "cold_boot"
 	OpenAPIDocSourceManualUpload = "manual_upload"
+)
+
+// StatusIncident (issue #599 / ADR-130 / cluster D commit 14 of
+// the platform-observability mega-PR) is the in-memory mirror of
+// the status_incidents table. The public status page
+// (deploy/statuspage/index.html) reads this via the
+// gatewayd-internal /v1/internal/slo.json endpoint, which
+// fetches the open subset via ListOpenStatusIncidents. Operators
+// create + resolve rows via the gregalectl CLI (`gregale status
+// incident post|resolve`).
+//
+// Closed-set vocabulary at the schema layer (migrations/00412):
+//   - component ∈ {apid, schedd, vmmd, gatewayd, meterd, imaged,
+//     builderd, faas-control-plane}
+//   - severity  ∈ {degraded, partial_outage, full_outage, maintenance}
+//   - message ≤ 1024 chars (CHECK length cap so a paste of a 50
+//     KB stack trace can't bloat the response).
+//
+// The component / severity strings are also defined as named
+// constants below so the CLI surface can range-check before
+// hitting the SQL CHECK.
+type StatusIncident struct {
+	ID         int64
+	Component  string
+	Severity   string
+	Message    string
+	PostedAt   time.Time
+	ResolvedAt *time.Time
+}
+
+// StatusIncidentComponent* are the closed-set vocabulary for the
+// status_incidents.component column (migrations/00412). Add a
+// new component by appending a constant + extending the SQL CHECK
+// (canonical DROP+ADD pair mirrors the migrations/00412 pattern).
+const (
+	StatusIncidentComponentApid             = "apid"
+	StatusIncidentComponentSchedd           = "schedd"
+	StatusIncidentComponentVmmd             = "vmmd"
+	StatusIncidentComponentGatewayd         = "gatewayd"
+	StatusIncidentComponentMeterd           = "meterd"
+	StatusIncidentComponentImaged           = "imaged"
+	StatusIncidentComponentBuilderd         = "builderd"
+	StatusIncidentComponentFaasControlPlane = "faas-control-plane"
+)
+
+// StatusIncidentSeverity* are the closed-set vocabulary for the
+// status_incidents.severity column (migrations/00412). Same
+// migration-extension pattern as the component constants above.
+const (
+	StatusIncidentSeverityDegraded      = "degraded"
+	StatusIncidentSeverityPartialOutage = "partial_outage"
+	StatusIncidentSeverityFullOutage    = "full_outage"
+	StatusIncidentSeverityMaintenance   = "maintenance"
 )
 
 // ---------------------------------------------------------------------------

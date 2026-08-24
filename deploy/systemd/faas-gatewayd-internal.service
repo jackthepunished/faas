@@ -11,6 +11,7 @@ Group=faas
 ExecStart=/opt/faas/current/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml
 Restart=on-failure
 RestartSec=2s
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 Slice=faas-cp.slice
 MemoryMax=512M
 EnvironmentFile=-/etc/faas/compute-db.env

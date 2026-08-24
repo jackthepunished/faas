@@ -1206,13 +1206,17 @@ func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
 }
 
 // TestOpsMetrics_WakeFailurePreinstantiated (issue #1059 / ADR-127)
-// pins the closed (box, reason) cartesian for the wake-failure counter
-// at boot. The constructor pre-instantiates every (box, reason) pair
-// for the reserved boxes (labelLocal, otherBoxLabel) × every closed
-// reason, so the §12 "Wake failures by reason (24h)" dashboard panel
-// surfaces a non-zero baseline from t=0 — the regression that drops
-// the pre-instantiation loop trips here, not in a downstream
-// "missing series" alert.
+// pins the closed (box, app, reason) cartesian for the wake-failure
+// counter at boot (commit 2 of the platform-observability mega-PR
+// extended the counter from {box, reason} to {box, app, reason};
+// commit 3 added the 2 schedd-side audit-reason strings). The
+// constructor pre-instantiates every (box, app, reason) tuple for
+// the reserved boxes (labelLocal, otherBoxLabel) × the reserved
+// apps (labelAppUnknown == "", otherAppLabel == "__other__") × every
+// closed reason = 2 × 2 × 10 = 40 series, so the §12 "Wake failures
+// by reason (24h)" dashboard panel surfaces a non-zero baseline
+// from t=0 — the regression that drops the pre-instantiation loop
+// trips here, not in a downstream "missing series" alert.
 func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
@@ -1225,39 +1229,44 @@ func TestOpsMetrics_WakeFailurePreinstantiated(t *testing.T) {
 		"vsock_fail",
 		"snapshot_restore_err",
 		"mem_backend_err",
+		"vmm_boot_failed",
+		"record_runtime_failed",
 	} {
 		for _, box := range []string{`local`, `__other__`} {
-			want := fmt.Sprintf(`vmmd_wake_failure_total{box=%q,reason=%q} 0`, box, reason)
-			if !strings.Contains(body, want) {
-				t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+			for _, app := range []string{``, `__other__`} {
+				want := fmt.Sprintf(`vmmd_wake_failure_total{app=%q,box=%q,reason=%q} 0`, app, box, reason)
+				if !strings.Contains(body, want) {
+					t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+				}
 			}
 		}
 	}
 }
 
 // TestOpsMetrics_WakeFailureIncrement (issue #1059 / ADR-127) pins
-// the per-(box, reason) counter flow. Three increments on the same
-// (box, reason) tuple must surface as `3` in the scrape body; two
-// increments on a different (box, reason) tuple must surface as `2`;
-// the reserved (__other__) bucket must remain at `0` until a real box
-// crosses the admission cap. The Prometheus Exposer reports the
-// current value per series, not the running total — the test fires
-// the increments via the accessor, not by hand-rolling the metric.
+// the per-(box, app, reason) counter flow. Three increments on the
+// same (box, app, reason) tuple must surface as `3` in the scrape
+// body; two increments on a different tuple must surface as `2`;
+// the reserved (__other__) buckets must remain at `0` until a real
+// box / app crosses the admission cap. The Prometheus Exposer
+// reports the current value per series, not the running total —
+// the test fires the increments via the accessor, not by
+// hand-rolling the metric.
 func TestOpsMetrics_WakeFailureIncrement(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "snapshot_restore_err").Inc()
-	m.WakeFailure("local", "netns_fail").Inc()
-	m.WakeFailure("local", "netns_fail").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "snapshot_restore_err").Inc()
+	m.WakeFailure("local", "my-app", "netns_fail").Inc()
+	m.WakeFailure("local", "my-app", "netns_fail").Inc()
 
 	body := render(t, m)
 	for _, want := range []string{
-		`vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 3`,
-		`vmmd_wake_failure_total{box="local",reason="netns_fail"} 2`,
-		// Reserved overflow bucket stays at 0 until a real box crosses
-		// the cap (see TestWakeFailure_OverflowCollapsesToOtherSlow).
-		`vmmd_wake_failure_total{box="__other__",reason="snapshot_restore_err"} 0`,
+		`vmmd_wake_failure_total{app="my-app",box="local",reason="snapshot_restore_err"} 3`,
+		`vmmd_wake_failure_total{app="my-app",box="local",reason="netns_fail"} 2`,
+		// Reserved overflow buckets stay at 0 until a real box / app
+		// crosses the cap.
+		`vmmd_wake_failure_total{app="__other__",box="__other__",reason="snapshot_restore_err"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
@@ -1266,18 +1275,20 @@ func TestOpsMetrics_WakeFailureIncrement(t *testing.T) {
 }
 
 // TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap (issue
-// #1059 / ADR-127) — the two reserved box labels ("local" and
-// "__other__") are admitted at boot without consuming capacity, so
-// they surface in /metrics as `0`-valued series on an idle daemon.
-// The metric-reader relies on this for "no data" detection — a
-// regression that admitted reserved labels against the cap would
-// leave a quiet fleet invisible to the §12 panel.
+// #1059 / ADR-127) — the reserved box labels (labelLocal,
+// otherBoxLabel) and reserved app labels (labelAppUnknown == "",
+// otherAppLabel == "__other__") are admitted at boot without
+// consuming capacity, so they surface in /metrics as `0`-valued
+// series on an idle daemon. The metric-reader relies on this for
+// "no data" detection — a regression that admitted reserved labels
+// against the cap would leave a quiet fleet invisible to the §12
+// panel.
 func TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
 	for _, want := range []string{
-		`vmmd_wake_failure_total{box="local",reason="snapshot_stale"} 0`,
-		`vmmd_wake_failure_total{box="__other__",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="",box="local",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="__other__",box="__other__",reason="snapshot_stale"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing reserved-label series %q in:\n%s", want, body)
@@ -1292,8 +1303,142 @@ func TestOpsMetrics_WakeFailureReservedLabelsNeverAgainstCap(t *testing.T) {
 // return nil`.
 func TestOpsMetrics_WakeFailureNilSafe(t *testing.T) {
 	var m *wire.OpsMetrics
-	if got := m.WakeFailure("local", "netns_fail"); got != nil {
+	if got := m.WakeFailure("local", "", "netns_fail"); got != nil {
 		t.Errorf("nil.WakeFailure = %v, want nil", got)
+	}
+}
+
+// TestWakeFailure_ClosedCartesian_PreInstantiated (issue #1059 /
+// ADR-127 §3.5 — cluster A commit 2 of the platform-observability
+// mega-PR) pins the (box, app, reason) cartesian at boot. After
+// the per-app wake-failure split and the schedd-side audit-reason
+// addition (cluster A commit 3), the metric ships 2 reserved boxes
+// × {labelAppUnknown, otherAppLabel} × 10 reasons = 40 series on an
+// idle daemon. The §12 "Wake failures by reason (24h)" dashboard
+// panel depends on the cartesian being complete at t=0 — a
+// regression that drops the inner for-loop trips here before it
+// surfaces as a "missing series" alert at 03:00. The COUNT marker
+// below pins the cartesian shape; the per-tuple loop pins the
+// (box, app, reason) ordering.
+func TestWakeFailure_ClosedCartesian_PreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	boxes := []string{`local`, `__other__`}
+	apps := []string{``, `__other__`}
+	reasons := []string{
+		`snapshot_stale`, `disk_full`, `jailer_fail`, `netns_fail`,
+		`cgroup_fail`, `vsock_fail`, `snapshot_restore_err`, `mem_backend_err`,
+		`vmm_boot_failed`, `record_runtime_failed`,
+	}
+	wantCount := len(boxes) * len(apps) * len(reasons)
+	gotCount := 0
+	for _, box := range boxes {
+		for _, app := range apps {
+			for _, reason := range reasons {
+				needle := fmt.Sprintf(`vmmd_wake_failure_total{app=%q,box=%q,reason=%q}`, app, box, reason)
+				if !strings.Contains(body, needle) {
+					t.Errorf("missing cartesian entry %q in:\n%s", needle, body)
+					continue
+				}
+				gotCount++
+			}
+		}
+	}
+	if gotCount != wantCount {
+		t.Errorf("cartesian series count = %d, want %d (the (box, app, reason) cartesian is incomplete)", gotCount, wantCount)
+	}
+}
+
+// TestBoxHostname_AdmissionSet pins the multi-host box-resolver
+// contract from cluster A commit 5 of the platform-observability
+// mega-PR (issue #1059 / ADR-127 §3.4 follow-up). The test
+// covers three guarantees:
+//
+//  1. BoxHostname() returns a non-empty, hostname-shaped label
+//     — operators get a real per-host Prometheus row, not a
+//     flat "local" series for every box in the fleet.
+//  2. OpsMetrics.WakeFailure with box="" resolves to BoxHostname()
+//     (the accessor-level fallback added in commit 5). The
+//     emitted series carries the host's hostname under the
+//     `box` label.
+//  3. Overflow collapses — once more than maxBoxLabelValues
+//     distinct box labels are admitted, new boxes land in
+//     otherBoxLabel ("__other__") per the existing boxLabelSet
+//     contract.
+//
+// The TODO(multi-host/ADR-066) comment block on BoxHostname()
+// documents the follow-up: replace os.Hostname() with
+// pkg/state/pkgstore.ComputeNodeIDForSelf() once the
+// compute_nodes table lands.
+//
+// The test deliberately runs (1)/(2) and (3) on TWO INDEPENDENT
+// registries so the hostname admission in (2) doesn't deplete
+// the cap for (3). Joining them on one registry would couple
+// the host's os.Hostname() to the overflow count, which is
+// flaky across CI machines.
+func TestBoxHostname_AdmissionSet(t *testing.T) {
+	// ─── Part A: hostname resolver (1)+(2) ────────────────────
+
+	// (1) BoxHostname() returns a non-empty, hostname-shaped label.
+	got := wire.BoxHostname()
+	if got == "" {
+		t.Fatalf("BoxHostname() returned empty string; want non-empty hostname")
+	}
+	// The fallback contract says an empty hostname collapses to
+	// labelLocal ("local") — anything else is a real os.Hostname()
+	// return, which must be non-empty and not the literal
+	// "__other__" reserved value (otherwise the helper would
+	// collide with the otherBoxLabel admission bucket).
+	if got == "__other__" {
+		t.Errorf("BoxHostname() returned reserved __other__ value %q; want hostname or labelLocal", got)
+	}
+
+	// (2) OpsMetrics.WakeFailure with box="" resolves to
+	// BoxHostname(). The emitted series carries the host's
+	// hostname under the `box` label, not the placeholder
+	// "local". Fresh registry — the hostname admission does NOT
+	// deplete the cap for the overflow part below.
+	mA := wire.NewOpsMetrics("vmmd")
+	c := mA.WakeFailure("", "", "snapshot_restore_err")
+	if c == nil {
+		t.Fatal("WakeFailure returned nil counter")
+	}
+	bodyA := render(t, mA)
+	wantA := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="snapshot_restore_err"} 0`, got)
+	if !strings.Contains(bodyA, wantA) {
+		t.Errorf("missing %q in:\n%s", wantA, bodyA)
+	}
+
+	// ─── Part B: overflow collapses (3) ───────────────────────
+	// Fresh registry. Admit maxBoxLabelValues distinct synthetic
+	// box labels, then drive a (cap+1)th distinct box. The
+	// (cap+1)th must collapse to otherBoxLabel.
+	mB := wire.NewOpsMetrics("vmmd")
+	for i := 0; i < 64; i++ {
+		label := fmt.Sprintf("box-%02d.example.test", i+1)
+		c := mB.WakeFailure(label, "", "snapshot_restore_err")
+		if c == nil {
+			t.Fatalf("WakeFailure returned nil counter at i=%d", i)
+		}
+		c.Inc()
+	}
+	// (cap+1)th distinct box — must collapse to otherBoxLabel.
+	overflow := mB.WakeFailure("box-overflow.example.test", "", "snapshot_restore_err")
+	if overflow == nil {
+		t.Fatal("WakeFailure returned nil counter at overflow")
+	}
+	overflow.Inc()
+	bodyB := render(t, mB)
+	// Overflow collapses: the literal "box-overflow.example.test"
+	// label MUST NOT surface in the body — admit must have
+	// returned otherBoxLabel for this (cap+1)th distinct real box.
+	if strings.Contains(bodyB, `vmmd_wake_failure_total{app="",box="box-overflow.example.test",reason="snapshot_restore_err"}`) {
+		t.Errorf("overflow box unexpectedly admitted (should collapse to __other__):\n%s", bodyB)
+	}
+	// And the __other__ bucket MUST surface at count=1 — the
+	// overflow's Inc lands on the collapsed series.
+	if !strings.Contains(bodyB, `vmmd_wake_failure_total{app="",box="__other__",reason="snapshot_restore_err"} 1`) {
+		t.Errorf("missing __other__ bucket for overflow box in:\n%s", bodyB)
 	}
 }
 
@@ -1349,6 +1494,145 @@ func TestOpsMetrics_WakeLatencyIncrement(t *testing.T) {
 	}
 }
 
+// TestRecordDaemonRestart_PreInstantiationCartesian pins the
+// (daemon, version) cartesian pre-instantiated by the constructor
+// (issue #573 / ADR-128 / cluster B commit 6 of the platform-
+// observability mega-PR). The constructor instantiates every
+// closed-daemon-name × wire.Version row so /metrics surfaces zero
+// rows from idle fleet; the "other" overflow bucket is also
+// pre-instantiated so an unexpected daemon name doesn't trip the
+// "missing series" alert path at boot.
+//
+// Cardinality: 10 daemons × 1 version = 10 series per OpsMetrics
+// instance. Across the 9 daemons that construct their own
+// OpsMetrics = 90 series fleet-wide, all with the same
+// {daemon, version} label set. Well below the Prometheus
+// "tens of thousands" guideline.
+func TestRecordDaemonRestart_PreInstantiationCartesian(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, daemon := range []string{
+		"apid", "gatewayd-public", "gatewayd-internal", "schedd",
+		"vmmd", "imaged", "meterd", "builderd", "gregale", "other",
+	} {
+		want := fmt.Sprintf(`vmmd_daemon_restart_count{daemon=%q,version=%q} 0`, daemon, wire.Version)
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-instantiated row %q in:\n%s", want, body)
+		}
+	}
+	// Add(1) at boot reflects the systemd restart count for THIS
+	// process — see RecordDaemonRestart field doc. After two
+	// increments the vmmd row should be at 1 (RecordDaemonRestart
+	// subtracts 1 to model "n-1 transitions" rather than "n
+	// increments across n processes"). Operators see "this is
+	// process N" rather than "N increments happened".
+	m.RecordDaemonRestart("vmmd", wire.Version, 2)
+	body = render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`vmmd_daemon_restart_count{daemon="vmmd",version=%q} 1`, wire.Version)) {
+		t.Errorf("missing vmmd row at count=1 after RecordDaemonRestart(vmmd, 2) in:\n%s", body)
+	}
+}
+
+// TestDaemon_BuildInfo_Uptime_Ready pins the three new daemon-side
+// observability gauges (issue #586 / ADR-129 / cluster C commit 9
+// of the platform-observability mega-PR):
+//
+//   - daemon_build_info{daemon, version, git_sha, build_time} — 1
+//     per closed daemon name, pre-instantiated at boot.
+//   - daemon_uptime_seconds{daemon} — starts at 0, SetDaemonUptime
+//     updates per tick.
+//   - daemon_ready{daemon} — 0 until MarkReady, 1 after.
+//
+// The constructor pre-instantiates every row at value=1 (for
+// build_info) / 0 (for uptime + ready). The test verifies the
+// shape and the accessors' effect on the body.
+func TestDaemon_BuildInfo_Uptime_Ready(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, daemon := range []string{
+		"apid", "gatewayd-public", "gatewayd-internal", "schedd",
+		"vmmd", "imaged", "meterd", "builderd", "gregale", "other",
+	} {
+		// Build info: 1 per closed daemon.
+		wantInfo := fmt.Sprintf(`vmmd_daemon_build_info{build_time=%q,daemon=%q,git_sha=%q,version=%q} 1`,
+			wire.BuildTime, daemon, wire.GitSHA, wire.Version)
+		if !strings.Contains(body, wantInfo) {
+			t.Errorf("missing pre-instantiated build-info row %q in:\n%s", wantInfo, body)
+		}
+		// Uptime: 0 per closed daemon.
+		wantUptime := fmt.Sprintf(`vmmd_daemon_uptime_seconds{daemon=%q} 0`, daemon)
+		if !strings.Contains(body, wantUptime) {
+			t.Errorf("missing pre-instantiated uptime row %q in:\n%s", wantUptime, body)
+		}
+		// Ready: 0 per closed daemon (MarkReady flips to 1).
+		wantReady := fmt.Sprintf(`vmmd_daemon_ready{daemon=%q} 0`, daemon)
+		if !strings.Contains(body, wantReady) {
+			t.Errorf("missing pre-instantiated ready row %q in:\n%s", wantReady, body)
+		}
+	}
+	// SetDaemonUptime + MarkReady update the body.
+	m.SetDaemonUptime("vmmd", 12.5)
+	m.MarkReady("vmmd")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="vmmd"} 12.5`) {
+		t.Errorf("missing uptime update at 12.5 in:\n%s", body)
+	}
+	if !strings.Contains(body, `vmmd_daemon_ready{daemon="vmmd"} 1`) {
+		t.Errorf("missing ready=1 after MarkReady in:\n%s", body)
+	}
+	// Unknown daemon name collapses to "other" (closed-set contract).
+	m.SetDaemonUptime("unknown-daemon", 1.0)
+	m.MarkReady("unknown-daemon")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="other"} 1`) {
+		t.Errorf("unknown daemon did not collapse to other in:\n%s", body)
+	}
+}
+
+// TestFaasDeployVersion_PreInstantiatedAndSetAccessor (issue #586
+// / ADR-129 / cluster C commit 11) pins the platform-wide release
+// identifier gauge:
+//
+//   - faas_deploy_version{version} — pre-instantiated at boot from
+//     wire.Version, value=1. SetDeployVersion("v2.0.0") re-stamps
+//     to the new version (rolling deploy, hot reload of a sidecar).
+//
+// The test verifies the constructor pre-instantiates a single row
+// at the current wire.Version, and SetDeployVersion stamps a fresh
+// version row alongside (or replaces — Prometheus's WithLabelValues
+// caches on first call, so a second call to the same label is
+// idempotent).
+func TestFaasDeployVersion_PreInstantiatedAndSetAccessor(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	want := fmt.Sprintf(`vmmd_faas_deploy_version{version=%q} 1`, wire.Version)
+	if !strings.Contains(body, want) {
+		t.Errorf("missing pre-instantiated faas_deploy_version row %q in:\n%s", want, body)
+	}
+	// SetDeployVersion on the same version is idempotent.
+	m.SetDeployVersion(wire.Version)
+	body = render(t, m)
+	if !strings.Contains(body, want) {
+		t.Errorf("idempotent SetDeployVersion dropped the row; got:\n%s", body)
+	}
+	// SetDeployVersion on a NEW version surfaces a fresh row.
+	m.SetDeployVersion("v2.0.0-test")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_faas_deploy_version{version="v2.0.0-test"} 1`) {
+		t.Errorf("SetDeployVersion did not surface new version row; got:\n%s", body)
+	}
+	// nil-receiver guard mirrors MarkReady.
+	var nilm *wire.OpsMetrics
+	nilm.SetDeployVersion("v2.0.0-test") // must not panic
+	// Empty version falls back to wire.Version (defensive default).
+	m2 := wire.NewOpsMetrics("apid")
+	m2.SetDeployVersion("")
+	body2 := render(t, m2)
+	if !strings.Contains(body2, fmt.Sprintf(`apid_faas_deploy_version{version=%q} 1`, wire.Version)) {
+		t.Errorf("empty version did not fall back to wire.Version; got:\n%s", body2)
+	}
+}
+
 // TestOpsMetrics_WakeLatencyNilSafe (issue #1059 / ADR-127) — the
 // accessor must be no-op on a nil receiver so vmmd / schedd unit
 // tests without metrics keep working (same nil-safe posture as
@@ -1358,6 +1642,61 @@ func TestOpsMetrics_WakeLatencyNilSafe(t *testing.T) {
 	if got := m.WakeLatency("local", "restore_ms"); got != nil {
 		t.Errorf("nil.WakeLatency = %v, want nil", got)
 	}
+}
+
+// TestCVECheckTotal_PreInstantiationCartesian (issue #601 /
+// ADR-131 / cluster D commit 13 of the platform-observability
+// mega-PR) pins the 12-row closed-cartesian at boot (3 results ×
+// 4 severities). A regression that drops the pre-instantiation
+// loop would leave the dashboard panels empty until the first
+// run completes — operators would lose the "no CVEs in the
+// last 24h" signal.
+func TestCVECheckTotal_PreInstantiationCartesian(t *testing.T) {
+	m := wire.NewOpsMetrics("meterd")
+	body := render(t, m)
+	for _, result := range []string{"pass", "fail", "new_cve"} {
+		for _, sev := range []string{"low", "medium", "high", "critical"} {
+			want := fmt.Sprintf(`meterd_cve_check_total{result=%q,severity=%q} 0`,
+				result, sev)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated cve_check_total row %q in:\n%s", want, body)
+			}
+		}
+	}
+	// RecordCVECheck increments a row.
+	m.RecordCVECheck("new_cve", "high")
+	body = render(t, m)
+	if !strings.Contains(body, `meterd_cve_check_total{result="new_cve",severity="high"} 1`) {
+		t.Errorf("RecordCVECheck did not increment the row; got:\n%s", body)
+	}
+	// nil-receiver guard.
+	var nilm *wire.OpsMetrics
+	nilm.RecordCVECheck("pass", "low") // must not panic
+}
+
+// TestCVEOpenTotal_AcceptsPerDepRows (issue #601 / ADR-131)
+// pins the open-CVE gauge shape. dep is the package name +
+// version; severity is the closed-set vocabulary. The test
+// asserts the gauge accepts per-(severity, dep) rows without
+// an overflow collapse.
+func TestCVEOpenTotal_AcceptsPerDepRows(t *testing.T) {
+	m := wire.NewOpsMetrics("meterd")
+	m.IncCVEOpen("medium", "libssl@1.1.1k-7", 1)
+	m.IncCVEOpen("high", "openssl@3.0.7-1", 1)
+	m.IncCVEOpen("critical", "linux-kernel@5.15.0-58", 1)
+	body := render(t, m)
+	for _, want := range []string{
+		`meterd_cves_open{dep="libssl@1.1.1k-7",severity="medium"} 1`,
+		`meterd_cves_open{dep="openssl@3.0.7-1",severity="high"} 1`,
+		`meterd_cves_open{dep="linux-kernel@5.15.0-58",severity="critical"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing per-dep cves_open row %q in:\n%s", want, body)
+		}
+	}
+	// nil-receiver guard.
+	var nilm *wire.OpsMetrics
+	nilm.IncCVEOpen("medium", "dep", 1) // must not panic
 }
 
 // TestOpsMetrics_ObserveSidecarRestartNilSafe pins the nil-

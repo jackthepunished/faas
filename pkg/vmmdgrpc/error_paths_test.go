@@ -31,6 +31,7 @@ package vmmdgrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -350,7 +351,7 @@ func TestWakeFailure_GRPCParseFailure_CreateFromSnapshot(t *testing.T) {
 		t.Fatal("CreateFromSnapshot(empty instance): want validation error, got nil")
 	}
 	body := scrapeOps(t, ops)
-	want := `vmmd_wake_failure_total{box="local",reason="snapshot_restore_err"} 1`
+	want := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="snapshot_restore_err"} 1`, wire.BoxHostname())
 	if !contains(body, want) {
 		t.Errorf("missing %q in scrape body:\n%s", want, body)
 	}
@@ -377,7 +378,7 @@ func TestWakeFailure_GRPCParseFailure_CreateColdBoot(t *testing.T) {
 		t.Fatal("CreateColdBoot(no app): want validation error, got nil")
 	}
 	body := scrapeOps(t, ops)
-	want := `vmmd_wake_failure_total{box="local",reason="mem_backend_err"} 1`
+	want := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="mem_backend_err"} 1`, wire.BoxHostname())
 	if !contains(body, want) {
 		t.Errorf("missing %q in scrape body:\n%s", want, body)
 	}

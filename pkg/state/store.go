@@ -2080,6 +2080,48 @@ type Store interface {
 	// schema-agnostic.
 	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
 
+	// RecordRestart (issue #586 / ADR-129 / cluster C commit 12 of
+	// the platform-observability mega-PR) bumps the persisted
+	// deployments.liveness_restart_count column by 1 in a single
+	// statement. Called by pkg/sched/Engine alongside the
+	// in-memory LivenessWindow.RecordRestart call so the column is
+	// the source of truth across schedd restarts. Returns
+	// ErrNotFound when the deployment row is missing so a
+	// misroute fails closed (mirrors UpsertDeploymentScanResult
+	// IDOR contract at line 2049). The CHECK constraint
+	// (deployments_liveness_restart_count_nonneg_chk,
+	// migrations/00411) rejects a negative bump at the SQL layer
+	// even though the application code is monotonic — belt-and-
+	// braces against a buggy caller.
+	RecordRestart(ctx context.Context, deploymentID string) error
+
+	// Issue #599 / ADR-130 / cluster D commit 14 of the
+	// platform-observability mega-PR — status-page incidents
+	// table (migrations/00412). Three methods on the Store
+	// interface:
+	//
+	//   InsertStatusIncident   appends an open row (resolved_at
+	//                          NULL). The status page surfaces
+	//                          this verbatim.
+	//   ResolveStatusIncident  stamps resolved_at on the row
+	//                          identified by id. Idempotent: a
+	//                          second call on an already-resolved
+	//                          row returns nil (no error) — the
+	//                          CLI can re-issue a resolve without
+	//                          surfacing 23514.
+	//   ListOpenStatusIncidents
+	//                          reads the partial-index
+	//                          (status_incidents_open WHERE
+	//                          resolved_at IS NULL) sorted by
+	//                          posted_at DESC. The
+	//                          /v1/internal/slo.json endpoint
+	//                          composes its response from this
+	//                          list plus meterd's loopback
+	//                          Prometheus exporter.
+	InsertStatusIncident(ctx context.Context, component, severity, message string) (StatusIncident, error)
+	ResolveStatusIncident(ctx context.Context, id int64) error
+	ListOpenStatusIncidents(ctx context.Context) ([]StatusIncident, error)
+
 	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
 	// document capture. The surface is paid-only (Free plan
 	// returns 403 from the apid) but the microVM always captures

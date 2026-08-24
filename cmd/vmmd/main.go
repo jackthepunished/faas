@@ -660,6 +660,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	wire.RegisterDefaultOps(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer so
 	// stale-fallback serves on the cold-boot Restore path emit
 	// `vmmd_storage_cache_stale_fallback_total`. vmmd is the
