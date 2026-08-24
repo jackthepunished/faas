@@ -1,6 +1,6 @@
 # ADR-124 · Affected-workloads preview with `--exclude`
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-08-24)
 - **Date:** 2026-08-21
 - **Scope:** `pkg/api/dto.go`, `cmd/apid/scan_service.go`, `cmd/gregale/{commands2.go,commands_decompose.go,commands_diff.go,client.go}` → `cmd/apid/handlers_dashboard.go`, `pkg/dashboard/{views,templates}/`.
 
@@ -291,3 +291,33 @@ table) lands its own migration.
   precedent (only relevant if new view ships a `template.HTML`).
 - ADR-050 (repo decomposition + project object) — the wider context.
 - ADR-095 (PR preview environments) — explicitly out of scope.
+
+## Acceptance notes (2026-08-24)
+
+ADR-124 ships via a 4-PR cluster:
+
+- **PR #1065** (head `0b4cf07f4`, MERGEABLE CLEAN 2026-08-23) —
+  initial surface; closed 5 ship-blockers + 4 code-review followup
+  fixes for the affected-workloads preview.
+- **PR-A** (rescue wire surface end-to-end + Prometheus counter) —
+  closes caveat #1 (CLI didn't render rescue wire fields) and
+  caveat #2 (no Prometheus metric for `plan_gate_rescued_by_exclude`).
+  Adds `apid_plan_gate_rescued_by_exclude_total{plan,reason}` with
+  12 pre-instantiated series; registers `--exclude` + `--show-affected`
+  in the CLI manifest so `gregale man` / completion ship.
+- **PR-B** (persistent `--exclude` history via
+  `deployment_scope_exclusions` migration 00418) — closes caveat
+  #3. `--persist-exclude` records slugs; subsequent deploys without
+  `--exclude` honor the persisted set automatically. Audit kind
+  `project.scope.excluded` per slug for SOC 2 CC7.2 paper trail.
+- **PR-C** (e2e coverage for excluded workload path) — closes
+  caveat #4. Extends `cmd/e2e/scan_project_exclude_e2e_test.go`
+  and `cmd/e2e/scan_project_partition_e2e_test.go` to cover the
+  brand-new excluded path end-to-end.
+- **PR-D** (OpenAPI examples + customer-facing
+  `docs/affected-workload-preview.md`) — closes caveat #5. ADR
+  status flipped from Proposed to Accepted with this section.
+
+ADR-127 (sister ADR for persistence, PR-B commit 6) is OPTIONAL;
+the persistence design is captured in 00418_deployment_scope_exclusions.sql
+header without a separate ADR file.
