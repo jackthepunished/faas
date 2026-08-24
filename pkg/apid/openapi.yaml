@@ -1861,6 +1861,107 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/debug/regressions:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: listAppDebugRegressions
+      summary: Active regression observations (ADR-127 / PR-B).
+      description: |
+        Returns regression observations written by the
+        debug_regression_observations table — surfaces per-route
+        p95 regressions detected by the regression cron
+        (cmd/apid/debug_regression_cron.go). Ordered by
+        regression_factor DESC, last_detected_at DESC (worst
+        first). Plan-gated by DebugTelemetryEnabled. The window
+        is clamped to DebugTelemetryRetentionDays.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Duration or 'Nd' alias. Defaults to `1h`."
+      x-since: 2026-08
+      responses:
+        '200':
+          description: Page of active regression observations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugRegressionsResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/debug/compare:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [apps]
+      operationId: compareAppDebugDeployments
+      summary: Per-route latency compare (ADR-127 / PR-B).
+      description: |
+        Compares two deployments' per-route latency
+        distributions in a shared time window. Body holds the
+        two deployment ids + optional route filter + optional
+        since/until bounds. Returns merged per-route stats with
+        per-deployment p50/p95/p99 + row counts. Plan-gated by
+        DebugTelemetryEnabled.
+      x-since: 2026-08
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebugCompareRequest'
+      responses:
+        '200':
+          description: Per-route compare stats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugCompareResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/debug/requests/{req_id}/replay:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: req_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: "Request id from the debug requests list."
+    post:
+      tags: [apps]
+      operationId: replayAppDebugRequest
+      summary: Queue replay of a recorded request (ADR-127 / PR-B stub).
+      description: |
+        PR-B returns 202 with `status: "queued"`. The mirror
+        invocation pipeline lands in issue #72 PR-A2
+        (feat-issue-72-traffic-mirror-pr-a2). The response shape
+        is stable across PR-B and PR-A2 so customer tooling can
+        wire once. Plan-gated by DebugTelemetryEnabled; requires
+        ScopesDeployWriteSurface.
+      x-since: 2026-08
+      responses:
+        '202':
+          description: Replay queued (PR-A2 will route it).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugReplayResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/deployments:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -15958,6 +16059,77 @@ components:
         cold_boot: { type: boolean }
         trace_id: { type: [string, 'null'], description: "W3C trace-id hex (32 chars), null when unset." }
         received_at: { type: string, format: date-time }
+
+    DebugRegressionsResponse:
+      type: object
+      description: |
+        Response from GET /v1/apps/{slug}/debug/regressions (ADR-127 / PR-B).
+        `since` echoes the effective window applied.
+      required: [regressions, since]
+      properties:
+        since: { type: string }
+        regressions:
+          type: array
+          items: { $ref: '#/components/schemas/DebugRegressionItem' }
+
+    DebugRegressionItem:
+      type: object
+      description: "One regression observation row."
+      required: [deployment_id, route, p95_ms, p95_base_ms, affected_count, regression_factor, first_detected_at, last_detected_at]
+      properties:
+        deployment_id: { type: string, format: uuid }
+        route: { type: string }
+        p95_ms: { type: integer, minimum: 0 }
+        p95_base_ms: { type: integer, minimum: 0 }
+        affected_count: { type: integer, minimum: 0 }
+        regression_factor: { type: string, description: "Decimal string with up to 2 places, NUMERIC(5,2)." }
+        first_detected_at: { type: string, format: date-time }
+        last_detected_at: { type: string, format: date-time }
+
+    DebugCompareRequest:
+      type: object
+      description: "POST body for /v1/apps/{slug}/debug/compare (ADR-127 / PR-B)."
+      required: [source, mirror]
+      properties:
+        source: { type: string, format: uuid, description: "Source deployment id." }
+        mirror: { type: string, format: uuid, description: "Mirror deployment id." }
+        route: { type: [string, 'null'], description: "Optional exact-match route filter." }
+        since: { type: [string, 'null'], description: "Lookback duration (e.g. '24h')." }
+        until: { type: [string, 'null'], description: "Window end (RFC3339). Empty = now." }
+
+    DebugCompareResponse:
+      type: object
+      description: "POST response from /v1/apps/{slug}/debug/compare (ADR-127 / PR-B)."
+      required: [source, mirror, routes]
+      properties:
+        source: { type: string, format: uuid }
+        mirror: { type: string, format: uuid }
+        routes:
+          type: array
+          items: { $ref: '#/components/schemas/DebugCompareRouteStats' }
+
+    DebugCompareRouteStats:
+      type: object
+      description: "Per-route latency stats for one side of the compare."
+      required: [route]
+      properties:
+        route: { type: string }
+        source_p50_ms: { type: [integer, 'null'] }
+        source_p95_ms: { type: [integer, 'null'] }
+        source_p99_ms: { type: [integer, 'null'] }
+        source_count: { type: [integer, 'null'], format: int64 }
+        mirror_p50_ms: { type: [integer, 'null'] }
+        mirror_p95_ms: { type: [integer, 'null'] }
+        mirror_p99_ms: { type: [integer, 'null'] }
+        mirror_count: { type: [integer, 'null'], format: int64 }
+
+    DebugReplayResponse:
+      type: object
+      description: "POST response from /v1/apps/{slug}/debug/requests/{req_id}/replay (ADR-127 / PR-B stub)."
+      required: [status]
+      properties:
+        mirror_invocation_id: { type: [string, 'null'], format: uuid, description: "Set when the mirror invocation lands in PR-A2." }
+        status: { type: string, enum: [queued, running, completed, failed] }
 
 
   responses:

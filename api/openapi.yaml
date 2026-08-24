@@ -1923,7 +1923,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebugCompareResponse'
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1956,7 +1956,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebugReplayResponse'
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
         '404': { $ref: '#/components/responses/NotFound' }
