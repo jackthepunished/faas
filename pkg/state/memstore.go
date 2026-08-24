@@ -14171,3 +14171,33 @@ func (m *MemStore) MirrorSummary(_ context.Context, ruleID string, since time.Ti
 	}
 	return s, nil
 }
+
+// --- ADR-127 PR-B — regression observation + dashboard reads (MemStore stubs) ---
+
+// UpsertRegressionObservation is a no-op in MemStore. The regression
+// cron runs only against the production PgStore; the MemStore
+// implementation exists solely to satisfy the Store interface so
+// unit tests that wire up a MemStore still compile.
+func (m *MemStore) UpsertRegressionObservation(_ context.Context, _ sqlc.UpsertRegressionObservationParams) error {
+	return nil
+}
+
+// ListActiveRegressionsByApp is a no-op in MemStore. Returns nil so
+// dashboard tests can assert "no regressions surfaced" without a
+// populated regression set.
+func (m *MemStore) ListActiveRegressionsByApp(_ context.Context, _ sqlc.ListActiveRegressionsByAppParams) ([]sqlc.ListActiveRegressionsByAppRow, error) {
+	return nil, nil
+}
+
+// ListDeploymentsForCompare is a no-op in MemStore. Returns nil so
+// dashboard tests can render the compare panel empty.
+func (m *MemStore) ListDeploymentsForCompare(_ context.Context, _ sqlc.ListDeploymentsForCompareParams) ([]sqlc.ListDeploymentsForCompareRow, error) {
+	return nil, nil
+}
+
+// ListAppsWithRecentTelemetry is a no-op in MemStore. Returns nil so
+// the regression cron's discovery loop is a no-op when wired against
+// a MemStore (handy for unit tests that don't want to seed rows).
+func (m *MemStore) ListAppsWithRecentTelemetry(_ context.Context, _ pgtype.Interval) ([]pgtype.UUID, error) {
+	return nil, nil
+}

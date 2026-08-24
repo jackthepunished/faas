@@ -494,6 +494,18 @@ type DataUpstreamProbesDefault struct {
 	ProbeNode        pgtype.Text
 }
 
+type DebugRegressionObservation struct {
+	AppID            pgtype.UUID
+	DeploymentID     pgtype.UUID
+	Route            string
+	P95Ms            int32
+	P95BaseMs        int32
+	AffectedCount    int32
+	RegressionFactor pgtype.Numeric
+	FirstDetectedAt  pgtype.Timestamptz
+	LastDetectedAt   pgtype.Timestamptz
+}
+
 type Deployment struct {
 	ID                    pgtype.UUID
 	AppID                 pgtype.UUID
@@ -899,6 +911,7 @@ type RequestTelemetry struct {
 	TraceID      pgtype.Text
 	SpansSummary []byte
 	ReceivedAt   pgtype.Timestamptz
+	Count        int32
 }
 
 type RequestTelemetryDefault struct {
@@ -914,6 +927,7 @@ type RequestTelemetryDefault struct {
 	TraceID      pgtype.Text
 	SpansSummary []byte
 	ReceivedAt   pgtype.Timestamptz
+	Count        int32
 }
 
 type Session struct {
