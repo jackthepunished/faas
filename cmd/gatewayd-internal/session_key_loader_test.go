@@ -1,8 +1,12 @@
 // session_key_loader_test.go — mirror of cmd/apid/session_key_loader_test.go.
 // See that file for the rationale (issue #585 / ADR-127 review-fix R1+R2
-// — FAAS_SESSION_KEY shape contract). The gatewayd-internal loader is
-// intentionally byte-equivalent to the apid one so a regression on either
-// side gets caught at unit-test time rather than at production 503 time.
+// — FAAS_SESSION_KEY shape contract). The gatewayd-internal loader
+// mirrors the apid env contract (PATH + CONTENT shapes; fail-closed on
+// broken keys) so a regression on either side gets caught at unit-test
+// time rather than at production 503 time. The 6 cases below are the
+// apid set (PATH, CONTENT, ghost-path, empty-fallback, wrong-length,
+// no-newline) minus the chmod-0000 ReadFile-fails case — the apid-only
+// test runs as a uid check; mirror covers the equivalent shape.
 
 package main
 
@@ -50,6 +54,47 @@ func TestGatewaydSessionManager_CONTENT_Shape(t *testing.T) {
 	mgr := loadSessionManager(getenv, newTestLogger2())
 	if mgr == nil {
 		t.Fatal("content-shaped: want manager, got nil")
+	}
+}
+
+func TestGatewaydSessionManager_PATH_DoesNotExist_FailsClosed(t *testing.T) {
+	// Mirror of apid's same-named test: a path-shaped env var pointing
+	// at a nonexistent file (typo, race with bootstrap, broken
+	// LoadCredential) must NOT silently produce a manager. The
+	// gatewayd loader falls through to hex.DecodeString of the path
+	// string itself, which fails → mgr=nil (the canonical CONTENT
+	// decoder fail-closed path).
+	getenv := func(name string) string {
+		if name == "FAAS_SESSION_KEY" {
+			return "/var/empty/this/does/not/exist"
+		}
+		return ""
+	}
+	mgr := loadSessionManager(getenv, newTestLogger2())
+	if mgr != nil {
+		t.Errorf("ghost-path contract: want nil manager (fail-closed), got %+v", mgr)
+	}
+}
+
+func TestGatewaydSessionManager_PATH_NoNewlineBytes(t *testing.T) {
+	// Mirror of apid's canonical-file tripwire: the production
+	// session.key emitted by `gregale secrets init` ends with no
+	// trailing newline. The loader must trim before hex.DecodeString
+	// so a hand-edited file with a trailing '\n' doesn't fail.
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "session.key")
+	if err := os.WriteFile(keyPath, []byte(testHexKey), 0o400); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	getenv := func(name string) string {
+		if name == "FAAS_SESSION_KEY" {
+			return keyPath
+		}
+		return ""
+	}
+	mgr := loadSessionManager(getenv, newTestLogger2())
+	if mgr == nil {
+		t.Fatal("path-no-newline contract: want manager, got nil")
 	}
 }
 

@@ -1051,7 +1051,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// warning so the daemon still boots for local testing. Production
 	// MUST set this to the contents of /etc/faas/secrets/session.key
 	// (root:root 0400, spec §11).
+	//
+	// Issue #585 / ADR-127 review-fix (PR #1078 follow-on): the
+	// loader returns (nil, sentinel) when the key is malformed,
+	// unreadable, or wrong-byte-length. We refuse to boot in that
+	// case — a nil session.Manager reaches sessionAuth which calls
+	// s.sessions.Verify and crashes on the first authenticated
+	// dashboard request (silent nil-deref). The pre-PR-1078 code
+	// logged the sentinel as a dev-mode warning and continued,
+	// which is the A5 silent-degradation class the apid loader was
+	// specifically written to close. Empty env (the dev fallback)
+	// still returns a real manager + a warning string so local
+	// iteration stays unblocked.
 	sessions, sessionsWarn := loadSessionManager(deps.getenv, log)
+	if sessions == nil {
+		return fmt.Errorf("apid: session manager: %s", sessionsWarn)
+	}
 	if sessionsWarn != "" {
 		log.Warn("session manager in dev mode; sessions reset on restart", "warning", sessionsWarn)
 	}

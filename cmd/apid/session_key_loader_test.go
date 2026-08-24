@@ -41,6 +41,45 @@ func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
+// TestSessionManager_PATH_ReadFileFails exercises the new
+// "FAAS_SESSION_KEY path read failed" sentinel — the branch that fires
+// when os.Stat succeeds (file exists, IsRegular) but os.ReadFile
+// fails (perms revoked mid-boot, file replaced by a symlink-to-
+// nothing between Stat and ReadFile, EIO on a tmpfs credential).
+//
+// Without this test the only thing pinning that branch is the
+// TestSessionManager_PATH_DoesNotExist_FailsClosed test, which
+// actually falls through to the hex decoder (os.Stat returns ENOENT,
+// so the path branch never runs). chmod 0000 is portable across
+// Linux/macOS but is bypassed by uid 0; on root we Skip with a clear
+// reason rather than falsely-green the test.
+func TestSessionManager_PATH_ReadFileFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 is bypassed by uid 0; cannot exercise os.ReadFile EACCES in this sandbox")
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "session.key")
+	if err := os.WriteFile(keyPath, []byte(testHexKey), 0o400); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	if err := os.Chmod(keyPath, 0o000); err != nil {
+		t.Fatalf("chmod 0000: %v", err)
+	}
+	getenv := func(name string) string {
+		if name == "FAAS_SESSION_KEY" {
+			return keyPath
+		}
+		return ""
+	}
+	mgr, warning := loadSessionManager(getenv, newTestLogger())
+	if mgr != nil {
+		t.Errorf("readfail contract: want nil manager (fail-closed), got %+v", mgr)
+	}
+	if warning != "FAAS_SESSION_KEY path read failed" {
+		t.Errorf("readfail contract: want path-read-failed sentinel, got %q", warning)
+	}
+}
+
 // TestSessionManager_PATH_Shape is the load-bearing tripwire: the
 // apid unit ships FAAS_SESSION_KEY=%d/faas_session_key, which on the
 // box evaluates to /run/credentials/faas-apid.service/faas_session_key.

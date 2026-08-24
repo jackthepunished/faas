@@ -36,8 +36,6 @@ package main
 import (
 	"context"
 	"encoding/hex"
-	"errors"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -343,15 +341,22 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) (*session.
 	// CONTENT-shaped decoder for back-compat.
 	if strings.HasPrefix(raw, "/") {
 		if info, err := os.Stat(raw); err == nil && info.Mode().IsRegular() {
+			// SECURITY: capture the path into a local BEFORE the
+			// ReadFile/TrimSpace reassignment — otherwise the slog
+			// log below would emit the hex key into the 'path' field
+			// (CLAUDE.md "Never log secret values"; slog ships to
+			// journald / Loki, where it would persist as a
+			// credentials-shaped datum).
+			path := raw
 			data, readErr := os.ReadFile(raw)
 			if readErr != nil {
 				log.Error("FAAS_SESSION_KEY path read failed",
-					"path", raw, "err", readErr)
+					"path", path, "err", readErr)
 				return nil, "FAAS_SESSION_KEY path read failed"
 			}
 			raw = strings.TrimSpace(string(data))
 			log.Info("FAAS_SESSION_KEY loaded via LoadCredential path",
-				"path", raw, "mode", info.Mode().String())
+				"path", path, "mode", info.Mode().String())
 		}
 	}
 	key, err := hex.DecodeString(raw)
@@ -389,9 +394,3 @@ func decodeErr(err error) string {
 	}
 	return err.Error()
 }
-
-// isNotExist is a tiny fs.ErrNotExist wrapper for tests that want
-// to assert the path-stat branch fell through to the content
-// decoder. Lifted out so the test imports don't need to know the
-// stdlib shape.
-func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }
