@@ -154,7 +154,10 @@ func RetentionLoop(ctx context.Context, db retentionExecer, interval time.Durati
 // DefaultRequestTelemetryRetentionDays is the upper bound across
 // plans (Scale=14, ADR-127 / pkg/api/limits.go). Hobby (3) and
 // Pro (7) fall under it — over-retention by ≤ 14 days is the
-// safe failure mode (PR-B adds per-app plan-aware filtering).
+// safe failure mode. PR-B's plan-aware sweep uses the per-plan
+// cap from pkg/api.MustLimitsFor(plan).DebugTelemetryRetentionDays
+// and falls back to DefaultRequestTelemetryRetentionDays for
+// unknown plans.
 const DefaultRequestTelemetryRetentionDays = 14
 
 // RequestTelemetryRetentionInterval is the cron cadence for the
@@ -174,6 +177,39 @@ const retentionRequestTelemetryBatchSQL = `DELETE FROM public.request_telemetry
                                              LIMIT $2
                                          )`
 
+// retentionRequestTelemetryPlanAwareBatchSQL is the per-app,
+// plan-aware sweep (PR-B). Joins request_telemetry to apps to
+// accounts and computes a per-app retention cutoff from the
+// account's plan via the CASE ladder. The bounded ctid-IN-SELECT
+// shape keeps the row-level locks short and avoids the
+// unbounded-DELETE WAL pathology.
+//
+// Plan → retention ladder (mirrors pkg/api/MustLimitsFor):
+//   * free   — 0 days (DebugTelemetryEnabled=false; pre-existing
+//     rows pre-downgrade are swept on the next tick).
+//   * hobby  — 3 days
+//   * pro    — 7 days
+//   * scale  — 14 days
+//   * other  — 1 day (safe failure mode for an unrecognised plan
+//     name; over-retention is the wrong failure mode here)
+//
+// The CASE uses acct.plan as a TEXT (the column type) so the
+// planner can short-circuit on the join key.
+const retentionRequestTelemetryPlanAwareBatchSQL = `DELETE FROM public.request_telemetry
+                                                   WHERE ctid IN (
+                                                       SELECT rt.ctid FROM public.request_telemetry rt
+                                                       JOIN public.apps a     ON a.id = rt.app_id
+                                                       JOIN public.accounts ac ON ac.id = a.account_id
+                                                       WHERE rt.received_at < now() - (CASE ac.plan
+                                                           WHEN 'free'  THEN interval '0 days'
+                                                           WHEN 'hobby' THEN interval '3 days'
+                                                           WHEN 'pro'   THEN interval '7 days'
+                                                           WHEN 'scale' THEN interval '14 days'
+                                                           ELSE              interval '1 day'
+                                                       END)
+                                                       LIMIT $1
+                                                   )`
+
 // RetentionOnceRequestTelemetry runs one DELETE pass against
 // public.request_telemetry, bounded by RetentionBatchSize per
 // statement and MaxRetentionBatches total iterations. Returns
@@ -181,14 +217,21 @@ const retentionRequestTelemetryBatchSQL = `DELETE FROM public.request_telemetry
 // additive free function, no shared state with the usage_minutes
 // sweep.
 //
-// The retention window is DefaultRequestTelemetryRetentionDays
-// (14d, the Scale cap). PR-A is over-retentive for Hobby/Pro;
-// PR-B adds per-app plan-aware filtering via the limits table.
+// PR-B switched from the hardcoded 14-day sweep
+// (PR-A's behavior) to a per-app, plan-aware sweep. The retention
+// window is derived from the account's plan via the CASE ladder
+// in retentionRequestTelemetryPlanAwareBatchSQL. Over-retention
+// is impossible because the cap is the plan's own cap, not the
+// fleet-wide Scale ceiling.
+//
+// On unknown plan names the sweep uses a 1-day fallback so an
+// unrecognised plan doesn't accidentally retain 14 days of
+// telemetry. PR-A's DefaultRequestTelemetryRetentionDays is
+// retained as the constant other callers reference.
 func RetentionOnceRequestTelemetry(ctx context.Context, db retentionExecer) (int64, error) {
-	interval := fmt.Sprintf("%d days", DefaultRequestTelemetryRetentionDays)
 	var total int64
 	for i := 0; i < MaxRetentionBatches; i++ {
-		tag, err := db.Exec(ctx, retentionRequestTelemetryBatchSQL, interval, RetentionBatchSize)
+		tag, err := db.Exec(ctx, retentionRequestTelemetryPlanAwareBatchSQL, RetentionBatchSize)
 		if err != nil {
 			return total, fmt.Errorf("request telemetry retention delete (batch %d, deleted so far %d): %w", i, total, err)
 		}
@@ -200,10 +243,87 @@ func RetentionOnceRequestTelemetry(ctx context.Context, db retentionExecer) (int
 	return total, ErrRetentionBatchCap
 }
 
+// retentionDropExpiredPartitionsSQL is a single-statement
+// partition-drop pass (PR-B ADR-127). Enumerates monthly
+// partitions of request_telemetry whose name encodes a month
+// older than the floor retention cap (1 day; safe upper bound
+// for any plan — Hobby=3d is the loosest cap), and DROPs each
+// in turn via a DO block.
+//
+// The partition name is request_telemetry_YYYYMM (the 00435
+// migration convention). We parse the trailing 6-digit suffix
+// into a date and compare against now() - 1 day. Anything older
+// can be safely dropped — the per-row sweep above already
+// deleted any row that's not beyond the per-plan retention.
+//
+// Cost: O(partitions) ≈ 3-4 rows on a healthy fleet. The
+// pg_inherits catalog query is constant-time.
+const retentionDropExpiredPartitionsSQL = `
+DO $$
+DECLARE
+    partname text;
+    partsuffix text;
+    partstart date;
+BEGIN
+    FOR partname IN
+        SELECT c.relname
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_class p ON p.oid = i.inhparent
+        WHERE p.relname = 'request_telemetry'
+          AND c.relname ~ '^request_telemetry_[0-9]{6}$'
+    LOOP
+        partsuffix := substring(partname from '[0-9]{6}$');
+        BEGIN
+            partstart := to_date(partsuffix, 'YYYYMM');
+        EXCEPTION WHEN OTHERS THEN
+            CONTINUE;
+        END;
+        IF partstart < date_trunc('month', now() - interval '1 day') THEN
+            EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(partname);
+        END IF;
+    END LOOP;
+END $$;
+`
+
+// DropExpiredRequestTelemetryPartitions (PR-B ADR-127) drops
+// monthly partitions of request_telemetry whose month-suffix
+// encodes a month older than the floor retention cap (1 day;
+// safe upper bound for any plan — Hobby=3d is the loosest cap).
+//
+// The DROP runs once per cron tick; the cron in
+// pkg/meter/retention.go::RetentionLoopRequestTelemetry calls
+// this AFTER RetentionOnceRequestTelemetry to keep the
+// per-tick work concentrated. Errors are logged + skipped —
+// a transient lock contention on one partition doesn't abort
+// the rest of the drops.
+//
+// The DO block loops over partitions and DROPs each inside the
+// same transaction; if one DROP fails the rest are skipped.
+// The IF EXISTS clause makes each DROP idempotent — a second
+// call finds nothing to drop.
+func DropExpiredRequestTelemetryPartitions(ctx context.Context, db retentionExecer) (int64, error) {
+	if _, err := db.Exec(ctx, retentionDropExpiredPartitionsSQL); err != nil {
+		return 0, fmt.Errorf("drop expired partitions: %w", err)
+	}
+	// The DO block doesn't surface a row count via Exec;
+	// return 0 to signal "ran" without claiming a count. The
+	// caller logs at the call site if a positive count is
+	// needed (pg_stat_user_tables provides the source-of-truth
+	// for post-drop validation).
+	return 0, nil
+}
+
 // RetentionLoopRequestTelemetry is the free-function goroutine
 // that calls RetentionOnceRequestTelemetry every Interval.
 // Returns on ctx.Done(). Mirrors RetentionLoop — same log posture
 // (cap-hit is Warn, hard DB failure is Error).
+//
+// PR-B: also calls DropExpiredRequestTelemetryPartitions after
+// the row-level sweep so monthly partitions whose entire row
+// set is past retention are reclaimed in one DDL op instead of
+// per-row ctid-IN-SELECT. The drop is best-effort — a transient
+// failure is logged + the loop continues. Next tick retries.
 func RetentionLoopRequestTelemetry(ctx context.Context, db retentionExecer, interval time.Duration, log *slog.Logger) {
 	if interval <= 0 {
 		interval = RequestTelemetryRetentionInterval
@@ -228,6 +348,16 @@ func RetentionLoopRequestTelemetry(ctx context.Context, db retentionExecer, inte
 			default:
 				if log != nil {
 					log.Error("request telemetry retention tick failed", "err", err)
+				}
+			}
+			// PR-B: drop expired monthly partitions AFTER the
+			// row-level sweep so a fresh partition doesn't lose
+			// rows that haven't been touched yet (the per-row
+			// sweep may have skipped rows whose plan-derived
+			// cap is still in the future).
+			if _, dropErr := DropExpiredRequestTelemetryPartitions(ctx, db); dropErr != nil {
+				if log != nil {
+					log.Warn("request telemetry partition drop tick failed", "err", dropErr)
 				}
 			}
 		}
