@@ -834,6 +834,26 @@ type OpsMetrics struct {
 	// (renamed in the ADR-123 ownership review) to make the
 	// meter-daemon-writer side explicit.
 	apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal *prometheus.CounterVec
+	// meterdAPIReachable (account_id, app_id) is the per-{app}
+	// reachability gauge fed by cmd/meterd/api_reachability_sweep.go
+	// every AlertEvalInterval: 1.0 when the app has served a
+	// successful invocation within the last 5 minutes, 0.0 when
+	// it has not. Backs the alert preset api_down. The alert
+	// evaluator reads the same data inline via
+	// state.WasInvokedSuccessfullySince; this gauge is the
+	// operator-visible mirror. PR-B / issue #1233 closes the
+	// "meterd_api_reachable{...} exists" prerequisite that ADR-123
+	// §Follow-ups calls out before flipping enabled_in_catalog=true.
+	meterdAPIReachable *prometheus.GaugeVec
+	// apidDeploymentFailedTotal (account_id, app_id) is the
+	// per-{app} delta counter of deployments whose status
+	// transitioned to 'failed' since the previous sweep. Fed by
+	// cmd/meterd/deployment_failure_sweep.go every AlertEvalInterval.
+	// Backs the alert preset deploy_failed. The alert evaluator
+	// reads the same data inline via state.CountFailedDeploymentsSince;
+	// this counter is the operator-visible mirror. PR-B / issue
+	// #1233.
+	apidDeploymentFailedTotal *prometheus.CounterVec
 	// standbyState — operator-facing enum gauge stamped by
 	// gatewayd-public on every active-passive HA state transition
 	// (Tier A8 / ADR-083). Values are 1/2/3 mapped to the
@@ -2403,6 +2423,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, r := range []string{"ok", "error"} {
 		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal.WithLabelValues(r)
 	}
+	// Issue #1233 / ADR-123 PR-B — `api_down` signal gauge.
+	// Writer: cmd/meterd/api_reachability_sweep.go::APIReachabilitySweepLoop
+	// stamps {account_id, app_id} = 1.0 (reachable) or 0.0 (no
+	// successful invocation in the last 5 min). Evaluator at
+	// pkg/alerts/evaluator.go reads the same data via
+	// state.WasInvokedSuccessfullySince; the gauge is the operator-
+	// visible mirror. Cardinality bounded by per-account app count
+	// (Hobby=5, Pro=25, Scale=100).
+	meterdAPIReachable := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_api_reachable",
+		Help: "Per-{account_id, app_id} reachability gauge: 1.0 when the app served a successful invocation within the last 5 minutes, 0.0 when it has not. Backs the alert preset api_down. Mirrors pkg/alerts/evaluator.go's inline WasInvokedSuccessfullySince lookup.",
+	}, []string{"account_id", "app_id"})
+	// Issue #1233 / ADR-123 PR-B — `deploy_failed` signal counter.
+	// Writer: cmd/meterd/deployment_failure_sweep.go::DeploymentFailureSweepLoop
+	// bumps the counter by the delta of new failures since the
+	// previous sweep. Evaluator at pkg/alerts/evaluator.go reads the
+	// same data via state.CountFailedDeploymentsSince; the counter is
+	// the operator-visible mirror. Cardinality bounded by per-account
+	// app count (Hobby=5, Pro=25, Scale=100).
+	apidDeploymentFailedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_deployment_failed_total",
+		Help: "Per-{account_id, app_id} delta counter of deployments whose status transitioned to 'failed' since the previous sweep. Backs the alert preset deploy_failed. Mirrors pkg/alerts/evaluator.go's inline CountFailedDeploymentsSince lookup.",
+	}, []string{"account_id", "app_id"})
 	imagedOCIPull := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_oci_pull_duration_seconds",
 		Help: "Latency of imaged's OCI registry pulls (manifest, config, blob, above-base), in seconds. Sized to api.OCIPullTimeoutSeconds (60 s).",
@@ -2771,6 +2814,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
+		// ADR-123 alert-preset signal series — PR-A (3) + PR-B (2). Each
+		// backs one of the 8 alert_presets catalog rows. Without
+		// registration the Vecs are created but never reach /metrics.
+		meterdAccountSpendEur,
+		apidTenantSurfaceCertExpirySeconds,
+		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal,
+		meterdAPIReachable,
+		apidDeploymentFailedTotal,
 		paddleWebhookVerifyFailedTotal, paddleWebhookReplaySuppressedTotal,
 		auditOrgEvent, authzDenied, authzAllowed,
 		wakeIDV4Fallback,
@@ -3815,6 +3866,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		paddleWebhookReplaySuppressedTotal:   paddleWebhookReplaySuppressedTotal,
 		alertEvaluatorEnabled:                alertEvaluatorEnabled,
 		meterdAccountSpendEur:                meterdAccountSpendEur,
+		meterdAPIReachable:                   meterdAPIReachable,
+		apidDeploymentFailedTotal:            apidDeploymentFailedTotal,
 		apidTenantSurfaceCertExpirySeconds:   apidTenantSurfaceCertExpirySeconds,
 		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal: apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal,
 		pgBackupLastPushed:                   pgBackupLastPushed,
@@ -5963,6 +6016,32 @@ func (m *OpsMetrics) ApidTenantSurfaceCertExpirySeconds() *prometheus.GaugeVec {
 		return nil
 	}
 	return m.apidTenantSurfaceCertExpirySeconds
+}
+
+// MeterdAPIReachable returns the per-{account_id, app_id}
+// reachability gauge fed by cmd/meterd/api_reachability_sweep.go
+// (issue #1233 / ADR-123 PR-B). The caller stamps 1.0 (reachable)
+// or 0.0 (no successful invocation in the last 5 min). Backs the
+// alert preset api_down. Returns nil on a nil receiver.
+func (m *OpsMetrics) MeterdAPIReachable() *prometheus.GaugeVec {
+	if m == nil {
+		return nil
+	}
+	return m.meterdAPIReachable
+}
+
+// ApidDeploymentFailedTotal returns the per-{account_id, app_id}
+// delta counter of deployments whose status transitioned to
+// 'failed' since the previous sweep, fed by
+// cmd/meterd/deployment_failure_sweep.go (issue #1233 / ADR-123
+// PR-B). Backs the alert preset deploy_failed. The counter is
+// additive across sweep boundaries; the writer is responsible
+// for tracking last-swept state. Returns nil on a nil receiver.
+func (m *OpsMetrics) ApidDeploymentFailedTotal() *prometheus.CounterVec {
+	if m == nil {
+		return nil
+	}
+	return m.apidDeploymentFailedTotal
 }
 
 // ApidTenantSurfaceCertExpiryRefresherWalkCompleteTotal increments
