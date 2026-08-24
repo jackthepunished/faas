@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -565,3 +566,134 @@ func TestPgStore_EdgeRule_UpdatedAtBumpsOnUpdate(t *testing.T) {
 		t.Errorf("updated_at didn't advance: before=%v after=%v", created.UpdatedAt, updated.UpdatedAt)
 	}
 }
+
+// pgSampleValidateRuleParams is the simplest valid
+// CreateEdgeRuleParams for kind=validate. The validate_mode
+// column is the load-bearing surface for ADR-128 §D1; the
+// companion tests below pin its round-trip + Update semantics.
+func pgSampleValidateRuleParams(accountID, appID, host, mode string) state.CreateEdgeRuleParams {
+	return state.CreateEdgeRuleParams{
+		AccountID:    accountID,
+		AppID:        appID,
+		MatchHost:    host,
+		MatchPath:    "/",
+		MatchMethods: []string{"POST"},
+		Priority:     100,
+		Enabled:      true,
+		Kind:         state.EdgeRuleKindValidate,
+		ValidateMode: mode,
+		Action: state.EdgeRuleAction{
+			Kind: state.EdgeRuleKindValidate,
+			Validate: &state.EdgeRuleValidateAction{
+				Schema: []byte(`{"type":"object","required":["x"]}`),
+			},
+		},
+	}
+}
+
+// TestPgStore_EdgeRule_ValidateModeTopLevelRoundTrip pins the
+// top-level validate_mode column (ADR-128 §D1). Create with
+// 'warn' → GetByID returns 'warn' → Update to 'observe' → GetByID
+// returns 'observe' → Update with empty string → SQL coalesce
+// keeps the existing 'observe' (the empty path is "leave alone").
+// A regression in the column-list scan or the INSERT/UPDATE
+// param binding surfaces as a wrong value here.
+func TestPgStore_EdgeRule_ValidateModeTopLevelRoundTrip(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "vt-rt")
+
+	created, err := s.CreateEdgeRule(ctx, pgSampleValidateRuleParams(acct, app, "vmodert.example.com", "warn"))
+	if err != nil {
+		t.Fatalf("CreateEdgeRule: %v", err)
+	}
+	if created.ValidateMode != "warn" {
+		t.Errorf("after create ValidateMode = %q, want %q (top-level column scan must round-trip)", created.ValidateMode, "warn")
+	}
+
+	got, err := s.GetEdgeRuleByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetEdgeRuleByID: %v", err)
+	}
+	if got.ValidateMode != "warn" {
+		t.Errorf("GetByID ValidateMode = %q, want %q", got.ValidateMode, "warn")
+	}
+
+	// Update: warn → observe. The store coalesces the empty
+	// path to "leave alone", so passing a non-empty value is
+	// the explicit-update path.
+	observe := "observe"
+	updated, err := s.UpdateEdgeRule(ctx, created.ID, state.UpdateEdgeRuleParams{ValidateMode: &observe})
+	if err != nil {
+		t.Fatalf("UpdateEdgeRule: %v", err)
+	}
+	if updated.ValidateMode != "observe" {
+		t.Errorf("after Update ValidateMode = %q, want %q", updated.ValidateMode, "observe")
+	}
+
+	// Update with empty string: pgstore coalesces '' to
+	// validate_mode (leave alone). The previous 'observe'
+	// value sticks.
+	empty := ""
+	updated2, err := s.UpdateEdgeRule(ctx, created.ID, state.UpdateEdgeRuleParams{ValidateMode: &empty})
+	if err != nil {
+		t.Fatalf("UpdateEdgeRule (empty): %v", err)
+	}
+	if updated2.ValidateMode != "observe" {
+		t.Errorf("after empty-string Update ValidateMode = %q, want %q (empty must coalesce to leave-alone)", updated2.ValidateMode, "observe")
+	}
+
+	// Update with nil pointer: leave-alone (no column write).
+	// The previous value still wins on the read-back.
+	updated3, err := s.UpdateEdgeRule(ctx, created.ID, state.UpdateEdgeRuleParams{Priority: ptr(75)})
+	if err != nil {
+		t.Fatalf("UpdateEdgeRule (no-mode): %v", err)
+	}
+	if updated3.ValidateMode != "observe" {
+		t.Errorf("after no-mode Update ValidateMode = %q, want %q (nil pointer must leave alone)", updated3.ValidateMode, "observe")
+	}
+	if updated3.Priority != 75 {
+		t.Errorf("priority after no-mode Update = %d, want 75", updated3.Priority)
+	}
+}
+
+// TestPgStore_EdgeRule_ValidateModeDefaultBlock pins the
+// NOT NULL DEFAULT 'block' behaviour: an empty ValidateMode on
+// Create coalesces to 'block' at the SQL boundary (the wire
+// handler relies on this for the create path; legacy rows
+// pre-00293 also land here).
+func TestPgStore_EdgeRule_ValidateModeDefaultBlock(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "vt-block")
+
+	created, err := s.CreateEdgeRule(ctx, pgSampleValidateRuleParams(acct, app, "vmodeblk.example.com", ""))
+	if err != nil {
+		t.Fatalf("CreateEdgeRule: %v", err)
+	}
+	if created.ValidateMode != "block" {
+		t.Errorf("empty ValidateMode coerced to %q, want %q (NOT NULL DEFAULT 'block')", created.ValidateMode, "block")
+	}
+}
+
+// TestPgStore_EdgeRule_ValidateModeInvalidRejected pins the
+// CHECK constraint on validate_mode. A non-closed value must
+// surface as SQLSTATE 23514 (check_violation) so the apid
+// handler can map it to a 422 — silently coercing to 'block'
+// would mask a customer typo.
+func TestPgStore_EdgeRule_ValidateModeInvalidRejected(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "vt-inv")
+
+	_, err := s.CreateEdgeRule(ctx, pgSampleValidateRuleParams(acct, app, "vmodeinv.example.com", "yolo"))
+	if err == nil {
+		t.Fatal("CreateEdgeRule accepted validate_mode='yolo'; want CHECK constraint rejection")
+	}
+	// The pgx error wraps the SQLSTATE 23514 in the message;
+	// a substring match is enough — the apid handler's
+	// EdgeRuleQuotaError / Conflict mapping uses the same shape.
+	if !strings.Contains(err.Error(), "validate_mode") &&
+		!strings.Contains(err.Error(), "check") {
+		t.Errorf("rejection error = %v; want one mentioning validate_mode / check constraint", err)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }

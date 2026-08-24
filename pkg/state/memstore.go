@@ -11665,6 +11665,12 @@ func (m *MemStore) CreateEdgeRule(_ context.Context, in CreateEdgeRuleParams) (E
 		Enabled:      in.Enabled,
 		Kind:         in.Kind,
 		Action:       in.Action,
+		// ValidateMode: empty string coerces to 'block' on
+		// the pgstore side (col 00293 NOT NULL DEFAULT 'block')
+		// and at the gateway handler (handler.go:2694). The
+		// memstore keeps the verbatim value so the in-memory
+		// mirror is byte-stable with the pgstore round-trip.
+		ValidateMode: in.ValidateMode,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -11774,6 +11780,11 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 		Enabled:      in.Enabled,
 		Kind:         in.Kind,
 		Action:       in.Action,
+		// ValidateMode: same shape as CreateEdgeRule — empty
+		// string is preserved verbatim so the memstore mirror
+		// matches the pgstore's column-NULL fallback (00293's
+		// NOT NULL DEFAULT 'block' kicks in on the wire round-trip).
+		ValidateMode: in.ValidateMode,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -12181,6 +12192,15 @@ func (m *MemStore) UpdateEdgeRule(_ context.Context, id string, p UpdateEdgeRule
 	}
 	if p.Action != nil {
 		r.Action = *p.Action
+	}
+	// ValidateMode nil-skip mirrors the pgstore coalesce pattern.
+	// The wire layer (cmd/apid/handlers_edge_rules.go) coerces
+	// '' to 'block' before the request reaches here, so a
+	// non-nil empty string in UpdateEdgeRuleParams is a
+	// legitimate explicit-clear request that the pgstore collapses
+	// to 'block' via coalesce(nullif('', ''), validate_mode).
+	if p.ValidateMode != nil {
+		r.ValidateMode = *p.ValidateMode
 	}
 	r.UpdatedAt = time.Now()
 	m.edgeRules[id] = r

@@ -4506,16 +4506,13 @@ var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:
 //     api.MaxRequestBodyBytes (per-plan 25 MB buffered / 100 MB
 //     streaming). Must be > 0 and <= MaxRequestBodyBytes at
 //     create-time.
-//   - ValidateMode: select how the gateway handles a failing body
-//     (issue #975 item #3 / Mega-Foundation #979-a). 'block' (the
-//     default) preserves the v1 behavior — reject with 422.
-//     'observe' counts failures via the gateway_validate_failures_total
-//     metric and never rejects, so an operator can spot noisy
-//     endpoints without breaking their customers. 'warn' also
-//     stamps `X-Validation-Warning: <rule_id>` on the proxied
-//     response (warning only; status still 200/whatever the app
-//     returned). Closed enum; unknown values reject at
-//     create-time.
+//   - ValidateMode: DEPRECATED (ADR-128 D2). Moved to top-level
+//     `EdgeRuleResponse.validate_mode` / `CreateEdgeRuleRequest.
+//     validate_mode` / `UpdateEdgeRuleRequest.validate_mode`. This
+//     action-level field is retained for the back-compat read
+//     window — older clients may still send it here and older
+//     decoders may still read it from a response. The field will
+//     be removed in the release after the deprecation notice.
 type EdgeRuleValidateAction struct {
 	Schema                json.RawMessage `json:"schema"`
 	ContentTypes          []string        `json:"content_types,omitempty"`
@@ -5372,6 +5369,14 @@ func isHeaderToken(s string) bool {
 // need seven per-kind models today; a typed SDK unmarshals into
 // one of the seven structs based on Kind (deferred to a
 // separate SDK ergonomics PR).
+//
+// ValidateMode is the top-level source of truth for kind=validate
+// (ADR-128 D1). It is the resolved mode ('observe' | 'warn' |
+// 'block'); the store's NOT NULL DEFAULT 'block' guarantees it
+// is never empty. The action-level `validate_mode` field is
+// retained for the back-compat read window (ADR-128 D2) but is
+// deprecated and will be dropped in the release after the
+// deprecation notice.
 type EdgeRuleResponse struct {
 	ID           string          `json:"id"`
 	AccountID    string          `json:"account_id"`
@@ -5382,6 +5387,7 @@ type EdgeRuleResponse struct {
 	Priority     int             `json:"priority"`
 	Enabled      bool            `json:"enabled"`
 	Kind         string          `json:"kind"`
+	ValidateMode string          `json:"validate_mode,omitempty"`
 	Action       json.RawMessage `json:"action"`
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
@@ -5391,6 +5397,11 @@ type EdgeRuleResponse struct {
 // Priority and Enabled are *int/*bool so the unset-vs-explicit
 // distinction survives (the DTO is what reaches the store layer
 // after pointer coercion).
+//
+// ValidateMode (ADR-128 D1) is the top-level source of truth for
+// kind=validate. The handler prefers this field over the
+// action-level `action.validate_mode` (deprecated). Empty == 'block'
+// (the SQL-side default; the column is NOT NULL).
 type CreateEdgeRuleRequest struct {
 	MatchHost    string          `json:"match_host"`
 	MatchPath    string          `json:"match_path"`
@@ -5398,17 +5409,25 @@ type CreateEdgeRuleRequest struct {
 	Priority     *int            `json:"priority,omitempty"`
 	Enabled      *bool           `json:"enabled,omitempty"`
 	Kind         string          `json:"kind"`
+	ValidateMode string          `json:"validate_mode,omitempty"`
 	Action       json.RawMessage `json:"action"`
 }
 
 // UpdateEdgeRuleRequest is the wire shape for PATCH /v1/edge-rules/{id}.
 // All fields are optional; nil = "leave alone".
+//
+// ValidateMode is *string so nil = "leave alone" (no row update).
+// An explicit empty string is a no-op — the pgstore UPDATE runs
+// coalesce(nullif($9, empty), validate_mode), which keeps the
+// existing column value. Customers who want to reset to 'block'
+// must send the explicit string "block".
 type UpdateEdgeRuleRequest struct {
 	MatchHost    *string          `json:"match_host,omitempty"`
 	MatchPath    *string          `json:"match_path,omitempty"`
 	MatchMethods *[]string        `json:"match_methods,omitempty"`
 	Priority     *int             `json:"priority,omitempty"`
 	Enabled      *bool            `json:"enabled,omitempty"`
+	ValidateMode *string          `json:"validate_mode,omitempty"`
 	Action       *json.RawMessage `json:"action,omitempty"`
 }
 

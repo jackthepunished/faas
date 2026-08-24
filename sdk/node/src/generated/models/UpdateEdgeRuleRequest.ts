@@ -25,6 +25,12 @@ export type UpdateEdgeRuleRequest = {
   priority?: number;
   enabled?: boolean;
   /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Omit (do not send) to leave the column untouched.
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
+  /**
    * Replaces the jsonb column whole.
    */
   action?: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);

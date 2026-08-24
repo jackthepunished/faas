@@ -7369,7 +7369,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 
 const edgeRuleSelectCols = `id, account_id, app_id, match_host, match_path,
        match_methods, priority, enabled, kind, action,
-       created_at, updated_at`
+       validate_mode, created_at, updated_at`
 
 // scanEdgeRule reads a single row. ErrNotFound on no-rows; raw error
 // otherwise. The kind column comes back as text; Action comes back
@@ -7417,7 +7417,7 @@ func scanEdgeRuleCols(scan func(...any) error) (EdgeRule, error) {
 	if err := scan(
 		&r.ID, &r.AccountID, &r.AppID, &r.MatchHost, &r.MatchPath,
 		&matchMethods, &r.Priority, &r.Enabled, &kind, &actionBytes,
-		&r.CreatedAt, &r.UpdatedAt,
+		&r.ValidateMode, &r.CreatedAt, &r.UpdatedAt,
 	); err != nil {
 		return EdgeRule{}, err
 	}
@@ -7445,14 +7445,23 @@ func (s *PgStore) CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (
 	row := s.pool.QueryRow(ctx, `
 		insert into edge_rules (
 			account_id, app_id, match_host, match_path,
-			match_methods, priority, enabled, kind, action
+			match_methods, priority, enabled, kind, action,
+			validate_mode
 		) values (
 			$1, $2, $3, $4,
-			$5, $6, $7, $8, $9::jsonb
+			$5, $6, $7, $8, $9::jsonb,
+			coalesce(nullif($10, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
 		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+		// $10: empty string is the apid-handler convention for
+		// "use the strictest mode"; coalesce turns it into
+		// 'block' per ADR-128. The SQL-side default at 00293
+		// would also fire on a column omission, but the explicit
+		// coalesce keeps the wire surface consistent with the
+		// empty-handler default at pkg/gateway/handler.go:2694.
+		in.ValidateMode,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {
@@ -7583,14 +7592,19 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 	row := tx.QueryRow(ctx, `
 		insert into edge_rules (
 			account_id, app_id, match_host, match_path,
-			match_methods, priority, enabled, kind, action
+			match_methods, priority, enabled, kind, action,
+			validate_mode
 		) values (
 			$1, $2, $3, $4,
-			$5, $6, $7, $8, $9::jsonb
+			$5, $6, $7, $8, $9::jsonb,
+			coalesce(nullif($10, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
 		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+		// $10: same empty-string→'block' coalesce as the un-capped
+		// CreateEdgeRule path (ADR-128).
+		in.ValidateMode,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {
@@ -8092,6 +8106,7 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		hostArg, pathArg any
 		methodsArg       any
 		actionArg        any
+		validateModeArg  any
 	)
 	if p.MatchHost != nil {
 		hostArg = *p.MatchHost
@@ -8109,6 +8124,17 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		}
 		actionArg = bytes
 	}
+	// ValidateMode nil-skip mirrors Action: a nil pointer means
+	// "do not touch the column". A non-nil empty string is a
+	// valid explicit-clear — coalesce(nullif(...)) will leave the
+	// existing value intact, which is what the customer expects
+	// from an empty-string request body. The wire surface
+	// (cmd/apid/handlers_edge_rules.go) coerces empty to 'block'
+	// before it reaches this layer per ADR-128 §D2's deprecation
+	// window contract.
+	if p.ValidateMode != nil {
+		validateModeArg = *p.ValidateMode
+	}
 
 	row := s.pool.QueryRow(ctx, `
 		update edge_rules set
@@ -8117,11 +8143,18 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			match_methods = coalesce($4, match_methods),
 			priority      = coalesce($5, priority),
 			enabled       = coalesce($6, enabled),
-			action        = case when $7 then $8::jsonb else action end
+			action        = case when $7 then $8::jsonb else action end,
+			validate_mode = coalesce(nullif($9, ''), validate_mode)
 		where id = $1
 		returning `+edgeRuleSelectCols,
 		id, hostArg, pathArg, methodsArg, p.Priority, p.Enabled,
 		p.Action != nil, actionArg,
+		// $9: nil-skip via coalesce (nil → keep existing).
+		// nullif('', '') collapses an explicit empty string
+		// to NULL too — same outcome. The wire layer coerces
+		// '' to 'block' before this point so the round-trip
+		// is observable in the response.
+		validateModeArg,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {

@@ -4584,6 +4584,14 @@ type EdgeRule struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	// ValidateMode (issue #975 item #3 / ADR-128) is the
+	// source-of-truth column for kind=validate enforcement.
+	// Empty == 'block' (the SQL-side default at 00293 also
+	// defaults to 'block' for pre-existing rows). Action.Validate
+	// .ValidateMode is kept as a read-side fallback for one
+	// release per ADR-128 §D2 so legacy JSONB-only rows
+	// preserve the customer's intended mode.
+	ValidateMode string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -4701,7 +4709,11 @@ type AlertPreset struct {
 
 // CreateEdgeRuleParams is the input bundle for CreateEdgeRule and
 // CreateEdgeRuleIfUnderQuota. Action is marshalled to jsonb at the
-// pgstore boundary.
+// pgstore boundary. ValidateMode is the kind=validate enforcement
+// mode (issue #975 item #3 / ADR-128) — empty string is coerced
+// to 'block' at the SQL-side default (00293 NOT NULL DEFAULT
+// 'block'), so callers can pass "" to opt into the strictest
+// mode.
 type CreateEdgeRuleParams struct {
 	AccountID    string
 	AppID        string
@@ -4712,6 +4724,7 @@ type CreateEdgeRuleParams struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	ValidateMode string
 }
 
 // UpdateEdgeRuleParams carries the optional fields of
@@ -4719,7 +4732,9 @@ type CreateEdgeRuleParams struct {
 // Action is *EdgeRuleAction because a nil means "do not touch the
 // jsonb column"; a non-nil replaces it wholesale (the kind-tagged
 // union has no partial-update shape — the customer re-sends the
-// full action body).
+// full action body). ValidateMode follows the same nil-skip
+// pattern as the other optional scalars — nil means "do not
+// touch the column"; non-nil replaces the column verbatim.
 type UpdateEdgeRuleParams struct {
 	MatchHost    *string
 	MatchPath    *string
@@ -4727,6 +4742,7 @@ type UpdateEdgeRuleParams struct {
 	Priority     *int
 	Enabled      *bool
 	Action       *EdgeRuleAction
+	ValidateMode *string
 }
 
 // EdgeRuleQuotaError is returned by CreateEdgeRuleIfUnderQuota when
