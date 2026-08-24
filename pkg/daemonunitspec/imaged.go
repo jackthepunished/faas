@@ -36,12 +36,13 @@ func UnitImaged() daemonunit.Unit {
 		After:         []string{"network.target", "faas-cp.slice", "faas-vmmd.service"},
 		Wants:         []string{"faas-cp.slice", "faas-vmmd.service"},
 
-		Type:       "simple",
-		User:       "faas-imaged",
-		Group:      "faas",
-		ExecStart:  `/opt/faas/current/bin/imaged --config /etc/faas/imaged.toml`,
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		Type:               "simple",
+		User:               "faas-imaged",
+		Group:              "faas",
+		ExecStart:          `/opt/faas/current/bin/imaged --config /etc/faas/imaged.toml`,
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice: "faas-cp.slice",
 		// Base-image conversion invokes mkfs.ext4 over the OCI layer

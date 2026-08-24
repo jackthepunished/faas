@@ -89,6 +89,7 @@ type Unit struct {
 	ExecStartPost         []string // ordered post-start fixups (vmmd runtime dir)
 	Restart               string
 	RestartSec            string
+	RestartCountExport    string // systemd 254+; e.g. "SYSTEMD_RESTARTS_ON_FAILURE"
 	Slice                 string
 	MemoryMax             string
 	Delegate              bool
@@ -181,6 +182,7 @@ func (u Unit) Render() []byte {
 	}
 	writeStringKV(&buf, "Restart", u.Restart)
 	writeStringKV(&buf, "RestartSec", u.RestartSec)
+	writeStringKV(&buf, "RestartCountExport", u.RestartCountExport)
 	writeStringKV(&buf, "Slice", u.Slice)
 	writeStringKV(&buf, "MemoryMax", u.MemoryMax)
 	if u.Delegate {
@@ -472,6 +474,8 @@ func apply(u *Unit, section, key, val string) error {
 		u.Restart = val
 	case "[Service]/RestartSec":
 		u.RestartSec = val
+	case "[Service]/RestartCountExport":
+		u.RestartCountExport = val
 	case "[Service]/Slice":
 		u.Slice = val
 	case "[Service]/MemoryMax":
@@ -647,6 +651,7 @@ func Diff(a, b Unit) []string {
 	add("[Service]", "ExecStartPost", fmt.Sprintf("%v", a.ExecStartPost), fmt.Sprintf("%v", b.ExecStartPost))
 	add("[Service]", "Restart", a.Restart, b.Restart)
 	add("[Service]", "RestartSec", a.RestartSec, b.RestartSec)
+	add("[Service]", "RestartCountExport", a.RestartCountExport, b.RestartCountExport)
 	add("[Service]", "Slice", a.Slice, b.Slice)
 	add("[Service]", "MemoryMax", a.MemoryMax, b.MemoryMax)
 	add("[Service]", "Delegate", boolStr(a.Delegate), boolStr(b.Delegate))

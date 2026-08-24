@@ -38,9 +38,10 @@ func UnitSchedd() daemonunit.Unit {
 			// the Hobby / no-quota plan shape (ADR-118 §9).
 			`/opt/faas/current/bin/schedd-brokerq-apply`,
 		},
-		ExecStart:  `/opt/faas/current/bin/schedd --config /etc/faas/schedd.toml`,
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		ExecStart:          `/opt/faas/current/bin/schedd --config /etc/faas/schedd.toml`,
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice:     "faas-cp.slice",
 		MemoryMax: "256M",
