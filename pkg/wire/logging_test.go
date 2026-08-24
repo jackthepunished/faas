@@ -81,26 +81,36 @@ func TestNewCorrelationLogger_EmitsCanonicalFields(t *testing.T) {
 // cluster C commit 10 of the platform-observability mega-PR) pins
 // the version propagation contract: every slog record emitted
 // through a NewCorrelationLogger constructed on top of a
-// base.With("daemon", ..., "version", ...) MUST carry both
-// "daemon" and "version" attributes. wire.Daemon() relies on this
-// to surface the binary identity from journalctl — a regression
-// that drops version from the With chain would mean operators
-// can't tell which commit SHA produced a panic stack trace.
+// base.With("version", ...) MUST carry both "daemon" and
+// "version" attributes exactly once per record. wire.Daemon()
+// relies on this to surface the binary identity from journalctl —
+// a regression that drops version from the With chain would mean
+// operators can't tell which commit SHA produced a panic stack
+// trace.
 //
-// The test mimics Daemon()'s pattern: base.With("daemon", name,
-// "version", Version), then NewCorrelationLogger(...). The
-// output JSON must carry "version" on every record, including
-// ones emitted from a child logger derived via WithCorrelationFields.
+// The test mimics Daemon()'s post-#852-fix pattern: base.With
+// only stamps "version" (NOT "daemon", since NewCorrelationLogger
+// already injects FieldDaemon). The output JSON must carry
+// "version" on every record, including ones emitted from a child
+// logger derived via WithCorrelationFields.
+//
+// Issue #852 fix: assert via strings.Count instead of
+// json.Unmarshal-into-map. The map decoder silently collapses
+// duplicate JSON keys (the previous tests all passed while
+// emitting daemon twice per record), so the string-count check
+// is the only regression test that catches the dedup-violating
+// shape. Exactly one `"daemon":` and one `"version":` per line
+// is the contract.
 func TestCorrelationLogger_StampsVersion(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	daemonName := "vmmd"
 	version := "1.2.3-test"
 
-	// Daemon() constructs the base with version before handing off
-	// to NewCorrelationLogger — mirror that pattern.
+	// Daemon() (post #852 fix) constructs the base with version
+	// only — daemon is injected by NewCorrelationLogger.
 	log := wire.NewCorrelationLogger(
-		base.With("daemon", daemonName, "version", version),
+		base.With("version", version),
 		wire.CorrelationFields{RequestID: "req-1"},
 		daemonName,
 	)
@@ -110,13 +120,32 @@ func TestCorrelationLogger_StampsVersion(t *testing.T) {
 	child := wire.WithCorrelationFields(log, wire.CorrelationFields{AppID: "app-1"})
 	child.Info("wake admit", "wake_id", "wake-1")
 
-	recs := decodeLines(t, &buf)
-	if len(recs) != 2 {
-		t.Fatalf("got %d records, want 2", len(recs))
+	// Raw-line assertion: every emitted line carries exactly one
+	// `"daemon":` and exactly one `"version":`. Pre-#852 fix this
+	// was 2 each because base.With stamped daemon AND
+	// NewCorrelationLogger stamped daemon a second time. Map
+	// decoders silently collapse duplicates, so this is the only
+	// test shape that catches the regression.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2", len(lines))
 	}
+	for i, line := range lines {
+		if c := strings.Count(line, `"daemon":`); c != 1 {
+			t.Errorf("record[%d] has %d %q keys, want 1 (#852 fix: each line must carry daemon exactly once). line=%q",
+				i, c, "daemon", line)
+		}
+		if c := strings.Count(line, `"version":`); c != 1 {
+			t.Errorf("record[%d] has %d %q keys, want 1 (Daemon()'s With chain must stamp version exactly once). line=%q",
+				i, c, "version", line)
+		}
+	}
+
+	// Decoded-receiver checks for the human-readable shape.
+	recs := decodeLines(t, &buf)
 	for i, rec := range recs {
 		if got, _ := rec["version"].(string); got != version {
-			t.Errorf("record[%d] version = %q, want %q (every log line must carry version)", i, got, version)
+			t.Errorf("record[%d] version = %q, want %q", i, got, version)
 		}
 		if got, _ := rec["daemon"].(string); got != daemonName {
 			t.Errorf("record[%d] daemon = %q, want %q", i, got, daemonName)
@@ -128,6 +157,85 @@ func TestCorrelationLogger_StampsVersion(t *testing.T) {
 	}
 	if got, _ := recs[1]["version"].(string); got != version {
 		t.Errorf("child record version = %q, want %q (child logger must inherit envelope version)", got, version)
+	}
+}
+
+// TestCorrelationLogger_DaemonEmittedOnce_ParentLogger pins issue
+// #852 directly: a logger built via Daemon()'s exact
+// post-fix construction (base.With("version", ...), then
+// NewCorrelationLogger(..., daemonName)) MUST emit "daemon" exactly
+// once per record. The pre-fix pattern (base.With("daemon", ...,
+// "version", ...), then NewCorrelationLogger(..., daemonName))
+// emitted "daemon" twice on every record — caught by nothing
+// because the existing tests decoded JSON into map[string]any,
+// which silently collapses duplicate keys.
+func TestCorrelationLogger_DaemonEmittedOnce_ParentLogger(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	log := wire.NewCorrelationLogger(
+		base.With("version", "1.2.3"),
+		wire.CorrelationFields{RequestID: "req-1"},
+		"schedd",
+	)
+	log.Info("boot")
+
+	line := strings.TrimSpace(buf.String())
+	if c := strings.Count(line, `"daemon":`); c != 1 {
+		t.Fatalf("got %d \"daemon\": keys, want 1 (issue #852 fix). line=%q", c, line)
+	}
+	if got, _ := decodeLines(t, &buf)[0]["daemon"].(string); got != "schedd" {
+		t.Errorf("daemon = %q, want schedd", got)
+	}
+}
+
+// TestCorrelationLogger_DaemonEmittedOnce_ChildLogger: even a
+// child logger derived via WithCorrelationFields must carry
+// exactly one "daemon" — the parent's daemon envelope survives
+// the With chain and NewCorrelationLogger must not stamp a second
+// copy.
+func TestCorrelationLogger_DaemonEmittedOnce_ChildLogger(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	parent := wire.NewCorrelationLogger(
+		base.With("version", "1.2.3"),
+		wire.CorrelationFields{},
+		"vmmd",
+	)
+	child := wire.WithCorrelationFields(parent, wire.CorrelationFields{AppID: "app-1"})
+	child.Info("wake admit", "wake_id", "wake-1")
+
+	line := strings.TrimSpace(buf.String())
+	if c := strings.Count(line, `"daemon":`); c != 1 {
+		t.Fatalf("got %d \"daemon\": keys on child record, want 1 (issue #852 fix). line=%q", c, line)
+	}
+	if got, _ := decodeLines(t, &buf)[0]["daemon"].(string); got != "vmmd" {
+		t.Errorf("daemon = %q, want vmmd", got)
+	}
+}
+
+// TestCorrelationLogger_DaemonNotOnEmptyName: the daemon field
+// is OPTIONAL. Passing "" to NewCorrelationLogger (a legitimate
+// call shape for non-daemon libraries that use the helper) must
+// emit zero "daemon" keys — neither an empty string nor a duplicate.
+func TestCorrelationLogger_DaemonNotOnEmptyName(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	log := wire.NewCorrelationLogger(
+		base.With("version", "1.2.3"),
+		wire.CorrelationFields{RequestID: "req-1"},
+		"", // no daemon — e.g. a test harness wrapping the helper
+	)
+	log.Info("hello")
+
+	line := strings.TrimSpace(buf.String())
+	if c := strings.Count(line, `"daemon":`); c != 0 {
+		t.Fatalf("got %d \"daemon\": keys, want 0 when daemon=\"\". line=%q", c, line)
+	}
+	if _, ok := decodeLines(t, &buf)[0]["daemon"]; ok {
+		t.Errorf("daemon field present on record when caller passed empty daemon name")
 	}
 }
 

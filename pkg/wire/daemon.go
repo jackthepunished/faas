@@ -182,8 +182,13 @@ func Daemon(name string, fn RunFunc) {
 		return
 	}
 
+	// Issue #852: do NOT stamp "daemon" on Logger().With — slog.Logger.With
+	// accumulates attrs without dedup, so NewCorrelationLogger (called below)
+	// would emit the daemon name twice on every record. NewCorrelationLogger
+	// injects FieldDaemon once when daemon != "". Keep "version" on the With
+	// chain so the version stamp survives correlation envelope construction.
 	log := NewCorrelationLogger(
-		Logger().With("daemon", name, "version", Version),
+		Logger().With("version", Version),
 		CorrelationFields{RequestID: NewRequestID()},
 		name,
 	)
@@ -251,7 +256,11 @@ func Daemon(name string, fn RunFunc) {
 	// nil-safe so a daemon that never registered its OpsMetrics
 	// doesn't panic.
 	defaultOps.MarkReady(name)
-	log.Info("ready", "daemon", name, "version", Version, "ready", true)
+	// Issue #852: do NOT re-stamp "daemon" / "version" on this call site.
+	// The slog.Logger.With envelope on log already carries "version" and
+	// NewCorrelationLogger already carries "daemon" — re-passing them here
+	// would emit duplicate JSON keys per the slog JSON handler contract.
+	log.Info("ready", "ready", true)
 	if err := fn(ctx, log); err != nil {
 		log.Error("exited with error", "err", err)
 		os.Exit(1)
