@@ -104,8 +104,8 @@ type Role struct {
 	// AltNames (SANs) lists the hostnames/IPs the leaf is valid for.
 	// Local-dev leaves always include 127.0.0.1, ::1, and localhost;
 	// distributed leaves add the per-daemon CommonName ("schedd.faas",
-	// etc.) plus the operator-set per-hostnames via the EnvSAN hook
-	// (future patch; not in this slice).
+	// etc.) plus the host-specific transport SANs supplied by the manifest
+	// renderer.
 	AltNames AltNames
 }
 
@@ -384,6 +384,19 @@ func CARoot(rootDir string) (certPath, keyPath string) {
 // force=true skips the NotAfter check and re-issues unconditionally —
 // used by `gregale pki rotate`.
 func EnsureLeaf(rootDir string, role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool) error {
+	return EnsureLeafWithSANs(rootDir, role, caCert, caKey, force, AltNames{})
+}
+
+// EnsureLeafWithSANs is the host-aware variant of EnsureLeaf. The fixed
+// role SANs remain the authorization identity (for example, vmmd.faas),
+// while extraSANs carries the stable private transport identity of the
+// box that owns the leaf (for example, fsn-3.gregale.dev). This lets a
+// fleet route to a specific compute node without creating duplicate
+// vmmd.faas records in a resolver.
+//
+// A fresh SAN is treated as drift: a still-valid certificate that lacks
+// one of the requested names is re-issued even when force is false.
+func EnsureLeafWithSANs(rootDir string, role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
 	certPath, keyPath := LeafPaths(rootDir, role)
 
 	if !force {
@@ -391,16 +404,48 @@ func EnsureLeaf(rootDir string, role Role, caCert *x509.Certificate, caKey *ecds
 		if err != nil {
 			return err
 		}
-		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold {
+		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold && certificateHasSANs(existing, extraSANs) {
 			return ErrLeafNotExpiringSoon
 		}
 	}
 
+	role.AltNames = mergeAltNames(role.AltNames, extraSANs)
 	certPEM, keyPEM, err := generateLeaf(role, caCert, caKey)
 	if err != nil {
 		return err
 	}
 	return writeLeaf(certPath, keyPEM, certPEM)
+}
+
+func certificateHasSANs(cert *x509.Certificate, required AltNames) bool {
+	if cert == nil {
+		return false
+	}
+	for _, requiredDNS := range required.DNSNames {
+		found := false
+		for _, existingDNS := range cert.DNSNames {
+			if existingDNS == requiredDNS {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	for _, requiredIP := range required.IPAddresses {
+		found := false
+		for _, existingIP := range cert.IPAddresses {
+			if existingIP.Equal(requiredIP) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // EnsureCA ensures the CA cert + key exist at rootDir/ca/. force=true

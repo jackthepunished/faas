@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +116,44 @@ func TestEnsureLeafSkipsFreshLeaf(t *testing.T) {
 	err = EnsureLeaf(root, role, caCert, caKey, false)
 	if !errors.Is(err, ErrLeafNotExpiringSoon) {
 		t.Errorf("second EnsureLeaf: got %v, want ErrLeafNotExpiringSoon", err)
+	}
+}
+
+func TestEnsureLeafWithSANsReissuesForNewTransportIdentity(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	role := Role{
+		CommonName: "vmmd.faas",
+		Kind:       KindServer,
+		Directory:  "vmmd",
+		Filename:   "server",
+		AltNames:   ProductionSANs("vmmd.faas"),
+	}
+	if err := EnsureLeaf(root, role, caCert, caKey, false); err != nil {
+		t.Fatalf("EnsureLeaf: %v", err)
+	}
+	certPath, _ := LeafPaths(root, role)
+	before := parseTestCert(t, certPath)
+
+	extra := AltNames{
+		DNSNames:    []string{"fsn-3.gregale.dev"},
+		IPAddresses: []net.IP{net.ParseIP("10.42.0.3")},
+	}
+	if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, extra); err != nil {
+		t.Fatalf("EnsureLeafWithSANs: %v", err)
+	}
+	after := parseTestCert(t, certPath)
+	if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
+		t.Fatal("EnsureLeafWithSANs did not reissue a fresh leaf when transport SANs were missing")
+	}
+	if !certificateHasSANs(after, extra) {
+		t.Fatalf("reissued leaf missing transport SANs: dns=%v ips=%v", after.DNSNames, after.IPAddresses)
+	}
+	if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, extra); !errors.Is(err, ErrLeafNotExpiringSoon) {
+		t.Fatalf("second EnsureLeafWithSANs = %v, want ErrLeafNotExpiringSoon", err)
 	}
 }
 

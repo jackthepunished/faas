@@ -3,6 +3,7 @@ package renderer
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/daemonunitspec"
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/pki"
 )
 
 // RenderOptions is the operator-supplied input set for a single
@@ -44,9 +46,10 @@ type RenderOptions struct {
 	// CgroupRoot is the cgroup v2 mount root. Default: /sys/fs/cgroup.
 	CgroupRoot string
 
-	// HostSANFile is an optional sidecar JSON file with per-host
-	// SANs. Used by the vmmd [compute_node] SAN list. Empty
-	// means no extra SANs (single-box default).
+	// HostSANFile is an optional sidecar JSON file with additional
+	// per-host certificate SANs. The manifest endpoint is always
+	// included automatically; this file is for extra private aliases.
+	// Empty means no extra SANs beyond the manifest endpoint.
 	HostSANFile string
 
 	// DryRun short-circuits all filesystem writes. The renderer
@@ -176,6 +179,10 @@ func render(opts RenderOptions) (RenderReport, error) {
 	if err != nil {
 		return RenderReport{}, err
 	}
+	extraSANs, err := endpointSANs(host, hostSANs)
+	if err != nil {
+		return RenderReport{}, err
+	}
 
 	// Resolve the per-host daemon set. The registry has 8 daemons;
 	// the host's role filters them out (we never short-circuit by
@@ -284,7 +291,7 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// PKI outputs here.
 	var pkiOutputs []OutputReport
 	if !opts.DryRun {
-		leafOutputs, err := renderPKI(opts.PKIRootDir, host.Role)
+		leafOutputs, err := renderPKI(opts.PKIRootDir, host.Role, extraSANs)
 		if err != nil {
 			return report, err
 		}
@@ -485,6 +492,48 @@ func loadHostSANs(path string) ([]string, error) {
 	var out []string
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("renderer: parse host SAN file %s: %w", path, err)
+	}
+	return out, nil
+}
+
+// endpointSANs turns the manifest endpoint and optional operator SAN file
+// into certificate SANs for this host's leaves. The endpoint is the private
+// routing identity for the box; role SANs such as vmmd.faas remain in the
+// certificate as the peer-authorization identity.
+func endpointSANs(host manifest.Host, configured []string) (pki.AltNames, error) {
+	var out pki.AltNames
+	add := func(raw string) {
+		if raw == "" {
+			return
+		}
+		if ip := net.ParseIP(raw); ip != nil {
+			for _, existing := range out.IPAddresses {
+				if existing.Equal(ip) {
+					return
+				}
+			}
+			out.IPAddresses = append(out.IPAddresses, ip)
+			return
+		}
+		for _, existing := range out.DNSNames {
+			if existing == raw {
+				return
+			}
+		}
+		out.DNSNames = append(out.DNSNames, raw)
+	}
+
+	if host.Address != "" {
+		address, _, err := manifest.ParseHostPort(host.Address)
+		if err != nil && !strings.HasPrefix(host.Address, "unix://") {
+			return out, fmt.Errorf("renderer: host %s endpoint SAN: %w", host.Name, err)
+		}
+		if err == nil {
+			add(address)
+		}
+	}
+	for _, san := range configured {
+		add(strings.TrimSpace(san))
 	}
 	return out, nil
 }

@@ -196,8 +196,8 @@ func TestRenderTOML_VmmdDerivesIdentityAndTargetFromHost(t *testing.T) {
 	if got := flat["compute_node.name"]; got != "fsn-2" {
 		t.Errorf("compute_node.name = %q, want fsn-2", got)
 	}
-	if got := flat["compute_node.target_url"]; got != "tcp://vmmd.faas:50051" {
-		t.Errorf("compute_node.target_url = %q, want tcp://vmmd.faas:50051", got)
+	if got := flat["compute_node.target_url"]; got != "tcp://10.42.0.2:50051" {
+		t.Errorf("compute_node.target_url = %q, want tcp://10.42.0.2:50051", got)
 	}
 	if got := flat["compute_node.overlay_ip"]; got != "10.42.0.2" {
 		t.Errorf("compute_node.overlay_ip = %q, want 10.42.0.2", got)

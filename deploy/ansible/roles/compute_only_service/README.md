@@ -17,9 +17,11 @@ with `DATABASE_URL` (gap G2).
   `RoleSingleBox` on the compute-only box and the cosign sign-keypair path
   assumes single-box assumptions (no per-box PKI subset).
 - `zz-faas-vmmd-client.conf.j2` — owns the split-box imaged → vmmd target and
-  dedicated `imaged/vmmd-client` leaf. The target is always the internal
-  `vmmd.faas` identity, not a provider-specific IP, so moving the compute box
-  does not require editing daemon certificates or hard-coded addresses.
+  dedicated `imaged/vmmd-client` leaf. The target is the compute host's
+  stable private endpoint, not a shared `vmmd.faas` resolver alias. The vmmd
+  server leaf retains `vmmd.faas` as its role identity and carries the
+  endpoint as an additional SAN, so adding another compute box cannot route
+  imaged to the wrong node.
 
 ## Side effects
 

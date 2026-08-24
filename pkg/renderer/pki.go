@@ -22,9 +22,9 @@ type PKIOutput struct {
 // leaf set is filtered by hostRole via `pkg/pki.RolesForBox` — a
 // control-plane box doesn't get vmmd's leaves, a compute-only box
 // doesn't get apid's, etc. Each leaf is issued via
-// `pkg/pki.EnsureLeaf(..., false)` which is idempotent: leaves whose
-// NotAfter is more than ReissueThreshold away are skipped
-// (ErrLeafNotExpiringSoon).
+// `pkg/pki.EnsureLeafWithSANs(..., false)` which is idempotent: leaves
+// whose NotAfter is more than ReissueThreshold away and already contain
+// the host's routing SANs are skipped (ErrLeafNotExpiringSoon).
 //
 // The CA is materialised via `pkg/pki.EnsureCA(rootDir, false)` —
 // the renderer's job is to make the CA + leaves exist on disk. The
@@ -37,7 +37,7 @@ type PKIOutput struct {
 // leaves are reported with Issued=false so the second-run report
 // surfaces every leaf (with Action="unchanged") — the doctor's
 // PKI-health signal depends on every leaf being visible.
-func renderPKI(rootDir, hostRole string) ([]PKIOutput, error) {
+func renderPKI(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, error) {
 	// EnsureCA is idempotent (force=false → don't re-issue if a
 	// fresh CA already exists). On a fresh box this generates the
 	// CA cert + key at <rootDir>/ca/{ca.crt,ca.key}. The mode
@@ -58,7 +58,7 @@ func renderPKI(rootDir, hostRole string) ([]PKIOutput, error) {
 
 	var out []PKIOutput
 	for _, role := range roles {
-		err := pki.EnsureLeaf(rootDir, role, caCert, caKey, false)
+		err := pki.EnsureLeafWithSANs(rootDir, role, caCert, caKey, false, extraSANs)
 		issued := err == nil
 		if err != nil && !errors.Is(err, pki.ErrLeafNotExpiringSoon) {
 			return nil, fmt.Errorf("renderer: pki: ensure leaf %s/%s: %w", role.Directory, role.Filename, err)

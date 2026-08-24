@@ -322,11 +322,12 @@ func computeNodeValue(daemon string, dc *manifest.DaemonConfig, k manifest.Table
 	case "target_url":
 		// vmmd's dial target is the host endpoint, never its bind
 		// address. A bind such as tcp://0.0.0.0:50051 is not routable
-		// and would make the control plane dial itself. Use the private
-		// PKI identity so stdlib hostname verification succeeds; Ansible
-		// maps that identity to the manifest endpoint on each box.
+		// and would make the control plane dial itself. Use the
+		// node-specific private endpoint so every compute row routes to
+		// the box named by that row; the renderer adds that endpoint to
+		// the host's PKI SAN set.
 		if hostAddress != "" {
-			return manifest.ServiceTCPURL("compute-only", hostAddress)
+			return manifest.TCPURL(hostAddress)
 		}
 		return dc.Bind, nil
 	case "overlay_ip":

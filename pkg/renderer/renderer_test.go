@@ -2,6 +2,8 @@ package renderer
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,6 +100,76 @@ fleet:
 			names = append(names, e.Name())
 		}
 		t.Errorf("dir has %d entries; expected only the manifest: %v", len(entries), names)
+	}
+}
+
+func TestEndpointSANsIncludesPrivateEndpointAndConfiguredNames(t *testing.T) {
+	sans, err := endpointSANs(manifest.Host{
+		Name:    "fsn-3",
+		Role:    "compute-only",
+		Address: "fsn-3.gregale.dev:50051",
+	}, []string{"vmmd-fsn-3.faas"})
+	if err != nil {
+		t.Fatalf("endpointSANs: %v", err)
+	}
+	if len(sans.DNSNames) != 2 || sans.DNSNames[0] != "fsn-3.gregale.dev" || sans.DNSNames[1] != "vmmd-fsn-3.faas" {
+		t.Fatalf("DNS SANs = %v, want endpoint plus configured SAN", sans.DNSNames)
+	}
+
+	sans, err = endpointSANs(manifest.Host{
+		Name:    "fsn-3",
+		Role:    "compute-only",
+		Address: "10.42.0.3:50051",
+	}, nil)
+	if err != nil {
+		t.Fatalf("endpointSANs literal IP: %v", err)
+	}
+	if len(sans.IPAddresses) != 1 || sans.IPAddresses[0].String() != "10.42.0.3" {
+		t.Fatalf("IP SANs = %v, want 10.42.0.3", sans.IPAddresses)
+	}
+}
+
+func TestRenderer_ComputePKIIncludesPrivateEndpointSAN(t *testing.T) {
+	dir := t.TempDir()
+	path := fixtureManifest(t, "fsn-2", "compute-only")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture manifest: %v", err)
+	}
+	body = []byte(strings.Replace(string(body),
+		"    - name: fsn-2\n      role: compute-only\n",
+		"    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n", 1))
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write endpoint manifest: %v", err)
+	}
+
+	_, err = Render(RenderOptions{
+		ManifestPath: path,
+		Host:         "fsn-2",
+		ReleasesRoot: filepath.Join(dir, "releases"),
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	certPEM, err := os.ReadFile(filepath.Join(dir, "tls", "vmmd", "server.crt"))
+	if err != nil {
+		t.Fatalf("read vmmd server cert: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("vmmd server cert is not PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse vmmd server cert: %v", err)
+	}
+	if !containsString(cert.DNSNames, "vmmd.faas") || !containsString(cert.DNSNames, "fsn-2.gregale.dev") {
+		t.Fatalf("vmmd server SANs = %v, want role and endpoint identities", cert.DNSNames)
 	}
 }
 
