@@ -74,7 +74,7 @@ var ErrMigrationLockNotHeld = errors.New("db: migration lock not held")
 // (cmd/migrate -status calls db.Status instead of MigrateUp; that path
 // is the only deliberate skip and is documented at the docstring on
 // MigrateUp itself).
-func AcquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (release func() error, err error) {
+func AcquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (release func(context.Context) error, err error) {
 	if pool == nil {
 		return nil, errors.New("db: AcquireMigrationLock: nil pool")
 	}
@@ -95,20 +95,20 @@ func AcquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (release func
 	}
 
 	var released bool
-	release = func() error {
+	release = func(releaseCtx context.Context) error {
 		if released {
 			return ErrMigrationLockNotHeld
 		}
 		released = true
 
-		// Run the unlock on a fresh context — the caller's ctx may already
-		// be cancelled (their goroutine panicked, the deadline expired,
-		// etc.) and we still want to release the lock before returning the
-		// connection to the pool. Using context.Background() is safe here
-		// because pg_advisory_unlock is a one-shot round trip; we bound it
-		// with a short timeout so a hung connection doesn't deadlock the
-		// shutdown path.
-		unlockCtx, cancel := context.WithTimeout(context.Background(), pgxLockUnlockTimeout)
+		// Bound the unlock round-trip with the caller's release ctx +
+		// pgxLockUnlockTimeout. If releaseCtx is already cancelled, the
+		// Exec errors with ctx.Err() — that's fine, the conn is still
+		// released below and PG auto-frees the lock at session end, so
+		// the lock cannot leak. Using a context.Background() here would
+		// be wrong: pgx checks cancellation and an unlock-after-shutdown
+		// would silently block the shutdown wait group.
+		unlockCtx, cancel := context.WithTimeout(releaseCtx, pgxLockUnlockTimeout)
 		defer cancel()
 
 		_, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", MigrationLockKey)

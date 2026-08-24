@@ -241,25 +241,6 @@ func newSchedInternalSvcMinter(ctx context.Context, store *state.PgStore, log *s
 	return m, nil
 }
 
-// mintClosure is the small closure factory shared by the cluster
-// and per-host paths so the future-call surface (one JWT per
-// app_id) lives in exactly one place. PR-3 lifts it from
-// newSchedInternalSvcMinter so both paths produce the same
-// closure shape.
-func mintClosure(svcName string, priv ed25519.PrivateKey, kid string) func(string) (string, error) {
-	return func(appID string) (string, error) {
-		claims := map[string]any{
-			// Future: per-app key-pinning — the receiver
-			// could refuse tokens whose app_id claim doesn't
-			// match the routed app. Today's receiver just
-			// checks svcName + aud + exp + sig, so we include
-			// app_id for audit-log fidelity only.
-			"app_id": appID,
-		}
-		return internalsvc.Mint(svcName, internalSvcTokenTTL, claims, priv, kid)
-	}
-}
-
 // loadSchedInternalSvcKey is the new top-level loader (round-3
 // G2 §17 closure). It picks the sealed-at-rest path when
 // FAAS_INTERNAL_SVC_KEY_SEALED_BLOB is set, falling back to the

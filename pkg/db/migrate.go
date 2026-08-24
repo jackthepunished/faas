@@ -66,7 +66,7 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return fmt.Errorf("db: acquire migration lock: %w", err)
 	}
-	defer func() { _ = release() }() //nolint:errcheck // PG auto-releases on conn close; logged at call sites
+	defer func() { _ = release(ctx) }() //nolint:errcheck // PG auto-releases on conn close; logged at call sites
 
 	connStr := stdlib.RegisterConnConfig(cfg.ConnConfig)
 	sqlDB, err := sql.Open("pgx", connStr)

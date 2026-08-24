@@ -35,7 +35,7 @@ func TestAcquireMigrationLock_BlocksSecondHolder(t *testing.T) {
 	const acquireDeadline = 4 * time.Second
 
 	type result struct {
-		release func() error
+		release func(context.Context) error
 		err     error
 	}
 	resultCh := make(chan result, 1)
@@ -49,7 +49,7 @@ func TestAcquireMigrationLock_BlocksSecondHolder(t *testing.T) {
 	// Hold the first lock for `holdFor`, then release.
 	time.Sleep(holdFor)
 	releaseAt := time.Now()
-	if err := first(); err != nil {
+	if err := first(context.Background()); err != nil {
 		t.Fatalf("first release: %v", err)
 	}
 
@@ -59,7 +59,7 @@ func TestAcquireMigrationLock_BlocksSecondHolder(t *testing.T) {
 			t.Fatalf("second acquire failed: %v", r.err)
 		}
 		if r.release != nil {
-			defer r.release() //nolint:errcheck
+			defer func() { _ = r.release(context.Background()) }() //nolint:errcheck
 		}
 		// The second goroutine was launched concurrently with the sleep;
 		// it should have observed the first release within a small window
@@ -87,10 +87,10 @@ func TestAcquireMigrationLock_DoubleReleaseReturnsErr(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	if err := release(); err != nil {
+	if err := release(context.Background()); err != nil {
 		t.Fatalf("first release: %v", err)
 	}
-	if err := release(); !errors.Is(err, ErrMigrationLockNotHeld) {
+	if err := release(context.Background()); !errors.Is(err, ErrMigrationLockNotHeld) {
 		t.Fatalf("second release: got %v, want ErrMigrationLockNotHeld", err)
 	}
 }
@@ -123,7 +123,7 @@ func TestAcquireMigrationLock_ReleasesOnContextCancel(t *testing.T) {
 		// acquire in the first place, the test is moot.
 		t.Skipf("acquire on cancelled ctx: %v (test condition not met)", err)
 	}
-	if err := release(); err != nil {
+	if err := release(context.Background()); err != nil {
 		t.Fatalf("release on cancelled ctx: %v (release should use its own ctx)", err)
 	}
 }

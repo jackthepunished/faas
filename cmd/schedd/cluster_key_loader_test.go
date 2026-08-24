@@ -66,6 +66,13 @@ func TestLoadClusterInternalSvcKey_RoundTrip(t *testing.T) {
 	if err := os.WriteFile(hostAgePath, []byte(hostKey.String()), 0o600); err != nil {
 		t.Fatalf("write host.age: %v", err)
 	}
+	// pkg/secretbox.LoadHostKey enforces 0o400 perm (M8 §11)
+	// even on test fixtures — WriteFile's mode arg is masked by
+	// the process umask, so chmod explicitly to the canonical
+	// shape the loader expects.
+	if err := os.Chmod(hostAgePath, 0o400); err != nil {
+		t.Fatalf("chmod host.age: %v", err)
+	}
 	t.Setenv("FAAS_HOST_AGE_DIR_OVERRIDE", hostDir) // consulted by the test-only loader shim below; not used in production
 
 	// Marshal the private key as PKCS#8 PEM (the production
@@ -174,6 +181,13 @@ func TestLoadClusterInternalSvcKey_RefusesKidMismatch(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(hostDir, "host.age"), []byte(hostKey.String()), 0o600); err != nil {
 		t.Fatalf("write host.age: %v", err)
+	}
+	// Enforce 0o400 perm — see M8 §11; LoadHostKey rejects any
+	// looser mode at fixture-load time. WriteFile's mode arg
+	// is umask-fragile (memory: pg shard 2 perm-fragile), so
+	// chmod explicitly.
+	if err := os.Chmod(filepath.Join(hostDir, "host.age"), 0o400); err != nil {
+		t.Fatalf("chmod host.age: %v", err)
 	}
 	priv1DER, err := x509.MarshalPKCS8PrivateKey(priv1)
 	if err != nil {

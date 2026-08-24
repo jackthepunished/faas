@@ -252,7 +252,7 @@ func TestDeleteClusterSigningKey_AfterInsert(t *testing.T) {
 	sealed := make([]byte, 32)
 	_, _ = rand.Read(sealed)
 	if err := store.InsertClusterSigningKey(ctx, ClusterSigningKey{
-		KeyID:        "AAAAAAAAAAAAAAAAAAAAD",
+		KeyID:        "AAAAAAAAAAAAAAAAAAAAAD",
 		PublicKeyPEM: string(pemBytes),
 		SealedBlob:   sealed,
 	}); err != nil {
