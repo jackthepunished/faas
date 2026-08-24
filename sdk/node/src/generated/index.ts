@@ -19,6 +19,7 @@ export type { AddTenantHostnameRequest } from './models/AddTenantHostnameRequest
 export type { AddTrustedSignerRequest } from './models/AddTrustedSignerRequest.js';
 export type { AdminSetGithubWebhookSecretRequest } from './models/AdminSetGithubWebhookSecretRequest.js';
 export type { AdminSetGithubWebhookSecretResponse } from './models/AdminSetGithubWebhookSecretResponse.js';
+export type { AlertPresetResponse } from './models/AlertPresetResponse.js';
 export type { AlertRuleResponse } from './models/AlertRuleResponse.js';
 export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';
 export type { APIKeyResponse } from './models/APIKeyResponse.js';
@@ -130,6 +131,7 @@ export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
 export type { EdgeRuleSuggestion } from './models/EdgeRuleSuggestion.js';
 export type { EdgeRuleThrottleAction } from './models/EdgeRuleThrottleAction.js';
 export type { EdgeRuleValidateAction } from './models/EdgeRuleValidateAction.js';
+export type { EnableAlertPresetRequest } from './models/EnableAlertPresetRequest.js';
 export type { EnvDiffCell } from './models/EnvDiffCell.js';
 export type { EnvDiffKind } from './models/EnvDiffKind.js';
 export type { EnvDiffResponse } from './models/EnvDiffResponse.js';
