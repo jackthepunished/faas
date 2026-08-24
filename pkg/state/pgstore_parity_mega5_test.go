@@ -149,28 +149,33 @@ func TestPgStore_ListDistinctUpstreamHostHashes_Empty_Mega5(t *testing.T) {
 
 func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
-	appID := mustCreateAppID(t, s, ctx, "upstr-grp")
+	acctID, appID := mustCreateAccountAndAppID(t, s, ctx, "upstr-grp")
 
 	// Two rows with the same (host_redacted_hash, kind, port) — the
 	// GROUP BY must collapse them to a single DataUpstreamTarget.
+	// data_upstreams requires account_id + source ('inferred'|'explicit');
+	// we use 'inferred' to mirror the classifier path.
 	hashA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 64 hex
 	hostA := fmt.Sprintf("a-%s.example", uuid.NewString()[:8])
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5432, $4)`,
-		uuid.New(), appID, hostA, hashA); err != nil {
+		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
+		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5432, $5)`,
+		uuid.New(), acctID, appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #1: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5432, $4)`,
-		uuid.New(), appID, hostA, hashA); err != nil {
+		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
+		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5432, $5)`,
+		uuid.New(), acctID, appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #2: %v", err)
 	}
 	// Different port → separate group.
 	hostB := fmt.Sprintf("b-%s.example", uuid.NewString()[:8])
 	hashB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5433, $4)`,
-		uuid.New(), appID, hostB, hashB); err != nil {
+		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
+		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5433, $5)`,
+		uuid.New(), acctID, appID, hostB, hashB); err != nil {
 		t.Fatalf("seed upstreams #3: %v", err)
 	}
 
@@ -204,6 +209,16 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 // for the parity tests below.
 func mustCreateAppID(t *testing.T, s *state.PgStore, ctx context.Context, tag string) uuid.UUID {
 	t.Helper()
+	_, appUUID := mustCreateAccountAndAppID(t, s, ctx, tag)
+	return appUUID
+}
+
+// mustCreateAccountAndAppID is the underlying helper used by both
+// the DeploymentSidecarRAMs tests (need app_id) and the
+// ListDistinctUpstreamHostHashes tests (need both account_id and
+// app_id).
+func mustCreateAccountAndAppID(t *testing.T, s *state.PgStore, ctx context.Context, tag string) (uuid.UUID, uuid.UUID) {
+	t.Helper()
 	acct, err := s.CreateAccount(ctx,
 		"acc-"+tag+"-"+uuid.NewString()+"@example.com", api.PlanPro)
 	if err != nil {
@@ -220,11 +235,15 @@ func mustCreateAppID(t *testing.T, s *state.PgStore, ctx context.Context, tag st
 	if err != nil {
 		t.Fatalf("CreateApp(%s): %v", tag, err)
 	}
+	acctUUID, err := uuid.Parse(acct.ID)
+	if err != nil {
+		t.Fatalf("acct.ID %q is not a UUID: %v", acct.ID, err)
+	}
 	appUUID, err := uuid.Parse(app.ID)
 	if err != nil {
 		t.Fatalf("app.ID %q is not a UUID: %v", app.ID, err)
 	}
-	return appUUID
+	return acctUUID, appUUID
 }
 
 // insertDeploymentWithSidecars inserts a bare-minimum deployment
