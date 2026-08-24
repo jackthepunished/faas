@@ -234,3 +234,78 @@ func TestPg_AlertPresetByName_HappyUnknown(t *testing.T) {
 		t.Errorf("AlertPresetByName(unknown): got %v, want ErrNotFound", err)
 	}
 }
+
+// TestPg_AlertPresetCatalog_AllEnabledAfterFlip pins the per-row
+// enabled_in_catalog state after migrations/00516 lands. PR-B's
+// data-only UPDATE flips the 5 disabled rows to enabled_in_catalog=true;
+// this test guards against a future migration accidentally re-disabling
+// a row (e.g. a seed re-run with `enabled_in_catalog=false` on a
+// pre-existing name) and against a future maintainer re-introducing a
+// "coming soon" row without bumping this test (which lists all 8).
+//
+// Once a new preset lands in the catalog seed, add its name to the
+// `expectedNames` set so this test stays a closed-set pin.
+func TestPg_AlertPresetCatalog_AllEnabledAfterFlip(t *testing.T) {
+	_, pool, ctx := pgStoreWithPool(t)
+	rows, err := pool.Query(ctx, `
+		SELECT name, enabled_in_catalog
+		  FROM alert_presets
+		 ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	expectedNames := map[string]bool{
+		"api_down":              true,
+		"cert_expiring_14d":     true,
+		"cold_start_10pct":      true,
+		"deploy_failed":         true,
+		"error_rate_2pct":       true,
+		"p95_latency_1s":        true,
+		"queue_backlog_growing": true,
+		"spend_eur_20":          true,
+	}
+	got := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		var enabled bool
+		if err := rows.Scan(&name, &enabled); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[name] = enabled
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	// Closed-set drift: every catalog row MUST appear in
+	// expectedNames. A future seed that adds a row without bumping
+	// this test is a sign the maintainer forgot the per-row pin.
+	if len(got) != len(expectedNames) {
+		var extra []string
+		for n := range got {
+			if !expectedNames[n] {
+				extra = append(extra, n)
+			}
+		}
+		var missing []string
+		for n := range expectedNames {
+			if _, ok := got[n]; !ok {
+				missing = append(missing, n)
+			}
+		}
+		t.Errorf("catalog row count drift: got %d rows, want %d; extra=%v missing=%v — update TestPg_AlertPresetCatalog_AllEnabledAfterFlip.expectedNames if a new preset was added intentionally",
+			len(got), len(expectedNames), extra, missing)
+	}
+	// All rows must have enabled_in_catalog=true. A disabled row means
+	// either migration 00516 didn't run or a future migration flipped
+	// it back.
+	var disabled []string
+	for name, enabled := range got {
+		if !enabled {
+			disabled = append(disabled, name)
+		}
+	}
+	if len(disabled) != 0 {
+		t.Errorf("alert_presets rows still disabled after PR-B flip: %v (expected empty — migration 00516 must enable all 8 catalog rows)", disabled)
+	}
+}
