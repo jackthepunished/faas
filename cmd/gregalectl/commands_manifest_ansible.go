@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/roleTemplating"
 )
 
 // manifestAnsibleFile is one deterministic generated artifact. Keeping the
@@ -258,9 +259,10 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 
 func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
 	var b strings.Builder
+	canonicalNodeName := canonicalComputeNodeName(host.Name, roleTemplating.Role(host.Role))
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
-	fmt.Fprintf(&b, "faas_node_name: %s\n", host.Name)
+	fmt.Fprintf(&b, "faas_node_name: %s\n", canonicalNodeName)
 	fmt.Fprintf(&b, "ansible_host: %q\n", ansibleHost)
 	b.WriteString("ansible_python_interpreter: /usr/bin/python3\n")
 	fmt.Fprintf(&b, "faas_overlay_provider: %q\n", overlayProvider)

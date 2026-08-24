@@ -20,7 +20,14 @@ CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
+# Always use the repository's Ansible configuration.  Ansible only discovers
+# ansible.cfg from the current directory (or its parents); the playbook lives
+# under deploy/ansible, so relying on discovery makes `make bootstrap-*` run
+# with different roles_path, forks, and host-key settings depending on where
+# the operator invokes make.
+ANSIBLE_CONFIG ?= $(CURDIR)/deploy/ansible/ansible.cfg
 ANSIBLE_INVENTORY ?= deploy/ansible/inventory/hosts.ini
+ANSIBLE_PLAYBOOK = ANSIBLE_CONFIG="$(ANSIBLE_CONFIG)" ansible-playbook
 
 .DEFAULT_GOAL := help
 
@@ -502,14 +509,25 @@ manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars t
 	./bin/gregalectl manifest ansible --manifest-file "$(MANIFEST)" --output-dir "$${ANSIBLE_GENERATED_DIR:-$(CURDIR)/deploy/ansible/.generated}"
 
 .PHONY: bootstrap-control-plane
-bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+bootstrap-control-plane: ansible-preflight ## Bootstrap the control-plane group. Honors $ANSIBLE_LIMIT (default control_plane).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
 
 .PHONY: bootstrap-compute
-bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+bootstrap-compute: ansible-preflight ## Bootstrap the compute-nodes group. Honors $ANSIBLE_LIMIT (default compute_nodes).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
+
+.PHONY: ansible-preflight
+ansible-preflight: ## Gather and validate peer facts before a role-limited bare-metal bootstrap
+	@test -f deploy/ansible/preflight.yml || (echo "deploy/ansible/preflight.yml missing"; exit 1)
+	@mkdir -p .cache/ansible
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml
+
+.PHONY: ansible-syntax-check
+ansible-syntax-check: ## Validate the bare-metal Ansible playbooks with the production config
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml --syntax-check
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --syntax-check
 
 .PHONY: tidy
 tidy: ## go mod tidy

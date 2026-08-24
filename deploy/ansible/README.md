@@ -15,7 +15,7 @@ In order (each role is independent and verifies its own preconditions):
 | `xfs` | §8 | `/srv/fc/jail` tmpfs | `/etc/fstab` `update` |
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
-| `nftables` | §7 | `/etc/nftables.conf` | `creates:` + `nft -c` syntax check |
+| `nftables` | §7 | `/etc/nftables.conf` | managed-marker backup + `nft -c` syntax check |
 | `postgres` | §1 (cp slice), §4 | distro PostgreSQL major, `faas` user | apt idempotent, `creates:` on home |
 
 ## Run it
@@ -27,6 +27,29 @@ make manifest-ansible MANIFEST=/path/to/splitbox.yaml
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 ```
+
+Every bootstrap target first runs `ansible-preflight` against the complete
+inventory. This is intentional: a role-limited run still renders the same
+private endpoint map on every host, so a missing peer address must stop the
+deployment before any host is changed. Run it explicitly when validating a
+new provider or inventory:
+
+```
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-preflight
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-syntax-check
+```
+
+SSH host-key checking is enabled by default. Seed the operator workstation's
+`known_hosts` from the provider console or another trusted channel before the
+first connection; never disable host-key verification for a production run.
+
+For a provider whose default route is public, define
+`faas_private_address` in provider-owned `host_vars` or inventory variables.
+It must be the stable private transport address used for host-to-host
+communication; do not copy a provider IP into the manifest or daemon URLs.
+The preflight rejects missing addresses, non-Linux/non-x86 hosts, and hosts
+without systemd. It also caches the discovered peer map for the subsequent
+role-limited bootstrap.
 
 ### Bootstrap targets (issue #911 / ADR-110)
 
@@ -52,7 +75,8 @@ make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 ```
 
-The generated `host_vars` owns `faas_box_role`, `faas_node_name`,
+The generated `host_vars` owns `faas_box_role`, the canonical
+`faas_node_name` (for example `fsn-2.faas`),
 `ansible_host`, `faas_vmmd_target_url`, and the private endpoint records
 written by the overlay role. `faas_vmmd_target_url` is
 `tcp://vmmd.faas:<port>` so the existing internal PKI hostname check
