@@ -47,6 +47,9 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `ansible_host: "10.42.0.2"`) {
 		t.Errorf("compute host vars missing host address:\n%s", computeVars)
 	}
+	if !strings.Contains(computeVars, `faas_node_name: fsn-2.faas`) {
+		t.Errorf("compute host vars missing canonical node identity:\n%s", computeVars)
+	}
 	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://vmmd.faas:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)
 	}

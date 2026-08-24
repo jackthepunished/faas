@@ -1,6 +1,7 @@
 # tailscale-specific overlay install (issue #98 / ADR-028).
 #
-# Why apt-key + repo over the upstream install script:
+# Why the repository is managed explicitly instead of using the upstream
+# install script:
 #   1. Idempotent — the apt module is atomic on a re-run.
 #   2. Audit-friendly — packages match a pinned version, so a
 #      side-channel release of `tailscale` can't sneak past the
@@ -8,6 +9,23 @@
 #   3. Air-gap friendly — operators running a closed env mirror
 #      the deb into their own apt repo and the role's URL flips
 #      to the mirror without code change.
+
+- name: tailscale — require the operator-owned authkey
+  ansible.builtin.stat:
+    path: "{{ faas_overlay_authkey_path }}"
+  register: tailscale_authkey_stat
+
+- name: tailscale — fail closed when the authkey is absent or loose
+  ansible.builtin.assert:
+    that:
+      - tailscale_authkey_stat.stat.exists
+      - tailscale_authkey_stat.stat.pw_name == 'root'
+      - tailscale_authkey_stat.stat.gr_name in ['root', 'faas']
+      - tailscale_authkey_stat.stat.mode in ['0400', '0440', '0640']
+    fail_msg: >-
+      {{ faas_overlay_authkey_path }} must be provisioned by the operator
+      with root ownership and mode 0400, 0440, or 0640 before the Tailscale
+      provider can be enabled. Placeholder credentials are not accepted.
 #
 # The systemd unit (templates/faas-overlay-tailscale.service.j2)
 # reads the authkey from faas_overlay_authkey_path. Tailscale's
@@ -16,35 +34,39 @@
 # restarts; we do NOT clear state on re-runs because a tailscale
 # re-auth from scratch every 90 days is operator-driven.
 
-- name: tailscale — install apt keyring
-  ansible.builtin.apt_key:
+- name: tailscale — install repository keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: tailscale — install repository keyring
+  ansible.builtin.get_url:
     url: https://pkgs.tailscale.com/stable/debian/gpg
-    state: present
+    dest: /etc/apt/keyrings/tailscale-archive-keyring.gpg
+    owner: root
+    group: root
+    mode: "0644"
 
 - name: tailscale — add apt repository
-  ansible.builtin.apt_repository:
-    repo: "deb https://pkgs.tailscale.com/stable/debian {{ ansible_distribution_release }} main"
+  ansible.builtin.deb822_repository:
+    name: tailscale
+    types: deb
+    uris: https://pkgs.tailscale.com/stable/debian
+    suites: "{{ ansible_distribution_release }}"
+    components: [main]
+    signed_by: /etc/apt/keyrings/tailscale-archive-keyring.gpg
     state: present
-    filename: tailscale
+    enabled: true
+    update_cache: true
 
 - name: tailscale — install package
   ansible.builtin.apt:
     name: tailscale
     state: present
     update_cache: true
-
-- name: tailscale — write authkey file (0640 root:faas)
-  ansible.builtin.copy:
-    dest: "{{ faas_overlay_authkey_path }}"
-    owner: root
-    group: faas
-    mode: "0640"
-    # Force-create so the role is runnable without an existing
-    # authkey file. Real operators vault this and let ansible
-    # read it; the content below is a placeholder the operator
-    # replaces with their tailnet admin console value.
-    content: "tskey-PLACEHOLDER\n"
-  when: false  # disabled by default — operator-vaulted secret; see role doc
 
 - name: tailscale — render systemd unit
   ansible.builtin.template:
@@ -58,6 +80,12 @@
     - restart faas-overlay
 
 - name: tailscale — enable + start service
+  ansible.builtin.systemd:
+    name: tailscaled
+    enabled: true
+    state: started
+
+- name: tailscale — enable + start overlay enrollment
   ansible.builtin.systemd:
     name: faas-overlay
     enabled: true

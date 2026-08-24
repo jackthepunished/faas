@@ -9,9 +9,11 @@
 # builderd/imaged under RoleControlPlane; the var below is the deploy-time
 # source of truth — every daemon's systemd unit reads it via
 # FAAS_<DAEMON>_ROLE.
+# `faas_node_name` below is the canonical compute identity used by the
+# control-plane database and release membership (`fsn-2.faas`).
 
 faas_box_role: compute-only
-faas_node_name: fsn-2
+faas_node_name: fsn-2.faas
 gatewayd_apps_domain: gregale.dev
 
 # Ansible connection vars. See host_vars/faas-fsn-1.yml for the

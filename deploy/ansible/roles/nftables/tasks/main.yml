@@ -20,11 +20,10 @@
 # (`br-tenants`) must match `pkg/netns.TenantBridge` — the unit test
 # `TestTenantBridgeMatches` in `pkg/netns/config_test.go` enforces this.
 #
-# Idempotency: if /etc/nftables.conf differs from the artifact, the
-# `creates:` flag on the .faas-orig sentinel prevents overwriting a
-# non-faas config. The first time we drop it, we save the previous
-# one as .faas-orig so `git diff /etc/nftables.conf` can show what
-# changed during a re-run with a different ruleset.
+# Idempotency and safety: before the first managed render, a remote copy of
+# any existing /etc/nftables.conf is preserved as .faas-orig. The managed
+# marker then identifies files owned by this role; `force: false` prevents a
+# later run from overwriting that one-time recovery copy.
 
 - name: nftables — install nftables package
   ansible.builtin.apt:
@@ -33,13 +32,28 @@
     update_cache: true
     cache_valid_time: 3600
 
+- name: nftables — inspect any pre-existing nftables.conf
+  ansible.builtin.stat:
+    path: /etc/nftables.conf
+  register: nftables_conf_stat
+
+- name: nftables — detect the managed ruleset marker
+  ansible.builtin.command:
+    argv: [grep, -q, "Managed by Gregale Ansible; do not edit.", /etc/nftables.conf]
+  register: nftables_managed_marker
+  changed_when: false
+  failed_when: false
+  when: nftables_conf_stat.stat.exists
+
 - name: nftables — back up any pre-existing nftables.conf (one-time)
   ansible.builtin.copy:
     src: /etc/nftables.conf
     dest: /etc/nftables.conf.faas-orig
     remote_src: true
-  failed_when: false
-  when: "'onebox-faas' not in (lookup('file', '/etc/nftables.conf', errors='ignore') or '')"
+    force: false
+  when:
+    - nftables_conf_stat.stat.exists
+    - nftables_managed_marker.rc | default(1) != 0
 
 # Tenant bridge bootstrap (idempotent). The per-instance netns in
 # pkg/netns/config.go expects `br-tenants` to exist with IP 10.100.0.1/16
@@ -75,6 +89,7 @@
 
 - name: nftables — bring the tenant bridge up
   ansible.builtin.command: ip link set {{ tenant_bridge }} up
+  changed_when: false
 
 # Boot-persistent bridge (tier-1, closes #134). The oneshot unit runs on
 # every boot BEFORE nftables.service (see Before= in the unit file), so the
@@ -102,11 +117,7 @@
     enabled: true
     state: started
   register: bridge_svc
-  # In chroot/CI the unit may not run because systemd isn't PID-1 here. The
-  # runtime tasks above already brought the bridge up on this host, so a
-  # benign "could not start" doesn't matter for the role's pass/fail — let
-  # the gate slide, matching the nftables.service handler pattern below.
-  failed_when: false
+  failed_when: bridge_svc.failed and ansible_service_mgr == 'systemd'
 
 # root-namespace IPv4 forwarding (tier-1). Without this, bridged-tenant
 # packets are dropped at routing before the host `postrouting` nat chain
@@ -156,4 +167,4 @@
     enabled: true
     state: started
   register: nft_svc
-  failed_when: false  # in chroot/CI `nftables` may not have systemd; let the gate slide
+  failed_when: nft_svc.failed and ansible_service_mgr == 'systemd'

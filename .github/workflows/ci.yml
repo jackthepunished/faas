@@ -267,6 +267,8 @@ jobs:
           pip install --quiet 'ansible-core==2.21.2'
           cd deploy/ansible
           ansible-galaxy collection install -r requirements.yml
+          # Gate-A: parse the complete-inventory safety preflight.
+          ansible-playbook --syntax-check preflight.yml
           # Gate-B: syntax-check the only production bootstrap playbook
           # before an operator can run either role-specific target.
           ansible-playbook --syntax-check bootstrap.yml

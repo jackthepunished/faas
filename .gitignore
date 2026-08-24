@@ -48,6 +48,7 @@ vmlinux-*
 
 # Manifest-derived Ansible inventory (generated; never hand-edit)
 /deploy/ansible/.generated/
+.cache/ansible/
 
 # CLIs (build output)
 /gregalectl

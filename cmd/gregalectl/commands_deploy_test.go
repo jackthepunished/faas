@@ -179,7 +179,7 @@ func TestCmdDeployAddNode_WritesHostVars(t *testing.T) {
 	if !strings.Contains(string(body), "faas_box_role: compute-only") {
 		t.Errorf("missing faas_box_role: compute-only\n%s", body)
 	}
-	if !strings.Contains(string(body), "faas_node_name: faas-fsn-3") {
+	if !strings.Contains(string(body), "faas_node_name: faas-fsn-3.faas") {
 		t.Errorf("missing faas_node_name\n%s", body)
 	}
 	if !strings.Contains(string(body), `ansible_host: "10.42.0.3"`) {
@@ -495,7 +495,7 @@ func TestRenderHostVarsYAML_ComputeOnly(t *testing.T) {
 	got := renderHostVarsYAMLWithTargetURL("fsn-3", "compute-only", "10.42.0.3", "ens5", "10.102.0.0/16", "fc00::/7", "100.64.0.0/14", "tcp://vmmd-3.faas:50051")
 	for _, want := range []string{
 		"faas_box_role: compute-only",
-		"faas_node_name: fsn-3",
+		"faas_node_name: fsn-3.faas",
 		`ansible_host: "10.42.0.3"`,
 		`public_iface: "ens5"`,
 		`masquerade_cidr: "10.102.0.0/16"`,
