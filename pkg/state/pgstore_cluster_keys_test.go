@@ -266,6 +266,95 @@ func TestDeleteClusterSigningKey_AfterInsert(t *testing.T) {
 	}
 }
 
+// TestInsertClusterSigningKey_IdempotentReInsertSameKid pins
+// the rotation-overlap branch of the ON CONFLICT DO UPDATE
+// retired_at clause:
+//
+//	retired_at = CASE
+//	    WHEN cluster_signing_keys.key_id = EXCLUDED.key_id
+//	        THEN cluster_signing_keys.retired_at  -- idempotent re-insert
+//	        ELSE now()                              -- rotation: previous kid retired
+//	END
+//
+// A second INSERT with the SAME kid must NOT bump retired_at
+// to now() (it would otherwise look like a rotation to verifiers
+// that read the row). Without this guard, an operator running
+// `hostage-gen cluster-init` twice in a row would mark the
+// canonical kid as retired and lock out the gateway until the
+// next INSERT landed.
+//
+// Note on rotated_at: the SQL sets rotated_at = COALESCE(prev, now())
+// on every re-insert — i.e. the FIRST non-NULL timestamp is preserved.
+// The test does NOT assert rotated_at stays NULL because the COALESCE
+// branch stamps it on the first re-insert by design; the test only
+// pins the retired_at idempotency invariant.
+//
+// Asserted invariants:
+//   - retired_at stays NULL (no rotation happened — the load-bearing
+//     idempotent re-insert contract)
+//   - sealed_blob bytes are replaced (the re-insert took effect;
+//     a stale-row aliasing bug would fail this)
+//   - created_at is preserved across the re-insert (no reset;
+//     a DELETE-then-INSERT in the ON CONFLICT branch would fail this)
+func TestInsertClusterSigningKey_IdempotentReInsertSameKid(t *testing.T) {
+	pool := pgtest.Open(t)
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store := NewPgStore(pool)
+
+	ctx := context.Background()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	pemBytes, err := marshalPubPEM(pub)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sealed1 := make([]byte, 32)
+	_, _ = rand.Read(sealed1)
+	sealed2 := make([]byte, 32)
+	_, _ = rand.Read(sealed2)
+
+	kid := "AAAAAAAAAAAAAAAAAAAAAA"
+	first := ClusterSigningKey{KeyID: kid, PublicKeyPEM: string(pemBytes), SealedBlob: sealed1}
+	if err := store.InsertClusterSigningKey(ctx, first); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	got, err := store.LoadClusterSigningKey(ctx)
+	if err != nil {
+		t.Fatalf("load after first: %v", err)
+	}
+	createdAtFirst := got.CreatedAt
+	if got.RetiredAt != nil {
+		t.Fatalf("first insert: expected retired_at NULL, got %v", *got.RetiredAt)
+	}
+
+	// Re-insert with the SAME kid but a different sealed_blob.
+	// The idempotent branch must replace sealed_blob without
+	// stamping retired_at to now() (the load-bearing invariant).
+	second := ClusterSigningKey{KeyID: kid, PublicKeyPEM: string(pemBytes), SealedBlob: sealed2}
+	if err := store.InsertClusterSigningKey(ctx, second); err != nil {
+		t.Fatalf("re-insert same kid: %v", err)
+	}
+	got, err = store.LoadClusterSigningKey(ctx)
+	if err != nil {
+		t.Fatalf("load after re-insert: %v", err)
+	}
+	if string(got.SealedBlob) != string(sealed2) {
+		t.Errorf("re-insert: sealed_blob not replaced")
+	}
+	if got.RetiredAt != nil {
+		t.Errorf("re-insert same kid: expected retired_at NULL (idempotent branch), got %v",
+			*got.RetiredAt)
+	}
+	if !got.CreatedAt.Equal(createdAtFirst) {
+		t.Errorf("re-insert: created_at was reset (was %v, now %v) — ON CONFLICT branch deleted the row",
+			createdAtFirst, got.CreatedAt)
+	}
+}
+
 // TestInsertClusterSigningKey_RejectsEmptyFields pins the
 // pre-Postgres input-validation guard. Without this, an operator
 // who forgets to populate one of key_id / public_key_pem /
