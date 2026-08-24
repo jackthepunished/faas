@@ -235,7 +235,12 @@ func TestClient_DoReq_NoProblemBodyFallsBackToStatus_Mega4(t *testing.T) {
 
 func TestClient_DoBytes_BodyLimitExactBoundary_Mega4(t *testing.T) {
 	t.Parallel()
-	// 4 MiB response body — must succeed (the cap is a >= marker).
+	// io.LimitReader SILENTLY truncates beyond the cap rather than
+	// erroring — pkg/api/client.go:252 uses
+	//   data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// so a 4 MiB response reads cleanly and any payload > 4 MiB
+	// would also "succeed" but with len(out) < body size. We pin
+	// the exact-boundary contract: 4 MiB reads intact.
 	const fourMiB = 4 << 20
 	body := make([]byte, fourMiB)
 	for i := range body {
@@ -254,6 +259,32 @@ func TestClient_DoBytes_BodyLimitExactBoundary_Mega4(t *testing.T) {
 	}
 	if len(out) != fourMiB {
 		t.Errorf("response len = %d, want %d", len(out), fourMiB)
+	}
+}
+
+func TestClient_DoBytes_BodyLimitSilentTruncate_Mega4(t *testing.T) {
+	t.Parallel()
+	// Same doBytes path, but with an 8 MiB response. io.LimitReader
+	// caps the read at 4 MiB and the remainder is silently dropped;
+	// doBytes does NOT return an error in that case. This pins the
+	// silent-truncation contract that pkg/api/client.go:252's call
+	// site relies on — callers must pre-size the response or check
+	// len(out) against an expected size.
+	const overLimit = 8 << 20
+	body := make([]byte, overLimit)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "t")
+	var out []byte
+	if err := c.doBytes(context.Background(), "GET", "/v1/raw", nil, &out); err != nil {
+		t.Fatalf("doBytes 8MiB response: want nil err, got %v", err)
+	}
+	if len(out) != 4<<20 {
+		t.Errorf("truncated len = %d, want 4MiB (the LimitReader cap)", len(out))
 	}
 }
 

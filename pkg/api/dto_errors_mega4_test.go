@@ -611,13 +611,13 @@ func TestValidateGeoCountryCode_Mega4(t *testing.T) {
 func TestThrottleKeyByIsPerConsumer_Mega4(t *testing.T) {
 	t.Parallel()
 	cases := map[string]bool{
-		"":                       false, // back-compat
-		ThrottleKeyByNone:        false,
-		ThrottleKeyByAPIKey:      true,
-		ThrottleKeyByJWTSubject:  true,
-		ThrottleKeyByJWTClaim:    true,
-		"ip":                     false, // unknown → default-false
-		"unknown-thing":          false,
+		"":                      false, // back-compat
+		ThrottleKeyByNone:       false,
+		ThrottleKeyByAPIKey:     true,
+		ThrottleKeyByJWTSubject: true,
+		ThrottleKeyByJWTClaim:   true,
+		"ip":                    false, // unknown → default-false
+		"unknown-thing":         false,
 	}
 	for k, want := range cases {
 		if got := ThrottleKeyByIsPerConsumer(k); got != want {
@@ -637,13 +637,13 @@ func TestSidecarValidate_Mega4(t *testing.T) {
 	}
 	// Happy path: a digest-pinned image + init type.
 	if p := (&Sidecar{
-		Name:    "logs",
-		Image:   "ghcr.io/org/logs@sha256:" + strings.Repeat("a", 64),
-		Type:    SidecarTypeInit,
-		Cmd:     []string{"sh", "-c", "tail -f /dev/null"},
-		Env:     map[string]string{"X": "y"},
-		Port:    0,
-		RamMB:   64,
+		Name:  "logs",
+		Image: "ghcr.io/org/logs@sha256:" + strings.Repeat("a", 64),
+		Type:  SidecarTypeInit,
+		Cmd:   []string{"sh", "-c", "tail -f /dev/null"},
+		Env:   map[string]string{"X": "y"},
+		Port:  0,
+		RamMB: 64,
 	}).Validate(limits); p != nil {
 		t.Errorf("ok: %v", p)
 	}
@@ -782,7 +782,7 @@ func TestStatusForCode_Mega4(t *testing.T) {
 		c := c
 		t.Run(c.code, func(t *testing.T) {
 			t.Parallel()
-		if got := StatusForCode(c.code); got != c.want {
+			if got := StatusForCode(c.code); got != c.want {
 				t.Errorf("StatusForCode(%q) = %d, want %d", c.code, got, c.want)
 			}
 		})

@@ -142,16 +142,25 @@ func TestParseBridgeOutput_HeaderWithNoColonSkipped_Mega4(t *testing.T) {
 
 // --- readUntilBlankLine error path -------------------------------
 
-func TestReadUntilBlankLine_Error_Mega4(t *testing.T) {
+func TestReadUntilBlankLine_HeadCapExceeded_Mega4(t *testing.T) {
 	t.Parallel()
-	// readUntilBlankLine surfaces bufio.ErrBufferFull when the buffer
-	// is exceeded before \n\n. Use a long line w/o terminator.
+	// readUntilBlankLine caps the head at headCap (64 KiB) and
+	// returns "bridge head exceeds 65536 bytes" once the cumulative
+	// buffer crosses that bound (forward.go:1070-1072). The error
+	// is NOT bufio.ErrBufferFull — bufio returns that only when
+	// ReadString's internal buffer fills, which doesn't happen
+	// here because the line never terminates. Use a long line w/o
+	// terminator to trigger the explicit cap check.
 	longLine := make([]byte, 70*1024)
 	for i := range longLine {
 		longLine[i] = 'x'
 	}
-	if _, err := readUntilBlankLine(newReaderForTest(longLine)); err == nil {
-		t.Fatal("want bufio.ErrBufferFull or similar error")
+	_, err := readUntilBlankLine(newReaderForTest(longLine))
+	if err == nil {
+		t.Fatal("want head-cap-exceeded error, got nil")
+	}
+	if !strings.Contains(err.Error(), "bridge head exceeds") {
+		t.Errorf("err = %v, want 'bridge head exceeds' substring", err)
 	}
 }
 
@@ -259,7 +268,7 @@ func TestEmitBootStartedMirror_WithWireCtx_Mega4(t *testing.T) {
 
 func TestForgetNet_NilReceiver_Mega4(t *testing.T) {
 	t.Parallel()
-	var s *Server // nil
+	var s *Server      // nil
 	s.ForgetNet("i-1") // must not panic
 }
 

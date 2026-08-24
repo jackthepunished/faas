@@ -284,10 +284,10 @@ func TestIsSlugSafe_Mega4(t *testing.T) {
 		want bool
 	}{
 		// Length
-		{"", false},        // < 3 chars
-		{"ab", false},      // < 3 chars
-		{"abc", true},      // min length
-		{strings.Repeat("a", 40), true}, // max length
+		{"", false},                      // < 3 chars
+		{"ab", false},                    // < 3 chars
+		{"abc", true},                    // min length
+		{strings.Repeat("a", 40), true},  // max length
 		{strings.Repeat("a", 41), false}, // > 40 chars
 		// Charset
 		{"abc-def", true},
@@ -302,14 +302,14 @@ func TestIsSlugSafe_Mega4(t *testing.T) {
 		// dead code (the comparison is impossible — 'a' > '9' in
 		// rune order), so '-' is accepted anywhere. Pinning the
 		// current behavior so any future tightening is intentional.
-		{"-abc", true},  // accepted by case 3 (r == '-')
-		{"abc-", true},  // accepted by case 3 (r == '-')
+		{"-abc", true}, // accepted by case 3 (r == '-')
+		{"abc-", true}, // accepted by case 3 (r == '-')
 		// Illegal chars
-		{"ABC", false},        // uppercase rejected
-		{"abc_def", false},    // underscore rejected
-		{"abc.def", false},    // dot rejected
-		{"abc def", false},    // space rejected
-		{"abc/def", false},    // slash rejected
+		{"ABC", false},     // uppercase rejected
+		{"abc_def", false}, // underscore rejected
+		{"abc.def", false}, // dot rejected
+		{"abc def", false}, // space rejected
+		{"abc/def", false}, // slash rejected
 	}
 	for _, c := range cases {
 		c := c
@@ -330,15 +330,15 @@ func TestIsDeploymentIDSafe_Mega4(t *testing.T) {
 		id   string
 		want bool
 	}{
-		{"", false},                                    // empty rejected
-		{"abc", true},                                  // minimal
+		{"", false},   // empty rejected
+		{"abc", true}, // minimal
 		{"12345678-1234-1234-1234-123456789012", true}, // UUID-shaped
-		{strings.Repeat("a", 64), true},               // max length
-		{strings.Repeat("a", 65), false},              // > 64 chars
-		{"abc/def", false},                            // path sep
-		{"abc\\def", false},                           // backslash
-		{"abc.def", false},                            // dot (path-traversal vector)
-		{"abc\x00def", false},                         // NUL byte
+		{strings.Repeat("a", 64), true},                // max length
+		{strings.Repeat("a", 65), false},               // > 64 chars
+		{"abc/def", false},                             // path sep
+		{"abc\\def", false},                            // backslash
+		{"abc.def", false},                             // dot (path-traversal vector)
+		{"abc\x00def", false},                          // NUL byte
 	}
 	for _, c := range cases {
 		c := c

@@ -116,8 +116,8 @@ func TestSortQuery_Single_Mega4(t *testing.T) {
 func TestParseBudgetHeaderMs_Mega4(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		in    string
-		want  int
+		in     string
+		want   int
 		wantOk bool
 	}{
 		{"", 0, false},
@@ -171,7 +171,7 @@ func TestHasSessionCookie_WithCookie_Mega4(t *testing.T) {
 
 func TestMetricsIncCacheOutcome_NilHandler_Mega4(t *testing.T) {
 	t.Parallel()
-	var h *Handler // nil
+	var h *Handler                  // nil
 	h.metricsIncCacheOutcome("hit") // must not panic
 }
 
@@ -200,8 +200,8 @@ func TestContainsToken_Mega4(t *testing.T) {
 		haystack, needle string
 		want             bool
 	}{
-		{"", "", false},         // empty needle → false
-		{"hello", "", false},    // empty needle → false
+		{"", "", false},      // empty needle → false
+		{"hello", "", false}, // empty needle → false
 		{"hello", "world", false},
 		{"hello world", "world", true},
 		{"abc", "abc", true},

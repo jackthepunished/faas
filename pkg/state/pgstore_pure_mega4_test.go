@@ -369,9 +369,9 @@ func TestClassifyHeartbeatGap_Mega4(t *testing.T) {
 	prev := time.Unix(1_700_000_000, 0).UTC()
 
 	cases := []struct {
-		name     string
-		gap      time.Duration
-		wantMiss bool
+		name      string
+		gap       time.Duration
+		wantMiss  bool
 		wantStale bool
 	}{
 		{"under interval (no flag)", 10 * time.Second, false, false},
