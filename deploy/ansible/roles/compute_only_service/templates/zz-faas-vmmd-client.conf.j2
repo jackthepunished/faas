@@ -1,9 +1,11 @@
 [Service]
 # Split-box imaged → vmmd mTLS is deployment-owned. Keep the dial target on
-# vmmd.faas so the certificate SAN remains valid when the compute host moves
-# to another bare-metal provider or overlay address. The dedicated imaged
-# client leaf is distinct from builderd's client leaf; both are issued by the
-# same internal CA but represent different daemon roles.
+# this compute host's stable private endpoint so a fleet with multiple
+# compute boxes cannot resolve a shared vmmd.faas alias to the wrong node.
+# The vmmd server leaf keeps vmmd.faas as its role identity and also carries
+# the endpoint SAN. The dedicated imaged client leaf is distinct from
+# builderd's client leaf; both are issued by the same internal CA but
+# represent different daemon roles.
 Environment=FAAS_VMM_SOCK={{ faas_vmmd_target_url }}
 Environment=FAAS_VMM_TLS_CERT_PATH=/etc/faas/tls/imaged/vmmd-client.crt
 Environment=FAAS_VMM_TLS_KEY_PATH=/etc/faas/tls/imaged/vmmd-client.key

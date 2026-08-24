@@ -50,7 +50,7 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `faas_node_name: fsn-2.faas`) {
 		t.Errorf("compute host vars missing canonical node identity:\n%s", computeVars)
 	}
-	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://vmmd.faas:50051"`) {
+	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://10.42.0.2:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)
 	}
 	if !strings.Contains(computeVars, `faas_gateway_listen: "0.0.0.0:8080"`) {
@@ -107,6 +107,54 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	}
 	if !strings.Contains(computeVars, `egress.faas`) {
 		t.Errorf("compute host vars missing egress private alias:\n%s", computeVars)
+	}
+}
+
+func TestRenderManifestAnsibleFiles_TwoComputeTargetsAreDistinct(t *testing.T) {
+	yaml := strings.Replace(validManifestYAML,
+		"    - name: fsn-1\n      role: control-plane\n",
+		"    - name: fsn-1\n      role: control-plane\n      address: fsn-1.gregale.dev:7100\n    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n    - name: fsn-3\n      role: compute-only\n      address: fsn-3.gregale.dev:50051\n", 1)
+	m, err := manifest.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("manifest.Parse: %v", err)
+	}
+	if errs := m.Validate(); errs != nil {
+		t.Fatalf("manifest.Validate: %v", errs)
+	}
+
+	files, err := renderManifestAnsibleFiles(m, t.TempDir())
+	if err != nil {
+		t.Fatalf("renderManifestAnsibleFiles: %v", err)
+	}
+	if len(files) != 4 {
+		t.Fatalf("generated files = %d, want inventory + 3 host_vars", len(files))
+	}
+	var inventory, fsn2Vars, fsn3Vars string
+	for _, file := range files {
+		switch {
+		case strings.HasSuffix(file.Path, filepath.Join("inventory", "hosts.ini")):
+			inventory = string(file.Body)
+		case strings.HasSuffix(file.Path, "fsn-2.yml"):
+			fsn2Vars = string(file.Body)
+		case strings.HasSuffix(file.Path, "fsn-3.yml"):
+			fsn3Vars = string(file.Body)
+		}
+	}
+	if !strings.Contains(inventory, "[compute_nodes]\nfsn-2\nfsn-3\n") {
+		t.Errorf("inventory did not retain both compute hosts:\n%s", inventory)
+	}
+	if !strings.Contains(fsn2Vars, `faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"`) {
+		t.Errorf("fsn-2 target is not node-specific:\n%s", fsn2Vars)
+	}
+	if !strings.Contains(fsn3Vars, `faas_vmmd_target_url: "tcp://fsn-3.gregale.dev:50051"`) {
+		t.Errorf("fsn-3 target is not node-specific:\n%s", fsn3Vars)
+	}
+	if strings.Count(fsn2Vars, `names: ["fsn-2.gregale.dev", "vmmd.faas", "egress.faas"]`) != 1 {
+		t.Errorf("first compute compatibility aliases missing or duplicated:\n%s", fsn2Vars)
+	}
+	if strings.Contains(fsn3Vars, `names: ["fsn-3.gregale.dev", "vmmd.faas`) ||
+		strings.Contains(fsn3Vars, `names: ["fsn-3.gregale.dev", "egress.faas`) {
+		t.Errorf("second compute received an ambiguous shared alias:\n%s", fsn3Vars)
 	}
 }
 

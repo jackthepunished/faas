@@ -154,7 +154,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			return nil, fmt.Errorf("host %s: %w", host.Name, parseErr)
 		}
 		if host.Role == "compute-only" {
-			targetURL, parseErr = manifest.ServiceTCPURL(host.Role, host.Address)
+			targetURL, parseErr = manifest.TCPURL(host.Address)
 			if parseErr != nil {
 				return nil, fmt.Errorf("host %s target: %w", host.Name, parseErr)
 			}
@@ -217,6 +217,14 @@ func appendHostCIDR(values []string, address, overlayCIDR string) []string {
 
 func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, error) {
 	internalHosts := make([]manifestInternalHost, 0, len(m.Fleet.Hosts))
+	firstCompute := ""
+	for _, host := range m.Fleet.Hosts {
+		if host.Role == roleComputeOnly {
+			if firstCompute == "" {
+				firstCompute = host.Name
+			}
+		}
+	}
 	for _, host := range m.Fleet.Hosts {
 		serviceName, err := manifest.ServiceName(host.Role)
 		if err != nil {
@@ -229,8 +237,11 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 		entry := manifestInternalHost{Names: []string{serviceName}}
 		if _, err := netip.ParseAddr(address); err == nil {
 			// Literal endpoint manifests retain their explicit address for
-			// backwards compatibility with local fixtures.
+			// backwards compatibility with local fixtures. Keep the
+			// manifest host name as a stable local alias so every entry
+			// remains usable even when the endpoint is an IP literal.
 			entry.Address = address
+			entry.Names = append([]string{host.Name}, entry.Names...)
 		} else {
 			// Hostname manifests are resolved from inventory host facts by
 			// the Ansible adapter. This keeps IPs out of generated config
@@ -239,11 +250,34 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 			entry.Names = append([]string{address}, entry.Names...)
 		}
 		if host.Role == roleComputeOnly {
-			entry.Names = append(entry.Names, "egress.faas")
+			// Stable hostnames are the node-specific routing records.
+			// Keep the role aliases only on the first compute host as
+			// compatibility fallbacks for static schedd/meterd config;
+			// emitting vmmd.faas or egress.faas on every compute host
+			// would make /etc/hosts resolution ambiguous.
+			if host.Name == firstCompute {
+				entry.Names = append(entry.Names, "egress.faas")
+			} else {
+				entry.Names = filterInternalHostNames(entry.Names, "vmmd.faas")
+			}
 		}
 		internalHosts = append(internalHosts, entry)
 	}
 	return internalHosts, nil
+}
+
+func filterInternalHostNames(names []string, omit ...string) []string {
+	blocked := make(map[string]struct{}, len(omit))
+	for _, name := range omit {
+		blocked[name] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := blocked[name]; !ok {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {

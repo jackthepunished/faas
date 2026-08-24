@@ -78,11 +78,13 @@ make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-c
 The generated `host_vars` owns `faas_box_role`, the canonical
 `faas_node_name` (for example `fsn-2.faas`),
 `ansible_host`, `faas_vmmd_target_url`, and the private endpoint records
-written by the overlay role. `faas_vmmd_target_url` is
-`tcp://vmmd.faas:<port>` so the existing internal PKI hostname check
-remains enabled. The bootstrap's discovery play gathers one private address
-per host, and the overlay role maps the fleet names plus `vmmd.faas`,
-`schedd.faas`, and `egress.faas` in one managed `/etc/hosts` block. Providers
+written by the overlay role. `faas_vmmd_target_url` is a node-specific
+stable private endpoint such as `tcp://fsn-3.gregale.dev:50051`; the host's
+vmmd server leaf carries that endpoint as an additional SAN while retaining
+`vmmd.faas` as its role identity. The bootstrap's discovery play gathers one
+private address per host. It maps every stable fleet name and keeps the
+role aliases (`vmmd.faas` and `egress.faas`) only on the first compute host,
+so `/etc/hosts` never resolves a shared alias ambiguously. Providers
 whose default route is public set `faas_private_address` in provider-owned
 inventory; daemon URLs and the committed manifest remain unchanged. The committed
 `host_vars/faas-fsn-{1,2}.yml` files remain checked-in reference fixtures;

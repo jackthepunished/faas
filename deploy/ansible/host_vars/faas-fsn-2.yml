@@ -27,7 +27,7 @@ ansible_python_interpreter: /usr/bin/python3
 # these through a managed systemd drop-in; no post-boot compute_nodes DB patch
 # is required.
 faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"
-faas_vmmd_target_url: "tcp://vmmd.faas:50051"
+faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"
 
 # Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
 # needs the overlay mesh to reach peer compute boxes (fsn-3+ when
