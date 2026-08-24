@@ -44,6 +44,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // planTokenWire is the JSON shape baked into the plan token. The
@@ -136,6 +137,11 @@ type scanPlanResponse struct {
 	Unaffected []api.PlanAffectedApp `json:"unaffected,omitempty"`
 	Skipped    []api.PlanAffectedApp `json:"skipped,omitempty"`
 	Removed    []string              `json:"removed,omitempty"`
+	// PersistedExclusions (ADR-124 follow-up #3) mirrors the
+	// persisted --exclude set the apply path folded in from
+	// deployment_scope_exclusions. Empty on preview; non-empty on
+	// apply when the operator's persisted intent took effect.
+	PersistedExclusions []string `json:"persisted_exclusions,omitempty"`
 }
 
 // toPlanWorkload translates a reposcan.Workload into the wire-
@@ -490,6 +496,54 @@ func evaluateQuotaGate(
 	return
 }
 
+// gateRescueReason maps the templated reason strings
+// evaluateQuotaGate emits to a closed-set vocabulary the
+// apid_plan_gate_rescued_by_exclude_total counter
+// (pkg/wire/metrics.go::PlanGateRescuedByExclude) labels
+// with. Cardinality is bounded: 4 plans × 3 reasons = 12
+// series (pre-instantiated). The "unknown" bucket catches any
+// future reason string so the metric doesn't drift; today
+// evaluateQuotaGate emits exactly the three prefixes handled
+// here. Multi-reason rescue plans are bucketed by their
+// FIRST reason — a future enhancement could surface
+// one-bucket-per-reason via a histogram, but the per-bucket
+// counts today are enough to triage which gate type the
+// rescue pattern is most often saving operators from.
+func gateRescueReason(reasons []string) string {
+	if len(reasons) == 0 {
+		return "unknown"
+	}
+	r := reasons[0]
+	switch {
+	case strings.HasPrefix(r, "apps over plan limit:"):
+		return "apps_over_limit"
+	case strings.HasPrefix(r, "crons over plan limit:"):
+		return "crons_over_limit"
+	case r == "crons not allowed on this plan":
+		return "crons_not_allowed"
+	default:
+		return "unknown"
+	}
+}
+
+// emitGateRescueMetric increments the apid_plan_gate_rescued_by_exclude_total
+// counter for the (plan, reason) bucket the gateRescueReason classifier
+// produced. ops may be nil (unit tests that don't wire metrics); the
+// nil-safe accessor inside pkg/wire returns nil and the Inc() is
+// skipped. Extracted into a helper so the helper imports the wire
+// type — the call site at the gateRescuedByExclude block does not
+// need to reference pkg/wire directly (the field s.ops already
+// carries a *wire.OpsMetrics that we never see in scan_service's
+// local lexical scope).
+func emitGateRescueMetric(ops *wire.OpsMetrics, plan string, reasons []string) {
+	if ops == nil {
+		return
+	}
+	if c := ops.PlanGateRescuedByExclude(plan, gateRescueReason(reasons)); c != nil {
+		c.Inc()
+	}
+}
+
 // planCron is the cron shape returned by the scan service. We keep
 // it distinct from state.Cron (which carries AppID + CreatedAt)
 // because at scan time there's no AppID yet — apply resolves the
@@ -672,6 +726,41 @@ func (s *server) scanService(
 	req, prob := parseScanMultipart(r, acct, limits)
 	if prob != nil {
 		return nil, state.Project{}, nil, nil, nil, nil, prob
+	}
+	// ADR-124 follow-up #3 — apply-time persisted-exclude fallback.
+	// When the apply path runs without an explicit --exclude AND a
+	// project row already exists (i.e. this is a re-deploy, not a
+	// brand-new project), fold the persisted set into req.Exclude
+	// so the operator's "I excluded this for the long haul" intent
+	// carries forward without re-typing. The response surfaces the
+	// merged set via resp.PersistedExclusions; the handler emits
+	// one KindProjectScopeExcluded audit row per slug below.
+	//
+	// Brand-new projects (no project row yet) skip the fallback —
+	// there is nothing persisted to fold in. The check is cheap
+	// (single ProjectBySlug; ErrNotFound is not an error here).
+	// persistedSlugs captures every slug folded in from the persisted
+	// deployment_scope_exclusions table on the apply path. When the
+	// operator did NOT pass --exclude on this deploy but a previous
+	// deploy ran with --persist-exclude, those slugs carry forward
+	// into this apply. Surfaced via resp.PersistedExclusions so the
+	// operator + dashboard can see exactly what carried forward; the
+	// apply handler emits one KindProjectScopeExcluded audit row per
+	// slug for SOC 2 CC7.2 paper trail.
+	var persistedSlugs []string
+	if apply && len(req.Exclude) == 0 {
+		if proj, projErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug); projErr == nil {
+			if persisted, lookupErr := s.store.LookupDeploymentScopeExclusions(r.Context(), acct.ID, proj.ID); lookupErr == nil && len(persisted) > 0 {
+				if req.Exclude == nil {
+					req.Exclude = make(map[string]bool, len(persisted))
+				}
+				for _, e := range persisted {
+					lname := strings.ToLower(e.Slug)
+					req.Exclude[lname] = true
+					persistedSlugs = append(persistedSlugs, lname)
+				}
+			}
+		}
 	}
 	// ADR-124: --only and --exclude are inverse filters and cannot
 	// share a slug. Reject the request pre-scan with a 409 and a
@@ -856,11 +945,16 @@ func (s *server) scanService(
 	canApply, notAllowed, reasons, _ = evaluateQuotaGate(filteredW, limits, observedApps, observedCrons)
 
 	// gateRescuedByExclude fires the slog seam when --exclude
-	// flipped a blocked gate to allowed. The slog key follows the
-	// §12 metrics naming convention; a Prometheus counter for
-	// this signal is filed as a follow-up (the slog line is the
-	// observable today, the metric is one-line addition once the
-	// rescue pattern is confirmed on real operator flows).
+	// flipped a blocked gate to allowed. ADR-124 follow-up #2
+	// adds a parallel metric emission alongside the slog; both
+	// are observable in production (slog for human triage, the
+	// counter for dashboarding + alerting). The reason label
+	// comes from gateRescueReason which collapses the templated
+	// raw reason to a closed-set vocabulary (12 series total —
+	// 4 plans × 3 reasons; pre-instantiated). s.ops may be nil
+	// in unit tests; the nil-safe accessor returns a nil
+	// counter and we skip the Inc(). This matches the
+	// GuestTailFailedTotal caller pattern in cmd/schedd/main.go.
 	gateRescuedByExclude := !preCanApply && canApply
 	if gateRescuedByExclude {
 		s.log.Info("plan_gate_rescued_by_exclude",
@@ -871,6 +965,7 @@ func (s *server) scanService(
 			slog.Bool("pre_exclude_not_allowed", preNotAllowed),
 			slog.Any("reasons", reasons),
 		)
+		emitGateRescueMetric(s.ops, string(acct.Plan), reasons)
 	}
 
 	// ADR-124 blast-radius partition: load every non-deleted app in
@@ -966,6 +1061,13 @@ func (s *server) scanService(
 		Unaffected: partition.Unaffected,
 		Skipped:    partition.Skipped,
 		Removed:    partition.Removed,
+		// ADR-124 follow-up #3 — persisted_exclusions mirrors the
+		// slugs the apply path folded in from the
+		// deployment_scope_exclusions table (when req.Exclude was
+		// empty). Empty when no persisted rows exist or when the
+		// scan path is preview; the omitempty keeps --json output
+		// stable for the common case.
+		PersistedExclusions: persistedSlugs,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path

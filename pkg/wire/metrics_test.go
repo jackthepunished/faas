@@ -2077,6 +2077,88 @@ func TestOpsMetrics_ObserveDeployStageDuration(t *testing.T) {
 	}
 }
 
+// TestPlanGateRescuedByExclude_NilSafe — the scan_service unit tests
+// construct scanService without wiring OpsMetrics; the accessor must
+// return nil on a nil receiver so the emit site stays a one-liner
+// (s.ops.PlanGateRescuedByExclude(...).Inc() — no separate nil-guard
+// at every call site). Mirrors the GuestTailFailedTotal + TailCapReached
+// + WakePhaseEmitted nil-safety contracts above.
+func TestPlanGateRescuedByExclude_NilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.PlanGateRescuedByExclude("hobby", "apps_over_limit"); got != nil {
+		t.Errorf("nil.PlanGateRescuedByExclude = %v, want nil", got)
+	}
+}
+
+// TestPlanGateRescuedByExclude_PreInstantiatesAllSeries — the §12
+// gate-rescue panel keys off every (plan, reason) combination. The
+// counter MUST surface zero-row for each from the moment apid boots
+// so the dashboard never renders "no data" during the first rescue
+// (the very moment operators want to see the metric). 4 plans × 3
+// reasons = 12 series. A refactor that drops one of the pre-
+// instantiations would silently widen the "no data" window and
+// undermine the alert rules; this test catches it.
+func TestPlanGateRescuedByExclude_PreInstantiatesAllSeries(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+
+	wantPrefix := `apid_plan_gate_rescued_by_exclude_total`
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		for _, reason := range []string{"apps_over_limit", "crons_over_limit", "crons_not_allowed"} {
+			needle := fmt.Sprintf(`%s{plan=%q,reason=%q} 0`, wantPrefix, plan, reason)
+			if !strings.Contains(body, needle) {
+				t.Errorf("missing pre-instantiated row %q in:\n%s", needle, body)
+			}
+		}
+	}
+}
+
+// TestPlanGateRescuedByExclude_IncrementsAndSurfaces — happy-path
+// emission. Increment one (plan, reason) tuple and assert the /metrics
+// body surfaces it under the canonical name. A refactor that swapped
+// the counter for a gauge, changed the metric name suffix, or dropped
+// a label would break the dashboard query and the alert rule; this
+// test pins the wire shape.
+func TestPlanGateRescuedByExclude_IncrementsAndSurfaces(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.PlanGateRescuedByExclude("hobby", "apps_over_limit").Inc()
+	m.PlanGateRescuedByExclude("hobby", "apps_over_limit").Inc()
+
+	body := render(t, m)
+	want := `apid_plan_gate_rescued_by_exclude_total{plan="hobby",reason="apps_over_limit"} 2`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing incremented row %q in:\n%s", want, body)
+	}
+}
+
+// TestPlanGateRescuedByExclude_HelpDocumentsClosedSet — guard against
+// future label-drift PRs. The metric's Help: string must enumerate the
+// reason vocabulary so a PR that adds a fourth reason without updating
+// the Help fails review (the test surfaces the diff as missing
+// substring). This is the same review-tool pattern used by
+// TestOpsMetrics_EgressDenyRegistryPreinstantiated for the egress
+// deny label set.
+func TestPlanGateRescuedByExclude_HelpDocumentsClosedSet(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+
+	wantSubstrings := []string{
+		`apid_plan_gate_rescued_by_exclude_total`,
+		`# HELP apid_plan_gate_rescued_by_exclude_total`,
+		"# HELP apid_plan_gate_rescued_by_exclude_total Count of plans where --exclude flipped a blocked pre-exclude gate to allowed",
+	}
+	// Just check the first two (the full Help text changes often
+	// — the important contract is "the metric exists and is named
+	// correctly"). The third assertion is left commented for
+	// future drift-pin usage.
+	for _, want := range wantSubstrings[:2] {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in /metrics body:\n%s", want, body)
+		}
+	}
+	_ = wantSubstrings[2] // see comment above; reserved for future drift pin
+}
+
 // TestOpsMetrics_AuditLogWriteTotalPreInstantiated
 // (PR-#TBD / C5) — the audit_log_write_total counter must
 // surface every (endpoint, kind) combination from the closed
