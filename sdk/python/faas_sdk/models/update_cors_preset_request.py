@@ -9,48 +9,63 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="EdgeRuleCORSAction")
+T = TypeVar("T", bound="UpdateCorsPresetRequest")
 
 
 @_attrs_define
-class EdgeRuleCORSAction:
-    """Stamps CORS headers + handles preflight in-process."""
+class UpdateCorsPresetRequest:
+    """Body for PATCH /v1/cors-presets/{id}. Every field is
+    optional (PATCH nil-skip convention). At least one field
+    must be present (an empty PATCH is rejected with 422
+    cors_preset_update_requires_field). The same partial
+    grammar check that fires on CreateCorsPresetRequest
+    (CorsOriginPattern, *+credentials footgun) fires here
+    on the partial payload; the apid handler additionally
+    re-validates against the merged post-update shape so a
+    PATCH that flips AllowCredentials to true while leaving
+    AllowOrigins=["*"] is rejected.
 
-    allow_origins: list[str]
-    allow_methods: list[str]
-    cors_preset_id: None | Unset | UUID = UNSET
-    """Optional CORS preset reference (issue #975 #4 PR-B /
-    ADR-129). When set, the rule's resolved CORS action is
-    the merged union of the preset's fields and the rule's
-    inline fields — with the rule taking precedence for any
-    non-empty inline field. Mutually exclusive with inline
-    fields: if cors_preset_id is set, allow_origins,
-    allow_methods, allow_headers, expose_headers,
-    allow_credentials, and max_age_seconds must all be empty
-    / unset. The preset is referenced by id (UUID); an
-    invalid id (cross-tenant, deleted) causes the rule to
-    be silently dropped from the gateway's compiled slice
-    (the request matches no rule, returning 404 from the
-    route layer).
+    app_id uses the **string tri-state: outer null = "do
+    not touch", inner null = "set to NULL (account-wide)",
+    inner non-null = "set to UUID (app-scoped)".
+
     """
+
+    app_id: None | Unset | UUID = UNSET
+    """Optional app scoping. Outer null = do not touch.
+    Inner null = set to NULL (account-wide). Inner
+    non-null = set to UUID (app-scoped).
+    """
+    name: str | Unset = UNSET
+    description: str | Unset = UNSET
+    allow_origins: list[str] | Unset = UNSET
+    allow_methods: list[str] | Unset = UNSET
     allow_headers: list[str] | Unset = UNSET
     expose_headers: list[str] | Unset = UNSET
-    allow_credentials: bool | Unset = False
+    allow_credentials: bool | Unset = UNSET
     max_age_seconds: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        allow_origins = self.allow_origins
-
-        allow_methods = self.allow_methods
-
-        cors_preset_id: None | str | Unset
-        if isinstance(self.cors_preset_id, Unset):
-            cors_preset_id = UNSET
-        elif isinstance(self.cors_preset_id, UUID):
-            cors_preset_id = str(self.cors_preset_id)
+        app_id: None | str | Unset
+        if isinstance(self.app_id, Unset):
+            app_id = UNSET
+        elif isinstance(self.app_id, UUID):
+            app_id = str(self.app_id)
         else:
-            cors_preset_id = self.cors_preset_id
+            app_id = self.app_id
+
+        name = self.name
+
+        description = self.description
+
+        allow_origins: list[str] | Unset = UNSET
+        if not isinstance(self.allow_origins, Unset):
+            allow_origins = self.allow_origins
+
+        allow_methods: list[str] | Unset = UNSET
+        if not isinstance(self.allow_methods, Unset):
+            allow_methods = self.allow_methods
 
         allow_headers: list[str] | Unset = UNSET
         if not isinstance(self.allow_headers, Unset):
@@ -66,14 +81,17 @@ class EdgeRuleCORSAction:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "allow_origins": allow_origins,
-                "allow_methods": allow_methods,
-            }
-        )
-        if cors_preset_id is not UNSET:
-            field_dict["cors_preset_id"] = cors_preset_id
+        field_dict.update({})
+        if app_id is not UNSET:
+            field_dict["app_id"] = app_id
+        if name is not UNSET:
+            field_dict["name"] = name
+        if description is not UNSET:
+            field_dict["description"] = description
+        if allow_origins is not UNSET:
+            field_dict["allow_origins"] = allow_origins
+        if allow_methods is not UNSET:
+            field_dict["allow_methods"] = allow_methods
         if allow_headers is not UNSET:
             field_dict["allow_headers"] = allow_headers
         if expose_headers is not UNSET:
@@ -88,11 +106,8 @@ class EdgeRuleCORSAction:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        allow_origins = cast(list[str], d.pop("allow_origins"))
 
-        allow_methods = cast(list[str], d.pop("allow_methods"))
-
-        def _parse_cors_preset_id(data: object) -> None | Unset | UUID:
+        def _parse_app_id(data: object) -> None | Unset | UUID:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -100,14 +115,22 @@ class EdgeRuleCORSAction:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                cors_preset_id_type_0 = UUID(data)
+                app_id_type_0 = UUID(data)
 
-                return cors_preset_id_type_0
+                return app_id_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | UUID, data)
 
-        cors_preset_id = _parse_cors_preset_id(d.pop("cors_preset_id", UNSET))
+        app_id = _parse_app_id(d.pop("app_id", UNSET))
+
+        name = d.pop("name", UNSET)
+
+        description = d.pop("description", UNSET)
+
+        allow_origins = cast(list[str], d.pop("allow_origins", UNSET))
+
+        allow_methods = cast(list[str], d.pop("allow_methods", UNSET))
 
         allow_headers = cast(list[str], d.pop("allow_headers", UNSET))
 
@@ -117,18 +140,20 @@ class EdgeRuleCORSAction:
 
         max_age_seconds = d.pop("max_age_seconds", UNSET)
 
-        edge_rule_cors_action = cls(
+        update_cors_preset_request = cls(
+            app_id=app_id,
+            name=name,
+            description=description,
             allow_origins=allow_origins,
             allow_methods=allow_methods,
-            cors_preset_id=cors_preset_id,
             allow_headers=allow_headers,
             expose_headers=expose_headers,
             allow_credentials=allow_credentials,
             max_age_seconds=max_age_seconds,
         )
 
-        edge_rule_cors_action.additional_properties = d
-        return edge_rule_cors_action
+        update_cors_preset_request.additional_properties = d
+        return update_cors_preset_request
 
     @property
     def additional_keys(self) -> list[str]:

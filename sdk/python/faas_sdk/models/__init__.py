@@ -126,6 +126,8 @@ from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
 from .consume_invoice_response import ConsumeInvoiceResponse
 from .consumed_credit_row import ConsumedCreditRow
+from .cors_preset_list_response import CorsPresetListResponse
+from .cors_preset_response import CorsPresetResponse
 from .create_alert_rule_request import CreateAlertRuleRequest
 from .create_alert_rule_request_comparison import CreateAlertRuleRequestComparison
 from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFailureSource
@@ -139,6 +141,7 @@ from .create_app_request_type import CreateAppRequestType
 from .create_app_webhook_request import CreateAppWebhookRequest
 from .create_app_webhook_request_event_filter_item import CreateAppWebhookRequestEventFilterItem
 from .create_app_webhook_request_retry_policy import CreateAppWebhookRequestRetryPolicy
+from .create_cors_preset_request import CreateCorsPresetRequest
 from .create_cron_request import CreateCronRequest
 from .create_custom_domain_request import CreateCustomDomainRequest
 from .create_deployment_files_body import CreateDeploymentFilesBody
@@ -517,6 +520,7 @@ from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequest
 from .update_app_webhook_request import UpdateAppWebhookRequest
 from .update_app_webhook_request_event_filter_item import UpdateAppWebhookRequestEventFilterItem
 from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetryPolicy
+from .update_cors_preset_request import UpdateCorsPresetRequest
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
 from .update_deployment_open_api_doc_body import UpdateDeploymentOpenAPIDocBody
@@ -675,6 +679,8 @@ __all__ = (
     "ChangePlanRequestPlan",
     "ConsumedCreditRow",
     "ConsumeInvoiceResponse",
+    "CorsPresetListResponse",
+    "CorsPresetResponse",
     "CreateAlertRuleRequest",
     "CreateAlertRuleRequestComparison",
     "CreateAlertRuleRequestFailureSource",
@@ -688,6 +694,7 @@ __all__ = (
     "CreateAppWebhookRequest",
     "CreateAppWebhookRequestEventFilterItem",
     "CreateAppWebhookRequestRetryPolicy",
+    "CreateCorsPresetRequest",
     "CreateCronRequest",
     "CreateCustomDomainRequest",
     "CreateDeploymentFilesBody",
@@ -1060,6 +1067,7 @@ __all__ = (
     "UpdateAppWebhookRequest",
     "UpdateAppWebhookRequestEventFilterItem",
     "UpdateAppWebhookRequestRetryPolicy",
+    "UpdateCorsPresetRequest",
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
     "UpdateDeploymentOpenAPIDocBody",
