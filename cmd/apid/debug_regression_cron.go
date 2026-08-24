@@ -34,6 +34,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -126,13 +127,17 @@ func startDebugRegressionCron(ctx context.Context, s *server, log *slog.Logger, 
 // every (deployment, route) regression detected. Per-app errors
 // are logged + skipped; the loop never aborts on a bad app.
 func (s *server) runRegressionOnce(ctx context.Context, log *slog.Logger) {
+	// Capture the pass-start timestamp at cron entry so the
+	// oldest-pass gauge measures wall-clock now() at emit time,
+	// not a frozen value from earlier in the pass.
+	lastPassAt := time.Now()
 	appIDs, err := s.store.ListAppsWithRecentTelemetry(ctx, pgtype.Interval{
 		Microseconds: int64(debugRegressionWindow / time.Microsecond),
 		Valid:        true,
 	})
 	if err != nil {
 		log.Warn("regression_cron: list apps failed", "err", err)
-		s.emitRegressionOldestPassGauge(ctx, log)
+		s.emitRegressionOldestPassGauge(ctx, log, lastPassAt)
 		return
 	}
 	if len(appIDs) > debugRegressionMaxApps {
@@ -151,9 +156,9 @@ func (s *server) runRegressionOnce(ctx context.Context, log *slog.Logger) {
 	}
 	// Always refresh the gauge — even if the per-app pass failed,
 	// the gauge still reflects the wall-clock staleness of the
-	// debug_regression_observations table so a stalled-loop alert
-	// fires when nothing else does.
-	s.emitRegressionOldestPassGauge(ctx, log)
+	// cron loop so a stalled-loop alert fires when nothing else
+	// does.
+	s.emitRegressionOldestPassGauge(ctx, log, lastPassAt)
 }
 
 // runRegressionForApp runs the per-app detector. Returns an error
@@ -221,15 +226,20 @@ func (s *server) runRegressionForApp(ctx context.Context, log *slog.Logger, appI
 	}
 	if len(baselineByRoute) > debugRegressionMaxRoutes {
 		// Cap the map so a 10k-route app doesn't blow up the
-		// per-app pass.
-		count := 0
+		// per-app pass. Sort the keys for determinism — Go's map
+		// iteration order is randomized, so without sorting the
+		// chosen cap-of-200 routes would change every tick and the
+		// regression banner would flake on/off across passes.
+		sortedRoutes := make([]string, 0, len(baselineByRoute))
 		for k := range baselineByRoute {
-			delete(baselineByRoute, k)
-			count++
-			if count > debugRegressionMaxRoutes {
-				break
-			}
+			sortedRoutes = append(sortedRoutes, k)
 		}
+		sort.Strings(sortedRoutes)
+		kept := make(map[string]int32, debugRegressionMaxRoutes)
+		for _, k := range sortedRoutes[:debugRegressionMaxRoutes] {
+			kept[k] = baselineByRoute[k]
+		}
+		baselineByRoute = kept
 	}
 
 	// Compute current p95 per route on the current deployment.
@@ -273,6 +283,14 @@ func (s *server) runRegressionForApp(ctx context.Context, log *slog.Logger, appI
 		}
 		affected := int32(0)
 		for _, row := range drilldown {
+			// Drilldown is per-deployment, not per-route — PR-B
+			// kept the simpler indexed query and filters in Go so
+			// the dashboard's "X requests affected" badge
+			// attributes the count to the regressed route rather
+			// than the deployment as a whole.
+			if row.Route != curRow.Route {
+				continue
+			}
 			if row.LatencyMs > threshold {
 				affected++
 			}
@@ -310,12 +328,22 @@ func (s *server) runRegressionForApp(ctx context.Context, log *slog.Logger, appI
 
 // emitRegressionOldestPassGauge (ADR-127 PR-B) refreshes the
 // apid_debug_regression_oldest_pass_seconds gauge after the cron
-// pass completes. Mirrors emitDoctorOldestObservationGauge's
-// shape: Set(0) when the row set is empty (cold start), Set(age)
-// when rows exist. Best-effort — a Store read failure is logged +
-// the gauge is left untouched so a transient DB hiccup doesn't
-// false-page on-call.
-func (s *server) emitRegressionOldestPassGauge(ctx context.Context, log *slog.Logger) {
+// pass completes. The metric measures wall-clock seconds since
+// the most recent cron pass — not "since last detected
+// regression", which made the value climb unboundedly when the
+// cron was healthy but silent. The doctor loop's
+// emitDoctorOldestObservationGauge uses the data-staleness
+// semantic; the regression cron uses the pass-staleness semantic
+// because regression detection is a positive observation that
+// can legitimately go quiet for hours (a stable production app)
+// — pass-staleness is the operator's "is the loop alive" signal,
+// data-staleness is misleadingly noisy.
+//
+// The caller passes lastPassAt (captured at cron entry); we
+// translate to seconds at emit time so the gauge reflects
+// wall-clock now, not a stale captured moment. Negative deltas
+// are clamped to 0 (clock-skew defense).
+func (s *server) emitRegressionOldestPassGauge(ctx context.Context, log *slog.Logger, lastPassAt time.Time) {
 	if s.ops == nil {
 		return
 	}
@@ -323,55 +351,15 @@ func (s *server) emitRegressionOldestPassGauge(ctx context.Context, log *slog.Lo
 	if gauge == nil {
 		return
 	}
-	maxAt, err := s.maxRegressionLastDetected(ctx)
-	if err != nil {
-		log.Warn("regression_cron: oldest pass read failed", "err", err)
-		return
-	}
-	if maxAt.IsZero() {
+	if lastPassAt.IsZero() {
 		gauge.Set(0)
 		return
 	}
-	age := time.Since(maxAt).Seconds()
+	age := time.Since(lastPassAt).Seconds()
 	if age < 0 {
-		age = 0 // clock-skew clamp
+		age = 0
 	}
 	gauge.Set(age)
-}
-
-// maxRegressionLastDetected scans debug_regression_observations
-// for the maximum last_detected_at. We re-use
-// ListActiveRegressionsByApp with a wide window — the rows are
-// already bounded (PRIMARY KEY on (app_id, deployment_id, route))
-// and the cron writes at most one row per (deployment, route) per
-// pass, so the table size is bounded by deployment churn.
-func (s *server) maxRegressionLastDetected(ctx context.Context) (time.Time, error) {
-	appIDs, err := s.store.ListAppsWithRecentTelemetry(ctx, pgtype.Interval{
-		Microseconds: int64(90 * 24 * time.Hour / time.Microsecond),
-		Valid:        true,
-	})
-	if err != nil {
-		return time.Time{}, err
-	}
-	var maxAt time.Time
-	for _, appID := range appIDs {
-		rows, err := s.store.ListActiveRegressionsByApp(ctx, sqlc.ListActiveRegressionsByAppParams{
-			AppID: appID,
-			Column2: pgtype.Interval{
-				Microseconds: int64(90 * 24 * time.Hour / time.Microsecond),
-				Valid:        true,
-			},
-		})
-		if err != nil {
-			return time.Time{}, err
-		}
-		for _, row := range rows {
-			if row.LastDetectedAt.Time.After(maxAt) {
-				maxAt = row.LastDetectedAt.Time
-			}
-		}
-	}
-	return maxAt, nil
 }
 
 // emitRegressionSkip (ADR-127 PR-B) bumps the
