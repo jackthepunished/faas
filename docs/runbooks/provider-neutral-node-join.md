@@ -30,7 +30,7 @@ The command performs these phases in order:
 4. Run the complete-fleet Ansible preflight, unless
    `--skip-fleet-preflight` is explicitly supplied after a recent successful
    preflight.
-5. Stage the root-only database environment, fleet PKI, image-signing keys,
+5. Stage the root-only database environment, a compute trust bundle, image-signing keys,
    signed release assets, bootstrap `gregalectl`, and the manifest.
 6. Run the production `deploy/ansible/bootstrap.yml` compute role.
 7. Install the signed release with `--defer-activation`; the database row is
@@ -38,7 +38,8 @@ The command performs these phases in order:
 8. Render the manifest, initialize host-local identity, start the four
    compute services, and wait for vmmd's socket, the internal gateway, and
    systemd-active status.
-9. Activate the compute row only after all readiness gates pass.
+9. Verify the control-plane row's role, release, manifest hash, and stable
+   target URL, then activate the compute row only after all gates pass.
 
 If a phase fails, the node remains non-schedulable. Re-running the same command
 is the recovery path after correcting the failed input or host condition.
@@ -50,8 +51,10 @@ The release workflow must provide these local artifacts:
 - `release.tar.gz`, alongside `release.cosign.bundle` and `release.sbom.json`;
 - a Linux/amd64 bootstrap `gregalectl` binary;
 - the `cosign` verifier binary;
-- a fleet PKI directory containing `ca/ca.crt`, `ca/ca.key`, and the
-  compute-only leaves;
+- either a compute trust-bundle directory containing `ca/ca.crt` and the
+  compute-only leaves, or the operator-side full PKI root. If the full root
+  is supplied, the pipeline issues/refreshes endpoint SANs locally and still
+  never copies `ca/ca.key` to a compute host;
 - the image-signing private/public key pair;
 - a root-only `compute-db.env` containing `DATABASE_URL=...`.
 
@@ -85,16 +88,21 @@ gregalectl deploy join-node \
   --ssh-host 203.0.113.27 \
   --ssh-user root \
   --ssh-key /secure/ssh/faas-fleet \
-  --release-tarball /secure/releases/release.tar.gz \
-  --bootstrap-binary /secure/tools/gregalectl-linux-amd64 \
-  --cosign-binary /secure/tools/cosign-linux-amd64 \
-  --pki-dir /secure/fleet/pki \
-  --sign-key /secure/fleet/sign.key \
-  --verify-key /secure/fleet/sign-pub.pem \
-  --compute-db-env /secure/fleet/compute-db.env \
+  --artifact-dir /secure/fleet/join-artifacts \
   --ansible-vars-file /secure/fleet/overlay-vars.yml \
   --yes
 ```
+
+The standard artifact directory contains `release.tar.gz`, its two release
+sidecars, `gregalectl-linux-amd64`, `cosign-linux-amd64`, `pki/`, `sign.key`,
+`sign-pub.pem`, and `compute-db.env`. Individual flags override those
+conventions when an artifact is stored elsewhere.
+
+The join state is durable in `node_join_jobs`. An interrupted or failed join
+can be retried with `--resume`; a lease prevents two operators from changing
+the same node concurrently. The command records preflight, convergence,
+verification, active, and failed phases and refreshes its lease while Ansible
+runs.
 
 The `fleet.hosts[].address` value is not replaced with the provider's public
 SSH address. It remains the stable private runtime endpoint and certificate
@@ -108,3 +116,27 @@ one join command. No `host_vars` file, `hosts.ini` entry, provider API call, or
 per-cloud code is required. At larger fleet sizes, run a complete preflight
 once and use `--skip-fleet-preflight` only when the fleet facts are still
 current; the join itself remains limited to the new node.
+
+For a batch, put only provider connection details in a short-lived file and
+let the shared manifest/artifact directory supply everything else:
+
+```yaml
+nodes:
+  - node: fsn-3
+    ssh_host: 203.0.113.27
+  - node: fsn-4
+    ssh_host: 198.51.100.44
+    ssh_port: 2222
+```
+
+Run `gregalectl deploy join-fleet --nodes-file nodes.yaml
+--manifest-file /secure/fleet/manifest.yaml --artifact-dir
+/secure/fleet/join-artifacts --max-parallel 8 --yes`. It runs one complete
+preflight, then converges at most eight nodes at a time. Each node still has
+its own durable job and lease, so a partial batch can be resumed safely.
+
+If a partially-converged host must be taken out of service first, run
+`gregalectl deploy rollback-node --node fsn-3 --yes`. This drains the
+control-plane row and records `rolled_back`; it intentionally leaves remote
+artifacts untouched for diagnosis. Use the original join command with
+`--resume` after correcting the cause.

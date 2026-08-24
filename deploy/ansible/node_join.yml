@@ -4,8 +4,9 @@
 # The cloud/provider boundary ends at the Ansible connection variables. The
 # playbook owns the rest of the lifecycle: stage trust material, converge the
 # production host role, install the verified release, render the manifest,
-# initialize host-local identity, start only the compute services, wait for
-# readiness, and activate the database row as the final operation.
+# initialize host-local identity, start only the compute services, and wait
+# for local readiness. The controller performs the final control-plane
+# verification and activation after this play returns.
 #
 # The caller supplies local paths through the faas_join_* variables. They are
 # controller-side inputs; secret contents never travel through --extra-vars.
@@ -57,7 +58,7 @@
         mode: "0600"
       no_log: true
 
-    - name: Stage the fleet PKI material
+    - name: Stage the compute trust bundle (the source never includes the CA private key)
       ansible.builtin.copy:
         src: "{{ faas_join_pki_source }}/"
         dest: /etc/faas/tls/
@@ -231,6 +232,7 @@
           - /etc/faas/manifest.yaml
           - --host
           - "{{ faas_join_inventory_name }}"
+          - --pki-trust-only
       changed_when: true
 
     - name: Initialize host-local runtime identity and backup stubs
@@ -279,19 +281,9 @@
         - faas-builderd.service
         - faas-imaged.service
 
-    - name: Activate the compute row only after all readiness gates pass
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/gregalectl
-          - compute-nodes
-          - activate
-          - --node
-          - "{{ faas_join_database_node }}"
-      register: faas_node_activation
-      changed_when: true
-
-    - name: Report successful node adoption
+    - name: Report local node readiness to the controller
       ansible.builtin.debug:
         msg: >-
-          {{ faas_join_database_node }} is active after signed release,
-          manifest render, service activation, and local readiness gates.
+          {{ faas_join_database_node }} is locally ready after signed release,
+          trust-only manifest render, service activation, and readiness gates;
+          the controller must verify the control-plane row before activation.

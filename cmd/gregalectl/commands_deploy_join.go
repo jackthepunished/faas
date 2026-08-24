@@ -7,17 +7,22 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/nodejoin"
 	"github.com/onebox-faas/faas/pkg/pki"
 )
 
@@ -35,9 +40,13 @@ type deployJoinOptions struct {
 	SignKeySource      string
 	VerifyKeySource    string
 	ComputeDBEnvSource string
+	ArtifactDir        string
 	AnsibleVarsFile    string
 	RepoRoot           string
 	SkipFleetPreflight bool
+	Resume             bool
+	Timeout            time.Duration
+	LeaseTTL           time.Duration
 	DryRun             bool
 	Yes                bool
 	JSON               bool
@@ -52,6 +61,18 @@ type deployJoinReport struct {
 	FleetPreflight bool     `json:"fleet_preflight"`
 	Applied        bool     `json:"applied"`
 	Steps          []string `json:"steps"`
+}
+
+var nodeJoinStoreOpener = openNodeJoinStore
+
+var joinControlPlaneVerifier = verifyAndActivateJoinedNode
+
+func openNodeJoinStore() (nodejoin.Store, func(), error) {
+	pool, err := openPgPoolFromEnv()
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("gregalectl deploy join-node: %w", err)
+	}
+	return nodejoin.NewPGStore(pool), pool.Close, nil
 }
 
 // ansiblePlaybookRunner is a process seam for CLI tests. The production path
@@ -78,13 +99,17 @@ func cmdDeployJoinNode(args []string) int {
 	releaseTarball := fs.String("release-tarball", "", "signed release.tar.gz (required for apply)")
 	bootstrapBinary := fs.String("bootstrap-binary", "", "Linux/amd64 gregalectl used before the release is installed (required for apply)")
 	cosignBinary := fs.String("cosign-binary", "", "cosign verifier binary staged on the adopted host (required for apply)")
-	pkiSource := fs.String("pki-dir", "", "fleet PKI directory containing ca/ and the compute-only leaves (required for apply)")
+	pkiSource := fs.String("pki-dir", "", "compute trust-bundle directory containing ca/ca.crt and the compute-only leaves (required for apply)")
 	signKey := fs.String("sign-key", "", "image-signing private key (required for apply)")
 	verifyKey := fs.String("verify-key", "", "image-signing public key (required for apply)")
 	computeDBEnv := fs.String("compute-db-env", "", "root-only compute-db.env source (required for apply)")
+	artifactDir := fs.String("artifact-dir", "", "directory containing the standard release, key, trust-bundle, and bootstrap assets")
 	ansibleVars := fs.String("ansible-vars-file", "", "optional provider/overlay Ansible vars file")
 	repoRoot := fs.String("repo-root", "", "path to the faas repository (default: inferred from gregalectl)")
 	skipPreflight := fs.Bool("skip-fleet-preflight", false, "skip the complete-fleet preflight (only for a previously validated fleet)")
+	resume := fs.Bool("resume", false, "resume a failed or interrupted join job for this exact desired state")
+	timeout := fs.Duration("timeout", 20*time.Minute, "maximum time allowed for the remote adoption")
+	leaseTTL := fs.Duration("lease-ttl", 30*time.Minute, "database lease held by this join worker")
 	dryRun := fs.Bool("dry-run", false, "validate and print the adoption plan without contacting the host")
 	yes := fs.Bool("yes", false, "approve the remote adoption")
 	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
@@ -110,9 +135,13 @@ func cmdDeployJoinNode(args []string) int {
 		SignKeySource:      *signKey,
 		VerifyKeySource:    *verifyKey,
 		ComputeDBEnvSource: *computeDBEnv,
+		ArtifactDir:        *artifactDir,
 		AnsibleVarsFile:    *ansibleVars,
 		RepoRoot:           *repoRoot,
 		SkipFleetPreflight: *skipPreflight,
+		Resume:             *resume,
+		Timeout:            *timeout,
+		LeaseTTL:           *leaseTTL,
 		DryRun:             *dryRun,
 		Yes:                *yes,
 		JSON:               *jsonOut || jsonOutput,
@@ -120,6 +149,7 @@ func cmdDeployJoinNode(args []string) int {
 	if opts.RepoRoot == "" {
 		opts.RepoRoot = defaultRepoRoot()
 	}
+	resolveJoinArtifacts(&opts)
 
 	report, err := deployJoinValidate(opts)
 	if err != nil {
@@ -135,12 +165,128 @@ func cmdDeployJoinNode(args []string) int {
 		return 2
 	}
 
-	code, err := deployJoinApply(&opts, &report)
+	code, err := executeDeployJoin(opts, &report)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl deploy join-node: %v\n", err)
 		return code
 	}
 	return emitDeployJoinReport(report, true, opts.JSON)
+}
+
+// cmdDeployRollbackNode is the operator-safe rollback boundary for a join.
+// It drains the control-plane row and records rolled_back, but deliberately
+// leaves remote files and services untouched for forensics. A later
+// `join-node --resume` can converge the same desired state again.
+func cmdDeployRollbackNode(args []string) int {
+	fs := flag.NewFlagSet("deploy rollback-node", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	node := fs.String("node", "", "manifest node whose join job should be rolled back (required)")
+	leaseTTL := fs.Duration("lease-ttl", 5*time.Minute, "rollback coordination lease")
+	yes := fs.Bool("yes", false, "confirm draining the node")
+	jsonOut := fs.Bool("json", false, "emit structured JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 || *node == "" {
+		fmt.Fprintln(os.Stderr, "gregalectl deploy rollback-node: --node is required")
+		return 2
+	}
+	if *leaseTTL <= 0 {
+		fmt.Fprintln(os.Stderr, "gregalectl deploy rollback-node: --lease-ttl must be positive")
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(os.Stderr, "gregalectl deploy rollback-node: re-run with --yes to drain and mark the join rolled back")
+		return 2
+	}
+	jobs, closeJobs, err := nodeJoinStoreOpener()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeJobs()
+	job, err := jobs.Get(context.Background(), *node)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: %v\n", err)
+		return 1
+	}
+	owner := fmt.Sprintf("gregalectl-rollback-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if _, err := jobs.AcquireLease(context.Background(), *node, owner, *leaseTTL); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: acquire lease: %v\n", err)
+		return 1
+	}
+	store, closeStore, err := computeNodesStoreOpener()
+	if err != nil {
+		_ = jobs.ReleaseLease(context.Background(), *node, owner)
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: open control-plane state: %v\n", err)
+		return 1
+	}
+	defer closeStore()
+	row, err := store.ComputeNodeByName(context.Background(), job.DatabaseNode)
+	if err != nil {
+		_ = jobs.ReleaseLease(context.Background(), *node, owner)
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: lookup row: %v\n", err)
+		return 1
+	}
+	if err := store.SetComputeNodeActive(context.Background(), row.ID, false); err != nil {
+		_ = jobs.ReleaseLease(context.Background(), *node, owner)
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: drain row: %v\n", err)
+		return 3
+	}
+	if err := jobs.MarkRolledBack(context.Background(), *node, owner, errors.New("operator requested rollback")); err != nil {
+		_ = jobs.ReleaseLease(context.Background(), *node, owner)
+		fmt.Fprintf(os.Stderr, "gregalectl deploy rollback-node: record rollback: %v\n", err)
+		return 3
+	}
+	if *jsonOut || jsonOutput {
+		jsonEmit(os.Stdout, map[string]any{"node": *node, "database_node": job.DatabaseNode, "phase": nodejoin.PhaseRolledBack, "active": false})
+		return 0
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "deploy rollback-node: node=%s database_node=%s phase=%s active=false\n", *node, job.DatabaseNode, nodejoin.PhaseRolledBack)
+	return 0
+}
+
+func executeDeployJoin(opts deployJoinOptions, report *deployJoinReport) (int, error) {
+	if opts.Timeout <= 0 {
+		return 2, errors.New("--timeout must be positive")
+	}
+	if opts.LeaseTTL <= 0 {
+		return 2, errors.New("--lease-ttl must be positive")
+	}
+	manifestHash, err := joinManifestHash(opts.ManifestFile)
+	if err != nil {
+		return 1, err
+	}
+	jobStore, closeJobStore, err := nodeJoinStoreOpener()
+	if err != nil {
+		return 1, err
+	}
+	defer closeJobStore()
+	spec := nodejoin.Spec{NodeName: opts.Node, DatabaseNode: report.DatabaseNode, SSHHost: opts.SSHHost, ManifestHash: manifestHash, ReleaseGitSHA: report.ReleaseGitSHA}
+	if _, err := jobStore.CreateOrResume(context.Background(), spec, opts.Resume); err != nil {
+		return 1, fmt.Errorf("prepare durable join job: %w", err)
+	}
+	owner := fmt.Sprintf("gregalectl-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if _, err := jobStore.AcquireLease(context.Background(), opts.Node, owner, opts.LeaseTTL); err != nil {
+		return 1, fmt.Errorf("acquire durable join lease: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+	defer cancel()
+	refreshDone := make(chan struct{})
+	defer close(refreshDone)
+	go refreshNodeJoinLease(ctx, jobStore, opts.Node, owner, opts.LeaseTTL, refreshDone)
+	progress := func(phase nodejoin.Phase) error {
+		return jobStore.UpdatePhase(ctx, opts.Node, owner, phase, "")
+	}
+	code, err := deployJoinApplyWithContext(ctx, &opts, report, progress)
+	if err != nil {
+		_ = jobStore.MarkFailed(context.Background(), opts.Node, owner, err)
+		return code, err
+	}
+	if err := jobStore.MarkComplete(context.Background(), opts.Node, owner); err != nil {
+		return 3, fmt.Errorf("mark active: %w", err)
+	}
+	return 0, nil
 }
 
 func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
@@ -160,7 +306,7 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 			"install the signed release while the database row remains drained",
 			"render configuration, initialize host identity, and start services",
 			"wait for sockets, gateway, and systemd readiness",
-			"activate the compute row as the final step",
+			"verify the control-plane row and activate it as the final step",
 		},
 	}
 	if opts.ManifestFile == "" {
@@ -251,10 +397,17 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 			return report, fmt.Errorf("--pki-dir missing %s: %w", key, err)
 		}
 	}
-	caCert, caKey := pki.CARoot(opts.PKISource)
-	for _, path := range []string{caCert, caKey} {
-		if _, err := os.Stat(path); err != nil {
-			return report, fmt.Errorf("--pki-dir missing %s: %w", path, err)
+	caCert, _ := pki.CARoot(opts.PKISource)
+	if _, err := os.Stat(caCert); err != nil {
+		return report, fmt.Errorf("--pki-dir missing %s: %w", caCert, err)
+	}
+	manifestSANs, err := joinHostSANs(m, opts.Node)
+	if err != nil {
+		return report, err
+	}
+	if err := pki.ValidateTrustBundle(opts.PKISource, roleComputeOnly, manifestSANs); err != nil {
+		if issuanceErr := pki.ValidateIssuanceMaterial(opts.PKISource, roleComputeOnly); issuanceErr != nil {
+			return report, fmt.Errorf("--pki-dir is neither a valid compute trust bundle nor issuable operator PKI: trust validation failed; issuance=%w", issuanceErr)
 		}
 	}
 	if !hasDatabaseURLLine(opts.ComputeDBEnvSource) {
@@ -275,6 +428,10 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 }
 
 func deployJoinApply(opts *deployJoinOptions, report *deployJoinReport) (int, error) {
+	return deployJoinApplyWithContext(context.Background(), opts, report, nil)
+}
+
+func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, report *deployJoinReport, progress func(nodejoin.Phase) error) (int, error) {
 	if opts.RepoRoot == "" {
 		opts.RepoRoot = defaultRepoRoot()
 	}
@@ -288,6 +445,14 @@ func deployJoinApply(opts *deployJoinOptions, report *deployJoinReport) (int, er
 	m, err := manifest.Load(opts.ManifestFile)
 	if err != nil {
 		return 1, err
+	}
+	manifestSANs, err := joinHostSANs(m, opts.Node)
+	if err != nil {
+		return 1, err
+	}
+	trustRoot := filepath.Join(tempRoot, "pki-trust")
+	if err := copyTrustBundle(opts.PKISource, trustRoot, roleComputeOnly, manifestSANs); err != nil {
+		return 3, fmt.Errorf("prepare compute trust bundle: %w", err)
 	}
 	files, err := renderManifestAnsibleFiles(m, tempRoot)
 	if err != nil {
@@ -334,7 +499,7 @@ func deployJoinApply(opts *deployJoinOptions, report *deployJoinReport) (int, er
 		"faas_join_manifest_source":          opts.ManifestFile,
 		"faas_join_bootstrap_binary_source":  opts.BootstrapBinary,
 		"faas_join_cosign_binary_source":     opts.CosignBinary,
-		"faas_join_pki_source":               opts.PKISource,
+		"faas_join_pki_source":               trustRoot,
 		"faas_join_sign_key_source":          opts.SignKeySource,
 		"faas_join_verify_key_source":        opts.VerifyKeySource,
 		"faas_join_compute_db_env_source":    opts.ComputeDBEnvSource,
@@ -359,17 +524,207 @@ func deployJoinApply(opts *deployJoinOptions, report *deployJoinReport) (int, er
 	}
 	common = append(common, "-e", "@"+varsPath)
 	if !opts.SkipFleetPreflight {
+		if progress != nil {
+			if err := progress(nodejoin.PhasePreflight); err != nil {
+				return 3, fmt.Errorf("record preflight phase: %w", err)
+			}
+		}
 		preflightArgs := append(append([]string{}, common...), filepath.Join(ansibleDir, "preflight.yml"))
-		if err := ansiblePlaybookRunner(context.Background(), ansibleDir, preflightArgs); err != nil {
+		if err := ansiblePlaybookRunner(ctx, ansibleDir, preflightArgs); err != nil {
 			return 3, fmt.Errorf("fleet preflight: %w", err)
 		}
 	}
+	if progress != nil {
+		if err := progress(nodejoin.PhaseConverging); err != nil {
+			return 3, fmt.Errorf("record converging phase: %w", err)
+		}
+	}
 	joinArgs := append(append([]string{}, common...), "--limit", opts.Node, filepath.Join(ansibleDir, "node_join.yml"))
-	if err := ansiblePlaybookRunner(context.Background(), ansibleDir, joinArgs); err != nil {
+	if err := ansiblePlaybookRunner(ctx, ansibleDir, joinArgs); err != nil {
 		return 3, fmt.Errorf("node adoption: %w", err)
+	}
+	if progress != nil {
+		if err := progress(nodejoin.PhaseVerifying); err != nil {
+			return 3, fmt.Errorf("record verifying phase: %w", err)
+		}
+	}
+	expectedManifestHash, err := joinManifestHash(opts.ManifestFile)
+	if err != nil {
+		return 3, err
+	}
+	if err := joinControlPlaneVerifier(ctx, report, expectedManifestHash); err != nil {
+		return 3, fmt.Errorf("control-plane readiness gate: %w", err)
 	}
 	report.Applied = true
 	return 0, nil
+}
+
+func refreshNodeJoinLease(ctx context.Context, store nodejoin.Store, nodeName, owner string, ttl time.Duration, done <-chan struct{}) {
+	interval := ttl / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = store.RefreshLease(ctx, nodeName, owner, ttl)
+		}
+	}
+}
+
+func verifyAndActivateJoinedNode(ctx context.Context, report *deployJoinReport, expectedManifestHash string) error {
+	store, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+	row, err := store.ComputeNodeByName(ctx, report.DatabaseNode)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", report.DatabaseNode, err)
+	}
+	if row.Role == nil || *row.Role != roleComputeOnly {
+		return fmt.Errorf("row role is %q, want %q", pointerString(row.Role), roleComputeOnly)
+	}
+	if row.ReleaseID == nil || *row.ReleaseID != report.ReleaseGitSHA {
+		return fmt.Errorf("row release_id is %q, want %q", pointerString(row.ReleaseID), report.ReleaseGitSHA)
+	}
+	if row.ManifestHash == nil || *row.ManifestHash != expectedManifestHash {
+		return fmt.Errorf("row manifest_hash is %q, want %q", pointerString(row.ManifestHash), expectedManifestHash)
+	}
+	if err := validateComputeTargetURL(row.TargetURL); err != nil {
+		return err
+	}
+	if !row.Active {
+		if err := store.SetComputeNodeActive(ctx, row.ID, true); err != nil {
+			return fmt.Errorf("activate row %s: %w", row.ID, err)
+		}
+	}
+	return nil
+}
+
+func validateComputeTargetURL(raw string) error {
+	if !strings.HasPrefix(raw, "tcp://") {
+		return fmt.Errorf("compute target_url %q is not a tcp endpoint", raw)
+	}
+	hostPort := strings.TrimPrefix(raw, "tcp://")
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil || host == "" {
+		return fmt.Errorf("compute target_url %q is not a valid host:port", raw)
+	}
+	if host == "0.0.0.0" || host == "::" || host == "127.0.0.1" || host == "localhost" {
+		return fmt.Errorf("compute target_url %q is not a stable routable endpoint", raw)
+	}
+	return nil
+}
+
+func pointerString(v *string) string {
+	if v == nil {
+		return "<nil>"
+	}
+	return *v
+}
+
+func resolveJoinArtifacts(opts *deployJoinOptions) {
+	if opts.ArtifactDir == "" {
+		return
+	}
+	resolve := func(current *string, name string) {
+		if *current == "" {
+			*current = filepath.Join(opts.ArtifactDir, name)
+		}
+	}
+	resolve(&opts.ReleaseTarball, releaseTarballName)
+	resolve(&opts.BootstrapBinary, "gregalectl-linux-amd64")
+	resolve(&opts.CosignBinary, "cosign-linux-amd64")
+	resolve(&opts.PKISource, "pki")
+	resolve(&opts.SignKeySource, "sign.key")
+	resolve(&opts.VerifyKeySource, "sign-pub.pem")
+	resolve(&opts.ComputeDBEnvSource, "compute-db.env")
+}
+
+func joinManifestHash(path string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read manifest for durable join state: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func joinHostSANs(m *manifest.Manifest, node string) (pki.AltNames, error) {
+	for _, host := range m.Fleet.Hosts {
+		if host.Name != node {
+			continue
+		}
+		address, _, err := manifest.ParseHostPort(host.Address)
+		if err != nil {
+			return pki.AltNames{}, fmt.Errorf("manifest host %s endpoint SAN: %w", node, err)
+		}
+		if ip := net.ParseIP(address); ip != nil {
+			return pki.AltNames{IPAddresses: []net.IP{ip}}, nil
+		}
+		return pki.AltNames{DNSNames: []string{address}}, nil
+	}
+	return pki.AltNames{}, fmt.Errorf("manifest does not declare host %q", node)
+}
+
+func copyTrustBundle(source, destination, hostRole string, extraSANs pki.AltNames) error {
+	if err := pki.ValidateTrustBundle(source, hostRole, extraSANs); err != nil {
+		if issuanceErr := pki.ValidateIssuanceMaterial(source, hostRole); issuanceErr != nil {
+			return err
+		}
+		caCert, caKey, issuanceErr := pki.EnsureCA(source, false)
+		if issuanceErr != nil {
+			return fmt.Errorf("issue trust bundle CA: %w", issuanceErr)
+		}
+		for _, role := range pki.RolesForBox(hostRole) {
+			if issuanceErr := pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extraSANs); issuanceErr != nil && !errors.Is(issuanceErr, pki.ErrLeafNotExpiringSoon) {
+				return fmt.Errorf("issue trust bundle leaf %s/%s: %w", role.Directory, role.Filename, issuanceErr)
+			}
+		}
+		if err := pki.ValidateTrustBundle(source, hostRole, extraSANs); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(destination, "ca"), 0o755); err != nil {
+		return err
+	}
+	caCert, _ := pki.CARoot(source)
+	caDest, _ := pki.CARoot(destination)
+	if err := copyTrustFile(caCert, caDest, 0o444); err != nil {
+		return err
+	}
+	for _, role := range pki.RolesForBox(hostRole) {
+		cert, key := pki.LeafPaths(source, role)
+		certDest, keyDest := pki.LeafPaths(destination, role)
+		if err := os.MkdirAll(filepath.Dir(certDest), 0o755); err != nil {
+			return err
+		}
+		if err := copyTrustFile(cert, certDest, 0o444); err != nil {
+			return err
+		}
+		if err := copyTrustFile(key, keyDest, 0o400); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyTrustFile(source, destination string, mode os.FileMode) error {
+	body, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("read trust file %s: %w", source, err)
+	}
+	if err := os.WriteFile(destination, body, mode); err != nil {
+		return fmt.Errorf("write trust file %s: %w", destination, err)
+	}
+	return os.Chmod(destination, mode)
 }
 
 func overrideJoinHostVars(body []byte, opts *deployJoinOptions) []byte {

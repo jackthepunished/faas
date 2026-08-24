@@ -70,7 +70,8 @@ gregalectl deploy join-node --manifest-file /secure/manifest.yaml \
 
 It generates an ephemeral manifest inventory, runs preflight, converges the
 compute role, installs the signed release while drained, applies the manifest,
-and activates the database row only after readiness. The provider-specific
+and lets the controller verify and activate the database row only after
+readiness. The provider-specific
 boundary is only the SSH connection; see
 `docs/runbooks/provider-neutral-node-join.md` for the complete contract.
 

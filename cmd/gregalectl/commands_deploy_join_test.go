@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/pki"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 func splitboxJoinManifest(t *testing.T) string {
@@ -102,6 +103,85 @@ func TestReleaseAssetPath_FindsCanonicalSibling(t *testing.T) {
 	}
 }
 
+func TestCopyTrustBundleNeverCopiesCAKey(t *testing.T) {
+	source := t.TempDir()
+	caCert, caKey, err := pki.EnsureCA(source, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}
+	for _, role := range pki.RolesForBox(roleComputeOnly) {
+		if err := pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extra); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destination := filepath.Join(t.TempDir(), "trust")
+	if err := copyTrustBundle(source, destination, roleComputeOnly, extra); err != nil {
+		t.Fatalf("copyTrustBundle: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "ca", "ca.key")); !os.IsNotExist(err) {
+		t.Fatalf("destination CA key stat = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "ca", "ca.crt")); err != nil {
+		t.Fatalf("destination CA cert: %v", err)
+	}
+}
+
+func TestCopyTrustBundleIssuesMissingEndpointSANLocally(t *testing.T) {
+	source := t.TempDir()
+	caCert, caKey, err := pki.EnsureCA(source, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range pki.RolesForBox(roleComputeOnly) {
+		if err := pki.EnsureLeaf(source, role, caCert, caKey, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destination := filepath.Join(t.TempDir(), "trust")
+	extra := pki.AltNames{DNSNames: []string{"fsn-3.gregale.dev"}}
+	if err := copyTrustBundle(source, destination, roleComputeOnly, extra); err != nil {
+		t.Fatalf("copyTrustBundle: %v", err)
+	}
+	if err := pki.ValidateTrustBundle(destination, roleComputeOnly, extra); err != nil {
+		t.Fatalf("destination trust bundle: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "ca", "ca.key")); !os.IsNotExist(err) {
+		t.Fatalf("destination CA key stat = %v, want not exist", err)
+	}
+}
+
+func TestVerifyAndActivateJoinedNodeUsesControlPlaneRow(t *testing.T) {
+	st := state.NewMemStore()
+	role := roleComputeOnly
+	release := "abcdef"
+	hash := "sha256:" + strings.Repeat("a", 64)
+	row, err := st.UpsertComputeNodeFromOperator(context.Background(), state.ComputeNode{
+		Name:         "fsn-2.faas",
+		TargetURL:    "tcp://fsn-2.gregale.dev:50051",
+		Role:         &role,
+		ReleaseID:    &release,
+		ManifestHash: &hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetComputeNodeActive(context.Background(), row.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	old := computeNodesStoreOpener
+	t.Cleanup(func() { computeNodesStoreOpener = old })
+	computeNodesStoreOpener = func() (state.Store, func(), error) { return st, func() {}, nil }
+	report := &deployJoinReport{DatabaseNode: "fsn-2.faas", ReleaseGitSHA: release}
+	if err := verifyAndActivateJoinedNode(context.Background(), report, hash); err != nil {
+		t.Fatalf("verifyAndActivateJoinedNode: %v", err)
+	}
+	got, err := st.ComputeNodeByName(context.Background(), "fsn-2.faas")
+	if err != nil || !got.Active {
+		t.Fatalf("row after activation = %#v, err=%v", got, err)
+	}
+}
+
 func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 	manifestPath := splitboxJoinManifest(t)
 	repo := t.TempDir()
@@ -142,29 +222,27 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 		}
 	}
 	pkiDir := filepath.Join(artifactDir, "pki")
-	for _, role := range pki.RolesForBox(roleComputeOnly) {
-		cert, key := pki.LeafPaths(pkiDir, role)
-		for _, path := range []string{cert, key} {
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(path, []byte("pki"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	caCert, caKey := pki.CARoot(pkiDir)
-	if err := os.MkdirAll(filepath.Dir(caCert), 0o700); err != nil {
+	caCertObj, caKeyObj, err := pki.EnsureCA(pkiDir, false)
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{caCert, caKey} {
-		if err := os.WriteFile(path, []byte("ca"), 0o600); err != nil {
+	for _, role := range pki.RolesForBox(roleComputeOnly) {
+		if err := pki.EnsureLeafWithSANs(pkiDir, role, caCertObj, caKeyObj, false, pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	_, caKey := pki.CARoot(pkiDir)
+	if err := os.Remove(caKey); err != nil {
+		t.Fatal(err)
+	}
 
 	oldRunner := ansiblePlaybookRunner
-	t.Cleanup(func() { ansiblePlaybookRunner = oldRunner })
+	oldVerifier := joinControlPlaneVerifier
+	t.Cleanup(func() {
+		ansiblePlaybookRunner = oldRunner
+		joinControlPlaneVerifier = oldVerifier
+	})
+	joinControlPlaneVerifier = func(context.Context, *deployJoinReport, string) error { return nil }
 	var calls [][]string
 	ansiblePlaybookRunner = func(_ context.Context, _ string, args []string) error {
 		calls = append(calls, append([]string(nil), args...))

@@ -201,6 +201,44 @@ func TestRenderer_ComputePKIIncludesPrivateEndpointSAN(t *testing.T) {
 	}
 }
 
+func TestRenderer_PKITrustOnlyDoesNotRequireCAKey(t *testing.T) {
+	dir := t.TempDir()
+	path := fixtureManifest(t, "fsn-2", "compute-only")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body),
+		"    - name: fsn-2\n      role: compute-only\n",
+		"    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n", 1))
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := RenderOptions{
+		ManifestPath: path,
+		Host:         "fsn-2",
+		ReleasesRoot: filepath.Join(dir, "releases"),
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	}
+	if err := os.MkdirAll(filepath.Join(opts.ReleasesRoot, "0123456789abcdef0123456789abcdef01234567"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(opts); err != nil {
+		t.Fatalf("initial Render: %v", err)
+	}
+	caKey := filepath.Join(opts.PKIRootDir, "ca", "ca.key")
+	if err := os.Remove(caKey); err != nil {
+		t.Fatal(err)
+	}
+	opts.PKITrustOnly = true
+	if _, err := Render(opts); err != nil {
+		t.Fatalf("trust-only Render: %v", err)
+	}
+}
+
 func TestRenderer_ResolvesSingleBoxHost(t *testing.T) {
 	dir := t.TempDir()
 	path := fixtureManifest(t, "fsn-1", "single-box")

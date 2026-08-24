@@ -52,6 +52,12 @@ type RenderOptions struct {
 	// Empty means no extra SANs beyond the manifest endpoint.
 	HostSANFile string
 
+	// PKITrustOnly validates an existing CA public certificate and the
+	// host's already-issued leaves without issuing anything. This is the
+	// required mode for remote compute-node adoption: the CA private key
+	// stays on the control-plane/operator side.
+	PKITrustOnly bool
+
 	// DryRun short-circuits all filesystem writes. The renderer
 	// still validates the manifest + runs the TOML placement check
 	// + computes the sha256s, but every publish is replaced with
@@ -291,7 +297,12 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// PKI outputs here.
 	var pkiOutputs []OutputReport
 	if !opts.DryRun {
-		leafOutputs, err := renderPKI(opts.PKIRootDir, host.Role, extraSANs)
+		var leafOutputs []PKIOutput
+		if opts.PKITrustOnly {
+			leafOutputs, err = renderPKITrustOnly(opts.PKIRootDir, host.Role, extraSANs)
+		} else {
+			leafOutputs, err = renderPKI(opts.PKIRootDir, host.Role, extraSANs)
+		}
 		if err != nil {
 			return report, err
 		}

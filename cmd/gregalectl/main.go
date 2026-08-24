@@ -53,7 +53,7 @@ Commands:
   backup       Operator rclone / archive credentials (backup init|unseal-archive-creds|unseal-rclone)
   secrets      Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)
   compute-nodes  Compute-node state machine (add|drain|drain-status|activate|force-drain; PR-A / multi-host scale-out)
-  deploy        Provider-neutral node adoption + fleet topology tools (deploy join-node|add-node)
+  deploy        Provider-neutral node adoption + fleet topology tools (deploy join-node|join-fleet|rollback-node|add-node)
   version      Print the CLI version
   completion   Print a shell completion script (bash|zsh|fish|powershell)
   man          Print the gregalectl(1) man page (or gregalectl-<command>(1) with one arg)
