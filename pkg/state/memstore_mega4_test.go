@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"testing"
 	"time"
 
@@ -96,7 +97,7 @@ func TestUpdateAccountPlan_Mega4(t *testing.T) {
 		}
 	}
 
-	if err := m.UpdateAccountPlan(context.Background(), "missing", api.PlanPro); err != ErrNotFound {
+	if err := m.UpdateAccountPlan(context.Background(), "missing", api.PlanPro); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateAccountPlan(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -119,7 +120,7 @@ func TestUpdateAccountStatus_Mega4(t *testing.T) {
 		}
 	}
 
-	if err := m.UpdateAccountStatus(context.Background(), "missing", AccountSuspended); err != ErrNotFound {
+	if err := m.UpdateAccountStatus(context.Background(), "missing", AccountSuspended); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing account: got %v, want ErrNotFound", err)
 	}
 }
@@ -146,11 +147,11 @@ func TestUpdateAccountProviderCustomerID_Mega4(t *testing.T) {
 		t.Errorf("AccountByProviderCustomerID.ID = %q, want acc-1", got.ID)
 	}
 
-	if _, err := m.AccountByProviderCustomerID(context.Background(), "cus_missing"); err != ErrNotFound {
+	if _, err := m.AccountByProviderCustomerID(context.Background(), "cus_missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("AccountByProviderCustomerID(missing): err = %v, want ErrNotFound", err)
 	}
 
-	if err := m.UpdateAccountProviderCustomerID(context.Background(), "missing", "cus_x"); err != ErrNotFound {
+	if err := m.UpdateAccountProviderCustomerID(context.Background(), "missing", "cus_x"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateAccountProviderCustomerID(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -168,7 +169,7 @@ func TestUpdateAccountStripeSubscriptionItem_Mega4(t *testing.T) {
 		t.Errorf("StripeSubscriptionItem = %q, want si_xyz", a.StripeSubscriptionItem)
 	}
 
-	if err := m.UpdateAccountStripeSubscriptionItem(context.Background(), "missing", "si_x"); err != ErrNotFound {
+	if err := m.UpdateAccountStripeSubscriptionItem(context.Background(), "missing", "si_x"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing: got %v, want ErrNotFound", err)
 	}
 }
@@ -243,12 +244,12 @@ func TestGetAPIKey_Mega4(t *testing.T) {
 	}
 
 	// Cross-account: IDOR-safe collapse to ErrNotFound.
-	if _, err := m.GetAPIKey(context.Background(), "acc-other", k.ID); err != ErrNotFound {
+	if _, err := m.GetAPIKey(context.Background(), "acc-other", k.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetAPIKey(cross-account): err = %v, want ErrNotFound", err)
 	}
 
 	// Missing.
-	if _, err := m.GetAPIKey(context.Background(), "acc-1", "missing"); err != ErrNotFound {
+	if _, err := m.GetAPIKey(context.Background(), "acc-1", "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetAPIKey(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -276,7 +277,7 @@ func TestDeleteAPIKeyReturning_Mega4(t *testing.T) {
 	}
 
 	// Re-delete returns ErrNotFound.
-	if _, err := m.DeleteAPIKeyReturning(context.Background(), "acc-1", k.ID); err != ErrNotFound {
+	if _, err := m.DeleteAPIKeyReturning(context.Background(), "acc-1", k.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("re-delete: err = %v, want ErrNotFound", err)
 	}
 }
@@ -304,7 +305,7 @@ func TestMarkAPIKeyRevoked_Mega4(t *testing.T) {
 	}
 
 	// Cross-account IDOR.
-	if _, err := m.MarkAPIKeyRevoked(context.Background(), "acc-other", k.ID); err != ErrNotFound {
+	if _, err := m.MarkAPIKeyRevoked(context.Background(), "acc-other", k.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cross-account revoke: err = %v, want ErrNotFound", err)
 	}
 }
@@ -327,7 +328,7 @@ func TestTouchKeyLastUsed_Mega4(t *testing.T) {
 	}
 
 	// Missing.
-	if err := m.TouchKeyLastUsed(context.Background(), "missing-id"); err != ErrNotFound {
+	if err := m.TouchKeyLastUsed(context.Background(), "missing-id"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing: err = %v, want ErrNotFound", err)
 	}
 }
@@ -397,7 +398,7 @@ func TestSetAndReadMFASecret_Mega4(t *testing.T) {
 	}
 
 	// Missing account.
-	if err := m.SetMFASecret(context.Background(), "missing", secret, nil); err != ErrNotFound {
+	if err := m.SetMFASecret(context.Background(), "missing", secret, nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SetMFASecret(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -408,12 +409,12 @@ func TestReadMFASecret_EmptyAndMissing_Mega4(t *testing.T) {
 	seedAccount(m, "acc-1", api.PlanPro)
 
 	// Never set: ErrNotFound (matches the pg behavior).
-	if _, err := m.ReadMFASecret(context.Background(), "acc-1"); err != ErrNotFound {
+	if _, err := m.ReadMFASecret(context.Background(), "acc-1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ReadMFASecret(never set): err = %v, want ErrNotFound", err)
 	}
 
 	// Missing account: ErrNotFound.
-	if _, err := m.ReadMFASecret(context.Background(), "missing"); err != ErrNotFound {
+	if _, err := m.ReadMFASecret(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ReadMFASecret(missing acct): err = %v, want ErrNotFound", err)
 	}
 }
@@ -456,10 +457,10 @@ func TestMarkMFAEnrolled_AndClearMFA_Mega4(t *testing.T) {
 	}
 
 	// Missing.
-	if err := m.MarkMFAEnrolled(context.Background(), "missing"); err != ErrNotFound {
+	if err := m.MarkMFAEnrolled(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("MarkMFAEnrolled(missing): err = %v, want ErrNotFound", err)
 	}
-	if err := m.ClearMFA(context.Background(), "missing"); err != ErrNotFound {
+	if err := m.ClearMFA(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ClearMFA(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -487,7 +488,7 @@ func TestSetMFARequired_ChangedFlag_Mega4(t *testing.T) {
 		t.Error("SetMFARequired(true→false): changed = false, want true")
 	}
 
-	if _, err := m.SetMFARequired(context.Background(), "missing", true); err != ErrNotFound {
+	if _, err := m.SetMFARequired(context.Background(), "missing", true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SetMFARequired(missing): err = %v, want ErrNotFound", err)
 	}
 }
@@ -557,10 +558,10 @@ func TestConsumeAndMatchRecoveryCode_Mega4(t *testing.T) {
 	}
 
 	// Missing account.
-	if _, _, _, err := m.ConsumeRecoveryCode(context.Background(), "missing", h1); err != ErrNotFound {
+	if _, _, _, err := m.ConsumeRecoveryCode(context.Background(), "missing", h1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Consume(missing): err = %v, want ErrNotFound", err)
 	}
-	if _, _, err := m.MatchRecoveryCode(context.Background(), "missing", h1); err != ErrNotFound {
+	if _, _, err := m.MatchRecoveryCode(context.Background(), "missing", h1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Match(missing): err = %v, want ErrNotFound", err)
 	}
 }
