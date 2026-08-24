@@ -1389,6 +1389,17 @@ func cmdDeployTarball(args []string) int {
 		}
 		PrintOK(osStdout, "Created project %s with %d app(s) and %d cron(s)",
 			apply.ProjectID, len(apply.Apps), len(plan.Crons))
+		// ADR-124 follow-up #1 (post-apply rescue signal). The wire
+		// invariant from cmd/apid/scan_service.go:864 is
+		// `gateRescuedByExclude := !preCanApply && canApply` so this
+		// fires only when the post-exclude apply succeeded but the
+		// pre-exclude gate would have blocked. Extracted into a
+		// helper so unit tests can pin the wire shape without
+		// standing up the full deploy command. The render is
+		// suppressed under --json (the jsonOutput branch returns
+		// above with a byte-shape write; the human-readable note
+		// would otherwise duplicate the JSON for those operators).
+		renderApplyRescue(osStdout, apply)
 		// Per-workload build lines (PR-A, repo decomposition Phase 5
 		// close-the-loop). The apply path enqueued one (deployment,
 		// build) per added/changed workload; surface them so the
@@ -3490,6 +3501,30 @@ func cmdUsageStorage(args []string) int {
 //
 // The summary is suppressed when no findings fired, so a clean deploy
 // prints nothing from this function.
+
+// renderApplyRescue writes the ADR-124 follow-up #1 post-apply
+// rescue signal to w. Fires only when apply.GateRescuedByExclude is
+// true; the wire invariant from cmd/apid/scan_service.go:864 is
+// `gateRescuedByExclude := !preCanApply && canApply`, so the helper
+// reaches the writer only when the post-exclude apply succeeded but
+// the pre-exclude gate would have blocked. Reasons come from the
+// wire verbatim; an empty reasons slice still renders the header so
+// the operator sees the rescue signal even when the server omitted
+// the per-reason detail. Extracted from cmdDeployTarball so unit
+// tests can pin the wire shape without standing up the full deploy
+// command (auth + scan + confirmation prompt + apply).
+func renderApplyRescue(w io.Writer, apply api.ApplyResponse) {
+	if !apply.GateRescuedByExclude {
+		return
+	}
+	if len(apply.CanApplyReasons) == 0 {
+		fmt.Fprintf(w, "  Note: gate was rescued by --exclude (pre-exclude would have blocked).\n")
+		return
+	}
+	fmt.Fprintf(w, "  Note: gate was rescued by --exclude (pre-exclude would have blocked); reasons: %s\n",
+		strings.Join(apply.CanApplyReasons, "; "))
+}
+
 func renderSecretScanWarnings(findings []secretscan.Finding, w io.Writer) {
 	if len(findings) == 0 {
 		return
