@@ -78,11 +78,6 @@ import (
 // compute_nodes.schedd_target_url, not from this var).
 var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 
-// defaultLocalScheddTarget is the target written by migration 00090 for the
-// synthetic single-box node. Keep it here as the comparison value for the
-// legacy FAAS_SCHEDD_SOCKET compatibility path in scheddrouter.go.
-const defaultLocalScheddTarget = "unix:///run/faas/schedd.sock"
-
 // gatewaydInternalSocket is the unix-domain socket schedd dials to
 // fire synthetic cron requests through gatewayd (spec §4.4, M7).
 // Mode 0660 group `faas` (ADR-015); only schedd can dial. Overridable
@@ -818,7 +813,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
 		deps.hostKeyDir = filepath.Dir(hp)
 	}
-	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log, scheddSocket)
+	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
 	// the consumers that don't currently fan-in (warm hints, log
@@ -933,18 +928,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// changes that flip the posture are out of scope (an operator
 	// adding a second box restarts gatewayd alongside schedd).
 	if nodes, err := pgStore.ActiveComputeNodes(ctx); err == nil {
-		multiBox := false
-		for _, n := range nodes {
-			if n.Name != "default-local" {
-				multiBox = true
-				break
-			}
-		}
-		backend.WithLegacySingleBox(!multiBox)
-		log.Info("gatewayd: schedd posture", "legacy_single_box", !multiBox, "active_nodes", len(nodes))
+		log.Info("gatewayd: schedd posture", "active_nodes", len(nodes))
+		// Multi-host safety cluster PR-7 (audit F5): the legacy
+		// single-box fallback is REMOVED. The backend always uses
+		// the per-node schedd router; the resolveSched fallback
+		// path is dead code. We keep the ActiveComputeNodes probe
+		// so the boot log still surfaces the fleet posture, but
+		// no longer use it to toggle any per-instance gate.
 	} else {
-		log.Warn("gatewayd: schedd posture probe failed; defaulting to legacy single-box fallback", "err", err)
-		backend.WithLegacySingleBox(true)
+		log.Warn("gatewayd: schedd posture probe failed; legacy fallback no longer exists", "err", err)
 	}
 
 	// Keep the routing + target caches fresh from apid/schedd's pg_notify
@@ -1342,25 +1334,68 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 		}
 	}
-	// ADR-119 — load FAAS_INTERNAL_SVC_PUBKEYS (JSON document
-	// mapping svcName → PEM-encoded Ed25519 public key). The
-	// env is read once at boot; runtime rotation is a
-	// follow-up (ADR-120 candidate — see plan). nil = no
-	// apps in internal_only mode should be reachable, and
-	// the gate 500s loudly rather than fail-open. Production
-	// wires schedd at minimum; meterd / future daemons add
-	// keys to the same JSON map.
-	if rawPubkeys, ok := os.LookupEnv("FAAS_INTERNAL_SVC_PUBKEYS"); ok && rawPubkeys != "" {
-		var perSvc map[string]string
-		if err := json.Unmarshal([]byte(rawPubkeys), &perSvc); err != nil {
-			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is not valid JSON; internal_only mode will 500 until corrected",
-				"err", err.Error())
-		} else if len(perSvc) == 0 {
-			log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is empty; internal_only mode will 500 until corrected")
-		} else {
-			deps.internalSvcVerifier = newInternalSvcVerifierFromPEMs(perSvc)
-			log.Info("gatewayd-internal: internal_only verifier loaded",
-				"svc_count", len(perSvc))
+	// PR-3 / ADR-125 fleet-wide signing key: try the
+	// cluster_signing_keys PG row FIRST so a JWT minted by
+	// schedd on box A is verifiable by gatewayd-internal on
+	// box B (audit F1+F20). The per-env path below is the
+	// fallback for the operator-migration window (single-box
+	// dev + legacy installs without `hostage-gen cluster-init`).
+	rotatingVerifier := &rotatingVerifier{}
+	clusterVerifier, clusterErr := loadClusterInternalSvcVerifier(ctx, pgStore)
+	switch {
+	case clusterErr == nil:
+		if initErr := rotatingVerifier.initial(clusterVerifier); initErr != nil {
+			return fmt.Errorf("gatewayd-internal: prime rotating verifier with cluster key: %w", initErr)
+		}
+		deps.internalSvcVerifier = rotatingVerifier
+		log.Info("gatewayd-internal: internal_only verifier loaded (cluster_signing_keys)",
+			"source", "cluster_signing_keys")
+		// Subscribe to rotations so a cluster-init refresh lands
+		// without daemon restart. Best-effort — if subscribe
+		// fails the boot-time key keeps working.
+		if subErr := SubscribeClusterVerifierChanges(ctx, pool, pgStore, rotatingVerifier, log); subErr != nil {
+			log.Warn("gatewayd-internal: cluster verifier rotation subscribe failed; verifier frozen at boot key",
+				"err", subErr.Error())
+		}
+	case errors.Is(clusterErr, ErrClusterVerifierUnavailable):
+		log.Info("gatewayd-internal: cluster_signing_keys row missing; falling back to FAAS_INTERNAL_SVC_PUBKEYS env path")
+	default:
+		// Hard error — DB unreachable, parse error on
+		// public_key_pem. Fall back to env path; log loudly so
+		// the operator can investigate. We do NOT fail boot —
+		// the env fallback is the operator-migration path and
+		// must keep the box reachable.
+		log.Warn("gatewayd-internal: cluster verifier load failed; falling back to FAAS_INTERNAL_SVC_PUBKEYS env path",
+			"err", clusterErr.Error())
+	}
+
+	// ADR-119 — env-path fallback: load FAAS_INTERNAL_SVC_PUBKEYS
+	// (JSON document mapping svcName → PEM-encoded Ed25519 public
+	// key). Read once at boot; runtime rotation is a follow-up
+	// (ADR-120 candidate — see plan). nil = no apps in
+	// internal_only mode should be reachable, and the gate 500s
+	// loudly rather than fail-open. Production wires schedd at
+	// minimum; meterd / future daemons add keys to the same JSON
+	// map.
+	//
+	// PR-3 / ADR-125 — this path runs ONLY when the cluster path
+	// above returned ErrClusterVerifierUnavailable or a hard
+	// error. In the cluster-OK case deps.internalSvcVerifier is
+	// already the rotatingVerifier backed by cluster_signing_keys.
+	if deps.internalSvcVerifier == nil {
+		if rawPubkeys, ok := os.LookupEnv("FAAS_INTERNAL_SVC_PUBKEYS"); ok && rawPubkeys != "" {
+			var perSvc map[string]string
+			if err := json.Unmarshal([]byte(rawPubkeys), &perSvc); err != nil {
+				log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is not valid JSON; internal_only mode will 500 until corrected",
+					"err", err.Error())
+			} else if len(perSvc) == 0 {
+				log.Warn("gatewayd-internal: FAAS_INTERNAL_SVC_PUBKEYS is empty; internal_only mode will 500 until corrected")
+			} else {
+				deps.internalSvcVerifier = newInternalSvcVerifierFromPEMs(perSvc)
+				log.Info("gatewayd-internal: internal_only verifier loaded (env)",
+					"svc_count", len(perSvc),
+					"source", "FAAS_INTERNAL_SVC_PUBKEYS")
+			}
 		}
 	}
 	// The scheddClient reference is needed by AppLogsHandler (PR-2).
