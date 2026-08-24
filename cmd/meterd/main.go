@@ -957,8 +957,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// apid_tenant_surface_cert_expiry_seconds
 	// (alert preset cert_expiring_14d); AccountSpendAggregatorLoop
 	// feeds meterd_account_spend_eur (alert preset spend_eur_20).
-	// Both free-function goroutines share the loop ctx so the
-	// daemon's drain cancels them in one go.
+	// PR-B adds APIReachabilitySweepLoop (alert preset api_down,
+	// meterd_api_reachable gauge) and DeploymentFailureSweepLoop
+	// (alert preset deploy_failed, apid_deployment_failed_total
+	// delta counter). All four free-function goroutines share the
+	// loop ctx so the daemon's drain cancels them in one go.
 	go CertExpiryRefresherLoop(ctx, CertExpiryRefresherParams{
 		Store:    store,
 		Log:      log,
@@ -970,6 +973,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		Log:      log,
 		Ops:      ops,
 		Interval: mc.AccountSpendAggregatorInterval,
+	})
+	go APIReachabilitySweepLoop(ctx, APIReachabilitySweepParams{
+		Store:    store,
+		Log:      log,
+		Ops:      ops,
+		Interval: mc.APIReachabilitySweepInterval,
+	})
+	go DeploymentFailureSweepLoop(ctx, DeploymentFailureSweepParams{
+		Store:    store,
+		Log:      log,
+		Ops:      ops,
+		Interval: mc.DeploymentFailureSweepInterval,
 	})
 
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
