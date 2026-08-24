@@ -216,6 +216,14 @@ func Daemon(name string, fn RunFunc) {
 	// a different value mid-process (rare, but cheap to handle).
 	defaultOps.SetDaemonBuildInfo(name, Version, GitSHA, BuildTime)
 
+	// Issue #586 / ADR-129: stamp the platform-wide release
+	// identifier gauge (faas_deploy_version{version}). Same
+	// rationale as SetDaemonBuildInfo — constructor pre-instantiates
+	// the row at (Version), this re-stamp is idempotent. The
+	// "Releases fleet-wide" stat panel reads this gauge to detect
+	// partial rollouts (a fleet with 2 versions visible is mid-rollout).
+	defaultOps.SetDeployVersion(Version)
+
 	// Issue #586 / ADR-129: 1-second uptime goroutine. Updates
 	// daemon_uptime_seconds{daemon} every 1s until ctx.Done().
 	// Cheap — one Prometheus gauge Set per tick per daemon, no

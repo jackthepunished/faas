@@ -192,6 +192,20 @@ type OpsMetrics struct {
 	// dashboard's "Fleet readiness" panel surfaces a zero row
 	// from boot. MarkReady(id) flips to 1.
 	daemonReady *prometheus.GaugeVec
+	// faasDeployVersion (issue #586 / ADR-129 / cluster C commit 11)
+	// is the per-version gauge that exposes the platform's
+	// current release identifier. Single-version by design —
+	// every daemon in a single release reports the same value,
+	// so the cartesian has at most N rows for the last N
+	// releases (operators compare across versions during a
+	// rolling deploy). The label is `version` (mirrors
+	// daemonBuildInfo's convention); the gauge value is always
+	// 1 and the label carries the signal. Pre-instantiated at
+	// boot from the current wire.Version so /metrics surfaces
+	// the release from process start without a SetDeployVersion
+	// call. SetDeployVersion(v) re-stamps on version change
+	// (rolling deploy, hot-reload).
+	faasDeployVersion *prometheus.GaugeVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -1553,6 +1567,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		daemonUptimeSeconds.WithLabelValues(daemon).Set(0)
 		daemonReady.WithLabelValues(daemon).Set(0)
 	}
+	// faasDeployVersion (issue #586 / ADR-129 / cluster C commit 11)
+	// is the platform-wide release identifier. Single label, `version`,
+	// so cardinality is bounded by the number of releases currently
+	// emitting metrics (one row per distinct version seen, well under
+	// the Prometheus tens-of-thousands guideline). Pre-instantiated at
+	// boot from wire.Version so /metrics surfaces the current release
+	// from process start without any SetDeployVersion call; SetDeployVersion
+	// re-stamps on version change (rolling deploy, hot-reload).
+	faasDeployVersion := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_faas_deploy_version",
+		Help: "Always-1 gauge that exposes the platform's current release identifier (issue #586 / ADR-129), labelled by version. One row per distinct version seen across the fleet — the gauge value is meaningless; the label carries the signal. Pre-instantiated at boot from wire.Version. Operator dashboards query this metric for the 'Releases fleet-wide' stat panel and to detect partial rollouts (a cluster with 2 versions visible is mid-rollout).",
+	}, []string{"version"})
+	faasDeployVersion.WithLabelValues(Version).Set(1)
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -2480,7 +2507,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3277,6 +3304,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		daemonBuildInfo:                      daemonBuildInfo,
 		daemonUptimeSeconds:                  daemonUptimeSeconds,
 		daemonReady:                          daemonReady,
+		faasDeployVersion:                    faasDeployVersion,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
@@ -3571,6 +3599,24 @@ func (m *OpsMetrics) MarkReady(daemon string) {
 		daemon = "other"
 	}
 	m.daemonReady.WithLabelValues(daemon).Set(1)
+}
+
+// SetDeployVersion (issue #586 / ADR-129) stamps the platform-wide
+// release identifier gauge. Called once by wire.Daemon() at boot from
+// wire.Version; the constructor pre-instantiates the row at the same
+// value, so this Set is idempotent and covers the edge case where
+// ldflags inject a different value mid-process (rolling deploy, hot
+// reload of a sidecar). The label is `version` — free-form text
+// matching wire.Version verbatim (typically "v1.2.3-<sha>"). nil-receiver
+// guard mirrors MarkReady.
+func (m *OpsMetrics) SetDeployVersion(version string) {
+	if m == nil {
+		return
+	}
+	if version == "" {
+		version = Version
+	}
+	m.faasDeployVersion.WithLabelValues(version).Set(1)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier

@@ -1589,6 +1589,50 @@ func TestDaemon_BuildInfo_Uptime_Ready(t *testing.T) {
 	}
 }
 
+// TestFaasDeployVersion_PreInstantiatedAndSetAccessor (issue #586
+// / ADR-129 / cluster C commit 11) pins the platform-wide release
+// identifier gauge:
+//
+//   - faas_deploy_version{version} — pre-instantiated at boot from
+//     wire.Version, value=1. SetDeployVersion("v2.0.0") re-stamps
+//     to the new version (rolling deploy, hot reload of a sidecar).
+//
+// The test verifies the constructor pre-instantiates a single row
+// at the current wire.Version, and SetDeployVersion stamps a fresh
+// version row alongside (or replaces — Prometheus's WithLabelValues
+// caches on first call, so a second call to the same label is
+// idempotent).
+func TestFaasDeployVersion_PreInstantiatedAndSetAccessor(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	want := fmt.Sprintf(`vmmd_faas_deploy_version{version=%q} 1`, wire.Version)
+	if !strings.Contains(body, want) {
+		t.Errorf("missing pre-instantiated faas_deploy_version row %q in:\n%s", want, body)
+	}
+	// SetDeployVersion on the same version is idempotent.
+	m.SetDeployVersion(wire.Version)
+	body = render(t, m)
+	if !strings.Contains(body, want) {
+		t.Errorf("idempotent SetDeployVersion dropped the row; got:\n%s", body)
+	}
+	// SetDeployVersion on a NEW version surfaces a fresh row.
+	m.SetDeployVersion("v2.0.0-test")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_faas_deploy_version{version="v2.0.0-test"} 1`) {
+		t.Errorf("SetDeployVersion did not surface new version row; got:\n%s", body)
+	}
+	// nil-receiver guard mirrors MarkReady.
+	var nilm *wire.OpsMetrics
+	nilm.SetDeployVersion("v2.0.0-test") // must not panic
+	// Empty version falls back to wire.Version (defensive default).
+	m2 := wire.NewOpsMetrics("apid")
+	m2.SetDeployVersion("")
+	body2 := render(t, m2)
+	if !strings.Contains(body2, fmt.Sprintf(`apid_faas_deploy_version{version=%q} 1`, wire.Version)) {
+		t.Errorf("empty version did not fall back to wire.Version; got:\n%s", body2)
+	}
+}
+
 // TestOpsMetrics_WakeLatencyNilSafe (issue #1059 / ADR-127) — the
 // accessor must be no-op on a nil receiver so vmmd / schedd unit
 // tests without metrics keep working (same nil-safe posture as
