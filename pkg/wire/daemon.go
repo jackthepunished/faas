@@ -235,19 +235,27 @@ func Daemon(name string, fn RunFunc) {
 	go recordUptime(ctx, name, startedAt)
 
 	log.Info("starting", "config", *configPath, "restart_count", SystemdRestartCount(), "git_sha", GitSHA, "build_time", BuildTime)
+	// Issue #586 / ADR-129 (review-fix PR #1082 #1): flip
+	// daemon_ready{daemon} to 1 BEFORE the run function blocks so
+	// the §12 "Fleet readiness" panel reflects the serving
+	// window — not the shutdown moment. The earlier ordering
+	// (MarkReady AFTER fn returns) inverted the semantic: a daemon
+	// that runs forever only flips the gauge to 1 once per
+	// process, during shutdown, after which the process disappears
+	// from the scrape. Every dashboard row rendered the wrong
+	// value the entire time it mattered. Now: ready fires
+	// synchronously at boot, fn() opens listeners + serves, and
+	// the gauge stays at 1 for the entire serving lifetime.
+	// Until /readyz lands (issue #571), "the run function being
+	// invoked" is the proxy for "ready to serve". DefaultOps is
+	// nil-safe so a daemon that never registered its OpsMetrics
+	// doesn't panic.
+	defaultOps.MarkReady(name)
+	log.Info("ready", "daemon", name, "version", Version, "ready", true)
 	if err := fn(ctx, log); err != nil {
 		log.Error("exited with error", "err", err)
 		os.Exit(1)
 	}
-	// Issue #586 / ADR-129: flip daemon_ready{daemon} to 1 once
-	// the run function returns successfully (i.e. the daemon
-	// reached its steady-state path). Until /readyz lands
-	// (issue #571), the run function returning IS the readiness
-	// barrier — a daemon that's serving traffic has called this
-	// line. DefaultOps.MarkReady is nil-safe, so a daemon that
-	// never registered its OpsMetrics doesn't panic.
-	defaultOps.MarkReady(name)
-	log.Info("ready", "daemon", name, "version", Version, "ready", true)
 	log.Info("shutdown complete")
 }
 

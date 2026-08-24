@@ -2150,7 +2150,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 		// the guard skips the metric increment in unit tests
 		// that don't wire an OpsMetrics.
 		if e.ops != nil {
-			e.ops.WakeFailure("local", bootInput.appID, "vmm_boot_failed").Inc()
+			e.ops.WakeFailure("", bootInput.appID, "vmm_boot_failed").Inc()
 		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "vmm_boot_failed")
 		return WakeResult{}, err
@@ -2232,7 +2232,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 		// engine.go:139 — the guard skips the metric increment
 		// in unit tests that don't wire an OpsMetrics.
 		if e.ops != nil {
-			e.ops.WakeFailure("local", bootInput.appID, "record_runtime_failed").Inc()
+			e.ops.WakeFailure("", bootInput.appID, "record_runtime_failed").Inc()
 		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)

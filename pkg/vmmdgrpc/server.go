@@ -351,7 +351,7 @@ func (s *Server) incWakeFailure(_ context.Context, reason string) {
 	if s == nil || s.ops == nil {
 		return
 	}
-	s.ops.WakeFailure("local", "", reason).Inc()
+	s.ops.WakeFailure("", "", reason).Inc()
 }
 
 // Register binds s to a gRPC server.
