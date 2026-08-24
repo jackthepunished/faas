@@ -1,0 +1,102 @@
+# Prometheus alert rules — bridge wire-protocol framing (ADR-127 §D3, G19).
+#
+# Companion to deploy/ansible/roles/prometheus/files/faas.rules.yml
+# (spec §12 SLO thresholds) and pg_backup.rules.yml (off-host
+# Postgres backup). This file holds the bridge-protection alerts
+# (FaasBridgeFramingMismatch + FaasBridgeRollbackStuck); splitting
+# them out lets a future ADR-126 follow-on add per-app framing
+# alerts without cross-editing the canonical rules file.
+#
+# Severity convention: matches faas.rules.yml header (info / warn /
+# page).
+#   - FaasBridgeFramingMismatch: `warn` — sustained mismatch rate
+#     > 0.1 rps for >1h. Operator may have left the surgical
+#     rollback running longer than intended, OR the H2C-capable
+#     base image regressed. Pages on-call but with grace window so
+#     a planned rollback doesn't fire.
+#   - FaasBridgeRollbackStuck: `page` — bridge_protocol=h1 traffic
+#     on http2/grpc apps for >4h. Same shape as the warn alert but
+#     tightened to surface the case where the operator forgot to
+#     flip the env back. Customer-visible (h2/grpc customers are
+#     riding the legacy framing which works but is suboptimal).
+#
+# Runbook: docs/ops/h2c-rollback.md.
+
+groups:
+  - name: faas.bridge
+    rules:
+      - alert: FaasBridgeFramingMismatch
+        # `vmmd_bridge_framing_total{framing="mismatch"}` is the
+        # per-(app_protocol, bridge_protocol) counter emitted by
+        # cmd/vmmd-stream-bridge::newHandler when the operator's
+        # FAAS_BRIDGE_PROTOCOL env value disagrees with the
+        # app's app_protocol setting (ADR-127 §D3 Layer 7). A
+        # non-zero rate means the bridge is serving an app in a
+        # framing the app did not opt into — typically because an
+        # operator forced FAAS_BRIDGE_PROTOCOL=h1 for a surgical
+        # rollback. The 1h grace window keeps a deliberate
+        # rollback from paging on-call.
+        expr: |
+          sum by (app_protocol, bridge_protocol) (
+            rate(vmmd_bridge_framing_total{framing="mismatch"}[5m])
+          ) > 0.1
+        for: 1h
+        labels:
+          severity: warn
+          component: vmmd
+        annotations:
+          summary: "Sustained bridge framing mismatch — surgical rollback in progress or H2C base image regressed"
+          description: |
+            The vmmd-stream-bridge is serving inbound requests with
+            bridge_protocol={{ $labels.bridge_protocol }} on apps
+            whose app_protocol={{ $labels.app_protocol }}. Mismatch
+            rate is {{ $value | humanize }} rps sustained for >1h.
+
+            Likely causes:
+              1. Operator-initiated surgical rollback
+                 (FAAS_BRIDGE_PROTOCOL=h1 on vmmd to roll a
+                 problem app back to H1+chunked).
+              2. H2C base image regression — apps staying on
+                 app_protocol=http2/grpc are getting H1+chunked
+                 unintentionally.
+
+            Investigation steps:
+              - `journalctl -u vmmd | grep "framing selected"` on
+                each vmmd host — should show framing=h1 lines.
+              - If intentional: leave the rollback running; this
+                alert is the operator's reminder.
+              - If unintentional: revert the FAAS_BRIDGE_PROTOCOL
+                env override per docs/ops/h2c-rollback.md "Switch
+                1" (revert to unset).
+
+            Runbook: docs/ops/h2c-rollback.md
+
+      - alert: FaasBridgeRollbackStuck
+        # Same surface as FaasBridgeFramingMismatch but tightened
+        # to 4h and paged. Catches the "operator forgot to flip
+        # the env back" case where the surgical rollback has
+        # been left running past the intended window.
+        expr: |
+          sum by (app_protocol, bridge_protocol) (
+            rate(vmmd_bridge_framing_total{framing="mismatch"}[5m])
+          ) > 0.1
+        for: 4h
+        labels:
+          severity: page
+          component: vmmd
+        annotations:
+          summary: "Surgical rollback running for >4h — operator likely forgot to flip FAAS_BRIDGE_PROTOCOL back"
+          description: |
+            The vmmd-stream-bridge has been serving
+            bridge_protocol={{ $labels.bridge_protocol }} on
+            app_protocol={{ $labels.app_protocol }} apps for >4h.
+
+            This is a tightened version of
+            FaasBridgeFramingMismatch — if you're seeing both
+            alerts, the rollback has been running past the
+            intended window. Confirm intent (was the rollback
+            meant to be permanent?) and either revert the env
+            override or update the runbook to document the
+            long-running rollback.
+
+            Runbook: docs/ops/h2c-rollback.md

@@ -1484,7 +1484,11 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, "POST", "http://unix"+reqInit.GetRequestUri(), bodyPr)
+	method := reqInit.GetMethod()
+	if method == "" {
+		method = "POST"
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, method, "http://unix"+reqInit.GetRequestUri(), bodyPr)
 	if err != nil {
 		return status.Errorf(codes.Internal, "build H2C request: %v", err)
 	}
@@ -1545,6 +1549,14 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// 8. Mirror guest response headers into the gRPC init frame.
 	initHeaders := make([]*vmmdpb.Header, 0, len(httpResp.Header))
 	for k, vs := range httpResp.Header {
+		// Bridge-side control-plane header (ADR-127 §D3 Layer 7).
+		// The bridge frames its own framing decision here so vmmd
+		// can compute match/mismatch for vmmd_bridge_framing_total.
+		// Stripped from the gRPC init frame — this is a vmmd↔bridge
+		// signal, not a guest response header.
+		if strings.EqualFold(k, "X-Faas-Bridge-Framing") {
+			continue
+		}
 		if strings.EqualFold(k, "Transfer-Encoding") {
 			continue
 		}
@@ -1555,6 +1567,34 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		for _, v := range vs {
 			initHeaders = append(initHeaders, &vmmdpb.Header{Name: k, Value: v})
 		}
+	}
+
+	// 8a. Bridge framing telemetry (ADR-127 §D3 Layer 7). The
+	// bridge writes X-Faas-Bridge-Framing into the response head
+	// (cmd/vmmd-stream-bridge/main.go::newHandler); we read it here
+	// to increment vmmd_bridge_framing_total with the closed
+	// cross-product (app_protocol, bridge_protocol, framing) where
+	// framing ∈ {match, mismatch}. mismatch means
+	// bridge_protocol ≠ appProtocolToBridgeProtocol(app_protocol) —
+	// the operator-forced surgical-rollback signal. This is the
+	// only producer of the counter on the vmmd side; the bridge is
+	// a stand-alone process that doesn't import pkg/wire (counter
+	// lifecycle is owned by vmmd's NewOpsMetrics at boot, commit 9
+	// of PR #1051). Falls back to "unknown" / "h1" if the header
+	// is absent — the guard is defence-in-depth against a bridge
+	// regression that drops the header.
+	appProtocol := reqInit.GetAppProtocol()
+	bridgeProtocol := httpResp.Header.Get("X-Faas-Bridge-Framing")
+	if bridgeProtocol == "" {
+		bridgeProtocol = "unknown"
+	}
+	expected := appProtocolToBridgeProtocol(appProtocol)
+	framingLabel := "match"
+	if bridgeProtocol != expected {
+		framingLabel = "mismatch"
+	}
+	if s.ops != nil {
+		s.ops.BridgeFramingTotal(appProtocol, bridgeProtocol, framingLabel).Inc()
 	}
 	// 8b. Trailers (ADR-126 / G19). For the H1+chunked bridge path
 	// (app_protocol=http1), the guest's H1 `Trailer:` headers arrive
@@ -1888,6 +1928,16 @@ func newStreamBridgeH2CTransport(sockPath string) *http2.Transport {
 		IdleConnTimeout: 5 * time.Minute,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
+		// ADR-127 §D2 (Layer 9) — outbound H2C client transport
+		// pins. Mirrors the same pins on the other two H2C
+		// transports (newGuestH2CTransport in
+		// cmd/vmmd-stream-bridge/h2c_terminator.go and
+		// newInternalProxyH2CTransport in
+		// pkg/gateway/internal_proxy.go). See those sites for
+		// per-field rationale.
+		MaxReadFrameSize:           1 << 20, // 1 MiB
+		MaxHeaderListSize:          1 << 20, // 1 MiB
+		StrictMaxConcurrentStreams: true,
 	}
 }
 

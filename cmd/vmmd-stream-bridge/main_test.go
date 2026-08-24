@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func TestParseDeadline_DurationString(t *testing.T) {
@@ -591,3 +595,190 @@ func firstDiff(a, b []byte) int {
 
 // silence unused import warnings if helpers get pruned.
 var _ = httptest.NewServer
+
+// TestMain_ServerHardeners (ADR-127 §D2, Layer 9) pins the
+// listener-level hardeners on the stdlib http.Server that the
+// bridge uses. The bridge binary is a stand-alone process spawned
+// per instance by vmmd; the listener config is set once in
+// buildServer() and never mutated. Verifying the pins here keeps
+// a future refactor from accidentally dropping one of them.
+//
+// The test calls buildServer() (not main()) so the assertions
+// always reflect what main() actually configures — a previous
+// version of this test replicated the srv literal and fell out
+// of sync with main() when the review-fix commits R2/R3 dropped
+// ReadTimeout (stdlib defaults to 0) and WriteByteTimeout
+// (http2.Server default 0 = unbounded). The test seam is the
+// buildServer() helper; do not duplicate the construction inline.
+//
+// The bridge wraps the per-request handler with
+// h2c.NewHandler(handler, &http2.Server{...}) — we cannot reach
+// inside the wrapper to verify the inner http2.Server fields
+// without an H2C roundtrip, so this test pins the stdlib-side
+// fields (which are public on *http.Server). See
+// TestNewGuestH2CTransport_SecurityPins for the client-side
+// transport pins.
+//
+// Pinned values (must match the h2cMax* const block in
+// h2c_terminator.go so the symmetry contract holds):
+//   - MaxHeaderBytes     = 1 MiB (api.DefaultMaxHeaderBytes)
+//   - IdleTimeout        = 120s
+//   - ReadTimeout        = 0   (UNSET — stdlib default; was 30s in PR #1050)
+//   - ReadHeaderTimeout  = 10s
+//   - WriteTimeout       = 0   (UNSET — streaming; was 0 in PR #1050)
+func TestMain_ServerHardeners(t *testing.T) {
+	// buildServer() is the test seam. Calling it pins main()'s
+	// actual srv literal — see the package docstring for
+	// buildServer() at main.go for the canonical pin rationale.
+	srv := buildServer("10.0.0.2", 8080, time.Now().Add(time.Minute))
+
+	if srv.MaxHeaderBytes != api.DefaultMaxHeaderBytes {
+		t.Errorf("srv.MaxHeaderBytes = %d, want %d (1 MiB per ADR-127 §D2)",
+			srv.MaxHeaderBytes, api.DefaultMaxHeaderBytes)
+	}
+	if srv.MaxHeaderBytes != 1<<20 {
+		t.Errorf("srv.MaxHeaderBytes = %d, want %d (1 MiB per ADR-127 §D2 — symmetry with h2cMaxHeaderListSize)",
+			srv.MaxHeaderBytes, 1<<20)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Errorf("srv.IdleTimeout = %v, want 120s (caps per-conn idle lifetime)", srv.IdleTimeout)
+	}
+	// ReadTimeout is intentionally UNSET (PR #1051 review-fix R2).
+	// stdlib's ReadTimeout caps the ENTIRE request lifetime; the
+	// bridge supports streaming uploads (Hobby+ plans: 100 MB)
+	// so a 30s cap would regress them. ReadHeaderTimeout below
+	// is the Slowloris defense.
+	if srv.ReadTimeout != 0 {
+		t.Errorf("srv.ReadTimeout = %v, want 0 (UNSET — was 30s pre-review-fix; stdlib default 0 permits streaming uploads)", srv.ReadTimeout)
+	}
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("srv.ReadHeaderTimeout = %v, want 10s (H2C preface budget)", srv.ReadHeaderTimeout)
+	}
+	if srv.WriteTimeout != 0 {
+		t.Errorf("srv.WriteTimeout = %v, want 0 (streaming SSE/long-poll requires no write deadline)", srv.WriteTimeout)
+	}
+}
+
+// TestNewHandler_FramingSlog (ADR-127 §D3, Layer 7) pins the
+// per-request framing-selection slog line at Info level. The
+// test swaps slog's default JSON handler for a bytes.Buffer
+// capture, dispatches a synthetic request to newHandler, and
+// asserts the buffer contains a single line with the expected
+// framing + method + path fields.
+//
+// Why Info (not Debug): the framing selection IS the operator's
+// primary rollback signal (docs/ops/h2c-rollback.md references
+// this log line in the surgical-rollback steps). An operator
+// running `journalctl -u vmmd | grep framing selected` while
+// reacting to the FaasBridgeFramingMismatch alert needs the
+// line to surface in journald's default level (info).
+func TestNewHandler_FramingSlog(t *testing.T) {
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
+		// LevelDebug: the framing-selection slog line was demoted from
+		// Info to Debug in the review-fix commit (R3 — Scale-plan
+		// per-request Info flood). The test asserts the line is
+		// emitted at the right level, so the handler must accept
+		// Debug entries.
+		Level: slog.LevelDebug,
+	})))
+	defer func() { slog.SetDefault(origLogger) }()
+
+	// Force the h2c framing path so the test asserts the h2c
+	// branch of the slog line. The h1 branch is symmetrical
+	// (same fields, different framing value) and not worth a
+	// second test.
+	t.Setenv("FAAS_BRIDGE_PROTOCOL", "h2c")
+
+	// newHandler captures the framing + writes the slog line
+	// before dispatching. The dispatch would normally hit
+	// handleH2CStream which dials the guest — to keep the
+	// test deterministic, we run the handler against a closed
+	// TCP port (the dial fails, the handler returns, but the
+	// slog line has already been written).
+	h := newHandler("127.0.0.1", 1, time.Now().Add(time.Minute))
+	req := httptest.NewRequest("GET", "/foo?bar=1", nil)
+	rw := &httptest.ResponseRecorder{}
+	h.ServeHTTP(rw, req)
+
+	// Parse the JSON log line + assert the framing-related
+	// fields. slog emits one line per call; buf should have
+	// exactly one.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly one slog line, got %d (buf = %q)", len(lines), buf.String())
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("parse slog JSON: %v (line = %q)", err, lines[0])
+	}
+	if msg, _ := rec["msg"].(string); msg != "vmmd-stream-bridge: framing selected" {
+		t.Errorf("msg = %q, want %q", msg, "vmmd-stream-bridge: framing selected")
+	}
+	if framing, _ := rec["framing"].(string); framing != "h2c" {
+		t.Errorf("framing = %q, want %q (FAAS_BRIDGE_PROTOCOL=h2c dispatch)", framing, "h2c")
+	}
+	if method, _ := rec["method"].(string); method != "GET" {
+		t.Errorf("method = %q, want %q", method, "GET")
+	}
+	if path, _ := rec["path"].(string); path != "/foo" {
+		t.Errorf("path = %q, want %q (raw request path, no querystring)", path, "/foo")
+	}
+	if appProtoEnv, _ := rec["app_protocol_env"].(string); appProtoEnv != "h2c" {
+		t.Errorf("app_protocol_env = %q, want %q", appProtoEnv, "h2c")
+	}
+	if guest, _ := rec["guest"].(string); guest != "127.0.0.1:1" {
+		t.Errorf("guest = %q, want %q", guest, "127.0.0.1:1")
+	}
+}
+
+// TestNewHandler_BridgeFramingHeader (ADR-127 §D3, Layer 7) pins
+// the X-Faas-Bridge-Framing response header that vmmd's
+// forwardHTTPStreamV2 reads to increment
+// vmmd_bridge_framing_total. The header is set BEFORE dispatch so
+// both handleH1Stream's http.Error BadGateway path and
+// handleH2CStream's http.Error BadGateway path inherit it
+// (stdlib commits w.Header() at WriteHeader time). The test uses a
+// closed TCP port (port 1) so the inner dial fails and the
+// path returns deterministically without writing further.
+//
+// Cross-product: FAAS_BRIDGE_PROTOCOL∈{h1, h2c} × {
+// header-set path }. The h1 branch is the operator's
+// surgical-rollback switch (docs/ops/h2c-rollback.md Switch 1) and
+// the h2c branch is the default-after-promotion shape.
+func TestNewHandler_BridgeFramingHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{name: "h1_default", env: "h1", want: "h1"},
+		{name: "h2c_promoted", env: "h2c", want: "h2c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FAAS_BRIDGE_PROTOCOL", tc.env)
+			h := newHandler("127.0.0.1", 1, time.Now().Add(time.Minute))
+			req := httptest.NewRequest("GET", "/probe", nil)
+			rw := &httptest.ResponseRecorder{}
+			h.ServeHTTP(rw, req)
+
+			got := rw.Header().Get("X-Faas-Bridge-Framing")
+			if got != tc.want {
+				t.Errorf("X-Faas-Bridge-Framing = %q, want %q (FAAS_BRIDGE_PROTOCOL=%s dispatch)",
+					got, tc.want, tc.env)
+			}
+			// 502 BadGateway is the expected response from both
+			// handleH1Stream and handleH2CStream when the guest
+			// dial at port 1 fails — the dial-failure path
+			// commits the response head but the X-Faas-Bridge-Framing
+			// header we set in newHandler must survive to the
+			// committed head (stdlib snapshots w.Header() at
+			// WriteHeader time, not earlier).
+			if rw.Code != http.StatusBadGateway {
+				t.Errorf("status code = %d, want %d (closed-port dial-fail path)", rw.Code, http.StatusBadGateway)
+			}
+		})
+	}
+}

@@ -27,27 +27,28 @@ import (
 )
 
 const (
-	serverSrcPath = "server.go"
-	dtoFile       = "dto.go"
-	secretsFile   = "secrets.go"
-	envFile       = "env.go"           // issue #395 / ADR-045
-	registryFile  = "registry_auth.go" // issue #461 / ADR-062
-	alertsFile    = "alerts.go"        // issue #396 PR 3 / ADR-045
-	manifestFile  = "appmanifest.go"
-	cliauthFile   = "cliauth.go"
-	mfaFile       = "mfa.go"
-	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
-	errorsFile    = "errors.go"
-	wakeTLFile    = "wake_timeline.go" // issue #517 PR-C / ADR-064
-	orgsFile      = "orgs.go"          // issue #190 / IAM-6 / ADR-061 PR 5
-	scanFile      = "dto_scan.go"      // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
-	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
-	billingFile   = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
-	diffFile      = "diff.go"          // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
-	upstreamsFile = "upstreams.go"     // ADR-098 §9.A PR-B
-	triggerFile   = "trigger.go"       // issue #757 / ADR-100 — trigger primitive wire DTOs
-	oidcFile      = "oidc.go"          // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
-	envDiffFile   = "env_diff.go"      // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
+	serverSrcPath     = "server.go"
+	dtoFile           = "dto.go"
+	secretsFile       = "secrets.go"
+	envFile           = "env.go"            // issue #395 / ADR-045
+	registryFile      = "registry_auth.go"  // issue #461 / ADR-062
+	alertsFile        = "alerts.go"         // issue #396 PR 3 / ADR-045
+	alertsPresetsFile = "alerts_presets.go" // ADR-123 / issue #1233 — alert-preset catalog DTOs
+	manifestFile      = "appmanifest.go"
+	cliauthFile       = "cliauth.go"
+	mfaFile           = "mfa.go"
+	sessionsFile      = "sessions.go" // IAM-3 (ADR-039)
+	errorsFile        = "errors.go"
+	wakeTLFile        = "wake_timeline.go" // issue #517 PR-C / ADR-064
+	orgsFile          = "orgs.go"          // issue #190 / IAM-6 / ADR-061 PR 5
+	scanFile          = "dto_scan.go"      // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
+	webhooksFile      = "webhooks.go"      // issue #476 / ADR-076
+	billingFile       = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
+	diffFile          = "diff.go"          // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
+	upstreamsFile     = "upstreams.go"     // ADR-098 §9.A PR-B
+	triggerFile       = "trigger.go"       // issue #757 / ADR-100 — trigger primitive wire DTOs
+	oidcFile          = "oidc.go"          // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
+	envDiffFile       = "env_diff.go"      // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -73,33 +74,34 @@ var routeExclude = map[string]bool{
 	// must move together; the SDK does not model operator-only
 	// surfaces, and the public OpenAPI spec does not document
 	// them.
-	"GET /v1/admin/obs/overview":                         true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants":                          true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants/{id}":                     true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes":                            true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/{name}/heartbeats":          true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/events":                     true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
-	"GET /v1/admin/obs/nodes/wake-latency":               true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
-	"GET /v1/admin/obs/anomalies":                        true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/admin/obs/audit-log/search":                 true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/events":                           true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/rate-limits":                      true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/events":                                     true, // SSE (cookie+Bearer, not s.auth)
-	"GET /login":                                         true, // dashboard magic-link GET (HTML form, browser-only)
-	"POST /logout":                                       true, // dashboard logout (HTML form, browser-only)
-	"GET /auth/verify":                                   true, // magic-link consume (legacy; PR #1 closed; kept for compat)
-	"GET /oauth/callback":                                true, // GitHub App install callback
-	"GET /oauth/code-callback":                           true, // GitHub App user-to-server OAuth callback (PR-C)
-	"POST /dashboard/install/connect":                    true, // GitHub App "Connect GitHub" button (PR-C)
-	"GET /dashboard":                                     true, // HTML dashboard
-	"GET /dashboard/":                                    true, // HTML dashboard
-	"POST /dashboard/account/delete":                     true, // HTML form
-	"POST /dashboard/account/restore":                    true, // HTML form
-	"GET /dashboard/account/export":                      true, // session-auth twin of /v1/account/export
-	"GET /dashboard/account/dpa":                         true, // session-auth twin of DPA
-	"POST /dashboard/raise-overage-cap":                  true, // HTML form (issue #561)
-	"POST /dashboard/apps/{slug}/crons/{id}/fire-now":    true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
-	"POST /dashboard/apps/{slug}/deployments/{id}/retry": true, // HTML form, per-stage retry (ADR-117 §Production-ready follow-on C4); CSRF sealed envelope, no SDK twin
+	"GET /v1/admin/obs/overview":                              true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants":                               true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}":                          true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes":                                 true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/heartbeats":               true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/events":                          true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":                    true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/anomalies":                             true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":                      true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                                true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/rate-limits":                           true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/events":                                          true, // SSE (cookie+Bearer, not s.auth)
+	"GET /login":                                              true, // dashboard magic-link GET (HTML form, browser-only)
+	"POST /logout":                                            true, // dashboard logout (HTML form, browser-only)
+	"GET /auth/verify":                                        true, // magic-link consume (legacy; PR #1 closed; kept for compat)
+	"GET /oauth/callback":                                     true, // GitHub App install callback
+	"GET /oauth/code-callback":                                true, // GitHub App user-to-server OAuth callback (PR-C)
+	"POST /dashboard/install/connect":                         true, // GitHub App "Connect GitHub" button (PR-C)
+	"GET /dashboard":                                          true, // HTML dashboard
+	"GET /dashboard/":                                         true, // HTML dashboard
+	"POST /dashboard/account/delete":                          true, // HTML form
+	"POST /dashboard/account/restore":                         true, // HTML form
+	"GET /dashboard/account/export":                           true, // session-auth twin of /v1/account/export
+	"GET /dashboard/account/dpa":                              true, // session-auth twin of DPA
+	"POST /dashboard/raise-overage-cap":                       true, // HTML form (issue #561)
+	"POST /dashboard/apps/{slug}/crons/{id}/fire-now":         true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
+	"POST /dashboard/apps/{slug}/deployments/{id}/retry":      true, // HTML form, per-stage retry (ADR-117 §Production-ready follow-on C4); CSRF sealed envelope, no SDK twin
+	"POST /dashboard/apps/{slug}/alert-presets/{name}/enable": true, // ADR-123 — dashboard form post; programatic enable is /v1 with SDK wrapper EnableAlertPreset
 	// ADR-124 affected-workloads preview. Dashboard HTML form endpoints
 	// parallel to the cron fire-now + retry entries. The /preview POST
 	// re-renders the preview; /preview/apply commits. Both share the
@@ -202,6 +204,12 @@ var dtoExclude = map[string]bool{
 	// The Go DTO is the typed wire shape that the SDK method
 	// unmarshals into.
 	"OpenAPIDocResponse": true,
+	// Issue #1233 / ADR-123 — internal conversion struct for the
+	// alert_presets catalog. The wire DTO is AlertPresetResponse;
+	// AlertPresetRow is the typed counterpart at the pkg/api ↔
+	// pkg/state seam (state row → wire DTO). It does not cross the
+	// wire on its own.
+	"AlertPresetRow": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -639,6 +647,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", envFile),
 		filepath.Join(root, "pkg", "api", registryFile),
 		filepath.Join(root, "pkg", "api", alertsFile),
+		filepath.Join(root, "pkg", "api", alertsPresetsFile),
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),
 		filepath.Join(root, "pkg", "api", mfaFile),

@@ -209,6 +209,27 @@ type MemStore struct {
 	// — the contract is the same Map+slice-walk the production
 	// PgStore implements with an index.
 	openAPISnapshots map[string]OpenAPISnapshot
+	// openAPIImports mirrors the per-app app_openapi_docs table
+	// from migrations/00416 (issue #975 item #2 / ADR-126).
+	// Keyed by app_id (one row per app, last-write-wins).
+	openAPIImports map[string]appOpenAPIImportRow
+	// alertPresets mirrors alert_presets (issue #1233 / ADR-123).
+	// System-owned catalog; only the seed migrations write these.
+	// Keyed by preset.ID — the apid enable handler reads via
+	// AlertPresetByName which scans the map (8 rows, O(N) is fine).
+	alertPresets map[string]AlertPreset
+	// accountSpendSnapshots mirrors account_spend_snapshot
+	// (migrations/00420 in this branch's renumber). meterd appends
+	// one row per tick; the alert evaluator's MTDSpendEurCents
+	// walks the map for the MTD-window SUM. Keyed by ID.
+	accountSpendSnapshots map[string]AccountSpendSnapshot
+	// tenantSurfaceCertExpiryStates mirrors
+	// meterd_tenant_surface_cert_expiry_state (migrations/00421 in
+	// this branch's renumber). The meterd cert-expiry refresher
+	// goroutine (PR-A wiring)
+	// upserts rows; the alert evaluator's MinCertExpiryForApp
+	// walks the map for the smallest remaining-seconds value.
+	tenantSurfaceCertExpiryStates map[string]TenantSurfaceCertExpiryState
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -616,6 +637,14 @@ func NewMemStore() *MemStore {
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
 		openAPIDocs:          map[string]openAPIDocRow{},
+		// ADR-126 / issue #975 item #2 — per-app OpenAPI imports.
+		// Keyed by app_id (one row per app, last-write-wins via
+		// the existing overwrite-not-insert contract). Same IDOR
+		// floor at the read methods as the pg path.
+		openAPIImports:                map[string]appOpenAPIImportRow{},
+		alertPresets:                  map[string]AlertPreset{},
+		accountSpendSnapshots:         map[string]AccountSpendSnapshot{},
+		tenantSurfaceCertExpiryStates: map[string]TenantSurfaceCertExpiryState{},
 		// ADR-120 / issue #975 item #5 — consumer keys. The map is
 		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
 		// enforced at the read methods (same as the pg path).
@@ -4893,7 +4922,16 @@ func (m *MemStore) UpsertDeploymentOpenAPIDoc(_ context.Context, deploymentID, a
 	if existing, ok := m.openAPIDocs[deploymentID]; ok {
 		// Idempotent overwrite: keep the original captured_at so
 		// "first-capture" semantics survive a re-delivered cold-boot
-		// event. updated_at is bumped for the audit trail.
+		// event. updated_at is bumped for the audit trail. Preserve
+		// the original AccountID + AppID too — mirrors pgstore's
+		// ON CONFLICT DO UPDATE clause, which intentionally omits
+		// those columns so a cold-boot re-delivery can't flip a
+		// row's tenant binding or re-parent it to a different app
+		// (which would be a §11 IDOR hole). MemStore would otherwise
+		// silently "correct" the row on every overwrite and drift
+		// away from PG in any test asserting equality.
+		row.AccountID = existing.AccountID
+		row.AppID = existing.AppID
 		row.CapturedAt = existing.CapturedAt
 		row.UpdatedAt = now
 	} else {
@@ -4933,6 +4971,195 @@ func (m *MemStore) CountOpenAPIDocsByAccount(_ context.Context, accountID string
 		}
 	}
 	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// appOpenAPIImportRow is the in-memory row mirror of app_openapi_docs
+// (migrations/00416). The struct is unexported; the public surface
+// is the four methods below — handler tests reach them through the
+// Store interface.
+// ---------------------------------------------------------------------------
+type appOpenAPIImportRow struct {
+	AppID          string
+	AccountID      string
+	Doc            []byte
+	Source         string
+	OpenAPIVersion string
+	EndpointCount  int
+	ByteSize       int
+	DocSHA256      []byte
+	CapturedAt     time.Time
+	UpdatedAt      time.Time
+}
+
+// GetAppOpenAPIDoc mirrors pgstore.GetAppOpenAPIDoc. Returns
+// ErrNotFound when the row is missing OR when the caller's
+// accountID does not match — the IDOR floor is enforced at the
+// method boundary so a future caller can't probe by appID alone.
+// The doc body is defensively copied on the way out so a caller
+// mutating the slice can't corrupt the map's internal copy.
+func (m *MemStore) GetAppOpenAPIDoc(_ context.Context, appID, accountID string) ([]byte, AppOpenAPIDocMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIImports[appID]
+	if !ok || row.AccountID != accountID {
+		return nil, AppOpenAPIDocMeta{}, ErrNotFound
+	}
+	return append([]byte(nil), row.Doc...), AppOpenAPIDocMeta{
+		AppID:          row.AppID,
+		AccountID:      row.AccountID,
+		Source:         row.Source,
+		OpenAPIVersion: row.OpenAPIVersion,
+		EndpointCount:  row.EndpointCount,
+		ByteSize:       row.ByteSize,
+		DocSHA256:      append([]byte(nil), row.DocSHA256...),
+		CapturedAt:     row.CapturedAt,
+		UpdatedAt:      row.UpdatedAt,
+	}, nil
+}
+
+// UpsertAppOpenAPIDoc mirrors pgstore. The app row must exist AND
+// belong to the caller's account (defence-in-depth — the apid
+// loadApp boundary already gates this, but the store layer must
+// enforce the IDOR floor so a future caller that bypasses the
+// handler — admin tool, test harness, internal API — cannot
+// write a row into a foreign tenant's app_id and then read it
+// back via GetAppOpenAPIDoc). FK CASCADE in migration 00416 makes
+// the parent-existence check unreachable in practice but the
+// explicit check keeps the error surface predictable. Idempotent:
+// a re-delivered import overwrites the same row, not creates a
+// second. openapiVersion is one of ValidOpenAPIVersions (closed
+// enum); the caller is responsible for pre-validation (the apid
+// openapiimport.ValidateImport check is upstream).
+func (m *MemStore) UpsertAppOpenAPIDoc(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
+		return ErrNotFound
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := appOpenAPIImportRow{
+		AppID:          appID,
+		AccountID:      accountID,
+		Doc:            docCopy,
+		Source:         OpenAPIImportSourceManualImport,
+		OpenAPIVersion: openapiVersion,
+		EndpointCount:  endpointCount,
+		ByteSize:       len(docCopy),
+		DocSHA256:      sum[:],
+	}
+	if existing, ok := m.openAPIImports[appID]; ok {
+		// Idempotent overwrite: keep the original captured_at so
+		// "first-imported" semantics survive a re-delivered import
+		// event. updated_at is bumped for the audit trail. Preserve
+		// the original AccountID too — this matches pgstore's
+		// `ON CONFLICT (app_id) DO UPDATE` clause, which lists
+		// doc/doc_sha256/byte_size/endpoint_count/source/openapi_version/
+		// captured_at/updated_at but intentionally omits account_id
+		// so the original row's tenant binding survives a re-import.
+		// Mirroring that omission here keeps MemStore and PgStore
+		// byte-identical for any test that asserts equality, and
+		// prevents an IDOR drift where a future caller passing a
+		// stale accountID could silently flip the row's tenant.
+		row.AccountID = existing.AccountID
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIImports[appID] = row
+	return nil
+}
+
+// DeleteAppOpenAPIDoc mirrors pgstore. ErrNotFound when no row
+// OR the caller's accountID does not match — same IDOR floor.
+// The apid caller treats ErrNotFound as "already deleted" so a
+// retry is a no-op (idempotent 204).
+func (m *MemStore) DeleteAppOpenAPIDoc(_ context.Context, appID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.openAPIImports[appID]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.openAPIImports, appID)
+	return nil
+}
+
+// CountOpenAPIImportsByAccount returns the number of import rows
+// the account owns. Drives the per-account quota gate
+// (api.Plan.OpenAPIImportsPerAccount). The count is a single pass
+// over the map — the in-memory store holds the entire dataset
+// under m.mu so an O(N) scan is fine.
+func (m *MemStore) CountOpenAPIImportsByAccount(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.openAPIImports {
+		if r.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// UpsertAppOpenAPIDocIfUnderQuota mirrors PgStore's transactional
+// count+lock+upsert. The MemStore is single-threaded under m.mu
+// so the atomicity is implicit (the PgStore tx's purpose is to
+// serialise concurrent imports; MemStore achieves the same via
+// the mutex). The Plan.Max=0 path is fail-closed.
+func (m *MemStore) UpsertAppOpenAPIDocIfUnderQuota(_ context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error {
+	if planMax <= 0 {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: 0, NotAllowed: true}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.AccountID != accountID {
+		return ErrNotFound
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return ErrNotFound
+	}
+	observed := 0
+	for _, r := range m.openAPIImports {
+		if r.AccountID == accountID {
+			observed++
+		}
+	}
+	if observed >= planMax {
+		return &QuotaError{Kind: QuotaErrorKindOpenAPIImports, Limit: planMax, Observed: observed}
+	}
+	now := time.Now()
+	docCopy := append([]byte(nil), doc...)
+	sum := sha256.Sum256(docCopy)
+	row := appOpenAPIImportRow{
+		AppID:          appID,
+		AccountID:      accountID,
+		Doc:            docCopy,
+		Source:         OpenAPIImportSourceManualImport,
+		OpenAPIVersion: openapiVersion,
+		EndpointCount:  endpointCount,
+		ByteSize:       len(docCopy),
+		DocSHA256:      sum[:],
+	}
+	if existing, ok := m.openAPIImports[appID]; ok {
+		// Same idempotent-overwrite contract as UpsertAppOpenAPIDoc
+		// — see the rationale there. The original AccountID +
+		// CapturedAt survive a re-import; UpdatedAt bumps.
+		row.AccountID = existing.AccountID
+		row.CapturedAt = existing.CapturedAt
+		row.UpdatedAt = now
+	} else {
+		row.CapturedAt = now
+		row.UpdatedAt = now
+	}
+	m.openAPIImports[appID] = row
+	return nil
 }
 
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
@@ -7617,6 +7844,99 @@ func (m *MemStore) MarkAllSnapshotsStaleByFCVersion(_ context.Context, currentVe
 		}
 	}
 	return n, nil
+}
+
+// MarkAllSnapshotsStaleByAppProtocol mirrors the SQL UPDATE: every
+// non-stale snapshot whose deployment's app.app_protocol ∈
+// appProtocols is flipped stale. ADR-127 §D1, Layer 6 (imaged F3
+// sweep). app_protocol=http1 snapshots are never affected. Empty
+// appProtocols is a no-op (matches the SQL behaviour: the UPDATE
+// runs against an empty set which matches nothing).
+func (m *MemStore) MarkAllSnapshotsStaleByAppProtocol(_ context.Context, appProtocols []string) (int64, error) {
+	if len(appProtocols) == 0 {
+		return 0, nil
+	}
+	allowed := make(map[string]struct{}, len(appProtocols))
+	for _, p := range appProtocols {
+		allowed[p] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	for i := range m.snapshots {
+		snap := m.snapshots[i]
+		if snap.Stale {
+			continue
+		}
+		dep, ok := m.deployments[snap.DeploymentID]
+		if !ok {
+			continue
+		}
+		app, ok := m.apps[dep.AppID]
+		if !ok {
+			continue
+		}
+		if _, match := allowed[app.AppProtocol]; match {
+			m.snapshots[i].Stale = true
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MarkSnapshotStaleByAppProtocol is the single-row mirror of
+// MarkAllSnapshotsStaleByAppProtocol. Returns ErrNotFound when no
+// snapshot matches the id AND the deployment's app.app_protocol
+// ∈ appProtocols. Empty inputs are errors (caller bug).
+func (m *MemStore) MarkSnapshotStaleByAppProtocol(_ context.Context, snapshotID string, appProtocols []string) error {
+	if len(appProtocols) == 0 {
+		return errors.New("memstore: MarkSnapshotStaleByAppProtocol: empty appProtocols set")
+	}
+	if snapshotID == "" {
+		return errors.New("memstore: MarkSnapshotStaleByAppProtocol: empty snapshotID")
+	}
+	allowed := make(map[string]struct{}, len(appProtocols))
+	for _, p := range appProtocols {
+		allowed[p] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.snapshots {
+		snap := m.snapshots[i]
+		if snap.ID != snapshotID {
+			continue
+		}
+		dep, ok := m.deployments[snap.DeploymentID]
+		if !ok {
+			return ErrNotFound
+		}
+		app, ok := m.apps[dep.AppID]
+		if !ok {
+			return ErrNotFound
+		}
+		if _, match := allowed[app.AppProtocol]; !match {
+			return ErrNotFound
+		}
+		if snap.Stale {
+			// Already stale — caller asked to mark stale, but it's
+			// already stale; treat as success (idempotent). The
+			// PgStore version (pkg/state/pgstore.go:9807) behaves
+			// the same: its UPDATE has no `s.stale = false`
+			// predicate, so a no-op flip still reports
+			// RowsAffected=1 and returns nil; the ErrNotFound path
+			// fires only when no row matches the id + app_protocol
+			// triple. The bulk path (MarkAllSnapshotsStaleByAppProtocol)
+			// DOES carry `and s.stale = false` so its row-count is
+			// the count of *newly* stale-marked rows; the single-row
+			// mirror here matches MemStore semantics, not bulk
+			// semantics, because the bulk return is a count and
+			// the single-row return is a found/not-found bool.
+			return nil
+		}
+		m.snapshots[i].Stale = true
+		return nil
+	}
+	return ErrNotFound
 }
 
 // MarkOldSnapshotsStale flips the given IDs to stale=true (no-op if absent).
@@ -11676,6 +11996,252 @@ func (m *MemStore) GetCorsPresetByID(_ context.Context, accountID, id string) (C
 		return CorsPreset{}, ErrNotFound
 	}
 	return p, nil
+}
+
+// --- alert_presets (issue #1233, ADR-123) -----------------------------------
+
+// ListAlertPresets mirrors the pgstore query: every catalog row
+// ordered by (category, name). Catalog cardinality is bounded (8
+// rows today) so no pagination is needed.
+func (m *MemStore) ListAlertPresets(_ context.Context) ([]AlertPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]AlertPreset, 0, len(m.alertPresets))
+	for _, p := range m.alertPresets {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Category != out[j].Category {
+			return out[i].Category < out[j].Category
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// AlertPresetByName scans the map (8 rows). O(N) is acceptable
+// for the catalog cardinality. Returns ErrNotFound on no match.
+func (m *MemStore) AlertPresetByName(_ context.Context, name string) (AlertPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.alertPresets {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+	return AlertPreset{}, ErrNotFound
+}
+
+// CountFailedDeploymentsSince mirrors the pgstore scan over the
+// deployments table. Used by the alert evaluator's
+// deployment_failed case. accountID is resolved via the apps
+// lookup (deployments stores app_id only, mirroring the pgstore
+// JOIN). appID "" means "any app on this account".
+func (m *MemStore) CountFailedDeploymentsSince(_ context.Context, accountID, appID string, since time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, d := range m.deployments {
+		// Resolve the deployment's account via the apps map
+		// (deployments carries app_id only).
+		app, ok := m.apps[d.AppID]
+		if !ok || app.AccountID != accountID {
+			continue
+		}
+		if appID != "" && d.AppID != appID {
+			continue
+		}
+		if d.Status != DeployFailed {
+			continue
+		}
+		if d.CreatedAt.Before(since) {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// WasInvokedSuccessfullySince mirrors the pgstore EXISTS scan.
+// Returns true iff at least one non-failed invocation exists in
+// the window — the api_up signal.
+func (m *MemStore) WasInvokedSuccessfullySince(_ context.Context, accountID, appID string, since time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inv := range m.invocations {
+		if inv.AccountID != accountID {
+			continue
+		}
+		if appID != "" && inv.AppID != appID {
+			continue
+		}
+		if inv.State == InvocationFailed {
+			continue
+		}
+		if inv.CreatedAt.Before(since) {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// MTDSpendEurCents mirrors the pgstore SUM(eur_cents) over
+// account_spend_snapshot. Returns 0 when no rows exist.
+func (m *MemStore) MTDSpendEurCents(_ context.Context, accountID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	monthStart := time.Now().UTC().Add(-time.Duration(time.Now().UTC().Day()-1) * 24 * time.Hour)
+	// Snap to UTC midnight of day 1 — date_trunc equivalent.
+	monthStart = time.Date(monthStart.Year(), monthStart.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var total int64
+	for _, s := range m.accountSpendSnapshots {
+		if s.AccountID != accountID {
+			continue
+		}
+		if s.PeriodStart.Before(monthStart) {
+			continue
+		}
+		total += s.EurCents
+	}
+	return total, nil
+}
+
+// UpsertAccountSpendSnapshot is the memstore mirror of the pg
+// upsert. Idempotent on (account_id, source, period_end) — a
+// double-fire (e.g. meterd restart mid-tick) overwrites the row
+// with the latest gb_seconds / eur_cents.
+func (m *MemStore) UpsertAccountSpendSnapshot(_ context.Context, accountID string, periodStart, periodEnd time.Time, gbSeconds float64, eurCents int64, source string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, s := range m.accountSpendSnapshots {
+		if s.AccountID == accountID && s.Source == source && s.PeriodEnd.Equal(periodEnd) {
+			s.PeriodStart = periodStart
+			s.GBSeconds = gbSeconds
+			s.EurCents = eurCents
+			m.accountSpendSnapshots[id] = s
+			return nil
+		}
+	}
+	id := uuidOrSentinel()
+	m.accountSpendSnapshots[id] = AccountSpendSnapshot{
+		ID:          id,
+		AccountID:   accountID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		GBSeconds:   gbSeconds,
+		EurCents:    eurCents,
+		Source:      source,
+		CreatedAt:   time.Now().UTC(),
+	}
+	return nil
+}
+
+// uuidOrSentinel returns a v4-ish UUID for in-memory map keys.
+// MemStore doesn't depend on the uuid package; a counter-based
+// sentinel keeps tests deterministic.
+var memStoreSnapshotCounter int64
+
+func uuidOrSentinel() string {
+	memStoreSnapshotCounter++
+	return fmt.Sprintf("snapshot-%d", memStoreSnapshotCounter)
+}
+
+// MinCertExpiryForApp walks the meterd_tenant_surface_cert_expiry_state
+// map and returns the smallest remaining seconds for the (account,
+// app) — or -1 when no surface is in 'ok' state.
+func (m *MemStore) MinCertExpiryForApp(_ context.Context, accountID, appID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var minSec *int64
+	for _, s := range m.tenantSurfaceCertExpiryStates {
+		if s.AccountID != accountID || s.AppID != appID {
+			continue
+		}
+		if s.LastWalkStatus != "ok" || s.LastObservedCertNotAfter == nil {
+			continue
+		}
+		remaining := int64(time.Until(*s.LastObservedCertNotAfter).Seconds())
+		if minSec == nil || remaining < *minSec {
+			r := remaining
+			minSec = &r
+		}
+	}
+	if minSec == nil {
+		return -1, nil
+	}
+	return *minSec, nil
+}
+
+// RefreshCertExpiryStates walks every tenant_surfaces row whose
+// cert_state='issued', upserts the
+// meterd_tenant_surface_cert_expiry_state mirror row, and stamps
+// last_refreshed_at=now(). Returns the number of rows upserted.
+// Mirrors pgstore.RefreshCertExpiryStates
+// for tests. The hostname is the lexicographically-smallest
+// verified hostname on the surface (matches the
+// pkg/gateway.CertExpiry ordering at cert_expiry_surface.go:88-93)
+// so the surface row's hostname is deterministic.
+func (m *MemStore) RefreshCertExpiryStates(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	now := time.Now()
+	for _, ts := range m.tenantSurfaces {
+		if ts.CertState != CertStateIssued {
+			continue
+		}
+		var notAfter *time.Time
+		status := "ok"
+		if !ts.CertNotAfter.IsZero() {
+			t := ts.CertNotAfter
+			notAfter = &t
+		} else {
+			status = "cert_unissued"
+		}
+		// Pick the primary hostname — sort-by-hostname matches
+		// pkg/gateway.CertExpiry so the on-disk cert the alert
+		// evaluator reads is the same one the issuer wrote.
+		hostname := ts.Name
+		for _, h := range m.tenantHostnames {
+			if h.SurfaceID != ts.ID || h.VerifiedAt.IsZero() {
+				continue
+			}
+			if h.Hostname < hostname {
+				hostname = h.Hostname
+			}
+		}
+		m.tenantSurfaceCertExpiryStates[ts.ID] = TenantSurfaceCertExpiryState{
+			TenantSurfaceID:          ts.ID,
+			AccountID:                ts.AccountID,
+			AppID:                    ts.AppID,
+			Hostname:                 hostname,
+			LastObservedCertNotAfter: notAfter,
+			LastWalkStatus:           status,
+			LastRefreshedAt:          now,
+		}
+		n++
+	}
+	return n, nil
+}
+
+// ListCertExpiryStateForWalker returns every row in
+// meterd_tenant_surface_cert_expiry_state whose
+// last_refreshed_at is fresher than (now - staleCutoff). Meterd's
+// refresher uses this to stamp the
+// apid_tenant_surface_cert_expiry_seconds gauge.
+func (m *MemStore) ListCertExpiryStateForWalker(_ context.Context, staleCutoff time.Duration) ([]TenantSurfaceCertExpiryState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cutoff := time.Now().Add(-staleCutoff)
+	var out []TenantSurfaceCertExpiryState
+	for _, s := range m.tenantSurfaceCertExpiryStates {
+		if s.LastRefreshedAt.Before(cutoff) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // UpdateEdgeRule mirrors the pgstore nil-skip semantics. Action

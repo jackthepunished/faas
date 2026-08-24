@@ -125,6 +125,17 @@ var routeExclude = map[string]bool{
 	// don't need a typed wrapper. Mirrors the dashboard-auth
 	// exclusion above.
 	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
+
+	// ADR-123 — alert-preset catalog dashboard form post. The
+	// dashboard's preset-enable card on app_detail.html renders
+	// `action="/apps/{slug}/alert-presets/{name}/enable"` and posts
+	// x-www-form-urlencoded body to /dashboard/apps/{slug}/alert-
+	// presets/{name}/enable. The SDK does not model the
+	// session-cookie-only dashboard auth surface (mirrors /logout
+	// above) — programatic enablement goes through
+	// POST /v1/apps/{slug}/alert-presets/{name}/enable which the
+	// SDK exposes as EnableAlertPreset.
+	"POST /dashboard/apps/{slug}/alert-presets/{name}/enable": true,
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire
@@ -203,6 +214,10 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/deployments/{deployment}/openapi":  "PatchAppsDeploymentOpenAPIDoc",  // manual upload; same store as cold-boot capture
 	"DELETE /v1/apps/{slug}/deployments/{deployment}/openapi": "DeleteAppsDeploymentOpenAPIDoc", // wipe the captured doc; re-captures on next cold boot
 	"GET /v1/apps/{slug}/env-diff":                            "GetAppEnvDiff",                  // ADR-117 PR-C: env vars + secrets × scopes matrix; matches operationId `getAppEnvDiff` (auto-derivation would produce `GetAppsSlugEnv-diff` because of the literal hyphen in the path segment — the explicit map drops the slug placeholder + the hyphen for Go SDK hygiene, mirroring the `GetAppMetrics` / `GetAppSLO` / `GetAppDataUpstream` precedent above)
+	"GET /v1/apps/{slug}/openapi":                             "GetAppOpenAPI",                  // issue #975 item #2 / ADR-126 — imported or auto-generated OpenAPI doc per app
+	"POST /v1/apps/{slug}/openapi":                            "ImportAppOpenAPI",               // manual upload (item #2 D2/D6); persists via UpsertAppOpenAPIDoc
+	"DELETE /v1/apps/{slug}/openapi":                          "DeleteAppOpenAPI",               // idempotent wipe of the imported doc (item #2 D5 emits pg_notify)
+	"POST /v1/apps/{slug}/openapi/dry-run":                    "DryRunAppOpenAPI",               // read-only edge-rule suggestions (item #2 D3)
 	"GET /v1/deployments/{id}":                                "GetDeployment",
 	"PATCH /v1/deployments/{id}":                              "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                                     "ListDeployments",
@@ -239,6 +254,15 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
+
+	// Issue #1233 / ADR-123 — alert-preset catalog. Auto-derivation
+	// would produce Swagger-style names ("GetAlert-presets",
+	// "PostAppsSlugAlert-presetsNameEnable") because the path uses
+	// a literal hyphen; the SDK names methods after the resource
+	// noun (AlertPreset) — same convention as edge-rules and
+	// throttle-suggestions above.
+	"GET /v1/alert-presets":                            "ListAlertPresets",
+	"POST /v1/apps/{slug}/alert-presets/{name}/enable": "EnableAlertPreset",
 
 	// ADR-089 (planned) — edge rules. The auto-derivation would
 	// produce Swagger-style names ("GetAppsSlugEdge-rules",
@@ -397,6 +421,14 @@ var methodRouteMap = map[string]string{
 	// names it GetAppMetrics to match the existing per-app methods
 	// (GetApp, ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
+
+	// ADR-127 / PR-A — production debugger data plane. The
+	// auto-derivation would produce GetAppsSlugDebugRequests
+	// (Swagger-style); the SDK names it ListAppDebugRequests to
+	// match the operationId on the spec side and the per-resource
+	// list family (ListAlertRules, ListEdgeRules, ListAppWebhooks)
+	// — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/debug/requests": "ListAppDebugRequests",
 
 	// Issue #393 — account-scoped list endpoints. Distinct from the
 	// per-app counterparts (ListInstances / ListSecrets / GetAppMetrics)

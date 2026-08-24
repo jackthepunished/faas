@@ -24,6 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
@@ -3150,6 +3151,52 @@ func (h *Handler) snapshotNonStaleByApp(ctx context.Context) (map[string]int64, 
 		out[r.AppID]++
 	}
 	return out, nil
+}
+
+// MarkAppProtocolSnapshotsStale is the F3-app-protocol sweep
+// (ADR-127 §D1, Layer 6). Mirrors MarkFCSnapshotsStale but flips
+// every non-stale snapshot whose deployment's app.app_protocol ∈
+// {http2, grpc} stale. Called from runFCSweep AFTER F2 (the
+// Firecracker-version sweep). The two sweeps have different
+// triggers (F2 on FC upgrade per ADR-005; F3 on
+// FAAS_BASE_IMAGE_VERSION bump per ADR-127) and different audit
+// subjects ("fc_version:<v>" vs "app_protocol:<v>") — they are
+// intentionally NOT merged.
+//
+// app_protocol=http1 snapshots are NEVER affected (ADR-126
+// §Decision 6). The sweep's audit subject carries the
+// FAAS_BASE_IMAGE_VERSION stamp so operators reading the audit
+// log can correlate a base-image bump with the rebuild.
+func (h *Handler) MarkAppProtocolSnapshotsStale(ctx context.Context) (int64, error) {
+	// The wire-protocol-capable close-set is {http2, grpc}; http1
+	// stays on the unchanged H1+chunked path.
+	h2cProtocols := []string{api.AppProtocolHTTP2, api.AppProtocolGRPC}
+
+	// Capture per-app non-stale row counts BEFORE the sweep so the
+	// audit emit can compute per-app "rows flipped" deltas (same
+	// shape as F2 — see MarkFCSnapshotsStale above).
+	beforeByApp, err := h.snapshotNonStaleByApp(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("imaged: mark stale by app_protocol: pre-sweep list: %w", err)
+	}
+	n, err := h.store.MarkAllSnapshotsStaleByAppProtocol(ctx, h2cProtocols)
+	if err != nil {
+		return 0, fmt.Errorf("imaged: mark stale by app_protocol: %w", err)
+	}
+	if n > 0 && h.audit != nil {
+		afterByApp, listErr := h.snapshotNonStaleByApp(ctx)
+		if listErr != nil {
+			// Best-effort: log the list failure and still return n
+			// to the caller (the mark-stale itself succeeded).
+			h.log.Warn("imaged: warm_snapshot_stale (app_protocol) post-sweep list",
+				"err", listErr)
+		} else {
+			h.emitWarmSnapshotStale(ctx,
+				"app_protocol:"+fcvm.FAAS_BASE_IMAGE_VERSION,
+				beforeByApp, afterByApp)
+		}
+	}
+	return n, nil
 }
 
 // emitWarmSnapshotStale (issue #470 / PR C / ADR-074) emits one

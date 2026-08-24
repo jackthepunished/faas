@@ -65,6 +65,24 @@ func hasReadWrite(u daemonunit.Unit, path string) bool {
 	return false
 }
 
+func hasEnvironment(u daemonunit.Unit, key, value string) bool {
+	for _, env := range u.Environment {
+		if env.Key == key && env.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLoadCredential(u daemonunit.Unit, name, path string) bool {
+	for _, cred := range u.LoadCredential {
+		if cred.Name == name && cred.Path == path && !cred.Optional {
+			return true
+		}
+	}
+	return false
+}
+
 // --- per-daemon UnitXxx() constructors ------------------------------
 
 func TestUnitVmmd_Shape(t *testing.T) {
@@ -112,6 +130,12 @@ func TestUnitApid_Shape(t *testing.T) {
 	}
 	if u.Slice != FaasCPSlice {
 		t.Errorf("apid: Slice = %q, want %q", u.Slice, FaasCPSlice)
+	}
+	if !hasEnvironment(u, "FAAS_HOST_HMAC_KEY_PATH", "%d/faas_host_hmac_key") {
+		t.Error("apid: missing FAAS_HOST_HMAC_KEY_PATH credential-dir environment")
+	}
+	if !hasLoadCredential(u, "faas_host_hmac_key", "/etc/faas/secrets/host.hmac.key") {
+		t.Error("apid: missing required faas_host_hmac_key LoadCredential")
 	}
 }
 

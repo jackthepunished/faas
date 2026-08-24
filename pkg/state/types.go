@@ -1759,16 +1759,27 @@ type FireNowRequest struct {
 // payload verbatim so the evaluator and the customer-facing metrics
 // endpoint cannot drift. failed_invocations is the only non-Prometheus
 // metric; its source dimension comes through AlertRule.FailureSource.
+//
+// Issue #1233 / ADR-123 — extended with 5 metrics backing the alert
+// preset catalog (api_up / account_spend_eur / deployment_failed /
+// cert_expiry_seconds / queue_depth). The pkg/api.AllowedAlertRuleMetrics
+// slice and the alert_rules_metric_chk DB CHECK mirror these byte-for-byte
+// (migrations/00349_alert_rules_extend_metrics_chk.sql).
 type AlertMetric string
 
 const (
-	AlertMetricErrorRate    AlertMetric = "error_rate_pct"
-	AlertMetricLatencyP50   AlertMetric = "latency_p50_ms"
-	AlertMetricLatencyP95   AlertMetric = "latency_p95_ms"
-	AlertMetricLatencyP99   AlertMetric = "latency_p99_ms"
-	AlertMetricColdStartPct AlertMetric = "cold_start_pct"
-	AlertMetricRequestCount AlertMetric = "request_count"
-	AlertMetricFailedInvocs AlertMetric = "failed_invocations"
+	AlertMetricErrorRate         AlertMetric = "error_rate_pct"
+	AlertMetricLatencyP50        AlertMetric = "latency_p50_ms"
+	AlertMetricLatencyP95        AlertMetric = "latency_p95_ms"
+	AlertMetricLatencyP99        AlertMetric = "latency_p99_ms"
+	AlertMetricColdStartPct      AlertMetric = "cold_start_pct"
+	AlertMetricRequestCount      AlertMetric = "request_count"
+	AlertMetricFailedInvocs      AlertMetric = "failed_invocations"
+	AlertMetricAPIUp             AlertMetric = "api_up"
+	AlertMetricAccountSpendEUR   AlertMetric = "account_spend_eur"
+	AlertMetricFailedDeployments AlertMetric = "deployment_failed"
+	AlertMetricCertExpirySeconds AlertMetric = "cert_expiry_seconds"
+	AlertMetricQueueDepth        AlertMetric = "queue_depth"
 )
 
 // AlertComparison is the textual form of the comparison operator stored
@@ -4631,6 +4642,78 @@ type CorsPreset struct {
 	UpdatedAt        time.Time
 }
 
+// AccountSpendSnapshot is the in-memory row mirrored from
+// account_spend_snapshot (issue #1233 / ADR-123 / migrations/00350).
+// meterd ticks write one row per (account, source) per
+// AlertEvalInterval. The alert evaluator reads SUM(eur_cents)
+// for the MTD window via MTDSpendEurCents.
+//
+// source is a closed vocabulary mirroring the
+// account_spend_snapshot_source_chk DB constraint:
+// 'running_seconds' | 'overage' | 'build_seconds' | 'snapshot_storage'.
+type AccountSpendSnapshot struct {
+	ID          string
+	AccountID   string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	GBSeconds   float64
+	EurCents    int64
+	Source      string
+	CreatedAt   time.Time
+}
+
+// TenantSurfaceCertExpiryState is the in-memory row mirrored from
+// meterd_tenant_surface_cert_expiry_state (issue #1233 / ADR-123 /
+// migrations/00351). The meterd cert-expiry refresher goroutine
+// (cmd/meterd/alert_presets_ticks.go) updates the
+// last_observed_cert_not_after + last_walk_status; the alert
+// evaluator reads MinCertExpiryForApp to compute the
+// cert_expiry_seconds metric.
+type TenantSurfaceCertExpiryState struct {
+	TenantSurfaceID          string
+	AccountID                string
+	AppID                    string
+	Hostname                 string
+	LastObservedCertNotAfter *time.Time
+	LastWalkStatus           string
+	LastRefreshedAt          time.Time
+}
+
+// AlertPreset is the in-memory row mirrored from alert_presets
+// (issue #1233, ADR-123). Catalog rows are system-owned; the
+// meterd + apid system-owner role is the only writer. Customers
+// have SELECT-only access via the apid GET surface.
+//
+// The struct is read-only at the Store boundary — there is no
+// Update / Delete / Create method on the Store interface for
+// alert_presets. The only write path is migration 00348's
+// idempotent seed.
+//
+// Comparison / Metric / WindowSpec mirror the alert_rules closed
+// vocabularies byte-for-byte (the DB CHECK constraints in
+// migrations/00347_alert_presets.sql pin this). When the
+// evaluator's `observe` dispatch learns a new metric, the catalog
+// can include it on the same PR — but a catalog entry MUST NOT
+// reference a metric the evaluator has not learned, or the
+// enable path would persist an alert_rules row whose metric the
+// evaluator then drops at run-time.
+type AlertPreset struct {
+	ID                     string
+	Name                   string
+	DisplayName            string
+	Description            string
+	Category               string
+	Metric                 string
+	Comparison             string
+	Threshold              float64
+	WindowSpec             string
+	DefaultCooldownMinutes int
+	EnabledInCatalog       bool
+	MinimumPlan            string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
 // CreateEdgeRuleParams is the input bundle for CreateEdgeRule and
 // CreateEdgeRuleIfUnderQuota. Action is marshalled to jsonb at the
 // pgstore boundary.
@@ -5055,3 +5138,81 @@ const (
 	StatusIncidentSeverityFullOutage    = "full_outage"
 	StatusIncidentSeverityMaintenance   = "maintenance"
 )
+
+// ---------------------------------------------------------------------------
+// OpenAPI Import (issue #975 item #2 / ADR-126).
+//
+// The per-app table `app_openapi_docs` carries the customer's
+// imported OpenAPI document — the "declared surface" side of the
+// closed loop. It co-exists with the per-deployment
+// deployment_openapi_docs (item #1): the latter holds what Gregale
+// captured during cold boot, the former holds what the customer
+// declared for the app.
+// ---------------------------------------------------------------------------
+
+// AppOpenAPIDocMeta is the metadata slice returned alongside the
+// imported document body. Mirrors OpenAPIDocMeta but keys on
+// (app_id, account_id) — one row per app, not per deployment.
+//
+// OpenAPIVersion is the closed enum value '3.0.0'..'3.1.1' (matches
+// the migrations/00416 CHECK constraint). Source is the closed
+// enum value 'manual_import' (item #2 does not admit cold-boot
+// captures; cold-boot goes to deployment_openapi_docs from item #1).
+//
+// EndpointCount is the count of HTTP operations in the imported
+// doc's paths.* — a generous ceiling for a single-app surface
+// (Stripe-scale 700-operation docs would be split per-app, not
+// per-spec). The SQL CHECK pins it 0..50; the apid layer enforces
+// the abuse-surface cap of 50 via api.Plan.OpenAPIImportMaxEndpoints.
+type AppOpenAPIDocMeta struct {
+	AppID          string
+	AccountID      string
+	Source         string
+	OpenAPIVersion string
+	EndpointCount  int
+	ByteSize       int
+	DocSHA256      []byte
+	CapturedAt     time.Time
+	UpdatedAt      time.Time
+}
+
+// OpenAPIImportSource values mirror the migrations/00416 CHECK
+// constraint. Inline-declared (same pattern as OpenAPIDocSource
+// above) so the pgstore and the apid handler agree on the enum
+// without a string-literal drift.
+const (
+	OpenAPIImportSourceManualImport = "manual_import"
+)
+
+// OpenAPIImportMaxDocBytes is the hard cap on the imported body,
+// applied at the apid layer (the SQL CHECK in migration 00416
+// applies the same constant for defense-in-depth). The
+// per-plan cap is layered on top via
+// api.Plan.OpenAPIImportMaxDocBytes() (limits.go). The constant
+// lives here (not in pkg/api/limits.go) because the validator at
+// pkg/openapiimport/validator.go and the cache at
+// pkg/openapidiff/spec_cache.go both reference it through the
+// Store interface and need a stable address.
+//
+// 256 KiB is generous for a single-app surface (Stripe-scale
+// 700-operation docs split per-app land well under this cap).
+// The cap is the abuse-surface ceiling, not the plan-tier ceiling.
+const OpenAPIImportMaxDocBytes = 256 * 1024
+
+// OpenAPIImportMaxEndpoints is the hard cap on the imported
+// doc's paths.* operation count, applied at the apid layer (the
+// SQL CHECK in migration 00416 applies the same constant for
+// defense-in-depth). 50 operations is generous for a single-app
+// surface.
+const OpenAPIImportMaxEndpoints = 50
+
+// ValidOpenAPIVersions is the closed enum the SQL CHECK admits.
+// Mirrors migrations/00416_openapi_import.sql. The validator at
+// pkg/openapiimport/validator.go compiles the imported doc
+// against the OpenAPI 3.1 meta-schema regardless of the declared
+// version — 3.0.x docs that don't use 3.0-only features pass;
+// customers needing strict 3.0 can ship 3.1.
+var ValidOpenAPIVersions = []string{
+	"3.0.0", "3.0.1", "3.0.2", "3.0.3", "3.0.4",
+	"3.1.0", "3.1.1",
+}

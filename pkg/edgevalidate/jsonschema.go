@@ -10,10 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
-
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
+
+	"github.com/onebox-faas/faas/pkg/jsonschemautil"
 )
 
 // CompiledSchema is the result of Compile: a ready-to-Validate
@@ -47,12 +46,13 @@ var schemaRefURLPattern = regexp.MustCompile(`(?i)"\$(?:ref|id)"\s*:\s*"[a-z][a-
 // pointer is stable across Compiler instances.
 var jsonschemaDraft2020 = *jsonschema.Draft2020
 
-// defaultPrinter mirrors jsonschema/v6's package-private
-// defaultPrinter. LocalizedString panics on nil printer (per
-// output.go:13); we keep a private default to localize kind
-// messages into English. Customers get a stable wire shape
-// regardless of the daemon's locale env.
-var defaultPrinter = message.NewPrinter(language.English)
+// defaultPrinter aliases the shared jsonschemautil.DefaultPrinter
+// so the existing call sites stay unchanged. LocalizedString
+// panics on nil printer (per jsonschema/v6 output.go:13); the
+// shared instance is an English printer so customers get a stable
+// wire shape regardless of the daemon's locale env. Factored
+// into pkg/jsonschemautil so pkg/openapiimport can share it.
+var defaultPrinter = jsonschemautil.DefaultPrinter
 
 // schemaMempool is a sync.Pool of *jsonschema.Compiler. We keep a
 // per-call compiler (the library has no safe Compile-on-existing-
@@ -199,7 +199,7 @@ func translateValidationError(ve *jsonschema.ValidationError) *FieldError {
 	for len(ve.Causes) > 0 {
 		ve = ve.Causes[0]
 	}
-	field := joinInstanceLocation(ve.InstanceLocation)
+	field := jsonschemautil.JoinInstanceLocation(ve.InstanceLocation)
 	expected := ""
 	if ve.ErrorKind != nil {
 		kp := ve.ErrorKind.KeywordPath()
@@ -214,31 +214,11 @@ func translateValidationError(ve *jsonschema.ValidationError) *FieldError {
 	return &FieldError{Field: field, Expected: expected, Got: got}
 }
 
-// joinInstanceLocation joins an InstanceLocation []string into a
-// dotted JSON Pointer-style path (e.g. ["address", "zip"] →
-// "/address/zip"). Empty slice → empty string. This matches the
-// shape customers expect from RFC 7807-style per-field error
-// payloads.
-func joinInstanceLocation(loc []string) string {
-	if len(loc) == 0 {
-		return ""
-	}
-	// Use slash as separator — InstanceLocation is a JSON
-	// Pointer token list. Per RFC 6901 the separator is "/" so
-	// that's what we use; the wire-shape FieldError in
-	// pkg/api/dto.go can decide on a different separator at the
-	// presentation layer.
-	var sz int
-	for _, s := range loc {
-		sz += 1 + len(s)
-	}
-	out := make([]byte, 0, sz)
-	for _, s := range loc {
-		out = append(out, '/')
-		out = append(out, s...)
-	}
-	return string(out)
-}
+// joinInstanceLocation was previously inlined here. It now lives
+// in pkg/jsonschemautil so pkg/openapiimport and this package can
+// share the canonical JSON Pointer shape. The local copy was
+// identical to the openapiimport copy; the dedup lands here as
+// part of the #975-item-2 review-fix cluster (Fix #8).
 
 // extractFirstExternalRef pulls the first $ref or $id URL value
 // out of the schema, for the audit log. It does a quick pass; not

@@ -370,6 +370,21 @@ type OpsMetrics struct {
 	// counter after every successful park (idle / aggressive /
 	// RAM-pressure).
 	evictedPriority *prometheus.CounterVec
+	// bridgeFramingTotal (ADR-127 §D3, Layer 7) — closed-set
+	// counter for the per-request framing decision at the bridge.
+	// Labels:
+	//   app_protocol     ∈ {http1, http2, grpc}
+	//   bridge_protocol  ∈ {h1, h2c}
+	//   framing          ∈ {match, mismatch}
+	// Pre-instantiates the full 3×2×2 = 12-series cross-product at
+	// boot so the §12 bridge-protection dashboard surfaces a zero
+	// row from idle fleet. The "mismatch" row is the operator-
+	// facing surgical-rollback signal — when bridge_protocol=h1
+	// but app_protocol ∈ {http2, grpc} (an operator forced the
+	// rollback per docs/ops/h2c-rollback.md), framing=mismatch so
+	// the FaasBridgeFramingMismatch alert (pkg/api/alerts.go) can
+	// trip a non-zero rate and page on-call.
+	bridgeFramingTotal *prometheus.CounterVec
 	// eventsWriteFail: introduced in commit 4 for the audit-log
 	// emission. A non-zero rate indicates that transitions are
 	// succeeding but the events row isn't being written — the state
@@ -696,6 +711,30 @@ type OpsMetrics struct {
 	// alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the
 	// operator's "is meterd actually evaluating rules?" view.
 	alertEvaluatorEnabled prometheus.Gauge
+
+	// Issue #1233 / ADR-123 — alert-preset signal gauges.
+	// meterdAccountSpendEur (account_id) is the MTD EUR spend
+	// computed by the meterd tick loop and stamped every
+	// AlertEvalInterval. Cardinity is bounded by account count.
+	meterdAccountSpendEur *prometheus.GaugeVec
+	// apidTenantSurfaceCertExpirySeconds (account_id, app_id,
+	// hostname) is the per-host cert-expiry gauge fed by the
+	// meterd_tenant_surface_cert_expiry_state walker
+	// (CLAUDE.md ownership rule: this is a derived signal cache,
+	// not customer intent, so the meter daemon owns the writer
+	// side; the apid process only reads via state.MinCertExpiryForApp).
+	// The alert evaluator's cert_expiry_seconds metric reads MIN
+	// across the label set.
+	apidTenantSurfaceCertExpirySeconds *prometheus.GaugeVec
+	// apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal
+	// (result) is the walker's fleet-level status counter —
+	// {ok, error} closed vocabulary. Surfaces a healthy vs
+	// failing walker for the §12 self-healing alert. The
+	// accessor is exposed as a `meterd_*` sibling at
+	// MeterdTenantSurfaceCertExpiryRefresherWalkCompleteTotal
+	// (renamed in the ADR-123 ownership review) to make the
+	// meter-daemon-writer side explicit.
+	apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal *prometheus.CounterVec
 	// standbyState — operator-facing enum gauge stamped by
 	// gatewayd-public on every active-passive HA state transition
 	// (Tier A8 / ADR-083). Values are 1/2/3 mapped to the
@@ -1600,6 +1639,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Always-1 gauge that exposes the platform's current release identifier (issue #586 / ADR-129), labelled by version. One row per distinct version seen across the fleet — the gauge value is meaningless; the label carries the signal. Pre-instantiated at boot from wire.Version. Operator dashboards query this metric for the 'Releases fleet-wide' stat panel and to detect partial rollouts (a cluster with 2 versions visible is mid-rollout).",
 	}, []string{"version"})
 	faasDeployVersion.WithLabelValues(Version).Set(1)
+	// ADR-127 §D3 (Layer 7) — bridgeFramingTotal. Three closed
+	// label sets; pre-instantiate the full cross-product so the
+	// bridge-protection dashboard panel renders a zero row from
+	// boot (the §12 panel-at-day-1 contract).
+	//
+	// app_protocol    ∈ {http1, http2, grpc}     (pkg/api/app_protocol.go)
+	// bridge_protocol ∈ {h1, h2c}
+	// framing         ∈ {match, mismatch}        (the alert source)
+	bridgeFramingTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_bridge_framing_total",
+		Help: "Count of inbound bridge requests by (app_protocol, bridge_protocol, framing), where framing=mismatch means the operator's FAAS_BRIDGE_PROTOCOL env value does not match the app's app_protocol setting (the surgical-rollback signal per docs/ops/h2c-rollback.md). All three label sets are closed; the 12-series cross-product is pre-instantiated at boot so the bridge-protection Grafana dashboard (deploy/grafana/bridge-protection.json, ADR-127 §D3) renders from boot. Producer: vmmd-side increment on receipt of the X-Faas-Bridge-Framing response header from the bridge in pkg/vmmdgrpc/forward.go::forwardHTTPStreamV2 (the bridge is a separate process that doesn't import pkg/wire, so the counter is incremented on the vmmd side via response-header roundtrip; cmd/vmmd-stream-bridge::newHandler writes the header, vmmd extracts it via httpResp.Header.Get). The metric is exported by vmmd's /metrics handler.",
+	}, []string{"app_protocol", "bridge_protocol", "framing"})
+	for _, ap := range api.AppProtocolClosedSet {
+		for _, bp := range []string{"h1", "h2c"} {
+			for _, fr := range []string{"match", "mismatch"} {
+				bridgeFramingTotal.WithLabelValues(ap, bp, fr)
+			}
+		}
+	}
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -2181,6 +2239,23 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// gauge series would otherwise look like "never scraped", which
 	// Prometheus treats as a missing time series rather than zero.
 	alertEvaluatorEnabled.Set(0)
+
+	// Issue #1233 / ADR-123 — alert-preset signal gauges.
+	meterdAccountSpendEur := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_account_spend_eur",
+		Help: "Per-{account_id} MTD EUR spend, recomputed by the meterd tick loop every AlertEvalInterval. Backs the alert preset spend_eur_20. Cardinity is bounded by account count.",
+	}, []string{"account_id"})
+	apidTenantSurfaceCertExpirySeconds := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_tenant_surface_cert_expiry_seconds",
+		Help: "Per-{account_id, app_id, hostname} remaining-seconds gauge for the meterd_tenant_surface_cert_expiry_state walker (CLAUDE.md ownership rule: meter daemon owns the writer side; apid reads via state.MinCertExpiryForApp). Backs the alert preset cert_expiring_14d. Cardinity is bounded by per-tenant surface count.",
+	}, []string{"account_id", "app_id", "hostname"})
+	apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_tenant_surface_cert_expiry_refresher_walk_complete_total",
+		Help: "Per-{result} walker status counter for the meterd_tenant_surface_cert_expiry refresher (issue #1233 / ADR-123). Closed vocabulary {ok, error}. Surfaces a healthy vs failing walker for the §12 self-healing alert.",
+	}, []string{"result"})
+	for _, r := range []string{"ok", "error"} {
+		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal.WithLabelValues(r)
+	}
 	imagedOCIPull := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_oci_pull_duration_seconds",
 		Help: "Latency of imaged's OCI registry pulls (manifest, config, blob, above-base), in seconds. Sized to api.OCIPullTimeoutSeconds (60 s).",
@@ -2544,7 +2619,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3342,6 +3417,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		daemonUptimeSeconds:                  daemonUptimeSeconds,
 		daemonReady:                          daemonReady,
 		faasDeployVersion:                    faasDeployVersion,
+		bridgeFramingTotal:                   bridgeFramingTotal,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
 		gatewayDrainWaitSeconds:              gatewayDrainWaitSeconds,
@@ -3387,78 +3463,81 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		paddleWebhookVerifyFailedTotal:       paddleWebhookVerifyFailedTotal,
 		paddleWebhookReplaySuppressedTotal:   paddleWebhookReplaySuppressedTotal,
 		alertEvaluatorEnabled:                alertEvaluatorEnabled,
-		pgBackupLastPushed:                   pgBackupLastPushed,
-		ipLabels:                             newIPLabelSet(maxIPLabelValues),
-		topTenantRPS:                         topTenantRPS,
-		topAccounts:                          newTopAccountSet(topAccountSetCap),
-		throttleSecondsTotal:                 throttleSecondsTotal,
-		throttleRatio:                        throttleRatio,
-		topApps:                              newTopAppSet(topAppSetCap),
-		throttleSecondsLastSeen:              newCPUThrottleLastSeen(),
-		cpuSecondsLast:                       newCPUSecondsLastSeen(),
-		cronFireNowDispatchDur:               cronFireNowDispatchDur,
-		stripePushDur:                        stripePushDur,
-		paddlePushDur:                        paddlePushDur,
-		buildDur:                             buildDur,
-		buildQueueWait:                       buildQueueWait,
-		residentGBPerCustomer:                residentGBPerCustomer,
-		billingCapExceededTotal:              billingCapExceededTotal,
-		meterdFloorAppliedTotal:              meterdFloorAppliedTotal,
-		auditOrgEvent:                        auditOrgEvent,
-		authzDenied:                          authzDenied,
-		authzAllowed:                         authzAllowed,
-		wakeIDV4Fallback:                     wakeIDV4Fallback,
-		snapshotDiskDrift:                    snapshotDiskDrift,
-		capacitySignatureRejected:            capacitySignatureRejected,
-		imagedOCIPull:                        imagedOCIPull,
-		instanceCPUPct:                       instanceCPUPct,
-		instanceRSSMB:                        instanceRSSMB,
-		instanceInflightReqs:                 instanceInflightReqs,
-		instanceCPUSecondsTotal:              instanceCPUSecondsTotal,
-		instanceStatsCollectDur:              instanceStatsCollectDur,
-		instanceStatsPartialErrors:           instanceStatsPartialErrors,
-		sidecarRestartTotal:                  sidecarRestartTotal,
-		cpuStatsCollectDur:                   cpuStatsCollectDurLocal,
-		scaleUpDecisions:                     scaleUpDecisions,
-		scaleDownDecisions:                   scaleDownDecisions,
-		floorReconcileDecisions:              floorReconcileDecisions,
-		floorReconcileErrors:                 floorReconcileErrors,
-		floorInstancesAdmitted:               floorInstancesAdmitted,
-		scaleUpAdmitRPS:                      scaleUpAdmitRPS,
-		sseClients:                           sseClients,
-		egressDeny:                           egressDeny,
-		ociEgressDeny:                        ociEgressDeny,
-		provenanceWrites:                     provenanceWrites,
-		imageScanVulns:                       imageScanVulns,
-		deployScanDuration:                   deployScanDuration,
-		deployStageDuration:                  deployStageDuration,
-		deployScanTotal:                      deployScanTotal,
-		deployScanVulns:                      deployScanVulns,
-		liveMigrationDecisions:               liveMigrationDecisions,
-		rebalanceDecisions:                   rebalanceDecisions,
-		migratingReconcileDecisions:          migratingReconcileDecisions,
-		appAtCapacityTotal:                   appAtCapacityTotal,
-		pressureReassignmentsTotal:           pressureReassignmentsTotal,
-		overflowTargetSpillHitsTotal:         overflowTargetSpillHitsTotal,
-		activePassiveFailoversTotal:          activePassiveFailoversTotal,
-		standbyState:                         standbyState,
-		standbyStateValue:                    StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
-		deadNodeReconcileDecisions:           deadNodeReconcileDecisions,
-		registryCredentialMarkUsedFailures:   registryCredentialMarkUsedFailures,
-		storageCacheStaleFallback:            storageCacheStaleFallback,
-		apidLogsEmittedTotal:                 apidLogsEmittedTotal,
-		apidLogsDroppedTotal:                 apidLogsDroppedTotal,
-		egressSourceErrors:                   egressSourceErrors,
-		oauthDisabledTotal:                   oauthDisabledTotal,
-		advisoryBatchesEmittedTotal:          advisoryBatchesEmittedTotal,
-		apidStatelessAdvisoryEventsTotal:     apidStatelessAdvisoryEventsTotal,
-		apidGithubdBridgeEnqueuedTotal:       apidGithubdBridgeEnqueuedTotal,
-		githubdPathFilterTotal:               githubdPathFilterTotal,
-		wakePhaseEmitted:                     wakePhaseEmitted,
-		wakePhaseDur:                         wakePhaseDur,
-		esmPollsTotal:                        esmPollsTotal,
-		esmRecordsConsumedTotal:              esmRecordsConsumedTotal,
-		esmLagSeconds:                        esmLagSeconds,
+		meterdAccountSpendEur:                meterdAccountSpendEur,
+		apidTenantSurfaceCertExpirySeconds:   apidTenantSurfaceCertExpirySeconds,
+		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal: apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal,
+		pgBackupLastPushed:                 pgBackupLastPushed,
+		ipLabels:                           newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                       topTenantRPS,
+		topAccounts:                        newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:               throttleSecondsTotal,
+		throttleRatio:                      throttleRatio,
+		topApps:                            newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:            newCPUThrottleLastSeen(),
+		cpuSecondsLast:                     newCPUSecondsLastSeen(),
+		cronFireNowDispatchDur:             cronFireNowDispatchDur,
+		stripePushDur:                      stripePushDur,
+		paddlePushDur:                      paddlePushDur,
+		buildDur:                           buildDur,
+		buildQueueWait:                     buildQueueWait,
+		residentGBPerCustomer:              residentGBPerCustomer,
+		billingCapExceededTotal:            billingCapExceededTotal,
+		meterdFloorAppliedTotal:            meterdFloorAppliedTotal,
+		auditOrgEvent:                      auditOrgEvent,
+		authzDenied:                        authzDenied,
+		authzAllowed:                       authzAllowed,
+		wakeIDV4Fallback:                   wakeIDV4Fallback,
+		snapshotDiskDrift:                  snapshotDiskDrift,
+		capacitySignatureRejected:          capacitySignatureRejected,
+		imagedOCIPull:                      imagedOCIPull,
+		instanceCPUPct:                     instanceCPUPct,
+		instanceRSSMB:                      instanceRSSMB,
+		instanceInflightReqs:               instanceInflightReqs,
+		instanceCPUSecondsTotal:            instanceCPUSecondsTotal,
+		instanceStatsCollectDur:            instanceStatsCollectDur,
+		instanceStatsPartialErrors:         instanceStatsPartialErrors,
+		sidecarRestartTotal:                sidecarRestartTotal,
+		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
+		scaleUpDecisions:                   scaleUpDecisions,
+		scaleDownDecisions:                 scaleDownDecisions,
+		floorReconcileDecisions:            floorReconcileDecisions,
+		floorReconcileErrors:               floorReconcileErrors,
+		floorInstancesAdmitted:             floorInstancesAdmitted,
+		scaleUpAdmitRPS:                    scaleUpAdmitRPS,
+		sseClients:                         sseClients,
+		egressDeny:                         egressDeny,
+		ociEgressDeny:                      ociEgressDeny,
+		provenanceWrites:                   provenanceWrites,
+		imageScanVulns:                     imageScanVulns,
+		deployScanDuration:                 deployScanDuration,
+		deployStageDuration:                deployStageDuration,
+		deployScanTotal:                    deployScanTotal,
+		deployScanVulns:                    deployScanVulns,
+		liveMigrationDecisions:             liveMigrationDecisions,
+		rebalanceDecisions:                 rebalanceDecisions,
+		migratingReconcileDecisions:        migratingReconcileDecisions,
+		appAtCapacityTotal:                 appAtCapacityTotal,
+		pressureReassignmentsTotal:         pressureReassignmentsTotal,
+		overflowTargetSpillHitsTotal:       overflowTargetSpillHitsTotal,
+		activePassiveFailoversTotal:        activePassiveFailoversTotal,
+		standbyState:                       standbyState,
+		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
+		deadNodeReconcileDecisions:         deadNodeReconcileDecisions,
+		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
+		storageCacheStaleFallback:          storageCacheStaleFallback,
+		apidLogsEmittedTotal:               apidLogsEmittedTotal,
+		apidLogsDroppedTotal:               apidLogsDroppedTotal,
+		egressSourceErrors:                 egressSourceErrors,
+		oauthDisabledTotal:                 oauthDisabledTotal,
+		advisoryBatchesEmittedTotal:        advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal:   apidStatelessAdvisoryEventsTotal,
+		apidGithubdBridgeEnqueuedTotal:     apidGithubdBridgeEnqueuedTotal,
+		githubdPathFilterTotal:             githubdPathFilterTotal,
+		wakePhaseEmitted:                   wakePhaseEmitted,
+		wakePhaseDur:                       wakePhaseDur,
+		esmPollsTotal:                      esmPollsTotal,
+		esmRecordsConsumedTotal:            esmRecordsConsumedTotal,
+		esmLagSeconds:                      esmLagSeconds,
 	}
 }
 
@@ -3685,6 +3764,27 @@ func (m *OpsMetrics) IncCVEOpen(severity, dep string, count float64) {
 		return
 	}
 	m.cvesOpenTotal.WithLabelValues(severity, dep).Set(count)
+}
+
+// BridgeFramingTotal (ADR-127 §D3, Layer 7) returns the per-
+// (app_protocol, bridge_protocol, framing) counter that the
+// vmmd-stream-bridge's newHandler closure increments on every
+// inbound request. The "mismatch" label is the operator-facing
+// signal for the surgical-rollback path: a sustained mismatch
+// rate > 0.1 rps triggers FaasBridgeFramingMismatch (see
+// pkg/api/alerts.go).
+//
+// All three label values are validated against closed sets in
+// the producer (cmd/vmmd-stream-bridge::newHandler); invalid
+// labels surface as Prometheus label-validation errors at boot
+// rather than silently extending the time-series set. nil-
+// receiver guard matches the OpsMetrics accessors above so unit
+// tests without metrics keep working.
+func (m *OpsMetrics) BridgeFramingTotal(appProtocol, bridgeProtocol, framing string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.bridgeFramingTotal.WithLabelValues(appProtocol, bridgeProtocol, framing)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier
@@ -5262,6 +5362,52 @@ func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
 		return func() {}
 	}
 	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
+	return func() {}
+}
+
+// MeterdAccountSpendEur returns the per-{account_id} MTD EUR-spend
+// gauge fed by the meterd spend aggregator. Issue #1233 / ADR-123
+// backs the alert preset spend_eur_20. Returns nil on a nil receiver.
+func (m *OpsMetrics) MeterdAccountSpendEur() *prometheus.GaugeVec {
+	if m == nil {
+		return nil
+	}
+	return m.meterdAccountSpendEur
+}
+
+// ApidTenantSurfaceCertExpirySeconds returns the per-{account_id,
+// app_id, hostname} remaining-seconds gauge fed by the
+// meterd_tenant_surface_cert_expiry refresher
+// (cmd/meterd/alert_presets_ticks.go). Issue #1233 / ADR-123 backs
+// the alert preset cert_expiring_14d. The accessor + metric name
+// keep the legacy `apid_` prefix for backward-compat with already-
+// deployed alert rules; the underlying table is meterd-owned per
+// the CLAUDE.md ownership rule. Returns nil on a nil receiver.
+func (m *OpsMetrics) ApidTenantSurfaceCertExpirySeconds() *prometheus.GaugeVec {
+	if m == nil {
+		return nil
+	}
+	return m.apidTenantSurfaceCertExpirySeconds
+}
+
+// ApidTenantSurfaceCertExpiryRefresherWalkCompleteTotal increments
+// the walker status counter with the closed-vocabulary {ok, error}
+// outcome. Used by the meterd_tenant_surface_cert_expiry
+// refresher at cmd/meterd/alert_presets_ticks.go
+// (issue #1233 / ADR-123) — surfaces a healthy vs failing walker
+// for the §12 self-healing alert. Returns a no-op closure on a nil
+// receiver or an unknown result.
+func (m *OpsMetrics) ApidTenantSurfaceCertExpiryRefresherWalkCompleteTotal(result string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch result {
+	case "ok", "error":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal.WithLabelValues(result).Inc()
 	return func() {}
 }
 

@@ -40,7 +40,7 @@ const (
 func cmdAlerts(args []string) int {
 	parent, _ := lookupCliCommand("alerts")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale alerts <list|add|info|update|rm|rotate-secret> --app <slug>", "alerts")
+		PrintUsage(os.Stderr, "usage: gregale alerts <list|add|info|update|rm|rotate-secret|preset> --app <slug>", "alerts")
 		return 1
 	}
 	switch args[0] {
@@ -56,6 +56,11 @@ func cmdAlerts(args []string) int {
 		return cmdAlertRm(args[1:])
 	case "rotate-secret":
 		return cmdAlertRotateSecret(args[1:])
+	case "preset":
+		// Issue #1233 / ADR-123 — alert-preset catalog +
+		// instantiate-from-preset. Two leaves under preset:
+		// list, enable. Documented at commands_alert_presets.go.
+		return cmdAlertsPreset(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown alerts subcommand %q\n", args[0])
 	sug, _ := suggestSubcommand(args[0], parent)
@@ -402,7 +407,7 @@ func cmdAlertRotateSecret(args []string) int {
 
 // alertIDPattern matches the 32-hex shape apid uses for alert rule
 // ids. Same convention as webhookIDPattern (commands_webhooks.go:342).
-var alertIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var alertIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // formatThreshold renders a float threshold without scientific
 // notation for the table view. Avoids the "%g" default which would

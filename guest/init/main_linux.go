@@ -472,6 +472,20 @@ func ensureRailpackMise() error {
 	return stageExecutable(railpackMiseSource, railpackMiseTarget)
 }
 
+// ensureBuilderShell ensures /bin/bash and /usr/bin/bash point to a valid shell
+// so python-build / mise scripts with #!/usr/bin/env bash can execute cleanly.
+func ensureBuilderShell() error {
+	for _, target := range []string{"/bin/bash", "/usr/bin/bash"} {
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			_ = os.MkdirAll(filepath.Dir(target), 0o755)
+			if _, shErr := os.Stat("/bin/sh"); shErr == nil {
+				_ = os.Symlink("/bin/sh", target)
+			}
+		}
+	}
+	return nil
+}
+
 func stageExecutable(source, target string) error {
 	in, err := os.Open(source) //nolint:forbidigo // source is the builder image's vetted mise path.
 	if err != nil {
@@ -555,6 +569,16 @@ func runBuild(m api.BuildManifest) error {
 		if err := flattenSingleSourceDir(m.Workdir); err != nil {
 			return writeAndPoweroff(m, fmt.Errorf("normalize source root: %w", err), "")
 		}
+		_ = filepath.Walk(m.Workdir, func(p string, info os.FileInfo, err error) error {
+			if err == nil {
+				if info.IsDir() {
+					_ = os.Chmod(p, 0o777)
+				} else {
+					_ = os.Chmod(p, 0o666)
+				}
+			}
+			return nil
+		})
 	}
 
 	// 2. Start BuildKit inside the builder VM. Railpack is a BuildKit
@@ -609,6 +633,9 @@ func runBuild(m api.BuildManifest) error {
 	guestStage("resolver")
 	if err := ensureRailpackMise(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("railpack mise: %w", err), "")
+	}
+	if err := ensureBuilderShell(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("builder shell: %w", err), "")
 	}
 	guestStage("mise")
 	// Railpack resolves language toolchains and package registries from inside
@@ -807,6 +834,9 @@ func runBuild(m api.BuildManifest) error {
 	// bounded liveness check and the build wall-clock timeout remains the outer
 	// safety limit.
 	cmd.Env = builderEnv(
+		"USER=root",
+		"HOME=/root",
+		"TMPDIR=/tmp",
 		"BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock",
 		"BUILDKIT_SESSION_HEALTH_TIMEOUT_MS=300000",
 	)
@@ -831,11 +861,20 @@ func runBuild(m api.BuildManifest) error {
 		// descendant prevents exec.Cmd.Wait from returning.
 		err = context.DeadlineExceeded
 	}
-	if err != nil && buildkitLog.Len() > 0 {
-		buf.WriteString("\n[buildkitd]\n")
-		_, _ = buf.Write(buildkitLog.Bytes())
+	fmt.Printf("guest-init: build command finished, err=%v, output bytes=%d\n", err, buf.Len())
+	if buf.Len() > 0 {
+		fmt.Printf("--- build output ---\n%s\n--- end build output ---\n", buf.String())
 	}
-	return writeAndPoweroff(m, err, tailOf(buf.Bytes(), m.LogTailBytes))
+	var combined bytes.Buffer
+	if buf.Len() > 0 {
+		combined.WriteString("[build]\n")
+		combined.WriteString(tailOf(buf.Bytes(), m.LogTailBytes/2))
+	}
+	if err != nil && buildkitLog.Len() > 0 {
+		combined.WriteString("\n[buildkitd]\n")
+		combined.WriteString(tailOf(buildkitLog.Bytes(), m.LogTailBytes/2))
+	}
+	return writeAndPoweroff(m, err, combined.String())
 }
 
 // probeBuilderWorkspace verifies the exact user/mount namespace boundary used
@@ -974,7 +1013,7 @@ func buildArgv(m api.BuildManifest) []string {
 	switch m.Framework {
 	case api.FrameworkDockerfile:
 		return []string{
-			"/usr/local/bin/buildctl", "build",
+			"/usr/local/bin/buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock", "build",
 			"--frontend", "dockerfile",
 			"--local", "context=" + m.Workdir,
 			"--local", "dockerfile=" + m.Workdir,
@@ -988,10 +1027,9 @@ func buildArgv(m api.BuildManifest) []string {
 		"/usr/local/bin/railpack", "prepare", shellQuote(m.Workdir),
 		"--plan-out", shellQuote(planPath),
 		"--info-out", shellQuote(infoPath),
-		"--hide-pretty-plan",
 	}, " ")
 	build := strings.Join([]string{
-		"/usr/local/bin/buildctl", "build",
+		"/usr/local/bin/buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock", "build",
 		"--frontend", "gateway.v0",
 		"--opt", "source=ghcr.io/railwayapp/railpack-frontend:latest",
 		"--opt", "filename=railpack-plan.json",
@@ -1000,7 +1038,7 @@ func buildArgv(m api.BuildManifest) []string {
 		"--output", "type=oci,dest=" + shellQuote(filepath.Join(m.OutDir, "image.tar")),
 		"--progress", "plain",
 	}, " ")
-	return []string{"/bin/sh", "-c", prepare + " && exec " + build}
+	return []string{"/bin/sh", "-c", "set -x; " + prepare + " && exec " + build}
 }
 
 // shellQuote quotes a path embedded in the small prepare/build command above.

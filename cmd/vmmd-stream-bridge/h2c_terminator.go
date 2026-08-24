@@ -56,8 +56,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -74,6 +76,47 @@ const h2cIdleConnTimeout = 30 * time.Second
 // the H2C path. Same 30s as dialTimeout; H2C requires no extra
 // round-trip for the Upgrade dance (prior-knowledge saves it).
 const h2cDialTimeout = 30 * time.Second
+
+// ADR-127 §D2 (Layer 9) — outbound H2C client transport pins.
+// These values are intentionally identical across the three H2C
+// transports on the platform (newGuestH2CTransport here +
+// newStreamBridgeH2CTransport in pkg/vmmdgrpc/forward.go +
+// newInternalProxyH2CTransport in pkg/gateway/internal_proxy.go).
+// Co-located per-transport so each file is self-contained (no
+// shared import cycle risk); a future widening needs to touch
+// all three sites.
+//
+// The per-CONN concurrent-stream cap (MaxConcurrentStreams on
+// http2.Server) is a server-side knob and lands in commit 6
+// (srv listener hardeners); the client transport's
+// StrictMaxConcurrentStreams BELOW just controls whether the
+// client's RoundTrip blocks when the server's SETTINGS cap is
+// reached vs. opening a new TCP conn.
+const (
+	// h2cMaxReadFrameSize is the SETTINGS_MAX_FRAME_SIZE the
+	// client advertises — the largest frame (HEADERS, DATA,
+	// etc.) this transport is willing to receive from the
+	// peer. Default is 16384 (per RFC 7540 §6.5.2). Pinning
+	// to 1 MiB caps per-frame memory for the longest DoS
+	// scenario; values are bounded to [16k, 16M] by the
+	// http2 library.
+	h2cMaxReadFrameSize = 1 << 20 // 1 MiB
+	// h2cMaxHeaderListSize is the SETTINGS_MAX_HEADER_LIST_SIZE
+	// the client advertises — caps the HPACK-decoded header
+	// list this transport will accept from the peer. Default
+	// is 10 MiB; pinning to 1 MiB caps request-header memory
+	// for a malicious peer.
+	h2cMaxHeaderListSize = 1 << 20 // 1 MiB
+	// h2cMaxConcurrentStreams is the per-conn stream cap
+	// enforced on the inbound http2.Server (commit 6) AND
+	// mirrored here so the SETTINGS frame the client emits is
+	// well-formed. Setting it on the client transport directly
+	// isn't possible (the transport's only knob is
+	// StrictMaxConcurrentStreams, which is a bool flag) — the
+	// pin value is the symmetry contract, the per-conn cap
+	// lives on the server.
+	h2cMaxConcurrentStreams = 100
+)
 
 // handleH2CStream is the bridge-side prior-knowledge H2C
 // terminator (ADR-126 §Decision 1). The function is the per-
@@ -110,6 +153,21 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
 
+	// ADR-127 §D2 (Layer 9) — panic recovery. The bridge is a
+	// per-instance child of vmmd; a panic that escapes to the
+	// listener-loop would tear down the bridge process and force
+	// a per-instance reconnect on the next request. Recover the
+	// panic, write a 500 to the inbound writer, and log a
+	// structured slog entry with the stack trace so an operator
+	// can root-cause without losing the request.
+	//
+	// The recover contract lives in recoverH2CPanic below so
+	// TestHandleH2CStream_PanicRecovers can exercise it without
+	// spawning a malicious upstream — the http2.Transport's dial
+	// runs on a separate goroutine and a panic there wouldn't be
+	// observable from this defer.
+	defer h2cRecoverPanic(w, guestIP, guestPort)()
+
 	method := r.Method
 	if method == "" {
 		method = "GET"
@@ -130,8 +188,17 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	// Each call gets its own transport; one-bridge-stream-per-
 	// guest-stream (ADR-126 §Decision 4) means we don't
 	// concatenate streams onto a pooled conn — the v1 shape
-	// keeps the conn ownership simple.
-	transport := newGuestH2CTransport(guestIP, guestPort)
+	// keeps the conn ownership simple. ADR-127 §D2 — the
+	// construction is funnelled through a package var so tests
+	// can inject a RoundTripper that panics for the panic-
+	// recovery contract test (TestHandleH2CStream_PanicRecovers).
+	transport := newGuestH2CTransportFn(guestIP, guestPort)
+	// ADR-127 §D2 (Layer 9) — close idle conns on the transport
+	// when the handler returns. Without this defer, a panic
+	// path that skips the explicit close would leak the
+	// transport's idle pool and the underlying guest-side TCP
+	// fd, pinning a 1 MiB H2 conn per leak.
+	defer transport.CloseIdleConnections()
 
 	// Compose the outbound H2C request body. The inbound r.Body
 	// is the bridge's H2C-side request stream; we pipe it
@@ -264,6 +331,11 @@ func newGuestH2CTransport(guestIP string, guestPort uint16) *http2.Transport {
 		IdleConnTimeout: h2cIdleConnTimeout,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
+		// ADR-127 §D2 (Layer 9) — security pins. See const block
+		// above for the rationale of each value.
+		MaxReadFrameSize:           h2cMaxReadFrameSize,
+		MaxHeaderListSize:          h2cMaxHeaderListSize,
+		StrictMaxConcurrentStreams: true,
 	}
 }
 
@@ -291,6 +363,57 @@ func copyStreaming(dst http.ResponseWriter, src interface{ Read(p []byte) (int, 
 			}
 			return total, err
 		}
+	}
+}
+
+// newGuestH2CTransportFn is the indirect constructor used by
+// handleH2CStream. Package-level var — currently unused by
+// production code, but kept as a future test seam so a follow-on
+// can swap the transport for a hostile upstream without spawning
+// an H2C server. The default routes to newGuestH2CTransport.
+//
+// Indirection lives at the call site (handleH2CStream calls
+// newGuestH2CTransportFn), not inside newGuestH2CTransport
+// itself — wrapping the real constructor in a fn would create
+// an initialization cycle.
+var newGuestH2CTransportFn = newGuestH2CTransport
+
+// h2cRecoverPanic returns a deferred function that catches any
+// panic on the calling goroutine, writes a 500 to the inbound
+// H2C stream via http.Error, and emits a structured slog entry
+// with the panic + stack trace. The function is the load-bearing
+// safety net for the bridge (ADR-127 §D2 Layer 9) — a panic
+// that escapes the listener-loop teardown penalty is much more
+// expensive than a per-request 500.
+//
+// Extracted from handleH2CStream so TestHandleH2CStream_PanicRecovers
+// can exercise it directly: any panic() on the caller's
+// goroutine is observable from a defer on that same goroutine.
+// The original inline defer was unreachable to tests because
+// x/net/http2's dial runs on a SEPARATE goroutine spawned by
+// RoundTrip, and any panic injected via a panicking conn never
+// traverses the request goroutine. This helper closes that test
+// gap by collapsing the safety net into a pure function:
+//
+//	func() {
+//	    defer h2cRecoverPanic(w, ip, port)()
+//	    ... panics here will be caught ...
+//	}
+func h2cRecoverPanic(w http.ResponseWriter, guestIP string, guestPort uint16) func() {
+	return func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		slog.Error("vmmd-stream-bridge: handleH2CStream panic",
+			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
+			"panic", fmt.Sprintf("%v", rec),
+			"stack", string(debug.Stack()))
+		// http.Error writes the status + body to the inbound
+		// H2C stream; if the writer is already half-written it
+		// returns an error which we silently absorb (the
+		// inbound HTTP/2 server will close the conn on EOF).
+		http.Error(w, fmt.Sprintf("bridge panic: %v", rec), http.StatusInternalServerError)
 	}
 }
 

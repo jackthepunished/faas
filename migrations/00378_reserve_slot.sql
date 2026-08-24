@@ -1,4 +1,7 @@
--- filename: 00378_reserve_slot.sql
+-- 00378_reserve_slot.sql — temporary concurrent-PR migration fence.
+-- The real migration for this slot is being coordinated by other
+-- open PRs (PR #1030 apps_public_auth_members_only). Remove this
+-- no-op when those migrations land, per ADR-041.
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;

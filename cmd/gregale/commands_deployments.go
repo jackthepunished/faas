@@ -42,7 +42,7 @@ import (
 // /v1/deployments/{id} and the --deployment flag on `gregale logs`).
 // Local validation lets the CLI return a fast validation_failed error
 // instead of a 404 round-trip — UX §3.3 "first error is the right one".
-var deploymentIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var deploymentIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // deploymentRowFmt is the human list-table column layout. Widths assume
 // 32-hex deployment ids (32 chars), 32-hex app ids (32 chars), short

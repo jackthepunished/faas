@@ -886,6 +886,36 @@ type ReleaseBundle struct {
 	AppliedAt    pgtype.Timestamptz
 }
 
+type RequestTelemetry struct {
+	ID           pgtype.UUID
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	DeploymentID pgtype.UUID
+	Route        string
+	Method       string
+	Status       int32
+	LatencyMs    int32
+	ColdBoot     bool
+	TraceID      pgtype.Text
+	SpansSummary []byte
+	ReceivedAt   pgtype.Timestamptz
+}
+
+type RequestTelemetryDefault struct {
+	ID           pgtype.UUID
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	DeploymentID pgtype.UUID
+	Route        string
+	Method       string
+	Status       int32
+	LatencyMs    int32
+	ColdBoot     bool
+	TraceID      pgtype.Text
+	SpansSummary []byte
+	ReceivedAt   pgtype.Timestamptz
+}
+
 type Session struct {
 	ID          pgtype.UUID
 	AccountID   pgtype.UUID

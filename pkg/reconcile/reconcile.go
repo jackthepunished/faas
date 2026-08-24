@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
@@ -134,11 +135,12 @@ func (s *Service) Reconcile(
 	scan reposcan.Result,
 	commitSHA string,
 	branch string,
+	exclude []string,
 ) (Result, error) {
 	// Implementation lives in the reconcile_internal.go file in
 	// the same package. Splitting it keeps this file readable as
 	// the package's public-surface contract.
-	return s.reconcile(ctx, project, scan, commitSHA, branch)
+	return s.reconcile(ctx, project, scan, commitSHA, branch, exclude)
 }
 
 // Plan runs the same three guards + diff as Reconcile but never
@@ -172,6 +174,7 @@ func (s *Service) Plan(
 	scan reposcan.Result,
 	commitSHA string,
 	branch string,
+	exclude []string,
 ) (Result, error) {
 	if s.Scan == nil {
 		// Mirror NewService's panic-on-nil so test stubs that
@@ -215,8 +218,16 @@ func (s *Service) Plan(
 	}
 
 	// 3. Diff. workloadDiff is read-only; it does not touch the
-	// store and does not emit audit.
-	actions := workloadDiff(scan, project, existing)
+	// store and does not emit audit. The exclude set is built
+	// here (lowercased for case-insensitive matching against
+	// existing WorkloadName) so the dry-run projection honors
+	// the operator's --exclude intent — without it, a dry-run
+	// Plan would still report removes for excluded apps.
+	excludeSet := make(map[string]bool, len(exclude))
+	for _, name := range exclude {
+		excludeSet[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	actions := workloadDiff(scan, project, existing, excludeSet)
 
 	// 4. Project the would-be Result without applying. The shape
 	// mirrors applyActions' return: Added = would-be creates,

@@ -93,7 +93,16 @@ func Materialize(name, dest string) error {
 	if err != nil {
 		return err
 	}
-	return os.CopyFS(dest, subFS)
+	if err := os.CopyFS(dest, subFS); err != nil {
+		return err
+	}
+	if name == "hello-go" || name == "function-go" {
+		modPath := filepath.Join(dest, "go.mod")
+		if _, err := os.Stat(modPath); os.IsNotExist(err) {
+			_ = os.WriteFile(modPath, []byte("module "+name+"\n\ngo 1.24\n"), 0o644)
+		}
+	}
+	return nil
 }
 
 // TarGz materializes the template and writes a tar.gz to dest. The
@@ -151,6 +160,21 @@ func TarGz(name, dest string) error {
 			continue
 		}
 		if err := copyFromFS(tw, rootFS, p); err != nil {
+			return err
+		}
+	}
+	if name == "hello-go" || name == "function-go" {
+		modContent := []byte("module " + name + "\n\ngo 1.24\n")
+		hdr := &tar.Header{
+			Name:     name + "/go.mod",
+			Mode:     0o644,
+			Size:     int64(len(modContent)),
+			Typeflag: tar.TypeReg,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if _, err := tw.Write(modContent); err != nil {
 			return err
 		}
 	}

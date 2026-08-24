@@ -18,10 +18,11 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // Wipe-comments-load-bearing rationale that USED to live in the unit
 // file body, now preserved here:
 //
-//   - apid is the SOLE consumer of faas_session_key + faas_host_age_identity
-//     LoadCredentials (every other control-plane daemon reads sealed.env
-//     but does NOT read these credentials; the 32-byte session key + the
-//     host X25519 private half never enter their environments).
+//   - apid is the SOLE consumer of faas_session_key, faas_host_age_identity,
+//     and faas_host_hmac_key LoadCredentials (every other control-plane
+//     daemon reads sealed.env but does NOT read these credentials; the
+//     session key, host X25519 private half, and value-hash HMAC key never
+//     enter their environments).
 //   - The rotation-overlap LoadCredential (`:-` flag) on
 //     `faas_host_age_identity_previous` is a no-op pre-rotation but
 //     essential during the 30-day window after `gregale host-age rotate
@@ -60,6 +61,7 @@ func UnitApid() daemonunit.Unit {
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_SESSION_KEY", Value: "%d/faas_session_key"},
 			{Key: "FAAS_HOST_AGE_IDENTITY_PATH", Value: "%d/faas_host_age_identity"},
+			{Key: "FAAS_HOST_HMAC_KEY_PATH", Value: "%d/faas_host_hmac_key"},
 			{Key: "FAAS_APID_ADVISORY_SOCK", Value: "/run/faas/apid.sock"},
 			{Key: "FAAS_STATUSPAGE_PATH", Value: "/etc/faas/statuspage/index.html"},
 		},
@@ -67,6 +69,7 @@ func UnitApid() daemonunit.Unit {
 			{Name: "faas_session_key", Path: "/etc/faas/secrets/session.key"},
 			{Name: "faas_host_age_identity", Path: "/etc/faas/secrets/host.age"},
 			{Name: "faas_host_age_identity_previous", Path: "/etc/faas/secrets/host.age.previous", Optional: true},
+			{Name: "faas_host_hmac_key", Path: "/etc/faas/secrets/host.hmac.key"},
 		},
 
 		NoNewPrivileges:       true,

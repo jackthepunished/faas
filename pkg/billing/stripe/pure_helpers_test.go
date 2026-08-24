@@ -17,9 +17,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/state"
+	stripe "github.com/stripe/stripe-go"
 )
 
 // --- Config.Defaults --------------------------------------------
@@ -170,3 +172,163 @@ func TestPaymentMethodSummary_NoCustomerIgnoresAPIKey(t *testing.T) {
 		t.Errorf("got %+v, want zero PaymentMethod", got)
 	}
 }
+
+// --- WireQuantityForMBSeconds --------------------------------------
+
+// Pin the canonical M7 wire-quantity formula. 256 MB Hobby admission +
+// 8 MB overhead × 60 min/h × 24 h = 22_809_600 mb_seconds.
+//
+//	qty = mb_seconds * 1000 / 1024 / 3600
+//	    = 22_809_600 * 1000 / 1024 / 3600
+//	    = 22_809_600_000 / 3_686_400
+//	    = 6187
+//
+// This is the same integer the sandbox test asserts against the wire
+// (sandbox_test.go::TestInvoiceShadow24h_Sandbox); pinning it here
+// proves the in-process helper agrees with the SDK-roundtrip answer.
+func TestWireQuantityForMBSeconds(t *testing.T) {
+	cases := []struct {
+		name      string
+		mbSeconds int64
+		want      int64
+	}{
+		{"zero", 0, 0},
+		{"canonical_m7_24h", 22_809_600, 6187},
+		{"one_hour_264mb", 264 * 60 * 60, 257},
+		{"negative_truncates_to_zero", -1000, 0},
+		{"one_mb_second", 1, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := WireQuantityForMBSeconds(tc.mbSeconds); got != tc.want {
+				t.Errorf("WireQuantityForMBSeconds(%d) = %d, want %d", tc.mbSeconds, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- Capabilities / StripeCapabilities ----------------------------
+
+// StripeCapabilities returns the static invariant capability set,
+// documented at client.go:391 as CapRefund | CapUsageMetered |
+// CapSandbox. Loader-side metadata callers (loader.go:160) read this
+// without constructing a *Client.
+func TestStripeCapabilities_InvariantBitSet(t *testing.T) {
+	got := StripeCapabilities()
+	want := billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox
+	if got != billing.CapabilitySet(want) {
+		t.Errorf("StripeCapabilities = %d, want %d (CapRefund|CapUsageMetered|CapSandbox)", got, want)
+	}
+	for _, cap := range []billing.Capability{
+		billing.CapRefund,
+		billing.CapUsageMetered,
+		billing.CapSandbox,
+	} {
+		if !got.Has(cap) {
+			t.Errorf("Has(%d) = false on StripeCapabilities", cap)
+		}
+	}
+}
+
+// (c *Client).Capabilities is the per-instance capability read for the
+// Provider-conformance lookup; must agree with the free function.
+func TestClient_Capabilities_MatchesStripeCapabilities(t *testing.T) {
+	c := &Client{}
+	if got := c.Capabilities(); got != StripeCapabilities() {
+		t.Errorf("Capabilities() = %d, want %d (StripeCapabilities)", got, StripeCapabilities())
+	}
+}
+
+// --- NewClient missing branches -----------------------------------
+
+// Empty apiKey → no SDK is constructed. The Client must still be
+// usable (logger is set, fields preserved) so meterd can hand out
+// the Config but block at requireAPI() until the operator provides
+// the key — mirroring the staging-environment pattern.
+func TestNewClient_EmptyAPIKeyLeavesAPINil(t *testing.T) {
+	c := NewClient(nil, nil, "", "", nil)
+	if c.api != nil {
+		t.Error("empty apiKey: api != nil, want nil")
+	}
+	if c.apiKey != "" {
+		t.Errorf("apiKey = %q, want preserved empty", c.apiKey)
+	}
+	if c.log == nil {
+		t.Error("nil logger: log not defaulted to slog.Default()")
+	}
+}
+
+// Non-empty apiKey builds the SDK *client.API. We don't dereference
+// the result (no test should round-trip a live call) — just pin that
+// the API pointer is non-nil after NewClient.
+func TestNewClient_NonEmptyAPIKeyBuildsAPI(t *testing.T) {
+	c := NewClient(nil, nil, "sk_test_dummy", "whsec_dummy", nil)
+	if c.api == nil {
+		t.Error("non-empty apiKey: api = nil, want non-nil SDK client.API")
+	}
+	if c.apiKey != "sk_test_dummy" {
+		t.Errorf("apiKey = %q, want preserved", c.apiKey)
+	}
+}
+
+// --- ClassifyPushError missing cases ------------------------------
+
+// An unknown stripe.ErrorType falls through to the default branch
+// and is labelled "other". Real-world: Stripe may add a new error
+// category between SDK upgrades; the classification must degrade
+// gracefully instead of panicking.
+func TestClassifyPushError_UnknownStripeTypeIsOther(t *testing.T) {
+	err := &stripe.Error{Type: stripe.ErrorType("some_new_category")}
+	if got := ClassifyPushError(err); got != "other" {
+		t.Errorf("unknown Stripe type: got %q, want other", got)
+	}
+}
+
+// A non-nil error that is neither a sentinel nor a *stripe.Error
+// wraps to "other". Anything reaching ClassifyPushError that the
+// SDK didn't tag should still produce a stable label so the metric
+// histogram doesn't drop the observation.
+func TestClassifyPushError_GenericErrorIsOther(t *testing.T) {
+	if got := ClassifyPushError(errors.New("kaboom")); got != "other" {
+		t.Errorf("generic err: got %q, want other", got)
+	}
+}
+
+// --- CreateUpgradeTransaction (pure stub) -------------------------
+
+// Stripe-side upgrade transactions are intentionally absent;
+// CreateUpgradeTransaction returns ("", "", nil) and the apid
+// handler falls back to FAAS_BILLING_PORTAL_URL. Pin the contract
+// so a future refactor to delegate to a future Stripe API doesn't
+// silently break the apid path.
+func TestCreateUpgradeTransaction_ReturnsEmptyStub(t *testing.T) {
+	c := &Client{}
+	txID, url, err := c.CreateUpgradeTransaction(context.Background(), state.Account{ID: "a"}, "")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if txID != "" || url != "" {
+		t.Errorf("got (%q, %q), want (\"\", \"\")", txID, url)
+	}
+}
+
+// --- VerifyWebhook missing branches -------------------------------
+
+// Empty webhook secret short-circuits to ErrBadSignature; we never
+// reach VerifySignature. Without this test the empty-secret branch
+// is uncovered.
+func TestVerifyWebhook_EmptySecretReturnsErrBadSignature(t *testing.T) {
+	c := &Client{secret: ""}
+	_, err := c.VerifyWebhook([]byte(`{"type":"customer.created"}`), map[string]string{}, 5*time.Minute)
+	if err == nil {
+		t.Fatal("empty secret: err = nil, want ErrBadSignature")
+	}
+	if !errors.Is(err, billing.ErrBadSignature) {
+		t.Errorf("err = %v, want wraps ErrBadSignature", err)
+	}
+}
+
+// stripeErrorStub removed — use a real *stripe.Error literal
+// directly (the SDK exposes the struct publicly and an empty-init
+// with just the Type field is the shape ClassifyPushError dispatches
+// on).

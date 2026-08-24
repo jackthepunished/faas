@@ -48,6 +48,34 @@ type StreamingStatus string
 // and for deterministic tests — do not reorder.
 var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
 
+// planRank maps a Plan to its rank (Free=0 … Scale=3). The lookup
+// returns -1 for any unknown plan so a closed-set drift surfaces
+// as a clean failure rather than a silent false-positive "you meet
+// the minimum plan". Used by PlanMeetsMinimumPlan to compare tiers
+// in O(1) without parsing Plans on every call.
+var planRank = map[Plan]int{
+	PlanFree:  0,
+	PlanHobby: 1,
+	PlanPro:   2,
+	PlanScale: 3,
+}
+
+// PlanMeetsMinimumPlan returns true iff customer's plan rank is
+// >= minimumPlan's rank. Used by enableAlertPreset to gate the
+// catalog row's minimum_plan before loadApp (so a low-plan
+// customer posting to a non-existent slug gets a 402, not a 404
+// that would leak the slug's existence — same shape as the
+// ErrPlanAlertRulesNotAllowed guard at handlers_alerts.go:158-162).
+// Returns false for unknown plans (closed-set enforcement).
+func PlanMeetsMinimumPlan(customer, minimumPlan Plan) bool {
+	cRank, cOk := planRank[customer]
+	mRank, mOk := planRank[minimumPlan]
+	if !cOk || !mOk {
+		return false
+	}
+	return cRank >= mRank
+}
+
 // GDPR self-service export rate limit (issue #755 / PR-5.1). Single
 // global value (not per-plan) because the cost is per-bundle (one
 // export scans every per-account table) and the abuse case is
@@ -482,6 +510,18 @@ type Limits struct {
 	// M7. Both enforced under the same apps-row lock + per-account
 	// read in pkg/state.CreateAlertRuleIfUnderQuota.
 	AlertRuleLimitPerAccount int
+	// AlertPresetCatalogLimitPerAccount (issue #1233 / ADR-123) is
+	// the informational count of catalog rows the customer may see
+	// in the alert_presets catalog. NOT a per-app cap — instantiating
+	// a preset counts toward the existing AlertRuleLimitPerApp /
+	// AlertRuleLimitPerAccount. Default 0 (no catalog seeded); the
+	// PR-A seed inserts 8 rows so every plan gets 8. Surfaced via
+	// the GET /v1/alert-presets response so the CLI / dashboard can
+	// render "8 presets available" without hardcoding the seed
+	// count — a future ADR that re-seeds the catalog only has to
+	// bump the seed + the per-plan values; consumers read the
+	// accessor.
+	AlertPresetCatalogLimitPerAccount int
 
 	// EdgeRulesPerApp caps how many edge rules (ADR-089) an app may
 	// hold. Per-app scope only — there is no account-wide edge rule
@@ -659,6 +699,19 @@ type Limits struct {
 	// gives 10× Pro to mirror the consumer_keys 25× scale ceiling
 	// scaled down by 2.5× (OpenAPI docs are larger + rarer).
 	OpenAPIDocsPerAccount int
+	// OpenAPIImportsPerAccount (ADR-126 / issue #975 item #2)
+	// caps how many imported OpenAPI docs one account may own
+	// across all its apps. Per-plan: Free 100, Hobby 1000, Pro
+	// 10000, Scale 10000 (mirrors the OpenAPIDocsPerAccount
+	// ladder so the two surfaces share the same per-account
+	// ceiling shape — the import is overwrite-not-multi-version
+	// per app, so the per-account cap is the load-bearing
+	// defensive cap against throwaway rows). The apid POST
+	// /v1/apps/{slug}/openapi handler enforces via
+	// Store.CountOpenAPIImportsByAccount; 403 when the cap is
+	// reached. Same fail-closed contract on unknown plans
+	// (return 0 → caller treats as quota-exceeded).
+	OpenAPIImportsPerAccount int
 
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
@@ -1126,6 +1179,43 @@ type Limits struct {
 	// rows beyond the cap are deleted first on the retention
 	// purge. Free=25, Hobby=100, Pro=500, Scale=1000.
 	AppErrorsMaxRequestRowsPerFingerprint int
+
+	// DebugTelemetryEnabled (ADR-127 / production debugger) gates
+	// whether the per-request telemetry plane is on for an
+	// account. Free=false (the abuse-floor tier carries no
+	// debugger surface; the upsell is the wake-elision / rollback
+	// guarantee). Hobby/Pro/Scale=true. Surfaced at
+	// cmd/apid/handlers_debug_telemetry.go via
+	// api.ErrPlanFeatureGated.
+	DebugTelemetryEnabled bool
+	// DebugTelemetryRetentionDays (ADR-127) is the per-plan cap
+	// on how long a request_telemetry row is queryable. The
+	// RetentionOnceRequestTelemetry sweep in
+	// pkg/meter/retention.go drops the oldest monthly partition
+	// whose max(received_at) is older than this bound. Free=0
+	// (off), Hobby=3, Pro=7, Scale=14.
+	DebugTelemetryRetentionDays int
+	// DebugTelemetryRequestsPerMinute (ADR-127) is the per-account
+	// rate cap on the IncrementRequestTelemetry ingest RPC. The
+	// recorder publisher reads this at startup; per-record
+	// overflow returns outcome {code: RATE_LIMITED, retry_after}
+	// rather than dropping silently. Hobby=1000, Pro=10000,
+	// Scale=50000.
+	DebugTelemetryRequestsPerMinute int
+	// DebugTelemetryDeploymentsPerApp (ADR-127 §Decision 4) is
+	// the per-app ceiling on distinct deployment_id labels the
+	// gateway_request_duration_seconds histogram admits. Past the
+	// cap the deploymentLabelSet (pkg/gateway/deployment_label_set.go)
+	// collapses the label to "__other__" — same discipline as
+	// accountLabelSet (pkg/wire/metrics.go:256, 312). Hobby=10,
+	// Pro=50, Scale=200.
+	DebugTelemetryDeploymentsPerApp int
+	// DebugTelemetrySpansPerTrace (ADR-127 §Decision 5) caps the
+	// number of customer OTel spans the platform retains per
+	// request_telemetry row's spans_summary jsonb. Past the cap
+	// the slowest N are kept and the rest truncated. Hobby=50,
+	// Pro=200, Scale=1000.
+	DebugTelemetrySpansPerTrace int
 }
 
 // UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
@@ -1259,8 +1349,9 @@ var planLimits = map[Plan]Limits{
 		// Alert rules (issue #396 / ADR-045): Free stays at 0/0.
 		// Gates via CodePlanAlertRulesNotAllowed at the handler level
 		// — the value is informational here for fail-closed accessors.
-		AlertRuleLimitPerApp:     0,
-		AlertRuleLimitPerAccount: 0,
+		AlertRuleLimitPerApp:              0,
+		AlertRuleLimitPerAccount:          0,
+		AlertPresetCatalogLimitPerAccount: 8,
 		// Edge rules (ADR-089): Free gets 5/app — the 5 cheap
 		// kinds (route, rewrite, redirect, headers, cors). JWT and
 		// IP stay Hobby+ only (paid-only security primitives).
@@ -1311,6 +1402,7 @@ var planLimits = map[Plan]Limits{
 		OpenAPIDocsPerDeployment: 0,
 		OpenAPIDocMaxBytes:       0,
 		OpenAPIDocsPerAccount:    0,
+		OpenAPIImportsPerAccount: 100,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1466,6 +1558,16 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                1,
 		AppErrorsMaxFingerprintsPerApp:        50,
 		AppErrorsMaxRequestRowsPerFingerprint: 25,
+		// ADR-127 production debugger. Free is gated off: no
+		// debugger surface, no rate budget, no retention. The
+		// handler returns 402 ErrPlanFeatureGated before the store
+		// is touched; the 0/0/0/0 here is the fail-closed
+		// defence-in-depth value the store still reads.
+		DebugTelemetryEnabled:           false,
+		DebugTelemetryRetentionDays:     0,
+		DebugTelemetryRequestsPerMinute: 0,
+		DebugTelemetryDeploymentsPerApp: 0,
+		DebugTelemetrySpansPerTrace:     0,
 	},
 	PlanHobby: {
 		Plan:                  PlanHobby,
@@ -1584,8 +1686,9 @@ var planLimits = map[Plan]Limits{
 		// cron shape (10) because the typical Hobby customer configures
 		// "one alert per app" and the spare capacity is for a couple of
 		// account-wide rules.
-		AlertRuleLimitPerApp:     3,
-		AlertRuleLimitPerAccount: 10,
+		AlertRuleLimitPerApp:              3,
+		AlertRuleLimitPerAccount:          10,
+		AlertPresetCatalogLimitPerAccount: 8,
 		// Edge rules (ADR-089): Hobby gets 25/app and unlocks the
 		// JWT + IP kinds.
 		EdgeRulesPerApp:     25,
@@ -1623,6 +1726,7 @@ var planLimits = map[Plan]Limits{
 		OpenAPIDocsPerDeployment: 1,
 		OpenAPIDocMaxBytes:       131072,
 		OpenAPIDocsPerAccount:    100,
+		OpenAPIImportsPerAccount: 1000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1786,6 +1890,17 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                7,
 		AppErrorsMaxFingerprintsPerApp:        200,
 		AppErrorsMaxRequestRowsPerFingerprint: 100,
+		// ADR-127 production debugger. Hobby gets the small-tier
+		// debugger surface: 3-day retention, 1000 req/min, up to
+		// 10 distinct deployments in the histogram, 50 spans per
+		// trace. The Hobby customer is debugging a single Hobby
+		// app — the 3-day cap matches the log-archive retention
+		// (spec §4.7).
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     3,
+		DebugTelemetryRequestsPerMinute: 1000,
+		DebugTelemetryDeploymentsPerApp: 10,
+		DebugTelemetrySpansPerTrace:     50,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,
@@ -1893,8 +2008,9 @@ var planLimits = map[Plan]Limits{
 		// Alert rules (issue #396): Pro gets 10 per-app and 30
 		// per-account. ~2× the Hobby per-account budget tracks the
 		// Pro app budget (25 apps vs Hobby's 5).
-		AlertRuleLimitPerApp:     10,
-		AlertRuleLimitPerAccount: 30,
+		AlertRuleLimitPerApp:              10,
+		AlertRuleLimitPerAccount:          30,
+		AlertPresetCatalogLimitPerAccount: 8,
 		// Edge rules (ADR-089): Pro gets 100/app with JWT + IP.
 		EdgeRulesPerApp:     100,
 		EdgeRulesJWTAllowed: true,
@@ -1928,6 +2044,7 @@ var planLimits = map[Plan]Limits{
 		OpenAPIDocsPerDeployment: 1,
 		OpenAPIDocMaxBytes:       131072,
 		OpenAPIDocsPerAccount:    1000,
+		OpenAPIImportsPerAccount: 10000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -2077,6 +2194,16 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                30,
 		AppErrorsMaxFingerprintsPerApp:        1000,
 		AppErrorsMaxRequestRowsPerFingerprint: 500,
+		// ADR-127 production debugger. Pro = "this month"
+		// retention, 10000 req/min, up to 50 distinct deployments
+		// in the histogram, 200 spans per trace. The 7-day
+		// retention matches the spec §4.7 "incident window"
+		// for the Pro plan.
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     7,
+		DebugTelemetryRequestsPerMinute: 10000,
+		DebugTelemetryDeploymentsPerApp: 50,
+		DebugTelemetrySpansPerTrace:     200,
 	},
 	PlanScale: {
 		Plan:                  PlanScale,
@@ -2190,8 +2317,9 @@ var planLimits = map[Plan]Limits{
 		// per-account — 2.5× Pro's per-app (10→25) and ~3× the
 		// per-account (30→100). Scale's app budget is 4× Pro's, so
 		// the per-account figure absorbs the fan-out.
-		AlertRuleLimitPerApp:     25,
-		AlertRuleLimitPerAccount: 100,
+		AlertRuleLimitPerApp:              25,
+		AlertRuleLimitPerAccount:          100,
+		AlertPresetCatalogLimitPerAccount: 8,
 		// Edge rules (ADR-089): Scale gets 500/app with JWT + IP.
 		EdgeRulesPerApp:     500,
 		EdgeRulesJWTAllowed: true,
@@ -2232,6 +2360,7 @@ var planLimits = map[Plan]Limits{
 		OpenAPIDocsPerDeployment: 1,
 		OpenAPIDocMaxBytes:       131072,
 		OpenAPIDocsPerAccount:    10000,
+		OpenAPIImportsPerAccount: 10000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -2395,6 +2524,19 @@ var planLimits = map[Plan]Limits{
 		AppErrorsRetentionDays:                90,
 		AppErrorsMaxFingerprintsPerApp:        5000,
 		AppErrorsMaxRequestRowsPerFingerprint: 1000,
+		// ADR-127 production debugger. Scale = "this quarter"
+		// retention, 50000 req/min, up to 200 distinct deployments
+		// in the histogram, 1000 spans per trace. The 14-day cap
+		// matches the scale tier's incident-window expectations;
+		// the deployment-label cap of 200 is what makes the
+		// deploymentLabelSet discipline load-bearing (without the
+		// cap a fleet with thousands of historical deployments
+		// would blow up Prometheus cardinality).
+		DebugTelemetryEnabled:           true,
+		DebugTelemetryRetentionDays:     14,
+		DebugTelemetryRequestsPerMinute: 50000,
+		DebugTelemetryDeploymentsPerApp: 200,
+		DebugTelemetrySpansPerTrace:     1000,
 	},
 }
 
@@ -3773,6 +3915,73 @@ func (p Plan) AppErrorsMaxRequestRowsPerFingerprint() int {
 	return l.AppErrorsMaxRequestRowsPerFingerprint
 }
 
+// DebugTelemetryEnabled (ADR-127) returns whether the per-request
+// telemetry plane is on for the account. Used by the apid handler
+// in cmd/apid/handlers_debug_telemetry.go to fail-closed before the
+// store is touched (api.ErrPlanFeatureGated). Returns false on
+// unknown plans (Free-tier floor — debug telemetry is a paid-only
+// surface, same posture as the per-plan *Allowed fields above).
+func (p Plan) DebugTelemetryEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.DebugTelemetryEnabled
+}
+
+// DebugTelemetryRetentionDays (ADR-127) returns the per-plan cap on
+// how long a request_telemetry row is queryable. Read by
+// RetentionOnceRequestTelemetry in pkg/meter/retention.go to decide
+// which monthly partition to drop. Returns 0 on unknown plans (Free
+// floor — debug telemetry is off, retention is 0).
+func (p Plan) DebugTelemetryRetentionDays() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryRetentionDays
+}
+
+// DebugTelemetryRequestsPerMinute (ADR-127) returns the per-account
+// rate cap on the IncrementRequestTelemetry ingest RPC. Read by the
+// publisher at startup; per-record overflow returns outcome
+// {code: RATE_LIMITED, retry_after}. Returns 0 on unknown plans.
+func (p Plan) DebugTelemetryRequestsPerMinute() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryRequestsPerMinute
+}
+
+// DebugTelemetryDeploymentsPerApp (ADR-127 §Decision 4) returns the
+// per-app ceiling on distinct deployment_id labels the
+// gateway_request_duration_seconds histogram admits. Read by
+// deploymentLabelSet (pkg/gateway/deployment_label_set.go) at
+// histogram-emission time; overflow collapses to "__other__". Returns
+// 0 on unknown plans — fail-closed, same posture as the deployment-cap
+// fields above.
+func (p Plan) DebugTelemetryDeploymentsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetryDeploymentsPerApp
+}
+
+// DebugTelemetrySpansPerTrace (ADR-127 §Decision 5) returns the cap
+// on customer OTel spans retained per request_telemetry row's
+// spans_summary jsonb. Read by the OTel ingest path; past the cap
+// the slowest N are kept and the rest truncated. Returns 0 on unknown
+// plans.
+func (p Plan) DebugTelemetrySpansPerTrace() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.DebugTelemetrySpansPerTrace
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -4421,6 +4630,25 @@ func (p Plan) OpenAPIDocsPerAccount() int {
 	return l.OpenAPIDocsPerAccount
 }
 
+// OpenAPIImportsPerAccount (ADR-126 / issue #975 item #2)
+// returns the per-account cap on imported OpenAPI docs
+// across all of the account's apps. Per-plan: Free 100, Hobby
+// 1000, Pro 10000, Scale 10000. The apid POST
+// /v1/apps/{slug}/openapi handler enforces via
+// Store.CountOpenAPIImportsByAccount; 403 when the cap is
+// reached. Note: per-app the import is overwrite-not-multi-
+// version (one row per app_id, primary-key shape), so the
+// per-account cap is the load-bearing defensive cap against
+// throwaway rows. Unknown plans fail closed (return 0) —
+// same contract as OpenAPIDocsPerAccount.
+func (p Plan) OpenAPIImportsPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OpenAPIImportsPerAccount
+}
+
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan
 // may opt apps into the reserved eviction tier. Free = false; Hobby+ =
 // true. apid's updateApp handler rejects a `reserved` PATCH on a Free
@@ -4521,6 +4749,22 @@ func (p Plan) AlertRuleLimitPerAccount() int {
 		return 0
 	}
 	return l.AlertRuleLimitPerAccount
+}
+
+// AlertPresetCatalogLimitPerAccount (issue #1233 / ADR-123) returns
+// the informational count of catalog rows visible to the plan.
+// Currently 8 across every plan — the alert_presets catalog is
+// system-seeded and not plan-tier conditional (the per-row
+// `minimum_plan` column is what gates individual presets; the
+// catalog row count is a single global figure). Surfaced so the
+// CLI / dashboard can render "8 presets available" without
+// hardcoding the seed count. Unknown plans fail closed (return 0).
+func (p Plan) AlertPresetCatalogLimitPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.AlertPresetCatalogLimitPerAccount
 }
 
 // WebhookPerApp returns the per-app outbound-webhook subscription cap

@@ -832,6 +832,15 @@ func cmdDeployTarball(args []string) int {
 	// overlap with code='exclude_only_overlap' but the CLI short-
 	// circuits so the operator gets the error pre-flight).
 	deployExclude := fs.String("exclude", "", "comma-separated workload names to omit from the apply set (ADR-124)")
+	// ADR-124 ship-blocker #4 (PR-followup): when --exclude
+	// produced a destructive subset (Removed non-empty), print a
+	// one-line warning before the plan view. The full WillDeploy /
+	// Skipped / Unaffected / Removed partition is opt-in via
+	// --show-affected so the default render stays terse; the warn
+	// is the nudge that drives the operator to re-run with the
+	// flag when a soft-delete is in play. ADR §3 documents this
+	// as "warning + show-affected opt-in" (not auto-promote).
+	deployShowAffected := fs.Bool("show-affected", false, "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
@@ -1353,11 +1362,11 @@ func cmdDeployTarball(args []string) int {
 			if jsonOutput {
 				return jsonOut(writeJSONProblem(planProblem(plan)))
 			}
-			printPlanText(osStdout, plan, excludeList, false)
+			printPlanText(osStdout, plan, excludeList, *deployShowAffected)
 			return printErr("Plan is not applicable on this plan", errors.New("over-quota or unsupported configuration"))
 		}
 		if !*yes && !jsonOutput && stdoutIsTTY() && stdinIsTTY() {
-			if !confirmPlan(osStdout, os.Stdin, plan, excludeList) {
+			if !confirmPlan(osStdout, os.Stdin, plan, excludeList, *deployShowAffected) {
 				return printErr("Aborted by user", errors.New("user declined at the confirm prompt"))
 			}
 		}
@@ -1512,11 +1521,11 @@ func cmdRollback(args []string) int {
 		a := rest[i]
 		switch {
 		case a == "--to":
-			if i+1 >= len(rest) {
+			i++
+			if i >= len(rest) {
 				return printErr("Missing value", fmt.Errorf("--to requires a deployment_id"))
 			}
-			to = rest[i+1]
-			i++ // consume the value
+			to = rest[i] //nolint:gosec // G602: bounds checked immediately above
 		case strings.HasPrefix(a, "--to="):
 			to = a[len("--to="):]
 		default:
@@ -1808,7 +1817,7 @@ func cmdCrons(args []string) int {
 // cronIDPattern is the 32-hex shape used by the API for cron ids
 // (CronResponse.ID, the path segment of /v1/crons/{id}). Mirrors
 // deploymentIDPattern — same 32-hex convention across the platform.
-var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // renderCronState writes the human multi-line state block for one
 // cron. Routes through io.Writer so tests can capture the body via

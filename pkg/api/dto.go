@@ -3243,6 +3243,14 @@ type AppMetricsResponse struct {
 	// as such in the UI; here it's named plainly because the
 	// dashboard copy does the labelling.
 	WakeP95MS float64 `json:"wake_p95_ms"`
+	// QueueDepth (issue #1233 / ADR-123) is the current waiters
+	// in the per-app wake gate queue, sourced from
+	// gateway_queue_depth{app}. Bounded by per-plan MaxQueueDepth
+	// (Hobby 5 / Pro 25 / Scale 100). The alert preset
+	// queue_backlog_growing uses this via the evaluator's
+	// queue_depth metric branch; the public metrics endpoint
+	// surfaces it for dashboard parity.
+	QueueDepth int64 `json:"queue_depth"`
 	// EgressBytes (ADR-046, step 10) is the total
 	// per-app egress byte delta over the window,
 	// queried from vmmd_egress_net_tx_bytes_total{app}
@@ -3706,6 +3714,17 @@ type PlanResponse struct {
 	CanApply        bool           `json:"can_apply"`
 	CronsNotAllowed bool           `json:"crons_not_allowed,omitempty"`
 	PlanToken       string         `json:"plan_token"`
+	// ADR-124 can_apply rescue signal. PreExclude is the gate
+	// evaluated on the full scan (pre-`--only`/pre-`--exclude`).
+	// Rescued is true when --exclude flipped a blocked gate to
+	// allowed. Reasons is the human-readable failure list for
+	// the post-exclude state; the dashboard renders it verbatim
+	// in the gate card so the operator sees why a still-blocked
+	// gate is blocked. omitempty drops these on the success
+	// path so existing --json consumers stay stable.
+	CanApplyPreExclude   bool     `json:"can_apply_pre_exclude,omitempty"`
+	GateRescuedByExclude bool     `json:"gate_rescued_by_exclude,omitempty"`
+	CanApplyReasons      []string `json:"can_apply_reasons,omitempty"`
 	// ADR-124: blast-radius partition. WillDeploy + Unaffected
 	// together enumerate every non-deleted app in the account plus
 	// the scan's proposed creates. Skipped is the operator-excluded
@@ -5631,4 +5650,73 @@ type OpenAPIDocResponse struct {
 	CapturedAt   string         `json:"captured_at"`
 	UpdatedAt    string         `json:"updated_at"`
 	Doc          map[string]any `json:"doc"`
+}
+
+// AppOpenAPIImportResponse is the typed wire envelope for the
+// POST /v1/apps/{slug}/openapi import endpoint (issue #975 item #2 /
+// ADR-126). Mirrors the row shape of app_openapi_docs (one row per
+// app, last-write-wins). Source is always "manual_import" — cold-boot
+// captures go to deployment_openapi_docs (item #1), not here.
+//
+// EndpointCount is the number of HTTP operations in the imported
+// doc's paths.*; ByteSize is the raw body size the handler enforced
+// against state.OpenAPIImportMaxDocBytes (256 KiB).
+type AppOpenAPIImportResponse struct {
+	AppID          string `json:"app_id"`
+	Source         string `json:"source"`
+	OpenAPIVersion string `json:"openapi_version"`
+	EndpointCount  int    `json:"endpoint_count"`
+	ByteSize       int    `json:"byte_size"`
+	CapturedAt     string `json:"captured_at"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// AppOpenAPIImportDryRunResponse is the typed wire envelope for the
+// POST /v1/apps/{slug}/openapi/dry-run endpoint (ADR-126 D3). The
+// customer pastes each Suggestion's Path + Methods + Kind + Action
+// into the existing create-edge-rule endpoint. Empty Suggestions
+// when the doc is fully covered by existing validate edge rules.
+type AppOpenAPIImportDryRunResponse struct {
+	Suggestions    []EdgeRuleSuggestion `json:"suggestions"`
+	OpenAPIVersion string               `json:"openapi_version"`
+	EndpointCount  int                  `json:"endpoint_count"`
+}
+
+// EdgeRuleSuggestion is a single read-only candidate row in the
+// dry-run response. Mirrors the create-edge-rule request body
+// fields so the customer can copy paste. The Kind + Action union
+// shape matches pkg/api/dto.go's existing EdgeRule*Action types.
+type EdgeRuleSuggestion struct {
+	Path    string         `json:"path"`
+	Methods []string       `json:"methods"`
+	Kind    string         `json:"kind"`
+	Action  map[string]any `json:"action"`
+}
+
+// DebugTelemetryRequestItem is one row of per-app request telemetry
+// returned by GET /v1/apps/{slug}/debug/requests (ADR-127 / PR-A).
+// The fields are 1:1 with the request_telemetry table columns; the
+// apid handler maps sqlc-generated rows to this wire DTO (cmd/apid
+// uses the sqlc row directly because pkg/api cannot import
+// pkg/state/sqlc without an import cycle).
+type DebugTelemetryRequestItem struct {
+	ID           string  `json:"id"`
+	DeploymentID string  `json:"deployment_id"`
+	Route        string  `json:"route"`
+	Method       string  `json:"method"`
+	Status       int     `json:"status"`
+	LatencyMS    int     `json:"latency_ms"`
+	ColdBoot     bool    `json:"cold_boot"`
+	TraceID      *string `json:"trace_id"`
+	ReceivedAt   string  `json:"received_at"`
+}
+
+// DebugTelemetryListResponse is the wire envelope for the debug
+// requests list endpoint. `Since` echoes the effective window
+// applied (after the plan's DebugTelemetryRetentionDays clamp) so
+// the dashboard can surface a "you widened past the cap" tile when
+// a customer asks for a longer window than their plan permits.
+type DebugTelemetryListResponse struct {
+	Since    string                      `json:"since"`
+	Requests []DebugTelemetryRequestItem `json:"requests"`
 }

@@ -195,6 +195,14 @@ func TestSecretLeakGuard_FAAS_EnvToLog(t *testing.T) {
 		"FAAS_DEPLOY_BASE_REF":        "identifier",
 		"FAAS_TRUSTED_PUBLISHERS_DIR": "path",
 		"FAAS_MAIL_TRANSPORT":         "enum-shaped transport identifier; see pkg/mail/factory.go (logs the value when unknown — operator-supplied, not a credential)",
+		// ADR-127 §D3 Layer 7 — the bridge's framing-selection slog
+		// line at cmd/vmmd-stream-bridge/main.go::newHandler logs the
+		// env value verbatim so an operator can correlate the env
+		// state with the framing actually used. The value is a
+		// closed enum ({h1, h2c}, anything else falls back to h1
+		// per currentBridgeFraming in cmd/vmmd-stream-bridge/framing.go),
+		// not a credential.
+		"FAAS_BRIDGE_PROTOCOL": "enum ({h1, h2c}); see cmd/vmmd-stream-bridge/main.go::newHandler framing-selection slog line (ADR-127 §D3 Layer 7)",
 		// ADR-115 §D4: the Resend API key + Postmark token are the
 		// load-bearing mail credentials. The Resend key MUST be scoped
 		// to "Sending access" only (not "Full access") in the Resend

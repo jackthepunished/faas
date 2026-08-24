@@ -126,10 +126,17 @@ const (
 	// handler can stamp both on the RFC 7807 problem without
 	// re-running the count.
 	QuotaErrorKindMirror QuotaErrorKind = "mirror"
+	// QuotaErrorKindOpenAPIImports (issue #975 item #2 / ADR-126)
+	// trips when an account exceeds Plan.OpenAPIImportsPerAccount
+	// for per-app OpenAPI doc imports. The store's
+	// UpsertAppOpenAPIDocIfUnderQuota runs count + lock + upsert
+	// inside the same critical section so a TOCTOU race can't slip
+	// past the cap.
+	QuotaErrorKindOpenAPIImports QuotaErrorKind = "openapi_imports"
 )
 
 type QuotaError struct {
-	Kind       QuotaErrorKind // "apps" | "crons" | "memory"
+	Kind       QuotaErrorKind // "apps" | "crons" | "memory" | "mirror" | "openapi_imports"
 	Limit      int            // caps at the time of the call
 	Observed   int            // count(*) observed inside the same critical section
 	NotAllowed bool           // true when the plan tier forbids the entity entirely (e.g. Free cron)
@@ -142,6 +149,11 @@ func (e *QuotaError) Error() string {
 			return "state: crons not allowed on this plan"
 		}
 		return fmt.Sprintf("state: cron quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+	case QuotaErrorKindOpenAPIImports:
+		if e.NotAllowed {
+			return "state: openapi_imports not allowed on this plan"
+		}
+		return fmt.Sprintf("state: openapi_imports quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
 	default:
 		return fmt.Sprintf("state: deployed-app quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
 	}
@@ -2170,6 +2182,59 @@ type Store interface {
 	// load the full body slice.
 	CountOpenAPIDocsByAccount(ctx context.Context, accountID string) (int, error)
 
+	// Per-app OpenAPI import (issue #975 item #2 / ADR-126).
+	// The four methods mirror the per-deployment methods above
+	// but key on (app_id, account_id) — one row per app, last
+	// write wins via INSERT ... ON CONFLICT DO UPDATE.
+
+	// GetAppOpenAPIDoc returns the (doc, meta) pair for one app.
+	// ErrNotFound when the row is missing OR when the caller's
+	// accountID does not match (the pgx row.Scan errors on no
+	// rows; we map it to ErrNotFound). The closed `openapi_version`
+	// enum is surfaced in the meta so the dry-run handler can
+	// reject a version-stamped suggestion on a different version
+	// without a second DB read.
+	GetAppOpenAPIDoc(ctx context.Context, appID, accountID string) ([]byte, AppOpenAPIDocMeta, error)
+	// UpsertAppOpenAPIDoc records (or overwrites) the imported
+	// OpenAPI body for one app. doc is the meta-schema-validated
+	// JSON bytes (the apid openapiimport.ValidateImport check
+	// passes before this call); endpointCount is the
+	// pre-computed paths.* operation count; openapiVersion is
+	// the closed enum value (one of ValidOpenAPIVersions). The
+	// row is filtered by (app_id, account_id) at the WHERE clause
+	// so a misrouted call from a different account fails with
+	// ErrNotFound. Idempotent: a re-delivered import overwrites
+	// the same row, not creates a second one.
+	//
+	// The per-account quota gate is upstream — prefer
+	// UpsertAppOpenAPIDocIfUnderQuota which bundles count+lock+upsert
+	// into a single atomic store call. This raw method is kept
+	// for callers that have already taken the lock (admin tool,
+	// test harness, internal API).
+	UpsertAppOpenAPIDoc(ctx context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string) error
+	// UpsertAppOpenAPIDocIfUnderQuota bundles the per-account quota
+	// gate (count + lock + check) with the upsert so a TOCTOU race
+	// between two concurrent imports under the same account can't
+	// slip past the cap. The PgStore impl runs the count + upsert
+	// inside a transaction with a row lock on the account; the
+	// MemStore impl serialises under m.mu. Returns
+	// ErrOpenAPIImportsPerAccountQuotaReached when count>=limit;
+	// ErrNotFound when the parent app row is missing or the
+	// caller's accountID does not match.
+	UpsertAppOpenAPIDocIfUnderQuota(ctx context.Context, appID, accountID string, doc []byte, endpointCount int, openapiVersion string, planMax int) error
+	// DeleteAppOpenAPIDoc removes the import row for one app.
+	// ErrNotFound when no row OR the caller's accountID does not
+	// match — same IDOR floor as the read. The apid caller
+	// treats ErrNotFound as "already deleted" so a retry is a
+	// no-op (idempotent 204).
+	DeleteAppOpenAPIDoc(ctx context.Context, appID, accountID string) error
+	// CountOpenAPIImportsByAccount returns the number of import
+	// rows the account owns. Drives the per-account quota gate
+	// (api.Plan.OpenAPIImportsPerAccount). The count is computed
+	// server-side via a SELECT COUNT(*) so the apid doesn't
+	// load the full body slice.
+	CountOpenAPIImportsByAccount(ctx context.Context, accountID string) (int, error)
+
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
 	// jsonb) stays the contract layer; this is the per-sidecar
@@ -2709,6 +2774,66 @@ type Store interface {
 	// the four InvocationSource values by the caller before the call.
 	CountFailedInvocationsSince(ctx context.Context, accountID, appID string, source InvocationSource, since time.Time) (int, error)
 
+	// Alert preset catalog (issue #1233 / ADR-123). The catalog has
+	// 8 system-owned rows; the Store exposes only read methods. The
+	// only write path is migration 00348's idempotent seed.
+	ListAlertPresets(ctx context.Context) ([]AlertPreset, error)
+	AlertPresetByName(ctx context.Context, name string) (AlertPreset, error)
+
+	// CountFailedDeploymentsSince counts deployments in
+	// status='failed' for (accountID, appID) since `since`. Used
+	// by the alert evaluator's deployment_failed metric branch
+	// (issue #1233, ADR-123). Mirrors CountFailedInvocationsSince
+	// but walks the deployments table; appID "" means "any app on
+	// this account" per the Store contract.
+	CountFailedDeploymentsSince(ctx context.Context, accountID, appID string, since time.Time) (int, error)
+
+	// WasInvokedSuccessfullySince returns true iff at least one
+	// non-failed invocation exists for (accountID, appID) since
+	// `since`. Used by the alert evaluator's api_up metric branch
+	// (issue #1233, ADR-123) — the binary reachability signal.
+	// appID "" means "any app on this account" per the Store
+	// contract; a cold-start app with no invocations returns false.
+	WasInvokedSuccessfullySince(ctx context.Context, accountID, appID string, since time.Time) (bool, error)
+
+	// MTDSpendEurCents returns the SUM(eur_cents) of every
+	// account_spend_snapshot row for the account whose
+	// period_start is within the current UTC month-to-date window.
+	// Used by the alert evaluator's account_spend_eur metric
+	// branch (issue #1233, ADR-123).
+	MTDSpendEurCents(ctx context.Context, accountID string) (int64, error)
+
+	// UpsertAccountSpendSnapshot is called by the meterd tick
+	// loop on every AlertEvalInterval. Idempotent via the
+	// (account_id, source, period_end) UNIQUE at migrations/00350.
+	UpsertAccountSpendSnapshot(ctx context.Context, accountID string, periodStart, periodEnd time.Time, gbSeconds float64, eurCents int64, source string) error
+
+	// MinCertExpiryForApp returns the smallest remaining seconds
+	// until cert expiry across all per-app tenant_surfaces for the
+	// given (account, app), or -1 when no surface has a cert in
+	// 'ok' state. Used by the alert evaluator's cert_expiry_seconds
+	// metric branch (issue #1233, ADR-123).
+	MinCertExpiryForApp(ctx context.Context, accountID, appID string) (int64, error)
+
+	// RefreshCertExpiryStates walks tenant_surfaces for rows with
+	// cert_state='issued', upserts
+	// meterd_tenant_surface_cert_expiry_state, and stamps
+	// last_refreshed_at = now(). Returns the number of rows
+	// updated. Called by the meterd cert-expiry refresher goroutine
+	// (issue #1233, ADR-123) on a 1-hour cadence. Note: the table
+	// is meterd-owned per the CLAUDE.md ownership rule; the writer
+	// runs in cmd/meterd; readers (apid / alert-evaluator) use
+	// MinCertExpiryForApp below.
+	RefreshCertExpiryStates(ctx context.Context) (int, error)
+	// ListCertExpiryStateForWalker returns every row in
+	// meterd_tenant_surface_cert_expiry_state whose
+	// last_refreshed_at is fresher than (now - staleCutoff).
+	// Meterd's refresher uses this to stamp the
+	// apid_tenant_surface_cert_expiry_seconds gauge (the metric
+	// name keeps its legacy apid_ prefix for backward-compat with
+	// already-deployed alert rules).
+	ListCertExpiryStateForWalker(ctx context.Context, staleCutoff time.Duration) ([]TenantSurfaceCertExpiryState, error)
+
 	// Invocations (Move 1 — async_invoke / queue / delayed_task / cron).
 	// apid writes customer-intent rows; schedd's drain loop owns the
 	// state transitions pending → dispatching → completed/failed.
@@ -3131,6 +3256,17 @@ type Store interface {
 	// the Firecracker version that made them). Returns the number of rows
 	// affected. Idempotent.
 	MarkAllSnapshotsStaleByFCVersion(ctx context.Context, currentVersion string) (int64, error)
+	// MarkAllSnapshotsStaleByAppProtocol flips every non-stale snapshot
+	// whose deployment's app.app_protocol ∈ appProtocols stale
+	// (ADR-127 §D1, Layer 6 — imaged F3 sweep, the app-protocol
+	// dimension of the F2/F3 split). app_protocol=http1 snapshots are
+	// never affected. Idempotent.
+	MarkAllSnapshotsStaleByAppProtocol(ctx context.Context, appProtocols []string) (int64, error)
+	// MarkSnapshotStaleByAppProtocol is the single-row mirror of
+	// MarkAllSnapshotsStaleByAppProtocol. Returns ErrNotFound when no
+	// snapshot matches the id AND the deployment's app.app_protocol
+	// ∈ appProtocols. Empty appProtocols is an error (caller bug).
+	MarkSnapshotStaleByAppProtocol(ctx context.Context, snapshotID string, appProtocols []string) error
 	// MarkOldSnapshotsStale marks the given snapshot IDs stale (per-app
 	// "current + previous" enforcement, run before DeleteSnapshotsByID).
 	MarkOldSnapshotsStale(ctx context.Context, beforeSnapshotIDs []string) (int64, error)
@@ -4433,6 +4569,48 @@ type Store interface {
 	// cutoff timestamp. Used by the nightly retention purge to
 	// age out orphaned request rows.
 	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
+
+	// --- ADR-127 production debugger (§Decision 1) ---
+	//
+	// The writer methods (InsertRequestTelemetry) are called by
+	// the apid gRPC server-side handler in
+	// cmd/apid/grpc_server_request_telemetry.go; gatewayd-internal
+	// dials apid over a unix socket and never touches the Store
+	// directly. Same ownership pattern as the AppError writes
+	// above (cmd/gatewayd-internal/app_errors_recorder.go:17-21).
+	// The reader methods back the
+	// /v1/apps/{slug}/debug/requests/* handlers in PR-A.
+
+	// InsertRequestTelemetry is the per-request INSERT called by
+	// grpc_server_request_telemetry.go. One row per gateway-served
+	// request; no ON CONFLICT — every request gets its own row.
+	// The recorder's in-process LRU dedupe at minute granularity
+	// is the upstream tripwire; the unique-index absence here is
+	// intentional (request_id is the natural dedupe, but the
+	// recorder doesn't carry it).
+	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
+
+	// ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
+	// Time-windowed (since, until) with hard limit; cursor pagination
+	// is by (received_at DESC, id) tuple, matching the
+	// request_telemetry_app_received_idx index direction. limit MUST
+	// be pre-clamped to api.DebugTelemetryMaxLimit by the handler.
+	ListRequestTelemetryByApp(ctx context.Context, arg sqlc.ListRequestTelemetryByAppParams) ([]sqlc.ListRequestTelemetryByAppRow, error)
+
+	// RequestTelemetryByDeployment backs the per-deployment
+	// drilldown and the regression detector (PR-B cron). Uses
+	// request_telemetry_app_dep_received_idx. Same limit contract
+	// as ListRequestTelemetryByApp.
+	RequestTelemetryByDeployment(ctx context.Context, arg sqlc.RequestTelemetryByDeploymentParams) ([]sqlc.RequestTelemetryByDeploymentRow, error)
+
+	// RequestTelemetryBaselineP95ByRoute backs the regression
+	// detector's per-route p95 baseline lookup. PR-B's cron calls
+	// this per-deployment, then composes the result with
+	// RequestTelemetryByDeployment in Go (the CTE-on-CTE shape
+	// that would back a single-round-trip regression query trips
+	// sqlc v1.31's "ambiguous column" parser; PR-B documents the
+	// Go-side composition in pkg/state/pgstore.go).
+	RequestTelemetryBaselineP95ByRoute(ctx context.Context, arg sqlc.RequestTelemetryBaselineP95ByRouteParams) ([]sqlc.RequestTelemetryBaselineP95ByRouteRow, error)
 
 	// --- ADR-098 connection-aware execution (§9.A) ---
 	//

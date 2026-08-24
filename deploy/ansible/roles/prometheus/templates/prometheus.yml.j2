@@ -27,6 +27,12 @@ rule_files:
   # postgres_backup role drops this file; if it's absent the alert
   # is simply skipped (Prometheus tolerates a missing rule_files entry).
   - /etc/prometheus/pg_backup.rules.yml
+  # ADR-127 §D3 / G19 — bridge wire-protocol framing alerts
+  # (FaasBridgeFramingMismatch + FaasBridgeRollbackStuck). The
+  # prometheus role drops this file at tasks/main.yml; if it's
+  # absent the alerts are simply skipped (Prometheus tolerates a
+  # missing rule_files entry). Runbook: docs/ops/h2c-rollback.md.
+  - /etc/prometheus/bridge.rules.yml
 
 # Alertmanager — loopback-only, dialed from the Prometheus binary on the
 # same box. Wired here so the operator's pager sees what the dashboard

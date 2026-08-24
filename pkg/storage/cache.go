@@ -206,6 +206,7 @@ func NewLocalCacheBackend(parent StorageBackend, root string, maxBytes int64) (*
 	if err := os.MkdirAll(root, 0o770); err != nil {
 		return nil, fmt.Errorf("storage: cache: mkdir %q: %w", root, err)
 	}
+	_ = os.Chmod(root, 0o770)
 	return &LocalCacheBackend{
 		parent:   parent,
 		root:     root,
@@ -525,6 +526,7 @@ func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, sr
 	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
 		return nil, fmt.Errorf("cache mkdir %q: %w", filepath.Dir(path), err)
 	}
+	_ = os.Chmod(filepath.Dir(path), 0o770)
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".faas-cache-*")
 	if err != nil {
 		return nil, fmt.Errorf("cache temp %q: %w", filepath.Dir(path), err)
@@ -608,6 +610,7 @@ func (c *LocalCacheBackend) writeCache(key string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
 		return fmt.Errorf("storage: cache: mkdir %q: %w", filepath.Dir(path), err)
 	}
+	_ = os.Chmod(filepath.Dir(path), 0o770)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("storage: cache: write %q: %w", path, err)
 	}

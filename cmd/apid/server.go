@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/openapidiff"
 	"github.com/onebox-faas/faas/pkg/promql"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -77,6 +78,16 @@ type server struct {
 	// lives on the cmd/apid wiring site so a single
 	// construction serves every consumer in this binary.
 	eventsPlatform *events.Platform
+	// specCache is the in-process LRU backing the
+	// ?source=auto OpenAPI generation (ADR-126 / issue #975
+	// item #2). The cache is keyed on (app_id, sha(doc),
+	// sha(routes), sha(rules)) and flushed per-app on either
+	// pg_notify channel — NotifyAppOpenAPIDocChanged (new)
+	// and NotifyEdgeRuleChanged (existing). nil is safe —
+	// the handler just bypasses the cache on every read and
+	// never invalidates. Wired via WithSpecCache from
+	// cmd/apid/main.go (production) or kept nil (unit tests).
+	specCache *openapidiff.SpecCache
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -211,6 +222,15 @@ type server struct {
 	// from it. Wired via WithDataPlacement from
 	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
 	dataPlacementEnabled bool
+	// hostHashFunc (issue #957) is the test seam for forcing
+	// the env-classifier into the silent-skip branch. Nil in
+	// production (cmd/apid/main.go does NOT call
+	// WithHostHashFunc); runEnvClassifier falls through to
+	// secretbox.HashHost. The seam exists only so the
+	// handlers_env_classifier_audit_test.go can drive the
+	// host_hash_failed audit emit without touching the
+	// host_hash_salt on disk.
+	hostHashFunc func(host string) (string, error)
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -452,6 +472,19 @@ func (s *server) WithDataPlacement(enabled bool) *server {
 	return s
 }
 
+// WithHostHashFunc (issue #957) attaches a stub for the env-
+// classifier's host-hash seam. Production wiring does NOT call
+// this method — s.hostHashFunc stays nil and runEnvClassifier
+// falls through to the canonical secretbox.HashHost (cmd/apid/
+// handlers_env.go). The seam exists so handlers_env_classifier
+// _audit_test.go can force the silent-skip branch
+// (host_hash_failed) and assert that env.classifier_failed
+// fires, without touching /etc/faas/host_hash_salt on disk.
+func (s *server) WithHostHashFunc(fn func(host string) (string, error)) *server {
+	s.hostHashFunc = fn
+	return s
+}
+
 // WithGatewaydControlURL (ADR-093) attaches the loopback URL
 // apid uses to reach gatewayd-internal's control listener
 // (/v1/internal/apps/{slug}/routes). Default
@@ -464,6 +497,22 @@ func (s *server) WithDataPlacement(enabled bool) *server {
 // this PR; same-box is the only supported posture today).
 func (s *server) WithGatewaydControlURL(url string) *server {
 	s.gatewaydControlURL = url
+	return s
+}
+
+// WithSpecCache attaches the in-process LRU backing the
+// ?source=auto OpenAPI generation (ADR-126 / issue #975
+// item #2). Production wires a *openapidiff.SpecCache from
+// cmd/apid/main.go via openapidiff.NewSpecCache(); tests
+// typically leave the field nil so the handler bypasses the
+// cache. The subscriber (runOpenAPIDocSubscriber) flushes
+// the cache per-app on either pg_notify channel —
+// NotifyAppOpenAPIDocChanged and NotifyEdgeRuleChanged — so
+// the entry is consistent with the on-disk doc + the
+// platform-enforced rules without an explicit per-request
+// freshness check.
+func (s *server) WithSpecCache(cache *openapidiff.SpecCache) *server {
+	s.specCache = cache
 	return s
 }
 
@@ -1005,6 +1054,21 @@ func (s *server) handler() http.Handler {
 	// read surface). Cross-account isolation is via loadApp at
 	// handlers_diff.go:diffApp.
 	mux.HandleFunc("POST /v1/apps/{slug}/diff", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.diffApp)))
+	// ADR-126 / issue #975 item #2 — OpenAPI Import + Auto-Generation.
+	// Four app-scoped routes keyed on {slug}, distinct from the
+	// deployment-keyed getOpenAPIDoc / patchOpenAPIDoc / openAPIDocDelete
+	// family above (item #1, lines 1025-1027). The GET accepts
+	// ?source=manual_import|auto so the dashboard can fetch either
+	// the customer's uploaded doc verbatim or the platform-merged
+	// auto-gen spec (cache-backed per app). Plan-tier gate is gone
+	// (limits are abuse-surface, not tier — Free can import up to
+	// the per-account row cap). The dry-run POST is read-only so it
+	// rides the read-scope chain with no requireMFA (same posture
+	// as /v1/apps/{slug}/diff just above).
+	mux.HandleFunc("GET /v1/apps/{slug}/openapi", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppOpenAPI)))
+	mux.HandleFunc("POST /v1/apps/{slug}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.postAppOpenAPIImport))))
+	mux.HandleFunc("POST /v1/apps/{slug}/openapi/dry-run", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.postAppOpenAPIImportDryRun)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/openapi", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAppOpenAPIImport))))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeployment))))
 	// Per-deploy grype scan drill-down (issue #464 / ADR-055).
 	// Returns the typed api.ScanResult envelope (status,
@@ -1201,6 +1265,19 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))
 
+	// Alert presets (ADR-123 / issue #1233). Catalog R/O for
+	// customers; instantiate-from-preset reuses the alert-rules
+	// create path (handlers_alert_presets.go). The enable route
+	// is idempotent so SDK retries are safe — the duplicate POST
+	// returns 409 "Preset already enabled" so the caller can
+	// branch on a stale POST without silently no-op'ing. Plan-tier
+	// gate (catalog row's minimum_plan → 402) and disabled-row
+	// gate (enabled_in_catalog=false → 400 alert_preset_disabled)
+	// both fire BEFORE loadApp for the same slug-leak reason
+	// createAlertRule gates on the per-plan cap (PR review F4).
+	mux.HandleFunc("GET /v1/alert-presets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertPresets))))
+	mux.HandleFunc("POST /v1/apps/{slug}/alert-presets/{name}/enable", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.enableAlertPreset)))))
+
 	// Edge rules (ADR-089, planned). Customer-facing resource that
 	// runs in pkg/gateway BEFORE host→app resolution. Mirrors the
 	// alert-rules decorator chain: authLimited → requireMFA →
@@ -1275,6 +1352,13 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/invocations/{id}/replay", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.replayInvocation)))))
 	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.delayedTaskGet))))
 	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.delayedTaskCancel))))
+
+	// ADR-127 production debugger — read-only slice in PR-A. The
+	// write-side (publisher → gRPC IncrementRequestTelemetry → apid
+	// receiver → sqlc INSERT) lands in PR-B; this GET exists so
+	// customers can already hit the endpoint and see rows once a
+	// row source is configured. Plan-gated by DebugTelemetryEnabled.
+	mux.HandleFunc("GET /v1/apps/{slug}/debug/requests", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.debugTelemetryListHandler))))
 
 	// API keys. Minting and revoking keys are admin-only — a leaked
 	// write-scoped key must not be able to grant itself more scopes.
@@ -1772,6 +1856,14 @@ func (s *server) handler() http.Handler {
 	// so the customer's next page-load sees the live SSE stream
 	// for the fresh row.
 	mux.Handle("POST /dashboard/apps/{slug}/deployments/{id}/retry", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRetryDeployment))))
+	// Issue #1233 / ADR-123 — alert-preset enable from the
+	// dashboard's preset grid. Same CSRF-envelope shape as
+	// dashboardFireCron (form-encoded body, action=
+	// "enable_alert_preset"). The handler delegates to
+	// enableAlertPresetFromForm after CSRF + auth so the JSON
+	// path (POST /v1/apps/{slug}/alert-presets/{name}/enable)
+	// and the dashboard path share a single guard order.
+	mux.Handle("POST /dashboard/apps/{slug}/alert-presets/{name}/enable", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardEnablePreset))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires

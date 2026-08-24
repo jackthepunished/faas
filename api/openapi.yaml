@@ -59,6 +59,8 @@ tags:
     description: Deployments & build status.
   - name: openapi_discovery
     description: Captured OpenAPI documents per deployment (ADR-122 / issue #975 item #1).
+  - name: openapi_import
+    description: Imported OpenAPI documents per app + auto-generated merged spec (ADR-126 / issue #975 item #2).
   - name: instances
     description: Read-only instance view.
   - name: domains
@@ -1815,6 +1817,50 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/debug/requests:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: listAppDebugRequests
+      summary: Per-app request telemetry (ADR-127 / PR-A).
+      description: |
+        Recent request rows for an app — status, latency_ms, route,
+        method, deployment_id, cold_boot, trace_id, received_at.
+        PR-A ships the read endpoint only; the write-side (publisher
+        → gRPC IncrementRequestTelemetry → apid receiver → sqlc
+        INSERT) lands in PR-B. The endpoint is plan-gated by
+        `DebugTelemetryEnabled` (Free off; Hobby/Pro/Scale on).
+        The window is clamped to `DebugTelemetryRetentionDays`
+        (Hobby 3d, Pro 7d, Scale 14d). When the clamp fires, the
+        effective `since` is returned in the response so the
+        dashboard can render a "you widened past the cap" tile.
+        Returns 200 with `requests: []` when no rows exist in the
+        window — never 404. Cross-account slug is 404 (IDOR-safe;
+        byte-identical to "no such app").
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Duration or 'Nd' alias. Defaults to `24h`. Clamped to plan's `DebugTelemetryRetentionDays`."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: [integer, 'null'], minimum: 1, maximum: 200, default: 20 }
+          description: "Page size, default 20, max 200."
+      responses:
+        '200':
+          description: Page of recent request telemetry rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugTelemetryListResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/deployments:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -2091,6 +2137,174 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/openapi:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [openapi_import]
+      operationId: getAppOpenAPI
+      summary: Read the imported (or auto-generated) OpenAPI document for an app.
+      description: |
+        Two source modes (selected via `?source=`):
+
+        - `manual_import` (default): returns the customer's uploaded
+          doc verbatim. Mirrors item #1's /deployments/{dep}/openapi
+          but on the app-keyed `app_openapi_docs` table (ADR-126 D1).
+
+        - `auto`: runs pkg/openapidiff.GenerateFromApp with the
+          imported doc + observed routes (ADR-093 bridge) +
+          existing edge rules; the merged spec is cached for 5 min
+          per (app_id, sha(doc), sha(routes), sha(rules)). Cache
+          headers: X-Faas-Cache: hit|miss, X-OpenAPI-Doc-Source:
+          "auto" | "degraded: routes_unavailable" |
+          "degraded: rules_unavailable" | "empty: no_import_no_rules".
+
+        Limits are abuse-surface, not plan-tier — every plan
+        including Free can import. Per-account row cap is
+        Plan.OpenAPIImportsPerAccount (Free 100, Hobby 1000,
+        Pro 10000, Scale 10000). Plan-tier gate is intentionally
+        absent on this surface (ADR-126 D6).
+      parameters:
+        - name: source
+          in: query
+          required: false
+          description: "Source mode. `manual_import` (default) returns the persisted customer doc verbatim. `auto` returns the platform-merged spec (imported doc ∪ observed routes ∪ existing edge rules)."
+          schema:
+            type: string
+            enum: [manual_import, auto]
+            default: manual_import
+      responses:
+        '200':
+          description: The OpenAPI document (imported or auto-generated).
+          headers:
+            X-OpenAPI-Doc-Source:
+              schema: { type: string }
+              description: "Provenance marker: manual_import, auto, degraded: routes_unavailable, degraded: rules_unavailable, empty: no_import_no_rules."
+            X-OpenAPI-Doc-Version:
+              schema: { type: string }
+              description: "OpenAPI version declared by the imported doc (3.0.x / 3.1.x)."
+            X-OpenAPI-Doc-Byte-Size:
+              schema: { type: integer }
+              description: "Raw byte size of the persisted doc body."
+            X-Faas-Cache:
+              schema: { type: string, enum: [hit, miss] }
+              description: "Cache hit/miss on the `?source=auto` path. Omitted on `?source=manual_import`."
+            X-OpenAPI-Doc-Annotations-Count:
+              schema: { type: integer }
+              description: "Count of `x-faas-edge-rules` annotations on the auto-gen spec (zero on manual_import)."
+          content:
+            application/json:
+              schema:
+                type: object
+                description: "The OpenAPI document body. manual_import returns the persisted doc verbatim; auto returns the merged spec (imported doc ∪ observed routes ∪ `x-faas-edge-rules` annotations)."
+        '400':
+          description: "code: invalid_source. `source` query value is not in the enum."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "code: not_found. No imported doc exists for this app (manual_import mode), or the app slug is cross-tenant."
+        '405':
+          description: "code: dry_run_requires_post. `?source=dry_run` is GET-only 405; dry-run is POST-only."
+    post:
+      tags: [openapi_import]
+      operationId: importAppOpenAPI
+      summary: Import an OpenAPI document for an app.
+      description: |
+        Customer-facing import (ADR-126 / issue #975 item #2).
+        Reads the body, validates via
+        pkg/openapiimport.ValidateImport (structural-minimum
+        OpenAPI 3.0 / 3.1 check), enforces size + endpoint
+        caps, persists via UpsertAppOpenAPIDoc, emits
+        app.openapi_import.replaced audit + pg_notify on
+        NotifyAppOpenAPIDocChanged. The auto-gen cache
+        (NotifyAppOpenAPIDocChanged + NotifyEdgeRuleChanged
+        fan-in) is flushed per-app so the next `?source=auto`
+        read recomputes.
+
+        Limits (abuse-surface, not plan-tier): body cap
+        state.OpenAPIImportMaxDocBytes (256 KiB), endpoint
+        cap state.OpenAPIImportMaxEndpoints (50). Per-account
+        row cap is Plan.OpenAPIImportsPerAccount.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: "OpenAPI 3.0/3.1 document. The validator only requires openapi, info, paths to be present + object-shaped; everything else is passthrough."
+              required: [openapi, info, paths]
+              properties:
+                openapi: { type: string, description: "OpenAPI version (3.0.x / 3.1.x)." }
+                info:    { type: object }
+                paths:   { type: object }
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppOpenAPIImportResponse' }
+        '400':
+          description: "code: empty_body. Body is zero bytes."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "code: openapi_import_quota_reached. Plan.OpenAPIImportsPerAccount() cap reached."
+        '413':
+          description: "code: openapi_import_too_large. Body exceeds state.OpenAPIImportMaxDocBytes (256 KiB) on the import endpoint."
+        '422':
+          description: "code: openapi_import_invalid or openapi_import_too_many_endpoints. Doc fails the structural-minimum validator or declares more than state.OpenAPIImportMaxEndpoints (50) endpoints on the import endpoint."
+    delete:
+      tags: [openapi_import]
+      operationId: deleteAppOpenAPI
+      summary: Delete the imported OpenAPI document for an app.
+      description: |
+        Idempotent: returns 204 even if no row existed.
+        Emits app.openapi_import.deleted audit + pg_notify
+        on NotifyAppOpenAPIDocChanged so the auto-gen cache
+        flushes.
+      responses:
+        '204': { description: Deleted (row gone from app_openapi_docs). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/apps/{slug}/openapi/dry-run:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [openapi_import]
+      operationId: dryRunAppOpenAPI
+      summary: Read-only preview of edge-rule suggestions for an imported doc.
+      description: |
+        POST-only (the body IS the import body). Same auth chain
+        as the GET surface minus the MFA requirement (read-only).
+        Validates the doc and walks paths, emitting one
+        EdgeRuleSuggestion per (path, method) pair NOT already
+        covered by an existing validate edge rule. Empty array
+        when the doc is fully covered.
+
+        Customer pastes each suggestion's Path + Methods + Kind
+        + Action back into the existing create-edge-rule endpoint
+        (item #2 D3). Does NOT persist; does NOT emit pg_notify.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [openapi, info, paths]
+              properties:
+                openapi: { type: string }
+                info:    { type: object }
+                paths:   { type: object }
+      responses:
+        '200':
+          description: Dry-run suggestions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppOpenAPIImportDryRunResponse' }
+        '400': { description: "code: empty_body." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: "code: openapi_import_too_large. Body exceeds state.OpenAPIImportMaxDocBytes (256 KiB) on the dry-run endpoint." }
+        '422':
+          description: "code: openapi_import_invalid or openapi_import_too_many_endpoints. Doc fails the structural-minimum validator or declares more than state.OpenAPIImportMaxEndpoints (50) endpoints on the dry-run endpoint."
 
   /v1/apps/{slug}/diff:
     parameters:
@@ -5041,6 +5255,168 @@ paths:
               example:
                 rotated_at: "2026-07-28T12:00:00Z"
                 webhook_secret_sealed_masked: "***"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Alert presets (ADR-123 / issue #1233) ───────────────────────────────
+  # Catalog of one-click alert presets. The catalog is R/O for
+  # customers (system-seeded via migration 00348). Enabling a
+  # preset clones it into a real alert_rules row via the existing
+  # quota path; the row is owned by the customer from then on
+  # (PATCH/DELETE/rotate-secret all work on the cloned row).
+  /v1/alert-presets:
+    get:
+      tags: [alert_rules]
+      operationId: listAlertPresets
+      summary: List the 8-row alert-preset catalog.
+      description: |
+        The catalog is small (8 rows in PR-A) so no pagination.
+        Rows whose enabled_in_catalog=false are returned with the
+        flag set so the dashboard can render "coming soon" — the
+        enable endpoint rejects them with 400 alert_preset_disabled.
+        Rows whose minimum_plan is above the caller's plan are
+        returned with enabled_in_catalog unchanged so the dashboard
+        can render an "upgrade to <plan>" hint per row.
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AlertPresetResponse' }
+              example:
+                - id: "0123456789abcdef0123456789abcdef"
+                  name: "error_rate_2pct"
+                  display_name: "Error rate exceeds 2%"
+                  description: "Fires when the rolling 15-minute error rate exceeds 2%."
+                  category: "reliability"
+                  metric: "error_rate_pct"
+                  comparison: "gt"
+                  threshold: 2
+                  window_spec: "15m"
+                  default_cooldown_minutes: 15
+                  minimum_plan: "hobby"
+                  enabled_in_catalog: true
+                - id: "fedcba9876543210fedcba9876543210"
+                  name: "api_down"
+                  display_name: "API is down"
+                  description: "Fires when the app has not served a successful invocation in 5 minutes."
+                  category: "availability"
+                  metric: "api_up"
+                  comparison: "lt"
+                  threshold: 1
+                  window_spec: "5m"
+                  default_cooldown_minutes: 5
+                  minimum_plan: "pro"
+                  enabled_in_catalog: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/alert-presets/{name}/enable:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: name
+        in: path
+        required: true
+        description: Preset name (catalog key — see `listAlertPresets`).
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+    post:
+      tags: [alert_rules]
+      operationId: enableAlertPreset
+      summary: Instantiate a preset as an alert rule.
+      description: |
+        Clones the catalog row into a real alert_rules row the
+        caller owns from then on. The (metric, comparison,
+        threshold, window_spec, default_cooldown_minutes)
+        sextuple is pre-filled server-side; the caller supplies
+        only webhook_url + webhook_secret (the delivery channel)
+        and optional cooldown_minutes / enabled overrides.
+
+        Pre-loadApp gates fire in this order: 404 on missing
+        preset → 400 alert_preset_disabled on disabled-in-catalog
+        → 402 plan_alert_presets_not_allowed on below-minimum-plan
+        → 400 alert_preset_invalid on body shape → 400
+        image_egress_denied on the SSRF egress guard → 402
+        plan_alert_rules_not_allowed on the per-plan cap → 403
+        plan_alert_rule_quota on the per-app / per-account cap.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EnableAlertPresetRequest' }
+            example:
+              webhook_url: "https://hooks.example.com/alerts"
+              webhook_secret: "shh"
+              cooldown_minutes: 5
+              enabled: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The instantiated alert rule (carries the masked secret).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # Dashboard form-POST sibling of /v1/apps/{slug}/alert-presets/{name}/enable.
+  # Accepts application/x-www-form-urlencoded (not JSON) so the
+  # server-rendered preset grid at pkg/dashboard/templates/app_detail.html
+  # can submit without client-side JS. On success returns a 302 redirect
+  # to /apps/{slug}?just_enabled={rule_id}; on 4xx returns the dashboard
+  # app_detail page with the error rendered into the preset card.
+  /dashboard/apps/{slug}/alert-presets/{name}/enable:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      # The name path parameter IS defined in the JSON sibling as
+      # an inline field (no reusable `Name` component exists yet —
+      # see #4862 in the component reuse backlog). Vacuum's
+      # `parameter-named-correctly` rule fails when a route
+      # declares a {name} path segment but no `name: in: path`
+      # parameter; mirroring the JSON sibling here keeps the
+      # spec-check gate green and gives dashboard clients a
+      # typed path arg in the SDK.
+      - name: name
+        in: path
+        required: true
+        description: Preset name (catalog key — same value the JSON
+          sibling accepts at /v1/apps/{slug}/alert-presets/{name}/enable).
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+    post:
+      tags: [alert_rules]
+      operationId: dashboardEnableAlertPreset
+      summary: Form-POST sibling of enableAlertPreset for the dashboard.
+      description: |
+        Receives application/x-www-form-urlencoded payload from the
+        preset-grid form. Coerces the (webhook_url, webhook_secret)
+        pair into the same EnableAlertPresetRequest body the JSON
+        sibling expects, runs the same plan-tier gate, then 302-redirects
+        to /apps/{slug}?just_enabled={rule_id}. The web-cookie auth
+        path is sufficient — no MFA challenge (the JSON sibling
+        requires MFA via the public-auth middleware).
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/EnableAlertPresetRequest' }
+      responses:
+        '302':
+          description: Redirect to /apps/{slug}?just_enabled={rule_id}.
+        '400': { $ref: '#/components/responses/AlertRuleInvalid' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/AlertRuleInvalid' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -9632,7 +10008,7 @@ components:
         deployed_via:
           type: [string, "null"]
           enum: [null, api, cli, dashboard, github, operator]
-          description: "Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00305_deployments_actor.sql's CHECK constraint."
+          description: "Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema layer by migrations/00303_deployments_actor.sql's CHECK constraint."
           example: "cli"
         deployed_from_ip:
           type: [string, "null"]
@@ -9660,18 +10036,18 @@ components:
         reason:
           type: string
           maxLength: 280
-          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
+          description: "Free-form operator note on the source-ref deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
         tag:
           type: string
           enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
-          description: "Closed-set annotation tag for grouping/filtering."
+          description: "Closed-set annotation tag on the source-ref deploy request for grouping/filtering."
         deployed_by:
           type: string
-          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
+          description: "Human-readable actor label on the source-ref deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
         pr_number:
           type: integer
           minimum: 1
-          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
+          description: "Pull-request number that drove this source-ref deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
         # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
         # auto-rollback echo. The migration 00354 column shape is
         # mirrored verbatim onto the wire so the dashboard, CLI
@@ -9749,19 +10125,29 @@ components:
           type: [string, "null"]
           pattern: '^[a-f0-9]{40}$'
           description: "40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA."
-        # Issue #977 / ADR-116 — deployment annotations. Optional;
-        # CLI auto-captures deployed_by from `git config user.name`.
+        # Issue #977 / ADR-116 — deployment annotation echo. The four
+        # columns stamped at create time are surfaced verbatim so the
+        # dashboard, CLI history, and SDK consumers can render the
+        # annotation without an audit round-trip. omitempty on each
+        # keeps pre-feature rows byte-identical to the pre-PR wire
+        # shape. The closed-set vocabulary on tag and the length cap
+        # on reason are enforced at the schema layer
+        # (deployments_tag_set_chk / deployments_reason_len_chk).
         reason:
-          type: [string, "null"]
+          type: string
           maxLength: 280
+          description: "Free-form operator note on the tarball deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
         tag:
-          type: [string, "null"]
-          enum: [null, incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          type: string
+          enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag on the tarball deploy request for grouping/filtering."
         deployed_by:
-          type: [string, "null"]
+          type: string
+          description: "Human-readable actor label on the tarball deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
         pr_number:
-          type: [integer, "null"]
+          type: integer
           minimum: 1
+          description: "Pull-request number that drove this tarball deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     UpdateDeploymentRequest:
 
@@ -11354,21 +11740,29 @@ components:
           enum: [tarball]
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
-        # Issue #977 / ADR-116 — annotation fields. The GitHub
-        # Action .github/actions/deploy/action.yml passes these
-        # from the action.yml inputs. nil/omitted on every field
-        # = no annotation.
+        # Issue #977 / ADR-116 — deployment annotation echo. The four
+        # columns stamped at create time are surfaced verbatim so the
+        # dashboard, CLI history, and SDK consumers can render the
+        # annotation without an audit round-trip. omitempty on each
+        # keeps pre-feature rows byte-identical to the pre-PR wire
+        # shape. The closed-set vocabulary on tag and the length cap
+        # on reason are enforced at the schema layer
+        # (deployments_tag_set_chk / deployments_reason_len_chk).
         reason:
-          type: [string, "null"]
+          type: string
           maxLength: 280
+          description: "Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."
         tag:
-          type: [string, "null"]
-          enum: [null, incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          type: string
+          enum: [incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request]
+          description: "Closed-set annotation tag for grouping/filtering."
         deployed_by:
-          type: [string, "null"]
+          type: string
+          description: "Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."
         pr_number:
-          type: [integer, "null"]
+          type: integer
           minimum: 1
+          description: "Pull-request number when the wire offers it (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
 
     DiffRequest:
       description: |
@@ -11679,6 +12073,19 @@ components:
         can_apply: { type: boolean }
         crons_not_allowed: { type: boolean }
         plan_token: { type: string, description: "base64-JSON plan token; pass back as ?plan_token= on /v1/projects to skip the second extract." }
+        # ADR-124 can_apply rescue signal (PR-followup ship-blocker
+        # #3). can_apply_pre_exclude mirrors the gate evaluated on the
+        # full scan (pre-`--only`/pre-`--exclude`); gate_rescued_by_
+        # exclude is the diff between pre and post — true when
+        # --exclude flipped a blocked gate to allowed. can_apply_
+        # reasons is the human-readable failure list for the post-
+        # exclude state. All three are omitempty on the wire so
+        # existing --json consumers stay stable.
+        can_apply_pre_exclude: { type: boolean }
+        gate_rescued_by_exclude: { type: boolean }
+        can_apply_reasons:
+          type: array
+          items: { type: string }
         # ADR-124 blast-radius partition. will_deploy + unaffected
         # together enumerate every existing app in the account plus the
         # scan's proposed creates. skipped is the operator-excluded
@@ -11725,6 +12132,12 @@ components:
         can_apply: { type: boolean }
         crons_not_allowed: { type: boolean }
         plan_token: { type: string }
+        # ADR-124 can_apply rescue signal (mirrors PlanResponse).
+        can_apply_pre_exclude: { type: boolean }
+        gate_rescued_by_exclude: { type: boolean }
+        can_apply_reasons:
+          type: array
+          items: { type: string }
         # ADR-124 blast-radius partition (mirrors PlanResponse).
         will_deploy:
           type: array
@@ -11903,6 +12316,78 @@ components:
         rotated_at: { type: string, format: date-time, example: "2026-07-28T12:00:00Z" }
         webhook_secret_sealed_masked: { type: string, example: "***" }
 
+    # ─── Alert presets (ADR-123 / issue #1233) ───────────────────────────────
+
+    AlertPresetResponse:
+      description: |
+        One row of the alert-preset catalog (issue #1233, ADR-123).
+        The catalog is system-seeded and R/O for customers — the
+        enable endpoint clones the row into a real alert_rules row
+        the customer owns from then on. No persistent preset_id FK
+        lands on alert_rules.
+      type: object
+      required:
+        - id
+        - name
+        - display_name
+        - description
+        - category
+        - metric
+        - comparison
+        - threshold
+        - window_spec
+        - default_cooldown_minutes
+        - minimum_plan
+        - enabled_in_catalog
+      properties:
+        id: { type: string, format: uuid, example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, minLength: 1, maxLength: 64, example: "error_rate_2pct" }
+        display_name: { type: string, example: "Error rate exceeds 2%" }
+        description: { type: string, example: "Fires when the rolling 15-minute error rate exceeds 2%." }
+        category:
+          type: string
+          enum: [availability, reliability, cost, deployment, infrastructure]
+          example: "reliability"
+        metric: { type: string, example: "error_rate_pct" }
+        comparison: { type: string, enum: [gt, gte, lt, lte], example: "gt" }
+        threshold: { type: number, example: 2 }
+        window_spec: { type: string, enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d'], example: "15m" }
+        default_cooldown_minutes: { type: integer, minimum: 5, maximum: 1440, example: 15 }
+        minimum_plan: { type: string, enum: [free, hobby, pro, scale], example: "hobby" }
+        enabled_in_catalog: { type: boolean, example: true }
+
+    EnableAlertPresetRequest:
+      description: |
+        Body for POST /v1/apps/{slug}/alert-presets/{name}/enable.
+        The (name, metric, comparison, threshold, window_spec,
+        default_cooldown_minutes) sextuple is pre-filled from the
+        catalog; the caller supplies only the delivery-side fields.
+      type: object
+      required: [webhook_url, webhook_secret]
+      properties:
+        webhook_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          example: "https://hooks.example.com/alerts"
+        webhook_secret:
+          type: string
+          maxLength: 256
+          example: "shh"
+        cooldown_minutes:
+          type: integer
+          minimum: 5
+          maximum: 1440
+          description: |
+            Override for the preset's default_cooldown_minutes.
+            Omit to use the catalog default.
+        enabled:
+          type: boolean
+          default: true
+          description: |
+            Whether the instantiated rule is enabled. Defaults to
+            true; pass false to stage the rule in disabled state.
+
     # ─── Edge rules (ADR-089, planned) ────────────────────────────────────────
 
     EdgeRuleResponse:
@@ -11951,7 +12436,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -11968,7 +12453,6 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
-            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -11986,7 +12470,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -12003,7 +12487,6 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
-            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -12032,7 +12515,6 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
-            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -12238,6 +12720,81 @@ components:
             `X-Validation-Warning: <rule_id>` on the response. An
             empty / omitted value is coerced to `block` at the
             gateway-side handler.
+
+    EdgeRuleCacheAction:
+      description: |
+        Edge-cache control primitive (ADR-122, kind=cache). Wraps the
+        response body in a per-route freshness window so a wake-elision
+        cache absorbs repeat traffic without paying a cold-boot cost.
+
+        Field-by-field:
+          * `max_age_seconds` — required. Fresh window in seconds. The
+            apid-side default is 60; the absolute platform cap is 3600
+            (`api.ResponseCacheMaxAgeMaxSeconds`). The runtime cache
+            layer in `pkg/gateway/response_cache.go` re-checks this
+            cap as defence-in-depth.
+          * `stale_if_error_seconds` — required. Stale-on-error window
+            in seconds. Default 300; absolute cap 300
+            (`api.ResponseCacheStaleIfErrorMaxSeconds`). During an
+            upstream error the gateway returns the cached body within
+            this window instead of 502/504.
+          * `vary_on` — optional closed vocabulary of non-credential
+            request headers that participate in the cache key.
+            Allowed values: `Accept-Language`, `Accept-Encoding`.
+            Credential-bearing headers (Authorization, Cookie) are
+            deliberately excluded — authed requests bypass the cache
+            entirely (ADR-122 D3).
+          * `methods` — optional closed vocabulary of HTTP methods
+            eligible for caching. Allowed values: `GET`, `HEAD`.
+            POST/PUT/PATCH/DELETE are deliberately excluded —
+            caching their responses is either incorrect (idempotency
+            breaks under retry) or unsafe (cross-user state).
+      type: object
+      required: [max_age_seconds, stale_if_error_seconds]
+      properties:
+        max_age_seconds:
+          type: integer
+          minimum: 0
+          maximum: 3600
+          default: 60
+          description: |
+            Fresh window in seconds. 0 = inherit the apid-side default
+            (60s). Positive values are clamped to the platform cap
+            (3600s = 1 hour).
+        stale_if_error_seconds:
+          type: integer
+          minimum: 0
+          maximum: 300
+          default: 300
+          description: |
+            Stale-on-error window in seconds. 0 = no stale-on-error
+            (errors return 502/504 directly). Positive values are
+            clamped to the platform cap (300s = 5 minutes).
+        vary_on:
+          type: array
+          description: |
+            Non-credential request headers that participate in the
+            cache key. Closed vocabulary:
+              - `Accept-Language`
+              - `Accept-Encoding`
+            Empty array (default) collapses to no extra key
+            dimensions; the URL path + query alone drives cache
+            identity.
+          items:
+            type: string
+            enum: [Accept-Language, Accept-Encoding]
+        methods:
+          type: array
+          description: |
+            HTTP methods eligible for caching. Closed vocabulary:
+              - `GET`
+              - `HEAD`
+            Empty array (default) collapses to the runtime's
+            cacheability predicate (GET + HEAD). POST/PUT/PATCH/DELETE
+            are deliberately absent.
+          items:
+            type: string
+            enum: [GET, HEAD]
 
     EdgeRuleLimitAction:
       description: |
@@ -12527,76 +13084,6 @@ components:
           maxLength: 128
           pattern: '^[A-Za-z][A-Za-z0-9-]*$'
           description: "Optional RFC 7230 token header name for per-request override (default `x-faas-budget-ms`). Empty = no override."
-
-    EdgeRuleCacheAction:
-      description: |
-        Per-route TTL knobs for safe response caching on selected
-        GET/HEAD paths (ADR-122 / §4.1.2.17). The primitive for
-        "GET /catalog/* → 60 s fresh + 5 min stale-on-error" without
-        forcing the customer to bring their own cache (Upstash
-        Redis). The hot-path applier
-        (pkg/gateway/handler_apply_edge_rule_cache.go) consults the
-        matched rule on each request; a hit serves the cached body
-        and returns BEFORE the wake gate, so no VM runs and no
-        `gb_ram_hour` accrues.
-
-        Auth posture: requests carrying `Authorization` or a session
-        cookie are a hard bypass — they are NEVER stored and NEVER
-        served. `vary_on` therefore accepts ONLY
-        `Accept-Language` / `Accept-Encoding`; adding
-        `Authorization` / `Cookie` to `vary_on` is rejected at
-        create-time with 422.
-
-        Field-by-field:
-          * `max_age_seconds` — fresh window in seconds. Default 60,
-            range `[0, 3600]`. A zero value disables fresh hits but
-            stale-on-error still applies within
-            `stale_if_error_seconds`.
-          * `stale_if_error_seconds` — post-fresh window during
-            which a stored entry may be served ONLY on origin
-            failure (wake gate failure or upstream 5xx/timeout).
-            Default 300, hard cap 300. Stale-while-revalidate
-            (serving stale while a refresh runs in the background)
-            is NOT supported.
-          * `vary_on` — closed vocabulary subset
-            (`Accept-Language`, `Accept-Encoding`) whose values
-            participate in the cache key. Empty = no vary
-            dimension beyond the URL.
-          * `methods` — optional method allowlist (default
-            `{GET, HEAD}`). Anything outside this set is rejected
-            at create-time with 422.
-
-        Per-plan quota: Free 0 (closed), Hobby 1, Pro 5, Scale 20
-        (`Limits.EdgeRulesCachePerApp`). The Free=0 default is
-        deliberate — the wake-elision guarantee is the upsell, not
-        a baseline amenity.
-      type: object
-      required: [max_age_seconds, stale_if_error_seconds]
-      properties:
-        max_age_seconds:
-          type: integer
-          format: int32
-          minimum: 0
-          maximum: 3600
-          description: "Fresh window in seconds (default 60, range [0, 3600])."
-        stale_if_error_seconds:
-          type: integer
-          format: int32
-          minimum: 0
-          maximum: 300
-          description: "Post-fresh window during which a stored entry may be served ONLY on origin failure (default 300, hard cap 300)."
-        vary_on:
-          type: array
-          description: "Closed vocabulary subset (Accept-Language, Accept-Encoding) whose values participate in the cache key."
-          items:
-            type: string
-            enum: [Accept-Language, Accept-Encoding]
-        methods:
-          type: array
-          description: "Optional method allowlist (default {GET, HEAD})."
-          items:
-            type: string
-            enum: [GET, HEAD]
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -13429,6 +13916,18 @@ components:
           description: "FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."
           x-since: "2026-07"
           x-issue: "273"
+        queue_depth:
+          type: integer
+          format: int64
+          description: |
+            Current wake-queue depth (`gateway_queue_depth{app}`).
+            Backs the `queue_backlog_growing` alert preset (ADR-123):
+            comparison `gt 50` over the chosen window. Best-effort:
+            absent on Prometheus failure (the field is `null`); the
+            evaluator's degraded-source contract skips firing
+            rather than guessing.
+          x-since: "2026-08"
+          x-issue: "1233"
         egress_bytes:
           type: integer
           format: int64
@@ -13507,6 +14006,139 @@ components:
           description: "Share of [45]xx requests with this route in the window."
           x-since: "2026-08"
           x-issue: "273"
+
+    AppOpenAPIImportResponse:
+      description: |
+        Response body for `POST /v1/apps/{slug}/openapi` (issue #975
+        item #2 / ADR-126). One row per app in `app_openapi_docs`,
+        last-write-wins. Source is always `manual_import` — cold-
+        boot captures go to `deployment_openapi_docs` (item #1).
+        `endpoint_count` is the number of HTTP operations in the
+        imported doc's `paths.*`; `byte_size` is the raw body size
+        the handler enforced against
+        `state.OpenAPIImportMaxDocBytes` (256 KiB).
+      type: object
+      required:
+        - app_id
+        - source
+        - openapi_version
+        - endpoint_count
+        - byte_size
+        - captured_at
+        - updated_at
+      properties:
+        app_id:
+          type: string
+          format: uuid
+          description: "App UUID the import row is bound to."
+          x-since: "2026-08"
+          x-issue: "975"
+        source:
+          type: string
+          enum: ["manual_import"]
+          description: "Row source. Always `manual_import` for this endpoint."
+          x-since: "2026-08"
+          x-issue: "975"
+        openapi_version:
+          type: string
+          enum: ["3.0.0","3.0.1","3.0.2","3.0.3","3.0.4","3.1.0","3.1.1"]
+          description: "OpenAPI spec version the imported doc declares."
+          x-since: "2026-08"
+          x-issue: "975"
+        endpoint_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: "Number of HTTP operations in the imported doc."
+          x-since: "2026-08"
+          x-issue: "975"
+        byte_size:
+          type: integer
+          minimum: 1
+          maximum: 262144
+          description: "Raw body size in bytes (state.OpenAPIImportMaxDocBytes = 256 KiB)."
+          x-since: "2026-08"
+          x-issue: "975"
+        captured_at:
+          type: string
+          format: date-time
+          description: "First-import timestamp; preserved across re-imports."
+          x-since: "2026-08"
+          x-issue: "975"
+        updated_at:
+          type: string
+          format: date-time
+          description: "Most-recent write timestamp; bumped on every import."
+          x-since: "2026-08"
+          x-issue: "975"
+
+    EdgeRuleSuggestion:
+      description: |
+        Single read-only candidate row in the dry-run response
+        (issue #975 item #2 D3 / ADR-126). Mirrors the
+        create-edge-rule request body fields so the customer can
+        copy-paste the suggestion into the existing endpoint.
+        `kind` + `action` union shape matches the existing
+        `EdgeRule*Action` types in `pkg/api/dto.go`.
+      type: object
+      required:
+        - path
+        - methods
+        - kind
+        - action
+      properties:
+        path:
+          type: string
+          description: "Operation path (e.g. `/users/{id}`)."
+          x-since: "2026-08"
+          x-issue: "975"
+        methods:
+          type: array
+          items: { type: string, enum: ["get","put","post","delete","options","head","patch","trace"] }
+          description: "HTTP methods the suggestion applies to."
+          x-since: "2026-08"
+          x-issue: "975"
+        kind:
+          type: string
+          enum: ["validate","cors","throttle","jwt","headers","cache","redirect","rewrite"]
+          description: "Edge-rule kind the suggestion produces."
+          x-since: "2026-08"
+          x-issue: "975"
+        action:
+          type: object
+          additionalProperties: true
+          description: "Action payload (matches EdgeRule*Action types)."
+          x-since: "2026-08"
+          x-issue: "975"
+
+    AppOpenAPIImportDryRunResponse:
+      description: |
+        Response body for `POST /v1/apps/{slug}/openapi/dry-run`
+        (issue #975 item #2 D3 / ADR-126). Read-only; no persist,
+        no `pg_notify`, no MFA. Empty `suggestions` array when the
+        doc is fully covered by existing validate edge rules.
+      type: object
+      required:
+        - suggestions
+        - openapi_version
+        - endpoint_count
+      properties:
+        suggestions:
+          type: array
+          items: { $ref: '#/components/schemas/EdgeRuleSuggestion' }
+          description: "Suggested EdgeRuleSuggestion rows."
+          x-since: "2026-08"
+          x-issue: "975"
+        openapi_version:
+          type: string
+          description: "OpenAPI version declared by the dry-run doc."
+          x-since: "2026-08"
+          x-issue: "975"
+        endpoint_count:
+          type: integer
+          description: "Number of operations in the dry-run doc."
+          x-since: "2026-08"
+          x-issue: "975"
 
     AppRoutesResponse:
       description: |
@@ -15563,6 +16195,35 @@ components:
       required: [delivery]
       properties:
         delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+
+    DebugTelemetryListResponse:
+      type: object
+      description: |
+        Response from GET /v1/apps/{slug}/debug/requests (ADR-127).
+        `since` echoes the effective window used (after the plan's
+        `DebugTelemetryRetentionDays` clamp) so the dashboard can
+        surface a "you widened past the cap" tile.
+      required: [requests, since]
+      properties:
+        since: { type: string, description: "Effective window applied (e.g. '24h', '72h')." }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/DebugTelemetryRequestItem' }
+
+    DebugTelemetryRequestItem:
+      type: object
+      description: "One row per gateway-served request, persisted by the recorder (PR-A)."
+      required: [id, deployment_id, route, method, status, latency_ms, cold_boot, received_at]
+      properties:
+        id: { type: string, format: uuid }
+        deployment_id: { type: string, format: uuid }
+        route: { type: string, description: "Route template (NOT expanded URL)." }
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS] }
+        status: { type: integer, minimum: 100, maximum: 599 }
+        latency_ms: { type: integer, minimum: 0 }
+        cold_boot: { type: boolean }
+        trace_id: { type: [string, 'null'], description: "W3C trace-id hex (32 chars), null when unset." }
+        received_at: { type: string, format: date-time }
 
 
   responses:

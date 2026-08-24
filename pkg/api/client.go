@@ -1493,6 +1493,38 @@ func (c *Client) RotateAlertRuleSecret(ctx context.Context, slug, id string) (Ro
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alerts/"+id+"/rotate-secret", nil, &out)
 }
 
+// --- Alert presets (ADR-123 / issue #1233) -------------------------------
+
+// ListAlertPresets returns the 8-row alert-preset catalog (issue
+// #1233, ADR-123). The catalog is small enough that no pagination
+// is needed — the SDK returns the flat slice verbatim. Disabled
+// rows are returned with enabled_in_catalog=false (so the CLI
+// renders them as "coming soon") and below-minimum-plan rows are
+// returned with their minimum_plan field intact (so the CLI /
+// dashboard can render an "upgrade to <plan>" hint per row).
+func (c *Client) ListAlertPresets(ctx context.Context) ([]AlertPresetResponse, error) {
+	var out []AlertPresetResponse
+	return out, c.do(ctx, "GET", "/v1/alert-presets", nil, &out)
+}
+
+// EnableAlertPreset instantiates a catalog row as a real
+// alert_rules row. The (metric, comparison, threshold, window_spec,
+// default_cooldown_minutes) quadruple is pre-filled server-side;
+// the caller supplies webhook_url + webhook_secret (the delivery
+// channel). CooldownMinutes and Enabled are optional overrides
+// (catalog defaults win when omitted). Returns 201 with the
+// instantiated AlertRuleResponse so the dashboard renders the new
+// rule alongside hand-rolled ones.
+//
+// Plan-tier gate: if the caller's plan is below the preset's
+// minimum_plan, the server returns 402
+// plan_alert_presets_not_allowed. The SDK surfaces the error
+// verbatim; the CLI prints the message and exits 1.
+func (c *Client) EnableAlertPreset(ctx context.Context, slug, presetName string, req EnableAlertPresetRequest) (AlertRuleResponse, error) {
+	var out AlertRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alert-presets/"+presetName+"/enable", req, &out)
+}
+
 // --- Edge rules (ADR-089, planned) ----------------------------------------
 
 // ListEdgeRules returns every edge rule owned by the authenticated
@@ -3340,4 +3372,96 @@ func (c *Client) PatchAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deploy
 // account.
 func (c *Client) DeleteAppsDeploymentOpenAPIDoc(ctx context.Context, slug, deployment string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/deployments/"+deployment+"/openapi", nil, nil)
+}
+
+// GetAppOpenAPI returns the imported or auto-generated OpenAPI
+// document for an app (issue #975 item #2 / ADR-126). The source
+// query param selects between the customer's imported doc verbatim
+// (`manual_import`, default) and the platform-merged spec
+// (`auto` — imported doc ∪ observed routes ∪ existing edge rules).
+// The body is the raw OpenAPI document; provenance lives in the
+// X-OpenAPI-Doc-Source response header. Limits are abuse-surface
+// (every plan including Free), per-account row cap is
+// Plan.OpenAPIImportsPerAccount.
+func (c *Client) GetAppOpenAPI(ctx context.Context, slug, source string) ([]byte, error) {
+	q := url.Values{}
+	if source != "" {
+		q.Set("source", source)
+	}
+	u := "/v1/apps/" + slug + "/openapi"
+	if encoded := q.Encode(); encoded != "" {
+		u += "?" + encoded
+	}
+	var body []byte
+	if err := c.doBytes(ctx, "GET", u, nil, &body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// ImportAppOpenAPI uploads (or overwrites) the customer's OpenAPI
+// document for an app. Body is the raw OpenAPI document; the
+// server validates shape (Draft 2020-12 + OpenAPI 3.1 schema) +
+// enforces size + endpoint caps before persisting. Returns the
+// stored row metadata (uuid + source + version + counts +
+// timestamps). 413 if the doc exceeds Plan.OpenAPIImportMaxDocBytes
+// (state constant 256 KiB), 422 on validation / endpoint-cap
+// failure, 403 on per-account quota.
+//
+// Wire format is the raw OpenAPI doc (no envelope) — the apid
+// handler reads r.Body bytes verbatim and feeds them to
+// openapiimport.ValidateImport. Wrapping in {"doc":...} would
+// fail the meta-schema compile because the top-level shape
+// would no longer be the OAI doc itself.
+func (c *Client) ImportAppOpenAPI(ctx context.Context, slug string, doc map[string]any) (AppOpenAPIImportResponse, error) {
+	var out AppOpenAPIImportResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi", doc, &out)
+}
+
+// DryRunAppOpenAPI previews edge-rule suggestions for a candidate
+// OpenAPI doc without persisting it. Same body shape as the import
+// endpoint (raw OpenAPI document); returns one EdgeRuleSuggestion
+// per (path, method) pair NOT already covered by an existing
+// validate edge rule. Empty array when the doc is fully covered.
+// Read-only — no pg_notify, no audit emit, no MFA requirement.
+//
+// Wire format mirrors ImportAppOpenAPI: raw OpenAPI doc, no
+// envelope.
+func (c *Client) DryRunAppOpenAPI(ctx context.Context, slug string, doc map[string]any) (AppOpenAPIImportDryRunResponse, error) {
+	var out AppOpenAPIImportDryRunResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/openapi/dry-run", doc, &out)
+}
+
+// DeleteAppOpenAPI wipes the imported OpenAPI document for an app.
+// Idempotent: returns 204 even if no row existed. Emits
+// app.openapi_import.deleted audit + pg_notify on
+// NotifyAppOpenAPIDocChanged so the auto-gen cache flushes.
+func (c *Client) DeleteAppOpenAPI(ctx context.Context, slug string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/openapi", nil, nil)
+}
+
+// ListAppDebugRequests returns the recent per-app request-telemetry
+// rows (status, latency_ms, route, deployment_id, trace_id,
+// received_at) for slug (ADR-127 / PR-A). The endpoint is the
+// read-side of the production-debugger data plane; the write-side
+// (gateway publisher → apid gRPC IncrementRequestTelemetry →
+// sqlc INSERT) lands in PR-B.
+//
+// since is a duration or 'Nd' alias (e.g. "30m", "24h", "3d") and
+// is clamped server-side to the plan's DebugTelemetryRetentionDays
+// (Free=off / 402; Hobby=3d; Pro=7d; Scale=14d). Empty falls
+// back to the server's default (24h). The response envelope's
+// `since` echoes the effective window applied, so a customer who
+// asks for 30d on Hobby gets 3d back with the same payload.
+//
+// 402 when the plan gates the feature (DebugTelemetryEnabled=false);
+// 404 when the app is owned by a different account (IDOR-safe
+// byte-identical-404).
+func (c *Client) ListAppDebugRequests(ctx context.Context, slug, since string) (DebugTelemetryListResponse, error) {
+	var out DebugTelemetryListResponse
+	path := "/v1/apps/" + slug + "/debug/requests"
+	if since != "" {
+		path += "?since=" + url.QueryEscape(since)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }

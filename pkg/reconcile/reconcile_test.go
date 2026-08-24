@@ -166,7 +166,7 @@ func TestReconcile_ThreeWorkloads_NoDiff(t *testing.T) {
 	seedApp(t, store, proj, "", "web", "")
 
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestReconcile_ThreeWorkloads_AddOne(t *testing.T) {
 	seedApp(t, store, proj, "", "worker", "")
 
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestReconcile_ThreeWorkloads_RemoveOne(t *testing.T) {
 		Tier: reposcan.TierCompose,
 	}
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -238,6 +238,112 @@ func TestReconcile_ThreeWorkloads_RemoveOne(t *testing.T) {
 	kinds := extractKinds(store.snapshotEvents())
 	if len(kinds) != 2 || kinds[0] != KindReconcileStarted || kinds[1] != KindWorkloadRemoved {
 		t.Errorf("expected [started, removed], got %v", kinds)
+	}
+}
+
+// TestReconcile_ExcludePreventsRemove pins code-review finding
+// #1 (PR #1065): the operator --exclude set MUST be honored by
+// workloadDiff. The pre-fix implementation filtered the SCAN
+// side (filteredW drops workloads whose name is in exclude)
+// but did NOT filter the EXISTING side, so a scan that drops
+// `extrasvc` (excluded) while leaving `api` + `worker` would
+// still emit a remove Action for `extrasvc` →
+// applyActions.applyRemove → SoftDeleteAppCascade. The
+// operator's `--exclude=extrasvc` was silently overridden.
+//
+// The fix: workloadDiff now filters `existing` by excludeSet
+// before the removes loop. This test seeds three apps
+// (api, worker, extrasvc), scans with only api + worker, and
+// passes exclude=["extrasvc"]. Expected:
+//
+//  1. out.Removed is empty (no soft-delete).
+//  2. extrasvc is still present in the store (not deleted).
+//  3. No KindWorkloadRemoved audit row fired.
+//  4. The audit chain is [started] + maybe KindWorkloadAdded/Changed
+//     but NO removed row.
+func TestReconcile_ExcludePreventsRemove(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+	seedApp(t, store, proj, "", "worker", "")
+	seedApp(t, store, proj, "", "extrasvc", "")
+
+	// Scan emits only api + worker (extrasvc is "removed" from
+	// the scan side). The exclude list mirrors what an operator
+	// would type: `--exclude=extrasvc` meaning "don't touch the
+	// extrasvc app at all".
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "", Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+			{Name: "worker", RootDir: "", Source: "compose.yaml: worker", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", []string{"extrasvc"})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Removed) != 0 {
+		t.Fatalf("exclude=extrasvc must prevent remove; got Removed=%v", out.Removed)
+	}
+
+	// extrasvc must still be present (not soft-deleted).
+	live, lerr := store.AppsForProject(context.Background(), proj.AccountID, proj.ID)
+	if lerr != nil {
+		t.Fatalf("AppsForProject: %v", lerr)
+	}
+	foundExtrasvc := false
+	for _, a := range live {
+		if a.WorkloadName == "extrasvc" {
+			foundExtrasvc = true
+			break
+		}
+	}
+	if !foundExtrasvc {
+		t.Errorf("extrasvc must remain live (exclude set prevents remove); live=%v", live)
+	}
+
+	// Audit: started only — NO KindWorkloadRemoved.
+	kinds := extractKinds(store.snapshotEvents())
+	for _, k := range kinds {
+		if k == KindWorkloadRemoved {
+			t.Errorf("audit must NOT include KindWorkloadRemoved when exclude=[extrasvc]; got kinds=%v", kinds)
+		}
+	}
+	if len(kinds) == 0 || kinds[0] != KindReconcileStarted {
+		t.Errorf("expected audit to begin with %q; got %v", KindReconcileStarted, kinds)
+	}
+}
+
+// TestReconcile_ExcludeMixedCaseAndTrim pins the
+// normalization contract: workloadDiff's exclude filter is
+// case-insensitive on WorkloadName AND trims surrounding
+// whitespace from operator input. The handler converts via
+// `strings.ToLower(strings.TrimSpace(name))` before threading
+// through; a future refactor that drops the trim would let
+// " extrasvc " (with surrounding spaces from copy-paste)
+// leak past the filter and soft-delete the app.
+func TestReconcile_ExcludeMixedCaseAndTrim(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "ExtraSvc", "") // mixed-case name on the store side
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{},
+		Tier:      reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	// Pass with mixed-case + whitespace; the filter MUST match
+	// "extrasvc" (lowercased) against "ExtraSvc" (lowercased).
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", []string{" EXTRASVC "})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Removed) != 0 {
+		t.Errorf("mixed-case+trimmed exclude must prevent remove; got Removed=%v", out.Removed)
 	}
 }
 
@@ -257,7 +363,7 @@ func TestReconcile_ThreeWorkloads_ChangeRootDir(t *testing.T) {
 		Tier: reposcan.TierCompose,
 	}
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -300,7 +406,7 @@ func TestReconcile_ScanSourceDowngrade(t *testing.T) {
 		Tier: reposcan.TierConvention,
 	}
 	svc := freshService(store, aud)
-	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err == nil {
 		t.Fatalf("expected downgrade rejection, got nil")
 	}
@@ -322,7 +428,7 @@ func TestReconcile_FeatureBranch_NoDiff(t *testing.T) {
 
 	svc := freshService(store, aud)
 	// branch="feature/x" != project.ProductionBranch="main".
-	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "feature/x")
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "feature/x", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -348,7 +454,7 @@ func TestReconcile_ZeroWorkloads_AlertEmitted(t *testing.T) {
 
 	svc := freshService(store, aud)
 	scan := reposcan.Result{Workloads: nil, Tier: 0}
-	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -375,7 +481,7 @@ func TestReconcile_AuditOrdering_RemovedBeforeCascade(t *testing.T) {
 		Tier: reposcan.TierCompose,
 	}
 	svc := freshService(store, aud)
-	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -404,7 +510,7 @@ func TestReconcile_OverQuota_CreatesSkipped(t *testing.T) {
 	// Attempt 3 creates. Free cap = 1. proj = 1 existing + 3 = 4.
 	// projected > cap → skipped.
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -457,7 +563,7 @@ func TestReconcile_InnerQuotaError_PartialAddsAndAlert(t *testing.T) {
 		Tier: reposcan.TierCompose,
 	}
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-inner-q", "main")
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-inner-q", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -606,7 +712,7 @@ func TestReconcile_AppliedIDs_IsolatesAddsFromChanged(t *testing.T) {
 		Tier: reposcan.TierCompose,
 	}
 	svc := freshService(store, aud)
-	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -645,7 +751,7 @@ func TestPlan_NoMutation_ProjectsDiff(t *testing.T) {
 		},
 		Tier: reposcan.TierCompose,
 	}
-	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-1", "main")
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-1", "main", nil)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -688,7 +794,7 @@ func TestPlan_FeatureBranchIgnored(t *testing.T) {
 		},
 		Tier: reposcan.TierCompose,
 	}
-	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-2", "feature/foo")
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-2", "feature/foo", nil)
 	if err != nil {
 		t.Fatalf("Plan feature-branch: %v", err)
 	}
@@ -706,7 +812,7 @@ func TestPlan_EmptyScan_AlertNoWorkloads(t *testing.T) {
 	svc := NewService(store, newFakeAuditor(store), nil)
 	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
 
-	out, err := svc.Plan(context.Background(), proj, reposcan.Result{Tier: reposcan.TierCompose}, "sha-plan-3", "main")
+	out, err := svc.Plan(context.Background(), proj, reposcan.Result{Tier: reposcan.TierCompose}, "sha-plan-3", "main", nil)
 	if err == nil {
 		t.Fatalf("Plan on empty scan must error")
 	}
@@ -728,7 +834,7 @@ func TestPlan_ScanSourceDowngrade_NoMutation(t *testing.T) {
 		},
 		Tier: reposcan.TierSingle,
 	}
-	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-4", "main")
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-4", "main", nil)
 	if err == nil {
 		t.Fatalf("Plan on downgrade must error")
 	}
