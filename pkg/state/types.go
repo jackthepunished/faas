@@ -5735,3 +5735,25 @@ var ValidOpenAPIVersions = []string{
 	"3.0.0", "3.0.1", "3.0.2", "3.0.3", "3.0.4",
 	"3.1.0", "3.1.1",
 }
+
+// DeploymentScopeExclusion is one persisted --exclude row (ADR-124
+// follow-up #3). The apply path folds every active row into the
+// per-deploy exclude list when req.Exclude is empty so an operator
+// who ran `--exclude foo --persist-exclude` once does not need to
+// keep typing it on every subsequent deploy. The schema (migration
+// 00418) has NO FK to apps(id) by design (see the SOFT-DELETE
+// CASCADE BLIND SPOT comment in 00418_deployment_scope_exclusions.sql
+// header) — app_id is a snapshot reference that may go stale; the
+// janitor PurgeOrphanedScopeExclusions reaps stale rows after the
+// 90-day retention window.
+type DeploymentScopeExclusion struct {
+	ID         string
+	AccountID  string
+	ProjectID  string
+	AppID      string
+	Slug       string
+	Reason     string
+	CreatedBy  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
