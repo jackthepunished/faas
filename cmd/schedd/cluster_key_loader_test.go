@@ -348,6 +348,21 @@ func loadClusterInternalSvcKeyWithDirOverride(
 	if kid != row.KeyID {
 		return nil, "", errors.New("cluster_signing_keys row kid mismatch — refusing to mint")
 	}
+	// Cross-check public_key_pem against the unsealed private key
+	// — mirrors the production loader's parseClusterPubPEM check
+	// (cmd/schedd/cluster_key_loader.go). Without this, a row
+	// whose key_id is consistent with sealed_blob but whose
+	// public_key_pem points at a DIFFERENT key would silently
+	// mint tokens with one key while gatewayd-internal verifies
+	// against another. Refuses loud for the same reason the
+	// production loader does.
+	pubPub, err := parseClusterPubPEM([]byte(row.PublicKeyPEM))
+	if err != nil {
+		return nil, "", err
+	}
+	if !pubPub.Equal(priv.Public().(ed25519.PublicKey)) {
+		return nil, "", errors.New("cluster_signing_keys public_key_pem does not match unsealed private key — refusing to mint")
+	}
 	return priv, kid, nil
 }
 
