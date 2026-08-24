@@ -154,3 +154,84 @@ func TestCoverageSlice15StaticEgressIPCrossAppConflict(t *testing.T) {
 		t.Errorf("err %q missing index name (apId handler branch)", err.Error())
 	}
 }
+
+// TestCoverageSlice15ProvisionedStaticEgressIPExists pins the
+// provisioned-bucket lookup (ADR-119 operator-bundle gate).
+// Covers the empty-accountID short-circuit + the !Is4 short-circuit
+// + the normal hit + the normal miss branches.
+func TestCoverageSlice15ProvisionedStaticEgressIPExists(t *testing.T) {
+	m, ctx, _, app, _ := memCoverageFixture(t)
+
+	ip := netip.MustParseAddr("203.0.113.42")
+
+	// Empty accountID short-circuit returns (false, nil).
+	got, err := m.ProvisionedStaticEgressIPExists(ctx, "", ip)
+	if err != nil || got {
+		t.Errorf("empty accountID: got (%v, %v), want (false, nil)", got, err)
+	}
+
+	// Non-v4 IP short-circuit returns (false, nil).
+	v6 := netip.MustParseAddr("2001:db8::1")
+	got, err = m.ProvisionedStaticEgressIPExists(ctx, app.AccountID, v6)
+	if err != nil || got {
+		t.Errorf("non-v4 IP: got (%v, %v), want (false, nil)", got, err)
+	}
+
+	// Miss: nothing seeded for this account yet.
+	got, err = m.ProvisionedStaticEgressIPExists(ctx, app.AccountID, ip)
+	if err != nil || got {
+		t.Errorf("miss: got (%v, %v), want (false, nil)", got, err)
+	}
+
+	// Seed and re-query for hit.
+	if err := m.ReplaceProvisionedStaticEgressIPs(ctx, app.AccountID, []netip.Addr{ip}); err != nil {
+		t.Fatalf("seed Replace: %v", err)
+	}
+	got, err = m.ProvisionedStaticEgressIPExists(ctx, app.AccountID, ip)
+	if err != nil || !got {
+		t.Errorf("hit: got (%v, %v), want (true, nil)", got, err)
+	}
+}
+
+// TestCoverageSlice15ReplaceProvisionedStaticEgressIPs pins the
+// provisioned-bucket write (ADR-119 vmmd SIGHUP path).
+// Covers the empty-accountID error branch + the non-v4 IP error
+// branch + the normal replace (clear-then-insert) branch.
+func TestCoverageSlice15ReplaceProvisionedStaticEgressIPs(t *testing.T) {
+	m, ctx, _, app, _ := memCoverageFixture(t)
+
+	// Empty accountID returns error.
+	if err := m.ReplaceProvisionedStaticEgressIPs(ctx, "", nil); err == nil {
+		t.Error("empty accountID: got nil err, want error")
+	}
+
+	// Non-v4 IP in the slice returns error.
+	v6 := netip.MustParseAddr("2001:db8::1")
+	if err := m.ReplaceProvisionedStaticEgressIPs(ctx, app.AccountID, []netip.Addr{v6}); err == nil {
+		t.Error("non-v4 IP: got nil err, want error")
+	}
+
+	// Normal replace: 2 IPs, then a clear (empty slice replaces with empty bucket).
+	ip1 := netip.MustParseAddr("203.0.113.1")
+	ip2 := netip.MustParseAddr("203.0.113.2")
+	if err := m.ReplaceProvisionedStaticEgressIPs(ctx, app.AccountID, []netip.Addr{ip1, ip2}); err != nil {
+		t.Fatalf("first replace: %v", err)
+	}
+	for _, ip := range []netip.Addr{ip1, ip2} {
+		got, _ := m.ProvisionedStaticEgressIPExists(ctx, app.AccountID, ip)
+		if !got {
+			t.Errorf("after first replace, %s missing from bucket", ip)
+		}
+	}
+
+	// Clear: empty slice replaces with empty bucket.
+	if err := m.ReplaceProvisionedStaticEgressIPs(ctx, app.AccountID, nil); err != nil {
+		t.Fatalf("clear replace: %v", err)
+	}
+	for _, ip := range []netip.Addr{ip1, ip2} {
+		got, _ := m.ProvisionedStaticEgressIPExists(ctx, app.AccountID, ip)
+		if got {
+			t.Errorf("after clear, %s still in bucket", ip)
+		}
+	}
+}
