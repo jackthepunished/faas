@@ -374,11 +374,13 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// Install /opt/faas/current symlink. The current symlink is
 	// sibling-of-releases, not inside; pkg/releaseinstall.AtomicFlip
 	// is the same pattern, but the renderer does not import that
-	// package. The release-id segment is the manifest's
-	// release.id (e.g. "v1.4.0-12-gabc1234") — the renderer
-	// doesn't synthesise a git_sha from the manifest.
+	// package. Release bundles are stored under their content-addressed
+	// git_sha directory. The human release ID is metadata only and may
+	// contain a tag/describe string that has no matching directory on
+	// disk. Keep both paths on the same immutable target so an automated
+	// node join cannot render a valid box and then strand its current link.
 	if !opts.DryRun {
-		target := filepath.Join(opts.ReleasesRoot, m.Release.ID)
+		target := filepath.Join(opts.ReleasesRoot, m.Release.GitSHA)
 		currentPath := filepath.Join(filepath.Dir(opts.ReleasesRoot), "current")
 		if err := installCurrentSymlink(currentPath, target); err != nil {
 			return report, err

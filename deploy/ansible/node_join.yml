@@ -1,0 +1,297 @@
+---
+# Provider-neutral adoption pipeline for an already-created compute host.
+#
+# The cloud/provider boundary ends at the Ansible connection variables. The
+# playbook owns the rest of the lifecycle: stage trust material, converge the
+# production host role, install the verified release, render the manifest,
+# initialize host-local identity, start only the compute services, wait for
+# readiness, and activate the database row as the final operation.
+#
+# The caller supplies local paths through the faas_join_* variables. They are
+# controller-side inputs; secret contents never travel through --extra-vars.
+
+- name: Prepare the adopted compute node
+  hosts: compute_nodes
+  gather_facts: false
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  tasks:
+    - name: Refuse to join a host other than the requested manifest node
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == faas_join_inventory_name
+          - faas_box_role == 'compute-only'
+        fail_msg: >-
+          node_join is limited to the manifest compute-only host. Requested
+          {{ faas_join_inventory_name }}, got {{ inventory_hostname }} with
+          role {{ faas_box_role | default('unset') }}.
+
+    - name: Create bootstrap directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/faas, mode: "0750" }
+        - { path: /etc/faas/secrets, mode: "0700" }
+        - { path: /etc/faas/secrets/vmmd, mode: "0700" }
+        - { path: /etc/faas/tls, mode: "0755" }
+        - { path: /usr/local/bin, mode: "0755" }
+        - { path: /var/lib/faas/bootstrap, mode: "0700" }
+
+    - name: Create the shared daemon group before staging group-readable keys
+      ansible.builtin.group:
+        name: faas
+        state: present
+        system: true
+
+    - name: Stage the compute database environment
+      ansible.builtin.copy:
+        src: "{{ faas_join_compute_db_env_source }}"
+        dest: /etc/faas/compute-db.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Stage the fleet PKI material
+      ansible.builtin.copy:
+        src: "{{ faas_join_pki_source }}/"
+        dest: /etc/faas/tls/
+        owner: root
+        group: root
+        mode: preserve
+      no_log: true
+
+    - name: Stage the image-signing private key
+      ansible.builtin.copy:
+        src: "{{ faas_join_sign_key_source }}"
+        dest: /etc/faas/secrets/sign.key
+        owner: root
+        group: faas
+        mode: "0440"
+      no_log: true
+
+    - name: Stage the image-signing public key
+      ansible.builtin.copy:
+        src: "{{ faas_join_verify_key_source }}"
+        dest: /etc/faas/secrets/sign-pub.pem
+        owner: root
+        group: root
+        mode: "0444"
+      no_log: true
+
+    - name: Stage the per-node capacity signing key
+      ansible.builtin.copy:
+        src: "{{ faas_join_node_key_source }}"
+        dest: /etc/faas/secrets/vmmd/node.key
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+
+    - name: Stage the per-node capacity public key
+      ansible.builtin.copy:
+        src: "{{ faas_join_node_pub_source }}"
+        dest: /etc/faas/secrets/vmmd/node.pub
+        owner: root
+        group: root
+        mode: "0444"
+      no_log: true
+
+    - name: Stage the manifest consumed by the on-host renderer
+      ansible.builtin.copy:
+        src: "{{ faas_join_manifest_source }}"
+        dest: /etc/faas/manifest.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Stage the bootstrap operator binary
+      ansible.builtin.copy:
+        src: "{{ faas_join_bootstrap_binary_source }}"
+        dest: /usr/local/bin/gregalectl
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stage the release cosign verifier
+      ansible.builtin.copy:
+        src: "{{ faas_join_cosign_binary_source }}"
+        dest: /usr/local/bin/cosign
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stage the signed release bundle
+      ansible.builtin.copy:
+        src: "{{ faas_join_release_tarball_source }}"
+        dest: /var/lib/faas/bootstrap/release.tar.gz
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Stage the release signature bundle
+      ansible.builtin.copy:
+        src: "{{ faas_join_release_signature_source }}"
+        dest: /var/lib/faas/bootstrap/release.cosign.bundle
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Stage the release SBoM
+      ansible.builtin.copy:
+        src: "{{ faas_join_release_sbom_source }}"
+        dest: /var/lib/faas/bootstrap/release.sbom.json
+        owner: root
+        group: root
+        mode: "0644"
+
+- import_playbook: bootstrap.yml
+
+- name: Install, render, start, and activate the adopted node
+  hosts: compute_nodes
+  gather_facts: true
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  tasks:
+    - name: Install the verified release while keeping the row drained
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - release
+          - install
+          - --git-sha
+          - "{{ faas_join_release_git_sha }}"
+          - --tarball-path
+          - /var/lib/faas/bootstrap/release.tar.gz
+          - --node
+          - "{{ faas_join_database_node }}"
+          - --role
+          - compute-only
+          - --defer-activation
+      register: faas_release_install
+      changed_when: faas_release_install.rc == 0
+      failed_when: >-
+        faas_release_install.rc != 0 and
+        'SBoM gate requires a prior baseline' not in
+        ((faas_release_install.stdout | default('')) ~
+         (faas_release_install.stderr | default('')))
+
+    - name: Initialize the per-release SBoM baseline on a new node
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - release
+          - kgv
+          - rotate
+          - --git-sha
+          - "{{ faas_join_release_git_sha }}"
+          - --from-zero
+      when: >-
+        faas_release_install.rc != 0 and
+        'SBoM gate requires a prior baseline' in
+        ((faas_release_install.stdout | default('')) ~
+         (faas_release_install.stderr | default('')))
+      changed_when: true
+
+    - name: Retry release installation after SBoM baseline initialization
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - release
+          - install
+          - --git-sha
+          - "{{ faas_join_release_git_sha }}"
+          - --tarball-path
+          - /var/lib/faas/bootstrap/release.tar.gz
+          - --node
+          - "{{ faas_join_database_node }}"
+          - --role
+          - compute-only
+          - --defer-activation
+      when: >-
+        faas_release_install.rc != 0 and
+        'SBoM gate requires a prior baseline' in
+        ((faas_release_install.stdout | default('')) ~
+         (faas_release_install.stderr | default('')))
+      changed_when: true
+
+    - name: Render the manifest for this exact host
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - manifest
+          - render
+          - --manifest-file
+          - /etc/faas/manifest.yaml
+          - --host
+          - "{{ faas_join_inventory_name }}"
+      changed_when: true
+
+    - name: Initialize host-local runtime identity and backup stubs
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - secrets
+          - init
+          - --host
+          - "{{ faas_join_database_node }}"
+      register: faas_secrets_init
+      changed_when: true
+
+    - name: Reload systemd after release/config publication
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start the compute-only daemon set
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - faas-vmmd.service
+        - faas-gatewayd-internal.service
+        - faas-builderd.service
+        - faas-imaged.service
+
+    - name: Wait for vmmd's local socket
+      ansible.builtin.wait_for:
+        path: /run/faas/vmmd.sock
+        timeout: 60
+
+    - name: Wait for the internal gateway listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8080
+        timeout: 60
+
+    - name: Require every compute-only service to be active
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      changed_when: false
+      loop:
+        - faas-vmmd.service
+        - faas-gatewayd-internal.service
+        - faas-builderd.service
+        - faas-imaged.service
+
+    - name: Activate the compute row only after all readiness gates pass
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - compute-nodes
+          - activate
+          - --node
+          - "{{ faas_join_database_node }}"
+      register: faas_node_activation
+      changed_when: true
+
+    - name: Report successful node adoption
+      ansible.builtin.debug:
+        msg: >-
+          {{ faas_join_database_node }} is active after signed release,
+          manifest render, service activation, and local readiness gates.

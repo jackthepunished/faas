@@ -838,6 +838,40 @@ func TestCmdComputeNodesActivate_MissingNode(t *testing.T) {
 	}
 }
 
+// TestCmdComputeNodesActivate_ResolvesName verifies the production wire
+// contract: the CLI accepts compute_nodes.name, while the state mutation is
+// keyed by the row UUID returned by ComputeNodeByName.
+func TestCmdComputeNodesActivate_ResolvesName(t *testing.T) {
+	st := state.NewMemStore()
+	setComputeNodesStoreOpener(func() (state.Store, func(), error) {
+		return st, func() {}, nil
+	})
+
+	row, err := st.CreateComputeNode(context.Background(), state.ComputeNode{
+		Name:               "fsn-2.faas",
+		TargetURL:          "tcp://fsn-2.gregale.dev:50051",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		Active:             false,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	if code := cmdComputeNodesActivate([]string{"--node", row.Name}); code != 0 {
+		t.Fatalf("activate exit code = %d, want 0", code)
+	}
+	got, err := st.ComputeNodeByID(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if !got.Active {
+		t.Fatal("activate left the node drained")
+	}
+}
+
 // TestCmdComputeNodesForceDrain_RequiresYes pins the loud-warning
 // branch (commands_compute_nodes.go:238-241) — exit 2 with a
 // diagnostic that NAMES --yes so the operator can copy-paste.

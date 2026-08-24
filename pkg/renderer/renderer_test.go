@@ -103,6 +103,34 @@ fleet:
 	}
 }
 
+func TestRenderer_CurrentSymlinkUsesGitSHA(t *testing.T) {
+	dir := t.TempDir()
+	releases := filepath.Join(dir, "releases")
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	if err := os.MkdirAll(filepath.Join(releases, gitSHA), 0o755); err != nil {
+		t.Fatalf("mkdir release: %v", err)
+	}
+	path := fixtureManifest(t, "fsn-1", "single-box")
+	if _, err := Render(RenderOptions{
+		ManifestPath: path,
+		ReleasesRoot: releases,
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got, err := os.Readlink(filepath.Join(dir, "current"))
+	if err != nil {
+		t.Fatalf("Readlink(current): %v", err)
+	}
+	want := filepath.Join(releases, gitSHA)
+	if got != want {
+		t.Fatalf("current = %q, want %q", got, want)
+	}
+}
+
 func TestEndpointSANsIncludesPrivateEndpointAndConfiguredNames(t *testing.T) {
 	sans, err := endpointSANs(manifest.Host{
 		Name:    "fsn-3",

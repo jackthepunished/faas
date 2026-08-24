@@ -87,9 +87,42 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 		t.Errorf("id changed across upsert: %q -> %q", operatorID, vmmd.ID)
 	}
 
-	// Step 5: row is active.
+	// Step 5: row remains active because the operator did not drain it.
 	if !vmmd.Active {
-		t.Error("vmmd upsert did not re-activate")
+		t.Error("vmmd upsert unexpectedly drained an active node")
+	}
+}
+
+// TestUpsertComputeNodeFromVmmd_PreservesOperatorDrain_MemStore pins the
+// activation boundary used by deploy join: vmmd may refresh capacity while
+// the operator keeps a newly-installed node drained until readiness passes.
+func TestUpsertComputeNodeFromVmmd_PreservesOperatorDrain_MemStore(t *testing.T) {
+	st := state.NewMemStore()
+	ctx := context.Background()
+
+	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name: "fsn-2", TargetURL: "tcp://vmmd-2.faas:50051",
+		VPCPUs: 160, MemMB: 56000, MaxConcurrency: 200, AdmissionCeilingMB: 47600,
+	})
+	if err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+	if err := st.SetComputeNodeActive(ctx, operator.ID, false); err != nil {
+		t.Fatalf("drain node: %v", err)
+	}
+
+	got, err := st.UpsertComputeNodeFromVmmd(ctx, state.ComputeNode{
+		Name: "fsn-2", TargetURL: "tcp://0.0.0.0:50051",
+		VPCPUs: 192, MemMB: 64000, MaxConcurrency: 250, AdmissionCeilingMB: 54000,
+	})
+	if err != nil {
+		t.Fatalf("vmmd upsert: %v", err)
+	}
+	if got.Active {
+		t.Fatal("vmmd self-registration reactivated an operator-drained node")
+	}
+	if got.VPCPUs != 192 || got.MemMB != 64000 {
+		t.Fatalf("vmmd capacity was not refreshed: vpcpus=%d mem_mb=%d", got.VPCPUs, got.MemMB)
 	}
 }
 

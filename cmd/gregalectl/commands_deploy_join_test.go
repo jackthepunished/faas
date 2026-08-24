@@ -1,0 +1,239 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/onebox-faas/faas/pkg/pki"
+)
+
+func splitboxJoinManifest(t *testing.T) string {
+	t.Helper()
+	body := strings.Replace(validManifestYAML,
+		"    - name: fsn-1\n      role: control-plane\n",
+		"    - name: fsn-1\n      role: control-plane\n      address: fsn-1.gregale.dev:9091\n    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n", 1)
+	return writeSplitboxManifest(t, body)
+}
+
+func TestDeployJoinValidate_DryRunNeedsOnlyManifestAndSSH(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "deploy/ansible"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/node_join.yml"), []byte("---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := deployJoinValidate(deployJoinOptions{
+		ManifestFile: manifestPath,
+		Node:         "fsn-2",
+		SSHHost:      "198.51.100.20",
+		RepoRoot:     repo,
+		DryRun:       true,
+	})
+	if err != nil {
+		t.Fatalf("deployJoinValidate: %v", err)
+	}
+	if report.DatabaseNode != "fsn-2.faas" {
+		t.Errorf("DatabaseNode = %q, want fsn-2.faas", report.DatabaseNode)
+	}
+	if report.ReleaseGitSHA != "abc1234567890abcdef1234567890abcdef12345" {
+		t.Errorf("ReleaseGitSHA = %q", report.ReleaseGitSHA)
+	}
+	if len(report.Steps) < 8 {
+		t.Fatalf("steps = %d, want lifecycle plan", len(report.Steps))
+	}
+}
+
+func TestDeployJoinValidate_RejectsControlPlane(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	_, err := deployJoinValidate(deployJoinOptions{
+		ManifestFile: manifestPath,
+		Node:         "fsn-1",
+		SSHHost:      "198.51.100.10",
+		RepoRoot:     t.TempDir(),
+		DryRun:       true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires compute-only") {
+		t.Fatalf("error = %v, want compute-only guard", err)
+	}
+}
+
+func TestOverrideJoinHostVars_UsesProviderSSHOnlyForConnection(t *testing.T) {
+	body := []byte("ansible_host: \"fsn-2.gregale.dev\"\nfaas_box_role: compute-only\n")
+	got := string(overrideJoinHostVars(body, &deployJoinOptions{
+		SSHHost: "203.0.113.8",
+		SSHUser: "gregale",
+		SSHPort: 2222,
+		SSHKey:  "/tmp/id_ed25519",
+	}))
+	for _, want := range []string{
+		`ansible_host: "203.0.113.8"`,
+		`ansible_user: "gregale"`,
+		"ansible_port: 2222",
+		`ansible_ssh_private_key_file: "/tmp/id_ed25519"`,
+		"faas_box_role: compute-only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("host vars missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "ansible_host: \"fsn-2.gregale.dev\"") {
+		t.Errorf("provider SSH override left manifest endpoint in place:\n%s", got)
+	}
+}
+
+func TestReleaseAssetPath_FindsCanonicalSibling(t *testing.T) {
+	dir := t.TempDir()
+	tarball := filepath.Join(dir, releaseTarballName)
+	if err := os.WriteFile(filepath.Join(dir, releaseSigName), []byte("sig"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := releaseAssetPath(tarball, releaseSigName)
+	if err != nil {
+		t.Fatalf("releaseAssetPath: %v", err)
+	}
+	if got != filepath.Join(dir, releaseSigName) {
+		t.Errorf("path = %q", got)
+	}
+}
+
+func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	repo := t.TempDir()
+	ansibleDir := filepath.Join(repo, "deploy", "ansible")
+	if err := os.MkdirAll(ansibleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ansibleDir, "node_join.yml"), []byte("---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	artifactDir := t.TempDir()
+	tarball := filepath.Join(artifactDir, releaseTarballName)
+	if err := os.WriteFile(tarball, []byte("tarball"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{releaseSigName, releaseSBOMName} {
+		if err := os.WriteFile(filepath.Join(artifactDir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bootstrap := filepath.Join(artifactDir, "gregalectl")
+	cosign := filepath.Join(artifactDir, "cosign")
+	for _, path := range []string{bootstrap, cosign} {
+		if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	computeDBEnv := filepath.Join(artifactDir, "compute-db.env")
+	if err := os.WriteFile(computeDBEnv, []byte("DATABASE_URL=postgres://faas@example/faas\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signKey := filepath.Join(artifactDir, "sign.key")
+	verifyKey := filepath.Join(artifactDir, "sign-pub.pem")
+	for _, path := range []string{signKey, verifyKey} {
+		if err := os.WriteFile(path, []byte("key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pkiDir := filepath.Join(artifactDir, "pki")
+	for _, role := range pki.RolesForBox(roleComputeOnly) {
+		cert, key := pki.LeafPaths(pkiDir, role)
+		for _, path := range []string{cert, key} {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("pki"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	caCert, caKey := pki.CARoot(pkiDir)
+	if err := os.MkdirAll(filepath.Dir(caCert), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{caCert, caKey} {
+		if err := os.WriteFile(path, []byte("ca"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldRunner := ansiblePlaybookRunner
+	t.Cleanup(func() { ansiblePlaybookRunner = oldRunner })
+	var calls [][]string
+	ansiblePlaybookRunner = func(_ context.Context, _ string, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		inventory := ""
+		for i := range args {
+			if args[i] == "-i" && i+1 < len(args) {
+				inventory = args[i+1]
+			}
+		}
+		if inventory == "" {
+			return fmt.Errorf("fake runner: missing inventory")
+		}
+		hostVars, err := os.ReadFile(filepath.Join(filepath.Dir(inventory), "host_vars", "fsn-2.yml"))
+		if err != nil {
+			return err
+		}
+		body := string(hostVars)
+		if !strings.Contains(body, `ansible_host: "203.0.113.27"`) {
+			return fmt.Errorf("provider SSH address missing from generated host vars:\n%s", body)
+		}
+		if !strings.Contains(body, `faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"`) {
+			return fmt.Errorf("stable runtime endpoint was overwritten:\n%s", body)
+		}
+		return nil
+	}
+
+	report, err := deployJoinValidate(deployJoinOptions{
+		ManifestFile:       manifestPath,
+		Node:               "fsn-2",
+		SSHHost:            "203.0.113.27",
+		ReleaseTarball:     tarball,
+		BootstrapBinary:    bootstrap,
+		CosignBinary:       cosign,
+		PKISource:          pkiDir,
+		SignKeySource:      signKey,
+		VerifyKeySource:    verifyKey,
+		ComputeDBEnvSource: computeDBEnv,
+		RepoRoot:           repo,
+		SkipFleetPreflight: true,
+	})
+	if err != nil {
+		t.Fatalf("deployJoinValidate: %v", err)
+	}
+	if code, err := deployJoinApply(&deployJoinOptions{
+		ManifestFile:       manifestPath,
+		Node:               "fsn-2",
+		SSHHost:            "203.0.113.27",
+		SSHUser:            "root",
+		SSHPort:            22,
+		ReleaseTarball:     tarball,
+		BootstrapBinary:    bootstrap,
+		CosignBinary:       cosign,
+		PKISource:          pkiDir,
+		SignKeySource:      signKey,
+		VerifyKeySource:    verifyKey,
+		ComputeDBEnvSource: computeDBEnv,
+		RepoRoot:           repo,
+		SkipFleetPreflight: true,
+	}, &report); err != nil || code != 0 {
+		t.Fatalf("deployJoinApply: code=%d err=%v", code, err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("Ansible calls = %d, want one limited join play", len(calls))
+	}
+	joined := strings.Join(calls[0], " ")
+	if !strings.Contains(joined, "--limit fsn-2") || !strings.Contains(joined, "node_join.yml") {
+		t.Fatalf("Ansible args missing node limit/playbook: %v", calls[0])
+	}
+	if !report.Applied {
+		t.Fatal("apply report was not marked applied")
+	}
+}

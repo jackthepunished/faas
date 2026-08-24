@@ -113,8 +113,9 @@ func openComputeNodesStore() (state.Store, func(), error) {
 // deleting the import in a refactor.
 var _ = (*pgxpool.Pool)(nil)
 
-// cmdComputeNodesDrain runs `UPDATE compute_nodes SET active=false
-// WHERE id=<fqdn>` via state.Store.MarkComputeNodeInactive.
+// cmdComputeNodesDrain resolves the operator-facing node name to its row ID,
+// then runs `UPDATE compute_nodes SET active=false` via
+// state.Store.MarkComputeNodeInactive.
 func cmdComputeNodesDrain(args []string) int {
 	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -126,14 +127,20 @@ func cmdComputeNodesDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
 		return 1
 	}
@@ -161,7 +168,7 @@ func cmdComputeNodesDrainStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -169,7 +176,12 @@ func cmdComputeNodesDrainStatus(args []string) int {
 	defer closeFn()
 
 	ctx := context.Background()
-	insts, err := st.ListInstancesByNodeID(ctx, *node)
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
+		return 1
+	}
+	insts, err := st.ListInstancesByNodeID(ctx, computeNode.ID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
 		return 1
@@ -203,14 +215,20 @@ func cmdComputeNodesActivate(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.SetComputeNodeActive(context.Background(), *node, true); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
+		return 1
+	}
+	if err := st.SetComputeNodeActive(ctx, computeNode.ID, true); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
 		return 1
 	}
@@ -239,14 +257,20 @@ func cmdComputeNodesForceDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain: --yes required (live instances may be cold-evicted)")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
 		return 1
 	}

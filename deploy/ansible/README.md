@@ -60,6 +60,20 @@ The split-box inventory maps to two Makefile targets:
 | `make bootstrap-control-plane` | `control_plane` | fsn-1 (control-plane) | split-box provisioning (PG-1) |
 | `make bootstrap-compute` | `compute_nodes` | fsn-2 (compute-only) | split-box provisioning (PG-1) |
 
+For a machine that was created outside the project (GCP, Hetzner, OVH, or
+another bare-metal provider), use the provider-neutral adoption pipeline:
+
+```text
+gregalectl deploy join-node --manifest-file /secure/manifest.yaml \
+  --node fsn-3 --ssh-host 203.0.113.27 [artifact and secret inputs] --yes
+```
+
+It generates an ephemeral manifest inventory, runs preflight, converges the
+compute role, installs the signed release while drained, applies the manifest,
+and activates the database row only after readiness. The provider-specific
+boundary is only the SSH connection; see
+`docs/runbooks/provider-neutral-node-join.md` for the complete contract.
+
 There is intentionally no combined `[box]` group. A host must belong to
 exactly one production role group, and `role_convergence` verifies that the
 host variable, inventory group, systemd role drop-ins, and active service
