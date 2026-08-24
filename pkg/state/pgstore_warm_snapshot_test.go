@@ -300,7 +300,7 @@ func TestPg_MarkAllSnapshotsStaleByAppProtocol(t *testing.T) {
 		var id string
 		if err := pool.QueryRow(ctx, `
 			insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-			values ($1, 'fc-1.0', 1000, 500, 'snap/' || $1 || '/mem', false, 'init')
+			values ($1::uuid, 'fc-1.0', 1000, 500, 'snap/' || $1::text || '/mem', false, 'init')
 			returning id::text
 		`, depID).Scan(&id); err != nil {
 			t.Fatalf("seed snap %s: %v", label, err)
@@ -391,7 +391,7 @@ func TestPg_MarkSnapshotStaleByAppProtocol(t *testing.T) {
 		var snapID string
 		if err := pool.QueryRow(ctx, `
 			insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-			values ($1, 'fc-1.0', 1000, 500, 'snap/' || $1 || '/mem', false, 'init')
+			values ($1::uuid, 'fc-1.0', 1000, 500, 'snap/' || $1::text || '/mem', false, 'init')
 			returning id::text
 		`, depID).Scan(&snapID); err != nil {
 			t.Fatalf("seed snap %s: %v", label, err)
