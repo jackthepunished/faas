@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -46,6 +47,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	apidpb "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1"
 	"github.com/onebox-faas/faas/pkg/apidgrpc"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
@@ -1749,17 +1751,91 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			Enabled:  true,
 			RingSize: 4096,
 		}, log)
+		// PR-B (ADR-127 §PR-B): dial apid's RequestTelemetry
+		// service over the unix socket and stream the collapsed
+		// buckets through IncrementRequestTelemetry. PR-A's
+		// log-only stub at this site is replaced — every batch
+		// now produces real INSERTs in apid's request_telemetry
+		// table. The dial is lazy: a transient apid outage
+		// doesn't block gateway boot, and the publisher's
+		// retry-with-backoff handles a cold apid start.
+		apidRTSock := osGetenv("FAAS_APID_REQUEST_TELEMETRY_SOCKET")
+		if apidRTSock == "" {
+			apidRTSock = "/run/faas/request_telemetry.sock"
+		}
+		rtCli, dialErr := apidgrpc.DialRequestTelemetry(ctx, apidRTSock, nil)
 		var rtShippedTotal int64
 		publisher := gateway.NewRequestTelemetryPublisher(gateway.RequestTelemetryPublisherConfig{
 			Enabled:        true,
 			FlushInterval:  5 * time.Second,
 			FlushBatchSize: 256,
 			MaxRetries:     3,
-		}, recorder, func(_ context.Context, rows []gateway.RequestTelemetryRow) error {
-			// PR-A: log-only stub. Returns nil so the
-			// publisher's success counter increments. PR-B
-			// replaces this body with a gRPC streaming client
-			// against apid's IncrementRequestTelemetry RPC.
+		}, recorder, func(ctx context.Context, rows []gateway.RequestTelemetryRow) error {
+			// Dial failed at boot — log-only fallback mirrors
+			// PR-A's stub. Operators see the dial failure once
+			// at startup + a per-tick "drained batch" debug.
+			if rtCli == nil {
+				rtShippedTotal += int64(len(rows))
+				if len(rows) > 0 {
+					log.Debug("request_telemetry: drained batch (no apid client)",
+						"batch_size", len(rows),
+						"shipped_total", rtShippedTotal)
+				}
+				return nil
+			}
+			stream, err := rtCli.IncrementRequestTelemetry(ctx)
+			if err != nil {
+				return fmt.Errorf("open request_telemetry stream: %w", err)
+			}
+			for i := range rows {
+				row := rows[i]
+				req := &apidpb.IncrementRequestTelemetryRequest{
+					AccountId:        row.AccountID.String(),
+					AppId:            row.AppID.String(),
+					DeploymentId:     row.DeploymentID.String(),
+					RouteTemplate:    row.Route,
+					Method:           row.Method,
+					HttpStatus:       int32(row.Status),
+					LatencyMs:        int32(row.LatencyMS),
+					ColdBoot:         row.ColdBoot,
+					TraceId:          row.TraceID,
+					ReceivedAtUnixMs: row.ReceivedAt.UnixMilli(),
+					Count:            int32(row.Count),
+				}
+				if row.Count < 1 {
+					req.Count = 1
+				}
+				if err := stream.Send(req); err != nil {
+					_ = stream.CloseSend()
+					return fmt.Errorf("send request_telemetry row: %w", err)
+				}
+			}
+			if err := stream.CloseSend(); err != nil {
+				log.Warn("request_telemetry: stream CloseSend failed",
+					"batch_size", len(rows), "err", err)
+			}
+			// Drain responses to detect per-row failures. The
+			// publisher's retry-with-backoff covers transient
+			// errors here; rate-limit + db_error outcomes are
+			// surfaced via Prometheus counters in the apid
+			// receiver (PR-B stage 4).
+			for {
+				resp, rerr := stream.Recv()
+				if rerr != nil {
+					// io.EOF is the canonical end-of-stream.
+					if errors.Is(rerr, io.EOF) {
+						break
+					}
+					return fmt.Errorf("recv request_telemetry response: %w", rerr)
+				}
+				if resp == nil {
+					break
+				}
+				if resp.GetOutcome() == "rate_limited" {
+					log.Debug("request_telemetry: row rate_limited",
+						"retry_after_ms", resp.GetRetryAfterMs())
+				}
+			}
 			rtShippedTotal += int64(len(rows))
 			if len(rows) > 0 {
 				log.Debug("request_telemetry: drained batch",
@@ -1768,6 +1844,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			}
 			return nil
 		}, log)
+		// Surface dial failures back into the ShipFn via rtCli.
+		// (Defer the close until after publisher.Stop so the
+		// publisher's final-drain batch can still ship.)
+		if dialErr != nil {
+			log.Warn("request_telemetry: apid socket dial failed; recorder ships to log only",
+				"err", dialErr)
+		} else {
+			defer func() {
+				if err := rtCli.Close(); err != nil {
+					log.Warn("request_telemetry: close apid client", "err", err)
+				}
+			}()
+		}
 		publisher.Start(ctx)
 		handler.WithRequestTelemetryRecorder(recorder)
 		// Stop() drains the final batch synchronously on shutdown.
