@@ -465,6 +465,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	ledger := sched.NewNodeLedger()
 	ops := wire.NewOpsMetrics("schedd")
+	wire.RegisterDefaultOps(ops)
 	// Dashboard gauges (spec §12): schedd owns the snapshots table and the
 	// admission ledger, so the four fcvm_* gauges live here, not in vmmd.
 	// The DashboardMetrics callbacks close over `store` (PG) and `ledger`

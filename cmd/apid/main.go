@@ -54,6 +54,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -451,7 +452,7 @@ func defaultDeps() runDeps {
 			}
 			return &http.Server{
 				Addr:              addr,
-				Handler:           h,
+				Handler:           trace.HTTPHandler("apid", h),
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       cfg.GetRequestReadTimeout(env),
 				WriteTimeout:      cfg.GetRequestWriteTimeout(env),
@@ -1138,6 +1139,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Built unconditionally so /metrics works even with FAAS_APID_METRICS_ADDR
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
+	wire.RegisterDefaultOps(ops)
 	srv.WithOpsMetrics(ctx, ops)
 
 	// ADR-093 / PR-D: end-to-end request budgets on the apid

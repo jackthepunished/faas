@@ -1,4 +1,6 @@
 -- filename: 00412_status_incidents.sql
+-- +goose Up
+-- +goose StatementBegin
 --
 -- Issue #599 / ADR-130 / cluster D commit 14 of the
 -- platform-observability mega-PR.
@@ -49,9 +51,14 @@
 -- MigrateUp) is idempotent. Same convention as 00411
 -- (deployments_liveness_restart_count) and 00264
 -- (deployments_secret_findings).
+--
+-- Slot reservation: 00412 chosen as next free real slot past
+-- 00411 (liveness_restart_count). The fence at
+-- 00412_reserve_slot.sql has been retired (now that this real
+-- migration has landed) per the migration-slot contiguity
+-- invariant (one file per slot, see
+-- migrations/embed_test.go::TestMigrationsContiguous).
 
--- +goose Up
--- +goose StatementBegin
 CREATE TABLE IF NOT EXISTS status_incidents (
     id          BIGSERIAL    PRIMARY KEY,
     component   TEXT         NOT NULL,

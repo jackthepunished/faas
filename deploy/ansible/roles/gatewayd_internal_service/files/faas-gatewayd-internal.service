@@ -19,6 +19,13 @@ Type=simple
 ExecStart=/opt/faas/current/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml
 Restart=on-failure
 RestartSec=2s
+# PR #1082 review-fix #2: surface the per-unit restart count to the
+# daemon via $SYSTEMD_RESTARTS_ON_FAILURE (systemd 254+
+# RestartCountExport). pkg/wire/daemon.go::Daemon() reads the env var
+# at boot and records it on daemon_restart_count so the
+# FaasRestartLoop / FaasRepeatedRestart / FaasStuckActivating alerts
+# (ADR-128) have a real-time signal.
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
 MemoryMax=512M

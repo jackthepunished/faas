@@ -44,21 +44,36 @@ import (
 // is a no-op when endpoint is empty — the daemon stays
 // Prometheus-only, no OTLP egress.
 //
+// When endpoint is non-empty the SDK wiring is a follow-on
+// (otelprom + otlpmetricgrpc deps land in the cluster-E
+// commit-17 follow-on PR). Until then, a one-line WARN log
+// fires so operators see a clear audit signal that the bridge
+// is wired-but-stub.
+//
 // The actual SDK wiring (otelprom.New + otlpmetricgrpc.New +
-// MeterProvider registration) lands in a follow-on commit
-// when the otelprom / otlpmetricgrpc deps land. This file
-// ships the entry point + the nil-safe shutdown shape so
-// cmd/<daemon>/main.go can call it today without a compile
-// failure when the deps aren't vendored yet.
+// MeterProvider registration) lands in the follow-on. This
+// file ships the entry point + the nil-safe shutdown shape
+// + the audit signal so cmd/<daemon>/main.go can call it
+// today without a compile failure when the deps aren't
+// vendored yet.
 func BridgePrometheusToOTLP(
 	ctx context.Context,
 	_ *prometheus.Registry,
 	endpoint string,
-	_ *slog.Logger,
+	log *slog.Logger,
 ) (shutdown func(context.Context) error, err error) {
 	if endpoint == "" {
 		// No-op: the daemon stays Prometheus-only.
 		return func(context.Context) error { return nil }, nil
+	}
+	// Review-fix PR #1082 #5: emit a clear audit signal so
+	// operators know the bridge is wired-but-stub. Without
+	// this, a daemon with OTEL_EXPORTER_OTLP_ENDPOINT set
+	// would silently no-op the bridge and the OTLP collector
+	// would receive nothing — operators would have no way
+	// to tell from /metrics or the slog envelope.
+	if log != nil {
+		log.Warn("otlp metrics bridge: endpoint configured but SDK wiring is a follow-on (cluster-E commit-17 follow-on PR); metrics will not reach the OTLP collector until otelprom + otlpmetricgrpc deps land", "endpoint", endpoint)
 	}
 	// TODO(cluster-E/commit-17-followon): wire the
 	// otelprom + otlpmetricgrpc deps and the periodic
@@ -66,5 +81,6 @@ func BridgePrometheusToOTLP(
 	// and ships when the otelprom dep is vendored
 	// (`go get go.opentelemetry.io/otel/exporters/otlp/
 	//  otlpmetric/otlpmetricgrpc`).
+	_ = ctx
 	return func(context.Context) error { return nil }, nil
 }

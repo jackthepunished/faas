@@ -1,4 +1,6 @@
 -- filename: 00411_liveness_restart_count.sql
+-- +goose Up
+-- +goose StatementBegin
 --
 -- Issue #586 / ADR-129 / cluster C commit 12 of the
 -- platform-observability mega-PR.
@@ -47,13 +49,10 @@
 --
 -- Slot reservation: 00411 chosen as next free real slot past
 -- 00410 (app_secret_value_hash, PR #1065 ADR-124 prod-fix
--- cluster). The fence at 00411_reserve_slot.sql locks the
--- slot at PR-open time per cross-pr-slot gate race memory
--- entry; the actual migration lands in the same PR because no
--- sibling PR claims an adjacent slot.
-
--- +goose Up
--- +goose StatementBegin
+-- cluster). The fence at 00411_reserve_slot.sql has been
+-- retired (now that this real migration has landed) per the
+-- migration-slot contiguity invariant (one file per slot,
+-- see migrations/embed_test.go::TestMigrationsContiguous).
 ALTER TABLE deployments
     ADD COLUMN IF NOT EXISTS liveness_restart_count INT NOT NULL DEFAULT 0;
 

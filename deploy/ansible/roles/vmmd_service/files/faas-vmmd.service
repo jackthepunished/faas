@@ -16,6 +16,14 @@ EnvironmentFile=-/etc/faas/sealed.env
 EnvironmentFile=-/etc/faas/compute-db.env
 Restart=on-failure
 RestartSec=2s
+# PR #1082 review-fix #2: surface the per-unit restart count to the
+# daemon via the $SYSTEMD_RESTARTS_ON_FAILURE env var (systemd 254+
+# RestartCountExport). pkg/wire/daemon.go::Daemon() reads the env var
+# at boot and records it on daemons.gregale_dev_restart_count_total
+# so the FaasRestartLoop / FaasRepeatedRestart / FaasStuckActivating
+# alerts (ADR-128) have a real-time signal instead of relying on
+# node_exporter scraping node_systemd_restart_count at 15s resolution.
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
 Delegate=yes

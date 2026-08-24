@@ -795,6 +795,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// so the Loop has it from the first tick. meter.NewLoop accepts nil
 	// and coerces to a fresh test registry; here we hand it the real one.
 	ops := wire.NewOpsMetrics("meterd")
+	wire.RegisterDefaultOps(ops)
 
 	// Residency timer: emits the §12 "Resident GB per paying customer"
 	// gauge (ADR-031, PR #141). Wired into the loop alongside
