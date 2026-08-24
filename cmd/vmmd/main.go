@@ -999,6 +999,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
 	}
+	// Issue #571 PR-A2: construct the /readyz probe (kvm +
+	// firecracker + gRPC). The gRPC bound signal flips to true
+	// here — deps.listen() succeeded, so the unix socket is
+	// bound and schedd can dial. BuildReadinessProbe also does
+	// a one-shot /dev/kvm open + firecracker LookPath; both
+	// succeed here or the daemon exits via the
+	// BuildReadinessProbe call's failure path (the probe is
+	// ready regardless).
+	vmmdProbe, grpcBound := BuildReadinessProbe()
+	grpcBound.MarkBound()
 	// CPU cache: a per-instance rate + accumulator over cgroup
 	// usage_usec, fed by runCPUSampleLoop below and consumed by
 	// vmmdgrpc.Server.Stats. issue #279 / PR-B. nil-safe so
@@ -1058,6 +1068,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// directly without polluting the main /metrics scrape
 		// (which is the wire-side OpsMetrics registry).
 		mux.Handle(metricsPath+"/wake-phase", wpm.Handler())
+		// Issue #571 PR-A2: /healthz + /readyz on the metrics mux
+		// (operator-side, loopback-only) for the LB scrape and
+		// on-box monitoring. Source of truth is the same
+		// BuildReadinessProbe wired at the deps.listen site
+		// above — single source between /readyz body and the
+		// daemon_ready gauge (issue #586 / ADR-129).
+		wire.ControlMuxLite(mux, vmmdProbe.ReadyFunc(), vmmdProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
