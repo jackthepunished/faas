@@ -159,13 +159,13 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	hostA := fmt.Sprintf("a-%s.example", uuid.NewString()[:8])
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
-		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5432, $5)`,
+		 VALUES ($1, $2, $3, 'inferred', 'prod', 'postgres', $4, 5432, $5)`,
 		uuid.New(), acctID, appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #1: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
-		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5432, $5)`,
+		 VALUES ($1, $2, $3, 'inferred', 'prod', 'postgres', $4, 5432, $5)`,
 		uuid.New(), acctID, appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #2: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	hashB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
-		 VALUES ($1, $2, $3, 'inferred', 'in', 'postgres', $4, 5433, $5)`,
+		 VALUES ($1, $2, $3, 'inferred', 'prod', 'postgres', $4, 5433, $5)`,
 		uuid.New(), acctID, appID, hostB, hashB); err != nil {
 		t.Fatalf("seed upstreams #3: %v", err)
 	}
