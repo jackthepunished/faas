@@ -36,6 +36,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // (0400 root:root). The .env file holds content-shaped env vars:
 //   - FAAS_SESSION_KEY=<64 hex chars>
 //   - FAAS_TLS_DNS_TOKEN=<provider API token>
+//
 // These are content-shaped env vars the loader reads via os.Getenv;
 // the LoadCredential+%d/<id> pattern only fits PATH-shaped vars
 // (env var = tmpfs path; loader does os.ReadFile(env)) — using it
