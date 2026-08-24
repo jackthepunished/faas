@@ -5174,6 +5174,16 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 			}
 		}
 	}
+	// Issue #586 / ADR-129 / cluster C commit 12: persist the
+	// lifetime restart counter on the deployments row so a
+	// schedd restart doesn't reset the signal. Best-effort: the
+	// in-memory LivenessWindow is the runtime decision authority;
+	// a column bump miss just means the persistent source-of-truth
+	// lags by one restart (the next bump catches up). Mirrors the
+	// AuditWriteFail warning posture above — log + continue.
+	if err := e.store.RecordRestart(ctx, deploymentID); err != nil {
+		e.log.Warn("liveness: persist restart count failed", "deployment", deploymentID, "err", err)
+	}
 	return nil
 }
 

@@ -2068,6 +2068,21 @@ type Store interface {
 	// schema-agnostic.
 	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
 
+	// RecordRestart (issue #586 / ADR-129 / cluster C commit 12 of
+	// the platform-observability mega-PR) bumps the persisted
+	// deployments.liveness_restart_count column by 1 in a single
+	// statement. Called by pkg/sched/Engine alongside the
+	// in-memory LivenessWindow.RecordRestart call so the column is
+	// the source of truth across schedd restarts. Returns
+	// ErrNotFound when the deployment row is missing so a
+	// misroute fails closed (mirrors UpsertDeploymentScanResult
+	// IDOR contract at line 2049). The CHECK constraint
+	// (deployments_liveness_restart_count_nonneg_chk,
+	// migrations/00411) rejects a negative bump at the SQL layer
+	// even though the application code is monotonic — belt-and-
+	// braces against a buggy caller.
+	RecordRestart(ctx context.Context, deploymentID string) error
+
 	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
 	// document capture. The surface is paid-only (Free plan
 	// returns 403 from the apid) but the microVM always captures

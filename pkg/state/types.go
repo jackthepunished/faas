@@ -1348,6 +1348,21 @@ type Deployment struct {
 	SecretFindings  []byte     `json:"secret_findings,omitempty"`
 	SecretScannedAt *time.Time `json:"secret_scanned_at,omitempty"`
 
+	// LivenessRestartCount (issue #586 / ADR-129 / cluster C
+	// commit 12) is the persisted lifetime restart counter for
+	// this deployment. pkg/state.pgstore.RecordRestart bumps it
+	// alongside the in-memory LivenessWindow.RecordRestart call
+	// (migrations/00411). On schedd startup the LivenessWindow
+	// seeds from this column so a fresh process inherits the
+	// prior count instead of starting at zero — closing the
+	// "schedd restart resets the restart-loop signal" gap. The
+	// column is monotonic in the application code; the
+	// deployments_liveness_restart_count_nonneg_chk CHECK is a
+	// belt-and-braces SQL-level guard. Dashboard surfaces query
+	// this column for the "Restart count (lifetime)" stat on
+	// /v1/deployments/{id}.
+	LivenessRestartCount int `json:"liveness_restart_count,omitempty"`
+
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping
 	// apps.status to `evicted_cold`; the apid GET /v1/apps/{slug}

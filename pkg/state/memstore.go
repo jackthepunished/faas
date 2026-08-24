@@ -4727,6 +4727,24 @@ func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, 
 	return nil
 }
 
+// RecordRestart (issue #586 / ADR-129 / cluster C commit 12) is
+// the in-memory mirror of PgStore.RecordRestart: bumps the
+// deployment's LivenessRestartCount by 1. Mirrors
+// UpsertDeploymentSecretFindings' IDOR contract (ErrNotFound on
+// missing row). The in-memory store is used by unit tests and
+// the dev-mode bootstrap — production runs against PgStore.
+func (m *MemStore) RecordRestart(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.LivenessRestartCount++
+	m.deployments[id] = d
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // openAPIDocRow is the in-memory row mirror of deployment_openapi_docs
 // (migrations/00330). The struct is unexported; the public surface is

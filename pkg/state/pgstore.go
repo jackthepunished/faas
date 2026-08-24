@@ -6005,6 +6005,32 @@ func (s *PgStore) UpsertDeploymentSecretFindings(ctx context.Context, deployment
 	return nil
 }
 
+// RecordRestart (issue #586 / ADR-129 / cluster C commit 12)
+// bumps the persisted deployments.liveness_restart_count column
+// by 1 in a single statement. Mirrors
+// UpsertDeploymentSecretFindings' IDOR + idempotency contract:
+// scopes to one deployment row, returns ErrNotFound on a
+// missing row so a misuse fails closed. The CHECK constraint
+// (deployments_liveness_restart_count_nonneg_chk,
+// migrations/00411) rejects a negative bump at the SQL layer.
+// Called from pkg/sched/Engine alongside the in-memory
+// LivenessWindow.RecordRestart call so the column is the source
+// of truth across schedd restarts.
+func (s *PgStore) RecordRestart(ctx context.Context, deploymentID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set liveness_restart_count = liveness_restart_count + 1
+		  where id = $1`,
+		deploymentID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetDeploymentSidecarLayer is the per-workload filesystem handle
 // for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
 // keyed by (deployment_id, sidecar_name). The whole row is
@@ -13856,6 +13882,7 @@ const deploymentSelectColumnsWithRootfs = `
 	min_instances,
 	scan_result, scan_status, scanned_at,
 	secret_findings, secret_scanned_at,
+	liveness_restart_count,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
 	scope,
@@ -13896,6 +13923,7 @@ const deploymentSelectColumnsQualified = `
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
 	d.secret_findings, d.secret_scanned_at,
+	d.liveness_restart_count,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
 	d.scope,
@@ -13985,6 +14013,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
 		&d.SecretFindings, &d.SecretScannedAt,
+		&d.LivenessRestartCount,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope,
 		&d.StageState,
