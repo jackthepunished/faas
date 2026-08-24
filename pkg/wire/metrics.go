@@ -400,6 +400,17 @@ type OpsMetrics struct {
 	// first four failures of every outage disappear from the
 	// dashboard.
 	appErrorsRecorded *prometheus.CounterVec
+	// requestTelemetryRecorded (ADR-127 PR-B) — counter the
+	// apid gRPC handler (cmd/apid/grpc_server_request_telemetry.go)
+	// increments per outcome. outcome ∈ {inserted, rate_limited,
+	// db_error}. `inserted` is the §12 customer-telemetry-ingest
+	// panel (rate over 5m). `rate_limited` is the per-account
+	// token-bucket overflow path (DebugTelemetryRequestsPerMinute
+	// exceeded). `db_error` is the per-row INSERT failure path.
+	// The closed label set keeps cardinality bounded.
+	// Single-registry: registered on every daemon; only apid
+	// increments via IncrementRequestTelemetryRecorded.
+	requestTelemetryRecorded *prometheus.CounterVec
 	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
 	// gatewayd-internal recorder's in-process LRU fingerprint
 	// cache. Every hit is a record() that did NOT need to call
@@ -2524,6 +2535,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's per-row drop signal — incremented for EVERY row of a failed flush batch (the batch is drained before flushBatch is called, so failures always lose data; per-row observe gives the §12 panel an accurate outage timeline rather than only the 5th-consecutive-failure tripwire). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, appErrorsRecorded)
+	// ADR-127 PR-B: production debugger ingest outcomes.
+	// outcome ∈ {inserted, rate_limited, db_error}. `inserted`
+	// is the customer-telemetry-ingest panel; `rate_limited` is
+	// the per-account token bucket overflow; `db_error` is the
+	// per-row INSERT failure path. Single-registry: registered on
+	// every daemon; only apid increments via
+	// IncrementRequestTelemetryRecorded.
+	requestTelemetryRecorded := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_request_telemetry_recorded_total",
+		Help: "Production debugger per-request telemetry ingest outcomes (ADR-127 PR-B), labelled by outcome ∈ {inserted, rate_limited, db_error}. `inserted` is the customer-telemetry-ingest panel (rate over 5m). `rate_limited` is the per-account token-bucket overflow path (DebugTelemetryRequestsPerMinute exceeded). `db_error` is the per-row INSERT failure path. Single-registry: registered on every daemon; only apid increments via IncrementRequestTelemetryRecorded.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, requestTelemetryRecorded)
 	// ADR-096: in-process LRU fingerprint cache hit counter.
 	// Unlabelled (no cardinality risk). Single-registry:
 	// registered on every daemon; only gatewayd-internal
@@ -3185,6 +3208,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsFingerprintCacheHits:        appErrorsFingerprintCacheHits,
 		appErrorsDedupeMerges:                appErrorsDedupeMerges,
 		appErrorsFlushDuration:               appErrorsFlushDuration,
+		requestTelemetryRecorded:             requestTelemetryRecorded,
 		appErrorsPurges:                      appErrorsPurges,
 		previewJanitorOutcomes:               previewJanitorOutcomes,
 		dataUpstreamRTT:                      dataUpstreamRTT,
@@ -3464,6 +3488,17 @@ func (m *OpsMetrics) ObserveAppErrorsRecorded(outcome string) {
 		return
 	}
 	m.appErrorsRecorded.WithLabelValues(outcome).Inc()
+}
+
+// IncrementRequestTelemetryRecorded increments the
+// production-debugger ingest counter by outcome. outcome ∈
+// {inserted, rate_limited, db_error} — the closed label set keeps
+// cardinality bounded. nil-safe — no-op if m is nil.
+func (m *OpsMetrics) IncrementRequestTelemetryRecorded(outcome string) {
+	if m == nil || m.requestTelemetryRecorded == nil {
+		return
+	}
+	m.requestTelemetryRecorded.WithLabelValues(outcome).Inc()
 }
 
 // ObserveAppErrorsFingerprintCacheHit increments the in-process
