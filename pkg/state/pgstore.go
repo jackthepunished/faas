@@ -7839,7 +7839,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 
 const edgeRuleSelectCols = `id, account_id, app_id, match_host, match_path,
        match_methods, priority, enabled, kind, action,
-       validate_mode, created_at, updated_at`
+       cors_preset_id, validate_mode, created_at, updated_at`
 
 // scanEdgeRule reads a single row. ErrNotFound on no-rows; raw error
 // otherwise. The kind column comes back as text; Action comes back
@@ -7883,20 +7883,31 @@ func scanEdgeRuleCols(scan func(...any) error) (EdgeRule, error) {
 		kind         string
 		matchMethods []string
 		actionBytes  []byte
+		corsPresetID *string
 	)
 	if err := scan(
 		&r.ID, &r.AccountID, &r.AppID, &r.MatchHost, &r.MatchPath,
 		&matchMethods, &r.Priority, &r.Enabled, &kind, &actionBytes,
-		&r.ValidateMode, &r.CreatedAt, &r.UpdatedAt,
+		&corsPresetID, &r.ValidateMode, &r.CreatedAt, &r.UpdatedAt,
 	); err != nil {
 		return EdgeRule{}, err
 	}
 	r.Kind = EdgeRuleKind(kind)
 	r.MatchMethods = matchMethods
+	if corsPresetID != nil {
+		r.CorsPresetID = corsPresetID
+	}
 	if len(actionBytes) > 0 {
 		if err := json.Unmarshal(actionBytes, &r.Action); err != nil {
 			return EdgeRule{}, fmt.Errorf("state: decode edge_rules.action for %s: %w", r.ID, err)
 		}
+	}
+	// Mirror the FK column into the action JSONB mirror so the
+	// runtime edge_rules.go can read Action.CORS.CorsPresetID
+	// without a second SELECT. The compile path also reads the
+	// top-level field directly via MergeCorsPresetIntoRule.
+	if r.CorsPresetID != nil && r.Action.CORS != nil {
+		r.Action.CORS.CorsPresetID = r.CorsPresetID
 	}
 	return r, nil
 }
@@ -7912,20 +7923,28 @@ func (s *PgStore) CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (
 	if methods == nil {
 		methods = []string{}
 	}
+	var corsPresetIDArg any
+	if in.CorsPresetID != nil {
+		corsPresetIDArg = *in.CorsPresetID
+	}
 	row := s.pool.QueryRow(ctx, `
 		insert into edge_rules (
 			account_id, app_id, match_host, match_path,
 			match_methods, priority, enabled, kind, action,
-			validate_mode
+			cors_preset_id, validate_mode
 		) values (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8, $9::jsonb,
-			coalesce(nullif($10, ''), 'block')
+			$10, coalesce(nullif($11, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
 		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
-		// $10: empty string is the apid-handler convention for
+		// $10: cors_preset_id nullable FK (migration 00428). nil
+		// pointer → SQL NULL = inline-only rule. The action
+		// jsonb mirror is updated separately by scanEdgeRuleCols.
+		corsPresetIDArg,
+		// $11: empty string is the apid-handler convention for
 		// "use the strictest mode"; coalesce turns it into
 		// 'block' per ADR-128. The SQL-side default at 00293
 		// would also fire on a column omission, but the explicit
@@ -8263,6 +8282,181 @@ func (s *PgStore) GetCorsPresetByID(ctx context.Context, accountID, id string) (
 	return scanCorsPreset(row)
 }
 
+// CreateCorsPresetIfUnderQuota — see Store interface. Returns:
+//   - (CorsPreset{}, *CorsPresetQuotaError) when either cap trips
+//   - (CorsPreset{}, ErrNotFound) when AppID is set and the apps
+//     row is gone (only the app-scoped branch can return this —
+//     account-wide presets with a missing account row fall
+//     through to the FK violation on insert and surface as
+//     ErrConflict)
+//   - (CorsPreset{}, ErrConflict) on UNIQUE collision
+//     ((account_id, COALESCE(app_id, ...), name))
+//
+// The FOR UPDATE row lock on the apps row is the TOCTOU defence
+// for app-scoped presets: concurrent inserts serialise on the
+// apps row before reading the count, so a burst of N parallel
+// inserts cannot race past the cap by N-1. Account-wide presets
+// skip the apps-row lock and rely on the per-account count alone.
+// The pg_notify trigger cors_presets_changed_notify (migration
+// 00428) fires AFTER the INSERT commits, so the gatewayd-internal
+// listener reloads the affected account's preset overlay.
+func (s *PgStore) CreateCorsPresetIfUnderQuota(ctx context.Context, p CorsPreset, limits api.Limits) (CorsPreset, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return CorsPreset{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	if p.AppID != "" {
+		var locked int
+		err = tx.QueryRow(ctx,
+			`select 1 from apps where id = $1 and status <> 'deleted' for update`, p.AppID,
+		).Scan(&locked)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return CorsPreset{}, ErrNotFound
+			}
+			return CorsPreset{}, fmt.Errorf("state: lock app %s: %w", p.AppID, err)
+		}
+
+		var appCount int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from cors_presets where app_id = $1`, p.AppID,
+		).Scan(&appCount); err != nil {
+			return CorsPreset{}, fmt.Errorf("state: count cors_presets for app %s: %w", p.AppID, err)
+		}
+		if appCount >= limits.CorsPresetsPerApp {
+			return CorsPreset{}, &CorsPresetQuotaError{
+				Scope:    CorsPresetQuotaScopeApp,
+				Limit:    limits.CorsPresetsPerApp,
+				Observed: appCount,
+			}
+		}
+	}
+
+	// Per-account count excludes soft-deleted apps' preset rows.
+	// Mirrors the alert_rules per-account query at pgstore.go:7213
+	// so the soft-delete semantics are consistent.
+	var accountCount int
+	if err := tx.QueryRow(ctx, `
+		select count(*) from cors_presets p
+		 where p.account_id = $1
+		   and (p.app_id is null
+		        or exists(select 1 from apps a
+		                   where a.id = p.app_id and a.status <> 'deleted'))`,
+		p.AccountID,
+	).Scan(&accountCount); err != nil {
+		return CorsPreset{}, fmt.Errorf("state: count cors_presets for account %s: %w", p.AccountID, err)
+	}
+	if accountCount >= limits.CorsPresetsPerAccount {
+		return CorsPreset{}, &CorsPresetQuotaError{
+			Scope:    CorsPresetQuotaScopeAccount,
+			Limit:    limits.CorsPresetsPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	var appIDArg any
+	if p.AppID != "" {
+		appIDArg = p.AppID
+	}
+	var descriptionArg any
+	if p.Description != "" {
+		descriptionArg = p.Description
+	}
+	row := tx.QueryRow(ctx, `
+		insert into cors_presets (
+			account_id, app_id, name, description,
+			allow_origins, allow_methods, allow_headers, expose_headers,
+			allow_credentials, max_age_seconds
+		) values (
+			$1, $2, $3, $4,
+			$5, $6, $7, $8,
+			$9, $10
+		)
+		returning `+corsPresetSelectCols,
+		p.AccountID, appIDArg, p.Name, descriptionArg,
+		nilToEmpty(p.AllowOrigins), nilToEmpty(p.AllowMethods),
+		nilToEmpty(p.AllowHeaders), nilToEmpty(p.ExposeHeaders),
+		p.AllowCredentials, p.MaxAgeSeconds,
+	)
+	r, err := scanCorsPreset(row)
+	if err != nil {
+		// UNIQUE collision on (account_id, COALESCE(app_id, ...),
+		// name) → ErrConflict (the apid boundary maps to 409
+		// "name already in use"). mapErr translates 23505 →
+		// ErrConflict per the pgstore 23505-→-ErrConflict
+		// precedent.
+		return CorsPreset{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CorsPreset{}, fmt.Errorf("state: commit cors_preset insert: %w", err)
+	}
+	return r, nil
+}
+
+// UpdateCorsPreset replaces the entire row (the customer re-sends
+// the full preset body, like UpdateEdgeRule). The
+// (account_id, COALESCE(app_id, ...), name) UNIQUE constraint is
+// the write-side defence against cross-tenant IDOR — a malicious
+// caller cannot UPDATE a preset owned by another account because
+// the WHERE clause pins account_id. The pg_notify trigger fires
+// AFTER the UPDATE commits so the gatewayd-internal listener
+// reloads the affected account's preset overlay.
+func (s *PgStore) UpdateCorsPreset(ctx context.Context, accountID, id string, p CorsPreset) (CorsPreset, error) {
+	var appIDArg any
+	if p.AppID != "" {
+		appIDArg = p.AppID
+	}
+	var descriptionArg any
+	if p.Description != "" {
+		descriptionArg = p.Description
+	}
+	row := s.pool.QueryRow(ctx, `
+		update cors_presets set
+			app_id           = $2,
+			name             = $3,
+			description      = $4,
+			allow_origins    = $5,
+			allow_methods    = $6,
+			allow_headers    = $7,
+			expose_headers   = $8,
+			allow_credentials = $9,
+			max_age_seconds  = $10
+		where account_id = $11 and id = $1
+		returning `+corsPresetSelectCols,
+		id, appIDArg, p.Name, descriptionArg,
+		nilToEmpty(p.AllowOrigins), nilToEmpty(p.AllowMethods),
+		nilToEmpty(p.AllowHeaders), nilToEmpty(p.ExposeHeaders),
+		p.AllowCredentials, p.MaxAgeSeconds, accountID,
+	)
+	r, err := scanCorsPreset(row)
+	if err != nil {
+		return CorsPreset{}, mapErr(err)
+	}
+	return r, nil
+}
+
+// DeleteCorsPreset removes a preset by id (scoped to the caller's
+// account; cross-account deletes return ErrNotFound). The
+// pg_notify trigger fires AFTER the DELETE commits so any
+// gatewayd-internal compile cache that references this preset
+// via edge_rules.cors_preset_id is invalidated; the FK ON DELETE
+// SET NULL clears the rule's FK column atomically with the
+// preset's removal, so the next compile reads the preset as
+// missing and MergeCorsPresetIntoRule fails closed (ADR-129 D3).
+func (s *PgStore) DeleteCorsPreset(ctx context.Context, accountID, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from cors_presets where account_id = $1 and id = $2`, accountID, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // --- alert_presets (issue #1233, ADR-123) -----------------------------------
 //
 // Catalog rows are system-owned. Customers have SELECT-only via the
@@ -8577,6 +8771,8 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		methodsArg       any
 		actionArg        any
 		validateModeArg  any
+		corsPresetSet    bool
+		corsPresetValue  any
 	)
 	if p.MatchHost != nil {
 		hostArg = *p.MatchHost
@@ -8593,6 +8789,19 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			return EdgeRule{}, fmt.Errorf("state: marshal edge_rule.action: %w", err)
 		}
 		actionArg = bytes
+	}
+	// CorsPresetID tri-state (ADR-129 D1): the wire layer
+	// distinguishes three cases for an UPDATE — absent (don't
+	// touch), JSON null (set column to NULL), JSON string (set
+	// column to UUID). The State mirror uses **string so the
+	// outer nil = absent, inner nil = JSON null, inner non-nil
+	// = JSON string. The case when $11 pattern below matches
+	// the action column's contract one line above.
+	if p.CorsPresetID != nil {
+		corsPresetSet = true
+		if *p.CorsPresetID != nil {
+			corsPresetValue = **p.CorsPresetID
+		}
 	}
 	// ValidateMode nil-skip mirrors Action: a nil pointer means
 	// "do not touch the column". A non-nil empty string is a
@@ -8614,6 +8823,7 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			priority      = coalesce($5, priority),
 			enabled       = coalesce($6, enabled),
 			action        = case when $7 then $8::jsonb else action end,
+			cors_preset_id = case when $11 then $12 else cors_preset_id end,
 			validate_mode = coalesce(nullif($9, ''), validate_mode)
 		where id = $1
 		returning `+edgeRuleSelectCols,
@@ -8625,6 +8835,14 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		// '' to 'block' before this point so the round-trip
 		// is observable in the response.
 		validateModeArg,
+		// $11 / $12: tri-state FK update (ADR-129 D1). When
+		// $11 is false, the column is untouched (the
+		// case-when default is cors_preset_id, the
+		// current value). When $11 is true, the column
+		// is set to $12, which is nil → SQL NULL for
+		// the "customer cleared the preset" signal or
+		// a UUID for the "set preset" signal.
+		corsPresetSet, corsPresetValue,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {

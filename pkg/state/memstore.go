@@ -13122,6 +13122,123 @@ func (m *MemStore) GetCorsPresetByID(_ context.Context, accountID, id string) (C
 	return p, nil
 }
 
+// CreateCorsPresetIfUnderQuota — see Store interface. The memstore
+// mirror uses the existing m.mu mutex for race-freedom; the
+// per-app + per-account caps are enforced in the same critical
+// section as the insert. UNIQUE collision on
+// (account_id, COALESCE(app_id, ...), name) returns ErrConflict,
+// matching pgstore's 23505-→-ErrConflict map.
+func (m *MemStore) CreateCorsPresetIfUnderQuota(_ context.Context, p CorsPreset, limits api.Limits) (CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p.AppID != "" {
+		app, ok := m.apps[p.AppID]
+		if !ok || app.Status == "deleted" {
+			return CorsPreset{}, ErrNotFound
+		}
+		var appCount int
+		for _, q := range m.corsPresets {
+			if q.AppID == p.AppID {
+				appCount++
+			}
+		}
+		if appCount >= limits.CorsPresetsPerApp {
+			return CorsPreset{}, &CorsPresetQuotaError{
+				Scope:    CorsPresetQuotaScopeApp,
+				Limit:    limits.CorsPresetsPerApp,
+				Observed: appCount,
+			}
+		}
+	}
+	// Per-account count excludes soft-deleted apps' preset rows.
+	var accountCount int
+	for _, q := range m.corsPresets {
+		if q.AccountID != p.AccountID {
+			continue
+		}
+		if q.AppID == "" {
+			accountCount++
+			continue
+		}
+		if app, ok := m.apps[q.AppID]; ok && app.Status != "deleted" {
+			accountCount++
+		}
+	}
+	if accountCount >= limits.CorsPresetsPerAccount {
+		return CorsPreset{}, &CorsPresetQuotaError{
+			Scope:    CorsPresetQuotaScopeAccount,
+			Limit:    limits.CorsPresetsPerAccount,
+			Observed: accountCount,
+		}
+	}
+	// UNIQUE collision: same name on the same (account, app)
+	// tuple. Account-wide presets collide on (account, "");
+	// app-scoped presets collide on (account, appID).
+	for _, q := range m.corsPresets {
+		if q.AccountID == p.AccountID && q.AppID == p.AppID && q.Name == p.Name {
+			return CorsPreset{}, ErrConflict
+		}
+	}
+	if p.ID == "" {
+		p.ID = uuid.NewString()
+	}
+	now := time.Now()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	m.corsPresets[p.ID] = p
+	return p, nil
+}
+
+// UpdateCorsPreset replaces the entire row. The memstore mirror
+// pins accountID so a cross-tenant UPDATE returns ErrNotFound,
+// matching the pgstore WHERE clause. UNIQUE collisions
+// (account_id, COALESCE(app_id, ...), name) return ErrConflict
+// (the apid boundary maps to 409 "name already in use").
+func (m *MemStore) UpdateCorsPreset(_ context.Context, accountID, id string, p CorsPreset) (CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.corsPresets[id]
+	if !ok || existing.AccountID != accountID {
+		return CorsPreset{}, ErrNotFound
+	}
+	// UNIQUE collision check on the post-update name+app_id
+	// tuple. Excludes the row being updated so renaming a
+	// preset to its own name is a no-op.
+	for qid, q := range m.corsPresets {
+		if qid == id {
+			continue
+		}
+		if q.AccountID == accountID && q.AppID == p.AppID && q.Name == p.Name {
+			return CorsPreset{}, ErrConflict
+		}
+	}
+	p.ID = id
+	p.AccountID = accountID
+	p.CreatedAt = existing.CreatedAt
+	p.UpdatedAt = time.Now()
+	m.corsPresets[id] = p
+	return p, nil
+}
+
+// DeleteCorsPreset removes a preset by id (scoped to the caller's
+// account). The pgstore trigger fires pg_notify on every write;
+// the memstore mirror has no pg-listen listener, so the gate is
+// in-process (the gatewayd-internal compile path reads through
+// the same Store interface, so a delete is visible on the next
+// read).
+func (m *MemStore) DeleteCorsPreset(_ context.Context, accountID, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.corsPresets[id]
+	if !ok || p.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.corsPresets, id)
+	return nil
+}
+
 // --- alert_presets (issue #1233, ADR-123) -----------------------------------
 
 // ListAlertPresets mirrors the pgstore query: every catalog row

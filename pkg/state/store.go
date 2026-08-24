@@ -3059,6 +3059,37 @@ type Store interface {
 	// 422 at the apid boundary ("preset has been deleted; re-save
 	// the rule") and to 5xx at the gateway compile path.
 	GetCorsPresetByID(ctx context.Context, accountID, id string) (CorsPreset, error)
+	// CreateCorsPresetIfUnderQuota (issue #975 #4 PR-B / ADR-129
+	// D2) inserts a preset iff both caps (per-app + per-account)
+	// have room. Returns:
+	//   - (CorsPreset{}, *CorsPresetQuotaError) when either cap trips
+	//   - (CorsPreset{}, ErrConflict) on UNIQUE collision
+	//     ((account_id, COALESCE(app_id, ...), name))
+	//   - (CorsPreset{}, ErrNotFound) when AppID is set and the
+	//     apps row is gone
+	// The pgstore implementation runs the per-app row lock +
+	// per-app count + per-account count in a single tx so parallel
+	// inserts cannot race past the cap. Memstore mirrors via the
+	// mutex. The "if under quota" prefix is a TOCTOU-defence naming
+	// convention borrowed from CreateEdgeRuleIfUnderQuota.
+	CreateCorsPresetIfUnderQuota(ctx context.Context, p CorsPreset, limits api.Limits) (CorsPreset, error)
+	// UpdateCorsPreset is the un-quota'd PATCH path. The caller is
+	// expected to have already validated name/origin/method
+	// counts at the apid write boundary. The pgstore implementation
+	// emits pg_notify('cors_preset_changed', $account_id) after the
+	// UPDATE commits so the gatewayd-internal cache reloads the
+	// account's preset overlay.
+	UpdateCorsPreset(ctx context.Context, accountID, id string, p CorsPreset) (CorsPreset, error)
+	// DeleteCorsPreset removes a preset by id (scoped to the
+	// caller's account; cross-account deletes return
+	// ErrNotFound). The pgstore implementation emits
+	// pg_notify('cors_preset_changed', $account_id) so any
+	// gatewayd-internal compile cache that references this preset
+	// via edge_rules.cors_preset_id is invalidated; the next
+	// compile reads the preset as missing and the rule's
+	// ON DELETE SET NULL FK clears, so MergeCorsPresetIntoRule
+	// fails closed (ADR-129 D3).
+	DeleteCorsPreset(ctx context.Context, accountID, id string) error
 	// CountEdgeRulesForApp is the quota check (called by the apid
 	// handler before the insert; the insert itself runs the same
 	// count inside the FOR UPDATE on the apps row).

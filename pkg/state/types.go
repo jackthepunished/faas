@@ -2235,6 +2235,47 @@ func (e *AlertRuleQuotaError) Is(target error) bool {
 // that distinguishes the two by errors.Is gets a clean match.
 var ErrAlertRuleQuotaExceeded = errors.New("state: alert rule quota exceeded")
 
+// CorsPresetQuotaError is returned by
+// CreateCorsPresetIfUnderQuota when either cap (per-app or
+// per-account) is reached. Mirrors AlertRuleQuotaError's shape:
+// the Scope field distinguishes the two so the apid handler can
+// render different copy ("delete from this app" vs "delete from
+// any app on your account"). A preset with AppID == "" counts
+// toward the per-account cap only; an app-scoped preset counts
+// toward both.
+//
+// Plan-tier table is pre-declared at pkg/api/limits.go:601-645
+// (PR-A shipped the table; PR-B adds the writer-side enforcer).
+// The Free tier declares 0 for every dimension
+// (limits.go:1382-1386) so the api.ErrPlanCorsPresetsNotAllowed
+// gate fires before CreateCorsPresetIfUnderQuota is reached —
+// this type only fires for Hobby/Pro/Scale at-cap.
+type CorsPresetQuotaError struct {
+	Scope    CorsPresetQuotaScope
+	Limit    int
+	Observed int
+}
+
+// CorsPresetQuotaScope names the cap that
+// CreateCorsPresetIfUnderQuota tripped on.
+type CorsPresetQuotaScope string
+
+const (
+	CorsPresetQuotaScopeApp     CorsPresetQuotaScope = "app"
+	CorsPresetQuotaScopeAccount CorsPresetQuotaScope = "account"
+)
+
+func (e *CorsPresetQuotaError) Error() string {
+	return fmt.Sprintf("state: cors preset quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is lets errors.As match the quota error type across the apid
+// handler boundary (mirrors AlertRuleQuotaError.Is above).
+func (e *CorsPresetQuotaError) Is(target error) bool {
+	_, ok := target.(*CorsPresetQuotaError)
+	return ok
+}
+
 // InvocationSource tags the API surface that originated a row on the
 // invocations table (Move 1 — async_invoke / queue / delayed_task / cron).
 // Mirrored as a CHECK constraint in migrations/00030_invocations.sql.
@@ -4539,6 +4580,19 @@ type EdgeRuleHeadersAction struct {
 // (["https://app.example.com"] or ["*"]); AllowMethods is required;
 // AllowCredentials toggles the credentials header; MaxAgeSeconds
 // stamps Access-Control-Max-Age on preflight responses.
+//
+// CorsPresetID (issue #975 #4 PR-B / ADR-129 D1/D2) is the
+// nullable pointer to a cors_presets row. When set, the inline
+// action fields MUST be empty/zero — the preset is the entire
+// policy. The compile-side merge helper
+// (pkg/state.MergeCorsPresetIntoRule, kind=cors branch in
+// cmd/gatewayd-internal/edge_rules.go::compileCORSRules) resolves
+// the preset's allow_origins / allow_methods / allow_headers /
+// expose_headers / allow_credentials / max_age_seconds into the
+// runtime CORS response. The EdgeRulesWire field on the wire DTO
+// (pkg/api/dto.go) mirrors this as `cors_preset_id` and the
+// apid-write boundary rejects `cors_preset_id + any non-empty
+// inline field` with 422 (ADR-129 D2 mutual exclusivity).
 type EdgeRuleCORSAction struct {
 	AllowOrigins     []string `json:"allow_origins"`
 	AllowMethods     []string `json:"allow_methods"`
@@ -4546,6 +4600,11 @@ type EdgeRuleCORSAction struct {
 	ExposeHeaders    []string `json:"expose_headers,omitempty"`
 	AllowCredentials bool     `json:"allow_credentials"`
 	MaxAgeSeconds    int      `json:"max_age_seconds"`
+	// CorsPresetID is *string (nullable). Empty pointer = inline
+	// policy only. Non-nil pointer = preset reference; inline
+	// fields above MUST be empty/zero. Migration 00428 adds
+	// edge_rules.cors_preset_id as the SQL-side mirror.
+	CorsPresetID *string `json:"cors_preset_id,omitempty"`
 }
 
 // EdgeRuleJWTAction validates an inbound Bearer JWT against a JWKS
@@ -4863,6 +4922,16 @@ type EdgeRule struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	// CorsPresetID (issue #975 #4 PR-B / ADR-129 D1) is the
+	// top-level nullable mirror of edge_rules.cors_preset_id.
+	// Pointer so the SQL NULL is distinguishable from "" (a
+	// pre-existing convention: EdgeRule.ID is also a string but
+	// we use *string for nullable FK columns). The compile-side
+	// helper pkg/state.MergeCorsPresetIntoRule uses this to
+	// resolve the preset; the runtime edge_rules.go reads
+	// Action.CORS.CorsPresetID (the JSONB mirror) so both stay
+	// in sync via scanEdgeRuleCols.
+	CorsPresetID *string
 	// ValidateMode (issue #975 item #3 / ADR-128) is the
 	// source-of-truth column for kind=validate enforcement.
 	// Empty == 'block' (the SQL-side default at 00293 also
@@ -5003,6 +5072,13 @@ type CreateEdgeRuleParams struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	// CorsPresetID (issue #975 #4 PR-B / ADR-129 D1) is the
+	// nullable FK target on edge_rules.cors_preset_id. nil =
+	// inline-only policy. Non-nil must reference a preset owned
+	// by the same account (the apid-Validate gate enforces this
+	// before the row is written; the gateway compile path also
+	// re-validates via MergeCorsPresetIntoRule).
+	CorsPresetID *string
 	ValidateMode string
 }
 
@@ -5014,6 +5090,9 @@ type CreateEdgeRuleParams struct {
 // full action body). ValidateMode follows the same nil-skip
 // pattern as the other optional scalars — nil means "do not
 // touch the column"; non-nil replaces the column verbatim.
+// CorsPresetID follows the same nil-skip pattern (ADR-129 D1) —
+// a non-nil pointer (including one that points to "") replaces
+// the column; nil leaves the FK untouched.
 type UpdateEdgeRuleParams struct {
 	MatchHost    *string
 	MatchPath    *string
@@ -5021,6 +5100,7 @@ type UpdateEdgeRuleParams struct {
 	Priority     *int
 	Enabled      *bool
 	Action       *EdgeRuleAction
+	CorsPresetID **string
 	ValidateMode *string
 }
 
