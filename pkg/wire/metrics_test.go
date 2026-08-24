@@ -1644,6 +1644,61 @@ func TestOpsMetrics_WakeLatencyNilSafe(t *testing.T) {
 	}
 }
 
+// TestCVECheckTotal_PreInstantiationCartesian (issue #601 /
+// ADR-131 / cluster D commit 13 of the platform-observability
+// mega-PR) pins the 12-row closed-cartesian at boot (3 results ×
+// 4 severities). A regression that drops the pre-instantiation
+// loop would leave the dashboard panels empty until the first
+// run completes — operators would lose the "no CVEs in the
+// last 24h" signal.
+func TestCVECheckTotal_PreInstantiationCartesian(t *testing.T) {
+	m := wire.NewOpsMetrics("meterd")
+	body := render(t, m)
+	for _, result := range []string{"pass", "fail", "new_cve"} {
+		for _, sev := range []string{"low", "medium", "high", "critical"} {
+			want := fmt.Sprintf(`meterd_cve_check_total{result=%q,severity=%q} 0`,
+				result, sev)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated cve_check_total row %q in:\n%s", want, body)
+			}
+		}
+	}
+	// RecordCVECheck increments a row.
+	m.RecordCVECheck("new_cve", "high")
+	body = render(t, m)
+	if !strings.Contains(body, `meterd_cve_check_total{result="new_cve",severity="high"} 1`) {
+		t.Errorf("RecordCVECheck did not increment the row; got:\n%s", body)
+	}
+	// nil-receiver guard.
+	var nilm *wire.OpsMetrics
+	nilm.RecordCVECheck("pass", "low") // must not panic
+}
+
+// TestCVEOpenTotal_AcceptsPerDepRows (issue #601 / ADR-131)
+// pins the open-CVE gauge shape. dep is the package name +
+// version; severity is the closed-set vocabulary. The test
+// asserts the gauge accepts per-(severity, dep) rows without
+// an overflow collapse.
+func TestCVEOpenTotal_AcceptsPerDepRows(t *testing.T) {
+	m := wire.NewOpsMetrics("meterd")
+	m.IncCVEOpen("medium", "libssl@1.1.1k-7", 1)
+	m.IncCVEOpen("high", "openssl@3.0.7-1", 1)
+	m.IncCVEOpen("critical", "linux-kernel@5.15.0-58", 1)
+	body := render(t, m)
+	for _, want := range []string{
+		`meterd_cves_open{dep="libssl@1.1.1k-7",severity="medium"} 1`,
+		`meterd_cves_open{dep="openssl@3.0.7-1",severity="high"} 1`,
+		`meterd_cves_open{dep="linux-kernel@5.15.0-58",severity="critical"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing per-dep cves_open row %q in:\n%s", want, body)
+		}
+	}
+	// nil-receiver guard.
+	var nilm *wire.OpsMetrics
+	nilm.IncCVEOpen("medium", "dep", 1) // must not panic
+}
+
 // TestOpsMetrics_ObserveSidecarRestartNilSafe pins the nil-
 // receiver contract (issue #463 / ADR-069 / ADR-071 / PR-C §4).
 // vmmd's dispatchSidecarRestart ALWAYS calls

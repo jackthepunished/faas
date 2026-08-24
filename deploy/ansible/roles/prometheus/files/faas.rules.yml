@@ -1237,3 +1237,24 @@ groups:
           summary: "Daemon stuck in 'activating' state for 5m"
           description: "A faas-* systemd unit has been in the 'activating' state for 5m without reaching 'active'. The daemon is not crashlooping (no RestartLoop signature) — it is simply not coming up. Likely causes: dependency deadlock (Postgres / etcd / Vault not ready), bad config syntax, missing sealed secret, port collision. Triage: `systemctl status faas-<name>.service` for the active state, `journalctl -u faas-<name>.service -n 100` for the dependency-exit / config-parse error. Recover per docs/runbooks/FaasStuckActivating.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasStuckActivating.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Issue #601 / ADR-131: FaasNewCve
+      #
+      # Pages when the cve-check workflow (.github/workflows/cve-check.yml)
+      # reports a new CVE ≥ medium severity. The metric is pushed by
+      # meterd from the workflow artifact (cluster D commit 13). Fires
+      # once per severity tier so the page text names the severity
+      # instead of just "CVE". Recover per docs/runbooks/FaasNewCve.md.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasNewCve
+        expr: increase(meterd_cve_check_total{result="new_cve", severity=~"medium|high|critical"}[1h]) > 0
+        for: 1m
+        labels:
+          severity: page
+          component: controlplane
+          family: cve
+        annotations:
+          summary: "New CVE ≥ medium detected by the nightly cve-check workflow"
+          description: "The nightly cve-check workflow (issue #601 / ADR-131) reported a new CVE ≥ medium severity within the last hour. The metric is meterd_cve_check_total{result=\"new_cve\"}; the GitHub Issue created by the workflow lists the CVE id, severity, and affected dependency. Triage: read the GitHub Issue for the CVE id + dep, check deps.dev / nvd.nist.gov for the affected versions + fixed-in version, decide patch vs. accept-risk posture, ship the patch (or the grype ignore). Recover per docs/runbooks/FaasNewCve.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasNewCve.md"

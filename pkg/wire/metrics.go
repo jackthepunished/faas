@@ -448,6 +448,26 @@ type OpsMetrics struct {
 	// faas_apid_error_rate_5m, _3d_baseline, _ratio) read from
 	// one counter.
 	requestTotal *prometheus.CounterVec
+	// cveCheckTotal (issue #601 / ADR-131) is the per-CVE-check-run
+	// counter the meterd scraper pushes from the .github/workflows/
+	// cve-check.yml nightly artifact. Labelled by {result, severity}
+	// where result ∈ {pass, fail, new_cve} (the three terminal
+	// states of a run) and severity ∈ {low, medium, high, critical}
+	// (the four severities the workflow filters). Pre-instantiated
+	// at the 12-cartesian (3 results × 4 severities) so dashboards
+	// render from boot. The Prometheus alert FaasNewCve reads the
+	// `result="new_cve"` rows to page on a fresh CVE ≥ medium.
+	cveCheckTotal *prometheus.CounterVec
+	// cvesOpenTotal (issue #601 / ADR-131) is the per-(severity,
+	// dep) gauge the cve-check workflow pushes from grype's filtered
+	// output. dep is the package name + version (e.g.
+	// "libssl@1.1.1k-7"); severity is the closed-set vocabulary
+	// above. The dep label cardinality is bounded by the package
+	// list — single-digit thousands at worst, well under the
+	// Prometheus guideline. Recorded alongside cveCheckTotal so the
+	// §12 dashboard's "Open CVEs by severity" stack panel reads
+	// from one metric.
+	cvesOpenTotal *prometheus.GaugeVec
 	// appErrorsRecorded (ADR-096) — counter the gatewayd-internal
 	// recorder (cmd/gatewayd-internal/app_errors_recorder.go) and
 	// the apid gRPC handler (cmd/apid/grpc_server_apperrors.go)
@@ -1976,6 +1996,23 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_request_total",
 		Help: "HTTP requests completed, labelled by account_id, route, and code (issue #303, ADR-039). The counter is the per-request total — paired with requestFailures (status >= 400 only) for the per-account error-rate view. account_id flows through the same accountLabelSet as requestFailures so a customer is represented by their real id in both, or by \"__other__\" in both. code ∈ {ok, err} (ok on 2xx/3xx, err on 4xx/5xx). route is r.Pattern or \"unmatched\". Backed by the §12 traffic-anomaly recording rules (faas_apid_request_rate_5m, _3d_baseline, _ratio).",
 	}, []string{"account_id", "route", "code"})
+	// Issue #601 / ADR-131: CVE-vs-SBOM check + open CVE counters
+	// pushed from the cve-check workflow via meterd. Closed-set
+	// pre-instantiation (12 rows for cveCheckTotal; severity × 0
+	// dep rows for cvesOpenTotal).
+	cveCheckTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_cve_check_total",
+		Help: "Per-CVE-check-run counter (issue #601 / ADR-131), labelled by result ∈ {pass, fail, new_cve} and severity ∈ {low, medium, high, critical}. Pushed by meterd from the .github/workflows/cve-check.yml artifact. Pre-instantiated at the 12-cartesian so dashboards render from boot. The Prometheus alert FaasNewCve reads result=\"new_cve\" rows to page on a fresh CVE.",
+	}, []string{"result", "severity"})
+	cvesOpenTotal := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_cves_open",
+		Help: "Per-(severity, dep) gauge (issue #601 / ADR-131) that exposes the currently-open CVE list. Pushed by meterd from grype's filtered output. severity is the closed-set vocabulary; dep is the package name + version (single-digit thousands at worst). The §12 dashboard's 'Open CVEs by severity' stack panel reads from this metric.",
+	}, []string{"severity", "dep"})
+	for _, result := range []string{"pass", "fail", "new_cve"} {
+		for _, sev := range []string{"low", "medium", "high", "critical"} {
+			cveCheckTotal.WithLabelValues(result, sev)
+		}
+	}
 	// Reserved label values: anonymous for unauthenticated traffic,
 	// __other__ for the bounded overflow. Both are admitted at boot
 	// without consuming capacity, and both are always re-admitted on
@@ -2507,7 +2544,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3324,6 +3361,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		accountOrgMismatch:                   accountOrgMismatch,
 		requestFailures:                      requestFailures,
 		requestTotal:                         requestTotal,
+		cveCheckTotal:                        cveCheckTotal,
+		cvesOpenTotal:                        cvesOpenTotal,
 		appErrorsRecorded:                    appErrorsRecorded,
 		appErrorsFingerprintCacheHits:        appErrorsFingerprintCacheHits,
 		appErrorsDedupeMerges:                appErrorsDedupeMerges,
@@ -3617,6 +3656,35 @@ func (m *OpsMetrics) SetDeployVersion(version string) {
 		version = Version
 	}
 	m.faasDeployVersion.WithLabelValues(version).Set(1)
+}
+
+// RecordCVECheck (issue #601 / ADR-131 / cluster D commit 13 of
+// the platform-observability mega-PR) increments the per-run
+// CVE-check counter. Called by meterd when it scrapes the
+// .github/workflows/cve-check.yml artifact. The closed-set
+// labels (result, severity) are pre-instantiated in the
+// constructor; RecordCVECheck accepts any string but Prometheus's
+// WithLabelValues caches on first call so an out-of-vocabulary
+// call is just a one-time cardinality bump. nil-receiver guard
+// mirrors SetDeployVersion.
+func (m *OpsMetrics) RecordCVECheck(result, severity string) {
+	if m == nil {
+		return
+	}
+	m.cveCheckTotal.WithLabelValues(result, severity).Inc()
+}
+
+// IncCVEOpen (issue #601 / ADR-131) sets the per-(severity, dep)
+// open-CVE gauge. Called by meterd from grype's filtered
+// output. The dep label is unbounded by design (every package
+// has a row) but bounded in practice by the dependency tree
+// size — single-digit thousands at worst. nil-receiver guard
+// mirrors RecordCVECheck.
+func (m *OpsMetrics) IncCVEOpen(severity, dep string, count float64) {
+	if m == nil {
+		return
+	}
+	m.cvesOpenTotal.WithLabelValues(severity, dep).Set(count)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier
