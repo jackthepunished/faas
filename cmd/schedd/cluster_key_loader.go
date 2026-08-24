@@ -144,7 +144,51 @@ func loadClusterInternalSvcKey(
 			"schedd: cluster_signing_keys row kid=%s does not match derived kid=%s from unsealed private key — refusing to mint",
 			row.KeyID, kid)
 	}
+
+	// Cross-check public_key_pem against the unsealed private key.
+	// The kid check above proves sealed_blob ↔ key_id, but a row
+	// could still be self-consistent at the kid level while having
+	// public_key_pem point at a *different* key (operator mistake
+	// during a manual rotation, where someone re-sealed the row
+	// but forgot to update public_key_pem, or vice versa). Without
+	// this second check, schedd would mint tokens whose JWT-embedded
+	// kid matches key_id but whose actual signing key disagrees with
+	// the public_key_pem gatewayd-internal pinned for verification —
+	// the cross-box mint/verify would diverge silently. Refuse loud.
+	pubPub, err := parseClusterPubPEM([]byte(row.PublicKeyPEM))
+	if err != nil {
+		return nil, "", fmt.Errorf("schedd: parse cluster_signing_keys public_key_pem (kid=%s): %w", row.KeyID, err)
+	}
+	if !pubPub.Equal(priv.Public().(ed25519.PublicKey)) {
+		return nil, "", fmt.Errorf(
+			"schedd: cluster_signing_keys public_key_pem does not match unsealed private key (kid=%s) — refusing to mint",
+			row.KeyID)
+	}
 	return priv, kid, nil
+}
+
+// parseClusterPubPEM decodes the canonical PKIX "PUBLIC KEY" PEM
+// shape stored in cluster_signing_keys.public_key_pem. Mirrors
+// the unsealed-private-key parse in parseClusterPrivPEM so both
+// sides agree on the wire shape; the gatewayd-internal verifier
+// loader parses the same shape at boot.
+func parseClusterPubPEM(data []byte) (ed25519.PublicKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("cluster key public_key_pem is not PEM-encoded")
+	}
+	if block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("cluster key public_key_pem has unexpected PEM block type %q", block.Type)
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKIX public key: %w", err)
+	}
+	pub, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("cluster key public_key_pem is not an Ed25519 public key")
+	}
+	return pub, nil
 }
 
 // unsealClusterKey is the small age-decrypt wrapper that mirrors
