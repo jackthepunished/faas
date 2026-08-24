@@ -1,4 +1,4 @@
--- filename: 00428_request_telemetry_count.sql
+-- filename: 00437_request_telemetry_count.sql
 -- +goose Up
 -- +goose StatementBegin
 

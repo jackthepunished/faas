@@ -264,31 +264,31 @@ func (p *requestTelemetryPublisher) tick(ctx context.Context) {
 //
 // Aggregation rules (PR-B):
 //
-//   * Key tuple: (AccountID, AppID, DeploymentID, Route, Method,
+//   - Key tuple: (AccountID, AppID, DeploymentID, Route, Method,
 //     Status, MinuteBucket(received_at)). Minute bucket =
 //     received_at truncated to the minute so all rows within a
 //     60-second window fold together.
-//   * LatencyMS in the aggregate: the MAX within the bucket.
+//   - LatencyMS in the aggregate: the MAX within the bucket.
 //     Worst-case-latency-is-the-shape-the-regression-detector-compares
 //     — picking max means a single 800ms outlier doesn't get washed
 //     into the median of 12ms. ADR-127 §Decision 5: the regression
 //     detector fires when p95 > p95_base * 1.20; the max-leaning
 //     bias inside the bucket does not skew the percentile_cont()
 //     output (which is computed across rows, not within a row).
-//   * Count: starts at 1, increments per duplicate key. The
+//   - Count: starts at 1, increments per duplicate key. The
 //     CHECK constraint count >= 1 (migrations/00428) keeps a
 //     bug from persisting zero.
-//   * ColdBoot: OR of all rows in the bucket (true wins). If
+//   - ColdBoot: OR of all rows in the bucket (true wins). If
 //     even one of the 1000 collapsed rows was a cold-boot wake,
 //     the aggregate row carries the flag — a customer wants to
 //     know "did the cold-boot penalty skew my average".
-//   * TraceID: first non-empty string in iteration order. The
+//   - TraceID: first non-empty string in iteration order. The
 //     W3C trace propagates across requests inside the bucket
 //     99% of the time, so the first one is representative.
 //     Empty buckets (no trace_ids) get "" — same as the
 //     recorder's behavior on a single request with no
 //     trace context.
-//   * ReceivedAt: MinuteBucket of the FIRST row. Same key as
+//   - ReceivedAt: MinuteBucket of the FIRST row. Same key as
 //     the bucket, so the apid receiver doesn't have to
 //     re-truncate; lets the query plan match the (received_at
 //     DESC) index ordering exactly.

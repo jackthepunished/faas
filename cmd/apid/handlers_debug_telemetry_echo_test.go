@@ -5,11 +5,11 @@
 // feeds it back into a follow-up request breaks because tooling
 // expects the short "Nd" / "Nh" canonical form. These tests
 // lock in:
-//   1. raw parseable input is echoed verbatim (round-trip safe)
-//   2. empty raw falls through to canonical form of effective
-//   3. clamped effective duration renders the canonical Nd / Nh
-//      form so the customer can detect the discrepancy
-//   4. unparseable raw falls through to canonical form of effective
+//  1. raw parseable input is echoed verbatim (round-trip safe)
+//  2. empty raw falls through to canonical form of effective
+//  3. clamped effective duration renders the canonical Nd / Nh
+//     form so the customer can detect the discrepancy
+//  4. unparseable raw falls through to canonical form of effective
 //
 // Part of PR-B's /code-review review-fix cluster.
 package main

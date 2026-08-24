@@ -1551,7 +1551,7 @@ delete from oidc_exchanged_tokens where id = $1;
 -- pkg/gateway/request_telemetry_publisher.go coalesces requests with
 -- the same (app, deployment, route, method, status, minute_bucket) into
 -- one row with `count` = the number of originals. count is INT NOT NULL
--- DEFAULT 1 (00428) so pre-PR-B clients keep working — the DEFAULT
+-- DEFAULT 1 (00437) so pre-PR-B clients keep working — the DEFAULT
 -- fires for any INSERT that omits the column. PR-B's publisher always
 -- passes it explicitly.
 INSERT INTO request_telemetry (

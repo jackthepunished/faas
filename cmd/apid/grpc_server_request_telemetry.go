@@ -43,9 +43,9 @@ import (
 // must stay aligned (goconst-flagged so drift breaks the lint
 // gate).
 const (
-	rtOutcomeInserted   = "inserted"
+	rtOutcomeInserted    = "inserted"
 	rtOutcomeRateLimited = "rate_limited"
-	rtOutcomeDBError    = "db_error"
+	rtOutcomeDBError     = "db_error"
 )
 
 // requestTelemetryStore is the Store subset the receiver needs.
@@ -74,15 +74,15 @@ type requestTelemetryStore interface {
 // upgrade takes effect within a minute (well under the customer's
 // perception).
 type telemetryRateLimiter struct {
-	mu     sync.Mutex
-	bucket map[uuid.UUID]*telemetryAccountBucket
-	limits map[uuid.UUID]api.Limits // plan-derived caps, TTL 60s
+	mu      sync.Mutex
+	bucket  map[uuid.UUID]*telemetryAccountBucket
+	limits  map[uuid.UUID]api.Limits // plan-derived caps, TTL 60s
 	cacheAt map[uuid.UUID]time.Time
 }
 
 type telemetryAccountBucket struct {
 	tokens     float64
-	lastRefill  time.Time
+	lastRefill time.Time
 }
 
 // newTelemetryRateLimiter wires an empty limiter.
@@ -109,7 +109,7 @@ func (r *telemetryRateLimiter) take(accountID uuid.UUID, bucketCap int) (bool, i
 	b, ok := r.bucket[accountID]
 	if !ok {
 		b = &telemetryAccountBucket{
-			tokens:    float64(bucketCap),
+			tokens:     float64(bucketCap),
 			lastRefill: now,
 		}
 		r.bucket[accountID] = b

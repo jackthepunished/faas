@@ -174,12 +174,12 @@ const RequestTelemetryRetentionInterval = 1 * time.Hour
 // unbounded-DELETE WAL pathology.
 //
 // Plan → retention ladder (mirrors pkg/api/MustLimitsFor):
-//   * free   — 0 days (DebugTelemetryEnabled=false; pre-existing
+//   - free   — 0 days (DebugTelemetryEnabled=false; pre-existing
 //     rows pre-downgrade are swept on the next tick).
-//   * hobby  — 3 days
-//   * pro    — 7 days
-//   * scale  — 14 days
-//   * other  — 1 day (safe failure mode for an unrecognised plan
+//   - hobby  — 3 days
+//   - pro    — 7 days
+//   - scale  — 14 days
+//   - other  — 1 day (safe failure mode for an unrecognised plan
 //     name; over-retention is the wrong failure mode here)
 //
 // The CASE uses acct.plan as a TEXT (the column type) so the

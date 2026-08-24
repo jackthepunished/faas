@@ -5744,8 +5744,8 @@ type DebugCompareRequest struct {
 	Source string `json:"source"`
 	Mirror string `json:"mirror"`
 	Route  string `json:"route,omitempty"`
-	Since  string `json:"since,omitempty"`  // duration string ("3h", "7d")
-	Until  string `json:"until,omitempty"`  // RFC3339 or empty for now
+	Since  string `json:"since,omitempty"` // duration string ("3h", "7d")
+	Until  string `json:"until,omitempty"` // RFC3339 or empty for now
 }
 
 // DebugCompareRouteStats is the per-route stats row in the
@@ -5768,8 +5768,8 @@ type DebugCompareRouteStats struct {
 // endpoint. Routes is empty when both deployments had no traffic
 // in the window.
 type DebugCompareResponse struct {
-	Source string                 `json:"source"`
-	Mirror string                 `json:"mirror"`
+	Source string                   `json:"source"`
+	Mirror string                   `json:"mirror"`
 	Routes []DebugCompareRouteStats `json:"routes"`
 }
 

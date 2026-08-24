@@ -175,10 +175,10 @@ func (s *server) runRegressionOnce(ctx context.Context, log *slog.Logger) {
 //     window).
 //  5. For each route where current.p95 > baseline.p95 * 1.20:
 //     a. count affected rows (current deployment's rows in window
-//        where latency_ms > baseline.p95 * 1.20).
+//     where latency_ms > baseline.p95 * 1.20).
 //     b. If affected >= debugRegressionMinAffected: upsert
-//        regression row with regression_factor = current.p95 /
-//        baseline.p95.
+//     regression row with regression_factor = current.p95 /
+//     baseline.p95.
 func (s *server) runRegressionForApp(ctx context.Context, log *slog.Logger, appID pgtype.UUID) error {
 	deps, err := s.store.ListDeploymentsForCompare(ctx, sqlc.ListDeploymentsForCompareParams{
 		AppID: appID,
