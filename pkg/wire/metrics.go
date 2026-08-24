@@ -1803,24 +1803,6 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_domain_doctor_skipped_flag_disabled_total",
 		Help: "Doctor passes skipped because FAAS_DOMAIN_DOCTOR_ENABLED was unset/false at the dns_poller tick (cmd/apid/dns_poller.go, ADR-120 Tier A1). Unlabelled — single-registry pattern, only apid increments.",
 	})
-	// debugRegressionOldestPassSeconds (ADR-127 PR-B): gauge of
-	// (now − max(last_detected_at)) across the
-	// debug_regression_observations row set at the moment the
-	// regression cron tick completes. Backs
-	// FaasDebugRegressionStalled (page, 30m).
-	debugRegressionOldestPassSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: prefix + "_debug_regression_oldest_pass_seconds",
-		Help: "Seconds elapsed since the most-recent debug_regression_observations row was refreshed by the regression cron (cmd/apid/debug_regression_cron.go, ADR-127 PR-B). Zero means the loop just ran against an empty table. Large values mean the cron is stalled. Backs FaasDebugRegressionStalled.",
-	})
-	// debugRegressionSkippedFlagDisabled (ADR-127 PR-B): counter
-	// of regression cron passes skipped because every account
-	// either had DebugTelemetryEnabled=false OR the operator
-	// flipped FAAS_DEBUG_TELEMETRY_ENABLED=false. Unlabelled —
-	// single-registry pattern, only apid increments.
-	debugRegressionSkippedFlagDisabled := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: prefix + "_debug_regression_skipped_flag_disabled_total",
-		Help: "Regression cron passes skipped because the operator flipped FAAS_DEBUG_TELEMETRY_ENABLED=false OR DebugTelemetryEnabled was off for every enumerated account (cmd/apid/debug_regression_cron.go, ADR-127 PR-B). Unlabelled — single-registry pattern, only apid increments.",
-	})
 	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
 	// events table by kind prefix (auth.*, key.*, secret.*,
 	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
@@ -2590,7 +2572,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ADR-127 PR-B: regression cron tick gauge.
 	// Single-registry: registered on every daemon; only apid
 	// increments via DebugRegressionOldestPassSeconds.
-	debugRegressionOldestPassSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+	debugRegressionOldestPassSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_debug_regression_oldest_pass_seconds",
 		Help: "Seconds elapsed since the most-recent debug_regression_observations row was refreshed by the regression cron (cmd/apid/debug_regression_cron.go, ADR-127 PR-B). Zero means the loop just ran against an empty table. Large values mean the cron is stalled. Backs FaasDebugRegressionStalled.",
 	})
@@ -2598,7 +2580,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ADR-127 PR-B: regression cron skip counter.
 	// Single-registry: registered on every daemon; only apid
 	// increments via DebugRegressionSkippedFlagDisabled.
-	debugRegressionSkippedFlagDisabled = prometheus.NewCounter(prometheus.CounterOpts{
+	debugRegressionSkippedFlagDisabled := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_debug_regression_skipped_flag_disabled_total",
 		Help: "Regression cron passes skipped because the operator flipped FAAS_DEBUG_TELEMETRY_ENABLED=false OR DebugTelemetryEnabled was off for every enumerated account (cmd/apid/debug_regression_cron.go, ADR-127 PR-B). Unlabelled — single-registry pattern, only apid increments.",
 	})

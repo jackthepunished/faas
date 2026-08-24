@@ -705,6 +705,7 @@ func extractPrintUsageTopics() ([]printUsageSite, error) {
 		"manDocsTopic":                    "man",
 		"docsOpenTopic":                   "open",
 		"throttleSuggestionsCmdDocsTopic": "throttle-suggestions",
+		"debugCmdDocsTopic":               "debug",
 	}
 
 	entries, err := os.ReadDir(".")

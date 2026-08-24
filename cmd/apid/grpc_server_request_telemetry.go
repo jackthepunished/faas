@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -335,24 +336,9 @@ func registerRequestTelemetryReceiver(s *grpc.Server, store requestTelemetryStor
 }
 
 // errorsAsPgError is a tiny helper that returns true when err is
-// (or wraps) a *pgconn.PgError, populating *target. Mirrors the
-// canonical pgx error.As pattern; inlined here so this file's
-// imports stay narrow.
+// (or wraps) a *pgconn.PgError, populating *target. Delegates to
+// errors.As so the errorlint pass is happy and the unwrap chain is
+// semantically correct for pgx v5.
 func errorsAsPgError(err error, target **pgconn.PgError) bool {
-	if err == nil {
-		return false
-	}
-	for cur := err; cur != nil; {
-		if pg, ok := cur.(*pgconn.PgError); ok {
-			*target = pg
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := cur.(unwrapper)
-		if !ok {
-			break
-		}
-		cur = u.Unwrap()
-	}
-	return false
+	return errors.As(err, target)
 }

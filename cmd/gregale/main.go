@@ -376,6 +376,11 @@ func run(args []string) int {
 		return cmdInvocations(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
+	case "debug":
+		// ADR-127 PR-B: production debugger (regression banner,
+		// compare panel, replay stub). Mirrors `invocations` for
+		// dispatcher shape.
+		return cmdDebug(args[1:])
 	case "billing":
 		// Issue #253: dashboard's "Open Stripe billing portal"
 		// button has a CLI twin. Subcommands live in

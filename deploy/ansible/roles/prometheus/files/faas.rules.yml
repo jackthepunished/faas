@@ -1171,3 +1171,47 @@ groups:
           summary: "vmmd cold-boot fallback > 30 % for 10m"
           description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/runbooks/FaasColdBootRatioHigh.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasColdBootRatioHigh.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # ADR-127 PR-B production debugger alerts. Mirrors the
+      # FaasDomainDoctorStalled / FaasAuditRetentionLoopStalled
+      # shape above — stalled loop pages on-call; stretched
+      # cadence warns.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasDebugRegressionStalled
+        # The regression cron (cmd/apid/debug_regression_cron.go)
+        # hasn't refreshed debug_regression_observations in >26m.
+        # Loop cadence is 5m (debugRegressionTickInterval); the
+        # 25.5m slack covers a Postgres hiccup. `for: 30m`
+        # debounces a single missed tick. A stuck cron means
+        # customers see stale or missing regression banners on
+        # the dashboard and the `gregale debug regressions <slug>`
+        # CLI returns no new rows — page.
+        expr: time() - timestamp(apid_debug_regression_oldest_pass_seconds) > 1560
+        for: 30m
+        labels:
+          severity: page
+          component: apid
+          family: debug_regression
+        annotations:
+          summary: "apid regression cron stalled >26m"
+          description: "The regression cron (cmd/apid/debug_regression_cron.go) has not refreshed debug_regression_observations in >26m. The gauge apid_debug_regression_oldest_pass_seconds stops updating when the loop stalls; Prometheus scrapes see a stale value. Customers' `gregale debug regressions <slug>` and the dashboard regression banner will return stale observations. Drill down per the runbook: check apid logs for `regression_cron: list apps failed` / `per-app pass failed`, then query Postgres for the MAX(last_detected_at) row, then escalate."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasDebugRegressionStalled.md"
+
+      - alert: FaasDebugRegressionDisabledByOperator
+        # The operator flipped FAAS_REQUEST_TELEMETRY_ENABLED=false.
+        # The skipped-flag counter is incrementing on every tick;
+        # the regression cron is intentionally not running. Info
+        # severity (no page); the alert exists so an operator can
+        # distinguish "operator disabled the cron" from "cron
+        # stalled".
+        expr: increase(apid_debug_regression_skipped_flag_disabled_total[1h]) > 0
+        for: 1h
+        labels:
+          severity: info
+          component: apid
+          family: debug_regression
+        annotations:
+          summary: "apid regression cron disabled by operator"
+          description: "FAAS_REQUEST_TELEMETRY_ENABLED has been set to false; the regression cron in cmd/apid/debug_regression_cron.go is intentionally skipping every tick. This is the operator's choice — no action required. To re-enable, unset the env var and restart apid (or restart meterd if the operator wants to keep the dashboard's HTTP surface dormant while keeping the cron live — the two kill-switches are separate)."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasDebugRegressionDisabledByOperator.md"

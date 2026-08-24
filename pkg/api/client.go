@@ -3433,3 +3433,48 @@ func (c *Client) ListAppDebugRequests(ctx context.Context, slug, since string) (
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
+
+// ListAppDebugRegressions returns the active regression
+// observations for an app (ADR-127 / PR-B). Ordered by
+// regression_factor DESC, last_detected_at DESC (worst first).
+// `since` is clamped server-side to the plan's
+// DebugTelemetryRetentionDays.
+//
+// 402 when the plan gates the feature (DebugTelemetryEnabled=false).
+func (c *Client) ListAppDebugRegressions(ctx context.Context, slug, since string) (DebugRegressionsResponse, error) {
+	var out DebugRegressionsResponse
+	path := "/v1/apps/" + slug + "/debug/regressions"
+	if since != "" {
+		path += "?since=" + url.QueryEscape(since)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// CompareAppDebugDeployments compares two deployments' per-route
+// latency distributions in a shared window (ADR-127 / PR-B).
+// `route` is optional (empty = all routes). `until` is optional
+// (empty = now). The response shape is stable across the dashboard
+// / API / CLI surfaces.
+func (c *Client) CompareAppDebugDeployments(ctx context.Context, slug, source, mirror, route, since, until string) (DebugCompareResponse, error) {
+	var out DebugCompareResponse
+	path := "/v1/apps/" + slug + "/debug/compare"
+	body := DebugCompareRequest{
+		Source: source,
+		Mirror: mirror,
+		Route:  route,
+		Since:  since,
+		Until:  until,
+	}
+	return out, c.do(ctx, "POST", path, body, &out)
+}
+
+// ReplayAppDebugRequest queues a replay of a recorded request
+// (ADR-127 / PR-B). PR-B returns a "queued" status — the
+// mirror invocation pipeline lands in issue #72 PR-A2.
+// Customer tooling can wire against the response shape today;
+// the actual replay will land when PR-A2 ships.
+func (c *Client) ReplayAppDebugRequest(ctx context.Context, slug, reqID string) (DebugReplayResponse, error) {
+	var out DebugReplayResponse
+	path := "/v1/apps/" + slug + "/debug/requests/" + reqID + "/replay"
+	return out, c.do(ctx, "POST", path, nil, &out)
+}

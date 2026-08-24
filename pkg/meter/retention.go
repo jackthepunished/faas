@@ -166,17 +166,6 @@ const DefaultRequestTelemetryRetentionDays = 14
 // the DELETE is bounded and the index makes it cheap.
 const RequestTelemetryRetentionInterval = 1 * time.Hour
 
-// retentionRequestTelemetryBatchSQL deletes rows in the bounded
-// DELETE pattern (ctid + LIMIT N) — same shape as
-// retentionBatchSQL above. Mirrors the partial index
-// request_telemetry_app_received_idx for the planner.
-const retentionRequestTelemetryBatchSQL = `DELETE FROM public.request_telemetry
-                                         WHERE ctid IN (
-                                             SELECT ctid FROM public.request_telemetry
-                                             WHERE received_at < (now() - $1::interval)
-                                             LIMIT $2
-                                         )`
-
 // retentionRequestTelemetryPlanAwareBatchSQL is the per-app,
 // plan-aware sweep (PR-B). Joins request_telemetry to apps to
 // accounts and computes a per-app retention cutoff from the

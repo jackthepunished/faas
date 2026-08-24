@@ -503,6 +503,17 @@ var cliCommands = []cliCommand{
 		Positionals: []string{"<id>"},
 	},
 	{
+		Name:    "debug",
+		DocSlug: "debug",
+		Short:   "Production debugger (ADR-127 / PR-B)",
+		Subcommands: []cliSub{
+			{Name: "requests", Short: "Per-request telemetry (list|get|replay)"},
+			{Name: "regressions", Short: "Active regression observations"},
+			{Name: "compare", Short: "Per-route deployment-vs-deployment compare"},
+		},
+		Positionals: []string{"<slug>"},
+	},
+	{
 		Name:    "invitations",
 		DocSlug: "invitations",
 		Short:   "Standalone invitation actions (invitations peek <token>|accept <token>)",
