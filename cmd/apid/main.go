@@ -610,6 +610,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// seam in runWithDeps doesn't.
 		go sseFanIn(ctx, log, pool, srv.events, nil)
 		startDNSPoller(ctx, srv, log)
+		// ADR-127 PR-B: regression detector. Mirrors the dns_poller's
+		// shape — first-pass-immediate + ticker + ctx-cancel. The
+		// cron is gated on FAAS_REQUEST_TELEMETRY_ENABLED so the
+		// surface can be dark-launched with the ginstal kill-switch
+		// that the apid gRPC receiver (Stage 4) already honors.
+		startDebugRegressionCron(ctx, srv, log, deps.getenv)
 		// G6 grace timer (spec §17 G6, ADR-021): the 30-day deletion
 		// grace sweep lives in apid (not meterd) because the write
 		// side (DELETE /v1/account, POST /v1/account/restore) is here
