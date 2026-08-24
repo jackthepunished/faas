@@ -17,6 +17,11 @@ from .add_tenant_hostname_request import AddTenantHostnameRequest
 from .add_trusted_signer_request import AddTrustedSignerRequest
 from .admin_set_github_webhook_secret_request import AdminSetGithubWebhookSecretRequest
 from .admin_set_github_webhook_secret_response import AdminSetGithubWebhookSecretResponse
+from .alert_preset_response import AlertPresetResponse
+from .alert_preset_response_category import AlertPresetResponseCategory
+from .alert_preset_response_comparison import AlertPresetResponseComparison
+from .alert_preset_response_minimum_plan import AlertPresetResponseMinimumPlan
+from .alert_preset_response_window_spec import AlertPresetResponseWindowSpec
 from .alert_rule_response import AlertRuleResponse
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
@@ -175,6 +180,9 @@ from .data_upstream_list_response import DataUpstreamListResponse
 from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
+from .debug_telemetry_list_response import DebugTelemetryListResponse
+from .debug_telemetry_request_item import DebugTelemetryRequestItem
+from .debug_telemetry_request_item_method import DebugTelemetryRequestItemMethod
 from .delayed_task_request import DelayedTaskRequest
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
@@ -257,6 +265,7 @@ from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
 from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
+from .enable_alert_preset_request import EnableAlertPresetRequest
 from .env_diff_cell import EnvDiffCell
 from .env_diff_kind import EnvDiffKind
 from .env_diff_response import EnvDiffResponse
@@ -459,13 +468,9 @@ from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
 from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
-from .source_ref_deploy_request_tag_type_1 import SourceRefDeployRequestTagType1
-from .source_ref_deploy_request_tag_type_2_type_1 import SourceRefDeployRequestTagType2Type1
-from .source_ref_deploy_request_tag_type_3_type_1 import SourceRefDeployRequestTagType3Type1
+from .source_ref_deploy_request_tag import SourceRefDeployRequestTag
 from .source_tarball_deploy_request import SourceTarballDeployRequest
-from .source_tarball_deploy_request_tag_type_1 import SourceTarballDeployRequestTagType1
-from .source_tarball_deploy_request_tag_type_2_type_1 import SourceTarballDeployRequestTagType2Type1
-from .source_tarball_deploy_request_tag_type_3_type_1 import SourceTarballDeployRequestTagType3Type1
+from .source_tarball_deploy_request_tag import SourceTarballDeployRequestTag
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
@@ -560,6 +565,11 @@ __all__ = (
     "AddTrustedSignerRequest",
     "AdminSetGithubWebhookSecretRequest",
     "AdminSetGithubWebhookSecretResponse",
+    "AlertPresetResponse",
+    "AlertPresetResponseCategory",
+    "AlertPresetResponseComparison",
+    "AlertPresetResponseMinimumPlan",
+    "AlertPresetResponseWindowSpec",
     "AlertRuleResponse",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",
@@ -714,6 +724,9 @@ __all__ = (
     "DataUpstreamResponse",
     "DataUpstreamResponseKind",
     "DataUpstreamResponseSource",
+    "DebugTelemetryListResponse",
+    "DebugTelemetryRequestItem",
+    "DebugTelemetryRequestItemMethod",
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
@@ -792,6 +805,7 @@ __all__ = (
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
     "EdgeRuleValidateActionValidateMode",
+    "EnableAlertPresetRequest",
     "EnvDiffCell",
     "EnvDiffKind",
     "EnvDiffResponse",
@@ -992,13 +1006,9 @@ __all__ = (
     "SLODuration",
     "SourceRefDeployRequest",
     "SourceRefDeployRequestFormat",
-    "SourceRefDeployRequestTagType1",
-    "SourceRefDeployRequestTagType2Type1",
-    "SourceRefDeployRequestTagType3Type1",
+    "SourceRefDeployRequestTag",
     "SourceTarballDeployRequest",
-    "SourceTarballDeployRequestTagType1",
-    "SourceTarballDeployRequestTagType2Type1",
-    "SourceTarballDeployRequestTagType3Type1",
+    "SourceTarballDeployRequestTag",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",

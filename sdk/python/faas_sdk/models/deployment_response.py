@@ -172,7 +172,7 @@ class DeploymentResponse:
     ) = UNSET
     """Closed-set classifier of how this deployment was submitted. One of `api` (SDK / API key) / `cli` (bearer
     token) / `dashboard` (session cookie) / `github` (githubd_bridge) / `operator` (admin). Enforced at the schema
-    layer by migrations/00305_deployments_actor.sql's CHECK constraint."""
+    layer by migrations/00303_deployments_actor.sql's CHECK constraint."""
     deployed_from_ip: None | str | Unset = UNSET
     """Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract).
     Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in
@@ -184,14 +184,15 @@ class DeploymentResponse:
     from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH
     identity, suitable for downstream GitHub-API correlation."""
     reason: str | Unset = UNSET
-    """Free-form operator note (≤280 chars). Example: 'Emergency rollback after payment provider incident'."""
+    """Free-form operator note on the source-ref deploy request (≤280 chars). Example: 'Emergency rollback after
+    payment provider incident'."""
     tag: DeploymentResponseTag | Unset = UNSET
-    """Closed-set annotation tag for grouping/filtering."""
+    """Closed-set annotation tag on the source-ref deploy request for grouping/filtering."""
     deployed_by: str | Unset = UNSET
-    """Human-readable actor label. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the
-    GitHub Action defaults to ${{ github.actor }}."""
+    """Human-readable actor label on the source-ref deploy request. CLI auto-captures from `git config user.name`;
+    githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}."""
     pr_number: int | Unset = UNSET
-    """Pull-request number when the wire offers it (githubd pull_request.number; Action ${{
+    """Pull-request number that drove this source-ref deploy request (githubd pull_request.number; Action ${{
     github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."""
     rollback_on_5xx: bool | Unset = False
     """Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Customer sets this at

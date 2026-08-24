@@ -53,6 +53,14 @@ class AppMetricsResponse:
     """
     wake_p95_ms: float
     """FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."""
+    queue_depth: int | Unset = UNSET
+    """Current wake-queue depth (`gateway_queue_depth{app}`).
+    Backs the `queue_backlog_growing` alert preset (ADR-123):
+    comparison `gt 50` over the chosen window. Best-effort:
+    absent on Prometheus failure (the field is `null`); the
+    evaluator's degraded-source contract skips firing
+    rather than guessing.
+    """
     egress_bytes: int | Unset = UNSET
     """Per-app egress byte delta over the window (informational; not billed). ADR-046. Source:
     schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until
@@ -98,6 +106,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = self.wake_p95_ms
 
+        queue_depth = self.queue_depth
+
         egress_bytes = self.egress_bytes
 
         tx_bytes = self.tx_bytes
@@ -126,6 +136,8 @@ class AppMetricsResponse:
                 "wake_p95_ms": wake_p95_ms,
             }
         )
+        if queue_depth is not UNSET:
+            field_dict["queue_depth"] = queue_depth
         if egress_bytes is not UNSET:
             field_dict["egress_bytes"] = egress_bytes
         if tx_bytes is not UNSET:
@@ -162,6 +174,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = d.pop("wake_p95_ms")
 
+        queue_depth = d.pop("queue_depth", UNSET)
+
         egress_bytes = d.pop("egress_bytes", UNSET)
 
         tx_bytes = d.pop("tx_bytes", UNSET)
@@ -187,6 +201,7 @@ class AppMetricsResponse:
             error_rate_pct=error_rate_pct,
             cold_start_pct=cold_start_pct,
             wake_p95_ms=wake_p95_ms,
+            queue_depth=queue_depth,
             egress_bytes=egress_bytes,
             tx_bytes=tx_bytes,
             routes=routes,
