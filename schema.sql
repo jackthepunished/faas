@@ -2279,6 +2279,38 @@ CREATE TABLE public.webhook_deliveries (
 
 
 --
+-- Name: request_telemetry; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.request_telemetry (
+    id uuid DEFAULT gen_random_uuid(),
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    deployment_id uuid NOT NULL,
+    route text NOT NULL,
+    method text NOT NULL,
+    status integer NOT NULL,
+    latency_ms integer NOT NULL,
+    cold_boot boolean DEFAULT false NOT NULL,
+    trace_id text,
+    spans_summary jsonb,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT request_telemetry_status_check CHECK (((status >= 100) AND (status <= 599))),
+    CONSTRAINT request_telemetry_latency_ms_check CHECK ((latency_ms >= 0)),
+    CONSTRAINT request_telemetry_trace_id_check CHECK (((trace_id IS NULL) OR (trace_id ~ '^[0-9a-f]{32}$'::text)))
+)
+PARTITION BY RANGE (received_at);
+
+
+--
+-- Name: request_telemetry_default; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.request_telemetry_default
+    PARTITION OF public.request_telemetry DEFAULT;
+
+
+--
 -- Name: data_upstream_probes_default; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 

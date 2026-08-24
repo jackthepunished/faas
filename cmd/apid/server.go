@@ -1340,6 +1340,13 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.delayedTaskGet))))
 	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.delayedTaskCancel))))
 
+	// ADR-127 production debugger — read-only slice in PR-A. The
+	// write-side (publisher → gRPC IncrementRequestTelemetry → apid
+	// receiver → sqlc INSERT) lands in PR-B; this GET exists so
+	// customers can already hit the endpoint and see rows once a
+	// row source is configured. Plan-gated by DebugTelemetryEnabled.
+	mux.HandleFunc("GET /v1/apps/{slug}/debug/requests", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.debugTelemetryListHandler))))
+
 	// API keys. Minting and revoking keys are admin-only — a leaked
 	// write-scoped key must not be able to grant itself more scopes.
 	// Listing is read.

@@ -150,3 +150,86 @@ func RetentionLoop(ctx context.Context, db retentionExecer, interval time.Durati
 		}
 	}
 }
+
+// DefaultRequestTelemetryRetentionDays is the upper bound across
+// plans (Scale=14, ADR-127 / pkg/api/limits.go). Hobby (3) and
+// Pro (7) fall under it — over-retention by ≤ 14 days is the
+// safe failure mode (PR-B adds per-app plan-aware filtering).
+const DefaultRequestTelemetryRetentionDays = 14
+
+// RequestTelemetryRetentionInterval is the cron cadence for the
+// request_telemetry sweep. Hourly matches the smaller per-plan
+// retention caps (Hobby=3d) without a meaningful load cost —
+// the DELETE is bounded and the index makes it cheap.
+const RequestTelemetryRetentionInterval = 1 * time.Hour
+
+// retentionRequestTelemetryBatchSQL deletes rows in the bounded
+// DELETE pattern (ctid + LIMIT N) — same shape as
+// retentionBatchSQL above. Mirrors the partial index
+// request_telemetry_app_received_idx for the planner.
+const retentionRequestTelemetryBatchSQL = `DELETE FROM public.request_telemetry
+                                         WHERE ctid IN (
+                                             SELECT ctid FROM public.request_telemetry
+                                             WHERE received_at < (now() - $1::interval)
+                                             LIMIT $2
+                                         )`
+
+// RetentionOnceRequestTelemetry runs one DELETE pass against
+// public.request_telemetry, bounded by RetentionBatchSize per
+// statement and MaxRetentionBatches total iterations. Returns
+// the cumulative row count. Same shape as RetentionOnce —
+// additive free function, no shared state with the usage_minutes
+// sweep.
+//
+// The retention window is DefaultRequestTelemetryRetentionDays
+// (14d, the Scale cap). PR-A is over-retentive for Hobby/Pro;
+// PR-B adds per-app plan-aware filtering via the limits table.
+func RetentionOnceRequestTelemetry(ctx context.Context, db retentionExecer) (int64, error) {
+	interval := fmt.Sprintf("%d days", DefaultRequestTelemetryRetentionDays)
+	var total int64
+	for i := 0; i < MaxRetentionBatches; i++ {
+		tag, err := db.Exec(ctx, retentionRequestTelemetryBatchSQL, interval, RetentionBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("request telemetry retention delete (batch %d, deleted so far %d): %w", i, total, err)
+		}
+		total += tag
+		if tag < RetentionBatchSize {
+			return total, nil
+		}
+	}
+	return total, ErrRetentionBatchCap
+}
+
+// RetentionLoopRequestTelemetry is the free-function goroutine
+// that calls RetentionOnceRequestTelemetry every Interval.
+// Returns on ctx.Done(). Mirrors RetentionLoop — same log posture
+// (cap-hit is Warn, hard DB failure is Error).
+func RetentionLoopRequestTelemetry(ctx context.Context, db retentionExecer, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = RequestTelemetryRetentionInterval
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n, err := RetentionOnceRequestTelemetry(ctx, db)
+			switch {
+			case err == nil:
+				if log != nil {
+					log.Info("request telemetry retention tick ok", "rows_deleted", n)
+				}
+			case errors.Is(err, ErrRetentionBatchCap):
+				if log != nil {
+					log.Warn("request telemetry retention tick hit batch cap; will resume next tick", "rows_deleted", n, "err", err)
+				}
+			default:
+				if log != nil {
+					log.Error("request telemetry retention tick failed", "err", err)
+				}
+			}
+		}
+	}
+}

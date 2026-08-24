@@ -1817,6 +1817,50 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/debug/requests:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: listAppDebugRequests
+      summary: Per-app request telemetry (ADR-127 / PR-A).
+      description: |
+        Recent request rows for an app — status, latency_ms, route,
+        method, deployment_id, cold_boot, trace_id, received_at.
+        PR-A ships the read endpoint only; the write-side (publisher
+        → gRPC IncrementRequestTelemetry → apid receiver → sqlc
+        INSERT) lands in PR-B. The endpoint is plan-gated by
+        `DebugTelemetryEnabled` (Free off; Hobby/Pro/Scale on).
+        The window is clamped to `DebugTelemetryRetentionDays`
+        (Hobby 3d, Pro 7d, Scale 14d). When the clamp fires, the
+        effective `since` is returned in the response so the
+        dashboard can render a "you widened past the cap" tile.
+        Returns 200 with `requests: []` when no rows exist in the
+        window — never 404. Cross-account slug is 404 (IDOR-safe;
+        byte-identical to "no such app").
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Duration or 'Nd' alias. Defaults to `24h`. Clamped to plan's `DebugTelemetryRetentionDays`."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: [integer, 'null'], minimum: 1, maximum: 200, default: 20 }
+          description: "Page size, default 20, max 200."
+      responses:
+        '200':
+          description: Page of recent request telemetry rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugTelemetryListResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/deployments:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -15885,6 +15929,35 @@ components:
       required: [delivery]
       properties:
         delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+
+    DebugTelemetryListResponse:
+      type: object
+      description: |
+        Response from GET /v1/apps/{slug}/debug/requests (ADR-127).
+        `since` echoes the effective window used (after the plan's
+        `DebugTelemetryRetentionDays` clamp) so the dashboard can
+        surface a "you widened past the cap" tile.
+      required: [requests, since]
+      properties:
+        since: { type: string, description: "Effective window applied (e.g. '24h', '72h')." }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/DebugTelemetryRequestItem' }
+
+    DebugTelemetryRequestItem:
+      type: object
+      description: "One row per gateway-served request, persisted by the recorder (PR-A)."
+      required: [id, deployment_id, route, method, status, latency_ms, cold_boot, received_at]
+      properties:
+        id: { type: string, format: uuid }
+        deployment_id: { type: string, format: uuid }
+        route: { type: string, description: "Route template (NOT expanded URL)." }
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS] }
+        status: { type: integer, minimum: 100, maximum: 599 }
+        latency_ms: { type: integer, minimum: 0 }
+        cold_boot: { type: boolean }
+        trace_id: { type: [string, 'null'], description: "W3C trace-id hex (32 chars), null when unset." }
+        received_at: { type: string, format: date-time }
 
 
   responses:

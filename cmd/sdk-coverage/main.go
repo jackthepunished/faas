@@ -402,6 +402,14 @@ var methodRouteMap = map[string]string{
 	// (GetApp, ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
 
+	// ADR-127 / PR-A — production debugger data plane. The
+	// auto-derivation would produce GetAppsSlugDebugRequests
+	// (Swagger-style); the SDK names it ListAppDebugRequests to
+	// match the operationId on the spec side and the per-resource
+	// list family (ListAlertRules, ListEdgeRules, ListAppWebhooks)
+	// — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/debug/requests": "ListAppDebugRequests",
+
 	// Issue #393 — account-scoped list endpoints. Distinct from the
 	// per-app counterparts (ListInstances / ListSecrets / GetAppMetrics)
 	// which take a slug; the aggregate route has no slug, so the SDK

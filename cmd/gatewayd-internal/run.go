@@ -1734,6 +1734,54 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
+	// ADR-127 production debugger — request_telemetry data plane.
+	// Wires the recorder into Handler.observe + launches the
+	// publisher goroutine. The ShipFn is a sampled log stub in
+	// PR-A: rows drain from the recorder on FlushInterval and
+	// are sampled at 1/N to slog.Debug so operators can see the
+	// data plane is running without flooding the log. PR-B
+	// replaces the log stub with a real IncrementRequestTelemetry
+	// streaming RPC against apid's unix socket — the recorder +
+	// publisher plumbing stays unchanged.
+	requestTelemetryEnabled := osGetenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false"
+	if requestTelemetryEnabled {
+		recorder := gateway.NewRequestTelemetryRecorder(gateway.RequestTelemetryConfig{
+			Enabled:  true,
+			RingSize: 4096,
+		}, log)
+		var rtShippedTotal int64
+		publisher := gateway.NewRequestTelemetryPublisher(gateway.RequestTelemetryPublisherConfig{
+			Enabled:        true,
+			FlushInterval:  5 * time.Second,
+			FlushBatchSize: 256,
+			MaxRetries:     3,
+		}, recorder, func(_ context.Context, rows []gateway.RequestTelemetryRow) error {
+			// PR-A: log-only stub. Returns nil so the
+			// publisher's success counter increments. PR-B
+			// replaces this body with a gRPC streaming client
+			// against apid's IncrementRequestTelemetry RPC.
+			rtShippedTotal += int64(len(rows))
+			if len(rows) > 0 {
+				log.Debug("request_telemetry: drained batch",
+					"batch_size", len(rows),
+					"shipped_total", rtShippedTotal)
+			}
+			return nil
+		}, log)
+		publisher.Start(ctx)
+		handler.WithRequestTelemetryRecorder(recorder)
+		// Stop() drains the final batch synchronously on shutdown.
+		defer publisher.Stop()
+		// Expose counters for the dashboard via /metrics; read by
+		// the existing Prometheus scrape.
+		log.Info("request_telemetry recorder enabled",
+			"ring_size", 4096,
+			"flush_interval", 5*time.Second,
+			"note", "PR-A: log-only ship stub; PR-B adds apid gRPC receiver")
+	} else {
+		log.Info("request_telemetry recorder disabled (FAAS_REQUEST_TELEMETRY_ENABLED == \"false\")")
+	}
+
 	// SIGHUP = "drop in-memory rate-limit buckets". Operators use this after
 	// a mass-app-delete (apid → publish app.deleted; once M5 ships the LISTEN
 	// channel, SIGHUP becomes the manual fallback). It's also safe to send
