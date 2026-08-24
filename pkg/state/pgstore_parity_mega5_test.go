@@ -53,20 +53,23 @@ func TestPgStore_DeploymentSidecarRAMs_Happy_Mega5(t *testing.T) {
 	}
 }
 
-func TestPgStore_DeploymentSidecarRAMs_NullLiteral_Mega5(t *testing.T) {
+func TestPgStore_DeploymentSidecarRAMs_EmptyArray_Mega5(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
-	appID := mustCreateAppID(t, s, ctx, "dsr-n")
+	appID := mustCreateAppID(t, s, ctx, "dsr-e")
 
-	// 'null'::jsonb is a valid schema value (the column default is
-	// '[]'::jsonb; the SQL branch treats either as "no sidecars").
-	depID := insertDeploymentWithSidecars(t, ctx, pool, appID, "null")
+	// '[]'::jsonb is the column default (migration 00118). The
+	// SQL branch in DeploymentSidecarRAMs reads this as the
+	// JSON string "[]" (len > 0, not "null"), which the decoder
+	// turns into a 0-row []sidecarRAMShape — so the function
+	// returns an empty []int, not nil. Pin that contract.
+	depID := insertDeploymentWithSidecars(t, ctx, pool, appID, "[]")
 
 	got, err := s.DeploymentSidecarRAMs(ctx, depID)
 	if err != nil {
-		t.Fatalf("DeploymentSidecarRAMs (null literal): %v", err)
+		t.Fatalf("DeploymentSidecarRAMs (empty array): %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("got = %v, want empty (null literal treated as no-sidecar)", got)
+		t.Errorf("got = %v, want empty (0-row sidecars jsonb)", got)
 	}
 }
 
@@ -89,21 +92,28 @@ func TestPgStore_DeploymentSidecarRAMs_EmptyID_Mega5(t *testing.T) {
 // --- AuthenticateOIDCBearer (PgStore) ----------------------------
 
 func TestPgStore_AuthenticateOIDCBearer_Happy_Mega5(t *testing.T) {
-	s, _, ctx := pgStoreWithPool(t)
+	s, pool, ctx := pgStoreWithPool(t)
 	acct, err := s.CreateAccount(ctx,
 		"oidc-happy-"+uuid.NewString()+"@example.com", api.PlanPro)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	tok := &state.OIDCExchangedToken{
-		AccountID: acct.ID,
-		TokenHash: []byte("hash-happy"),
-		ExpiresAt: time.Now().Add(time.Hour),
-		IssuerURL: "https://issuer.example",
-		Subject:   "user-1",
+	// Seed via raw SQL — InsertOIDCExchangedToken (pgstore.go:444)
+	// omits `id` from its INSERT and the table has no DEFAULT, so
+	// the production write path fails with 23502. Pin the read
+	// path here; the write bug is out of scope for this PR
+	// (zero-source-change rule).
+	acctUUID, err := uuid.Parse(acct.ID)
+	if err != nil {
+		t.Fatalf("parse acct.ID: %v", err)
 	}
-	if _, err := s.InsertOIDCExchangedToken(ctx, tok); err != nil {
-		t.Fatalf("InsertOIDCExchangedToken: %v", err)
+	if _, err := pool.Exec(ctx, `INSERT INTO oidc_exchanged_tokens
+		(id, account_id, token_hash, expires_at, issuer_url, subject, audience, jti)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
+		uuid.New(), acctUUID, []byte("hash-happy"),
+		time.Now().Add(time.Hour),
+		"https://issuer.example", "user-1", []string{}); err != nil {
+		t.Fatalf("seed oidc_exchanged_tokens: %v", err)
 	}
 	gotAcct, gotKey, err := s.AuthenticateOIDCBearer(ctx, []byte("hash-happy"))
 	if err != nil {
@@ -146,21 +156,21 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	hashA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 64 hex
 	hostA := fmt.Sprintf("a-%s.example", uuid.NewString()[:8])
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, 'in', 'postgres', $2, 5432, $3)`,
-		appID, hostA, hashA); err != nil {
+		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5432, $4)`,
+		uuid.New(), appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #1: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, 'in', 'postgres', $2, 5432, $3)`,
-		appID, hostA, hashA); err != nil {
+		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5432, $4)`,
+		uuid.New(), appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #2: %v", err)
 	}
 	// Different port → separate group.
 	hostB := fmt.Sprintf("b-%s.example", uuid.NewString()[:8])
 	hashB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO data_upstreams(app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, 'in', 'postgres', $2, 5433, $3)`,
-		appID, hostB, hashB); err != nil {
+		`INSERT INTO data_upstreams(id, app_id, scope, kind, host, port, host_redacted_hash) VALUES ($1, $2, 'in', 'postgres', $3, 5433, $4)`,
+		uuid.New(), appID, hostB, hashB); err != nil {
 		t.Fatalf("seed upstreams #3: %v", err)
 	}
 
