@@ -400,6 +400,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ops: hoisted above (PR-H moved it next to the Auditor
 	// construction so the per-daemon registry is shared by
 	// audit + reconcile + sync.Mutex-free observer paths).
+	//
+	// Issue #571 / PR-A2: githubd /readyz probe. Three signals —
+	// PG ping (binding store / secret resolver both round-trip
+	// the pool on every push), GitHub App credentials loaded
+	// (realSvc != nil; nil means OAuth + Checks are unavailable
+	// and the dispatcher falls back to full fan-out with the
+	// breaker_open metric label), and the webhook secret
+	// resolver wired (always set in production; nil = deploy
+	// misconfig where the per-tenant path fell back to the
+	// platform-wide env).
+	githubdProbe, githubdStop := githubd.BuildReadinessProbe(ctx, pool,
+		func() bool { return realSvc != nil },
+		func() bool { return secretResolver != nil },
+	)
+	defer githubdStop()
+
 	srv := &githubd.Server{
 		Service:        webhookSvc,
 		Log:            log,
@@ -412,6 +428,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		TLSKeyPath:     cfg.TLSKeyPath,
 		TLSCAPath:      cfg.TLSCAPath,
 		SecretResolver: secretResolver,
+		ReadyFunc:      githubdProbe.ReadyFunc(),
+		ReasonFunc:     githubdProbe.ReasonFunc(),
 	}
 	cleanup, errc, err := srv.Start(ctx)
 	if err != nil {
