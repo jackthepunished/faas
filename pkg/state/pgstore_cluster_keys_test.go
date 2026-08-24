@@ -266,6 +266,50 @@ func TestDeleteClusterSigningKey_AfterInsert(t *testing.T) {
 	}
 }
 
+// TestInsertClusterSigningKey_RejectsEmptyFields pins the
+// pre-Postgres input-validation guard. Without this, an operator
+// who forgets to populate one of key_id / public_key_pem /
+// sealed_blob would push the malformed row to goose's INSERT and
+// crash on the table CHECK constraints (kid shape, PEM header)
+// with a less actionable error message. Loud refuse-early means
+// the operator CLI can show a targeted error instead of a SQL
+// traceback.
+func TestInsertClusterSigningKey_RejectsEmptyFields(t *testing.T) {
+	pool := pgtest.Open(t)
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store := NewPgStore(pool)
+
+	ctx := context.Background()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	pemBytes, err := marshalPubPEM(pub)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sealed := make([]byte, 32)
+	_, _ = rand.Read(sealed)
+
+	cases := []struct {
+		name string
+		key  ClusterSigningKey
+	}{
+		{"empty_key_id", ClusterSigningKey{KeyID: "", PublicKeyPEM: string(pemBytes), SealedBlob: sealed}},
+		{"empty_public_key_pem", ClusterSigningKey{KeyID: deriveKidForTest(t, nil), PublicKeyPEM: "", SealedBlob: sealed}},
+		{"empty_sealed_blob", ClusterSigningKey{KeyID: deriveKidForTest(t, nil), PublicKeyPEM: string(pemBytes), SealedBlob: nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := store.InsertClusterSigningKey(ctx, tc.key); err == nil {
+				t.Fatalf("%s: expected empty-field refusal, got nil", tc.name)
+			}
+		})
+	}
+}
+
 // marshalPubPEM serialises an Ed25519 public key as the
 // PEM-encoded PKIX form that cluster_signing_keys.public_key_pem
 // stores. Mirrors the load-side parse in
