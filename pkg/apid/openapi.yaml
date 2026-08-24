@@ -14243,6 +14243,15 @@ components:
         removed:
           type: array
           items: { type: string, description: "Slugs the apply path will SoftDeleteAppCascade." }
+        # ADR-124 follow-up #3 — persisted_exclusions lists every
+        # slug the apply path folded in from the
+        # deployment_scope_exclusions table (the operator's
+        # "I excluded this for the long haul" intent). Empty on
+        # preview; non-empty on apply when persisted rows took
+        # effect.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
 
     ApplyResponse:
       description: "Apply response. Carries the inserted project_id and per-app IDs."
@@ -14291,6 +14300,13 @@ components:
         removed:
           type: array
           items: { type: string }
+        # ADR-124 follow-up #3 — mirrors PlanResponse; the apply
+        # response also surfaces persisted_exclusions so the CLI
+        # can render "(carried forward from --persist-exclude:
+        # slug1, slug2)" alongside the partition.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
         project_id: { type: string, pattern: '^[a-f0-9]{32}$' }
         apps:
           type: array

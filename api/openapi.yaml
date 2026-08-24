@@ -5940,6 +5940,15 @@ paths:
                 limit_crons: 5
                 can_apply: true
                 plan_token: eyJoYXMiOiI...
+                # ADR-124 partition fields (preview surface).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected:
+                  - {name: legacy-job, root_dir: jobs/legacy, class: http, action: noop, id: 0123456789abcdef0123456789abcdef}
+                skipped:
+                  - {name: risky-migration, root_dir: jobs/migrate, class: http, action: noop}
+                removed: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -5991,6 +6000,20 @@ paths:
                   - {slug: worker, id: 0123456789abcdef0123456789abcdef}
                 scan_source: compose
                 can_apply: true
+                # ADR-124 partition fields (apply surface; mirrors
+                # PlanResponse so the CLI --show-affected render
+                # doesn't have to switch DTOs between scan and
+                # apply).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected: []
+                skipped: []
+                removed: []
+                # ADR-124 follow-up #3 — slugs that were folded in
+                # from the deployment_scope_exclusions table on this
+                # apply (operator's --persist-exclude carry-forward).
+                persisted_exclusions: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -14243,6 +14266,15 @@ components:
         removed:
           type: array
           items: { type: string, description: "Slugs the apply path will SoftDeleteAppCascade." }
+        # ADR-124 follow-up #3 — persisted_exclusions lists every
+        # slug the apply path folded in from the
+        # deployment_scope_exclusions table (the operator's
+        # "I excluded this for the long haul" intent). Empty on
+        # preview; non-empty on apply when persisted rows took
+        # effect.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
 
     ApplyResponse:
       description: "Apply response. Carries the inserted project_id and per-app IDs."
@@ -14291,6 +14323,13 @@ components:
         removed:
           type: array
           items: { type: string }
+        # ADR-124 follow-up #3 — mirrors PlanResponse; the apply
+        # response also surfaces persisted_exclusions so the CLI
+        # can render "(carried forward from --persist-exclude:
+        # slug1, slug2)" alongside the partition.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
         project_id: { type: string, pattern: '^[a-f0-9]{32}$' }
         apps:
           type: array

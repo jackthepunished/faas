@@ -4227,6 +4227,14 @@ type PlanResponse struct {
 	Unaffected []PlanAffectedApp `json:"unaffected,omitempty"`
 	Skipped    []PlanAffectedApp `json:"skipped,omitempty"`
 	Removed    []string          `json:"removed,omitempty"`
+	// PersistedExclusions (ADR-124 follow-up #3) lists every slug
+	// that was folded into this scan/apply from the persisted
+	// deployment_scope_exclusions table — i.e. the operator's
+	// "I excluded this for the long haul" intent. The handler
+	// emits one KindProjectScopeExcluded audit row per slug. Empty
+	// on the common path (no persisted exclusions); the omitempty
+	// keeps existing --json consumers stable.
+	PersistedExclusions []string `json:"persisted_exclusions,omitempty"`
 }
 
 // ApplyResponse is the success body for POST /v1/projects. Carries
