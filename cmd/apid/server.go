@@ -1942,6 +1942,12 @@ func (s *server) handler() http.Handler {
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)
 	// Dependency-aware readiness probe (testing PostgreSQL pool ping).
+	// Note: this is the CUSTOMER-side /readyz (cookie-auth path) and
+	// returns a rich JSON body. The OPERATOR-side /readyz on the
+	// metrics mux (cmd/apid/main.go:~1518, issue #571 PR-A2) uses
+	// pkg/wire.ControlMuxLite + NewPGPingSignal and returns a short
+	// ASCII body for the LB scrape. The two share the same source
+	// of truth (the same pgxpool) but different auth shapes.
 	mux.HandleFunc("GET /readyz", s.readyz)
 
 	// Spec hosting (anonymous; see pkg/apid/openapi_handler.go).
