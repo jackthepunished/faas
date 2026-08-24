@@ -12,6 +12,7 @@
 package state
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func TestMemStore_InsertDataUpstream_Mega5(t *testing.T) {
 	if id != uuid.Nil {
 		t.Errorf("id = %v, want uuid.Nil", id)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -38,7 +39,7 @@ func TestMemStore_ListDataUpstreamsByApp_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -50,7 +51,7 @@ func TestMemStore_GetDataUpstreamByID_Mega5(t *testing.T) {
 	if row != (DataUpstream{}) {
 		t.Errorf("row = %+v, want zero value", row)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -58,7 +59,7 @@ func TestMemStore_GetDataUpstreamByID_Mega5(t *testing.T) {
 func TestMemStore_DeleteDataUpstreamByID_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.DeleteDataUpstreamByID(t.Context(), uuid.New()); err != errMemStoreDataUpstreams {
+	if err := m.DeleteDataUpstreamByID(t.Context(), uuid.New()); !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -66,7 +67,7 @@ func TestMemStore_DeleteDataUpstreamByID_Mega5(t *testing.T) {
 func TestMemStore_InsertDataUpstreamProbe_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.InsertDataUpstreamProbe(t.Context(), sqlc.InsertDataUpstreamProbeParams{}); err != errMemStoreDataUpstreams {
+	if err := m.InsertDataUpstreamProbe(t.Context(), sqlc.InsertDataUpstreamProbeParams{}); !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -78,7 +79,7 @@ func TestMemStore_ListDataUpstreamProbesByHostRegion_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -86,7 +87,7 @@ func TestMemStore_ListDataUpstreamProbesByHostRegion_Mega5(t *testing.T) {
 func TestMemStore_PruneDataUpstreamProbesOlderThan_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.PruneDataUpstreamProbesOlderThan(t.Context(), time.Now()); err != errMemStoreDataUpstreams {
+	if err := m.PruneDataUpstreamProbesOlderThan(t.Context(), time.Now()); !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -98,7 +99,7 @@ func TestMemStore_ListAllAppDataUpstreams_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -110,7 +111,7 @@ func TestMemStore_CountDataUpstreamsByApp_Mega5(t *testing.T) {
 	if n != 0 {
 		t.Errorf("n = %d, want 0", n)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }
@@ -122,7 +123,7 @@ func TestMemStore_ListDistinctUpstreamHostHashes_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreDataUpstreams {
+	if !errors.Is(err, errMemStoreDataUpstreams) {
 		t.Errorf("err = %v, want errMemStoreDataUpstreams", err)
 	}
 }

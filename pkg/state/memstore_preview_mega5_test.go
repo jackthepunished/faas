@@ -13,6 +13,7 @@
 package state
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func seedApp_Mega5(m *MemStore, id, accountID, slug string) App {
 func TestStampPreviewDestroyCommentedAt_NotFound_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if _, err := m.StampPreviewDestroyCommentedAt(t.Context(), "missing", time.Now()); err != ErrNotFound {
+	if _, err := m.StampPreviewDestroyCommentedAt(t.Context(), "missing", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -47,7 +48,7 @@ func TestStampPreviewDestroyCommentedAt_ProductionApp_Mega5(t *testing.T) {
 	// Production app (PreviewOfSlug == "") → ErrNotFound per the
 	// doc-comment contract.
 	seedApp_Mega5(m, "prod-1", "acc-1", "my-app")
-	if _, err := m.StampPreviewDestroyCommentedAt(t.Context(), "prod-1", time.Now()); err != ErrNotFound {
+	if _, err := m.StampPreviewDestroyCommentedAt(t.Context(), "prod-1", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (production app)", err)
 	}
 }

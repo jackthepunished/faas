@@ -9,6 +9,7 @@
 package state
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -72,7 +73,7 @@ func TestGetTenantHostnameByName_LowercaseFallback_Mega5(t *testing.T) {
 func TestGetTenantHostnameByName_NotFound_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if _, err := m.GetTenantHostnameByName(t.Context(), "missing.example"); err != ErrNotFound {
+	if _, err := m.GetTenantHostnameByName(t.Context(), "missing.example"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -83,7 +84,7 @@ func TestGetTenantHostnameByName_SurfaceDeleted_Mega5(t *testing.T) {
 	seedTenantSurface_Mega5(m, "sf-gone", SurfaceStatusDeleted)
 	seedTenantHostname_Mega5(m, "gone.example", "sf-gone")
 
-	if _, err := m.GetTenantHostnameByName(t.Context(), "gone.example"); err != ErrNotFound {
+	if _, err := m.GetTenantHostnameByName(t.Context(), "gone.example"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (parent surface soft-deleted)", err)
 	}
 }
@@ -96,7 +97,7 @@ func TestGetTenantHostnameByName_SurfaceMissing_Mega5(t *testing.T) {
 	// behavior when the parent row is gone).
 	seedTenantHostname_Mega5(m, "orphan.example", "sf-ghost")
 
-	if _, err := m.GetTenantHostnameByName(t.Context(), "orphan.example"); err != ErrNotFound {
+	if _, err := m.GetTenantHostnameByName(t.Context(), "orphan.example"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (parent surface missing)", err)
 	}
 }

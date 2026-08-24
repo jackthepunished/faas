@@ -12,6 +12,7 @@
 package state
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
@@ -20,7 +21,7 @@ import (
 func TestMemStore_InsertRequestTelemetry_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.InsertRequestTelemetry(t.Context(), sqlc.InsertRequestTelemetryParams{}); err != errMemStoreRequestTelemetry {
+	if err := m.InsertRequestTelemetry(t.Context(), sqlc.InsertRequestTelemetryParams{}); !errors.Is(err, errMemStoreRequestTelemetry) {
 		t.Errorf("err = %v, want errMemStoreRequestTelemetry", err)
 	}
 }
@@ -32,7 +33,7 @@ func TestMemStore_ListRequestTelemetryByApp_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreRequestTelemetry {
+	if !errors.Is(err, errMemStoreRequestTelemetry) {
 		t.Errorf("err = %v, want errMemStoreRequestTelemetry", err)
 	}
 }
@@ -44,7 +45,7 @@ func TestMemStore_RequestTelemetryByDeployment_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreRequestTelemetry {
+	if !errors.Is(err, errMemStoreRequestTelemetry) {
 		t.Errorf("err = %v, want errMemStoreRequestTelemetry", err)
 	}
 }
@@ -56,7 +57,7 @@ func TestMemStore_RequestTelemetryBaselineP95ByRoute_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreRequestTelemetry {
+	if !errors.Is(err, errMemStoreRequestTelemetry) {
 		t.Errorf("err = %v, want errMemStoreRequestTelemetry", err)
 	}
 }

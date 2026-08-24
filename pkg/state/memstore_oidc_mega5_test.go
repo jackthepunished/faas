@@ -15,6 +15,7 @@
 package state
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func TestAuthenticateOIDCBearer_NotFoundHash_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
 	seedAccount(m, "acc-1", api.PlanPro)
-	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("missing")); err != ErrNotFound {
+	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("missing")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -78,7 +79,7 @@ func TestAuthenticateOIDCBearer_AccountDeleted_Mega5(t *testing.T) {
 	if _, err := m.InsertOIDCExchangedToken(t.Context(), tok); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-ghost")); err != ErrNotFound {
+	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-ghost")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (account missing)", err)
 	}
 }
@@ -97,11 +98,11 @@ func TestAuthenticateOIDCBearer_ExpiredLazyDelete_Mega5(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// First call: lazy-deletes the row, returns ErrNotFound.
-	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-expired")); err != ErrNotFound {
+	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-expired")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("first call: err = %v, want ErrNotFound", err)
 	}
 	// Second call: row is gone — confirms lazy-delete happened.
-	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-expired")); err != ErrNotFound {
+	if _, _, err := m.AuthenticateOIDCBearer(t.Context(), []byte("hash-expired")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("second call: err = %v, want ErrNotFound (row should be deleted)", err)
 	}
 }
@@ -119,7 +120,7 @@ func seedOIDCTrustPolicy_Mega5(m *MemStore, accountID, issuer, pattern string) {
 func TestAccountByOIDCSubject_NotFound_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if _, err := m.AccountByOIDCSubject(t.Context(), "https://noissuer", "any"); err != ErrNotFound {
+	if _, err := m.AccountByOIDCSubject(t.Context(), "https://noissuer", "any"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -160,7 +161,7 @@ func TestAccountByOIDCSubject_RegexNoMatch_Mega5(t *testing.T) {
 	seedAccount(m, "acc-1", api.PlanPro)
 	seedOIDCTrustPolicy_Mega5(m, "acc-1", "https://issuer-1", `^user-[0-9]+$`)
 
-	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-1", "admin-1"); err != ErrNotFound {
+	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-1", "admin-1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (regex no match)", err)
 	}
 }
@@ -172,7 +173,7 @@ func TestAccountByOIDCSubject_WrongIssuer_Mega5(t *testing.T) {
 	// Policy is bound to issuer-1; query for issuer-2 must miss.
 	seedOIDCTrustPolicy_Mega5(m, "acc-1", "https://issuer-1", "")
 
-	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-2", "anything"); err != ErrNotFound {
+	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-2", "anything"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (wrong issuer)", err)
 	}
 }
@@ -184,7 +185,7 @@ func TestAccountByOIDCSubject_AccountMissingForPolicy_Mega5(t *testing.T) {
 	// skip the policy and return ErrNotFound (rather than panicking).
 	seedOIDCTrustPolicy_Mega5(m, "ghost", "https://issuer-1", "")
 
-	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-1", "anything"); err != ErrNotFound {
+	if _, err := m.AccountByOIDCSubject(t.Context(), "https://issuer-1", "anything"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound (account for policy is missing)", err)
 	}
 }
@@ -263,11 +264,11 @@ func TestGetOIDCExchangedTokenByHash_ExpiredLazyDelete_Mega5(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// First call: lazy-deletes, returns ErrNotFound.
-	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("hash-exp")); err != ErrNotFound {
+	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("hash-exp")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("first call: err = %v, want ErrNotFound", err)
 	}
 	// Second call: row gone — confirms the lazy-delete branch ran.
-	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("hash-exp")); err != ErrNotFound {
+	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("hash-exp")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("second call: err = %v, want ErrNotFound (row should be deleted)", err)
 	}
 }
@@ -275,7 +276,7 @@ func TestGetOIDCExchangedTokenByHash_ExpiredLazyDelete_Mega5(t *testing.T) {
 func TestGetOIDCExchangedTokenByHash_NotFound_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("never-inserted")); err != ErrNotFound {
+	if _, err := m.GetOIDCExchangedTokenByHash(t.Context(), []byte("never-inserted")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }

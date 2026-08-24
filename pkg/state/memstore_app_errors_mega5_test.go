@@ -13,6 +13,7 @@
 package state
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func TestMemStore_IncrementAppError_Mega5(t *testing.T) {
 	if ok {
 		t.Error("ok = true, want false")
 	}
-	if err != errMemStoreAppErrors {
+	if !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -36,7 +37,7 @@ func TestMemStore_IncrementAppError_Mega5(t *testing.T) {
 func TestMemStore_InsertAppErrorRequest_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.InsertAppErrorRequest(t.Context(), sqlc.InsertAppErrorRequestParams{}); err != errMemStoreAppErrors {
+	if err := m.InsertAppErrorRequest(t.Context(), sqlc.InsertAppErrorRequestParams{}); !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -48,7 +49,7 @@ func TestMemStore_ListAppErrorGroups_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreAppErrors {
+	if !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -60,7 +61,7 @@ func TestMemStore_ListAppErrorRequests_Mega5(t *testing.T) {
 	if rows != nil {
 		t.Errorf("rows = %+v, want nil", rows)
 	}
-	if err != errMemStoreAppErrors {
+	if !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -72,7 +73,7 @@ func TestMemStore_GetAppErrorSample_Mega5(t *testing.T) {
 	if !reflect.DeepEqual(row, AppErrorSampleRow{}) {
 		t.Errorf("row = %+v, want zero value", row)
 	}
-	if err != errMemStoreAppErrors {
+	if !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -84,7 +85,7 @@ func TestMemStore_ListAppErrorFingerprintsForPurge_Mega5(t *testing.T) {
 	if ids != nil {
 		t.Errorf("ids = %+v, want nil", ids)
 	}
-	if err != errMemStoreAppErrors {
+	if !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -93,7 +94,7 @@ func TestMemStore_DeleteAppErrorsByIDs_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
 	ids := []uuid.UUID{uuid.New()}
-	if err := m.DeleteAppErrorsByIDs(t.Context(), ids); err != errMemStoreAppErrors {
+	if err := m.DeleteAppErrorsByIDs(t.Context(), ids); !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -102,7 +103,7 @@ func TestMemStore_DeleteAppErrorRequestsByIDs_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
 	ids := []uuid.UUID{uuid.New()}
-	if err := m.DeleteAppErrorRequestsByIDs(t.Context(), ids); err != errMemStoreAppErrors {
+	if err := m.DeleteAppErrorRequestsByIDs(t.Context(), ids); !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
@@ -110,7 +111,7 @@ func TestMemStore_DeleteAppErrorRequestsByIDs_Mega5(t *testing.T) {
 func TestMemStore_DeleteAppErrorRequestsOlderThan_Mega5(t *testing.T) {
 	t.Parallel()
 	m := NewMemStore()
-	if err := m.DeleteAppErrorRequestsOlderThan(t.Context(), uuid.Nil, time.Now()); err != errMemStoreAppErrors {
+	if err := m.DeleteAppErrorRequestsOlderThan(t.Context(), uuid.Nil, time.Now()); !errors.Is(err, errMemStoreAppErrors) {
 		t.Errorf("err = %v, want errMemStoreAppErrors", err)
 	}
 }
