@@ -1619,7 +1619,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"daemon"})
 	daemonReady := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "_daemon_ready",
-		Help: "Readiness gauge (issue #586 / ADR-129), labelled by daemon. 0 = initializing / not yet serving traffic; 1 = ready. wire.Daemon() flips the gauge to 1 after the run function returns from the readiness barrier (see issue #571 for the /readyz implementation; until then MarkReady is a no-op stub defaulting to ready on boot). Operator dashboards query this for the 'Fleet readiness' panel.",
+		Help: "Readiness gauge (issue #586 / ADR-129 / issue #571 PR-A2), labelled by daemon. 0 = initializing / draining / not yet serving traffic; 1 = ready. wire.Daemon() flips the gauge to 1 after the run function blocks (the same source of truth the daemon's /readyz endpoint reads from; see pkg/wire/readiness.go). Operator dashboards query this for the 'Fleet readiness' panel.",
 	}, []string{"daemon"})
 	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
 		daemonBuildInfo.WithLabelValues(daemon, Version, GitSHA, BuildTime).Set(1)
@@ -3700,13 +3700,24 @@ func (m *OpsMetrics) SetDaemonUptime(daemon string, seconds float64) {
 	m.daemonUptimeSeconds.WithLabelValues(daemon).Set(seconds)
 }
 
-// MarkReady (issue #586 / ADR-129) flips the per-daemon readiness
-// gauge from 0 to 1. Called once by wire.Daemon() after the
-// daemon's run function returns from the readiness barrier (see
-// issue #571 for the /readyz implementation; until then MarkReady
-// is a no-op stub defaulting to ready on boot). nil-receiver guard
-// mirrors RecordDaemonRestart.
-func (m *OpsMetrics) MarkReady(daemon string) {
+// MarkReady (issue #586 / ADR-129 / issue #571 PR-A2) flips the
+// per-daemon readiness gauge. Called by wire.Daemon() at boot
+// (ready=true) and again by RunAndShutdown on ctx.Done()
+// (ready=false, "draining"). Called directly by the daemon-side
+// readiness probes (pkg/wire/readiness.go, commit 2) when their
+// signals flip — single source of truth between the /readyz body
+// and the daemon_ready gauge.
+//
+// reason is captured for human triage (operator can pair the
+// reason string with the gauge value in journalctl) but is NOT
+// surfaced as a Prometheus label — adding a reason label would
+// inflate cardinality (one row per unique reason string per
+// daemon). Pass "" when there is no human-readable reason to
+// surface; pass "draining" / "pg ping failed: ..." / etc. when
+// the operator can act on it.
+//
+// nil-receiver guard mirrors RecordDaemonRestart.
+func (m *OpsMetrics) MarkReady(daemon string, ready bool, reason string) {
 	if m == nil {
 		return
 	}
@@ -3716,7 +3727,11 @@ func (m *OpsMetrics) MarkReady(daemon string) {
 	default:
 		daemon = "other"
 	}
-	m.daemonReady.WithLabelValues(daemon).Set(1)
+	v := 0
+	if ready {
+		v = 1
+	}
+	m.daemonReady.WithLabelValues(daemon).Set(float64(v))
 }
 
 // SetDeployVersion (issue #586 / ADR-129) stamps the platform-wide

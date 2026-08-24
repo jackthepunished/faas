@@ -255,7 +255,7 @@ func Daemon(name string, fn RunFunc) {
 	// invoked" is the proxy for "ready to serve". DefaultOps is
 	// nil-safe so a daemon that never registered its OpsMetrics
 	// doesn't panic.
-	defaultOps.MarkReady(name)
+	defaultOps.MarkReady(name, true, "")
 	// Issue #852: do NOT re-stamp "daemon" / "version" on this call site.
 	// The slog.Logger.With envelope on log already carries "version" and
 	// NewCorrelationLogger already carries "daemon" — re-passing them here
