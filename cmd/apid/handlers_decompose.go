@@ -240,6 +240,78 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 		"app_count":   len(added) + len(changed),
 	})
 
+	// ADR-124 follow-up #3 (PR-B commit 5): write the operator's
+	// persisted exclusions to deployment_scope_exclusions on a
+	// successful apply when --persist-exclude was set. The
+	// partition Skipped list carries every slug the operator
+	// excluded (post-fallback, so persisted carry-forward slugs
+	// are included if they were excluded this deploy). Idempotent
+	// on duplicate (23505 → ErrConflict is treated as a no-op
+	// because the row already exists from a prior deploy). Audit
+	// row emitted per slug for SOC 2 CC7.2 paper trail.
+	if resp.PersistExclude && len(resp.Skipped) > 0 {
+		for _, skipped := range resp.Skipped {
+			// Find the freshly-inserted app_id for this slug (it
+			// exists because reconcile just inserted every
+			// workload as a fresh app row on the apply path).
+			var appID string
+			for _, a := range added {
+				if a.Slug == skipped.Slug {
+					appID = a.ID
+					break
+				}
+			}
+			// The slug is in Skipped but didn't match an added
+			// app — this can happen when the operator excluded an
+			// existing app via --exclude (the audit fix at
+			// TestReconcile_ExcludePreventsRemove covers the
+			// apply-side contract). Lookup the existing app id.
+			if appID == "" {
+				if apps, lerr := s.store.AppsForProject(r.Context(), acct.ID, insertedProject.ID); lerr == nil {
+					for _, a := range apps {
+						if a.Slug == skipped.Slug {
+							appID = a.ID
+							break
+						}
+					}
+				}
+			}
+			row, perr := s.store.CreateDeploymentScopeExclusion(r.Context(), state.DeploymentScopeExclusion{
+				AccountID: acct.ID,
+				ProjectID: insertedProject.ID,
+				AppID:     appID, // empty is allowed: schema has no FK to apps(id)
+				Slug:      skipped.Slug,
+				Reason:    "persisted_via_flag",
+				CreatedBy: "cli", // future: thread actor from the auth context
+			})
+			if perr != nil && perr != state.ErrConflict {
+				// Don't fail the apply on a persist-write miss;
+				// log the error via the audit log and continue.
+				// The apply already succeeded — losing one
+				// persist write is acceptable per the ADR-127 §1
+				// audit-log-is-durable-record posture.
+				s.audit.Emit(r.Context(), "project.scope.excluded", &acct.ID, map[string]any{
+					"project_id":    insertedProject.ID,
+					"workload_name": skipped.Slug,
+					"reason":        "persist_write_failed",
+					"err":           perr.Error(),
+				})
+				continue
+			}
+			// Audit row: only emit when we actually wrote the
+			// row (ErrConflict means it already existed from a
+			// prior deploy).
+			if perr == nil && row.ID != "" {
+				s.audit.Emit(r.Context(), "project.scope.excluded", &acct.ID, map[string]any{
+					"project_id":    insertedProject.ID,
+					"app_id":        row.AppID,
+					"workload_name": row.Slug,
+					"reason":        row.Reason,
+				})
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 

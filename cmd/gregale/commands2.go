@@ -841,6 +841,18 @@ func cmdDeployTarball(args []string) int {
 	// flag when a soft-delete is in play. ADR §3 documents this
 	// as "warning + show-affected opt-in" (not auto-promote).
 	deployShowAffected := fs.Bool("show-affected", false, "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)")
+	// ADR-124 follow-up #3 (PR-B commit 5): --persist-exclude is the
+	// write-side complement to --exclude. When set, the operator's
+	// excluded slugs are recorded into deployment_scope_exclusions
+	// on a successful apply; subsequent deploys without --exclude
+	// honor the persisted set automatically (the apply path folds
+	// them into the engine call's excludeList, see
+	// cmd/apid/scan_service.go::scanService apply-time fallback).
+	// Default OFF — the operator's intent is explicit. The audit
+	// log (kind=project.scope.excluded) is the durable record beyond
+	// the 90-day active window; ADR-127 §1 documents the no-FK
+	// posture.
+	deployPersistExclude := fs.Bool("persist-exclude", false, "record --exclude slugs into deployment_scope_exclusions for future deploys (ADR-124 follow-up #3)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
@@ -1354,7 +1366,7 @@ func cmdDeployTarball(args []string) int {
 				strings.Join(clash, ", ")))
 		}
 		plan, err := client.ScanProject(ctx, openTarball, filepath.Base(*tarball),
-			*projectSlug, prodBranch, 0, onlyList, excludeList)
+			*projectSlug, prodBranch, 0, onlyList, excludeList, *deployPersistExclude)
 		if err != nil {
 			return printErr("Scan failed", err)
 		}
@@ -1380,7 +1392,7 @@ func cmdDeployTarball(args []string) int {
 		}
 		defer func() { _ = openTarball2.Close() }()
 		apply, err := client.ApplyProjectPlan(ctx, plan.PlanToken, openTarball2, filepath.Base(*tarball),
-			*projectSlug, prodBranch, 0, onlyList, excludeList)
+			*projectSlug, prodBranch, 0, onlyList, excludeList, *deployPersistExclude)
 		if err != nil {
 			return printErr("Apply failed", err)
 		}

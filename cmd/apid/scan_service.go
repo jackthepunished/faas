@@ -80,6 +80,13 @@ type scanPlanRequest struct {
 	// Only. intersect(Only, Exclude) is rejected pre-scan with
 	// code="exclude_only_overlap".
 	Exclude map[string]bool
+	// PersistExclude (ADR-124 follow-up #3, PR-B commit 5) is the
+	// write-side complement to Exclude. When true on a successful
+	// apply path, the apply handler calls
+	// CreateDeploymentScopeExclusion per excluded slug, recording
+	// the operator's "I excluded this for the long haul" intent.
+	// Default false. The scan path accepts and ignores.
+	PersistExclude bool
 }
 
 // scanPlanResponse is the body returned by the scan service and
@@ -124,6 +131,16 @@ type scanPlanResponse struct {
 	GateRescuedByExclude bool     `json:"gate_rescued_by_exclude,omitempty"`
 	CanApplyReasons      []string `json:"can_apply_reasons,omitempty"`
 	PlanToken            string   `json:"plan_token"`
+	// PersistExclude (ADR-124 follow-up #3, PR-B commit 5) is the
+	// operator's write-side intent captured from the multipart
+	// persist_exclude field. The scan path accepts and ignores it;
+	// the apply path uses it to decide whether to call
+	// CreateDeploymentScopeExclusion per excluded slug on a
+	// successful apply. Internal — not serialized to JSON
+	// (consumers see the effect via PersistedExclusions on the
+	// response when the persisted set carries forward, and via
+	// audit log rows of kind=project.scope.excluded).
+	PersistExclude bool `json:"-"`
 	// ADR-124 blast-radius partition. WillDeploy + Unaffected
 	// enumerate the scan-workload existence against every non-deleted
 	// app in the account keyed by (RootDir, Name). Skipped is the
@@ -1048,6 +1065,12 @@ func (s *server) scanService(
 		CanApplyPreExclude:   preCanApply,
 		GateRescuedByExclude: gateRescuedByExclude,
 		CanApplyReasons:      reasons,
+		// ADR-124 follow-up #3 (PR-B commit 5): pass the operator's
+		// persist intent through to the apply handler so it can
+		// write the deployment_scope_exclusions rows on a
+		// successful apply. The scan path accepts the field but
+		// does nothing with it (default-OFF posture).
+		PersistExclude: req.PersistExclude,
 		// ADR-124 partition projection. Skipped is the operator --exclude
 		// subset; Unaffected is every account app not in the scan keys;
 		// WillDeploy keeps reposcan's order so the i-alignment with
@@ -1399,12 +1422,13 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 			"Bad multipart", err.Error())
 	}
 	var (
-		sourcePath  string
-		onlySet     = map[string]bool{}
-		excludeSet  = map[string]bool{}
-		projectSlug string
-		prodBranch  = "main"
-		installID   int64
+		sourcePath      string
+		onlySet         = map[string]bool{}
+		excludeSet      = map[string]bool{}
+		projectSlug     string
+		prodBranch      = "main"
+		installID       int64
+		persistExclude  bool
 	)
 	for {
 		part, perr := mr.NextPart()
@@ -1459,6 +1483,15 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 					excludeSet[s] = true
 				}
 			}
+		case "persist_exclude":
+			// ADR-124 follow-up #3 (PR-B commit 5): write-side
+			// flag. The scan path accepts and ignores; the apply
+			// path triggers CreateDeploymentScopeExclusion per
+			// excluded slug on a successful apply. Empty value or
+			// absent field = false (the default-OFF posture).
+			b, _ := io.ReadAll(io.LimitReader(part, 32))
+			v := strings.ToLower(strings.TrimSpace(string(b)))
+			persistExclude = v == "true" || v == "1" || v == "yes"
 		default:
 			_, _ = io.Copy(io.Discard, part)
 		}
@@ -1492,14 +1525,15 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 	}
 
 	return &scanPlanRequest{
-		SourcePath:   sourcePath,
-		SourceSHA256: hash,
-		ScanDir:      scanDir,
-		ProjectSlug:  projectSlug,
-		ProdBranch:   prodBranch,
-		InstallID:    installID,
-		Only:         onlySet,
-		Exclude:      excludeSet,
+		SourcePath:     sourcePath,
+		SourceSHA256:   hash,
+		ScanDir:        scanDir,
+		ProjectSlug:    projectSlug,
+		ProdBranch:     prodBranch,
+		InstallID:      installID,
+		Only:           onlySet,
+		Exclude:        excludeSet,
+		PersistExclude: persistExclude,
 	}, nil
 }
 

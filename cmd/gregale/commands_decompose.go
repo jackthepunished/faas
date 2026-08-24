@@ -60,6 +60,11 @@ func cmdScan(args []string) int {
 	// preview opt in explicitly so the default behaviour for scripts
 	// and CI is unchanged.
 	showAffected := fs.Bool("show-affected", false, "render the WillDeploy + Unaffected tables (ADR-124)")
+	// ADR-124 follow-up #3 (PR-B commit 5): --persist-exclude on
+	// `scan` is a no-op (scan never writes); accepted for symmetry
+	// with `deploy` so a single flag set can be reused across the
+	// scan + apply pair. The handler ignores it on the scan path.
+	persistExclude := fs.Bool("persist-exclude", false, "record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3)")
 	projectSlug := fs.String("project-slug", "", "kebab slug; default = repo dir basename")
 	installID := fs.Int64("install-id", 0, "GitHub install id (with --repo)")
 	prodBranch := fs.String("production-branch", "main", "production branch for the project")
@@ -105,7 +110,7 @@ func cmdScan(args []string) int {
 		return printErr("Could not open source", err)
 	}
 	defer func() { _ = src.Close() }()
-	plan, err := client.ScanProject(ctx, src, sourceName, *projectSlug, *prodBranch, *installID, onlyList, excludeList)
+	plan, err := client.ScanProject(ctx, src, sourceName, *projectSlug, *prodBranch, *installID, onlyList, excludeList, *persistExclude)
 	if err != nil {
 		return printErr("Scan failed", err)
 	}

@@ -404,6 +404,11 @@ var cliCommands = []cliCommand{
 			// docs.gregale.dev territory.
 			{Name: "exclude", Short: "omit workloads (slug, comma-separated; mutex with --only; ADR-124)"},
 			{Name: "show-affected", Short: "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)"},
+			// ADR-124 follow-up #3 (PR-B commit 5): write-side
+			// complement to --exclude. Records excluded slugs into
+			// deployment_scope_exclusions on a successful apply so
+			// subsequent deploys honor the persisted set automatically.
+			{Name: "persist-exclude", Short: "record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3)"},
 		},
 	},
 	{
@@ -733,6 +738,11 @@ var cliCommands = []cliCommand{
 			// completion tables.
 			{Name: "exclude", Short: "omit workloads (slug, comma-separated; mutex with --only; ADR-124)"},
 			{Name: "show-affected", Short: "render the WillDeploy + Unaffected tables (ADR-124)"},
+			// ADR-124 follow-up #3 (PR-B commit 5): symmetric flag
+			// set on scan (no-op on the scan path; the scan handler
+			// ignores persist_exclude). Accepted so a single flag set
+			// is reusable across the scan + apply pair.
+			{Name: "persist-exclude", Short: "record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3)"},
 		},
 	},
 	{
