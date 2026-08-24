@@ -971,6 +971,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// PR-X; the v2 path is deploy/ansible/roles/control_plane_service/
 	// files/meterd.toml.example).
 	const metricsPath = "/metrics"
+	// Issue #571 PR-A2: /readyz probe driven by loop.Health.
+	// Built before the metrics-listener block so the
+	// ControlMuxLite registration below can wire /readyz on
+	// the same mux as /healthz + /metrics. defer stop so the
+	// SIGTERM drain window surfaces in daemon_ready as 0.
+	meterdProbe, meterdStop := BuildReadinessProbe(loop)
+	defer meterdStop()
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
 		if deps.metricsListenAndServe == nil {
@@ -1006,6 +1013,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			w.WriteHeader(code)
 			_ = json.NewEncoder(w).Encode(status)
 		})
+		// Issue #571 PR-A2: /readyz (operator-side, short ASCII
+		// body for the LB scrape). Driven by the same loop.Health
+		// verdict via a 1s adapter goroutine (see
+		// cmd/meterd/readiness.go). Stale tick names surface in
+		// the body reason when the probe is 503. /healthz stays
+		// the rich-JSON path for dashboards.
+		wire.ControlMuxLite(mux, meterdProbe.ReadyFunc(), meterdProbe.ReasonFunc())
 		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
 		srv, err := deps.metricsListenAndServe(cfg.MetricsAddr, mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
 		if err != nil {
