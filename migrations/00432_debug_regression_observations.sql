@@ -1,4 +1,4 @@
--- filename: 00430_debug_regression_observations.sql
+-- filename: 00432_debug_regression_observations.sql
 -- +goose Up
 -- +goose StatementBegin
 

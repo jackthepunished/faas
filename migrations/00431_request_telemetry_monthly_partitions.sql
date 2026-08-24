@@ -1,4 +1,4 @@
--- filename: 00429_request_telemetry_monthly_partitions.sql
+-- filename: 00431_request_telemetry_monthly_partitions.sql
 -- +goose Up
 -- +goose StatementBegin
 
