@@ -83,15 +83,30 @@ const maxForceRestartReasonLen = 64
 var forceRestartReasonShape = regexp.MustCompile(`^[a-z0-9_]*$`)
 
 // forceRestartableStates is the closed set of instance states
-// from which a force-restart is allowed. Anything else (PARKED,
-// PARKED_SCHEDULED, PARKED_FAILED, STOPPED, DELETED, …) returns
+// from which a force-restart is allowed. Only {RUNNING} is
+// eligible — anything else (PARKED, PARKED_SCHEDULED, PARKED_
+// FAILED, STOPPED, DELETED, WAKING, COLD_BOOTING, …) returns
 // 409 instance_not_restartable WITHOUT writing an intent row.
 //
-// Mirrors forceParkableStates at
-// handlers_admin_force_park.go:80-84 exactly. force-restart is
-// operator-initiated against a live instance; an already-parked
-// instance is not eligible (the operator's goal is to wedged-
-// instance recovery, not to do a second Park).
+// This is intentionally TIGHTER than forceParkableStates at
+// handlers_admin_force_park.go:80-84 ({RUNNING, WAKING,
+// COLD_BOOTING}). The engine's state-machine gate at
+// pkg/sched/engine.go:5299 enforces the same {RUNNING}-only
+// posture — Engine.ForceRestart returns
+// state.ErrInstanceNotRunning on the locked re-read when the
+// instance is in WAKING or COLD_BOOTING. If the apid gate
+// accepted WAKING/COLD_BOOTING and the engine rejected them,
+// the operator would see a misleading 202 Accepted (intent row
+// written + pg_notify emitted) followed by a status=failed on
+// polling — silent failure. Restricting the apid gate to
+// {RUNNING} closes that race and matches the operator's actual
+// semantic: "force-restart a wedged live instance".
+//
+// force-park (ParkInstance via Engine.Park) does not have
+// this issue because the state machine at
+// pkg/state/machine.go:62-63 explicitly allows all of
+// {RUNNING, WAKING, COLD_BOOTING} → PARKED transitions, and
+// Engine.ParkWithReason's CanTransition guard accepts them.
 //
 // The map is keyed by the raw instance.state string (the
 // `instances.state` column is a plain text column — see
@@ -101,9 +116,7 @@ var forceRestartReasonShape = regexp.MustCompile(`^[a-z0-9_]*$`)
 // against the raw column value is the same shape the state
 // machine at pkg/state/machine.go:88-95 uses internally.
 var forceRestartableStates = map[string]struct{}{
-	"RUNNING":      {},
-	"WAKING":       {},
-	"COLD_BOOTING": {},
+	"RUNNING": {},
 }
 
 // postForceRestart handles POST /v1/admin/instances/{id}/force-restart.

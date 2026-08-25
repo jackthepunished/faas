@@ -766,6 +766,67 @@ func TestPostForceRestart_TableDriven(t *testing.T) {
 		}
 	})
 
+	t.Run("waking_state_returns_409_no_intent", func(t *testing.T) {
+		// P2d apid gate is intentionally TIGHTER than force-park's
+		// ({RUNNING, WAKING, COLD_BOOTING}); the engine's state-
+		// machine validation at engine.go:5299 rejects non-RUNNING
+		// states, so accepting them at the gate would yield a
+		// misleading 202-then-fail. WAKING instances get 409
+		// instance_not_restartable with NO intent row written.
+		fake := &fakeStoreForIntent{}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "WAKING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		var prob api.Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+			t.Fatalf("decode problem: %v body=%s", err, rec.Body.String())
+		}
+		if prob.Code != "instance_not_restartable" {
+			t.Errorf("code = %q, want instance_not_restartable", prob.Code)
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on 409; got %d calls", len(fake.insertCalls))
+		}
+	})
+
+	t.Run("cold_booting_state_returns_409_no_intent", func(t *testing.T) {
+		// Same as WAKING above — COLD_BOOTING instances are not
+		// eligible for force-restart because the engine's locked
+		// re-read rejects them as state.ErrInstanceNotRunning.
+		fake := &fakeStoreForIntent{}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "COLD_BOOTING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		var prob api.Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+			t.Fatalf("decode problem: %v body=%s", err, rec.Body.String())
+		}
+		if prob.Code != "instance_not_restartable" {
+			t.Errorf("code = %q, want instance_not_restartable", prob.Code)
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on 409; got %d calls", len(fake.insertCalls))
+		}
+	})
+
 	t.Run("store_returns_error_returns_500", func(t *testing.T) {
 		fake := &fakeStoreForIntent{insertErr: errors.New("connection refused")}
 		srv, store, key := newForceHarness(t, fake)
