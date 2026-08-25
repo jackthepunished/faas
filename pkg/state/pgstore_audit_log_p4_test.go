@@ -185,8 +185,9 @@ func TestPgStoreListAuditLog_TargetAccountID_JSONBContainment(t *testing.T) {
 	})
 
 	matched, err := store.ListAuditLog(ctx, state.AuditLogFilter{
-		TargetAccountID: &targetID,
-		Limit:           100,
+		TargetAccountID:  &targetID,
+		IncludeAnonymous: true,
+		Limit:            100,
 	})
 	if err != nil {
 		t.Fatalf("list: %v", err)

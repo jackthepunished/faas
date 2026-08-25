@@ -32,14 +32,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
+func pgStoreOperatorIntent(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
+	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return state.NewPgStore(pool), pool, ctx
+}
+
+func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	// 1. Insert.
 	acct := "11111111-1111-1111-1111-111111111111"
@@ -107,9 +118,7 @@ func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	acct := "11111111-1111-1111-1111-111111111111"
 	actor := "22222222-2222-2222-2222-222222222222"
@@ -143,9 +152,7 @@ func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_GetNotFound(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	_, err := store.GetOperatorIntent(ctx, "deadbeef-dead-beef-dead-beefdeadbeef")
 	if !errors.Is(err, state.ErrOperatorIntentNotFound) {
@@ -154,9 +161,7 @@ func TestPgStore_OperatorIntent_GetNotFound(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
@@ -191,9 +196,7 @@ func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
 //   - a separately-stamped MarkSucceeded row is NOT touched
 //     (terminal rows are not reclaimed — only `running`).
 func TestPgStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, pool, ctx := pgStoreOperatorIntent(t)
 
 	actor := "33333333-3333-3333-3333-333333333333"
 	accountID := "44444444-4444-4444-4444-444444444444"
