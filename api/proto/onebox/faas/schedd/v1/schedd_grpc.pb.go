@@ -33,6 +33,7 @@ const (
 	Schedd_ReportActivity_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
 	Schedd_ParkInstance_FullMethodName          = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
 	Schedd_ForceColdBootNextWake_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ForceColdBootNextWake"
+	Schedd_ForceRestartInstance_FullMethodName  = "/onebox.faas.schedd.v1.Schedd/ForceRestartInstance"
 	Schedd_ListInstanceStats_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
 	Schedd_StreamAppLogs_FullMethodName         = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
 	Schedd_StreamWarmHints_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
@@ -102,6 +103,32 @@ type ScheddClient interface {
 	// deployment has no snapshots — durable no-op). NotFound when
 	// the deployment does not exist. Idempotent.
 	ForceColdBootNextWake(ctx context.Context, in *ForceColdBootNextWakeRequest, opts ...grpc.CallOption) (*ForceColdBootNextWakeResponse, error)
+	// ForceRestartInstance (P2d follow-on) is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive. Distinct from
+	// ForceColdBootNextWake (snapshot flip only, no destroy) and
+	// ParkInstance (park, no snapshot flip). Engine.ForceRestart:
+	//
+	//   - if the locked re-read observes a non-RUNNING state,
+	//     returns ok=false with error_msg="state: instance not in
+	//     running state" (race-loser posture; the customer-driven
+	//     action won the lock — desired end-state achieved, no
+	//     audit-row-repaint needed).
+	//   - on success, fires the destroy (RUNNING → STOPPED via
+	//     transitionWithKind with kind "force_restart"), flips
+	//     warm + init snapshots stale, and returns ok=true with the
+	//     snap IDs marked stale populated.
+	//
+	// Codes: NotFound when the instance_id doesn't exist; FailedPrecondition
+	// when the locked re-read observed a non-RUNNING state AND the
+	// error path is mapped to a gRPC status (the server returns
+	// ok=false on the wire rather than a status error so the
+	// gregalectl CLI can render the cause verbatim). Internal on
+	// unexpected errors (destroy failure surfaces as ok=true +
+	// snap_ids_marked_stale populated + error_msg populated so
+	// the operator learns the partial-success shape).
+	//
+	// Additive per ADR-016.
+	ForceRestartInstance(ctx context.Context, in *ForceRestartInstanceRequest, opts ...grpc.CallOption) (*ForceRestartInstanceResponse, error)
 	// ListInstanceStats returns the per-instance CPU-µs snapshot the
 	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
 	// meterdsamp the per-minute CPU delta from this snapshot and
@@ -355,6 +382,16 @@ func (c *scheddClient) ForceColdBootNextWake(ctx context.Context, in *ForceColdB
 	return out, nil
 }
 
+func (c *scheddClient) ForceRestartInstance(ctx context.Context, in *ForceRestartInstanceRequest, opts ...grpc.CallOption) (*ForceRestartInstanceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceRestartInstanceResponse)
+	err := c.cc.Invoke(ctx, Schedd_ForceRestartInstance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *scheddClient) ListInstanceStats(ctx context.Context, in *ListInstanceStatsRequest, opts ...grpc.CallOption) (*ListInstanceStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListInstanceStatsResponse)
@@ -506,6 +543,32 @@ type ScheddServer interface {
 	// deployment has no snapshots — durable no-op). NotFound when
 	// the deployment does not exist. Idempotent.
 	ForceColdBootNextWake(context.Context, *ForceColdBootNextWakeRequest) (*ForceColdBootNextWakeResponse, error)
+	// ForceRestartInstance (P2d follow-on) is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive. Distinct from
+	// ForceColdBootNextWake (snapshot flip only, no destroy) and
+	// ParkInstance (park, no snapshot flip). Engine.ForceRestart:
+	//
+	//   - if the locked re-read observes a non-RUNNING state,
+	//     returns ok=false with error_msg="state: instance not in
+	//     running state" (race-loser posture; the customer-driven
+	//     action won the lock — desired end-state achieved, no
+	//     audit-row-repaint needed).
+	//   - on success, fires the destroy (RUNNING → STOPPED via
+	//     transitionWithKind with kind "force_restart"), flips
+	//     warm + init snapshots stale, and returns ok=true with the
+	//     snap IDs marked stale populated.
+	//
+	// Codes: NotFound when the instance_id doesn't exist; FailedPrecondition
+	// when the locked re-read observed a non-RUNNING state AND the
+	// error path is mapped to a gRPC status (the server returns
+	// ok=false on the wire rather than a status error so the
+	// gregalectl CLI can render the cause verbatim). Internal on
+	// unexpected errors (destroy failure surfaces as ok=true +
+	// snap_ids_marked_stale populated + error_msg populated so
+	// the operator learns the partial-success shape).
+	//
+	// Additive per ADR-016.
+	ForceRestartInstance(context.Context, *ForceRestartInstanceRequest) (*ForceRestartInstanceResponse, error)
 	// ListInstanceStats returns the per-instance CPU-µs snapshot the
 	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
 	// meterdsamp the per-minute CPU delta from this snapshot and
@@ -724,6 +787,9 @@ func (UnimplementedScheddServer) ParkInstance(context.Context, *ParkInstanceRequ
 func (UnimplementedScheddServer) ForceColdBootNextWake(context.Context, *ForceColdBootNextWakeRequest) (*ForceColdBootNextWakeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForceColdBootNextWake not implemented")
 }
+func (UnimplementedScheddServer) ForceRestartInstance(context.Context, *ForceRestartInstanceRequest) (*ForceRestartInstanceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForceRestartInstance not implemented")
+}
 func (UnimplementedScheddServer) ListInstanceStats(context.Context, *ListInstanceStatsRequest) (*ListInstanceStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListInstanceStats not implemented")
 }
@@ -856,6 +922,24 @@ func _Schedd_ForceColdBootNextWake_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Schedd_ForceRestartInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceRestartInstanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ForceRestartInstance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ForceRestartInstance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ForceRestartInstance(ctx, req.(*ForceRestartInstanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Schedd_ListInstanceStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListInstanceStatsRequest)
 	if err := dec(in); err != nil {
@@ -983,6 +1067,10 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ForceColdBootNextWake",
 			Handler:    _Schedd_ForceColdBootNextWake_Handler,
+		},
+		{
+			MethodName: "ForceRestartInstance",
+			Handler:    _Schedd_ForceRestartInstance_Handler,
 		},
 		{
 			MethodName: "ListInstanceStats",
