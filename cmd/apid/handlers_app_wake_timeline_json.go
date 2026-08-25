@@ -104,17 +104,22 @@ func buildAppWakeTimeline(
 		}
 	}
 
-	// Aggregation — mirrors handlers_dashboard.go:2605-2661 line-for-
-	// line. Two-denominator rule + descending-cutoff break are the
-	// load-bearing invariants from the PR-A review cluster.
-	triggerHist := make(map[string]int)
-	atCapCount := 0
-	wakeCountWithMeta := 0
-	rows := make([]api.WakeTimelineJSONRow, 0, len(instances))
+	// Counter rollup. The two-denominator rule +
+	// descending-cutoff break invariants (PR-A review cluster
+	// findings #4/#5, PR #1031) live in
+	// aggregateWakeTimeline — shared with the HTML page at
+	// renderAppWakeTimeline (handlers_dashboard.go). Row-shape
+	// differences (JSON has additional AtCapacityPresent +
+	// ReadyInMS em-dash sentinel semantics) stay here because
+	// they're a wire-contract concern, not an aggregation
+	// concern.
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	agg := aggregateWakeTimeline(instances, bootMetas, cutoff)
+
+	rows := make([]api.WakeTimelineJSONRow, 0, len(instances))
 	for _, ins := range instances {
 		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
-			break // DESC order — first pre-cutoff row means we're done.
+			break // same descending-break as aggregateWakeTimeline
 		}
 		row := api.WakeTimelineJSONRow{
 			Kind:              "wake.boot_started",
@@ -127,7 +132,6 @@ func buildAppWakeTimeline(
 			row.At = ins.StartedAt.UTC().Format(time.RFC3339)
 		}
 		if meta, hasMeta := bootMetas[ins.WakeID]; hasMeta {
-			wakeCountWithMeta++
 			row.Trigger = meta.Trigger
 			row.QueuedCount = int32(meta.QueuedCount)
 			row.ConcurrencyAtAdmit = int32(meta.ConcurrencyAtAdmit)
@@ -136,30 +140,19 @@ func buildAppWakeTimeline(
 			if meta.ReadyInMS > 0 {
 				row.ReadyInMS = int32(meta.ReadyInMS)
 			}
-			if meta.Trigger != "" {
-				triggerHist[meta.Trigger]++
-			}
-			if meta.AtCapacityPresent && meta.AtCapacity {
-				atCapCount++
-			}
 		}
 		rows = append(rows, row)
-	}
-	wakeCount24h := len(rows)
-	atCapPct := 0.0
-	if wakeCountWithMeta > 0 {
-		atCapPct = float64(atCapCount) / float64(wakeCountWithMeta) * 100
 	}
 	return api.AppWakeTimelineResponse{
 		App: api.WakeTimelineApp{
 			AppID: app.ID,
 			Slug:  app.Slug,
 		},
-		WakeCount24h:      wakeCount24h,
-		WakeCountWithMeta: wakeCountWithMeta,
-		AtCapacityCount:   atCapCount,
-		AtCapacityPct:     atCapPct,
-		TriggerHistogram:  triggerHist, // empty map, not nil — wire shape contract
+		WakeCount24h:      agg.WakeCount24h,
+		WakeCountWithMeta: agg.WakeCountWithMeta,
+		AtCapacityCount:   agg.AtCapacityCount,
+		AtCapacityPct:     agg.AtCapacityPct,
+		TriggerHistogram:  agg.TriggerHistogram, // empty map, not nil — wire shape contract
 		Rows:              rows,
 		AsOf:              time.Now().UTC().Format(time.RFC3339Nano),
 	}, nil

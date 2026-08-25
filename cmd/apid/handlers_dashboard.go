@@ -2602,21 +2602,19 @@ func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, l
 	// header so the customer understands "of N known wakes".
 	// The body table still renders all 24h rows so the per-row
 	// audit trail isn't lossy.
-	triggerHist := make(map[string]int)
-	atCapCount := 0
-	wakeCountWithMeta := 0
-	rows := make([]views.WakeTimelineRow, 0, len(instances))
+	//
+	// Counter math is shared with the JSON mirror at
+	// cmd/apid/handlers_app_wake_timeline_json.go via
+	// aggregateWakeTimeline (review-fix cluster, PR #1097). The
+	// row-shape loop still lives here because the HTML page
+	// emits a different row type (views.WakeTimelineRow, no
+	// JSON sentinels).
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	agg := aggregateWakeTimeline(instances, bootMetas, cutoff)
+
+	rows := make([]views.WakeTimelineRow, 0, len(instances))
 	for _, ins := range instances {
 		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
-			// Instances are returned in DESC order so the
-			// moment we see one before the cutoff we can
-			// break — no further iteration needed. The
-			// prior continue-only implementation walked
-			// the full slice even after every row was
-			// older than the cutoff (PR-A review
-			// finding #4 — comment promised a break but
-			// the code didn't deliver it).
 			break
 		}
 		meta, hasMeta := bootMetas[ins.WakeID]
@@ -2628,36 +2626,24 @@ func (s *server) renderAppWakeTimeline(w http.ResponseWriter, r *http.Request, l
 			row.At = ins.StartedAt.UTC().Format(time.RFC3339)
 		}
 		if hasMeta {
-			wakeCountWithMeta++
 			row.Trigger = meta.Trigger
 			row.QueuedCount = meta.QueuedCount
 			row.ConcurrencyAtAdmit = meta.ConcurrencyAtAdmit
 			row.AtCapacity = meta.AtCapacity
 			row.AtCapacityPresent = meta.AtCapacityPresent
 			row.ReadyInMS = meta.ReadyInMS
-			if meta.Trigger != "" {
-				triggerHist[meta.Trigger]++
-			}
-			if meta.AtCapacityPresent && meta.AtCapacity {
-				atCapCount++
-			}
 		}
 		rows = append(rows, row)
-	}
-	wakeCount24h := len(rows)
-	atCapPct := 0.0
-	if wakeCountWithMeta > 0 {
-		atCapPct = float64(atCapCount) / float64(wakeCountWithMeta) * 100
 	}
 	view := dashboard.WakeTimelinePageData{
 		App: dashboard.AppListItem{
 			Slug: app.Slug,
 		},
-		WakeCount24h:         wakeCount24h,
-		WakeCountWithMeta:    wakeCountWithMeta,
-		AtCapacityCount:      atCapCount,
-		AtCapacityPct:        atCapPct,
-		TriggerHistogramHTML: views.RenderTriggerHistogram(triggerHist),
+		WakeCount24h:         agg.WakeCount24h,
+		WakeCountWithMeta:    agg.WakeCountWithMeta,
+		AtCapacityCount:      agg.AtCapacityCount,
+		AtCapacityPct:        agg.AtCapacityPct,
+		TriggerHistogramHTML: views.RenderTriggerHistogram(agg.TriggerHistogram),
 		RenderTable:          views.RenderWakeTimelineTable(rows),
 	}
 	page := dashboard.Page{
