@@ -33,10 +33,18 @@ import (
 // the default-on state. Production binaries never see this — testOnlyTTY
 // is `nil` in non-test builds (output.go).
 func TestMain(m *testing.M) {
+	previousNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	_ = os.Unsetenv("NO_COLOR")
+	resetNOColorCache()
 	on := true
 	testOnlyTTY = &on
 	code := m.Run()
 	testOnlyTTY = nil
+	if hadNoColor {
+		_ = os.Setenv("NO_COLOR", previousNoColor)
+	} else {
+		_ = os.Unsetenv("NO_COLOR")
+	}
 	os.Exit(code)
 }
 
