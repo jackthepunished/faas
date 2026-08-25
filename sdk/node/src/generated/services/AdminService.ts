@@ -9,6 +9,7 @@ import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js
 import type { BillingPaddleOveragePreflightResponse } from '../models/BillingPaddleOveragePreflightResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
 import type { ConsumeInvoiceResponse } from '../models/ConsumeInvoiceResponse.js';
+import type { ObsHealthResponse } from '../models/ObsHealthResponse.js';
 import type { OperatorIntentAcceptedResponse } from '../models/OperatorIntentAcceptedResponse.js';
 import type { OperatorIntentResponse } from '../models/OperatorIntentResponse.js';
 import type { RekeyProgress } from '../models/RekeyProgress.js';
@@ -577,6 +578,48 @@ export class AdminService {
         401: `code: unauthorized`,
         403: `getOperatorIntent 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
         404: `code: operator_intent_not_found — no operator intent with the supplied id.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Meta-obs health snapshot — audit write rates, outcome-missing counts, trace_id completeness, alert firing count (admin-only).
+   * Operator-side meta-observation endpoint. Composes a single
+   * JSON snapshot from:
+   *
+   * - `audit_log_write_total[5m]` / `audit_log_write_failures_total[5m]` /
+   * `audit_log_coverage_ratio_5m` — apid's own Prometheus
+   * counters (PR #TBD / C5).
+   * - `SELECT kind, count(*) FROM operator_intents WHERE
+   * status = 'running' AND started_at < now() - interval
+   * '5 minutes' GROUP BY kind` — single SQL query.
+   * - `SELECT kind, count(*) FILTER (WHERE trace_id IS NOT
+   * NULL)::float / count(*) FROM events WHERE kind LIKE
+   * 'operator.action.%' AND at > now() - interval '5
+   * minutes' GROUP BY kind` — reads events (live), NOT
+   * audit_log (FK-free post-deletion copy).
+   * - `count(ALERTS{alertstate="firing"})` — Prometheus
+   * Alertmanager integration.
+   *
+   * Federation is out of scope (each daemon owns its own
+   * /metrics); this endpoint is the local apid's view. Kinds
+   * with zero rows in the SQL-derived fields are seeded to
+   * 0 (counts) or 1.0 (ratios, vacuous truth) so the JSON
+   * shape stays stable.
+   *
+   * @returns ObsHealthResponse Health snapshot. Every closed-set field is present.
+   * @throws ApiError
+   */
+  public static getObsHealth(): CancelablePromise<ObsHealthResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/admin/obs/health',
+      errors: {
+        401: `code: unauthorized`,
+        403: `obs health 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

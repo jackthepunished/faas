@@ -191,6 +191,7 @@ export type { MirrorSummaryResponse } from './MirrorSummaryResponse.js';
 export type { OAuthProviderCapability } from './OAuthProviderCapability.js';
 export type { OIDCExchangeRequest } from './OIDCExchangeRequest.js';
 export type { OIDCExchangeResponse } from './OIDCExchangeResponse.js';
+export type { ObsHealthResponse } from './ObsHealthResponse.js';
 export type { OperatorIntentAcceptedResponse } from './OperatorIntentAcceptedResponse.js';
 export type { OperatorIntentResponse } from './OperatorIntentResponse.js';
 export type { OperatorRuntimeConfig } from './OperatorRuntimeConfig.js';
