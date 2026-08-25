@@ -11963,9 +11963,21 @@ func (s *PgStore) DeleteComputeNode(ctx context.Context, id string) error {
 // events with engine-hex IDs without realising the events_subject_idx
 // expects canonical UUIDs, leading to "the row landed but
 // ListEvents(subject=<hex>) returns nothing" — a silent-drop bug
-// that the audit-log PR's MemStore fix specifically ruled out for
-// MemStore. Don't widen the contract.
+// AppendEvent (pre-PR-#TBD shim) delegates to AppendEventWithTrace
+// with traceID=nil. Retained so the existing Store interface stays
+// source-compatible for the many test doubles that only override the
+// four-arg signature.
 func (s *PgStore) AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error {
+	return s.AppendEventWithTrace(ctx, actor, kind, subject, data, nil)
+}
+
+// AppendEventWithTrace writes one row to events with an optional
+// OTel W3C 32-char hex trace_id (migrations/00456). When traceID
+// is nil the column is left NULL — pre-PR rows + cron-fired rows
+// without an inbound trace_id keep that shape. The regex CHECK
+// on events.trace_id is enforced by Postgres on INSERT; a non-hex
+// value surfaces as SQLSTATE 23514 to the caller.
+func (s *PgStore) AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
 	var subj *uuid.UUID
 	if subject != nil {
 		u, err := uuid.Parse(*subject)
@@ -11974,8 +11986,8 @@ func (s *PgStore) AppendEvent(ctx context.Context, actor, kind string, subject *
 		}
 	}
 	_, err := s.pool.Exec(ctx,
-		`insert into events (actor, kind, subject, data) values ($1, $2, $3, $4::jsonb)`,
-		actor, kind, subj, data)
+		`insert into events (actor, kind, subject, trace_id, data) values ($1, $2, $3, $4, $5::jsonb)`,
+		actor, kind, subj, traceID, data)
 	return err
 }
 

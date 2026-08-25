@@ -6606,12 +6606,16 @@ func (m *MemStore) InsertOperatorIntent(
 	actorID string,
 	reason string,
 	metadata json.RawMessage,
+	traceID *string,
 ) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := uuid.NewString()
 	if metadata == nil {
 		metadata = json.RawMessage("{}")
+	}
+	if traceID != nil && !isOTelHex32(*traceID) {
+		return "", fmt.Errorf("state: InsertOperatorIntent: trace_id %q must match ^[0-9a-f]{32}$", *traceID)
 	}
 	m.operatorIntents[id] = OperatorIntent{
 		ID:          id,
@@ -6623,6 +6627,7 @@ func (m *MemStore) InsertOperatorIntent(
 		Metadata:    metadata,
 		Status:      OperatorIntentPending,
 		RequestedAt: time.Now().UTC(),
+		TraceID:     traceID,
 	}
 	return id, nil
 }
@@ -9499,19 +9504,32 @@ func (m *MemStore) OperatorCapacity(_ context.Context) (OperatorCapacitySnapshot
 	return out, nil
 }
 
-// AppendEvent (commit 4) fixes two pre-existing bugs that the audit-log
-// PR surfaced. Before: the row's Subject pointer was dropped on the
-// floor (line 1226-1227 had a dead type-assertion placeholder and
-// the Event literal never set Subject), so ListEvents could never
-// filter by subject. After: parse the string into a *uuid.UUID and
-// copy Data so a caller can reuse the byte slice. The hex form is
-// accepted too (see parseSubjectID).
-func (m *MemStore) AppendEvent(_ context.Context, actor, kind string, subject *string, data []byte) error {
+// AppendEvent (pre-PR-#TBD shim) delegates to AppendEventWithTrace
+// with traceID=nil. Retained for source compatibility with the
+// many test doubles that only override the four-arg signature.
+// The Subject parse + Data copy fixes (parseSubjectID) that landed
+// on main in commit 4 of the audit-log PR are preserved — they
+// live inside AppendEventWithTrace below.
+func (m *MemStore) AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error {
+	return m.AppendEventWithTrace(ctx, actor, kind, subject, data, nil)
+}
+
+// AppendEventWithTrace writes one row to the in-memory events
+// mirror with an optional OTel W3C 32-char hex trace_id. The hex
+// format is validated defensively at the boundary so test doubles
+// cannot accept an invalid value (mirrors the migration CHECK at
+// 00456 for PgStore). When traceID is nil the field is left nil.
+func (m *MemStore) AppendEventWithTrace(_ context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var subj *uuid.UUID
 	if subject != nil {
 		subj = parseSubjectID(*subject)
+	}
+	if traceID != nil {
+		if !isOTelHex32(*traceID) {
+			return fmt.Errorf("state: AppendEventWithTrace: trace_id %q must match ^[0-9a-f]{32}$", *traceID)
+		}
 	}
 	e := Event{
 		ID:      int64(len(m.events) + 1),
@@ -9519,10 +9537,29 @@ func (m *MemStore) AppendEvent(_ context.Context, actor, kind string, subject *s
 		Actor:   actor,
 		Kind:    kind,
 		Subject: subj,
+		TraceID: traceID,
 		Data:    append([]byte(nil), data...),
 	}
 	m.events = append(m.events, e)
 	return nil
+}
+
+// isOTelHex32 returns true when s is exactly 32 lowercase hex
+// characters (the OTel W3C trace-id format enforced by the
+// events.trace_id / operator_intents.trace_id CHECK constraints
+// at migrations/00456). Used by MemStore.AppendEventWithTrace to
+// mirror the migration's invariant without a Postgres round-trip.
+func isOTelHex32(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]Event, error) {

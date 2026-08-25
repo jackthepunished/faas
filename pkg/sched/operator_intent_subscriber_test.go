@@ -86,7 +86,7 @@ func TestInsertClaimMark_Lifecycle(t *testing.T) {
 	acct := "acct-id"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"target-id", &acct, actor, "test reason", json.RawMessage(`{}`),
+		"target-id", &acct, actor, "test reason", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -128,14 +128,14 @@ func TestFIFOClaimOrdering(t *testing.T) {
 
 	first, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"first-target", &acct, actor, "first", nil,
+		"first-target", &acct, actor, "first", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert first: %v", err)
 	}
 	second, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"second-target", &acct, actor, "second", nil,
+		"second-target", &acct, actor, "second", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert second: %v", err)
@@ -180,7 +180,7 @@ func TestMarkFailedLifecycle(t *testing.T) {
 	actor := "actor-id"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"target-id", nil, actor, "test", nil,
+		"target-id", nil, actor, "test", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -233,7 +233,7 @@ func TestPartialSuccess_SnapIDsPersistedOnFailedRow(t *testing.T) {
 	actor := "actor-id"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceRestart,
-		"target-instance-id", nil, actor, "wedged_destroy", nil,
+		"target-instance-id", nil, actor, "wedged_destroy", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -279,7 +279,7 @@ func TestPartialSuccess_SnapIDsPersistedOnFailedRow(t *testing.T) {
 	// case to the partial-success test above).
 	raceID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceRestart,
-		"race-target", nil, actor, "race", nil,
+		"race-target", nil, actor, "race", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert race: %v", err)
@@ -315,7 +315,7 @@ func TestSnapIDsMarkedStale_Persisted(t *testing.T) {
 	actor := "actor-id"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"target-id", nil, actor, "snap stale", nil,
+		"target-id", nil, actor, "snap stale", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -363,7 +363,7 @@ func TestForceRestart_InsertClaimMark_Lifecycle(t *testing.T) {
 	acct := "acct-id"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceRestart,
-		"target-instance-id", &acct, actor, "operator_smoke", json.RawMessage(`{}`),
+		"target-instance-id", &acct, actor, "operator_smoke", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -429,21 +429,21 @@ func TestForceRestart_FIFOOrderingWithExistingKinds(t *testing.T) {
 
 	park, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"park-target", &acct, actor, "park", nil,
+		"park-target", &acct, actor, "park", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert park: %v", err)
 	}
 	coldboot, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"coldboot-target", &acct, actor, "coldboot", nil,
+		"coldboot-target", &acct, actor, "coldboot", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert coldboot: %v", err)
 	}
 	restart, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceRestart,
-		"restart-target", &acct, actor, "restart", nil,
+		"restart-target", &acct, actor, "restart", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert restart: %v", err)

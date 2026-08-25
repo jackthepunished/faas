@@ -47,6 +47,7 @@ func seedOperatorIntent(t *testing.T, store *state.MemStore, actorID, accountID,
 		actorID,
 		"test_reason",
 		nil,
+		nil, // traceID — pre-C6; tests below pin trace_id round-trip explicitly.
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)

@@ -41,7 +41,7 @@ func TestMemStore_OperatorIntent_FullLifecycle(t *testing.T) {
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"33333333-3333-3333-3333-333333333333",
-		&acct, actor, "wedged instance", json.RawMessage(`{}`),
+		&acct, actor, "wedged instance", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -90,7 +90,7 @@ func TestMemStore_OperatorIntent_FIFOClaim(t *testing.T) {
 	// Insert two intents — older first, then newer.
 	first, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"first-target", &acct, actor, "first", nil,
+		"first-target", &acct, actor, "first", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert first: %v", err)
@@ -101,7 +101,7 @@ func TestMemStore_OperatorIntent_FIFOClaim(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	second, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"second-target", &acct, actor, "second", nil,
+		"second-target", &acct, actor, "second", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert second: %v", err)
@@ -137,7 +137,7 @@ func TestMemStore_OperatorIntent_MarkFailed(t *testing.T) {
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"44444444-4444-4444-4444-444444444444", nil, actor, "stale snap", nil,
+		"44444444-4444-4444-4444-444444444444", nil, actor, "stale snap", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -174,7 +174,7 @@ func TestMemStore_OperatorIntent_MarkWithoutClaimReturnsNotFound(t *testing.T) {
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"55555555-5555-5555-5555-555555555555", nil, actor, "no claim", nil,
+		"55555555-5555-5555-5555-555555555555", nil, actor, "no claim", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -215,7 +215,7 @@ func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	stuckID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"66666666-6666-6666-6666-666666666666",
-		&acct, actor, "stuck", nil,
+		&acct, actor, "stuck", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
@@ -228,7 +228,7 @@ func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	terminalID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
 		"77777777-7777-7777-7777-777777777777",
-		&acct, actor, "terminal", nil,
+		&acct, actor, "terminal", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(terminal): %v", err)

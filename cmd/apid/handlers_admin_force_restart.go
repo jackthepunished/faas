@@ -204,6 +204,7 @@ func (s *server) postForceRestart(w http.ResponseWriter, r *http.Request, acct s
 		acct.ID,
 		reason,
 		nil,
+		nil, // traceID — wired by C6 (cmd/apid/handlers_admin_force_restart.go: middleware.TraceIDFrom(r)).
 	)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,

@@ -173,6 +173,7 @@ func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct stat
 		acct.ID,
 		reason,
 		nil,
+		nil, // traceID — wired by C6 (cmd/apid/handlers_admin_force_park.go: middleware.TraceIDFrom(r)).
 	)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,

@@ -59,6 +59,13 @@ var ErrOperatorIntentNotFound = errors.New("state: operator intent not found")
 //
 // Both ids are passed as strings for symmetry with the rest
 // of the pgstore surface (uuid.UUID casts inline below).
+//
+// traceID (PR-#TBD / C2) is the optional OTel W3C 32-char hex
+// trace_id stamped by the apid force-action handler (lifted off
+// the inbound HTTP request by middleware.TraceID). Nil leaves
+// the column NULL — same shape as the pre-PR rows. The regex
+// CHECK at migrations/00456 enforces the format on INSERT; an
+// invalid value surfaces as SQLSTATE 23514 to the caller.
 func (s *PgStore) InsertOperatorIntent(
 	ctx context.Context,
 	kind OperatorIntentKind,
@@ -67,6 +74,7 @@ func (s *PgStore) InsertOperatorIntent(
 	actorID string,
 	reason string,
 	metadata json.RawMessage,
+	traceID *string,
 ) (string, error) {
 	if metadata == nil {
 		metadata = json.RawMessage("{}")
@@ -74,9 +82,9 @@ func (s *PgStore) InsertOperatorIntent(
 	id := uuid.NewString()
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO operator_intents
-		    (id, kind, target_id, account_id, actor_id, reason, metadata, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-	`, id, string(kind), targetID, accountID, actorID, reason, metadata)
+		    (id, kind, target_id, account_id, actor_id, reason, metadata, status, trace_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+	`, id, string(kind), targetID, accountID, actorID, reason, metadata, traceID)
 	if err != nil {
 		return "", fmt.Errorf("state: insert operator_intent: %w", err)
 	}
@@ -111,12 +119,14 @@ func (s *PgStore) ClaimPendingOperatorIntent(ctx context.Context) (OperatorInten
 		startedAt, finishedAt                               *time.Time
 		snapIDsMarkedStale                                  []string
 		requestedAt                                         time.Time
+		traceID                                             *string
 	)
 	row := tx.QueryRow(ctx, `
 		SELECT id, kind, target_id, account_id, actor_id, reason,
 		       metadata::text, status, requested_at, started_at,
 		       finished_at, COALESCE(error, ''),
-		       snap_ids_marked_stale
+		       snap_ids_marked_stale,
+		       trace_id
 		FROM operator_intents
 		WHERE status = 'pending'
 		ORDER BY requested_at ASC
@@ -125,7 +135,7 @@ func (s *PgStore) ClaimPendingOperatorIntent(ctx context.Context) (OperatorInten
 	`)
 	if err := row.Scan(&id, &kindStr, &targetID, &accountID, &actorID, &reason,
 		&metadataStr, new(string), &requestedAt, &startedAt, &finishedAt,
-		&errMsg, &snapIDsMarkedStale); err != nil {
+		&errMsg, &snapIDsMarkedStale, &traceID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return OperatorIntent{}, ErrOperatorIntentNotFound
 		}
@@ -150,7 +160,7 @@ func (s *PgStore) ClaimPendingOperatorIntent(ctx context.Context) (OperatorInten
 	return decodeOperatorIntentRow(id, kindStr, targetID, actorID, reason,
 		accountID, errMsg, startedAt, finishedAt,
 		metadataStr, OperatorIntentRunning, requestedAt,
-		snapIDsMarkedStale), nil
+		snapIDsMarkedStale, traceID), nil
 }
 
 // MarkOperatorIntentSucceeded stamps the row's terminal state.
@@ -232,18 +242,20 @@ func (s *PgStore) GetOperatorIntent(ctx context.Context, id string) (OperatorInt
 		snapIDsMarkedStale                              []string
 		requestedAt                                     time.Time
 		statusStr                                       string
+		traceID                                         *string
 	)
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, kind, target_id, account_id, actor_id, reason,
 		       metadata::text, status, requested_at, started_at,
 		       finished_at, COALESCE(error, ''),
-		       snap_ids_marked_stale
+		       snap_ids_marked_stale,
+		       trace_id
 		FROM operator_intents
 		WHERE id = $1
 	`, id)
 	if err := row.Scan(&id, &kindStr, &targetID, &accountID, &actorID, &reason,
 		&metadataStr, &statusStr, &requestedAt, &startedAt, &finishedAt,
-		&errMsg, &snapIDsMarkedStale); err != nil {
+		&errMsg, &snapIDsMarkedStale, &traceID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return OperatorIntent{}, ErrOperatorIntentNotFound
 		}
@@ -252,7 +264,7 @@ func (s *PgStore) GetOperatorIntent(ctx context.Context, id string) (OperatorInt
 	return decodeOperatorIntentRow(id, kindStr, targetID, actorID, reason,
 		accountID, errMsg, startedAt, finishedAt,
 		metadataStr, OperatorIntentStatus(statusStr), requestedAt,
-		snapIDsMarkedStale), nil
+		snapIDsMarkedStale, traceID), nil
 }
 
 // ReclaimStuckRunningOperatorIntents resets `running` rows
@@ -299,6 +311,7 @@ func decodeOperatorIntentRow(
 	status OperatorIntentStatus,
 	requestedAt time.Time,
 	snapIDsMarkedStale []string,
+	traceID *string,
 ) OperatorIntent {
 	// Fill nullable string fields with empty sentinels — Get claims
 	// these as nil rather than '', so a nil → "" coercion avoids
@@ -324,6 +337,7 @@ func decodeOperatorIntentRow(
 		FinishedAt:         finishedAt,
 		Error:              e,
 		SnapIDsMarkedStale: snapIDsMarkedStale,
+		TraceID:            traceID,
 	}
 }
 

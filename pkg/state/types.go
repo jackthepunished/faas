@@ -1859,6 +1859,13 @@ const (
 // Target_id is free-text (NOT a uuid column) because it is either an
 // instance_id (force_park) OR a deployment_id (force_cold_boot). The
 // kind column disambiguates.
+//
+// TraceID is the OTel W3C 32-char hex identifier shared with the
+// inbound HTTP request (apid) and the terminal outcome audit row
+// (schedd). Lets the operator-action observability layer join
+// alert ↔ action ↔ outcome on one column. Nullable: NULL when
+// the action arrived via a path that did not stamp a trace_id
+// (e.g. legacy cron-fired reclaim_build).
 type OperatorIntent struct {
 	ID                 string
 	Kind               OperatorIntentKind
@@ -1873,6 +1880,7 @@ type OperatorIntent struct {
 	FinishedAt         *time.Time
 	Error              string
 	SnapIDsMarkedStale []string
+	TraceID            *string
 }
 
 // AlertMetric is a closed vocabulary for the metric side of an AlertRule
@@ -2947,12 +2955,23 @@ type InstanceTouch struct {
 }
 
 // Event is one row in the append-only audit log (spec §6.1).
+//
+// TraceID is the OTel W3C 32-char hex trace identifier (when set)
+// that ties this event to the inbound request, the operator_intents
+// row it produced (enqueue ↔ outcome), and any downstream
+// dispatch context. Nullable: pre-PR #TBD rows + cron-fired
+// rows without an inbound trace_id keep NULL. Reads of TraceID
+// stay scoped to paths that explicitly opt in (e.g.
+// ListEventsWithTraceID used by /v1/admin/obs/health); the
+// canonical ListEvents SELECT does not include the column for
+// backwards compatibility with hot-path readers.
 type Event struct {
 	ID      int64
 	At      time.Time
 	Actor   string
 	Kind    string
 	Subject *uuid.UUID
+	TraceID *string
 	Data    json.RawMessage
 }
 

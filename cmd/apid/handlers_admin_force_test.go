@@ -121,6 +121,7 @@ func (f *fakeStoreForIntent) InsertOperatorIntent(
 	accountID *string,
 	actorID, reason string,
 	metadata json.RawMessage,
+	traceID *string,
 ) (string, error) {
 	f.insertCalls = append(f.insertCalls, intentInsertCall{
 		Kind:    kind,
@@ -135,7 +136,7 @@ func (f *fakeStoreForIntent) InsertOperatorIntent(
 	if f.nextIntentID != "" {
 		return f.nextIntentID, nil
 	}
-	return f.inner.InsertOperatorIntent(ctx, kind, targetID, accountID, actorID, reason, metadata)
+	return f.inner.InsertOperatorIntent(ctx, kind, targetID, accountID, actorID, reason, metadata, traceID)
 }
 
 // newForceHarness wires a server with a MemStore + an optional
