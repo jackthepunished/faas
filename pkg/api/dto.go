@@ -5682,6 +5682,18 @@ type ForceColdBootResponse struct {
 	TierWalked         []string `json:"tier_walked"`
 }
 
+// SweepStuckBuildsResponse is the wire shape returned by POST
+// /v1/admin/builds/sweep-stuck (P2c of the operator-side
+// observability mega-PR, Commit 5c). SweptCount is 0 when no
+// rows matched the threshold (the audit row is still emitted
+// so the operator's "I checked" is durable).
+type SweepStuckBuildsResponse struct {
+	OK            bool   `json:"ok"`
+	SweptCount    int    `json:"swept_count"`
+	OlderThanSecs int    `json:"older_than_seconds"`
+	ThresholdISO  string `json:"threshold_iso"`
+}
+
 // ThrottleSuggestionRow is one (route → suggested rate) row in the
 // payload returned by GET /v1/apps/{slug}/throttle-suggestions
 // (ADR-091 D20.5 amendment, issue #881 / PR-E). The recommender is

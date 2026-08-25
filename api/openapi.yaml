@@ -8141,6 +8141,66 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  # P2c of the operator-side observability mega-PR (Commit 5c).
+  # Fleet-level sweep of `builds` rows stuck in 'running' past
+  # the threshold. Calls state.Store.SweepStuckRunningBuilds
+  # directly per user decision (NO builderd gRPC server).
+  /v1/admin/builds/sweep-stuck:
+    post:
+      tags: [admin]
+      operationId: postSweepStuckBuilds
+      summary: Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
+      description: |
+        Operator-side recovery primitive for builder microVMs that
+        crashed (OOM, kernel panic, host reboot) and left their
+        `builds` row in 'running' indefinitely. Mirrors the
+        in-process reaper at pkg/builderd/reaper.go:48 — the
+        operator-facing endpoint is the manual escape hatch for
+        when the reaper's grace period is too long for an
+        incident.
+
+        `?older_than=` is clamped to [1m, 60m] so a fat-fingered
+        "1ns" cannot sweep in-flight builds. Default 15m.
+
+        Audit row: operator.action.reclaim_build with
+        account_id=NULL (fleet-level, not tenant-scoped).
+      parameters:
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+        - in: query
+          name: older_than
+          required: false
+          schema:
+            type: string
+            pattern: '^[0-9]+(ns|us|ms|s|m|h)$'
+            example: 15m
+          description: Threshold duration. Clamped to [1m, 60m]. Default 15m.
+      responses:
+        '200':
+          description: Sweep complete. `swept_count` may be 0 when no rows match the threshold.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SweepStuckBuildsResponse' }
+        '400':
+          description: '`?confirm=true` is missing or `?older_than=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500':
+          description: 'Store call failed (transient PG hiccup; retry with the same threshold).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
@@ -9429,6 +9489,37 @@ components:
             type: string
             enum: [warm, init]
           description: Snapshot tiers walked by Engine.ForceColdBootNextWake. Fixed at [warm, init] per ADR-005.
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
+
+    # P2c of the operator-side observability mega-PR (Commit 5c).
+    # Returned by POST /v1/admin/builds/sweep-stuck on the 200
+    # path. SweptCount may be 0 when no rows match the threshold
+    # — the audit row is still emitted so the operator's "I
+    # checked" is durable.
+    SweepStuckBuildsResponse:
+      description: |
+        Wire shape for POST /v1/admin/builds/sweep-stuck
+        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
+        row is emitted under operator.action.reclaim_build with
+        account_id=NULL (fleet-level sweep, not tenant-scoped).
+      type: object
+      required: [ok, swept_count, older_than_seconds, threshold_iso]
+      properties:
+        ok: { type: boolean, example: true }
+        swept_count:
+          type: integer
+          minimum: 0
+          description: Rows flipped from 'running' to 'failed' with failure_class='timeout'. 0 when none match.
+        older_than_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Effective threshold after parsing ?older_than=. Clamped to [60, 3600].
+        threshold_iso:
+          type: string
+          format: date-time
+          description: RFC 3339 cutoff timestamp (now - older_than).
       x-since: "2026-08"
       x-pr-cluster: "operator-obs-mega"
 

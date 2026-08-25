@@ -1521,6 +1521,13 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
 	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	// P2c (reclaim-stuck-build) — fleet-level sweep that calls
+	// state.Store.SweepStuckRunningBuilds directly (per user
+	// decision, NO builderd gRPC server). ?older_than= is
+	// clamped to [1m, 60m] so a fat-fingered "1ns" cannot sweep
+	// in-flight builds.
+	mux.HandleFunc("POST /v1/admin/builds/sweep-stuck",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postSweepStuckBuilds))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session

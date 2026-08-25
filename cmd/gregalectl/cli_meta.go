@@ -272,6 +272,30 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// P2c of the operator-side observability mega-PR
+		// (Commit 5c). Operator-side build-recovery primitive —
+		// `sweep-stuck` opens a state.Store via FAAS_PG_DSN
+		// and calls state.Store.SweepStuckRunningBuilds
+		// directly (per user decision: NO builderd gRPC
+		// server). The Store method is also called by
+		// pkg/builderd/reaper.go:48 — the CLI path is the
+		// operator's manual escape hatch when the reaper's
+		// grace period is too long for an incident.
+		Name:    dispatchBuilds,
+		DocSlug: "builds",
+		Short:   "Build-recovery primitives (builds sweep-stuck)",
+		Subcommands: []cliSub{
+			{
+				Name:  "sweep-stuck",
+				Short: "Flip every 'running' build row older than the threshold to 'failed/timeout'",
+				Flags: []cliFlag{
+					{Name: "older-than", Short: "threshold duration (clamped to [1m, 60m]; default 15m)"},
+					{Name: "yes", Short: "acknowledge that rows older than the threshold will be flipped (required)"},
+				},
+			},
+		},
+	},
+	{
 		Name:    "manifest",
 		DocSlug: "manifest",
 		Short:   "Operator split-box deployment manifest (manifest validate|render|ansible; issue #911 / ADR-110)",
