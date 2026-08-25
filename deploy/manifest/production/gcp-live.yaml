@@ -128,8 +128,8 @@ postgresql:
   policy: on-boot
 
 release:
-  id: pre-1.0-2bc7988e
-  git_sha: 2bc7988e98b00bc6e700169a5bfe523866b1d915
+  id: pre-1.0-2ca06699
+  git_sha: 2ca066992ce361782c3fa0a88fa3a137dfda2291
   architecture: x86_64
   firecracker_version: 1.7.0
   firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419
