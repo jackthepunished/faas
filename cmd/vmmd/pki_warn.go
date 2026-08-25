@@ -13,10 +13,10 @@
 // gap that vmmd cannot fix on its own — `pki init` would need to know
 // about the rewrite too.
 //
-// Until `pki init` gains the equivalent auto-append (tracked as a
-// follow-up, ADR-115 candidate), vmmd surfaces the mismatch at startup
-// so an operator running `gregale pki init && systemctl start faas-vmmd`
-// sees the gap before traffic starts to fail. The Warn is advisory-only:
+// Until the topology-aware renderer or `pki init --box-role=compute-only
+// --cn=<node> --transport-san=<endpoint>` has issued the equivalent node
+// identity, vmmd surfaces the mismatch at startup so an operator sees the
+// gap before traffic starts to fail. The Warn is advisory-only:
 // it does not change the registered-set behavior and does not change
 // the cert path. vmmd still starts and serves traffic; only the
 // handshake with schedd through the verifier fails when the leaf CN
@@ -122,6 +122,6 @@ func warnIfPkiCNMismatch(cfg ComputeNodeConfig, serverTLS *tls.Config, log *slog
 			"leaf_cn", leafCN,
 			"config_name", name,
 			"registered_name", expected,
-			"fix", "regenerate the leaf with `gregale pki init --cn="+expected+"` (or copy the project's rewrite logic into your pki init script), then SIGHUP faas-vmmd")
+			"fix", "regenerate the compute-only leaves with `gregalectl pki init --box-role=compute-only --cn="+expected+" --transport-san=<private-endpoint>`, then SIGHUP faas-vmmd")
 	}
 }

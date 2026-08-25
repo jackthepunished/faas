@@ -159,12 +159,18 @@ func TestCopyTrustBundleNeverCopiesCAKey(t *testing.T) {
 	}
 	extra := pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}
 	for _, role := range pki.RolesForBox(roleComputeOnly) {
-		if err := pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extra); err != nil {
+		var err error
+		if role.Directory == "vmmd" {
+			err = pki.EnsureLeafWithCNAndSANs(source, role, "fsn-2.faas", caCert, caKey, false, extra)
+		} else {
+			err = pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extra)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
 	destination := filepath.Join(t.TempDir(), "trust")
-	if err := copyTrustBundle(source, destination, roleComputeOnly, extra); err != nil {
+	if err := copyTrustBundle(source, destination, roleComputeOnly, extra, "fsn-2.faas"); err != nil {
 		t.Fatalf("copyTrustBundle: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(destination, "ca", "ca.key")); !os.IsNotExist(err) {
@@ -188,10 +194,10 @@ func TestCopyTrustBundleIssuesMissingEndpointSANLocally(t *testing.T) {
 	}
 	destination := filepath.Join(t.TempDir(), "trust")
 	extra := pki.AltNames{DNSNames: []string{"fsn-3.gregale.dev"}}
-	if err := copyTrustBundle(source, destination, roleComputeOnly, extra); err != nil {
+	if err := copyTrustBundle(source, destination, roleComputeOnly, extra, "fsn-2.faas"); err != nil {
 		t.Fatalf("copyTrustBundle: %v", err)
 	}
-	if err := pki.ValidateTrustBundle(destination, roleComputeOnly, extra); err != nil {
+	if err := pki.ValidateTrustBundleForNode(destination, roleComputeOnly, extra, "fsn-2.faas"); err != nil {
 		t.Fatalf("destination trust bundle: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(destination, "ca", "ca.key")); !os.IsNotExist(err) {
@@ -275,7 +281,13 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, role := range pki.RolesForBox(roleComputeOnly) {
-		if err := pki.EnsureLeafWithSANs(pkiDir, role, caCertObj, caKeyObj, false, pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}); err != nil {
+		var err error
+		if role.Directory == "vmmd" {
+			err = pki.EnsureLeafWithCNAndSANs(pkiDir, role, "fsn-2.faas", caCertObj, caKeyObj, false, pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}})
+		} else {
+			err = pki.EnsureLeafWithSANs(pkiDir, role, caCertObj, caKeyObj, false, pki.AltNames{DNSNames: []string{"fsn-2.gregale.dev"}})
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 	}

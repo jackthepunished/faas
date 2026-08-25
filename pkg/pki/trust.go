@@ -15,6 +15,19 @@ import (
 // CA private key. It is deliberately read-only: a missing or stale leaf is a
 // deployment error rather than an invitation for a remote host to mint one.
 func ValidateTrustBundle(rootDir, hostRole string, extraSANs AltNames) error {
+	return validateTrustBundle(rootDir, hostRole, extraSANs, "")
+}
+
+// ValidateTrustBundleForNode is the topology-aware trust-bundle validator.
+// In addition to the canonical daemon CNs, it requires the vmmd leaves on a
+// compute-only box to use nodeCN. That CN is the compute_nodes identity used
+// by the handshake verifier; accepting the generic vmmd.faas CN here would
+// allow a bundle to pass staging and then be drained by schedd's verifier.
+func ValidateTrustBundleForNode(rootDir, hostRole string, extraSANs AltNames, nodeCN string) error {
+	return validateTrustBundle(rootDir, hostRole, extraSANs, nodeCN)
+}
+
+func validateTrustBundle(rootDir, hostRole string, extraSANs AltNames, nodeCN string) error {
 	roles := RolesForBox(hostRole)
 	if len(roles) == 0 {
 		return fmt.Errorf("pki: no roles for host role %q", hostRole)
@@ -46,6 +59,13 @@ func ValidateTrustBundle(rootDir, hostRole string, extraSANs AltNames) error {
 		}
 		if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
 			return fmt.Errorf("pki: leaf %q is outside its validity window", certPath)
+		}
+		expectedCN := role.CommonName
+		if nodeCN != "" && hostRole == "compute-only" && role.Directory == "vmmd" {
+			expectedCN = nodeCN
+		}
+		if cert.Subject.CommonName != expectedCN {
+			return fmt.Errorf("pki: leaf %q has CN %q; want %q", certPath, cert.Subject.CommonName, expectedCN)
 		}
 		requiredSANs := mergeAltNames(role.AltNames, extraSANs)
 		if !certificateHasSANs(cert, requiredSANs) {

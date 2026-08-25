@@ -273,6 +273,19 @@
          (faas_release_install.stderr | default('')))
       changed_when: true
 
+    - name: Verify the requested release is the active on-host release
+      ansible.builtin.command:
+        argv:
+          - readlink
+          - -f
+          - /opt/faas/current
+      register: faas_active_release
+      changed_when: false
+      failed_when: >-
+        faas_active_release.rc != 0 or
+        (faas_active_release.stdout | trim) !=
+        ('/opt/faas/releases/' ~ faas_join_release_git_sha)
+
     - name: Render the manifest for this exact host
       ansible.builtin.command:
         argv:

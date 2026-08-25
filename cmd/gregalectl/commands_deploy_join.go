@@ -417,7 +417,7 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 	if err != nil {
 		return report, err
 	}
-	if err := pki.ValidateTrustBundle(opts.PKISource, roleComputeOnly, manifestSANs); err != nil {
+	if err := pki.ValidateTrustBundleForNode(opts.PKISource, roleComputeOnly, manifestSANs, report.DatabaseNode); err != nil {
 		if issuanceErr := pki.ValidateIssuanceMaterial(opts.PKISource, roleComputeOnly); issuanceErr != nil {
 			return report, fmt.Errorf("--pki-dir is neither a valid compute trust bundle nor issuable operator PKI: trust validation failed; issuance=%w", issuanceErr)
 		}
@@ -478,7 +478,7 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		return 1, err
 	}
 	trustRoot := filepath.Join(tempRoot, "pki-trust")
-	if err := copyTrustBundle(opts.PKISource, trustRoot, roleComputeOnly, manifestSANs); err != nil {
+	if err := copyTrustBundle(opts.PKISource, trustRoot, roleComputeOnly, manifestSANs, report.DatabaseNode); err != nil {
 		return 3, fmt.Errorf("prepare compute trust bundle: %w", err)
 	}
 	files, err := renderManifestAnsibleFiles(m, tempRoot)
@@ -762,8 +762,8 @@ func joinHostSANs(m *manifest.Manifest, node string) (pki.AltNames, error) {
 	return pki.AltNames{}, fmt.Errorf("manifest does not declare host %q", node)
 }
 
-func copyTrustBundle(source, destination, hostRole string, extraSANs pki.AltNames) error {
-	if err := pki.ValidateTrustBundle(source, hostRole, extraSANs); err != nil {
+func copyTrustBundle(source, destination, hostRole string, extraSANs pki.AltNames, nodeCN string) error {
+	if err := pki.ValidateTrustBundleForNode(source, hostRole, extraSANs, nodeCN); err != nil {
 		if issuanceErr := pki.ValidateIssuanceMaterial(source, hostRole); issuanceErr != nil {
 			return err
 		}
@@ -772,11 +772,17 @@ func copyTrustBundle(source, destination, hostRole string, extraSANs pki.AltName
 			return fmt.Errorf("issue trust bundle CA: %w", issuanceErr)
 		}
 		for _, role := range pki.RolesForBox(hostRole) {
-			if issuanceErr := pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extraSANs); issuanceErr != nil && !errors.Is(issuanceErr, pki.ErrLeafNotExpiringSoon) {
+			var issuanceErr error
+			if hostRole == roleComputeOnly && role.Directory == "vmmd" {
+				issuanceErr = pki.EnsureLeafWithCNAndSANs(source, role, nodeCN, caCert, caKey, false, extraSANs)
+			} else {
+				issuanceErr = pki.EnsureLeafWithSANs(source, role, caCert, caKey, false, extraSANs)
+			}
+			if issuanceErr != nil && !errors.Is(issuanceErr, pki.ErrLeafNotExpiringSoon) {
 				return fmt.Errorf("issue trust bundle leaf %s/%s: %w", role.Directory, role.Filename, issuanceErr)
 			}
 		}
-		if err := pki.ValidateTrustBundle(source, hostRole, extraSANs); err != nil {
+		if err := pki.ValidateTrustBundleForNode(source, hostRole, extraSANs, nodeCN); err != nil {
 			return err
 		}
 	}
