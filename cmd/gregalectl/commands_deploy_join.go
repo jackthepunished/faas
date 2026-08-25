@@ -24,6 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/manifest"
 	"github.com/onebox-faas/faas/pkg/nodejoin"
 	"github.com/onebox-faas/faas/pkg/pki"
+	"github.com/onebox-faas/faas/pkg/releaseinstall"
 )
 
 type deployJoinOptions struct {
@@ -34,6 +35,7 @@ type deployJoinOptions struct {
 	SSHPort            int
 	SSHKey             string
 	ReleaseTarball     string
+	ReleaseGitSHA      string
 	BootstrapBinary    string
 	CosignBinary       string
 	PKISource          string
@@ -68,7 +70,7 @@ var nodeJoinStoreOpener = openNodeJoinStore
 var joinControlPlaneVerifier = verifyAndActivateJoinedNode
 
 func openNodeJoinStore() (nodejoin.Store, func(), error) {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("gregalectl deploy join-node: %w", err)
 	}
@@ -78,6 +80,12 @@ func openNodeJoinStore() (nodejoin.Store, func(), error) {
 // ansiblePlaybookRunner is a process seam for CLI tests. The production path
 // streams Ansible's output so the operator sees exactly which phase failed.
 var ansiblePlaybookRunner = defaultAnsiblePlaybookRunner
+
+// joinReleaseBundleRegistrar is a seam for CLI tests. Production joins
+// register the signed bundle metadata before Ansible can install it, so the
+// host-side release installer can stamp applied_at without racing a missing
+// release_bundles row.
+var joinReleaseBundleRegistrar = registerJoinReleaseBundle
 
 func defaultAnsiblePlaybookRunner(ctx context.Context, workingDir string, args []string) error {
 	cmd := exec.CommandContext(ctx, "ansible-playbook", args...)
@@ -97,6 +105,7 @@ func cmdDeployJoinNode(args []string) int {
 	sshPort := fs.Int("ssh-port", 22, "SSH port for the adopted machine")
 	sshKey := fs.String("ssh-key", "", "optional SSH private key used by Ansible")
 	releaseTarball := fs.String("release-tarball", "", "signed release.tar.gz (required for apply)")
+	releaseGitSHA := fs.String("release-git-sha", "", "optional signed release SHA override when the manifest still points at the prior release")
 	bootstrapBinary := fs.String("bootstrap-binary", "", "Linux/amd64 gregalectl used before the release is installed (required for apply)")
 	cosignBinary := fs.String("cosign-binary", "", "cosign verifier binary staged on the adopted host (required for apply)")
 	pkiSource := fs.String("pki-dir", "", "compute trust-bundle directory containing ca/ca.crt and the compute-only leaves (required for apply)")
@@ -129,6 +138,7 @@ func cmdDeployJoinNode(args []string) int {
 		SSHPort:            *sshPort,
 		SSHKey:             *sshKey,
 		ReleaseTarball:     *releaseTarball,
+		ReleaseGitSHA:      *releaseGitSHA,
 		BootstrapBinary:    *bootstrapBinary,
 		CosignBinary:       *cosignBinary,
 		PKISource:          *pkiSource,
@@ -353,7 +363,12 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 	if m.Release.GitSHA == "" {
 		return report, errors.New("manifest release.git_sha is empty")
 	}
-	report.ReleaseGitSHA = m.Release.GitSHA
+	report.ReleaseGitSHA = strings.TrimSpace(opts.ReleaseGitSHA)
+	if report.ReleaseGitSHA == "" {
+		report.ReleaseGitSHA = m.Release.GitSHA
+	} else if !releaseinstall.ValidGitSHA(report.ReleaseGitSHA) {
+		return report, fmt.Errorf("--release-git-sha %q is not a 40-character lowercase SHA", report.ReleaseGitSHA)
+	}
 	if opts.RepoRoot == "" {
 		opts.RepoRoot = defaultRepoRoot()
 	}
@@ -442,6 +457,13 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 	m, err := manifest.Load(opts.ManifestFile)
 	if err != nil {
 		return 1, err
+	}
+	expectedManifestHash, err := joinManifestHash(opts.ManifestFile)
+	if err != nil {
+		return 3, err
+	}
+	if err := joinReleaseBundleRegistrar(ctx, opts.ReleaseTarball, report.ReleaseGitSHA, expectedManifestHash); err != nil {
+		return 3, fmt.Errorf("register release bundle: %w", err)
 	}
 	builderBaseRef := ""
 	if digest := strings.TrimSpace(m.Release.BuilderBaseDigest); digest != "" {
@@ -561,15 +583,68 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 			return 3, fmt.Errorf("record verifying phase: %w", err)
 		}
 	}
-	expectedManifestHash, err := joinManifestHash(opts.ManifestFile)
-	if err != nil {
-		return 3, err
-	}
 	if err := joinControlPlaneVerifier(ctx, report, expectedManifestHash); err != nil {
 		return 3, fmt.Errorf("control-plane readiness gate: %w", err)
 	}
 	report.Applied = true
 	return 0, nil
+}
+
+func registerJoinReleaseBundle(ctx context.Context, tarballPath, expectedGitSHA, expectedManifestHash string) error {
+	packed, err := os.ReadFile(tarballPath)
+	if err != nil {
+		return fmt.Errorf("read tarball: %w", err)
+	}
+	manifestBytes, err := extractTarballMember(packed, releaseinstall.ManifestName)
+	if err != nil {
+		return fmt.Errorf("read embedded release manifest: %w", err)
+	}
+	var releaseManifest releaseinstall.Manifest
+	if err := json.Unmarshal(manifestBytes, &releaseManifest); err != nil {
+		return fmt.Errorf("decode embedded release manifest: %w", err)
+	}
+	if err := releaseinstall.ValidateManifest(releaseManifest); err != nil {
+		return fmt.Errorf("validate embedded release manifest: %w", err)
+	}
+	if releaseManifest.GitSHA != expectedGitSHA {
+		return fmt.Errorf("embedded release git_sha=%s does not match requested %s", releaseManifest.GitSHA, expectedGitSHA)
+	}
+	if releaseManifest.ManifestHash != expectedManifestHash {
+		return fmt.Errorf("embedded release manifest_hash=%s does not match topology manifest %s", releaseManifest.ManifestHash, expectedManifestHash)
+	}
+
+	pool, err := openPgPoolFromEnv(ctx)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	store := releaseinstall.NewStore(pool)
+	existing, err := store.GetByGitSHA(ctx, expectedGitSHA)
+	if err == nil {
+		if existing.ManifestHash != releaseManifest.ManifestHash || !sameReleaseDaemonHashes(existing.DaemonHashes, releaseManifest.DaemonHashes) {
+			return fmt.Errorf("existing release_bundles row for %s does not match the signed release manifest", expectedGitSHA)
+		}
+		return nil
+	}
+	if !errors.Is(err, releaseinstall.ErrNotFound) {
+		return fmt.Errorf("look up release_bundles: %w", err)
+	}
+	if _, err := store.Insert(ctx, releaseinstall.FromManifest(releaseManifest)); err != nil {
+		return fmt.Errorf("insert release_bundles: %w", err)
+	}
+	return nil
+}
+
+func sameReleaseDaemonHashes(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name, hash := range right {
+		if left[name] != hash {
+			return false
+		}
+	}
+	return true
 }
 
 func refreshNodeJoinLease(ctx context.Context, store nodejoin.Store, nodeName, owner string, ttl time.Duration, done <-chan struct{}) {

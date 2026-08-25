@@ -76,11 +76,12 @@ func TestWithBudget_AttachesReservation(t *testing.T) {
 func TestWithBudget_ChainAddsReservations(t *testing.T) {
 	b := reqbudget.Budget{Total: time.Second, Started: time.Now()}
 	ctx := reqbudget.NewContext(context.Background(), b)
-	dl1, has1 := WithBudget(ctx).Deadline()
+	first := WithBudget(ctx)
+	dl1, has1 := first.Deadline()
 	if !has1 {
 		t.Fatal("first WithBudget: no deadline")
 	}
-	dl2, has2 := WithBudget(WithBudget(ctx)).Deadline()
+	dl2, has2 := WithBudget(first).Deadline()
 	if !has2 {
 		t.Fatal("second WithBudget: no deadline")
 	}

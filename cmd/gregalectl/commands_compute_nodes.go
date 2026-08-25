@@ -102,7 +102,7 @@ func setComputeNodesStoreOpener(fn func() (state.Store, func(), error)) {
 // existing openPgPoolFromEnv helper (commands_release.go:344). The
 // returned close func releases the pool when the caller defers it.
 func openComputeNodesStore() (state.Store, func(), error) {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("gregalectl compute-nodes: %w", err)
 	}

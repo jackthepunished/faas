@@ -64,6 +64,54 @@ func TestDeployJoinValidate_RejectsControlPlane(t *testing.T) {
 	}
 }
 
+func TestDeployJoinValidate_AllowsSignedReleaseOverride(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "deploy/ansible"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/node_join.yml"), []byte("---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const release = "0123456789abcdef0123456789abcdef01234567"
+	report, err := deployJoinValidate(deployJoinOptions{
+		ManifestFile:  manifestPath,
+		Node:          "fsn-2",
+		SSHHost:       "198.51.100.20",
+		ReleaseGitSHA: release,
+		RepoRoot:      repo,
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("deployJoinValidate: %v", err)
+	}
+	if report.ReleaseGitSHA != release {
+		t.Fatalf("ReleaseGitSHA = %q, want %q", report.ReleaseGitSHA, release)
+	}
+}
+
+func TestDeployJoinValidate_RejectsInvalidReleaseOverride(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "deploy/ansible"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/node_join.yml"), []byte("---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := deployJoinValidate(deployJoinOptions{
+		ManifestFile:  manifestPath,
+		Node:          "fsn-2",
+		SSHHost:       "198.51.100.20",
+		ReleaseGitSHA: "not-a-sha",
+		RepoRoot:      repo,
+		DryRun:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--release-git-sha") {
+		t.Fatalf("error = %v, want invalid release override", err)
+	}
+}
+
 func TestOverrideJoinHostVars_UsesProviderSSHOnlyForConnection(t *testing.T) {
 	body := []byte("ansible_host: \"fsn-2.gregale.dev\"\nfaas_box_role: compute-only\n")
 	got := string(overrideJoinHostVars(body, &deployJoinOptions{
@@ -238,11 +286,14 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 
 	oldRunner := ansiblePlaybookRunner
 	oldVerifier := joinControlPlaneVerifier
+	oldRegistrar := joinReleaseBundleRegistrar
 	t.Cleanup(func() {
 		ansiblePlaybookRunner = oldRunner
 		joinControlPlaneVerifier = oldVerifier
+		joinReleaseBundleRegistrar = oldRegistrar
 	})
 	joinControlPlaneVerifier = func(context.Context, *deployJoinReport, string) error { return nil }
+	joinReleaseBundleRegistrar = func(context.Context, string, string, string) error { return nil }
 	var calls [][]string
 	ansiblePlaybookRunner = func(_ context.Context, _ string, args []string) error {
 		calls = append(calls, append([]string(nil), args...))
