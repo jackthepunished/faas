@@ -8214,7 +8214,8 @@ func (m *MemStore) CreateComputeNode(_ context.Context, node ComputeNode) (Compu
 // (issue #98 / ADR-028). vmmd's self-registration calls this at startup
 // — a node that has already been registered has its capacity refreshed
 // and is reactivated (active=true), even if an operator had previously
-// drained it. The loop-then-store mirrors a write-then-map in the
+// drained it. The explicit FromVmmd path below preserves the operator's
+// active decision. The loop-then-store mirrors a write-then-map in the
 // MemStore: cheaper than a SELECT-then-UPDATE for tests that hammer the
 // path. CreatedAt stays monotonic on conflict.
 //
@@ -8261,11 +8262,11 @@ func (m *MemStore) UpsertComputeNodeFromOperator(_ context.Context, node Compute
 }
 
 // UpsertComputeNodeFromVmmd mirrors pgstore's vmmd-side
-// self-registration. On conflict, target_url is preserved (the
-// operator's POSTed value wins); the other fields are taken from
-// the new row. The cold-INSERT case (no existing row) takes
-// target_url from the new row, same shape as
-// UpsertComputeNodeFromOperator — there's nothing to preserve.
+// self-registration. On conflict, target_url and active are preserved
+// (the operator's POSTed value and drain decision win); the other
+// fields are taken from the new row. The cold-INSERT case (no existing
+// row) takes target_url from the new row and starts active, same shape
+// as UpsertComputeNodeFromOperator — there's nothing to preserve.
 //
 // This is the load-bearing fix for the second-box cutover. See
 // pgstore's comment on UpsertComputeNodeFromVmmd for the trap.
@@ -8309,7 +8310,11 @@ func (m *MemStore) upsertComputeNodeLocked(node ComputeNode, preserveTargetURLOn
 	if n.LastHeartbeatAt.IsZero() {
 		n.LastHeartbeatAt = n.CreatedAt
 	}
-	n.Active = true
+	if existing == nil || !preserveTargetURLOnConflict {
+		n.Active = true
+	} else {
+		n.Active = existing.Active
+	}
 	m.computeNodes[n.ID] = n
 	return n, nil
 }

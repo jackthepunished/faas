@@ -11034,7 +11034,8 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 
 // UpsertComputeNodeFromVmmd is the vmmd self-registration write
 // path (cmd/vmmd/register.go). Writes the vmmd-owned resource
-// numbers + re-activates the row. On conflict, target_url is
+// numbers but does not change the operator-controlled active bit.
+// On conflict, target_url is
 // PRESERVED — `coalesce(compute_nodes.target_url,
 // excluded.target_url)` keeps the existing operator-POSTed
 // value intact. The COALESCE handles the cold-INSERT case where
@@ -11077,7 +11078,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true,
+		      active              = compute_nodes.active,
 		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url),
 		      region              = coalesce(compute_nodes.region, excluded.region),
 		      zone                = coalesce(compute_nodes.zone, excluded.zone),

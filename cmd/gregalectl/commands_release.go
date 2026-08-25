@@ -7,7 +7,7 @@
 // PR-3:
 //
 //   gregalectl release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH
-//   gregalectl release install --git-sha SHA [--releases-root PATH] [--node NAME] [--role ROLE]
+//   gregalectl release install --git-sha SHA [--releases-root PATH] [--node NAME] [--role ROLE] [--defer-activation]
 //
 // Dispatcher shape mirrors commands_manifest.go:
 // flag.Parse for the leaf's own flags, subcommand fan-out in
@@ -113,6 +113,8 @@ Flags (install):
   --node NAME           compute_nodes.name to stamp (default:
                         FAAS_NODE_NAME, then hostname; compute-only
                         installs use NAME.faas).
+  --role ROLE            control-plane or compute-only role template.
+  --defer-activation     keep a compute row drained until readiness passes.
 
 Exit codes:
   0  success
@@ -293,7 +295,7 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 // table.
 func cmdReleaseInstall(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregalectl release install --git-sha SHA [--role ROLE]", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release install --git-sha SHA [--role ROLE] [--defer-activation]", "release")
 		return 0
 	}
 	fs := flag.NewFlagSet("release install", flag.ContinueOnError)
@@ -306,6 +308,7 @@ func cmdReleaseInstall(args []string) int {
 	// applies roleTemplating.ApplyFilesystem(role) after the
 	// symlink flip.
 	roleFlag := fs.String("role", "", "box role: control-plane|compute-only (ADR-112). Empty = no role templating.")
+	deferActivation := fs.Bool("defer-activation", false, "keep the compute_nodes row drained after install; the deployment pipeline activates it only after readiness gates")
 	// ADR-113: --legacy-bundle-dir is the sunset path for the old
 	// `copyBinIntoRelease` flow. Empty (default) means use the new
 	// tarball + cosign + SBoM-gated path. When set, the install
@@ -646,6 +649,17 @@ func cmdReleaseInstall(args []string) int {
 			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: upsert compute_nodes: %v\n", cnErr)
 		}
 		return 3
+	}
+	if *deferActivation {
+		// A newly installed node must not become schedulable merely
+		// because its release is on disk. The provider-neutral join
+		// pipeline starts services, runs readiness gates, and activates
+		// this exact row as its final step. Use the returned UUID because
+		// SetComputeNodeActive is intentionally id-keyed in state.Store.
+		if err := state.NewPgStore(openPool).SetComputeNodeActive(context.Background(), cnID, false); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: defer activation: %v\n", err)
+			return 3
+		}
 	}
 	// PR-B (issue #935): the post-mutation role write happens
 	// INSIDE the role-branch else-block above (so idempotent re-runs

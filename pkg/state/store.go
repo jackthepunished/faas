@@ -3367,10 +3367,11 @@ type Store interface {
 	UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error)
 	// UpsertComputeNodeFromVmmd is the vmmd self-registration
 	// write path (cmd/vmmd/register.go). Writes only the
-	// vmmd-owned resource numbers + re-activates the row. ON
+	// vmmd-owned resource numbers and preserves the operator-controlled
+	// active bit. ON
 	// CONFLICT (name) DO UPDATE SET vpcpus, mem_mb,
 	// max_concurrency, admission_ceiling_mb, vcpu_budget,
-	// active=true, target_url = COALESCE(compute_nodes.target_url,
+	// active=compute_nodes.active, target_url = COALESCE(compute_nodes.target_url,
 	// excluded.target_url) — the existing target_url (operator's
 	// POSTed value, or the seed row's value on cold start) is
 	// preserved on conflict. The COALESCE handles the cold-INSERT

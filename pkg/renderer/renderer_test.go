@@ -103,6 +103,34 @@ fleet:
 	}
 }
 
+func TestRenderer_CurrentSymlinkUsesGitSHA(t *testing.T) {
+	dir := t.TempDir()
+	releases := filepath.Join(dir, "releases")
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	if err := os.MkdirAll(filepath.Join(releases, gitSHA), 0o755); err != nil {
+		t.Fatalf("mkdir release: %v", err)
+	}
+	path := fixtureManifest(t, "fsn-1", "single-box")
+	if _, err := Render(RenderOptions{
+		ManifestPath: path,
+		ReleasesRoot: releases,
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got, err := os.Readlink(filepath.Join(dir, "current"))
+	if err != nil {
+		t.Fatalf("Readlink(current): %v", err)
+	}
+	want := filepath.Join(releases, gitSHA)
+	if got != want {
+		t.Fatalf("current = %q, want %q", got, want)
+	}
+}
+
 func TestEndpointSANsIncludesPrivateEndpointAndConfiguredNames(t *testing.T) {
 	sans, err := endpointSANs(manifest.Host{
 		Name:    "fsn-3",
@@ -170,6 +198,44 @@ func TestRenderer_ComputePKIIncludesPrivateEndpointSAN(t *testing.T) {
 	}
 	if !containsString(cert.DNSNames, "vmmd.faas") || !containsString(cert.DNSNames, "fsn-2.gregale.dev") {
 		t.Fatalf("vmmd server SANs = %v, want role and endpoint identities", cert.DNSNames)
+	}
+}
+
+func TestRenderer_PKITrustOnlyDoesNotRequireCAKey(t *testing.T) {
+	dir := t.TempDir()
+	path := fixtureManifest(t, "fsn-2", "compute-only")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body),
+		"    - name: fsn-2\n      role: compute-only\n",
+		"    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n", 1))
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := RenderOptions{
+		ManifestPath: path,
+		Host:         "fsn-2",
+		ReleasesRoot: filepath.Join(dir, "releases"),
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	}
+	if err := os.MkdirAll(filepath.Join(opts.ReleasesRoot, "0123456789abcdef0123456789abcdef01234567"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(opts); err != nil {
+		t.Fatalf("initial Render: %v", err)
+	}
+	caKey := filepath.Join(opts.PKIRootDir, "ca", "ca.key")
+	if err := os.Remove(caKey); err != nil {
+		t.Fatal(err)
+	}
+	opts.PKITrustOnly = true
+	if _, err := Render(opts); err != nil {
+		t.Fatalf("trust-only Render: %v", err)
 	}
 }
 

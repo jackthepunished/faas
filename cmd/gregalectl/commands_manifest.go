@@ -89,6 +89,7 @@ Flags (render):
   --etc-faas-dir DIR       TOML root (default /etc/faas).
   --systemd-dir DIR        systemd unit tree (default /etc/systemd/system).
   --pki-root-dir DIR       PKI root (default /etc/faas/tls).
+  --pki-trust-only         validate existing leaves without requiring the CA private key.
   --cgroup-root DIR        cgroup v2 mount root (default /sys/fs/cgroup).
   --host-san-file PATH     Optional JSON file with per-host SANs.
   --dry-run                Compute all outputs but do not write.
@@ -253,6 +254,7 @@ func cmdManifestRender(args []string) int {
 	etcFaasDir := fs.String("etc-faas-dir", "", "TOML root (default /etc/faas)")
 	systemdDir := fs.String("systemd-dir", "", "systemd unit tree (default /etc/systemd/system)")
 	pkiRootDir := fs.String("pki-root-dir", "", "PKI root (default /etc/faas/tls)")
+	pkiTrustOnly := fs.Bool("pki-trust-only", false, "validate existing PKI leaves without requiring the CA private key")
 	cgroupRoot := fs.String("cgroup-root", "", "cgroup v2 mount root (default /sys/fs/cgroup)")
 	hostSANFile := fs.String("host-san-file", "", "optional JSON file with per-host SANs")
 	dryRun := fs.Bool("dry-run", false, "compute outputs but do not write")
@@ -270,6 +272,7 @@ func cmdManifestRender(args []string) int {
 		EtcFaasDir:   *etcFaasDir,
 		SystemdDir:   *systemdDir,
 		PKIRootDir:   *pkiRootDir,
+		PKITrustOnly: *pkiTrustOnly,
 		CgroupRoot:   *cgroupRoot,
 		HostSANFile:  *hostSANFile,
 		DryRun:       *dryRun,

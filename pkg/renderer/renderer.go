@@ -52,6 +52,12 @@ type RenderOptions struct {
 	// Empty means no extra SANs beyond the manifest endpoint.
 	HostSANFile string
 
+	// PKITrustOnly validates an existing CA public certificate and the
+	// host's already-issued leaves without issuing anything. This is the
+	// required mode for remote compute-node adoption: the CA private key
+	// stays on the control-plane/operator side.
+	PKITrustOnly bool
+
 	// DryRun short-circuits all filesystem writes. The renderer
 	// still validates the manifest + runs the TOML placement check
 	// + computes the sha256s, but every publish is replaced with
@@ -291,7 +297,12 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// PKI outputs here.
 	var pkiOutputs []OutputReport
 	if !opts.DryRun {
-		leafOutputs, err := renderPKI(opts.PKIRootDir, host.Role, extraSANs)
+		var leafOutputs []PKIOutput
+		if opts.PKITrustOnly {
+			leafOutputs, err = renderPKITrustOnly(opts.PKIRootDir, host.Role, extraSANs)
+		} else {
+			leafOutputs, err = renderPKI(opts.PKIRootDir, host.Role, extraSANs)
+		}
 		if err != nil {
 			return report, err
 		}
@@ -374,11 +385,13 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// Install /opt/faas/current symlink. The current symlink is
 	// sibling-of-releases, not inside; pkg/releaseinstall.AtomicFlip
 	// is the same pattern, but the renderer does not import that
-	// package. The release-id segment is the manifest's
-	// release.id (e.g. "v1.4.0-12-gabc1234") — the renderer
-	// doesn't synthesise a git_sha from the manifest.
+	// package. Release bundles are stored under their content-addressed
+	// git_sha directory. The human release ID is metadata only and may
+	// contain a tag/describe string that has no matching directory on
+	// disk. Keep both paths on the same immutable target so an automated
+	// node join cannot render a valid box and then strand its current link.
 	if !opts.DryRun {
-		target := filepath.Join(opts.ReleasesRoot, m.Release.ID)
+		target := filepath.Join(opts.ReleasesRoot, m.Release.GitSHA)
 		currentPath := filepath.Join(filepath.Dir(opts.ReleasesRoot), "current")
 		if err := installCurrentSymlink(currentPath, target); err != nil {
 			return report, err

@@ -66,7 +66,7 @@ type cliFlag struct {
 //   - backup          (init | unseal-rclone | unseal-archive-creds)
 //   - secrets         (init | rotate | status | stamp)
 //   - compute-nodes   (add | list | show | drain | drain-status | activate | force-drain)
-//   - deploy          (add-node)
+//   - deploy          (join-node | add-node)
 //   - trusted-publishers (add | remove | list) — see ADR-058 deviation note in main.go:15
 //   - version         (internal)
 //   - completion      (bash | zsh | fish | powershell) (internal)
@@ -148,6 +148,8 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// Provider-neutral node adoption is the production path. The
+		// legacy add-node surface remains documented for migration only.
 		// Multi-host scale-out gap #2 (companion to gap #1 closed by
 		// compute-nodes add). operator-side coordinator that writes
 		// host_vars/<fqdn>.yml + hosts.ini + commits + ssh bootstrap
@@ -155,8 +157,62 @@ var cliCommands = []cliCommand{
 		// runbook into a single command.
 		Name:    dispatchDeploy,
 		DocSlug: "deploy",
-		Short:   "Fleet topology coordinator (deploy add-node; multi-host scale-out gap #2)",
+		Short:   "Provider-neutral node adoption and fleet topology coordinator",
 		Subcommands: []cliSub{
+			{
+				Name:  "join-fleet",
+				Short: "Adopt a bounded batch of already-created compute hosts",
+				Flags: []cliFlag{
+					{Name: "nodes-file", Short: "YAML/JSON node list (required)"},
+					{Name: "manifest-file", Short: "split-box manifest (required)"},
+					{Name: "artifact-dir", Short: "standard shared join assets"},
+					{Name: "max-parallel", Short: "bounded concurrent joins (default 4)"},
+					{Name: "skip-fleet-preflight", Short: "skip one shared fleet preflight"},
+					{Name: "resume", Short: "resume failed/interrupted joins"},
+					{Name: "continue-on-error", Short: "continue reporting other node failures"},
+					{Name: "dry-run", Short: "validate without contacting hosts"},
+					{Name: "yes", Short: "approve the remote adoption"},
+					{Name: "json", Short: "emit structured JSON"},
+				},
+			},
+			{
+				Name:  "rollback-node",
+				Short: "Drain a join row and record a resumable rollback",
+				Flags: []cliFlag{
+					{Name: "node", Short: "manifest node (required)"},
+					{Name: "lease-ttl", Short: "rollback coordination lease"},
+					{Name: "yes", Short: "confirm the drain"},
+					{Name: "json", Short: "emit structured JSON"},
+				},
+			},
+			{
+				Name:  "join-node",
+				Short: "Adopt an already-created machine: preflight, bootstrap, release, readiness, and control-plane activation",
+				Flags: []cliFlag{
+					{Name: "manifest-file", Short: "split-box manifest (required)"},
+					{Name: "node", Short: "manifest compute-only host name (required)"},
+					{Name: "ssh-host", Short: "SSH address of the already-created machine (required)"},
+					{Name: "ssh-user", Short: "SSH user (default root)"},
+					{Name: "ssh-port", Short: "SSH port (default 22)"},
+					{Name: "ssh-key", Short: "optional SSH private key"},
+					{Name: "release-tarball", Short: "signed release.tar.gz"},
+					{Name: "bootstrap-binary", Short: "Linux bootstrap gregalectl"},
+					{Name: "cosign-binary", Short: "cosign verifier"},
+					{Name: "pki-dir", Short: "compute trust-bundle directory (CA private key is never copied)"},
+					{Name: "sign-key", Short: "image-signing private key"},
+					{Name: "verify-key", Short: "image-signing public key"},
+					{Name: "compute-db-env", Short: "root-only compute DB environment"},
+					{Name: "artifact-dir", Short: "standard directory containing join assets"},
+					{Name: "ansible-vars-file", Short: "optional provider/overlay Ansible vars"},
+					{Name: "skip-fleet-preflight", Short: "skip complete-fleet preflight"},
+					{Name: "resume", Short: "resume an interrupted join job"},
+					{Name: "timeout", Short: "maximum join duration"},
+					{Name: "lease-ttl", Short: "join coordination lease duration"},
+					{Name: "dry-run", Short: "print the plan without contacting the host"},
+					{Name: "yes", Short: "approve the remote adoption"},
+					{Name: "json", Short: "emit structured JSON"},
+				},
+			},
 			{
 				Name:  "add-node",
 				Short: "Add a node to the fleet: write host_vars + hosts.ini + git commit + ssh bootstrap + POST compute_nodes",
@@ -204,6 +260,7 @@ var cliCommands = []cliCommand{
 					{Name: "pki-root-dir", Short: "PKI root (default /etc/faas/tls)"},
 					{Name: "cgroup-root", Short: "cgroup v2 mount root (default /sys/fs/cgroup)"},
 					{Name: "host-san-file", Short: "optional JSON file with per-host SANs"},
+					{Name: "pki-trust-only", Short: "validate existing leaves without the CA private key"},
 					{Name: "dry-run", Short: "compute outputs but do not write"},
 				},
 			},
@@ -243,6 +300,7 @@ var cliCommands = []cliCommand{
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
 					{Name: "node", Short: "compute_nodes.name to stamp (default: FAAS_NODE_NAME, then hostname; compute-only uses NAME.faas)"},
 					{Name: "role", Short: "box role: control-plane|compute-only (ADR-112); empty = no role templating. Reads /etc/faas/first-boot.env's FAAS_BOX_ROLE when unset.", ClosedSet: []string{"", "control-plane", "compute-only"}},
+					{Name: "defer-activation", Short: "keep a compute row drained until readiness gates pass"},
 				},
 			},
 			{

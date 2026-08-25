@@ -253,6 +253,43 @@ func TestEnsureLeafClientExtKeyUsage(t *testing.T) {
 	}
 }
 
+func TestValidateTrustBundleDoesNotNeedCAKey(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	extra := AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}
+	for _, role := range RolesForBox("compute-only") {
+		if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, extra); err != nil {
+			t.Fatalf("EnsureLeafWithSANs(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	_, caKeyPath := CARoot(root)
+	if err := os.Remove(caKeyPath); err != nil {
+		t.Fatalf("remove CA key: %v", err)
+	}
+	if err := ValidateTrustBundle(root, "compute-only", extra); err != nil {
+		t.Fatalf("ValidateTrustBundle: %v", err)
+	}
+}
+
+func TestValidateTrustBundleRejectsMissingTransportSAN(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	for _, role := range RolesForBox("compute-only") {
+		if err := EnsureLeaf(root, role, caCert, caKey, false); err != nil {
+			t.Fatalf("EnsureLeaf(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	if err := ValidateTrustBundle(root, "compute-only", AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}); err == nil {
+		t.Fatal("ValidateTrustBundle succeeded with a missing transport SAN")
+	}
+}
+
 // TestEnsureLeafIncludesLocalDevSANs pins the SAN list: every leaf
 // must carry localhost + 127.0.0.1 + ::1 so single-box tests stay
 // correct. The CommonName (e.g. schedd.faas) is added in addition.

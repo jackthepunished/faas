@@ -69,3 +69,23 @@ func renderPKI(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, e
 	}
 	return out, nil
 }
+
+// renderPKITrustOnly validates an already-issued per-host trust bundle. A
+// compute node must not receive the fleet CA private key and must not be able
+// to mint replacement leaves, so this path never calls EnsureCA or
+// EnsureLeaf. It returns the existing leaf paths for the normal render
+// report, preserving the renderer's idempotence/accounting semantics.
+func renderPKITrustOnly(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, error) {
+	if err := pki.ValidateTrustBundle(rootDir, hostRole, extraSANs); err != nil {
+		return nil, fmt.Errorf("renderer: pki: validate trust bundle: %w", err)
+	}
+	var out []PKIOutput
+	for _, role := range pki.RolesForBox(hostRole) {
+		certPath, keyPath := pki.LeafPaths(rootDir, role)
+		out = append(out,
+			PKIOutput{Path: filepath.ToSlash(certPath), Issued: false},
+			PKIOutput{Path: filepath.ToSlash(keyPath), Issued: false},
+		)
+	}
+	return out, nil
+}
