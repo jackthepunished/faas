@@ -754,7 +754,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// in unit tests that don't wire a real pgxpool; the probe
 	// short-circuits to "pg pool nil (test path)" in that case.
 	scheddProbe, scheddBound := BuildReadinessProbe(ctx, pool, 5*time.Second)
-	scheddBound.MarkBound()
+	// NOTE: scheddBound.MarkBound() is intentionally NOT called
+	// here — see cmd/schedd/readiness.go for why. The flip must
+	// fire inside the serve goroutine, just before gsrv.Serve,
+	// so a panic during the ~465 lines of setup below cannot
+	// leave /readyz reporting ready while no gRPC server is
+	// actually running (PR #1091 review Finding 5).
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
@@ -1219,6 +1224,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", scheddpb.Schedd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		scheddBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 

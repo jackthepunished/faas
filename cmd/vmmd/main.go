@@ -1009,7 +1009,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// BuildReadinessProbe call's failure path (the probe is
 	// ready regardless).
 	vmmdProbe, grpcBound := BuildReadinessProbe()
-	grpcBound.MarkBound()
+	// NOTE: grpcBound.MarkBound() is intentionally NOT called
+	// here — see cmd/vmmd/readiness.go BuildReadinessProbe for
+	// why. The flip must fire inside the serve goroutine, just
+	// before gsrv.Serve, so a panic during the ~90 lines of
+	// setup below cannot leave /readyz reporting ready while
+	// no gRPC server is actually running (PR #1091 review
+	// Finding 5).
 	// CPU cache: a per-instance rate + accumulator over cgroup
 	// usage_usec, fed by runCPUSampleLoop below and consumed by
 	// vmmdgrpc.Server.Stats. issue #279 / PR-B. nil-safe so
@@ -1100,6 +1106,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", vmmdpb.Vmmd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		grpcBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 

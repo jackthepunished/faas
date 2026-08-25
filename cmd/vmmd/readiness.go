@@ -26,6 +26,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -38,8 +39,9 @@ import (
 const devKVM = "/dev/kvm"
 
 // BuildReadinessProbe constructs the vmmd /readyz probe + the
-// grpcBoundSignal the main goroutine flips after the gRPC
-// listener is bound. Returns the probe and the bound-flipper.
+// grpcBoundSignal the main goroutine flips immediately before
+// gsrv.Serve(lis) inside the serve goroutine. Returns the probe
+// and the bound-flipper.
 //
 // Construction-time probe values are evaluated immediately:
 // /dev/kvm is opened (closed on success), and `firecracker` is
@@ -47,6 +49,16 @@ const devKVM = "/dev/kvm"
 // signal to false with the reason as the body. A passing check
 // starts the signal at true so /readyz returns 200 unless the
 // gRPC bind fails later (the only runtime-flipping signal).
+//
+// PR #1091 review Finding 5: the gRPC bound signal MUST flip
+// inside the serve goroutine, immediately before
+// gsrv.Serve(lis). Flipping it earlier (right after
+// deps.listen() returns) leaves a ~90-line window where the
+// daemon reports ready but no gRPC server is actually running —
+// any panic during that window (cpuCache/netCache construction,
+// impl.Register, /metrics endpoint setup, …) leaves the
+// readiness probe stuck at "ready" while /readyz is scraped
+// with no listener.
 func BuildReadinessProbe() (*wire.ReadyzProbe, *grpcBoundSignal) {
 	p := &wire.ReadyzProbe{}
 	p.RegisterSignal(kvmOpenableSignal(), nil)
@@ -98,16 +110,26 @@ func fcBinarySignal() *wire.ReadySignal {
 }
 
 // grpcBoundSignal is a flip-from-outside signal: the vmmd
-// main.go calls MarkBound() after deps.listen() returns a
-// usable net.Listener. Before that flip the probe reports
-// "grpc not yet bound"; after the flip it reports ready.
+// main.go calls MarkBound() immediately before gsrv.Serve(lis)
+// inside the serve goroutine. Before that flip the probe
+// reports "grpc not yet bound"; after the flip it reports
+// ready.
 //
-// Not goroutine-safe — the vmmd boot path is single-threaded
-// until ctx-cancel, and MarkBound is called once during boot.
-// A future race-free refactor would wrap MarkBound in
-// sync.Once.
+// MarkBound is guarded by sync.Once so a panic during the
+// intervening ~90 lines of vmmd setup (BuildReadinessProbe
+// through impl.Register) cannot leave the signal wedged in
+// the not-bound state across a retry, and so a second call
+// from any future second serve-goroutine is a no-op. PR
+// #1091 review Finding 5: previously MarkBound was called
+// right after deps.listen() — between the listen and the
+// actual gsrv.Serve call there are ~90 lines of vmmd setup
+// (cpuCache, netCache, activityTracker, gsrv, impl, Register,
+// optional /metrics endpoint). A panic or early-return during
+// that window would leave /readyz reporting ready even though
+// no gRPC server was actually running.
 type grpcBoundSignal struct {
-	sig *wire.ReadySignal
+	sig  *wire.ReadySignal
+	once sync.Once
 }
 
 // Signal returns the underlying *wire.ReadySignal for
@@ -122,8 +144,12 @@ func (g *grpcBoundSignal) Signal() *wire.ReadySignal {
 }
 
 // MarkBound flips the gRPC bound signal to ready. Called once
-// during boot, after deps.listen() returns. After MarkBound,
-// /readyz returns 200 iff kvm + fc-binary are also ready.
+// during boot, immediately before gsrv.Serve(lis) inside the
+// serve goroutine. After MarkBound, /readyz returns 200 iff
+// kvm + fc-binary are also ready. Idempotent — repeated calls
+// are no-ops.
 func (g *grpcBoundSignal) MarkBound() {
-	g.Signal().Set(true, "")
+	g.once.Do(func() {
+		g.Signal().Set(true, "")
+	})
 }

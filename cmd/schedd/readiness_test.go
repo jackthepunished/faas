@@ -116,6 +116,23 @@ func TestGrpcBoundSignal_MarkBound(t *testing.T) {
 	}
 }
 
+// TestGrpcBoundSignal_MarkBoundIdempotent is the regression test
+// for PR #1091 review Finding 5. The fix moved MarkBound into
+// sync.Once; this test confirms repeated calls do not panic and
+// do not re-flip the signal back to false. The previous shape
+// used a bare Set() — a second call would have been a silent
+// no-op anyway because Set(true,"") on an already-true signal
+// is a no-op, but the contract is now formally documented.
+func TestGrpcBoundSignal_MarkBoundIdempotent(t *testing.T) {
+	_, bound := BuildReadinessProbe(context.Background(), &fakePGPool{}, time.Second)
+	bound.MarkBound()
+	bound.MarkBound() // must not panic
+	bound.MarkBound()
+	if r, _ := bound.Signal().Report(); !r {
+		t.Errorf("after 3× MarkBound: ready = false, want true")
+	}
+}
+
 func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	pool := &fakePGPool{}
 	ctx, cancel := context.WithCancel(context.Background())
