@@ -1,4 +1,4 @@
--- filename: 00431_operator_intents.sql
+-- filename: 00438_operator_intents.sql
 -- +goose Up
 -- ADR-127 / PR #1099 P2 redesign: durable intent queue for
 -- `POST /v1/admin/instances/{id}/force-park` and
@@ -69,7 +69,7 @@
 -- OR a deployment uuid depending on the kind; the kind column
 -- disambiguates.
 --
--- Slot fence: 00431 was claimed for this PR (the 00430-00439
+-- Slot fence: 00438 was claimed for this PR (the 00430-00439
 -- range is fenced per the cross-PR slot gate).
 
 CREATE TABLE IF NOT EXISTS operator_intents (

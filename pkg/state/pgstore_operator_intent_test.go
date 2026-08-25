@@ -17,6 +17,9 @@
 //     ErrOperatorIntentNotFound for missing id.
 //  7. Replay-safe: a second claim after MarkSucceeded returns
 //     ErrOperatorIntentNotFound (the row is terminal).
+//  8. ReclaimStuckRunningOperatorIntents resets rows older
+//     than the threshold back to `pending`, leaves terminal
+//     rows alone, and is idempotent on a second call.
 //
 // Build tag matches the rest of the pgstore tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -27,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -170,5 +174,117 @@ func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
 	}
 	if got.AccountID != nil {
 		t.Errorf("AccountID=%v, want nil for fleet-level", got.AccountID)
+	}
+}
+
+// TestPgStore_OperatorIntent_ReclaimStuckRunning seeds one
+// row in `running`, calls ReclaimStuckRunningOperatorIntents
+// with a threshold older than started_at, then asserts:
+//
+//   - the row's status is back to 'pending' + started_at is
+//     NULL (the reclaim path stamps NULL because the row is
+//     no longer in-flight);
+//   - a follow-up ClaimPendingOperatorIntent picks the same
+//     row up (round-trip into the dispatch path is unblocked);
+//   - a second reclaim with the same threshold returns 0
+//     (idempotency);
+//   - a separately-stamped MarkSucceeded row is NOT touched
+//     (terminal rows are not reclaimed — only `running`).
+func TestPgStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.Open(t)
+	store := state.NewPgStore(pool)
+
+	actor := "33333333-3333-3333-3333-333333333333"
+	accountID := "44444444-4444-4444-4444-444444444444"
+
+	// Stuck-running row: claim it (status -> running,
+	// started_at -> now()), then back-date started_at via a
+	// direct UPDATE so the reclaim threshold (now - 5min)
+	// selects it. We can't time-travel without a direct
+	// UPDATE; the pgstore surface only exposes
+	// Mark{Success,Failed}, both of which transition to a
+	// terminal state and would defeat the test.
+	stuckID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForcePark,
+		"66666666-6666-6666-6666-666666666666",
+		&accountID, actor, "stuck", json.RawMessage(`{}`),
+	)
+	if err != nil {
+		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("ClaimPendingOperatorIntent(stuck): %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE operator_intents SET started_at = now() - INTERVAL '10 minutes' WHERE id = $1`,
+		stuckID); err != nil {
+		t.Fatalf("back-date started_at: %v", err)
+	}
+
+	// Terminal row: insert + claim + MarkSucceeded. The
+	// reclaim must leave this row alone (the WHERE clause
+	// filters on status='running').
+	terminalID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceColdBoot,
+		"77777777-7777-7777-7777-777777777777",
+		&accountID, actor, "terminal", json.RawMessage(`{}`),
+	)
+	if err != nil {
+		t.Fatalf("InsertOperatorIntent(terminal): %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("ClaimPendingOperatorIntent(terminal): %v", err)
+	}
+	if err := store.MarkOperatorIntentSucceeded(ctx, terminalID, []string{"s1"}); err != nil {
+		t.Fatalf("MarkOperatorIntentSucceeded(terminal): %v", err)
+	}
+
+	// Reclaim with a 5-min cutoff — the stuck row's started_at
+	// is 10 min old so it qualifies; the terminal row stays.
+	threshold := time.Now().Add(-5 * time.Minute)
+	n, err := store.ReclaimStuckRunningOperatorIntents(ctx, threshold)
+	if err != nil {
+		t.Fatalf("ReclaimStuckRunningOperatorIntents: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reclaim count = %d, want 1", n)
+	}
+
+	stuck, err := store.GetOperatorIntent(ctx, stuckID)
+	if err != nil {
+		t.Fatalf("GetOperatorIntent(stuck): %v", err)
+	}
+	if stuck.Status != state.OperatorIntentPending {
+		t.Errorf("stuck.Status = %q, want pending", stuck.Status)
+	}
+	if stuck.StartedAt != nil {
+		t.Errorf("stuck.StartedAt = %v, want nil after reclaim", stuck.StartedAt)
+	}
+
+	// Terminal row is untouched.
+	terminal, err := store.GetOperatorIntent(ctx, terminalID)
+	if err != nil {
+		t.Fatalf("GetOperatorIntent(terminal): %v", err)
+	}
+	if terminal.Status != state.OperatorIntentSucceeded {
+		t.Errorf("terminal.Status = %q, want succeeded", terminal.Status)
+	}
+
+	// Idempotency: second reclaim with the same threshold
+	// returns 0 — the stuck row is back to pending and
+	// invisible to the WHERE clause, and the terminal row
+	// was never matched.
+	n2, err := store.ReclaimStuckRunningOperatorIntents(ctx, threshold)
+	if err != nil {
+		t.Fatalf("ReclaimStuckRunningOperatorIntents (idempotent): %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("reclaim idempotent count = %d, want 0", n2)
+	}
+
+	// The reclaimed row is now claimable.
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Errorf("ClaimPendingOperatorIntent after reclaim: %v", err)
 	}
 }

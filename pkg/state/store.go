@@ -2598,7 +2598,7 @@ type Store interface {
 	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
 	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
 
-	// Operator intent queue (PR #1099 P2 redesign / migrations/00431).
+	// Operator intent queue (PR #1099 P2 redesign / migrations/00438).
 	// apid inserts on the two admin recovery endpoints
 	// (POST /v1/admin/instances/{id}/force-park and
 	// POST /v1/admin/apps/{slug}/force-cold-boot), emits
@@ -2625,6 +2625,19 @@ type Store interface {
 	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
 	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error
 	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
+	// ReclaimStuckRunningOperatorIntents resets every operator_intents
+	// row whose status='running' AND whose started_at is older than
+	// threshold back to status='pending' (clearing started_at to NULL)
+	// so the next ClaimPendingOperatorIntent call picks it up. Used by
+	// schedd's operatorIntentStuckRunningTimeout safety tick — without
+	// it, a schedd crash between Claim and Mark* leaves the row stuck
+	// in `running` forever and the intent is silently dropped.
+	//
+	// Returns the number of rows affected. Idempotent: a second call
+	// with the same threshold after the rows have been re-claimed
+	// affects 0 rows. The reclaim is a single UPDATE so the
+	// FOR UPDATE SKIP LOCKED claim path sees a consistent snapshot.
+	ReclaimStuckRunningOperatorIntents(ctx context.Context, threshold time.Time) (int, error)
 
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down

@@ -6169,6 +6169,40 @@ func (m *MemStore) GetOperatorIntent(_ context.Context, id string) (OperatorInte
 	return r, nil
 }
 
+// ReclaimStuckRunningOperatorIntents mirrors
+// PgStore.ReclaimStuckRunningOperatorIntents: walk the map,
+// flip any `running` row whose StartedAt is older than the
+// threshold back to `pending` (clearing StartedAt so the
+// next Claim stamps a fresh value). Returns the count.
+//
+// The MemStore path exists so schedd's safety tick can be
+// unit-tested without spinning up Postgres. The semantics
+// match the pgstore: a row that is already `pending`,
+// `succeeded`, or `failed` is left alone; only rows that
+// have been stuck in `running` for longer than the
+// threshold are reset.
+func (m *MemStore) ReclaimStuckRunningOperatorIntents(_ context.Context, threshold time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int
+	for id, r := range m.operatorIntents {
+		if r.Status != OperatorIntentRunning {
+			continue
+		}
+		if r.StartedAt == nil {
+			continue
+		}
+		if r.StartedAt.After(threshold) {
+			continue
+		}
+		r.Status = OperatorIntentPending
+		r.StartedAt = nil
+		m.operatorIntents[id] = r
+		n++
+	}
+	return n, nil
+}
+
 func (m *MemStore) ListCronsForApp(_ context.Context, appID string) ([]Cron, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

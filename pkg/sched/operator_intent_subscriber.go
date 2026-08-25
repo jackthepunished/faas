@@ -4,7 +4,7 @@
 // Producer: apid's POST /v1/admin/instances/{id}/force-park
 // and POST /v1/admin/apps/{slug}/force-cold-boot handlers
 // insert a row into operator_intents
-// (migrations/00431, status='pending') and emit
+// (migrations/00438, status='pending') and emit
 // db.NotifyOperatorIntent on the wire.
 //
 // Consumer: loop.go's Run() multiplexes db.NotifyOperatorIntent
@@ -88,6 +88,21 @@ const operatorIntentStuckRunningTimeout = 5 * time.Minute
 // `pending` so the next claim picks them up; matches fire-now's
 // stuck-row safety pattern.
 func (l *Loop) drainPendingOperatorIntents(ctx context.Context) {
+	// Reclaim stuck-running rows FIRST. If schedd crashed
+	// mid-dispatch (between Claim and Mark*), the row is
+	// orphaned in `running` and the 30s safety tick is the
+	// only thing that frees it. Doing the reclaim before the
+	// drain means a freshly-reclaimed row is eligible for
+	// claim on this same drain call (no need to wait for the
+	// next tick).
+	if n, err := l.engine.Store().ReclaimStuckRunningOperatorIntents(ctx, time.Now().Add(-operatorIntentStuckRunningTimeout)); err != nil {
+		l.log.Warn("sched: operator_intent: reclaim stuck-running failed",
+			"err", err, "threshold", operatorIntentStuckRunningTimeout.String())
+	} else if n > 0 {
+		l.log.Info("sched: operator_intent: reclaimed stuck-running rows",
+			"count", n, "threshold", operatorIntentStuckRunningTimeout.String())
+	}
+
 	for {
 		intent, err := l.engine.Store().ClaimPendingOperatorIntent(ctx)
 		if errors.Is(err, state.ErrOperatorIntentNotFound) {

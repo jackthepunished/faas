@@ -13,6 +13,10 @@
 //     for missing id.
 //  5. FIFO claim semantics: with two pending rows, the
 //     earlier-requested row is claimed first.
+//  6. ReclaimStuckRunningOperatorIntents resets rows whose
+//     StartedAt is older than the threshold back to
+//     `pending` (StartedAt cleared), leaves terminal rows
+//     alone, and is idempotent.
 //
 // Build tag matches the rest of the memstore tests; no
 // Postgres required.
@@ -178,5 +182,106 @@ func TestMemStore_OperatorIntent_MarkWithoutClaimReturnsNotFound(t *testing.T) {
 	// Mark succeeded on a row that's still pending → error.
 	if err := store.MarkOperatorIntentSucceeded(ctx, id, nil); !errors.Is(err, state.ErrOperatorIntentNotFound) {
 		t.Errorf("MarkSucceeded on pending row: got %v, want ErrOperatorIntentNotFound", err)
+	}
+}
+
+// TestMemStore_OperatorIntent_ReclaimStuckRunning mirrors
+// the pgstore test: claim a row (status -> running, stamps
+// started_at), then assert that
+// ReclaimStuckRunningOperatorIntents:
+//
+//   - flips the row's status back to `pending` with started_at
+//     cleared, when the threshold is in the future (matches
+//     every running row regardless of when it started);
+//   - leaves terminal rows alone (where clause filters on
+//     status='running');
+//   - is idempotent on a second call;
+//   - allows the reclaimed row to be Claimed again.
+//
+// Unlike the pgstore test we don't back-date started_at
+// (the MemStore map is a struct value, not a pointer, and
+// there's no exposed StartedAt setter); using a future
+// threshold achieves the same WHERE-clause match — a row is
+// reclaimed iff status='running' AND started_at IS NOT NULL
+// AND started_at < threshold. A threshold in the future
+// selects every running row.
+func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "22222222-2222-2222-2222-222222222222"
+	acct := "11111111-1111-1111-1111-111111111111"
+
+	stuckID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForcePark,
+		"66666666-6666-6666-6666-666666666666",
+		&acct, actor, "stuck", nil,
+	)
+	if err != nil {
+		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("ClaimPendingOperatorIntent(stuck): %v", err)
+	}
+
+	// Terminal row: insert + claim + MarkSucceeded.
+	terminalID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceColdBoot,
+		"77777777-7777-7777-7777-777777777777",
+		&acct, actor, "terminal", nil,
+	)
+	if err != nil {
+		t.Fatalf("InsertOperatorIntent(terminal): %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("ClaimPendingOperatorIntent(terminal): %v", err)
+	}
+	if err := store.MarkOperatorIntentSucceeded(ctx, terminalID, []string{"s1"}); err != nil {
+		t.Fatalf("MarkOperatorIntentSucceeded(terminal): %v", err)
+	}
+
+	// Future threshold matches the just-claimed row (whose
+	// started_at is roughly time.Now()) because every
+	// started_at is in the past relative to it.
+	threshold := time.Now().Add(time.Minute)
+	n, err := store.ReclaimStuckRunningOperatorIntents(ctx, threshold)
+	if err != nil {
+		t.Fatalf("ReclaimStuckRunningOperatorIntents: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reclaim count = %d, want 1", n)
+	}
+
+	got, err := store.GetOperatorIntent(ctx, stuckID)
+	if err != nil {
+		t.Fatalf("GetOperatorIntent(stuck post-reclaim): %v", err)
+	}
+	if got.Status != state.OperatorIntentPending {
+		t.Errorf("stuck.Status = %q, want pending", got.Status)
+	}
+	if got.StartedAt != nil {
+		t.Errorf("stuck.StartedAt = %v, want nil after reclaim", got.StartedAt)
+	}
+
+	terminal, err := store.GetOperatorIntent(ctx, terminalID)
+	if err != nil {
+		t.Fatalf("GetOperatorIntent(terminal): %v", err)
+	}
+	if terminal.Status != state.OperatorIntentSucceeded {
+		t.Errorf("terminal.Status = %q, want succeeded", terminal.Status)
+	}
+
+	// Idempotency.
+	n2, err := store.ReclaimStuckRunningOperatorIntents(ctx, threshold)
+	if err != nil {
+		t.Fatalf("ReclaimStuckRunningOperatorIntents (idempotent): %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("reclaim idempotent count = %d, want 0", n2)
+	}
+
+	// Reclaimed row is now claimable again.
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Errorf("ClaimPendingOperatorIntent after reclaim: %v", err)
 	}
 }

@@ -12,7 +12,7 @@ import (
 )
 
 // pgstore_operator_intent.go — CRUD for the operator_intents
-// table (migrations/00431, PR #1099 P2 redesign).
+// table (migrations/00438, PR #1099 P2 redesign).
 //
 // Two producers, one consumer:
 //
@@ -231,6 +231,36 @@ func (s *PgStore) GetOperatorIntent(ctx context.Context, id string) (OperatorInt
 		accountID, startedAt, finishedAt, errMsg,
 		metadataStr, OperatorIntentStatus(statusStr), requestedAt,
 		snapIDsMarkedStale), nil
+}
+
+// ReclaimStuckRunningOperatorIntents resets `running` rows
+// older than the threshold back to `pending` so the next
+// ClaimPendingOperatorIntent picks them up. The UPDATE clears
+// started_at because the row is no longer "in-flight" —
+// the next claim will stamp a fresh started_at. The SELECT
+// is intentionally absent: a single statement-update is
+// atomic and avoids the TOCTOU window a SELECT-then-UPDATE
+// pair would open (a row could be MarkSucceeded between
+// the two statements and we'd overwrite the terminal state).
+//
+// Returns the row count via RowsAffected; the caller logs at
+// INFO when the count is non-zero (a steady-state value of 0
+// is expected — the safety tick fires every 30s and only
+// reclaiming rows after the 5min timeout keeps this number
+// small).
+func (s *PgStore) ReclaimStuckRunningOperatorIntents(ctx context.Context, threshold time.Time) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE operator_intents
+		SET status = 'pending',
+		    started_at = NULL
+		WHERE status = 'running'
+		  AND started_at IS NOT NULL
+		  AND started_at < $1
+	`, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("state: reclaim stuck running operator_intent: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // decodeOperatorIntentRow is the shared row → struct
