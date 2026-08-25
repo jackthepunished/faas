@@ -158,6 +158,16 @@ func (f *fakeSinkSchedAPI) ForceColdBootNextWake(context.Context, string) ([]str
 	return nil, nil
 }
 
+// ForceRestart (P2d follow-on to PR #1099) — stub to satisfy
+// the SchedAPI interface; the capacity e2e tests never
+// exercise the ForceRestartInstance RPC path (same precedent
+// as ForceColdBootNextWake above). The capacity publisher
+// never sends this RPC. strictModeFakeSink inherits this
+// method via embedding.
+func (f *fakeSinkSchedAPI) ForceRestart(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+
 // bufconnStreamer is a capacityStreamer backed by a bufconn
 // dialer. Construct one with newBufconnStreamer(t) inside a
 // test and pass it to runCapacityPublishWithStreamer.
