@@ -16,8 +16,8 @@
 //      Failover steps, Rollback, Validation matrix).
 //   3. TestRunbooks_FaasRulesYml_AllUrlsResolve — every
 //      `runbook_url:` line in the Prometheus rules YAML
-//      maps to a file under docs/runbooks/. Closes the
-//      "rename a runbook, forget to update the alert"
+//      maps to a file under docs/{runbooks,ops}/. Closes
+//      the "rename a runbook, forget to update the alert"
 //      failure mode.
 //
 // Companion file: docs_site_smoke_test.go handles the
@@ -185,10 +185,13 @@ func TestRunbooks_GateA_ExistsAndHasRequiredSections(t *testing.T) {
 //
 // This test parses the YAML, walks every alert group,
 // grabs every runbook_url annotation, and asserts each
-// path component (after `docs/runbooks/`) maps to a file
-// under docs/runbooks/. The exact URL form is whatever
-// the YAML encodes — we strip query strings + fragments
-// and resolve relative to the module root.
+// path component (after `docs/runbooks/` OR `docs/ops/`)
+// maps to a file under docs/. The exact URL form is
+// whatever the YAML encodes — we strip query strings +
+// fragments and resolve relative to the module root. The
+// docs/ops/ anchor was added by PR #1099 P3 alongside
+// the new alert-cookbook / escalation / build-queue-stuck
+// cross-cutting runbooks.
 //
 // gopkg.in/yaml.v3 is the same YAML dep the ansible role
 // uses (it's already in go.mod via the Prometheus exporter
@@ -245,9 +248,14 @@ func TestRunbooks_FaasRulesYml_AllUrlsResolve(t *testing.T) {
 			//   2. Absolute filesystem path ("/docs/runbooks/...")
 			//      — anchored to module root.
 			//   3. GitHub absolute URL
-			//      ("https://github.com/<org>/<repo>/blob/main/docs/runbooks/<file>")
-			//      — extract the docs/runbooks/<file> tail and
-			//      resolve against the module root.
+			//      ("https://github.com/<org>/<repo>/blob/main/<docs>/<file>")
+			//      where <docs> is one of {docs/runbooks, docs/ops}.
+			//      Extract the <docs>/<file> tail and resolve
+			//      against the module root. The two prefixes
+			//      are accepted because docs/runbooks/ holds the
+			//      per-alert legacy runbooks and docs/ops/ holds
+			//      the operator cookbook + escalation matrix +
+			//      cross-cutting families added in PR #1099 P3.
 			//
 			// Strip query + fragment first (Prometheus's
 			// runbook_url sometimes has ?params in dashboards).
@@ -256,9 +264,14 @@ func TestRunbooks_FaasRulesYml_AllUrlsResolve(t *testing.T) {
 			resolved := clean
 			if strings.HasPrefix(resolved, "http://") || strings.HasPrefix(resolved, "https://") {
 				// Pull the path component out of the URL.
-				// We don't need a real URL parser — the runbook
-				// anchor is always docs/runbooks/<file>.md.
-				idx := strings.Index(resolved, "docs/runbooks/")
+				// We don't need a real URL parser — look for the
+				// first occurrence of either accepted docs anchor.
+				idx := -1
+				for _, anchor := range []string{"docs/runbooks/", "docs/ops/"} {
+					if i := strings.Index(resolved, anchor); i >= 0 && (idx < 0 || i < idx) {
+						idx = i
+					}
+				}
 				if idx >= 0 {
 					resolved = resolved[idx:]
 				}
