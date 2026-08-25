@@ -1,4 +1,4 @@
--- filename: 00428_node_join_jobs.sql
+-- filename: 00429_node_join_jobs.sql
 -- +goose Up
 -- +goose StatementBegin
 --
