@@ -2887,6 +2887,31 @@ type Store interface {
 	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
 	GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error)
 
+	// OperatorIntentOutcomeMissingCounts (Obs-Meta + Trace-IDs Mega-PR / C7)
+	// powers GET /v1/admin/obs/health. Returns a map of kind → count
+	// for every operator_intents row that is "stuck running": status
+	// is still `running` but started_at is older than threshold. The
+	// map's keys cover the closed set
+	// {force_park, force_cold_boot, force_restart} plus any
+	// zero-count keys the caller asked for — caller-side
+	// initialization pins the operator-action vocabulary so the
+	// handler never has to special-case empty results.
+	OperatorIntentOutcomeMissingCounts(ctx context.Context, threshold time.Time) (map[string]int, error)
+
+	// OperatorActionTraceCompleteness (Obs-Meta + Trace-IDs Mega-PR /
+	// C7) powers GET /v1/admin/obs/health's
+	// trace_id_completeness_ratio tile. Returns a map of kind →
+	// coverage ratio (0.0–1.0) for every events row of kind
+	// LIKE 'operator.action.%' received in the last `since`
+	// window. The ratio is the count of rows where trace_id IS
+	// NOT NULL divided by the total count; when no rows match the
+	// kind, the returned value is 1.0 (vacuous truth — the
+	// completeness ratio is undefined for an empty set, and the
+	// handler surfaces that as 1.0 to avoid a misleading "0%" tile
+	// when nothing has happened in the window). Reads from events
+	// (live), NOT audit_log (FK-free post-deletion evidence copy).
+	OperatorActionTraceCompleteness(ctx context.Context, since time.Time) (map[string]float64, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the

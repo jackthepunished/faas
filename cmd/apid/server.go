@@ -1588,6 +1588,16 @@ func (s *server) handler() http.Handler {
 	// not currently self-register a compute_nodes row at startup.
 	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
+	// Obs-Meta + Trace-IDs Mega-PR / C7 — meta-obs health
+	// endpoint. Answers the operator's "is the obs stack itself
+	// healthy?" question: a JSON snapshot of the audit_log write
+	// counters, the operator_intent outcome-missing count, the
+	// trace_id completeness ratio, and the Prometheus alert
+	// firing count. Same two-layer gate (admin scope + MFA) as
+	// the rest of /v1/admin/obs/*; no MFA bypass for this one
+	// because the snapshot exposes alert-state metadata.
+	mux.HandleFunc("GET /v1/admin/obs/health",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsHealthHandler))))
 
 	// P2a + P2b + P2d — operator recovery primitives. All three
 	// routes mount under requireScope(admin-only) so the admin

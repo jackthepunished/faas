@@ -6743,6 +6743,76 @@ func (m *MemStore) ReclaimStuckRunningOperatorIntents(_ context.Context, thresho
 	return n, nil
 }
 
+// OperatorIntentOutcomeMissingCounts mirrors
+// PgStore.OperatorIntentOutcomeMissingCounts by walking the
+// in-memory operatorIntents map. Same closed-set contract: the
+// map carries every kind that has a stuck-running row; the
+// handler seeds zero-count kinds from its closed-set vocabulary.
+func (m *MemStore) OperatorIntentOutcomeMissingCounts(_ context.Context, threshold time.Time) (map[string]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int)
+	for _, r := range m.operatorIntents {
+		if r.Status != OperatorIntentRunning {
+			continue
+		}
+		if r.StartedAt == nil {
+			continue
+		}
+		if r.StartedAt.After(threshold) {
+			continue
+		}
+		out[string(r.Kind)]++
+	}
+	return out, nil
+}
+
+// OperatorActionTraceCompleteness mirrors
+// PgStore.OperatorActionTraceCompleteness over the in-memory
+// events slice. Mirrors the production events table; audit_log
+// is NOT consulted (audit_log is the post-deletion evidence
+// table, not the live diagnostic surface — see
+// PgStore.OperatorActionTraceCompleteness comment for the
+// ADR-091 §3.7.4 two-surface split).
+//
+// Vacuous-truth rule: kinds with zero rows in the window are
+// ABSENT from the returned map; the handler seeds them to 1.0
+// per the Store interface comment. We do NOT pre-seed here
+// because the in-memory store has no concept of "the closed set
+// of kinds" — that's a policy the handler owns.
+func (m *MemStore) OperatorActionTraceCompleteness(_ context.Context, since time.Time) (map[string]float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type acc struct {
+		total int
+		withT int
+	}
+	agg := make(map[string]*acc)
+	for _, e := range m.events {
+		if len(e.Kind) < 16 || e.Kind[:16] != "operator.action." {
+			continue
+		}
+		if e.At.Before(since) {
+			continue
+		}
+		if _, ok := agg[e.Kind]; !ok {
+			agg[e.Kind] = &acc{}
+		}
+		agg[e.Kind].total++
+		if e.TraceID != nil && *e.TraceID != "" {
+			agg[e.Kind].withT++
+		}
+	}
+	out := make(map[string]float64, len(agg))
+	for kind, a := range agg {
+		if a.total == 0 {
+			continue
+		}
+		out[kind] = float64(a.withT) / float64(a.total)
+	}
+	return out, nil
+}
+
 func (m *MemStore) ListCronsForApp(_ context.Context, appID string) ([]Cron, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

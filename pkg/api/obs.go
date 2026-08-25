@@ -760,3 +760,61 @@ type ObsBuilderHeartbeatRow struct {
 	CPUPct60s     *float64  `json:"cpu_pct_60s,omitempty"`
 	DiskUsedBytes *int64    `json:"disk_used_bytes,omitempty"`
 }
+
+// ObsHealthResponse (Obs-Meta + Trace-IDs Mega-PR / C7) is the
+// body of GET /v1/admin/obs/health. The endpoint exists so the
+// operator can answer "is the obs stack itself healthy?" — a
+// meta-question about the audit / operator-action pipeline,
+// not the customer-facing fleet.
+//
+// Field shape (closed-set):
+//
+//   - AuditLogWriteTotal5m / AuditLogWriteFailures5m: counter
+//     deltas over a 5m window from the apid Prometheus
+//     (`audit_log_write_total` / `audit_log_write_failures_total`,
+//     PR #TBD / C5).
+//   - AuditLogCoverageRatio5m: ratio of audit_log writes with a
+//     non-NULL trace_id over all audit_log writes in the window.
+//     Surfaces the same trace_id completeness metric from the
+//     C5 audit metric set, scoped to all kinds.
+//   - OperatorIntentOutcomeMissingCounts: stuck-running intents
+//     grouped by kind (force_park / force_cold_boot /
+//     force_restart). When the count is non-zero the operator
+//     action pipeline is degraded; the dashboard surfaces this
+//     as a red tile.
+//   - TraceIDCompletenessRatio: per-kind ratio of operator.action.*
+//     events with a non-NULL trace_id over all operator.action.*
+//     events in the window. Kinds with zero rows are seeded to
+//     1.0 (vacuous truth — see Store interface comment).
+//   - AlertsFiring: count of Prometheus alert rules in the firing
+//     state via PromQL ALERTS{alertstate="firing"} (existing
+//     Alertmanager integration).
+//
+// All fields are non-nullable on the wire; absent data is
+// represented as 0 (counters) or 1.0 (ratios), never as null, so
+// the dashboard can render without per-field nil-checks.
+type ObsHealthResponse struct {
+	GeneratedAt                        time.Time          `json:"generated_at"`
+	AuditLogWriteTotal5m               int64              `json:"audit_log_write_total_5m"`
+	AuditLogWriteFailures5m            int64              `json:"audit_log_write_failures_5m"`
+	AuditLogCoverageRatio5m            float64            `json:"audit_log_coverage_ratio_5m"`
+	OperatorIntentOutcomeMissingCounts map[string]int     `json:"operator_intent_outcome_missing_total"`
+	TraceIDCompletenessRatio           map[string]float64 `json:"trace_id_completeness_ratio"`
+	AlertsFiring                       int64              `json:"alerts_firing"`
+}
+
+// ObsHealthKindVocabulary is the closed set of operator-action
+// kinds the /v1/admin/obs/health handler emits to
+// OperatorIntentOutcomeMissingCounts + TraceIDCompletenessRatio.
+// The handler seeds zero-count kinds with 0 (counts) or 1.0
+// (ratios) so the JSON shape is stable. Adding a new kind means
+// appending to this set AND emitting an audit row of the new
+// kind from the matching handler.
+//
+// Exported so cmd/apid (obs_health_query.go) and the test files
+// can reference the closed-set seed without copy-paste.
+var ObsHealthKindVocabulary = []string{
+	"force_park",
+	"force_cold_boot",
+	"force_restart",
+}

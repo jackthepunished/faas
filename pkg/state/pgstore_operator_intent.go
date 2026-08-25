@@ -297,6 +297,97 @@ func (s *PgStore) ReclaimStuckRunningOperatorIntents(ctx context.Context, thresh
 	return int(tag.RowsAffected()), nil
 }
 
+// OperatorIntentOutcomeMissingCounts (Obs-Meta + Trace-IDs Mega-PR /
+// C7) groups every operator_intents row stuck in `running` past
+// the threshold (started_at < threshold) by kind. The query is a
+// single index scan over
+// operator_intents (status, started_at) when present; absent the
+// dedicated index the planner falls back to a seqscan, which is
+// acceptable at the row counts the obs-meta endpoint cares about
+// (admin-only, polled by humans, not on the customer hot path).
+//
+// Returns a map keyed by kind (force_park / force_cold_boot /
+// force_restart); empty rows yield an empty map. The handler
+// merges the result with its closed-set seed to guarantee the
+// response shape stays stable on an empty DB.
+func (s *PgStore) OperatorIntentOutcomeMissingCounts(ctx context.Context, threshold time.Time) (map[string]int, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT kind, count(*)
+		FROM operator_intents
+		WHERE status = 'running'
+		  AND started_at IS NOT NULL
+		  AND started_at < $1
+		GROUP BY kind
+	`, threshold)
+	if err != nil {
+		return nil, fmt.Errorf("state: count stuck running operator_intents: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			return nil, fmt.Errorf("state: scan stuck running operator_intents: %w", err)
+		}
+		out[kind] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate stuck running operator_intents: %w", err)
+	}
+	return out, nil
+}
+
+// OperatorActionTraceCompleteness (Obs-Meta + Trace-IDs Mega-PR /
+// C7) reads the per-kind coverage ratio of trace_id over the live
+// events rows of kind LIKE 'operator.action.%' received in the
+// `since` window. The SELECT uses the count(*) FILTER (WHERE ...)
+// aggregate — Postgres ≥ 9.4 — so the query is a single round-trip
+// per scrape.
+//
+// Source: events table (live, bigint id, append-only). Distinct
+// from audit_log (FK-free, copy-time evidence populated only on
+// account deletion in production): operator action rows live in
+// events because audit.emit() calls store.AppendEventWithTrace
+// (PR #1099's writer-of-record). audit_log is the regulator-grade
+// post-deletion replay surface; events is the live diagnostic
+// surface. ADR-091 §3.7.4 records the two-surface split.
+//
+// The returned map covers every kind that has at least one row in
+// the window. Kinds with zero rows are absent from the map; the
+// handler seeds them to 1.0 (vacuous truth, see Store interface
+// comment) so the JSON shape stays stable.
+func (s *PgStore) OperatorActionTraceCompleteness(ctx context.Context, since time.Time) (map[string]float64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT kind,
+		       CASE WHEN count(*) = 0
+		            THEN 0
+		            ELSE count(*) FILTER (WHERE trace_id IS NOT NULL)::float / count(*)
+		       END AS ratio
+		FROM events
+		WHERE kind LIKE 'operator.action.%'
+		  AND at > $1
+		GROUP BY kind
+	`, since)
+	if err != nil {
+		return nil, fmt.Errorf("state: trace_id completeness ratio: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]float64)
+	for rows.Next() {
+		var kind string
+		var ratio float64
+		if err := rows.Scan(&kind, &ratio); err != nil {
+			return nil, fmt.Errorf("state: scan trace_id completeness ratio: %w", err)
+		}
+		out[kind] = ratio
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate trace_id completeness ratio: %w", err)
+	}
+	return out, nil
+}
+
 // decodeOperatorIntentRow is the shared row → struct
 // converter used by Claim / Get. Scans return string columns
 // from the SQL `text` casts (kind, status) and pointer columns

@@ -3045,6 +3045,15 @@ type AuditLog struct {
 	Actor        string     // optional; "" when the emitter is anonymous
 	ReceivedAt   time.Time
 	Data         json.RawMessage // nullable; verbatim payload at emit time
+	// TraceID is the OTel W3C 32-char hex trace identifier (when
+	// set) that ties this audit_log row to the inbound request, the
+	// operator_intents row it produced, and any downstream dispatch
+	// context. Mirrors Event.TraceID (migrations/00456). Nullable:
+	// pre-PR rows + cron-fired rows without an inbound trace_id keep
+	// NULL. The OperatorActionTraceCompleteness read aggregates the
+	// NOT-NULL ratio over audit_log rows of kind LIKE
+	// 'operator.action.%'.
+	TraceID *string
 }
 
 // DeploymentAuditKind is the closed-set vocabulary enforced by
