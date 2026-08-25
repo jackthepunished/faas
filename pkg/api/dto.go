@@ -3631,6 +3631,51 @@ type WakeTimelineApp struct {
 	URL    string `json:"url,omitempty"`
 }
 
+// AppUsageSummaryResponse is the wire shape for
+// GET /v1/apps/{slug}/usage — per-app billing summary over a
+// caller-supplied window (default: trailing 30d). Plan-gated
+// Hobby+ (AppUsageSummaryAllowed). Free falls through with
+// plan_app_usage_summary_not_allowed.
+//
+// Field-by-field:
+//   - PeriodStart / PeriodEnd: half-open [PeriodStart, PeriodEnd)
+//     window in UTC. Snapped to UTC midnight on the inclusive end
+//     (the handler clamps; this struct just records what was
+//     rolled up).
+//   - MBSeconds + GBHours: rollup of usage_minutes.mb_seconds for
+//     this app in the window. GBHours is the rounded float
+//     (6-decimal precision — mirrors MonthlyUsageGB's rounding).
+//   - Requests / TxBytes: cumulative HTTP activity (informational).
+//   - BuilderSeconds: cumulative builder-microVM CPU-time
+//     (informational — surfaced as a sidebar line on the dashboard).
+//   - ColdBootCount: WAKE_RESTORE→WAKE_COLD_BOOT transitions.
+//   - PlanIncludedGBHours: echoed from acct.Plan.PlanIncludedGBHours()
+//     so the dashboard can render the included-band badge without
+//     a second round-trip.
+//   - OverageGBHours: max(0, gb_hours - plan_included). 0 when
+//     gb_hours ≤ plan_included. The dashboard renders this as the
+//     red overage chip; the Stripe pusher bills it at €0.01/GB-h.
+//   - Source: "usage_minutes" today (after the 30d retention cap).
+//     "usage_daily" / "mixed" land with the trail-period reader
+//     follow-up — same wire shape, no migration needed.
+//   - AsOf: RFC3339Nano UTC stamping the envelope's authoritative
+//     "as of" instant.
+type AppUsageSummaryResponse struct {
+	Slug                string    `json:"slug"`
+	PeriodStart         time.Time `json:"period_start"`
+	PeriodEnd           time.Time `json:"period_end"`
+	MBSeconds           int64     `json:"mb_seconds"`
+	GBHours             float64   `json:"gb_hours"`
+	Requests            int64     `json:"requests"`
+	TxBytes             int64     `json:"tx_bytes"`
+	BuilderSeconds      float64   `json:"builder_seconds"`
+	ColdBootCount       int64     `json:"cold_boot_count"`
+	PlanIncludedGBHours float64   `json:"plan_included_gb_hours"`
+	OverageGBHours      float64   `json:"overage_gb_hours"`
+	Source              string    `json:"source"`
+	AsOf                string    `json:"as_of"`
+}
+
 // WakeTimelineJSONRow is one row of AppWakeTimelineResponse.Rows.
 // Mirrors pkg/dashboard/views.WakeTimelineRow's fields so the JSON
 // mirror can render the same dashboard page 1:1 — the only

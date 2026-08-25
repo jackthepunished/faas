@@ -916,6 +916,12 @@ func (s *server) handler() http.Handler {
 	// {wake_id}/timeline below — that's issue #517 / PR-C, this is
 	// the per-app rollup mirror.
 	mux.HandleFunc("GET /v1/apps/{slug}/wake-timeline", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppWakeTimeline)))
+	// Per-app billing usage summary (commit 4 of the per-app
+	// observability PR series). Same auth chain as the other
+	// Hobby+-gated surfaces (read-only, no MFA, IDOR-safe via
+	// loadApp). Plan-gated Hobby+ via AppUsageSummaryAllowed —
+	// same 402 contract as /metrics and /wake-timeline.
+	mux.HandleFunc("GET /v1/apps/{slug}/usage", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppUsage)))
 	// ADR-093: per-route observability reader. Same auth chain
 	// as /v1/apps/{slug}/metrics (read-only, no MFA, primary
 	// caller is an API key with ScopesReadSurface). The handler
