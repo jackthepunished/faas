@@ -305,20 +305,6 @@ func rotateRestartHint(daemon string) string {
 		"   Other daemons (gatewayd-internal, meterd, githubd, builderd): systemctl reload faas-<daemon>  # PR-E rotation deferred to Tier A10"
 }
 
-// ensureAllLeaves iterates the role set returned by
-// pki.RolesForBox(boxRole) (or pki.Roles() when boxRole=="") and
-// ensures each leaf is present. Returns the count of freshly-written
-// leaves, the count of leaves skipped (NotAfter > ReissueThreshold),
-// and a slice of per-leaf errors (the caller decides whether the
-// aggregate counts as success).
-//
-// boxRole is the Gate-B PR-3 per-box PKI subset selector; passing ""
-// preserves the pre-Gate-B posture (every leaf for every daemon,
-// which is the canonical single-box dev/lima shape).
-func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, boxRole string) (int, int, []error) {
-	return ensureAllLeavesWithIdentity(rootDir, caCert, caKey, force, boxRole, "", pki.AltNames{})
-}
-
 type pkiIdentityOptions struct {
 	nodeCN       string
 	transportSAN pki.AltNames
@@ -366,9 +352,8 @@ func ensureAllLeavesWithIdentity(rootDir string, caCert *x509.Certificate, caKey
 	return written, skipped, errs
 }
 
-// ensureAllLeavesFiltered is ensureAllLeaves with an optional --daemon
-// scope. daemon="" iterates every role (delegates to ensureAllLeaves);
-// daemon="<dir>" matches role.Directory == dir PLUS one cross-directory
+// ensureAllLeavesFilteredWithIdentity iterates every role, with an optional
+// --daemon scope. daemon="<dir>" matches role.Directory == dir PLUS one cross-directory
 // carve-out for the egress pair: when daemon=="egress", the meterd
 // client leaf (Directory=meterd, Filename=egress-client) is also
 // included because the egress server's CN (egress.faas) is paired with
@@ -381,10 +366,6 @@ func ensureAllLeavesWithIdentity(rootDir string, caCert *x509.Certificate, caKey
 // the per-box filter are eligible for the --daemon narrowing; this is
 // how `gregalectl pki rotate --box-role=compute-only --daemon=imaged`
 // would only rotate the imaged server leaf on fsn-2.
-func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon string, boxRole string) (int, int, []error) {
-	return ensureAllLeavesFilteredWithIdentity(rootDir, caCert, caKey, force, daemon, boxRole, "", pki.AltNames{})
-}
-
 func ensureAllLeavesFilteredWithIdentity(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon, boxRole, nodeCN string, extraSANs pki.AltNames) (int, int, []error) {
 	if daemon == "" {
 		return ensureAllLeavesWithIdentity(rootDir, caCert, caKey, force, boxRole, nodeCN, extraSANs)
