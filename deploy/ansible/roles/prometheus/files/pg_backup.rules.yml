@@ -10,7 +10,7 @@
 # degrading silently — the cluster keeps running but the off-host
 # recovery point slides into the local archive's retention window.
 #
-# Runbook: docs/runbooks/PostgresBackup.md.
+# Runbook: docs/ops/PostgresBackup.md.
 
 groups:
   - name: faas.pg_backup
@@ -32,4 +32,4 @@ groups:
             Last successful push: {{ $value | humanizeDuration }} ago.
             Check `systemctl status faas-pg-basebackup-push.timer` and
             `journalctl -u faas-pg-basebackup-push.service` on the CP host.
-            Runbook: docs/runbooks/PostgresBackup.md
+            Runbook: docs/ops/PostgresBackup.md
