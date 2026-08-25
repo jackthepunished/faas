@@ -76,17 +76,31 @@ const appErrorsSummaryDefaultWindow = 24 * time.Hour
 // IDOR posture: loadApp returns 404 on cross-account slug. The
 // 404 is byte-identical to the "no such app" 404 so existence
 // is not leaking through the auth gate.
+//
+// Operator-as-tenant view (P1): see handlers_obs_on_behalf_of.go.
+// When ?on_behalf_of= is present, the plan gate, loadApp, the
+// retention clamp (target.Plan.AppErrorsRetentionDays()), and the
+// ListAppErrorGroups predicate (target.ID) all flow through the
+// target's identity.
 func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acct state.Account) { //nolint:contextcheck
+	target, ok := s.resolveOnBehalfOf(w, r, acct, "errors-summary")
+	if !ok {
+		return
+	}
+	authAcct := acct
+	if target != nil {
+		authAcct = *target
+	}
 	// Plan gate: per-app error surfacing is Hobby+; Free gets 402 +
 	// upsell. The gate runs BEFORE loadApp so a Free customer
 	// probing a Hobby+ slug never gets a 404 (slug-leak guard —
 	// same posture as handlers_metrics.go:53-57 and the rest of
 	// the per-app observability PR series).
-	if !acct.Plan.AppErrorsAllowed() {
-		api.WriteProblem(w, api.ErrPlanAppErrorsNotAllowed(acct.Plan))
+	if !authAcct.Plan.AppErrorsAllowed() {
+		api.WriteProblem(w, api.ErrPlanAppErrorsNotAllowed(authAcct.Plan))
 		return
 	}
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	app, ok := s.loadApp(w, r, authAcct, r.PathValue("slug"))
 	if !ok {
 		return
 	}
@@ -107,7 +121,7 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 	// so the dashboard can render the "you widened past the
 	// retention cap" tile; the existing WindowClamped bool
 	// already lives on the wire shape.
-	retentionCap := time.Duration(acct.Plan.AppErrorsRetentionDays()) * 24 * time.Hour
+	retentionCap := time.Duration(authAcct.Plan.AppErrorsRetentionDays()) * 24 * time.Hour
 	if until.Sub(since) > retentionCap {
 		windowClamped = true
 		since = until.Add(-retentionCap)
@@ -123,7 +137,7 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	rows, err := s.store.ListAppErrorGroups(r.Context(), buildAppErrorsSummaryParams(
-		acct.ID, app.ID, since, until, curC, curLS, curFP, limit,
+		authAcct.ID, app.ID, since, until, curC, curLS, curFP, limit,
 	))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "list failed", "see request_id"))
@@ -138,6 +152,9 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 			LastSeenAt:  last.LastSeenAt.UTC().Format(time.RFC3339Nano),
 			Fingerprint: last.Fingerprint,
 		})
+	}
+	if target != nil {
+		emitOperatorActionView(r, s, acct, target.ID, "errors-summary")
 	}
 	writeJSON(w, http.StatusOK, api.AppErrorsSummaryResponse{
 		GeneratedAt:   time.Now().UTC().Format(time.RFC3339Nano),

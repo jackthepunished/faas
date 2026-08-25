@@ -57,12 +57,26 @@ const usageDefaultWindowDays = 30
 // getAppUsage serves GET /v1/apps/{slug}/usage. Returns
 // api.AppUsageSummaryResponse. 200 on success, 402 on Free, 404
 // on cross-account slug (via loadApp).
+//
+// Operator-as-tenant view (P1): see handlers_obs_on_behalf_of.go.
+// When ?on_behalf_of= is present, the plan gate, loadApp, and the
+// usage rollup all flow through the target's identity. The plan
+// overage math uses the target's plan_included_GB_hours so the
+// audit row's account_id and the response DTO line up.
 func (s *server) getAppUsage(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !acct.Plan.AppUsageSummaryAllowed() {
-		api.WriteProblem(w, api.ErrPlanAppUsageSummaryNotAllowed(acct.Plan))
+	target, ok := s.resolveOnBehalfOf(w, r, acct, "usage")
+	if !ok {
 		return
 	}
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug")) //nolint:contextcheck // loadApp uses r.Context() for its own DB calls; helper is shared across every per-app handler.
+	authAcct := acct
+	if target != nil {
+		authAcct = *target
+	}
+	if !authAcct.Plan.AppUsageSummaryAllowed() {
+		api.WriteProblem(w, api.ErrPlanAppUsageSummaryNotAllowed(authAcct.Plan))
+		return
+	}
+	app, ok := s.loadApp(w, r, authAcct, r.PathValue("slug")) //nolint:contextcheck // loadApp uses r.Context() for its own DB calls; helper is shared across every per-app handler.
 	if !ok {
 		return
 	}
@@ -73,7 +87,7 @@ func (s *server) getAppUsage(w http.ResponseWriter, r *http.Request, acct state.
 		return
 	}
 
-	summary, source, sumErr := meter.BuildAppWindowSummary(r.Context(), s.store, acct.ID, app.ID, since, until)
+	summary, source, sumErr := meter.BuildAppWindowSummary(r.Context(), s.store, authAcct.ID, app.ID, since, until)
 	if sumErr != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal,
 			"usage summary fetch failed",
@@ -81,12 +95,15 @@ func (s *server) getAppUsage(w http.ResponseWriter, r *http.Request, acct state.
 		return
 	}
 
-	planIncluded := float64(acct.Plan.PlanIncludedGBHours())
+	planIncluded := float64(authAcct.Plan.PlanIncludedGBHours())
 	overage := summary.GBHours - planIncluded
 	if overage < 0 {
 		overage = 0
 	}
 
+	if target != nil {
+		emitOperatorActionView(r, s, acct, target.ID, "usage")
+	}
 	writeJSON(w, http.StatusOK, api.AppUsageSummaryResponse{
 		Slug:                app.Slug,
 		PeriodStart:         since.UTC(),
