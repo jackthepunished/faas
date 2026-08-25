@@ -89,6 +89,28 @@ func (s *stubAuditOps) AuditWriteFailureDuration(result string) prometheus.Obser
 	return stubObserver{s: s, result: result}
 }
 
+// AuditLogWriteTotal (PR-#TBD / C5) — success-path counter.
+// Returns a no-op stub counter so the audit emit path can
+// call .Inc() without dragging Prometheus into the unit tests.
+// Pre-instantiation guarantees a real counter exists in
+// production; the stub mirrors the no-op behaviour for tests
+// that don't care about the increment value.
+func (s *stubAuditOps) AuditLogWriteTotal(endpoint, kind string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stub_audit_log_write_total",
+		Help: "test stub for the audit_log_write_total counter",
+	})
+}
+
+// AuditLogWriteFailuresTotal (PR-#TBD / C5) — failure-path
+// counter. Same shape as AuditLogWriteTotal above.
+func (s *stubAuditOps) AuditLogWriteFailuresTotal(endpoint, kind, errorClass string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stub_audit_log_write_failures_total",
+		Help: "test stub for the audit_log_write_failures_total counter",
+	})
+}
+
 func (s *stubAuditOps) failureCount(t *testing.T, accountID string) float64 {
 	t.Helper()
 	s.mu.Lock()
@@ -425,6 +447,16 @@ func (*typedNilAuditOps) AuditWriteFailures(_ string) prometheus.Counter {
 	return nil
 }
 func (*typedNilAuditOps) AuditWriteFailureDuration(_ string) prometheus.Observer {
+	return nil
+}
+
+// AuditLogWriteTotal + AuditLogWriteFailuresTotal
+// (PR-#TBD / C5) — return nil so the typed-nil audit Ops
+// surface stays consistent with the existing two methods.
+func (*typedNilAuditOps) AuditLogWriteTotal(_, _ string) prometheus.Counter {
+	return nil
+}
+func (*typedNilAuditOps) AuditLogWriteFailuresTotal(_, _, _ string) prometheus.Counter {
 	return nil
 }
 

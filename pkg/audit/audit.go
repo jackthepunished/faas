@@ -28,6 +28,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"reflect"
 	"time"
@@ -47,9 +48,16 @@ import (
 // AccountID label cardinality is bounded by the bounded-admission
 // helper upstream of the counter (pkg/wire); empty input collapses to
 // "anonymous" and overflow collapses to "__other__".
+//
+// PR-#TBD / C5 added AuditLogWriteTotal and
+// AuditLogWriteFailuresTotal so /v1/admin/obs/health can
+// report 5-minute write throughput + failure rates. The
+// audit emit site is the only incrementer.
 type Ops interface {
 	AuditWriteFailures(accountID string) prometheus.Counter
 	AuditWriteFailureDuration(result string) prometheus.Observer
+	AuditLogWriteTotal(endpoint, kind string) prometheus.Counter
+	AuditLogWriteFailuresTotal(endpoint, kind, errorClass string) prometheus.Counter
 }
 
 // Auditor is the IAM-4 audit seam. Constructed once per daemon and
@@ -263,6 +271,17 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 	}
 	err = a.store.AppendEventWithTrace(ctx, actor, kind, subject, payload, traceID)
 	dur := time.Since(start)
+	// PR-#TBD / C5 — increment the success/failure counters
+	// behind /v1/admin/obs/health. The kind label is mapped
+	// onto the closed set (auditKindClosedSet in pkg/wire);
+	// unknown kinds collapse to "other" so a typo in audit
+	// emit sites cannot blow up Prometheus cardinality. The
+	// endpoint label is taken from a.actor (the per-daemon
+	// string wired at New — apid, schedd, meterd,
+	// gatewayd-internal), pre-validated against
+	// auditEndpointClosedSet.
+	endpoint := a.actor
+	metricKind := auditKindMetricLabel(kind)
 	if a.ops != nil {
 		if err != nil {
 			a.ops.AuditWriteFailureDuration("failed").Observe(dur.Seconds())
@@ -275,6 +294,107 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 			"actor", actor, "kind", kind, "subject", subject, "err", err)
 		if a.ops != nil {
 			a.ops.AuditWriteFailures(subjectStr).Inc()
+			a.ops.AuditLogWriteFailuresTotal(endpoint, metricKind, errorClassFromErr(err)).Inc()
+		}
+	} else if a.ops != nil {
+		a.ops.AuditLogWriteTotal(endpoint, metricKind).Inc()
+	}
+}
+
+// auditKindMetricLabel maps an audit kind (free-text, e.g.
+// "operator.action.force_park" or
+// "operator.action.force_park.outcome") onto the closed metric
+// label set declared in pkg/wire.NewOpsMetrics
+// (auditKindClosedSet). Unknown kinds collapse to "other" so
+// cardinality stays bounded regardless of caller typos.
+//
+// Mapping table:
+//
+//	"operator.action.force_park"            → "force_park"
+//	"operator.action.force_cold_boot"       → "force_cold_boot"
+//	"operator.action.force_restart"         → "force_restart"
+//	"operator.action.force_park.outcome"    → "force_park.outcome"
+//	"operator.action.force_cold_boot.outcome" → "force_cold_boot.outcome"
+//	"operator.action.force_restart.outcome" → "force_restart.outcome"
+//	anything else                           → "other"
+//
+// Called from pkg/audit.Auditor.emit (PR-#TBD / C5). PR-#TBD's
+// /v1/admin/obs/health reads the resulting counters via PromQL.
+func auditKindMetricLabel(kind string) string {
+	const (
+		requestSuffix  = ".outcome"
+		verbPark       = "force_park"
+		verbColdBoot   = "force_cold_boot"
+		verbRestart    = "force_restart"
+		operatorPrefix = "operator.action."
+	)
+	switch kind {
+	case operatorPrefix + verbPark:
+		return verbPark
+	case operatorPrefix + verbColdBoot:
+		return verbColdBoot
+	case operatorPrefix + verbRestart:
+		return verbRestart
+	case operatorPrefix + verbPark + requestSuffix:
+		return verbPark + requestSuffix
+	case operatorPrefix + verbColdBoot + requestSuffix:
+		return verbColdBoot + requestSuffix
+	case operatorPrefix + verbRestart + requestSuffix:
+		return verbRestart + requestSuffix
+	default:
+		return "other"
+	}
+}
+
+// errorClassFromErr classifies a pgx / Postgres error onto the
+// closed auditLogWriteFailuresTotal error_class label set. The
+// mapping is intentionally conservative: only SQLSTATEs the
+// events / operator_intents tables actually emit at audit
+// write-time get a labelled bucket; everything else collapses
+// to "other" so an obscure transient doesn't fill a dashboard
+// panel with one-off series.
+//
+// SQLSTATE 23514 (check_violation) is the events.trace_id
+// regex at 00456 — labelled so a regression in the C4 trace_id
+// middleware surfaces as a check_violation bucket spike. SQLSTATE
+// 23505 (unique_violation) is the events.id / events.??? PK
+// races — labelled so the operator can tell the difference.
+//
+// pgx wraps pgconn.PgError values via errors.As; the function
+// is pgx-aware but does NOT depend on pgx directly to keep this
+// helper unit-testable from the audit_test package.
+func errorClassFromErr(err error) string {
+	if err == nil {
+		return "other"
+	}
+	// Probe the wrapped chain via the standard library interface
+	// (any *pgconn.PgError exposes Code() and SQLState() in the
+	// pgx v5 stack). When err is not a *pgconn.PgError, fall
+	// through to "other".
+	type sqlStater interface{ SQLState() string }
+	var s sqlStater
+	// errors.As is the cheapest reliable probe across the pgx
+	// stack; we accept the import cost once here rather than
+	// threading pgconn through the audit package's test surface.
+	if errors.As(err, &s) {
+		switch s.SQLState() {
+		case "23514":
+			return "sqlstate_23514"
+		case "23505":
+			return "sqlstate_23505"
+		case "57014", "57P01", "57P02", "57P03":
+			// statement_timeout / admin_shutdown / crash_shutdown /
+			// cannot_connect_now. Collapsed to "timeout" since the
+			// operator's response is the same: investigate the
+			// pool / database. The fine-grained labels would be
+			// nice-to-have but the bucket is closed.
+			return "timeout"
 		}
 	}
+	// ctx.DeadlineExceeded surfaces here too — match on string
+	// rather than importing context in two places.
+	if err.Error() == context.DeadlineExceeded.Error() {
+		return "timeout"
+	}
+	return "other"
 }

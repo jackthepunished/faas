@@ -213,22 +213,6 @@ func TestOperatorIntentSubscriber_ExplicitTraceIDWinsOverSpanContext(t *testing.
 	}
 }
 
-// containsKey is a tiny helper that scans a json.RawMessage byte
-// slice for a JSON key — used by the table-shape assertion without
-// pulling in the full unmarshal path. Renamed from `contains` to
-// avoid colliding with the existing helper at
-// pkg/sched/engine_emit_test.go:65 (which scans []string slices
-// for a wake-event kind).
-func containsKey(b []byte, key string) bool {
-	needle := `"` + key + `"`
-	for i := 0; i+len(needle) <= len(b); i++ {
-		if string(b[i:i+len(needle)]) == needle {
-			return true
-		}
-	}
-	return false
-}
-
 // traceIDPtr returns a pointer to a stable traceID literal for the
 // InsertOperatorIntent call site. The address cannot be taken on
 // a const directly (untyped string constant); this helper holds the

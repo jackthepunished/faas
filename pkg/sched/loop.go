@@ -510,6 +510,13 @@ func (l *Loop) Run(ctx context.Context) error {
 	// latency at ~1 round-trip matters.
 	l.drainPendingOperatorIntents(ctx)
 
+	// PR-#TBD / C5: run the completeness tick once at startup so
+	// the gauge surfaces a real value at t=0 instead of the
+	// pre-instantiation default of 1.0 (vacuous truth). Cheap —
+	// two SELECTs over partial indexes — and bounded by the
+	// completeness ticker that fires every 60s afterward.
+	l.runOperatorIntentCompletenessTick(ctx)
+
 	reaperT := time.NewTicker(10 * time.Second)
 	defer reaperT.Stop()
 	cronT := time.NewTicker(60 * time.Second)
@@ -530,6 +537,17 @@ func (l *Loop) Run(ctx context.Context) error {
 	// operatorIntentSafetyTick.
 	operatorIntentT := time.NewTicker(operatorIntentSafetyTick)
 	defer operatorIntentT.Stop()
+	// Operator-intent completeness ticker (PR-#TBD / C5). 60s
+	// cadence — drives the gauge
+	// operatorActionTraceCompletenessRatio and the counter
+	// operatorIntentOutcomeMissingTotal that
+	// /v1/admin/obs/health surfaces. Slower than the safety
+	// tick because the queries are read-only and window-
+	// aggregated; a 60s sweep is enough resolution for the
+	// 5-minute trace_id coverage gauge. Defined in
+	// operator_intent_completeness.go alongside the body.
+	operatorIntentCompletenessT := time.NewTicker(operatorIntentCompletenessTick)
+	defer operatorIntentCompletenessT.Stop()
 	// Watchdog ticker (commit 3, spec §6.1). 1s cadence matches the
 	// spec's "per-second" granularity for catching stuck rows before
 	// they pin a ledger reservation for the full 30s cold-boot
@@ -782,6 +800,15 @@ func (l *Loop) Run(ctx context.Context) error {
 			// cadence (vs fire-now's 60s) matches the operator-
 			// action SLA.
 			l.drainPendingOperatorIntents(ctx)
+		case <-operatorIntentCompletenessT.C:
+			// PR-#TBD / C5: 60s observability sweep. Reads
+			// events + operator_intents to drive
+			// operatorActionTraceCompletenessRatio (gauge) and
+			// operatorIntentOutcomeMissingTotal (counter). Both
+			// queries are read-only; the body is nil-safe on
+			// l.ops and tolerates a missing operator_intents
+			// table (42P01) for fresh clusters pre-migration.
+			l.runOperatorIntentCompletenessTick(ctx)
 		case <-triggerT.C:
 			// Issue #757 / ADR-100: trigger dispatch tick. 1s
 			// safety cadence; WakeupTriggers advances the

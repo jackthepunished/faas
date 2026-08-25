@@ -70,6 +70,35 @@ func (s *stubAuditOps) AuditWriteFailureDuration(result string) prometheus.Obser
 	return stubObserver{s: s, result: result}
 }
 
+// AuditLogWriteTotal (PR-#TBD / C5) — success-path counter.
+// Returns a fresh per-call counter so each emit site
+// increments its own series; mirrors the existing per-
+// accountID counter behaviour for AuditWriteFailures.
+func (s *stubAuditOps) AuditLogWriteTotal(endpoint, kind string) prometheus.Counter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stub_audit_log_write_total",
+		Help: "test stub for the audit_log_write_total counter",
+	})
+	s.registry.MustRegister(c)
+	return c
+}
+
+// AuditLogWriteFailuresTotal (PR-#TBD / C5) — failure-path
+// counter. Returns a fresh counter per call so each failure
+// mode can be inspected individually.
+func (s *stubAuditOps) AuditLogWriteFailuresTotal(endpoint, kind, errorClass string) prometheus.Counter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stub_audit_log_write_failures_total",
+		Help: "test stub for the audit_log_write_failures_total counter",
+	})
+	s.registry.MustRegister(c)
+	return c
+}
+
 func (s *stubAuditOps) failureCount(t *testing.T, accountID string) float64 {
 	t.Helper()
 	s.mu.Lock()
