@@ -454,15 +454,29 @@ jobs:
           use_oidc: true
           fail_ci_if_error: true
 
-  # Shard 2 (Postgres-heavy B): pkg/state, cmd/gregale, cmd/schedd, etc.
+  # Shard 2 (Postgres-heavy B) is split into two jobs because pkg/state and
+  # cmd/gregale are independent race-enabled hot spots. Both jobs keep their
+  # own Postgres service so a slow package group cannot hold the other group
+  # behind it.
   unit-tests-pg-2:
-    name: unit tests (pg shard 2 — state/gregale/schedd)
+    name: unit tests (pg shard 2${{ matrix.id }} — ${{ matrix.label }})
     runs-on: ubuntu-latest
-    # 15m (was 10m) — cmd/gregale grew after PR #832's
-    # PR-B source-ref tests; the package-level test binary
-    # under -race -count=1 -p 4 sits near the 10m ceiling.
-    # Mirrors the pgstore-coverage-sweep-timeout-fix
-    # posture: add slack before splitting shards.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: a
+            label: state/reconcile/reposcan
+            package_pattern: '/(pkg/state|pkg/statefuldenylist|pkg/reconcile|pkg/reposcan)(/|$)'
+            coverage_file: cover-shard2a.out
+            state_coverage: true
+          - id: b
+            label: gregale/gregalectl/daemons
+            package_pattern: '/(cmd/gregale|cmd/gregalectl|cmd/meterd|cmd/schedd|cmd/schema-dump)(/|$)'
+            coverage_file: cover-shard2b.out
+            state_coverage: false
+    # Keep the previous headroom while the new package-group timings settle.
+    # The normal wall time is reduced because the two groups run concurrently.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -505,32 +519,29 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: unit tests (pg shard 2)
+      - name: unit tests (pg shard 2${{ matrix.id }})
         run: |
           mkdir -p coverage
-          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '(pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan)')
-          # 14m (was 10m) — under -race -count=1 -p 4 the
-          # cmd/gregale package alone sits at ~3m; pkg/state
-          # sub-tests add another ~3m; the remaining packages
-          # round out the budget. 14m keeps headroom against
-          # CI load spikes (memory: pgstore-coverage-sweep-
-          # timeout-fix). Job-level timeout is 15m.
-          go test -race -count=1 -p 4 -timeout=14m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '${{ matrix.package_pattern }}')
+          test -n "$PKGS"
+          printf '%s\n' "$PKGS"
+          go test -race -count=1 -p 4 -timeout=14m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
-        run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
+        if: ${{ matrix.state_coverage }}
+        run: make check-state-coverage COVERFILE=coverage/${{ matrix.coverage_file }}
 
       - name: coverage floor (ship-blocking packages)
-        # Validates pkg/state ≥ 70% via the new coverage-floor gate
-        # (see Makefile, mirror of check-state-coverage). Packages
-        # not exercised by this shard's PKGS list print
-        # "(no statements — skip)" and don't fail the gate.
+        # Validates the ship-blocking package floors via the shared
+        # coverage-floor gate (see Makefile). Packages not exercised by
+        # this matrix entry's PKGS list print "(no statements — skip)"
+        # and don't fail the gate.
         run: make coverage-floor COVERDIR=coverage
 
-      - name: upload to Codecov (pg shard 2)
+      - name: upload to Codecov (pg shard 2${{ matrix.id }})
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
-          files: coverage/cover-shard2.out
+          files: coverage/${{ matrix.coverage_file }}
           flags: unittests
           use_oidc: true
           fail_ci_if_error: true
