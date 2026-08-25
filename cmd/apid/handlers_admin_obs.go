@@ -456,6 +456,51 @@ func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Ac
 	s.audit.Emit(r.Context(), "operator.action.force_cold_boot", aidPtr, data)
 }
 
+// emitOperatorActionForceRestart writes an operator.action.restart_instance
+// audit row when an admin force-restarts a wedged live instance
+// via the P2d endpoint. `targetAccountID` is the instance's owning
+// account; may be empty when the instance cannot be resolved (the
+// audit row is still emitted so the operator action is durable).
+//
+// PR #1105 (P2d follow-on to PR #1099) — force-restart is the
+// operator-initiated twin of schedd's DestroyForLivenessFailure:
+// kill the instance + flip the deployment's latest warm + init
+// snapshots stale so the next customer Wake takes the cold-boot
+// branch. `result` is "enqueued" when the intent row was written
+// successfully (the durable record) or "rejected" when the state
+// gate failed (no intent was written; the audit row is the only
+// durable signal). Terminal outcome (succeeded/failed) is emitted
+// by schedd as a separate operator.action.restart_instance.outcome
+// audit row — see pkg/sched/operator_intent_subscriber.go.
+// intentID is "" on the rejected path; snapIDs is the list of
+// (warm + init) snapshots that were marked stale during dispatch
+// — may be empty when the deployment had no snapshots (legitimate
+// no-op success), never nil on the success path.
+func emitOperatorActionForceRestart(r *http.Request, s *server, caller state.Account, targetAccountID, instanceID, appID, deploymentID, previousState, reason, result, intentID string, snapIDs []string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	var aidPtr *string
+	if targetAccountID != "" {
+		aidPtr = &targetAccountID
+	}
+	data := map[string]any{
+		"actor":             caller.ID,
+		"target_account_id": targetAccountID,
+		"intent_id":         intentID,
+		"instance_id":       instanceID,
+		"app_id":            appID,
+		"deployment_id":     deploymentID,
+		"previous_state":    previousState,
+		"reason":            reason,
+		"result":            result,
+	}
+	if len(snapIDs) > 0 {
+		data["snap_ids_marked_stale"] = snapIDs
+	}
+	s.audit.Emit(r.Context(), "operator.action.restart_instance", aidPtr, data)
+}
+
 // emitOperatorActionReclaimBuild writes an operator.action.reclaim_build
 // audit row when an admin sweeps stuck-running builds via the P2c
 // endpoint. accountID is nil because the sweep is fleet-level (no

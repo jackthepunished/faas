@@ -12,10 +12,10 @@
  */
 export type OperatorIntentResponse = {
   intent_id: string;
-  kind: 'force_park' | 'force_cold_boot';
+  kind: 'force_park' | 'force_cold_boot' | 'force_restart';
   status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   /**
-   * Instance UUID (force_park) or deployment UUID (force_cold_boot).
+   * Instance UUID (force_park or force_restart) or deployment UUID (force_cold_boot).
    */
   target_id: string;
   /**
@@ -36,7 +36,7 @@ export type OperatorIntentResponse = {
    */
   error?: string;
   /**
-   * Populated for force_cold_boot on succeeded status. Empty when no snapshots existed.
+   * Populated for force_cold_boot and force_restart on succeeded status. Empty when no snapshots existed.
    */
   snap_ids_marked_stale?: Array<string>;
 };

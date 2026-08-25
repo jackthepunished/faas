@@ -87,10 +87,11 @@ var routeExclude = map[string]bool{
 	// Mirror the exclusion across BOTH this list AND
 	// cmd/apid/spec_compliance_test.go::routeExclude; the two
 	// lists must move together.
-	"POST /v1/admin/instances/{id}/force-park":   true, // PR #1099 P2a — operator-only recovery primitive
-	"POST /v1/admin/apps/{slug}/force-cold-boot": true, // PR #1099 P2b — operator-only recovery primitive
-	"POST /v1/admin/builds/sweep-stuck":          true, // PR #1099 P2c — operator-only recovery primitive
-	"GET /v1/admin/operator-intents/{id}":        true, // PR #1099 P2.3 — operator-only intent polling endpoint
+	"POST /v1/admin/instances/{id}/force-park":    true, // PR #1099 P2a — operator-only recovery primitive
+	"POST /v1/admin/apps/{slug}/force-cold-boot":  true, // PR #1099 P2b — operator-only recovery primitive
+	"POST /v1/admin/instances/{id}/force-restart": true, // PR #1105 P2d — operator-only recovery primitive
+	"POST /v1/admin/builds/sweep-stuck":           true, // PR #1099 P2c — operator-only recovery primitive
+	"GET /v1/admin/operator-intents/{id}":         true, // PR #1099 P2.3 — operator-only intent polling endpoint
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie
