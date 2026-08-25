@@ -22,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched/instancestats"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -529,6 +530,7 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 	if _, err := authorizeInstance(ctx, s.owner, s.resolver, req.GetInstanceId()); err != nil {
 		return nil, err
 	}
+	ctx = withTraceIDSpan(ctx) // PR-#TBD / C6
 	start := time.Now()
 	err := s.engine.ParkWithReason(ctx, req.GetInstanceId(), req.GetReason())
 	s.ops.Observe(op, time.Since(start), err)
@@ -553,6 +555,7 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 // Engine.ForceColdBootNextWake doc-comment.
 func (s *Server) ForceColdBootNextWake(ctx context.Context, req *scheddpb.ForceColdBootNextWakeRequest) (*scheddpb.ForceColdBootNextWakeResponse, error) {
 	const op = "ForceColdBootNextWake"
+	ctx = withTraceIDSpan(ctx) // PR-#TBD / C6
 	start := time.Now()
 	snapIDs, err := s.engine.ForceColdBootNextWake(ctx, req.GetDeploymentId())
 	s.ops.Observe(op, time.Since(start), err)
@@ -607,6 +610,7 @@ func (s *Server) ForceRestartInstance(ctx context.Context, req *scheddpb.ForceRe
 	if _, err := authorizeInstance(ctx, s.owner, s.resolver, req.GetInstanceId()); err != nil {
 		return nil, err
 	}
+	ctx = withTraceIDSpan(ctx) // PR-#TBD / C6
 	start := time.Now()
 	snapIDs, err := s.engine.ForceRestart(ctx, req.GetInstanceId(), req.GetReason())
 	s.ops.Observe(op, time.Since(start), err)
@@ -1301,4 +1305,61 @@ func toProblem(err error) *api.Problem {
 		return p
 	}
 	return api.NewProblem(int(codes.Internal), "internal", "schedd operation failed", err.Error())
+}
+
+// withTraceIDSpan (PR-#TBD / C6) reads the inbound trace_id
+// from the gRPC metadata envelope (x-faas-trace-id, set by
+// pkg/scheddgrpc.Client.ParkInstance et al. via
+// wire.WithCorrelationOutgoing) and wraps ctx with an OTel
+// span context carrying that trace_id.
+//
+// Why an OTel span context (rather than a custom ctx key):
+// pkg/audit.Auditor.emit has an existing OTel-context lift at
+// audit.go:228-239 that stamps data["trace_id"] from the
+// active OTel span. Injecting a synthetic span with the
+// trace_id from the metadata envelope routes the trace_id
+// through the same path the apid middleware uses — without
+// that, every audit emit on the gRPC path would surface a
+// NULL trace_id even when the caller sent one.
+//
+// The synthetic span is non-recorded (SpanContextConfig
+// without a tracer provider) so it does NOT register a span
+// with the global OTel tracer; only the SpanContext
+// trace_id is propagated. Future PRs that wire otelgrpc into
+// schedd's gRPC server can replace this with a real recorded
+// span — the audit emit path is identical.
+//
+// Empty trace_id (the legacy / meterd-reaper case) is a
+// no-op: ctx is returned unchanged. The audit emit's OTel
+// lift at audit.go:228-239 then sees an invalid span
+// context and skips the trace_id stamp, which is the
+// correct behaviour for non-operator callers.
+func withTraceIDSpan(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	corr, ok := wire.CorrelationFromIncoming(ctx)
+	if !ok || corr.TraceID == "" {
+		return ctx
+	}
+	// Parse the OTel 32-char-hex trace_id. Parse errors fall
+	// through to ctx unchanged (silent no-op), matching the
+	// "garbage-in / no-op" posture of the audit emit's OTel
+	// lift. TraceIDFromHex is the canonical OTel constructor;
+	// it returns a zero TraceID + error on malformed input
+	// (e.g. wrong length, non-hex chars). We treat a zero
+	// TraceID the same as a parse error — empty / invalid
+	// trace_ids are silently dropped so the audit emit sees
+	// an invalid span context (no trace_id stamp).
+	trace, err := oteltrace.TraceIDFromHex(corr.TraceID)
+	if err != nil || trace.IsValid() == false {
+		return ctx
+	}
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    trace,
+		SpanID:     oteltrace.SpanID{},
+		TraceFlags: oteltrace.FlagsSampled,
+		Remote:     true,
+	})
+	return oteltrace.ContextWithSpanContext(ctx, sc)
 }

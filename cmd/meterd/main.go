@@ -162,8 +162,16 @@ func (a *scheddCPUAdapter) refresh() {
 // uses. Slice 4 adds ParkInstance to scheddgrpc; in tests we inject a
 // recording stub. Defining the interface here keeps meterd independent
 // of pkg/scheddgrpc until the surface exists (ADR-019).
+//
+// traceID (PR-#TBD / C6) is the new scheddgrpc.Client.ParkInstance
+// arg; meterd has no operator-action audit row to attribute
+// (it's an automated reaper), so it always passes "" — the
+// schedd-side correlation envelope stays empty and the audit
+// path falls back to whatever the schedd subscriber would
+// have stamped. Mirrors the EmptyEnvelopeOK pattern in the
+// CLI: an empty trace_id is a no-op, not an error.
 type parkInstanceParker interface {
-	ParkInstance(ctx context.Context, instanceID, reason string) error
+	ParkInstance(ctx context.Context, instanceID, reason, traceID string) error
 	// ListInstanceStats is the per-instance CPU-µs snapshot the
 	// meterd sampler reads once per minute. Issue #279 / PR-B.
 	// Returns an empty slice when schedd has no rows for this

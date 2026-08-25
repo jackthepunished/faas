@@ -41,7 +41,7 @@ type localParkedCall struct {
 	Reason     string
 }
 
-func (p *localParker) ParkInstance(_ context.Context, id, reason string) error {
+func (p *localParker) ParkInstance(_ context.Context, id, reason, _traceID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.parked = append(p.parked, localParkedCall{InstanceID: id, Reason: reason})

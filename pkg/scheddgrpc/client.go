@@ -48,7 +48,17 @@ type ScheddClient interface {
 	// this method is additive per ADR-016.
 	EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
-	ParkInstance(ctx context.Context, instanceID, reason string) error
+	// ParkInstance (PR-#TBD / C6): traceID is the optional
+	// OTel-format 32-char-hex value forwarded via the gRPC
+	// x-faas-trace-id metadata envelope (see
+	// wire.CorrelationFields.TraceID). Empty string = no
+	// envelope attached; the schedd-side handler then sees
+	// zero trace_id context. The gregalectl CLI generates a
+	// fresh trace_id on every force-* invocation (mirrors
+	// the apid middleware at pkg/middleware/traceid.go) so
+	// the operator's incident log joins to the schedd-side
+	// audit emit on a single key.
+	ParkInstance(ctx context.Context, instanceID, reason, traceID string) error
 	// StreamAppLogs (issue #309 / tier-2 DX): level + grep are
 	// the customer-facing --level / --grep filters forwarded
 	// to schedd (issue #254 / Move 4). Both empty = no filter;
@@ -219,7 +229,20 @@ func (c *Client) ReportActivity(ctx context.Context, touches []state.InstanceTou
 // ParkInstance forces schedd to park one instance (M7, spec §4.7). The
 // reason string is for the audit log. NotFound returns state.ErrNotFound
 // so meterd's quota loop can decide to log-and-continue vs bubble up.
-func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) error {
+//
+// traceID (PR-#TBD / C6) — optional OTel 32-char-hex value
+// forwarded via the gRPC x-faas-trace-id envelope (see
+// wire.CorrelationFields.TraceID + wire.WithCorrelationOutgoing).
+// The schedd-side handler extracts it via
+// wire.CorrelationFromIncoming(ctx) and stamps it onto any
+// audit row the engine path emits; an empty traceID is a
+// no-op (no envelope attached). The gregalectl CLI generates
+// a fresh trace_id per force-* invocation so the operator's
+// incident log joins to the schedd-side audit emit on a
+// single key — same pattern the apid middleware
+// (pkg/middleware/traceid.go) uses for the apid path.
+func (c *Client) ParkInstance(ctx context.Context, instanceID, reason, traceID string) error {
+	ctx = wire.WithCorrelationOutgoing(ctx, wire.CorrelationFields{TraceID: traceID})
 	resp, err := c.cli.ParkInstance(ctx, &scheddpb.ParkInstanceRequest{
 		InstanceId: instanceID,
 		Reason:     reason,
@@ -245,7 +268,12 @@ func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) er
 // list when the deployment has no snapshots in either tier (durable
 // no-op). NotFound is mapped to state.ErrNotFound so the apid
 // handler can render a 404 with code "deployment_not_found".
-func (c *Client) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+//
+// traceID (PR-#TBD / C6) — optional OTel 32-char-hex forwarded
+// via the gRPC x-faas-trace-id envelope; empty = no envelope.
+// See ParkInstance doc-comment for the rationale.
+func (c *Client) ForceColdBootNextWake(ctx context.Context, deploymentID, traceID string) ([]string, error) {
+	ctx = wire.WithCorrelationOutgoing(ctx, wire.CorrelationFields{TraceID: traceID})
 	resp, err := c.cli.ForceColdBootNextWake(ctx, &scheddpb.ForceColdBootNextWakeRequest{
 		DeploymentId: deploymentID,
 	})
@@ -275,7 +303,12 @@ func (c *Client) ForceColdBootNextWake(ctx context.Context, deploymentID string)
 //     dispatch matches the engine-layer contract.
 //   - gRPC NotFound → state.ErrNotFound (mirrors ForceColdBootNextWake).
 //   - any other gRPC error → lifted via liftErr.
-func (c *Client) ForceRestartInstance(ctx context.Context, instanceID, reason string) ([]string, error) {
+//
+// traceID (PR-#TBD / C6) — optional OTel 32-char-hex forwarded
+// via the gRPC x-faas-trace-id envelope; empty = no envelope.
+// See ParkInstance doc-comment for the rationale.
+func (c *Client) ForceRestartInstance(ctx context.Context, instanceID, reason, traceID string) ([]string, error) {
+	ctx = wire.WithCorrelationOutgoing(ctx, wire.CorrelationFields{TraceID: traceID})
 	resp, err := c.cli.ForceRestartInstance(ctx, &scheddpb.ForceRestartInstanceRequest{
 		InstanceId: instanceID,
 		Reason:     reason,

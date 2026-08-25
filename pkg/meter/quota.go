@@ -18,8 +18,15 @@ import (
 // stops burning RAM on a suspended customer. Defining the interface here
 // keeps meterd from importing pkg/scheddgrpc (which would invert the
 // caller direction; ADR-019 records the meterd→schedd dependency).
+//
+// traceID (PR-#TBD / C6) — the new scheddgrpc.Client.ParkInstance
+// arg. meterd's quota loop is an automated reaper; it has no
+// operator-action audit row to attribute, so the quota-path
+// caller always passes "" (the schedd-side correlation
+// envelope stays empty). Mirrors the EmptyEnvelopeOK
+// contract on the cli side.
 type ScheddParker interface {
-	ParkInstance(ctx context.Context, instanceID, reason string) error
+	ParkInstance(ctx context.Context, instanceID, reason, traceID string) error
 }
 
 // Notifier is the db.Notify surface the meter uses. Lives behind an
@@ -99,7 +106,7 @@ func EnforceQuota(
 			if !state.State(in.State).CountsForRAM() {
 				continue
 			}
-			if err := schedd.ParkInstance(ctx, in.ID, "quota_exceeded_free"); err != nil {
+			if err := schedd.ParkInstance(ctx, in.ID, "quota_exceeded_free", ""); err != nil {
 				log.Warn("meter: park instance failed", "instance", in.ID, "err", err)
 				continue
 			}

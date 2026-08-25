@@ -138,7 +138,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 // implementations leaking into other test packages.
 type nopParker struct{}
 
-func (nopParker) ParkInstance(context.Context, string, string) error { return nil }
+func (nopParker) ParkInstance(context.Context, string, string, string) error { return nil }
 func (nopParker) ListInstanceStats(context.Context) ([]scheddgrpc.InstanceStatsRow, error) {
 	// Issue #279 / PR-B: the test harness returns an empty
 	// snapshot so the meterd sampler writes 0 CPU-µs per minute

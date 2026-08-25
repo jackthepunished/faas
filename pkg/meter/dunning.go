@@ -231,7 +231,7 @@ func (d *Dunning) parkAll(ctx context.Context, accountID string) {
 		if !state.State(in.State).CountsForRAM() {
 			continue
 		}
-		if err := d.p.Parker.ParkInstance(ctx, in.ID, "dunning_past_due_7d"); err != nil {
+		if err := d.p.Parker.ParkInstance(ctx, in.ID, "dunning_past_due_7d", ""); err != nil {
 			d.p.Log.Warn("meter: dunning park instance", "instance", in.ID, "err", err)
 			continue
 		}
