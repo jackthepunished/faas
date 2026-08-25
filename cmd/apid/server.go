@@ -1498,10 +1498,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
 
-	// P2a + P2b — operator recovery primitives. Both routes mount
-	// under requireScope(admin-only) so the admin allowlist
-	// (s.adminAllows at compute_nodes.go:74-86) is the only
-	// structural gate. The handlers themselves additionally
+	// P2a + P2b + P2d — operator recovery primitives. All three
+	// routes mount under requireScope(admin-only) so the admin
+	// allowlist (s.adminAllows at compute_nodes.go:74-86) is the
+	// only structural gate. The handlers themselves additionally
 	// require ?confirm=true as a tripwire against operator
 	// fat-fingering (matches the force-drain --yes ack at
 	// commands_compute_nodes.go:249).
@@ -1509,6 +1509,14 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
 	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	// P2d — operator recovery primitive: force-restart kills a
+	// wedged live instance + flips the deployment's latest warm +
+	// init snapshots stale so the next Wake takes the cold-boot
+	// branch. PR #1105 follow-on to PR #1099. Same auth posture
+	// (admin scope + MFA + allowlist) and ?confirm=true tripwire
+	// as force-park / force-cold-boot above.
+	mux.HandleFunc("POST /v1/admin/instances/{id}/force-restart",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceRestart))))
 	// PR #1099 P2 redesign: polling endpoint for the
 	// operator_intents rows. NO MFA — mirrors getFireCronRequest
 	// at cmd/apid/handlers_fire_cron_request.go:38-83 because the

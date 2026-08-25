@@ -461,15 +461,100 @@ export class AdminService {
     });
   }
   /**
+   * Enqueue a force-restart intent for a wedged RUNNING instance (admin-only).
+   * Operator-side recovery primitive for instances wedged in
+   * {RUNNING} that the customer can't wait for the idle
+   * reaper to handle AND whose snapshot is suspected to be
+   * the carrier of the wedge. Composes the two earlier
+   * primitives: kill the instance (force-park) AND flip the
+   * deployment's latest warm + init snapshots stale
+   * (force-cold-boot). Per ADR-005 ("snapshot of a wedged
+   * VM is a wedged VM"), the recovery action is destroy +
+   * snap-stale so the next Wake is a guaranteed cold boot.
+   *
+   * PR #1105 (P2d follow-on to PR #1099): apid writes a row
+   * to `operator_intents` (kind = `force_restart`, CHECK
+   * widened by migrations/00446) and emits
+   * `pg_notify('operator_intent', …)`; schedd (the ONLY
+   * writer to `instances` per CLAUDE.md §6.2) is the sole
+   * consumer and dispatches via `engine.ForceRestart` so the
+   * `pkg/state/machine.go` `CanTransition` guard fires on the
+   * locked re-read. The handler returns 202 Accepted with an
+   * intent_id; the operator polls
+   * GET /v1/admin/operator-intents/{id} for terminal state
+   * and `snap_ids_marked_stale`.
+   *
+   * Gate is intentionally TIGHTER than force-park's
+   * ({RUNNING, WAKING, COLD_BOOTING}): force-restart only
+   * acts on RUNNING instances because the engine's
+   * state-machine validation at pkg/sched/engine.go:5299
+   * rejects non-RUNNING states as
+   * `state.ErrInstanceNotRunning` (a wedged WAKING /
+   * COLD_BOOTING instance's nodeID may be empty or its
+   * destroy path may race with the Wake). Operators targeting
+   * WAKING / COLD_BOOTING instances get 409
+   * `instance_not_restartable` with no intent row written.
+   *
+   * `?confirm=true` is required as a tripwire against
+   * operator fat-fingering. Optional `?reason=<slug>` defaults
+   * to `operator_force_restart`; values are clamped to the
+   * `[a-z0-9_]{1,64}` shape.
+   *
+   * @returns OperatorIntentAcceptedResponse Force-restart 202: intent row written + pg_notify emitted. Poll `status_url` for terminal state and `snap_ids_marked_stale`.
+   * @throws ApiError
+   */
+  public static postForceRestartInstance({
+    id,
+    confirm,
+    reason,
+  }: {
+    /**
+     * Force-restart target. Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
+     */
+    id: string,
+    /**
+     * Must be the literal string "true" — tripwire on force-restart against operator fat-fingering.
+     */
+    confirm: 'true',
+    /**
+     * Audit-log slug. Default `operator_force_restart`. Clamped to `[a-z0-9_]{1,64}`.
+     */
+    reason?: string,
+  }): CancelablePromise<OperatorIntentAcceptedResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/instances/{id}/force-restart',
+      path: {
+        'id': id,
+      },
+      query: {
+        'confirm': confirm,
+        'reason': reason,
+      },
+      errors: {
+        400: `Force-restart validation: \`?confirm=true\` is missing or \`?reason=\` failed validation.`,
+        401: `code: unauthorized`,
+        403: `Force-restart 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
+        404: `Force-restart 404: code: instance_not_found — no instance row with the supplied id.`,
+        409: `Force-restart 409: code: instance_not_restartable — instance state is not RUNNING. WAKING / COLD_BOOTING / PARKED / STOPPED all return this code without writing an intent row.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * Read the current state of an operator intent (admin-only).
    * Returns the row written by the 202 Accepted response of
-   * POST /v1/admin/instances/{id}/force-park or
-   * POST /v1/admin/apps/{slug}/force-cold-boot. Status is
-   * one of "pending" | "running" | "succeeded" | "failed" |
+   * POST /v1/admin/instances/{id}/force-park, POST
+   * /v1/admin/instances/{id}/force-restart, or POST
+   * /v1/admin/apps/{slug}/force-cold-boot. Status is one of
+   * "pending" | "running" | "succeeded" | "failed" |
    * "cancelled". SnapIDsMarkedStale is populated on terminal
-   * status for force_cold_boot intents (warm + init tiers
-   * walked). On failure, Error carries the bounded dispatch
-   * error message (1 KB cap).
+   * status for force_cold_boot and force_restart intents
+   * (warm + init tiers walked). On failure, Error carries
+   * the bounded dispatch error message (1 KB cap).
    *
    * @returns OperatorIntentResponse Current state of the intent.
    * @throws ApiError

@@ -58,6 +58,10 @@ type fakeEngine struct {
 	// mega-PR) drives the ForceColdBootNextWake handler tests.
 	// Default nil = no-op (returns nil + empty snap IDs).
 	forceColdBootFn func(ctx context.Context, deploymentID string) ([]string, error)
+	// forceRestartFn (P2d follow-on to PR #1099) drives the
+	// ForceRestartInstance handler tests. Default nil = no-op
+	// (returns nil + empty snap IDs).
+	forceRestartFn func(ctx context.Context, instanceID, reason string) ([]string, error)
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope, _ string) (sched.WakeResult, error) {
@@ -113,6 +117,17 @@ func (f *fakeEngine) ParkWithReason(ctx context.Context, instanceID, reason stri
 func (f *fakeEngine) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
 	if f.forceColdBootFn != nil {
 		return f.forceColdBootFn(ctx, deploymentID)
+	}
+	return nil, nil
+}
+
+// ForceRestart (P2d follow-on to PR #1099) mirrors
+// ForceColdBootNextWake's pattern: default returns nil + empty
+// snap IDs; tests that exercise the real RPC behaviour inject
+// a forceRestartFn via the fakeEngine struct.
+func (f *fakeEngine) ForceRestart(ctx context.Context, instanceID, reason string) ([]string, error) {
+	if f.forceRestartFn != nil {
+		return f.forceRestartFn(ctx, instanceID, reason)
 	}
 	return nil, nil
 }

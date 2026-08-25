@@ -188,7 +188,7 @@ func TestMarkFailedLifecycle(t *testing.T) {
 	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if err := store.MarkOperatorIntentFailed(ctx, id, "can_transition: instance state PARKED"); err != nil {
+	if err := store.MarkOperatorIntentFailed(ctx, id, "can_transition: instance state PARKED", nil); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -209,6 +209,98 @@ func TestMarkFailedLifecycle(t *testing.T) {
 	// Second claim: terminal row invisible.
 	if _, err := store.ClaimPendingOperatorIntent(ctx); !errors.Is(err, state.ErrOperatorIntentNotFound) {
 		t.Errorf("claim after failed: got %v, want ErrOperatorIntentNotFound", err)
+	}
+}
+
+// TestPartialSuccess_SnapIDsPersistedOnFailedRow pins the P2d
+// R4 review fix: when Engine.ForceRestart flips the deployment's
+// warm + init snaps stale but timedDestroy fails (vmmd wedged),
+// the partial-success snap IDs MUST land on the operator_intent
+// row even though status='failed'. Without this, an operator
+// querying GET /v1/admin/operator-intents/{id} sees
+// status='failed' but no evidence that the snap-stale work
+// landed — they don't know whether the next wake will be a
+// cold boot (it WILL, because the snaps ARE stale in the
+// database).
+//
+// The terminal operator.action.<verb>.outcome audit row already
+// carried snap_ids_marked_stale; this test pins that the row
+// itself now agrees with the audit row on partial-success.
+func TestPartialSuccess_SnapIDsPersistedOnFailedRow(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "actor-id"
+	id, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"target-instance-id", nil, actor, "wedged_destroy", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	// Engine.ForceRestart returned (snapIDs, destroyErr). The
+	// subscriber stamps the row failed but must also persist
+	// the snap IDs so the operator's GET endpoint surfaces
+	// "next wake will cold-boot despite the destroy error".
+	partial := []string{"snap-warm-partial", "snap-init-partial"}
+	if err := store.MarkOperatorIntentFailed(ctx, id,
+		"sched: force_restart: destroy instance: vmmd timeout", partial); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	got, err := store.GetOperatorIntent(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != state.OperatorIntentFailed {
+		t.Errorf("status=%q, want failed", got.Status)
+	}
+	if got.Error == "" {
+		t.Errorf("error not stamped (destroy cause must survive on the row)")
+	}
+	if len(got.SnapIDsMarkedStale) != len(partial) {
+		t.Fatalf("snap_ids_marked_stale len=%d, want %d (partial-success must persist)",
+			len(got.SnapIDsMarkedStale), len(partial))
+	}
+	for i, w := range partial {
+		if got.SnapIDsMarkedStale[i] != w {
+			t.Errorf("snap_ids[%d]=%q, want %q", i, got.SnapIDsMarkedStale[i], w)
+		}
+	}
+
+	// Race-loser / unknown-kind posture: MarkFailed with nil
+	// snapIDs must NOT wipe a previously-stamped value (the
+	// impl coerces nil→empty, but a nil caller never had any
+	// IDs to wipe in the first place — this is the symmetric
+	// case to the partial-success test above).
+	raceID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"race-target", nil, actor, "race", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert race: %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("Claim race: %v", err)
+	}
+	if err := store.MarkOperatorIntentFailed(ctx, raceID,
+		"state: instance not in running state", nil); err != nil {
+		t.Fatalf("MarkFailed race: %v", err)
+	}
+	raceGot, err := store.GetOperatorIntent(ctx, raceID)
+	if err != nil {
+		t.Fatalf("Get race: %v", err)
+	}
+	if raceGot.Status != state.OperatorIntentFailed {
+		t.Errorf("race status=%q, want failed", raceGot.Status)
+	}
+	if len(raceGot.SnapIDsMarkedStale) != 0 {
+		t.Errorf("race snap_ids_marked_stale len=%d, want 0 (race-loser stamps no snaps)",
+			len(raceGot.SnapIDsMarkedStale))
 	}
 }
 
@@ -248,5 +340,147 @@ func TestSnapIDsMarkedStale_Persisted(t *testing.T) {
 		if got.SnapIDsMarkedStale[i] != w {
 			t.Errorf("snap_ids[%d]=%q, want %q", i, got.SnapIDsMarkedStale[i], w)
 		}
+	}
+}
+
+// TestForceRestart_InsertClaimMark_Lifecycle (P2d follow-on)
+// pins that the new state.OperatorIntentKindForceRestart flows
+// through the InsertOperatorIntent → ClaimPendingOperatorIntent
+// → MarkOperatorIntentSucceeded round-trip the
+// drainPendingOperatorIntents path relies on. Mirrors
+// TestInsertClaimMark_Lifecycle exactly with the third kind
+// value. The dispatch arm in processOperatorIntent is wired up
+// in operator_intent_subscriber.go (case state.OperatorIntentKindForceRestart
+// → Engine.ForceRestart); Engine.ForceRestart is tested at
+// engine_force_restart_test.go. This test pins the table-state
+// contract only — that the third constant is accepted at the
+// store layer and the FIFO claim query doesn't filter it out.
+func TestForceRestart_InsertClaimMark_Lifecycle(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "actor-id"
+	acct := "acct-id"
+	id, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"target-instance-id", &acct, actor, "operator_smoke", json.RawMessage(`{}`),
+	)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	got, err := store.ClaimPendingOperatorIntent(ctx)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if got.ID != id {
+		t.Errorf("Claim id=%q, want %q", got.ID, id)
+	}
+	if got.Kind != state.OperatorIntentKindForceRestart {
+		t.Errorf("Claim kind=%q, want %q (constant must round-trip through the store)", got.Kind, state.OperatorIntentKindForceRestart)
+	}
+	if got.Status != state.OperatorIntentRunning {
+		t.Errorf("Claim status=%q, want running", got.Status)
+	}
+
+	if err := store.MarkOperatorIntentSucceeded(ctx, id, []string{"snap-tier-warm-fr", "snap-tier-init-fr"}); err != nil {
+		t.Fatalf("MarkSucceeded: %v", err)
+	}
+
+	// Read-back: the kind + snap_ids_marked_stale must persist
+	// so the GET endpoint renders "kind: force_restart" + the
+	// "what was affected" tile.
+	final, err := store.GetOperatorIntent(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Kind != state.OperatorIntentKindForceRestart {
+		t.Errorf("Get kind=%q, want %q", final.Kind, state.OperatorIntentKindForceRestart)
+	}
+	if final.Status != state.OperatorIntentSucceeded {
+		t.Errorf("Get status=%q, want succeeded", final.Status)
+	}
+	if len(final.SnapIDsMarkedStale) != 2 {
+		t.Errorf("Get snap_ids len=%d, want 2 (MarkSucceeded stamped both)", len(final.SnapIDsMarkedStale))
+	}
+
+	// Second claim: row is terminal, invisible to the claim query.
+	if _, err := store.ClaimPendingOperatorIntent(ctx); !errors.Is(err, state.ErrOperatorIntentNotFound) {
+		t.Errorf("second claim after succeeded: got %v, want ErrOperatorIntentNotFound", err)
+	}
+}
+
+// TestForceRestart_FIFOOrderingWithExistingKinds pins that the
+// FIFO claim query orders force_restart alongside the existing
+// two kinds by requested_at ASC. A regression here (e.g. a
+// default-case filters out force_restart) would surface as an
+// audit-log replay hazard — a force_restart row gets stuck
+// behind a force_park row that's dispatched first.
+//
+// Mirrors TestFIFOClaimOrdering shape: three rows in
+// force_park → force_cold_boot → force_restart order, all
+// should claim in that order.
+func TestForceRestart_FIFOOrderingWithExistingKinds(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "actor-id"
+	acct := "acct-id"
+
+	park, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForcePark,
+		"park-target", &acct, actor, "park", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert park: %v", err)
+	}
+	coldboot, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceColdBoot,
+		"coldboot-target", &acct, actor, "coldboot", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert coldboot: %v", err)
+	}
+	restart, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"restart-target", &acct, actor, "restart", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert restart: %v", err)
+	}
+
+	// Claim in insertion order.
+	g1, err := store.ClaimPendingOperatorIntent(ctx)
+	if err != nil {
+		t.Fatalf("Claim 1: %v", err)
+	}
+	if g1.ID != park {
+		t.Errorf("Claim 1 id=%q, want park=%q", g1.ID, park)
+	}
+	g2, err := store.ClaimPendingOperatorIntent(ctx)
+	if err != nil {
+		t.Fatalf("Claim 2: %v", err)
+	}
+	if g2.ID != coldboot {
+		t.Errorf("Claim 2 id=%q, want coldboot=%q", g2.ID, coldboot)
+	}
+	g3, err := store.ClaimPendingOperatorIntent(ctx)
+	if err != nil {
+		t.Fatalf("Claim 3: %v", err)
+	}
+	if g3.ID != restart {
+		t.Errorf("Claim 3 id=%q, want restart=%q (force_restart must not be filtered by the claim query)", g3.ID, restart)
+	}
+
+	// Mark all three succeeded.
+	for _, id := range []string{park, coldboot, restart} {
+		if err := store.MarkOperatorIntentSucceeded(ctx, id, nil); err != nil {
+			t.Fatalf("MarkSucceeded %s: %v", id, err)
+		}
+	}
+
+	// Fourth claim → empty queue.
+	if _, err := store.ClaimPendingOperatorIntent(ctx); !errors.Is(err, state.ErrOperatorIntentNotFound) {
+		t.Errorf("fourth claim: got %v, want ErrOperatorIntentNotFound", err)
 	}
 }

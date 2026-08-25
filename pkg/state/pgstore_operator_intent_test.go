@@ -43,13 +43,14 @@ func pgStoreOperatorIntent(t *testing.T) (*state.PgStore, *pgxpool.Pool, context
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	// These tests exercise the PgStore CRUD contract, while the migration
-	// shape is pinned independently by migrations/00445_operator_intents_test.go.
-	// Installing only that table keeps each isolated fixture cheap; running all
-	// 445 migrations five times pushes the PostgreSQL shard over its budget.
+	// package pins the production schema. Installing only the table keeps each
+	// isolated fixture cheap; replaying all migrations for every test pushes
+	// the PostgreSQL shard over its wall-clock budget.
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE operator_intents (
 			id uuid PRIMARY KEY,
-			kind text NOT NULL CHECK (kind IN ('force_park', 'force_cold_boot')),
+			kind text NOT NULL CHECK (kind IN
+				('force_park', 'force_cold_boot', 'force_restart')),
 			target_id text NOT NULL,
 			account_id uuid NULL,
 			actor_id uuid NOT NULL,
@@ -160,7 +161,7 @@ func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 
-	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found"); err != nil {
+	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found", nil); err != nil {
 		t.Fatalf("MarkOperatorIntentFailed: %v", err)
 	}
 

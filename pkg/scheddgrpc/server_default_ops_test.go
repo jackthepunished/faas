@@ -43,6 +43,13 @@ func (noopEngine) ParkWithReason(context.Context, string, string) error { return
 func (noopEngine) ForceColdBootNextWake(context.Context, string) ([]string, error) {
 	return nil, nil
 }
+
+// ForceRestart (P2d follow-on to PR #1099) — stub to satisfy
+// the SchedAPI interface; the white-box nil-ops test doesn't
+// exercise the handler body. Mirrors ForceColdBootNextWake.
+func (noopEngine) ForceRestart(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
 func (noopEngine) StreamAppLogs(context.Context, string, int64, time.Time, string, LogFrameSink) error {
 	return nil
 }

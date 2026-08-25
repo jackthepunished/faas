@@ -94,6 +94,7 @@ var routeExclude = map[string]bool{
 	// FAAS_ADMIN_EMAILS allowlist).
 	"POST /v1/admin/instances/{id}/force-park":                true, // PR #1099 P2a
 	"POST /v1/admin/apps/{slug}/force-cold-boot":              true, // PR #1099 P2b
+	"POST /v1/admin/instances/{id}/force-restart":             true, // PR #1105 P2d
 	"POST /v1/admin/builds/sweep-stuck":                       true, // PR #1099 P2c
 	"GET /v1/admin/operator-intents/{id}":                     true, // PR #1099 P2.3
 	"GET /v1/events":                                          true, // SSE (cookie+Bearer, not s.auth)

@@ -15,6 +15,20 @@ import (
 // ErrNotFound is returned by Store reads when a row does not exist.
 var ErrNotFound = errors.New("state: not found")
 
+// ErrInstanceNotRunning is returned by Engine.ForceRestart
+// (pkg/sched/engine.go) when the gated re-read under lockApp
+// observes a state other than RUNNING. The race-loser posture:
+// a customer-driven Park or Destroy won the lock between the
+// apid gate-time read and schedd's locked re-read. The desired
+// end-state (instance no longer running) is already achieved,
+// but we still stamp the operator_intent row failed so the
+// audit trail records that the admin click did not mutate
+// state itself. Translated at the handler boundary to a 409
+// instance_not_restartable via the apid gate (which holds its
+// own forceRestartableStates check), so this sentinel is the
+// *post-lock-re-read* correlate of that pre-lock gate.
+var ErrInstanceNotRunning = errors.New("state: instance not in running state")
+
 // ErrCorsWildcardWithCredentials is returned by
 // MergeCorsPresetIntoRule when the merged AllowOrigins contains
 // the bare "*" wildcard alongside AllowCredentials: true. This is
@@ -2623,7 +2637,17 @@ type Store interface {
 	) (string, error)
 	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
 	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
-	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error
+	// MarkOperatorIntentFailed stamps the row's terminal failure
+	// state. snapIDs captures the partial-success shape: when a
+	// force_restart dispatch flips the deployment's warm + init
+	// snapshots stale but timedDestroy fails (vmmd wedged), the
+	// snapshots ARE stale in the database but the destroy is not.
+	// Persisting snapIDs here means GET /v1/admin/operator-intents/{id}
+	// surfaces "what this action affected" even on the failure
+	// path — the operator learns the next wake WILL cold-boot
+	// despite the destroy error. snapIDs may be nil (race-loser,
+	// unknown-kind, deployment-not-found, etc.).
+	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string, snapIDs []string) error
 	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
 	// ReclaimStuckRunningOperatorIntents resets every operator_intents
 	// row whose status='running' AND whose started_at is older than

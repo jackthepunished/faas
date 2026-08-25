@@ -4,13 +4,14 @@
 /* eslint-disable */
 /**
  * Wire shape for the 202 Accepted response of POST
- * /v1/admin/instances/{id}/force-park and POST
+ * /v1/admin/instances/{id}/force-park, POST
+ * /v1/admin/instances/{id}/force-restart, and POST
  * /v1/admin/apps/{slug}/force-cold-boot (admin scope +
  * FAAS_ADMIN_EMAILS allowlist). The audit row is emitted
- * under operator.action.{park_instance, force_cold_boot}
- * with target_account_id = the instance's / app's owning
- * account. StatusURL is the relative path; clients prepend
- * the apid base URL.
+ * under operator.action.{park_instance, restart_instance,
+ * force_cold_boot} with target_account_id = the instance's /
+ * app's owning account. StatusURL is the relative path;
+ * clients prepend the apid base URL.
  *
  */
 export type OperatorIntentAcceptedResponse = {
@@ -27,13 +28,13 @@ export type OperatorIntentAcceptedResponse = {
    * Recommended horizon to stop polling (UTC, RFC 3339).
    */
   expires_at: string;
-  kind: 'force_park' | 'force_cold_boot';
+  kind: 'force_park' | 'force_cold_boot' | 'force_restart';
   /**
-   * Populated for force_park. The instance the operator targeted.
+   * Populated for force_park and force_restart. The instance the operator targeted.
    */
   instance_id?: string;
   /**
-   * Populated for force_park. Gate-time read of `instances.state`.
+   * Populated for force_park and force_restart. Gate-time read of `instances.state`.
    */
   previous_state?: 'RUNNING' | 'WAKING' | 'COLD_BOOTING';
   /**
