@@ -147,6 +147,20 @@ func (l *Loop) processOperatorIntent(ctx context.Context, intent state.OperatorI
 		err = l.engine.ParkWithReason(ctx, intent.TargetID, intent.Reason)
 	case state.OperatorIntentKindForceColdBoot:
 		snapIDs, err = l.engine.ForceColdBootNextWake(ctx, intent.TargetID)
+	case state.OperatorIntentKindForceRestart:
+		// ForceRestart (P2d follow-on to PR #1099) kills the
+		// instance (RUNNING → STOPPED) and marks the
+		// deployment's latest warm + init snaps stale. The
+		// returned snap IDs are stamped on the intent row so
+		// the operator's GET endpoint surfaces "what did this
+		// action affect". Engine.ForceRestart returns
+		// state.ErrInstanceNotRunning on the race-loser posture
+		// (customer-driven Park/Destroy won the lockApp
+		// re-read) — the row is stamped failed with the error
+		// verbatim; the audit trail records that the admin
+		// click was an idempotent no-op. See Engine.ForceRestart
+		// for the full state-machine contract.
+		snapIDs, err = l.engine.ForceRestart(ctx, intent.TargetID, intent.Reason)
 	default:
 		// Should be impossible — the schema CHECK rejects any
 		// unknown kind — but if we somehow receive one, stamp
