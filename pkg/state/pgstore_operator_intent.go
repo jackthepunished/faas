@@ -107,7 +107,8 @@ func (s *PgStore) ClaimPendingOperatorIntent(ctx context.Context) (OperatorInten
 
 	var (
 		id, kindStr, targetID, actorID, reason, metadataStr string
-		accountID, startedAt, finishedAt, errMsg            *string
+		accountID, errMsg                                   *string
+		startedAt, finishedAt                               *time.Time
 		snapIDsMarkedStale                                  []string
 		requestedAt                                         time.Time
 	)
@@ -131,20 +132,23 @@ func (s *PgStore) ClaimPendingOperatorIntent(ctx context.Context) (OperatorInten
 		return OperatorIntent{}, fmt.Errorf("state: claim operator_intent scan: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
+	var claimedAt time.Time
+	if err := tx.QueryRow(ctx, `
 		UPDATE operator_intents
 		SET status = 'running',
 		    started_at = now()
 		WHERE id = $1
-	`, id); err != nil {
+		RETURNING started_at
+	`, id).Scan(&claimedAt); err != nil {
 		return OperatorIntent{}, fmt.Errorf("state: claim operator_intent update: %w", err)
 	}
+	startedAt = &claimedAt
 
 	if err := tx.Commit(ctx); err != nil {
 		return OperatorIntent{}, fmt.Errorf("state: claim operator_intent commit: %w", err)
 	}
 	return decodeOperatorIntentRow(id, kindStr, targetID, actorID, reason,
-		accountID, startedAt, finishedAt, errMsg,
+		accountID, errMsg, startedAt, finishedAt,
 		metadataStr, OperatorIntentRunning, requestedAt,
 		snapIDsMarkedStale), nil
 }
@@ -223,7 +227,8 @@ func (s *PgStore) MarkOperatorIntentFailed(ctx context.Context, id, errMsg strin
 func (s *PgStore) GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error) {
 	var (
 		kindStr, targetID, actorID, reason, metadataStr string
-		accountID, startedAt, finishedAt, errMsg        *string
+		accountID, errMsg                               *string
+		startedAt, finishedAt                           *time.Time
 		snapIDsMarkedStale                              []string
 		requestedAt                                     time.Time
 		statusStr                                       string
@@ -245,7 +250,7 @@ func (s *PgStore) GetOperatorIntent(ctx context.Context, id string) (OperatorInt
 		return OperatorIntent{}, fmt.Errorf("state: get operator_intent: %w", err)
 	}
 	return decodeOperatorIntentRow(id, kindStr, targetID, actorID, reason,
-		accountID, startedAt, finishedAt, errMsg,
+		accountID, errMsg, startedAt, finishedAt,
 		metadataStr, OperatorIntentStatus(statusStr), requestedAt,
 		snapIDsMarkedStale), nil
 }
@@ -288,38 +293,22 @@ func (s *PgStore) ReclaimStuckRunningOperatorIntents(ctx context.Context, thresh
 // OperatorIntent / OperatorIntentStatus values.
 func decodeOperatorIntentRow(
 	id, kindStr, targetID, actorID, reason string,
-	accountID, startedAt, finishedAt, errMsg *string,
+	accountID, errMsg *string,
+	startedAt, finishedAt *time.Time,
 	metadataStr string,
 	status OperatorIntentStatus,
 	requestedAt time.Time,
 	snapIDsMarkedStale []string,
 ) OperatorIntent {
-	// Fill nullable fields with empty sentinels — Get claims
-	// these as nil rather than '', so a nil → "" coercion
-	// avoids surprising callers that do `if i.AccountID == ""`.
-	var acct, started, fin, e string
+	// Fill nullable string fields with empty sentinels — Get claims
+	// these as nil rather than '', so a nil → "" coercion avoids
+	// surprising callers that do `if i.AccountID == ""`.
+	var acct, e string
 	if accountID != nil {
 		acct = *accountID
 	}
-	if startedAt != nil {
-		started = *startedAt
-	}
-	if finishedAt != nil {
-		fin = *finishedAt
-	}
 	if errMsg != nil {
 		e = *errMsg
-	}
-	var startedT, finishedT *time.Time
-	if started != "" {
-		if pt, err := time.Parse(time.RFC3339Nano, started); err == nil {
-			startedT = &pt
-		}
-	}
-	if fin != "" {
-		if pt, err := time.Parse(time.RFC3339Nano, fin); err == nil {
-			finishedT = &pt
-		}
 	}
 	return OperatorIntent{
 		ID:                 id,
@@ -331,8 +320,8 @@ func decodeOperatorIntentRow(
 		Metadata:           json.RawMessage(metadataStr),
 		Status:             status,
 		RequestedAt:        requestedAt,
-		StartedAt:          startedT,
-		FinishedAt:         finishedT,
+		StartedAt:          startedAt,
+		FinishedAt:         finishedAt,
 		Error:              e,
 		SnapIDsMarkedStale: snapIDsMarkedStale,
 	}
