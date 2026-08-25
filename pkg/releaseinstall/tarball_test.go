@@ -183,6 +183,28 @@ func TestTarball_Build_EmbedsManifest(t *testing.T) {
 	}
 }
 
+func TestTarball_LegacyUnhashedGuestInitIsAccepted(t *testing.T) {
+	binDir, root, gitSHA, manifestHash := fakeBinDir(t)
+	if err := os.WriteFile(filepath.Join(binDir, "init"), deterministicBody("init"), 0o755); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Unix(1_700_000_000, 0).UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// This models a signed pre-canonical artifact whose archive contains
+	// guest-init but whose manifest predates the tool_hashes entry.
+	delete(tb.Manifest.ToolHashes, "init")
+	delete(tb.ToolSHA256, "init")
+	extractRoot := t.TempDir()
+	if err := tb.Extract(extractRoot); err != nil {
+		t.Fatalf("extract legacy init: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(extractRoot, gitSHA, "bin", "init")); err != nil {
+		t.Fatalf("extracted legacy init: %v", err)
+	}
+}
+
 // TestTarball_Verify_BlessedManifests asserts Verify returns nil
 // on a tarball that was just produced and stamped with a fake cosign
 // signature (the happy path — no tampering, the fixture verifier
