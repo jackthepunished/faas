@@ -2369,6 +2369,77 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// AppWakeTimelineOptions controls the optional query params for
+// GetAppWakeTimeline. Since and Until are RFC3339Nano strings (NOT
+// time.Time — the wire form is the canonical string so caller-side
+// parse failures surface at the SDK boundary, not inside the
+// transport). Empty values fall through to the server's defaults
+// (24h trailing window). Per-app observability backend PR series.
+type AppWakeTimelineOptions struct {
+	Since string
+	Until string
+}
+
+// GetAppWakeTimeline returns the wire-friendly mirror of the
+// per-app dashboard wake-timeline HTML page
+// (cmd/apid/handlers_dashboard.go renderAppWakeTimeline). The
+// aggregation math (descending-cutoff break, two-denominator rule,
+// em-dash policy) is shared with the HTML page via the cmd/apid
+// helper; this method is the SDK entry point.
+//
+// opts.Since / opts.Until default to the server's trailing-24h
+// window when empty. Plan-gated Hobby+ — Free gets 402
+// plan_per_app_metrics_not_allowed (same code as GetAppMetrics so a
+// plan downgrade flips both endpoints at once).
+func (c *Client) GetAppWakeTimeline(ctx context.Context, slug string, opts AppWakeTimelineOptions) (AppWakeTimelineResponse, error) {
+	var out AppWakeTimelineResponse
+	path := "/v1/apps/" + slug + "/wake-timeline"
+	q := url.Values{}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Until != "" {
+		q.Set("until", opts.Until)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// AppUsageSummaryOptions controls the optional query params for
+// GetAppUsageSummary. Since and Until are RFC3339Nano strings; empty
+// values fall through to the server's defaults (trailing-30d window
+// ending at UTC midnight). Caller-side parse failures surface at the
+// SDK boundary so the wire form stays canonical. Per-app
+// observability backend PR series.
+type AppUsageSummaryOptions struct {
+	Since string
+	Until string
+}
+
+// GetAppUsageSummary returns the per-app billing usage rollup for
+// slug over the [since, until] window (default: trailing 30d,
+// clamped at 90d upper bound). Plan-gated Hobby+ — Free gets 402
+// plan_app_usage_summary_not_allowed. The handler computes
+// overage_gb_hours as max(0, total_gb_hours - plan_included) so the
+// dashboard's red overage chip has no second-roundtrip cost.
+func (c *Client) GetAppUsageSummary(ctx context.Context, slug string, opts AppUsageSummaryOptions) (AppUsageSummaryResponse, error) {
+	var out AppUsageSummaryResponse
+	path := "/v1/apps/" + slug + "/usage"
+	q := url.Values{}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Until != "" {
+		q.Set("until", opts.Until)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // GetAppThrottleSuggestions returns the per-route throttle
 // recommendation payload for slug over the named range window
 // (ADR-091 D20.5 amendment, issue #881). The recommender is

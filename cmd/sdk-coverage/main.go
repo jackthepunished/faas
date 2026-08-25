@@ -422,6 +422,18 @@ var methodRouteMap = map[string]string{
 	// (GetApp, ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
 
+	// Per-app observability backend PR series (PR #1097). The
+	// wake-timeline path uses a literal hyphen (matching the
+	// dashboard route); the auto-derivation would produce
+	// GetAppsSlugWake-timeline (Swagger-style with the hyphen
+	// preserved). The usage path auto-derives to
+	// GetAppsSlugUsage — drop the slug placeholder from the verb
+	// to match the sibling per-app family (GetAppMetrics,
+	// GetAppSLO, GetAppRoutes) and use the DTO type name
+	// (AppUsageSummary) for the noun.
+	"GET /v1/apps/{slug}/wake-timeline": "GetAppWakeTimeline",
+	"GET /v1/apps/{slug}/usage":         "GetAppUsageSummary",
+
 	// ADR-127 / PR-A — production debugger data plane. The
 	// auto-derivation would produce GetAppsSlugDebugRequests
 	// (Swagger-style); the SDK names it ListAppDebugRequests to
