@@ -294,7 +294,7 @@ func joinWireReasons(reasons []string) string {
 //
 // Mirrors pkg/gateway/readiness.go::NewStalenessSignal.
 func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(), stopper func()) {
-	s := newReadySignal(false, "")
+	s := newReadySignal(false, "no touch yet")
 	var lastTouch atomic.Int64 // unix nanos; 0 = "never touched"
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -347,8 +347,21 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 		<-done
 		s.Set(false, "shutting down")
 	}
-	// Pre-arm the signal — the first touch flips it ready.
-	s.Set(true, "")
+	// No pre-arm. PR #1091 review Finding 7: the previous shape
+	// called s.Set(true, "") at construction, then the first
+	// tick flipped to (false, "no touch yet") if Touch had not
+	// arrived in the cadence window. That created a brief window
+	// (≤cadence ≈ up to 1 s) where /readyz reported ready
+	// before any real Touch had landed — contradicting the
+	// invariant that every component must opt IN to ready. The
+	// signal now starts at (false, "no touch yet") and the
+	// first tick is the canonical readiness flip. Touch fires
+	// at most cadence after the goroutine starts, so the
+	// /readyz scrape delay between boot and first observation
+	// is bounded by `cadence` — same as the pre-arm path's
+	// "no touch yet" reason. The pkg/gateway copy still has
+	// the pre-arm shape; PR #1091 Finding 8 tracks the
+	// follow-up that lifts this fix into pkg/gateway.
 	return s, touchFn, stopperFn
 }
 

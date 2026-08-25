@@ -5,6 +5,12 @@
 // short-ASCII /readyz on the same metrics mux that surfaces
 // the same loop.Health verdict via a 1s adapter goroutine.
 //
+// The adapter goroutine fires the first evaluation
+// synchronously inside the goroutine (before the 1 s ticker
+// starts), so the first /readyz scrape after meterd boot
+// observes a real loop.Health verdict — not a pre-armed
+// (true, ""). PR #1091 review Finding 7.
+//
 // Why an adapter goroutine (instead of calling loop.Health on
 // the /readyz hot path): the /healthz handler already calls
 // loop.Health on every scrape, so the verdict is always
@@ -29,23 +35,28 @@ import (
 )
 
 // BuildReadinessProbe constructs the meterd /readyz probe
-// driven by loop.Health. The probe starts ready=true (a fresh
-// daemon with no ticks fired yet still reports Healthy=false
-// per meter.Health; the operator sees "stale: ..." immediately
-// on the first /readyz scrape).
+// driven by loop.Health. The probe starts at (false, "meterd
+// loop not yet evaluated") — the first adapter tick (which fires
+// synchronously inside the goroutine, before the 1 s ticker)
+// evaluates loop.Health and flips to the canonical verdict.
 //
 // Returns the probe. Drain() (RunAndShutdown's drain path) is
 // responsible for firing the helper-goroutine stopper, so the
 // caller does not get a stop func — pkg/wire.Drain owns the
 // lifecycle of the helper goroutine via RegisterSignal's
 // stopper arg.
+//
+// PR #1091 review Finding 7: the previous shape pre-armed the
+// signal to (true, "") at construction, then the first tick
+// flipped to false if any sweep was stale. That left a window
+// where /readyz reported ready before any real evaluation had
+// happened — same invariant violation the wire-side
+// NewStalenessSignal pre-arm did. Now the signal starts at
+// (false, "meterd loop not yet evaluated") and the first tick
+// (which fires synchronously inside the goroutine) is the
+// canonical readiness flip.
 func BuildReadinessProbe(loop *meter.Loop) *wire.ReadyzProbe {
-	sig := &wire.ReadySignal{}
-	// Pre-arm so the first /readyz scrape doesn't see a stale
-	// 503 — the first adapter tick will flip it to false if
-	// any tick is stale. Mirrors pkg/wire/readiness.go
-	// NewStalenessSignal's pre-arm.
-	sig.Set(true, "")
+	sig := wire.NewReadySignalForTest(false, "meterd loop not yet evaluated")
 
 	stop := make(chan struct{})
 	done := make(chan struct{})

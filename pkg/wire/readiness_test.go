@@ -224,17 +224,20 @@ func TestReadySignal_ReportSetAtomicPair(t *testing.T) {
 	wg.Wait()
 }
 
-func TestNewStalenessSignal_PreArmedReady(t *testing.T) {
-	// The signal is pre-armed to ready=true at construction so
-	// that the first /readyz scrape sees a sensible state before
-	// the first Touch arrives. The first tick of the helper
-	// goroutine then re-evaluates and flips to false if no
-	// touch has happened in `stale`. This matches pkg/gateway's
-	// contract.
+func TestNewStalenessSignal_StartsNotReady(t *testing.T) {
+	// PR #1091 review Finding 7: NewStalenessSignal no longer
+	// pre-arms the signal to ready at construction. The previous
+	// pre-arm created a ≤cadence window where /readyz reported
+	// ready before any real Touch had landed, contradicting the
+	// "every component must opt IN" invariant. The signal now
+	// starts at (false, "no touch yet") and the first tick is
+	// the canonical readiness flip.
 	s, _, stopper := wire.NewStalenessSignal(50 * time.Millisecond)
 	defer stopper()
-	if r, _ := s.Report(); !r {
-		t.Errorf("NewStalenessSignal: ready = false at construction, want true (pre-armed)")
+	if r, reason := s.Report(); r {
+		t.Errorf("NewStalenessSignal: ready = true at construction (reason=%q), want false (no pre-arm)", reason)
+	} else if reason != "no touch yet" {
+		t.Errorf("NewStalenessSignal: reason = %q at construction, want \"no touch yet\"", reason)
 	}
 }
 
