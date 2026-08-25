@@ -5238,6 +5238,140 @@ func (e *Engine) ForceColdBootNextWake(ctx context.Context, deploymentID string)
 	return snapIDs, nil
 }
 
+// ForceRestart (P2d of the operator-side observability follow-up mega-PR)
+// is the operator-initiated kill-instance + cold-boot-on-next-wake
+// primitive. Routes through operator_intents (kind = 'force_restart',
+// schema CHECK widened by migrations/00446); the schedd subscriber
+// (operator_intent_subscriber.go) dispatches here.
+//
+// Distinction from siblings:
+//   - Engine.Park (force-park primitive) → idempotent stop, no
+//     snapshot flip.
+//   - Engine.ForceColdBootNextWake (force-cold-boot primitive) →
+//     snapshot-policy flip only, no instance destroy.
+//   - Engine.DestroyForLivenessFailure (vmmd retry-loop drain) →
+//     destroy-side, swallows errors.
+//   - Engine.ForceRestart (here) → destroy-side AND snapshot flip,
+//     surfaces errors. The third primitive in the
+//     `operator_intents.kind` closed set.
+//
+// Locking: acquires e.lockApp(app_id) — same lock the watchdog +
+// Park paths take. A customer-driven Park racing this call observes
+// a consistent state under the lock; the locked re-read flips the
+// state-gate result.
+//
+// State-machine: RUNNING → STOPPED via transitionWithKind (the
+// §6.2 invariant; CanTransition inside transitionWithKind validates
+// the edge). The kind discriminator is "force_restart" — distinct
+// from DestroyForLivenessFailure's "liveness_failed" so audit-log
+// readers can separate operator actions from watchdog kills.
+//
+// Returns the snap IDs marked stale so the schedd subscriber can
+// populate operator_intents.snap_ids_marked_stale (visible via
+// GET /v1/admin/operator-intents/{id}). Returns state.ErrInstanceNotRunning
+// when the locked re-read observes a non-RUNNING state — the
+// race-loser posture documented on the sentinel.
+func (e *Engine) ForceRestart(ctx context.Context, instanceID, reason string) ([]string, error) {
+	// Initial read for app_id + deployment_id.
+	fresh, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("sched: force_restart: initial read instance %s: %w", instanceID, err)
+	}
+	appID := fresh.AppID
+	deploymentID := fresh.DeploymentID
+
+	// Acquire the app lock so a parallel Wake / Park / prior
+	// watchdog for the same app observes a consistent state.
+	release := e.lockApp(appID)
+	defer release()
+
+	// Re-read under the lock for state-machine validation. If
+	// the row vanished between the two reads (Park by the
+	// customer, retention sweep), surface the read error so the
+	// operator sees the truth — same posture as
+	// DestroyForWorkloadOOMFailure's review-finding-#4 fix at
+	// engine.go:5280-5293.
+	freshLocked, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		return nil, fmt.Errorf("sched: force_restart: locked read instance %s: %w", instanceID, err)
+	}
+	if state.State(freshLocked.State) != state.StateRunning {
+		// Race: a customer-driven Park / Destroy (or a prior
+		// force-restart) won the lock. The desired end-state
+		// (instance no longer running) is achieved. The
+		// caller (schedd subscriber) stamps the operator_intent
+		// row failed with state.ErrInstanceNotRunning so the
+		// audit trail records the admin click was an
+		// idempotent no-op. Mirror KillStuck's reservation
+		// release posture for safety.
+		e.ledger.Release(instanceID)
+		return nil, state.ErrInstanceNotRunning
+	}
+
+	// Eagerly mark the deployment's latest snapshot stale so
+	// the next Wake cold-boots. ADR-005 invariant — an
+	// operator-initiated kill is also implicitly a
+	// kill-the-snapshot so a wedged snap is never restored.
+	// Both warm + init tiers (parallel to ForceColdBootNextWake
+	// at engine.go:5217).
+	var snapIDs []string
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deploymentID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if merr := e.store.MarkSnapshotStale(ctx, snap.ID); merr != nil {
+			e.log.Warn("force_restart: mark snapshot stale",
+				"instance", instanceID,
+				"snap_id", snap.ID,
+				"tier", tier,
+				"err", merr.Error())
+			continue
+		}
+		snapIDs = append(snapIDs, snap.ID)
+	}
+
+	// Reset the idle timer on the destroyed instance so the
+	// replacement cold-boot instance's idle budget starts fresh
+	// (issue #554 §implementation notes — same precedent as
+	// DestroyForLivenessFailure + DestroyForWorkloadOOMFailure).
+	now := time.Now().UTC()
+	if _, terr := e.store.TouchInstancesLastSeen(ctx, []state.InstanceTouch{
+		{InstanceID: instanceID, LastRequest: now},
+	}); terr != nil {
+		e.log.Warn("force_restart: touch instances last seen", "instance", instanceID, "err", terr)
+	}
+
+	// Free the ledger reservation BEFORE the destroy so a
+	// parallel Wake for the same app can admit a new instance
+	// immediately. Mirrors the liveness + workload-OOM ordering.
+	e.ledger.Release(instanceID)
+
+	// Surface the destroy error — operator-initiated, not
+	// retry-loop (same rationale as the read-error surfaces
+	// above). The snap-stale work above is durable; the destroy
+	// is the operator-visible status. If the destroy fails the
+	// operator sees (snapIDs, err) on the wire and via the
+	// terminal operator_intent row.
+	if err := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second); err != nil {
+		return snapIDs, fmt.Errorf("sched: force_restart: destroy instance %s: %w", instanceID, err)
+	}
+
+	// RUNNING → STOPPED with kind "force_restart". The operator's
+	// reason lands in the events row's data JSON. transitionWithKind
+	// does the CanTransition guard internally (engine.go:5569+).
+	// Counter emission: deliberately omitted. LivenessRestarts +
+	// WorkloadOOMKills are the workload-initiated labels.
+	// Operator actions are tracked separately by the operator_intent
+	// rows + the terminal operator.action.<verb>.outcome audit
+	// rows; adding a third ops counter would create a fourth
+	// source of truth for the same volume.
+	e.transitionWithKind(ctx, instanceID, appID, state.StateStopped, "force_restart", reason)
+
+	return snapIDs, nil
+}
+
 // DestroyForWorkloadOOMFailure (Cluster C / ADR-121) is the
 // workload-OOM-triggered destroy path. The producer chain is:
 //
