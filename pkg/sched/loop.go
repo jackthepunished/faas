@@ -482,6 +482,12 @@ func (l *Loop) Run(ctx context.Context) error {
 		db.NotifySnapshotPrime,
 		db.NotifyCronRunNow, // PR-D / issue #791: multiplexed on the cron loop's existing LISTEN; zero extra pool connections.
 		db.NotifyAppDelete,  // ADR-098: multiplexed on the cron loop's existing LISTEN; same zero-cost pattern as NotifyCronRunNow. Saves a 7th long-term pool subscriber (the standalone one tipped pool.MaxConns=8 over the edge and starved the async-invoke drain's BeginTx under e2e query bursts).
+		// PR #1099 P2 redesign: multiplexed onto the existing
+		// LISTEN. Same zero-cost pattern as NotifyCronRunNow +
+		// NotifyAppDelete; one LISTEN connection, one multiplexed
+		// handler arm, one extra safety ticker. No additional
+		// pool subscriber.
+		db.NotifyOperatorIntent,
 	}, l.log)
 	if err != nil {
 		return err
@@ -497,6 +503,13 @@ func (l *Loop) Run(ctx context.Context) error {
 	// round-trip rather than waiting for the 60s safety tick.
 	l.drainPendingFireNowRequests(ctx)
 
+	// PR #1099 P2 redesign: drain any operator_intents rows that
+	// survived a schedd bounce. Same defense-in-depth pattern as
+	// the fire-now drain above — operator actions are time-
+	// sensitive (the on-call is paged) so bounding post-restart
+	// latency at ~1 round-trip matters.
+	l.drainPendingOperatorIntents(ctx)
+
 	reaperT := time.NewTicker(10 * time.Second)
 	defer reaperT.Stop()
 	cronT := time.NewTicker(60 * time.Second)
@@ -509,6 +522,14 @@ func (l *Loop) Run(ctx context.Context) error {
 	// 60s for recovery is acceptable.
 	fireNowT := time.NewTicker(fireNowSafetyTick)
 	defer fireNowT.Stop()
+	// Operator-intent safety ticker (PR #1099 P2 redesign).
+	// 30s cadence (vs fire-now's 60s) because operator recovery
+	// primitives are time-sensitive: an SRE on the incident
+	// bridge expects the action to take effect within a minute,
+	// not two. Mirrors pkg/sched/operator_intent_subscriber.go::
+	// operatorIntentSafetyTick.
+	operatorIntentT := time.NewTicker(operatorIntentSafetyTick)
+	defer operatorIntentT.Stop()
 	// Watchdog ticker (commit 3, spec §6.1). 1s cadence matches the
 	// spec's "per-second" granularity for catching stuck rows before
 	// they pin a ledger reservation for the full 30s cold-boot
@@ -751,6 +772,15 @@ func (l *Loop) Run(ctx context.Context) error {
 			// drainPendingFireNowRequests is the single owner of the
 			// claim + dispatch loop.
 			l.drainPendingFireNowRequests(ctx)
+		case <-operatorIntentT.C:
+			// PR #1099 P2 redesign: safety sweep. Picks up rows
+			// that missed a NotifyOperatorIntent delivery
+			// (Postgres bounce, network blip). Same dispatcher as
+			// the notify arm — drainPendingOperatorIntents is the
+			// single owner of the claim + dispatch loop. 30s
+			// cadence (vs fire-now's 60s) matches the operator-
+			// action SLA.
+			l.drainPendingOperatorIntents(ctx)
 		case <-triggerT.C:
 			// Issue #757 / ADR-100: trigger dispatch tick. 1s
 			// safety cadence; WakeupTriggers advances the
@@ -1180,6 +1210,14 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 			return
 		}
 		l.appDelete.evictApp(ctx, p.AppID)
+	case db.NotifyOperatorIntent:
+		// PR #1099 P2 redesign: operator-intent wake. The notify
+		// payload is informational (the row in operator_intents
+		// is the source of truth) — the drain handles claim +
+		// dispatch regardless of which intent_id the notify
+		// carried. Same defense-in-depth pattern as
+		// NotifyCronRunNow's handler arm above.
+		l.drainPendingOperatorIntents(ctx)
 	}
 }
 
