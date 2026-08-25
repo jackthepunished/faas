@@ -145,6 +145,8 @@ export type { FilterCriteriaClause } from './models/FilterCriteriaClause.js';
 export type { FilterCriteriaOp } from './models/FilterCriteriaOp.js';
 export type { FireCronRequestResponse } from './models/FireCronRequestResponse.js';
 export type { FireCronResponse } from './models/FireCronResponse.js';
+export type { ForceColdBootResponse } from './models/ForceColdBootResponse.js';
+export type { ForceParkResponse } from './models/ForceParkResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './models/GraceWindowResponse.js';
 export type { Id32 } from './models/Id32.js';
@@ -271,6 +273,7 @@ export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js'
 export type { SourceTarballDeployRequest } from './models/SourceTarballDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
+export type { SweepStuckBuildsResponse } from './models/SweepStuckBuildsResponse.js';
 export type { TemplateView } from './models/TemplateView.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './models/TenantSurfaceResponse.js';

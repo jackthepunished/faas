@@ -86,6 +86,15 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/events":                                true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/rate-limits":                           true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/admin/obs/builder-heartbeats":                    true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
+
+	// Operator-side observability mega-PR (PR #1099) P2 recovery
+	// primitives. Mirror the cmd/sdk-coverage/main.go::routeExclude
+	// entries for these same routes — both lists must move
+	// together (operator-only surface, admin scope +
+	// FAAS_ADMIN_EMAILS allowlist).
+	"POST /v1/admin/instances/{id}/force-park":    true, // PR #1099 P2a
+	"POST /v1/admin/apps/{slug}/force-cold-boot":   true, // PR #1099 P2b
+	"POST /v1/admin/builds/sweep-stuck":           true, // PR #1099 P2c
 	"GET /v1/events":                                          true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                                              true, // dashboard magic-link GET (HTML form, browser-only)
 	"POST /logout":                                            true, // dashboard logout (HTML form, browser-only)

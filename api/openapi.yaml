@@ -8038,14 +8038,17 @@ paths:
           name: id
           required: true
           schema: { type: string, format: uuid }
+          description: Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
         - in: query
           name: confirm
           required: true
           schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-park against operator fat-fingering.
         - in: query
           name: reason
           required: false
           schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
       responses:
         '200':
           description: Park accepted. The instance transitions to PARKED within seconds.
@@ -8053,13 +8056,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ForceParkResponse' }
         '400':
-          description: '`?confirm=true` is missing or `?reason=` failed validation.'
+          description: 'Force-park validation: `?confirm=true` is missing or `?reason=` failed validation.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: 'code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          description: 'Force-park 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -8075,7 +8078,7 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '503':
-          description: 'code: schedd_unavailable — FAAS_APID_SCHEDD_TARGET is empty on this deployment.'
+          description: 'Force-park 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -8104,14 +8107,17 @@ paths:
           name: slug
           required: true
           schema: { type: string }
+          description: App slug (e.g. "my-app"). Resolved to the app's latest deployment by `created_at DESC`.
         - in: query
           name: confirm
           required: true
           schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-cold-boot against operator fat-fingering.
         - in: query
           name: reason
           required: false
           schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
       responses:
         '200':
           description: '`snap_ids_marked_stale` may be empty when the deployment has no snapshots.'
@@ -8119,13 +8125,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ForceColdBootResponse' }
         '400':
-          description: '`?confirm=true` is missing or `?reason=` failed validation.'
+          description: 'Force-cold-boot validation: `?confirm=true` is missing or `?reason=` failed validation.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: 'code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          description: 'Force-cold-boot 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -8136,7 +8142,7 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '503':
-          description: 'code: schedd_unavailable — FAAS_APID_SCHEDD_TARGET is empty on this deployment.'
+          description: 'Force-cold-boot 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -8169,6 +8175,7 @@ paths:
           name: confirm
           required: true
           schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on sweep-stuck against operator fat-fingering.
         - in: query
           name: older_than
           required: false
@@ -8184,13 +8191,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SweepStuckBuildsResponse' }
         '400':
-          description: '`?confirm=true` is missing or `?older_than=` failed validation.'
+          description: 'Sweep-stuck validation: `?confirm=true` is missing or `?older_than=` failed validation.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: 'code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          description: 'Sweep-stuck 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

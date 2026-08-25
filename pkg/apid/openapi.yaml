@@ -8009,6 +8009,205 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  # ─── Operator recovery primitives (P2 of the operator-side
+  # observability mega-PR, Commit 5b) ───────────────────────
+  # Two admin-only POST endpoints that proxy to schedd's gRPC
+  # RPCs. The audit row is emitted under `operator.action.
+  # {park_instance, force_cold_boot}`. Both require
+  # ?confirm=true as a tripwire (matches the force-drain --yes
+  # ack pattern at gregalectl force-drain).
+  /v1/admin/instances/{id}/force-park:
+    post:
+      tags: [admin]
+      operationId: postForceParkInstance
+      summary: Force-park a wedged live instance (admin-only).
+      description: |
+        Operator-side recovery primitive for instances wedged in
+        {RUNNING, WAKING, COLD_BOOTING} that the customer can't
+        wait for the idle reaper to handle. Routes through schedd's
+        existing `ParkInstance` gRPC RPC so the state-machine
+        guard at `pkg/state/machine.go` fires — schedd is the
+        ONLY writer to `instances` per CLAUDE.md §6.2.
+
+        Requires `?confirm=true` as a tripwire against operator
+        fat-fingering. Optional `?reason=<slug>` defaults to
+        `operator_force_park`; values are clamped to the
+        `[a-z0-9_]{1,64}` shape.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+          description: Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-park against operator fat-fingering.
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
+      responses:
+        '200':
+          description: Park accepted. The instance transitions to PARKED within seconds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ForceParkResponse' }
+        '400':
+          description: 'Force-park validation: `?confirm=true` is missing or `?reason=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Force-park 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: instance_not_found — no instance row with the supplied id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: 'code: instance_not_parkable — instance state is not in {RUNNING, WAKING, COLD_BOOTING}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: 'Force-park 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/admin/apps/{slug}/force-cold-boot:
+    post:
+      tags: [admin]
+      operationId: postForceColdBootApp
+      summary: Mark the latest warm + init snapshots of an app's latest deployment stale (admin-only).
+      description: |
+        Operator-side recovery primitive for the case where the
+        live instance is fine but the snapshot backing the warm
+        tier is suspected to be the carrier of a customer-reported
+        wedge. Per ADR-005 ("snapshot of a wedged VM is a wedged
+        VM"), the recovery action is `MarkSnapshotStale` on the
+        deployment's latest warm + init snapshots — NOT a state-
+        machine transition. The instance row is NOT mutated;
+        the next customer Wake takes the cold-boot path through
+        `engine.go:4800-4820 usableSnapshotForWake` returning
+        `haveSnap=false`.
+
+        Requires `?confirm=true` as a tripwire. Optional
+        `?reason=<slug>` defaults to `operator_force_cold_boot`.
+      parameters:
+        - in: path
+          name: slug
+          required: true
+          schema: { type: string }
+          description: App slug (e.g. "my-app"). Resolved to the app's latest deployment by `created_at DESC`.
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-cold-boot against operator fat-fingering.
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
+      responses:
+        '200':
+          description: '`snap_ids_marked_stale` may be empty when the deployment has no snapshots.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ForceColdBootResponse' }
+        '400':
+          description: 'Force-cold-boot validation: `?confirm=true` is missing or `?reason=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Force-cold-boot 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: app_not_found — no app with the supplied slug.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: 'Force-cold-boot 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # P2c of the operator-side observability mega-PR (Commit 5c).
+  # Fleet-level sweep of `builds` rows stuck in 'running' past
+  # the threshold. Calls state.Store.SweepStuckRunningBuilds
+  # directly per user decision (NO builderd gRPC server).
+  /v1/admin/builds/sweep-stuck:
+    post:
+      tags: [admin]
+      operationId: postSweepStuckBuilds
+      summary: Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
+      description: |
+        Operator-side recovery primitive for builder microVMs that
+        crashed (OOM, kernel panic, host reboot) and left their
+        `builds` row in 'running' indefinitely. Mirrors the
+        in-process reaper at pkg/builderd/reaper.go:48 — the
+        operator-facing endpoint is the manual escape hatch for
+        when the reaper's grace period is too long for an
+        incident.
+
+        `?older_than=` is clamped to [1m, 60m] so a fat-fingered
+        "1ns" cannot sweep in-flight builds. Default 15m.
+
+        Audit row: operator.action.reclaim_build with
+        account_id=NULL (fleet-level, not tenant-scoped).
+      parameters:
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on sweep-stuck against operator fat-fingering.
+        - in: query
+          name: older_than
+          required: false
+          schema:
+            type: string
+            pattern: '^[0-9]+(ns|us|ms|s|m|h)$'
+            example: 15m
+          description: Threshold duration. Clamped to [1m, 60m]. Default 15m.
+      responses:
+        '200':
+          description: Sweep complete. `swept_count` may be 0 when no rows match the threshold.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SweepStuckBuildsResponse' }
+        '400':
+          description: 'Sweep-stuck validation: `?confirm=true` is missing or `?older_than=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Sweep-stuck 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500':
+          description: 'Store call failed (transient PG hiccup; retry with the same threshold).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
@@ -9237,6 +9436,99 @@ components:
       x-since: "2026-08"
       x-adr: "089"
       x-pr-cluster: "PR-C"
+
+    # P2 of the operator-side observability mega-PR (Commit 5b).
+    # Returned by POST /v1/admin/instances/{id}/force-park on
+    # the 200 path. previous_state reflects the gate-time read,
+    # not the post-call state, so a parallel customer-driven
+    # Park race doesn't lie in the audit log.
+    ForceParkResponse:
+      description: |
+        Wire shape for POST /v1/admin/instances/{id}/force-park
+        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
+        row is emitted under operator.action.park_instance with
+        target_account_id = the instance's owning account.
+      type: object
+      required: [ok, instance_id, previous_state, reason]
+      properties:
+        ok: { type: boolean, example: true }
+        instance_id: { type: string, format: uuid }
+        previous_state:
+          type: string
+          enum: [RUNNING, WAKING, COLD_BOOTING]
+          description: Gate-time read of `instances.state`. Reflects the read at handler entry, NOT the post-call state.
+        reason:
+          type: string
+          pattern: '^[a-z0-9_]{1,64}$'
+          example: operator_force_park
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
+
+    # P2 of the operator-side observability mega-PR (Commit 5b).
+    # Returned by POST /v1/admin/apps/{slug}/force-cold-boot on
+    # the 200 path. snap_ids_marked_stale may be empty when the
+    # deployment has no snapshots — the audit row is still
+    # emitted (durable record of operator check, even when
+    # no-op).
+    ForceColdBootResponse:
+      description: |
+        Wire shape for POST /v1/admin/apps/{slug}/force-cold-boot
+        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
+        row is emitted under operator.action.force_cold_boot
+        with target_account_id = the app's owning account.
+      type: object
+      required: [ok, app_id, deployment_id, snap_ids_marked_stale, reason, tier_walked]
+      properties:
+        ok: { type: boolean, example: true }
+        app_id: { type: string, format: uuid }
+        deployment_id: { type: string, format: uuid }
+        snap_ids_marked_stale:
+          type: array
+          items: { type: string, format: uuid }
+          description: Snap IDs flipped to stale. Empty when the deployment has no snapshots.
+        reason:
+          type: string
+          pattern: '^[a-z0-9_]{1,64}$'
+          example: operator_force_cold_boot
+        tier_walked:
+          type: array
+          items:
+            type: string
+            enum: [warm, init]
+          description: Snapshot tiers walked by Engine.ForceColdBootNextWake. Fixed at [warm, init] per ADR-005.
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
+
+    # P2c of the operator-side observability mega-PR (Commit 5c).
+    # Returned by POST /v1/admin/builds/sweep-stuck on the 200
+    # path. SweptCount may be 0 when no rows match the threshold
+    # — the audit row is still emitted so the operator's "I
+    # checked" is durable.
+    SweepStuckBuildsResponse:
+      description: |
+        Wire shape for POST /v1/admin/builds/sweep-stuck
+        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
+        row is emitted under operator.action.reclaim_build with
+        account_id=NULL (fleet-level sweep, not tenant-scoped).
+      type: object
+      required: [ok, swept_count, older_than_seconds, threshold_iso]
+      properties:
+        ok: { type: boolean, example: true }
+        swept_count:
+          type: integer
+          minimum: 0
+          description: Rows flipped from 'running' to 'failed' with failure_class='timeout'. 0 when none match.
+        older_than_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Effective threshold after parsing ?older_than=. Clamped to [60, 3600].
+        threshold_iso:
+          type: string
+          format: date-time
+          description: RFC 3339 cutoff timestamp (now - older_than).
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."

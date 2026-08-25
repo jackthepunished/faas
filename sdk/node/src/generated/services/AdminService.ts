@@ -9,7 +9,10 @@ import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js
 import type { BillingPaddleOveragePreflightResponse } from '../models/BillingPaddleOveragePreflightResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
 import type { ConsumeInvoiceResponse } from '../models/ConsumeInvoiceResponse.js';
+import type { ForceColdBootResponse } from '../models/ForceColdBootResponse.js';
+import type { ForceParkResponse } from '../models/ForceParkResponse.js';
 import type { RekeyProgress } from '../models/RekeyProgress.js';
+import type { SweepStuckBuildsResponse } from '../models/SweepStuckBuildsResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -325,6 +328,176 @@ export class AdminService {
         missing or empty). Set the identity path alongside
         the flag, then restart apid.
         `,
+      },
+    });
+  }
+  /**
+   * Force-park a wedged live instance (admin-only).
+   * Operator-side recovery primitive for instances wedged in
+   * {RUNNING, WAKING, COLD_BOOTING} that the customer can't
+   * wait for the idle reaper to handle. Routes through schedd's
+   * existing `ParkInstance` gRPC RPC so the state-machine
+   * guard at `pkg/state/machine.go` fires — schedd is the
+   * ONLY writer to `instances` per CLAUDE.md §6.2.
+   *
+   * Requires `?confirm=true` as a tripwire against operator
+   * fat-fingering. Optional `?reason=<slug>` defaults to
+   * `operator_force_park`; values are clamped to the
+   * `[a-z0-9_]{1,64}` shape.
+   *
+   * @returns ForceParkResponse Park accepted. The instance transitions to PARKED within seconds.
+   * @throws ApiError
+   */
+  public static postForceParkInstance({
+    id,
+    confirm,
+    reason,
+  }: {
+    /**
+     * Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
+     */
+    id: string,
+    /**
+     * Must be the literal string "true" — tripwire on force-park against operator fat-fingering.
+     */
+    confirm: 'true',
+    /**
+     * Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
+     */
+    reason?: string,
+  }): CancelablePromise<ForceParkResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/instances/{id}/force-park',
+      path: {
+        'id': id,
+      },
+      query: {
+        'confirm': confirm,
+        'reason': reason,
+      },
+      errors: {
+        400: `Force-park validation: \`?confirm=true\` is missing or \`?reason=\` failed validation.`,
+        401: `code: unauthorized`,
+        403: `Force-park 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
+        404: `code: instance_not_found — no instance row with the supplied id.`,
+        409: `code: instance_not_parkable — instance state is not in {RUNNING, WAKING, COLD_BOOTING}.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `Force-park 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.`,
+      },
+    });
+  }
+  /**
+   * Mark the latest warm + init snapshots of an app's latest deployment stale (admin-only).
+   * Operator-side recovery primitive for the case where the
+   * live instance is fine but the snapshot backing the warm
+   * tier is suspected to be the carrier of a customer-reported
+   * wedge. Per ADR-005 ("snapshot of a wedged VM is a wedged
+   * VM"), the recovery action is `MarkSnapshotStale` on the
+   * deployment's latest warm + init snapshots — NOT a state-
+   * machine transition. The instance row is NOT mutated;
+   * the next customer Wake takes the cold-boot path through
+   * `engine.go:4800-4820 usableSnapshotForWake` returning
+   * `haveSnap=false`.
+   *
+   * Requires `?confirm=true` as a tripwire. Optional
+   * `?reason=<slug>` defaults to `operator_force_cold_boot`.
+   *
+   * @returns ForceColdBootResponse `snap_ids_marked_stale` may be empty when the deployment has no snapshots.
+   * @throws ApiError
+   */
+  public static postForceColdBootApp({
+    slug,
+    confirm,
+    reason,
+  }: {
+    /**
+     * App slug (e.g. "my-app"). Resolved to the app's latest deployment by `created_at DESC`.
+     */
+    slug: string,
+    /**
+     * Must be the literal string "true" — tripwire on force-cold-boot against operator fat-fingering.
+     */
+    confirm: 'true',
+    /**
+     * Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
+     */
+    reason?: string,
+  }): CancelablePromise<ForceColdBootResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/apps/{slug}/force-cold-boot',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'confirm': confirm,
+        'reason': reason,
+      },
+      errors: {
+        400: `Force-cold-boot validation: \`?confirm=true\` is missing or \`?reason=\` failed validation.`,
+        401: `code: unauthorized`,
+        403: `Force-cold-boot 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
+        404: `code: app_not_found — no app with the supplied slug.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `Force-cold-boot 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.`,
+      },
+    });
+  }
+  /**
+   * Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
+   * Operator-side recovery primitive for builder microVMs that
+   * crashed (OOM, kernel panic, host reboot) and left their
+   * `builds` row in 'running' indefinitely. Mirrors the
+   * in-process reaper at pkg/builderd/reaper.go:48 — the
+   * operator-facing endpoint is the manual escape hatch for
+   * when the reaper's grace period is too long for an
+   * incident.
+   *
+   * `?older_than=` is clamped to [1m, 60m] so a fat-fingered
+   * "1ns" cannot sweep in-flight builds. Default 15m.
+   *
+   * Audit row: operator.action.reclaim_build with
+   * account_id=NULL (fleet-level, not tenant-scoped).
+   *
+   * @returns SweepStuckBuildsResponse Sweep complete. `swept_count` may be 0 when no rows match the threshold.
+   * @throws ApiError
+   */
+  public static postSweepStuckBuilds({
+    confirm,
+    olderThan,
+  }: {
+    /**
+     * Must be the literal string "true" — tripwire on sweep-stuck against operator fat-fingering.
+     */
+    confirm: 'true',
+    /**
+     * Threshold duration. Clamped to [1m, 60m]. Default 15m.
+     */
+    olderThan?: string,
+  }): CancelablePromise<SweepStuckBuildsResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/builds/sweep-stuck',
+      query: {
+        'confirm': confirm,
+        'older_than': olderThan,
+      },
+      errors: {
+        400: `Sweep-stuck validation: \`?confirm=true\` is missing or \`?older_than=\` failed validation.`,
+        401: `code: unauthorized`,
+        403: `Sweep-stuck 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        500: `Store call failed (transient PG hiccup; retry with the same threshold).`,
       },
     });
   }
