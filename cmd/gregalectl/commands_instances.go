@@ -110,6 +110,7 @@ func cmdInstancesForcePark(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-park:", err)
 		return 1
 	}
+	//nolint:errcheck // final stdout write; best-effort status line
 	fmt.Fprintf(os.Stdout, "force-parked %s reason=%s\n", *instanceID, *reason)
 	return 0
 }
@@ -179,6 +180,7 @@ func cmdInstancesForceColdBoot(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-cold-boot:", err)
 		return 1
 	}
+	//nolint:errcheck // final stdout write; best-effort status line
 	fmt.Fprintf(os.Stdout, "force-cold-boot app=%s deployment=%s reason=%s snap_ids=%v\n",
 		*appSlug, dep.ID, *reason, snapIDs)
 	return 0

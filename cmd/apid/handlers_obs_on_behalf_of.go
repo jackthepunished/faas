@@ -39,16 +39,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// onBehalfOfResult carries the resolved target account (when
-// on_behalf_of was supplied and resolved successfully) plus the
-// endpoint string the handler should stamp on the audit row. A
-// nil target means on_behalf_of was absent or resolved to the
-// caller themselves — the handler proceeds with its normal path.
-type onBehalfOfResult struct {
-	target   *state.Account
-	endpoint string
-}
-
 // resolveOnBehalfOf parses ?on_behalf_of= from the URL, resolves
 // the target account (UUID first, slug fallback), gates through
 // s.adminAllows(target), and writes the appropriate RFC 7807

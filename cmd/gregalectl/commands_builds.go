@@ -77,6 +77,7 @@ func cmdBuildsSweepStuck(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl builds sweep-stuck:", err)
 		return 1
 	}
+	//nolint:errcheck // final stdout write; best-effort status line
 	fmt.Fprintf(os.Stdout, "swept=%d older_than=%s threshold_iso=%s\n",
 		swept, olderThan.String(), threshold.UTC().Format(time.RFC3339))
 	return 0
