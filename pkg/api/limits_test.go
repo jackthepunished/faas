@@ -146,7 +146,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// abuse-floor tier carries no per-request telemetry,
 			// no retention, no rate budget. Handler returns 402
 			// ErrPlanFeatureGated before the store is touched.
-			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0},
+			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0, PerAppMetricsAllowed: false, AppUsageSummaryAllowed: false, AppErrorsAllowed: false},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -293,7 +293,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// retention (matches log-archive retention), 1000
 			// req/min ingest, 10 deployments max in the histogram
 			// (small Hobby app), 50 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50, OpenAPIImportsPerAccount: 1000},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50, OpenAPIImportsPerAccount: 1000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -436,7 +436,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-127: Pro = "this month" debugger surface — 7-day
 			// retention, 10000 req/min ingest, 50 deployments in
 			// the histogram, 200 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200, OpenAPIImportsPerAccount: 10000},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, CertExpiryWarningDays: 30, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -590,7 +590,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// cap, a fleet with thousands of historical deployments
 			// would blow up Prometheus cardinality), 1000 spans per
 			// trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000, OpenAPIImportsPerAccount: 10000},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -2290,6 +2290,106 @@ func TestPlanWebSocketEnabled_UnknownFailsClosed(t *testing.T) {
 	}
 	if got := unknown.WebSocketResponseAllowed(); got {
 		t.Errorf("Plan(nonexistent).WebSocketResponseAllowed() = true, want false (fail-closed)")
+	}
+}
+
+// TestPlanPerAppMetricsAllowed pins the per-plan gate that apid's
+// per-app observability handlers consult
+// (cmd/apid/handlers_metrics.go +
+// cmd/apid/handlers_wake_timeline.go). The handler returns 402
+// ErrPlanPerAppMetricsNotAllowed when this returns false. Free must
+// fail closed (the surface is paid-only); Hobby/Pro/Scale must
+// return true. Mirrors the gating posture of
+// TestPlanMinInstancesAllowed above and TestPlanStreaming.
+func TestPlanPerAppMetricsAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		plan   Plan
+		want   bool
+		reason string
+	}{
+		{PlanFree, false, "Free is the abuse-floor tier; the per-app dashboard is paid-only"},
+		{PlanHobby, true, "Hobby is the first paid tier; 'see what you pay for' is the upsell"},
+		{PlanPro, true, "Pro is the first tier where production observability matters"},
+		{PlanScale, true, "Scale is the tier where enterprise observability matters"},
+	} {
+		t.Run(string(tc.plan), func(t *testing.T) {
+			if got := tc.plan.PerAppMetricsAllowed(); got != tc.want {
+				t.Errorf("%s.PerAppMetricsAllowed() = %v, want %v (%s)",
+					tc.plan, got, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+// TestPlanAppUsageSummaryAllowed pins the per-plan gate that
+// apid's billing-usage handler consults
+// (cmd/apid/handlers_usage.go). The handler returns 402
+// ErrPlanAppUsageSummaryNotAllowed when this returns false. Free
+// must fail closed (billing-transparency is paid-only); Hobby/Pro/
+// Scale must return true.
+func TestPlanAppUsageSummaryAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		plan   Plan
+		want   bool
+		reason string
+	}{
+		{PlanFree, false, "Free is the abuse-floor tier; billing-usage read is paid-only"},
+		{PlanHobby, true, "Hobby is the first paid tier; billing transparency is part of the contract"},
+		{PlanPro, true, "Pro is the first tier with production-grade billing visibility"},
+		{PlanScale, true, "Scale is the tier where enterprise billing visibility matters"},
+	} {
+		t.Run(string(tc.plan), func(t *testing.T) {
+			if got := tc.plan.AppUsageSummaryAllowed(); got != tc.want {
+				t.Errorf("%s.AppUsageSummaryAllowed() = %v, want %v (%s)",
+					tc.plan, got, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+// TestPlanAppErrorsAllowed pins the per-plan gate that apid's
+// error-fingerprint handler consults
+// (cmd/apid/handlers_app_errors.go). The handler returns 402
+// ErrPlanAppErrorsNotAllowed when this returns false. Free must
+// fail closed (grouped errors are paid-only); Hobby/Pro/Scale must
+// return true.
+func TestPlanAppErrorsAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		plan   Plan
+		want   bool
+		reason string
+	}{
+		{PlanFree, false, "Free is the abuse-floor tier; error grouping is paid-only"},
+		{PlanHobby, true, "Hobby is the first paid tier; 'see what failed' is the upsell"},
+		{PlanPro, true, "Pro is the first tier with production-grade error visibility"},
+		{PlanScale, true, "Scale is the tier where enterprise error visibility matters"},
+	} {
+		t.Run(string(tc.plan), func(t *testing.T) {
+			if got := tc.plan.AppErrorsAllowed(); got != tc.want {
+				t.Errorf("%s.AppErrorsAllowed() = %v, want %v (%s)",
+					tc.plan, got, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+// TestPlanPerAppObservability_UnknownFailsClosed pins the
+// fail-closed contract for the three per-app observability
+// accessors above. A typo in apid's buildApp (e.g. Plan("freee"))
+// must not silently enable the per-app dashboard on a plan that
+// doesn't allow it — the worst case is a Free customer reading
+// Hobby+ telemetry unmetered. Same shape as
+// TestPlanWebSocketEnabled_UnknownFailsClosed.
+func TestPlanPerAppObservability_UnknownFailsClosed(t *testing.T) {
+	const unknown = Plan("nonexistent")
+	if got := unknown.PerAppMetricsAllowed(); got {
+		t.Errorf("Plan(nonexistent).PerAppMetricsAllowed() = true, want false (fail-closed)")
+	}
+	if got := unknown.AppUsageSummaryAllowed(); got {
+		t.Errorf("Plan(nonexistent).AppUsageSummaryAllowed() = true, want false (fail-closed)")
+	}
+	if got := unknown.AppErrorsAllowed(); got {
+		t.Errorf("Plan(nonexistent).AppErrorsAllowed() = true, want false (fail-closed)")
 	}
 }
 
