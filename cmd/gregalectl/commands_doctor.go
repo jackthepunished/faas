@@ -234,7 +234,7 @@ func cmdDoctorDispatch(args []string) int {
 
 	// Open the DB pool lazily so checks 1-3 can run without one.
 	// Doctor must work on a fresh box with no DB reachable.
-	pool, dbErr := openPgPoolFromEnv()
+	pool, dbErr := openPgPoolFromEnv(context.Background())
 	if dbErr != nil {
 		if *deep {
 			// Deep requires DB (check 6 walks ListComputeNodes).

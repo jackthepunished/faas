@@ -70,7 +70,7 @@ var nodeJoinStoreOpener = openNodeJoinStore
 var joinControlPlaneVerifier = verifyAndActivateJoinedNode
 
 func openNodeJoinStore() (nodejoin.Store, func(), error) {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("gregalectl deploy join-node: %w", err)
 	}
@@ -613,7 +613,7 @@ func registerJoinReleaseBundle(ctx context.Context, tarballPath, expectedGitSHA,
 		return fmt.Errorf("embedded release manifest_hash=%s does not match topology manifest %s", releaseManifest.ManifestHash, expectedManifestHash)
 	}
 
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(ctx)
 	if err != nil {
 		return err
 	}

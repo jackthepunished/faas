@@ -191,7 +191,7 @@ func cmdReleaseBundle(args []string) int {
 	// still have the on-disk manifest — the operator can retry
 	// the INSERT (release_bundles has no UNIQUE on git_sha so
 	// retries would collide; the CLI surfaces that as a conflict).
-	pool, dbErr := openPgPoolFromEnv()
+	pool, dbErr := openPgPoolFromEnv(context.Background())
 	if dbErr != nil {
 		if jsonEnabled() {
 			jsonEmit(os.Stdout, releaseBundleReport{
@@ -499,7 +499,7 @@ func cmdReleaseInstall(args []string) int {
 	// (no DSN, no row) — that's the legacy first-boot path; we
 	// fall through to the env fallback. node is the canonical
 	// compute_nodes.name for this box.
-	openPool, dbErr := openPgPoolFromEnv()
+	openPool, dbErr := openPgPoolFromEnv(context.Background())
 	if dbErr != nil {
 		openPool = nil // legacy / --no-db mode
 	} else {
@@ -897,7 +897,7 @@ func extractTarballMember(packed []byte, name string) ([]byte, error) {
 // DATABASE_URL is the name emitted by the control-plane sealed.env
 // and is therefore the production fallback. Returns an error when
 // neither variable is set.
-func openPgPoolFromEnv() (*pgxpool.Pool, error) {
+func openPgPoolFromEnv(ctx context.Context) (*pgxpool.Pool, error) {
 	dsn := os.Getenv("FAAS_PG_DSN")
 	if dsn == "" {
 		dsn = os.Getenv("DATABASE_URL")
@@ -921,7 +921,7 @@ func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse database DSN: %w", err)
 	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pgxpool: %w", err)
 	}

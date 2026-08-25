@@ -342,7 +342,7 @@ func cmdManifestRender(args []string) int {
 // warning (the render itself succeeded; the operator can re-run
 // with FAAS_PG_DSN or DATABASE_URL set after the next deploy).
 func writeComputeNodeRole(name, role string) error {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return err
 	}
