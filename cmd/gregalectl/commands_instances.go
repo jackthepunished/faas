@@ -238,9 +238,38 @@ func cmdInstancesForceRestart(args []string) int {
 		return 1
 	}
 	defer closeFn()
+	// ForceRestartInstance returns (snapIDs, err) in three of the
+	// four outcomes:
+	//   - happy           : (snapIDs, nil)         — len(snapIDs) >= 1
+	//   - partial-success : (snapIDs, destroyErr)  — len(snapIDs) >= 1
+	//   - race-loser      : (nil,    ErrInstanceNotRunning)
+	//   - not-found       : (nil,    ErrNotFound)
+	//   - unexpected      : (nil,    err)
+	// The partial-success case is the load-bearing one for R6:
+	// the deployment's warm + init snapshots ARE stale in the
+	// database (the customer's next Wake WILL cold-boot), but
+	// the destroy errored (vmmd wedged). Print snap IDs on the
+	// error path so the operator learns the durable signal —
+	// otherwise the CLI looks like a hard failure with no
+	// upside.
 	snapIDs, err := cli.ForceRestartInstance(context.Background(), *instanceID, *reason)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-restart:", err)
+		if len(snapIDs) > 0 {
+			// Partial-success: snaps were flipped before the
+			// destroy errored. Annotate the stderr line so the
+			// operator's incident-log grep distinguishes
+			// "destroy failed AND next wake is still cold-boot"
+			// from "destroy failed AND nothing landed". The
+			// audit row + operator_intent row already agree on
+			// this shape (R4 review fix); the CLI is just
+			// closing the surface so the operator's
+			// `force-restart $id --yes` return-code is not the
+			// only feedback channel.
+			fmt.Fprintf(os.Stderr,
+				"gregalectl instances force-restart: snap_ids_marked_stale=%v — next wake will be a cold boot despite the destroy error\n",
+				snapIDs)
+		}
 		return 1
 	}
 	//nolint:errcheck // final stdout write; best-effort status line
