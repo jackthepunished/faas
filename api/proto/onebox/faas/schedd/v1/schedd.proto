@@ -67,6 +67,18 @@ service Schedd {
   // for the obvious error paths.
   rpc ParkInstance(ParkInstanceRequest) returns (ParkInstanceResponse);
 
+  // ForceColdBootNextWake asks schedd to mark the deployment's
+  // latest warm + init snapshots stale so the next customer Wake
+  // cold-boots from rootfs per ADR-005. Operator-side recovery
+  // primitive (P2b of the operator-side observability mega-PR):
+  // when a wedged instance is reported and the snapshot is
+  // suspected to be the carrier, the on-call engineer forces a
+  // one-shot cold-boot instead of parking the live instance.
+  // Returns the snap IDs that were marked stale (empty when the
+  // deployment has no snapshots — durable no-op). NotFound when
+  // the deployment does not exist. Idempotent.
+  rpc ForceColdBootNextWake(ForceColdBootNextWakeRequest) returns (ForceColdBootNextWakeResponse);
+
   // ListInstanceStats returns the per-instance CPU-µs snapshot the
   // schedd's instancestats.Poller maintains (issue #279 / PR-B).
   // meterdsamp the per-minute CPU delta from this snapshot and
@@ -541,6 +553,23 @@ message ParkInstanceResponse {
   // ok reports whether the park succeeded. False means the instance
   // was already parked (idempotent) or didn't exist.
   bool ok = 1;
+}
+
+// ForceColdBootNextWakeRequest asks schedd to mark a deployment's
+// latest warm + init snapshots stale. The deployment_id is the
+// apps.deployments.id row (NOT the apps.id). Returns the IDs of
+// the snapshots marked stale — empty list means the deployment
+// has no snapshots (durable no-op).
+message ForceColdBootNextWakeRequest {
+  string deployment_id = 1;
+}
+
+message ForceColdBootNextWakeResponse {
+  // snap_ids_marked_stale is the list of snapshot IDs that were
+  // transitioned to stale=true. Empty when the deployment has no
+  // snapshots in either tier. Order is not significant (warm then
+  // init when both exist).
+  repeated string snap_ids_marked_stale = 1;
 }
 
 // InstanceStatsRow is the schedd-side per-instance stat row that

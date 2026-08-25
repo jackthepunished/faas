@@ -5187,6 +5187,57 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	return nil
 }
 
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) marks a deployment's latest warm + init snapshots
+// stale so the next customer Wake cold-boots from rootfs per
+// ADR-005 ("snapshot of a wedged VM is a wedged VM"). This is the
+// recovery primitive for the case where the live instance is fine
+// (or already parked by the operator) but the snapshot backing
+// the warm tier is suspected to be the carrier of the customer-
+// reported wedge. Unlike DestroyForLivenessFailure, this method
+// does NOT touch the instance state machine, does NOT acquire
+// lockApp (no transition is happening), and does NOT destroy a
+// VM — it's a snapshot-policy flip only.
+//
+// Returns the snap IDs that were marked stale, in (warm, init)
+// order. Empty list when the deployment has no snapshots in
+// either tier (durable no-op — the operator audit row still
+// records the call so a future operator can see the action was
+// taken).
+//
+// Idempotent: MarkSnapshotStale is itself idempotent (stale=
+// true on an already-stale row is a no-op). state.ErrNotFound
+// when the deployment_id has no row in apps.deployments; the
+// caller (gRPC layer) maps that to codes.NotFound.
+//
+// Best-effort: a MarkSnapshotStale failure on one tier does not
+// stop the other tier from being marked stale. The first error
+// is logged + dropped — the audit row + the wire response are
+// the durable record of what was attempted.
+func (e *Engine) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+	deployment, err := e.store.DeploymentByID(ctx, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	var snapIDs []string
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deployment.ID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if merr := e.store.MarkSnapshotStale(ctx, snap.ID); merr != nil {
+			e.log.Warn("force_cold_boot: mark snapshot stale failed",
+				"deployment_id", deploymentID,
+				"snap_id", snap.ID,
+				"tier", tier,
+				"err", merr.Error())
+			continue
+		}
+		snapIDs = append(snapIDs, snap.ID)
+	}
+	return snapIDs, nil
+}
+
 // DestroyForWorkloadOOMFailure (Cluster C / ADR-121) is the
 // workload-OOM-triggered destroy path. The producer chain is:
 //

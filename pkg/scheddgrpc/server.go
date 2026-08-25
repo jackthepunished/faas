@@ -176,6 +176,13 @@ type SchedAPI interface {
 	// The reason string is for the audit log; the park semantics are
 	// identical to the idle-reaper Park.
 	ParkWithReason(ctx context.Context, instanceID, reason string) error
+	// ForceColdBootNextWake (P2b of the operator-side observability
+	// mega-PR) marks a deployment's latest warm + init snapshots
+	// stale so the next customer Wake cold-boots from rootfs per
+	// ADR-005. Returns the snap IDs that were marked stale — empty
+	// list when the deployment has no snapshots (durable no-op).
+	// See Engine.ForceColdBootNextWake for the full contract.
+	ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error)
 	// StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B
 	// acceptance #3 + #4) fans out the per-instance log stream
 	// to a callback. The engine resolves the live instances,
@@ -525,6 +532,34 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &scheddpb.ParkInstanceResponse{Ok: true}, nil
+}
+
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) is the operator-side recovery primitive for the case
+// where the live instance is fine but the snapshot backing the
+// warm tier is suspected to be the carrier of a customer-reported
+// wedge. The handler is a thin wrapper around
+// Engine.ForceColdBootNextWake: it returns the snap IDs that were
+// marked stale (empty list = no snapshots, durable no-op), or
+// NotFound when the deployment_id is unknown. Idempotent — see
+// Engine.ForceColdBootNextWake doc-comment.
+func (s *Server) ForceColdBootNextWake(ctx context.Context, req *scheddpb.ForceColdBootNextWakeRequest) (*scheddpb.ForceColdBootNextWakeResponse, error) {
+	const op = "ForceColdBootNextWake"
+	start := time.Now()
+	snapIDs, err := s.engine.ForceColdBootNextWake(ctx, req.GetDeploymentId())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		// ErrNotFound → NotFound status; everything else Internal.
+		// The ErrNotFound mapping is the load-bearing one: apid's
+		// handler turns NotFound into 404 with code
+		// "deployment_not_found" so the operator UI can render a
+		// "double-check the deployment id" tile.
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &scheddpb.ForceColdBootNextWakeResponse{SnapIdsMarkedStale: snapIDs}, nil
 }
 
 // ReportLivenessFailed (issue #554 / ADR-078) is the vmmd
