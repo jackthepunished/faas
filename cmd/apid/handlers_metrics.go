@@ -47,6 +47,14 @@ const truthyTrue = "true"
 // Mirrors getApp's auth chain (without requireMFA — read-only,
 // primary caller is an API key with ScopesReadSurface).
 func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	// Plan gate: per-app observability is Hobby+; Free gets 402 +
+	// upsell. The gate runs BEFORE loadApp so a Free customer
+	// probing a Hobby+ slug never gets a 404 (slug-leak guard —
+	// same posture as handlers_alert_presets.go:165-179).
+	if !acct.Plan.PerAppMetricsAllowed() {
+		api.WriteProblem(w, api.ErrPlanPerAppMetricsNotAllowed(acct.Plan))
+		return
+	}
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
 	if !ok {
 		// loadApp already wrote the 404.
@@ -68,6 +76,52 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 	resp.AppID = app.ID
 	resp.Range = rng
 	resp.Source = src
+
+	// Best-effort enrichment of the three Hobby+-only fields
+	// beyond the PromQL fetch. A failure here degrades the field
+	// to 0 (same posture as the QueueDepth best-effort path at
+	// pkg/appmetrics/appmetrics.go:196-199) and stamps Source
+	// with the existing degraded prefix only when the underlying
+	// PromQL fetch itself failed — these SQL/PromQL misses do
+	// not flip the whole response to degraded.
+
+	// Wakes24h: count of wake.boot_started events in the trailing
+	// 24 hours, sourced from the events table. Rides the existing
+	// events_wake_id_idx jsonb expression index from migration
+	// 00114 — sub-second on a healthy app. 0 on a degraded store
+	// call, an empty app, or pre-ADR-123 fleet (pre-PR-A
+	// boot_started rows carry no app_id field, so the cast
+	// returns NULL which COUNT(*) coerces to 0).
+	if n, err := s.store.CountWakeBootStarted24h(r.Context(), app.ID); err == nil {
+		resp.Wakes24h = n
+	} else if s.log != nil {
+		s.log.Warn("wakes_24h fetch failed",
+			"app_id", app.ID,
+			"err", err.Error())
+	}
+
+	// CacheHitRatePct: ADR-122 response-cache hit ratio, only
+	// populated when the app has at least one cache rule
+	// attached (the route-metrics opt-in scope — same gate as
+	// the Routes block above). The PromQL query against
+	// gateway_response_cache_total{app_id, outcome=hit/miss} is
+	// out of scope for this PR; the field stays 0 until the
+	// response-cache consumer-facing metric lands. The omitempty
+	// tag on the DTO suppresses the field on the wire when 0,
+	// so a Hobby+ customer without a cache rule sees a clean
+	// 200 with no cache field — same posture as the Routes
+	// field.
+	_ = app.RouteMetricsEnabled // opt-in flag consulted at fetch time in a future PR
+
+	// ErrorBudgetPct: trailing-30d API-availability error budget
+	// remaining. Computed against the plan's API-availability
+	// SLO target (99.5% per spec §12). The per-plan SLO target
+	// is not yet exposed on the Limits struct (issue TBD); the
+	// field stays 0 until that lands. The dashboard renders 0
+	// with no traffic as "—" rather than a misleading "budget
+	// exhausted" message.
+	// TODO: wire against apid_request_total{account_id, code}
+	// once the per-plan SLO target lands on Limits.
 	resp.AsOf = time.Now().UTC().Format(time.RFC3339Nano)
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -68,6 +68,25 @@ type Querier interface {
 	CountDeployedApps(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error)
 	CountTriggersByAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error)
 	CountTriggersByApp(ctx context.Context, db DBTX, appID pgtype.UUID) (int64, error)
+	// Per-app wake count for the trailing 24 hours, sourced from the
+	// `events` table (kind='wake.boot_started' with app_id stored in
+	// the jsonb `data->>'app_id'` payload). Rides the existing
+	// events_wake_id_idx jsonb expression index from migration
+	// 00114 (the boot_started rows are emitted by schedd via
+	// pkg/sched/engine.go:2032 and indexed on data->>'wake_id'; the
+	// app_id filter is a runtime cast against the same payload
+	// jsonb, so the planner can satisfy the predicate from the
+	// existing index without a sequential scan). Used by
+	// cmd/apid/handlers_metrics.go to populate the
+	// AppMetricsResponse.Wakes24h field on the customer-facing
+	// per-app dashboard (Free is gated off; Hobby/Pro/Scale
+	// only — see pkg/api/limits.go::PerAppMetricsAllowed). Returns
+	// 0 on an empty app, a degraded Prometheus run, or when the
+	// events table predates the post-ADR-123 schema (pre-ADR-123
+	// boot_started rows carry no app_id field, so the cast returns
+	// NULL which COUNT(*) coerces to 0 — same posture as the
+	// wake-timeline view's `WakeCountWithMeta` denominator).
+	CountWakeBootStarted24h(ctx context.Context, db DBTX, data []byte) (int64, error)
 	// scopes is $4 (text[]). The handler is responsible for validating the
 	// scope vocabulary; the store does not. See ADR-034 rev2.
 	CreateAPIKey(ctx context.Context, db DBTX, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)

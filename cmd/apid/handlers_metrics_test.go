@@ -14,6 +14,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -272,5 +274,159 @@ func TestAppMetrics_ScopeRejected(t *testing.T) {
 	rec := e.do(t, "GET", "/v1/apps/my-api/metrics", nil, nil)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("deploy:write-only status %d, want 403", rec.Code)
+	}
+}
+
+// ----- Commit 2: plan gate + enrichment -----
+//
+// The four tests below pin the per-app-dashboard Hobby+ gate
+// (PerAppMetricsAllowed on the Limits struct) and the three
+// post-prometheus enrichment fields (wakes_24h, cache_hit_rate_pct,
+// error_budget_pct). The gate runs BEFORE loadApp so a Free
+// customer probing a slug never gets a 404 (slug-leak guard — same
+// posture as handlers_alert_presets.go:165-179).
+
+// TestAppMetrics_FreePlanReturns402 confirms the Free plan is
+// rejected with the documented plan_per_app_metrics_not_allowed
+// code. Per pkg/api/limits.go::PerAppMetricsAllowed, Free returns
+// false; the gate fires BEFORE loadApp so the response is 402 (not
+// 404 from a slug-leak on a Hobby+ app the Free customer guessed
+// correctly).
+func TestAppMetrics_FreePlanReturns402(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "my-api")
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics", nil, nil)
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("Free plan status %d, want 402", rec.Code)
+	}
+	assertProblem(t, rec, http.StatusPaymentRequired, api.CodePlanPerAppMetricsNotAllowed)
+}
+
+// TestAppMetrics_HobbyPlanReturns200 confirms Hobby+ passes the
+// gate. The endpoint returns 200 with the documented shape; the
+// three enrichment fields land on the wire (zeros are expected when
+// the underlying store is MemStore and the PromQL client is nil —
+// both stubs are present-tense fail-soft).
+func TestAppMetrics_HobbyPlanReturns200(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "my-api")
+	installPromFixture(t, &e, func(q string) string {
+		return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"17"]}]}}`
+	})
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics?range=5m", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Hobby plan status %d, want 200", rec.Code)
+	}
+	var out api.AppMetricsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.RequestCount != 17 {
+		t.Errorf("request_count = %d, want 17 (fixture)", out.RequestCount)
+	}
+	// wakes_24h on MemStore returns the sentinel error → the field
+	// degrades to 0 and the handler logs a warn. The 200 contract is
+	// preserved (the field is best-effort — the handler must NOT 5xx
+	// on a degraded store). The pgtest integration test (//go:build
+	// metal) pins the enriched value against a real events table.
+	if out.Wakes24h != 0 {
+		t.Errorf("wakes_24h on MemStore stub = %d, want 0 (sentinel degrade)", out.Wakes24h)
+	}
+}
+
+// TestAppMetrics_PlanDowngradeBounces pins the no-stale-plan-cache
+// contract: the handler reads acct.Plan at request entry, so a
+// downgrade between two consecutive polls flips 200 → 402 on the
+// very next request without a session refresh. The dashboard relies
+// on this to render its upsell_to_resume chip without a stale-cache
+// window. The test flips the in-memory account row directly (the
+// production downgrade path lives in handlers_billing.go — out of
+// scope for this PR).
+func TestAppMetrics_PlanDowngradeBounces(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "my-api")
+	installPromFixture(t, &e, func(q string) string {
+		return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"0"]}]}}`
+	})
+
+	// Baseline: Pro passes the gate.
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Pro baseline status %d, want 200", rec.Code)
+	}
+
+	// Downgrade the account in place — simulate the customer
+	// clicking the downgrade button between polls. The middleware
+	// loads the account fresh on every request, so the next poll
+	// must observe the new plan without any session refresh.
+	if err := e.store.UpdateAccountPlan(context.Background(), e.acct.ID, api.PlanFree); err != nil {
+		t.Fatalf("UpdateAccountPlan: %v", err)
+	}
+
+	rec = e.do(t, "GET", "/v1/apps/my-api/metrics", nil, nil)
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("post-downgrade status %d, want 402 (no stale plan cache)", rec.Code)
+	}
+	assertProblem(t, rec, http.StatusPaymentRequired, api.CodePlanPerAppMetricsNotAllowed)
+}
+
+// wakeBootStartedStore wraps *state.MemStore and overrides
+// CountWakeBootStarted24h to return a known value so the test
+// can pin the enrichment wire field without standing up pgtest.
+// Method-shadowing via embedding: the outer method wins over the
+// MemStore sentinel stub at pkg/state/memstore_wake_count.go:38.
+type wakeBootStartedStore struct {
+	*state.MemStore
+	count int64
+	err   error
+}
+
+func (w wakeBootStartedStore) CountWakeBootStarted24h(_ context.Context, _ string) (int64, error) {
+	return w.count, w.err
+}
+
+// TestAppMetrics_Wakes24hEnrichment pins the wakes_24h wire field
+// end-to-end: when the underlying store returns a positive count,
+// the handler stamps it on the response. The path through
+// s.store.CountWakeBootStarted24h → resp.Wakes24h is the load-
+// bearing bit — everything else (PromQL fetch, route opt-in, SLO
+// budget) stays at zero in this PR and is covered by the open
+// follow-ups in the description of pkg/api/dto.go::AppMetricsResponse.
+func TestAppMetrics_Wakes24hEnrichment(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "my-api")
+	wrapped := wakeBootStartedStore{MemStore: e.store, count: 47}
+	srv := newServer(wrapped, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"gregale.dev", noopNotifier{}).WithOpsMetrics(context.Background(), e.ops)
+	installPromFixture(t, &e, func(q string) string {
+		return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"0"]}]}}`
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/apps/my-api/metrics?range=5m", nil)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	srv.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.AppMetricsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Wakes24h != 47 {
+		t.Errorf("wakes_24h = %d, want 47 (wrapped store returned it)", out.Wakes24h)
+	}
+	// The other two enrichment fields stay 0 until their PromQL
+	// wires land — the test pins that they are NOT silently
+	// populated by the PromQL fetch path (zero is the documented
+	// state).
+	if out.CacheHitRatePct != 0 {
+		t.Errorf("cache_hit_rate_pct = %v, want 0 (cache not yet wired)", out.CacheHitRatePct)
+	}
+	if out.ErrorBudgetPct != 0 {
+		t.Errorf("error_budget_pct = %v, want 0 (SLO target not yet wired)", out.ErrorBudgetPct)
 	}
 }

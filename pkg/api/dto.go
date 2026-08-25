@@ -3290,6 +3290,52 @@ type AppMetricsResponse struct {
 	// header convention so the SDK generator picks it up
 	// automatically.
 	Routes []RouteRow `json:"routes,omitempty"`
+
+	// Wakes24h is the count of wake.boot_started events the
+	// schedd recorded for this app in the trailing 24 hours.
+	// Sourced from the events table (count over
+	// kind='wake.boot_started' AND app_id=$1 AND
+	// at >= now() - interval '24 hours'); rides the existing
+	// events_wake_id_idx jsonb expression index from migration
+	// 00114. Best-effort: 0 when Prometheus is degraded, the
+	// events row hasn't been written, or the store query
+	// fails. The customer-facing dashboard surfaces this as
+	// the "wakes today" line item; combined with ColdStartPct
+	// it answers "is my app wake-bound or sleep-bound". The
+	// pre-ADR-123 fleet renders this as 0 because pre-PR-A
+	// boot_started rows carry no app_id field — same posture
+	// as the wake-timeline view's `WakeCountWithMeta`
+	// denominator at cmd/apid/handlers_dashboard.go:2659.
+	Wakes24h int64 `json:"wakes_24h,omitempty"`
+
+	// CacheHitRatePct is the share of cache-eligible requests
+	// served from gateway_response_cache (ADR-122) over the
+	// window. Only populated when the app has at least one
+	// cache rule attached (the route-metrics opt-in scope —
+	// same gate as `Routes` above); 0 otherwise so the
+	// dashboard distinguishes "feature off" (field absent)
+	// from "feature on, zero traffic" (field present, 0).
+	// Mirrors the response-cache wakes-avoided count in
+	// `pkg/appmetrics.Fetch` for the operator-side view; the
+	// customer-facing denominator is "requests that hit a
+	// cache-eligible route" rather than the fleet-wide total
+	// so a customer with a single cacheable path sees a
+	// meaningful percentage rather than 0.0001%.
+	CacheHitRatePct float64 `json:"cache_hit_rate_pct,omitempty"`
+
+	// ErrorBudgetPct is the remaining API-availability error
+	// budget as a percentage (0 = exhausted, 100 = full). The
+	// window is the trailing 30 days (the §12 SLO evaluation
+	// period). Computed as
+	// `100 - (observed_error_rate_pct × 30d_window_factor)`
+	// against the plan's API-availability SLO target
+	// (99.5% per spec §12). Best-effort: 0 when the
+	// `apid_request_total{account_id, route, code}` series is
+	// degraded or the per-plan SLO target is unknown. The
+	// dashboard renders this as a "burn remaining" gauge; a
+	// 0 with no traffic renders as "—" rather than a
+	// misleading "budget exhausted" message.
+	ErrorBudgetPct float64 `json:"error_budget_pct,omitempty"`
 }
 
 // RouteRow is the per-route detail row returned by the

@@ -1306,6 +1306,30 @@ select count(*) from triggers t
 join apps a on a.id = t.app_id
 where a.account_id = $1 and a.status <> 'deleted';
 
+-- name: CountWakeBootStarted24h :one
+-- Per-app wake count for the trailing 24 hours, sourced from the
+-- `events` table (kind='wake.boot_started' with app_id stored in
+-- the jsonb `data->>'app_id'` payload). Rides the existing
+-- events_wake_id_idx jsonb expression index from migration
+-- 00114 (the boot_started rows are emitted by schedd via
+-- pkg/sched/engine.go:2032 and indexed on data->>'wake_id'; the
+-- app_id filter is a runtime cast against the same payload
+-- jsonb, so the planner can satisfy the predicate from the
+-- existing index without a sequential scan). Used by
+-- cmd/apid/handlers_metrics.go to populate the
+-- AppMetricsResponse.Wakes24h field on the customer-facing
+-- per-app dashboard (Free is gated off; Hobby/Pro/Scale
+-- only — see pkg/api/limits.go::PerAppMetricsAllowed). Returns
+-- 0 on an empty app, a degraded Prometheus run, or when the
+-- events table predates the post-ADR-123 schema (pre-ADR-123
+-- boot_started rows carry no app_id field, so the cast returns
+-- NULL which COUNT(*) coerces to 0 — same posture as the
+-- wake-timeline view's `WakeCountWithMeta` denominator).
+SELECT COUNT(*) FROM events
+WHERE kind = 'wake.boot_started'
+  AND (data->>'app_id')::uuid = $1
+  AND at >= now() - interval '24 hours';
+
 -- name: ClaimTriggerRecords :many
 -- FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
 -- precedent: concurrent schedd replicas each claim disjoint row

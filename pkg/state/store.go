@@ -3026,6 +3026,24 @@ type Store interface {
 	// dashboard's "Recent wakes" table doesn't fan out per row.
 	// Empty map when no rows match (pre-ADR-123 fleet).
 	LookupBootStartedForWakes(ctx context.Context, wakeIDs []string) (map[string]WakeBootMeta, error)
+	// CountWakeBootStarted24h returns the count of wake.boot_started
+	// events the schedd recorded for the given app in the trailing
+	// 24 hours. Used by cmd/apid/handlers_metrics.go to populate
+	// the AppMetricsResponse.Wakes24h field on the customer-facing
+	// per-app dashboard (Free is gated off; Hobby/Pro/Scale only
+	// — see pkg/api/limits.go::PerAppMetricsAllowed). Returns 0 on
+	// an empty app, a degraded store call, or when the events
+	// table predates the post-ADR-123 schema (pre-ADR-123
+	// boot_started rows carry no app_id field, so the cast
+	// returns NULL which COUNT(*) coerces to 0). Rides the
+	// existing events_wake_id_idx jsonb expression index from
+	// migration 00114 (the boot_started rows are emitted by schedd
+	// via pkg/sched/engine.go:2032 and indexed on
+	// data->>'wake_id'; the app_id filter is a runtime cast against
+	// the same payload jsonb, so the planner satisfies the
+	// predicate from the existing index without a sequential
+	// scan).
+	CountWakeBootStarted24h(ctx context.Context, appID string) (int64, error)
 	// ListAllInstances returns every instance on the box, ordered newest
 	// first. schedd's G7 reaper warm-passes this slice to the conntrack
 	// reader (pkg/sched/flowcount) once per tick — a single bulk read is

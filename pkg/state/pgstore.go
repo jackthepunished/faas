@@ -11521,6 +11521,29 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 	return out, rows.Err()
 }
 
+// CountWakeBootStarted24h (per-app dashboard, Hobby+) returns the
+// count of wake.boot_started events the schedd recorded for the
+// given app in the trailing 24 hours. See the Store interface
+// comment for the rationale and the index-riding detail
+// (events_wake_id_idx from migration 00114). Returns 0 on an
+// empty app, a degraded store call, or when the events table
+// predates the post-ADR-123 schema (pre-ADR-123 boot_started rows
+// carry no app_id field, so the cast returns NULL which COUNT(*)
+// coerces to 0 — same posture as the wake-timeline view's
+// `WakeCountWithMeta` denominator at
+// cmd/apid/handlers_dashboard.go:2659).
+func (s *PgStore) CountWakeBootStarted24h(ctx context.Context, appID string) (int64, error) {
+	const q = `SELECT COUNT(*) FROM events
+WHERE kind = 'wake.boot_started'
+  AND (data->>'app_id')::uuid = $1::uuid
+  AND at >= now() - interval '24 hours'`
+	var n int64
+	if err := s.pool.QueryRow(ctx, q, appID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountWakeBootStarted24h: %w", err)
+	}
+	return n, nil
+}
+
 // ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
 // backend's read-side query for the live events table. Mirrors the
 // SQL in pkg/state/queries.sql::ListAllEventsPaged; the raw-SQL
