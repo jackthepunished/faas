@@ -2598,6 +2598,47 @@ type Store interface {
 	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
 	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
 
+	// Operator intent queue (PR #1099 P2 redesign / migrations/00445).
+	// apid inserts on the two admin recovery endpoints
+	// (POST /v1/admin/instances/{id}/force-park and
+	// POST /v1/admin/apps/{slug}/force-cold-boot), emits
+	// db.NotifyOperatorIntent, returns 202 Accepted. schedd (the
+	// only consumer) claims via FOR UPDATE SKIP LOCKED LIMIT 1 and
+	// dispatches by kind. Routes the admin primitives through a
+	// table + pg_notify seam so apid never imports pkg/scheddgrpc
+	// (the apid-control-plane-only depguard rule is preserved).
+	//
+	// Metadata is opaque json.RawMessage; today it's always empty
+	// (force_park / force_cold_boot carry no extra payload) but the
+	// column is reserved for future per-kind fields without a
+	// migration.
+	InsertOperatorIntent(
+		ctx context.Context,
+		kind OperatorIntentKind,
+		targetID string,
+		accountID *string,
+		actorID string,
+		reason string,
+		metadata json.RawMessage,
+	) (string, error)
+	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
+	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
+	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error
+	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
+	// ReclaimStuckRunningOperatorIntents resets every operator_intents
+	// row whose status='running' AND whose started_at is older than
+	// threshold back to status='pending' (clearing started_at to NULL)
+	// so the next ClaimPendingOperatorIntent call picks it up. Used by
+	// schedd's operatorIntentStuckRunningTimeout safety tick — without
+	// it, a schedd crash between Claim and Mark* leaves the row stuck
+	// in `running` forever and the intent is silently dropped.
+	//
+	// Returns the number of rows affected. Idempotent: a second call
+	// with the same threshold after the rows have been re-claimed
+	// affects 0 rows. The reclaim is a single UPDATE so the
+	// FOR UPDATE SKIP LOCKED claim path sees a consistent snapshot.
+	ReclaimStuckRunningOperatorIntents(ctx context.Context, threshold time.Time) (int, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the
@@ -3506,6 +3547,26 @@ type Store interface {
 	// CPU/disk fields are nil). The LEFT JOIN onto compute_nodes is
 	// done in the handler; this query is just the latest-row-per-node.
 	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// LatestBuilderHeartbeatStats (operator-side observability
+	// mega-PR / Commit 7 — P5) is the builder_tick twin of
+	// LatestHeartbeatStats. Filters to source='builder_tick' only;
+	// the underlying writer (pkg/builderd/heartbeat.go) is deferred
+	// to a follow-up PR per the Commit 7 risk list (builderd does
+	// not currently self-register a compute_nodes row at startup).
+	// The mirror method exists today so the
+	// GET /v1/admin/obs/builder-heartbeats endpoint can land
+	// without waiting on the writer; once the writer is live, the
+	// row count goes from zero to non-zero without an API change.
+	LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// QueuedBuildsCount (Commit 7 — P5) returns the number of
+	// builds in 'queued' state across the fleet. Per-node labeling
+	// is deferred (builds.target_node_id is not yet a column; adding
+	// it is a follow-up migration). Today the gauge is a
+	// fleet-total — the operator dashboard renders "X builds in
+	// the queue" without per-schedd attribution.
+	QueuedBuildsCount(ctx context.Context) (int, error)
 
 	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
 	// new per-node utilization fields on /v1/admin/obs/nodes. One row

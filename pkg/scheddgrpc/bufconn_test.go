@@ -54,6 +54,10 @@ type fakeEngine struct {
 	// ReportWorkloadOOM handler tests. Default nil = no-op (mirrors
 	// destroyFn above).
 	destroyForWorkloadOOMFn func(ctx context.Context, instanceID string, peakMB, planMB int) error
+	// forceColdBootFn (P2b of the operator-side observability
+	// mega-PR) drives the ForceColdBootNextWake handler tests.
+	// Default nil = no-op (returns nil + empty snap IDs).
+	forceColdBootFn func(ctx context.Context, deploymentID string) ([]string, error)
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope, _ string) (sched.WakeResult, error) {
@@ -100,6 +104,17 @@ func (f *fakeEngine) ParkWithReason(ctx context.Context, instanceID, reason stri
 		return f.parkFn(ctx, instanceID, reason)
 	}
 	return nil
+}
+
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) mirrors ParkWithReason's pattern: default returns nil
+// + empty snap IDs; tests that exercise the real RPC behaviour
+// inject a forceColdBootFn via the fakeEngine struct.
+func (f *fakeEngine) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+	if f.forceColdBootFn != nil {
+		return f.forceColdBootFn(ctx, deploymentID)
+	}
+	return nil, nil
 }
 
 // StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B) — the

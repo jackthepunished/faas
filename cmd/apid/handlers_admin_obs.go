@@ -359,6 +359,119 @@ func emitPIIAccessed(r *http.Request, s *server, caller state.Account, endpoint 
 	})
 }
 
+// emitOperatorActionView writes an operator.action.view audit row
+// whenever an admin reads a tenant's data via ?on_behalf_of= (P1).
+// The audit subject is the TARGET account id (so the target's
+// audit-log feed shows every operator view), and the actor field
+// captures the calling admin so the admin's own audit log can
+// also be filtered to "what did I read on behalf of tenants".
+//
+// `endpoint` should be the route name (e.g. "metrics", "usage").
+// `targetID` is the resolved target account's id (NOT slug).
+//
+// No-op when s.audit is nil, matching emitPIIAccessed's
+// nil-tolerant default.
+func emitOperatorActionView(r *http.Request, s *server, caller state.Account, targetID, endpoint string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	tid := targetID
+	s.audit.Emit(r.Context(), "operator.action.view", &tid, map[string]any{
+		"actor":             caller.ID,
+		"endpoint":          endpoint,
+		"target_kind":       "account",
+		"target_account_id": targetID,
+	})
+}
+
+// emitOperatorActionParkInstance writes an operator.action.park_instance
+// audit row when an admin force-parks an instance via the P2a endpoint.
+// `targetAccountID` is the instance's owning account; may be empty
+// when the instance cannot be resolved (the audit row is still
+// emitted so the operator action is durable).
+//
+// PR #1099 P2 redesign: `result` is "enqueued" when the intent
+// row was written successfully (the durable record) or
+// "rejected" when the state gate failed (no intent was written;
+// the audit row is the only durable signal). Terminal outcome
+// (succeeded/failed) is emitted by schedd as a separate
+// operator.action.park_instance.outcome audit row — see
+// pkg/sched/operator_intent_subscriber.go. intentID is "" on
+// the rejected path; snapIDs is always nil for park (cold-boot
+// only).
+func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Account, targetAccountID, instanceID, appID, deploymentID, previousState, reason, result, intentID string, snapIDs []string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	var aidPtr *string
+	if targetAccountID != "" {
+		aidPtr = &targetAccountID
+	}
+	s.audit.Emit(r.Context(), "operator.action.park_instance", aidPtr, map[string]any{
+		"actor":             caller.ID,
+		"target_account_id": targetAccountID,
+		"intent_id":         intentID,
+		"instance_id":       instanceID,
+		"app_id":            appID,
+		"deployment_id":     deploymentID,
+		"previous_state":    previousState,
+		"reason":            reason,
+		"result":            result,
+	})
+}
+
+// emitOperatorActionForceColdBoot writes an operator.action.force_cold_boot
+// audit row when an admin forces the next wake of a deployment to be
+// a cold boot via the P2b endpoint. snapIDs is the list of
+// (warm + init) snapshots that were marked stale; may be empty when
+// the deployment had no snapshots.
+//
+// PR #1099 P2 redesign: `result` is "enqueued" when the intent
+// row was written successfully, "rejected" when an earlier gate
+// failed. Terminal outcome (succeeded/failed) is emitted by
+// schedd as a separate operator.action.force_cold_boot.outcome
+// audit row. intentID is "" on the rejected path. The
+// snap_ids_marked_stale field on the request-kind audit row is
+// always empty here (the actual snap IDs are stamped on the
+// terminal outcome row once schedd walks the tiers).
+func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Account, targetAccountID, appID, deploymentID, result, intentID string, snapIDs []string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	var aidPtr *string
+	if targetAccountID != "" {
+		aidPtr = &targetAccountID
+	}
+	data := map[string]any{
+		"actor":             caller.ID,
+		"target_account_id": targetAccountID,
+		"intent_id":         intentID,
+		"app_id":            appID,
+		"deployment_id":     deploymentID,
+		"result":            result,
+	}
+	if len(snapIDs) > 0 {
+		data["snap_ids_marked_stale"] = snapIDs
+	}
+	s.audit.Emit(r.Context(), "operator.action.force_cold_boot", aidPtr, data)
+}
+
+// emitOperatorActionReclaimBuild writes an operator.action.reclaim_build
+// audit row when an admin sweeps stuck-running builds via the P2c
+// endpoint. accountID is nil because the sweep is fleet-level (no
+// single tenant owns the operation).
+func emitOperatorActionReclaimBuild(r *http.Request, s *server, caller state.Account, olderThanSeconds, sweptCount int, thresholdISO string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	s.audit.Emit(r.Context(), "operator.action.reclaim_build", nil, map[string]any{
+		"actor":              caller.ID,
+		"older_than_seconds": olderThanSeconds,
+		"swept_count":        sweptCount,
+		"threshold_iso":      thresholdISO,
+	})
+}
+
 // obsNodeWakeLatency handles GET /v1/admin/obs/nodes/wake-latency
 // (PR #4 / ADR-092 §3.6). Surfaces per-node wake-latency
 // quantiles (p50, p95, p99) over a 5-minute window by PromQL-

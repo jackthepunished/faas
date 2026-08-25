@@ -46,16 +46,35 @@ const truthyTrue = "true"
 // getAppMetrics serves GET /v1/apps/{slug}/metrics?range=.
 // Mirrors getApp's auth chain (without requireMFA — read-only,
 // primary caller is an API key with ScopesReadSurface).
+//
+// Operator-as-tenant view (P1): when ?on_behalf_of=<uuid-or-slug>
+// is present, the handler reads the target's data using the
+// target's plan (Free→402 still applies even when the caller is
+// admin) and emits an operator.action.view audit row keyed on
+// the target's account id with the caller captured as the actor.
+// The caller must be in the admin allowlist for the target — the
+// two-step gate (resolveOnBehalfOf + loadApp's cross-account
+// guard) prevents an admin from reading another admin's data.
 func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	target, ok := s.resolveOnBehalfOf(w, r, acct, "metrics")
+	if !ok {
+		return
+	}
+	authAcct := acct
+	if target != nil {
+		authAcct = *target
+	}
 	// Plan gate: per-app observability is Hobby+; Free gets 402 +
 	// upsell. The gate runs BEFORE loadApp so a Free customer
 	// probing a Hobby+ slug never gets a 404 (slug-leak guard —
-	// same posture as handlers_alert_presets.go:165-179).
-	if !acct.Plan.PerAppMetricsAllowed() {
-		api.WriteProblem(w, api.ErrPlanPerAppMetricsNotAllowed(acct.Plan))
+	// same posture as handlers_alert_presets.go:165-179). When
+	// on_behalf_of is set, authAcct is the target so the gate
+	// reads from target.Plan (not caller's plan).
+	if !authAcct.Plan.PerAppMetricsAllowed() {
+		api.WriteProblem(w, api.ErrPlanPerAppMetricsNotAllowed(authAcct.Plan))
 		return
 	}
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
+	app, ok := s.loadApp(w, r, authAcct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
 	if !ok {
 		// loadApp already wrote the 404.
 		return
@@ -124,6 +143,9 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 	// TODO: wire against apid_request_total{account_id, code}
 	// once the per-plan SLO target lands on Limits.
 	resp.AsOf = time.Now().UTC().Format(time.RFC3339Nano)
+	if target != nil {
+		emitOperatorActionView(r, s, acct, target.ID, "metrics")
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

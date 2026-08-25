@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,17 +59,32 @@ import (
 //	?since=<rfc3339>          inclusive lower bound
 //	?include_anonymous=<0|1>  when 1, surfaces account_id IS NULL rows
 //	?limit=<n>                default 200, cap 500
+//	?actor_email=<email>      (P4 / operator-self-service) exact match on
+//	                          accounts.email — JOIN in pgstore, in-memory
+//	                          filter on MemStore
+//	?operator_only=<0|1>      sugar for kind_prefix=operator.action..
+//	                          Mutually exclusive with ?kind_prefix (the
+//	                          handler returns 400 if both are supplied)
+//	?target_account_id=<uuid> JSONB containment on data
+//	                          (audit_log.data @> jsonb_build_object('target_account_id', $N))
+//	                          — set on every `operator.action.*` row by
+//	                          Commit 3's emit helpers, so this filter is
+//	                          the natural inverse of operator_only
 //
 // NO ?q= free-text on data::text — doctrine matched at
 // cmd/apid/handlers_audit_log.go:36-39 (the audit_log table has
 // no GIN index on data; a free-text filter would be a sequential
 // scan with no DLQ guard). ADR-091 §3.7.1 amended 2026-08-10.
+//
+// Each returned row also carries `is_operator_action: <bool>` derived
+// from the kind-prefix check (operator.action.*) so the operator UI
+// can badge the row without re-deriving the prefix server-side.
 func (s *server) obsAuditLogSearch(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if allowed, prob := s.adminAllows(acct); !allowed {
 		api.WriteProblem(w, prob)
 		return
 	}
-	since, kindPrefix, includeAnon, limit, prob := parseObsAuditLogSearchQuery(r)
+	since, kindPrefix, includeAnon, limit, actorEmail, operatorOnly, targetAccountID, prob := parseObsAuditLogSearchQuery(r)
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
@@ -83,12 +99,37 @@ func (s *server) obsAuditLogSearch(w http.ResponseWriter, r *http.Request, acct 
 		}
 		accountFilter = &parsed
 	}
+	// Mutual-exclusivity gate: ?operator_only=true is sugar for
+	// ?kind_prefix=operator.action.. Setting both is contradictory;
+	// 400 the request with a stable problem code so the operator
+	// UI surfaces a precise error rather than silently picking one.
+	if operatorOnly && kindPrefix != "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "conflicting_filters",
+			"operator_only and kind_prefix are mutually exclusive",
+			"omit kind_prefix when operator_only=true, or vice-versa"))
+		return
+	}
+	effectiveKindPrefix := kindPrefix
+	if operatorOnly {
+		effectiveKindPrefix = "operator.action."
+	}
+	var accountEmailFilter *string
+	if actorEmail != "" {
+		accountEmailFilter = &actorEmail
+	}
+	var targetAccountFilter *string
+	if targetAccountID != uuid.Nil {
+		idStr := targetAccountID.String()
+		targetAccountFilter = &idStr
+	}
 	rows, err := s.store.ListAuditLog(r.Context(), state.AuditLogFilter{
 		AccountID:        accountFilter,
-		KindPrefix:       kindPrefix,
+		KindPrefix:       effectiveKindPrefix,
 		Since:            since,
 		IncludeAnonymous: includeAnon,
 		Limit:            limit,
+		ActorEmail:       accountEmailFilter,
+		TargetAccountID:  targetAccountFilter,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list audit log"))
@@ -105,6 +146,10 @@ func (s *server) obsAuditLogSearch(w http.ResponseWriter, r *http.Request, acct 
 	if accountFilter != nil {
 		acctIDStr = accountFilter.String()
 	}
+	targetIDStr := ""
+	if targetAccountFilter != nil {
+		targetIDStr = *targetAccountFilter
+	}
 	windowHours := 0
 	if !since.IsZero() {
 		windowHours = int(time.Since(since).Hours())
@@ -115,8 +160,11 @@ func (s *server) obsAuditLogSearch(w http.ResponseWriter, r *http.Request, acct 
 		Limit:            limit,
 		IncludeAnonymous: includeAnon,
 		WindowHours:      windowHours,
-		KindPrefix:       kindPrefix,
+		KindPrefix:       effectiveKindPrefix,
 		AccountID:        acctIDStr,
+		ActorEmail:       actorEmail,
+		OperatorOnly:     operatorOnly,
+		TargetAccountID:  targetIDStr,
 	})
 }
 
@@ -250,12 +298,17 @@ var obsNodesEventsChannels = []string{
 // string. Returns the parsed filter values plus a *api.Problem
 // on out-of-range input. Extracted so the handler stays under
 // the 50-line ceiling.
-func parseObsAuditLogSearchQuery(r *http.Request) (since time.Time, kindPrefix string, includeAnon bool, limit int, prob *api.Problem) {
+//
+// The three P4 fields (actor_email, operator_only,
+// target_account_id) are the operator-self-service surface; see
+// the obsAuditLogSearch doc-comment for the rationale + mutual-
+// exclusivity rule with kind_prefix.
+func parseObsAuditLogSearchQuery(r *http.Request) (since time.Time, kindPrefix string, includeAnon bool, limit int, actorEmail string, operatorOnly bool, targetAccountID uuid.UUID, prob *api.Problem) {
 	q := r.URL.Query()
 	if raw := q.Get("since"); raw != "" {
 		t, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
-			return time.Time{}, "", false, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			return time.Time{}, "", false, 0, "", false, uuid.Nil, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 				"Invalid since", "since must be RFC 3339 (e.g. 2026-07-25T00:00:00Z)")
 		}
 		since = t
@@ -266,7 +319,7 @@ func parseObsAuditLogSearchQuery(r *http.Request) (since time.Time, kindPrefix s
 	if raw := q.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
-			return time.Time{}, "", false, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			return time.Time{}, "", false, 0, "", false, uuid.Nil, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 				"Invalid limit", "limit must be a positive integer")
 		}
 		if n > api.ObsAdminAuditLogLimitMax {
@@ -274,7 +327,24 @@ func parseObsAuditLogSearchQuery(r *http.Request) (since time.Time, kindPrefix s
 		}
 		limit = n
 	}
-	return since, kindPrefix, includeAnon, limit, nil
+	actorEmail = strings.TrimSpace(q.Get("actor_email"))
+	if raw := q.Get("operator_only"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return time.Time{}, "", false, 0, "", false, uuid.Nil, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid operator_only", "operator_only must be a boolean (true/false)")
+		}
+		operatorOnly = parsed
+	}
+	if raw := q.Get("target_account_id"); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			return time.Time{}, "", false, 0, "", false, uuid.Nil, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid target_account_id", "target_account_id must be a UUID")
+		}
+		targetAccountID = parsed
+	}
+	return since, kindPrefix, includeAnon, limit, actorEmail, operatorOnly, targetAccountID, nil
 }
 
 // parseObsEventsQuery parses the events query string. Same
@@ -312,16 +382,19 @@ func parseObsEventsQuery(r *http.Request) (since time.Time, kindPrefix string, l
 // is captured verbatim — the whole point of the audit_log row
 // is for a regulator to read the human identifier without
 // joining back to a deleted accounts row. Data is the verbatim
-// JSON payload.
+// JSON payload. IsOperatorAction is derived from the kind-prefix
+// check at projection time so the operator UI can badge the
+// row without re-deriving the prefix on every render.
 func toObsAuditLogRows(rows []state.AuditLog) []api.ObsAuditLogRow {
 	out := make([]api.ObsAuditLogRow, 0, len(rows))
 	for _, r := range rows {
 		entry := api.ObsAuditLogRow{
-			ID:           r.ID.String(),
-			Kind:         r.Kind,
-			AccountEmail: r.AccountEmail,
-			Actor:        r.Actor,
-			ReceivedAt:   r.ReceivedAt.UTC(),
+			ID:               r.ID.String(),
+			Kind:             r.Kind,
+			AccountEmail:     r.AccountEmail,
+			Actor:            r.Actor,
+			ReceivedAt:       r.ReceivedAt.UTC(),
+			IsOperatorAction: strings.HasPrefix(r.Kind, "operator.action."),
 		}
 		if r.AccountID != nil {
 			entry.AccountID = r.AccountID.String()

@@ -61,8 +61,13 @@ const (
 //
 // Query params (all optional):
 //
-//	since   RFC 3339 timestamp; rows strictly older are skipped
-//	limit   1..1000; defaults to 200
+//	since        RFC 3339 timestamp; rows strictly older are skipped
+//	limit        1..1000; defaults to 200
+//	on_behalf_of <uuid-or-slug> — operator-as-tenant view (P1); see
+//	             handlers_obs_on_behalf_of.go. When set, the auth
+//	             context is the target's account; the slug →
+//	             account forge-proof check fires against the
+//	             target's account id (not the caller's).
 //
 // On any limit > Max we silently cap. On a malformed since we
 // return 400 invalid_since (not silently drop, per the convention
@@ -71,6 +76,14 @@ const (
 // proof).
 func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	slug := r.PathValue("slug")
+	target, ok := s.resolveOnBehalfOf(w, r, acct, "wake-timeline")
+	if !ok {
+		return
+	}
+	authAcct := acct
+	if target != nil {
+		authAcct = *target
+	}
 	wakeID := r.PathValue("wake_id")
 	if wakeID == "" {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -78,7 +91,7 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 		return
 	}
 	app, err := s.store.AppBySlug(r.Context(), slug)
-	if err != nil || app.AccountID != acct.ID {
+	if err != nil || app.AccountID != authAcct.ID {
 		s.notFound(w, "no such app")
 		return
 	}
@@ -177,6 +190,9 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 		// slice is the SQL result set, which is the source of
 		// truth for the at-ordering.
 		nextCursor = rows[limit-1].At.UTC().Format(time.RFC3339Nano)
+	}
+	if target != nil {
+		emitOperatorActionView(r, s, acct, target.ID, "wake-timeline")
 	}
 	writeJSON(w, http.StatusOK, api.WakeTimelineResponse{
 		WakeID:     wakeID,

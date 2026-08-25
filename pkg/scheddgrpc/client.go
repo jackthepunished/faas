@@ -238,6 +238,26 @@ func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) er
 	return nil
 }
 
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) asks schedd to mark a deployment's latest warm + init
+// snapshots stale so the next customer Wake cold-boots from rootfs
+// per ADR-005. Returns the snap IDs that were marked stale — empty
+// list when the deployment has no snapshots in either tier (durable
+// no-op). NotFound is mapped to state.ErrNotFound so the apid
+// handler can render a 404 with code "deployment_not_found".
+func (c *Client) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+	resp, err := c.cli.ForceColdBootNextWake(ctx, &scheddpb.ForceColdBootNextWakeRequest{
+		DeploymentId: deploymentID,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, state.ErrNotFound
+		}
+		return nil, liftErr(err)
+	}
+	return resp.GetSnapIdsMarkedStale(), nil
+}
+
 // InstanceStatsRow is the typed mirror of scheddpb.InstanceStatsRow
 // the meterd sampler reads. Defined here so pkg/meter doesn't reach
 // into the protobuf package directly. Issue #279 / PR-B.

@@ -190,6 +190,8 @@ export type { MFAVerifyResponse } from './models/MFAVerifyResponse.js';
 export type { OAuthProviderCapability } from './models/OAuthProviderCapability.js';
 export type { OIDCExchangeRequest } from './models/OIDCExchangeRequest.js';
 export type { OIDCExchangeResponse } from './models/OIDCExchangeResponse.js';
+export type { OperatorIntentAcceptedResponse } from './models/OperatorIntentAcceptedResponse.js';
+export type { OperatorIntentResponse } from './models/OperatorIntentResponse.js';
 export type { OrgAccountID } from './models/OrgAccountID.js';
 export type { OrgInvitationResponse } from './models/OrgInvitationResponse.js';
 export type { OrgListResponse } from './models/OrgListResponse.js';
@@ -271,6 +273,7 @@ export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js'
 export type { SourceTarballDeployRequest } from './models/SourceTarballDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
+export type { SweepStuckBuildsResponse } from './models/SweepStuckBuildsResponse.js';
 export type { TemplateView } from './models/TemplateView.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './models/TenantSurfaceResponse.js';

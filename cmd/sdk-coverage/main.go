@@ -78,6 +78,19 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
 	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/builder-heartbeats":      true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
+
+	// Operator-side observability mega-PR (PR #1099) P2 recovery
+	// primitives. Same operator-only posture as the ADR-091
+	// cluster above: admin scope + FAAS_ADMIN_EMAILS allowlist;
+	// SDK consumers authenticate as a tenant, not an operator.
+	// Mirror the exclusion across BOTH this list AND
+	// cmd/apid/spec_compliance_test.go::routeExclude; the two
+	// lists must move together.
+	"POST /v1/admin/instances/{id}/force-park":   true, // PR #1099 P2a — operator-only recovery primitive
+	"POST /v1/admin/apps/{slug}/force-cold-boot": true, // PR #1099 P2b — operator-only recovery primitive
+	"POST /v1/admin/builds/sweep-stuck":          true, // PR #1099 P2c — operator-only recovery primitive
+	"GET /v1/admin/operator-intents/{id}":        true, // PR #1099 P2.3 — operator-only intent polling endpoint
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie

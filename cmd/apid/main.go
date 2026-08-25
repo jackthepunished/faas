@@ -1097,6 +1097,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
 	srv.WithOAuthConfig(oauthCfg)
 
+	// PR #1099 P2 redesign: force-park + force-cold-boot now route
+	// through the operator_intents table + pg_notify (migrations/00431,
+	// pkg/sched/operator_intent_subscriber.go). apid never imports
+	// pkg/scheddgrpc — the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. schedd is still the only
+	// writer to instances; the trigger is now a Postgres row
+	// INSERT, not a direct gRPC call.
+
 	// Issue #142: Stripe billing portal URL template for the changePlan
 	// 402 response. Empty = 402 omits billing_portal_url; the dashboard
 	// renders a generic "use the billing portal" message. Production sets

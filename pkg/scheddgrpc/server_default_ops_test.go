@@ -40,6 +40,9 @@ func (noopEngine) ReportActivity(context.Context, []state.InstanceTouch) (int, e
 	return 0, nil
 }
 func (noopEngine) ParkWithReason(context.Context, string, string) error { return nil }
+func (noopEngine) ForceColdBootNextWake(context.Context, string) ([]string, error) {
+	return nil, nil
+}
 func (noopEngine) StreamAppLogs(context.Context, string, int64, time.Time, string, LogFrameSink) error {
 	return nil
 }

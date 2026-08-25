@@ -87,6 +87,9 @@ func (c *capturingEngine) ReportActivity(_ context.Context, _ []state.InstanceTo
 	return 0, nil
 }
 func (c *capturingEngine) ParkWithReason(_ context.Context, _, _ string) error { return nil }
+func (c *capturingEngine) ForceColdBootNextWake(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
 func (c *capturingEngine) StreamAppLogs(_ context.Context, _ string, _ int64, _ time.Time, _ string, _ scheddgrpc.LogFrameSink) error {
 	return nil
 }

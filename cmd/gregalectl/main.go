@@ -162,6 +162,23 @@ func run(args []string) int {
 		// / SetComputeNodeActive). Signature matches every other
 		// dispatch* arm (see commands_release.go:cmdReleaseDispatch).
 		return cmdComputeNodesDispatch(args[1:])
+	case dispatchInstances:
+		// P2a + P2b — operator recovery primitives. force-park
+		// dials schedd directly via FAAS_SCHEDD_ADDR. force-cold-
+		// boot opens a state.Store + dials schedd (latest-
+		// deployment resolution mirrors the apid handler). Both
+		// require --yes as a tripwire.
+		return cmdInstancesDispatch(args[1:])
+	case dispatchBuilds:
+		// P2c — operator-side build-recovery primitive.
+		// sweep-stuck opens a state.Store via FAAS_PG_DSN and
+		// calls state.Store.SweepStuckRunningBuilds directly
+		// (per user decision: NO builderd gRPC server). The
+		// Store method is also called by pkg/builderd/reaper.go:48
+		// — the CLI path is the operator's manual escape hatch
+		// when the reaper's grace period is too long for an
+		// incident.
+		return cmdBuildsDispatch(args[1:])
 	case dispatchDeploy:
 		// Provider-neutral join-node is the production path. The legacy
 		// add-node coordinator remains available for migration and local

@@ -241,6 +241,62 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// P2a + P2b of the operator-side observability mega-PR
+		// (Commit 5b). Operator recovery primitives — `force-park`
+		// dials schedd directly via FAAS_SCHEDD_ADDR, `force-cold-
+		// boot` opens a state.Store via FAAS_PG_DSN to resolve
+		// the latest deployment before dialing schedd. Both
+		// require --yes as a tripwire (matches the force-drain
+		// --yes ack pattern at compute-nodes force-drain).
+		Name:    dispatchInstances,
+		DocSlug: "instances",
+		Short:   "Instance recovery primitives (instances force-park|force-cold-boot)",
+		Subcommands: []cliSub{
+			{
+				Name:  "force-park",
+				Short: "Force-park a wedged live instance via schedd's ParkInstance gRPC RPC",
+				Flags: []cliFlag{
+					{Name: "instance-id", Short: "instance id (uuid) to force-park (required)"},
+					{Name: "reason", Short: "audit reason slug [a-z0-9_]{1,64} (default: operator_force_park)"},
+					{Name: "yes", Short: "acknowledge that the instance will be evicted from the wake path (required)"},
+				},
+			},
+			{
+				Name:  "force-cold-boot",
+				Short: "Mark the latest warm + init snapshots of an app's latest deployment stale",
+				Flags: []cliFlag{
+					{Name: "app-slug", Short: "app slug whose latest deployment will be cold-booted on next wake (required)"},
+					{Name: "reason", Short: "audit reason slug [a-z0-9_]{1,64} (default: operator_force_cold_boot)"},
+					{Name: "yes", Short: "acknowledge that the customer's next wake will be a cold boot (required)"},
+				},
+			},
+		},
+	},
+	{
+		// P2c of the operator-side observability mega-PR
+		// (Commit 5c). Operator-side build-recovery primitive —
+		// `sweep-stuck` opens a state.Store via FAAS_PG_DSN
+		// and calls state.Store.SweepStuckRunningBuilds
+		// directly (per user decision: NO builderd gRPC
+		// server). The Store method is also called by
+		// pkg/builderd/reaper.go:48 — the CLI path is the
+		// operator's manual escape hatch when the reaper's
+		// grace period is too long for an incident.
+		Name:    dispatchBuilds,
+		DocSlug: "builds",
+		Short:   "Build-recovery primitives (builds sweep-stuck)",
+		Subcommands: []cliSub{
+			{
+				Name:  "sweep-stuck",
+				Short: "Flip every 'running' build row older than the threshold to 'failed/timeout'",
+				Flags: []cliFlag{
+					{Name: "older-than", Short: "threshold duration (clamped to [1m, 60m]; default 15m)"},
+					{Name: "yes", Short: "acknowledge that rows older than the threshold will be flipped (required)"},
+				},
+			},
+		},
+	},
+	{
 		Name:    "manifest",
 		DocSlug: "manifest",
 		Short:   "Operator split-box deployment manifest (manifest validate|render|ansible; issue #911 / ADR-110)",

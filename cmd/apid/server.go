@@ -88,6 +88,15 @@ type server struct {
 	// never invalidates. Wired via WithSpecCache from
 	// cmd/apid/main.go (production) or kept nil (unit tests).
 	specCache *openapidiff.SpecCache
+	// PR #1099 P2 redesign: force-park + force-cold-boot now
+	// route through the operator_intents table + pg_notify
+	// (migrations/00431). apid never imports pkg/scheddgrpc —
+	// the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. The handler flow is
+	// INSERT operator_intents row → s.notif.Notify('operator_intent',
+	// payload) → return 202 Accepted; schedd (the only writer
+	// to instances) claims + dispatches via the
+	// pkg/sched/operator_intent_subscriber.go drain.
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -1481,6 +1490,43 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodesEventsSSE))))
 	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
+	// P5 (operator-side observability mega-PR / Commit 7) —
+	// builderd fleet heartbeat + build-queue depth. Today's row
+	// count is zero: the underlying writer (pkg/builderd/heartbeat.go)
+	// is deferred per the Commit 7 PR risk list — builderd does
+	// not currently self-register a compute_nodes row at startup.
+	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
+
+	// P2a + P2b — operator recovery primitives. Both routes mount
+	// under requireScope(admin-only) so the admin allowlist
+	// (s.adminAllows at compute_nodes.go:74-86) is the only
+	// structural gate. The handlers themselves additionally
+	// require ?confirm=true as a tripwire against operator
+	// fat-fingering (matches the force-drain --yes ack at
+	// commands_compute_nodes.go:249).
+	mux.HandleFunc("POST /v1/admin/instances/{id}/force-park",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
+	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	// PR #1099 P2 redesign: polling endpoint for the
+	// operator_intents rows. NO MFA — mirrors getFireCronRequest
+	// at cmd/apid/handlers_fire_cron_request.go:38-83 because the
+	// operator is already authenticated via the initial POST; MFA
+	// at the polling endpoint would re-auth without operational
+	// benefit. Admin scope + s.adminAllows are the only access
+	// controls (the admin scope gate is the load-bearing IDOR
+	// closure — fleet-level intents with account_id=NULL are
+	// visible to any admin).
+	mux.HandleFunc("GET /v1/admin/operator-intents/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.getOperatorIntent)))
+	// P2c (reclaim-stuck-build) — fleet-level sweep that calls
+	// state.Store.SweepStuckRunningBuilds directly (per user
+	// decision, NO builderd gRPC server). ?older_than= is
+	// clamped to [1m, 60m] so a fat-fingered "1ns" cannot sweep
+	// in-flight builds.
+	mux.HandleFunc("POST /v1/admin/builds/sweep-stuck",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postSweepStuckBuilds))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
