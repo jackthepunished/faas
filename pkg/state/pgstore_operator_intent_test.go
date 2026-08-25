@@ -34,7 +34,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -43,8 +42,34 @@ func pgStoreOperatorIntent(t *testing.T) (*state.PgStore, *pgxpool.Pool, context
 	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
+	// These tests exercise the PgStore CRUD contract, while the migration
+	// shape is pinned independently by migrations/00445_operator_intents_test.go.
+	// Installing only that table keeps each isolated fixture cheap; running all
+	// 445 migrations five times pushes the PostgreSQL shard over its budget.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE operator_intents (
+			id uuid PRIMARY KEY,
+			kind text NOT NULL CHECK (kind IN ('force_park', 'force_cold_boot')),
+			target_id text NOT NULL,
+			account_id uuid NULL,
+			actor_id uuid NOT NULL,
+			reason text NULL,
+			metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+			status text NOT NULL DEFAULT 'pending' CHECK (status IN
+				('pending', 'running', 'succeeded', 'failed', 'cancelled')),
+			requested_at timestamptz NOT NULL DEFAULT now(),
+			started_at timestamptz NULL,
+			finished_at timestamptz NULL,
+			error text NULL,
+			snap_ids_marked_stale text[] NULL
+		);
+		CREATE INDEX operator_intents_pending_idx
+			ON operator_intents (status, requested_at)
+			WHERE status = 'pending';
+		CREATE INDEX operator_intents_target_idx
+			ON operator_intents (target_id, requested_at DESC);
+	`); err != nil {
+		t.Fatalf("create operator_intents fixture: %v", err)
 	}
 	return state.NewPgStore(pool), pool, ctx
 }
