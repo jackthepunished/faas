@@ -430,3 +430,40 @@ func TestAppMetrics_Wakes24hEnrichment(t *testing.T) {
 		t.Errorf("error_budget_pct = %v, want 0 (SLO target not yet wired)", out.ErrorBudgetPct)
 	}
 }
+
+// TestAppMetrics_ZeroEnrichmentFieldsAlwaysOnWire pins the
+// code-review contract from PR #1097 (commit 2 of the review-fix
+// cluster): cache_hit_rate_pct + error_budget_pct are non-omitempty
+// on the DTO, so the fields are ALWAYS present on the wire — even
+// when 0. This matters for SDK consumers because the documented
+// schema must match the actual JSON: omitempty on a float64=0
+// would drop the field and break "is this app's cache rule wired"
+// detection. The decoded JSON map check (raw key presence) is the
+// load-bearing assertion; the typed decode above already round-
+// trips 0 either way.
+func TestAppMetrics_ZeroEnrichmentFieldsAlwaysOnWire(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "my-api")
+	installPromFixture(t, &e, func(q string) string {
+		return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"0"]}]}}`
+	})
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics?range=5m", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Decode into a generic map so we can assert on key presence,
+	// not just typed values (a typed decode round-trips 0 either
+	// way — the wire-shape contract is about whether the JSON key
+	// is emitted at all).
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	for _, key := range []string{"cache_hit_rate_pct", "error_budget_pct"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("wire key %q missing — DTO tag must not be omitempty", key)
+		}
+	}
+}

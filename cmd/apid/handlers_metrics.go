@@ -103,17 +103,15 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 			"err", err.Error())
 	}
 
-	// CacheHitRatePct: ADR-122 response-cache hit ratio, only
-	// populated when the app has at least one cache rule
-	// attached (the route-metrics opt-in scope — same gate as
-	// the Routes block above). The PromQL query against
-	// gateway_response_cache_total{app_id, outcome=hit/miss} is
-	// out of scope for this PR; the field stays 0 until the
-	// response-cache consumer-facing metric lands. The omitempty
-	// tag on the DTO suppresses the field on the wire when 0,
-	// so a Hobby+ customer without a cache rule sees a clean
-	// 200 with no cache field — same posture as the Routes
-	// field.
+	// CacheHitRatePct: ADR-122 response-cache hit ratio. The
+	// PromQL query against gateway_response_cache_total{app_id,
+	// outcome=hit/miss} is out of scope for this PR; the field
+	// stays 0 until the response-cache consumer-facing metric
+	// lands. The DTO is non-omitempty (this field is ALWAYS on
+	// the wire) so the dashboard can rely on the documented
+	// schema. Feature-off vs. feature-on-zero-traffic is
+	// distinguished by the `Routes` block presence, not by
+	// this field's absence.
 	_ = app.RouteMetricsEnabled // opt-in flag consulted at fetch time in a future PR
 
 	// ErrorBudgetPct: trailing-30d API-availability error budget
