@@ -560,13 +560,6 @@ func (q *Queries) CountTriggersByApp(ctx context.Context, db DBTX, appID pgtype.
 	return count, err
 }
 
-// NOTE: CountWakeBootStarted24h was previously declared here as a
-// sqlc binding but the binding had a broken parameter shape
-// (compared a UUID literal against the whole jsonb payload, which
-// would always return 0). The canonical implementation lives in
-// pkg/state/pgstore.go as a hand-written raw-SQL method. See
-// pkg/state/queries.sql for the matching rationale comment.
-
 const createAPIKey = `-- name: CreateAPIKey :one
 insert into api_keys (account_id, key_sha256, label, scopes)
 values ($1, $2, $3, $4)

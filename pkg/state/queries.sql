@@ -1306,28 +1306,6 @@ select count(*) from triggers t
 join apps a on a.id = t.app_id
 where a.account_id = $1 and a.status <> 'deleted';
 
--- NOTE: CountWakeBootStarted24h was previously declared here as a sqlc
--- query binding. Code-review finding on PR #1097 surfaced that the
--- binding was generated with the wrong parameter shape (it bound
--- `data []byte` — the whole jsonb row — as $1, comparing a UUID
--- literal against an arbitrary jsonb blob, which would always
--- return 0). The canonical implementation lives in pkg/state/pgstore.go
--- as a hand-written raw-SQL method (Store interface
--- CountWakeBootStarted24h); that path uses $1::uuid against
--- (data->>'app_id')::uuid and is the only correct production path.
---
--- The previous comment also falsely claimed the existing
--- events_wake_id_idx jsonb expression index (migration 00114,
--- on data->>'wake_id') covers the app_id predicate here. It
--- does NOT — the index key is the wake_id, not the app_id, and
--- the planner has no way to satisfy `(data->>'app_id')::uuid = $1`
--- from that index. On a Scale-tier app with a large fleet the
--- planner will seq-scan the trailing-24h wake.boot_started rows
--- and re-evaluate the jsonb cast per row. Sub-second claim in
--- the PR description was therefore wrong. The follow-up
--- migration adding a covering index on (data->>'app_id', at)
--- is tracked separately (out of scope for this PR).
-
 -- name: ClaimTriggerRecords :many
 -- FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
 -- precedent: concurrent schedd replicas each claim disjoint row

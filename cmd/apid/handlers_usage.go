@@ -18,10 +18,11 @@ package main
 // 404).
 //
 // Window vocabulary: caller passes ?since= and ?until= in RFC3339.
-// Both default to UTC midnight snaps; the handler clamps `since`
-// to `until - 90d` upper bound. Empty input → defaults to
-// trailing 30d ending at period_end = now().UTC() snapped down to
-// UTC midnight (matches the dashboard's "this month" chip).
+// Both clamp to UTC midnight on parse (the dashboard's "this
+// month" chip relies on a stable day boundary). The handler
+// clamps `since` to `until - 90d` upper bound. Empty input →
+// defaults to trailing 30d ending at period_end = now().UTC()
+// snapped down to UTC midnight.
 //
 // Overage computation: max(0, gb_hours - plan_included). The
 // helper pkg/meter.BuildAppWindowSummary rolls up the raw window;
@@ -104,10 +105,22 @@ func (s *server) getAppUsage(w http.ResponseWriter, r *http.Request, acct state.
 }
 
 // parseUsageWindow resolves the (since, until) half-open window
-// from the URL query string. Both default to a trailing 30d
-// window ending at UTC midnight; both clamp to RFC3339. The
-// upper bound (since cannot be earlier than until - 90d) is the
-// load-bearing guard against an unbounded indexed scan.
+// from the URL query string. BOTH bounds default to a trailing
+// 30d window ending at UTC midnight; BOTH bounds clamp to
+// RFC3339. The upper bound (since cannot be earlier than
+// until - 90d) is the load-bearing guard against an unbounded
+// indexed scan.
+//
+// UTC-midnight snap on caller-supplied until: code-review on
+// PR #1097 surfaced that a customer passing
+// until=2026-08-27T15:00:00Z previously produced
+// period_end=15:00 and period_start=2026-07-28T15:00:00Z,
+// contradicting the documented OpenAPI example
+// (2026-07-28T00:00:00Z � 2026-08-27T00:00:00Z) and the DTO
+// comment ("Snapped to UTC midnight on the inclusive end").
+// Snap every until value (not just the omitted one) so the
+// dashboard's "this month" chip and the customer-supplied
+// query render the same period_end shape.
 //
 // Returns a *api.Problem so the handler can writeProblem directly
 // on the error path without re-constructing the error envelope.
@@ -122,12 +135,14 @@ func parseUsageWindow(r *http.Request, now time.Time) (time.Time, time.Time, *ap
 				"until must be RFC3339")
 		}
 		until = t.UTC()
-	} else {
-		// Snap to UTC midnight so the period_end is a stable
-		// day boundary. The dashboard's "this month" chip
-		// re-uses the same snap.
-		until = time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC)
 	}
+	// Snap EVERY until value to UTC midnight (caller-supplied
+	// or default) so the period_end is a stable day boundary.
+	// The dashboard's "this month" chip re-uses the same snap;
+	// a customer passing until=2026-08-27T15:00:00Z gets
+	// period_end=2026-08-27T00:00:00Z (the day boundary of
+	// their query, not the time-of-day).
+	until = time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC)
 
 	since := until.AddDate(0, 0, -usageDefaultWindowDays)
 	if raw := q.Get("since"); raw != "" {
@@ -139,6 +154,13 @@ func parseUsageWindow(r *http.Request, now time.Time) (time.Time, time.Time, *ap
 		}
 		since = t.UTC()
 	}
+	// Snap EVERY since value to UTC midnight too. A customer
+	// passing since=2026-07-28T15:00:00Z gets period_start at
+	// the day boundary of their date, not 15:00. Otherwise the
+	// rolled-up hours shift by 15h against the dashboard's
+	// day-boundary math (rolling the trailing 15h of the
+	// boundary day in). Mirrors the until snap above.
+	since = time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, time.UTC)
 
 	// Clamp `since` to the upper bound so a customer cannot
 	// unbounded-scan usage_minutes. Without this guard,

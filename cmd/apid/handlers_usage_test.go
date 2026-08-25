@@ -133,3 +133,71 @@ func TestAppUsage_UnknownSlug404(t *testing.T) {
 	rec := e.do(t, "GET", "/v1/apps/ghost/usage", nil, nil)
 	assertProblem(t, rec, http.StatusNotFound, api.CodeNotFound)
 }
+
+// TestAppUsage_CallerSuppliedUntilSnappedToMidnight pins the
+// code-review contract from PR #1097 (commit 4 of the review-fix
+// cluster): parseUsageWindow must snap EVERY until value to UTC
+// midnight, not just the omitted-default. A customer passing
+// until=2026-08-27T15:00:00Z previously produced
+// period_end=15:00 + period_start=2026-07-28T15:00:00Z, which
+// contradicted the documented OpenAPI example (midnight-to-
+// midnight) and the DTO comment ("Snapped to UTC midnight on the
+// inclusive end"). The dashboard tile's row-count was rendered
+// against a 30d 9h window, not the documented 30d window.
+//
+// We seed a fixed `now` via the URL query and assert the response
+// period_end is at the day boundary of the customer's date
+// (NOT the time-of-day they supplied).
+func TestAppUsage_CallerSuppliedUntilSnappedToMidnight(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "my-api")
+
+	// Pass until at 15:00 UTC — the response must snap to
+	// 00:00 UTC of the same day.
+	rec := e.do(t, "GET", "/v1/apps/my-api/usage?until=2026-08-27T15:00:00Z", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.AppUsageSummaryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantEnd := time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC)
+	if !out.PeriodEnd.Equal(wantEnd) {
+		t.Errorf("PeriodEnd = %v, want %v (15:00 input must snap to UTC midnight of same day)", out.PeriodEnd, wantEnd)
+	}
+	// period_start = period_end - 30d at UTC midnight.
+	wantStart := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+	if !out.PeriodStart.Equal(wantStart) {
+		t.Errorf("PeriodStart = %v, want %v (30d back from snapped until)", out.PeriodStart, wantStart)
+	}
+}
+
+// TestAppUsage_CallerSuppliedSinceSnappedToMidnight pins the
+// same contract on the since side: a customer passing
+// since=2026-07-28T15:00:00Z must get period_start at the
+// day boundary of that date (not 15:00). The dashboard renders
+// the window against day-boundary math, so a half-open
+// boundary at 15:00 would shift the rolled-up hours by 15h
+// (rolling the last 15h of the trailing day in).
+func TestAppUsage_CallerSuppliedSinceSnappedToMidnight(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "my-api")
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/usage?since=2026-07-28T15:00:00Z&until=2026-08-27T15:00:00Z", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.AppUsageSummaryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantStart := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+	if !out.PeriodStart.Equal(wantStart) {
+		t.Errorf("PeriodStart = %v, want %v (15:00 input must snap to UTC midnight of same day)", out.PeriodStart, wantStart)
+	}
+	wantEnd := time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC)
+	if !out.PeriodEnd.Equal(wantEnd) {
+		t.Errorf("PeriodEnd = %v, want %v (15:00 input must snap to UTC midnight of same day)", out.PeriodEnd, wantEnd)
+	}
+}
