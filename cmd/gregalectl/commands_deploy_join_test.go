@@ -304,12 +304,16 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 	}, &report); err != nil || code != 0 {
 		t.Fatalf("deployJoinApply: code=%d err=%v", code, err)
 	}
-	if len(calls) != 1 {
-		t.Fatalf("Ansible calls = %d, want one limited join play", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("Ansible calls = %d, want control-plane convergence plus limited join", len(calls))
 	}
-	joined := strings.Join(calls[0], " ")
+	controlPlane := strings.Join(calls[0], " ")
+	if !strings.Contains(controlPlane, "--limit control_plane") || !strings.Contains(controlPlane, "node_join_control_plane.yml") {
+		t.Fatalf("Ansible args missing control-plane limit/playbook: %v", calls[0])
+	}
+	joined := strings.Join(calls[1], " ")
 	if !strings.Contains(joined, "--limit fsn-2") || !strings.Contains(joined, "node_join.yml") {
-		t.Fatalf("Ansible args missing node limit/playbook: %v", calls[0])
+		t.Fatalf("Ansible args missing node limit/playbook: %v", calls[1])
 	}
 	if !report.Applied {
 		t.Fatal("apply report was not marked applied")

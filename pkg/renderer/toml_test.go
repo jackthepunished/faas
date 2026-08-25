@@ -153,6 +153,46 @@ func TestRenderTOML_GatewaydInternal(t *testing.T) {
 	}
 }
 
+func TestRenderTOML_GatewaydInternalPeerTLS(t *testing.T) {
+	dc := &manifest.DaemonConfig{
+		Bind: "tcp://0.0.0.0:8080",
+		ScheddTLS: &manifest.TLSMaterial{
+			CertPath: "/etc/faas/tls/gatewayd/schedd-client.crt",
+			KeyPath:  "/etc/faas/tls/gatewayd/schedd-client.key",
+			CAPath:   "/etc/faas/tls/ca/ca.crt",
+		},
+		VMMTLS: &manifest.TLSMaterial{
+			CertPath: "/etc/faas/tls/gatewayd/vmmd-client.crt",
+			KeyPath:  "/etc/faas/tls/gatewayd/vmmd-client.key",
+			CAPath:   "/etc/faas/tls/ca/ca.crt",
+		},
+		EgressTLS: &manifest.TLSMaterial{
+			CertPath: "/etc/faas/tls/egress/egress.crt",
+			KeyPath:  "/etc/faas/tls/egress/egress.key",
+			CAPath:   "/etc/faas/tls/ca/ca.crt",
+		},
+	}
+	body, _, err := renderTOML(tomlRenderCtx{Daemon: "gatewayd-internal", DC: dc})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	for _, want := range []string{
+		`schedd_tls_cert_path = "/etc/faas/tls/gatewayd/schedd-client.crt"`,
+		`schedd_tls_key_path = "/etc/faas/tls/gatewayd/schedd-client.key"`,
+		`schedd_tls_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+		`vmmd_tls_cert_path = "/etc/faas/tls/gatewayd/vmmd-client.crt"`,
+		`vmmd_tls_key_path = "/etc/faas/tls/gatewayd/vmmd-client.key"`,
+		`vmmd_tls_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+		`egress_tls_cert_path = "/etc/faas/tls/egress/egress.crt"`,
+		`egress_tls_key_path = "/etc/faas/tls/egress/egress.key"`,
+		`egress_tls_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("gatewayd-internal body missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestRenderTOML_VmmdWithComputeNode(t *testing.T) {
 	// vmmd has both PrivateKeys AND ComputeNodeBlock. Confirm
 	// both flow into the flatMap and the body has the [compute_node]
@@ -179,6 +219,63 @@ func TestRenderTOML_VmmdWithComputeNode(t *testing.T) {
 		prefixed := k.Table + "." + k.Key
 		if _, ok := flat[prefixed]; !ok {
 			t.Errorf("flatMap missing table key %q", prefixed)
+		}
+	}
+}
+
+func TestRenderTOML_VmmdSplitBoxClientTLS(t *testing.T) {
+	body, _, err := renderTOML(tomlRenderCtx{
+		Daemon: "vmmd",
+		DC: &manifest.DaemonConfig{
+			Bind: "tcp://0.0.0.0:50051",
+			ScheddClientTLS: &manifest.TLSMaterial{
+				CertPath: "/etc/faas/tls/vmmd/schedd-client.crt",
+				KeyPath:  "/etc/faas/tls/vmmd/schedd-client.key",
+				CAPath:   "/etc/faas/tls/ca/ca.crt",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	for _, want := range []string{
+		`schedd_client_cert_path = "/etc/faas/tls/vmmd/schedd-client.crt"`,
+		`schedd_client_key_path = "/etc/faas/tls/vmmd/schedd-client.key"`,
+		`schedd_client_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("vmmd body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRenderTOML_BuilderdDerivesPerHostVMMDTarget(t *testing.T) {
+	body, _, err := renderTOML(tomlRenderCtx{
+		Daemon:      "builderd",
+		HostAddress: "fsn-3.gregale.dev:50051",
+		DC: &manifest.DaemonConfig{
+			Bind: "tcp://127.0.0.1:9091",
+			Outbound: &manifest.OutboundConfig{
+				Target: "tcp://fsn-2.gregale.dev:50051",
+				TLS: &manifest.TLSMaterial{
+					CertPath: "/etc/faas/tls/builderd/vmmd-client.crt",
+					KeyPath:  "/etc/faas/tls/builderd/vmmd-client.key",
+					CAPath:   "/etc/faas/tls/ca/ca.crt",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	for _, want := range []string{
+		`vmmd_target = "tcp://fsn-3.gregale.dev:50051"`,
+		`tls_cert_path = "/etc/faas/tls/builderd/vmmd-client.crt"`,
+		`tls_key_path = "/etc/faas/tls/builderd/vmmd-client.key"`,
+		`tls_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("builderd body missing %q:\n%s", want, body)
 		}
 	}
 }

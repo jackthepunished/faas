@@ -122,6 +122,7 @@ var cliCommands = []cliCommand{
 					{Name: "max-concurrency", Short: "max concurrent live instances"},
 					{Name: "admission-ceiling-mb", Short: "tenant RAM admission ceiling (85% of mem-mb for production nodes)"},
 					{Name: "from-file", Short: "JSON payload matching computeNodePayload (PR-B bridge)"},
+					{Name: "defer-activation", Short: "insert/update the row drained until deployment readiness completes"},
 					{Name: "json", Short: "emit structured JSON to stdout"},
 				},
 			},

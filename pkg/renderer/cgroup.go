@@ -6,9 +6,9 @@ import (
 )
 
 // renderCgroupBody builds the subtree_control body bytes for the
-// per-host slice. The slice's actual mkdir + write happens in
-// renderer.go's publish phase (so the SHA256 idempotent short-
-// circuit covers cgroup writes too).
+// per-host slice. The slice's write happens in renderer.go's publish phase;
+// cgroup v2's subtree_control is a kernel pseudo-file and is therefore
+// written directly rather than through the regular atomic-file publisher.
 //
 // The `memory` controller is load-bearing for tenant admission
 // (CLAUDE.md / §11). The renderer asserts it is present in the
@@ -28,19 +28,23 @@ func renderCgroupBody(sliceName, controllers string) ([]byte, error) {
 		return nil, fmt.Errorf("renderer: cgroup: controllers list %q missing \"cpu\"", controllers)
 	}
 
-	// Build the "+ctrl +ctrl" body. Sorted so a re-render produces
-	// the same bytes (idempotent short-circuit).
+	// Build the canonical space-separated "+ctrl +ctrl" body. The cgroup v2
+	// kernel interface accepts whitespace-separated operations, but does not
+	// accept one operation per line. Sorted output keeps re-renders stable.
 	ordered := make([]string, 0, len(parsed))
 	for c := range parsed {
 		ordered = append(ordered, c)
 	}
 	sortStrings(ordered)
 	var body strings.Builder
-	for _, c := range ordered {
+	for i, c := range ordered {
+		if i > 0 {
+			body.WriteByte(' ')
+		}
 		body.WriteString("+")
 		body.WriteString(c)
-		body.WriteByte('\n')
 	}
+	body.WriteByte('\n')
 	return []byte(body.String()), nil
 }
 

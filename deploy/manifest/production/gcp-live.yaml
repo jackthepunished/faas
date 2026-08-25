@@ -2,15 +2,17 @@
 #
 # This is the deployment-specific counterpart to
 # deploy/manifest/examples/splitbox.example.yaml. It records the stable
-# private-DNS names and immutable release tuple for the two-node GCP fleet.
-# `fsn-1.gregale.dev` and `fsn-2.gregale.dev` must resolve through the
+# private-DNS names and immutable release tuple for the three-node GCP fleet.
+# `fsn-1.gregale.dev`, `fsn-2.gregale.dev`, and `fsn-3.gregale.dev` must resolve through the
 # operator's private/split-horizon DNS to the fleet's routable private
 # addresses; they must not be published as public Cloudflare records.
 # The same private DNS view must resolve the mTLS service identities
 # `schedd.faas`, `vmmd.faas`, and `egress.faas`; those names are certificate
 # identities and remain separate from the public app wildcard.
-# The overlay CIDR remains fleet-specific and must be reviewed when moving
-# this manifest to another network.
+# The provider-native NIC is pinned below. The GCP VPC CIDR is deliberately
+# not used as vmmd's overlay preference because vmmd's tenant-overlay safety
+# gate rejects RFC1918 ranges; the private transport names remain the source
+# of truth for node-to-node control traffic.
 #
 # The release tuple is pinned to the merged main commit that will be tagged
 # for the next signed pre-1.0 release. Do not change the bytes after hashing
@@ -27,6 +29,10 @@ fleet:
     - name: fsn-2
       role: compute-only
       address: fsn-2.gregale.dev:50051
+      tags: ["gcp-vpc"]
+    - name: fsn-3
+      role: compute-only
+      address: fsn-3.gregale.dev:50051
       tags: ["gcp-vpc"]
 
 daemons:
@@ -51,9 +57,12 @@ daemons:
       key_path: /etc/faas/tls/vmmd/server.key
       ca_path: /etc/faas/tls/ca/ca.crt
       mode: "0400"
+    schedd_client_tls:
+      cert_path: /etc/faas/tls/vmmd/schedd-client.crt
+      key_path: /etc/faas/tls/vmmd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
     compute_node:
       host_bridge_cidr: 10.100.0.0/16
-      overlay_cidr: 10.156.0.0/20
       overlay_interface: ens4
   apid:
     bind: unix:///run/faas/apid.sock
@@ -64,6 +73,29 @@ daemons:
   gatewayd_internal:
     bind: tcp://0.0.0.0:8080
     apid_loopback: http://fsn-1.gregale.dev:8081
+    schedd_tls:
+      cert_path: /etc/faas/tls/gatewayd/schedd-client.crt
+      key_path: /etc/faas/tls/gatewayd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    vmmd_tls:
+      cert_path: /etc/faas/tls/gatewayd/vmmd-client.crt
+      key_path: /etc/faas/tls/gatewayd/vmmd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    egress_tls:
+      cert_path: /etc/faas/tls/egress/egress.crt
+      key_path: /etc/faas/tls/egress/egress.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+  builderd:
+    # The renderer derives the per-host vmmd target from the compute
+    # host's own address; the placeholder target supplies the schema's
+    # outbound shape and is never copied into the final TOML.
+    bind: tcp://127.0.0.1:9091
+    outbound:
+      target: tcp://fsn-2.gregale.dev:50051
+      tls:
+        cert_path: /etc/faas/tls/builderd/vmmd-client.crt
+        key_path: /etc/faas/tls/builderd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
 
 overlay:
   provider: static

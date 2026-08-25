@@ -49,6 +49,14 @@
         state: present
         system: true
 
+    - name: Allow shared daemons to traverse the shared secret directory
+      ansible.builtin.file:
+        path: /etc/faas/secrets
+        state: directory
+        owner: root
+        group: faas
+        mode: "0750"
+
     - name: Stage the compute database environment
       ansible.builtin.copy:
         src: "{{ faas_join_compute_db_env_source }}"
@@ -160,6 +168,49 @@
   serial: 1
   max_fail_percentage: 0
   tasks:
+    - name: Install the manifest and builder-base identity for imaged
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/faas-imaged.service.d/zz-faas-manifest-base.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          Environment=FAAS_MANIFEST_PATH=/etc/faas/manifest.yaml
+          Environment=FAAS_BUILDER_BASE_REF={{ faas_builder_base_ref | default(faas_join_builder_base_ref) }}
+
+    - name: Pre-register the adopted node as drained before release installation
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - compute-nodes
+          - add
+          - --name
+          - "{{ faas_join_database_node }}"
+          - --target-url
+          - "{{ faas_vmmd_target_url }}"
+          - --vpcpus
+          - "{{ ansible_processor_vcpus }}"
+          - --mem-mb
+          - "{{ ansible_memtotal_mb }}"
+          - --max-concurrency
+          - "{{ faas_join_max_concurrency | default((ansible_processor_vcpus | int) * 50, true) }}"
+          - --admission-ceiling-mb
+          - "{{ faas_join_admission_ceiling_mb | default(((ansible_memtotal_mb | int) * 85 / 100) | int, true) }}"
+          - --defer-activation
+      register: faas_compute_node_preregister
+      changed_when: true
+
+    - name: Stop stale compute-only services before replacing the active release
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - faas-vmmd.service
+        - faas-gatewayd-internal.service
+        - faas-builderd.service
+        - faas-imaged.service
+
     - name: Install the verified release while keeping the row drained
       ansible.builtin.command:
         argv:
@@ -261,10 +312,18 @@
         - faas-builderd.service
         - faas-imaged.service
 
-    - name: Wait for vmmd's local socket
+    - name: Wait for vmmd's local socket on single-box targets
       ansible.builtin.wait_for:
         path: /run/faas/vmmd.sock
         timeout: 60
+      when: faas_vmmd_target_url is not match('^tcp://')
+
+    - name: Wait for vmmd's TCP listener on split-box targets
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 50051
+        timeout: 60
+      when: faas_vmmd_target_url is match('^tcp://')
 
     - name: Wait for the internal gateway listener
       ansible.builtin.wait_for:

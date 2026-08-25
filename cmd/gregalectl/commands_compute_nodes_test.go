@@ -246,6 +246,31 @@ func TestCmdComputeNodesAdd_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCmdComputeNodesAdd_DeferActivationLeavesRowDrained(t *testing.T) {
+	resetMemStore(t)
+	if code := cmdComputeNodesAdd([]string{
+		"--name=fsn-3",
+		"--target-url=tcp://vmmd-3.faas:50051",
+		"--vpcpus=4", "--mem-mb=16384",
+		"--max-concurrency=200", "--admission-ceiling-mb=13926",
+		"--defer-activation",
+	}); code != 0 {
+		t.Fatalf("cmdComputeNodesAdd(--defer-activation) = %d, want 0", code)
+	}
+	st, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+	row, err := st.ComputeNodeByName(context.Background(), "fsn-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Active {
+		t.Fatal("deferred row is active; want drained")
+	}
+}
+
 // TestCmdComputeNodesAdd_HappyPath_JSON asserts the --json output
 // shape is what the PR-B deploy add-node will consume.
 func TestCmdComputeNodesAdd_HappyPath_JSON(t *testing.T) {

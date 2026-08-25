@@ -142,6 +142,36 @@ func TestPublishAtomic_CleansUpTempOnError(t *testing.T) {
 	}
 }
 
+func TestPublishCgroupControl_WritesAndMatchesControllerSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cgroup.subtree_control")
+	body := []byte("+cpu\n+memory\n")
+
+	digest, changed, err := publishCgroupControl(path, body)
+	if err != nil {
+		t.Fatalf("first publishCgroupControl: %v", err)
+	}
+	if !changed || digest == "" {
+		t.Fatalf("first publishCgroupControl = digest %q, changed %v; want digest and changed", digest, changed)
+	}
+
+	// cgroup v2 reports enabled controllers without '+' and may format them
+	// on one line; both forms represent the same enabled set.
+	if err := os.WriteFile(path, []byte("cpu memory\n"), 0o644); err != nil {
+		t.Fatalf("rewrite pseudo-file fixture: %v", err)
+	}
+	digest, changed, err = publishCgroupControl(path, body)
+	if err != nil {
+		t.Fatalf("idempotent publishCgroupControl: %v", err)
+	}
+	if changed {
+		t.Errorf("idempotent publishCgroupControl changed = true, want false")
+	}
+	if digest == "" {
+		t.Errorf("idempotent digest is empty")
+	}
+}
+
 func TestHashFileIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data")

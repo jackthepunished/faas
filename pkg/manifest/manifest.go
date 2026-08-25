@@ -283,6 +283,18 @@ type DaemonConfig struct {
 	// the rendered TOML.
 	TLS *TLSMaterial `yaml:"tls,omitempty"`
 
+	// GatewaydInternal's split-box peers are separate from TLS, which
+	// describes a daemon's own listener, and from Outbound, which is a
+	// single legacy peer shape used by schedd. Keep the three gateway
+	// client/server bundles explicit so the renderer cannot silently emit
+	// a plaintext control-plane connection when this daemon runs on a
+	// compute-only host.
+	ScheddTLS         *TLSMaterial `yaml:"schedd_tls,omitempty"`
+	VMMTLS            *TLSMaterial `yaml:"vmmd_tls,omitempty"`
+	EgressTLS         *TLSMaterial `yaml:"egress_tls,omitempty"`
+	ScheddClientTLS   *TLSMaterial `yaml:"schedd_client_tls,omitempty"`
+	AdvisoryClientTLS *TLSMaterial `yaml:"advisory_client_tls,omitempty"`
+
 	// Outbound is the dial target. On a single-box install this is
 	// the unix socket; on a split-box fleet it's the tcp://
 	// `<overlay-address>:<port>` of the box that runs the target
@@ -876,6 +888,21 @@ func (d *Daemons) validate() Errors {
 		}
 		if dc.TLS != nil {
 			errs = append(errs, dc.TLS.validate(path+".tls")...)
+		}
+		if dc.ScheddTLS != nil {
+			errs = append(errs, dc.ScheddTLS.validate(path+".schedd_tls")...)
+		}
+		if dc.VMMTLS != nil {
+			errs = append(errs, dc.VMMTLS.validate(path+".vmmd_tls")...)
+		}
+		if dc.EgressTLS != nil {
+			errs = append(errs, dc.EgressTLS.validate(path+".egress_tls")...)
+		}
+		if dc.ScheddClientTLS != nil {
+			errs = append(errs, dc.ScheddClientTLS.validate(path+".schedd_client_tls")...)
+		}
+		if dc.AdvisoryClientTLS != nil {
+			errs = append(errs, dc.AdvisoryClientTLS.validate(path+".advisory_client_tls")...)
 		}
 		if dc.Outbound != nil {
 			errs = append(errs, dc.Outbound.validate(path+".outbound")...)

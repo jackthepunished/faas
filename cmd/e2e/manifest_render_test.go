@@ -195,7 +195,7 @@ func TestManifestRender_WriteAndIdempotent(t *testing.T) {
 		filepath.Join(dir, "etc", "vmmd.toml"),
 		filepath.Join(dir, "systemd", "faas-schedd.service"),
 		filepath.Join(dir, "systemd", "faas-cp.slice"),
-		filepath.Join(dir, "cgroup", "faas-cp.slice", "subtree_control"),
+		filepath.Join(dir, "cgroup", "faas.slice", "faas-cp.slice", "cgroup.subtree_control"),
 	} {
 		if _, err := os.Stat(want); err != nil {
 			t.Errorf("first render: missing output %s: %v", want, err)

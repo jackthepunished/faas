@@ -172,6 +172,20 @@
   ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
   changed_when: false
 
+# The firecracker role creates /srv/fc for the root-owned vmmd, but the
+# split-box imaged and builderd services also need to traverse it to reach
+# their group-writable staging roots. A 0700 root:root parent makes the
+# apparently-correct child modes ineffective and fails only when imaged
+# tries its first digest-pinned base pull. Keep the parent non-world-readable
+# while granting the shared faas group traversal.
+- name: compute_only_service — allow shared daemons to traverse /srv/fc
+  ansible.builtin.file:
+    path: /srv/fc
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
 - name: compute_only_service — create imaged systemd drop-in directory
   ansible.builtin.file:
     path: /etc/systemd/system/faas-imaged.service.d
@@ -255,6 +269,18 @@
     - /var/spool/faas
     - /var/spool/faas/builds
     - /dev/shm/faas-base-staging
+
+# The compute daemons share selected subdirectories below /var/lib/faas.
+# postgres creates this parent as root-only on control-plane images; compute
+# hosts need group traversal so non-root imaged can reach its Grype cache and
+# OCI cache without broadening any child directory's permissions.
+- name: compute_only_service — allow faas daemons to traverse shared state root
+  ansible.builtin.file:
+    path: /var/lib/faas
+    owner: root
+    group: faas
+    mode: "0750"
+    state: directory
 
 # OCI storage uses a read-through disk cache. ProtectSystem=strict only
 # permits writes to explicit ReadWritePaths, and image-seeded hosts may
