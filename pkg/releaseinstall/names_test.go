@@ -49,6 +49,19 @@ func TestSupportBinaryNames_Stable(t *testing.T) {
 	}
 }
 
+func TestLegacyUnhashedSupportBinaryNames_IsNarrow(t *testing.T) {
+	got := LegacyUnhashedSupportBinaryNames()
+	if len(got) != 1 || got[0] != "init" {
+		t.Fatalf("legacy compatibility catalog = %v, want [init]", got)
+	}
+	if !IsLegacyUnhashedSupportBinaryName("init") {
+		t.Fatal("init is not recognised as a legacy support binary")
+	}
+	if IsLegacyUnhashedSupportBinaryName("gregalectl") || IsLegacyUnhashedSupportBinaryName("rogue") {
+		t.Fatal("legacy compatibility catalog accepted an unrelated support file")
+	}
+}
+
 // TestRuntimeAssetNames_Stable asserts the runtime-asset catalog is
 // stable across calls and includes the six canonical runner paths
 // (go124, go124-alpine, node22, node24, python312, python313).
