@@ -88,18 +88,15 @@ type server struct {
 	// never invalidates. Wired via WithSpecCache from
 	// cmd/apid/main.go (production) or kept nil (unit tests).
 	specCache *openapidiff.SpecCache
-	// scheddClient (P2 of the operator-side observability
-	// mega-PR) is apid's handle to schedd's gRPC service
-	// (pkg/scheddgrpc). Used by the admin recovery handlers
-	// (force-park, force-cold-boot-next-wake). nil-safe — the
-	// handler returns 503 when not wired. Set via
-	// WithScheddClient from cmd/apid/main.go (production) or
-	// kept nil (unit tests + dev mode without schedd).
-	// Typed as the small `forceRecoverer` interface (defined
-	// in handlers_admin_force_park.go) so handler tests can
-	// substitute a fake without spinning up a gRPC server;
-	// *scheddgrpc.Client satisfies the interface.
-	scheddClient forceRecoverer
+	// PR #1099 P2 redesign: force-park + force-cold-boot now
+	// route through the operator_intents table + pg_notify
+	// (migrations/00431). apid never imports pkg/scheddgrpc —
+	// the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. The handler flow is
+	// INSERT operator_intents row → s.notif.Notify('operator_intent',
+	// payload) → return 202 Accepted; schedd (the only writer
+	// to instances) claims + dispatches via the
+	// pkg/sched/operator_intent_subscriber.go drain.
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -525,22 +522,6 @@ func (s *server) WithGatewaydControlURL(url string) *server {
 // freshness check.
 func (s *server) WithSpecCache(cache *openapidiff.SpecCache) *server {
 	s.specCache = cache
-	return s
-}
-
-// WithScheddClient (P2 of the operator-side observability
-// mega-PR) attaches apid's handle to schedd's gRPC service.
-// Used by the admin recovery handlers (force-park,
-// force-cold-boot-next-wake) — production wires a live
-// socket-dialed *scheddgrpc.Client from cmd/apid/main.go via
-// scheddgrpc.NewClient(wire.DialContext(...)); tests can inject
-// a hand-rolled fake or leave nil so the handlers 503. The
-// parameter is typed as the small `forceRecoverer` interface
-// (defined in handlers_admin_force_park.go) so handler tests
-// can substitute a fake without standing up a gRPC server;
-// *scheddgrpc.Client satisfies the interface.
-func (s *server) WithScheddClient(c forceRecoverer) *server {
-	s.scheddClient = c
 	return s
 }
 
@@ -1528,6 +1509,17 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
 	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	// PR #1099 P2 redesign: polling endpoint for the
+	// operator_intents rows. NO MFA — mirrors getFireCronRequest
+	// at cmd/apid/handlers_fire_cron_request.go:38-83 because the
+	// operator is already authenticated via the initial POST; MFA
+	// at the polling endpoint would re-auth without operational
+	// benefit. Admin scope + s.adminAllows are the only access
+	// controls (the admin scope gate is the load-bearing IDOR
+	// closure — fleet-level intents with account_id=NULL are
+	// visible to any admin).
+	mux.HandleFunc("GET /v1/admin/operator-intents/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.getOperatorIntent)))
 	// P2c (reclaim-stuck-build) — fleet-level sweep that calls
 	// state.Store.SweepStuckRunningBuilds directly (per user
 	// decision, NO builderd gRPC server). ?older_than= is

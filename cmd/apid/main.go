@@ -53,7 +53,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/openapidiff"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
-	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/trace"
@@ -1098,27 +1097,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
 	srv.WithOAuthConfig(oauthCfg)
 
-	// P2 recovery primitives (operator-side observability mega-PR):
-	// wire a lazy gRPC dial to schedd's unix socket so the
-	// /v1/admin/instances/{id}/force-park and
-	// /v1/admin/apps/{slug}/force-cold-boot handlers can route
-	// through schedd's existing ParkInstance + ForceColdBootNextWake
-	// RPCs (preserving the schedd-is-only-writer-to-instances
-	// invariant from CLAUDE.md §6.2). The dial is lazy: it never
-	// blocks the boot on schedd being up, mirroring the gatewayd-
-	// internal and meterd precedents at
-	// cmd/gatewayd-internal/scheddrouter.go:67 and
-	// cmd/meterd/main.go:569. The canonical env var is
-	// FAAS_SCHEDD_SOCKET (same as gatewayd-internal + meterd —
-	// not FAAS_APID_SCHEDD_TARGET, which never existed; the prior
-	// handler error message was wrong on the env var name and is
-	// corrected in the same review-fix cluster).
-	scheddTarget := envOr("FAAS_SCHEDD_SOCKET", "unix:///run/faas/schedd.sock")
-	scheddClient, err := scheddgrpc.DialContext(ctx, scheddTarget, nil)
-	if err != nil {
-		return fmt.Errorf("apid: dial schedd at %s: %w", scheddTarget, err)
-	}
-	srv.WithScheddClient(scheddClient)
+	// PR #1099 P2 redesign: force-park + force-cold-boot now route
+	// through the operator_intents table + pg_notify (migrations/00431,
+	// pkg/sched/operator_intent_subscriber.go). apid never imports
+	// pkg/scheddgrpc — the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. schedd is still the only
+	// writer to instances; the trigger is now a Postgres row
+	// INSERT, not a direct gRPC call.
 
 	// Issue #142: Stripe billing portal URL template for the changePlan
 	// 402 response. Empty = 402 omits billing_portal_url; the dashboard

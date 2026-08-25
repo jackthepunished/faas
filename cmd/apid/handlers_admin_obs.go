@@ -389,7 +389,17 @@ func emitOperatorActionView(r *http.Request, s *server, caller state.Account, ta
 // `targetAccountID` is the instance's owning account; may be empty
 // when the instance cannot be resolved (the audit row is still
 // emitted so the operator action is durable).
-func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Account, targetAccountID, instanceID, appID, deploymentID, previousState, reason, scheddResult string) {
+//
+// PR #1099 P2 redesign: `result` is "enqueued" when the intent
+// row was written successfully (the durable record) or
+// "rejected" when the state gate failed (no intent was written;
+// the audit row is the only durable signal). Terminal outcome
+// (succeeded/failed) is emitted by schedd as a separate
+// operator.action.park_instance.outcome audit row — see
+// pkg/sched/operator_intent_subscriber.go. intentID is "" on
+// the rejected path; snapIDs is always nil for park (cold-boot
+// only).
+func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Account, targetAccountID, instanceID, appID, deploymentID, previousState, reason, result, intentID string, snapIDs []string) {
 	if s == nil || s.audit == nil {
 		return
 	}
@@ -400,12 +410,13 @@ func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Acc
 	s.audit.Emit(r.Context(), "operator.action.park_instance", aidPtr, map[string]any{
 		"actor":             caller.ID,
 		"target_account_id": targetAccountID,
+		"intent_id":         intentID,
 		"instance_id":       instanceID,
 		"app_id":            appID,
 		"deployment_id":     deploymentID,
 		"previous_state":    previousState,
 		"reason":            reason,
-		"schedd_result":     scheddResult,
+		"result":            result,
 	})
 }
 
@@ -413,13 +424,17 @@ func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Acc
 // audit row when an admin forces the next wake of a deployment to be
 // a cold boot via the P2b endpoint. snapIDs is the list of
 // (warm + init) snapshots that were marked stale; may be empty when
-// the deployment had no snapshots. scheddResult distinguishes
-// "success" from a 503 RPC failure so the audit log can answer
-// "did the operator's action actually take effect?" — without it,
-// an empty snapIDs list is ambiguous between "deployment had no
-// snapshots" (legitimate no-op) and "schedd was down and the
-// RPC failed" (operator action did not land).
-func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Account, targetAccountID, appID, deploymentID, scheddResult, scheddErr string, snapIDs []string) {
+// the deployment had no snapshots.
+//
+// PR #1099 P2 redesign: `result` is "enqueued" when the intent
+// row was written successfully, "rejected" when an earlier gate
+// failed. Terminal outcome (succeeded/failed) is emitted by
+// schedd as a separate operator.action.force_cold_boot.outcome
+// audit row. intentID is "" on the rejected path. The
+// snap_ids_marked_stale field on the request-kind audit row is
+// always empty here (the actual snap IDs are stamped on the
+// terminal outcome row once schedd walks the tiers).
+func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Account, targetAccountID, appID, deploymentID, result, intentID string, snapIDs []string) {
 	if s == nil || s.audit == nil {
 		return
 	}
@@ -428,16 +443,15 @@ func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Ac
 		aidPtr = &targetAccountID
 	}
 	data := map[string]any{
-		"actor":                 caller.ID,
-		"target_account_id":     targetAccountID,
-		"app_id":                appID,
-		"deployment_id":         deploymentID,
-		"snap_ids_marked_stale": snapIDs,
-		"tier_walked":           []string{"warm", "init"},
-		"schedd_result":         scheddResult,
+		"actor":             caller.ID,
+		"target_account_id": targetAccountID,
+		"intent_id":         intentID,
+		"app_id":            appID,
+		"deployment_id":     deploymentID,
+		"result":            result,
 	}
-	if scheddErr != "" {
-		data["schedd_error"] = scheddErr
+	if len(snapIDs) > 0 {
+		data["snap_ids_marked_stale"] = snapIDs
 	}
 	s.audit.Emit(r.Context(), "operator.action.force_cold_boot", aidPtr, data)
 }

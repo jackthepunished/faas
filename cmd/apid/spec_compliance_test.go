@@ -74,27 +74,28 @@ var routeExclude = map[string]bool{
 	// must move together; the SDK does not model operator-only
 	// surfaces, and the public OpenAPI spec does not document
 	// them.
-	"GET /v1/admin/obs/overview":                              true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants":                               true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/tenants/{id}":                          true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes":                                 true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/{name}/heartbeats":               true, // ADR-091 — operator-only
-	"GET /v1/admin/obs/nodes/events":                          true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
-	"GET /v1/admin/obs/nodes/wake-latency":                    true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
-	"GET /v1/admin/obs/anomalies":                             true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/admin/obs/audit-log/search":                      true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/events":                                true, // ADR-091 — operator-only (PR #3)
-	"GET /v1/admin/obs/rate-limits":                           true, // ADR-091 — operator-only (PR #2)
-	"GET /v1/admin/obs/builder-heartbeats":                    true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
+	"GET /v1/admin/obs/overview":                true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants":                 true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":        true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/builder-heartbeats":      true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
 
 	// Operator-side observability mega-PR (PR #1099) P2 recovery
 	// primitives. Mirror the cmd/sdk-coverage/main.go::routeExclude
 	// entries for these same routes — both lists must move
 	// together (operator-only surface, admin scope +
 	// FAAS_ADMIN_EMAILS allowlist).
-	"POST /v1/admin/instances/{id}/force-park":    true, // PR #1099 P2a
-	"POST /v1/admin/apps/{slug}/force-cold-boot":   true, // PR #1099 P2b
-	"POST /v1/admin/builds/sweep-stuck":           true, // PR #1099 P2c
+	"POST /v1/admin/instances/{id}/force-park":                true, // PR #1099 P2a
+	"POST /v1/admin/apps/{slug}/force-cold-boot":              true, // PR #1099 P2b
+	"POST /v1/admin/builds/sweep-stuck":                       true, // PR #1099 P2c
+	"GET /v1/admin/operator-intents/{id}":                     true, // PR #1099 P2.3
 	"GET /v1/events":                                          true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                                              true, // dashboard magic-link GET (HTML form, browser-only)
 	"POST /logout":                                            true, // dashboard logout (HTML form, browser-only)

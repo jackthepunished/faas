@@ -8020,18 +8020,23 @@ paths:
     post:
       tags: [admin]
       operationId: postForceParkInstance
-      summary: Force-park a wedged live instance (admin-only).
+      summary: Enqueue a force-park intent for a wedged live instance (admin-only).
       description: |
         Operator-side recovery primitive for instances wedged in
         {RUNNING, WAKING, COLD_BOOTING} that the customer can't
-        wait for the idle reaper to handle. Routes through schedd's
-        existing `ParkInstance` gRPC RPC so the state-machine
-        guard at `pkg/state/machine.go` fires — schedd is the
-        ONLY writer to `instances` per CLAUDE.md §6.2.
+        wait for the idle reaper to handle. PR #1099 P2 redesign:
+        apid writes a row to `operator_intents` (PR #1099 P2.1)
+        and emits `pg_notify('operator_intent', …)`; schedd
+        (the ONLY writer to `instances` per CLAUDE.md §6.2) is
+        the sole consumer and dispatches via
+        `engine.ParkWithReason` so the `pkg/state/machine.go`
+        `CanTransition` guard fires. The handler returns 202
+        Accepted with an intent_id; the operator polls
+        GET /v1/admin/operator-intents/{id} for terminal state.
 
-        Requires `?confirm=true` as a tripwire against operator
-        fat-fingering. Optional `?reason=<slug>` defaults to
-        `operator_force_park`; values are clamped to the
+        `?confirm=true` is required as a tripwire against
+        operator fat-fingering. Optional `?reason=<slug>` defaults
+        to `operator_force_park`; values are clamped to the
         `[a-z0-9_]{1,64}` shape.
       parameters:
         - in: path
@@ -8050,11 +8055,11 @@ paths:
           schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
           description: Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
       responses:
-        '200':
-          description: Park accepted. The instance transitions to PARKED within seconds.
+        '202':
+          description: Intent row written + pg_notify emitted. Poll `status_url` for terminal state.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ForceParkResponse' }
+              schema: { $ref: '#/components/schemas/OperatorIntentAcceptedResponse' }
         '400':
           description: 'Force-park validation: `?confirm=true` is missing or `?reason=` failed validation.'
           content:
@@ -8077,17 +8082,12 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-        '503':
-          description: 'Force-park 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
-          content:
-            application/problem+json:
-              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/admin/apps/{slug}/force-cold-boot:
     post:
       tags: [admin]
       operationId: postForceColdBootApp
-      summary: Mark the latest warm + init snapshots of an app's latest deployment stale (admin-only).
+      summary: Enqueue a force-cold-boot intent for an app's latest deployment (admin-only).
       description: |
         Operator-side recovery primitive for the case where the
         live instance is fine but the snapshot backing the warm
@@ -8097,8 +8097,15 @@ paths:
         deployment's latest warm + init snapshots — NOT a state-
         machine transition. The instance row is NOT mutated;
         the next customer Wake takes the cold-boot path through
-        `engine.go:4800-4820 usableSnapshotForWake` returning
-        `haveSnap=false`.
+        `engine.go::usableSnapshotForWake` returning `haveSnap=false`.
+
+        PR #1099 P2 redesign: apid writes a row to `operator_intents`
+        and emits `pg_notify('operator_intent', …)`; schedd is the
+        sole consumer and dispatches via
+        `engine.ForceColdBootNextWake`. The handler returns 202
+        Accepted with an intent_id; the operator polls
+        GET /v1/admin/operator-intents/{id} for the resolved
+        `snap_ids_marked_stale` (unknown at enqueue time).
 
         Requires `?confirm=true` as a tripwire. Optional
         `?reason=<slug>` defaults to `operator_force_cold_boot`.
@@ -8119,11 +8126,11 @@ paths:
           schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
           description: Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
       responses:
-        '200':
-          description: '`snap_ids_marked_stale` may be empty when the deployment has no snapshots.'
+        '202':
+          description: Intent row written + pg_notify emitted. Poll `status_url` for terminal state and `snap_ids_marked_stale`.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ForceColdBootResponse' }
+              schema: { $ref: '#/components/schemas/OperatorIntentAcceptedResponse' }
         '400':
           description: 'Force-cold-boot validation: `?confirm=true` is missing or `?reason=` failed validation.'
           content:
@@ -8136,16 +8143,56 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
-          description: 'code: app_not_found — no app with the supplied slug.'
+          description: 'code: app_not_found — no app with the supplied slug; OR code: deployment_not_found — app has no deployments to force-cold-boot.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-        '503':
-          description: 'Force-cold-boot 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.'
+
+  # P2 polling endpoint (PR #1099 P2.3). Returns the current
+  # state of an operator_intents row. Polled by the operator
+  # after a 202 from force-park or force-cold-boot. Admin
+  # scope only; no MFA (mirrors getFireCronRequest).
+  # IDOR closure: 404 (not 403) on wrong-owner so an admin
+  # cannot distinguish "wrong id" from "wrong owner".
+  /v1/admin/operator-intents/{id}:
+    get:
+      tags: [admin]
+      operationId: getOperatorIntent
+      summary: Read the current state of an operator intent (admin-only).
+      description: |
+        Returns the row written by the 202 Accepted response of
+        POST /v1/admin/instances/{id}/force-park or
+        POST /v1/admin/apps/{slug}/force-cold-boot. Status is
+        one of "pending" | "running" | "succeeded" | "failed" |
+        "cancelled". SnapIDsMarkedStale is populated on terminal
+        status for force_cold_boot intents (warm + init tiers
+        walked). On failure, Error carries the bounded dispatch
+        error message (1 KB cap).
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+          description: Operator intent UUID returned in the 202 Accepted body (`intent_id`).
+      responses:
+        '200':
+          description: Current state of the intent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorIntentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'getOperatorIntent 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: operator_intent_not_found — no operator intent with the supplied id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # P2c of the operator-side observability mega-PR (Commit 5c).
   # Fleet-level sweep of `builds` rows stuck in 'running' past
@@ -9437,26 +9484,64 @@ components:
       x-adr: "089"
       x-pr-cluster: "PR-C"
 
-    # P2 of the operator-side observability mega-PR (Commit 5b).
-    # Returned by POST /v1/admin/instances/{id}/force-park on
-    # the 200 path. previous_state reflects the gate-time read,
-    # not the post-call state, so a parallel customer-driven
-    # Park race doesn't lie in the audit log.
-    ForceParkResponse:
+    # P2 of the operator-side observability mega-PR (Commit P2.3).
+    # Returned by POST /v1/admin/instances/{id}/force-park and
+    # POST /v1/admin/apps/{slug}/force-cold-boot on the 202 path.
+    # Both handlers now route through the operator_intents table +
+    # pg_notify seam (PR #1099 P2 redesign). The intent row is the
+    # source of truth; the operator polls status_url for terminal
+    # state.
+    #
+    # InstanceID + PreviousState are populated for force_park;
+    # AppID + DeploymentID for force_cold_boot. Kind disambiguates
+    # which fields are meaningful. ExpiresAt is the recommended
+    # horizon for the operator to stop polling (5 minutes; matches
+    # the 30s safety tick + a comfortable buffer).
+    OperatorIntentAcceptedResponse:
       description: |
-        Wire shape for POST /v1/admin/instances/{id}/force-park
-        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
-        row is emitted under operator.action.park_instance with
-        target_account_id = the instance's owning account.
+        Wire shape for the 202 Accepted response of POST
+        /v1/admin/instances/{id}/force-park and POST
+        /v1/admin/apps/{slug}/force-cold-boot (admin scope +
+        FAAS_ADMIN_EMAILS allowlist). The audit row is emitted
+        under operator.action.{park_instance, force_cold_boot}
+        with target_account_id = the instance's / app's owning
+        account. StatusURL is the relative path; clients prepend
+        the apid base URL.
       type: object
-      required: [ok, instance_id, previous_state, reason]
+      required: [ok, intent_id, status_url, expires_at, kind, reason]
       properties:
         ok: { type: boolean, example: true }
-        instance_id: { type: string, format: uuid }
+        intent_id:
+          type: string
+          format: uuid
+          description: Operator intent UUID. Used to poll status_url.
+        status_url:
+          type: string
+          description: Relative path to GET /v1/admin/operator-intents/{intent_id}.
+          example: /v1/admin/operator-intents/11111111-1111-1111-1111-111111111111
+        expires_at:
+          type: string
+          format: date-time
+          description: Recommended horizon to stop polling (UTC, RFC 3339).
+        kind:
+          type: string
+          enum: [force_park, force_cold_boot]
+        instance_id:
+          type: string
+          format: uuid
+          description: Populated for force_park. The instance the operator targeted.
         previous_state:
           type: string
           enum: [RUNNING, WAKING, COLD_BOOTING]
-          description: Gate-time read of `instances.state`. Reflects the read at handler entry, NOT the post-call state.
+          description: Populated for force_park. Gate-time read of `instances.state`.
+        app_id:
+          type: string
+          format: uuid
+          description: Populated for force_cold_boot. The app whose deployment was targeted.
+        deployment_id:
+          type: string
+          format: uuid
+          description: Populated for force_cold_boot. The latest deployment of the app.
         reason:
           type: string
           pattern: '^[a-z0-9_]{1,64}$'
@@ -9464,38 +9549,55 @@ components:
       x-since: "2026-08"
       x-pr-cluster: "operator-obs-mega"
 
-    # P2 of the operator-side observability mega-PR (Commit 5b).
-    # Returned by POST /v1/admin/apps/{slug}/force-cold-boot on
-    # the 200 path. snap_ids_marked_stale may be empty when the
-    # deployment has no snapshots — the audit row is still
-    # emitted (durable record of operator check, even when
-    # no-op).
-    ForceColdBootResponse:
+    # P2 of the operator-side observability mega-PR (Commit P2.3).
+    # Returned by GET /v1/admin/operator-intents/{id}. Mirrors
+    # state.OperatorIntent. Status is one of "pending" | "running"
+    # | "succeeded" | "failed" | "cancelled". On success,
+    # SnapIDsMarkedStale is populated for force_cold_boot (warm +
+    # init tiers walked). On failure, Error carries the bounded
+    # dispatch error message (1 KB cap).
+    OperatorIntentResponse:
       description: |
-        Wire shape for POST /v1/admin/apps/{slug}/force-cold-boot
-        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
-        row is emitted under operator.action.force_cold_boot
-        with target_account_id = the app's owning account.
+        Wire shape for GET /v1/admin/operator-intents/{id}
+        (admin scope + FAAS_ADMIN_EMAILS allowlist; NO MFA —
+        mirrors getFireCronRequest). IDOR closure: 404 (not 403)
+        on wrong-owner so an admin cannot distinguish "wrong id"
+        from "wrong owner".
       type: object
-      required: [ok, app_id, deployment_id, snap_ids_marked_stale, reason, tier_walked]
+      required: [intent_id, kind, status, target_id, requested_at]
       properties:
-        ok: { type: boolean, example: true }
-        app_id: { type: string, format: uuid }
-        deployment_id: { type: string, format: uuid }
+        intent_id: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [force_park, force_cold_boot]
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+        target_id:
+          type: string
+          description: Instance UUID (force_park) or deployment UUID (force_cold_boot).
+        account_id:
+          type: string
+          format: uuid
+          description: Owning account. NULL for fleet-level intents (e.g. P2c reclaim_build).
+        requested_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          description: Set when schedd claims the intent (pending → running).
+        finished_at:
+          type: string
+          format: date-time
+          description: Set on terminal status (succeeded/failed/cancelled).
+        error:
+          type: string
+          description: Bounded dispatch error message (1 KB cap) on failed status.
         snap_ids_marked_stale:
           type: array
           items: { type: string, format: uuid }
-          description: Snap IDs flipped to stale. Empty when the deployment has no snapshots.
-        reason:
-          type: string
-          pattern: '^[a-z0-9_]{1,64}$'
-          example: operator_force_cold_boot
-        tier_walked:
-          type: array
-          items:
-            type: string
-            enum: [warm, init]
-          description: Snapshot tiers walked by Engine.ForceColdBootNextWake. Fixed at [warm, init] per ADR-005.
+          description: Populated for force_cold_boot on succeeded status. Empty when no snapshots existed.
       x-since: "2026-08"
       x-pr-cluster: "operator-obs-mega"
 

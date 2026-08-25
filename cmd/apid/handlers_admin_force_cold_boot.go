@@ -1,40 +1,38 @@
 // handlers_admin_force_cold_boot.go — operator-side recovery primitive
-// P2b (force-cold-boot-next-wake). The on-call engineer posts here
-// when the live instance looks fine but the snapshot backing the
-// warm tier is suspected to be the carrier of a customer-reported
-// wedge. Per ADR-005 ("snapshot of a wedged VM is a wedged VM"),
-// the recovery action is to mark the latest warm + init snapshots
-// stale — NOT to mutate the instance row. The next customer Wake
-// then takes the cold-boot path through
-// `engine.go:4800-4820 usableSnapshotForWake` returning
-// `haveSnap=false`.
+// P2b (force-cold-boot-next-wake). PR #1099 P2 redesign: same
+// pattern as force-park — INSERT operator_intents row +
+// pg_notify + 202 Accepted. schedd's operator_intent_subscriber
+// calls Engine.ForceColdBootNextWake which marks the warm +
+// init snapshots stale (the recovery action per ADR-005:
+// "snapshot of a wedged VM is a wedged VM"). No instance row
+// mutation; the next customer Wake picks `haveSnap=false` and
+// takes the cold-boot path.
 //
 // Auth + IDOR posture mirrors postForcePark: admin scope + MFA +
 // s.adminAllows (allowlist check), ?confirm=true tripwire. The
 // handler resolves the slug → apps row → latest deployments row
-// (by created_at DESC) and forwards the deployment ID to
-// schedd's gRPC RPC.
+// (by created_at DESC) and forwards the deployment ID via the
+// intent row's target_id field.
 //
-// The handler also has to handle the case where the deployment
-// has zero snapshots. Per the spec edge case "Empty": engine
-// returns ([]string{}, nil) and the handler stamps the empty
-// list in the audit row (durable record of operator check, even
-// when no-op). The HTTP response is 200 OK in both cases.
-//
-// Race note: a customer Wake can race with this handler — the
-// engine's MarkSnapshotStale is idempotent (re-stamp is a no-op
-// success), and the next Wake still picks `haveSnap=false` from
-// the post-stale read. Same precedent as the postForcePark race
-// documentation.
+// The handler does NOT wait for the dispatch — the actual snap
+// walk happens asynchronously in schedd, and the GET
+// /v1/admin/operator-intents/{id} endpoint surfaces the
+// snap_ids_marked_stale field on terminal status. Empty
+// snap_ids means "deployment had no snapshots" (legitimate
+// no-op) — the operator learns via the GET endpoint, not via
+// the 202 response.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -62,18 +60,14 @@ func (s *server) latestDeploymentForApp(ctx context.Context, appID string) (stat
 }
 
 // postForceColdBoot handles POST /v1/admin/apps/{slug}/force-cold-boot.
-// 200 on success (snap_ids_marked_stale may be empty), 400 on
-// missing ?confirm=true or invalid ?reason=, 403 admin_required,
-// 404 app_not_found or deployment_not_found, 503 when scheddClient
-// is not wired.
+// 202 on success (intent row written), 400 on missing
+// ?confirm=true or invalid ?reason=, 403 admin_required, 404
+// app_not_found or deployment_not_found.
+//
+// Note: no 409 — the cold-boot path has no "not-eligible" state
+// to gate on (the engine walks the tiers idempotently; an
+// already-stale deployment is a no-op success, not a rejection).
 func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if s.scheddClient == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
-			"schedd_unavailable",
-			"schedd client not wired",
-			"FAAS_SCHEDD_SOCKET is empty on this deployment; admin recovery endpoints are unreachable"))
-		return
-	}
 	if r.URL.Query().Get("confirm") != "true" {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"confirm required",
@@ -122,30 +116,54 @@ func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct 
 		return
 	}
 
-	snapIDs, fcErr := s.scheddClient.ForceColdBootNextWake(r.Context(), dep.ID)
-	if fcErr != nil {
-		// Emit the audit row BEFORE returning the error so the
-		// operator action is durable. schedd_result="error"
-		// distinguishes a 503 RPC failure from the legitimate
-		// no-op case (deployment had no snapshots) where
-		// snapIDs comes back empty with nil error.
-		emitOperatorActionForceColdBoot(r, s, acct, app.AccountID, app.ID, dep.ID, "error", fcErr.Error(), nil)
-		if errors.Is(fcErr, state.ErrNotFound) {
-			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
-				"deployment not found", "schedd could not find the deployment"))
-			return
-		}
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
-			"schedd_unavailable", "force-cold-boot RPC failed", fcErr.Error()))
+	var targetAccountPtr *string
+	if app.AccountID != "" {
+		acctID := app.AccountID
+		targetAccountPtr = &acctID
+	}
+
+	// Insert the intent row. Source of truth — once durable, the
+	// request returns 202.
+	intentID, err := s.store.InsertOperatorIntent(
+		r.Context(),
+		state.OperatorIntentKindForceColdBoot,
+		dep.ID,
+		targetAccountPtr,
+		acct.ID,
+		reason,
+		nil,
+	)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeInternal, "insert operator intent failed", err.Error()))
 		return
 	}
-	emitOperatorActionForceColdBoot(r, s, acct, app.AccountID, app.ID, dep.ID, "success", "", snapIDs)
-	writeJSON(w, http.StatusOK, api.ForceColdBootResponse{
-		OK:                 true,
-		AppID:              app.ID,
-		DeploymentID:       dep.ID,
-		SnapIDsMarkedStale: snapIDs,
-		Reason:             reason,
-		TierWalked:         []string{"warm", "init"},
+
+	// Fire-and-forget notify (same precedent as force-park).
+	notifyPayload, _ := json.Marshal(map[string]any{
+		"intent_id": intentID,
+		"kind":      string(state.OperatorIntentKindForceColdBoot),
+		"target_id": dep.ID,
+	})
+	if nerr := s.notif.Notify(r.Context(), db.NotifyOperatorIntent, string(notifyPayload)); nerr != nil {
+		s.log.Warn("apid: operator_intent: notify failed",
+			"intent_id", intentID, "err", nerr)
+	}
+
+	// Emit the request-kind audit row with result="enqueued"
+	// + intent_id. SnapIDs are NOT populated here — they're
+	// stamped on the terminal outcome row emitted by schedd.
+	emitOperatorActionForceColdBoot(r, s, acct, app.AccountID,
+		app.ID, dep.ID, "enqueued", intentID, nil)
+
+	writeJSON(w, http.StatusAccepted, api.OperatorIntentAcceptedResponse{
+		OK:           true,
+		IntentID:     intentID,
+		StatusURL:    "/v1/admin/operator-intents/" + intentID,
+		ExpiresAt:    time.Now().UTC().Add(operatorIntentPollHorizon),
+		Kind:         string(state.OperatorIntentKindForceColdBoot),
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+		Reason:       reason,
 	})
 }

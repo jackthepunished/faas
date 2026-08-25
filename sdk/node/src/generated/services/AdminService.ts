@@ -9,8 +9,8 @@ import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js
 import type { BillingPaddleOveragePreflightResponse } from '../models/BillingPaddleOveragePreflightResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
 import type { ConsumeInvoiceResponse } from '../models/ConsumeInvoiceResponse.js';
-import type { ForceColdBootResponse } from '../models/ForceColdBootResponse.js';
-import type { ForceParkResponse } from '../models/ForceParkResponse.js';
+import type { OperatorIntentAcceptedResponse } from '../models/OperatorIntentAcceptedResponse.js';
+import type { OperatorIntentResponse } from '../models/OperatorIntentResponse.js';
 import type { RekeyProgress } from '../models/RekeyProgress.js';
 import type { SweepStuckBuildsResponse } from '../models/SweepStuckBuildsResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -332,20 +332,25 @@ export class AdminService {
     });
   }
   /**
-   * Force-park a wedged live instance (admin-only).
+   * Enqueue a force-park intent for a wedged live instance (admin-only).
    * Operator-side recovery primitive for instances wedged in
    * {RUNNING, WAKING, COLD_BOOTING} that the customer can't
-   * wait for the idle reaper to handle. Routes through schedd's
-   * existing `ParkInstance` gRPC RPC so the state-machine
-   * guard at `pkg/state/machine.go` fires — schedd is the
-   * ONLY writer to `instances` per CLAUDE.md §6.2.
+   * wait for the idle reaper to handle. PR #1099 P2 redesign:
+   * apid writes a row to `operator_intents` (PR #1099 P2.1)
+   * and emits `pg_notify('operator_intent', …)`; schedd
+   * (the ONLY writer to `instances` per CLAUDE.md §6.2) is
+   * the sole consumer and dispatches via
+   * `engine.ParkWithReason` so the `pkg/state/machine.go`
+   * `CanTransition` guard fires. The handler returns 202
+   * Accepted with an intent_id; the operator polls
+   * GET /v1/admin/operator-intents/{id} for terminal state.
    *
-   * Requires `?confirm=true` as a tripwire against operator
-   * fat-fingering. Optional `?reason=<slug>` defaults to
-   * `operator_force_park`; values are clamped to the
+   * `?confirm=true` is required as a tripwire against
+   * operator fat-fingering. Optional `?reason=<slug>` defaults
+   * to `operator_force_park`; values are clamped to the
    * `[a-z0-9_]{1,64}` shape.
    *
-   * @returns ForceParkResponse Park accepted. The instance transitions to PARKED within seconds.
+   * @returns OperatorIntentAcceptedResponse Intent row written + pg_notify emitted. Poll `status_url` for terminal state.
    * @throws ApiError
    */
   public static postForceParkInstance({
@@ -365,7 +370,7 @@ export class AdminService {
      * Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
      */
     reason?: string,
-  }): CancelablePromise<ForceParkResponse> {
+  }): CancelablePromise<OperatorIntentAcceptedResponse> {
     return __request(OpenAPI, {
       method: 'POST',
       url: '/v1/admin/instances/{id}/force-park',
@@ -386,12 +391,11 @@ export class AdminService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
-        503: `Force-park 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.`,
       },
     });
   }
   /**
-   * Mark the latest warm + init snapshots of an app's latest deployment stale (admin-only).
+   * Enqueue a force-cold-boot intent for an app's latest deployment (admin-only).
    * Operator-side recovery primitive for the case where the
    * live instance is fine but the snapshot backing the warm
    * tier is suspected to be the carrier of a customer-reported
@@ -400,13 +404,20 @@ export class AdminService {
    * deployment's latest warm + init snapshots — NOT a state-
    * machine transition. The instance row is NOT mutated;
    * the next customer Wake takes the cold-boot path through
-   * `engine.go:4800-4820 usableSnapshotForWake` returning
-   * `haveSnap=false`.
+   * `engine.go::usableSnapshotForWake` returning `haveSnap=false`.
+   *
+   * PR #1099 P2 redesign: apid writes a row to `operator_intents`
+   * and emits `pg_notify('operator_intent', …)`; schedd is the
+   * sole consumer and dispatches via
+   * `engine.ForceColdBootNextWake`. The handler returns 202
+   * Accepted with an intent_id; the operator polls
+   * GET /v1/admin/operator-intents/{id} for the resolved
+   * `snap_ids_marked_stale` (unknown at enqueue time).
    *
    * Requires `?confirm=true` as a tripwire. Optional
    * `?reason=<slug>` defaults to `operator_force_cold_boot`.
    *
-   * @returns ForceColdBootResponse `snap_ids_marked_stale` may be empty when the deployment has no snapshots.
+   * @returns OperatorIntentAcceptedResponse Intent row written + pg_notify emitted. Poll `status_url` for terminal state and `snap_ids_marked_stale`.
    * @throws ApiError
    */
   public static postForceColdBootApp({
@@ -426,7 +437,7 @@ export class AdminService {
      * Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
      */
     reason?: string,
-  }): CancelablePromise<ForceColdBootResponse> {
+  }): CancelablePromise<OperatorIntentAcceptedResponse> {
     return __request(OpenAPI, {
       method: 'POST',
       url: '/v1/admin/apps/{slug}/force-cold-boot',
@@ -441,12 +452,50 @@ export class AdminService {
         400: `Force-cold-boot validation: \`?confirm=true\` is missing or \`?reason=\` failed validation.`,
         401: `code: unauthorized`,
         403: `Force-cold-boot 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
-        404: `code: app_not_found — no app with the supplied slug.`,
+        404: `code: app_not_found — no app with the supplied slug; OR code: deployment_not_found — app has no deployments to force-cold-boot.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
-        503: `Force-cold-boot 503: code: schedd_unavailable — FAAS_SCHEDD_SOCKET is empty on this deployment.`,
+      },
+    });
+  }
+  /**
+   * Read the current state of an operator intent (admin-only).
+   * Returns the row written by the 202 Accepted response of
+   * POST /v1/admin/instances/{id}/force-park or
+   * POST /v1/admin/apps/{slug}/force-cold-boot. Status is
+   * one of "pending" | "running" | "succeeded" | "failed" |
+   * "cancelled". SnapIDsMarkedStale is populated on terminal
+   * status for force_cold_boot intents (warm + init tiers
+   * walked). On failure, Error carries the bounded dispatch
+   * error message (1 KB cap).
+   *
+   * @returns OperatorIntentResponse Current state of the intent.
+   * @throws ApiError
+   */
+  public static getOperatorIntent({
+    id,
+  }: {
+    /**
+     * Operator intent UUID returned in the 202 Accepted body (`intent_id`).
+     */
+    id: string,
+  }): CancelablePromise<OperatorIntentResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/admin/operator-intents/{id}',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `getOperatorIntent 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
+        404: `code: operator_intent_not_found — no operator intent with the supplied id.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
       },
     });
   }

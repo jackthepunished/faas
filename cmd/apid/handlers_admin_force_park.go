@@ -1,13 +1,15 @@
 // handlers_admin_force_park.go — operator-side recovery primitive
-// P2a (force-park). The on-call engineer posts to this endpoint
-// when an instance is wedged in {RUNNING, WAKING, COLD_BOOTING}
-// and the customer can't wait for the idle reaper. The handler
-// routes through schedd's existing ParkInstance RPC
-// (pkg/scheddgrpc.Server.ParkInstance) so the state-machine
-// guard at pkg/state/machine.go:88-95 fires — schedd is the
-// ONLY writer to `instances` per CLAUDE.md §6.2. A direct
-// apid→store write would bypass lockApp + CanTransition and
-// risk a state-machine violation.
+// P2a (force-park). PR #1099 P2 redesign: the handler no longer
+// dials schedd over gRPC (that path violated the apid-control-
+// plane-only depguard rule). It instead writes an
+// operator_intents row (migrations/00431, status='pending'),
+// emits db.NotifyOperatorIntent, and returns 202 Accepted with
+// the intent_id + a status_url for polling. schedd is the only
+// writer to instances; the trigger is now a Postgres row INSERT,
+// and the actual Park runs in schedd's
+// pkg/sched/operator_intent_subscriber.go dispatch path
+// (which preserves the load-bearing lockApp +
+// machine.go::CanTransition guard from §6.2).
 //
 // Auth + IDOR posture mirrors getAppMetrics (admin scope + MFA +
 // s.adminAllows). Requires ?confirm=true as a tripwire — same
@@ -25,23 +27,29 @@
 // Audit row: operator.action.park_instance with
 //
 //	account_id = target instance's account id
-//	data = {actor: caller.ID, instance_id, app_id, deployment_id,
-//	        previous_state, reason, schedd_result}
+//	data = {actor: caller.ID, intent_id, instance_id, app_id,
+//	        deployment_id, previous_state, reason, result}
 //
-// previous_state reflects the gate-time read (NOT the post-call
-// state) so a parallel customer-driven Park race doesn't lie in
-// the audit log — same pattern as handlers_admin_obs.go.
+// `result` is "enqueued" when the intent row was written
+// successfully (the durable record) or "rejected" when the
+// state gate failed (the audit row is emitted even when no
+// intent was written, so the operator's "I checked" is
+// durable). Terminal outcome (succeeded/failed) is emitted by
+// schedd as a separate operator.action.park_instance.outcome
+// audit row — see pkg/sched/operator_intent_subscriber.go.
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -60,9 +68,7 @@ var forceParkReasonShape = regexp.MustCompile(`^[a-z0-9_]*$`)
 // forceParkableStates is the closed set of instance states from
 // which a force-park is allowed. Anything else (PARKED, PARKED_
 // SCHEDULED, PARKED_FAILED, STOPPED, DELETED, …) returns 409
-// instance_not_parkable. The list is intentionally conservative:
-// if the instance is already parked, we don't want to spam the
-// audit log with no-op rows.
+// instance_not_parkable WITHOUT writing an intent row.
 //
 // The map is keyed by the raw instance.state string (the
 // `instances.state` column is a plain text column — see
@@ -77,30 +83,18 @@ var forceParkableStates = map[string]struct{}{
 	"COLD_BOOTING": {},
 }
 
-// forceRecoverer is the small surface apid calls into schedd for
-// the P2 recovery primitives. Defining it here (rather than
-// depending on the full *scheddgrpc.Client) lets the handler
-// tests substitute a hand-rolled fake without spinning up a
-// gRPC server. The production type — *scheddgrpc.Client —
-// satisfies this interface via its ParkInstance and
-// ForceColdBootNextWake methods.
-type forceRecoverer interface {
-	ParkInstance(ctx context.Context, instanceID, reason string) error
-	ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error)
-}
+// operatorIntentPollHorizon is the recommended poll horizon
+// stamped in the 202 Accepted response (ExpiresAt). 5 minutes
+// gives the operator a comfortable buffer past the schedd
+// safety tick (30s) + first dispatch attempt.
+const operatorIntentPollHorizon = 5 * time.Minute
 
 // postForcePark handles POST /v1/admin/instances/{id}/force-park.
-// 200 on success, 400 on missing ?confirm=true or invalid
-// ?reason=, 403 admin_required, 404 instance_not_found, 409
-// instance_not_parkable, 503 when scheddClient is not wired.
+// 202 on success (intent row written), 400 on missing
+// ?confirm=true or invalid ?reason=, 403 admin_required, 404
+// instance_not_found, 409 instance_not_parkable (no intent row
+// written; audit row stamped with result="rejected").
 func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if s.scheddClient == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
-			"schedd_unavailable",
-			"schedd client not wired",
-			"FAAS_SCHEDD_SOCKET is empty on this deployment; admin recovery endpoints are unreachable"))
-		return
-	}
 	if r.URL.Query().Get("confirm") != "true" {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"confirm required",
@@ -127,8 +121,10 @@ func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct stat
 
 	// State gate: read the instance fresh so the gate-time check
 	// matches the audit row's previous_state. A racing customer-
-	// driven Park can move the row between this read and the
-	// schedd RPC — the handler doc-comment documents the race.
+	// driven Park can move the row between this read and schedd's
+	// Engine.Park — the schedd-side CanTransition guard closes
+	// that race; the audit trail records both the gate-time
+	// previous_state and the terminal outcome.
 	ins, err := s.store.InstanceByID(r.Context(), instanceID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
@@ -141,8 +137,12 @@ func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct stat
 		return
 	}
 	if _, ok := forceParkableStates[ins.State]; !ok {
+		// Reject WITHOUT writing an intent row. Audit row is
+		// still emitted with result="rejected" so the operator
+		// action is durable.
 		emitOperatorActionParkInstance(r, s, acct, "", instanceID,
-			ins.AppID, ins.DeploymentID, ins.State, reason, "error")
+			ins.AppID, ins.DeploymentID, ins.State, reason,
+			"rejected", "", nil)
 		api.WriteProblem(w, api.NewProblem(http.StatusConflict,
 			"instance_not_parkable",
 			"instance is not in a parkable state",
@@ -152,38 +152,79 @@ func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct stat
 
 	// Resolve the app → account so the audit row's account_id is
 	// the instance's owning account (not the calling admin's
-	// account). If app resolution fails we still emit the audit
-	// row with targetAccountID="" — the audit row is durable
-	// even when the join is impossible (mirrors the precedent at
-	// emitOperatorActionForceColdBoot which also tolerates a
-	// missing app row).
+	// account). If app resolution fails we still write the
+	// intent row with account_id=NULL — the intent's
+	// target_id is the source of truth for what the operator
+	// acted on.
 	app, aerr := s.store.AppByID(r.Context(), ins.AppID)
-	targetAccountID := ""
-	if aerr == nil {
-		targetAccountID = app.AccountID
+	var targetAccountPtr *string
+	if aerr == nil && app.AccountID != "" {
+		acctID := app.AccountID
+		targetAccountPtr = &acctID
 	}
 
-	parkErr := s.scheddClient.ParkInstance(r.Context(), instanceID, reason)
-	result := "success"
-	if parkErr != nil {
-		result = "error"
-	}
-	emitOperatorActionParkInstance(r, s, acct, targetAccountID, instanceID,
-		ins.AppID, ins.DeploymentID, ins.State, reason, result)
-	if parkErr != nil {
-		if errors.Is(parkErr, state.ErrNotFound) {
-			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
-				"instance not found", "schedd could not find the instance"))
-			return
-		}
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
-			"schedd_unavailable", "park RPC failed", parkErr.Error()))
+	// Insert the intent row. This is the source of truth —
+	// once it's durable, the request returns 202.
+	intentID, err := s.store.InsertOperatorIntent(
+		r.Context(),
+		state.OperatorIntentKindForcePark,
+		instanceID,
+		targetAccountPtr,
+		acct.ID,
+		reason,
+		nil,
+	)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeInternal, "insert operator intent failed", err.Error()))
 		return
 	}
-	writeJSON(w, http.StatusOK, api.ForceParkResponse{
+
+	// Emit pg_notify. Fire-and-forget: a failure here is
+	// logged but does NOT 5xx the request — the intent row
+	// is durable and the 30s safety tick reclaims any row
+	// whose notify was lost. Same precedent as
+	// cmd/apid/handlers_cron_run.go:99-104.
+	notifyPayload, _ := json.Marshal(map[string]any{
+		"intent_id": intentID,
+		"kind":      string(state.OperatorIntentKindForcePark),
+		"target_id": instanceID,
+	})
+	if nerr := s.notif.Notify(r.Context(), db.NotifyOperatorIntent, string(notifyPayload)); nerr != nil {
+		s.log.Warn("apid: operator_intent: notify failed",
+			"intent_id", intentID, "err", nerr)
+	}
+
+	// Emit the request-kind audit row with result="enqueued"
+	// + intent_id. The terminal outcome audit row is emitted
+	// by schedd on terminal state (operator.action.park_instance.
+	// outcome). Same actor + target shape as the previous
+	// design; the rename of schedd_result→result reflects the
+	// shift to async semantics (values: "enqueued" | "rejected").
+	emitOperatorActionParkInstance(r, s, acct,
+		targetAccountIDOrEmpty(targetAccountPtr),
+		instanceID, ins.AppID, ins.DeploymentID, ins.State,
+		reason, "enqueued", intentID, nil)
+
+	writeJSON(w, http.StatusAccepted, api.OperatorIntentAcceptedResponse{
 		OK:            true,
+		IntentID:      intentID,
+		StatusURL:     "/v1/admin/operator-intents/" + intentID,
+		ExpiresAt:     time.Now().UTC().Add(operatorIntentPollHorizon),
+		Kind:          string(state.OperatorIntentKindForcePark),
 		InstanceID:    instanceID,
 		PreviousState: ins.State,
 		Reason:        reason,
 	})
+}
+
+// targetAccountIDOrEmpty dereferences the optional pointer, "" when
+// nil. Used to keep the audit row's account_id field consistent
+// between the nil-pointer + non-empty-string shapes — the audit
+// writer treats both the same way.
+func targetAccountIDOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

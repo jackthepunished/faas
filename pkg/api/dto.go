@@ -5655,31 +5655,50 @@ type RekeyProgress struct {
 	LastID  string `json:"last_id,omitempty"`
 }
 
-// ForceParkResponse is the wire shape returned by POST
-// /v1/admin/instances/{id}/force-park (P2a of the operator-side
-// observability mega-PR, Commit 5b). PreviousState reflects the
-// gate-time read of `instances.state`, NOT the post-call state
-// — a parallel customer-driven Park race between the gate and
-// the schedd RPC does not lie in the audit log.
-type ForceParkResponse struct {
-	OK            bool   `json:"ok"`
-	InstanceID    string `json:"instance_id"`
-	PreviousState string `json:"previous_state"`
-	Reason        string `json:"reason"`
+// OperatorIntentAcceptedResponse is the wire shape returned by
+// POST /v1/admin/instances/{id}/force-park and
+// POST /v1/admin/apps/{slug}/force-cold-boot (PR #1099 P2
+// redesign). Both handlers now return 202 Accepted with an
+// intent_id; the operator polls GET /v1/admin/operator-intents/{id}
+// for terminal status. StatusURL is the relative path; clients
+// prepend the apid base URL.
+//
+// InstanceID + PreviousState are populated for force_park;
+// AppID + DeploymentID for force_cold_boot. Kind disambiguates
+// which fields are meaningful. ExpiresAt is the recommended
+// horizon for the operator to stop polling (5 minutes; matches
+// the 30s safety tick + a comfortable buffer).
+type OperatorIntentAcceptedResponse struct {
+	OK            bool      `json:"ok"`
+	IntentID      string    `json:"intent_id"`
+	StatusURL     string    `json:"status_url"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Kind          string    `json:"kind"`
+	InstanceID    string    `json:"instance_id,omitempty"`
+	AppID         string    `json:"app_id,omitempty"`
+	DeploymentID  string    `json:"deployment_id,omitempty"`
+	PreviousState string    `json:"previous_state,omitempty"`
+	Reason        string    `json:"reason"`
 }
 
-// ForceColdBootResponse is the wire shape returned by POST
-// /v1/admin/apps/{slug}/force-cold-boot (P2b of the operator-side
-// observability mega-PR, Commit 5b). SnapIDsMarkedStale may be
-// empty when the deployment has no snapshots — the audit row is
-// still emitted so the operator check is durable even when no-op.
-type ForceColdBootResponse struct {
-	OK                 bool     `json:"ok"`
-	AppID              string   `json:"app_id"`
-	DeploymentID       string   `json:"deployment_id"`
-	SnapIDsMarkedStale []string `json:"snap_ids_marked_stale"`
-	Reason             string   `json:"reason"`
-	TierWalked         []string `json:"tier_walked"`
+// OperatorIntentResponse is the wire shape returned by
+// GET /v1/admin/operator-intents/{id}. It mirrors the
+// state.OperatorIntent struct directly. Status is one of
+// "pending" | "running" | "succeeded" | "failed" | "cancelled".
+// On success, SnapIDsMarkedStale is populated for
+// force_cold_boot (warm + init tiers walked). On failure,
+// Error carries the bounded dispatch error message (1 KB cap).
+type OperatorIntentResponse struct {
+	IntentID           string     `json:"intent_id"`
+	Kind               string     `json:"kind"`
+	Status             string     `json:"status"`
+	TargetID           string     `json:"target_id"`
+	AccountID          string     `json:"account_id,omitempty"`
+	RequestedAt        time.Time  `json:"requested_at"`
+	StartedAt          *time.Time `json:"started_at,omitempty"`
+	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+	Error              string     `json:"error,omitempty"`
+	SnapIDsMarkedStale []string   `json:"snap_ids_marked_stale,omitempty"`
 }
 
 // SweepStuckBuildsResponse is the wire shape returned by POST
