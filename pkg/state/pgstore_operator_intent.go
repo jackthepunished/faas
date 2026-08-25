@@ -180,17 +180,34 @@ func (s *PgStore) MarkOperatorIntentSucceeded(ctx context.Context, id string, sn
 // via `GET /v1/admin/operator-intents/{id}`. Cap to 1 KB to
 // match the audit payload convention
 // (pkg/sched/loop.go:1840-1864).
-func (s *PgStore) MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error {
+//
+// snapIDs captures the partial-success shape (P2d / R4 review
+// fix): when a force_restart dispatch flips the deployment's
+// warm + init snapshots stale but timedDestroy fails, the snaps
+// ARE stale in the database but the destroy is not. Persisting
+// them on the failed row means GET /v1/admin/operator-intents/{id}
+// surfaces "the next wake WILL cold-boot" even on the failure
+// path. snapIDs may be nil (race-loser / unknown-kind /
+// deployment-not-found / etc.).
+func (s *PgStore) MarkOperatorIntentFailed(ctx context.Context, id, errMsg string, snapIDs []string) error {
 	if len(errMsg) > 1024 {
 		errMsg = errMsg[:1024]
+	}
+	if snapIDs == nil {
+		// pgx encodes a nil []string as NULL on the wire, but
+		// the column is text[] NOT NULL — coerce to an empty
+		// slice so the INSERT shape is uniform. Same precedent
+		// as MarkOperatorIntentSucceeded's snapIDs handling.
+		snapIDs = []string{}
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE operator_intents
 		SET status = 'failed',
 		    error = $2,
-		    finished_at = $3
+		    snap_ids_marked_stale = $3,
+		    finished_at = $4
 		WHERE id = $1 AND status = 'running'
-	`, id, errMsg, time.Now().UTC())
+	`, id, errMsg, snapIDs, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("state: mark operator_intent failed: %w", err)
 	}

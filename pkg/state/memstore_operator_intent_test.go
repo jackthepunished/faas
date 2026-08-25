@@ -145,7 +145,7 @@ func TestMemStore_OperatorIntent_MarkFailed(t *testing.T) {
 	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found"); err != nil {
+	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found", nil); err != nil {
 		t.Fatalf("MarkOperatorIntentFailed: %v", err)
 	}
 	got, err := store.GetOperatorIntent(ctx, id)

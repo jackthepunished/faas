@@ -188,7 +188,7 @@ func TestMarkFailedLifecycle(t *testing.T) {
 	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if err := store.MarkOperatorIntentFailed(ctx, id, "can_transition: instance state PARKED"); err != nil {
+	if err := store.MarkOperatorIntentFailed(ctx, id, "can_transition: instance state PARKED", nil); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -209,6 +209,98 @@ func TestMarkFailedLifecycle(t *testing.T) {
 	// Second claim: terminal row invisible.
 	if _, err := store.ClaimPendingOperatorIntent(ctx); !errors.Is(err, state.ErrOperatorIntentNotFound) {
 		t.Errorf("claim after failed: got %v, want ErrOperatorIntentNotFound", err)
+	}
+}
+
+// TestPartialSuccess_SnapIDsPersistedOnFailedRow pins the P2d
+// R4 review fix: when Engine.ForceRestart flips the deployment's
+// warm + init snaps stale but timedDestroy fails (vmmd wedged),
+// the partial-success snap IDs MUST land on the operator_intent
+// row even though status='failed'. Without this, an operator
+// querying GET /v1/admin/operator-intents/{id} sees
+// status='failed' but no evidence that the snap-stale work
+// landed — they don't know whether the next wake will be a
+// cold boot (it WILL, because the snaps ARE stale in the
+// database).
+//
+// The terminal operator.action.<verb>.outcome audit row already
+// carried snap_ids_marked_stale; this test pins that the row
+// itself now agrees with the audit row on partial-success.
+func TestPartialSuccess_SnapIDsPersistedOnFailedRow(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "actor-id"
+	id, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"target-instance-id", nil, actor, "wedged_destroy", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	// Engine.ForceRestart returned (snapIDs, destroyErr). The
+	// subscriber stamps the row failed but must also persist
+	// the snap IDs so the operator's GET endpoint surfaces
+	// "next wake will cold-boot despite the destroy error".
+	partial := []string{"snap-warm-partial", "snap-init-partial"}
+	if err := store.MarkOperatorIntentFailed(ctx, id,
+		"sched: force_restart: destroy instance: vmmd timeout", partial); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	got, err := store.GetOperatorIntent(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != state.OperatorIntentFailed {
+		t.Errorf("status=%q, want failed", got.Status)
+	}
+	if got.Error == "" {
+		t.Errorf("error not stamped (destroy cause must survive on the row)")
+	}
+	if len(got.SnapIDsMarkedStale) != len(partial) {
+		t.Fatalf("snap_ids_marked_stale len=%d, want %d (partial-success must persist)",
+			len(got.SnapIDsMarkedStale), len(partial))
+	}
+	for i, w := range partial {
+		if got.SnapIDsMarkedStale[i] != w {
+			t.Errorf("snap_ids[%d]=%q, want %q", i, got.SnapIDsMarkedStale[i], w)
+		}
+	}
+
+	// Race-loser / unknown-kind posture: MarkFailed with nil
+	// snapIDs must NOT wipe a previously-stamped value (the
+	// impl coerces nil→empty, but a nil caller never had any
+	// IDs to wipe in the first place — this is the symmetric
+	// case to the partial-success test above).
+	raceID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceRestart,
+		"race-target", nil, actor, "race", nil,
+	)
+	if err != nil {
+		t.Fatalf("Insert race: %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("Claim race: %v", err)
+	}
+	if err := store.MarkOperatorIntentFailed(ctx, raceID,
+		"state: instance not in running state", nil); err != nil {
+		t.Fatalf("MarkFailed race: %v", err)
+	}
+	raceGot, err := store.GetOperatorIntent(ctx, raceID)
+	if err != nil {
+		t.Fatalf("Get race: %v", err)
+	}
+	if raceGot.Status != state.OperatorIntentFailed {
+		t.Errorf("race status=%q, want failed", raceGot.Status)
+	}
+	if len(raceGot.SnapIDsMarkedStale) != 0 {
+		t.Errorf("race snap_ids_marked_stale len=%d, want 0 (race-loser stamps no snaps)",
+			len(raceGot.SnapIDsMarkedStale))
 	}
 }
 

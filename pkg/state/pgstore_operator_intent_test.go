@@ -126,7 +126,7 @@ func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 
-	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found"); err != nil {
+	if err := store.MarkOperatorIntentFailed(ctx, id, "deployment not found", nil); err != nil {
 		t.Fatalf("MarkOperatorIntentFailed: %v", err)
 	}
 
