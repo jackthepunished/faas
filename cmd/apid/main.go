@@ -1524,8 +1524,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		var apidProbe wire.ReadyzProbe
 		if deps.pool != nil {
 			pgSig, pgStop := wire.NewPGPingSignal(ctx, deps.pool, 5*time.Second)
-			apidProbe.RegisterSignal(pgSig)
-			defer pgStop() // flip /readyz to 503 on ctx.Done before run() returns
+			apidProbe.RegisterSignal(pgSig, pgStop)
+			// NOTE: pgStop is wired through pkg/wire.ReadyzProbe.Drain
+			// (issue #571 PR-A2 / Finding 4 PR #1091 review). The
+			// earlier `defer pgStop()` is gone — Drain fires the
+			// helper goroutine's stopper synchronously before
+			// flipping the signal to "draining", so a /readyz
+			// scrape that lands during the SIGTERM drain window
+			// sees the helper already stopped (no re-flip race).
 		} else {
 			// Test path: no pool. Always-ready so /readyz returns
 			// 200. Mirrors the pre-split degradation pattern.

@@ -34,22 +34,26 @@ import (
 // per meter.Health; the operator sees "stale: ..." immediately
 // on the first /readyz scrape).
 //
-// Returns the probe + a stop func the daemon boot path defers.
-// The stop func flips the signal to "meterd stopping" on
-// shutdown so the SIGTERM drain window surfaces in
-// daemon_ready{daemon="meterd"} as 0.
-func BuildReadinessProbe(loop *meter.Loop) (*wire.ReadyzProbe, func()) {
+// Returns the probe. Drain() (RunAndShutdown's drain path) is
+// responsible for firing the helper-goroutine stopper, so the
+// caller does not get a stop func — pkg/wire.Drain owns the
+// lifecycle of the helper goroutine via RegisterSignal's
+// stopper arg.
+func BuildReadinessProbe(loop *meter.Loop) *wire.ReadyzProbe {
 	sig := &wire.ReadySignal{}
 	// Pre-arm so the first /readyz scrape doesn't see a stale
 	// 503 — the first adapter tick will flip it to false if
 	// any tick is stale. Mirrors pkg/wire/readiness.go
 	// NewStalenessSignal's pre-arm.
 	sig.Set(true, "")
-	p := &wire.ReadyzProbe{}
-	p.RegisterSignal(sig)
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
+	stopFn := func() {
+		close(stop)
+		<-done
+		sig.Set(false, "meterd stopping")
+	}
 	go func() {
 		defer close(done)
 		t := time.NewTicker(time.Second)
@@ -82,10 +86,7 @@ func BuildReadinessProbe(loop *meter.Loop) (*wire.ReadyzProbe, func()) {
 			}
 		}
 	}()
-	stopFn := func() {
-		close(stop)
-		<-done
-		sig.Set(false, "meterd stopping")
-	}
-	return p, stopFn
+	p := &wire.ReadyzProbe{}
+	p.RegisterSignal(sig, stopFn)
+	return p
 }

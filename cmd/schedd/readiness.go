@@ -46,25 +46,18 @@ type pgPool interface {
 // a probe with no PG signal — only the gRPC bound signal. The
 // /readyz body surfaces the failing reason, so an operator
 // reading the panel sees "pg pool nil" rather than a silent 200.
-func BuildReadinessProbe(ctx context.Context, pool pgPool, pgPingEvery time.Duration) (*wire.ReadyzProbe, *grpcBoundSignal, func()) {
+func BuildReadinessProbe(ctx context.Context, pool pgPool, pgPingEvery time.Duration) (*wire.ReadyzProbe, *grpcBoundSignal) {
 	p := &wire.ReadyzProbe{}
-	var stoppers []func()
 	if pool != nil {
 		sig, stop := wire.NewPGPingSignal(ctx, pool, pgPingEvery)
-		p.RegisterSignal(sig)
-		stoppers = append(stoppers, stop)
+		p.RegisterSignal(sig, stop)
 	} else {
 		s := p.Register()
 		s.Set(false, "pg pool nil (test path)")
 	}
 	bound := &grpcBoundSignal{}
-	p.RegisterSignal(bound.Signal())
-	stopAll := func() {
-		for _, st := range stoppers {
-			st()
-		}
-	}
-	return p, bound, stopAll
+	p.RegisterSignal(bound.Signal(), nil)
+	return p, bound
 }
 
 // grpcBoundSignal — see cmd/vmmd/readiness.go for the canonical

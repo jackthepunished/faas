@@ -159,8 +159,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cfg.BuildDriveDir writable (the overlay mount source).
 	// Constructed after openDB so the pool is live; the vmmd
 	// dial signal races alongside the driver dial below.
-	builderdProbe, builderdStop := BuildReadinessProbe(ctx, pool, cfg.BuildDriveDir, vmmTarget, nil)
-	defer builderdStop()
+	builderdProbe := BuildReadinessProbe(ctx, pool, cfg.BuildDriveDir, vmmTarget, nil)
 
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the tls_* cluster; nil TLS on a

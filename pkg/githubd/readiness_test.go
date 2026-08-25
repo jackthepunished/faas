@@ -22,11 +22,11 @@ func (f *fakeGHPool) Ping(ctx context.Context) error {
 
 func TestBuildReadinessProbe_AllSignalsHappy(t *testing.T) {
 	pool := &fakeGHPool{pingFn: func(ctx context.Context) error { return nil }}
-	p, stop := BuildReadinessProbe(context.Background(), pool,
+	p := BuildReadinessProbe(context.Background(), pool,
 		func() bool { return true },
 		func() bool { return true },
 	)
-	defer stop()
+	defer p.Drain("", nil)
 	if p == nil {
 		t.Fatal("BuildReadinessProbe returned nil")
 	}
@@ -46,11 +46,11 @@ func TestBuildReadinessProbe_PGPingFails(t *testing.T) {
 	pool := &fakeGHPool{pingFn: func(ctx context.Context) error {
 		return errors.New("connection refused")
 	}}
-	p, stop := BuildReadinessProbe(context.Background(), pool,
+	p := BuildReadinessProbe(context.Background(), pool,
 		func() bool { return true },
 		func() bool { return true },
 	)
-	defer stop()
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && (strings.Contains(reason, "pg") || strings.Contains(reason, "connection")) {
@@ -69,11 +69,11 @@ func TestBuildReadinessProbe_PGPingFails(t *testing.T) {
 
 func TestBuildReadinessProbe_CredsNotLoaded(t *testing.T) {
 	pool := &fakeGHPool{pingFn: func(ctx context.Context) error { return nil }}
-	p, stop := BuildReadinessProbe(context.Background(), pool,
+	p := BuildReadinessProbe(context.Background(), pool,
 		func() bool { return false },
 		func() bool { return true },
 	)
-	defer stop()
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if r, _ := p.All(); !r {
@@ -92,11 +92,11 @@ func TestBuildReadinessProbe_CredsNotLoaded(t *testing.T) {
 
 func TestBuildReadinessProbe_SecretNotWired(t *testing.T) {
 	pool := &fakeGHPool{pingFn: func(ctx context.Context) error { return nil }}
-	p, stop := BuildReadinessProbe(context.Background(), pool,
+	p := BuildReadinessProbe(context.Background(), pool,
 		func() bool { return true },
 		func() bool { return false },
 	)
-	defer stop()
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if r, _ := p.All(); !r {
@@ -110,11 +110,11 @@ func TestBuildReadinessProbe_SecretNotWired(t *testing.T) {
 }
 
 func TestBuildReadinessProbe_NilPool(t *testing.T) {
-	p, stop := BuildReadinessProbe(context.Background(), nil,
+	p := BuildReadinessProbe(context.Background(), nil,
 		func() bool { return true },
 		func() bool { return true },
 	)
-	defer stop()
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && strings.Contains(reason, "pg pool nil") {
@@ -134,8 +134,8 @@ func TestBuildReadinessProbe_NilPool(t *testing.T) {
 func TestBuildReadinessProbe_NilClosures(t *testing.T) {
 	pool := &fakeGHPool{pingFn: func(ctx context.Context) error { return nil }}
 	// nil credsLoaded + nil secretWired: only PG ping registered.
-	p, stop := BuildReadinessProbe(context.Background(), pool, nil, nil)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, nil, nil)
+	defer p.Drain("", nil)
 	if p == nil {
 		t.Fatal("BuildReadinessProbe returned nil")
 	}

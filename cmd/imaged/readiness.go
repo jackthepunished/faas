@@ -43,25 +43,18 @@ const defaultStorageRoot = "/srv/fc"
 //
 // Returns the probe + a stop func the daemon boot path
 // defers. stop() halts the helper goroutines.
-func BuildReadinessProbe(storageRoot string) (*wire.ReadyzProbe, func()) {
+func BuildReadinessProbe(storageRoot string) *wire.ReadyzProbe {
 	if storageRoot == "" {
 		storageRoot = defaultStorageRoot
 	}
 	cacheDir := filepath.Join(storageRoot, "cache")
 
 	p := &wire.ReadyzProbe{}
-	stoppers := []func(){}
 	for _, path := range []string{storageRoot, cacheDir} {
 		sig, stop := writableSignal(path, 5*time.Second)
-		p.RegisterSignal(sig)
-		stoppers = append(stoppers, stop)
+		p.RegisterSignal(sig, stop)
 	}
-	stopAll := func() {
-		for _, st := range stoppers {
-			st()
-		}
-	}
-	return p, stopAll
+	return p
 }
 
 // writableSignal returns a (*ReadySignal, stopper). The signal

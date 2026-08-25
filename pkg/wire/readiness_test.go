@@ -128,7 +128,7 @@ func TestReadyzProbe_ReadyFuncIgnoresReason(t *testing.T) {
 
 func TestReadyzProbe_RegisterSignal_NilSafe(t *testing.T) {
 	var p wire.ReadyzProbe
-	p.RegisterSignal(nil) // must not panic
+	p.RegisterSignal(nil, nil) // must not panic
 	if ready, _ := p.All(); !ready {
 		t.Errorf("RegisterSignal(nil) followed by no other registers: ready = false, want true (nil must be a no-op)")
 	}
@@ -136,11 +136,11 @@ func TestReadyzProbe_RegisterSignal_NilSafe(t *testing.T) {
 
 func TestReadyzProbe_RegisterSignal_FoldsExisting(t *testing.T) {
 	var p wire.ReadyzProbe
-	p.RegisterSignal(nil) // nil-safe; must not panic
+	p.RegisterSignal(nil, nil) // nil-safe; must not panic
 	// Real signal:
 	sig := &wire.ReadySignal{}
 	sig.Set(true, "")
-	p.RegisterSignal(sig)
+	p.RegisterSignal(sig, nil)
 	if !p.ReadyFunc()() {
 		t.Errorf("RegisterSignal of ready signal: ready = false, want true")
 	}

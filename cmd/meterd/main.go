@@ -977,8 +977,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ControlMuxLite registration below can wire /readyz on
 	// the same mux as /healthz + /metrics. defer stop so the
 	// SIGTERM drain window surfaces in daemon_ready as 0.
-	meterdProbe, meterdStop := BuildReadinessProbe(loop)
-	defer meterdStop()
+	meterdProbe := BuildReadinessProbe(loop)
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
 		if deps.metricsListenAndServe == nil {

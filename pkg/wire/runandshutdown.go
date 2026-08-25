@@ -133,10 +133,23 @@ func RunAndShutdown(ctx context.Context, log *slog.Logger, probe *ReadyzProbe, n
 // bespoke drain semantics (e.g. gatewayd-public's drain
 // tracker wrapping) can compose it with its own logic.
 //
-// The signal flip is a single Set per signal; the gauge
-// reset uses defaultOps.MarkReady so the gauge label set
-// stays in sync with the daemon's name. nil probe and nil
-// log are tolerated (no-op).
+// Order is load-bearing (Finding 4 from PR #1091 review):
+//
+//  1. Fire every registered stopper synchronously. Each
+//     stopper (NewPGPingSignal, NewStalenessSignal, and
+//     per-daemon helpers like vmmdDialSignal /
+//     buildsDirSignal / writableSignal / meterd's loop.Health
+//     adapter) closes its goroutine's stop channel and
+//     blocks until the goroutine exits. Firing stoppers FIRST
+//     guarantees no helper is alive to re-flip a signal after
+//     we set it.
+//  2. Flip every signal to (false, "draining"). With all
+//     helpers stopped, the flip is uncontended.
+//  3. Reset the daemon_ready{daemon} gauge to 0 (reason
+//     "draining") so the §12 "Fleet readiness" panel
+//     reflects the draining state in real time.
+//
+// nil probe and nil log are tolerated (no-op).
 func (p *ReadyzProbe) Drain(name string, log *slog.Logger) {
 	if p == nil {
 		return
@@ -144,12 +157,23 @@ func (p *ReadyzProbe) Drain(name string, log *slog.Logger) {
 	p.mu.RLock()
 	signals := make([]*ReadySignal, len(p.signals))
 	copy(signals, p.signals)
+	stoppers := make([]func(), len(p.stoppers))
+	copy(stoppers, p.stoppers)
 	p.mu.RUnlock()
+	// Step 1: stop helpers BEFORE flipping signals. Each stopper
+	// blocks until its helper goroutine exits, so by the time the
+	// loop returns no helper can re-flip a signal.
+	for _, st := range stoppers {
+		st()
+	}
+	// Step 2: flip signals to (false, "draining") now that all
+	// helpers are stopped.
 	for _, s := range signals {
 		s.Set(false, "draining")
 	}
+	// Step 3: reset the daemon-level gauge.
 	defaultOps.MarkReady(name, false, "draining")
 	if log != nil {
-		log.Info("readiness drained", "name", name, "signals", len(signals))
+		log.Info("readiness drained", "name", name, "signals", len(signals), "stoppers", len(stoppers))
 	}
 }

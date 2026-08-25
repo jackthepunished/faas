@@ -57,7 +57,7 @@ type pgPool interface {
 // pool is the *pgxpool.Pool used by the build worker; nil
 // degrades the probe to a single "pg pool nil (test path)"
 // signal.
-func BuildReadinessProbe(ctx context.Context, pool pgPool, storageRoot, vmmTarget string, dial vmmdDialer) (*wire.ReadyzProbe, func()) {
+func BuildReadinessProbe(ctx context.Context, pool pgPool, storageRoot, vmmTarget string, dial vmmdDialer) *wire.ReadyzProbe {
 	if storageRoot == "" {
 		storageRoot = defaultBuildsDir
 	}
@@ -68,27 +68,18 @@ func BuildReadinessProbe(ctx context.Context, pool pgPool, storageRoot, vmmTarge
 		dial = defaultDial
 	}
 	p := &wire.ReadyzProbe{}
-	var stoppers []func()
 	if pool != nil {
 		sig, stop := wire.NewPGPingSignal(ctx, pool, 5*time.Second)
-		p.RegisterSignal(sig)
-		stoppers = append(stoppers, stop)
+		p.RegisterSignal(sig, stop)
 	} else {
 		s := p.Register()
 		s.Set(false, "pg pool nil (test path)")
 	}
 	vmmSig, vmmStop := vmmdDialSignal(ctx, vmmTarget, dial, 5*time.Second)
-	p.RegisterSignal(vmmSig)
-	stoppers = append(stoppers, vmmStop)
+	p.RegisterSignal(vmmSig, vmmStop)
 	buildsSig, buildsStop := buildsDirSignal(buildsDir, 5*time.Second)
-	p.RegisterSignal(buildsSig)
-	stoppers = append(stoppers, buildsStop)
-	stopAll := func() {
-		for _, st := range stoppers {
-			st()
-		}
-	}
-	return p, stopAll
+	p.RegisterSignal(buildsSig, buildsStop)
+	return p
 }
 
 // defaultDial is the production dial path: grpc.DialContext.

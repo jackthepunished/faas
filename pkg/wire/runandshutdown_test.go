@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,4 +169,65 @@ func TestReadyzProbe_DrainNilProbe(t *testing.T) {
 	// nil probe should not panic. Drains is no-op.
 	var p *ReadyzProbe
 	p.Drain("test", nil)
+}
+
+// TestReadyzProbe_DrainStopsHelpersBeforeFlippingSignals is the
+// regression test for Finding 4 from PR #1091 review. The prior
+// shape had Drain flip signals to (false, "draining") but leave
+// the helper goroutines running — so a NewPGPingSignal /
+// NewStalenessSignal / vmmdDialSignal helper could re-flip a
+// signal back to true on its next tick. The probe would then
+// report ready while the daemon is mid-drain.
+//
+// The fix: Drain() fires every registered stopper synchronously
+// BEFORE flipping signals. This test exercises the round-trip:
+// a custom helper goroutine that re-flips the signal on every
+// 10 ms tick is registered via RegisterSignal(s, stopper).
+// After Drain, the helper goroutine is dead (its stop channel
+// closed, its done channel observed by stopper); a 50 ms sleep
+// gives the goroutine every chance to re-flip the signal —
+// it cannot, because the helper is gone.
+func TestReadyzProbe_DrainStopsHelpersBeforeFlippingSignals(t *testing.T) {
+	probe := &ReadyzProbe{}
+	sig := &ReadySignal{}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	probe.RegisterSignal(sig, func() {
+		close(stop)
+		<-done
+	})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(10 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				// Re-flip the signal to true on every tick. If
+				// Drain doesn't stop this goroutine first, /readyz
+				// would see ready=true mid-drain (the bug).
+				sig.Set(true, "")
+			}
+		}
+	}()
+	// Let the goroutine flip the signal a few times.
+	time.Sleep(50 * time.Millisecond)
+	if r, _ := probe.All(); !r {
+		t.Fatalf("setup: helper goroutine never flipped signal to ready")
+	}
+
+	probe.Drain("test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Drain is synchronous: by the time it returned, the helper
+	// goroutine is dead. A subsequent sleep gives the (now-dead)
+	// goroutine every chance to re-flip the signal — it can't.
+	time.Sleep(100 * time.Millisecond)
+	if r, reason := probe.All(); r {
+		t.Errorf("after Drain + 100ms: All() = true (helper goroutine re-flipped the signal post-drain — Finding 4 regression)")
+	} else if !strings.Contains(reason, "draining") {
+		t.Errorf("after Drain + 100ms: reason = %q, want contains \"draining\"", reason)
+	}
 }

@@ -93,10 +93,19 @@ func (s *ReadySignal) lastReason() string {
 // pre-split behaviour, preserved so an early-boot scrape does not
 // see a spurious 503.
 //
+// stoppers collects one stopper func per helper-backed signal
+// (NewPGPingSignal, NewStalenessSignal, and per-daemon helpers
+// like vmmdDialSignal / buildsDirSignal / writableSignal).
+// Drain() fires every stopper BEFORE flipping signals to false
+// so a helper goroutine can't re-flip a signal after the drain
+// has set it. Manual signals (Register, RegisterSignal with nil
+// stopper) don't have a stopper entry; Drain() ignores them.
+//
 // Mirrors pkg/gateway/readiness.go::ReadyzProbe.
 type ReadyzProbe struct {
-	mu      sync.RWMutex
-	signals []*ReadySignal
+	mu       sync.RWMutex
+	signals  []*ReadySignal
+	stoppers []func()
 }
 
 // Register adds a new ReadySignal to the probe and returns it so
@@ -119,22 +128,31 @@ func (p *ReadyzProbe) Register() *ReadySignal {
 	return s
 }
 
-// RegisterSignal adds a pre-constructed *ReadySignal to the probe.
-// This is the helper-constructor counterpart to Register: helper
-// constructors (NewPGPingSignal, NewStalenessSignal) build a signal
-// internally and return it for the caller to drive via Stopper /
-// Touch. Register() would build a second placeholder signal;
-// RegisterSignal folds the existing one into the probe without
-// allocating a duplicate.
+// RegisterSignal adds a pre-constructed *ReadySignal to the probe
+// plus an optional stopper func for the helper goroutine that
+// drives the signal (NewPGPingSignal, NewStalenessSignal,
+// vmmdDialSignal, buildsDirSignal, writableSignal, meterd's
+// loop.Health adapter). Drain() fires every registered stopper
+// synchronously BEFORE flipping signals to false; this prevents
+// the helper goroutine from re-flipping a signal after the drain
+// has set it (Finding 4 from PR #1091 review).
+//
+// stopper may be nil for signals that have no helper goroutine
+// (vmmd's kvmOpenableSignal, fcBinarySignal, grpcBoundSignal,
+// githubd's credsLoadedSignal / secretWiredSignal — manual flips).
+// A nil stopper is silently dropped from the stoppers slice.
 //
 // Order in All() is the order of the Register / RegisterSignal
 // calls, which is preserved for the /readyz reason concat.
-func (p *ReadyzProbe) RegisterSignal(s *ReadySignal) {
+func (p *ReadyzProbe) RegisterSignal(s *ReadySignal, stopper func()) {
 	if s == nil {
 		return
 	}
 	p.mu.Lock()
 	p.signals = append(p.signals, s)
+	if stopper != nil {
+		p.stoppers = append(p.stoppers, stopper)
+	}
 	p.mu.Unlock()
 }
 

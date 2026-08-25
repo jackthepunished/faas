@@ -544,8 +544,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// can wire /readyz on the same mux as /metrics. defer
 		// stop so the SIGTERM drain window surfaces in
 		// daemon_ready as 0.
-		imagedProbe, imagedStop := BuildReadinessProbe(envOr("FAAS_STORAGE_ROOT", defaultStorageRoot))
-		defer imagedStop()
+		imagedProbe := BuildReadinessProbe(envOr("FAAS_STORAGE_ROOT", defaultStorageRoot))
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
 		wire.ControlMuxLite(mux, imagedProbe.ReadyFunc(), imagedProbe.ReasonFunc())

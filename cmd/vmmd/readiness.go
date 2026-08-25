@@ -49,10 +49,10 @@ const devKVM = "/dev/kvm"
 // gRPC bind fails later (the only runtime-flipping signal).
 func BuildReadinessProbe() (*wire.ReadyzProbe, *grpcBoundSignal) {
 	p := &wire.ReadyzProbe{}
-	p.RegisterSignal(kvmOpenableSignal())
-	p.RegisterSignal(fcBinarySignal())
+	p.RegisterSignal(kvmOpenableSignal(), nil)
+	p.RegisterSignal(fcBinarySignal(), nil)
 	bound := &grpcBoundSignal{}
-	p.RegisterSignal(bound.Signal())
+	p.RegisterSignal(bound.Signal(), nil)
 	return p, bound
 }
 

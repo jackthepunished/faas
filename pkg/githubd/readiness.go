@@ -55,29 +55,22 @@ type secretResolverWired func() bool
 // degrades the probe to a single "pg pool nil (test path)"
 // signal. credsLoaded + secretWired are closure hooks the
 // boot path uses to gate the other two signals.
-func BuildReadinessProbe(ctx context.Context, pool pgPool, credsLoaded appCredsLoaded, secretWired secretResolverWired) (*wire.ReadyzProbe, func()) {
+func BuildReadinessProbe(ctx context.Context, pool pgPool, credsLoaded appCredsLoaded, secretWired secretResolverWired) *wire.ReadyzProbe {
 	p := &wire.ReadyzProbe{}
-	var stoppers []func()
 	if pool != nil {
 		sig, stop := wire.NewPGPingSignal(ctx, pool, 5*time.Second)
-		p.RegisterSignal(sig)
-		stoppers = append(stoppers, stop)
+		p.RegisterSignal(sig, stop)
 	} else {
 		s := p.Register()
 		s.Set(false, "pg pool nil (test path)")
 	}
 	if credsLoaded != nil {
-		p.RegisterSignal(credsLoadedSignal(credsLoaded, 5*time.Second))
+		p.RegisterSignal(credsLoadedSignal(credsLoaded, 5*time.Second), nil)
 	}
 	if secretWired != nil {
-		p.RegisterSignal(secretWiredSignal(secretWired, 5*time.Second))
+		p.RegisterSignal(secretWiredSignal(secretWired, 5*time.Second), nil)
 	}
-	stopAll := func() {
-		for _, st := range stoppers {
-			st()
-		}
-	}
-	return p, stopAll
+	return p
 }
 
 // credsLoadedSignal polls credsLoaded on a 5 s cadence. The

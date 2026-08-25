@@ -34,8 +34,8 @@ func TestBuildReadinessProbe_NilPool(t *testing.T) {
 	// Unit-test path: no real pool. The probe must NOT panic
 	// on pool=nil and must surface "pg pool nil (test path)"
 	// as the failing reason.
-	p, bound, stop := BuildReadinessProbe(context.Background(), nil, time.Second)
-	defer stop()
+	p, bound := BuildReadinessProbe(context.Background(), nil, time.Second)
+	defer p.Drain("", nil)
 	if p == nil || bound == nil {
 		t.Fatal("BuildReadinessProbe returned nil")
 	}
@@ -56,8 +56,8 @@ func TestBuildReadinessProbe_PGHealthy(t *testing.T) {
 	pool := &fakePGPool{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, bound, stop := BuildReadinessProbe(ctx, pool, 50*time.Millisecond)
-	defer stop()
+	p, bound := BuildReadinessProbe(ctx, pool, 50*time.Millisecond)
+	defer p.Drain("", nil)
 	bound.MarkBound()
 	// Wait for the first ping to succeed.
 	deadline := time.Now().Add(time.Second)
@@ -76,8 +76,8 @@ func TestBuildReadinessProbe_PGFailsFlipsNotReady(t *testing.T) {
 	pool := &fakePGPool{err: errors.New("connection refused")}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, bound, stop := BuildReadinessProbe(ctx, pool, 30*time.Millisecond)
-	defer stop()
+	p, bound := BuildReadinessProbe(ctx, pool, 30*time.Millisecond)
+	defer p.Drain("", nil)
 	bound.MarkBound()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -96,8 +96,8 @@ func TestBuildReadinessProbe_PGFailsFlipsNotReady(t *testing.T) {
 }
 
 func TestGrpcBoundSignal_StartsNotReady(t *testing.T) {
-	_, bound, stop := BuildReadinessProbe(context.Background(), &fakePGPool{}, time.Second)
-	defer stop()
+	_, bound := BuildReadinessProbe(context.Background(), &fakePGPool{}, time.Second)
+	defer bound.Signal().Set(false, "test cleanup") // cheap equivalent to Drain for manual signal
 	r, reason := bound.Signal().Report()
 	if r {
 		t.Errorf("before MarkBound: ready = true (reason=%q), want false", reason)
@@ -108,8 +108,8 @@ func TestGrpcBoundSignal_StartsNotReady(t *testing.T) {
 }
 
 func TestGrpcBoundSignal_MarkBound(t *testing.T) {
-	_, bound, stop := BuildReadinessProbe(context.Background(), &fakePGPool{}, time.Second)
-	defer stop()
+	p, bound := BuildReadinessProbe(context.Background(), &fakePGPool{}, time.Second)
+	defer p.Drain("", nil)
 	bound.MarkBound()
 	if r, _ := bound.Signal().Report(); !r {
 		t.Errorf("after MarkBound: ready = false, want true")
@@ -120,8 +120,8 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	pool := &fakePGPool{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, bound, stop := BuildReadinessProbe(ctx, pool, 50*time.Millisecond)
-	defer stop()
+	p, bound := BuildReadinessProbe(ctx, pool, 50*time.Millisecond)
+	defer p.Drain("", nil)
 	bound.MarkBound()
 	// Wait for first ping to succeed.
 	deadline := time.Now().Add(time.Second)

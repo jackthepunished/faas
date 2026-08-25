@@ -43,8 +43,8 @@ func TestBuildReadinessProbe_HappyPath(t *testing.T) {
 		}
 		return nil
 	}
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "", dial)
+	defer p.Drain("", nil)
 	if p == nil {
 		t.Fatal("BuildReadinessProbe returned nil")
 	}
@@ -69,8 +69,8 @@ func TestBuildReadinessProbe_BuildsDirWritable(t *testing.T) {
 	}
 	pool := &fakePGPool{pingFn: func(ctx context.Context) error { return nil }}
 	dial := func(ctx context.Context, target string) error { return nil }
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
+	defer p.Drain("", nil)
 	// Probe must flip ready (PG + buildsDir + vmmd dial all OK).
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -94,8 +94,8 @@ func TestBuildReadinessProbe_PGPingFails(t *testing.T) {
 		return errors.New("connection refused")
 	}}
 	dial := func(ctx context.Context, target string) error { return nil }
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && (strings.Contains(reason, "pg") || strings.Contains(reason, "connection")) {
@@ -122,8 +122,8 @@ func TestBuildReadinessProbe_VmmdDialFails(t *testing.T) {
 	dial := func(ctx context.Context, target string) error {
 		return errors.New("connection refused")
 	}
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && strings.Contains(reason, "vmmd dial") {
@@ -147,8 +147,8 @@ func TestBuildReadinessProbe_NilPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	dial := func(ctx context.Context, target string) error { return nil }
-	p, stop := BuildReadinessProbe(context.Background(), nil, root, "unix:///run/faas/vmmd.sock", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), nil, root, "unix:///run/faas/vmmd.sock", dial)
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && strings.Contains(reason, "pg pool nil") {
@@ -173,8 +173,8 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	}
 	pool := &fakePGPool{pingFn: func(ctx context.Context) error { return nil }}
 	dial := func(ctx context.Context, target string) error { return nil }
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
-	defer stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
+	defer p.Drain("", nil)
 	time.Sleep(50 * time.Millisecond)
 	mux := http.NewServeMux()
 	wire.ControlMuxLite(mux, p.ReadyFunc(), p.ReasonFunc())
@@ -186,7 +186,7 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	}
 }
 
-func TestBuildReadinessProbe_StopFlipsFalse(t *testing.T) {
+func TestBuildReadinessProbe_DrainFlipsFalse(t *testing.T) {
 	root := t.TempDir()
 	buildsDir := filepath.Join(root, "builds")
 	if err := os.MkdirAll(buildsDir, 0o755); err != nil {
@@ -194,15 +194,15 @@ func TestBuildReadinessProbe_StopFlipsFalse(t *testing.T) {
 	}
 	pool := &fakePGPool{pingFn: func(ctx context.Context) error { return nil }}
 	dial := func(ctx context.Context, target string) error { return nil }
-	p, stop := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
-	stop()
+	p := BuildReadinessProbe(context.Background(), pool, root, "unix:///run/faas/vmmd.sock", dial)
+	p.Drain("", nil)
 	r, reason := p.All()
 	if r {
-		t.Errorf("after stop: All() = true, want false")
+		t.Errorf("after Drain: All() = true, want false")
 	}
-	// At least one signal should report stopping.
-	if !strings.Contains(reason, "stopping") {
-		t.Errorf("reason = %q, want contains \"stopping\"", reason)
+	// At least one signal should report draining.
+	if !strings.Contains(reason, "draining") {
+		t.Errorf("reason = %q, want contains \"draining\"", reason)
 	}
 }
 

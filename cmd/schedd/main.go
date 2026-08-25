@@ -753,8 +753,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Probe construction is platform-portable — pool may be nil
 	// in unit tests that don't wire a real pgxpool; the probe
 	// short-circuits to "pg pool nil (test path)" in that case.
-	scheddProbe, scheddBound, scheddStop := BuildReadinessProbe(ctx, pool, 5*time.Second)
-	defer scheddStop()
+	scheddProbe, scheddBound := BuildReadinessProbe(ctx, pool, 5*time.Second)
 	scheddBound.MarkBound()
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),

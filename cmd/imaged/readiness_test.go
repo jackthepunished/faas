@@ -19,8 +19,8 @@ func TestBuildReadinessProbe_HappyPath(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p, stop := BuildReadinessProbe(root)
-	defer stop()
+	p := BuildReadinessProbe(root)
+	defer p.Drain("", nil)
 	if p == nil {
 		t.Fatal("BuildReadinessProbe returned nil")
 	}
@@ -42,8 +42,8 @@ func TestBuildReadinessProbe_MissingRoot(t *testing.T) {
 	// creation fails. /readyz must surface the failing
 	// reason. This is the "deploy misconfigured" path.
 	bogus := "/nonexistent-parent-12345/root"
-	p, stop := BuildReadinessProbe(bogus)
-	defer stop()
+	p := BuildReadinessProbe(bogus)
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && reason != "" {
@@ -70,8 +70,8 @@ func TestBuildReadinessProbe_NonWritablePath(t *testing.T) {
 	// Reset perms at test teardown so t.TempDir can clean up.
 	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
 
-	p, stop := BuildReadinessProbe(root)
-	defer stop()
+	p := BuildReadinessProbe(root)
+	defer p.Drain("", nil)
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if r, reason := p.All(); !r && (strings.Contains(reason, "permission") || strings.Contains(reason, "denied")) {
@@ -93,8 +93,8 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p, stop := BuildReadinessProbe(root)
-	defer stop()
+	p := BuildReadinessProbe(root)
+	defer p.Drain("", nil)
 	time.Sleep(50 * time.Millisecond)
 	mux := http.NewServeMux()
 	wire.ControlMuxLite(mux, p.ReadyFunc(), p.ReasonFunc())
@@ -106,18 +106,18 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite(t *testing.T) {
 	}
 }
 
-func TestBuildReadinessProbe_StopFlipsFalse(t *testing.T) {
+func TestBuildReadinessProbe_DrainFlipsFalse(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "cache"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p, stop := BuildReadinessProbe(root)
-	stop()
+	p := BuildReadinessProbe(root)
+	p.Drain("", nil)
 	r, reason := p.All()
 	if r {
-		t.Errorf("after stop: All() = true, want false")
+		t.Errorf("after Drain: All() = true, want false")
 	}
-	if !strings.Contains(reason, "stopping") {
-		t.Errorf("reason = %q, want contains \"stopping\"", reason)
+	if !strings.Contains(reason, "draining") {
+		t.Errorf("reason = %q, want contains \"draining\"", reason)
 	}
 }

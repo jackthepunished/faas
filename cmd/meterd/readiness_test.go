@@ -22,8 +22,8 @@ import (
 func TestBuildReadinessProbe_NilLoop(t *testing.T) {
 	// Nil loop (test path / config error) surfaces "meterd
 	// loop nil" as the failing reason.
-	p, stop := BuildReadinessProbe(nil)
-	defer stop()
+	p := BuildReadinessProbe(nil)
+	defer p.Drain("", nil)
 	if p == nil {
 		t.Fatal("BuildReadinessProbe(nil) returned nil probe")
 	}
@@ -38,17 +38,20 @@ func TestBuildReadinessProbe_NilLoop(t *testing.T) {
 	}
 }
 
-func TestBuildReadinessProbe_StopFlipsFalse(t *testing.T) {
-	// stop() flips the signal to "meterd stopping" regardless
-	// of the underlying loop state.
-	p, stop := BuildReadinessProbe(nil)
-	stop()
+func TestBuildReadinessProbe_DrainFlipsFalse(t *testing.T) {
+	// Drain() flips every signal to (false, "draining") and
+	// fires every registered stopper (Finding 4 from PR #1091
+	// review — the helper goroutine must exit before the
+	// signal flip is observed). After Drain, /readyz must
+	// see 503 with the "draining" reason in the body.
+	p := BuildReadinessProbe(nil)
+	p.Drain("", nil)
 	r, reason := p.All()
 	if r {
-		t.Errorf("after stop: All() = true, want false")
+		t.Errorf("after Drain: All() = true, want false")
 	}
-	if !strings.Contains(reason, "stopping") {
-		t.Errorf("reason = %q, want contains \"stopping\"", reason)
+	if !strings.Contains(reason, "draining") {
+		t.Errorf("reason = %q, want contains \"draining\"", reason)
 	}
 }
 
@@ -57,8 +60,8 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite_NilLoop(t *testing.T) {
 	// (the panic-prone path). The /readyz body must surface
 	// the failing reason with the canonical "not-ready:"
 	// prefix.
-	p, stop := BuildReadinessProbe(nil)
-	defer stop()
+	p := BuildReadinessProbe(nil)
+	defer p.Drain("", nil)
 	time.Sleep(50 * time.Millisecond)
 	mux := http.NewServeMux()
 	wire.ControlMuxLite(mux, p.ReadyFunc(), p.ReasonFunc())
@@ -78,21 +81,23 @@ func TestBuildReadinessProbe_EndToEndViaControlMuxLite_NilLoop(t *testing.T) {
 	}
 }
 
-func TestBuildReadinessProbe_EndToStopOnShutdown(t *testing.T) {
-	// After stop(), /readyz must return 503 with reason
-	// "meterd stopping" so the §12 "Fleet readiness" panel
-	// surfaces the drain window.
-	p, stop := BuildReadinessProbe(nil)
-	stop()
+func TestBuildReadinessProbe_EndToDrainOnShutdown(t *testing.T) {
+	// After Drain(), /readyz must return 503 with reason
+	// "draining" so the §12 "Fleet readiness" panel surfaces
+	// the drain window. Drain is the canonical post-RunAndShutdown
+	// hook (replaces the per-daemon `defer stop()` shape from
+	// PR-A2 commit 9).
+	p := BuildReadinessProbe(nil)
+	p.Drain("", nil)
 	mux := http.NewServeMux()
 	wire.ControlMuxLite(mux, p.ReadyFunc(), p.ReasonFunc())
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusServiceUnavailable {
-		t.Errorf("/readyz code = %d, want 503 (stopping)", rr.Code)
+		t.Errorf("/readyz code = %d, want 503 (draining)", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "stopping") {
-		t.Errorf("/readyz body = %q, want contains \"stopping\"", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "draining") {
+		t.Errorf("/readyz body = %q, want contains \"draining\"", rr.Body.String())
 	}
 }

@@ -412,11 +412,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// resolver wired (always set in production; nil = deploy
 	// misconfig where the per-tenant path fell back to the
 	// platform-wide env).
-	githubdProbe, githubdStop := githubd.BuildReadinessProbe(ctx, pool,
+	githubdProbe := githubd.BuildReadinessProbe(ctx, pool,
 		func() bool { return realSvc != nil },
 		func() bool { return secretResolver != nil },
 	)
-	defer githubdStop()
 
 	srv := &githubd.Server{
 		Service:        webhookSvc,
