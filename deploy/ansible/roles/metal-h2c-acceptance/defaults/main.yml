@@ -1,0 +1,90 @@
+# G19.3 / ADR-127 Layer 12 — opt-in metal acceptance fixture.
+#
+# This role is deliberately not included by bootstrap.yml. It mutates neither
+# the normal production topology nor the vmmd service unless an operator runs
+# the dedicated acceptance playbook with mha_enabled=true.
+
+mha_enabled: false
+mha_require_kvm: true
+mha_require_x86_64: true
+
+mha_install_dir: /opt/faas/metal-h2c-acceptance
+mha_harness_path: "{{ mha_install_dir }}/metal-acceptance.sh"
+mha_fixture_env_path: /etc/faas/metal-h2c-acceptance/fixture-apps.env
+mha_service_name: faas-metal-h2c-acceptance.service
+mha_runner_user: faas-metal-acceptance
+mha_runner_group: faas-metal-acceptance
+
+# A oneshot unit is installed for repeatable operator runs, but is not
+# enabled or started by default. The normal invocation is `systemctl start
+# faas-metal-h2c-acceptance` after the fixture has been deployed.
+mha_service_enabled: false
+mha_service_state: stopped
+
+# Fixture provisioning is intentionally an explicit operator action. The
+# command is supplied by the deployment environment so an API token never
+# enters this role or the repository. Example:
+#
+#   -e mha_provision_fixtures=true \
+#   -e 'mha_fixture_provision_command=/usr/local/sbin/gregale-provision-h2c'
+mha_provision_fixtures: false
+mha_fixture_provision_command: ""
+mha_api_base: ""
+mha_api_token: ""
+mha_run_acceptance: false
+
+mha_acceptance_timeout_seconds: 30
+mha_framing_assert_command: ""
+mha_surgical_rollback_command: ""
+mha_surgical_restore_command: ""
+mha_wholesale_rollback_command: ""
+mha_wholesale_restore_command: ""
+
+# The five canonical §14 M8 row 5 fixtures. URLs and gRPC targets can be
+# overridden in host/group vars; the slugs remain stable so logs and incident
+# notes are comparable across providers.
+mha_fixture_apps:
+  - id: app_http1_default
+    slug: metal-h2c-http1
+    app_protocol: http1
+    expected_framing: h1
+    probe: http1
+    path: /
+    description: "HTTP/1.1 baseline; verify zero behavior change."
+  - id: app_http2_prior_knowledge
+    slug: metal-h2c-http2
+    app_protocol: http2
+    expected_framing: h2c
+    probe: h2c
+    path: /
+    description: "H2 prior-knowledge client to H2C listener."
+  - id: app_grpc_unary
+    slug: metal-h2c-grpc-unary
+    app_protocol: grpc
+    expected_framing: h2c
+    probe: grpc
+    grpc_method: grpc.health.v1.Health/Check
+    grpc_payload: '{}'
+    description: "Unary gRPC; trailers flow through H2C as HEADERS frames."
+  - id: app_grpc_server_streaming
+    slug: metal-h2c-grpc-stream
+    app_protocol: grpc
+    expected_framing: h2c
+    probe: grpc
+    grpc_method: grpc.health.v1.Health/Watch
+    grpc_payload: '{"service":""}'
+    description: "Server-streaming gRPC; verify long-lived H2C stability."
+  - id: app_surgical_rollback_target
+    slug: metal-h2c-rollback
+    app_protocol: http2
+    expected_framing: h1
+    probe: rollback
+    path: /
+    description: "Rollback target; force h1 and v1 switches must remain live."
+
+mha_expected_fixture_ids:
+  - app_http1_default
+  - app_http2_prior_knowledge
+  - app_grpc_unary
+  - app_grpc_server_streaming
+  - app_surgical_rollback_target

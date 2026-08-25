@@ -1216,10 +1216,10 @@ add `deploy/ansible/roles/metal-h2c-acceptance/`).
     `metalAvailable(t)` gates using the canonical pattern at
     `cmd/e2e/deploy_override_port_metal_test.go:165`. Build tag
     `//go:build metal` preserved. Depends on G19.1 + G19.3.
-  - **G19.3** — `deploy/ansible/roles/metal-h2c-acceptance/`. Mirrors
-    `deploy/ansible/roles/control_plane_service/` shape;
-    `defaults/main.yml` exposes a 5-app fixture set
-    (`app_http1_default`, `app_http2_prior_knowledge`,
-    `app_grpc_unary`, `app_grpc_server_streaming`,
-    `app_surgical_rollback_target`); `tasks/main.yml` runs the 5
-    §14 M8 row 5 acceptance gates. Depends on G19.1 + G19.2.
+  - **G19.3** — `deploy/ansible/roles/metal-h2c-acceptance/`. The
+    opt-in role is now implemented with the five-app fixture contract,
+    KVM/x86_64 preflight, root-owned secret environment, non-root oneshot
+    harness, and five named §14 M8 row 5 gates. It is invoked only through
+    `deploy/ansible/metal-h2c-acceptance.yml`; the normal production
+    `bootstrap.yml` remains unchanged. G19.2 still owns enabling the Go
+    metal tests once a real acceptance host is available.
