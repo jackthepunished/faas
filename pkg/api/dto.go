@@ -5655,6 +5655,33 @@ type RekeyProgress struct {
 	LastID  string `json:"last_id,omitempty"`
 }
 
+// ForceParkResponse is the wire shape returned by POST
+// /v1/admin/instances/{id}/force-park (P2a of the operator-side
+// observability mega-PR, Commit 5b). PreviousState reflects the
+// gate-time read of `instances.state`, NOT the post-call state
+// — a parallel customer-driven Park race between the gate and
+// the schedd RPC does not lie in the audit log.
+type ForceParkResponse struct {
+	OK            bool   `json:"ok"`
+	InstanceID    string `json:"instance_id"`
+	PreviousState string `json:"previous_state"`
+	Reason        string `json:"reason"`
+}
+
+// ForceColdBootResponse is the wire shape returned by POST
+// /v1/admin/apps/{slug}/force-cold-boot (P2b of the operator-side
+// observability mega-PR, Commit 5b). SnapIDsMarkedStale may be
+// empty when the deployment has no snapshots — the audit row is
+// still emitted so the operator check is durable even when no-op.
+type ForceColdBootResponse struct {
+	OK                 bool     `json:"ok"`
+	AppID              string   `json:"app_id"`
+	DeploymentID       string   `json:"deployment_id"`
+	SnapIDsMarkedStale []string `json:"snap_ids_marked_stale"`
+	Reason             string   `json:"reason"`
+	TierWalked         []string `json:"tier_walked"`
+}
+
 // ThrottleSuggestionRow is one (route → suggested rate) row in the
 // payload returned by GET /v1/apps/{slug}/throttle-suggestions
 // (ADR-091 D20.5 amendment, issue #881 / PR-E). The recommender is

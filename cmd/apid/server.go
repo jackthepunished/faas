@@ -88,6 +88,18 @@ type server struct {
 	// never invalidates. Wired via WithSpecCache from
 	// cmd/apid/main.go (production) or kept nil (unit tests).
 	specCache *openapidiff.SpecCache
+	// scheddClient (P2 of the operator-side observability
+	// mega-PR) is apid's handle to schedd's gRPC service
+	// (pkg/scheddgrpc). Used by the admin recovery handlers
+	// (force-park, force-cold-boot-next-wake). nil-safe — the
+	// handler returns 503 when not wired. Set via
+	// WithScheddClient from cmd/apid/main.go (production) or
+	// kept nil (unit tests + dev mode without schedd).
+	// Typed as the small `forceRecoverer` interface (defined
+	// in handlers_admin_force_park.go) so handler tests can
+	// substitute a fake without spinning up a gRPC server;
+	// *scheddgrpc.Client satisfies the interface.
+	scheddClient forceRecoverer
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -513,6 +525,22 @@ func (s *server) WithGatewaydControlURL(url string) *server {
 // freshness check.
 func (s *server) WithSpecCache(cache *openapidiff.SpecCache) *server {
 	s.specCache = cache
+	return s
+}
+
+// WithScheddClient (P2 of the operator-side observability
+// mega-PR) attaches apid's handle to schedd's gRPC service.
+// Used by the admin recovery handlers (force-park,
+// force-cold-boot-next-wake) — production wires a live
+// socket-dialed *scheddgrpc.Client from cmd/apid/main.go via
+// scheddgrpc.NewClient(wire.DialContext(...)); tests can inject
+// a hand-rolled fake or leave nil so the handlers 503. The
+// parameter is typed as the small `forceRecoverer` interface
+// (defined in handlers_admin_force_park.go) so handler tests
+// can substitute a fake without standing up a gRPC server;
+// *scheddgrpc.Client satisfies the interface.
+func (s *server) WithScheddClient(c forceRecoverer) *server {
+	s.scheddClient = c
 	return s
 }
 
@@ -1481,6 +1509,18 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodesEventsSSE))))
 	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
+
+	// P2a + P2b — operator recovery primitives. Both routes mount
+	// under requireScope(admin-only) so the admin allowlist
+	// (s.adminAllows at compute_nodes.go:74-86) is the only
+	// structural gate. The handlers themselves additionally
+	// require ?confirm=true as a tripwire against operator
+	// fat-fingering (matches the force-drain --yes ack at
+	// commands_compute_nodes.go:249).
+	mux.HandleFunc("POST /v1/admin/instances/{id}/force-park",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
+	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
