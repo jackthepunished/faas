@@ -163,6 +163,67 @@ func TestReadyzProbe_ReasonFunc(t *testing.T) {
 	}
 }
 
+// TestReadySignal_ReportSetAtomicPair is the regression test
+// for PR #1091 review Finding 6. The previous shape stored the
+// ready bit in atomic.Bool and the reason string under a
+// sync.RWMutex; Report() did `s.ready.Load(); s.lastReason()` —
+// two separate operations. A Set() firing between the Load and
+// the RLock could leave Report() returning a stale reason with
+// a fresh ready bit (or vice versa).
+//
+// The fix bundles (ready, reason) into a single immutable
+// readyState struct published via atomic.Pointer. Set is a single
+// Store; Report is a single Load. A concurrent Report+Set must
+// observe either the old state or the new state, never a torn
+// pair. The test stresses the pair from two goroutines for
+// several iterations and asserts every observed snapshot is
+// internally consistent (one of two valid states).
+func TestReadySignal_ReportSetAtomicPair(t *testing.T) {
+	s := wire.NewReadySignalForTest(false, "v0")
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// Writer: flips between (false, "v0") and (true, "v1") every
+	// iteration.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.Set(false, "v0")
+			s.Set(true, "v1")
+		}
+	}()
+	// Reader: 100 goroutines, each observing 1000 reports.
+	const readers = 100
+	const reads = 1000
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < reads; j++ {
+				ready, reason := s.Report()
+				switch {
+				case ready && reason == "v1":
+					// valid (true, "v1")
+				case !ready && reason == "v0":
+					// valid (false, "v0")
+				default:
+					t.Errorf("torn snapshot: ready=%v reason=%q (must be (true,\"v1\") or (false,\"v0\"))", ready, reason)
+					return
+				}
+			}
+		}()
+	}
+	// Let the race run for a short window.
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 func TestNewStalenessSignal_PreArmedReady(t *testing.T) {
 	// The signal is pre-armed to ready=true at construction so
 	// that the first /readyz scrape sees a sensible state before
