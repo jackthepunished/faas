@@ -3290,6 +3290,64 @@ type AppMetricsResponse struct {
 	// header convention so the SDK generator picks it up
 	// automatically.
 	Routes []RouteRow `json:"routes,omitempty"`
+
+	// Wakes24h is the count of wake.boot_started events the
+	// schedd recorded for this app in the trailing 24 hours.
+	// Sourced from the events table (count over
+	// kind='wake.boot_started' AND app_id=$1 AND
+	// at >= now() - interval '24 hours'). The (data->>'app_id')
+	// predicate is NOT covered by the existing events_wake_id_idx
+	// jsonb expression index (migration 00114 indexes
+	// data->>'wake_id'); on a Scale-tier app with a large fleet
+	// the underlying query can seq-scan + jsonb-cast per row.
+	// Best-effort: 0 when Prometheus is degraded, the events
+	// row hasn't been written, or the store query fails. The
+	// customer-facing dashboard surfaces this as the "wakes
+	// today" line item; combined with ColdStartPct it answers
+	// "is my app wake-bound or sleep-bound". The pre-ADR-123
+	// fleet renders this as 0 because pre-PR-A boot_started
+	// rows carry no app_id field — same posture as the
+	// wake-timeline view's `WakeCountWithMeta` denominator at
+	// cmd/apid/handlers_dashboard.go:2659.
+	Wakes24h int64 `json:"wakes_24h,omitempty"`
+
+	// CacheHitRatePct is the share of cache-eligible requests
+	// served from gateway_response_cache (ADR-122) over the
+	// window. Field is ALWAYS present on the wire so the SDK
+	// can rely on the documented schema — 0 means either
+	// "feature off" (no cache rule attached) or "feature on,
+	// zero traffic". The dashboard distinguishes the two via
+	// the existence of the `Routes` block, not via field
+	// absence. Mirrors the response-cache wakes-avoided count
+	// in `pkg/appmetrics.Fetch` for the operator-side view;
+	// the customer-facing denominator is "requests that hit a
+	// cache-eligible route" rather than the fleet-wide total
+	// so a customer with a single cacheable path sees a
+	// meaningful percentage rather than 0.0001%.
+	//
+	// Implementation note: the PromQL query against
+	// gateway_response_cache_total{app_id, outcome=hit/miss}
+	// is out of scope for this PR; the field stays 0 until
+	// the response-cache consumer-facing metric lands.
+	CacheHitRatePct float64 `json:"cache_hit_rate_pct"`
+
+	// ErrorBudgetPct is the remaining API-availability error
+	// budget as a percentage (0 = exhausted, 100 = full).
+	// Field is ALWAYS present on the wire so the SDK can rely
+	// on the documented schema — 0 renders as "—" on the
+	// dashboard rather than a misleading "budget exhausted"
+	// message. Window is the trailing 30 days (the §12 SLO
+	// evaluation period). Computed as
+	// `100 - (observed_error_rate_pct × 30d_window_factor)`
+	// against the plan's API-availability SLO target
+	// (99.5% per spec §12). Best-effort: 0 when the
+	// `apid_request_total{account_id, route, code}` series is
+	// degraded or the per-plan SLO target is unknown.
+	//
+	// Implementation note: the per-plan SLO target is not
+	// yet exposed on the Limits struct (issue TBD); the
+	// field stays 0 until that lands.
+	ErrorBudgetPct float64 `json:"error_budget_pct"`
 }
 
 // RouteRow is the per-route detail row returned by the
@@ -3506,6 +3564,154 @@ type AppSLOResponse struct {
 	WakeQueueP95MS float64 `json:"wake_queue_p95_ms"`
 	RequestsTotal  int64   `json:"requests_total"`
 	ThrottledTotal int64   `json:"throttled_total"`
+}
+
+// AppWakeTimelineResponse is the JSON mirror of the per-app
+// wake-timeline dashboard page (cmd/apid/handlers_dashboard.go:2548).
+// The dashboard HTML page keeps its pre-rendered HTML chips
+// (RenderTriggerHistogram, RenderWakeTimelineTable); this DTO is the
+// wire-friendly mirror a separate frontend agent can consume.
+//
+// The aggregation math (24h cutoff descending-break, two-denominator
+// rule for at-capacity %, em-dash policy) is shared with the HTML
+// handler via cmd/apid/handlers_wake_timeline.go::buildWakeTimeline
+// — see that helper for the load-bearing invariant.
+//
+// Plan gate: Hobby+ (PerAppMetricsAllowed). 402 on Free — same code
+// as /v1/apps/{slug}/metrics (plan_per_app_metrics_not_allowed). The
+// shared accessor means a downgrade between the two endpoints
+// flips both at once.
+//
+// Source conventions:
+//   - WakeCount24h: number of instances in the trailing 24h window
+//     (descending-cutoff break: the SQL is LIMIT 50, so any sane
+//     customer workload lands inside the 24h window — the dashboard
+//     never claims "true" 24h since it would need a separate SQL
+//     scan; mirrors the HTML page's documented 50-row cap).
+//   - WakeCountWithMeta: denominator for AtCapacityPct — the count
+//     of those rows where the events.wake.boot_started LEFT JOIN
+//     succeeded (pre-ADR-123 fleet rows contribute zero to this
+//     numerator but still appear in Rows so the per-row audit
+//     trail isn't lossy).
+//   - AtCapacityCount / AtCapacityPct: only meaningful when
+//     WakeCountWithMeta > 0; 0 otherwise (SafePercent math).
+//   - TriggerHistogram: empty map (NOT null) on a fresh app, or a
+//     trigger → N count of WakeBootMeta.Trigger values across the
+//     meta-bearing rows.
+//   - Rows: every instance in the 50-row slice whose StartedAt is
+//     within the 24h cutoff, in DESC order. Pre-ADR-123 fleet rows
+//     appear with the Trigger/QueuedCount/ReadyInMS fields absent
+//     (zero-valued); the dashboard renders em-dash on those — the
+//     JSON wire shape uses omitempty so the dashboard SPA can
+//     distinguish "absent" (jsonb key missing) from "explicit zero"
+//     (jsonb key present and 0).
+//
+// Wire freshness: AsOf is the handler's local time.Now().UTC() at
+// JSON marshal; SQL reads against the events + instances tables
+// happen just before, so consumers should treat AsOf as the
+// authoritative "as of" instant for the row set.
+type AppWakeTimelineResponse struct {
+	App               WakeTimelineApp       `json:"app"`
+	WakeCount24h      int                   `json:"wake_count_24h"`
+	WakeCountWithMeta int                   `json:"wake_count_with_meta"`
+	AtCapacityCount   int                   `json:"at_capacity_count"`
+	AtCapacityPct     float64               `json:"at_capacity_pct"`
+	TriggerHistogram  map[string]int        `json:"trigger_histogram"` // empty map, not nil
+	Rows              []WakeTimelineJSONRow `json:"rows"`
+	AsOf              string                `json:"as_of"` // RFC3339Nano UTC
+}
+
+// WakeTimelineApp is the slim per-app DTO embedded inside
+// AppWakeTimelineResponse.App. The dashboard's pkg/dashboard
+// AppListItem carries template-specific glyph/badge fields (SLO
+// badge, StateBadge*, QuotaLabel) — those don't belong on the wire.
+// The dashboard SPA only needs the bare identification (slug +
+// app_id) plus a couple of status fields for the heading.
+//
+// Field choices are deliberate:
+//   - AppID: needed for client-side cache keys + dashboard "open in
+//     gateway" links; same UUID the per-app dashboard header uses.
+//   - Slug: the human-readable ID the dashboard already keys by.
+//   - Status: optional dashboard-rendered badge (e.g. "active" /
+//     "paused"). "" when the apps row has no current deployment.
+//   - URL: optional public URL once a deployment is bound; "" until
+//     then. Matches the dashboard's apps-list cell.
+type WakeTimelineApp struct {
+	AppID  string `json:"app_id"`
+	Slug   string `json:"slug"`
+	Status string `json:"status,omitempty"`
+	URL    string `json:"url,omitempty"`
+}
+
+// AppUsageSummaryResponse is the wire shape for
+// GET /v1/apps/{slug}/usage — per-app billing summary over a
+// caller-supplied window (default: trailing 30d). Plan-gated
+// Hobby+ (AppUsageSummaryAllowed). Free falls through with
+// plan_app_usage_summary_not_allowed.
+//
+// Field-by-field:
+//   - PeriodStart / PeriodEnd: half-open [PeriodStart, PeriodEnd)
+//     window in UTC. Snapped to UTC midnight on the inclusive end
+//     (the handler clamps; this struct just records what was
+//     rolled up).
+//   - MBSeconds + GBHours: rollup of usage_minutes.mb_seconds for
+//     this app in the window. GBHours is the rounded float
+//     (6-decimal precision — mirrors MonthlyUsageGB's rounding).
+//   - Requests / TxBytes: cumulative HTTP activity (informational).
+//   - BuilderSeconds: cumulative builder-microVM CPU-time
+//     (informational — surfaced as a sidebar line on the dashboard).
+//   - ColdBootCount: WAKE_RESTORE→WAKE_COLD_BOOT transitions.
+//   - PlanIncludedGBHours: echoed from acct.Plan.PlanIncludedGBHours()
+//     so the dashboard can render the included-band badge without
+//     a second round-trip.
+//   - OverageGBHours: max(0, gb_hours - plan_included). 0 when
+//     gb_hours ≤ plan_included. The dashboard renders this as the
+//     red overage chip; the Stripe pusher bills it at €0.01/GB-h.
+//   - Source: "usage_minutes" today (after the 30d retention cap).
+//     "usage_daily" / "mixed" land with the trail-period reader
+//     follow-up — same wire shape, no migration needed.
+//   - AsOf: RFC3339Nano UTC stamping the envelope's authoritative
+//     "as of" instant.
+type AppUsageSummaryResponse struct {
+	Slug                string    `json:"slug"`
+	PeriodStart         time.Time `json:"period_start"`
+	PeriodEnd           time.Time `json:"period_end"`
+	MBSeconds           int64     `json:"mb_seconds"`
+	GBHours             float64   `json:"gb_hours"`
+	Requests            int64     `json:"requests"`
+	TxBytes             int64     `json:"tx_bytes"`
+	BuilderSeconds      float64   `json:"builder_seconds"`
+	ColdBootCount       int64     `json:"cold_boot_count"`
+	PlanIncludedGBHours float64   `json:"plan_included_gb_hours"`
+	OverageGBHours      float64   `json:"overage_gb_hours"`
+	Source              string    `json:"source"`
+	AsOf                string    `json:"as_of"`
+}
+
+// WakeTimelineJSONRow is one row of AppWakeTimelineResponse.Rows.
+// Mirrors pkg/dashboard/views.WakeTimelineRow's fields so the JSON
+// mirror can render the same dashboard page 1:1 — the only
+// difference is the omitempty discipline on the nullable fields
+// (jsonb-absent vs jsonb-present-and-zero) and the explicit
+// AtCapacityPresent bit, which the HTML renderer emits as em-dash
+// when false.
+//
+// ReadyInMS = -1 sentinel encodes "still booting or rejected, no
+// boot_completed row to compute from" — the JSON wire shape picks
+// -1 over the HTML page's em-dash convention because Go's json
+// package can't render "—" inline. The dashboard SPA renders "—"
+// on -1, mirroring the HTML page cell-empty branch
+// (pkg/dashboard/views/wake_timeline.go:158).
+type WakeTimelineJSONRow struct {
+	Kind               string `json:"kind"`
+	State              string `json:"state"`
+	At                 string `json:"at"` // RFC3339
+	Trigger            string `json:"trigger,omitempty"`
+	QueuedCount        int32  `json:"queued_count,omitempty"`
+	ConcurrencyAtAdmit int32  `json:"concurrency_at_admit,omitempty"`
+	AtCapacity         bool   `json:"at_capacity"`
+	AtCapacityPresent  bool   `json:"at_capacity_present"`
+	ReadyInMS          int32  `json:"ready_in_ms,omitempty"` // -1 = em-dash on absent
 }
 
 // AccountSLOResponse is the flat account-wide SLO rollup returned by

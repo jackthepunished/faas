@@ -49,6 +49,8 @@ export type { AppSLOResponse } from './models/AppSLOResponse.js';
 export type { AppsMetricsResponse } from './models/AppsMetricsResponse.js';
 export type { AppStreamingStatus } from './models/AppStreamingStatus.js';
 export type { AppTrustedSignerListResponse } from './models/AppTrustedSignerListResponse.js';
+export type { AppUsageSummaryResponse } from './models/AppUsageSummaryResponse.js';
+export type { AppWakeTimelineResponse } from './models/AppWakeTimelineResponse.js';
 export type { AppWebhookDeliveryListResponse } from './models/AppWebhookDeliveryListResponse.js';
 export type { AppWebhookDeliveryResponse } from './models/AppWebhookDeliveryResponse.js';
 export type { AppWebhookResponse } from './models/AppWebhookResponse.js';
@@ -299,7 +301,9 @@ export type { UsageExportResponse } from './models/UsageExportResponse.js';
 export type { UsageResponse } from './models/UsageResponse.js';
 export type { UsageSummaryResponse } from './models/UsageSummaryResponse.js';
 export type { Vulnerability } from './models/Vulnerability.js';
+export type { WakeTimelineApp } from './models/WakeTimelineApp.js';
 export type { WakeTimelineEvent } from './models/WakeTimelineEvent.js';
+export type { WakeTimelineJSONRow } from './models/WakeTimelineJSONRow.js';
 export type { WakeTimelineResponse } from './models/WakeTimelineResponse.js';
 
 export { AccountService } from './services/AccountService.js';

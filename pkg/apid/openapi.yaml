@@ -1524,8 +1524,215 @@ paths:
                 error_rate_pct: 0.7
                 cold_start_pct: 8.5
                 wake_p95_ms: 380.2
+                wakes_24h: 47
+                cache_hit_rate_pct: 0.0
+                error_budget_pct: 0.0
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app metrics surface. Free
+            plan — Hobby or above required. The gate runs BEFORE
+            `loadApp` so a Free customer probing a slug never gets a
+            404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_per_app_metrics_not_allowed"
+                title: "Per-app metrics unavailable on this plan"
+                status: 402
+                code: "plan_per_app_metrics_not_allowed"
+                detail: "the free plan does not include per-app metrics; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#per-app-metrics"
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/wake-timeline:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppWakeTimeline
+      summary: Per-app wake timeline (JSON mirror of the dashboard page).
+      description: |
+        Wire-friendly mirror of the dashboard's per-app wake-timeline
+        HTML page (`/dashboard/apps/{slug}/wake-timeline`,
+        cmd/apid/handlers_dashboard.go:2548 renderAppWakeTimeline).
+        The HTML page keeps its pre-rendered HTML chips; this endpoint
+        emits the same data as JSON so a separate frontend agent can
+        render without re-parsing HTML.
+
+        Returns the 50 most-recent instance rows for the app, joined
+        against the events table's `wake.boot_started` rows for the
+        per-row telemetry (Trigger, QueuedCount, ConcurrencyAtAdmit,
+        AtCapacity, ReadyInMS). The aggregation math is shared with
+        the HTML page:
+
+          - 24h cutoff descending-break: the moment a row's
+            `started_at` falls before the trailing-24h instant, the
+            loop breaks (no further iteration). Pre-ADR-123 fleet
+            rows with no `started_at` are not eligible for the break
+            (always in scope).
+          - Two-denominator rule for `at_capacity_pct`: numerator is
+            the count of rows where the events join succeeded AND
+            the at_capacity flag is true; denominator is the count
+            of rows where the events join succeeded
+            (`wake_count_with_meta`). Pre-PR-A fleet rows contribute
+            to `wake_count_24h` but not the denominator — same
+            posture as the HTML page.
+
+        Plan-gated Hobby+ (mirror of /v1/apps/{slug}/metrics —
+        same `code` so a downgrade between the two endpoints flips
+        both at once).
+      responses:
+        '200':
+          description: The wake-timeline snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppWakeTimelineResponse'
+              example:
+                app:
+                  app_id: "0123456789abcdef0123456789abcdef"
+                  slug: "my-api"
+                wake_count_24h: 24
+                wake_count_with_meta: 20
+                at_capacity_count: 3
+                at_capacity_pct: 15.0
+                trigger_histogram:
+                  "manual.cron": 8
+                  "manual.api": 7
+                  "scheduled.idle": 5
+                rows:
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T13:00:00Z"
+                    trigger: "manual.api"
+                    queued_count: 0
+                    concurrency_at_admit: 2
+                    at_capacity: false
+                    at_capacity_present: true
+                    ready_in_ms: 342
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T12:58:11Z"
+                    at_capacity: false
+                    at_capacity_present: false
+                    ready_in_ms: -1
+                as_of: "2026-07-28T13:00:00.123456Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app wake-timeline. Free plan —
+            Hobby or above required. Same code as /v1/apps/{slug}/metrics
+            (plan_per_app_metrics_not_allowed) so a single downgrade
+            flips both endpoints at once.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_per_app_metrics_not_allowed"
+                title: "Per-app metrics unavailable on this plan"
+                status: 402
+                code: "plan_per_app_metrics_not_allowed"
+                detail: "the free plan does not include per-app metrics; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#per-app-metrics"
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/usage:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppUsage
+      summary: Per-app billing usage summary (trailing 30d by default).
+      description: |
+        Customer-facing billing rollup for one app over a caller-
+        supplied window (default: trailing 30d, clamped at 90d upper
+        bound). Plan-gated Hobby+ — Free gets 402
+        `plan_app_usage_summary_not_allowed`.
+
+        Window resolution: `since` and `until` are RFC3339 timestamps.
+        Both default to UTC midnight snaps; `until` defaults to
+        `now()` snapped down, `since` defaults to `until - 30d`. The
+        handler clamps `since` to `until - 90d` so a customer cannot
+        unbounded-scan `usage_minutes` (ADR-048 retention is 30d; the
+        90d ceiling is a forward-compatibility ceiling for when
+        `usage_daily` lands).
+
+        Overage computation: `overage_gb_hours = max(0, gb_hours -
+        plan_included_gb_hours)`. The included band is echoed from
+        `acct.Plan.PlanIncludedGBHours()`; the overage figure is the
+        integer-rounded float the Stripe pusher bills at €0.01/GB-h.
+
+        Source: `usage_minutes` today (after the 30d retention cap).
+        `usage_daily` / `mixed` land with the trail-period reader
+        follow-up — same wire shape, no migration needed.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "RFC3339 lower bound. Default: `until - 30d`."
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "RFC3339 upper bound. Default: `now()` snapped to UTC midnight."
+      responses:
+        '200':
+          description: The usage summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppUsageSummaryResponse'
+              example:
+                slug: "my-api"
+                period_start: "2026-07-28T00:00:00Z"
+                period_end: "2026-08-27T00:00:00Z"
+                mb_seconds: 4194304000
+                gb_hours: 1.135417
+                requests: 8421
+                tx_bytes: 94371840
+                builder_seconds: 192.5
+                cold_boot_count: 14
+                plan_included_gb_hours: 50.0
+                overage_gb_hours: 0.0
+                source: "usage_minutes"
+                as_of: "2026-08-27T13:00:00.123456Z"
+        '400':
+          description: |
+            Invalid window — `since`/`until` not RFC3339, or `since`
+            later than `until`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app usage summary. Free
+            plan — Hobby or above required. Same posture as the
+            other per-app observability surfaces; the gate runs
+            BEFORE `loadApp` so a Free customer probing a slug
+            never gets a 404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_app_usage_summary_not_allowed"
+                title: "Per-app usage summary unavailable on this plan"
+                status: 402
+                code: "plan_app_usage_summary_not_allowed"
+                detail: "the free plan does not include the per-app usage summary; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#usage-summary"
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -1744,6 +1951,23 @@ paths:
                 $ref: '#/components/schemas/AppErrorsSummaryResponse'
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app error surfacing. Free
+            plan — Hobby or above required. The gate runs BEFORE
+            `loadApp` so a Free customer probing a slug never gets
+            a 404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_app_errors_not_allowed"
+                title: "Per-app errors unavailable on this plan"
+                status: 402
+                code: "plan_app_errors_not_allowed"
+                detail: "the free plan does not include per-app errors; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#app-errors"
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -13982,6 +14206,63 @@ components:
             $ref: '#/components/schemas/RouteRow'
           x-since: "2026-08"
           x-issue: "273"
+        wakes_24h:
+          type: integer
+          format: int64
+          description: |
+            Count of `wake.boot_started` events the schedd recorded for
+            this app in the trailing 24 hours. Sourced from the
+            `events` table via the events_wake_id_idx jsonb expression
+            index (migration 00114) — sub-second on a healthy app.
+            Best-effort: 0 on a degraded store call, an empty app, or
+            when the events table predates the post-ADR-123 schema
+            (pre-PR-A boot_started rows carry no app_id field, so the
+            cast returns NULL which COUNT(*) coerces to 0 — same
+            posture as the wake-timeline view's `WakeCountWithMeta`
+            denominator at cmd/apid/handlers_dashboard.go:2659). The
+            dashboard surfaces this as the "wakes today" line item;
+            combined with `cold_start_pct` it answers "is my app
+            wake-bound or sleep-bound". Field absent on Free
+            (the per-app dashboard is Hobby+ only — see
+            pkg/api/limits.go::PerAppMetricsAllowed).
+          x-since: "2026-08"
+          x-issue: "TBD"
+        cache_hit_rate_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: |
+            Share of cache-eligible requests served from
+            `gateway_response_cache` (ADR-122) over the window.
+            ALWAYS present on the wire (the SDK can rely on the
+            documented schema) — 0 means either "feature off" (no
+            cache rule attached) or "feature on, zero traffic". The
+            dashboard distinguishes the two via the existence of the
+            `routes` block, not via field absence. The field stays 0
+            until the response-cache consumer-facing metric lands
+            (the current per-app dashboard surfaces the
+            `gateway_response_cache_total{outcome=hit/miss}` rollup
+            through the operator-side §12 panel, not this field).
+          x-since: "2026-08"
+          x-issue: "TBD"
+        error_budget_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: |
+            Trailing-30d API-availability error budget remaining (0 =
+            exhausted, 100 = full). ALWAYS present on the wire so the
+            SDK can rely on the documented schema — 0 renders as "—"
+            on the dashboard rather than a misleading "budget
+            exhausted" message. Computed against the plan's
+            API-availability SLO target (99.5% per spec §12). The
+            field stays 0 until the per-plan SLO target lands on the
+            `Limits` struct (issue TBD); once wired, the field is
+            computed against `apid_request_total{account_id, code}`
+            over the trailing 30d, scaled by the per-plan SLO
+            target.
+          x-since: "2026-08"
+          x-issue: "TBD"
 
     RouteRow:
       description: |
@@ -14763,6 +15044,186 @@ components:
         p99_ms: { type: number, description: "p99 latency in milliseconds." }
       x-since: "2026-08"
       x-issue: "696"
+
+    WakeTimelineApp:
+      description: |
+        Slim per-app identification embedded in `AppWakeTimelineResponse`.
+        Carries only the fields the dashboard SPA needs for the
+        wake-timeline header (slug + app_id). The wider
+        pkg/dashboard.AppListItem type carries template-specific
+        glyph/badge fields (SLO badge, StateBadge*, QuotaLabel) that
+        don't belong on the wire.
+      type: object
+      required: [app_id, slug]
+      properties:
+        app_id: { type: string, format: uuid }
+        slug:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+          description: "DNS-safe app slug (matches apps.slug)."
+        status: { type: string, description: "Optional deployment status (active/paused). Empty until a deployment is bound." }
+        url:    { type: string, description: "Optional public URL once a deployment is bound." }
+
+    WakeTimelineJSONRow:
+      description: |
+        One row of `AppWakeTimelineResponse.rows`. Mirrors
+        pkg/dashboard/views.WakeTimelineRow's fields so the JSON
+        mirror can render the same dashboard page 1:1. The
+        nullable fields (Trigger / QueuedCount / ConcurrencyAtAdmit
+        / ReadyInMS) use omitempty so the dashboard SPA can
+        distinguish "absent" (jsonb key missing — pre-PR-A fleet
+        row) from "explicit zero" (jsonb key present and 0).
+        `ready_in_ms = -1` is the em-dash sentinel for "no
+        boot_completed row yet" (still booting or rejected) — the
+        dashboard SPA renders "—" on -1, mirroring the HTML page
+        cell-empty branch.
+      type: object
+      required: [kind, state, at_capacity, at_capacity_present]
+      properties:
+        kind:
+          type: string
+          enum: [wake.boot_started]
+          description: "Event kind. Today always wake.boot_started; the field is open for future wake.boot_completed/_failed rows."
+        state:
+          type: string
+          description: "Mirror of the instance.state column on the per-app-detail recent-wakes table."
+        at:
+          type: string
+          format: date-time
+          description: "RFC3339 UTC timestamp of the wake."
+        trigger:
+          type: string
+          description: "Closed-enum trigger that admitted the wake (manual.cron / manual.api / scheduled.idle / …). Empty/absent on pre-PR-A fleet rows."
+        queued_count:
+          type: integer
+          format: int32
+          description: "ledger.Concurrency at admit. 0 when absent."
+        concurrency_at_admit:
+          type: integer
+          format: int32
+          description: "Same reading; 0 is the cold-start case."
+        at_capacity:
+          type: boolean
+          description: "True when admitted at the plan's per-app MaxConcurrency ceiling. Only meaningful when at_capacity_present is true."
+        at_capacity_present:
+          type: boolean
+          description: "True when the at_capacity key was in jsonb; false = absent (pre-PR-A fleet). The dashboard renders em-dash when false."
+        ready_in_ms:
+          type: integer
+          format: int32
+          description: "Wall-clock boot_started → boot_completed delta in ms. -1 when still booting or rejected. 0 is impossible (a 0ms wake would round to a positive integer)."
+
+    AppWakeTimelineResponse:
+      description: |
+        JSON mirror of the dashboard per-app wake-timeline page.
+        Plan-gated Hobby+ (same code as /v1/apps/{slug}/metrics:
+        plan_per_app_metrics_not_allowed).
+
+        `trigger_histogram` is a JSON object (map[string]int) — empty
+        `{}` on a fresh app, never null. The dashboard SPA must
+        treat missing keys as 0 (JSON.parse() returns undefined for
+        missing keys, not 0 — the render code adds the explicit
+        `?? 0` fallback).
+
+        `at_capacity_pct` is the share of `wake_count_with_meta`
+        rows where the events.wake.boot_started join succeeded AND
+        the at_capacity flag is true. Pre-PR-A fleet rows
+        contribute to `wake_count_24h` but not the denominator.
+      type: object
+      required: [app, wake_count_24h, wake_count_with_meta, at_capacity_count, at_capacity_pct, trigger_histogram, rows, as_of]
+      properties:
+        app: { $ref: '#/components/schemas/WakeTimelineApp' }
+        wake_count_24h:
+          type: integer
+          description: "Number of instance rows in the trailing 24h window (after the descending-cutoff break)."
+        wake_count_with_meta:
+          type: integer
+          description: "Denominator for at_capacity_pct — count of rows where the events.wake.boot_started LEFT JOIN succeeded."
+        at_capacity_count:
+          type: integer
+          description: "Numerator for at_capacity_pct."
+        at_capacity_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of meta-bearing rows admitted at the per-app MaxConcurrency ceiling."
+        trigger_histogram:
+          type: object
+          additionalProperties: { type: integer }
+          description: "trigger → N count of WakeBootMeta.Trigger values across the meta-bearing rows. Empty {} on a fresh app, never null."
+        rows:
+          type: array
+          description: "Wake rows in DESC StartedAt order, truncated at the 24h cutoff (descending-cutoff break)."
+          items: { $ref: '#/components/schemas/WakeTimelineJSONRow' }
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC timestamp marking the JSON envelope's authoritative 'as of' instant."
+
+    AppUsageSummaryResponse:
+      description: |
+        Wire shape for `GET /v1/apps/{slug}/usage?since=&until=`
+        (commit 4 of the per-app observability PR series).
+        Plan-gated Hobby+; Free falls through with
+        `plan_app_usage_summary_not_allowed`.
+
+        `gb_hours` is the rounded float of `mb_seconds / 1024 /
+        3600` (mirror of `meter.MonthlyUsageGB`'s 6-decimal
+        rounding). `overage_gb_hours = max(0, gb_hours -
+        plan_included_gb_hours)` — 0 when the customer is under
+        their included band, the billable overage above the band
+        otherwise. The Stripe pusher bills overage at €0.01/GB-h
+        (CLAUDE.md integer-cents-only rule).
+      type: object
+      required: [slug, period_start, period_end, mb_seconds, gb_hours, requests, tx_bytes, builder_seconds, cold_boot_count, plan_included_gb_hours, overage_gb_hours, source, as_of]
+      properties:
+        slug:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+        period_start:
+          type: string
+          format: date-time
+          description: "Half-open [period_start, period_end) window's inclusive lower bound. UTC."
+        period_end:
+          type: string
+          format: date-time
+          description: "Half-open window's exclusive upper bound. UTC midnight snap (handler defaults)."
+        mb_seconds:
+          type: integer
+          format: int64
+          description: "Sum of usage_minutes.mb_seconds for this app in the window (ADR-048 billable unit)."
+        gb_hours:
+          type: number
+          description: "mb_seconds / 1024 / 3600, rounded to 6 decimal places (mirror of meter.MonthlyUsageGB)."
+        requests:
+          type: integer
+          format: int64
+          description: "Cumulative HTTP request count (informational; not billed)."
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative HTTP response body bytes (ADR-046; informational; not billed)."
+        builder_seconds:
+          type: number
+          description: "Cumulative builder-microVM CPU-seconds (informational; surfaced as a sidebar line on the dashboard)."
+        cold_boot_count:
+          type: integer
+          format: int64
+          description: "WAKE_RESTORE→WAKE_COLD_BOOT transitions in the window."
+        plan_included_gb_hours:
+          type: number
+          description: "Echoed from acct.Plan.PlanIncludedGBHours() — plan's per-month included band so the dashboard renders the included-band badge without a second round-trip."
+        overage_gb_hours:
+          type: number
+          description: "max(0, gb_hours - plan_included_gb_hours). 0 when the customer is under their included band; the billable overage above the band otherwise."
+        source:
+          type: string
+          enum: [usage_minutes, usage_daily, mixed]
+          description: "Which rollup reader produced this summary. usage_minutes today (30d retention); usage_daily lands with the trail-period follow-up."
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC stamping the envelope's authoritative 'as of' instant."
 
     AppSLOResponse:
       description: |

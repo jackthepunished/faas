@@ -1216,6 +1216,43 @@ type Limits struct {
 	// the slowest N are kept and the rest truncated. Hobby=50,
 	// Pro=200, Scale=1000.
 	DebugTelemetrySpansPerTrace int
+
+	// PerAppMetricsAllowed (issue #TBD / ADR-TBD) gates whether
+	// the customer-facing per-app observability surface is on for
+	// an account. The surface covers
+	// GET /v1/apps/{slug}/metrics (latency / error rate / cold-boot
+	// ratio / wake count) and the JSON mirror of the wake-timeline
+	// page (GET /v1/apps/{slug}/wake-timeline). Free=false (the
+	// abuse-floor tier carries no per-app dashboard; the upsell is
+	// the "see what you're paying for" expectation). Hobby/Pro/
+	// Scale=true. Surfaced at cmd/apid/handlers_metrics.go and the
+	// new cmd/apid/handlers_wake_timeline.go via
+	// api.ErrPlanPerAppMetricsNotAllowed.
+	PerAppMetricsAllowed bool
+
+	// AppUsageSummaryAllowed (issue #TBD / ADR-TBD) gates whether
+	// the customer-facing per-app billing-usage read is on. The
+	// surface covers GET /v1/apps/{slug}/usage — the current-cycle
+	// GB-hours + request rollup + plan-included vs overage split.
+	// Free=false (the tier carries no usage dashboard; the upsell
+	// is the §4.7 billing-transparency expectation). Hobby/Pro/
+	// Scale=true. Surfaced at cmd/apid/handlers_usage.go via
+	// api.ErrPlanAppUsageSummaryNotAllowed.
+	AppUsageSummaryAllowed bool
+
+	// AppErrorsAllowed (issue #TBD / ADR-TBD) gates whether the
+	// per-app error-fingerprint read is on for an account. The
+	// surface covers GET /v1/apps/{slug}/errors/summary (top
+	// fingerprints + drill-down). Free=false (the tier carries no
+	// grouped-error view; the upsell is the "see what failed"
+	// expectation). Hobby/Pro/Scale=true. The retention ceiling is
+	// AppErrorsRetentionDays (Free=1, Hobby=7, Pro=30, Scale=90),
+	// so a downgraded customer sees the smaller of the two windows
+	// automatically — the handler clamps the `since` window to
+	// now().Add(-AppErrorsRetentionDays). Surfaced at
+	// cmd/apid/handlers_app_errors.go via
+	// api.ErrPlanAppErrorsNotAllowed.
+	AppErrorsAllowed bool
 }
 
 // UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
@@ -1568,6 +1605,13 @@ var planLimits = map[Plan]Limits{
 		DebugTelemetryRequestsPerMinute: 0,
 		DebugTelemetryDeploymentsPerApp: 0,
 		DebugTelemetrySpansPerTrace:     0,
+		// Per-app observability surface (Free = off). 0/0/0 is the
+		// fail-closed defence-in-depth value the store still reads;
+		// the handler-level ErrPlan*NotAllowed 402 is the primary
+		// gate.
+		PerAppMetricsAllowed:   false,
+		AppUsageSummaryAllowed: false,
+		AppErrorsAllowed:       false,
 	},
 	PlanHobby: {
 		Plan:                  PlanHobby,
@@ -1901,6 +1945,13 @@ var planLimits = map[Plan]Limits{
 		DebugTelemetryRequestsPerMinute: 1000,
 		DebugTelemetryDeploymentsPerApp: 10,
 		DebugTelemetrySpansPerTrace:     50,
+		// Per-app observability surface (Hobby = on). The Hobby
+		// tier is the lowest paid plan; the upsell is "see what
+		// you're paying for" rather than a debug-telemetry
+		// capability.
+		PerAppMetricsAllowed:   true,
+		AppUsageSummaryAllowed: true,
+		AppErrorsAllowed:       true,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,
@@ -2204,6 +2255,12 @@ var planLimits = map[Plan]Limits{
 		DebugTelemetryRequestsPerMinute: 10000,
 		DebugTelemetryDeploymentsPerApp: 50,
 		DebugTelemetrySpansPerTrace:     200,
+		// Per-app observability surface (Pro = on). Same posture
+		// as Hobby; Pro gets larger retention ceilings via the
+		// existing AppErrorsRetentionDays / usage_daily fields.
+		PerAppMetricsAllowed:   true,
+		AppUsageSummaryAllowed: true,
+		AppErrorsAllowed:       true,
 	},
 	PlanScale: {
 		Plan:                  PlanScale,
@@ -2537,6 +2594,11 @@ var planLimits = map[Plan]Limits{
 		DebugTelemetryRequestsPerMinute: 50000,
 		DebugTelemetryDeploymentsPerApp: 200,
 		DebugTelemetrySpansPerTrace:     1000,
+		// Per-app observability surface (Scale = on). Largest
+		// retention ceiling via AppErrorsRetentionDays (90d).
+		PerAppMetricsAllowed:   true,
+		AppUsageSummaryAllowed: true,
+		AppErrorsAllowed:       true,
 	},
 }
 
@@ -3980,6 +4042,53 @@ func (p Plan) DebugTelemetrySpansPerTrace() int {
 		return 0
 	}
 	return l.DebugTelemetrySpansPerTrace
+}
+
+// PerAppMetricsAllowed returns whether the customer-facing per-app
+// observability surface is on for the account. The surface covers
+// GET /v1/apps/{slug}/metrics (latency / error rate / cold-boot
+// ratio / wake count) and the JSON mirror of the wake-timeline page
+// (GET /v1/apps/{slug}/wake-timeline). Used by the apid handlers
+// in cmd/apid/handlers_metrics.go and the new
+// cmd/apid/handlers_wake_timeline.go to fail-closed before
+// loadApp is touched (api.ErrPlanPerAppMetricsNotAllowed). Returns
+// false on unknown plans (Free-tier floor — the surface is a
+// paid-only capability, same posture as the per-plan *Allowed
+// fields above).
+func (p Plan) PerAppMetricsAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.PerAppMetricsAllowed
+}
+
+// AppUsageSummaryAllowed returns whether the customer-facing per-app
+// billing-usage read is on. Used by the apid handler in
+// cmd/apid/handlers_usage.go to fail-closed before loadApp is
+// touched (api.ErrPlanAppUsageSummaryNotAllowed). Returns false on
+// unknown plans (Free-tier floor — billing transparency is a
+// paid-only capability).
+func (p Plan) AppUsageSummaryAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.AppUsageSummaryAllowed
+}
+
+// AppErrorsAllowed returns whether the per-app error-fingerprint
+// read is on for the account. Used by the apid handler in
+// cmd/apid/handlers_app_errors.go to fail-closed before loadApp is
+// touched (api.ErrPlanAppErrorsNotAllowed). Returns false on
+// unknown plans (Free-tier floor — error grouping is a paid-only
+// capability).
+func (p Plan) AppErrorsAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.AppErrorsAllowed
 }
 
 // LivenessPeriodSeconds returns the per-plan default poll cadence

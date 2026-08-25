@@ -77,6 +77,15 @@ const appErrorsSummaryDefaultWindow = 24 * time.Hour
 // 404 is byte-identical to the "no such app" 404 so existence
 // is not leaking through the auth gate.
 func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acct state.Account) { //nolint:contextcheck
+	// Plan gate: per-app error surfacing is Hobby+; Free gets 402 +
+	// upsell. The gate runs BEFORE loadApp so a Free customer
+	// probing a Hobby+ slug never gets a 404 (slug-leak guard —
+	// same posture as handlers_metrics.go:53-57 and the rest of
+	// the per-app observability PR series).
+	if !acct.Plan.AppErrorsAllowed() {
+		api.WriteProblem(w, api.ErrPlanAppErrorsNotAllowed(acct.Plan))
+		return
+	}
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
 		return
@@ -86,6 +95,22 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "validation_failed", "invalid window", err.Error()))
 		return
+	}
+	// Per-plan retention clamp (ADR-096). Hobby=7d, Pro=30d,
+	// Scale=90d. A customer cannot query past their plan's
+	// retention window — without the clamp, a Free customer
+	// who upgrades to Hobby could see 90 days of pre-Hobby
+	// history that the retention cron has NOT purged yet
+	// (the cron is account-scoped on the new plan only, and a
+	// freshly-upgraded Free account has no Hobby-side purge
+	// entry until 7d rolls over). The clamp sets WindowClamped
+	// so the dashboard can render the "you widened past the
+	// retention cap" tile; the existing WindowClamped bool
+	// already lives on the wire shape.
+	retentionCap := time.Duration(acct.Plan.AppErrorsRetentionDays()) * 24 * time.Hour
+	if until.Sub(since) > retentionCap {
+		windowClamped = true
+		since = until.Add(-retentionCap)
 	}
 	limit, err := parseAppErrorsLimit(q.Get("limit"))
 	if err != nil {

@@ -906,6 +906,22 @@ func (s *server) handler() http.Handler {
 	// cross-account slug is a 404, not a 200 with another tenant's
 	// data.
 	mux.HandleFunc("GET /v1/apps/{slug}/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppMetrics)))
+	// Per-app dashboard JSON mirror — wire-friendly emission of the
+	// same shape the dashboard HTML page renders (cmd/apid/
+	// handlers_dashboard.go:2548 renderAppWakeTimeline). Auth chain
+	// matches /v1/apps/{slug}/metrics (read-only, no MFA, primary
+	// caller is an API key with ScopesReadSurface). Plan-gated
+	// Hobby+ via handlers_app_wake_timeline_json.go::getAppWakeTimeline.
+	// Distinct from the per-wake-id endpoint at /v1/apps/{slug}/wakes/
+	// {wake_id}/timeline below — that's issue #517 / PR-C, this is
+	// the per-app rollup mirror.
+	mux.HandleFunc("GET /v1/apps/{slug}/wake-timeline", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppWakeTimeline)))
+	// Per-app billing usage summary (commit 4 of the per-app
+	// observability PR series). Same auth chain as the other
+	// Hobby+-gated surfaces (read-only, no MFA, IDOR-safe via
+	// loadApp). Plan-gated Hobby+ via AppUsageSummaryAllowed —
+	// same 402 contract as /metrics and /wake-timeline.
+	mux.HandleFunc("GET /v1/apps/{slug}/usage", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppUsage)))
 	// ADR-093: per-route observability reader. Same auth chain
 	// as /v1/apps/{slug}/metrics (read-only, no MFA, primary
 	// caller is an API key with ScopesReadSurface). The handler
