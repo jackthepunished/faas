@@ -1,4 +1,4 @@
--- filename: 00438_operator_intents.sql
+-- filename: 00440_operator_intents.sql
 -- +goose Up
 -- ADR-127 / PR #1099 P2 redesign: durable intent queue for
 -- `POST /v1/admin/instances/{id}/force-park` and
@@ -69,8 +69,14 @@
 -- OR a deployment uuid depending on the kind; the kind column
 -- disambiguates.
 --
--- Slot fence: 00438 was claimed for this PR (the 00430-00439
--- range is fenced per the cross-PR slot gate).
+-- Slot fence: 00440 was claimed for this PR (the 00430-00440
+-- range is fenced per the cross-PR slot gate). 00431-00439
+-- are reservation placeholders that shadow slots currently
+-- held by PR #1036 (reals at 431-434), PR #1085 (reals at
+-- 435-437), and PR #1024 (reals at 437-439). Leapfrog past
+-- the highest sibling claim (00439) with a 1-slot margin —
+-- same precedent as PR #1064 / 6898e4666 ("leapfrog E.2 past
+-- PR #1036 + PR #1024 → 00440/00441").
 
 CREATE TABLE IF NOT EXISTS operator_intents (
     id              uuid PRIMARY KEY,

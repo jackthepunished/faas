@@ -2598,7 +2598,7 @@ type Store interface {
 	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
 	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
 
-	// Operator intent queue (PR #1099 P2 redesign / migrations/00438).
+	// Operator intent queue (PR #1099 P2 redesign / migrations/00440).
 	// apid inserts on the two admin recovery endpoints
 	// (POST /v1/admin/instances/{id}/force-park and
 	// POST /v1/admin/apps/{slug}/force-cold-boot), emits

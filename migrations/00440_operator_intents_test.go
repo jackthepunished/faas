@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00438_operator_intents.sql
+// Migration-apply test for 00440_operator_intents.sql
 // (ADR-127 / PR #1099 P2 redesign step 1).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00438 (no goose
+//  1. Migration set applies cleanly through 00440 (no goose
 //     duplicate-version panic against 00430 + siblings).
 //  2. operator_intents table exists with the closed-vocabulary
 //     CHECK on kind ('force_park' | 'force_cold_boot') and on
@@ -34,7 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00438_OperatorIntents(t *testing.T) {
+func TestMigrations_00440_OperatorIntents(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

@@ -4,7 +4,7 @@
 // Producer: apid's POST /v1/admin/instances/{id}/force-park
 // and POST /v1/admin/apps/{slug}/force-cold-boot handlers
 // insert a row into operator_intents
-// (migrations/00438, status='pending') and emit
+// (migrations/00440, status='pending') and emit
 // db.NotifyOperatorIntent on the wire.
 //
 // Consumer: loop.go's Run() multiplexes db.NotifyOperatorIntent

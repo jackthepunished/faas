@@ -12,7 +12,7 @@ import (
 )
 
 // pgstore_operator_intent.go — CRUD for the operator_intents
-// table (migrations/00438, PR #1099 P2 redesign).
+// table (migrations/00440, PR #1099 P2 redesign).
 //
 // Two producers, one consumer:
 //
