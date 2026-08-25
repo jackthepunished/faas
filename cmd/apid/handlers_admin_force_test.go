@@ -1,7 +1,7 @@
 // handlers_admin_force_test.go — pins the contract of the P2
 // (force-park + force-cold-boot) admin recovery handlers added
 // in Commit P2.3 of the operator-side observability mega-PR
-// (PR #1099).
+// (PR #1099) AND the P2d (force-restart) follow-on in PR #1105.
 //
 // The redesign (post-depguard R6 fix) routes P2 through an
 // operator_intents table + pg_notify seam — apid is no longer
@@ -633,4 +633,239 @@ func (f *failingNotifier) Subscribe(_ context.Context, _ []string) (<-chan db.No
 }
 func (f *failingNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) bool, _ time.Duration) (string, error) {
 	return "", db.ErrWaitTimeout
+}
+
+// TestPostForceRestart_TableDriven pins the seven edges of the
+// force-restart handler (P2d follow-on to PR #1099). The
+// state-gate set is identical to force-park ({RUNNING, WAKING,
+// COLD_BOOTING}) — only the audit kind and 409 error code
+// differ ("operator.action.restart_instance" + "restart_instance
+// .outcome" vs "operator.action.park_instance" + "park_instance
+// .outcome"; "instance_not_restartable" vs "instance_not_parkable").
+//
+//  1. confirm-required tripwire — without ?confirm=true the
+//     handler returns 400 validation_failed (no intent insert,
+//     no notify, no audit row).
+//  2. reason shape — non-[a-z0-9_] chars or >64 chars returns
+//     400 (no intent insert).
+//  3. instance uuid — malformed UUID returns 404 with no insert.
+//  4. state gate — instance state ∉ {RUNNING, WAKING,
+//     COLD_BOOTING} returns 409 instance_not_restartable
+//     WITHOUT writing an intent row. Audit row stamped with
+//     result="rejected" so the operator's "I checked" is durable.
+//  5. store error — InsertOperatorIntent returns error → 500.
+//  6. happy path — handler inserts an intent row, fires notify,
+//     returns 202 Accepted with intent_id + status_url.
+//  7. notify failure is logged but does NOT 5xx — the intent
+//     row is the source of truth; the 30s safety tick reclaims
+//     any notify-dropped row (same precedent as cron_run_now).
+func TestPostForceRestart_TableDriven(t *testing.T) {
+	t.Run("missing_confirm_returns_400", func(t *testing.T) {
+		fake := &fakeStoreForIntent{}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "RUNNING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted; got %d calls", len(fake.insertCalls))
+		}
+		if n := notifyCountByChannel(srv); n != 0 {
+			t.Errorf("notify should not have been emitted; got %d calls", n)
+		}
+	})
+
+	t.Run("invalid_reason_returns_400", func(t *testing.T) {
+		fake := &fakeStoreForIntent{}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "RUNNING")
+
+		// Space + punctuation are not in [a-z0-9_]; handler must 400.
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true&reason=has%20space", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on bad reason; got %d calls", len(fake.insertCalls))
+		}
+	})
+
+	t.Run("invalid_uuid_returns_404", func(t *testing.T) {
+		fake := &fakeStoreForIntent{}
+		srv, _, key := newForceHarness(t, fake)
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/not-a-uuid/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on bad uuid; got %d calls", len(fake.insertCalls))
+		}
+	})
+
+	t.Run("nil_instance_returns_404", func(t *testing.T) {
+		// The MemStore has no instance at this uuid — gate-time
+		// read fails, handler returns 404 with no intent insert.
+		fake := &fakeStoreForIntent{}
+		srv, _, key := newForceHarness(t, fake)
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/00000000-0000-0000-0000-000000000000/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on missing instance; got %d calls", len(fake.insertCalls))
+		}
+	})
+
+	t.Run("parked_state_returns_409_no_intent", func(t *testing.T) {
+		fake := &fakeStoreForIntent{}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "PARKED")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true&reason=already_parked", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		var prob api.Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+			t.Fatalf("decode problem: %v body=%s", err, rec.Body.String())
+		}
+		if prob.Code != "instance_not_restartable" {
+			t.Errorf("code = %q, want instance_not_restartable", prob.Code)
+		}
+		if len(fake.insertCalls) != 0 {
+			t.Errorf("intent should not have been inserted on 409; got %d calls", len(fake.insertCalls))
+		}
+	})
+
+	t.Run("store_returns_error_returns_500", func(t *testing.T) {
+		fake := &fakeStoreForIntent{insertErr: errors.New("connection refused")}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "RUNNING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+		}
+		var prob api.Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+			t.Fatalf("decode problem: %v body=%s", err, rec.Body.String())
+		}
+		if prob.Code != "internal_error" {
+			t.Errorf("code = %q, want internal_error", prob.Code)
+		}
+	})
+
+	t.Run("happy_path_inserts_intent_returns_202", func(t *testing.T) {
+		fake := &fakeStoreForIntent{nextIntentID: "44444444-4444-4444-4444-444444444444"}
+		srv, store, key := newForceHarness(t, fake)
+		insID, _ := seedRunningInstance(t, store, "RUNNING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true&reason=incident_42", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 1 {
+			t.Fatalf("intent insert calls = %d, want 1", len(fake.insertCalls))
+		}
+		if fake.insertCalls[0].Kind != state.OperatorIntentKindForceRestart {
+			t.Errorf("intent kind = %q, want force_restart", fake.insertCalls[0].Kind)
+		}
+		if fake.insertCalls[0].Target != insID {
+			t.Errorf("intent target = %q, want %q", fake.insertCalls[0].Target, insID)
+		}
+		if fake.insertCalls[0].Reason != "incident_42" {
+			t.Errorf("intent reason = %q, want incident_42", fake.insertCalls[0].Reason)
+		}
+		if n := notifyCountByChannel(srv); n != 1 {
+			t.Fatalf("notify calls on operator_intent channel = %d, want 1", n)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v body=%s", err, rec.Body.String())
+		}
+		if body["ok"] != true {
+			t.Errorf("body.ok = %v, want true", body["ok"])
+		}
+		if body["intent_id"] != "44444444-4444-4444-4444-444444444444" {
+			t.Errorf("body.intent_id = %v, want 44444444-...", body["intent_id"])
+		}
+		if body["status_url"] != "/v1/admin/operator-intents/44444444-4444-4444-4444-444444444444" {
+			t.Errorf("body.status_url = %v", body["status_url"])
+		}
+		if body["previous_state"] != "RUNNING" {
+			t.Errorf("body.previous_state = %v, want RUNNING", body["previous_state"])
+		}
+		if body["kind"] != "force_restart" {
+			t.Errorf("body.kind = %v, want force_restart", body["kind"])
+		}
+	})
+
+	t.Run("notify_failure_returns_202_with_intent_id", func(t *testing.T) {
+		// pg_notify drop is non-fatal: the intent row is durable,
+		// the 30s safety tick reclaims it, the response is still
+		// 202 Accepted. Same precedent as handlers_cron_run.go.
+		fake := &fakeStoreForIntent{nextIntentID: "55555555-5555-5555-5555-555555555555"}
+		srv, store, key := newForceHarness(t, fake)
+		srv.notif = &failingNotifier{err: errors.New("pg notify dropped")}
+		insID, _ := seedRunningInstance(t, store, "RUNNING")
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/instances/"+insID+"/force-restart?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+		}
+		if len(fake.insertCalls) != 1 {
+			t.Fatalf("intent insert calls = %d, want 1", len(fake.insertCalls))
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v body=%s", err, rec.Body.String())
+		}
+		if body["intent_id"] != "55555555-5555-5555-5555-555555555555" {
+			t.Errorf("body.intent_id = %v, want 55555555-...", body["intent_id"])
+		}
+	})
 }
