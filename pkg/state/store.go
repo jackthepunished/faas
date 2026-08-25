@@ -15,6 +15,20 @@ import (
 // ErrNotFound is returned by Store reads when a row does not exist.
 var ErrNotFound = errors.New("state: not found")
 
+// ErrInstanceNotRunning is returned by Engine.ForceRestart
+// (pkg/sched/engine.go) when the gated re-read under lockApp
+// observes a state other than RUNNING. The race-loser posture:
+// a customer-driven Park or Destroy won the lock between the
+// apid gate-time read and schedd's locked re-read. The desired
+// end-state (instance no longer running) is already achieved,
+// but we still stamp the operator_intent row failed so the
+// audit trail records that the admin click did not mutate
+// state itself. Translated at the handler boundary to a 409
+// instance_not_restartable via the apid gate (which holds its
+// own forceRestartableStates check), so this sentinel is the
+// *post-lock-re-read* correlate of that pre-lock gate.
+var ErrInstanceNotRunning = errors.New("state: instance not in running state")
+
 // ErrCorsWildcardWithCredentials is returned by
 // MergeCorsPresetIntoRule when the merged AllowOrigins contains
 // the bare "*" wildcard alongside AllowCredentials: true. This is
