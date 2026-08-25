@@ -377,10 +377,10 @@ func emitOperatorActionView(r *http.Request, s *server, caller state.Account, ta
 	}
 	tid := targetID
 	s.audit.Emit(r.Context(), "operator.action.view", &tid, map[string]any{
-		"actor":       caller.ID,
-		"endpoint":    endpoint,
-		"target_kind": "account",
-		"target_id":   targetID,
+		"actor":             caller.ID,
+		"endpoint":          endpoint,
+		"target_kind":       "account",
+		"target_account_id": targetID,
 	})
 }
 
@@ -398,13 +398,14 @@ func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Acc
 		aidPtr = &targetAccountID
 	}
 	s.audit.Emit(r.Context(), "operator.action.park_instance", aidPtr, map[string]any{
-		"actor":          caller.ID,
-		"instance_id":    instanceID,
-		"app_id":         appID,
-		"deployment_id":  deploymentID,
-		"previous_state": previousState,
-		"reason":         reason,
-		"schedd_result":  scheddResult,
+		"actor":             caller.ID,
+		"target_account_id": targetAccountID,
+		"instance_id":       instanceID,
+		"app_id":            appID,
+		"deployment_id":     deploymentID,
+		"previous_state":    previousState,
+		"reason":            reason,
+		"schedd_result":     scheddResult,
 	})
 }
 
@@ -412,8 +413,13 @@ func emitOperatorActionParkInstance(r *http.Request, s *server, caller state.Acc
 // audit row when an admin forces the next wake of a deployment to be
 // a cold boot via the P2b endpoint. snapIDs is the list of
 // (warm + init) snapshots that were marked stale; may be empty when
-// the deployment had no snapshots.
-func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Account, targetAccountID, appID, deploymentID string, snapIDs []string) {
+// the deployment had no snapshots. scheddResult distinguishes
+// "success" from a 503 RPC failure so the audit log can answer
+// "did the operator's action actually take effect?" — without it,
+// an empty snapIDs list is ambiguous between "deployment had no
+// snapshots" (legitimate no-op) and "schedd was down and the
+// RPC failed" (operator action did not land).
+func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Account, targetAccountID, appID, deploymentID, scheddResult, scheddErr string, snapIDs []string) {
 	if s == nil || s.audit == nil {
 		return
 	}
@@ -421,13 +427,19 @@ func emitOperatorActionForceColdBoot(r *http.Request, s *server, caller state.Ac
 	if targetAccountID != "" {
 		aidPtr = &targetAccountID
 	}
-	s.audit.Emit(r.Context(), "operator.action.force_cold_boot", aidPtr, map[string]any{
+	data := map[string]any{
 		"actor":                 caller.ID,
+		"target_account_id":     targetAccountID,
 		"app_id":                appID,
 		"deployment_id":         deploymentID,
 		"snap_ids_marked_stale": snapIDs,
 		"tier_walked":           []string{"warm", "init"},
-	})
+		"schedd_result":         scheddResult,
+	}
+	if scheddErr != "" {
+		data["schedd_error"] = scheddErr
+	}
+	s.audit.Emit(r.Context(), "operator.action.force_cold_boot", aidPtr, data)
 }
 
 // emitOperatorActionReclaimBuild writes an operator.action.reclaim_build

@@ -71,7 +71,7 @@ func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct 
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
 			"schedd_unavailable",
 			"schedd client not wired",
-			"FAAS_APID_SCHEDD_TARGET is empty on this deployment; admin recovery endpoints are unreachable"))
+			"FAAS_SCHEDD_SOCKET is empty on this deployment; admin recovery endpoints are unreachable"))
 		return
 	}
 	if r.URL.Query().Get("confirm") != "true" {
@@ -123,8 +123,13 @@ func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct 
 	}
 
 	snapIDs, fcErr := s.scheddClient.ForceColdBootNextWake(r.Context(), dep.ID)
-	emitOperatorActionForceColdBoot(r, s, acct, app.AccountID, app.ID, dep.ID, snapIDs)
 	if fcErr != nil {
+		// Emit the audit row BEFORE returning the error so the
+		// operator action is durable. schedd_result="error"
+		// distinguishes a 503 RPC failure from the legitimate
+		// no-op case (deployment had no snapshots) where
+		// snapIDs comes back empty with nil error.
+		emitOperatorActionForceColdBoot(r, s, acct, app.AccountID, app.ID, dep.ID, "error", fcErr.Error(), nil)
 		if errors.Is(fcErr, state.ErrNotFound) {
 			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 				"deployment not found", "schedd could not find the deployment"))
@@ -134,6 +139,7 @@ func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct 
 			"schedd_unavailable", "force-cold-boot RPC failed", fcErr.Error()))
 		return
 	}
+	emitOperatorActionForceColdBoot(r, s, acct, app.AccountID, app.ID, dep.ID, "success", "", snapIDs)
 	writeJSON(w, http.StatusOK, api.ForceColdBootResponse{
 		OK:                 true,
 		AppID:              app.ID,

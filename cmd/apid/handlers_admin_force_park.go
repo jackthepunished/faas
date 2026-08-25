@@ -98,7 +98,7 @@ func (s *server) postForcePark(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
 			"schedd_unavailable",
 			"schedd client not wired",
-			"FAAS_APID_SCHEDD_TARGET is empty on this deployment; admin recovery endpoints are unreachable"))
+			"FAAS_SCHEDD_SOCKET is empty on this deployment; admin recovery endpoints are unreachable"))
 		return
 	}
 	if r.URL.Query().Get("confirm") != "true" {

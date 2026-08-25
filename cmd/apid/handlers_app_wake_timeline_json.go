@@ -116,11 +116,15 @@ func buildAppWakeTimeline(
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	agg := aggregateWakeTimeline(instances, bootMetas, cutoff)
 
-	rows := make([]api.WakeTimelineJSONRow, 0, len(instances))
-	for _, ins := range instances {
-		if !ins.StartedAt.IsZero() && ins.StartedAt.UTC().Before(cutoff) {
-			break // same descending-break as aggregateWakeTimeline
-		}
+	// Use the shared helper for the post-cutoff prefix so the
+	// row-build loop doesn't re-implement the same
+	// descending-break that aggregateWakeTimeline just performed
+	// — the review cluster flagged this duplication as the
+	// primary drift hazard.
+	timelineRows := wakeTimelineCutoff(instances, cutoff)
+
+	rows := make([]api.WakeTimelineJSONRow, 0, len(timelineRows))
+	for _, ins := range timelineRows {
 		row := api.WakeTimelineJSONRow{
 			Kind:              "wake.boot_started",
 			State:             ins.State,
