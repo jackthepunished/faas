@@ -1,0 +1,21 @@
+[Unit]
+Description=Gregale G19.3 metal H2C acceptance gates
+Documentation=docs/adr/127-g19.1-h2c-bridge-hardening.md docs/ops/h2c-rollout.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={{ mha_fixture_env_path }}
+
+[Service]
+Type=oneshot
+User={{ mha_runner_user }}
+Group={{ mha_runner_group }}
+EnvironmentFile={{ mha_fixture_env_path }}
+ExecStart={{ mha_harness_path }} all
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths={{ mha_install_dir }} {{ mha_fixture_env_path }}
+
+[Install]
+WantedBy=multi-user.target
