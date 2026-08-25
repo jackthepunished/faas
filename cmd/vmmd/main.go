@@ -660,6 +660,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	wire.BootStamps(ctx, "vmmd", ops)
 	wire.RegisterDefaultOps(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer so
 	// stale-fallback serves on the cold-boot Restore path emit
@@ -999,6 +1000,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
 	}
+	// Issue #571 PR-A2: construct the /readyz probe (kvm +
+	// firecracker + gRPC). The gRPC bound signal flips to true
+	// here — deps.listen() succeeded, so the unix socket is
+	// bound and schedd can dial. BuildReadinessProbe also does
+	// a one-shot /dev/kvm open + firecracker LookPath; both
+	// succeed here or the daemon exits via the
+	// BuildReadinessProbe call's failure path (the probe is
+	// ready regardless).
+	vmmdProbe, grpcBound := BuildReadinessProbe()
+	// NOTE: grpcBound.MarkBound() is intentionally NOT called
+	// here — see cmd/vmmd/readiness.go BuildReadinessProbe for
+	// why. The flip must fire inside the serve goroutine, just
+	// before gsrv.Serve, so a panic during the ~90 lines of
+	// setup below cannot leave /readyz reporting ready while
+	// no gRPC server is actually running (PR #1091 review
+	// Finding 5).
 	// CPU cache: a per-instance rate + accumulator over cgroup
 	// usage_usec, fed by runCPUSampleLoop below and consumed by
 	// vmmdgrpc.Server.Stats. issue #279 / PR-B. nil-safe so
@@ -1058,6 +1075,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// directly without polluting the main /metrics scrape
 		// (which is the wire-side OpsMetrics registry).
 		mux.Handle(metricsPath+"/wake-phase", wpm.Handler())
+		// Issue #571 PR-A2: /healthz + /readyz on the metrics mux
+		// (operator-side, loopback-only) for the LB scrape and
+		// on-box monitoring. Source of truth is the same
+		// BuildReadinessProbe wired at the deps.listen site
+		// above — single source between /readyz body and the
+		// daemon_ready gauge (issue #586 / ADR-129).
+		wire.ControlMuxLite(mux, vmmdProbe.ReadyFunc(), vmmdProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
@@ -1082,6 +1106,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", vmmdpb.Vmmd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		grpcBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 

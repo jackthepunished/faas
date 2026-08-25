@@ -1152,6 +1152,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// We do NOT pass a Broadcaster — gatewayd is the public
 	// listener (CLAUDE.md ownership), not an SSE fan-out source.
 	gatewayOps := wire.NewOpsMetrics("gatewayd")
+	wire.BootStamps(ctx, "gatewayd", gatewayOps)
 	wire.RegisterDefaultOps(gatewayOps)
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)

@@ -50,13 +50,98 @@ var BuildTime = ""
 var defaultOps *OpsMetrics
 
 // RegisterDefaultOps stores ops as the package-level default so
-// Daemon() can call RecordDaemonRestart on it. Call this once at
-// the top of cmd/<daemon>/main.go, immediately after
-// wire.NewOpsMetrics(name). Passing nil clears the registration
-// (used by tests). Subsequent calls overwrite — the daemon boot
-// path is single-threaded so this is safe.
+// RunAndShutdown / recordUptime / wire.Daemon's shutdown-flip can
+// read from it. Call this once at the top of
+// cmd/<daemon>/main.go, immediately after
+// wire.NewOpsMetrics(name) and wire.BootStamps(ctx, name, ops).
+// Passing nil clears the registration (used by tests).
+// Subsequent calls overwrite — the daemon boot path is
+// single-threaded so this is safe.
+//
+// Why RegisterDefaultOps + BootStamps are TWO calls instead of one:
+// BootStamps is the load-bearing call site for the boot-time
+// metric stamps (issue #573 / ADR-128 restart count + issue #586
+// / ADR-129 build info + deploy version + uptime goroutine +
+// ready gauge). Those stamps need ops to be fully constructed,
+// so they cannot live inside Daemon() (Daemon() is called BEFORE
+// fn runs, and ops is constructed INSIDE fn). Splitting them
+// keeps BootStamps in the per-daemon run() where ops is alive,
+// and RegisterDefaultOps in the same spot so any helper
+// goroutine that captures defaultOps (RunAndShutdown's
+// drain-flip, recordUptime's 1s ticker) reads the same instance.
 func RegisterDefaultOps(ops *OpsMetrics) {
 	defaultOps = ops
+}
+
+// BootStamps records the daemon's boot-time metrics (issue #573 /
+// ADR-128 restart count + issue #586 / ADR-129 build info +
+// deploy version + uptime goroutine + ready gauge) and starts
+// the per-second uptime goroutine. Call this immediately after
+// `ops := wire.NewOpsMetrics(name)` and before
+// wire.RegisterDefaultOps(ops), in the daemon's run() function.
+//
+// Why hoisted out of Daemon(): the prior wiring had Daemon() call
+// defaultOps.* at the top of its body (RecordDaemonRestart +
+// SetDaemonBuildInfo + SetDeployVersion + recordUptime spawn +
+// MarkReady(name, true, "")). But RegisterDefaultOps runs INSIDE
+// fn, so defaultOps was still nil at Daemon()'s call sites — every
+// boot stamp was a silent no-op (OpsMetrics methods have
+// nil-receiver guards). The whole point of #573/#586 metrics is
+// that they fire on every boot; under the prior wiring they fired
+// zero times across the entire fleet for years. BootStamps runs
+// after ops is constructed, so the stamps actually fire.
+//
+// The ready-gauge flip moves here too (was in Daemon's "ready"
+// log line): MarkReady(name, true, "") is the entrypoint for the
+// §12 "Fleet readiness" panel, and a daemon's "I am ready" is
+// "ops is constructed and my name is known to the metrics
+// registry" — not "fn is about to be called". With BootStamps
+// inside run(), the flip happens at the same instant the
+// per-daemon metric labels become live.
+//
+// A nil ops is tolerated — every helper called below has a
+// nil-receiver guard, so a daemon that hasn't wired its
+// OpsMetrics (rare — the test path) doesn't panic.
+//
+// Idempotent on every method called (each Set is a no-op if the
+// gauge is already at the desired value). Calling BootStamps
+// twice on the same (name, ops) is safe.
+func BootStamps(ctx context.Context, name string, ops *OpsMetrics) {
+	if ops == nil {
+		return
+	}
+	// Issue #573 / ADR-128: record systemd-driven restart count.
+	// The systemd unit (deploy/ansible/roles/<daemon>/files/<daemon>.service)
+	// sets Environment=SYSTEMD_RESTARTS_ON_FAILURE=<n> via the
+	// RestartCountExport pattern (systemd 254+); when that env
+	// var is unset (older systemd, dev runs without a unit, etc.)
+	// SystemdRestartCount returns 0 and the counter stays at 0.
+	ops.RecordDaemonRestart(name, Version, SystemdRestartCount())
+
+	// Issue #586 / ADR-129: stamp the build info gauge so the
+	// "Daemon versions fleet-wide" dashboard panel surfaces the
+	// current binary's identity from process start.
+	ops.SetDaemonBuildInfo(name, Version, GitSHA, BuildTime)
+
+	// Issue #586 / ADR-129: stamp the platform-wide release
+	// identifier gauge (faas_deploy_version{version}).
+	ops.SetDeployVersion(Version)
+
+	// Issue #586 / ADR-129: 1-second uptime goroutine. Updates
+	// daemon_uptime_seconds{daemon} every 1s until ctx.Done().
+	// Cheap — one Prometheus gauge Set per tick per daemon, no
+	// allocations beyond the time.Time. Goroutine exits on
+	// shutdown; the gauge freezes at the last value (which is
+	// the right thing — operators want to see "uptime at the
+	// moment of shutdown" rather than a zero).
+	go recordUptimeWithOps(ctx, name, time.Now(), ops)
+
+	// Issue #586 / ADR-129: flip daemon_ready{daemon} to 1 so
+	// the §12 "Fleet readiness" panel reflects the serving
+	// window — not the shutdown moment. Until /readyz flips
+	// signals per component (issue #571), the daemon-level
+	// gauge is the only readiness signal.
+	ops.MarkReady(name, true, "")
 }
 
 // EnvLogLevel is the operator-facing env var that controls the slog.Level
@@ -182,8 +267,13 @@ func Daemon(name string, fn RunFunc) {
 		return
 	}
 
+	// Issue #852: do NOT stamp "daemon" on Logger().With — slog.Logger.With
+	// accumulates attrs without dedup, so NewCorrelationLogger (called below)
+	// would emit the daemon name twice on every record. NewCorrelationLogger
+	// injects FieldDaemon once when daemon != "". Keep "version" on the With
+	// chain so the version stamp survives correlation envelope construction.
 	log := NewCorrelationLogger(
-		Logger().With("daemon", name, "version", Version),
+		Logger().With("version", Version),
 		CorrelationFields{RequestID: NewRequestID()},
 		name,
 	)
@@ -197,76 +287,54 @@ func Daemon(name string, fn RunFunc) {
 
 	go watchLogLevelReload(ctx, log, hupCh, os.Getenv)
 
-	// Issue #573 / ADR-128: record systemd-driven restart count.
-	// The systemd unit (deploy/ansible/roles/<daemon>/files/<daemon>.service)
-	// sets Environment=SYSTEMD_RESTARTS_ON_FAILURE=<n> via the
-	// RestartCountExport pattern (systemd 254+); when that env
-	// var is unset (older systemd, dev runs without a unit, etc.)
-	// SystemdRestartCount returns 0 and the counter stays at 0.
-	// The alert rules fall back to node_exporter's
-	// node_systemd_restart_count in that case.
-	defaultOps.RecordDaemonRestart(name, Version, SystemdRestartCount())
-
-	// Issue #586 / ADR-129: stamp the build info gauge so the
-	// "Daemon versions fleet-wide" dashboard panel surfaces the
-	// current binary's identity from process start. The
-	// constructor already pre-instantiates the row at
-	// (daemon, Version, GitSHA, BuildTime); this re-stamp is
-	// idempotent and covers the edge case where ldflags inject
-	// a different value mid-process (rare, but cheap to handle).
-	defaultOps.SetDaemonBuildInfo(name, Version, GitSHA, BuildTime)
-
-	// Issue #586 / ADR-129: stamp the platform-wide release
-	// identifier gauge (faas_deploy_version{version}). Same
-	// rationale as SetDaemonBuildInfo — constructor pre-instantiates
-	// the row at (Version), this re-stamp is idempotent. The
-	// "Releases fleet-wide" stat panel reads this gauge to detect
-	// partial rollouts (a fleet with 2 versions visible is mid-rollout).
-	defaultOps.SetDeployVersion(Version)
-
-	// Issue #586 / ADR-129: 1-second uptime goroutine. Updates
-	// daemon_uptime_seconds{daemon} every 1s until ctx.Done().
-	// Cheap — one Prometheus gauge Set per tick per daemon, no
-	// allocations beyond the time.Time. Goroutine exits on
-	// shutdown; the gauge freezes at the last value (which is
-	// the right thing — operators want to see "uptime at the
-	// moment of shutdown" rather than a zero).
-	startedAt := time.Now()
-	go recordUptime(ctx, name, startedAt)
+	// Issue #573 / ADR-128 + #586 / ADR-129: boot-time metric
+	// stamps moved out of Daemon() into wire.BootStamps. They used
+	// to live here, but RegisterDefaultOps runs INSIDE fn, so
+	// defaultOps was still nil at these call sites and every
+	// stamp was a silent no-op. BootStamps fires them from the
+	// daemon's run() right after ops is constructed — see
+	// wire.BootStamps.
 
 	log.Info("starting", "config", *configPath, "restart_count", SystemdRestartCount(), "git_sha", GitSHA, "build_time", BuildTime)
-	// Issue #586 / ADR-129 (review-fix PR #1082 #1): flip
-	// daemon_ready{daemon} to 1 BEFORE the run function blocks so
-	// the §12 "Fleet readiness" panel reflects the serving
-	// window — not the shutdown moment. The earlier ordering
-	// (MarkReady AFTER fn returns) inverted the semantic: a daemon
-	// that runs forever only flips the gauge to 1 once per
-	// process, during shutdown, after which the process disappears
-	// from the scrape. Every dashboard row rendered the wrong
-	// value the entire time it mattered. Now: ready fires
-	// synchronously at boot, fn() opens listeners + serves, and
-	// the gauge stays at 1 for the entire serving lifetime.
-	// Until /readyz lands (issue #571), "the run function being
-	// invoked" is the proxy for "ready to serve". DefaultOps is
-	// nil-safe so a daemon that never registered its OpsMetrics
-	// doesn't panic.
-	defaultOps.MarkReady(name)
-	log.Info("ready", "daemon", name, "version", Version, "ready", true)
+	// Issue #852: do NOT re-stamp "daemon" / "version" on this call site.
+	// The slog.Logger.With envelope on log already carries "version" and
+	// NewCorrelationLogger already carries "daemon" — re-passing them here
+	// would emit duplicate JSON keys per the slog JSON handler contract.
+	log.Info("ready", "ready", true)
 	if err := fn(ctx, log); err != nil {
 		log.Error("exited with error", "err", err)
+		// Issue #586 / ADR-129 (Finding 2 from PR #1091 review):
+		// flip daemon_ready{daemon} to 0 BEFORE os.Exit so a scrape
+		// that lands during the SIGTERM drain window sees 0, not
+		// "ready forever, then process gone". defaultOps is nil-safe
+		// so a daemon that exited before RegisterDefaultOps ran
+		// doesn't panic.
+		defaultOps.MarkReady(name, false, "exited with error")
 		os.Exit(1)
 	}
+	// Issue #586 / ADR-129 (Finding 2 from PR #1091 review):
+	// flip daemon_ready{daemon} to 0 BEFORE the process exits so
+	// the §12 "Fleet readiness" panel reflects the post-serve
+	// state. Without this flip the gauge stays at 1 forever
+	// (until the process disappears from the scrape target),
+	// producing a misleading dashboard panel that shows
+	// "every daemon ready" while the fleet is mid-shutdown.
+	defaultOps.MarkReady(name, false, "shutdown complete")
 	log.Info("shutdown complete")
 }
 
-// recordUptime (issue #586 / ADR-129) ticks daemon_uptime_seconds
-// every 1s. Lives in the goroutine spawned from wire.Daemon();
-// exits when ctx is cancelled. Uses defaultOps so the daemon's
-// main.go only needs to register its OpsMetrics once (see
-// RegisterDefaultOps) and doesn't have to thread the metric
-// through every goroutine. Time-since-start is computed locally
-// each tick so a clock-slew doesn't accumulate error.
-func recordUptime(ctx context.Context, name string, startedAt time.Time) {
+// recordUptimeWithOps (issue #586 / ADR-129) ticks
+// daemon_uptime_seconds every 1s. Lives in the goroutine spawned
+// from wire.BootStamps; exits when ctx is cancelled. Uses the
+// ops argument explicitly (NOT defaultOps) so BootStamps's
+// "ops is alive at call time" invariant is preserved — callers
+// pass the same *OpsMetrics NewOpsMetrics returned. Time-since-start
+// is computed locally each tick so a clock-slew doesn't
+// accumulate error. A nil ops is tolerated (no-op).
+func recordUptimeWithOps(ctx context.Context, name string, startedAt time.Time, ops *OpsMetrics) {
+	if ops == nil {
+		return
+	}
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 	for {
@@ -274,7 +342,7 @@ func recordUptime(ctx context.Context, name string, startedAt time.Time) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			defaultOps.SetDaemonUptime(name, time.Since(startedAt).Seconds())
+			ops.SetDaemonUptime(name, time.Since(startedAt).Seconds())
 		}
 	}
 }

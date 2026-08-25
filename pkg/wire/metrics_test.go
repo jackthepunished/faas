@@ -1572,7 +1572,7 @@ func TestDaemon_BuildInfo_Uptime_Ready(t *testing.T) {
 	}
 	// SetDaemonUptime + MarkReady update the body.
 	m.SetDaemonUptime("vmmd", 12.5)
-	m.MarkReady("vmmd")
+	m.MarkReady("vmmd", true, "")
 	body = render(t, m)
 	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="vmmd"} 12.5`) {
 		t.Errorf("missing uptime update at 12.5 in:\n%s", body)
@@ -1580,9 +1580,16 @@ func TestDaemon_BuildInfo_Uptime_Ready(t *testing.T) {
 	if !strings.Contains(body, `vmmd_daemon_ready{daemon="vmmd"} 1`) {
 		t.Errorf("missing ready=1 after MarkReady in:\n%s", body)
 	}
+	// MarkReady(true, "") flips ready → 1 (already covered above).
+	// MarkReady(false, reason) flips back to 0 (commit 3 tri-state).
+	m.MarkReady("vmmd", false, "draining")
+	body = render(t, m)
+	if !strings.Contains(body, `vmmd_daemon_ready{daemon="vmmd"} 0`) {
+		t.Errorf("missing ready=0 after MarkReady(vmmd, false, \"draining\") in:\n%s", body)
+	}
 	// Unknown daemon name collapses to "other" (closed-set contract).
 	m.SetDaemonUptime("unknown-daemon", 1.0)
-	m.MarkReady("unknown-daemon")
+	m.MarkReady("unknown-daemon", true, "")
 	body = render(t, m)
 	if !strings.Contains(body, `vmmd_daemon_uptime_seconds{daemon="other"} 1`) {
 		t.Errorf("unknown daemon did not collapse to other in:\n%s", body)

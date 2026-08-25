@@ -259,19 +259,18 @@ func TestNewPGPingSignal_StopIsIdempotent(t *testing.T) {
 }
 
 // TestNewStalenessSignal_FreshTouchReady verifies the touch path
-// keeps the signal ready while touches are recent.
+// keeps the signal ready while touches are recent. PR #1091
+// review Finding 8: the pre-arm at NewStalenessSignal's tail
+// was removed so the signal starts at (false, "no touch yet");
+// the first tick is the canonical readiness flip.
 func TestNewStalenessSignal_FreshTouchReady(t *testing.T) {
 	sig, touch, stop := NewStalenessSignal(200 * time.Millisecond)
 	defer stop()
-	// The helper returns with the bit already set to true (see
-	// pre-arm at NewStalenessSignal's tail).
-	ok, _ := sig.Report()
-	if !ok {
-		t.Fatalf("staleness signal reports not-ready immediately after construction")
-	}
+	// No pre-arm: signal reports not-ready until the first tick
+	// fires after Touch lands.
 	touch()
 	time.Sleep(50 * time.Millisecond)
-	ok, _ = sig.Report()
+	ok, _ := sig.Report()
 	if !ok {
 		t.Errorf("staleness signal flipped not-ready 50 ms after fresh touch")
 	}

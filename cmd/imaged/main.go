@@ -277,6 +277,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// files/faas.rules.yml depend on imaged_oci_pull_duration_seconds
 	// being live, not empty.)
 	ops := wire.NewOpsMetrics("imaged")
+	wire.BootStamps(ctx, "imaged", ops)
 	wire.RegisterDefaultOps(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer onto the
 	// daemon's *wire.OpsMetrics so stale-fallback serves emit
@@ -537,8 +538,16 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// cmd/imaged/config.go::LoadConfig.
 	metricsAddr := imgCfg.GetMetricsAddr(os.Getenv)
 	if metricsAddr != "" {
+		// Issue #571 PR-A2: /readyz probe (storage root +
+		// cache dir writability). Built before the metrics
+		// listener so the ControlMuxLite registration below
+		// can wire /readyz on the same mux as /metrics. defer
+		// stop so the SIGTERM drain window surfaces in
+		// daemon_ready as 0.
+		imagedProbe := BuildReadinessProbe(envOr("FAAS_STORAGE_ROOT", defaultStorageRoot))
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
+		wire.ControlMuxLite(mux, imagedProbe.ReadyFunc(), imagedProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.

@@ -1,44 +1,45 @@
-// Package gateway — readiness.go owns the readiness probes the Tier
-// A7 edge daemons wire to /readyz.
+// Package wire — readiness.go owns the daemon-level readiness helpers
+// (issue #571). It is the daemon-side counterpart of
+// pkg/gateway/readiness.go, which serves the Tier A7 edge daemons.
 //
-// Background: the pre-split gatewayd-internal wired /readyz with `nil`
-// (cmd/gatewayd-internal/main.go:878 — `gateway.ControlMux(handler.Metrics(),
-// nil)`), which made /readyz return 200 unconditionally
-// (pkg/gateway/control.go:37 — `if ready == nil || ready()`). That
-// was acceptable for single-box (one daemon, no LB to drain) but
-// fails closed wrong after the split: a partial-boot daemon would
-// happily accept traffic even though the routing cache, the
-// cert-bundle, and the warm-hint subscription are not yet ready.
+// Why duplicated: pkg/gateway already imports pkg/wire (the
+// dependency direction is gateway -> wire, not the reverse). Lifting
+// the helpers into pkg/wire makes them available to every cmd/<daemon>/
+// main.go without creating a cycle. The two implementations stay in
+// lockstep via the ADR-129 footnote on daemon-level /readyz; a future
+// PR can extract pkg/readiness if a third caller appears. For now the
+// surface is small (~120 LOC) and stable, so the duplication cost is
+// bounded.
 //
-// Tier A7 (ADR-070) introduces two daemons — gatewayd-public and
-// gatewayd-internal — each with a real readiness signal:
+// What lives here:
 //
-//   - gatewayd-public readiness: routing-cache mirror is hydrated
-//     (app_changed/domain_changed pg_notify has fired at least
-//     once), AND the cert-sync subscriber is fresh (last receipt
-//     within 2× api.CertSyncIntervalSeconds), AND the warm-hint
-//     subscriber has converged (last receipt within 2× the
-//     broadcast cadence), AND the PG connection is up
-//     (pgxpool.Ping succeeded at most N seconds ago).
+//   - ReadySignal: one component's "I'm ready" bit. Operators add
+//     signals with ReadyzProbe.Register; the /readyz handler flips to
+//     503 when ANY registered signal reports false. Signals are
+//     independent — no priority order, no AND-of-children logic.
+//   - ReadyzProbe: fan-in point. Daemons Register one ReadySignal
+//     per component at construction; the /readyz handler calls All().
+//     Zero state (no signals registered) returns ready=true — the
+//     pre-split behaviour, so an early-boot scrape does not see a
+//     spurious 503.
+//   - NewStalenessSignal: signal that flips false after `stale`
+//     elapses since the last Touch. Used by meterd's loop.Health
+//     adapter (cmd/meterd/readiness.go).
+//   - NewPGPingSignal: signal that tracks pgxpool.Pool liveness.
+//     Used by apid, schedd, githubd (cmd/<daemon>/readiness.go).
+//   - ControlMuxLite: registers /healthz (200 ok) and /readyz
+//     (200 ready / 503 not-ready:<reason>) on an existing
+//     http.ServeMux. Lighter than gateway.ControlMux (no drain
+//     wrapping, no separate metrics registry).
 //
-//   - gatewayd-internal readiness: routing-target cache is
-//     non-empty (the per-app targetSet has at least one entry OR
-//     we just admitted a cold wake that produced one), AND the
-//     per-node schedd dial cache has at least one ready client,
-//     AND the warm-hint subscriber is fresh, AND the PG
-//     connection is up.
-//
-// Each probe is independently composable. ReadyzProbe.All folds the
-// per-component signals into a single ReadyFunc suitable for
-// passing to gateway.ControlMux. The zero value is the no-op
-// "always ready" probe — wired at boot BEFORE the rest of the
-// daemon's components register, so /readyz stays 200 during the
-// first 100 ms of boot (the LB scrape interval is 1 s+; an
-// instantaneous flip during boot is invisible to operators).
-package gateway
+// RunAndShutdown lives in runandshutdown.go (commit 11) — the drain
+// helper is logically separate from the probe-fan-in shape and
+// merited its own file.
+package wire
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,14 +49,12 @@ import (
 // ready bit and the reason string into a single immutable struct
 // so Set and Report see a consistent snapshot. Reading the
 // signal returns a single Load; writing is a single Store of a
-// fresh struct. PR #1091 review Finding 8 lifts the atomic.Pointer
-// refactor (originally Finding 6 in pkg/wire) into pkg/gateway
-// so the two readiness.go files stay in lockstep. The previous
-// shape stored ready in atomic.Bool and reason under a
-// sync.RWMutex, so a Report() that landed between
-// s.ready.Load() (true) and s.lastReason() ("stale") could
-// return (true, "stale") — a stale reason paired with a fresh
-// ready bit. The inverse — (false, "") — was also possible.
+// fresh struct. PR #1091 review Finding 6: the previous shape
+// stored ready in atomic.Bool and reason under a sync.RWMutex,
+// so a Report() that landed between s.ready.Load() (true) and
+// s.lastReason() ("stale") could return (true, "stale") — a
+// stale reason paired with a fresh ready bit. The inverse —
+// (false, "") — was also possible.
 type readyState struct {
 	ready  bool
 	reason string
@@ -72,6 +71,13 @@ type readyState struct {
 // publish and observe a single atomic.Pointer to an immutable
 // readyState — so the (ready, reason) pair is always observed as
 // a consistent snapshot.
+//
+// Mirrors pkg/gateway/readiness.go::ReadySignal — see the ADR-129
+// footnote in docs/adr/0129-deploy-observability.md on daemon-level
+// /readyz for the rationale on duplication. pkg/gateway still has
+// the pre-Finding-6 split shape (atomic.Bool + sync.RWMutex); PR
+// #1091 review Finding 8 tracks the follow-up that lifts the
+// atomic.Pointer refactor into pkg/gateway once this lands.
 type ReadySignal struct {
 	state atomic.Pointer[readyState]
 }
@@ -115,7 +121,11 @@ func (s *ReadySignal) Report() (ready bool, reason string) {
 	st := s.state.Load()
 	if st == nil {
 		// Zero-value ReadySignal — never Set. Treat as the
-		// pre-Set "not yet ready" state.
+		// pre-Set "not yet ready" state (the original
+		// atomic.Bool default was false; the original
+		// sync.RWMutex reason was ""). This branch only fires
+		// for direct struct literals — every constructor in
+		// this package allocates an initial readyState.
 		return false, ""
 	}
 	return st.ready, st.reason
@@ -128,9 +138,20 @@ func (s *ReadySignal) Report() (ready bool, reason string) {
 // signals are registered (the zero state), All returns true — the
 // pre-split behaviour, preserved so an early-boot scrape does not
 // see a spurious 503.
+//
+// stoppers collects one stopper func per helper-backed signal
+// (NewPGPingSignal, NewStalenessSignal, and per-daemon helpers
+// like vmmdDialSignal / buildsDirSignal / writableSignal).
+// Drain() fires every stopper BEFORE flipping signals to false
+// so a helper goroutine can't re-flip a signal after the drain
+// has set it. Manual signals (Register, RegisterSignal with nil
+// stopper) don't have a stopper entry; Drain() ignores them.
+//
+// Mirrors pkg/gateway/readiness.go::ReadyzProbe.
 type ReadyzProbe struct {
-	mu      sync.RWMutex
-	signals []*ReadySignal
+	mu       sync.RWMutex
+	signals  []*ReadySignal
+	stoppers []func()
 }
 
 // Register adds a new ReadySignal to the probe and returns it so
@@ -151,26 +172,31 @@ func (p *ReadyzProbe) Register() *ReadySignal {
 	return s
 }
 
-// RegisterSignal adds a pre-constructed *ReadySignal to the probe.
-// This is the helper-constructor counterpart to Register: helper
-// constructors (NewPGPingSignal, NewStalenessSignal) build a signal
-// internally and return it for the caller to drive via Stopper /
-// Touch. Register() would build a second placeholder signal;
-// RegisterSignal folds the existing one into the probe without
-// allocating a duplicate.
+// RegisterSignal adds a pre-constructed *ReadySignal to the probe
+// plus an optional stopper func for the helper goroutine that
+// drives the signal (NewPGPingSignal, NewStalenessSignal,
+// vmmdDialSignal, buildsDirSignal, writableSignal, meterd's
+// loop.Health adapter). Drain() fires every registered stopper
+// synchronously BEFORE flipping signals to false; this prevents
+// the helper goroutine from re-flipping a signal after the drain
+// has set it (Finding 4 from PR #1091 review).
 //
-// Used by PR-B1 (gatewayd-internal /readyz tighten) where the
-// production wiring mixes Register (manual schedd-router / nodeCache
-// signals) with RegisterSignal (PG ping + warm-hint staleness, both
-// helper-constructed). The order in All() is the order of the
-// Register / RegisterSignal calls, which is preserved for the
-// /readyz reason concat.
-func (p *ReadyzProbe) RegisterSignal(s *ReadySignal) {
+// stopper may be nil for signals that have no helper goroutine
+// (vmmd's kvmOpenableSignal, fcBinarySignal, grpcBoundSignal,
+// githubd's credsLoadedSignal / secretWiredSignal — manual flips).
+// A nil stopper is silently dropped from the stoppers slice.
+//
+// Order in All() is the order of the Register / RegisterSignal
+// calls, which is preserved for the /readyz reason concat.
+func (p *ReadyzProbe) RegisterSignal(s *ReadySignal, stopper func()) {
 	if s == nil {
 		return
 	}
 	p.mu.Lock()
 	p.signals = append(p.signals, s)
+	if stopper != nil {
+		p.stoppers = append(p.stoppers, stopper)
+	}
 	p.mu.Unlock()
 }
 
@@ -204,12 +230,12 @@ func (p *ReadyzProbe) All() (ready bool, reason string) {
 	if len(reasons) > 5 {
 		reasons = reasons[:5]
 	}
-	return ready, joinReasons(reasons)
+	return ready, joinWireReasons(reasons)
 }
 
-// ReadyFunc returns a ReadyFunc suitable for gateway.ControlMux.
-// The returned func is safe for concurrent use; the underlying
-// All() is RLock-guarded.
+// ReadyFunc returns a ReadyFunc suitable for ControlMuxLite (or
+// any handler that takes a func() bool). The returned func is
+// safe for concurrent use; the underlying All() is RLock-guarded.
 func (p *ReadyzProbe) ReadyFunc() ReadyFunc {
 	return func() bool {
 		ok, _ := p.All()
@@ -217,7 +243,17 @@ func (p *ReadyzProbe) ReadyFunc() ReadyFunc {
 	}
 }
 
-func joinReasons(reasons []string) string {
+// ReasonFunc returns a func that yields the current readiness
+// reason string ("draining", "pg ping failed: ...", etc.) suitable
+// for the /readyz body. Returns "" when ready.
+func (p *ReadyzProbe) ReasonFunc() func() string {
+	return func() string {
+		_, reason := p.All()
+		return reason
+	}
+}
+
+func joinWireReasons(reasons []string) string {
 	out := ""
 	for i, r := range reasons {
 		if i > 0 {
@@ -237,8 +273,8 @@ func joinReasons(reasons []string) string {
 // callers should typically construct the signal at boot and let
 // it run forever. A shutdown hook that flips the signal false on
 // SIGTERM prevents a late-arriving Touch from re-enabling a
-// draining daemon — see cmd/gatewayd-public/drain.go and
-// cmd/gatewayd-internal/drain.go for the canonical wiring.
+// draining daemon — see cmd/gatewayd-public/drain.go for the
+// canonical wiring, mirrored here for daemon-level /readyz.
 //
 // stale must be positive; pass api.CertSyncIntervalSeconds or
 // the warm-hint publish cadence at the call site.
@@ -255,6 +291,8 @@ func joinReasons(reasons []string) string {
 // even though the touch was fresh. The goroutine catches
 // staleness; the touch path is the hot recovery path readers
 // (LB probes, ops dashboards) observe.
+//
+// Mirrors pkg/gateway/readiness.go::NewStalenessSignal.
 func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(), stopper func()) {
 	s := newReadySignal(false, "no touch yet")
 	var lastTouch atomic.Int64 // unix nanos; 0 = "never touched"
@@ -271,9 +309,6 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 	if cadence < 10*time.Millisecond {
 		cadence = 10 * time.Millisecond
 	}
-	// touch: write the timestamp AND flip the signal ready. The
-	// goroutine catches the stale-flip; the touch path is the hot
-	// recovery path /readyz scrapes observe.
 	touchFn := func() {
 		lastTouch.Store(time.Now().UnixNano())
 		s.Set(true, "")
@@ -312,12 +347,21 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 		<-done
 		s.Set(false, "shutting down")
 	}
-	// No pre-arm. PR #1091 review Finding 8 lifts Finding 7
-	// (originally pkg/wire only) into pkg/gateway so the two
-	// readiness.go files stay in lockstep. The signal now
-	// starts at (false, "no touch yet") and the first tick is
-	// the canonical readiness flip. See pkg/wire/readiness.go
-	// for the full rationale.
+	// No pre-arm. PR #1091 review Finding 7: the previous shape
+	// called s.Set(true, "") at construction, then the first
+	// tick flipped to (false, "no touch yet") if Touch had not
+	// arrived in the cadence window. That created a brief window
+	// (≤cadence ≈ up to 1 s) where /readyz reported ready
+	// before any real Touch had landed — contradicting the
+	// invariant that every component must opt IN to ready. The
+	// signal now starts at (false, "no touch yet") and the
+	// first tick is the canonical readiness flip. Touch fires
+	// at most cadence after the goroutine starts, so the
+	// /readyz scrape delay between boot and first observation
+	// is bounded by `cadence` — same as the pre-arm path's
+	// "no touch yet" reason. The pkg/gateway copy still has
+	// the pre-arm shape; PR #1091 Finding 8 tracks the
+	// follow-up that lifts this fix into pkg/gateway.
 	return s, touchFn, stopperFn
 }
 
@@ -333,11 +377,13 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 // the bit flips false before the process exits — same pattern as
 // NewStalenessSignal's stopper.
 //
-// every must be positive; pass api.ReplicaHeartbeatIntervalSeconds
-// (5 s) at the call site for the post-split daemon shape. The P50
-// pgxpool.Ping on EX44 is sub-millisecond when the pool has warm
-// connections (per ADR-040 bench); under pool exhaustion the ping
-// will block on Connect for up to pgx's DialTimeout (default 5 s).
+// every must be positive; pass 5 s at the call site for the
+// post-split daemon shape. The P50 pgxpool.Ping on EX44 is
+// sub-millisecond when the pool has warm connections (per ADR-040
+// bench); under pool exhaustion the ping will block on Connect for
+// up to pgx's DialTimeout (default 5 s).
+//
+// Mirrors pkg/gateway/readiness.go::NewPGPingSignal.
 func NewPGPingSignal(ctx context.Context, pool pinger, every time.Duration) (*ReadySignal, func()) {
 	if every <= 0 {
 		every = 5 * time.Second
@@ -392,6 +438,67 @@ func NewPGPingSignal(ctx context.Context, pool pinger, every time.Duration) (*Re
 // pinger is the subset of *pgxpool.Pool we need for NewPGPingSignal.
 // Defining it locally avoids dragging pgxpool into every test
 // import; the production wiring passes *pgxpool.Pool directly.
+//
+// Same shape as pkg/gateway/readiness.go::pinger.
 type pinger interface {
 	Ping(context.Context) error
+}
+
+// ReadyFunc is the contract ControlMuxLite / any handler accepts:
+// a goroutine-safe predicate returning the daemon's readiness.
+// Returns true ⇒ /readyz returns 200; false ⇒ /readyz returns 503
+// with the reason surfaced via ReasonFunc.
+type ReadyFunc func() bool
+
+// ControlMuxLite registers /healthz and /readyz on an existing
+// http.ServeMux — the daemon's metrics mux, typically (so the LB
+// already scraping /metrics gets /healthz + /readyz on the same
+// URL pattern). Lighter than pkg/gateway.ControlMux: no drain
+// tracker wrapping, no separate metrics registry. Drains are
+// handled separately by wire.RunAndShutdown (commit 11) flipping
+// the probe's signals to false.
+//
+// Body shape:
+//
+//	GET /healthz → 200 "ok"
+//	GET /readyz  → 200 "ready" if ready() is true
+//	               503 "not-ready:<reason>" otherwise
+//
+// The bodies are short ASCII to keep log-shipping cheap. Operators
+// triage via the response body plus the daemon_ready Prometheus
+// gauge (issue #586 / ADR-129).
+//
+// mux is required; readyFunc may be nil — passing nil degrades to
+// the pre-split "always ready" behaviour (always 200), preserved
+// so a partial-boot daemon that hasn't wired its probe yet does
+// not brick the LB scrape path. Once the daemon constructs its
+// probe, the caller replaces the registration with one driven by
+// the probe (or uses RunAndShutdown's single-source-of-truth
+// pattern in commit 11).
+func ControlMuxLite(mux *http.ServeMux, readyFunc ReadyFunc, reasonFunc func() string) {
+	if mux == nil {
+		return
+	}
+	if readyFunc == nil {
+		readyFunc = func() bool { return true }
+	}
+	if reasonFunc == nil {
+		reasonFunc = func() string { return "" }
+	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if readyFunc() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+			return
+		}
+		body := "not-ready:" + reasonFunc()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(body))
+	})
 }
