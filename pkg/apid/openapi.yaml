@@ -1549,6 +1549,100 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/wake-timeline:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppWakeTimeline
+      summary: Per-app wake timeline (JSON mirror of the dashboard page).
+      description: |
+        Wire-friendly mirror of the dashboard's per-app wake-timeline
+        HTML page (`/dashboard/apps/{slug}/wake-timeline`,
+        cmd/apid/handlers_dashboard.go:2548 renderAppWakeTimeline).
+        The HTML page keeps its pre-rendered HTML chips; this endpoint
+        emits the same data as JSON so a separate frontend agent can
+        render without re-parsing HTML.
+
+        Returns the 50 most-recent instance rows for the app, joined
+        against the events table's `wake.boot_started` rows for the
+        per-row telemetry (Trigger, QueuedCount, ConcurrencyAtAdmit,
+        AtCapacity, ReadyInMS). The aggregation math is shared with
+        the HTML page:
+
+          - 24h cutoff descending-break: the moment a row's
+            `started_at` falls before the trailing-24h instant, the
+            loop breaks (no further iteration). Pre-ADR-123 fleet
+            rows with no `started_at` are not eligible for the break
+            (always in scope).
+          - Two-denominator rule for `at_capacity_pct`: numerator is
+            the count of rows where the events join succeeded AND
+            the at_capacity flag is true; denominator is the count
+            of rows where the events join succeeded
+            (`wake_count_with_meta`). Pre-PR-A fleet rows contribute
+            to `wake_count_24h` but not the denominator — same
+            posture as the HTML page.
+
+        Plan-gated Hobby+ (mirror of /v1/apps/{slug}/metrics —
+        same `code` so a downgrade between the two endpoints flips
+        both at once).
+      responses:
+        '200':
+          description: The wake-timeline snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppWakeTimelineResponse'
+              example:
+                app:
+                  app_id: "0123456789abcdef0123456789abcdef"
+                  slug: "my-api"
+                wake_count_24h: 24
+                wake_count_with_meta: 20
+                at_capacity_count: 3
+                at_capacity_pct: 15.0
+                trigger_histogram:
+                  "manual.cron": 8
+                  "manual.api": 7
+                  "scheduled.idle": 5
+                rows:
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T13:00:00Z"
+                    trigger: "manual.api"
+                    queued_count: 0
+                    concurrency_at_admit: 2
+                    at_capacity: false
+                    at_capacity_present: true
+                    ready_in_ms: 342
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T12:58:11Z"
+                    at_capacity: false
+                    at_capacity_present: false
+                    ready_in_ms: -1
+                as_of: "2026-07-28T13:00:00.123456Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app wake-timeline. Free plan —
+            Hobby or above required. Same code as /v1/apps/{slug}/metrics
+            (plan_per_app_metrics_not_allowed) so a single downgrade
+            flips both endpoints at once.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_per_app_metrics_not_allowed"
+                title: "Per-app metrics unavailable on this plan"
+                status: 402
+                code: "plan_per_app_metrics_not_allowed"
+                detail: "the free plan does not include per-app metrics; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#per-app-metrics"
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/routes:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -14838,6 +14932,121 @@ components:
         p99_ms: { type: number, description: "p99 latency in milliseconds." }
       x-since: "2026-08"
       x-issue: "696"
+
+    WakeTimelineApp:
+      description: |
+        Slim per-app identification embedded in `AppWakeTimelineResponse`.
+        Carries only the fields the dashboard SPA needs for the
+        wake-timeline header (slug + app_id). The wider
+        pkg/dashboard.AppListItem type carries template-specific
+        glyph/badge fields (SLO badge, StateBadge*, QuotaLabel) that
+        don't belong on the wire.
+      type: object
+      required: [app_id, slug]
+      properties:
+        app_id: { type: string, format: uuid }
+        slug:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+          description: "DNS-safe app slug (matches apps.slug)."
+        status: { type: string, description: "Optional deployment status (active/paused). Empty until a deployment is bound." }
+        url:    { type: string, description: "Optional public URL once a deployment is bound." }
+
+    WakeTimelineJSONRow:
+      description: |
+        One row of `AppWakeTimelineResponse.rows`. Mirrors
+        pkg/dashboard/views.WakeTimelineRow's fields so the JSON
+        mirror can render the same dashboard page 1:1. The
+        nullable fields (Trigger / QueuedCount / ConcurrencyAtAdmit
+        / ReadyInMS) use omitempty so the dashboard SPA can
+        distinguish "absent" (jsonb key missing — pre-PR-A fleet
+        row) from "explicit zero" (jsonb key present and 0).
+        `ready_in_ms = -1` is the em-dash sentinel for "no
+        boot_completed row yet" (still booting or rejected) — the
+        dashboard SPA renders "—" on -1, mirroring the HTML page
+        cell-empty branch.
+      type: object
+      required: [kind, state, at_capacity, at_capacity_present]
+      properties:
+        kind:
+          type: string
+          enum: [wake.boot_started]
+          description: "Event kind. Today always wake.boot_started; the field is open for future wake.boot_completed/_failed rows."
+        state:
+          type: string
+          description: "Mirror of the instance.state column on the per-app-detail recent-wakes table."
+        at:
+          type: string
+          format: date-time
+          description: "RFC3339 UTC timestamp of the wake."
+        trigger:
+          type: string
+          description: "Closed-enum trigger that admitted the wake (manual.cron / manual.api / scheduled.idle / …). Empty/absent on pre-PR-A fleet rows."
+        queued_count:
+          type: integer
+          format: int32
+          description: "ledger.Concurrency at admit. 0 when absent."
+        concurrency_at_admit:
+          type: integer
+          format: int32
+          description: "Same reading; 0 is the cold-start case."
+        at_capacity:
+          type: boolean
+          description: "True when admitted at the plan's per-app MaxConcurrency ceiling. Only meaningful when at_capacity_present is true."
+        at_capacity_present:
+          type: boolean
+          description: "True when the at_capacity key was in jsonb; false = absent (pre-PR-A fleet). The dashboard renders em-dash when false."
+        ready_in_ms:
+          type: integer
+          format: int32
+          description: "Wall-clock boot_started → boot_completed delta in ms. -1 when still booting or rejected. 0 is impossible (a 0ms wake would round to a positive integer)."
+
+    AppWakeTimelineResponse:
+      description: |
+        JSON mirror of the dashboard per-app wake-timeline page.
+        Plan-gated Hobby+ (same code as /v1/apps/{slug}/metrics:
+        plan_per_app_metrics_not_allowed).
+
+        `trigger_histogram` is a JSON object (map[string]int) — empty
+        `{}` on a fresh app, never null. The dashboard SPA must
+        treat missing keys as 0 (JSON.parse() returns undefined for
+        missing keys, not 0 — the render code adds the explicit
+        `?? 0` fallback).
+
+        `at_capacity_pct` is the share of `wake_count_with_meta`
+        rows where the events.wake.boot_started join succeeded AND
+        the at_capacity flag is true. Pre-PR-A fleet rows
+        contribute to `wake_count_24h` but not the denominator.
+      type: object
+      required: [app, wake_count_24h, wake_count_with_meta, at_capacity_count, at_capacity_pct, trigger_histogram, rows, as_of]
+      properties:
+        app: { $ref: '#/components/schemas/WakeTimelineApp' }
+        wake_count_24h:
+          type: integer
+          description: "Number of instance rows in the trailing 24h window (after the descending-cutoff break)."
+        wake_count_with_meta:
+          type: integer
+          description: "Denominator for at_capacity_pct — count of rows where the events.wake.boot_started LEFT JOIN succeeded."
+        at_capacity_count:
+          type: integer
+          description: "Numerator for at_capacity_pct."
+        at_capacity_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of meta-bearing rows admitted at the per-app MaxConcurrency ceiling."
+        trigger_histogram:
+          type: object
+          additionalProperties: { type: integer }
+          description: "trigger → N count of WakeBootMeta.Trigger values across the meta-bearing rows. Empty {} on a fresh app, never null."
+        rows:
+          type: array
+          description: "Wake rows in DESC StartedAt order, truncated at the 24h cutoff (descending-cutoff break)."
+          items: { $ref: '#/components/schemas/WakeTimelineJSONRow' }
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC timestamp marking the JSON envelope's authoritative 'as of' instant."
 
     AppSLOResponse:
       description: |
