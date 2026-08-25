@@ -2894,6 +2894,29 @@ type AuditLogFilter struct {
 	// the handler to the over-read constant; a zero value means
 	// "store default" (the operator endpoint passes a sane cap).
 	Limit int
+	// ActorEmail, when set, restricts to rows whose
+	// account_email column matches exactly (case-sensitive).
+	// Operator-only filter — the customer endpoint does not
+	// expose this. Added in P4 of the operator-side
+	// observability mega-PR (Commit 6). Empty pointer = no
+	// constraint.
+	ActorEmail *string
+	// OperatorOnly, when true, restricts to rows whose kind
+	// starts with "operator.action." (the operator action
+	// vocabulary adopted in Commit 3). Equivalent to setting
+	// KindPrefix="operator.action." but with the dedicated
+	// query-param `?operator_only=true` so the operator
+	// dashboard's filter chip strip can render a single
+	// boolean toggle. Mutually exclusive with a non-empty
+	// KindPrefix at the handler layer.
+	OperatorOnly bool
+	// TargetAccountID, when set, restricts to rows whose
+	// data->>'target_account_id' matches. The data column is
+	// JSONB; the query uses the containment operator
+	// (@> jsonb_build_object('target_account_id', $N)) so the
+	// GIN index on data (verified at PR-open) is used.
+	// Operator-only filter. Empty pointer = no constraint.
+	TargetAccountID *string
 }
 
 // AuditLogKindAccountDeleted is the canonical kind value emitted into

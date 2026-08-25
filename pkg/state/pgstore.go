@@ -17517,6 +17517,27 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 		sinceParam = nil
 	}
 
+	// OperatorOnly takes precedence over KindPrefix at the SQL
+	// layer: it forces kind like 'operator.action.%'. The
+	// handler layer enforces mutual exclusivity (returns 400
+	// when both are set); the SQL is defensive — a stray
+	// KindPrefix with OperatorOnly=true would be ignored.
+	kindPrefix := filter.KindPrefix
+	if filter.OperatorOnly {
+		kindPrefix = "operator.action."
+	}
+
+	// Build the actor_email + target_account_id params. Both are
+	// optional; the SQL uses ($N::text is null or ...) so an
+	// empty pointer is a no-op.
+	var actorEmailParam, targetAccountIDParam interface{}
+	if filter.ActorEmail != nil {
+		actorEmailParam = *filter.ActorEmail
+	}
+	if filter.TargetAccountID != nil {
+		targetAccountIDParam = *filter.TargetAccountID
+	}
+
 	rows, err := s.pool.Query(ctx,
 		`select id, kind, account_id, account_email, actor, received_at, data
 		   from audit_log
@@ -17524,12 +17545,16 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 		    and ($2 = '' or kind like $2 || '%')
 		    and ($3::timestamptz is null or received_at >= $3::timestamptz)
 		    and ($4::bool or account_id is not null)
+		    and ($5::text is null or account_email = $5::text)
+		    and ($6::text is null or data @> jsonb_build_object('target_account_id', $6::text))
 		  order by received_at desc, id desc
-		  limit $5`,
+		  limit $7`,
 		filter.AccountID,
-		filter.KindPrefix,
+		kindPrefix,
 		sinceParam,
 		filter.IncludeAnonymous,
+		actorEmailParam,
+		targetAccountIDParam,
 		limit,
 	)
 	if err != nil {

@@ -8711,6 +8711,12 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 	if limit <= 0 {
 		limit = 100
 	}
+	// OperatorOnly takes precedence over KindPrefix at the SQL
+	// layer (pgstore) and is mirrored here for shape parity.
+	kindPrefix := filter.KindPrefix
+	if filter.OperatorOnly {
+		kindPrefix = "operator.action."
+	}
 	var out []AuditLog
 	for i := len(m.auditLog) - 1; i >= 0; i-- {
 		row := m.auditLog[i]
@@ -8719,7 +8725,7 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 				continue
 			}
 		}
-		if filter.KindPrefix != "" && !strings.HasPrefix(row.Kind, filter.KindPrefix) {
+		if kindPrefix != "" && !strings.HasPrefix(row.Kind, kindPrefix) {
 			continue
 		}
 		if !filter.Since.IsZero() && row.ReceivedAt.Before(filter.Since) {
@@ -8727,6 +8733,18 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 		}
 		if !filter.IncludeAnonymous && row.AccountID == nil {
 			continue
+		}
+		if filter.ActorEmail != nil && row.AccountEmail != *filter.ActorEmail {
+			continue
+		}
+		if filter.TargetAccountID != nil {
+			// data @> jsonb_build_object('target_account_id', $N)
+			// semantic — the data JSON must contain the key with
+			// the requested value. We decode row.Data on the
+			// in-memory path; the pgstore path is index-driven.
+			if !auditLogDataHasKey(row.Data, "target_account_id", *filter.TargetAccountID) {
+				continue
+			}
 		}
 		// Defensive copy so the caller's slice doesn't alias the
 		// in-memory store row.
@@ -8740,6 +8758,30 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 		}
 	}
 	return out, nil
+}
+
+// auditLogDataHasKey is the in-memory twin of the pgstore's
+// data @> jsonb_build_object(...) containment query. Returns true
+// when the JSONB-shaped row.Data contains the (key, value) pair.
+// Returns false on any parse error — a malformed data column is
+// treated as "doesn't contain the key", which is the same
+// behaviour the pgstore path has (the row is excluded from the
+// result set when its data->>'target_account_id' is null or
+// different).
+func auditLogDataHasKey(data json.RawMessage, key, want string) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return false
+	}
+	got, ok := m[key]
+	if !ok {
+		return false
+	}
+	s, ok := got.(string)
+	return ok && s == want
 }
 
 // ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the

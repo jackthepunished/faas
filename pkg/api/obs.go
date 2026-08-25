@@ -400,6 +400,11 @@ type ObsRateLimitResponse struct {
 // IncludeAnonymous is the effective value (caller's request, not the
 // server's default) so the operator UI can render "anonymous rows
 // surfacing" without a second round-trip.
+//
+// ActorEmail / OperatorOnly / TargetAccountID echo the three new
+// P4 filters (Commit 6 of the operator-side observability
+// mega-PR) so the operator UI can re-render the filter chip
+// strip without a second round-trip.
 type ObsAuditLogSearchResponse struct {
 	GeneratedAt      time.Time        `json:"generated_at"`
 	Items            []ObsAuditLogRow `json:"items"`
@@ -408,6 +413,9 @@ type ObsAuditLogSearchResponse struct {
 	WindowHours      int              `json:"window_hours"`
 	KindPrefix       string           `json:"kind_prefix,omitempty"`
 	AccountID        string           `json:"account_id,omitempty"`
+	ActorEmail       string           `json:"actor_email,omitempty"`
+	OperatorOnly     bool             `json:"operator_only,omitempty"`
+	TargetAccountID  string           `json:"target_account_id,omitempty"`
 }
 
 // ObsAuditLogRow is one row of the audit-log search. The fields are
@@ -416,14 +424,21 @@ type ObsAuditLogSearchResponse struct {
 // (empty for anonymous rows), and Data is the verbatim JSON payload.
 // The grep tests in handlers_admin_obs_pr3_security_test.go pin the
 // omission of any caller-side redaction; this struct IS the wire shape.
+//
+// IsOperatorAction is a derived field (Commit 6 / P4) — true
+// when Kind has the "operator.action." prefix (the operator
+// action vocabulary adopted in Commit 3). Computed at the
+// handler projection so the operator dashboard can badge the
+// row without re-deriving the prefix on every render.
 type ObsAuditLogRow struct {
-	ID           string          `json:"id"`
-	Kind         string          `json:"kind"`
-	AccountID    string          `json:"account_id,omitempty"`
-	AccountEmail string          `json:"account_email,omitempty"`
-	Actor        string          `json:"actor,omitempty"`
-	ReceivedAt   time.Time       `json:"received_at"`
-	Data         json.RawMessage `json:"data,omitempty"`
+	ID               string          `json:"id"`
+	Kind             string          `json:"kind"`
+	AccountID        string          `json:"account_id,omitempty"`
+	AccountEmail     string          `json:"account_email,omitempty"`
+	Actor            string          `json:"actor,omitempty"`
+	ReceivedAt       time.Time       `json:"received_at"`
+	Data             json.RawMessage `json:"data,omitempty"`
+	IsOperatorAction bool            `json:"is_operator_action"`
 }
 
 // ObsEventListResponse is the body of GET /v1/admin/obs/events
