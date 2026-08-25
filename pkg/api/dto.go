@@ -3295,17 +3295,20 @@ type AppMetricsResponse struct {
 	// schedd recorded for this app in the trailing 24 hours.
 	// Sourced from the events table (count over
 	// kind='wake.boot_started' AND app_id=$1 AND
-	// at >= now() - interval '24 hours'); rides the existing
-	// events_wake_id_idx jsonb expression index from migration
-	// 00114. Best-effort: 0 when Prometheus is degraded, the
-	// events row hasn't been written, or the store query
-	// fails. The customer-facing dashboard surfaces this as
-	// the "wakes today" line item; combined with ColdStartPct
-	// it answers "is my app wake-bound or sleep-bound". The
-	// pre-ADR-123 fleet renders this as 0 because pre-PR-A
-	// boot_started rows carry no app_id field — same posture
-	// as the wake-timeline view's `WakeCountWithMeta`
-	// denominator at cmd/apid/handlers_dashboard.go:2659.
+	// at >= now() - interval '24 hours'). The (data->>'app_id')
+	// predicate is NOT covered by the existing events_wake_id_idx
+	// jsonb expression index (migration 00114 indexes
+	// data->>'wake_id'); on a Scale-tier app with a large fleet
+	// the underlying query can seq-scan + jsonb-cast per row.
+	// Best-effort: 0 when Prometheus is degraded, the events
+	// row hasn't been written, or the store query fails. The
+	// customer-facing dashboard surfaces this as the "wakes
+	// today" line item; combined with ColdStartPct it answers
+	// "is my app wake-bound or sleep-bound". The pre-ADR-123
+	// fleet renders this as 0 because pre-PR-A boot_started
+	// rows carry no app_id field — same posture as the
+	// wake-timeline view's `WakeCountWithMeta` denominator at
+	// cmd/apid/handlers_dashboard.go:2659.
 	Wakes24h int64 `json:"wakes_24h,omitempty"`
 
 	// CacheHitRatePct is the share of cache-eligible requests

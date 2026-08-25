@@ -1306,29 +1306,27 @@ select count(*) from triggers t
 join apps a on a.id = t.app_id
 where a.account_id = $1 and a.status <> 'deleted';
 
--- name: CountWakeBootStarted24h :one
--- Per-app wake count for the trailing 24 hours, sourced from the
--- `events` table (kind='wake.boot_started' with app_id stored in
--- the jsonb `data->>'app_id'` payload). Rides the existing
--- events_wake_id_idx jsonb expression index from migration
--- 00114 (the boot_started rows are emitted by schedd via
--- pkg/sched/engine.go:2032 and indexed on data->>'wake_id'; the
--- app_id filter is a runtime cast against the same payload
--- jsonb, so the planner can satisfy the predicate from the
--- existing index without a sequential scan). Used by
--- cmd/apid/handlers_metrics.go to populate the
--- AppMetricsResponse.Wakes24h field on the customer-facing
--- per-app dashboard (Free is gated off; Hobby/Pro/Scale
--- only — see pkg/api/limits.go::PerAppMetricsAllowed). Returns
--- 0 on an empty app, a degraded Prometheus run, or when the
--- events table predates the post-ADR-123 schema (pre-ADR-123
--- boot_started rows carry no app_id field, so the cast returns
--- NULL which COUNT(*) coerces to 0 — same posture as the
--- wake-timeline view's `WakeCountWithMeta` denominator).
-SELECT COUNT(*) FROM events
-WHERE kind = 'wake.boot_started'
-  AND (data->>'app_id')::uuid = $1
-  AND at >= now() - interval '24 hours';
+-- NOTE: CountWakeBootStarted24h was previously declared here as a sqlc
+-- query binding. Code-review finding on PR #1097 surfaced that the
+-- binding was generated with the wrong parameter shape (it bound
+-- `data []byte` — the whole jsonb row — as $1, comparing a UUID
+-- literal against an arbitrary jsonb blob, which would always
+-- return 0). The canonical implementation lives in pkg/state/pgstore.go
+-- as a hand-written raw-SQL method (Store interface
+-- CountWakeBootStarted24h); that path uses $1::uuid against
+-- (data->>'app_id')::uuid and is the only correct production path.
+--
+-- The previous comment also falsely claimed the existing
+-- events_wake_id_idx jsonb expression index (migration 00114,
+-- on data->>'wake_id') covers the app_id predicate here. It
+-- does NOT — the index key is the wake_id, not the app_id, and
+-- the planner has no way to satisfy `(data->>'app_id')::uuid = $1`
+-- from that index. On a Scale-tier app with a large fleet the
+-- planner will seq-scan the trailing-24h wake.boot_started rows
+-- and re-evaluate the jsonb cast per row. Sub-second claim in
+-- the PR description was therefore wrong. The follow-up
+-- migration adding a covering index on (data->>'app_id', at)
+-- is tracked separately (out of scope for this PR).
 
 -- name: ClaimTriggerRecords :many
 -- FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks

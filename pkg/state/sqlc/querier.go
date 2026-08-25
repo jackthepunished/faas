@@ -79,14 +79,13 @@ type Querier interface {
 	// existing index without a sequential scan). Used by
 	// cmd/apid/handlers_metrics.go to populate the
 	// AppMetricsResponse.Wakes24h field on the customer-facing
-	// per-app dashboard (Free is gated off; Hobby/Pro/Scale
-	// only — see pkg/api/limits.go::PerAppMetricsAllowed). Returns
-	// 0 on an empty app, a degraded Prometheus run, or when the
-	// events table predates the post-ADR-123 schema (pre-ADR-123
-	// boot_started rows carry no app_id field, so the cast returns
-	// NULL which COUNT(*) coerces to 0 — same posture as the
-	// wake-timeline view's `WakeCountWithMeta` denominator).
-	CountWakeBootStarted24h(ctx context.Context, db DBTX, data []byte) (int64, error)
+	// NOTE: CountWakeBootStarted24h was previously declared here on
+	// the Querier interface but the binding was generated with a
+	// broken parameter shape. The canonical implementation lives in
+	// pkg/state/pgstore.go and the Store interface (CountWakeBootStarted24h
+	// method, app_id string parameter). See pkg/state/queries.sql for
+	// the matching rationale comment.
+
 	// scopes is $4 (text[]). The handler is responsible for validating the
 	// scope vocabulary; the store does not. See ADR-034 rev2.
 	CreateAPIKey(ctx context.Context, db DBTX, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)

@@ -86,9 +86,12 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 	// not flip the whole response to degraded.
 
 	// Wakes24h: count of wake.boot_started events in the trailing
-	// 24 hours, sourced from the events table. Rides the existing
-	// events_wake_id_idx jsonb expression index from migration
-	// 00114 — sub-second on a healthy app. 0 on a degraded store
+	// 24 hours, sourced from the events table. The (data->>'app_id')
+	// predicate is NOT covered by events_wake_id_idx (migration 00114
+	// indexes data->>'wake_id'); on a Scale-tier app with a large
+	// fleet this can seq-scan + jsonb-cast per row. A follow-up
+	// migration adds a covering index — see the Store interface
+	// comment for CountWakeBootStarted24h. 0 on a degraded store
 	// call, an empty app, or pre-ADR-123 fleet (pre-PR-A
 	// boot_started rows carry no app_id field, so the cast
 	// returns NULL which COUNT(*) coerces to 0).
