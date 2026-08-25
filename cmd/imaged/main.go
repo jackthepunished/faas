@@ -277,6 +277,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// files/faas.rules.yml depend on imaged_oci_pull_duration_seconds
 	// being live, not empty.)
 	ops := wire.NewOpsMetrics("imaged")
+	wire.BootStamps(ctx, "imaged", ops)
 	wire.RegisterDefaultOps(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer onto the
 	// daemon's *wire.OpsMetrics so stale-fallback serves emit

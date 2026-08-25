@@ -185,6 +185,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// it once (not inline in the /metrics block) is what makes the build
 	// series real rather than a throwaway (ADR-030).
 	ops := wire.NewOpsMetrics("builderd")
+	wire.BootStamps(ctx, "builderd", ops)
 	wire.RegisterDefaultOps(ops)
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// so markSucceeded / markFailed emit

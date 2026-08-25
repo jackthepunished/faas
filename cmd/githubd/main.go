@@ -153,6 +153,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cross-process shared state).
 	store := state.NewPgStore(pool)
 	ops := wire.NewOpsMetrics("githubd")
+	wire.BootStamps(ctx, "githubd", ops)
+	wire.RegisterDefaultOps(ops)
 	ghAud := audit.New(store, log, ops, "githubd")
 	ghReconcile := buildGithubdReconcileService(store, ghAud, log)
 

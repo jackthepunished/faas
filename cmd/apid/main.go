@@ -1155,6 +1155,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Built unconditionally so /metrics works even with FAAS_APID_METRICS_ADDR
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
+	wire.BootStamps(ctx, "apid", ops)
 	wire.RegisterDefaultOps(ops)
 	srv.WithOpsMetrics(ctx, ops)
 
