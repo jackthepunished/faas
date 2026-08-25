@@ -43,6 +43,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -100,6 +101,12 @@ type pkiFlags struct {
 	rootDir string
 	force   bool
 	daemon  string
+	// nodeCN and transportSAN are used when a compute-only box is
+	// provisioned from operator-owned PKI material. vmmd's leaves use
+	// nodeCN as their verifier identity while every selected leaf gets
+	// transportSAN for endpoint validation.
+	nodeCN       string
+	transportSAN string
 	// boxRole selects the per-box PKI subset (Gate-B PR-3). Empty
 	// preserves the pre-Gate-B posture of issuing every leaf from
 	// pkg/pki.Roles() — that's the canonical single-box dev/lima
@@ -127,6 +134,10 @@ func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
 		"rotate only the leaves in this directory (rotate path; e.g. --daemon egress to reissue just the egress server + meterd client leaves)")
 	fs.StringVar(&f.boxRole, "box-role", "",
 		"per-box PKI subset (Gate-B PR-3): '', 'single-box' = full Roles(); 'control-plane' = fsn-1 leaves; 'compute-only' = fsn-2 leaves")
+	fs.StringVar(&f.nodeCN, "cn", "",
+		"compute node identity for vmmd leaves (compute-only; .faas is appended when omitted)")
+	fs.StringVar(&f.transportSAN, "transport-san", "",
+		"private DNS name or IP to add to every selected leaf (for example fsn-3.gregale.dev)")
 	// --json is wired in the leaf-specific cmd functions so the
 	// help text is colocated with the per-leaf intent; the
 	// newPKIFlags helper is shared by the destructive leaves
@@ -147,11 +158,15 @@ func cmdPKIInit(args []string) int {
 		PrintUsage(os.Stderr, "usage: gregalectl pki init [flags]", "pki")
 		return 1
 	}
+	identity, err := pkiIdentity(f)
+	if err != nil {
+		return printErr("pki init: identity", err)
+	}
 	caCert, caKey, err := pki.EnsureCA(f.rootDir, f.force)
 	if err != nil {
 		return printErr("pki init: ensure CA", err)
 	}
-	written, skipped, errs := ensureAllLeaves(f.rootDir, caCert, caKey, f.force, f.boxRole)
+	written, skipped, errs := ensureAllLeavesWithIdentity(f.rootDir, caCert, caKey, f.force, f.boxRole, identity.nodeCN, identity.transportSAN)
 	for _, e := range errs {
 		fmt.Fprintf(os.Stderr, "  ! %v\n", e)
 	}
@@ -213,6 +228,10 @@ func cmdPKIRotate(args []string) int {
 		PrintUsage(os.Stderr, "usage: gregalectl pki rotate [flags]", "pki")
 		return 1
 	}
+	identity, err := pkiIdentity(f)
+	if err != nil {
+		return printErr("pki rotate: identity", err)
+	}
 	// Rotate is destructive on the leaves; the CA is preserved unless
 	// the operator also passes --rotate-ca (out of scope for slice 2;
 	// see ADR-052 §Risks). We pass force=false to EnsureCA so a
@@ -222,7 +241,7 @@ func cmdPKIRotate(args []string) int {
 	if err != nil {
 		return printErr("pki rotate: ensure CA", err)
 	}
-	written, _, errs := ensureAllLeavesFiltered(f.rootDir, caCert, caKey, true, f.daemon, f.boxRole)
+	written, _, errs := ensureAllLeavesFilteredWithIdentity(f.rootDir, caCert, caKey, true, f.daemon, f.boxRole, identity.nodeCN, identity.transportSAN)
 	for _, e := range errs {
 		fmt.Fprintf(os.Stderr, "  ! %v\n", e)
 	}
@@ -286,22 +305,41 @@ func rotateRestartHint(daemon string) string {
 		"   Other daemons (gatewayd-internal, meterd, githubd, builderd): systemctl reload faas-<daemon>  # PR-E rotation deferred to Tier A10"
 }
 
-// ensureAllLeaves iterates the role set returned by
-// pki.RolesForBox(boxRole) (or pki.Roles() when boxRole=="") and
-// ensures each leaf is present. Returns the count of freshly-written
-// leaves, the count of leaves skipped (NotAfter > ReissueThreshold),
-// and a slice of per-leaf errors (the caller decides whether the
-// aggregate counts as success).
-//
-// boxRole is the Gate-B PR-3 per-box PKI subset selector; passing ""
-// preserves the pre-Gate-B posture (every leaf for every daemon,
-// which is the canonical single-box dev/lima shape).
-func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, boxRole string) (int, int, []error) {
+type pkiIdentityOptions struct {
+	nodeCN       string
+	transportSAN pki.AltNames
+}
+
+func pkiIdentity(f *pkiFlags) (pkiIdentityOptions, error) {
+	identity := pkiIdentityOptions{}
+	if f.nodeCN == "" && f.transportSAN == "" {
+		return identity, nil
+	}
+	if f.boxRole != "compute-only" {
+		return identity, errors.New("--cn/--transport-san require --box-role=compute-only")
+	}
+	if raw := strings.TrimSpace(f.nodeCN); raw != "" {
+		identity.nodeCN = raw
+		if !strings.HasSuffix(identity.nodeCN, ".faas") {
+			identity.nodeCN += ".faas"
+		}
+	}
+	if raw := strings.TrimSpace(f.transportSAN); raw != "" {
+		if ip := net.ParseIP(raw); ip != nil {
+			identity.transportSAN.IPAddresses = []net.IP{ip}
+		} else {
+			identity.transportSAN.DNSNames = []string{raw}
+		}
+	}
+	return identity, nil
+}
+
+func ensureAllLeavesWithIdentity(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, boxRole, nodeCN string, extraSANs pki.AltNames) (int, int, []error) {
 	roles := pki.RolesForBox(boxRole)
 	var written, skipped int
 	var errs []error
 	for _, role := range roles {
-		err := pki.EnsureLeaf(rootDir, role, caCert, caKey, force)
+		err := ensureLeafWithIdentity(rootDir, role, caCert, caKey, force, nodeCN, extraSANs)
 		switch {
 		case err == nil:
 			written++
@@ -314,9 +352,8 @@ func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.Priv
 	return written, skipped, errs
 }
 
-// ensureAllLeavesFiltered is ensureAllLeaves with an optional --daemon
-// scope. daemon="" iterates every role (delegates to ensureAllLeaves);
-// daemon="<dir>" matches role.Directory == dir PLUS one cross-directory
+// ensureAllLeavesFilteredWithIdentity iterates every role, with an optional
+// --daemon scope. daemon="<dir>" matches role.Directory == dir PLUS one cross-directory
 // carve-out for the egress pair: when daemon=="egress", the meterd
 // client leaf (Directory=meterd, Filename=egress-client) is also
 // included because the egress server's CN (egress.faas) is paired with
@@ -329,9 +366,9 @@ func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.Priv
 // the per-box filter are eligible for the --daemon narrowing; this is
 // how `gregalectl pki rotate --box-role=compute-only --daemon=imaged`
 // would only rotate the imaged server leaf on fsn-2.
-func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon string, boxRole string) (int, int, []error) {
+func ensureAllLeavesFilteredWithIdentity(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon, boxRole, nodeCN string, extraSANs pki.AltNames) (int, int, []error) {
 	if daemon == "" {
-		return ensureAllLeaves(rootDir, caCert, caKey, force, boxRole)
+		return ensureAllLeavesWithIdentity(rootDir, caCert, caKey, force, boxRole, nodeCN, extraSANs)
 	}
 	roles := pki.RolesForBox(boxRole)
 	var written, skipped int
@@ -340,7 +377,7 @@ func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ec
 		if !roleMatchesDaemon(role, daemon) {
 			continue
 		}
-		err := pki.EnsureLeaf(rootDir, role, caCert, caKey, force)
+		err := ensureLeafWithIdentity(rootDir, role, caCert, caKey, force, nodeCN, extraSANs)
 		switch {
 		case err == nil:
 			written++
@@ -351,6 +388,16 @@ func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ec
 		}
 	}
 	return written, skipped, errs
+}
+
+func ensureLeafWithIdentity(rootDir string, role pki.Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, nodeCN string, extraSANs pki.AltNames) error {
+	if nodeCN != "" && role.Directory == "vmmd" {
+		return pki.EnsureLeafWithCNAndSANs(rootDir, role, nodeCN, caCert, caKey, force, extraSANs)
+	}
+	if len(extraSANs.DNSNames) != 0 || len(extraSANs.IPAddresses) != 0 {
+		return pki.EnsureLeafWithSANs(rootDir, role, caCert, caKey, force, extraSANs)
+	}
+	return pki.EnsureLeaf(rootDir, role, caCert, caKey, force)
 }
 
 // roleMatchesDaemon returns true if role belongs to daemon. The

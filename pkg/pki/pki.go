@@ -31,6 +31,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -397,6 +398,28 @@ func EnsureLeaf(rootDir string, role Role, caCert *x509.Certificate, caKey *ecds
 // A fresh SAN is treated as drift: a still-valid certificate that lacks
 // one of the requested names is re-issued even when force is false.
 func EnsureLeafWithSANs(rootDir string, role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
+	return ensureLeafWithIdentity(rootDir, role, "", caCert, caKey, force, extraSANs)
+}
+
+// EnsureLeafWithCNAndSANs is the host-identity variant of
+// EnsureLeafWithSANs. Compute-node vmmd leaves use the node's registered
+// identity (for example, fsn-3.faas) as their Subject CN so the handshake
+// verifier can bind the certificate to the compute_nodes row. The role's
+// daemon SANs remain present, so the same leaf still works for TLS endpoint
+// verification against vmmd.faas and the host's private transport name.
+//
+// This is intentionally separate from EnsureLeafWithSANs: most daemon leaves
+// must retain their fixed role CN, while only a node-identity leaf should be
+// overridden by topology-aware provisioning.
+func EnsureLeafWithCNAndSANs(rootDir string, role Role, commonName string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
+	commonName = strings.TrimSpace(commonName)
+	if commonName == "" {
+		return errors.New("pki: node leaf common name is empty")
+	}
+	return ensureLeafWithIdentity(rootDir, role, commonName, caCert, caKey, force, extraSANs)
+}
+
+func ensureLeafWithIdentity(rootDir string, role Role, commonName string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
 	certPath, keyPath := LeafPaths(rootDir, role)
 
 	if !force {
@@ -404,11 +427,18 @@ func EnsureLeafWithSANs(rootDir string, role Role, caCert *x509.Certificate, caK
 		if err != nil {
 			return err
 		}
-		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold && certificateHasSANs(existing, extraSANs) {
+		expectedCN := role.CommonName
+		if commonName != "" {
+			expectedCN = commonName
+		}
+		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold && existing.Subject.CommonName == expectedCN && certificateHasSANs(existing, extraSANs) {
 			return ErrLeafNotExpiringSoon
 		}
 	}
 
+	if commonName != "" {
+		role.CommonName = commonName
+	}
 	role.AltNames = mergeAltNames(role.AltNames, extraSANs)
 	certPEM, keyPEM, err := generateLeaf(role, caCert, caKey)
 	if err != nil {

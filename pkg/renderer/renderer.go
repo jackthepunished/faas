@@ -300,9 +300,9 @@ func render(opts RenderOptions) (RenderReport, error) {
 	if !opts.DryRun {
 		var leafOutputs []PKIOutput
 		if opts.PKITrustOnly {
-			leafOutputs, err = renderPKITrustOnly(opts.PKIRootDir, host.Role, extraSANs)
+			leafOutputs, err = renderPKITrustOnly(opts.PKIRootDir, host.Name, host.Role, extraSANs)
 		} else {
-			leafOutputs, err = renderPKI(opts.PKIRootDir, host.Role, extraSANs)
+			leafOutputs, err = renderPKI(opts.PKIRootDir, host.Name, host.Role, extraSANs)
 		}
 		if err != nil {
 			return report, err

@@ -46,6 +46,29 @@ import (
 	"github.com/onebox-faas/faas/pkg/pki"
 )
 
+func TestPKIIdentityCanonicalizesComputeNodeAndTransportSAN(t *testing.T) {
+	identity, err := pkiIdentity(&pkiFlags{
+		boxRole:      "compute-only",
+		nodeCN:       "fsn-3",
+		transportSAN: "fsn-3.gregale.dev",
+	})
+	if err != nil {
+		t.Fatalf("pkiIdentity: %v", err)
+	}
+	if identity.nodeCN != "fsn-3.faas" {
+		t.Fatalf("node CN = %q, want fsn-3.faas", identity.nodeCN)
+	}
+	if len(identity.transportSAN.DNSNames) != 1 || identity.transportSAN.DNSNames[0] != "fsn-3.gregale.dev" {
+		t.Fatalf("transport SAN = %#v, want fsn-3.gregale.dev", identity.transportSAN)
+	}
+}
+
+func TestPKIIdentityRejectsNodeIdentityOnControlPlane(t *testing.T) {
+	if _, err := pkiIdentity(&pkiFlags{boxRole: "control-plane", nodeCN: "fsn-1"}); err == nil {
+		t.Fatal("pkiIdentity accepted a compute node identity on control-plane")
+	}
+}
+
 // captureOsStdoutPKI swaps the package-level osStdout for a buffer
 // and returns a restore closure. Local to this file so we can grow
 // the buffer type independently from the sign_keys + host_age

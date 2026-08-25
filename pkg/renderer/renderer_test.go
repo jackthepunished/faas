@@ -199,6 +199,9 @@ func TestRenderer_ComputePKIIncludesPrivateEndpointSAN(t *testing.T) {
 	if !containsString(cert.DNSNames, "vmmd.faas") || !containsString(cert.DNSNames, "fsn-2.gregale.dev") {
 		t.Fatalf("vmmd server SANs = %v, want role and endpoint identities", cert.DNSNames)
 	}
+	if cert.Subject.CommonName != "fsn-2.faas" {
+		t.Fatalf("vmmd server CN = %q, want fsn-2.faas", cert.Subject.CommonName)
+	}
 }
 
 func TestRenderer_PKITrustOnlyDoesNotRequireCAKey(t *testing.T) {
