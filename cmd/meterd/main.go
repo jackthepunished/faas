@@ -1019,7 +1019,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// cmd/meterd/readiness.go). Stale tick names surface in
 		// the body reason when the probe is 503. /healthz stays
 		// the rich-JSON path for dashboards.
-		wire.ControlMuxLite(mux, meterdProbe.ReadyFunc(), meterdProbe.ReasonFunc())
+		wire.ControlReadyMuxLite(mux, meterdProbe.ReadyFunc(), meterdProbe.ReasonFunc())
 		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
 		srv, err := deps.metricsListenAndServe(cfg.MetricsAddr, mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
 		if err != nil {

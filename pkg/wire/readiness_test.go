@@ -383,6 +383,26 @@ func TestControlMuxLite_HealthzReturns200(t *testing.T) {
 	}
 }
 
+func TestControlReadyMuxLite_PreservesExistingHealthz(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	wire.ControlReadyMuxLite(mux, nil, nil)
+
+	healthz := httptest.NewRecorder()
+	mux.ServeHTTP(healthz, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if healthz.Code != http.StatusTeapot {
+		t.Errorf("existing /healthz code = %d, want %d", healthz.Code, http.StatusTeapot)
+	}
+
+	readyz := httptest.NewRecorder()
+	mux.ServeHTTP(readyz, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if readyz.Code != http.StatusOK || readyz.Body.String() != "ready" {
+		t.Errorf("/readyz = %d %q, want 200 ready", readyz.Code, readyz.Body.String())
+	}
+}
+
 func TestControlMuxLite_ReadyzReturns200(t *testing.T) {
 	mux := http.NewServeMux()
 	wire.ControlMuxLite(mux, func() bool { return true }, nil)

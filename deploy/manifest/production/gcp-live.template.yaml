@@ -2,7 +2,7 @@
 #
 # This is the deployment-specific counterpart to
 # deploy/manifest/examples/splitbox.example.yaml. It records the stable
-# private-DNS names and immutable release tuple for the three-node GCP fleet.
+# private-DNS names and immutable topology for the three-node GCP fleet.
 # `fsn-1.gregale.dev`, `fsn-2.gregale.dev`, and `fsn-3.gregale.dev` must resolve through the
 # operator's private/split-horizon DNS to the fleet's routable private
 # addresses; they must not be published as public Cloudflare records.
@@ -14,9 +14,11 @@
 # gate rejects RFC1918 ranges; the private transport names remain the source
 # of truth for node-to-node control traffic.
 #
-# The release tuple is pinned to the merged main commit that will be tagged
-# for the next signed pre-1.0 release. Do not change the bytes after hashing
-# them for GREGALE_RELEASE_MANIFEST_HASH.
+# The release identity below is a schema-valid template value. Release CI
+# materializes a final manifest with the tag commit and publishes that exact
+# file beside the signed bundle. Do not hand-edit release.git_sha for a
+# release; change topology here and let the release workflow derive the
+# release identity and manifest hash.
 
 schema_version: "1.0.0"
 
@@ -128,8 +130,8 @@ postgresql:
   policy: on-boot
 
 release:
-  id: pre-1.0-2ca06699
-  git_sha: 2ca066992ce361782c3fa0a88fa3a137dfda2291
+  id: pre-1.0-template
+  git_sha: 0000000000000000000000000000000000000000
   architecture: x86_64
   firecracker_version: 1.7.0
   firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419

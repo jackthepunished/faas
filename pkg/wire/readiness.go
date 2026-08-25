@@ -31,6 +31,8 @@
 //     (200 ready / 503 not-ready:<reason>) on an existing
 //     http.ServeMux. Lighter than gateway.ControlMux (no drain
 //     wrapping, no separate metrics registry).
+//   - ControlReadyMuxLite: registers only /readyz, for daemons
+//     that own a richer /healthz response on the same mux.
 //
 // RunAndShutdown lives in runandshutdown.go (commit 11) — the drain
 // helper is logically separate from the probe-fan-in shape and
@@ -479,17 +481,28 @@ func ControlMuxLite(mux *http.ServeMux, readyFunc ReadyFunc, reasonFunc func() s
 	if mux == nil {
 		return
 	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	ControlReadyMuxLite(mux, readyFunc, reasonFunc)
+}
+
+// ControlReadyMuxLite registers only the daemon-level /readyz endpoint on an
+// existing http.ServeMux. Use this when the caller already owns /healthz and
+// needs to preserve its response shape, such as meterd's rich JSON health
+// report.
+func ControlReadyMuxLite(mux *http.ServeMux, readyFunc ReadyFunc, reasonFunc func() string) {
+	if mux == nil {
+		return
+	}
 	if readyFunc == nil {
 		readyFunc = func() bool { return true }
 	}
 	if reasonFunc == nil {
 		reasonFunc = func() string { return "" }
 	}
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if readyFunc() {
