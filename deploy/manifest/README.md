@@ -10,17 +10,19 @@ CI gate both consume this directory's contents.
 - `examples/splitbox.example.yaml` — canonical split-box example
   (one control-plane host + one compute-only host). Load it with
   `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
-- `production/gcp-live.yaml` — deployment-specific manifest for the current
-  two-node fleet. Its private names, overlay network, and release tuple are
-  fleet-specific; its provider-neutral `private_dns: managed_hosts` adapter
-  derives private addresses from Ansible host facts and its hash must be
-  computed before a release.
+- `production/gcp-live.template.yaml` — deployment-specific topology template
+  for the GCP fleet. Its private names and overlay network are fleet-specific;
+  its provider-neutral `private_dns: managed_hosts` adapter derives private
+  addresses from Ansible host facts. Release CI materializes the release tuple
+  and publishes the final `production-manifest.yaml` beside the signed bundle.
 
 ## Layout
 
 ```
 deploy/manifest/
 ├── README.md           (this file)
+├── production/
+│   └── gcp-live.template.yaml
 └── examples/
     └── splitbox.example.yaml
 ```

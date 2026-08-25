@@ -75,7 +75,7 @@ Run a plan first:
 
 ```text
 gregalectl deploy join-node \
-  --manifest-file deploy/manifest/production/gcp-live.yaml \
+  --manifest-file /secure/fleet/production-manifest.yaml \
   --node fsn-3 \
   --ssh-host 203.0.113.27 \
   --dry-run

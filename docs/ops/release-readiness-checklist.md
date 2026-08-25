@@ -12,28 +12,19 @@ This document defines the authoritative checklist and operational runbook for cu
 ## Pre-Release Gates & Manifest Anchoring
 
 ### Step 1: Run Automated Pre-Release Verification
-Run the pre-release automated gate from the repository root:
+Run the pre-release automated gate from the repository root. It materializes
+the production manifest automatically from the topology template:
 ```bash
-./scripts/pre-release-check.sh deploy/manifest/production/gcp-live.yaml
+./scripts/pre-release-check.sh
 ```
 This script asserts:
 - Manifest schema validity via `gregalectl manifest validate`.
-- Commit SHA alignment between `git HEAD` and `gcp-live.yaml`.
+- The generated release identity matches the current commit.
 - Clean execution of all unit tests (`./pkg/...`, `./cmd/...`, `./guest/...`).
 - Successful local build of the canonical daemon tarball.
-- Outputs the exact `GREGALE_RELEASE_MANIFEST_HASH`.
+- Computes the exact manifest hash used by the signed release bundle.
 
-### Step 2: Configure GitHub Repository Variable
-Export the manifest hash and configure it in GitHub repository variables:
-```bash
-# Calculate manifest hash:
-MANIFEST_HASH="sha256:$(sha256sum deploy/manifest/production/gcp-live.yaml | awk '{print $1}')"
-
-# Set GitHub variable:
-gh variable set GREGALE_RELEASE_MANIFEST_HASH --body "$MANIFEST_HASH"
-```
-
-### Step 3: Create and Push the Release Candidate Tag
+### Step 2: Create and Push the Release Candidate Tag
 Tag the approved release commit on `main` and push:
 ```bash
 # Example tag: v0.1.3-rc.1
@@ -41,7 +32,7 @@ git tag -a v0.1.3-rc.1 -m "Release candidate v0.1.3-rc.1"
 git push origin v0.1.3-rc.1
 ```
 
-### Step 4: Monitor CI Build & Signing Pipeline
+### Step 3: Monitor CI Build & Signing Pipeline
 Track the release workflow in GitHub Actions (`.github/workflows/release.yml`):
 - Cross-compilation of `gregale` CLI binaries.
 - Creation of `release.tar.gz` and SPDX SBOM (`release.sbom.json`).
@@ -52,7 +43,7 @@ Track the release workflow in GitHub Actions (`.github/workflows/release.yml`):
 
 ## Fleet Deployment & Installation
 
-### Step 5: Install Release Bundle on Production Nodes
+### Step 4: Install Release Bundle on Production Nodes
 On both `fsn-1` (control-plane) and `fsn-2` (compute-only), install the signed release:
 ```bash
 gregalectl release install \
@@ -62,7 +53,7 @@ gregalectl release install \
   --apply-symlink
 ```
 
-### Step 6: Execute Deep Diagnostic Checks
+### Step 5: Execute Deep Diagnostic Checks
 Verify that the on-disk tree, `release_bundles` table, and `compute_nodes` table are synchronized and healthy:
 ```bash
 # Run local diagnostic:

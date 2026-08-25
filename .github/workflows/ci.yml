@@ -146,6 +146,12 @@ jobs:
       - name: build
         run: make build
 
+      # Release manifests are generated from the production topology
+      # template. Keep the projection deterministic and schema-valid on every
+      # PR so a release tag cannot discover template drift for the first time.
+      - name: release manifest materialization
+        run: bash scripts/materialize-release-manifest_test.sh
+
       # CI quick-wins cluster — wire missing local gates into `test` job.
       # Each target self-documents as "CI gate" in its Makefile comment
       # (Makefile:147 / :184 / :537 / :707) but `make build` (the only

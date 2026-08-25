@@ -6,8 +6,40 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 git_sha=${GIT_SHA:-$(git -C "$repo_root" rev-parse HEAD)}
-manifest_hash=${MANIFEST_HASH:?MANIFEST_HASH must be set to sha256:<64hex>}
 out_dir=${OUT_DIR:-"$repo_root/out"}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "neither sha256sum nor shasum is available" >&2
+    exit 2
+  fi
+}
+
+# Prefer the materialized manifest itself as the source of the hash. The
+# legacy MANIFEST_HASH input remains accepted for local callers, but when
+# both are supplied they must agree. This prevents a release from signing
+# one manifest while publishing a hash for different bytes.
+manifest_file=${MANIFEST_FILE:-}
+if [[ -n "$manifest_file" ]]; then
+  [[ -f "$manifest_file" ]] || {
+    echo "MANIFEST_FILE does not exist: $manifest_file" >&2
+    exit 2
+  }
+  manifest_hash="sha256:$(sha256_file "$manifest_file")"
+  if [[ -n "${MANIFEST_HASH:-}" && "$MANIFEST_HASH" != "$manifest_hash" ]]; then
+    echo "MANIFEST_HASH=$MANIFEST_HASH does not match $manifest_file ($manifest_hash)" >&2
+    exit 2
+  fi
+elif [[ -n "${MANIFEST_HASH:-}" ]]; then
+  manifest_hash=$MANIFEST_HASH
+else
+  echo "set MANIFEST_FILE or MANIFEST_HASH=sha256:<64hex>" >&2
+  exit 2
+fi
 
 case "$git_sha" in
   [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]* ) ;;
