@@ -103,6 +103,13 @@ func (failingStore) AppendEvent(_ context.Context, _, _ string, _ *string, _ []b
 	return errors.New("simulated AppendEvent failure")
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method; the test fixture must override
+// it to keep the failure contract alive.
+func (failingStore) AppendEventWithTrace(_ context.Context, _, _ string, _ *string, _ []byte, _ *string) error {
+	return errors.New("simulated AppendEventWithTrace failure")
+}
+
 // TestAuditEmit_SuccessObservesOkHistogram asserts the success
 // branch observes the AppendEvent latency under result="ok" and
 // does NOT increment the failure counter.

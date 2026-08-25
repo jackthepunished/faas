@@ -250,7 +250,18 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 		subject = accountID
 	}
 	start := time.Now()
-	err = a.store.AppendEvent(ctx, actor, kind, subject, payload)
+	// PR-#TBD / C4 — lift the trace_id off the jsonb payload and
+	// persist it as a column on the events table (migrations/00456).
+	// The OTel-context lift at audit.go:221-232 and the explicit
+	// data["trace_id"] set by C3's schedd subscriber both write
+	// into the same map key, so this extraction captures whichever
+	// source supplied the value. A nil-typed entry (key present,
+	// value nil) is treated as nil.
+	var traceID *string
+	if v, ok := data["trace_id"].(string); ok && v != "" {
+		traceID = &v
+	}
+	err = a.store.AppendEventWithTrace(ctx, actor, kind, subject, payload, traceID)
 	dur := time.Since(start)
 	if a.ops != nil {
 		if err != nil {

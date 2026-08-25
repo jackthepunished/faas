@@ -136,6 +136,14 @@ func (failingStore) AppendEvent(_ context.Context, _, _ string, _ *string, _ []b
 	return errAppendEventBoom
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) delegates to the same
+// failing shim — the audit emit path now calls this method, so
+// the test fixture must override it to keep the failure contract
+// alive.
+func (failingStore) AppendEventWithTrace(_ context.Context, _, _ string, _ *string, _ []byte, _ *string) error {
+	return errAppendEventBoom
+}
+
 // silentLog discards slog output so test runs stay clean.
 func silentLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
