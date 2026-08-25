@@ -81,6 +81,9 @@
     signed_by: /etc/apt/keyrings/grafana.asc
     state: present
     enabled: true
+
+- name: grafana — refresh apt metadata after adding repository
+  ansible.builtin.apt:
     update_cache: true
 
 - name: grafana — pin installed version via /etc/apt/preferences.d

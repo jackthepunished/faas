@@ -9,12 +9,14 @@ import (
 )
 
 // supportBinaryNames are executable files that are not daemons but are
-// required by a running host. They travel with the atomic release because
-// vmmd starts the bridge helpers and the upgrade path invokes gregalectl from
-// the active release tree.
+// required by a running host or by the guest image builder. They travel with
+// the atomic release because vmmd starts the bridge helpers, imaged injects
+// init as the guest PID 1, and the upgrade path invokes gregalectl from the
+// active release tree.
 var supportBinaryNames = []string{
 	"gregale",
 	"gregalectl",
+	"init",
 	"vmmd-raw-bridge",
 	"vmmd-stream-bridge",
 }

@@ -151,7 +151,7 @@ func Render(opts RenderOptions) (RenderReport, error) {
 //  2. /etc/systemd/system/faas-<daemon>.service   (per daemon)
 //  3. /etc/systemd/system/faas-cp.slice     (once per host)
 //  4. /etc/faas/tls/<role>/<file>.{crt,key} (per role in RolesForBox)
-//  5. /sys/fs/cgroup/<slice>/subtree_control (once per host)
+//  5. /sys/fs/cgroup/<systemd-parent>/<slice>/cgroup.subtree_control (once per host)
 //
 // Phase 1: load + validate. NO filesystem writes if the manifest
 // is invalid. Phase 2: compute all outputs in memory and verify
@@ -195,20 +195,19 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// Critical — best-effort daemons still ship on the host they
 	// run on).
 	//
-	// Note: builderd is NOT in the registry because it is not a
-	// long-running systemd service — vmmd spawns it per-build inside
-	// an ephemeral builder microVM (ADR-003). The registry shape
-	// (8 daemons) is correct; the renderer's role filter must mirror
-	// it (no "builderd" entry — adding one would be a no-op against
-	// ActivationOrder() and a footgun for future readers).
+	// builderd is a long-running systemd service on compute-only boxes;
+	// its vmmd client is rendered from the same per-host endpoint as the
+	// vmmd self-registration below. It is not the ephemeral builder VM —
+	// it is the durable build-queue orchestrator that asks vmmd to spawn
+	// those VMs.
 	daemons := daemonunitspec.ActivationOrder()
 	switch host.Role {
 	case "compute-only":
-		// Compute-only boxes run vmmd, imaged, and gatewayd-internal.
+		// Compute-only boxes run vmmd, imaged, gatewayd-internal, and
+		// builderd.
 		// They do NOT run apid, schedd, meterd, githubd, or
-		// gatewayd-public. (builderd is per-build via vmmd; not a
-		// systemd unit — see comment above.)
-		daemons = filterDaemons(daemons, "vmmd", "imaged", "gatewayd-internal")
+		// gatewayd-public.
+		daemons = filterDaemons(daemons, "vmmd", "imaged", "gatewayd-internal", "builderd")
 	case "control-plane":
 		// Control-plane boxes run apid, schedd, meterd, githubd,
 		// gatewayd-public. They do NOT run vmmd, imaged, or
@@ -218,14 +217,16 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// single-box (and ""): all 8 (Registry already includes imaged).
 
 	// Compute every output in memory first. Phase 3 publishes them
-	// atomically. The two-phase approach makes the renderer
+	// atomically (apart from the cgroup v2 pseudo-file). The two-phase
+	// approach makes the renderer
 	// fail-fast: any output that fails to validate (e.g. a
 	// tombstone hit) aborts the publish phase with no partial
 	// state.
 	type computedOutput struct {
-		path string
-		body []byte
-		mode os.FileMode
+		path          string
+		body          []byte
+		mode          os.FileMode
+		cgroupControl bool
 	}
 	var outputs []computedOutput
 	report := RenderReport{Host: host.Name, Role: host.Role, ManifestHash: manifestHash}
@@ -318,21 +319,24 @@ func render(opts RenderOptions) (RenderReport, error) {
 		}
 	}
 
-	// 5. /sys/fs/cgroup/<slice>/subtree_control
+	// 5. /sys/fs/cgroup/<systemd-parent>/<slice>/cgroup.subtree_control
 	cgroupBody, cgroupErr := renderCgroupBody(m.Cgroups.Slice, m.Cgroups.Controllers)
 	if cgroupErr != nil {
 		return report, cgroupErr
 	}
-	cgroupPath := filepath.Join(opts.CgroupRoot, m.Cgroups.Slice, "subtree_control")
+	cgroupPath := resolveCgroupControlPath(opts.CgroupRoot, m.Cgroups.Slice)
 	if !opts.DryRun {
-		// Ensure the slice directory exists so publishAtomic's
-		// tmp + rename can target it. MkdirAll is a no-op on a
-		// fresh slice after the first run.
-		if err := os.MkdirAll(filepath.Join(opts.CgroupRoot, m.Cgroups.Slice), 0o755); err != nil {
-			return report, fmt.Errorf("renderer: cgroup: mkdir %s: %w", filepath.Join(opts.CgroupRoot, m.Cgroups.Slice), err)
+		// The slice is created by systemd_slices. MkdirAll is a no-op when the
+		// cgroup exists and also keeps the filesystem-backed renderer tests
+		// usable; cgroup.subtree_control itself must be opened directly below.
+		if err := os.MkdirAll(filepath.Dir(cgroupPath), 0o755); err != nil {
+			return report, fmt.Errorf("renderer: cgroup: mkdir %s: %w", filepath.Dir(cgroupPath), err)
+		}
+		if err := ensureCgroupControllers(opts.CgroupRoot, filepath.Dir(cgroupPath), cgroupBody); err != nil {
+			return report, err
 		}
 	}
-	outputs = append(outputs, computedOutput{path: cgroupPath, body: cgroupBody, mode: 0o644})
+	outputs = append(outputs, computedOutput{path: cgroupPath, body: cgroupBody, mode: 0o644, cgroupControl: true})
 
 	// Phase 3: publish each computed output. The idempotent
 	// short-circuit uses publishAtomic's digest comparison.
@@ -348,7 +352,14 @@ func render(opts RenderOptions) (RenderReport, error) {
 			})
 			continue
 		}
-		digest, changed, err := publishAtomic(co.path, co.body, co.mode)
+		var digest string
+		var changed bool
+		var err error
+		if co.cgroupControl {
+			digest, changed, err = publishCgroupControl(co.path, co.body)
+		} else {
+			digest, changed, err = publishAtomic(co.path, co.body, co.mode)
+		}
 		if err != nil {
 			return report, err
 		}
@@ -403,6 +414,22 @@ func render(opts RenderOptions) (RenderReport, error) {
 		return report.Outputs[i].Path < report.Outputs[j].Path
 	})
 	return report, nil
+}
+
+// resolveCgroupControlPath follows the systemd hierarchy used by the
+// production units: faas-cp.slice is nested below faas.slice. The direct
+// slice fallback keeps the Lima cgroup shim and older single-box fixtures
+// working when systemd does not create the enclosing slice.
+func resolveCgroupControlPath(cgroupRoot, slice string) string {
+	nested := filepath.Join(cgroupRoot, "faas.slice", slice, "cgroup.subtree_control")
+	if _, err := os.Stat(nested); err == nil {
+		return nested
+	}
+	direct := filepath.Join(cgroupRoot, slice, "cgroup.subtree_control")
+	if _, err := os.Stat(direct); err == nil {
+		return direct
+	}
+	return nested
 }
 
 // resolveHost picks the host to render for. Single-box manifests

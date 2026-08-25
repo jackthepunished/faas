@@ -37,7 +37,7 @@ help: ## List targets
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
+build: guest-runners ## Build every daemon + CLIs + guest init + function runners into ./bin
 	@mkdir -p $(BINDIR)
 	@for d in $(DAEMONS); do \
 	  echo "building $$d"; \
@@ -47,6 +47,8 @@ build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 	  echo "building $$c (CLI)"; \
 	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$c ./cmd/$$c || exit 1; \
 	done
+	@echo "building init (guest PID 1)"
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o $(BINDIR)/init ./guest/init
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and
 # must be built for the guest architecture (linux/amd64, CGO off). Each

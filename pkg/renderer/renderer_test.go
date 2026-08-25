@@ -640,6 +640,14 @@ func TestRenderSystemd_ThreadsHostNameIntoUnit(t *testing.T) {
 			if !bytes.Contains(body, []byte("Environment=FAAS_NODE_NAME=fsn-1")) {
 				t.Errorf("rendered unit missing Environment=FAAS_NODE_NAME=fsn-1:\n%s", body)
 			}
+			serviceStart := bytes.Index(body, []byte("[Service]\n"))
+			if serviceStart < 0 {
+				t.Fatal("rendered unit missing [Service] section")
+			}
+			identityAt := bytes.Index(body, []byte("Environment=FAAS_NODE_NAME=fsn-1"))
+			if identityAt < serviceStart {
+				t.Errorf("node identity landed before [Service]:\n%s", body)
+			}
 		})
 	}
 }

@@ -301,6 +301,7 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 			"generate an ephemeral Ansible inventory without changing git",
 			"adopt the provider SSH target for this host only",
 			"run complete-fleet preflight unless explicitly skipped",
+			"converge control-plane peer access from the complete manifest",
 			"stage trust material, signed release assets, and manifest",
 			"converge the production compute-only Ansible role",
 			"install the signed release while the database row remains drained",
@@ -388,15 +389,11 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 	if info, err := os.Stat(opts.CosignBinary); err == nil && info.Mode()&0o111 == 0 {
 		return report, fmt.Errorf("--cosign-binary is not executable: %s", opts.CosignBinary)
 	}
-	for _, role := range pki.RolesForBox(roleComputeOnly) {
-		cert, key := pki.LeafPaths(opts.PKISource, role)
-		if _, err := os.Stat(cert); err != nil {
-			return report, fmt.Errorf("--pki-dir missing %s: %w", cert, err)
-		}
-		if _, err := os.Stat(key); err != nil {
-			return report, fmt.Errorf("--pki-dir missing %s: %w", key, err)
-		}
-	}
+	// A PKI source may be either a ready trust bundle or the operator-side
+	// issuance root. Do not reject missing leaves here: the latter is allowed
+	// to issue/refresh the compute-only leaves in copyTrustBundle below. The
+	// trust-bundle and issuance-material validators are the authoritative
+	// checks for those two supported input shapes.
 	caCert, _ := pki.CARoot(opts.PKISource)
 	if _, err := os.Stat(caCert); err != nil {
 		return report, fmt.Errorf("--pki-dir missing %s: %w", caCert, err)
@@ -445,6 +442,14 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 	m, err := manifest.Load(opts.ManifestFile)
 	if err != nil {
 		return 1, err
+	}
+	builderBaseRef := ""
+	if digest := strings.TrimSpace(m.Release.BuilderBaseDigest); digest != "" {
+		// The release manifest stores the immutable image digest; the
+		// public repository name is the platform's documented builder-base
+		// contract. Operators can override this through ansible-vars-file
+		// with faas_builder_base_ref when using a mirror.
+		builderBaseRef = "ghcr.io/poyrazk/builder-base@sha256:" + digest
 	}
 	manifestSANs, err := joinHostSANs(m, opts.Node)
 	if err != nil {
@@ -508,6 +513,7 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		"faas_join_release_tarball_source":   opts.ReleaseTarball,
 		"faas_join_release_signature_source": signature,
 		"faas_join_release_sbom_source":      sbom,
+		"faas_join_builder_base_ref":         builderBaseRef,
 	}
 	varsPath := filepath.Join(tempRoot, "join-vars.json")
 	body, err := json.Marshal(vars)
@@ -538,6 +544,13 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		if err := progress(nodejoin.PhaseConverging); err != nil {
 			return 3, fmt.Errorf("record converging phase: %w", err)
 		}
+	}
+	// A node join changes the control-plane's peer allowlists as well as the
+	// adopted host. Keep this as a separate, narrowly limited play so the
+	// existing compute fleet is never rebooted or reconfigured by --limit.
+	controlPlaneArgs := append(append([]string{}, common...), "--limit", "control_plane", filepath.Join(ansibleDir, "node_join_control_plane.yml"))
+	if err := ansiblePlaybookRunner(ctx, ansibleDir, controlPlaneArgs); err != nil {
+		return 3, fmt.Errorf("control-plane topology convergence: %w", err)
 	}
 	joinArgs := append(append([]string{}, common...), "--limit", opts.Node, filepath.Join(ansibleDir, "node_join.yml"))
 	if err := ansiblePlaybookRunner(ctx, ansibleDir, joinArgs); err != nil {
