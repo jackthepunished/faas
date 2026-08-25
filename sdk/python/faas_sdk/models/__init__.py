@@ -73,6 +73,10 @@ from .app_streaming_status import AppStreamingStatus
 from .app_streaming_status_cap_kind import AppStreamingStatusCapKind
 from .app_streaming_status_status import AppStreamingStatusStatus
 from .app_trusted_signer_list_response import AppTrustedSignerListResponse
+from .app_usage_summary_response import AppUsageSummaryResponse
+from .app_usage_summary_response_source import AppUsageSummaryResponseSource
+from .app_wake_timeline_response import AppWakeTimelineResponse
+from .app_wake_timeline_response_trigger_histogram import AppWakeTimelineResponseTriggerHistogram
 from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
 from .app_webhook_delivery_response import AppWebhookDeliveryResponse
 from .app_webhook_delivery_response_payload import AppWebhookDeliveryResponsePayload
@@ -543,8 +547,11 @@ from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
 from .vulnerability import Vulnerability
 from .vulnerability_severity import VulnerabilitySeverity
+from .wake_timeline_app import WakeTimelineApp
 from .wake_timeline_event import WakeTimelineEvent
 from .wake_timeline_event_data import WakeTimelineEventData
+from .wake_timeline_json_row import WakeTimelineJSONRow
+from .wake_timeline_json_row_kind import WakeTimelineJSONRowKind
 from .wake_timeline_response import WakeTimelineResponse
 
 __all__ = (
@@ -627,6 +634,10 @@ __all__ = (
     "AppStreamingStatusCapKind",
     "AppStreamingStatusStatus",
     "AppTrustedSignerListResponse",
+    "AppUsageSummaryResponse",
+    "AppUsageSummaryResponseSource",
+    "AppWakeTimelineResponse",
+    "AppWakeTimelineResponseTriggerHistogram",
     "AppWebhookDeliveryListResponse",
     "AppWebhookDeliveryResponse",
     "AppWebhookDeliveryResponsePayload",
@@ -1077,7 +1088,10 @@ __all__ = (
     "UsageSummaryResponse",
     "Vulnerability",
     "VulnerabilitySeverity",
+    "WakeTimelineApp",
     "WakeTimelineEvent",
     "WakeTimelineEventData",
+    "WakeTimelineJSONRow",
+    "WakeTimelineJSONRowKind",
     "WakeTimelineResponse",
 )

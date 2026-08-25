@@ -88,5 +88,54 @@ export type AppMetricsResponse = {
    *
    */
   routes?: Array<RouteRow>;
+  /**
+   * Count of `wake.boot_started` events the schedd recorded for
+   * this app in the trailing 24 hours. Sourced from the
+   * `events` table via the events_wake_id_idx jsonb expression
+   * index (migration 00114) — sub-second on a healthy app.
+   * Best-effort: 0 on a degraded store call, an empty app, or
+   * when the events table predates the post-ADR-123 schema
+   * (pre-PR-A boot_started rows carry no app_id field, so the
+   * cast returns NULL which COUNT(*) coerces to 0 — same
+   * posture as the wake-timeline view's `WakeCountWithMeta`
+   * denominator at cmd/apid/handlers_dashboard.go:2659). The
+   * dashboard surfaces this as the "wakes today" line item;
+   * combined with `cold_start_pct` it answers "is my app
+   * wake-bound or sleep-bound". Field absent on Free
+   * (the per-app dashboard is Hobby+ only — see
+   * pkg/api/limits.go::PerAppMetricsAllowed).
+   *
+   */
+  wakes_24h?: number;
+  /**
+   * Share of cache-eligible requests served from
+   * `gateway_response_cache` (ADR-122) over the window.
+   * ALWAYS present on the wire (the SDK can rely on the
+   * documented schema) — 0 means either "feature off" (no
+   * cache rule attached) or "feature on, zero traffic". The
+   * dashboard distinguishes the two via the existence of the
+   * `routes` block, not via field absence. The field stays 0
+   * until the response-cache consumer-facing metric lands
+   * (the current per-app dashboard surfaces the
+   * `gateway_response_cache_total{outcome=hit/miss}` rollup
+   * through the operator-side §12 panel, not this field).
+   *
+   */
+  cache_hit_rate_pct?: number;
+  /**
+   * Trailing-30d API-availability error budget remaining (0 =
+   * exhausted, 100 = full). ALWAYS present on the wire so the
+   * SDK can rely on the documented schema — 0 renders as "—"
+   * on the dashboard rather than a misleading "budget
+   * exhausted" message. Computed against the plan's
+   * API-availability SLO target (99.5% per spec §12). The
+   * field stays 0 until the per-plan SLO target lands on the
+   * `Limits` struct (issue TBD); once wired, the field is
+   * computed against `apid_request_total{account_id, code}`
+   * over the trailing 30d, scaled by the per-plan SLO
+   * target.
+   *
+   */
+  error_budget_pct?: number;
 };
 
