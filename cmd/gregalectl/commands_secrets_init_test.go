@@ -207,6 +207,48 @@ func TestSecretsInit_ForceOverwrite(t *testing.T) {
 	}
 }
 
+// TestSecretsInit_PreserveExisting keeps an already-provisioned host identity
+// stable while filling in files that a previously interrupted deployment did
+// not reach. This is the retry contract used by node_join.yml.
+func TestSecretsInit_PreserveExisting(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("test requires root")
+	}
+	dir := t.TempDir()
+	if _, err := runSecretsInit(t, dir, nil); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+	hostAgePath := filepath.Join(dir, "host.age")
+	before, err := os.ReadFile(hostAgePath)
+	if err != nil {
+		t.Fatalf("read host.age before preserve retry: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "session.key")); err != nil {
+		t.Fatalf("remove session.key: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "storage-box", "rclone.conf")); err != nil {
+		t.Fatalf("remove rclone.conf: %v", err)
+	}
+	if out, err := runSecretsInit(t, dir, []string{"--preserve-existing"}); err != nil {
+		t.Fatalf("preserve retry: %v (out=%s)", err, out)
+	}
+	after, err := os.ReadFile(hostAgePath)
+	if err != nil {
+		t.Fatalf("read host.age after preserve retry: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("preserve retry changed existing host.age")
+	}
+	for _, p := range []string{
+		filepath.Join(dir, "session.key"),
+		filepath.Join(dir, "storage-box", "rclone.conf"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("preserve retry did not recreate %s: %v", p, err)
+		}
+	}
+}
+
 // TestSecretsStamp_DoesNotRewriteHostAge pins the repair contract: a failed
 // database stamp must leave the existing identity byte-for-byte unchanged.
 func TestSecretsStamp_DoesNotRewriteHostAge(t *testing.T) {
