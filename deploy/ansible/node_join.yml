@@ -39,6 +39,7 @@
         - { path: /etc/faas, mode: "0750" }
         - { path: /etc/faas/secrets, mode: "0700" }
         - { path: /etc/faas/secrets/vmmd, mode: "0700" }
+        - { path: /etc/faas/secrets/storage-box, mode: "0700" }
         - { path: /etc/faas/tls, mode: "0755" }
         - { path: /usr/local/bin, mode: "0755" }
         - { path: /var/lib/faas/bootstrap, mode: "0700" }
@@ -299,6 +300,36 @@
           - --pki-trust-only
       changed_when: true
 
+    - name: Stage the reusable box-age identity when supplied
+      ansible.builtin.copy:
+        src: "{{ faas_join_box_age_key_source }}"
+        dest: /etc/faas/secrets/storage-box/box-age-key
+        owner: root
+        group: root
+        mode: "0440"
+      no_log: true
+      when: (faas_join_box_age_key_source | default('') | trim) != ''
+
+    - name: Stage the encrypted rclone envelope when supplied
+      ansible.builtin.copy:
+        src: "{{ faas_join_rclone_envelope_source }}"
+        dest: /var/lib/faas/bootstrap/rclone.conf.age
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+      when: (faas_join_rclone_envelope_source | default('') | trim) != ''
+
+    - name: Stage the encrypted archive credentials envelope when supplied
+      ansible.builtin.copy:
+        src: "{{ faas_join_archive_envelope_source }}"
+        dest: /var/lib/faas/bootstrap/archive-creds.json.age
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+      when: (faas_join_archive_envelope_source | default('') | trim) != ''
+
     - name: Initialize host-local runtime identity and backup stubs
       ansible.builtin.command:
         argv:
@@ -310,6 +341,59 @@
           - "{{ faas_join_database_node }}"
       register: faas_secrets_init
       changed_when: true
+
+    - name: Unseal the reusable rclone configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - backup
+          - unseal-rclone
+          - --in
+          - /var/lib/faas/bootstrap/rclone.conf.age
+          - --force
+      no_log: true
+      when: (faas_join_rclone_envelope_source | default('') | trim) != ''
+
+    - name: Unseal the reusable archive credentials
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - backup
+          - unseal-archive-creds
+          - --in
+          - /var/lib/faas/bootstrap/archive-creds.json.age
+          - --force
+      no_log: true
+      when: (faas_join_archive_envelope_source | default('') | trim) != ''
+
+    - name: Remove encrypted backup envelopes after unseal
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/faas/bootstrap/rclone.conf.age
+        - /var/lib/faas/bootstrap/archive-creds.json.age
+      when:
+        - (faas_join_rclone_envelope_source | default('') | trim) != '' or
+          (faas_join_archive_envelope_source | default('') | trim) != ''
+
+    - name: Run the node-scoped doctor before starting services
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/gregalectl
+          - doctor
+          - --node
+          - "{{ faas_join_database_node }}"
+          - --fail-on
+          - warn
+          - --json
+      register: faas_join_doctor
+      changed_when: false
+      failed_when: faas_join_doctor.rc != 0
+      # This is the acceptance gate for the adopted host. It deliberately
+      # runs after identity/release rendering and before any service can
+      # become schedulable, so a missing filesystem, secret, certificate,
+      # or release membership cannot hide behind systemd=active.
 
     - name: Reload systemd after release/config publication
       ansible.builtin.systemd:

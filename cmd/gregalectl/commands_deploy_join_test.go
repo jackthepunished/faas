@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/pki"
+	"github.com/onebox-faas/faas/pkg/releaseinstall"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -112,6 +113,48 @@ func TestDeployJoinValidate_RejectsInvalidReleaseOverride(t *testing.T) {
 	}
 }
 
+func TestDeployJoinValidate_StorageContract(t *testing.T) {
+	manifestPath := splitboxJoinManifest(t)
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "deploy/ansible"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/node_join.yml"), []byte("---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := deployJoinOptions{
+		ManifestFile: manifestPath,
+		Node:         "fsn-2",
+		SSHHost:      "198.51.100.20",
+		RepoRoot:     repo,
+		DryRun:       true,
+	}
+	base.StorageDevice = "nvme0n1"
+	if _, err := deployJoinValidate(base); err == nil || !strings.Contains(err.Error(), "absolute device path") {
+		t.Fatalf("relative storage device error = %v, want absolute-path guard", err)
+	}
+	base.StorageDevice = ""
+	base.FormatStorage = true
+	if _, err := deployJoinValidate(base); err == nil || !strings.Contains(err.Error(), "requires --storage-device") {
+		t.Fatalf("format-without-device error = %v, want explicit device guard", err)
+	}
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withManifestDevice := strings.Replace(
+		string(manifestBytes),
+		"      address: fsn-2.gregale.dev:50051\n",
+		"      address: fsn-2.gregale.dev:50051\n      storage_device: /dev/disk/by-id/google-local-ssd-0\n", 1,
+	)
+	deviceManifest := writeSplitboxManifest(t, withManifestDevice)
+	base.ManifestFile = deviceManifest
+	base.FormatStorage = true
+	if _, err := deployJoinValidate(base); err != nil {
+		t.Fatalf("manifest storage device should satisfy --format-storage: %v", err)
+	}
+}
+
 func TestOverrideJoinHostVars_UsesProviderSSHOnlyForConnection(t *testing.T) {
 	body := []byte("ansible_host: \"fsn-2.gregale.dev\"\nfaas_box_role: compute-only\n")
 	got := string(overrideJoinHostVars(body, &deployJoinOptions{
@@ -133,6 +176,38 @@ func TestOverrideJoinHostVars_UsesProviderSSHOnlyForConnection(t *testing.T) {
 	}
 	if strings.Contains(got, "ansible_host: \"fsn-2.gregale.dev\"") {
 		t.Errorf("provider SSH override left manifest endpoint in place:\n%s", got)
+	}
+}
+
+func TestOverrideJoinHostVars_PreservesStorageContract(t *testing.T) {
+	got := string(overrideJoinHostVars([]byte("faas_box_role: compute-only\n"), &deployJoinOptions{
+		SSHHost:       "203.0.113.8",
+		SSHUser:       "root",
+		SSHPort:       22,
+		StorageDevice: "/dev/disk/by-id/scsi-0Google_PersistentDisk_data",
+		FormatStorage: true,
+	}))
+	for _, want := range []string{
+		`faas_storage_device: "/dev/disk/by-id/scsi-0Google_PersistentDisk_data"`,
+		"faas_storage_format: true",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("host vars missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestScopeDoctorNodes_IsNodeLocal(t *testing.T) {
+	rows := []releaseinstall.ComputeNodeRow{
+		{Name: "fsn-2.faas"},
+		{Name: "fsn-3.faas"},
+	}
+	scoped, found := scopeDoctorNodes(rows, "fsn-3.faas")
+	if !found || len(scoped) != 1 || scoped[0].Name != "fsn-3.faas" {
+		t.Fatalf("scopeDoctorNodes = %#v, found=%v", scoped, found)
+	}
+	if scoped, found := scopeDoctorNodes(rows, "missing.faas"); found || len(scoped) != 0 {
+		t.Fatalf("missing node scope = %#v, found=%v; want not found", scoped, found)
 	}
 }
 
@@ -210,12 +285,16 @@ func TestVerifyAndActivateJoinedNodeUsesControlPlaneRow(t *testing.T) {
 	role := roleComputeOnly
 	release := "abcdef"
 	hash := "sha256:" + strings.Repeat("a", 64)
+	certificate := "-----BEGIN CERTIFICATE-----\njoined-node\n-----END CERTIFICATE-----"
+	fingerprint := strings.Repeat("b", 64)
 	row, err := st.UpsertComputeNodeFromOperator(context.Background(), state.ComputeNode{
-		Name:         "fsn-2.faas",
-		TargetURL:    "tcp://fsn-2.gregale.dev:50051",
-		Role:         &role,
-		ReleaseID:    &release,
-		ManifestHash: &hash,
+		Name:            "fsn-2.faas",
+		TargetURL:       "tcp://fsn-2.gregale.dev:50051",
+		Role:            &role,
+		ReleaseID:       &release,
+		ManifestHash:    &hash,
+		HostCertificate: &certificate,
+		CertFingerprint: &fingerprint,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -233,6 +312,33 @@ func TestVerifyAndActivateJoinedNodeUsesControlPlaneRow(t *testing.T) {
 	got, err := st.ComputeNodeByName(context.Background(), "fsn-2.faas")
 	if err != nil || !got.Active {
 		t.Fatalf("row after activation = %#v, err=%v", got, err)
+	}
+}
+
+func TestVerifyAndActivateJoinedNodeRejectsUnstampedIdentity(t *testing.T) {
+	st := state.NewMemStore()
+	role := roleComputeOnly
+	release := "abcdef"
+	hash := "sha256:" + strings.Repeat("a", 64)
+	row, err := st.UpsertComputeNodeFromOperator(context.Background(), state.ComputeNode{
+		Name:         "fsn-2.faas",
+		TargetURL:    "tcp://fsn-2.gregale.dev:50051",
+		Role:         &role,
+		ReleaseID:    &release,
+		ManifestHash: &hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetComputeNodeActive(context.Background(), row.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	old := computeNodesStoreOpener
+	t.Cleanup(func() { computeNodesStoreOpener = old })
+	computeNodesStoreOpener = func() (state.Store, func(), error) { return st, func() {}, nil }
+	report := &deployJoinReport{DatabaseNode: "fsn-2.faas", ReleaseGitSHA: release}
+	if err := verifyAndActivateJoinedNode(context.Background(), report, hash); err == nil || !strings.Contains(err.Error(), "host_certificate is empty") {
+		t.Fatalf("verifyAndActivateJoinedNode error = %v, want unstamped identity guard", err)
 	}
 }
 

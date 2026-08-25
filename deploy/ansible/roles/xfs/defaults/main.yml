@@ -1,0 +1,10 @@
+---
+# The fast root is a real, dedicated filesystem in production. A node join
+# may supply an explicit blank block device; the role formats it only when
+# faas_storage_format is explicitly enabled. Without a device, an existing
+# mount is required and the role never guesses which disk is safe to touch.
+faas_storage_mountpoint: /srv/fc
+faas_storage_device: ""
+faas_storage_format: false
+faas_storage_mount_options: noatime,prjquota
+faas_storage_require_reflink: true

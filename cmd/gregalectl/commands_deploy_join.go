@@ -42,6 +42,11 @@ type deployJoinOptions struct {
 	SignKeySource      string
 	VerifyKeySource    string
 	ComputeDBEnvSource string
+	StorageDevice      string
+	FormatStorage      bool
+	BoxAgeKeySource    string
+	RcloneEnvelope     string
+	ArchiveEnvelope    string
 	ArtifactDir        string
 	AnsibleVarsFile    string
 	RepoRoot           string
@@ -112,6 +117,11 @@ func cmdDeployJoinNode(args []string) int {
 	signKey := fs.String("sign-key", "", "image-signing private key (required for apply)")
 	verifyKey := fs.String("verify-key", "", "image-signing public key (required for apply)")
 	computeDBEnv := fs.String("compute-db-env", "", "root-only compute-db.env source (required for apply)")
+	storageDevice := fs.String("storage-device", "", "optional fast-root block device (must be an absolute path; manifest host value is used when omitted)")
+	formatStorage := fs.Bool("format-storage", false, "format an explicitly supplied blank storage device as XFS with reflink support")
+	boxAgeKey := fs.String("box-age-key", "", "optional box-age identity source (artifact-dir convention: box-age-key)")
+	rcloneEnvelope := fs.String("rclone-envelope", "", "optional encrypted rclone.conf envelope (artifact-dir convention: rclone.conf.age)")
+	archiveEnvelope := fs.String("archive-creds-envelope", "", "optional encrypted archive credentials envelope (artifact-dir convention: archive-creds.json.age)")
 	artifactDir := fs.String("artifact-dir", "", "directory containing the standard release, key, trust-bundle, and bootstrap assets")
 	ansibleVars := fs.String("ansible-vars-file", "", "optional provider/overlay Ansible vars file")
 	repoRoot := fs.String("repo-root", "", "path to the faas repository (default: inferred from gregalectl)")
@@ -145,6 +155,11 @@ func cmdDeployJoinNode(args []string) int {
 		SignKeySource:      *signKey,
 		VerifyKeySource:    *verifyKey,
 		ComputeDBEnvSource: *computeDBEnv,
+		StorageDevice:      *storageDevice,
+		FormatStorage:      *formatStorage,
+		BoxAgeKeySource:    *boxAgeKey,
+		RcloneEnvelope:     *rcloneEnvelope,
+		ArchiveEnvelope:    *archiveEnvelope,
 		ArtifactDir:        *artifactDir,
 		AnsibleVarsFile:    *ansibleVars,
 		RepoRoot:           *repoRoot,
@@ -313,11 +328,12 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 			"run complete-fleet preflight unless explicitly skipped",
 			"converge control-plane peer access from the complete manifest",
 			"stage trust material, signed release assets, and manifest",
+			"converge or verify the dedicated XFS fast-root filesystem",
 			"converge the production compute-only Ansible role",
 			"install the signed release while the database row remains drained",
-			"render configuration, initialize host identity, and start services",
+			"render configuration, initialize host identity, and unseal supplied backup envelopes",
 			"wait for sockets, gateway, and systemd readiness",
-			"verify the control-plane row and activate it as the final step",
+			"run the node-scoped doctor and verify the control-plane row before activation",
 		},
 	}
 	if opts.ManifestFile == "" {
@@ -340,6 +356,9 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 	if opts.SSHPort < 1 || opts.SSHPort > 65535 {
 		return report, fmt.Errorf("--ssh-port %d is outside 1..65535", opts.SSHPort)
 	}
+	if opts.StorageDevice != "" && !filepath.IsAbs(opts.StorageDevice) {
+		return report, fmt.Errorf("--storage-device %q must be an absolute device path", opts.StorageDevice)
+	}
 	m, err := manifest.Load(opts.ManifestFile)
 	if err != nil {
 		return report, err
@@ -356,9 +375,18 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 		if host.Role != roleComputeOnly {
 			return report, fmt.Errorf("manifest host %q has role %q; join-node requires compute-only", opts.Node, host.Role)
 		}
+		if opts.StorageDevice == "" {
+			opts.StorageDevice = host.StorageDevice
+		}
 	}
 	if !hostFound {
 		return report, fmt.Errorf("manifest does not declare host %q", opts.Node)
+	}
+	if opts.StorageDevice != "" && !filepath.IsAbs(opts.StorageDevice) {
+		return report, fmt.Errorf("storage device %q must be an absolute device path", opts.StorageDevice)
+	}
+	if opts.FormatStorage && opts.StorageDevice == "" {
+		return report, errors.New("--format-storage requires --storage-device or manifest fleet.hosts[].storage_device")
 	}
 	if m.Release.GitSHA == "" {
 		return report, errors.New("manifest release.git_sha is empty")
@@ -397,6 +425,28 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 		if name != "pki-dir" && !info.Mode().IsRegular() {
 			return report, fmt.Errorf("--%s must be a regular file", name)
 		}
+	}
+	for name, path := range map[string]string{
+		"box-age-key":            opts.BoxAgeKeySource,
+		"rclone-envelope":        opts.RcloneEnvelope,
+		"archive-creds-envelope": opts.ArchiveEnvelope,
+	} {
+		if path == "" {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return report, fmt.Errorf("--%s: %w", name, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			return report, fmt.Errorf("--%s must be a regular file", name)
+		}
+	}
+	if (opts.RcloneEnvelope != "" || opts.ArchiveEnvelope != "") && opts.BoxAgeKeySource == "" {
+		return report, errors.New("--rclone-envelope/--archive-creds-envelope require --box-age-key")
+	}
+	if (opts.RcloneEnvelope == "") != (opts.ArchiveEnvelope == "") {
+		return report, errors.New("--rclone-envelope and --archive-creds-envelope must be supplied together")
 	}
 	if info, err := os.Stat(opts.BootstrapBinary); err == nil && info.Mode()&0o111 == 0 {
 		return report, fmt.Errorf("--bootstrap-binary is not executable: %s", opts.BootstrapBinary)
@@ -530,6 +580,11 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		"faas_join_sign_key_source":          opts.SignKeySource,
 		"faas_join_verify_key_source":        opts.VerifyKeySource,
 		"faas_join_compute_db_env_source":    opts.ComputeDBEnvSource,
+		"faas_join_storage_device":           opts.StorageDevice,
+		"faas_join_format_storage":           opts.FormatStorage,
+		"faas_join_box_age_key_source":       opts.BoxAgeKeySource,
+		"faas_join_rclone_envelope_source":   opts.RcloneEnvelope,
+		"faas_join_archive_envelope_source":  opts.ArchiveEnvelope,
 		"faas_join_node_key_source":          nodeKeySource,
 		"faas_join_node_pub_source":          nodePubSource,
 		"faas_join_release_tarball_source":   opts.ReleaseTarball,
@@ -685,6 +740,12 @@ func verifyAndActivateJoinedNode(ctx context.Context, report *deployJoinReport, 
 	if row.ManifestHash == nil || *row.ManifestHash != expectedManifestHash {
 		return fmt.Errorf("row manifest_hash is %q, want %q", pointerString(row.ManifestHash), expectedManifestHash)
 	}
+	if row.HostCertificate == nil || strings.TrimSpace(*row.HostCertificate) == "" {
+		return fmt.Errorf("row host_certificate is empty; the node identity was not stamped")
+	}
+	if row.CertFingerprint == nil || strings.TrimSpace(*row.CertFingerprint) == "" {
+		return fmt.Errorf("row cert_fingerprint is empty; the node identity was not stamped")
+	}
 	if err := validateComputeTargetURL(row.TargetURL); err != nil {
 		return err
 	}
@@ -727,6 +788,15 @@ func resolveJoinArtifacts(opts *deployJoinOptions) {
 			*current = filepath.Join(opts.ArtifactDir, name)
 		}
 	}
+	resolveIfPresent := func(current *string, name string) {
+		if *current != "" {
+			return
+		}
+		candidate := filepath.Join(opts.ArtifactDir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			*current = candidate
+		}
+	}
 	resolve(&opts.ReleaseTarball, releaseTarballName)
 	resolve(&opts.BootstrapBinary, "gregalectl-linux-amd64")
 	resolve(&opts.CosignBinary, "cosign-linux-amd64")
@@ -734,6 +804,9 @@ func resolveJoinArtifacts(opts *deployJoinOptions) {
 	resolve(&opts.SignKeySource, "sign.key")
 	resolve(&opts.VerifyKeySource, "sign-pub.pem")
 	resolve(&opts.ComputeDBEnvSource, "compute-db.env")
+	resolveIfPresent(&opts.BoxAgeKeySource, "box-age-key")
+	resolveIfPresent(&opts.RcloneEnvelope, "rclone.conf.age")
+	resolveIfPresent(&opts.ArchiveEnvelope, "archive-creds.json.age")
 }
 
 func joinManifestHash(path string) (string, error) {
@@ -832,6 +905,12 @@ func overrideJoinHostVars(body []byte, opts *deployJoinOptions) []byte {
 		"ansible_user: "+yamlQuote(opts.SSHUser),
 		"ansible_port: "+strconv.Itoa(opts.SSHPort),
 	)
+	if opts.StorageDevice != "" {
+		lines = append(lines, "faas_storage_device: "+yamlQuote(opts.StorageDevice))
+	}
+	if opts.FormatStorage {
+		lines = append(lines, "faas_storage_format: true")
+	}
 	if opts.SSHKey != "" {
 		lines = append(lines, "ansible_ssh_private_key_file: "+yamlQuote(opts.SSHKey))
 	}

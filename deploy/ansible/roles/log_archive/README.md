@@ -18,7 +18,7 @@ have, and where the local spool root sits.
 
 1. Fail-closed asserts on
    `/etc/faas/secrets/storage-box/archive-creds.json`
-   (mode `0440`, owner `root`, group `faas` — spec §11). Both
+   (mode `0400`, owner `root`, group `root` — spec §11). Both
    daemons read this via systemd's `LoadCredential=` so the
    plaintext never appears on the host filesystem outside
    the unit's `$CREDENTIALS_DIRECTORY`.
