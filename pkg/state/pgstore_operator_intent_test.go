@@ -32,14 +32,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
+func pgStoreOperatorIntent(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
+	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	// These tests exercise the PgStore CRUD contract, while the migration
+	// shape is pinned independently by migrations/00445_operator_intents_test.go.
+	// Installing only that table keeps each isolated fixture cheap; running all
+	// 445 migrations five times pushes the PostgreSQL shard over its budget.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE operator_intents (
+			id uuid PRIMARY KEY,
+			kind text NOT NULL CHECK (kind IN ('force_park', 'force_cold_boot')),
+			target_id text NOT NULL,
+			account_id uuid NULL,
+			actor_id uuid NOT NULL,
+			reason text NULL,
+			metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+			status text NOT NULL DEFAULT 'pending' CHECK (status IN
+				('pending', 'running', 'succeeded', 'failed', 'cancelled')),
+			requested_at timestamptz NOT NULL DEFAULT now(),
+			started_at timestamptz NULL,
+			finished_at timestamptz NULL,
+			error text NULL,
+			snap_ids_marked_stale text[] NULL
+		);
+		CREATE INDEX operator_intents_pending_idx
+			ON operator_intents (status, requested_at)
+			WHERE status = 'pending';
+		CREATE INDEX operator_intents_target_idx
+			ON operator_intents (target_id, requested_at DESC);
+	`); err != nil {
+		t.Fatalf("create operator_intents fixture: %v", err)
+	}
+	return state.NewPgStore(pool), pool, ctx
+}
+
+func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	// 1. Insert.
 	acct := "11111111-1111-1111-1111-111111111111"
@@ -107,9 +143,7 @@ func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	acct := "11111111-1111-1111-1111-111111111111"
 	actor := "22222222-2222-2222-2222-222222222222"
@@ -143,9 +177,7 @@ func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_GetNotFound(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	_, err := store.GetOperatorIntent(ctx, "deadbeef-dead-beef-dead-beefdeadbeef")
 	if !errors.Is(err, state.ErrOperatorIntentNotFound) {
@@ -154,9 +186,7 @@ func TestPgStore_OperatorIntent_GetNotFound(t *testing.T) {
 }
 
 func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, _, ctx := pgStoreOperatorIntent(t)
 
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
@@ -191,9 +221,7 @@ func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
 //   - a separately-stamped MarkSucceeded row is NOT touched
 //     (terminal rows are not reclaimed — only `running`).
 func TestPgStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-	store := state.NewPgStore(pool)
+	store, pool, ctx := pgStoreOperatorIntent(t)
 
 	actor := "33333333-3333-3333-3333-333333333333"
 	accountID := "44444444-4444-4444-4444-444444444444"

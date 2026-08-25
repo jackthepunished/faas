@@ -31,12 +31,19 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
 func TestMigrations_00445_OperatorIntents(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("replay db.MigrateUp: %v", err)
+	}
 
 	// Table presence + status enum CHECK + kind enum CHECK.
 	// pg_constraint has both CHECKs; we read both definitions
