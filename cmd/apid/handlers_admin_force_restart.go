@@ -2,21 +2,21 @@
 // P2d (force-restart / kill instance + cold-boot on next wake).
 // PR #1105 follow-on to PR #1099. Mirrors postForcePark + the
 // `force_park` audit shape byte-for-byte with three differences:
-//   1. State gate = forceRestartableStates ({RUNNING, WAKING,
-//      COLD_BOOTING}) — same set as force-park. force-restart
-//      is operator-initiated; it cannot act on PARKED / STOPPED
-//      instances (the §6.2 CanTransition guard inside
-//      schedd's Engine.ForceRestart fires on the locked re-read
-//      and stamps the intent failed if a customer-driven Park
-//      won the race).
-//   2. Audit kind = operator.action.restart_instance (the
-//      terminal outcome audit kind is
-//      operator.action.restart_instance.outcome, emitted by
-//      schedd's operator_intent_subscriber.go on the new
-//      force_restart dispatch arm).
-//   3. 409 code = instance_not_restartable (distinct from
-//      instance_not_parkable so the audit-log filter can
-//      distinguish the two rejection shapes).
+//  1. State gate = forceRestartableStates ({RUNNING, WAKING,
+//     COLD_BOOTING}) — same set as force-park. force-restart
+//     is operator-initiated; it cannot act on PARKED / STOPPED
+//     instances (the §6.2 CanTransition guard inside
+//     schedd's Engine.ForceRestart fires on the locked re-read
+//     and stamps the intent failed if a customer-driven Park
+//     won the race).
+//  2. Audit kind = operator.action.restart_instance (the
+//     terminal outcome audit kind is
+//     operator.action.restart_instance.outcome, emitted by
+//     schedd's operator_intent_subscriber.go on the new
+//     force_restart dispatch arm).
+//  3. 409 code = instance_not_restartable (distinct from
+//     instance_not_parkable so the audit-log filter can
+//     distinguish the two rejection shapes).
 //
 // The handler does NOT call schedd over gRPC (that path violates
 // the apid-control-plane-only depguard rule at

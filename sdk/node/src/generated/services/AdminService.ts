@@ -461,17 +461,16 @@ export class AdminService {
     });
   }
   /**
-   * Enqueue a force-restart intent for a wedged live instance (admin-only).
+   * Enqueue a force-restart intent for a wedged RUNNING instance (admin-only).
    * Operator-side recovery primitive for instances wedged in
-   * {RUNNING, WAKING, COLD_BOOTING} that the customer can't
-   * wait for the idle reaper to handle AND whose snapshot is
-   * suspected to be the carrier of the wedge. Composes the
-   * two earlier primitives: kill the instance (force-park)
-   * AND flip the deployment's latest warm + init snapshots
-   * stale (force-cold-boot). Per ADR-005 ("snapshot of a
-   * wedged VM is a wedged VM"), the recovery action is
-   * destroy + snap-stale so the next Wake is a guaranteed
-   * cold boot.
+   * {RUNNING} that the customer can't wait for the idle
+   * reaper to handle AND whose snapshot is suspected to be
+   * the carrier of the wedge. Composes the two earlier
+   * primitives: kill the instance (force-park) AND flip the
+   * deployment's latest warm + init snapshots stale
+   * (force-cold-boot). Per ADR-005 ("snapshot of a wedged
+   * VM is a wedged VM"), the recovery action is destroy +
+   * snap-stale so the next Wake is a guaranteed cold boot.
    *
    * PR #1105 (P2d follow-on to PR #1099): apid writes a row
    * to `operator_intents` (kind = `force_restart`, CHECK
@@ -484,6 +483,17 @@ export class AdminService {
    * intent_id; the operator polls
    * GET /v1/admin/operator-intents/{id} for terminal state
    * and `snap_ids_marked_stale`.
+   *
+   * Gate is intentionally TIGHTER than force-park's
+   * ({RUNNING, WAKING, COLD_BOOTING}): force-restart only
+   * acts on RUNNING instances because the engine's
+   * state-machine validation at pkg/sched/engine.go:5299
+   * rejects non-RUNNING states as
+   * `state.ErrInstanceNotRunning` (a wedged WAKING /
+   * COLD_BOOTING instance's nodeID may be empty or its
+   * destroy path may race with the Wake). Operators targeting
+   * WAKING / COLD_BOOTING instances get 409
+   * `instance_not_restartable` with no intent row written.
    *
    * `?confirm=true` is required as a tripwire against
    * operator fat-fingering. Optional `?reason=<slug>` defaults
@@ -526,7 +536,7 @@ export class AdminService {
         401: `code: unauthorized`,
         403: `Force-restart 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.`,
         404: `Force-restart 404: code: instance_not_found — no instance row with the supplied id.`,
-        409: `code: instance_not_restartable — instance state is not in {RUNNING, WAKING, COLD_BOOTING}.`,
+        409: `Force-restart 409: code: instance_not_restartable — instance state is not RUNNING. WAKING / COLD_BOOTING / PARKED / STOPPED all return this code without writing an intent row.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
