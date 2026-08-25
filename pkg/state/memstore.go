@@ -6141,7 +6141,7 @@ func (m *MemStore) MarkOperatorIntentSucceeded(_ context.Context, id string, sna
 	return nil
 }
 
-func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string) error {
+func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string, snapIDs []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.operatorIntents[id]
@@ -6153,6 +6153,15 @@ func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string
 	}
 	r.Status = OperatorIntentFailed
 	r.Error = errMsg
+	// P2d R4 review fix: persist snapIDs on the failure path so
+	// partial-success (snaps flipped stale but destroy errored)
+	// is reflected on the operator_intent row. Mirror the pgstore
+	// impl's nil→empty coercion so the test-side assertions
+	// match across both backends.
+	if snapIDs == nil {
+		snapIDs = []string{}
+	}
+	r.SnapIDsMarkedStale = snapIDs
 	now := time.Now().UTC()
 	r.FinishedAt = &now
 	m.operatorIntents[id] = r

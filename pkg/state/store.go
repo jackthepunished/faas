@@ -2637,7 +2637,17 @@ type Store interface {
 	) (string, error)
 	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
 	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
-	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error
+	// MarkOperatorIntentFailed stamps the row's terminal failure
+	// state. snapIDs captures the partial-success shape: when a
+	// force_restart dispatch flips the deployment's warm + init
+	// snapshots stale but timedDestroy fails (vmmd wedged), the
+	// snapshots ARE stale in the database but the destroy is not.
+	// Persisting snapIDs here means GET /v1/admin/operator-intents/{id}
+	// surfaces "what this action affected" even on the failure
+	// path — the operator learns the next wake WILL cold-boot
+	// despite the destroy error. snapIDs may be nil (race-loser,
+	// unknown-kind, deployment-not-found, etc.).
+	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string, snapIDs []string) error
 	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
 	// ReclaimStuckRunningOperatorIntents resets every operator_intents
 	// row whose status='running' AND whose started_at is older than

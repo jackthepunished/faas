@@ -167,7 +167,7 @@ func (l *Loop) processOperatorIntent(ctx context.Context, intent state.OperatorI
 		// the row failed and move on. No audit emit; the row's
 		// state is the source of truth.
 		const unknownKindMsg = "operator_intent: unknown kind"
-		if mErr := l.engine.Store().MarkOperatorIntentFailed(ctx, intent.ID, unknownKindMsg); mErr != nil {
+		if mErr := l.engine.Store().MarkOperatorIntentFailed(ctx, intent.ID, unknownKindMsg, nil); mErr != nil {
 			l.log.Warn("sched: operator_intent: mark failed (unknown kind)",
 				"intent_id", intent.ID, "kind", intent.Kind, "err", mErr)
 		}
@@ -179,12 +179,24 @@ func (l *Loop) processOperatorIntent(ctx context.Context, intent state.OperatorI
 	if err != nil {
 		resultLabel = operatorIntentResultLabelFailed
 		msg := err.Error()
-		if mErr := l.engine.Store().MarkOperatorIntentFailed(ctx, intent.ID, msg); mErr != nil {
+		// P2d R4 review fix: persist the snap IDs we collected
+		// on partial-success (snaps flipped stale but destroy
+		// errored). The terminal operator.action.<verb>.outcome
+		// audit row already carries them, but the operator_intent
+		// row's snap_ids_marked_stale column was previously
+		// only populated on the succeeded branch — so an operator
+		// querying GET /v1/admin/operator-intents/{id} after a
+		// partial-success failure saw status='failed' but no
+		// evidence that the snap-stale work had landed. Now both
+		// branches persist the same field; the audit row +
+		// operator_intent row stay in lock-step.
+		if mErr := l.engine.Store().MarkOperatorIntentFailed(ctx, intent.ID, msg, snapIDs); mErr != nil {
 			l.log.Warn("sched: operator_intent: mark failed",
 				"intent_id", intent.ID, "kind", intent.Kind, "err", mErr)
 		}
 		l.log.Warn("sched: operator_intent: dispatch failed",
-			"intent_id", intent.ID, "kind", intent.Kind, "target_id", intent.TargetID, "err", err)
+			"intent_id", intent.ID, "kind", intent.Kind, "target_id", intent.TargetID,
+			"snap_ids_marked_stale", snapIDs, "err", err)
 	} else {
 		if mErr := l.engine.Store().MarkOperatorIntentSucceeded(ctx, intent.ID, snapIDs); mErr != nil {
 			l.log.Warn("sched: operator_intent: mark succeeded",
