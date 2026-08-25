@@ -143,6 +143,10 @@ type MemStore struct {
 	// status transitions follow the production 5-state CHECK (pending
 	// → running → succeeded|failed|cancelled).
 	fireNowRequests map[string]FireNowRequest
+	// operatorIntents mirrors operator_intents (migrations/00431)
+	// for handler + subscriber tests. Keyed by intent id (UUID);
+	// status transitions follow the production 5-state CHECK.
+	operatorIntents map[string]OperatorIntent
 	// alertRules mirrors alert_rules for handler tests. Keyed by
 	// ruleID. AlertDelivery rows are kept separately so the
 	// delivery list query can walk just the matching subset on
@@ -629,6 +633,7 @@ func NewMemStore() *MemStore {
 		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
 		fireNowRequests:      map[string]FireNowRequest{},
+		operatorIntents:      map[string]OperatorIntent{},
 		alertRules:           map[string]AlertRule{},
 		alertDeliveries:      map[string]AlertDelivery{},
 		appWebhooks:          map[string]AppWebhook{},
@@ -6050,6 +6055,116 @@ func (m *MemStore) GetFireNowRequest(_ context.Context, requestID string) (FireN
 	r, ok := m.fireNowRequests[requestID]
 	if !ok {
 		return FireNowRequest{}, ErrFireNowRequestNotFound
+	}
+	return r, nil
+}
+
+// Operator intent queue (PR #1099 P2 redesign / migrations/00431).
+// In-memory mirror of operator_intents — same shape, same status
+// enum, same FOR UPDATE SKIP LOCKED FIFO claim semantics as the
+// pg path. Handler tests (cmd/apid/handlers_admin_force_test.go)
+// exercise Insert / Claim / Mark* via the same Store interface
+// that production apid uses; schedd-subscriber tests
+// (pkg/sched/operator_intent_subscriber_test.go) exercise the
+// dispatch + state-machine path against this map.
+//
+// Concurrency: the same mutex that guards fireNowRequests covers
+// this map. Insert / Claim / Mark* all take it for the duration of
+// their critical section. The map is keyed by intent id (UUID);
+// collisions are impossible in practice.
+func (m *MemStore) InsertOperatorIntent(
+	_ context.Context,
+	kind OperatorIntentKind,
+	targetID string,
+	accountID *string,
+	actorID string,
+	reason string,
+	metadata json.RawMessage,
+) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := uuid.NewString()
+	if metadata == nil {
+		metadata = json.RawMessage("{}")
+	}
+	m.operatorIntents[id] = OperatorIntent{
+		ID:          id,
+		Kind:        kind,
+		TargetID:    targetID,
+		AccountID:   accountID,
+		ActorID:     actorID,
+		Reason:      reason,
+		Metadata:    metadata,
+		Status:      OperatorIntentPending,
+		RequestedAt: time.Now().UTC(),
+	}
+	return id, nil
+}
+
+func (m *MemStore) ClaimPendingOperatorIntent(_ context.Context) (OperatorIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldestID string
+	var oldestAt time.Time
+	for id, r := range m.operatorIntents {
+		if r.Status != OperatorIntentPending {
+			continue
+		}
+		if oldestID == "" || r.RequestedAt.Before(oldestAt) {
+			oldestID = id
+			oldestAt = r.RequestedAt
+		}
+	}
+	if oldestID == "" {
+		return OperatorIntent{}, ErrOperatorIntentNotFound
+	}
+	r := m.operatorIntents[oldestID]
+	r.Status = OperatorIntentRunning
+	now := time.Now().UTC()
+	r.StartedAt = &now
+	m.operatorIntents[oldestID] = r
+	return r, nil
+}
+
+func (m *MemStore) MarkOperatorIntentSucceeded(_ context.Context, id string, snapIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok || r.Status != OperatorIntentRunning {
+		return ErrOperatorIntentNotFound
+	}
+	r.Status = OperatorIntentSucceeded
+	r.SnapIDsMarkedStale = snapIDs
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.operatorIntents[id] = r
+	return nil
+}
+
+func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok || r.Status != OperatorIntentRunning {
+		return ErrOperatorIntentNotFound
+	}
+	if len(errMsg) > 1024 {
+		errMsg = errMsg[:1024]
+	}
+	r.Status = OperatorIntentFailed
+	r.Error = errMsg
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.operatorIntents[id] = r
+	return nil
+}
+
+func (m *MemStore) GetOperatorIntent(_ context.Context, id string) (OperatorIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok {
+		return OperatorIntent{}, ErrOperatorIntentNotFound
 	}
 	return r, nil
 }

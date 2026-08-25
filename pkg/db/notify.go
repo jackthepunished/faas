@@ -379,6 +379,23 @@ const (
 	//   migrations/00243 fires on every INSERT/UPDATE/DELETE of
 	//   either table, including verified flips).
 	NotifyTenantSurfaceChanged = "tenant_surface_changed"
+	// NotifyOperatorIntent {"intent_id":uuid, "kind":"force_park|
+	//                       force_cold_boot", "target_id":uuid}
+	//   apid → schedd (PR #1099 P2 redesign, ADR-127): a row
+	//   was inserted into operator_intents (migrations/00431).
+	//   schedd's operator-intent subscriber
+	//   (pkg/sched/operator_intent_subscriber.go) is the only
+	//   listener; it multiplexes onto schedd's existing
+	//   SubscribeWithReconnect block (zero extra pool
+	//   connections, matches PR-D's cron_run_now precedent).
+	//   The payload is the bare intent_id — kind is re-read
+	//   from the row at claim time (defence against notify
+	//   loss; the trigger fires on every INSERT and the
+	//   safety tick at 30s sweeps any unclaimed rows). The
+	//   original depguard violation (apid → schedd gRPC) is
+	//   closed by this channel: apid never imports
+	//   pkg/scheddgrpc.
+	NotifyOperatorIntent = "operator_intent"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

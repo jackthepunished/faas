@@ -1754,6 +1754,65 @@ type FireNowRequest struct {
 	FinishedAt   *time.Time
 }
 
+// OperatorIntentStatus is the closed vocabulary for
+// operator_intents.status (migrations/00431). Mirrors the audit-event
+// `operator.action.<verb>.outcome` shape — only `succeeded` and
+// `failed` are emitted by schedd's terminal transition; `cancelled`
+// is reserved for a future operator-cancel surface (schema is
+// forward-compatible).
+type OperatorIntentStatus string
+
+const (
+	OperatorIntentPending   OperatorIntentStatus = "pending"
+	OperatorIntentRunning   OperatorIntentStatus = "running"
+	OperatorIntentSucceeded OperatorIntentStatus = "succeeded"
+	OperatorIntentFailed    OperatorIntentStatus = "failed"
+	OperatorIntentCancelled OperatorIntentStatus = "cancelled"
+)
+
+// OperatorIntentKind is the closed vocabulary for
+// operator_intents.kind (migrations/00431). Matches the CHECK
+// constraint byte-for-byte.
+type OperatorIntentKind string
+
+const (
+	OperatorIntentKindForcePark     OperatorIntentKind = "force_park"
+	OperatorIntentKindForceColdBoot OperatorIntentKind = "force_cold_boot"
+)
+
+// OperatorIntent is one row of operator_intents (migrations/00431).
+// PR #1099 P2 redesign: apid (the only producer) inserts on
+// POST /v1/admin/instances/{id}/force-park or
+// POST /v1/admin/apps/{slug}/force-cold-boot, emits
+// `db.NotifyOperatorIntent`, returns 202 Accepted. schedd (the only
+// consumer) claims the row via ClaimPendingOperatorIntent
+// (FOR UPDATE SKIP LOCKED LIMIT 1), dispatches by kind
+// (force_park → Engine.Park, force_cold_boot →
+// Engine.ForceColdBootNextWake), then transitions status to terminal.
+//
+// Invariant: a single row represents a single admin-action attempt.
+// Admin actions are deliberate re-clicks, not retries, so there is
+// no per-request idempotency wrapper — two clicks produce two intents.
+//
+// Target_id is free-text (NOT a uuid column) because it is either an
+// instance_id (force_park) OR a deployment_id (force_cold_boot). The
+// kind column disambiguates.
+type OperatorIntent struct {
+	ID                 string
+	Kind               OperatorIntentKind
+	TargetID           string
+	AccountID          *string // nil for fleet-level actions (e.g. reclaim_build); set for per-account actions
+	ActorID            string
+	Reason             string
+	Metadata           json.RawMessage
+	Status             OperatorIntentStatus
+	RequestedAt        time.Time
+	StartedAt          *time.Time
+	FinishedAt         *time.Time
+	Error              string
+	SnapIDsMarkedStale []string
+}
+
 // AlertMetric is a closed vocabulary for the metric side of an AlertRule
 // condition (issue #396, ADR-045). Names mirror the AppMetricsResponse
 // payload verbatim so the evaluator and the customer-facing metrics

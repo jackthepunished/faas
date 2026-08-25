@@ -2598,6 +2598,34 @@ type Store interface {
 	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
 	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
 
+	// Operator intent queue (PR #1099 P2 redesign / migrations/00431).
+	// apid inserts on the two admin recovery endpoints
+	// (POST /v1/admin/instances/{id}/force-park and
+	// POST /v1/admin/apps/{slug}/force-cold-boot), emits
+	// db.NotifyOperatorIntent, returns 202 Accepted. schedd (the
+	// only consumer) claims via FOR UPDATE SKIP LOCKED LIMIT 1 and
+	// dispatches by kind. Routes the admin primitives through a
+	// table + pg_notify seam so apid never imports pkg/scheddgrpc
+	// (the apid-control-plane-only depguard rule is preserved).
+	//
+	// Metadata is opaque json.RawMessage; today it's always empty
+	// (force_park / force_cold_boot carry no extra payload) but the
+	// column is reserved for future per-kind fields without a
+	// migration.
+	InsertOperatorIntent(
+		ctx context.Context,
+		kind OperatorIntentKind,
+		targetID string,
+		accountID *string,
+		actorID string,
+		reason string,
+		metadata json.RawMessage,
+	) (string, error)
+	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
+	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
+	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string) error
+	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the
