@@ -1778,6 +1778,18 @@ type OperatorIntentKind string
 const (
 	OperatorIntentKindForcePark     OperatorIntentKind = "force_park"
 	OperatorIntentKindForceColdBoot OperatorIntentKind = "force_cold_boot"
+	// OperatorIntentKindForceRestart is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive (P2d).
+	// Dispatched by schedd's Engine.ForceRestart; the
+	// operator_intents.kind CHECK constraint widened by
+	// migrations/00446 to include this value. Audit envelope:
+	// operator.action.restart_instance (apid, at intent-write)
+	// + operator.action.restart_instance.outcome (schedd, at
+	// terminal). Mirrors the existing two in shape — apid
+	// inserts a pending row + emits db.NotifyOperatorIntent;
+	// schedd claims via FOR UPDATE SKIP LOCKED LIMIT 1 and
+	// dispatches by kind.
+	OperatorIntentKindForceRestart OperatorIntentKind = "force_restart"
 )
 
 // OperatorIntent is one row of operator_intents (migrations/00431).
@@ -1788,7 +1800,8 @@ const (
 // consumer) claims the row via ClaimPendingOperatorIntent
 // (FOR UPDATE SKIP LOCKED LIMIT 1), dispatches by kind
 // (force_park → Engine.Park, force_cold_boot →
-// Engine.ForceColdBootNextWake), then transitions status to terminal.
+// Engine.ForceColdBootNextWake, force_restart → Engine.ForceRestart),
+// then transitions status to terminal.
 //
 // Invariant: a single row represents a single admin-action attempt.
 // Admin actions are deliberate re-clicks, not retries, so there is
