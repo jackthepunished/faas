@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -788,9 +789,17 @@ func reconcileManifestBuilderBase() error {
 		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (manifest pins %s)",
 			envRef, pinned)
 	}
-	if parsed.Digest != pinned {
+	// OCI references carry the algorithm prefix (`sha256:<hex>`), while
+	// production manifests historically store the same digest as raw
+	// 64-character hex. Compare the canonical hex payload so both wire
+	// forms describe the same immutable builder image.
+	if digestHex(parsed.Digest) != digestHex(pinned) {
 		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF digest %q does not match manifest release.builder_base_digest %q (run `gregale manifest validate --file=%s` to inspect)",
 			parsed.Digest, pinned, manifestPath)
 	}
 	return nil
+}
+
+func digestHex(digest string) string {
+	return strings.TrimPrefix(strings.TrimSpace(digest), "sha256:")
 }

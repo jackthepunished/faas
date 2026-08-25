@@ -32,13 +32,15 @@ The command performs these phases in order:
    preflight.
 5. Stage the root-only database environment, a compute trust bundle, image-signing keys,
    signed release assets, bootstrap `gregalectl`, and the manifest.
-6. Run the production `deploy/ansible/bootstrap.yml` compute role.
-7. Install the signed release with `--defer-activation`; the database row is
+6. Register the embedded signed release manifest in `release_bundles` and
+   require its topology hash to match the supplied manifest.
+7. Run the production `deploy/ansible/bootstrap.yml` compute role.
+8. Install the signed release with `--defer-activation`; the database row is
    kept drained while the box is being prepared.
-8. Render the manifest, initialize host-local identity, start the four
+9. Render the manifest, initialize host-local identity, start the four
    compute services, and wait for vmmd's socket, the internal gateway, and
    systemd-active status.
-9. Verify the control-plane row's role, release, manifest hash, and stable
+10. Verify the control-plane row's role, release, manifest hash, and stable
    target URL, then activate the compute row only after all gates pass.
 
 If a phase fails, the node remains non-schedulable. Re-running the same command
@@ -97,6 +99,13 @@ The standard artifact directory contains `release.tar.gz`, its two release
 sidecars, `gregalectl-linux-amd64`, `cosign-linux-amd64`, `pki/`, `sign.key`,
 `sign-pub.pem`, and `compute-db.env`. Individual flags override those
 conventions when an artifact is stored elsewhere.
+
+By default the release SHA comes from `manifest.release.git_sha`. During a
+rolling release transition, an operator may pass `--release-git-sha` to adopt
+the signed bundle supplied in the artifact directory while the topology
+manifest still names the previously installed release. The host installer
+verifies that the tarball's embedded release SHA matches this override; the
+manifest topology hash remains the durable configuration identity.
 
 The join state is durable in `node_join_jobs`. An interrupted or failed join
 can be retried with `--resume`; a lease prevents two operators from changing

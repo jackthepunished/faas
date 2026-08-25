@@ -197,6 +197,7 @@ var cliCommands = []cliCommand{
 					{Name: "ssh-port", Short: "SSH port (default 22)"},
 					{Name: "ssh-key", Short: "optional SSH private key"},
 					{Name: "release-tarball", Short: "signed release.tar.gz"},
+					{Name: "release-git-sha", Short: "optional signed release SHA override"},
 					{Name: "bootstrap-binary", Short: "Linux bootstrap gregalectl"},
 					{Name: "cosign-binary", Short: "cosign verifier"},
 					{Name: "pki-dir", Short: "compute trust-bundle directory (CA private key is never copied)"},
