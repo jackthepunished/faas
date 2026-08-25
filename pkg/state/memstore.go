@@ -5473,6 +5473,24 @@ func (m *MemStore) SweepStuckRunningBuilds(_ context.Context, threshold time.Tim
 	return n, nil
 }
 
+// QueuedBuildsCount (operator-side observability mega-PR / Commit 7
+// — P5) returns the number of builds currently in 'queued' state.
+// Mirrors PgStore.QueuedBuildsCount. Per-node labeling is
+// deferred (builds.target_node_id is not yet a column) so the
+// gauge degrades to a fleet-total — the dashboard renders
+// "X builds in the queue" without per-schedd attribution.
+func (m *MemStore) QueuedBuildsCount(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, b := range m.builds {
+		if b.Status == BuildQueued {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // SetBuildStartedAtForTest is a test-only hook that lets the reaper
 // tests backdate a build's started_at without touching the public
 // Create flow. Mirrors the BackdateForTest pattern on instances.
@@ -8518,20 +8536,48 @@ func (m *MemStore) AppendComputeNodeHeartbeatWithStats(_ context.Context, nodeID
 // pattern). Missing or pre-PR #4 nodes return nil for the stat
 // pointers — the handler renders "—" for those.
 func (m *MemStore) LatestHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return m.latestHeartbeatStatsWhere("", false)
+}
+
+// LatestBuilderHeartbeatStats (operator-side observability
+// mega-PR / Commit 7 — P5) returns the most-recent heartbeat
+// filtered to source='builder_tick'. The underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
+// risk list. In the meantime the table is empty for
+// builder_tick, so this returns the empty slice.
+func (m *MemStore) LatestBuilderHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return m.latestHeartbeatStatsWhere("builder_tick", true)
+}
+
+// latestHeartbeatStatsWhere is the shared implementation for
+// LatestHeartbeatStats (all sources, project silent nodes) and
+// LatestBuilderHeartbeatStats (one source, project only the
+// nodes that have a row). The two projections differ because
+// the vmmd node list is the operator-visible fleet while the
+// builder_tick list is "builderds we have written about" — we
+// don't synthesise entries for nodes that haven't reported.
+func (m *MemStore) latestHeartbeatStatsWhere(sourceFilter string, onlyMatchingNodes bool) ([]ComputeNodeHeartbeatStats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]ComputeNodeHeartbeatStats, 0, len(m.computeNodes))
-	for nodeID := range m.computeNodes {
-		rows := m.computeNodeHeartbeats[nodeID]
-		if len(rows) == 0 {
-			// No heartbeats yet. Still project the node so the
-			// handler can render "no data" rather than dropping
-			// it from the list entirely — the operator needs to
-			// see "node registered but silent" as a signal.
+	for nodeID, rows := range m.computeNodeHeartbeats {
+		// Walk rows in reverse insertion order until we find
+		// one matching the filter. Mirrors pgstore's
+		// `order by received_at desc` semantics.
+		var latest *ComputeNodeHeartbeat
+		for i := len(rows) - 1; i >= 0; i-- {
+			if sourceFilter == "" || rows[i].Source == sourceFilter {
+				latest = &rows[i]
+				break
+			}
+		}
+		if latest == nil {
+			if onlyMatchingNodes {
+				continue
+			}
 			out = append(out, ComputeNodeHeartbeatStats{NodeID: nodeID})
 			continue
 		}
-		latest := rows[len(rows)-1]
 		out = append(out, ComputeNodeHeartbeatStats{
 			NodeID:        nodeID,
 			ReceivedAt:    latest.ReceivedAt,

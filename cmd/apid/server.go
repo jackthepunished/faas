@@ -1509,6 +1509,13 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodesEventsSSE))))
 	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
+	// P5 (operator-side observability mega-PR / Commit 7) —
+	// builderd fleet heartbeat + build-queue depth. Today's row
+	// count is zero: the underlying writer (pkg/builderd/heartbeat.go)
+	// is deferred per the Commit 7 PR risk list — builderd does
+	// not currently self-register a compute_nodes row at startup.
+	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
 
 	// P2a + P2b — operator recovery primitives. Both routes mount
 	// under requireScope(admin-only) so the admin allowlist

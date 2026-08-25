@@ -1258,3 +1258,32 @@ groups:
           summary: "New CVE ≥ medium detected by the nightly cve-check workflow"
           description: "The nightly cve-check workflow (issue #601 / ADR-131) reported a new CVE ≥ medium severity within the last hour. The metric is meterd_cve_check_total{result=\"new_cve\"}; the GitHub Issue created by the workflow lists the CVE id, severity, and affected dependency. Triage: read the GitHub Issue for the CVE id + dep, check deps.dev / nvd.nist.gov for the affected versions + fixed-in version, decide patch vs. accept-risk posture, ship the patch (or the grype ignore). Recover per docs/ops/FaasNewCve.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/ops/FaasNewCve.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Operator-side observability mega-PR — Commit 7 (P5) —
+      # FaasBuildQueueDepthHigh. Pages when the operator dashboard
+      # `faas_build_queue_depth` gauge (fleet-total queued builds,
+      # bumped every 30s by the apid metrics collector) sustains
+      # > 50 queued for 10m. The threshold deliberately errs loose:
+      # builderd's default concurrency budget is 2 microVMs (1
+      # guaranteed + 1 opportunistic, ADR-003), so a sustained
+      # queue > 50 means the cluster's build throughput is
+      # insufficient for the wake rate. Triage: `gregalectl builds
+      # list --status=queued` for the in-flight builds, the
+      # `/v1/admin/obs/builder-heartbeats` endpoint for live
+      # builderd liveness, then the recovery primitives in the
+      # runbook (drain + scale the affected schedd, or recover
+      # the wedged builderd). Recover per
+      # docs/ops/build-queue-stuck.md.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasBuildQueueDepthHigh
+        expr: faas_build_queue_depth > 50
+        for: 10m
+        labels:
+          severity: page
+          component: builderd
+          family: build_queue_stuck
+        annotations:
+          summary: "builderd build queue > 50 queued builds for 10m"
+          description: "The fleet-total queued-builds gauge `faas_build_queue_depth` has exceeded 50 for 10m. With builderd's default concurrency of 2 microVMs (1 guaranteed + 1 opportunistic per ADR-003), sustained depth > 50 means builds are arriving faster than builderd can drain the queue. Triage: `gregalectl builds list --status=queued` for the in-flight builds, `/v1/admin/obs/builder-heartbeats` for live builderd liveness (a missing builder_tick signature means the writer is wedged), `gregalectl builds sweep-stuck --older-than=15m --yes` to reclaim the wedged 'running' rows. Recover per docs/ops/FaasBuildQueueBacklog.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/ops/FaasBuildQueueBacklog.md"

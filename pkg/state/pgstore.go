@@ -6462,6 +6462,24 @@ func (s *PgStore) SweepStuckRunningBuilds(ctx context.Context, threshold time.Ti
 	return int(tag.RowsAffected()), nil
 }
 
+// QueuedBuildsCount (operator-side observability mega-PR / Commit 7
+// — P5) returns the number of builds currently in 'queued' state
+// across the fleet. Per-node labeling is deferred (builds.target_node_id
+// is not yet a column — adding it is a follow-up migration per the
+// PR-open checklist). Today the gauge is a fleet-total; the operator
+// dashboard renders "X builds in the queue" without per-schedd
+// attribution. A partial index on builds(status='queued') keeps
+// this O(matches) instead of O(table).
+func (s *PgStore) QueuedBuildsCount(ctx context.Context) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from builds where status = 'queued'`,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count queued builds: %w", err)
+	}
+	return n, nil
+}
+
 // ClaimQueuedBuild atomically transitions queued → running via a single
 // UPDATE … RETURNING and sets started_at = now(). Returns ErrNotFound
 // when the row is missing OR already in another status — that second
@@ -10744,10 +10762,34 @@ func (s *PgStore) AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeI
 // handler renders it as "no data" with the rest of the
 // compute_nodes row intact).
 func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return s.latestHeartbeatStatsWhere(ctx, "")
+}
+
+// LatestBuilderHeartbeatStats (operator-side observability
+// mega-PR / Commit 7 — P5) returns the most-recent heartbeat
+// filtered to source='builder_tick'. The underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7 risk
+// list — builderd does not currently self-register a
+// compute_nodes row at startup. The mirror method exists today
+// so the GET /v1/admin/obs/builder-heartbeats endpoint can
+// land without waiting on the writer; once the writer is live,
+// the row count goes from zero to non-zero without an API change.
+func (s *PgStore) LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return s.latestHeartbeatStatsWhere(ctx, "where source = 'builder_tick'")
+}
+
+// latestHeartbeatStatsWhere is the shared implementation for
+// the LatestHeartbeatStats / LatestBuilderHeartbeatStats twins.
+// The whereClause string is either empty (all sources) or a
+// bare `where source = '<name>'` clause — interpolated as a
+// literal here, NOT user input, so SQL injection is not a
+// concern; the two callers live in this file.
+func (s *PgStore) latestHeartbeatStatsWhere(ctx context.Context, whereClause string) ([]ComputeNodeHeartbeatStats, error) {
 	rows, err := s.pool.Query(ctx, `
 		select distinct on (node_id)
 		       node_id, received_at, cpu_pct_60s, disk_used_bytes
 		from compute_node_heartbeats
+		`+whereClause+`
 		order by node_id, received_at desc
 	`)
 	if err != nil {

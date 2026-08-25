@@ -3507,6 +3507,26 @@ type Store interface {
 	// done in the handler; this query is just the latest-row-per-node.
 	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
 
+	// LatestBuilderHeartbeatStats (operator-side observability
+	// mega-PR / Commit 7 — P5) is the builder_tick twin of
+	// LatestHeartbeatStats. Filters to source='builder_tick' only;
+	// the underlying writer (pkg/builderd/heartbeat.go) is deferred
+	// to a follow-up PR per the Commit 7 risk list (builderd does
+	// not currently self-register a compute_nodes row at startup).
+	// The mirror method exists today so the
+	// GET /v1/admin/obs/builder-heartbeats endpoint can land
+	// without waiting on the writer; once the writer is live, the
+	// row count goes from zero to non-zero without an API change.
+	LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// QueuedBuildsCount (Commit 7 — P5) returns the number of
+	// builds in 'queued' state across the fleet. Per-node labeling
+	// is deferred (builds.target_node_id is not yet a column; adding
+	// it is a follow-up migration). Today the gauge is a
+	// fleet-total — the operator dashboard renders "X builds in
+	// the queue" without per-schedd attribution.
+	QueuedBuildsCount(ctx context.Context) (int, error)
+
 	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
 	// new per-node utilization fields on /v1/admin/obs/nodes. One row
 	// per compute_node that has at least one live instance.

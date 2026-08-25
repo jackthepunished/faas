@@ -482,3 +482,34 @@ type ObsEventRow struct {
 	Subject string          `json:"subject,omitempty"`
 	Data    json.RawMessage `json:"data,omitempty"`
 }
+
+// ObsBuilderHeartbeatListResponse is the response of the
+// /v1/admin/obs/builder-heartbeats endpoint (operator-side
+// observability mega-PR / Commit 7 — P5). One row per active
+// builderd that has stamped a `builder_tick` heartbeat recently;
+// QueuedBuilds is the fleet-total in-flight build queue.
+//
+// Both fields are always non-nil so the JSON shape is stable on
+// empty / quiet cases — a fresh cluster with no builderds emits
+// `{"items":[],"queued_builds":0}`.
+type ObsBuilderHeartbeatListResponse struct {
+	GeneratedAt  time.Time                `json:"generated_at"`
+	Items        []ObsBuilderHeartbeatRow `json:"items"`
+	QueuedBuilds int                      `json:"queued_builds"`
+}
+
+// ObsBuilderHeartbeatRow is one row of the builderd heartbeat
+// projection. Mirrors ObsHeartbeatRow but for the
+// source='builder_tick' slice — the underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
+// risk list so today's row count is zero. Once the writer
+// is live, the row count goes from zero to non-zero without
+// an API change. CPUPct60s + DiskUsedBytes mirror the vmmd
+// heartbeat columns; nullable because the builderd writer
+// is not yet emitting them.
+type ObsBuilderHeartbeatRow struct {
+	NodeID        string    `json:"node_id"`
+	ReceivedAt    time.Time `json:"received_at"`
+	CPUPct60s     *float64  `json:"cpu_pct_60s,omitempty"`
+	DiskUsedBytes *int64    `json:"disk_used_bytes,omitempty"`
+}
