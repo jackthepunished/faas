@@ -41,7 +41,17 @@ func TestMain(m *testing.M) {
 	setComputeNodesStoreOpener(func() (state.Store, func(), error) {
 		return state.NewMemStore(), func() {}, nil
 	})
-	os.Exit(m.Run())
+	previousNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	_ = os.Unsetenv("NO_COLOR")
+	noColorCached.Store(false)
+	noColorVal = false
+	code := m.Run()
+	if hadNoColor {
+		_ = os.Setenv("NO_COLOR", previousNoColor)
+	} else {
+		_ = os.Unsetenv("NO_COLOR")
+	}
+	os.Exit(code)
 }
 
 // resetMemStore re-wires the seam so successive calls inside the
