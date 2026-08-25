@@ -292,6 +292,7 @@
           - /usr/local/bin/gregalectl
           - secrets
           - init
+          - --preserve-existing
           - --host
           - "{{ faas_join_database_node }}"
       register: faas_secrets_init
