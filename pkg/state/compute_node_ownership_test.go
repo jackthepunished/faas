@@ -101,6 +101,43 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 	}
 }
 
+func TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_MemStore(t *testing.T) {
+	st := state.NewMemStore()
+	ctx := context.Background()
+
+	if _, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name:               "memstore-cert",
+		TargetURL:          "tcp://vmmd-2.faas:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}); err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+
+	base := state.ComputeNode{
+		Name:               "memstore-cert",
+		TargetURL:          "tcp://0.0.0.0:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}
+	if _, err := st.UpsertComputeNodeFromVmmd(ctx, base); err != nil {
+		t.Fatalf("same-fingerprint vmmd upsert: %v", err)
+	}
+
+	base.CertFingerprint = stringPtr("fingerprint-b")
+	if _, err := st.UpsertComputeNodeFromVmmd(ctx, base); !errors.Is(err, state.ErrCertFingerprintDrift) {
+		t.Fatalf("drift upsert error = %v, want ErrCertFingerprintDrift", err)
+	}
+}
+
 func stringPtr(value string) *string { return &value }
 
 // TestUpsertComputeNodeFromVmmd_PreservesOperatorDrain_MemStore pins the
