@@ -508,7 +508,7 @@ groups:
           family: tenant_abuse
         annotations:
           summary: "Tenant {{ $labels.account_id }} exceeding 500 rps for 10m"
-          description: "Customer {{ $labels.account_id }} sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/ops/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+          description: "Customer {{ $labels.account_id }} sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
 
       # ─────────────────────────────────────────────────────────────────
@@ -936,7 +936,7 @@ groups:
           family: cpu_starvation
         annotations:
           summary: "Tenant slice {{ $labels.slice }} throttled > 80% for 5m"
-          description: "Plan sub-slice {{ $labels.slice }} has been > 80% throttled over the rolling 5-minute window for 5m (issue #301 / ADR-044). The cpu.max quota for that plan is saturated; quiescent workloads are preempted. Cross-check the top-throttled-apps Grafana panel for which (account_id, app_id) is the dominant offender, then follow docs/ops/FaasCpuStarvation.md §Recover."
+          description: "Plan sub-slice {{ $labels.slice }} has been > 80% throttled over the rolling 5-minute window for 5m (issue #301 / ADR-044). The cpu.max quota for that plan is saturated; quiescent workloads are preempted. Cross-check the top-throttled-apps Grafana panel for which (account_id, app_id) is the dominant offender, then follow docs/runbooks/FaasCpuStarvation.md §Recover."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasCpuStarvation.md"
 
       # ─────────────────────────────────────────────────────────────────
@@ -1169,7 +1169,7 @@ groups:
           family: cold_boot_ratio
         annotations:
           summary: "vmmd cold-boot fallback > 30 % for 10m"
-          description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/ops/FaasColdBootRatioHigh.md."
+          description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/runbooks/FaasColdBootRatioHigh.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasColdBootRatioHigh.md"
 
       # ─────────────────────────────────────────────────────────────────
