@@ -88,11 +88,11 @@ func TestMemStore_AppendEventWithTrace_RejectsNonOTelHex(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()
 	for _, bad := range []string{
-		"",                  // empty
-		"not-hex",           // non-hex chars
-		"4bf92f3577b34da6a3ce929d0e0e473", // 31 chars (too short)
+		"",                                  // empty
+		"not-hex",                           // non-hex chars
+		"4bf92f3577b34da6a3ce929d0e0e473",   // 31 chars (too short)
 		"4bf92f3577b34da6a3ce929d0e0e47360", // 33 chars (too long)
-		"4BF92F3577B34DA6A3CE929D0E0E4736", // uppercase (CHECK is lowercase only)
+		"4BF92F3577B34DA6A3CE929D0E0E4736",  // uppercase (CHECK is lowercase only)
 	} {
 		badCopy := bad
 		err := m.AppendEventWithTrace(ctx, "test", "kind", nil, []byte(`{}`), &badCopy)
@@ -201,10 +201,10 @@ func TestIsOTelHex32(t *testing.T) {
 		{"00000000000000000000000000000000", true},
 		{"ffffffffffffffffffffffffffffffff", true},
 		{"", false},
-		{"4bf92f3577b34da6a3ce929d0e0e473", false},  // 31
+		{"4bf92f3577b34da6a3ce929d0e0e473", false},   // 31
 		{"4bf92f3577b34da6a3ce929d0e0e47360", false}, // 33
-		{"4BF92F3577B34DA6A3CE929D0E0E4736", false}, // uppercase
-		{"4bf92f3577b34da6a3ce929d0e0e473g", false}, // non-hex char
+		{"4BF92F3577B34DA6A3CE929D0E0E4736", false},  // uppercase
+		{"4bf92f3577b34da6a3ce929d0e0e473g", false},  // non-hex char
 	}
 	for _, c := range cases {
 		if got := isOTelHex32(c.in); got != c.want {

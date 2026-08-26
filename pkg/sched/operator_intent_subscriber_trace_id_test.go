@@ -189,11 +189,11 @@ func TestOperatorIntentSubscriber_ExplicitTraceIDWinsOverSpanContext(t *testing.
 
 	explicit := "4bf92f3577b34da6a3ce929d0e0e4736"
 	data := map[string]any{
-		"actor":      "actor-id",
-		"intent_id":  "intent-id",
-		"target_id":  "target-id",
-		"result":     "succeeded",
-		"trace_id":   explicit, // explicit value supplied by the lift
+		"actor":     "actor-id",
+		"intent_id": "intent-id",
+		"target_id": "target-id",
+		"result":    "succeeded",
+		"trace_id":  explicit, // explicit value supplied by the lift
 	}
 	auditor.Emit(otelCtx, "operator.action.test", nil, data)
 
