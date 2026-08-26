@@ -8,11 +8,19 @@
 //     operatorActionTraceCompletenessRatio<kind>).
 //     SELECT kind, count(*) FILTER (WHERE trace_id IS NOT
 //     NULL)::float / count(*) FROM events WHERE kind LIKE
-//     'operator.action.%' AND received_at > now() - interval
+//     'operator.action.%' AND at > now() - interval
 //     '5 minutes' GROUP BY kind. Kinds absent from the result
 //     are treated as 1.0 (no rows ⇒ vacuously complete) so the
 //     pre-instantiated gauge surfaces zero only when there is
-//     evidence of a coverage gap.
+//     evidence of a coverage gap. The window predicate reads
+//     `at`, NOT `received_at` — `events.at` is the canonical
+//     timestamp column (migrations/00001_init.sql:132;
+//     `received_at` belongs to compute_node_heartbeats and
+//     audit_log, different tables). The previous
+//     received_at-shaped predicate raised "column does not
+//     exist" at runtime and zeroed the gauge via the catch-all
+//     best-effort log path; the query now reads `at` and the
+//     ratio surfaces a real value.
 //
 //  2. Stuck-running operator_intent count per kind (the counter
 //     operatorIntentOutcomeMissingTotal<kind>). Reads
@@ -168,7 +176,7 @@ func (l *Loop) observeTraceCompletenessRatio(ctx context.Context, gaugeUpdates *
 		    END AS ratio
 		FROM events
 		WHERE kind LIKE 'operator.action.%'
-		  AND received_at > now() - ($1::text || ' seconds')::interval
+		  AND at > now() - ($1::text || ' seconds')::interval
 		GROUP BY kind
 	`, int64(operatorIntentCompletenessWindow.Seconds()))
 	if err != nil {
