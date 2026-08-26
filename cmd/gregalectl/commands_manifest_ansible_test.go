@@ -62,6 +62,9 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `faas_gateway_listen: "0.0.0.0:8080"`) {
 		t.Errorf("compute host vars missing split gateway listener:\n%s", computeVars)
 	}
+	if !strings.Contains(computeVars, `faas_gateway_target_url: "tcp://10.42.0.2:8080"`) {
+		t.Errorf("compute host vars missing database-discovered gateway target:\n%s", computeVars)
+	}
 	// Multi-host safety cluster PR-9 (audit F8-B): the manifest
 	// renderer must emit faas_public_listen_addr + faas_public_control_addr
 	// so a correctly bootstrapped fleet never reaches the PR-8
@@ -100,10 +103,10 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(controlVars, `faas_compute_allowed_cidrs: ["10.42.0.2/32"]`) {
 		t.Errorf("control host vars missing compute scheduler allowlist:\n%s", controlVars)
 	}
-	if !strings.Contains(controlVars, `faas_gatewayd_internal_target: "tcp://10.42.0.2:8080"`) {
-		t.Errorf("control host vars missing split gateway target:\n%s", controlVars)
+	if !strings.Contains(controlVars, "faas_compute_gateway_discovery: database") {
+		t.Errorf("control host vars missing database gateway discovery:\n%s", controlVars)
 	}
-	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://10.42.0.2:8080"`) {
+	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://127.0.0.1:8080"`) {
 		t.Errorf("control host vars missing schedd synth target:\n%s", controlVars)
 	}
 	if !strings.Contains(controlVars, `faas_schedd_gateway_metrics_url: ""`) {
@@ -166,6 +169,10 @@ func TestRenderManifestAnsibleFiles_TwoComputeTargetsAreDistinct(t *testing.T) {
 	if !strings.Contains(fsn3Vars, `faas_vmmd_target_url: "tcp://fsn-3.gregale.dev:50051"`) {
 		t.Errorf("fsn-3 target is not node-specific:\n%s", fsn3Vars)
 	}
+	if !strings.Contains(fsn2Vars, `faas_gateway_target_url: "tcp://fsn-2.gregale.dev:8080"`) ||
+		!strings.Contains(fsn3Vars, `faas_gateway_target_url: "tcp://fsn-3.gregale.dev:8080"`) {
+		t.Errorf("compute gateway targets are not node-specific:\nfsn-2=%s\nfsn-3=%s", fsn2Vars, fsn3Vars)
+	}
 	if strings.Count(fsn2Vars, `names: ["fsn-2.gregale.dev", "vmmd.faas", "egress.faas"]`) != 1 {
 		t.Errorf("first compute compatibility aliases missing or duplicated:\n%s", fsn2Vars)
 	}
@@ -202,7 +209,7 @@ func TestRenderManifestAnsibleFiles_HostnameEndpointsUseOverlayBoundary(t *testi
 	}
 	for _, want := range []string{
 		`ansible_host: "fsn-1.gregale.dev"`,
-		`faas_gatewayd_internal_target: "tcp://fsn-2.gregale.dev:8080"`,
+		`faas_compute_gateway_discovery: database`,
 		`faas_postgres_listen_addresses: "fsn-1.gregale.dev"`,
 		`faas_postgres_allowed_cidrs: ["10.42.0.0/24"]`,
 		`faas_compute_allowed_cidrs: ["10.42.0.0/24"]`,

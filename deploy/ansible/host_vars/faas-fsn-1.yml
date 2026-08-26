@@ -13,6 +13,10 @@
 faas_box_role: control-plane
 faas_node_name: fsn-1
 gatewayd_apps_domain: gregale.dev
+# The public edge keeps the control-plane API local and discovers compute
+# gateways from the database. Draining any single compute box therefore
+# cannot make the API entrypoint unhealthy.
+faas_compute_gateway_discovery: database
 
 # Ansible connection vars. `ansible_host` is the cross-box addressing
 # target (Layer-3 mesh endpoint: Tailscale/Wireguard IP, internal LAN,

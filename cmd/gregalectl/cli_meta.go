@@ -117,6 +117,7 @@ var cliCommands = []cliCommand{
 				Flags: []cliFlag{
 					{Name: "name", Short: "fqdn / short-hostname of the new node (required)"},
 					{Name: "target-url", Short: "routable dial target for vmmd (tcp://vmmd-N.faas:50051 or unix://...)"},
+					{Name: "gateway-target-url", Short: "private HTTP target for gatewayd-internal (tcp://host:port)"},
 					{Name: "vpcpus", Short: "vCPU count reported to schedd"},
 					{Name: "mem-mb", Short: "RAM MB reported to schedd"},
 					{Name: "max-concurrency", Short: "max concurrent live instances"},

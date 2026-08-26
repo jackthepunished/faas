@@ -244,6 +244,23 @@ func TestInternalReverseProxy_DialFailure_502BadGateway(t *testing.T) {
 	}
 }
 
+func TestInternalReverseProxy_NoComputeCapacity_503(t *testing.T) {
+	dialer := &stubDialer{dialErr: ErrNoComputeCapacity}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if got := rr.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want 5", got)
+	}
+	if !strings.Contains(rr.Body.String(), "compute capacity unavailable") {
+		t.Errorf("body = %q, want compute capacity unavailable", rr.Body.String())
+	}
+}
+
 // TestInternalReverseProxy_UpstreamError_StatusPropagated verifies
 // 5xx responses from the internal daemon flow through unchanged
 // (we don't mask upstream errors).

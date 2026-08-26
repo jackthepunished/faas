@@ -260,6 +260,7 @@ curl -fsS -X POST 'https://faas-fsn-1:8081/v1/compute-nodes' \
   -d '{
     "name": "fsn-2",
     "target_url": "tcp://vmmd-2.faas:50051",
+    "gateway_target_url": "tcp://fsn-2.gregale.dev:8080",
     "vpcpus": 160,
     "mem_mb": 56000,
     "max_concurrency": 200,
