@@ -99,6 +99,9 @@ func (s *PgStore) MarkRuntimeConfigOperationBlocked(ctx context.Context, id, pha
 }
 
 func (s *PgStore) finishRuntimeConfigOperation(ctx context.Context, id string, status RuntimeConfigOperationStatus, phase, message string, effectiveValue json.RawMessage, appliedCount, targetCount int) error {
+	if effectiveValue == nil {
+		effectiveValue = json.RawMessage("null")
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("state: finish runtime config operation begin: %w", err)
