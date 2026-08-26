@@ -8810,6 +8810,101 @@ func (m *MemStore) PerNodeLiveStats(_ context.Context) ([]PerNodeStats, error) {
 	return out, nil
 }
 
+// OperatorCapacity mirrors PgStore.OperatorCapacity without exposing the
+// underlying app or instance rows. MemStore keeps the same placement and live
+// state semantics so operator endpoint tests exercise the production shape.
+func (m *MemStore) OperatorCapacity(_ context.Context) (OperatorCapacitySnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	byNode := make(map[string]int, len(m.computeNodes))
+	out := OperatorCapacitySnapshot{Nodes: make([]OperatorCapacityNode, 0, len(m.computeNodes))}
+	for id, n := range m.computeNodes {
+		row := OperatorCapacityNode{
+			ID:                 n.ID,
+			Name:               n.Name,
+			Active:             n.Active,
+			VPCPUs:             n.VPCPUs,
+			VCPUBudget:         n.VCPUBudget,
+			MemMB:              n.MemMB,
+			AdmissionCeilingMB: n.AdmissionCeilingMB,
+		}
+		if row.ID == "" {
+			row.ID = id
+		}
+		out.Nodes = append(out.Nodes, row)
+		byNode[row.ID] = len(out.Nodes) - 1
+	}
+
+	tenantIDs := make(map[string]struct{})
+	for _, app := range m.apps {
+		if app.Status == AppDeleted {
+			continue
+		}
+		out.AppsTotal++
+		tenantIDs[app.AccountID] = struct{}{}
+		if app.NodeID == "" {
+			out.UnplacedApps++
+			continue
+		}
+		if nodeIndex, ok := byNode[app.NodeID]; ok {
+			out.Nodes[nodeIndex].AppsCount++
+			// A node-local set is not needed: each app contributes once
+			// to its owner's tenant count in the placement projection.
+		}
+	}
+	out.TenantsTotal = int64(len(tenantIDs))
+
+	// Recount per-node tenant placements exactly, matching COUNT(DISTINCT
+	// account_id) in the SQL projection.
+	tenantsByNode := make(map[string]map[string]struct{})
+	for _, app := range m.apps {
+		if app.Status == AppDeleted || app.NodeID == "" {
+			continue
+		}
+		if _, ok := byNode[app.NodeID]; !ok {
+			continue
+		}
+		set := tenantsByNode[app.NodeID]
+		if set == nil {
+			set = make(map[string]struct{})
+			tenantsByNode[app.NodeID] = set
+		}
+		set[app.AccountID] = struct{}{}
+	}
+	for nodeID, set := range tenantsByNode {
+		out.Nodes[byNode[nodeID]].TenantsCount = int64(len(set))
+	}
+
+	for _, inst := range m.instances {
+		if !isInstanceStateLive(inst.State) || inst.NodeID == "" {
+			continue
+		}
+		nodeIndex, ok := byNode[inst.NodeID]
+		if !ok {
+			continue
+		}
+		node := &out.Nodes[nodeIndex]
+		node.InstancesLive++
+		switch inst.State {
+		case instanceStateRunning:
+			node.InstancesRunning++
+		case instanceStateWaking:
+			node.InstancesWaking++
+		case instanceStateColdBooting:
+			node.InstancesColdBooting++
+		}
+		node.RAMUsedMB += int64(inst.RAMMB) + 8
+	}
+	sort.Slice(out.Nodes, func(i, j int) bool {
+		if out.Nodes[i].Active != out.Nodes[j].Active {
+			return out.Nodes[i].Active
+		}
+		return out.Nodes[i].Name < out.Nodes[j].Name
+	})
+	return out, nil
+}
+
 // AppendEvent (commit 4) fixes two pre-existing bugs that the audit-log
 // PR surfaced. Before: the row's Subject pointer was dropped on the
 // floor (line 1226-1227 had a dead type-assertion placeholder and

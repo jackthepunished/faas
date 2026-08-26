@@ -145,6 +145,111 @@ type ObsTenantDetailResponse struct {
 	Sessions ObsTenantCounts `json:"sessions"`
 }
 
+// ObsTenant360Response is the bounded operator view for one tenant. It keeps
+// the existing identity/application projection and adds month-scoped usage
+// plus a small billing window, so routine support work does not require a
+// direct database query.
+type ObsTenant360Response struct {
+	Account  ObsTenantRow     `json:"account"`
+	Apps     []ObsTenantApp   `json:"apps"`
+	Orgs     []ObsTenantOrg   `json:"orgs"`
+	APIKeys  ObsTenantCounts  `json:"api_keys"`
+	Sessions ObsTenantCounts  `json:"sessions"`
+	Usage    ObsTenantUsage   `json:"usage"`
+	Billing  ObsTenantBilling `json:"billing"`
+}
+
+type ObsTenantUsage struct {
+	Month           string              `json:"month"`
+	UsedGBHours     float64             `json:"used_gb_hours"`
+	IncludedGBHours int64               `json:"included_gb_hours"`
+	OverageGBHours  float64             `json:"overage_gb_hours"`
+	OverageCents    int64               `json:"overage_cents"`
+	UsedCPUHours    float64             `json:"used_cpu_hours"`
+	UsedEgressGB    float64             `json:"used_egress_gb"`
+	UsedIngressGB   float64             `json:"used_ingress_gb"`
+	ColdBootTotal   int64               `json:"cold_boots"`
+	Requests        int64               `json:"requests"`
+	Apps            []ObsTenantUsageApp `json:"apps"`
+}
+
+type ObsTenantUsageApp struct {
+	AppID      string `json:"app_id"`
+	AppSlug    string `json:"app_slug,omitempty"`
+	MBSeconds  int64  `json:"mb_seconds"`
+	CPUUsec    int64  `json:"cpu_usec"`
+	Requests   int64  `json:"requests"`
+	TXBytes    int64  `json:"tx_bytes"`
+	NetTxBytes int64  `json:"net_tx_bytes"`
+	NetRxBytes int64  `json:"net_rx_bytes"`
+	ColdBoots  int64  `json:"cold_boots"`
+}
+
+type ObsTenantBilling struct {
+	CurrentMonthOverageCents int64               `json:"current_month_overage_cents"`
+	OverageCapCents          *int64              `json:"overage_cap_cents,omitempty"`
+	ActiveCreditsCents       int64               `json:"active_credits_cents"`
+	Invoices                 []ObsInvoiceSummary `json:"invoices"`
+}
+
+type ObsInvoiceSummary struct {
+	ID              string    `json:"id"`
+	Provider        string    `json:"provider"`
+	Number          string    `json:"number,omitempty"`
+	Status          string    `json:"status"`
+	Currency        string    `json:"currency"`
+	PeriodStart     time.Time `json:"period_start"`
+	PeriodEnd       time.Time `json:"period_end"`
+	TotalCents      int64     `json:"total_cents"`
+	AmountPaidCents int64     `json:"amount_paid_cents"`
+}
+
+// ObsCapacityResponse is the bounded fleet capacity snapshot used by the
+// operator capacity page. It contains resource headroom and placement
+// counters, never workload rows.
+type ObsCapacityResponse struct {
+	GeneratedAt time.Time          `json:"generated_at"`
+	Summary     ObsCapacitySummary `json:"summary"`
+	Nodes       []ObsCapacityNode  `json:"nodes"`
+}
+
+type ObsCapacitySummary struct {
+	TotalNodes              int   `json:"total_nodes"`
+	ActiveNodes             int   `json:"active_nodes"`
+	InactiveNodes           int   `json:"inactive_nodes"`
+	TotalVCPUs              int64 `json:"total_vcpus"`
+	TotalVCPUBudget         int64 `json:"total_vcpu_budget"`
+	TotalMemMB              int64 `json:"total_mem_mb"`
+	TotalAdmissionCeilingMB int64 `json:"total_admission_ceiling_mb"`
+	RAMUsedMB               int64 `json:"ram_used_mb"`
+	AdmissionMarginMB       int64 `json:"admission_margin_mb"`
+	InstancesLive           int64 `json:"instances_live"`
+	InstancesRunning        int64 `json:"instances_running"`
+	InstancesWaking         int64 `json:"instances_waking"`
+	InstancesColdBooting    int64 `json:"instances_cold_booting"`
+	AppsTotal               int64 `json:"apps_total"`
+	TenantsTotal            int64 `json:"tenants_total"`
+	UnplacedApps            int64 `json:"unplaced_apps"`
+}
+
+type ObsCapacityNode struct {
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	Active               bool   `json:"active"`
+	VPCPUs               int    `json:"vpcpus"`
+	VCPUBudget           int    `json:"vcpu_budget"`
+	MemMB                int    `json:"mem_mb"`
+	AdmissionCeilingMB   int    `json:"admission_ceiling_mb"`
+	InstancesLive        int64  `json:"instances_live"`
+	InstancesRunning     int64  `json:"instances_running"`
+	InstancesWaking      int64  `json:"instances_waking"`
+	InstancesColdBooting int64  `json:"instances_cold_booting"`
+	RAMUsedMB            int64  `json:"ram_used_mb"`
+	AdmissionMarginMB    int64  `json:"admission_margin_mb"`
+	AppsCount            int64  `json:"apps_count"`
+	TenantsCount         int64  `json:"tenants_count"`
+}
+
 // ObsTenantActivityResponse is the bounded activity view for one tenant.
 // It intentionally carries invocation metadata and audit metadata only:
 // request payloads, results, headers, and audit data may contain customer
