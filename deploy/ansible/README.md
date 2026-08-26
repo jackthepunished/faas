@@ -11,6 +11,7 @@ In order (each role is independent and verifies its own preconditions):
 |---|---|---|---|
 | `cgroups_v2` | §11 | asserts kernel cmdline | verify-only |
 | `grub` | §11 | `/etc/default/grub`, sysctl | `creates:` sentinel, regex match |
+| `storage` | §8 | provider-neutral `/srv/fc` filesystem and directory contract | reuses valid mounts; initializes only eligible blank devices |
 | `lvm` | §8 | verify lv-system / lv-fc when the reference layout is selected | verify-only |
 | `xfs` | §8 | dedicated fast-root mount, XFS features, `/srv/fc/jail` tmpfs | explicit device contract + `/etc/fstab` |
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
@@ -110,10 +111,17 @@ The fast-root contract is provider-neutral. Set
 provider's `/dev/disk/by-id/...` name, or pass `--storage-device` to
 `deploy join-node`. The `xfs` role accepts an existing XFS filesystem or,
 only when `--format-storage` is explicitly supplied, a blank block device.
-It never selects a disk by size or formats an unknown device. Every
+The `xfs` role never selects a disk by size or formats an unknown device. Every
 production compute host must end with a dedicated XFS mount at
 `storage.fast_root`, with `reflink=1` and `prjquota`; a root-filesystem
 fallback is rejected.
+
+The preceding `storage` role provides the provider-neutral automatic path.
+When no explicit device is declared, it selects exactly one blank non-root
+disk or two equally-sized blank non-root disks for a mirror. It still refuses
+mounted, signed, partitioned, or ambiguous devices. An explicitly declared
+blank device remains protected by the `--format-storage` /
+`faas_storage_format` consent gate; an existing XFS device is reused.
 
 For a split-box manifest, the generated control-plane variables also
 declare the database listener address and the compute `/32` allow-list.

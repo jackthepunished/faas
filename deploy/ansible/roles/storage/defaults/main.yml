@@ -1,0 +1,21 @@
+---
+# Provider-neutral storage contract for the Firecracker working tree.
+#
+# auto is intentionally conservative: an already-valid /srv/fc mount is
+# reused; otherwise exactly one blank non-root disk is formatted, or exactly
+# two equally-sized blank non-root disks are mirrored. A disk is eligible
+# only when wipefs reports no signatures, so an existing disk is never
+# silently destroyed.
+faas_storage_mode: auto
+faas_storage_mount: /srv/fc
+faas_storage_redundancy: auto
+faas_storage_device: ""
+# Auto-discovered blank disks are part of the provider-neutral workflow. An
+# explicitly named blank device still requires operator consent.
+faas_storage_format: false
+# Do not accidentally consume a small scratch/ephemeral disk. Override this
+# policy for a deliberately smaller test fleet.
+faas_storage_min_bytes: 53687091200
+faas_storage_mount_options: noatime,prjquota
+faas_storage_filesystem: xfs
+faas_storage_label: faas-fc

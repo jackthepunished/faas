@@ -64,6 +64,8 @@
     # Shared preconditions (every box):
     - role: cgroups_v2
     - role: grub
+    - role: storage
+      tags: [storage]
     - role: lvm
     - role: xfs
     - role: firecracker
@@ -100,6 +102,8 @@
     # production paging credentials or run a second Alertmanager instance.
     - role: cgroups_v2
     - role: grub
+    - role: storage
+      tags: [storage]
     - role: lvm
     - role: xfs
     - role: firecracker
