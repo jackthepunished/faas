@@ -142,6 +142,60 @@ func TestListCorsPresets_HappyPath(t *testing.T) {
 	}
 }
 
+// TestListCorsPresets_AppIDQueryFilter pins the GET /v1/cors-presets
+// ?app_id=... query parameter (issue #975 #4 PR-B / ADR-129). The
+// filter is read from r.URL.Query() (NOT r.Body — GETs have no
+// body, so a previous implementation that decoded the filter from
+// the request body always saw filter.AppID == nil and silently
+// returned the account-wide set). The expected behaviour: the
+// handler scopes ListCorsPresetsForApp to the given app_id and
+// returns ONLY the app-scoped presets; an unknown / cross-tenant
+// app_id returns 404 (no slug-leak).
+func TestListCorsPresets_AppIDQueryFilter(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	// One app-scoped preset for cors-list-app, one account-wide
+	// preset, one app-scoped preset for a different app.
+	appID := mustSeedApp(t, e, "cors-list-app")
+	otherAppID := mustSeedApp(t, e, "cors-list-other")
+	appScoped := mustSeedCorsPreset(t, e, "for-app", appID)
+	_ = mustSeedCorsPreset(t, e, "acct-wide", "")
+	_ = mustSeedCorsPreset(t, e, "for-other", otherAppID)
+
+	rec := e.do(t, "GET", "/v1/cors-presets?app_id="+appID, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list with app_id: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var out api.CorsPresetListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(out.Presets) != 1 {
+		t.Fatalf("got %d presets, want 1 (app_id filter must scope to app-scoped only)", len(out.Presets))
+	}
+	if out.Presets[0].ID != appScoped.ID {
+		t.Errorf("presets[0].id = %q, want %q (filter must return the app-scoped preset)", out.Presets[0].ID, appScoped.ID)
+	}
+}
+
+// TestListCorsPresets_AppIDQueryFilter_CrossTenantReturns404 pins
+// the cross-tenant IDOR guard on the GET /v1/cors-presets?app_id=
+// path. A query parameter carrying an app_id the caller's account
+// doesn't own must collapse to 404 (matches the precedent at
+// handlers_alerts.go:243-247 — no slug-leak). Without this gate,
+// a customer could probe other tenants' app ids by checking
+// whether the response is a 200 empty-list or a 404.
+func TestListCorsPresets_AppIDQueryFilter_CrossTenantReturns404(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	// Seed an app under a different account.
+	otherEnv := setup(t, api.PlanHobby)
+	otherAppID := mustSeedApp(t, otherEnv, "foreign-app")
+
+	rec := e.do(t, "GET", "/v1/cors-presets?app_id="+otherAppID, nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("cross-tenant app_id: status %d, want 404 (no slug-leak)", rec.Code)
+	}
+}
+
 // TestGetCorsPreset_HappyPath confirms the by-id read path
 // returns the canonical row.
 func TestGetCorsPreset_HappyPath(t *testing.T) {

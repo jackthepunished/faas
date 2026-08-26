@@ -94,7 +94,10 @@ func (s *server) createCorsPreset(w http.ResponseWriter, r *http.Request, acct s
 // round trip.
 func (s *server) listCorsPresets(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	var filter api.CorsPresetListFilter
-	_ = decodeJSON(r, &filter) // query params; ignore body decode errors
+	if v := r.URL.Query().Get("app_id"); v != "" {
+		id := v
+		filter.AppID = &id
+	}
 	if filter.AppID != nil {
 		if prob := s.gateCorsPresetApp(r.Context(), acct, filter.AppID); prob != nil {
 			api.WriteProblem(w, prob)
@@ -196,10 +199,10 @@ func (s *server) patchCorsPreset(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	s.audit.Emit(r.Context(), "cors_preset.updated", &acct.ID, map[string]any{
-		"preset_id":   row.ID,
-		"account_id":  row.AccountID,
-		"app_id":      row.AppID,
-		"name":        row.Name,
+		"preset_id":  row.ID,
+		"account_id": row.AccountID,
+		"app_id":     row.AppID,
+		"name":       row.Name,
 	})
 	s.log.Info("cors preset updated",
 		"preset", logsanitize.Field(row.ID),
