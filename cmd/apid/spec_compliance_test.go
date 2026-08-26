@@ -272,33 +272,40 @@ var dtoExclude = map[string]bool{
 	"ObsEventRow":                     true,
 	"ObsBuilderHeartbeatListResponse": true,
 	"ObsBuilderHeartbeatRow":          true,
-	// PR #1111 / Obs-Meta + Trace-IDs Mega-PR — additional
-	// admin-only Obs* DTOs surfaced by C7's GET
-	// /v1/admin/obs/health endpoint and the broader ops
-	// surface. Same rationale as the ObsOverviewResponse
-	// block above: admin routes intentionally not registered
-	// in the public OpenAPI spec.
+	// P2d / C5/C7 mega-PR follow-on DTOs (Obs-Meta + Trace-IDs
+	// Mega-PR / PR #1111): admin-only shapes for /v1/admin/obs/*
+	// surface; intentionally undocumented for public consumers.
+	// The C7 follow-on registers ONLY the new ObsHealthResponse —
+	// every other Obs* DTO stays admin-only and is excluded here.
 	"ObsAccountMutationResponse": true,
 	"ObsAppDetail":               true,
 	"ObsAppDetailResponse":       true,
 	"ObsAppHealth":               true,
 	"ObsAuditActivityRow":        true,
-	"ObsCapacityNode":            true,
-	"ObsCapacityResponse":        true,
-	"ObsCapacitySummary":         true,
-	"ObsDeploymentRow":           true,
-	"ObsInstanceRow":             true,
-	"ObsInvocationRow":           true,
-	"ObsInvoiceSummary":          true,
-	"ObsNodeApp":                 true,
-	"ObsNodeDetailResponse":      true,
-	"ObsNodeDrainStatus":         true,
-	"ObsNodeMutationResponse":    true,
-	"ObsTenant360Response":       true,
-	"ObsTenantActivityResponse":  true,
-	"ObsTenantBilling":           true,
-	"ObsTenantUsage":             true,
-	"ObsTenantUsageApp":          true,
+	// ADR-115 capacity PR (post-PR #1111): admin-only capacity
+	// snapshot shapes — same admin-only posture as the other
+	// Obs* DTOs above; not registered in api/openapi.yaml.
+	"ObsCapacityNode":     true,
+	"ObsCapacityResponse": true,
+	"ObsCapacitySummary":  true,
+	"ObsDeploymentRow":    true,
+	"ObsInstanceRow":      true,
+	"ObsInvocationRow":    true,
+	// ObsInvoiceSummary: PR #1099 P3 follow-on (post-PR #1111);
+	// admin-only billing summary shape.
+	"ObsInvoiceSummary":       true,
+	"ObsNodeApp":              true,
+	"ObsNodeDetailResponse":   true,
+	"ObsNodeDrainStatus":      true,
+	"ObsNodeMutationResponse": true,
+	// ObsTenant360Response / ObsTenantBilling / ObsTenantUsage*:
+	// PR #1099 P4 (post-PR #1111); admin-only tenant 360 + billing
+	// + usage shapes; intentionally undocumented.
+	"ObsTenant360Response":      true,
+	"ObsTenantActivityResponse": true,
+	"ObsTenantBilling":          true,
+	"ObsTenantUsage":            true,
+	"ObsTenantUsageApp":         true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
