@@ -64,7 +64,10 @@ func UnitSchedd() daemonunit.Unit {
 		// on both means a missing file at boot is non-fatal — the
 		// loader then falls back to the plaintext-PEM path
 		// (loadOrGenerateSchedKey).
-		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/secrets/schedd/schedd.env",
+		// Shared OCI storage is the authoritative snapshot/layer source on
+		// multi-box deployments. The optional prefix keeps single-box/local
+		// development bootable when storage.env has not been provisioned yet.
+		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/secrets/schedd/schedd.env -/etc/faas/storage.env",
 		Environment: []daemonunit.KV{
 			{Key: "TMPDIR", Value: "/var/lib/faas/oci-tmp"},
 		},

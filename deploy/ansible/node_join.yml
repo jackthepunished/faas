@@ -67,6 +67,15 @@
         mode: "0600"
       no_log: true
 
+    - name: Stage the shared OCI storage environment
+      ansible.builtin.copy:
+        src: "{{ faas_join_storage_env_source }}"
+        dest: /etc/faas/storage.env
+        owner: root
+        group: faas
+        mode: "0440"
+      no_log: true
+
     - name: Stage the compute trust bundle (the source never includes the CA private key)
       ansible.builtin.copy:
         src: "{{ faas_join_pki_source }}/"

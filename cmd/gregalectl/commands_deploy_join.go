@@ -42,6 +42,7 @@ type deployJoinOptions struct {
 	SignKeySource      string
 	VerifyKeySource    string
 	ComputeDBEnvSource string
+	StorageEnvSource   string
 	StorageDevice      string
 	FormatStorage      bool
 	BoxAgeKeySource    string
@@ -117,6 +118,7 @@ func cmdDeployJoinNode(args []string) int {
 	signKey := fs.String("sign-key", "", "image-signing private key (required for apply)")
 	verifyKey := fs.String("verify-key", "", "image-signing public key (required for apply)")
 	computeDBEnv := fs.String("compute-db-env", "", "root-only compute-db.env source (required for apply)")
+	storageEnv := fs.String("storage-env", "", "shared OCI storage.env source (required for multi-box apply)")
 	storageDevice := fs.String("storage-device", "", "optional fast-root block device (must be an absolute path; manifest host value is used when omitted)")
 	formatStorage := fs.Bool("format-storage", false, "format an explicitly supplied blank storage device as XFS with reflink support")
 	boxAgeKey := fs.String("box-age-key", "", "optional box-age identity source (artifact-dir convention: box-age-key)")
@@ -155,6 +157,7 @@ func cmdDeployJoinNode(args []string) int {
 		SignKeySource:      *signKey,
 		VerifyKeySource:    *verifyKey,
 		ComputeDBEnvSource: *computeDBEnv,
+		StorageEnvSource:   *storageEnv,
 		StorageDevice:      *storageDevice,
 		FormatStorage:      *formatStorage,
 		BoxAgeKeySource:    *boxAgeKey,
@@ -414,6 +417,7 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 		"sign-key":         opts.SignKeySource,
 		"verify-key":       opts.VerifyKeySource,
 		"compute-db-env":   opts.ComputeDBEnvSource,
+		"storage-env":      opts.StorageEnvSource,
 	} {
 		if path == "" {
 			return report, fmt.Errorf("--%s is required for apply", name)
@@ -425,6 +429,9 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 		if name != "pki-dir" && !info.Mode().IsRegular() {
 			return report, fmt.Errorf("--%s must be a regular file", name)
 		}
+	}
+	if err := validateSharedStorageEnv(opts.StorageEnvSource); err != nil {
+		return report, fmt.Errorf("--storage-env: %w", err)
 	}
 	for name, path := range map[string]string{
 		"box-age-key":            opts.BoxAgeKeySource,
@@ -580,6 +587,7 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		"faas_join_sign_key_source":          opts.SignKeySource,
 		"faas_join_verify_key_source":        opts.VerifyKeySource,
 		"faas_join_compute_db_env_source":    opts.ComputeDBEnvSource,
+		"faas_join_storage_env_source":       opts.StorageEnvSource,
 		"faas_join_storage_device":           opts.StorageDevice,
 		"faas_join_format_storage":           opts.FormatStorage,
 		"faas_join_box_age_key_source":       opts.BoxAgeKeySource,
@@ -804,6 +812,7 @@ func resolveJoinArtifacts(opts *deployJoinOptions) {
 	resolve(&opts.SignKeySource, "sign.key")
 	resolve(&opts.VerifyKeySource, "sign-pub.pem")
 	resolve(&opts.ComputeDBEnvSource, "compute-db.env")
+	resolve(&opts.StorageEnvSource, "storage.env")
 	resolveIfPresent(&opts.BoxAgeKeySource, "box-age-key")
 	resolveIfPresent(&opts.RcloneEnvelope, "rclone.conf.age")
 	resolveIfPresent(&opts.ArchiveEnvelope, "archive-creds.json.age")
@@ -929,6 +938,54 @@ func hasDatabaseURLLine(path string) bool {
 		}
 	}
 	return false
+}
+
+// validateSharedStorageEnv enforces the multi-box storage contract at the
+// provider-neutral join boundary. The file is still copied verbatim to both
+// hosts; parsing here only prevents a join that would silently run with
+// host-local snapshots or without a shared registry.
+func validateSharedStorageEnv(path string) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	values := make(map[string]string)
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), "\"'")
+		values[key] = value
+		seen[key] = true
+	}
+	if values["FAAS_STORAGE_BACKEND"] != "oci" {
+		return errors.New("must set FAAS_STORAGE_BACKEND=oci")
+	}
+	if strings.TrimSpace(values["FAAS_OCI_REGISTRY"]) == "" {
+		return errors.New("must set FAAS_OCI_REGISTRY")
+	}
+	if raw := values["FAAS_STORAGE_LOCAL_PREFIXES"]; raw != "" {
+		for _, prefix := range strings.Split(raw, ",") {
+			prefix = strings.TrimSpace(prefix)
+			if !strings.HasSuffix(prefix, "/") {
+				prefix += "/"
+			}
+			if prefix == "snap/" {
+				return errors.New("FAAS_STORAGE_LOCAL_PREFIXES must not include snap/")
+			}
+		}
+	}
+	if seen["FAAS_STORAGE_CACHE_DIR"] && strings.TrimSpace(values["FAAS_STORAGE_CACHE_DIR"]) == "" {
+		return errors.New("FAAS_STORAGE_CACHE_DIR must not be empty; the node-local cache is required for prepositioned wakes")
+	}
+	return nil
 }
 
 func releaseAssetPath(tarballPath, name string) (string, error) {

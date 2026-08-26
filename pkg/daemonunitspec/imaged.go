@@ -77,11 +77,11 @@ func UnitImaged() daemonunit.Unit {
 			"cap_sys_chroot",
 		},
 
-		// Issue #585 / ADR-127: sealed.env dropped; per-daemon compute-db.env
-		// (DATABASE_URL) is the only EnvironmentFile=. The optional '-' prefix
-		// remains so an image-seeded compute node can boot before secrets
-		// provisioning has populated the file.
-		EnvironmentFile: "-/etc/faas/compute-db.env",
+		// Issue #585 / ADR-127: sealed.env dropped; compute-db.env carries
+		// DATABASE_URL and storage.env carries the shared OCI snapshot/layer
+		// backend. The optional '-' prefix keeps image-seeded nodes bootable
+		// before secret and storage provisioning has populated the files.
+		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/storage.env",
 		Environment: []daemonunit.KV{
 			// ProtectSystem=strict makes the host /tmp read-only. Keep OCI
 			// layer verification and upload scratch on the writable base disk.

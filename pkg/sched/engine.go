@@ -1719,6 +1719,26 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
 	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	var snapshotNodes []string
+	if haveSnap {
+		if replicas, ok := e.store.(state.SnapshotReplicaStore); ok {
+			var replicaErr error
+			snapshotNodes, replicaErr = replicas.ReadySnapshotReplicaNodes(ctx, snap.ID)
+			if replicaErr != nil {
+				// Snapshot replicas are an optimization. A schema rollout,
+				// transient DB error, or an older test store must never turn a
+				// valid shared snapshot into a failed wake.
+				e.log.Debug("snapshot replica lookup failed; using normal placement", "snapshot_id", snap.ID, "err", replicaErr)
+				snapshotNodes = nil
+			}
+		}
+	}
+	// Do not let a stale WarmAffinity hint defeat a known-ready replica.
+	// When the warm hint itself is ready, retain its stronger sticky bias;
+	// otherwise let ChoosePlacement rank the ready replica set.
+	if len(snapshotNodes) > 0 && !containsNodeID(snapshotNodes, warmHint) {
+		warmHint = ""
+	}
 	// ADR-098 PR-D: connection-aware placement bias. Score is
 	// the synchronous read (per ADR §D2 — schedd does NOT
 	// LISTEN on data_upstreams_changed). On cache miss, Refresh
@@ -1746,8 +1766,9 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		PreferredNodeID: warmHint,
-		PreferredRegion: preferredRegion,
+		PreferredNodeID:  warmHint,
+		PreferredNodeIDs: snapshotNodes,
+		PreferredRegion:  preferredRegion,
 	})
 	if err != nil {
 		release()
@@ -4399,7 +4420,7 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// success path so imaged writes both rows. The engine does NOT
 	// write the warm row directly to avoid a unique-violation on
 	// (deployment_id, tier) between engine and imaged.
-	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b, state.SnapshotTierInit)
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, ins.NodeID, vmstate, b, state.SnapshotTierInit)
 	return nil
 }
 
@@ -4538,7 +4559,7 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 	// store.CreateSnapshot tier=warm here to avoid a unique-
 	// violation on (deployment_id, tier) with imaged's row.
 	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
-	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, ins.NodeID, vmstatePath, b, state.SnapshotTierWarm)
 	// Issue #470 / PR C / ADR-074: emit app.warm_snapshot_promoted
 	// so operators can grep gregale audit-events --kind-prefix
 	// warm_snapshot to see lifecycle activity. Subject is
@@ -5865,7 +5886,7 @@ func (e *Engine) emitInstanceChanged(ctx context.Context, instanceID, appID stri
 // tier="warm" when the engine captured a warm snapshot and tier="init"
 // for the legacy cold capture. imaged's subscriber reads the field
 // from the JSON and writes the matching snapshots.tier column.
-func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstatePath string, b SnapshotBytes, tier string) {
+func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, nodeID, vmstatePath string, b SnapshotBytes, tier string) {
 	if e.notif == nil {
 		return
 	}
@@ -5874,6 +5895,7 @@ func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstateP
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"deployment_id": deploymentID,
+		"node_id":       nodeID,
 		"vmstate_path":  vmstatePath,
 		"storage_key":   state.SnapMemKey(deploymentID),
 		"mem_bytes":     b.MemBytes,

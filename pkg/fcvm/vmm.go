@@ -513,7 +513,12 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// driver streams the bytes over HTTP. Tmp cleanup happens via the
 	// deferred Kill (chroot lives on tmpfs and disappears with it).
 	memSrc := spec.VMStatePath
-	if spec.StorageKey != "" && v.storage != nil {
+	// A LocalCacheBackend can expose an existing cache file through
+	// LocalPath, but that file is not an authoritative write destination when
+	// its parent is OCI. Bypass the local-path rename in OCI mode so Put
+	// always publishes the new snapshot to the shared registry and then
+	// refreshes the cache.
+	if spec.StorageKey != "" && v.storage != nil && !strings.EqualFold(os.Getenv("FAAS_STORAGE_BACKEND"), "oci") {
 		memTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.StorageKey)
 		if gerr != nil {
 			return gerr
@@ -993,10 +998,10 @@ func (v *JailerVMM) SendStatelessAdvisory(ctx context.Context, l Lease, appID st
 // blob is Put under it via the configured StorageBackend AFTER the
 // successful moveOut. The local driver maps "snap/<depID>/mem" to the
 // canonical /srv/fc/snap path so the Put is effectively a no-op bytewise
-// move; a future remote driver would actually stream the bytes. On Put
-// failure we leave MemPath populated so the legacy code path can still
-// recover the snapshot on the next read — the storage publish is best-
-// effort with a Warn log rather than a hard error.
+// move; a remote driver streams the bytes to the shared registry. A
+// storage-key publication is authoritative for multi-box deployments, so a
+// remote Put failure fails the snapshot instead of allowing imaged to record
+// an unusable snapshot row.
 //
 // Issue #470 / PR #470-FU-A: Snapshot is now a thin wrapper around
 // SnapshotKeepAlive + v.Kill. The pause + /snapshot/create + mem/vmstate
@@ -1023,12 +1028,12 @@ func (v *JailerVMM) Snapshot(ctx context.Context, l Lease, spec SnapshotSpec) (S
 // subsequent Resume (VMM.ResumeVM) and for keeping the live Instance
 // entry intact.
 //
-// The pause / create / publish sequence is lifted verbatim from the
-// pre-PR-A Snapshot so the legacy wire shape and storage behaviour
-// stay bit-for-bit identical. The split keeps every PR-A diff in one
-// place (the new method + the new ResumeVM helper) and makes the
-// pre-existing pause/create/publish code the single source of truth
-// for both init-tier and warm-tier captures.
+// The pause / create / publish sequence is lifted from the pre-PR-A
+// Snapshot so the legacy wire shape and local storage behaviour stay
+// identical. The shared-storage branch now fails closed when a keyed
+// publication cannot complete, which prevents a multi-box database row
+// from pointing at a missing restore blob. The split keeps both init-tier
+// and warm-tier captures on one implementation.
 //
 // Error mapping mirrors Snapshot: pause / create / moveOut / open /
 // put failures are wrapped with the firecracker-side status so the
@@ -1079,10 +1084,10 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 	// authoritative and we stream the vmstate bytes straight from the
 	// chroot-resident file (no moveOut, no host-path allocation).
 	// When the key is empty we keep the legacy moveOut(spec.VMStatePath)
-	// behaviour byte-for-bit so single-box / default-local is
-	// unaffected. As with mem, Put failure is Warn-level (best-effort
-	// durability in this slice; later slices may tighten) so a
-	// transient backend hiccup doesn't fail a successful pause.
+	// behaviour byte-for-bit so single-box / default-local is unaffected. A
+	// keyed publication is required to succeed; otherwise a subsequent
+	// cross-box wake could observe a database row whose restore blob is absent
+	// from the shared backend.
 	// A local backend already owns the canonical destination on the same
 	// filesystem as the jail. Publish the Firecracker-produced mem file by
 	// rename instead of copying it through a private /tmp and then copying it
@@ -1135,12 +1140,11 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 		// so the openCustomerFile guard does not apply.
 		f, oerr := os.Open(vmstateSrcInChroot)
 		if oerr != nil {
-			slog.Default().Warn("vmm: snapshot vmstate storage open failed",
-				"key", spec.VMStateStorageKey, "err", oerr)
+			return SnapshotInfo{}, fmt.Errorf("vmm: open snapshot vmstate for publish: %w", oerr)
 		} else {
 			if perr := v.storage.Put(ctx, spec.VMStateStorageKey, f); perr != nil {
-				slog.Default().Warn("vmm: snapshot vmstate storage put failed",
-					"key", spec.VMStateStorageKey, "err", perr)
+				_ = f.Close()
+				return SnapshotInfo{}, fmt.Errorf("vmm: publish snapshot vmstate: %w", perr)
 			}
 			_ = f.Close()
 		}
@@ -1165,12 +1169,11 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 		// openCustomerFile guard does not apply.
 		f, oerr := os.Open(memTmpPath)
 		if oerr != nil {
-			slog.Default().Warn("vmm: snapshot storage open failed",
-				"key", spec.StorageKey, "err", oerr)
+			return SnapshotInfo{}, fmt.Errorf("vmm: open snapshot mem for publish: %w", oerr)
 		} else {
 			if perr := v.storage.Put(ctx, spec.StorageKey, f); perr != nil {
-				slog.Default().Warn("vmm: snapshot storage put failed",
-					"key", spec.StorageKey, "err", perr)
+				_ = f.Close()
+				return SnapshotInfo{}, fmt.Errorf("vmm: publish snapshot mem: %w", perr)
 			}
 			_ = f.Close()
 		}

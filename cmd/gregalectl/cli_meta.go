@@ -205,6 +205,7 @@ var cliCommands = []cliCommand{
 					{Name: "sign-key", Short: "image-signing private key"},
 					{Name: "verify-key", Short: "image-signing public key"},
 					{Name: "compute-db-env", Short: "root-only compute DB environment"},
+					{Name: "storage-env", Short: "shared OCI storage environment"},
 					{Name: "storage-device", Short: "optional dedicated fast-root block device"},
 					{Name: "format-storage", Short: "explicitly format a supplied blank device as XFS"},
 					{Name: "box-age-key", Short: "optional box-age identity source"},

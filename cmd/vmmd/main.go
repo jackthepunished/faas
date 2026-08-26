@@ -48,6 +48,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/snapshothipd"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
@@ -678,6 +679,46 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				ops.StorageCacheStaleFallback().Inc()
 			}),
 		})
+	}
+	// Issue #1054: vmmd is the node-local worker host in the current
+	// compute-only topology. Unlike schedd, vmmd is installed on every
+	// compute box, already owns that box's StorageBackend/cache, and has
+	// the self-registered node ID in hand. The local backend is intentionally
+	// excluded: two hosts can both have /srv/fc while sharing no bytes, so
+	// marking local-only reads as replicas would create false-ready rows.
+	if nodeID != "" && strings.EqualFold(os.Getenv("FAAS_STORAGE_BACKEND"), "oci") {
+		if storage.AsCacheBackend(storageBackend) == nil {
+			return errors.New("vmmd: OCI snapshot fan-out requires the local read-through cache")
+		}
+		replicaStore, ok := store.(state.SnapshotReplicaStore)
+		if !ok {
+			return errors.New("vmmd: OCI snapshot fan-out requires a snapshot replica store")
+		}
+		fanoutRegion := ""
+		if node, regionErr := store.ComputeNodeByID(ctx, nodeID); regionErr != nil {
+			log.Warn("vmmd: snapshot fan-out region lookup failed", "node_id", nodeID, "err", regionErr)
+		} else if node.Region != nil {
+			fanoutRegion = strings.TrimSpace(*node.Region)
+		}
+		fanoutMetrics, metricErr := snapshothipd.NewPrometheusMetrics(ops.Registry(), fanoutRegion)
+		if metricErr != nil {
+			return fmt.Errorf("vmmd: register snapshot fan-out metrics: %w", metricErr)
+		}
+		fanout := snapshothipd.New(replicaStore, storageBackend, nodeID, log).
+			WithMetrics(fanoutMetrics)
+		if raw := os.Getenv("FAAS_SNAPSHOT_FANOUT_INTERVAL"); raw != "" {
+			interval, parseErr := time.ParseDuration(raw)
+			if parseErr != nil || interval <= 0 {
+				return fmt.Errorf("FAAS_SNAPSHOT_FANOUT_INTERVAL=%q: must be a positive duration", raw)
+			}
+			fanout.WithInterval(interval)
+		}
+		go func() {
+			if runErr := fanout.Run(ctx); runErr != nil && ctx.Err() == nil {
+				log.Error("vmmd: snapshot fan-out stopped", "err", runErr)
+			}
+		}()
+		log.Info("vmmd: snapshot fan-out enabled", "node_id", nodeID, "interval", fanout.Interval())
 	}
 	// Issue #667 / ADR-078: single storeStamper adapter satisfies
 	// BOTH the FrameworkReadyStamper interface (PR #470-FU-B) and

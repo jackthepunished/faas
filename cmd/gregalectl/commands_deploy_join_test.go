@@ -197,6 +197,34 @@ func TestOverrideJoinHostVars_PreservesStorageContract(t *testing.T) {
 	}
 }
 
+func TestValidateSharedStorageEnv(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "storage.env")
+	if err := os.WriteFile(path, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSharedStorageEnv(path); err != nil {
+		t.Fatalf("valid storage env rejected: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("FAAS_STORAGE_BACKEND=local\nFAAS_OCI_REGISTRY=https://registry.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSharedStorageEnv(path); err == nil || !strings.Contains(err.Error(), "BACKEND=oci") {
+		t.Fatalf("local storage env error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\nFAAS_STORAGE_LOCAL_PREFIXES=snap/,base/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSharedStorageEnv(path); err == nil || !strings.Contains(err.Error(), "snap/") {
+		t.Fatalf("snap prefix error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\nFAAS_STORAGE_CACHE_DIR=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSharedStorageEnv(path); err == nil || !strings.Contains(err.Error(), "CACHE_DIR") {
+		t.Fatalf("empty cache dir error = %v", err)
+	}
+}
+
 func TestScopeDoctorNodes_IsNodeLocal(t *testing.T) {
 	rows := []releaseinstall.ComputeNodeRow{
 		{Name: "fsn-2.faas"},
@@ -374,6 +402,10 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 	if err := os.WriteFile(computeDBEnv, []byte("DATABASE_URL=postgres://faas@example/faas\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	storageEnv := filepath.Join(artifactDir, "storage.env")
+	if err := os.WriteFile(storageEnv, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	signKey := filepath.Join(artifactDir, "sign.key")
 	verifyKey := filepath.Join(artifactDir, "sign-pub.pem")
 	for _, path := range []string{signKey, verifyKey} {
@@ -449,6 +481,7 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 		SignKeySource:      signKey,
 		VerifyKeySource:    verifyKey,
 		ComputeDBEnvSource: computeDBEnv,
+		StorageEnvSource:   storageEnv,
 		RepoRoot:           repo,
 		SkipFleetPreflight: true,
 	})
@@ -468,6 +501,7 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 		SignKeySource:      signKey,
 		VerifyKeySource:    verifyKey,
 		ComputeDBEnvSource: computeDBEnv,
+		StorageEnvSource:   storageEnv,
 		RepoRoot:           repo,
 		SkipFleetPreflight: true,
 	}, &report); err != nil || code != 0 {

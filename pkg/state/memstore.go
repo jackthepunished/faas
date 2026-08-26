@@ -309,7 +309,14 @@ type MemStore struct {
 	// deploymentIDs are UUIDs).
 	deploymentSidecarLayers map[string]DeploymentSidecarLayer
 	snapshots               []Snapshot
-	events                  []Event
+	// snapshotReplicas mirrors snapshot_replicas (issue #1054). The
+	// production worker uses the table as a durable cache-warming queue;
+	// MemStore keeps the same state machine for scheduler and worker tests.
+	snapshotReplicas map[snapshotReplicaKey]snapshotReplicaRow
+	// snapshotOrigins records the producer node/locality for region-scoped
+	// fan-out. Legacy snapshots without an entry remain globally eligible.
+	snapshotOrigins map[string]snapshotOriginRow
+	events          []Event
 	// auditLog (issue #755 / PR-6) is the in-memory mirror of the
 	// pgstore.audit_log table. Append-only by spec — MemStore has no
 	// UpdateAuditLog / DeleteAuditLog pair. The DeleteAccount path
@@ -684,6 +691,8 @@ func NewMemStore() *MemStore {
 		// semantics).
 		deploymentSidecarLayers: map[string]DeploymentSidecarLayer{},
 		snapshots:               []Snapshot{},
+		snapshotReplicas:        map[snapshotReplicaKey]snapshotReplicaRow{},
+		snapshotOrigins:         map[string]snapshotOriginRow{},
 		events:                  []Event{},
 		usage:                   []usageMinute{},
 		usageByMonth:            []Usage{},

@@ -24,6 +24,14 @@
     group: faas
     mode: "0640"
 
+- name: vmmd_service — install shared storage env example
+  ansible.builtin.copy:
+    src: ../../_shared/files/storage.env.example
+    dest: /etc/faas/storage.env.example
+    owner: root
+    group: faas
+    mode: "0640"
+
 - name: vmmd_service — install systemd unit
   ansible.builtin.copy:
     src: faas-vmmd.service
