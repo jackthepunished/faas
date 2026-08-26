@@ -125,19 +125,18 @@ func (s *PgStore) UpsertRuntimeConfig(ctx context.Context, update RuntimeConfigU
 		currentVersion++
 		if _, err := tx.Exec(ctx, `
 			UPDATE runtime_config_entries
-			SET desired_value = $5::jsonb,
+			SET desired_value = $2::jsonb,
 			    effective_value = NULL,
-			    version = $6,
-			    apply_mode = $7,
+			    version = $3,
+			    apply_mode = $4,
 			    status = 'pending',
 			    last_error = NULL,
-			    actor_id = NULLIF($8, '')::uuid,
-			    reason = $9,
+			    actor_id = NULLIF($5, '')::uuid,
+			    reason = $6,
 			    updated_at = now(),
 			    applied_at = NULL
 			WHERE id = $1`,
-			id, update.Key, string(update.Scope), update.ScopeID,
-			string(update.DesiredValue), currentVersion, string(update.ApplyMode),
+			id, string(update.DesiredValue), currentVersion, string(update.ApplyMode),
 			update.ActorID, update.Reason); err != nil {
 			return RuntimeConfig{}, fmt.Errorf("state: update runtime config: %w", err)
 		}

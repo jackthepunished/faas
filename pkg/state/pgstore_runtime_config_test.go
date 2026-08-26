@@ -185,7 +185,7 @@ func TestPgStoreRuntimeConfigOperationLifecycleAndGuards(t *testing.T) {
 	if _, err := store.CreateRuntimeConfigOperation(ctx, state.RuntimeConfig{ApplyMode: state.RuntimeConfigApplyRolling, DesiredValue: json.RawMessage("{")}, "", ""); err == nil {
 		t.Fatal("invalid operation JSON unexpectedly accepted")
 	}
-	if _, err := store.GetRuntimeConfigOperation(ctx, "missing"); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
+	if _, err := store.GetRuntimeConfigOperation(ctx, "00000000-0000-0000-0000-000000000001"); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
 		t.Fatalf("missing operation = %v, want not found", err)
 	}
 	if _, err := store.ClaimPendingRuntimeConfigOperation(ctx); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
