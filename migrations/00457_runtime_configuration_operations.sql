@@ -4,6 +4,7 @@
 -- audit history, and optimistic version checks keep those transitions safe.
 
 -- +goose Up
+-- +goose StatementBegin
 
 CREATE TABLE IF NOT EXISTS runtime_config_operations (
     id uuid PRIMARY KEY,
@@ -57,9 +58,13 @@ CREATE TRIGGER runtime_config_operations_notify
 AFTER INSERT OR UPDATE ON runtime_config_operations
 FOR EACH ROW EXECUTE FUNCTION notify_runtime_config_operation_changed();
 
+-- +goose StatementEnd
+
 -- +goose Down
+-- +goose StatementBegin
 DROP TRIGGER IF EXISTS runtime_config_operations_notify ON runtime_config_operations;
 DROP FUNCTION IF EXISTS notify_runtime_config_operation_changed();
 DROP INDEX IF EXISTS runtime_config_operations_key_idx;
 DROP INDEX IF EXISTS runtime_config_operations_requested_idx;
 DROP TABLE IF EXISTS runtime_config_operations;
+-- +goose StatementEnd

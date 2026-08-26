@@ -1,4 +1,5 @@
 -- +goose Up
+-- +goose StatementBegin
 -- Operator runtime configuration (ADR-132).
 --
 -- The row is the durable desired state. Daemons keep an in-memory
@@ -72,10 +73,14 @@ CREATE TRIGGER runtime_config_entries_notify
 AFTER INSERT OR UPDATE ON runtime_config_entries
 FOR EACH ROW EXECUTE FUNCTION notify_runtime_config_changed();
 
+-- +goose StatementEnd
+
 -- +goose Down
+-- +goose StatementBegin
 DROP TRIGGER IF EXISTS runtime_config_entries_notify ON runtime_config_entries;
 DROP FUNCTION IF EXISTS notify_runtime_config_changed();
 DROP INDEX IF EXISTS runtime_config_revisions_lookup_idx;
 DROP TABLE IF EXISTS runtime_config_revisions;
 DROP INDEX IF EXISTS runtime_config_entries_scope_idx;
 DROP TABLE IF EXISTS runtime_config_entries;
+-- +goose StatementEnd
