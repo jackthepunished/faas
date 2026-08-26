@@ -3112,6 +3112,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"force_park.outcome",
 		"force_cold_boot.outcome",
 		"force_restart.outcome",
+		// apid request-side instance-oriented aliases
+		// (pkg/audit.auditKindMetricLabel maps them onto the
+		// verb-oriented labels above). The auditLogWriteTotal
+		// + auditLogWriteFailuresTotal counters are
+		// pre-instantiated for both shapes so /obs/health's
+		// join doesn't break on first emit.
+		"park_instance",
+		"park_instance.outcome",
+		"restart_instance",
+		"restart_instance.outcome",
 		"other",
 	}
 	auditErrorClassClosedSet := []string{
@@ -3120,7 +3130,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"timeout",
 		"other",
 	}
-	operatorIntentKindClosedSet := []string{"force_park", "force_cold_boot", "force_restart"}
+	// Shared by the operatorIntentOutcomeMissingTotal counter
+	// and the operatorActionTraceCompletenessRatio gauge. The
+	// gauge's kind-grouped query (pkg/sched.operator_intent_
+	// completeness.go::observeTraceCompletenessRatio) strips
+	// the "operator.action." prefix from raw audit kinds, so
+	// the gauge reads BOTH the verb-oriented forms (schedd
+	// outcome emits) AND the instance-oriented forms (apid
+	// request emits) — pre-instantiating both keeps the gauge
+	// grid complete. The counter pre-instantiates both too
+	// (the closed-set semantics keep cardinality bounded; the
+	// counter just stays at 0 for the instance-oriented forms
+	// since schedd never writes those — that's intentional).
+	operatorIntentKindClosedSet := []string{
+		"force_park",
+		"force_cold_boot",
+		"force_restart",
+		"park_instance",
+		"restart_instance",
+	}
 	auditLogWriteTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_audit_log_write_total",
 		Help: "Count of events-table appends the audit emit path completed, labelled by endpoint and kind. /v1/admin/obs/health reads this via PromQL `sum(increase(audit_log_write_total[5m]))` to report 5-minute throughput. Single-registry: registered on every daemon; only the audit emit site (pkg/audit.Auditor.Emit / EmitResult) increments via AuditLogWriteTotal.",

@@ -323,23 +323,40 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 //
 // Mapping table:
 //
-//	"operator.action.force_park"            → "force_park"
-//	"operator.action.force_cold_boot"       → "force_cold_boot"
-//	"operator.action.force_restart"         → "force_restart"
-//	"operator.action.force_park.outcome"    → "force_park.outcome"
+//	"operator.action.force_park"             → "force_park"
+//	"operator.action.force_cold_boot"        → "force_cold_boot"
+//	"operator.action.force_restart"          → "force_restart"
+//	"operator.action.force_park.outcome"     → "force_park.outcome"
 //	"operator.action.force_cold_boot.outcome" → "force_cold_boot.outcome"
-//	"operator.action.force_restart.outcome" → "force_restart.outcome"
+//	"operator.action.force_restart.outcome"  → "force_restart.outcome"
+//
+// Plus the apid request-side aliases (the apid handler emits use
+// the instance-oriented names "park_instance" and
+// "restart_instance"; schedd's outcome-side emits use the
+// verb-oriented names "force_<verb>.outcome". Both sides MUST
+// land on the same metric label so a single PromQL query can
+// join them — aliasing the instance-oriented forms onto the
+// verb-oriented labels keeps the closed set tight without
+// renaming the audit emit sites):
+//
+//	"operator.action.park_instance"          → "force_park"
+//	"operator.action.park_instance.outcome"  → "force_park.outcome"
+//	"operator.action.restart_instance"       → "force_restart"
+//	"operator.action.restart_instance.outcome" → "force_restart.outcome"
+//
 //	anything else                           → "other"
 //
 // Called from pkg/audit.Auditor.emit (PR-#TBD / C5). PR-#TBD's
 // /v1/admin/obs/health reads the resulting counters via PromQL.
 func auditKindMetricLabel(kind string) string {
 	const (
-		requestSuffix  = ".outcome"
-		verbPark       = "force_park"
-		verbColdBoot   = "force_cold_boot"
-		verbRestart    = "force_restart"
-		operatorPrefix = "operator.action."
+		requestSuffix   = ".outcome"
+		verbPark        = "force_park"
+		verbColdBoot    = "force_cold_boot"
+		verbRestart     = "force_restart"
+		instancePark    = "park_instance"
+		instanceRestart = "restart_instance"
+		operatorPrefix  = "operator.action."
 	)
 	switch kind {
 	case operatorPrefix + verbPark:
@@ -353,6 +370,19 @@ func auditKindMetricLabel(kind string) string {
 	case operatorPrefix + verbColdBoot + requestSuffix:
 		return verbColdBoot + requestSuffix
 	case operatorPrefix + verbRestart + requestSuffix:
+		return verbRestart + requestSuffix
+	// apid request-side aliases (instance-oriented). The
+	// schedd-side outcome audit emits these via the verb-
+	// oriented forms above; aliasing keeps both surfaces on
+	// the same metric label without renaming the audit emit
+	// sites (which would break the join with intent.Kind).
+	case operatorPrefix + instancePark:
+		return verbPark
+	case operatorPrefix + instancePark + requestSuffix:
+		return verbPark + requestSuffix
+	case operatorPrefix + instanceRestart:
+		return verbRestart
+	case operatorPrefix + instanceRestart + requestSuffix:
 		return verbRestart + requestSuffix
 	default:
 		return "other"

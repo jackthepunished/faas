@@ -150,7 +150,14 @@ func (l *Loop) observeTraceCompletenessRatio(ctx context.Context, gaugeUpdates *
 	// Closed kind set — see auditKindClosedSet in
 	// pkg/wire/metrics.go. Mirror the structure here so a
 	// typo in one place shows up in test diffs, not in a
-	// silent gauge label.
+	// silent gauge label. Includes the apid request-side
+	// instance-oriented aliases ("park_instance",
+	// "restart_instance", "*.outcome") — the gauge's
+	// prefix-strip pass (below) hands us the post-strip form,
+	// and the kindClosedSet lookup must recognise both the
+	// verb-oriented (schedd outcome emits) and the
+	// instance-oriented (apid request emits) shapes so a
+	// single ratio computation covers both surfaces.
 	kindClosedSet := []string{
 		"force_park",
 		"force_cold_boot",
@@ -158,6 +165,10 @@ func (l *Loop) observeTraceCompletenessRatio(ctx context.Context, gaugeUpdates *
 		"force_park.outcome",
 		"force_cold_boot.outcome",
 		"force_restart.outcome",
+		"park_instance",
+		"park_instance.outcome",
+		"restart_instance",
+		"restart_instance.outcome",
 	}
 	// Pre-fill with 1.0 (vacuous truth — no rows in window
 	// ⇒ 100% complete). The pre-instantiated gauge surfaces
