@@ -1462,8 +1462,14 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListTenants))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsGetTenant))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}/activity",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsTenantActivity))))
+	mux.HandleFunc("GET /v1/admin/obs/apps/{id}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsAppDetail))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/detail",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeDetail))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
 	// PR #4 (ADR-092 §3.6) — per-node wake-latency quantiles.
@@ -1535,6 +1541,14 @@ func (s *server) handler() http.Handler {
 	// in-flight builds.
 	mux.HandleFunc("POST /v1/admin/builds/sweep-stuck",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postSweepStuckBuilds))))
+	// Compute-node lifecycle controls. They are deliberately separate from
+	// the read-only /obs namespace and require both MFA and confirm=true.
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/drain",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeDrain))))
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/force-drain",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeForceDrain))))
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/activate",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeActivate))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session

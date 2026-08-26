@@ -145,6 +145,125 @@ type ObsTenantDetailResponse struct {
 	Sessions ObsTenantCounts `json:"sessions"`
 }
 
+// ObsTenantActivityResponse is the bounded activity view for one tenant.
+// It intentionally carries invocation metadata and audit metadata only:
+// request payloads, results, headers, and audit data may contain customer
+// secrets and never belong in the operator activity feed.
+type ObsTenantActivityResponse struct {
+	AccountID   string                `json:"account_id"`
+	GeneratedAt time.Time             `json:"generated_at"`
+	Invocations []ObsInvocationRow    `json:"invocations"`
+	AuditEvents []ObsAuditActivityRow `json:"audit_events"`
+	Limit       int                   `json:"limit"`
+}
+
+// ObsInvocationRow is the safe operational projection of an invocation.
+type ObsInvocationRow struct {
+	ID          string     `json:"id"`
+	AppID       string     `json:"app_id"`
+	AppSlug     string     `json:"app_slug,omitempty"`
+	State       string     `json:"state"`
+	Source      string     `json:"source"`
+	Method      string     `json:"method"`
+	Path        string     `json:"path"`
+	Outcome     string     `json:"outcome,omitempty"`
+	Attempts    int        `json:"attempts"`
+	LastError   string     `json:"last_error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+// ObsAuditActivityRow is the safe metadata-only projection of audit_log.
+// Data is deliberately omitted; the global audit page remains the explicit
+// high-detail path for an operator who is authorized to inspect it.
+type ObsAuditActivityRow struct {
+	ID      string    `json:"id"`
+	At      time.Time `json:"at"`
+	Kind    string    `json:"kind"`
+	Actor   string    `json:"actor,omitempty"`
+	Subject string    `json:"subject,omitempty"`
+}
+
+// ObsAppDetailResponse is the workload drill-down used by operations to
+// answer which deployment and instances belong to a customer app.
+type ObsAppDetailResponse struct {
+	App         ObsAppDetail       `json:"app"`
+	Deployments []ObsDeploymentRow `json:"deployments"`
+	Instances   []ObsInstanceRow   `json:"instances"`
+	Invocations []ObsInvocationRow `json:"invocations"`
+}
+
+type ObsAppDetail struct {
+	ID             string    `json:"id"`
+	AccountID      string    `json:"account_id"`
+	Slug           string    `json:"slug"`
+	Type           string    `json:"type"`
+	Runtime        string    `json:"runtime"`
+	Status         string    `json:"status"`
+	RAMMB          int       `json:"ram_mb"`
+	MaxConcurrency int       `json:"max_concurrency"`
+	MinInstances   int       `json:"min_instances"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type ObsDeploymentRow struct {
+	ID          string    `json:"id"`
+	Status      string    `json:"status"`
+	Kind        string    `json:"kind"`
+	ImageDigest string    `json:"image_digest,omitempty"`
+	SourceURL   string    `json:"source_url,omitempty"`
+	CommitSHA   string    `json:"commit_sha,omitempty"`
+	ErrorCode   string    `json:"error_code,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type ObsInstanceRow struct {
+	ID            string     `json:"id"`
+	AppID         string     `json:"app_id"`
+	AppSlug       string     `json:"app_slug,omitempty"`
+	AccountID     string     `json:"account_id,omitempty"`
+	DeploymentID  string     `json:"deployment_id"`
+	NodeID        string     `json:"node_id,omitempty"`
+	NodeName      string     `json:"node_name,omitempty"`
+	State         string     `json:"state"`
+	RAMMB         int        `json:"ram_mb"`
+	StartedAt     time.Time  `json:"started_at"`
+	LastRequestAt time.Time  `json:"last_request_at"`
+	ParkedAt      *time.Time `json:"parked_at,omitempty"`
+}
+
+// ObsNodeDetailResponse is the node-to-workload drill-down. It is designed
+// for bounded fleet inspection: apps are summarized and instances carry no
+// jail internals, host IPs, or lease material.
+type ObsNodeDetailResponse struct {
+	Node      ObsNodeRow       `json:"node"`
+	Apps      []ObsNodeApp     `json:"apps"`
+	Instances []ObsInstanceRow `json:"instances"`
+}
+
+type ObsNodeApp struct {
+	ID                   string     `json:"id"`
+	Slug                 string     `json:"slug"`
+	AccountID            string     `json:"account_id"`
+	Status               string     `json:"status"`
+	InstancesLive        int        `json:"instances_live"`
+	InstancesRunning     int        `json:"instances_running"`
+	InstancesWaking      int        `json:"instances_waking"`
+	InstancesColdBooting int        `json:"instances_cold_booting"`
+	RAMUsedMB            int64      `json:"ram_used_mb"`
+	LastRequestAt        *time.Time `json:"last_request_at,omitempty"`
+}
+
+type ObsNodeMutationResponse struct {
+	OK             bool   `json:"ok"`
+	Node           string `json:"node"`
+	PreviousActive bool   `json:"previous_active"`
+	Active         bool   `json:"active"`
+	LiveInstances  int    `json:"live_instances"`
+	Forced         bool   `json:"forced"`
+	Reason         string `json:"reason"`
+}
+
 // ObsTenantApp is a single app row in the tenant detail view.
 // Status is the app state (active|evicted_cold|deleted_*) and
 // Deployments is the count of non-deleted deployments. The

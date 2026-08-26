@@ -77,7 +77,10 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/overview":                true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/tenants":                 true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}/activity":   true, // operator-only tenant activity drill-down
+	"GET /v1/admin/obs/apps/{id}":               true, // operator-only app workload drill-down
 	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/detail":     true, // operator-only node workload drill-down
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
 	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
@@ -96,6 +99,9 @@ var routeExclude = map[string]bool{
 	"POST /v1/admin/apps/{slug}/force-cold-boot":              true, // PR #1099 P2b
 	"POST /v1/admin/instances/{id}/force-restart":             true, // PR #1105 P2d
 	"POST /v1/admin/builds/sweep-stuck":                       true, // PR #1099 P2c
+	"POST /v1/admin/ops/nodes/{name}/drain":                   true, // operator-only node lifecycle control
+	"POST /v1/admin/ops/nodes/{name}/force-drain":             true, // operator-only destructive node lifecycle control
+	"POST /v1/admin/ops/nodes/{name}/activate":                true, // operator-only node lifecycle control
 	"GET /v1/admin/operator-intents/{id}":                     true, // PR #1099 P2.3
 	"GET /v1/events":                                          true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                                              true, // dashboard magic-link GET (HTML form, browser-only)
