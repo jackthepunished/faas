@@ -1119,6 +1119,8 @@ jobs:
       # in embed_test.go and are not built under `!no_pg` exclusion
       # here because their package has no build tag.
       - name: migrations apply-and-walk
+        env:
+          FAAS_MIGRATION_ALLOWED_GAPS: ${{ steps.migration_slots.outputs.external_slots }}
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
 
       # Replay safety for migrations this diff ADDS. apply-and-walk above
