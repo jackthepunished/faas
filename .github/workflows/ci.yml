@@ -475,9 +475,10 @@ jobs:
             package_pattern: '/(cmd/gregale|cmd/gregalectl|cmd/meterd|cmd/schedd|cmd/schema-dump)(/|$)'
             coverage_file: cover-shard2b.out
             state_coverage: false
-    # Keep the previous headroom while the new package-group timings settle.
-    # The normal wall time is reduced because the two groups run concurrently.
-    timeout-minutes: 15
+    # The race-enabled state suite is currently a 12–16 minute workload on
+    # shared GitHub runners; leave explicit headroom without weakening its
+    # in-process test timeout.
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -525,7 +526,7 @@ jobs:
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '${{ matrix.package_pattern }}')
           test -n "$PKGS"
           printf '%s\n' "$PKGS"
-          go test -race -count=1 -p 4 -timeout=14m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
+          go test -race -count=1 -p 4 -timeout=18m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
         if: ${{ matrix.state_coverage }}
