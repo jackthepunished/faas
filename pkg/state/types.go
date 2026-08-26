@@ -2839,6 +2839,38 @@ type PerNodeStats struct {
 	RAMUsedMB            int64
 }
 
+// OperatorCapacityNode is the bounded read-side capacity projection used by
+// the operator console. It deliberately contains counts and resource
+// numbers, not app or instance rows, so the projection remains cheap as the
+// fleet grows.
+type OperatorCapacityNode struct {
+	ID                   string
+	Name                 string
+	Active               bool
+	VPCPUs               int
+	VCPUBudget           int
+	MemMB                int
+	AdmissionCeilingMB   int
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
+	AppsCount            int64
+	TenantsCount         int64
+}
+
+// OperatorCapacitySnapshot is the fleet-wide capacity projection. AppsTotal
+// and TenantsTotal are exact distinct counts across the fleet; per-node
+// tenant counts are placement counts and may intentionally overlap when a
+// tenant owns apps on more than one node.
+type OperatorCapacitySnapshot struct {
+	Nodes        []OperatorCapacityNode
+	AppsTotal    int64
+	TenantsTotal int64
+	UnplacedApps int64
+}
+
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
 // gateway accumulates these in memory and hands them to schedd every 15 s.
 type InstanceTouch struct {

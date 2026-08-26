@@ -3607,6 +3607,11 @@ type Store interface {
 	// by the caller if it wants the global number (the existing
 	// fleet Σ lives in the schedd engine, not on this wire).
 	PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error)
+	// OperatorCapacity returns a bounded fleet-wide capacity snapshot. The
+	// production implementation performs the live-instance and app-placement
+	// rollups in Postgres; it must not be implemented by loading every instance
+	// row into apid.
+	OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error)
 
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error

@@ -10881,6 +10881,78 @@ func (s *PgStore) PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error) 
 	return out, nil
 }
 
+// OperatorCapacity returns the fleet-wide capacity projection for the
+// operator console. The two CTEs aggregate live instances and placed apps
+// before joining to compute_nodes, which preserves rows for empty nodes and
+// avoids the O(instances) response allocation that a ListAllInstances-based
+// implementation would require.
+func (s *PgStore) OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error) {
+	rows, err := s.pool.Query(ctx, `
+		with live as (
+			select i.node_id,
+			       count(*) as instances_live,
+			       count(*) filter (where i.state = 'RUNNING') as instances_running,
+			       count(*) filter (where i.state = 'WAKING') as instances_waking,
+			       count(*) filter (where i.state = 'COLD_BOOTING') as instances_cold_booting,
+			       coalesce(sum(i.ram_mb + 8), 0)::bigint as ram_used_mb
+			  from instances i
+			 where i.state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+			 group by i.node_id
+		), placed as (
+			select a.node_id,
+			       count(*)::bigint as apps_count,
+			       count(distinct a.account_id)::bigint as tenants_count
+			  from apps a
+			 where a.status <> 'deleted' and a.node_id is not null
+			 group by a.node_id
+		)
+		select n.id, n.name, n.active, n.vpcpus, n.vcpu_budget, n.mem_mb,
+		       n.admission_ceiling_mb,
+		       coalesce(l.instances_live, 0)::bigint,
+		       coalesce(l.instances_running, 0)::bigint,
+		       coalesce(l.instances_waking, 0)::bigint,
+		       coalesce(l.instances_cold_booting, 0)::bigint,
+		       coalesce(l.ram_used_mb, 0)::bigint,
+		       coalesce(p.apps_count, 0)::bigint,
+		       coalesce(p.tenants_count, 0)::bigint
+		  from compute_nodes n
+		  left join live l on l.node_id = n.id
+		  left join placed p on p.node_id = n.id
+		 order by n.active desc, n.name asc
+	`)
+	if err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: operator capacity nodes: %w", err)
+	}
+	defer rows.Close()
+
+	out := OperatorCapacitySnapshot{Nodes: make([]OperatorCapacityNode, 0, 64)}
+	for rows.Next() {
+		var node OperatorCapacityNode
+		if err := rows.Scan(
+			&node.ID, &node.Name, &node.Active, &node.VPCPUs, &node.VCPUBudget,
+			&node.MemMB, &node.AdmissionCeilingMB, &node.InstancesLive,
+			&node.InstancesRunning, &node.InstancesWaking, &node.InstancesColdBooting,
+			&node.RAMUsedMB, &node.AppsCount, &node.TenantsCount,
+		); err != nil {
+			return OperatorCapacitySnapshot{}, fmt.Errorf("state: scan operator capacity node: %w", err)
+		}
+		out.Nodes = append(out.Nodes, node)
+	}
+	if err := rows.Err(); err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: iterate operator capacity nodes: %w", err)
+	}
+
+	if err := s.pool.QueryRow(ctx, `
+		select count(*) filter (where status <> 'deleted')::bigint,
+		       count(distinct account_id) filter (where status <> 'deleted')::bigint,
+		       count(*) filter (where status <> 'deleted' and node_id is null)::bigint
+		  from apps
+	`).Scan(&out.AppsTotal, &out.TenantsTotal, &out.UnplacedApps); err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: operator capacity totals: %w", err)
+	}
+	return out, nil
+}
+
 // MarkComputeNodeInactive flips active=false on the row (PR #114,
 // schedd heartbeat path). Idempotent: the UPDATE matches regardless
 // of current value, so re-flipping an inactive row is a no-op. We

@@ -1460,6 +1460,10 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsOverview))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListTenants))))
+	mux.HandleFunc("GET /v1/admin/obs/capacity",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsCapacity))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}/360",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsTenant360))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsGetTenant))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}/activity",

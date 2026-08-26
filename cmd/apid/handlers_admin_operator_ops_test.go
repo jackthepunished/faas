@@ -2,12 +2,68 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
+
+func TestObsCapacity_HappyPath_ReturnsBoundedSnapshot(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	rec := e.do(t, "GET", "/v1/admin/obs/capacity", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("capacity: got status %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp api.ObsCapacityResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal capacity: %v", err)
+	}
+	if resp.GeneratedAt.IsZero() {
+		t.Fatal("capacity: generated_at is zero")
+	}
+	if resp.Nodes == nil {
+		t.Fatal("capacity: nodes must be a non-nil array")
+	}
+}
+
+func TestObsTenant360_RejectsBadMonth(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	rec := e.do(t, "GET", "/v1/admin/obs/tenants/"+e.acct.ID+"/360?month=not-a-month", nil, nil)
+	if rec.Code != 400 {
+		t.Fatalf("tenant 360 bad month: got status %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestObsTenant360_HappyPath_ReturnsUsageAndBilling(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	rec := e.do(t, "GET", "/v1/admin/obs/tenants/"+e.acct.ID+"/360?month=2026-08", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("tenant 360: got status %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp api.ObsTenant360Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal tenant 360: %v", err)
+	}
+	if resp.Account.AccountID != e.acct.ID {
+		t.Fatalf("tenant 360 account id: got %q, want %q", resp.Account.AccountID, e.acct.ID)
+	}
+	if resp.Usage.Month != "2026-08" {
+		t.Fatalf("tenant 360 usage month: got %q", resp.Usage.Month)
+	}
+	if resp.Usage.Apps == nil || resp.Billing.Invoices == nil {
+		t.Fatal("tenant 360: usage apps and billing invoices must be non-nil arrays")
+	}
+}
+
+func TestObsTenant360_UnknownTenant(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	rec := e.do(t, "GET", "/v1/admin/obs/tenants/00000000-0000-0000-0000-000000000000/360", nil, nil)
+	if rec.Code != 404 {
+		t.Fatalf("tenant 360 unknown tenant: got status %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
 
 func TestObsTenantActivity_UnknownTenant(t *testing.T) {
 	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
