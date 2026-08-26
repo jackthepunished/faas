@@ -11,8 +11,8 @@ In order (each role is independent and verifies its own preconditions):
 |---|---|---|---|
 | `cgroups_v2` | §11 | asserts kernel cmdline | verify-only |
 | `grub` | §11 | `/etc/default/grub`, sysctl | `creates:` sentinel, regex match |
-| `lvm` | §8 | verify lv-system / lv-fc | verify-only |
-| `xfs` | §8 | `/srv/fc/jail` tmpfs | `/etc/fstab` `update` |
+| `lvm` | §8 | verify lv-system / lv-fc when the reference layout is selected | verify-only |
+| `xfs` | §8 | dedicated fast-root mount, XFS features, `/srv/fc/jail` tmpfs | explicit device contract + `/etc/fstab` |
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
 | `nftables` | §7 | `/etc/nftables.conf` | managed-marker backup + `nft -c` syntax check |
@@ -105,6 +105,16 @@ inventory; daemon URLs and the committed manifest remain unchanged. The committe
 `host_vars/faas-fsn-{1,2}.yml` files remain checked-in reference fixtures;
 the manifest-generated tree is the deployment source of truth.
 
+The fast-root contract is provider-neutral. Set
+`fleet.hosts[].storage_device` to an absolute stable device path such as a
+provider's `/dev/disk/by-id/...` name, or pass `--storage-device` to
+`deploy join-node`. The `xfs` role accepts an existing XFS filesystem or,
+only when `--format-storage` is explicitly supplied, a blank block device.
+It never selects a disk by size or formats an unknown device. Every
+production compute host must end with a dedicated XFS mount at
+`storage.fast_root`, with `reflink=1` and `prjquota`; a root-filesystem
+fallback is rejected.
+
 For a split-box manifest, the generated control-plane variables also
 declare the database listener address and the compute `/32` allow-list.
 Provide `faas_postgres_password` through Ansible Vault (or another secret
@@ -121,8 +131,9 @@ The `lvm` role defaults to `faas_storage_layout=auto`: hosts with the
 reference LVM volumes are validated, while provider-native disks such as
 GCP persistent disks use their filesystem directly. Set
 `faas_storage_layout=reference-lvm` when a fleet requires the reference
-layout. The `xfs` role similarly enforces `prjquota` only when `/srv/fc`
-is mounted as a real filesystem.
+layout. The `xfs` role now fails closed when `/srv/fc` is not a dedicated
+XFS mount; attach the provider's data disk and declare its stable device path
+instead of allowing a root-filesystem fallback.
 
 ## After the reference node hosts the executor
 

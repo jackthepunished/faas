@@ -237,14 +237,20 @@ type Fleet struct {
 
 // Host is one control-plane node in the fleet. `name` is the canonical
 // identity (matches `compute_nodes.name` in the database) and `role`
-// is one of `pkg/role.AllRoles`. `Overlay` and `Storage` are pointers
-// because per-host overrides are optional — the renderer falls back to
-// the package-level value when absent.
+// is one of `pkg/role.AllRoles`. `Overlay` is a pointer because the
+// per-host override is optional; StorageDevice is an explicit path
+// override and is empty when the host already owns its fast-root mount.
 type Host struct {
 	Name    string  `yaml:"name"`
 	Role    string  `yaml:"role"`
 	Address string  `yaml:"address,omitempty"`
 	Overlay *string `yaml:"overlay,omitempty"`
+	// StorageDevice is an optional provider-neutral block-device path for
+	// this host's fast root. It is intentionally per-host because stable
+	// /dev/disk/by-id paths differ between providers and machines. When it
+	// is empty, the deployment requires an already-mounted fast root instead
+	// of guessing which disk is safe to format.
+	StorageDevice string `yaml:"storage_device,omitempty"`
 	// Tags are free-form, opaque labels the doctor uses to filter
 	// checks (e.g. `--role=compute-only` skips cert checks for the
 	// egress server leaf, which lives on the control-plane box).
@@ -833,6 +839,10 @@ func (f *Fleet) validate() Errors {
 		if h.Address != "" && !looksLikeHostPort(h.Address) {
 			errs = append(errs, Error{path + ".address",
 				fmt.Sprintf("address %q must be host:port or unix://path", h.Address)})
+		}
+		if h.StorageDevice != "" && !filepath.IsAbs(h.StorageDevice) {
+			errs = append(errs, Error{path + ".storage_device",
+				fmt.Sprintf("storage_device %q must be an absolute device path", h.StorageDevice)})
 		}
 	}
 	// Single-box sanity: at most one host when role == single-box.

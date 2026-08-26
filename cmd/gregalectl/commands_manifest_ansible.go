@@ -174,7 +174,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -291,7 +291,7 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string, storageMountpoint string) string {
 	var b strings.Builder
 	canonicalNodeName := canonicalComputeNodeName(host.Name, roleTemplating.Role(host.Role))
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
@@ -299,6 +299,12 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayI
 	fmt.Fprintf(&b, "faas_node_name: %s\n", canonicalNodeName)
 	fmt.Fprintf(&b, "ansible_host: %q\n", ansibleHost)
 	b.WriteString("ansible_python_interpreter: /usr/bin/python3\n")
+	if host.StorageDevice != "" {
+		fmt.Fprintf(&b, "faas_storage_device: %q\n", host.StorageDevice)
+	}
+	if storageMountpoint != "" {
+		fmt.Fprintf(&b, "faas_storage_mountpoint: %q\n", storageMountpoint)
+	}
 	fmt.Fprintf(&b, "faas_overlay_provider: %q\n", overlayProvider)
 	switch overlayProvider {
 	case "tailscale":

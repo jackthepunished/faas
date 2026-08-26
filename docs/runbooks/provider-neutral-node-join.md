@@ -32,15 +32,21 @@ The command performs these phases in order:
    preflight.
 5. Stage the root-only database environment, a compute trust bundle, image-signing keys,
    signed release assets, bootstrap `gregalectl`, and the manifest.
-6. Register the embedded signed release manifest in `release_bundles` and
+6. Converge the fast-root storage contract. The target must be a dedicated XFS
+   mount with `reflink=1` and `prjquota`; a blank device is formatted only when
+   `--format-storage` explicitly approves the supplied absolute device path.
+7. Register the embedded signed release manifest in `release_bundles` and
    require its topology hash to match the supplied manifest.
-7. Run the production `deploy/ansible/bootstrap.yml` compute role.
-8. Install the signed release with `--defer-activation`; the database row is
+8. Run the production `deploy/ansible/bootstrap.yml` compute role.
+9. Install the signed release with `--defer-activation`; the database row is
    kept drained while the box is being prepared.
-9. Render the manifest, initialize host-local identity, start the four
-   compute services, and wait for vmmd's socket, the internal gateway, and
-   systemd-active status.
-10. Verify the control-plane row's role, release, manifest hash, and stable
+10. Render the manifest, initialize host-local identity, unseal the supplied
+    encrypted backup envelopes, and run a node-scoped doctor with warnings as
+    failures. A join without real backup envelopes remains visibly incomplete
+    and cannot pass this acceptance gate.
+11. Start the four compute services and wait for vmmd's socket, the internal
+    gateway, and systemd-active status.
+12. Verify the control-plane row's role, release, manifest hash, and stable
    target URL, then activate the compute row only after all gates pass.
 
 If a phase fails, the node remains non-schedulable. Re-running the same command
@@ -59,6 +65,13 @@ The release workflow must provide these local artifacts:
   never copies `ca/ca.key` to a compute host;
 - the image-signing private/public key pair;
 - a root-only `compute-db.env` containing `DATABASE_URL=...`.
+
+For a production compute node, also provide the storage contract through the
+manifest or `--storage-device`. If backup is part of the node's responsibility,
+the standard artifact directory may contain `box-age-key`, `rclone.conf.age`,
+and `archive-creds.json.age`; the latter two are encrypted envelopes and are
+unsealed on the host with the staged box identity. Plaintext backup secrets are
+never passed as Ansible variables.
 
 The PKI and signing files are sensitive deployment material. Keep them in the
 operator's secret store and use a short-lived workspace for the command. The
@@ -95,10 +108,21 @@ gregalectl deploy join-node \
   --yes
 ```
 
+If the manifest does not already declare the host's device, add it to this
+invocation explicitly. Use `--format-storage` only for a confirmed blank
+device:
+
+```text
+  --storage-device /dev/disk/by-id/provider-stable-data-disk \
+  --format-storage
+```
+
 The standard artifact directory contains `release.tar.gz`, its two release
 sidecars, `gregalectl-linux-amd64`, `cosign-linux-amd64`, `pki/`, `sign.key`,
-`sign-pub.pem`, and `compute-db.env`. Individual flags override those
-conventions when an artifact is stored elsewhere.
+`sign-pub.pem`, and `compute-db.env`. It may additionally contain
+`box-age-key`, `rclone.conf.age`, and `archive-creds.json.age` for a complete
+backup-ready join. Individual flags override those conventions when an
+artifact is stored elsewhere.
 
 By default the release SHA comes from `manifest.release.git_sha`. During a
 rolling release transition, an operator may pass `--release-git-sha` to adopt
@@ -120,11 +144,12 @@ identity. `--ssh-host` is a connection override for this one adoption run.
 ## Scale-out operation
 
 The manifest remains the desired fleet topology. Add the new stable private
-hostname and runtime port to the manifest, prepare its PKI material, and run
-one join command. No `host_vars` file, `hosts.ini` entry, provider API call, or
-per-cloud code is required. At larger fleet sizes, run a complete preflight
-once and use `--skip-fleet-preflight` only when the fleet facts are still
-current; the join itself remains limited to the new node.
+hostname, runtime port, and (when needed) stable device-by-id storage path to
+the manifest, prepare its PKI material, and run one join command. No `host_vars`
+file, `hosts.ini` entry, provider API call, or per-cloud code is required. At
+larger fleet sizes, run a complete preflight once and use
+`--skip-fleet-preflight` only when the fleet facts are still current; the join
+itself remains limited to the new node.
 
 For a batch, put only provider connection details in a short-lived file and
 let the shared manifest/artifact directory supply everything else:
