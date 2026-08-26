@@ -1,0 +1,455 @@
+---
+# storage — converge the provider-neutral /srv/fc contract.
+#
+# The cloud/provider boundary ends before this role: the host already exists
+# and is reachable over SSH. This role uses Linux block-device discovery only;
+# it does not call a GCP, Hetzner, OVH, or other provider API.
+
+- name: storage — validate selectors
+  ansible.builtin.assert:
+    that:
+      - faas_storage_mode in ['auto', 'validate-only']
+      - faas_storage_redundancy in ['auto', 'single', 'mirror']
+      - faas_storage_filesystem == 'xfs'
+    fail_msg: >-
+      faas_storage_mode must be auto or validate-only, redundancy must be
+      auto/single/mirror, and the filesystem must be xfs.
+  changed_when: false
+
+- name: storage — ensure shared faas group exists
+  ansible.builtin.group:
+    name: faas
+    state: present
+    system: true
+
+- name: storage — ensure mountpoint exists
+  ansible.builtin.file:
+    path: "{{ faas_storage_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: storage — inspect current /srv/fc mount
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE,OPTIONS
+      - --mountpoint
+      - "{{ faas_storage_mount }}"
+  register: storage_mount
+  changed_when: false
+  failed_when: false
+
+- name: storage — inspect unmounted mountpoint contents
+  ansible.builtin.command:
+    argv:
+      - find
+      - "{{ faas_storage_mount }}"
+      - -mindepth
+      - "1"
+      - -maxdepth
+      - "1"
+      - -print
+      - -quit
+  register: storage_mountpoint_contents
+  changed_when: false
+  failed_when: false
+
+- name: storage — refuse to hide unmounted data
+  ansible.builtin.assert:
+    that:
+      - storage_mount.rc == 0 or (storage_mountpoint_contents.stdout | trim) == ''
+    fail_msg: >-
+      {{ faas_storage_mount }} is not a dedicated mount and is not empty.
+      Refusing to mount a new filesystem over existing data.
+
+- name: storage — inspect XFS feature flags
+  ansible.builtin.command:
+    argv:
+      - xfs_info
+      - "{{ faas_storage_mount }}"
+  register: storage_xfs_info
+  changed_when: false
+  failed_when: false
+  when:
+    - storage_mount.rc == 0
+    - >-
+      " xfs " in (' ' ~ storage_mount.stdout ~ ' ')
+
+- name: storage — classify existing filesystem
+  ansible.builtin.set_fact:
+    faas_storage_existing_valid: >-
+      {{ storage_mount.rc == 0 and
+         (' xfs ' in (' ' ~ storage_mount.stdout ~ ' ')) and
+         ('prjquota' in storage_mount.stdout) and
+         (storage_xfs_info.rc | default(1) == 0) and
+         ('reflink=1' in storage_xfs_info.stdout | default('')) }}
+    faas_storage_existing_mount: "{{ storage_mount.stdout | default('') | trim }}"
+
+- name: storage — detect an interrupted mirror setup
+  ansible.builtin.command:
+    argv:
+      - test
+      - -b
+      - /dev/md/faas-fc
+  register: storage_existing_array
+  changed_when: false
+  failed_when: false
+
+- name: storage — inspect existing mirror filesystem
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -o
+      - value
+      - -s
+      - TYPE
+      - /dev/md/faas-fc
+  register: storage_existing_array_fs
+  changed_when: false
+  failed_when: false
+  when: storage_existing_array.rc == 0
+
+- name: storage — reject an incompatible interrupted mirror
+  ansible.builtin.assert:
+    that:
+      - storage_existing_array_fs.stdout | trim in ['', 'xfs']
+    fail_msg: >-
+      /dev/md/faas-fc already exists with filesystem type
+      {{ storage_existing_array_fs.stdout | trim }}. Refusing to reformat it.
+  when:
+    - storage_existing_array.rc == 0
+    - not (faas_storage_existing_valid | bool)
+
+- name: storage — reuse a valid existing filesystem
+  ansible.builtin.debug:
+    msg: >-
+      Reusing {{ faas_storage_mount }} ({{ faas_storage_existing_mount }});
+      provider-native storage is already converged.
+  when: faas_storage_existing_valid | bool
+
+- name: storage — reject an unsafe existing mount
+  ansible.builtin.assert:
+    that:
+      - faas_storage_existing_valid | bool
+    fail_msg: >-
+      {{ faas_storage_mount }} is already mounted but does not satisfy the
+      production storage contract (XFS, reflink=1, prjquota). Refusing to
+      reformat or replace a mounted filesystem automatically.
+  when:
+    - storage_mount.rc == 0
+    - not (faas_storage_existing_valid | bool)
+
+- name: storage — require an existing filesystem in validation-only mode
+  ansible.builtin.assert:
+    that:
+      - faas_storage_existing_valid | bool
+    fail_msg: >-
+      faas_storage_mode=validate-only requires an existing valid
+      {{ faas_storage_mount }} filesystem; no storage changes were attempted.
+  when:
+    - faas_storage_mode == 'validate-only'
+
+- name: storage — install filesystem tooling for a new layout
+  ansible.builtin.apt:
+    name:
+      - mdadm
+      - xfsprogs
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — resolve the configured device
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - "{{ faas_storage_device }}"
+  register: storage_explicit_device
+  changed_when: false
+  failed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length > 0
+
+- name: storage — inspect the configured device filesystem
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -o
+      - value
+      - -s
+      - TYPE
+      - "{{ storage_explicit_device.stdout | trim }}"
+  register: storage_explicit_device_type
+  changed_when: false
+  failed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length > 0
+    - storage_explicit_device.rc == 0
+
+- name: storage — require explicit consent for a blank configured device
+  ansible.builtin.assert:
+    that:
+      - (storage_explicit_device_type.stdout | trim) in ['', 'xfs']
+      - >-
+        (storage_explicit_device_type.stdout | trim) != '' or
+        faas_storage_format | bool
+    fail_msg: >-
+      {{ faas_storage_device }} is blank. Re-run the join with
+      --format-storage (or set faas_storage_format=true) to explicitly allow
+      creating the production XFS fast-root filesystem. Existing non-XFS
+      filesystems are never reformatted.
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length > 0
+    - storage_explicit_device.rc == 0
+
+- name: storage — discover blank non-root disks
+  ansible.builtin.shell: |
+    set -eu
+    root_source="$(findmnt -n -o SOURCE /)"
+    root_disks="$(lsblk -s -nrpo NAME,TYPE "$root_source" 2>/dev/null | awk '$2 == "disk" {print $1}')"
+    lsblk -dnpo NAME,TYPE,SIZE | while read -r device kind size; do
+      [ "$kind" = disk ] || continue
+      printf '%s\n' "$root_disks" | grep -Fxq "$device" && continue
+      [ "$size" -ge "{{ faas_storage_min_bytes }}" ] || continue
+      lsblk -nrpo MOUNTPOINT "$device" | grep -q '.' && continue
+      wipefs -n "$device" 2>/dev/null | grep -q '.' && continue
+      printf '%s|%s\n' "$device" "$size"
+    done
+  args:
+    executable: /bin/bash
+  register: storage_blank_disks
+  changed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length == 0
+
+- name: storage — select the explicit device
+  ansible.builtin.set_fact:
+    faas_storage_selected_disks:
+      - "{{ storage_explicit_device.stdout | trim }}"
+    faas_storage_selected_sizes: []
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length > 0
+    - storage_explicit_device.rc == 0
+
+- name: storage — select automatically discovered disks
+  ansible.builtin.set_fact:
+    faas_storage_selected_disks: >-
+      {{ (storage_blank_disks.stdout_lines | default([])) |
+         map('regex_replace', '\\|[0-9]+$', '') | list }}
+    faas_storage_selected_sizes: >-
+      {{ (storage_blank_disks.stdout_lines | default([])) |
+         map('regex_replace', '^[^|]+\\|', '') |
+         map('int') | list }}
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length == 0
+
+- name: storage — reuse an interrupted mirror selection
+  ansible.builtin.set_fact:
+    faas_storage_selected_disks:
+      - /dev/md/faas-fc
+    faas_storage_selected_sizes: []
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - storage_existing_array.rc == 0
+
+- name: storage — validate the explicit device
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -ceu
+      - |
+        device="{{ storage_explicit_device.stdout | trim }}"
+        root_source="$(findmnt -n -o SOURCE /)"
+        root_disks="$(lsblk -s -nrpo NAME,TYPE "$root_source" 2>/dev/null | awk '$2 == "disk" {print $1}')"
+        candidate_disks="$(lsblk -s -nrpo NAME,TYPE "$device" 2>/dev/null | awk '$2 == "disk" {print $1}')"
+        [ -n "$device" ]
+        [ -n "$(lsblk -dnno TYPE "$device")" ]
+        case "$(lsblk -dnno TYPE "$device")" in
+          disk|part|raid*|crypt) ;;
+          *) exit 1 ;;
+        esac
+        while IFS= read -r root_disk; do
+          [ -z "$root_disk" ] && continue
+          if printf '%s\n' "$candidate_disks" | grep -Fxq "$root_disk"; then
+            exit 1
+          fi
+        done <<< "$root_disks"
+        mounted_target="$(findmnt -rn -S "$device" -o TARGET | head -n 1)"
+        [ -z "$mounted_target" ] || [ "$mounted_target" = "{{ faas_storage_mount }}" ]
+  changed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_device | length > 0
+    - storage_explicit_device.rc == 0
+
+- name: storage — require a safe disk selection
+  ansible.builtin.assert:
+    that:
+      - faas_storage_selected_disks | default([]) | length in [1, 2]
+      - storage_existing_array.rc != 0 or faas_storage_selected_disks | length == 1
+      - (faas_storage_redundancy != 'single' or faas_storage_selected_disks | length == 1)
+      - (faas_storage_redundancy != 'mirror' or faas_storage_selected_disks | length == 2)
+      - (faas_storage_selected_disks | length != 2 or
+         (faas_storage_selected_sizes | default([]) | unique | length == 1))
+    fail_msg: >-
+      Expected one blank non-root disk for a single layout, or two equally
+      sized blank non-root disks for a mirror layout. Found:
+      {{ faas_storage_selected_disks | default([]) | join(', ') }}.
+      Set faas_storage_device or faas_storage_redundancy explicitly after
+      reviewing the host; the pipeline will not guess across existing disks.
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — decide redundancy for automatic selection
+  ansible.builtin.set_fact:
+    faas_storage_use_mirror: >-
+      {{ (storage_existing_array.rc == 0) or
+         (faas_storage_redundancy == 'mirror') or
+         (faas_storage_redundancy == 'auto' and
+          (faas_storage_selected_disks | length == 2)) }}
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — create mirror array from two blank disks
+  ansible.builtin.command:
+    argv:
+      - mdadm
+      - --create
+      - /dev/md/faas-fc
+      - --metadata=1.2
+      - --level=1
+      - --raid-devices=2
+      - "{{ faas_storage_selected_disks[0] }}"
+      - "{{ faas_storage_selected_disks[1] }}"
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - storage_existing_array.rc != 0
+    - faas_storage_use_mirror | bool
+
+- name: storage — wait for the mirror device
+  ansible.builtin.command: udevadm settle
+  changed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_use_mirror | bool
+
+- name: storage — persist the mirror definition
+  ansible.builtin.command: mdadm --detail --scan /dev/md/faas-fc
+  register: storage_array_scan
+  changed_when: false
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_use_mirror | bool
+
+- name: storage — persist mirror metadata
+  ansible.builtin.lineinfile:
+    path: /etc/mdadm/mdadm.conf
+    regexp: '^ARRAY /dev/md/faas-fc '
+    line: "{{ storage_array_scan.stdout | trim }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - faas_storage_use_mirror | bool
+
+- name: storage — choose filesystem device
+  ansible.builtin.set_fact:
+    faas_storage_filesystem_device: "{{ '/dev/md/faas-fc' if (faas_storage_use_mirror | bool) else faas_storage_selected_disks[0] }}"
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — format the new filesystem
+  ansible.builtin.command:
+    argv:
+      - mkfs.xfs
+      - -f
+      - -m
+      - reflink=1
+      - -L
+      - "{{ faas_storage_label }}"
+      - "{{ faas_storage_filesystem_device }}"
+  when:
+    - not (faas_storage_existing_valid | bool)
+    - storage_existing_array.rc != 0 or (storage_existing_array_fs.stdout | default('') | trim) == ''
+    - >-
+      (faas_storage_device | length == 0) or
+      ((storage_explicit_device_type.stdout | default('') | trim) == '')
+
+- name: storage — read the new filesystem UUID
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -o
+      - value
+      - -s
+      - UUID
+      - "{{ faas_storage_filesystem_device }}"
+  register: storage_uuid
+  changed_when: false
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — mount the provider-neutral filesystem
+  ansible.posix.mount:
+    path: "{{ faas_storage_mount }}"
+    src: "UUID={{ storage_uuid.stdout | trim }}"
+    fstype: xfs
+    opts: "{{ faas_storage_mount_options }}"
+    dump: "0"
+    passno: "2"
+    state: mounted
+  when: not (faas_storage_existing_valid | bool)
+
+- name: storage — create the standard Firecracker directories
+  ansible.builtin.file:
+    path: "{{ faas_storage_mount }}/{{ item }}"
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+  loop:
+    - base
+    - base-staging
+    - builder
+    - jail
+    - layers
+    - scans
+    - sigs
+    - snap
+
+- name: storage — verify final filesystem contract
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE,OPTIONS
+      - --mountpoint
+      - "{{ faas_storage_mount }}"
+  register: storage_final_mount
+  changed_when: false
+
+- name: storage — verify final XFS features
+  ansible.builtin.command: xfs_info "{{ faas_storage_mount }}"
+  register: storage_final_xfs_info
+  changed_when: false
+
+- name: storage — assert final filesystem contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        " xfs " in (' ' ~ storage_final_mount.stdout ~ ' ')
+      - >-
+        "prjquota" in storage_final_mount.stdout
+      - "'reflink=1' in storage_final_xfs_info.stdout"
+    fail_msg: >-
+      {{ faas_storage_mount }} did not converge to an XFS filesystem with
+      prjquota enabled.
