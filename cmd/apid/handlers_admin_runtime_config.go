@@ -200,7 +200,7 @@ func (s *server) adminRuntimeConfigPatch(w http.ResponseWriter, r *http.Request,
 			})
 		}
 		_ = s.notif.Notify(r.Context(), db.NotifyRuntimeConfigOperationChanged, operation.ID)
-		w.Header().Set("Location", "/v1/admin/config/operations/"+operation.ID)
+		w.Header().Set("Location", "/v1/admin/config-operations/"+operation.ID)
 		writeJSON(w, http.StatusAccepted, runtimeConfigOperationResponse(operation))
 		return
 	}
