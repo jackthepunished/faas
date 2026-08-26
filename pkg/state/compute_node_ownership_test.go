@@ -273,6 +273,51 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_PgStore(t *testing
 	}
 }
 
+// TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_PgStore pins the
+// fail-closed multi-host safety check: vmmd may re-register with the same
+// host fingerprint, but a different leaf must be reconciled explicitly.
+func TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_PgStore(t *testing.T) {
+	_, pool, ctx := pgStoreWithPool(t)
+
+	name := "ownership-cert-" + time.Now().UTC().Format("20060102T150405.000000000")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `delete from compute_nodes where name = $1`, name)
+	})
+
+	s := state.NewPgStore(pool)
+	if _, err := s.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name:               name,
+		TargetURL:          "tcp://vmmd-2.faas:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}); err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+
+	base := state.ComputeNode{
+		Name:               name,
+		TargetURL:          "tcp://0.0.0.0:50051",
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+		CertFingerprint:    stringPtr("fingerprint-a"),
+	}
+	if _, err := s.UpsertComputeNodeFromVmmd(ctx, base); err != nil {
+		t.Fatalf("same-fingerprint vmmd upsert: %v", err)
+	}
+
+	base.CertFingerprint = stringPtr("fingerprint-b")
+	if _, err := s.UpsertComputeNodeFromVmmd(ctx, base); !errors.Is(err, state.ErrCertFingerprintDrift) {
+		t.Fatalf("drift upsert error = %v, want ErrCertFingerprintDrift", err)
+	}
+}
+
 // TestUpsertComputeNodeFromVmmd_ColdInsert_FallsBackToVmmdURL_PgStore:
 // the PgStore mirror of the cold-INSERT case. COALESCE on the
 // existing target_url (NULL) falls back to the new row's value.
