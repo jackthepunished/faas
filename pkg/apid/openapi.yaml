@@ -10304,9 +10304,8 @@ components:
           pattern: '^[a-z0-9_]{1,64}$'
           example: operator_force_park
         trace_id:
-          type: string
+          type: [string, "null"]
           pattern: '^[0-9a-f]{32}$'
-          nullable: true
           description: |
             Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
             hex identifier shared with the inbound HTTP request
@@ -10368,9 +10367,8 @@ components:
           items: { type: string, format: uuid }
           description: Populated for force_cold_boot and force_restart on succeeded status. Empty when no snapshots existed.
         trace_id:
-          type: string
+          type: [string, "null"]
           pattern: '^[0-9a-f]{32}$'
-          nullable: true
           description: |
             Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
             hex identifier shared with the inbound HTTP request
