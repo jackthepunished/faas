@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // TestTraceID_GeneratesWhenInboundAbsent pins the generation
@@ -34,11 +36,19 @@ import (
 func TestTraceID_GeneratesWhenInboundAbsent(t *testing.T) {
 	var got *string
 	var ctxValue string
+	var sc oteltrace.SpanContext
 	h := TraceID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = TraceIDFrom(r)
 		if v, ok := r.Context().Value(TraceIDKey{}).(string); ok {
 			ctxValue = v
 		}
+		// PR-#TBD / fix-cluster A — the middleware must also
+		// stamp a valid OTel SpanContext on r.Context() so
+		// downstream audit.Auditor.Emit's OTel-lift finds the
+		// trace_id via oteltrace.SpanContextFromContext. Without
+		// this, the apid audit emit's trace_id lands as NULL
+		// even though TraceIDKey was set.
+		sc = oteltrace.SpanContextFromContext(r.Context())
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -56,6 +66,12 @@ func TestTraceID_GeneratesWhenInboundAbsent(t *testing.T) {
 	}
 	if h := rr.Header().Get(TraceIDHeader); h != *got {
 		t.Errorf("response header %q != TraceIDFrom() %q", h, *got)
+	}
+	if !sc.TraceID().IsValid() {
+		t.Errorf("OTel SpanContext.TraceID().IsValid() = false; want true (middleware must bridge TraceIDKey → SpanContext)")
+	}
+	if sc.TraceID().String() != *got {
+		t.Errorf("SpanContext.TraceID() = %q, want %q (match TraceIDKey value)", sc.TraceID().String(), *got)
 	}
 }
 
@@ -145,5 +161,82 @@ func TestNewTraceID_Format(t *testing.T) {
 				t.Errorf("NewTraceID[%d] = %q; want lowercase hex", j, c)
 			}
 		}
+	}
+}
+
+// TestWithSpanContext_RoundTrip pins the happy path: a valid
+// 32-char OTel hex trace_id lifts into a SpanContext whose
+// TraceID matches the input. The synthetic SpanContext carries
+// a valid TraceID + zero SpanID (no real tracer is involved);
+// the audit emit's OTel-lift at pkg/audit/audit.go:228-239 reads
+// trace_id via sc.TraceID().IsValid() (which IS true here) so
+// the bridge is load-bearing even though SpanContext.IsValid()
+// returns false (SpanID is zero).
+func TestWithSpanContext_RoundTrip(t *testing.T) {
+	const id = "4bf92f3577b34da6a3ce929d0e0e4736"
+	ctx := WithSpanContext(context.Background(), id)
+	sc := oteltrace.SpanContextFromContext(ctx)
+	if !sc.TraceID().IsValid() {
+		t.Fatalf("SpanContext.TraceID().IsValid() = false; want true (valid OTel hex)")
+	}
+	if got := sc.TraceID().String(); got != id {
+		t.Errorf("SpanContext.TraceID() = %q, want %q", got, id)
+	}
+	if sc.SpanID().IsValid() {
+		t.Errorf("SpanContext.SpanID() = %q; want zero SpanID (synthetic ctx only carries trace_id)", sc.SpanID())
+	}
+	if sc.TraceFlags() != oteltrace.FlagsSampled {
+		t.Errorf("SpanContext.TraceFlags() = %v; want FlagsSampled", sc.TraceFlags())
+	}
+	if !sc.IsRemote() {
+		t.Errorf("SpanContext.IsRemote() = false; want true (synthetic ctx is remote)")
+	}
+}
+
+// TestWithSpanContext_NilOnEmpty pins the empty-id no-op. Mirrors
+// WithTraceID's empty-id contract so callers can compose them
+// without nil-checking.
+func TestWithSpanContext_NilOnEmpty(t *testing.T) {
+	ctx := context.Background()
+	got := WithSpanContext(ctx, "")
+	if got != ctx {
+		t.Errorf("WithSpanContext(ctx, \"\") returned %v, want unchanged ctx", got)
+	}
+	if sc := oteltrace.SpanContextFromContext(got); sc.TraceID().IsValid() {
+		t.Errorf("WithSpanContext(ctx, \"\") stamped a valid TraceID; want invalid")
+	}
+}
+
+// TestWithSpanContext_NilCtx confirms the nil-ctx no-op. Defensive
+// — the middleware always passes a non-nil ctx, but downstream
+// helpers may pass through nil.
+func TestWithSpanContext_NilCtx(t *testing.T) {
+	got := WithSpanContext(nil, "4bf92f3577b34da6a3ce929d0e0e4736")
+	if got != nil {
+		t.Errorf("WithSpanContext(nil, id) = %v, want nil", got)
+	}
+}
+
+// TestWithSpanContext_MalformedHex pins the "garbage-in / no-op"
+// posture. A malformed inbound trace_id (non-hex chars, wrong
+// length) does NOT poison the SpanContext — the audit emit's
+// own OTel lift has the same posture.
+func TestWithSpanContext_MalformedHex(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"non-hex-chars", "not-a-hex-value-but-32charsXX"},
+		{"too-short", "4bf92f3577b34da6a3ce929d0e0e473"},
+		{"too-long", "4bf92f3577b34da6a3ce929d0e0e473600"},
+		{"uppercase-rejected", "4BF92F3577B34DA6A3CE929D0E0E4736"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := WithSpanContext(context.Background(), tc.id)
+			if sc := oteltrace.SpanContextFromContext(ctx); sc.TraceID().IsValid() {
+				t.Errorf("malformed id %q stamped a valid TraceID %q; want invalid", tc.id, sc.TraceID())
+			}
+		})
 	}
 }

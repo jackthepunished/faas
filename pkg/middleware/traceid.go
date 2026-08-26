@@ -38,6 +38,8 @@ import (
 	"context"
 	"net/http"
 
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -92,6 +94,55 @@ func NewTraceID() string {
 	return wire.NewTraceID()
 }
 
+// WithSpanContext lifts an OTel W3C trace_id into an OTel
+// SpanContext so downstream audit.Auditor.Emit's OTel-lift
+// (pkg/audit/audit.go:228-239) finds it via
+// oteltrace.SpanContextFromContext.
+//
+// Mirrors the scheddgrpc-side withTraceIDSpan helper
+// (pkg/scheddgrpc/server.go:1284-1312) but reads an explicit
+// id rather than gRPC metadata — the HTTP middleware path
+// has no MD envelope to walk, so the trace_id is passed in
+// explicitly.
+//
+// Returns ctx unchanged when:
+//   - ctx is nil
+//   - id is empty
+//   - id isn't a valid 32-char OTel hex (parse error or
+//     zero TraceID after parse)
+//
+// The "garbage-in / no-op" posture matches the audit emit's
+// own OTel lift: a malformed inbound trace_id never poisons
+// the span context the audit emit reads.
+//
+// The synthetic SpanContext is non-recorded — no SpanContextConfig
+// tracer provider is set, so the span does NOT register with
+// any global OTel tracer; only the SpanContext.PropagationFields
+// flow through the ctx. This matches scheddgrpc's pattern and
+// keeps the middleware out of the OTel exporter's wiring (which
+// is per-daemon and out of scope here).
+//
+// TraceFlags is FlagsSampled so downstream consumers that key
+// off the sampled bit (e.g. tail-based samplers, future ADR-129
+// work) treat the request as sampled. Remote: true signals the
+// span came from outside this process.
+func WithSpanContext(ctx context.Context, traceID string) context.Context {
+	if ctx == nil || traceID == "" {
+		return ctx
+	}
+	trace, err := oteltrace.TraceIDFromHex(traceID)
+	if err != nil || !trace.IsValid() {
+		return ctx
+	}
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    trace,
+		SpanID:     oteltrace.SpanID{},
+		TraceFlags: oteltrace.FlagsSampled,
+		Remote:     true,
+	})
+	return oteltrace.ContextWithSpanContext(ctx, sc)
+}
+
 // TraceID is a middleware that ensures every inbound request
 // has an X-Trace-Id header (inbound override OR freshly generated),
 // stores it on the context via WithTraceID, and echoes it back
@@ -114,7 +165,19 @@ func TraceID(next http.Handler) http.Handler {
 			traceID = NewTraceID()
 		}
 		w.Header().Set(TraceIDHeader, traceID)
-		r = r.WithContext(WithTraceID(r.Context(), traceID))
+		// Compose both the TraceIDKey stash (so TraceIDFrom(r)
+		// returns *string for the handlers' InsertOperatorIntent
+		// arg) AND the OTel SpanContext (so audit.Auditor.Emit's
+		// OTel-lift at pkg/audit/audit.go:228-239 stamps
+		// data["trace_id"] onto the audit row). Without the
+		// SpanContext bridge the apid audit emit's trace_id
+		// would land as NULL even though the column + Store
+		// path is wired correctly — the two context keys
+		// (TraceIDKey vs OTel SpanContext) are disjoint and
+		// neither reads the other.
+		ctx := WithTraceID(r.Context(), traceID)
+		ctx = WithSpanContext(ctx, traceID)
+		r = r.WithContext(ctx)
 		next.ServeHTTP(w, r)
 	})
 }

@@ -226,15 +226,28 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 	if data == nil {
 		data = map[string]any{}
 	}
-	if sc := oteltrace.SpanContextFromContext(ctx); sc.IsValid() {
+	if sc := oteltrace.SpanContextFromContext(ctx); sc.TraceID().IsValid() {
 		// Don't overwrite a customer-supplied trace_id (e.g. cron-fired
 		// events that synthesise a trace_id for the row). The merge
 		// falls back to the active span context only when the field
 		// is absent.
+		//
+		// PR-#TBD / fix-cluster A — gate the trace_id lift on
+		// TraceID().IsValid() alone, not the full SpanContext.IsValid().
+		// The synthetic SpanContexts that pkg/middleware.WithSpanContext
+		// and pkg/scheddgrpc.withTraceIDSpan stamp on ctx carry a
+		// valid TraceID + zero SpanID (we don't synthesise a SpanID —
+		// that would require a real tracer to be load-bearing); the
+		// OTel SDK treats a zero SpanID as invalid, so the full
+		// SpanContext.IsValid() gate would skip the lift entirely on
+		// both the HTTP and gRPC operator-action paths. Splitting the
+		// gate keeps the trace_id lift load-bearing while the span_id
+		// lift (which DOES need a valid SpanID to be meaningful) stays
+		// a no-op for synthetic contexts.
 		if _, ok := data["trace_id"]; !ok {
 			data["trace_id"] = sc.TraceID().String()
 		}
-		if _, ok := data["span_id"]; !ok {
+		if _, ok := data["span_id"]; !ok && sc.SpanID().IsValid() {
 			data["span_id"] = sc.SpanID().String()
 		}
 	}
