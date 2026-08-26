@@ -11285,7 +11285,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		values ($1, $2, $3, $4, $5, $6, $7, true,
 		        $8, $9, $10,
 		        $11, $12,
-		        $13, $14, $15, $16, $17, $18)
+		        $13, $14, $15, $16, $17, $18, $19)
 		on conflict (name) do update
 		  set vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
