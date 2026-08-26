@@ -56,7 +56,9 @@ func UnitBuilderd() daemonunit.Unit {
 		Slice:     "faas-cp.slice",
 		MemoryMax: "512M",
 
-		EnvironmentFile: "-/etc/faas/compute-db.env",
+		// The source-layer path follows the same shared OCI storage contract
+		// as vmmd/imaged on a multi-box fleet.
+		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/storage.env",
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_BUILDERD_CONFIG", Value: "/etc/faas/builderd.toml"},
 		},

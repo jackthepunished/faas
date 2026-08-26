@@ -47,6 +47,7 @@ func cmdDeployJoinFleet(args []string) int {
 	signKey := fs.String("sign-key", "", "image-signing private key")
 	verifyKey := fs.String("verify-key", "", "image-signing public key")
 	computeDBEnv := fs.String("compute-db-env", "", "root-only compute DB environment")
+	storageEnv := fs.String("storage-env", "", "shared OCI storage.env source")
 	ansibleVars := fs.String("ansible-vars-file", "", "optional provider/overlay Ansible vars")
 	repoRoot := fs.String("repo-root", "", "path to the faas repository")
 	maxParallel := fs.Int("max-parallel", 4, "maximum number of nodes converged at once")
@@ -106,7 +107,7 @@ func cmdDeployJoinFleet(args []string) int {
 			ReleaseTarball: *releaseTarball, BootstrapBinary: *bootstrapBinary,
 			CosignBinary: *cosignBinary, PKISource: *pkiSource,
 			SignKeySource: *signKey, VerifyKeySource: *verifyKey,
-			ComputeDBEnvSource: *computeDBEnv, ArtifactDir: *artifactDir,
+			ComputeDBEnvSource: *computeDBEnv, StorageEnvSource: *storageEnv, ArtifactDir: *artifactDir,
 			AnsibleVarsFile: *ansibleVars, RepoRoot: *repoRoot,
 			SkipFleetPreflight: *skipPreflight, Resume: *resume,
 			Timeout: *timeout, LeaseTTL: *leaseTTL, DryRun: *dryRun, Yes: *yes,

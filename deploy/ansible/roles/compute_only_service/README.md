@@ -30,6 +30,9 @@ with `DATABASE_URL` (gap G2).
 - Installs the imaged example TOML to `/etc/faas/imaged.toml.example`
   (operator copies to `imaged.toml`).
 - Installs the systemd unit to `/etc/systemd/system/faas-imaged.service`.
+- Installs the shared `storage.env.example`; the provider-neutral node join
+  pipeline stages the populated `/etc/faas/storage.env` for OCI-backed
+  multi-box deployments.
 - **Mega-PR-C**: chowns `/run/faas` to root:faas 0775 at deploy time AND
   ships a `/etc/tmpfiles.d/faas.conf` rule so the same ownership
   survives every reboot. Mirrors `control_plane_service`'s PR-D + PR-M

@@ -349,6 +349,40 @@ func TestChoosePlacement_Table(t *testing.T) {
 	}
 }
 
+func TestChoosePlacementPrefersReadySnapshotReplica(t *testing.T) {
+	nodes := []state.ComputeNode{
+		node("cached", "cached", 20, 100),
+		node("uncached", "uncached", 0, 100),
+	}
+	placement, err := ChoosePlacement(nodes,
+		map[string]int64{"cached": 20, "uncached": 0},
+		map[string]int64{},
+		Request{RAMMB: 40, PreferredNodeIDs: []string{"cached"}})
+	if err != nil {
+		t.Fatalf("ChoosePlacement: %v", err)
+	}
+	if placement.NodeID != "cached" {
+		t.Fatalf("node = %q, want cached", placement.NodeID)
+	}
+}
+
+func TestChoosePlacementFallsThroughWhenReadyReplicaIsFull(t *testing.T) {
+	nodes := []state.ComputeNode{
+		node("cached", "cached", 90, 100),
+		node("uncached", "uncached", 0, 100),
+	}
+	placement, err := ChoosePlacement(nodes,
+		map[string]int64{"cached": 90, "uncached": 0},
+		map[string]int64{},
+		Request{RAMMB: 40, PreferredNodeIDs: []string{"cached"}})
+	if err != nil {
+		t.Fatalf("ChoosePlacement: %v", err)
+	}
+	if placement.NodeID != "uncached" {
+		t.Fatalf("node = %q, want uncached", placement.NodeID)
+	}
+}
+
 // TestChoosePlacement_RejectsNonPositiveRAM pins the "RAM must be
 // positive" guard. A zero-RAM request would silently land on the first
 // active node with zero check, which is wrong (every real instance

@@ -11,6 +11,30 @@
   become: true
   serial: 1
   max_fail_percentage: 0
+  pre_tasks:
+    - name: Ensure the shared daemon group exists before staging storage config
+      ansible.builtin.group:
+        name: faas
+        state: present
+        system: true
+
+    - name: Ensure the control-plane configuration directory exists
+      ansible.builtin.file:
+        path: /etc/faas
+        state: directory
+        owner: root
+        group: faas
+        mode: "0750"
+
+    - name: Stage the shared OCI storage environment on the control plane
+      ansible.builtin.copy:
+        src: "{{ faas_join_storage_env_source }}"
+        dest: /etc/faas/storage.env
+        owner: root
+        group: faas
+        mode: "0440"
+      no_log: true
+      when: (faas_join_storage_env_source | default('') | trim) != ''
   roles:
     # The generated control-plane host vars contain the complete manifest
     # allowlists. This renders the canonical nftables policy, including the

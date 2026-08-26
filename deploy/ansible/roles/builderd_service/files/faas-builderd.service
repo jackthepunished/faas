@@ -41,6 +41,9 @@ MemoryMax=512M
 # compute-db.env is kept for the optional DATABASE_URL the TOML config
 # references on OCI-backed storage backends.
 EnvironmentFile=-/etc/faas/compute-db.env
+# Shared OCI storage contract. Optional for single-box/local deployments;
+# required on a multi-box fleet and identical on every storage consumer.
+EnvironmentFile=-/etc/faas/storage.env
 
 NoNewPrivileges=yes
 ProtectSystem=strict

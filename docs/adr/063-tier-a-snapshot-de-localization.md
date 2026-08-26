@@ -1,14 +1,15 @@
 # ADR-063 · Tier A: snapshot de-localization (residual local-cache semantics)
 
-- **Status:** **Accepted** (revised 2026-08-16)
+- **Status:** **Accepted** (revised 2026-08-26; issue #1054 follow-on)
 - **Date:** 2026-08-01
 - **Issue:** Phase 2 / Gate A — record the snapshot locality decision
   taken as a side effect of Tier 1's OCI storage rollout
-- **Decision:** Snapshots are **per-schedd-local caches**; the
-  authoritative blob lives in the shared OCI registry (ADR-054).
-  Cross-node wake pulls the blob on demand; this is acceptable for
-  v1.0 because the cold-boot path (ADR-005) is the slow path and
-  keeps the snapshot a cache, not a truth source.
+- **Decision:** Snapshots are **node-local caches** backed by a
+  shared OCI registry (ADR-054). The node-local `snapshothipd`
+  worker asynchronously prepositions both restore blobs on active
+  compute nodes in the snapshot's region. Cross-node wake still
+  pulls on demand when no ready replica exists; cold boot remains
+  the correctness fallback (ADR-005).
 
 ## Context
 
@@ -25,33 +26,47 @@ re-snapshot locally, or pull from schedd-B's cache?
 
 ## Decision
 
-**Per-schedd-local cache; cross-node pulls on demand from the OCI
-registry.** The snapshot is a cache; cold-boot (no snapshot) is
-always legal (ADR-005).
+**Shared authoritative blob plus asynchronous regional cache
+prepositioning.** The snapshot is a cache; cold-boot (no snapshot)
+is always legal (ADR-005).
 
 Specifically:
 
-- Each schedd writes its own `snapshot_local_path` row when it
-  snaps an instance. No sharing, no cross-schedd snapshot file
-  transfer.
-- A wake on the owner schedd hits the local cache (warm-restore).
+- `vmmd` publishes snapshot memory and vmstate through the shared
+  storage backend when `FAAS_STORAGE_BACKEND=oci`; `snap/` is no
+  longer in the default OCI local-prefix list.
+- `snapshot_replicas` is a durable per-(snapshot,node) queue. Each
+  node-local `vmmd` reconciles it, claims work with row locking, drains
+  both blobs through the read-through cache, and marks the pair
+  `ready` only after both reads succeed. vmmd is used because the current
+  compute-only Ansible role runs vmmd on every compute box while schedd
+  remains a control-plane service.
+- `snapshot_origins` records the producing node and region. New
+  snapshots fan out only inside that region; legacy rows without
+  origin metadata remain eligible for safe catch-up.
+- A wake prefers a node with a ready local replica, while retaining
+  the normal capacity and cold-boot fallback rules.
 - A wake on a non-owner schedd is rejected before reaching vmmd
   (`pkg/scheddgrpc` ownership guard returns `codes.FailedPrecondition`
   on mismatch). The gateway's per-node dial cache routes the
   customer's request to the owner schedd via `apps.node_id`.
-- If the owner's local snapshot is gone (drained box, disk
-  pressure, etc.), the owner falls back to cold-boot
-  (`CreateColdBoot`); the snapshot is a cache, not a prerequisite.
-- Cross-node snapshot transfer is **out of scope**. v1.0
-  cross-node wakes hit the owner; v1.1 may revisit if a
-  hot-standby is added.
+- If a replica is missing, stale, or its registry pull fails, the
+  owner falls back to on-demand shared-backend restore and then
+  cold-boot (`CreateColdBoot`) if restore is unavailable.
+- The worker is intentionally embedded in vmmd for the first
+  implementation. Its durable queue and storage interfaces are
+  provider-neutral, so a future standalone systemd unit can reuse
+  the same state machine without introducing peer IP/SSH coupling.
 
 ## Consequences
 
-- v1.0 cross-node wake latency = owner RTT + (snapshot hit) restore
-  or (snapshot miss) cold-boot. Same as v1.0 single-box latency.
-- Snapshot disk usage scales linearly with (apps × owners); not
-  (apps × schedds). Operationally clean.
+- Prepositioned cross-node wake latency is the local-cache restore
+  path; the acceptance target is p50 ≤200 ms after `ready`.
+  A cache miss remains owner RTT + shared-backend restore or cold
+  boot and is observable through the fan-out metric.
+- Snapshot disk usage scales with the configured local cache budget
+  on each active node. The cache is bounded and evictable; the OCI
+  registry remains the durable source.
 - The OCI registry is the durable source of truth for the base
   + per-app layers; snapshots remain ephemeral.
 - "Snapshot exists for every owned app" becomes "snapshot exists
@@ -63,13 +78,35 @@ Specifically:
 ## Rejected alternatives
 
 - **Cross-node snapshot replication (rsync + warm standby).**
-  Rejected for v1.0: doubles snapshot disk cost, doubles the
-  snapshot-rebuild pipeline complexity, and the cold-boot fallback
-  is already a clean ADR-005 path.
+  Rejected: it couples boxes to private addresses and provider
+  storage. The shared-backend queue provides the same locality
+  benefit without a peer transfer protocol.
 - **Centralized snapshot server.** Rejected: contradicts the
   multi-box posture; one snapshot server is one failure domain.
-- **OCI as the snapshot blob (in addition to layers).** Rejected:
-  Firecracker's snapshot restore is kernel-version-pinned
-  (`snapshots.fc_version`) and `FC` upgrades drop them anyway
-  (ADR-005). The OCI layer is the durable artefact; the snapshot
-  is a per-host micro-optimisation.
+- **OCI as the snapshot blob (in addition to layers).** Accepted as
+  the authoritative transport, not as a truth source: Firecracker's
+  snapshot restore is kernel-version-pinned (`snapshots.fc_version`)
+  and FC upgrades drop snapshots anyway (ADR-005). The local cache
+  remains an optimization.
+
+## Implementation status
+
+Issue #1054's first implementation is wired in PR-A:
+
+- migration `00456_snapshot_replicas.sql` adds the durable queue and
+  regional origin metadata;
+- `pkg/snapshothipd` performs bounded, retryable cache warming from vmmd;
+- `snapshothipd_fanout_total{outcome,region}` exposes the pre-instantiated
+  closed `{ready, failed}` outcome set;
+- scheduler placement prefers ready replicas without making them a
+  correctness dependency.
+
+The `snapshots.storage_key` column is already PostgreSQL `text` from
+migration `00022_snapshots_storage_key.sql`, so it accepts shared-registry
+keys without a second type-widening migration. OCI registry references stay
+in the storage backend configuration; the database continues to store the
+provider-neutral logical key (`snap/<deployment>/mem`).
+
+The two-node metal drill still must measure the ≤200 ms prepositioned
+wake target and run the 100-cycle leak check before the M9 acceptance
+row can be marked green.
