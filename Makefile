@@ -49,6 +49,7 @@ build: guest-runners ## Build every daemon + CLIs + guest init + function runner
 	done
 	@echo "building init (guest PID 1)"
 	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o $(BINDIR)/init ./guest/init
+	@install -m 0755 scripts/schedd-brokerq-apply $(BINDIR)/schedd-brokerq-apply
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and
 # must be built for the guest architecture (linux/amd64, CGO off). Each

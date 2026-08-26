@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Apply schedd's optional broker-egress shaper before the daemon starts.
+#
+# The systemd unit invokes this helper from the active release bundle. An
+# unset cap is the normal path for plans without broker-egress shaping and is
+# deliberately a no-op. A configured cap fails closed on malformed input or
+# a missing interface so the operator cannot mistake an unshaped broker pipe
+# for an enforced one.
+set -euo pipefail
+
+cap="${FAAS_BROKER_EGRESS_MBIT:-}"
+if [[ -z "$cap" ]]; then
+  exit 0
+fi
+
+if [[ ! "$cap" =~ ^[1-9][0-9]*$ ]]; then
+  echo "schedd-brokerq-apply: FAAS_BROKER_EGRESS_MBIT must be a positive integer (got $cap)" >&2
+  exit 1
+fi
+
+iface="${FAAS_BROKER_EGRESS_IFNAME:-faas-brokerq}"
+if [[ ! "$iface" =~ ^[[:alnum:]_.:-]+$ ]]; then
+  echo "schedd-brokerq-apply: invalid interface name" >&2
+  exit 1
+fi
+
+command -v ip >/dev/null 2>&1 || {
+  echo "schedd-brokerq-apply: ip command not found" >&2
+  exit 1
+}
+command -v tc >/dev/null 2>&1 || {
+  echo "schedd-brokerq-apply: tc command not found" >&2
+  exit 1
+}
+ip link show dev "$iface" >/dev/null
+
+# replace makes restarts and explicit operator re-application idempotent while
+# preserving the same tbf parameters pinned by pkg/sched.BrokerTcCommands.
+exec tc qdisc replace dev "$iface" root tbf \
+  rate "${cap}mbit" burst 32kbit latency 400ms
