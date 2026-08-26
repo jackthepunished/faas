@@ -87,12 +87,19 @@ func TestMemStoreRuntimeConfigCRUDAndRevisionHistory(t *testing.T) {
 	if err != nil || len(nodeOnly) != 1 || nodeOnly[0].Key != "node_limit" {
 		t.Fatalf("node runtime configs = %#v, %v", nodeOnly, err)
 	}
+	globalNode, err := store.ListRuntimeConfigs(ctx, RuntimeConfigScopeGlobal, "node-a")
+	if err != nil || len(globalNode) != 0 {
+		t.Fatalf("global configs for node scope = %#v, %v", globalNode, err)
+	}
 
 	if err := store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, 99, json.RawMessage(`"bad"`), ""); !errors.Is(err, ErrRuntimeConfigConflict) {
 		t.Fatalf("mark with stale version = %v, want conflict", err)
 	}
 	if err := store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, row.Version, json.RawMessage(`"60s"`), ""); err != nil {
 		t.Fatalf("mark applied: %v", err)
+	}
+	if err := store.MarkRuntimeConfigApplied(ctx, "missing", RuntimeConfigScopeGlobal, "", 1, json.RawMessage(`true`), ""); !errors.Is(err, ErrRuntimeConfigConflict) {
+		t.Fatalf("mark missing runtime config = %v, want conflict", err)
 	}
 	got, err = store.GetRuntimeConfig(ctx, row.Key, row.Scope, row.ScopeID)
 	if err != nil || got.Status != RuntimeConfigApplied || string(got.EffectiveValue) != `"60s"` || got.AppliedAt == nil {
@@ -121,6 +128,10 @@ func TestMemStoreRuntimeConfigCRUDAndRevisionHistory(t *testing.T) {
 	revisions, err = store.ListRuntimeConfigRevisions(ctx, row.Key, row.Scope, row.ScopeID, 0)
 	if err != nil || len(revisions) != 3 {
 		t.Fatalf("default runtime config revisions = %#v, %v", revisions, err)
+	}
+	revisions, err = store.ListRuntimeConfigRevisions(ctx, row.Key, row.Scope, row.ScopeID, 201)
+	if err != nil || len(revisions) != 3 {
+		t.Fatalf("capped runtime config revisions = %#v, %v", revisions, err)
 	}
 }
 
@@ -186,5 +197,19 @@ func TestMemStoreRuntimeConfigOperationGuardsAndTerminalPaths(t *testing.T) {
 	blocked, err := store.GetRuntimeConfigOperation(ctx, op.ID)
 	if err != nil || blocked.Status != RuntimeConfigOperationBlocked || blocked.Error != "requires two-person approval" {
 		t.Fatalf("blocked operation = %#v, %v", blocked, err)
+	}
+
+	orphan, err := store.CreateRuntimeConfigOperation(ctx, RuntimeConfig{
+		Key: "orphan", Scope: RuntimeConfigScopeGlobal, DesiredValue: json.RawMessage(`true`),
+		ApplyMode: RuntimeConfigApplyGraceful, Version: 1,
+	}, "actor", "orphan")
+	if err != nil {
+		t.Fatalf("create orphan operation: %v", err)
+	}
+	if _, err := store.ClaimPendingRuntimeConfigOperation(ctx); err != nil {
+		t.Fatalf("claim orphan operation: %v", err)
+	}
+	if err := store.MarkRuntimeConfigOperationSucceeded(ctx, orphan.ID, nil, 0, 0); err != nil {
+		t.Fatalf("succeed orphan operation: %v", err)
 	}
 }

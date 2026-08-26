@@ -165,6 +165,10 @@ func TestPgStoreRuntimeConfigCRUDAndRevisionHistory(t *testing.T) {
 	if err != nil || len(revisions) != 3 {
 		t.Fatalf("default revisions = %#v, %v", revisions, err)
 	}
+	revisions, err = store.ListRuntimeConfigRevisions(ctx, "request_read_timeout", state.RuntimeConfigScopeGlobal, "", 201)
+	if err != nil || len(revisions) != 3 {
+		t.Fatalf("capped revisions = %#v, %v", revisions, err)
+	}
 }
 
 func TestPgStoreRuntimeConfigOperationLifecycleAndGuards(t *testing.T) {
@@ -199,15 +203,15 @@ func TestPgStoreRuntimeConfigOperationLifecycleAndGuards(t *testing.T) {
 	if _, err := store.ClaimPendingRuntimeConfigOperation(ctx); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
 		t.Fatalf("second claim = %v, want not found", err)
 	}
-	if err := store.MarkRuntimeConfigOperationSucceeded(ctx, op.ID, json.RawMessage(`10`), 1, 1); err != nil {
+	if err := store.MarkRuntimeConfigOperationSucceeded(ctx, op.ID, nil, 1, 1); err != nil {
 		t.Fatalf("mark succeeded: %v", err)
 	}
 	got, err := store.GetRuntimeConfigOperation(ctx, op.ID)
-	if err != nil || got.Status != state.RuntimeConfigOperationSucceeded || got.FinishedAt == nil || got.AppliedCount != 1 || got.TargetCount != 1 {
+	if err != nil || got.Status != state.RuntimeConfigOperationSucceeded || got.FinishedAt == nil || got.AppliedCount != 1 || got.TargetCount != 1 || string(got.EffectiveValue) != "null" {
 		t.Fatalf("succeeded operation = %#v, %v", got, err)
 	}
 	config, err = store.GetRuntimeConfig(ctx, config.Key, config.Scope, config.ScopeID)
-	if err != nil || config.Status != state.RuntimeConfigApplied || string(config.EffectiveValue) != `10` {
+	if err != nil || config.Status != state.RuntimeConfigApplied || string(config.EffectiveValue) != `null` {
 		t.Fatalf("config after operation = %#v, %v", config, err)
 	}
 	if err := store.MarkRuntimeConfigOperationSucceeded(ctx, op.ID, nil, 0, 0); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
@@ -253,11 +257,11 @@ func TestPgStoreRuntimeConfigOperationLifecycleAndGuards(t *testing.T) {
 	if _, err := store.ClaimPendingRuntimeConfigOperation(ctx); err != nil {
 		t.Fatalf("claim third operation: %v", err)
 	}
-	if err := store.MarkRuntimeConfigOperationBlocked(ctx, op.ID, "approval", "requires approval"); err != nil {
+	if err := store.MarkRuntimeConfigOperationBlocked(ctx, op.ID, "approval", strings.Repeat("b", 2048)); err != nil {
 		t.Fatalf("mark blocked: %v", err)
 	}
 	got, err = store.GetRuntimeConfigOperation(ctx, op.ID)
-	if err != nil || got.Status != state.RuntimeConfigOperationBlocked || got.Error != "requires approval" {
+	if err != nil || got.Status != state.RuntimeConfigOperationBlocked || len(got.Error) != 1024 {
 		t.Fatalf("blocked operation = %#v, %v", got, err)
 	}
 }
