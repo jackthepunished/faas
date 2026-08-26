@@ -360,6 +360,20 @@ type invalidator interface {
 	// the next mutation; we never block the notify path on a
 	// transient CA failure.
 	RequestCertForSurface(ctx context.Context, surfaceID string) error
+	// ResetCorsPresets (issue #975 #4 PR-B / ADR-129 D4) drops
+	// the per-host edge-rule LRU for the affected account so
+	// the next request recompiles and re-fetches the up-to-date
+	// preset via state.GetCorsPresetByID. Wholesale reset is
+	// correct: the per-rule compile path re-reads the preset
+	// on every cache miss, so the post-reset compile produces
+	// resolved actions against the latest row. The account_id
+	// payload is informational — the cmd-side pg_notify channel
+	// is too narrow to do per-account surgical eviction without
+	// restructuring the LRU key to include account_id. For the
+	// multi-tenant case the worst-case is "another account's
+	// request recompiles" — same compile cost as the first
+	// request to a host, no incorrect routing.
+	ResetCorsPresets(accountID string)
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -391,6 +405,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 		db.NotifyDeploymentChanged,
 		db.NotifyEdgeRuleChanged,
 		db.NotifyTenantSurfaceChanged,
+		db.NotifyCorsPresetChanged,
 	}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
@@ -594,5 +609,35 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		if err := inv.RequestCertForSurface(ctx, n.Payload); err != nil {
 			log.Warn("gatewayd: cert remint failed", "surface", n.Payload, "err", err)
 		}
+	case db.NotifyCorsPresetChanged:
+		// Issue #975 #4 PR-B / ADR-129 D4. The trigger at
+		// migrations/00428 fires pg_notify
+		// ('cors_preset_changed', NEW.account_id::text) on
+		// every cors_presets INSERT / UPDATE / DELETE. The
+		// compile path (cmd/gatewayd-internal/edge_rules.go
+		// ::compileCORSRules) bakes the preset's
+		// allow_origins / allow_methods / etc. into the
+		// resolved EdgeRuleCORSResolved slice at compile
+		// time, so a preset edit leaves stale resolved
+		// shapes in the per-host LRU. Wholesale
+		// ResetEdgeRules drops the LRU so the next request
+		// recompiles and re-fetches the preset from PG.
+		// The account_id payload is informational; the
+		// LRU is per-host keyed, not per-account, so a
+		// surgical per-account eviction would require a
+		// richer key. Wholesale flush is the same posture
+		// as NotifyEdgeRuleChanged and is bounded by the
+		// compile cost (one SELECT per cache miss).
+		//
+		// Empty / missing payload is logged-and-dropped:
+		// the production trigger always emits
+		// NEW/OLD.account_id, so an empty payload signals a
+		// bug or a future trigger revision. Better to
+		// over-stale than to evict on a misrouted event.
+		if n.Payload == "" {
+			log.Warn("gatewayd: bad cors_preset_changed payload", "payload", n.Payload)
+			return
+		}
+		inv.ResetCorsPresets(n.Payload)
 	}
 }

@@ -156,6 +156,13 @@ type fakeInvalidator struct {
 	// the log-and-swallow path.
 	remintSurfaces []string
 	remintErr      error
+	// resetCorsPresetsAccounts records the account_ids that
+	// received ResetCorsPresets (issue #975 #4 PR-B /
+	// ADR-129 D4). One entry per NotifyCorsPresetChanged
+	// notification — the trigger at migrations/00428 fires
+	// pg_notify('cors_preset_changed', account_id) on every
+	// cors_presets INSERT / UPDATE / DELETE.
+	resetCorsPresetsAccounts []string
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -208,6 +215,11 @@ func (f *fakeInvalidator) RequestCertForSurface(_ context.Context, surfaceID str
 	err := f.remintErr
 	f.mu.Unlock()
 	return err
+}
+func (f *fakeInvalidator) ResetCorsPresets(accountID string) {
+	f.mu.Lock()
+	f.resetCorsPresetsAccounts = append(f.resetCorsPresetsAccounts, accountID)
+	f.mu.Unlock()
 }
 
 func TestHandleInvalidation(t *testing.T) {
@@ -277,6 +289,40 @@ func TestHandleInvalidation_DeploymentChangedRefreshesWeights(t *testing.T) {
 	}
 	if f.refreshed[0] != "app-7" {
 		t.Errorf("refreshed[0] = %q, want app-7", f.refreshed[0])
+	}
+}
+
+// TestHandleInvalidation_CorsPresetChanged (issue #975 #4 PR-B /
+// ADR-129 D4) — a db.NotifyCorsPresetChanged event must trigger
+// ResetCorsPresets on the invalidator so the per-host edge-rule
+// LRU drops the account's compiled CORS slices and the next
+// request recompiles against the up-to-date preset row. The
+// trigger at migrations/00428 fires on every cors_presets
+// INSERT / UPDATE / DELETE; the payload is the bare account_id
+// verbatim (NEW.account_id::text on INSERT/UPDATE, OLD on
+// DELETE). Empty payload is logged-and-dropped: a future trigger
+// without a payload falls back to no-op rather than crash.
+func TestHandleInvalidation_CorsPresetChanged(t *testing.T) {
+	f := &fakeInvalidator{}
+	log := testLogger()
+
+	// Happy path: valid account_id payload → reset recorded.
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyCorsPresetChanged,
+		Payload: "acc-42",
+	}, log)
+	// Empty payload → no reset, no panic. (The trigger always
+	// emits NEW/OLD.account_id; this is the defensive path for
+	// any future trigger that forgets the payload.)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyCorsPresetChanged, Payload: ""}, log)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.resetCorsPresetsAccounts) != 1 {
+		t.Fatalf("resetCorsPresetsAccounts = %v, want 1 entry (acc-42)", f.resetCorsPresetsAccounts)
+	}
+	if f.resetCorsPresetsAccounts[0] != "acc-42" {
+		t.Errorf("resetCorsPresetsAccounts[0] = %q, want acc-42", f.resetCorsPresetsAccounts[0])
 	}
 }
 
