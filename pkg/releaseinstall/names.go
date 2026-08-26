@@ -17,6 +17,7 @@ var supportBinaryNames = []string{
 	"gregale",
 	"gregalectl",
 	"init",
+	"schedd-brokerq-apply",
 	"vmmd-raw-bridge",
 	"vmmd-stream-bridge",
 }
