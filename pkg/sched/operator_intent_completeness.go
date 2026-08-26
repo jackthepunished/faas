@@ -2,9 +2,9 @@
 // that drives the operator-action observability counters behind
 // GET /v1/admin/obs/health (PR-#TBD / C5).
 //
-// Two queries, both over the local pool:
+// One query, over the local pool:
 //
-//  1. Trace_id completeness ratio per kind (the gauge
+//   - Trace_id completeness ratio per kind (the gauge
 //     operatorActionTraceCompletenessRatio<kind>).
 //     SELECT kind, count(*) FILTER (WHERE trace_id IS NOT
 //     NULL)::float / count(*) FROM events WHERE kind LIKE
@@ -22,15 +22,18 @@
 //     best-effort log path; the query now reads `at` and the
 //     ratio surfaces a real value.
 //
-//  2. Stuck-running operator_intent count per kind (the counter
-//     operatorIntentOutcomeMissingTotal<kind>). Reads
-//     operator_intents WHERE status='running' AND started_at <
-//     now() - interval '5 minutes'; same threshold as the
-//     existing safety tick's reclaim cutoff. The counter
-//     accumulates over time — Prometheus' `rate()` converts the
-//     cumulative count into a per-second stuck-running rate.
+// History: this file used to drive a SECOND counter
+// (operatorIntentOutcomeMissingTotal) that polled
+// operator_intents for rows stuck in `running` past the safety-
+// tick threshold. That counter raced the safety tick's reclaim
+// AND duplicated the Store.OperatorIntentOutcomeMissingCounts
+// surface used by the operator-side obs health endpoint, so the
+// fix-cluster (#1111 review-finding #5) deleted it. Stuck-
+// running observability now flows through the Store method
+// alone — the same path the apid /obs/health handler reads on
+// each request.
 //
-// Both queries are read-only and bypass the engine — schedd is
+// The query is read-only and bypasses the engine — schedd is
 // already the operator_intents writer (CLAUDE.md ownership) so
 // the read is on the same connection as the existing safety
 // tick's writes. The existing safety tick's reclaim runs on a
@@ -119,10 +122,6 @@ func (l *Loop) runOperatorIntentCompletenessTick(ctx context.Context) {
 func (l *Loop) observeOperatorIntentCompleteness(ctx context.Context) (gaugeUpdates int) {
 	if err := l.observeTraceCompletenessRatio(ctx, &gaugeUpdates); err != nil {
 		l.log.Warn("sched: operator_intent_completeness: trace ratio query failed",
-			"err", err)
-	}
-	if err := l.observeStuckRunningOutcomeMissing(ctx); err != nil {
-		l.log.Warn("sched: operator_intent_completeness: stuck-running query failed",
 			"err", err)
 	}
 	return gaugeUpdates
@@ -236,77 +235,6 @@ func (l *Loop) observeTraceCompletenessRatio(ctx context.Context, gaugeUpdates *
 	for k, v := range ratios {
 		l.ops.SetOperatorActionTraceCompleteness(k, v)
 		*gaugeUpdates++
-	}
-	return nil
-}
-
-// observeStuckRunningOutcomeMissing runs the
-// operator_intents-side aggregation and increments the per-
-// kind counter.
-//
-// The query reads only (no FOR UPDATE, no claim); it does NOT
-// race the existing operatorIntentSafetyTick's reclaim. The
-// counter accumulates observations across ticks; rate() over
-// the operator-action SLA window (5 min) surfaces the
-// stuck-running rate per kind. A persistent >0 rate implies
-// the safety tick isn't draining fast enough — separate
-// alert surface from PR #1106's "stuck-running" page.
-//
-// SQLSTATE 42P01 (undefined_table) is treated as a
-// recoverable "table not migrated yet" condition and
-// returns nil — schedd may boot before the 00456 migration
-// has run on a fresh cluster.
-func (l *Loop) observeStuckRunningOutcomeMissing(ctx context.Context) error {
-	rows, err := l.pool.Query(ctx, `
-		SELECT
-		    kind,
-		    count(*) AS stuck
-		FROM operator_intents
-		WHERE status = 'running'
-		  AND started_at < now() - ($1::text || ' seconds')::interval
-		GROUP BY kind
-	`, int64(operatorIntentCompletenessTick.Seconds()*10)) // 5 min default; matches safety-tick threshold
-	if err != nil {
-		// 42P01 = undefined_table. Tolerate: the table
-		// may not exist on a fresh cluster pre-migration.
-		// Returning nil keeps the gauge path healthy so a
-		// transient migration race doesn't crash the tick.
-		const sqlstateUndefinedTable = "42P01"
-		if sqlStateOf(err) == sqlstateUndefinedTable {
-			return nil
-		}
-		return fmt.Errorf("query stuck-running count: %w", err)
-	}
-	defer rows.Close()
-
-	// Closed kind set — see operatorIntentKindClosedSet in
-	// pkg/wire/metrics.go. Mirror here.
-	closedSet := map[string]struct{}{
-		"force_park":      {},
-		"force_cold_boot": {},
-		"force_restart":   {},
-	}
-
-	for rows.Next() {
-		var kind string
-		var stuck int64
-		if err := rows.Scan(&kind, &stuck); err != nil {
-			return fmt.Errorf("scan stuck-running row: %w", err)
-		}
-		if _, ok := closedSet[kind]; !ok {
-			// Unknown kind — skip rather than blow up
-			// cardinality. Future operator.action.<verb>
-			// additions extend the closed set in
-			// pkg/wire/metrics.go, and this map will pick
-			// them up in lock-step.
-			continue
-		}
-		if c := l.ops.OperatorIntentOutcomeMissingTotal(kind); c != nil {
-			c.Add(float64(stuck))
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate stuck-running rows: %w", err)
 	}
 	return nil
 }

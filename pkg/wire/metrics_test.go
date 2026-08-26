@@ -2162,31 +2162,6 @@ func TestOpsMetrics_AuditLogWriteFailuresTotalPreInstantiated(t *testing.T) {
 	}
 }
 
-// TestOpsMetrics_OperatorIntentOutcomeMissingPreInstantiated
-// (PR-#TBD / C5) — the per-kind counter surfaces at boot.
-// Pre-instantiation is load-bearing for the same NaN-vs-zero
-// reason as audit_log_write_total.
-func TestOpsMetrics_OperatorIntentOutcomeMissingPreInstantiated(t *testing.T) {
-	m := wire.NewOpsMetrics("schedd")
-	body := render(t, m)
-	for _, k := range []string{"force_park", "force_cold_boot", "force_restart"} {
-		want := fmt.Sprintf(`schedd_operator_intent_outcome_missing_total{kind=%q} 0`, k)
-		if !strings.Contains(body, want) {
-			t.Errorf("missing pre-instantiated row %q in:\n%s", want, body)
-		}
-	}
-}
-
-// TestOpsMetrics_OperatorIntentOutcomeMissingNilSafe
-// (PR-#TBD / C5) — accessor must be nil-safe so tests /
-// legacy paths without OpsMetrics don't crash.
-func TestOpsMetrics_OperatorIntentOutcomeMissingNilSafe(t *testing.T) {
-	var m *wire.OpsMetrics
-	if got := m.OperatorIntentOutcomeMissingTotal("force_park"); got != nil {
-		t.Errorf("nil receiver returned non-nil counter: %v", got)
-	}
-}
-
 // TestOpsMetrics_SetOperatorActionTraceCompleteness
 // (PR-#TBD / C5) — the per-kind gauge accepts Set values
 // in [0.0, 1.0] and round-trips through /metrics. The gauge

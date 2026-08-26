@@ -1352,7 +1352,7 @@ func withTraceIDSpan(ctx context.Context) context.Context {
 	// trace_ids are silently dropped so the audit emit sees
 	// an invalid span context (no trace_id stamp).
 	trace, err := oteltrace.TraceIDFromHex(corr.TraceID)
-	if err != nil || trace.IsValid() == false {
+	if err != nil || !trace.IsValid() {
 		return ctx
 	}
 	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{

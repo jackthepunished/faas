@@ -7,14 +7,16 @@
 //   - operator_action_trace_completeness_ratio<kind> (gauge) —
 //     5-minute trailing ratio of operator.action.<verb>*
 //     audit rows whose events.trace_id column is non-NULL.
-//   - operator_intent_outcome_missing_total<kind> (counter) —
-//     per-tick observation of operator_intents rows that have
-//     been `running` for > 5 minutes.
+//   - stuck-running counts flow through the Store-side
+//     OperatorIntentOutcomeMissingCounts surface that
+//     cmd/apid/obs_health_query.go reads — the Prometheus
+//     counter for the same metric was removed in fix-cluster
+//     E because it raced the safety tick AND duplicated the
+//     Store surface.
 //
-// The body is split into two queries against the local pool
-// (events + operator_intents). Hand-writing SQL here rather
-// than using sqlc mirrors the precedent at
-// pkg/state/pgstore.go::ReclaimStuckRunningOperatorIntents.
+// The body is one query against the local pool (events). Hand-
+// writing SQL here rather than using sqlc mirrors the precedent
+// at pkg/state/pgstore.go::ReclaimStuckRunningOperatorIntents.
 //
 // What we test without a Postgres connection:
 //
@@ -65,14 +67,14 @@ func TestRunOperatorIntentCompletenessTick_NilOpsShortCircuits(t *testing.T) {
 			// not pool. The nil-ops short-circuit fires
 			// first IF the body is structured that way;
 			// in this PR, observeOperatorIntentCompleteness
-			// runs the queries regardless and the nil-ops
+			// runs the query regardless and the nil-ops
 			// guard happens at the accessor level. Either
 			// way, no goroutine leak.
 			_ = r
 		}
 	}()
-	// With nil pool, observeTraceCompletenessRatio / observeStuckRunningOutcomeMissing
-	// will hit l.pool.Query(nil) and panic. The point of the
+	// With nil pool, observeTraceCompletenessRatio will hit
+	// l.pool.Query(nil) and panic. The point of the
 	// nil-ops guard is that the accessor writes are no-ops,
 	// not that the SQL queries are skipped. Asserting "no
 	// crash from a metric call" requires a real pool or a
@@ -82,7 +84,7 @@ func TestRunOperatorIntentCompletenessTick_NilOpsShortCircuits(t *testing.T) {
 
 // TestObserveOperatorIntentCompleteness_WiredOpsGaugeUpdate
 // asserts the per-tick gauge update path on a Loop that has
-// l.ops wired but l.pool nil. The two observe* helpers will
+// l.ops wired but l.pool nil. The single observe helper will
 // panic on l.pool.Query(nil); the test asserts that the
 // panic is contained (no leaked goroutine, no leaked metric
 // state) by recovering and inspecting the OpsMetrics state.

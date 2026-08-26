@@ -1480,16 +1480,6 @@ type OpsMetrics struct {
 	// {sqlstate_23514, sqlstate_23505, timeout, other}. Same
 	// pre-instantiation grid.
 	auditLogWriteFailuresTotal *prometheus.CounterVec
-	// operatorIntentOutcomeMissingTotal (PR-#TBD / C5):
-	// per-kind counter the schedd 60s tick increments when an
-	// operator_intent row has been `running` for > 5 minutes
-	// without a terminal outcome (the stuck-running condition
-	// the existing ReclaimStuckRunningOperatorIntents safety
-	// tick recovers from). Labels: kind ∈ {force_park,
-	// force_cold_boot, force_restart}. The
-	// /v1/admin/obs/health endpoint surfaces this counter
-	// directly.
-	operatorIntentOutcomeMissingTotal *prometheus.CounterVec
 	// operatorActionTraceCompletenessRatio (PR-#TBD / C5):
 	// per-kind gauge the schedd 60s tick sets to the 5-minute
 	// ratio of operator.action.<verb>* audit rows whose
@@ -3157,10 +3147,6 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_audit_log_write_failures_total",
 		Help: "Count of events-table appends that failed, labelled by endpoint, kind, and error_class ∈ {sqlstate_23514, sqlstate_23505, timeout, other}. The audit emit path surfaces SQLSTATE 23514 (check_violation — the regex on events.trace_id at 00456) and 23505 (unique_violation) as labelled buckets; everything else collapses to 'other'. /v1/admin/obs/health reports the failure rate vs audit_log_write_total — a sustained non-zero failure rate implies the events table is degraded.",
 	}, []string{"endpoint", "kind", "error_class"})
-	operatorIntentOutcomeMissingTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: prefix + "_operator_intent_outcome_missing_total",
-		Help: "Count of operator_intents rows observed in `running` for > 5 minutes without a terminal outcome (the stuck-running condition the 30s ReclaimStuckRunningOperatorIntents safety tick recovers from). Labelled by kind ∈ {force_park, force_cold_boot, force_restart}. Single-registry: registered on every daemon; only schedd increments via OperatorIntentOutcomeMissing. /v1/admin/obs/health surfaces this counter directly.",
-	}, []string{"kind"})
 	operatorActionTraceCompletenessRatio := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "_operator_action_trace_completeness_ratio",
 		Help: "5-minute trailing ratio (0.0..1.0) of operator.action.<verb>* audit rows whose events.trace_id column is non-NULL. Labelled by kind ∈ {force_park, force_cold_boot, force_restart, force_park.outcome, force_cold_boot.outcome, force_restart.outcome}. Single-registry: registered on every daemon; only schedd sets the value via SetOperatorActionTraceCompleteness (60s tick). A drop below 0.95 is the obs-coverage alert tripwire — every force-action should carry a trace_id end-to-end (PR-#TBD C1-C4 contract).",
@@ -3173,14 +3159,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			}
 		}
 	}
+	// Pre-instantiate the operator-action gauge for the request-side
+	// instance-oriented aliases (park_instance / restart_instance)
+	// in addition to the verb-oriented forms. No
+	// operatorIntentOutcomeMissingTotal counter is registered here
+	// anymore — the Stuck-running counter was removed in the
+	// PR-#TBD / fix-cluster E (the counter raced the safety tick
+	// AND duplicated the Store.OperatorIntentOutcomeMissingCounts
+	// surface used by the operator /obs/health endpoint; that
+	// Store method is now the single source of truth).
 	for _, kind := range operatorIntentKindClosedSet {
-		operatorIntentOutcomeMissingTotal.WithLabelValues(kind)
 		operatorActionTraceCompletenessRatio.WithLabelValues(kind)
 	}
 	commonCollectors = append(commonCollectors,
 		auditLogWriteTotal,
 		auditLogWriteFailuresTotal,
-		operatorIntentOutcomeMissingTotal,
 		operatorActionTraceCompletenessRatio,
 	)
 	reg.MustRegister(commonCollectors...)
@@ -3676,7 +3669,6 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		esmLagSeconds:                        esmLagSeconds,
 		auditLogWriteTotal:                   auditLogWriteTotal,
 		auditLogWriteFailuresTotal:           auditLogWriteFailuresTotal,
-		operatorIntentOutcomeMissingTotal:    operatorIntentOutcomeMissingTotal,
 		operatorActionTraceCompletenessRatio: operatorActionTraceCompletenessRatio,
 	}
 }
@@ -4520,19 +4512,6 @@ func (m *OpsMetrics) AuditLogWriteFailuresTotal(endpoint, kind, errorClass strin
 		return nil
 	}
 	return m.auditLogWriteFailuresTotal.WithLabelValues(endpoint, kind, errorClass)
-}
-
-// OperatorIntentOutcomeMissingTotal returns the per-kind counter
-// for stuck-running operator_intents rows (PR-#TBD / C5). kind
-// ∈ {force_park, force_cold_boot, force_restart}. Incremented by
-// schedd's 60s completeness tick when an operator_intent row has
-// been `running` for > 5 minutes without a terminal outcome.
-// nil-safe.
-func (m *OpsMetrics) OperatorIntentOutcomeMissingTotal(kind string) prometheus.Counter {
-	if m == nil {
-		return nil
-	}
-	return m.operatorIntentOutcomeMissingTotal.WithLabelValues(kind)
 }
 
 // SetOperatorActionTraceCompleteness sets the per-kind gauge to
