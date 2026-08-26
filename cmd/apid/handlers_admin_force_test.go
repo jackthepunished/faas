@@ -82,6 +82,11 @@ type intentInsertCall struct {
 	Account *string
 	Actor   string
 	Reason  string
+	// TraceID is the OTel W3C trace_id passed by the handler.
+	// Captured so PR-#TBD / fix-cluster B's middleware.TraceIDFrom
+	// wiring can be pinned end-to-end (header → ctx → InsertOperatorIntent
+	// → operator_intents.trace_id column).
+	TraceID *string
 }
 
 // fakeStoreForIntent wraps the MemStore so the test can observe
@@ -129,6 +134,7 @@ func (f *fakeStoreForIntent) InsertOperatorIntent(
 		Account: accountID,
 		Actor:   actorID,
 		Reason:  reason,
+		TraceID: traceID,
 	})
 	if f.insertErr != nil {
 		return "", f.insertErr
