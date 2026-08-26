@@ -45,6 +45,7 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
 		Name:               "fsn-2",
 		TargetURL:          "tcp://vmmd-2.faas:50051",
+		ScheddTargetURL:    stringPtr("tcp://fsn-2.gregale.dev:9090"),
 		GatewayTargetURL:   stringPtr("tcp://fsn-2.gregale.dev:8080"),
 		VPCPUs:             160,
 		MemMB:              56000,
@@ -84,6 +85,9 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 	}
 	if vmmd.GatewayTargetURL == nil || *vmmd.GatewayTargetURL != "tcp://fsn-2.gregale.dev:8080" {
 		t.Fatalf("vmmd upsert lost operator gateway_target_url: got %v", vmmd.GatewayTargetURL)
+	}
+	if vmmd.ScheddTargetURL == nil || *vmmd.ScheddTargetURL != "tcp://fsn-2.gregale.dev:9090" {
+		t.Fatalf("vmmd upsert lost operator schedd_target_url: got %v", vmmd.ScheddTargetURL)
 	}
 
 	// Step 4: id preserved (same row).
