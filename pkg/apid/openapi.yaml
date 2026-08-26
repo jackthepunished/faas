@@ -5987,7 +5987,7 @@ paths:
         plan_cors_preset_not_allowed on the Free-tier cap-0 →
         422 cors_preset_invalid on the body shape → 404
         cors_preset_app_not_found on a cross-tenant app_id →
-        402 plan_cors_preset_quota_reached on the per-account
+        403 plan_cors_preset_quota_reached on the per-account
         / per-app cap → 409 cors_preset_name_conflict on a
         duplicate (account_id, COALESCE(app_id, '00..00'),
         name) tuple.
@@ -6006,6 +6006,8 @@ paths:
               schema: { $ref: '#/components/schemas/CorsPresetResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '403': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/CorsPresetInvalid' }
         '422': { $ref: '#/components/responses/CorsPresetInvalid' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -6587,7 +6589,7 @@ paths:
       summary: Delete an edge rule.
       responses:
         '204':
-          description: Deleted.
+          description: The cors preset was deleted. Referencing edge_rules.cors_preset_id was atomically cleared via ON DELETE SET NULL; the gateway compile path fails closed until the customer wires a new preset or inlines fallback values.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }

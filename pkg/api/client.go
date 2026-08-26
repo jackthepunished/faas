@@ -3685,7 +3685,7 @@ func (c *Client) GetAppsSlugMirrorsIdSummary(ctx context.Context, slug, id, wind
 // merge happens at compile time (state.MergeCorsPresetIntoRule).
 //
 // Plan gates: Free → 402 plan_cors_preset_not_allowed (the cap
-// is 0); Hobby/Pro/Scale → 402 plan_cors_preset_quota_reached
+// is 0); Hobby/Pro/Scale → 403 plan_cors_preset_quota_reached
 // at the per-account / per-app quota. The wire-level codes are
 // surfaced verbatim on *api.Problem; the SDK does not retry.
 

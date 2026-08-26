@@ -66,7 +66,7 @@ export class CorsPresetsService {
    * plan_cors_preset_not_allowed on the Free-tier cap-0 →
    * 422 cors_preset_invalid on the body shape → 404
    * cors_preset_app_not_found on a cross-tenant app_id →
-   * 402 plan_cors_preset_quota_reached on the per-account
+   * 403 plan_cors_preset_quota_reached on the per-account
    * / per-app cap → 409 cors_preset_name_conflict on a
    * duplicate (account_id, COALESCE(app_id, '00..00'),
    * name) tuple.
@@ -104,6 +104,15 @@ export class CorsPresetsService {
         wire-level codes are 422 for grammar violations and 402
         for plan gates.
         `,
+        403: `code: cors_preset_invalid | cors_wildcard_with_credentials |
+        cors_preset_update_requires_field | cors_preset_name_conflict |
+        plan_cors_preset_not_allowed | plan_cors_preset_quota_reached
+        (issue #975 #4 PR-B / ADR-129). The body validates the
+        same shape as the storage-side CHECK constraints; the
+        wire-level codes are 422 for grammar violations and 402
+        for plan gates.
+        `,
+        404: `code: not_found`,
         409: `code: cors_preset_invalid | cors_wildcard_with_credentials |
         cors_preset_update_requires_field | cors_preset_name_conflict |
         plan_cors_preset_not_allowed | plan_cors_preset_quota_reached

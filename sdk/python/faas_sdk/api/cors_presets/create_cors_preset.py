@@ -51,6 +51,16 @@ def _parse_response(
 
         return response_402
 
+    if response.status_code == 403:
+        response_403 = Problem.from_dict(response.json())
+
+        return response_403
+
+    if response.status_code == 404:
+        response_404 = Problem.from_dict(response.json())
+
+        return response_404
+
     if response.status_code == 409:
         response_409 = Problem.from_dict(response.json())
 
@@ -105,7 +115,7 @@ def sync_detailed(
     plan_cors_preset_not_allowed on the Free-tier cap-0 →
     422 cors_preset_invalid on the body shape → 404
     cors_preset_app_not_found on a cross-tenant app_id →
-    402 plan_cors_preset_quota_reached on the per-account
+    403 plan_cors_preset_quota_reached on the per-account
     / per-app cap → 409 cors_preset_name_conflict on a
     duplicate (account_id, COALESCE(app_id, '00..00'),
     name) tuple.
@@ -163,7 +173,7 @@ def sync(
     plan_cors_preset_not_allowed on the Free-tier cap-0 →
     422 cors_preset_invalid on the body shape → 404
     cors_preset_app_not_found on a cross-tenant app_id →
-    402 plan_cors_preset_quota_reached on the per-account
+    403 plan_cors_preset_quota_reached on the per-account
     / per-app cap → 409 cors_preset_name_conflict on a
     duplicate (account_id, COALESCE(app_id, '00..00'),
     name) tuple.
@@ -216,7 +226,7 @@ async def asyncio_detailed(
     plan_cors_preset_not_allowed on the Free-tier cap-0 →
     422 cors_preset_invalid on the body shape → 404
     cors_preset_app_not_found on a cross-tenant app_id →
-    402 plan_cors_preset_quota_reached on the per-account
+    403 plan_cors_preset_quota_reached on the per-account
     / per-app cap → 409 cors_preset_name_conflict on a
     duplicate (account_id, COALESCE(app_id, '00..00'),
     name) tuple.
@@ -272,7 +282,7 @@ async def asyncio(
     plan_cors_preset_not_allowed on the Free-tier cap-0 →
     422 cors_preset_invalid on the body shape → 404
     cors_preset_app_not_found on a cross-tenant app_id →
-    402 plan_cors_preset_quota_reached on the per-account
+    403 plan_cors_preset_quota_reached on the per-account
     / per-app cap → 409 cors_preset_name_conflict on a
     duplicate (account_id, COALESCE(app_id, '00..00'),
     name) tuple.
