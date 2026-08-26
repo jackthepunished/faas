@@ -1064,9 +1064,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      - name: migrations check (static)
-        run: make migrations-check
-
       # PR-P4 — assert deploy/scripts/verify-secrets.sh is shaped
       # correctly (executable, bash-parseable, presence of the
       # Paddle + Stripe blocks added by Streams A + B). The
@@ -1101,11 +1098,20 @@ jobs:
         run: BATS_TEST=1 ./scripts/ci/check_migration_slots.sh
       - name: migration slot collision (vs other open PRs)
         if: github.event_name == 'pull_request'
+        id: migration_slots
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.base_ref }}
         run: ./scripts/ci/check_migration_slots.sh
+      # A PR may append after a contiguous migration range owned by a sibling
+      # PR. The cross-PR gate above has verified those slots are claimed and
+      # non-overlapping; pass that verified list to the local contiguity test.
+      # Push/main runs leave this output empty and remain strictly 1..N.
+      - name: migrations check (static)
+        env:
+          FAAS_MIGRATION_ALLOWED_GAPS: ${{ steps.migration_slots.outputs.external_slots }}
+        run: make migrations-check
       # No `-tags no_pg` here on purpose: apply_walk_test.go carries
       # `//go:build !no_pg`, so the static-only `make migrations-check`
       # step skips it and this step picks it up. The `-run` filter

@@ -17,6 +17,7 @@ package migrations
 import (
 	"bufio"
 	"io/fs"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -135,13 +136,38 @@ func TestMigrationsContiguous(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no embedded migrations; embed.go is empty?")
 	}
-	for i, f := range files {
-		want := int64(i + 1)
+	allowedGaps := externallyClaimedMigrationGaps()
+	want := int64(1)
+	for position, f := range files {
+		for want < f.Version && allowedGaps[want] {
+			want++
+		}
 		if f.Version != want {
-			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, i+1)
+			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, position+1)
 			return // report first gap, not all
 		}
+		want++
 	}
+}
+
+// externallyClaimedMigrationGaps is populated only by the PR migration gate
+// after it has verified that a sibling open PR owns the missing slots. Main
+// and release checks leave the variable empty and therefore retain the strict
+// contiguous 1..N invariant. The value is a comma-separated list of decimal
+// migration versions, for example "00456,00457".
+func externallyClaimedMigrationGaps() map[int64]bool {
+	allowed := make(map[int64]bool)
+	for _, raw := range strings.Split(os.Getenv("FAAS_MIGRATION_ALLOWED_GAPS"), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		version, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil && version > 0 {
+			allowed[version] = true
+		}
+	}
+	return allowed
 }
 
 // TestMigrationsUniquePrefixes asserts no two REAL migration files share
