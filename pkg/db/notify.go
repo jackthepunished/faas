@@ -436,6 +436,12 @@ const (
 	//   closed by this channel: apid never imports
 	//   pkg/scheddgrpc.
 	NotifyOperatorIntent = "operator_intent"
+	// NotifyRuntimeConfigChanged is emitted by migration 00456 after a
+	// durable operator configuration write. Daemons reconcile the row from
+	// Postgres instead of trusting the payload so missed notifications are
+	// repaired on the next boot/reconnect.
+	NotifyRuntimeConfigChanged          = "runtime_config_changed"
+	NotifyRuntimeConfigOperationChanged = "runtime_config_operation_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

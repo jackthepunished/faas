@@ -42,6 +42,22 @@ slots_from_paths() {
 		|| true
 }
 
+# all_slots_from_paths includes reservations. It is used to tell the local
+# contiguity test which gaps are already claimed by sibling PRs; reservations
+# are not executable schema claims, but they still explain a planned gap.
+all_slots_from_paths() {
+	grep -oE '^migrations/[0-9]{5}_[^/]*\.sql$' \
+		| sed -E 's|migrations/([0-9]{5})_.*|\1|' \
+		| sort -u \
+		|| true
+}
+
+emit_external_slots() {
+	if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+		printf 'external_slots=%s\n' "${1:-}" >>"${GITHUB_OUTPUT}"
+	fi
+}
+
 # Inverse of slots_from_paths: emit ONLY the reservation slots. Used to log
 # the carved-out slots for reviewer visibility (so a maintainer reading CI
 # output knows what was skipped, not just what collided). Lives in its own
@@ -85,6 +101,12 @@ if [[ "${BATS_TEST:-0}" == "1" ]]; then
 		echo "SELF-TEST FAIL: reserved_from_paths got [${got_reserved}], want [${want_reserved}]" >&2
 		exit 1
 	fi
+	got_all="$(printf '%s\n' "${fixtures[@]}" | all_slots_from_paths | sort | tr '\n' ',' | sed 's/,$//')"
+	want_all="00054,00055,00056,00057"
+	if [[ "${got_all}" != "${want_all}" ]]; then
+		echo "SELF-TEST FAIL: all_slots_from_paths got [${got_all}], want [${want_all}]" >&2
+		exit 1
+	fi
 	echo "SELF-TEST PASS: slots_from_paths and reserved_from_paths filter reservations correctly"
 	exit 0
 fi
@@ -102,6 +124,7 @@ mine_raw="$(git diff --name-only --diff-filter=A "${base}" HEAD -- 'migrations/*
 mine="$(printf '%s\n' "${mine_raw}" | slots_from_paths)"
 
 if [[ -z "${mine}" ]]; then
+	emit_external_slots ""
 	echo "no new migration slots in this PR; nothing to check"
 	exit 0
 fi
@@ -114,11 +137,13 @@ fi
 
 if ! open_prs="$(gh pr list --repo "${REPO}" --state open --limit 100 \
 	--json number --jq '.[].number' 2>/dev/null)"; then
+	emit_external_slots ""
 	echo "::warning::could not list open PRs (restricted token or rate limit); skipping cross-PR slot check"
 	exit 0
 fi
 
 conflict=0
+sibling_slots=""
 for pr in ${open_prs}; do
 	[[ "${pr}" == "${PR_NUMBER}" ]] && continue
 
@@ -129,6 +154,10 @@ for pr in ${open_prs}; do
 	fi
 
 	theirs="$(printf '%s\n' "${files}" | slots_from_paths || true)"
+	theirs_all="$(printf '%s\n' "${files}" | all_slots_from_paths || true)"
+	if [[ -n "${theirs_all}" ]]; then
+		sibling_slots+="${theirs_all}"$'\n'
+	fi
 	[[ -z "${theirs}" ]] && continue
 
 	# comm needs sorted input; both sides are sorted -u already.
@@ -142,6 +171,9 @@ for pr in ${open_prs}; do
 		conflict=1
 	fi
 done
+
+external_slots="$(printf '%s' "${sibling_slots}" | sort -u | paste -sd, -)"
+emit_external_slots "${external_slots}"
 
 if (( conflict )); then
 	exit 1

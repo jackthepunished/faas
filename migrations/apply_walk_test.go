@@ -14,6 +14,9 @@ package migrations_test
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,10 +30,10 @@ import (
 //
 // Three assertions:
 //
-//  1. row_count == max(version_id) for applied rows — a gap in the
-//     version sequence would mean a row was inserted out of order, which
-//     goose's bookkeeping should never produce. (Sanity check on the
-//     version table itself.)
+//  1. the applied rows cover every version up to max(version_id), except
+//     for explicitly verified sibling-PR gaps on a pull-request build.
+//     Those gaps are real files that another open PR owns and are passed
+//     through FAAS_MIGRATION_ALLOWED_GAPS by the migration-slot gate.
 //  2. max(version_id) == highest embedded migration prefix — the binary's
 //     embedded set must agree with what goose recorded. Catches
 //     findMissingMigrations-style failures that embed_test.go misses (e.g.,
@@ -54,9 +57,9 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 
 	// Walk goose_db_version. Goose creates a sentinel row (version_id=0,
 	// is_applied=true) on first table creation, then one row per applied
-	// migration — so for N migrations applied the table holds N+1 rows
-	// and MAX(version_id) == N. A gap in the version sequence manifests
-	// as MAX(version_id) < (nRows - 1), not as a row-count mismatch.
+	// migration. On a normal main/release build the table therefore holds
+	// max(version_id)+1 rows. A PR build may temporarily omit slots owned by
+	// a verified sibling PR; those slots are the only permitted holes here.
 	//
 	// The WHERE is_applied filter is deliberate: goose keeps a row with
 	// is_applied=false for the migration it's currently working on (the
@@ -69,10 +72,6 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 	).Scan(&nRows, &maxVer); err != nil {
 		t.Fatalf("query goose_db_version: %v", err)
 	}
-	if nRows != maxVer+1 {
-		t.Errorf("goose_db_version row count %d != max(version_id) %d + 1: hole in the applied version sequence (the +1 is the version=0 sentinel goose inserts at table creation)", nRows, maxVer)
-	}
-
 	// Pull the parsed embedded set from the shared helper. Reusing
 	// migrations.LoadMigrations keeps filename-parsing rules identical
 	// between the static and apply-and-walk tests — if the convention
@@ -82,6 +81,27 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no embedded migrations; embed.go is empty?")
 	}
+	embedded := make(map[int64]bool, len(files))
+	for _, f := range files {
+		embedded[f.Version] = true
+	}
+	allowedGaps := externallyClaimedMigrationGaps()
+	var permittedMissing int64
+	for version := int64(1); version <= maxVer; version++ {
+		if embedded[version] {
+			continue
+		}
+		if !allowedGaps[version] {
+			t.Errorf("goose_db_version is missing migration version %d, which is not a verified sibling-PR gap", version)
+			continue
+		}
+		permittedMissing++
+	}
+	expectedRows := maxVer + 1 - permittedMissing
+	if nRows != expectedRows {
+		t.Errorf("goose_db_version row count %d != expected %d after accounting for %d verified sibling-PR gap(s) (max version %d plus the version=0 sentinel)", nRows, expectedRows, permittedMissing, maxVer)
+	}
+
 	highest := files[len(files)-1].Version
 	highestName := files[len(files)-1].Name
 
@@ -108,6 +128,25 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 	// version-table row counts before; this assertion pins the
 	// post-rename schema shape.
 	assertColumnRenamed(t, pool, "accounts", "provider_customer_id")
+}
+
+// externallyClaimedMigrationGaps mirrors the static migration-contiguity
+// test. The environment is populated only after the PR slot gate has
+// verified that an open sibling PR owns the missing versions. Main and
+// release jobs leave it empty, preserving strict migration checking.
+func externallyClaimedMigrationGaps() map[int64]bool {
+	allowed := make(map[int64]bool)
+	for _, raw := range strings.Split(os.Getenv("FAAS_MIGRATION_ALLOWED_GAPS"), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		version, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil && version > 0 {
+			allowed[version] = true
+		}
+	}
+	return allowed
 }
 
 // assertColumnRenamed fails the test if `table` does not have

@@ -307,7 +307,7 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 	// asserts the row exists immediately after the env PUT).
 	// The classifier is cheap (one env row + one dedupe-merge
 	// INSERT) so the latency hit is sub-ms.
-	if s.dataPlacementEnabled {
+	if s.runtimeBool(runtimeConfigDataPlacement, s.dataPlacementEnabled) {
 		if err := s.runEnvClassifier(r.Context(), acct, app, scope, key, req.Value); err != nil {
 			// The env row is already persisted — a classifier
 			// failure (e.g. secretbox salt missing) is a
