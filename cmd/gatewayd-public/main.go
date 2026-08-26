@@ -65,6 +65,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -458,7 +459,7 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           publicHandler,
+		Handler:           trace.HTTPHandler("gatewayd-public", publicHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
@@ -467,7 +468,7 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 	}
 	controlSrv := &http.Server{
 		Addr:              controlAddr,
-		Handler:           controlMux,
+		Handler:           trace.HTTPHandler("gatewayd-public-control", controlMux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second,
 		WriteTimeout:      time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second,

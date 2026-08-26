@@ -41,7 +41,17 @@ func TestMain(m *testing.M) {
 	setComputeNodesStoreOpener(func() (state.Store, func(), error) {
 		return state.NewMemStore(), func() {}, nil
 	})
-	os.Exit(m.Run())
+	previousNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	_ = os.Unsetenv("NO_COLOR")
+	noColorCached.Store(false)
+	noColorVal = false
+	code := m.Run()
+	if hadNoColor {
+		_ = os.Setenv("NO_COLOR", previousNoColor)
+	} else {
+		_ = os.Unsetenv("NO_COLOR")
+	}
+	os.Exit(code)
 }
 
 // resetMemStore re-wires the seam so successive calls inside the
@@ -243,6 +253,31 @@ func TestCmdComputeNodesAdd_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "compute_node_changed pg_notify fired") {
 		t.Errorf("stderr missing pg_notify hint: %q", stderr)
+	}
+}
+
+func TestCmdComputeNodesAdd_DeferActivationLeavesRowDrained(t *testing.T) {
+	resetMemStore(t)
+	if code := cmdComputeNodesAdd([]string{
+		"--name=fsn-3",
+		"--target-url=tcp://vmmd-3.faas:50051",
+		"--vpcpus=4", "--mem-mb=16384",
+		"--max-concurrency=200", "--admission-ceiling-mb=13926",
+		"--defer-activation",
+	}); code != 0 {
+		t.Fatalf("cmdComputeNodesAdd(--defer-activation) = %d, want 0", code)
+	}
+	st, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+	row, err := st.ComputeNodeByName(context.Background(), "fsn-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Active {
+		t.Fatal("deferred row is active; want drained")
 	}
 }
 
@@ -835,6 +870,40 @@ func TestCmdComputeNodesActivate_MissingNode(t *testing.T) {
 	})
 	if !strings.Contains(stderr, "--node required") {
 		t.Errorf("activate(nil) stderr missing --node required (got %q)", stderr)
+	}
+}
+
+// TestCmdComputeNodesActivate_ResolvesName verifies the production wire
+// contract: the CLI accepts compute_nodes.name, while the state mutation is
+// keyed by the row UUID returned by ComputeNodeByName.
+func TestCmdComputeNodesActivate_ResolvesName(t *testing.T) {
+	st := state.NewMemStore()
+	setComputeNodesStoreOpener(func() (state.Store, func(), error) {
+		return st, func() {}, nil
+	})
+
+	row, err := st.CreateComputeNode(context.Background(), state.ComputeNode{
+		Name:               "fsn-2.faas",
+		TargetURL:          "tcp://fsn-2.gregale.dev:50051",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		Active:             false,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	if code := cmdComputeNodesActivate([]string{"--node", row.Name}); code != 0 {
+		t.Fatalf("activate exit code = %d, want 0", code)
+	}
+	got, err := st.ComputeNodeByID(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if !got.Active {
+		t.Fatal("activate left the node drained")
 	}
 }
 

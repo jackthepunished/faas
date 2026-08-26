@@ -190,8 +190,8 @@ func TestWarnIfPkiCNMismatch_Mismatch(t *testing.T) {
 	}
 	// The fix line should hint at the operator's next step.
 	fix, ok := r["fix"].(string)
-	if !ok || !strings.Contains(fix, "gregale pki init") {
-		t.Errorf("fix = %v, want substring %q", r["fix"], "gregale pki init")
+	if !ok || !strings.Contains(fix, "gregalectl pki init") {
+		t.Errorf("fix = %v, want substring %q", r["fix"], "gregalectl pki init")
 	}
 }
 

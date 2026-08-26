@@ -344,6 +344,15 @@ func Verify(root string, m Manifest) error {
 	for name := range m.AssetHashes {
 		catalog[name] = struct{}{}
 	}
+	// Older signed releases may have left guest-init in the release
+	// directory before it was added to tool_hashes. Preserve only this
+	// explicitly catalogued compatibility file; arbitrary leftovers remain
+	// rejected below.
+	for _, name := range LegacyUnhashedSupportBinaryNames() {
+		if _, err := os.Stat(filepath.Join(bin, name)); err == nil {
+			catalog[name] = struct{}{}
+		}
+	}
 	walkRoot := bin
 	if info, err := os.Lstat(bin); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		walkRoot, err = filepath.EvalSymlinks(bin)

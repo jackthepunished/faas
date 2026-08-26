@@ -1524,8 +1524,215 @@ paths:
                 error_rate_pct: 0.7
                 cold_start_pct: 8.5
                 wake_p95_ms: 380.2
+                wakes_24h: 47
+                cache_hit_rate_pct: 0.0
+                error_budget_pct: 0.0
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app metrics surface. Free
+            plan — Hobby or above required. The gate runs BEFORE
+            `loadApp` so a Free customer probing a slug never gets a
+            404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_per_app_metrics_not_allowed"
+                title: "Per-app metrics unavailable on this plan"
+                status: 402
+                code: "plan_per_app_metrics_not_allowed"
+                detail: "the free plan does not include per-app metrics; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#per-app-metrics"
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/wake-timeline:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppWakeTimeline
+      summary: Per-app wake timeline (JSON mirror of the dashboard page).
+      description: |
+        Wire-friendly mirror of the dashboard's per-app wake-timeline
+        HTML page (`/dashboard/apps/{slug}/wake-timeline`,
+        cmd/apid/handlers_dashboard.go:2548 renderAppWakeTimeline).
+        The HTML page keeps its pre-rendered HTML chips; this endpoint
+        emits the same data as JSON so a separate frontend agent can
+        render without re-parsing HTML.
+
+        Returns the 50 most-recent instance rows for the app, joined
+        against the events table's `wake.boot_started` rows for the
+        per-row telemetry (Trigger, QueuedCount, ConcurrencyAtAdmit,
+        AtCapacity, ReadyInMS). The aggregation math is shared with
+        the HTML page:
+
+          - 24h cutoff descending-break: the moment a row's
+            `started_at` falls before the trailing-24h instant, the
+            loop breaks (no further iteration). Pre-ADR-123 fleet
+            rows with no `started_at` are not eligible for the break
+            (always in scope).
+          - Two-denominator rule for `at_capacity_pct`: numerator is
+            the count of rows where the events join succeeded AND
+            the at_capacity flag is true; denominator is the count
+            of rows where the events join succeeded
+            (`wake_count_with_meta`). Pre-PR-A fleet rows contribute
+            to `wake_count_24h` but not the denominator — same
+            posture as the HTML page.
+
+        Plan-gated Hobby+ (mirror of /v1/apps/{slug}/metrics —
+        same `code` so a downgrade between the two endpoints flips
+        both at once).
+      responses:
+        '200':
+          description: The wake-timeline snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppWakeTimelineResponse'
+              example:
+                app:
+                  app_id: "0123456789abcdef0123456789abcdef"
+                  slug: "my-api"
+                wake_count_24h: 24
+                wake_count_with_meta: 20
+                at_capacity_count: 3
+                at_capacity_pct: 15.0
+                trigger_histogram:
+                  "manual.cron": 8
+                  "manual.api": 7
+                  "scheduled.idle": 5
+                rows:
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T13:00:00Z"
+                    trigger: "manual.api"
+                    queued_count: 0
+                    concurrency_at_admit: 2
+                    at_capacity: false
+                    at_capacity_present: true
+                    ready_in_ms: 342
+                  - kind: "wake.boot_started"
+                    state: "RUNNING"
+                    at: "2026-07-28T12:58:11Z"
+                    at_capacity: false
+                    at_capacity_present: false
+                    ready_in_ms: -1
+                as_of: "2026-07-28T13:00:00.123456Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app wake-timeline. Free plan —
+            Hobby or above required. Same code as /v1/apps/{slug}/metrics
+            (plan_per_app_metrics_not_allowed) so a single downgrade
+            flips both endpoints at once.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_per_app_metrics_not_allowed"
+                title: "Per-app metrics unavailable on this plan"
+                status: 402
+                code: "plan_per_app_metrics_not_allowed"
+                detail: "the free plan does not include per-app metrics; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#per-app-metrics"
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/usage:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppUsage
+      summary: Per-app billing usage summary (trailing 30d by default).
+      description: |
+        Customer-facing billing rollup for one app over a caller-
+        supplied window (default: trailing 30d, clamped at 90d upper
+        bound). Plan-gated Hobby+ — Free gets 402
+        `plan_app_usage_summary_not_allowed`.
+
+        Window resolution: `since` and `until` are RFC3339 timestamps.
+        Both default to UTC midnight snaps; `until` defaults to
+        `now()` snapped down, `since` defaults to `until - 30d`. The
+        handler clamps `since` to `until - 90d` so a customer cannot
+        unbounded-scan `usage_minutes` (ADR-048 retention is 30d; the
+        90d ceiling is a forward-compatibility ceiling for when
+        `usage_daily` lands).
+
+        Overage computation: `overage_gb_hours = max(0, gb_hours -
+        plan_included_gb_hours)`. The included band is echoed from
+        `acct.Plan.PlanIncludedGBHours()`; the overage figure is the
+        integer-rounded float the Stripe pusher bills at €0.01/GB-h.
+
+        Source: `usage_minutes` today (after the 30d retention cap).
+        `usage_daily` / `mixed` land with the trail-period reader
+        follow-up — same wire shape, no migration needed.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "RFC3339 lower bound. Default: `until - 30d`."
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "RFC3339 upper bound. Default: `now()` snapped to UTC midnight."
+      responses:
+        '200':
+          description: The usage summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppUsageSummaryResponse'
+              example:
+                slug: "my-api"
+                period_start: "2026-07-28T00:00:00Z"
+                period_end: "2026-08-27T00:00:00Z"
+                mb_seconds: 4194304000
+                gb_hours: 1.135417
+                requests: 8421
+                tx_bytes: 94371840
+                builder_seconds: 192.5
+                cold_boot_count: 14
+                plan_included_gb_hours: 50.0
+                overage_gb_hours: 0.0
+                source: "usage_minutes"
+                as_of: "2026-08-27T13:00:00.123456Z"
+        '400':
+          description: |
+            Invalid window — `since`/`until` not RFC3339, or `since`
+            later than `until`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app usage summary. Free
+            plan — Hobby or above required. Same posture as the
+            other per-app observability surfaces; the gate runs
+            BEFORE `loadApp` so a Free customer probing a slug
+            never gets a 404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_app_usage_summary_not_allowed"
+                title: "Per-app usage summary unavailable on this plan"
+                status: 402
+                code: "plan_app_usage_summary_not_allowed"
+                detail: "the free plan does not include the per-app usage summary; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#usage-summary"
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -1744,6 +1951,23 @@ paths:
                 $ref: '#/components/schemas/AppErrorsSummaryResponse'
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            Plan does not unlock the per-app error surfacing. Free
+            plan — Hobby or above required. The gate runs BEFORE
+            `loadApp` so a Free customer probing a slug never gets
+            a 404 (slug-leak guard).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: "https://docs.gregale.dev/errors/plan_app_errors_not_allowed"
+                title: "Per-app errors unavailable on this plan"
+                status: 402
+                code: "plan_app_errors_not_allowed"
+                detail: "the free plan does not include per-app errors; upgrade to Hobby or above."
+                docs_url: "https://docs.gregale.dev/plans#app-errors"
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -7785,6 +8009,348 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  # ─── Operator recovery primitives (P2 of the operator-side
+  # observability mega-PR, Commit 5b) ───────────────────────
+  # Two admin-only POST endpoints that proxy to schedd's gRPC
+  # RPCs. The audit row is emitted under `operator.action.
+  # {park_instance, force_cold_boot}`. Both require
+  # ?confirm=true as a tripwire (matches the force-drain --yes
+  # ack pattern at gregalectl force-drain).
+  /v1/admin/instances/{id}/force-park:
+    post:
+      tags: [admin]
+      operationId: postForceParkInstance
+      summary: Enqueue a force-park intent for a wedged live instance (admin-only).
+      description: |
+        Operator-side recovery primitive for instances wedged in
+        {RUNNING, WAKING, COLD_BOOTING} that the customer can't
+        wait for the idle reaper to handle. PR #1099 P2 redesign:
+        apid writes a row to `operator_intents` (PR #1099 P2.1)
+        and emits `pg_notify('operator_intent', …)`; schedd
+        (the ONLY writer to `instances` per CLAUDE.md §6.2) is
+        the sole consumer and dispatches via
+        `engine.ParkWithReason` so the `pkg/state/machine.go`
+        `CanTransition` guard fires. The handler returns 202
+        Accepted with an intent_id; the operator polls
+        GET /v1/admin/operator-intents/{id} for terminal state.
+
+        `?confirm=true` is required as a tripwire against
+        operator fat-fingering. Optional `?reason=<slug>` defaults
+        to `operator_force_park`; values are clamped to the
+        `[a-z0-9_]{1,64}` shape.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+          description: Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-park against operator fat-fingering.
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_park`. Clamped to `[a-z0-9_]{1,64}`.
+      responses:
+        '202':
+          description: Intent row written + pg_notify emitted. Poll `status_url` for terminal state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorIntentAcceptedResponse' }
+        '400':
+          description: 'Force-park validation: `?confirm=true` is missing or `?reason=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Force-park 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: instance_not_found — no instance row with the supplied id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: 'code: instance_not_parkable — instance state is not in {RUNNING, WAKING, COLD_BOOTING}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/admin/apps/{slug}/force-cold-boot:
+    post:
+      tags: [admin]
+      operationId: postForceColdBootApp
+      summary: Enqueue a force-cold-boot intent for an app's latest deployment (admin-only).
+      description: |
+        Operator-side recovery primitive for the case where the
+        live instance is fine but the snapshot backing the warm
+        tier is suspected to be the carrier of a customer-reported
+        wedge. Per ADR-005 ("snapshot of a wedged VM is a wedged
+        VM"), the recovery action is `MarkSnapshotStale` on the
+        deployment's latest warm + init snapshots — NOT a state-
+        machine transition. The instance row is NOT mutated;
+        the next customer Wake takes the cold-boot path through
+        `engine.go::usableSnapshotForWake` returning `haveSnap=false`.
+
+        PR #1099 P2 redesign: apid writes a row to `operator_intents`
+        and emits `pg_notify('operator_intent', …)`; schedd is the
+        sole consumer and dispatches via
+        `engine.ForceColdBootNextWake`. The handler returns 202
+        Accepted with an intent_id; the operator polls
+        GET /v1/admin/operator-intents/{id} for the resolved
+        `snap_ids_marked_stale` (unknown at enqueue time).
+
+        Requires `?confirm=true` as a tripwire. Optional
+        `?reason=<slug>` defaults to `operator_force_cold_boot`.
+      parameters:
+        - in: path
+          name: slug
+          required: true
+          schema: { type: string }
+          description: App slug (e.g. "my-app"). Resolved to the app's latest deployment by `created_at DESC`.
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-cold-boot against operator fat-fingering.
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_cold_boot`. Clamped to `[a-z0-9_]{1,64}`.
+      responses:
+        '202':
+          description: Intent row written + pg_notify emitted. Poll `status_url` for terminal state and `snap_ids_marked_stale`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorIntentAcceptedResponse' }
+        '400':
+          description: 'Force-cold-boot validation: `?confirm=true` is missing or `?reason=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Force-cold-boot 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: app_not_found — no app with the supplied slug; OR code: deployment_not_found — app has no deployments to force-cold-boot.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # P2d follow-on to PR #1099 (PR #1105). Force-restart is the
+  # operator-initiated twin of schedd's DestroyForLivenessFailure:
+  # kill the instance + flip the deployment's latest warm + init
+  # snapshots stale so the next customer Wake takes the cold-boot
+  # branch. Routes through the same operator_intents table +
+  # pg_notify seam as force-park / force-cold-boot; schedd is the
+  # sole consumer and dispatches via engine.ForceRestart.
+  /v1/admin/instances/{id}/force-restart:
+    post:
+      tags: [admin]
+      operationId: postForceRestartInstance
+      summary: Enqueue a force-restart intent for a wedged RUNNING instance (admin-only).
+      description: |
+        Operator-side recovery primitive for instances wedged in
+        {RUNNING} that the customer can't wait for the idle
+        reaper to handle AND whose snapshot is suspected to be
+        the carrier of the wedge. Composes the two earlier
+        primitives: kill the instance (force-park) AND flip the
+        deployment's latest warm + init snapshots stale
+        (force-cold-boot). Per ADR-005 ("snapshot of a wedged
+        VM is a wedged VM"), the recovery action is destroy +
+        snap-stale so the next Wake is a guaranteed cold boot.
+
+        PR #1105 (P2d follow-on to PR #1099): apid writes a row
+        to `operator_intents` (kind = `force_restart`, CHECK
+        widened by migrations/00446) and emits
+        `pg_notify('operator_intent', …)`; schedd (the ONLY
+        writer to `instances` per CLAUDE.md §6.2) is the sole
+        consumer and dispatches via `engine.ForceRestart` so the
+        `pkg/state/machine.go` `CanTransition` guard fires on the
+        locked re-read. The handler returns 202 Accepted with an
+        intent_id; the operator polls
+        GET /v1/admin/operator-intents/{id} for terminal state
+        and `snap_ids_marked_stale`.
+
+        Gate is intentionally TIGHTER than force-park's
+        ({RUNNING, WAKING, COLD_BOOTING}): force-restart only
+        acts on RUNNING instances because the engine's
+        state-machine validation at pkg/sched/engine.go:5299
+        rejects non-RUNNING states as
+        `state.ErrInstanceNotRunning` (a wedged WAKING /
+        COLD_BOOTING instance's nodeID may be empty or its
+        destroy path may race with the Wake). Operators targeting
+        WAKING / COLD_BOOTING instances get 409
+        `instance_not_restartable` with no intent row written.
+
+        `?confirm=true` is required as a tripwire against
+        operator fat-fingering. Optional `?reason=<slug>` defaults
+        to `operator_force_restart`; values are clamped to the
+        `[a-z0-9_]{1,64}` shape.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+          description: Force-restart target. Instance UUID returned by /v1/apps/{slug}/instances or /v1/admin/obs/instances.
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on force-restart against operator fat-fingering.
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]{1,64}$' }
+          description: Audit-log slug. Default `operator_force_restart`. Clamped to `[a-z0-9_]{1,64}`.
+      responses:
+        '202':
+          description: 'Force-restart 202: intent row written + pg_notify emitted. Poll `status_url` for terminal state and `snap_ids_marked_stale`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorIntentAcceptedResponse' }
+        '400':
+          description: 'Force-restart validation: `?confirm=true` is missing or `?reason=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Force-restart 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'Force-restart 404: code: instance_not_found — no instance row with the supplied id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: 'Force-restart 409: code: instance_not_restartable — instance state is not RUNNING. WAKING / COLD_BOOTING / PARKED / STOPPED all return this code without writing an intent row.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # P2 polling endpoint (PR #1099 P2.3). Returns the current
+  # state of an operator_intents row. Polled by the operator
+  # after a 202 from force-park or force-cold-boot. Admin
+  # scope only; no MFA (mirrors getFireCronRequest).
+  # IDOR closure: 404 (not 403) on wrong-owner so an admin
+  # cannot distinguish "wrong id" from "wrong owner".
+  /v1/admin/operator-intents/{id}:
+    get:
+      tags: [admin]
+      operationId: getOperatorIntent
+      summary: Read the current state of an operator intent (admin-only).
+      description: |
+        Returns the row written by the 202 Accepted response of
+        POST /v1/admin/instances/{id}/force-park, POST
+        /v1/admin/instances/{id}/force-restart, or POST
+        /v1/admin/apps/{slug}/force-cold-boot. Status is one of
+        "pending" | "running" | "succeeded" | "failed" |
+        "cancelled". SnapIDsMarkedStale is populated on terminal
+        status for force_cold_boot and force_restart intents
+        (warm + init tiers walked). On failure, Error carries
+        the bounded dispatch error message (1 KB cap).
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+          description: Operator intent UUID returned in the 202 Accepted body (`intent_id`).
+      responses:
+        '200':
+          description: Current state of the intent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorIntentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'getOperatorIntent 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: 'code: operator_intent_not_found — no operator intent with the supplied id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # P2c of the operator-side observability mega-PR (Commit 5c).
+  # Fleet-level sweep of `builds` rows stuck in 'running' past
+  # the threshold. Calls state.Store.SweepStuckRunningBuilds
+  # directly per user decision (NO builderd gRPC server).
+  /v1/admin/builds/sweep-stuck:
+    post:
+      tags: [admin]
+      operationId: postSweepStuckBuilds
+      summary: Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
+      description: |
+        Operator-side recovery primitive for builder microVMs that
+        crashed (OOM, kernel panic, host reboot) and left their
+        `builds` row in 'running' indefinitely. Mirrors the
+        in-process reaper at pkg/builderd/reaper.go:48 — the
+        operator-facing endpoint is the manual escape hatch for
+        when the reaper's grace period is too long for an
+        incident.
+
+        `?older_than=` is clamped to [1m, 60m] so a fat-fingered
+        "1ns" cannot sweep in-flight builds. Default 15m.
+
+        Audit row: operator.action.reclaim_build with
+        account_id=NULL (fleet-level, not tenant-scoped).
+      parameters:
+        - in: query
+          name: confirm
+          required: true
+          schema: { type: string, enum: ['true'] }
+          description: Must be the literal string "true" — tripwire on sweep-stuck against operator fat-fingering.
+        - in: query
+          name: older_than
+          required: false
+          schema:
+            type: string
+            pattern: '^[0-9]+(ns|us|ms|s|m|h)$'
+            example: 15m
+          description: Threshold duration. Clamped to [1m, 60m]. Default 15m.
+      responses:
+        '200':
+          description: Sweep complete. `swept_count` may be 0 when no rows match the threshold.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SweepStuckBuildsResponse' }
+        '400':
+          description: 'Sweep-stuck validation: `?confirm=true` is missing or `?older_than=` failed validation.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Sweep-stuck 403: code: admin_required — caller is not in the FAAS_ADMIN_EMAILS allowlist.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500':
+          description: 'Store call failed (transient PG hiccup; retry with the same threshold).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
@@ -9013,6 +9579,155 @@ components:
       x-since: "2026-08"
       x-adr: "089"
       x-pr-cluster: "PR-C"
+
+    # P2 of the operator-side observability mega-PR (Commit P2.3).
+    # Returned by POST /v1/admin/instances/{id}/force-park and
+    # POST /v1/admin/apps/{slug}/force-cold-boot on the 202 path.
+    # Both handlers now route through the operator_intents table +
+    # pg_notify seam (PR #1099 P2 redesign). The intent row is the
+    # source of truth; the operator polls status_url for terminal
+    # state.
+    #
+    # InstanceID + PreviousState are populated for force_park;
+    # AppID + DeploymentID for force_cold_boot. Kind disambiguates
+    # which fields are meaningful. ExpiresAt is the recommended
+    # horizon for the operator to stop polling (5 minutes; matches
+    # the 30s safety tick + a comfortable buffer).
+    OperatorIntentAcceptedResponse:
+      description: |
+        Wire shape for the 202 Accepted response of POST
+        /v1/admin/instances/{id}/force-park, POST
+        /v1/admin/instances/{id}/force-restart, and POST
+        /v1/admin/apps/{slug}/force-cold-boot (admin scope +
+        FAAS_ADMIN_EMAILS allowlist). The audit row is emitted
+        under operator.action.{park_instance, restart_instance,
+        force_cold_boot} with target_account_id = the instance's /
+        app's owning account. StatusURL is the relative path;
+        clients prepend the apid base URL.
+      type: object
+      required: [ok, intent_id, status_url, expires_at, kind, reason]
+      properties:
+        ok: { type: boolean, example: true }
+        intent_id:
+          type: string
+          format: uuid
+          description: Operator intent UUID. Used to poll status_url.
+        status_url:
+          type: string
+          description: Relative path to GET /v1/admin/operator-intents/{intent_id}.
+          example: /v1/admin/operator-intents/11111111-1111-1111-1111-111111111111
+        expires_at:
+          type: string
+          format: date-time
+          description: Recommended horizon to stop polling (UTC, RFC 3339).
+        kind:
+          type: string
+          enum: [force_park, force_cold_boot, force_restart]
+        instance_id:
+          type: string
+          format: uuid
+          description: Populated for force_park and force_restart. The instance the operator targeted.
+        previous_state:
+          type: string
+          enum: [RUNNING, WAKING, COLD_BOOTING]
+          description: Populated for force_park and force_restart. Gate-time read of `instances.state`.
+        app_id:
+          type: string
+          format: uuid
+          description: Populated for force_cold_boot. The app whose deployment was targeted.
+        deployment_id:
+          type: string
+          format: uuid
+          description: Populated for force_cold_boot. The latest deployment of the app.
+        reason:
+          type: string
+          pattern: '^[a-z0-9_]{1,64}$'
+          example: operator_force_park
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
+
+    # P2 of the operator-side observability mega-PR (Commit P2.3).
+    # Returned by GET /v1/admin/operator-intents/{id}. Mirrors
+    # state.OperatorIntent. Status is one of "pending" | "running"
+    # | "succeeded" | "failed" | "cancelled". On success,
+    # SnapIDsMarkedStale is populated for force_cold_boot (warm +
+    # init tiers walked). On failure, Error carries the bounded
+    # dispatch error message (1 KB cap).
+    OperatorIntentResponse:
+      description: |
+        Wire shape for GET /v1/admin/operator-intents/{id}
+        (admin scope + FAAS_ADMIN_EMAILS allowlist; NO MFA —
+        mirrors getFireCronRequest). IDOR closure: 404 (not 403)
+        on wrong-owner so an admin cannot distinguish "wrong id"
+        from "wrong owner".
+      type: object
+      required: [intent_id, kind, status, target_id, requested_at]
+      properties:
+        intent_id: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [force_park, force_cold_boot, force_restart]
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+        target_id:
+          type: string
+          description: Instance UUID (force_park or force_restart) or deployment UUID (force_cold_boot).
+        account_id:
+          type: string
+          format: uuid
+          description: Owning account. NULL for fleet-level intents (e.g. P2c reclaim_build).
+        requested_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          description: Set when schedd claims the intent (pending → running).
+        finished_at:
+          type: string
+          format: date-time
+          description: Set on terminal status (succeeded/failed/cancelled).
+        error:
+          type: string
+          description: Bounded dispatch error message (1 KB cap) on failed status.
+        snap_ids_marked_stale:
+          type: array
+          items: { type: string, format: uuid }
+          description: Populated for force_cold_boot and force_restart on succeeded status. Empty when no snapshots existed.
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
+
+    # P2c of the operator-side observability mega-PR (Commit 5c).
+    # Returned by POST /v1/admin/builds/sweep-stuck on the 200
+    # path. SweptCount may be 0 when no rows match the threshold
+    # — the audit row is still emitted so the operator's "I
+    # checked" is durable.
+    SweepStuckBuildsResponse:
+      description: |
+        Wire shape for POST /v1/admin/builds/sweep-stuck
+        (admin scope + FAAS_ADMIN_EMAILS allowlist). The audit
+        row is emitted under operator.action.reclaim_build with
+        account_id=NULL (fleet-level sweep, not tenant-scoped).
+      type: object
+      required: [ok, swept_count, older_than_seconds, threshold_iso]
+      properties:
+        ok: { type: boolean, example: true }
+        swept_count:
+          type: integer
+          minimum: 0
+          description: Rows flipped from 'running' to 'failed' with failure_class='timeout'. 0 when none match.
+        older_than_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Effective threshold after parsing ?older_than=. Clamped to [60, 3600].
+        threshold_iso:
+          type: string
+          format: date-time
+          description: RFC 3339 cutoff timestamp (now - older_than).
+      x-since: "2026-08"
+      x-pr-cluster: "operator-obs-mega"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
@@ -12436,7 +13151,15 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          default: block
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Resolved mode; always present on read. Empty on read
+            would be a database invariant violation.
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -12470,7 +13193,14 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget, cache]
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          default: block
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Omitted == 'block' (the SQL-side default).
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -12499,6 +13229,12 @@ components:
           items: { type: string }
         priority: { type: integer, minimum: 0, maximum: 10000 }
         enabled: { type: boolean }
+        validate_mode:
+          type: string
+          enum: [block, observe, warn]
+          description: |
+            Top-level source of truth for kind=validate (ADR-128).
+            Omit (do not send) to leave the column untouched.
         action:
           description: 'Replaces the jsonb column whole.'
           oneOf:
@@ -12712,13 +13448,19 @@ components:
           type: string
           enum: [block, observe, warn]
           default: block
+          deprecated: true
           description: |
-            How the gateway handles a schema mismatch. `block` rejects
-            with 422 (the strictest mode; preserves the pre-2026
-            behaviour). `observe` counts via the metric and proxies
-            normally. `warn` does the same and stamps
-            `X-Validation-Warning: <rule_id>` on the response. An
-            empty / omitted value is coerced to `block` at the
+            DEPRECATED (ADR-128 D2). Moved to top-level
+            `EdgeRuleResponse.validate_mode` /
+            `CreateEdgeRuleRequest.validate_mode` /
+            `UpdateEdgeRuleRequest.validate_mode`. Retained on
+            the action body for the back-compat read window.
+            How the gateway handles a schema mismatch. `block`
+            rejects with 422 (the strictest mode; preserves the
+            pre-2026 behaviour). `observe` counts via the metric
+            and proxies normally. `warn` does the same and stamps
+            `X-Validation-Warning: <rule_id>` on the response.
+            An empty / omitted value is coerced to `block` at the
             gateway-side handler.
 
     EdgeRuleCacheAction:
@@ -13955,6 +14697,63 @@ components:
             $ref: '#/components/schemas/RouteRow'
           x-since: "2026-08"
           x-issue: "273"
+        wakes_24h:
+          type: integer
+          format: int64
+          description: |
+            Count of `wake.boot_started` events the schedd recorded for
+            this app in the trailing 24 hours. Sourced from the
+            `events` table via the events_wake_id_idx jsonb expression
+            index (migration 00114) — sub-second on a healthy app.
+            Best-effort: 0 on a degraded store call, an empty app, or
+            when the events table predates the post-ADR-123 schema
+            (pre-PR-A boot_started rows carry no app_id field, so the
+            cast returns NULL which COUNT(*) coerces to 0 — same
+            posture as the wake-timeline view's `WakeCountWithMeta`
+            denominator at cmd/apid/handlers_dashboard.go:2659). The
+            dashboard surfaces this as the "wakes today" line item;
+            combined with `cold_start_pct` it answers "is my app
+            wake-bound or sleep-bound". Field absent on Free
+            (the per-app dashboard is Hobby+ only — see
+            pkg/api/limits.go::PerAppMetricsAllowed).
+          x-since: "2026-08"
+          x-issue: "TBD"
+        cache_hit_rate_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: |
+            Share of cache-eligible requests served from
+            `gateway_response_cache` (ADR-122) over the window.
+            ALWAYS present on the wire (the SDK can rely on the
+            documented schema) — 0 means either "feature off" (no
+            cache rule attached) or "feature on, zero traffic". The
+            dashboard distinguishes the two via the existence of the
+            `routes` block, not via field absence. The field stays 0
+            until the response-cache consumer-facing metric lands
+            (the current per-app dashboard surfaces the
+            `gateway_response_cache_total{outcome=hit/miss}` rollup
+            through the operator-side §12 panel, not this field).
+          x-since: "2026-08"
+          x-issue: "TBD"
+        error_budget_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: |
+            Trailing-30d API-availability error budget remaining (0 =
+            exhausted, 100 = full). ALWAYS present on the wire so the
+            SDK can rely on the documented schema — 0 renders as "—"
+            on the dashboard rather than a misleading "budget
+            exhausted" message. Computed against the plan's
+            API-availability SLO target (99.5% per spec §12). The
+            field stays 0 until the per-plan SLO target lands on the
+            `Limits` struct (issue TBD); once wired, the field is
+            computed against `apid_request_total{account_id, code}`
+            over the trailing 30d, scaled by the per-plan SLO
+            target.
+          x-since: "2026-08"
+          x-issue: "TBD"
 
     RouteRow:
       description: |
@@ -14736,6 +15535,186 @@ components:
         p99_ms: { type: number, description: "p99 latency in milliseconds." }
       x-since: "2026-08"
       x-issue: "696"
+
+    WakeTimelineApp:
+      description: |
+        Slim per-app identification embedded in `AppWakeTimelineResponse`.
+        Carries only the fields the dashboard SPA needs for the
+        wake-timeline header (slug + app_id). The wider
+        pkg/dashboard.AppListItem type carries template-specific
+        glyph/badge fields (SLO badge, StateBadge*, QuotaLabel) that
+        don't belong on the wire.
+      type: object
+      required: [app_id, slug]
+      properties:
+        app_id: { type: string, format: uuid }
+        slug:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+          description: "DNS-safe app slug (matches apps.slug)."
+        status: { type: string, description: "Optional deployment status (active/paused). Empty until a deployment is bound." }
+        url:    { type: string, description: "Optional public URL once a deployment is bound." }
+
+    WakeTimelineJSONRow:
+      description: |
+        One row of `AppWakeTimelineResponse.rows`. Mirrors
+        pkg/dashboard/views.WakeTimelineRow's fields so the JSON
+        mirror can render the same dashboard page 1:1. The
+        nullable fields (Trigger / QueuedCount / ConcurrencyAtAdmit
+        / ReadyInMS) use omitempty so the dashboard SPA can
+        distinguish "absent" (jsonb key missing — pre-PR-A fleet
+        row) from "explicit zero" (jsonb key present and 0).
+        `ready_in_ms = -1` is the em-dash sentinel for "no
+        boot_completed row yet" (still booting or rejected) — the
+        dashboard SPA renders "—" on -1, mirroring the HTML page
+        cell-empty branch.
+      type: object
+      required: [kind, state, at_capacity, at_capacity_present]
+      properties:
+        kind:
+          type: string
+          enum: [wake.boot_started]
+          description: "Event kind. Today always wake.boot_started; the field is open for future wake.boot_completed/_failed rows."
+        state:
+          type: string
+          description: "Mirror of the instance.state column on the per-app-detail recent-wakes table."
+        at:
+          type: string
+          format: date-time
+          description: "RFC3339 UTC timestamp of the wake."
+        trigger:
+          type: string
+          description: "Closed-enum trigger that admitted the wake (manual.cron / manual.api / scheduled.idle / …). Empty/absent on pre-PR-A fleet rows."
+        queued_count:
+          type: integer
+          format: int32
+          description: "ledger.Concurrency at admit. 0 when absent."
+        concurrency_at_admit:
+          type: integer
+          format: int32
+          description: "Same reading; 0 is the cold-start case."
+        at_capacity:
+          type: boolean
+          description: "True when admitted at the plan's per-app MaxConcurrency ceiling. Only meaningful when at_capacity_present is true."
+        at_capacity_present:
+          type: boolean
+          description: "True when the at_capacity key was in jsonb; false = absent (pre-PR-A fleet). The dashboard renders em-dash when false."
+        ready_in_ms:
+          type: integer
+          format: int32
+          description: "Wall-clock boot_started → boot_completed delta in ms. -1 when still booting or rejected. 0 is impossible (a 0ms wake would round to a positive integer)."
+
+    AppWakeTimelineResponse:
+      description: |
+        JSON mirror of the dashboard per-app wake-timeline page.
+        Plan-gated Hobby+ (same code as /v1/apps/{slug}/metrics:
+        plan_per_app_metrics_not_allowed).
+
+        `trigger_histogram` is a JSON object (map[string]int) — empty
+        `{}` on a fresh app, never null. The dashboard SPA must
+        treat missing keys as 0 (JSON.parse() returns undefined for
+        missing keys, not 0 — the render code adds the explicit
+        `?? 0` fallback).
+
+        `at_capacity_pct` is the share of `wake_count_with_meta`
+        rows where the events.wake.boot_started join succeeded AND
+        the at_capacity flag is true. Pre-PR-A fleet rows
+        contribute to `wake_count_24h` but not the denominator.
+      type: object
+      required: [app, wake_count_24h, wake_count_with_meta, at_capacity_count, at_capacity_pct, trigger_histogram, rows, as_of]
+      properties:
+        app: { $ref: '#/components/schemas/WakeTimelineApp' }
+        wake_count_24h:
+          type: integer
+          description: "Number of instance rows in the trailing 24h window (after the descending-cutoff break)."
+        wake_count_with_meta:
+          type: integer
+          description: "Denominator for at_capacity_pct — count of rows where the events.wake.boot_started LEFT JOIN succeeded."
+        at_capacity_count:
+          type: integer
+          description: "Numerator for at_capacity_pct."
+        at_capacity_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of meta-bearing rows admitted at the per-app MaxConcurrency ceiling."
+        trigger_histogram:
+          type: object
+          additionalProperties: { type: integer }
+          description: "trigger → N count of WakeBootMeta.Trigger values across the meta-bearing rows. Empty {} on a fresh app, never null."
+        rows:
+          type: array
+          description: "Wake rows in DESC StartedAt order, truncated at the 24h cutoff (descending-cutoff break)."
+          items: { $ref: '#/components/schemas/WakeTimelineJSONRow' }
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC timestamp marking the JSON envelope's authoritative 'as of' instant."
+
+    AppUsageSummaryResponse:
+      description: |
+        Wire shape for `GET /v1/apps/{slug}/usage?since=&until=`
+        (commit 4 of the per-app observability PR series).
+        Plan-gated Hobby+; Free falls through with
+        `plan_app_usage_summary_not_allowed`.
+
+        `gb_hours` is the rounded float of `mb_seconds / 1024 /
+        3600` (mirror of `meter.MonthlyUsageGB`'s 6-decimal
+        rounding). `overage_gb_hours = max(0, gb_hours -
+        plan_included_gb_hours)` — 0 when the customer is under
+        their included band, the billable overage above the band
+        otherwise. The Stripe pusher bills overage at €0.01/GB-h
+        (CLAUDE.md integer-cents-only rule).
+      type: object
+      required: [slug, period_start, period_end, mb_seconds, gb_hours, requests, tx_bytes, builder_seconds, cold_boot_count, plan_included_gb_hours, overage_gb_hours, source, as_of]
+      properties:
+        slug:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+        period_start:
+          type: string
+          format: date-time
+          description: "Half-open [period_start, period_end) window's inclusive lower bound. UTC."
+        period_end:
+          type: string
+          format: date-time
+          description: "Half-open window's exclusive upper bound. UTC midnight snap (handler defaults)."
+        mb_seconds:
+          type: integer
+          format: int64
+          description: "Sum of usage_minutes.mb_seconds for this app in the window (ADR-048 billable unit)."
+        gb_hours:
+          type: number
+          description: "mb_seconds / 1024 / 3600, rounded to 6 decimal places (mirror of meter.MonthlyUsageGB)."
+        requests:
+          type: integer
+          format: int64
+          description: "Cumulative HTTP request count (informational; not billed)."
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative HTTP response body bytes (ADR-046; informational; not billed)."
+        builder_seconds:
+          type: number
+          description: "Cumulative builder-microVM CPU-seconds (informational; surfaced as a sidebar line on the dashboard)."
+        cold_boot_count:
+          type: integer
+          format: int64
+          description: "WAKE_RESTORE→WAKE_COLD_BOOT transitions in the window."
+        plan_included_gb_hours:
+          type: number
+          description: "Echoed from acct.Plan.PlanIncludedGBHours() — plan's per-month included band so the dashboard renders the included-band badge without a second round-trip."
+        overage_gb_hours:
+          type: number
+          description: "max(0, gb_hours - plan_included_gb_hours). 0 when the customer is under their included band; the billable overage above the band otherwise."
+        source:
+          type: string
+          enum: [usage_minutes, usage_daily, mixed]
+          description: "Which rollup reader produced this summary. usage_minutes today (30d retention); usage_daily lands with the trail-period follow-up."
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC stamping the envelope's authoritative 'as of' instant."
 
     AppSLOResponse:
       description: |

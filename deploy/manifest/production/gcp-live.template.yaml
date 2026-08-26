@@ -1,0 +1,160 @@
+# GCP live split-box deployment manifest.
+#
+# This is the deployment-specific counterpart to
+# deploy/manifest/examples/splitbox.example.yaml. It records the stable
+# private-DNS names and immutable topology for the three-node GCP fleet.
+# `fsn-1.gregale.dev`, `fsn-2.gregale.dev`, and `fsn-3.gregale.dev` must resolve through the
+# operator's private/split-horizon DNS to the fleet's routable private
+# addresses; they must not be published as public Cloudflare records.
+# The same private DNS view must resolve the mTLS service identities
+# `schedd.faas`, `vmmd.faas`, and `egress.faas`; those names are certificate
+# identities and remain separate from the public app wildcard.
+# The provider-native NIC is pinned below. The GCP VPC CIDR is deliberately
+# not used as vmmd's overlay preference because vmmd's tenant-overlay safety
+# gate rejects RFC1918 ranges; the private transport names remain the source
+# of truth for node-to-node control traffic.
+#
+# The release identity below is a schema-valid template value. Release CI
+# materializes a final manifest with the tag commit and publishes that exact
+# file beside the signed bundle. Do not hand-edit release.git_sha for a
+# release; change topology here and let the release workflow derive the
+# release identity and manifest hash.
+
+schema_version: "1.0.0"
+
+fleet:
+  hosts:
+    - name: fsn-1
+      role: control-plane
+      address: fsn-1.gregale.dev:9091
+      tags: ["primary", "gcp-vpc"]
+    - name: fsn-2
+      role: compute-only
+      address: fsn-2.gregale.dev:50051
+      tags: ["gcp-vpc"]
+    - name: fsn-3
+      role: compute-only
+      address: fsn-3.gregale.dev:50051
+      tags: ["gcp-vpc"]
+
+daemons:
+  schedd:
+    bind: tcp://0.0.0.0:9091
+    tls:
+      cert_path: /etc/faas/tls/schedd/server.crt
+      key_path: /etc/faas/tls/schedd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+    outbound:
+      target: tcp://vmmd.faas:50051
+      tls:
+        cert_path: /etc/faas/tls/schedd/vmmd-client.crt
+        key_path: /etc/faas/tls/schedd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
+    gateway_synth_target: tcp://fsn-2.gregale.dev:8080
+  vmmd:
+    bind: tcp://0.0.0.0:50051
+    tls:
+      cert_path: /etc/faas/tls/vmmd/server.crt
+      key_path: /etc/faas/tls/vmmd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+    schedd_client_tls:
+      cert_path: /etc/faas/tls/vmmd/schedd-client.crt
+      key_path: /etc/faas/tls/vmmd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    compute_node:
+      host_bridge_cidr: 10.100.0.0/16
+      overlay_interface: ens4
+  apid:
+    bind: unix:///run/faas/apid.sock
+  meterd:
+    bind: unix:///run/faas/meterd.sock
+  gatewayd_public:
+    bind: tcp://0.0.0.0:443
+  gatewayd_internal:
+    bind: tcp://0.0.0.0:8080
+    apid_loopback: http://fsn-1.gregale.dev:8081
+    schedd_tls:
+      cert_path: /etc/faas/tls/gatewayd/schedd-client.crt
+      key_path: /etc/faas/tls/gatewayd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    vmmd_tls:
+      cert_path: /etc/faas/tls/gatewayd/vmmd-client.crt
+      key_path: /etc/faas/tls/gatewayd/vmmd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    egress_tls:
+      cert_path: /etc/faas/tls/egress/egress.crt
+      key_path: /etc/faas/tls/egress/egress.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+  builderd:
+    # The renderer derives the per-host vmmd target from the compute
+    # host's own address; the placeholder target supplies the schema's
+    # outbound shape and is never copied into the final TOML.
+    bind: tcp://127.0.0.1:9091
+    outbound:
+      target: tcp://fsn-2.gregale.dev:50051
+      tls:
+        cert_path: /etc/faas/tls/builderd/vmmd-client.crt
+        key_path: /etc/faas/tls/builderd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
+
+overlay:
+  provider: static
+  cidr: 10.156.0.0/20
+
+# The GCP VPC is RFC1918. These exceptions are intentionally explicit and
+# limited to the VPC overlay used by this fleet; do not copy this block to a
+# different network without reviewing its lateral-movement boundary.
+egress:
+  danger_accept_rfc1918_lateral_movement: true
+  overlay_exceptions:
+    - 10.156.0.0/20
+
+dns:
+  apps_domain: gregale.dev
+  mode: cloudflare
+
+# Private transport names are managed from gathered host facts by the
+# provider-neutral Ansible adapter. GCP Cloud DNS may still provide a local
+# optimization, but it is not required and must not be the source of truth.
+private_dns:
+  mode: managed_hosts
+  zone: gregale.dev
+
+postgresql:
+  # Credentials remain in host-local secret material, never in this file.
+  dsn: postgres://faas@fsn-1.gregale.dev:5432/faas?sslmode=disable
+  database: faas
+  migration_max_slot: 341
+  policy: on-boot
+
+release:
+  id: pre-1.0-template
+  git_sha: 0000000000000000000000000000000000000000
+  architecture: x86_64
+  firecracker_version: 1.7.0
+  firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419
+  kernel_digest: 9ee2204edd2162a6d9762bc6e07df00fdad57b83f9bf54bb8de4c9a200106e34
+  builder_base_digest: 56254c9475fe03ed3c485c85c4f86456d1a4206149cfa9ce294a818cdf7a411e
+  runtime_base_digest: 362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143
+
+storage:
+  fast_root: /srv/fc
+  spool_root: /var/spool/faas
+  log_root: /var/log/faas
+  run_dir: /run/faas
+
+cgroups:
+  slice: faas-cp.slice
+  controllers: "memory,cpu,io,pids"
+
+pki:
+  root_dir: /etc/faas/tls
+  ca_fingerprint: ceda4ea9662ceb9ef4c744d6dad7ed04591c6108d7de75f340614de02567162c
+  allowed_sans:
+    - schedd.faas
+    - vmmd.faas
+    - apid.faas
+    - gatewayd-public.faas
+    - gatewayd-internal-public.faas

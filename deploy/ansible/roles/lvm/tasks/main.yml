@@ -26,6 +26,12 @@
   check_mode: false
   failed_when: false
 
+- name: lvm — classify the reference layout
+  ansible.builtin.set_fact:
+    faas_lvm_reference_detected: >-
+      {{ 'lv-system' in lvs_out.stdout and 'lv-fc' in lvs_out.stdout }}
+  changed_when: false
+
 - name: lvm — assert lv-system (~60 GB) and lv-fc (~440 GB) exist
   ansible.builtin.assert:
     that:
@@ -39,7 +45,7 @@
     success_msg: "lv-system + lv-fc present"
   when:
     - lvs_out.rc == 0
-    - faas_storage_layout == 'reference-lvm' or (lvs_out.stdout | trim) != ''
+    - faas_storage_layout == 'reference-lvm' or (faas_lvm_reference_detected | bool)
 
 - name: lvm — use provider-native filesystem layout
   ansible.builtin.debug:
@@ -49,4 +55,4 @@
   when:
     - faas_storage_layout == 'auto'
     - lvs_out.rc == 0
-    - (lvs_out.stdout | trim) == ''
+    - not (faas_lvm_reference_detected | bool)

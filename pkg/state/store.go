@@ -77,6 +77,20 @@ var ErrConcurrentWake = errors.New("state: concurrent wake — wake_id conflict"
 // exiting the engine's wake path before any local side effect.
 var ErrWakeAlreadyInflight = errors.New("state: wake already in flight on another node")
 
+// ErrInstanceNotRunning is returned by Engine.ForceRestart
+// (pkg/sched/engine.go) when the gated re-read under lockApp
+// observes a state other than RUNNING. The race-loser posture:
+// a customer-driven Park or Destroy won the lock between the
+// apid gate-time read and schedd's locked re-read. The desired
+// end-state (instance no longer running) is already achieved,
+// but we still stamp the operator_intent row failed so the
+// audit trail records that the admin click did not mutate
+// state itself. Translated at the handler boundary to a 409
+// instance_not_restartable via the apid gate (which holds its
+// own forceRestartableStates check), so this sentinel is the
+// *post-lock-re-read* correlate of that pre-lock gate.
+var ErrInstanceNotRunning = errors.New("state: instance not in running state")
+
 // ErrCorsWildcardWithCredentials is returned by
 // MergeCorsPresetIntoRule when the merged AllowOrigins contains
 // the bare "*" wildcard alongside AllowCredentials: true. This is
@@ -2142,6 +2156,48 @@ type Store interface {
 	// schema-agnostic.
 	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
 
+	// RecordRestart (issue #586 / ADR-129 / cluster C commit 12 of
+	// the platform-observability mega-PR) bumps the persisted
+	// deployments.liveness_restart_count column by 1 in a single
+	// statement. Called by pkg/sched/Engine alongside the
+	// in-memory LivenessWindow.RecordRestart call so the column is
+	// the source of truth across schedd restarts. Returns
+	// ErrNotFound when the deployment row is missing so a
+	// misroute fails closed (mirrors UpsertDeploymentScanResult
+	// IDOR contract at line 2049). The CHECK constraint
+	// (deployments_liveness_restart_count_nonneg_chk,
+	// migrations/00411) rejects a negative bump at the SQL layer
+	// even though the application code is monotonic — belt-and-
+	// braces against a buggy caller.
+	RecordRestart(ctx context.Context, deploymentID string) error
+
+	// Issue #599 / ADR-130 / cluster D commit 14 of the
+	// platform-observability mega-PR — status-page incidents
+	// table (migrations/00412). Three methods on the Store
+	// interface:
+	//
+	//   InsertStatusIncident   appends an open row (resolved_at
+	//                          NULL). The status page surfaces
+	//                          this verbatim.
+	//   ResolveStatusIncident  stamps resolved_at on the row
+	//                          identified by id. Idempotent: a
+	//                          second call on an already-resolved
+	//                          row returns nil (no error) — the
+	//                          CLI can re-issue a resolve without
+	//                          surfacing 23514.
+	//   ListOpenStatusIncidents
+	//                          reads the partial-index
+	//                          (status_incidents_open WHERE
+	//                          resolved_at IS NULL) sorted by
+	//                          posted_at DESC. The
+	//                          /v1/internal/slo.json endpoint
+	//                          composes its response from this
+	//                          list plus meterd's loopback
+	//                          Prometheus exporter.
+	InsertStatusIncident(ctx context.Context, component, severity, message string) (StatusIncident, error)
+	ResolveStatusIncident(ctx context.Context, id int64) error
+	ListOpenStatusIncidents(ctx context.Context) ([]StatusIncident, error)
+
 	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
 	// document capture. The surface is paid-only (Free plan
 	// returns 403 from the apid) but the microVM always captures
@@ -2618,6 +2674,57 @@ type Store interface {
 	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
 	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
 
+	// Operator intent queue (PR #1099 P2 redesign / migrations/00445).
+	// apid inserts on the two admin recovery endpoints
+	// (POST /v1/admin/instances/{id}/force-park and
+	// POST /v1/admin/apps/{slug}/force-cold-boot), emits
+	// db.NotifyOperatorIntent, returns 202 Accepted. schedd (the
+	// only consumer) claims via FOR UPDATE SKIP LOCKED LIMIT 1 and
+	// dispatches by kind. Routes the admin primitives through a
+	// table + pg_notify seam so apid never imports pkg/scheddgrpc
+	// (the apid-control-plane-only depguard rule is preserved).
+	//
+	// Metadata is opaque json.RawMessage; today it's always empty
+	// (force_park / force_cold_boot carry no extra payload) but the
+	// column is reserved for future per-kind fields without a
+	// migration.
+	InsertOperatorIntent(
+		ctx context.Context,
+		kind OperatorIntentKind,
+		targetID string,
+		accountID *string,
+		actorID string,
+		reason string,
+		metadata json.RawMessage,
+	) (string, error)
+	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
+	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
+	// MarkOperatorIntentFailed stamps the row's terminal failure
+	// state. snapIDs captures the partial-success shape: when a
+	// force_restart dispatch flips the deployment's warm + init
+	// snapshots stale but timedDestroy fails (vmmd wedged), the
+	// snapshots ARE stale in the database but the destroy is not.
+	// Persisting snapIDs here means GET /v1/admin/operator-intents/{id}
+	// surfaces "what this action affected" even on the failure
+	// path — the operator learns the next wake WILL cold-boot
+	// despite the destroy error. snapIDs may be nil (race-loser,
+	// unknown-kind, deployment-not-found, etc.).
+	MarkOperatorIntentFailed(ctx context.Context, id, errMsg string, snapIDs []string) error
+	GetOperatorIntent(ctx context.Context, id string) (OperatorIntent, error)
+	// ReclaimStuckRunningOperatorIntents resets every operator_intents
+	// row whose status='running' AND whose started_at is older than
+	// threshold back to status='pending' (clearing started_at to NULL)
+	// so the next ClaimPendingOperatorIntent call picks it up. Used by
+	// schedd's operatorIntentStuckRunningTimeout safety tick — without
+	// it, a schedd crash between Claim and Mark* leaves the row stuck
+	// in `running` forever and the intent is silently dropped.
+	//
+	// Returns the number of rows affected. Idempotent: a second call
+	// with the same threshold after the rows have been re-claimed
+	// affects 0 rows. The reclaim is a single UPDATE so the
+	// FOR UPDATE SKIP LOCKED claim path sees a consistent snapshot.
+	ReclaimStuckRunningOperatorIntents(ctx context.Context, threshold time.Time) (int, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the
@@ -3054,6 +3161,26 @@ type Store interface {
 	// dashboard's "Recent wakes" table doesn't fan out per row.
 	// Empty map when no rows match (pre-ADR-123 fleet).
 	LookupBootStartedForWakes(ctx context.Context, wakeIDs []string) (map[string]WakeBootMeta, error)
+	// CountWakeBootStarted24h returns the count of wake.boot_started
+	// events the schedd recorded for the given app in the trailing
+	// 24 hours. Used by cmd/apid/handlers_metrics.go to populate
+	// the AppMetricsResponse.Wakes24h field on the customer-facing
+	// per-app dashboard (Free is gated off; Hobby/Pro/Scale only
+	// — see pkg/api/limits.go::PerAppMetricsAllowed). Returns 0 on
+	// an empty app, a degraded store call, or when the events
+	// table predates the post-ADR-123 schema (pre-ADR-123
+	// boot_started rows carry no app_id field, so the cast
+	// returns NULL which COUNT(*) coerces to 0).
+	//
+	// Performance: the (data->>'app_id')::uuid predicate is NOT
+	// covered by the existing events_wake_id_idx jsonb expression
+	// index (migration 00114 indexes data->>'wake_id', not app_id).
+	// On a Scale-tier app with a large wake fleet the planner will
+	// seq-scan the trailing-24h wake.boot_started rows and
+	// re-evaluate the jsonb cast per row. A follow-up migration
+	// adding a covering index on (data->>'app_id', at) is tracked
+	// separately.
+	CountWakeBootStarted24h(ctx context.Context, appID string) (int64, error)
 	// ListAllInstances returns every instance on the box, ordered newest
 	// first. schedd's G7 reaper warm-passes this slice to the conntrack
 	// reader (pkg/sched/flowcount) once per tick — a single bulk read is
@@ -3395,10 +3522,11 @@ type Store interface {
 	UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error)
 	// UpsertComputeNodeFromVmmd is the vmmd self-registration
 	// write path (cmd/vmmd/register.go). Writes only the
-	// vmmd-owned resource numbers + re-activates the row. ON
+	// vmmd-owned resource numbers and preserves the operator-controlled
+	// active bit. ON
 	// CONFLICT (name) DO UPDATE SET vpcpus, mem_mb,
 	// max_concurrency, admission_ceiling_mb, vcpu_budget,
-	// active=true, target_url = COALESCE(compute_nodes.target_url,
+	// active=compute_nodes.active, target_url = COALESCE(compute_nodes.target_url,
 	// excluded.target_url) — the existing target_url (operator's
 	// POSTed value, or the seed row's value on cold start) is
 	// preserved on conflict. The COALESCE handles the cold-INSERT
@@ -3514,6 +3642,26 @@ type Store interface {
 	// done in the handler; this query is just the latest-row-per-node.
 	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
 
+	// LatestBuilderHeartbeatStats (operator-side observability
+	// mega-PR / Commit 7 — P5) is the builder_tick twin of
+	// LatestHeartbeatStats. Filters to source='builder_tick' only;
+	// the underlying writer (pkg/builderd/heartbeat.go) is deferred
+	// to a follow-up PR per the Commit 7 risk list (builderd does
+	// not currently self-register a compute_nodes row at startup).
+	// The mirror method exists today so the
+	// GET /v1/admin/obs/builder-heartbeats endpoint can land
+	// without waiting on the writer; once the writer is live, the
+	// row count goes from zero to non-zero without an API change.
+	LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// QueuedBuildsCount (Commit 7 — P5) returns the number of
+	// builds in 'queued' state across the fleet. Per-node labeling
+	// is deferred (builds.target_node_id is not yet a column; adding
+	// it is a follow-up migration). Today the gauge is a
+	// fleet-total — the operator dashboard renders "X builds in
+	// the queue" without per-schedd attribution.
+	QueuedBuildsCount(ctx context.Context) (int, error)
+
 	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
 	// new per-node utilization fields on /v1/admin/obs/nodes. One row
 	// per compute_node that has at least one live instance.
@@ -3529,6 +3677,11 @@ type Store interface {
 	// by the caller if it wants the global number (the existing
 	// fleet Σ lives in the schedd engine, not on this wire).
 	PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error)
+	// OperatorCapacity returns a bounded fleet-wide capacity snapshot. The
+	// production implementation performs the live-instance and app-placement
+	// rollups in Postgres; it must not be implemented by loading every instance
+	// row into apid.
+	OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error)
 
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error

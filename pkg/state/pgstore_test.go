@@ -3616,8 +3616,12 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 		Role:               ptrStr("control-plane"),
 		Generation:         ptrInt(7),
 	}
-	if _, err := s.UpsertComputeNodeFromOperator(ctx, operatorFirst); err != nil {
+	operatorRow, err := s.UpsertComputeNodeFromOperator(ctx, operatorFirst)
+	if err != nil {
 		t.Fatalf("operator first upsert: %v", err)
+	}
+	if err := s.SetComputeNodeActive(ctx, operatorRow.ID, false); err != nil {
+		t.Fatalf("drain node: %v", err)
 	}
 
 	// Step 2: vmmd self-registers on boot. It posts different
@@ -3690,6 +3694,9 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 	}
 	if got.Zone == nil || *got.Zone != "eu-fra-1" {
 		t.Errorf("Zone = %v, want preserved operator value \"eu-fra-1\"", got.Zone)
+	}
+	if got.Active {
+		t.Error("vmmd self-registration reactivated an operator-drained node")
 	}
 }
 

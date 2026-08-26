@@ -13,13 +13,13 @@
 
 - name: restart postgresql
   ansible.builtin.service:
-    name: postgresql
+    name: "postgresql@{{ postgres_major_version }}-main.service"
     state: restarted
   failed_when: false  # chroot/CI lacks systemd
 
 - name: reload postgresql
   ansible.builtin.service:
-    name: postgresql
+    name: "postgresql@{{ postgres_major_version }}-main.service"
     state: reloaded
   failed_when: false
 

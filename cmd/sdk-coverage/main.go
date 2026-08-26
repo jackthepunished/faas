@@ -68,9 +68,14 @@ var routeExclude = map[string]bool{
 	// BOTH this list AND cmd/apid/spec_compliance_test.go::routeExclude;
 	// the two lists must move together.
 	"GET /v1/admin/obs/overview":                true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/capacity":                true, // operator-only capacity projection
 	"GET /v1/admin/obs/tenants":                 true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}/360":        true, // operator-only tenant 360 projection
 	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}/activity":   true, // operator-only tenant activity drill-down
+	"GET /v1/admin/obs/apps/{id}":               true, // operator-only app workload drill-down
 	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/detail":     true, // operator-only node workload drill-down
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
@@ -78,6 +83,26 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
 	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/builder-heartbeats":      true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
+
+	// Operator-side observability mega-PR (PR #1099) P2 recovery
+	// primitives. Same operator-only posture as the ADR-091
+	// cluster above: admin scope + FAAS_ADMIN_EMAILS allowlist;
+	// SDK consumers authenticate as a tenant, not an operator.
+	// Mirror the exclusion across BOTH this list AND
+	// cmd/apid/spec_compliance_test.go::routeExclude; the two
+	// lists must move together.
+	"POST /v1/admin/instances/{id}/force-park":         true, // PR #1099 P2a — operator-only recovery primitive
+	"POST /v1/admin/apps/{slug}/force-cold-boot":       true, // PR #1099 P2b — operator-only recovery primitive
+	"POST /v1/admin/instances/{id}/force-restart":      true, // PR #1105 P2d — operator-only recovery primitive
+	"POST /v1/admin/builds/sweep-stuck":                true, // PR #1099 P2c — operator-only recovery primitive
+	"POST /v1/admin/ops/accounts/{id}/suspend":         true, // operator-only tenant lifecycle control
+	"POST /v1/admin/ops/accounts/{id}/restore":         true, // operator-only tenant lifecycle control
+	"POST /v1/admin/ops/accounts/{id}/revoke-sessions": true, // operator-only tenant security control
+	"POST /v1/admin/ops/nodes/{name}/drain":            true, // operator-only node lifecycle control
+	"POST /v1/admin/ops/nodes/{name}/force-drain":      true, // operator-only destructive node lifecycle control
+	"POST /v1/admin/ops/nodes/{name}/activate":         true, // operator-only node lifecycle control
+	"GET /v1/admin/operator-intents/{id}":              true, // PR #1099 P2.3 — operator-only intent polling endpoint
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie
@@ -421,6 +446,18 @@ var methodRouteMap = map[string]string{
 	// names it GetAppMetrics to match the existing per-app methods
 	// (GetApp, ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
+
+	// Per-app observability backend PR series (PR #1097). The
+	// wake-timeline path uses a literal hyphen (matching the
+	// dashboard route); the auto-derivation would produce
+	// GetAppsSlugWake-timeline (Swagger-style with the hyphen
+	// preserved). The usage path auto-derives to
+	// GetAppsSlugUsage — drop the slug placeholder from the verb
+	// to match the sibling per-app family (GetAppMetrics,
+	// GetAppSLO, GetAppRoutes) and use the DTO type name
+	// (AppUsageSummary) for the noun.
+	"GET /v1/apps/{slug}/wake-timeline": "GetAppWakeTimeline",
+	"GET /v1/apps/{slug}/usage":         "GetAppUsageSummary",
 
 	// ADR-127 / PR-A — production debugger data plane. The
 	// auto-derivation would produce GetAppsSlugDebugRequests

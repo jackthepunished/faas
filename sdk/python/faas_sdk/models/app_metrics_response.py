@@ -53,6 +53,14 @@ class AppMetricsResponse:
     """
     wake_p95_ms: float
     """FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."""
+    queue_depth: int | Unset = UNSET
+    """Current wake-queue depth (`gateway_queue_depth{app}`).
+    Backs the `queue_backlog_growing` alert preset (ADR-123):
+    comparison `gt 50` over the chosen window. Best-effort:
+    absent on Prometheus failure (the field is `null`); the
+    evaluator's degraded-source contract skips firing
+    rather than guessing.
+    """
     egress_bytes: int | Unset = UNSET
     """Per-app egress byte delta over the window (informational; not billed). ADR-046. Source:
     schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until
@@ -72,6 +80,49 @@ class AppMetricsResponse:
     50 distinct routes + the `__route_other__` wildcard-path
     overflow bucket. The route label is method + raw path
     (pre-rewrite, ADR-093 D6).
+    """
+    wakes_24h: int | Unset = UNSET
+    """Count of `wake.boot_started` events the schedd recorded for
+    this app in the trailing 24 hours. Sourced from the
+    `events` table via the events_wake_id_idx jsonb expression
+    index (migration 00114) — sub-second on a healthy app.
+    Best-effort: 0 on a degraded store call, an empty app, or
+    when the events table predates the post-ADR-123 schema
+    (pre-PR-A boot_started rows carry no app_id field, so the
+    cast returns NULL which COUNT(*) coerces to 0 — same
+    posture as the wake-timeline view's `WakeCountWithMeta`
+    denominator at cmd/apid/handlers_dashboard.go:2659). The
+    dashboard surfaces this as the "wakes today" line item;
+    combined with `cold_start_pct` it answers "is my app
+    wake-bound or sleep-bound". Field absent on Free
+    (the per-app dashboard is Hobby+ only — see
+    pkg/api/limits.go::PerAppMetricsAllowed).
+    """
+    cache_hit_rate_pct: float | Unset = UNSET
+    """Share of cache-eligible requests served from
+    `gateway_response_cache` (ADR-122) over the window.
+    ALWAYS present on the wire (the SDK can rely on the
+    documented schema) — 0 means either "feature off" (no
+    cache rule attached) or "feature on, zero traffic". The
+    dashboard distinguishes the two via the existence of the
+    `routes` block, not via field absence. The field stays 0
+    until the response-cache consumer-facing metric lands
+    (the current per-app dashboard surfaces the
+    `gateway_response_cache_total{outcome=hit/miss}` rollup
+    through the operator-side §12 panel, not this field).
+    """
+    error_budget_pct: float | Unset = UNSET
+    """Trailing-30d API-availability error budget remaining (0 =
+    exhausted, 100 = full). ALWAYS present on the wire so the
+    SDK can rely on the documented schema — 0 renders as "—"
+    on the dashboard rather than a misleading "budget
+    exhausted" message. Computed against the plan's
+    API-availability SLO target (99.5% per spec §12). The
+    field stays 0 until the per-plan SLO target lands on the
+    `Limits` struct (issue TBD); once wired, the field is
+    computed against `apid_request_total{account_id, code}`
+    over the trailing 30d, scaled by the per-plan SLO
+    target.
     """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -98,6 +149,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = self.wake_p95_ms
 
+        queue_depth = self.queue_depth
+
         egress_bytes = self.egress_bytes
 
         tx_bytes = self.tx_bytes
@@ -108,6 +161,12 @@ class AppMetricsResponse:
             for routes_item_data in self.routes:
                 routes_item = routes_item_data.to_dict()
                 routes.append(routes_item)
+
+        wakes_24h = self.wakes_24h
+
+        cache_hit_rate_pct = self.cache_hit_rate_pct
+
+        error_budget_pct = self.error_budget_pct
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -126,12 +185,20 @@ class AppMetricsResponse:
                 "wake_p95_ms": wake_p95_ms,
             }
         )
+        if queue_depth is not UNSET:
+            field_dict["queue_depth"] = queue_depth
         if egress_bytes is not UNSET:
             field_dict["egress_bytes"] = egress_bytes
         if tx_bytes is not UNSET:
             field_dict["tx_bytes"] = tx_bytes
         if routes is not UNSET:
             field_dict["routes"] = routes
+        if wakes_24h is not UNSET:
+            field_dict["wakes_24h"] = wakes_24h
+        if cache_hit_rate_pct is not UNSET:
+            field_dict["cache_hit_rate_pct"] = cache_hit_rate_pct
+        if error_budget_pct is not UNSET:
+            field_dict["error_budget_pct"] = error_budget_pct
 
         return field_dict
 
@@ -162,6 +229,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = d.pop("wake_p95_ms")
 
+        queue_depth = d.pop("queue_depth", UNSET)
+
         egress_bytes = d.pop("egress_bytes", UNSET)
 
         tx_bytes = d.pop("tx_bytes", UNSET)
@@ -175,6 +244,12 @@ class AppMetricsResponse:
 
                 routes.append(routes_item)
 
+        wakes_24h = d.pop("wakes_24h", UNSET)
+
+        cache_hit_rate_pct = d.pop("cache_hit_rate_pct", UNSET)
+
+        error_budget_pct = d.pop("error_budget_pct", UNSET)
+
         app_metrics_response = cls(
             app_id=app_id,
             range_=range_,
@@ -187,9 +262,13 @@ class AppMetricsResponse:
             error_rate_pct=error_rate_pct,
             cold_start_pct=cold_start_pct,
             wake_p95_ms=wake_p95_ms,
+            queue_depth=queue_depth,
             egress_bytes=egress_bytes,
             tx_bytes=tx_bytes,
             routes=routes,
+            wakes_24h=wakes_24h,
+            cache_hit_rate_pct=cache_hit_rate_pct,
+            error_budget_pct=error_budget_pct,
         )
 
         app_metrics_response.additional_properties = d

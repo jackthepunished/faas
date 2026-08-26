@@ -114,7 +114,13 @@ type MemStore struct {
 	// the row back without a second query.
 	githubWebhookSecretMeta map[int64]webhookSecretMeta
 	deployments             map[string]Deployment
-	builds                  map[string]Build
+	// statusIncidents (issue #599 / ADR-130) is the in-memory
+	// mirror of the status_incidents table (migrations/00412).
+	// Append-only + resolved_at-stamped; the partial-index read
+	// (status_incidents_open WHERE resolved_at IS NULL) is mirrored
+	// by the ListOpenStatusIncidents loop filter.
+	statusIncidents []StatusIncident
+	builds          map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
 	// build_id (mirrors build_provenance.build_id UNIQUE). MemStore
 	// holds the same idempotent-replace semantics as PgStore's
@@ -137,6 +143,10 @@ type MemStore struct {
 	// status transitions follow the production 5-state CHECK (pending
 	// → running → succeeded|failed|cancelled).
 	fireNowRequests map[string]FireNowRequest
+	// operatorIntents mirrors operator_intents (migrations/00431)
+	// for handler + subscriber tests. Keyed by intent id (UUID);
+	// status transitions follow the production 5-state CHECK.
+	operatorIntents map[string]OperatorIntent
 	// alertRules mirrors alert_rules for handler tests. Keyed by
 	// ruleID. AlertDelivery rows are kept separately so the
 	// delivery list query can walk just the matching subset on
@@ -623,6 +633,7 @@ func NewMemStore() *MemStore {
 		doctorObs:            map[string]DomainDoctorObservation{},
 		crons:                map[string]Cron{},
 		fireNowRequests:      map[string]FireNowRequest{},
+		operatorIntents:      map[string]OperatorIntent{},
 		alertRules:           map[string]AlertRule{},
 		alertDeliveries:      map[string]AlertDelivery{},
 		appWebhooks:          map[string]AppWebhook{},
@@ -4756,6 +4767,91 @@ func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, 
 	return nil
 }
 
+// RecordRestart (issue #586 / ADR-129 / cluster C commit 12) is
+// the in-memory mirror of PgStore.RecordRestart: bumps the
+// deployment's LivenessRestartCount by 1. Mirrors
+// UpsertDeploymentSecretFindings' IDOR contract (ErrNotFound on
+// missing row). The in-memory store is used by unit tests and
+// the dev-mode bootstrap — production runs against PgStore.
+func (m *MemStore) RecordRestart(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.LivenessRestartCount++
+	m.deployments[id] = d
+	return nil
+}
+
+// InsertStatusIncident (issue #599 / ADR-130 / cluster D commit 14)
+// is the in-memory mirror of PgStore.InsertStatusIncident.
+// Closed-set vocabulary is enforced via switch rather than CHECK
+// (the in-memory store is dev-mode / unit-test only; production
+// runs against PgStore).
+func (m *MemStore) InsertStatusIncident(_ context.Context, component, severity, message string) (StatusIncident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch component {
+	case StatusIncidentComponentApid, StatusIncidentComponentSchedd,
+		StatusIncidentComponentVmmd, StatusIncidentComponentGatewayd,
+		StatusIncidentComponentMeterd, StatusIncidentComponentImaged,
+		StatusIncidentComponentBuilderd, StatusIncidentComponentFaasControlPlane:
+	default:
+		return StatusIncident{}, ErrNotFound // closed-set enforcement
+	}
+	switch severity {
+	case StatusIncidentSeverityDegraded, StatusIncidentSeverityPartialOutage,
+		StatusIncidentSeverityFullOutage, StatusIncidentSeverityMaintenance:
+	default:
+		return StatusIncident{}, ErrNotFound
+	}
+	if len(message) > 1024 {
+		return StatusIncident{}, ErrNotFound
+	}
+	inc := StatusIncident{
+		ID:        int64(len(m.statusIncidents) + 1),
+		Component: component,
+		Severity:  severity,
+		Message:   message,
+		PostedAt:  time.Now(),
+	}
+	m.statusIncidents = append(m.statusIncidents, inc)
+	return inc, nil
+}
+
+// ResolveStatusIncident (issue #599 / ADR-130) — in-memory mirror.
+// Idempotent on already-resolved rows (mirrors PgStore).
+func (m *MemStore) ResolveStatusIncident(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.statusIncidents {
+		if m.statusIncidents[i].ID == id {
+			if m.statusIncidents[i].ResolvedAt == nil {
+				now := time.Now()
+				m.statusIncidents[i].ResolvedAt = &now
+			}
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
+// ListOpenStatusIncidents (issue #599 / ADR-130) — in-memory mirror.
+// Returns the open subset (resolved_at == nil), most-recent first.
+func (m *MemStore) ListOpenStatusIncidents(_ context.Context) ([]StatusIncident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []StatusIncident
+	for i := len(m.statusIncidents) - 1; i >= 0; i-- {
+		if m.statusIncidents[i].ResolvedAt == nil {
+			out = append(out, m.statusIncidents[i])
+		}
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // openAPIDocRow is the in-memory row mirror of deployment_openapi_docs
 // (migrations/00330). The struct is unexported; the public surface is
@@ -5382,6 +5478,24 @@ func (m *MemStore) SweepStuckRunningBuilds(_ context.Context, threshold time.Tim
 	return n, nil
 }
 
+// QueuedBuildsCount (operator-side observability mega-PR / Commit 7
+// — P5) returns the number of builds currently in 'queued' state.
+// Mirrors PgStore.QueuedBuildsCount. Per-node labeling is
+// deferred (builds.target_node_id is not yet a column) so the
+// gauge degrades to a fleet-total — the dashboard renders
+// "X builds in the queue" without per-schedd attribution.
+func (m *MemStore) QueuedBuildsCount(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, b := range m.builds {
+		if b.Status == BuildQueued {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // SetBuildStartedAtForTest is a test-only hook that lets the reaper
 // tests backdate a build's started_at without touching the public
 // Create flow. Mirrors the BackdateForTest pattern on instances.
@@ -5943,6 +6057,159 @@ func (m *MemStore) GetFireNowRequest(_ context.Context, requestID string) (FireN
 		return FireNowRequest{}, ErrFireNowRequestNotFound
 	}
 	return r, nil
+}
+
+// Operator intent queue (PR #1099 P2 redesign / migrations/00431).
+// In-memory mirror of operator_intents — same shape, same status
+// enum, same FOR UPDATE SKIP LOCKED FIFO claim semantics as the
+// pg path. Handler tests (cmd/apid/handlers_admin_force_test.go)
+// exercise Insert / Claim / Mark* via the same Store interface
+// that production apid uses; schedd-subscriber tests
+// (pkg/sched/operator_intent_subscriber_test.go) exercise the
+// dispatch + state-machine path against this map.
+//
+// Concurrency: the same mutex that guards fireNowRequests covers
+// this map. Insert / Claim / Mark* all take it for the duration of
+// their critical section. The map is keyed by intent id (UUID);
+// collisions are impossible in practice.
+func (m *MemStore) InsertOperatorIntent(
+	_ context.Context,
+	kind OperatorIntentKind,
+	targetID string,
+	accountID *string,
+	actorID string,
+	reason string,
+	metadata json.RawMessage,
+) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := uuid.NewString()
+	if metadata == nil {
+		metadata = json.RawMessage("{}")
+	}
+	m.operatorIntents[id] = OperatorIntent{
+		ID:          id,
+		Kind:        kind,
+		TargetID:    targetID,
+		AccountID:   accountID,
+		ActorID:     actorID,
+		Reason:      reason,
+		Metadata:    metadata,
+		Status:      OperatorIntentPending,
+		RequestedAt: time.Now().UTC(),
+	}
+	return id, nil
+}
+
+func (m *MemStore) ClaimPendingOperatorIntent(_ context.Context) (OperatorIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldestID string
+	var oldestAt time.Time
+	for id, r := range m.operatorIntents {
+		if r.Status != OperatorIntentPending {
+			continue
+		}
+		if oldestID == "" || r.RequestedAt.Before(oldestAt) {
+			oldestID = id
+			oldestAt = r.RequestedAt
+		}
+	}
+	if oldestID == "" {
+		return OperatorIntent{}, ErrOperatorIntentNotFound
+	}
+	r := m.operatorIntents[oldestID]
+	r.Status = OperatorIntentRunning
+	now := time.Now().UTC()
+	r.StartedAt = &now
+	m.operatorIntents[oldestID] = r
+	return r, nil
+}
+
+func (m *MemStore) MarkOperatorIntentSucceeded(_ context.Context, id string, snapIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok || r.Status != OperatorIntentRunning {
+		return ErrOperatorIntentNotFound
+	}
+	r.Status = OperatorIntentSucceeded
+	r.SnapIDsMarkedStale = snapIDs
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.operatorIntents[id] = r
+	return nil
+}
+
+func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string, snapIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok || r.Status != OperatorIntentRunning {
+		return ErrOperatorIntentNotFound
+	}
+	if len(errMsg) > 1024 {
+		errMsg = errMsg[:1024]
+	}
+	r.Status = OperatorIntentFailed
+	r.Error = errMsg
+	// P2d R4 review fix: persist snapIDs on the failure path so
+	// partial-success (snaps flipped stale but destroy errored)
+	// is reflected on the operator_intent row. Mirror the pgstore
+	// impl's nil→empty coercion so the test-side assertions
+	// match across both backends.
+	if snapIDs == nil {
+		snapIDs = []string{}
+	}
+	r.SnapIDsMarkedStale = snapIDs
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.operatorIntents[id] = r
+	return nil
+}
+
+func (m *MemStore) GetOperatorIntent(_ context.Context, id string) (OperatorIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.operatorIntents[id]
+	if !ok {
+		return OperatorIntent{}, ErrOperatorIntentNotFound
+	}
+	return r, nil
+}
+
+// ReclaimStuckRunningOperatorIntents mirrors
+// PgStore.ReclaimStuckRunningOperatorIntents: walk the map,
+// flip any `running` row whose StartedAt is older than the
+// threshold back to `pending` (clearing StartedAt so the
+// next Claim stamps a fresh value). Returns the count.
+//
+// The MemStore path exists so schedd's safety tick can be
+// unit-tested without spinning up Postgres. The semantics
+// match the pgstore: a row that is already `pending`,
+// `succeeded`, or `failed` is left alone; only rows that
+// have been stuck in `running` for longer than the
+// threshold are reset.
+func (m *MemStore) ReclaimStuckRunningOperatorIntents(_ context.Context, threshold time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int
+	for id, r := range m.operatorIntents {
+		if r.Status != OperatorIntentRunning {
+			continue
+		}
+		if r.StartedAt == nil {
+			continue
+		}
+		if r.StartedAt.After(threshold) {
+			continue
+		}
+		r.Status = OperatorIntentPending
+		r.StartedAt = nil
+		m.operatorIntents[id] = r
+		n++
+	}
+	return n, nil
 }
 
 func (m *MemStore) ListCronsForApp(_ context.Context, appID string) ([]Cron, error) {
@@ -8150,7 +8417,8 @@ func (m *MemStore) CreateComputeNode(_ context.Context, node ComputeNode) (Compu
 // (issue #98 / ADR-028). vmmd's self-registration calls this at startup
 // — a node that has already been registered has its capacity refreshed
 // and is reactivated (active=true), even if an operator had previously
-// drained it. The loop-then-store mirrors a write-then-map in the
+// drained it. The explicit FromVmmd path below preserves the operator's
+// active decision. The loop-then-store mirrors a write-then-map in the
 // MemStore: cheaper than a SELECT-then-UPDATE for tests that hammer the
 // path. CreatedAt stays monotonic on conflict.
 //
@@ -8197,11 +8465,11 @@ func (m *MemStore) UpsertComputeNodeFromOperator(_ context.Context, node Compute
 }
 
 // UpsertComputeNodeFromVmmd mirrors pgstore's vmmd-side
-// self-registration. On conflict, target_url is preserved (the
-// operator's POSTed value wins); the other fields are taken from
-// the new row. The cold-INSERT case (no existing row) takes
-// target_url from the new row, same shape as
-// UpsertComputeNodeFromOperator — there's nothing to preserve.
+// self-registration. On conflict, target_url and active are preserved
+// (the operator's POSTed value and drain decision win); the other
+// fields are taken from the new row. The cold-INSERT case (no existing
+// row) takes target_url from the new row and starts active, same shape
+// as UpsertComputeNodeFromOperator — there's nothing to preserve.
 //
 // This is the load-bearing fix for the second-box cutover. See
 // pgstore's comment on UpsertComputeNodeFromVmmd for the trap.
@@ -8270,7 +8538,11 @@ func (m *MemStore) upsertComputeNodeLocked(node ComputeNode, preserveTargetURLOn
 	if n.LastHeartbeatAt.IsZero() {
 		n.LastHeartbeatAt = n.CreatedAt
 	}
-	n.Active = true
+	if existing == nil || !preserveTargetURLOnConflict {
+		n.Active = true
+	} else {
+		n.Active = existing.Active
+	}
 	m.computeNodes[n.ID] = n
 	return n, nil
 }
@@ -8474,20 +8746,48 @@ func (m *MemStore) AppendComputeNodeHeartbeatWithStats(_ context.Context, nodeID
 // pattern). Missing or pre-PR #4 nodes return nil for the stat
 // pointers — the handler renders "—" for those.
 func (m *MemStore) LatestHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return m.latestHeartbeatStatsWhere("", false)
+}
+
+// LatestBuilderHeartbeatStats (operator-side observability
+// mega-PR / Commit 7 — P5) returns the most-recent heartbeat
+// filtered to source='builder_tick'. The underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
+// risk list. In the meantime the table is empty for
+// builder_tick, so this returns the empty slice.
+func (m *MemStore) LatestBuilderHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return m.latestHeartbeatStatsWhere("builder_tick", true)
+}
+
+// latestHeartbeatStatsWhere is the shared implementation for
+// LatestHeartbeatStats (all sources, project silent nodes) and
+// LatestBuilderHeartbeatStats (one source, project only the
+// nodes that have a row). The two projections differ because
+// the vmmd node list is the operator-visible fleet while the
+// builder_tick list is "builderds we have written about" — we
+// don't synthesise entries for nodes that haven't reported.
+func (m *MemStore) latestHeartbeatStatsWhere(sourceFilter string, onlyMatchingNodes bool) ([]ComputeNodeHeartbeatStats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]ComputeNodeHeartbeatStats, 0, len(m.computeNodes))
-	for nodeID := range m.computeNodes {
-		rows := m.computeNodeHeartbeats[nodeID]
-		if len(rows) == 0 {
-			// No heartbeats yet. Still project the node so the
-			// handler can render "no data" rather than dropping
-			// it from the list entirely — the operator needs to
-			// see "node registered but silent" as a signal.
+	for nodeID, rows := range m.computeNodeHeartbeats {
+		// Walk rows in reverse insertion order until we find
+		// one matching the filter. Mirrors pgstore's
+		// `order by received_at desc` semantics.
+		var latest *ComputeNodeHeartbeat
+		for i := len(rows) - 1; i >= 0; i-- {
+			if sourceFilter == "" || rows[i].Source == sourceFilter {
+				latest = &rows[i]
+				break
+			}
+		}
+		if latest == nil {
+			if onlyMatchingNodes {
+				continue
+			}
 			out = append(out, ComputeNodeHeartbeatStats{NodeID: nodeID})
 			continue
 		}
-		latest := rows[len(rows)-1]
 		out = append(out, ComputeNodeHeartbeatStats{
 			NodeID:        nodeID,
 			ReceivedAt:    latest.ReceivedAt,
@@ -8559,6 +8859,101 @@ func (m *MemStore) PerNodeLiveStats(_ context.Context) ([]PerNodeStats, error) {
 	for _, row := range agg {
 		out = append(out, *row)
 	}
+	return out, nil
+}
+
+// OperatorCapacity mirrors PgStore.OperatorCapacity without exposing the
+// underlying app or instance rows. MemStore keeps the same placement and live
+// state semantics so operator endpoint tests exercise the production shape.
+func (m *MemStore) OperatorCapacity(_ context.Context) (OperatorCapacitySnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	byNode := make(map[string]int, len(m.computeNodes))
+	out := OperatorCapacitySnapshot{Nodes: make([]OperatorCapacityNode, 0, len(m.computeNodes))}
+	for id, n := range m.computeNodes {
+		row := OperatorCapacityNode{
+			ID:                 n.ID,
+			Name:               n.Name,
+			Active:             n.Active,
+			VPCPUs:             n.VPCPUs,
+			VCPUBudget:         n.VCPUBudget,
+			MemMB:              n.MemMB,
+			AdmissionCeilingMB: n.AdmissionCeilingMB,
+		}
+		if row.ID == "" {
+			row.ID = id
+		}
+		out.Nodes = append(out.Nodes, row)
+		byNode[row.ID] = len(out.Nodes) - 1
+	}
+
+	tenantIDs := make(map[string]struct{})
+	for _, app := range m.apps {
+		if app.Status == AppDeleted {
+			continue
+		}
+		out.AppsTotal++
+		tenantIDs[app.AccountID] = struct{}{}
+		if app.NodeID == "" {
+			out.UnplacedApps++
+			continue
+		}
+		if nodeIndex, ok := byNode[app.NodeID]; ok {
+			out.Nodes[nodeIndex].AppsCount++
+			// A node-local set is not needed: each app contributes once
+			// to its owner's tenant count in the placement projection.
+		}
+	}
+	out.TenantsTotal = int64(len(tenantIDs))
+
+	// Recount per-node tenant placements exactly, matching COUNT(DISTINCT
+	// account_id) in the SQL projection.
+	tenantsByNode := make(map[string]map[string]struct{})
+	for _, app := range m.apps {
+		if app.Status == AppDeleted || app.NodeID == "" {
+			continue
+		}
+		if _, ok := byNode[app.NodeID]; !ok {
+			continue
+		}
+		set := tenantsByNode[app.NodeID]
+		if set == nil {
+			set = make(map[string]struct{})
+			tenantsByNode[app.NodeID] = set
+		}
+		set[app.AccountID] = struct{}{}
+	}
+	for nodeID, set := range tenantsByNode {
+		out.Nodes[byNode[nodeID]].TenantsCount = int64(len(set))
+	}
+
+	for _, inst := range m.instances {
+		if !isInstanceStateLive(inst.State) || inst.NodeID == "" {
+			continue
+		}
+		nodeIndex, ok := byNode[inst.NodeID]
+		if !ok {
+			continue
+		}
+		node := &out.Nodes[nodeIndex]
+		node.InstancesLive++
+		switch inst.State {
+		case instanceStateRunning:
+			node.InstancesRunning++
+		case instanceStateWaking:
+			node.InstancesWaking++
+		case instanceStateColdBooting:
+			node.InstancesColdBooting++
+		}
+		node.RAMUsedMB += int64(inst.RAMMB) + 8
+	}
+	sort.Slice(out.Nodes, func(i, j int) bool {
+		if out.Nodes[i].Active != out.Nodes[j].Active {
+			return out.Nodes[i].Active
+		}
+		return out.Nodes[i].Name < out.Nodes[j].Name
+	})
 	return out, nil
 }
 
@@ -8667,6 +9062,12 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 	if limit <= 0 {
 		limit = 100
 	}
+	// OperatorOnly takes precedence over KindPrefix at the SQL
+	// layer (pgstore) and is mirrored here for shape parity.
+	kindPrefix := filter.KindPrefix
+	if filter.OperatorOnly {
+		kindPrefix = "operator.action."
+	}
 	var out []AuditLog
 	for i := len(m.auditLog) - 1; i >= 0; i-- {
 		row := m.auditLog[i]
@@ -8675,7 +9076,7 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 				continue
 			}
 		}
-		if filter.KindPrefix != "" && !strings.HasPrefix(row.Kind, filter.KindPrefix) {
+		if kindPrefix != "" && !strings.HasPrefix(row.Kind, kindPrefix) {
 			continue
 		}
 		if !filter.Since.IsZero() && row.ReceivedAt.Before(filter.Since) {
@@ -8683,6 +9084,18 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 		}
 		if !filter.IncludeAnonymous && row.AccountID == nil {
 			continue
+		}
+		if filter.ActorEmail != nil && row.AccountEmail != *filter.ActorEmail {
+			continue
+		}
+		if filter.TargetAccountID != nil {
+			// data @> jsonb_build_object('target_account_id', $N)
+			// semantic — the data JSON must contain the key with
+			// the requested value. We decode row.Data on the
+			// in-memory path; the pgstore path is index-driven.
+			if !auditLogDataHasKey(row.Data, "target_account_id", *filter.TargetAccountID) {
+				continue
+			}
 		}
 		// Defensive copy so the caller's slice doesn't alias the
 		// in-memory store row.
@@ -8696,6 +9109,30 @@ func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]Aud
 		}
 	}
 	return out, nil
+}
+
+// auditLogDataHasKey is the in-memory twin of the pgstore's
+// data @> jsonb_build_object(...) containment query. Returns true
+// when the JSONB-shaped row.Data contains the (key, value) pair.
+// Returns false on any parse error — a malformed data column is
+// treated as "doesn't contain the key", which is the same
+// behaviour the pgstore path has (the row is excluded from the
+// result set when its data->>'target_account_id' is null or
+// different).
+func auditLogDataHasKey(data json.RawMessage, key, want string) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return false
+	}
+	got, ok := m[key]
+	if !ok {
+		return false
+	}
+	s, ok := got.(string)
+	return ok && s == want
 }
 
 // ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the
@@ -11717,6 +12154,12 @@ func (m *MemStore) CreateEdgeRule(_ context.Context, in CreateEdgeRuleParams) (E
 		Enabled:      in.Enabled,
 		Kind:         in.Kind,
 		Action:       in.Action,
+		// ValidateMode: empty string coerces to 'block' on
+		// the pgstore side (col 00293 NOT NULL DEFAULT 'block')
+		// and at the gateway handler (handler.go:2694). The
+		// memstore keeps the verbatim value so the in-memory
+		// mirror is byte-stable with the pgstore round-trip.
+		ValidateMode: in.ValidateMode,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -11826,6 +12269,11 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 		Enabled:      in.Enabled,
 		Kind:         in.Kind,
 		Action:       in.Action,
+		// ValidateMode: same shape as CreateEdgeRule — empty
+		// string is preserved verbatim so the memstore mirror
+		// matches the pgstore's column-NULL fallback (00293's
+		// NOT NULL DEFAULT 'block' kicks in on the wire round-trip).
+		ValidateMode: in.ValidateMode,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -12233,6 +12681,15 @@ func (m *MemStore) UpdateEdgeRule(_ context.Context, id string, p UpdateEdgeRule
 	}
 	if p.Action != nil {
 		r.Action = *p.Action
+	}
+	// ValidateMode nil-skip mirrors the pgstore coalesce pattern.
+	// The wire layer (cmd/apid/handlers_edge_rules.go) coerces
+	// '' to 'block' before the request reaches here, so a
+	// non-nil empty string in UpdateEdgeRuleParams is a
+	// legitimate explicit-clear request that the pgstore collapses
+	// to 'block' via coalesce(nullif('', ''), validate_mode).
+	if p.ValidateMode != nil {
+		r.ValidateMode = *p.ValidateMode
 	}
 	r.UpdatedAt = time.Now()
 	m.edgeRules[id] = r

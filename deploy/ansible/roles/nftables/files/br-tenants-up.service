@@ -14,16 +14,10 @@ Before=nftables.service vmmd.service faas-cp.slice
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# `ip link add … type bridge` exits non-zero when the bridge already exists
-# (cold-boot's second start, re-run of `make bootstrap`); `ip addr add … dev
-# …` exits non-zero with "File exists" when the address is already present;
-# `ip link set … up` is idempotent and exit-0. systemd's Type=oneshot with
-# RemainAfterExit=yes treats the unit as "active" once the FIRST ExecStart
-# that returns 0 has run; later re-runs that hit the already-active path
-# succeed. Tested on Ubuntu 22.04 (the EX44 target) and the Lima guest.
-ExecStart=/usr/sbin/ip link add br-tenants type bridge
-ExecStart=/usr/sbin/ip addr add 10.100.0.1/16 dev br-tenants
-ExecStart=/usr/sbin/ip link set br-tenants up
+# The bridge and address may already exist after the Ansible role's runtime
+# tasks, a reboot, or a repeated bootstrap. Keep the whole oneshot idempotent
+# while still propagating genuine failures from the create/add operations.
+ExecStart=/bin/sh -ec '/usr/sbin/ip link show br-tenants >/dev/null 2>&1 || /usr/sbin/ip link add br-tenants type bridge; /usr/sbin/ip addr show dev br-tenants | /usr/bin/grep -q "inet 10.100.0.1/16" || /usr/sbin/ip addr add 10.100.0.1/16 dev br-tenants; /usr/sbin/ip link set br-tenants up'
 # Do NOT add a [Restart] section: a per-ExecStart failure here indicates a
 # genuinely broken network stack (e.g. the iproute2 module isn't loaded)
 # and should NOT silently retry; the operator must triage.

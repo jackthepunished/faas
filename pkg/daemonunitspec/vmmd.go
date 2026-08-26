@@ -60,8 +60,9 @@ func UnitVmmd() daemonunit.Unit {
 			`/usr/bin/chown root:faas /run/faas`,
 			`/usr/bin/chmod 0775 /run/faas`,
 		},
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice: "faas-cp.slice",
 

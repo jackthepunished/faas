@@ -219,3 +219,24 @@ func TestParsePerm_HappyPath(t *testing.T) {
 		})
 	}
 }
+
+func TestDoctorSecretModeAllowed(t *testing.T) {
+	tests := []struct {
+		name string
+		got  os.FileMode
+		want os.FileMode
+		ok   bool
+	}{
+		{name: "canonical group-readable", got: 0o440, want: 0o440, ok: true},
+		{name: "stricter root-only", got: 0o400, want: 0o440, ok: true},
+		{name: "world-readable drift", got: 0o444, want: 0o440, ok: false},
+		{name: "writable drift", got: 0o640, want: 0o440, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := doctorSecretModeAllowed(tt.got, tt.want); got != tt.ok {
+				t.Errorf("doctorSecretModeAllowed(%04o, %04o) = %v, want %v", tt.got, tt.want, got, tt.ok)
+			}
+		})
+	}
+}

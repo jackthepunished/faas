@@ -465,6 +465,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	ledger := sched.NewNodeLedger()
 	ops := wire.NewOpsMetrics("schedd")
+	wire.BootStamps(ctx, "schedd", ops)
+	wire.RegisterDefaultOps(ops)
 	// Dashboard gauges (spec §12): schedd owns the snapshots table and the
 	// admission ledger, so the four fcvm_* gauges live here, not in vmmd.
 	// The DashboardMetrics callbacks close over `store` (PG) and `ledger`
@@ -747,6 +749,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("schedd: listen %s: %w", listenTarget, err)
 	}
+	// Issue #571 PR-A2: /readyz probe (PG ping + gRPC bound).
+	// Probe construction is platform-portable — pool may be nil
+	// in unit tests that don't wire a real pgxpool; the probe
+	// short-circuits to "pg pool nil (test path)" in that case.
+	scheddProbe, scheddBound := BuildReadinessProbe(ctx, pool, 5*time.Second)
+	// NOTE: scheddBound.MarkBound() is intentionally NOT called
+	// here — see cmd/schedd/readiness.go for why. The flip must
+	// fire inside the serve goroutine, just before gsrv.Serve,
+	// so a panic during the ~465 lines of setup below cannot
+	// leave /readyz reporting ready while no gRPC server is
+	// actually running (PR #1091 review Finding 5).
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
@@ -766,6 +779,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// `curl /metrics` scrape returns the canonical schedd ops
 		// series; Prometheus hits both paths.
 		mux.Handle(metricsPath+"/fcvm", dashGauges.Handler())
+		// Issue #571 PR-A2: /healthz + /readyz on the metrics mux
+		// (operator-side, loopback-only). Source of truth is the
+		// same BuildReadinessProbe wired at the deps.listen site
+		// above — single source between /readyz body and the
+		// daemon_ready gauge (issue #586 / ADR-129).
+		wire.ControlMuxLite(mux, scheddProbe.ReadyFunc(), scheddProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
@@ -1205,6 +1224,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", scheddpb.Schedd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		scheddBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 

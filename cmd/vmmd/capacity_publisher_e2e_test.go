@@ -148,6 +148,26 @@ func (f *fakeSinkSchedAPI) DestroyForWorkloadOOMFailure(context.Context, string,
 	return nil
 }
 
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR, added in Commit 5a) — stub to satisfy the SchedAPI
+// interface; the capacity e2e tests never exercise the
+// ForceColdBootNextWake RPC path (that's exercised by the
+// scheddgrpc integration tests and the apid admin handler
+// round-trip). The capacity publisher never sends this RPC.
+func (f *fakeSinkSchedAPI) ForceColdBootNextWake(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+// ForceRestart (P2d follow-on to PR #1099) — stub to satisfy
+// the SchedAPI interface; the capacity e2e tests never
+// exercise the ForceRestartInstance RPC path (same precedent
+// as ForceColdBootNextWake above). The capacity publisher
+// never sends this RPC. strictModeFakeSink inherits this
+// method via embedding.
+func (f *fakeSinkSchedAPI) ForceRestart(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+
 // bufconnStreamer is a capacityStreamer backed by a bufconn
 // dialer. Construct one with newBufconnStreamer(t) inside a
 // test and pass it to runCapacityPublishWithStreamer.

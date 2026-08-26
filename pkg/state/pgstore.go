@@ -6005,6 +6005,101 @@ func (s *PgStore) UpsertDeploymentSecretFindings(ctx context.Context, deployment
 	return nil
 }
 
+// RecordRestart (issue #586 / ADR-129 / cluster C commit 12)
+// bumps the persisted deployments.liveness_restart_count column
+// by 1 in a single statement. Mirrors
+// UpsertDeploymentSecretFindings' IDOR + idempotency contract:
+// scopes to one deployment row, returns ErrNotFound on a
+// missing row so a misuse fails closed. The CHECK constraint
+// (deployments_liveness_restart_count_nonneg_chk,
+// migrations/00411) rejects a negative bump at the SQL layer.
+// Called from pkg/sched/Engine alongside the in-memory
+// LivenessWindow.RecordRestart call so the column is the source
+// of truth across schedd restarts.
+func (s *PgStore) RecordRestart(ctx context.Context, deploymentID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set liveness_restart_count = liveness_restart_count + 1
+		  where id = $1`,
+		deploymentID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// InsertStatusIncident (issue #599 / ADR-130 / cluster D commit 14)
+// appends an open row to the status_incidents table. The CHECK
+// constraints on component + severity enforce the closed-set
+// vocabulary at the SQL layer so a typo at the CLI surface fails
+// closed (23514). The id is BIGSERIAL; we RETURN it for the CLI
+// to render ("incident <id> posted").
+func (s *PgStore) InsertStatusIncident(ctx context.Context, component, severity, message string) (StatusIncident, error) {
+	var inc StatusIncident
+	inc.Component = component
+	inc.Severity = severity
+	inc.Message = message
+	err := s.pool.QueryRow(ctx,
+		`insert into status_incidents (component, severity, message)
+		 values ($1, $2, $3)
+		 returning id, posted_at`,
+		component, severity, message,
+	).Scan(&inc.ID, &inc.PostedAt)
+	if err != nil {
+		return StatusIncident{}, err
+	}
+	return inc, nil
+}
+
+// ResolveStatusIncident (issue #599 / ADR-130) stamps resolved_at
+// on the row identified by id. Idempotent: a second call on an
+// already-resolved row returns nil so the CLI can re-issue a
+// resolve without surfacing 23514 / not-found. ErrNotFound when
+// the id doesn't exist.
+func (s *PgStore) ResolveStatusIncident(ctx context.Context, id int64) error {
+	tag, err := s.pool.Exec(ctx,
+		`update status_incidents
+		    set resolved_at = coalesce(resolved_at, now())
+		  where id = $1`,
+		id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListOpenStatusIncidents (issue #599 / ADR-130) reads the partial
+// index (status_incidents_open WHERE resolved_at IS NULL) sorted
+// by posted_at DESC. The /v1/internal/slo.json endpoint composes
+// its response from this list.
+func (s *PgStore) ListOpenStatusIncidents(ctx context.Context) ([]StatusIncident, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, component, severity, message, posted_at, resolved_at
+		   from status_incidents
+		  where resolved_at is null
+		  order by posted_at desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StatusIncident
+	for rows.Next() {
+		var inc StatusIncident
+		if err := rows.Scan(&inc.ID, &inc.Component, &inc.Severity,
+			&inc.Message, &inc.PostedAt, &inc.ResolvedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, inc)
+	}
+	return out, rows.Err()
+}
+
 // SetDeploymentSidecarLayer is the per-workload filesystem handle
 // for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
 // keyed by (deployment_id, sidecar_name). The whole row is
@@ -6365,6 +6460,24 @@ func (s *PgStore) SweepStuckRunningBuilds(ctx context.Context, threshold time.Ti
 		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// QueuedBuildsCount (operator-side observability mega-PR / Commit 7
+// — P5) returns the number of builds currently in 'queued' state
+// across the fleet. Per-node labeling is deferred (builds.target_node_id
+// is not yet a column — adding it is a follow-up migration per the
+// PR-open checklist). Today the gauge is a fleet-total; the operator
+// dashboard renders "X builds in the queue" without per-schedd
+// attribution. A partial index on builds(status='queued') keeps
+// this O(matches) instead of O(table).
+func (s *PgStore) QueuedBuildsCount(ctx context.Context) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from builds where status = 'queued'`,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count queued builds: %w", err)
+	}
+	return n, nil
 }
 
 // ClaimQueuedBuild atomically transitions queued → running via a single
@@ -7369,7 +7482,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 
 const edgeRuleSelectCols = `id, account_id, app_id, match_host, match_path,
        match_methods, priority, enabled, kind, action,
-       created_at, updated_at`
+       validate_mode, created_at, updated_at`
 
 // scanEdgeRule reads a single row. ErrNotFound on no-rows; raw error
 // otherwise. The kind column comes back as text; Action comes back
@@ -7417,7 +7530,7 @@ func scanEdgeRuleCols(scan func(...any) error) (EdgeRule, error) {
 	if err := scan(
 		&r.ID, &r.AccountID, &r.AppID, &r.MatchHost, &r.MatchPath,
 		&matchMethods, &r.Priority, &r.Enabled, &kind, &actionBytes,
-		&r.CreatedAt, &r.UpdatedAt,
+		&r.ValidateMode, &r.CreatedAt, &r.UpdatedAt,
 	); err != nil {
 		return EdgeRule{}, err
 	}
@@ -7445,14 +7558,23 @@ func (s *PgStore) CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (
 	row := s.pool.QueryRow(ctx, `
 		insert into edge_rules (
 			account_id, app_id, match_host, match_path,
-			match_methods, priority, enabled, kind, action
+			match_methods, priority, enabled, kind, action,
+			validate_mode
 		) values (
 			$1, $2, $3, $4,
-			$5, $6, $7, $8, $9::jsonb
+			$5, $6, $7, $8, $9::jsonb,
+			coalesce(nullif($10, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
 		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+		// $10: empty string is the apid-handler convention for
+		// "use the strictest mode"; coalesce turns it into
+		// 'block' per ADR-128. The SQL-side default at 00293
+		// would also fire on a column omission, but the explicit
+		// coalesce keeps the wire surface consistent with the
+		// empty-handler default at pkg/gateway/handler.go:2694.
+		in.ValidateMode,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {
@@ -7583,14 +7705,19 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 	row := tx.QueryRow(ctx, `
 		insert into edge_rules (
 			account_id, app_id, match_host, match_path,
-			match_methods, priority, enabled, kind, action
+			match_methods, priority, enabled, kind, action,
+			validate_mode
 		) values (
 			$1, $2, $3, $4,
-			$5, $6, $7, $8, $9::jsonb
+			$5, $6, $7, $8, $9::jsonb,
+			coalesce(nullif($10, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
 		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+		// $10: same empty-string→'block' coalesce as the un-capped
+		// CreateEdgeRule path (ADR-128).
+		in.ValidateMode,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {
@@ -8092,6 +8219,7 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		hostArg, pathArg any
 		methodsArg       any
 		actionArg        any
+		validateModeArg  any
 	)
 	if p.MatchHost != nil {
 		hostArg = *p.MatchHost
@@ -8109,6 +8237,17 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		}
 		actionArg = bytes
 	}
+	// ValidateMode nil-skip mirrors Action: a nil pointer means
+	// "do not touch the column". A non-nil empty string is a
+	// valid explicit-clear — coalesce(nullif(...)) will leave the
+	// existing value intact, which is what the customer expects
+	// from an empty-string request body. The wire surface
+	// (cmd/apid/handlers_edge_rules.go) coerces empty to 'block'
+	// before it reaches this layer per ADR-128 §D2's deprecation
+	// window contract.
+	if p.ValidateMode != nil {
+		validateModeArg = *p.ValidateMode
+	}
 
 	row := s.pool.QueryRow(ctx, `
 		update edge_rules set
@@ -8117,11 +8256,18 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			match_methods = coalesce($4, match_methods),
 			priority      = coalesce($5, priority),
 			enabled       = coalesce($6, enabled),
-			action        = case when $7 then $8::jsonb else action end
+			action        = case when $7 then $8::jsonb else action end,
+			validate_mode = coalesce(nullif($9, ''), validate_mode)
 		where id = $1
 		returning `+edgeRuleSelectCols,
 		id, hostArg, pathArg, methodsArg, p.Priority, p.Enabled,
 		p.Action != nil, actionArg,
+		// $9: nil-skip via coalesce (nil → keep existing).
+		// nullif('', '') collapses an explicit empty string
+		// to NULL too — same outcome. The wire layer coerces
+		// '' to 'block' before this point so the round-trip
+		// is observable in the response.
+		validateModeArg,
 	)
 	r, err := scanEdgeRule(row)
 	if err != nil {
@@ -10683,10 +10829,34 @@ func (s *PgStore) AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeI
 // handler renders it as "no data" with the rest of the
 // compute_nodes row intact).
 func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return s.latestHeartbeatStatsWhere(ctx, "")
+}
+
+// LatestBuilderHeartbeatStats (operator-side observability
+// mega-PR / Commit 7 — P5) returns the most-recent heartbeat
+// filtered to source='builder_tick'. The underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7 risk
+// list — builderd does not currently self-register a
+// compute_nodes row at startup. The mirror method exists today
+// so the GET /v1/admin/obs/builder-heartbeats endpoint can
+// land without waiting on the writer; once the writer is live,
+// the row count goes from zero to non-zero without an API change.
+func (s *PgStore) LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	return s.latestHeartbeatStatsWhere(ctx, "where source = 'builder_tick'")
+}
+
+// latestHeartbeatStatsWhere is the shared implementation for
+// the LatestHeartbeatStats / LatestBuilderHeartbeatStats twins.
+// The whereClause string is either empty (all sources) or a
+// bare `where source = '<name>'` clause — interpolated as a
+// literal here, NOT user input, so SQL injection is not a
+// concern; the two callers live in this file.
+func (s *PgStore) latestHeartbeatStatsWhere(ctx context.Context, whereClause string) ([]ComputeNodeHeartbeatStats, error) {
 	rows, err := s.pool.Query(ctx, `
 		select distinct on (node_id)
 		       node_id, received_at, cpu_pct_60s, disk_used_bytes
 		from compute_node_heartbeats
+		`+whereClause+`
 		order by node_id, received_at desc
 	`)
 	if err != nil {
@@ -10774,6 +10944,78 @@ func (s *PgStore) PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error) 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("state: iterate per-node live stats: %w", err)
+	}
+	return out, nil
+}
+
+// OperatorCapacity returns the fleet-wide capacity projection for the
+// operator console. The two CTEs aggregate live instances and placed apps
+// before joining to compute_nodes, which preserves rows for empty nodes and
+// avoids the O(instances) response allocation that a ListAllInstances-based
+// implementation would require.
+func (s *PgStore) OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error) {
+	rows, err := s.pool.Query(ctx, `
+		with live as (
+			select i.node_id,
+			       count(*) as instances_live,
+			       count(*) filter (where i.state = 'RUNNING') as instances_running,
+			       count(*) filter (where i.state = 'WAKING') as instances_waking,
+			       count(*) filter (where i.state = 'COLD_BOOTING') as instances_cold_booting,
+			       coalesce(sum(i.ram_mb + 8), 0)::bigint as ram_used_mb
+			  from instances i
+			 where i.state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+			 group by i.node_id
+		), placed as (
+			select a.node_id,
+			       count(*)::bigint as apps_count,
+			       count(distinct a.account_id)::bigint as tenants_count
+			  from apps a
+			 where a.status <> 'deleted' and a.node_id is not null
+			 group by a.node_id
+		)
+		select n.id, n.name, n.active, n.vpcpus, n.vcpu_budget, n.mem_mb,
+		       n.admission_ceiling_mb,
+		       coalesce(l.instances_live, 0)::bigint,
+		       coalesce(l.instances_running, 0)::bigint,
+		       coalesce(l.instances_waking, 0)::bigint,
+		       coalesce(l.instances_cold_booting, 0)::bigint,
+		       coalesce(l.ram_used_mb, 0)::bigint,
+		       coalesce(p.apps_count, 0)::bigint,
+		       coalesce(p.tenants_count, 0)::bigint
+		  from compute_nodes n
+		  left join live l on l.node_id = n.id
+		  left join placed p on p.node_id = n.id
+		 order by n.active desc, n.name asc
+	`)
+	if err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: operator capacity nodes: %w", err)
+	}
+	defer rows.Close()
+
+	out := OperatorCapacitySnapshot{Nodes: make([]OperatorCapacityNode, 0, 64)}
+	for rows.Next() {
+		var node OperatorCapacityNode
+		if err := rows.Scan(
+			&node.ID, &node.Name, &node.Active, &node.VPCPUs, &node.VCPUBudget,
+			&node.MemMB, &node.AdmissionCeilingMB, &node.InstancesLive,
+			&node.InstancesRunning, &node.InstancesWaking, &node.InstancesColdBooting,
+			&node.RAMUsedMB, &node.AppsCount, &node.TenantsCount,
+		); err != nil {
+			return OperatorCapacitySnapshot{}, fmt.Errorf("state: scan operator capacity node: %w", err)
+		}
+		out.Nodes = append(out.Nodes, node)
+	}
+	if err := rows.Err(); err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: iterate operator capacity nodes: %w", err)
+	}
+
+	if err := s.pool.QueryRow(ctx, `
+		select count(*) filter (where status <> 'deleted')::bigint,
+		       count(distinct account_id) filter (where status <> 'deleted')::bigint,
+		       count(*) filter (where status <> 'deleted' and node_id is null)::bigint
+		  from apps
+	`).Scan(&out.AppsTotal, &out.TenantsTotal, &out.UnplacedApps); err != nil {
+		return OperatorCapacitySnapshot{}, fmt.Errorf("state: operator capacity totals: %w", err)
 	}
 	return out, nil
 }
@@ -10973,7 +11215,8 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 
 // UpsertComputeNodeFromVmmd is the vmmd self-registration write
 // path (cmd/vmmd/register.go). Writes the vmmd-owned resource
-// numbers + re-activates the row. On conflict, target_url is
+// numbers but does not change the operator-controlled active bit.
+// On conflict, target_url is
 // PRESERVED — `coalesce(compute_nodes.target_url,
 // excluded.target_url)` keeps the existing operator-POSTed
 // value intact. The COALESCE handles the cold-INSERT case where
@@ -11045,7 +11288,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true,
+		      active              = compute_nodes.active,
 		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url),
 		      region              = coalesce(compute_nodes.region, excluded.region),
 		      zone                = coalesce(compute_nodes.zone, excluded.zone),
@@ -11510,6 +11753,41 @@ func (s *PgStore) LookupBootStartedForWakes(ctx context.Context, wakeIDs []strin
 		out[wakeID] = meta
 	}
 	return out, rows.Err()
+}
+
+// CountWakeBootStarted24h (per-app dashboard, Hobby+) returns the
+// count of wake.boot_started events the schedd recorded for the
+// given app in the trailing 24 hours. Hand-written raw-SQL path
+// — the sqlc-generated binding was deleted because it had the
+// wrong parameter shape (bound the whole jsonb row against a UUID
+// literal, which would always return 0). See the rationale
+// comment at pkg/state/queries.sql for the full story.
+//
+// Performance note: the (data->>'app_id')::uuid predicate is NOT
+// covered by the existing events_wake_id_idx jsonb expression
+// index (migration 00114 indexes data->>'wake_id', not app_id).
+// On a Scale-tier app with a large wake fleet the planner will
+// seq-scan the trailing-24h wake.boot_started rows and
+// re-evaluate the jsonb cast per row. The PR description's
+// "sub-second via the existing index" claim was therefore wrong;
+// a follow-up migration adding a covering index on
+// (data->>'app_id', at) is tracked separately. Returns 0 on an
+// empty app, a degraded store call, or when the events table
+// predates the post-ADR-123 schema (pre-ADR-123 boot_started
+// rows carry no app_id field, so the cast returns NULL which
+// COUNT(*) coerces to 0 — same posture as the wake-timeline
+// view's `WakeCountWithMeta` denominator at
+// cmd/apid/handlers_dashboard.go:2659).
+func (s *PgStore) CountWakeBootStarted24h(ctx context.Context, appID string) (int64, error) {
+	const q = `SELECT COUNT(*) FROM events
+WHERE kind = 'wake.boot_started'
+  AND (data->>'app_id')::uuid = $1::uuid
+  AND at >= now() - interval '24 hours'`
+	var n int64
+	if err := s.pool.QueryRow(ctx, q, appID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountWakeBootStarted24h: %w", err)
+	}
+	return n, nil
 }
 
 // ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
@@ -14341,6 +14619,7 @@ const deploymentSelectColumnsWithRootfs = `
 	min_instances,
 	scan_result, scan_status, scanned_at,
 	secret_findings, secret_scanned_at,
+	liveness_restart_count,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
 	scope,
@@ -14381,6 +14660,7 @@ const deploymentSelectColumnsQualified = `
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
 	d.secret_findings, d.secret_scanned_at,
+	d.liveness_restart_count,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
 	d.scope,
@@ -14470,6 +14750,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
 		&d.SecretFindings, &d.SecretScannedAt,
+		&d.LivenessRestartCount,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope,
 		&d.StageState,
@@ -17470,6 +17751,27 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 		sinceParam = nil
 	}
 
+	// OperatorOnly takes precedence over KindPrefix at the SQL
+	// layer: it forces kind like 'operator.action.%'. The
+	// handler layer enforces mutual exclusivity (returns 400
+	// when both are set); the SQL is defensive — a stray
+	// KindPrefix with OperatorOnly=true would be ignored.
+	kindPrefix := filter.KindPrefix
+	if filter.OperatorOnly {
+		kindPrefix = "operator.action."
+	}
+
+	// Build the actor_email + target_account_id params. Both are
+	// optional; the SQL uses ($N::text is null or ...) so an
+	// empty pointer is a no-op.
+	var actorEmailParam, targetAccountIDParam interface{}
+	if filter.ActorEmail != nil {
+		actorEmailParam = *filter.ActorEmail
+	}
+	if filter.TargetAccountID != nil {
+		targetAccountIDParam = *filter.TargetAccountID
+	}
+
 	rows, err := s.pool.Query(ctx,
 		`select id, kind, account_id, account_email, actor, received_at, data
 		   from audit_log
@@ -17477,12 +17779,16 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 		    and ($2 = '' or kind like $2 || '%')
 		    and ($3::timestamptz is null or received_at >= $3::timestamptz)
 		    and ($4::bool or account_id is not null)
+		    and ($5::text is null or account_email = $5::text)
+		    and ($6::text is null or data @> jsonb_build_object('target_account_id', $6::text))
 		  order by received_at desc, id desc
-		  limit $5`,
+		  limit $7`,
 		filter.AccountID,
-		filter.KindPrefix,
+		kindPrefix,
 		sinceParam,
 		filter.IncludeAnonymous,
+		actorEmailParam,
+		targetAccountIDParam,
 		limit,
 	)
 	if err != nil {

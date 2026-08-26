@@ -1,4 +1,7 @@
-# xfs (spec §8) — verify prjquota on /srv/fc and ensure /srv/fc/jail tmpfs.
+# xfs (spec §8) — converge and verify the fast-root filesystem, then
+# ensure /srv/fc/jail is a tmpfs. A supplied blank device is formatted
+# only with explicit operator consent; without a device this role never
+# guesses which disk is safe to touch.
 #
 # Spec §8: the FC-root filesystem MUST have `prjquota` enabled so we
 # can bill per-tenant disk without per-customer LVs. The jailer tmpfs
@@ -6,44 +9,187 @@
 # there by mistake disappears on reboot and eats RAM until then").
 # We size it 12 GB — well below the tenant budget on a single box.
 #
-# Disabled-by-default: the prjquota check is gated on /srv/fc existing
-# with a non-tmpfs fs (it ships from installimage on a real EX44; on
-# Hetzner cloud vms used for CI tests there is no /srv/fc). We use a
-# fact + assert pattern instead of conditionals to stay declarative.
+- name: xfs — validate the requested storage device path
+  ansible.builtin.stat:
+    path: "{{ faas_storage_device }}"
+  register: faas_storage_device_stat
+  when: (faas_storage_device | default('') | trim) != ''
 
-- name: xfs — gather mount facts
-  ansible.builtin.setup:
-    filter: ansible_mounts
-  when: false  # ansible.setup already ran via gather_facts
-
-- name: xfs — read /proc/mounts
-  ansible.builtin.slurp:
-    src: /proc/mounts
-  register: mounts_blob
-  changed_when: false
-  check_mode: false
-
-- name: xfs — extract mount rows from blob
-  ansible.builtin.set_fact:
-    mounts_text: "{{ mounts_blob.content | b64decode }}"
-
-- name: xfs — assert /srv/fc rootfs has prjquota (when /srv/fc is a real fs)
+- name: xfs — require the requested storage device to be a block device
   ansible.builtin.assert:
     that:
-      - >-
-        (mounts_text | regex_search('(?m)^[^ ]+ /srv/fc [^ ]+ [^ ]+.*prjquota')) is not none
+      - faas_storage_device_stat.stat.exists
+      - faas_storage_device_stat.stat.isblkdev | default(false)
     fail_msg: >-
-      /srv/fc must be mounted with `prjquota`. Re-image with the
-      installimage config (spec §8); enabling prjquota on an existing
-      XFS is destructive.
-    success_msg: "/srv/fc has prjquota"
-  # Folded scalar, not an inline value: the expression opens with a
-  # double-quoted "/srv/fc", so YAML read it as a quoted scalar and then
-  # choked on the rest of the line. It mixes both quote styles, so neither
-  # outer quoting works — a block scalar is the only clean form.
-  when: >-
-    (mounts_text | regex_search('(?m)^[^ ]+ /srv/fc [^ ]+')) is not none
-    and (mounts_text | regex_search('(?m)^[^ ]+ /srv/fc tmpfs ')) is none
+      faas_storage_device={{ faas_storage_device }} is not an existing block
+      device. Refusing to guess or format a path.
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — inspect the requested storage device filesystem
+  ansible.builtin.command:
+    argv: [blkid, -o, value, -s, TYPE, "{{ faas_storage_device }}"]
+  register: faas_storage_device_type
+  changed_when: false
+  failed_when: false
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — inspect whether the requested device is already mounted
+  ansible.builtin.command:
+    argv: [findmnt, -S, "{{ faas_storage_device }}", -n, -o, TARGET]
+  register: faas_storage_device_mount
+  changed_when: false
+  failed_when: false
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — require a blank device or an existing XFS filesystem
+  ansible.builtin.assert:
+    that:
+      - (faas_storage_device_type.stdout | trim) in ['', 'xfs']
+      - >-
+        (faas_storage_device_mount.stdout | default('') | trim) == '' or
+        (faas_storage_device_mount.stdout | default('') | trim) == faas_storage_mountpoint
+    fail_msg: >-
+      {{ faas_storage_device }} is already formatted or mounted with an
+      unsupported filesystem. The join pipeline only accepts XFS and never
+      reformats an existing filesystem.
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — require explicit consent before formatting a blank device
+  ansible.builtin.assert:
+    that:
+      - faas_storage_format | bool
+    fail_msg: >-
+      {{ faas_storage_device }} is blank. Re-run the join with
+      --format-storage (or set faas_storage_format=true) to explicitly allow
+      creating the production XFS fast-root filesystem.
+  when:
+    - (faas_storage_device | default('') | trim) != ''
+    - (faas_storage_device_type.stdout | default('') | trim) == ''
+
+- name: xfs — install xfsprogs before formatting a blank device
+  ansible.builtin.package:
+    name: xfsprogs
+    state: present
+  when:
+    - (faas_storage_device | default('') | trim) != ''
+    - (faas_storage_device_type.stdout | default('') | trim) == ''
+    - faas_storage_format | bool
+
+- name: xfs — format the explicitly approved blank device
+  ansible.builtin.command:
+    argv: [mkfs.xfs, -m, reflink=1, "{{ faas_storage_device }}"]
+  register: faas_storage_mkfs
+  when:
+    - (faas_storage_device | default('') | trim) != ''
+    - (faas_storage_device_type.stdout | default('') | trim) == ''
+    - faas_storage_format | bool
+
+- name: xfs — read the fast-root filesystem UUID
+  ansible.builtin.command:
+    argv: [blkid, -o, value, -s, UUID, "{{ faas_storage_device }}"]
+  register: faas_storage_device_uuid
+  changed_when: false
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — require a filesystem UUID for the managed mount
+  ansible.builtin.assert:
+    that:
+      - (faas_storage_device_uuid.stdout | trim) | length > 0
+    fail_msg: "Could not read a UUID from {{ faas_storage_device }}. Refusing to write fstab."
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — ensure fast-root mountpoint exists
+  ansible.builtin.file:
+    path: "{{ faas_storage_mountpoint }}"
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
+- name: xfs — persist the provider-neutral fast-root mount
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^UUID={{ faas_storage_device_uuid.stdout | trim | regex_escape }}\s+{{ faas_storage_mountpoint | regex_escape }}\s'
+    line: "UUID={{ faas_storage_device_uuid.stdout | trim }} {{ faas_storage_mountpoint }} xfs {{ faas_storage_mount_options }} 0 2"
+    state: present
+    create: false
+  when: (faas_storage_device | default('') | trim) != ''
+
+- name: xfs — read current fast-root mount target before mounting
+  ansible.builtin.command:
+    argv: [findmnt, -T, "{{ faas_storage_mountpoint }}", -n, -o, TARGET]
+  register: faas_storage_pre_mount_target
+  changed_when: false
+  failed_when: false
+
+- name: xfs — mount the managed fast-root filesystem
+  ansible.builtin.command:
+    argv: [mount, "{{ faas_storage_mountpoint }}"]
+  register: faas_storage_mount_result
+  changed_when: true
+  failed_when: >-
+    faas_storage_mount_result.rc != 0 and
+    'already mounted' not in ((faas_storage_mount_result.stdout | default('')) ~ (faas_storage_mount_result.stderr | default('')))
+  when:
+    - (faas_storage_device | default('') | trim) != ''
+    - (faas_storage_pre_mount_target.stdout | default('') | trim) != faas_storage_mountpoint
+
+- name: xfs — read the effective fast-root mount target
+  ansible.builtin.command:
+    argv: [findmnt, -T, "{{ faas_storage_mountpoint }}", -n, -o, TARGET]
+  register: faas_storage_mount_target
+  changed_when: false
+  failed_when: false
+
+- name: xfs — read the effective fast-root filesystem type
+  ansible.builtin.command:
+    argv: [findmnt, -T, "{{ faas_storage_mountpoint }}", -n, -o, FSTYPE]
+  register: faas_storage_mount_fstype
+  changed_when: false
+  failed_when: false
+
+- name: xfs — require a dedicated XFS fast-root mount
+  ansible.builtin.assert:
+    that:
+      - (faas_storage_mount_target.stdout | trim) == faas_storage_mountpoint
+      - (faas_storage_mount_fstype.stdout | trim) == 'xfs'
+    fail_msg: >-
+      {{ faas_storage_mountpoint }} must be its own XFS mount. Found target
+      {{ faas_storage_mount_target.stdout | trim | default('missing') }} with
+      filesystem {{ faas_storage_mount_fstype.stdout | trim | default('missing') }}.
+      Attach/provide a fast-root device and run the join again.
+
+- name: xfs — inspect XFS feature flags
+  ansible.builtin.command: xfs_info "{{ faas_storage_mountpoint }}"
+  register: faas_storage_xfs_info
+  changed_when: false
+  failed_when: false
+
+- name: xfs — require reflink support on the fast root
+  ansible.builtin.assert:
+    that:
+      - faas_storage_xfs_info.rc == 0
+      - not (faas_storage_require_reflink | bool) or 'reflink=1' in faas_storage_xfs_info.stdout
+    fail_msg: >-
+      {{ faas_storage_mountpoint }} is XFS but does not expose reflink=1.
+      Firecracker snapshot cloning requires an XFS filesystem created with
+      reflink support.
+
+- name: xfs — require project quotas on the fast root
+  ansible.builtin.command:
+    argv: [findmnt, -T, "{{ faas_storage_mountpoint }}", -n, -o, OPTIONS]
+  register: faas_storage_mount_options_effective
+  changed_when: false
+  failed_when: false
+
+- name: xfs — assert project quotas are enabled
+  ansible.builtin.assert:
+    that:
+      - "'prjquota' in faas_storage_mount_options_effective.stdout"
+    fail_msg: >-
+      {{ faas_storage_mountpoint }} must be mounted with prjquota. Add the
+      managed mount options or re-mount the existing XFS filesystem before
+      retrying the join.
 
 - name: xfs — ensure /srv/fc/jail directory (1700 perms per Gotchas)
   ansible.builtin.file:

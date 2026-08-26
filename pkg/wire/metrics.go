@@ -17,6 +17,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -140,6 +141,71 @@ type OpsMetrics struct {
 	// path issues. Cardinality bounds match livenessRestarts (per-app
 	// deployment count).
 	workloadOOMKills *prometheus.CounterVec
+	// daemonRestartCount (issue #573 / ADR-128) is the per-(daemon,
+	// version) counter that records how many times systemd has
+	// restarted THIS process in its lifetime. The producer is the
+	// wire.Daemon() boot path, which reads the
+	// $SYSTEMD_RESTARTS_ON_FAILURE env var (set by the systemd unit
+	// Restart=on-failure + RestartCountExport logic) and calls
+	// RecordDaemonRestart(name, Version) once at startup. The
+	// counter's purpose is to backstop node_exporter's
+	// node_systemd_restart_count{name=~"faas-.*\\.service"} metric
+	// in environments where the systemd collector isn't running
+	// (operator disabled --collector.systemd, or scrape is broken) —
+	// the alert rules in faas.rules.yml (FaasRestartLoop /
+	// FaasRepeatedRestart) prefer the node_exporter metric but
+	// fall back to daemon_restart_count{daemon} with a longer
+	// for-window. Labels are bounded by the closed daemon set
+	// (apid, gatewayd-public, gatewayd-internal, schedd, vmmd,
+	// imaged, meterd, builderd, gregale) × the wire.Version
+	// string, so the cartesian is pre-instantiated at boot to
+	// surface zero rows from idle.
+	daemonRestartCount *prometheus.CounterVec
+	// daemonBuildInfo (issue #586 / ADR-129) is the per-(daemon,
+	// version, git_sha, build_time) gauge that exposes the
+	// identity of the running binary. Always 1 (the gauge's value
+	// is meaningless — the labels carry the signal). Operator
+	// dashboards query this metric for the "Daemon versions
+	// fleet-wide" heatmap panel. The label set is bounded at 9
+	// daemon names × the wire.Version × git_sha × build_time
+	// cartesian, but in practice git_sha and build_time are
+	// constant per binary so the realistic cardinality is 9 (one
+	// row per daemon, all sharing the same version+git_sha
+	// tuple). Pre-instantiated at boot — see SetDaemonBuildInfo.
+	daemonBuildInfo *prometheus.GaugeVec
+	// daemonUptimeSeconds (issue #586 / ADR-129) is the per-daemon
+	// gauge that exposes process uptime in seconds. Updated every
+	// 1s by a goroutine spawned from wire.Daemon() (see
+	// recordUptime for the contract). The gauge is set, not
+	// accumulated, so a daemon restart drops the value to a
+	// small number and operators can read the value directly as
+	// "seconds since this process started". Pre-instantiated at
+	// the closed daemon set with an initial 0.
+	daemonUptimeSeconds *prometheus.GaugeVec
+	// daemonReady (issue #586 / ADR-129) is the per-daemon gauge
+	// that flips 0 → 1 when the daemon has completed all
+	// initialization (TLS handshake, DB pool warm-up, listener
+	// open) and is serving traffic. Until the daemon's run
+	// function signals readiness (via MarkReady, see issue #571
+	// for the /readyz implementation), the gauge reads 0.
+	// Pre-instantiated at 0 for every daemon so the §12
+	// dashboard's "Fleet readiness" panel surfaces a zero row
+	// from boot. MarkReady(id) flips to 1.
+	daemonReady *prometheus.GaugeVec
+	// faasDeployVersion (issue #586 / ADR-129 / cluster C commit 11)
+	// is the per-version gauge that exposes the platform's
+	// current release identifier. Single-version by design —
+	// every daemon in a single release reports the same value,
+	// so the cartesian has at most N rows for the last N
+	// releases (operators compare across versions during a
+	// rolling deploy). The label is `version` (mirrors
+	// daemonBuildInfo's convention); the gauge value is always
+	// 1 and the label carries the signal. Pre-instantiated at
+	// boot from the current wire.Version so /metrics surfaces
+	// the release from process start without a SetDeployVersion
+	// call. SetDeployVersion(v) re-stamps on version change
+	// (rolling deploy, hot-reload).
+	faasDeployVersion *prometheus.GaugeVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -233,6 +299,22 @@ type OpsMetrics struct {
 	// primitive and is held only across the lookup/insert path.
 	// Prometheus increments happen outside the critical section.
 	boxLabels *boxLabelSet
+	// appLabels: the bounded admission set that backs the
+	// app-labelled metrics on OpsMetrics (issue #1059 / ADR-127
+	// §3.5 deferred work). Same shape and contract as boxLabels /
+	// accountLabels / ipLabels (fixed-capacity, non-evicting,
+	// __other__ collapse via otherAppLabel) but a distinct type
+	// so the four sets do not share capacity. The cap is
+	// maxAppLabelValues (256) — sized for the Scale plan budget
+	// (100 deployed apps) plus Tier A multi-region fan-out
+	// headroom. The reserved "" label surfaces a missing-app-slug
+	// path (a hook site fired before app_id was resolved) distinctly
+	// from a real app slug that hit the admission cap (which
+	// collapses to otherAppLabel). Constructed once per OpsMetrics
+	// in NewOpsMetrics; the mutex is the only synchronisation
+	// primitive and is held only across the lookup/insert path.
+	// Prometheus increments happen outside the critical section.
+	appLabels *appLabelSet
 	// guestTailSeconds (issue #667 / ADR-078) — histogram of the
 	// per-tail-task wall-clock duration from registration (a
 	// waitUntil(promise) call inside the handler) to terminal
@@ -381,6 +463,26 @@ type OpsMetrics struct {
 	// faas_apid_error_rate_5m, _3d_baseline, _ratio) read from
 	// one counter.
 	requestTotal *prometheus.CounterVec
+	// cveCheckTotal (issue #601 / ADR-131) is the per-CVE-check-run
+	// counter the meterd scraper pushes from the .github/workflows/
+	// cve-check.yml nightly artifact. Labelled by {result, severity}
+	// where result ∈ {pass, fail, new_cve} (the three terminal
+	// states of a run) and severity ∈ {low, medium, high, critical}
+	// (the four severities the workflow filters). Pre-instantiated
+	// at the 12-cartesian (3 results × 4 severities) so dashboards
+	// render from boot. The Prometheus alert FaasNewCve reads the
+	// `result="new_cve"` rows to page on a fresh CVE ≥ medium.
+	cveCheckTotal *prometheus.CounterVec
+	// cvesOpenTotal (issue #601 / ADR-131) is the per-(severity,
+	// dep) gauge the cve-check workflow pushes from grype's filtered
+	// output. dep is the package name + version (e.g.
+	// "libssl@1.1.1k-7"); severity is the closed-set vocabulary
+	// above. The dep label cardinality is bounded by the package
+	// list — single-digit thousands at worst, well under the
+	// Prometheus guideline. Recorded alongside cveCheckTotal so the
+	// §12 dashboard's "Open CVEs by severity" stack panel reads
+	// from one metric.
+	cvesOpenTotal *prometheus.GaugeVec
 	// appErrorsRecorded (ADR-096) — counter the gatewayd-internal
 	// recorder (cmd/gatewayd-internal/app_errors_recorder.go) and
 	// the apid gRPC handler (cmd/apid/grpc_server_apperrors.go)
@@ -1478,6 +1580,65 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of workload OOM-kill detections on the customer's per-VM cgroup v2 leaf (Cluster C / ADR-121), labelled by (app, deployment). The producer chain is guest-init cgroup.events listener → vsock DGRAM type 0x05 → Manager.ReportWorkloadOOM → Engine.DestroyForWorkloadOOMFailure. The dashboard panel pairs this with liveness_restarts_total to distinguish 'healthz is bad' (liveness) from 'RAM cap is too low' (workload OOM). Per-deployment cardinality is bounded by the plan's deployed_apps cap (same as livenessRestarts).",
 	}, []string{"app", "deployment"})
 	workloadOOMKills.WithLabelValues("other", "other")
+	// Issue #573 / ADR-128: per-(daemon, version) restart counter.
+	// Closed daemon set mirrors the cmd/ tree (Tier A7 split kept
+	// gatewayd-public and gatewayd-internal as distinct units per
+	// ADR-070). The version label is the current wire.Version —
+	// the pre-instantiation runs once per NewOpsMetrics call so
+	// each daemon exposes its own (daemon, thisVersion) row from
+	// boot, plus an "other" overflow row for any daemon name we
+	// might add later (defensive — operator shouldn't see this in
+	// the closed set, but the pre-instantiation guarantees the
+	// label set renders even before the first RecordDaemonRestart
+	// call).
+	daemonRestartCount := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_daemon_restart_count",
+		Help: "Count of systemd-driven restarts of THIS daemon process (issue #573 / ADR-128), labelled by (daemon, version). Producer is wire.Daemon() reading $SYSTEMD_RESTARTS_ON_FAILURE at boot; alert rules prefer node_exporter's node_systemd_restart_count{name=~'faas-.*\\.service'} when the systemd collector is enabled (commit 6 of the cluster B mega-PR added --collector.systemd to the node_exporter unit). This counter is the backstop for environments where the systemd collector is disabled. Closed daemon set: apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged, meterd, builderd, gregale.",
+	}, []string{"daemon", "version"})
+	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
+		daemonRestartCount.WithLabelValues(daemon, Version)
+	}
+	// Issue #586 / ADR-129: per-daemon build info + uptime + ready.
+	// Closed daemon set mirrors daemonRestartCount above (9 closed
+	// + "other" overflow = 10). Pre-instantiated with the
+	// current wire.Version, GitSHA, BuildTime so /metrics surfaces
+	// the daemon identity from boot — the operator dashboard
+	// "Daemon versions fleet-wide" panel renders a non-empty
+	// row immediately after the daemon starts, not after the
+	// first SetDaemonBuildInfo call (which only happens on the
+	// ready line). Uptime starts at 0; the goroutine spawned
+	// by wire.Daemon() updates it every 1s. Ready starts at 0;
+	// wire.Daemon().MarkReady flips it to 1.
+	daemonBuildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_build_info",
+		Help: "Always-1 gauge that exposes the running binary's identity (issue #586 / ADR-129), labelled by (daemon, version, git_sha, build_time). The labels carry the signal — the gauge value is meaningless. Operator dashboards query this metric for the 'Daemon versions fleet-wide' heatmap panel. The closed daemon set (apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged, meterd, builderd, gregale) is pre-instantiated at boot so /metrics surfaces the identity from process start.",
+	}, []string{"daemon", "version", "git_sha", "build_time"})
+	daemonUptimeSeconds := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_uptime_seconds",
+		Help: "Process uptime in seconds (issue #586 / ADR-129), labelled by daemon. Updated every 1s by the wire.Daemon() boot goroutine. Operator dashboards query this for the 'Daemon uptime (1h)' timeseries panel. The closed daemon set is pre-instantiated at 0 so /metrics surfaces zero rows from idle.",
+	}, []string{"daemon"})
+	daemonReady := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_daemon_ready",
+		Help: "Readiness gauge (issue #586 / ADR-129 / issue #571 PR-A2), labelled by daemon. 0 = initializing / draining / not yet serving traffic; 1 = ready. wire.Daemon() flips the gauge to 1 after the run function blocks (the same source of truth the daemon's /readyz endpoint reads from; see pkg/wire/readiness.go). Operator dashboards query this for the 'Fleet readiness' panel.",
+	}, []string{"daemon"})
+	for _, daemon := range []string{"apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale", "other"} {
+		daemonBuildInfo.WithLabelValues(daemon, Version, GitSHA, BuildTime).Set(1)
+		daemonUptimeSeconds.WithLabelValues(daemon).Set(0)
+		daemonReady.WithLabelValues(daemon).Set(0)
+	}
+	// faasDeployVersion (issue #586 / ADR-129 / cluster C commit 11)
+	// is the platform-wide release identifier. Single label, `version`,
+	// so cardinality is bounded by the number of releases currently
+	// emitting metrics (one row per distinct version seen, well under
+	// the Prometheus tens-of-thousands guideline). Pre-instantiated at
+	// boot from wire.Version so /metrics surfaces the current release
+	// from process start without any SetDeployVersion call; SetDeployVersion
+	// re-stamps on version change (rolling deploy, hot-reload).
+	faasDeployVersion := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_faas_deploy_version",
+		Help: "Always-1 gauge that exposes the platform's current release identifier (issue #586 / ADR-129), labelled by version. One row per distinct version seen across the fleet — the gauge value is meaningless; the label carries the signal. Pre-instantiated at boot from wire.Version. Operator dashboards query this metric for the 'Releases fleet-wide' stat panel and to detect partial rollouts (a cluster with 2 versions visible is mid-rollout).",
+	}, []string{"version"})
+	faasDeployVersion.WithLabelValues(Version).Set(1)
 	// ADR-127 §D3 (Layer 7) — bridgeFramingTotal. Three closed
 	// label sets; pre-instantiate the full cross-product so the
 	// bridge-protection dashboard panel renders a zero row from
@@ -1546,6 +1707,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// cartesian — same precedent as warmSnapshotErrors above and
 	// writeRedirectTotal's outcome × auth_kind cross product.
 	wakeFailureReasons := []string{
+		// vmmd-side closed vocab (issue #1059 / ADR-127). The
+		// classifier at pkg/fcvm/wake_classify.go maps every
+		// vmmd wake-failure hook site to exactly one of these
+		// eight reasons.
 		"snapshot_stale",
 		"disk_full",
 		"jailer_fail",
@@ -1554,15 +1719,42 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"vsock_fail",
 		"snapshot_restore_err",
 		"mem_backend_err",
+		// schedd-side audit-reason strings (issue #1059 / ADR-127
+		// §3.6 — schedd parity, cluster A commit 3 of the
+		// platform-observability mega-PR). The schedd's Engine
+		// emits `vmm_boot_failed` from the vmm.Create{Restore,ColdBoot}
+		// RPC error branch and `record_runtime_failed` from the
+		// post-boot SetInstanceRuntime DB-write branch. Both
+		// literals come straight off the events.BootFailed.Reason
+		// field at pkg/sched/engine.go:2123 / :2194 — they are the
+		// existing audit-reason strings, the metric just gains a
+		// counter surface. schedd emits on its own
+		// schedd_wake_failure_total registry (single-registry per
+		// daemon); the cross-daemon reason union is intentional so
+		// dashboards can use a single legend across the fleet.
+		"vmm_boot_failed",
+		"record_runtime_failed",
 	}
 	wakeFailureBoxes := []string{labelLocal, otherBoxLabel}
+	// wakeFailureApps: the per-app pre-instantiation set (issue
+	// #1059 / ADR-127 §3.5). We pre-instantiate the RESERVED
+	// app labels (labelAppUnknown == "", otherAppLabel ==
+	// "__other__") so /metrics surfaces zero rows from an idle
+	// fleet, and rely on the appLabelSet admission (max
+	// maxAppLabelValues = 256) to admit real app slugs as wake
+	// failures land. The appLabel() accessor collapses overflow
+	// to otherAppLabel so the Prometheus TSDB series set stays
+	// bounded over the daemon's lifetime.
+	wakeFailureApps := []string{labelAppUnknown, otherAppLabel}
 	wakeFailure := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_failure_total",
-		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__) and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err}. The closed reason set is enforced by pkg/fcvm/wake_classify.go — every wake-failure site maps to exactly one reason. The box label is bounded by maxBoxLabelValues (64) and is set by the host; today it resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain).",
-	}, []string{"box", "reason"})
+		Help: "Count of wake failures (issue #1059 / ADR-127), labelled by box (admission-bounded, overflow collapses to __other__), app (admission-bounded, overflow collapses to __other__), and reason ∈ {snapshot_stale, disk_full, jailer_fail, netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err, mem_backend_err, vmm_boot_failed, record_runtime_failed}. The first 8 reasons are the vmmd-side closed vocabulary enforced by pkg/fcvm/wake_classify.go — every vmmd wake-failure hook site maps to exactly one of these. The last 2 reasons (vmm_boot_failed, record_runtime_failed) are schedd-side audit-reason strings emitted from the schedd's Engine wake-error branches at pkg/sched/engine.go:2123 / :2194 — cluster A commit 3 of the platform-observability mega-PR added schedd parity (ADR-127 §3.6). vmmd emits only the first 8; schedd emits only the last 2; the union is pre-instantiated in the constructor so /metrics surfaces zero rows from idle fleet regardless of which daemon hosts the registry. The box label is bounded by maxBoxLabelValues (64) and resolves to \"local\" until the Tier A multi-host rollout lands (ADR-062 / ADR-066 chain). The app label is bounded by maxAppLabelValues (256) and resolves to the call site's app identifier — empty input collapses to labelAppUnknown (\"\") to distinguish missing-app-slug calls from real app slugs that hit the admission cap (which collapse to otherAppLabel).",
+	}, []string{"box", "app", "reason"})
 	for _, box := range wakeFailureBoxes {
-		for _, reason := range wakeFailureReasons {
-			wakeFailure.WithLabelValues(box, reason)
+		for _, app := range wakeFailureApps {
+			for _, reason := range wakeFailureReasons {
+				wakeFailure.WithLabelValues(box, app, reason)
+			}
 		}
 	}
 	// wakeLatency (issue #1059 / ADR-127) — see OpsMetrics.wakeLatency
@@ -1862,6 +2054,23 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_request_total",
 		Help: "HTTP requests completed, labelled by account_id, route, and code (issue #303, ADR-039). The counter is the per-request total — paired with requestFailures (status >= 400 only) for the per-account error-rate view. account_id flows through the same accountLabelSet as requestFailures so a customer is represented by their real id in both, or by \"__other__\" in both. code ∈ {ok, err} (ok on 2xx/3xx, err on 4xx/5xx). route is r.Pattern or \"unmatched\". Backed by the §12 traffic-anomaly recording rules (faas_apid_request_rate_5m, _3d_baseline, _ratio).",
 	}, []string{"account_id", "route", "code"})
+	// Issue #601 / ADR-131: CVE-vs-SBOM check + open CVE counters
+	// pushed from the cve-check workflow via meterd. Closed-set
+	// pre-instantiation (12 rows for cveCheckTotal; severity × 0
+	// dep rows for cvesOpenTotal).
+	cveCheckTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_cve_check_total",
+		Help: "Per-CVE-check-run counter (issue #601 / ADR-131), labelled by result ∈ {pass, fail, new_cve} and severity ∈ {low, medium, high, critical}. Pushed by meterd from the .github/workflows/cve-check.yml artifact. Pre-instantiated at the 12-cartesian so dashboards render from boot. The Prometheus alert FaasNewCve reads result=\"new_cve\" rows to page on a fresh CVE.",
+	}, []string{"result", "severity"})
+	cvesOpenTotal := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_cves_open",
+		Help: "Per-(severity, dep) gauge (issue #601 / ADR-131) that exposes the currently-open CVE list. Pushed by meterd from grype's filtered output. severity is the closed-set vocabulary; dep is the package name + version (single-digit thousands at worst). The §12 dashboard's 'Open CVEs by severity' stack panel reads from this metric.",
+	}, []string{"severity", "dep"})
+	for _, result := range []string{"pass", "fail", "new_cve"} {
+		for _, sev := range []string{"low", "medium", "high", "critical"} {
+			cveCheckTotal.WithLabelValues(result, sev)
+		}
+	}
 	// Reserved label values: anonymous for unauthenticated traffic,
 	// __other__ for the bounded overflow. Both are admitted at boot
 	// without consuming capacity, and both are always re-admitted on
@@ -2410,7 +2619,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
@@ -3203,6 +3412,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		writeRedirectLatency:                 writeRedirectLatency,
 		livenessRestarts:                     livenessRestarts,
 		workloadOOMKills:                     workloadOOMKills,
+		daemonRestartCount:                   daemonRestartCount,
+		daemonBuildInfo:                      daemonBuildInfo,
+		daemonUptimeSeconds:                  daemonUptimeSeconds,
+		daemonReady:                          daemonReady,
+		faasDeployVersion:                    faasDeployVersion,
 		bridgeFramingTotal:                   bridgeFramingTotal,
 		guestInitDuration:                    guestInitDuration,
 		wakeRPCDuration:                      wakeRPCDuration,
@@ -3212,6 +3426,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		wakeFailure:                          wakeFailure,
 		wakeLatency:                          wakeLatency,
 		boxLabels:                            newBoxLabelSet(maxBoxLabelValues),
+		appLabels:                            newAppLabelSet(maxAppLabelValues),
 		guestTailSeconds:                     guestTailSeconds,
 		guestTailFailedTotal:                 guestTailFailedTotal,
 		tailCapReached:                       tailCapReached,
@@ -3222,6 +3437,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		accountOrgMismatch:                   accountOrgMismatch,
 		requestFailures:                      requestFailures,
 		requestTotal:                         requestTotal,
+		cveCheckTotal:                        cveCheckTotal,
+		cvesOpenTotal:                        cvesOpenTotal,
 		appErrorsRecorded:                    appErrorsRecorded,
 		appErrorsFingerprintCacheHits:        appErrorsFingerprintCacheHits,
 		appErrorsDedupeMerges:                appErrorsDedupeMerges,
@@ -3402,6 +3619,166 @@ func (m *OpsMetrics) WorkloadOOMKills(app, deployment string) prometheus.Counter
 		deployment = labelUnknown
 	}
 	return m.workloadOOMKills.WithLabelValues(app, deployment)
+}
+
+// RecordDaemonRestart (issue #573 / ADR-128) records the systemd
+// restart count for the calling daemon. The wire.Daemon() boot
+// path reads $SYSTEMD_RESTARTS_ON_FAILURE (set by the systemd
+// unit's Restart=on-failure + RestartCountExport logic — see
+// deploy/ansible/roles/<daemon>/files/<daemon>.service) and calls
+// this accessor once at startup. Add(1) is called n-1 times where
+// n is the systemd restart count, so the counter ends at n minus
+// the increment at the boot immediately after — operators see
+// "this process is the Nth incarnation" rather than "N+1
+// increments happened across N processes". A "this process" read
+// is also what the FaasRestartLoop alert wants (it's wired off
+// the per-process delta).
+//
+// The daemon label is normalised through the closed set
+// (apid, gatewayd-public, gatewayd-internal, schedd, vmmd, imaged,
+// meterd, builderd, gregale) — anything else collapses to "other"
+// so the label cardinality stays bounded across the daemon's
+// lifetime. nil-receiver guard mirrors LivenessRestarts /
+// WorkloadOOMKills so unit tests without metrics keep working.
+func (m *OpsMetrics) RecordDaemonRestart(daemon, version string, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	if version == "" {
+		version = Version
+	}
+	m.daemonRestartCount.WithLabelValues(daemon, version).Add(float64(n - 1))
+}
+
+// SetDaemonBuildInfo (issue #586 / ADR-129) re-stamps the build
+// info gauge for a daemon. The constructor already pre-instantiates
+// every (daemon, thisVersion, thisGitSHA, thisBuildTime) row with
+// value=1, so this accessor is only useful when the daemon's
+// identity changes mid-process (e.g. a hot-reload that re-reads
+// ldflags-injected values, or a /v1/internal/reload-build-info
+// handler that's out of scope here). nil-receiver guard mirrors
+// RecordDaemonRestart so unit tests without metrics keep working.
+func (m *OpsMetrics) SetDaemonBuildInfo(daemon, version, gitSHA, buildTime string) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	if version == "" {
+		version = Version
+	}
+	if gitSHA == "" {
+		gitSHA = GitSHA
+	}
+	m.daemonBuildInfo.WithLabelValues(daemon, version, gitSHA, buildTime).Set(1)
+}
+
+// SetDaemonUptime (issue #586 / ADR-129) updates the per-daemon
+// uptime gauge. Called once per second by the goroutine spawned
+// from wire.Daemon() (see recordUptime). nil-receiver guard
+// mirrors RecordDaemonRestart.
+func (m *OpsMetrics) SetDaemonUptime(daemon string, seconds float64) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	m.daemonUptimeSeconds.WithLabelValues(daemon).Set(seconds)
+}
+
+// MarkReady (issue #586 / ADR-129 / issue #571 PR-A2) flips the
+// per-daemon readiness gauge. Called by wire.Daemon() at boot
+// (ready=true) and again by RunAndShutdown on ctx.Done()
+// (ready=false, "draining"). Called directly by the daemon-side
+// readiness probes (pkg/wire/readiness.go, commit 2) when their
+// signals flip — single source of truth between the /readyz body
+// and the daemon_ready gauge.
+//
+// reason is captured for human triage (operator can pair the
+// reason string with the gauge value in journalctl) but is NOT
+// surfaced as a Prometheus label — adding a reason label would
+// inflate cardinality (one row per unique reason string per
+// daemon). Pass "" when there is no human-readable reason to
+// surface; pass "draining" / "pg ping failed: ..." / etc. when
+// the operator can act on it.
+//
+// nil-receiver guard mirrors RecordDaemonRestart.
+func (m *OpsMetrics) MarkReady(daemon string, ready bool, reason string) {
+	if m == nil {
+		return
+	}
+	switch daemon {
+	case "apid", "gatewayd-public", "gatewayd-internal", "schedd", "vmmd", "imaged", "meterd", "builderd", "gregale":
+		// closed set, admit unchanged
+	default:
+		daemon = "other"
+	}
+	v := 0
+	if ready {
+		v = 1
+	}
+	m.daemonReady.WithLabelValues(daemon).Set(float64(v))
+}
+
+// SetDeployVersion (issue #586 / ADR-129) stamps the platform-wide
+// release identifier gauge. Called once by wire.Daemon() at boot from
+// wire.Version; the constructor pre-instantiates the row at the same
+// value, so this Set is idempotent and covers the edge case where
+// ldflags inject a different value mid-process (rolling deploy, hot
+// reload of a sidecar). The label is `version` — free-form text
+// matching wire.Version verbatim (typically "v1.2.3-<sha>"). nil-receiver
+// guard mirrors MarkReady.
+func (m *OpsMetrics) SetDeployVersion(version string) {
+	if m == nil {
+		return
+	}
+	if version == "" {
+		version = Version
+	}
+	m.faasDeployVersion.WithLabelValues(version).Set(1)
+}
+
+// RecordCVECheck (issue #601 / ADR-131 / cluster D commit 13 of
+// the platform-observability mega-PR) increments the per-run
+// CVE-check counter. Called by meterd when it scrapes the
+// .github/workflows/cve-check.yml artifact. The closed-set
+// labels (result, severity) are pre-instantiated in the
+// constructor; RecordCVECheck accepts any string but Prometheus's
+// WithLabelValues caches on first call so an out-of-vocabulary
+// call is just a one-time cardinality bump. nil-receiver guard
+// mirrors SetDeployVersion.
+func (m *OpsMetrics) RecordCVECheck(result, severity string) {
+	if m == nil {
+		return
+	}
+	m.cveCheckTotal.WithLabelValues(result, severity).Inc()
+}
+
+// IncCVEOpen (issue #601 / ADR-131) sets the per-(severity, dep)
+// open-CVE gauge. Called by meterd from grype's filtered
+// output. The dep label is unbounded by design (every package
+// has a row) but bounded in practice by the dependency tree
+// size — single-digit thousands at worst. nil-receiver guard
+// mirrors RecordCVECheck.
+func (m *OpsMetrics) IncCVEOpen(severity, dep string, count float64) {
+	if m == nil {
+		return
+	}
+	m.cvesOpenTotal.WithLabelValues(severity, dep).Set(count)
 }
 
 // BridgeFramingTotal (ADR-127 §D3, Layer 7) returns the per-
@@ -3617,25 +3994,40 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 	return m.wakeSnapshotTier.WithLabelValues(tier)
 }
 
-// WakeFailure returns the per-(box, reason) counter the wake-failure
-// hook sites increment on every wake failure (issue #1059 / ADR-127).
-// reason MUST be one of {snapshot_stale, disk_full, jailer_fail,
-// netns_fail, cgroup_fail, vsock_fail, snapshot_restore_err,
+// WakeFailure returns the per-(box, app, reason) counter the
+// wake-failure hook sites increment on every wake failure
+// (issue #1059 / ADR-127, §3.5 per-app split). reason MUST be
+// one of {snapshot_stale, disk_full, jailer_fail, netns_fail,
+// cgroup_fail, vsock_fail, snapshot_restore_err,
 // mem_backend_err} — the closed vocabulary is enforced by
-// pkg/fcvm/wake_classify.go and the wake-failure call sites hardcode
-// the literal reason string. box is resolved through the boxLabelSet
-// admission (maxBoxLabelValues = 64); overflow collapses to
-// "__other__". The (box, reason) cartesian is pre-instantiated in
-// the constructor for every (box, reason) pair so the §12
-// "Wake failures by reason (24h)" dashboard panel surfaces zero rows
-// from idle fleet. nil-safe — returns nil if m is nil so unit tests
-// without metrics keep building (same nil-safe posture as
-// WarmSnapshotErrors).
-func (m *OpsMetrics) WakeFailure(box, reason string) prometheus.Counter {
+// pkg/fcvm/wake_classify.go and the wake-failure call sites
+// hardcode the literal reason string. box is resolved through
+// the boxLabelSet admission (maxBoxLabelValues = 64);
+// overflow collapses to "__other__". An empty box argument
+// resolves to BoxHostname() so call sites can pass "" to
+// inherit the hostname-derived label (issue #1059 / ADR-127
+// §3.4 follow-up — cluster A commit 5 of the platform-
+// observability mega-PR). app is resolved through the
+// appLabelSet admission (maxAppLabelValues = 256); empty
+// input collapses to labelAppUnknown ("") to distinguish a
+// missing-app-slug path from a real app slug that hit the
+// admission cap (which collapses to otherAppLabel). The
+// (box, app, reason) cartesian is pre-instantiated in the
+// constructor for every pair in the closed set (the reserved
+// {labelLocal, otherBoxLabel} × {labelAppUnknown, otherAppLabel}
+// × 10 reasons matrix — 40 series from idle fleet) so the §12
+// "Wake failures by reason (24h)" dashboard panel surfaces
+// zero rows from an idle fleet. nil-safe — returns nil if m
+// is nil so unit tests without metrics keep building (same
+// nil-safe posture as WarmSnapshotErrors).
+func (m *OpsMetrics) WakeFailure(box, app, reason string) prometheus.Counter {
 	if m == nil {
 		return nil
 	}
-	return m.wakeFailure.WithLabelValues(m.boxLabel(box), reason)
+	if box == "" {
+		box = BoxHostname()
+	}
+	return m.wakeFailure.WithLabelValues(m.boxLabel(box), m.appLabel(app), reason)
 }
 
 // WakeLatency returns the per-(box, phase) histogram observer the
@@ -3645,15 +4037,21 @@ func (m *OpsMetrics) WakeFailure(box, reason string) prometheus.Counter {
 // existing fleet-level vmmd_wake_phase_duration_seconds{phase}
 // histogram so the §12 dashboard panel can swap fleet → per-box
 // without a legend change. box is resolved through the boxLabelSet
-// admission (same contract as WakeFailure above). The (box, phase)
-// cartesian is pre-instantiated in the constructor for every pair so
-// the "Per-box p99 wake latency (24h)" dashboard panel surfaces zero
-// rows from idle fleet. wake_id is attached as a
-// prometheus.Exemplar at the call site (matching the wakeRPCDuration
-// precedent at metrics.go:1421). nil-safe — returns nil if m is nil.
+// admission (same contract as WakeFailure above); an empty box
+// argument resolves to BoxHostname() (issue #1059 / ADR-127 §3.4
+// follow-up — cluster A commit 5 of the platform-observability
+// mega-PR). The (box, phase) cartesian is pre-instantiated in the
+// constructor for every pair so the "Per-box p99 wake latency
+// (24h)" dashboard panel surfaces zero rows from idle fleet.
+// wake_id is attached as a prometheus.Exemplar at the call site
+// (matching the wakeRPCDuration precedent at metrics.go:1421).
+// nil-safe — returns nil if m is nil.
 func (m *OpsMetrics) WakeLatency(box, phase string) prometheus.Observer {
 	if m == nil {
 		return nil
+	}
+	if box == "" {
+		box = BoxHostname()
 	}
 	return m.wakeLatency.WithLabelValues(m.boxLabel(box), phase)
 }
@@ -5805,6 +6203,87 @@ const labelLocal = "local"
 // label is intentionally lossy.
 const otherBoxLabel = "__other__"
 
+// BoxHostname returns the canonical box label for the current
+// control-plane host — the os.Hostname() value, falling back to
+// labelLocal ("local") if the hostname lookup fails or returns
+// empty. Wire callers should pass "" rather than the literal
+// "local" so the accessors resolve to BoxHostname(); the
+// existing literal "local" call sites remain valid for now and
+// will be migrated in a follow-up commit when the Tier A
+// multi-host rollout (ADR-062 / ADR-066 chain) lands.
+//
+// The function is pure and side-effect-free — it does not touch
+// the boxLabelSet admission set, which is the accessor's job.
+// Callers must still funnel the result through m.boxLabel(box)
+// (OpsMetrics.WakeFailure and OpsMetrics.WakeLatency do this
+// internally when the caller passes ""). The hostname is
+// read on every call, not cached — a rare codepath and the
+// underlying syscall is cheap.
+//
+// TODO(multi-host/ADR-066): replace os.Hostname() lookup with
+// compute_nodes.id once the compute_nodes table lands (Tier A
+// multi-host rollout). At that point BoxHostname() becomes a
+// pkg/state/pkgstore.ComputeNodeIDForSelf() call and the call
+// sites in pkg/fcvm/manager.go and pkg/vmmdgrpc/server.go stop
+// passing the literal "local". Until then the literal stays in
+// place because compute_nodes doesn't exist yet, and the host
+// hostname is a reasonable stand-in for "this box's box" —
+// operators get per-host Prometheus rows from an idle fleet.
+func BoxHostname() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return labelLocal
+	}
+	return host
+}
+
+// maxAppLabelValues caps the per-OpsMetrics app-label admission
+// set (issue #1059 / ADR-127 §3.5 deferred work, shipped in the
+// platform-observability mega-PR alongside the per-app wake-
+// failure split). Sized at 256 — covers the single-region Scale
+// plan budget (100 deployed apps per pkg/api/limits.go) plus
+// headroom for Tier A multi-region fan-out and per-account
+// per-region app replication. The cap is far below the "tens of
+// thousands of series per metric" Prometheus guideline so a
+// hostile config can never exhaust TSDB cardinality on this
+// label. Above the cap, new app slugs collapse to otherAppLabel
+// ("__other__") so the Prometheus TSDB series set stays bounded
+// over the daemon's lifetime.
+//
+// Distinct from maxBoxLabelValues, maxAccountLabelValues, and
+// maxIPLabelValues so the four sets do not share capacity —
+// an account-surge affects account labels while app cardinality
+// stays low, and vice versa.
+//
+// Per-plan budget reference (pkg/api/limits.go):
+//
+//	Free   →  1 deployed app
+//	Hobby  →  5 deployed apps
+//	Pro    → 25 deployed apps
+//	Scale  → 100 deployed apps
+//
+// 256 covers Scale headroom (100 apps × 2.5× = ~250) plus a
+// small fleet-of-fleets fudge factor for a future multi-region
+// rollout (ADR-066 chain).
+const maxAppLabelValues = 256
+
+// labelAppUnknown is the reserved app identifier for callsites
+// that do not have an app slug in scope (issue #1059 / ADR-127
+// §3.5). Always admitted without consuming capacity, and always
+// re-admitted on collision-free lookups so appLabelSet is free
+// to reset across a restart. The literal "" distinguishes a
+// "no app in scope" call from a real app slug that hit the
+// admission cap (which collapses to otherAppLabel) — the two
+// failure modes mean different things on a triage panel.
+const labelAppUnknown = ""
+
+// otherAppLabel is the reserved app identifier for traffic whose
+// app slug exceeded the admission cap. Same contract as
+// otherAccountLabel / otherBoxLabel — operators must check the
+// daemon slog for the original app slug when an app lands here;
+// the metric label is intentionally lossy.
+const otherAppLabel = "__other__"
+
 // accountLabelSet is the bounded admission set that backs every
 // account_id-labelled metric in OpsMetrics (issue #278). The set is
 // deliberately a plain map+mutex, not an LRU: an evicting LRU would
@@ -6114,6 +6593,120 @@ func (m *OpsMetrics) boxLabel(box string) string {
 		return box
 	}
 	return m.boxLabels.admit(box)
+}
+
+// appLabelSet is the bounded admission set that backs the
+// app-labelled metrics on OpsMetrics (issue #1059 / ADR-127 §3.5
+// deferred work, shipped in the platform-observability mega-PR).
+// Same shape and contract as boxLabelSet / accountLabelSet /
+// ipLabelSet — plain map + mutex, fixed capacity, non-evicting —
+// but a distinct type so the four sets do not share capacity
+// (an account-surge must not steal slots from the app admission
+// set, and vice versa). The cap is maxAppLabelValues (256). Above
+// the cap, new app slugs collapse to otherAppLabel ("__other__")
+// so the Prometheus TSDB series set stays bounded over the
+// daemon's lifetime. The map is initialised once per OpsMetrics
+// in NewOpsMetrics; the mutex is the only synchronisation
+// primitive and is held only across the lookup/insert path.
+// Prometheus Counter / Histogram increments happen outside the
+// critical section.
+//
+// Reserved values (labelAppUnknown, otherAppLabel) are admitted
+// at boot without consuming capacity and are always re-admitted
+// on collision-free lookups. labelAppUnknown ("") is the
+// missing-app-slug placeholder used by hook sites that fire
+// before app_id is resolved — it is observable distinctly from a
+// real app slug that hit the admission cap (which collapses to
+// otherAppLabel). Real app slugs consume capacity once and are
+// never evicted in process — the daemon restart is the only path
+// that resets the set.
+type appLabelSet struct {
+	mu       sync.Mutex
+	admitted map[string]struct{}
+	cap      int
+}
+
+// newAppLabelSet constructs an admission set with the given
+// capacity. capacity must be > 0; the call panics otherwise to
+// fail loud at boot rather than silently allow unbounded
+// admission.
+//
+// Returns a pointer because appLabelSet contains a sync.Mutex;
+// returning by value would copy the lock (govet copylocks).
+func newAppLabelSet(capacity int) *appLabelSet {
+	if capacity <= 0 {
+		panic("wire: appLabelSet capacity must be positive")
+	}
+	s := &appLabelSet{
+		admitted: make(map[string]struct{}, capacity),
+		cap:      capacity,
+	}
+	// Reserved values don't count against the cap, but pre-admitting
+	// them at construction means appLabel() doesn't need a special
+	// branch for them — the lookup short-circuits through the same
+	// map. labelAppUnknown is the empty string; pre-admitting it is
+	// a no-op for the empty-string case but documents the contract.
+	s.admitted[labelAppUnknown] = struct{}{}
+	s.admitted[otherAppLabel] = struct{}{}
+	return s
+}
+
+// admit resolves an app slug to its label value (issue #1059 /
+// ADR-127 §3.5). Empty input stays as labelAppUnknown ("") so a
+// missing app slug (pathological — the host usually supplies
+// one) is observable distinctly from a real app slug that hit
+// the admission cap (which collapses to otherAppLabel). Reserved
+// values (labelAppUnknown, otherAppLabel) are always admitted
+// without consuming capacity. Real app slugs are admitted up to
+// the capacity; further slugs collapse to otherAppLabel without
+// ever consuming capacity, and the underlying map is never
+// resized past cap.
+//
+// Concurrency: holds mu across the lookup+insert. The hot path
+// is the "already admitted" lookup, which is O(1) and never
+// inserts. The Prometheus increment happens at the call site
+// AFTER admit returns, so it is outside the critical section.
+//
+// Pointer receiver: the type contains a sync.Mutex, so copying
+// the value would duplicate the lock. appLabelSet is constructed
+// once per OpsMetrics in NewOpsMetrics and held as a pointer
+// field.
+func (s *appLabelSet) admit(app string) string {
+	switch app {
+	case labelAppUnknown, otherAppLabel:
+		return app
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.admitted[app]; ok {
+		return app
+	}
+	// Reserved labels (labelAppUnknown, otherAppLabel) are
+	// pre-admitted at construction (see newAppLabelSet) and consume
+	// map entries but NOT user-facing capacity. The user-facing cap
+	// of `s.cap` distinct REAL app slugs must hold. The check is
+	// therefore "real app slugs admitted = (len - reserved) >= s.cap",
+	// not "len >= s.cap" — the same bug-fix shape as
+	// boxLabelSet.admit (TestWakeFailure_OverflowCollapsesToOther).
+	const reservedCount = 2
+	realAdmitted := len(s.admitted) - reservedCount
+	if realAdmitted >= s.cap {
+		return otherAppLabel
+	}
+	s.admitted[app] = struct{}{}
+	return app
+}
+
+// appLabel exposes the admission set as an OpsMetrics method so
+// callers don't need to know the underlying type. Safe on a nil
+// receiver — returns the input unchanged for the daemon paths
+// that don't wire an OpsMetrics (unit tests, see sched / vmmd
+// test fixtures).
+func (m *OpsMetrics) appLabel(app string) string {
+	if m == nil || m.appLabels == nil {
+		return app
+	}
+	return m.appLabels.admit(app)
 }
 
 // RenderSeconds is a tiny helper for callers that want to hand-format a

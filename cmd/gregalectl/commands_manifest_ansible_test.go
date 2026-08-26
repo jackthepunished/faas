@@ -13,7 +13,7 @@ import (
 func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	yaml := strings.Replace(validManifestYAML,
 		"    - name: fsn-1\n      role: control-plane\n",
-		"    - name: fsn-1\n      role: control-plane\n      address: 10.42.0.1:7100\n    - name: fsn-2\n      role: compute-only\n      address: 10.42.0.2:50051\n", 1)
+		"    - name: fsn-1\n      role: control-plane\n      address: 10.42.0.1:7100\n    - name: fsn-2\n      role: compute-only\n      address: 10.42.0.2:50051\n      storage_device: /dev/disk/by-id/google-local-ssd-0\n", 1)
 	m, err := manifest.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatalf("manifest.Parse: %v", err)
@@ -49,6 +49,12 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	}
 	if !strings.Contains(computeVars, `faas_node_name: fsn-2.faas`) {
 		t.Errorf("compute host vars missing canonical node identity:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_storage_device: "/dev/disk/by-id/google-local-ssd-0"`) {
+		t.Errorf("compute host vars missing provider-neutral storage device:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_storage_mountpoint: "/srv/fc"`) {
+		t.Errorf("compute host vars missing manifest storage mountpoint:\n%s", computeVars)
 	}
 	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://10.42.0.2:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)

@@ -182,6 +182,19 @@ func TestValidate_Valid(t *testing.T) {
 	}
 }
 
+func TestValidate_StorageDeviceMustBeAbsolute(t *testing.T) {
+	body := strings.Replace(validManifest,
+		"      address: 10.42.0.2:50051\n",
+		"      address: 10.42.0.2:50051\n      storage_device: nvme0n1\n", 1)
+	m, err := Parse([]byte(body))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if errs := m.Validate(); errs == nil || !strings.Contains(errs.Error(), "storage_device") || !strings.Contains(errs.Error(), "absolute") {
+		t.Fatalf("Validate = %v, want absolute storage_device error", errs)
+	}
+}
+
 func TestValidate_EmptyFile(t *testing.T) {
 	_, err := Parse([]byte(""))
 	if err == nil {

@@ -24,7 +24,13 @@ export type CreateEdgeRuleRequest = {
   match_methods?: Array<string>;
   priority?: number;
   enabled?: boolean;
-  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget' | 'cache';
+  /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Omitted == 'block' (the SQL-side default).
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
   /**
    * Kind-tagged action body — shape depends on `kind`.
    */

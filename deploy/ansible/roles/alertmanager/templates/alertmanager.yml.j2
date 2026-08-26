@@ -18,13 +18,21 @@
 #   /etc/alertmanager/secrets/pushover-token    (mode 0400, alertmanager:alertmanager)
 #   /etc/alertmanager/secrets/pushover-user-key (mode 0400, alertmanager:alertmanager)
 # The tasks/main.yml loader asserts the file permissions before systemd unit
-# enable. Empty paths (dev/CI hosts) are tolerated by the role but yield a
-# config Alertmanager refuses to start — see am_dev_mode below.
+# enable. Empty paths are valid only for am_dev_mode: the resulting config is
+# deliberately silent until an operator provisions a notification channel.
 
-{% if am_smtp_smarthost is defined %}
+{% set am_smtp_password_path = am_smtp_password_file | default('') | trim %}
+{% set am_pushover_token_path = am_pushover_token_file | default('') | trim %}
+{% set am_pushover_user_key_path = am_pushover_user_key_file | default('') | trim %}
+{% set am_smtp_host = am_smtp_smarthost | default('') | trim %}
+{% set am_email_enabled = am_smtp_host | length > 0 and am_smtp_password_path | length > 0 %}
+{% set am_pushover_enabled = am_pushover_token_path | length > 0 and am_pushover_user_key_path | length > 0 %}
+{% set am_notifications_enabled = am_email_enabled or am_pushover_enabled %}
+
+{% if am_email_enabled %}
 global:
   resolve_timeout: 5m
-  smtp_smarthost: "{{ am_smtp_smarthost }}"
+  smtp_smarthost: "{{ am_smtp_host }}"
   smtp_from: "{{ am_email_from }}"
 {% else %}
 global:
@@ -32,7 +40,11 @@ global:
 {% endif %}
 
 route:
+{% if am_notifications_enabled %}
   receiver: faas-page
+{% else %}
+  receiver: faas-silent
+{% endif %}
   group_by: [alertname, component]
   group_wait: 30s
   group_interval: 5m
@@ -41,13 +53,21 @@ route:
     # page-severity: full notify (email + Pushover).
     - matchers:
         - severity = "page"
+{% if am_notifications_enabled %}
       receiver: faas-page
+{% else %}
+      receiver: faas-silent
+{% endif %}
       group_wait: 10s
       repeat_interval: 1h
     # warn-severity: ticket-only email; longer repeat so we don't spam.
     - matchers:
         - severity = "warn"
+{% if am_email_enabled %}
       receiver: faas-warn
+{% else %}
+      receiver: faas-silent
+{% endif %}
       repeat_interval: 4h
     # info-severity: no receiver — the matcher matches but no route fires.
     - matchers:
@@ -57,38 +77,44 @@ route:
 
 receivers:
   - name: faas-page
+{% if am_email_enabled %}
     email_configs:
       - to: "{{ am_email_to_page }}"
         # smtp_smarthost / smtp_from default to global.* — operator may override
         # am_smtp_smarthost via -e to point at an external relay. Per-receiver
         # auth_username is the alertmanager-side identity, not a secret.
         auth_username: "{{ am_smtp_auth_username }}"
-        auth_password_file: "{{ am_smtp_password_file }}"
+        auth_password_file: "{{ am_smtp_password_path }}"
         require_tls: {{ am_smtp_require_tls | default(false) | string | lower }}
         send_resolved: true
         headers:
           X-Faas-Alert: "page"
+{% endif %}
+{% if am_pushover_enabled %}
     pushover_configs:
       # token + user_key both via _file indirection. Alertmanager reads the
       # file at send time, so the secrets are never in this rendered YAML.
-      - token_file: "{{ am_pushover_token_file }}"
-        user_key_file: "{{ am_pushover_user_key_file }}"
+      - token_file: "{{ am_pushover_token_path }}"
+        user_key_file: "{{ am_pushover_user_key_path }}"
         send_resolved: true
         priority: 2          # emergency: bypass quiet hours on the device
         retry: 1m            # Alertmanager <duration> field — unit required
         expire: 1h           # ditto; integer would fail amtool check-config
         title: "faas page"
         url: "{{ am_alerts_url | default('http://127.0.0.1:9090/alerts') }}"
+{% endif %}
 
   - name: faas-warn
+{% if am_email_enabled %}
     email_configs:
       - to: "{{ am_email_to_warn }}"
         auth_username: "{{ am_smtp_auth_username }}"
-        auth_password_file: "{{ am_smtp_password_file }}"
+        auth_password_file: "{{ am_smtp_password_path }}"
         require_tls: {{ am_smtp_require_tls | default(false) | string | lower }}
         send_resolved: true
         headers:
           X-Faas-Alert: "warn"
+{% endif %}
 
   - name: faas-silent
     # No integration blocks. The route matches severity="info" but

@@ -5,7 +5,7 @@
 #   warn  → ticket-only email via the alertmanager `faas-warn` route.
 #   page  → operator email + Pushover via the `faas-page` route.
 #
-# Runbook URLs point at docs/runbooks/<AlertName>.md. Each runbook is a
+# Runbook URLs point at docs/ops/<AlertName>.md. Each runbook is a
 # stub today (symptom / verify / silence steps) — the URLs satisfy
 # `runbook_url:` even when the runbook content is a TODO. A follow-up
 # PR fills the runbooks with concrete triage commands.
@@ -386,7 +386,7 @@ groups:
       # pkg/wire/metrics.go (apid_audit_events_deleted_total,
       # apid_audit_events_retention_lag_seconds, apid_audit_events_volume_total{kind_prefix}).
       # This group closes the operator surface: three alerts that map
-      # directly onto docs/runbooks/FaasAuditRetentionExhaustion.md's
+      # directly onto docs/ops/FaasAuditRetentionExhaustion.md's
       # three-signal triage.
       #
       # Metric-semantics notes (PR-D20.4 review caught three bugs that
@@ -495,7 +495,7 @@ groups:
       # being saturated, which is a separate signal (covered by the
       # snapshot_fleet_avg_mb-style fleet dashboards, not by this rule).
       #
-      # Response: rate-limit + notify (docs/runbooks/tenant-abuse.md
+      # Response: rate-limit + notify (docs/ops/tenant-abuse.md
       # §Recover step 1+2). Escalation: suspend deployment (step 3).
       # Severity: warn — abuse, not outage.
       # ─────────────────────────────────────────────────────────────────
@@ -508,7 +508,7 @@ groups:
           family: tenant_abuse
         annotations:
           summary: "Tenant {{ $labels.account_id }} exceeding 500 rps for 10m"
-          description: "Customer {{ $labels.account_id }} sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+          description: "Customer {{ $labels.account_id }} sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/ops/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
 
       # ─────────────────────────────────────────────────────────────────
@@ -920,7 +920,7 @@ groups:
       # cgroup's cpu.max just caps their slice); the response is
       # operator-side capacity work, not a customer-facing outage.
       #
-      # Response cascade (docs/runbooks/FaasCpuStarvation.md §Recover):
+      # Response cascade (docs/ops/FaasCpuStarvation.md §Recover):
       # top-N panel → plan raise for the customer → consider
       # faas-tenant slice CPUQuota bump (1600% = 16 cores). Memory
       # is NOT in scope — the per-VM memory.max is enforced by
@@ -936,7 +936,7 @@ groups:
           family: cpu_starvation
         annotations:
           summary: "Tenant slice {{ $labels.slice }} throttled > 80% for 5m"
-          description: "Plan sub-slice {{ $labels.slice }} has been > 80% throttled over the rolling 5-minute window for 5m (issue #301 / ADR-044). The cpu.max quota for that plan is saturated; quiescent workloads are preempted. Cross-check the top-throttled-apps Grafana panel for which (account_id, app_id) is the dominant offender, then follow docs/runbooks/FaasCpuStarvation.md §Recover."
+          description: "Plan sub-slice {{ $labels.slice }} has been > 80% throttled over the rolling 5-minute window for 5m (issue #301 / ADR-044). The cpu.max quota for that plan is saturated; quiescent workloads are preempted. Cross-check the top-throttled-apps Grafana panel for which (account_id, app_id) is the dominant offender, then follow docs/ops/FaasCpuStarvation.md §Recover."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasCpuStarvation.md"
 
       # ─────────────────────────────────────────────────────────────────
@@ -965,7 +965,7 @@ groups:
           family: path_filter
         annotations:
           summary: "githubd path-filter degraded — credentials missing or compare API unreachable"
-          description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 10m. mode=error fires when the GitHub App credentials are not provisioned (cmd/githubd wires NewUnavailableChangedFiles as the stub) or when the GitHub compare API returned a transport / non-2xx error. mode=breaker_open fires after 3 consecutive errors trip the breaker (pkg/githubd/changedfiles.go). Either way every push rebuilds every touched app — the conservative posture defeats the path-filter efficiency win. Verify: 1) FAAS_GITHUB_APP_ID + FAAS_GITHUB_APP_KEY_PATH point at a valid App + key; 2) outbound api.github.com is reachable; 3) the App installation hasn't been revoked. Runbook: docs/runbooks/FaasGithubdPathFilterDegraded.md."
+          description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 10m. mode=error fires when the GitHub App credentials are not provisioned (cmd/githubd wires NewUnavailableChangedFiles as the stub) or when the GitHub compare API returned a transport / non-2xx error. mode=breaker_open fires after 3 consecutive errors trip the breaker (pkg/githubd/changedfiles.go). Either way every push rebuilds every touched app — the conservative posture defeats the path-filter efficiency win. Verify: 1) FAAS_GITHUB_APP_ID + FAAS_GITHUB_APP_KEY_PATH point at a valid App + key; 2) outbound api.github.com is reachable; 3) the App installation hasn't been revoked. Runbook: docs/ops/FaasGithubdPathFilterDegraded.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGithubdPathFilterDegraded.md"
 
       # ─────────────────────────────────────────────────────────────────
@@ -995,7 +995,7 @@ groups:
           family: route_metrics
         annotations:
           summary: "App {{ $labels.app }} sustained in __route_other__ overflow for 10m"
-          description: "gateway_requests_by_route_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/runbooks/GatewayWildcardRoute.md."
+          description: "gateway_requests_by_route_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/ops/GatewayWildcardRoute.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/GatewayWildcardRoute.md"
 
       - alert: FaasGithubdPathFilterDegradedWarn
@@ -1169,5 +1169,121 @@ groups:
           family: cold_boot_ratio
         annotations:
           summary: "vmmd cold-boot fallback > 30 % for 10m"
-          description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/runbooks/FaasColdBootRatioHigh.md."
+          description: "Cold-boot fallback rate has exceeded 30 % of all wakes for 10m. The §6.2 budget is approaching saturation on the wake-economics curve — sustained cold-boot at this rate is ~3x the wake-side I/O of a healthy fleet and stresses lv-fc (pkg/fcvm/lvfc.go). Catching this trend before snapshot_fleet_avg exceeds 160 MB gives ~24 h headroom. Drill-down: `rate(vmmd_wake_failure_total{reason=\"disk_full\"}[5m])` (storage pressure), `fcvm_snapshot_fleet_avg_bytes` (growth signal). Recover: see docs/ops/FaasColdBootRatioHigh.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasColdBootRatioHigh.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Issue #573 / ADR-128 — restart-loop detection (cluster B commit 7
+      # of the platform-observability mega-PR). The three alerts below
+      # answer the three operator questions from the issue body:
+      #
+      #   1. FaasRestartLoop — "is a daemon crashlooping RIGHT NOW?"
+      #      Pages within 2m of the 5th restart in 5m. Catastrophic —
+      #      the box is failing fast and customers will see wake
+      #      errors as the daemon is mid-replacement.
+      #
+      #   2. FaasRepeatedRestart — "is a daemon being restarted
+      #      persistently across the hour?" 20 restarts in 1h means
+      #      the systemd unit is unstable but hasn't tripped
+      #      Restart=on-failure's SecStartLimitBurst yet — operationally
+      #      important because the daemon will eventually enter the
+      #      failed state and stop being restarted.
+      #
+      #   3. FaasStuckActivating — "is a daemon stuck in the
+      #      'activating' state without ever reaching 'active'?"
+      #      Pages at 5m of stuck-activating. Distinct from
+      #      RestartLoop because the unit is NOT crashlooping —
+      #      it's just not coming up (dependency deadlock, bad config
+      #      syntax, missing secret, etc.).
+      #
+      # Source metric: node_systemd_restart_count{name=~'faas-.*\\.service'}
+      # from node_exporter's --collector.systemd (commit 6 added the
+      # flag). Backstop: our own <daemon>_daemon_restart_count{daemon, version}
+      # counter (also commit 6) — see the fallback for-window in
+      # each alert expression.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasRestartLoop
+        expr: increase(node_systemd_restart_count{name=~"faas-.*\\.service"}[5m]) > 5
+        for: 2m
+        labels:
+          severity: page
+          component: controlplane
+          family: daemon_lifecycle
+        annotations:
+          summary: "Daemon restart-loop detected (>5 restarts in 5m)"
+          description: "A faas-* systemd unit has restarted more than 5 times in the rolling 5-minute window for 2m. The daemon is crashlooping — customers will see wake errors as the unit is mid-replacement. Fallback (older systemd, no --collector.systemd): increase(<daemon>_daemon_restart_count[5m]) > 5 with the same for-window. Triage: `systemctl status faas-<name>.service` for the active state, `journalctl -u faas-<name>.service -n 200` for the panic / exit-on-error signature. Recover per docs/ops/FaasRestartLoop.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasRestartLoop.md"
+
+      - alert: FaasRepeatedRestart
+        expr: increase(node_systemd_restart_count{name=~"faas-.*\\.service"}[1h]) > 20
+        for: 5m
+        labels:
+          severity: warn
+          component: controlplane
+          family: daemon_lifecycle
+        annotations:
+          summary: "Daemon restarted >20 times in 1h (approaching SecStartLimitBurst)"
+          description: "A faas-* systemd unit has restarted more than 20 times in the rolling 1-hour window for 5m. The daemon is unstable but hasn't tripped the systemd SecStartLimitBurst threshold yet — operationally important because the unit will eventually enter the failed state and stop being restarted, taking customers offline. Fallback (older systemd): increase(<daemon>_daemon_restart_count[1h]) > 20. Triage: `systemctl show faas-<name>.service --property=NRestarts` for the cumulative count, `journalctl -u faas-<name>.service --since '1 hour ago'` for the recurring failure signature. Recover per docs/ops/FaasRepeatedRestart.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasRepeatedRestart.md"
+
+      - alert: FaasStuckActivating
+        expr: node_systemd_unit_state{name=~"faas-.*\\.service", state="activating"} == 1
+        for: 5m
+        labels:
+          severity: page
+          component: controlplane
+          family: daemon_lifecycle
+        annotations:
+          summary: "Daemon stuck in 'activating' state for 5m"
+          description: "A faas-* systemd unit has been in the 'activating' state for 5m without reaching 'active'. The daemon is not crashlooping (no RestartLoop signature) — it is simply not coming up. Likely causes: dependency deadlock (Postgres / etcd / Vault not ready), bad config syntax, missing sealed secret, port collision. Triage: `systemctl status faas-<name>.service` for the active state, `journalctl -u faas-<name>.service -n 100` for the dependency-exit / config-parse error. Recover per docs/ops/FaasStuckActivating.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasStuckActivating.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Issue #601 / ADR-131: FaasNewCve
+      #
+      # Pages when the cve-check workflow (.github/workflows/cve-check.yml)
+      # reports a new CVE ≥ medium severity. The metric is pushed by
+      # meterd from the workflow artifact (cluster D commit 13). Fires
+      # once per severity tier so the page text names the severity
+      # instead of just "CVE". Recover per docs/ops/FaasNewCve.md.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasNewCve
+        expr: increase(meterd_cve_check_total{result="new_cve", severity=~"medium|high|critical"}[1h]) > 0
+        for: 1m
+        labels:
+          severity: page
+          component: controlplane
+          family: cve
+        annotations:
+          summary: "New CVE ≥ medium detected by the nightly cve-check workflow"
+          description: "The nightly cve-check workflow (issue #601 / ADR-131) reported a new CVE ≥ medium severity within the last hour. The metric is meterd_cve_check_total{result=\"new_cve\"}; the GitHub Issue created by the workflow lists the CVE id, severity, and affected dependency. Triage: read the GitHub Issue for the CVE id + dep, check deps.dev / nvd.nist.gov for the affected versions + fixed-in version, decide patch vs. accept-risk posture, ship the patch (or the grype ignore). Recover per docs/ops/FaasNewCve.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasNewCve.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Operator-side observability mega-PR — Commit 7 (P5) —
+      # FaasBuildQueueDepthHigh. Pages when the operator dashboard
+      # `faas_build_queue_depth` gauge (fleet-total queued builds,
+      # bumped every 30s by the apid metrics collector) sustains
+      # > 50 queued for 10m. The threshold deliberately errs loose:
+      # builderd's default concurrency budget is 2 microVMs (1
+      # guaranteed + 1 opportunistic, ADR-003), so a sustained
+      # queue > 50 means the cluster's build throughput is
+      # insufficient for the wake rate. Triage: `gregalectl builds
+      # list --status=queued` for the in-flight builds, the
+      # `/v1/admin/obs/builder-heartbeats` endpoint for live
+      # builderd liveness, then the recovery primitives in the
+      # runbook (drain + scale the affected schedd, or recover
+      # the wedged builderd). Recover per
+      # docs/ops/build-queue-stuck.md.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasBuildQueueDepthHigh
+        expr: faas_build_queue_depth > 50
+        for: 10m
+        labels:
+          severity: page
+          component: builderd
+          family: build_queue_stuck
+        annotations:
+          summary: "builderd build queue > 50 queued builds for 10m"
+          description: "The fleet-total queued-builds gauge `faas_build_queue_depth` has exceeded 50 for 10m. With builderd's default concurrency of 2 microVMs (1 guaranteed + 1 opportunistic per ADR-003), sustained depth > 50 means builds are arriving faster than builderd can drain the queue. Triage: `gregalectl builds list --status=queued` for the in-flight builds, `/v1/admin/obs/builder-heartbeats` for live builderd liveness (a missing builder_tick signature means the writer is wedged), `gregalectl builds sweep-stuck --older-than=15m --yes` to reclaim the wedged 'running' rows. Recover per docs/ops/FaasBuildQueueBacklog.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasBuildQueueBacklog.md"

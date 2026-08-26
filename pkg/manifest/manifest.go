@@ -237,14 +237,20 @@ type Fleet struct {
 
 // Host is one control-plane node in the fleet. `name` is the canonical
 // identity (matches `compute_nodes.name` in the database) and `role`
-// is one of `pkg/role.AllRoles`. `Overlay` and `Storage` are pointers
-// because per-host overrides are optional — the renderer falls back to
-// the package-level value when absent.
+// is one of `pkg/role.AllRoles`. `Overlay` is a pointer because the
+// per-host override is optional; StorageDevice is an explicit path
+// override and is empty when the host already owns its fast-root mount.
 type Host struct {
 	Name    string  `yaml:"name"`
 	Role    string  `yaml:"role"`
 	Address string  `yaml:"address,omitempty"`
 	Overlay *string `yaml:"overlay,omitempty"`
+	// StorageDevice is an optional provider-neutral block-device path for
+	// this host's fast root. It is intentionally per-host because stable
+	// /dev/disk/by-id paths differ between providers and machines. When it
+	// is empty, the deployment requires an already-mounted fast root instead
+	// of guessing which disk is safe to format.
+	StorageDevice string `yaml:"storage_device,omitempty"`
 	// Tags are free-form, opaque labels the doctor uses to filter
 	// checks (e.g. `--role=compute-only` skips cert checks for the
 	// egress server leaf, which lives on the control-plane box).
@@ -282,6 +288,18 @@ type DaemonConfig struct {
 	// `tls_cert_path` / `tls_key_path` / `tls_ca_path` keys into
 	// the rendered TOML.
 	TLS *TLSMaterial `yaml:"tls,omitempty"`
+
+	// GatewaydInternal's split-box peers are separate from TLS, which
+	// describes a daemon's own listener, and from Outbound, which is a
+	// single legacy peer shape used by schedd. Keep the three gateway
+	// client/server bundles explicit so the renderer cannot silently emit
+	// a plaintext control-plane connection when this daemon runs on a
+	// compute-only host.
+	ScheddTLS         *TLSMaterial `yaml:"schedd_tls,omitempty"`
+	VMMTLS            *TLSMaterial `yaml:"vmmd_tls,omitempty"`
+	EgressTLS         *TLSMaterial `yaml:"egress_tls,omitempty"`
+	ScheddClientTLS   *TLSMaterial `yaml:"schedd_client_tls,omitempty"`
+	AdvisoryClientTLS *TLSMaterial `yaml:"advisory_client_tls,omitempty"`
 
 	// Outbound is the dial target. On a single-box install this is
 	// the unix socket; on a split-box fleet it's the tcp://
@@ -822,6 +840,10 @@ func (f *Fleet) validate() Errors {
 			errs = append(errs, Error{path + ".address",
 				fmt.Sprintf("address %q must be host:port or unix://path", h.Address)})
 		}
+		if h.StorageDevice != "" && !filepath.IsAbs(h.StorageDevice) {
+			errs = append(errs, Error{path + ".storage_device",
+				fmt.Sprintf("storage_device %q must be an absolute device path", h.StorageDevice)})
+		}
 	}
 	// Single-box sanity: at most one host when role == single-box.
 	// Single-box sanity: at most one host when role == single-box is
@@ -876,6 +898,21 @@ func (d *Daemons) validate() Errors {
 		}
 		if dc.TLS != nil {
 			errs = append(errs, dc.TLS.validate(path+".tls")...)
+		}
+		if dc.ScheddTLS != nil {
+			errs = append(errs, dc.ScheddTLS.validate(path+".schedd_tls")...)
+		}
+		if dc.VMMTLS != nil {
+			errs = append(errs, dc.VMMTLS.validate(path+".vmmd_tls")...)
+		}
+		if dc.EgressTLS != nil {
+			errs = append(errs, dc.EgressTLS.validate(path+".egress_tls")...)
+		}
+		if dc.ScheddClientTLS != nil {
+			errs = append(errs, dc.ScheddClientTLS.validate(path+".schedd_client_tls")...)
+		}
+		if dc.AdvisoryClientTLS != nil {
+			errs = append(errs, dc.AdvisoryClientTLS.validate(path+".advisory_client_tls")...)
 		}
 		if dc.Outbound != nil {
 			errs = append(errs, dc.Outbound.validate(path+".outbound")...)

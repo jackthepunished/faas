@@ -1534,6 +1534,25 @@ func (g *gatewaydEdgeRules) compileValidateRules(storeRules []state.EdgeRule) ([
 		if len(action.ContentTypes) > 0 {
 			contentTypes = append(contentTypes, action.ContentTypes...)
 		}
+		// ValidateMode source-of-truth (ADR-128):
+		//   1. Top-level column (state.EdgeRule.ValidateMode)
+		//      wins. New writes land here per the store
+		//      layer's empty-string→'block' coalesce.
+		//   2. Fallback to action.ValidateMode when the
+		//      top-level column is empty. This is the
+		//      deprecation window contract (ADR-128 §D2):
+		//      rows written before this PR shipped with the
+		//      mode in action JSON only. After one release
+		//      the fallback is removed.
+		//   3. Empty string (both top-level empty AND action
+		//      empty) is the strict-mode sentinel — the
+		//      handler coerces to 'block' at
+		//      handler.go:2694. Matches the schema-side
+		//      NOT NULL DEFAULT 'block' at 00293.
+		mode := r.ValidateMode
+		if mode == "" {
+			mode = action.ValidateMode
+		}
 		out = append(out, gateway.EdgeRuleValidateResolved{
 			ID:                  r.ID,
 			AccountID:           r.AccountID,
@@ -1546,9 +1565,7 @@ func (g *gatewaydEdgeRules) compileValidateRules(storeRules []state.EdgeRule) ([
 			ApplyWhileStreaming: action.ApplyWhileStreaming,
 			RejectUnknownFields: action.RejectOnUnknown,
 			MaxBodyBytes:        action.MaxBodyBytes,
-			// Empty string is treated as 'block' by the handler —
-			// matches the schema default at 00293.
-			ValidateMode: action.ValidateMode,
+			ValidateMode:        mode,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

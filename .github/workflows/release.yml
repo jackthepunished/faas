@@ -214,20 +214,26 @@ jobs:
       - name: Build canonical daemon tarball and SPDX SBOM
         env:
           GIT_SHA: ${{ github.sha }}
-          # This is a repository variable, not the illustrative manifest
-          # in deploy/manifest/examples. Publishing a signed bundle tied to
-          # the example would make the artifact look production-ready while
-          # guaranteeing manifest drift on every real fleet.
-          MANIFEST_HASH: ${{ vars.GREGALE_RELEASE_MANIFEST_HASH }}
+          # The production manifest is not a repository variable or the
+          # illustrative manifest
+          # in deploy/manifest/examples. The production manifest is
+          # materialized from the checked-in topology template below so the
+          # tag commit and the signed bundle always share one identity.
           OUT_DIR: ${{ runner.temp }}/gregale-release
           SYFT_BIN: syft
         run: |
           set -euo pipefail
-          if [[ ! "${MANIFEST_HASH:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "GREGALE_RELEASE_MANIFEST_HASH must be configured as sha256:<64 lowercase hex> before tagging a release" >&2
-            exit 2
-          fi
-          scripts/build-canonical-tarball.sh
+          MANIFEST_FILE="$OUT_DIR/production-manifest.yaml"
+          scripts/materialize-release-manifest.sh \
+            --template deploy/manifest/production/gcp-live.template.yaml \
+            --git-sha "$GIT_SHA" \
+            --output "$MANIFEST_FILE"
+          go run ./cmd/gregalectl manifest validate --file "$MANIFEST_FILE"
+          MANIFEST_FILE="$MANIFEST_FILE" \
+            GIT_SHA="$GIT_SHA" \
+            OUT_DIR="$OUT_DIR" \
+            SYFT_BIN="$SYFT_BIN" \
+            scripts/build-canonical-tarball.sh
 
       - name: Sign canonical tarball with GitHub OIDC
         env:
@@ -242,7 +248,7 @@ jobs:
             --certificate-identity-regexp '^https://github\.com/poyrazK/faas/\.github/workflows/release\.yml@refs/tags/.+$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$OUT_DIR/release.tar.gz"
-          (cd "$OUT_DIR" && sha256sum release.tar.gz release.cosign.bundle release.sbom.json > SHA256SUMS)
+          (cd "$OUT_DIR" && sha256sum release.tar.gz release.cosign.bundle release.sbom.json production-manifest.yaml > SHA256SUMS)
 
       - name: Upload canonical release artifacts
         uses: actions/upload-artifact@v4
@@ -259,4 +265,5 @@ jobs:
             ${{ runner.temp }}/gregale-release/release.cosign.bundle
             ${{ runner.temp }}/gregale-release/release.sbom.json
             ${{ runner.temp }}/gregale-release/release-manifest.json
+            ${{ runner.temp }}/gregale-release/production-manifest.yaml
             ${{ runner.temp }}/gregale-release/SHA256SUMS

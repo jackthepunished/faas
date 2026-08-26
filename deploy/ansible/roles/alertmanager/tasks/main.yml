@@ -123,6 +123,21 @@
     - item | length > 0
   no_log: true   # paths flow through ansible.builtin.stat, defensive even though they're not the secret bytes
 
+- name: alertmanager — require a notification channel in production
+  ansible.builtin.assert:
+    that:
+      - am_dev_mode | bool or
+        ((am_smtp_smarthost | default('') | trim | length > 0) and
+         (am_smtp_password_file | default('') | trim | length > 0)) or
+        ((am_pushover_token_file | default('') | trim | length > 0) and
+         (am_pushover_user_key_file | default('') | trim | length > 0))
+    fail_msg: >-
+      Alertmanager production mode needs at least one complete notification
+      channel: SMTP host + password file, or Pushover token + user-key files.
+      Use am_dev_mode=true only for a deliberately silent bootstrap/CI host.
+  when: not am_dev_mode | bool
+  no_log: true
+
 - name: alertmanager — render config
   ansible.builtin.template:
     src: alertmanager.yml.j2

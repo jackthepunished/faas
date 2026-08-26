@@ -1,9 +1,12 @@
 package renderer
 
 import (
+	"crypto/ecdsa"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/pki"
 )
@@ -37,7 +40,7 @@ type PKIOutput struct {
 // leaves are reported with Issued=false so the second-run report
 // surfaces every leaf (with Action="unchanged") — the doctor's
 // PKI-health signal depends on every leaf being visible.
-func renderPKI(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, error) {
+func renderPKI(rootDir, hostName, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, error) {
 	// EnsureCA is idempotent (force=false → don't re-issue if a
 	// fresh CA already exists). On a fresh box this generates the
 	// CA cert + key at <rootDir>/ca/{ca.crt,ca.key}. The mode
@@ -58,7 +61,7 @@ func renderPKI(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, e
 
 	var out []PKIOutput
 	for _, role := range roles {
-		err := pki.EnsureLeafWithSANs(rootDir, role, caCert, caKey, false, extraSANs)
+		err := ensureHostLeaf(rootDir, role, hostName, hostRole, caCert, caKey, false, extraSANs)
 		issued := err == nil
 		if err != nil && !errors.Is(err, pki.ErrLeafNotExpiringSoon) {
 			return nil, fmt.Errorf("renderer: pki: ensure leaf %s/%s: %w", role.Directory, role.Filename, err)
@@ -68,4 +71,45 @@ func renderPKI(rootDir, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, e
 		out = append(out, PKIOutput{Path: filepath.ToSlash(keyPath), Issued: issued})
 	}
 	return out, nil
+}
+
+// renderPKITrustOnly validates an already-issued per-host trust bundle. A
+// compute node must not receive the fleet CA private key and must not be able
+// to mint replacement leaves, so this path never calls EnsureCA or
+// EnsureLeaf. It returns the existing leaf paths for the normal render
+// report, preserving the renderer's idempotence/accounting semantics.
+func renderPKITrustOnly(rootDir, hostName, hostRole string, extraSANs pki.AltNames) ([]PKIOutput, error) {
+	if err := pki.ValidateTrustBundleForNode(rootDir, hostRole, extraSANs, nodeCommonName(hostName, hostRole)); err != nil {
+		return nil, fmt.Errorf("renderer: pki: validate trust bundle: %w", err)
+	}
+	var out []PKIOutput
+	for _, role := range pki.RolesForBox(hostRole) {
+		certPath, keyPath := pki.LeafPaths(rootDir, role)
+		out = append(out,
+			PKIOutput{Path: filepath.ToSlash(certPath), Issued: false},
+			PKIOutput{Path: filepath.ToSlash(keyPath), Issued: false},
+		)
+	}
+	return out, nil
+}
+
+// ensureHostLeaf keeps the canonical daemon CNs for every leaf except the
+// compute-only vmmd leaves. Those leaves also carry the daemon SANs, but their
+// subject must be the node identity that appears in compute_nodes so the
+// mTLS verifier can bind a report to the box that sent it.
+func ensureHostLeaf(rootDir string, role pki.Role, hostName, hostRole string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs pki.AltNames) error {
+	if nodeCN := nodeCommonName(hostName, hostRole); nodeCN != "" && role.Directory == "vmmd" {
+		return pki.EnsureLeafWithCNAndSANs(rootDir, role, nodeCN, caCert, caKey, force, extraSANs)
+	}
+	return pki.EnsureLeafWithSANs(rootDir, role, caCert, caKey, force, extraSANs)
+}
+
+func nodeCommonName(hostName, hostRole string) string {
+	if hostRole != "compute-only" || hostName == "" {
+		return ""
+	}
+	if strings.HasSuffix(hostName, ".faas") {
+		return hostName
+	}
+	return hostName + ".faas"
 }

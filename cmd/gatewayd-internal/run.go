@@ -67,6 +67,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -721,7 +722,7 @@ func defaultDeps() runDeps {
 func defaultServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           trace.HTTPHandler("gatewayd-internal", handler),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Issue #995 Phase 3 / ADR-121: tighten the control +
 		// unix-socket listener (small, short-lived requests;
@@ -1143,6 +1144,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// We do NOT pass a Broadcaster — gatewayd is the public
 	// listener (CLAUDE.md ownership), not an SSE fan-out source.
 	gatewayOps := wire.NewOpsMetrics("gatewayd")
+	wire.BootStamps(ctx, "gatewayd", gatewayOps)
+	wire.RegisterDefaultOps(gatewayOps)
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	// Synthetic invocations share the same per-node HTTP→vmmd bridge as

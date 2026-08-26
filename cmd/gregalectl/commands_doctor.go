@@ -234,7 +234,7 @@ func cmdDoctorDispatch(args []string) int {
 
 	// Open the DB pool lazily so checks 1-3 can run without one.
 	// Doctor must work on a fresh box with no DB reachable.
-	pool, dbErr := openPgPoolFromEnv()
+	pool, dbErr := openPgPoolFromEnv(context.Background())
 	if dbErr != nil {
 		if *deep {
 			// Deep requires DB (check 6 walks ListComputeNodes).
@@ -1252,14 +1252,11 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			})
 			continue
 		}
-		// Mode check. The load-bearing contract is "no
-		// group/world bits + user bits ≤ canonical" — spec §11
-		// says secrets are not world- or group-readable. We
-		// accept a stricter mode (e.g. 0o400 instead of 0o440)
-		// but never a looser one, and never anything with group
-		// or world bits set. The exact-mode comparison was
-		// over-strict: a 0o000 mode (rare but valid for an
-		// un-read file) wouldn't match 0o400.
+		// Mode check. A file may be stricter than its canonical
+		// profile (0400 is valid where 0440 is the maximum), but
+		// it may not add any permission bit outside that profile.
+		// This keeps the rclone.conf 0440 root:postgres contract
+		// usable while rejecting world-readable or writable drift.
 		got := info.Mode().Perm()
 		want, permErr := parsePerm(s.want)
 		if permErr != nil {
@@ -1271,7 +1268,7 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			})
 			continue
 		}
-		if got&(0o077) != 0 || got&0o700 > want&0o700 {
+		if !doctorSecretModeAllowed(got, want) {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckSecrets,
 				Severity: doctorSeverityError,
@@ -1329,11 +1326,14 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 	// on-disk side passes AND a DB store is available. A
 	// missing DB makes the on-disk check the only signal —
 	// the operator can run `secrets init` to re-stamp. The
-	// check walks EVERY compute_nodes row (no --node filter
-	// gate) so a per-node drift on a multi-host cluster
-	// surfaces even when the operator runs `gregalectl
-	// doctor` without flags.
+	// The fingerprint belongs to the host running this command,
+	// not to every row in the fleet. An unscoped doctor therefore
+	// validates local files but skips this DB association; a
+	// node-scoped invocation performs the exact comparison.
 	if deps.store == nil {
+		return findings, nil
+	}
+	if strings.TrimSpace(deps.nodeFilter) == "" {
 		return findings, nil
 	}
 	nodes, err := deps.store.ListComputeNodes(ctx)
@@ -1345,6 +1345,16 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			Detail:   err.Error(),
 		})
 		return findings, fmt.Errorf("list compute_nodes: %w", err)
+	}
+	scoped, found := scopeDoctorNodes(nodes, deps.nodeFilter)
+	if !found {
+		return append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityError,
+			Target:   deps.nodeFilter,
+			Message:  "node filter was not found in compute_nodes",
+			Detail:   "register the node before running the node-scoped doctor",
+		}), nil
 	}
 	hostAgeID, loadErr := secretbox.LoadHostKey("/etc/faas/secrets/host.age")
 	if loadErr != nil {
@@ -1362,7 +1372,7 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 	// initialization look drifted.
 	sum := sha256.Sum256([]byte(secretbox.RecipientString(hostAgeID)))
 	got := hex.EncodeToString(sum[:])
-	for _, n := range nodes {
+	for _, n := range scoped {
 		if n.CertFingerprint == nil {
 			continue
 		}
@@ -1399,6 +1409,26 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 		}
 	}
 	return findings, nil
+}
+
+func doctorSecretModeAllowed(got, want os.FileMode) bool {
+	return got&^want == 0
+}
+
+// scopeDoctorNodes keeps host-local identity checks tied to the node whose
+// filesystem is being inspected. An unscoped doctor intentionally does not
+// call this helper: one host cannot validate another host's private secrets.
+func scopeDoctorNodes(nodes []releaseinstall.ComputeNodeRow, filter string) ([]releaseinstall.ComputeNodeRow, bool) {
+	if strings.TrimSpace(filter) == "" {
+		return nil, false
+	}
+	scoped := make([]releaseinstall.ComputeNodeRow, 0, 1)
+	for _, node := range nodes {
+		if node.Name == filter {
+			scoped = append(scoped, node)
+		}
+	}
+	return scoped, len(scoped) > 0
 }
 
 // builder-base ext4 hooks (issue #938 / PR-B / ADR-114). Package-level

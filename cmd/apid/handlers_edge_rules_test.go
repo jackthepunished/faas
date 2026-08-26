@@ -159,6 +159,187 @@ func TestCreateEdgeRule_HobbyJWT_Returns201(t *testing.T) {
 	}
 }
 
+// --- Issue #975 #3 / ADR-128 — top-level validate_mode wire field ---
+
+// edgeRuleValidateReq is the cheapest valid kind=validate body
+// for create. Used by the top-level validate_mode tests below.
+func edgeRuleValidateReq() api.CreateEdgeRuleRequest {
+	return api.CreateEdgeRuleRequest{
+		MatchHost:    "validate.example.com",
+		MatchPath:    "/",
+		MatchMethods: []string{"POST"},
+		Priority:     intPtr(100),
+		Enabled:      boolPtr(true),
+		Kind:         string(state.EdgeRuleKindValidate),
+		Action:       json.RawMessage(`{"schema":{"type":"object","required":["x"]}}`),
+	}
+}
+
+// TestCreateEdgeRule_ValidateModeTopLevel_Observed confirms
+// ADR-128 §D1: a top-level validate_mode on the wire surface
+// round-trips to the response and persists. The deprecated
+// action-level field is absent here (the new wire shape is
+// fully standalone).
+func TestCreateEdgeRule_ValidateModeTopLevel_Observed(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodetop")
+	req := edgeRuleValidateReq()
+	req.ValidateMode = api.ValidateModeObserve
+
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var out api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ValidateMode != api.ValidateModeObserve {
+		t.Errorf("response ValidateMode = %q, want %q (top-level wire field must surface)", out.ValidateMode, api.ValidateModeObserve)
+	}
+
+	// Read-back via GET-by-id must surface the same value.
+	rec = e.do(t, "GET", "/v1/edge-rules/"+out.ID, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal GET: %v", err)
+	}
+	if got.ValidateMode != api.ValidateModeObserve {
+		t.Errorf("GET ValidateMode = %q, want %q", got.ValidateMode, api.ValidateModeObserve)
+	}
+}
+
+// TestCreateEdgeRule_ValidateModeTopLevel_Warn confirms the
+// warn mode round-trips (the X-Validation-Warning header is
+// applied at the gateway hot path; this test only pins the
+// wire + store path).
+func TestCreateEdgeRule_ValidateModeTopLevel_Warn(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodetopwarn")
+	req := edgeRuleValidateReq()
+	req.ValidateMode = api.ValidateModeWarn
+
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var out api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ValidateMode != api.ValidateModeWarn {
+		t.Errorf("response ValidateMode = %q, want %q", out.ValidateMode, api.ValidateModeWarn)
+	}
+}
+
+// TestCreateEdgeRule_ValidateModeTopLevel_DefaultBlock confirms
+// that omitting the top-level field coerces to 'block' via the
+// SQL NOT NULL DEFAULT (the action-level field is also omitted
+// in this test). The create path's resolveValidateMode helper
+// returns "" for an empty top-level + empty action, and pgstore
+// coalesces that to 'block' at the SQL boundary.
+func TestCreateEdgeRule_ValidateModeTopLevel_DefaultBlock(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodetopdefault")
+	req := edgeRuleValidateReq()
+	// Both ValidateMode (top-level) and action.validate_mode
+	// omitted.
+
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var out api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ValidateMode != api.ValidateModeBlock {
+		t.Errorf("default ValidateMode = %q, want %q (NOT NULL DEFAULT 'block')", out.ValidateMode, api.ValidateModeBlock)
+	}
+}
+
+// TestCreateEdgeRule_ValidateModeTopLevel_RejectsInvalid pins
+// the closed-enum gate at the dto boundary. A typo like
+// "observ" must surface as a 400 with the closed list, NOT a
+// 500 from a later SQL CHECK violation.
+func TestCreateEdgeRule_ValidateModeTopLevel_RejectsInvalid(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodetopinvalid")
+	req := edgeRuleValidateReq()
+	req.ValidateMode = "observ" // typo
+
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_ValidateModeActionJSONFallback confirms
+// ADR-128 §D2: the deprecated action-level field still works
+// during the back-compat read window. A request with ONLY
+// action.validate_mode set (no top-level field) must surface
+// as that mode in the response.
+func TestCreateEdgeRule_ValidateModeActionJSONFallback(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodeactionfb")
+	req := edgeRuleValidateReq()
+	// Top-level ValidateMode: empty. Action-level only.
+	req.Action = json.RawMessage(
+		`{"schema":{"type":"object","required":["x"]},"validate_mode":"warn"}`,
+	)
+
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var out api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ValidateMode != api.ValidateModeWarn {
+		t.Errorf("back-compat fallback ValidateMode = %q, want %q (action-level field must still resolve during the read window)",
+			out.ValidateMode, api.ValidateModeWarn)
+	}
+}
+
+// TestUpdateEdgeRule_ValidateModeTopLevel confirms the
+// top-level UpdateEdgeRuleRequest.validate_mode persists.
+func TestUpdateEdgeRule_ValidateModeTopLevel(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "vmodeupd")
+	req := edgeRuleValidateReq()
+	// Create with 'block' default.
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var created api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if created.ValidateMode != api.ValidateModeBlock {
+		t.Fatalf("created.ValidateMode = %q, want %q", created.ValidateMode, api.ValidateModeBlock)
+	}
+
+	// PATCH to 'observe' via top-level wire field.
+	observe := api.ValidateModeObserve
+	upd := api.UpdateEdgeRuleRequest{ValidateMode: &observe}
+	rec = e.do(t, "PATCH", "/v1/edge-rules/"+created.ID, upd, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var updated api.EdgeRuleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if updated.ValidateMode != api.ValidateModeObserve {
+		t.Errorf("patched ValidateMode = %q, want %q", updated.ValidateMode, api.ValidateModeObserve)
+	}
+}
+
 // --- PR 5 (ADR-091 D11) — HS* dropped from JWT algorithm vocab ---
 
 // TestCreateEdgeRule_JWTRejectsHS256Alg pins that HS256 (and

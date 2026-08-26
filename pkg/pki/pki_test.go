@@ -159,6 +159,43 @@ func TestEnsureLeafWithSANsReissuesForNewTransportIdentity(t *testing.T) {
 	}
 }
 
+func TestEnsureLeafWithCNAndSANsReissuesForNodeIdentity(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	role := Role{
+		CommonName: "vmmd.faas",
+		Kind:       KindServer,
+		Directory:  "vmmd",
+		Filename:   "server",
+		AltNames:   ProductionSANs("vmmd.faas"),
+	}
+	if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, AltNames{DNSNames: []string{"fsn-3.gregale.dev"}}); err != nil {
+		t.Fatalf("EnsureLeafWithSANs: %v", err)
+	}
+	certPath, _ := LeafPaths(root, role)
+	before := parseTestCert(t, certPath)
+	nodeSAN := AltNames{DNSNames: []string{"fsn-3.gregale.dev"}}
+	if err := EnsureLeafWithCNAndSANs(root, role, "fsn-3.faas", caCert, caKey, false, nodeSAN); err != nil {
+		t.Fatalf("EnsureLeafWithCNAndSANs: %v", err)
+	}
+	after := parseTestCert(t, certPath)
+	if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
+		t.Fatal("EnsureLeafWithCNAndSANs did not reissue a leaf when the node CN changed")
+	}
+	if after.Subject.CommonName != "fsn-3.faas" {
+		t.Fatalf("CN = %q, want fsn-3.faas", after.Subject.CommonName)
+	}
+	if !certificateHasSANs(after, AltNames{DNSNames: []string{"vmmd.faas", "fsn-3.gregale.dev"}}) {
+		t.Fatalf("SANs = %v, want daemon and transport identities", after.DNSNames)
+	}
+	if err := EnsureLeafWithCNAndSANs(root, role, "fsn-3.faas", caCert, caKey, false, nodeSAN); !errors.Is(err, ErrLeafNotExpiringSoon) {
+		t.Fatalf("second EnsureLeafWithCNAndSANs = %v, want ErrLeafNotExpiringSoon", err)
+	}
+}
+
 // TestEnsureLeafForceRotates verifies that force=true re-issues even
 // when the existing leaf is fresh. The serial number must differ.
 func TestEnsureLeafForceRotates(t *testing.T) {
@@ -252,6 +289,71 @@ func TestEnsureLeafClientExtKeyUsage(t *testing.T) {
 	}
 	if hasEKU(cert, x509.ExtKeyUsageServerAuth) {
 		t.Error("client leaf carries ServerAuth EKU — defense-in-depth violation")
+	}
+}
+
+func TestValidateTrustBundleDoesNotNeedCAKey(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	extra := AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}
+	for _, role := range RolesForBox("compute-only") {
+		if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, extra); err != nil {
+			t.Fatalf("EnsureLeafWithSANs(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	_, caKeyPath := CARoot(root)
+	if err := os.Remove(caKeyPath); err != nil {
+		t.Fatalf("remove CA key: %v", err)
+	}
+	if err := ValidateTrustBundle(root, "compute-only", extra); err != nil {
+		t.Fatalf("ValidateTrustBundle: %v", err)
+	}
+}
+
+func TestValidateTrustBundleForNodeRejectsGenericVMMDIdentity(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	extra := AltNames{DNSNames: []string{"fsn-3.gregale.dev"}}
+	for _, role := range RolesForBox("compute-only") {
+		if err := EnsureLeafWithSANs(root, role, caCert, caKey, false, extra); err != nil {
+			t.Fatalf("EnsureLeafWithSANs(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	if err := ValidateTrustBundleForNode(root, "compute-only", extra, "fsn-3.faas"); err == nil {
+		t.Fatal("ValidateTrustBundleForNode accepted generic vmmd CN")
+	}
+	for _, role := range RolesForBox("compute-only") {
+		if role.Directory != "vmmd" {
+			continue
+		}
+		if err := EnsureLeafWithCNAndSANs(root, role, "fsn-3.faas", caCert, caKey, true, extra); err != nil {
+			t.Fatalf("EnsureLeafWithCNAndSANs(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	if err := ValidateTrustBundleForNode(root, "compute-only", extra, "fsn-3.faas"); err != nil {
+		t.Fatalf("ValidateTrustBundleForNode after node issuance: %v", err)
+	}
+}
+
+func TestValidateTrustBundleRejectsMissingTransportSAN(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	for _, role := range RolesForBox("compute-only") {
+		if err := EnsureLeaf(root, role, caCert, caKey, false); err != nil {
+			t.Fatalf("EnsureLeaf(%s/%s): %v", role.Directory, role.Filename, err)
+		}
+	}
+	if err := ValidateTrustBundle(root, "compute-only", AltNames{DNSNames: []string{"fsn-2.gregale.dev"}}); err == nil {
+		t.Fatal("ValidateTrustBundle succeeded with a missing transport SAN")
 	}
 }
 

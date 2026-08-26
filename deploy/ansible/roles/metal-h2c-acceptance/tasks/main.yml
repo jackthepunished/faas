@@ -1,0 +1,192 @@
+# G19.3 / ADR-127 Layer 12 — metal-only H2C acceptance fixture.
+#
+# This role is intentionally guarded and opt-in. It is a fixture harness for
+# a real KVM host, not a production bootstrap role. The five acceptance tasks
+# below are kept separate so Ansible output names the exact failed gate.
+
+- name: metal-h2c-acceptance — require explicit opt-in
+  ansible.builtin.assert:
+    that:
+      - mha_enabled | bool
+    fail_msg: >-
+      metal-h2c-acceptance is opt-in. Set mha_enabled=true from the dedicated
+      acceptance inventory or playbook; bootstrap.yml never enables this role.
+
+- name: metal-h2c-acceptance — require Linux x86_64 KVM host
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system == 'Linux'
+      - (not (mha_require_x86_64 | bool)) or ansible_facts.architecture in ['x86_64', 'amd64']
+    fail_msg: >-
+      G19.3 requires a Linux x86_64 bare-metal host; got
+      {{ ansible_facts.system }}/{{ ansible_facts.architecture }}.
+
+- name: metal-h2c-acceptance — inspect /dev/kvm
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: mha_kvm_stat
+
+- name: metal-h2c-acceptance — require /dev/kvm
+  ansible.builtin.assert:
+    that:
+      - (not (mha_require_kvm | bool)) or (mha_kvm_stat.stat.exists and mha_kvm_stat.stat.ischr)
+    fail_msg: >-
+      /dev/kvm is unavailable. Run the G19.3 role on the designated bare-metal
+      acceptance host with KVM enabled; do not bypass this gate on production.
+
+- name: metal-h2c-acceptance — derive fixture IDs
+  ansible.builtin.set_fact:
+    mha_fixture_ids: "{{ mha_fixture_apps | map(attribute='id') | list }}"
+
+- name: metal-h2c-acceptance — pin the canonical five-app fixture set
+  ansible.builtin.assert:
+    that:
+      - mha_fixture_apps | length == 5
+      - (mha_fixture_ids | unique | length) == 5
+      - (mha_fixture_ids | sort) == (mha_expected_fixture_ids | sort)
+    fail_msg: >-
+      The G19.3 fixture set must contain exactly the five canonical IDs:
+      {{ mha_expected_fixture_ids | join(', ') }}.
+
+- name: metal-h2c-acceptance — validate each fixture contract
+  ansible.builtin.assert:
+    that:
+      - item.id | length > 0
+      - item.slug | length > 0
+      - item.app_protocol in ['http1', 'http2', 'grpc']
+      - item.expected_framing in ['h1', 'h2c']
+      - item.probe in ['http1', 'h2c', 'grpc', 'rollback']
+    fail_msg: "Invalid G19.3 fixture definition: {{ item | to_json }}"
+  loop: "{{ mha_fixture_apps }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: metal-h2c-acceptance — require provisioning inputs when enabled
+  ansible.builtin.assert:
+    that:
+      - mha_fixture_provision_command | length > 0
+      - mha_api_base | length > 0
+      - mha_api_token | length > 0
+    fail_msg: >-
+      mha_provision_fixtures=true requires an explicit provision command,
+      mha_api_base, and mha_api_token. The role never invents a token or
+      mutates the production API implicitly.
+  when: mha_provision_fixtures | bool
+
+- name: metal-h2c-acceptance — ensure runner group exists
+  ansible.builtin.group:
+    name: "{{ mha_runner_group }}"
+    system: true
+    state: present
+
+- name: metal-h2c-acceptance — ensure runner user exists
+  ansible.builtin.user:
+    name: "{{ mha_runner_user }}"
+    group: "{{ mha_runner_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    password: '*'
+
+- name: metal-h2c-acceptance — create harness directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ mha_runner_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ mha_install_dir }}", mode: '0750' }
+    - { path: "{{ mha_fixture_env_path | dirname }}", mode: '0750' }
+
+- name: metal-h2c-acceptance — install acceptance harness
+  ansible.builtin.copy:
+    src: metal-acceptance.sh
+    dest: "{{ mha_harness_path }}"
+    owner: root
+    group: "{{ mha_runner_group }}"
+    mode: '0750'
+  register: mha_harness_file
+
+- name: metal-h2c-acceptance — render fixture environment
+  ansible.builtin.template:
+    src: fixture-apps.env.j2
+    dest: "{{ mha_fixture_env_path }}"
+    owner: root
+    group: "{{ mha_runner_group }}"
+    mode: '0640'
+  no_log: true
+  register: mha_fixture_env_file
+
+- name: metal-h2c-acceptance — install systemd unit
+  ansible.builtin.template:
+    src: h2c-acceptance.service.j2
+    dest: "/etc/systemd/system/{{ mha_service_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  register: mha_service_file
+
+- name: metal-h2c-acceptance — reload systemd after unit changes
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: mha_service_file.changed
+
+- name: metal-h2c-acceptance — provision the five fixture apps
+  ansible.builtin.shell: "{{ mha_fixture_provision_command }}"
+  args:
+    executable: /bin/bash
+    chdir: "{{ mha_install_dir }}"
+  environment:
+    FAAS_API: "{{ mha_api_base }}"
+    FAAS_TOKEN: "{{ mha_api_token }}"
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  no_log: true
+  when: mha_provision_fixtures | bool
+
+- name: metal-h2c-acceptance — HTTP/1.1 baseline gate
+  ansible.builtin.command:
+    argv: ["{{ mha_harness_path }}", http1, app_http1_default]
+  environment:
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  changed_when: false
+  when: mha_run_acceptance | default(false) | bool
+
+- name: metal-h2c-acceptance — H2 prior-knowledge unary gate
+  ansible.builtin.command:
+    argv: ["{{ mha_harness_path }}", h2c-prior-knowledge, app_http2_prior_knowledge]
+  environment:
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  changed_when: false
+  when: mha_run_acceptance | default(false) | bool
+
+- name: metal-h2c-acceptance — gRPC trailers and streaming gate
+  ansible.builtin.command:
+    argv: ["{{ mha_harness_path }}", grpc-trailers, app_grpc_unary, app_grpc_server_streaming]
+  environment:
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  changed_when: false
+  when: mha_run_acceptance | default(false) | bool
+
+- name: metal-h2c-acceptance — surgical rollback gate
+  ansible.builtin.command:
+    argv: ["{{ mha_harness_path }}", surgical-rollback, app_surgical_rollback_target]
+  environment:
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  changed_when: false
+  when: mha_run_acceptance | default(false) | bool
+
+- name: metal-h2c-acceptance — wholesale rollback gate
+  ansible.builtin.command:
+    argv: ["{{ mha_harness_path }}", wholesale-rollback, app_surgical_rollback_target]
+  environment:
+    FAAS_H2C_FIXTURE_ENV: "{{ mha_fixture_env_path }}"
+  changed_when: false
+  when: mha_run_acceptance | default(false) | bool
+
+- name: metal-h2c-acceptance — apply requested service state
+  ansible.builtin.systemd:
+    name: "{{ mha_service_name }}"
+    enabled: "{{ mha_service_enabled | bool }}"
+    state: "{{ mha_service_state }}"
+  when: mha_service_enabled | bool or mha_service_state != 'stopped'

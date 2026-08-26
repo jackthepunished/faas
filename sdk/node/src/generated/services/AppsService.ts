@@ -11,6 +11,8 @@ import type { AppRoutesResponse } from '../models/AppRoutesResponse.js';
 import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
 import type { AppStreamingStatus } from '../models/AppStreamingStatus.js';
+import type { AppUsageSummaryResponse } from '../models/AppUsageSummaryResponse.js';
+import type { AppWakeTimelineResponse } from '../models/AppWakeTimelineResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { DebugTelemetryListResponse } from '../models/DebugTelemetryListResponse.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
@@ -217,6 +219,149 @@ export class AppsService {
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
+        402: `Plan does not unlock the per-app metrics surface. Free
+        plan — Hobby or above required. The gate runs BEFORE
+        \`loadApp\` so a Free customer probing a slug never gets a
+        404 (slug-leak guard).
+        `,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app wake timeline (JSON mirror of the dashboard page).
+   * Wire-friendly mirror of the dashboard's per-app wake-timeline
+   * HTML page (`/dashboard/apps/{slug}/wake-timeline`,
+   * cmd/apid/handlers_dashboard.go:2548 renderAppWakeTimeline).
+   * The HTML page keeps its pre-rendered HTML chips; this endpoint
+   * emits the same data as JSON so a separate frontend agent can
+   * render without re-parsing HTML.
+   *
+   * Returns the 50 most-recent instance rows for the app, joined
+   * against the events table's `wake.boot_started` rows for the
+   * per-row telemetry (Trigger, QueuedCount, ConcurrencyAtAdmit,
+   * AtCapacity, ReadyInMS). The aggregation math is shared with
+   * the HTML page:
+   *
+   * - 24h cutoff descending-break: the moment a row's
+   * `started_at` falls before the trailing-24h instant, the
+   * loop breaks (no further iteration). Pre-ADR-123 fleet
+   * rows with no `started_at` are not eligible for the break
+   * (always in scope).
+   * - Two-denominator rule for `at_capacity_pct`: numerator is
+   * the count of rows where the events join succeeded AND
+   * the at_capacity flag is true; denominator is the count
+   * of rows where the events join succeeded
+   * (`wake_count_with_meta`). Pre-PR-A fleet rows contribute
+   * to `wake_count_24h` but not the denominator — same
+   * posture as the HTML page.
+   *
+   * Plan-gated Hobby+ (mirror of /v1/apps/{slug}/metrics —
+   * same `code` so a downgrade between the two endpoints flips
+   * both at once).
+   *
+   * @returns AppWakeTimelineResponse The wake-timeline snapshot.
+   * @throws ApiError
+   */
+  public static getAppWakeTimeline({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<AppWakeTimelineResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/wake-timeline',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        402: `Plan does not unlock the per-app wake-timeline. Free plan —
+        Hobby or above required. Same code as /v1/apps/{slug}/metrics
+        (plan_per_app_metrics_not_allowed) so a single downgrade
+        flips both endpoints at once.
+        `,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app billing usage summary (trailing 30d by default).
+   * Customer-facing billing rollup for one app over a caller-
+   * supplied window (default: trailing 30d, clamped at 90d upper
+   * bound). Plan-gated Hobby+ — Free gets 402
+   * `plan_app_usage_summary_not_allowed`.
+   *
+   * Window resolution: `since` and `until` are RFC3339 timestamps.
+   * Both default to UTC midnight snaps; `until` defaults to
+   * `now()` snapped down, `since` defaults to `until - 30d`. The
+   * handler clamps `since` to `until - 90d` so a customer cannot
+   * unbounded-scan `usage_minutes` (ADR-048 retention is 30d; the
+   * 90d ceiling is a forward-compatibility ceiling for when
+   * `usage_daily` lands).
+   *
+   * Overage computation: `overage_gb_hours = max(0, gb_hours -
+   * plan_included_gb_hours)`. The included band is echoed from
+   * `acct.Plan.PlanIncludedGBHours()`; the overage figure is the
+   * integer-rounded float the Stripe pusher bills at €0.01/GB-h.
+   *
+   * Source: `usage_minutes` today (after the 30d retention cap).
+   * `usage_daily` / `mixed` land with the trail-period reader
+   * follow-up — same wire shape, no migration needed.
+   *
+   * @returns AppUsageSummaryResponse The usage summary.
+   * @throws ApiError
+   */
+  public static getAppUsage({
+    slug,
+    since,
+    until,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * RFC3339 lower bound. Default: `until - 30d`.
+     */
+    since?: string,
+    /**
+     * RFC3339 upper bound. Default: `now()` snapped to UTC midnight.
+     */
+    until?: string,
+  }): CancelablePromise<AppUsageSummaryResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/usage',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'since': since,
+        'until': until,
+      },
+      errors: {
+        400: `Invalid window — \`since\`/\`until\` not RFC3339, or \`since\`
+        later than \`until\`.
+        `,
+        401: `code: unauthorized`,
+        402: `Plan does not unlock the per-app usage summary. Free
+        plan — Hobby or above required. Same posture as the
+        other per-app observability surfaces; the gate runs
+        BEFORE \`loadApp\` so a Free customer probing a slug
+        never gets a 404 (slug-leak guard).
+        `,
         404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
@@ -453,6 +598,11 @@ export class AppsService {
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
+        402: `Plan does not unlock the per-app error surfacing. Free
+        plan — Hobby or above required. The gate runs BEFORE
+        \`loadApp\` so a Free customer probing a slug never gets
+        a 404 (slug-leak guard).
+        `,
         404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).

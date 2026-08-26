@@ -235,6 +235,28 @@ func TestReconcileManifestBuilderBase_DigestMatchOK(t *testing.T) {
 	}
 }
 
+func TestReconcileManifestBuilderBase_RawManifestDigestMatchOK(t *testing.T) {
+	// Production manifests use the raw 64-hex form, while OCI references
+	// necessarily use sha256:<hex>. The reconcile gate must normalize both.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "manifest.yaml")
+	d := sha256hex64()
+	rawManifest := strings.Replace(
+		manifestWithBuilderDigest(d),
+		"builder_base_digest: sha256:"+d,
+		"builder_base_digest: "+d,
+		1,
+	)
+	if err := os.WriteFile(p, []byte(rawManifest), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("FAAS_MANIFEST_PATH", p)
+	t.Setenv("FAAS_BUILDER_BASE_REF", "ghcr.io/x/base@sha256:"+d)
+	if err := reconcileManifestBuilderBase(); err != nil {
+		t.Errorf("reconcile(raw manifest match) = %v; want nil", err)
+	}
+}
+
 func TestReconcileManifestBuilderBase_ManifestUnreadable(t *testing.T) {
 	t.Setenv("FAAS_MANIFEST_PATH", "/nonexistent/manifest.yaml")
 	t.Setenv("FAAS_BUILDER_BASE_REF", "")

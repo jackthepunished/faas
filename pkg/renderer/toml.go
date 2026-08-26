@@ -101,7 +101,7 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 	if ctx.HostRole == "compute-only" {
 		dbURL = ""
 	}
-	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, dbURL, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
+	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, dbURL, ctx.AppsDomain, ctx.HostAddress, host.PrivateKeys, flat); err != nil {
 		return nil, nil, err
 	}
 
@@ -129,9 +129,9 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 // flatMap under their leaf names. Missing manifest values (e.g. a
 // schedd with no apps_domain) yield an empty value; the validator +
 // daemon-load path handle the absent-key shape.
-func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain string, keys []string, flat map[string]string) error {
+func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain, hostAddress string, keys []string, flat map[string]string) error {
 	for _, k := range keys {
-		v, err := privateKeyValue(daemon, dc, dbURL, appsDomain, k)
+		v, err := privateKeyValue(daemon, dc, dbURL, appsDomain, hostAddress, k)
 		if err != nil {
 			return fmt.Errorf("renderer: %s: %s: %w", daemon, k, err)
 		}
@@ -155,7 +155,7 @@ func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain
 // into their TOML so the daemons can serve tenant requests with
 // the canonical apps_domain. Empty appsDomain is acceptable (the
 // daemon falls back to FAAS_APPS_DOMAIN env var).
-func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain, key string) (string, error) {
+func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain, hostAddress, key string) (string, error) {
 	switch key {
 	case "socket_path":
 		// unix:///run/faas/<daemon>.sock → /run/faas/<daemon>.sock
@@ -198,6 +198,10 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain
 		// compute-only gatewayd must instead use the control-plane
 		// listener rendered by the split-box manifest.
 		return dc.APIDLoopback, nil
+	case "schedd_tls_cert_path", "schedd_tls_key_path", "schedd_tls_ca_path":
+		return tlsMaterialValue(dc.ScheddTLS, key, "schedd_tls_"), nil
+	case "egress_tls_cert_path", "egress_tls_key_path", "egress_tls_ca_path":
+		return tlsMaterialValue(dc.EgressTLS, key, "egress_tls_"), nil
 	case "vmmd_socket":
 		// schedd's legacy unix fallback. TCP targets are rendered into
 		// vmmd_target instead so the daemon cannot silently dial its local
@@ -207,11 +211,17 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain
 		}
 		return "", nil
 	case "vmmd_target":
+		if daemon == "builderd" && hostAddress != "" {
+			return manifest.TCPURL(hostAddress)
+		}
 		if dc.Outbound != nil && !strings.HasPrefix(dc.Outbound.Target, "unix://") {
 			return dc.Outbound.Target, nil
 		}
 		return "", nil
 	case "vmmd_tls_cert_path", "vmmd_tls_key_path", "vmmd_tls_ca_path":
+		if daemon == "gatewayd-internal" {
+			return tlsMaterialValue(dc.VMMTLS, key, "vmmd_tls_"), nil
+		}
 		if dc.Outbound == nil || dc.Outbound.TLS == nil {
 			return "", nil
 		}
@@ -223,6 +233,10 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain
 		default:
 			return dc.Outbound.TLS.CAPath, nil
 		}
+	case "schedd_client_cert_path", "schedd_client_key_path", "schedd_client_ca_path":
+		return tlsMaterialValue(dc.ScheddClientTLS, key, "schedd_client_"), nil
+	case "advisory_client_cert_path", "advisory_client_key_path", "advisory_client_ca_path":
+		return tlsMaterialValue(dc.AdvisoryClientTLS, key, "advisory_client_"), nil
 	case "gateway_synth_socket":
 		if dc.GatewaySynthTarget == "" && dc.Outbound != nil && strings.HasPrefix(dc.Outbound.Target, "unix://") {
 			return strings.TrimPrefix(dc.Outbound.Target, "unix://"), nil
@@ -242,19 +256,39 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain
 		// will fail loudly if the field is required.
 		return "", nil
 	case "tls_cert_path", "tls_key_path", "tls_ca_path":
-		if dc.TLS == nil {
+		material := dc.TLS
+		if daemon == "builderd" && dc.Outbound != nil {
+			material = dc.Outbound.TLS
+		}
+		if material == nil {
 			return "", nil
 		}
 		switch key {
 		case "tls_cert_path":
-			return dc.TLS.CertPath, nil
+			return material.CertPath, nil
 		case "tls_key_path":
-			return dc.TLS.KeyPath, nil
+			return material.KeyPath, nil
 		case "tls_ca_path":
-			return dc.TLS.CAPath, nil
+			return material.CAPath, nil
 		}
 	}
 	return "", nil
+}
+
+func tlsMaterialValue(material *manifest.TLSMaterial, key, prefix string) string {
+	if material == nil {
+		return ""
+	}
+	switch key {
+	case prefix + "cert_path":
+		return material.CertPath
+	case prefix + "key_path":
+		return material.KeyPath
+	case prefix + "ca_path":
+		return material.CAPath
+	default:
+		return ""
+	}
 }
 
 // defaultMetricsAddrForDaemon returns the Prometheus metrics endpoint

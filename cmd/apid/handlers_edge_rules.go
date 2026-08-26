@@ -49,8 +49,22 @@ const (
 // edgeRuleResponse builds the wire shape. Action is re-marshalled
 // verbatim — the kind-specific struct has already been validated
 // and round-tripped through jsonb on the read path.
+//
+// ValidateMode is surfaced at the top level (ADR-128 D1).
+// The SQL column is NOT NULL DEFAULT 'block', so a pgstore
+// round-trip always carries a value; the memstore preserves
+// empty verbatim (memstore.go:CreateEdgeRule). We default to
+// 'block' here so the wire response always carries a resolved
+// value regardless of backing store. The action-level field is
+// also re-emitted for the back-compat window (ADR-128 D2) so
+// older clients reading action.validate_mode still see the
+// same value.
 func edgeRuleResponse(r state.EdgeRule) api.EdgeRuleResponse {
 	actionBytes, _ := json.Marshal(r.Action)
+	mode := r.ValidateMode
+	if mode == "" {
+		mode = api.ValidateModeBlock
+	}
 	return api.EdgeRuleResponse{
 		ID:           r.ID,
 		AccountID:    r.AccountID,
@@ -61,6 +75,7 @@ func edgeRuleResponse(r state.EdgeRule) api.EdgeRuleResponse {
 		Priority:     r.Priority,
 		Enabled:      r.Enabled,
 		Kind:         string(r.Kind),
+		ValidateMode: mode,
 		Action:       actionBytes,
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
@@ -313,6 +328,14 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		Enabled:      enabled,
 		Kind:         state.EdgeRuleKind(req.Kind),
 		Action:       actionFromBody(req.Kind, req.Action),
+		// ValidateMode (ADR-128 D1): the top-level wire
+		// field is the source of truth for kind=validate.
+		// If the wire field is empty (client didn't send
+		// the new top-level field), fall back to the
+		// deprecated action-level field for the
+		// back-compat window (D2). Empty result is fine —
+		// the SQL coalesce forces 'block' on insert.
+		ValidateMode: resolveValidateMode(req.Kind, req.ValidateMode, req.Action),
 	}, limits)
 	if err != nil {
 		var qe *state.EdgeRuleQuotaError
@@ -380,6 +403,19 @@ func validateEdgeRuleBody(req *api.CreateEdgeRuleRequest, plan api.Plan) *api.Pr
 		if *req.Priority < 0 || *req.Priority > 10000 {
 			return api.ErrValidation(fmt.Sprintf("priority must be in 0..10000 (got %d)", *req.Priority))
 		}
+	}
+	// ValidateMode (ADR-128 D1): the top-level wire field
+	// must be one of the closed enum if set. Empty == 'block'
+	// (the SQL-side default). The action-level field is also
+	// validated by validateEdgeRuleAction via the
+	// EdgeRuleValidateAction.Validate() path.
+	if req.ValidateMode != "" &&
+		req.ValidateMode != api.ValidateModeBlock &&
+		req.ValidateMode != api.ValidateModeObserve &&
+		req.ValidateMode != api.ValidateModeWarn {
+		return api.ErrValidation(fmt.Sprintf(
+			"validate_mode must be one of %q, %q, %q (got %q)",
+			api.ValidateModeBlock, api.ValidateModeObserve, api.ValidateModeWarn, req.ValidateMode))
 	}
 	if len(req.Action) == 0 {
 		return api.ErrValidation("action is required")
@@ -625,6 +661,21 @@ func (s *server) updateEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 			return
 		}
 	}
+	// ValidateMode (ADR-128 D1): top-level wire field on
+	// update must be the closed enum when set. nil == "leave
+	// alone" (no row update). The action-level field is
+	// validated inside validateEdgeRuleAction via the
+	// EdgeRuleValidateAction.Validate() path.
+	if req.ValidateMode != nil &&
+		*req.ValidateMode != "" &&
+		*req.ValidateMode != api.ValidateModeBlock &&
+		*req.ValidateMode != api.ValidateModeObserve &&
+		*req.ValidateMode != api.ValidateModeWarn {
+		api.WriteProblem(w, api.ErrValidation(fmt.Sprintf(
+			"validate_mode must be one of %q, %q, %q (got %q)",
+			api.ValidateModeBlock, api.ValidateModeObserve, api.ValidateModeWarn, *req.ValidateMode)))
+		return
+	}
 	// Build the update params. Lowercase the host on write so the
 	// gateway matcher can do case-insensitive compares without
 	// per-request ToLower.
@@ -677,7 +728,60 @@ func edgeRuleUpdateParamsFrom(req api.UpdateEdgeRuleRequest, kind state.EdgeRule
 		decoded := actionFromBody(string(kind), *req.Action)
 		out.Action = &decoded
 	}
+	// ValidateMode (ADR-128 D1): top-level wire field wins.
+	// If absent (nil pointer) AND Action carries a deprecated
+	// action-level value, fall back to that for the
+	// back-compat window (D2). A non-nil empty string is
+	// the customer's explicit "reset to default" — pgstore
+	// Update coalesces '' to validate_mode = validate_mode
+	// (leave alone), so empty still leaves the column
+	// untouched unless the action JSON supplied a value.
+	// This matches the shape of Priority / Enabled.
+	if req.ValidateMode != nil {
+		out.ValidateMode = req.ValidateMode
+	} else if req.Action != nil {
+		if mode := validateModeFromAction(string(kind), *req.Action); mode != "" {
+			out.ValidateMode = &mode
+		}
+	}
 	return out
+}
+
+// resolveValidateMode picks the source of truth for the
+// kind=validate validate_mode field on the create path
+// (ADR-128 D1+D2). Top-level wire field wins when set; the
+// deprecated action-level value is the fallback for the
+// back-compat window. Returns "" for non-validate kinds
+// (the column is NOT NULL DEFAULT 'block' so the pgstore
+// coalesce handles the empty case correctly).
+func resolveValidateMode(kind string, topLevel string, actionRaw json.RawMessage) string {
+	if topLevel != "" {
+		return topLevel
+	}
+	return validateModeFromAction(kind, actionRaw)
+}
+
+// validateModeFromAction extracts the kind=validate mode from
+// a wire action JSON, returning an empty string for non-validate
+// kinds or for validate kinds without the field set. The pgstore
+// INSERT coalesces an empty value to 'block' (the SQL-side
+// default at 00293 is also 'block') so empty is the right
+// sentinel for "use the strictest mode".
+func validateModeFromAction(kind string, raw json.RawMessage) string {
+	if kind != string(state.EdgeRuleKindValidate) {
+		return ""
+	}
+	var a api.EdgeRuleValidateAction
+	if err := json.Unmarshal(raw, &a); err != nil {
+		// actionFromBody would have already surfaced this
+		// error path; reaching here means the body decoded
+		// at least syntactically. Treat malformed fragments
+		// as "use the default" rather than 500ing on the
+		// re-decode — the primary decode already cleared
+		// the validateEdgeRuleAction gate.
+		return ""
+	}
+	return a.ValidateMode
 }
 
 // --- delete ----------------------------------------------------------------

@@ -39,7 +39,14 @@ export type EdgeRuleResponse = {
   match_methods: Array<string>;
   priority: number;
   enabled: boolean;
-  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget' | 'cache';
+  /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Resolved mode; always present on read. Empty on read
+   * would be a database invariant violation.
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
   /**
    * Kind-tagged union — shape varies by `kind`.
    */

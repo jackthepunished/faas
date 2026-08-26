@@ -30,6 +30,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -101,7 +102,7 @@ func setComputeNodesStoreOpener(fn func() (state.Store, func(), error)) {
 // existing openPgPoolFromEnv helper (commands_release.go:344). The
 // returned close func releases the pool when the caller defers it.
 func openComputeNodesStore() (state.Store, func(), error) {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("gregalectl compute-nodes: %w", err)
 	}
@@ -113,8 +114,9 @@ func openComputeNodesStore() (state.Store, func(), error) {
 // deleting the import in a refactor.
 var _ = (*pgxpool.Pool)(nil)
 
-// cmdComputeNodesDrain runs `UPDATE compute_nodes SET active=false
-// WHERE id=<fqdn>` via state.Store.MarkComputeNodeInactive.
+// cmdComputeNodesDrain resolves the operator-facing node name to its row ID,
+// then runs `UPDATE compute_nodes SET active=false` via
+// state.Store.MarkComputeNodeInactive.
 func cmdComputeNodesDrain(args []string) int {
 	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -126,14 +128,20 @@ func cmdComputeNodesDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
 		return 1
 	}
@@ -161,7 +169,7 @@ func cmdComputeNodesDrainStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -169,7 +177,12 @@ func cmdComputeNodesDrainStatus(args []string) int {
 	defer closeFn()
 
 	ctx := context.Background()
-	insts, err := st.ListInstancesByNodeID(ctx, *node)
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
+		return 1
+	}
+	insts, err := st.ListInstancesByNodeID(ctx, computeNode.ID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
 		return 1
@@ -203,14 +216,20 @@ func cmdComputeNodesActivate(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.SetComputeNodeActive(context.Background(), *node, true); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
+		return 1
+	}
+	if err := st.SetComputeNodeActive(ctx, computeNode.ID, true); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
 		return 1
 	}
@@ -239,14 +258,20 @@ func cmdComputeNodesForceDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain: --yes required (live instances may be cold-evicted)")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
 		return 1
 	}
@@ -566,6 +591,7 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	maxConc := fs.Int("max-concurrency", 0, "max concurrent live instances")
 	admCeil := fs.Int("admission-ceiling-mb", 0, "tenant RAM admission ceiling (85% of mem-mb for production nodes)")
 	fromFile := fs.String("from-file", "", "read a computeNodePayload-shaped JSON file instead of the per-field flags (PR-B bridge)")
+	deferActivation := fs.Bool("defer-activation", false, "insert/update the row drained so a deployment can activate it after readiness checks")
 	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -640,9 +666,14 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	// preserves them. The cold-insert branch (no existing row)
 	// leaves them nil — same as the pre-PR-A apid behavior.
 	node := state.ComputeNode{
-		Name:               payload.Name,
-		TargetURL:          payload.TargetURL,
-		VPCPUs:             payload.VPCPUs,
+		Name:      payload.Name,
+		TargetURL: payload.TargetURL,
+		VPCPUs:    payload.VPCPUs,
+		// The database enforces a positive per-node vCPU budget. The
+		// operator payload historically carried physical vCPUs only, so
+		// derive the default using the same 8x overcommit policy as the
+		// scheduler instead of sending zero and violating the schema.
+		VCPUBudget:         payload.VPCPUs * api.CPUOvercommit,
 		MemMB:              payload.MemMB,
 		MaxConcurrency:     payload.MaxConcurrency,
 		AdmissionCeilingMB: payload.AdmissionCeilingMB,
@@ -661,6 +692,13 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: upsert: %v\n", err)
 		return 1
+	}
+	if *deferActivation {
+		if err := st.SetComputeNodeActive(context.Background(), row.ID, false); err != nil {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: defer activation: %v\n", err)
+			return 1
+		}
+		row.Active = false
 	}
 
 	// `compute_node_changed` pg_notify trigger (migration 00026) fires

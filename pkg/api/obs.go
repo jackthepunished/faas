@@ -145,6 +145,256 @@ type ObsTenantDetailResponse struct {
 	Sessions ObsTenantCounts `json:"sessions"`
 }
 
+// ObsTenant360Response is the bounded operator view for one tenant. It keeps
+// the existing identity/application projection and adds month-scoped usage
+// plus a small billing window, so routine support work does not require a
+// direct database query.
+type ObsTenant360Response struct {
+	Account  ObsTenantRow     `json:"account"`
+	Apps     []ObsTenantApp   `json:"apps"`
+	Orgs     []ObsTenantOrg   `json:"orgs"`
+	APIKeys  ObsTenantCounts  `json:"api_keys"`
+	Sessions ObsTenantCounts  `json:"sessions"`
+	Usage    ObsTenantUsage   `json:"usage"`
+	Billing  ObsTenantBilling `json:"billing"`
+}
+
+type ObsTenantUsage struct {
+	Month           string              `json:"month"`
+	UsedGBHours     float64             `json:"used_gb_hours"`
+	IncludedGBHours int64               `json:"included_gb_hours"`
+	OverageGBHours  float64             `json:"overage_gb_hours"`
+	OverageCents    int64               `json:"overage_cents"`
+	UsedCPUHours    float64             `json:"used_cpu_hours"`
+	UsedEgressGB    float64             `json:"used_egress_gb"`
+	UsedIngressGB   float64             `json:"used_ingress_gb"`
+	ColdBootTotal   int64               `json:"cold_boots"`
+	Requests        int64               `json:"requests"`
+	Apps            []ObsTenantUsageApp `json:"apps"`
+}
+
+type ObsTenantUsageApp struct {
+	AppID      string `json:"app_id"`
+	AppSlug    string `json:"app_slug,omitempty"`
+	MBSeconds  int64  `json:"mb_seconds"`
+	CPUUsec    int64  `json:"cpu_usec"`
+	Requests   int64  `json:"requests"`
+	TXBytes    int64  `json:"tx_bytes"`
+	NetTxBytes int64  `json:"net_tx_bytes"`
+	NetRxBytes int64  `json:"net_rx_bytes"`
+	ColdBoots  int64  `json:"cold_boots"`
+}
+
+type ObsTenantBilling struct {
+	CurrentMonthOverageCents int64               `json:"current_month_overage_cents"`
+	OverageCapCents          *int64              `json:"overage_cap_cents,omitempty"`
+	ActiveCreditsCents       int64               `json:"active_credits_cents"`
+	Invoices                 []ObsInvoiceSummary `json:"invoices"`
+}
+
+type ObsInvoiceSummary struct {
+	ID              string    `json:"id"`
+	Provider        string    `json:"provider"`
+	Number          string    `json:"number,omitempty"`
+	Status          string    `json:"status"`
+	Currency        string    `json:"currency"`
+	PeriodStart     time.Time `json:"period_start"`
+	PeriodEnd       time.Time `json:"period_end"`
+	TotalCents      int64     `json:"total_cents"`
+	AmountPaidCents int64     `json:"amount_paid_cents"`
+}
+
+// ObsCapacityResponse is the bounded fleet capacity snapshot used by the
+// operator capacity page. It contains resource headroom and placement
+// counters, never workload rows.
+type ObsCapacityResponse struct {
+	GeneratedAt time.Time          `json:"generated_at"`
+	Summary     ObsCapacitySummary `json:"summary"`
+	Nodes       []ObsCapacityNode  `json:"nodes"`
+}
+
+type ObsCapacitySummary struct {
+	TotalNodes              int   `json:"total_nodes"`
+	ActiveNodes             int   `json:"active_nodes"`
+	InactiveNodes           int   `json:"inactive_nodes"`
+	TotalVCPUs              int64 `json:"total_vcpus"`
+	TotalVCPUBudget         int64 `json:"total_vcpu_budget"`
+	TotalMemMB              int64 `json:"total_mem_mb"`
+	TotalAdmissionCeilingMB int64 `json:"total_admission_ceiling_mb"`
+	RAMUsedMB               int64 `json:"ram_used_mb"`
+	AdmissionMarginMB       int64 `json:"admission_margin_mb"`
+	InstancesLive           int64 `json:"instances_live"`
+	InstancesRunning        int64 `json:"instances_running"`
+	InstancesWaking         int64 `json:"instances_waking"`
+	InstancesColdBooting    int64 `json:"instances_cold_booting"`
+	AppsTotal               int64 `json:"apps_total"`
+	TenantsTotal            int64 `json:"tenants_total"`
+	UnplacedApps            int64 `json:"unplaced_apps"`
+}
+
+type ObsCapacityNode struct {
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	Active               bool   `json:"active"`
+	VPCPUs               int    `json:"vpcpus"`
+	VCPUBudget           int    `json:"vcpu_budget"`
+	MemMB                int    `json:"mem_mb"`
+	AdmissionCeilingMB   int    `json:"admission_ceiling_mb"`
+	InstancesLive        int64  `json:"instances_live"`
+	InstancesRunning     int64  `json:"instances_running"`
+	InstancesWaking      int64  `json:"instances_waking"`
+	InstancesColdBooting int64  `json:"instances_cold_booting"`
+	RAMUsedMB            int64  `json:"ram_used_mb"`
+	AdmissionMarginMB    int64  `json:"admission_margin_mb"`
+	AppsCount            int64  `json:"apps_count"`
+	TenantsCount         int64  `json:"tenants_count"`
+}
+
+// ObsTenantActivityResponse is the bounded activity view for one tenant.
+// It intentionally carries invocation metadata and audit metadata only:
+// request payloads, results, headers, and audit data may contain customer
+// secrets and never belong in the operator activity feed.
+type ObsTenantActivityResponse struct {
+	AccountID   string                `json:"account_id"`
+	GeneratedAt time.Time             `json:"generated_at"`
+	Invocations []ObsInvocationRow    `json:"invocations"`
+	AuditEvents []ObsAuditActivityRow `json:"audit_events"`
+	Limit       int                   `json:"limit"`
+}
+
+type ObsAccountMutationResponse struct {
+	Account         ObsTenantRow `json:"account"`
+	Action          string       `json:"action"`
+	RevokedSessions int          `json:"revoked_sessions"`
+}
+
+// ObsInvocationRow is the safe operational projection of an invocation.
+type ObsInvocationRow struct {
+	ID          string     `json:"id"`
+	AppID       string     `json:"app_id"`
+	AppSlug     string     `json:"app_slug,omitempty"`
+	State       string     `json:"state"`
+	Source      string     `json:"source"`
+	Method      string     `json:"method"`
+	Path        string     `json:"path"`
+	Outcome     string     `json:"outcome,omitempty"`
+	Attempts    int        `json:"attempts"`
+	LastError   string     `json:"last_error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+// ObsAuditActivityRow is the safe metadata-only projection of audit_log.
+// Data is deliberately omitted; the global audit page remains the explicit
+// high-detail path for an operator who is authorized to inspect it.
+type ObsAuditActivityRow struct {
+	ID      string    `json:"id"`
+	At      time.Time `json:"at"`
+	Kind    string    `json:"kind"`
+	Actor   string    `json:"actor,omitempty"`
+	Subject string    `json:"subject,omitempty"`
+}
+
+// ObsAppDetailResponse is the workload drill-down used by operations to
+// answer which deployment and instances belong to a customer app.
+type ObsAppDetailResponse struct {
+	App         ObsAppDetail       `json:"app"`
+	Deployments []ObsDeploymentRow `json:"deployments"`
+	Instances   []ObsInstanceRow   `json:"instances"`
+	Invocations []ObsInvocationRow `json:"invocations"`
+	Health      ObsAppHealth       `json:"health"`
+}
+
+type ObsAppHealth struct {
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Metrics           AppMetricsResponse    `json:"metrics"`
+	Errors            []AppErrorSummaryItem `json:"errors"`
+	ErrorsWindowStart time.Time             `json:"errors_window_start"`
+	ErrorsWindowEnd   time.Time             `json:"errors_window_end"`
+}
+
+type ObsAppDetail struct {
+	ID             string    `json:"id"`
+	AccountID      string    `json:"account_id"`
+	Slug           string    `json:"slug"`
+	Type           string    `json:"type"`
+	Runtime        string    `json:"runtime"`
+	Status         string    `json:"status"`
+	RAMMB          int       `json:"ram_mb"`
+	MaxConcurrency int       `json:"max_concurrency"`
+	MinInstances   int       `json:"min_instances"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type ObsDeploymentRow struct {
+	ID          string    `json:"id"`
+	Status      string    `json:"status"`
+	Kind        string    `json:"kind"`
+	ImageDigest string    `json:"image_digest,omitempty"`
+	SourceURL   string    `json:"source_url,omitempty"`
+	CommitSHA   string    `json:"commit_sha,omitempty"`
+	ErrorCode   string    `json:"error_code,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type ObsInstanceRow struct {
+	ID            string     `json:"id"`
+	AppID         string     `json:"app_id"`
+	AppSlug       string     `json:"app_slug,omitempty"`
+	AccountID     string     `json:"account_id,omitempty"`
+	DeploymentID  string     `json:"deployment_id"`
+	NodeID        string     `json:"node_id,omitempty"`
+	NodeName      string     `json:"node_name,omitempty"`
+	State         string     `json:"state"`
+	RAMMB         int        `json:"ram_mb"`
+	StartedAt     time.Time  `json:"started_at"`
+	LastRequestAt time.Time  `json:"last_request_at"`
+	ParkedAt      *time.Time `json:"parked_at,omitempty"`
+}
+
+// ObsNodeDetailResponse is the node-to-workload drill-down. It is designed
+// for bounded fleet inspection: apps are summarized and instances carry no
+// jail internals, host IPs, or lease material.
+type ObsNodeDetailResponse struct {
+	Node      ObsNodeRow         `json:"node"`
+	Apps      []ObsNodeApp       `json:"apps"`
+	Instances []ObsInstanceRow   `json:"instances"`
+	Drain     ObsNodeDrainStatus `json:"drain"`
+}
+
+type ObsNodeDrainStatus struct {
+	TotalInstances   int       `json:"total_instances"`
+	LiveInstances    int       `json:"live_instances"`
+	RunningInstances int       `json:"running_instances"`
+	WakingInstances  int       `json:"waking_instances"`
+	ColdBooting      int       `json:"cold_booting_instances"`
+	DrainSafe        bool      `json:"drain_safe"`
+	ObservedAt       time.Time `json:"observed_at"`
+}
+
+type ObsNodeApp struct {
+	ID                   string     `json:"id"`
+	Slug                 string     `json:"slug"`
+	AccountID            string     `json:"account_id"`
+	Status               string     `json:"status"`
+	InstancesLive        int        `json:"instances_live"`
+	InstancesRunning     int        `json:"instances_running"`
+	InstancesWaking      int        `json:"instances_waking"`
+	InstancesColdBooting int        `json:"instances_cold_booting"`
+	RAMUsedMB            int64      `json:"ram_used_mb"`
+	LastRequestAt        *time.Time `json:"last_request_at,omitempty"`
+}
+
+type ObsNodeMutationResponse struct {
+	OK             bool   `json:"ok"`
+	Node           string `json:"node"`
+	PreviousActive bool   `json:"previous_active"`
+	Active         bool   `json:"active"`
+	LiveInstances  int    `json:"live_instances"`
+	Forced         bool   `json:"forced"`
+	Reason         string `json:"reason"`
+}
+
 // ObsTenantApp is a single app row in the tenant detail view.
 // Status is the app state (active|evicted_cold|deleted_*) and
 // Deployments is the count of non-deleted deployments. The
@@ -400,6 +650,11 @@ type ObsRateLimitResponse struct {
 // IncludeAnonymous is the effective value (caller's request, not the
 // server's default) so the operator UI can render "anonymous rows
 // surfacing" without a second round-trip.
+//
+// ActorEmail / OperatorOnly / TargetAccountID echo the three new
+// P4 filters (Commit 6 of the operator-side observability
+// mega-PR) so the operator UI can re-render the filter chip
+// strip without a second round-trip.
 type ObsAuditLogSearchResponse struct {
 	GeneratedAt      time.Time        `json:"generated_at"`
 	Items            []ObsAuditLogRow `json:"items"`
@@ -408,6 +663,9 @@ type ObsAuditLogSearchResponse struct {
 	WindowHours      int              `json:"window_hours"`
 	KindPrefix       string           `json:"kind_prefix,omitempty"`
 	AccountID        string           `json:"account_id,omitempty"`
+	ActorEmail       string           `json:"actor_email,omitempty"`
+	OperatorOnly     bool             `json:"operator_only,omitempty"`
+	TargetAccountID  string           `json:"target_account_id,omitempty"`
 }
 
 // ObsAuditLogRow is one row of the audit-log search. The fields are
@@ -416,14 +674,21 @@ type ObsAuditLogSearchResponse struct {
 // (empty for anonymous rows), and Data is the verbatim JSON payload.
 // The grep tests in handlers_admin_obs_pr3_security_test.go pin the
 // omission of any caller-side redaction; this struct IS the wire shape.
+//
+// IsOperatorAction is a derived field (Commit 6 / P4) — true
+// when Kind has the "operator.action." prefix (the operator
+// action vocabulary adopted in Commit 3). Computed at the
+// handler projection so the operator dashboard can badge the
+// row without re-deriving the prefix on every render.
 type ObsAuditLogRow struct {
-	ID           string          `json:"id"`
-	Kind         string          `json:"kind"`
-	AccountID    string          `json:"account_id,omitempty"`
-	AccountEmail string          `json:"account_email,omitempty"`
-	Actor        string          `json:"actor,omitempty"`
-	ReceivedAt   time.Time       `json:"received_at"`
-	Data         json.RawMessage `json:"data,omitempty"`
+	ID               string          `json:"id"`
+	Kind             string          `json:"kind"`
+	AccountID        string          `json:"account_id,omitempty"`
+	AccountEmail     string          `json:"account_email,omitempty"`
+	Actor            string          `json:"actor,omitempty"`
+	ReceivedAt       time.Time       `json:"received_at"`
+	Data             json.RawMessage `json:"data,omitempty"`
+	IsOperatorAction bool            `json:"is_operator_action"`
 }
 
 // ObsEventListResponse is the body of GET /v1/admin/obs/events
@@ -466,4 +731,35 @@ type ObsEventRow struct {
 	Kind    string          `json:"kind"`
 	Subject string          `json:"subject,omitempty"`
 	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// ObsBuilderHeartbeatListResponse is the response of the
+// /v1/admin/obs/builder-heartbeats endpoint (operator-side
+// observability mega-PR / Commit 7 — P5). One row per active
+// builderd that has stamped a `builder_tick` heartbeat recently;
+// QueuedBuilds is the fleet-total in-flight build queue.
+//
+// Both fields are always non-nil so the JSON shape is stable on
+// empty / quiet cases — a fresh cluster with no builderds emits
+// `{"items":[],"queued_builds":0}`.
+type ObsBuilderHeartbeatListResponse struct {
+	GeneratedAt  time.Time                `json:"generated_at"`
+	Items        []ObsBuilderHeartbeatRow `json:"items"`
+	QueuedBuilds int                      `json:"queued_builds"`
+}
+
+// ObsBuilderHeartbeatRow is one row of the builderd heartbeat
+// projection. Mirrors ObsHeartbeatRow but for the
+// source='builder_tick' slice — the underlying writer
+// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
+// risk list so today's row count is zero. Once the writer
+// is live, the row count goes from zero to non-zero without
+// an API change. CPUPct60s + DiskUsedBytes mirror the vmmd
+// heartbeat columns; nullable because the builderd writer
+// is not yet emitting them.
+type ObsBuilderHeartbeatRow struct {
+	NodeID        string    `json:"node_id"`
+	ReceivedAt    time.Time `json:"received_at"`
+	CPUPct60s     *float64  `json:"cpu_pct_60s,omitempty"`
+	DiskUsedBytes *int64    `json:"disk_used_bytes,omitempty"`
 }

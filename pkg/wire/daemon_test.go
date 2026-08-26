@@ -11,8 +11,10 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -366,4 +368,171 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// TestBootStamps_RecordsAllGauges asserts that BootStamps records
+// restart count, build info, deploy version, and the ready gauge
+// when invoked on a fresh *OpsMetrics. This is the test that
+// proves the boot-order bug fix: under the prior wiring, these
+// stamps were called from wire.Daemon() via defaultOps before
+// the daemon's run() had registered its ops, so every stamp was
+// a silent no-op. After the fix, the stamps fire when
+// wire.BootStamps runs inside run().
+func TestBootStamps_RecordsAllGauges(t *testing.T) {
+	t.Setenv("SYSTEMD_RESTARTS_ON_FAILURE", "7")
+	ops := wire.NewOpsMetrics("vmmd")
+	// CRITICAL: do NOT call RegisterDefaultOps before BootStamps.
+	// The whole point of the fix is that BootStamps operates on
+	// the explicit ops argument, not on the package-level
+	// defaultOps pointer. If BootStamps were still reading
+	// defaultOps, this test would silently no-op (matching the
+	// prior production bug).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wire.BootStamps(ctx, "vmmd", ops)
+
+	// Scrape the registry and assert every boot stamp is visible.
+	// Metrics names are prefixed by NewOpsMetrics (issue #573 /
+	// #586 ADR pattern); "vmmd" prefix yields
+	// "vmmd_daemon_restart_count" etc.
+	//
+	// Restart counter math: NewOpsMetrics constructor
+	// pre-instantiates the row at 0; RecordDaemonRestart does
+	// Add(n-1). With env=7 the gauge reads 6. The
+	// "constructor at 0, RecordDaemonRestart adds n-1" shape
+	// is the convention every daemon relies on for the §12
+	// "Daemon restart rate" panel.
+	body := scrapeOpsMetrics(t, ops)
+	for _, want := range []string{
+		`vmmd_daemon_restart_count{daemon="vmmd",version="dev"} 6`,
+		// Label order is alphabetical (Prometheus text-format
+		// contract): build_time, daemon, git_sha, version.
+		`vmmd_daemon_build_info{build_time="",daemon="vmmd",git_sha="unknown",version="dev"} 1`,
+		`vmmd_faas_deploy_version{version="dev"} 1`,
+		`vmmd_daemon_ready{daemon="vmmd"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestBootStamps_NilOpsNoPanic asserts that BootStamps with a nil
+// *OpsMetrics is a no-op (every helper called by BootStamps has
+// a nil-receiver guard). The daemon's run() path always passes a
+// real ops, but a future caller that wires BootStamps before
+// NewOpsMetrics (an unlikely but possible race) shouldn't panic.
+func TestBootStamps_NilOpsNoPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wire.BootStamps(ctx, "vmmd", nil)
+	// No assertion — the load-bearing behaviour is "no panic".
+	// If we got here, nil-ops is tolerated.
+}
+
+// TestBootStamps_StartsUptimeGoroutine asserts that
+// daemon_uptime_seconds{daemon} ticks every 1s after BootStamps.
+// The prior wiring spawned the uptime goroutine from wire.Daemon
+// via recordUptime(...), but defaultOps was nil so the gauge
+// writes were silent no-ops. After the fix, the goroutine is
+// spawned from BootStamps with ops explicit, so the gauge
+// actually advances.
+//
+// Waits ~2.1 s to see at least two ticks (the goroutine fires
+// at t=0 and t=1s) and asserts the gauge is at least 1.0 s.
+func TestBootStamps_StartsUptimeGoroutine(t *testing.T) {
+	ops := wire.NewOpsMetrics("vmmd")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wire.BootStamps(ctx, "vmmd", ops)
+
+	// Wait at least one full ticker interval (1s) plus a margin
+	// so the gauge has advanced past the constructor's pre-instantiated
+	// 0.0 value. Two ticker periods (2.1s) gives the goroutine
+	// a chance to fire at t=1.0s AND t=2.0s; the value read is
+	// monotonic with the time elapsed since BootStamps returned.
+	time.Sleep(2100 * time.Millisecond)
+
+	body := scrapeOpsMetrics(t, ops)
+	// The gauge is vmmd_daemon_uptime_seconds{daemon="vmmd"} <num>;
+	// the value is monotonic but the snapshot depends on tick
+	// alignment. Assert "at least 1.0" rather than an exact
+	// value to keep the test robust against scheduler jitter.
+	prefix := `vmmd_daemon_uptime_seconds{daemon="vmmd"} `
+	idx := strings.Index(body, prefix)
+	if idx == -1 {
+		t.Fatalf("missing %q in:\n%s", prefix, body)
+	}
+	rest := body[idx+len(prefix):]
+	end := strings.Index(rest, "\n")
+	if end == -1 {
+		t.Fatalf("no newline after %q in:\n%s", prefix, body)
+	}
+	raw := strings.TrimSpace(rest[:end])
+	got, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	if got < 1.0 {
+		t.Errorf("uptime gauge = %v, want >= 1.0 (BootStamps goroutine not ticking)", got)
+	}
+}
+
+// TestDaemonShutdownFlipsReadyFalse is the regression test for
+// Finding 2 from PR #1091: prior wiring had Daemon() flipping
+// daemon_ready to 1 at boot but never flipping it back to 0 at
+// shutdown, so the §12 "Fleet readiness" panel reported `1` for
+// the entire process lifetime (until the process disappeared
+// from the scrape target).
+//
+// Strategy: drive a fresh OpsMetrics through RegisterDefaultOps
+// so the Daemon envelope can see it. Run Daemon with a
+// short-lived fn (returns nil after 50 ms). After Daemon returns,
+// scrape the registry and assert daemon_ready{daemon} is 0.
+func TestDaemonShutdownFlipsReadyFalse(t *testing.T) {
+	ops := wire.NewOpsMetrics("vmmd")
+	wire.RegisterDefaultOps(ops)
+	t.Cleanup(func() { wire.RegisterDefaultOps(nil) })
+
+	// Reset the flag set so flag.Parse in Daemon doesn't trip.
+	// (Daemon calls flag.Parse itself; this is the
+	// already-trampled flag namespace reset.)
+	oldCommandLine := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet("test", flag.ContinueOnError)
+	t.Cleanup(func() { flag.CommandLine = oldCommandLine })
+
+	// Drive Daemon with a fn that returns nil after a short
+	// delay. We don't go through the SIGTERM path because the
+	// "clean shutdown" branch is the load-bearing one for the
+	// §12 dashboard panel — every daemon exits via os.Exit
+	// (after Daemon returns) and the gauge needs to be 0 at
+	// that instant.
+	wire.Daemon("vmmd", func(ctx context.Context, log *slog.Logger) error {
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	})
+
+	body := scrapeOpsMetrics(t, ops)
+	// Daemon's MarkReady(name, false, "shutdown complete") fires
+	// after fn returns, BEFORE the process exits. After the
+	// function returns, the registry should show ready=0.
+	if !strings.Contains(body, `vmmd_daemon_ready{daemon="vmmd"} 0`) {
+		t.Errorf("daemon_ready did not flip to 0 after shutdown in:\n%s", body)
+	}
+}
+
+// scrapeOpsMetrics returns the Prometheus text-format dump for
+// ops. Used by BootStamps tests to assert what actually landed
+// in the registry. Routes the request through ops.Handler() so
+// the assertion surface matches what a real /metrics scrape
+// would see.
+func scrapeOpsMetrics(t *testing.T, ops *wire.OpsMetrics) string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rr := httptest.NewRecorder()
+	ops.Handler().ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("metrics scrape returned status %d", rr.Code)
+	}
+	return rr.Body.String()
 }

@@ -1,0 +1,10 @@
+---
+- name: restart control-plane postgresql
+  ansible.builtin.service:
+    name: "postgresql@{{ control_plane_postgres_major_version }}-main.service"
+    state: restarted
+
+- name: reload control-plane postgresql
+  ansible.builtin.service:
+    name: "postgresql@{{ control_plane_postgres_major_version }}-main.service"
+    state: reloaded

@@ -37,7 +37,7 @@ help: ## List targets
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
+build: guest-runners ## Build every daemon + CLIs + guest init + function runners into ./bin
 	@mkdir -p $(BINDIR)
 	@for d in $(DAEMONS); do \
 	  echo "building $$d"; \
@@ -47,6 +47,8 @@ build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 	  echo "building $$c (CLI)"; \
 	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$c ./cmd/$$c || exit 1; \
 	done
+	@echo "building init (guest PID 1)"
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o $(BINDIR)/init ./guest/init
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and
 # must be built for the guest architecture (linux/amd64, CGO off). Each
@@ -189,7 +191,7 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 # check-state-coverage does. Excludes generated sqlc. Floors are 5pp below
 # the post-PR number; the floor is a fixed line the suite must stay above,
 # not a moving goalpost (mirrors codecov.yml project.default.target).
-# Wired into the unit-tests-pg-2 CI job (see ci.yml).
+# Wired into the matrix-expanded unit-tests-pg-2a/2b CI jobs (see ci.yml).
 .PHONY: coverage-floor
 coverage-floor: ## Assert ship-blocking package floors across all coverage/cover-shard*.out
 	@bash -c 'set -e; COVERDIR="$${COVERDIR:-$(COVERAGE_DIR)}"; \

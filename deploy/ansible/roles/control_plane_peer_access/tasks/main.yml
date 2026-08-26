@@ -1,0 +1,73 @@
+---
+# The regular postgres role owns initial database provisioning and deliberately
+# requires an Ansible-managed password before enabling split-box access. A
+# node join must not rotate or rediscover that secret; it only converges the
+# already-provisioned control-plane listener and pg_hba entries from the full
+# manifest.
+
+- name: control-plane peer access — discover PostgreSQL cluster config
+  ansible.builtin.find:
+    paths: /etc/postgresql
+    file_type: directory
+    recurse: false
+  register: control_plane_postgres_cluster_dirs
+  changed_when: false
+
+- name: control-plane peer access — require an installed PostgreSQL cluster
+  ansible.builtin.assert:
+    that:
+      - (control_plane_postgres_cluster_dirs.files | default([]) | length) > 0
+    fail_msg: >-
+      node join cannot converge control-plane PostgreSQL access because no
+      PostgreSQL cluster exists under /etc/postgresql.
+
+- name: control-plane peer access — derive active cluster config directory
+  ansible.builtin.set_fact:
+    control_plane_postgres_major_version: >-
+      {{ (control_plane_postgres_cluster_dirs.files
+      | map(attribute='path') | map('basename') | list | sort | last) }}
+    control_plane_postgres_config_dir: >-
+      /etc/postgresql/{{ (control_plane_postgres_cluster_dirs.files
+      | map(attribute='path') | map('basename') | list | sort | last) }}/main
+
+- name: control-plane peer access — require manifest-derived database inputs
+  ansible.builtin.assert:
+    that:
+      - faas_postgres_listen_addresses is defined
+      - (faas_postgres_listen_addresses | string | length) > 0
+      - faas_postgres_allowed_cidrs is defined
+      - (faas_postgres_allowed_cidrs | length) > 0
+    fail_msg: >-
+      generated control-plane inventory is missing the PostgreSQL listener or
+      compute allowlist; refusing to open a partial split-box database path.
+
+- name: control-plane peer access — converge PostgreSQL listener address
+  ansible.builtin.lineinfile:
+    path: "{{ control_plane_postgres_config_dir }}/postgresql.conf"
+    regexp: "^#?listen_addresses\\s*="
+    line: "listen_addresses = '{{ faas_postgres_listen_addresses }}'"
+    create: false
+  register: control_plane_postgres_listen
+  notify: restart control-plane postgresql
+
+- name: control-plane peer access — render manifest-derived pg_hba entries
+  ansible.builtin.copy:
+    dest: "{{ control_plane_postgres_config_dir }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+    content: |
+      # Managed by Gregale node-join topology convergence; do not edit.
+      local   all             postgres                                peer
+      local   all             faas                                    peer map=faas_map
+      host    faas            faas                                    127.0.0.1/32            scram-sha-256
+      host    faas            faas                                    ::1/128                  scram-sha-256
+      {% for cidr in faas_postgres_allowed_cidrs %}
+      host    faas            faas                                    {{ cidr }}                scram-sha-256
+      {% endfor %}
+      host    all             all             127.0.0.1/32            reject
+      host    all             all             ::1/128                 reject
+  notify: reload control-plane postgresql
+
+- name: control-plane peer access — apply PostgreSQL changes before the node dial
+  ansible.builtin.meta: flush_handlers

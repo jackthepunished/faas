@@ -15,7 +15,8 @@
 //
 //   - init   — write host.age/box-age-key/session.key/rclone.conf/
 //              archive-creds as a single batch. Refuses overwrite
-//              unless --force is passed. After host.age succeeds,
+//              unless --force is passed, or --preserve-existing is
+//              used by an idempotent deployment retry. After host.age succeeds,
 //              computes the PEM fingerprint and stamps
 //              compute_nodes.{host_certificate, cert_fingerprint}
 //              when FAAS_PG_DSN is set (soft warning on
@@ -126,10 +127,11 @@ const subSecretsStamp = "stamp"
 // FAAS_PG_DSN is a soft warning, not an opt-out switch; the DB
 // write fires whenever the DSN is set.
 type secretsInitFlags struct {
-	dir   string
-	force bool
-	host  string
-	dsn   string
+	dir              string
+	force            bool
+	preserveExisting bool
+	host             string
+	dsn              string
 }
 
 func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secretsInitFlags) {
@@ -137,6 +139,7 @@ func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secret
 	f := &secretsInitFlags{}
 	fs.StringVar(&f.dir, "dir", defaultSecretsDir, "root secrets directory (default /etc/faas/secrets)")
 	fs.BoolVar(&f.force, "force", defaultForce, "overwrite existing secret files (default false)")
+	fs.BoolVar(&f.preserveExisting, "preserve-existing", false, "preserve existing secret files and create only missing files (deployment retry)")
 	fs.StringVar(&f.host, "host", "", "compute_nodes.name to stamp (default: hostname from os.Hostname)")
 	fs.StringVar(&f.dsn, "pg-dsn", "", "PostgreSQL DSN (default: $FAAS_PG_DSN)")
 	return fs, f
@@ -182,7 +185,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// back from disk so we can compute the public recipient for
 	// the cert_fingerprint write.
 	hostAgePath := filepath.Join(f.dir, "host.age")
-	hostAgeID, err := writeHostAge(hostAgePath, f.force)
+	hostAgeID, err := writeOrLoadHostAge(hostAgePath, f.force, f.preserveExisting)
 	if err != nil {
 		return err
 	}
@@ -196,7 +199,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// chown root:postgres (best-effort; postgres may not exist
 	// on a dev box).
 	boxAgePath := filepath.Join(storageDir, "box-age-key")
-	if err := writeBoxAgeKey(boxAgePath, f.force, stdout); err != nil {
+	if err := writeBoxAgeKey(boxAgePath, f.force, f.preserveExisting, stdout); err != nil {
 		return err
 	}
 
@@ -204,7 +207,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// hex-encoded (the gatewayd loader expects hex per
 	// cmd/gatewayd-internal/session_key.go:32).
 	sessionKeyPath := filepath.Join(f.dir, "session.key")
-	if err := writeSessionKey(sessionKeyPath, f.force); err != nil {
+	if err := writeSessionKey(sessionKeyPath, f.force, f.preserveExisting); err != nil {
 		return err
 	}
 
@@ -216,7 +219,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// (postgres_backup/tasks/main.yml) passes before the unseal
 	// step.
 	rclonePath := filepath.Join(storageDir, "rclone.conf")
-	if err := writeRcloneStub(rclonePath, f.force, stdout); err != nil {
+	if err := writeRcloneStub(rclonePath, f.force, f.preserveExisting, stdout); err != nil {
 		return err
 	}
 
@@ -225,7 +228,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// it. The mandatory-on-disk file is the existence + 0400 mode
 	// (deploy/ansible/roles/log_archive/tasks/main.yml:39).
 	archivePath := filepath.Join(storageDir, "archive-creds.json")
-	if err := writeArchiveStub(archivePath, f.force); err != nil {
+	if err := writeArchiveStub(archivePath, f.force, f.preserveExisting); err != nil {
 		return err
 	}
 
@@ -396,13 +399,38 @@ func writeHostAge(path string, force bool) (*age.X25519Identity, error) {
 	return id, nil
 }
 
+// writeOrLoadHostAge is the deployment-retry variant of writeHostAge. An
+// existing identity is load-bearing state: preserve it and derive the
+// fingerprint from the same bytes instead of rotating it during a retry.
+func writeOrLoadHostAge(path string, force, preserveExisting bool) (*age.X25519Identity, error) {
+	if preserveExisting {
+		if _, err := os.Stat(path); err == nil {
+			id, loadErr := secretbox.LoadHostKey(path)
+			if loadErr != nil {
+				return nil, fmt.Errorf("load existing host.age %s: %w", path, loadErr)
+			}
+			return id, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat %s: %w", path, err)
+		}
+	}
+	return writeHostAge(path, force)
+}
+
 // writeBoxAgeKey writes a fresh X25519 identity with mode 0440
 // root:postgres. Uses secretbox.GenerateAndSaveHostKey for the
 // keygen (same shape as host.age); the file IS the right half
 // (the file content is the identity string per filippo.io/age
 // convention). Postgres may not exist on a dev install — the
 // chown is best-effort and the mode is the load-bearing contract.
-func writeBoxAgeKey(path string, force bool, stdout io.Writer) error {
+func writeBoxAgeKey(path string, force, preserveExisting bool, stdout io.Writer) error {
+	if preserveExisting {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+	}
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
@@ -425,7 +453,14 @@ func writeBoxAgeKey(path string, force bool, stdout io.Writer) error {
 // writeSessionKey writes a 32-byte random key, hex-encoded.
 // Mode 0400 root:root; the gatewayd loader reads FAAS_SESSION_KEY
 // and expects hex (cmd/gatewayd-internal/session_key.go:43).
-func writeSessionKey(path string, force bool) error {
+func writeSessionKey(path string, force, preserveExisting bool) error {
+	if preserveExisting {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+	}
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
@@ -451,7 +486,14 @@ func writeSessionKey(path string, force bool) error {
 // replaces it with the real plaintext via `backup unseal-rclone`.
 // The stub is a single line of JSON so the ansible stat-assert
 // (postgres_backup/tasks/main.yml:198) passes.
-func writeRcloneStub(path string, force bool, stdout io.Writer) error {
+func writeRcloneStub(path string, force, preserveExisting bool, stdout io.Writer) error {
+	if preserveExisting {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+	}
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
@@ -477,7 +519,14 @@ func writeRcloneStub(path string, force bool, stdout io.Writer) error {
 // shape is empty object {} — the log-archive's LoadCredential
 // (cmd/faas-apid/main.go / systemd unit) parses the file as JSON
 // and an empty object is the canonical "no creds yet" state.
-func writeArchiveStub(path string, force bool) error {
+func writeArchiveStub(path string, force, preserveExisting bool) error {
+	if preserveExisting {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+	}
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
