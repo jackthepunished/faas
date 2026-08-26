@@ -10,4 +10,5 @@
   ansible.builtin.systemd:
     name: faas-gatewayd-internal
     state: restarted
+    daemon_reload: true
   listen: restart faas-gatewayd-internal

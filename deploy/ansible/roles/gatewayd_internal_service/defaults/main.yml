@@ -35,9 +35,11 @@ gatewayd_vmmd_tls_ca_path: /etc/faas/tls/ca/ca.crt
 
 # The egress byte stream is a local Unix socket on a single box and a
 # dedicated mTLS TCP listener when gatewayd-internal runs on a compute-only
-# host. The manifest renderer overrides this on split deployments; keeping
-# the default empty preserves the single-box DAC path.
-gatewayd_egress_listen: ""
+# host. The manifest renderer emits the inventory-facing
+# `faas_gatewayd_egress_listen` name; retain the role-local name as an
+# override for hand-authored inventories and older callers. Keeping the
+# default empty preserves the single-box DAC path.
+gatewayd_egress_listen: "{{ faas_gatewayd_egress_listen | default('') }}"
 gatewayd_egress_tls_cert_path: /etc/faas/tls/egress/egress.crt
 gatewayd_egress_tls_key_path: /etc/faas/tls/egress/egress.key
 gatewayd_egress_tls_ca_path: /etc/faas/tls/ca/ca.crt
