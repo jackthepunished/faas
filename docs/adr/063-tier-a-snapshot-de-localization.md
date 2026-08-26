@@ -93,7 +93,7 @@ Specifically:
 
 Issue #1054's first implementation is wired in PR-A:
 
-- migration `00456_snapshot_replicas.sql` adds the durable queue and
+- migration `00468_snapshot_replicas.sql` adds the durable queue and
   regional origin metadata;
 - `pkg/snapshothipd` performs bounded, retryable cache warming from vmmd;
 - `snapshothipd_fanout_total{outcome,region}` exposes the pre-instantiated
