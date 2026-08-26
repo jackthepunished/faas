@@ -1543,6 +1543,12 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postSweepStuckBuilds))))
 	// Compute-node lifecycle controls. They are deliberately separate from
 	// the read-only /obs namespace and require both MFA and confirm=true.
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/suspend",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountSuspend))))
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/restore",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountRestore))))
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/revoke-sessions",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountRevokeSessions))))
 	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/drain",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeDrain))))
 	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/force-drain",

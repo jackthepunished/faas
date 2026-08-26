@@ -157,6 +157,12 @@ type ObsTenantActivityResponse struct {
 	Limit       int                   `json:"limit"`
 }
 
+type ObsAccountMutationResponse struct {
+	Account         ObsTenantRow `json:"account"`
+	Action          string       `json:"action"`
+	RevokedSessions int          `json:"revoked_sessions"`
+}
+
 // ObsInvocationRow is the safe operational projection of an invocation.
 type ObsInvocationRow struct {
 	ID          string     `json:"id"`
@@ -191,6 +197,15 @@ type ObsAppDetailResponse struct {
 	Deployments []ObsDeploymentRow `json:"deployments"`
 	Instances   []ObsInstanceRow   `json:"instances"`
 	Invocations []ObsInvocationRow `json:"invocations"`
+	Health      ObsAppHealth       `json:"health"`
+}
+
+type ObsAppHealth struct {
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Metrics           AppMetricsResponse    `json:"metrics"`
+	Errors            []AppErrorSummaryItem `json:"errors"`
+	ErrorsWindowStart time.Time             `json:"errors_window_start"`
+	ErrorsWindowEnd   time.Time             `json:"errors_window_end"`
 }
 
 type ObsAppDetail struct {
@@ -236,9 +251,20 @@ type ObsInstanceRow struct {
 // for bounded fleet inspection: apps are summarized and instances carry no
 // jail internals, host IPs, or lease material.
 type ObsNodeDetailResponse struct {
-	Node      ObsNodeRow       `json:"node"`
-	Apps      []ObsNodeApp     `json:"apps"`
-	Instances []ObsInstanceRow `json:"instances"`
+	Node      ObsNodeRow         `json:"node"`
+	Apps      []ObsNodeApp       `json:"apps"`
+	Instances []ObsInstanceRow   `json:"instances"`
+	Drain     ObsNodeDrainStatus `json:"drain"`
+}
+
+type ObsNodeDrainStatus struct {
+	TotalInstances   int       `json:"total_instances"`
+	LiveInstances    int       `json:"live_instances"`
+	RunningInstances int       `json:"running_instances"`
+	WakingInstances  int       `json:"waking_instances"`
+	ColdBooting      int       `json:"cold_booting_instances"`
+	DrainSafe        bool      `json:"drain_safe"`
+	ObservedAt       time.Time `json:"observed_at"`
 }
 
 type ObsNodeApp struct {

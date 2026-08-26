@@ -99,6 +99,9 @@ var routeExclude = map[string]bool{
 	"POST /v1/admin/apps/{slug}/force-cold-boot":              true, // PR #1099 P2b
 	"POST /v1/admin/instances/{id}/force-restart":             true, // PR #1105 P2d
 	"POST /v1/admin/builds/sweep-stuck":                       true, // PR #1099 P2c
+	"POST /v1/admin/ops/accounts/{id}/suspend":                true, // operator-only tenant lifecycle control
+	"POST /v1/admin/ops/accounts/{id}/restore":                true, // operator-only tenant lifecycle control
+	"POST /v1/admin/ops/accounts/{id}/revoke-sessions":        true, // operator-only tenant security control
 	"POST /v1/admin/ops/nodes/{name}/drain":                   true, // operator-only node lifecycle control
 	"POST /v1/admin/ops/nodes/{name}/force-drain":             true, // operator-only destructive node lifecycle control
 	"POST /v1/admin/ops/nodes/{name}/activate":                true, // operator-only node lifecycle control

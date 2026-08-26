@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -83,6 +85,94 @@ func (s *server) obsTenantActivity(w http.ResponseWriter, r *http.Request, acct 
 	})
 }
 
+func (s *server) postObsAccountSuspend(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	s.postObsAccountMutation(w, r, acct, "suspend")
+}
+
+func (s *server) postObsAccountRestore(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	s.postObsAccountMutation(w, r, acct, "restore")
+}
+
+func (s *server) postObsAccountRevokeSessions(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	s.postObsAccountMutation(w, r, acct, "revoke-sessions")
+}
+
+func (s *server) postObsAccountMutation(w http.ResponseWriter, r *http.Request, acct state.Account, action string) {
+	if allowed, prob := s.adminAllows(acct); !allowed {
+		api.WriteProblem(w, prob)
+		return
+	}
+	if r.URL.Query().Get("confirm") != "true" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "confirm required", "?confirm=true is required for account lifecycle changes"))
+		return
+	}
+	reason := r.URL.Query().Get("reason")
+	if reason == "" {
+		reason = "operator_" + strings.ReplaceAll(action, "-", "_")
+	}
+	if len(reason) > obsOpsReasonMaxLen || !obsOpsReasonShape.MatchString(reason) {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "invalid reason", "reason must match [a-z0-9_]{1,64}"))
+		return
+	}
+	targetID := r.PathValue("id")
+	if _, err := uuid.Parse(targetID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad account id", "expected UUID"))
+		return
+	}
+	if targetID == acct.ID {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "cannot modify operator account", "use a separate operator account for lifecycle actions"))
+		return
+	}
+	if _, err := s.store.AccountByID(r.Context(), targetID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Account not found", err.Error()))
+		return
+	}
+	revokedSessions := 0
+	var err error
+	switch action {
+	case "suspend":
+		err = s.store.UpdateAccountStatus(r.Context(), targetID, state.AccountSuspended)
+		if err == nil {
+			// uuid.Nil is an impossible session id and therefore makes the
+			// operator action revoke every active session for the target.
+			revokedSessions, err = s.store.RevokeAllSessions(r.Context(), targetID, uuid.Nil.String())
+		}
+	case "restore":
+		err = s.store.UpdateAccountStatus(r.Context(), targetID, state.AccountActive)
+	case "revoke-sessions":
+		revokedSessions, err = s.store.RevokeAllSessions(r.Context(), targetID, uuid.Nil.String())
+	default:
+		err = fmt.Errorf("unsupported account action %q", action)
+	}
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Account not found", err.Error()))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not apply account operation"))
+		return
+	}
+	target, err := s.store.AccountByID(r.Context(), targetID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not reload account after operation"))
+		return
+	}
+	if s.audit != nil {
+		subject := targetID
+		s.audit.Emit(r.Context(), "operator.action.account_"+strings.ReplaceAll(action, "-", "_"), &subject, map[string]any{
+			"actor":             acct.ID,
+			"target_account_id": targetID,
+			"revoked_sessions":  revokedSessions,
+			"reason":            reason,
+		})
+	}
+	writeJSON(w, http.StatusOK, api.ObsAccountMutationResponse{
+		Account:         projectTenantRow(r.Context(), s.store, target, false),
+		Action:          action,
+		RevokedSessions: revokedSessions,
+	})
+}
+
 func (s *server) obsAppDetail(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if allowed, prob := s.adminAllows(acct); !allowed {
 		api.WriteProblem(w, prob)
@@ -122,6 +212,19 @@ func (s *server) obsAppDetail(w http.ResponseWriter, r *http.Request, acct state
 	if len(invocations) > obsOpsActivityLimitMax {
 		invocations = invocations[:obsOpsActivityLimitMax]
 	}
+	rng := r.URL.Query().Get("range")
+	if rng == "" {
+		rng = appmetrics.DefaultRange
+	}
+	if !appmetrics.IsValidRange(rng) {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "invalid range", fmt.Sprintf("range must be one of: %s", strings.Join(appmetrics.Ranges(), ", "))))
+		return
+	}
+	health, err := s.obsAppHealth(r.Context(), app, rng)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not load app health"))
+		return
+	}
 	writeJSON(w, http.StatusOK, api.ObsAppDetailResponse{
 		App: api.ObsAppDetail{
 			ID:             app.ID,
@@ -138,7 +241,31 @@ func (s *server) obsAppDetail(w http.ResponseWriter, r *http.Request, acct state
 		Deployments: projectObsDeployments(deployments),
 		Instances:   projectObsInstances(instances, map[string]string{app.ID: app.Slug}, map[string]string{app.ID: app.AccountID}, s.nodeNames(r.Context())),
 		Invocations: projectObsInvocations(invocations, map[string]string{app.ID: app.Slug}, obsOpsActivityLimitMax),
+		Health:      health,
 	})
+}
+
+func (s *server) obsAppHealth(ctx context.Context, app state.App, rng string) (api.ObsAppHealth, error) {
+	now := time.Now().UTC()
+	metrics, source := appmetrics.Fetch(ctx, s.promqlClient, s.log, app.ID, rng)
+	metrics.AppID = app.ID
+	metrics.Range = rng
+	metrics.Source = source
+	metrics.AsOf = now.Format(time.RFC3339Nano)
+	since := now.Add(-24 * time.Hour)
+	rows, err := s.store.ListAppErrorGroups(ctx, buildAppErrorsSummaryParams(
+		app.AccountID, app.ID, since, now, nil, nil, nil, 10,
+	))
+	if err != nil {
+		return api.ObsAppHealth{}, err
+	}
+	return api.ObsAppHealth{
+		GeneratedAt:       now,
+		Metrics:           metrics,
+		Errors:            projectAppErrorSummaryRows(rows),
+		ErrorsWindowStart: since,
+		ErrorsWindowEnd:   now,
+	}, nil
 }
 
 func (s *server) obsNodeDetail(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -186,6 +313,7 @@ func (s *server) obsNodeDetail(w http.ResponseWriter, r *http.Request, acct stat
 		Node:      rows[0],
 		Apps:      projectObsNodeApps(apps, instances),
 		Instances: projectObsInstances(instances, appSlugs(appByID), appAccounts(appByID), map[string]string{node.ID: node.Name}),
+		Drain:     projectObsDrainStatus(instances),
 	})
 }
 
@@ -445,6 +573,28 @@ func countObsLiveInstances(rows []state.Instance) int {
 		}
 	}
 	return count
+}
+
+func projectObsDrainStatus(rows []state.Instance) api.ObsNodeDrainStatus {
+	status := api.ObsNodeDrainStatus{
+		TotalInstances: len(rows),
+		ObservedAt:     time.Now().UTC(),
+	}
+	for _, row := range rows {
+		switch row.State {
+		case "RUNNING":
+			status.LiveInstances++
+			status.RunningInstances++
+		case "WAKING":
+			status.LiveInstances++
+			status.WakingInstances++
+		case "COLD_BOOTING":
+			status.LiveInstances++
+			status.ColdBooting++
+		}
+	}
+	status.DrainSafe = status.LiveInstances == 0
+	return status
 }
 
 func truncateObsText(value string, max int) string {

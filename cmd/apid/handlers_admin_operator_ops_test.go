@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -40,6 +41,59 @@ func TestObsNodeMutation_RequiresConfirmation(t *testing.T) {
 	}
 }
 
+func TestObsAccountMutation_RequiresConfirmation(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	target, err := e.store.CreateAccount(context.Background(), "tenant@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("create target account: %v", err)
+	}
+	rec := e.do(t, "POST", "/v1/admin/ops/accounts/"+target.ID+"/suspend", nil, nil)
+	if rec.Code != 400 {
+		t.Fatalf("account suspend without confirmation: got status %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	current, err := e.store.AccountByID(context.Background(), target.ID)
+	if err != nil {
+		t.Fatalf("reload target account: %v", err)
+	}
+	if current.Status != state.AccountActive {
+		t.Fatalf("account status changed without confirmation: got %q", current.Status)
+	}
+}
+
+func TestObsAccountMutation_RejectsSelf(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	rec := e.do(t, "POST", "/v1/admin/ops/accounts/"+e.acct.ID+"/suspend?confirm=true", nil, nil)
+	if rec.Code != 409 {
+		t.Fatalf("self account suspend: got status %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	current, err := e.store.AccountByID(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("reload operator account: %v", err)
+	}
+	if current.Status != state.AccountActive {
+		t.Fatalf("operator account status changed: got %q", current.Status)
+	}
+}
+
+func TestObsAccountSuspend_UpdatesStatus(t *testing.T) {
+	e := newObsEnv(t, api.ScopesAdminOnly, "ops@faas.dev", "ops@faas.dev")
+	target, err := e.store.CreateAccount(context.Background(), "tenant-suspend@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("create target account: %v", err)
+	}
+	rec := e.do(t, "POST", "/v1/admin/ops/accounts/"+target.ID+"/suspend?confirm=true&reason=customer_request", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("account suspend: got status %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	current, err := e.store.AccountByID(context.Background(), target.ID)
+	if err != nil {
+		t.Fatalf("reload target account: %v", err)
+	}
+	if current.Status != state.AccountSuspended {
+		t.Fatalf("account status: got %q, want %q", current.Status, state.AccountSuspended)
+	}
+}
+
 func TestProjectObsNodeApps_SeparatesLiveStates(t *testing.T) {
 	now := time.Now().UTC()
 	apps := []state.App{{ID: "app-1", AccountID: "acct-1", Slug: "orders", Status: state.AppActive}}
@@ -57,5 +111,29 @@ func TestProjectObsNodeApps_SeparatesLiveStates(t *testing.T) {
 	}
 	if rows[0].RAMUsedMB != 400 {
 		t.Fatalf("node app RAM: got %d, want 400", rows[0].RAMUsedMB)
+	}
+}
+
+func TestProjectObsDrainStatus_TracksLiveStates(t *testing.T) {
+	rows := []state.Instance{
+		{State: "RUNNING"},
+		{State: "WAKING"},
+		{State: "COLD_BOOTING"},
+		{State: "PARKED"},
+	}
+	status := projectObsDrainStatus(rows)
+	if status.TotalInstances != 4 || status.LiveInstances != 3 {
+		t.Fatalf("drain totals: got %+v", status)
+	}
+	if status.RunningInstances != 1 || status.WakingInstances != 1 || status.ColdBooting != 1 {
+		t.Fatalf("drain live-state counters: got %+v", status)
+	}
+	if status.DrainSafe {
+		t.Fatal("drain marked safe while live instances remain")
+	}
+
+	status = projectObsDrainStatus([]state.Instance{{State: "PARKED"}})
+	if !status.DrainSafe || status.LiveInstances != 0 {
+		t.Fatalf("parked-only node should be drain safe: %+v", status)
 	}
 }
