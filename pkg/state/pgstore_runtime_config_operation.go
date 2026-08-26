@@ -52,7 +52,7 @@ func (s *PgStore) ClaimPendingRuntimeConfigOperation(ctx context.Context) (Runti
 
 	row := tx.QueryRow(ctx, `
 		WITH next_operation AS (
-			SELECT id
+			SELECT id AS operation_id
 			FROM runtime_config_operations
 			WHERE status = 'pending'
 			ORDER BY requested_at ASC
@@ -62,7 +62,7 @@ func (s *PgStore) ClaimPendingRuntimeConfigOperation(ctx context.Context) (Runti
 		UPDATE runtime_config_operations AS op
 		SET status = 'running', phase = 'claimed', started_at = now()
 		FROM next_operation
-		WHERE op.id = next_operation.id
+		WHERE op.id = next_operation.operation_id
 		RETURNING `+runtimeConfigOperationColumns)
 	operation, err := scanRuntimeConfigOperation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
