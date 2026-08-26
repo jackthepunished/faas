@@ -61,6 +61,12 @@ type InternalDialer interface {
 	DialContext(ctx context.Context, target string) (net.Conn, error)
 }
 
+// ErrNoComputeCapacity is returned by a dynamic internal dialer when the
+// control plane has no reachable compute gateway. It is deliberately distinct
+// from a malformed proxy configuration: the control plane is still healthy,
+// but the data plane has no capacity for this request.
+var ErrNoComputeCapacity = errors.New("no compute capacity")
+
 // NewUnixSocketDialer returns an InternalDialer that dials a unix
 // socket at `path`. The dialer ignores the target string the caller
 // passes — every request routes to the same socket in the v1.0
@@ -445,6 +451,11 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		p.logger().Warn("internal round-trip failed",
 			"target", p.Target.String(),
 			"err", err)
+		if errors.Is(err, ErrNoComputeCapacity) {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "compute capacity unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "bad gateway: internal round-trip failed", http.StatusBadGateway)
 		return
 	}

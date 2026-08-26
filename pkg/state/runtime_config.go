@@ -1,0 +1,139 @@
+package state
+
+import (
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+// RuntimeConfigScope identifies the blast-radius boundary of a runtime
+// configuration value. The control plane currently applies global values to
+// apid; the narrower scopes are persisted now so rolling fleet application can
+// converge without changing the API contract later.
+type RuntimeConfigScope string
+
+const (
+	RuntimeConfigScopeGlobal       RuntimeConfigScope = "global"
+	RuntimeConfigScopeControlPlane RuntimeConfigScope = "control_plane"
+	RuntimeConfigScopeDaemon       RuntimeConfigScope = "daemon"
+	RuntimeConfigScopeNode         RuntimeConfigScope = "node"
+)
+
+// RuntimeConfigApplyMode tells the operator console how a value is applied.
+// Hot values are swapped into the process snapshot. The other modes are
+// durable desired state and require a graceful/rolling controller or a
+// break-glass deployment workflow.
+type RuntimeConfigApplyMode string
+
+const (
+	RuntimeConfigApplyHot        RuntimeConfigApplyMode = "hot"
+	RuntimeConfigApplyGraceful   RuntimeConfigApplyMode = "graceful"
+	RuntimeConfigApplyRolling    RuntimeConfigApplyMode = "rolling"
+	RuntimeConfigApplyBreakGlass RuntimeConfigApplyMode = "break_glass"
+)
+
+type RuntimeConfigStatus string
+
+const (
+	RuntimeConfigPending RuntimeConfigStatus = "pending"
+	RuntimeConfigApplied RuntimeConfigStatus = "applied"
+	RuntimeConfigFailed  RuntimeConfigStatus = "failed"
+	RuntimeConfigBlocked RuntimeConfigStatus = "blocked"
+)
+
+// RuntimeConfigOperationStatus is the lifecycle of an asynchronous operator
+// configuration apply request. A row is never silently discarded: pending
+// means it is waiting for a daemon/deployment controller, running means a
+// controller has claimed it, and blocked/failed preserve the operator-facing
+// reason the desired state is not effective.
+type RuntimeConfigOperationStatus string
+
+const (
+	RuntimeConfigOperationPending   RuntimeConfigOperationStatus = "pending"
+	RuntimeConfigOperationRunning   RuntimeConfigOperationStatus = "running"
+	RuntimeConfigOperationSucceeded RuntimeConfigOperationStatus = "succeeded"
+	RuntimeConfigOperationFailed    RuntimeConfigOperationStatus = "failed"
+	RuntimeConfigOperationBlocked   RuntimeConfigOperationStatus = "blocked"
+	RuntimeConfigOperationCancelled RuntimeConfigOperationStatus = "cancelled"
+)
+
+var (
+	ErrRuntimeConfigNotFound = errors.New("state: runtime config not found")
+	ErrRuntimeConfigConflict = errors.New("state: runtime config version conflict")
+)
+
+// RuntimeConfig is the desired/effective state of one operator setting.
+// Values are JSON so the catalog can support booleans, bounded integers,
+// durations, and enums without adding a schema migration for every setting.
+type RuntimeConfig struct {
+	ID             string
+	Key            string
+	Scope          RuntimeConfigScope
+	ScopeID        string
+	DesiredValue   json.RawMessage
+	EffectiveValue json.RawMessage
+	Version        int64
+	ApplyMode      RuntimeConfigApplyMode
+	Status         RuntimeConfigStatus
+	LastError      string
+	ActorID        string
+	Reason         string
+	UpdatedAt      time.Time
+	AppliedAt      *time.Time
+}
+
+// RuntimeConfigUpdate is the write-side request passed to the state layer.
+// ExpectedVersion is optimistic concurrency: nil means last-write-wins, while
+// a pointer requires that exact version (zero means the row must not exist).
+type RuntimeConfigUpdate struct {
+	Key             string
+	Scope           RuntimeConfigScope
+	ScopeID         string
+	DesiredValue    json.RawMessage
+	ApplyMode       RuntimeConfigApplyMode
+	ActorID         string
+	Reason          string
+	ExpectedVersion *int64
+}
+
+// RuntimeConfigOperation records one graceful, rolling, or break-glass apply
+// request. Desired state lives in RuntimeConfig; this row is the durable
+// workflow/audit handle the operator console polls.
+type RuntimeConfigOperation struct {
+	ID             string
+	Key            string
+	Scope          RuntimeConfigScope
+	ScopeID        string
+	Version        int64
+	DesiredValue   json.RawMessage
+	EffectiveValue json.RawMessage
+	ApplyMode      RuntimeConfigApplyMode
+	Status         RuntimeConfigOperationStatus
+	Phase          string
+	Error          string
+	ActorID        string
+	Reason         string
+	TargetCount    int
+	AppliedCount   int
+	FailedCount    int
+	RequestedAt    time.Time
+	StartedAt      *time.Time
+	FinishedAt     *time.Time
+}
+
+// RuntimeConfigRevision is the append-only change history for one setting.
+// It is separate from audit_log so the configuration screen can render the
+// exact old/new JSON values and optimistic version without joining opaque
+// audit payloads.
+type RuntimeConfigRevision struct {
+	ID        int64
+	Key       string
+	Scope     RuntimeConfigScope
+	ScopeID   string
+	Version   int64
+	OldValue  json.RawMessage
+	NewValue  json.RawMessage
+	ActorID   string
+	Reason    string
+	CreatedAt time.Time
+}

@@ -93,7 +93,9 @@ daemons:
         cert_path: /etc/faas/tls/schedd/vmmd-client.crt
         key_path: /etc/faas/tls/schedd/vmmd-client.key
         ca_path: /etc/faas/tls/ca/ca.crt
-    gateway_synth_target: tcp://fsn-2.gregale.dev:8080
+    # The control-plane edge owns the stable scheduler entrypoint and
+    # selects an active compute gateway from compute_nodes.
+    gateway_synth_target: tcp://127.0.0.1:8080
   vmmd:
     bind: tcp://0.0.0.0:50051
     tls:

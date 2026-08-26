@@ -147,6 +147,12 @@ type MemStore struct {
 	// for handler + subscriber tests. Keyed by intent id (UUID);
 	// status transitions follow the production 5-state CHECK.
 	operatorIntents map[string]OperatorIntent
+	// runtimeConfigs mirrors runtime_config_entries (migration 00456).
+	// The key is config_key + scope + scope_id, matching the production
+	// unique constraint and the reconciliation lookup path.
+	runtimeConfigs          map[string]RuntimeConfig
+	runtimeConfigOperations map[string]RuntimeConfigOperation
+	runtimeConfigRevisions  []RuntimeConfigRevision
 	// alertRules mirrors alert_rules for handler tests. Keyed by
 	// ruleID. AlertDelivery rows are kept separately so the
 	// delivery list query can walk just the matching subset on
@@ -634,21 +640,24 @@ func NewMemStore() *MemStore {
 		// issue #72 / ADR-125: mirror-rules and mirror-results
 		// stores. Empty until the first create; the per-app count
 		// in CreateMirrorRuleIfUnderQuota walks the map.
-		mirrorRules:          map[string]MirrorRule{},
-		mirrorResults:        map[string]MirrorInvocationResult{},
-		domains:              map[string]CustomDomain{},
-		doctorObs:            map[string]DomainDoctorObservation{},
-		crons:                map[string]Cron{},
-		fireNowRequests:      map[string]FireNowRequest{},
-		operatorIntents:      map[string]OperatorIntent{},
-		alertRules:           map[string]AlertRule{},
-		alertDeliveries:      map[string]AlertDelivery{},
-		appWebhooks:          map[string]AppWebhook{},
-		appWebhookDeliveries: map[string]AppWebhookDelivery{},
-		alertClaimKeys:       map[string]time.Time{},
-		edgeRules:            map[string]EdgeRule{},
-		corsPresets:          map[string]CorsPreset{},
-		openAPIDocs:          map[string]openAPIDocRow{},
+		mirrorRules:             map[string]MirrorRule{},
+		mirrorResults:           map[string]MirrorInvocationResult{},
+		domains:                 map[string]CustomDomain{},
+		doctorObs:               map[string]DomainDoctorObservation{},
+		crons:                   map[string]Cron{},
+		fireNowRequests:         map[string]FireNowRequest{},
+		operatorIntents:         map[string]OperatorIntent{},
+		runtimeConfigs:          map[string]RuntimeConfig{},
+		runtimeConfigOperations: map[string]RuntimeConfigOperation{},
+		runtimeConfigRevisions:  []RuntimeConfigRevision{},
+		alertRules:              map[string]AlertRule{},
+		alertDeliveries:         map[string]AlertDelivery{},
+		appWebhooks:             map[string]AppWebhook{},
+		appWebhookDeliveries:    map[string]AppWebhookDelivery{},
+		alertClaimKeys:          map[string]time.Time{},
+		edgeRules:               map[string]EdgeRule{},
+		corsPresets:             map[string]CorsPreset{},
+		openAPIDocs:             map[string]openAPIDocRow{},
 		// ADR-126 / issue #975 item #2 — per-app OpenAPI imports.
 		// Keyed by app_id (one row per app, last-write-wins via
 		// the existing overwrite-not-insert contract). Same IDOR
@@ -8537,6 +8546,9 @@ func (m *MemStore) upsertComputeNodeLocked(node ComputeNode, preserveTargetURLOn
 		}
 		if preserveTargetURLOnConflict && existing.ScheddTargetURL != nil && n.ScheddTargetURL == nil {
 			n.ScheddTargetURL = existing.ScheddTargetURL
+		}
+		if preserveTargetURLOnConflict && existing.GatewayTargetURL != nil && n.GatewayTargetURL == nil {
+			n.GatewayTargetURL = existing.GatewayTargetURL
 		}
 	} else if n.ID == "" {
 		n.ID = newID()

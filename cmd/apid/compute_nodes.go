@@ -32,7 +32,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -95,6 +99,7 @@ func (s *server) adminAllows(acct state.Account) (bool, *api.Problem) {
 type computeNodePayload struct {
 	Name               string `json:"name"`
 	TargetURL          string `json:"target_url"`
+	GatewayTargetURL   string `json:"gateway_target_url,omitempty"`
 	VPCPUs             int    `json:"vpcpus"`
 	MemMB              int    `json:"mem_mb"`
 	MaxConcurrency     int    `json:"max_concurrency"`
@@ -108,6 +113,7 @@ type computeNodeResponse struct {
 	ID                 string `json:"id"`
 	Name               string `json:"name"`
 	TargetURL          string `json:"target_url"`
+	GatewayTargetURL   string `json:"gateway_target_url,omitempty"`
 	VPCPUs             int    `json:"vpcpus"`
 	MemMB              int    `json:"mem_mb"`
 	MaxConcurrency     int    `json:"max_concurrency"`
@@ -126,6 +132,7 @@ func toComputeNodeResponse(n state.ComputeNode) computeNodeResponse {
 		ID:                 n.ID,
 		Name:               n.Name,
 		TargetURL:          n.TargetURL,
+		GatewayTargetURL:   stringValue(n.GatewayTargetURL),
 		VPCPUs:             n.VPCPUs,
 		MemMB:              n.MemMB,
 		MaxConcurrency:     n.MaxConcurrency,
@@ -137,6 +144,13 @@ func toComputeNodeResponse(n state.ComputeNode) computeNodeResponse {
 		r.LastHeartbeatAt = n.LastHeartbeatAt.UTC().Format("2006-01-02T15:04:05.999999Z07:00")
 	}
 	return r
+}
+
+func stringValue(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // listComputeNodes handles GET /v1/compute-nodes. include_inactive=1
@@ -191,6 +205,13 @@ func (s *server) createOrUpdateComputeNode(w http.ResponseWriter, r *http.Reques
 			"Missing target_url", "target_url is required (unix:///... or tcp://...)"))
 		return
 	}
+	if value := strings.TrimSpace(p.GatewayTargetURL); value != "" {
+		if err := validateGatewayTargetURL(value); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "bad_request",
+				"Invalid gateway_target_url", err.Error()))
+			return
+		}
+	}
 	// Resource-size sanity mirrors vmmd's registerComputeNode: zero
 	// values are a config bug, not a meaningful "I want a node with
 	// zero RAM" state. Same 400 surface so the operator's UI can
@@ -201,9 +222,24 @@ func (s *server) createOrUpdateComputeNode(w http.ResponseWriter, r *http.Reques
 			"vpcpus, mem_mb, max_concurrency, admission_ceiling_mb must all be > 0"))
 		return
 	}
+	var gatewayTargetURL *string
+	if strings.TrimSpace(p.GatewayTargetURL) != "" {
+		value := strings.TrimSpace(p.GatewayTargetURL)
+		gatewayTargetURL = &value
+	} else if existing, lookupErr := s.store.ComputeNodeByName(r.Context(), p.Name); lookupErr == nil {
+		// Older operator clients do not send gateway_target_url. Preserve a
+		// previously enrolled endpoint rather than silently removing a live
+		// node from the public data-plane pool on an unrelated capacity edit.
+		gatewayTargetURL = existing.GatewayTargetURL
+	} else if !errors.Is(lookupErr, state.ErrNotFound) {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal",
+			"Lookup failed", lookupErr.Error()))
+		return
+	}
 	row, err := s.store.UpsertComputeNodeFromOperator(r.Context(), state.ComputeNode{
 		Name:               p.Name,
 		TargetURL:          p.TargetURL,
+		GatewayTargetURL:   gatewayTargetURL,
 		VPCPUs:             p.VPCPUs,
 		MemMB:              p.MemMB,
 		MaxConcurrency:     p.MaxConcurrency,
@@ -215,6 +251,21 @@ func (s *server) createOrUpdateComputeNode(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, toComputeNodeResponse(row))
+}
+
+func validateGatewayTargetURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("gateway_target_url must be tcp://host:port: %w", err)
+	}
+	if u.Scheme != "tcp" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("gateway_target_url must be tcp://host:port")
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("gateway_target_url must be tcp://host:port")
+	}
+	return nil
 }
 
 // deleteComputeNode handles DELETE /v1/compute-nodes/{name}. Soft

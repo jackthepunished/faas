@@ -118,7 +118,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	var postgresAllowedCIDRs []string
 	var computeAllowedCIDRs []string
 	var controlPlaneAllowedCIDRs []string
-	var gatewayInternalTarget string
+	var gatewaySynthTarget string
 	var scheddTarget string
 	var controlPlaneAPIDLoopback string
 	for _, fleetHost := range m.Fleet.Hosts {
@@ -142,8 +142,12 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			}
 			postgresAllowedCIDRs = appendHostCIDR(postgresAllowedCIDRs, address, m.Overlay.CIDR)
 			computeAllowedCIDRs = appendHostCIDR(computeAllowedCIDRs, address, m.Overlay.CIDR)
-			if gatewayInternalTarget == "" {
-				gatewayInternalTarget = "tcp://" + net.JoinHostPort(address, "8080")
+			if gatewaySynthTarget == "" {
+				// Schedd runs on the control plane. It targets the local
+				// public gateway, which then uses the same DB-backed compute
+				// pool as external traffic; no scheduler config names a
+				// particular compute node.
+				gatewaySynthTarget = "tcp://127.0.0.1:8080"
 			}
 		}
 	}
@@ -174,7 +178,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -291,7 +295,7 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string, storageMountpoint string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string, storageMountpoint string) string {
 	var b strings.Builder
 	canonicalNodeName := canonicalComputeNodeName(host.Name, roleTemplating.Role(host.Role))
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
@@ -338,6 +342,8 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayI
 	if host.Role == roleComputeOnly {
 		b.WriteString("faas_vmmd_listen_addr: \"tcp://0.0.0.0:50051\"\n")
 		fmt.Fprintf(&b, "faas_vmmd_target_url: %q\n", targetURL)
+		computeAddress, _, _ := manifest.ParseHostPort(host.Address)
+		fmt.Fprintf(&b, "faas_gateway_target_url: %q\n", "tcp://"+net.JoinHostPort(computeAddress, "8080"))
 		fmt.Fprintf(&b, "faas_vmmd_schedd_target: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_gatewayd_schedd_target: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_gatewayd_apid_loopback: %q\n", controlPlaneAPIDLoopback)
@@ -354,15 +360,20 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayI
 		fmt.Fprintf(&b, "faas_public_listen_addr: %q\n", renderPublicListenAddr(host))
 		fmt.Fprintf(&b, "faas_public_control_addr: %q\n", renderPublicControlAddr(host))
 	}
-	if host.Role == roleControlPlane && gatewayInternalTarget != "" {
+	if host.Role == roleControlPlane {
+		// Public ingress discovers active compute gateways from the database.
+		// This keeps the control-plane API healthy while every compute node is
+		// drained and makes node add/drain a data change, not a systemd rewrite.
+		b.WriteString("faas_compute_gateway_discovery: database\n")
+	}
+	if host.Role == roleControlPlane && gatewaySynthTarget != "" {
 		b.WriteString("faas_meterd_config_managed: true\n")
 		fmt.Fprintf(&b, "faas_meterd_schedd_socket: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_meterd_egress_socket: %q\n", fmt.Sprintf("tcp://egress.faas:%d", manifestGatewayEgressPort))
 		b.WriteString("faas_meterd_schedd_tls_cert_path: /etc/faas/tls/meterd/schedd-client.crt\n")
 		b.WriteString("faas_meterd_schedd_tls_key_path: /etc/faas/tls/meterd/schedd-client.key\n")
 		b.WriteString("faas_meterd_schedd_tls_ca_path: /etc/faas/tls/ca/ca.crt\n")
-		fmt.Fprintf(&b, "faas_gatewayd_internal_target: %q\n", gatewayInternalTarget)
-		fmt.Fprintf(&b, "faas_schedd_gateway_synth_target: %q\n", gatewayInternalTarget)
+		fmt.Fprintf(&b, "faas_schedd_gateway_synth_target: %q\n", gatewaySynthTarget)
 		// gatewayd-internal deliberately binds its control/metrics
 		// listener to loopback. Do not generate an unreachable remote
 		// scrape URL; the explicit empty override disables schedd's

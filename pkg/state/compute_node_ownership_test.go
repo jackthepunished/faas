@@ -45,6 +45,8 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
 		Name:               "fsn-2",
 		TargetURL:          "tcp://vmmd-2.faas:50051",
+		ScheddTargetURL:    stringPtr("tcp://fsn-2.gregale.dev:9090"),
+		GatewayTargetURL:   stringPtr("tcp://fsn-2.gregale.dev:8080"),
 		VPCPUs:             160,
 		MemMB:              56000,
 		MaxConcurrency:     200,
@@ -81,6 +83,12 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 		t.Errorf("vmmd upsert CLOBBERED operator target_url: got %q, want tcp://vmmd-2.faas:50051",
 			vmmd.TargetURL)
 	}
+	if vmmd.GatewayTargetURL == nil || *vmmd.GatewayTargetURL != "tcp://fsn-2.gregale.dev:8080" {
+		t.Fatalf("vmmd upsert lost operator gateway_target_url: got %v", vmmd.GatewayTargetURL)
+	}
+	if vmmd.ScheddTargetURL == nil || *vmmd.ScheddTargetURL != "tcp://fsn-2.gregale.dev:9090" {
+		t.Fatalf("vmmd upsert lost operator schedd_target_url: got %v", vmmd.ScheddTargetURL)
+	}
 
 	// Step 4: id preserved (same row).
 	if vmmd.ID != operatorID {
@@ -92,6 +100,45 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 		t.Error("vmmd upsert unexpectedly drained an active node")
 	}
 }
+
+func TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_MemStore(t *testing.T) {
+	st := state.NewMemStore()
+	ctx := context.Background()
+
+	if _, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name:               "memstore-cert",
+		TargetURL:          "tcp://vmmd-2.faas:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}); err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+
+	base := state.ComputeNode{
+		Name:               "memstore-cert",
+		TargetURL:          "tcp://0.0.0.0:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}
+	if _, err := st.UpsertComputeNodeFromVmmd(ctx, base); err != nil {
+		t.Fatalf("same-fingerprint vmmd upsert: %v", err)
+	}
+
+	base.CertFingerprint = stringPtr("fingerprint-b")
+	if _, err := st.UpsertComputeNodeFromVmmd(ctx, base); !errors.Is(err, state.ErrCertFingerprintDrift) {
+		t.Fatalf("drift upsert error = %v, want ErrCertFingerprintDrift", err)
+	}
+}
+
+func stringPtr(value string) *string { return &value }
 
 // TestUpsertComputeNodeFromVmmd_PreservesOperatorDrain_MemStore pins the
 // activation boundary used by deploy join: vmmd may refresh capacity while
@@ -260,6 +307,51 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_PgStore(t *testing
 	if got.TargetURL != "tcp://vmmd-2.faas:50051" {
 		t.Errorf("pgstore vmmd upsert CLOBBERED operator target_url: got %q, want tcp://vmmd-2.faas:50051",
 			got.TargetURL)
+	}
+}
+
+// TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_PgStore pins the
+// fail-closed multi-host safety check: vmmd may re-register with the same
+// host fingerprint, but a different leaf must be reconciled explicitly.
+func TestUpsertComputeNodeFromVmmd_RejectsCertFingerprintDrift_PgStore(t *testing.T) {
+	_, pool, ctx := pgStoreWithPool(t)
+
+	name := "ownership-cert-" + time.Now().UTC().Format("20060102T150405.000000000")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `delete from compute_nodes where name = $1`, name)
+	})
+
+	s := state.NewPgStore(pool)
+	if _, err := s.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name:               name,
+		TargetURL:          "tcp://vmmd-2.faas:50051",
+		CertFingerprint:    stringPtr("fingerprint-a"),
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+	}); err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+
+	base := state.ComputeNode{
+		Name:               name,
+		TargetURL:          "tcp://0.0.0.0:50051",
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+		CertFingerprint:    stringPtr("fingerprint-a"),
+	}
+	if _, err := s.UpsertComputeNodeFromVmmd(ctx, base); err != nil {
+		t.Fatalf("same-fingerprint vmmd upsert: %v", err)
+	}
+
+	base.CertFingerprint = stringPtr("fingerprint-b")
+	if _, err := s.UpsertComputeNodeFromVmmd(ctx, base); !errors.Is(err, state.ErrCertFingerprintDrift) {
+		t.Fatalf("drift upsert error = %v, want ErrCertFingerprintDrift", err)
 	}
 }
 

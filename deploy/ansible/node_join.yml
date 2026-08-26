@@ -199,6 +199,8 @@
           - "{{ faas_join_database_node }}"
           - --target-url
           - "{{ faas_vmmd_target_url }}"
+          - --gateway-target-url
+          - "{{ faas_gateway_target_url | default('tcp://' ~ ansible_host ~ ':8080', true) }}"
           - --vpcpus
           - "{{ ansible_processor_vcpus }}"
           - --mem-mb

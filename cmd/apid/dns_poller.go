@@ -42,7 +42,7 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 		// flag is OFF, bump the skipped_flag_disabled counter so
 		// an operator can correlate a fleet-wide stale-domain alert
 		// with an explicit opt-out.
-		if api.DomainDoctorEnabled() {
+		if s.runtimeBool(runtimeConfigDomainDoctor, api.DomainDoctorEnabled()) {
 			s.runDoctorOnce(ctx, log)
 		} else {
 			s.emitDoctorSkip(log)
@@ -53,7 +53,7 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 				return
 			case <-t.C:
 				s.runVerifyOnce(ctx, log)
-				if api.DomainDoctorEnabled() {
+				if s.runtimeBool(runtimeConfigDomainDoctor, api.DomainDoctorEnabled()) {
 					s.runDoctorOnce(ctx, log)
 				} else {
 					s.emitDoctorSkip(log)
@@ -88,7 +88,7 @@ func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 	// gated on api.TenantSurfacesEnabled() so a feature-flag
 	// disable suppresses the LISTEN load on the poller goroutine
 	// even when the table is empty.
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		return
 	}
 	pendingHostnames, err := s.pendingUnverifiedHostnames(ctx)
