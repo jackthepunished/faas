@@ -45,6 +45,7 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
 		Name:               "fsn-2",
 		TargetURL:          "tcp://vmmd-2.faas:50051",
+		GatewayTargetURL:   stringPtr("tcp://fsn-2.gregale.dev:8080"),
 		VPCPUs:             160,
 		MemMB:              56000,
 		MaxConcurrency:     200,
@@ -81,6 +82,9 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 		t.Errorf("vmmd upsert CLOBBERED operator target_url: got %q, want tcp://vmmd-2.faas:50051",
 			vmmd.TargetURL)
 	}
+	if vmmd.GatewayTargetURL == nil || *vmmd.GatewayTargetURL != "tcp://fsn-2.gregale.dev:8080" {
+		t.Fatalf("vmmd upsert lost operator gateway_target_url: got %v", vmmd.GatewayTargetURL)
+	}
 
 	// Step 4: id preserved (same row).
 	if vmmd.ID != operatorID {
@@ -92,6 +96,8 @@ func TestUpsertComputeNodeFromVmmd_PreservesOperatorTargetURL_MemStore(t *testin
 		t.Error("vmmd upsert unexpectedly drained an active node")
 	}
 }
+
+func stringPtr(value string) *string { return &value }
 
 // TestUpsertComputeNodeFromVmmd_PreservesOperatorDrain_MemStore pins the
 // activation boundary used by deploy join: vmmd may refresh capacity while

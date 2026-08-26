@@ -8529,6 +8529,9 @@ func (m *MemStore) upsertComputeNodeLocked(node ComputeNode, preserveTargetURLOn
 		if preserveTargetURLOnConflict && existing.ScheddTargetURL != nil && n.ScheddTargetURL == nil {
 			n.ScheddTargetURL = existing.ScheddTargetURL
 		}
+		if preserveTargetURLOnConflict && existing.GatewayTargetURL != nil && n.GatewayTargetURL == nil {
+			n.GatewayTargetURL = existing.GatewayTargetURL
+		}
 	} else if n.ID == "" {
 		n.ID = newID()
 	}

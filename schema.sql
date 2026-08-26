@@ -1029,7 +1029,9 @@ CREATE TABLE public.compute_nodes (
     cert_fingerprint text,
     role text,
     generation integer,
+    gateway_target_url text,
     CONSTRAINT compute_nodes_admission_ceiling_mb_check CHECK ((admission_ceiling_mb > 0)),
+    CONSTRAINT compute_nodes_gateway_target_url_scheme_chk CHECK (((gateway_target_url IS NULL) OR (gateway_target_url ~ '^tcp://[^/:][^/]*:[0-9]+$'::text))),
     CONSTRAINT compute_nodes_max_concurrency_check CHECK ((max_concurrency > 0)),
     CONSTRAINT compute_nodes_mem_mb_check CHECK ((mem_mb > 0)),
     CONSTRAINT compute_nodes_public_ip_format_chk CHECK (((public_ip IS NULL) OR (family(public_ip) = ANY (ARRAY[4, 6])))),
@@ -5335,5 +5337,3 @@ ALTER TABLE ONLY public.usage_minutes
 
 --
 --
-
-

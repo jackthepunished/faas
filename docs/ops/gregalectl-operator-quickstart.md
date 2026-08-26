@@ -155,6 +155,7 @@ old name; the dispatcher refuses new code paths to call it.
 gregalectl compute-nodes add \
     --name fsn-2 \
     --target-url tcp://vmmd-2.faas:50051 \
+    --gateway-target-url tcp://fsn-2.gregale.dev:8080 \
     --vpcpus 32 --mem-mb 65536 --max-concurrency 200
 
 # List every registered node (--json for CI gates)
@@ -178,6 +179,11 @@ gregalectl compute-nodes force-drain --node fsn-2 --yes
 (gregalectl mega-PR). The state package owns the underlying
 `ListComputeNodes` / `ComputeNodeByName` calls; the dispatcher never
 bypasses the schema.
+
+`target_url` is the VM manager endpoint. `gateway_target_url` is the
+separate private HTTP data-plane endpoint; the manifest/Ansible pipeline
+derives it from the node hostname, so normal node joins do not require a
+second hand-written address.
 
 ### Fleet topology coordinator
 

@@ -2701,9 +2701,15 @@ type MirrorSummary struct {
 // on mismatch. The pointer types mirror Region/Zone (a SQL NULL
 // round-trips as nil, never collapsing into "").
 type ComputeNode struct {
-	ID                 string
-	Name               string
-	TargetURL          string // wire.ParseTarget-compatible — the vmmd dial target (Firecracker + jailer)
+	ID        string
+	Name      string
+	TargetURL string // wire.ParseTarget-compatible — the vmmd dial target (Firecracker + jailer)
+	// GatewayTargetURL is the private HTTP endpoint for this node's
+	// gatewayd-internal listener. It is separate from TargetURL because the
+	// latter is the vmmd gRPC endpoint and the two services may use different
+	// ports, certificates, or network paths. nil means the node is not yet
+	// eligible for public data-plane ingress.
+	GatewayTargetURL   *string
 	VPCPUs             int
 	MemMB              int
 	MaxConcurrency     int

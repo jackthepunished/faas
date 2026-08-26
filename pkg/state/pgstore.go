@@ -10531,7 +10531,7 @@ type SnapshotSize struct {
 // is safe: pkg/api has no outbound dependency on pkg/state, so no cycle.
 
 // scanComputeNode reads a single compute_nodes row, projecting the
-// canonical 22-column layout (matches the SELECT / RETURNING lists
+// canonical 23-column layout (matches the SELECT / RETURNING lists
 // in ActiveComputeNodes, ListAllComputeNodes, ComputeNodeByID,
 // ComputeNodeByName, CreateComputeNode, UpsertComputeNode,
 // UpsertComputeNodeFromOperator, UpsertComputeNodeFromVmmd).
@@ -10540,7 +10540,7 @@ type SnapshotSize struct {
 //
 //	id, name, target_url, vpcpus, mem_mb, max_concurrency,
 //	admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-//	region, zone, schedd_target_url,
+//	region, zone, schedd_target_url, gateway_target_url,
 //	public_ip, public_ip_set_at,
 //	release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 //
@@ -10548,9 +10548,11 @@ type SnapshotSize struct {
 // fails at runtime with pgx's column count error — the wire-level
 // contract every helper above enforces.
 //
-// PR-3a (issue #911 / ADR-110) widened the projection from 14 to 22
-// columns: public_ip / public_ip_set_at (migration 00174 closure)
-// + release_id / manifest_hash / host_certificate / cert_fingerprint /
+// PR-3a (issue #911 / ADR-110) widened the projection from 14 to 22;
+// migration 00456 adds gateway_target_url for a 23-column projection.
+// The earlier 22-column additions were public_ip / public_ip_set_at
+// (migration 00174 closure) + release_id / manifest_hash /
+// host_certificate / cert_fingerprint /
 // role / generation (migration 00266). Pre-PR-3a callers that hand-rolled
 // SQL against the 14-column layout must be updated together; the only
 // readers of the wider shape are the 8 helpers listed in the comment
@@ -10560,7 +10562,7 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
 		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone,
-		&n.ScheddTargetURL, &n.PublicIp, &n.PublicIpSetAt,
+		&n.ScheddTargetURL, &n.GatewayTargetURL, &n.PublicIp, &n.PublicIpSetAt,
 		&n.ReleaseID, &n.ManifestHash, &n.HostCertificate, &n.CertFingerprint,
 		&n.Role, &n.Generation); err != nil {
 		return ComputeNode{}, mapErr(err)
@@ -10572,7 +10574,7 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url,
+		       region, zone, schedd_target_url, gateway_target_url,
 		       public_ip, public_ip_set_at,
 		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
@@ -10603,7 +10605,7 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url,
+		       region, zone, schedd_target_url, gateway_target_url,
 		       public_ip, public_ip_set_at,
 		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
@@ -10628,7 +10630,7 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url,
+		       region, zone, schedd_target_url, gateway_target_url,
 		       public_ip, public_ip_set_at,
 		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
@@ -10645,7 +10647,7 @@ func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNo
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url,
+		       region, zone, schedd_target_url, gateway_target_url,
 		       public_ip, public_ip_set_at,
 		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
@@ -11050,25 +11052,25 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// (release_id, manifest_hash, host_certificate, cert_fingerprint,
 	// role, generation) are also nullable on INSERT — operator-added
 	// pre-PR-3a rows accept the schema without a backfill. RETURNING
-	// projects all 22 columns to match scanComputeNode's scan width.
+	// projects all 23 columns to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone,
+		     region, zone, gateway_target_url,
 		     public_ip, public_ip_set_at,
 		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
 		values ($1, $2, $3, $4, $5, $6, $7, $8,
-		        $9, $10,
-		        $11, $12,
-		        $13, $14, $15, $16, $17, $18)
+		        $9, $10, $11,
+		        $12, $13,
+		        $14, $15, $16, $17, $18, $19)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url,
+		          region, zone, schedd_target_url, gateway_target_url,
 		          public_ip, public_ip_set_at,
 		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget, node.Active,
-		node.Region, node.Zone,
+		node.Region, node.Zone, node.GatewayTargetURL,
 		node.PublicIp, node.PublicIpSetAt,
 		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
 		node.Role, node.Generation)
@@ -11092,7 +11094,7 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // rows to api.VCPUSlots (160); pre-migration rows see the same
 // default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 22-column
+	// region/zone are projected to match scanComputeNode's 23-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
@@ -11105,17 +11107,17 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// use COALESCE to preserve any value PR-X wrote first; generation
 	// is doctor-driven and uses COALESCE so the doctor's bump is
 	// monotonic (a later UPSERT with nil generation must not lower the
-	// counter). RETURNING projects all 22 columns.
+	// counter). RETURNING projects all 23 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone,
+		     region, zone, gateway_target_url,
 		     public_ip, public_ip_set_at,
 		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
 		values ($1, $2, $3, $4, $5, $6, $7, true,
-		        $8, $9,
-		        $10, $11,
-		        $12, $13, $14, $15, $16, $17)
+		        $8, $9, $10,
+		        $11, $12,
+		        $13, $14, $15, $16, $17, $18)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -11127,6 +11129,7 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      region              = excluded.region,
 		      zone                = excluded.zone,
 		      schedd_target_url   = excluded.schedd_target_url,
+		      gateway_target_url  = excluded.gateway_target_url,
 		      release_id          = excluded.release_id,
 		      manifest_hash       = excluded.manifest_hash,
 		      role                = excluded.role,
@@ -11135,12 +11138,12 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url,
+		          region, zone, schedd_target_url, gateway_target_url,
 		          public_ip, public_ip_set_at,
 		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget,
-		node.Region, node.Zone,
+		node.Region, node.Zone, node.GatewayTargetURL,
 		node.PublicIp, node.PublicIpSetAt,
 		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
 		node.Role, node.Generation)
@@ -11171,13 +11174,13 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone,
+		     region, zone, gateway_target_url,
 		     public_ip, public_ip_set_at,
 		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
 		values ($1, $2, $3, $4, $5, $6, $7, true,
-		        $8, $9,
-		        $10, $11,
-		        $12, $13, $14, $15, $16, $17)
+		        $8, $9, $10,
+		        $11, $12,
+		        $13, $14, $15, $16, $17, $18)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -11189,6 +11192,7 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 		      region              = excluded.region,
 		      zone                = excluded.zone,
 		      schedd_target_url   = excluded.schedd_target_url,
+		      gateway_target_url  = excluded.gateway_target_url,
 		      release_id          = excluded.release_id,
 		      manifest_hash       = excluded.manifest_hash,
 		      host_certificate    = excluded.host_certificate,
@@ -11197,12 +11201,12 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url,
+		          region, zone, schedd_target_url, gateway_target_url,
 		          public_ip, public_ip_set_at,
 		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget,
-		node.Region, node.Zone,
+		node.Region, node.Zone, node.GatewayTargetURL,
 		node.PublicIp, node.PublicIpSetAt,
 		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
 		node.Role, node.Generation)
@@ -11275,7 +11279,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone, schedd_target_url,
+		     region, zone, schedd_target_url, gateway_target_url,
 		     public_ip, public_ip_set_at,
 		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
 		values ($1, $2, $3, $4, $5, $6, $7, true,
@@ -11293,6 +11297,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      region              = coalesce(compute_nodes.region, excluded.region),
 		      zone                = coalesce(compute_nodes.zone, excluded.zone),
 		      schedd_target_url   = coalesce(compute_nodes.schedd_target_url, excluded.schedd_target_url),
+		      gateway_target_url  = coalesce(compute_nodes.gateway_target_url, excluded.gateway_target_url),
 		      public_ip           = coalesce(compute_nodes.public_ip, excluded.public_ip),
 		      public_ip_set_at    = coalesce(compute_nodes.public_ip_set_at, excluded.public_ip_set_at),
 		      release_id          = coalesce(compute_nodes.release_id, excluded.release_id),
@@ -11303,12 +11308,12 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url,
+		          region, zone, schedd_target_url, gateway_target_url,
 		          public_ip, public_ip_set_at,
 		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget,
-		node.Region, node.Zone, node.ScheddTargetURL,
+		node.Region, node.Zone, node.ScheddTargetURL, node.GatewayTargetURL,
 		node.PublicIp, node.PublicIpSetAt,
 		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
 		node.Role, node.Generation)
@@ -11497,7 +11502,7 @@ func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url,
+		       region, zone, schedd_target_url, gateway_target_url,
 		       public_ip, public_ip_set_at,
 		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes

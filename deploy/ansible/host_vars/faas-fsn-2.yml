@@ -29,6 +29,12 @@ ansible_python_interpreter: /usr/bin/python3
 faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"
 faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"
 
+# The control-plane public gateway discovers this endpoint from the
+# compute_nodes registry. It is deliberately separate from vmmd's gRPC
+# target above; gatewayd-internal serves the HTTP application data plane.
+faas_gateway_listen: "0.0.0.0:8080"
+faas_gateway_target_url: "tcp://fsn-2.gregale.dev:8080"
+
 # Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
 # needs the overlay mesh to reach peer compute boxes (fsn-3+ when
 # they land). The Jinja2 template at

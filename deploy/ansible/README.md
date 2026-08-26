@@ -106,6 +106,12 @@ inventory; daemon URLs and the committed manifest remain unchanged. The committe
 `host_vars/faas-fsn-{1,2}.yml` files remain checked-in reference fixtures;
 the manifest-generated tree is the deployment source of truth.
 
+The generated compute variables also set `faas_gateway_target_url` to the
+node's private `gatewayd-internal` listener (`tcp://<node>:8080`). The control
+plane's `gatewayd-public` uses `compute_nodes.gateway_target_url` with database
+discovery and keeps its API route on `127.0.0.1:8081`; adding or draining a
+compute node therefore does not require changing a static first-node target.
+
 The fast-root contract is provider-neutral. Set
 `fleet.hosts[].storage_device` to an absolute stable device path such as a
 provider's `/dev/disk/by-id/...` name, or pass `--storage-device` to
