@@ -589,6 +589,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// block short-circuits to nil when pool is nil.
 	deps.pool = pool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
+		// ADR-132: pg_notify is a low-latency wake-up only. The
+		// subscriber re-reads the durable runtime_config_entries row, so a
+		// missed notification is repaired by the next reconnect or boot.
+		go func() {
+			if err := runRuntimeConfigSubscriber(ctx, pool, srv, log); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("runtime_config subscriber exited", "err", err)
+			}
+		}()
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
 		// failed to load); we skip the goroutine launch in that
@@ -1095,6 +1103,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"github_enabled", oauthCfg.GitHub.Enabled())
 	}
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	// ADR-132: seed the hot runtime configuration snapshot from the
+	// deployment environment, then reconcile durable operator overrides
+	// before any listener is exposed. Database state wins over the
+	// bootstrap fallback for catalogued runtime settings.
+	srv.WithRuntimeConfigManager(newRuntimeConfigManager(deps.getenv))
+	if err := srv.runtimeConfig.reconcile(ctx, store); err != nil {
+		return fmt.Errorf("apid: reconcile runtime config: %w", err)
+	}
 	srv.WithOAuthConfig(oauthCfg)
 
 	// PR #1099 P2 redesign: force-park + force-cold-boot now route

@@ -9,7 +9,10 @@
 
 package httpsec
 
-import "net/http"
+import (
+	"net/http"
+	"sync"
+)
 
 // Header values are package-level constants so the test suite can pin
 // them byte-for-byte without copy-pasting the literal. Editing these
@@ -42,11 +45,23 @@ const (
 // the env once at startup, so a runtime flip on a long-running daemon
 // is unsupported (and would race any in-flight request).
 var HSTSEnabled = true
+var hstsMu sync.RWMutex
 
 // SetHSTSEnabled is the explicit setter called from cmd/*/main.go's
 // run() after env parsing. Avoids the "is this var exported? is it
 // mutated by tests?" ambiguity of a bare exported bool.
-func SetHSTSEnabled(enabled bool) { HSTSEnabled = enabled }
+func SetHSTSEnabled(enabled bool) {
+	hstsMu.Lock()
+	HSTSEnabled = enabled
+	hstsMu.Unlock()
+}
+
+func hstsEnabled() bool {
+	hstsMu.RLock()
+	enabled := HSTSEnabled
+	hstsMu.RUnlock()
+	return enabled
+}
 
 // Static is the middleware that emits the five static hardening
 // headers on every response. It MUST be mounted at the outermost
@@ -65,7 +80,7 @@ func Static(next http.Handler) http.Handler {
 		h.Set(HeaderXContentTypeOptions, ValueXContentTypeOptions)
 		h.Set(HeaderReferrerPolicy, ValueReferrerPolicy)
 		h.Set(HeaderPermissionsPolicy, ValuePermissionsPolicy)
-		if HSTSEnabled {
+		if hstsEnabled() {
 			h.Set(HeaderStrictTransportSecurity, ValueHSTSMaxAge)
 		}
 		next.ServeHTTP(w, r)

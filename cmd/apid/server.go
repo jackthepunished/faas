@@ -231,6 +231,10 @@ type server struct {
 	// from it. Wired via WithDataPlacement from
 	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
 	dataPlacementEnabled bool
+	// runtimeConfig is the durable operator configuration snapshot. It is
+	// deliberately in-memory for request hot paths; the admin handler writes
+	// Postgres and the notification reconciler refreshes this snapshot.
+	runtimeConfig *runtimeConfigManager
 	// hostHashFunc (issue #957) is the test seam for forcing
 	// the env-classifier into the silent-skip branch. Nil in
 	// production (cmd/apid/main.go does NOT call
@@ -478,7 +482,47 @@ func (s *server) WithEventsPlatform(p *events.Platform) *server {
 // existing positional call sites in tests don't need editing.
 func (s *server) WithDataPlacement(enabled bool) *server {
 	s.dataPlacementEnabled = enabled
+	if s.runtimeConfig == nil {
+		s.runtimeConfig = newRuntimeConfigManager(nil)
+	}
+	_ = s.runtimeConfig.apply(runtimeConfigDataPlacement, boolJSON(enabled))
 	return s
+}
+
+// WithRuntimeConfigManager replaces the default environment-seeded manager
+// with the production manager using the caller's environment seam. The
+// setter keeps the existing test constructors source-compatible while making
+// runtime configuration injectable in boot tests.
+func (s *server) WithRuntimeConfigManager(manager *runtimeConfigManager) *server {
+	if manager != nil {
+		s.runtimeConfig = manager
+		// Apply the bootstrap HSTS value through the same side-effect path
+		// used by a later hot update. This keeps the environment fallback
+		// and the durable operator override on one source of truth.
+		_ = s.runtimeConfig.apply(runtimeConfigHSTS, s.runtimeConfig.Value(runtimeConfigHSTS))
+	}
+	return s
+}
+
+func (s *server) runtimeBool(key string, fallback bool) bool {
+	if s.runtimeConfig == nil {
+		return fallback
+	}
+	return s.runtimeConfig.Bool(key, fallback)
+}
+
+func (s *server) runtimeInt(key string, fallback int) int {
+	if s.runtimeConfig == nil {
+		return fallback
+	}
+	return s.runtimeConfig.Int(key, fallback)
+}
+
+func boolJSON(value bool) []byte {
+	if value {
+		return []byte("true")
+	}
+	return []byte("false")
 }
 
 // WithHostHashFunc (issue #957) attaches a stub for the env-
@@ -684,6 +728,7 @@ func newServerWithDeps(
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
 		audit:                  aud,
+		runtimeConfig:          newRuntimeConfigManager(nil),
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the
@@ -1559,6 +1604,20 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeForceDrain))))
 	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/activate",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeActivate))))
+
+	// ADR-132 — typed runtime configuration. GET and PATCH are MFA-gated
+	// because the catalog includes security-adjacent deployment posture. Hot
+	// values apply in the request; graceful values become durable operations.
+	// Filesystem/bootstrap settings remain visible as deployment-managed
+	// entries.
+	mux.HandleFunc("GET /v1/admin/config",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigList))))
+	mux.HandleFunc("PATCH /v1/admin/config/{key}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigPatch))))
+	mux.HandleFunc("GET /v1/admin/config-operations/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigOperationGet)))
+	mux.HandleFunc("GET /v1/admin/config/{key}/revisions",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigRevisions)))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session

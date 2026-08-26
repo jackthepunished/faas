@@ -2073,7 +2073,7 @@ func dialFailureReason(err error) string {
 // so the CLI gets a deterministic error code (per the
 // pre-#911 pattern in api/flags.go).
 func (s *server) getDomainDoctor(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.DomainDoctorEnabled() {
+	if !s.runtimeBool(runtimeConfigDomainDoctor, api.DomainDoctorEnabled()) {
 		api.WriteProblem(w, api.ErrDoctorDisabled())
 		return
 	}
@@ -2090,19 +2090,11 @@ func (s *server) getDomainDoctor(w http.ResponseWriter, r *http.Request, acct st
 	writeJSON(w, http.StatusOK, report)
 }
 
-// doctorTTL returns the FAAS_DOMAIN_DOCTOR_TTL_SECONDS value
-// (default 300s). Read at request time so an operator can
-// tighten / loosen the cache without bouncing apid.
-func doctorTTL() time.Duration {
-	v := strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_TTL_SECONDS"))
-	if v == "" {
-		return 5 * time.Minute
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return 5 * time.Minute
-	}
-	return time.Duration(n) * time.Second
+// doctorTTL returns the hot runtime-configured doctor cache age. The
+// environment remains the bootstrap fallback for local/dev compatibility;
+// the operator database override is applied without restarting apid.
+func (s *server) doctorTTL() time.Duration {
+	return time.Duration(s.runtimeInt(runtimeConfigDomainDoctorTTL, 300)) * time.Second
 }
 
 // buildDoctorReport reads the cached observation row and
@@ -2113,7 +2105,7 @@ func doctorTTL() time.Duration {
 func (s *server) buildDoctorReport(ctx context.Context, d state.CustomDomain) (api.DomainDoctorReport, error) {
 	obs, err := s.store.GetDoctorObservation(ctx, d.Domain)
 	if err == nil {
-		if time.Since(obs.ObservedAt) < doctorTTL() {
+		if time.Since(obs.ObservedAt) < s.doctorTTL() {
 			return doctorReportFromObs(d, obs, false), nil
 		}
 		// Stale: fall through to a synchronous re-probe so

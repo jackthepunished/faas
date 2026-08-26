@@ -2663,6 +2663,23 @@ type Store interface {
 	// FOR UPDATE SKIP LOCKED claim path sees a consistent snapshot.
 	ReclaimStuckRunningOperatorIntents(ctx context.Context, threshold time.Time) (int, error)
 
+	// Runtime configuration (ADR-132). The database stores desired state;
+	// daemons apply it to an in-memory snapshot and call
+	// MarkRuntimeConfigApplied after validation. pg_notify is emitted by the
+	// writer/trigger, but callers must also reconcile from the table after a
+	// restart because LISTEN delivery is intentionally not durable.
+	ListRuntimeConfigs(ctx context.Context, scope RuntimeConfigScope, scopeID string) ([]RuntimeConfig, error)
+	GetRuntimeConfig(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string) (RuntimeConfig, error)
+	UpsertRuntimeConfig(ctx context.Context, update RuntimeConfigUpdate) (RuntimeConfig, error)
+	MarkRuntimeConfigApplied(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64, effectiveValue json.RawMessage, applyErr string) error
+	CreateRuntimeConfigOperation(ctx context.Context, config RuntimeConfig, actorID, reason string) (RuntimeConfigOperation, error)
+	GetRuntimeConfigOperation(ctx context.Context, id string) (RuntimeConfigOperation, error)
+	ClaimPendingRuntimeConfigOperation(ctx context.Context) (RuntimeConfigOperation, error)
+	MarkRuntimeConfigOperationSucceeded(ctx context.Context, id string, effectiveValue json.RawMessage, appliedCount, targetCount int) error
+	MarkRuntimeConfigOperationFailed(ctx context.Context, id, phase, errMsg string) error
+	MarkRuntimeConfigOperationBlocked(ctx context.Context, id, phase, reason string) error
+	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the

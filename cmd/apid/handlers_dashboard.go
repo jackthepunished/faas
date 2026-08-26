@@ -2437,7 +2437,7 @@ func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log 
 	// operator choice. The dark-launch was a soak-only construct
 	// per ADR-120's Tier-A3 section; the operator's escape hatch
 	// MUST be visible in BOTH surfaces, not just the CLI.
-	if !api.DomainDoctorEnabled() {
+	if !s.runtimeBool(runtimeConfigDomainDoctor, api.DomainDoctorEnabled()) {
 		api.WriteProblem(w, api.ErrDoctorDisabled())
 		return
 	}
