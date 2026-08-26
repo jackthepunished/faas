@@ -10549,7 +10549,7 @@ type SnapshotSize struct {
 // contract every helper above enforces.
 //
 // PR-3a (issue #911 / ADR-110) widened the projection from 14 to 22;
-// migration 00456 adds gateway_target_url for a 23-column projection.
+// migration 00468 adds gateway_target_url for a 23-column projection.
 // The earlier 22-column additions were public_ip / public_ip_set_at
 // (migration 00174 closure) + release_id / manifest_hash /
 // host_certificate / cert_fingerprint /
