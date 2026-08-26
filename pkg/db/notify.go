@@ -91,6 +91,18 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         NotifyCronChanged's payload shape so the
 //	                         existing decoder pattern applies unchanged)
 //	NotifyKeyChanged        {"key_id":uuid}
+//	NotifyClusterSigningKeysChanged {}
+//	                         PR-3 / ADR-125: cluster_signing_keys row
+//	                         INSERT/UPDATE/DELETE; the listener pattern
+//	                         in cmd/schedd/cluster_key_loader.go and
+//	                         cmd/gatewayd-internal/cluster_key_verifier_loader.go
+//	                         re-loads the row on every delivery. Payload
+//	                         is bare table name (mirrors
+//	                         compute_node_keys_changed_trg at
+//	                         schema.sql:4317-4320); consumer re-reads.
+//	NotifyBuildQueued       {"build_id":uuid, "app_id":uuid,
+//	                         "kind":"tarball|dockerfile|function",
+//	                         "deployment_id":uuid}
 //	NotifyBuildQueued       {"build_id":uuid, "app_id":uuid,
 //	                         "kind":"tarball|dockerfile|function",
 //	                         "deployment_id":uuid}
@@ -120,6 +132,13 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         meterd → dashboard: paid-tier overage crossed
 //	                         100 %; apps keep running, overage accrues at
 //	                         €0.01/GB-h (spec §1, §10).
+//	NotifyMigrationsApplied {"version_id":int64}
+//	                         the leader's goose-up landed a migration at
+//	                         MAX(version_id) of goose_db_version (migration
+//	                         00347 trigger). cmd/migrate -wait-for-migrations
+//	                         unblocks and re-reads the ledger before
+//	                         declaring the fleet caught up. ADR-124 amendment
+//	                         / PR-2 / audit F2-B.
 //	NotifyCronFired         {"cron_id":uuid, "app_id":uuid, "at":rfc3339nano}
 //	                         schedd → dashboard: a synthetic cron request
 //	                         was dispatched through gatewayd-internal so metering
@@ -174,6 +193,16 @@ const (
 	NotifyDomainChanged     = "domain_changed"
 	NotifyCronChanged       = "cron_changed"
 	NotifyTriggerChanged    = "trigger_changed"
+	// NotifyMigrationsApplied fires when the migration_notify_trg
+	// (migration 00347) inserts a row into goose_db_version at the
+	// leading edge of the ledger. cmd/migrate -wait-for-migrations
+	// subscribes via cmd/migrate/wait.go::WaitForMigrationsApplied
+	// so non-leader daemons block until the leader's last migration
+	// lands before opening their own connection (PR-2 / audit F2-B /
+	// ADR-124 amendment). The payload is the decimal version_id; the
+	// waiter re-reads the ledger to confirm v == MaxEmbedded before
+	// returning, so a spurious early fire is harmless.
+	NotifyMigrationsApplied = "migrations_applied"
 	// NotifyTriggerReady fires when a row is inserted into
 	// trigger_records (migrations/00297_triggers.sql). schedd's
 	// dispatch tick consumes via cmd/schedd/main.go's existing
@@ -185,18 +214,29 @@ const (
 	//     full 1s tick before the first batch)
 	//   - dashboard SSE (commit #16 / §4.7.X — operator-facing
 	//     "your trigger just received a record" notification)
-	NotifyTriggerReady    = "trigger_ready"
-	NotifyKeyChanged      = "key_changed"
-	NotifyBuildQueued     = "build_queued"
-	NotifyBuildLog        = "build_log"
-	NotifyDomainVerify    = "domain_verify"
-	NotifyInstanceChanged = "instance_changed"
-	NotifySnapshotPrime   = "snapshot_prime"
-	NotifySnapshotBoot    = "snapshot_boot"
-	NotifySnapshotWritten = "snapshot_written"
-	NotifyBillingPastDue  = "billing_past_due"
-	NotifyQuotaWarning    = "quota_warning"
-	NotifyCronFired       = "cron_fired"
+	NotifyTriggerReady = "trigger_ready"
+	NotifyKeyChanged   = "key_changed"
+	// NotifyClusterSigningKeysChanged fires when the
+	// cluster_signing_keys_changed_trg (migration 00351) inserts,
+	// updates, or deletes a row in cluster_signing_keys. PR-3 /
+	// audit F1+F20 / ADR-125: the listener pattern in
+	// cmd/{schedd,gatewayd-internal}/cluster_*_loader.go subscribes
+	// to this channel and re-loads the cluster-wide Ed25519 keypair
+	// from PG, so a rotation propagates to every minter and verifier
+	// within one Postgres NOTIFY delivery (~5 ms end-to-end). The
+	// payload is informational — consumers always re-read the row
+	// to defend against notify loss.
+	NotifyClusterSigningKeysChanged = "cluster_signing_keys_changed"
+	NotifyBuildQueued               = "build_queued"
+	NotifyBuildLog                  = "build_log"
+	NotifyDomainVerify              = "domain_verify"
+	NotifyInstanceChanged           = "instance_changed"
+	NotifySnapshotPrime             = "snapshot_prime"
+	NotifySnapshotBoot              = "snapshot_boot"
+	NotifySnapshotWritten           = "snapshot_written"
+	NotifyBillingPastDue            = "billing_past_due"
+	NotifyQuotaWarning              = "quota_warning"
+	NotifyCronFired                 = "cron_fired"
 	// NotifyRateLimitChanged fires on every INSERT / UPDATE of
 	// tokens/last_refill on pg_ratelimit_counters (migration
 	// 00126, the C4 trigger). Payload is JSON

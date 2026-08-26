@@ -1,0 +1,73 @@
+-- filename: 00432_instances_wake_attempt_active_unique.sql
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00432_instances_wake_attempt_active_unique.sql — multi-host safety cluster
+-- PR-5 / audit F4 (cluster-wide wakeCoord). Adds a UNIQUE partial index on
+-- instances(wake_id) WHERE state IN ('waking', 'cold_booting'). This is the
+-- DB-level dedup primitive that closes the cross-box race where two schedd
+-- daemons (on different boxes) both boot the same wake attempt: the second
+-- INSERT lands a 23505 (UNIQUE violation) and the engine can recover via
+-- ReadActiveInstanceForWakeID.
+--
+-- Why the partial predicate: an instance's wake_id stays stable for the
+-- lifetime of that boot. The same wake_id reappearing with state='running'
+-- is the SAME instance, not a duplicate — the engine updated the state
+-- column in place. The partial predicate matches ONLY the in-flight states
+-- where two rows with the same wake_id would be a true race.
+--
+-- State values are lowercased to match the instances.state CHECK
+-- constraint from migration 00001 (which constrains state to
+-- {'parked','waking','cold_booting','running','parking',...}). An
+-- uppercase predicate would never match any row and the index would
+-- silently be a no-op, defeating the dedup gate.
+--
+-- Why we don't add a NOT NULL constraint on wake_id: the column has been
+-- NOT NULL since migrations/00028_instances_wake_id.sql. Re-asserting it
+-- here would be a no-op on a fresh DB and could break a half-migrated box
+-- (which the project tolerates via the COALESCE pattern in scanInstance).
+--
+-- Existing non-unique index instances_wake_id_app_idx (00028, on
+-- (app_id, wake_id)) is unchanged — it's the chooser-side lookup, not
+-- the dedup gate. The two indexes share the wake_id column but serve
+-- different planner roles: the new unique partial index enforces the
+-- invariant; the legacy non-unique index supports the existing scan
+-- pattern.
+--
+-- Pre-condition: at the time this migration runs, no two rows exist
+-- with the same wake_id AND state IN ('waking', 'cold_booting'). This
+-- invariant holds for every shipped pre-PR-5 install because (a) on
+-- single-box, schedd mints a fresh UUIDv7 per wake; (b) on multi-box
+-- without the owner-gate, races COULD have produced duplicates, but
+-- the post-restart recovery flow (MarkComputeNodeInactive + cold
+-- boot) clears in-flight rows for any drained box before another box
+-- picks up the wake. The PR-5 owner gate + the partial index together
+-- make the invariant permanent.
+--
+-- Slot note: PR-5 originally claimed 00350 (branched off post-00346).
+-- A flood of #1006 safe-releases mega fences consumed 00350..00375
+-- on main; PR #1023 (ADR-124 app_protocol) claimed 00376-00382;
+-- PR #1019 (mirror) claimed 00383-00386; PR #1046 (openapi-import)
+-- claimed 00383; PR #1049 (openapi-import rebump) and #1070 (wake-
+-- failure) absorbed 00387-00416. PR-5 was renumbered to 00432 (chain
+-- through 00418 → 00422 → 00428 → 00432 to dodge PR #1017, PR #1024,
+-- PR #1064, and PR #1067 collision waves) — see memory
+-- cross-pr-slot-precheck-pr-867-collision-2026-08-13. PR-5 lands past
+-- PR-4's real claim at 00431_compute_nodes_active_unique.sql. The
+-- migration slot-dance runbook referenced historically in this file
+-- (docs/runbooks/migration-slot-dance.md) is not on this branch.
+--
+-- The CREATE INDEX references `instances(wake_id)` with no schema
+-- qualifier so the index lands on whatever schema the migration
+-- runner's search_path resolves — preserves the per-test schema
+-- isolation under pgtest, which sets search_path=<schema>,public.
+CREATE UNIQUE INDEX IF NOT EXISTS instances_wake_attempt_active_idx
+    ON instances(wake_id)
+    WHERE state IN ('waking', 'cold_booting');
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+DROP INDEX IF EXISTS instances_wake_attempt_active_idx;
+-- +goose StatementEnd
