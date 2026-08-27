@@ -1,7 +1,6 @@
 package state
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -161,8 +160,6 @@ func TestMemStore_RecoverRolloutActionsAndGuards(t *testing.T) {
 }
 
 func TestMemStore_RecoverRolloutErrorGuards(t *testing.T) {
-	ctx := context.Background()
-
 	noRollout, ctx, _, app, _ := memDeploymentFixture(t)
 	if _, _, err := noRollout.RecoverRollout(ctx, app.ID, "abort", "none"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("no active rollout error = %v, want ErrNotFound", err)
