@@ -3733,10 +3733,19 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		// render the annotation without an audit round-trip.
 		// omitempty on each field keeps pre-feature rows
 		// byte-identical to the pre-PR wire shape.
-		Reason:     d.Reason,
-		Tag:        d.Tag,
-		DeployedBy: d.DeployedBy,
-		PRNumber:   d.PRNumber,
+		Reason:               d.Reason,
+		Tag:                  d.Tag,
+		DeployedBy:           d.DeployedBy,
+		PRNumber:             d.PRNumber,
+		CanaryPreset:         d.CanaryPreset,
+		CanaryStep:           d.CanaryStep,
+		CanaryTotalSteps:     d.CanaryTotalSteps,
+		CanaryStepStartedAt:  d.CanaryStepStartedAt,
+		RolloutState:         d.RolloutState,
+		RolloutStartedAt:     d.RolloutStartedAt,
+		RolloutCompletedAt:   d.RolloutCompletedAt,
+		RolloutAbortedAt:     d.RolloutAbortedAt,
+		RolloutAbortedReason: d.RolloutAbortedReason,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint

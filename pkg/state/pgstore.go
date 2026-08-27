@@ -4657,7 +4657,7 @@ func (s *PgStore) SafedeployStampRollout(ctx context.Context, id string, rollout
 	if err != nil {
 		return Deployment{}, fmt.Errorf("state: safedeploy stamp begin: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	row := tx.QueryRow(ctx,
 		`select `+deploymentSelectColumnsWithRootfs+`
@@ -14989,7 +14989,11 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number,
 	rollback_on_5xx,
 	first_wake_at, first_5xx_window_ends_at, first_5xx_count,
-	last_auto_rollback_at, coalesce(last_auto_rollback_reason,'')`
+	last_auto_rollback_at, coalesce(last_auto_rollback_reason,''),
+	coalesce(canary_preset, 'none'), canary_step, canary_total_steps,
+	canary_step_started_at, coalesce(rollout_state, 'pending'),
+	rollout_started_at, rollout_completed_at, rollout_aborted_at,
+	coalesce(rollout_aborted_reason, '')`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -15030,7 +15034,11 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number,
 	d.rollback_on_5xx,
 	d.first_wake_at, d.first_5xx_window_ends_at, d.first_5xx_count,
-	d.last_auto_rollback_at, coalesce(d.last_auto_rollback_reason,'')`
+	d.last_auto_rollback_at, coalesce(d.last_auto_rollback_reason,''),
+	coalesce(d.canary_preset, 'none'), d.canary_step, d.canary_total_steps,
+	d.canary_step_started_at, coalesce(d.rollout_state, 'pending'),
+	d.rollout_started_at, d.rollout_completed_at, d.rollout_aborted_at,
+	coalesce(d.rollout_aborted_reason, '')`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -15072,6 +15080,8 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	// field (the closed-set is enforced at the schema layer via
 	// deployments_last_auto_rollback_reason_check).
 	var firstWakeAt, first5xxWindowEndsAt, lastAutoRollbackAt *time.Time
+	var canaryStepStartedAt *time.Time
+	var rolloutStartedAt, rolloutCompletedAt, rolloutAbortedAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so
 	// the SELECT projections in DeploymentByID / LatestDeployment /
 	// etc. match. The scan order matches the column order in the
@@ -15120,6 +15130,10 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.RollbackOn5xx,
 		&firstWakeAt, &first5xxWindowEndsAt, &d.First5xxCount,
 		&lastAutoRollbackAt, &d.LastAutoRollbackReason,
+		&d.CanaryPreset, &d.CanaryStep, &d.CanaryTotalSteps,
+		&canaryStepStartedAt, &d.RolloutState,
+		&rolloutStartedAt, &rolloutCompletedAt, &rolloutAbortedAt,
+		&d.RolloutAbortedReason,
 	); err != nil {
 		return mapErr(err)
 	}
@@ -15147,6 +15161,10 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	d.FirstWakeAt = firstWakeAt
 	d.First5xxWindowEndsAt = first5xxWindowEndsAt
 	d.LastAutoRollbackAt = lastAutoRollbackAt
+	d.CanaryStepStartedAt = canaryStepStartedAt
+	d.RolloutStartedAt = rolloutStartedAt
+	d.RolloutCompletedAt = rolloutCompletedAt
+	d.RolloutAbortedAt = rolloutAbortedAt
 	return nil
 }
 

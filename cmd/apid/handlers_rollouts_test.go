@@ -62,6 +62,7 @@ func seedAppWithRollout(t *testing.T, e testEnv, slug string, rolloutState strin
 	dep, err := e.store.CreateDeployment(context.Background(), state.Deployment{
 		AppID:       app.ID,
 		ImageDigest: "deadbeef",
+		Status:      state.DeployLive,
 	})
 	if err != nil {
 		t.Fatal(err)

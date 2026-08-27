@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -69,15 +70,27 @@ func cmdRolloutsRecover(args []string) int {
 	fs := flag.NewFlagSet("rollouts recover", flag.ContinueOnError)
 	action := fs.String("action", "", "recover action (advance|promote|abort)")
 	reason := fs.String("reason", "", "operator-supplied reason (logged to deployment_audit)")
-	if err := fs.Parse(args); err != nil {
+	// The public usage is `recover <slug> --action ...`, while the
+	// standard flag package stops parsing at the first positional
+	// argument. Peel off the documented slug first so both that
+	// spelling and the conventional flags-before-positionals form
+	// remain accepted.
+	var slug string
+	flagArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		slug = args[0]
+		flagArgs = args[1:]
+	}
+	if err := fs.Parse(flagArgs); err != nil {
 		return 1
 	}
-	// Positional <slug> is the only remaining arg.
-	if fs.NArg() < 1 {
+	if slug == "" && fs.NArg() > 0 {
+		slug = fs.Arg(0)
+	}
+	if slug == "" {
 		PrintUsage(os.Stderr, "usage: gregale rollouts recover <slug> --action advance|promote|abort [--reason <text>]", "rollouts")
 		return 1
 	}
-	slug := fs.Arg(0)
 	if *action == "" {
 		return printErr("Missing --action", fmt.Errorf("--action is required (one of: advance, promote, abort)"))
 	}
@@ -103,14 +116,14 @@ func cmdRolloutsRecover(args []string) int {
 	// Human-mode echo: deployment id, post-state, traffic
 	// percent, and the audit row id (the operator can paste
 	// the audit id into the dashboard's deployment timeline).
-	fmt.Fprintf(osStdout, "Rollout %s on app %s.\n", *action, slug)
-	fmt.Fprintf(osStdout, "  deployment:  %s\n", resp.Deployment.ID)
+	_, _ = fmt.Fprintf(osStdout, "Rollout %s on app %s.\n", *action, slug)
+	_, _ = fmt.Fprintf(osStdout, "  deployment:  %s\n", resp.Deployment.ID)
 	if resp.Deployment.RolloutState != "" {
-		fmt.Fprintf(osStdout, "  state:       %s\n", resp.Deployment.RolloutState)
+		_, _ = fmt.Fprintf(osStdout, "  state:       %s\n", resp.Deployment.RolloutState)
 	}
 	if resp.Deployment.CanaryTotalSteps > 0 {
-		fmt.Fprintf(osStdout, "  canary_step: %d / %d\n", resp.Deployment.CanaryStep, resp.Deployment.CanaryTotalSteps)
+		_, _ = fmt.Fprintf(osStdout, "  canary_step: %d / %d\n", resp.Deployment.CanaryStep, resp.Deployment.CanaryTotalSteps)
 	}
-	fmt.Fprintf(osStdout, "  audit_id:    %s\n", resp.AuditID)
+	_, _ = fmt.Fprintf(osStdout, "  audit_id:    %s\n", resp.AuditID)
 	return 0
 }

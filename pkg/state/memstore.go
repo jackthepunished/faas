@@ -3971,6 +3971,12 @@ func (m *MemStore) CreateDeployment(_ context.Context, d Deployment) (Deployment
 	if !ok || app.Status == AppDeleted {
 		return Deployment{}, ErrNotFound
 	}
+	if d.CanaryPreset == "" {
+		d.CanaryPreset = "none"
+	}
+	if d.RolloutState == "" {
+		d.RolloutState = "pending"
+	}
 
 	// Find the most-recent non-terminal deployment row for this app.
 	// O(N) over the map is fine at one-box scale; spec §6 keeps the
@@ -12656,16 +12662,6 @@ func (m *MemStore) UpdateAlertRule(_ context.Context, id string, p UpdateAlertRu
 	}
 	if p.CooldownMinutes != nil {
 		r.CooldownMinutes = *p.CooldownMinutes
-	}
-	if p.Action != nil {
-		// The MemStore accepts the string directly — the
-		// closed-set vocabulary is enforced at the schema layer
-		// (migrations/00481_alert_rules_action.sql) on the
-		// PgStore path. Unit tests that need a row with a bad
-		// value (e.g. TestEvaluator_ActionExecutor_UnknownAction)
-		// rely on this leniency to exercise the evaluator's
-		// defensive unknown-action branch.
-		r.Action = AlertAction(*p.Action)
 	}
 	r.UpdatedAt = time.Now()
 	m.alertRules[id] = r

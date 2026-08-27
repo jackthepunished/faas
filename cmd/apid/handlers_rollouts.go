@@ -54,9 +54,9 @@ import (
 //
 //  1. Plan-gate (Pro+ only) — same posture as
 //     updateDeploymentTraffic. 403 plan_traffic_split_not_allowed.
-//  2. loadApp — 404 no such app, 403 cross-account.
-//  3. Decode body — 400 malformed.
-//  4. Action closed-set — 422 invalid_recover_action.
+//  2. Decode body — 400 malformed.
+//  3. Action closed-set — 422 invalid_recover_action.
+//  4. loadApp — 404 no such app, 403 cross-account.
 //  5. Reason trim — empty is legal (the operator might want to
 //     trip a default reason; the meterd audit row records "").
 //  6. store.RecoverRollout — atomic-tx with state-machine guards
@@ -70,23 +70,25 @@ func (s *server) recoverRollout(w http.ResponseWriter, r *http.Request, acct sta
 		api.WriteProblem(w, api.ErrPlanTrafficSplitNotAllowed(acct.Plan))
 		return
 	}
-	// (2) loadApp — IDOR-safe lookup (404 unknown, 403
-	// cross-account).
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
-	if !ok {
-		return
-	}
-	// (3) Decode body.
+	// (2) Decode body.
 	var req api.RecoverRolloutRequest
 	if err := decodeJSON(r, &req); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
 		return
 	}
-	// (4) Action closed-set. The store re-validates; this is
+	// (3) Action closed-set. The store re-validates; this is
 	// the primary gate so the operator's 422 surfaces
 	// without a Postgres round-trip.
 	if !api.AllowedRecoverRolloutAction(req.Action) {
 		api.WriteProblem(w, api.ErrInvalidRecoverAction(req.Action))
+		return
+	}
+	// (4) loadApp — IDOR-safe lookup (404 unknown, 403
+	// cross-account). This follows request-shape validation so
+	// malformed/unknown actions have deterministic client errors
+	// even when the slug is stale.
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
 		return
 	}
 	// (5) Reason trim (allow empty). Length cap matches the
@@ -122,12 +124,12 @@ func (s *server) recoverRollout(w http.ResponseWriter, r *http.Request, acct sta
 	// feed. Best-effort: a failure is logged-and-continued.
 	if s.audit != nil {
 		s.audit.Emit(r.Context(), "deployment.rollout_recovered", &acct.ID, map[string]any{
-			"app":             app.ID,
-			"deployment":      updated.ID,
-			"action":          req.Action,
-			"reason":          req.Reason,
+			"app":              app.ID,
+			"deployment":       updated.ID,
+			"action":           req.Action,
+			"reason":           req.Reason,
 			"deployment_audit": auditID,
-			"actor":           acct.ID,
+			"actor":            acct.ID,
 		})
 	}
 	// (8) 200 RolloutTransitionResponse. Caller can echo the

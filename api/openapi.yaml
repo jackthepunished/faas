@@ -11403,6 +11403,59 @@ components:
           enum: [null, threshold_exceeded, first_window_expired]
           description: "Closed-set classifier for the most recent auto-rollback trigger. `threshold_exceeded` = first_5xx_count crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing the threshold (clean wake window). Closed-set is enforced at the schema layer via deployments_last_auto_rollback_reason_check."
 
+        # SAFE-RELEASES-A/F: canary ladder and durable rollout state.
+        canary_preset:
+          type: string
+          enum: [none, slow, balanced, aggressive, 1-10-50-100]
+          description: "Canary preset used by the deployment's progressive rollout. `none` preserves the default 100% deployment path."
+        canary_step:
+          type: integer
+          minimum: 0
+          description: "Current zero-based canary ladder step."
+        canary_total_steps:
+          type: integer
+          minimum: 0
+          description: "Total number of canary ladder steps; zero means no canary ladder."
+        canary_step_started_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the current canary step began."
+        rollout_state:
+          type: string
+          enum: [pending, rolling_out, complete, aborted]
+          description: "Durable rollout state used by the canary orchestrator and operator recovery path."
+        rollout_started_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which rollout processing began."
+        rollout_completed_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the rollout reached complete."
+        rollout_aborted_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the rollout was aborted."
+        rollout_aborted_reason:
+          type: string
+          description: "Operator or orchestrator reason recorded when the rollout is aborted."
+
+    CanaryPresetSpec:
+      description: "Progressive canary rollout preset requested on deployment creation (issue #976 / ADR-122)."
+      type: object
+      required: [preset]
+      properties:
+        preset:
+          type: string
+          enum: [none, slow, balanced, aggressive, 1-10-50-100]
+          description: "Closed-set canary ladder catalog name."
+        step_durations:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+          description: "Optional step durations encoded as Go time.Duration nanoseconds; reserved for custom-ladder support."
+
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
       type: object
@@ -12038,6 +12091,13 @@ components:
           type: [boolean, "null"]
           description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false."
           example: true
+
+        # SAFE-RELEASES-A: optional progressive canary preset.
+        canary:
+          oneOf:
+            - $ref: '#/components/schemas/CanaryPresetSpec'
+            - type: 'null'
+          description: "Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only."
 
     CreateDeploymentOverrides:
       description: |
