@@ -137,6 +137,14 @@
         group: root
         mode: "0755"
 
+    - name: Stage the join bootstrap operator binary
+      ansible.builtin.copy:
+        src: "{{ faas_join_bootstrap_binary_source }}"
+        dest: /var/lib/faas/bootstrap/gregalectl
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Stage the release cosign verifier
       ansible.builtin.copy:
         src: "{{ faas_join_cosign_binary_source }}"
@@ -381,7 +389,7 @@
     - name: Initialize host-local runtime identity and backup stubs
       ansible.builtin.command:
         argv:
-          - /usr/local/bin/gregalectl
+          - /var/lib/faas/bootstrap/gregalectl
           - secrets
           - init
           - --preserve-existing
