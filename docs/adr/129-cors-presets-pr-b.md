@@ -102,8 +102,8 @@ Three reasons:
   compile-time merge keeps `EdgeRuleCORSResolved` as one struct. No
   "preset + inline fallback" flag at the runtime boundary.
 - **Migration economy.** One column + one FK + one partial index =
-  one migration (slot 00484 after the fifth rebase renumber;
-  originally 00428 → 00472 → 00475 → 00479 → 00481 → 00484). No new tables, no new enums.
+  one migration (slot 00487 after the sixth rebase renumber;
+  originally 00428 → 00472 → 00475 → 00479 → 00481 → 00484 → 00487). No new tables, no new enums.
 
 Concretely:
 
@@ -285,20 +285,20 @@ needed.
 
 ## Implementation notes
 
-- Migration slot: **00484** (fifth-renumber after main merged
-  PR #1133 snapshot-boot-node-routing just 4 minutes after the
-  fourth renumber landed — shipping `00481_reserve_slot.sql`
-  + `00482_instances_live_node_id_idx.sql` +
-  `00483_schema_integrity_repair.sql` to main). Slot history:
+- Migration slot: **00487** (sixth-renumber after main merged
+  PR #1111 Obs-Meta + Trace-IDs, shipping `00484_reserve_slot.sql`
+  + `00485_deployments_canary_state.sql` (PR #1124) +
+  `00486_events_operator_intents_trace_id.sql` (PR #1111) to main).
+  Slot history:
   00428 (initial) → 00472 (1st rebase, main's 00428 fence) →
   00475 (2nd rebase, PR #1064 merge's 00472/00473/00474/00476
   fences) → 00479 (3rd renumber, PR #1111's real migration
   at 00475) → 00481 (4th renumber, PR #1126 merged to main at
-  00479 + PR #1127 claims 00480) → **00484** (5th renumber,
-  PR #1133 merged to main at 00481/00482/00483). 00484 is the
-  next free slot above the current mainline 00483. No open PR
-  claims it (verified across 1134/1132/1123/1111/1100/1085/
-  1083/1076/1075/1041/1030/1024/997/989/971/947/945/944/943).
+  00479 + PR #1127 claims 00480) → 00484 (5th renumber,
+  PR #1133 merged 00481/00482/00483) → **00487** (6th renumber,
+  PR #1111 finally merged to main at 00486 + PR #1124 added
+  00484 fence + 00485 real). 00487 is the next free slot above
+  mainline 00486. No open PR claims it.
   Highest pre-#1064 migration on the rebased tree is
   `00471_runtime_configuration_operations.sql`. See
   `migrations/README.md` for the reservation fence convention.
@@ -314,7 +314,7 @@ needed.
   (validation matrix + plan quota + IDOR + audit);
   `cmd/gatewayd-internal/edge_rules_compile_cors_preset_test.go`
   (end-to-end + mutual exclusivity + footgun re-validation).
-- Companion test for migration 00484:
-  `migrations/00484_edge_rules_cors_preset_fk_test.go` pinning
+- Companion test for migration 00487:
+  `migrations/00487_edge_rules_cors_preset_fk_test.go` pinning
   column existence, nullable, FK ON DELETE SET NULL behavior, index
   selectivity.
