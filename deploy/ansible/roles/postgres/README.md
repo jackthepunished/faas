@@ -25,28 +25,29 @@ share the database without opening it to the public interface.
    `faas_postgres_password` from Ansible Vault before enabling that path.
 7. **§14 M8 restore-drill wiring**:
    - `wal_level = replica` (restart-needed)
-   - `archive_mode = on` (reload)
-   - `archive_command = 'cp %p /var/lib/pgsql/archive/%f'` (reload)
+   - `archive_mode = on` (restart-needed)
+   - provider-neutral `archive_command` with local-first WAL archival and
+     best-effort `rclone` push (reload)
    - `max_wal_senders = 3` (reload)
    - Creates `/var/lib/pgsql/archive` owned `postgres:postgres 0750`.
 
-The archive directory is local-only — the M8 restore drill script
-(`deploy/scripts/faas-m8-restore-drill.sh`) replays WAL from there
-after rsyncing a nightly basebackup. Off-host WAL shipping and
-pgbackrest are explicitly **M9** follow-ups (see plan §Step 4).
+The archive directory is the local authoritative copy — the M8 restore
+drill script (`deploy/scripts/faas-m8-restore-drill.sh`) replays WAL from
+there after rsyncing a nightly basebackup. The off-host rclone mirror is
+best-effort and is installed by the `postgres_backup` role (issue #250).
 
 ### `archive_command` quoting constraint
 
 `archive_command = '...'` is a **shell string** that PostgreSQL passes
 to `sh -c`. `%p` is the full path of the WAL segment to archive, `%f`
-is the filename. Today we use `cp %p /var/lib/pgsql/archive/%f` — a
-single `cp` with no shell metacharacters, so the single-quote
-delimiting in `postgresql.conf.j2` is safe.
+is the filename. The current command copies locally first and then
+best-effort mirrors the local file through the staged `offhostbox`
+rclone remote.
 
-**Constraint**: keep the value a single command with no `&&`, `||`,
-pipes, or embedded variables. If you need compound behavior, wrap it
-in a shell script under `/usr/local/bin/` and call that instead. The
-restore-drill script's cleanup sed (`/^# --- faas-m8-restore-drill:/,
+**Constraint**: keep the value on one line and preserve the local-copy
+failure as the only non-zero exit path. Remote failures must be logged
+but must not block PostgreSQL WAL recycling. The restore-drill script's
+cleanup sed (`/^# --- faas-m8-restore-drill:/,
 /^recovery_target_action = /d`) relies on the value being a single
 line — multi-line archive commands will break the range match.
 

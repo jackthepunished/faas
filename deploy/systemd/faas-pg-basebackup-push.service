@@ -32,8 +32,8 @@ After=faas-pg-basebackup.service
 # PR-8 (issue #911 / ADR-110 deferred): env var renamed from
 # HETZNER_STORAGE_BOX_BASEBACKUP_PATH → OFF_HOST_BACKUP_BASEBACKUP_PATH.
 # Off-host box is operator-agnostic; the rclone remote alias is
-# `offhostbox:` (was `hertznerbox:`). Match the ansible role's
-# vars_files rename + the `99-faas-off-host-backup.conf` drop-in.
+# `offhostbox:` (was `hertznerbox:`). Match the Ansible role's
+# vars_files rename; provider-specific connection details remain in rclone.conf.
 
 [Service]
 Type=oneshot
@@ -41,25 +41,27 @@ User=root
 Group=root
 
 Environment=OFF_HOST_BACKUP_BASEBACKUP_PATH=faas-pg-basebackup
+# Provider-specific connection details live in the rclone remote named
+# `offhostbox`; the unit never needs a cloud/provider-specific IP or host.
+Environment=OFF_HOST_BACKUP_REMOTE=offhostbox
 # Issue #585 / ADR-127 — sealed.env is apid-only; pg-basebackup-push no
 # longer inherits it. The rclone config (sealed at rest via host.age) is
-# loaded via LoadCredential below. The bash ExecStart uses
-# --config=%d/faas_off_host_backup_rclone, which resolves to
-# $CREDENTIALS_DIRECTORY/faas_off_host_backup_rclone — only valid when
-# the matching LoadCredential directive has staged the file at
-# unit activation. Missing the LoadCredential would silently make the
-# path nonexistent and rclone exit with "config file not found".
-LoadCredential=faas_off_host_backup_rclone:/etc/faas/secrets/pg-basebackup-push/rclone.conf
+# loaded via the optional LoadCredential below. A missing credential is a
+# supported unconfigured state; the timer logs that state and exits cleanly.
+LoadCredential=faas_off_host_backup_rclone:-/etc/faas/secrets/storage-box/rclone.conf
 
 ExecStart=/usr/bin/env bash -c '\
   set -euo pipefail; \
+  config=%d/faas_off_host_backup_rclone; \
+  [[ -r "$${config}" ]] || { echo "off-host backup disabled: credential not installed" >&2; exit 0; }; \
+  grep -q '^\[offhostbox\]$' "$${config}" || { echo "off-host backup disabled: offhostbox remote not configured" >&2; exit 0; }; \
   src=/var/lib/pgsql/basebackup; \
   [[ -d "$${src}" ]] || { echo "no $$src" >&2; exit 1; }; \
   [[ -n "$$(ls -1A "$${src}")" ]] || { echo "$$src empty — nothing to push" >&2; exit 1; }; \
-  rclone sync "$${src}" "offhostbox:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}" \
-    --config=%d/faas_off_host_backup_rclone \
+  rclone sync "$${src}" "$${OFF_HOST_BACKUP_REMOTE}:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}" \
+    --config="$${config}" \
     --stats=0 --quiet; \
-  echo "pushed $$src → offhostbox:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}"'
+  echo "pushed $$src → $${OFF_HOST_BACKUP_REMOTE}:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}"'
 SuccessExitStatus=0
 TimeoutStartSec=2h
 

@@ -83,6 +83,15 @@ func hasLoadCredential(u daemonunit.Unit, name, path string) bool {
 	return false
 }
 
+func hasOptionalLoadCredential(u daemonunit.Unit, name, path string) bool {
+	for _, cred := range u.LoadCredential {
+		if cred.Name == name && cred.Path == path && cred.Optional {
+			return true
+		}
+	}
+	return false
+}
+
 // --- per-daemon UnitXxx() constructors ------------------------------
 
 func TestUnitVmmd_Shape(t *testing.T) {
@@ -137,6 +146,12 @@ func TestUnitApid_Shape(t *testing.T) {
 	if !hasLoadCredential(u, "faas_host_hmac_key", "/etc/faas/secrets/host.hmac.key") {
 		t.Error("apid: missing required faas_host_hmac_key LoadCredential")
 	}
+	if !hasEnvironment(u, "FAAS_LOG_ARCHIVE_CREDS_PATH", "%d/faas_archive_creds") {
+		t.Error("apid: missing optional log archive credential-dir environment")
+	}
+	if !hasOptionalLoadCredential(u, "faas_archive_creds", "/etc/faas/secrets/storage-box/archive-creds.json") {
+		t.Error("apid: missing optional faas_archive_creds LoadCredential")
+	}
 }
 
 func TestUnitSchedd_Shape(t *testing.T) {
@@ -189,6 +204,12 @@ func TestUnitGatewaydInternal_Shape(t *testing.T) {
 	assertBasicShape(t, "gatewayd-internal", u)
 	if u.Slice != FaasCPSlice {
 		t.Errorf("gatewayd-internal: Slice = %q, want %q", u.Slice, FaasCPSlice)
+	}
+	if !hasEnvironment(u, "FAAS_LOG_ARCHIVE_CREDS_PATH", "%d/faas_archive_creds") {
+		t.Error("gatewayd-internal: missing optional log archive credential-dir environment")
+	}
+	if !hasOptionalLoadCredential(u, "faas_archive_creds", "/etc/faas/secrets/storage-box/archive-creds.json") {
+		t.Error("gatewayd-internal: missing optional faas_archive_creds LoadCredential")
 	}
 }
 

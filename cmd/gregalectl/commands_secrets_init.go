@@ -49,9 +49,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"filippo.io/age"
@@ -193,14 +191,12 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	hostCertPEM := []byte(secretbox.RecipientString(hostAgeID))
 	hostCertFP := sha256Hex(hostCertPEM)
 
-	// Step 2: box-age-key (0440 root:postgres). The on-disk
+	// Step 2: box-age-key (0400 root:root). The on-disk
 	// content is the X25519 identity (mirrors what cmdBackup
-	// reads at unseal time). generateBoxAgeKey writes the file
-	// via secretbox.GenerateAndSaveHostKey + chmod 0440 +
-	// chown root:postgres (best-effort; postgres may not exist
-	// on a dev box).
+	// reads at unseal time). It is consumed only by the root-run
+	// unseal CLI, never by a daemon.
 	boxAgePath := filepath.Join(storageDir, "box-age-key")
-	if err := writeBoxAgeKey(boxAgePath, f.force, f.preserveExisting, stdout); err != nil {
+	if err := writeBoxAgeKey(boxAgePath, f.force, f.preserveExisting); err != nil {
 		return err
 	}
 
@@ -212,7 +208,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 		return err
 	}
 
-	// Step 4: rclone.conf (0440 root:postgres). The init leaf
+	// Step 4: rclone.conf (0400 root:root). The init leaf
 	// writes a stub envelope; the operator uses `backup
 	// unseal-rclone` to overwrite with the real plaintext after
 	// scp'ing the .age envelope. The stub is a single-line JSON
@@ -220,7 +216,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// (postgres_backup/tasks/main.yml) passes before the unseal
 	// step.
 	rclonePath := filepath.Join(storageDir, "rclone.conf")
-	if err := writeRcloneStub(rclonePath, f.force, f.preserveExisting, stdout); err != nil {
+	if err := writeRcloneStub(rclonePath, f.force, f.preserveExisting); err != nil {
 		return err
 	}
 
@@ -344,30 +340,6 @@ func resolveSecretsDSN() string {
 	return ""
 }
 
-// chownRootPostgres sets the file group to postgres (best-effort —
-// the postgres group may not exist on a dev box; emit a warning on
-// lookup failure rather than refusing init, since the canonical
-// owner:root:root posture plus the 0440 mode is the load-bearing
-// identity contract per spec §11). Failures of the actual Chown
-// syscall (path mismatch, EPERM) DO error — those are config drift.
-func chownRootPostgres(path string, stdout io.Writer) error {
-	g, err := user.LookupGroup("postgres")
-	if err != nil {
-		if stdout != nil {
-			_, _ = fmt.Fprintf(stdout, "warning: postgres group lookup failed (chown skipped for %s): %v\n", path, err)
-		}
-		return nil
-	}
-	gid, gerr := strconv.Atoi(g.Gid)
-	if gerr != nil {
-		return fmt.Errorf("parse postgres gid %q: %w", g.Gid, gerr)
-	}
-	if err := os.Chown(path, 0, gid); err != nil {
-		return fmt.Errorf("chown root:postgres %s: %w", path, err)
-	}
-	return nil
-}
-
 // enforceFileMode re-applies the requested mode after WriteFile.
 // The umask may loosen the mode WriteFile requests, so a post-write
 // Chmod is the only way to guarantee the contract on disk.
@@ -418,13 +390,12 @@ func writeOrLoadHostAge(path string, force, preserveExisting bool) (*age.X25519I
 	return writeHostAge(path, force)
 }
 
-// writeBoxAgeKey writes a fresh X25519 identity with mode 0440
-// root:postgres. Uses secretbox.GenerateAndSaveHostKey for the
+// writeBoxAgeKey writes a fresh X25519 identity with mode 0400
+// root:root. Uses secretbox.GenerateAndSaveHostKey for the
 // keygen (same shape as host.age); the file IS the right half
 // (the file content is the identity string per filippo.io/age
-// convention). Postgres may not exist on a dev install — the
-// chown is best-effort and the mode is the load-bearing contract.
-func writeBoxAgeKey(path string, force, preserveExisting bool, stdout io.Writer) error {
+// convention). The key is consumed only by the root-run unseal CLI.
+func writeBoxAgeKey(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
 			return nil
@@ -442,10 +413,7 @@ func writeBoxAgeKey(path string, force, preserveExisting bool, stdout io.Writer)
 	if _, err := secretbox.GenerateAndSaveHostKey(path); err != nil {
 		return err
 	}
-	if err := enforceFileMode(path, 0o440); err != nil {
-		return err
-	}
-	if err := chownRootPostgres(path, stdout); err != nil {
+	if err := enforceFileMode(path, 0o400); err != nil {
 		return err
 	}
 	return nil
@@ -486,8 +454,9 @@ func writeSessionKey(path string, force, preserveExisting bool) error {
 // writeRcloneStub writes a placeholder envelope. The operator
 // replaces it with the real plaintext via `backup unseal-rclone`.
 // The stub is a single line of JSON so the ansible stat-assert
-// (postgres_backup/tasks/main.yml:198) passes.
-func writeRcloneStub(path string, force, preserveExisting bool, stdout io.Writer) error {
+// (postgres_backup/tasks/main.yml) passes. systemd reads the source as root
+// and stages it for the PostgreSQL service, so the source stays root-only.
+func writeRcloneStub(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
 			return nil
@@ -503,13 +472,10 @@ func writeRcloneStub(path string, force, preserveExisting bool, stdout io.Writer
 		}
 	}
 	stub := []byte(`{"_":"secrets init stub — replace via 'gregalectl backup unseal-rclone'"}`)
-	if err := os.WriteFile(path, stub, 0o440); err != nil {
+	if err := os.WriteFile(path, stub, 0o400); err != nil {
 		return fmt.Errorf("write rclone.conf stub %s: %w", path, err)
 	}
-	if err := enforceFileMode(path, 0o440); err != nil {
-		return err
-	}
-	if err := chownRootPostgres(path, stdout); err != nil {
+	if err := enforceFileMode(path, 0o400); err != nil {
 		return err
 	}
 	return nil

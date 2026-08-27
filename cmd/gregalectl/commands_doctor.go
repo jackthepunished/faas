@@ -1228,8 +1228,8 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 	}{
 		{"host.age", "/etc/faas/secrets/host.age", "0400", doctorSeverityError},
 		{"session.key", "/etc/faas/secrets/session.key", "0400", doctorSeverityWarn},
-		{"box-age-key", storageDir + "/box-age-key", "0440", doctorSeverityWarn},
-		{"rclone.conf", storageDir + "/rclone.conf", "0440", doctorSeverityWarn},
+		{"box-age-key", storageDir + "/box-age-key", "0400", doctorSeverityWarn},
+		{"rclone.conf", storageDir + "/rclone.conf", "0400", doctorSeverityWarn},
 		{"archive-creds.json", storageDir + "/archive-creds.json", "0400", doctorSeverityWarn},
 	}
 	for _, s := range secrets {

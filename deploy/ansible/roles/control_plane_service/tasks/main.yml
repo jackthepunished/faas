@@ -422,13 +422,14 @@
       credential envelope with broader access.
   when: faas_archive_creds_stat.stat.exists
 
-# Issue #562 — install the apid systemd drop-in that surfaces
-# the S3 archive credentials envelope via LoadCredential= and
-# grants the shipper write access to /var/log/faas/archive.
+# Issue #562 — install the apid systemd drop-in that grants
+# the shipper write access to /var/log/faas/archive. The S3
+# archive credential is part of the apid base unit and is loaded
+# optionally, so this drop-in contains no secret source.
 # Drop-in files live alongside the unit and are auto-loaded
 # by systemd when the unit is reloaded (mirrors the
 # postgres storage-box drop-in at deploy/ansible/roles/
-# postgres/files/postgresql.service.d/99-faas-storage-box.conf).
+# postgres/files/postgresql@.service.d/99-faas-off-host-backup.conf).
 - name: control_plane_service — install apid log-archive drop-in (issue #562)
   ansible.builtin.copy:
     src: "faas-apid.service.d/99-faas-log-archive.conf"
