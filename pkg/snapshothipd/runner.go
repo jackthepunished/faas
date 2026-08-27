@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	// DefaultInterval keeps a newly-created snapshot discoverable quickly
-	// while bounding the reconciliation query to one read per second per
-	// compute node.
+	// DefaultInterval keeps newly-created fan-out jobs moving quickly. The
+	// steady-state reconciliation is event-cursor based, so it does not scan
+	// the complete snapshots table.
 	DefaultInterval = time.Second
 	// DefaultMaxPerTick avoids making a registry outage or a large snapshot
 	// backlog monopolise a schedd process.
@@ -80,8 +80,9 @@ func (r *Runner) WithMaxPerTick(max int) *Runner {
 }
 
 // Run performs one reconciliation immediately, then keeps the local cache
-// current until ctx is cancelled. A tick error is logged and does not stop
-// the daemon; the next tick retries the durable queue.
+// current until ctx is cancelled. Each reconciliation consumes the durable
+// event cursor, rather than scanning the complete snapshots table. A tick
+// error is logged and does not stop the daemon; the next tick retries.
 func (r *Runner) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
@@ -115,6 +116,11 @@ func (r *Runner) validate() error {
 }
 
 func (r *Runner) runTick(ctx context.Context) {
+	r.reconcile(ctx)
+	r.runWorkTick(ctx)
+}
+
+func (r *Runner) reconcile(ctx context.Context) {
 	added, err := r.store.EnqueueSnapshotReplicasForNode(ctx, r.nodeID)
 	if err != nil {
 		r.log.Warn("snapshothipd: reconcile failed", "node_id", r.nodeID, "err", err)
@@ -123,6 +129,9 @@ func (r *Runner) runTick(ctx context.Context) {
 	if added > 0 {
 		r.log.Info("snapshothipd: snapshot replica jobs enqueued", "node_id", r.nodeID, "count", added)
 	}
+}
+
+func (r *Runner) runWorkTick(ctx context.Context) {
 	for i := 0; i < r.maxTick; i++ {
 		if ctx.Err() != nil {
 			return
