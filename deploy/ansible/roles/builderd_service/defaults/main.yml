@@ -11,3 +11,7 @@ builderd_config_path: /etc/faas/builderd.toml
 # builderd_build_staging_root matches the unit's ReadWritePaths=
 # pass at /srv/fc/builder. Must be writable by faas-builderd.
 builderd_build_staging_root: /srv/fc/builder
+# builderd_cache_dir matches builderd's canonical Config.CacheDir and the
+# unit's ReadWritePaths=. It is a host-local content-addressed cache; the
+# build output remains in shared storage for the imaged/snapshot pipeline.
+builderd_cache_dir: /var/cache/faas/builds
