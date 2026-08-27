@@ -49,6 +49,12 @@ import (
 // shape. The two compose.
 const SchemaVersion = "1.0.0"
 
+// MaxComputeNodes is the supported production fleet ceiling for the
+// manifest/Ansible deployment path. It is an explicit contract rather than a
+// claim about the theoretical scheduler capacity: raising it should follow a
+// scale validation run and a review of resolver, firewall, and rollout costs.
+const MaxComputeNodes = 1000
+
 // SupportedSchemaVersions lists every schema_version the validator
 // accepts. Schema-evolution policy: keep the previous major version on
 // a bump for at least one release cycle (so an operator upgrading
@@ -233,6 +239,19 @@ func (e *Egress) validate() Errors {
 // declare exactly one host with role `single-box`.
 type Fleet struct {
 	Hosts []Host `yaml:"hosts"`
+}
+
+// ComputeNodeCount returns the number of compute-only hosts in the fleet.
+// Keeping this count in the manifest package gives validators, deployment
+// tooling, and scale checks one definition of the production fleet size.
+func (f Fleet) ComputeNodeCount() int {
+	count := 0
+	for _, host := range f.Hosts {
+		if host.Role == "compute-only" {
+			count++
+		}
+	}
+	return count
 }
 
 // Host is one control-plane node in the fleet. `name` is the canonical
@@ -844,6 +863,11 @@ func (f *Fleet) validate() Errors {
 			errs = append(errs, Error{path + ".storage_device",
 				fmt.Sprintf("storage_device %q must be an absolute device path", h.StorageDevice)})
 		}
+	}
+	computeNodeCount := f.ComputeNodeCount()
+	if computeNodeCount > MaxComputeNodes {
+		errs = append(errs, Error{"fleet.hosts",
+			fmt.Sprintf("declares %d compute-only hosts; maximum supported is %d", computeNodeCount, MaxComputeNodes)})
 	}
 	// Single-box sanity: at most one host when role == single-box.
 	// Single-box sanity: at most one host when role == single-box is

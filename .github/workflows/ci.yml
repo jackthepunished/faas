@@ -290,6 +290,12 @@ jobs:
           # Gate-B: syntax-check the only production bootstrap playbook
           # before an operator can run either role-specific target.
           ansible-playbook --syntax-check bootstrap.yml
+          # Gate-C: keep the connection-free scale validator parseable.
+          ansible-playbook --syntax-check scale_check.yml
+          # Gate-D: render and validate the 1/10/100/1000 compute-node
+          # topologies, then run Ansible check-mode against the largest one.
+          cd ../..
+          GREGALE_ANSIBLE_SCALE_CHECK=1 go test -count=1 -timeout=5m ./cmd/gregalectl -run '^TestRenderManifestAnsibleFiles_ScaleMatrix$'
 
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
       # through pkg/wire.Daemon. `--help` must exit 0 with non-empty usage text
