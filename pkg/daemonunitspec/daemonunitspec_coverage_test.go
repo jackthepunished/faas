@@ -179,6 +179,9 @@ func TestUnitBuilderd_Shape(t *testing.T) {
 			t.Errorf("builderd: After must NOT include apid (cross-host split-box): got %v", u.After)
 		}
 	}
+	if !hasReadWrite(u, "/var/cache/faas/builds") {
+		t.Error("builderd: missing ReadWritePaths=/var/cache/faas/builds")
+	}
 }
 
 func TestUnitGatewaydInternal_Shape(t *testing.T) {

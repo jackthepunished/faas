@@ -25,8 +25,10 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     EX44, /dev/shm is tmpfs. This is the regression that broke every
 //     cd-controlplane deploy 2026-08-04 → 2026-08-05 (PR-K.2 + ADR-053).
 //   - ReadWritePaths covers the per-fc path: /srv/fc/{snap,base,sigs} +
-//     /dev/shm/faas-base-staging + logs/spool. /srv/fc/sigs was missed
-//     when ADR-038 landed and crash-looped imaged on the DO box.
+//     /dev/shm/faas-base-staging + logs/spool, plus the shared Grype DB
+//     cache so an expired vulnerability database can refresh under the
+//     systemd sandbox. /srv/fc/sigs was missed when ADR-038 landed and
+//     crash-looped imaged on the DO box.
 //
 // See ADR-078 for the migration that wiped these from the unit body.
 //
@@ -106,7 +108,7 @@ func UnitImaged() daemonunit.Unit {
 		ReadOnlyPaths: []string{"/etc/faas"},
 		ReadWritePaths: []string{
 			"/srv/fc/snap", "/srv/fc/base", "/srv/fc/base-staging", "/srv/fc/scans", "/srv/fc/sigs",
-			"/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache",
+			"/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache", "/var/lib/faas/grype",
 			"/dev/shm/faas-base-staging",
 		},
 

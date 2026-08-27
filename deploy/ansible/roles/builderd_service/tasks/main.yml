@@ -127,6 +127,17 @@
     group: faas
     mode: "0770"
 
+# builderd's content-addressed build cache defaults to /var/cache/faas/builds
+# (cmd/builderd/config.go). ProtectSystem=strict requires this host-local
+# cache to be both present and explicitly whitelisted by the unit.
+- name: builderd_service — ensure build cache exists
+  ansible.builtin.file:
+    path: "{{ builderd_cache_dir }}"
+    state: directory
+    owner: faas-builderd
+    group: faas
+    mode: "0770"
+
 # builderd's ProtectSystem=strict namespace also allows the shared log and
 # spool roots. The compute_only_service role converges these later, but this
 # role runs first in bootstrap and must make its own declared write paths
@@ -157,6 +168,7 @@
       - /var/log/faas
       - /var/spool/faas
       - /var/lib/faas/cache
+      - "{{ builderd_cache_dir }}"
 
 - name: builderd_service — assert every ReadWritePaths= target exists
   ansible.builtin.stat:
