@@ -343,7 +343,7 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 				Reason:    "persisted_via_flag",
 				CreatedBy: "cli", // future: thread actor from the auth context
 			})
-			if perr != nil && perr != state.ErrConflict {
+			if perr != nil && !errors.Is(perr, state.ErrConflict) {
 				// Don't fail the apply on a persist-write miss;
 				// log the error via the audit log and continue.
 				// The apply already succeeded — losing one

@@ -33,6 +33,8 @@ export type ApplyResponse = {
   unaffected?: Array<PlanAffectedApp>;
   skipped?: Array<PlanAffectedApp>;
   removed?: Array<string>;
+  persisted_exclusions?: Array<string>;
+  stale_persisted_exclusions?: Array<string>;
   project_id?: string;
   apps?: Array<{
     slug: string;

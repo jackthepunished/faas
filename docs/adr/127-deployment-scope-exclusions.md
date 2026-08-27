@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-08-24)
 - **Date:** 2026-08-24
-- **Scope:** `migrations/00418_deployment_scope_exclusions.sql`,
+- **Scope:** `migrations/00488_deployment_scope_exclusions.sql`,
   `pkg/state/{store.go,pgstore_deployment_scope_exclusions.go,memstore_deployment_scope_exclusions.go}`,
   `pkg/reconcile/audit.go`,
   `pkg/api/dto.go`,
@@ -75,7 +75,7 @@ Three precedents on this platform push the answer into an ADR:
 
 ### 1. New table `deployment_scope_exclusions`
 
-Migration `migrations/00418_deployment_scope_exclusions.sql` (slot
+Migration `migrations/00488_deployment_scope_exclusions.sql` (slot
 00418; PR-B commit 1, fence at 00417).
 
 ```sql

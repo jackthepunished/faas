@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00418 (deployment_scope_exclusions
+// Migration-apply test for 00488 (deployment_scope_exclusions
 // table — ADR-124 follow-up #3 persistent --exclude history).
 //
 // Pins the load-bearing contracts:
@@ -22,7 +22,7 @@
 //  6. NO FK to apps(id) — soft-deleted apps do NOT cascade. The
 //     row must survive UPDATE apps SET status='deleted' (this
 //     is the SOFT-DELETE CASCADE BLIND SPOT documented in
-//     00418_deployment_scope_exclusions.sql header).
+//     00488_deployment_scope_exclusions.sql header).
 //  7. ON DELETE CASCADE on accounts and projects DOES fire —
 //     these are real DELETE paths (GDPR hard-delete + project
 //     full-reset) so the FK posture is symmetric for them.

@@ -3546,10 +3546,10 @@ func renderApplyRescue(w io.Writer, apply api.ApplyResponse) {
 		source = "by excluded workloads (some persisted via --persist-exclude)"
 	}
 	if len(apply.CanApplyReasons) == 0 {
-		fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked).\n", source)
+		_, _ = fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked).\n", source)
 		return
 	}
-	fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked); reasons: %s\n",
+	_, _ = fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked); reasons: %s\n",
 		source, strings.Join(apply.CanApplyReasons, "; "))
 }
 

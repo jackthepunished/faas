@@ -319,5 +319,5 @@ ADR-124 ships via a 4-PR cluster:
   status flipped from Proposed to Accepted with this section.
 
 ADR-127 (sister ADR for persistence, PR-B commit 6) is OPTIONAL;
-the persistence design is captured in 00418_deployment_scope_exclusions.sql
+the persistence design is captured in 00488_deployment_scope_exclusions.sql
 header without a separate ADR file.

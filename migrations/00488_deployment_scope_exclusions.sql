@@ -1,4 +1,4 @@
--- filename: 00418_deployment_scope_exclusions.sql
+-- filename: 00488_deployment_scope_exclusions.sql
 -- +goose Up
 -- +goose StatementBegin
 --
@@ -69,12 +69,12 @@
 -- preview) was cut from origin/main at commit `0b4cf07f4`
 -- where the migration tail was 00386. origin/main has since
 -- advanced 140 commits to 00416_openapi_import.sql (PR #1049).
--- Picking 00418 (after the 00417 fence) is correct against
--- the current origin/main head. The author MUST rebase before
--- opening — see 00417_reserve_slot.sql header for the recipe.
--- If the rebased branch reveals a conflict, renumber following
--- the PR #1024 / #1064 / #1070 renumber pattern (most recent
--- observed renumber hops were 4-12 slots).
+-- Picking 00488 (after the 00487 fence) is correct against
+-- the current origin/main head (00486_events_operator_intents_trace_id.sql).
+-- The original branch picked 00417 + 00418 but those slots were
+-- claimed by PR #1070 alert-presets / alert-presets-seed after
+-- the rebase, so renumbered to 00487 + 00488 — see 00487_reserve_slot.sql
+-- header for the renumber recipe.
 
 -- Replay-safe posture: every CREATE in this Up block uses
 -- IF NOT EXISTS (or DROP TRIGGER IF EXISTS before CREATE
@@ -137,7 +137,7 @@ CREATE TRIGGER deployment_scope_exclusions_set_updated_at_trg
 -- delete CASCADE blind spot section above; the absence of an
 -- apps FK is the load-bearing design choice here). The goose
 -- Down sequence runs migrations in reverse apply order so the
--- 00417 fence is already gone by the time this Down fires.
+-- 00487 fence is already gone by the time this Down fires.
 DROP TRIGGER IF EXISTS deployment_scope_exclusions_set_updated_at_trg
     ON deployment_scope_exclusions;
 DROP FUNCTION IF EXISTS deployment_scope_exclusions_set_updated_at();
