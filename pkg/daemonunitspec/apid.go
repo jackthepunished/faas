@@ -63,6 +63,7 @@ func UnitApid() daemonunit.Unit {
 			{Key: "FAAS_SESSION_KEY", Value: "%d/faas_session_key"},
 			{Key: "FAAS_HOST_AGE_IDENTITY_PATH", Value: "%d/faas_host_age_identity"},
 			{Key: "FAAS_HOST_HMAC_KEY_PATH", Value: "%d/faas_host_hmac_key"},
+			{Key: "FAAS_LOG_ARCHIVE_CREDS_PATH", Value: "%d/faas_archive_creds"},
 			{Key: "FAAS_APID_ADVISORY_SOCK", Value: "/run/faas/apid.sock"},
 			{Key: "FAAS_STATUSPAGE_PATH", Value: "/etc/faas/statuspage/index.html"},
 		},
@@ -71,6 +72,7 @@ func UnitApid() daemonunit.Unit {
 			{Name: "faas_host_age_identity", Path: "/etc/faas/secrets/host.age"},
 			{Name: "faas_host_age_identity_previous", Path: "/etc/faas/secrets/host.age.previous", Optional: true},
 			{Name: "faas_host_hmac_key", Path: "/etc/faas/secrets/host.hmac.key"},
+			{Name: "faas_archive_creds", Path: "/etc/faas/secrets/storage-box/archive-creds.json", Optional: true},
 		},
 
 		NoNewPrivileges:       true,

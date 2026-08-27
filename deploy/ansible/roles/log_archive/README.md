@@ -9,32 +9,30 @@ daemons share one credential envelope:
 | `gatewayd-internal` | reads per-day archives back on `?archive=1` (PR-B handler) |
 
 The Go-level wiring (config parsing, SigV4 sign, S3 client) lives
-in `pkg/logarchive` and is loaded by both daemons via `os.Getenv`
-on the same `FAAS_LOG_ARCHIVE_*` envelope. This role is the
-host-level glue: where the envelope lives, what perms it must
-have, and where the local spool root sits.
+in `pkg/logarchive`. Both daemons read the same provider-neutral
+S3 settings plus the same systemd-staged `archive-creds.json`
+envelope. This role is the host-level glue: where the source
+envelope lives, what perms it must have, and where the local
+spool root sits.
 
 ## What this role does
 
 1. Fail-closed asserts on
    `/etc/faas/secrets/storage-box/archive-creds.json`
-   (mode `0400`, owner `root`, group `root` — spec §11). Both
-   daemons read this via systemd's `LoadCredential=` so the
+   (mode `0400`, owner `root`, group `root` — spec §11). PID 1
+   reads this source and systemd stages it for both daemons via
+   `LoadCredential=` so the
    plaintext never appears on the host filesystem outside
    the unit's `$CREDENTIALS_DIRECTORY`.
 2. Creates `/var/log/faas/archive` (`faas:faas`, mode `0750`).
    The apid shipper writes `.partial` files here on the way
    to the bucket; gatewayd-internal does NOT touch this dir
    (read-back is bucket-only, not spool).
-3. Drops
-   `/etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-log-archive.conf`
-   so the read-back handler can LoadCredential the same
-   envelope apid reads. Mirrors the apid drop-in at
-   `control_plane_service/files/faas-apid.service.d/`.
-4. Asserts the spool root mode is `≤ 0750` and the drop-in
-   itself is `0644 root:root` (spec §11).
-5. Runs `systemctl daemon-reload` so the next gatewayd-internal
-   restart picks up the new `LoadCredential=`.
+3. Removes the legacy gatewayd-internal archive drop-in. The
+   gatewayd-internal base unit owns the optional `LoadCredential=`
+   declaration, so the feature is safe before the envelope exists.
+4. Asserts the spool root mode is `≤ 0750` (spec §11).
+5. Runs `systemctl daemon-reload` after removing the legacy drop-in.
 
 ## What this role does NOT do
 
@@ -52,14 +50,13 @@ have, and where the local spool root sits.
   CLI ships in PR-A and the operator runs it once during
   `bootstrap.sh` step 11d (RETIRED 2026-08-15 by issue #911 / PR-1;
   v2 path is PR-X `gregalectl secrets init`) — mirrors the `unseal-rclone`
-  flow at `deploy/ansible/roles/postgres/files/postgresql.service.d/
-  99-faas-storage-box.conf`. This role assumes the envelope
+  flow at `deploy/ansible/roles/postgres/files/postgresql@.service.d/
+  99-faas-off-host-backup.conf`. This role assumes the envelope
   is already on disk; the assert catches any future perms
   drift.
-- **No daemon restart.** `daemon-reload` is fired so the new
-  drop-in is picked up on the *next* `systemctl restart
-  faas-gatewayd-internal` (an operator action). The role
-  never silently bounces the edge on a deployed box.
+- **No daemon restart.** The role only removes the legacy drop-in
+  and reloads systemd; operators choose when to restart a deployed
+  daemon so the role never silently bounces the edge.
 - **No S3 lifecycle policy attachment.** That's an operator
   action on the bucket itself; see `docs/runbooks/
   FaasLogArchiveShipperDegraded.md` "Bucket lifecycle
@@ -67,9 +64,9 @@ have, and where the local spool root sits.
 
 ## Idempotency
 
-`copy` overwrites cleanly; `file` for the spool root is a
-no-op on a converged box; the asserts are read-only. Re-running
-on a converged host produces zero `changed`.
+`file` for the spool root and legacy drop-in removal are no-ops on a
+converged box; the asserts are read-only. Re-running on a converged
+host produces zero `changed`.
 
 ## Refs
 

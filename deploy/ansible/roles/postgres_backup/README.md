@@ -2,13 +2,13 @@
 
 Drops and enables the `faas-pg-basebackup.{service,timer}` pair (local
 basebackup) + the `faas-pg-basebackup-push.{service,timer}` pair
-(off-host push to Hetzner Storage Box, issue #250). Both timers run
+(off-host push through a provider-neutral rclone remote, issue #250). Both timers run
 on the 03:00 / 03:30 UTC cadence.
 
 ## What this role does
 
-1. Fails-closed if `HETZNER_STORAGE_BOX_USER` / `HETZNER_STORAGE_BOX_HOST`
-   are unset (issue #250 acceptance #3).
+1. Validates the stable remote alias and logical backup paths. Provider
+   credentials and endpoints stay inside the rclone configuration.
 2. Installs `rclone` via apt (matches the distro PostgreSQL install pattern;
    no vendored binaries).
 3. Creates `/var/lib/pgsql/basebackup` (postgres-owned, postgres group,
@@ -26,11 +26,11 @@ on the 03:00 / 03:30 UTC cadence.
 ## Why no PG config changes
 
 The `postgres` role already configures `wal_level = replica`,
-`archive_mode = on`, `archive_command` (issue #250 rewrites the
-local-only `cp` baseline to compound local `cp` + rclone push),
+`archive_mode = on` (both restart-required settings), `archive_command` (issue #250 rewrites the
+local-only `cp` baseline to local-first + best-effort rclone push),
 and `max_wal_senders = 3` (`roles/postgres/tasks/main.yml:118-156`).
 The basebackup + push services only need those + the running
-cluster — no new GUCs, no restart.
+cluster — no new GUCs in this role.
 
 ## Idempotency
 

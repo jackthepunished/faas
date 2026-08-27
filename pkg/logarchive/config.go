@@ -100,6 +100,15 @@ const EnvLocalBytesMax = "FAAS_LOG_ARCHIVE_LOCAL_BYTES_MAX"
 // already grants /var/log/faas).
 const EnvSpoolRoot = "FAAS_LOG_ARCHIVE_SPOOL_ROOT"
 
+// EnvCredentialsPath is the systemd-staged archive credential path. It is
+// separate from the S3 value env vars because the file is loaded by PID 1
+// and exposed to each daemon as a credential-directory path.
+const EnvCredentialsPath = "FAAS_LOG_ARCHIVE_CREDS_PATH"
+
+// DefaultCredentialsPath is used outside systemd (for example by a manual
+// binary invocation) and is also the source path used by LoadCredential=.
+const DefaultCredentialsPath = "/etc/faas/secrets/storage-box/archive-creds.json"
+
 // DefaultSpoolRoot is the local spool directory the shipper
 // owns. Matches the apid systemd unit's ReadWritePaths entry
 // (/var/log/faas). Tests override via Params.SpoolRoot.
@@ -142,6 +151,11 @@ type Config struct {
 	// SpoolRoot is the directory the spool writes into. Empty =
 	// DefaultSpoolRoot.
 	SpoolRoot string
+
+	// regionExplicit distinguishes an explicit FAAS_LOG_ARCHIVE_REGION from
+	// ConfigFromEnv's us-east-1 default. It lets an archive envelope provide
+	// its region without overriding an operator-provided environment value.
+	regionExplicit bool
 }
 
 // Enabled reports whether the config has the minimum required
@@ -167,16 +181,17 @@ func ConfigFromEnv(getenv func(string) string, log *slog.Logger) (Config, error)
 		log = slog.Default()
 	}
 	cfg := Config{
-		Endpoint:      getenv(EnvEndpoint),
-		Region:        defaultRegion(getenv(EnvRegion)),
-		Bucket:        getenv(EnvBucket),
-		KeyID:         getenv(EnvKeyID),
-		Secret:        getenv(EnvSecret),
-		FlushInterval: parseDurationEnv(getenv(EnvInterval), DefaultFlushInterval, EnvInterval, log),
-		PurgeInterval: DefaultPurgeInterval,
-		RetentionDays: parseIntEnv(getenv(EnvRetentionDays), DefaultRetentionDays, EnvRetentionDays, log),
-		LocalBytesMax: parseInt64Env(getenv(EnvLocalBytesMax), DefaultLocalBytesMax, EnvLocalBytesMax, log),
-		SpoolRoot:     defaultSpoolRoot(getenv(EnvSpoolRoot)),
+		Endpoint:       getenv(EnvEndpoint),
+		Region:         defaultRegion(getenv(EnvRegion)),
+		Bucket:         getenv(EnvBucket),
+		KeyID:          getenv(EnvKeyID),
+		Secret:         getenv(EnvSecret),
+		FlushInterval:  parseDurationEnv(getenv(EnvInterval), DefaultFlushInterval, EnvInterval, log),
+		PurgeInterval:  DefaultPurgeInterval,
+		RetentionDays:  parseIntEnv(getenv(EnvRetentionDays), DefaultRetentionDays, EnvRetentionDays, log),
+		LocalBytesMax:  parseInt64Env(getenv(EnvLocalBytesMax), DefaultLocalBytesMax, EnvLocalBytesMax, log),
+		SpoolRoot:      defaultSpoolRoot(getenv(EnvSpoolRoot)),
+		regionExplicit: getenv(EnvRegion) != "",
 	}
 	if cfg.KeyID != "" && cfg.Secret == "" {
 		return cfg, fmt.Errorf("logarchive: %s set but %s empty (refusing to boot)", EnvKeyID, EnvSecret)
