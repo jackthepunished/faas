@@ -2141,7 +2141,7 @@ type InsertRequestTelemetryParams struct {
 // pkg/gateway/request_telemetry_publisher.go coalesces requests with
 // the same (app, deployment, route, method, status, minute_bucket) into
 // one row with `count` = the number of originals. count is INT NOT NULL
-// DEFAULT 1 (00437) so pre-PR-B clients keep working — the DEFAULT
+// DEFAULT 1 (00440) so pre-PR-B clients keep working — the DEFAULT
 // fires for any INSERT that omits the column. PR-B's publisher always
 // passes it explicitly.
 func (q *Queries) InsertRequestTelemetry(ctx context.Context, db DBTX, arg InsertRequestTelemetryParams) error {
