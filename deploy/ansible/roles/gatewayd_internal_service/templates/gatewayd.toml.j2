@@ -43,3 +43,12 @@ egress_tls_cert_path = "{{ gatewayd_egress_tls_cert_path }}"
 egress_tls_key_path = "{{ gatewayd_egress_tls_key_path }}"
 egress_tls_ca_path = "{{ gatewayd_egress_tls_ca_path }}"
 {% endif %}
+
+{% if gatewayd_app_errors_target | default('') | length > 0 %}
+# Split-box AppErrors recorder target. The client leaf is issued in the
+# gatewayd directory and is bound to this compute node's registered CN.
+app_errors_target = "{{ gatewayd_app_errors_target }}"
+app_errors_tls_cert_path = "{{ gatewayd_app_errors_tls_cert_path }}"
+app_errors_tls_key_path = "{{ gatewayd_app_errors_tls_key_path }}"
+app_errors_tls_ca_path = "{{ gatewayd_app_errors_tls_ca_path }}"
+{% endif %}

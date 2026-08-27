@@ -47,6 +47,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/sched/flowcount"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/snapshothipd"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -1082,7 +1083,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
 	)...)
-	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(mgr, ops, fcVersion, log, cpuCache, netCache, activityTracker)
+	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(mgr, ops, fcVersion, log, cpuCache, netCache, activityTracker).
+		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{}))
 	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
 	// on the gRPC server. vmmd is the corroborating-observation
 	// source for wake.boot_started (mirror at the gRPC server

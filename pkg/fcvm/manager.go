@@ -3113,6 +3113,22 @@ func (m *Manager) SnapshotLive() map[string]string {
 	return out
 }
 
+// SnapshotLiveHostIPs returns a copy of the instance-to-host-IP map used by
+// compute-side conntrack attribution. The map is intentionally separate from
+// SnapshotLive, whose values are veth names for byte telemetry.
+func (m *Manager) SnapshotLiveHostIPs() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(m.live))
+	for id, inst := range m.live {
+		if inst == nil || !inst.Lease.HostIP.IsValid() {
+			continue
+		}
+		out[id] = inst.Lease.HostIP.String()
+	}
+	return out
+}
+
 // LeasedCount reports how many allocator slots are held. After a clean teardown
 // of everything, LiveCount and LeasedCount must both be zero — the leak check.
 func (m *Manager) LeasedCount() int { return m.alloc.InUse() }

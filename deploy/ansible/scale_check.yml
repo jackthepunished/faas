@@ -48,9 +48,10 @@
         that:
           - hostvars[item].faas_box_role == 'control-plane'
           - hostvars[item].faas_compute_gateway_discovery == 'database'
+          - hostvars[item].faas_apid_app_errors_listen is match('^tcp://0\\.0\\.0\\.0:9093$')
         fail_msg: >-
           {{ item }} is in control_plane but its generated role or discovery
-          mode is not production split-box compatible.
+          mode or AppErrors listener is not production split-box compatible.
       loop: "{{ control_plane_hosts }}"
 
     - name: Require compute host_vars to be node-specific
@@ -60,7 +61,8 @@
           - hostvars[item].faas_vmmd_target_url is match('^tcp://[^:]+:[0-9]+$')
           - hostvars[item].faas_gateway_target_url is match('^tcp://[^:]+:8080$')
           - hostvars[item].faas_vmmd_schedd_target is match('^tcp://[^:]+:[0-9]+$')
+          - hostvars[item].faas_gatewayd_app_errors_target is match('^tcp://apid\\.faas:9093$')
         fail_msg: >-
-          {{ item }} is in compute_nodes but its generated routing targets are
-          missing or not node-specific transport URLs.
+          {{ item }} is in compute_nodes but its generated routing or
+          AppErrors targets are missing or not production transport URLs.
       loop: "{{ compute_hosts }}"

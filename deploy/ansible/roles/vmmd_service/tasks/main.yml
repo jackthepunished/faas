@@ -151,6 +151,15 @@
     create_home: false
     password: "*"
 
+# G7 idle-reaper telemetry: vmmd is the privileged compute-side reader of
+# conntrack. Install the distro package through Ansible's provider-neutral
+# package abstraction so the same bare-metal play works on GCP, Hetzner, and
+# OVH Ubuntu images without a provider-specific bootstrap step.
+- name: vmmd_service — install conntrack userspace reader
+  ansible.builtin.package:
+    name: conntrack
+    state: present
+
 # ADR-053: parent-base loopback mount scratch dir. vmmd owns the
 # loopback mounts (cmd/vmmd/main.go wires pkg/vmmdmount.Registry)
 # and imaged reads through them, so the directory must be writable

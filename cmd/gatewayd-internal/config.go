@@ -98,6 +98,14 @@ type Config struct {
 	EgressTLSKeyPath  string `toml:"egress_tls_key_path"`
 	EgressTLSCAPath   string `toml:"egress_tls_ca_path"`
 
+	// AppErrorsTarget is the apid AppErrors gRPC endpoint. Empty TLS paths
+	// preserve the local Unix-socket path; split-box manifests set a
+	// tcp:// target plus the gatewayd client leaf below.
+	AppErrorsTarget      string `toml:"app_errors_target"`
+	AppErrorsTLSCertPath string `toml:"app_errors_tls_cert_path"`
+	AppErrorsTLSKeyPath  string `toml:"app_errors_tls_key_path"`
+	AppErrorsTLSCAPath   string `toml:"app_errors_tls_ca_path"`
+
 	// StreamingEnabled (issue #471 / ADR-047) gates the per-app
 	// streaming response path. When false (the default), gatewayd
 	// buffers responses per the legacy v1 contract even when the
@@ -323,4 +331,28 @@ func (c *Config) LoadScheddTLS() (*tls.Config, error) {
 // the error straight to a TOML key.
 func (c *Config) LoadEgressTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfigWithPrefix("egress_", c.EgressTLSCertPath, c.EgressTLSKeyPath, c.EgressTLSCAPath)
+}
+
+// GetAppErrorsTarget resolves the remote AppErrors target. The environment
+// aliases retain compatibility with the pre-split Unix socket deployment.
+func (c *Config) GetAppErrorsTarget(env func(string) string) string {
+	if v := env("FAAS_APID_APP_ERRORS_TARGET"); v != "" {
+		return v
+	}
+	if v := env("FAAS_APID_APP_ERRORS_SOCKET"); v != "" {
+		return v
+	}
+	if c != nil && c.AppErrorsTarget != "" {
+		return c.AppErrorsTarget
+	}
+	return "/run/faas/app_errors.sock"
+}
+
+// LoadAppErrorsTLS returns the client mTLS config gatewayd uses to report
+// errors to apid. Empty paths preserve the Unix-socket/single-box path.
+func (c *Config) LoadAppErrorsTLS() (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadClientTLSConfigWithPrefix("app_errors_", c.AppErrorsTLSCertPath, c.AppErrorsTLSKeyPath, c.AppErrorsTLSCAPath)
 }

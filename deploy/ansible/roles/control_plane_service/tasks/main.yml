@@ -125,6 +125,8 @@
     daemon_reload: true
   when: >-
     cp_units.changed
+    or (faas_app_errors_dropin.changed | default(false))
+    or (faas_app_errors_dropin_removed.changed | default(false))
     or (faas_log_archive_dropin.changed | default(false))
     or (faas_log_archive_dropin_removed.changed | default(false))
 
@@ -167,6 +169,27 @@
     owner: root
     group: root
     mode: "0644"
+
+# Split-box AppErrors is a private compute→control-plane mTLS listener. The
+# generated target is absent on single-box inventories, where apid keeps its
+# legacy Unix socket. Remove the drop-in on a role transition so a host does
+# not retain a stale TCP endpoint after returning to single-box mode.
+- name: control_plane_service — install apid AppErrors target drop-in
+  ansible.builtin.template:
+    src: 99-faas-app-errors.conf.j2
+    dest: /etc/systemd/system/faas-apid.service.d/99-faas-app-errors.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: faas_app_errors_dropin
+  when: faas_apid_app_errors_listen | default('') | length > 0
+
+- name: control_plane_service — remove apid AppErrors target drop-in
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-apid.service.d/99-faas-app-errors.conf
+    state: absent
+  register: faas_app_errors_dropin_removed
+  when: faas_apid_app_errors_listen | default('') | length == 0
 
 - name: control_plane_service — install split-box schedd routing drop-in
   ansible.builtin.template:

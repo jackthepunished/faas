@@ -1172,6 +1172,7 @@ func nodeTelemetryFromProto(in []*scheddpb.InstanceTelemetry) []sched.NodeTeleme
 		item := sched.NodeTelemetry{
 			InstanceID:       row.GetInstanceId(),
 			InflightRequests: row.GetInflightRequests(),
+			OpenConns:        row.GetOpenConns(),
 		}
 		if value := row.GetResidentBytes(); value != nil {
 			v := value.GetValue()

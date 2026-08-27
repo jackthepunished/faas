@@ -139,7 +139,8 @@ func assertScaleInventory(t *testing.T, inventory string, hostVars map[string]st
 
 	controlVars := hostVars["control-plane"]
 	if !strings.Contains(controlVars, "faas_box_role: control-plane") ||
-		!strings.Contains(controlVars, "faas_compute_gateway_discovery: database") {
+		!strings.Contains(controlVars, "faas_compute_gateway_discovery: database") ||
+		!strings.Contains(controlVars, `faas_apid_app_errors_listen: "tcp://0.0.0.0:9093"`) {
 		t.Fatalf("control-plane host_vars do not describe the production control role")
 	}
 	if !strings.Contains(controlVars, `faas_postgres_listen_addresses: "control-plane.gregale.dev"`) {
@@ -156,6 +157,7 @@ func assertScaleInventory(t *testing.T, inventory string, hostVars map[string]st
 			!strings.Contains(body, `ansible_host: "`+address+`"`) ||
 			!strings.Contains(body, target) ||
 			!strings.Contains(body, gatewayTarget) ||
+			!strings.Contains(body, `faas_gatewayd_app_errors_target: "tcp://apid.faas:9093"`) ||
 			!strings.Contains(body, `faas_vmmd_schedd_target: "tcp://schedd.faas:7100"`) {
 			t.Fatalf("%s host_vars are missing stable node-specific routing", hostName)
 		}

@@ -67,6 +67,17 @@ type Config struct {
 	// AdvisorySock (CI users `faas-githubd` doesn't exist either).
 	GithubdBridgeSock string `toml:"githubd_bridge_sock"`
 
+	// AppErrorsTarget is the gatewayd-internal → apid AppErrors gRPC
+	// endpoint. The default is the legacy local Unix socket; split-box
+	// manifests set a tcp:// target and the TLS paths below.
+	AppErrorsTarget string `toml:"app_errors_target"`
+
+	// AppErrorsTLS is the server mTLS material for the AppErrors listener.
+	// Empty paths preserve the single-box Unix-socket path.
+	AppErrorsTLSCertPath string `toml:"app_errors_tls_cert_path"`
+	AppErrorsTLSKeyPath  string `toml:"app_errors_tls_key_path"`
+	AppErrorsTLSCAPath   string `toml:"app_errors_tls_ca_path"`
+
 	// GithubdSocket is the unix-domain socket apid dials to call
 	// githubd's EnqueueBuild RPC (issue #98 / ADR-028 phase). Empty
 	// uses the newGithubdClient stub-client path (every method
@@ -184,6 +195,7 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			overlayAppErrorsTLSFromEnv(c)
 			// Gate-B: even on the missing-file path, resolve Role
 			// against FAAS_APID_ROLE so env wins over the empty
 			// TOML default. role.FromConfig falls back to
@@ -196,6 +208,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("apid: parse %q: %w", path, err)
 	}
+	overlayAppErrorsTLSFromEnv(c)
 	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
 	// c.Role is consulted against FAAS_APID_ROLE. Setting Role in
 	// the defaults-struct literal lets toml.Unmarshal overwrite it,
@@ -212,6 +225,24 @@ func LoadConfig(path string) (*Config, error) {
 		c.NodeName = v
 	}
 	return c, nil
+}
+
+// overlayAppErrorsTLSFromEnv keeps the generated split-box systemd drop-in
+// independent from hand-maintained apid.toml files. Empty values do not
+// override TOML, preserving the single-box defaults and test fixtures.
+func overlayAppErrorsTLSFromEnv(c *Config) {
+	if c == nil {
+		return
+	}
+	if v := os.Getenv("FAAS_APID_APP_ERRORS_TLS_CERT_PATH"); v != "" {
+		c.AppErrorsTLSCertPath = v
+	}
+	if v := os.Getenv("FAAS_APID_APP_ERRORS_TLS_KEY_PATH"); v != "" {
+		c.AppErrorsTLSKeyPath = v
+	}
+	if v := os.Getenv("FAAS_APID_APP_ERRORS_TLS_CA_PATH"); v != "" {
+		c.AppErrorsTLSCAPath = v
+	}
 }
 
 // GetListenAddr returns the listen address with env-var overlay
@@ -254,6 +285,22 @@ func (c *Config) GetGithubdBridgeSock(env func(string) string) string {
 		return v
 	}
 	return c.GithubdBridgeSock
+}
+
+// GetAppErrorsTarget resolves the AppErrors listener target. The new target
+// variable wins, while the historical socket variable remains an alias so
+// existing single-box units do not need a coordinated config edit.
+func (c *Config) GetAppErrorsTarget(env func(string) string) string {
+	if v := env("FAAS_APID_APP_ERRORS_TARGET"); v != "" {
+		return v
+	}
+	if v := env("FAAS_APID_APP_ERRORS_SOCKET"); v != "" {
+		return v
+	}
+	if c != nil && c.AppErrorsTarget != "" {
+		return c.AppErrorsTarget
+	}
+	return "/run/faas/app_errors.sock"
 }
 
 // GetGithubdSocket returns the githubd dial target with env-var
@@ -396,6 +443,16 @@ func (c *Config) LoadGithubdBridgeTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfigWithPrefix("githubd_bridge_", c.GithubdBridgeTLSCertPath, c.GithubdBridgeTLSKeyPath, c.GithubdBridgeTLSCAPath)
 }
 
+// LoadAppErrorsTLS returns the server mTLS config for the AppErrors listener.
+// It intentionally follows the same empty-versus-partial path contract as
+// the advisory and githubd bridge listeners.
+func (c *Config) LoadAppErrorsTLS() (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefix("app_errors_", c.AppErrorsTLSCertPath, c.AppErrorsTLSKeyPath, c.AppErrorsTLSCAPath)
+}
+
 // LoadGithubdTLS returns the client mTLS config apid uses to dial
 // githubd's EnqueueBuild gRPC server (ADR-052). Empty cluster returns
 // (nil, nil); partial cluster is rejected with the githubd_tls_*
@@ -457,6 +514,16 @@ func (c *Config) LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(v wire.NodeV
 		return nil, nil
 	}
 	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("githubd_bridge_", c.GithubdBridgeTLSCertPath, c.GithubdBridgeTLSKeyPath, c.GithubdBridgeTLSCAPath, v, reload)
+}
+
+// LoadAppErrorsTLSWithPrefixAndVerifierAndReload combines mTLS, the
+// compute-node CN binding, and SIGHUP-driven leaf rotation for the remote
+// AppErrors listener. Unix-socket callers keep the nil-TLS path.
+func (c *Config) LoadAppErrorsTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("app_errors_", c.AppErrorsTLSCertPath, c.AppErrorsTLSKeyPath, c.AppErrorsTLSCAPath, v, reload)
 }
 
 // LoadGithubdTLSWithVerifier is the PR-B (issue #678 / ADR-056)

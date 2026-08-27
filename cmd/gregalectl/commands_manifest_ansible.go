@@ -29,6 +29,7 @@ type manifestInternalHost struct {
 }
 
 const manifestGatewayEgressPort = 9092
+const manifestAppErrorsPort = 9093
 
 // manifestPrivateHostsGroupVarsThreshold keeps the generated inventory
 // compact as fleets grow. Below this point retaining the resolver map in each
@@ -283,6 +284,12 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 				entry.Names = filterInternalHostNames(entry.Names, "vmmd.faas")
 			}
 		}
+		if host.Role == roleControlPlane {
+			// apid.faas is a stable private service identity. It resolves to
+			// the control-plane address from this manifest's resolver map and
+			// is independent of the provider or the host's public IP.
+			entry.Names = append(entry.Names, "apid.faas")
+		}
 		internalHosts = append(internalHosts, entry)
 	}
 	return internalHosts, nil
@@ -366,6 +373,7 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayS
 		fmt.Fprintf(&b, "faas_gatewayd_schedd_target: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_gatewayd_apid_loopback: %q\n", controlPlaneAPIDLoopback)
 		fmt.Fprintf(&b, "faas_gatewayd_egress_listen: %q\n", fmt.Sprintf("tcp://0.0.0.0:%d", manifestGatewayEgressPort))
+		fmt.Fprintf(&b, "faas_gatewayd_app_errors_target: %q\n", fmt.Sprintf("tcp://apid.faas:%d", manifestAppErrorsPort))
 		b.WriteString("faas_gateway_listen: \"0.0.0.0:8080\"\n")
 		// Multi-host safety cluster PR-9 (audit F8-B): emit
 		// faas_public_listen_addr so the ansible role passes
@@ -383,6 +391,7 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayS
 		// This keeps the control-plane API healthy while every compute node is
 		// drained and makes node add/drain a data change, not a systemd rewrite.
 		b.WriteString("faas_compute_gateway_discovery: database\n")
+		fmt.Fprintf(&b, "faas_apid_app_errors_listen: %q\n", fmt.Sprintf("tcp://0.0.0.0:%d", manifestAppErrorsPort))
 	}
 	if host.Role == roleControlPlane && gatewaySynthTarget != "" {
 		b.WriteString("faas_meterd_config_managed: true\n")

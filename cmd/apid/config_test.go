@@ -71,6 +71,10 @@ githubd_bridge_tls_ca_path = "/etc/faas/tls/ca.pem"
 githubd_tls_cert_path = "/etc/faas/tls/apid/githubd-client.crt"
 githubd_tls_key_path = "/etc/faas/tls/apid/githubd-client.key"
 githubd_tls_ca_path = "/etc/faas/tls/ca.pem"
+app_errors_target = "tcp://apid.faas:9093"
+app_errors_tls_cert_path = "/etc/faas/tls/apid/advisory.crt"
+app_errors_tls_key_path = "/etc/faas/tls/apid/advisory.key"
+app_errors_tls_ca_path = "/etc/faas/tls/ca.pem"
 node_name = "fsn-1-apid"
 role = "control-plane"
 `
@@ -110,6 +114,12 @@ role = "control-plane"
 	}
 	if cfg.GithubdClientTLSCertPath == "" || cfg.GithubdClientTLSKeyPath == "" || cfg.GithubdClientTLSCAPath == "" {
 		t.Errorf("githubd client TLS path overrides not all set: %+v", cfg)
+	}
+	if cfg.AppErrorsTarget != "tcp://apid.faas:9093" {
+		t.Errorf("AppErrorsTarget = %q", cfg.AppErrorsTarget)
+	}
+	if cfg.AppErrorsTLSCertPath == "" || cfg.AppErrorsTLSKeyPath == "" || cfg.AppErrorsTLSCAPath == "" {
+		t.Errorf("app errors TLS path overrides not all set: %+v", cfg)
 	}
 	if cfg.NodeName != "fsn-1-apid" {
 		t.Errorf("NodeName = %q, want %q", cfg.NodeName, "fsn-1-apid")
@@ -212,6 +222,21 @@ func TestConfig_LoadGithubdTLS(t *testing.T) {
 	}
 }
 
+func TestConfig_LoadAppErrorsTLS(t *testing.T) {
+	c := &Config{}
+	tls, err := c.LoadAppErrorsTLS()
+	if err != nil || tls != nil {
+		t.Errorf("all-empty: tls=%v err=%v, want nil", tls, err)
+	}
+
+	c.AppErrorsTLSCertPath = "/some/cert"
+	if _, err := c.LoadAppErrorsTLS(); err == nil {
+		t.Errorf("partial (cert only): expected error naming missing fields")
+	} else if !strings.Contains(err.Error(), "app_errors_tls_key_path") || !strings.Contains(err.Error(), "app_errors_tls_ca_path") {
+		t.Errorf("err = %q, want both app_errors_tls_key_path and app_errors_tls_ca_path named", err.Error())
+	}
+}
+
 func TestConfig_GetHelpersEnvOverlay(t *testing.T) {
 	// Env wins over TOML for every field that has a legacy FAAS_*
 	// env var. The containerised-deploys path uses env-only config
@@ -239,6 +264,8 @@ func TestConfig_GetHelpersEnvOverlay(t *testing.T) {
 			return "/run/faas/gh-other.sock"
 		case "FAAS_APPS_DOMAIN":
 			return "apps.env.com"
+		case "FAAS_APID_APP_ERRORS_TARGET":
+			return "tcp://apid.env:9093"
 		}
 		return ""
 	}
@@ -260,6 +287,10 @@ func TestConfig_GetHelpersEnvOverlay(t *testing.T) {
 	if got := c.GetAppsDomain(env); got != "apps.env.com" {
 		t.Errorf("GetAppsDomain (env) = %q, want env value", got)
 	}
+	c.AppErrorsTarget = "tcp://apid.toml:9093"
+	if got := c.GetAppErrorsTarget(env); got != "tcp://apid.env:9093" {
+		t.Errorf("GetAppErrorsTarget (env) = %q, want env value", got)
+	}
 
 	// Empty env → TOML value falls through.
 	empty := func(string) string { return "" }
@@ -268,6 +299,12 @@ func TestConfig_GetHelpersEnvOverlay(t *testing.T) {
 	}
 	if got := c.GetMetricsAddr(empty); got != "127.0.0.1:9101" {
 		t.Errorf("GetMetricsAddr (empty env) = %q, want TOML value", got)
+	}
+	if got := c.GetAppErrorsTarget(empty); got != "tcp://apid.toml:9093" {
+		t.Errorf("GetAppErrorsTarget (empty env) = %q, want TOML value", got)
+	}
+	if got := (&Config{}).GetAppErrorsTarget(empty); got != "/run/faas/app_errors.sock" {
+		t.Errorf("GetAppErrorsTarget (empty config) = %q, want legacy socket", got)
 	}
 }
 

@@ -220,7 +220,8 @@ func Roles() []Role {
 
 	// Per-daemon outbound client leaves. vmmd dials schedd + apid;
 	// meterd dials schedd + gatewayd-internal; gatewayd-internal dials schedd + vmmd;
-	// apid dials githubd. Builderd and schedd dials only vmmd (covered
+	// gatewayd-internal also reports AppErrors to apid; apid dials githubd.
+	// Builderd and schedd dials only vmmd (covered
 	// by the per-daemon TOML that points at vmmd's "server" leaf as
 	// the CA-trustable remote).
 	//
@@ -244,6 +245,7 @@ func Roles() []Role {
 		{CommonName: "meterd.faas", Kind: KindClient, Directory: "meterd", Filename: "egress-client", AltNames: ProductionSANs("meterd.faas")},
 		{CommonName: "gatewayd.faas", Kind: KindClient, Directory: "gatewayd", Filename: "schedd-client", AltNames: ProductionSANs("gatewayd.faas")},
 		{CommonName: "gatewayd.faas", Kind: KindClient, Directory: "gatewayd", Filename: "vmmd-client", AltNames: ProductionSANs("gatewayd.faas")},
+		{CommonName: "gatewayd.faas", Kind: KindClient, Directory: "gatewayd", Filename: "apid-client", AltNames: ProductionSANs("gatewayd.faas")},
 		{CommonName: "apid.faas", Kind: KindClient, Directory: "apid", Filename: "githubd-client", AltNames: ProductionSANs("apid.faas")},
 		{CommonName: "builderd.faas", Kind: KindClient, Directory: "builderd", Filename: "vmmd-client", AltNames: ProductionSANs("builderd.faas")},
 		{CommonName: "schedd.faas", Kind: KindClient, Directory: "schedd", Filename: "vmmd-client", AltNames: ProductionSANs("schedd.faas")},

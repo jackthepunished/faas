@@ -920,6 +920,10 @@ message InstanceTelemetry {
   int64 inflight_requests = 6;
   google.protobuf.Timestamp last_request_at = 7;
   google.protobuf.Int64Value net_tx_bytes = 8;
+  // Open TCP connection count observed by vmmd on the compute host. The
+  // value is transported with the existing persistent capacity stream so
+  // schedd does not need a per-node conntrack query.
+  int64 open_conns = 9;
 }
 
 // ReportCapacityAck is the typed "I consumed all your messages"
