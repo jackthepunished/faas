@@ -5211,13 +5211,14 @@ func (s *PgStore) ListDeploymentsForAccount(ctx context.Context, accountID strin
 		rows, err = s.pool.Query(ctx,
 			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
-			 where a.account_id = $1 order by d.created_at desc limit $2`,
+			 where a.account_id = $1 and a.status <> 'deleted'
+			 order by d.created_at desc limit $2`,
 			accountID, limit)
 	} else {
 		rows, err = s.pool.Query(ctx,
 			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
-			 where a.account_id = $1 and d.created_at < $2
+			 where a.account_id = $1 and a.status <> 'deleted' and d.created_at < $2
 			 order by d.created_at desc limit $3`,
 			accountID, before, limit)
 	}
