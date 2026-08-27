@@ -1,4 +1,4 @@
--- filename: 00484_deployments_canary_state.sql
+-- filename: 00485_deployments_canary_state.sql
 -- +goose Up
 -- +goose StatementBegin
 
