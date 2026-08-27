@@ -355,13 +355,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [version, reason]
-              properties:
-                version: { type: integer, format: int64, minimum: 1 }
-                reason: { type: string, minLength: 3, maxLength: 500 }
-                expected_version: { type: integer, format: int64, minimum: 0 }
+            schema: { $ref: '#/components/schemas/RollbackOperatorRuntimeConfigRequest' }
       responses:
         '200':
           description: Rolled-back and applied configuration entry
@@ -9387,6 +9381,15 @@ components:
         actor_id: { type: string }
         reason: { type: string }
         created_at: { type: string, format: date-time }
+
+    RollbackOperatorRuntimeConfigRequest:
+      description: "Request to apply a historical runtime configuration revision."
+      type: object
+      required: [version, reason]
+      properties:
+        version: { type: integer, format: int64, minimum: 1 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        expected_version: { type: integer, format: int64, minimum: 0 }
 
     # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────
 
