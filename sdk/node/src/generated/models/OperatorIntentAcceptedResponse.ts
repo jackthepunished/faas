@@ -46,5 +46,16 @@ export type OperatorIntentAcceptedResponse = {
    */
   deployment_id?: string;
   reason: string;
+  /**
+   * Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
+   * hex identifier shared with the inbound HTTP request
+   * and the schedd dispatch context. Always populated for
+   * the inbound force-action route (the middleware
+   * generates one when absent); surfaced here so the
+   * caller can correlate the 202 response with the
+   * terminal outcome row.
+   *
+   */
+  trace_id?: string | null;
 };
 

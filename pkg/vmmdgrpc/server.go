@@ -33,6 +33,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -132,6 +133,14 @@ type VmmdAPI interface {
 	WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error)
 }
 
+// flowCounter is the compute-side conntrack seam. Keeping it local to the
+// gRPC package avoids widening VmmdAPI (and every test fake) while allowing
+// production to inject flowcount.Reader and tests to inject a tiny fake.
+type flowCounter interface {
+	Warm(context.Context, []state.Instance) error
+	Open(context.Context, string) (int64, error)
+}
+
 // Server implements vmmdpb.VmmdServer.
 type Server struct {
 	vmmdpb.UnimplementedVmmdServer
@@ -170,6 +179,10 @@ type Server struct {
 	// constructors; production cmd/vmmd uses
 	// NewWithCPUAndNetAndActivity.
 	activity *activity.ActivityTracker
+	// flowCounter samples conntrack on the compute host. Stats includes the
+	// resulting count in the existing persistent capacity telemetry stream so
+	// schedd's reaper does not query a remote node or misclassify a live flow.
+	flowCounter flowCounter
 	// migrations (Tier A5 / ADR-066) tracks in-flight
 	// Phase 1 → Phase 5 leases. The dying vmmd mints a
 	// lease at PrepareLiveMigration; the new owner vmmd
@@ -238,6 +251,15 @@ func NewWithCPUAndNetAndActivity(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string
 // fixtures).
 func (s *Server) WithEvents(p *events.Platform) *Server {
 	s.events = p
+	return s
+}
+
+// WithFlowCounter wires the compute-side conntrack reader used by Stats.
+// Keeping this fluent and optional preserves non-Linux/unit-test behavior.
+func (s *Server) WithFlowCounter(counter flowCounter) *Server {
+	if s != nil {
+		s.flowCounter = counter
+	}
 	return s
 }
 
@@ -683,14 +705,55 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 	}
 
 	var total int64
+	openConns := s.openConns(ctx)
 	resp.Instances = make([]*vmmdpb.InstanceStats, 0, len(resident))
 	for inst, b := range resident {
 		total += b
 		row := buildInstanceStatsRow(inst, b, s.cpuCache, s.netCache, s.activity, s.ops)
+		row.OpenConns = openConns[inst]
 		resp.Instances = append(resp.Instances, row)
 	}
 	resp.TotalResidentBytes = wrapperspb.Int64(total)
 	return resp, nil
+}
+
+// openConns performs one bulk conntrack walk for the current live set and
+// attributes the result to instance IDs. Errors are fail-open: a missing
+// conntrack binary or transient kernel read must not make Stats unavailable.
+func (s *Server) openConns(ctx context.Context) map[string]int64 {
+	if s == nil || s.flowCounter == nil {
+		return nil
+	}
+	provider, ok := s.vmm.(interface{ SnapshotLiveHostIPs() map[string]string })
+	if !ok {
+		return nil
+	}
+	hosts := provider.SnapshotLiveHostIPs()
+	if len(hosts) == 0 {
+		return map[string]int64{}
+	}
+	instances := make([]state.Instance, 0, len(hosts))
+	for id, hostIP := range hosts {
+		instances = append(instances, state.Instance{ID: id, HostIP: hostIP})
+	}
+	if err := s.flowCounter.Warm(ctx, instances); err != nil {
+		if s.log != nil {
+			s.log.Warn("vmmd: conntrack snapshot failed; open connections omitted", "err", err)
+		}
+		return nil
+	}
+	counts := make(map[string]int64, len(hosts))
+	for id := range hosts {
+		value, err := s.flowCounter.Open(ctx, id)
+		if err != nil {
+			if s.log != nil {
+				s.log.Warn("vmmd: conntrack instance lookup failed", "instance", id, "err", err)
+			}
+			continue
+		}
+		counts[id] = value
+	}
+	return counts
 }
 
 // buildInstanceStatsRow assembles one wire row from the per-instance

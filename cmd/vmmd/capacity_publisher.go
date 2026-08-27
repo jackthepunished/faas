@@ -43,6 +43,7 @@ import (
 	"time"
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
+	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -89,6 +90,11 @@ type countReader interface {
 	LeasedCount() int
 }
 
+// telemetryReader reads vmmd's local Stats snapshot. Production passes the
+// already-constructed gRPC server directly, so this is an in-process read;
+// the only network operation remains the persistent capacity stream.
+type telemetryReader func(context.Context) (*vmmdpb.StatsResponse, error)
+
 // runCapacityPublish is the outer reconnect loop. It is
 // invoked as a goroutine from main.go and exits when ctx
 // fires. The loop is intentionally simple: dial → stream
@@ -121,6 +127,7 @@ func runCapacityPublish(
 	nodeKey *ecdsa.PrivateKey,
 	nodeKeyID string,
 	log *slog.Logger,
+	telemetry ...telemetryReader,
 ) {
 	if scheddTarget == "" {
 		// No target → no-op. main.go gates this on the
@@ -140,7 +147,7 @@ func runCapacityPublish(
 		nodeKeyID:       nodeKeyID,
 		log:             log,
 	}
-	runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
+	runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer, tick, resident, log, telemetry...)
 }
 
 // runCapacityPublishWithStreamer is the test-friendly entry
@@ -156,6 +163,7 @@ func runCapacityPublishWithStreamer(
 	tick time.Duration,
 	resident residentBytesFn,
 	log *slog.Logger,
+	telemetry ...telemetryReader,
 ) {
 	if tick <= 0 {
 		tick = CapacityInterval
@@ -165,7 +173,7 @@ func runCapacityPublishWithStreamer(
 		if ctx.Err() != nil {
 			return
 		}
-		err := drainCapacityPublish(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
+		err := drainCapacityPublish(ctx, counts, nodeID, cfg, streamer, tick, resident, log, telemetry...)
 		if ctx.Err() != nil {
 			return
 		}
@@ -200,6 +208,7 @@ func drainCapacityPublish(
 	tick time.Duration,
 	resident residentBytesFn,
 	log *slog.Logger,
+	telemetry ...telemetryReader,
 ) error {
 	cli, cleanup, err := streamer.Open(ctx)
 	if err != nil {
@@ -219,7 +228,7 @@ func drainCapacityPublish(
 			// wait for it here — the ctx is already Done.
 			return nil
 		case <-t.C:
-			report := buildCapacityReport(streamer, counts, nodeID, cfg, resident, log)
+			report := buildCapacityReport(ctx, streamer, counts, nodeID, cfg, resident, log, telemetry...)
 			if err := cli.Send(report); err != nil {
 				return err
 			}
@@ -322,12 +331,14 @@ func (p prodStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityC
 // A persistent signing-key bug must surface in `vmmd` logs,
 // not silently regress to "sends zero signatures".
 func buildCapacityReport(
+	ctx context.Context,
 	streamer capacityStreamer,
 	counts countReader,
 	nodeID string,
 	cfg ComputeNodeConfig,
 	resident residentBytesFn,
 	log *slog.Logger,
+	telemetry ...telemetryReader,
 ) *scheddpb.CapacityReport {
 	// nil counts → live=0, leased=0. Lets the unit tests
 	// run without a real *fcvm.Manager (which requires
@@ -341,7 +352,17 @@ func buildCapacityReport(
 	}
 
 	var usedMB int64
-	if bytes, ok := resident(); ok {
+	var stats *vmmdpb.StatsResponse
+	if len(telemetry) > 0 && telemetry[0] != nil {
+		var err error
+		stats, err = telemetry[0](ctx)
+		if err != nil && log != nil {
+			log.Warn("vmmd: telemetry snapshot failed; sending capacity only", "node_id", nodeID, "err", err)
+		}
+	}
+	if stats != nil && stats.GetTotalResidentBytes() != nil {
+		usedMB = stats.GetTotalResidentBytes().GetValue() >> 20
+	} else if bytes, ok := resident(); ok {
 		var sum int64
 		for _, b := range bytes {
 			sum += b
@@ -367,6 +388,26 @@ func buildCapacityReport(
 		UsedMb:          int32(usedMB),
 		RamHeadroomMb:   int32(headroom),
 		VcpuBusy:        live * 2,
+	}
+	if stats != nil {
+		report.Instances = make([]*scheddpb.InstanceTelemetry, 0, len(stats.GetInstances()))
+		for _, in := range stats.GetInstances() {
+			if in == nil || in.GetInstance() == "" {
+				continue
+			}
+			row := &scheddpb.InstanceTelemetry{
+				InstanceId:          in.GetInstance(),
+				ResidentBytes:       in.GetResidentBytes(),
+				CpuPct:              in.GetCpuPct(),
+				CpuSeconds:          in.GetCpuSeconds(),
+				CpuThrottledSeconds: in.GetCpuThrottledSeconds(),
+				InflightRequests:    in.GetInflightRequests(),
+				LastRequestAt:       in.GetLastRequestAt(),
+				NetTxBytes:          in.GetNetTxBytes(),
+				OpenConns:           in.GetOpenConns(),
+			}
+			report.Instances = append(report.Instances, row)
+		}
 	}
 	// Slice-3: stamp node_signature + node_key_id when the
 	// streamer was wired with a signing key. Pre-slice-3

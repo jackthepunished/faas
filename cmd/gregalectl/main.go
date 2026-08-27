@@ -191,6 +191,17 @@ func run(args []string) int {
 		// add-node coordinator remains available for migration and local
 		// repository workflows.
 		return cmdDeployDispatch(args[1:])
+	case dispatchObs:
+		// Obs-Meta + Trace-IDs Mega-PR / C8 — operator-side
+		// meta-obs health snapshot. `gregalectl obs health` dials
+		// apid's GET /v1/admin/obs/health (admin scope + MFA +
+		// FAAS_ADMIN_EMAILS allowlist), prints the closed-set
+		// snapshot in human-readable form by default, or raw JSON
+		// with --json / $FAAS_JSON=1. Mirrors the existing
+		// `gregalectl admin` subcommand's HTTP-dial pattern.
+		// Future subcommands (events / incidents) reserve the
+		// `obs` dispatcher for follow-on PRs.
+		return cmdObsDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])
 		return 1

@@ -52,6 +52,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // capturingEngine is a SchedAPI whose CapacitySink drives
@@ -135,6 +137,23 @@ func (c *capturingEngine) DestroyForLivenessFailure(_ context.Context, _, _ stri
 // exercise the ReportWorkloadOOM RPC path.
 func (c *capturingEngine) DestroyForWorkloadOOMFailure(_ context.Context, _ string, _, _ int) error {
 	return nil
+}
+
+type telemetryCapturingEngine struct {
+	*capturingEngine
+	telemetryMu sync.Mutex
+	nodeID      string
+	rows        []sched.NodeTelemetry
+}
+
+func (c *telemetryCapturingEngine) TelemetrySink() sched.TelemetrySink {
+	return func(nodeID string, _ time.Time, _ time.Time, rows []sched.NodeTelemetry) error {
+		c.telemetryMu.Lock()
+		defer c.telemetryMu.Unlock()
+		c.nodeID = nodeID
+		c.rows = append([]sched.NodeTelemetry(nil), rows...)
+		return nil
+	}
 }
 
 // TestReportCapacity_RoundTrip drives two reports through the
@@ -227,6 +246,44 @@ func TestReportCapacity_RoundTrip(t *testing.T) {
 		if got.SampledAt.Unix() != w.SampledAt.Unix() {
 			t.Errorf("[%d] SampledAt = %v, want %v", i, got.SampledAt, w.SampledAt)
 		}
+	}
+}
+
+func TestReportCapacity_BatchedTelemetryReachesCacheSink(t *testing.T) {
+	mu := sync.Mutex{}
+	engine := &telemetryCapturingEngine{
+		capturingEngine: &capturingEngine{mu: &mu},
+	}
+	cli := newServer(t, engine)
+	stream, err := cli.ReportCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("ReportCapacity: %v", err)
+	}
+	if err := stream.Send(&scheddpb.CapacityReport{
+		NodeId:          "node-a",
+		SampledAtUnixMs: 1730000000000,
+		Instances: []*scheddpb.InstanceTelemetry{{
+			InstanceId:       "vm-1",
+			ResidentBytes:    wrapperspb.Int64(128 << 20),
+			CpuPct:           wrapperspb.Double(4.5),
+			InflightRequests: 7,
+			OpenConns:        2,
+			LastRequestAt:    timestamppb.New(time.Unix(123, 0)),
+		}},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+	engine.telemetryMu.Lock()
+	defer engine.telemetryMu.Unlock()
+	if engine.nodeID != "node-a" || len(engine.rows) != 1 {
+		t.Fatalf("telemetry = node=%q rows=%d, want node-a/1", engine.nodeID, len(engine.rows))
+	}
+	row := engine.rows[0]
+	if row.InstanceID != "vm-1" || row.ResidentBytes == nil || *row.ResidentBytes != 128<<20 || row.CPUPct == nil || *row.CPUPct != 4.5 || row.InflightRequests != 7 || row.OpenConns != 2 {
+		t.Fatalf("telemetry row = %+v, want vm-1 resident=128MiB cpu=4.5 inflight=7 open_conns=2", row)
 	}
 }
 

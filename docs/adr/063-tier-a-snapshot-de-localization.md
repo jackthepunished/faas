@@ -35,12 +35,13 @@ Specifically:
 - `vmmd` publishes snapshot memory and vmstate through the shared
   storage backend when `FAAS_STORAGE_BACKEND=oci`; `snap/` is no
   longer in the default OCI local-prefix list.
-- `snapshot_replicas` is a durable per-(snapshot,node) queue. Each
-  node-local `vmmd` reconciles it, claims work with row locking, drains
-  both blobs through the read-through cache, and marks the pair
-  `ready` only after both reads succeed. vmmd is used because the current
-  compute-only Ansible role runs vmmd on every compute box while schedd
-  remains a control-plane service.
+- `snapshot_replicas` is a durable per-(snapshot,node) queue. A global
+  `snapshot_fanout_events` stream records one event per usable snapshot and
+  each node has a durable cursor. The node-local `vmmd` consumes only events
+  newer than its cursor, claims work with row locking, drains both blobs
+  through the read-through cache, and marks the pair `ready` only after both
+  reads succeed. vmmd is used because the current compute-only Ansible role
+  runs vmmd on every compute box while schedd remains a control-plane service.
 - `snapshot_origins` records the producing node and region. New
   snapshots fan out only inside that region; legacy rows without
   origin metadata remain eligible for safe catch-up.
@@ -57,6 +58,11 @@ Specifically:
   implementation. Its durable queue and storage interfaces are
   provider-neutral, so a future standalone systemd unit can reuse
   the same state machine without introducing peer IP/SSH coupling.
+- Snapshot publication appends one fan-out event instead of making every
+  worker scan the complete snapshots table each second. A newly joined node
+  replays the event stream from cursor zero, while origin and node-activation
+  triggers repair locality and activation races. Cursor replay is the recovery
+  guard for workers that were offline during publication.
 
 ## Consequences
 

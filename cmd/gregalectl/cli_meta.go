@@ -67,6 +67,7 @@ type cliFlag struct {
 //   - secrets         (init | rotate | status | stamp)
 //   - compute-nodes   (add | list | show | drain | drain-status | activate | force-drain)
 //   - deploy          (join-node | add-node)
+//   - obs             (health)
 //   - trusted-publishers (add | remove | list) — see ADR-058 deviation note in main.go:15
 //   - version         (internal)
 //   - completion      (bash | zsh | fish | powershell) (internal)
@@ -462,6 +463,29 @@ var cliCommands = []cliCommand{
 			{Name: "pg-dsn", Short: "PostgreSQL DSN (default: $FAAS_PG_DSN or $DATABASE_URL)"},
 			{Name: "no-db", Short: "skip the compute_nodes.cert_fingerprint write"},
 			{Name: "force", Short: "overwrite existing secret files (default false)"},
+		},
+	},
+	{
+		// Obs-Meta + Trace-IDs Mega-PR / C8 — operator-side
+		// meta-obs health snapshot. Dials apid's
+		// GET /v1/admin/obs/health (admin scope + MFA +
+		// FAAS_ADMIN_EMAILS allowlist) and emits the closed-set
+		// snapshot. `--json` / `$FAAS_JSON=1` overrides the
+		// human-readable summary. Out-of-scope subcommands
+		// (events / incidents) reserve room for follow-on PRs.
+		Name:    dispatchObs,
+		DocSlug: "obs",
+		Short:   "Operator-side meta-obs health snapshot (obs health; Obs-Meta + Trace-IDs Mega-PR / C8)",
+		Subcommands: []cliSub{
+			{
+				Name:  subObsHealth,
+				Short: "Fetch GET /v1/admin/obs/health from apid (admin scope + MFA required)",
+				Flags: []cliFlag{
+					{Name: "json", Short: "emit raw JSON snapshot (overrides human summary)"},
+					{Name: "admin-token", Short: "admin bearer for the FAAS_ADMIN_EMAILS allowlist (default: $FAAS_ADMIN_TOKEN)"},
+					{Name: "timeout", Short: "HTTP timeout for the apid round-trip (default 10s)"},
+				},
+			},
 		},
 	},
 	// Internal surface — version, completion, man.

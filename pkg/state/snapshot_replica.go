@@ -42,8 +42,11 @@ type SnapshotOriginStore interface {
 // capability. A worker only starts when the concrete store implements this
 // interface.
 type SnapshotReplicaStore interface {
-	// EnqueueSnapshotReplicasForNode creates idempotent warming jobs for every
-	// current non-stale snapshot that this node should have locally.
+	// EnqueueSnapshotReplicasForNode consumes the global snapshot fan-out event
+	// cursor for this node and creates idempotent warming jobs. Implementations
+	// must be safe to call on every worker tick. The production implementation
+	// consumes only events newer than the node cursor; in-memory/test
+	// implementations may retain a full-snapshot fallback.
 	EnqueueSnapshotReplicasForNode(ctx context.Context, nodeID string) (int, error)
 	// ClaimSnapshotReplica atomically leases one pending/retryable job for the
 	// node. ErrNotFound means the queue is empty.

@@ -25,6 +25,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/nodejoin"
 	"github.com/onebox-faas/faas/pkg/pki"
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
+	"github.com/onebox-faas/faas/pkg/storage"
 )
 
 type deployJoinOptions struct {
@@ -989,6 +990,9 @@ func validateSharedStorageEnv(path string) error {
 	}
 	if seen["FAAS_STORAGE_CACHE_DIR"] && strings.TrimSpace(values["FAAS_STORAGE_CACHE_DIR"]) == "" {
 		return errors.New("FAAS_STORAGE_CACHE_DIR must not be empty; the node-local cache is required for prepositioned wakes")
+	}
+	if cacheDir := strings.TrimSpace(values["FAAS_STORAGE_CACHE_DIR"]); cacheDir != "" && cacheDir != storage.DefaultOCICacheDir {
+		return fmt.Errorf("FAAS_STORAGE_CACHE_DIR=%q is not supported by the managed systemd units; use %s", cacheDir, storage.DefaultOCICacheDir)
 	}
 	return nil
 }

@@ -31,6 +31,10 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // silentLogger is the slog.Logger used by tests that don't care
@@ -55,9 +59,40 @@ func TestBuildCapacityReport_NodeIDPropagated(t *testing.T) {
 		}, true
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000}
-	got := buildCapacityReport(nil, counts, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, counts, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident, silentLogger())
 	if got.GetNodeId() != "0193f7c0-uuid-7bbb-9def-0123456789ab" {
 		t.Errorf("node_id = %q, want 0193f7c0-uuid-7bbb-9def-0123456789ab", got.GetNodeId())
+	}
+}
+
+func TestBuildCapacityReport_BatchesLocalTelemetry(t *testing.T) {
+	resident := func() (map[string]int64, bool) {
+		return nil, false
+	}
+	stats := telemetryReader(func(context.Context) (*vmmdpb.StatsResponse, error) {
+		return &vmmdpb.StatsResponse{
+			TotalResidentBytes: wrapperspb.Int64(256 << 20),
+			Instances: []*vmmdpb.InstanceStats{{
+				Instance:         "vm-1",
+				ResidentBytes:    wrapperspb.Int64(256 << 20),
+				CpuPct:           wrapperspb.Double(12.5),
+				InflightRequests: 3,
+				OpenConns:        5,
+				LastRequestAt:    timestamppb.New(time.Unix(123, 0)),
+			}},
+		}, nil
+	})
+
+	got := buildCapacityReport(context.Background(), nil, nil, "node-a", ComputeNodeConfig{MemMB: 1024}, resident, silentLogger(), stats)
+	if got.GetUsedMb() != 256 {
+		t.Fatalf("used_mb = %d, want 256 from Stats snapshot", got.GetUsedMb())
+	}
+	if len(got.GetInstances()) != 1 {
+		t.Fatalf("telemetry rows = %d, want 1", len(got.GetInstances()))
+	}
+	row := got.GetInstances()[0]
+	if row.GetInstanceId() != "vm-1" || row.GetInflightRequests() != 3 || row.GetOpenConns() != 5 || row.GetCpuPct().GetValue() != 12.5 {
+		t.Fatalf("telemetry row = %+v, want vm-1 cpu=12.5 inflight=3 open_conns=5", row)
 	}
 }
 
@@ -73,7 +108,7 @@ func TestBuildCapacityReport_ResidentBytesSummed(t *testing.T) {
 		}, true
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000}
-	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 200 {
 		t.Errorf("used_mb = %d, want 200", got.GetUsedMb())
 	}
@@ -93,7 +128,7 @@ func TestBuildCapacityReport_NonLinuxHostEmitsZero(t *testing.T) {
 		return nil, false // non-Linux: cgroup read failed
 	}
 	cfg := ComputeNodeConfig{MemMB: 47600}
-	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 0 {
 		t.Errorf("used_mb = %d on non-Linux; want 0", got.GetUsedMb())
 	}
@@ -113,7 +148,7 @@ func TestBuildCapacityReport_OverCommitClampsAtZero(t *testing.T) {
 		return map[string]int64{"i-1": 2000 * 1024 * 1024}, true // 2000 MiB
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000} // 1000 MiB cap
-	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 2000 {
 		t.Errorf("used_mb = %d, want 2000", got.GetUsedMb())
 	}
@@ -135,7 +170,7 @@ func TestBuildCapacityReport_VCPUScaledByLiveCount(t *testing.T) {
 	// placeholder is a no-op for live=0; the load-bearing
 	// path is exercised in the metal suite.
 	resident := func() (map[string]int64, bool) { return nil, true }
-	got := buildCapacityReport(nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, resident, silentLogger())
 	if got.GetVcpuBusy() != 0 {
 		t.Errorf("vcpu_busy = %d, want 0 (live=0)", got.GetVcpuBusy())
 	}
@@ -149,7 +184,7 @@ func TestBuildCapacityReport_VCPUScaledByLiveCount(t *testing.T) {
 func TestBuildCapacityReport_TimeStampMonotonic(t *testing.T) {
 	t.Parallel()
 	before := time.Now().UnixMilli()
-	got := buildCapacityReport(nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, noResident, silentLogger())
+	got := buildCapacityReport(context.Background(), nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, noResident, silentLogger())
 	after := time.Now().UnixMilli()
 	if got.GetSampledAtUnixMs() < before || got.GetSampledAtUnixMs() > after {
 		t.Errorf("sampled_at_unix_ms = %d, want in [%d, %d]", got.GetSampledAtUnixMs(), before, after)

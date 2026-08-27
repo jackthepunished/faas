@@ -41,7 +41,7 @@ func TestMemStore_OperatorIntent_FullLifecycle(t *testing.T) {
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"33333333-3333-3333-3333-333333333333",
-		&acct, actor, "wedged instance", json.RawMessage(`{}`),
+		&acct, actor, "wedged instance", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -90,7 +90,7 @@ func TestMemStore_OperatorIntent_FIFOClaim(t *testing.T) {
 	// Insert two intents — older first, then newer.
 	first, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"first-target", &acct, actor, "first", nil,
+		"first-target", &acct, actor, "first", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert first: %v", err)
@@ -101,7 +101,7 @@ func TestMemStore_OperatorIntent_FIFOClaim(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	second, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"second-target", &acct, actor, "second", nil,
+		"second-target", &acct, actor, "second", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert second: %v", err)
@@ -137,7 +137,7 @@ func TestMemStore_OperatorIntent_MarkFailed(t *testing.T) {
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
-		"44444444-4444-4444-4444-444444444444", nil, actor, "stale snap", nil,
+		"44444444-4444-4444-4444-444444444444", nil, actor, "stale snap", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -174,7 +174,7 @@ func TestMemStore_OperatorIntent_MarkWithoutClaimReturnsNotFound(t *testing.T) {
 	actor := "22222222-2222-2222-2222-222222222222"
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
-		"55555555-5555-5555-5555-555555555555", nil, actor, "no claim", nil,
+		"55555555-5555-5555-5555-555555555555", nil, actor, "no claim", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -215,7 +215,7 @@ func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	stuckID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"66666666-6666-6666-6666-666666666666",
-		&acct, actor, "stuck", nil,
+		&acct, actor, "stuck", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
@@ -228,7 +228,7 @@ func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	terminalID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
 		"77777777-7777-7777-7777-777777777777",
-		&acct, actor, "terminal", nil,
+		&acct, actor, "terminal", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(terminal): %v", err)
@@ -285,3 +285,152 @@ func TestMemStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 		t.Errorf("ClaimPendingOperatorIntent after reclaim: %v", err)
 	}
 }
+
+// TestMemStore_OperatorIntentOutcomeMissingCounts_CoversPgStore
+// is the in-memory twin of the pgstore path that
+// cmd/apid/obs_health_query.go reads to surface stuck-running
+// rows via /v1/admin/obs/health. The Mega-PR (C7) added the
+// PgStore method (pkg/state/pgstore_operator_intent.go:313) and
+// the MemStore mirror (memstore.go:6225) but never pinned either
+// — pg shard 2 covers PgStore, MemStore side was untested, so
+// the pkg/state coverage gate fell to 69.9%. Two assertions:
+//
+//  1. A pending row (not running) is not counted.
+//  2. A running row whose started_at is BEFORE threshold
+//     (set via time.Now().Add(time.Minute) — every real
+//     started_at is in the past relative to it) IS counted.
+//
+// The third clause of the WHERE — `started_at IS NOT NULL` —
+// is exercised implicitly by ClaimPendingOperatorIntent, which
+// stamps started_at before transitioning to `running`.
+func TestMemStore_OperatorIntentOutcomeMissingCounts_CoversPgStore(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	actor := "22222222-2222-2222-2222-222222222222"
+	acct := "11111111-1111-1111-1111-111111111111"
+
+	// Stuck-running row inserted FIRST so it's the oldest
+	// pending; ClaimPendingOperatorIntent will pick it up
+	// (FIFO claim by requested_at). The threshold in the
+	// future then matches its just-stamped started_at.
+	stuckID, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForceColdBoot,
+		"99999999-9999-9999-9999-999999999999",
+		&acct, actor, "stuck", nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
+	}
+	if _, err := store.ClaimPendingOperatorIntent(ctx); err != nil {
+		t.Fatalf("ClaimPendingOperatorIntent(stuck): %v", err)
+	}
+
+	// Later-inserted pending row — must NOT be counted. Insert
+	// AFTER the claim so the stuck row stays the only
+	// running row (FIFO claim would otherwise pick this up).
+	if _, err := store.InsertOperatorIntent(
+		ctx, state.OperatorIntentKindForcePark,
+		"88888888-8888-8888-8888-888888888888",
+		&acct, actor, "pending", nil, nil,
+	); err != nil {
+		t.Fatalf("InsertOperatorIntent(pending): %v", err)
+	}
+
+	// Future threshold selects every running row.
+	counts, err := store.OperatorIntentOutcomeMissingCounts(ctx, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("OperatorIntentOutcomeMissingCounts: %v", err)
+	}
+	if got := counts[string(state.OperatorIntentKindForceColdBoot)]; got != 1 {
+		t.Errorf("stuck-running count = %d, want 1 (kind=%s)", got, state.OperatorIntentKindForceColdBoot)
+	}
+	if _, present := counts[string(state.OperatorIntentKindForcePark)]; present {
+		t.Errorf("pending row must not be counted; got %v", counts)
+	}
+
+	// Sanity: the stuck id is still in the map.
+	if _, err := store.GetOperatorIntent(ctx, stuckID); err != nil {
+		t.Errorf("GetOperatorIntent(stuck) post-count: %v", err)
+	}
+}
+
+// TestMemStore_OperatorActionTraceCompleteness_CoversPgStore
+// pins the in-memory twin of
+// pkg/state/pgstore_operator_intent.go:360 (pgstore path the
+// schedd 60s completeness tick reads). The Mega-PR (C7) added
+// the MemStore mirror (memstore.go:6257) without test coverage;
+// this file closes the gap so the pkg/state coverage gate stays
+// above 70%.
+//
+// Three assertions cover the 4 conditional branches in the
+// aggregation loop:
+//
+//  1. Rows whose kind does NOT start with "operator.action."
+//     are excluded (the len<16 short-circuit).
+//  2. Rows whose `at` is before the `since` window are
+//     excluded.
+//  3. The ratio is correct for a kind with mixed trace_id
+//     presence — 1-of-2 = 0.5.
+//
+// The vacuous-truth rule (kinds with zero rows absent from the
+// map) is exercised by the empty-input baseline of the function
+// — every MemStore starts with no events, so the first call
+// returns an empty map.
+func TestMemStore_OperatorActionTraceCompleteness_CoversPgStore(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+
+	// Baseline: empty store returns empty map (vacuous-truth
+	// surface for the handler's closed-set seed).
+	got, err := store.OperatorActionTraceCompleteness(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("OperatorActionTraceCompleteness(baseline): %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("baseline map = %v, want empty", got)
+	}
+
+	// Non-operator-action row must be excluded.
+	if err := store.AppendEventWithTrace(ctx, "test:schedd", "app.wake", nil, []byte(`{}`), nil); err != nil {
+		t.Fatalf("AppendEventWithTrace(non-operator): %v", err)
+	}
+
+	// Operator-action rows: 2 with trace_id, 1 without. The
+	// "without" case exercises the
+	// `e.TraceID != nil && *e.TraceID != ""` guard — passing
+	// nil for traceID leaves TraceID nil on the row.
+	if err := store.AppendEventWithTrace(ctx, "test:schedd", "operator.action.park_instance", nil, []byte(`{}`), strPtr("4bf92f3577b34da6a3ce929d0e0e4736")); err != nil {
+		t.Fatalf("AppendEventWithTrace(with trace_id 1): %v", err)
+	}
+	if err := store.AppendEventWithTrace(ctx, "test:schedd", "operator.action.park_instance", nil, []byte(`{}`), strPtr("4bf92f3577b34da6a3ce929d0e0e4737")); err != nil {
+		t.Fatalf("AppendEventWithTrace(with trace_id 2): %v", err)
+	}
+	if err := store.AppendEventWithTrace(ctx, "test:schedd", "operator.action.park_instance", nil, []byte(`{}`), nil); err != nil {
+		t.Fatalf("AppendEventWithTrace(without trace_id): %v", err)
+	}
+
+	ratio, err := store.OperatorActionTraceCompleteness(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("OperatorActionTraceCompleteness(populated): %v", err)
+	}
+	if got := ratio["operator.action.park_instance"]; got != 2.0/3.0 {
+		t.Errorf("ratio[operator.action.park_instance] = %v, want 0.6667", got)
+	}
+
+	// Window excludes everything older than since. A
+	// since-in-the-future window yields an empty map (every
+	// event's At is in the past).
+	future, err := store.OperatorActionTraceCompleteness(ctx, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("OperatorActionTraceCompleteness(future window): %v", err)
+	}
+	if len(future) != 0 {
+		t.Errorf("future-window map = %v, want empty (every At is in the past)", future)
+	}
+}
+
+// strPtr is a tiny helper — *string is the wire shape
+// AppendEventWithTrace expects for trace_id; avoiding a
+// package-level var keeps the test self-contained.
+func strPtr(s string) *string { return &s }

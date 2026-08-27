@@ -9,9 +9,8 @@
 //   2. Happy path: empty store returns 200 with empty `items`
 //      and `queued_builds: 0` (the underlying writer
 //      pkg/builderd/heartbeat.go is deferred per the Commit 7
-//      PR risk list — builderd does not currently self-register
-//      a compute_nodes row at startup; the today row count is
-//      zero).
+//      builderd emits the source='builder_tick' rows in production;
+//      a fresh test store remains empty until a producer publishes one).
 //   3. With a builder_tick heartbeat on the in-memory store,
 //      the row surfaces under items.
 //   4. With a queued build, QueuedBuilds is 1 (not the total

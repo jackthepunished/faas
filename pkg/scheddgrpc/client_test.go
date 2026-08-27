@@ -287,7 +287,7 @@ func TestClientParkInstance_Ok(t *testing.T) {
 			return nil
 		},
 	})
-	if err := c.ParkInstance(context.Background(), "i-1", "idle"); err != nil {
+	if err := c.ParkInstance(context.Background(), "i-1", "idle", ""); err != nil {
 		t.Errorf("ParkInstance: %v", err)
 	}
 }
@@ -304,7 +304,7 @@ func TestClientParkInstance_NotFound(t *testing.T) {
 			return state.ErrNotFound
 		},
 	})
-	err := c.ParkInstance(context.Background(), "i-1", "idle")
+	err := c.ParkInstance(context.Background(), "i-1", "idle", "")
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("ParkInstance = %v, want errors.Is(state.ErrNotFound)", err)
 	}
@@ -331,7 +331,7 @@ func TestClientParkInstance_PlainErrorPassesThrough(t *testing.T) {
 			return errors.New("db boom")
 		},
 	})
-	got := c.ParkInstance(context.Background(), "i-1", "idle")
+	got := c.ParkInstance(context.Background(), "i-1", "idle", "")
 	if got == nil {
 		t.Fatal("expected error from ParkInstance")
 	}

@@ -33,6 +33,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -132,6 +133,7 @@ func (s *server) postForceColdBoot(w http.ResponseWriter, r *http.Request, acct 
 		acct.ID,
 		reason,
 		nil,
+		middleware.TraceIDFrom(r),
 	)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,

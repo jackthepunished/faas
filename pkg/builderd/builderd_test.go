@@ -194,6 +194,24 @@ func TestProcessOne_CacheHitSkipsSpawn(t *testing.T) {
 	}
 }
 
+func TestSnapshotBootPayloadIncludesBuilderNode(t *testing.T) {
+	b := &Builderd{builderNodeID: "fsn-2.faas"}
+	got := b.snapshotBootPayload("app-1", "dep-1")
+	want := `{"app_id":"app-1","deployment_id":"dep-1","node_id":"fsn-2.faas"}`
+	if got != want {
+		t.Fatalf("snapshotBootPayload() = %q, want %q", got, want)
+	}
+}
+
+func TestSnapshotBootPayloadOmitsEmptyBuilderNode(t *testing.T) {
+	b := &Builderd{}
+	got := b.snapshotBootPayload("app-1", "dep-1")
+	want := `{"app_id":"app-1","deployment_id":"dep-1"}`
+	if got != want {
+		t.Fatalf("snapshotBootPayload() = %q, want %q", got, want)
+	}
+}
+
 func TestProcessOne_VMSpawnSucceedsAndStamps(t *testing.T) {
 	store := state.NewMemStore()
 	src := filepath.Join(t.TempDir(), "src.tar.gz")
@@ -898,6 +916,54 @@ func TestMaterializeSourceFromStorage(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("materialized source = %q, want %q", got, want)
+	}
+}
+
+type eventuallyAvailableStorage struct {
+	storage.StorageBackend
+	missing int
+	calls   int
+}
+
+func (s *eventuallyAvailableStorage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	s.calls++
+	if s.calls <= s.missing {
+		return nil, storage.ErrNotFound
+	}
+	return s.StorageBackend.Get(ctx, key)
+}
+
+func TestWaitForSourceRetriesRemoteNotFound(t *testing.T) {
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	buildID := "550e8400-e29b-41d4-a716-446655440000"
+	want := []byte("source-after-registry-visibility-delay")
+	if err := be.Put(context.Background(), "sources/"+buildID+".tar.gz", bytes.NewReader(want)); err != nil {
+		t.Fatalf("Put source: %v", err)
+	}
+	delayed := &eventuallyAvailableStorage{StorageBackend: be, missing: 2}
+	dst := filepath.Join(t.TempDir(), "builds", buildID+".tar.gz")
+	b := New(state.NewMemStore(), &fakeNotifier{}, nil, NewCache(t.TempDir()), NewDetector(), nil, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))).WithSourceStorage(delayed)
+
+	// ProcessOne performs this first lookup before entering the bounded
+	// local/remote wait loop. Simulate that initial registry miss here.
+	if err := b.materializeSource(context.Background(), buildID, dst); err != nil {
+		t.Fatalf("initial materializeSource: %v", err)
+	}
+	if err := b.waitForSource(context.Background(), buildID, dst, 2*time.Second); err != nil {
+		t.Fatalf("waitForSource: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("materialized source = %q, want %q", got, want)
+	}
+	if delayed.calls < 3 {
+		t.Fatalf("source backend calls = %d, want at least 3", delayed.calls)
 	}
 }
 

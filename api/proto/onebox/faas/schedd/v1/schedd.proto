@@ -15,6 +15,7 @@ package onebox.faas.schedd.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 
 option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpb";
 
@@ -901,6 +902,28 @@ message CapacityReport {
   // signature to a registered key so a rotated/replayed
   // signature cannot piggyback on a stale registry entry.
   string node_key_id         = 9;
+  // Complete per-node vmmd Stats batch sampled alongside this frame. Keeping
+  // it on the persistent capacity stream removes the schedd-side 200 ms
+  // fresh-dial fan-out across the fleet.
+  repeated InstanceTelemetry instances = 10;
+}
+
+// InstanceTelemetry is the vmmd-side Stats row carried in CapacityReport.
+// Node identity is inherited from the enclosing report. Wrapper fields retain
+// the existing absent-versus-zero semantics used by ListInstanceStats.
+message InstanceTelemetry {
+  string instance_id = 1;
+  google.protobuf.Int64Value resident_bytes = 2;
+  google.protobuf.DoubleValue cpu_pct = 3;
+  google.protobuf.DoubleValue cpu_seconds = 4;
+  google.protobuf.DoubleValue cpu_throttled_seconds = 5;
+  int64 inflight_requests = 6;
+  google.protobuf.Timestamp last_request_at = 7;
+  google.protobuf.Int64Value net_tx_bytes = 8;
+  // Open TCP connection count observed by vmmd on the compute host. The
+  // value is transported with the existing persistent capacity stream so
+  // schedd does not need a per-node conntrack query.
+  int64 open_conns = 9;
 }
 
 // ReportCapacityAck is the typed "I consumed all your messages"
@@ -967,4 +990,3 @@ message EnsureWakeResponse {
   // AdmitInstanceResponse.deployment_id. Empty on failure.
   string deployment_id = 7;
 }
-

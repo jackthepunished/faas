@@ -133,7 +133,11 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.4.0
-          args: --timeout=3m
+          # The full repository lint is clean but can exceed three minutes
+          # on a cold hosted-runner cache. Keep the linter's own deadline
+          # above the observed ~3m20s runtime so timing is not reported as a
+          # lint failure.
+          args: --timeout=6m
           # Cache is built into the action; default cache key works.
 
       # Re-runs the same checks golangci-lint covers as a fallback, in case
@@ -290,6 +294,12 @@ jobs:
           # Gate-B: syntax-check the only production bootstrap playbook
           # before an operator can run either role-specific target.
           ansible-playbook --syntax-check bootstrap.yml
+          # Gate-C: keep the connection-free scale validator parseable.
+          ansible-playbook --syntax-check scale_check.yml
+          # Gate-D: render and validate the 1/10/100/1000 compute-node
+          # topologies, then run Ansible check-mode against the largest one.
+          cd ../..
+          GREGALE_ANSIBLE_SCALE_CHECK=1 go test -count=1 -timeout=5m ./cmd/gregalectl -run '^TestRenderManifestAnsibleFiles_ScaleMatrix$'
 
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
       # through pkg/wire.Daemon. `--help` must exit 0 with non-empty usage text
@@ -974,6 +984,24 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
+      - name: download Go modules with retry
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout 45s go mod download; then
+              echo "Go modules downloaded on attempt ${attempt}"
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Go module download failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            delay=$((attempt * 5))
+            echo "Go module download attempt ${attempt} failed; retrying in ${delay}s" >&2
+            sleep "${delay}"
+          done
       - name: make test-load
         run: make test-load
 

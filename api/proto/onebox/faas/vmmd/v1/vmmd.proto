@@ -847,6 +847,10 @@ message InstanceStats {
   // per-plan tc tbf qdisc reads, so the cap and the meter are
   // consistent. Informational — not billed (ADR-046 §6).
   google.protobuf.Int64Value net_tx_bytes = 10;
+  // Open TCP connection count observed from the compute host's conntrack
+  // table. Zero is a real idle value; the enclosing Stats response is
+  // additive so older schedd peers can ignore this field.
+  int64 open_conns = 11;
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the

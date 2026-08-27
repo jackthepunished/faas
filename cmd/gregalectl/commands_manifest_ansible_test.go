@@ -79,6 +79,9 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `faas_gatewayd_egress_listen: "tcp://0.0.0.0:9092"`) {
 		t.Errorf("compute host vars missing split egress listener:\n%s", computeVars)
 	}
+	if !strings.Contains(computeVars, `faas_gatewayd_app_errors_target: "tcp://apid.faas:9093"`) {
+		t.Errorf("compute host vars missing split AppErrors target:\n%s", computeVars)
+	}
 	if !strings.Contains(computeVars, `faas_vmmd_schedd_target: "tcp://schedd.faas:7100"`) {
 		t.Errorf("compute host vars missing scheduler target:\n%s", computeVars)
 	}
@@ -105,6 +108,9 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	}
 	if !strings.Contains(controlVars, "faas_compute_gateway_discovery: database") {
 		t.Errorf("control host vars missing database gateway discovery:\n%s", controlVars)
+	}
+	if !strings.Contains(controlVars, `faas_apid_app_errors_listen: "tcp://0.0.0.0:9093"`) {
+		t.Errorf("control host vars missing AppErrors listener:\n%s", controlVars)
 	}
 	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://127.0.0.1:8080"`) {
 		t.Errorf("control host vars missing schedd synth target:\n%s", controlVars)
@@ -232,7 +238,7 @@ func TestRenderManifestAnsibleFiles_HostnameEndpointsUseOverlayBoundary(t *testi
 		`faas_private_dns_zone: "gregale.dev"`,
 		`faas_private_hosts:`,
 		`- inventory_host: "fsn-1"`,
-		`names: ["fsn-1.gregale.dev", "schedd.faas"]`,
+		`names: ["fsn-1.gregale.dev", "schedd.faas", "apid.faas"]`,
 		`- inventory_host: "fsn-2"`,
 		`names: ["fsn-2.gregale.dev", "vmmd.faas", "egress.faas"]`,
 	} {

@@ -20,13 +20,14 @@
 // tripwire. The threshold param ?older_than= is bounded to
 // [1m, 60m] to keep a fat-fingered "1ns" from sweeping every
 // currently-running build. Default 15m mirrors the reaper's
-// grace period.
+// grace period. Every successful sweep also records the
+// operator-supplied reason in the audit row.
 //
 // Audit row: operator.action.reclaim_build with
 //
 //	account_id = nil (fleet-level sweep, not tenant-scoped)
 //	data = {actor: caller.ID, older_than_seconds, swept_count,
-//	        threshold_iso}
+//	        threshold_iso, reason}
 //
 // matches the precedent at handlers_admin_obs.go:441 where
 // fleet-level events stamp account_id=NULL.
@@ -65,10 +66,19 @@ const (
 // 200 on success, 400 on missing ?confirm=true or invalid
 // ?older_than=, 403 admin_required, 500 on store error.
 func (s *server) postSweepStuckBuilds(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if allowed, prob := s.adminAllows(acct); !allowed {
+		api.WriteProblem(w, prob)
+		return
+	}
 	if r.URL.Query().Get("confirm") != "true" {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"confirm required",
 			"?confirm=true is required to sweep stuck builds; aborts on operator typo"))
+		return
+	}
+	reason, perr := parseSweepReason(r.URL.Query().Get("reason"))
+	if perr != nil {
+		api.WriteProblem(w, perr)
 		return
 	}
 	olderThan, perr := parseSweepOlderThan(r.URL.Query().Get("older_than"))
@@ -84,13 +94,30 @@ func (s *server) postSweepStuckBuilds(w http.ResponseWriter, r *http.Request, ac
 			api.CodeInternal, "sweep failed", err.Error()))
 		return
 	}
-	emitOperatorActionReclaimBuild(r, s, acct, int(olderThan.Seconds()), swept, threshold.UTC().Format(time.RFC3339))
+	emitOperatorActionReclaimBuild(r, s, acct, int(olderThan.Seconds()), swept, threshold.UTC().Format(time.RFC3339), reason)
 	writeJSON(w, http.StatusOK, api.SweepStuckBuildsResponse{
 		OK:            true,
 		SweptCount:    swept,
 		OlderThanSecs: int(olderThan.Seconds()),
 		ThresholdISO:  threshold.UTC().Format(time.RFC3339),
 	})
+}
+
+const sweepDefaultReason = "operator_reclaim_build"
+
+// parseSweepReason returns the normalized operator reason or a 400 api.Problem.
+// Reasons intentionally use the same constrained shape as the other operator
+// lifecycle actions so audit search and incident tooling can treat all action
+// records consistently.
+func parseSweepReason(raw string) (string, *api.Problem) {
+	if raw == "" {
+		return sweepDefaultReason, nil
+	}
+	if len(raw) > obsOpsReasonMaxLen || !obsOpsReasonShape.MatchString(raw) {
+		return "", api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"invalid reason", "reason must match [a-z0-9_]{1,64}")
+	}
+	return raw, nil
 }
 
 // parseSweepOlderThan returns the ?older_than= duration parsed

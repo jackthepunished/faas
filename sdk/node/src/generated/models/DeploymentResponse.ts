@@ -175,5 +175,41 @@ export type DeploymentResponse = {
    * Closed-set classifier for the most recent auto-rollback trigger. `threshold_exceeded` = first_5xx_count crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing the threshold (clean wake window). Closed-set is enforced at the schema layer via deployments_last_auto_rollback_reason_check.
    */
   last_auto_rollback_reason?: 'threshold_exceeded' | 'first_window_expired';
+  /**
+   * Canary preset used by the deployment's progressive rollout. `none` preserves the default 100% deployment path.
+   */
+  canary_preset?: 'none' | 'slow' | 'balanced' | 'aggressive' | '1-10-50-100';
+  /**
+   * Current zero-based canary ladder step.
+   */
+  canary_step?: number;
+  /**
+   * Total number of canary ladder steps; zero means no canary ladder.
+   */
+  canary_total_steps?: number;
+  /**
+   * Wall-clock timestamp at which the current canary step began.
+   */
+  canary_step_started_at?: string | null;
+  /**
+   * Durable rollout state used by the canary orchestrator and operator recovery path.
+   */
+  rollout_state?: 'pending' | 'rolling_out' | 'complete' | 'aborted';
+  /**
+   * Wall-clock timestamp at which rollout processing began.
+   */
+  rollout_started_at?: string | null;
+  /**
+   * Wall-clock timestamp at which the rollout reached complete.
+   */
+  rollout_completed_at?: string | null;
+  /**
+   * Wall-clock timestamp at which the rollout was aborted.
+   */
+  rollout_aborted_at?: string | null;
+  /**
+   * Operator or orchestrator reason recorded when the rollout is aborted.
+   */
+  rollout_aborted_reason?: string;
 };
 

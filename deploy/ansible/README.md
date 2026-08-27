@@ -40,6 +40,19 @@ make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-pre
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-syntax-check
 ```
 
+Before connecting to any provider, run the connection-free scale gate:
+
+```
+make manifest-scale-check
+```
+
+It renders and validates 1, 10, 100, and 1,000 compute-node topologies and
+runs `scale_check.yml` in Ansible check-mode against the largest generated
+inventory. The manifest contract currently supports up to 1,000
+`compute-only` hosts. For fleets larger than 32 hosts, the shared private
+resolver map is emitted once in `inventory/group_vars/all.yml`; host-specific
+transport and routing values remain in `host_vars`.
+
 SSH host-key checking is enabled by default. Seed the operator workstation's
 `known_hosts` from the provider console or another trusted channel before the
 first connection; never disable host-key verification for a production run.
@@ -102,8 +115,10 @@ make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-c
 
 The generated `host_vars` owns `faas_box_role`, the canonical
 `faas_node_name` (for example `fsn-2.faas`),
-`ansible_host`, `faas_vmmd_target_url`, and the private endpoint records
-written by the overlay role. `faas_vmmd_target_url` is a node-specific
+`ansible_host`, and `faas_vmmd_target_url`. The generated private endpoint
+records written by the overlay role live in each host's `host_vars` for small
+fleets and in shared `inventory/group_vars/all.yml` for larger fleets.
+`faas_vmmd_target_url` is a node-specific
 stable private endpoint such as `tcp://fsn-3.gregale.dev:50051`; the host's
 vmmd server leaf carries that endpoint as an additional SAN while retaining
 `vmmd.faas` as its role identity. The bootstrap's discovery play gathers one

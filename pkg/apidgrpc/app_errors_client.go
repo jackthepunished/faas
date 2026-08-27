@@ -75,11 +75,11 @@ type Client struct {
 // compile-time assertion that *Client satisfies AppErrorsClient.
 var _ AppErrorsClient = (*Client)(nil)
 
-// Dial opens a lazy gRPC connection to apid's unix socket. Same
-// auth model as scheddgrpc.Dial: socket DAC mode 0660 group
-// `faas` is the only auth in v1.0; transport uses insecure
-// credentials over a trusted local socket. Connection dials on
-// first RPC; Dial never blocks on apid being up.
+// Dial opens a lazy gRPC connection to apid's AppErrors endpoint. The
+// legacy bare path remains a Unix socket authenticated by DAC; tcp:// and
+// dns:// targets are rejected unless DialContext receives a complete mTLS
+// config. Connection dials on the first RPC; Dial never blocks on apid being
+// up.
 //
 // Legacy entrypoint retained for source compatibility; production
 // code should call DialContext so the caller's context controls

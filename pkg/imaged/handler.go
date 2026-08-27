@@ -84,6 +84,12 @@ type Handler struct {
 	oci     oci.Puller
 	builder LayerBuilder
 	log     *slog.Logger
+	// nodeName is the compute_node identity of this imaged process. A
+	// snapshot_boot notification is fleet-wide, while the builder's OCI
+	// export is local to the node that produced it. Named multi-box daemons
+	// therefore handle only notifications addressed to their own node.
+	// Empty preserves the legacy single-box behaviour.
+	nodeName string
 
 	// trustedPublishersDir is the directory holding the per-app
 	// cosign trusted-publisher PEM files (issue #472 / ADR-054).
@@ -450,6 +456,14 @@ func (p *ociImageSignaturePuller) FetchSignature(ctx context.Context, ref, diges
 
 func (h *Handler) WithFunctionRunnerNode22(p string) *Handler {
 	h.functionRunnerNode22Path = p
+	return h
+}
+
+// WithNodeName pins the handler to a compute node identity for split-box
+// event routing. cmd/imaged wires this from FAAS_NODE_NAME, which is also
+// the identity used by builderd when it emits snapshot_boot.
+func (h *Handler) WithNodeName(name string) *Handler {
+	h.nodeName = strings.TrimSpace(name)
 	return h
 }
 
@@ -1171,6 +1185,12 @@ func (h *Handler) HandleNotification(ctx context.Context, n db.Notification) {
 			h.log.Warn("imaged: bad snapshot_boot payload", "err", err)
 			return
 		}
+		if !handlesSnapshotBoot(h.nodeName, p.NodeID) {
+			h.log.Debug("imaged: ignoring snapshot_boot for sibling node",
+				"owner_node", p.NodeID, "local_node", h.nodeName,
+				"deployment", p.DeploymentID)
+			return
+		}
 		if err := h.handleSnapshotBoot(ctx, p); err != nil {
 			h.log.Warn("imaged: snapshot boot failed", "deployment", p.DeploymentID, "err", err)
 		}
@@ -1281,6 +1301,19 @@ type snapshotWrittenPayload struct {
 type snapshotBootPayload struct {
 	AppID        string `json:"app_id"`
 	DeploymentID string `json:"deployment_id"`
+	NodeID       string `json:"node_id,omitempty"`
+}
+
+// handlesSnapshotBoot is the split-box ownership gate. The event publisher
+// and consumer both use the registered compute_node name. Empty values are
+// accepted for the legacy one-box shape; once both sides are named, a
+// notification can only be consumed by its owner. A named daemon also
+// accepts an unlabelled event during a rolling upgrade, because older
+// builderd versions did not include node_id yet.
+func handlesSnapshotBoot(localNode, ownerNode string) bool {
+	localNode = strings.TrimSpace(localNode)
+	ownerNode = strings.TrimSpace(ownerNode)
+	return localNode == "" || ownerNode == "" || localNode == ownerNode
 }
 
 // handleDeployment advances a deployment up to the point where a snapshot

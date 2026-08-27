@@ -179,6 +179,45 @@ var ErrMirrorDeploymentNotLive = errors.New("state: mirror_rules source/mirror d
 // 409 mirror_deployment_not_live).
 var ErrMirrorCrossAppMismatch = errors.New("state: mirror_rules source/mirror deployment belong to different apps")
 
+// ErrInvalidRecoverAction (issue #976 / ADR-122 / SAFE-RELEASES-R)
+// is returned by RecoverRollout when the requested action is not
+// in the closed set {"advance","promote","abort"}. The
+// handler-level closed-set check (api.AllowedRecoverRolloutAction)
+// is the primary gate; this sentinel surfaces the same condition
+// at the store layer so a caller driving the store directly
+// (e.g. the CLI's test path) gets a stable error. Translated at
+// the handler boundary to api.ErrInvalidRecoverAction (422).
+var ErrInvalidRecoverAction = errors.New("state: invalid recover_rollout action")
+
+// ErrRolloutNotStuck is returned by RecoverRollout when the
+// operator asks for action="advance" on a deployment that is NOT
+// stuck — i.e. either rollout_state is 'aborted' / 'complete' or
+// the canary_step_started_at is within the stuck-after window
+// (StuckAfterDuration in pkg/safedeploy/orchestrator.go). The CLI
+// distinguishes "fix a stuck rollout" (advance is the right call)
+// from "force-step a healthy rollout" (use promote), so this
+// sentinel exists to keep that distinction visible at the HTTP
+// boundary. Translated at the handler boundary to
+// api.ErrRolloutNotStuck (409 Conflict).
+var ErrRolloutNotStuck = errors.New("state: rollout is not stuck; use promote instead")
+
+// ErrRolloutStateInvalid is returned by RecoverRollout when the
+// deployment's rollout_state is 'complete' (already done) or
+// 'aborted' (closed). The handler is expected to translate this
+// to api.ErrRolloutStateInvalid (409 Conflict) so the CLI's
+// post-condition check is loud.
+var ErrRolloutStateInvalid = errors.New("state: rollout state does not permit recovery")
+
+// RecoverRolloutStuckAfter (issue #976 / ADR-122 / SAFE-RELEASES-R)
+// is the canned stuck-detection window the RecoverRollout method
+// uses to gate action="advance". It MUST match
+// pkg/safedeploy.StuckAfterDuration so the CLI's view of "this
+// rollout is stuck" agrees with the meterd orchestrator's view —
+// the store layer duplicates the constant (no import, to keep
+// pkg/safedeploy off pkg/state's import graph) and pins the
+// equality in tests. 30 minutes is the ADR-122 canned value.
+const RecoverRolloutStuckAfter = 30 * time.Minute
+
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
@@ -497,6 +536,14 @@ type AppErrorSampleRow struct {
 	AppErrorRequestRow
 	HeadersSample []byte // jsonb raw; handler parses to map[string]string
 	Redactions    []string
+}
+
+// ComputeNodeUsageBatcher is the optional bulk form of ComputeNodeUsedMB.
+// Placement uses it when a fleet has nodes without a fresh vmmd capacity
+// report, avoiding one SQL round trip per candidate node. It is separate from
+// Store so narrow test doubles and older integrations remain source-compatible.
+type ComputeNodeUsageBatcher interface {
+	ComputeNodeUsedMBByNode(ctx context.Context, nodeIDs []string) (map[string]int64, error)
 }
 
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
@@ -1910,6 +1957,45 @@ type Store interface {
 	// deployments_live_traffic_idx (migration 00162); MemStore
 	// iterates m.deployments filtered by status='live'.
 	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
+	// ListCanaryInFlight (issue #976 / ADR-122 / SAFE-RELEASES-A)
+	// returns every deployment row that is mid-canary: status='live'
+	// AND canary_total_steps > 0 AND canary_step < canary_total_steps
+	// AND rollout_state IN ('pending','rolling_out'). The orchestrator
+	// (pkg/safedeploy) and the canary_progression meterd tick
+	// (pkg/canary) both walk this set every tick. Empty slice when no
+	// canaries are in flight — both consumers treat (nil, nil) as a
+	// no-op.
+	ListCanaryInFlight(ctx context.Context) ([]Deployment, error)
+	// SafedeployListPendingRollouts (issue #976 / ADR-122 /
+	// SAFE-RELEASES-F) returns the orchestrator's walk set: rows
+	// whose rollout_state is 'pending' or 'rolling_out' AND
+	// canary_total_steps > 0 (rollout_state alone isn't enough —
+	// pre-F rows have rollout_state='pending' from the migration
+	// fast-default but canary_total_steps=0, meaning no canary
+	// ladder was configured and the rollout auto-completes on
+	// first wake; the orchestrator skips them). Ordered
+	// (rollout_started_at NULLS FIRST, created_at ASC) so a
+	// brand-new pending row (no started_at yet) walks before a
+	// half-finished rolling_out row — the fair-queue property the
+	// operator dashboard relies on.
+	SafedeployListPendingRollouts(ctx context.Context) ([]Deployment, error)
+	// SafedeployStampRollout (issue #976 / ADR-122 /
+	// SAFE-RELEASES-F) is the canonical atomic write the
+	// orchestrator uses to transition rollout_state. The
+	// (rollout_state, rollout_started_at, rollout_completed_at,
+	// rollout_aborted_at, rollout_aborted_reason) tuple must move
+	// together — partial writes would leave the row in a
+	// half-finished state that the next ListCanaryInFlight walk
+	// would re-pick. Implementations MUST take the same FOR
+	// UPDATE lock that UpdateDeploymentTraffic uses
+	// (deployments.id PK) so concurrent orchestrator ticks don't
+	// race on the same row.
+	//
+	// The audit row is NOT written here — the orchestrator calls
+	// AppendDeploymentAudit explicitly so the deployment_audit
+	// row carries the orchestrator's actor sentinel, not a
+	// generic state.Stamp.
+	SafedeployStampRollout(ctx context.Context, id string, state string, startedAt, completedAt, abortedAt *time.Time, abortedReason string) (Deployment, error)
 	// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique
 	// live deployment for (appID, scope). Backed by the partial
 	// UNIQUE index deployments_app_scope_live_uniq that PR-D
@@ -1973,6 +2059,44 @@ type Store interface {
 	// range-check — this method holds the FOR UPDATE lock that
 	// makes the rebalance race-free against CreateDeployment.
 	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error)
+
+	// RecoverRollout (issue #976 / ADR-122 / SAFE-RELEASES-R) is
+	// the operator manual-recovery escape hatch — the back-end
+	// counterpart of the `gregale rollouts recover <slug>` CLI
+	// subcommand. The store runs the state-machine guards + the
+	// canary-step advance + the deployment_audit emit in a single
+	// atomic transaction so a concurrent canary_progression tick
+	// (or a concurrent alert-driven action executor) cannot
+	// interleave a partial state.
+	//
+	// action ∈ {"advance", "promote", "abort"}:
+	//
+	//   - "advance": bumps canary_step by 1, stamps
+	//     canary_step_started_at = now(), redistributes the
+	//     traffic-split (largest-remainder Σ = 100). Requires the
+	//     rollout to be stuck (canary_step_started_at older than
+	//     the stuck-after window) — returns ErrRolloutNotStuck
+	//     for a healthy rollout.
+	//
+	//   - "promote": short-circuits the rollout to canary_step =
+	//     canary_total_steps and rollout_state = 'complete',
+	//     with traffic_percent = 100 on the in-flight row and 0
+	//     on the siblings. No stuck-check — promote is the
+	//     operator's "I'm sure, ship it" path.
+	//
+	//   - "abort": flips rollout_state = 'aborted',
+	//     rollout_aborted_at = now(), rollout_aborted_reason =
+	//     reason. Legal from rollout_state IN ('pending',
+	//     'rolling_out'). Emits a deployment_audit row with
+	//     kind = 'deploy.rolled_back' so the dashboard timeline
+	//     surfaces the operator's call.
+	//
+	// Returns the refreshed Deployment row + the audit row id
+	// (so the CLI can echo "audit_id=…"). Both pgstore and
+	// memstore implement the same closed-set guards + audit
+	// emit so handler tests can pin both backends to the same
+	// shape.
+	RecoverRollout(ctx context.Context, appID string, action, reason string) (Deployment, int64, error)
 
 	// MirrorRules (issue #72 / ADR-125) — per-deployment traffic-
 	// mirroring CRUD + comparison ledger reads.
@@ -2702,6 +2826,12 @@ type Store interface {
 	// (force_park / force_cold_boot carry no extra payload) but the
 	// column is reserved for future per-kind fields without a
 	// migration.
+	//
+	// traceID (PR-#TBD / C2) is the optional OTel W3C 32-char hex
+	// trace identifier stamped by the apid force-action handler.
+	// Nil leaves the column NULL. The regex CHECK at
+	// migrations/00486 enforces the format on INSERT for PgStore;
+	// MemStore validates defensively via isOTelHex32.
 	InsertOperatorIntent(
 		ctx context.Context,
 		kind OperatorIntentKind,
@@ -2710,6 +2840,7 @@ type Store interface {
 		actorID string,
 		reason string,
 		metadata json.RawMessage,
+		traceID *string,
 	) (string, error)
 	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
 	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
@@ -2756,6 +2887,31 @@ type Store interface {
 	MarkRuntimeConfigOperationBlocked(ctx context.Context, id, phase, reason string) error
 	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
 	GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error)
+
+	// OperatorIntentOutcomeMissingCounts (Obs-Meta + Trace-IDs Mega-PR / C7)
+	// powers GET /v1/admin/obs/health. Returns a map of kind → count
+	// for every operator_intents row that is "stuck running": status
+	// is still `running` but started_at is older than threshold. The
+	// map's keys cover the closed set
+	// {force_park, force_cold_boot, force_restart} plus any
+	// zero-count keys the caller asked for — caller-side
+	// initialization pins the operator-action vocabulary so the
+	// handler never has to special-case empty results.
+	OperatorIntentOutcomeMissingCounts(ctx context.Context, threshold time.Time) (map[string]int, error)
+
+	// OperatorActionTraceCompleteness (Obs-Meta + Trace-IDs Mega-PR /
+	// C7) powers GET /v1/admin/obs/health's
+	// trace_id_completeness_ratio tile. Returns a map of kind →
+	// coverage ratio (0.0–1.0) for every events row of kind
+	// LIKE 'operator.action.%' received in the last `since`
+	// window. The ratio is the count of rows where trace_id IS
+	// NOT NULL divided by the total count; when no rows match the
+	// kind, the returned value is 1.0 (vacuous truth — the
+	// completeness ratio is undefined for an empty set, and the
+	// handler surfaces that as 1.0 to avoid a misleading "0%" tile
+	// when nothing has happened in the window). Reads from events
+	// (live), NOT audit_log (FK-free post-deletion evidence copy).
+	OperatorActionTraceCompleteness(ctx context.Context, since time.Time) (map[string]float64, error)
 
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
@@ -3677,13 +3833,8 @@ type Store interface {
 	// LatestBuilderHeartbeatStats (operator-side observability
 	// mega-PR / Commit 7 — P5) is the builder_tick twin of
 	// LatestHeartbeatStats. Filters to source='builder_tick' only;
-	// the underlying writer (pkg/builderd/heartbeat.go) is deferred
-	// to a follow-up PR per the Commit 7 risk list (builderd does
-	// not currently self-register a compute_nodes row at startup).
-	// The mirror method exists today so the
-	// GET /v1/admin/obs/builder-heartbeats endpoint can land
-	// without waiting on the writer; once the writer is live, the
-	// row count goes from zero to non-zero without an API change.
+	// cmd/builderd publishes these rows independently of the build
+	// queue so idle builders remain observable.
 	LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
 
 	// QueuedBuildsCount (Commit 7 — P5) returns the number of
@@ -3716,7 +3867,21 @@ type Store interface {
 	OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error)
 
 	// Audit (append-only, spec §6.1).
+	//
+	// AppendEvent is the pre-PR-#TBD shape retained as a shim that
+	// delegates to AppendEventWithTrace(ctx, actor, kind, subject, data,
+	// nil). Existing callers — including the extensive test
+	// doubles — keep compiling without change.
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
+	// AppendEventWithTrace is the operator-obs Trace ID sibling.
+	// When traceID is non-nil it must match the regex
+	// `^[0-9a-f]{32}$` (the migration CHECK at 00486 enforces this
+	// on the `events.trace_id` column for PgStore; MemStore
+	// validates defensively at the boundary so test doubles
+	// cannot accept an invalid value). When traceID is nil the
+	// column is left NULL — the pre-PR rows + cron-fired rows
+	// without an inbound trace_id keep that shape.
+	AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
 	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
 	// wake-timeline read-side query. Filters on the jsonb

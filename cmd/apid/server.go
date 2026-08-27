@@ -1235,6 +1235,15 @@ func (s *server) handler() http.Handler {
 	// the imaged syft populator hasn't run for this build.
 	mux.HandleFunc("GET /v1/builds/{id}/sbom", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildSbom)))
 	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.rollbackApp)))))
+	// SAFE-RELEASES-R (issue #976 / ADR-122): the operator
+	// manual-rollout-recovery escape hatch. The CLI subcommand
+	// `gregale rollouts recover <slug>` is the canonical caller;
+	// the route is here for scripting + the rare on-call
+	// operator who hits the apid directly. State-machine
+	// guards (advance/promote/abort) live in
+	// store.RecoverRollout and the closed-set error mapping
+	// lives in cmd/apid/handlers_rollouts.go.
+	mux.HandleFunc("POST /v1/apps/{slug}/rollouts/recover", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.recoverRollout)))))
 	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.parkApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.wakeApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.renameApp)))))
@@ -1588,6 +1597,16 @@ func (s *server) handler() http.Handler {
 	// not currently self-register a compute_nodes row at startup.
 	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
+	// Obs-Meta + Trace-IDs Mega-PR / C7 — meta-obs health
+	// endpoint. Answers the operator's "is the obs stack itself
+	// healthy?" question: a JSON snapshot of the audit_log write
+	// counters, the operator_intent outcome-missing count, the
+	// trace_id completeness ratio, and the Prometheus alert
+	// firing count. Same two-layer gate (admin scope + MFA) as
+	// the rest of /v1/admin/obs/*; no MFA bypass for this one
+	// because the snapshot exposes alert-state metadata.
+	mux.HandleFunc("GET /v1/admin/obs/health",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsHealthHandler))))
 
 	// P2a + P2b + P2d — operator recovery primitives. All three
 	// routes mount under requireScope(admin-only) so the admin
@@ -1596,18 +1615,20 @@ func (s *server) handler() http.Handler {
 	// require ?confirm=true as a tripwire against operator
 	// fat-fingering (matches the force-drain --yes ack at
 	// commands_compute_nodes.go:249).
-	mux.HandleFunc("POST /v1/admin/instances/{id}/force-park",
-		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
-	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
-		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	mux.Handle("POST /v1/admin/instances/{id}/force-park",
+		middleware.TraceID(s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark)))))
+	mux.Handle("POST /v1/admin/apps/{slug}/force-cold-boot",
+		middleware.TraceID(s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot)))))
 	// P2d — operator recovery primitive: force-restart kills a
 	// wedged live instance + flips the deployment's latest warm +
 	// init snapshots stale so the next Wake takes the cold-boot
 	// branch. PR #1105 follow-on to PR #1099. Same auth posture
 	// (admin scope + MFA + allowlist) and ?confirm=true tripwire
-	// as force-park / force-cold-boot above.
-	mux.HandleFunc("POST /v1/admin/instances/{id}/force-restart",
-		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceRestart))))
+	// as force-park / force-cold-boot above. The TraceID middleware
+	// wraps the chain on the same axis as the two above so every
+	// inbound force-action carries the same observability trace_id.
+	mux.Handle("POST /v1/admin/instances/{id}/force-restart",
+		middleware.TraceID(s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceRestart)))))
 	// PR #1099 P2 redesign: polling endpoint for the
 	// operator_intents rows. NO MFA — mirrors getFireCronRequest
 	// at cmd/apid/handlers_fire_cron_request.go:38-83 because the

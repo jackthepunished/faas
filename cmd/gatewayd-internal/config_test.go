@@ -238,6 +238,27 @@ func TestConfig_LoadVMMDPingTLS(t *testing.T) {
 	})
 }
 
+func TestConfig_AppErrorsTargetAndTLS(t *testing.T) {
+	c := &Config{AppErrorsTarget: "tcp://apid.faas:9093"}
+	if got := c.GetAppErrorsTarget(func(string) string { return "" }); got != "tcp://apid.faas:9093" {
+		t.Fatalf("GetAppErrorsTarget = %q, want TOML target", got)
+	}
+	if got := (&Config{}).GetAppErrorsTarget(func(string) string { return "" }); got != "/run/faas/app_errors.sock" {
+		t.Fatalf("empty GetAppErrorsTarget = %q, want legacy socket", got)
+	}
+
+	tlsCfg, err := (&Config{}).LoadAppErrorsTLS()
+	if err != nil || tlsCfg != nil {
+		t.Fatalf("all-empty AppErrors TLS: cfg=%v err=%v, want nil", tlsCfg, err)
+	}
+	c.AppErrorsTLSCertPath = "/some/cert"
+	if _, err := c.LoadAppErrorsTLS(); err == nil {
+		t.Fatal("partial AppErrors TLS: expected error")
+	} else if !strings.Contains(err.Error(), "app_errors_tls_key_path") || !strings.Contains(err.Error(), "app_errors_tls_ca_path") {
+		t.Fatalf("partial AppErrors TLS error = %q, want missing field names", err)
+	}
+}
+
 // writeTLSFixtures writes a self-signed client cert + key + CA into
 // dir and returns the three paths. Used by
 // TestConfig_LoadVMMDPingTLS to exercise wire.LoadClientTLSConfigWithPrefix

@@ -396,6 +396,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		nodeInfos = append(nodeInfos, sched.ComputeNodeInfo{ID: n.ID, TargetURL: n.TargetURL})
 	}
 	vmmRouter := sched.NewVMMRouter(nodeInfos, deps.dialVMM, vmmTLS)
+	nodeRegistry := sched.NewNodeRegistry(nodes)
 
 	// Tier A3: subscribe to compute_node_changed and refresh the
 	// router's (nodeID, target_url) map on every payload. The
@@ -451,9 +452,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		switch {
 		case err == nil:
 			vmmRouter.Refresh(nodeID, row.TargetURL)
+			nodeRegistry.Refresh(row)
 			return nil
 		case errors.Is(err, state.ErrNotFound):
 			vmmRouter.Refresh(nodeID, "")
+			nodeRegistry.Remove(nodeID)
 			return nil
 		default:
 			return err
@@ -503,6 +506,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("schedd: init engine: %w", err)
 	}
 	engine.WithOpsMetrics(ops)
+	// Keep the engine's ownership scope aligned with the gRPC server,
+	// heartbeat, and floor trigger. An empty owner preserves the central
+	// scheduler's fleet-wide placement; a configured owner pins this
+	// schedd to its registered compute node.
+	engine.WithOwnerNodeID(ownerNodeID)
+	engine.WithNodeRegistry(nodeRegistry)
 	// ADR-098 PR-D: connection-aware upstream affinity. Wired
 	// when FAAS_UPSTREAM_AFFINITY=1 is set (default OFF per the
 	// cluster outline's rollout gate — flip PR-D last, one
@@ -1172,20 +1181,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// PR #114 / ADR-025 axis 3: per-node liveness sweep. Every
 	// `HeartbeatInterval` (default 30s) the heartbeat goroutine
-	// dials a fresh *VMMClient per active node via deps.dialVMM
-	// (issue #120), calls Ping, then Close — bypassing the
-	// VMMRouter cache so every heartbeat pays the dial cost and
-	// sees a fresh transport. deps.dialVMM already routes through
-	// sched.DialVMMContext → pkg/overlay (issue #120), so the
-	// heartbeat dial shares the same cross-box dial primitive as
-	// the engine without an extra adapter. On success we stamp
-	// last_heartbeat_at, on failure we flip active=false so
-	// placement skips the dead node and the alertmanager rule
-	// (PR #115) fires. Production cadence is overridable via
-	// FAAS_HEARTBEAT_INTERVAL; tests inject a sub-second interval
-	// through runDeps.heartbeatInterval to exercise the wiring.
+	// probes active nodes through a bounded worker pool. Each probe still uses a
+	// fresh *VMMClient via deps.dialVMM, but slow/dead nodes cannot serialize the
+	// fleet sweep. On success we stamp last_heartbeat_at; on failure we flip
+	// active=false so placement skips the dead node. Production cadence is
+	// overridable via FAAS_HEARTBEAT_INTERVAL; tests inject a sub-second
+	// interval through runDeps.heartbeatInterval.
 	hb := sched.NewHeartbeat(store, sched.HeartbeatDialerFunc(deps.dialVMM), vmmTLS, log).
-		WithOwnerNodeID(ownerNodeID)
+		WithOwnerNodeID(ownerNodeID).
+		WithNodeRegistry(nodeRegistry)
 	hb.Interval = cfg.HeartbeatInterval
 	hb.Staleness = cfg.HeartbeatStaleness
 	if deps.heartbeatInterval > 0 {
@@ -1210,12 +1214,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		reader,
 		ops,
 		log,
-	)
+	).WithTelemetry(engine.NodeTelemetryCache()).WithNodeRegistry(nodeRegistry)
 	// Register the gRPC server with the Reader wired so the
 	// ListInstanceStats RPC (issue #279 / PR-B) can serve the
 	// per-instance CPU-µs snapshot to meterd. The reader is
-	// populated by the poller above (200 ms cadence); a meterd
-	// call before the first tick returns an empty list.
+	// populated by the persistent capacity stream and projected locally at the
+	// poller's 200 ms cadence; a meterd call before the first stream frame
+	// returns an empty list.
 	scheddgrpc.NewWithStats(engine, reader, ops, log).
 		WithOwner(scheddgrpc.OwnerNodeID(ownerNodeID), store).
 		Register(gsrv)
@@ -1257,7 +1262,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	appDeleteSub := sched.NewAppDeleteSubscriber(engine, log)
 	loop := sched.NewLoop(pool, engine, log).
 		WithAppDeleteSubscriber(appDeleteSub).
-		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{})).
+		WithFlowCounter(sched.NewNodeAwareFlowCounter(engine.NodeTelemetryCache(), flowcount.NewReader(wire.ExecRunner{}))).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
 		// PR #74: §17 retention sweep — DELETEs STOPPED/FAILED rows older
 		// than cfg.RetentionDuration (defaults to api.DefaultInstanceRetention

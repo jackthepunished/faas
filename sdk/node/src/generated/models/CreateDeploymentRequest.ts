@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CanaryPresetSpec } from './CanaryPresetSpec.js';
 import type { CreateDeploymentOverrides } from './CreateDeploymentOverrides.js';
 import type { Sidecar } from './Sidecar.js';
 /**
@@ -52,5 +53,9 @@ export type CreateDeploymentRequest = {
    * Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false.
    */
   rollback_on_5xx?: boolean | null;
+  /**
+   * Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only.
+   */
+  canary?: (CanaryPresetSpec | null);
 };
 

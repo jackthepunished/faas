@@ -50,6 +50,7 @@ const (
 	oidcFile           = "oidc.go"            // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
 	envDiffFile        = "env_diff.go"        // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
 	operatorConfigFile = "operator_config.go" // ADR-132 — operator runtime configuration
+	obsFile            = "obs.go"             // Obs-Meta + Trace-IDs Mega-PR / C7 — operator obs backend DTOs + ObsHealthResponse
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -92,6 +93,7 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/admin/obs/builder-heartbeats":      true, // ADR-091 — operator-only (operator-side mega-PR Commit 7 / P5)
+	"GET /v1/admin/obs/health":                  true, // Obs-Meta + Trace-IDs Mega-PR / C7 — operator-only meta-obs health snapshot
 
 	// Operator-side observability mega-PR (PR #1099) P2 recovery
 	// primitives. Mirror the cmd/sdk-coverage/main.go::routeExclude
@@ -234,6 +236,76 @@ var dtoExclude = map[string]bool{
 	// pkg/state seam (state row → wire DTO). It does not cross the
 	// wire on its own.
 	"AlertPresetRow": true,
+	// Issue #777 / ADR-091 — operator observability backend DTOs
+	// are admin-only (/v1/admin/obs/*); they belong to a non-public
+	// surface and are not registered in the customer-facing OpenAPI
+	// spec. The Mega-PR #1099 shipped the DTOs but did not register
+	// the routes in api/openapi.yaml (admin surface is intentionally
+	// undocumented for public consumers). The C7 follow-on
+	// registers ONLY the new ObsHealthResponse — every other Obs*
+	// DTO stays admin-only and is excluded here.
+	"ObsOverviewResponse":             true,
+	"ObsOverviewTotals":               true,
+	"ObsOverviewRateLimited":          true,
+	"ObsOverviewNodeHealth":           true,
+	"ObsOverviewFailureKind":          true,
+	"ObsTenantRow":                    true,
+	"ObsTenantListResponse":           true,
+	"ObsTenantDetailResponse":         true,
+	"ObsTenantApp":                    true,
+	"ObsTenantOrg":                    true,
+	"ObsTenantCounts":                 true,
+	"ObsNodeRow":                      true,
+	"ObsNodeListResponse":             true,
+	"ObsHeartbeatListResponse":        true,
+	"ObsWakeLatencyQuantile":          true,
+	"ObsNodeWakeLatencyResponse":      true,
+	"ObsHeartbeatRow":                 true,
+	"ObsAnomalyRow":                   true,
+	"ObsAnomalyListResponse":          true,
+	"ObsRateLimitDurableRow":          true,
+	"ObsRateLimitLiveRow":             true,
+	"ObsRateLimitResponse":            true,
+	"ObsAuditLogSearchResponse":       true,
+	"ObsAuditLogRow":                  true,
+	"ObsEventListResponse":            true,
+	"ObsEventRow":                     true,
+	"ObsBuilderHeartbeatListResponse": true,
+	"ObsBuilderHeartbeatRow":          true,
+	// P2d / C5/C7 mega-PR follow-on DTOs (Obs-Meta + Trace-IDs
+	// Mega-PR / PR #1111): admin-only shapes for /v1/admin/obs/*
+	// surface; intentionally undocumented for public consumers.
+	// The C7 follow-on registers ONLY the new ObsHealthResponse —
+	// every other Obs* DTO stays admin-only and is excluded here.
+	"ObsAccountMutationResponse": true,
+	"ObsAppDetail":               true,
+	"ObsAppDetailResponse":       true,
+	"ObsAppHealth":               true,
+	"ObsAuditActivityRow":        true,
+	// ADR-115 capacity PR (post-PR #1111): admin-only capacity
+	// snapshot shapes — same admin-only posture as the other
+	// Obs* DTOs above; not registered in api/openapi.yaml.
+	"ObsCapacityNode":     true,
+	"ObsCapacityResponse": true,
+	"ObsCapacitySummary":  true,
+	"ObsDeploymentRow":    true,
+	"ObsInstanceRow":      true,
+	"ObsInvocationRow":    true,
+	// ObsInvoiceSummary: PR #1099 P3 follow-on (post-PR #1111);
+	// admin-only billing summary shape.
+	"ObsInvoiceSummary":       true,
+	"ObsNodeApp":              true,
+	"ObsNodeDetailResponse":   true,
+	"ObsNodeDrainStatus":      true,
+	"ObsNodeMutationResponse": true,
+	// ObsTenant360Response / ObsTenantBilling / ObsTenantUsage*:
+	// PR #1099 P4 (post-PR #1111); admin-only tenant 360 + billing
+	// + usage shapes; intentionally undocumented.
+	"ObsTenant360Response":      true,
+	"ObsTenantActivityResponse": true,
+	"ObsTenantBilling":          true,
+	"ObsTenantUsage":            true,
+	"ObsTenantUsageApp":         true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -688,6 +760,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", oidcFile),
 		filepath.Join(root, "pkg", "api", envDiffFile),
 		filepath.Join(root, "pkg", "api", operatorConfigFile),
+		filepath.Join(root, "pkg", "api", obsFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

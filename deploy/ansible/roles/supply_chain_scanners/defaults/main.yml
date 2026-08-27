@@ -50,10 +50,10 @@ syft_release:
 # images/* Dockerfiles' apt-install precedent.
 install_root: /usr/local
 
-# Shared read-only database path consumed by the hardened imaged unit. The
-# role refreshes it as root during provisioning; imaged only needs group-read
-# access at runtime and must not fall back to a home-directory cache hidden by
-# ProtectHome=strict.
+# Shared database path consumed by the hardened imaged unit. The role refreshes
+# it as root during provisioning, while imaged may also refresh an expired DB
+# at scan time. Keeping the cache on an explicit systemd/Ansible write path
+# avoids a stale database turning every deployment into a scan failure.
 grype_db_cache_dir: /var/lib/faas/grype
 
 # arch is overridable for an arm64 dev box (Lima / Mac) so the

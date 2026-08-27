@@ -12,28 +12,91 @@ import (
 
 const snapshotReplicaRetryDelay = 5 * time.Second
 
-// EnqueueSnapshotReplicasForNode is the reconciliation half of snapshot
-// fan-out. It is safe to run at every worker tick and also repairs jobs missed
-// while a node or schedd was offline.
+// EnqueueSnapshotReplicasForNode consumes the global snapshot fan-out event
+// stream for one node. The cursor makes the normal path proportional to new
+// snapshots rather than to the complete snapshots table. It is safe to call
+// on every worker tick and also repairs jobs missed while a node or schedd
+// was offline.
 func (s *PgStore) EnqueueSnapshotReplicasForNode(ctx context.Context, nodeID string) (int, error) {
 	if nodeID == "" {
 		return 0, errors.New("state: enqueue snapshot replicas: node_id required")
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The cursor must never advance past an event that was visible to the
+	// max(id) query but not to the INSERT query. A repeatable-read snapshot
+	// makes both statements observe the same event set; an event committed
+	// concurrently is picked up on the next worker tick.
+	if _, err := tx.Exec(ctx, `set transaction isolation level repeatable read`); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas isolation: %w", err)
+	}
+
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		select active from compute_nodes where id = $1`, nodeID).Scan(&active); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("state: enqueue snapshot replicas node lookup: %w", err)
+	}
+	if !active {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf("state: enqueue snapshot replicas inactive commit: %w", err)
+		}
+		return 0, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		insert into snapshot_replica_cursors (node_id)
+		values ($1)
+		on conflict (node_id) do nothing`, nodeID); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas cursor init: %w", err)
+	}
+	var lastEventID int64
+	if err := tx.QueryRow(ctx, `
+		select last_event_id
+		  from snapshot_replica_cursors
+		 where node_id = $1
+		 for update`, nodeID).Scan(&lastEventID); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas cursor read: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
 		insert into snapshot_replicas (snapshot_id, node_id, region)
-		select sn.id, cn.id, coalesce(cn.region, '')
-		from snapshots sn
-		cross join compute_nodes cn
-		left join snapshot_origins so on so.snapshot_id = sn.id
-		where cn.id = $1
-		  and cn.active = true
-		  and sn.stale = false
-		  and sn.storage_key <> ''
-		  and (so.snapshot_id is null or so.region = '' or so.region = coalesce(cn.region, ''))
-		  and (so.snapshot_id is null or so.node_id is null or so.node_id <> cn.id)
-		on conflict (snapshot_id, node_id) do nothing`, nodeID)
+		select e.snapshot_id, cn.id, coalesce(cn.region, '')
+		  from snapshot_fanout_events e
+		  join snapshots sn on sn.id = e.snapshot_id
+		  cross join compute_nodes cn
+		  left join snapshot_origins so on so.snapshot_id = sn.id
+		 where e.id > $2
+		   and cn.id = $1
+		   and cn.active = true
+		   and sn.stale = false
+		   and sn.storage_key <> ''
+		   and (so.snapshot_id is null or so.region = '' or so.region = coalesce(cn.region, ''))
+		   and (so.snapshot_id is null or so.node_id is null or so.node_id <> cn.id)
+		on conflict (snapshot_id, node_id) do nothing`, nodeID, lastEventID)
 	if err != nil {
 		return 0, fmt.Errorf("state: enqueue snapshot replicas for %s: %w", nodeID, err)
+	}
+	var latestEventID int64
+	if err := tx.QueryRow(ctx, `
+		select coalesce(max(id), $1)
+		  from snapshot_fanout_events
+		 where id > $1`, lastEventID).Scan(&latestEventID); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas cursor advance: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		update snapshot_replica_cursors
+		   set last_event_id = $2, updated_at = now()
+		 where node_id = $1`, nodeID, latestEventID); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas cursor update: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("state: enqueue snapshot replicas commit: %w", err)
 	}
 	return int(tag.RowsAffected()), nil
 }

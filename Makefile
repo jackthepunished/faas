@@ -531,6 +531,11 @@ ansible-preflight: ## Gather and validate peer facts before a role-limited bare-
 ansible-syntax-check: ## Validate the bare-metal Ansible playbooks with the production config
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml --syntax-check
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --syntax-check
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/scale_check.yml --syntax-check
+
+.PHONY: manifest-scale-check
+manifest-scale-check: ## Validate manifest/Ansible generation at 1, 10, 100, and 1000 compute nodes
+	GREGALE_ANSIBLE_SCALE_CHECK=1 $(GO) test -count=1 -timeout=5m ./pkg/manifest ./cmd/gregalectl -run 'Test(FleetValidateComputeNodeScale|RenderManifestAnsibleFiles_ScaleMatrix)$$'
 
 .PHONY: tidy
 tidy: ## go mod tidy

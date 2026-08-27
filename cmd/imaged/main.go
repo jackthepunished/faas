@@ -356,6 +356,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
+		WithNodeName(os.Getenv("FAAS_NODE_NAME")).
 		WithStorage(storageBackend).
 		WithRuntimeBaseStaging().
 		WithArtifactReplicator(artifactReplicator).

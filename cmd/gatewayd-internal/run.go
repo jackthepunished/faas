@@ -1463,6 +1463,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 // Production calls run → runWithDeps(defaultDeps()); tests inject a custom
 // deps.listen so they can probe a real socket without binding :8080.
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	cfg := deps.config
+	if cfg == nil {
+		cfg = &Config{}
+	}
 	// DEPLOY-1 / ADR-075 capdecl gate. gatewayd-internal is
 	// unprivileged — no Allow, no Deny. The HTTP/1.1 listener,
 	// the gRPC egress sink, the schedd dial, the vmmd dial and
@@ -2089,8 +2093,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// ADR-096: customer-facing automatic error grouping writer
 	// path. gatewayd-internal records every 4xx/5xx response on
-	// the public edge and ships batches to apid via the
-	// unix-socket gRPC IncrementAppError streaming RPC. apid is
+	// the public edge and ships batches to apid via the AppErrors gRPC
+	// IncrementAppError streaming RPC. The target is a local Unix socket
+	// on one-box deployments and a private mTLS endpoint in split-box mode.
+	// apid is
 	// the sole writer to app_errors / app_error_requests
 	// (CLAUDE.md ownership); the gateway never opens a direct
 	// Postgres connection for this store.
@@ -2103,22 +2109,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cost beyond a single int compare) and the publisher
 	// goroutine is NOT started.
 	//
-	// apid socket: defaults to /run/faas/apid.sock (the
-	// ADR-015 unix-socket DAC convention shared with schedd +
-	// vmmd). Operators override via FAAS_APID_SOCKET when the
-	// socket path diverges (containerised deployments, etc).
+	// The legacy AppErrors socket defaults to /run/faas/app_errors.sock
+	// (the ADR-015 unix-socket DAC convention shared with schedd + vmmd).
+	// Split-box manifests provide app_errors_target and its client mTLS
+	// paths in gatewayd.toml.
 	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") != "false"
-	apidAppErrorsSock := osGetenv("FAAS_APID_APP_ERRORS_SOCKET")
-	if apidAppErrorsSock == "" {
-		apidAppErrorsSock = "/run/faas/app_errors.sock"
+	apidAppErrorsTarget := cfg.GetAppErrorsTarget(osGetenv)
+	appErrorsTLS, appErrorsTLSErr := cfg.LoadAppErrorsTLS()
+	if appErrorsTLSErr != nil {
+		return fmt.Errorf("gatewayd: load app errors TLS: %w", appErrorsTLSErr)
 	}
 	if appErrorsEnabled && deps.opsMetrics != nil {
 		// Build the recorder + publisher; wire the publisher
 		// goroutine; wrap the public handler with the
 		// recorder's middleware.
-		cli, dialErr := apidgrpc.DialContext(ctx, apidAppErrorsSock, nil)
+		cli, dialErr := apidgrpc.DialContext(ctx, apidAppErrorsTarget, appErrorsTLS)
 		if dialErr != nil {
-			log.Warn("app_errors: apid socket dial failed; recorder disabled", "err", dialErr)
+			log.Warn("app_errors: apid target dial failed; recorder disabled", "target", apidAppErrorsTarget, "err", dialErr)
 		} else {
 			recorder := newAppErrorsRecorder(appErrorsRecorderConfig{
 				Enabled:               true,
@@ -2131,7 +2138,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			recorder.pub = publisher
 			go publisher.Run(ctx)
 			publicHandler = recorder.Middleware(publicHandler)
-			log.Info("app_errors recorder enabled", "apid_socket", apidAppErrorsSock)
+			log.Info("app_errors recorder enabled", "apid_target", apidAppErrorsTarget)
 		}
 	} else {
 		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED == \"false\")")

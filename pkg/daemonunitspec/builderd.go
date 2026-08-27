@@ -21,7 +21,9 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // builderd's ReadWritePaths= list is the load-bearing pair with the
 // role's `file:` module mkdir list — a drift between the two is
 // caught by the role's `assert every ReadWritePaths= target exists`
-// task (Deploy-tree fail-loud shape, mirrors imaged + vmmd).
+// task (Deploy-tree fail-loud shape, mirrors imaged + vmmd). The
+// content-addressed build cache is included explicitly so ProtectSystem
+// does not turn an otherwise successful build into a best-effort cache miss.
 //
 // Cross-host dep note (Mega-PR-C, issue #911 / ADR-110): builderd
 // is intentionally NOT After= faas-apid.service. apid runs only on
@@ -72,7 +74,7 @@ func UnitBuilderd() daemonunit.Unit {
 		ProtectControlGroups:  true,
 
 		ReadOnlyPaths:  []string{"/etc/faas"},
-		ReadWritePaths: []string{"/srv/fc/builder", "/srv/fc/base", "/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache"},
+		ReadWritePaths: []string{"/srv/fc/builder", "/srv/fc/base", "/var/log/faas", "/var/spool/faas", "/var/lib/faas/cache", "/var/cache/faas/builds"},
 
 		WantedBy: "multi-user.target",
 	}

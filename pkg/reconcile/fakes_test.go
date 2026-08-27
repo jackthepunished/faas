@@ -91,6 +91,25 @@ func (s *fakeStore) AppendEvent(ctx context.Context, actor, kind string, subject
 	return s.MemStore.AppendEvent(ctx, actor, kind, subject, data)
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method (audit.go::emit lifts the
+// trace_id from data and forwards it via the new sibling).
+// Same recording + delegation shape as AppendEvent above so
+// the test hooks see every audit emit regardless of which
+// entry point (AppendEvent vs AppendEventWithTrace) the
+// caller took.
+func (s *fakeStore) AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
+	s.mu.Lock()
+	s.appendEvents = append(s.appendEvents, fakeEvent{
+		Actor:   actor,
+		Kind:    kind,
+		Subject: subject,
+		Data:    data,
+	})
+	s.mu.Unlock()
+	return s.MemStore.AppendEventWithTrace(ctx, actor, kind, subject, data, traceID)
+}
+
 // CreateAccount promotes the embedded *state.MemStore.CreateAccount
 // up so the linter can see it. The staticcheck QF1008 hit on
 // "s.MemStore.CreateAccount" is the kind of noise a fake
@@ -147,6 +166,18 @@ func (noopOps) AuditWriteFailures(string) prometheus.Counter {
 }
 func (noopOps) AuditWriteFailureDuration(string) prometheus.Observer {
 	return prometheus.NewHistogram(prometheus.HistogramOpts{})
+}
+
+// AuditLogWriteTotal + AuditLogWriteFailuresTotal
+// (PR-#TBD / C5) — same no-op shape as AuditWriteFailures
+// above. The audit emit path increments these on every
+// success / failure; the reconcile tests don't assert on
+// them.
+func (noopOps) AuditLogWriteTotal(string, string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{})
+}
+func (noopOps) AuditLogWriteFailuresTotal(string, string, string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{})
 }
 
 // newFakeAuditor builds a real pkg/audit.Auditor backed by the

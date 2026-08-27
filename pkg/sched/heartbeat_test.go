@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"testing"
@@ -47,11 +48,14 @@ import (
 // keep the dial count low even on a multi-node fleet — the
 // "fresh_dial_per_tick" subtest below asserts that invariant.
 type heartbeatFakeDialer struct {
-	mu      sync.Mutex
-	dials   []string // targetURLs in Dial call order
-	dialErr map[string]error
-	pingErr map[string]error // targetURL → err returned by Ping
-	closed  int              // number of VMM clients closed by the heartbeat
+	mu        sync.Mutex
+	dials     []string // targetURLs in Dial call order
+	dialErr   map[string]error
+	pingErr   map[string]error // targetURL → err returned by Ping
+	closed    int              // number of VMM clients closed by the heartbeat
+	pingDelay time.Duration
+	active    int
+	maxActive int
 }
 
 func (h *heartbeatFakeDialer) Dial(_ context.Context, target string, _ *tls.Config) (VMM, error) {
@@ -75,8 +79,20 @@ type heartbeatFakeVMM struct {
 
 func (h *heartbeatFakeVMM) Ping(_ context.Context) (*PingOutcome, error) {
 	h.dialer.mu.Lock()
-	defer h.dialer.mu.Unlock()
-	if err, ok := h.dialer.pingErr[h.target]; ok {
+	h.dialer.active++
+	if h.dialer.active > h.dialer.maxActive {
+		h.dialer.maxActive = h.dialer.active
+	}
+	err := h.dialer.pingErr[h.target]
+	delay := h.dialer.pingDelay
+	h.dialer.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	h.dialer.mu.Lock()
+	h.dialer.active--
+	h.dialer.mu.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	return &PingOutcome{FcVersion: "1.10.0", ServerTime: time.Now()}, nil
@@ -190,6 +206,40 @@ func TestHeartbeat_HealthyNodeStampsTimestamp(t *testing.T) {
 	}
 	if !nodes[0].Active {
 		t.Error("Active flipped to false on a healthy node — false positive")
+	}
+}
+
+func TestHeartbeat_ProbesAreBoundedAndConcurrent(t *testing.T) {
+	store := state.NewMemStore()
+	for i := 0; i < 7; i++ {
+		_, err := store.CreateComputeNode(context.Background(), state.ComputeNode{
+			Name:               fmt.Sprintf("node-%d", i),
+			TargetURL:          fmt.Sprintf("tcp://10.0.0.%d:50051", i+2),
+			VPCPUs:             8,
+			MemMB:              8192,
+			MaxConcurrency:     4,
+			AdmissionCeilingMB: 4096,
+			Active:             true,
+		})
+		if err != nil {
+			t.Fatalf("CreateComputeNode: %v", err)
+		}
+	}
+	dialer := &heartbeatFakeDialer{pingErr: map[string]error{}, pingDelay: 25 * time.Millisecond}
+	h := NewHeartbeat(store, dialer, nil, nil)
+	h.Concurrency = 2
+	if err := h.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	nodes, err := store.ActiveComputeNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ActiveComputeNodes: %v", err)
+	}
+	if got := len(dialer.dials); got != len(nodes) {
+		t.Fatalf("Dial calls = %d, want %d", got, len(nodes))
+	}
+	if dialer.maxActive != 2 {
+		t.Fatalf("max concurrent pings = %d, want 2", dialer.maxActive)
 	}
 }
 

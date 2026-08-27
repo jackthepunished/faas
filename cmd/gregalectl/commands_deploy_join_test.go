@@ -223,6 +223,12 @@ func TestValidateSharedStorageEnv(t *testing.T) {
 	if err := validateSharedStorageEnv(path); err == nil || !strings.Contains(err.Error(), "CACHE_DIR") {
 		t.Fatalf("empty cache dir error = %v", err)
 	}
+	if err := os.WriteFile(path, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\nFAAS_STORAGE_CACHE_DIR=/srv/custom-cache\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSharedStorageEnv(path); err == nil || !strings.Contains(err.Error(), "managed systemd units") {
+		t.Fatalf("non-canonical cache path error = %v, want managed-unit guard", err)
+	}
 }
 
 func TestScopeDoctorNodes_IsNodeLocal(t *testing.T) {

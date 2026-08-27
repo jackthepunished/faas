@@ -944,6 +944,30 @@ type CreateDeploymentRequest struct {
 	Tag        *string `json:"tag,omitempty"`
 	DeployedBy *string `json:"deployed_by,omitempty"`
 	PRNumber   *int    `json:"pr_number,omitempty"`
+	// Canary (issue #976 / ADR-122 / SAFE-RELEASES-A). Pointer
+	// so omitted == "no canary; server-default 'none' preset"
+	// (today's behaviour preserved exactly: 100% on the new
+	// row). On a non-nil Canary the handler resolves Preset
+	// against pkg/api/canary.LookupPreset, stamps
+	// canary_preset/canary_step/canary_total_steps, and the
+	// canary_progression meterd tick walks the ladder from there.
+	// Plan-gated at Pro+ via acct.Plan.TrafficSplitAllowed()
+	// (mirrors the TrafficPercent gate at line 922-923). nil on
+	// the wire → 'none' with zero ladder.
+	Canary *CanaryPresetSpec `json:"canary,omitempty"`
+}
+
+// CanaryPresetSpec is the canary ladder a customer asks for on a
+// deploy (issue #976 / ADR-122 / SAFE-RELEASES-A). Preset is the
+// catalog name from pkg/api/canary (none/slow/balanced/aggressive/
+// 1-10-50-100). StepDurations is reserved for forward-compat —
+// customers who need a custom ladder land in a follow-up; today's
+// validator rejects any non-preset value with 400. The field is
+// exposed as a typed slice so a future preset=CUSTOM path only
+// needs to widen LookupPreset, not the DTO.
+type CanaryPresetSpec struct {
+	Preset        string          `json:"preset"`
+	StepDurations []time.Duration `json:"step_durations,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -1623,6 +1647,37 @@ type DeploymentResponse struct {
 	First5xxCount          int        `json:"first_5xx_count"`
 	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
 	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
+	// Canary ladder echo (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A). CanaryPreset is the catalog name; the
+	// handler resolves it via pkg/api/canary.LookupPreset so
+	// "1-10-50-100" surfaces as the alias of "balanced" on the
+	// wire. CanaryStep / CanaryTotalSteps are the in-progress
+	// ladder position (advanced by the canary_progression
+	// meterd tick on a wall-clock boundary). CanaryStepStartedAt
+	// is the wall-clock anchor for the current step's Duration
+	// gate. omitempty keeps pre-PR rows byte-identical to the
+	// old wire shape (every column defaulted to 'none'/0/NULL
+	// at the schema layer via PG11+ fast-default).
+	CanaryPreset        string     `json:"canary_preset,omitempty"`
+	CanaryStep          int        `json:"canary_step,omitempty"`
+	CanaryTotalSteps    int        `json:"canary_total_steps,omitempty"`
+	CanaryStepStartedAt *time.Time `json:"canary_step_started_at,omitempty"`
+	// Rollout state machine echo (issue #976 / ADR-122 /
+	// SAFE-RELEASES-F). One of pending/rolling_out/complete/
+	// aborted (closed set at deployments_rollout_state_chk).
+	// Transitions are owned by pkg/safedeploy.Orchestrator.Once
+	// (commit 5) and by the manual gregale rollouts recover
+	// CLI (commit 6). omitempty so pre-PR rows render the
+	// old wire shape (rollout_state='pending' is the
+	// fast-default zero-value but omitempty drops it because
+	// 'pending' isn't "" — the dashboard fills in from
+	// pkg/state.SerializeDeployment which always stamps the
+	// resolved value).
+	RolloutState         string     `json:"rollout_state,omitempty"`
+	RolloutStartedAt     *time.Time `json:"rollout_started_at,omitempty"`
+	RolloutCompletedAt   *time.Time `json:"rollout_completed_at,omitempty"`
+	RolloutAbortedAt     *time.Time `json:"rollout_aborted_at,omitempty"`
+	RolloutAbortedReason string     `json:"rollout_aborted_reason,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source
@@ -6286,4 +6341,83 @@ type DebugCompareResponse struct {
 type DebugReplayResponse struct {
 	MirrorInvocationID string `json:"mirror_invocation_id,omitempty"`
 	Status             string `json:"status"`
+}
+
+// ---- SAFE-RELEASES-R (issue #976 / ADR-122 / Mega PR #2 commit 6) ----
+
+// AllowedRecoverRolloutActions is the closed-set vocabulary for
+// the RecoverRolloutRequest.Action field. Mirrors the
+// cmd/gregale CLI parser's local closed-set check and the
+// handler's nil-coerced default (handler maps missing Action to
+// ErrInvalidRecoverAction at the validation boundary).
+var AllowedRecoverRolloutActions = []string{"advance", "promote", "abort"}
+
+// AllowedRecoverRolloutAction returns true iff v is a member of
+// AllowedRecoverRolloutActions. Mirrors the membership-helper
+// pattern at AllowedAlertRuleAction / AllowedAlertRuleMetric.
+func AllowedRecoverRolloutAction(v string) bool {
+	for _, a := range AllowedRecoverRolloutActions {
+		if a == v {
+			return true
+		}
+	}
+	return false
+}
+
+// RecoverRolloutRequest is the body for
+// POST /v1/apps/{slug}/rollouts/recover — the operator manual-
+// recovery escape hatch when the safedeploy orchestrator's
+// 30-min stuck-rollout detector fires and the operator wants to
+// push the canary forward (or short-circuit to 100% via promote,
+// or hard-abort). The CLI subcommand `gregale rollouts recover
+// <slug> --action advance|promote|abort --reason <text>` sends
+// this body. Plan-gated via api.Plan.TrafficSplitAllowed() —
+// Free plan returns 403.
+//
+// Action semantics (mirrors the handler-level state machine):
+//
+//   - "advance" — bump canary_step by 1 (capped at
+//     canary_total_steps - 1), stamp canary_step_started_at = now,
+//     and redistribute traffic via the existing
+//     state.UpdateDeploymentTraffic. Requires the rollout to be
+//     in {pending, rolling_out} AND the row must be stuck (>30min
+//     since canary_step_started_at). The "stuck" gate is the
+//     reason this exists — healthy rollouts advance on their own
+//     via pkg/canary; manual recovery is the operator override.
+//
+//   - "promote" — short-circuit the canary ladder to 100%
+//     traffic on the in-flight deployment + zero siblings so Σ
+//     stays 100 by construction. rollout_state flips to
+//     'complete'. Requires rollout_state ∈ {pending,
+//     rolling_out}. No stuck-check (the operator is explicitly
+//     declaring "ship it").
+//
+//   - "abort" — flip rollout_state to 'aborted', stamp
+//     rollout_aborted_at = now + the operator's reason text into
+//     rollout_aborted_reason. The deployment row stays 'live'
+//     with whatever traffic_percent it currently has (the
+//     operator is responsible for `gregale deploys rollback`
+//     if they want to fully revert). Requires rollout_state ∈
+//     {pending, rolling_out}.
+type RecoverRolloutRequest struct {
+	// Action is the closed-set verb ∈ {advance, promote, abort}.
+	Action string `json:"action"`
+	// Reason is a free-form operator note captured into the
+	// deployment_audit row's Data payload. The plan gate does
+	// NOT require a reason — but the cmd/gregale CLI marks
+	// --reason as required (operators writing a recovery note
+	// is the entire point of the audit trail).
+	Reason string `json:"reason,omitempty"`
+}
+
+// RolloutTransitionResponse is the body returned by
+// POST /v1/apps/{slug}/rollouts/recover. The Deployment carries
+// the post-transition state (rollout_state + canary_step +
+// rollout_completed_at / rollout_aborted_at). AuditID is the
+// deployment_audit row id so the operator CLI can echo it as
+// a chip on the terminal — the operator's "what happened"
+// timeline starts at this row.
+type RolloutTransitionResponse struct {
+	Deployment DeploymentResponse `json:"deployment"`
+	AuditID    string             `json:"audit_id"`
 }
