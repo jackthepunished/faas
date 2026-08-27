@@ -5,6 +5,7 @@
 import type { OperatorRuntimeConfig } from '../models/OperatorRuntimeConfig.js';
 import type { OperatorRuntimeConfigOperation } from '../models/OperatorRuntimeConfigOperation.js';
 import type { OperatorRuntimeConfigRevision } from '../models/OperatorRuntimeConfigRevision.js';
+import type { RollbackOperatorRuntimeConfigRequest } from '../models/RollbackOperatorRuntimeConfigRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -122,11 +123,7 @@ export class OperatorService {
      * Catalog key to roll back.
      */
     key: string,
-    requestBody: {
-      version: number;
-      reason: string;
-      expected_version?: number;
-    },
+    requestBody: RollbackOperatorRuntimeConfigRequest,
   }): CancelablePromise<OperatorRuntimeConfig> {
     return __request(OpenAPI, {
       method: 'POST',
