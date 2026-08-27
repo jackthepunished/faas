@@ -64,7 +64,7 @@ var ErrOperatorIntentNotFound = errors.New("state: operator intent not found")
 // trace_id stamped by the apid force-action handler (lifted off
 // the inbound HTTP request by middleware.TraceID). Nil leaves
 // the column NULL — same shape as the pre-PR rows. The regex
-// CHECK at migrations/00469 enforces the format on INSERT; an
+// CHECK at migrations/00472 enforces the format on INSERT; an
 // invalid value surfaces as SQLSTATE 23514 to the caller.
 func (s *PgStore) InsertOperatorIntent(
 	ctx context.Context,

@@ -9588,7 +9588,7 @@ func (m *MemStore) AppendEvent(ctx context.Context, actor, kind string, subject 
 // mirror with an optional OTel W3C 32-char hex trace_id. The hex
 // format is validated defensively at the boundary so test doubles
 // cannot accept an invalid value (mirrors the migration CHECK at
-// 00469 for PgStore). When traceID is nil the field is left nil.
+// 00472 for PgStore). When traceID is nil the field is left nil.
 func (m *MemStore) AppendEventWithTrace(_ context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -9617,7 +9617,7 @@ func (m *MemStore) AppendEventWithTrace(_ context.Context, actor, kind string, s
 // isOTelHex32 returns true when s is exactly 32 lowercase hex
 // characters (the OTel W3C trace-id format enforced by the
 // events.trace_id / operator_intents.trace_id CHECK constraints
-// at migrations/00469). Used by MemStore.AppendEventWithTrace to
+// at migrations/00472). Used by MemStore.AppendEventWithTrace to
 // mirror the migration's invariant without a Postgres round-trip.
 func isOTelHex32(s string) bool {
 	if len(s) != 32 {
