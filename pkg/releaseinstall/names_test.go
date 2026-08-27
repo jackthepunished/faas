@@ -33,8 +33,8 @@ func TestSupportBinaryNames_Stable(t *testing.T) {
 			t.Errorf("SupportBinaryNames[%d] = %q, want %q", i, second[i], first[i])
 		}
 	}
-	// The five canonical support binaries — every release ships these.
-	want := []string{"gregale", "gregalectl", "init", "vmmd-raw-bridge", "vmmd-stream-bridge"}
+	// The six canonical support binaries — every release ships these.
+	want := []string{"gregale", "gregalectl", "init", "schedd-brokerq-apply", "vmmd-raw-bridge", "vmmd-stream-bridge"}
 	for _, name := range want {
 		found := false
 		for _, got := range first {

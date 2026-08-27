@@ -64,6 +64,11 @@ func fakeBinDir(t *testing.T) (binDir, releasesRoot, gitSHA, manifestHash string
 			t.Fatalf("write daemon %s: %v", name, err)
 		}
 	}
+	for _, name := range releaseinstall.SupportBinaryNames() {
+		if err := os.WriteFile(filepath.Join(binDir, name), deterministicBody(name), 0o755); err != nil {
+			t.Fatalf("write support binary %s: %v", name, err)
+		}
+	}
 	return binDir, root, gitSHA, manifestHash
 }
 
@@ -181,6 +186,38 @@ func TestTarball_Build_EmbedsManifest(t *testing.T) {
 	if embedded.GitSHA != gitSHA || embedded.ManifestHash != manifestHash {
 		t.Fatalf("embedded identity = (%s, %s), want (%s, %s)", embedded.GitSHA, embedded.ManifestHash, gitSHA, manifestHash)
 	}
+}
+
+func TestTarball_Build_IncludesScheddBrokerQHelper(t *testing.T) {
+	_, root, gitSHA, manifestHash := fakeBinDir(t)
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Unix(1_700_000_000, 0).UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	if _, ok := tb.Manifest.ToolHashes["schedd-brokerq-apply"]; !ok {
+		t.Fatalf("manifest tool_hashes does not include schedd-brokerq-apply: %v", tb.Manifest.ToolHashes)
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(tb.Packed))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, nextErr := tr.Next()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			t.Fatalf("tar next: %v", nextErr)
+		}
+		if hdr.Name == "schedd-brokerq-apply" {
+			return
+		}
+	}
+	t.Fatal("canonical tarball does not contain schedd-brokerq-apply")
 }
 
 func TestTarball_LegacyUnhashedGuestInitIsAccepted(t *testing.T) {
