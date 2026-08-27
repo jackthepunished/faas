@@ -80,6 +80,20 @@ func (f *flushCounter) AppendEvent(ctx context.Context, actor, kind string, subj
 	return nil
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method; delegate to the wrapped Store and
+// increment the counter so the test's metric assertions stay
+// aligned regardless of which sibling was called.
+func (f *flushCounter) AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
+	if err := f.Store.AppendEventWithTrace(ctx, actor, kind, subject, data, traceID); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.count++
+	return nil
+}
+
 func (f *flushCounter) Count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -96,6 +110,12 @@ type failingFlushStore struct {
 
 func (failingFlushStore) AppendEvent(_ context.Context, _, _ string, _ *string, _ []byte) error {
 	return errors.New("simulated failed-login AppendEvent failure")
+}
+
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method.
+func (failingFlushStore) AppendEventWithTrace(_ context.Context, _, _ string, _ *string, _ []byte, _ *string) error {
+	return errors.New("simulated failed-login AppendEventWithTrace failure")
 }
 
 func newStubFailedOps() *stubFailedOps {

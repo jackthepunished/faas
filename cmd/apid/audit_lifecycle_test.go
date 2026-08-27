@@ -46,6 +46,12 @@ func (failingAppendStore) AppendEvent(_ context.Context, _, _ string, _ *string,
 	return errFailingAppend
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method.
+func (failingAppendStore) AppendEventWithTrace(_ context.Context, _, _ string, _ *string, _ []byte, _ *string) error {
+	return errFailingAppend
+}
+
 var errFailingAppend = failingAppendError{"simulated AppendEvent failure"}
 
 type failingAppendError struct{ msg string }

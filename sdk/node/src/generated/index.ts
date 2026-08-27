@@ -195,6 +195,7 @@ export type { MirrorRuleListResponse } from './models/MirrorRuleListResponse.js'
 export type { MirrorRuleResponse } from './models/MirrorRuleResponse.js';
 export type { MirrorSummaryResponse } from './models/MirrorSummaryResponse.js';
 export type { OAuthProviderCapability } from './models/OAuthProviderCapability.js';
+export type { ObsHealthResponse } from './models/ObsHealthResponse.js';
 export type { OIDCExchangeRequest } from './models/OIDCExchangeRequest.js';
 export type { OIDCExchangeResponse } from './models/OIDCExchangeResponse.js';
 export type { OperatorIntentAcceptedResponse } from './models/OperatorIntentAcceptedResponse.js';

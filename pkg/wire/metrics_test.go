@@ -2076,3 +2076,111 @@ func TestOpsMetrics_ObserveDeployStageDuration(t *testing.T) {
 		}
 	}
 }
+
+// TestOpsMetrics_AuditLogWriteTotalPreInstantiated
+// (PR-#TBD / C5) — the audit_log_write_total counter must
+// surface every (endpoint, kind) combination from the closed
+// sets in /metrics from boot. The /v1/admin/obs/health
+// endpoint reads this counter via PromQL; if any combination
+// is absent at boot the resulting sum(increase(...)) line
+// surfaces as NaN (no data) rather than 0 — which a
+// dashboard panel interprets as "no traffic" rather than
+// "100% broken". Pre-instantiation at boot is the load-
+// bearing pattern (precedent: activePassiveFailovers,
+// standbyState, pgBackupLastPushed in this file).
+func TestOpsMetrics_AuditLogWriteTotalPreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+	endpoints := []string{"apid", "schedd", "meterd", "gatewayd-internal"}
+	kinds := []string{
+		"force_park", "force_cold_boot", "force_restart",
+		"force_park.outcome", "force_cold_boot.outcome",
+		"force_restart.outcome", "other",
+	}
+	for _, e := range endpoints {
+		for _, k := range kinds {
+			want := fmt.Sprintf(`apid_audit_log_write_total{endpoint=%q,kind=%q} 0`, e, k)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated row %q in:\n%s", want, body)
+			}
+		}
+	}
+}
+
+// TestOpsMetrics_AuditLogWriteTotalNilSafe (PR-#TBD / C5) —
+// the per-(endpoint, kind) accessor must be nil-safe so the
+// pkg/audit emit path can be called from a test harness that
+// hasn't wired OpsMetrics. Precedent: PgBackupLastPushedNilSafe
+// at metrics_test.go:196-201.
+func TestOpsMetrics_AuditLogWriteTotalNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.AuditLogWriteTotal("apid", "force_park"); got != nil {
+		t.Errorf("nil receiver returned non-nil counter: %v", got)
+	}
+	if got := m.AuditLogWriteFailuresTotal("apid", "force_park", "sqlstate_23514"); got != nil {
+		t.Errorf("nil receiver returned non-nil counter: %v", got)
+	}
+}
+
+// TestOpsMetrics_AuditLogWriteTotalInc (PR-#TBD / C5) —
+// round-trip the counter through .Inc() and confirm the
+// /metrics scrape reflects the increment. Mirrors the
+// TestOpsMetrics_EgressDenyIncrement pattern at
+// metrics_test.go:359-371.
+func TestOpsMetrics_AuditLogWriteTotalInc(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.AuditLogWriteTotal("apid", "force_park").Inc()
+	m.AuditLogWriteTotal("apid", "force_park").Inc()
+	body := render(t, m)
+	want := `apid_audit_log_write_total{endpoint="apid",kind="force_park"} 2`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected counter increment to surface:\n%s\nwant: %s", body, want)
+	}
+}
+
+// TestOpsMetrics_AuditLogWriteFailuresTotalPreInstantiated
+// (PR-#TBD / C5) — the failure counter's full label grid
+// (endpoint × kind × error_class) must surface at boot.
+// error_class is the SQLSTATE-derived closed set: 23514
+// (check_violation), 23505 (unique_violation), timeout, and
+// "other" overflow.
+func TestOpsMetrics_AuditLogWriteFailuresTotalPreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+	endpoints := []string{"apid", "schedd", "meterd", "gatewayd-internal"}
+	kinds := []string{"force_park", "force_cold_boot", "force_restart", "other"}
+	errClasses := []string{"sqlstate_23514", "sqlstate_23505", "timeout", "other"}
+	for _, e := range endpoints {
+		for _, k := range kinds {
+			for _, ec := range errClasses {
+				want := fmt.Sprintf(`apid_audit_log_write_failures_total{endpoint=%q,error_class=%q,kind=%q} 0`, e, ec, k)
+				if !strings.Contains(body, want) {
+					t.Errorf("missing pre-instantiated row %q in:\n%s", want, body)
+				}
+			}
+		}
+	}
+}
+
+// TestOpsMetrics_SetOperatorActionTraceCompleteness
+// (PR-#TBD / C5) — the per-kind gauge accepts Set values
+// in [0.0, 1.0] and round-trips through /metrics. The gauge
+// is set by the schedd 60s completeness tick from
+// pkg/sched/operator_intent_completeness.go.
+func TestOpsMetrics_SetOperatorActionTraceCompleteness(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.SetOperatorActionTraceCompleteness("force_park", 0.95)
+	body := render(t, m)
+	want := `schedd_operator_action_trace_completeness_ratio{kind="force_park"} 0.95`
+	if !strings.Contains(body, want) {
+		t.Errorf("gauge did not surface Set value:\n%s\nwant: %s", body, want)
+	}
+}
+
+// TestOpsMetrics_SetOperatorActionTraceCompletenessNilSafe
+// (PR-#TBD / C5) — accessor must be nil-safe.
+func TestOpsMetrics_SetOperatorActionTraceCompletenessNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	// Must not panic.
+	m.SetOperatorActionTraceCompleteness("force_park", 1.0)
+}

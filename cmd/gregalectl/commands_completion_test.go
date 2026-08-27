@@ -38,6 +38,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"dispatchDeploy":       "deploy",        // PR-B (multi-host scale-out gap #2)
 		"dispatchInstances":    "instances",     // P2 of operator-obs mega-PR (Commit 5b)
 		"dispatchBuilds":       "builds",        // P2c of operator-obs mega-PR (Commit 5c)
+		"dispatchObs":          "obs",           // Obs-Meta + Trace-IDs Mega-PR / C8 — operator-side meta-obs health snapshot
 	}
 	caseNames, err := extractMainCaseArms(dispatchConsts)
 	if err != nil {

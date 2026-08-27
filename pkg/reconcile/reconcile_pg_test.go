@@ -64,6 +64,18 @@ func (pgNoopOps) AuditWriteFailureDuration(string) prometheus.Observer {
 	return prometheus.NewHistogram(prometheus.HistogramOpts{})
 }
 
+// AuditLogWriteTotal + AuditLogWriteFailuresTotal
+// (PR-#TBD / C5) — same no-op shape as the existing two
+// methods. The reconcile-pg tests don't assert on these
+// counters; the audit emit path increments them as a
+// side-effect of every emit.
+func (pgNoopOps) AuditLogWriteTotal(string, string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{})
+}
+func (pgNoopOps) AuditLogWriteFailuresTotal(string, string, string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{})
+}
+
 func countAuditRows(t *testing.T, pool *pgxpool.Pool, kind string) int {
 	t.Helper()
 	var n int

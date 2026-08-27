@@ -28,6 +28,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"reflect"
 	"time"
@@ -47,9 +48,16 @@ import (
 // AccountID label cardinality is bounded by the bounded-admission
 // helper upstream of the counter (pkg/wire); empty input collapses to
 // "anonymous" and overflow collapses to "__other__".
+//
+// PR-#TBD / C5 added AuditLogWriteTotal and
+// AuditLogWriteFailuresTotal so /v1/admin/obs/health can
+// report 5-minute write throughput + failure rates. The
+// audit emit site is the only incrementer.
 type Ops interface {
 	AuditWriteFailures(accountID string) prometheus.Counter
 	AuditWriteFailureDuration(result string) prometheus.Observer
+	AuditLogWriteTotal(endpoint, kind string) prometheus.Counter
+	AuditLogWriteFailuresTotal(endpoint, kind, errorClass string) prometheus.Counter
 }
 
 // Auditor is the IAM-4 audit seam. Constructed once per daemon and
@@ -218,15 +226,28 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 	if data == nil {
 		data = map[string]any{}
 	}
-	if sc := oteltrace.SpanContextFromContext(ctx); sc.IsValid() {
+	if sc := oteltrace.SpanContextFromContext(ctx); sc.TraceID().IsValid() {
 		// Don't overwrite a customer-supplied trace_id (e.g. cron-fired
 		// events that synthesise a trace_id for the row). The merge
 		// falls back to the active span context only when the field
 		// is absent.
+		//
+		// PR-#TBD / fix-cluster A — gate the trace_id lift on
+		// TraceID().IsValid() alone, not the full SpanContext.IsValid().
+		// The synthetic SpanContexts that pkg/middleware.WithSpanContext
+		// and pkg/scheddgrpc.withTraceIDSpan stamp on ctx carry a
+		// valid TraceID + zero SpanID (we don't synthesise a SpanID —
+		// that would require a real tracer to be load-bearing); the
+		// OTel SDK treats a zero SpanID as invalid, so the full
+		// SpanContext.IsValid() gate would skip the lift entirely on
+		// both the HTTP and gRPC operator-action paths. Splitting the
+		// gate keeps the trace_id lift load-bearing while the span_id
+		// lift (which DOES need a valid SpanID to be meaningful) stays
+		// a no-op for synthetic contexts.
 		if _, ok := data["trace_id"]; !ok {
 			data["trace_id"] = sc.TraceID().String()
 		}
-		if _, ok := data["span_id"]; !ok {
+		if _, ok := data["span_id"]; !ok && sc.SpanID().IsValid() {
 			data["span_id"] = sc.SpanID().String()
 		}
 	}
@@ -250,8 +271,30 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 		subject = accountID
 	}
 	start := time.Now()
-	err = a.store.AppendEvent(ctx, actor, kind, subject, payload)
+	// PR-#TBD / C4 — lift the trace_id off the jsonb payload and
+	// persist it as a column on the events table (migrations/00486).
+	// The OTel-context lift at audit.go:221-232 and the explicit
+	// data["trace_id"] set by C3's schedd subscriber both write
+	// into the same map key, so this extraction captures whichever
+	// source supplied the value. A nil-typed entry (key present,
+	// value nil) is treated as nil.
+	var traceID *string
+	if v, ok := data["trace_id"].(string); ok && v != "" {
+		traceID = &v
+	}
+	err = a.store.AppendEventWithTrace(ctx, actor, kind, subject, payload, traceID)
 	dur := time.Since(start)
+	// PR-#TBD / C5 — increment the success/failure counters
+	// behind /v1/admin/obs/health. The kind label is mapped
+	// onto the closed set (auditKindClosedSet in pkg/wire);
+	// unknown kinds collapse to "other" so a typo in audit
+	// emit sites cannot blow up Prometheus cardinality. The
+	// endpoint label is taken from a.actor (the per-daemon
+	// string wired at New — apid, schedd, meterd,
+	// gatewayd-internal), pre-validated against
+	// auditEndpointClosedSet.
+	endpoint := a.actor
+	metricKind := auditKindMetricLabel(kind)
 	if a.ops != nil {
 		if err != nil {
 			a.ops.AuditWriteFailureDuration("failed").Observe(dur.Seconds())
@@ -264,6 +307,137 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 			"actor", actor, "kind", kind, "subject", subject, "err", err)
 		if a.ops != nil {
 			a.ops.AuditWriteFailures(subjectStr).Inc()
+			a.ops.AuditLogWriteFailuresTotal(endpoint, metricKind, errorClassFromErr(err)).Inc()
+		}
+	} else if a.ops != nil {
+		a.ops.AuditLogWriteTotal(endpoint, metricKind).Inc()
+	}
+}
+
+// auditKindMetricLabel maps an audit kind (free-text, e.g.
+// "operator.action.force_park" or
+// "operator.action.force_park.outcome") onto the closed metric
+// label set declared in pkg/wire.NewOpsMetrics
+// (auditKindClosedSet). Unknown kinds collapse to "other" so
+// cardinality stays bounded regardless of caller typos.
+//
+// Mapping table:
+//
+//	"operator.action.force_park"             → "force_park"
+//	"operator.action.force_cold_boot"        → "force_cold_boot"
+//	"operator.action.force_restart"          → "force_restart"
+//	"operator.action.force_park.outcome"     → "force_park.outcome"
+//	"operator.action.force_cold_boot.outcome" → "force_cold_boot.outcome"
+//	"operator.action.force_restart.outcome"  → "force_restart.outcome"
+//
+// Plus the apid request-side aliases (the apid handler emits use
+// the instance-oriented names "park_instance" and
+// "restart_instance"; schedd's outcome-side emits use the
+// verb-oriented names "force_<verb>.outcome". Both sides MUST
+// land on the same metric label so a single PromQL query can
+// join them — aliasing the instance-oriented forms onto the
+// verb-oriented labels keeps the closed set tight without
+// renaming the audit emit sites):
+//
+//	"operator.action.park_instance"          → "force_park"
+//	"operator.action.park_instance.outcome"  → "force_park.outcome"
+//	"operator.action.restart_instance"       → "force_restart"
+//	"operator.action.restart_instance.outcome" → "force_restart.outcome"
+//
+//	anything else                           → "other"
+//
+// Called from pkg/audit.Auditor.emit (PR-#TBD / C5). PR-#TBD's
+// /v1/admin/obs/health reads the resulting counters via PromQL.
+func auditKindMetricLabel(kind string) string {
+	const (
+		requestSuffix   = ".outcome"
+		verbPark        = "force_park"
+		verbColdBoot    = "force_cold_boot"
+		verbRestart     = "force_restart"
+		instancePark    = "park_instance"
+		instanceRestart = "restart_instance"
+		operatorPrefix  = "operator.action."
+	)
+	switch kind {
+	case operatorPrefix + verbPark:
+		return verbPark
+	case operatorPrefix + verbColdBoot:
+		return verbColdBoot
+	case operatorPrefix + verbRestart:
+		return verbRestart
+	case operatorPrefix + verbPark + requestSuffix:
+		return verbPark + requestSuffix
+	case operatorPrefix + verbColdBoot + requestSuffix:
+		return verbColdBoot + requestSuffix
+	case operatorPrefix + verbRestart + requestSuffix:
+		return verbRestart + requestSuffix
+	// apid request-side aliases (instance-oriented). The
+	// schedd-side outcome audit emits these via the verb-
+	// oriented forms above; aliasing keeps both surfaces on
+	// the same metric label without renaming the audit emit
+	// sites (which would break the join with intent.Kind).
+	case operatorPrefix + instancePark:
+		return verbPark
+	case operatorPrefix + instancePark + requestSuffix:
+		return verbPark + requestSuffix
+	case operatorPrefix + instanceRestart:
+		return verbRestart
+	case operatorPrefix + instanceRestart + requestSuffix:
+		return verbRestart + requestSuffix
+	default:
+		return "other"
+	}
+}
+
+// errorClassFromErr classifies a pgx / Postgres error onto the
+// closed auditLogWriteFailuresTotal error_class label set. The
+// mapping is intentionally conservative: only SQLSTATEs the
+// events / operator_intents tables actually emit at audit
+// write-time get a labelled bucket; everything else collapses
+// to "other" so an obscure transient doesn't fill a dashboard
+// panel with one-off series.
+//
+// SQLSTATE 23514 (check_violation) is the events.trace_id
+// regex at 00486 — labelled so a regression in the C4 trace_id
+// middleware surfaces as a check_violation bucket spike. SQLSTATE
+// 23505 (unique_violation) is the events.id / events.??? PK
+// races — labelled so the operator can tell the difference.
+//
+// pgx wraps pgconn.PgError values via errors.As; the function
+// is pgx-aware but does NOT depend on pgx directly to keep this
+// helper unit-testable from the audit_test package.
+func errorClassFromErr(err error) string {
+	if err == nil {
+		return "other"
+	}
+	// Probe the wrapped chain via the standard library interface
+	// (any *pgconn.PgError exposes Code() and SQLState() in the
+	// pgx v5 stack). When err is not a *pgconn.PgError, fall
+	// through to "other".
+	type sqlStater interface{ SQLState() string }
+	var s sqlStater
+	// errors.As is the cheapest reliable probe across the pgx
+	// stack; we accept the import cost once here rather than
+	// threading pgconn through the audit package's test surface.
+	if errors.As(err, &s) {
+		switch s.SQLState() {
+		case "23514":
+			return "sqlstate_23514"
+		case "23505":
+			return "sqlstate_23505"
+		case "57014", "57P01", "57P02", "57P03":
+			// statement_timeout / admin_shutdown / crash_shutdown /
+			// cannot_connect_now. Collapsed to "timeout" since the
+			// operator's response is the same: investigate the
+			// pool / database. The fine-grained labels would be
+			// nice-to-have but the bucket is closed.
+			return "timeout"
 		}
 	}
+	// ctx.DeadlineExceeded surfaces here too — match on string
+	// rather than importing context in two places.
+	if err.Error() == context.DeadlineExceeded.Error() {
+		return "timeout"
+	}
+	return "other"
 }

@@ -62,7 +62,9 @@ func pgStoreOperatorIntent(t *testing.T) (*state.PgStore, *pgxpool.Pool, context
 			started_at timestamptz NULL,
 			finished_at timestamptz NULL,
 			error text NULL,
-			snap_ids_marked_stale text[] NULL
+			snap_ids_marked_stale text[] NULL,
+			trace_id text NULL
+				CHECK (trace_id IS NULL OR trace_id ~ '^[0-9a-f]{32}$')
 		);
 		CREATE INDEX operator_intents_pending_idx
 			ON operator_intents (status, requested_at)
@@ -84,7 +86,7 @@ func TestPgStore_OperatorIntent_FullLifecycle(t *testing.T) {
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"33333333-3333-3333-3333-333333333333",
-		&acct, actor, "wedged instance", json.RawMessage(`{}`),
+		&acct, actor, "wedged instance", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -151,7 +153,7 @@ func TestPgStore_OperatorIntent_FailurePath(t *testing.T) {
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
 		"44444444-4444-4444-4444-444444444444",
-		&acct, actor, "stale snap", nil,
+		&acct, actor, "stale snap", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -193,7 +195,7 @@ func TestPgStore_OperatorIntent_NilAccountID(t *testing.T) {
 	id, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"55555555-5555-5555-5555-555555555555",
-		nil, actor, "fleet-level", json.RawMessage(`{}`),
+		nil, actor, "fleet-level", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent: %v", err)
@@ -237,7 +239,7 @@ func TestPgStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	stuckID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForcePark,
 		"66666666-6666-6666-6666-666666666666",
-		&accountID, actor, "stuck", json.RawMessage(`{}`),
+		&accountID, actor, "stuck", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(stuck): %v", err)
@@ -257,7 +259,7 @@ func TestPgStore_OperatorIntent_ReclaimStuckRunning(t *testing.T) {
 	terminalID, err := store.InsertOperatorIntent(
 		ctx, state.OperatorIntentKindForceColdBoot,
 		"77777777-7777-7777-7777-777777777777",
-		&accountID, actor, "terminal", json.RawMessage(`{}`),
+		&accountID, actor, "terminal", json.RawMessage(`{}`), nil,
 	)
 	if err != nil {
 		t.Fatalf("InsertOperatorIntent(terminal): %v", err)

@@ -39,5 +39,16 @@ export type OperatorIntentResponse = {
    * Populated for force_cold_boot and force_restart on succeeded status. Empty when no snapshots existed.
    */
   snap_ids_marked_stale?: Array<string>;
+  /**
+   * Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
+   * hex identifier shared with the inbound HTTP request
+   * and the schedd dispatch context. NULL when the row
+   * predates C4 or when the inbound request carried no
+   * trace_id (e.g. cron-fired reaper paths). Joins
+   * "this alert" ↔ "this operator action" ↔ "this
+   * schedd dispatch" on one column.
+   *
+   */
+  trace_id?: string | null;
 };
 

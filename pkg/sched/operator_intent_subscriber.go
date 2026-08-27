@@ -227,6 +227,17 @@ func (l *Loop) processOperatorIntent(ctx context.Context, intent state.OperatorI
 			"finished_at":           time.Now().UTC(),
 			"snap_ids_marked_stale": snapIDs,
 		}
+		// PR-#TBD / C3 — propagate the OTel W3C trace_id from
+		// the inbound HTTP request (apid → row) onto the
+		// terminal outcome audit row so the dashboard can join
+		// alert ↔ action ↔ outcome on one column. The existing
+		// OTel lift at pkg/audit/audit.go:221-232 also writes
+		// data["trace_id"] from a span context when present;
+		// an explicit value here wins because the audit emit
+		// happens AFTER the OTel lift runs.
+		if intent.TraceID != nil {
+			data["trace_id"] = *intent.TraceID
+		}
 		if err != nil {
 			data["error"] = err.Error()
 		}

@@ -70,7 +70,7 @@ func (s *stubSchedd) Wake(context.Context, string, string, string) (string, stri
 func (s *stubSchedd) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {
 	panic("stubSchedd.ReportActivity")
 }
-func (s *stubSchedd) ParkInstance(context.Context, string, string) error {
+func (s *stubSchedd) ParkInstance(context.Context, string, string, string) error {
 	panic("stubSchedd.ParkInstance")
 }
 func (s *stubSchedd) StreamAppLogs(context.Context, string, int64, time.Time, string, string, string) (scheddgrpc.LogStream, error) {

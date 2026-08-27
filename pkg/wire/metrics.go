@@ -1463,6 +1463,31 @@ type OpsMetrics struct {
 	// the Prometheus series count flat. Closed set pre-instantiated
 	// at boot so the panel surfaces zero from process start.
 	esmLagSeconds *prometheus.HistogramVec
+	// auditLogWriteTotal (PR-#TBD / C5): per-(endpoint, kind)
+	// counter incremented on every successful events-table
+	// append at pkg/audit.Auditor.Emit. Splits the legacy
+	// AuditWriteFailures counter along the success/failure
+	// axis so /v1/admin/obs/health can report write throughput
+	// directly. Labels: endpoint ∈ {apid, schedd, meterd,
+	// gatewayd-internal}; kind is the closed operator-action
+	// kind vocabulary (operator.action.<verb> /
+	// operator.action.<verb>.outcome for verb ∈
+	// {force_park, force_cold_boot, force_restart}) plus
+	// "other" overflow. Pre-instantiated in NewOpsMetrics.
+	auditLogWriteTotal *prometheus.CounterVec
+	// auditLogWriteFailuresTotal (PR-#TBD / C5): same label set
+	// as auditLogWriteTotal plus error_class ∈
+	// {sqlstate_23514, sqlstate_23505, timeout, other}. Same
+	// pre-instantiation grid.
+	auditLogWriteFailuresTotal *prometheus.CounterVec
+	// operatorActionTraceCompletenessRatio (PR-#TBD / C5):
+	// per-kind gauge the schedd 60s tick sets to the 5-minute
+	// ratio of operator.action.<verb>* audit rows whose
+	// trace_id column is non-NULL. Closed kind set matches
+	// auditLogWriteTotal. Lets the dashboard tile "trace_id
+	// coverage per kind" alert before a 5% drop becomes a
+	// stuck page.
+	operatorActionTraceCompletenessRatio *prometheus.GaugeVec
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -3047,6 +3072,110 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		esmLagSeconds.WithLabelValues(source, "_agg")
 	}
 	commonCollectors = append(commonCollectors, esmPollsTotal, esmRecordsConsumedTotal, esmLagSeconds)
+
+	// PR-#TBD / C5 — operator-action observability layer
+	// (PR #1106 P2d follow-on). Four new series feed the
+	// /v1/admin/obs/health endpoint (C7). Closed label sets
+	// pre-instantiated below so /metrics surfaces zero from
+	// boot.
+	//
+	// auditLogWriteTotal / auditLogWriteFailuresTotal share
+	// the same endpoint × kind grid. The grid is bounded at
+	// 4 endpoints × 7 kinds × {success, [error_class]} = a
+	// small constant. kind is the closed operator-action
+	// vocabulary: 3 verbs × {request, outcome} = 6 plus
+	// "other" overflow. The emit path routes non-operator
+	// kinds (cron, wake, deployment, etc.) to "other" so a
+	// typo in audit.emit() callers cannot blow up
+	// cardinality — the audit-log layer's bounded admission
+	// set already enforces this in spirit.
+	//
+	// Closed label sets are declared locally so they sit next
+	// to the constructors that consume them. Extending these
+	// slices also extends the pre-instantiation grid (no
+	// separate label-value to keep in sync).
+	auditEndpointClosedSet := []string{"apid", "schedd", "meterd", "gatewayd-internal"}
+	auditKindClosedSet := []string{
+		"force_park",
+		"force_cold_boot",
+		"force_restart",
+		"force_park.outcome",
+		"force_cold_boot.outcome",
+		"force_restart.outcome",
+		// apid request-side instance-oriented aliases
+		// (pkg/audit.auditKindMetricLabel maps them onto the
+		// verb-oriented labels above). The auditLogWriteTotal
+		// + auditLogWriteFailuresTotal counters are
+		// pre-instantiated for both shapes so /obs/health's
+		// join doesn't break on first emit.
+		"park_instance",
+		"park_instance.outcome",
+		"restart_instance",
+		"restart_instance.outcome",
+		"other",
+	}
+	auditErrorClassClosedSet := []string{
+		"sqlstate_23514", // check_violation (events.trace_id regex at 00486)
+		"sqlstate_23505", // unique_violation
+		"timeout",
+		"other",
+	}
+	// Shared by the operatorIntentOutcomeMissingTotal counter
+	// and the operatorActionTraceCompletenessRatio gauge. The
+	// gauge's kind-grouped query (pkg/sched.operator_intent_
+	// completeness.go::observeTraceCompletenessRatio) strips
+	// the "operator.action." prefix from raw audit kinds, so
+	// the gauge reads BOTH the verb-oriented forms (schedd
+	// outcome emits) AND the instance-oriented forms (apid
+	// request emits) — pre-instantiating both keeps the gauge
+	// grid complete. The counter pre-instantiates both too
+	// (the closed-set semantics keep cardinality bounded; the
+	// counter just stays at 0 for the instance-oriented forms
+	// since schedd never writes those — that's intentional).
+	operatorIntentKindClosedSet := []string{
+		"force_park",
+		"force_cold_boot",
+		"force_restart",
+		"park_instance",
+		"restart_instance",
+	}
+	auditLogWriteTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_audit_log_write_total",
+		Help: "Count of events-table appends the audit emit path completed, labelled by endpoint and kind. /v1/admin/obs/health reads this via PromQL `sum(increase(audit_log_write_total[5m]))` to report 5-minute throughput. Single-registry: registered on every daemon; only the audit emit site (pkg/audit.Auditor.Emit / EmitResult) increments via AuditLogWriteTotal.",
+	}, []string{"endpoint", "kind"})
+	auditLogWriteFailuresTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_audit_log_write_failures_total",
+		Help: "Count of events-table appends that failed, labelled by endpoint, kind, and error_class ∈ {sqlstate_23514, sqlstate_23505, timeout, other}. The audit emit path surfaces SQLSTATE 23514 (check_violation — the regex on events.trace_id at 00486) and 23505 (unique_violation) as labelled buckets; everything else collapses to 'other'. /v1/admin/obs/health reports the failure rate vs audit_log_write_total — a sustained non-zero failure rate implies the events table is degraded.",
+	}, []string{"endpoint", "kind", "error_class"})
+	operatorActionTraceCompletenessRatio := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_operator_action_trace_completeness_ratio",
+		Help: "5-minute trailing ratio (0.0..1.0) of operator.action.<verb>* audit rows whose events.trace_id column is non-NULL. Labelled by kind ∈ {force_park, force_cold_boot, force_restart, force_park.outcome, force_cold_boot.outcome, force_restart.outcome}. Single-registry: registered on every daemon; only schedd sets the value via SetOperatorActionTraceCompleteness (60s tick). A drop below 0.95 is the obs-coverage alert tripwire — every force-action should carry a trace_id end-to-end (PR-#TBD C1-C4 contract).",
+	}, []string{"kind"})
+	for _, endpoint := range auditEndpointClosedSet {
+		for _, kind := range auditKindClosedSet {
+			auditLogWriteTotal.WithLabelValues(endpoint, kind)
+			for _, ec := range auditErrorClassClosedSet {
+				auditLogWriteFailuresTotal.WithLabelValues(endpoint, kind, ec)
+			}
+		}
+	}
+	// Pre-instantiate the operator-action gauge for the request-side
+	// instance-oriented aliases (park_instance / restart_instance)
+	// in addition to the verb-oriented forms. No
+	// operatorIntentOutcomeMissingTotal counter is registered here
+	// anymore — the Stuck-running counter was removed in the
+	// PR-#TBD / fix-cluster E (the counter raced the safety tick
+	// AND duplicated the Store.OperatorIntentOutcomeMissingCounts
+	// surface used by the operator /obs/health endpoint; that
+	// Store method is now the single source of truth).
+	for _, kind := range operatorIntentKindClosedSet {
+		operatorActionTraceCompletenessRatio.WithLabelValues(kind)
+	}
+	commonCollectors = append(commonCollectors,
+		auditLogWriteTotal,
+		auditLogWriteFailuresTotal,
+		operatorActionTraceCompletenessRatio,
+	)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -3466,78 +3595,81 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		meterdAccountSpendEur:                meterdAccountSpendEur,
 		apidTenantSurfaceCertExpirySeconds:   apidTenantSurfaceCertExpirySeconds,
 		apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal: apidTenantSurfaceCertExpiryRefresherWalkCompleteTotal,
-		pgBackupLastPushed:                 pgBackupLastPushed,
-		ipLabels:                           newIPLabelSet(maxIPLabelValues),
-		topTenantRPS:                       topTenantRPS,
-		topAccounts:                        newTopAccountSet(topAccountSetCap),
-		throttleSecondsTotal:               throttleSecondsTotal,
-		throttleRatio:                      throttleRatio,
-		topApps:                            newTopAppSet(topAppSetCap),
-		throttleSecondsLastSeen:            newCPUThrottleLastSeen(),
-		cpuSecondsLast:                     newCPUSecondsLastSeen(),
-		cronFireNowDispatchDur:             cronFireNowDispatchDur,
-		stripePushDur:                      stripePushDur,
-		paddlePushDur:                      paddlePushDur,
-		buildDur:                           buildDur,
-		buildQueueWait:                     buildQueueWait,
-		residentGBPerCustomer:              residentGBPerCustomer,
-		billingCapExceededTotal:            billingCapExceededTotal,
-		meterdFloorAppliedTotal:            meterdFloorAppliedTotal,
-		auditOrgEvent:                      auditOrgEvent,
-		authzDenied:                        authzDenied,
-		authzAllowed:                       authzAllowed,
-		wakeIDV4Fallback:                   wakeIDV4Fallback,
-		snapshotDiskDrift:                  snapshotDiskDrift,
-		capacitySignatureRejected:          capacitySignatureRejected,
-		imagedOCIPull:                      imagedOCIPull,
-		instanceCPUPct:                     instanceCPUPct,
-		instanceRSSMB:                      instanceRSSMB,
-		instanceInflightReqs:               instanceInflightReqs,
-		instanceCPUSecondsTotal:            instanceCPUSecondsTotal,
-		instanceStatsCollectDur:            instanceStatsCollectDur,
-		instanceStatsPartialErrors:         instanceStatsPartialErrors,
-		sidecarRestartTotal:                sidecarRestartTotal,
-		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
-		scaleUpDecisions:                   scaleUpDecisions,
-		scaleDownDecisions:                 scaleDownDecisions,
-		floorReconcileDecisions:            floorReconcileDecisions,
-		floorReconcileErrors:               floorReconcileErrors,
-		floorInstancesAdmitted:             floorInstancesAdmitted,
-		scaleUpAdmitRPS:                    scaleUpAdmitRPS,
-		sseClients:                         sseClients,
-		egressDeny:                         egressDeny,
-		ociEgressDeny:                      ociEgressDeny,
-		provenanceWrites:                   provenanceWrites,
-		imageScanVulns:                     imageScanVulns,
-		deployScanDuration:                 deployScanDuration,
-		deployStageDuration:                deployStageDuration,
-		deployScanTotal:                    deployScanTotal,
-		deployScanVulns:                    deployScanVulns,
-		liveMigrationDecisions:             liveMigrationDecisions,
-		rebalanceDecisions:                 rebalanceDecisions,
-		migratingReconcileDecisions:        migratingReconcileDecisions,
-		appAtCapacityTotal:                 appAtCapacityTotal,
-		pressureReassignmentsTotal:         pressureReassignmentsTotal,
-		overflowTargetSpillHitsTotal:       overflowTargetSpillHitsTotal,
-		activePassiveFailoversTotal:        activePassiveFailoversTotal,
-		standbyState:                       standbyState,
-		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
-		deadNodeReconcileDecisions:         deadNodeReconcileDecisions,
-		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
-		storageCacheStaleFallback:          storageCacheStaleFallback,
-		apidLogsEmittedTotal:               apidLogsEmittedTotal,
-		apidLogsDroppedTotal:               apidLogsDroppedTotal,
-		egressSourceErrors:                 egressSourceErrors,
-		oauthDisabledTotal:                 oauthDisabledTotal,
-		advisoryBatchesEmittedTotal:        advisoryBatchesEmittedTotal,
-		apidStatelessAdvisoryEventsTotal:   apidStatelessAdvisoryEventsTotal,
-		apidGithubdBridgeEnqueuedTotal:     apidGithubdBridgeEnqueuedTotal,
-		githubdPathFilterTotal:             githubdPathFilterTotal,
-		wakePhaseEmitted:                   wakePhaseEmitted,
-		wakePhaseDur:                       wakePhaseDur,
-		esmPollsTotal:                      esmPollsTotal,
-		esmRecordsConsumedTotal:            esmRecordsConsumedTotal,
-		esmLagSeconds:                      esmLagSeconds,
+		pgBackupLastPushed:                   pgBackupLastPushed,
+		ipLabels:                             newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                         topTenantRPS,
+		topAccounts:                          newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:                 throttleSecondsTotal,
+		throttleRatio:                        throttleRatio,
+		topApps:                              newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:              newCPUThrottleLastSeen(),
+		cpuSecondsLast:                       newCPUSecondsLastSeen(),
+		cronFireNowDispatchDur:               cronFireNowDispatchDur,
+		stripePushDur:                        stripePushDur,
+		paddlePushDur:                        paddlePushDur,
+		buildDur:                             buildDur,
+		buildQueueWait:                       buildQueueWait,
+		residentGBPerCustomer:                residentGBPerCustomer,
+		billingCapExceededTotal:              billingCapExceededTotal,
+		meterdFloorAppliedTotal:              meterdFloorAppliedTotal,
+		auditOrgEvent:                        auditOrgEvent,
+		authzDenied:                          authzDenied,
+		authzAllowed:                         authzAllowed,
+		wakeIDV4Fallback:                     wakeIDV4Fallback,
+		snapshotDiskDrift:                    snapshotDiskDrift,
+		capacitySignatureRejected:            capacitySignatureRejected,
+		imagedOCIPull:                        imagedOCIPull,
+		instanceCPUPct:                       instanceCPUPct,
+		instanceRSSMB:                        instanceRSSMB,
+		instanceInflightReqs:                 instanceInflightReqs,
+		instanceCPUSecondsTotal:              instanceCPUSecondsTotal,
+		instanceStatsCollectDur:              instanceStatsCollectDur,
+		instanceStatsPartialErrors:           instanceStatsPartialErrors,
+		sidecarRestartTotal:                  sidecarRestartTotal,
+		cpuStatsCollectDur:                   cpuStatsCollectDurLocal,
+		scaleUpDecisions:                     scaleUpDecisions,
+		scaleDownDecisions:                   scaleDownDecisions,
+		floorReconcileDecisions:              floorReconcileDecisions,
+		floorReconcileErrors:                 floorReconcileErrors,
+		floorInstancesAdmitted:               floorInstancesAdmitted,
+		scaleUpAdmitRPS:                      scaleUpAdmitRPS,
+		sseClients:                           sseClients,
+		egressDeny:                           egressDeny,
+		ociEgressDeny:                        ociEgressDeny,
+		provenanceWrites:                     provenanceWrites,
+		imageScanVulns:                       imageScanVulns,
+		deployScanDuration:                   deployScanDuration,
+		deployStageDuration:                  deployStageDuration,
+		deployScanTotal:                      deployScanTotal,
+		deployScanVulns:                      deployScanVulns,
+		liveMigrationDecisions:               liveMigrationDecisions,
+		rebalanceDecisions:                   rebalanceDecisions,
+		migratingReconcileDecisions:          migratingReconcileDecisions,
+		appAtCapacityTotal:                   appAtCapacityTotal,
+		pressureReassignmentsTotal:           pressureReassignmentsTotal,
+		overflowTargetSpillHitsTotal:         overflowTargetSpillHitsTotal,
+		activePassiveFailoversTotal:          activePassiveFailoversTotal,
+		standbyState:                         standbyState,
+		standbyStateValue:                    StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
+		deadNodeReconcileDecisions:           deadNodeReconcileDecisions,
+		registryCredentialMarkUsedFailures:   registryCredentialMarkUsedFailures,
+		storageCacheStaleFallback:            storageCacheStaleFallback,
+		apidLogsEmittedTotal:                 apidLogsEmittedTotal,
+		apidLogsDroppedTotal:                 apidLogsDroppedTotal,
+		egressSourceErrors:                   egressSourceErrors,
+		oauthDisabledTotal:                   oauthDisabledTotal,
+		advisoryBatchesEmittedTotal:          advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal:     apidStatelessAdvisoryEventsTotal,
+		apidGithubdBridgeEnqueuedTotal:       apidGithubdBridgeEnqueuedTotal,
+		githubdPathFilterTotal:               githubdPathFilterTotal,
+		wakePhaseEmitted:                     wakePhaseEmitted,
+		wakePhaseDur:                         wakePhaseDur,
+		esmPollsTotal:                        esmPollsTotal,
+		esmRecordsConsumedTotal:              esmRecordsConsumedTotal,
+		esmLagSeconds:                        esmLagSeconds,
+		auditLogWriteTotal:                   auditLogWriteTotal,
+		auditLogWriteFailuresTotal:           auditLogWriteFailuresTotal,
+		operatorActionTraceCompletenessRatio: operatorActionTraceCompletenessRatio,
 	}
 }
 
@@ -4357,6 +4489,41 @@ func (m *OpsMetrics) AuditWriteFailureDuration(result string) prometheus.Observe
 		return nil
 	}
 	return m.auditWriteDur.WithLabelValues(result)
+}
+
+// AuditLogWriteTotal returns the per-(endpoint, kind) counter for
+// successful events-table appends (PR-#TBD / C5). endpoint ∈
+// {apid, schedd, meterd, gatewayd-internal}; kind is the closed
+// operator-action vocabulary + "other" overflow (see
+// NewOpsMetrics pre-instantiation block). nil-safe.
+func (m *OpsMetrics) AuditLogWriteTotal(endpoint, kind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditLogWriteTotal.WithLabelValues(endpoint, kind)
+}
+
+// AuditLogWriteFailuresTotal returns the per-(endpoint, kind,
+// error_class) counter for failed events-table appends
+// (PR-#TBD / C5). error_class ∈ {sqlstate_23514, sqlstate_23505,
+// timeout, other}. nil-safe.
+func (m *OpsMetrics) AuditLogWriteFailuresTotal(endpoint, kind, errorClass string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditLogWriteFailuresTotal.WithLabelValues(endpoint, kind, errorClass)
+}
+
+// SetOperatorActionTraceCompleteness sets the per-kind gauge to
+// the 5-minute trailing ratio (0.0..1.0) of operator.action.<verb>*
+// audit rows whose events.trace_id column is non-NULL (PR-#TBD /
+// C5). Set by schedd's 60s completeness tick via a single SQL
+// aggregation. nil-safe.
+func (m *OpsMetrics) SetOperatorActionTraceCompleteness(kind string, ratio float64) {
+	if m == nil {
+		return
+	}
+	m.operatorActionTraceCompletenessRatio.WithLabelValues(kind).Set(ratio)
 }
 
 // CronFireNowDispatchDuration returns the per-result observer for

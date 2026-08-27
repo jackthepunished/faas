@@ -948,6 +948,14 @@ func (f *failingAuditStore) AppendEvent(ctx context.Context, actor, kind string,
 	return &failingAuditErr{}
 }
 
+// AppendEventWithTrace (PR-#TBD / C2) — C4's audit emit path
+// routes through this method; increment the same failures
+// counter so the test's metric assertions stay aligned.
+func (f *failingAuditStore) AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error {
+	f.failures++
+	return &failingAuditErr{}
+}
+
 type failingAuditErr struct{}
 
 func (*failingAuditErr) Error() string { return "simulated AppendEvent failure" }

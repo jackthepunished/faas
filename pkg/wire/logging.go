@@ -238,3 +238,27 @@ func NewRequestID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// NewTraceID returns a 128-bit random hex string formatted as the
+// OTel W3C 32-char lowercase-hex trace_id format
+// (`^[0-9a-f]{32}$`). Migrated at 00486 to a dedicated `events.
+// trace_id` and `operator_intents.trace_id` column on the
+// operator-action observability path so the dashboard can join
+// alert ↔ action ↔ outcome on one column.
+//
+// Format choice mirrors the precedent at
+// migrations/00427_request_telemetry.sql — same regex CHECK on
+// the database side. Lives in pkg/wire so schedd / apid /
+// gatewayd all share a single source of truth (a future sibling
+// PR may add the same generator to pkg/gateway/observability).
+//
+// Failure mode identical to NewRequestID: a rand.Read failure
+// emits the all-zero trace_id rather than panicking the request
+// hot path. The CHECK on events.trace_id accepts this value
+// (it is still 32 lowercase hex chars), so an audit row's
+// trace_id column would just be all-zero — a degraded but
+// non-crashing trace. Production code never relies on the
+// all-zero value; TreatAsZeroIfFound / Sentry should track it.
+func NewTraceID() string {
+	return NewRequestID() // byte-identical shape; named for clarity.
+}

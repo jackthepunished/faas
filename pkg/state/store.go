@@ -2825,6 +2825,12 @@ type Store interface {
 	// (force_park / force_cold_boot carry no extra payload) but the
 	// column is reserved for future per-kind fields without a
 	// migration.
+	//
+	// traceID (PR-#TBD / C2) is the optional OTel W3C 32-char hex
+	// trace identifier stamped by the apid force-action handler.
+	// Nil leaves the column NULL. The regex CHECK at
+	// migrations/00486 enforces the format on INSERT for PgStore;
+	// MemStore validates defensively via isOTelHex32.
 	InsertOperatorIntent(
 		ctx context.Context,
 		kind OperatorIntentKind,
@@ -2833,6 +2839,7 @@ type Store interface {
 		actorID string,
 		reason string,
 		metadata json.RawMessage,
+		traceID *string,
 	) (string, error)
 	ClaimPendingOperatorIntent(ctx context.Context) (OperatorIntent, error)
 	MarkOperatorIntentSucceeded(ctx context.Context, id string, snapIDs []string) error
@@ -2879,6 +2886,31 @@ type Store interface {
 	MarkRuntimeConfigOperationBlocked(ctx context.Context, id, phase, reason string) error
 	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
 	GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error)
+
+	// OperatorIntentOutcomeMissingCounts (Obs-Meta + Trace-IDs Mega-PR / C7)
+	// powers GET /v1/admin/obs/health. Returns a map of kind → count
+	// for every operator_intents row that is "stuck running": status
+	// is still `running` but started_at is older than threshold. The
+	// map's keys cover the closed set
+	// {force_park, force_cold_boot, force_restart} plus any
+	// zero-count keys the caller asked for — caller-side
+	// initialization pins the operator-action vocabulary so the
+	// handler never has to special-case empty results.
+	OperatorIntentOutcomeMissingCounts(ctx context.Context, threshold time.Time) (map[string]int, error)
+
+	// OperatorActionTraceCompleteness (Obs-Meta + Trace-IDs Mega-PR /
+	// C7) powers GET /v1/admin/obs/health's
+	// trace_id_completeness_ratio tile. Returns a map of kind →
+	// coverage ratio (0.0–1.0) for every events row of kind
+	// LIKE 'operator.action.%' received in the last `since`
+	// window. The ratio is the count of rows where trace_id IS
+	// NOT NULL divided by the total count; when no rows match the
+	// kind, the returned value is 1.0 (vacuous truth — the
+	// completeness ratio is undefined for an empty set, and the
+	// handler surfaces that as 1.0 to avoid a misleading "0%" tile
+	// when nothing has happened in the window). Reads from events
+	// (live), NOT audit_log (FK-free post-deletion evidence copy).
+	OperatorActionTraceCompleteness(ctx context.Context, since time.Time) (map[string]float64, error)
 
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
@@ -3834,7 +3866,21 @@ type Store interface {
 	OperatorCapacity(ctx context.Context) (OperatorCapacitySnapshot, error)
 
 	// Audit (append-only, spec §6.1).
+	//
+	// AppendEvent is the pre-PR-#TBD shape retained as a shim that
+	// delegates to AppendEventWithTrace(ctx, actor, kind, subject, data,
+	// nil). Existing callers — including the extensive test
+	// doubles — keep compiling without change.
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
+	// AppendEventWithTrace is the operator-obs Trace ID sibling.
+	// When traceID is non-nil it must match the regex
+	// `^[0-9a-f]{32}$` (the migration CHECK at 00486 enforces this
+	// on the `events.trace_id` column for PgStore; MemStore
+	// validates defensively at the boundary so test doubles
+	// cannot accept an invalid value). When traceID is nil the
+	// column is left NULL — the pre-PR rows + cron-fired rows
+	// without an inbound trace_id keep that shape.
+	AppendEventWithTrace(ctx context.Context, actor, kind string, subject *string, data []byte, traceID *string) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
 	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
 	// wake-timeline read-side query. Filters on the jsonb

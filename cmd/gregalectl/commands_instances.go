@@ -31,6 +31,7 @@ import (
 	"os"
 
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // dispatchInstances is the dispatcher key wired into
@@ -86,12 +87,22 @@ func openScheddClientFromEnv() (*scheddgrpc.Client, func(), error) {
 // commands_compute_nodes.go:245-280. Audit row emission is the
 // apid handler's job (handlers_admin_force_park.go); this CLI
 // just drives the same RPC the meterd reaper uses.
+//
+// --trace-id (PR-#TBD / C6): optional OTel 32-char-hex
+// forwarded via the gRPC x-faas-trace-id envelope so the
+// schedd-side audit emit (operator.action.<verb>.outcome)
+// joins the CLI invocation on a single key. Empty (the
+// default) auto-generates a fresh trace_id so every CLI
+// invocation carries one — operators rely on this for
+// post-incident log stitching, and a CLI run without
+// --trace-id would create a blind spot.
 func cmdInstancesForcePark(args []string) int {
 	fs := flag.NewFlagSet("force-park", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	instanceID := fs.String("instance-id", "", "instance id (uuid) to force-park")
 	reason := fs.String("reason", "operator_force_park", "audit reason slug ([a-z0-9_]{1,64})")
 	ack := fs.Bool("yes", false, "acknowledge that the instance will be evicted from the wake path")
+	traceIDFlag := fs.String("trace-id", "", "OTel 32-char-hex trace id (auto-generated when empty)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -103,18 +114,22 @@ func cmdInstancesForcePark(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-park: --yes required (the instance will be evicted from the wake path)")
 		return 2
 	}
+	traceID := *traceIDFlag
+	if traceID == "" {
+		traceID = wire.NewTraceID()
+	}
 	cli, closeFn, err := openScheddClientFromEnv()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
-	if err := cli.ParkInstance(context.Background(), *instanceID, *reason); err != nil {
+	if err := cli.ParkInstance(context.Background(), *instanceID, *reason, traceID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-park:", err)
 		return 1
 	}
 	//nolint:errcheck // final stdout write; best-effort status line
-	fmt.Fprintf(os.Stdout, "force-parked %s reason=%s\n", *instanceID, *reason)
+	fmt.Fprintf(os.Stdout, "force-parked %s reason=%s trace_id=%s\n", *instanceID, *reason, traceID)
 	return 0
 }
 
@@ -135,12 +150,24 @@ func cmdInstancesForcePark(args []string) int {
 // request. This is the same trade-off the meterd reaper makes
 // (cmd/meterd/main.go:184-198: it triggers ParkInstance but
 // does NOT write a customer-facing audit row).
+// cmdInstancesForceColdBoot resolves --app-slug + --reason +
+// --yes, opens a state.Store via FAAS_PG_DSN, looks up the
+// app + its latest deployment (mirrors the apid handler's
+// latestDeploymentForApp), then dials schedd to call
+// ForceColdBootNextWake. Matches the meterd precedent of
+// resolving app → deployment → RPC, but dials schedd (not
+// apid) because the snap-flip primitive is schedd-internal.
+//
+// --trace-id (PR-#TBD / C6): same auto-generate-on-empty
+// contract as cmdInstancesForcePark; see that function's
+// doc-comment for the rationale.
 func cmdInstancesForceColdBoot(args []string) int {
 	fs := flag.NewFlagSet("force-cold-boot", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	appSlug := fs.String("app-slug", "", "app slug whose latest deployment will be cold-booted on next wake")
 	reason := fs.String("reason", "operator_force_cold_boot", "audit reason slug ([a-z0-9_]{1,64})")
 	ack := fs.Bool("yes", false, "acknowledge that the customer's next wake will be a cold boot")
+	traceIDFlag := fs.String("trace-id", "", "OTel 32-char-hex trace id (auto-generated when empty)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -172,20 +199,24 @@ func cmdInstancesForceColdBoot(args []string) int {
 		return 1
 	}
 
+	traceID := *traceIDFlag
+	if traceID == "" {
+		traceID = wire.NewTraceID()
+	}
 	cli, scheddClose, err := openScheddClientFromEnv()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer scheddClose()
-	snapIDs, err := cli.ForceColdBootNextWake(ctx, dep.ID)
+	snapIDs, err := cli.ForceColdBootNextWake(ctx, dep.ID, traceID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-cold-boot:", err)
 		return 1
 	}
 	//nolint:errcheck // final stdout write; best-effort status line
-	fmt.Fprintf(os.Stdout, "force-cold-boot app=%s deployment=%s reason=%s snap_ids=%v\n",
-		*appSlug, dep.ID, *reason, snapIDs)
+	fmt.Fprintf(os.Stdout, "force-cold-boot app=%s deployment=%s reason=%s trace_id=%s snap_ids=%v\n",
+		*appSlug, dep.ID, *reason, traceID, snapIDs)
 	return 0
 }
 
@@ -215,12 +246,17 @@ func cmdInstancesForceColdBoot(args []string) int {
 // at commands_compute_nodes.go:249. Without --yes the CLI
 // exits 2 with a stderr message so an operator can't fat-
 // finger the call.
+//
+// --trace-id (PR-#TBD / C6): same auto-generate-on-empty
+// contract as cmdInstancesForcePark; see that function's
+// doc-comment for the rationale.
 func cmdInstancesForceRestart(args []string) int {
 	fs := flag.NewFlagSet("force-restart", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	instanceID := fs.String("instance-id", "", "instance id (uuid) to force-restart (kill + cold-boot on next wake)")
 	reason := fs.String("reason", "operator_force_restart", "audit reason slug ([a-z0-9_]{1,64})")
 	ack := fs.Bool("yes", false, "acknowledge that the instance will be killed and the next wake will be a cold boot")
+	traceIDFlag := fs.String("trace-id", "", "OTel 32-char-hex trace id (auto-generated when empty)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -231,6 +267,10 @@ func cmdInstancesForceRestart(args []string) int {
 	if !*ack {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-restart: --yes required (the instance will be killed and the next wake will be a cold boot)")
 		return 2
+	}
+	traceID := *traceIDFlag
+	if traceID == "" {
+		traceID = wire.NewTraceID()
 	}
 	cli, closeFn, err := openScheddClientFromEnv()
 	if err != nil {
@@ -252,7 +292,7 @@ func cmdInstancesForceRestart(args []string) int {
 	// error path so the operator learns the durable signal —
 	// otherwise the CLI looks like a hard failure with no
 	// upside.
-	snapIDs, err := cli.ForceRestartInstance(context.Background(), *instanceID, *reason)
+	snapIDs, err := cli.ForceRestartInstance(context.Background(), *instanceID, *reason, traceID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl instances force-restart:", err)
 		if len(snapIDs) > 0 {
@@ -273,7 +313,7 @@ func cmdInstancesForceRestart(args []string) int {
 		return 1
 	}
 	//nolint:errcheck // final stdout write; best-effort status line
-	fmt.Fprintf(os.Stdout, "force-restart %s reason=%s snap_ids=%v\n",
-		*instanceID, *reason, snapIDs)
+	fmt.Fprintf(os.Stdout, "force-restart %s reason=%s trace_id=%s snap_ids=%v\n",
+		*instanceID, *reason, traceID, snapIDs)
 	return 0
 }
