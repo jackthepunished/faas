@@ -9,8 +9,10 @@ import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentPreviewURL } from '../models/DeploymentPreviewURL.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
+import type { RecoverRolloutRequest } from '../models/RecoverRolloutRequest.js';
 import type { RetryDeploymentRequest } from '../models/RetryDeploymentRequest.js';
 import type { RollbackRequest } from '../models/RollbackRequest.js';
+import type { RolloutTransitionResponse } from '../models/RolloutTransitionResponse.js';
 import type { ScanResult } from '../models/ScanResult.js';
 import type { SecretScanResult } from '../models/SecretScanResult.js';
 import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
@@ -264,6 +266,80 @@ export class DeploymentsService {
         401: `code: unauthorized`,
         404: `code: rollback_target_not_found — the named target_deployment_id does not match any deployment of this app (or does not exist).`,
         409: `code: no_rollback_target | rollback_target_already_live | rollback_target_snapshot_expired — rollback was rejected; see the response body for the specific code and detail.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Operator manual rollout recovery (SAFE-RELEASES-R, issue
+   * The operator escape hatch for a stuck canary rollout. Three
+   * closed-set actions:
+   *
+   * - `advance`: bumps `canary_step` by 1, stamps
+   * `canary_step_started_at = now()`, and redistributes the
+   * traffic-split (largest-remainder Σ = 100). Requires the
+   * rollout to be stuck (`canary_step_started_at` older than
+   * the canned 30-minute stuck-after window). On a healthy
+   * rollout the handler returns 409 `rollout_not_stuck`
+   * with the suggestion "use --action promote instead".
+   *
+   * - `promote`: short-circuits the rollout to
+   * `canary_step = canary_total_steps` and
+   * `rollout_state = 'complete'`, with `traffic_percent = 100`
+   * on the in-flight row + 0 on the siblings. No stuck-check;
+   * this is the operator's "I'm sure, ship it" path.
+   *
+   * - `abort`: flips `rollout_state = 'aborted'` with
+   * `rollout_aborted_reason = reason`. Legal from
+   * `rollout_state ∈ {pending, rolling_out}`. Emits a
+   * `deploy.rolled_back` audit row.
+   *
+   * Returns the post-transition Deployment + the audit row id
+   * so the operator's terminal can echo `audit_id=…`. Plan-tier
+   * gated to Pro+ (Hobby / Free get 403
+   * `plan_traffic_split_not_allowed`).
+   *
+   * @returns RolloutTransitionResponse The post-recovery deployment + audit row id.
+   * @throws ApiError
+   */
+  public static recoverRollout({
+    slug,
+    requestBody,
+    idempotencyKey,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: RecoverRolloutRequest,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<RolloutTransitionResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/rollouts/recover',
+      path: {
+        'slug': slug,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        403: `Plan tier gate tripped (Hobby / Free).`,
+        404: `code: not_found`,
+        409: `one of: rollout_not_stuck | rollout_state_invalid`,
+        422: `action ∉ {advance, promote, abort} (closed-set check).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

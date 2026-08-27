@@ -281,6 +281,11 @@ func run(args []string) int {
 		return cmdDashboard(args[1:])
 	case "rollback":
 		return cmdRollback(args[1:])
+	case "rollouts":
+		// SAFE-RELEASES-R (issue #976 / ADR-122) — operator
+		// manual-recovery escape hatch. See
+		// cmd/gregale/commands_rollouts.go.
+		return cmdRollouts(args[1:])
 	case "park":
 		return cmdPark(args[1:])
 	case "wake":

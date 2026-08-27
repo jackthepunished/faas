@@ -1235,6 +1235,15 @@ func (s *server) handler() http.Handler {
 	// the imaged syft populator hasn't run for this build.
 	mux.HandleFunc("GET /v1/builds/{id}/sbom", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildSbom)))
 	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.rollbackApp)))))
+	// SAFE-RELEASES-R (issue #976 / ADR-122): the operator
+	// manual-rollout-recovery escape hatch. The CLI subcommand
+	// `gregale rollouts recover <slug>` is the canonical caller;
+	// the route is here for scripting + the rare on-call
+	// operator who hits the apid directly. State-machine
+	// guards (advance/promote/abort) live in
+	// store.RecoverRollout and the closed-set error mapping
+	// lives in cmd/apid/handlers_rollouts.go.
+	mux.HandleFunc("POST /v1/apps/{slug}/rollouts/recover", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.recoverRollout)))))
 	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.parkApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.wakeApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.renameApp)))))

@@ -2871,6 +2871,76 @@ paths:
           description: 'one of: no_rollback_target | rollback_target_already_live | rollback_target_snapshot_expired'
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/rollouts/recover:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deployments]
+      operationId: recoverRollout
+      summary: Operator manual rollout recovery (SAFE-RELEASES-R, issue #976 / ADR-122).
+      description: |
+        The operator escape hatch for a stuck canary rollout. Three
+        closed-set actions:
+
+          - `advance`: bumps `canary_step` by 1, stamps
+            `canary_step_started_at = now()`, and redistributes the
+            traffic-split (largest-remainder Σ = 100). Requires the
+            rollout to be stuck (`canary_step_started_at` older than
+            the canned 30-minute stuck-after window). On a healthy
+            rollout the handler returns 409 `rollout_not_stuck`
+            with the suggestion "use --action promote instead".
+
+          - `promote`: short-circuits the rollout to
+            `canary_step = canary_total_steps` and
+            `rollout_state = 'complete'`, with `traffic_percent = 100`
+            on the in-flight row + 0 on the siblings. No stuck-check;
+            this is the operator's "I'm sure, ship it" path.
+
+          - `abort`: flips `rollout_state = 'aborted'` with
+            `rollout_aborted_reason = reason`. Legal from
+            `rollout_state ∈ {pending, rolling_out}`. Emits a
+            `deploy.rolled_back` audit row.
+
+        Returns the post-transition Deployment + the audit row id
+        so the operator's terminal can echo `audit_id=…`. Plan-tier
+        gated to Pro+ (Hobby / Free get 403
+        `plan_traffic_split_not_allowed`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoverRolloutRequest'
+            example: {"action": "promote", "reason": "manual-test"}
+      responses:
+        '200':
+          description: The post-recovery deployment + audit row id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RolloutTransitionResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Plan tier gate tripped (Hobby / Free).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 'one of: rollout_not_stuck | rollout_state_invalid'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: 'action ∉ {advance, promote, abort} (closed-set check).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/park:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -11342,6 +11412,59 @@ components:
           enum: [null, threshold_exceeded, first_window_expired]
           description: "Closed-set classifier for the most recent auto-rollback trigger. `threshold_exceeded` = first_5xx_count crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing the threshold (clean wake window). Closed-set is enforced at the schema layer via deployments_last_auto_rollback_reason_check."
 
+        # SAFE-RELEASES-A/F: canary ladder and durable rollout state.
+        canary_preset:
+          type: string
+          enum: [none, slow, balanced, aggressive, 1-10-50-100]
+          description: "Canary preset used by the deployment's progressive rollout. `none` preserves the default 100% deployment path."
+        canary_step:
+          type: integer
+          minimum: 0
+          description: "Current zero-based canary ladder step."
+        canary_total_steps:
+          type: integer
+          minimum: 0
+          description: "Total number of canary ladder steps; zero means no canary ladder."
+        canary_step_started_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the current canary step began."
+        rollout_state:
+          type: string
+          enum: [pending, rolling_out, complete, aborted]
+          description: "Durable rollout state used by the canary orchestrator and operator recovery path."
+        rollout_started_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which rollout processing began."
+        rollout_completed_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the rollout reached complete."
+        rollout_aborted_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp at which the rollout was aborted."
+        rollout_aborted_reason:
+          type: string
+          description: "Operator or orchestrator reason recorded when the rollout is aborted."
+
+    CanaryPresetSpec:
+      description: "Progressive canary rollout preset requested on deployment creation (issue #976 / ADR-122)."
+      type: object
+      required: [preset]
+      properties:
+        preset:
+          type: string
+          enum: [none, slow, balanced, aggressive, 1-10-50-100]
+          description: "Closed-set canary ladder catalog name."
+        step_durations:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+          description: "Optional step durations encoded as Go time.Duration nanoseconds; reserved for custom-ladder support."
+
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
       type: object
@@ -11438,6 +11561,33 @@ components:
           format: uuid
           description: "The UUID of the deployment to promote back to 'live'. Must belong to the same app as the URL slug, and must have status='superseded'. Nil/empty falls back to the most-recent superseded deployment (legacy behaviour)."
           example: "0123456789abcdef0123456789abcdef"
+
+    RecoverRolloutRequest:
+      description: "Body for POST /v1/apps/{slug}/rollouts/recover (SAFE-RELEASES-R, issue #976 / ADR-122). Closed-set `action` ∈ {advance, promote, abort}; `reason` is the operator-supplied free-text captured into the deployment_audit row's data payload."
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [advance, promote, abort]
+          description: "The recovery action. `advance` requires the rollout to be stuck (>30 min in the same canary step); `promote` short-circuits the rollout to 100% / complete; `abort` flips rollout_state='aborted'."
+          example: "promote"
+        reason:
+          type: string
+          description: "Operator-supplied reason (≤1024 chars). Lands verbatim in the deployment_audit row's data payload under the `reason` key."
+          example: "manual-test"
+
+    RolloutTransitionResponse:
+      description: "POST /v1/apps/{slug}/rollouts/recover response. The post-recovery Deployment + the audit row id (so the operator's terminal can echo audit_id=…)."
+      type: object
+      required: [deployment, audit_id]
+      properties:
+        deployment:
+          $ref: '#/components/schemas/DeploymentResponse'
+        audit_id:
+          type: string
+          description: "The deployment_audit row id (stringified so JSON-number → int64 → BigInt drift doesn't poison SDK callers)."
+          example: "42"
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."
@@ -11950,6 +12100,13 @@ components:
           type: [boolean, "null"]
           description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false."
           example: true
+
+        # SAFE-RELEASES-A: optional progressive canary preset.
+        canary:
+          oneOf:
+            - $ref: '#/components/schemas/CanaryPresetSpec'
+            - type: 'null'
+          description: "Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only."
 
     CreateDeploymentOverrides:
       description: |
