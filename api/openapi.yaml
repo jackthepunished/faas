@@ -55,7 +55,7 @@ tags:
     description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
     description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo) per app.
-- name: mirror
+  - name: mirror
     description: |
       Traffic mirroring rules (issue #72 / ADR-124 / ADR-125). Each rule
       pins a source deployment to a mirror deployment; the gateway
