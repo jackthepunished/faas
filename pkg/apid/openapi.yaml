@@ -5940,6 +5940,15 @@ paths:
                 limit_crons: 5
                 can_apply: true
                 plan_token: eyJoYXMiOiI...
+                # ADR-124 partition fields (preview surface).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected:
+                  - {name: legacy-job, root_dir: jobs/legacy, class: http, action: noop, id: 0123456789abcdef0123456789abcdef}
+                skipped:
+                  - {name: risky-migration, root_dir: jobs/migrate, class: http, action: noop}
+                removed: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -5991,6 +6000,20 @@ paths:
                   - {slug: worker, id: 0123456789abcdef0123456789abcdef}
                 scan_source: compose
                 can_apply: true
+                # ADR-124 partition fields (apply surface; mirrors
+                # PlanResponse so the CLI --show-affected render
+                # doesn't have to switch DTOs between scan and
+                # apply).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected: []
+                skipped: []
+                removed: []
+                # ADR-124 follow-up #3 — slugs that were folded in
+                # from the deployment_scope_exclusions table on this
+                # apply (operator's --persist-exclude carry-forward).
+                persisted_exclusions: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -6004,10 +6027,12 @@ paths:
       - name: slug
         in: path
         required: true
+        description: Project slug (the (account, project) namespace owning the persisted exclusion).
         schema: { type: string }
       - name: slug2
         in: path
         required: true
+        description: Excluded workload slug (the app slug persisted via a prior --persist-exclude deploy).
         schema: { type: string }
     delete:
       tags: [projects]
@@ -14361,7 +14386,7 @@ components:
         # slug1, slug2)" alongside the partition.
         persisted_exclusions:
           type: array
-          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
+          items: { type: string, description: "Slugs folded into this apply from deployment_scope_exclusions (a prior --persist-exclude deploy). Empty when the apply path took the per-deploy req.Exclude list verbatim." }
         # ADR-124 code-review fix #2 — mirrors PlanResponse.
         stale_persisted_exclusions:
           type: array

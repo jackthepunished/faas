@@ -428,6 +428,16 @@ var methodRouteMap = map[string]string{
 	"POST /v1/projects/scan": "ScanProject",
 	"POST /v1/projects":      "ApplyProjectPlan",
 
+	// ADR-124 follow-up #3 — persistent --exclude history. The
+	// auto-derivation would produce "DeleteProjectsSlugExclusionsSlug2"
+	// (Swagger-style with both path placeholders preserved); the SDK
+	// names it after the resource noun (DeploymentScopeExclusion)
+	// so the explicit map drops both slug placeholders — same
+	// convention as the edge-rules / app-webhooks / alert-rules
+	// clusters above. The delete path is the operator-undo escape
+	// hatch when a persisted slug is blocking deploys.
+	"DELETE /v1/projects/{slug}/exclusions/{slug2}": "DeleteDeploymentScopeExclusion",
+
 	// Issue #311 — gregale signup split from login (PR #786). The
 	// programmatic-auth surface is JSON-only and orthogonal to the
 	// cookie-auth /login /signup dashboard routes (which are

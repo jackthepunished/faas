@@ -6027,10 +6027,12 @@ paths:
       - name: slug
         in: path
         required: true
+        description: Project slug (the (account, project) namespace owning the persisted exclusion).
         schema: { type: string }
       - name: slug2
         in: path
         required: true
+        description: Excluded workload slug (the app slug persisted via a prior --persist-exclude deploy).
         schema: { type: string }
     delete:
       tags: [projects]
@@ -14384,7 +14386,7 @@ components:
         # slug1, slug2)" alongside the partition.
         persisted_exclusions:
           type: array
-          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
+          items: { type: string, description: "Slugs folded into this apply from deployment_scope_exclusions (a prior --persist-exclude deploy). Empty when the apply path took the per-deploy req.Exclude list verbatim." }
         # ADR-124 code-review fix #2 — mirrors PlanResponse.
         stale_persisted_exclusions:
           type: array
