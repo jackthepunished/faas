@@ -25,6 +25,7 @@ package githubd
 
 import (
 	"crypto/rand"
+	"strings"
 	"testing"
 
 	"filippo.io/age"
@@ -62,13 +63,21 @@ func newTestAgeKeypair(t *testing.T) (*age.X25519Identity, *age.X25519Recipient)
 // can assert the bytea is age-armoured (PR-C spec section
 // "End-state after PR-C", row "Install token at rest").
 //
-// maxValueBytes=256 mirrors production's maxInstallTokenBytes.
+// maxValueBytes mirrors production's maxInstallTokenBytes.
 func sealForTest(t *testing.T, recipient *age.X25519Recipient, token string) ([]byte, error) {
 	t.Helper()
 	if recipient == nil {
 		t.Fatalf("sealForTest: nil recipient")
 	}
-	return secretbox.SealOne(recipient, installTokenTestSealKey, token, 256)
+	return secretbox.SealOne(recipient, installTokenTestSealKey, token, maxInstallTokenBytes)
+}
+
+func TestSealForTestAllowsProviderTokenHeadroom(t *testing.T) {
+	_, recipient := newTestAgeKeypair(t)
+	token := "ghs_" + strings.Repeat("x", 1024)
+	if _, err := sealForTest(t, recipient, token); err != nil {
+		t.Fatalf("seal provider-sized installation token: %v", err)
+	}
 }
 
 // _ pins crypto/rand so gofmt/goimports doesn't drop it during a

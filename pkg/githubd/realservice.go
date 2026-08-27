@@ -48,11 +48,13 @@ const defaultProductionBranch = "main"
 // The unseal path in ensureInstallToken matches this key exactly.
 const installTokenSealKey = "GITHUB_INSTALL_TOKEN"
 
-// maxInstallTokenBytes bounds the install-token length before
-// sealing. GitHub's install tokens are ~100 bytes today; 256 gives
-// 2× headroom for future format changes without allowing a runaway
-// token to bloat the durable row.
-const maxInstallTokenBytes = 256
+// maxInstallTokenBytes bounds the provider-issued install-token length
+// before sealing. GitHub installation tokens are opaque credentials and
+// their length is not a stable API contract; the previous 256-byte cap
+// rejected a valid token during the live OAuth callback. Keep a defensive
+// bound, but leave enough room for provider format changes without allowing
+// an unexpectedly large response to bloat the durable row.
+const maxInstallTokenBytes = 4 << 10
 
 // tokenRefreshSkew is the lead-time ensureInstallToken uses to
 // decide "is the sealed token still good, or should I re-mint?".
