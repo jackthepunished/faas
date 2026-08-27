@@ -1,16 +1,17 @@
 //go:build !no_pg
 
-// Migration-apply test for 00475_edge_rules_cors_preset_fk.sql
+// Migration-apply test for 00479_edge_rules_cors_preset_fk.sql
 // (ADR-129 D1). Pins four concerns because the migration carries
 // four:
 //
-//  1. Migration set applies cleanly through 00475 (slot landed
-//     between main's 00474_reserve_slot.sql and 00476_reserve_slot.sql;
-//     main has reservations at 00472-00474 + 00476 owned by another
-//     open PR — the original 00472 slot was lost to the cross-PR fence
-//     on the second rebase, then renumbered from 00472 to 00475).
-//     Verify no goose duplicate-version panic against any of main's
-//     reservations.
+//  1. Migration set applies cleanly through 00479. Slot history:
+//     00428 (initial) → 00472 (1st rebase, main's 00428 fence)
+//     → 00475 (2nd rebase, PR #1064 merge's 00472/00473/00474/00476
+//     fences) → 00479 (3rd renumber, open PR #1111 claimed 00475
+//     after the second renumber landed). 00479 is the next free
+//     slot above the eventual mainline 00478 after PR #1111 merges.
+//     Verify no goose duplicate-version panic against any of
+//     main's or PR #1111's slots.
 //  2. edge_rules.cors_preset_id column exists under that exact
 //     name, is nullable, and has no DEFAULT (NULL is the default).
 //     ADR-129 D1 mandates NULL-on-default because gen_random_uuid()'s
@@ -37,13 +38,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00475_EdgeRulesCorsPresetFK(t *testing.T) {
+func TestMigrations_00479_EdgeRulesCorsPresetFK(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	// (1) Run the full migration set. 00475 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (failure mode: a slot collision between this migration's 00475 and an open-PR fence — re-run the open-PR slot precheck including refs/pull/<N>/head)", err)
+		t.Fatalf("db.MigrateUp: %v (failure mode: a slot collision between this migration's 00479 and an open-PR fence — re-run the open-PR slot precheck including refs/pull/<N>/head)", err)
 	}
 
 	// (2) Column shape pin. information_schema.columns exposes the
@@ -185,6 +186,6 @@ func TestMigrations_00475_EdgeRulesCorsPresetFK(t *testing.T) {
 	// Replay safety: re-running the migration set is a no-op.
 	// The DROP CONSTRAINT IF EXISTS + ADD pair must be idempotent.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp (replay): %v (00475 must be replay-safe — ADD COLUMN IF NOT EXISTS + DROP CONSTRAINT IF EXISTS + ADD CONSTRAINT)", err)
+		t.Fatalf("db.MigrateUp (replay): %v (00479 must be replay-safe — ADD COLUMN IF NOT EXISTS + DROP CONSTRAINT IF EXISTS + ADD CONSTRAINT)", err)
 	}
 }
