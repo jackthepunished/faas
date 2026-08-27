@@ -303,10 +303,10 @@ var methodRouteMap = map[string]string{
 	// uses a literal hyphen; the SDK names methods after the
 	// resource noun (CorsPreset) — same convention as the
 	// three precedents above.
-	"GET /v1/cors-presets":       "ListCorsPresets",
-	"POST /v1/cors-presets":      "CreateCorsPreset",
-	"GET /v1/cors-presets/{id}":  "GetCorsPreset",
-	"PATCH /v1/cors-presets/{id}": "UpdateCorsPreset",
+	"GET /v1/cors-presets":         "ListCorsPresets",
+	"POST /v1/cors-presets":        "CreateCorsPreset",
+	"GET /v1/cors-presets/{id}":    "GetCorsPreset",
+	"PATCH /v1/cors-presets/{id}":  "UpdateCorsPreset",
 	"DELETE /v1/cors-presets/{id}": "DeleteCorsPreset",
 
 	// ADR-089 (planned) — edge rules. The auto-derivation would

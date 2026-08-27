@@ -7935,7 +7935,7 @@ func (s *PgStore) CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (
 		) values (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8, $9::jsonb,
-			$10, coalesce(nullif($11, ''), 'block')
+			$10::uuid, coalesce(nullif($11, ''), 'block')
 		)
 		returning `+edgeRuleSelectCols,
 		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
@@ -8823,7 +8823,7 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			priority      = coalesce($5, priority),
 			enabled       = coalesce($6, enabled),
 			action        = case when $7 then $8::jsonb else action end,
-			cors_preset_id = case when $11 then $12 else cors_preset_id end,
+			cors_preset_id = case when $11 then $12::uuid else cors_preset_id end,
 			validate_mode = coalesce(nullif($9, ''), validate_mode)
 		where id = $1
 		returning `+edgeRuleSelectCols,
