@@ -174,6 +174,18 @@ func (b *fakeBackend) Admit(_ context.Context, _, _, _, _ string, maxConcurrency
 // Admits returns the AdmitInstance() call count (test assertion hook).
 func (b *fakeBackend) Admits() *int32 { return &b.admits }
 
+// LookupMirrorRules (issue #72 / ADR-125 PR-A3) is the no-op
+// stub that satisfies the Backend interface widened in PR-A3.
+// PR-A3 commit 3 wires the real fan-out in pkg/gateway/handler.go
+// so the handler consults this method post-Pick. Until then,
+// every test that uses fakeBackend sees "no mirror" — pre-A3
+// behaviour preserved bit-for-bit. Tests that want to exercise
+// the mirror dispatch path use the real PGBackend with a
+// fakeMirrorStore (see pgbackend_test.go::fakeMirrorStore).
+func (b *fakeBackend) LookupMirrorRules(_ context.Context, _ string) ([]MirrorRuleRow, bool) {
+	return nil, false
+}
+
 func newTestHandler(t *testing.T) (*Handler, *fakeBackend, *httptest.Server) {
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

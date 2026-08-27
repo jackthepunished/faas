@@ -516,3 +516,136 @@ func TestPGBackend_ResolveSched_MultiBox_HappyPathRoutesToOwner(t *testing.T) {
 		t.Errorf("legacy b.sched received %d Admits, want 0 (multi-box routes to owner)", legacySched.Calls())
 	}
 }
+
+// fakeMirrorStore (issue #72 / ADR-125 PR-A3) is a controllable
+// mirrorRulesStore. The rows slice is the canned response;
+// refreshCalls tracks how many times the gateway hit the store
+// (the cache-coherence tests pin "second call within the same
+// window skips the store"). mu guards both because RefreshMirrorRules
+// is the only concurrent caller today but future tests may run
+// RefreshMirrorRules from a goroutine (the production notify path).
+type fakeMirrorStore struct {
+	mu           sync.Mutex
+	rows         map[string][]gateway.MirrorRuleRow
+	err          error
+	refreshCalls int
+}
+
+func (s *fakeMirrorStore) ListMirrorRules(_ context.Context, appID string) ([]gateway.MirrorRuleRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshCalls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.rows[appID], nil
+}
+
+func (s *fakeMirrorStore) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshCalls
+}
+
+// TestPGBackend_RefreshMirrorRules_Cache (issue #72 / ADR-125
+// PR-A3) — after RefreshMirrorRules, LookupMirrorRules returns
+// the cached slice without hitting the store again. The store
+// call counter pins "cache hit = zero store calls".
+func TestPGBackend_RefreshMirrorRules_Cache(t *testing.T) {
+	store := &fakeMirrorStore{rows: map[string][]gateway.MirrorRuleRow{
+		"app-1": {
+			{ID: "r-1", AccountID: "acct-1", AppID: "app-1",
+				SourceDeploymentID: "dep-src", MirrorDeploymentID: "dep-mir",
+				Percent: 100, Enabled: true, IncludeBody: false,
+				RedactHeaders: []string{"X-Custom"}},
+		},
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, gateway.NewFakeScheduler(""), nil).
+		WithMirrorStore(store)
+
+	if err := b.RefreshMirrorRules(context.Background(), "app-1"); err != nil {
+		t.Fatalf("RefreshMirrorRules: %v", err)
+	}
+	if n := store.calls(); n != 1 {
+		t.Errorf("store refresh calls after one Refresh = %d, want 1", n)
+	}
+	rules, ok := b.LookupMirrorRules(context.Background(), "app-1")
+	if !ok {
+		t.Fatal("LookupMirrorRules after Refresh = miss; want hit")
+	}
+	if len(rules) != 1 || rules[0].ID != "r-1" || rules[0].SourceDeploymentID != "dep-src" {
+		t.Fatalf("LookupMirrorRules = %+v, want one rule r-1→dep-src", rules)
+	}
+	if n := store.calls(); n != 1 {
+		t.Errorf("LookupMirrorRules must be cache-only; store calls = %d, want still 1", n)
+	}
+}
+
+// TestPGBackend_LookupMirrorRules_CacheHitMiss (issue #72 /
+// ADR-125 PR-A3) — pre-refresh lookup is a cache miss
+// (handler treats this as "no mirror"); post-refresh is a hit;
+// app with no rules still returns hit-but-empty so the dispatch
+// goroutine skips without a second check.
+func TestPGBackend_LookupMirrorRules_CacheHitMiss(t *testing.T) {
+	store := &fakeMirrorStore{rows: map[string][]gateway.MirrorRuleRow{
+		"app-empty": {}, // rule-less app — refresh writes an empty non-nil slice
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, gateway.NewFakeScheduler(""), nil).
+		WithMirrorStore(store)
+
+	// Cache miss on first lookup for an app that has never been refreshed.
+	if _, ok := b.LookupMirrorRules(context.Background(), "app-never-refreshed"); ok {
+		t.Fatal("LookupMirrorRules for never-refreshed app = hit; want miss")
+	}
+
+	// After refresh of an empty-rules app, lookup returns hit with empty slice.
+	if err := b.RefreshMirrorRules(context.Background(), "app-empty"); err != nil {
+		t.Fatalf("RefreshMirrorRules: %v", err)
+	}
+	rules, ok := b.LookupMirrorRules(context.Background(), "app-empty")
+	if !ok {
+		t.Fatal("LookupMirrorRules post-refresh of empty-rules app = miss; want hit (empty slice is still a hit)")
+	}
+	if len(rules) != 0 {
+		t.Errorf("LookupMirrorRules for empty-rules app = %+v, want empty slice", rules)
+	}
+}
+
+// TestPGBackend_RefreshMirrorRules_PerAppIsolation (issue #72 /
+// ADR-125 PR-A3) — refreshing app A does not disturb app B's
+// cached rules. RefreshMirrorRules keys by appID so a customer's
+// rule change can't poison another tenant's picker.
+func TestPGBackend_RefreshMirrorRules_PerAppIsolation(t *testing.T) {
+	store := &fakeMirrorStore{rows: map[string][]gateway.MirrorRuleRow{
+		"app-A": {{ID: "r-A", AccountID: "acct-A", AppID: "app-A",
+			SourceDeploymentID: "src-A", MirrorDeploymentID: "mir-A",
+			Percent: 50, Enabled: true}},
+		"app-B": {{ID: "r-B", AccountID: "acct-B", AppID: "app-B",
+			SourceDeploymentID: "src-B", MirrorDeploymentID: "mir-B",
+			Percent: 100, Enabled: true}},
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, gateway.NewFakeScheduler(""), nil).
+		WithMirrorStore(store)
+
+	// Refresh app A; app B is still a cache miss.
+	if err := b.RefreshMirrorRules(context.Background(), "app-A"); err != nil {
+		t.Fatalf("RefreshMirrorRules app-A: %v", err)
+	}
+	if _, ok := b.LookupMirrorRules(context.Background(), "app-B"); ok {
+		t.Error("app-B lookup after app-A refresh = hit; want miss (per-app isolation)")
+	}
+	// Refresh app B; app A is unchanged.
+	beforeA, _ := b.LookupMirrorRules(context.Background(), "app-A")
+	if err := b.RefreshMirrorRules(context.Background(), "app-B"); err != nil {
+		t.Fatalf("RefreshMirrorRules app-B: %v", err)
+	}
+	afterA, ok := b.LookupMirrorRules(context.Background(), "app-A")
+	if !ok || len(afterA) != 1 || afterA[0].ID != "r-A" {
+		t.Errorf("app-A lookup after app-B refresh = %+v ok=%v, want r-A preserved", afterA, ok)
+	}
+	_ = beforeA // beforeA pinned for diff in a follow-up if the assertion becomes non-trivial
+	rulesB, ok := b.LookupMirrorRules(context.Background(), "app-B")
+	if !ok || len(rulesB) != 1 || rulesB[0].ID != "r-B" {
+		t.Errorf("app-B lookup after refresh = %+v ok=%v, want r-B", rulesB, ok)
+	}
+}

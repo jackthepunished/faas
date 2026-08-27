@@ -354,6 +354,31 @@ type PGBackend struct {
 	// widens (PR-B step 5).
 	scopeMu    sync.Mutex
 	scopeAudit map[string]string // appID -> last scope arg
+
+	// mirrorMu + mirrorRules (issue #72 / ADR-125 PR-A3) cache
+	// the per-app set of enabled mirror rules. RefreshMirrorRules
+	// loads from the store, filters to Enabled=true, and swaps
+	// the slice under mirrorMu.Lock. LookupMirrorRules is
+	// cache-only — no store hop on the customer hot path. The
+	// mirror goroutine (PR-A3 commit 3) reads this slice to
+	// decide whether to fan out. The map is bounded at the
+	// tenant fleet scale (one entry per app that has at least
+	// one enabled rule); a rule-less app's slice is an empty
+	// non-nil slice (the cache-miss signal) that the lookup
+	// returns as (nil, false). PR-A3 does NOT add eviction —
+	// Limits.MirrorTargetsPerApp ≤ 3 per app keeps the working
+	// set trivial; an app that deletes its last rule has its
+	// cache entry overwritten to the empty slice on the next
+	// pg_notify refresh.
+	mirrorMu    sync.RWMutex
+	mirrorRules map[string][]MirrorRuleRow
+
+	// mirrorStore (issue #72 / ADR-125 PR-A3) is the gateway-side
+	// seam the RefreshMirrorRules notify handler reads. nil =
+	// no refresh; LookupMirrorRules stays in cache-miss mode
+	// for every app until a rule is poked (test seam; production
+	// wires this from cmd/gatewayd-internal).
+	mirrorStore mirrorRulesStore
 }
 
 // recordScope (issue #272 / ADR-095 PR-B) is the test seam that
@@ -455,12 +480,13 @@ func NewPGBackend(router Router, sched Scheduler, log *slog.Logger) *PGBackend {
 		log = slog.Default()
 	}
 	return &PGBackend{
-		router:     router,
-		sched:      sched,
-		log:        log,
-		routes:     NewRouteCache(RouteCacheCap),
-		apps:       map[string]App{},
-		appsPicker: map[string]*appPicker{},
+		router:      router,
+		sched:       sched,
+		log:         log,
+		routes:      NewRouteCache(RouteCacheCap),
+		apps:        map[string]App{},
+		appsPicker:  map[string]*appPicker{},
+		mirrorRules: map[string][]MirrorRuleRow{},
 	}
 }
 
@@ -507,6 +533,42 @@ type deploymentWeight struct {
 // the picker has no pkg/state import — same shape as Router above.
 type deploymentWeightsStore interface {
 	LiveDeployments(ctx context.Context, appID string) ([]DeploymentWeightsRow, error)
+}
+
+// MirrorRuleRow (issue #72 / ADR-125 PR-A3) is the gateway-side
+// projection of a state.MirrorRule. The mirror dispatch goroutine
+// (commit 3) needs every field of the rule at run-time — source
+// deployment, mirror deployment, sampling percent, body-capture
+// flag, customer redact list — so the projection is 1:1 with the
+// state type modulo CreatedAt / UpdatedAt (diagnostics-only,
+// unread on the hot path). cmd/gatewayd-internal/backend.go does
+// the translation from state.MirrorRule to this shape; the gateway
+// package never imports pkg/state.
+//
+// Field semantics live on state.MirrorRule (pkg/state/types.go);
+// this is the wire-shape the gateway cares about.
+type MirrorRuleRow struct {
+	ID                 string
+	AccountID          string
+	AppID              string
+	SourceDeploymentID string
+	MirrorDeploymentID string
+	Percent            int
+	Enabled            bool
+	IncludeBody        bool
+	RedactHeaders      []string
+}
+
+// mirrorRulesStore is the gateway-side seam used by
+// RefreshMirrorRules (issue #72 / ADR-125 PR-A3). Returns every
+// rule for appID (enabled or not); RefreshMirrorRules filters to
+// Enabled=true before caching so a customer who PATCHes a rule
+// disabled = true drops out of the picker on the next pg_notify
+// refresh. The production adapter wires state.PgStore.ListMirrorRules;
+// tests inject a fake that returns canned rows. Mirrors the
+// deploymentWeightsStore shape so the cmd-side wire is symmetric.
+type mirrorRulesStore interface {
+	ListMirrorRules(ctx context.Context, appID string) ([]MirrorRuleRow, error)
 }
 
 // DeploymentWeightsRow is the gateway-side projection of the
@@ -1015,6 +1077,81 @@ func (b *PGBackend) RefreshDeploymentWeights(ctx context.Context, appID string) 
 	return nil
 }
 
+// RefreshMirrorRules (issue #72 / ADR-125 PR-A3) reloads the
+// per-app mirror-rule cache from the store. The notify loop
+// calls this on db.NotifyDeploymentChanged when payload.kind ==
+// "mirror" (the apid CRUD handlers stamp the discriminator — see
+// cmd/apid/handlers_mirror.go + the kind="mirror" arm in
+// cmd/gatewayd-internal/backend.go).
+//
+// Behaviour:
+//
+//   - Reads ListMirrorRules(appID). The store returns every rule
+//     (enabled or not); the gateway filters to Enabled=true
+//     because the dispatch goroutine (commit 3) only ever
+//     fires for enabled rules.
+//   - Swaps the slice under mirrorMu.Lock; the previous slice is
+//     garbage once no goroutine holds a reference. The map entry
+//     is created on the first refresh for an app; subsequent
+//     refreshes overwrite in place.
+//   - Empty slice ≠ cache miss: a rule-less app still gets a
+//     map entry pointing at an empty non-nil slice, so the
+//     handler's LookupMirrorRules returns ([]MirrorRuleRow{},
+//     true) — the dispatch goroutine sees "no mirror" without
+//     paying for a second cache check.
+//
+// Returns the error wrapped with operation context. The notify
+// handler logs-and-continues on a non-nil error — a brief
+// staleness window is preferable to crashing the edge.
+func (b *PGBackend) RefreshMirrorRules(ctx context.Context, appID string) error {
+	if b.mirrorStore == nil {
+		// No store wired — nothing to refresh. The cache
+		// stays empty (all lookups return cache-miss). This
+		// is the test seam: tests that don't care about the
+		// refresh path leave WithMirrorStore unwired.
+		return nil
+	}
+	rows, err := b.mirrorStore.ListMirrorRules(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("gatewayd-internal: refresh mirror rules app=%s: %w", appID, err)
+	}
+	enabled := make([]MirrorRuleRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Enabled {
+			enabled = append(enabled, r)
+		}
+	}
+	b.mirrorMu.Lock()
+	b.mirrorRules[appID] = enabled
+	b.mirrorMu.Unlock()
+	return nil
+}
+
+// LookupMirrorRules (issue #72 / ADR-125 PR-A3) is the cache
+// reader the handler calls post-Pick to decide whether to fan out
+// to a mirror VM. Returns (rules, true) on cache hit — including
+// the empty-slice case (a rule-less app still returns true so the
+// handler skips the dispatch loop without a second check).
+//
+// Cache miss returns (nil, false); the handler treats this as
+// "no mirror" (mirror never blocks the customer response — the
+// next pg_notify for kind="mirror" will populate the cache).
+//
+// Hot-path discipline: NO store call. RefreshMirrorRules is the
+// only path that reads the store, and it runs from the notify
+// subscriber on a separate goroutine. A customer who POSTs a
+// mirror rule sees the first fan-out fire ~50ms after the apid
+// kind="mirror" notify propagates.
+func (b *PGBackend) LookupMirrorRules(ctx context.Context, appID string) ([]MirrorRuleRow, bool) {
+	b.mirrorMu.RLock()
+	rules, ok := b.mirrorRules[appID]
+	b.mirrorMu.RUnlock()
+	if ok {
+		return rules, true
+	}
+	return nil, false
+}
+
 // buildDeploymentWeights filters rows to Percent > 0 and sorts
 // (Percent DESC, DeploymentID ASC) for stable tie-break on the
 // cumulative-weight binary search (PR-B / issue #556). A
@@ -1083,6 +1220,21 @@ func pickerHasDeploymentByID(weights []deploymentWeight, id string) bool {
 // as every other PGBackend.With*).
 func (b *PGBackend) WithStore(s deploymentWeightsStore) *PGBackend {
 	b.store = s
+	return b
+}
+
+// WithMirrorStore (issue #72 / ADR-125 PR-A3) arms the
+// mirror-rule store for RefreshMirrorRules. nil = no store
+// wired; RefreshMirrorRules no-ops so the cache stays empty
+// (every LookupMirrorRules returns cache-miss until the daemon
+// restarts — the test seam). Production wires this from
+// cmd/gatewayd-internal so a db.NotifyDeploymentChanged event
+// with payload.kind == "mirror" triggers the refresh.
+//
+// Returns *PGBackend for fluent chaining (same shape as
+// every other PGBackend.With*).
+func (b *PGBackend) WithMirrorStore(s mirrorRulesStore) *PGBackend {
+	b.mirrorStore = s
 	return b
 }
 

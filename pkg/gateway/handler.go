@@ -496,6 +496,15 @@ type Backend interface {
 	// future caller surfaces (synth handler, replay worker) can
 	// pass a distinct closed-enum value without breaking the wire.
 	Admit(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	// LookupMirrorRules (issue #72 / ADR-125 PR-A3) returns the
+	// enabled mirror rules cached for appID, or (nil, false) on a
+	// cache miss. The handler treats a miss as "no mirror" — the
+	// mirror never blocks the customer response; the next
+	// pg_notify for kind="mirror" will populate the cache. Returns
+	// the gateway-local projection (MirrorRuleRow), not the state
+	// type, so the gateway package keeps its zero-pkg/state import
+	// discipline (mirrors deploymentWeightsStore's posture).
+	LookupMirrorRules(ctx context.Context, appID string) ([]MirrorRuleRow, bool)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
