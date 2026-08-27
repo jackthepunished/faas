@@ -133,7 +133,11 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.4.0
-          args: --timeout=3m
+          # The full repository lint is clean but can exceed three minutes
+          # on a cold hosted-runner cache. Keep the linter's own deadline
+          # above the observed ~3m20s runtime so timing is not reported as a
+          # lint failure.
+          args: --timeout=6m
           # Cache is built into the action; default cache key works.
 
       # Re-runs the same checks golangci-lint covers as a fallback, in case
