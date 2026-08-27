@@ -123,6 +123,26 @@ func TestRunnerTickFailureIsRetryable(t *testing.T) {
 	}
 }
 
+func TestRunnerWorkTickDoesNotReconcile(t *testing.T) {
+	store := &fakeReplicaStore{job: state.SnapshotReplicaJob{
+		SnapshotID: "snap-1", DeploymentID: "dep-1", NodeID: "node-2", Region: "local",
+		StorageKey: "snap/dep-1/mem", VMStateStorageKey: "snap/dep-1/vmstate",
+	}}
+	backend := &fakeBackend{objects: map[string][]byte{
+		"snap/dep-1/mem":     []byte("memory"),
+		"snap/dep-1/vmstate": []byte("vmstate"),
+	}}
+	r := New(store, backend, "node-2", slog.Default())
+	r.runWorkTick(context.Background())
+
+	if store.queued != 0 {
+		t.Fatalf("work tick reconciled the full snapshot set: enqueue calls=%d", store.queued)
+	}
+	if !store.ready {
+		t.Fatal("work tick did not process an already-enqueued replica")
+	}
+}
+
 func TestSyncJobRejectsIncompleteKeys(t *testing.T) {
 	job := state.SnapshotReplicaJob{StorageKey: "snap/dep/mem"}
 	if err := syncJob(context.Background(), &fakeBackend{}, job); err == nil {
