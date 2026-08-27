@@ -3525,16 +3525,32 @@ func cmdUsageStorage(args []string) int {
 // the per-reason detail. Extracted from cmdDeployTarball so unit
 // tests can pin the wire shape without standing up the full deploy
 // command (auth + scan + confirmation prompt + apply).
+//
+// Code-review fix #7: distinguish per-deploy --exclude from
+// persisted carry-forward exclusions in the rendered copy. The
+// wire carries both via apply.PersistedExclusions (the slugs
+// the server folded in from the deployment_scope_exclusions
+// table on this deploy); when the slice is non-empty, the rescue
+// signal could equally have come from the operator's --exclude
+// OR the persisted set, and the previous render always said "by
+// --exclude" — misleading operators who didn't pass --exclude on
+// this run. The new copy reads "by excluded workloads" when a
+// persisted set carried forward, falling back to "by --exclude"
+// for the per-deploy-only case.
 func renderApplyRescue(w io.Writer, apply api.ApplyResponse) {
 	if !apply.GateRescuedByExclude {
 		return
 	}
+	source := "by --exclude"
+	if len(apply.PersistedExclusions) > 0 {
+		source = "by excluded workloads (some persisted via --persist-exclude)"
+	}
 	if len(apply.CanApplyReasons) == 0 {
-		fmt.Fprintf(w, "  Note: gate was rescued by --exclude (pre-exclude would have blocked).\n")
+		fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked).\n", source)
 		return
 	}
-	fmt.Fprintf(w, "  Note: gate was rescued by --exclude (pre-exclude would have blocked); reasons: %s\n",
-		strings.Join(apply.CanApplyReasons, "; "))
+	fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked); reasons: %s\n",
+		source, strings.Join(apply.CanApplyReasons, "; "))
 }
 
 func renderSecretScanWarnings(findings []secretscan.Finding, w io.Writer) {

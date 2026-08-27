@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,6 +160,17 @@ type scanPlanResponse struct {
 	// deployment_scope_exclusions. Empty on preview; non-empty on
 	// apply when the operator's persisted intent took effect.
 	PersistedExclusions []string `json:"persisted_exclusions,omitempty"`
+	// StalePersistedExclusions (code-review fix #2) is the subset
+	// of PersistedExclusions whose slug no longer exists in the
+	// current scan. We do NOT add these to req.Exclude — that
+	// would trip exclude_unknown_slug (400) and lock the
+	// operator out of subsequent deploys until they run
+	// `gregale deployments exclude clear --slug=...`. Surfacing
+	// the stale set lets the dashboard render a "persisted
+	// exclusion ignored (workload no longer in repo)" badge
+	// instead. The janitor at PurgeOrphanedScopeExclusions
+	// reaps these rows past the 90-day retention window.
+	StalePersistedExclusions []string `json:"stale_persisted_exclusions,omitempty"`
 }
 
 // toPlanWorkload translates a reposcan.Workload into the wire-
@@ -430,6 +442,39 @@ func emitWorkloadSkippedRow(
 		"commit_sha":    sourceSHA,
 	}
 	auditor.EmitAs(ctx, actor, reconcile.KindWorkloadSkipped, &acctID, data)
+}
+
+// emitPersistedExcludedAuditRows fires one project.scope.excluded
+// audit row per slug carried forward from the persisted
+// deployment_scope_exclusions table (code-review fix #5). Tagged
+// with reason="persisted" so SOC 2 reviewers can distinguish a
+// persisted fold-in from a per-deploy --exclude (which is
+// emitted as reason="unchanged via exclude" via
+// emitWorkloadSkippedRow above). appID is left empty here because
+// the persisted set's app rows are not yet resolved at scan
+// time — the apply-side handler stamps a synthetic UUID on the
+// brand-new path (see handlers_decompose.go::syntheticExclusionAppID).
+func emitPersistedExcludedAuditRows(
+	ctx context.Context,
+	auditor auditEmitterAs,
+	actor string,
+	accountID string,
+	projectID string,
+	sourceSHA string,
+	slugs []string,
+) {
+	if auditor == nil || len(slugs) == 0 {
+		return
+	}
+	for _, slug := range slugs {
+		acctID := accountID
+		auditor.EmitAs(ctx, actor, reconcile.KindProjectScopeExcluded, &acctID, map[string]any{
+			"project_id":    projectID,
+			"workload_name": slug,
+			"reason":        "persisted",
+			"commit_sha":    sourceSHA,
+		})
+	}
 }
 
 // toPlanManaged translates a reposcan.Managed into the wire-shape
@@ -765,7 +810,17 @@ func (s *server) scanService(
 	// apply handler emits one KindProjectScopeExcluded audit row per
 	// slug for SOC 2 CC7.2 paper trail.
 	var persistedSlugs []string
-	if apply && len(req.Exclude) == 0 {
+	// Code-review fix #3: drop the `len(req.Exclude) == 0` guard.
+	// The original guard meant typing `--exclude=foo` while a
+	// persisted set existed silently dropped the persisted
+	// carry-forward — the operator's persisted intent was
+	// shadowed by any per-deploy --exclude, even though the
+	// intent of `--exclude=foo,bar` + persisted `baz,quux` is
+	// "exclude foo + bar + baz + quux" (union semantics). Fold
+	// in regardless; the post-scan check below filters slugs no
+	// longer in the repo into stale_persisted_exclusions instead
+	// of tripping exclude_unknown_slug (fix #2).
+	if apply {
 		if proj, projErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug); projErr == nil {
 			if persisted, lookupErr := s.store.LookupDeploymentScopeExclusions(r.Context(), acct.ID, proj.ID); lookupErr == nil && len(persisted) > 0 {
 				if req.Exclude == nil {
@@ -776,6 +831,25 @@ func (s *server) scanService(
 					req.Exclude[lname] = true
 					persistedSlugs = append(persistedSlugs, lname)
 				}
+			}
+		}
+	}
+	// Code-review fix #6: a persisted slug that also appears in
+	// req.Only would trip the --only/--exclude mutex below with
+	// 409 exclude_only_overlap. The persisted set is the
+	// "long-haul" intent (per ADR-127) and the operator's
+	// ephemeral --only contradicts it; honor persisted by
+	// stripping the slug from req.Only before the mutex check.
+	// Audit emission downstream tags the slug as reason="persisted"
+	// so operators can trace what happened.
+	if len(persistedSlugs) > 0 && len(req.Only) > 0 {
+		persistedSet := make(map[string]bool, len(persistedSlugs))
+		for _, slug := range persistedSlugs {
+			persistedSet[slug] = true
+		}
+		for slug := range req.Only {
+			if persistedSet[slug] {
+				delete(req.Only, slug)
 			}
 		}
 	}
@@ -891,23 +965,70 @@ func (s *server) scanService(
 	// honoured. 400 exclude_unknown_slug codes the failure with the
 	// unknown slug in the message so the dashboard can render it
 	// inline.
+	// Code-review fix #2: split persisted-vs-per-deploy
+	// slugs in the unknown set. A persisted slug that no
+	// longer exists in the repo (the workload was renamed or
+	// deleted in a future commit) MUST NOT trip
+	// exclude_unknown_slug — otherwise the operator is
+	// locked out of subsequent deploys until they run
+	// `gregale deployments exclude clear --slug=...` or
+	// wait for the 90-day janitor to reap the row. Surface
+	// these as StalePersistedExclusions instead; the dashboard
+	// can render a "persisted exclusion ignored" badge.
+	var stalePersistedSlugs []string
 	if len(req.Exclude) > 0 {
 		scanNames := make(map[string]bool, len(result.Workloads))
 		for _, w := range result.Workloads {
 			scanNames[strings.ToLower(w.Name)] = true
 		}
 		var unknown []string
-		for slug := range req.Exclude {
-			if !scanNames[slug] {
-				unknown = append(unknown, slug)
+		if len(persistedSlugs) > 0 {
+			persistedSet := make(map[string]bool, len(persistedSlugs))
+			for _, slug := range persistedSlugs {
+				persistedSet[slug] = true
+			}
+			for slug := range req.Exclude {
+				if !scanNames[slug] {
+					if persistedSet[slug] {
+						stalePersistedSlugs = append(stalePersistedSlugs, slug)
+						delete(req.Exclude, slug)
+					} else {
+						unknown = append(unknown, slug)
+					}
+				}
+			}
+		} else {
+			for slug := range req.Exclude {
+				if !scanNames[slug] {
+					unknown = append(unknown, slug)
+				}
 			}
 		}
+		sort.Strings(stalePersistedSlugs)
 		if len(unknown) > 0 {
 			sort.Strings(unknown)
 			return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
 				http.StatusBadRequest, "exclude_unknown_slug",
 				"exclude slug is not a workload in this commit",
 				fmt.Sprintf("unknown: %s", strings.Join(unknown, ", ")))
+		}
+		// Drop stale persisted slugs from persistedSlugs so
+		// the response.PersistedExclusions surface reflects
+		// only the actually-applied ones (the audit emit and
+		// the apply-side persist-write loop both key off
+		// this slice).
+		if len(stalePersistedSlugs) > 0 {
+			staleSet := make(map[string]bool, len(stalePersistedSlugs))
+			for _, slug := range stalePersistedSlugs {
+				staleSet[slug] = true
+			}
+			filtered := persistedSlugs[:0]
+			for _, slug := range persistedSlugs {
+				if !staleSet[slug] {
+					filtered = append(filtered, slug)
+				}
+			}
+			persistedSlugs = filtered
 		}
 	}
 	// Managed services (compose image: db, etc.) are not subject to
@@ -958,7 +1079,7 @@ func (s *server) scanService(
 	// shrunk the workload set below the plan cap. evaluateQuotaGate
 	// derives the cron count from workloads internally so both
 	// calls are self-contained (no shared scan state).
-	preCanApply, preNotAllowed, _, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
+	preCanApply, preNotAllowed, preReasons, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
 	canApply, notAllowed, reasons, _ = evaluateQuotaGate(filteredW, limits, observedApps, observedCrons)
 
 	// gateRescuedByExclude fires the slog seam when --exclude
@@ -974,15 +1095,23 @@ func (s *server) scanService(
 	// GuestTailFailedTotal caller pattern in cmd/schedd/main.go.
 	gateRescuedByExclude := !preCanApply && canApply
 	if gateRescuedByExclude {
+		// Code-review fix #4: preReasons (the gate-failure
+		// reasons that fired BEFORE --exclude shrank the
+		// workload set) are the operationally meaningful
+		// signal here — the POST-filter `reasons` are empty by
+		// construction when canApply=true (the gate passed).
+		// Passing post-filter reasons caused the metric to
+		// always emit reason="unknown" on a rescue, defeating
+		// the closed-set cardinality budget.
 		s.log.Info("plan_gate_rescued_by_exclude",
 			slog.String("project_slug", req.ProjectSlug),
 			slog.String("account_id", acct.ID),
 			slog.Bool("pre_exclude_can_apply", preCanApply),
 			slog.Bool("post_exclude_can_apply", canApply),
 			slog.Bool("pre_exclude_not_allowed", preNotAllowed),
-			slog.Any("reasons", reasons),
+			slog.Any("reasons", preReasons),
 		)
-		emitGateRescueMetric(s.ops, string(acct.Plan), reasons)
+		emitGateRescueMetric(s.ops, string(acct.Plan), preReasons)
 	}
 
 	// ADR-124 blast-radius partition: load every non-deleted app in
@@ -1027,6 +1156,22 @@ func (s *server) scanService(
 	actor := resolvedActorString(routeKindForRequest(r), acct.ID, "")
 	sourceSHA := req.SourceSHA256
 	emitSkippedAuditRows(r.Context(), s.audit, actor, acct.ID, projectID, sourceSHA, partition.Skipped)
+
+	// Code-review fix #5: emit one project.scope.excluded audit
+	// row per carried-forward persisted slug, tagged with
+	// reason="persisted" so operators can trace which slugs
+	// came from persistence vs the operator's per-deploy
+	// --exclude. Without this row, the SOC 2 trail showed the
+	// skip but couldn't tell you whether the operator typed
+	// it today or whether it was the long-haul persisted
+	// intent from a prior deploy. Preview-time emission is the
+	// source of truth (same precedent as
+	// emitSkippedAuditRows); the apply-side persist-write
+	// handler emits an additional row tagged
+	// reason="persisted_via_flag" for the write itself.
+	if len(persistedSlugs) > 0 {
+		emitPersistedExcludedAuditRows(r.Context(), s.audit, actor, acct.ID, projectID, sourceSHA, persistedSlugs)
+	}
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
@@ -1091,6 +1236,12 @@ func (s *server) scanService(
 		// scan path is preview; the omitempty keeps --json output
 		// stable for the common case.
 		PersistedExclusions: persistedSlugs,
+		// Code-review fix #2: stale_persisted_exclusions is the
+		// subset of PersistedExclusions whose slug is no longer
+		// in the repo. Surfaced so the dashboard can render a
+		// "persisted exclusion ignored" badge instead of failing
+		// the deploy with exclude_unknown_slug.
+		StalePersistedExclusions: stalePersistedSlugs,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
@@ -1491,7 +1642,17 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 			// absent field = false (the default-OFF posture).
 			b, _ := io.ReadAll(io.LimitReader(part, 32))
 			v := strings.ToLower(strings.TrimSpace(string(b)))
-			persistExclude = v == "true" || v == "1" || v == "yes"
+			// strconv.ParseBool accepts "1", "t", "T", "TRUE",
+			// "true", "True", "0", "f", "F", "FALSE", "false",
+			// "False" — broader than the hand-rolled
+			// {"true","1","yes"} set, and matches the convention
+			// of the other 6 boolean fields in the package
+			// (code-review finding #8).
+			if v != "" {
+				if parsed, perr := strconv.ParseBool(v); perr == nil {
+					persistExclude = parsed
+				}
+			}
 		default:
 			_, _ = io.Copy(io.Discard, part)
 		}

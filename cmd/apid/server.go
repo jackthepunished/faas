@@ -1366,6 +1366,19 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/projects/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.scanProject))))
 	mux.HandleFunc("POST /v1/projects", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.applyProject)))))
 
+	// ADR-124 code-review fix #2 — operator escape hatch. The
+	// CLI's `gregale deployments exclude clear --slug=NAME
+	// --project-slug=SLUG` calls this when a persisted exclusion
+	// is stale (the workload was renamed or deleted in a future
+	// commit) and blocking deploys via exclude_unknown_slug.
+	// Idempotent at the store level — DELETE on no row returns
+	// 404 with code="scope_exclusion_not_found" so the CLI can
+	// render "already clear" instead of a hard error. Requires
+	// deploy:write because mutating the persisted exclusion set
+	// changes which workloads auto-exclude on subsequent
+	// deploys.
+	mux.HandleFunc("DELETE /v1/projects/{slug}/exclusions/{slug2}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteDeploymentScopeExclusion))))
+
 	// Alert rules (ADR-045 / issue #396 PR 3).
 	// CRUD surface under /v1/apps/{slug}/alerts. The rotate-secret
 	// action verb is the literal `/rotate-secret` segment (Go 1.22+

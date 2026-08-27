@@ -967,6 +967,20 @@ func (c *Client) ApplyProjectPlan(
 	return out, c.doReq(c.uploadHTTP(), req, &out)
 }
 
+// DeleteDeploymentScopeExclusion drops a single persisted
+// --exclude row from deployment_scope_exclusions (ADR-124
+// code-review fix #2). The CLI's `gregale deployments exclude clear
+// --slug=...` calls into here as the operator-grade escape hatch
+// when a persisted slug no longer exists in the repo and is
+// blocking deploys. The server returns 404 with Problem
+// code="scope_exclusion_not_found" when no row matches; the CLI
+// branches on that via errors.As(&*api.APIError) to render
+// "already clear" rather than surface a hard error.
+func (c *Client) DeleteDeploymentScopeExclusion(ctx context.Context, projectSlug, slug string) error {
+	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/exclusions/" + url.PathEscape(slug)
+	return c.do(ctx, "DELETE", path, nil, nil)
+}
+
 // writeProjectMultipartFields serializes the multipart body shared
 // by ScanProject + ApplyProjectPlan. The fields exactly mirror the
 // OpenAPI ProjectScanRequest schema (the spec-compliance AST gate

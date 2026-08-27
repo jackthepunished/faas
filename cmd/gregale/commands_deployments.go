@@ -28,11 +28,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -119,10 +121,22 @@ func truncateReason(s string, max int) string {
 	return string(runes[:max]) + "…"
 }
 
-// cmdDeployments implements `gregale deployments [--limit N] [--before C] [--all]`.
+// cmdDeployments implements `gregale deployments [--limit N] [--before C] [--all]`
+// and the `exclude` subcommand family
+// (`gregale deployments exclude clear --slug=... [--project-slug=...]`).
 // Mirrors cmdApps (commands.go:251) except pagination is exposed.
-// Wire shape: GET /v1/deployments (paginated; cursor=before, limit=limit).
+// Wire shape: GET /v1/deployments (paginated; cursor=before, limit=limit)
+// and DELETE /v1/projects/{slug}/exclusions/{slug} (ADR-124 code-review
+// fix #2 escape hatch).
 func cmdDeployments(args []string) int {
+	// Subcommand dispatch — must run BEFORE flag parsing or the
+	// FlagSet chokes on the unrecognised "exclude" verb.
+	if len(args) > 0 {
+		switch args[0] {
+		case "exclude":
+			return cmdDeploymentsExclude(args[1:])
+		}
+	}
 	fs := flag.NewFlagSet("deployments", flag.ContinueOnError)
 	limit := fs.Int("limit", 50, "page size (1-200)")
 	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
@@ -177,6 +191,82 @@ func cmdDeployments(args []string) int {
 	if page.NextBefore != "" {
 		_, _ = fmt.Fprintf(osStdout, "... more — pass --before %s\n", page.NextBefore)
 	}
+	return 0
+}
+
+// cmdDeploymentsExclude dispatches the `exclude` verb family.
+// Today: `clear` (ADR-124 code-review fix #2 escape hatch — drop a
+// stale persisted exclusion that no longer exists in the repo).
+// Future: `list` (render the persisted exclusion table for a project)
+// lands here when the dashboard drill-down needs a CLI sibling.
+func cmdDeploymentsExclude(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale deployments exclude clear --slug=NAME [--project-slug=SLUG]", "deployments exclude")
+		return 1
+	}
+	switch args[0] {
+	case "clear":
+		return cmdDeploymentsExcludeClear(args[1:])
+	default:
+		PrintUsage(os.Stderr, "usage: gregale deployments exclude clear --slug=NAME [--project-slug=SLUG]", "deployments exclude")
+		return 1
+	}
+}
+
+// cmdDeploymentsExcludeClear implements
+// `gregale deployments exclude clear --slug=NAME [--project-slug=SLUG]`.
+// ADR-124 code-review fix #2 — escape hatch for operators locked
+// out by a stale persisted exclusion (workload renamed or deleted
+// in the repo). Without this command, the only option was psql +
+// hand-DELETE; the CLI surface is the operator-grade path. The
+// server responds 404 when no row matches (already cleared), so
+// the command is idempotent and safe to re-run.
+//
+// --project-slug defaults to the slug carried in FAAS_PROJECT_SLUG
+// (the same default every other gregale subcommand uses); the
+// optional flag is here for shell scripts that batch-clear across
+// projects without env-mutating each iteration.
+func cmdDeploymentsExcludeClear(args []string) int {
+	fs := flag.NewFlagSet("deployments exclude clear", flag.ContinueOnError)
+	slug := fs.String("slug", "", "lowercase workload slug to clear from deployment_scope_exclusions (required)")
+	projectSlug := fs.String("project-slug", "", "project slug (defaults to FAAS_PROJECT_SLUG env)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *slug == "" {
+		PrintUsage(os.Stderr, "usage: gregale deployments exclude clear --slug=NAME [--project-slug=SLUG]", "deployments exclude")
+		return 1
+	}
+	if *projectSlug == "" {
+		*projectSlug = os.Getenv("FAAS_PROJECT_SLUG")
+	}
+	if *projectSlug == "" {
+		PrintUsage(os.Stderr, "usage: gregale deployments exclude clear --slug=NAME --project-slug=SLUG (or set FAAS_PROJECT_SLUG)", "deployments exclude")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	ctx := context.Background()
+	// Normalise to lowercase — the schema's CHECK slug = lower(slug)
+	// rejects mixed case, and the server's lookup is case-folded too.
+	*slug = strings.ToLower(strings.TrimSpace(*slug))
+	*projectSlug = strings.ToLower(strings.TrimSpace(*projectSlug))
+	if err := client.DeleteDeploymentScopeExclusion(ctx, *projectSlug, *slug); err != nil {
+		// 404 is fine — already cleared is the same observable end state.
+		// Server returns Problem{Code: "scope_exclusion_not_found"} wrapped
+		// in *APIError; branch on the code via errors.As so the same
+		// surface handles both transports (HTTP 404 + any future
+		// local-cache miss with the same code).
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) && apiErr.Problem.Code == "scope_exclusion_not_found" {
+			_, _ = fmt.Fprintf(osStdout, "no persisted exclusion for %q in project %q (already clear)\n", *slug, *projectSlug)
+			return 0
+		}
+		return printErr("Request failed", err)
+	}
+	_, _ = fmt.Fprintf(osStdout, "cleared persisted exclusion: project=%q slug=%q\n", *projectSlug, *slug)
 	return 0
 }
 
