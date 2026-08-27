@@ -39,6 +39,17 @@ Track the release workflow in GitHub Actions (`.github/workflows/release.yml`):
 - Keyless signing with GitHub OIDC via Cosign/Rekor (`release.cosign.bundle`).
 - Release publication with SHA256 checksums.
 
+The control-plane CD workflow consumes these published assets; it does not
+rebuild daemon binaries. After the release workflow is green, select the
+exact tag when dispatching `cd-controlplane`:
+
+```bash
+gh workflow run cd-controlplane.yml --ref main -f release_tag=v0.1.18-rc.1
+```
+
+The workflow verifies the release checksum, Cosign identity, embedded release
+manifest, and production-manifest hash before staging anything on the host.
+
 ---
 
 ## Fleet Deployment & Installation
