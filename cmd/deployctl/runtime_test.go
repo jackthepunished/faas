@@ -232,6 +232,44 @@ func TestHealthAddressFollowsBundledRole(t *testing.T) {
 	}
 }
 
+func TestReadinessProbeFromConfigUsesSplitTCPListener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schedd.toml")
+	if err := os.WriteFile(path, []byte("socket_path = \"/run/faas/schedd.sock\"\nlisten_addr = \"tcp://0.0.0.0:9091\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, target, err := readinessProbeFromConfig(path, daemonunitspec.ProbeUnix, "/run/faas/schedd.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeTCP || target != "127.0.0.1:9091" {
+		t.Fatalf("probe = %q %q, want tcp 127.0.0.1:9091", probe, target)
+	}
+}
+
+func TestReadinessProbeFromConfigUsesLegacyUnixFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schedd.toml")
+	if err := os.WriteFile(path, []byte("socket_path = \"/run/faas/custom-schedd.sock\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, target, err := readinessProbeFromConfig(path, daemonunitspec.ProbeUnix, "/run/faas/schedd.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeUnix || target != "/run/faas/custom-schedd.sock" {
+		t.Fatalf("probe = %q %q, want unix /run/faas/custom-schedd.sock", probe, target)
+	}
+}
+
+func TestReadinessProbeForListenTargetAcceptsBareTCP(t *testing.T) {
+	probe, target, err := readinessProbeForListenTarget("0.0.0.0:50051")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeTCP || target != "127.0.0.1:50051" {
+		t.Fatalf("probe = %q %q, want tcp 127.0.0.1:50051", probe, target)
+	}
+}
+
 // TestHostRestartIteratesServiceOrderInOrder asserts that Restart()
 // walks serviceOrder forward without re-sorting. This guards against
 // a future refactor that adds a hidden toposort inside Restart —

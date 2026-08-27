@@ -448,22 +448,20 @@ func (r hostRuntime) waitReady(ctx context.Context, service string) error {
 	if r.waitReadyOverride != nil {
 		return r.waitReadyOverride(ctx, service)
 	}
-	for _, entry := range daemonunitspec.Registry {
-		if entry.Name != service {
-			continue
-		}
-		switch entry.Lifecycle.Probe {
-		case daemonunitspec.ProbeUnix:
-			return waitPath(ctx, entry.Lifecycle.ProbeTarget, r.readyTimeout)
-		case daemonunitspec.ProbeTCP:
-			return waitTCP(ctx, entry.Lifecycle.ProbeTarget, r.readyTimeout)
-		case daemonunitspec.ProbeSystemd:
-			return waitSystemdActive(ctx, "faas-"+service+".service", r.readyTimeout)
-		default:
-			return fmt.Errorf("unknown readiness probe for %s", service)
-		}
+	probe, target, err := readinessProbeForService(service)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("unknown service %q", service)
+	switch probe {
+	case daemonunitspec.ProbeUnix:
+		return waitPath(ctx, target, r.readyTimeout)
+	case daemonunitspec.ProbeTCP:
+		return waitTCP(ctx, target, r.readyTimeout)
+	case daemonunitspec.ProbeSystemd:
+		return waitSystemdActive(ctx, "faas-"+service+".service", r.readyTimeout)
+	default:
+		return fmt.Errorf("unknown readiness probe for %s", service)
+	}
 }
 
 func (r hostRuntime) waitHTTP(ctx context.Context, address string) error {

@@ -110,6 +110,32 @@ func TestDeployRollsBackWhenCurrentSymlinkIsRelative(t *testing.T) {
 	}
 }
 
+func TestDeployRejectsExistingCurrentReleaseWithoutVerifiedRollback(t *testing.T) {
+	root := t.TempDir()
+	makeRelease(t, root, "new")
+	old := filepath.Join(root, "old")
+	if err := os.MkdirAll(filepath.Join(old, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(root, "current")
+	if err := os.Symlink(old, current); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{}
+	controller := newController(t, root, current, runtime)
+
+	err := controller.Deploy(context.Background(), "new")
+	if err == nil || !strings.Contains(err.Error(), "not rollback-capable") {
+		t.Fatalf("Deploy error = %v, want rollback-capable preflight error", err)
+	}
+	if len(runtime.calls) != 0 {
+		t.Fatalf("runtime calls = %v, want no calls before preflight", runtime.calls)
+	}
+}
+
 func TestDeployStopsBeforeActivationWhenMigrationFails(t *testing.T) {
 	root := t.TempDir()
 	makeRelease(t, root, "new")
