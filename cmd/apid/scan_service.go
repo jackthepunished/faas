@@ -1573,13 +1573,13 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 			"Bad multipart", err.Error())
 	}
 	var (
-		sourcePath      string
-		onlySet         = map[string]bool{}
-		excludeSet      = map[string]bool{}
-		projectSlug     string
-		prodBranch      = "main"
-		installID       int64
-		persistExclude  bool
+		sourcePath     string
+		onlySet        = map[string]bool{}
+		excludeSet     = map[string]bool{}
+		projectSlug    string
+		prodBranch     = "main"
+		installID      int64
+		persistExclude bool
 	)
 	for {
 		part, perr := mr.NextPart()

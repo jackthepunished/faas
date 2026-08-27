@@ -5747,13 +5747,13 @@ var ValidOpenAPIVersions = []string{
 // janitor PurgeOrphanedScopeExclusions reaps stale rows after the
 // 90-day retention window.
 type DeploymentScopeExclusion struct {
-	ID         string
-	AccountID  string
-	ProjectID  string
-	AppID      string
-	Slug       string
-	Reason     string
-	CreatedBy  string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID        string
+	AccountID string
+	ProjectID string
+	AppID     string
+	Slug      string
+	Reason    string
+	CreatedBy string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

@@ -108,12 +108,12 @@ func seedAccountWithAPIKey(t *testing.T, h *e2etest.Harness,
 // workload. Setup:
 //
 //   - 3 pre-seeded apps:
-//     * "matching-app"   (RootDir="services/api", Name="api") —
-//       scan discovers a matching workload.
-//     * "legacy-app"     (RootDir="external/legacy", Name="legacy")
-//       — scan does NOT discover a matching workload.
-//     * "side-app"       (RootDir="external/side", Name="side") —
-//       scan does NOT discover a matching workload.
+//   - "matching-app"   (RootDir="services/api", Name="api") —
+//     scan discovers a matching workload.
+//   - "legacy-app"     (RootDir="external/legacy", Name="legacy")
+//     — scan does NOT discover a matching workload.
+//   - "side-app"       (RootDir="external/side", Name="side") —
+//     scan does NOT discover a matching workload.
 //   - Scan fixture: singleWorkloadFixture (1 workload: `api`).
 //
 // Expected partition:

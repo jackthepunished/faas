@@ -658,7 +658,7 @@ func NewMemStore() *MemStore {
 		// issue #72 / ADR-125: mirror-rules and mirror-results
 		// stores. Empty until the first create; the per-app count
 		// in CreateMirrorRuleIfUnderQuota walks the map.
-// Rebase resolution (2026-08-27): merge HEAD's added fields
+		// Rebase resolution (2026-08-27): merge HEAD's added fields
 		// (fireNowRequests, operatorIntents, runtimeConfigs +
 		// operations + revisions, alertPresets, accountSpendSnapshots,
 		// openAPIImports) with the cluster's deploymentScopeExclusions
