@@ -115,7 +115,7 @@ func TestPg_MarkMFAEnrolled_UnknownAccountReturnsErrNotFound(t *testing.T) {
 
 // TestPg_ClearMFA_NullsSecretsAndHashes pins the three-column null-out:
 // secret, recovery hashes, AND enrolled_at all go to NULL together.
-// mfa_required is intentionally untouched (chokepoints re-set it).
+// mfa_required is intentionally untouched so an explicit policy remains.
 func TestPg_ClearMFA_NullsSecretsAndHashes(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
@@ -152,8 +152,8 @@ func TestPg_ClearMFA_UnknownAccountReturnsErrNotFound(t *testing.T) {
 
 // TestPg_SetMFARequired_FlipsAndReportsChanged pins the changed=true path.
 // After the call the row carries the new value AND the method reports the
-// change (so the chokepoint can suppress a duplicate audit Emit on a
-// redelivered webhook).
+// change so a policy caller can suppress a duplicate audit Emit on a
+// repeated request.
 func TestPg_SetMFARequired_FlipsAndReportsChanged(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
@@ -175,8 +175,8 @@ func TestPg_SetMFARequired_FlipsAndReportsChanged(t *testing.T) {
 
 // TestPg_SetMFARequired_NoOpReportsUnchanged pins the changed=false branch
 // (the WHERE … AND mfa_required <> $2 clause filters out a no-op write).
-// The handler relies on `changed=false` to skip the audit Emit on webhook
-// replays — that's the load-bearing bit.
+// Policy handlers can rely on `changed=false` to skip a duplicate audit
+// Emit on repeated requests — that's the load-bearing bit.
 func TestPg_SetMFARequired_NoOpReportsUnchanged(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))

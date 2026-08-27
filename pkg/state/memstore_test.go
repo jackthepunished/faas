@@ -3369,9 +3369,8 @@ func TestSha256Equal(t *testing.T) {
 
 // TestSetMFARequired_ChangedReportsRealWrites confirms the new
 // (changed bool, err error) return shape differentiates a real
-// write from a same-value no-op. The chokepoint callers
-// (flipMFARequiredIfUnenrolled) suppress the audit Emit on a no-op
-// so a redelivered webhook doesn't double-record.
+// write from a same-value no-op. Policy callers can use the changed
+// result to avoid duplicate audit records on repeated requests.
 func TestSetMFARequired_ChangedReportsRealWrites(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()
@@ -3389,8 +3388,8 @@ func TestSetMFARequired_ChangedReportsRealWrites(t *testing.T) {
 		t.Errorf("first write changed = false, want true")
 	}
 
-	// Second write: true → true. Must report changed=false so the
-	// chokepoint suppresses the duplicate audit Emit.
+	// Second write: true → true. Must report changed=false so a
+	// repeated policy request can suppress a duplicate audit Emit.
 	changed, err = m.SetMFARequired(ctx, acct.ID, true)
 	if err != nil {
 		t.Fatalf("SetMFARequired(true) repeat: %v", err)

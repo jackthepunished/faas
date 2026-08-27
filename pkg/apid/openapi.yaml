@@ -202,11 +202,13 @@ tags:
       artifact; the device-code flow is the SDK programmatic-auth path.
   - name: mfa
     description: |
-      TOTP MFA on dashboard sessions (IAM-2, issue #186). Five
+      Optional TOTP MFA on dashboard sessions (IAM-2, issue #186). Five
       POST endpoints: enroll (one-shot secret + recovery codes),
       confirm (first TOTP code), verify (step-up for an
       mfa_pending session), recover (burn a recovery code), and
-      disable (opt-out via password or recovery code).
+      disable (opt-out via password or recovery code). Enrollment
+      is never triggered automatically by plan, billing, or deploy
+      events.
   - name: github
     description: |
       GitHub App integration (ADR-012, PR-B). The dashboard bind
@@ -633,8 +635,10 @@ paths:
       summary: Finish MFA enrollment with the first TOTP code.
       description: |
         Verifies the 6-digit code against the sealed secret
-        and stamps mfa_enrolled_at. Re-issues the session
-        cookie without the mfa_pending flag.
+        and stamps mfa_enrolled_at. Re-issues the current session
+        cookie without the mfa_pending flag; future dashboard logins
+        will require a TOTP verification because enrollment is the
+        customer's explicit opt-in.
       requestBody:
         required: true
         content:
@@ -721,8 +725,8 @@ paths:
         mfa_enrolled_at. Body must include exactly one of
         `password` (re-verified against account_passwords)
         or `recovery_code` (consumed). Leaves mfa_required
-        untouched so the plan-upgrade / 2nd-deploy
-        chokepoints can re-arm.
+        untouched so an explicit operator/workspace policy remains
+        in force after disable.
       requestBody:
         required: true
         content:
@@ -17347,7 +17351,8 @@ components:
       description: |
         Empty success body. Side effects: mfa_secret_encrypted,
         mfa_recovery_codes_hash, and mfa_enrolled_at are all NULL.
-        mfa_required is left as-is so the chokepoints can re-arm.
+        mfa_required is left as-is so an explicit policy remains in
+        force after disable.
       type: object
       additionalProperties: false
 

@@ -5,7 +5,8 @@
 /**
  * Empty success body. Side effects: mfa_secret_encrypted,
  * mfa_recovery_codes_hash, and mfa_enrolled_at are all NULL.
- * mfa_required is left as-is so the chokepoints can re-arm.
+ * mfa_required is left as-is so an explicit policy remains in
+ * force after disable.
  *
  */
 export type MFADisableResponse = Record<string, any>;

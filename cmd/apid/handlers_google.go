@@ -242,7 +242,7 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 	// Issue Session Cookie. IAM-2 mfa_pending stamp preserved;
 	// IAM-3 (ADR-039) mints a sid + creates the sessions row +
 	// emits auth.session.created via the unified helper.
-	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "google")
+	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaSessionPending(acct), "google")
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

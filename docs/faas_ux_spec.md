@@ -239,10 +239,10 @@ The `capacity_unavailable` case should be near-impossible in practice (admission
 
 #### 7.1 MFA-specific copy (IAM-2, issue #186)
 
-The dashboard renders MFA surfaces in three places: the enrollment page, the "your account needs MFA" prompt that appears when a session is mfa_pending, and the recovery-code "lost device" page. The copy is the same in all three.
+The dashboard renders MFA surfaces in three places: the optional enrollment page, the "your account needs MFA" prompt that appears when a session is mfa_pending, and the recovery-code "lost device" page. The copy distinguishes voluntary setup from a session that is already waiting for verification.
 
 - **Enrollment landing** — headline: "Add a second factor." Subhead: "Scan the QR, paste the code, and you're set." The QR + otpauth URL render side-by-side; recovery codes are listed underneath with a copyable "Save these somewhere" button (the dashboard does NOT auto-download them; the customer decides where they go).
-- **Step-up prompt** (replaces the dashboard on every session-cookie route while mfa_pending=true) — headline: "Confirm it's you." Subhead: "We sent you here because your account is on a paid plan / has a card / multiple deployments. Enter your 6-digit code to continue." A footer link points to the recovery-code page if the customer has lost their device.
+- **Step-up prompt** (replaces the dashboard on every session-cookie route while mfa_pending=true) — headline: "Confirm it's you." Subhead: "MFA is enabled for this account. Enter your 6-digit code to continue." A footer link points to the recovery-code page if the customer has lost their device.
 - **Recovery-code screen** — headline: "Use a recovery code." Subhead: "Each recovery code is single-use. After 10 burns you'll need to re-enroll MFA." The form has a single text input; submit returns to the dashboard with the same cookie cleared.
 
 All three screens obey the §7 three-line shape (headline → cause → one next action). The dashboard never auto-routes the customer past MFA — they must explicitly complete /confirm, /verify, or /recover.
@@ -289,15 +289,11 @@ Both are recorded here so the implementation spec's §17 gap register and §3 AD
 
 ### 11.1 MFA on dashboard sessions (IAM-2, issue #186)
 
-Every session-cookie route is gated by `requireMFA` unless the customer's account is enrolled or the route is on the MFA allowlist (`/v1/account`, `/v1/account/mfa/{enroll,confirm,verify,recover,disable}`). API-key requests bypass MFA entirely — the scope check is the gate, and the issuing customer already proved possession at key-mint time. Two-factor is for humans logging in via the dashboard, not for CI.
+MFA is opt-in for dashboard users. An authenticated user can open Security and start enrollment at any time; plan changes, billing events, and deployment count never enroll or challenge an account automatically. API-key requests bypass MFA entirely — the scope check is the gate, and the issuing customer already proved possession at key-mint time. Two-factor is for humans logging in via the dashboard, not for CI.
 
-Three chokepoints set `mfa_required = true`:
+After the first successful `/v1/account/mfa/confirm`, every subsequent dashboard login issues an `mfa_pending` cookie. The `requireMFA` middleware allows the account view and MFA recovery routes while pending, and blocks other session-cookie routes until `/verify` or `/recover` re-issues the cookie. The dashboard therefore remains usable for a user who chooses MFA without imposing it on users who do not.
 
-1. **Plan upgrade across the paid threshold** (`free|hobby → pro|scale`). Hobby stays hobby on a free→hobby flip — the boundary is "will the customer hold a card-backed resource?", and Hobby has no card requirement.
-2. **2nd deployment** (account already has ≥ 1 active deployment before the about-to-be-created one). Free never sees this — the `CreateAppIfUnderQuota` cap blocks a 2nd app, so there's no 2nd deployment to chokepoint on.
-3. **Card attached** (provider_customer_id freshly stamped). In practice the plan-upgrade chokepoint fires first because the apid upgrade path is the only one that mints a new provider customer, but the card-attached predicate still exists for future webhook paths.
-
-Once `mfa_required = true`, every subsequent login issues an `mfa_pending` cookie. The dashboard customer sees the step-up prompt (§7.1) and either completes enrollment, verifies with a TOTP code, or burns a recovery code. Either way, the cookie re-issue drops the `mfa_pending` flag.
+The `mfa_required` column remains an explicit policy hook for a future operator/workspace requirement. It is not set by plan upgrades, card attachment, or the second deployment. An unenrolled account with that explicit policy still receives an enrollment challenge; an enrolled account remains challenged because enrollment itself is the user's opt-in state.
 
 Recovery codes: 10 single-use 10-char base32 strings, stored as SHA-256 hashes. SHA-256 not Argon2id because the codes are 80-bit entropy — Argon2id's tunable cost isn't justified on data that's already computationally infeasible to brute-force from a leaked blob. The customer sees the plaintexts once on /enroll; the server has no way to re-display them. If the customer loses all 10 codes AND their authenticator, the recovery path is /disable via password (which the customer can reset via email if needed) followed by a fresh /enroll.
 

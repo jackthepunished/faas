@@ -181,6 +181,24 @@ func TestHandleBillingEventStripe(t *testing.T) {
 	_ = time.Now // unused import guard
 }
 
+// TestHandleBillingEventSubscriptionCreatedDoesNotEnableMFA pins
+// the opt-in policy for billing webhooks. Attaching a card or
+// starting a subscription must not force MFA enrollment.
+func TestHandleBillingEventSubscriptionCreatedDoesNotEnableMFA(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	e.s.handleBillingEvent(context.Background(), billing.Event{
+		Type: billing.EventSubscriptionCreated,
+	}, e.acct)
+
+	fresh, err := e.store.AccountByID(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.MFARequired {
+		t.Fatal("subscription-created webhook silently enabled MFA; enrollment must be opt-in")
+	}
+}
+
 // TestListDeploymentsWithPagination covers the deployment list endpoint
 // including the limit-clamping + cursor handling. The handler accepts
 // `?limit=N` and `?before=<RFC3339Nano>` for cursor pagination.

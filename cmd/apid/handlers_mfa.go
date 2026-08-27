@@ -1,6 +1,9 @@
 // MFA handlers (IAM-2, issue #186).
 //
-// Five POST endpoints under /v1/account/mfa/*. The wire shapes
+// Five POST endpoints under /v1/account/mfa/*. MFA is opt-in: any
+// authenticated dashboard user may start enrollment, and a
+// confirmed authenticator is required for subsequent dashboard
+// sessions. The wire shapes
 // live in pkg/api/mfa.go; the audit taxonomy is locked:
 //
 //   - account.mfa_enrolled            — mfaConfirm success
@@ -443,9 +446,8 @@ func (s *server) sendBurnEmail(ctx context.Context, acct state.Account, remainin
 // is the analog of /v1/account/delete's password re-prompt.
 //
 // Clears mfa_secret_encrypted + mfa_recovery_codes_hash +
-// mfa_enrolled_at. Leaves mfa_required untouched so the
-// chokepoints (plan upgrade / card attach / 2nd deploy) can
-// re-arm on the next trigger.
+// mfa_enrolled_at. Leaves mfa_required untouched so an explicit
+// policy remains in force after disable.
 //
 // CSRF (issue #186 review finding #7): ClearMFA is irreversible
 // from the customer's perspective (re-enroll is the only path
@@ -652,10 +654,10 @@ func SetMFAIdentities(f func() []*age.X25519Identity) { mfaIdentities = f }
 // given mfa-pending flag) and sets it on the response. Used by
 // /confirm, /verify, /recover to clear the mfa_pending flag
 // after a successful step-up. Mirrors issueSessionCookie but
-// takes the mfaPending explicitly so the verify step-up can
-// pass false even if the account still has mfa_required set
-// (the customer is enrolled; the policy flag can stay armed
-// for the future).
+// takes the mfaPending explicitly so the verify step-up can clear
+// the current session's pending state even though the account's
+// enrollment or explicit policy still requires MFA on future
+// sessions.
 //
 // IAM-3 (ADR-039, issue #187 + #244 merged): this path REUSES
 // the existing sid — it reads the current state.Session out of
@@ -774,129 +776,4 @@ func (s *server) reissueSessionCookieWithStepUp(w http.ResponseWriter, r *http.R
 // hash.
 func consumeRecoveryCode(ctx context.Context, st consumeRecoveryCodeSelector, accountID string, presented []byte) (matched bool, lastCode bool, remaining int, err error) {
 	return st.ConsumeRecoveryCode(ctx, accountID, presented)
-}
-
-// --- auto-flip chokepoints --------------------------------------------------
-//
-// Three chokepoints set mfa_required=true when a customer
-// crosses the "real customer" boundary (issue #186 / IAM-2):
-//
-//   - Plan upgrade across the paid threshold (free|hobby →
-//     pro|scale). Hobby stays hobby on a free→hobby flip —
-//     the boundary is "will the customer hold a credit-card-
-//     backed resource?", and Hobby still has no card
-//     requirement.
-//   - Card attached (provider_customer_id freshly stamped).
-//   - 2nd deploy (account-wide post-insert deployment count
-//     >= 2 — the just-created row plus at least one prior).
-//
-// The chokepoints are best-effort: a SetMFARequired failure
-// logs at WARN and continues — the customer's primary action
-// (plan change / card attach / deploy) lands regardless. The
-// audit Emit fires only when the row actually changed (the
-// SetMFARequired `changed` return is true), so a redelivered
-// webhook doesn't double-record the chokepoint.
-
-// mfaFlipOnUpgrade is the plan-upgrade predicate. Returns
-// true iff the customer is moving from a no-card-required
-// tier to a card-required tier. Hobby → Pro and Hobby →
-// Scale cross the boundary; Free → Hobby does not.
-//
-// (Hobby has no card requirement in the plan spec — the
-// payment-required CodePayment only fires for Pro + Scale.
-// Free → Hobby is a self-serve plan bump; Hobby → Pro +
-// Hobby → Scale require the Stripe webhook.)
-func mfaFlipOnUpgrade(old, new api.Plan) bool {
-	if new != api.PlanPro && new != api.PlanScale {
-		return false
-	}
-	return old == api.PlanFree || old == api.PlanHobby
-}
-
-// mfaFlipOnDeploy is the 2nd-deploy predicate. Returns
-// true iff the customer's account-wide deployment count
-// AFTER the about-to-be-created one is ≥ 2. The chokepoint
-// caller (maybeFlipMFAOnDeploy) runs AFTER CreateDeployment
-// has already inserted the new row, so a count of 2 means
-// this customer's deploy is the 2nd or later across all
-// apps they own. Free accounts never trip this —
-// CreateAppIfUnderQuota blocks at app #2 — so the chokepoint
-// only matters for Hobby / Pro / Scale customers.
-func mfaFlipOnDeploy(currentCount int) bool { return currentCount >= 2 }
-
-// flipMFARequiredIfUnenrolled sets mfa_required=true on the
-// account iff the customer has not yet enrolled. The audit Emit
-// fires only when SetMFARequired reports `changed=true`; a
-// redelivered webhook (or a second chokepoint firing in the
-// same request) returns changed=false and emits nothing,
-// avoiding duplicate rows in the audit log.
-//
-// The `reason` argument drives the audit `data` shape —
-// one of "plan_upgrade", "card_attached", "second_deploy".
-// The `extra` map is the caller-supplied context (e.g.
-// deploy_count, from/to plan) that's relevant to that
-// chokepoint.
-//
-// Called by changePlan, the card-attached webhook paths,
-// and createDeployment. NOT a public method — the three
-// callers are tightly coupled to the apid handler struct.
-func (s *server) flipMFARequiredIfUnenrolled(ctx context.Context, acct state.Account, reason string, extra map[string]any) {
-	if acct.MFAEnrolled() {
-		return
-	}
-	changed, err := s.store.SetMFARequired(ctx, acct.ID, true)
-	if err != nil {
-		s.log.Warn("mfa_required set failed", "account", acct.ID, "reason", reason, "err", err.Error())
-		return
-	}
-	if !changed {
-		// Row already carried mfa_required=true (a prior chokepoint
-		// ran, or a webhook was redelivered). The "silent re-arm"
-		// gap (PR #629 review finding F2): previously suppressed the
-		// audit row entirely, so SOC 2 CC6.2 couldn't prove the
-		// chokepoint fired on a customer whose mfa_required was
-		// already true. Emit a separate audit kind so the row
-		// distinguishes "first arm" from "re-arm on a later
-		// chokepoint hit" — both lines stay in the audit log
-		// without either duplicating.
-		data := map[string]any{"reason": reason}
-		for k, v := range extra {
-			data[k] = v
-		}
-		s.audit.Emit(ctx, "account.mfa_required_armed_again", &acct.ID, data)
-		return
-	}
-	data := map[string]any{"reason": reason}
-	for k, v := range extra {
-		data[k] = v
-	}
-	s.audit.Emit(ctx, "account.mfa_required_enabled", &acct.ID, data)
-}
-
-// maybeFlipMFAOnDeploy is the 2nd-deploy chokepoint's thin
-// wrapper. Called from createDeployment (image branch) +
-// createDeploymentMultipart (tarball branch) after a
-// successful CreateDeployment. Counts the post-insert active
-// deployments for the account; if >= 2, arms mfa_required.
-//
-// The threshold is the post-insert count, not the pre-insert
-// count, because CountDeployments is the SQL of truth (it
-// joins through apps and excludes failed/superseded). The
-// pre-insert check would race against concurrent deploys;
-// the post-insert check sees exactly what's in the DB.
-// Free accounts never trip this — CreateAppIfUnderQuota
-// blocks at app #2 — so the chokepoint only matters for
-// Hobby / Pro / Scale customers.
-func (s *server) maybeFlipMFAOnDeploy(ctx context.Context, acct state.Account) {
-	count, err := s.store.CountDeployments(ctx, acct.ID)
-	if err != nil {
-		s.log.Warn("mfa_required count failed", "account", acct.ID, "err", err.Error())
-		return
-	}
-	if !mfaFlipOnDeploy(count) {
-		return
-	}
-	s.flipMFARequiredIfUnenrolled(ctx, acct, "second_deploy", map[string]any{
-		"deploy_count": count,
-	})
 }

@@ -192,6 +192,25 @@ func TestChangePlan_GateMatrix(t *testing.T) {
 	}
 }
 
+// TestChangePlan_DoesNotEnableMFA pins the opt-in policy: crossing
+// into a paid plan must not silently arm MFA for a customer who has
+// not chosen it in Security.
+func TestChangePlan_DoesNotEnableMFA(t *testing.T) {
+	e, _ := setupChangePlan(t, api.PlanHobby, "si_abc")
+	rec := e.do(t, "PATCH", "/v1/account/plan",
+		map[string]string{"plan": string(api.PlanPro)}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\nbody = %s", rec.Code, rec.Body)
+	}
+	fresh, err := e.store.AccountByID(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.MFARequired {
+		t.Fatal("plan upgrade silently enabled MFA; enrollment must be opt-in")
+	}
+}
+
 // TestChangePlan_NoBillingPortalURL confirms the 402 still goes out (the
 // customer knows the upgrade was blocked) when the operator has not
 // configured a billing portal URL. The BillingPortalURL field is

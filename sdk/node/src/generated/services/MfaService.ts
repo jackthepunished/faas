@@ -40,8 +40,10 @@ export class MfaService {
   /**
    * Finish MFA enrollment with the first TOTP code.
    * Verifies the 6-digit code against the sealed secret
-   * and stamps mfa_enrolled_at. Re-issues the session
-   * cookie without the mfa_pending flag.
+   * and stamps mfa_enrolled_at. Re-issues the current session
+   * cookie without the mfa_pending flag; future dashboard logins
+   * will require a TOTP verification because enrollment is the
+   * customer's explicit opt-in.
    *
    * @returns MFAConfirmResponse Enrolled.
    * @throws ApiError
@@ -118,8 +120,8 @@ export class MfaService {
    * mfa_enrolled_at. Body must include exactly one of
    * `password` (re-verified against account_passwords)
    * or `recovery_code` (consumed). Leaves mfa_required
-   * untouched so the plan-upgrade / 2nd-deploy
-   * chokepoints can re-arm.
+   * untouched so an explicit operator/workspace policy remains
+   * in force after disable.
    *
    * @returns MFADisableResponse Disabled.
    * @throws ApiError

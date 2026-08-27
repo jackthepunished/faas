@@ -522,12 +522,13 @@ func (s *server) verifyPasswordOrPad(ctx context.Context, email, password string
 // X-Forwarded-Proto header pins it (the loopback dev path is HTTP).
 //
 // IAM-2 (issue #186): the cookie is stamped with MfaPending=true
-// when the account is mfa_required && !mfa_enrolled. The requireMFA
-// middleware (cmd/apid/mfa_middleware.go) reads the flag off the
-// envelope via withMFAPending; every protected route 403s
-// CodeMFARequired while the cookie is pending. The mfaEnrollRequired
-// predicate is the same one used by the OAuth callbacks so all
-// five cookie-issue paths agree on the policy.
+// when the account has opted into MFA (mfa_enrolled) or an explicit
+// mfa_required policy is active. The requireMFA middleware
+// (cmd/apid/mfa_middleware.go) reads the flag off the envelope via
+// withMFAPending; every protected route 403s CodeMFARequired while
+// the cookie is pending. The mfaSessionPending predicate is the
+// same one used by the OAuth callbacks so all five cookie-issue
+// paths agree on the policy.
 //
 // IAM-3 (ADR-039, issue #187 + #244 merged): the cookie is now
 // issued via issueDashboardSession (cmd/apid/issue_session.go),
@@ -537,7 +538,7 @@ func (s *server) verifyPasswordOrPad(ctx context.Context, email, password string
 // (handlers_auth_login.go), the email+password ladder reserved
 // for issue #2 / PR #2 once IAM-3 lands.
 func (s *server) issueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "password")
+	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaSessionPending(acct), "password")
 	if err != nil {
 		s.log.Error("auth.session_issue", "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
