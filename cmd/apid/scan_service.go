@@ -396,7 +396,17 @@ func computeAffectedPartition(
 			if a.ProjectID != projectID {
 				continue
 			}
-			if exclude[strings.ToLower(a.WorkloadName)] {
+			// Exclude by either slug OR workload name — the
+			// operator's --exclude maps to the app slug (the
+			// operator-visible wire name), while the
+			// reconcile-engine diff keys off workload_name.
+			// Apps where Slug != WorkloadName (rare, but
+			// legitimate — see the dual-view test
+			// TestScanPartition_ExcludedExistingAppDualView)
+			// must honour the exclude contract on BOTH fields.
+			// Mirrors the Skipped dual-view filter above.
+			if exclude[strings.ToLower(a.Slug)] ||
+				exclude[strings.ToLower(a.WorkloadName)] {
 				continue
 			}
 			k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}

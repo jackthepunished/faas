@@ -257,6 +257,13 @@ func TestScanExclude_ExistingAppRescued(t *testing.T) {
 	// Removed. Without the project_id binding, the partition
 	// leaves Removed empty by design and the baseline assertion
 	// at line 276 trips.
+	//
+	// The partition's Removed exclude-filter checks BOTH
+	// `a.Slug` and `a.WorkloadName` (the dual-key
+	// `exclude[strings.ToLower(a.Slug)] ||
+	// exclude[strings.ToLower(a.WorkloadName)]` check
+	// added in this same fix), so an app with empty
+	// WorkloadName is still rescued by `--exclude=<slug>`.
 	proj, err := store.CreateProject(ctx, state.Project{
 		AccountID: res.Account.ID,
 		Slug:      "exclude-existing",

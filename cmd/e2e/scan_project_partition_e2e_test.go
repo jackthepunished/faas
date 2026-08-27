@@ -192,20 +192,20 @@ func TestScanPartition_CardinalityComplete(t *testing.T) {
 		t.Fatalf("scan status = %d, want 200 (body=%s)", status, body)
 	}
 
-	// WillDeploy: exactly 1 row, the scan workload `api`, Action=create.
+	// WillDeploy: exactly 1 row, the scan workload `api`.
+	// Action + ID are pinned below (lines 230-240) — the scan
+	// discovers `matching-app` (same RootDir, Name) and reuses
+	// the existing row, so WillDeploy[0] carries Action="update"
+	// + the matching.ID. The Action="create" / empty-ID assertions
+	// that used to live here were the precondition for the
+	// partition surface BEFORE we set matching-app's RootDir +
+	// WorkloadName to match the scan fixture. With matching key
+	// the partition reuses the row, so this block intentionally
+	// only pins Slug + cardinality.
 	if len(plan.WillDeploy) != 1 {
 		t.Errorf("WillDeploy len = %d, want 1; got: %+v", len(plan.WillDeploy), plan.WillDeploy)
-	} else {
-		w := plan.WillDeploy[0]
-		if w.Slug != "api" {
-			t.Errorf("WillDeploy[0].Slug = %q, want api", w.Slug)
-		}
-		if w.Action != "create" {
-			t.Errorf("WillDeploy[0].Action = %q, want create", w.Action)
-		}
-		if w.ID != "" {
-			t.Errorf("WillDeploy[0].ID = %q, want empty (Action=create)", w.ID)
-		}
+	} else if plan.WillDeploy[0].Slug != "api" {
+		t.Errorf("WillDeploy[0].Slug = %q, want api", plan.WillDeploy[0].Slug)
 	}
 
 	// Unaffected: exactly 2 rows, legacy-app + side-app.
