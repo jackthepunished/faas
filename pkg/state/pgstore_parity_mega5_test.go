@@ -154,7 +154,10 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	// Two rows with the same (host_redacted_hash, kind, port) — the
 	// GROUP BY must collapse them to a single DataUpstreamTarget.
 	// data_upstreams requires account_id + source ('inferred'|'explicit');
-	// we use 'inferred' to mirror the classifier path.
+	// we use 'inferred' to mirror the classifier path. The UNIQUE
+	// dedupe key is (app_id, scope, kind, host, port), so the 2 rows
+	// must differ on scope to INSERT successfully while still
+	// collapsing on the GROUP BY (which doesn't include scope).
 	hashA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 64 hex
 	hostA := fmt.Sprintf("a-%s.example", uuid.NewString()[:8])
 	if _, err := pool.Exec(ctx,
@@ -165,7 +168,7 @@ func TestPgStore_ListDistinctUpstreamHostHashes_GroupBy_Mega5(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO data_upstreams(id, account_id, app_id, source, scope, kind, host, port, host_redacted_hash)
-		 VALUES ($1, $2, $3, 'inferred', 'prod', 'postgres', $4, 5432, $5)`,
+		 VALUES ($1, $2, $3, 'inferred', 'staging', 'postgres', $4, 5432, $5)`,
 		uuid.New(), acctID, appID, hostA, hashA); err != nil {
 		t.Fatalf("seed upstreams #2: %v", err)
 	}
