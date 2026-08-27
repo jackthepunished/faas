@@ -3581,3 +3581,62 @@ func (c *Client) ReplayAppDebugRequest(ctx context.Context, slug, reqID string) 
 	path := "/v1/apps/" + slug + "/debug/requests/" + reqID + "/replay"
 	return out, c.do(ctx, "POST", path, nil, &out)
 }
+
+// --- Traffic mirroring (issue #72 / ADR-125 PR-A2) ---------------------
+//
+// Six thin wrappers over the /v1/apps/{slug}/mirrors CRUD surface.
+// Method names follow the auto-derived convention cmd/sdk-coverage
+// enforces (Verb + PascalCase(path-with-placeholders-stripped)) so
+// the wire + SDK name surface stays in lockstep. All methods thread
+// the authed client's bearer token through c.do so the server-side
+// auth chain is identical to a hand-rolled HTTP call.
+
+// PostAppsSlugMirrors creates a mirror rule on an app. The body is
+// the canonical CreateMirrorRuleRequest; the server returns the
+// stored MirrorRuleResponse (with id, always_stripped_headers
+// manifest, and the CreatedAt/UpdatedAt stamps).
+func (c *Client) PostAppsSlugMirrors(ctx context.Context, slug string, req CreateMirrorRuleRequest) (MirrorRuleResponse, error) {
+	var out MirrorRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/mirrors", req, &out)
+}
+
+// GetAppsSlugMirrors returns every rule on the app (enabled or
+// not). At most Limits.MirrorTargetsPerApp rows so no cursor is
+// needed in A2 (1-3 rows).
+func (c *Client) GetAppsSlugMirrors(ctx context.Context, slug string) (MirrorRuleListResponse, error) {
+	var out MirrorRuleListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/mirrors", nil, &out)
+}
+
+// GetAppsSlugMirrorsId loads one rule by id. The server enforces
+// the IDOR posture (silent 404 on cross-account); the SDK does not
+// translate — the caller sees the raw 404.
+func (c *Client) GetAppsSlugMirrorsId(ctx context.Context, slug, id string) (MirrorRuleResponse, error) {
+	var out MirrorRuleResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/mirrors/"+id, nil, &out)
+}
+
+// PatchAppsSlugMirrorsId applies a partial update. The pointer
+// fields on UpdateMirrorRuleRequest let the caller distinguish
+// "absent" from "set to zero" — Percent=0 is legal (disable without
+// removing) and distinct from omitting the field.
+func (c *Client) PatchAppsSlugMirrorsId(ctx context.Context, slug, id string, req UpdateMirrorRuleRequest) (MirrorRuleResponse, error) {
+	var out MirrorRuleResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/mirrors/"+id, req, &out)
+}
+
+// DeleteAppsSlugMirrorsId removes the rule. The server returns 204;
+// downstream mirror_invocation_results rows cascade via FK ON
+// DELETE CASCADE (migration 00384_mirror_rules.sql).
+func (c *Client) DeleteAppsSlugMirrorsId(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/mirrors/"+id, nil, nil)
+}
+
+// GetAppsSlugMirrorsIdSummary returns the aggregate drift counts
+// over the requested window. windowStr must be one of "1h" / "24h"
+// / "7d"; the server returns 422 invalid_mirror_window on anything
+// else.
+func (c *Client) GetAppsSlugMirrorsIdSummary(ctx context.Context, slug, id, windowStr string) (MirrorSummaryResponse, error) {
+	var out MirrorSummaryResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/mirrors/"+id+"/summary?window="+windowStr, nil, &out)
+}

@@ -43,6 +43,14 @@
 
 package api
 
+// CSRFTokenResponse is an action-bound token for browser clients. The
+// corresponding cookie remains HttpOnly; returning the token in JSON lets a
+// single-page app submit CSRF-protected mutations without exposing the cookie
+// to JavaScript.
+type CSRFTokenResponse struct {
+	CSRFToken string `json:"csrf_token"`
+}
+
 // MFAEnrollRequest is empty — the customer brings only their
 // session cookie. Kept as a struct (not omitted) so the JSON
 // decoder accepts a bare {} body without a "no JSON object"

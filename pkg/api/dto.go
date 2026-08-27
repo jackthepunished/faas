@@ -1659,6 +1659,167 @@ type UpdateDeploymentTrafficRequest struct {
 	TrafficPercent int `json:"traffic_percent"`
 }
 
+// CreateMirrorRuleRequest is the body for
+// POST /v1/apps/{slug}/mirrors (issue #72 / ADR-125 traffic
+// mirroring PR-A2). The (SourceDeploymentID, MirrorDeploymentID)
+// pair MUST both reference live deployments belonging to the
+// slug's app (the store enforces this in
+// CreateMirrorRuleIfUnderQuota's FOR UPDATE lock). Percent is the
+// fan-out fraction [0, 100] (0 disables the rule without
+// removing it; 100 mirrors every customer request). IncludeBody
+// defaults to false — sensitive bodies stay off by default per
+// the spec hint; customers who want body comparison pass
+// --include-body at the CLI / set IncludeBody=true here. The
+// RedactHeaders list is the customer's *additive* redact set;
+// the always-stripped headers (Authorization, Cookie, Set-Cookie,
+// X-API-Key, Proxy-Authorization, WWW-Authenticate) are stripped
+// at the gateway regardless of this field (see ADR-124 §D8).
+type CreateMirrorRuleRequest struct {
+	SourceDeploymentID string   `json:"source_deployment_id"`
+	MirrorDeploymentID string   `json:"mirror_deployment_id"`
+	Percent            int      `json:"percent"`
+	IncludeBody        bool     `json:"include_body"`
+	RedactHeaders      []string `json:"redact_headers"`
+}
+
+// UpdateMirrorRuleRequest is the body for
+// PATCH /v1/apps/{slug}/mirrors/{id} (issue #72 / ADR-125 PR-A2).
+// Every field is a pointer so the handler can distinguish "field
+// absent" from "field set to zero value" (Percent=0 is legal and
+// distinct from "PATCH with no body"). RedactHeaders uses a
+// pointer-to-slice so a PATCH with `"redact_headers": []` clears
+// the customer's additive list; a PATCH that omits the field
+// leaves it untouched.
+type UpdateMirrorRuleRequest struct {
+	Percent       *int      `json:"percent,omitempty"`
+	Enabled       *bool     `json:"enabled,omitempty"`
+	IncludeBody   *bool     `json:"include_body,omitempty"`
+	RedactHeaders *[]string `json:"redact_headers,omitempty"`
+}
+
+// MirrorRuleResponse is the canonical mirror-rule response
+// (issue #72 / ADR-125 PR-A2). Returned by POST (201), GET
+// (200), PATCH (200), and as a list element under
+// MirrorRuleListResponse. Snake-case tags; no `omitempty` on
+// response fields (clients can detect absent vs zero via the
+// same call). The AlwaysStrippedHeaders field documents the
+// always-stripped set so the customer can render a complete
+// redaction manifest in their UI without consulting the docs.
+type MirrorRuleResponse struct {
+	ID                    string    `json:"id"`
+	AccountID             string    `json:"account_id"`
+	AppID                 string    `json:"app_id"`
+	SourceDeploymentID    string    `json:"source_deployment_id"`
+	MirrorDeploymentID    string    `json:"mirror_deployment_id"`
+	Percent               int       `json:"percent"`
+	Enabled               bool      `json:"enabled"`
+	IncludeBody           bool      `json:"include_body"`
+	RedactHeaders         []string  `json:"redact_headers"`
+	AlwaysStrippedHeaders []string  `json:"always_stripped_headers"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+// MirrorRuleListResponse wraps GET /v1/apps/{slug}/mirrors
+// (issue #72 / ADR-125 PR-A2). Count is informational — the
+// store's ListMirrorRules returns at most Limits.MirrorTargetsPerApp
+// rows (1-3), so no pagination cursor is needed in A2. If A3's
+// multi-target mirror follow-on widens the cap, this struct
+// gets a NextCursor field with the standard Opaque-string
+// envelope.
+type MirrorRuleListResponse struct {
+	Rules []MirrorRuleResponse `json:"rules"`
+	Count int                  `json:"count"`
+}
+
+// MirrorSummaryResponse is the body of
+// GET /v1/apps/{slug}/mirrors/{id}/summary?window={1h|24h|7d}
+// (issue #72 / ADR-125 PR-A2). All counts are pre-aggregated
+// server-side via SQL aggregates (COUNT / SUM / p99_cont) — the
+// client never iterates the ledger. MeanLatencyDiffMs /
+// P99LatencyDiffMs are *signed* (mirror_ms − source_ms; positive
+// = mirror is slower). CrashCount counts the rows where the
+// mirror VM exited abnormally before producing a response (the
+// customer's source request still succeeded). WindowSeconds is
+// the parsed window in seconds so the CLI can render "last 1h"
+// without parsing the query string.
+type MirrorSummaryResponse struct {
+	TotalInvocations  int64 `json:"total_invocations"`
+	StatusDiffCount   int64 `json:"status_diff_count"`
+	SchemaDiffCount   int64 `json:"schema_diff_count"`
+	BodyDiffCount     int64 `json:"body_diff_count"`
+	MeanLatencyDiffMs int64 `json:"mean_latency_diff_ms"`
+	P99LatencyDiffMs  int64 `json:"p99_latency_diff_ms"`
+	CrashCount        int64 `json:"crash_count"`
+	WindowSeconds     int   `json:"window_seconds"`
+}
+
+// MirrorWindowDuration is the parsed window argument for the
+// summary endpoint (issue #72 / ADR-125 PR-A2). Three discrete
+// values — the customer's "tell me drift over recent traffic"
+// question doesn't need a free-form duration; these three cover
+// the typical UI surfaces (live dashboard / daily review /
+// weekly report).
+type MirrorWindowDuration int
+
+const (
+	// MirrorWindow1h is the default; aligns with the dashboard's
+	// "last hour" panel.
+	MirrorWindow1h MirrorWindowDuration = 3600
+	// MirrorWindow24h covers a full day; matches the customer-facing
+	// "yesterday's drift" report.
+	MirrorWindow24h MirrorWindowDuration = 86400
+	// MirrorWindow7d covers a rolling week; matches the SLA-style
+	// report the customer sends to their own stakeholders.
+	MirrorWindow7d MirrorWindowDuration = 604800
+)
+
+// errInvalidMirrorWindow is the parse-failure sentinel returned
+// by ParseMirrorWindow when the input is anything other than
+// "" / "1h" / "24h" / "7d". Unexported because the canonical
+// HTTP-shaped surface is the ErrInvalidMirrorWindow constructor
+// in errors.go; the sentinel is internal to the parser so a
+// future caller in this package can errors.Is on it. Cross-package
+// callers should rely on the constructor's code + status, not
+// this sentinel.
+var errInvalidMirrorWindow = fmt.Errorf("invalid mirror window (must be 1h, 24h, or 7d)")
+
+// ParseMirrorWindow parses a string ("1h" | "24h" | "7d") into the
+// typed duration. Empty input falls through to the 1h default.
+// Returns the parse-failure sentinel (errors.Is(err,
+// errInvalidMirrorWindow) works inside this package; outside,
+// use the ErrInvalidMirrorWindow constructor's code field) on
+// any other input so the handler can return 422
+// invalid_mirror_window.
+func ParseMirrorWindow(s string) (MirrorWindowDuration, error) {
+	switch s {
+	case "", "1h":
+		return MirrorWindow1h, nil
+	case "24h":
+		return MirrorWindow24h, nil
+	case "7d":
+		return MirrorWindow7d, nil
+	}
+	return 0, errInvalidMirrorWindow
+}
+
+// MirrorAlwaysStrippedHeaders is the set of headers the gateway
+// strips from every mirror invocation regardless of the
+// customer-supplied RedactHeaders list (issue #72 / ADR-125
+// PR-A2 §D8). Authentication-bearing headers stay out of the
+// ledger — they would either leak the customer's session into
+// their own mirror, or fail JCS canonicalisation on the way in.
+// This list is rendered into the MirrorRuleResponse so customers
+// can render a "redacted headers" manifest in their UI.
+var MirrorAlwaysStrippedHeaders = []string{
+	"Authorization",
+	"Cookie",
+	"Set-Cookie",
+	"X-API-Key",
+	"Proxy-Authorization",
+	"WWW-Authenticate",
+}
+
 // RollbackRequest is the body for POST /v1/apps/{slug}/rollback.
 //
 // All fields are optional. With an empty body the handler falls back to

@@ -803,6 +803,48 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    "mirror",
+		DocSlug: "mirror",
+		Short:   "Manage traffic mirroring (mirror list|create|info|update|rm|summary --app <slug>; issue #72 / ADR-124; Pro/Scale only)",
+		Subcommands: []cliSub{
+			{Name: "list", Short: "List mirror rules", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+			}},
+			{Name: "create", Short: "Create a mirror rule", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+				{Name: "source", Short: "source deployment id (live)", Req: true},
+				{Name: "mirror", Short: "mirror deployment id (live; same app)", Req: true},
+				{Name: "percent", Short: "fan-out percent in [0, 100]; 100 = every request"},
+				{Name: "include-body", Short: "include request/response bodies in the comparison ledger"},
+				{Name: "redact-header", Short: "extra header name to redact (repeatable)"},
+			}},
+			{Name: "info", Short: "Show one mirror rule", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+				{Name: "id", Short: "mirror rule id", Req: true},
+			}},
+			{Name: "update", Short: "Patch a mirror rule (patch semantics)", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+				{Name: "id", Short: "mirror rule id", Req: true},
+				{Name: "percent", Short: "new percent in [0, 100]"},
+				{Name: "enable", Short: "enable the rule (mutually exclusive with --disable)"},
+				{Name: "disable", Short: "disable the rule (mutually exclusive with --enable)"},
+				{Name: "include-body", Short: "enable body capture (mutually exclusive with --no-include-body)"},
+				{Name: "no-include-body", Short: "disable body capture"},
+				{Name: "redact-header", Short: "extra header name to redact (repeatable)"},
+				{Name: "clear-redact", Short: "clear the customer's redact_headers list (drop to always-stripped only)"},
+			}},
+			{Name: "rm", Short: "Delete a mirror rule", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+				{Name: "id", Short: "mirror rule id", Req: true},
+			}},
+			{Name: "summary", Short: "Aggregate mirror drift counts over a window", Flags: []cliFlag{
+				{Name: "app", Short: "app slug", Req: true},
+				{Name: "id", Short: "mirror rule id", Req: true},
+				{Name: "window", Short: "summary window: 1h | 24h | 7d (default 1h)", ClosedSet: []string{"1h", "24h", "7d"}},
+			}},
+		},
+	},
+	{
 		Name:    "webhooks",
 		DocSlug: "webhooks",
 		Short:   "Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)",

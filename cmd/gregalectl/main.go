@@ -68,7 +68,11 @@ Docs: ` + docsURL + `
 `
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	// Keep the kernel-provided argument vector intact. The global --json
+	// parser removes its flag from the slice it receives; release CLI
+	// bootstrapping needs the original vector when it re-execs the verified
+	// child so that global flags are not lost across the process boundary.
+	os.Exit(run(append([]string(nil), os.Args[1:]...)))
 }
 
 func init() {
@@ -82,6 +86,9 @@ func run(args []string) int {
 	if len(args) == 0 {
 		fmt.Print(usage)
 		return 0
+	}
+	if code, handled := maybeBootstrapReleaseCLI(args); handled {
+		return code
 	}
 	switch args[0] {
 	case "version", "--version", "-v":

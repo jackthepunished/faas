@@ -114,6 +114,11 @@ func cmdDeployJoinFleet(args []string) int {
 			JSON: *jsonOut || jsonOutput,
 		}
 		resolveJoinArtifacts(&o)
+		if !o.DryRun && o.Yes {
+			if code, handled := maybeBootstrapReleaseCLIFromTarball(o.ReleaseTarball, o.ReleaseGitSHA); handled {
+				return code
+			}
+		}
 		report, validateErr := deployJoinValidate(o)
 		if validateErr != nil {
 			fmt.Fprintf(os.Stderr, "gregalectl deploy join-fleet: node %s: %v\n", n.Node, validateErr)
