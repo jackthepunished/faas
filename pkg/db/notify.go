@@ -436,7 +436,7 @@ const (
 	//   closed by this channel: apid never imports
 	//   pkg/scheddgrpc.
 	NotifyOperatorIntent = "operator_intent"
-	// NotifyRuntimeConfigChanged is emitted by migration 00456 after a
+	// NotifyRuntimeConfigChanged is emitted by migration 00466 after a
 	// durable operator configuration write. Daemons reconcile the row from
 	// Postgres instead of trusting the payload so missed notifications are
 	// repaired on the next boot/reconnect.

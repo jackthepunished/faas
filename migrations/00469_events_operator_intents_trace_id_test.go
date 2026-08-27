@@ -1,9 +1,16 @@
 //go:build !no_pg
 
-// Migration 00456 — adds the `trace_id` column to both `events`
+// Migration 00469 — adds the `trace_id` column to both `events`
 // (the live audit log) and `operator_intents` (the dispatch table)
 // so the operator-action observability layer can join enqueue ↔
 // terminal-outcome audit rows on one column.
+//
+// Slot history: this migration was originally numbered 00456 when
+// the branch was created against pre-PR-#1115 main. During the
+// post-PR-#1111 rebase onto main (which has since consumed slots
+// 00456-00468 for runtime configuration + compute_node gateway
+// target), the slot was renumbered to 00469 to clear the
+// bridge-reservation fence that main now owns at 00456.
 //
 // Pins:
 //
@@ -41,7 +48,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigration_00456_EventsOperatorIntentsTraceID(t *testing.T) {
+func TestMigration_00469_EventsOperatorIntentsTraceID(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -68,7 +75,7 @@ func TestMigration_00456_EventsOperatorIntentsTraceID(t *testing.T) {
 	assertPartialIndex(t, ctx, pool, "operator_intents_trace_idx", "operator_intents", "trace_id")
 
 	// (5) Replay-safe: second MigrateUp is a no-op (the IF NOT
-	// EXISTS guards in 00456's Up block make this true; pgtest
+	// EXISTS guards in 00469's Up block make this true; pgtest
 	// gives a fresh schema per test, so we explicitly re-apply
 	// here to pin the property).
 	if err := mustMigrateUp(ctx, pool); err != nil {

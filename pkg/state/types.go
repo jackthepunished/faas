@@ -3048,7 +3048,7 @@ type AuditLog struct {
 	// TraceID is the OTel W3C 32-char hex trace identifier (when
 	// set) that ties this audit_log row to the inbound request, the
 	// operator_intents row it produced, and any downstream dispatch
-	// context. Mirrors Event.TraceID (migrations/00456). Nullable:
+	// context. Mirrors Event.TraceID (migrations/00469). Nullable:
 	// pre-PR rows + cron-fired rows without an inbound trace_id keep
 	// NULL. The OperatorActionTraceCompleteness read aggregates the
 	// NOT-NULL ratio over audit_log rows of kind LIKE
