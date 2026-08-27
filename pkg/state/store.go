@@ -3411,6 +3411,18 @@ type Store interface {
 	// Migration 00028 enforces NOT NULL going forward, so passing empty
 	// is fine — the row still has a non-NULL wake_id after the write.
 	CreateInstance(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID string) (Instance, error)
+	// CreateInstanceWithMode (issue #72 / ADR-125 PR-A3) is the
+	// mode-aware overload the schedd uses to stamp mode='mirror'
+	// on canary-shadow instances. mode must be either
+	// InstanceModeNormal or InstanceModeMirror — the SQL CHECK
+	// (migrations/00385) rejects any other value. The legacy
+	// CreateInstance method preserves its no-mode signature
+	// (mode='normal' is the column default) so test fixtures
+	// and pre-A3 callers continue to work bit-for-bit; only the
+	// 3 schedd engine call sites and the mirror admission
+	// (Engine.AdmitMirrorInstance) call this overload with
+	// an explicit mode value.
+	CreateInstanceWithMode(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID, mode string) (Instance, error)
 	InstanceByID(ctx context.Context, id string) (Instance, error)
 	// ReadActiveInstanceForWakeID is the cluster-coord lookup
 	// primitive (multi-host safety cluster PR-5 / audit F4). When

@@ -156,6 +156,21 @@ type SchedAPI interface {
 	//
 	// trigger (ADR-127): see Wake.
 	AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (sched.WakeResult, error)
+	// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) is the
+	// mirror-VM admission sibling to AdmitInstance. Stamps
+	// mode='mirror' on the new instances row (PR-A1's 00385 column)
+	// and is gated by the per-rule concurrent-mirror-VM cap (default
+	// 5; engine.MirrorMaxConcurrentPerRule). On cap-at-max returns
+	// sched.ErrMirrorSlotAtCapacity — the server maps that to a
+	// ResourceExhausted gRPC + api.CodeMirrorSlotAtCapacity so the
+	// gateway dispatch goroutine can branch on result=cap_at_max
+	// for the metric + ledger.
+	//
+	// appID/mirrorDeploymentID/mirrorRuleID (no scope/trigger): the
+	// mirror goroutine's detached ctx (ADR-098) doesn't carry the
+	// customer's scope/trigger — the ledger row records them via
+	// mirror_invocation_results, not here.
+	AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (sched.WakeResult, error)
 	// EnsureWake (ADR-098) is the single-flight-safe wake RPC. The engine
 	// coalesces every concurrent EnsureWake call for the same app into one
 	// virtual boot; followers see the leader's outcome. The leader runs
@@ -400,6 +415,42 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		return nil, err
 	}
 	start := time.Now()
+	// PR-A3 (issue #72 / ADR-125): is_mirror routes the admit
+	// through Engine.AdmitMirrorInstance so the per-rule slot
+	// cap fires and mode='mirror' is stamped on the instances
+	// row. The mirror admission path returns the same WakeResult
+	// shape as the normal path; the gateway consumes
+	// at-capacity vs admitted identically.
+	if req.GetIsMirror() {
+		res, err := s.engine.AdmitMirrorInstance(ctx, req.GetAppId(), req.GetMirrorRuleId(), req.GetDeploymentId())
+		s.ops.Observe(op, time.Since(start), err)
+		if err != nil {
+			// ErrMirrorSlotAtCapacity is a benign cap-at-max
+			// outcome, NOT a real failure — surface as a
+			// ResourceExhausted gRPC code so the gateway can
+			// distinguish from the error path. The normal error
+			// path goes through toProblem as before.
+			if errors.Is(err, sched.ErrMirrorSlotAtCapacity) {
+				// Bypass toProblem: the cap-at-max outcome is a
+				// benign, bounded, transient signal — not an
+				// internal failure. Wire it as ResourceExhausted
+				// with api.CodeMirrorSlotAtCapacity so the
+				// gateway dispatch goroutine can branch on
+				// Status(codes.ResourceExhausted) via
+				// grpcerr.IsCode (PR-A3 / ADR-124).
+				return nil, grpcerr.New(codes.ResourceExhausted, api.CodeMirrorSlotAtCapacity,
+					"mirror slot at capacity",
+					"per-rule mirror slot cap reached; goroutine will write ledger entry with result=cap_at_max")
+			}
+			return nil, grpcerr.ToStatus(toProblem(err))
+		}
+		return &scheddpb.AdmitInstanceResponse{
+			InstanceId: res.InstanceID,
+			NodeId:     res.NodeID,
+			Method:     mapMethod(res.Method),
+			WakeId:     res.WakeID,
+		}, nil
+	}
 	// PR-B (issue #272): scope threaded through AdmitInstance the
 	// same way as Wake. Empty scope = legacy prod; the engine's
 	// resolveApp then reads the LiveDeployment row by appID only.

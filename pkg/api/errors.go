@@ -420,6 +420,16 @@ const (
 	// bounds it at 1 second so the wire always emits a non-zero
 	// hint.
 	CodeWaitForWarm = "wait_for_warm"
+	// CodeMirrorSlotAtCapacity (issue #72 / ADR-125 PR-A3) is the
+	// per-rule mirror VM concurrency cap reached. Wire shape
+	// mirrors CodeWaitForWarm (gRPC ResourceExhausted, HTTP 503):
+	// the cap is a deliberate, bounded, transient outcome — the
+	// customer's next mirror request will likely succeed once an
+	// in-flight mirror VM parks. The gateway dispatch goroutine
+	// catches this code and writes a ledger entry with
+	// status_diff=true + metric result=cap_at_max (see
+	// pkg/gateway/mirror_dispatch.go).
+	CodeMirrorSlotAtCapacity = "mirror_slot_at_capacity"
 	// CodeEdgeRuleMaintenance marks a kind=maintenance edge-rule
 	// hit on the gatewayd hot path (ADR-091 amendment, PR-A
 	// #???). The customer configured an (host, path, http_method)
@@ -1452,7 +1462,7 @@ func StatusForCode(code string) int {
 		CodeInvalidEgressAllowlist, CodeInvalidPublicAuthIPAllowlist:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm,
-		CodeEdgeRuleMaintenance, CodeAppMaintenance:
+		CodeEdgeRuleMaintenance, CodeAppMaintenance, CodeMirrorSlotAtCapacity:
 		return http.StatusServiceUnavailable
 	case CodeScanCritical:
 		// 503 — the base ext4 has a CRITICAL Grype finding

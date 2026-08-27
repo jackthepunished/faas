@@ -10460,6 +10460,27 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 	return inst, nil
 }
 
+// CreateInstanceWithMode (issue #72 / ADR-125 PR-A3) is the
+// mode-aware overload the schedd's mirror admission path uses to
+// stamp mode='mirror' on canary-shadow instances. The SQL is
+// 1:1 with CreateInstance's INSERT — only the explicit `mode`
+// column on the values list differs. The CHECK constraint on
+// the mode column (migrations/00385) rejects any value other
+// than 'normal' or 'mirror' with SQLSTATE 23514 at write time,
+// so a typo at the call site fails fast rather than leaking
+// as a wire-shape typo on the wake proto. mode must be a
+// non-empty string from state.InstanceMode{normal,mirror};
+// the engine validates before calling (Engine.AdmitMirrorInstance).
+func (s *PgStore) CreateInstanceWithMode(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID, mode string) (Instance, error) {
+	row := s.pool.QueryRow(ctx,
+		`insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at, mode)
+		 values ($1, $2, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else $6::uuid end, now(), $7)
+		 returning id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
+		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count`,
+		appID, deploymentID, state, ramMB, nodeID, wakeID, mode)
+	return scanInstance(row)
+}
+
 func (s *PgStore) InstanceByID(ctx context.Context, id string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),

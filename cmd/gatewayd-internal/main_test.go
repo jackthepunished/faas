@@ -53,6 +53,15 @@ func (f *fixedBackend) Admit(_ context.Context, _, _, _, _ string, _ int) (strin
 	return "wake-fixed", gateway.WakeMethodColdBoot, false, nil
 }
 
+// LookupMirrorRules (PR-A3 / issue #72 / ADR-124) — fixedBackend
+// is a unit-test fake used for the gateway's wake path; mirror
+// rule picking is exercised in pkg/gateway/pgbackend_test.go.
+// Returns no rules + false so the handler fan-out path stays
+// dormant here.
+func (f *fixedBackend) LookupMirrorRules(_ context.Context, _ string) ([]gateway.MirrorRuleRow, bool) {
+	return nil, false
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

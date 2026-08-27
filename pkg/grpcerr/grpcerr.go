@@ -40,7 +40,8 @@ func codeToGRPC(code string) codes.Code {
 		api.CodeAppLayerTooBig,
 		api.CodeQuotaExhausted,
 		api.CodeCapacity,
-		api.CodeWaitForWarm:
+		api.CodeWaitForWarm,
+		api.CodeMirrorSlotAtCapacity:
 		// CodeWaitForWarm (PR-D, issue #462) is a 503 on the HTTP
 		// surface and ResourceExhausted on gRPC. The gRPC code is
 		// the lossy carrier — the HTTP status is re-derived from

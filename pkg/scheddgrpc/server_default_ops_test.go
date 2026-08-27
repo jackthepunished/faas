@@ -33,6 +33,9 @@ func (noopEngine) Wake(context.Context, string, string, string, string) (sched.W
 func (noopEngine) AdmitInstance(context.Context, string, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
+func (noopEngine) AdmitMirrorInstance(context.Context, string, string, string) (sched.WakeResult, error) {
+	return sched.WakeResult{}, nil
+}
 func (noopEngine) EnsureWake(context.Context, string, string) (sched.CoordOutcome, error) {
 	return sched.CoordOutcome{}, nil
 }

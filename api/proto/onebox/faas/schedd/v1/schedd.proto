@@ -403,6 +403,25 @@ message WakeRequest {
   // (no new BootStarted row is emitted — the existing row's
   // events.data.trigger is untouched). Additive per ADR-016.
   string trigger = 4;
+  // is_mirror (issue #72 / ADR-124 PR-A3) marks the wake as
+  // a canary-shadow mirror invocation driven by a customer
+  // mirror rule. schedd stamps mode='mirror' on the new
+  // instances row (PR-A1's migrations/00385 + CHECK) so the
+  // sampler skips the row (the customer is billed per running
+  // second on the source, not the mirror) and the reaper
+  // leaves the VM up for MirrorMaxLifetimeSeconds. Empty
+  // (false) = normal customer wake — pre-A3 wire behaviour
+  // preserved bit-for-bit. Additive per ADR-016 — pre-A3
+  // callers ignore the field and observe the same wire
+  // behaviour as before.
+  bool is_mirror = 5;
+  // mirror_rule_id (issue #72 / ADR-124 PR-A3) is the
+  // mirror_rules.id the dispatch goroutine is acting for.
+  // schedd keys its per-rule concurrent-VM cost circuit
+  // (Engine.tryAcquireMirrorSlot) on this value. Empty
+  // = legacy wake — pre-A3 callers ignore the field.
+  // Additive per ADR-016.
+  string mirror_rule_id = 6;
 }
 
 // WakeMethod reports whether the wake was a snapshot restore or a cold boot.
@@ -486,6 +505,16 @@ message AdmitInstanceRequest {
   // trigger (ADR-127) mirrors WakeRequest.trigger. See that field
   // for the closed-enum contract. Additive per ADR-016.
   string trigger = 4;
+  // is_mirror (issue #72 / ADR-124 PR-A3) mirrors
+  // WakeRequest.is_mirror. Same semantics — schedd stamps
+  // mode='mirror' on the admitted instance row. Additive per
+  // ADR-016.
+  bool is_mirror = 5;
+  // mirror_rule_id (issue #72 / ADR-124 PR-A3) mirrors
+  // WakeRequest.mirror_rule_id — schedd keys the per-rule
+  // concurrent-VM cost circuit on this value. Additive per
+  // ADR-016.
+  string mirror_rule_id = 6;
 }
 
 // AdmitInstanceResponse is the typed result of Engine.AdmitInstance.

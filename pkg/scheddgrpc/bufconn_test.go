@@ -75,8 +75,18 @@ func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, sco
 	// Default: behave like Wake so existing tests that don't set
 	// admitInstanceFn continue to compile and pass unchanged.
 	// (PR-C widening: deployment_id is forwarded to Wake via "")
+	return f.wakeFn(ctx, appID, "", scope)
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) is the sibling
+// to AdmitInstance used when the gateway dispatches a mirror
+// VM. The bufconn test suite doesn't exercise the mirror hot path,
+// so the default delegate mirrors AdmitInstance (Wake-fn or nil).
+// Mirror-specific behaviour is asserted by pkg/sched's
+// engine_mirror_test.go.
+func (f *fakeEngine) AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (sched.WakeResult, error) {
 	if f.wakeFn != nil {
-		return f.wakeFn(ctx, appID, "", scope)
+		return f.wakeFn(ctx, appID, mirrorDeploymentID, "")
 	}
 	return sched.WakeResult{}, nil
 }
