@@ -191,6 +191,51 @@ func TestServicesInUnitDirRejectsUnknownDaemon(t *testing.T) {
 	}
 }
 
+func TestReconcileServiceTopologyRemovesOppositeRoleResidue(t *testing.T) {
+	unitDir := t.TempDir()
+	for _, name := range []string{"faas-vmmd.service", "faas-gatewayd.service"} {
+		if err := os.WriteFile(filepath.Join(unitDir, name), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(unitDir, "faas-builderd.service")); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := runCommand
+	t.Cleanup(func() { runCommand = orig })
+	var calls [][]string
+	runCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+
+	r := hostRuntime{unitDir: unitDir}
+	if err := r.reconcileServiceTopology(context.Background(), []string{"apid"}); err != nil {
+		t.Fatalf("reconcileServiceTopology: %v", err)
+	}
+
+	hasCall := func(want ...string) bool {
+		for _, call := range calls {
+			if reflect.DeepEqual(call, want) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCall("systemctl", "disable", "--now", "faas-vmmd.service") {
+		t.Errorf("missing disable for stale vmmd: %v", calls)
+	}
+	if hasCall("systemctl", "disable", "--now", "faas-builderd.service") {
+		t.Errorf("already-masked builderd was sent through disable --now: %v", calls)
+	}
+	for _, service := range []string{"vmmd", "builderd", "gatewayd", "spool-sync"} {
+		if !hasCall("systemctl", "mask", "--force", "faas-"+service+".service") {
+			t.Errorf("missing mask for omitted %s: %v", service, calls)
+		}
+	}
+}
+
 func TestRestartServicesFiltersRegistryByManifest(t *testing.T) {
 	order, err := daemonunitspec.RestartOrder()
 	if err != nil {

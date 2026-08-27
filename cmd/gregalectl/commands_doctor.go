@@ -43,6 +43,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/releasebundle"
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 )
@@ -1448,8 +1449,8 @@ var (
 	}
 	// A split control-plane does not run imaged/builderd, so the
 	// builder-base probe is not applicable there. Prefer the explicit
-	// role when supplied; otherwise use systemd's read-only unit state
-	// to distinguish a compute-capable box from a control-only box.
+	// role when supplied; otherwise use the active deployment manifest
+	// and only fall back to systemd state for legacy canonical releases.
 	builderBaseRequiredHook = func(ctx context.Context) bool {
 		if role := os.Getenv("FAAS_BOX_ROLE"); role != "" {
 			return role == "compute-only" || role == "single-box"
@@ -1469,6 +1470,41 @@ var (
 		return cmd.CombinedOutput()
 	}
 )
+
+// builderBaseRequired determines whether this host's active deployment owns
+// the compute-side builder base. A controller-managed deployment has an
+// explicit releasebundle manifest whose systemd files are the authoritative
+// role set. This must win over systemctl is-enabled: an older one-box install
+// can leave an opposite-role unit enabled but inactive on a split
+// control-plane, which is residue rather than evidence that the host needs a
+// builder base. Canonical releases without the wrapper retain the legacy
+// systemd fallback for compute-node compatibility.
+func builderBaseRequired(ctx context.Context, deps *doctorDeps) bool {
+	if role := strings.TrimSpace(os.Getenv("FAAS_BOX_ROLE")); role != "" {
+		return role == "compute-only" || role == "single-box"
+	}
+	if deps != nil && deps.releasesRoot != "" && deps.currentGitSHA != "" {
+		root := releaseinstall.BundleRoot(deps.releasesRoot, deps.currentGitSHA)
+		manifestPath := filepath.Join(root, releasebundle.ManifestName)
+		if _, err := os.Stat(manifestPath); err == nil {
+			deployment, readErr := releasebundle.Read(root)
+			if readErr == nil {
+				for _, file := range deployment.Files {
+					switch file.Path {
+					case "systemd/faas-vmmd.service", "systemd/faas-builderd.service", "systemd/faas-imaged.service":
+						return true
+					}
+				}
+				return false
+			}
+			// checkBundle reports a malformed deployment manifest as an
+			// independent error. Do not add a misleading builder-base
+			// error based on stale systemd enablement in that case.
+			return false
+		}
+	}
+	return builderBaseRequiredHook(ctx)
+}
 
 // checkBuilderBaseExt4 verifies the staged builder base ext4 contains
 // /usr/local/bin/faas-guest-init (issue #938 / PR-B / ADR-114).
@@ -1491,14 +1527,13 @@ var (
 // today; the ctx anchor lets future --json=streaming or timeout-
 // bounded wrappers reuse this check without churn).
 func checkBuilderBaseExt4(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
-	_ = deps
 	basePath := locateBuilderBasePathHook()
 	storageRoot := os.Getenv("FAAS_STORAGE_ROOT")
 	if storageRoot == "" {
 		storageRoot = "/srv/fc"
 	}
 	canonicalPath := filepath.Join(storageRoot, "base", "runner-builder-"+runtime.GOARCH+".ext4")
-	if os.Getenv("FAAS_BUILDER_BASE_PATH") == "" && basePath == canonicalPath && !builderBaseRequiredHook(ctx) {
+	if os.Getenv("FAAS_BUILDER_BASE_PATH") == "" && basePath == canonicalPath && !builderBaseRequired(ctx, deps) {
 		return []doctorFinding{{
 			Check:    doctorCheckBuilderBaseExt4,
 			Severity: doctorSeverityOK,

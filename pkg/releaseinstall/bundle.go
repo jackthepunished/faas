@@ -285,6 +285,29 @@ func Verify(root string, m Manifest) error {
 		return err
 	}
 	bin := BinDir(root, m.GitSHA)
+	if err := verifyCanonicalFiles(bin, m); err != nil {
+		return err
+	}
+	// A controller-managed host release contains the canonical daemon
+	// bundle plus deployctl/migrate and the role-specific systemd tree.
+	// Those controller files are intentionally outside the signed
+	// releaseinstall bin catalog; the sibling releasebundle manifest is
+	// the exact-file integrity envelope for that assembled deployment.
+	// Keep the canonical hash checks above, then let that envelope account
+	// for the additional files. A plain releaseinstall directory has no
+	// manifest.json and keeps the strict catalog walk below.
+	if hasDeploymentManifest, err := verifyDeploymentBundle(root, m); hasDeploymentManifest {
+		return err
+	}
+
+	return verifyUnexpectedBinFiles(bin, m)
+}
+
+// verifyCanonicalFiles checks every daemon, support executable, and runtime
+// asset recorded in the releaseinstall manifest. It deliberately does not
+// walk for unexpected files because controller-managed deployments carry a
+// second, role-specific integrity envelope around the canonical tree.
+func verifyCanonicalFiles(bin string, m Manifest) error {
 	// Iterate over the canonical daemon-name set so an extra
 	// binary in bin/ that isn't in the catalog doesn't silently
 	// pass verification.
@@ -328,9 +351,47 @@ func Verify(root string, m Manifest) error {
 			return fmt.Errorf("releaseinstall: asset %s sha256 %s, want %s", name, "sha256:"+got, want)
 		}
 	}
+	return nil
+}
+
+// verifyDeploymentBundle verifies the optional releasebundle envelope used
+// by deployctl's assembled host deployment. The bool distinguishes a plain
+// canonical release (no envelope) from a malformed envelope, which must be
+// reported as an error rather than silently falling back to the strict bin
+// walk.
+func verifyDeploymentBundle(root string, m Manifest) (bool, error) {
+	releaseRoot := BundleRoot(root, m.GitSHA)
+	path := filepath.Join(releaseRoot, releasebundle.ManifestName)
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("releaseinstall: stat deployment manifest: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return true, fmt.Errorf("releaseinstall: deployment manifest is not a regular file")
+	}
+	deployment, err := releasebundle.Read(releaseRoot)
+	if err != nil {
+		return true, fmt.Errorf("releaseinstall: read deployment manifest: %w", err)
+	}
+	if deployment.ReleaseID != m.GitSHA || deployment.CommitSHA != m.GitSHA {
+		return true, fmt.Errorf("releaseinstall: deployment manifest identity (%s, %s) does not match git_sha %s", deployment.ReleaseID, deployment.CommitSHA, m.GitSHA)
+	}
+	if err := releasebundle.Verify(releaseRoot, deployment); err != nil {
+		return true, fmt.Errorf("releaseinstall: verify deployment bundle: %w", err)
+	}
+	return true, nil
+}
+
+// verifyUnexpectedBinFiles retains the strict catalog check for canonical
+// release directories that do not have a controller deployment envelope.
+func verifyUnexpectedBinFiles(bin string, m Manifest) error {
 	// Walk the bin directory and reject any file that isn't a
 	// catalog daemon (names from manifest.SortedHostKeys()).
 	// Mirrors pkg/releasebundle.Verify's "unexpected files" check.
+	daemonNames := manifest.SortedHostKeys()
 	catalog := make(map[string]struct{}, len(daemonNames)*2)
 	for _, name := range daemonNames {
 		catalog[name] = struct{}{}
