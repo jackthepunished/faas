@@ -33,6 +33,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	mirrorRollup "github.com/onebox-faas/faas/pkg/mirror"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/floor"
@@ -1482,6 +1483,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"metrics_url", cfg.GatewayMetricsURL,
 			"window_s", api.ScaleUpWindowSeconds,
 			"aggressive", cfg.ReaperAggressive)
+		// Issue #72 / ADR-124 / ADR-125 PR-A3 commit 4: mirror
+		// invocation_summary rollup + ledger retention sweep.
+		// Runs on the same interval as the scale-up triggers so
+		// a single shared dial governs the schedd's housekeeping
+		// cadence. Errors are logged Warn inside RollupLoop and
+		// retried on the next tick — a persistent failure
+		// surfaces as a flood of WARN logs an operator can alert
+		// on.
+		go mirrorRollup.RollupLoop(ctx, mirrorPoolAdapter{pool: pool}, mirrorRollup.DefaultRollupInterval, log)
+		log.Info("mirror rollup + ledger sweep enabled",
+			"interval", mirrorRollup.DefaultRollupInterval,
+			"retention", mirrorRollup.DefaultLedgerRetention)
 	}
 	// Cron dispatch path: route synthetic requests through gatewayd-internal's
 	// internal listener so metering + rate limits apply identically
@@ -2091,4 +2104,21 @@ type schedTargetsLedger struct {
 // ledger's Concurrency accessor (pkg/sched/admission.go).
 func (s schedTargetsLedger) Concurrency(appID string) int {
 	return s.ledger.Concurrency(appID)
+}
+
+// mirrorPoolAdapter (issue #72 / ADR-124 / ADR-125 PR-A3 commit 4)
+// bridges *pgxpool.Pool.Exec's pgconn.CommandTag return into the
+// int64-shaped execer interface pkg/mirror expects. Mirrors the
+// canonical cmd/meterd/main.go::poolAdapter shape (the meter
+// rollup uses the same seam). Avoids importing pgxpool into
+// pkg/mirror and keeps the rollup unit-testable without a
+// Postgres dependency.
+type mirrorPoolAdapter struct{ pool *pgxpool.Pool }
+
+func (a mirrorPoolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, error) {
+	tag, err := a.pool.Exec(ctx, sql, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
