@@ -8809,10 +8809,8 @@ func (m *MemStore) LatestHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbe
 
 // LatestBuilderHeartbeatStats (operator-side observability
 // mega-PR / Commit 7 — P5) returns the most-recent heartbeat
-// filtered to source='builder_tick'. The underlying writer
-// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
-// risk list. In the meantime the table is empty for
-// builder_tick, so this returns the empty slice.
+// filtered to source='builder_tick'. The production writer is
+// exercised by builderd; this method simply filters the history.
 func (m *MemStore) LatestBuilderHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
 	return m.latestHeartbeatStatsWhere("builder_tick", true)
 }

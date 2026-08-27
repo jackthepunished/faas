@@ -70,7 +70,56 @@ func TestParseSweepOlderThan_TableDriven(t *testing.T) {
 	}
 }
 
+func TestParseSweepReason_TableDriven(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		want     string
+		wantCode string
+	}{
+		{name: "empty_defaults", want: sweepDefaultReason},
+		{name: "valid_reason", raw: "incident_2026_08_27", want: "incident_2026_08_27"},
+		{name: "hyphen_rejected", raw: "incident-123", wantCode: api.CodeValidation},
+		{name: "space_rejected", raw: "incident 123", wantCode: api.CodeValidation},
+		{name: "too_long_rejected", raw: "12345678901234567890123456789012345678901234567890123456789012345", wantCode: api.CodeValidation},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, prob := parseSweepReason(c.raw)
+			if c.wantCode != "" {
+				if prob == nil {
+					t.Fatalf("expected problem, got reason %q", got)
+				}
+				if prob.Code != c.wantCode {
+					t.Errorf("code = %q, want %q", prob.Code, c.wantCode)
+				}
+				return
+			}
+			if prob != nil {
+				t.Fatalf("unexpected problem: %+v", prob)
+			}
+			if got != c.want {
+				t.Errorf("reason = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestPostSweepStuckBuilds_TableDriven(t *testing.T) {
+	t.Run("non_allowlisted_admin_is_denied", func(t *testing.T) {
+		srv, _, key := newForceHarness(t, nil)
+		srv.adminAllowlist.emails = map[string]struct{}{"another-operator@example.com": {}}
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/builds/sweep-stuck?confirm=true&older_than=15m", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("missing_confirm_returns_400", func(t *testing.T) {
 		srv, _, key := newForceHarness(t, nil)
 		req := httptest.NewRequest(http.MethodPost,
@@ -128,6 +177,26 @@ func TestPostSweepStuckBuilds_TableDriven(t *testing.T) {
 		}
 		if prob.Code != "older_too_large" {
 			t.Errorf("code = %q, want older_too_large", prob.Code)
+		}
+	})
+
+	t.Run("invalid_reason_returns_400", func(t *testing.T) {
+		srv, _, key := newForceHarness(t, nil)
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/admin/builds/sweep-stuck?confirm=true&older_than=15m&reason=incident-123", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		var prob api.Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+			t.Fatalf("decode problem: %v", err)
+		}
+		if prob.Code != api.CodeValidation {
+			t.Errorf("code = %q, want %q", prob.Code, api.CodeValidation)
 		}
 	})
 

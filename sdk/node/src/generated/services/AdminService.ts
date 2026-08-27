@@ -598,7 +598,8 @@ export class AdminService {
    * "1ns" cannot sweep in-flight builds. Default 15m.
    *
    * Audit row: operator.action.reclaim_build with
-   * account_id=NULL (fleet-level, not tenant-scoped).
+   * account_id=NULL (fleet-level, not tenant-scoped), including
+   * the normalized operator reason.
    *
    * @returns SweepStuckBuildsResponse Sweep complete. `swept_count` may be 0 when no rows match the threshold.
    * @throws ApiError
@@ -606,6 +607,7 @@ export class AdminService {
   public static postSweepStuckBuilds({
     confirm,
     olderThan,
+    reason = 'operator_reclaim_build',
   }: {
     /**
      * Must be the literal string "true" — tripwire on sweep-stuck against operator fat-fingering.
@@ -615,6 +617,10 @@ export class AdminService {
      * Threshold duration. Clamped to [1m, 60m]. Default 15m.
      */
     olderThan?: string,
+    /**
+     * Optional durable audit reason. Lowercase letters, numbers, and underscores only.
+     */
+    reason?: string,
   }): CancelablePromise<SweepStuckBuildsResponse> {
     return __request(OpenAPI, {
       method: 'POST',
@@ -622,6 +628,7 @@ export class AdminService {
       query: {
         'confirm': confirm,
         'older_than': olderThan,
+        'reason': reason,
       },
       errors: {
         400: `Sweep-stuck validation: \`?confirm=true\` is missing or \`?older_than=\` failed validation.`,

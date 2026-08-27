@@ -3676,13 +3676,8 @@ type Store interface {
 	// LatestBuilderHeartbeatStats (operator-side observability
 	// mega-PR / Commit 7 — P5) is the builder_tick twin of
 	// LatestHeartbeatStats. Filters to source='builder_tick' only;
-	// the underlying writer (pkg/builderd/heartbeat.go) is deferred
-	// to a follow-up PR per the Commit 7 risk list (builderd does
-	// not currently self-register a compute_nodes row at startup).
-	// The mirror method exists today so the
-	// GET /v1/admin/obs/builder-heartbeats endpoint can land
-	// without waiting on the writer; once the writer is live, the
-	// row count goes from zero to non-zero without an API change.
+	// cmd/builderd publishes these rows independently of the build
+	// queue so idle builders remain observable.
 	LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
 
 	// QueuedBuildsCount (Commit 7 — P5) returns the number of
