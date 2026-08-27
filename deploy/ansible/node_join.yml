@@ -385,6 +385,7 @@
           - secrets
           - init
           - --preserve-existing
+          - --no-db
           - --host
           - "{{ faas_join_database_node }}"
       register: faas_secrets_init
