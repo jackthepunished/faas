@@ -202,11 +202,13 @@ tags:
       artifact; the device-code flow is the SDK programmatic-auth path.
   - name: mfa
     description: |
-      TOTP MFA on dashboard sessions (IAM-2, issue #186). Five
+      Optional TOTP MFA on dashboard sessions (IAM-2, issue #186). Five
       POST endpoints: enroll (one-shot secret + recovery codes),
       confirm (first TOTP code), verify (step-up for an
       mfa_pending session), recover (burn a recovery code), and
-      disable (opt-out via password or recovery code).
+      disable (opt-out via password or recovery code). Enrollment
+      is never triggered automatically by plan, billing, or deploy
+      events.
   - name: github
     description: |
       GitHub App integration (ADR-012, PR-B). The dashboard bind
@@ -341,6 +343,39 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/admin/config/{key}/rollback:
+    post:
+      tags: [operator]
+      operationId: rollbackOperatorRuntimeConfig
+      summary: Roll back a hot runtime setting to a previous revision
+      description: |
+        Applies the selected historical value as a new revision through the
+        same zero-downtime hot-apply path as PATCH. Only mutable hot settings
+        are eligible. The request is optimistic-concurrency protected and
+        the rollback itself is appended to the audit and revision history.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+          description: Catalog key to roll back.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackOperatorRuntimeConfigRequest' }
+      responses:
+        '200':
+          description: Rolled-back and applied configuration entry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorRuntimeConfig' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/admin/config/{key}/revisions:
     get:
@@ -600,8 +635,10 @@ paths:
       summary: Finish MFA enrollment with the first TOTP code.
       description: |
         Verifies the 6-digit code against the sealed secret
-        and stamps mfa_enrolled_at. Re-issues the session
-        cookie without the mfa_pending flag.
+        and stamps mfa_enrolled_at. Re-issues the current session
+        cookie without the mfa_pending flag; future dashboard logins
+        will require a TOTP verification because enrollment is the
+        customer's explicit opt-in.
       requestBody:
         required: true
         content:
@@ -688,8 +725,8 @@ paths:
         mfa_enrolled_at. Body must include exactly one of
         `password` (re-verified against account_passwords)
         or `recovery_code` (consumed). Leaves mfa_required
-        untouched so the plan-upgrade / 2nd-deploy
-        chokepoints can re-arm.
+        untouched so an explicit operator/workspace policy remains
+        in force after disable.
       requestBody:
         required: true
         content:
@@ -4451,47 +4488,35 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ADR-117 production-ready follow-on (issue #976 / SAFE-RELEASES-E.2
+  # retry seam). Same 404 IDOR-safe posture as the sibling endpoints
+  # but a tailored copy keeps vacuum's description-duplication rule
+  # at zero on this branch.
   /v1/deployments/{id}/retry:
     parameters:
       - $ref: '#/components/parameters/Id32'
     post:
       tags: [deployments]
-      operationId: retryDeploymentFromStage
-      summary: Per-stage retry (ADR-117 §Production-ready follow-on, C2).
+      operationId: retryDeployment
+      summary: Retry a failed deployment from a named stage (ADR-117 production-ready follow-on C2).
       description: |
-        Inserts a fresh `deployments` row from a failed (or stale)
-        row, restarting the imaged chokepoint at `from_stage`. The
-        fresh row copies every input primitive from the source
-        (`image`, `source_url`, `commit_sha`, `overrides`,
-        `sidecars`, `scope`, `traffic_percent`) and seeds a fresh
-        `stage_state` (`current = from_stage`, empty history). The
-        source row is left untouched — the new row's id is
-        returned in the body so the customer can wire it to
-        `GET /v1/deployments/{new-id}/logs` for live progress
-        (mirrors `gregale deploys retry` UX).
+        Closes the production-ready gap exposed by ADR-117 §C4: a
+        deployment that fails partway is restorable via
+        `POST /v1/deployments/{id}/retry` with a `from_stage` field.
+        The deployment row is duplicated (NOT mutated); the new
+        row carries a fresh `stage_state.current` and a fresh
+        `stage_state.history` so the dashboard's stage-progression
+        timeline (and the CLI's `gregale deploys show <id>` summary)
+        reflects the retry as a separate event.
 
-        `from_stage` must be one of the closed 6-stage vocabulary
-        (`source_download` / `dependency_restore` / `image_build` /
-        `security_scan` / `snapshot_prepare` / `readiness`).
-        `from_stage = source_download` is intentional — it's the
-        "retry-from-top" case and re-runs the whole pipeline.
+        The closed-6 vocabulary mirrors `state.AllStageNames`
+        (ADR-117); the API rejects unknown values with 400.
+        Empty strings are rejected for the same reason.
 
-        Status codes:
-
-          - 202 Accepted with the new row (the row is written;
-            imaged picks it up; the SSE stream on the new id is
-            the customer's progress surface).
-          - 400 if `from_stage` is empty or not in the closed-6
-            vocabulary.
-          - 401 if not authenticated.
-          - 404 if the source deployment does not exist OR is in
-            another account (IDOR posture; never 403, never
-            reveal cross-account existence).
-          - 500 for storage-layer failures.
-
-        Auth chain: authLimited → requireMFA → requireScope
-        (deploy-write). Non-idempotent (every call creates a fresh
-        row); the operator must surface this in the dashboard.
+        Auth chain mirrors `POST /v1/apps/{slug}/deployments`:
+        `authLimited → requireMFA → requireScope(ScopesDeployWriteSurface)`.
+        Returns 202 Accepted with the new deployment row (same
+        shape as `POST /v1/apps/{slug}/deployments`).
       requestBody:
         required: true
         content:
@@ -4500,17 +4525,77 @@ paths:
               $ref: '#/components/schemas/RetryDeploymentRequest'
       responses:
         '202':
-          description: "Fresh row inserted with `stage_state.current = from_stage`. imaged picks it up; progress is on the per-deployment SSE stream."
+          description: The new deployment row (same shape as a fresh deploy).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
         '400':
-          description: "Bad request: `from_stage` missing or not in the closed-6 vocabulary. Stable code `validation`."
-          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+          description: |
+            `400 Bad Request` — `from_stage` is empty or
+            not in the closed-6 vocabulary.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — the caller's MFA factor or scope
+            does not satisfy the deploy-write surface.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Retry requested on a missing or cross-account deployment (IDOR-safe; never 403).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/deployments/{id}/url:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentURL
+      summary: Get per-deployment preview URL (SAFE-RELEASES-C.2).
+      description: |
+        Returns the per-deployment preview URL shape
+        `deploy-{N}.{slug}.gregale.dev` that the cert allowlist will
+        mint under for a single deployment (issue #976 / ADR-122).
+        `N` is the per-app 1-based ordinal of the deployment row,
+        resolved from state.DeploymentOrdinal — the order is
+        stable so a previously-issued URL doesn't silently rot when
+        a later deploy lands.
+
+        The `alive` field is the same predicate the cert allowlist
+        consults (state.Deployment.DeploymentPreviewActive):
+        `true` iff the deployment's status is in
+        `{pending, building, imaging, snapshotting, live}`. When
+        `alive=false` the handler returns 200 with `host=""` and
+        `url=""` so the dashboard renders a "preview closed" chip
+        without round-tripping again. When the per-deployment
+        preview zone is disabled (`wire.DeployWildcardSuffix == ""`)
+        the handler returns the same 200 + Alive=false shape so
+        envelopes stay stable across environments.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account
+            (IDOR-safe; no account-existence leak).
+      responses:
+        '200':
+          description: The resolved per-deployment preview URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPreviewURL'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
-          description: Source deployment missing or cross-account probe (IDOR-safe; never 403).
+          description: Deployment row missing or cross-account probe on the preview URL seam (IDOR-safe; never 403).
           content:
             application/problem+json:
               schema:
@@ -9687,6 +9772,15 @@ components:
         reason: { type: string }
         created_at: { type: string, format: date-time }
 
+    RollbackOperatorRuntimeConfigRequest:
+      description: "Request to apply a historical runtime configuration revision."
+      type: object
+      required: [version, reason]
+      properties:
+        version: { type: integer, format: int64, minimum: 1 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        expected_version: { type: integer, format: int64, minimum: 0 }
+
     # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────
 
     PasswordLoginRequest:
@@ -12237,6 +12331,40 @@ components:
         essential:
           type: boolean
           description: "Defaults to true. type=init non-zero exit → fail deploy; type=sidecar non-zero exit → restart-loop. PR-B's runtime."
+
+    # ─── Deployments (PR-E1 / SAFE-RELEASES-C.2) ──────────────────────────
+
+    DeploymentPreviewURL:
+      description: |
+        Per-deployment preview URL read seam response.
+        Issue #976 / ADR-122 / SAFE-RELEASES-C.2.
+        Mirrors the api.DeploymentPreviewURL struct in pkg/api/dto.go.
+      type: object
+      required: [deployment_id, app_id, alive]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+          description: Echoed from the path so a batch caller can correlate.
+        app_id:
+          type: string
+          format: uuid
+          description: Resolved parent app id.
+        host:
+          type: string
+          description: 'Per-deployment preview hostname (`deploy-{N}.{slug}.gregale.dev`). Empty when alive=false OR when wire.DeployWildcardSuffix is "" (zone disabled).'
+          example: deploy-3.url-happy.gregale.dev
+        url:
+          type: string
+          description: Full request URL (`https://<host>`). Empty when host is empty.
+          example: https://deploy-3.url-happy.gregale.dev
+        alive:
+          type: boolean
+          description: 'True iff the deployment exists, belongs to the caller, and has a status in {pending, building, imaging, snapshotting, live} (the same predicate as state.Deployment.DeploymentPreviewActive the cert allowlist consults).'
+        last_checked_at:
+          type: [string, "null"]
+          format: date-time
+          description: 'When certmagic last validated the cert under host. Null for never-touched hostnames. NOT a latency probe — the cert NotAfter is the load-bearing expiry.'
 
     # ─── Instances ────────────────────────────────────────────────────────
 
@@ -17324,7 +17452,8 @@ components:
       description: |
         Empty success body. Side effects: mfa_secret_encrypted,
         mfa_recovery_codes_hash, and mfa_enrolled_at are all NULL.
-        mfa_required is left as-is so the chokepoints can re-arm.
+        mfa_required is left as-is so an explicit policy remains in
+        force after disable.
       type: object
       additionalProperties: false
 

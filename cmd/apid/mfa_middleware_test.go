@@ -32,8 +32,8 @@ import (
 // to the desired value. The cookie must carry a sid backed by a
 // live sessions row, otherwise requireSessionCookie rejects it
 // with CodeSessionExpired (IAM-3 / ADR-039). The login handlers
-// use the same IssueWithSession path after a plan-upgrade
-// chokepoint flips mfa_required.
+// use the same IssueWithSession path after the account opts into
+// MFA or an explicit policy is enabled.
 func reissueWithMFAFlag(t *testing.T, mgr *session.Manager, sid, accountID string, pending bool) *http.Cookie {
 	t.Helper()
 	tok, err := mgr.IssueWithSession(sid, accountID, pending)

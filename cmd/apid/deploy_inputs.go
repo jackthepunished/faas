@@ -191,17 +191,6 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 			api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 			return
 		}
-		// IAM-2 (issue #186): 2nd-deploy chokepoint. Same wiring
-		// as the image branch in handlers.go::createDeployment.
-		// The deployment row is now visible; if the new count
-		// is >= 2, arm mfa_required for the next login. The
-		// helper's CreateDeployment already incremented the
-		// CountDeployments view (the in-tx supersede is invisible
-		// above the Store seam), so calling this here is
-		// behaviour-equivalent to the pre-refactor
-		// "post-CreateDeployment, pre-CreateBuild" site — see
-		// handlers_mfa.go:790-797.
-		s.maybeFlipMFAOnDeploy(r.Context(), acct)
 		// Look up the durable deployment row to build the wire
 		// response. LatestDeployment returns the row we just
 		// inserted (state.Store.CreateDeployment is its own tx

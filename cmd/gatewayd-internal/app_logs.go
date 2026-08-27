@@ -241,6 +241,21 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 	// from blocking when the SSE writer is slow; a dropped frame
 	// is no worse than a missed frame on a quiet stream because
 	// the heartbeat keeps the client alive.
+	//
+	// Terminal-result carve-out (gatewayd flake surfaced 2026-08-24,
+	// dispatch 32718562570 / TestServeAppLogs_GenericErrorDelegatesToRenderAppLogsError):
+	// a non-EOF error from Recv must NEVER be dropped on the
+	// non-blocking `default:` path, because the handler's only
+	// signal that an error occurred is the closed recvCh — if the
+	// terminal recvResult is dropped, the handler's `!ok` branch
+	// fires and emits `event: end\ndata: {}` (clean-EOF frame)
+	// instead of the RenderAppLogsError envelope the SDK is
+	// pinned to. ~6% failure rate under -race -count=50 because
+	// the handler can race behind the receive goroutine exactly
+	// once on the second Recv (1st result still buffered).
+	// Resolve by splitting the send into two paths: regular frames
+	// may drop; terminal results block until the handler consumes
+	// them or the streamCtx cancels.
 	recvCh := make(chan recvResult, 1)
 	go func() {
 		defer close(recvCh)
@@ -251,19 +266,35 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 				return
 			default:
 			}
+			if err == nil {
+				// Regular frame — drop rather than block
+				// when the SSE writer is behind.
+				select {
+				case recvCh <- recvResult{frame: f, err: nil}:
+				case <-streamCtx.Done():
+					return
+				default:
+					// Channel full — drop. The heartbeat
+					// keeps the client alive, and the
+					// per-instance ring is the durable
+					// source of truth.
+				}
+				continue
+			}
+			// Terminal result (any non-nil err from Recv,
+			// including io.EOF / codes.NotFound / generic).
+			// Block until the handler consumes it OR the
+			// streamCtx cancels; do not drop. If we drop a
+			// terminal error here the handler emits the
+			// clean-EOF `event: end\ndata: {}` frame instead
+			// of the RenderAppLogsError envelope the SDK
+			// decodes.
 			select {
 			case recvCh <- recvResult{frame: f, err: err}:
 			case <-streamCtx.Done():
 				return
-			default:
-				// Channel full — the SSE writer is behind.
-				// Drop rather than block; the heartbeat keeps
-				// the client alive, and the per-instance ring
-				// is the durable source of truth.
 			}
-			if err != nil {
-				return
-			}
+			return
 		}
 	}()
 

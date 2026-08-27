@@ -606,26 +606,23 @@ type Store interface {
 	// when the row is missing — the handler must surface 404 then.
 	MarkMFAEnrolled(ctx context.Context, id string) error
 	// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash,
-	// and mfa_enrolled_at. Does NOT touch mfa_required — the
-	// chokepoints (plan upgrade / card attached / 2nd deploy) re-set
-	// it on the next trigger. The audit Emit is the caller's job
+	// and mfa_enrolled_at. Does NOT touch mfa_required so an explicit
+	// policy remains in force after a customer disables MFA. The audit
+	// Emit is the caller's job
 	// (the events table is the audit trail; this method does not
 	// persist a reason string).
 	ClearMFA(ctx context.Context, id string) error
-	// SetMFARequired writes the mfa_required flag and reports whether
-	// the row actually changed. Returns (changed=true, nil) on a real
-	// write, (changed=false, nil) when the value was already what was
-	// requested (the chokepoint suppresses a duplicate audit Emit in
-	// that case), and (changed=false, ErrNotFound) when the row is
+	// SetMFARequired writes the explicit mfa_required policy flag and
+	// reports whether the row actually changed. Returns (changed=true,
+	// nil) on a real write, (changed=false, nil) when the value was
+	// already what was requested, and (changed=false, ErrNotFound) when the row is
 	// missing — distinguishable from a no-op so the handler can 404
 	// the missing case.
 	SetMFARequired(ctx context.Context, id string, required bool) (changed bool, err error)
 	// CountDeployments returns the total number of live deployment
-	// rows for the account across all apps. Used by the 2nd-deploy
-	// auto-flip chokepoint (issue #186): when the count after the
-	// about-to-be-created deployment is ≥ 2, the chokepoint sets
-	// mfa_required=true. Soft-deleted apps and `failed`/`superseded`
-	// deployments are excluded. Empty on a fresh account.
+	// rows for the account across all apps. Soft-deleted apps and
+	// `failed`/`superseded` deployments are excluded. Empty on a fresh
+	// account.
 	CountDeployments(ctx context.Context, id string) (int, error)
 
 	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
@@ -1884,6 +1881,22 @@ type Store interface {
 	CreateDeployment(ctx context.Context, d Deployment) (Deployment, error)
 	DeploymentByID(ctx context.Context, id string) (Deployment, error)
 	LatestDeployment(ctx context.Context, appID string) (Deployment, error)
+	// DeploymentOrdinal (issue #976 / ADR-122 / SAFE-RELEASES-C.2)
+	// returns the per-app 1-based ordinal of the deployment row,
+	// ordered by (created_at, id). Stable: the same {app_id,
+	// deployment_id} pair always resolves to the same ordinal
+	// even after later deploys land (the latest deploy is Nth,
+	// the one before it is (N-1)th, etc.). Used by the
+	// deployment-preview URL surface to stamp the
+	// `deploy-{N}.{slug}.gregale.dev` host — N MUST be stable
+	// for an existing row across runs so a previously-issued
+	// URL doesn't silently rot when the customer deploys a
+	// fresh row.
+	//
+	// Returns ErrNotFound when no row exists for deploymentID
+	// (handled by the apid handler with the standard 404 +
+	// IDOR posture).
+	DeploymentOrdinal(ctx context.Context, appID, deploymentID string) (int, error)
 	// LiveDeployment returns the app's current live deployment (status='live').
 	// schedd's wake path boots from this; ErrNotFound if the app has never had a
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
@@ -2742,6 +2755,7 @@ type Store interface {
 	MarkRuntimeConfigOperationFailed(ctx context.Context, id, phase, errMsg string) error
 	MarkRuntimeConfigOperationBlocked(ctx context.Context, id, phase, reason string) error
 	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
+	GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error)
 
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
@@ -3737,6 +3751,44 @@ type Store interface {
 	// The memstore mirrors the shape so handler tests can exercise
 	// the read path without spinning Postgres.
 	InsertAuditLog(ctx context.Context, entry AuditLog) error
+
+	// AppendDeploymentAudit (issue #976 / ADR-122 / SAFE-RELEASES-E.2)
+	// inserts one row of the deployment_audit table
+	// (migrations/00332_deployment_audit.sql). The table is the
+	// per-deployment counterpart of the events stream: events rows
+	// are per-emit, indexed for subject lookups; deployment_audit
+	// rows are per-deployment, indexed for (deployment_id, at DESC)
+	// timeline reads. The two coexist — AppendDeploymentAudit is
+	// the structured counterpart of audit.EmitAs for the deploy
+	// lifecycle.
+	//
+	// kind must be in the closed set enforced by
+	// deployment_audit_kind_chk; the handler-level type alias
+	// DeploymentAuditKind (pkg/state/types.go, defined alongside
+	// this method) prevents drift between the Go vocabulary and
+	// the SQL CHECK.
+	//
+	// Returns the id Postgres assigned. MemStore picks a sequential
+	// id so the round-trip test pins both backends to the same
+	// shape.
+	AppendDeploymentAudit(ctx context.Context, entry DeploymentAudit) (int64, error)
+
+	// ListDeploymentAudit (issue #976 / ADR-122 / SAFE-RELEASES-E.2)
+	// returns deployment_audit rows for one deployment, ordered
+	// (at DESC, id DESC) — same tiebreaker discipline as
+	// ListAuditLog. The deployment_audit_deployment_idx
+	// ((deployment_id, at DESC), migration 00332) backs the query
+	// so the timeline endpoint stays sub-millisecond at one-box
+	// scale.
+	//
+	// limit > 0 caps the page; <= 0 means "no row cap" — caller
+	// must bound via the per-deployment retention (90 days per
+	// ADR-122 §Consequences) or the customer-facing handler cap
+	// (DeploymentAuditPageSizeMax). The deployment_id has no FK
+	// to deployments(id), so a deployment row deleted by 90-day
+	// GC can still have its audit rows listed — the dashboard
+	// shows them under the orphaned-deployment_id sentinel.
+	ListDeploymentAudit(ctx context.Context, deploymentID string, limit int) ([]DeploymentAudit, error)
 
 	// AppendDeploymentStage (ADR-117, migration 00302) appends a
 	// closed stage transition to deployments.stage_state and returns

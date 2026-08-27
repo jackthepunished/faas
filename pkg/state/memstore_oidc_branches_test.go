@@ -27,6 +27,10 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // TestRegexpMatch_HitsAndMisses pins the canonical Go regexp
@@ -234,5 +238,191 @@ func TestDeleteOIDCExchangedToken_HappyAndErrorOnUnknown(t *testing.T) {
 	// Unknown id from the start also returns ErrNotFound.
 	if err := m.DeleteOIDCExchangedToken(context.Background(), "never-existed"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Delete(never-existed): err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestAuthenticateOIDCBearer_HitAndMisses pins the bearer-token
+// authentication path (issue #270 / ADR-101). Three branches:
+//
+//   - Hit: an inserted exchanged token resolves to its (Account,
+//     APIKey) pair.
+//   - Miss (unknown hash): returns (zero, zero, ErrNotFound).
+//   - Expired: a row whose ExpiresAt is in the past is
+//     lazy-deleted and returns ErrNotFound. The lazy-delete is
+//     the MemStore equivalent of the pg `WHERE expires_at >
+//     NOW()` filter.
+//
+// The lazy-delete side-effect is load-bearing: a second
+// AuthenticateOIDCBearer call with the same expired hash must
+// still return ErrNotFound but the row must be gone (no memory
+// leak, no goroutine pinning the row for retry).
+func TestAuthenticateOIDCBearer_HitAndMisses(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	// Seed an account the bearer resolves to.
+	acct, err := m.CreateAccount(ctx, "bearer-"+uuid.NewString()+"@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	// Happy path: insert a token, then authenticate against the
+	// same hash.
+	goodHash := bytes.Repeat([]byte{0x11}, 32)
+	if _, err := m.InsertOIDCExchangedToken(ctx, &OIDCExchangedToken{
+		ID:        "exch-good",
+		AccountID: acct.ID,
+		TokenHash: goodHash,
+		IssuerURL: "https://accounts.google.com",
+	}); err != nil {
+		t.Fatalf("InsertOIDCExchangedToken: %v", err)
+	}
+	resolvedAcct, key, err := m.AuthenticateOIDCBearer(ctx, goodHash)
+	if err != nil {
+		t.Fatalf("AuthenticateOIDCBearer(hit): err = %v, want nil", err)
+	}
+	if resolvedAcct.ID != acct.ID {
+		t.Errorf("Auth(hit).Account.ID = %q, want %q", resolvedAcct.ID, acct.ID)
+	}
+	if key.ID == "" {
+		t.Error("Auth(hit).APIKey.ID is empty")
+	}
+
+	// Miss: an unknown hash → ErrNotFound, zero values.
+	if _, _, err := m.AuthenticateOIDCBearer(ctx, bytes.Repeat([]byte{0x22}, 32)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Auth(unknown): err = %v, want ErrNotFound", err)
+	}
+
+	// Expired: insert a token with ExpiresAt in the past. The
+	// first auth call returns ErrNotFound AND lazily deletes the
+	// row (MemStore mirror of `WHERE expires_at > NOW()`). The
+	// second call still returns ErrNotFound (no resurrection).
+	expiredHash := bytes.Repeat([]byte{0x33}, 32)
+	if _, err := m.InsertOIDCExchangedToken(ctx, &OIDCExchangedToken{
+		ID:        "exch-expired",
+		AccountID: acct.ID,
+		TokenHash: expiredHash,
+		IssuerURL: "https://idp.example.com",
+		ExpiresAt: time.Now().Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("InsertOIDCExchangedToken (expired): %v", err)
+	}
+	if _, _, err := m.AuthenticateOIDCBearer(ctx, expiredHash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Auth(expired): err = %v, want ErrNotFound", err)
+	}
+	// Lazy-delete verified: GetOIDCExchangedTokenByHash on the
+	// same hash is now also ErrNotFound.
+	if _, err := m.GetOIDCExchangedTokenByHash(ctx, expiredHash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetOIDCExchangedTokenByHash after lazy-delete: err = %v, want ErrNotFound", err)
+	}
+
+	// Account-deleted branch: insert a token whose AccountID no
+	// longer exists in m.accounts. AuthenticateOIDCBearer must
+	// still return ErrNotFound (NOT a panic, NOT a stale row
+	// resolution). The pg equivalent is FK CASCADE on the
+	// account delete; MemStore mirrors it by looking up
+	// m.accounts[row.AccountID] and returning ErrNotFound when
+	// the lookup misses.
+	orphanHash := bytes.Repeat([]byte{0x44}, 32)
+	if _, err := m.InsertOIDCExchangedToken(ctx, &OIDCExchangedToken{
+		ID:        "exch-orphan",
+		AccountID: "ghost-account-id",
+		TokenHash: orphanHash,
+		IssuerURL: "https://idp.example.com",
+	}); err != nil {
+		t.Fatalf("InsertOIDCExchangedToken (orphan): %v", err)
+	}
+	if _, _, err := m.AuthenticateOIDCBearer(ctx, orphanHash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Auth(orphan): err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestAccountByOIDCSubject_TrustPolicyMatch pins the issuer-
+// URL + subject-pattern resolution path. The contract (ADR-101
+// PR-A): any account that has a trust policy for the given
+// issuer URL matches; an empty SubjectPattern accepts any
+// subject; a non-empty SubjectPattern is regex-matched.
+//
+// Branches pinned:
+//
+//   - Issuer URL mismatch: ErrNotFound even with a valid
+//     policy on the same account (proves the issuer filter is
+//     the gating predicate, not the account match).
+//   - Subject pattern mismatch (regex no-match): ErrNotFound
+//     when the policy's pattern rejects the subject.
+//   - Subject pattern match (regex hit): returns the policy's
+//     account.
+//   - Account bound to the policy missing from m.accounts:
+//     ErrNotFound (the policy row is dangling — the pg schema
+//     has FK ON DELETE SET NULL; MemStore mirrors the
+//     ErrNotFound behaviour).
+//   - Empty SubjectPattern accepts any subject: returns the
+//     account without regex matching.
+func TestAccountByOIDCSubject_TrustPolicyMatch(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	// Seed two accounts + four policies.
+	acctA, err := m.CreateAccount(ctx, "oidc-a-"+uuid.NewString()+"@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount(a): %v", err)
+	}
+	acctB, err := m.CreateAccount(ctx, "oidc-b-"+uuid.NewString()+"@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount(b): %v", err)
+	}
+	if _, err := m.UpsertOIDCTrustPolicy(ctx, &OIDCTrustPolicy{
+		AccountID:      acctA.ID,
+		IssuerURL:      "https://idp1.example.com",
+		SubjectPattern: "^ops@",
+	}); err != nil {
+		t.Fatalf("UpsertOIDCTrustPolicy(acctA): %v", err)
+	}
+	if _, err := m.UpsertOIDCTrustPolicy(ctx, &OIDCTrustPolicy{
+		AccountID: acctB.ID,
+		IssuerURL: "https://idp1.example.com",
+		// Empty pattern = accept any subject.
+		SubjectPattern: "",
+	}); err != nil {
+		t.Fatalf("UpsertOIDCTrustPolicy(acctB): %v", err)
+	}
+
+	// Issuer URL mismatch → ErrNotFound.
+	if _, err := m.AccountByOIDCSubject(ctx, "https://other.example.com", "ops@example.com"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AccountByOIDCSubject(wrong issuer): err = %v, want ErrNotFound", err)
+	}
+
+	// Subject pattern match (regex hit) → acctA.
+	resolved, err := m.AccountByOIDCSubject(ctx, "https://idp1.example.com", "ops@gregale.dev")
+	if err != nil {
+		t.Fatalf("AccountByOIDCSubject(regex match): %v", err)
+	}
+	if resolved.ID != acctA.ID {
+		t.Errorf("regex-match resolved.ID = %q, want %q (acctA)", resolved.ID, acctA.ID)
+	}
+
+	// Subject pattern mismatch (regex no-match) → acctB's
+	// empty pattern catches it. We can distinguish by asking
+	// for a subject the regex rejects.
+	resolved2, err := m.AccountByOIDCSubject(ctx, "https://idp1.example.com", "user@gregale.dev")
+	if err != nil {
+		t.Fatalf("AccountByOIDCSubject(empty-pattern catch): %v", err)
+	}
+	if resolved2.ID != acctB.ID {
+		t.Errorf("empty-pattern resolved.ID = %q, want %q (acctB)", resolved2.ID, acctB.ID)
+	}
+
+	// Dangling policy: insert a policy whose AccountID doesn't
+	// exist in m.accounts. The resolver must skip it (return
+	// ErrNotFound, not panic, not stale).
+	if _, err := m.UpsertOIDCTrustPolicy(ctx, &OIDCTrustPolicy{
+		AccountID:      "ghost-account",
+		IssuerURL:      "https://dangling.example.com",
+		SubjectPattern: "",
+	}); err != nil {
+		t.Fatalf("UpsertOIDCTrustPolicy(dangling): %v", err)
+	}
+	if _, err := m.AccountByOIDCSubject(ctx, "https://dangling.example.com", "anything"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AccountByOIDCSubject(dangling): err = %v, want ErrNotFound", err)
 	}
 }

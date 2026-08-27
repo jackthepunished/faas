@@ -130,7 +130,7 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "link expired or already used", http.StatusGone)
 		return
 	}
-	mfaPending := mfaEnrollRequired(acct)
+	mfaPending := mfaSessionPending(acct)
 	// IAM-3 (ADR-039): the magic-link verify path now mints a sid
 	// + creates the sessions row + emits auth.session.created
 	// through the unified helper. The route never reaches the

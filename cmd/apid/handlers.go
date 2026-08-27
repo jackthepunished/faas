@@ -523,10 +523,6 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
-	// IAM-2 2nd-deploy chokepoint: arm mfa_required when this is the
-	// customer's 2nd live deployment. Post-CreateDeployment notify +
-	// audit + log fan-out is in notifyAndAuditDeployment.
-	s.maybeFlipMFAOnDeploy(r.Context(), acct)
 	notifyAndAuditDeployment(r.Context(), s, acct, app, d, prev, &req)
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 }

@@ -228,6 +228,32 @@ func (s *PgStore) ListRuntimeConfigRevisions(ctx context.Context, key string, sc
 	return out, nil
 }
 
+func (s *PgStore) GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error) {
+	var revision RuntimeConfigRevision
+	var scopeText string
+	var oldValue, newValue []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, config_key, scope, scope_id, version,
+		       COALESCE(old_value, 'null'::jsonb), new_value,
+		       COALESCE(actor_id::text, ''), COALESCE(reason, ''), created_at
+		FROM runtime_config_revisions
+		WHERE config_key = $1 AND scope = $2 AND scope_id = $3 AND version = $4`,
+		key, string(scope), scopeID, version).
+		Scan(&revision.ID, &revision.Key, &scopeText, &revision.ScopeID,
+			&revision.Version, &oldValue, &newValue, &revision.ActorID,
+			&revision.Reason, &revision.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RuntimeConfigRevision{}, ErrRuntimeConfigNotFound
+	}
+	if err != nil {
+		return RuntimeConfigRevision{}, fmt.Errorf("state: get runtime config revision: %w", err)
+	}
+	revision.Scope = RuntimeConfigScope(scopeText)
+	revision.OldValue = json.RawMessage(oldValue)
+	revision.NewValue = json.RawMessage(newValue)
+	return revision, nil
+}
+
 type runtimeConfigScanner interface {
 	Scan(dest ...any) error
 }

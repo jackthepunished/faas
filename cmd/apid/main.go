@@ -1118,6 +1118,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// before any listener is exposed. Database state wins over the
 	// bootstrap fallback for catalogued runtime settings.
 	srv.WithRuntimeConfigManager(newRuntimeConfigManager(deps.getenv))
+	// Seed legacy consumers from the same bootstrap snapshot before the
+	// durable reconciliation. The durable operator value must win after a
+	// restart; calling WithDataPlacement after reconcile would overwrite it
+	// with the environment fallback on every boot.
+	srv.WithDataPlacement(dataPlacementEnabledFromEnv(deps.getenv))
 	if err := srv.runtimeConfig.reconcile(ctx, store); err != nil {
 		return fmt.Errorf("apid: reconcile runtime config: %w", err)
 	}
@@ -1243,12 +1248,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("apid: reqbudget middleware config: %w", err)
 	}
 
-	// ADR-098 PR-B / C4 — per-PR feature flag
-	// (FAAS_DATA_PLACEMENT=1). Default OFF preserves the
-	// pre-PR-B byte-for-byte posture. Ops flips the flag
-	// per-node after the cluster-outline's "Rollout gate"
-	// one-month soak.
-	srv.WithDataPlacement(dataPlacementEnabledFromEnv(deps.getenv))
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// into the server so the audit subscriber (which receives
 	// the signature-rejection kinds from imaged's verify hook)

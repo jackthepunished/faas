@@ -334,14 +334,14 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 		`{"hash":"`+hex.EncodeToString(hash)+`"}`)
 
 	// Issue a session cookie so the browser is logged in too.
-	// IAM-2: stamp mfa_pending=true if the account is
-	// mfa_required && !mfa_enrolled. The /cli-auth page is on the
-	// dashboardAuthChain (not gated by s.auth), so the customer
-	// can re-render the post-claim page even while pending.
+	// IAM-2: stamp mfa_pending=true if the account has opted into MFA
+	// or an explicit mfa_required policy is active. The /cli-auth page
+	// is on the dashboardAuthChain (not gated by s.auth), so the
+	// customer can re-render the post-claim page even while pending.
 	// IAM-3 (ADR-039) routes through the unified helper so the
 	// sessions row is created with the same sid that the cookie
 	// envelope carries.
-	cookie, _, err := h.srv.issueDashboardSession(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "cli_code")
+	cookie, _, err := h.srv.issueDashboardSession(r.Context(), r, acct.ID, mfaSessionPending(acct), "cli_code")
 	if err != nil {
 		h.log.Error("cli_auth.issue_session", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)

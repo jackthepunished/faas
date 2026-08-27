@@ -1,7 +1,7 @@
 // MFA handler tests (IAM-2, issue #186).
 //
-// Covers the five /v1/account/mfa/* endpoints + the
-// chokepoint helpers. Tests use the MemStore + an in-process
+// Covers the five /v1/account/mfa/* endpoints + the opt-in
+// session policy. Tests use the MemStore + an in-process
 // age identity so the seal/unseal path runs end-to-end
 // without an external key file. The MFA recipient + identity
 // are wired into the package-level vars (mfaRecipient,
@@ -47,9 +47,8 @@ import (
 )
 
 // mfaTestEnv is the session-cookie twin of testEnv for the MFA
-// flow. The cookie is fresh-issued (mfa_pending=false) — every
-// test here is exercising the post-enrollment path where the
-// cookie is already cleared.
+// flow. Most tests exercise the post-enrollment path where the
+// cookie is already cleared after a successful challenge.
 //
 // `id` is the in-process age identity used by the seal/unseal
 // path inside the handlers. It is also exposed so callers can
@@ -68,19 +67,14 @@ type mfaTestEnv struct {
 // setupWithMFA mints a MemStore, an account, an ephemeral
 // session manager, and an in-process age identity wired into
 // both mfaRecipient + mfaIdentity. The returned env carries a
-// non-mfa_pending cookie so requireMFA passes for the routes
-// under test.
+// cookie whose pending state matches the account's MFA policy.
 //
-// `mfaRequired` lets the test pin the policy flag up-front;
-// the chokepoint tests use this to avoid standing up a Stripe
-// webhook just to arm the flag.
+// `mfaRequired` lets the test pin an explicit policy flag up-front.
 //
 // `mfaEnrolled` stamps mfa_enrolled_at via MarkMFAEnrolled,
-// which ALSO clears mfa_required. So if the test wants both
-// flags set, the order matters: the chokepoint predicate
-// (mfaEnrollRequired) is `mfa_required && !mfa_enrolled`, so
-// `mfaEnrolled=true` is the post-enrollment state where
-// mfa_required is false.
+// which also clears mfa_required. An enrolled account is still
+// pending on a newly issued dashboard session because enrollment
+// is the customer's opt-in choice.
 func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mfaTestEnv {
 	t.Helper()
 	// Recovery-code HMAC upgrade: the production loader wires this
@@ -121,7 +115,7 @@ func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mf
 	// accepts the cookie and the four session handlers can read
 	// the current sid off the context. The login path is the
 	// same shape (issueDashboardSession → IssueWithSession).
-	mfaPending := mfaEnrollRequired(acct)
+	mfaPending := mfaSessionPending(acct)
 	mfaSid := uuid.NewString()
 	if _, err := store.CreateSession(context.Background(), mfaSid, acct.ID, "192.0.2.20", "mfa-test-ua"); err != nil {
 		t.Fatalf("CreateSession: %v", err)
@@ -269,8 +263,8 @@ func injectCSRFToken(body []byte, tok string) []byte {
 // strconvQuote is unused; strconv.Quote is now used directly.
 
 // mfaIssueWithPending re-issues the cookie with mfa_pending set
-// the way the login handlers would after a chokepoint flipped
-// mfa_required. Returns a fresh cookie the test can pin on the
+// the way the login handlers issue a session for an account that
+// requires MFA. Returns a fresh cookie the test can pin on the
 // next request.
 //
 // IAM-3 (ADR-039): the cookie must carry a sid backed by a
@@ -682,157 +676,70 @@ func TestMFADisable_RejectsBadBody(t *testing.T) {
 	}
 }
 
-// --- chokepoint helpers -----------------------------------------------------
-
-// TestMFAFlipOnUpgrade covers the plan-upgrade chokepoint
-// predicate directly. The chokepoint is wired into changePlan
-// + the Stripe webhook; the test pins the predicate's truth
-// table so a future edit can't quietly change the boundary
-// (e.g. "what counts as crossing the paid threshold?").
-func TestMFAFlipOnUpgrade(t *testing.T) {
-	cases := []struct {
-		old, newP api.Plan
-		want      bool
+// TestMFAIsOptIn pins the account-level policy. New accounts do not
+// receive an MFA challenge, while an account with a confirmed
+// authenticator does. MFARequired remains an explicit policy hook.
+func TestMFAIsOptIn(t *testing.T) {
+	tests := []struct {
+		name        string
+		mfaRequired bool
+		mfaEnrolled bool
+		wantPending bool
 	}{
-		{api.PlanFree, api.PlanHobby, false},  // still no-card
-		{api.PlanFree, api.PlanPro, true},     // crosses boundary
-		{api.PlanFree, api.PlanScale, true},   // crosses boundary
-		{api.PlanHobby, api.PlanPro, true},    // crosses boundary
-		{api.PlanHobby, api.PlanScale, true},  // crosses boundary
-		{api.PlanPro, api.PlanPro, false},     // no-op
-		{api.PlanPro, api.PlanScale, false},   // already paid
-		{api.PlanPro, api.PlanFree, false},    // downgrade (forbidden, but predicate returns false)
-		{api.PlanScale, api.PlanHobby, false}, // downgrade
+		{name: "new_account", wantPending: false},
+		{name: "explicit_policy", mfaRequired: true, wantPending: true},
+		{name: "user_opted_in", mfaEnrolled: true, wantPending: true},
+		{name: "enrolled_policy_cleared", mfaEnrolled: true, wantPending: true},
 	}
-	for _, c := range cases {
-		got := mfaFlipOnUpgrade(c.old, c.newP)
-		if got != c.want {
-			t.Errorf("mfaFlipOnUpgrade(%s, %s) = %v, want %v", c.old, c.newP, got, c.want)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := setupWithMFA(t, api.PlanPro, tt.mfaRequired, tt.mfaEnrolled)
+			if got := mfaSessionPending(e.acct); got != tt.wantPending {
+				t.Errorf("mfaSessionPending(%+v) = %v, want %v", e.acct, got, tt.wantPending)
+			}
+		})
 	}
 }
 
-// TestMFAFlipOnDeploy pins the 2nd-deploy predicate. The
-// argument is the count BEFORE the about-to-be-created deploy,
-// currentCount is the POST-insert account-wide deployment count.
-// The chokepoint (maybeFlipMFAOnDeploy) runs AFTER CreateDeployment,
-// so the count includes the just-created row. The threshold is
-// "this customer's deploy was the 2nd or later", which fires at
-// currentCount >= 2.
-//
-// Concretely:
-//   - 0 = no deployments yet (handler hasn't run, hypothetical)
-//   - 1 = customer's 1st deploy just landed (chokepoint skips)
-//   - 2 = customer's 2nd deploy just landed (chokepoint fires)
-//   - 5 = customer's 6th deploy just landed (chokepoint fires; the
-//     SetMFARequired `changed` return suppresses the duplicate
-//     audit Emit on subsequent trips)
-func TestMFAFlipOnDeploy(t *testing.T) {
-	cases := []struct {
-		currentCount int
-		want         bool
+// TestIssueSessionCookie_EnrolledAccountIsPending verifies the
+// login boundary, not just the pure predicate: a new account gets
+// an ordinary cookie, while a customer who completed enrollment
+// gets a pending cookie that must be stepped up.
+func TestIssueSessionCookie_EnrolledAccountIsPending(t *testing.T) {
+	tests := []struct {
+		name        string
+		mfaEnrolled bool
+		wantPending bool
 	}{
-		{0, false}, // hypothetical: chokepoint fired before any deploy
-		{1, false}, // 1st deploy just landed — skip
-		{2, true},  // 2nd deploy just landed — fire
-		{5, true},  // 6th deploy just landed — fire (idempotent)
+		{name: "not_enrolled", wantPending: false},
+		{name: "enrolled", mfaEnrolled: true, wantPending: true},
 	}
-	for _, c := range cases {
-		got := mfaFlipOnDeploy(c.currentCount)
-		if got != c.want {
-			t.Errorf("mfaFlipOnDeploy(%d) = %v, want %v", c.currentCount, got, c.want)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := setupWithMFA(t, api.PlanPro, false, tt.mfaEnrolled)
+			req := httptest.NewRequest(http.MethodPost, "/v1/auth/login", nil)
+			rec := httptest.NewRecorder()
+			e.srv.issueSessionCookie(rec, req, e.acct)
+
+			var cookie *http.Cookie
+			for _, candidate := range rec.Result().Cookies() {
+				if candidate.Name == sessionCookie {
+					cookie = candidate
+					break
+				}
+			}
+			if cookie == nil {
+				t.Fatal("issueSessionCookie did not set faas_sid")
+			}
+			env, err := e.mgr.Verify(cookie.Value)
+			if err != nil {
+				t.Fatalf("verify issued cookie: %v", err)
+			}
+			if env.MfaPending != tt.wantPending {
+				t.Errorf("MfaPending = %v, want %v", env.MfaPending, tt.wantPending)
+			}
+		})
 	}
-}
-
-// TestFlipMFARequiredIfUnenrolled covers the chokepoint helper
-// directly. An unenrolled account gets the flag set; an
-// already-enrolled account is untouched.
-//
-// The helper is a method on *server, so we call it via the
-// testEnv's srv field. The audit Emit fires against the in-
-// memory auditor (newServerWithDeps wires noopNotifier but
-// keeps the auditor — best-effort; we don't assert on
-// auditor rows here, only on the mfa_required flag flip).
-func TestFlipMFARequiredIfUnenrolled(t *testing.T) {
-	t.Run("unenrolled_gets_required_true", func(t *testing.T) {
-		e := setupWithMFA(t, api.PlanPro, false, false)
-		ctx := context.Background()
-		fresh, _ := e.store.AccountByID(ctx, e.acct.ID)
-		e.srv.flipMFARequiredIfUnenrolled(ctx, fresh, "plan_upgrade",
-			map[string]any{"from": "free", "to": "pro"})
-
-		after, _ := e.store.AccountByID(ctx, e.acct.ID)
-		if !after.MFARequired {
-			t.Errorf("MFARequired = false after flip, want true")
-		}
-	})
-	t.Run("already_enrolled_is_noop", func(t *testing.T) {
-		e := setupWithMFA(t, api.PlanPro, false, true)
-		ctx := context.Background()
-		fresh, _ := e.store.AccountByID(ctx, e.acct.ID)
-		e.srv.flipMFARequiredIfUnenrolled(ctx, fresh, "plan_upgrade", nil)
-
-		after, _ := e.store.AccountByID(ctx, e.acct.ID)
-		if after.MFARequired {
-			t.Errorf("MFARequired = true after no-op flip on enrolled account")
-		}
-	})
-
-	// already_required_emits_armed_again: the second-chokepoint audit
-	// surface (issue #286 / IAM hardening mega-PR review finding F2).
-	// When a chokepoint fires on an account whose mfa_required is
-	// already true (e.g. webhook redelivery, or two chokepoints hit
-	// in the same session), the helper must still emit a
-	// distinguishable audit row so SOC 2 CC6.2 can prove the
-	// chokepoint fired. Pre-PR the helper returned silently on the
-	// unchanged branch, leaving an audit-log hole.
-	//
-	// Distinct kind from the first-arm "account.mfa_required_enabled"
-	// so a downstream query ("did this account ever re-trip a
-	// chokepoint?") stays simple.
-	t.Run("already_required_emits_armed_again", func(t *testing.T) {
-		e := setupWithMFA(t, api.PlanPro, true, false) // mfa_required=true, not enrolled
-		// Swap in a fresh auditor so we can read rows out of the
-		// in-memory store. The default auditor wired by newServer is
-		// a noopNotifier-flavoured one that goes through the same
-		// MemStore, but rebuilding it explicitly makes the test
-		// self-contained and immune to future wiring drift.
-		e.srv.audit = newAuditor(e.store, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-		ctx := context.Background()
-		fresh, _ := e.store.AccountByID(ctx, e.acct.ID)
-		acctID := fresh.ID
-
-		// Chokepoint hit — row is already armed, so the helper must
-		// emit account.mfa_required_armed_again, NOT silently return.
-		e.srv.flipMFARequiredIfUnenrolled(ctx, fresh, "plan_upgrade",
-			map[string]any{"from": "free", "to": "pro"})
-
-		// State didn't change.
-		after, _ := e.store.AccountByID(ctx, acctID)
-		if !after.MFARequired {
-			t.Errorf("MFARequired = false after second-chokepoint hit, want still true")
-		}
-
-		// Audit row landed. ListEvents filters on subject (the acct
-		// id) — confirm exactly one row of the armed-again kind.
-		rows, err := e.store.ListEvents(ctx, acctID, 10)
-		if err != nil {
-			t.Fatalf("ListEvents: %v", err)
-		}
-		var armed int
-		for _, ev := range rows {
-			if ev.Kind == "account.mfa_required_armed_again" {
-				armed++
-			}
-			if ev.Kind == "account.mfa_required_enabled" {
-				t.Errorf("unexpected account.mfa_required_enabled row on already-armed re-hit — the helper should emit armed_again, not enabled")
-			}
-		}
-		if armed != 1 {
-			t.Errorf("account.mfa_required_armed_again count = %d, want 1 (rows seen: %d)", armed, len(rows))
-		}
-	})
 }
 
 // --- burn-out + race tests (issue #186 review findings #13–#17) -------------

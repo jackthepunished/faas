@@ -20,7 +20,7 @@
 //   - s.adminAllows — per-daemon operator-email allowlist (compute_nodes.go).
 //     PR-2 (gatewayd-internal AppLogsHandler) doesn't need it; keep the seam
 //     per-daemon.
-//   - mfaEnrollRequired — login-handler-only predicate that decides
+//   - mfaSessionPending — login-handler-only predicate that decides
 //     whether to stamp MfaPending=true on a freshly issued cookie.
 //     pkg/auth reads the flag, cmd/apid writes it.
 package main

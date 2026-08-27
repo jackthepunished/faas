@@ -5,6 +5,7 @@
 import type { OperatorRuntimeConfig } from '../models/OperatorRuntimeConfig.js';
 import type { OperatorRuntimeConfigOperation } from '../models/OperatorRuntimeConfigOperation.js';
 import type { OperatorRuntimeConfigRevision } from '../models/OperatorRuntimeConfigRevision.js';
+import type { RollbackOperatorRuntimeConfigRequest } from '../models/RollbackOperatorRuntimeConfigRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -101,6 +102,43 @@ export class OperatorService {
         401: `code: unauthorized`,
         403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
         404: `code: not_found`,
+      },
+    });
+  }
+  /**
+   * Roll back a hot runtime setting to a previous revision
+   * Applies the selected historical value as a new revision through the
+   * same zero-downtime hot-apply path as PATCH. Only mutable hot settings
+   * are eligible. The request is optimistic-concurrency protected and
+   * the rollback itself is appended to the audit and revision history.
+   *
+   * @returns OperatorRuntimeConfig Rolled-back and applied configuration entry
+   * @throws ApiError
+   */
+  public static rollbackOperatorRuntimeConfig({
+    key,
+    requestBody,
+  }: {
+    /**
+     * Catalog key to roll back.
+     */
+    key: string,
+    requestBody: RollbackOperatorRuntimeConfigRequest,
+  }): CancelablePromise<OperatorRuntimeConfig> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/config/{key}/rollback',
+      path: {
+        'key': key,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `code: not_found`,
+        409: `code: conflict`,
       },
     });
   }
