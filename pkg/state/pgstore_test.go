@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -4088,5 +4089,177 @@ func TestPg_ReadActiveInstanceForWakeID_ParkedRowHidden(t *testing.T) {
 	_, err = s.ReadActiveInstanceForWakeID(ctx, wakeID)
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("ReadActiveInstanceForWakeID after park: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestPg_DeploymentAuditRoundtrip (issue #976 / ADR-122 /
+// SAFE-RELEASES-E.2) pins the AppendDeploymentAudit + ListDeploymentAudit
+// pgstore surface. Mirrors TestPg_DeploymentActorRoundtrip's shape
+// (write, read back, assert closed-set CHECK rejects, assert
+// cross-deployment filter is honored).
+func TestPg_DeploymentAuditRoundtrip(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	// Generate a deterministic deployment UUID for this test
+	// (the deployment_audit table has no FK to deployments, so
+	// we don't need a real deployment row).
+	deploymentID := uuid.New()
+	otherDeploymentID := uuid.New()
+
+	// 1. Full payload — deploy.created with all fields populated.
+	id1, err := s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: deploymentID,
+		Kind:         state.DeployCreated,
+		Actor:        "apid:dashboard",
+		Data:         json.RawMessage(`{"ref":"sha256:abc","supersedes":""}`),
+	})
+	if err != nil {
+		t.Fatalf("AppendDeploymentAudit: %v", err)
+	}
+	if id1 == 0 {
+		t.Errorf("AppendDeploymentAudit id = 0, want non-zero (Postgres IDENTITY returns)")
+	}
+
+	// 2. Read back via ListDeploymentAudit — exactly one row for
+	// this deployment_id.
+	rows, err := s.ListDeploymentAudit(ctx, deploymentID.String(), 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentAudit: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListDeploymentAudit len = %d, want 1", len(rows))
+	}
+	if rows[0].Kind != state.DeployCreated {
+		t.Errorf("rows[0].Kind = %q, want %q", rows[0].Kind, state.DeployCreated)
+	}
+	if rows[0].Actor != "apid:dashboard" {
+		t.Errorf("rows[0].Actor = %q, want %q", rows[0].Actor, "apid:dashboard")
+	}
+	if rows[0].DeploymentID != deploymentID {
+		t.Errorf("rows[0].DeploymentID = %v, want %v", rows[0].DeploymentID, deploymentID)
+	}
+	// Postgres jsonb canonicalises whitespace ("ref": "v" not "ref":"v")
+	// so a literal byte-equal compare breaks under the jsonb driver;
+	// compare structurally so the test pins the payload shape rather
+	// than the storage form.
+	var got map[string]any
+	if err := json.Unmarshal(rows[0].Data, &got); err != nil {
+		t.Fatalf("Data unmarshal: %v", err)
+	}
+	want := map[string]any{"ref": "sha256:abc", "supersedes": ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rows[0].Data = %v, want %v (jsonb round-trip canonicalises whitespace; compare structurally)", got, want)
+	}
+
+	// 3. Cross-deployment filter — write a row for a different
+	// deployment_id and assert ListDeploymentAudit does NOT
+	// bleed it in.
+	if _, err := s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: otherDeploymentID,
+		Kind:         state.DeploySourceRef,
+		Actor:        "apid:cli",
+		Data:         json.RawMessage(`{"ref":"refs/heads/main"}`),
+	}); err != nil {
+		t.Fatalf("AppendDeploymentAudit (other): %v", err)
+	}
+	rowsScoped, err := s.ListDeploymentAudit(ctx, deploymentID.String(), 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentAudit (scoped): %v", err)
+	}
+	if len(rowsScoped) != 1 {
+		t.Errorf("ListDeploymentAudit (scoped) len = %d, want 1 (other-deployment row must NOT bleed in)", len(rowsScoped))
+	}
+
+	// 4. Closed-set kind CHECK rejection. Drive the violation
+	// directly through the store to confirm the constraint is
+	// wired (the apid handler is expected to mirror the
+	// vocabulary, but the constraint is the source of truth).
+	_, err = s.AppendDeploymentAudit(ctx, state.DeploymentAudit{
+		DeploymentID: deploymentID,
+		Kind:         "rogue_audit_kind",
+		Actor:        "apid",
+	})
+	if err == nil {
+		t.Errorf("expected CHECK violation on rogue_audit_kind, got nil")
+	}
+}
+
+// TestPg_DeploymentOrdinal (issue #976 / ADR-122 /
+// SAFE-RELEASES-C.2) pins the per-app 1-based rank the
+// deployment-preview URL surface stamps. Pairs with
+// TestMemStore_DeploymentOrdinal — both impls MUST agree; drift
+// rots every existing deployment-preview URL the moment a new
+// deploy lands.
+//
+//   - first deployment in app = ordinal 1 (no COUNT(*) bias)
+//   - third deployment in app = ordinal 3 (correct rank across ordering)
+//   - second app's first deployment = ordinal 1 in that app
+//     (separate counter per app — no global sequence shared)
+//   - missing deployment_id in known app = ErrNotFound (sentinel)
+//
+// Postgres-only behavior verified:
+//   - row_number() over (partition by app_id order by
+//     created_at, id) is stable — same (app_id, id) pair
+//     always resolves to the same rank even after later
+//     deploys land.
+//   - pgx.ErrNoRows maps to ErrNotFound (NOT a 500).
+func TestPg_DeploymentOrdinal(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	a := uuid.New()
+	b := uuid.New()
+	d1 := uuid.New()
+	d2 := uuid.New()
+	d3 := uuid.New()
+	dX := uuid.New()
+	now := time.Now()
+	// Two apps so we can pin the "separate counter per app"
+	// assertion. Insert via the underlying pool (CreateDeployment
+	// is heavier than necessary and would force status transitions
+	// — for the ordinal query we only need the {id, app_id,
+	// status, created_at} columns, and we set status='live' so
+	// the apps status='active' parent precondition is moot (we
+	// insert directly without going through CreateApp).
+	mustExec := func(stmt string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, stmt, args...); err != nil {
+			t.Fatalf("exec %q args=%v: %v", stmt, args, err)
+		}
+	}
+	mustExec(`insert into accounts (id, email, plan) values ($1, $2, 'free')`, uuid.New(), uuid.New().String()+"@example.com")
+	acctID := uuid.New()
+	mustExec(`insert into accounts (id, email, plan) values ($1, $2, 'free')`, acctID, acctID.String()+"@example.com")
+	mustExec(`insert into apps (id, account_id, slug, status, ram_mb) values ($1, $2, 'ordinal-app', 'active', 256)`, a, acctID)
+	mustExec(`insert into apps (id, account_id, slug, status, ram_mb) values ($1, $2, 'ordinal-app-other', 'active', 256)`, b, acctID)
+
+	insert := func(id string, appID string, at time.Time) {
+		t.Helper()
+		// Status 'building' instead of 'live' — the deployments_app_scope_live_uniq
+		// partial unique index (migration 00213) caps each (app_id, scope) at one
+		// live row. The ordinal query doesn't depend on status; we only need
+		// distinct rows for the test.
+		mustExec(`insert into deployments (id, app_id, status, image_digest, created_at)
+		          values ($1, $2, 'building', 'sha256:ord', $3)`,
+			id, appID, at)
+	}
+	// Insert out-of-order to exercise (created_at, id) sort.
+	insert(d3.String(), a.String(), now.Add(2*time.Second))
+	insert(d1.String(), a.String(), now)
+	insert(d2.String(), a.String(), now.Add(1*time.Second))
+	insert(dX.String(), b.String(), now)
+
+	if got, err := s.DeploymentOrdinal(ctx, a.String(), d1.String()); err != nil || got != 1 {
+		t.Errorf("ord(d1) = %d err=%v, want 1", got, err)
+	}
+	if got, err := s.DeploymentOrdinal(ctx, a.String(), d2.String()); err != nil || got != 2 {
+		t.Errorf("ord(d2) = %d err=%v, want 2", got, err)
+	}
+	if got, err := s.DeploymentOrdinal(ctx, a.String(), d3.String()); err != nil || got != 3 {
+		t.Errorf("ord(d3) = %d err=%v, want 3", got, err)
+	}
+	if got, err := s.DeploymentOrdinal(ctx, b.String(), dX.String()); err != nil || got != 1 {
+		t.Errorf("ord(dX in app b) = %d err=%v, want 1 (separate counter)", got, err)
+	}
+	if _, err := s.DeploymentOrdinal(ctx, a.String(), uuid.New().String()); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("missing deployment: err = %v, want ErrNotFound", err)
 	}
 }
