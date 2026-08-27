@@ -170,14 +170,15 @@ func New(store state.Store, notif Notifier, vm VM, cache *Cache, det *Detector, 
 		cfg.SourceWaitTimeout = 10 * time.Second
 	}
 	return &Builderd{
-		store:    store,
-		notif:    notif,
-		vm:       vm,
-		cache:    cache,
-		detector: det,
-		resid:    resid,
-		cfg:      cfg,
-		log:      log,
+		store:         store,
+		notif:         notif,
+		vm:            vm,
+		cache:         cache,
+		detector:      det,
+		resid:         resid,
+		cfg:           cfg,
+		log:           log,
+		builderNodeID: cfg.BuilderNodeID,
 	}
 }
 
@@ -428,7 +429,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		// imaged, snapshot_prime for schedd) avoids the race where schedd
 		// tries to mount a .tar as a virtio-blk drive.
 		if err := b.notif.Notify(ctx, db.NotifySnapshotBoot,
-			fmt.Sprintf(`{"app_id":"%s","deployment_id":"%s"}`, app.ID, dep.ID)); err != nil {
+			b.snapshotBootPayload(app.ID, dep.ID)); err != nil {
 			b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "notify prime: "+err.Error(), buildStart)
 			return BuildResult{}, err
 		}
@@ -600,7 +601,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		return BuildResult{}, err
 	}
 	if err := b.notif.Notify(ctx, db.NotifySnapshotBoot,
-		fmt.Sprintf(`{"app_id":"%s","deployment_id":"%s"}`, app.ID, dep.ID)); err != nil {
+		b.snapshotBootPayload(app.ID, dep.ID)); err != nil {
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "notify prime: "+err.Error(), buildStart)
 		return BuildResult{}, err
 	}
@@ -611,6 +612,23 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	b.recordProvenance(ctx, build, dep, app, acct, srcHash, false, ver)
 	b.markSucceeded(ctx, build.ID, "ok", buildStart)
 	return BuildResult{BuildID: build.ID, LayerPath: out.OCIImage, LayerBytes: out.LogTailBytes}, nil
+}
+
+// snapshotBootPayload identifies the compute node that produced the local
+// OCI export. snapshot_boot is a fleet-wide PostgreSQL notification, but the
+// rootfs_path it carries indirectly is node-local until imaged publishes the
+// app layer. Including the builder identity lets each imaged daemon discard
+// work owned by a sibling node instead of opening a path it cannot see.
+//
+// An empty builderNodeID preserves the single-box/test shape and omits the
+// optional field for backwards compatibility with existing fixtures.
+func (b *Builderd) snapshotBootPayload(appID, deploymentID string) string {
+	payload := fmt.Sprintf(`{"app_id":"%s","deployment_id":"%s"}`, appID, deploymentID)
+	if b.builderNodeID == "" {
+		return payload
+	}
+	return fmt.Sprintf(`{"app_id":"%s","deployment_id":"%s","node_id":"%s"}`,
+		appID, deploymentID, b.builderNodeID)
 }
 
 // markSucceeded updates the build row to BuildSucceeded, finished=true.

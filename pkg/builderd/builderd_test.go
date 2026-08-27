@@ -194,6 +194,24 @@ func TestProcessOne_CacheHitSkipsSpawn(t *testing.T) {
 	}
 }
 
+func TestSnapshotBootPayloadIncludesBuilderNode(t *testing.T) {
+	b := &Builderd{builderNodeID: "fsn-2.faas"}
+	got := b.snapshotBootPayload("app-1", "dep-1")
+	want := `{"app_id":"app-1","deployment_id":"dep-1","node_id":"fsn-2.faas"}`
+	if got != want {
+		t.Fatalf("snapshotBootPayload() = %q, want %q", got, want)
+	}
+}
+
+func TestSnapshotBootPayloadOmitsEmptyBuilderNode(t *testing.T) {
+	b := &Builderd{}
+	got := b.snapshotBootPayload("app-1", "dep-1")
+	want := `{"app_id":"app-1","deployment_id":"dep-1"}`
+	if got != want {
+		t.Fatalf("snapshotBootPayload() = %q, want %q", got, want)
+	}
+}
+
 func TestProcessOne_VMSpawnSucceedsAndStamps(t *testing.T) {
 	store := state.NewMemStore()
 	src := filepath.Join(t.TempDir(), "src.tar.gz")

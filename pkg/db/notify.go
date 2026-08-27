@@ -176,7 +176,7 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         in-flight wake on the deleted app unwinds
 //	                         with ErrAppDeleted instead of waiting for
 //	                         the wake-coord TTL.
-//	NotifySnapshotBoot      {"app_id":uuid, "deployment_id":uuid}
+//	NotifySnapshotBoot      {"app_id":uuid, "deployment_id":uuid, "node_id":string}
 //	                         builderd → imaged: a build VM has produced an
 //	                         OCI image tarball and stamped it on
 //	                         deployments.rootfs_path. imaged converts the
