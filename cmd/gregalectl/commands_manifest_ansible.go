@@ -30,6 +30,13 @@ type manifestInternalHost struct {
 
 const manifestGatewayEgressPort = 9092
 
+// manifestPrivateHostsGroupVarsThreshold keeps the generated inventory
+// compact as fleets grow. Below this point retaining the resolver map in each
+// host_vars file preserves the small-fleet artifact shape; above it,
+// the map is shared through inventory/group_vars/all.yml instead of being
+// duplicated once per host (which would make generated input quadratic).
+const manifestPrivateHostsGroupVarsThreshold = 32
+
 // cmdManifestAnsible materialises the Ansible inventory shape from the same
 // manifest that drives the on-host renderer. The generated inventory is
 // intentionally separate from deploy/ansible/inventory/ so a fleet can use
@@ -121,6 +128,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	var gatewaySynthTarget string
 	var scheddTarget string
 	var controlPlaneAPIDLoopback string
+	sharedPrivateHosts := len(m.Fleet.Hosts) > manifestPrivateHostsGroupVarsThreshold
 	for _, fleetHost := range m.Fleet.Hosts {
 		if fleetHost.Role == roleControlPlane {
 			scheddTarget, err = manifest.ServiceTCPURL(fleetHost.Role, fleetHost.Address)
@@ -178,7 +186,11 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
+		privateHosts := internalHosts
+		if sharedPrivateHosts {
+			privateHosts = nil
+		}
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback, privateHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -193,6 +205,12 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 		Path: filepath.Join(outputDir, "inventory", "hosts.ini"),
 		Body: inventory.Bytes(),
 	}}
+	if sharedPrivateHosts {
+		files = append(files, manifestAnsibleFile{
+			Path: filepath.Join(outputDir, "inventory", "group_vars", "all.yml"),
+			Body: []byte(renderManifestPrivateResolverVars(internalHosts, m.PrivateDNS.Mode, m.PrivateDNS.Zone)),
+		})
+	}
 	files = append(files, hostVars...)
 	return files, nil
 }
@@ -400,6 +418,26 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayS
 		} else {
 			fmt.Fprintf(&b, "faas_control_plane_allowed_cidrs: [%s]\n", quotedYAMLList(controlPlaneAllowedCIDRs))
 		}
+	}
+	return b.String()
+}
+
+func renderManifestPrivateResolverVars(internalHosts []manifestInternalHost, privateDNSMode, privateDNSZone string) string {
+	var b strings.Builder
+	b.WriteString("# Generated from the split-box manifest; do not hand-edit.\n")
+	if privateDNSMode != "" {
+		fmt.Fprintf(&b, "faas_private_dns_mode: %q\n", privateDNSMode)
+		fmt.Fprintf(&b, "faas_private_dns_zone: %q\n", privateDNSZone)
+	}
+	b.WriteString("faas_private_hosts:\n")
+	for _, internalHost := range internalHosts {
+		b.WriteString("  - ")
+		if internalHost.Address != "" {
+			fmt.Fprintf(&b, "address: %q\n", internalHost.Address)
+		} else {
+			fmt.Fprintf(&b, "inventory_host: %q\n", internalHost.InventoryHost)
+		}
+		fmt.Fprintf(&b, "    names: [%s]\n", quotedYAMLList(internalHost.Names))
 	}
 	return b.String()
 }

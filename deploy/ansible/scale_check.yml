@@ -1,0 +1,66 @@
+---
+# Provider-neutral, connection-free validation for a generated production
+# inventory. This is deliberately separate from preflight.yml: preflight
+# gathers facts and must reach every real host, while this gate validates the
+# generated topology and host_vars shape in CI or before any SSH is attempted.
+
+- name: Validate generated Gregale fleet topology
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  check_mode: true
+  any_errors_fatal: true
+  vars:
+    control_plane_hosts: "{{ groups['control_plane'] | default([]) }}"
+    compute_hosts: "{{ groups['compute_nodes'] | default([]) }}"
+    fleet_hosts: "{{ (control_plane_hosts + compute_hosts) | unique }}"
+  tasks:
+    - name: Require the production split-box groups
+      ansible.builtin.assert:
+        that:
+          - control_plane_hosts | length == 1
+          - compute_hosts | length >= 1
+          - compute_hosts | length <= 1000
+          - "'box' not in groups"
+        fail_msg: >-
+          Generated inventory must contain exactly one control_plane host, one
+          to 1000 compute_nodes hosts, and no retired box group; got
+          control_plane={{ control_plane_hosts | length }},
+          compute_nodes={{ compute_hosts | length }}.
+
+    - name: Require one production group per fleet host
+      ansible.builtin.assert:
+        that:
+          - >-
+            (hostvars[item].group_names | intersect(['control_plane', 'compute_nodes']) | length) == 1
+          - hostvars[item].faas_box_role is defined
+          - hostvars[item].ansible_host is defined
+          - hostvars[item].faas_node_name is defined
+          - hostvars[item].faas_private_hosts is defined
+          - hostvars[item].faas_private_hosts | length == fleet_hosts | length
+        fail_msg: >-
+          Generated host_vars for {{ item }} does not describe exactly one
+          production role and a complete private peer map.
+      loop: "{{ fleet_hosts }}"
+
+    - name: Require control-plane host_vars to match its inventory group
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].faas_box_role == 'control-plane'
+          - hostvars[item].faas_compute_gateway_discovery == 'database'
+        fail_msg: >-
+          {{ item }} is in control_plane but its generated role or discovery
+          mode is not production split-box compatible.
+      loop: "{{ control_plane_hosts }}"
+
+    - name: Require compute host_vars to be node-specific
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].faas_box_role == 'compute-only'
+          - hostvars[item].faas_vmmd_target_url is match('^tcp://[^:]+:[0-9]+$')
+          - hostvars[item].faas_gateway_target_url is match('^tcp://[^:]+:8080$')
+          - hostvars[item].faas_vmmd_schedd_target is match('^tcp://[^:]+:[0-9]+$')
+        fail_msg: >-
+          {{ item }} is in compute_nodes but its generated routing targets are
+          missing or not node-specific transport URLs.
+      loop: "{{ compute_hosts }}"
