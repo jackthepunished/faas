@@ -4,10 +4,11 @@
 // It runs after s.auth has stamped the verified principal, and
 // reads the mfa-pending flag off the session envelope via a
 // separate context value (pkg/auth/middleware.WithMFAPending). The
-// flag is true when the cookie was issued by a login path on an
-// account that is mfa_required && !mfa_enrolled; the cookie-stamp
-// path in pkg/auth.RequireSession (the cookie branch) is the only
-// writer. ADR-046.
+// flag is true when the cookie was issued by a login path for an
+// account with a confirmed authenticator or an explicit
+// mfa_required policy; the cookie-stamp path in
+// pkg/auth.RequireSession (the cookie branch) is the only writer.
+// ADR-046.
 //
 // The MFA allowlist is path-prefixed against r.URL.Path in
 // pkg/auth/middleware so the dashboard's /v1/account whoami can
@@ -23,7 +24,7 @@
 // with it — keeping a copy here would have been an unused
 // duplicate golangci-lint flags as dead code. The s.requireMFA
 // facade now lives in cmd/apid/auth_facade.go. This file keeps
-// only mfaEnrollRequired, which the login handlers use to decide
+// only mfaSessionPending, which the login handlers use to decide
 // whether to stamp MfaPending=true on a freshly issued cookie.
 
 package main
@@ -32,16 +33,18 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// mfaEnrollRequired is the predicate the login handlers check to
-// decide whether to stamp MfaPending=true on the new session
-// cookie. Returns true iff the account has the policy flag set
-// AND has not yet enrolled. The inverse is "the customer has
-// either cleared MFA or never been required to".
+// mfaSessionPending is the predicate the login handlers check to
+// decide whether to stamp MfaPending=true on a new session cookie.
+// MFA is opt-in: an account with a confirmed authenticator must
+// verify it on every new dashboard session. MFARequired remains an
+// explicit policy hook for future operator/workspace enforcement;
+// it also keeps already-armed legacy accounts fail-closed until they
+// enroll or an operator clears that policy.
 //
 // Used by handlers_auth_*.go and the OAuth callbacks. Kept as a
 // free function (not a method on Account) so the auth handlers
 // can call it inline without exposing the predicate outside
 // cmd/apid.
-func mfaEnrollRequired(acct state.Account) bool {
-	return acct.MFARequired && !acct.MFAEnrolled()
+func mfaSessionPending(acct state.Account) bool {
+	return acct.MFARequired || acct.MFAEnrolled()
 }

@@ -605,26 +605,23 @@ type Store interface {
 	// when the row is missing — the handler must surface 404 then.
 	MarkMFAEnrolled(ctx context.Context, id string) error
 	// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash,
-	// and mfa_enrolled_at. Does NOT touch mfa_required — the
-	// chokepoints (plan upgrade / card attached / 2nd deploy) re-set
-	// it on the next trigger. The audit Emit is the caller's job
+	// and mfa_enrolled_at. Does NOT touch mfa_required so an explicit
+	// policy remains in force after a customer disables MFA. The audit
+	// Emit is the caller's job
 	// (the events table is the audit trail; this method does not
 	// persist a reason string).
 	ClearMFA(ctx context.Context, id string) error
-	// SetMFARequired writes the mfa_required flag and reports whether
-	// the row actually changed. Returns (changed=true, nil) on a real
-	// write, (changed=false, nil) when the value was already what was
-	// requested (the chokepoint suppresses a duplicate audit Emit in
-	// that case), and (changed=false, ErrNotFound) when the row is
+	// SetMFARequired writes the explicit mfa_required policy flag and
+	// reports whether the row actually changed. Returns (changed=true,
+	// nil) on a real write, (changed=false, nil) when the value was
+	// already what was requested, and (changed=false, ErrNotFound) when the row is
 	// missing — distinguishable from a no-op so the handler can 404
 	// the missing case.
 	SetMFARequired(ctx context.Context, id string, required bool) (changed bool, err error)
 	// CountDeployments returns the total number of live deployment
-	// rows for the account across all apps. Used by the 2nd-deploy
-	// auto-flip chokepoint (issue #186): when the count after the
-	// about-to-be-created deployment is ≥ 2, the chokepoint sets
-	// mfa_required=true. Soft-deleted apps and `failed`/`superseded`
-	// deployments are excluded. Empty on a fresh account.
+	// rows for the account across all apps. Soft-deleted apps and
+	// `failed`/`superseded` deployments are excluded. Empty on a fresh
+	// account.
 	CountDeployments(ctx context.Context, id string) (int, error)
 
 	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the

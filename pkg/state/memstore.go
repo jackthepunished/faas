@@ -1333,8 +1333,9 @@ func (m *MemStore) MarkMFAEnrolled(_ context.Context, id string) error {
 }
 
 // ClearMFA nulls the secret + recovery-codes + enrolled_at. Does
-// NOT touch mfa_required — the chokepoints re-arm it. The audit Emit
-// is the caller's job; the events table is the audit trail.
+// NOT touch mfa_required so an explicit policy remains in force.
+// The audit Emit is the caller's job; the events table is the audit
+// trail.
 func (m *MemStore) ClearMFA(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1349,11 +1350,8 @@ func (m *MemStore) ClearMFA(_ context.Context, id string) error {
 	return nil
 }
 
-// SetMFARequired writes the policy flag and reports whether the row
-// actually changed. The chokepoint callers use `changed` to suppress
-// a duplicate audit Emit when a redelivered webhook (or a second
-// chokepoint firing in the same request) requests the same value
-// the row already carries. Mirrors the `WHERE mfa_required <> $2`
+// SetMFARequired writes the explicit policy flag and reports whether
+// the row actually changed. Mirrors the `WHERE mfa_required <> $2`
 // guard in PgStore.SetMFARequired.
 func (m *MemStore) SetMFARequired(_ context.Context, id string, required bool) (changed bool, err error) {
 	m.mu.Lock()

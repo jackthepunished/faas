@@ -343,12 +343,12 @@ type Account struct {
 	// because Postgres bytea[] has no array-diffing write. Stored as
 	// bytea[] so the consume path is a single-row serialised update.
 	MFARecoveryCodesHash [][]byte
-	// MFARequired is the policy flag set by the three chokepoints:
-	// plan upgrade, card attached, 2nd deploy. The customer clears it
-	// only by completing /enroll + /confirm (MarkMFAEnrolled flips it
-	// to false on the first successful confirm) or by /disable. API
-	// keys ignore this column per the IAM-2 design decision (keys are
-	// already cryptographically scoped).
+	// MFARequired is an explicit policy flag. It is separate from
+	// MFAEnrolledAt because "policy says enroll" and "customer has
+	// enrolled" are different states. Customer lifecycle events do not
+	// set this flag; MFA enrollment is opt-in. API keys ignore this
+	// column per the IAM-2 design decision (keys are already
+	// cryptographically scoped).
 	MFARequired bool
 	// KeyGraceWindowDays overrides the plan-default API-key rotation
 	// grace window (issue #189 / IAM-5, default 7 days). NIL falls
@@ -379,12 +379,10 @@ type Account struct {
 func (a Account) Active() bool { return a.Status == AccountActive || a.Status == AccountPastDue }
 
 // MFAEnrolled reports whether the customer has at least one
-// successful TOTP confirmation. Distinct from MFARequired: a
-// customer who has enrolled is no longer blocked even if a future
-// plan change again sets MFARequired=true. The LATCH is on
-// MFAEnrolled, not MFARequired — the chokepoints set required=true,
-// the customer clears it once via /confirm, and the chokepoints
-// re-arm on the next trigger.
+// successful TOTP confirmation. An enrolled customer has opted in
+// and is challenged on each new dashboard session. MFARequired is
+// reserved for an explicit policy that can also require first-time
+// enrollment from an otherwise unenrolled account.
 func (a Account) MFAEnrolled() bool { return a.MFAEnrolledAt != nil }
 
 // APIKey is a hashed, account-scoped credential. Scopes is the set of

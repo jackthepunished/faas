@@ -182,7 +182,7 @@ func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 //
 // Wide projection intentionally matches AccountByID/AccountByEmail/
 // AccountByKeyHash so mfa_* / deletion_requested_at / past_due_at
-// are present and the requireMFA chokepoint sees post-enrollment
+// are present and the requireMFA middleware sees post-enrollment
 // state (see scanAccountCols doc-comment at pkg/state/pgstore.go).
 //
 // PR-9 §1: closes the N+1 fan-out in
@@ -832,8 +832,8 @@ func (s *PgStore) MarkMFAEnrolled(ctx context.Context, id string) error {
 }
 
 // ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash, and
-// mfa_enrolled_at. mfa_required is intentionally untouched: the
-// chokepoints re-set it on the next trigger. The audit trail lives
+// mfa_enrolled_at. mfa_required is intentionally untouched so an
+// explicit policy remains in force after disable. The audit trail lives
 // in the events table (handlers_mfa.go emits the `account.mfa_disabled`
 // row before/after this call).
 func (s *PgStore) ClearMFA(ctx context.Context, id string) error {
@@ -852,11 +852,8 @@ func (s *PgStore) ClearMFA(ctx context.Context, id string) error {
 	return nil
 }
 
-// SetMFARequired writes the mfa_required flag and reports whether
-// the row was actually changed. The chokepoint callers use `changed`
-// to suppress a duplicate audit Emit when a redelivered webhook (or
-// a second chokepoint firing in the same request) requests the same
-// value the row already carries. Returns ErrNotFound when the
+// SetMFARequired writes the explicit mfa_required policy flag and
+// reports whether the row was actually changed. Returns ErrNotFound when the
 // account row is missing (UNKNOWN differs from a no-op — a missing
 // row is a 404, a no-op write is a 200 with no audit event).
 func (s *PgStore) SetMFARequired(ctx context.Context, id string, required bool) (changed bool, err error) {
@@ -883,13 +880,10 @@ func (s *PgStore) SetMFARequired(ctx context.Context, id string, required bool) 
 }
 
 // CountDeployments returns the total deployment count for the
-// account across all apps. The 2nd-deploy chokepoint fires when
-// this returns >= 2 (the about-to-be-created deployment, AFTER
-// CreateDeployment lands, brings the account-wide total to 2 or
-// more — i.e. this is the customer's 2nd or later deploy). The
-// per-app invariant ("scale to one deploy per app at a time") is
-// enforced by CreateDeployment's same-row supersede; this counter
-// captures the cross-app volume the chokepoint cares about.
+// account across all apps. The per-app invariant ("scale to one
+// deploy per app at a time") is enforced by CreateDeployment's
+// same-row supersede; this counter captures the cross-app live
+// workload.
 //
 // Status 'failed' + 'superseded' are excluded: a failed build
 // counts as nothing, and a superseded deployment is one that was
@@ -975,8 +969,8 @@ func scanAccounts(rows pgx.Rows) ([]Account, error) {
 // we scan into *time.Time / *[]byte and lift them onto the Account
 // when non-NULL. The four mfa_* fields are projected by every SELECT
 // (CreateAccount, AccountByID/Email/KeyHash/ProviderCustomerID, and
-// ListAllAccounts) so the chokepoints + requireMFA middleware always
-// see the post-enrollment state — Review Finding #1 fix.
+// ListAllAccounts) so the account policy + requireMFA middleware
+// always see the post-enrollment state — Review Finding #1 fix.
 //
 // egress_allowlist_extra (issue #679 / PR-B / ADR-082) is the
 // per-account additive budget on top of the plan's

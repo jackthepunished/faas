@@ -174,7 +174,6 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
-	s.maybeFlipMFAOnDeploy(r.Context(), acct)
 	s.auditSourceRefDeploy(r.Context(), acct, app, res, prev, req, resolvedSHA, installID, ann)
 	// Reload the deployment row so the response carries the
 	// canonical wire shape (mirrors createDeployment's

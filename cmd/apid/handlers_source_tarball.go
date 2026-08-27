@@ -177,7 +177,6 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.maybeFlipMFAOnDeploy(r.Context(), acct)
 	s.auditLocalTarballDeploy(r.Context(), acct, app, res, sidecar, spoolBytes, ann)
 
 	d, err := s.store.LatestDeployment(r.Context(), app.ID)

@@ -286,7 +286,7 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	//
 	// IAM-3 (ADR-039) goes through the unified helper so the sessions
 	// row is created + auth.session.created is emitted.
-	cookie, _, err := s.issueDashboardSessionWithGithub(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "github", githubUser.Login)
+	cookie, _, err := s.issueDashboardSessionWithGithub(r.Context(), r, acct.ID, mfaSessionPending(acct), "github", githubUser.Login)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return
