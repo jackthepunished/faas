@@ -12,6 +12,8 @@
 //     must NOT call githubd.ExchangeOAuthCode on a mismatch.
 //  3. githubd transport error: cookie matches, but the gRPC call
 //     fails → 502 + audit auth.install.token_exchange_failed.
+//  4. missing GitHub App installation: the connect handler and the
+//     callback race both redirect to GitHub's installation flow.
 //
 // Plus a missing-state and missing-code branch as the cheap 400
 // guards against malformed queries.
@@ -27,6 +29,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -42,9 +45,11 @@ import (
 // handlers_oauth_test.go because its ExchangeOAuthCode returns
 // errGithubdNotReady.
 type oauthCodeCallbackFake struct {
-	installID     string
-	defaultBranch string
-	exchangeErr   error
+	installID       string
+	defaultBranch   string
+	exchangeErr     error
+	installState    InstallState
+	installStateErr error
 
 	gotAccountID string
 	gotCode      string
@@ -55,7 +60,7 @@ type oauthCodeCallbackFake struct {
 // GithubdClient surface, with the methods we don't use falling
 // through to not-ready problems so accidental calls fail loudly.
 func (f *oauthCodeCallbackFake) GetInstallState(context.Context, string) (InstallState, string, string, error) {
-	return InstallStateUnspecified, "", "", errGithubdNotReady
+	return f.installState, "", "", f.installStateErr
 }
 func (f *oauthCodeCallbackFake) ExchangeOAuthCode(_ context.Context, accountID, code, state string) (string, string, error) {
 	f.gotAccountID = accountID
@@ -238,6 +243,123 @@ func TestRenderOAuthCodeCallback_GithubdErrorPropagates(t *testing.T) {
 // the dashboard forgets to mint the state cookie (the redirect from
 // the "Connect GitHub" button failed). The handler must short-circuit
 // before reaching githubd.
+// TestRenderOAuthCodeCallback_MissingInstallationResumesInstallFlow covers
+// the race where GitHub has redirected with a code but githubd still finds no
+// App installation. This is an expected first-use condition, not a 502 outage.
+func TestRenderOAuthCodeCallback_MissingInstallationResumesInstallFlow(t *testing.T) {
+	t.Setenv("FAAS_GITHUB_APP_INSTALL_URL", "https://github.com/apps/test-app/installations/new")
+	gh := &oauthCodeCallbackFake{
+		exchangeErr: errors.New("rpc error: code = Internal desc = githubd: user has no app installations"),
+	}
+	srv, _, _, sessionCookie := newOAuthCodeCallbackServer(t, gh)
+	stateToken := mintStateToken(t)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/oauth/code-callback?code=oauth-code-xyz&state="+stateToken, nil)
+	r.AddCookie(sessionCookie)
+	r.AddCookie(&http.Cookie{Name: oauthCodeStateCookie, Value: stateToken, Path: oauthCodeCallbackPath})
+	srv.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("code = %d, want 302\nbody = %s", rec.Code, rec.Body.String())
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if loc.Path != "/apps/test-app/installations/new" {
+		t.Errorf("Location path = %q, want /apps/test-app/installations/new", loc.Path)
+	}
+	if loc.Query().Get("state") == "" {
+		t.Error("installation redirect missing fresh state")
+	}
+	if strings.Contains(rec.Body.String(), "github_unreachable") {
+		t.Error("missing installation must not render github_unreachable")
+	}
+	if gh.gotCalls != 1 {
+		t.Errorf("ExchangeOAuthCode calls = %d, want 1", gh.gotCalls)
+	}
+}
+
+func TestStartConnectGitHub_RedirectsToInstallationWhenNeeded(t *testing.T) {
+	t.Setenv("FAAS_GITHUB_APP_CLIENT_ID", "client-123")
+	t.Setenv("FAAS_GITHUB_APP_INSTALL_URL", "https://github.com/apps/test-app/installations/new")
+	gh := &oauthCodeCallbackFake{installState: InstallStateNotInstalled}
+	srv, _, _, sessionCookie := newOAuthCodeCallbackServer(t, gh)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/install/connect", nil)
+	r.AddCookie(sessionCookie)
+	srv.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("code = %d, want 302\nbody = %s", rec.Code, rec.Body.String())
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if loc.Path != "/apps/test-app/installations/new" {
+		t.Errorf("Location path = %q, want /apps/test-app/installations/new", loc.Path)
+	}
+	stateToken := loc.Query().Get("state")
+	if stateToken == "" {
+		t.Fatal("installation redirect missing state")
+	}
+	if stateCookie := findCookie(rec.Result().Cookies(), oauthCodeStateCookie); stateCookie == nil || stateCookie.Value != stateToken {
+		t.Errorf("state cookie = %#v, want value matching redirect state %q", stateCookie, stateToken)
+	}
+}
+
+func TestStartConnectGitHub_AuthorizesInstalledApp(t *testing.T) {
+	t.Setenv("FAAS_GITHUB_APP_CLIENT_ID", "client-123")
+	t.Setenv("FAAS_GITHUB_APP_REDIRECT_URI", "https://gregale.dev/oauth/code-callback")
+	t.Setenv("FAAS_GITHUB_APP_INSTALL_URL", "https://github.com/apps/test-app/installations/new")
+	gh := &oauthCodeCallbackFake{installState: InstallStateInstalled}
+	srv, _, _, sessionCookie := newOAuthCodeCallbackServer(t, gh)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/install/connect", nil)
+	r.AddCookie(sessionCookie)
+	srv.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("code = %d, want 302\nbody = %s", rec.Code, rec.Body.String())
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if loc.Path != "/login/oauth/authorize" {
+		t.Errorf("Location path = %q, want /login/oauth/authorize", loc.Path)
+	}
+	if got := loc.Query().Get("client_id"); got != "client-123" {
+		t.Errorf("client_id = %q, want client-123", got)
+	}
+	if got := loc.Query().Get("redirect_uri"); got != "https://gregale.dev/oauth/code-callback" {
+		t.Errorf("redirect_uri = %q, want configured callback", got)
+	}
+	if loc.Query().Get("state") == "" {
+		t.Error("authorize redirect missing state")
+	}
+}
+
+func TestGithubAppInstallURL_RejectsNonHTTPSConfiguration(t *testing.T) {
+	t.Setenv("FAAS_GITHUB_APP_INSTALL_URL", "http://github.com/apps/test-app/installations/new")
+	if _, err := githubAppInstallURL("state"); err == nil {
+		t.Fatal("githubAppInstallURL accepted non-HTTPS configuration")
+	}
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
 func TestRenderOAuthCodeCallback_MissingState(t *testing.T) {
 	gh := &oauthCodeCallbackFake{installID: "9999", defaultBranch: "main"}
 	srv, _, _, sessionCookie := newOAuthCodeCallbackServer(t, gh)

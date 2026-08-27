@@ -40,6 +40,7 @@
 // Failure surfaces:
 //   - missing code or state query param   → 400 problem
 //   - missing or mismatched CSRF cookie   → 403 csrf_rejected + audit
+//   - missing GitHub App installation      → redirect to GitHub install flow
 //   - githubd.ExchangeOAuthCode errs      → 502 problem
 //   - success                             → 302 to
 //     /dashboard/account?github=connected&install=<id>&default_branch=<branch>
@@ -49,11 +50,13 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -75,7 +78,47 @@ const (
 	// GitHub OAuth round-trip is typically well under 60 s; 5
 	// minutes is the upper bound for a user completing the dialog.
 	oauthCodeStateTTL = 5 * time.Minute
+
+	// defaultGitHubAppInstallURL is the hosted Gregale App's installation
+	// endpoint. Self-hosted deployments can override it with
+	// FAAS_GITHUB_APP_INSTALL_URL (for a different App slug or GitHub
+	// Enterprise host).
+	defaultGitHubAppInstallURL = "https://github.com/apps/gregale-platform/installations/new"
+
+	// githubNoAppInstallError is the stable diagnostic currently returned by
+	// githubd when the OAuth user has not installed this App yet. The gRPC
+	// boundary preserves the diagnostic as an Internal status today, so the
+	// apid edge recognizes this narrow condition and resumes the install flow
+	// instead of presenting it as a GitHub outage.
+	githubNoAppInstallError = "user has no app installations"
 )
+
+// githubAppInstallURL adds the OAuth state to the operator-configured GitHub
+// App installation URL. The URL is configuration, never request input, but we
+// still require an absolute HTTPS URL so a bad deployment cannot turn this
+// handler into an open redirect.
+func githubAppInstallURL(stateToken string) (string, error) {
+	raw := os.Getenv("FAAS_GITHUB_APP_INSTALL_URL")
+	if raw == "" {
+		raw = defaultGitHubAppInstallURL
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != schemeHTTPS || u.Host == "" {
+		return "", fmt.Errorf("FAAS_GITHUB_APP_INSTALL_URL must be an absolute HTTPS URL")
+	}
+	query := u.Query()
+	query.Set("state", stateToken)
+	u.RawQuery = query.Encode()
+	return u.String(), nil
+}
+
+func githubAppInstallationRequired(state InstallState) bool {
+	return state != InstallStateInstalled && state != InstallStateBound
+}
+
+func isGithubAppNotInstalled(err error) bool {
+	return err != nil && strings.Contains(err.Error(), githubNoAppInstallError)
+}
 
 // issueOAuthCodeState mints a 16-byte CSRF state token and writes it
 // to a short-lived cookie scoped to /oauth/code-callback. The
@@ -192,6 +235,18 @@ func (s *server) renderOAuthCodeCallback(w http.ResponseWriter, r *http.Request)
 	// permanence is the audit-worthy event).
 	installID, defaultBranch, err := s.githubd.ExchangeOAuthCode(r.Context(), acct.ID, code, queryState)
 	if err != nil {
+		if isGithubAppNotInstalled(err) {
+			log.Warn("oauth code callback: GitHub App installation required",
+				"account_id", acct.ID)
+			acctID := acct.ID
+			s.audit.Emit(r.Context(), "auth.install.install_required", &acctID, map[string]any{
+				"reason": "github_app_not_installed",
+			})
+			if s.redirectToGitHubAppInstall(w, r) {
+				return
+			}
+			return
+		}
 		log.Error("oauth code callback: githubd ExchangeOAuthCode failed",
 			"account_id", acct.ID,
 			"err", err)
@@ -221,10 +276,33 @@ func (s *server) renderOAuthCodeCallback(w http.ResponseWriter, r *http.Request)
 	http.Redirect(w, r, "/dashboard/account?"+q.Encode(), http.StatusFound)
 }
 
+// redirectToGitHubAppInstall starts a fresh state-protected installation
+// round-trip. It is used both by the normal preflight path and by the callback
+// race where an OAuth code arrives before githubd observes the installation.
+func (s *server) redirectToGitHubAppInstall(w http.ResponseWriter, r *http.Request) bool {
+	stateToken, err := s.issueOAuthCodeState(w, r)
+	if err != nil {
+		s.log.Error("issue oauth code state for GitHub App installation", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error",
+			"Internal Error", "failed to generate CSRF state"))
+		return false
+	}
+	installURL, err := githubAppInstallURL(stateToken)
+	if err != nil {
+		s.log.Error("build GitHub App installation URL", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "github_oauth_misconfigured",
+			"OAuth Misconfigured", err.Error()))
+		return false
+	}
+	http.Redirect(w, r, installURL, http.StatusFound)
+	return true
+}
+
 // startConnectGitHub (POST /dashboard/install/connect) is the
 // dashboard "Connect GitHub" button click handler. It mints a
 // narrow CSRF state cookie scoped to /oauth/code-callback and
-// 302s the browser to GitHub's authorize URL.
+// 302s the browser to GitHub's installation URL when the account has not
+// installed the App yet, or to the user authorization URL when it has.
 //
 // POST-only (not GET) so an opportunistic <img src=…> cannot
 // mint a state cookie and trip a CSRF path. Same posture as
@@ -232,17 +310,15 @@ func (s *server) renderOAuthCodeCallback(w http.ResponseWriter, r *http.Request)
 // shape, but the dashboard chrome triggers it on click; here we
 // POST because the click is rendered from a form).
 //
-// We don't read FAAS_GITHUB_APP_CLIENT_ID env directly here —
-// GitHub App OAuth credentials are operator-controlled and
-// /oauth/callback's renderOAuthCallback handler reads them at
-// exchange time. This handler builds the authorize URL from
-// the same env var the githubd side uses (FAAS_GITHUB_APP_CLIENT_ID)
-// so the two URLs agree.
+// The preflight calls githubd.GetInstallState so a first-time user is guided
+// through GitHub's explicit App approval step. GitHub does not allow Gregale
+// to install an App silently on a user's account or organization.
 func (s *server) startConnectGitHub(w http.ResponseWriter, r *http.Request) {
 	const op = "startConnectGitHub"
 	log := s.log.With("op", op)
 
-	if _, ok := AccountFrom(r.Context()); !ok {
+	acct, ok := AccountFrom(r.Context())
+	if !ok {
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 			"Unauthorized", "sign in to connect GitHub"))
 		return
@@ -253,6 +329,25 @@ func (s *server) startConnectGitHub(w http.ResponseWriter, r *http.Request) {
 		log.Error("FAAS_GITHUB_APP_CLIENT_ID not configured")
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "github_oauth_misconfigured",
 			"OAuth Misconfigured", "FAAS_GITHUB_APP_CLIENT_ID environment variable is required"))
+		return
+	}
+
+	installState, _, _, err := s.githubd.GetInstallState(r.Context(), acct.ID)
+	if err != nil {
+		if problem := api.AsProblem(err); problem != nil {
+			api.WriteProblem(w, problem)
+			return
+		}
+		log.Error("get GitHub App installation state", "account_id", acct.ID, "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
+			"Could not reach GitHub", "retry the connect flow in a minute: https://docs/connect-github"))
+		return
+	}
+	if githubAppInstallationRequired(installState) {
+		log.Info("redirecting account to GitHub App installation",
+			"account_id", acct.ID,
+			"install_state", installState)
+		s.redirectToGitHubAppInstall(w, r)
 		return
 	}
 
