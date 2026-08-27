@@ -102,7 +102,8 @@ Three reasons:
   compile-time merge keeps `EdgeRuleCORSResolved` as one struct. No
   "preset + inline fallback" flag at the runtime boundary.
 - **Migration economy.** One column + one FK + one partial index =
-  one migration (slot 00428). No new tables, no new enums.
+  one migration (slot 00472 after the rebase renumber; originally
+  00428). No new tables, no new enums.
 
 Concretely:
 
@@ -284,9 +285,12 @@ needed.
 
 ## Implementation notes
 
-- Migration slot: **00428** (next free; highest in tree is
-  `00427_request_telemetry.sql`). `migrations/README.md` documents
-  the reservation fences at 00422-00426 — unrelated to this work.
+- Migration slot: **00472** (renumbered from 00428 during the
+  rebase onto current main; main had a 00428_reserve_slot.sql
+  fence owned by another open PR, so the slot was unavailable).
+  Highest real migration on the rebased tree is
+  `00471_runtime_configuration_operations.sql`. See
+  `migrations/README.md` for the reservation fence convention.
 - ADR-128 is the template for this ADR's structure.
 - The compile helper signature `MergeCorsPresetIntoRule` is
   unchanged; only the `*string` nil-check at the call site in
@@ -299,7 +303,7 @@ needed.
   (validation matrix + plan quota + IDOR + audit);
   `cmd/gatewayd-internal/edge_rules_compile_cors_preset_test.go`
   (end-to-end + mutual exclusivity + footgun re-validation).
-- Companion test for migration 00428:
-  `migrations/00428_edge_rules_cors_preset_fk_test.go` pinning
+- Companion test for migration 00472:
+  `migrations/00472_edge_rules_cors_preset_fk_test.go` pinning
   column existence, nullable, FK ON DELETE SET NULL behavior, index
   selectivity.

@@ -1,13 +1,15 @@
 //go:build !no_pg
 
-// Migration-apply test for 00428_edge_rules_cors_preset_fk.sql
+// Migration-apply test for 00472_edge_rules_cors_preset_fk.sql
 // (ADR-129 D1). Pins four concerns because the migration carries
 // four:
 //
-//  1. Migration set applies cleanly through 00428 (next free slot
-//     above main's 00427 — verify no goose duplicate-version
-//     panic). Main's reservations at 00422-00426 ship unchanged;
-//     00427 is the highest real migration in tree.
+//  1. Migration set applies cleanly through 00472 (slot landed
+//     after main's 00471_runtime_configuration_operations.sql;
+//     main has a reservation at 00428 owned by another open PR —
+//     the original 00428 slot was lost to the cross-PR fence on
+//     rebase, this file renumbered to 00472). Verify no goose
+//     duplicate-version panic against any of main's reservations.
 //  2. edge_rules.cors_preset_id column exists under that exact
 //     name, is nullable, and has no DEFAULT (NULL is the default).
 //     ADR-129 D1 mandates NULL-on-default because gen_random_uuid()'s
@@ -34,13 +36,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00428_EdgeRulesCorsPresetFK(t *testing.T) {
+func TestMigrations_00472_EdgeRulesCorsPresetFK(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00428 should land last.
+	// (1) Run the full migration set. 00472 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (failure mode: a slot collision between this migration's 00428 and an open-PR fence — re-run the open-PR slot precheck including refs/pull/<N>/head)", err)
+		t.Fatalf("db.MigrateUp: %v (failure mode: a slot collision between this migration's 00472 and an open-PR fence — re-run the open-PR slot precheck including refs/pull/<N>/head)", err)
 	}
 
 	// (2) Column shape pin. information_schema.columns exposes the
@@ -182,6 +184,6 @@ func TestMigrations_00428_EdgeRulesCorsPresetFK(t *testing.T) {
 	// Replay safety: re-running the migration set is a no-op.
 	// The DROP CONSTRAINT IF EXISTS + ADD pair must be idempotent.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp (replay): %v (00428 must be replay-safe — ADD COLUMN IF NOT EXISTS + DROP CONSTRAINT IF EXISTS + ADD CONSTRAINT)", err)
+		t.Fatalf("db.MigrateUp (replay): %v (00472 must be replay-safe — ADD COLUMN IF NOT EXISTS + DROP CONSTRAINT IF EXISTS + ADD CONSTRAINT)", err)
 	}
 }
