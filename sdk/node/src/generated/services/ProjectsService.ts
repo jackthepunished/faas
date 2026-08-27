@@ -128,7 +128,13 @@ export class ProjectsService {
     slug,
     slug2,
   }: {
+    /**
+     * Project slug (the (account, project) namespace owning the persisted exclusion).
+     */
     slug: string,
+    /**
+     * Excluded workload slug (the app slug persisted via a prior --persist-exclude deploy).
+     */
     slug2: string,
   }): CancelablePromise<{
     ok?: boolean;
