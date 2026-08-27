@@ -1384,7 +1384,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateEdgeRule))))
 	mux.HandleFunc("DELETE /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteEdgeRule))))
 
-// Traffic mirroring (issue #72 / ADR-125 PR-A2). Six routes
+	// Traffic mirroring (issue #72 / ADR-125 PR-A2). Six routes
 	// under /v1/apps/{slug}/mirrors. The path is slug-scoped (not
 	// deployment-id-scoped) so the IDOR guard is the cheaper
 	// s.loadApp path — loadApp resolves to (app, true) only when

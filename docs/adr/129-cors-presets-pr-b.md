@@ -102,8 +102,8 @@ Three reasons:
   compile-time merge keeps `EdgeRuleCORSResolved` as one struct. No
   "preset + inline fallback" flag at the runtime boundary.
 - **Migration economy.** One column + one FK + one partial index =
-  one migration (slot 00472 after the rebase renumber; originally
-  00428). No new tables, no new enums.
+  one migration (slot 00475 after the second rebase renumber;
+  originally 00428 → 00472 → 00475). No new tables, no new enums.
 
 Concretely:
 
@@ -285,10 +285,14 @@ needed.
 
 ## Implementation notes
 
-- Migration slot: **00472** (renumbered from 00428 during the
-  rebase onto current main; main had a 00428_reserve_slot.sql
-  fence owned by another open PR, so the slot was unavailable).
-  Highest real migration on the rebased tree is
+- Migration slot: **00475** (second-renumber after the second
+  rebase onto current main; main now has reservation fences at
+  slots 00472-00474 and 00476 owned by another open PR — those
+  fences occupy the slot, and the audit pair 00477/00478 is
+  shipped. The only free slot in that window is 00475).
+  First renumber was 00428 → 00472 (main's 00428 fence); second
+  renumber is 00472 → 00475 (main's 00472 fence). Highest real
+  pre-audit-pair migration on the rebased tree is
   `00471_runtime_configuration_operations.sql`. See
   `migrations/README.md` for the reservation fence convention.
 - ADR-128 is the template for this ADR's structure.
@@ -303,7 +307,7 @@ needed.
   (validation matrix + plan quota + IDOR + audit);
   `cmd/gatewayd-internal/edge_rules_compile_cors_preset_test.go`
   (end-to-end + mutual exclusivity + footgun re-validation).
-- Companion test for migration 00472:
-  `migrations/00472_edge_rules_cors_preset_fk_test.go` pinning
+- Companion test for migration 00475:
+  `migrations/00475_edge_rules_cors_preset_fk_test.go` pinning
   column existence, nullable, FK ON DELETE SET NULL behavior, index
   selectivity.
