@@ -4574,6 +4574,116 @@ func (s *PgStore) LiveDeployments(ctx context.Context, appID string) ([]Deployme
 	return scanDeployments(rows)
 }
 
+// ListCanaryInFlight (issue #976 / ADR-122 / SAFE-RELEASES-A + F)
+// returns every deployment that is mid-canary across all apps:
+// status='live' AND canary_total_steps > 0 AND canary_step <
+// canary_total_steps AND rollout_state IN ('pending','rolling_out').
+// The canary_progression meterd tick walks the per-deployment
+// ladder; the safe-deploy orchestrator walks the rollout-state
+// machine. Both walk this same set — the indexes on (status,
+// canary_total_steps) and on (rollout_state) keep the scan
+// sub-millisecond at fleet scale.
+//
+// Uses a partial-index-friendly predicate: the planner can switch
+// to deployments_live_traffic_idx for the status='live' slice. No
+// new index needed for this PR; the column defaults + status
+// index from migration 00162 are sufficient.
+func (s *PgStore) ListCanaryInFlight(ctx context.Context) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments
+		 where status = 'live'
+		   and canary_total_steps > 0
+		   and canary_step < canary_total_steps
+		   and rollout_state in ('pending','rolling_out')
+		 order by created_at asc`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list canary in-flight: %w", err)
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+// SafedeployListPendingRollouts (issue #976 / ADR-122 /
+// SAFE-RELEASES-F) walks the orchestrator's tick set. The
+// predicate is a strict superset of ListCanaryInFlight: it
+// includes rows with canary_total_steps=0 (the "no canary ladder"
+// case where rollout_state still walks pending → complete on
+// first tick). The orchestrator skips those rows internally when
+// advancing the state machine, but they still need to appear
+// here so the orchestrator can stamp rollout_completed_at on
+// them.
+//
+// Ordering is (rollout_started_at NULLS FIRST, created_at ASC):
+// a brand-new pending row walks first (no started_at yet), then
+// in-flight rolling_out rows in FIFO order. The fairness
+// property matches the alert evaluator's per-rule-walk shape so
+// the operator dashboard's "oldest pending" panel reads true.
+func (s *PgStore) SafedeployListPendingRollouts(ctx context.Context) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments
+		 where rollout_state in ('pending','rolling_out')
+		   and status = 'live'
+		 order by rollout_started_at asc nulls first, created_at asc`)
+	if err != nil {
+		return nil, fmt.Errorf("state: safedeploy list pending rollouts: %w", err)
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+// SafedeployStampRollout (issue #976 / ADR-122 / SAFE-RELEASES-F)
+// is the atomic-write primitive the orchestrator uses to
+// transition rollout_state. The write is a single UPDATE that
+// moves the (rollout_state, rollout_started_at,
+// rollout_completed_at, rollout_aborted_at, rollout_aborted_reason)
+// tuple in lock-step — partial writes would leave the row in a
+// half-finished state the next ListPendingRollouts walk would
+// re-pick.
+//
+// Locking: takes FOR UPDATE on the deployment row inside a tx so
+// a concurrent orchestrator tick (or the AlertEvaluator's
+// ActionDispatcher demote/promote path) cannot interleave. The
+// audit emit is the caller's responsibility — the orchestrator
+// calls AppendDeploymentAudit explicitly so the audit row
+// carries the orchestrator's actor sentinel.
+//
+// Returns the post-write row so the orchestrator can decide
+// whether to emit additional audit fields (e.g. the rollout's
+// terminal canary step when transitioning to 'complete').
+func (s *PgStore) SafedeployStampRollout(ctx context.Context, id string, rolloutState string, startedAt, completedAt, abortedAt *time.Time, abortedReason string) (Deployment, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: safedeploy stamp begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	row := tx.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments where id = $1
+		 for update`, id)
+	dep, err := scanDeployment(row)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: safedeploy stamp load: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`update deployments set
+			rollout_state = $2,
+			rollout_started_at = $3,
+			rollout_completed_at = $4,
+			rollout_aborted_at = $5,
+			rollout_aborted_reason = $6
+		 where id = $1`,
+		id, rolloutState, startedAt, completedAt, abortedAt, abortedReason); err != nil {
+		return Deployment{}, fmt.Errorf("state: safedeploy stamp update: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, fmt.Errorf("state: safedeploy stamp commit: %w", err)
+	}
+	return dep, nil
+}
+
 // CountLiveInstancesByDeployment returns the number of instances in
 // {WAKING, COLD_BOOTING, RUNNING} for the given deployment_id (issue
 // #555 PR-6). The DeploymentCounterWatcher
@@ -5237,6 +5347,226 @@ func (s *PgStore) UpdateDeploymentStatus(ctx context.Context, id string, status 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RecoverRollout (issue #976 / ADR-122 / SAFE-RELEASES-R) is the
+// Postgres-backed counterpart of MemStore.RecoverRollout — the
+// atomic-tx primitive that drives the operator CLI's manual
+// recovery path. The whole flow runs inside a single transaction
+// so the canary_step bump + traffic redistribution + audit emit
+// land together or not at all; a concurrent canary_progression
+// tick or alert-driven action executor is serialised behind the
+// FOR UPDATE lock.
+//
+// action ∈ {"advance", "promote", "abort"}; see
+// MemStore.RecoverRollout for the closed-set semantics.
+//
+// Returns the refreshed Deployment row + the audit row id (so
+// the CLI's terminal can echo "audit_id=N"). Both backends share
+// the same closed-set guards so handler tests can pin the same
+// shape against either store.
+func (s *PgStore) RecoverRollout(ctx context.Context, appID string, action, reason string) (Deployment, int64, error) {
+	switch action {
+	case "advance", "promote", "abort":
+	default:
+		return Deployment{}, 0, ErrInvalidRecoverAction
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, 0, fmt.Errorf("state: recover_rollout begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+
+	// (1) Find + lock the active rollout row for this app.
+	// Mirrors SafedeployListPendingRollouts' predicate; the FOR
+	// UPDATE serialises a concurrent canary tick or alert-driven
+	// action executor on the same row.
+	row := tx.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		   from deployments
+		  where app_id = $1
+		    and status = 'live'
+		    and rollout_state in ('pending','rolling_out')
+		  order by created_at desc
+		  limit 1
+		  for update`, appID)
+	dep, scanErr := scanDeploymentWithRootfs(row)
+	if scanErr != nil {
+		if errors.Is(scanErr, ErrNotFound) {
+			return Deployment{}, 0, ErrNotFound
+		}
+		return Deployment{}, 0, fmt.Errorf("state: recover_rollout load: %w", scanErr)
+	}
+
+	now := time.Now().UTC()
+
+	var (
+		auditKind   DeploymentAuditKind
+		auditData   []byte
+		newTrafficP int
+	)
+	switch action {
+	case "advance":
+		// Stuck-detection gate. canary_step_started_at NULL or
+		// within the stuck-after window both trip
+		// ErrRolloutNotStuck; the CLI distinguishes "fix a
+		// stuck rollout" (advance) from "force-step a
+		// healthy rollout" (promote).
+		if dep.CanaryStepStartedAt == nil {
+			return Deployment{}, 0, ErrRolloutNotStuck
+		}
+		if now.Sub(*dep.CanaryStepStartedAt) < RecoverRolloutStuckAfter {
+			return Deployment{}, 0, ErrRolloutNotStuck
+		}
+		if dep.CanaryTotalSteps <= 0 || dep.CanaryStep >= dep.CanaryTotalSteps {
+			return Deployment{}, 0, ErrRolloutStateInvalid
+		}
+
+		newStep := dep.CanaryStep + 1
+		newTrafficP = stepToPercent(newStep, dep.CanaryTotalSteps)
+
+		// Bump step, stamp started_at, stamp traffic_percent.
+		if _, err := tx.Exec(ctx,
+			`update deployments set
+				canary_step = $2,
+				canary_step_started_at = $3,
+				traffic_percent = $4
+			 where id = $1`,
+			dep.ID, newStep, now, newTrafficP); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout stamp advance: %w", err)
+		}
+
+		// Redistribute residual across siblings (largest-
+		// remainder Σ = 100).
+		siblingRows, err := tx.Query(ctx,
+			`select id, traffic_percent
+			   from deployments
+			  where app_id = $1 and status = 'live' and id != $2
+			  order by id`,
+			appID, dep.ID)
+		if err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout read siblings: %w", err)
+		}
+		var siblings []struct {
+			ID    string
+			Prior int
+		}
+		for siblingRows.Next() {
+			var s struct {
+				ID    string
+				Prior int
+			}
+			if err := siblingRows.Scan(&s.ID, &s.Prior); err != nil {
+				siblingRows.Close()
+				return Deployment{}, 0, fmt.Errorf("state: recover_rollout scan sibling: %w", err)
+			}
+			siblings = append(siblings, s)
+		}
+		siblingRows.Close()
+		if err := siblingRows.Err(); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout iterate siblings: %w", err)
+		}
+		newWeights := RedistributeTraffic(siblings, 100-newTrafficP)
+		for i, s := range siblings {
+			if _, err := tx.Exec(ctx,
+				`update deployments set traffic_percent = $2 where id = $1`,
+				s.ID, newWeights[i]); err != nil {
+				return Deployment{}, 0, fmt.Errorf("state: recover_rollout stamp sibling %s: %w", s.ID, err)
+			}
+		}
+
+		// If the bump reaches the top of the ladder, flip
+		// rollout_state='complete'.
+		if newStep >= dep.CanaryTotalSteps {
+			if _, err := tx.Exec(ctx,
+				`update deployments set
+					rollout_state = 'complete',
+					rollout_completed_at = $2
+				 where id = $1`,
+				dep.ID, now); err != nil {
+				return Deployment{}, 0, fmt.Errorf("state: recover_rollout stamp complete: %w", err)
+			}
+		}
+
+		auditKind = DeployTrafficChanged
+		auditData = []byte(fmt.Sprintf(`{"action":"advance","reason":%q}`, reason))
+
+	case "promote":
+		if dep.CanaryTotalSteps <= 0 || dep.CanaryStep >= dep.CanaryTotalSteps {
+			return Deployment{}, 0, ErrRolloutStateInvalid
+		}
+
+		// Short-circuit: step = total, traffic_percent = 100,
+		// siblings zeroed, rollout_state = 'complete'.
+		if _, err := tx.Exec(ctx,
+			`update deployments set
+				canary_step = $2,
+				canary_step_started_at = $3,
+				traffic_percent = 100,
+				rollout_state = 'complete',
+				rollout_completed_at = $3
+			 where id = $1`,
+			dep.ID, dep.CanaryTotalSteps, now); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout stamp promote: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`update deployments set traffic_percent = 0
+			  where app_id = $1 and status = 'live' and id != $2`,
+			appID, dep.ID); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout zero siblings: %w", err)
+		}
+
+		auditKind = DeployTrafficChanged
+		auditData = []byte(fmt.Sprintf(`{"action":"promote","reason":%q}`, reason))
+
+	case "abort":
+		if _, err := tx.Exec(ctx,
+			`update deployments set
+				rollout_state = 'aborted',
+				rollout_aborted_at = $2,
+				rollout_aborted_reason = $3
+			 where id = $1`,
+			dep.ID, now, reason); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: recover_rollout stamp abort: %w", err)
+		}
+		auditKind = DeployRolledBack
+		auditData = []byte(fmt.Sprintf(`{"action":"abort","reason":%q}`, reason))
+	}
+
+	// Audit emit rides the same tx as the deployment stamp —
+	// failures roll back the deployment update. The audit row's
+	// actor sentinel "operator:cli:recover_rollout" distinguishes
+	// the operator-driven path from the meterd-driven
+	// canary_progression / safedeploy orchestrator paths.
+	var auditID int64
+	if err := tx.QueryRow(ctx,
+		`insert into deployment_audit
+		    (deployment_id, account_id, kind, actor, at, data)
+		 values ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)
+		 returning id`,
+		dep.ID,
+		nil, // account_id is nullable; the CLI carries the actor via the actor column
+		string(auditKind),
+		"operator:cli:recover_rollout",
+		now,
+		auditData,
+	).Scan(&auditID); err != nil {
+		return Deployment{}, 0, fmt.Errorf("state: recover_rollout append audit: %w", err)
+	}
+
+	// Read back the post-write row.
+	row2 := tx.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		   from deployments where id = $1`, dep.ID)
+	updated, scanErr := scanDeploymentWithRootfs(row2)
+	if scanErr != nil {
+		return Deployment{}, 0, fmt.Errorf("state: recover_rollout readback: %w", scanErr)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, 0, fmt.Errorf("state: recover_rollout commit: %w", err)
+	}
+	return updated, auditID, nil
 }
 
 func (s *PgStore) MarkDeploymentSuperseded(ctx context.Context, id string) error {

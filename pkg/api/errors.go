@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+
+	"github.com/onebox-faas/faas/pkg/api/canary"
 )
 
 // docsBase is the canonical documentation URL prefix sourced
@@ -817,6 +819,14 @@ const (
 	// this code on out-of-range input as a defence-in-depth
 	// backstop.
 	CodeInvalidTrafficPercent = "invalid_traffic_percent"
+	// CodeInvalidCanaryPreset (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) is a 422 for an out-of-catalog canary
+	// preset name. The pkg/api/canary closed-set is the source
+	// of truth (mirrored on disk by deployments_canary_preset_chk
+	// at migration 00480); the handler validates membership
+	// before INSERT so a typo doesn't surface as a CHECK
+	// violation deep in the pgstore layer.
+	CodeInvalidCanaryPreset = "invalid_canary_preset"
 	// CodeTrafficPercentSumInvalid (issue #556) is a 409
 	// (Conflict) for the defensive backstop: post-write
 	// Σ(traffic_percent WHERE status='live') != 100. In
@@ -2571,6 +2581,29 @@ const (
 	// outbound problem envelope so an SDK can branch on it
 	// without parsing prose. ADR-093 §Decision.
 	CodeRequestBudgetExceeded = "request_budget_exceeded"
+	// CodeInvalidRecoverAction (issue #976 / ADR-122 /
+	// SAFE-RELEASES-R) is the 422 the recover_rollout handler
+	// emits when the request body's `action` is outside the
+	// closed set {"advance","promote","abort"}. Mirrors
+	// CodeInvalidTrafficPercent (422 for shape errors that the
+	// plan-gate / state-machine guards downstream would not
+	// trip on).
+	CodeInvalidRecoverAction = "invalid_recover_action"
+	// CodeRolloutNotStuck (issue #976 / ADR-122 / SAFE-RELEASES-R)
+	// is the 409 the recover_rollout handler emits when the
+	// operator asks for action="advance" on a rollout that is
+	// NOT stuck (canary_step_started_at within the stuck-after
+	// window). Distinct from CodeRolloutStateInvalid because
+	// the customer-facing fix is different ("use promote
+	// instead" vs "rollout already terminal").
+	CodeRolloutNotStuck = "rollout_not_stuck"
+	// CodeRolloutStateInvalid (issue #976 / ADR-122 /
+	// SAFE-RELEASES-R) is the 409 the recover_rollout handler
+	// emits when the rollout is already in a terminal state
+	// ('complete' or 'aborted') and the requested recovery
+	// cannot proceed. Distinct from CodeRolloutNotStuck because
+	// the failure mode is "already done" vs "not stuck yet".
+	CodeRolloutStateInvalid = "rollout_state_invalid"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
@@ -3348,6 +3381,20 @@ func ErrInvalidTrafficPercent(got int) *Problem {
 		fmt.Sprintf("traffic_percent must be in [0, %d]; got %d.", cap, got)).
 		WithLimit(int64(cap), int64(got)).
 		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
+}
+
+// ErrInvalidCanaryPreset (issue #976 / ADR-122 / SAFE-RELEASES-A)
+// is returned by buildDeploymentForInsert when the request body's
+// canary.preset is not in pkg/api/canary.AllowedCanaryPresets. 422
+// mirrors ErrInvalidTrafficPercent — shape violation, distinct from
+// the plan-gate 403 above it. The allowed-set is also rendered on
+// the wire so the CLI can suggest the closest match in its error
+// chip.
+func ErrInvalidCanaryPreset(got string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidCanaryPreset,
+		"Invalid canary preset",
+		fmt.Sprintf("canary preset %q is not in the closed-set catalog (%v); see --canary-preset in `gregale deploy --help`.", got, canary.AllowedCanaryPresets)).
+		WithDocs("https://docs.gregale.dev/deployments#canary-presets")
 }
 
 // ErrTrafficPercentSumInvalid (issue #556) is the defensive
@@ -4349,4 +4396,46 @@ func ErrRequestValidationFailed(ruleID string, errs []FieldError) *Problem {
 	}
 	p.Errors = errs
 	return p
+}
+
+// ErrInvalidRecoverAction (issue #976 / ADR-122 / SAFE-RELEASES-R)
+// is the 422 the recover_rollout handler emits when the request
+// body's `action` field is outside the closed set
+// {"advance","promote","abort"}. Detail echoes the bad value so
+// the CLI renders it. 422 mirrors the shape-error convention used
+// by ErrInvalidTrafficPercent (above) — the plan-gate and
+// state-machine guards downstream would not trip on this input,
+// so 422 (shape) not 403 (plan) or 409 (state).
+func ErrInvalidRecoverAction(got string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidRecoverAction,
+		"Invalid recover_rollout action",
+		fmt.Sprintf("recover_rollout.action must be one of {advance, promote, abort}; got %q.", got)).
+		WithDocs(docsBase + "/deploys#recover-rollout")
+}
+
+// ErrRolloutNotStuck (issue #976 / ADR-122 / SAFE-RELEASES-R) is
+// the 409 the recover_rollout handler emits when the operator
+// asks for action="advance" on a rollout that is NOT stuck. The
+// detail suggests the alternative ("use --action promote
+// instead") so the CLI surfaces a usable next step. 409 because
+// the request is well-formed but cannot proceed in current
+// state.
+func ErrRolloutNotStuck() *Problem {
+	return NewProblem(http.StatusConflict, CodeRolloutNotStuck,
+		"Rollout is not stuck",
+		"canary_step_started_at is within the stuck-after window; wait for the rollout to age, or use --action promote to force-step.").
+		WithDocs(docsBase + "/deploys#recover-rollout")
+}
+
+// ErrRolloutStateInvalid (issue #976 / ADR-122 / SAFE-RELEASES-R)
+// is the 409 the recover_rollout handler emits when the
+// deployment's rollout_state is 'complete' or 'aborted' and the
+// requested recovery cannot proceed. Distinct from
+// ErrRolloutNotStuck because the failure mode is "already
+// terminal" vs "not stuck yet".
+func ErrRolloutStateInvalid(state string) *Problem {
+	return NewProblem(http.StatusConflict, CodeRolloutStateInvalid,
+		"Rollout state does not permit recovery",
+		fmt.Sprintf("rollout_state=%q; recovery requires rollout_state in {pending, rolling_out}.", state)).
+		WithDocs(docsBase + "/deploys#recover-rollout")
 }

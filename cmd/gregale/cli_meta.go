@@ -675,6 +675,25 @@ var cliCommands = []cliCommand{
 		Short:   "Re-promote the previous deployment",
 	},
 	{
+		// SAFE-RELEASES-R (issue #976 / ADR-122): the
+		// operator manual-recovery escape hatch — see
+		// cmd/gregale/commands_rollouts.go. The CLI
+		// subcommand `gregale rollouts recover <slug>` is
+		// the canonical caller; the route is mounted at
+		// POST /v1/apps/{slug}/rollouts/recover (apid).
+		Name:    "rollouts",
+		DocSlug: "rollouts",
+		Short:   "Operator manual rollout recovery (rollouts recover <slug> --action advance|promote|abort --reason <text>)",
+		Subcommands: []cliSub{
+			{Name: "recover", Short: "Manually advance / promote / abort a stuck rollout (operator escape hatch)"},
+		},
+		Positionals: []string{"<slug>"},
+		Flags: []cliFlag{
+			{Name: "action", Short: "recover action", ClosedSet: []string{"advance", "promote", "abort"}, Req: true},
+			{Name: "reason", Short: "operator-supplied reason (logged to deployment_audit)"},
+		},
+	},
+	{
 		Name:    "scan",
 		DocSlug: "scan",
 		Short:   "Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)",

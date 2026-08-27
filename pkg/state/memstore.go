@@ -4166,6 +4166,427 @@ func (m *MemStore) LiveDeployments(_ context.Context, appID string) ([]Deploymen
 	return out, nil
 }
 
+// ListCanaryInFlight (issue #976 / ADR-122 / SAFE-RELEASES-A + F)
+// mirrors PgStore.ListCanaryInFlight across all apps: status='live'
+// AND canary_total_steps > 0 AND canary_step < canary_total_steps
+// AND rollout_state IN ('pending','rolling_out'). Tests pin both
+// impls against the same predicate so a refactor cannot silently
+// drift the in-memory surface from the on-disk query.
+func (m *MemStore) ListCanaryInFlight(_ context.Context) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		if d.Status != DeployLive {
+			continue
+		}
+		if d.CanaryTotalSteps <= 0 || d.CanaryStep >= d.CanaryTotalSteps {
+			continue
+		}
+		if d.RolloutState != "pending" && d.RolloutState != "rolling_out" {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// SafedeployListPendingRollouts (issue #976 / ADR-122 /
+// SAFE-RELEASES-F) mirrors PgStore.SafedeployListPendingRollouts.
+// Strict superset of ListCanaryInFlight — includes rows with
+// canary_total_steps=0 so the orchestrator can stamp them
+// 'complete' on first tick. The ordering discipline matches the
+// SQL (rollout_started_at NULLS FIRST, created_at ASC) so the
+// MemStore-backed integration tests can pin a deterministic
+// walk order.
+func (m *MemStore) SafedeployListPendingRollouts(_ context.Context) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		if d.Status != DeployLive {
+			continue
+		}
+		if d.RolloutState != "pending" && d.RolloutState != "rolling_out" {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// rollout_started_at NULLS FIRST: a zero-value pointer
+		// sorts before any non-zero time. Time.Time{}.IsZero()
+		// is the in-memory mirror of SQL NULL.
+		if out[i].RolloutStartedAt == nil && out[j].RolloutStartedAt != nil {
+			return true
+		}
+		if out[i].RolloutStartedAt != nil && out[j].RolloutStartedAt == nil {
+			return false
+		}
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// SafedeployStampRollout (issue #976 / ADR-122 / SAFE-RELEASES-F)
+// mirrors PgStore.SafedeployStampRollout for the in-memory test
+// seam. The PgStore version takes FOR UPDATE inside a tx; the
+// MemStore just holds m.mu for the whole write so a concurrent
+// orchestrator tick on the same row serialises correctly. The
+// returned Deployment is a deep copy so a caller can't mutate
+// the in-memory row through the returned value.
+func (m *MemStore) SafedeployStampRollout(_ context.Context, id string, rolloutState string, startedAt, completedAt, abortedAt *time.Time, abortedReason string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	d.RolloutState = rolloutState
+	if startedAt != nil {
+		t := *startedAt
+		d.RolloutStartedAt = &t
+	}
+	if completedAt != nil {
+		t := *completedAt
+		d.RolloutCompletedAt = &t
+	}
+	if abortedAt != nil {
+		t := *abortedAt
+		d.RolloutAbortedAt = &t
+	}
+	d.RolloutAbortedReason = abortedReason
+	m.deployments[id] = d
+	return d, nil
+}
+
+// RecoverRollout (issue #976 / ADR-122 / SAFE-RELEASES-R) is the
+// in-memory mirror of PgStore.RecoverRollout — the operator
+// manual-recovery escape hatch used by the
+// `gregale rollouts recover <slug>` CLI subcommand. Holds m.mu
+// for the whole body so a concurrent canary_progression tick or
+// alert-driven action executor cannot interleave a partial
+// state.
+//
+// action ∈ {"advance", "promote", "abort"}:
+//
+//   - advance: requires rollout_state IN ('pending','rolling_out'),
+//     canary_total_steps > 0, canary_step < canary_total_steps,
+//     and canary_step_started_at older than
+//     RecoverRolloutStuckAfter. Bumps canary_step by 1, stamps
+//     canary_step_started_at = now(), and runs the same
+//     largest-remainder redistribution as UpdateDeploymentTraffic
+//     so Σ = 100 stays invariant. On step reaching
+//     canary_total_steps, flips rollout_state='complete' and
+//     stamps rollout_completed_at. Emits one deployment_audit
+//     row with kind='deploy.traffic_changed' (the canary step
+//     advance is itself a traffic change; the rollout-state flip
+//     gets its own 'deploy.rolled_back' audit on abort and no
+//     separate audit on completion — the final
+//     canary_step_started_at + traffic_percent=100 row is the
+//     audit signal).
+//
+//   - promote: same predicate minus the stuck-check. Sets
+//     canary_step = canary_total_steps, rollout_state =
+//     'complete', traffic_percent = 100 (sibling rows zeroed to
+//     keep Σ=100), stamps rollout_completed_at +
+//     canary_step_started_at = now(). Emits one deployment_audit
+//     row with kind='deploy.traffic_changed'.
+//
+//   - abort: any state in ('pending','rolling_out'). Sets
+//     rollout_state = 'aborted', rollout_aborted_at = now(),
+//     rollout_aborted_reason = reason. Emits one deployment_audit
+//     row with kind='deploy.rolled_back' (re-using the existing
+//     closed-set audit kind — a CLI-initiated abort and a
+//     meterd-initiated auto-rollback share the same audit
+//     signal; the audit `actor` field carries the difference).
+//
+// Returns the refreshed Deployment + the audit row id (so the
+// CLI can echo "audit_id=…"). Both backends share the same
+// closed-set guards so handler tests can pin the same shape
+// against either store.
+func (m *MemStore) RecoverRollout(_ context.Context, appID string, action, reason string) (Deployment, int64, error) {
+	// Validate action at the store boundary so a direct store
+	// caller (CLI test path) gets the same 422 shape as the
+	// handler. The handler also validates via
+	// api.AllowedRecoverRolloutAction; this is defence-in-depth.
+	switch action {
+	case "advance", "promote", "abort":
+	default:
+		return Deployment{}, 0, ErrInvalidRecoverAction
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Find the active deployment for this app: rollout_state ∈
+	// ('pending','rolling_out') and status='live'. There can be
+	// at most one active rollout per app at a time (canary
+	// progression auto-supersedes the prior live row).
+	var target *Deployment
+	for id, d := range m.deployments {
+		if d.AppID != appID || d.Status != DeployLive {
+			continue
+		}
+		if d.RolloutState != "pending" && d.RolloutState != "rolling_out" {
+			continue
+		}
+		d := d
+		target = &d
+		_ = id
+		break
+	}
+	if target == nil {
+		return Deployment{}, 0, ErrNotFound
+	}
+
+	now := time.Now()
+
+	switch action {
+	case "advance":
+		// Stuck-detection gate. The CLI distinguishes
+		// "fix a stuck rollout" (advance is the right call)
+		// from "force-step a healthy rollout" (use promote),
+		// so the operator's terminal failure is loud: 409
+		// ErrRolloutNotStuck.
+		if target.CanaryStepStartedAt == nil {
+			return Deployment{}, 0, ErrRolloutNotStuck
+		}
+		if now.Sub(*target.CanaryStepStartedAt) < RecoverRolloutStuckAfter {
+			return Deployment{}, 0, ErrRolloutNotStuck
+		}
+		if target.CanaryTotalSteps <= 0 || target.CanaryStep >= target.CanaryTotalSteps {
+			return Deployment{}, 0, ErrRolloutStateInvalid
+		}
+
+		// Bump step, stamp started_at.
+		target.CanaryStep++
+		t := now
+		target.CanaryStepStartedAt = &t
+
+		// Resolve the stage's traffic percent via the canary
+		// catalog (pkg/api/canary). We don't import it here —
+		// the MemStore reads the closed-set raw weights via
+		// the catalog-side helper resolved in the
+		// handler/safedeploy layer. For the MemStore test seam,
+		// we re-use the in-memory catalog (pkg/api/canary)
+		// through a deferred lookup. To keep the state
+		// package import-clean we use a linear step-to-percent
+		// mapping: step k / total N gets 1,10,50,100 in that
+		// progression. Real production resolves via the
+		// catalog; the store-layer semantics are "bump the
+		// step" — the orchestrator/handler layer applies the
+		// catalog and stamps traffic_percent. For the
+		// MemStore test we mirror the
+		// 1-10-50-100-equivalent curve.
+		stepPct := stepToPercent(target.CanaryStep, target.CanaryTotalSteps)
+		target.TrafficPercent = stepPct
+
+		// Redistribute residual across sibling live rows.
+		siblings := []siblingRow{}
+		for otherID, other := range m.deployments {
+			if other.AppID != appID || other.Status != DeployLive || otherID == target.ID {
+				continue
+			}
+			siblings = append(siblings, siblingRow{ID: otherID, Prior: other.TrafficPercent})
+		}
+		sort.SliceStable(siblings, func(a, b int) bool { return siblings[a].ID < siblings[b].ID })
+		newWeights := RedistributeTraffic(toHelperSiblings(siblings), 100-stepPct)
+		for i, s := range siblings {
+			other := m.deployments[s.ID]
+			other.TrafficPercent = newWeights[i]
+			m.deployments[s.ID] = other
+		}
+
+		// If the bump reaches the top of the ladder, flip
+		// rollout_state='complete'.
+		if target.CanaryStep >= target.CanaryTotalSteps {
+			target.RolloutState = "complete"
+			t := now
+			target.RolloutCompletedAt = &t
+		}
+		m.deployments[target.ID] = *target
+
+		auditID, err := m.appendDeploymentAuditLocked(DeploymentAudit{
+			DeploymentID: uuid.MustParse(target.ID),
+			AccountID:    nil,
+			Kind:         DeployTrafficChanged,
+			Actor:        "operator:cli:recover_rollout",
+			At:           now,
+			Data:         json.RawMessage(fmt.Sprintf(`{"action":"advance","reason":%q}`, reason)),
+		})
+		if err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
+		}
+		return *target, auditID, nil
+
+	case "promote":
+		if target.CanaryTotalSteps <= 0 || target.CanaryStep >= target.CanaryTotalSteps {
+			return Deployment{}, 0, ErrRolloutStateInvalid
+		}
+		target.CanaryStep = target.CanaryTotalSteps
+		target.RolloutState = "complete"
+		target.TrafficPercent = 100
+		t := now
+		target.CanaryStepStartedAt = &t
+		target.RolloutCompletedAt = &t
+
+		// Zero sibling live rows so Σ = 100.
+		for otherID, other := range m.deployments {
+			if other.AppID != appID || other.Status != DeployLive || otherID == target.ID {
+				continue
+			}
+			other.TrafficPercent = 0
+			m.deployments[otherID] = other
+		}
+		m.deployments[target.ID] = *target
+
+		auditID, err := m.appendDeploymentAuditLocked(DeploymentAudit{
+			DeploymentID: uuid.MustParse(target.ID),
+			AccountID:    nil,
+			Kind:         DeployTrafficChanged,
+			Actor:        "operator:cli:recover_rollout",
+			At:           now,
+			Data:         json.RawMessage(fmt.Sprintf(`{"action":"promote","reason":%q}`, reason)),
+		})
+		if err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
+		}
+		return *target, auditID, nil
+
+	case "abort":
+		target.RolloutState = "aborted"
+		t := now
+		target.RolloutAbortedAt = &t
+		target.RolloutAbortedReason = reason
+		m.deployments[target.ID] = *target
+
+		auditID, err := m.appendDeploymentAuditLocked(DeploymentAudit{
+			DeploymentID: uuid.MustParse(target.ID),
+			AccountID:    nil,
+			Kind:         DeployRolledBack,
+			Actor:        "operator:cli:recover_rollout",
+			At:           now,
+			Data:         json.RawMessage(fmt.Sprintf(`{"action":"abort","reason":%q}`, reason)),
+		})
+		if err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
+		}
+		return *target, auditID, nil
+	}
+	return Deployment{}, 0, ErrInvalidRecoverAction
+}
+
+// siblingRow + toHelperSiblings adapt the MemStore's per-method
+// sibling-tracking shape to the type RedistributeTraffic expects.
+type siblingRow struct {
+	ID    string
+	Prior int
+}
+
+func toHelperSiblings(in []siblingRow) []struct {
+	ID    string
+	Prior int
+} {
+	out := make([]struct {
+		ID    string
+		Prior int
+	}, len(in))
+	for i, s := range in {
+		out[i].ID = s.ID
+		out[i].Prior = s.Prior
+	}
+	return out
+}
+
+// stepToPercent maps a (step, total_steps) pair onto the catalog's
+// percent for that step. The MemStore RecoverRollout doesn't import
+// pkg/api/canary (would invert the dependency), so it inlines the
+// canonical 1-10-50-100 progression the catalog returns for the
+// `1-10-50-100` preset (the only preset CLI surfaces today via
+// `gregale deploy --canary-preset 1-10-50-100`). Total steps == 0
+// or step > total returns 0 — the handler layer is responsible for
+// non-default presets, where the catalog resolves to a stage table
+// that's stamped by the canary_progression tick on each step.
+//
+// Production deployments that use the slower presets (slow,
+// balanced, aggressive) will continue to advance via the meterd
+// orchestrator (which DOES import pkg/api/canary); the CLI's
+// `recover` path is the operator escape hatch for stuck rollouts
+// and is calibrated for the headline 4-stage cadence. Pinning the
+// step-to-percent curve here keeps the MemStore test suite
+// deterministic without duplicating the catalog.
+func stepToPercent(step, total int) int {
+	if total <= 0 || step <= 0 {
+		return 0
+	}
+	switch total {
+	case 4: // 1-10-50-100 / balanced.
+		switch step {
+		case 1:
+			return 1
+		case 2:
+			return 10
+		case 3:
+			return 50
+		case 4:
+			return 100
+		default:
+			return 0
+		}
+	case 3: // aggressive (5/50/100).
+		switch step {
+		case 1:
+			return 5
+		case 2:
+			return 50
+		case 3:
+			return 100
+		}
+	case 2: // slow (1/100).
+		switch step {
+		case 1:
+			return 1
+		case 2:
+			return 100
+		}
+	}
+	return 0
+}
+
+// appendDeploymentAuditLocked is the lock-held variant of
+// AppendDeploymentAudit used by RecoverRollout's transactional
+// body. It assumes the caller holds m.mu (RecoverRollout does);
+// AppendDeploymentAudit is the public lock-acquiring wrapper.
+// Behaviour matches AppendDeploymentAudit so the deployment_audit
+// id sequence is monotonic across both entry points.
+func (m *MemStore) appendDeploymentAuditLocked(entry DeploymentAudit) (int64, error) {
+	var dataCopy json.RawMessage
+	if len(entry.Data) > 0 {
+		dataCopy = append(json.RawMessage(nil), entry.Data...)
+	}
+	at := entry.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	id := int64(len(m.deploymentAudit) + 1)
+	m.deploymentAudit = append(m.deploymentAudit, DeploymentAudit{
+		ID:           id,
+		DeploymentID: entry.DeploymentID,
+		AccountID:    entry.AccountID,
+		Kind:         entry.Kind,
+		Actor:        entry.Actor,
+		At:           at,
+		Data:         dataCopy,
+	})
+	return id, nil
+}
+
 // CountLiveInstancesByDeployment mirrors PgStore.CountLiveInstancesByDeployment
 // for the in-memory test seam (issue #555 PR-6). The state filter
 // matches the SQL — {waking, cold_booting, running} — and the
@@ -5357,6 +5778,36 @@ func (m *MemStore) SetDeploymentParked(_ context.Context, id, reason string, at 
 	}
 	d.ParkedReason = reason
 	d.ParkedAt = &at
+	m.deployments[id] = d
+	return nil
+}
+
+// SetDeploymentCanaryState (issue #976 / ADR-122 / SAFE-RELEASES-R)
+// is the test-seam helper that lets handler / integration tests
+// hand-stamp the canary + rollout columns without driving the
+// meterd orchestrator. The production path stamps these columns
+// via the canary_progression tick (pkg/canary) and the
+// safedeploy orchestrator (pkg/safedeploy); this method exists
+// purely so the recover_rollout handler tests can pin a
+// deterministic starting state. Documented as a test seam so a
+// production reader knows the method is not on the writer
+// hot-path — every call goes through m.mu so concurrent
+// orchestrator ticks can't interleave.
+func (m *MemStore) SetDeploymentCanaryState(_ context.Context, id, preset string, step, total int, stepStartedAt time.Time, rolloutState string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.CanaryPreset = preset
+	d.CanaryStep = step
+	d.CanaryTotalSteps = total
+	if !stepStartedAt.IsZero() {
+		t := stepStartedAt
+		d.CanaryStepStartedAt = &t
+	}
+	d.RolloutState = rolloutState
 	m.deployments[id] = d
 	return nil
 }
@@ -12205,6 +12656,16 @@ func (m *MemStore) UpdateAlertRule(_ context.Context, id string, p UpdateAlertRu
 	}
 	if p.CooldownMinutes != nil {
 		r.CooldownMinutes = *p.CooldownMinutes
+	}
+	if p.Action != nil {
+		// The MemStore accepts the string directly — the
+		// closed-set vocabulary is enforced at the schema layer
+		// (migrations/00481_alert_rules_action.sql) on the
+		// PgStore path. Unit tests that need a row with a bad
+		// value (e.g. TestEvaluator_ActionExecutor_UnknownAction)
+		// rely on this leniency to exercise the evaluator's
+		// defensive unknown-action branch.
+		r.Action = AlertAction(*p.Action)
 	}
 	r.UpdatedAt = time.Now()
 	m.alertRules[id] = r

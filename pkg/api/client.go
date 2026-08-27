@@ -1108,6 +1108,25 @@ func (c *Client) PatchDeploymentsIdTraffic(ctx context.Context, id string, perce
 		UpdateDeploymentTrafficRequest{TrafficPercent: percent}, &out)
 }
 
+// RecoverRollout (issue #976 / ADR-122 / SAFE-RELEASES-R) is the
+// operator manual-recovery escape hatch — POST
+// /v1/apps/{slug}/rollouts/recover. The CLI subcommand
+// `gregale rollouts recover <slug> --action advance|promote|abort
+// --reason <text>` is the canonical caller; the SDK method is
+// here for the rare operator who scripts recovery directly.
+//
+// action ∈ {"advance", "promote", "abort"} — the handler does
+// the closed-set check (422 ErrInvalidRecoverAction on bad
+// input). reason is captured into the deployment_audit row's
+// data payload. The returned RolloutTransitionResponse carries
+// the post-transition Deployment + the audit row id so the
+// operator's terminal can echo the chip.
+func (c *Client) RecoverRollout(ctx context.Context, slug, action, reason string) (RolloutTransitionResponse, error) {
+	var out RolloutTransitionResponse
+	body := RecoverRolloutRequest{Action: action, Reason: reason}
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollouts/recover", body, &out)
+}
+
 // Park and Wake toggle the app between cold-parked and live.
 func (c *Client) Park(ctx context.Context, slug string) error {
 	return c.do(ctx, "POST", "/v1/apps/"+slug+"/park", nil, nil)
