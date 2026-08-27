@@ -32,7 +32,7 @@ table inet faas {
 {% endif -%}
 {% if faas_compute_allowed_cidrs is defined and faas_compute_allowed_cidrs -%}
 {% for cidr in faas_compute_allowed_cidrs -%}
-    ip saddr {{ cidr }} tcp dport { 8081, 9091 } accept comment "faas control services from compute"
+    ip saddr {{ cidr }} tcp dport { {{ faas_compute_allowed_ports | join(', ') }} } accept comment "faas control services from compute"
 {% endfor -%}
 {% endif -%}
 {% if faas_control_plane_allowed_cidrs is defined and faas_control_plane_allowed_cidrs -%}

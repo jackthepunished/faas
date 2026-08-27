@@ -1257,7 +1257,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	appDeleteSub := sched.NewAppDeleteSubscriber(engine, log)
 	loop := sched.NewLoop(pool, engine, log).
 		WithAppDeleteSubscriber(appDeleteSub).
-		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{})).
+		WithFlowCounter(sched.NewNodeAwareFlowCounter(engine.NodeTelemetryCache(), flowcount.NewReader(wire.ExecRunner{}))).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
 		// PR #74: §17 retention sweep — DELETEs STOPPED/FAILED rows older
 		// than cfg.RetentionDuration (defaults to api.DefaultInstanceRetention

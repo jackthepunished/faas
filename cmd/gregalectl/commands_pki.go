@@ -391,7 +391,11 @@ func ensureAllLeavesFilteredWithIdentity(rootDir string, caCert *x509.Certificat
 }
 
 func ensureLeafWithIdentity(rootDir string, role pki.Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, nodeCN string, extraSANs pki.AltNames) error {
-	if nodeCN != "" && role.Directory == "vmmd" {
+	// vmmd and gatewayd's apid client both connect to the control plane as
+	// a compute-node identity. Keep the node CN limited to those client
+	// leaves; gatewayd's listener and its other client leaves retain their
+	// daemon-role CNs for handler-layer authorization.
+	if nodeCN != "" && (role.Directory == "vmmd" || (role.Directory == "gatewayd" && role.Filename == "apid-client")) {
 		return pki.EnsureLeafWithCNAndSANs(rootDir, role, nodeCN, caCert, caKey, force, extraSANs)
 	}
 	if len(extraSANs.DNSNames) != 0 || len(extraSANs.IPAddresses) != 0 {

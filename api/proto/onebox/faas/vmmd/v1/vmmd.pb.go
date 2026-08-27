@@ -1706,7 +1706,11 @@ type InstanceStats struct {
 	// statistics/rx_bytes counter is the same kernel counter the
 	// per-plan tc tbf qdisc reads, so the cap and the meter are
 	// consistent. Informational — not billed (ADR-046 §6).
-	NetTxBytes    *wrapperspb.Int64Value `protobuf:"bytes,10,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
+	NetTxBytes *wrapperspb.Int64Value `protobuf:"bytes,10,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
+	// Open TCP connection count observed from the compute host's conntrack
+	// table. Zero is a real idle value; the enclosing Stats response is
+	// additive so older schedd peers can ignore this field.
+	OpenConns     int64 `protobuf:"varint,11,opt,name=open_conns,json=openConns,proto3" json:"open_conns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1809,6 +1813,13 @@ func (x *InstanceStats) GetNetTxBytes() *wrapperspb.Int64Value {
 		return x.NetTxBytes
 	}
 	return nil
+}
+
+func (x *InstanceStats) GetOpenConns() int64 {
+	if x != nil {
+		return x.OpenConns
+	}
+	return 0
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the
@@ -4345,7 +4356,7 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"live_count\x18\x01 \x01(\x05R\tliveCount\x12!\n" +
 	"\fleased_count\x18\x02 \x01(\x05R\vleasedCount\x12M\n" +
 	"\x14total_resident_bytes\x18\x03 \x01(\v2\x1b.google.protobuf.Int64ValueR\x12totalResidentBytes\x12@\n" +
-	"\tinstances\x18\x04 \x03(\v2\".onebox.faas.vmmd.v1.InstanceStatsR\tinstances\"\x9d\x04\n" +
+	"\tinstances\x18\x04 \x03(\v2\".onebox.faas.vmmd.v1.InstanceStatsR\tinstances\"\xbc\x04\n" +
 	"\rInstanceStats\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12\x1b\n" +
 	"\tlease_uid\x18\x02 \x01(\x05R\bleaseUid\x12\x17\n" +
@@ -4359,7 +4370,9 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x0flast_request_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\rlastRequestAt\x12=\n" +
 	"\fnet_tx_bytes\x18\n" +
 	" \x01(\v2\x1b.google.protobuf.Int64ValueR\n" +
-	"netTxBytes\"\r\n" +
+	"netTxBytes\x12\x1d\n" +
+	"\n" +
+	"open_conns\x18\v \x01(\x03R\topenConns\"\r\n" +
 	"\vPingRequest\"j\n" +
 	"\fPingResponse\x12\x1d\n" +
 	"\n" +

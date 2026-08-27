@@ -82,6 +82,7 @@ type NodeTelemetry struct {
 	InflightRequests    int64
 	LastRequestAt       time.Time
 	NetTxBytes          *int64
+	OpenConns           int64
 }
 
 // NodeTelemetryCache holds the most recent batched report from each node.
@@ -143,6 +144,28 @@ func (c *NodeTelemetryCache) Snapshot(now time.Time) []NodeTelemetryWithNode {
 		}
 	}
 	return out
+}
+
+// LookupOpenConns returns the freshest compute-side conntrack count for an
+// instance. A miss means the node report is absent or stale; callers should
+// use their safe fallback rather than treating a stale zero as authoritative.
+func (c *NodeTelemetryCache) LookupOpenConns(instanceID string, now time.Time) (int64, bool) {
+	if c == nil || instanceID == "" {
+		return 0, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, entry := range c.nodes {
+		if now.Sub(entry.lastSeen) > TelemetryFreshness {
+			continue
+		}
+		for _, row := range entry.rows {
+			if row.InstanceID == instanceID {
+				return row.OpenConns, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // NodeTelemetryWithNode is the flattened cache view used by the stats

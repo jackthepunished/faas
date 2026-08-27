@@ -6,11 +6,10 @@ Environment=FAAS_GATEWAYD_CONFIG={{ gatewayd_config_path }}
 # The warm-hint/log stream client uses this target. Compute-only hosts get
 # the generated control-plane TCP URL; single-box hosts retain the Unix path.
 Environment=FAAS_SCHEDD_SOCKET={{ faas_gatewayd_schedd_target | default(faas_vmmd_schedd_target | default('/run/faas/schedd.sock')) }}
-{% if (faas_box_role | default('single-box')) == 'compute-only' %}
-# ADR-096's AppErrors listener is currently local Unix-socket only. A
-# compute-only gateway must not repeatedly dial its own empty /run socket;
-# keep the recorder explicitly disabled until the remote mTLS endpoint lands.
-Environment=FAAS_APP_ERRORS_ENABLED=false
+{% if gatewayd_app_errors_target | default('') | length > 0 %}
+# Compute-only gatewayd reports grouped application errors to the control
+# plane over the private mTLS target rendered in gatewayd.toml.
+Environment=FAAS_APID_APP_ERRORS_TARGET={{ gatewayd_app_errors_target }}
 {% endif %}
 {% if gatewayd_egress_listen | default('') | length > 0 %}
 # Split-box meterd consumes the egress stream over the private mTLS

@@ -1717,18 +1717,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// flips the kill-switch to default-on. Set
 	// FAAS_APP_ERRORS_ENABLED=false to cleanly disable both
 	// the writer (apid gRPC) and the gateway-side recorder.
+	var appErrSrv *grpc.Server
+	var appErrLis net.Listener
+	appErrRotator := wire.NewTLSRotator(nil)
 	if deps.getenv("FAAS_APP_ERRORS_ENABLED") != "false" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
-		appErrSrv, appErrLis, err := runAppErrorsServer(ctx, srv.store, srv.ops, log)
+		appErrTarget := cfg.GetAppErrorsTarget(deps.getenv)
+		appErrTLS, tlsErr := cfg.LoadAppErrorsTLSWithPrefixAndVerifierAndReload(nodeVerifier, appErrRotator.Reload(nil))
+		if tlsErr != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: app errors TLS: %w", tlsErr)
+		}
+		appErrRotator.Set(appErrTLS)
+		appErrSrv, appErrLis, err = runAppErrorsServer(ctx, appErrTarget, appErrTLS, srv.store, srv.ops, log)
 		if err != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: app errors server: %w", err)
 		}
 		go func() {
-			log.Info("apid app errors server listening")
+			log.Info("apid app errors server listening", "target", appErrTarget)
 			if err := appErrSrv.Serve(appErrLis); err != nil {
 				log.Error("apid app errors serve", "err", err)
 			}
 		}()
+		if appErrTLS != nil {
+			appErrHupCh := make(chan os.Signal, 1)
+			signal.Notify(appErrHupCh, syscall.SIGHUP)
+			defer signal.Stop(appErrHupCh)
+			appErrReload := func() (*tls.Config, error) {
+				return cfg.LoadAppErrorsTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, appErrHupCh, appErrRotator, appErrReload)
+		}
 		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
 
 		// ADR-095 PR-C: preview teardown janitor. Lives in apid
@@ -1807,6 +1826,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// with a gRPC error mid-enqueue, which the dispatcher
 			// handles with log + skip — but graceful is cheaper.
 			bridgeSrv.GracefulStop()
+		}
+		if appErrSrv != nil {
+			appErrSrv.GracefulStop()
 		}
 		// Issue #286: drain the async failed-login audit channel
 		// so in-flight rows land in the events table before the
@@ -2211,24 +2233,32 @@ func isUnixSocketPath(target string) bool {
 
 // runAppErrorsServer brings up the AppErrors gRPC server
 // (ADR-096 §3.5: gatewayd-internal → apid IncrementAppError
-// streaming RPC). Listens on a unix socket under /run/faas so
-// the gateway-side dial is loopback-only and TLS-free (single-box
-// mode). The socket path is hard-coded to /run/faas/app_errors.sock
-// — gatewayd-internal dials it via FAAS_APID_APP_ERRORS_SOCK env
-// (defaulting to the same path). PR-A wires this server behind
-// FAAS_APP_ERRORS_ENABLED so the surface exists but is dormant
-// until PR-B flips the flag.
+// streaming RPC). Unix targets retain the local DAC-authenticated
+// single-box path; tcp:// targets use the same mTLS-only listener
+// contract as the other split-box gRPC surfaces.
 //
 // Returns the server (caller calls Serve) and the listener. Errors
 // here are non-fatal: the caller logs and continues without the
 // app_errors gRPC server (the apid HTTP listener still serves).
-func runAppErrorsServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
-	const sock = "/run/faas/app_errors.sock"
-	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	if !isUnixSocketPath(target) && tlsCfg == nil {
+		return nil, nil, fmt.Errorf("app errors: target %q is non-unix but app_errors_tls_* is empty (mTLS is required)", target)
+	}
+	var lis net.Listener
+	var err error
+	if isUnixSocketPath(target) {
+		path := strings.TrimPrefix(target, "unix://")
+		lis, err = wire.ListenOrRecreateByName(path, "faas-apid")
+	} else {
+		lis, err = wire.Listen(ctx, target, tlsCfg)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("app errors listen: %w", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(append(
+		wire.ServerCredsOrEmpty(tlsCfg),
+		wire.TraceServerOptions()...,
+	)...)
 	registerAppErrorsReceiver(srv, store, ops, true)
 	return srv, lis, nil
 }

@@ -45,6 +45,12 @@ func TestNodeTelemetryCacheReplacesAsOneBatchAndExpires(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatalf("expired snapshot length = %d, want 0", len(rows))
 	}
+	if got, ok := cache.LookupOpenConns("vm-1", base.Add(time.Second)); !ok || got != 0 {
+		t.Fatalf("fresh open-conns lookup = (%d, %v), want (0, true)", got, ok)
+	}
+	if _, ok := cache.LookupOpenConns("vm-1", base.Add(TelemetryFreshness+time.Nanosecond)); ok {
+		t.Fatal("stale open-conns lookup unexpectedly hit")
+	}
 }
 
 func TestNodeUsageCacheRequiresCompleteSnapshot(t *testing.T) {

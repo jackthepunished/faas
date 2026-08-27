@@ -98,6 +98,24 @@
     state: file
   when: gatewayd_vmmd_tls_cert_path | default('') | length > 0
 
+- name: gatewayd_internal_service — grant faas access to AppErrors client key
+  ansible.builtin.file:
+    path: "{{ gatewayd_app_errors_tls_key_path }}"
+    owner: root
+    group: faas
+    mode: "0440"
+    state: file
+  when: gatewayd_app_errors_target | default('') | length > 0
+
+- name: gatewayd_internal_service — grant faas access to AppErrors client certificate
+  ansible.builtin.file:
+    path: "{{ gatewayd_app_errors_tls_cert_path }}"
+    owner: root
+    group: faas
+    mode: "0444"
+    state: file
+  when: gatewayd_app_errors_target | default('') | length > 0
+
 - name: gatewayd_internal_service — systemctl daemon-reload (idempotent, after new unit file)
   ansible.builtin.systemd:
     daemon_reload: true

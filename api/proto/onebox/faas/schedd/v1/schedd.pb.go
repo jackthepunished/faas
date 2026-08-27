@@ -2085,8 +2085,12 @@ type InstanceTelemetry struct {
 	InflightRequests    int64                   `protobuf:"varint,6,opt,name=inflight_requests,json=inflightRequests,proto3" json:"inflight_requests,omitempty"`
 	LastRequestAt       *timestamppb.Timestamp  `protobuf:"bytes,7,opt,name=last_request_at,json=lastRequestAt,proto3" json:"last_request_at,omitempty"`
 	NetTxBytes          *wrapperspb.Int64Value  `protobuf:"bytes,8,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Open TCP connection count observed by vmmd on the compute host. The
+	// value is transported with the existing persistent capacity stream so
+	// schedd does not need a per-node conntrack query.
+	OpenConns     int64 `protobuf:"varint,9,opt,name=open_conns,json=openConns,proto3" json:"open_conns,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InstanceTelemetry) Reset() {
@@ -2173,6 +2177,13 @@ func (x *InstanceTelemetry) GetNetTxBytes() *wrapperspb.Int64Value {
 		return x.NetTxBytes
 	}
 	return nil
+}
+
+func (x *InstanceTelemetry) GetOpenConns() int64 {
+	if x != nil {
+		return x.OpenConns
+	}
+	return 0
 }
 
 // ReportCapacityAck is the typed "I consumed all your messages"
@@ -2529,7 +2540,7 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x0enode_signature\x18\b \x01(\fR\rnodeSignature\x12\x1e\n" +
 	"\vnode_key_id\x18\t \x01(\tR\tnodeKeyId\x12F\n" +
 	"\tinstances\x18\n" +
-	" \x03(\v2(.onebox.faas.schedd.v1.InstanceTelemetryR\tinstances\"\xf0\x03\n" +
+	" \x03(\v2(.onebox.faas.schedd.v1.InstanceTelemetryR\tinstances\"\x8f\x04\n" +
 	"\x11InstanceTelemetry\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12B\n" +
@@ -2541,7 +2552,9 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x11inflight_requests\x18\x06 \x01(\x03R\x10inflightRequests\x12B\n" +
 	"\x0flast_request_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\rlastRequestAt\x12=\n" +
 	"\fnet_tx_bytes\x18\b \x01(\v2\x1b.google.protobuf.Int64ValueR\n" +
-	"netTxBytes\"\x13\n" +
+	"netTxBytes\x12\x1d\n" +
+	"\n" +
+	"open_conns\x18\t \x01(\x03R\topenConns\"\x13\n" +
 	"\x11ReportCapacityAck\"D\n" +
 	"\x11EnsureWakeRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x18\n" +

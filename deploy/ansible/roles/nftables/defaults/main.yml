@@ -36,6 +36,13 @@ faas_postgres_allowed_cidrs: []
 # TCP/9091; keep this separate from PostgreSQL so the firewall contract is
 # explicit even though both lists are currently derived from the same fleet.
 faas_compute_allowed_cidrs: []
+# Control-plane TCP services reached by compute nodes. The AppErrors
+# listener is the additive 9093 endpoint; older inventories can override
+# this list explicitly while single-box hosts leave the CIDR list empty.
+faas_compute_allowed_ports:
+  - 8081
+  - 9091
+  - 9093
 # Control-plane ingress to compute services. The manifest generator sets
 # these only on compute-only hosts; an empty list keeps the one-box policy.
 faas_control_plane_allowed_cidrs: []

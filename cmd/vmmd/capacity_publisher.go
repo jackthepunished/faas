@@ -404,6 +404,7 @@ func buildCapacityReport(
 				InflightRequests:    in.GetInflightRequests(),
 				LastRequestAt:       in.GetLastRequestAt(),
 				NetTxBytes:          in.GetNetTxBytes(),
+				OpenConns:           in.GetOpenConns(),
 			}
 			report.Instances = append(report.Instances, row)
 		}

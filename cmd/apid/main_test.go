@@ -141,6 +141,23 @@ func TestSeedDevAccount_InvalidToken(t *testing.T) {
 	}
 }
 
+func TestRunAppErrorsServer_RejectsPlaintextRemoteTarget(t *testing.T) {
+	_, _, err := runAppErrorsServer(
+		context.Background(),
+		"tcp://127.0.0.1:9093",
+		nil,
+		nil,
+		nil,
+		discardLogger(),
+	)
+	if err == nil {
+		t.Fatal("remote AppErrors target without TLS should be rejected")
+	}
+	if !contains(err.Error(), "mTLS is required") {
+		t.Fatalf("error = %q, want mTLS requirement", err)
+	}
+}
+
 // --- runWithDeps -----------------------------------------------------------
 
 // withBillingKeysForTest seeds the FAAS_PADDLE_* keys that
