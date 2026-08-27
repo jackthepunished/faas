@@ -829,6 +829,25 @@ const (
 	// tripwire surfaces a 409 (not a silent DB drift).
 	CodeTrafficPercentSumInvalid = "traffic_percent_sum_invalid"
 
+	// Traffic mirroring (issue #72 / ADR-125 PR-A2). Seven RFC 7807
+	// codes for the /v1/apps/{slug}/mirrors CRUD surface. The
+	// plan-gate (403) and per-app quota (422) are the load-bearing
+	// 4xx shapes; the shape errors (invalid percent, source==mirror,
+	// cross-app mismatch, deployment not live) are first-line
+	// defences before the SQL CHECKs in migration 00384. The 404
+	// is reserved for post-IDOR "rule deleted between requests"
+	// cases — a cross-account lookup never emits it (s.notFound
+	// returns the generic "not_found" instead, so cross-account
+	// probing cannot distinguish "exists" from "doesn't").
+	CodePlanMirrorNotAllowed    = "plan_mirror_not_allowed"
+	CodeMirrorRuleQuotaExceeded = "mirror_rule_quota_exceeded"
+	CodeInvalidMirrorPercent    = "invalid_mirror_percent"
+	CodeMirrorSourceTargetSame  = "mirror_source_target_same"
+	CodeMirrorDeploymentNotLive = "mirror_deployment_not_live"
+	CodeMirrorCrossAppMismatch  = "mirror_cross_app_mismatch"
+	CodeMirrorRuleNotFound      = "mirror_rule_not_found"
+	CodeInvalidMirrorWindow     = "invalid_mirror_window"
+
 	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
 	// codes are the load-bearing 400-class shapes; the stateful
@@ -1437,6 +1456,43 @@ func StatusForCode(code string) int {
 		// shape-second 422 contract; the plan-gate cousin
 		// (CodePlanTrafficSplitNotAllowed) is the 403 above.
 		return http.StatusUnprocessableEntity
+	case CodePlanMirrorNotAllowed:
+		// 403 — issue #72 / ADR-125 PR-A2. Free/Hobby plan tier
+		// gate for the mirror surface. Mirrors CodePlanTrafficSplitNotAllowed
+		// (403, plan-gate cousin). The 422 sibling family below
+		// (quota / percent / cross-app / source-target-same /
+		// invalid-window) handles shape errors; this is the only
+		// 403 in the mirror family.
+		return http.StatusForbidden
+	case CodeMirrorRuleQuotaExceeded,
+		CodeInvalidMirrorPercent,
+		CodeMirrorSourceTargetSame,
+		CodeMirrorCrossAppMismatch,
+		CodeInvalidMirrorWindow:
+		// 422 — issue #72 / ADR-125 PR-A2 mirror shape family.
+		// Per-app quota exceeded, percent outside [0, 100],
+		// source==mirror, cross-app deployment pair, and
+		// malformed `?window=` all land here. The 409 sibling
+		// (CodeMirrorDeploymentNotLive) handles "rule is legal
+		// but referenced deployment state has moved".
+		return http.StatusUnprocessableEntity
+	case CodeMirrorDeploymentNotLive:
+		// 409 — issue #72 / ADR-125 PR-A2. Mirrors
+		// CodeTrafficPercentSumInvalid (409 family): the rule
+		// body is internally consistent but the deployment
+		// state has moved between the customer's GET and POST.
+		// Sits next to CodeTrafficPercentSumInvalid because the
+		// retry path is identical (GET fresh deployment ids,
+		// retry).
+		return http.StatusConflict
+	case CodeMirrorRuleNotFound:
+		// 404 — issue #72 / ADR-125 PR-A2. Reserved for the
+		// post-IDOR "rule was deleted between requests" case.
+		// Cross-account lookups return s.notFound with the
+		// generic "not_found" code (not this), so probing
+		// cannot distinguish "exists in another account" from
+		// "doesn't exist anywhere".
+		return http.StatusNotFound
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
 	case CodeStatelessOnlyViolation:
@@ -3309,6 +3365,118 @@ func ErrTrafficPercentSumInvalid(observed int) *Problem {
 		"traffic_percent sum invariant violated",
 		fmt.Sprintf("sum of traffic_percent across live deployments must be 100; observed %d.", observed)).
 		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
+}
+
+// ErrPlanMirrorNotAllowed (issue #72 / ADR-125 traffic mirroring
+// PR-A2) is returned when a Free/Hobby account tries to create a
+// mirror rule (issue #72 / ADR-125). The customer's bill on
+// Free/Hobby is built around scale-to-zero; a mirror rule wakes
+// a separate VM for every customer request (billed per running
+// second), which is the cost shape of Pro / Scale. Hobby is
+// deliberately NOT promoted to the gate's "allowed" set — see
+// the Limits.MirrorRuleAllowed comment in pkg/api/limits.go for
+// the cost-shaping rationale (mirror's bill is N×ram_mb×seconds
+// per request, distinct from traffic split's canary floor).
+func ErrPlanMirrorNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanMirrorNotAllowed,
+		"Plan doesn't allow traffic mirroring",
+		fmt.Sprintf("the %s plan wakes a mirror VM on every request (billed per running second); upgrade to Pro or Scale to mirror traffic in the background.", p)).
+		WithDocs("https://docs.gregale.dev/plans#traffic-mirror")
+}
+
+// ErrMirrorRuleQuotaExceeded (issue #72 / ADR-125 PR-A2) is
+// returned when the customer already holds the plan's per-app
+// cap (Pro 1, Scale 3). 422 (not 403) because the request shape
+// is legal and the plan permits the feature — only the per-app
+// count is at the cap. WithLimit carries the cap and the
+// observed count so the CLI renders actionable retry guidance
+// (raise your plan, or delete an existing rule first).
+func ErrMirrorRuleQuotaExceeded(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeMirrorRuleQuotaExceeded,
+		"mirror rule quota exceeded",
+		fmt.Sprintf("this app already has %d mirror rule(s); the plan cap is %d.", observed, l.MirrorTargetsPerApp)).
+		WithLimit(int64(l.MirrorTargetsPerApp), int64(observed)).
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrInvalidMirrorPercent (issue #72 / ADR-125 PR-A2) is
+// returned when the requested mirror percent is outside [0, 100]
+// (the SQL CHECK in migration 00384 is the second-line defence;
+// this surfaces before that check). 422 mirrors
+// ErrInvalidTrafficPercent above — range-before-plan, so a
+// malformed value is loud regardless of plan.
+func ErrInvalidMirrorPercent(got int) *Problem {
+	const cap = 100
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidMirrorPercent,
+		"Invalid mirror percent",
+		fmt.Sprintf("mirror percent must be in [0, %d]; got %d.", cap, got)).
+		WithLimit(int64(cap), int64(got)).
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrMirrorSourceTargetSame (issue #72 / ADR-125 PR-A2) is
+// returned when the customer POSTs a rule whose source and
+// mirror deployments resolve to the same row. 422 because the
+// request shape is legal — only the rule body is self-referential,
+// which is meaningless (the mirror VM would call itself).
+func ErrMirrorSourceTargetSame() *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeMirrorSourceTargetSame,
+		"source and mirror deployments must differ",
+		"source_deployment_id and mirror_deployment_id cannot reference the same deployment.").
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrMirrorDeploymentNotLive (issue #72 / ADR-125 PR-A2) is
+// returned when one or both referenced deployments has been
+// superseded or deleted between the customer's GET and POST.
+// 409 Conflict because the request shape is legal and the
+// referenced IDs are valid — only the state has moved (a
+// deployment was rolled back / superseded mid-request). The
+// customer's retry path is to GET the deployments and pick a
+// fresh live target.
+func ErrMirrorDeploymentNotLive() *Problem {
+	return NewProblem(http.StatusConflict, CodeMirrorDeploymentNotLive,
+		"referenced deployment is not live",
+		"one or both of source_deployment_id / mirror_deployment_id points at a deployment that is not 'live'; mirror targets must both be live.").
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrMirrorCrossAppMismatch (issue #72 / ADR-125 PR-A2) is
+// returned when source and mirror deployments belong to
+// different apps. 422 because the request shape is legal — the
+// IDs are real — only the cross-app pair is meaningless (a
+// mirror VM cannot serve a source VM from a different app; the
+// per-app quotas would be split across two owners).
+func ErrMirrorCrossAppMismatch() *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeMirrorCrossAppMismatch,
+		"source and mirror deployments must belong to the same app",
+		"source_deployment_id and mirror_deployment_id must reference deployments of the same app (slug in the URL path).").
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrMirrorRuleNotFound (issue #72 / ADR-125 PR-A2) is the
+// 404 sentinel for the customer-facing mirror surface. Used by
+// handlers only AFTER the IDOR guard passes — a cross-account
+// lookup returns s.notFound (a generic Problem with code
+// "not_found"), never this. Emitted when the rule was deleted
+// between the customer's GET and PATCH/DELETE.
+func ErrMirrorRuleNotFound(id string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeMirrorRuleNotFound,
+		"mirror rule not found",
+		fmt.Sprintf("no mirror rule with id %q on this app.", id)).
+		WithDocs("https://docs.gregale.dev/apps#mirror-rules")
+}
+
+// ErrInvalidMirrorWindow (issue #72 / ADR-125 PR-A2) is the
+// 422 sentinel for malformed `?window=…` query arguments on the
+// summary endpoint. Three discrete values are accepted (1h,
+// 24h, 7d); anything else surfaces this 422 so the CLI renders
+// the accepted set without consulting the docs.
+func ErrInvalidMirrorWindow(got string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidMirrorWindow,
+		"Invalid mirror window",
+		fmt.Sprintf("window must be one of: 1h, 24h, 7d; got %q.", got)).
+		WithDocs("https://docs.gregale.dev/apps#mirror-summary")
 }
 
 // ErrSidecarCapExceeded is returned when the request carries more

@@ -65,6 +65,7 @@ Commands:
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
+  mirror       Manage traffic mirroring (issue #72 / ADR-124; Pro/Scale only)
   throttle-suggestions  Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N])
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
@@ -286,6 +287,8 @@ func run(args []string) int {
 		return cmdWake(args[1:])
 	case "traffic":
 		return cmdTraffic(args[1:])
+	case "mirror":
+		return cmdMirror(args[1:])
 	case "domains":
 		return cmdDomains(args[1:])
 	case "tenant-surfaces":
