@@ -1021,11 +1021,10 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 	// pass it through without recompiling — the store contract is
 	// "match the policy, return the account".
 	//
-	// The simplest "match" rule that matches the customer's
-	// expectation: any account that has a trust policy for this
-	// issuer_url. Order = iteration order of the map (Go map
-	// iteration is randomized; callers don't depend on a specific
-	// account being picked).
+	// Prefer a matching subject pattern over a permissive policy, then
+	// use stable tie-breakers. This mirrors the PostgreSQL query and
+	// prevents a wildcard policy from shadowing a more specific policy
+	// when multiple accounts trust the same issuer.
 	//
 	// For the PR-A scope this is correct: the trust policy is
 	// auto-created on first exchange, AFTER AccountByOIDCSubject
@@ -1038,6 +1037,7 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 	// reverse index once the dashboard exposes "which subjects
 	// does this account trust" — needs a column on the trust
 	// policy for binding subjects explicitly.
+	matches := make([]OIDCTrustPolicy, 0, len(m.oidcTrustPolicies))
 	for _, policy := range m.oidcTrustPolicies {
 		if policy.IssuerURL != issuerURL {
 			continue
@@ -1051,13 +1051,27 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 		if !matched {
 			continue
 		}
-		acct, ok := m.accounts[policy.AccountID]
+		_, ok := m.accounts[policy.AccountID]
 		if !ok {
 			continue
 		}
-		return acct, nil
+		matches = append(matches, policy)
 	}
-	return Account{}, ErrNotFound
+	if len(matches) == 0 {
+		return Account{}, ErrNotFound
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		iSpecific := matches[i].SubjectPattern != ""
+		jSpecific := matches[j].SubjectPattern != ""
+		if iSpecific != jSpecific {
+			return iSpecific
+		}
+		if len(matches[i].SubjectPattern) != len(matches[j].SubjectPattern) {
+			return len(matches[i].SubjectPattern) > len(matches[j].SubjectPattern)
+		}
+		return matches[i].AccountID < matches[j].AccountID
+	})
+	return m.accounts[matches[0].AccountID], nil
 }
 
 // regexpMatch is a tiny inlined wrapper to keep the import surface
