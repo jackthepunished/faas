@@ -29,9 +29,8 @@ import (
 //
 // The init tests assert file-side effects only, so we forcibly
 // clear FAAS_PG_DSN for the duration of the call (t.Setenv rolls
-// back automatically on test exit). This matches the original
-// `--no-db` semantics without carrying a CLI flag that's only
-// meaningful in tests.
+// back automatically on test exit). This keeps the tests local while
+// the deployment retry path exercises the explicit `--no-db` flag.
 func runSecretsInit(t *testing.T, dir string, args []string) (string, error) {
 	t.Helper()
 	t.Setenv("FAAS_PG_DSN", "")
@@ -172,6 +171,16 @@ func TestSecretsInit_WriteAllFive(t *testing.T) {
 		if len(body) == 0 {
 			t.Errorf("%s is empty", p)
 		}
+	}
+}
+
+func TestSecretsInit_NoDBFlag(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("test requires root")
+	}
+	dir := t.TempDir()
+	if out, err := runSecretsInit(t, dir, []string{"--no-db"}); err != nil {
+		t.Fatalf("secrets init --no-db: %v (out=%s)", err, out)
 	}
 }
 
