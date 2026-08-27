@@ -178,6 +178,11 @@ func cmdDeployJoinNode(args []string) int {
 		opts.RepoRoot = defaultRepoRoot()
 	}
 	resolveJoinArtifacts(&opts)
+	if !opts.DryRun && opts.Yes {
+		if code, handled := maybeBootstrapReleaseCLIFromTarball(opts.ReleaseTarball, opts.ReleaseGitSHA); handled {
+			return code
+		}
+	}
 
 	report, err := deployJoinValidate(opts)
 	if err != nil {
