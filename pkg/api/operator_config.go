@@ -61,3 +61,13 @@ type OperatorRuntimeConfigRevision struct {
 	Reason    string          `json:"reason"`
 	CreatedAt string          `json:"created_at"`
 }
+
+// RollbackOperatorRuntimeConfigRequest is the body for
+// POST /v1/admin/config/{key}/rollback. ExpectedVersion is optional;
+// when present, the server rejects the request if the live revision has
+// changed since the operator loaded the history.
+type RollbackOperatorRuntimeConfigRequest struct {
+	Version         int64  `json:"version"`
+	Reason          string `json:"reason"`
+	ExpectedVersion *int64 `json:"expected_version,omitempty"`
+}

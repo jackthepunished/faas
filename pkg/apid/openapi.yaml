@@ -342,6 +342,39 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/admin/config/{key}/rollback:
+    post:
+      tags: [operator]
+      operationId: rollbackOperatorRuntimeConfig
+      summary: Roll back a hot runtime setting to a previous revision
+      description: |
+        Applies the selected historical value as a new revision through the
+        same zero-downtime hot-apply path as PATCH. Only mutable hot settings
+        are eligible. The request is optimistic-concurrency protected and
+        the rollback itself is appended to the audit and revision history.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+          description: Catalog key to roll back.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackOperatorRuntimeConfigRequest' }
+      responses:
+        '200':
+          description: Rolled-back and applied configuration entry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorRuntimeConfig' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /v1/admin/config/{key}/revisions:
     get:
       tags: [operator]
@@ -9585,6 +9618,15 @@ components:
         actor_id: { type: string }
         reason: { type: string }
         created_at: { type: string, format: date-time }
+
+    RollbackOperatorRuntimeConfigRequest:
+      description: "Request to apply a historical runtime configuration revision."
+      type: object
+      required: [version, reason]
+      properties:
+        version: { type: integer, format: int64, minimum: 1 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        expected_version: { type: integer, format: int64, minimum: 0 }
 
     # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────
 

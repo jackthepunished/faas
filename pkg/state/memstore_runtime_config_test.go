@@ -133,6 +133,13 @@ func TestMemStoreRuntimeConfigCRUDAndRevisionHistory(t *testing.T) {
 	if err != nil || len(revisions) != 3 {
 		t.Fatalf("capped runtime config revisions = %#v, %v", revisions, err)
 	}
+	revision, err := store.GetRuntimeConfigRevision(ctx, row.Key, row.Scope, row.ScopeID, 1)
+	if err != nil || revision.Version != 1 || string(revision.NewValue) != `"30s"` {
+		t.Fatalf("first runtime config revision = %#v, %v", revision, err)
+	}
+	if _, err := store.GetRuntimeConfigRevision(ctx, row.Key, row.Scope, row.ScopeID, 99); !errors.Is(err, ErrRuntimeConfigNotFound) {
+		t.Fatalf("missing runtime config revision = %v, want ErrRuntimeConfigNotFound", err)
+	}
 }
 
 func TestMemStoreRuntimeConfigOperationGuardsAndTerminalPaths(t *testing.T) {

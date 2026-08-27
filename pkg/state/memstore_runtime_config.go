@@ -121,6 +121,21 @@ func (m *MemStore) ListRuntimeConfigRevisions(_ context.Context, key string, sco
 	return out, nil
 }
 
+func (m *MemStore) GetRuntimeConfigRevision(_ context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.runtimeConfigRevisions) - 1; i >= 0; i-- {
+		revision := m.runtimeConfigRevisions[i]
+		if revision.Key != key || revision.Scope != scope || revision.ScopeID != scopeID || revision.Version != version {
+			continue
+		}
+		revision.OldValue = append(json.RawMessage(nil), revision.OldValue...)
+		revision.NewValue = append(json.RawMessage(nil), revision.NewValue...)
+		return revision, nil
+	}
+	return RuntimeConfigRevision{}, ErrRuntimeConfigNotFound
+}
+
 func (m *MemStore) MarkRuntimeConfigApplied(_ context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64, effectiveValue json.RawMessage, applyErr string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

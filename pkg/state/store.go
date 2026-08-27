@@ -2741,6 +2741,7 @@ type Store interface {
 	MarkRuntimeConfigOperationFailed(ctx context.Context, id, phase, errMsg string) error
 	MarkRuntimeConfigOperationBlocked(ctx context.Context, id, phase, reason string) error
 	ListRuntimeConfigRevisions(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, limit int) ([]RuntimeConfigRevision, error)
+	GetRuntimeConfigRevision(ctx context.Context, key string, scope RuntimeConfigScope, scopeID string, version int64) (RuntimeConfigRevision, error)
 
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
