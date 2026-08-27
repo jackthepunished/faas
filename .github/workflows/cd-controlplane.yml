@@ -162,19 +162,22 @@ jobs:
           # a tombstone now. The v2 tree is the single source of truth for
           # every unit — the daemonunitspec.Registry (pkg/daemonunitspec) is
           # the audit target.
+          # This workflow targets the control-plane role. Compute-only
+          # units (vmmd, gatewayd-internal, builderd, imaged) are deployed
+          # by the node-join/Ansible path on compute hosts; shipping them in
+          # this bundle makes deployctl try to enable masked units on the CP
+          # host and reintroduces the split-role failure mode.
           for unit in \
             faas-apid.service \
             faas-cp.slice \
-            faas-gatewayd-internal.service \
             faas-gatewayd-public.service \
             faas-githubd.service \
-            faas-imaged.service \
             faas-meterd.service \
-            faas-schedd.service \
-            faas-vmmd.service; do
-            # Look up the unit in any role files/ tree. The role-ownership
-            # is the v2 partition: gatewayd-internal/public sit in their
-            # own roles (ADR-070); the rest follow pkg/daemonunitspec.
+            faas-schedd.service; do
+            # Look up the unit in the v2 role files/ trees. The role
+            # ownership is the source of truth for the CP subset; deployctl
+            # independently derives its activation/restart set from the
+            # files actually present in this bundle.
             src=""
             for role_dir in \
               deploy/ansible/roles/control_plane_service/files \

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,25 +37,170 @@ type hostRuntime struct {
 	waitReadyOverride func(ctx context.Context, service string) error
 }
 
+const (
+	serviceFilePrefix = "faas-"
+	serviceFileSuffix = ".service"
+)
+
+// servicesInUnitDir returns the daemons actually shipped by a release
+// bundle, in dependency order. daemonunitspec.Registry is the catalog for
+// all roles, not the list for one host: a control-plane bundle must not try
+// to enable compute-only units that happen to be present in that catalog.
+func servicesInUnitDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	services := make(map[string]struct{})
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, serviceFilePrefix) || !strings.HasSuffix(name, serviceFileSuffix) {
+			continue
+		}
+		service := strings.TrimSuffix(strings.TrimPrefix(name, serviceFilePrefix), serviceFileSuffix)
+		if _, err := daemonunitspec.UnitByName(service); err != nil {
+			return nil, fmt.Errorf("unknown release daemon unit %q: %w", name, err)
+		}
+		services[service] = struct{}{}
+	}
+	if len(services) == 0 {
+		return nil, errors.New("release contains no daemon service units")
+	}
+	return orderedServices(services)
+}
+
+// manifestServices extracts the role-specific daemon set from the verified
+// bundle manifest. An empty set is retained as a compatibility fallback for
+// older unit tests and legacy callers that did not record systemd files.
+func manifestServices(manifest releasebundle.Manifest) (map[string]struct{}, bool, error) {
+	services := make(map[string]struct{})
+	for _, file := range manifest.Files {
+		if !strings.HasPrefix(file.Path, "systemd/") {
+			continue
+		}
+		name := strings.TrimPrefix(file.Path, "systemd/")
+		if !strings.HasPrefix(name, serviceFilePrefix) || !strings.HasSuffix(name, serviceFileSuffix) {
+			continue
+		}
+		service := strings.TrimSuffix(strings.TrimPrefix(name, serviceFilePrefix), serviceFileSuffix)
+		if _, err := daemonunitspec.UnitByName(service); err != nil {
+			return nil, false, fmt.Errorf("unknown manifest daemon unit %q: %w", file.Path, err)
+		}
+		services[service] = struct{}{}
+	}
+	return services, len(services) > 0, nil
+}
+
+func orderedServices(services map[string]struct{}) ([]string, error) {
+	order, err := daemonunitspec.RestartOrder()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(services))
+	for _, service := range order {
+		if _, ok := services[service]; ok {
+			out = append(out, service)
+		}
+	}
+	if len(out) == len(services) {
+		return out, nil
+	}
+	missing := make([]string, 0, len(services)-len(out))
+	seen := make(map[string]struct{}, len(out))
+	for _, service := range out {
+		seen[service] = struct{}{}
+	}
+	for service := range services {
+		if _, ok := seen[service]; !ok {
+			missing = append(missing, service)
+		}
+	}
+	sort.Strings(missing)
+	return nil, fmt.Errorf("release daemon units missing from restart order: %s", strings.Join(missing, ", "))
+}
+
+func hasService(services []string, wanted string) bool {
+	for _, service := range services {
+		if service == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func (r hostRuntime) restartServices(manifest releasebundle.Manifest) ([]string, error) {
+	order := r.serviceOrder
+	if len(order) == 0 {
+		var err error
+		order, err = daemonunitspec.RestartOrder()
+		if err != nil {
+			return nil, fmt.Errorf("resolve restart order: %w", err)
+		}
+	}
+	services, present, err := manifestServices(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return order, nil
+	}
+	filtered := make([]string, 0, len(services))
+	for _, service := range order {
+		if _, ok := services[service]; ok {
+			filtered = append(filtered, service)
+		}
+	}
+	if len(filtered) != len(services) {
+		return nil, fmt.Errorf("manifest daemon units are not covered by restart order")
+	}
+	return filtered, nil
+}
+
+func healthAddressForManifest(manifest releasebundle.Manifest) (string, error) {
+	services, present, err := manifestServices(manifest)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := services["gatewayd-public"]; ok {
+		return "http://127.0.0.1:9092/healthz", nil
+	}
+	if _, ok := services["gatewayd-internal"]; ok {
+		return "http://127.0.0.1:9090/healthz", nil
+	}
+	if !present {
+		return "http://127.0.0.1:9090/healthz", nil
+	}
+	return "", errors.New("release has no gateway health endpoint")
+}
+
 func (r hostRuntime) Preflight(_ context.Context, manifest releasebundle.Manifest, releaseRoot string) error {
 	if manifest.Target != "linux/amd64" {
 		return fmt.Errorf("unsupported release target %q", manifest.Target)
 	}
-	if err := ensureBaseStagingRoots(); err != nil {
-		return err
+	services, err := servicesInUnitDir(filepath.Join(releaseRoot, "systemd"))
+	if err != nil {
+		return fmt.Errorf("required daemon units: %w", err)
 	}
 	for _, path := range []string{
 		filepath.Join(releaseRoot, "bin", "migrate"),
 		filepath.Join(releaseRoot, "systemd"),
 		"/etc/systemd/system",
 		"/run/faas",
-		"/srv/fc/base",
-		"/srv/fc/base-staging",
-		"/srv/fc/scans",
 		"/dev/shm",
 	} {
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("required path %s: %w", path, err)
+		}
+	}
+	// The base-image staging trees are compute-only resources owned by
+	// imaged. A control-plane release must not require the imaged user or
+	// the compute disk layout just because the daemon registry contains
+	// those daemons for other node roles.
+	if hasService(services, "imaged") {
+		for _, path := range []string{"/srv/fc/base", "/srv/fc/base-staging", "/srv/fc/scans"} {
+			if _, err := os.Stat(path); err != nil {
+				return fmt.Errorf("required compute path %s: %w", path, err)
+			}
 		}
 	}
 	return nil
@@ -70,13 +216,19 @@ func (r hostRuntime) Migrate(ctx context.Context, manifest releasebundle.Manifes
 }
 
 func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
-	if err := ensureBaseStagingRoots(); err != nil {
-		return err
-	}
-	if err := cleanupAllBaseScratch(); err != nil {
-		return fmt.Errorf("cleanup base scratch: %w", err)
-	}
 	units := filepath.Join(releaseRoot, "systemd")
+	services, err := servicesInUnitDir(units)
+	if err != nil {
+		return fmt.Errorf("read release daemon units: %w", err)
+	}
+	if hasService(services, "imaged") {
+		if err := ensureBaseStagingRoots(); err != nil {
+			return err
+		}
+		if err := cleanupAllBaseScratch(); err != nil {
+			return fmt.Errorf("cleanup base scratch: %w", err)
+		}
+	}
 	if err := filepath.WalkDir(units, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -108,7 +260,7 @@ func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
 	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	for _, service := range daemonunitspec.ActivationOrder() {
+	for _, service := range services {
 		if err := runCommand(ctx, "systemctl", "enable", "faas-"+service+".service"); err != nil {
 			return err
 		}
@@ -245,8 +397,12 @@ func cleanupAllBaseScratch() error {
 	return errors.Join(errs...)
 }
 
-func (r hostRuntime) Restart(ctx context.Context, _ releasebundle.Manifest) error {
-	for _, service := range r.serviceOrder {
+func (r hostRuntime) Restart(ctx context.Context, manifest releasebundle.Manifest) error {
+	serviceOrder, err := r.restartServices(manifest)
+	if err != nil {
+		return err
+	}
+	for _, service := range serviceOrder {
 		if err := runCommand(ctx, "systemctl", "reset-failed", "faas-"+service+".service"); err != nil {
 			return err
 		}
@@ -277,8 +433,12 @@ func (r hostRuntime) ensureRunFaasOwnership(ctx context.Context) error {
 	return runCommand(ctx, "chmod", "0775", "/run/faas")
 }
 
-func (r hostRuntime) Healthy(ctx context.Context, _ releasebundle.Manifest) error {
-	if err := r.waitHTTP(ctx, "http://127.0.0.1:9090/healthz"); err != nil {
+func (r hostRuntime) Healthy(ctx context.Context, manifest releasebundle.Manifest) error {
+	address, err := healthAddressForManifest(manifest)
+	if err != nil {
+		return err
+	}
+	if err := r.waitHTTP(ctx, address); err != nil {
 		return err
 	}
 	return nil

@@ -158,6 +158,80 @@ func TestDefaultHostRuntimeUsesRestartOrder(t *testing.T) {
 	}
 }
 
+func TestServicesInUnitDirScopesToBundledRole(t *testing.T) {
+	dir := t.TempDir()
+	for _, service := range []string{
+		"apid", "schedd", "gatewayd-public", "meterd", "githubd",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "faas-"+service+".service"), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "faas-cp.slice"), []byte("[Slice]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := servicesInUnitDir(dir)
+	if err != nil {
+		t.Fatalf("servicesInUnitDir: %v", err)
+	}
+	want := []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("servicesInUnitDir = %v, want %v", got, want)
+	}
+}
+
+func TestServicesInUnitDirRejectsUnknownDaemon(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "faas-not-a-daemon.service"), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := servicesInUnitDir(dir); err == nil {
+		t.Fatal("servicesInUnitDir accepted an unknown daemon unit")
+	}
+}
+
+func TestRestartServicesFiltersRegistryByManifest(t *testing.T) {
+	order, err := daemonunitspec.RestartOrder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := releasebundle.Manifest{}
+	for _, service := range []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"} {
+		manifest.Files = append(manifest.Files, releasebundle.File{Path: "systemd/faas-" + service + ".service"})
+	}
+	r := hostRuntime{serviceOrder: order}
+	got, err := r.restartServices(manifest)
+	if err != nil {
+		t.Fatalf("restartServices: %v", err)
+	}
+	want := []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restartServices = %v, want %v", got, want)
+	}
+}
+
+func TestHealthAddressFollowsBundledRole(t *testing.T) {
+	manifest := releasebundle.Manifest{}
+	manifest.Files = []releasebundle.File{{Path: "systemd/faas-gatewayd-public.service"}}
+	got, err := healthAddressForManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:9092/healthz" {
+		t.Fatalf("control-plane health address = %q, want public control listener", got)
+	}
+
+	manifest.Files = []releasebundle.File{{Path: "systemd/faas-gatewayd-internal.service"}}
+	got, err = healthAddressForManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:9090/healthz" {
+		t.Fatalf("compute health address = %q, want internal control listener", got)
+	}
+}
+
 // TestHostRestartIteratesServiceOrderInOrder asserts that Restart()
 // walks serviceOrder forward without re-sorting. This guards against
 // a future refactor that adds a hidden toposort inside Restart —
