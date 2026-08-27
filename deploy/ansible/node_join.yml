@@ -433,15 +433,24 @@
           - --node
           - "{{ faas_join_database_node }}"
           - --fail-on
-          - warn
+          - >-
+            {{ 'warn' if
+               ((faas_join_rclone_envelope_source | default('') | trim) != '' or
+                (faas_join_archive_envelope_source | default('') | trim) != '')
+               else 'error' }}
           - --json
       register: faas_join_doctor
       changed_when: false
       failed_when: faas_join_doctor.rc != 0
       # This is the acceptance gate for the adopted host. It deliberately
       # runs after identity/release rendering and before any service can
-      # become schedulable, so a missing filesystem, secret, certificate,
-      # or release membership cannot hide behind systemd=active.
+      # become schedulable, so a missing filesystem, mandatory secret,
+      # certificate, or release membership cannot hide behind systemd=active.
+      # Backup envelopes are optional join inputs: when the operator has not
+      # supplied them yet, the doctor still reports the placeholder warnings,
+      # but they do not block compute-node activation. Supplying either
+      # envelope opts into the strict warning gate (the CLI validation also
+      # requires the pair and their box-age key).
 
     - name: Reload systemd after release/config publication
       ansible.builtin.systemd:
