@@ -8391,6 +8391,21 @@ func (m *MemStore) ComputeNodeUsedMB(_ context.Context, nodeID string) (int64, e
 	return used, nil
 }
 
+// ComputeNodeUsedMBByNode is the in-memory equivalent of PgStore's single
+// aggregate fallback. It keeps tests and local fixtures on the same bulk API
+// as production without changing the Store interface.
+func (m *MemStore) ComputeNodeUsedMBByNode(ctx context.Context, nodeIDs []string) (map[string]int64, error) {
+	used := make(map[string]int64, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		value, err := m.ComputeNodeUsedMB(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		used[nodeID] = value
+	}
+	return used, nil
+}
+
 func (m *MemStore) HeartbeatComputeNode(_ context.Context, nodeID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

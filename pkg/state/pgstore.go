@@ -10711,6 +10711,47 @@ func (s *PgStore) ComputeNodeUsedMB(ctx context.Context, nodeID string) (int64, 
 	return used, nil
 }
 
+// ComputeNodeUsedMBByNode returns live resident usage for all requested
+// nodes in one aggregate query. This is the placement fallback for a fleet
+// whose vmmd capacity streams have not produced a fresh sample yet.
+func (s *PgStore) ComputeNodeUsedMBByNode(ctx context.Context, nodeIDs []string) (map[string]int64, error) {
+	used := make(map[string]int64, len(nodeIDs))
+	if len(nodeIDs) == 0 {
+		return used, nil
+	}
+	parsedIDs := make([]uuid.UUID, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		parsed, err := uuid.Parse(nodeID)
+		if err != nil {
+			return nil, fmt.Errorf("state: compute node %q is not a UUID: %w", nodeID, err)
+		}
+		parsedIDs = append(parsedIDs, parsed)
+	}
+	rows, err := s.pool.Query(ctx, `
+		select node_id::text, coalesce(sum(ram_mb + $2), 0)::bigint
+		  from instances
+		 where node_id = any($1::uuid[])
+		   and state in ('waking','cold_booting','running')
+		 group by node_id
+	`, parsedIDs, api.PerVMOverheadMB)
+	if err != nil {
+		return nil, fmt.Errorf("state: compute nodes used_mb: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID string
+		var value int64
+		if err := rows.Scan(&nodeID, &value); err != nil {
+			return nil, fmt.Errorf("state: scan compute nodes used_mb: %w", err)
+		}
+		used[nodeID] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate compute nodes used_mb: %w", err)
+	}
+	return used, nil
+}
+
 func (s *PgStore) HeartbeatComputeNode(ctx context.Context, nodeID string) error {
 	tag, err := s.pool.Exec(ctx,
 		`update compute_nodes set last_heartbeat_at = now() where id = $1`, nodeID)

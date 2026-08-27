@@ -599,8 +599,9 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 	// Instance-stats poller ticker (issue #170 / PR-A). Per-Tick
 	// sweep: enumerate live instances + active compute_nodes,
-	// dial each node fresh, decode Stats, replace the Reader
-	// snapshot, emit the wire rollup. Default cadence
+	// project the persistent node telemetry snapshot, replace the Reader
+	// snapshot, and emit the wire rollup. A legacy fresh-dial fallback remains
+	// available for fixtures that do not wire the stream cache. Default cadence
 	// instancestats.DefaultStatsInterval (200 ms — 5 Hz). The
 	// ticker is constructed BEFORE the first Tick (below) so
 	// the first sample lands at t=0 instead of t=Interval — a
