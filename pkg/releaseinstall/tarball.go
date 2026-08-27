@@ -440,6 +440,14 @@ func trustedArchiveEntries(m Manifest) map[string]string {
 	for name := range m.AssetHashes {
 		entries[name] = name
 	}
+	// A signed pre-canonical artifact may contain guest-init without a
+	// tool_hashes entry. It is a fixed legacy compatibility member, not a
+	// wildcard for unrecognised archive paths.
+	for _, name := range LegacyUnhashedSupportBinaryNames() {
+		if _, ok := m.ToolHashes[name]; !ok {
+			entries[name] = name
+		}
+	}
 	return entries
 }
 
@@ -623,6 +631,11 @@ func (t *Tarball) hashWalk() error {
 	}
 	for name := range t.Manifest.AssetHashes {
 		roster[name] = struct{}{}
+	}
+	for _, name := range LegacyUnhashedSupportBinaryNames() {
+		if _, ok := t.ToolSHA256[name]; !ok {
+			roster[name] = struct{}{}
+		}
 	}
 	roster[ManifestName] = struct{}{}
 	var unknown []string

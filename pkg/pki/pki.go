@@ -21,9 +21,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -31,8 +33,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// FingerprintPrefix is the canonical prefix the project stamps on
+// every cert fingerprint column (compute_nodes.cert_fingerprint,
+// release_bundles.signing_cert_fingerprint, …). The "sha256:" tag
+// matches the wire convention used by cert-manager, cosign, and the
+// HTTP Public Key Pinning draft — operators reading a row can paste
+// the value into openssl directly to verify:
+//
+//	openssl x509 -in /etc/faas/tls/vmmd/server.crt -noout -fingerprint -sha256
+//
+// The LoadCertificateFingerprint output uses this prefix so the two
+// commands agree byte-for-byte (after dropping the "sha256:" prefix
+// from the openssl output).
+const FingerprintPrefix = "sha256:"
 
 // DefaultRootDir is the canonical install path for control-plane PKI
 // material. The default-local and multi-box topologies share the same
@@ -104,8 +121,8 @@ type Role struct {
 	// AltNames (SANs) lists the hostnames/IPs the leaf is valid for.
 	// Local-dev leaves always include 127.0.0.1, ::1, and localhost;
 	// distributed leaves add the per-daemon CommonName ("schedd.faas",
-	// etc.) plus the operator-set per-hostnames via the EnvSAN hook
-	// (future patch; not in this slice).
+	// etc.) plus the host-specific transport SANs supplied by the manifest
+	// renderer.
 	AltNames AltNames
 }
 
@@ -384,6 +401,41 @@ func CARoot(rootDir string) (certPath, keyPath string) {
 // force=true skips the NotAfter check and re-issues unconditionally —
 // used by `gregale pki rotate`.
 func EnsureLeaf(rootDir string, role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool) error {
+	return EnsureLeafWithSANs(rootDir, role, caCert, caKey, force, AltNames{})
+}
+
+// EnsureLeafWithSANs is the host-aware variant of EnsureLeaf. The fixed
+// role SANs remain the authorization identity (for example, vmmd.faas),
+// while extraSANs carries the stable private transport identity of the
+// box that owns the leaf (for example, fsn-3.gregale.dev). This lets a
+// fleet route to a specific compute node without creating duplicate
+// vmmd.faas records in a resolver.
+//
+// A fresh SAN is treated as drift: a still-valid certificate that lacks
+// one of the requested names is re-issued even when force is false.
+func EnsureLeafWithSANs(rootDir string, role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
+	return ensureLeafWithIdentity(rootDir, role, "", caCert, caKey, force, extraSANs)
+}
+
+// EnsureLeafWithCNAndSANs is the host-identity variant of
+// EnsureLeafWithSANs. Compute-node vmmd leaves use the node's registered
+// identity (for example, fsn-3.faas) as their Subject CN so the handshake
+// verifier can bind the certificate to the compute_nodes row. The role's
+// daemon SANs remain present, so the same leaf still works for TLS endpoint
+// verification against vmmd.faas and the host's private transport name.
+//
+// This is intentionally separate from EnsureLeafWithSANs: most daemon leaves
+// must retain their fixed role CN, while only a node-identity leaf should be
+// overridden by topology-aware provisioning.
+func EnsureLeafWithCNAndSANs(rootDir string, role Role, commonName string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
+	commonName = strings.TrimSpace(commonName)
+	if commonName == "" {
+		return errors.New("pki: node leaf common name is empty")
+	}
+	return ensureLeafWithIdentity(rootDir, role, commonName, caCert, caKey, force, extraSANs)
+}
+
+func ensureLeafWithIdentity(rootDir string, role Role, commonName string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, extraSANs AltNames) error {
 	certPath, keyPath := LeafPaths(rootDir, role)
 
 	if !force {
@@ -391,16 +443,55 @@ func EnsureLeaf(rootDir string, role Role, caCert *x509.Certificate, caKey *ecds
 		if err != nil {
 			return err
 		}
-		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold {
+		expectedCN := role.CommonName
+		if commonName != "" {
+			expectedCN = commonName
+		}
+		if existing != nil && time.Until(existing.NotAfter) >= ReissueThreshold && existing.Subject.CommonName == expectedCN && certificateHasSANs(existing, extraSANs) {
 			return ErrLeafNotExpiringSoon
 		}
 	}
 
+	if commonName != "" {
+		role.CommonName = commonName
+	}
+	role.AltNames = mergeAltNames(role.AltNames, extraSANs)
 	certPEM, keyPEM, err := generateLeaf(role, caCert, caKey)
 	if err != nil {
 		return err
 	}
 	return writeLeaf(certPath, keyPEM, certPEM)
+}
+
+func certificateHasSANs(cert *x509.Certificate, required AltNames) bool {
+	if cert == nil {
+		return false
+	}
+	for _, requiredDNS := range required.DNSNames {
+		found := false
+		for _, existingDNS := range cert.DNSNames {
+			if existingDNS == requiredDNS {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	for _, requiredIP := range required.IPAddresses {
+		found := false
+		for _, existingIP := range cert.IPAddresses {
+			if existingIP.Equal(requiredIP) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // EnsureCA ensures the CA cert + key exist at rootDir/ca/. force=true
@@ -679,4 +770,70 @@ func randomSerial() (*big.Int, error) {
 	}
 	// Ensure positive.
 	return n.Abs(n), nil
+}
+
+// LoadCertificateFingerprint reads the PEM-encoded leaf cert at
+// certPath, parses it, and returns the canonical fingerprint string
+// "<FingerprintPrefix><64hex>" where the hex is the SHA-256 of the
+// DER-encoded certificate body.
+//
+// Hashing the DER body (not the public key, not the SPKI, not the
+// signature) is the convention used by:
+//   - openssl `x509 ... -fingerprint -sha256`
+//   - cert-manager's io.cert-manager.certificate-request fingerprint
+//   - cosign's --certificate-identity-regexp path
+//   - the HTTP Public Key Pinning draft (deprecated but still
+//     referenced in deployment guides)
+//
+// Hashing the DER means a re-issued leaf with the same key + same
+// subject but a different serial / validity window produces a
+// DIFFERENT fingerprint — which is the correct behaviour for
+// collision detection (the whole leaf is what wire-level verifiers
+// pin against, not just the key).
+//
+// The function is the canonical one for the column
+// compute_nodes.cert_fingerprint (migration 00271, ADR-052
+// amendment, PR-4 / audit F6): every cert the project stores as a
+// fingerprint derives from this helper. The multi-host safety
+// audit (F6) discovered that vmmd's startup UPSERT silently
+// overwrites a compute_nodes row whose existing fingerprint
+// differs from the local leaf's — meaning a leaked cert on one box
+// could be replaced by an attacker who issued a new leaf under the
+// same CA. The fix is a pre-flight compare (cmd/vmmd/register.go)
+// and the persistent storage of this fingerprint on every
+// register. Failing loud on drift is the load-bearing invariant.
+//
+// Errors:
+//   - file missing → wrapped os.ErrNotExist
+//   - file mode permissive → wrapped ErrInsecurePubKeyPerms
+//   - PEM block missing → "not PEM-encoded" error
+//   - x509 parse failure → wrapped parse error
+//   - x509 serial/sign issues → wrapped parse error
+//
+// Returns the string with no trailing newline. The format is
+// stable; consumers (compute_nodes.cert_fingerprint column, PR-4
+// doctor drift detector, ADR-052 amendment error contract) parse
+// it as "sha256:" + lowercase hex.
+func LoadCertificateFingerprint(certPath string) (string, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", fmt.Errorf("pki: read cert %q: %w", certPath, err)
+	}
+	if err := enforceCertMode(certPath); err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", fmt.Errorf("pki: cert %q is not PEM-encoded", certPath)
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		return "", fmt.Errorf("pki: parse cert %q: %w", certPath, err)
+	}
+	// Hash the DER body (the bytes between the "-----BEGIN
+	// CERTIFICATE-----" and "-----END CERTIFICATE-----" lines,
+	// base64-decoded) — this is what openssl -fingerprint hashes
+	// and what every other tool in the ecosystem hashes. The
+	// block.Bytes returned by pem.Decode is the raw DER.
+	sum := sha256.Sum256(block.Bytes)
+	return FingerprintPrefix + hex.EncodeToString(sum[:]), nil
 }

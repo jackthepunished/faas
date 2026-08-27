@@ -9,9 +9,11 @@
 # builderd/imaged under RoleControlPlane; the var below is the deploy-time
 # source of truth — every daemon's systemd unit reads it via
 # FAAS_<DAEMON>_ROLE.
+# `faas_node_name` below is the canonical compute identity used by the
+# control-plane database and release membership (`fsn-2.faas`).
 
 faas_box_role: compute-only
-faas_node_name: fsn-2
+faas_node_name: fsn-2.faas
 gatewayd_apps_domain: gregale.dev
 
 # Ansible connection vars. See host_vars/faas-fsn-1.yml for the
@@ -25,7 +27,13 @@ ansible_python_interpreter: /usr/bin/python3
 # these through a managed systemd drop-in; no post-boot compute_nodes DB patch
 # is required.
 faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"
-faas_vmmd_target_url: "tcp://vmmd.faas:50051"
+faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"
+
+# The control-plane public gateway discovers this endpoint from the
+# compute_nodes registry. It is deliberately separate from vmmd's gRPC
+# target above; gatewayd-internal serves the HTTP application data plane.
+faas_gateway_listen: "0.0.0.0:8080"
+faas_gateway_target_url: "tcp://fsn-2.gregale.dev:8080"
 
 # Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
 # needs the overlay mesh to reach peer compute boxes (fsn-3+ when

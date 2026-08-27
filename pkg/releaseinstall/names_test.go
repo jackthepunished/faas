@@ -33,8 +33,8 @@ func TestSupportBinaryNames_Stable(t *testing.T) {
 			t.Errorf("SupportBinaryNames[%d] = %q, want %q", i, second[i], first[i])
 		}
 	}
-	// The four canonical support binaries — every release ships these.
-	want := []string{"gregale", "gregalectl", "vmmd-raw-bridge", "vmmd-stream-bridge"}
+	// The six canonical support binaries — every release ships these.
+	want := []string{"gregale", "gregalectl", "init", "schedd-brokerq-apply", "vmmd-raw-bridge", "vmmd-stream-bridge"}
 	for _, name := range want {
 		found := false
 		for _, got := range first {
@@ -46,6 +46,19 @@ func TestSupportBinaryNames_Stable(t *testing.T) {
 		if !found {
 			t.Errorf("SupportBinaryNames missing %q (got %v)", name, first)
 		}
+	}
+}
+
+func TestLegacyUnhashedSupportBinaryNames_IsNarrow(t *testing.T) {
+	got := LegacyUnhashedSupportBinaryNames()
+	if len(got) != 1 || got[0] != "init" {
+		t.Fatalf("legacy compatibility catalog = %v, want [init]", got)
+	}
+	if !IsLegacyUnhashedSupportBinaryName("init") {
+		t.Fatal("init is not recognised as a legacy support binary")
+	}
+	if IsLegacyUnhashedSupportBinaryName("gregalectl") || IsLegacyUnhashedSupportBinaryName("rogue") {
+		t.Fatal("legacy compatibility catalog accepted an unrelated support file")
 	}
 }
 

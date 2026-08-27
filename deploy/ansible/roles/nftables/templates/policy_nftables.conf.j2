@@ -1,5 +1,6 @@
 #!/usr/sbin/nft -f
 # onebox-faas nftables.conf (spec §7, §11)
+# Managed by Gregale Ansible; do not edit on the host.
 # Tenant egress denylist — SMTP, RFC1918, link-local, metadata.
 # Tap proxy NAT — used by gatewayd-internal for outbound guest traffic.
 
@@ -68,7 +69,7 @@ table inet faas {
     ip6 daddr ff00::/8 counter name "drop_v6_ff00___8" drop
 {% if overlay_cidrs is defined and overlay_cidrs -%}
 {% for cidr in overlay_cidrs -%}
-    ip saddr {{ cidr }} accept
+{{ '    ' }}ip saddr {{ cidr }} accept
 {% endfor -%}
 {% endif -%}{{ '    ' }}iifname "br-tenants" oifname "{{ public_iface }}" accept
   }
@@ -82,10 +83,10 @@ table inet faas {
     ip saddr {{ masquerade_cidr }} oifname "{{ public_iface }}" masquerade
 {% if overlay_cidrs is defined and overlay_cidrs -%}
 {% for cidr in overlay_cidrs -%}
-    ip saddr {{ cidr }} oifname "{{ public_iface }}" masquerade
+{{ '    ' }}ip saddr {{ cidr }} oifname "{{ public_iface }}" masquerade
 {% endfor -%}
 {% endif -%}
 {% if masquerade_cidr_v6 is defined and masquerade_cidr_v6 -%}
-    ip6 saddr {{ masquerade_cidr_v6 }} oifname "{{ public_iface }}" masquerade
+{{ '    ' }}ip6 saddr {{ masquerade_cidr_v6 }} oifname "{{ public_iface }}" masquerade
 {% endif -%}{{ '  ' }}}
 }

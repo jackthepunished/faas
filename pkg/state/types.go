@@ -1348,6 +1348,21 @@ type Deployment struct {
 	SecretFindings  []byte     `json:"secret_findings,omitempty"`
 	SecretScannedAt *time.Time `json:"secret_scanned_at,omitempty"`
 
+	// LivenessRestartCount (issue #586 / ADR-129 / cluster C
+	// commit 12) is the persisted lifetime restart counter for
+	// this deployment. pkg/state.pgstore.RecordRestart bumps it
+	// alongside the in-memory LivenessWindow.RecordRestart call
+	// (migrations/00411). On schedd startup the LivenessWindow
+	// seeds from this column so a fresh process inherits the
+	// prior count instead of starting at zero — closing the
+	// "schedd restart resets the restart-loop signal" gap. The
+	// column is monotonic in the application code; the
+	// deployments_liveness_restart_count_nonneg_chk CHECK is a
+	// belt-and-braces SQL-level guard. Dashboard surfaces query
+	// this column for the "Restart count (lifetime)" stat on
+	// /v1/deployments/{id}.
+	LivenessRestartCount int `json:"liveness_restart_count,omitempty"`
+
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping
 	// apps.status to `evicted_cold`; the apid GET /v1/apps/{slug}
@@ -1739,21 +1754,104 @@ type FireNowRequest struct {
 	FinishedAt   *time.Time
 }
 
+// OperatorIntentStatus is the closed vocabulary for
+// operator_intents.status (migrations/00431). Mirrors the audit-event
+// `operator.action.<verb>.outcome` shape — only `succeeded` and
+// `failed` are emitted by schedd's terminal transition; `cancelled`
+// is reserved for a future operator-cancel surface (schema is
+// forward-compatible).
+type OperatorIntentStatus string
+
+const (
+	OperatorIntentPending   OperatorIntentStatus = "pending"
+	OperatorIntentRunning   OperatorIntentStatus = "running"
+	OperatorIntentSucceeded OperatorIntentStatus = "succeeded"
+	OperatorIntentFailed    OperatorIntentStatus = "failed"
+	OperatorIntentCancelled OperatorIntentStatus = "cancelled"
+)
+
+// OperatorIntentKind is the closed vocabulary for
+// operator_intents.kind (migrations/00431). Matches the CHECK
+// constraint byte-for-byte.
+type OperatorIntentKind string
+
+const (
+	OperatorIntentKindForcePark     OperatorIntentKind = "force_park"
+	OperatorIntentKindForceColdBoot OperatorIntentKind = "force_cold_boot"
+	// OperatorIntentKindForceRestart is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive (P2d).
+	// Dispatched by schedd's Engine.ForceRestart; the
+	// operator_intents.kind CHECK constraint widened by
+	// migrations/00446 to include this value. Audit envelope:
+	// operator.action.restart_instance (apid, at intent-write)
+	// + operator.action.restart_instance.outcome (schedd, at
+	// terminal). Mirrors the existing two in shape — apid
+	// inserts a pending row + emits db.NotifyOperatorIntent;
+	// schedd claims via FOR UPDATE SKIP LOCKED LIMIT 1 and
+	// dispatches by kind.
+	OperatorIntentKindForceRestart OperatorIntentKind = "force_restart"
+)
+
+// OperatorIntent is one row of operator_intents (migrations/00431).
+// PR #1099 P2 redesign: apid (the only producer) inserts on
+// POST /v1/admin/instances/{id}/force-park or
+// POST /v1/admin/apps/{slug}/force-cold-boot, emits
+// `db.NotifyOperatorIntent`, returns 202 Accepted. schedd (the only
+// consumer) claims the row via ClaimPendingOperatorIntent
+// (FOR UPDATE SKIP LOCKED LIMIT 1), dispatches by kind
+// (force_park → Engine.Park, force_cold_boot →
+// Engine.ForceColdBootNextWake, force_restart → Engine.ForceRestart),
+// then transitions status to terminal.
+//
+// Invariant: a single row represents a single admin-action attempt.
+// Admin actions are deliberate re-clicks, not retries, so there is
+// no per-request idempotency wrapper — two clicks produce two intents.
+//
+// Target_id is free-text (NOT a uuid column) because it is either an
+// instance_id (force_park) OR a deployment_id (force_cold_boot). The
+// kind column disambiguates.
+type OperatorIntent struct {
+	ID                 string
+	Kind               OperatorIntentKind
+	TargetID           string
+	AccountID          *string // nil for fleet-level actions (e.g. reclaim_build); set for per-account actions
+	ActorID            string
+	Reason             string
+	Metadata           json.RawMessage
+	Status             OperatorIntentStatus
+	RequestedAt        time.Time
+	StartedAt          *time.Time
+	FinishedAt         *time.Time
+	Error              string
+	SnapIDsMarkedStale []string
+}
+
 // AlertMetric is a closed vocabulary for the metric side of an AlertRule
 // condition (issue #396, ADR-045). Names mirror the AppMetricsResponse
 // payload verbatim so the evaluator and the customer-facing metrics
 // endpoint cannot drift. failed_invocations is the only non-Prometheus
 // metric; its source dimension comes through AlertRule.FailureSource.
+//
+// Issue #1233 / ADR-123 — extended with 5 metrics backing the alert
+// preset catalog (api_up / account_spend_eur / deployment_failed /
+// cert_expiry_seconds / queue_depth). The pkg/api.AllowedAlertRuleMetrics
+// slice and the alert_rules_metric_chk DB CHECK mirror these byte-for-byte
+// (migrations/00349_alert_rules_extend_metrics_chk.sql).
 type AlertMetric string
 
 const (
-	AlertMetricErrorRate    AlertMetric = "error_rate_pct"
-	AlertMetricLatencyP50   AlertMetric = "latency_p50_ms"
-	AlertMetricLatencyP95   AlertMetric = "latency_p95_ms"
-	AlertMetricLatencyP99   AlertMetric = "latency_p99_ms"
-	AlertMetricColdStartPct AlertMetric = "cold_start_pct"
-	AlertMetricRequestCount AlertMetric = "request_count"
-	AlertMetricFailedInvocs AlertMetric = "failed_invocations"
+	AlertMetricErrorRate         AlertMetric = "error_rate_pct"
+	AlertMetricLatencyP50        AlertMetric = "latency_p50_ms"
+	AlertMetricLatencyP95        AlertMetric = "latency_p95_ms"
+	AlertMetricLatencyP99        AlertMetric = "latency_p99_ms"
+	AlertMetricColdStartPct      AlertMetric = "cold_start_pct"
+	AlertMetricRequestCount      AlertMetric = "request_count"
+	AlertMetricFailedInvocs      AlertMetric = "failed_invocations"
+	AlertMetricAPIUp             AlertMetric = "api_up"
+	AlertMetricAccountSpendEUR   AlertMetric = "account_spend_eur"
+	AlertMetricFailedDeployments AlertMetric = "deployment_failed"
+	AlertMetricCertExpirySeconds AlertMetric = "cert_expiry_seconds"
+	AlertMetricQueueDepth        AlertMetric = "queue_depth"
 )
 
 // AlertComparison is the textual form of the comparison operator stored
@@ -2603,9 +2701,15 @@ type MirrorSummary struct {
 // on mismatch. The pointer types mirror Region/Zone (a SQL NULL
 // round-trips as nil, never collapsing into "").
 type ComputeNode struct {
-	ID                 string
-	Name               string
-	TargetURL          string // wire.ParseTarget-compatible — the vmmd dial target (Firecracker + jailer)
+	ID        string
+	Name      string
+	TargetURL string // wire.ParseTarget-compatible — the vmmd dial target (Firecracker + jailer)
+	// GatewayTargetURL is the private HTTP endpoint for this node's
+	// gatewayd-internal listener. It is separate from TargetURL because the
+	// latter is the vmmd gRPC endpoint and the two services may use different
+	// ports, certificates, or network paths. nil means the node is not yet
+	// eligible for public data-plane ingress.
+	GatewayTargetURL   *string
 	VPCPUs             int
 	MemMB              int
 	MaxConcurrency     int
@@ -2741,6 +2845,38 @@ type PerNodeStats struct {
 	RAMUsedMB            int64
 }
 
+// OperatorCapacityNode is the bounded read-side capacity projection used by
+// the operator console. It deliberately contains counts and resource
+// numbers, not app or instance rows, so the projection remains cheap as the
+// fleet grows.
+type OperatorCapacityNode struct {
+	ID                   string
+	Name                 string
+	Active               bool
+	VPCPUs               int
+	VCPUBudget           int
+	MemMB                int
+	AdmissionCeilingMB   int
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
+	AppsCount            int64
+	TenantsCount         int64
+}
+
+// OperatorCapacitySnapshot is the fleet-wide capacity projection. AppsTotal
+// and TenantsTotal are exact distinct counts across the fleet; per-node
+// tenant counts are placement counts and may intentionally overlap when a
+// tenant owns apps on more than one node.
+type OperatorCapacitySnapshot struct {
+	Nodes        []OperatorCapacityNode
+	AppsTotal    int64
+	TenantsTotal int64
+	UnplacedApps int64
+}
+
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
 // gateway accumulates these in memory and hands them to schedd every 15 s.
 type InstanceTouch struct {
@@ -2868,6 +3004,29 @@ type AuditLogFilter struct {
 	// the handler to the over-read constant; a zero value means
 	// "store default" (the operator endpoint passes a sane cap).
 	Limit int
+	// ActorEmail, when set, restricts to rows whose
+	// account_email column matches exactly (case-sensitive).
+	// Operator-only filter — the customer endpoint does not
+	// expose this. Added in P4 of the operator-side
+	// observability mega-PR (Commit 6). Empty pointer = no
+	// constraint.
+	ActorEmail *string
+	// OperatorOnly, when true, restricts to rows whose kind
+	// starts with "operator.action." (the operator action
+	// vocabulary adopted in Commit 3). Equivalent to setting
+	// KindPrefix="operator.action." but with the dedicated
+	// query-param `?operator_only=true` so the operator
+	// dashboard's filter chip strip can render a single
+	// boolean toggle. Mutually exclusive with a non-empty
+	// KindPrefix at the handler layer.
+	OperatorOnly bool
+	// TargetAccountID, when set, restricts to rows whose
+	// data->>'target_account_id' matches. The data column is
+	// JSONB; the query uses the containment operator
+	// (@> jsonb_build_object('target_account_id', $N)) so the
+	// GIN index on data (verified at PR-open) is used.
+	// Operator-only filter. Empty pointer = no constraint.
+	TargetAccountID *string
 }
 
 // AuditLogKindAccountDeleted is the canonical kind value emitted into
@@ -4573,6 +4732,14 @@ type EdgeRule struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	// ValidateMode (issue #975 item #3 / ADR-128) is the
+	// source-of-truth column for kind=validate enforcement.
+	// Empty == 'block' (the SQL-side default at 00293 also
+	// defaults to 'block' for pre-existing rows). Action.Validate
+	// .ValidateMode is kept as a read-side fallback for one
+	// release per ADR-128 §D2 so legacy JSONB-only rows
+	// preserve the customer's intended mode.
+	ValidateMode string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -4616,9 +4783,85 @@ type CorsPreset struct {
 	UpdatedAt        time.Time
 }
 
+// AccountSpendSnapshot is the in-memory row mirrored from
+// account_spend_snapshot (issue #1233 / ADR-123 / migrations/00350).
+// meterd ticks write one row per (account, source) per
+// AlertEvalInterval. The alert evaluator reads SUM(eur_cents)
+// for the MTD window via MTDSpendEurCents.
+//
+// source is a closed vocabulary mirroring the
+// account_spend_snapshot_source_chk DB constraint:
+// 'running_seconds' | 'overage' | 'build_seconds' | 'snapshot_storage'.
+type AccountSpendSnapshot struct {
+	ID          string
+	AccountID   string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	GBSeconds   float64
+	EurCents    int64
+	Source      string
+	CreatedAt   time.Time
+}
+
+// TenantSurfaceCertExpiryState is the in-memory row mirrored from
+// meterd_tenant_surface_cert_expiry_state (issue #1233 / ADR-123 /
+// migrations/00351). The meterd cert-expiry refresher goroutine
+// (cmd/meterd/alert_presets_ticks.go) updates the
+// last_observed_cert_not_after + last_walk_status; the alert
+// evaluator reads MinCertExpiryForApp to compute the
+// cert_expiry_seconds metric.
+type TenantSurfaceCertExpiryState struct {
+	TenantSurfaceID          string
+	AccountID                string
+	AppID                    string
+	Hostname                 string
+	LastObservedCertNotAfter *time.Time
+	LastWalkStatus           string
+	LastRefreshedAt          time.Time
+}
+
+// AlertPreset is the in-memory row mirrored from alert_presets
+// (issue #1233, ADR-123). Catalog rows are system-owned; the
+// meterd + apid system-owner role is the only writer. Customers
+// have SELECT-only access via the apid GET surface.
+//
+// The struct is read-only at the Store boundary — there is no
+// Update / Delete / Create method on the Store interface for
+// alert_presets. The only write path is migration 00348's
+// idempotent seed.
+//
+// Comparison / Metric / WindowSpec mirror the alert_rules closed
+// vocabularies byte-for-byte (the DB CHECK constraints in
+// migrations/00347_alert_presets.sql pin this). When the
+// evaluator's `observe` dispatch learns a new metric, the catalog
+// can include it on the same PR — but a catalog entry MUST NOT
+// reference a metric the evaluator has not learned, or the
+// enable path would persist an alert_rules row whose metric the
+// evaluator then drops at run-time.
+type AlertPreset struct {
+	ID                     string
+	Name                   string
+	DisplayName            string
+	Description            string
+	Category               string
+	Metric                 string
+	Comparison             string
+	Threshold              float64
+	WindowSpec             string
+	DefaultCooldownMinutes int
+	EnabledInCatalog       bool
+	MinimumPlan            string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
 // CreateEdgeRuleParams is the input bundle for CreateEdgeRule and
 // CreateEdgeRuleIfUnderQuota. Action is marshalled to jsonb at the
-// pgstore boundary.
+// pgstore boundary. ValidateMode is the kind=validate enforcement
+// mode (issue #975 item #3 / ADR-128) — empty string is coerced
+// to 'block' at the SQL-side default (00293 NOT NULL DEFAULT
+// 'block'), so callers can pass "" to opt into the strictest
+// mode.
 type CreateEdgeRuleParams struct {
 	AccountID    string
 	AppID        string
@@ -4629,6 +4872,7 @@ type CreateEdgeRuleParams struct {
 	Enabled      bool
 	Kind         EdgeRuleKind
 	Action       EdgeRuleAction
+	ValidateMode string
 }
 
 // UpdateEdgeRuleParams carries the optional fields of
@@ -4636,7 +4880,9 @@ type CreateEdgeRuleParams struct {
 // Action is *EdgeRuleAction because a nil means "do not touch the
 // jsonb column"; a non-nil replaces it wholesale (the kind-tagged
 // union has no partial-update shape — the customer re-sends the
-// full action body).
+// full action body). ValidateMode follows the same nil-skip
+// pattern as the other optional scalars — nil means "do not
+// touch the column"; non-nil replaces the column verbatim.
 type UpdateEdgeRuleParams struct {
 	MatchHost    *string
 	MatchPath    *string
@@ -4644,6 +4890,7 @@ type UpdateEdgeRuleParams struct {
 	Priority     *int
 	Enabled      *bool
 	Action       *EdgeRuleAction
+	ValidateMode *string
 }
 
 // EdgeRuleQuotaError is returned by CreateEdgeRuleIfUnderQuota when
@@ -4986,6 +5233,59 @@ const OpenAPIDocMaxBytes = 128 * 1024
 const (
 	OpenAPIDocSourceColdBoot     = "cold_boot"
 	OpenAPIDocSourceManualUpload = "manual_upload"
+)
+
+// StatusIncident (issue #599 / ADR-130 / cluster D commit 14 of
+// the platform-observability mega-PR) is the in-memory mirror of
+// the status_incidents table. The public status page
+// (deploy/statuspage/index.html) reads this via the
+// gatewayd-internal /v1/internal/slo.json endpoint, which
+// fetches the open subset via ListOpenStatusIncidents. Operators
+// create + resolve rows via the gregalectl CLI (`gregale status
+// incident post|resolve`).
+//
+// Closed-set vocabulary at the schema layer (migrations/00412):
+//   - component ∈ {apid, schedd, vmmd, gatewayd, meterd, imaged,
+//     builderd, faas-control-plane}
+//   - severity  ∈ {degraded, partial_outage, full_outage, maintenance}
+//   - message ≤ 1024 chars (CHECK length cap so a paste of a 50
+//     KB stack trace can't bloat the response).
+//
+// The component / severity strings are also defined as named
+// constants below so the CLI surface can range-check before
+// hitting the SQL CHECK.
+type StatusIncident struct {
+	ID         int64
+	Component  string
+	Severity   string
+	Message    string
+	PostedAt   time.Time
+	ResolvedAt *time.Time
+}
+
+// StatusIncidentComponent* are the closed-set vocabulary for the
+// status_incidents.component column (migrations/00412). Add a
+// new component by appending a constant + extending the SQL CHECK
+// (canonical DROP+ADD pair mirrors the migrations/00412 pattern).
+const (
+	StatusIncidentComponentApid             = "apid"
+	StatusIncidentComponentSchedd           = "schedd"
+	StatusIncidentComponentVmmd             = "vmmd"
+	StatusIncidentComponentGatewayd         = "gatewayd"
+	StatusIncidentComponentMeterd           = "meterd"
+	StatusIncidentComponentImaged           = "imaged"
+	StatusIncidentComponentBuilderd         = "builderd"
+	StatusIncidentComponentFaasControlPlane = "faas-control-plane"
+)
+
+// StatusIncidentSeverity* are the closed-set vocabulary for the
+// status_incidents.severity column (migrations/00412). Same
+// migration-extension pattern as the component constants above.
+const (
+	StatusIncidentSeverityDegraded      = "degraded"
+	StatusIncidentSeverityPartialOutage = "partial_outage"
+	StatusIncidentSeverityFullOutage    = "full_outage"
+	StatusIncidentSeverityMaintenance   = "maintenance"
 )
 
 // ---------------------------------------------------------------------------

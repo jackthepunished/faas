@@ -37,19 +37,22 @@ import (
 // TestWakeFailure_FirstNBoxesAdmitted asserts the first
 // maxBoxLabelValues distinct box identifiers round-trip unchanged
 // through the box-labelled counter. We sub-sample at 64 (the full
-// cap) — the cap is exercised by the overflow test below.
+// cap) — the cap is exercised by the overflow test below. (Note:
+// the counter now carries a third label dimension "app" per
+// ADR-127 §3.5 — the box assertion pins the box dimension; the
+// app dimension is exercised by metrics_cardinality_app_test.go.)
 func TestWakeFailure_FirstNBoxesAdmitted(t *testing.T) {
 	const n = 64
 	m := wire.NewOpsMetrics("vmmd")
 	for i := 0; i < n; i++ {
 		box := fmt.Sprintf("box-%02d", i)
 		// Force admission by hitting the wake-failure counter once.
-		m.WakeFailure(box, "snapshot_restore_err").Inc()
+		m.WakeFailure(box, "", "snapshot_restore_err").Inc()
 	}
 	body := render(t, m)
 	for i := 0; i < n; i++ {
 		box := fmt.Sprintf("box-%02d", i)
-		want := fmt.Sprintf(`vmmd_wake_failure_total{box=%q,reason="snapshot_restore_err"} 1`, box)
+		want := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="snapshot_restore_err"} 1`, box)
 		if !strings.Contains(body, want) {
 			t.Errorf("missing admitted series %q in:\n%s", want, body)
 		}
@@ -73,14 +76,14 @@ func TestWakeFailure_OverflowCollapsesToOther(t *testing.T) {
 	// "__other__" bucket.
 	for i := 0; i < 65; i++ {
 		box := fmt.Sprintf("box-%02d", i)
-		m.WakeFailure(box, "snapshot_restore_err").Inc()
+		m.WakeFailure(box, "", "snapshot_restore_err").Inc()
 	}
 	body := render(t, m)
 
 	// Spot-check the overflow bucket: the 65th box (box-64) must
 	// NOT have a per-box series in the scrape output — its
 	// increment must have collapsed to "__other__".
-	if strings.Contains(body, `vmmd_wake_failure_total{box="box-64",reason="snapshot_restore_err"}`) {
+	if strings.Contains(body, `vmmd_wake_failure_total{app="",box="box-64",reason="snapshot_restore_err"}`) {
 		t.Errorf("overflow box-64 unexpectedly admitted (should collapse to __other__):\n%s", body)
 	}
 
@@ -88,7 +91,7 @@ func TestWakeFailure_OverflowCollapsesToOther(t *testing.T) {
 	// surface with count 1.
 	for i := 0; i < 64; i++ {
 		box := fmt.Sprintf("box-%02d", i)
-		want := fmt.Sprintf(`vmmd_wake_failure_total{box=%q,reason="snapshot_restore_err"} 1`, box)
+		want := fmt.Sprintf(`vmmd_wake_failure_total{app="",box=%q,reason="snapshot_restore_err"} 1`, box)
 		if !strings.Contains(body, want) {
 			t.Errorf("missing admitted series %q in:\n%s", want, body)
 		}
@@ -96,7 +99,7 @@ func TestWakeFailure_OverflowCollapsesToOther(t *testing.T) {
 
 	// The reserved "__other__" bucket must surface with count 1
 	// (the 65th increment collapsed here).
-	want := `vmmd_wake_failure_total{box="__other__",reason="snapshot_restore_err"} 1`
+	want := `vmmd_wake_failure_total{app="",box="__other__",reason="snapshot_restore_err"} 1`
 	if !strings.Contains(body, want) {
 		t.Errorf("missing overflow bucket series %q in:\n%s", want, body)
 	}
@@ -112,8 +115,8 @@ func TestWakeFailure_ReservedLabelsNeverAgainstCap(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	body := render(t, m)
 	for _, want := range []string{
-		`vmmd_wake_failure_total{box="local",reason="snapshot_stale"} 0`,
-		`vmmd_wake_failure_total{box="__other__",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="",box="local",reason="snapshot_stale"} 0`,
+		`vmmd_wake_failure_total{app="__other__",box="__other__",reason="snapshot_stale"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing reserved-label series %q in:\n%s", want, body)
@@ -129,8 +132,8 @@ func TestWakeFailure_ReservedLabelsNeverAgainstCap(t *testing.T) {
 // monotonicity).
 func TestWakeFailure_SameBoxReturnsSameCounter(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
-	a := m.WakeFailure("box-dup", "netns_fail")
-	b := m.WakeFailure("box-dup", "netns_fail")
+	a := m.WakeFailure("box-dup", "", "netns_fail")
+	b := m.WakeFailure("box-dup", "", "netns_fail")
 	if a == nil || b == nil {
 		t.Fatal("counter is nil")
 	}
@@ -147,7 +150,7 @@ func TestWakeFailure_SameBoxReturnsSameCounter(t *testing.T) {
 	// Five total increments land on the same counter, so the
 	// registry surface shows 5.
 	body := render(t, m)
-	if !strings.Contains(body, `vmmd_wake_failure_total{box="box-dup",reason="netns_fail"} 5`) {
+	if !strings.Contains(body, `vmmd_wake_failure_total{app="",box="box-dup",reason="netns_fail"} 5`) {
 		t.Errorf("expected box-dup series at 5 after 5 increments, got:\n%s", body)
 	}
 }
@@ -169,7 +172,7 @@ func TestWakeFailure_RaceSafe(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
 				box := fmt.Sprintf("race-%d-%d", g, i)
-				m.WakeFailure(box, "jailer_fail").Inc()
+				m.WakeFailure(box, "", "jailer_fail").Inc()
 			}
 		}(g)
 	}

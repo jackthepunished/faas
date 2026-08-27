@@ -156,7 +156,7 @@ func defaultDeps() runDeps {
 	return runDeps{
 		configPath: envOr("FAAS_SCHEDD_CONFIG", "/etc/faas/schedd.toml"),
 		openDB:     db.Open,
-		migrate:    db.MigrateUp,
+		migrate:    db.MigrateUp, // F2 / ADR-124: acquires pg_advisory_lock; safe for fleet bootstrap
 		detectFC:   fcvm.DetectFirecrackerVersion,
 		dialVMM: func(ctx context.Context, target string, tlsCfg *tls.Config) (sched.VMM, error) {
 			return sched.DialVMMContext(ctx, target, tlsCfg)
@@ -465,6 +465,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	ledger := sched.NewNodeLedger()
 	ops := wire.NewOpsMetrics("schedd")
+	wire.BootStamps(ctx, "schedd", ops)
+	wire.RegisterDefaultOps(ops)
 	// Dashboard gauges (spec §12): schedd owns the snapshots table and the
 	// admission ledger, so the four fcvm_* gauges live here, not in vmmd.
 	// The DashboardMetrics callbacks close over `store` (PG) and `ledger`
@@ -747,6 +749,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("schedd: listen %s: %w", listenTarget, err)
 	}
+	// Issue #571 PR-A2: /readyz probe (PG ping + gRPC bound).
+	// Probe construction is platform-portable — pool may be nil
+	// in unit tests that don't wire a real pgxpool; the probe
+	// short-circuits to "pg pool nil (test path)" in that case.
+	scheddProbe, scheddBound := BuildReadinessProbe(ctx, pool, 5*time.Second)
+	// NOTE: scheddBound.MarkBound() is intentionally NOT called
+	// here — see cmd/schedd/readiness.go for why. The flip must
+	// fire inside the serve goroutine, just before gsrv.Serve,
+	// so a panic during the ~465 lines of setup below cannot
+	// leave /readyz reporting ready while no gRPC server is
+	// actually running (PR #1091 review Finding 5).
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
@@ -766,6 +779,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// `curl /metrics` scrape returns the canonical schedd ops
 		// series; Prometheus hits both paths.
 		mux.Handle(metricsPath+"/fcvm", dashGauges.Handler())
+		// Issue #571 PR-A2: /healthz + /readyz on the metrics mux
+		// (operator-side, loopback-only). Source of truth is the
+		// same BuildReadinessProbe wired at the deps.listen site
+		// above — single source between /readyz body and the
+		// daemon_ready gauge (issue #586 / ADR-129).
+		wire.ControlMuxLite(mux, scheddProbe.ReadyFunc(), scheddProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
@@ -1205,6 +1224,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", scheddpb.Schedd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		scheddBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 
@@ -1478,19 +1502,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// The mode lookup reads the same per-app cache the
 			// dispatcher already populates (no extra SQL). The
 			// minter is the closure below — it loads the
-			// Ed25519 keypair from FAAS_INTERNAL_SVC_KEY_PATH
-			// at boot and mints a fresh JWT per synth request
-			// (TTL 30s; the §15 plan calls out replay-attack
-			// posture). Both are nil-safe: a dev box without
-			// FAAS_INTERNAL_SVC_KEY_PATH leaves the minter nil
-			// and SynthesizeRequest logs a loud warn +
-			// internal_only requests 403.
-			if minter, mErr := newSchedInternalSvcMinter(log); mErr != nil {
+			// Ed25519 keypair from cluster_signing_keys (PR-3
+			// / ADR-125 fleet-wide key) with a per-host
+			// FAAS_INTERNAL_SVC_KEY_PATH fallback, and mints
+			// a fresh JWT per synth request (TTL 30s; the
+			// §15 plan calls out replay-attack posture). The
+			// minter is nil-safe: a dev box without either
+			// source leaves the minter nil and SynthesizeRequest
+			// logs a loud warn + internal_only requests 403.
+			if minter, mErr := newSchedInternalSvcMinter(ctx, store, log); mErr != nil {
 				log.Warn("schedd: internal-svc minter not wired; internal_only cron requests will 403 until corrected",
 					"err", mErr.Error())
 			} else {
 				modeLookup := sched.PublicAuthModeFromStore(store.AppByID)
-				sched.ConfigureInternalSvcAuth(synth, modeLookup, minter)
+				sched.ConfigureInternalSvcAuth(synth, modeLookup, minter.AsFunc())
 				// The trigger batch path (postBatch) does NOT
 				// route through httpGatewaySynth — it uses
 				// l.gatewayHTTPClient directly. Wire the same
@@ -1500,7 +1525,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// synth.go::handleInvocationDispatchBatch would
 				// 403 every internal_only batch the schedd posts.
 				loop.WithAppPublicAuthModeLookup(modeLookup)
-				loop.WithMintInternalSvcToken(minter)
+				loop.WithMintInternalSvcToken(minter.AsFunc())
+
+				// PR-3 / ADR-125 rotation: subscribe to the
+				// cluster_signing_keys_changed channel and
+				// atomic-swap the minter on every delivery.
+				// Best-effort — if the subscribe fails the
+				// boot-time key keeps working; rotation
+				// just requires a daemon restart until the
+				// operator fixes the channel/subscribe path.
+				if subErr := SubscribeClusterKeyChanges(ctx, pool, store, minter, log); subErr != nil {
+					log.Warn("schedd: cluster key rotation subscribe failed; minter frozen at boot key",
+						"err", subErr.Error())
+				}
 			}
 			loop.WithGatewaySynth(synth)
 		}

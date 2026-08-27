@@ -82,6 +82,15 @@ type Server struct {
 	// env, mirroring the gatewayd-internal proxy's behaviour.
 	// Resolved once at boot via NewPGWebhookSecretResolver.
 	SecretResolver WebhookSecretResolver
+
+	// ReadyFunc + ReasonFunc are the /readyz hooks (issue #571
+	// PR-A2). Wired by cmd/githubd/main.go to
+	// wire.ReadyzProbe.ReadyFunc/ReasonFunc. Both nil = skip
+	// /readyz registration (test-friendly default); both set =
+	// register /healthz + /readyz via wire.ControlMuxLite on
+	// the same loopback mux as /metrics + /webhooks/github.
+	ReadyFunc  func() bool
+	ReasonFunc func() string
 }
 
 // DefaultSocketPath is the ADR-015 / spec §11 location for the
@@ -258,6 +267,15 @@ func (s *Server) WebhookLoopbackHandler() http.Handler {
 		// (the daemon stays up); just skip /metrics so a partially
 		// configured unit test doesn't expose a stray handler.
 		mux.Handle("/metrics", s.Ops.Handler())
+	}
+	// Issue #571 / PR-A2: operator-side /healthz + /readyz on the
+	// loopback mux. Both ReadyFunc + ReasonFunc must be wired
+	// (single-nil = skip; the boot path is responsible for
+	// passing both). ControlMuxLite is the canonical shape —
+	// /readyz returns 503 with the failing reason when the
+	// probe is degraded.
+	if s.ReadyFunc != nil && s.ReasonFunc != nil {
+		wire.ControlMuxLite(mux, s.ReadyFunc, s.ReasonFunc)
 	}
 	return mux
 }

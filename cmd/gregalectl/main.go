@@ -53,7 +53,7 @@ Commands:
   backup       Operator rclone / archive credentials (backup init|unseal-archive-creds|unseal-rclone)
   secrets      Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)
   compute-nodes  Compute-node state machine (add|drain|drain-status|activate|force-drain; PR-A / multi-host scale-out)
-  deploy        Fleet topology coordinator (deploy add-node; PR-B / multi-host scale-out gap #2)
+  deploy        Provider-neutral node adoption + fleet topology tools (deploy join-node|join-fleet|rollback-node|add-node)
   version      Print the CLI version
   completion   Print a shell completion script (bash|zsh|fish|powershell)
   man          Print the gregalectl(1) man page (or gregalectl-<command>(1) with one arg)
@@ -162,11 +162,27 @@ func run(args []string) int {
 		// / SetComputeNodeActive). Signature matches every other
 		// dispatch* arm (see commands_release.go:cmdReleaseDispatch).
 		return cmdComputeNodesDispatch(args[1:])
+	case dispatchInstances:
+		// P2a + P2b — operator recovery primitives. force-park
+		// dials schedd directly via FAAS_SCHEDD_ADDR. force-cold-
+		// boot opens a state.Store + dials schedd (latest-
+		// deployment resolution mirrors the apid handler). Both
+		// require --yes as a tripwire.
+		return cmdInstancesDispatch(args[1:])
+	case dispatchBuilds:
+		// P2c — operator-side build-recovery primitive.
+		// sweep-stuck opens a state.Store via FAAS_PG_DSN and
+		// calls state.Store.SweepStuckRunningBuilds directly
+		// (per user decision: NO builderd gRPC server). The
+		// Store method is also called by pkg/builderd/reaper.go:48
+		// — the CLI path is the operator's manual escape hatch
+		// when the reaper's grace period is too long for an
+		// incident.
+		return cmdBuildsDispatch(args[1:])
 	case dispatchDeploy:
-		// PR-B (multi-host scale-out gap #2). Single subcommand
-		// today: add-node (host_vars + hosts.ini + git commit +
-		// ssh bootstrap + POST compute_nodes). The four-step
-		// coordination lives in cmd/gregalectl/commands_deploy.go.
+		// Provider-neutral join-node is the production path. The legacy
+		// add-node coordinator remains available for migration and local
+		// repository workflows.
 		return cmdDeployDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])

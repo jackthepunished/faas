@@ -233,6 +233,31 @@ func TestVerify_FailsOnUnexpectedFile(t *testing.T) {
 	}
 }
 
+func TestVerify_AllowsLegacyGuestInitWithoutToolHash(t *testing.T) {
+	root := t.TempDir()
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	bin := filepath.Join(root, gitSHA, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	for _, name := range manifest.SortedHostKeys() {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("fake-"+name), 0o755); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(bin, "init"), []byte("legacy-guest-init"), 0o755); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	m, err := Build(root, gitSHA, "sha256:"+strings.Repeat("a", 64), time.Now())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	delete(m.ToolHashes, "init")
+	if err := Verify(root, m); err != nil {
+		t.Fatalf("Verify legacy init: %v", err)
+	}
+}
+
 func TestValidateManifest_RejectsPartialMap(t *testing.T) {
 	// Two daemons missing — must be rejected.
 	partial := make(map[string]string)

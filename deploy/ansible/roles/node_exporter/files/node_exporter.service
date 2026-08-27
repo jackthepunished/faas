@@ -12,7 +12,8 @@ ExecStart=/usr/local/bin/node_exporter \
   --web.listen-address={{ node_exporter_listen_addr }} \
   --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|run)($|/) \
   --collector.netclass.ignored-devices=^(veth|docker) \
-  --collector.diskstats.ignored-devices=^(loop|dm-)
+  --collector.diskstats.ignored-devices=^(loop|dm-) \
+  --collector.systemd
 Restart=on-failure
 RestartSec=5
 

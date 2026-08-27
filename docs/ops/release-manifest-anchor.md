@@ -1,33 +1,38 @@
-# Release manifest anchor
+# Release manifest materialization
 
 The signed daemon bundle must be tied to the exact deployment manifest that
-was rendered and applied to the production fleet. The example manifest under
-`deploy/manifest/examples/` is illustrative only and must never be used as a
-release anchor.
+is rendered and applied to the production fleet. The checked-in production
+file is now a topology template:
 
-Before pushing a release tag:
+```text
+deploy/manifest/production/gcp-live.template.yaml
+```
 
-1. Render and validate the real fleet manifest through the normal deployment
-   workflow. Keep the canonical YAML bytes unchanged after hashing.
-2. Compute its digest:
+It deliberately contains a schema-valid placeholder release identity. The
+release workflow materializes the final manifest using the tagged commit,
+computes its SHA-256, embeds that hash in `release-manifest.json`, and
+publishes the exact YAML as `production-manifest.yaml` beside the signed
+bundle.
 
-   ```sh
-   sha256sum /path/to/production-manifest.yaml
-   ```
+This is automatic and avoids the impossible circular operation of committing
+a file containing its own commit SHA. It also removes the mutable
+`GREGALE_RELEASE_MANIFEST_HASH` repository variable from the release gate.
 
-3. Set the repository variable `GREGALE_RELEASE_MANIFEST_HASH` to the result
-   with the `sha256:` prefix. With `gh`:
+For a local pre-release check:
 
-   ```sh
-   gh variable set GREGALE_RELEASE_MANIFEST_HASH \
-     --body "sha256:<64 lowercase hex characters>"
-   ```
+```sh
+./scripts/pre-release-check.sh
+```
 
-The daemon release job fails closed when this variable is missing or has the
-wrong shape. The resulting `release-manifest.json` carries that same digest;
-`gregalectl release install` and `gregalectl doctor --deep` compare it with
-the node's recorded release membership.
+For an explicit materialization:
 
-This variable is configuration, not a secret. Do not substitute the hash of
-`deploy/manifest/examples/splitbox.example.yaml`, a temporary `live-e2e-*`
-release, or a hand-edited copy of the production manifest.
+```sh
+scripts/materialize-release-manifest.sh \
+  --git-sha "$(git rev-parse HEAD)" \
+  --output /tmp/production-manifest.yaml
+```
+
+Never use the illustrative manifest under `deploy/manifest/examples/` or a
+temporary `live-e2e-*` release as a production release anchor. Operators
+deploy the `production-manifest.yaml` asset emitted by the same signed
+release that contains the daemon bundle.

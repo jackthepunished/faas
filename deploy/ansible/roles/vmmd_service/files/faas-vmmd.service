@@ -12,10 +12,22 @@ ExecStart=/opt/faas/current/bin/vmmd --config /etc/faas/vmmd.toml
 ExecStartPost=/usr/bin/chown root:faas /run/faas
 ExecStartPost=/usr/bin/chmod 0775 /run/faas
 Environment=TMPDIR=/srv/fc/base
-EnvironmentFile=-/etc/faas/sealed.env
+# Issue #585 / ADR-127 — sealed.env is apid-only; vmmd keeps compute-db.env
+# (DATABASE_URL) but no longer inherits the full sealed.env.
 EnvironmentFile=-/etc/faas/compute-db.env
+# Shared OCI storage contract. Optional for single-box/local deployments;
+# required on a multi-box fleet and identical on every storage consumer.
+EnvironmentFile=-/etc/faas/storage.env
 Restart=on-failure
 RestartSec=2s
+# PR #1082 review-fix #2: surface the per-unit restart count to the
+# daemon via the $SYSTEMD_RESTARTS_ON_FAILURE env var (systemd 254+
+# RestartCountExport). pkg/wire/daemon.go::Daemon() reads the env var
+# at boot and records it on daemons.gregale_dev_restart_count_total
+# so the FaasRestartLoop / FaasRepeatedRestart / FaasStuckActivating
+# alerts (ADR-128) have a real-time signal instead of relying on
+# node_exporter scraping node_systemd_restart_count at 15s resolution.
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
 Delegate=yes

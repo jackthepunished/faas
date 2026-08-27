@@ -31,7 +31,8 @@ was red on `unit tests (pg shard 2)`).
 |-------------------------------------------------------------|-------------------------------------------|-------------------|
 | `lint + build`                                              | golangci-lint v2.4.0 + gofmt repo-wide    | `ci.yml:70`       |
 | `unit tests (pg shard 1 — apid/meter/migrations)`          | apid + meter + migrations + db + alerts   | `ci.yml:222`      |
-| `unit tests (pg shard 2 — state/gregale/schedd)`            | pkg/state + cmd/gregale + schedd          | `ci.yml:~290`     |
+| `unit tests (pg shard 2a — state/reconcile/reposcan)`       | pkg/state + reconcile + reposcan         | `ci.yml:461-545`  |
+| `unit tests (pg shard 2b — gregale/gregalectl/daemons)`     | gregale + gregalectl + meterd + schedd    | `ci.yml:461-545`  |
 | `unit tests (pure Go shard 1 — sched/fcvm/gateway)`        | sched + fcvm + gateway (-race)             | `ci.yml:~350`     |
 | `unit tests (pure Go shard 2 — light packages)`            | the rest of the race-enabled tree         | `ci.yml:~380`     |
 | `CodeQL`                                                    | CodeQL SARIF (security gate)              | `codeql.yml`      |

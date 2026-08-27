@@ -72,7 +72,7 @@ func defaultDeps() runDeps {
 		openDB: func(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 			return db.OpenWithAppName(ctx, dsn, "faas-builderd")
 		},
-		migrate: db.MigrateUp,
+		migrate: db.MigrateUp, // F2 / ADR-124: acquires pg_advisory_lock; safe for fleet bootstrap
 		// newDriver is set per build tag at link time: metal uses vmmd
 		// over gRPC; non-metal uses the stub that returns ErrNotMetal.
 		// The *Context form (issue #95) threads ctx + tlsCfg through to
@@ -153,6 +153,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 
+	// Issue #571 / PR-A2: builderd /readyz probe. Three signals —
+	// PG ping (queued-build backlog stays reachable), vmmd RPC
+	// dialable (the build-volume microVM host), and
+	// cfg.BuildDriveDir writable (the overlay mount source).
+	// Constructed after openDB so the pool is live; the vmmd
+	// dial signal races alongside the driver dial below.
+	builderdProbe := BuildReadinessProbe(ctx, pool, cfg.BuildDriveDir, vmmTarget, nil)
+
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the tls_* cluster; nil TLS on a
 	// unix target keeps single-box behaviour unchanged.
@@ -176,6 +184,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// it once (not inline in the /metrics block) is what makes the build
 	// series real rather than a throwaway (ADR-030).
 	ops := wire.NewOpsMetrics("builderd")
+	wire.BootStamps(ctx, "builderd", ops)
+	wire.RegisterDefaultOps(ops)
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// so markSucceeded / markFailed emit
 	// wake.build_succeeded / wake.build_failed on the events
@@ -211,6 +221,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
+		// Issue #571 / PR-A2: operator-side /healthz + /readyz on
+		// the metrics mux. ControlMuxLite is the canonical
+		// shape — /readyz returns 503 with the failing reason
+		// when the probe is degraded. Customer-facing routes
+		// are on the apid mux (cmd/apid/handlers_ready.go).
+		wire.ControlMuxLite(mux, builderdProbe.ReadyFunc(), builderdProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.

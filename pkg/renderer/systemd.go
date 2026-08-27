@@ -42,10 +42,10 @@ func renderSystemd(daemon, hostName string) ([]byte, error) {
 
 // injectNodeNameEnvironment appends an `Environment=FAAS_NODE_NAME=<hostName>`
 // line to the [Service] block of `body`. The line is inserted after the
-// last `Environment=` / `EnvironmentFile=` directive (preserving the
-// daemonunit.Unit field ordering — daemonunit emits directives in a
-// deterministic order, and the new line belongs at the tail of the
-// directive cluster, not a fresh one).
+// last `Environment=` / `EnvironmentFile=` directive in that block
+// (preserving the daemonunit.Unit field ordering — daemonunit emits
+// directives in a deterministic order, and the new line belongs at the tail
+// of the directive cluster, not a fresh one).
 //
 // The function is a no-op on bodies that already carry the
 // FAAS_NODE_NAME environment line (idempotent against re-renders that
@@ -58,26 +58,45 @@ func injectNodeNameEnvironment(body []byte, hostName string) ([]byte, error) {
 	if bytes.Contains(body, []byte(marker)) {
 		return body, nil
 	}
-	newLine := []byte("Environment=FAAS_NODE_NAME=" + hostName + "\n")
 
-	// Walk to the tail of the [Service] block. The daemonunit
-	// renderer emits a single [Service] block per unit; the tail
-	// is the last line before the EOF (or the next [Section]).
 	lines := strings.Split(string(body), "\n")
-	insertAt := len(lines)
+	serviceStart := -1
+	serviceEnd := len(lines)
 	for i, ln := range lines {
-		if strings.HasPrefix(ln, "[") && strings.HasSuffix(ln, "]") && i > 0 {
-			insertAt = i
+		if strings.TrimSpace(ln) == "[Service]" {
+			serviceStart = i
 			break
 		}
 	}
-	// Build the new body: lines[:insertAt] + newLine + lines[insertAt:].
-	// The trailing newline is preserved by `body` ending with "\n"
-	// (daemonunit.Render always emits a final newline); the new
-	// line carries its own "\n".
+	if serviceStart < 0 {
+		return nil, fmt.Errorf("systemd unit has no [Service] section")
+	}
+	for i := serviceStart + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			serviceEnd = i
+			break
+		}
+	}
+
+	// Insert after the last environment directive in [Service]. If the
+	// constructor has no environment directives, place it at the start of
+	// the section. Restricting the scan to [Service] is important: systemd
+	// ignores Environment= in [Unit], which would silently drop node identity.
+	insertAt := serviceStart + 1
+	for i := serviceStart + 1; i < serviceEnd; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "Environment=") || strings.HasPrefix(trimmed, "EnvironmentFile=") {
+			insertAt = i + 1
+		}
+	}
+	newLine := "Environment=FAAS_NODE_NAME=" + hostName
+
+	// Build the new body from logical lines. The trailing empty element from
+	// Split preserves daemonunit.Render's final newline.
 	out := make([]string, 0, len(lines)+1)
 	out = append(out, lines[:insertAt]...)
-	out = append(out, string(newLine))
+	out = append(out, newLine)
 	out = append(out, lines[insertAt:]...)
 	return []byte(strings.Join(out, "\n")), nil
 }

@@ -83,15 +83,19 @@ daemons:
       key_path: /etc/faas/tls/schedd/server.key
       ca_path: /etc/faas/tls/ca/ca.crt
       mode: "0400"
-    # The control-plane scheduler dials the compute vmmd over private mTLS
-    # and sends cron/metrics traffic to the remote gatewayd-internal.
+    # This is the static compatibility fallback. Per-node routing comes
+    # from compute_nodes.target_url, which the renderer derives from each
+    # compute host's endpoint. Static cron/metrics traffic uses the primary
+    # compute gatewayd-internal.
     outbound:
       target: tcp://vmmd.faas:50051
       tls:
         cert_path: /etc/faas/tls/schedd/vmmd-client.crt
         key_path: /etc/faas/tls/schedd/vmmd-client.key
         ca_path: /etc/faas/tls/ca/ca.crt
-    gateway_synth_target: tcp://fsn-2.gregale.dev:8080
+    # The control-plane edge owns the stable scheduler entrypoint and
+    # selects an active compute gateway from compute_nodes.
+    gateway_synth_target: tcp://127.0.0.1:8080
   vmmd:
     bind: tcp://0.0.0.0:50051
     tls:
@@ -99,6 +103,10 @@ daemons:
       key_path: /etc/faas/tls/vmmd/server.key
       ca_path: /etc/faas/tls/ca/ca.crt
       mode: "0400"
+    schedd_client_tls:
+      cert_path: /etc/faas/tls/vmmd/schedd-client.crt
+      key_path: /etc/faas/tls/vmmd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
     # PR scale-out tier-1 residual (PR #937 / Gaps #3 + #5):
     # per-host compute_node overrides. The slot allocator
     # (pkg/fcvm.SetHostIPBase) carves per-VM /30 leases from
@@ -123,6 +131,29 @@ daemons:
     bind: unix:///run/faas/gatewayd-internal.sock
     # Compute gatewayd proxies the apid surface to the control plane.
     apid_loopback: http://fsn-1.gregale.dev:8081
+    # Split-box peer identities. These are intentionally separate from
+    # `tls` (the daemon has no customer-facing TLS listener) and from
+    # `outbound` (which models schedd's single vmmd peer).
+    schedd_tls:
+      cert_path: /etc/faas/tls/gatewayd/schedd-client.crt
+      key_path: /etc/faas/tls/gatewayd/schedd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    vmmd_tls:
+      cert_path: /etc/faas/tls/gatewayd/vmmd-client.crt
+      key_path: /etc/faas/tls/gatewayd/vmmd-client.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+    egress_tls:
+      cert_path: /etc/faas/tls/egress/egress.crt
+      key_path: /etc/faas/tls/egress/egress.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+  builderd:
+    bind: tcp://127.0.0.1:9091
+    outbound:
+      target: tcp://fsn-2.gregale.dev:50051
+      tls:
+        cert_path: /etc/faas/tls/builderd/vmmd-client.crt
+        key_path: /etc/faas/tls/builderd/vmmd-client.key
+        ca_path: /etc/faas/tls/ca/ca.crt
 
 # Overlay — per-host overlay network identity. The generated Ansible
 # inventory writes a managed private endpoint block so the fleet and private

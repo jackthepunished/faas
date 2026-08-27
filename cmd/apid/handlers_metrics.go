@@ -46,8 +46,35 @@ const truthyTrue = "true"
 // getAppMetrics serves GET /v1/apps/{slug}/metrics?range=.
 // Mirrors getApp's auth chain (without requireMFA — read-only,
 // primary caller is an API key with ScopesReadSurface).
+//
+// Operator-as-tenant view (P1): when ?on_behalf_of=<uuid-or-slug>
+// is present, the handler reads the target's data using the
+// target's plan (Free→402 still applies even when the caller is
+// admin) and emits an operator.action.view audit row keyed on
+// the target's account id with the caller captured as the actor.
+// The caller must be in the admin allowlist for the target — the
+// two-step gate (resolveOnBehalfOf + loadApp's cross-account
+// guard) prevents an admin from reading another admin's data.
 func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
+	target, ok := s.resolveOnBehalfOf(w, r, acct, "metrics")
+	if !ok {
+		return
+	}
+	authAcct := acct
+	if target != nil {
+		authAcct = *target
+	}
+	// Plan gate: per-app observability is Hobby+; Free gets 402 +
+	// upsell. The gate runs BEFORE loadApp so a Free customer
+	// probing a Hobby+ slug never gets a 404 (slug-leak guard —
+	// same posture as handlers_alert_presets.go:165-179). When
+	// on_behalf_of is set, authAcct is the target so the gate
+	// reads from target.Plan (not caller's plan).
+	if !authAcct.Plan.PerAppMetricsAllowed() {
+		api.WriteProblem(w, api.ErrPlanPerAppMetricsNotAllowed(authAcct.Plan))
+		return
+	}
+	app, ok := s.loadApp(w, r, authAcct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
 	if !ok {
 		// loadApp already wrote the 404.
 		return
@@ -68,7 +95,57 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 	resp.AppID = app.ID
 	resp.Range = rng
 	resp.Source = src
+
+	// Best-effort enrichment of the three Hobby+-only fields
+	// beyond the PromQL fetch. A failure here degrades the field
+	// to 0 (same posture as the QueueDepth best-effort path at
+	// pkg/appmetrics/appmetrics.go:196-199) and stamps Source
+	// with the existing degraded prefix only when the underlying
+	// PromQL fetch itself failed — these SQL/PromQL misses do
+	// not flip the whole response to degraded.
+
+	// Wakes24h: count of wake.boot_started events in the trailing
+	// 24 hours, sourced from the events table. The (data->>'app_id')
+	// predicate is NOT covered by events_wake_id_idx (migration 00114
+	// indexes data->>'wake_id'); on a Scale-tier app with a large
+	// fleet this can seq-scan + jsonb-cast per row. A follow-up
+	// migration adds a covering index — see the Store interface
+	// comment for CountWakeBootStarted24h. 0 on a degraded store
+	// call, an empty app, or pre-ADR-123 fleet (pre-PR-A
+	// boot_started rows carry no app_id field, so the cast
+	// returns NULL which COUNT(*) coerces to 0).
+	if n, err := s.store.CountWakeBootStarted24h(r.Context(), app.ID); err == nil {
+		resp.Wakes24h = n
+	} else if s.log != nil {
+		s.log.Warn("wakes_24h fetch failed",
+			"app_id", app.ID,
+			"err", err.Error())
+	}
+
+	// CacheHitRatePct: ADR-122 response-cache hit ratio. The
+	// PromQL query against gateway_response_cache_total{app_id,
+	// outcome=hit/miss} is out of scope for this PR; the field
+	// stays 0 until the response-cache consumer-facing metric
+	// lands. The DTO is non-omitempty (this field is ALWAYS on
+	// the wire) so the dashboard can rely on the documented
+	// schema. Feature-off vs. feature-on-zero-traffic is
+	// distinguished by the `Routes` block presence, not by
+	// this field's absence.
+	_ = app.RouteMetricsEnabled // opt-in flag consulted at fetch time in a future PR
+
+	// ErrorBudgetPct: trailing-30d API-availability error budget
+	// remaining. Computed against the plan's API-availability
+	// SLO target (99.5% per spec §12). The per-plan SLO target
+	// is not yet exposed on the Limits struct (issue TBD); the
+	// field stays 0 until that lands. The dashboard renders 0
+	// with no traffic as "—" rather than a misleading "budget
+	// exhausted" message.
+	// TODO: wire against apid_request_total{account_id, code}
+	// once the per-plan SLO target lands on Limits.
 	resp.AsOf = time.Now().UTC().Format(time.RFC3339Nano)
+	if target != nil {
+		emitOperatorActionView(r, s, acct, target.ID, "metrics")
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

@@ -144,6 +144,12 @@ type Request struct {
 	// the preferred node still has headroom — affinity is bias, never
 	// a gate (ADR-005: cold boot must always work).
 	PreferredNodeID string
+	// PreferredNodeIDs is the set of compute nodes whose local cache has a
+	// complete copy of the selected snapshot (issue #1054). It is a bias,
+	// never a capacity gate: if every ready replica is full, placement falls
+	// through to the normal fleet chooser and the shared backend remains the
+	// cold-restore fallback.
+	PreferredNodeIDs []string
 	// PreferredRegion (ADR-098 PR-D + amendment issue #954) is
 	// the connection-aware placement bias, scoped to a single
 	// deployment. The Engine populates this from

@@ -11,11 +11,14 @@ Group=faas
 ExecStart=/opt/faas/current/bin/gatewayd-public
 Restart=on-failure
 RestartSec=2s
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 Slice=faas-cp.slice
 MemoryMax=512M
 AmbientCapabilities=
 Environment=FAAS_PUBLIC_CONTROL_ADDR=127.0.0.1:9092
 Environment=FAAS_INTERNAL_TARGET=
+Environment=FAAS_COMPUTE_GATEWAY_DISCOVERY=database
+Environment=FAAS_CONTROL_PLANE_API_TARGET=http://127.0.0.1:8081
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

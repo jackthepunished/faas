@@ -64,6 +64,8 @@ func startHAComponents(
 	// WarmupErrors land on this daemon's /metrics scrape target
 	// (mirrors cmd/gatewayd-internal/run.go:610).
 	ops := wire.NewOpsMetrics("gatewayd_public")
+	wire.BootStamps(ctx, "gatewayd_public", ops)
+	wire.RegisterDefaultOps(ops)
 
 	// DNSHandoff. Gated on FAAS_DNS_PROVIDER (no provider → no
 	// DNS to flip → subscriber is a no-op).

@@ -7,8 +7,8 @@
 # per-deployment.
 [Interface]
 Address = {{ faas_overlay_address | default('10.100.0.1/24') }}
-# PrivateKey must be supplied out-of-band; see role doc.
-PrivateKey = {{ faas_overlay_private_key | default('PLACEHOLDER') }}
+# PrivateKey is required from the operator-managed secret source.
+PrivateKey = {{ faas_overlay_private_key }}
 ListenPort = {{ faas_overlay_wg_port | default(51820) }}
 
 {% for peer in faas_overlay_peers | default([]) %}

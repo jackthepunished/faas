@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/roleTemplating"
 )
 
 // renderHostVarsYAML returns the canonical host_vars/<fqdn>.yml body
@@ -46,6 +48,7 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 func renderHostVarsYAMLWithTargetURL(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs, targetURL string) string {
 	roleComment := roleControlPlane + " box"
 	roleMarker := roleControlPlane
+	canonicalNodeName := canonicalComputeNodeName(fqdn, roleTemplating.Role(role))
 	hosts := []string{"postgres", "scheduler", "metering", "gateway-public", "githubd"}
 	if role == roleComputeOnly {
 		roleComment = roleComputeOnly + " box"
@@ -70,7 +73,7 @@ func renderHostVarsYAMLWithTargetURL(fqdn, role, ansibleHost, publicIface, masqC
 	fmt.Fprintf(&b, "# unit reads it via FAAS_<DAEMON>_ROLE.\n")
 	fmt.Fprintf(&b, "\n")
 	fmt.Fprintf(&b, "faas_box_role: %s\n", roleMarker)
-	fmt.Fprintf(&b, "faas_node_name: %s\n", fqdn)
+	fmt.Fprintf(&b, "faas_node_name: %s\n", canonicalNodeName)
 	fmt.Fprintf(&b, "\n")
 	fmt.Fprintf(&b, "# Ansible connection vars. `ansible_host` is the cross-box addressing\n")
 	fmt.Fprintf(&b, "# target (Layer-3 mesh endpoint: Tailscale/Wireguard IP, internal LAN,\n")

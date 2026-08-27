@@ -90,7 +90,7 @@ The two operators actually need are:
 
 ```bash
 sudo stat -c '%a %U:%G %n' /etc/faas/secrets/storage-box/archive-creds.json
-# expected: 0440 root:faas /etc/faas/secrets/storage-box/archive-creds.json
+# expected: 0400 root:root /etc/faas/secrets/storage-box/archive-creds.json
 ```
 
 The `log_archive` ansible role asserts this on every run
@@ -182,7 +182,7 @@ In order — each step assumes the previous didn't help:
    ```
    The unseal reads the host.age-sealed form, decrypts it
    into `/etc/faas/secrets/storage-box/archive-creds.json`
-   (mode `0440 root:faas`), and `systemctl restart apid`
+   (mode `0400 root:root`), and `systemctl restart apid`
    forces the shipper to re-read the new envelope on its
    next boot. Run the same restart on
    `faas-gatewayd-internal` so the read-back handler picks

@@ -48,6 +48,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/snapshothipd"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
@@ -660,6 +661,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	wire.BootStamps(ctx, "vmmd", ops)
+	wire.RegisterDefaultOps(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer so
 	// stale-fallback serves on the cold-boot Restore path emit
 	// `vmmd_storage_cache_stale_fallback_total`. vmmd is the
@@ -676,6 +679,46 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				ops.StorageCacheStaleFallback().Inc()
 			}),
 		})
+	}
+	// Issue #1054: vmmd is the node-local worker host in the current
+	// compute-only topology. Unlike schedd, vmmd is installed on every
+	// compute box, already owns that box's StorageBackend/cache, and has
+	// the self-registered node ID in hand. The local backend is intentionally
+	// excluded: two hosts can both have /srv/fc while sharing no bytes, so
+	// marking local-only reads as replicas would create false-ready rows.
+	if nodeID != "" && strings.EqualFold(os.Getenv("FAAS_STORAGE_BACKEND"), "oci") {
+		if storage.AsCacheBackend(storageBackend) == nil {
+			return errors.New("vmmd: OCI snapshot fan-out requires the local read-through cache")
+		}
+		replicaStore, ok := store.(state.SnapshotReplicaStore)
+		if !ok {
+			return errors.New("vmmd: OCI snapshot fan-out requires a snapshot replica store")
+		}
+		fanoutRegion := ""
+		if node, regionErr := store.ComputeNodeByID(ctx, nodeID); regionErr != nil {
+			log.Warn("vmmd: snapshot fan-out region lookup failed", "node_id", nodeID, "err", regionErr)
+		} else if node.Region != nil {
+			fanoutRegion = strings.TrimSpace(*node.Region)
+		}
+		fanoutMetrics, metricErr := snapshothipd.NewPrometheusMetrics(ops.Registry(), fanoutRegion)
+		if metricErr != nil {
+			return fmt.Errorf("vmmd: register snapshot fan-out metrics: %w", metricErr)
+		}
+		fanout := snapshothipd.New(replicaStore, storageBackend, nodeID, log).
+			WithMetrics(fanoutMetrics)
+		if raw := os.Getenv("FAAS_SNAPSHOT_FANOUT_INTERVAL"); raw != "" {
+			interval, parseErr := time.ParseDuration(raw)
+			if parseErr != nil || interval <= 0 {
+				return fmt.Errorf("FAAS_SNAPSHOT_FANOUT_INTERVAL=%q: must be a positive duration", raw)
+			}
+			fanout.WithInterval(interval)
+		}
+		go func() {
+			if runErr := fanout.Run(ctx); runErr != nil && ctx.Err() == nil {
+				log.Error("vmmd: snapshot fan-out stopped", "err", runErr)
+			}
+		}()
+		log.Info("vmmd: snapshot fan-out enabled", "node_id", nodeID, "interval", fanout.Interval())
 	}
 	// Issue #667 / ADR-078: single storeStamper adapter satisfies
 	// BOTH the FrameworkReadyStamper interface (PR #470-FU-B) and
@@ -998,6 +1041,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
 	}
+	// Issue #571 PR-A2: construct the /readyz probe (kvm +
+	// firecracker + gRPC). The gRPC bound signal flips to true
+	// here — deps.listen() succeeded, so the unix socket is
+	// bound and schedd can dial. BuildReadinessProbe also does
+	// a one-shot /dev/kvm open + firecracker LookPath; both
+	// succeed here or the daemon exits via the
+	// BuildReadinessProbe call's failure path (the probe is
+	// ready regardless).
+	vmmdProbe, grpcBound := BuildReadinessProbe()
+	// NOTE: grpcBound.MarkBound() is intentionally NOT called
+	// here — see cmd/vmmd/readiness.go BuildReadinessProbe for
+	// why. The flip must fire inside the serve goroutine, just
+	// before gsrv.Serve, so a panic during the ~90 lines of
+	// setup below cannot leave /readyz reporting ready while
+	// no gRPC server is actually running (PR #1091 review
+	// Finding 5).
 	// CPU cache: a per-instance rate + accumulator over cgroup
 	// usage_usec, fed by runCPUSampleLoop below and consumed by
 	// vmmdgrpc.Server.Stats. issue #279 / PR-B. nil-safe so
@@ -1057,6 +1116,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// directly without polluting the main /metrics scrape
 		// (which is the wire-side OpsMetrics registry).
 		mux.Handle(metricsPath+"/wake-phase", wpm.Handler())
+		// Issue #571 PR-A2: /healthz + /readyz on the metrics mux
+		// (operator-side, loopback-only) for the LB scrape and
+		// on-box monitoring. Source of truth is the same
+		// BuildReadinessProbe wired at the deps.listen site
+		// above — single source between /readyz body and the
+		// daemon_ready gauge (issue #586 / ADR-129).
+		wire.ControlMuxLite(mux, vmmdProbe.ReadyFunc(), vmmdProbe.ReasonFunc())
 		// ADR-122: apply the canonical metrics-listener shape —
 		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
 		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
@@ -1081,6 +1147,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("grpc listening", "addr", listenTarget, "service", vmmdpb.Vmmd_ServiceDesc.ServiceName)
+		// Flip the gRPC bound signal immediately before
+		// gsrv.Serve so /readyz reflects "the gRPC server is
+		// actually running" — not merely "the unix socket is
+		// bound" (PR #1091 review Finding 5).
+		grpcBound.MarkBound()
 		serveErr <- gsrv.Serve(lis)
 	}()
 

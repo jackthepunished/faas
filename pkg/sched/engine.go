@@ -136,7 +136,18 @@ type Engine struct {
 	notif  Notifier
 	fcVer  string // running Firecracker version — snapshots load only on a match (ADR-005)
 	log    *slog.Logger
-	ops    *wire.OpsMetrics // nil is tolerated by KillStuck (skip the counter increment)
+	// ops is the per-daemon Prometheus registry (issue #1059 /
+	// ADR-127). e.ops.WakeFailure is the schedd-side emitter for
+	// the wake-failure observability surface (cluster A commit 3
+	// of the platform-observability mega-PR) — schedd emits
+	// schedd_wake_failure_total{box, app, reason} from the
+	// audit-reason strings on the vmm_boot_failed (engine.go:2123)
+	// and record_runtime_failed (:2194) error branches. The
+	// closed reason union lives at pkg/wire/metrics.go. ops is
+	// nil-safe — nil is tolerated by KillStuck (skip the
+	// counter increment) and by WakeFailure (nil receiver returns
+	// nil, see pkg/wire/metrics.go).
+	ops *wire.OpsMetrics
 
 	// wakeLimiter is the per-app + per-account admission-rate
 	// throttle (ADR-099 PR-0 / ADR-080 Risk #1). nil is a no-op —
@@ -807,6 +818,63 @@ func (e *Engine) WithOwnerNodeID(nodeID string) *Engine {
 // emits the instances.parked_liveness_exhausted audit row. nil
 // is safe — the window check is skipped. Production cmd/schedd
 // wires sched.NewLivenessWindow(window, maxN) at construction.
+
+// createInstanceWithWakeRetry is the cluster-coord Layer 2 helper
+// (multi-host safety cluster PR-5 / audit F4). Wraps
+// store.CreateInstance; on a SQLSTATE 23505 (the partial unique
+// index instances_wake_attempt_active_idx rejected the INSERT
+// because another schedd already created an in-flight row with
+// the same wake_id) it returns state.ErrWakeAlreadyInflight.
+//
+// The helper deliberately does NOT return the winner's row. The
+// engine's downstream path (ledger.Admit, vmm.CreateColdBoot,
+// SetInstanceRuntime, store.DeleteInstance, transitionWithKind,
+// emitInstanceChanged) is keyed by (ins.ID, placement.NodeID) —
+// if we returned the remote winner's row, this schedd would boot
+// a LOCAL microVM tagged with a REMOTE instance UUID, double-
+// billing the customer, double-allocating per-app concurrency
+// slots, and (in single-box degenerate case) colliding on
+// cgroup / jail uid / netns per spec §6.2-5. The partial unique
+// index IS the cluster-coord primitive: one inserter wins, all
+// others exit cleanly with a typed sentinel that the upstream
+// surfaces through the existing error funnel.
+//
+// Retry policy: a single attempt. The partial unique index is
+// binary (succeeds, or 23505) — once tripped, the winner's row
+// is already in the table in WAKING / COLD_BOOTING; retries
+// against the same wake_id always 23505 and never win. The
+// jittered retry loop previously lifted into this helper was
+// removed because (a) the binary guarantee above makes retries
+// useless, and (b) the previous "winner-recovery" branch read
+// the winner's row and returned it as if this schedd had minted
+// it — that turned the helper into a dangerous lie (the layered
+// downstream was never designed to be safe with a foreign row).
+//
+// Caller propagation: the three call sites (engine.go:1460 floor
+// admit, :1764 wake dispatch, :3750 prime) wrap the sentinel
+// with their own context and surface it as a typed error; the
+// gateway-side retry / cron-side reschedule / redeploy handles
+// the "another box handled it" follow-up. Callers that want to
+// observe the winner's progress can call
+// state.PgStore.ReadActiveInstanceForWakeID directly — the
+// primitive remains exported for that purpose.
+func (e *Engine) createInstanceWithWakeRetry(ctx context.Context, appID, deploymentID, initState string, ramMB int, nodeID, wakeID string) (state.Instance, error) {
+	ins, err := e.store.CreateInstance(ctx, appID, deploymentID, initState, ramMB, nodeID, wakeID)
+	if err == nil {
+		return ins, nil
+	}
+	if errors.Is(err, state.ErrConcurrentWake) {
+		// Loser path: another schedd (or this schedd's wakeCoord
+		// released the slot to a peer race that landed just before
+		// us) won the INSERT. Surfacing ErrWakeAlreadyInflight
+		// unwinds the layered downstream — no ledger reservation,
+		// no vmmd.CreateColdBoot, no row mutation — so the local
+		// box cannot boot a microVM tagged with the remote winner's
+		// instance UUID.
+		return state.Instance{}, state.ErrWakeAlreadyInflight
+	}
+	return state.Instance{}, err
+}
 func (e *Engine) WithLivenessWindow(w *LivenessWindow) *Engine {
 	if e == nil {
 		return e
@@ -1162,6 +1230,33 @@ func (e *Engine) EnsureWake(ctx context.Context, appID, trigger string) (CoordOu
 	if e == nil || e.wakeCoord == nil {
 		return CoordOutcome{}, fmt.Errorf("sched: EnsureWake: engine not fully constructed")
 	}
+	// Multi-host safety cluster PR-5 / audit F4 (Layer 1 — owner gate):
+	// refuse the wake if the app is owned by another schedd in the
+	// fleet. This is the SAME check that lives in
+	// choosePlacementLocked (engine.go:~2483), lifted earlier in the
+	// pipeline so a foreign-owned app fails-fast at entry rather than
+	// consuming a slot in the wakeCoord queue. The two layers (queue
+	// refusal here + placement refusal in choosePlacementLocked) are
+	// deliberately redundant — choosePlacementLocked still gates the
+	// chooser so a stale app.NodeID can't slip through via a direct
+	// choosePlacement call that bypasses EnsureWake.
+	//
+	// Empty ownerNodeID preserves the single-box dev path (the
+	// synthetic default-local row has no NodeID constraint). Empty
+	// app.NodeID is the legacy non-shared case (an app never pinned
+	// to a node); the engine's chooser places it on the local box.
+	if e.ownerNodeID != "" {
+		app, err := e.store.AppByID(ctx, appID)
+		if err != nil && !errors.Is(err, state.ErrNotFound) {
+			return CoordOutcome{}, fmt.Errorf("sched: EnsureWake: load app %q: %w", appID, err)
+		}
+		if err == nil && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+			return CoordOutcome{}, fmt.Errorf(
+				"sched: EnsureWake: app %q owned by node %q, this schedd owns %q — refusing (run on the owning box)",
+				appID, app.NodeID, e.ownerNodeID,
+			)
+		}
+	}
 	call, isLeader, err := e.wakeCoord.Enter(appID)
 	if err != nil {
 		return CoordOutcome{}, err
@@ -1375,7 +1470,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	}
 	wakeID := wakeUUID.String()
 
-	ins, err := e.store.CreateInstance(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID)
+	ins, err := e.createInstanceWithWakeRetry(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID)
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
@@ -1624,6 +1719,26 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
 	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	var snapshotNodes []string
+	if haveSnap {
+		if replicas, ok := e.store.(state.SnapshotReplicaStore); ok {
+			var replicaErr error
+			snapshotNodes, replicaErr = replicas.ReadySnapshotReplicaNodes(ctx, snap.ID)
+			if replicaErr != nil {
+				// Snapshot replicas are an optimization. A schema rollout,
+				// transient DB error, or an older test store must never turn a
+				// valid shared snapshot into a failed wake.
+				e.log.Debug("snapshot replica lookup failed; using normal placement", "snapshot_id", snap.ID, "err", replicaErr)
+				snapshotNodes = nil
+			}
+		}
+	}
+	// Do not let a stale WarmAffinity hint defeat a known-ready replica.
+	// When the warm hint itself is ready, retain its stronger sticky bias;
+	// otherwise let ChoosePlacement rank the ready replica set.
+	if len(snapshotNodes) > 0 && !containsNodeID(snapshotNodes, warmHint) {
+		warmHint = ""
+	}
 	// ADR-098 PR-D: connection-aware placement bias. Score is
 	// the synchronous read (per ADR §D2 — schedd does NOT
 	// LISTEN on data_upstreams_changed). On cache miss, Refresh
@@ -1651,8 +1766,9 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		PreferredNodeID: warmHint,
-		PreferredRegion: preferredRegion,
+		PreferredNodeID:  warmHint,
+		PreferredNodeIDs: snapshotNodes,
+		PreferredRegion:  preferredRegion,
 	})
 	if err != nil {
 		release()
@@ -1679,7 +1795,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 			WrittenAt: time.Now(),
 		})
 	}
-	ins, err := e.store.CreateInstance(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID)
+	ins, err := e.createInstanceWithWakeRetry(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID)
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: create instance: %w", err)
@@ -2124,6 +2240,23 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 				FailedAt:   time.Now().UTC(),
 			})
 		}
+		// issue #1059 / ADR-127 §3.6 — schedd-side parity
+		// (cluster A commit 3 of the platform-observability
+		// mega-PR). The schedd emits schedd_wake_failure_total
+		// with reason="vmm_boot_failed" alongside the events
+		// emit above. The reason literal is from the closed
+		// wakeFailureReasons union (pkg/wire/metrics.go) — the
+		// schedd-side audit-reason vocabulary joins the
+		// vmmd-side classifier vocabulary so a single dashboard
+		// legend covers both. bootInput.appID is the actual app
+		// slug — schedd has the app identifier in scope here
+		// (the audit-reason emit also references it). e.ops is
+		// nil-safe per the field doc comment at engine.go:139 —
+		// the guard skips the metric increment in unit tests
+		// that don't wire an OpsMetrics.
+		if e.ops != nil {
+			e.ops.WakeFailure("", bootInput.appID, "vmm_boot_failed").Inc()
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "vmm_boot_failed")
 		return WakeResult{}, err
 	}
@@ -2194,6 +2327,17 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 				Reason:     "record_runtime_failed",
 				FailedAt:   time.Now().UTC(),
 			})
+		}
+		// issue #1059 / ADR-127 §3.6 — schedd-side parity
+		// (cluster A commit 3). Same WakeFailure increment as
+		// the vmm_boot_failed branch above; only the reason
+		// literal changes (post-boot SetInstanceRuntime DB write
+		// failed instead of pre-boot vmm.* RPC failed). e.ops
+		// is nil-safe per the field doc comment at
+		// engine.go:139 — the guard skips the metric increment
+		// in unit tests that don't wire an OpsMetrics.
+		if e.ops != nil {
+			e.ops.WakeFailure("", bootInput.appID, "record_runtime_failed").Inc()
 		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)
@@ -3684,7 +3828,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 			"app", appID, "err", err)
 	}
 	primeWakeID := primeWakeUUID.String()
-	ins, err := e.store.CreateInstance(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, primeWakeID)
+	ins, err := e.createInstanceWithWakeRetry(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, primeWakeID)
 	if err != nil {
 		return fmt.Errorf("sched: prime: create instance: %w", err)
 	}
@@ -4276,7 +4420,7 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// success path so imaged writes both rows. The engine does NOT
 	// write the warm row directly to avoid a unique-violation on
 	// (deployment_id, tier) between engine and imaged.
-	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b, state.SnapshotTierInit)
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, ins.NodeID, vmstate, b, state.SnapshotTierInit)
 	return nil
 }
 
@@ -4415,7 +4559,7 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 	// store.CreateSnapshot tier=warm here to avoid a unique-
 	// violation on (deployment_id, tier) with imaged's row.
 	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
-	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, ins.NodeID, vmstatePath, b, state.SnapshotTierWarm)
 	// Issue #470 / PR C / ADR-074: emit app.warm_snapshot_promoted
 	// so operators can grep gregale audit-events --kind-prefix
 	// warm_snapshot to see lifecycle activity. Subject is
@@ -5135,7 +5279,202 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 			}
 		}
 	}
+	// Issue #586 / ADR-129 / cluster C commit 12: persist the
+	// lifetime restart counter on the deployments row so a
+	// schedd restart doesn't reset the signal. Best-effort: the
+	// in-memory LivenessWindow is the runtime decision authority;
+	// a column bump miss just means the persistent source-of-truth
+	// lags by one restart (the next bump catches up). Mirrors the
+	// AuditWriteFail warning posture above — log + continue.
+	if err := e.store.RecordRestart(ctx, deploymentID); err != nil {
+		e.log.Warn("liveness: persist restart count failed", "deployment", deploymentID, "err", err)
+	}
 	return nil
+}
+
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) marks a deployment's latest warm + init snapshots
+// stale so the next customer Wake cold-boots from rootfs per
+// ADR-005 ("snapshot of a wedged VM is a wedged VM"). This is the
+// recovery primitive for the case where the live instance is fine
+// (or already parked by the operator) but the snapshot backing
+// the warm tier is suspected to be the carrier of the customer-
+// reported wedge. Unlike DestroyForLivenessFailure, this method
+// does NOT touch the instance state machine, does NOT acquire
+// lockApp (no transition is happening), and does NOT destroy a
+// VM — it's a snapshot-policy flip only.
+//
+// Returns the snap IDs that were marked stale, in (warm, init)
+// order. Empty list when the deployment has no snapshots in
+// either tier (durable no-op — the operator audit row still
+// records the call so a future operator can see the action was
+// taken).
+//
+// Idempotent: MarkSnapshotStale is itself idempotent (stale=
+// true on an already-stale row is a no-op). state.ErrNotFound
+// when the deployment_id has no row in apps.deployments; the
+// caller (gRPC layer) maps that to codes.NotFound.
+//
+// Best-effort: a MarkSnapshotStale failure on one tier does not
+// stop the other tier from being marked stale. The first error
+// is logged + dropped — the audit row + the wire response are
+// the durable record of what was attempted.
+func (e *Engine) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+	deployment, err := e.store.DeploymentByID(ctx, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	var snapIDs []string
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deployment.ID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if merr := e.store.MarkSnapshotStale(ctx, snap.ID); merr != nil {
+			e.log.Warn("force_cold_boot: mark snapshot stale failed",
+				"deployment_id", deploymentID,
+				"snap_id", snap.ID,
+				"tier", tier,
+				"err", merr.Error())
+			continue
+		}
+		snapIDs = append(snapIDs, snap.ID)
+	}
+	return snapIDs, nil
+}
+
+// ForceRestart (P2d of the operator-side observability follow-up mega-PR)
+// is the operator-initiated kill-instance + cold-boot-on-next-wake
+// primitive. Routes through operator_intents (kind = 'force_restart',
+// schema CHECK widened by migrations/00446); the schedd subscriber
+// (operator_intent_subscriber.go) dispatches here.
+//
+// Distinction from siblings:
+//   - Engine.Park (force-park primitive) → idempotent stop, no
+//     snapshot flip.
+//   - Engine.ForceColdBootNextWake (force-cold-boot primitive) →
+//     snapshot-policy flip only, no instance destroy.
+//   - Engine.DestroyForLivenessFailure (vmmd retry-loop drain) →
+//     destroy-side, swallows errors.
+//   - Engine.ForceRestart (here) → destroy-side AND snapshot flip,
+//     surfaces errors. The third primitive in the
+//     `operator_intents.kind` closed set.
+//
+// Locking: acquires e.lockApp(app_id) — same lock the watchdog +
+// Park paths take. A customer-driven Park racing this call observes
+// a consistent state under the lock; the locked re-read flips the
+// state-gate result.
+//
+// State-machine: RUNNING → STOPPED via transitionWithKind (the
+// §6.2 invariant; CanTransition inside transitionWithKind validates
+// the edge). The kind discriminator is "force_restart" — distinct
+// from DestroyForLivenessFailure's "liveness_failed" so audit-log
+// readers can separate operator actions from watchdog kills.
+//
+// Returns the snap IDs marked stale so the schedd subscriber can
+// populate operator_intents.snap_ids_marked_stale (visible via
+// GET /v1/admin/operator-intents/{id}). Returns state.ErrInstanceNotRunning
+// when the locked re-read observes a non-RUNNING state — the
+// race-loser posture documented on the sentinel.
+func (e *Engine) ForceRestart(ctx context.Context, instanceID, reason string) ([]string, error) {
+	// Initial read for app_id + deployment_id.
+	fresh, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("sched: force_restart: initial read instance %s: %w", instanceID, err)
+	}
+	appID := fresh.AppID
+	deploymentID := fresh.DeploymentID
+
+	// Acquire the app lock so a parallel Wake / Park / prior
+	// watchdog for the same app observes a consistent state.
+	release := e.lockApp(appID)
+	defer release()
+
+	// Re-read under the lock for state-machine validation. If
+	// the row vanished between the two reads (Park by the
+	// customer, retention sweep), surface the read error so the
+	// operator sees the truth — same posture as
+	// DestroyForWorkloadOOMFailure's review-finding-#4 fix at
+	// engine.go:5280-5293.
+	freshLocked, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		return nil, fmt.Errorf("sched: force_restart: locked read instance %s: %w", instanceID, err)
+	}
+	if state.State(freshLocked.State) != state.StateRunning {
+		// Race: a customer-driven Park / Destroy (or a prior
+		// force-restart) won the lock. The desired end-state
+		// (instance no longer running) is achieved. The
+		// caller (schedd subscriber) stamps the operator_intent
+		// row failed with state.ErrInstanceNotRunning so the
+		// audit trail records the admin click was an
+		// idempotent no-op. Mirror KillStuck's reservation
+		// release posture for safety.
+		e.ledger.Release(instanceID)
+		return nil, state.ErrInstanceNotRunning
+	}
+
+	// Eagerly mark the deployment's latest snapshot stale so
+	// the next Wake cold-boots. ADR-005 invariant — an
+	// operator-initiated kill is also implicitly a
+	// kill-the-snapshot so a wedged snap is never restored.
+	// Both warm + init tiers (parallel to ForceColdBootNextWake
+	// at engine.go:5217).
+	var snapIDs []string
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deploymentID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if merr := e.store.MarkSnapshotStale(ctx, snap.ID); merr != nil {
+			e.log.Warn("force_restart: mark snapshot stale",
+				"instance", instanceID,
+				"snap_id", snap.ID,
+				"tier", tier,
+				"err", merr.Error())
+			continue
+		}
+		snapIDs = append(snapIDs, snap.ID)
+	}
+
+	// Reset the idle timer on the destroyed instance so the
+	// replacement cold-boot instance's idle budget starts fresh
+	// (issue #554 §implementation notes — same precedent as
+	// DestroyForLivenessFailure + DestroyForWorkloadOOMFailure).
+	now := time.Now().UTC()
+	if _, terr := e.store.TouchInstancesLastSeen(ctx, []state.InstanceTouch{
+		{InstanceID: instanceID, LastRequest: now},
+	}); terr != nil {
+		e.log.Warn("force_restart: touch instances last seen", "instance", instanceID, "err", terr)
+	}
+
+	// Free the ledger reservation BEFORE the destroy so a
+	// parallel Wake for the same app can admit a new instance
+	// immediately. Mirrors the liveness + workload-OOM ordering.
+	e.ledger.Release(instanceID)
+
+	// Surface the destroy error — operator-initiated, not
+	// retry-loop (same rationale as the read-error surfaces
+	// above). The snap-stale work above is durable; the destroy
+	// is the operator-visible status. If the destroy fails the
+	// operator sees (snapIDs, err) on the wire and via the
+	// terminal operator_intent row.
+	if err := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second); err != nil {
+		return snapIDs, fmt.Errorf("sched: force_restart: destroy instance %s: %w", instanceID, err)
+	}
+
+	// RUNNING → STOPPED with kind "force_restart". The operator's
+	// reason lands in the events row's data JSON. transitionWithKind
+	// does the CanTransition guard internally (engine.go:5569+).
+	// Counter emission: deliberately omitted. LivenessRestarts +
+	// WorkloadOOMKills are the workload-initiated labels.
+	// Operator actions are tracked separately by the operator_intent
+	// rows + the terminal operator.action.<verb>.outcome audit
+	// rows; adding a third ops counter would create a fourth
+	// source of truth for the same volume.
+	e.transitionWithKind(ctx, instanceID, appID, state.StateStopped, "force_restart", reason)
+
+	return snapIDs, nil
 }
 
 // DestroyForWorkloadOOMFailure (Cluster C / ADR-121) is the
@@ -5547,7 +5886,7 @@ func (e *Engine) emitInstanceChanged(ctx context.Context, instanceID, appID stri
 // tier="warm" when the engine captured a warm snapshot and tier="init"
 // for the legacy cold capture. imaged's subscriber reads the field
 // from the JSON and writes the matching snapshots.tier column.
-func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstatePath string, b SnapshotBytes, tier string) {
+func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, nodeID, vmstatePath string, b SnapshotBytes, tier string) {
 	if e.notif == nil {
 		return
 	}
@@ -5556,6 +5895,7 @@ func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstateP
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"deployment_id": deploymentID,
+		"node_id":       nodeID,
 		"vmstate_path":  vmstatePath,
 		"storage_key":   state.SnapMemKey(deploymentID),
 		"mem_bytes":     b.MemBytes,

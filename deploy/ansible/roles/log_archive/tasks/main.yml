@@ -53,15 +53,13 @@
 # root is a no-op on a converged box; the asserts are read-only.
 # Re-running produces zero `changed`.
 
-# Fail-closed assert: the archive creds envelope MUST be 0440
-# root:faas. Both the apid shipper and gatewayd-internal's
-# read-back handler read it via systemd's LoadCredential= staging
-# dir (the `$CREDENTIALS_DIRECTORY` the unit exposes at boot).
-# The faas group membership is what lets both daemons — which
-# run as User=faas / Group=faas — traverse the credential
-# without root. Mirrors the postgres_backup role's perms
-# assert at deploy/ansible/roles/postgres_backup/tasks/main.yml
-# :198-225 (same shape, different owner/group pair).
+# Fail-closed assert: the archive creds envelope MUST be 0400
+# root:root. Both the apid shipper and gatewayd-internal's
+# read-back handler receive it through systemd's
+# LoadCredential= staging directory. The source file is therefore
+# never read directly by the unprivileged daemon, and keeping it
+# root-only avoids widening the archive credential to every member
+# of the shared faas group.
 - name: log_archive — stat archive creds envelope
   ansible.builtin.stat:
     path: /etc/faas/secrets/storage-box/archive-creds.json
@@ -78,16 +76,16 @@
   ansible.builtin.assert:
     that:
       - log_archive_creds_stat.stat.exists
-      - log_archive_creds_stat.stat.mode == "0440"
+      - log_archive_creds_stat.stat.mode == "0400"
       - log_archive_creds_stat.stat.pw_name == "root"
-      - log_archive_creds_stat.stat.gr_name == "faas"
+      - log_archive_creds_stat.stat.gr_name == "root"
     fail_msg: >-
       /etc/faas/secrets/storage-box/archive-creds.json must be
-      0440 root:faas (issue #562). Re-run `gregalectl backup
+      0400 root:root (issue #562). Re-run `gregalectl backup
       unseal-archive-creds` (PR-A CLI leaf) to repopulate from
       the host.age-sealed form. The faas group membership lets
-      both apid and gatewayd-internal read the envelope via
-      systemd LoadCredential= without root.
+      both apid and gatewayd-internal receive the envelope via
+      systemd LoadCredential= without direct filesystem access.
   when: log_archive_creds_stat.stat.exists
 
 # Spec §11: /var/log/faas/archive is the spool root the apid

@@ -42,7 +42,7 @@ import (
 // createDomain's 202 choice (the legacy custom_domains path
 // returns 202 for the same reason).
 func (s *server) createTenantSurface(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}
@@ -205,7 +205,7 @@ func hostnameCreateProblem(err error, plan api.Plan, surfaceID string) *api.Prob
 // is bounded by TenantSurfacesPerAccount (25 today) so we render
 // the whole list with no cursor — mirrors listCrons / listDomains.
 func (s *server) listTenantSurfaces(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}
@@ -242,7 +242,7 @@ func (s *server) listTenantSurfaces(w http.ResponseWriter, r *http.Request, acct
 // for active surfaces; the cert history / audit trail stay
 // in the DB but the API hides them.
 func (s *server) getTenantSurface(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}
@@ -272,7 +272,7 @@ func (s *server) getTenantSurface(w http.ResponseWriter, r *http.Request, acct s
 // so gatewayd drops any in-flight cert work. Soft-deleted
 // surfaces are NOT re-deletable (404 — same as missing).
 func (s *server) deleteTenantSurface(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}
@@ -328,7 +328,7 @@ func (s *server) deleteTenantSurface(w http.ResponseWriter, r *http.Request, acc
 // reserves CodeTenantHostnameAlreadyClaimed for exactly this
 // case).
 func (s *server) addTenantHostname(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}
@@ -383,7 +383,7 @@ func (s *server) addTenantHostname(w http.ResponseWriter, r *http.Request, acct 
 // surface_id back), confirms AccountID, then deletes. The path
 // param is lowercased server-side to match the citext storage.
 func (s *server) removeTenantHostname(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !api.TenantSurfacesEnabled() {
+	if !s.runtimeBool(runtimeConfigTenantSurfaces, api.TenantSurfacesEnabled()) {
 		api.WriteProblem(w, api.ErrTenantSurfacesNotAllowed(acct.Plan))
 		return
 	}

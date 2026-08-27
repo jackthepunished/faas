@@ -44,6 +44,23 @@ import (
 	"time"
 )
 
+// readyState is the atomic unit of ReadySignal — bundling the
+// ready bit and the reason string into a single immutable struct
+// so Set and Report see a consistent snapshot. Reading the
+// signal returns a single Load; writing is a single Store of a
+// fresh struct. PR #1091 review Finding 8 lifts the atomic.Pointer
+// refactor (originally Finding 6 in pkg/wire) into pkg/gateway
+// so the two readiness.go files stay in lockstep. The previous
+// shape stored ready in atomic.Bool and reason under a
+// sync.RWMutex, so a Report() that landed between
+// s.ready.Load() (true) and s.lastReason() ("stale") could
+// return (true, "stale") — a stale reason paired with a fresh
+// ready bit. The inverse — (false, "") — was also possible.
+type readyState struct {
+	ready  bool
+	reason string
+}
+
 // ReadySignal is one component's "I'm ready" bit. Operators add
 // signals with ReadyzProbe.Register; the /readyz handler flips to
 // 503 when ANY registered signal reports false. Signals are
@@ -51,33 +68,57 @@ import (
 // logic. If two signals report the same fact, the second one is
 // authoritative (it overwrites the first).
 //
-// Every method is safe for concurrent use.
+// Every method is safe for concurrent use. Set and Report
+// publish and observe a single atomic.Pointer to an immutable
+// readyState — so the (ready, reason) pair is always observed as
+// a consistent snapshot.
 type ReadySignal struct {
-	mu     sync.RWMutex
-	ready  atomic.Bool // primary flag — read on the /readyz hot path
-	reason string      // last reason string for the /readyz body
+	state atomic.Pointer[readyState]
+}
+
+// newReadySignal constructs a ReadySignal pre-set to (ready,
+// reason). Used by Register, NewStalenessSignal, NewPGPingSignal
+// and any caller that wants an initial state without an extra
+// atomic hop. Allocates the initial readyState up front so the
+// zero-value ReadySignal can be safely reported before its first
+// Set call (Report() falls through to the zero-value state).
+func newReadySignal(ready bool, reason string) *ReadySignal {
+	s := &ReadySignal{}
+	s.state.Store(&readyState{ready: ready, reason: reason})
+	return s
+}
+
+// NewReadySignalForTest exports newReadySignal under an
+// underscore-friendly name so the test binary can construct a
+// ReadySignal with a known initial state without exposing the
+// lower-case constructor in the public API.
+func NewReadySignalForTest(ready bool, reason string) *ReadySignal {
+	return newReadySignal(ready, reason)
 }
 
 // Set flips the signal's ready bit. reason is optional — pass ""
 // for "no human-readable reason needed". The /readyz handler
 // surfaces the most recent reason across all registered signals
-// when /readyz returns 503.
+// when /readyz returns 503. The (ready, reason) pair is published
+// as a single atomic.Pointer.Store so a concurrent Report() will
+// see either the old state or the new state — never a torn pair.
 func (s *ReadySignal) Set(ready bool, reason string) {
-	s.ready.Store(ready)
-	s.mu.Lock()
-	s.reason = reason
-	s.mu.Unlock()
+	s.state.Store(&readyState{ready: ready, reason: reason})
 }
 
-// Report returns the current bit and the most recent reason.
+// Report returns the current (ready, reason) snapshot. The pair
+// is read from a single atomic.Pointer.Load so a concurrent Set()
+// either fires fully before Report() reads or fully after — never
+// in the middle. A zero-value ReadySignal (never Set) reports
+// (false, ""), which is the conservative "not yet ready" answer.
 func (s *ReadySignal) Report() (ready bool, reason string) {
-	return s.ready.Load(), s.lastReason()
-}
-
-func (s *ReadySignal) lastReason() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.reason
+	st := s.state.Load()
+	if st == nil {
+		// Zero-value ReadySignal — never Set. Treat as the
+		// pre-Set "not yet ready" state.
+		return false, ""
+	}
+	return st.ready, st.reason
 }
 
 // ReadyzProbe is the fan-in point. Daemons Register one ReadySignal
@@ -103,9 +144,7 @@ type ReadyzProbe struct {
 // If a daemon wants the pre-split "always ready" behaviour during
 // boot, the caller calls Set(true, "") immediately after Register.
 func (p *ReadyzProbe) Register() *ReadySignal {
-	s := &ReadySignal{}
-	s.ready.Store(false) // explicit; atomic.Bool zero value is false
-	s.reason = "not yet ready"
+	s := newReadySignal(false, "not yet ready")
 	p.mu.Lock()
 	p.signals = append(p.signals, s)
 	p.mu.Unlock()
@@ -217,8 +256,7 @@ func joinReasons(reasons []string) string {
 // staleness; the touch path is the hot recovery path readers
 // (LB probes, ops dashboards) observe.
 func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(), stopper func()) {
-	s := &ReadySignal{}
-	s.ready.Store(false)
+	s := newReadySignal(false, "no touch yet")
 	var lastTouch atomic.Int64 // unix nanos; 0 = "never touched"
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -274,8 +312,12 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 		<-done
 		s.Set(false, "shutting down")
 	}
-	// Pre-arm the signal — the first touch flips it ready.
-	s.Set(true, "")
+	// No pre-arm. PR #1091 review Finding 8 lifts Finding 7
+	// (originally pkg/wire only) into pkg/gateway so the two
+	// readiness.go files stay in lockstep. The signal now
+	// starts at (false, "no touch yet") and the first tick is
+	// the canonical readiness flip. See pkg/wire/readiness.go
+	// for the full rationale.
 	return s, touchFn, stopperFn
 }
 
@@ -300,9 +342,7 @@ func NewPGPingSignal(ctx context.Context, pool pinger, every time.Duration) (*Re
 	if every <= 0 {
 		every = 5 * time.Second
 	}
-	s := &ReadySignal{}
-	s.ready.Store(false)
-	s.Set(false, "pg ping not yet attempted")
+	s := newReadySignal(false, "pg ping not yet attempted")
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {

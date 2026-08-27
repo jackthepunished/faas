@@ -20,6 +20,17 @@
 # path ships first; this stub is here so the wiring exists when
 # an operator wants it.
 
+- name: wireguard — require operator-vaulted key and peer set
+  ansible.builtin.assert:
+    that:
+      - faas_overlay_private_key | default('') | length > 0
+      - faas_overlay_private_key != 'PLACEHOLDER'
+      - faas_overlay_peers | default([]) | length > 0
+    fail_msg: >-
+      WireGuard requires faas_overlay_private_key and at least one
+      faas_overlay_peers entry from an operator-managed secret source.
+      Placeholder or empty mesh configuration is refused.
+
 - name: wireguard — install tools
   ansible.builtin.apt:
     name:
@@ -36,6 +47,7 @@
     owner: root
     group: root
     mode: "0600"
+  no_log: true
   notify:
     - restart faas-overlay
 

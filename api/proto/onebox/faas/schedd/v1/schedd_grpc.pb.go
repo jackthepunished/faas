@@ -28,17 +28,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Schedd_Wake_FullMethodName                 = "/onebox.faas.schedd.v1.Schedd/Wake"
-	Schedd_AdmitInstance_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
-	Schedd_ReportActivity_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
-	Schedd_ParkInstance_FullMethodName         = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
-	Schedd_ListInstanceStats_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
-	Schedd_StreamAppLogs_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
-	Schedd_StreamWarmHints_FullMethodName      = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
-	Schedd_ReportCapacity_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
-	Schedd_ReportLivenessFailed_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ReportLivenessFailed"
-	Schedd_EnsureWake_FullMethodName           = "/onebox.faas.schedd.v1.Schedd/EnsureWake"
-	Schedd_ReportWorkloadOOM_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportWorkloadOOM"
+	Schedd_Wake_FullMethodName                  = "/onebox.faas.schedd.v1.Schedd/Wake"
+	Schedd_AdmitInstance_FullMethodName         = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
+	Schedd_ReportActivity_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
+	Schedd_ParkInstance_FullMethodName          = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
+	Schedd_ForceColdBootNextWake_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ForceColdBootNextWake"
+	Schedd_ForceRestartInstance_FullMethodName  = "/onebox.faas.schedd.v1.Schedd/ForceRestartInstance"
+	Schedd_ListInstanceStats_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
+	Schedd_StreamAppLogs_FullMethodName         = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
+	Schedd_StreamWarmHints_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
+	Schedd_ReportCapacity_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
+	Schedd_ReportLivenessFailed_FullMethodName  = "/onebox.faas.schedd.v1.Schedd/ReportLivenessFailed"
+	Schedd_EnsureWake_FullMethodName            = "/onebox.faas.schedd.v1.Schedd/EnsureWake"
+	Schedd_ReportWorkloadOOM_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/ReportWorkloadOOM"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -90,6 +92,43 @@ type ScheddClient interface {
 	// exceeded_free" etc). Returns Ok on success; ResourceExhausted / NotFound
 	// for the obvious error paths.
 	ParkInstance(ctx context.Context, in *ParkInstanceRequest, opts ...grpc.CallOption) (*ParkInstanceResponse, error)
+	// ForceColdBootNextWake asks schedd to mark the deployment's
+	// latest warm + init snapshots stale so the next customer Wake
+	// cold-boots from rootfs per ADR-005. Operator-side recovery
+	// primitive (P2b of the operator-side observability mega-PR):
+	// when a wedged instance is reported and the snapshot is
+	// suspected to be the carrier, the on-call engineer forces a
+	// one-shot cold-boot instead of parking the live instance.
+	// Returns the snap IDs that were marked stale (empty when the
+	// deployment has no snapshots — durable no-op). NotFound when
+	// the deployment does not exist. Idempotent.
+	ForceColdBootNextWake(ctx context.Context, in *ForceColdBootNextWakeRequest, opts ...grpc.CallOption) (*ForceColdBootNextWakeResponse, error)
+	// ForceRestartInstance (P2d follow-on) is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive. Distinct from
+	// ForceColdBootNextWake (snapshot flip only, no destroy) and
+	// ParkInstance (park, no snapshot flip). Engine.ForceRestart:
+	//
+	//   - if the locked re-read observes a non-RUNNING state,
+	//     returns ok=false with error_msg="state: instance not in
+	//     running state" (race-loser posture; the customer-driven
+	//     action won the lock — desired end-state achieved, no
+	//     audit-row-repaint needed).
+	//   - on success, fires the destroy (RUNNING → STOPPED via
+	//     transitionWithKind with kind "force_restart"), flips
+	//     warm + init snapshots stale, and returns ok=true with the
+	//     snap IDs marked stale populated.
+	//
+	// Codes: NotFound when the instance_id doesn't exist; FailedPrecondition
+	// when the locked re-read observed a non-RUNNING state AND the
+	// error path is mapped to a gRPC status (the server returns
+	// ok=false on the wire rather than a status error so the
+	// gregalectl CLI can render the cause verbatim). Internal on
+	// unexpected errors (destroy failure surfaces as ok=true +
+	// snap_ids_marked_stale populated + error_msg populated so
+	// the operator learns the partial-success shape).
+	//
+	// Additive per ADR-016.
+	ForceRestartInstance(ctx context.Context, in *ForceRestartInstanceRequest, opts ...grpc.CallOption) (*ForceRestartInstanceResponse, error)
 	// ListInstanceStats returns the per-instance CPU-µs snapshot the
 	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
 	// meterdsamp the per-minute CPU delta from this snapshot and
@@ -333,6 +372,26 @@ func (c *scheddClient) ParkInstance(ctx context.Context, in *ParkInstanceRequest
 	return out, nil
 }
 
+func (c *scheddClient) ForceColdBootNextWake(ctx context.Context, in *ForceColdBootNextWakeRequest, opts ...grpc.CallOption) (*ForceColdBootNextWakeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceColdBootNextWakeResponse)
+	err := c.cc.Invoke(ctx, Schedd_ForceColdBootNextWake_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *scheddClient) ForceRestartInstance(ctx context.Context, in *ForceRestartInstanceRequest, opts ...grpc.CallOption) (*ForceRestartInstanceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceRestartInstanceResponse)
+	err := c.cc.Invoke(ctx, Schedd_ForceRestartInstance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *scheddClient) ListInstanceStats(ctx context.Context, in *ListInstanceStatsRequest, opts ...grpc.CallOption) (*ListInstanceStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListInstanceStatsResponse)
@@ -473,6 +532,43 @@ type ScheddServer interface {
 	// exceeded_free" etc). Returns Ok on success; ResourceExhausted / NotFound
 	// for the obvious error paths.
 	ParkInstance(context.Context, *ParkInstanceRequest) (*ParkInstanceResponse, error)
+	// ForceColdBootNextWake asks schedd to mark the deployment's
+	// latest warm + init snapshots stale so the next customer Wake
+	// cold-boots from rootfs per ADR-005. Operator-side recovery
+	// primitive (P2b of the operator-side observability mega-PR):
+	// when a wedged instance is reported and the snapshot is
+	// suspected to be the carrier, the on-call engineer forces a
+	// one-shot cold-boot instead of parking the live instance.
+	// Returns the snap IDs that were marked stale (empty when the
+	// deployment has no snapshots — durable no-op). NotFound when
+	// the deployment does not exist. Idempotent.
+	ForceColdBootNextWake(context.Context, *ForceColdBootNextWakeRequest) (*ForceColdBootNextWakeResponse, error)
+	// ForceRestartInstance (P2d follow-on) is the operator-initiated
+	// kill-instance + cold-boot-on-next-wake primitive. Distinct from
+	// ForceColdBootNextWake (snapshot flip only, no destroy) and
+	// ParkInstance (park, no snapshot flip). Engine.ForceRestart:
+	//
+	//   - if the locked re-read observes a non-RUNNING state,
+	//     returns ok=false with error_msg="state: instance not in
+	//     running state" (race-loser posture; the customer-driven
+	//     action won the lock — desired end-state achieved, no
+	//     audit-row-repaint needed).
+	//   - on success, fires the destroy (RUNNING → STOPPED via
+	//     transitionWithKind with kind "force_restart"), flips
+	//     warm + init snapshots stale, and returns ok=true with the
+	//     snap IDs marked stale populated.
+	//
+	// Codes: NotFound when the instance_id doesn't exist; FailedPrecondition
+	// when the locked re-read observed a non-RUNNING state AND the
+	// error path is mapped to a gRPC status (the server returns
+	// ok=false on the wire rather than a status error so the
+	// gregalectl CLI can render the cause verbatim). Internal on
+	// unexpected errors (destroy failure surfaces as ok=true +
+	// snap_ids_marked_stale populated + error_msg populated so
+	// the operator learns the partial-success shape).
+	//
+	// Additive per ADR-016.
+	ForceRestartInstance(context.Context, *ForceRestartInstanceRequest) (*ForceRestartInstanceResponse, error)
 	// ListInstanceStats returns the per-instance CPU-µs snapshot the
 	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
 	// meterdsamp the per-minute CPU delta from this snapshot and
@@ -688,6 +784,12 @@ func (UnimplementedScheddServer) ReportActivity(context.Context, *ReportActivity
 func (UnimplementedScheddServer) ParkInstance(context.Context, *ParkInstanceRequest) (*ParkInstanceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ParkInstance not implemented")
 }
+func (UnimplementedScheddServer) ForceColdBootNextWake(context.Context, *ForceColdBootNextWakeRequest) (*ForceColdBootNextWakeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForceColdBootNextWake not implemented")
+}
+func (UnimplementedScheddServer) ForceRestartInstance(context.Context, *ForceRestartInstanceRequest) (*ForceRestartInstanceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForceRestartInstance not implemented")
+}
 func (UnimplementedScheddServer) ListInstanceStats(context.Context, *ListInstanceStatsRequest) (*ListInstanceStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListInstanceStats not implemented")
 }
@@ -798,6 +900,42 @@ func _Schedd_ParkInstance_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ScheddServer).ParkInstance(ctx, req.(*ParkInstanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Schedd_ForceColdBootNextWake_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceColdBootNextWakeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ForceColdBootNextWake(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ForceColdBootNextWake_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ForceColdBootNextWake(ctx, req.(*ForceColdBootNextWakeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Schedd_ForceRestartInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceRestartInstanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ForceRestartInstance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ForceRestartInstance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ForceRestartInstance(ctx, req.(*ForceRestartInstanceRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -925,6 +1063,14 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ParkInstance",
 			Handler:    _Schedd_ParkInstance_Handler,
+		},
+		{
+			MethodName: "ForceColdBootNextWake",
+			Handler:    _Schedd_ForceColdBootNextWake_Handler,
+		},
+		{
+			MethodName: "ForceRestartInstance",
+			Handler:    _Schedd_ForceRestartInstance_Handler,
 		},
 		{
 			MethodName: "ListInstanceStats",

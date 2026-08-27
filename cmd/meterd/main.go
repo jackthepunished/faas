@@ -562,7 +562,7 @@ func defaultDeps() runDeps {
 	return runDeps{
 		configPath: "/etc/faas/meterd.toml",
 		openDB:     db.Open,
-		migrate:    db.MigrateUp,
+		migrate:    db.MigrateUp, // F2 / ADR-124: acquires pg_advisory_lock; safe for fleet bootstrap
 		loadMeter:  func(c *Config) (*meter.Config, error) { return c.Meter, nil },
 		getenv:     os.Getenv,
 		dialSchedd: func(ctx context.Context, target string, tlsCfg *tls.Config) (parkInstanceParker, error) {
@@ -778,6 +778,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// flag is on. A bad parse logs and falls through to mc.Defaults().
 	applyEnvTick("FAAS_UPSTREAM_PROBE_INTERVAL", &mc.UpstreamProbeInterval, deps.getenv, log)
 	applyEnvTick("FAAS_UPSTREAM_PROBE_PARTITION_INTERVAL", &mc.UpstreamPartitionCreateInterval, deps.getenv, log)
+	// ADR-123: cert-expiry refresher + MTD spend aggregator
+	// cadences. Defaults live in cmd/meterd/alert_presets_ticks.go
+	// so the loops and the env-tick parser share the same source
+	// of truth.
+	applyEnvTick("FAAS_CERT_EXPIRY_REFRESHER_INTERVAL", &mc.CertExpiryRefresherInterval, deps.getenv, log)
+	applyEnvTick("FAAS_ACCOUNT_SPEND_AGGREGATOR_INTERVAL", &mc.AccountSpendAggregatorInterval, deps.getenv, log)
 
 	// Dunning timer: drives the 7-day past_due → suspended and 21-day
 	// suspended → deleted_pending transitions (spec §4.7, §17). Wired
@@ -795,6 +801,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// so the Loop has it from the first tick. meter.NewLoop accepts nil
 	// and coerces to a fresh test registry; here we hand it the real one.
 	ops := wire.NewOpsMetrics("meterd")
+	wire.BootStamps(ctx, "meterd", ops)
+	wire.RegisterDefaultOps(ops)
 
 	// Residency timer: emits the §12 "Resident GB per paying customer"
 	// gauge (ADR-031, PR #141). Wired into the loop alongside
@@ -934,6 +942,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// of rows between ticks.
 	go meter.RetentionLoopRequestTelemetry(ctx, poolAdapter{pool}, meter.RequestTelemetryRetentionInterval, log)
 
+	// ADR-123 / issue #1233: alert-preset signal-feeding
+	// goroutines. CertExpiryRefresherLoop (meterd-owned, owns the
+	// meterd_tenant_surface_cert_expiry_state table per the
+	// CLAUDE.md ownership rule) feeds
+	// apid_tenant_surface_cert_expiry_seconds
+	// (alert preset cert_expiring_14d); AccountSpendAggregatorLoop
+	// feeds meterd_account_spend_eur (alert preset spend_eur_20).
+	// Both free-function goroutines share the loop ctx so the
+	// daemon's drain cancels them in one go.
+	go CertExpiryRefresherLoop(ctx, CertExpiryRefresherParams{
+		Store:    store,
+		Log:      log,
+		Ops:      ops,
+		Interval: mc.CertExpiryRefresherInterval,
+	})
+	go AccountSpendAggregatorLoop(ctx, AccountSpendAggregatorParams{
+		Store:    store,
+		Log:      log,
+		Ops:      ops,
+		Interval: mc.AccountSpendAggregatorInterval,
+	})
+
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
@@ -942,6 +972,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// PR-X; the v2 path is deploy/ansible/roles/control_plane_service/
 	// files/meterd.toml.example).
 	const metricsPath = "/metrics"
+	// Issue #571 PR-A2: /readyz probe driven by loop.Health.
+	// Built before the metrics-listener block so the
+	// ControlMuxLite registration below can wire /readyz on
+	// the same mux as /healthz + /metrics. defer stop so the
+	// SIGTERM drain window surfaces in daemon_ready as 0.
+	meterdProbe := BuildReadinessProbe(loop)
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
 		if deps.metricsListenAndServe == nil {
@@ -977,6 +1013,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			w.WriteHeader(code)
 			_ = json.NewEncoder(w).Encode(status)
 		})
+		// Issue #571 PR-A2: /readyz (operator-side, short ASCII
+		// body for the LB scrape). Driven by the same loop.Health
+		// verdict via a 1s adapter goroutine (see
+		// cmd/meterd/readiness.go). Stale tick names surface in
+		// the body reason when the probe is 503. /healthz stays
+		// the rich-JSON path for dashboards.
+		wire.ControlReadyMuxLite(mux, meterdProbe.ReadyFunc(), meterdProbe.ReasonFunc())
 		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
 		srv, err := deps.metricsListenAndServe(cfg.MetricsAddr, mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
 		if err != nil {

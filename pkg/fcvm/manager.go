@@ -2266,7 +2266,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		// inner step (netns add, TAP create, nft apply) failed.
 		// nil-safe: the receiver guards on m.wakeFailureMetrics.
 		if m.wakeFailureMetrics != nil {
-			m.wakeFailureMetrics.WakeFailure("local", WakeReasonNetnsFail).Inc()
+			m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonNetnsFail).Inc()
 		}
 		return nil, fmt.Errorf("wake %s: network setup: %w", req.Instance, err)
 	}
@@ -2426,7 +2426,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		// memory.max = plan + 8 MB" makes any sustained
 		// cgroup_fail rate an operator action item. nil-safe.
 		if m.wakeFailureMetrics != nil {
-			m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+			m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
 		}
 	}
 
@@ -2463,7 +2463,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			// operator-facing surface can spot the sustained case
 			// without grepping slog.
 			if m.wakeFailureMetrics != nil {
-				m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+				m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
 			}
 		}
 		for _, sc := range req.Sidecars {
@@ -2471,7 +2471,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 				m.log.Warn("cgroup fence: writeWorkloadCgroup sidecar failed, continuing",
 					"instance", req.Instance, "sidecar", sc.Name, "err", wErr)
 				if m.wakeFailureMetrics != nil {
-					m.wakeFailureMetrics.WakeFailure("local", WakeReasonCgroupFail).Inc()
+					m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
 				}
 			}
 		}
@@ -2700,7 +2700,7 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// only the cold-boot-fallback rate. nil-safe.
 			if m.wakeFailureMetrics != nil {
 				reason := ClassifyWakeError(rErr, WakeContext{Snapshot: req.Snapshot, FCVersion: m.fcVersion})
-				m.wakeFailureMetrics.WakeFailure("local", reason).Inc()
+				m.wakeFailureMetrics.WakeFailure("", req.AppID, reason).Inc()
 			}
 			_ = m.vmm.Kill(ctx, lease)
 		}
@@ -2747,7 +2747,7 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		// the same call shape (Snapshot may be nil here).
 		if m.wakeFailureMetrics != nil {
 			reason := ClassifyWakeError(err, WakeContext{FCVersion: m.fcVersion})
-			m.wakeFailureMetrics.WakeFailure("local", reason).Inc()
+			m.wakeFailureMetrics.WakeFailure("", req.AppID, reason).Inc()
 		}
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)
 	}

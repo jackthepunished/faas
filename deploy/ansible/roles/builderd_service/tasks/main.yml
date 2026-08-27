@@ -47,6 +47,14 @@
     group: faas
     mode: "0640"
 
+- name: builderd_service — install shared storage env example
+  ansible.builtin.copy:
+    src: ../../_shared/files/storage.env.example
+    dest: /etc/faas/storage.env.example
+    owner: root
+    group: faas
+    mode: "0640"
+
 - name: builderd_service — install systemd unit
   ansible.builtin.copy:
     src: faas-builderd.service
@@ -118,6 +126,21 @@
     owner: faas-builderd
     group: faas
     mode: "0770"
+
+# builderd's ProtectSystem=strict namespace also allows the shared log and
+# spool roots. The compute_only_service role converges these later, but this
+# role runs first in bootstrap and must make its own declared write paths
+# exist before the pre-start assertions below.
+- name: builderd_service — ensure shared log and spool roots exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: faas
+    mode: "0770"
+  loop:
+    - /var/log/faas
+    - /var/spool/faas
 
 # Spec §11 — ProtectSystem=strict ReadWritePaths= assert. Mirrors
 # the same shape as imaged (compute_only_service/tasks/main.yml) and

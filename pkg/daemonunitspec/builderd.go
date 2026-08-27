@@ -32,6 +32,12 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // unit that will never activate). builderd schedules builds via
 // gRPC over the wire to apid on fsn-1 (the [apphub] layer), so
 // there is no same-host ordering need at unit-activation time.
+//
+// Issue #585 / ADR-127 — sealed.env is apid-only; builderd keeps compute-db.env
+// (DATABASE_URL) but no longer inherits the full sealed.env. The
+// FAAS_BUILDERD_CONFIG path is set as a literal Environment= entry so
+// cmd/builderd/main.go:67 falls back to it without needing the env var
+// from sealed.env.
 func UnitBuilderd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas builderd — build orchestrator + ephemeral builder microVMs (spec §4.5, ADR-003, ADR-005)",
@@ -39,17 +45,23 @@ func UnitBuilderd() daemonunit.Unit {
 		After:         []string{"network.target", "faas-cp.slice", "faas-vmmd.service"},
 		Wants:         []string{"faas-cp.slice", "faas-vmmd.service"},
 
-		Type:       "simple",
-		User:       "faas-builderd",
-		Group:      "faas",
-		ExecStart:  "/opt/faas/current/bin/builderd",
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		Type:               "simple",
+		User:               "faas-builderd",
+		Group:              "faas",
+		ExecStart:          "/opt/faas/current/bin/builderd",
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice:     "faas-cp.slice",
 		MemoryMax: "512M",
 
-		EnvironmentFile: "-/etc/faas/sealed.env -/etc/faas/compute-db.env",
+		// The source-layer path follows the same shared OCI storage contract
+		// as vmmd/imaged on a multi-box fleet.
+		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/storage.env",
+		Environment: []daemonunit.KV{
+			{Key: "FAAS_BUILDERD_CONFIG", Value: "/etc/faas/builderd.toml"},
+		},
 
 		NoNewPrivileges:       true,
 		ProtectSystem:         "strict",

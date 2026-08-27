@@ -20,7 +20,14 @@ CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
+# Always use the repository's Ansible configuration.  Ansible only discovers
+# ansible.cfg from the current directory (or its parents); the playbook lives
+# under deploy/ansible, so relying on discovery makes `make bootstrap-*` run
+# with different roles_path, forks, and host-key settings depending on where
+# the operator invokes make.
+ANSIBLE_CONFIG ?= $(CURDIR)/deploy/ansible/ansible.cfg
 ANSIBLE_INVENTORY ?= deploy/ansible/inventory/hosts.ini
+ANSIBLE_PLAYBOOK = ANSIBLE_CONFIG="$(ANSIBLE_CONFIG)" ansible-playbook
 
 .DEFAULT_GOAL := help
 
@@ -30,7 +37,7 @@ help: ## List targets
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
+build: guest-runners ## Build every daemon + CLIs + guest init + function runners into ./bin
 	@mkdir -p $(BINDIR)
 	@for d in $(DAEMONS); do \
 	  echo "building $$d"; \
@@ -40,6 +47,9 @@ build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 	  echo "building $$c (CLI)"; \
 	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$c ./cmd/$$c || exit 1; \
 	done
+	@echo "building init (guest PID 1)"
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o $(BINDIR)/init ./guest/init
+	@install -m 0755 scripts/schedd-brokerq-apply $(BINDIR)/schedd-brokerq-apply
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and
 # must be built for the guest architecture (linux/amd64, CGO off). Each
@@ -182,7 +192,7 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 # check-state-coverage does. Excludes generated sqlc. Floors are 5pp below
 # the post-PR number; the floor is a fixed line the suite must stay above,
 # not a moving goalpost (mirrors codecov.yml project.default.target).
-# Wired into the unit-tests-pg-2 CI job (see ci.yml).
+# Wired into the matrix-expanded unit-tests-pg-2a/2b CI jobs (see ci.yml).
 .PHONY: coverage-floor
 coverage-floor: ## Assert ship-blocking package floors across all coverage/cover-shard*.out
 	@bash -c 'set -e; COVERDIR="$${COVERDIR:-$(COVERAGE_DIR)}"; \
@@ -454,7 +464,7 @@ ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on t
 	  exit 0'
 
 .PHONY: lint
-lint: egress-check lint-incompatible-mods image-validate ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate + packer-builder syntax (ADR-111)
+lint: egress-check lint-incompatible-mods image-validate sealed-env-scope-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate + packer-builder syntax (ADR-111) + sealed.env scope gate (ADR-127)
 	@$(GO) tool golangci-lint run
 
 # ADR-111: packer-builder syntax gate. Delegates to deploy/packer/Makefile:image-validate,
@@ -491,6 +501,10 @@ public-endpoint-check: ## Validate the public HTTPS/Caddy endpoint (PUBLIC_ENDPO
 systemd-hardening-check: ## Static release gate for production systemd isolation directives
 	bash scripts/ci/check_systemd_hardening.sh $(CURDIR)
 
+.PHONY: sealed-env-scope-check
+sealed-env-scope-check: ## Static gate: /etc/faas/sealed.env is loaded only by faas-apid.service (issue #585, ADR-127)
+	@bash scripts/ci/check_sealed_env_scope.sh $(CURDIR)
+
 .PHONY: manifest-ansible
 manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars tree (MANIFEST + ANSIBLE_GENERATED_DIR required)
 	@test -n "$(MANIFEST)" || (echo "MANIFEST is required (example: MANIFEST=deploy/manifest/splitbox.yaml)" >&2; exit 2)
@@ -498,14 +512,25 @@ manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars t
 	./bin/gregalectl manifest ansible --manifest-file "$(MANIFEST)" --output-dir "$${ANSIBLE_GENERATED_DIR:-$(CURDIR)/deploy/ansible/.generated}"
 
 .PHONY: bootstrap-control-plane
-bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+bootstrap-control-plane: ansible-preflight ## Bootstrap the control-plane group. Honors $ANSIBLE_LIMIT (default control_plane).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
 
 .PHONY: bootstrap-compute
-bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+bootstrap-compute: ansible-preflight ## Bootstrap the compute-nodes group. Honors $ANSIBLE_LIMIT (default compute_nodes).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
+
+.PHONY: ansible-preflight
+ansible-preflight: ## Gather and validate peer facts before a role-limited bare-metal bootstrap
+	@test -f deploy/ansible/preflight.yml || (echo "deploy/ansible/preflight.yml missing"; exit 1)
+	@mkdir -p .cache/ansible
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml
+
+.PHONY: ansible-syntax-check
+ansible-syntax-check: ## Validate the bare-metal Ansible playbooks with the production config
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml --syntax-check
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --syntax-check
 
 .PHONY: tidy
 tidy: ## go mod tidy

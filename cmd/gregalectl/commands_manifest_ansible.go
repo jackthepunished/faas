@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/roleTemplating"
 )
 
 // manifestAnsibleFile is one deterministic generated artifact. Keeping the
@@ -117,7 +118,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	var postgresAllowedCIDRs []string
 	var computeAllowedCIDRs []string
 	var controlPlaneAllowedCIDRs []string
-	var gatewayInternalTarget string
+	var gatewaySynthTarget string
 	var scheddTarget string
 	var controlPlaneAPIDLoopback string
 	for _, fleetHost := range m.Fleet.Hosts {
@@ -141,8 +142,12 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			}
 			postgresAllowedCIDRs = appendHostCIDR(postgresAllowedCIDRs, address, m.Overlay.CIDR)
 			computeAllowedCIDRs = appendHostCIDR(computeAllowedCIDRs, address, m.Overlay.CIDR)
-			if gatewayInternalTarget == "" {
-				gatewayInternalTarget = "tcp://" + net.JoinHostPort(address, "8080")
+			if gatewaySynthTarget == "" {
+				// Schedd runs on the control plane. It targets the local
+				// public gateway, which then uses the same DB-backed compute
+				// pool as external traffic; no scheduler config names a
+				// particular compute node.
+				gatewaySynthTarget = "tcp://127.0.0.1:8080"
 			}
 		}
 	}
@@ -153,7 +158,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			return nil, fmt.Errorf("host %s: %w", host.Name, parseErr)
 		}
 		if host.Role == "compute-only" {
-			targetURL, parseErr = manifest.ServiceTCPURL(host.Role, host.Address)
+			targetURL, parseErr = manifest.TCPURL(host.Address)
 			if parseErr != nil {
 				return nil, fmt.Errorf("host %s target: %w", host.Name, parseErr)
 			}
@@ -173,7 +178,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, m.PrivateDNS.Mode, m.PrivateDNS.Zone, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs, m.Storage.FastRoot)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -216,6 +221,14 @@ func appendHostCIDR(values []string, address, overlayCIDR string) []string {
 
 func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, error) {
 	internalHosts := make([]manifestInternalHost, 0, len(m.Fleet.Hosts))
+	firstCompute := ""
+	for _, host := range m.Fleet.Hosts {
+		if host.Role == roleComputeOnly {
+			if firstCompute == "" {
+				firstCompute = host.Name
+			}
+		}
+	}
 	for _, host := range m.Fleet.Hosts {
 		serviceName, err := manifest.ServiceName(host.Role)
 		if err != nil {
@@ -228,8 +241,11 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 		entry := manifestInternalHost{Names: []string{serviceName}}
 		if _, err := netip.ParseAddr(address); err == nil {
 			// Literal endpoint manifests retain their explicit address for
-			// backwards compatibility with local fixtures.
+			// backwards compatibility with local fixtures. Keep the
+			// manifest host name as a stable local alias so every entry
+			// remains usable even when the endpoint is an IP literal.
 			entry.Address = address
+			entry.Names = append([]string{host.Name}, entry.Names...)
 		} else {
 			// Hostname manifests are resolved from inventory host facts by
 			// the Ansible adapter. This keeps IPs out of generated config
@@ -238,11 +254,34 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 			entry.Names = append([]string{address}, entry.Names...)
 		}
 		if host.Role == roleComputeOnly {
-			entry.Names = append(entry.Names, "egress.faas")
+			// Stable hostnames are the node-specific routing records.
+			// Keep the role aliases only on the first compute host as
+			// compatibility fallbacks for static schedd/meterd config;
+			// emitting vmmd.faas or egress.faas on every compute host
+			// would make /etc/hosts resolution ambiguous.
+			if host.Name == firstCompute {
+				entry.Names = append(entry.Names, "egress.faas")
+			} else {
+				entry.Names = filterInternalHostNames(entry.Names, "vmmd.faas")
+			}
 		}
 		internalHosts = append(internalHosts, entry)
 	}
 	return internalHosts, nil
+}
+
+func filterInternalHostNames(names []string, omit ...string) []string {
+	blocked := make(map[string]struct{}, len(omit))
+	for _, name := range omit {
+		blocked[name] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := blocked[name]; !ok {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
@@ -256,13 +295,20 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewaySynthTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, privateDNSMode, privateDNSZone, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string, storageMountpoint string) string {
 	var b strings.Builder
+	canonicalNodeName := canonicalComputeNodeName(host.Name, roleTemplating.Role(host.Role))
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
-	fmt.Fprintf(&b, "faas_node_name: %s\n", host.Name)
+	fmt.Fprintf(&b, "faas_node_name: %s\n", canonicalNodeName)
 	fmt.Fprintf(&b, "ansible_host: %q\n", ansibleHost)
 	b.WriteString("ansible_python_interpreter: /usr/bin/python3\n")
+	if host.StorageDevice != "" {
+		fmt.Fprintf(&b, "faas_storage_device: %q\n", host.StorageDevice)
+	}
+	if storageMountpoint != "" {
+		fmt.Fprintf(&b, "faas_storage_mountpoint: %q\n", storageMountpoint)
+	}
 	fmt.Fprintf(&b, "faas_overlay_provider: %q\n", overlayProvider)
 	switch overlayProvider {
 	case "tailscale":
@@ -296,21 +342,38 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayI
 	if host.Role == roleComputeOnly {
 		b.WriteString("faas_vmmd_listen_addr: \"tcp://0.0.0.0:50051\"\n")
 		fmt.Fprintf(&b, "faas_vmmd_target_url: %q\n", targetURL)
+		computeAddress, _, _ := manifest.ParseHostPort(host.Address)
+		fmt.Fprintf(&b, "faas_gateway_target_url: %q\n", "tcp://"+net.JoinHostPort(computeAddress, "8080"))
 		fmt.Fprintf(&b, "faas_vmmd_schedd_target: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_gatewayd_schedd_target: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_gatewayd_apid_loopback: %q\n", controlPlaneAPIDLoopback)
 		fmt.Fprintf(&b, "faas_gatewayd_egress_listen: %q\n", fmt.Sprintf("tcp://0.0.0.0:%d", manifestGatewayEgressPort))
 		b.WriteString("faas_gateway_listen: \"0.0.0.0:8080\"\n")
+		// Multi-host safety cluster PR-9 (audit F8-B): emit
+		// faas_public_listen_addr so the ansible role passes
+		// FAAS_PUBLIC_LISTEN_ADDR=... to gatewayd-public and
+		// the PR-8 boot-time check (requirePublicBindInMultiHost)
+		// does not fire. Without this emission, a correctly
+		// bootstrapped fleet reaches the boot-time error and
+		// refuses to start; with it, the operator only sees
+		// the loopback default on a single-box dev install.
+		fmt.Fprintf(&b, "faas_public_listen_addr: %q\n", renderPublicListenAddr(host))
+		fmt.Fprintf(&b, "faas_public_control_addr: %q\n", renderPublicControlAddr(host))
 	}
-	if host.Role == roleControlPlane && gatewayInternalTarget != "" {
+	if host.Role == roleControlPlane {
+		// Public ingress discovers active compute gateways from the database.
+		// This keeps the control-plane API healthy while every compute node is
+		// drained and makes node add/drain a data change, not a systemd rewrite.
+		b.WriteString("faas_compute_gateway_discovery: database\n")
+	}
+	if host.Role == roleControlPlane && gatewaySynthTarget != "" {
 		b.WriteString("faas_meterd_config_managed: true\n")
 		fmt.Fprintf(&b, "faas_meterd_schedd_socket: %q\n", scheddTarget)
 		fmt.Fprintf(&b, "faas_meterd_egress_socket: %q\n", fmt.Sprintf("tcp://egress.faas:%d", manifestGatewayEgressPort))
 		b.WriteString("faas_meterd_schedd_tls_cert_path: /etc/faas/tls/meterd/schedd-client.crt\n")
 		b.WriteString("faas_meterd_schedd_tls_key_path: /etc/faas/tls/meterd/schedd-client.key\n")
 		b.WriteString("faas_meterd_schedd_tls_ca_path: /etc/faas/tls/ca/ca.crt\n")
-		fmt.Fprintf(&b, "faas_gatewayd_internal_target: %q\n", gatewayInternalTarget)
-		fmt.Fprintf(&b, "faas_schedd_gateway_synth_target: %q\n", gatewayInternalTarget)
+		fmt.Fprintf(&b, "faas_schedd_gateway_synth_target: %q\n", gatewaySynthTarget)
 		// gatewayd-internal deliberately binds its control/metrics
 		// listener to loopback. Do not generate an unreachable remote
 		// scrape URL; the explicit empty override disables schedd's
@@ -347,6 +410,44 @@ func quotedYAMLList(values []string) string {
 		quoted[i] = fmt.Sprintf("%q", value)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// renderPublicListenAddr is the PR-9 emit for
+// faas_public_listen_addr. Multi-host safety cluster (audit F8-B):
+// the PR-8 boot-time check (gatewayd-public/main.go:625
+// requirePublicBindInMultiHost) refuses to start the public
+// listener on a loopback default when FAAS_NODE_NAME is set. The
+// manifest renderer must emit an explicit host:port from the host
+// row so the ansible role passes FAAS_PUBLIC_LISTEN_ADDR and the
+// check does not fire.
+//
+// Single-box posture (the host's Address is loopback) is preserved
+// — operators who intentionally want loopback bind keep it. Multi-
+// box hosts with a public IP get that IP; multi-box hosts with
+// just a private overlay address get 0.0.0.0 + the same port (the
+// LB reaches the box via the public path the operator wires
+// upstream).
+func renderPublicListenAddr(host manifest.Host) string {
+	address, port, err := manifest.ParseHostPort(host.Address)
+	if err != nil || address == "" {
+		return "0.0.0.0:443"
+	}
+	_ = port
+	// Public listen addr: the public-facing host:port. Without a
+	// separate PublicIP field, default to the host's address; the
+	// loopback case is preserved (single-box posture).
+	return net.JoinHostPort(address, "443")
+}
+
+// renderPublicControlAddr is the companion emit for
+// faas_public_control_addr. Mirrors renderPublicListenAddr shape
+// but pins to the canonical :9092 control listener port.
+func renderPublicControlAddr(host manifest.Host) string {
+	address, _, err := manifest.ParseHostPort(host.Address)
+	if err != nil || address == "" {
+		return "0.0.0.0:9092"
+	}
+	return net.JoinHostPort(address, "9092")
 }
 
 func writeGeneratedAnsibleFile(path string, body []byte, force bool) error {

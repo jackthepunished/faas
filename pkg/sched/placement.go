@@ -115,6 +115,7 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 	var (
 		candidates []state.ComputeNode
 		warmFit    *state.ComputeNode
+		snapshotF  []state.ComputeNode
 	)
 	for i := range nodes {
 		n := nodes[i]
@@ -157,6 +158,9 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 			nCopy := n
 			warmFit = &nCopy
 		}
+		if containsNodeID(r.PreferredNodeIDs, n.ID) {
+			snapshotF = append(snapshotF, n)
+		}
 	}
 
 	if warmFit != nil {
@@ -167,6 +171,27 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 			CeilingMB:  warmFit.AdmissionCeilingMB,
 			VCPUBudget: warmFit.VCPUBudget,
 			UsedMB:     usedMB[warmFit.ID],
+		}, nil
+	}
+
+	// A ready local snapshot is a stronger locality signal than the
+	// least-loaded tie-break, but remains a hint: capacity was checked above
+	// and a saturated replica is simply omitted from snapshotF. Choose the
+	// best ready replica deterministically when more than one is available.
+	if len(snapshotF) > 0 {
+		best := snapshotF[0]
+		for _, n := range snapshotF[1:] {
+			if betterCandidate(n, usedMB[n.ID], usedVCPU[n.ID], best, usedMB[best.ID], usedVCPU[best.ID], r.PreferredRegion) {
+				best = n
+			}
+		}
+		return Placement{
+			NodeID:     best.ID,
+			Name:       best.Name,
+			TargetURL:  best.TargetURL,
+			CeilingMB:  best.AdmissionCeilingMB,
+			VCPUBudget: best.VCPUBudget,
+			UsedMB:     usedMB[best.ID],
 		}, nil
 	}
 
@@ -216,6 +241,15 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 		VCPUBudget: best.VCPUBudget,
 		UsedMB:     usedMB[best.ID],
 	}, nil
+}
+
+func containsNodeID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // betterCandidate returns true if `n` should replace `best` per the

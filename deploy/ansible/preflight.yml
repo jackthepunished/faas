@@ -1,0 +1,97 @@
+---
+# Bare-metal deployment preflight.
+#
+# This play deliberately targets the complete production inventory. The
+# role-specific bootstrap is commonly invoked with --limit, but its managed
+# /etc/hosts block still needs a private address for every peer. Facts are
+# cached by deploy/ansible/ansible.cfg and consumed by bootstrap.yml.
+
+- name: Validate the bare-metal fleet before a role-limited bootstrap
+  hosts: control_plane:compute_nodes
+  gather_facts: true
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require a split production fleet
+      ansible.builtin.assert:
+        that:
+          - groups['control_plane'] | length >= 1
+          - groups['compute_nodes'] | length >= 1
+        fail_msg: >-
+          Production inventory must contain at least one control_plane host
+          and one compute_nodes host; got control_plane={{ groups['control_plane'] | length }},
+          compute_nodes={{ groups['compute_nodes'] | length }}.
+      run_once: true
+
+    - name: Require exactly one production role per host
+      ansible.builtin.assert:
+        that:
+          - (group_names | intersect(['control_plane', 'compute_nodes']) | length) == 1
+        fail_msg: >-
+          {{ inventory_hostname }} must belong to exactly one of
+          control_plane or compute_nodes; got {{ group_names | join(', ') }}.
+
+    - name: Require the host variable to agree with its inventory role
+      ansible.builtin.assert:
+        that:
+          - faas_box_role | default('') in ['control-plane', 'compute-only']
+          - >-
+            (faas_box_role == 'control-plane' and 'control_plane' in group_names)
+            or
+            (faas_box_role == 'compute-only' and 'compute_nodes' in group_names)
+        fail_msg: >-
+          {{ inventory_hostname }} has faas_box_role={{ faas_box_role | default('unset') }}
+          but inventory groups are {{ group_names | join(', ') }}.
+          Use the manifest-generated split-box inventory.
+
+    - name: Require a supported bare-metal operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_system == 'Linux'
+          - ansible_architecture in ['x86_64', 'amd64']
+          - ansible_python.version.major | int >= 3
+        fail_msg: >-
+          {{ inventory_hostname }} is not a supported Gregale host
+          (system={{ ansible_system }}, architecture={{ ansible_architecture }},
+          python={{ ansible_python.version.major }}).
+
+    - name: Resolve and cache the provider-neutral private address
+      ansible.builtin.set_fact:
+        faas_private_dns_address: >-
+          {{ faas_private_address | default(ansible_default_ipv4.address, true) }}
+        cacheable: true
+
+    - name: Require a concrete private transport address
+      ansible.builtin.assert:
+        that:
+          - faas_private_dns_address | default('') | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }} has no private transport address. Set
+          faas_private_address in provider-owned inventory; do not put a
+          provider IP into daemon configuration or the committed manifest.
+
+    - name: Require systemd on a production host
+      ansible.builtin.assert:
+        that:
+          - ansible_service_mgr == 'systemd'
+        fail_msg: >-
+          {{ inventory_hostname }} reports service manager
+          {{ ansible_service_mgr }}, but production bare-metal deployment
+          requires systemd.
+
+- name: Validate the complete peer address map
+  hosts: control_plane:compute_nodes
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Confirm all inventory peers have cached private addresses
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].faas_private_dns_address | default('') | length > 0
+        fail_msg: >-
+          peer {{ item }} has no cached private address. Run the preflight
+          against the complete inventory and provide faas_private_address
+          for providers whose default route is public.
+      loop: "{{ (groups['control_plane'] + groups['compute_nodes']) | unique }}"
+      run_once: true

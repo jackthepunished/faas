@@ -13,7 +13,7 @@ import (
 func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	yaml := strings.Replace(validManifestYAML,
 		"    - name: fsn-1\n      role: control-plane\n",
-		"    - name: fsn-1\n      role: control-plane\n      address: 10.42.0.1:7100\n    - name: fsn-2\n      role: compute-only\n      address: 10.42.0.2:50051\n", 1)
+		"    - name: fsn-1\n      role: control-plane\n      address: 10.42.0.1:7100\n    - name: fsn-2\n      role: compute-only\n      address: 10.42.0.2:50051\n      storage_device: /dev/disk/by-id/google-local-ssd-0\n", 1)
 	m, err := manifest.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatalf("manifest.Parse: %v", err)
@@ -47,11 +47,34 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `ansible_host: "10.42.0.2"`) {
 		t.Errorf("compute host vars missing host address:\n%s", computeVars)
 	}
-	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://vmmd.faas:50051"`) {
+	if !strings.Contains(computeVars, `faas_node_name: fsn-2.faas`) {
+		t.Errorf("compute host vars missing canonical node identity:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_storage_device: "/dev/disk/by-id/google-local-ssd-0"`) {
+		t.Errorf("compute host vars missing provider-neutral storage device:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_storage_mountpoint: "/srv/fc"`) {
+		t.Errorf("compute host vars missing manifest storage mountpoint:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://10.42.0.2:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)
 	}
 	if !strings.Contains(computeVars, `faas_gateway_listen: "0.0.0.0:8080"`) {
 		t.Errorf("compute host vars missing split gateway listener:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_gateway_target_url: "tcp://10.42.0.2:8080"`) {
+		t.Errorf("compute host vars missing database-discovered gateway target:\n%s", computeVars)
+	}
+	// Multi-host safety cluster PR-9 (audit F8-B): the manifest
+	// renderer must emit faas_public_listen_addr + faas_public_control_addr
+	// so a correctly bootstrapped fleet never reaches the PR-8
+	// boot-time check (gatewayd-public refuses to start on a
+	// loopback default when FAAS_NODE_NAME is set).
+	if !strings.Contains(computeVars, `faas_public_listen_addr: "10.42.0.2:443"`) {
+		t.Errorf("compute host vars missing faas_public_listen_addr emission:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_public_control_addr: "10.42.0.2:9092"`) {
+		t.Errorf("compute host vars missing faas_public_control_addr emission:\n%s", computeVars)
 	}
 	if !strings.Contains(computeVars, `faas_gatewayd_egress_listen: "tcp://0.0.0.0:9092"`) {
 		t.Errorf("compute host vars missing split egress listener:\n%s", computeVars)
@@ -80,10 +103,10 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(controlVars, `faas_compute_allowed_cidrs: ["10.42.0.2/32"]`) {
 		t.Errorf("control host vars missing compute scheduler allowlist:\n%s", controlVars)
 	}
-	if !strings.Contains(controlVars, `faas_gatewayd_internal_target: "tcp://10.42.0.2:8080"`) {
-		t.Errorf("control host vars missing split gateway target:\n%s", controlVars)
+	if !strings.Contains(controlVars, "faas_compute_gateway_discovery: database") {
+		t.Errorf("control host vars missing database gateway discovery:\n%s", controlVars)
 	}
-	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://10.42.0.2:8080"`) {
+	if !strings.Contains(controlVars, `faas_schedd_gateway_synth_target: "tcp://127.0.0.1:8080"`) {
 		t.Errorf("control host vars missing schedd synth target:\n%s", controlVars)
 	}
 	if !strings.Contains(controlVars, `faas_schedd_gateway_metrics_url: ""`) {
@@ -104,6 +127,58 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	}
 	if !strings.Contains(computeVars, `egress.faas`) {
 		t.Errorf("compute host vars missing egress private alias:\n%s", computeVars)
+	}
+}
+
+func TestRenderManifestAnsibleFiles_TwoComputeTargetsAreDistinct(t *testing.T) {
+	yaml := strings.Replace(validManifestYAML,
+		"    - name: fsn-1\n      role: control-plane\n",
+		"    - name: fsn-1\n      role: control-plane\n      address: fsn-1.gregale.dev:7100\n    - name: fsn-2\n      role: compute-only\n      address: fsn-2.gregale.dev:50051\n    - name: fsn-3\n      role: compute-only\n      address: fsn-3.gregale.dev:50051\n", 1)
+	m, err := manifest.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("manifest.Parse: %v", err)
+	}
+	if errs := m.Validate(); errs != nil {
+		t.Fatalf("manifest.Validate: %v", errs)
+	}
+
+	files, err := renderManifestAnsibleFiles(m, t.TempDir())
+	if err != nil {
+		t.Fatalf("renderManifestAnsibleFiles: %v", err)
+	}
+	if len(files) != 4 {
+		t.Fatalf("generated files = %d, want inventory + 3 host_vars", len(files))
+	}
+	var inventory, fsn2Vars, fsn3Vars string
+	for _, file := range files {
+		switch {
+		case strings.HasSuffix(file.Path, filepath.Join("inventory", "hosts.ini")):
+			inventory = string(file.Body)
+		case strings.HasSuffix(file.Path, "fsn-2.yml"):
+			fsn2Vars = string(file.Body)
+		case strings.HasSuffix(file.Path, "fsn-3.yml"):
+			fsn3Vars = string(file.Body)
+		}
+	}
+	if !strings.Contains(inventory, "[compute_nodes]\nfsn-2\nfsn-3\n") {
+		t.Errorf("inventory did not retain both compute hosts:\n%s", inventory)
+	}
+	if !strings.Contains(fsn2Vars, `faas_vmmd_target_url: "tcp://fsn-2.gregale.dev:50051"`) {
+		t.Errorf("fsn-2 target is not node-specific:\n%s", fsn2Vars)
+	}
+	if !strings.Contains(fsn3Vars, `faas_vmmd_target_url: "tcp://fsn-3.gregale.dev:50051"`) {
+		t.Errorf("fsn-3 target is not node-specific:\n%s", fsn3Vars)
+	}
+	if !strings.Contains(fsn2Vars, `faas_gateway_target_url: "tcp://fsn-2.gregale.dev:8080"`) ||
+		!strings.Contains(fsn3Vars, `faas_gateway_target_url: "tcp://fsn-3.gregale.dev:8080"`) {
+		t.Errorf("compute gateway targets are not node-specific:\nfsn-2=%s\nfsn-3=%s", fsn2Vars, fsn3Vars)
+	}
+	if strings.Count(fsn2Vars, `names: ["fsn-2.gregale.dev", "vmmd.faas", "egress.faas"]`) != 1 {
+		t.Errorf("first compute compatibility aliases missing or duplicated:\n%s", fsn2Vars)
+	}
+	if strings.Contains(fsn3Vars, `names: ["fsn-3.gregale.dev", "vmmd.faas`) ||
+		strings.Contains(fsn3Vars, `names: ["fsn-3.gregale.dev", "egress.faas`) {
+		t.Errorf("second compute received an ambiguous shared alias:\n%s", fsn3Vars)
 	}
 }
 
@@ -134,7 +209,7 @@ func TestRenderManifestAnsibleFiles_HostnameEndpointsUseOverlayBoundary(t *testi
 	}
 	for _, want := range []string{
 		`ansible_host: "fsn-1.gregale.dev"`,
-		`faas_gatewayd_internal_target: "tcp://fsn-2.gregale.dev:8080"`,
+		`faas_compute_gateway_discovery: database`,
 		`faas_postgres_listen_addresses: "fsn-1.gregale.dev"`,
 		`faas_postgres_allowed_cidrs: ["10.42.0.0/24"]`,
 		`faas_compute_allowed_cidrs: ["10.42.0.0/24"]`,

@@ -17,9 +17,11 @@ with `DATABASE_URL` (gap G2).
   `RoleSingleBox` on the compute-only box and the cosign sign-keypair path
   assumes single-box assumptions (no per-box PKI subset).
 - `zz-faas-vmmd-client.conf.j2` — owns the split-box imaged → vmmd target and
-  dedicated `imaged/vmmd-client` leaf. The target is always the internal
-  `vmmd.faas` identity, not a provider-specific IP, so moving the compute box
-  does not require editing daemon certificates or hard-coded addresses.
+  dedicated `imaged/vmmd-client` leaf. The target is the compute host's
+  stable private endpoint, not a shared `vmmd.faas` resolver alias. The vmmd
+  server leaf retains `vmmd.faas` as its role identity and carries the
+  endpoint as an additional SAN, so adding another compute box cannot route
+  imaged to the wrong node.
 
 ## Side effects
 
@@ -28,6 +30,9 @@ with `DATABASE_URL` (gap G2).
 - Installs the imaged example TOML to `/etc/faas/imaged.toml.example`
   (operator copies to `imaged.toml`).
 - Installs the systemd unit to `/etc/systemd/system/faas-imaged.service`.
+- Installs the shared `storage.env.example`; the provider-neutral node join
+  pipeline stages the populated `/etc/faas/storage.env` for OCI-backed
+  multi-box deployments.
 - **Mega-PR-C**: chowns `/run/faas` to root:faas 0775 at deploy time AND
   ships a `/etc/tmpfiles.d/faas.conf` rule so the same ownership
   survives every reboot. Mirrors `control_plane_service`'s PR-D + PR-M

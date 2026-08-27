@@ -359,7 +359,8 @@ type ComputeNode struct {
 	// per-node role label: control-plane | compute-node (PR-3a). Populated from manifest.fleet.hosts[].role by PR-2 renderer. NULL = pre-manifest row.
 	Role pgtype.Text
 	// monotonic counter bumped by PR-4 doctor on per-node inconsistency detection (PR-3a). Default 0; never decreases.
-	Generation pgtype.Int4
+	Generation       pgtype.Int4
+	GatewayTargetUrl pgtype.Text
 }
 
 type ComputeNodeHeartbeat struct {

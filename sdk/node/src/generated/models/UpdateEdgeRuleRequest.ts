@@ -3,7 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { EdgeRuleBudgetAction } from './EdgeRuleBudgetAction.js';
-import type { EdgeRuleCacheAction } from './EdgeRuleCacheAction.js';
 import type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
 import type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 import type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
@@ -26,8 +25,14 @@ export type UpdateEdgeRuleRequest = {
   priority?: number;
   enabled?: boolean;
   /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Omit (do not send) to leave the column untouched.
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
+  /**
    * Replaces the jsonb column whole.
    */
-  action?: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction | EdgeRuleCacheAction);
+  action?: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);
 };
 

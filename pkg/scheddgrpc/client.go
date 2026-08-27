@@ -238,6 +238,76 @@ func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) er
 	return nil
 }
 
+// ForceColdBootNextWake (P2b of the operator-side observability
+// mega-PR) asks schedd to mark a deployment's latest warm + init
+// snapshots stale so the next customer Wake cold-boots from rootfs
+// per ADR-005. Returns the snap IDs that were marked stale — empty
+// list when the deployment has no snapshots in either tier (durable
+// no-op). NotFound is mapped to state.ErrNotFound so the apid
+// handler can render a 404 with code "deployment_not_found".
+func (c *Client) ForceColdBootNextWake(ctx context.Context, deploymentID string) ([]string, error) {
+	resp, err := c.cli.ForceColdBootNextWake(ctx, &scheddpb.ForceColdBootNextWakeRequest{
+		DeploymentId: deploymentID,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, state.ErrNotFound
+		}
+		return nil, liftErr(err)
+	}
+	return resp.GetSnapIdsMarkedStale(), nil
+}
+
+// ForceRestartInstance (P2d follow-on to PR #1099) asks schedd to
+// kill a live instance and flip its deployment's snapshots stale.
+// Returns the snap IDs marked stale on success. Maps the wire
+// outcomes:
+//
+//   - ok=true + snap_ids_marked_stale populated + error_msg
+//     empty → happy path. Returns (snapIDs, nil).
+//   - ok=true + snap_ids_marked_stale populated + error_msg
+//     non-empty → partial success. Returns (snapIDs, error);
+//     the caller can decide to log the destroy cause without
+//     failing the operator-visible result (the durable signal
+//     is the snap-stale work; the next wake WILL cold-boot).
+//   - ok=false + error_msg non-empty → race-loser. Returns
+//     (nil, state.ErrInstanceNotRunning) so the CLI's errors.Is
+//     dispatch matches the engine-layer contract.
+//   - gRPC NotFound → state.ErrNotFound (mirrors ForceColdBootNextWake).
+//   - any other gRPC error → lifted via liftErr.
+func (c *Client) ForceRestartInstance(ctx context.Context, instanceID, reason string) ([]string, error) {
+	resp, err := c.cli.ForceRestartInstance(ctx, &scheddpb.ForceRestartInstanceRequest{
+		InstanceId: instanceID,
+		Reason:     reason,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, state.ErrNotFound
+		}
+		return nil, liftErr(err)
+	}
+	snapIDs := resp.GetSnapIdsMarkedStale()
+	if !resp.GetOk() {
+		// Race-loser posture — the engine observed a non-RUNNING
+		// state on the locked re-read. Map the typed sentinel
+		// back so the CLI uses errors.Is like the rest of the
+		// pkg/state surface. Wrap the wire-side error_msg so the
+		// operator sees both "state: instance not in running
+		// state" + the engine's reason detail.
+		if msg := resp.GetErrorMsg(); msg != "" {
+			return nil, fmt.Errorf("%w: %s", state.ErrInstanceNotRunning, msg)
+		}
+		return nil, state.ErrInstanceNotRunning
+	}
+	if msg := resp.GetErrorMsg(); msg != "" {
+		// Partial success — destroy failed but snaps were flipped.
+		// Surface the destroy cause with the snap IDs; the caller
+		// decides how to present it.
+		return snapIDs, errors.New(msg)
+	}
+	return snapIDs, nil
+}
+
 // InstanceStatsRow is the typed mirror of scheddpb.InstanceStatsRow
 // the meterd sampler reads. Defined here so pkg/meter doesn't reach
 // into the protobuf package directly. Issue #279 / PR-B.

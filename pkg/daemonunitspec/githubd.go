@@ -29,25 +29,35 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     attribution hmac key + the github-bot pool credentials.
 //
 // See ADR-078 for the migration that wiped these from the unit body.
+//
+// Issue #585 / ADR-127 — sealed.env is apid-only; githubd loads the
+// GitHub App credentials (FAAS_GITHUB_APP_ID / CLIENT_ID / CLIENT_SECRET /
+// WEBHOOK_SECRET) from /etc/faas/secrets/githubd/githubd.env (0400
+// root:root). The host.age identity is delivered via LoadCredential=
+// (the env var holds the %d/<name> tmpfs path, mirroring apid). The PEM
+// key file path is set as a literal Environment= entry so the daemon's
+// readKeyPEMDefault finds it on first boot.
 func UnitGithubd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description: "onebox-faas githubd — GitHub App integration",
 		After:       []string{"network.target", "postgresql.service", "faas-cp.slice"},
 		Wants:       []string{"faas-cp.slice"},
 
-		Type:       "simple",
-		User:       "faas",
-		Group:      "faas",
-		ExecStart:  `/opt/faas/current/bin/githubd --config /etc/faas/githubd.toml`,
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		Type:               "simple",
+		User:               "faas",
+		Group:              "faas",
+		ExecStart:          `/opt/faas/current/bin/githubd --config /etc/faas/githubd.toml`,
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice:     "faas-cp.slice",
 		MemoryMax: "256M",
 
-		EnvironmentFile: "/etc/faas/sealed.env",
+		EnvironmentFile: "-/etc/faas/compute-db.env -/etc/faas/secrets/githubd/githubd.env",
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_HOST_AGE_IDENTITY_PATH", Value: "%d/faas_host_age_identity"},
+			{Key: "FAAS_GITHUB_APP_KEY_PATH", Value: "/etc/faas/secrets/githubd/app.pem"},
 		},
 		LoadCredential: []daemonunit.LoadCred{
 			{Name: "faas_host_age_identity", Path: "/etc/faas/secrets/host.age"},

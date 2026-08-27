@@ -67,6 +67,45 @@ service Schedd {
   // for the obvious error paths.
   rpc ParkInstance(ParkInstanceRequest) returns (ParkInstanceResponse);
 
+  // ForceColdBootNextWake asks schedd to mark the deployment's
+  // latest warm + init snapshots stale so the next customer Wake
+  // cold-boots from rootfs per ADR-005. Operator-side recovery
+  // primitive (P2b of the operator-side observability mega-PR):
+  // when a wedged instance is reported and the snapshot is
+  // suspected to be the carrier, the on-call engineer forces a
+  // one-shot cold-boot instead of parking the live instance.
+  // Returns the snap IDs that were marked stale (empty when the
+  // deployment has no snapshots — durable no-op). NotFound when
+  // the deployment does not exist. Idempotent.
+  rpc ForceColdBootNextWake(ForceColdBootNextWakeRequest) returns (ForceColdBootNextWakeResponse);
+
+  // ForceRestartInstance (P2d follow-on) is the operator-initiated
+  // kill-instance + cold-boot-on-next-wake primitive. Distinct from
+  // ForceColdBootNextWake (snapshot flip only, no destroy) and
+  // ParkInstance (park, no snapshot flip). Engine.ForceRestart:
+  //
+  //   - if the locked re-read observes a non-RUNNING state,
+  //     returns ok=false with error_msg="state: instance not in
+  //     running state" (race-loser posture; the customer-driven
+  //     action won the lock — desired end-state achieved, no
+  //     audit-row-repaint needed).
+  //   - on success, fires the destroy (RUNNING → STOPPED via
+  //     transitionWithKind with kind "force_restart"), flips
+  //     warm + init snapshots stale, and returns ok=true with the
+  //     snap IDs marked stale populated.
+  //
+  // Codes: NotFound when the instance_id doesn't exist; FailedPrecondition
+  // when the locked re-read observed a non-RUNNING state AND the
+  // error path is mapped to a gRPC status (the server returns
+  // ok=false on the wire rather than a status error so the
+  // gregalectl CLI can render the cause verbatim). Internal on
+  // unexpected errors (destroy failure surfaces as ok=true +
+  // snap_ids_marked_stale populated + error_msg populated so
+  // the operator learns the partial-success shape).
+  //
+  // Additive per ADR-016.
+  rpc ForceRestartInstance(ForceRestartInstanceRequest) returns (ForceRestartInstanceResponse);
+
   // ListInstanceStats returns the per-instance CPU-µs snapshot the
   // schedd's instancestats.Poller maintains (issue #279 / PR-B).
   // meterdsamp the per-minute CPU delta from this snapshot and
@@ -541,6 +580,66 @@ message ParkInstanceResponse {
   // ok reports whether the park succeeded. False means the instance
   // was already parked (idempotent) or didn't exist.
   bool ok = 1;
+}
+
+// ForceColdBootNextWakeRequest asks schedd to mark a deployment's
+// latest warm + init snapshots stale. The deployment_id is the
+// apps.deployments.id row (NOT the apps.id). Returns the IDs of
+// the snapshots marked stale — empty list means the deployment
+// has no snapshots (durable no-op).
+message ForceColdBootNextWakeRequest {
+  string deployment_id = 1;
+}
+
+message ForceColdBootNextWakeResponse {
+  // snap_ids_marked_stale is the list of snapshot IDs that were
+  // transitioned to stale=true. Empty when the deployment has no
+  // snapshots in either tier. Order is not significant (warm then
+  // init when both exist).
+  repeated string snap_ids_marked_stale = 1;
+}
+
+// ForceRestartInstanceRequest asks schedd to kill an instance and
+// flip the deployment's snapshots stale. The instance_id is the
+// instances.id row (NOT the app_id). Reason is operator-supplied
+// free-form text that flows into the audit row's data JSON; the
+// server-side reason validator (operational tooling) enforces a
+// [a-z0-9_]{1,64} shape — see Engine.ForceRestart for the full
+// contract.
+message ForceRestartInstanceRequest {
+  string instance_id = 1;
+  string reason      = 2;
+}
+
+// ForceRestartInstanceResponse is the result of
+// Engine.ForceRestart.
+//
+// ok is true when the schedd engine accepted the action and
+// fired the destroy (snapshots flipped stale AND destroy issued).
+// false when the locked re-read observed a non-RUNNING state —
+// the race-loser posture documented on
+// state.ErrInstanceNotRunning (pkg/state/store.go). The
+// desired end-state was achieved by the racing action; the
+// admin click is an idempotent no-op.
+//
+// snap_ids_marked_stale is the list of snapshot IDs that were
+// transitioned to stale=true. Empty when the deployment has no
+// snapshots in either tier. Order is warm-then-init when both
+// exist (mirrors Engine.ForceRestart's loop order). Always
+// populated when ok=true; empty on ok=false.
+//
+// error_msg carries the free-text error detail when ok=false
+// (e.g. "state: instance not in running state" for the
+// race-loser branch, or the destroy-failure cause for the
+// partial-success branch where ok=true). Capped at 1 KB by
+// the server-side enforcement matching the
+// operator_intents.error column convention (pkg/sched/
+// operator_intent_subscriber.go). Unset on the ok=true +
+// destroy-succeeded path.
+message ForceRestartInstanceResponse {
+  bool   ok                    = 1;
+  repeated string snap_ids_marked_stale = 2;
+  string error_msg             = 3;
 }
 
 // InstanceStatsRow is the schedd-side per-instance stat row that

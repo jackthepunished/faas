@@ -1247,6 +1247,7 @@ type appChangedPayload struct {
 // imaged is the sole writer to the snapshots table, so it records the row.
 type snapshotWrittenPayload struct {
 	DeploymentID string `json:"deployment_id"`
+	NodeID       string `json:"node_id,omitempty"`
 	VMStatePath  string `json:"vmstate_path"`
 	// StorageKey is the canonical StorageBackend key (issue #96,
 	// ADR-025 axis 2). schedd populates it on the snapshot_written
@@ -2280,8 +2281,25 @@ func (h *Handler) handleSnapshotWritten(ctx context.Context, p snapshotWrittenPa
 		// framework-ready signal has actually fired.
 		Tier: p.Tier,
 	}
-	if _, err := h.store.CreateSnapshot(ctx, snap); err != nil && !errors.Is(err, state.ErrConflict) {
-		return fmt.Errorf("imaged: create snapshot: %w", err)
+	stored, err := h.store.CreateSnapshot(ctx, snap)
+	if err != nil {
+		if !errors.Is(err, state.ErrConflict) {
+			return fmt.Errorf("imaged: create snapshot: %w", err)
+		}
+		stored, err = h.store.LatestSnapshotForTier(ctx, p.DeploymentID, snap.Tier)
+		if err != nil {
+			return fmt.Errorf("imaged: load existing snapshot: %w", err)
+		}
+	}
+	if p.NodeID != "" {
+		if origins, ok := h.store.(state.SnapshotOriginStore); ok {
+			if originErr := origins.RecordSnapshotOrigin(ctx, stored.ID, p.NodeID); originErr != nil {
+				// Origin metadata improves locality but is not the blob's
+				// source of truth. Keep the deployment live if an older
+				// compute_nodes row or a transient DB issue blocks it.
+				h.log.Warn("imaged: record snapshot origin failed", "snapshot_id", stored.ID, "node_id", p.NodeID, "err", originErr)
+			}
+		}
 	}
 
 	if err := h.store.MarkDeploymentLive(ctx, dep.ID); err != nil {

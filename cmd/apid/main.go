@@ -55,6 +55,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -452,7 +453,7 @@ func defaultDeps() runDeps {
 			}
 			return &http.Server{
 				Addr:              addr,
-				Handler:           h,
+				Handler:           trace.HTTPHandler("apid", h),
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       cfg.GetRequestReadTimeout(env),
 				WriteTimeout:      cfg.GetRequestWriteTimeout(env),
@@ -550,6 +551,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 		closePool()
 		return fmt.Errorf("apid: pool warm-up: %w", err)
 	}
+	// F2 / ADR-124 / PR-2 audit: db.MigrateUp acquires the session-scoped
+	// pg_advisory_lock internally, so apid's boot is safe alongside every
+	// other daemon in the fleet. Do NOT replace this with a direct goose.Up
+	// call — the lock is the load-bearing guarantee.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		closePool()
 		return fmt.Errorf("apid: migrate: %w", err)
@@ -588,6 +593,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// block short-circuits to nil when pool is nil.
 	deps.pool = pool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
+		// ADR-132: pg_notify is a low-latency wake-up only. The
+		// subscriber re-reads the durable runtime_config_entries row, so a
+		// missed notification is repaired by the next reconnect or boot.
+		go func() {
+			if err := runRuntimeConfigSubscriber(ctx, pool, srv, log); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("runtime_config subscriber exited", "err", err)
+			}
+		}()
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
 		// failed to load); we skip the goroutine launch in that
@@ -1057,7 +1070,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// warning so the daemon still boots for local testing. Production
 	// MUST set this to the contents of /etc/faas/secrets/session.key
 	// (root:root 0400, spec §11).
+	//
+	// Issue #585 / ADR-127 review-fix (PR #1078 follow-on): the
+	// loader returns (nil, sentinel) when the key is malformed,
+	// unreadable, or wrong-byte-length. We refuse to boot in that
+	// case — a nil session.Manager reaches sessionAuth which calls
+	// s.sessions.Verify and crashes on the first authenticated
+	// dashboard request (silent nil-deref). The pre-PR-1078 code
+	// logged the sentinel as a dev-mode warning and continued,
+	// which is the A5 silent-degradation class the apid loader was
+	// specifically written to close. Empty env (the dev fallback)
+	// still returns a real manager + a warning string so local
+	// iteration stays unblocked.
 	sessions, sessionsWarn := loadSessionManager(deps.getenv, log)
+	if sessions == nil {
+		return fmt.Errorf("apid: session manager: %s", sessionsWarn)
+	}
 	if sessionsWarn != "" {
 		log.Warn("session manager in dev mode; sessions reset on restart", "warning", sessionsWarn)
 	}
@@ -1085,7 +1113,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"github_enabled", oauthCfg.GitHub.Enabled())
 	}
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	// ADR-132: seed the hot runtime configuration snapshot from the
+	// deployment environment, then reconcile durable operator overrides
+	// before any listener is exposed. Database state wins over the
+	// bootstrap fallback for catalogued runtime settings.
+	srv.WithRuntimeConfigManager(newRuntimeConfigManager(deps.getenv))
+	if err := srv.runtimeConfig.reconcile(ctx, store); err != nil {
+		return fmt.Errorf("apid: reconcile runtime config: %w", err)
+	}
 	srv.WithOAuthConfig(oauthCfg)
+
+	// PR #1099 P2 redesign: force-park + force-cold-boot now route
+	// through the operator_intents table + pg_notify (migrations/00431,
+	// pkg/sched/operator_intent_subscriber.go). apid never imports
+	// pkg/scheddgrpc — the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. schedd is still the only
+	// writer to instances; the trigger is now a Postgres row
+	// INSERT, not a direct gRPC call.
 
 	// Issue #142: Stripe billing portal URL template for the changePlan
 	// 402 response. Empty = 402 omits billing_portal_url; the dashboard
@@ -1160,6 +1204,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Built unconditionally so /metrics works even with FAAS_APID_METRICS_ADDR
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
+	wire.BootStamps(ctx, "apid", ops)
+	wire.RegisterDefaultOps(ops)
 	srv.WithOpsMetrics(ctx, ops)
 
 	// ADR-093 / PR-D: end-to-end request budgets on the apid
@@ -1513,16 +1559,43 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// families in one round-trip.
 	var metricsSrv *http.Server
 	if metricsAddr := resolveMetricsAddr(deps.getenv, cfg.GetMetricsAddr(deps.getenv)); metricsAddr != "" {
+		// Issue #571 PR-A2: wire /healthz + /readyz on the
+		// metrics mux (operator-side, loopback-only) so the LB
+		// scrape + on-box monitoring see the same readiness as
+		// the customer-side /readyz (cmd/apid/handlers_ready.go)
+		// without depending on the cookie-auth path. The probe
+		// uses NewPGPingSignal against the same pool the
+		// customer-side /readyz pings, so both endpoints track the
+		// same source of truth. nil pool (test path with no
+		// metrics_addr wired) short-circuits to an always-ready
+		// signal so unit tests don't construct a pgxpool they
+		// don't need.
+		var apidProbe wire.ReadyzProbe
+		if deps.pool != nil {
+			pgSig, pgStop := wire.NewPGPingSignal(ctx, deps.pool, 5*time.Second)
+			apidProbe.RegisterSignal(pgSig, pgStop)
+			// NOTE: pgStop is wired through pkg/wire.ReadyzProbe.Drain
+			// (issue #571 PR-A2 / Finding 4 PR #1091 review). The
+			// earlier `defer pgStop()` is gone — Drain fires the
+			// helper goroutine's stopper synchronously before
+			// flipping the signal to "draining", so a /readyz
+			// scrape that lands during the SIGTERM drain window
+			// sees the helper already stopped (no re-flip race).
+		} else {
+			// Test path: no pool. Always-ready so /readyz returns
+			// 200. Mirrors the pre-split degradation pattern.
+			s := apidProbe.Register()
+			s.Set(true, "")
+		}
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.HandlerFor(
+			prometheus.Gatherers{ops.Registry(), budgetReg},
+			promhttp.HandlerOpts{Registry: ops.Registry()},
+		))
+		wire.ControlMuxLite(metricsMux, apidProbe.ReadyFunc(), apidProbe.ReasonFunc())
 		metricsSrv = &http.Server{
-			Addr: metricsAddr,
-			// promhttp.HandlerFor over a Gatherers chain serves
-			// both registries on a single scrape; the
-			// HandlerOpts.Registry is the writer for the `go_*`
-			// runtime collectors (registered against ops').
-			Handler: promhttp.HandlerFor(
-				prometheus.Gatherers{ops.Registry(), budgetReg},
-				promhttp.HandlerOpts{Registry: ops.Registry()},
-			),
+			Addr:    metricsAddr,
+			Handler: metricsMux,
 			// Issue #995 Phase 1: tighten the metrics listener.
 			// Loopback-only and no body, so the production defaults
 			// (60s/300s) are looser than needed — a 10s read / 10s

@@ -140,6 +140,18 @@ self-registration UPSERTs the same row. The synthetic
 
 ## Pre-flight
 
+For snapshot locality, prepare one secret-backed `/etc/faas/storage.env`
+payload and pass it to the provider-neutral join command as
+`--storage-env /secure/storage.env`. The join pipeline installs the same
+payload on the control plane and compute node. It must contain
+`FAAS_STORAGE_BACKEND=oci` and `FAAS_OCI_REGISTRY`; leave `snap/` out of
+`FAAS_STORAGE_LOCAL_PREFIXES` so snapshots remain in shared OCI storage and
+the node-local cache can be warmed by vmmd. Leave
+`FAAS_STORAGE_CACHE_DIR` unset for the default `/var/lib/faas/cache`, or set
+it to a non-empty path; an explicitly empty value disables the required
+prepositioning cache. Do not put registry credentials in the manifest,
+inventory, or git.
+
 ```sh
 # 1. Confirm the new node has the daemon fleet provisioned.
 ssh faas-fsn-2 'systemctl is-system-running && \
@@ -260,6 +272,7 @@ curl -fsS -X POST 'https://faas-fsn-1:8081/v1/compute-nodes' \
   -d '{
     "name": "fsn-2",
     "target_url": "tcp://vmmd-2.faas:50051",
+    "gateway_target_url": "tcp://fsn-2.gregale.dev:8080",
     "vpcpus": 160,
     "mem_mb": 56000,
     "max_concurrency": 200,

@@ -33,12 +33,13 @@ func UnitGatewaydPublic() daemonunit.Unit {
 		After:         []string{"faas-cp.slice", "network-online.target", "faas-apid.service"},
 		Wants:         []string{"faas-cp.slice", "faas-apid.service"},
 
-		Type:       "simple",
-		User:       "faas",
-		Group:      "faas",
-		ExecStart:  `/opt/faas/current/bin/gatewayd-public`,
-		Restart:    "on-failure",
-		RestartSec: "2s",
+		Type:               "simple",
+		User:               "faas",
+		Group:              "faas",
+		ExecStart:          `/opt/faas/current/bin/gatewayd-public`,
+		Restart:            "on-failure",
+		RestartSec:         "2s",
+		RestartCountExport: "SYSTEMD_RESTARTS_ON_FAILURE",
 
 		Slice:     "faas-cp.slice",
 		MemoryMax: "512M",
@@ -48,6 +49,8 @@ func UnitGatewaydPublic() daemonunit.Unit {
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_PUBLIC_CONTROL_ADDR", Value: "127.0.0.1:9092"},
 			{Key: "FAAS_INTERNAL_TARGET", Value: ""},
+			{Key: "FAAS_COMPUTE_GATEWAY_DISCOVERY", Value: "database"},
+			{Key: "FAAS_CONTROL_PLANE_API_TARGET", Value: "http://127.0.0.1:8081"},
 		},
 
 		NoNewPrivileges:         true,

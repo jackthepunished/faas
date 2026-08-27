@@ -65,6 +65,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -226,17 +227,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 	inflight := gateway.NewConnStateTracker()
 
 	// Reverse-proxy to gatewayd-internal. Same-box installs keep the unix
-	// socket contract; split-box control planes set FAAS_INTERNAL_TARGET to a
-	// private tcp://host:port target rendered from the manifest. The TCP
-	// dialer is fixed at startup so the customer request URL cannot influence
-	// the destination.
+	// socket contract. Stable split-box control planes use the database-backed
+	// compute gateway pool; FAAS_INTERNAL_TARGET remains a temporary legacy
+	// fallback so an old box can converge without an outage.
 	internalTarget := strings.TrimSpace(os.Getenv("FAAS_INTERNAL_TARGET"))
+	computeDiscovery := strings.TrimSpace(os.Getenv("FAAS_COMPUTE_GATEWAY_DISCOVERY"))
 	internalURL := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
 	var internalDialer gateway.InternalDialer
-	if internalTarget == "" {
+	switch {
+	case computeDiscovery == "database" && internalTarget == "":
+		internalDialer = newComputeGatewayPool(pgStore, log)
+		log.Info("gatewayd-public: database-backed compute gateway pool enabled")
+	case internalTarget == "":
 		internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
 		internalDialer = gateway.NewUnixSocketDialer(internalSocket)
-	} else {
+	default:
 		parsedTarget, parseErr := url.Parse(internalTarget)
 		if parseErr != nil || parsedTarget.Scheme != "tcp" || parsedTarget.Host == "" || parsedTarget.Path != "" {
 			return fmt.Errorf("gatewayd-public: FAAS_INTERNAL_TARGET must be tcp://host:port, got %q", internalTarget)
@@ -249,13 +254,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// the public→internal hop. The unix SynthServer enables native H2C;
 	// the split-box TCP listener uses the ordinary HTTP/1.1 server unless
 	// an operator explicitly enables H2C after both ends are configured.
-	h2cEnabled := envBoolOr("FAAS_INTERNAL_H2C", internalTarget == "")
+	h2cEnabled := envBoolOr("FAAS_INTERNAL_H2C", internalTarget == "" && computeDiscovery != "database")
 	proxy := gateway.NewInternalReverseProxy(
 		internalDialer,
 		internalURL,
 		log,
 		h2cEnabled,
 	)
+	// A dynamic dialer selects a different compute node per request. Do not
+	// let the transport pool an idle connection under the single logical
+	// gatewayd URL, otherwise a drained node could keep receiving traffic.
+	if computeDiscovery == "database" && internalTarget == "" {
+		if transport, ok := proxy.Transport.(*http.Transport); ok {
+			transport.DisableKeepAlives = true
+		}
+	}
 	// Issue #587 / PR-A: per-request drain tracker shared between
 	// the InternalReverseProxy and the control mux so every
 	// ServeHTTP surface contributes to the same in-flight count.
@@ -330,9 +343,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// reads the path suffix). Wrap the proxy in a mux that
 	// routes /v1/traces/ to the handler and falls through to the
 	// proxy for everything else.
+	controlPlaneTarget := envOr("FAAS_CONTROL_PLANE_API_TARGET", "http://127.0.0.1:8081")
+	controlPlaneHandler, err := newControlPlaneProxy(controlPlaneTarget, proxy, log)
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: control-plane API proxy: %w", err)
+	}
 	traceMux := http.NewServeMux()
 	traceMux.Handle("/v1/traces/", traceSetup.Handler)
-	traceMux.Handle("/", proxy)
+	traceMux.Handle("/", controlPlaneHandler)
 
 	// Public-facing handler: httpsec outer wrapper → budget middleware →
 	// trace mux → internal proxy.
@@ -359,6 +377,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, budgetReg, probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
+	// Multi-host safety cluster PR-8 (audit F8-A): in multi-host
+	// posture (FAAS_NODE_NAME != ""), refuse to boot with the
+	// loopback default — operator must explicitly set
+	// FAAS_PUBLIC_LISTEN_ADDR / FAAS_PUBLIC_CONTROL_ADDR. Without
+	// this gate, gatewayd-public binds 127.0.0.1 on a multi-box
+	// node and serves nothing; the LB can't reach it, traffic
+	// disappears. PR-9 emits the env vars from the manifest
+	// renderer so the box never reaches this error in a
+	// correctly bootstrapped fleet; this is the backstop.
+	if err := requirePublicBindInMultiHost(); err != nil {
+		return fmt.Errorf("gatewayd-public: multi-host bind check failed: %w", err)
+	}
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux)
 	// Tier A8 / ADR-083 (code-review fix #5): hook the public
 	// listener's ConnState to the in-flight tracker so the
@@ -446,7 +476,7 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           publicHandler,
+		Handler:           trace.HTTPHandler("gatewayd-public", publicHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
@@ -455,7 +485,7 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 	}
 	controlSrv := &http.Server{
 		Addr:              controlAddr,
-		Handler:           controlMux,
+		Handler:           trace.HTTPHandler("gatewayd-public-control", controlMux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second,
 		WriteTimeout:      time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second,
@@ -620,6 +650,61 @@ func envOr(envKey, def string) string {
 		return v
 	}
 	return def
+}
+
+// requirePublicBindInMultiHost enforces the multi-host safety
+// cluster PR-8 (audit F8-A) invariant: when the operator has
+// configured a node name (FAAS_NODE_NAME != "" — the multi-box
+// posture signal) AND the listen addr is the loopback default
+// the daemon would otherwise bind silently on a multi-box node,
+// refuse to boot with a loud error. Single-box installs leave
+// FAAS_NODE_NAME unset and the check falls through.
+//
+// The "explicit env override" branch is the escape hatch: an
+// operator who really does want the loopback bind (a node
+// behind an external LB, a smoke-test box) sets
+// FAAS_PUBLIC_LISTEN_ADDR explicitly. The os.LookupEnv check
+// distinguishes "unset → default → would loopback" from
+// "explicitly set to loopback" — the latter is allowed.
+//
+// The companion check for FAAS_PUBLIC_CONTROL_ADDR mirrors this
+// shape; the control listener serves /healthz, /readyz, /metrics,
+// but a loopback control bind on a multi-box node is also a
+// misconfiguration (no operator-side prometheus / kube-probe
+// can reach it).
+func requirePublicBindInMultiHost() error {
+	nodeName := os.Getenv("FAAS_NODE_NAME")
+	if nodeName == "" {
+		return nil // single-box posture; loopback is correct.
+	}
+
+	// Listen addr: distinguish unset (default → loopback) from
+	// explicitly set (operator override). The set-to-loopback
+	// case is permitted (escape hatch).
+	if _, explicit := os.LookupEnv("FAAS_PUBLIC_LISTEN_ADDR"); !explicit {
+		// Default would be the loopback bind. Refuse.
+		return fmt.Errorf(
+			"gatewayd-public: FAAS_NODE_NAME=%q indicates multi-host posture, but "+
+				"FAAS_PUBLIC_LISTEN_ADDR is unset and the default %q would loopback on this box. "+
+				"Set FAAS_PUBLIC_LISTEN_ADDR to a reachable host:port (e.g. 0.0.0.0:443 or "+
+				"the node's public IP) and ensure TLS termination is wired upstream. "+
+				"See docs/adr/126-public-bind-multi-host.md",
+			nodeName, defaultListenAddr)
+	}
+
+	// Control addr: same check. Single-box default loops back
+	// to 127.0.0.1:9092 which is correct (the loopback kube-probe
+	// path); multi-box demands an explicit bind.
+	if _, explicit := os.LookupEnv("FAAS_PUBLIC_CONTROL_ADDR"); !explicit {
+		return fmt.Errorf(
+			"gatewayd-public: FAAS_NODE_NAME=%q indicates multi-host posture, but "+
+				"FAAS_PUBLIC_CONTROL_ADDR is unset and the default %q would loopback on this box. "+
+				"Set FAAS_PUBLIC_CONTROL_ADDR to a reachable host:port for kube-probes / "+
+				"prometheus scrape. "+
+				"See docs/adr/126-public-bind-multi-host.md",
+			nodeName, defaultPublicControlAddr)
+	}
+	return nil
 }
 
 // envBoolOr parses common true/false spellings for an env knob.

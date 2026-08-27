@@ -52,7 +52,7 @@ const dataUpstreamsListMaxLimit = 50
 // cross-scope (per ADR-098 §D5 — the per-app cap is unchanged
 // across scopes) so the dashboard renders one unified bar.
 func (s *server) listUpstreams(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !s.dataPlacementEnabled {
+	if !s.runtimeBool(runtimeConfigDataPlacement, s.dataPlacementEnabled) {
 		api.WriteProblem(w, api.ErrPlanFeatureGated("data_upstreams", acct.Plan))
 		return
 	}
@@ -129,7 +129,7 @@ func (s *server) listUpstreams(w http.ResponseWriter, r *http.Request, acct stat
 // getUpstream returns one upstream by ID. Used by the dashboard's
 // "edit upstream" pane.
 func (s *server) getUpstream(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !s.dataPlacementEnabled {
+	if !s.runtimeBool(runtimeConfigDataPlacement, s.dataPlacementEnabled) {
 		api.WriteProblem(w, api.ErrPlanFeatureGated("data_upstreams", acct.Plan))
 		return
 	}
@@ -170,7 +170,7 @@ func (s *server) getUpstream(w http.ResponseWriter, r *http.Request, acct state.
 // (the §D1.a env-key closed set) is irrelevant here — the
 // customer is explicitly creating the row, not inferring it.
 func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !s.dataPlacementEnabled {
+	if !s.runtimeBool(runtimeConfigDataPlacement, s.dataPlacementEnabled) {
 		api.WriteProblem(w, api.ErrPlanFeatureGated("data_upstreams", acct.Plan))
 		return
 	}
@@ -316,7 +316,7 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 // pg_notify and confuse schedd). The FK CASCADE on account_id
 // / app_id handles the GDPR path automatically.
 func (s *server) deleteUpstream(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if !s.dataPlacementEnabled {
+	if !s.runtimeBool(runtimeConfigDataPlacement, s.dataPlacementEnabled) {
 		api.WriteProblem(w, api.ErrPlanFeatureGated("data_upstreams", acct.Plan))
 		return
 	}

@@ -20,6 +20,13 @@ Group=faas
 ExecStart=/opt/faas/current/bin/builderd
 Restart=on-failure
 RestartSec=2s
+# PR #1082 review-fix #2: surface the per-unit restart count to the
+# daemon via $SYSTEMD_RESTARTS_ON_FAILURE (systemd 254+
+# RestartCountExport). pkg/wire/daemon.go::Daemon() reads the env var
+# at boot and records it on daemon_restart_count so the
+# FaasRestartLoop / FaasRepeatedRestart / FaasStuckActivating alerts
+# (ADR-128) have a real-time signal.
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
 MemoryMax=512M
@@ -29,14 +36,14 @@ MemoryMax=512M
 # the resource cap and the sandbox. The /srv/fc/builder dir is the
 # staging root for the build artifact; ReadWritePaths= below
 # whitelists exactly the paths the daemon writes to.
-# FAAS_BUILDERD_CONFIG set via EnvironmentFile=/etc/faas/sealed.env;
-# FAAS_BUILDERD_ROLE set via the 99-faas-role.conf drop-in (Mega-PR-C).
-# Sealed env is the production source for optional overrides; the TOML
-# config remains sufficient for an image-seeded compute node. A missing
-# sealed file must not turn the role-correct builder daemon into a systemd
-# 203/resources loop during first boot.
-EnvironmentFile=-/etc/faas/sealed.env
+# FAAS_BUILDERD_CONFIG set via the 99-faas-role.conf drop-in (Mega-PR-C);
+# sealed.env is no longer read (issue #585 / ADR-127 — apid-only).
+# compute-db.env is kept for the optional DATABASE_URL the TOML config
+# references on OCI-backed storage backends.
 EnvironmentFile=-/etc/faas/compute-db.env
+# Shared OCI storage contract. Optional for single-box/local deployments;
+# required on a multi-box fleet and identical on every storage consumer.
+EnvironmentFile=-/etc/faas/storage.env
 
 NoNewPrivileges=yes
 ProtectSystem=strict

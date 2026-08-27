@@ -1565,6 +1565,30 @@ func StatusForCode(code string) int {
 		// handler maps LogArchiveEnabled() == false to this
 		// code via ErrPlanLogArchiveNotAllowed.
 		return http.StatusPaymentRequired
+	case CodePlanPerAppMetricsNotAllowed:
+		// Per-app observability surface (per-app metrics +
+		// wake-timeline JSON mirror) is Hobby+. Free gets the
+		// 402 + upsell at the apid handler edge
+		// (cmd/apid/handlers_metrics.go +
+		// cmd/apid/handlers_wake_timeline.go). Mirrors the
+		// LogArchiveNotAllowed posture.
+		return http.StatusPaymentRequired
+	case CodePlanAppUsageSummaryNotAllowed:
+		// Per-app billing-usage read is Hobby+. Free gets the
+		// 402 + upsell at cmd/apid/handlers_usage.go. Same
+		// family as the other "X unavailable on this plan"
+		// codes above.
+		return http.StatusPaymentRequired
+	case CodePlanAppErrorsNotAllowed:
+		// Per-app error-fingerprint read is Hobby+. Free gets
+		// the 402 + upsell at
+		// cmd/apid/handlers_app_errors.go. Same family as
+		// the other "X unavailable on this plan" codes
+		// above. The retention ceiling is enforced separately
+		// via Limits.AppErrorsRetentionDays (the handler
+		// clamps the `since` window to the new bound on
+		// every call).
+		return http.StatusPaymentRequired
 	// Issue #561 — spend cap pauses workload. 402 mirrors the existing
 	// `CodePlanFeatureGated` / `CodePlanCronsNotAllowed` /
 	// `CodePlanAlertRulesNotAllowed` family: a deliberate account-level
@@ -2159,6 +2183,28 @@ const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
 // the body.
 const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
 
+// CodeAlertPresetInvalid is the 400 the customer sees when an
+// enable-from-preset body is malformed (closed-set drift on
+// cooldown_minutes, oversized webhook_secret, etc). Issue
+// #1233 / ADR-123.
+const CodeAlertPresetInvalid = "alert_preset_invalid"
+
+// CodeAlertPresetDisabled is the 400 the customer sees when the
+// catalog row is enabled_in_catalog=false (the preset is staged
+// for a future release). Mirrors CodeAlertPresetInvalid's
+// status so the dashboard renders the same "coming soon"
+// affordance the catalog grid already shows for the disabled
+// rows.
+const CodeAlertPresetDisabled = "alert_preset_disabled"
+
+// CodePlanAlertPresetsNotAllowed is the 402 the customer sees
+// when their plan is below the preset's minimum_plan (e.g. a
+// Hobby customer trying to enable api_down whose minimum_plan
+// is Pro). Fires BEFORE loadApp so a low-plan customer posting
+// to a non-existent slug gets a clean 402 — same slug-leak
+// guard as CodePlanAlertRulesNotAllowed. Issue #1233 / ADR-123.
+const CodePlanAlertPresetsNotAllowed = "plan_alert_presets_not_allowed"
+
 // CodePlanConsumerKeyQuotaReached is the RFC 7807 stable code
 // returned when the per-app or per-account consumer_keys quota is
 // exhausted. The intent is "your plan allows N keys per app (or per
@@ -2349,6 +2395,73 @@ func ErrPlanLogArchiveNotAllowed(p Plan) *Problem {
 		WithDocs(docsBase + "/plans#log-archive")
 }
 
+// CodePlanPerAppMetricsNotAllowed (per-app observability surface)
+// gates GET /v1/apps/{slug}/metrics and the JSON mirror of the
+// wake-timeline page (GET /v1/apps/{slug}/wake-timeline). Mirrors
+// ErrPlanLogArchiveNotAllowed / ErrPlanCronsNotAllowed: 402 + a
+// stable `code` the SDK branches on without parsing the body. Free
+// never sees the latency / cold-boot / wake-narrative surface so
+// the customer gets the upsell rather than a silent 404.
+const CodePlanPerAppMetricsNotAllowed = "plan_per_app_metrics_not_allowed"
+
+// ErrPlanPerAppMetricsNotAllowed is returned by the apid
+// per-app observability handlers (cmd/apid/handlers_metrics.go +
+// cmd/apid/handlers_wake_timeline.go) when the customer's plan has
+// PerAppMetricsAllowed() == false (Free today). The Hobby+ copy is
+// the deliberate upgrade hint; Free never sees the metrics surface
+// so the customer gets the upsell message rather than a silent 404.
+func ErrPlanPerAppMetricsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanPerAppMetricsNotAllowed,
+		"Per-app metrics unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include per-app metrics; upgrade to Hobby or above to see latency, error rate, cold-boot ratio and the wake-narrative.", p)).
+		WithDocs(docsBase + "/plans#per-app-metrics")
+}
+
+// CodePlanAppUsageSummaryNotAllowed (per-app billing-usage read)
+// gates GET /v1/apps/{slug}/usage. Mirrors the ErrPlanLogArchive
+// shape: 402 + a stable `code` the SDK branches on without parsing
+// the body. Free never sees the billing-usage surface so the
+// customer gets the upsell rather than a silent 404.
+const CodePlanAppUsageSummaryNotAllowed = "plan_app_usage_summary_not_allowed"
+
+// ErrPlanAppUsageSummaryNotAllowed is returned by the apid usage
+// handler (cmd/apid/handlers_usage.go) when the customer's plan has
+// AppUsageSummaryAllowed() == false (Free today). The Hobby+ copy
+// is the deliberate upgrade hint; Free never sees the
+// billing-usage surface so the customer gets the upsell message
+// rather than a silent 404.
+func ErrPlanAppUsageSummaryNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanAppUsageSummaryNotAllowed,
+		"App usage summary unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include per-app billing-usage read-back; upgrade to Hobby or above to see this-month GB-hours and the plan-included vs overage split.", p)).
+		WithDocs(docsBase + "/plans#app-usage-summary")
+}
+
+// CodePlanAppErrorsNotAllowed (per-app error-fingerprint read)
+// gates GET /v1/apps/{slug}/errors/summary. Mirrors the
+// ErrPlanLogArchive shape: 402 + a stable `code` the SDK branches
+// on without parsing the body. Free never sees the grouped-error
+// surface so the customer gets the upsell rather than a silent
+// 404.
+const CodePlanAppErrorsNotAllowed = "plan_app_errors_not_allowed"
+
+// ErrPlanAppErrorsNotAllowed is returned by the apid
+// error-summary handler (cmd/apid/handlers_app_errors.go) when the
+// customer's plan has AppErrorsAllowed() == false (Free today).
+// The Hobby+ copy is the deliberate upgrade hint; Free never sees
+// the grouped-error surface so the customer gets the upsell
+// message rather than a silent 404. The retention ceiling is
+// separately enforced via Limits.AppErrorsRetentionDays — the
+// handler clamps the `since` window to the new bound on every
+// call so a downgraded customer sees "no history visible" rather
+// than a torn page.
+func ErrPlanAppErrorsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanAppErrorsNotAllowed,
+		"App error grouping unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include per-app error-fingerprint grouping; upgrade to Hobby or above to see top failing endpoints and drill-down samples.", p)).
+		WithDocs(docsBase + "/plans#app-errors")
+}
+
 // CodeAppWebhookInvalid is the 400 the customer sees for any
 // malformed webhook body — missing target_url, invalid retry_policy,
 // out-of-vocabulary event, oversize webhook_secret, etc.
@@ -2529,6 +2642,40 @@ func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Proble
 		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#alerts")
+}
+
+// ErrAlertPresetInvalid is the closed-set + shape error for
+// enable-from-preset requests (issue #1233, ADR-123). Mirrors
+// ErrAlertRuleInvalid's shape so the CLI's problem-code table is
+// one row deep.
+func ErrAlertPresetInvalid(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAlertPresetInvalid,
+		"Invalid alert preset", reason).
+		WithDocs(docsBase + "/alerts/presets")
+}
+
+// ErrAlertPresetDisabled is returned when the customer POSTs to
+// enable a catalog row whose enabled_in_catalog=false. The 8
+// catalog rows ship 5 disabled in PR-A (the same 5 the dashboard
+// renders with a "coming soon" badge); the 402 is the API-side
+// mirror of that UX so a CLI caller gets the same hint.
+func ErrAlertPresetDisabled(presetName string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAlertPresetDisabled,
+		"Alert preset not yet available",
+		fmt.Sprintf("the %q preset is staged for a future release; check the catalog for available presets.", presetName)).
+		WithDocs(docsBase + "/alerts/presets")
+}
+
+// ErrPlanAlertPresetsNotAllowed is returned when the customer's
+// plan is below the preset's minimum_plan (e.g. Hobby trying
+// api_down whose floor is Pro). 402 mirrors ErrPlanAlertRulesNotAllowed
+// so the slug-leak guard pattern is one row deep.
+func ErrPlanAlertPresetsNotAllowed(plan Plan, presetName, minimumPlan string) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanAlertPresetsNotAllowed,
+		"Alert preset not available on this plan",
+		fmt.Sprintf("the %q preset requires the %s plan or higher; the %s plan does not include it.",
+			presetName, minimumPlan, plan)).
 		WithDocs(docsBase + "/plans#alerts")
 }
 

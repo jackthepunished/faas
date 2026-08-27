@@ -305,6 +305,7 @@ func (h HostPolicy) Render() string {
 	var b strings.Builder
 	b.WriteString("#!/usr/sbin/nft -f\n")
 	b.WriteString("# onebox-faas nftables.conf (spec §7, §11)\n")
+	b.WriteString("# Managed by Gregale Ansible; do not edit on the host.\n")
 	b.WriteString("# Tenant egress denylist — SMTP, RFC1918, link-local, metadata.\n")
 	b.WriteString("# Tap proxy NAT — used by gatewayd-internal for outbound guest traffic.\n")
 	b.WriteString("\n")

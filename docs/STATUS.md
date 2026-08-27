@@ -505,7 +505,7 @@ The §14 M8 gates still on the board are listed in [What's next](#whats-next).
 
 - **ADR-066** (Tier A5 cross-node live-instance migration, accepted 2026-08-07): four-phase handoff (Park → mint lease → `MigrateInstanceOwner` → ack), `schedd_live_migration_decisions_total{outcome}` counter, `apps.migrated_at` + `instances.migrated_at` stamped in the same transaction. Bundled with PR #509 (Tier A4 per-node schedd), PRs in the ADR-066 → 067 → 068 cluster.
 - **ADR-062** (per-node schedd + async placement claim, accepted 2026-08-16): single-writer-per-host invariant survives multi-host deploys; `apid_control_plane_only` depguard in `.golangci.yml` prevents a control-plane path from calling a compute-only peer.
-- **ADR-063** (snapshot de-localization, accepted 2026-08-16): snapshots are per-schedd-local caches; authoritative blob lives in the shared OCI registry (ADR-054). Cross-node wake pulls on demand; acceptable for v1.0 because the cold-boot path (ADR-005) is the slow path.
+- **ADR-063** (snapshot de-localization, revised 2026-08-26; issue #1054): snapshots use the shared OCI backend as the authoritative transport, while each active node's vmmd asynchronously prepositions both restore blobs through a durable `snapshot_replicas` queue. Origin metadata restricts new fan-out to the producer's region; wake placement prefers ready local replicas and retains on-demand restore/cold-boot fallback. The two-node ≤200 ms prepositioned-wake measurement and 100-cycle leak drill remain M9 acceptance work.
 - **ADR-067** (migrating-instance watchdog, accepted 2026-08-16): 1 s ticker self-heals stuck `state='migrating'` rows that never committed (peer died mid-handoff, gRPC dropped, operator killed the new owner). The watchdog is the only writer that can move a row out of `migrating` without a peer commit.
 - **ADR-110** (declarative split-box manifest, accepted 2026-08-16): versioned YAML + typed schema at `deploy/manifest/splitbox.yaml` + `pkg/manifest/`; SemVer `schema_version (1.0.0)`; canonical validation through `gregalectl manifest validate` + the renderer + the release bundle installer + the doctor + the metal harness. PR-cluster shipped (PRs #912 #913 #914 #915 #917 #918 #919 #920 #921 #922 #923 #924).
 
@@ -1216,10 +1216,10 @@ add `deploy/ansible/roles/metal-h2c-acceptance/`).
     `metalAvailable(t)` gates using the canonical pattern at
     `cmd/e2e/deploy_override_port_metal_test.go:165`. Build tag
     `//go:build metal` preserved. Depends on G19.1 + G19.3.
-  - **G19.3** — `deploy/ansible/roles/metal-h2c-acceptance/`. Mirrors
-    `deploy/ansible/roles/control_plane_service/` shape;
-    `defaults/main.yml` exposes a 5-app fixture set
-    (`app_http1_default`, `app_http2_prior_knowledge`,
-    `app_grpc_unary`, `app_grpc_server_streaming`,
-    `app_surgical_rollback_target`); `tasks/main.yml` runs the 5
-    §14 M8 row 5 acceptance gates. Depends on G19.1 + G19.2.
+  - **G19.3** — `deploy/ansible/roles/metal-h2c-acceptance/`. The
+    opt-in role is now implemented with the five-app fixture contract,
+    KVM/x86_64 preflight, root-owned secret environment, non-root oneshot
+    harness, and five named §14 M8 row 5 gates. It is invoked only through
+    `deploy/ansible/metal-h2c-acceptance.yml`; the normal production
+    `bootstrap.yml` remains unchanged. G19.2 still owns enabling the Go
+    metal tests once a real acceptance host is available.

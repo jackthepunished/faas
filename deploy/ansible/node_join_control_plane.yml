@@ -1,0 +1,46 @@
+---
+# Converge only the control-plane access policy needed before adopting a new
+# compute node. The provider-neutral join command runs this play with
+# `--limit control_plane`, then runs node_join.yml with the new node limit.
+# Keeping the plays separate prevents a join from re-running the full fleet
+# bootstrap or touching already-adopted compute nodes.
+
+- name: Converge control-plane peer access for the joining node
+  hosts: control_plane
+  gather_facts: true
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  pre_tasks:
+    - name: Ensure the shared daemon group exists before staging storage config
+      ansible.builtin.group:
+        name: faas
+        state: present
+        system: true
+
+    - name: Ensure the control-plane configuration directory exists
+      ansible.builtin.file:
+        path: /etc/faas
+        state: directory
+        owner: root
+        group: faas
+        mode: "0750"
+
+    - name: Stage the shared OCI storage environment on the control plane
+      ansible.builtin.copy:
+        src: "{{ faas_join_storage_env_source }}"
+        dest: /etc/faas/storage.env
+        owner: root
+        group: faas
+        mode: "0440"
+      no_log: true
+      when: (faas_join_storage_env_source | default('') | trim) != ''
+  roles:
+    # The generated control-plane host vars contain the complete manifest
+    # allowlists. This renders the canonical nftables policy, including the
+    # new compute CIDR and scheduler/API ports.
+    - role: nftables
+    # PostgreSQL has a separate role because the normal postgres role also
+    # owns password/bootstrap policy. A join must only update the listener
+    # and pg_hba from the already-provisioned control-plane credentials.
+    - role: control_plane_peer_access

@@ -14,9 +14,21 @@ export type SourceTarballDeployRequest = {
    * 40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA.
    */
   ref?: string | null;
-  reason?: string | null;
+  /**
+   * Free-form operator note on the tarball deploy request (≤280 chars). Example: 'Emergency rollback after payment provider incident'.
+   */
+  reason?: string;
+  /**
+   * Closed-set annotation tag on the tarball deploy request for grouping/filtering.
+   */
   tag?: 'incident_recovery' | 'hotfix' | 'scheduled_maintenance' | 'compliance_hold' | 'partner_request';
-  deployed_by?: string | null;
-  pr_number?: number | null;
+  /**
+   * Human-readable actor label on the tarball deploy request. CLI auto-captures from `git config user.name`; githubd stamps pusher.name; the GitHub Action defaults to ${{ github.actor }}.
+   */
+  deployed_by?: string;
+  /**
+   * Pull-request number that drove this tarball deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR.
+   */
+  pr_number?: number;
 };
 

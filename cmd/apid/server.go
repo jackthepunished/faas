@@ -88,6 +88,15 @@ type server struct {
 	// never invalidates. Wired via WithSpecCache from
 	// cmd/apid/main.go (production) or kept nil (unit tests).
 	specCache *openapidiff.SpecCache
+	// PR #1099 P2 redesign: force-park + force-cold-boot now
+	// route through the operator_intents table + pg_notify
+	// (migrations/00431). apid never imports pkg/scheddgrpc —
+	// the apid-control-plane-only depguard rule
+	// (.golangci.yml:41-58) is preserved. The handler flow is
+	// INSERT operator_intents row → s.notif.Notify('operator_intent',
+	// payload) → return 202 Accepted; schedd (the only writer
+	// to instances) claims + dispatches via the
+	// pkg/sched/operator_intent_subscriber.go drain.
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -222,6 +231,10 @@ type server struct {
 	// from it. Wired via WithDataPlacement from
 	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
 	dataPlacementEnabled bool
+	// runtimeConfig is the durable operator configuration snapshot. It is
+	// deliberately in-memory for request hot paths; the admin handler writes
+	// Postgres and the notification reconciler refreshes this snapshot.
+	runtimeConfig *runtimeConfigManager
 	// hostHashFunc (issue #957) is the test seam for forcing
 	// the env-classifier into the silent-skip branch. Nil in
 	// production (cmd/apid/main.go does NOT call
@@ -469,7 +482,47 @@ func (s *server) WithEventsPlatform(p *events.Platform) *server {
 // existing positional call sites in tests don't need editing.
 func (s *server) WithDataPlacement(enabled bool) *server {
 	s.dataPlacementEnabled = enabled
+	if s.runtimeConfig == nil {
+		s.runtimeConfig = newRuntimeConfigManager(nil)
+	}
+	_ = s.runtimeConfig.apply(runtimeConfigDataPlacement, boolJSON(enabled))
 	return s
+}
+
+// WithRuntimeConfigManager replaces the default environment-seeded manager
+// with the production manager using the caller's environment seam. The
+// setter keeps the existing test constructors source-compatible while making
+// runtime configuration injectable in boot tests.
+func (s *server) WithRuntimeConfigManager(manager *runtimeConfigManager) *server {
+	if manager != nil {
+		s.runtimeConfig = manager
+		// Apply the bootstrap HSTS value through the same side-effect path
+		// used by a later hot update. This keeps the environment fallback
+		// and the durable operator override on one source of truth.
+		_ = s.runtimeConfig.apply(runtimeConfigHSTS, s.runtimeConfig.Value(runtimeConfigHSTS))
+	}
+	return s
+}
+
+func (s *server) runtimeBool(key string, fallback bool) bool {
+	if s.runtimeConfig == nil {
+		return fallback
+	}
+	return s.runtimeConfig.Bool(key, fallback)
+}
+
+func (s *server) runtimeInt(key string, fallback int) int {
+	if s.runtimeConfig == nil {
+		return fallback
+	}
+	return s.runtimeConfig.Int(key, fallback)
+}
+
+func boolJSON(value bool) []byte {
+	if value {
+		return []byte("true")
+	}
+	return []byte("false")
 }
 
 // WithHostHashFunc (issue #957) attaches a stub for the env-
@@ -675,6 +728,7 @@ func newServerWithDeps(
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
 		audit:                  aud,
+		runtimeConfig:          newRuntimeConfigManager(nil),
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the
@@ -906,6 +960,22 @@ func (s *server) handler() http.Handler {
 	// cross-account slug is a 404, not a 200 with another tenant's
 	// data.
 	mux.HandleFunc("GET /v1/apps/{slug}/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppMetrics)))
+	// Per-app dashboard JSON mirror — wire-friendly emission of the
+	// same shape the dashboard HTML page renders (cmd/apid/
+	// handlers_dashboard.go:2548 renderAppWakeTimeline). Auth chain
+	// matches /v1/apps/{slug}/metrics (read-only, no MFA, primary
+	// caller is an API key with ScopesReadSurface). Plan-gated
+	// Hobby+ via handlers_app_wake_timeline_json.go::getAppWakeTimeline.
+	// Distinct from the per-wake-id endpoint at /v1/apps/{slug}/wakes/
+	// {wake_id}/timeline below — that's issue #517 / PR-C, this is
+	// the per-app rollup mirror.
+	mux.HandleFunc("GET /v1/apps/{slug}/wake-timeline", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppWakeTimeline)))
+	// Per-app billing usage summary (commit 4 of the per-app
+	// observability PR series). Same auth chain as the other
+	// Hobby+-gated surfaces (read-only, no MFA, IDOR-safe via
+	// loadApp). Plan-gated Hobby+ via AppUsageSummaryAllowed —
+	// same 402 contract as /metrics and /wake-timeline.
+	mux.HandleFunc("GET /v1/apps/{slug}/usage", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppUsage)))
 	// ADR-093: per-route observability reader. Same auth chain
 	// as /v1/apps/{slug}/metrics (read-only, no MFA, primary
 	// caller is an API key with ScopesReadSurface). The handler
@@ -1265,6 +1335,19 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))
 
+	// Alert presets (ADR-123 / issue #1233). Catalog R/O for
+	// customers; instantiate-from-preset reuses the alert-rules
+	// create path (handlers_alert_presets.go). The enable route
+	// is idempotent so SDK retries are safe — the duplicate POST
+	// returns 409 "Preset already enabled" so the caller can
+	// branch on a stale POST without silently no-op'ing. Plan-tier
+	// gate (catalog row's minimum_plan → 402) and disabled-row
+	// gate (enabled_in_catalog=false → 400 alert_preset_disabled)
+	// both fire BEFORE loadApp for the same slug-leak reason
+	// createAlertRule gates on the per-plan cap (PR review F4).
+	mux.HandleFunc("GET /v1/alert-presets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertPresets))))
+	mux.HandleFunc("POST /v1/apps/{slug}/alert-presets/{name}/enable", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.enableAlertPreset)))))
+
 	// Edge rules (ADR-089, planned). Customer-facing resource that
 	// runs in pkg/gateway BEFORE host→app resolution. Mirrors the
 	// alert-rules decorator chain: authLimited → requireMFA →
@@ -1431,10 +1514,20 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsOverview))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListTenants))))
+	mux.HandleFunc("GET /v1/admin/obs/capacity",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsCapacity))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}/360",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsTenant360))))
 	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsGetTenant))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}/activity",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsTenantActivity))))
+	mux.HandleFunc("GET /v1/admin/obs/apps/{id}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsAppDetail))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/detail",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeDetail))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
 	// PR #4 (ADR-092 §3.6) — per-node wake-latency quantiles.
@@ -1461,6 +1554,79 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodesEventsSSE))))
 	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
+	// P5 (operator-side observability mega-PR / Commit 7) —
+	// builderd fleet heartbeat + build-queue depth. Today's row
+	// count is zero: the underlying writer (pkg/builderd/heartbeat.go)
+	// is deferred per the Commit 7 PR risk list — builderd does
+	// not currently self-register a compute_nodes row at startup.
+	mux.HandleFunc("GET /v1/admin/obs/builder-heartbeats",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsBuilderHeartbeats))))
+
+	// P2a + P2b + P2d — operator recovery primitives. All three
+	// routes mount under requireScope(admin-only) so the admin
+	// allowlist (s.adminAllows at compute_nodes.go:74-86) is the
+	// only structural gate. The handlers themselves additionally
+	// require ?confirm=true as a tripwire against operator
+	// fat-fingering (matches the force-drain --yes ack at
+	// commands_compute_nodes.go:249).
+	mux.HandleFunc("POST /v1/admin/instances/{id}/force-park",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForcePark))))
+	mux.HandleFunc("POST /v1/admin/apps/{slug}/force-cold-boot",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceColdBoot))))
+	// P2d — operator recovery primitive: force-restart kills a
+	// wedged live instance + flips the deployment's latest warm +
+	// init snapshots stale so the next Wake takes the cold-boot
+	// branch. PR #1105 follow-on to PR #1099. Same auth posture
+	// (admin scope + MFA + allowlist) and ?confirm=true tripwire
+	// as force-park / force-cold-boot above.
+	mux.HandleFunc("POST /v1/admin/instances/{id}/force-restart",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postForceRestart))))
+	// PR #1099 P2 redesign: polling endpoint for the
+	// operator_intents rows. NO MFA — mirrors getFireCronRequest
+	// at cmd/apid/handlers_fire_cron_request.go:38-83 because the
+	// operator is already authenticated via the initial POST; MFA
+	// at the polling endpoint would re-auth without operational
+	// benefit. Admin scope + s.adminAllows are the only access
+	// controls (the admin scope gate is the load-bearing IDOR
+	// closure — fleet-level intents with account_id=NULL are
+	// visible to any admin).
+	mux.HandleFunc("GET /v1/admin/operator-intents/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.getOperatorIntent)))
+	// P2c (reclaim-stuck-build) — fleet-level sweep that calls
+	// state.Store.SweepStuckRunningBuilds directly (per user
+	// decision, NO builderd gRPC server). ?older_than= is
+	// clamped to [1m, 60m] so a fat-fingered "1ns" cannot sweep
+	// in-flight builds.
+	mux.HandleFunc("POST /v1/admin/builds/sweep-stuck",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postSweepStuckBuilds))))
+	// Compute-node lifecycle controls. They are deliberately separate from
+	// the read-only /obs namespace and require both MFA and confirm=true.
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/suspend",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountSuspend))))
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/restore",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountRestore))))
+	mux.HandleFunc("POST /v1/admin/ops/accounts/{id}/revoke-sessions",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsAccountRevokeSessions))))
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/drain",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeDrain))))
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/force-drain",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeForceDrain))))
+	mux.HandleFunc("POST /v1/admin/ops/nodes/{name}/activate",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.postObsNodeActivate))))
+
+	// ADR-132 — typed runtime configuration. GET and PATCH are MFA-gated
+	// because the catalog includes security-adjacent deployment posture. Hot
+	// values apply in the request; graceful values become durable operations.
+	// Filesystem/bootstrap settings remain visible as deployment-managed
+	// entries.
+	mux.HandleFunc("GET /v1/admin/config",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigList))))
+	mux.HandleFunc("PATCH /v1/admin/config/{key}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigPatch))))
+	mux.HandleFunc("GET /v1/admin/config-operations/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigOperationGet)))
+	mux.HandleFunc("GET /v1/admin/config/{key}/revisions",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.adminRuntimeConfigRevisions)))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
@@ -1852,6 +2018,14 @@ func (s *server) handler() http.Handler {
 	// so the customer's next page-load sees the live SSE stream
 	// for the fresh row.
 	mux.Handle("POST /dashboard/apps/{slug}/deployments/{id}/retry", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRetryDeployment))))
+	// Issue #1233 / ADR-123 — alert-preset enable from the
+	// dashboard's preset grid. Same CSRF-envelope shape as
+	// dashboardFireCron (form-encoded body, action=
+	// "enable_alert_preset"). The handler delegates to
+	// enableAlertPresetFromForm after CSRF + auth so the JSON
+	// path (POST /v1/apps/{slug}/alert-presets/{name}/enable)
+	// and the dashboard path share a single guard order.
+	mux.Handle("POST /dashboard/apps/{slug}/alert-presets/{name}/enable", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardEnablePreset))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires
@@ -1930,6 +2104,12 @@ func (s *server) handler() http.Handler {
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)
 	// Dependency-aware readiness probe (testing PostgreSQL pool ping).
+	// Note: this is the CUSTOMER-side /readyz (cookie-auth path) and
+	// returns a rich JSON body. The OPERATOR-side /readyz on the
+	// metrics mux (cmd/apid/main.go:~1518, issue #571 PR-A2) uses
+	// pkg/wire.ControlMuxLite + NewPGPingSignal and returns a short
+	// ASCII body for the LB scrape. The two share the same source
+	// of truth (the same pgxpool) but different auth shapes.
 	mux.HandleFunc("GET /readyz", s.readyz)
 
 	// Spec hosting (anonymous; see pkg/apid/openapi_handler.go).

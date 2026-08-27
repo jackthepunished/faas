@@ -16,6 +16,13 @@ Type=simple
 ExecStart=/opt/faas/current/bin/gatewayd-public
 Restart=on-failure
 RestartSec=2s
+# PR #1082 review-fix #2: surface the per-unit restart count to the
+# daemon via $SYSTEMD_RESTARTS_ON_FAILURE (systemd 254+
+# RestartCountExport). pkg/wire/daemon.go::Daemon() reads the env var
+# at boot and records it on daemon_restart_count so the
+# FaasRestartLoop / FaasRepeatedRestart / FaasStuckActivating alerts
+# (ADR-128) have a real-time signal.
+RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
 MemoryMax=512M
@@ -42,6 +49,8 @@ AmbientCapabilities=
 # control. Read by cmd/gatewayd-public/main.go:154 (envOr("FAAS_PUBLIC_CONTROL_ADDR")).
 Environment=FAAS_PUBLIC_CONTROL_ADDR=127.0.0.1:9092
 Environment=FAAS_INTERNAL_TARGET=
+Environment=FAAS_COMPUTE_GATEWAY_DISCOVERY=database
+Environment=FAAS_CONTROL_PLANE_API_TARGET=http://127.0.0.1:8081
 
 # Hardening baseline — gatewayd-public is NOT root; runs as faas:faas.
 User=faas

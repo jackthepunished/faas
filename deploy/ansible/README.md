@@ -11,11 +11,12 @@ In order (each role is independent and verifies its own preconditions):
 |---|---|---|---|
 | `cgroups_v2` | §11 | asserts kernel cmdline | verify-only |
 | `grub` | §11 | `/etc/default/grub`, sysctl | `creates:` sentinel, regex match |
-| `lvm` | §8 | verify lv-system / lv-fc | verify-only |
-| `xfs` | §8 | `/srv/fc/jail` tmpfs | `/etc/fstab` `update` |
+| `storage` | §8 | provider-neutral `/srv/fc` filesystem and directory contract | reuses valid mounts; initializes only eligible blank devices |
+| `lvm` | §8 | verify lv-system / lv-fc when the reference layout is selected | verify-only |
+| `xfs` | §8 | dedicated fast-root mount, XFS features, `/srv/fc/jail` tmpfs | explicit device contract + `/etc/fstab` |
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
-| `nftables` | §7 | `/etc/nftables.conf` | `creates:` + `nft -c` syntax check |
+| `nftables` | §7 | `/etc/nftables.conf` | managed-marker backup + `nft -c` syntax check |
 | `postgres` | §1 (cp slice), §4 | distro PostgreSQL major, `faas` user | apt idempotent, `creates:` on home |
 
 ## Run it
@@ -28,6 +29,29 @@ make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-c
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 ```
 
+Every bootstrap target first runs `ansible-preflight` against the complete
+inventory. This is intentional: a role-limited run still renders the same
+private endpoint map on every host, so a missing peer address must stop the
+deployment before any host is changed. Run it explicitly when validating a
+new provider or inventory:
+
+```
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-preflight
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini ansible-syntax-check
+```
+
+SSH host-key checking is enabled by default. Seed the operator workstation's
+`known_hosts` from the provider console or another trusted channel before the
+first connection; never disable host-key verification for a production run.
+
+For a provider whose default route is public, define
+`faas_private_address` in provider-owned `host_vars` or inventory variables.
+It must be the stable private transport address used for host-to-host
+communication; do not copy a provider IP into the manifest or daemon URLs.
+The preflight rejects missing addresses, non-Linux/non-x86 hosts, and hosts
+without systemd. It also caches the discovered peer map for the subsequent
+role-limited bootstrap.
+
 ### Bootstrap targets (issue #911 / ADR-110)
 
 The split-box inventory maps to two Makefile targets:
@@ -36,6 +60,30 @@ The split-box inventory maps to two Makefile targets:
 |---|---|---|---|
 | `make bootstrap-control-plane` | `control_plane` | fsn-1 (control-plane) | split-box provisioning (PG-1) |
 | `make bootstrap-compute` | `compute_nodes` | fsn-2 (compute-only) | split-box provisioning (PG-1) |
+
+For a machine that was created outside the project (GCP, Hetzner, OVH, or
+another bare-metal provider), use the provider-neutral adoption pipeline:
+
+```text
+gregalectl deploy join-node --manifest-file /secure/manifest.yaml \
+  --node fsn-3 --ssh-host 203.0.113.27 [artifact and secret inputs] --yes
+```
+
+For a multi-box join, include the same secret-backed `storage.env` for every
+box with `--storage-env /secure/storage.env`. The join pipeline installs it
+on the control plane and the adopted compute node as `root:faas 0440` and
+rejects `FAAS_STORAGE_BACKEND=local` or a `snap/` local-prefix override. The
+file must set `FAAS_STORAGE_BACKEND=oci` and `FAAS_OCI_REGISTRY`; credentials
+remain outside the repository. This lets vmmd preposition snapshots into
+each node's bounded read-through cache without provider-specific disk or
+peer-address configuration.
+
+It generates an ephemeral manifest inventory, runs preflight, converges the
+compute role, installs the signed release while drained, applies the manifest,
+and lets the controller verify and activate the database row only after
+readiness. The provider-specific
+boundary is only the SSH connection; see
+`docs/runbooks/provider-neutral-node-join.md` for the complete contract.
 
 There is intentionally no combined `[box]` group. A host must belong to
 exactly one production role group, and `role_convergence` verifies that the
@@ -52,17 +100,43 @@ make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
 make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 ```
 
-The generated `host_vars` owns `faas_box_role`, `faas_node_name`,
+The generated `host_vars` owns `faas_box_role`, the canonical
+`faas_node_name` (for example `fsn-2.faas`),
 `ansible_host`, `faas_vmmd_target_url`, and the private endpoint records
-written by the overlay role. `faas_vmmd_target_url` is
-`tcp://vmmd.faas:<port>` so the existing internal PKI hostname check
-remains enabled. The bootstrap's discovery play gathers one private address
-per host, and the overlay role maps the fleet names plus `vmmd.faas`,
-`schedd.faas`, and `egress.faas` in one managed `/etc/hosts` block. Providers
+written by the overlay role. `faas_vmmd_target_url` is a node-specific
+stable private endpoint such as `tcp://fsn-3.gregale.dev:50051`; the host's
+vmmd server leaf carries that endpoint as an additional SAN while retaining
+`vmmd.faas` as its role identity. The bootstrap's discovery play gathers one
+private address per host. It maps every stable fleet name and keeps the
+role aliases (`vmmd.faas` and `egress.faas`) only on the first compute host,
+so `/etc/hosts` never resolves a shared alias ambiguously. Providers
 whose default route is public set `faas_private_address` in provider-owned
 inventory; daemon URLs and the committed manifest remain unchanged. The committed
 `host_vars/faas-fsn-{1,2}.yml` files remain checked-in reference fixtures;
 the manifest-generated tree is the deployment source of truth.
+
+The generated compute variables also set `faas_gateway_target_url` to the
+node's private `gatewayd-internal` listener (`tcp://<node>:8080`). The control
+plane's `gatewayd-public` uses `compute_nodes.gateway_target_url` with database
+discovery and keeps its API route on `127.0.0.1:8081`; adding or draining a
+compute node therefore does not require changing a static first-node target.
+
+The fast-root contract is provider-neutral. Set
+`fleet.hosts[].storage_device` to an absolute stable device path such as a
+provider's `/dev/disk/by-id/...` name, or pass `--storage-device` to
+`deploy join-node`. The `xfs` role accepts an existing XFS filesystem or,
+only when `--format-storage` is explicitly supplied, a blank block device.
+The `xfs` role never selects a disk by size or formats an unknown device. Every
+production compute host must end with a dedicated XFS mount at
+`storage.fast_root`, with `reflink=1` and `prjquota`; a root-filesystem
+fallback is rejected.
+
+The preceding `storage` role provides the provider-neutral automatic path.
+When no explicit device is declared, it selects exactly one blank non-root
+disk or two equally-sized blank non-root disks for a mirror. It still refuses
+mounted, signed, partitioned, or ambiguous devices. An explicitly declared
+blank device remains protected by the `--format-storage` /
+`faas_storage_format` consent gate; an existing XFS device is reused.
 
 For a split-box manifest, the generated control-plane variables also
 declare the database listener address and the compute `/32` allow-list.
@@ -80,8 +154,9 @@ The `lvm` role defaults to `faas_storage_layout=auto`: hosts with the
 reference LVM volumes are validated, while provider-native disks such as
 GCP persistent disks use their filesystem directly. Set
 `faas_storage_layout=reference-lvm` when a fleet requires the reference
-layout. The `xfs` role similarly enforces `prjquota` only when `/srv/fc`
-is mounted as a real filesystem.
+layout. The `xfs` role now fails closed when `/srv/fc` is not a dedicated
+XFS mount; attach the provider's data disk and declare its stable device path
+instead of allowing a root-filesystem fallback.
 
 ## After the reference node hosts the executor
 

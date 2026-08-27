@@ -9,15 +9,25 @@ import (
 )
 
 // supportBinaryNames are executable files that are not daemons but are
-// required by a running host. They travel with the atomic release because
-// vmmd starts the bridge helpers and the upgrade path invokes gregalectl from
-// the active release tree.
+// required by a running host or by the guest image builder. They travel with
+// the atomic release because vmmd starts the bridge helpers, imaged injects
+// init as the guest PID 1, and the upgrade path invokes gregalectl from the
+// active release tree.
 var supportBinaryNames = []string{
 	"gregale",
 	"gregalectl",
+	"init",
+	"schedd-brokerq-apply",
 	"vmmd-raw-bridge",
 	"vmmd-stream-bridge",
 }
+
+// legacyUnhashedSupportBinaryNames contains support files that appeared in
+// pre-canonical release directories before they were added to tool_hashes.
+// Keep this list deliberately narrow: these files may be preserved during a
+// retry of an older signed release, but arbitrary extra files must still fail
+// catalog verification.
+var legacyUnhashedSupportBinaryNames = []string{"init"}
 
 // runtimeAssetNames is the immutable set of guest function runners that
 // imaged injects into application layers. They are release assets, not
@@ -36,6 +46,25 @@ var runtimeAssetNames = []string{
 // SupportBinaryNames returns the fixed support-binary catalog in stable order.
 func SupportBinaryNames() []string {
 	return append([]string(nil), supportBinaryNames...)
+}
+
+// LegacyUnhashedSupportBinaryNames returns the fixed compatibility catalog for
+// release manifests produced before the support-binary hash map included the
+// guest PID 1 binary.
+func LegacyUnhashedSupportBinaryNames() []string {
+	return append([]string(nil), legacyUnhashedSupportBinaryNames...)
+}
+
+// IsLegacyUnhashedSupportBinaryName reports whether name is a known support
+// file that may exist in an older release directory without a tool_hashes
+// entry. It is not a general-purpose extra-file allowlist.
+func IsLegacyUnhashedSupportBinaryName(name string) bool {
+	for _, candidate := range legacyUnhashedSupportBinaryNames {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // RuntimeAssetNames returns the stable release-relative paths for all

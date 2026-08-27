@@ -3,7 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { EdgeRuleBudgetAction } from './EdgeRuleBudgetAction.js';
-import type { EdgeRuleCacheAction } from './EdgeRuleCacheAction.js';
 import type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
 import type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 import type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
@@ -27,8 +26,14 @@ export type CreateEdgeRuleRequest = {
   enabled?: boolean;
   kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget' | 'cache';
   /**
+   * Top-level source of truth for kind=validate (ADR-128).
+   * Omitted == 'block' (the SQL-side default).
+   *
+   */
+  validate_mode?: 'block' | 'observe' | 'warn';
+  /**
    * Kind-tagged action body — shape depends on `kind`.
    */
-  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction | EdgeRuleCacheAction);
+  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);
 };
 

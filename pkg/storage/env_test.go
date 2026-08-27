@@ -30,16 +30,16 @@ func unsetEnvForTest(t *testing.T, key string) {
 }
 
 // TestParseLocalPrefixes_Default: an empty env var returns the
-// canonical ADR-054 default list. The default is the union of
-// {snap, base, kernel, layers} — content-addressed, latency-
-// sensitive, small enough to keep on every box.
+// canonical ADR-054 default list. Snapshot blobs are intentionally
+// not local-only: issue #1054's fan-out worker pulls them from the
+// shared OCI backend and the read-through cache keeps them local.
 func TestParseLocalPrefixes_Default(t *testing.T) {
 	t.Setenv("FAAS_STORAGE_LOCAL_PREFIXES", "")
 	got, err := parseLocalPrefixes("")
 	if err != nil {
 		t.Fatalf("parseLocalPrefixes: %v", err)
 	}
-	want := []string{"snap/", "base/", "kernel/", "layers/", "scans/"}
+	want := []string{"base/", "kernel/", "layers/", "scans/"}
 	if len(got) != len(want) {
 		t.Fatalf("len = %d, want %d (got %v)", len(got), len(want), got)
 	}

@@ -39,6 +39,28 @@
 # aliases. For hostname endpoints, the address is resolved from the
 # provider's gathered host facts; no provider IP is copied into daemon
 # configuration. Public Cloudflare DNS is never used for this private path.
+- name: overlay — refuse unresolved private endpoint aliases
+  ansible.builtin.assert:
+    that:
+      - private_address | length > 0
+    fail_msg: >-
+      private endpoint {{ item.names | join(', ') }} has no concrete address.
+      Run the complete ansible-preflight first or provide
+      faas_private_address for {{ item.inventory_host | default('the manifest host') }}.
+  vars:
+    private_address: >-
+      {{ item.address | default(
+           hostvars[item.inventory_host].faas_private_dns_address
+           | default(hostvars[item.inventory_host].faas_private_address | default('', true), true),
+           true) }}
+  loop: "{{ faas_private_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item.names | join(', ') }}"
+  when:
+    - (faas_private_hosts | default([]) | length) > 0
+    - (faas_private_dns_mode | default('') in ['', 'managed_hosts'])
+  tags: [private-endpoints]
+
 - name: overlay — install manifest private endpoint aliases
   ansible.builtin.blockinfile:
     path: /etc/hosts

@@ -147,13 +147,16 @@ func wrapWithCache(parent StorageBackend, kind string) (StorageBackend, error) {
 	return cache, nil
 }
 
-// defaultLocalPrefixes is the canonical local-prefix set
-// (ADR-054 §1): /srv/fc/{snap,base,kernel,layers} stay on disk
-// because they're content-addressed, latency-sensitive on every
-// cold boot, and small enough to keep on every box. Operators
-// override via FAAS_STORAGE_LOCAL_PREFIXES (comma-separated).
+// defaultLocalPrefixes is the canonical local-prefix set for OCI mode
+// (ADR-054 §1). Snapshot blobs are intentionally absent: issue #1054's
+// node-local fan-out worker needs every compute box to pull the same
+// canonical snapshot from the shared OCI backend. The read-through cache
+// still keeps the blob local after the first pull, so a prepositioned wake
+// does not pay a registry round trip. Operators can opt back into legacy
+// local snapshots with FAAS_STORAGE_LOCAL_PREFIXES=snap/,... during a
+// staged migration, but that disables cross-box snapshot availability.
 var defaultLocalPrefixes = []string{
-	"snap/", "base/", "kernel/", "layers/", "scans/",
+	"base/", "kernel/", "layers/", "scans/",
 }
 
 // parseLocalPrefixes splits a FAAS_STORAGE_LOCAL_PREFIXES value

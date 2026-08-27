@@ -1,4 +1,8 @@
 [Service]
-# Split-box edge routing. Empty keeps the legacy same-box unix socket;
-# manifest-generated control-plane inventory sets the private compute target.
-Environment=FAAS_INTERNAL_TARGET={{ faas_gatewayd_internal_target | default('') }}
+# Stable split-box edge routing. The control-plane API is always local;
+# customer traffic discovers active compute gateways from compute_nodes.
+# FAAS_INTERNAL_TARGET is intentionally empty: a single static compute
+# endpoint makes draining one box take down the control-plane edge.
+Environment=FAAS_INTERNAL_TARGET=
+Environment=FAAS_COMPUTE_GATEWAY_DISCOVERY={{ faas_compute_gateway_discovery | default('') }}
+Environment=FAAS_CONTROL_PLANE_API_TARGET=http://127.0.0.1:8081

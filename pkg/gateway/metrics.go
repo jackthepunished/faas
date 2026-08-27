@@ -167,7 +167,45 @@ type Metrics struct {
 	// additional_properties_not_allowed, enum_violation,
 	// format_violation, other), well below the 50-counter budget
 	// any single Metrics instance ships.
+	//
+	// DEPRECATED (ADR-128 §5): the canonical metric for new
+	// dashboards is `validateFailures` below (named
+	// gateway_validate_failures_total per the issue spec).
+	// edgeRuleValidateFailures is shadow-emitted for one release
+	// so existing dashboards keep working, then dropped.
 	edgeRuleValidateFailures *prometheus.CounterVec
+	// validateFailures (issue #975 #3 / ADR-128): the spec-named
+	// counter at gateway_validate_failures_total{app_id, rule_id,
+	// mode, reason}. Replaces edgeRuleValidateFailures above as
+	// the canonical observability surface. The (app_id, rule_id)
+	// pair is bounded by ruleLabelSet (pkg/gateway/rule_label_set.go)
+	// at 256 distinct rule IDs per app; overflow collapses to
+	// rule_id="__other__" so the Prometheus series set stays
+	// bounded over the daemon's lifetime. Worst-case per-app
+	// cardinality is (256 rules + 1 __other__) × 4 modes × 6
+	// reasons = 6168 series per app, well under Prometheus'
+	// per-instance label budget.
+	//
+	// Pre-instantiation: NONE — Prometheus CounterVec requires
+	// all labels at WithLabelValues time, so the (app_id, rule_id)
+	// pair cannot be pre-instantiated without knowing runtime
+	// inputs. Series surface on first scrape as rules fire.
+	// Operators alerting on rate == 0 must handle the cold-start
+	// window (no failure has been observed yet → no series exists
+	// → rate returns no data, not zero). The legacy
+	// edgeRuleValidateFailures counter above IS pre-instantiated
+	// (24 combos — mode × reason only) for the §12 panel-at-day-1
+	// contract; once validateFailures graduates out of the
+	// shadow window, that pre-instantiation can move here as
+	// synthetic (app_id, rule_id, mode, reason) tuples for the
+	// known fleet.
+	validateFailures *prometheus.CounterVec
+	// ruleLabels (ADR-128 §D3) is the per-app admission set
+	// backing the (app_id, rule_id) label pair on
+	// validateFailures. See pkg/gateway/rule_label_set.go for
+	// the contract — mirror of boxLabelSet / accountLabelSet with
+	// per-app (instead of global) cap.
+	ruleLabels *ruleLabelSet
 	// routeConsumerThrottleDecisions (ADR-104, issue #881 Phase 3):
 	// counter of per-consumer throttle decisions, labelled by
 	// {kind, outcome}. `kind` is the KeyBy dimension
@@ -569,8 +607,23 @@ func NewMetrics() *Metrics {
 		// bucket; reason is closed at 6).
 		edgeRuleValidateFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_edge_rule_validate_failures_total",
-			Help: "Edge-rule kind=validate body mismatches, labelled by validate_mode (observe|warn|block|other) and reason (required_missing|type_mismatch|additional_properties_not_allowed|enum_violation|format_violation|other). The counter increments in every mode; the reject decision is independent. `other` is the coerce bucket for unknown inputs. Issue #975 #3 / Mega-Foundation #979-a.",
+			Help: "Edge-rule kind=validate body mismatches, labelled by validate_mode (observe|warn|block|other) and reason (required_missing|type_mismatch|additional_properties_not_allowed|enum_violation|format_violation|other). The counter increments in every mode; the reject decision is independent. `other` is the coerce bucket for unknown inputs. Issue #975 #3 / Mega-Foundation #979-a. DEPRECATED (ADR-128 §5): use gateway_validate_failures_total instead.",
 		}, []string{"mode", "reason"}),
+		// validateFailures (ADR-128 §5 / issue #975 #3) — the
+		// spec-named replacement for edgeRuleValidateFailures
+		// above. Same {mode, reason} closed vocab; the new
+		// labels are {app_id, rule_id} so operators can localize
+		// failures to a specific rule on a specific app. The
+		// rule_id axis is bounded by ruleLabelSet
+		// (pkg/gateway/rule_label_set.go) — 256 distinct rule IDs
+		// per app, overflow collapses to "__other__".
+		validateFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_validate_failures_total",
+			Help: "Edge-rule kind=validate body mismatches, labelled by app_id (unbounded but addressable via PromQL `app_id=...`), rule_id (bounded per-app by ruleLabelSet; overflow → \"__other__\"), mode (observe|warn|block|other) and reason (required_missing|type_mismatch|additional_properties_not_allowed|enum_violation|format_violation|other). The counter increments in every mode — the reject decision is independent of the count. `other` is the coerce-on-unknown bucket. Replaces gateway_edge_rule_validate_failures_total per ADR-128 §5. Issue #975 #3 / Mega-Foundation #979-a.",
+		}, []string{"app_id", "rule_id", "mode", "reason"}),
+		// ruleLabelSet admission (ADR-128 §D3) — see
+		// pkg/gateway/rule_label_set.go for the contract.
+		ruleLabels: newRuleLabelSet(),
 		// ADR-104 (issue #881 Phase 3) — per-consumer throttle
 		// decisions, distinct from the per-rule edgeRuleApply path.
 		// `kind` ∈ {none, api_key, jwt_subject, jwt_claim} tracks the
@@ -1110,6 +1163,29 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"matched", "blocked"} {
 		m.internalAuthMatch.WithLabelValues(outcome)
 	}
+	// ADR-128 §5: pre-instantiate the closed (mode, reason) cross
+	// product on the LEGACY edgeRuleValidateFailures counter
+	// (24 = 4 modes × 6 reasons) for the §12 panel-at-day-1
+	// contract. The canonical validateFailures counter carries
+	// (app_id, rule_id, mode, reason) and cannot be
+	// pre-instantiated without runtime inputs (CounterVec
+	// requires all labels at WithLabelValues time). Operators
+	// alerting on rate == 0 must handle the cold-start window
+	// for the canonical counter; the legacy one is kept warm
+	// for one release per ADR-128 §5 so existing dashboards
+	// stay populated while the migration lands.
+	for _, mode := range []string{"observe", "warn", "block", "other"} {
+		for _, reason := range []string{
+			"required_missing",
+			"type_mismatch",
+			"additional_properties_not_allowed",
+			"enum_violation",
+			"format_violation",
+			"other",
+		} {
+			m.edgeRuleValidateFailures.WithLabelValues(mode, reason)
+		}
+	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
 	// (result) set on the walk-completeness counter so the §12
 	// dashboard panel surfaces from boot. result="partial" is the
@@ -1204,7 +1280,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.internalAuthMatch, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.validateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.internalAuthMatch, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1594,18 +1670,30 @@ func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
 }
 
-// ObserveEdgeRuleValidateFailure (issue #975 #3 / Mega-Foundation #979-a)
-// increments the kind=validate failure counter. mode is the rule's
-// validate_mode (observe|warn|block); reason is the bounded taxonomy
-// from pkg/edgevalidate (required_missing | type_mismatch |
-// additional_properties_not_allowed | enum_violation | format_violation
-// | other). The metric is incremented in every mode — the reject
-// decision is independent and handled by the handler. Nil-safe so the
-// Handler hot path doesn't need a nil guard, mirroring
-// ObserveEdgeRuleMatch / ObserveEdgeRuleApply above. Unknown mode
-// values are coerced to "other" so a malformed wire payload cannot
-// add a new label tuple and break the §12 dashboard panel.
-func (m *Metrics) ObserveEdgeRuleValidateFailure(mode, reason string) {
+// ObserveEdgeRuleValidateFailure (issue #975 #3 / Mega-Foundation #979-a
+// / ADR-128 §5) increments the kind=validate failure counter. mode is
+// the rule's validate_mode (observe|warn|block); reason is the
+// bounded taxonomy from pkg/edgevalidate (required_missing |
+// type_mismatch | additional_properties_not_allowed |
+// enum_violation | format_violation | other). The metric is
+// incremented in every mode — the reject decision is independent and
+// handled by the handler. Nil-safe so the Handler hot path doesn't
+// need a nil guard, mirroring ObserveEdgeRuleMatch /
+// ObserveEdgeRuleApply above. Unknown mode values are coerced to
+// "other" so a malformed wire payload cannot add a new label tuple
+// and break the §12 dashboard panel.
+//
+// ADR-128 §5 — both the deprecated
+// gateway_edge_rule_validate_failures_total{mode, reason} counter
+// (legacy dashboards) AND the new gateway_validate_failures_total
+// {app_id, rule_id, mode, reason} counter are incremented on each
+// call. The legacy counter is shadow-emitted for one release, then
+// dropped. The (appID, ruleID) pair is admitted through ruleLabelSet
+// (cap 256 per app; overflow → "__other__") so the new metric's
+// rule_id axis stays bounded. Pass appID=""/ruleID="" if the caller
+// cannot supply them (defensive — the handler always does); the
+// ruleLabel helper coerces empty inputs to "__other__".
+func (m *Metrics) ObserveEdgeRuleValidateFailure(appID, ruleID, mode, reason string) {
 	if m == nil {
 		return
 	}
@@ -1623,7 +1711,25 @@ func (m *Metrics) ObserveEdgeRuleValidateFailure(mode, reason string) {
 	default:
 		reason = reasonOther
 	}
+	// Legacy counter (ADR-128 §5 deprecation window).
 	m.edgeRuleValidateFailures.WithLabelValues(mode, reason).Inc()
+	// Canonical counter — rule_id is admitted through the
+	// per-app set so the Prometheus series set stays bounded.
+	resolvedRule := m.ruleLabel(appID, ruleID)
+	m.validateFailures.WithLabelValues(appID, resolvedRule, mode, reason).Inc()
+}
+
+// ruleLabel exposes the per-app admission set as a Metrics
+// method so callers don't need to know the underlying type. Safe
+// on a nil receiver — returns the input unchanged for the daemon
+// paths that don't wire Metrics (unit tests, see pkg/gateway
+// test fixtures). Mirrors OpsMetrics.boxLabel
+// (pkg/wire/metrics.go:5966).
+func (m *Metrics) ruleLabel(appID, ruleID string) string {
+	if m == nil || m.ruleLabels == nil {
+		return ruleID
+	}
+	return m.ruleLabels.admit(appID, ruleID)
 }
 
 // ObserveRouteConsumerThrottleDecision (ADR-104, issue #881 Phase 3)

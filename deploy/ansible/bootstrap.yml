@@ -64,6 +64,8 @@
     # Shared preconditions (every box):
     - role: cgroups_v2
     - role: grub
+    - role: storage
+      tags: [storage]
     - role: lvm
     - role: xfs
     - role: firecracker
@@ -95,9 +97,13 @@
   max_fail_percentage: 0
 
   roles:
-    # Shared preconditions (same as cp):
+    # Shared host preconditions. Control-plane monitoring and notification
+    # services stay on the control-plane role; a compute box must not require
+    # production paging credentials or run a second Alertmanager instance.
     - role: cgroups_v2
     - role: grub
+    - role: storage
+      tags: [storage]
     - role: lvm
     - role: xfs
     - role: firecracker
@@ -106,9 +112,6 @@
     - role: nftables
     - role: overlay
     - role: node_exporter
-    - role: alertmanager
-    - role: prometheus
-    - role: grafana
     # Compute-only:
     - role: vmmd_service
     - role: gatewayd_internal_service

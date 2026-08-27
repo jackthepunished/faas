@@ -1,0 +1,12 @@
+# G19.3 / ADR-127 Layer 12. Dedicated acceptance playbook; never included by
+# bootstrap.yml. The inventory must define a `metal_acceptance` group.
+- name: Install and optionally run the G19.3 metal H2C acceptance fixture
+  hosts: metal_acceptance
+  become: true
+  gather_facts: true
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - role: metal-h2c-acceptance
+      vars:
+        mha_enabled: true

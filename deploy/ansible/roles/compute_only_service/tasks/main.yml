@@ -27,17 +27,21 @@
       sets faas_box_role correctly for this host.
 
 # The imaged → vmmd hop is a split-box production dependency. Keep the
-# service identity in the target URL so grpc-go verifies vmmd.faas against the
-# vmmd server SAN; a literal overlay IP would fail TLS after provisioning.
+# node-specific private endpoint in the target URL so grpc-go verifies the
+# endpoint SAN on the matching vmmd server leaf. The leaf retains vmmd.faas
+# as its role identity for peer authorization; the endpoint name selects one
+# compute node among many.
 - name: compute_only_service — require canonical imaged vmmd target
   ansible.builtin.assert:
     that:
       - faas_vmmd_target_url is defined
-      - faas_vmmd_target_url is match('^tcp://vmmd\\.faas:[0-9]+$')
+      - faas_vmmd_target_url is match('^tcp://[^/]+:[0-9]+$')
+      - "'0.0.0.0' not in faas_vmmd_target_url"
+      - "'[::]' not in faas_vmmd_target_url"
     fail_msg: >-
-      compute-only imaged requires faas_vmmd_target_url in the form
-      tcp://vmmd.faas:<port>; do not configure the vmmd IP directly because
-      the internal PKI certificate is issued for vmmd.faas.
+      compute-only imaged requires a node-specific routable
+      faas_vmmd_target_url in the form tcp://<private-hostname>:<port>;
+      do not configure a wildcard bind address or a shared vmmd.faas alias.
   when: (faas_box_role | default('single-box')) == 'compute-only'
 
 # Split-box database credentials are deliberately not rendered into daemon
@@ -52,6 +56,14 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: compute_only_service — install shared storage env example
+  ansible.builtin.copy:
+    src: ../../_shared/files/storage.env.example
+    dest: /etc/faas/storage.env.example
+    owner: root
+    group: faas
+    mode: "0640"
 
 - name: compute_only_service — require compute DB env on split-box hosts
   ansible.builtin.stat:
@@ -168,6 +180,20 @@
   ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
   changed_when: false
 
+# The firecracker role creates /srv/fc for the root-owned vmmd, but the
+# split-box imaged and builderd services also need to traverse it to reach
+# their group-writable staging roots. A 0700 root:root parent makes the
+# apparently-correct child modes ineffective and fails only when imaged
+# tries its first digest-pinned base pull. Keep the parent non-world-readable
+# while granting the shared faas group traversal.
+- name: compute_only_service — allow shared daemons to traverse /srv/fc
+  ansible.builtin.file:
+    path: /srv/fc
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
 - name: compute_only_service — create imaged systemd drop-in directory
   ansible.builtin.file:
     path: /etc/systemd/system/faas-imaged.service.d
@@ -251,6 +277,18 @@
     - /var/spool/faas
     - /var/spool/faas/builds
     - /dev/shm/faas-base-staging
+
+# The compute daemons share selected subdirectories below /var/lib/faas.
+# postgres creates this parent as root-only on control-plane images; compute
+# hosts need group traversal so non-root imaged can reach its Grype cache and
+# OCI cache without broadening any child directory's permissions.
+- name: compute_only_service — allow faas daemons to traverse shared state root
+  ansible.builtin.file:
+    path: /var/lib/faas
+    owner: root
+    group: faas
+    mode: "0750"
+    state: directory
 
 # OCI storage uses a read-through disk cache. ProtectSystem=strict only
 # permits writes to explicit ReadWritePaths, and image-seeded hosts may

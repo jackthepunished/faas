@@ -8,10 +8,14 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.edge_rule_response_kind import EdgeRuleResponseKind, check_edge_rule_response_kind
+from ..models.edge_rule_response_validate_mode import (
+    EdgeRuleResponseValidateMode,
+    check_edge_rule_response_validate_mode,
+)
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
-    from ..models.edge_rule_cache_action import EdgeRuleCacheAction
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
     from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -49,7 +53,6 @@ class EdgeRuleResponse:
     kind: EdgeRuleResponseKind
     action: (
         EdgeRuleBudgetAction
-        | EdgeRuleCacheAction
         | EdgeRuleCORSAction
         | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
@@ -68,10 +71,14 @@ class EdgeRuleResponse:
     updated_at: datetime.datetime
     priority: int = 100
     enabled: bool = True
+    validate_mode: EdgeRuleResponseValidateMode | Unset = "block"
+    """Top-level source of truth for kind=validate (ADR-128).
+    Resolved mode; always present on read. Empty on read
+    would be a database invariant violation.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
         from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -128,14 +135,16 @@ class EdgeRuleResponse:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleThrottleAction):
             action = self.action.to_dict()
-        elif isinstance(self.action, EdgeRuleBudgetAction):
-            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
         created_at = self.created_at.isoformat()
 
         updated_at = self.updated_at.isoformat()
+
+        validate_mode: str | Unset = UNSET
+        if not isinstance(self.validate_mode, Unset):
+            validate_mode = self.validate_mode
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -155,13 +164,14 @@ class EdgeRuleResponse:
                 "updated_at": updated_at,
             }
         )
+        if validate_mode is not UNSET:
+            field_dict["validate_mode"] = validate_mode
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
-        from ..models.edge_rule_cache_action import EdgeRuleCacheAction
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
         from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -198,7 +208,6 @@ class EdgeRuleResponse:
             data: object,
         ) -> (
             EdgeRuleBudgetAction
-            | EdgeRuleCacheAction
             | EdgeRuleCORSAction
             | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
@@ -308,25 +317,24 @@ class EdgeRuleResponse:
                 return action_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                action_type_12 = EdgeRuleBudgetAction.from_dict(data)
-
-                return action_type_12
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_13 = EdgeRuleCacheAction.from_dict(data)
+            action_type_12 = EdgeRuleBudgetAction.from_dict(data)
 
-            return action_type_13
+            return action_type_12
 
         action = _parse_action(d.pop("action"))
 
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
+
+        _validate_mode = d.pop("validate_mode", UNSET)
+        validate_mode: EdgeRuleResponseValidateMode | Unset
+        if isinstance(_validate_mode, Unset):
+            validate_mode = UNSET
+        else:
+            validate_mode = check_edge_rule_response_validate_mode(_validate_mode)
 
         edge_rule_response = cls(
             id=id,
@@ -341,6 +349,7 @@ class EdgeRuleResponse:
             action=action,
             created_at=created_at,
             updated_at=updated_at,
+            validate_mode=validate_mode,
         )
 
         edge_rule_response.additional_properties = d

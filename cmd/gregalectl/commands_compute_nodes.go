@@ -25,11 +25,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -101,7 +103,7 @@ func setComputeNodesStoreOpener(fn func() (state.Store, func(), error)) {
 // existing openPgPoolFromEnv helper (commands_release.go:344). The
 // returned close func releases the pool when the caller defers it.
 func openComputeNodesStore() (state.Store, func(), error) {
-	pool, err := openPgPoolFromEnv()
+	pool, err := openPgPoolFromEnv(context.Background())
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("gregalectl compute-nodes: %w", err)
 	}
@@ -113,8 +115,9 @@ func openComputeNodesStore() (state.Store, func(), error) {
 // deleting the import in a refactor.
 var _ = (*pgxpool.Pool)(nil)
 
-// cmdComputeNodesDrain runs `UPDATE compute_nodes SET active=false
-// WHERE id=<fqdn>` via state.Store.MarkComputeNodeInactive.
+// cmdComputeNodesDrain resolves the operator-facing node name to its row ID,
+// then runs `UPDATE compute_nodes SET active=false` via
+// state.Store.MarkComputeNodeInactive.
 func cmdComputeNodesDrain(args []string) int {
 	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -126,14 +129,20 @@ func cmdComputeNodesDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
 		return 1
 	}
@@ -161,7 +170,7 @@ func cmdComputeNodesDrainStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -169,7 +178,12 @@ func cmdComputeNodesDrainStatus(args []string) int {
 	defer closeFn()
 
 	ctx := context.Background()
-	insts, err := st.ListInstancesByNodeID(ctx, *node)
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
+		return 1
+	}
+	insts, err := st.ListInstancesByNodeID(ctx, computeNode.ID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status:", err)
 		return 1
@@ -203,14 +217,20 @@ func cmdComputeNodesActivate(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate: --node required")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.SetComputeNodeActive(context.Background(), *node, true); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
+		return 1
+	}
+	if err := st.SetComputeNodeActive(ctx, computeNode.ID, true); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
 		return 1
 	}
@@ -239,14 +259,20 @@ func cmdComputeNodesForceDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain: --yes required (live instances may be cold-evicted)")
 		return 2
 	}
-	st, closeFn, err := openComputeNodesStore()
+	st, closeFn, err := computeNodesStoreOpener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer closeFn()
 
-	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
+	ctx := context.Background()
+	computeNode, err := st.ComputeNodeByName(ctx, *node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
+		return 1
+	}
+	if err := st.MarkComputeNodeInactive(ctx, computeNode.ID); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
 		return 1
 	}
@@ -306,14 +332,14 @@ func reportComputeNodesList(w io.Writer, nodes []state.ComputeNode, activeOnly b
 		_, _ = fmt.Fprintf(w, "(no compute nodes%s)\n", activeOnlyString(activeOnly))
 		return
 	}
-	_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7s  %-7s  %-7s  %-7s  %s\n", "NAME", "ROLE", "VPCPUS", "MEM_MB", "MAXCON", "ACTIVE", "TARGET_URL")
+	_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7s  %-7s  %-7s  %-7s  %-36s  %s\n", "NAME", "ROLE", "VPCPUS", "MEM_MB", "MAXCON", "ACTIVE", "TARGET_URL", "GATEWAY_TARGET_URL")
 	for _, n := range nodes {
 		role := ""
 		if n.Role != nil {
 			role = *n.Role
 		}
-		_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7d  %-7d  %-7d  %-7t  %s\n",
-			n.Name, role, n.VPCPUs, n.MemMB, n.MaxConcurrency, n.Active, n.TargetURL)
+		_, _ = fmt.Fprintf(w, "%-32s  %-15s  %-7d  %-7d  %-7d  %-7t  %-36s  %s\n",
+			n.Name, role, n.VPCPUs, n.MemMB, n.MaxConcurrency, n.Active, n.TargetURL, computeNodeGatewayTargetValue(n.GatewayTargetURL))
 	}
 }
 
@@ -351,6 +377,7 @@ type computeNodeBrief struct {
 	AdmissionCeilingMB int     `json:"admission_ceiling_mb"`
 	Active             bool    `json:"active"`
 	TargetURL          string  `json:"target_url"`
+	GatewayTargetURL   string  `json:"gateway_target_url,omitempty"`
 }
 
 func emitComputeNodesListJSON(w io.Writer, nodes []state.ComputeNode) int {
@@ -364,6 +391,7 @@ func emitComputeNodesListJSON(w io.Writer, nodes []state.ComputeNode) int {
 			VPCPUs: n.VPCPUs, MemMB: n.MemMB,
 			MaxConcurrency: n.MaxConcurrency, AdmissionCeilingMB: n.AdmissionCeilingMB,
 			Active: n.Active, TargetURL: n.TargetURL,
+			GatewayTargetURL: computeNodeGatewayTargetValue(n.GatewayTargetURL),
 		})
 	}
 	body, err := json.Marshal(out)
@@ -457,6 +485,7 @@ func reportComputeNodeShow(w io.Writer, n state.ComputeNode, live int) {
 	_, _ = fmt.Fprintf(w, "id=%s\n", n.ID)
 	_, _ = fmt.Fprintf(w, "role=%s\n", role)
 	_, _ = fmt.Fprintf(w, "target_url=%s\n", n.TargetURL)
+	_, _ = fmt.Fprintf(w, "gateway_target_url=%s\n", computeNodeGatewayTargetValue(n.GatewayTargetURL))
 	_, _ = fmt.Fprintf(w, "vpcpus=%d\n", n.VPCPUs)
 	_, _ = fmt.Fprintf(w, "mem_mb=%d\n", n.MemMB)
 	_, _ = fmt.Fprintf(w, "max_concurrency=%d\n", n.MaxConcurrency)
@@ -490,6 +519,7 @@ type computeNodeShowJSON struct {
 	ID                 string  `json:"id"`
 	Role               *string `json:"role,omitempty"`
 	TargetURL          string  `json:"target_url"`
+	GatewayTargetURL   string  `json:"gateway_target_url,omitempty"`
 	VPCPUs             int     `json:"vpcpus"`
 	MemMB              int     `json:"mem_mb"`
 	MaxConcurrency     int     `json:"max_concurrency"`
@@ -507,7 +537,7 @@ type computeNodeShowJSON struct {
 func emitComputeNodeShowJSON(w io.Writer, n state.ComputeNode, live int) int {
 	body, err := json.Marshal(computeNodeShowJSON{
 		Name: n.Name, ID: n.ID, Role: n.Role,
-		TargetURL: n.TargetURL, VPCPUs: n.VPCPUs, MemMB: n.MemMB,
+		TargetURL: n.TargetURL, GatewayTargetURL: computeNodeGatewayTargetValue(n.GatewayTargetURL), VPCPUs: n.VPCPUs, MemMB: n.MemMB,
 		MaxConcurrency: n.MaxConcurrency, AdmissionCeilingMB: n.AdmissionCeilingMB,
 		Active: n.Active, Region: n.Region, Zone: n.Zone,
 		ReleaseID: n.ReleaseID, ManifestHash: n.ManifestHash,
@@ -561,11 +591,13 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "", "fqdn / short-hostname of the new node (required)")
 	targetURL := fs.String("target-url", "", "routable dial target for vmmd (tcp://vmmd-N.faas:50051 or unix://...)")
+	gatewayTargetURL := fs.String("gateway-target-url", "", "private HTTP target for gatewayd-internal (tcp://host:port)")
 	vpcpus := fs.Int("vpcpus", 0, "vCPU count reported to schedd")
 	memMB := fs.Int("mem-mb", 0, "RAM MB reported to schedd")
 	maxConc := fs.Int("max-concurrency", 0, "max concurrent live instances")
 	admCeil := fs.Int("admission-ceiling-mb", 0, "tenant RAM admission ceiling (85% of mem-mb for production nodes)")
 	fromFile := fs.String("from-file", "", "read a computeNodePayload-shaped JSON file instead of the per-field flags (PR-B bridge)")
+	deferActivation := fs.Bool("defer-activation", false, "insert/update the row drained so a deployment can activate it after readiness checks")
 	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -586,6 +618,7 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 		payload = computeNodePayload{
 			Name:               *name,
 			TargetURL:          *targetURL,
+			GatewayTargetURL:   *gatewayTargetURL,
 			VPCPUs:             *vpcpus,
 			MemMB:              *memMB,
 			MaxConcurrency:     *maxConc,
@@ -615,6 +648,12 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: --target-url invalid: %v\n", err)
 		return 2
 	}
+	if strings.TrimSpace(payload.GatewayTargetURL) != "" {
+		if err := validGatewayTargetURL(payload.GatewayTargetURL); err != nil {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: --gateway-target-url invalid: %v\n", err)
+			return 2
+		}
+	}
 	if payload.VPCPUs <= 0 || payload.MemMB <= 0 || payload.MaxConcurrency <= 0 || payload.AdmissionCeilingMB <= 0 {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes add: vpcpus, mem-mb, max-concurrency, admission-ceiling-mb must all be > 0")
 		return 2
@@ -640,12 +679,20 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	// preserves them. The cold-insert branch (no existing row)
 	// leaves them nil — same as the pre-PR-A apid behavior.
 	node := state.ComputeNode{
-		Name:               payload.Name,
-		TargetURL:          payload.TargetURL,
-		VPCPUs:             payload.VPCPUs,
+		Name:      payload.Name,
+		TargetURL: payload.TargetURL,
+		VPCPUs:    payload.VPCPUs,
+		// The database enforces a positive per-node vCPU budget. The
+		// operator payload historically carried physical vCPUs only, so
+		// derive the default using the same 8x overcommit policy as the
+		// scheduler instead of sending zero and violating the schema.
+		VCPUBudget:         payload.VPCPUs * api.CPUOvercommit,
 		MemMB:              payload.MemMB,
 		MaxConcurrency:     payload.MaxConcurrency,
 		AdmissionCeilingMB: payload.AdmissionCeilingMB,
+	}
+	if value := strings.TrimSpace(payload.GatewayTargetURL); value != "" {
+		node.GatewayTargetURL = &value
 	}
 	if existing, lookupErr := st.ComputeNodeByName(context.Background(), payload.Name); lookupErr == nil {
 		node.Role = existing.Role
@@ -653,6 +700,9 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 		node.ManifestHash = existing.ManifestHash
 		node.HostCertificate = existing.HostCertificate
 		node.CertFingerprint = existing.CertFingerprint
+		if node.GatewayTargetURL == nil {
+			node.GatewayTargetURL = existing.GatewayTargetURL
+		}
 	} else if !errors.Is(lookupErr, state.ErrNotFound) {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: lookup existing: %v\n", lookupErr)
 		return 1
@@ -661,6 +711,13 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: upsert: %v\n", err)
 		return 1
+	}
+	if *deferActivation {
+		if err := st.SetComputeNodeActive(context.Background(), row.ID, false); err != nil {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: defer activation: %v\n", err)
+			return 1
+		}
+		row.Active = false
 	}
 
 	// `compute_node_changed` pg_notify trigger (migration 00026) fires
@@ -675,8 +732,8 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	if *jsonOut {
 		return emitComputeNodeAddedJSON(stdout, row)
 	}
-	_, _ = fmt.Fprintf(stdout, "OK name=%s id=%s target_url=%s vpcpus=%d mem_mb=%d max_concurrency=%d admission_ceiling_mb=%d\n",
-		row.Name, row.ID, row.TargetURL, row.VPCPUs, row.MemMB, row.MaxConcurrency, row.AdmissionCeilingMB)
+	_, _ = fmt.Fprintf(stdout, "OK name=%s id=%s target_url=%s gateway_target_url=%s vpcpus=%d mem_mb=%d max_concurrency=%d admission_ceiling_mb=%d\n",
+		row.Name, row.ID, row.TargetURL, computeNodeGatewayTargetValue(row.GatewayTargetURL), row.VPCPUs, row.MemMB, row.MaxConcurrency, row.AdmissionCeilingMB)
 	return 0
 }
 
@@ -687,6 +744,7 @@ func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 type computeNodePayload struct {
 	Name               string `json:"name"`
 	TargetURL          string `json:"target_url"`
+	GatewayTargetURL   string `json:"gateway_target_url,omitempty"`
 	VPCPUs             int    `json:"vpcpus"`
 	MemMB              int    `json:"mem_mb"`
 	MaxConcurrency     int    `json:"max_concurrency"`
@@ -701,6 +759,7 @@ func emitComputeNodeAddedJSON(w io.Writer, row state.ComputeNode) int {
 		Name               string `json:"name"`
 		ID                 string `json:"id"`
 		TargetURL          string `json:"target_url"`
+		GatewayTargetURL   string `json:"gateway_target_url,omitempty"`
 		VPCPUs             int    `json:"vpcpus"`
 		MemMB              int    `json:"mem_mb"`
 		MaxConcurrency     int    `json:"max_concurrency"`
@@ -708,7 +767,8 @@ func emitComputeNodeAddedJSON(w io.Writer, row state.ComputeNode) int {
 		Active             bool   `json:"active"`
 	}{
 		Name: row.Name, ID: row.ID, TargetURL: row.TargetURL,
-		VPCPUs: row.VPCPUs, MemMB: row.MemMB,
+		GatewayTargetURL: computeNodeGatewayTargetValue(row.GatewayTargetURL),
+		VPCPUs:           row.VPCPUs, MemMB: row.MemMB,
 		MaxConcurrency: row.MaxConcurrency, AdmissionCeilingMB: row.AdmissionCeilingMB,
 		Active: row.Active,
 	})
@@ -722,6 +782,35 @@ func emitComputeNodeAddedJSON(w io.Writer, row state.ComputeNode) int {
 	}
 	_, _ = w.Write([]byte("\n"))
 	return 0
+}
+
+func computeNodeGatewayTargetValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+// validGatewayTargetURL accepts only the private TCP listener exposed by a
+// compute node's gatewayd-internal. Keeping this separate from target_url is
+// important: target_url is vmmd's gRPC endpoint and must never be used for
+// HTTP application routing.
+func validGatewayTargetURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("parse target: %w", err)
+	}
+	if u.Scheme != "tcp" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("must be tcp://host:port")
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("must be tcp://host:port")
+	}
+	if isNonRoutableHost(host) {
+		return fmt.Errorf("host %q is not routable from the control plane", host)
+	}
+	return nil
 }
 
 // validComputeNodeName is the local mirror of the apid handler's

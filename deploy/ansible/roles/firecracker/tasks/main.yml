@@ -53,7 +53,7 @@
       fc_kernel_tar_sha256 is missing, malformed, or still the
       placeholder. Same shape as fc_release_sha256 above.
 
-- name: firecracker — mkdir /usr/local/bin and /srv/fc/base
+- name: firecracker — mkdir runtime binary and kernel roots
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -63,6 +63,7 @@
   loop:
     - /usr/local/bin
     - /srv/fc/base
+    - /srv/fc/kernel
 
 - name: firecracker — download firecracker release tarball
   ansible.builtin.get_url:

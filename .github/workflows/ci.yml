@@ -146,6 +146,12 @@ jobs:
       - name: build
         run: make build
 
+      # Release manifests are generated from the production topology
+      # template. Keep the projection deterministic and schema-valid on every
+      # PR so a release tag cannot discover template drift for the first time.
+      - name: release manifest materialization
+        run: bash scripts/materialize-release-manifest_test.sh
+
       # CI quick-wins cluster — wire missing local gates into `test` job.
       # Each target self-documents as "CI gate" in its Makefile comment
       # (Makefile:147 / :184 / :537 / :707) but `make build` (the only
@@ -195,6 +201,18 @@ jobs:
 
       - name: systemd hardening gate
         run: make systemd-hardening-check
+
+      # sealed-env-scope-check (issue #585 / ADR-127): the apid unit
+      # is the only legitimate consumer of /etc/faas/sealed.env. Every
+      # other daemon must use LoadCredential= or a per-daemon
+      # /etc/faas/secrets/<daemon>/*.env (0400 root:root). The gate
+      # walks deploy/systemd/ + deploy/controlplane/systemd/ + every
+      # ansible role's files/*.service and refuses any
+      # EnvironmentFile={-,}/etc/faas/sealed.env line that isn't in
+      # faas-apid.service. Fail-loud; tripwire prevents future
+      # re-introduction of the apid-leak pattern.
+      - name: sealed.env scope gate
+        run: make sealed-env-scope-check
 
       # +incompatible direct-dep gate (release blocker B1). Today this
       # flags github.com/stripe/stripe-go v70.15.0+incompatible (go.mod:25)
@@ -267,6 +285,8 @@ jobs:
           pip install --quiet 'ansible-core==2.21.2'
           cd deploy/ansible
           ansible-galaxy collection install -r requirements.yml
+          # Gate-A: parse the complete-inventory safety preflight.
+          ansible-playbook --syntax-check preflight.yml
           # Gate-B: syntax-check the only production bootstrap playbook
           # before an operator can run either role-specific target.
           ansible-playbook --syntax-check bootstrap.yml
@@ -434,16 +454,31 @@ jobs:
           use_oidc: true
           fail_ci_if_error: true
 
-  # Shard 2 (Postgres-heavy B): pkg/state, cmd/gregale, cmd/schedd, etc.
+  # Shard 2 (Postgres-heavy B) is split into two jobs because pkg/state and
+  # cmd/gregale are independent race-enabled hot spots. Both jobs keep their
+  # own Postgres service so a slow package group cannot hold the other group
+  # behind it.
   unit-tests-pg-2:
-    name: unit tests (pg shard 2 — state/gregale/schedd)
+    name: unit tests (pg shard 2${{ matrix.id }} — ${{ matrix.label }})
     runs-on: ubuntu-latest
-    # 15m (was 10m) — cmd/gregale grew after PR #832's
-    # PR-B source-ref tests; the package-level test binary
-    # under -race -count=1 -p 4 sits near the 10m ceiling.
-    # Mirrors the pgstore-coverage-sweep-timeout-fix
-    # posture: add slack before splitting shards.
-    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: a
+            label: state/reconcile/reposcan
+            package_pattern: '/(pkg/state|pkg/statefuldenylist|pkg/reconcile|pkg/reposcan)(/|$)'
+            coverage_file: cover-shard2a.out
+            state_coverage: true
+          - id: b
+            label: gregale/gregalectl/daemons
+            package_pattern: '/(cmd/gregale|cmd/gregalectl|cmd/meterd|cmd/schedd|cmd/schema-dump)(/|$)'
+            coverage_file: cover-shard2b.out
+            state_coverage: false
+    # The race-enabled state suite includes a large, migration-backed package
+    # and can exceed 18 minutes on shared GitHub runners. Keep a bounded,
+    # explicit budget with enough cleanup headroom for the test timeout.
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
@@ -485,32 +520,29 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: unit tests (pg shard 2)
+      - name: unit tests (pg shard 2${{ matrix.id }})
         run: |
           mkdir -p coverage
-          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '(pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan)')
-          # 14m (was 10m) — under -race -count=1 -p 4 the
-          # cmd/gregale package alone sits at ~3m; pkg/state
-          # sub-tests add another ~3m; the remaining packages
-          # round out the budget. 14m keeps headroom against
-          # CI load spikes (memory: pgstore-coverage-sweep-
-          # timeout-fix). Job-level timeout is 15m.
-          go test -race -count=1 -p 4 -timeout=14m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '${{ matrix.package_pattern }}')
+          test -n "$PKGS"
+          printf '%s\n' "$PKGS"
+          go test -race -count=1 -p 4 -timeout=28m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
-        run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
+        if: ${{ matrix.state_coverage }}
+        run: make check-state-coverage COVERFILE=coverage/${{ matrix.coverage_file }}
 
       - name: coverage floor (ship-blocking packages)
-        # Validates pkg/state ≥ 70% via the new coverage-floor gate
-        # (see Makefile, mirror of check-state-coverage). Packages
-        # not exercised by this shard's PKGS list print
-        # "(no statements — skip)" and don't fail the gate.
+        # Validates the ship-blocking package floors via the shared
+        # coverage-floor gate (see Makefile). Packages not exercised by
+        # this matrix entry's PKGS list print "(no statements — skip)"
+        # and don't fail the gate.
         run: make coverage-floor COVERDIR=coverage
 
-      - name: upload to Codecov (pg shard 2)
+      - name: upload to Codecov (pg shard 2${{ matrix.id }})
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
-          files: coverage/cover-shard2.out
+          files: coverage/${{ matrix.coverage_file }}
           flags: unittests
           use_oidc: true
           fail_ci_if_error: true
@@ -1033,9 +1065,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      - name: migrations check (static)
-        run: make migrations-check
-
       # PR-P4 — assert deploy/scripts/verify-secrets.sh is shaped
       # correctly (executable, bash-parseable, presence of the
       # Paddle + Stripe blocks added by Streams A + B). The
@@ -1070,11 +1099,20 @@ jobs:
         run: BATS_TEST=1 ./scripts/ci/check_migration_slots.sh
       - name: migration slot collision (vs other open PRs)
         if: github.event_name == 'pull_request'
+        id: migration_slots
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.base_ref }}
         run: ./scripts/ci/check_migration_slots.sh
+      # A PR may append after a contiguous migration range owned by a sibling
+      # PR. The cross-PR gate above has verified those slots are claimed and
+      # non-overlapping; pass that verified list to the local contiguity test.
+      # Push/main runs leave this output empty and remain strictly 1..N.
+      - name: migrations check (static)
+        env:
+          FAAS_MIGRATION_ALLOWED_GAPS: ${{ steps.migration_slots.outputs.external_slots }}
+        run: make migrations-check
       # No `-tags no_pg` here on purpose: apply_walk_test.go carries
       # `//go:build !no_pg`, so the static-only `make migrations-check`
       # step skips it and this step picks it up. The `-run` filter
@@ -1082,6 +1120,8 @@ jobs:
       # in embed_test.go and are not built under `!no_pg` exclusion
       # here because their package has no build tag.
       - name: migrations apply-and-walk
+        env:
+          FAAS_MIGRATION_ALLOWED_GAPS: ${{ steps.migration_slots.outputs.external_slots }}
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
 
       # Replay safety for migrations this diff ADDS. apply-and-walk above

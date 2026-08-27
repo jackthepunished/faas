@@ -55,15 +55,35 @@
     state: present
     update_cache: true
 
-- name: grafana — add Grafana GPG key
-  ansible.builtin.apt_key:
-    url: https://apt.grafana.com/gpg.key
-    state: present
+- name: grafana — install repository keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
-- name: grafana — add Grafana apt repository
-  ansible.builtin.apt_repository:
-    repo: "deb https://apt.grafana.com stable main"
+- name: grafana — install repository keyring
+  ansible.builtin.get_url:
+    url: https://apt.grafana.com/gpg.key
+    dest: /etc/apt/keyrings/grafana.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: grafana — add apt repository
+  ansible.builtin.deb822_repository:
+    name: grafana
+    types: deb
+    uris: https://apt.grafana.com
+    suites: stable
+    components: [main]
+    signed_by: /etc/apt/keyrings/grafana.asc
     state: present
+    enabled: true
+
+- name: grafana — refresh apt metadata after adding repository
+  ansible.builtin.apt:
     update_cache: true
 
 - name: grafana — pin installed version via /etc/apt/preferences.d
