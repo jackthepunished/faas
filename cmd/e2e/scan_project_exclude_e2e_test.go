@@ -249,13 +249,28 @@ func TestScanExclude_ExistingAppRescued(t *testing.T) {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 
-	// Seed the legacy app BEFORE the scan runs.
+	// Seed the legacy app BEFORE the scan runs. The Removed
+	// partition is project-scoped (multi-project safety —
+	// pkg/reconcile/partition comment); we MUST create the
+	// project row + assign the legacy app to it so the
+	// baseline (no exclude) scan surfaces `legacy-api` in
+	// Removed. Without the project_id binding, the partition
+	// leaves Removed empty by design and the baseline assertion
+	// at line 276 trips.
+	proj, err := store.CreateProject(ctx, state.Project{
+		AccountID: res.Account.ID,
+		Slug:      "exclude-existing",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
 	legacy, err := store.CreateApp(ctx, state.App{
 		AccountID:      res.Account.ID,
 		Slug:           "legacy-api",
 		Type:           state.AppTypeApp,
 		RAMMB:          256,
 		MaxConcurrency: 1,
+		ProjectID:      proj.ID,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp legacy: %v", err)

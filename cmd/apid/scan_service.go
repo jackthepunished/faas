@@ -269,6 +269,16 @@ func computeAffectedPartition(
 	for _, a := range existingApps {
 		idx[workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}] = a
 	}
+	// scanKeys is keyed on (RootDir, Name) of every scan workload.
+	// Built early (before Skipped + Unaffected + Removed loops) so
+	// the dual-view Skipped branch below can skip apps that ARE in
+	// the scan set; the Skipped row from the workload branch already
+	// covers those (avoids a duplicate Skipped entry for the same
+	// slug).
+	scanKeys := make(map[workloadKey]struct{}, len(allScanWl))
+	for _, w := range allScanWl {
+		scanKeys[workloadKey{RootDir: w.RootDir, Name: w.Name}] = struct{}{}
+	}
 	// WillDeploy: filteredW (no excluded) → create or update. Order
 	// preserved so the i-alignment with respWorkloads stays intact.
 	will := make([]api.PlanAffectedApp, 0, len(filteredW))
@@ -285,7 +295,13 @@ func computeAffectedPartition(
 		will = append(will, row)
 	}
 	// Skipped: every scan workload (filteredW or dropped by --only)
-	// whose lowercased name is in exclude. Order preserved.
+	// whose lowercased name is in exclude, plus every existing app
+	// in the account whose slug is in exclude but who is NOT in the
+	// scan set (dual-view: the operator's --exclude intent applies
+	// to BOTH a scan workload and a stale app row — see
+	// TestScanPartition_ExcludedExistingAppDualView for the pin).
+	// Order preserved: scan workloads first, then existing-app
+	// rows, then sorted by Slug for determinism.
 	skip := make([]api.PlanAffectedApp, 0)
 	if len(exclude) > 0 {
 		for _, w := range allScanWl {
@@ -302,15 +318,41 @@ func computeAffectedPartition(
 			}
 			skip = append(skip, row)
 		}
+		// Add excluded existing apps not in the scan set — these
+		// are apps whose workload was removed from the repo (or
+		// renamed) but the operator still wants the --exclude
+		// contract honored (no soft-delete on apply). Without
+		// this branch the dashboard's Skipped column would be
+		// empty for the dual-view case.
+		seen := make(map[string]bool, len(skip))
+		for _, s := range skip {
+			seen[s.Slug] = true
+		}
+		for _, a := range existingApps {
+			if !exclude[strings.ToLower(a.Slug)] {
+				continue
+			}
+			if seen[a.Slug] {
+				continue
+			}
+			k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
+			if _, hit := scanKeys[k]; hit {
+				continue
+			}
+			skip = append(skip, api.PlanAffectedApp{
+				Slug:            a.Slug,
+				ID:              a.ID,
+				Action:          "noop",
+				ExistingRootDir: a.RootDir,
+			})
+			seen[a.Slug] = true
+		}
 	}
 	// Unaffected: existing apps whose (RootDir, Name) is not in any
 	// scan workload. The "no scan workload" check is across allScanWl
 	// (post-`--only`) so an excluded update doesn't shift an app from
-	// Unaffected to Skipped — it stays in Skipped only.
-	scanKeys := make(map[workloadKey]struct{}, len(allScanWl))
-	for _, w := range allScanWl {
-		scanKeys[workloadKey{RootDir: w.RootDir, Name: w.Name}] = struct{}{}
-	}
+	// Unaffected to Skipped — it stays in Skipped only. scanKeys was
+	// built above the Skipped loop (shared with the dual-view branch).
 	unaff := make([]api.PlanAffectedApp, 0, len(existingApps))
 	for _, a := range existingApps {
 		k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
@@ -331,6 +373,9 @@ func computeAffectedPartition(
 	//     not see their other projects' apps in the destructive
 	//     preview. Unaffected stays account-scoped (blast-radius
 	//     view); Removed is project-scoped (the destructive view).
+	//     Empty projectID (no project_slug on the request, brand-
+	//     new project not yet inserted) makes the loop a no-op
+	//     because no existing app can have a matching ProjectID.
 	//  2. (RootDir, WorkloadName) NOT in scanKeys — same-key apps
 	//     are matched (WillDeploy), not removed. Mirrors
 	//     pkg/reconcile.diff.workloadDiff:106-115 (the `removes`
@@ -960,11 +1005,21 @@ func (s *server) scanService(
 		filteredW = append(filteredW, wl)
 	}
 	// Post-scan exclude-validity check: every entry in req.Exclude
-	// must correspond to a real scan workload. A typo would otherwise
-	// silently survive and confuse the operator about what was
-	// honoured. 400 exclude_unknown_slug codes the failure with the
-	// unknown slug in the message so the dashboard can render it
-	// inline.
+	// must correspond to a real scan workload OR an existing app in
+	// the account. A typo would otherwise silently survive and
+	// confuse the operator about what was honoured. 400
+	// exclude_unknown_slug codes the failure with the unknown slug in
+	// the message so the dashboard can render it inline.
+	//
+	// Existing-app slugs are accepted because operators commonly
+	// exclude workloads that exist in the account but were renamed
+	// or removed from the current commit (the audit fix at
+	// pkg/reconcile/reconcile_test.go::TestReconcile_ExcludePreventsRemove
+	// pins the apply-side contract). The Skipped partition below
+	// surfaces excluded existing apps in BOTH Unaffected (blast-
+	// radius) and Skipped (operator intent) views — see
+	// TestScanPartition_ExcludedExistingAppDualView.
+	//
 	// Code-review fix #2: split persisted-vs-per-deploy
 	// slugs in the unknown set. A persisted slug that no
 	// longer exists in the repo (the workload was renamed or
@@ -975,11 +1030,26 @@ func (s *server) scanService(
 	// wait for the 90-day janitor to reap the row. Surface
 	// these as StalePersistedExclusions instead; the dashboard
 	// can render a "persisted exclusion ignored" badge.
+	//
+	// Load acctApps early so the exclude-validity check can
+	// recognise existing-app slugs alongside scanNames. The same
+	// `acctApps` slice is reused by computeAffectedPartition
+	// below (Unaffected + Skipped + Removed loops) — one DB
+	// round-trip per scan.
+	acctApps, listErr := s.store.ListApps(r.Context(), acct.ID)
+	if listErr != nil {
+		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
+			fmt.Sprintf("list account apps: %v", listErr))
+	}
 	var stalePersistedSlugs []string
 	if len(req.Exclude) > 0 {
 		scanNames := make(map[string]bool, len(result.Workloads))
 		for _, w := range result.Workloads {
 			scanNames[strings.ToLower(w.Name)] = true
+		}
+		existingSlugs := make(map[string]bool, len(acctApps))
+		for _, a := range acctApps {
+			existingSlugs[strings.ToLower(a.Slug)] = true
 		}
 		var unknown []string
 		if len(persistedSlugs) > 0 {
@@ -988,20 +1058,22 @@ func (s *server) scanService(
 				persistedSet[slug] = true
 			}
 			for slug := range req.Exclude {
-				if !scanNames[slug] {
-					if persistedSet[slug] {
-						stalePersistedSlugs = append(stalePersistedSlugs, slug)
-						delete(req.Exclude, slug)
-					} else {
-						unknown = append(unknown, slug)
-					}
+				if scanNames[slug] || existingSlugs[slug] {
+					continue
+				}
+				if persistedSet[slug] {
+					stalePersistedSlugs = append(stalePersistedSlugs, slug)
+					delete(req.Exclude, slug)
+				} else {
+					unknown = append(unknown, slug)
 				}
 			}
 		} else {
 			for slug := range req.Exclude {
-				if !scanNames[slug] {
-					unknown = append(unknown, slug)
+				if scanNames[slug] || existingSlugs[slug] {
+					continue
 				}
+				unknown = append(unknown, slug)
 			}
 		}
 		sort.Strings(stalePersistedSlugs)
@@ -1114,16 +1186,11 @@ func (s *server) scanService(
 		emitGateRescueMetric(s.ops, string(acct.Plan), preReasons)
 	}
 
-	// ADR-124 blast-radius partition: load every non-deleted app in
-	// the account and project each (RootDir, Name) against the scan
-	// workload set. ListApps is account-scoped; per-account apps
-	// include rows in other projects (intentional — Unaffected is
-	// the blast-radius view, project-agnostic).
-	acctApps, listErr := s.store.ListApps(r.Context(), acct.ID)
-	if listErr != nil {
-		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
-			fmt.Sprintf("list account apps: %v", listErr))
-	}
+	// ADR-124 blast-radius partition: `acctApps` was loaded earlier
+	// (above the exclude-validity check) so the same round-trip
+	// serves both purposes. ListApps is account-scoped; per-account
+	// apps include rows in other projects (intentional — Unaffected
+	// is the blast-radius view, project-agnostic).
 
 	// Load the project so the partition's Removed loop is project-
 	// scoped (matches what reconcile will SoftDeleteAppCascade).

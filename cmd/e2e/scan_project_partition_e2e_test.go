@@ -171,6 +171,15 @@ func TestScanPartition_CardinalityComplete(t *testing.T) {
 		Type:           state.AppTypeApp,
 		RAMMB:          256,
 		MaxConcurrency: 1,
+		// The (RootDir, WorkloadName) MUST match the scan fixture
+		// (singleWorkloadFixture emits a workload with
+		// RootDir="services/api", Name="api"). Otherwise the
+		// partition treats matching-app as Unaffected (no scan
+		// match) and WillDeploy carries the scan workload as a
+		// fresh `create` instead of an `update` against this
+		// pre-existing app row.
+		RootDir:      "services/api",
+		WorkloadName: "api",
 	})
 	if err != nil {
 		t.Fatalf("CreateApp matching-app: %v", err)
