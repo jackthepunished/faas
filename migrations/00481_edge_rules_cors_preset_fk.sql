@@ -1,4 +1,4 @@
--- filename: 00479_edge_rules_cors_preset_fk.sql
+-- filename: 00481_edge_rules_cors_preset_fk.sql
 -- +goose Up
 -- +goose StatementBegin
 

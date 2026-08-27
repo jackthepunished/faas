@@ -102,8 +102,8 @@ Three reasons:
   compile-time merge keeps `EdgeRuleCORSResolved` as one struct. No
   "preset + inline fallback" flag at the runtime boundary.
 - **Migration economy.** One column + one FK + one partial index =
-  one migration (slot 00479 after the third rebase renumber;
-  originally 00428 → 00472 → 00475 → 00479). No new tables, no new enums.
+  one migration (slot 00481 after the fourth rebase renumber;
+  originally 00428 → 00472 → 00475 → 00479 → 00481). No new tables, no new enums.
 
 Concretely:
 
@@ -285,16 +285,18 @@ needed.
 
 ## Implementation notes
 
-- Migration slot: **00479** (third-renumber after open PR #1111
-  opened and also claimed slot 00475). Slot history:
+- Migration slot: **00481** (fourth-renumber after main merged
+  PR #1126 MFA opt-in at 00479 just 6 minutes after the third
+  renumber landed, and open PR #1127 claims 00480 with
+  `00480_snapshot_replica_event_queue.sql`). Slot history:
   00428 (initial) → 00472 (1st rebase, main's 00428 fence) →
-  00475 (2nd rebase, PR #1064 merge's 00472/00473/00474/00476 fences) →
-  **00479** (3rd renumber, PR #1111 now claims 00475 with a real
-  migration `00475_events_operator_intents_trace_id.sql`).
-  00479 is the next free slot above the eventual mainline 00478
-  after PR #1111 merges — main's pre-#1064 audit pair is at
-  00477/00478 (both shipped). Highest pre-#1064 migration on
-  the rebased tree is
+  00475 (2nd rebase, PR #1064 merge's 00472/00473/00474/00476
+  fences) → 00479 (3rd renumber, PR #1111's real migration
+  at 00475) → **00481** (4th renumber, PR #1126 merged to
+  main at 00479 + PR #1127 claims 00480).
+  00481 is the next free slot above the current mainline 00479
+  (PR #1126 MFA opt-in, shipped). Highest pre-#1064 migration
+  on the rebased tree is
   `00471_runtime_configuration_operations.sql`. See
   `migrations/README.md` for the reservation fence convention.
 - ADR-128 is the template for this ADR's structure.
@@ -309,7 +311,7 @@ needed.
   (validation matrix + plan quota + IDOR + audit);
   `cmd/gatewayd-internal/edge_rules_compile_cors_preset_test.go`
   (end-to-end + mutual exclusivity + footgun re-validation).
-- Companion test for migration 00479:
-  `migrations/00479_edge_rules_cors_preset_fk_test.go` pinning
+- Companion test for migration 00481:
+  `migrations/00481_edge_rules_cors_preset_fk_test.go` pinning
   column existence, nullable, FK ON DELETE SET NULL behavior, index
   selectivity.
