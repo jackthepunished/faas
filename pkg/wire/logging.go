@@ -241,7 +241,7 @@ func NewRequestID() string {
 
 // NewTraceID returns a 128-bit random hex string formatted as the
 // OTel W3C 32-char lowercase-hex trace_id format
-// (`^[0-9a-f]{32}$`). Migrated at 00475 to a dedicated `events.
+// (`^[0-9a-f]{32}$`). Migrated at 00486 to a dedicated `events.
 // trace_id` and `operator_intents.trace_id` column on the
 // operator-action observability path so the dashboard can join
 // alert ↔ action ↔ outcome on one column.

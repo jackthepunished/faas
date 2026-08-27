@@ -272,7 +272,7 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 	}
 	start := time.Now()
 	// PR-#TBD / C4 — lift the trace_id off the jsonb payload and
-	// persist it as a column on the events table (migrations/00475).
+	// persist it as a column on the events table (migrations/00486).
 	// The OTel-context lift at audit.go:221-232 and the explicit
 	// data["trace_id"] set by C3's schedd subscriber both write
 	// into the same map key, so this extraction captures whichever
@@ -398,7 +398,7 @@ func auditKindMetricLabel(kind string) string {
 // panel with one-off series.
 //
 // SQLSTATE 23514 (check_violation) is the events.trace_id
-// regex at 00475 — labelled so a regression in the C4 trace_id
+// regex at 00486 — labelled so a regression in the C4 trace_id
 // middleware surfaces as a check_violation bucket spike. SQLSTATE
 // 23505 (unique_violation) is the events.id / events.??? PK
 // races — labelled so the operator can tell the difference.
