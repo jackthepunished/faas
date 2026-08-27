@@ -66,6 +66,24 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 	if previous == releaseRoot {
 		return errors.New("deploycontroller: release is already active")
 	}
+	// Never replace a usable release when the current pointer names a
+	// directory that cannot be verified for rollback. A dangling legacy
+	// pointer is tolerated for first installation; an existing but incomplete
+	// release is a hard preflight error so activation cannot leave the host
+	// without a safe recovery target.
+	if previous != "" {
+		if _, statErr := os.Stat(previous); statErr == nil {
+			previousManifest, readErr := releasebundle.Read(previous)
+			if readErr != nil {
+				return fmt.Errorf("deploycontroller: current release is not rollback-capable: %w", readErr)
+			}
+			if verifyErr := releasebundle.Verify(previous, previousManifest); verifyErr != nil {
+				return fmt.Errorf("deploycontroller: current release is not rollback-capable: %w", verifyErr)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("deploycontroller: stat current release: %w", statErr)
+		}
+	}
 
 	if err := c.runtime.Preflight(ctx, manifest, releaseRoot); err != nil {
 		return fmt.Errorf("deploycontroller: preflight %q: %w", releaseID, err)
