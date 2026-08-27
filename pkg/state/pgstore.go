@@ -8823,7 +8823,7 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 			priority      = coalesce($5, priority),
 			enabled       = coalesce($6, enabled),
 			action        = case when $7 then $8::jsonb else action end,
-			cors_preset_id = case when $11 then $12::uuid else cors_preset_id end,
+			cors_preset_id = case when $10 then $11::uuid else cors_preset_id end,
 			validate_mode = coalesce(nullif($9, ''), validate_mode)
 		where id = $1
 		returning `+edgeRuleSelectCols,
@@ -8835,11 +8835,11 @@ func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRul
 		// '' to 'block' before this point so the round-trip
 		// is observable in the response.
 		validateModeArg,
-		// $11 / $12: tri-state FK update (ADR-129 D1). When
-		// $11 is false, the column is untouched (the
+		// $10 / $11: tri-state FK update (ADR-129 D1). When
+		// $10 is false, the column is untouched (the
 		// case-when default is cors_preset_id, the
-		// current value). When $11 is true, the column
-		// is set to $12, which is nil → SQL NULL for
+		// current value). When $10 is true, the column
+		// is set to $11, which is nil → SQL NULL for
 		// the "customer cleared the preset" signal or
 		// a UUID for the "set preset" signal.
 		corsPresetSet, corsPresetValue,
