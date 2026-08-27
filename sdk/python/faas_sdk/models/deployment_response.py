@@ -8,6 +8,10 @@ from uuid import UUID
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.deployment_response_canary_preset import (
+    DeploymentResponseCanaryPreset,
+    check_deployment_response_canary_preset,
+)
 from ..models.deployment_response_deployed_via_type_1 import (
     DeploymentResponseDeployedViaType1,
     check_deployment_response_deployed_via_type_1,
@@ -43,6 +47,10 @@ from ..models.deployment_response_parked_reason_type_2_type_1 import (
 from ..models.deployment_response_parked_reason_type_3_type_1 import (
     DeploymentResponseParkedReasonType3Type1,
     check_deployment_response_parked_reason_type_3_type_1,
+)
+from ..models.deployment_response_rollout_state import (
+    DeploymentResponseRolloutState,
+    check_deployment_response_rollout_state,
 )
 from ..models.deployment_response_tag import DeploymentResponseTag, check_deployment_response_tag
 from ..types import UNSET, Unset
@@ -221,6 +229,25 @@ class DeploymentResponse:
     crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing
     the threshold (clean wake window). Closed-set is enforced at the schema layer via
     deployments_last_auto_rollback_reason_check."""
+    canary_preset: DeploymentResponseCanaryPreset | Unset = UNSET
+    """Canary preset used by the deployment's progressive rollout. `none` preserves the default 100% deployment
+    path."""
+    canary_step: int | Unset = UNSET
+    """Current zero-based canary ladder step."""
+    canary_total_steps: int | Unset = UNSET
+    """Total number of canary ladder steps; zero means no canary ladder."""
+    canary_step_started_at: datetime.datetime | None | Unset = UNSET
+    """Wall-clock timestamp at which the current canary step began."""
+    rollout_state: DeploymentResponseRolloutState | Unset = UNSET
+    """Durable rollout state used by the canary orchestrator and operator recovery path."""
+    rollout_started_at: datetime.datetime | None | Unset = UNSET
+    """Wall-clock timestamp at which rollout processing began."""
+    rollout_completed_at: datetime.datetime | None | Unset = UNSET
+    """Wall-clock timestamp at which the rollout reached complete."""
+    rollout_aborted_at: datetime.datetime | None | Unset = UNSET
+    """Wall-clock timestamp at which the rollout was aborted."""
+    rollout_aborted_reason: str | Unset = UNSET
+    """Operator or orchestrator reason recorded when the rollout is aborted."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -461,6 +488,52 @@ class DeploymentResponse:
         else:
             last_auto_rollback_reason = self.last_auto_rollback_reason
 
+        canary_preset: str | Unset = UNSET
+        if not isinstance(self.canary_preset, Unset):
+            canary_preset = self.canary_preset
+
+        canary_step = self.canary_step
+
+        canary_total_steps = self.canary_total_steps
+
+        canary_step_started_at: None | str | Unset
+        if isinstance(self.canary_step_started_at, Unset):
+            canary_step_started_at = UNSET
+        elif isinstance(self.canary_step_started_at, datetime.datetime):
+            canary_step_started_at = self.canary_step_started_at.isoformat()
+        else:
+            canary_step_started_at = self.canary_step_started_at
+
+        rollout_state: str | Unset = UNSET
+        if not isinstance(self.rollout_state, Unset):
+            rollout_state = self.rollout_state
+
+        rollout_started_at: None | str | Unset
+        if isinstance(self.rollout_started_at, Unset):
+            rollout_started_at = UNSET
+        elif isinstance(self.rollout_started_at, datetime.datetime):
+            rollout_started_at = self.rollout_started_at.isoformat()
+        else:
+            rollout_started_at = self.rollout_started_at
+
+        rollout_completed_at: None | str | Unset
+        if isinstance(self.rollout_completed_at, Unset):
+            rollout_completed_at = UNSET
+        elif isinstance(self.rollout_completed_at, datetime.datetime):
+            rollout_completed_at = self.rollout_completed_at.isoformat()
+        else:
+            rollout_completed_at = self.rollout_completed_at
+
+        rollout_aborted_at: None | str | Unset
+        if isinstance(self.rollout_aborted_at, Unset):
+            rollout_aborted_at = UNSET
+        elif isinstance(self.rollout_aborted_at, datetime.datetime):
+            rollout_aborted_at = self.rollout_aborted_at.isoformat()
+        else:
+            rollout_aborted_at = self.rollout_aborted_at
+
+        rollout_aborted_reason = self.rollout_aborted_reason
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -549,6 +622,24 @@ class DeploymentResponse:
             field_dict["last_auto_rollback_at"] = last_auto_rollback_at
         if last_auto_rollback_reason is not UNSET:
             field_dict["last_auto_rollback_reason"] = last_auto_rollback_reason
+        if canary_preset is not UNSET:
+            field_dict["canary_preset"] = canary_preset
+        if canary_step is not UNSET:
+            field_dict["canary_step"] = canary_step
+        if canary_total_steps is not UNSET:
+            field_dict["canary_total_steps"] = canary_total_steps
+        if canary_step_started_at is not UNSET:
+            field_dict["canary_step_started_at"] = canary_step_started_at
+        if rollout_state is not UNSET:
+            field_dict["rollout_state"] = rollout_state
+        if rollout_started_at is not UNSET:
+            field_dict["rollout_started_at"] = rollout_started_at
+        if rollout_completed_at is not UNSET:
+            field_dict["rollout_completed_at"] = rollout_completed_at
+        if rollout_aborted_at is not UNSET:
+            field_dict["rollout_aborted_at"] = rollout_aborted_at
+        if rollout_aborted_reason is not UNSET:
+            field_dict["rollout_aborted_reason"] = rollout_aborted_reason
 
         return field_dict
 
@@ -1023,6 +1114,94 @@ class DeploymentResponse:
 
         last_auto_rollback_reason = _parse_last_auto_rollback_reason(d.pop("last_auto_rollback_reason", UNSET))
 
+        _canary_preset = d.pop("canary_preset", UNSET)
+        canary_preset: DeploymentResponseCanaryPreset | Unset
+        if isinstance(_canary_preset, Unset):
+            canary_preset = UNSET
+        else:
+            canary_preset = check_deployment_response_canary_preset(_canary_preset)
+
+        canary_step = d.pop("canary_step", UNSET)
+
+        canary_total_steps = d.pop("canary_total_steps", UNSET)
+
+        def _parse_canary_step_started_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                canary_step_started_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return canary_step_started_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        canary_step_started_at = _parse_canary_step_started_at(d.pop("canary_step_started_at", UNSET))
+
+        _rollout_state = d.pop("rollout_state", UNSET)
+        rollout_state: DeploymentResponseRolloutState | Unset
+        if isinstance(_rollout_state, Unset):
+            rollout_state = UNSET
+        else:
+            rollout_state = check_deployment_response_rollout_state(_rollout_state)
+
+        def _parse_rollout_started_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                rollout_started_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return rollout_started_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        rollout_started_at = _parse_rollout_started_at(d.pop("rollout_started_at", UNSET))
+
+        def _parse_rollout_completed_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                rollout_completed_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return rollout_completed_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        rollout_completed_at = _parse_rollout_completed_at(d.pop("rollout_completed_at", UNSET))
+
+        def _parse_rollout_aborted_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                rollout_aborted_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return rollout_aborted_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        rollout_aborted_at = _parse_rollout_aborted_at(d.pop("rollout_aborted_at", UNSET))
+
+        rollout_aborted_reason = d.pop("rollout_aborted_reason", UNSET)
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -1068,6 +1247,15 @@ class DeploymentResponse:
             first_5xx_count=first_5xx_count,
             last_auto_rollback_at=last_auto_rollback_at,
             last_auto_rollback_reason=last_auto_rollback_reason,
+            canary_preset=canary_preset,
+            canary_step=canary_step,
+            canary_total_steps=canary_total_steps,
+            canary_step_started_at=canary_step_started_at,
+            rollout_state=rollout_state,
+            rollout_started_at=rollout_started_at,
+            rollout_completed_at=rollout_completed_at,
+            rollout_aborted_at=rollout_aborted_at,
+            rollout_aborted_reason=rollout_aborted_reason,
         )
 
         deployment_response.additional_properties = d

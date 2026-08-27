@@ -21,6 +21,7 @@ from ..models.create_deployment_request_tag_type_3_type_1 import (
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.canary_preset_spec import CanaryPresetSpec
     from ..models.create_deployment_overrides import CreateDeploymentOverrides
     from ..models.sidecar import Sidecar
 
@@ -76,9 +77,13 @@ class CreateDeploymentRequest:
     rollback_on_5xx: bool | None | Unset = UNSET
     """Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server
     default false."""
+    canary: CanaryPresetSpec | None | Unset = UNSET
+    """Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale
+    only."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.canary_preset_spec import CanaryPresetSpec
         from ..models.create_deployment_overrides import CreateDeploymentOverrides
 
         image = self.image
@@ -152,6 +157,14 @@ class CreateDeploymentRequest:
         else:
             rollback_on_5xx = self.rollback_on_5xx
 
+        canary: dict[str, Any] | None | Unset
+        if isinstance(self.canary, Unset):
+            canary = UNSET
+        elif isinstance(self.canary, CanaryPresetSpec):
+            canary = self.canary.to_dict()
+        else:
+            canary = self.canary
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -177,11 +190,14 @@ class CreateDeploymentRequest:
             field_dict["pr_number"] = pr_number
         if rollback_on_5xx is not UNSET:
             field_dict["rollback_on_5xx"] = rollback_on_5xx
+        if canary is not UNSET:
+            field_dict["canary"] = canary
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.canary_preset_spec import CanaryPresetSpec
         from ..models.create_deployment_overrides import CreateDeploymentOverrides
         from ..models.sidecar import Sidecar
 
@@ -325,6 +341,23 @@ class CreateDeploymentRequest:
 
         rollback_on_5xx = _parse_rollback_on_5xx(d.pop("rollback_on_5xx", UNSET))
 
+        def _parse_canary(data: object) -> CanaryPresetSpec | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                canary_type_0 = CanaryPresetSpec.from_dict(data)
+
+                return canary_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CanaryPresetSpec | None | Unset, data)
+
+        canary = _parse_canary(d.pop("canary", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
@@ -337,6 +370,7 @@ class CreateDeploymentRequest:
             deployed_by=deployed_by,
             pr_number=pr_number,
             rollback_on_5xx=rollback_on_5xx,
+            canary=canary,
         )
 
         create_deployment_request.additional_properties = d

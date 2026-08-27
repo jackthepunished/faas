@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from attrs import define as _attrs_define
@@ -52,6 +52,15 @@ class OperatorIntentAcceptedResponse:
     """Populated for force_cold_boot. The app whose deployment was targeted."""
     deployment_id: UUID | Unset = UNSET
     """Populated for force_cold_boot. The latest deployment of the app."""
+    trace_id: None | str | Unset = UNSET
+    """Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
+    hex identifier shared with the inbound HTTP request
+    and the schedd dispatch context. Always populated for
+    the inbound force-action route (the middleware
+    generates one when absent); surfaced here so the
+    caller can correlate the 202 response with the
+    terminal outcome row.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,6 +92,12 @@ class OperatorIntentAcceptedResponse:
         if not isinstance(self.deployment_id, Unset):
             deployment_id = str(self.deployment_id)
 
+        trace_id: None | str | Unset
+        if isinstance(self.trace_id, Unset):
+            trace_id = UNSET
+        else:
+            trace_id = self.trace_id
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -103,6 +118,8 @@ class OperatorIntentAcceptedResponse:
             field_dict["app_id"] = app_id
         if deployment_id is not UNSET:
             field_dict["deployment_id"] = deployment_id
+        if trace_id is not UNSET:
+            field_dict["trace_id"] = trace_id
 
         return field_dict
 
@@ -149,6 +166,15 @@ class OperatorIntentAcceptedResponse:
         else:
             deployment_id = UUID(_deployment_id)
 
+        def _parse_trace_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_id = _parse_trace_id(d.pop("trace_id", UNSET))
+
         operator_intent_accepted_response = cls(
             ok=ok,
             intent_id=intent_id,
@@ -160,6 +186,7 @@ class OperatorIntentAcceptedResponse:
             previous_state=previous_state,
             app_id=app_id,
             deployment_id=deployment_id,
+            trace_id=trace_id,
         )
 
         operator_intent_accepted_response.additional_properties = d
