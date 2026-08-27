@@ -141,6 +141,10 @@ jobs:
             .github/actions/deploy/bin/gregale
             /tmp/gregale-build/gregale-darwin-arm64
             SHA256SUMS
+          # Release candidates (for example v0.1.18-rc.1) must not be
+          # presented as stable releases. Keep the tag convention and the
+          # GitHub release classification in lockstep.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Gregale ${{ github.ref_name }}
 

@@ -89,6 +89,27 @@ func TestDeployRollsBackOnHealthFailure(t *testing.T) {
 	}
 }
 
+func TestDeployRollsBackWhenCurrentSymlinkIsRelative(t *testing.T) {
+	root := t.TempDir()
+	makeRelease(t, root, "new")
+	old := makeRelease(t, filepath.Join(root, "releases"), "old")
+	current := filepath.Join(root, "current")
+	if err := os.Symlink(filepath.Join("releases", "old"), current); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{healthyErr: errors.New("gateway not ready")}
+	controller := newController(t, root, current, runtime)
+
+	err := controller.Deploy(context.Background(), "new")
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("Deploy error = %v, want rollback error", err)
+	}
+	want := []string{"preflight", "migrate", "activate:" + filepath.Join(root, "new"), "restart", "healthy", "activate:" + old, "restart", "healthy"}
+	if strings.Join(runtime.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", runtime.calls, want)
+	}
+}
+
 func TestDeployStopsBeforeActivationWhenMigrationFails(t *testing.T) {
 	root := t.TempDir()
 	makeRelease(t, root, "new")

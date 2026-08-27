@@ -59,7 +59,7 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 		return fmt.Errorf("deploycontroller: verify release %q: %w", releaseID, err)
 	}
 
-	previous, err := os.Readlink(c.config.CurrentPath)
+	previous, err := readCurrentTarget(c.config.CurrentPath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("deploycontroller: read current release: %w", err)
 	}
@@ -86,6 +86,22 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 		return c.rollback(ctx, releaseID, previous, err)
 	}
 	return nil
+}
+
+// readCurrentTarget normalizes a relative current symlink against the
+// symlink's directory. Older installers published `current -> releases/<id>`
+// while the controller now writes an absolute target; without this
+// normalization rollback tries to read `releases/<id>/manifest.json` from
+// the process working directory instead of `/opt/faas/releases/<id>`.
+func readCurrentTarget(path string) (string, error) {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	return filepath.Clean(target), nil
 }
 
 func (c *Controller) rollback(ctx context.Context, releaseID, previous string, cause error) error {
