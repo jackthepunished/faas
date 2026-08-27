@@ -38,8 +38,7 @@ import (
 type fakeEdgeRuleStore struct {
 	mu       sync.Mutex
 	rules    map[string][]state.EdgeRule
-	presets  map[string]state.CorsPreset // presetID → CorsPreset, keyed by ID alone
-	presetBy map[string]state.CorsPreset // accountID+id → CorsPreset, keyed by composite
+	presetBy map[string]state.CorsPreset // accountID+":"+id → CorsPreset, keyed by composite
 	err      error
 	calls    map[string]int // host -> call count, for loader-frequency assertions
 }
@@ -59,9 +58,8 @@ func (f *fakeEdgeRuleStore) MatchEdgeRulesForHost(_ context.Context, host string
 
 // GetCorsPresetByID mirrors state.Store.GetCorsPresetByID for tests:
 // cross-tenant lookups collapse to ErrNotFound (account_id + id
-// composite key) so PR-B IDOR regressions surface in tests. The
-// (presets, presetBy) maps are kept side-by-side so tests can seed
-// either path. Issue #975 #4 PR-B / ADR-129 D3.
+// composite key) so PR-B IDOR regressions surface in tests. Issue
+// #975 #4 PR-B / ADR-129 D3.
 func (f *fakeEdgeRuleStore) GetCorsPresetByID(_ context.Context, accountID, id string) (state.CorsPreset, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
