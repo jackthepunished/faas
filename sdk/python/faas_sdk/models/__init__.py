@@ -337,6 +337,8 @@ from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
+from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
+from .list_operator_runtime_config_revisions_response_200 import ListOperatorRuntimeConfigRevisionsResponse200
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
 from .list_tenant_surfaces_response import ListTenantSurfacesResponse
@@ -360,6 +362,23 @@ from .mfa_verify_response import MFAVerifyResponse
 from .o_auth_provider_capability import OAuthProviderCapability
 from .oidc_exchange_request import OIDCExchangeRequest
 from .oidc_exchange_response import OIDCExchangeResponse
+from .operator_intent_accepted_response import OperatorIntentAcceptedResponse
+from .operator_intent_accepted_response_kind import OperatorIntentAcceptedResponseKind
+from .operator_intent_accepted_response_previous_state import OperatorIntentAcceptedResponsePreviousState
+from .operator_intent_response import OperatorIntentResponse
+from .operator_intent_response_kind import OperatorIntentResponseKind
+from .operator_intent_response_status import OperatorIntentResponseStatus
+from .operator_runtime_config import OperatorRuntimeConfig
+from .operator_runtime_config_apply_mode import OperatorRuntimeConfigApplyMode
+from .operator_runtime_config_kind import OperatorRuntimeConfigKind
+from .operator_runtime_config_operation import OperatorRuntimeConfigOperation
+from .operator_runtime_config_operation_apply_mode import OperatorRuntimeConfigOperationApplyMode
+from .operator_runtime_config_operation_scope import OperatorRuntimeConfigOperationScope
+from .operator_runtime_config_operation_status import OperatorRuntimeConfigOperationStatus
+from .operator_runtime_config_revision import OperatorRuntimeConfigRevision
+from .operator_runtime_config_revision_scope import OperatorRuntimeConfigRevisionScope
+from .operator_runtime_config_source import OperatorRuntimeConfigSource
+from .operator_runtime_config_status import OperatorRuntimeConfigStatus
 from .org_invitation_response import OrgInvitationResponse
 from .org_invitation_response_role import OrgInvitationResponseRole
 from .org_invitation_response_status import OrgInvitationResponseStatus
@@ -396,6 +415,10 @@ from .plan_workload_action import PlanWorkloadAction
 from .plan_workload_class import PlanWorkloadClass
 from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
+from .post_force_cold_boot_app_confirm import PostForceColdBootAppConfirm
+from .post_force_park_instance_confirm import PostForceParkInstanceConfirm
+from .post_force_restart_instance_confirm import PostForceRestartInstanceConfirm
+from .post_sweep_stuck_builds_confirm import PostSweepStuckBuildsConfirm
 from .problem import Problem
 from .programmatic_api_key import ProgrammaticAPIKey
 from .programmatic_auth_response import ProgrammaticAuthResponse
@@ -478,6 +501,7 @@ from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .sweep_stuck_builds_response import SweepStuckBuildsResponse
 from .template_view import TemplateView
 from .template_view_category import TemplateViewCategory
 from .tenant_hostname_response import TenantHostnameResponse
@@ -531,6 +555,7 @@ from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
 from .update_edge_rule_request_validate_mode import UpdateEdgeRuleRequestValidateMode
+from .update_operator_runtime_config_body import UpdateOperatorRuntimeConfigBody
 from .update_trigger_request import UpdateTriggerRequest
 from .update_trigger_request_broker_poison_strategy_type_1 import UpdateTriggerRequestBrokerPoisonStrategyType1
 from .update_trigger_request_broker_poison_strategy_type_2_type_1 import (
@@ -886,6 +911,8 @@ __all__ = (
     "ListCronRunsResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
+    "ListOperatorRuntimeConfigResponse200",
+    "ListOperatorRuntimeConfigRevisionsResponse200",
     "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
     "ListTenantSurfacesResponse",
@@ -909,6 +936,23 @@ __all__ = (
     "OAuthProviderCapability",
     "OIDCExchangeRequest",
     "OIDCExchangeResponse",
+    "OperatorIntentAcceptedResponse",
+    "OperatorIntentAcceptedResponseKind",
+    "OperatorIntentAcceptedResponsePreviousState",
+    "OperatorIntentResponse",
+    "OperatorIntentResponseKind",
+    "OperatorIntentResponseStatus",
+    "OperatorRuntimeConfig",
+    "OperatorRuntimeConfigApplyMode",
+    "OperatorRuntimeConfigKind",
+    "OperatorRuntimeConfigOperation",
+    "OperatorRuntimeConfigOperationApplyMode",
+    "OperatorRuntimeConfigOperationScope",
+    "OperatorRuntimeConfigOperationStatus",
+    "OperatorRuntimeConfigRevision",
+    "OperatorRuntimeConfigRevisionScope",
+    "OperatorRuntimeConfigSource",
+    "OperatorRuntimeConfigStatus",
     "OrgInvitationResponse",
     "OrgInvitationResponseRole",
     "OrgInvitationResponseStatus",
@@ -945,6 +989,10 @@ __all__ = (
     "PlanWorkloadClass",
     "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
+    "PostForceColdBootAppConfirm",
+    "PostForceParkInstanceConfirm",
+    "PostForceRestartInstanceConfirm",
+    "PostSweepStuckBuildsConfirm",
     "Problem",
     "ProgrammaticAPIKey",
     "ProgrammaticAuthResponse",
@@ -1025,6 +1073,7 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "SweepStuckBuildsResponse",
     "TemplateView",
     "TemplateViewCategory",
     "TenantHostnameResponse",
@@ -1078,6 +1127,7 @@ __all__ = (
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
     "UpdateEdgeRuleRequestValidateMode",
+    "UpdateOperatorRuntimeConfigBody",
     "UpdateTriggerRequest",
     "UpdateTriggerRequestBrokerPoisonStrategyType1",
     "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",
