@@ -1,9 +1,9 @@
 //go:build !no_pg
 
 // Migration 00430 — widens compute_node_heartbeats.source CHECK
-// to include 'builder_tick' for the (deferred) pkg/builderd/
-// heartbeat.go writer (operator-side observability mega-PR /
-// Commit 7). Pattern mirrors 00091_apps_node_claimable_test.go.
+// to include 'builder_tick' for the pkg/builderd heartbeat writer
+// (operator-side observability mega-PR / Commit 7). Pattern mirrors
+// 00091_apps_node_claimable_test.go.
 //
 // What this pins:
 //

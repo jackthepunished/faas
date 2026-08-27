@@ -18,13 +18,10 @@
 //	would force the operator UI to filter by source on every
 //	render.
 //
-// Today's row count is zero: the underlying builder_tick writer
-// (pkg/builderd/heartbeat.go) is deferred per the Commit 7 PR
-// risk list — builderd does not currently self-register a
-// compute_nodes row at startup. The endpoint lands with the
-// handler returning an empty `items` slice; once the writer is
-// live, the row count goes from zero to non-zero without an API
-// change.
+// builderd publishes the builder_tick row independently of the build queue;
+// a quiet builder is therefore distinguishable from a missing builder. The
+// writer resolves the compute node registered by vmmd and retries naturally
+// while a fresh compute box is still joining the fleet.
 package main
 
 import (

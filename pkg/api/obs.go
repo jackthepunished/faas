@@ -750,11 +750,8 @@ type ObsBuilderHeartbeatListResponse struct {
 
 // ObsBuilderHeartbeatRow is one row of the builderd heartbeat
 // projection. Mirrors ObsHeartbeatRow but for the
-// source='builder_tick' slice — the underlying writer
-// (pkg/builderd/heartbeat.go) is deferred per the Commit 7
-// risk list so today's row count is zero. Once the writer
-// is live, the row count goes from zero to non-zero without
-// an API change. CPUPct60s + DiskUsedBytes mirror the vmmd
+// source='builder_tick' slice. The builderd writer emits the
+// source and timestamps; CPUPct60s + DiskUsedBytes mirror the vmmd
 // heartbeat columns; nullable because the builderd writer
 // is not yet emitting them.
 type ObsBuilderHeartbeatRow struct {

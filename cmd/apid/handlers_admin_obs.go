@@ -505,7 +505,7 @@ func emitOperatorActionForceRestart(r *http.Request, s *server, caller state.Acc
 // audit row when an admin sweeps stuck-running builds via the P2c
 // endpoint. accountID is nil because the sweep is fleet-level (no
 // single tenant owns the operation).
-func emitOperatorActionReclaimBuild(r *http.Request, s *server, caller state.Account, olderThanSeconds, sweptCount int, thresholdISO string) {
+func emitOperatorActionReclaimBuild(r *http.Request, s *server, caller state.Account, olderThanSeconds, sweptCount int, thresholdISO, reason string) {
 	if s == nil || s.audit == nil {
 		return
 	}
@@ -514,6 +514,7 @@ func emitOperatorActionReclaimBuild(r *http.Request, s *server, caller state.Acc
 		"older_than_seconds": olderThanSeconds,
 		"swept_count":        sweptCount,
 		"threshold_iso":      thresholdISO,
+		"reason":             reason,
 	})
 }
 

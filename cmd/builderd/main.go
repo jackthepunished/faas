@@ -216,6 +216,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 	// SubscribeWithReconnect owns its own cancel inside the wrapper.
+	// Start the independent builder liveness signal only after all
+	// database-backed startup wiring succeeds, so a failed boot cannot
+	// leave a heartbeat goroutine using a pool that is about to close.
+	go builderHeartbeatLoop(ctx, store, builderHeartbeatNodeName(cfg), defaultBuilderHeartbeatInterval, log)
 
 	var httpSrv *http.Server
 	if cfg.MetricsAddr != "" {

@@ -6,8 +6,8 @@
 -- heartbeat + per-node build-queue gauge). Widens the existing
 -- CHECK constraint on compute_node_heartbeats.source from
 -- ('heartbeat_tick','deactivation','reactivation') to add the
--- new 'builder_tick' value emitted by the (deferred, see PR
--- description) pkg/builderd/heartbeat.go goroutine.
+-- new 'builder_tick' value emitted by the cmd/builderd heartbeat
+-- goroutine.
 --
 -- Why a separate source value rather than reusing 'heartbeat_tick':
 --
@@ -17,9 +17,8 @@
 --   (which is observability-only — a missing builder_tick does
 --   NOT flip the node inactive). The migration widening the
 --   enum unblocks both the apid admin endpoint
---   GET /v1/admin/obs/builder-heartbeats and the future
---   builderd writer; until the writer lands, the table is
---   simply empty for source='builder_tick'.
+--   GET /v1/admin/obs/builder-heartbeats and the builderd
+--   writer; idle builders continue to produce these rows.
 --
 -- Constraint naming:
 --

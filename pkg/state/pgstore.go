@@ -10862,13 +10862,9 @@ func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartb
 
 // LatestBuilderHeartbeatStats (operator-side observability
 // mega-PR / Commit 7 — P5) returns the most-recent heartbeat
-// filtered to source='builder_tick'. The underlying writer
-// (pkg/builderd/heartbeat.go) is deferred per the Commit 7 risk
-// list — builderd does not currently self-register a
-// compute_nodes row at startup. The mirror method exists today
-// so the GET /v1/admin/obs/builder-heartbeats endpoint can
-// land without waiting on the writer; once the writer is live,
-// the row count goes from zero to non-zero without an API change.
+// filtered to source='builder_tick'. cmd/builderd publishes
+// these rows independently of the build queue so idle builders
+// remain observable.
 func (s *PgStore) LatestBuilderHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
 	return s.latestHeartbeatStatsWhere(ctx, "where source = 'builder_tick'")
 }

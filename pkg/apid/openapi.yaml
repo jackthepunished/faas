@@ -8769,7 +8769,8 @@ paths:
         "1ns" cannot sweep in-flight builds. Default 15m.
 
         Audit row: operator.action.reclaim_build with
-        account_id=NULL (fleet-level, not tenant-scoped).
+        account_id=NULL (fleet-level, not tenant-scoped), including
+        the normalized operator reason.
       parameters:
         - in: query
           name: confirm
@@ -8784,6 +8785,14 @@ paths:
             pattern: '^[0-9]+(ns|us|ms|s|m|h)$'
             example: 15m
           description: Threshold duration. Clamped to [1m, 60m]. Default 15m.
+        - in: query
+          name: reason
+          required: false
+          schema:
+            type: string
+            pattern: '^[a-z0-9_]{1,64}$'
+            default: operator_reclaim_build
+          description: Optional durable audit reason. Lowercase letters, numbers, and underscores only.
       responses:
         '200':
           description: Sweep complete. `swept_count` may be 0 when no rows match the threshold.
