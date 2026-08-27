@@ -980,6 +980,24 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
+      - name: download Go modules with retry
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout 45s go mod download; then
+              echo "Go modules downloaded on attempt ${attempt}"
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Go module download failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            delay=$((attempt * 5))
+            echo "Go module download attempt ${attempt} failed; retrying in ${delay}s" >&2
+            sleep "${delay}"
+          done
       - name: make test-load
         run: make test-load
 
