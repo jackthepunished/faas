@@ -3115,7 +3115,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"other",
 	}
 	auditErrorClassClosedSet := []string{
-		"sqlstate_23514", // check_violation (events.trace_id regex at 00472)
+		"sqlstate_23514", // check_violation (events.trace_id regex at 00475)
 		"sqlstate_23505", // unique_violation
 		"timeout",
 		"other",
@@ -3145,7 +3145,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"endpoint", "kind"})
 	auditLogWriteFailuresTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_audit_log_write_failures_total",
-		Help: "Count of events-table appends that failed, labelled by endpoint, kind, and error_class ∈ {sqlstate_23514, sqlstate_23505, timeout, other}. The audit emit path surfaces SQLSTATE 23514 (check_violation — the regex on events.trace_id at 00472) and 23505 (unique_violation) as labelled buckets; everything else collapses to 'other'. /v1/admin/obs/health reports the failure rate vs audit_log_write_total — a sustained non-zero failure rate implies the events table is degraded.",
+		Help: "Count of events-table appends that failed, labelled by endpoint, kind, and error_class ∈ {sqlstate_23514, sqlstate_23505, timeout, other}. The audit emit path surfaces SQLSTATE 23514 (check_violation — the regex on events.trace_id at 00475) and 23505 (unique_violation) as labelled buckets; everything else collapses to 'other'. /v1/admin/obs/health reports the failure rate vs audit_log_write_total — a sustained non-zero failure rate implies the events table is degraded.",
 	}, []string{"endpoint", "kind", "error_class"})
 	operatorActionTraceCompletenessRatio := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "_operator_action_trace_completeness_ratio",

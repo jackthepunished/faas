@@ -1,4 +1,4 @@
--- filename: 00472_events_operator_intents_trace_id.sql
+-- filename: 00475_events_operator_intents_trace_id.sql
 -- +goose Up
 -- +goose StatementBegin
 --

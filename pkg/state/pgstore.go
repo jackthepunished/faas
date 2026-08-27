@@ -11972,7 +11972,7 @@ func (s *PgStore) AppendEvent(ctx context.Context, actor, kind string, subject *
 }
 
 // AppendEventWithTrace writes one row to events with an optional
-// OTel W3C 32-char hex trace_id (migrations/00472). When traceID
+// OTel W3C 32-char hex trace_id (migrations/00475). When traceID
 // is nil the column is left NULL — pre-PR rows + cron-fired rows
 // without an inbound trace_id keep that shape. The regex CHECK
 // on events.trace_id is enforced by Postgres on INSERT; a non-hex

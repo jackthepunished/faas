@@ -2,7 +2,7 @@
 // round-trip contract for MemStore.AppendEventWithTrace and
 // MemStore.InsertOperatorIntent. The PgStore equivalents are
 // covered by pgstore_operator_intent_test.go (and
-// migrations/00472_events_operator_intents_trace_id_test.go
+// migrations/00475_events_operator_intents_trace_id_test.go
 // for the schema).
 //
 // Pins:
@@ -12,7 +12,7 @@
 //     a trace_id — preserves pre-PR contract for callers that don't
 //     know about trace_ids.
 //  3. AppendEventWithTrace rejects a non-OTel-hex trace_id (the
-//     migration CHECK at 00472 enforces the same regex on
+//     migration CHECK at 00475 enforces the same regex on
 //     events.trace_id for PgStore; MemStore validates defensively
 //     at the boundary so test doubles cannot accept an invalid
 //     value).
@@ -22,7 +22,7 @@
 //     the value persists through the FOR UPDATE SKIP LOCKED claim).
 //  6. GetOperatorIntent round-trips the trace_id.
 //  7. InsertOperatorIntent rejects a non-OTel-hex trace_id with
-//     a clear error (mirrors 00472's CHECK violation contract).
+//     a clear error (mirrors 00475's CHECK violation contract).
 
 package state
 
@@ -83,7 +83,7 @@ func TestMemStore_AppendEvent_ShimLeavesTraceIDNil(t *testing.T) {
 
 // TestMemStore_AppendEventWithTrace_RejectsNonOTelHex pins the
 // defensive validation in MemStore that mirrors the migration
-// CHECK constraint at 00472.
+// CHECK constraint at 00475.
 func TestMemStore_AppendEventWithTrace_RejectsNonOTelHex(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()
@@ -173,7 +173,7 @@ func TestMemStore_ClaimPendingOperatorIntent_RoundTripsTraceID(t *testing.T) {
 
 // TestMemStore_InsertOperatorIntent_RejectsNonOTelHex pins the
 // defensive validation on the operator_intents path. Mirrors
-// the migration CHECK at 00472 for events.operator_intents.
+// the migration CHECK at 00475 for events.operator_intents.
 func TestMemStore_InsertOperatorIntent_RejectsNonOTelHex(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

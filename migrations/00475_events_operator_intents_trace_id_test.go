@@ -1,17 +1,29 @@
 //go:build !no_pg
 
-// Migration 00472 — adds the `trace_id` column to both `events`
+// Migration 00475 — adds the `trace_id` column to both `events`
 // (the live audit log) and `operator_intents` (the dispatch table)
 // so the operator-action observability layer can join enqueue ↔
 // terminal-outcome audit rows on one column.
 //
-// Slot history: this migration was originally numbered 00456 when
-// the branch was created against pre-PR-#1115 main. During the
-// post-PR-#1111 rebase onto main, the slot was renumbered twice:
-// first to 00469 to clear main's bridge-reservation fence at 00456,
-// then to 00472 once main consumed 00469-00471 (runtime
-// configuration + snapshot replicas). Main now owns 00456
-// through 00471; this migration lives at the next free slot.
+// Slot history: this migration has been renumbered four times
+// during the post-PR-#1111 rebase cycle as adjacent slots on
+// main + other open PRs got claimed:
+//
+//   1. Originally 00456 when the branch was created against
+//      pre-PR-#1115 main.
+//   2. Renumbered to 00469 to clear main's bridge-reservation
+//      fence at 00456.
+//   3. Renumbered to 00472 once main consumed 00469-00471
+//      (runtime configuration + snapshot replicas).
+//   4. Renumbered to 00475 after the post-rebase CI flagged
+//      open PRs #1090 (CORS preset FK), #1064 (deployment audit
+//      + 90-day backfill), and #1083 (alert-presets enable
+//      signals) each claiming slots in the 00472-00474 cluster.
+//      Main now owns through 00471; the 00472 and 00474 gaps
+//      are allowlisted in the migrations-contiguity gate
+//      (other PRs' claims); the fence parked at 00473 fills
+//      the unallowlisted gap between them; this migration
+//      lives at 00475.
 //
 // Pins:
 //
@@ -49,7 +61,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigration_00472_EventsOperatorIntentsTraceID(t *testing.T) {
+func TestMigration_00475_EventsOperatorIntentsTraceID(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -76,7 +88,7 @@ func TestMigration_00472_EventsOperatorIntentsTraceID(t *testing.T) {
 	assertPartialIndex(t, ctx, pool, "operator_intents_trace_idx", "operator_intents", "trace_id")
 
 	// (5) Replay-safe: second MigrateUp is a no-op (the IF NOT
-	// EXISTS guards in 00472's Up block make this true; pgtest
+	// EXISTS guards in 00475's Up block make this true; pgtest
 	// gives a fresh schema per test, so we explicitly re-apply
 	// here to pin the property).
 	if err := mustMigrateUp(ctx, pool); err != nil {

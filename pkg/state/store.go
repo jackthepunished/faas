@@ -2829,7 +2829,7 @@ type Store interface {
 	// traceID (PR-#TBD / C2) is the optional OTel W3C 32-char hex
 	// trace identifier stamped by the apid force-action handler.
 	// Nil leaves the column NULL. The regex CHECK at
-	// migrations/00472 enforces the format on INSERT for PgStore;
+	// migrations/00475 enforces the format on INSERT for PgStore;
 	// MemStore validates defensively via isOTelHex32.
 	InsertOperatorIntent(
 		ctx context.Context,
@@ -3874,7 +3874,7 @@ type Store interface {
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	// AppendEventWithTrace is the operator-obs Trace ID sibling.
 	// When traceID is non-nil it must match the regex
-	// `^[0-9a-f]{32}$` (the migration CHECK at 00472 enforces this
+	// `^[0-9a-f]{32}$` (the migration CHECK at 00475 enforces this
 	// on the `events.trace_id` column for PgStore; MemStore
 	// validates defensively at the boundary so test doubles
 	// cannot accept an invalid value). When traceID is nil the
