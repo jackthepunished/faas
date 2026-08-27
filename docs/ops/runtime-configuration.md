@@ -51,6 +51,9 @@ credential outage.
 - `PATCH /v1/admin/config/{key}` — hot apply or queue an asynchronous apply.
 - `GET /v1/admin/config-operations/{id}` — poll an asynchronous apply.
 - `GET /v1/admin/config/{key}/revisions` — inspect append-only history.
+- `POST /v1/admin/config/{key}/rollback` — apply an older hot revision as a
+  new revision; the request requires a reason and supports optimistic
+  `expected_version` protection.
 
 All writes require admin scope, MFA, a reason, and an optional expected
 version. Sensitive values are redacted in list, operation, and revision

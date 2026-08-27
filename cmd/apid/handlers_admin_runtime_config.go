@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,6 +44,12 @@ type runtimeConfigPatchRequest struct {
 	Value           json.RawMessage `json:"value"`
 	Reason          string          `json:"reason"`
 	ExpectedVersion *int64          `json:"expected_version"`
+}
+
+type runtimeConfigRollbackRequest struct {
+	Version         int64  `json:"version"`
+	Reason          string `json:"reason"`
+	ExpectedVersion *int64 `json:"expected_version"`
 }
 
 func runtimeConfigOperationResponse(operation state.RuntimeConfigOperation) api.OperatorRuntimeConfigOperation {
@@ -204,27 +212,8 @@ func (s *server) adminRuntimeConfigPatch(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusAccepted, runtimeConfigOperationResponse(operation))
 		return
 	}
-	applied, err := s.runtimeConfig.applyVersion(key, req.Value, row.Version)
-	if err != nil {
-		_ = s.store.MarkRuntimeConfigApplied(r.Context(), key, row.Scope, row.ScopeID, row.Version, nil, err.Error())
-		api.WriteProblem(w, api.ErrCapacity("could not apply runtime configuration"))
-		return
-	}
-	if !applied {
-		// Another request has already installed a newer durable version in
-		// this process. Leave that newer value live and converge the local
-		// snapshot from the database before reporting the optimistic-write
-		// conflict to the operator.
-		_ = s.runtimeConfig.reconcile(r.Context(), s.store)
-		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
-		return
-	}
-	if err := s.store.MarkRuntimeConfigApplied(r.Context(), key, row.Scope, row.ScopeID, row.Version, req.Value, ""); err != nil {
+	if err := s.applyHotRuntimeConfig(r.Context(), row); err != nil {
 		if errors.Is(err, state.ErrRuntimeConfigConflict) {
-			// The durable row was superseded after the local hot swap. The
-			// newer value must win; reconciling here avoids waiting for the
-			// notification/ticker before the current apid process catches up.
-			_ = s.runtimeConfig.reconcile(r.Context(), s.store)
 			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
 			return
 		}
@@ -260,6 +249,139 @@ func (s *server) adminRuntimeConfigPatch(w http.ResponseWriter, r *http.Request,
 		Version:        row.Version,
 		UpdatedAt:      row.UpdatedAt.UTC().Format(time.RFC3339),
 		AppliedAt:      nowUTCString(),
+	})
+}
+
+// applyHotRuntimeConfig is the single in-process apply path for synchronous
+// settings and rollbacks. It intentionally acknowledges the durable row only
+// after the versioned snapshot has been swapped. If the acknowledgement loses
+// a race, the newer database version is reconciled immediately; a transient
+// database error leaves the new value live and the subscriber repairs the
+// acknowledgement later, so a database hiccup never requires an apid restart.
+func (s *server) applyHotRuntimeConfig(ctx context.Context, row state.RuntimeConfig) error {
+	applied, err := s.runtimeConfig.applyVersion(row.Key, row.DesiredValue, row.Version)
+	if err != nil {
+		_ = s.store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, row.Version, nil, err.Error())
+		return err
+	}
+	if !applied {
+		_ = s.runtimeConfig.reconcile(ctx, s.store)
+		return state.ErrRuntimeConfigConflict
+	}
+	if err := s.store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, row.Version, row.DesiredValue, ""); err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigConflict) {
+			_ = s.runtimeConfig.reconcile(ctx, s.store)
+		}
+		return err
+	}
+	return nil
+}
+
+// adminRuntimeConfigRollback applies a previous hot revision as a new
+// version. The original revision remains immutable in the history, so the
+// rollback itself is auditable and can be rolled forward again if needed.
+func (s *server) adminRuntimeConfigRollback(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if allowed, prob := s.adminAllows(acct); !allowed {
+		api.WriteProblem(w, prob)
+		return
+	}
+	key := strings.TrimSpace(r.PathValue("key"))
+	def, ok := s.runtimeConfig.Definition(key)
+	if !ok {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Unknown configuration key", "the key is not in the operator configuration catalog"))
+		return
+	}
+	if !def.Mutable || def.ApplyMode != state.RuntimeConfigApplyHot {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Only hot settings can be rolled back", "this setting requires its deployment-managed apply workflow"))
+		return
+	}
+	var req runtimeConfigRollbackRequest
+	if err := decodeJSON(r, &req); err != nil || req.Version < 1 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Invalid rollback revision", "version must be a positive revision number"))
+		return
+	}
+	if len(req.Reason) < 3 || len(req.Reason) > 500 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Invalid change reason", "reason must be 3..500 characters"))
+		return
+	}
+	current, err := s.store.GetRuntimeConfig(r.Context(), key, state.RuntimeConfigScopeGlobal, "")
+	if err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Configuration has no revisions", "apply a setting once before rolling it back"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not read runtime configuration"))
+		return
+	}
+	if req.Version >= current.Version {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration revision is already current", "choose an older revision to create a rollback"))
+		return
+	}
+	if req.ExpectedVersion != nil && *req.ExpectedVersion != current.Version {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
+		return
+	}
+	revision, err := s.store.GetRuntimeConfigRevision(r.Context(), key, state.RuntimeConfigScopeGlobal, "", req.Version)
+	if err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Configuration revision not found", "the requested revision is not available for this setting"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not read configuration revision"))
+		return
+	}
+	if err := validateRuntimeConfigValue(def, revision.NewValue); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration revision is incompatible", "the catalog type changed and this revision cannot be applied"))
+		return
+	}
+	reason := fmt.Sprintf("rollback to v%d: %s", req.Version, req.Reason)
+	expectedVersion := current.Version
+	if req.ExpectedVersion != nil {
+		expectedVersion = *req.ExpectedVersion
+	}
+	row, err := s.store.UpsertRuntimeConfig(r.Context(), state.RuntimeConfigUpdate{
+		Key:             key,
+		Scope:           state.RuntimeConfigScopeGlobal,
+		DesiredValue:    revision.NewValue,
+		ApplyMode:       state.RuntimeConfigApplyHot,
+		ActorID:         acct.ID,
+		Reason:          reason,
+		ExpectedVersion: &expectedVersion,
+	})
+	if err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigConflict) {
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not save runtime configuration rollback"))
+		return
+	}
+	if err := s.applyHotRuntimeConfig(r.Context(), row); err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigConflict) {
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not apply runtime configuration rollback"))
+		return
+	}
+	if s.audit != nil {
+		s.audit.Emit(r.Context(), "operator.runtime_config_rollback", nil, map[string]any{
+			"key": key, "version": row.Version, "rollback_target_version": req.Version,
+			"value": revision.NewValue, "reason": req.Reason, "actor": acct.ID,
+		})
+	}
+	_ = s.notif.Notify(r.Context(), db.NotifyRuntimeConfigChanged, key)
+	row.EffectiveValue = append(json.RawMessage(nil), row.DesiredValue...)
+	row.Status = state.RuntimeConfigApplied
+	writeJSON(w, http.StatusOK, runtimeConfigEntryResponse{
+		Key: def.Key, Label: def.Label, Description: def.Description,
+		Category: def.Category, Kind: def.Kind,
+		DefaultValue:   append(json.RawMessage(nil), def.Default...),
+		DesiredValue:   append(json.RawMessage(nil), row.DesiredValue...),
+		EffectiveValue: append(json.RawMessage(nil), row.EffectiveValue...),
+		Source:         "operator", ApplyMode: string(def.ApplyMode), Mutable: def.Mutable,
+		Sensitive: def.Sensitive, Status: string(state.RuntimeConfigApplied),
+		Version: row.Version, UpdatedAt: row.UpdatedAt.UTC().Format(time.RFC3339), AppliedAt: nowUTCString(),
 	})
 }
 

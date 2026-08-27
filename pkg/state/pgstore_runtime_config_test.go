@@ -169,6 +169,13 @@ func TestPgStoreRuntimeConfigCRUDAndRevisionHistory(t *testing.T) {
 	if err != nil || len(revisions) != 3 {
 		t.Fatalf("capped revisions = %#v, %v", revisions, err)
 	}
+	revision, err := store.GetRuntimeConfigRevision(ctx, "request_read_timeout", state.RuntimeConfigScopeGlobal, "", 1)
+	if err != nil || revision.Version != 1 || string(revision.NewValue) != `"30s"` {
+		t.Fatalf("first revision = %#v, %v", revision, err)
+	}
+	if _, err := store.GetRuntimeConfigRevision(ctx, "request_read_timeout", state.RuntimeConfigScopeGlobal, "", 99); !errors.Is(err, state.ErrRuntimeConfigNotFound) {
+		t.Fatalf("missing revision = %v, want ErrRuntimeConfigNotFound", err)
+	}
 }
 
 func TestPgStoreRuntimeConfigOperationLifecycleAndGuards(t *testing.T) {
