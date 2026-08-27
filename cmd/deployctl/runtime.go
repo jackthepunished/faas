@@ -63,6 +63,9 @@ func servicesInUnitDir(dir string) ([]string, error) {
 		}
 		services[service] = struct{}{}
 	}
+	if len(services) == 0 {
+		return nil, errors.New("release contains no daemon service units")
+	}
 	return orderedServices(services)
 }
 
