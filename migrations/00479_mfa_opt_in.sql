@@ -1,4 +1,4 @@
--- filename: 00472_mfa_opt_in.sql
+-- filename: 00479_mfa_opt_in.sql
 -- Issue #186 follow-up: make customer MFA genuinely opt-in.
 --
 -- Earlier versions armed mfa_required from plan upgrades, billing
