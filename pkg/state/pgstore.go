@@ -3159,13 +3159,28 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
 				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end,
+-- ADR-119: per-app static egress IP
+				   -- (customer BYOIP). SetStaticEgressIP
+				   -- distinguishes "don't touch" (don't run
+				   -- the SET clause) from "explicit IP"
+				   -- (write the IP + stamp the audit
+				   -- timestamp atomically). NULL with
+				   -- SetStaticEgressIP=true clears the
+				   -- pin (DELETE wire shape). The inet
+				   -- text-encoding is the canonical pgx
+				   -- representation; family=4 CHECK + the
+				   -- partial unique index enforce the v1
+				   -- contract (IPv4 only, no two apps on
+				   -- the same account pin the same IP).
+				   static_egress_ip = case when $57 then $58::inet else static_egress_ip end,
+				   static_egress_ip_set_at = case when $57 and $58 is not null then NOW() when $57 and $58 is null then NULL else static_egress_ip_set_at end,
 			   -- ADR-118: per-app ingress IP allowlist. Same Set-bit
 			   -- pattern as EgressAllowlist above (SetPublicAuthIPAllowlist
 			   -- distinguishes "don't touch" from "explicit empty"). The
 			   -- DB trigger at migrations/00308_apps_public_auth_ip_allowlist.sql
 			   -- rejects non-v4/v6 families and masklen /0 (defence in
 			   -- depth on top of the apid parse step).
-				   public_auth_ip_allowlist = case when $57 then $58::cidr[] else public_auth_ip_allowlist end,
+				   public_auth_ip_allowlist = case when $59 then $60::cidr[] else public_auth_ip_allowlist end,
 				   -- ADR-124: per-app wire-protocol selector
 				   -- (apps.app_protocol). Same Set*/optional-pointer
 				   -- pattern as websocket_enabled above. The Set bit
@@ -3176,7 +3191,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 				   -- {http1, http2, grpc}; apid validates the value
 				   -- (Plan.AppProtocolAllowed gates 'grpc' to
 				   -- Hobby+) before reaching this UPDATE.
-					   app_protocol = case when $59 then $60 else app_protocol end
+					   app_protocol = case when $61 then $62 else app_protocol end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -3275,6 +3290,15 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// EgressAllowlist).
 		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
 		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins),
+		// ADR-119: per-app static egress IP. SetStaticEgressIP
+		// is the "don't touch" sentinel; StaticEgressIP is the
+		// value (nil = clear). derefAddr lifts the *netip.Addr
+		// into a string-encodable shape — pgx accepts the inet
+		// text representation. The CASE in the SET clause
+		// above stamps NOW() on every non-null write so the
+		// audit timestamp is always current when the customer
+		// re-pins.
+		p.SetStaticEgressIP, derefAddr(p.StaticEgressIP),
 		// ADR-118: per-app ingress IP allowlist. Same nil-pointer +
 		// Set-bit convention as EgressAllowlist above. cidrPrefixesToArray
 		// renders an empty slice as '{}' (the column DEFAULT) so a
@@ -3324,6 +3348,21 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// derefAddr returns the string-encoded form of a *netip.Addr, or
+// nil if the pointer is nil. Used by the UpdateApp SQL wrapper for
+// the STATIC_EGRESS_IP arg (ADR-119); the CASE in the SQL guards
+// the nil so a missing pointer never touches the wire (Set bit is
+// false in that case). When the Set bit is true with a nil pointer,
+// the customer is clearing the pin (DELETE wire shape) — the CASE
+// writes NULL atomically. pgx accepts the inet text representation
+// directly; the family=4 CHECK at the DB layer enforces IPv4-only.
+func derefAddr(a *netip.Addr) any {
+	if a == nil {
+		return nil
+	}
+	return a.String()
 }
 
 // derefStrings returns the dereferenced value of a *[]string, or nil if
@@ -14812,7 +14851,15 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// (no coalesce needed). Closed-set
 		// apps_app_protocol_chk rejects any value outside
 		// {http1, http2, grpc} at write time.
-		&a.AppProtocol); err != nil {
+		&a.AppProtocol,
+		// ADR-119: per-app static egress IP + audit stamp.
+		// static_egress_ip is nullable inet — pgx scans it into
+		// *netip.Addr (Go nil when SQL NULL). static_egress_ip_
+		// set_at is nullable timestamptz — pgx scans it into
+		// *time.Time (Go nil when SQL NULL). Both pointer
+		// targets are populated by the Set*/CASE branch on the
+		// write side.
+		&a.StaticEgressIP, &a.StaticEgressIPSetAt); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
@@ -14962,7 +15009,17 @@ const appsSelectColumns = `
 	-- Text NOT NULL with constant default — plain string
 	-- scan is safe (no coalesce needed). Positional last so
 	-- future audit-log columns can append safely.
-	app_protocol`
+	app_protocol,
+	-- ADR-119: per-app static egress IP (customer BYOIP). Nullable
+	-- inet (NULL = no pin); family=4 CHECK enforced at the DB
+	-- layer. Scanned into *netip.Addr directly — pgx maps SQL
+	-- inet to Go's netip.Addr natively for non-NULL rows, and a
+	-- SQL NULL maps to a Go nil pointer when the scan target is
+	-- a pointer to a value type. The companion timestamp column
+	-- (static_egress_ip_set_at) is nullable timestamptz scanned
+	-- into *time.Time (pgx handles SQL NULL → Go nil natively —
+	-- same shape as ReassignedAt / MigratedAt above).
+	static_egress_ip, static_egress_ip_set_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -20580,4 +20637,82 @@ func (s *PgStore) MirrorSummary(ctx context.Context, ruleID string, since time.T
 		s2.P99LatencyDiffMs = int(*p99LatencyDiff)
 	}
 	return s2, nil
+}
+
+// ProvisionedStaticEgressIPExists (ADR-119 redesign) is the
+// apid-side gate. Returns true iff the (account_id, customer_ip)
+// tuple is in the operator-provisioned set. The vmmd bundle
+// reload writes the table from the operator's TOML on SIGHUP;
+// the apid PUT path reads it here. A false return is the
+// "not provisioned" surface the customer sees as 404 Not
+// Found (api.ErrStaticEgressIPNotProvisioned).
+//
+// Implementation note: the lookup is a single-row PK read
+// against the `(account_id, customer_ip)` composite index
+// declared by migration 00337. Sub-millisecond under realistic
+// load.
+func (s *PgStore) ProvisionedStaticEgressIPExists(ctx context.Context, accountID string, ip netip.Addr) (bool, error) {
+	if accountID == "" || !ip.Is4() {
+		return false, nil
+	}
+	var found bool
+	row := s.pool.QueryRow(ctx,
+		`select exists(
+		   select 1
+		     from provisioned_static_egress_ips
+		    where account_id = $1::uuid
+		      and customer_ip = $2::inet
+		)`,
+		accountID, ip.String())
+	if err := row.Scan(&found); err != nil {
+		return false, fmt.Errorf("state: ProvisionedStaticEgressIPExists: %w", err)
+	}
+	return found, nil
+}
+
+// ReplaceProvisionedStaticEgressIPs (ADR-119 redesign) is the
+// vmmd-side write that mirrors the operator's TOML into the
+// Postgres gate table. The watcher calls this on every SIGHUP
+// (and once at startup). The store clears the table for the
+// given account_id, then inserts the new set inside a single
+// transaction — the visible-state invariant is "either the
+// prior set OR the new set, never a partial mix". Empty
+// `ips` removes all rows for the account (the "revoke
+// provisioning" path).
+//
+// The DELETE + INSERT pair runs in one transaction so a
+// concurrent apid PUT either sees the prior set or the new
+// set, not a partial empty+insert gap. The `customer_ip` v4
+// CHECK on the table (migration 00337) rejects non-IPv4 inputs
+// at the database boundary; the caller-side deny-set gate is
+// `api.ValidateStaticEgressIP` (defence in depth).
+func (s *PgStore) ReplaceProvisionedStaticEgressIPs(ctx context.Context, accountID string, ips []netip.Addr) error {
+	if accountID == "" {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: empty account_id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`delete from provisioned_static_egress_ips where account_id = $1::uuid`,
+		accountID); err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: delete: %w", err)
+	}
+	for _, ip := range ips {
+		if !ip.Is4() {
+			return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: rejecting non-v4 %s", ip)
+		}
+		if _, err := tx.Exec(ctx,
+			`insert into provisioned_static_egress_ips (account_id, customer_ip)
+			  values ($1::uuid, $2::inet)`,
+			accountID, ip.String()); err != nil {
+			return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: insert %s: %w", ip, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: ReplaceProvisionedStaticEgressIPs: commit: %w", err)
+	}
+	return nil
 }
