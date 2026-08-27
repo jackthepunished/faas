@@ -1152,6 +1152,25 @@ func (b *PGBackend) LookupMirrorRules(ctx context.Context, appID string) ([]Mirr
 	return nil, false
 }
 
+// ScheduleMirror (issue #72 / ADR-124 / ADR-125 PR-A3) is the
+// Backend-side implementation of the mirror goroutine's "wake up
+// the mirror VM" primitive. Forwards to the per-app schedd client
+// (resolved via resolveSched, same path as Admit) so multi-box
+// deployments route the mirror wake to the owning node.
+//
+// On cap-at-max the underlying Scheduler returns an error wrapping
+// sched.ErrMirrorSlotAtCapacity; the dispatch goroutine detects
+// that and writes a ledger entry with status_diff=true +
+// gateway_mirror_dispatched_total{result="cap_at_max"}. We do NOT
+// unwrap/re-wrap here — the goroutine inspects errors.Is directly.
+func (b *PGBackend) ScheduleMirror(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error) {
+	sched, err := b.resolveSched(ctx, appID)
+	if err != nil {
+		return "", "", err
+	}
+	return sched.AdmitMirrorInstance(ctx, appID, mirrorDeploymentID, mirrorRuleID)
+}
+
 // buildDeploymentWeights filters rows to Percent > 0 and sorts
 // (Percent DESC, DeploymentID ASC) for stable tie-break on the
 // cumulative-weight binary search (PR-B / issue #556). A

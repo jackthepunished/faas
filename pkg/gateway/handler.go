@@ -505,6 +505,19 @@ type Backend interface {
 	// type, so the gateway package keeps its zero-pkg/state import
 	// discipline (mirrors deploymentWeightsStore's posture).
 	LookupMirrorRules(ctx context.Context, appID string) ([]MirrorRuleRow, bool)
+	// ScheduleMirror (issue #72 / ADR-124 / ADR-125 PR-A3) is the
+	// mirror-VM admission sibling to Admit. Stamps mode='mirror'
+	// on the new instances row (PR-A1's 00385) and is gated by
+	// the per-rule concurrent-mirror-VM cap (default 5,
+	// sched.MirrorMaxConcurrentPerRule). Returns the mirror
+	// wakeID on success, or an error wrapping
+	// sched.ErrMirrorSlotAtCapacity on cap-at-max (the dispatch
+	// goroutine maps that to ledger result=cap_at_max +
+	// gateway_mirror_dispatched_total{result="cap_at_max"}).
+	// Real failures (RAM headroom, chooser, store) come back as
+	// *api.Problem-shaped errors — the dispatch goroutine logs +
+	// drops those without writing a misleading ledger row.
+	ScheduleMirror(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -541,6 +554,13 @@ type Handler struct {
 	gate           *WakeGate
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
+	// mirrorRoundTripper (issue #72 / ADR-124 PR-A3) is the
+	// per-request HTTP forwarder the dispatch goroutine uses
+	// to reach the mirror VM. Defaults to
+	// NewDefaultMirrorRoundTripper(nil) inside dispatchMirror so
+	// a nil field is safe; tests inject a stub via
+	// WithMirrorRoundTripper.
+	mirrorRoundTripper MirrorRoundTripper
 	// log may be nil (defaults to slog.Default()).
 	log *slog.Logger
 	// appsSuffix is the configured public suffix (e.g. ".gregale.dev").
@@ -1187,6 +1207,17 @@ func (h *Handler) WithPublicAuth(cache *PublicAuthCache, unsealer PublicAuthUnse
 // other Handler.With*).
 func (h *Handler) WithResponseCache(cache *ResponseCache) *Handler {
 	h.responseCache = cache
+	return h
+}
+
+// WithMirrorRoundTripper (issue #72 / ADR-124 PR-A3) wires the
+// HTTP forwarder the dispatch goroutine uses to reach the mirror
+// VM. nil is safe (dispatchMirror defaults to
+// NewDefaultMirrorRoundTripper(nil) on a nil field); tests inject
+// a stub to assert on the request shape without standing up a
+// real upstream. Fluent setter, mirrors WithResponseCache.
+func (h *Handler) WithMirrorRoundTripper(rt MirrorRoundTripper) *Handler {
+	h.mirrorRoundTripper = rt
 	return h
 }
 
@@ -5113,6 +5144,28 @@ haveApp:
 		return
 	}
 	target := pick.Target
+
+	// Mirror fan-out (issue #72 / ADR-124 / ADR-125 PR-A3). After
+	// the customer request has been routed, fan out one goroutine
+	// per enabled rule (closed set: bounded by Limits.MirrorTargetsPerApp ≤
+	// 3 per app). The dispatch goroutine is fire-and-forget — it
+	// derives its own detached ctx (ADR-098 pattern, mirror of
+	// pkg/gateway/gate.go:172-205) so the customer's request
+	// cancellation never reaches the mirror. A wedged mirror VM is
+	// bounded by MirrorMaxLifetimeSeconds=5. Cache miss returns
+	// (nil, false) and is treated as "no mirror", not an error —
+	// the notifier-driven RefreshMirrorRules populates the cache
+	// asynchronously. The lookup itself does NOT block on the
+	// store read.
+	if rules, ok := h.backend.LookupMirrorRules(r.Context(), app.ID); ok { //nolint:contextcheck // request ctx at handler boundary.
+		for _, rule := range rules {
+			rule := rule
+			if !shouldMirrorRequest(rule.Percent, pick.Picked) {
+				continue
+			}
+			go h.dispatchMirror(r.Context(), target.InstanceID, &target, rule, cloneRequestForMirror(r))
+		}
+	}
 
 	// Stamp the per-instance identity on the request BEFORE proxying so
 	// the per-node vmmd forwarder (issue #98 / ADR-028) can attribute

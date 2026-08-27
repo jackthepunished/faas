@@ -581,6 +581,33 @@ type Metrics struct {
 	// TouchComputeNodeChangedSubscriber so cmd/gatewayd-internal's wiring can
 	// pass nil *Metrics in tests without a guarded call site.
 	computeNodeChangedSubscriberAlive prometheus.Gauge
+	// mirrorDispatched (issue #72 / ADR-124 PR-A3) is the
+	// per-mirror-invocation counter, labelled by
+	// {app_id, rule_id, result}. `result` is the closed set
+	// {ok, mirror_5xx, status_diff, body_diff, cap_at_max,
+	// sched_error, mirror_roundtrip_error, build_request_error} —
+	// the dispatch goroutine (pkg/gateway/mirror_dispatch.go) is
+	// the only incrementer. `app_id` is unbounded but addressable
+	// via PromQL; `rule_id` is bounded by Limits.MirrorTargetsPerApp
+	// (≤ 3 per app) so the per-app cardinality is small. This is
+	// the §12 dashboard chip "MirrorPanel dispatched" surface
+	// (issue #72 / ADR-124).
+	mirrorDispatched *prometheus.CounterVec
+	// mirrorLatency (issue #72 / ADR-124 PR-A3) is the per-
+	// mirror-invocation latency histogram, labelled by
+	// {app_id, rule_id}. Buckets span 5ms to 10s — the
+	// MirrorMaxLifetimeSeconds cap (5s) is the upper bound;
+	// anything beyond is the budget exceeded. Powers the
+	// §12 mirror latency p99 panel.
+	mirrorLatency *prometheus.HistogramVec
+	// mirrorBodyDiff (issue #72 / ADR-124 PR-A3) is the
+	// per-mirror-invocation body-drift counter, labelled by
+	// {app_id, rule_id}. Increment happens when
+	// ClassifyResult reports bodyDiff=true (sha256 of mirror
+	// response differs from source). Powers the §12 mirror
+	// drift-rate alert (mirror_drift_rate > 0.5 for 5m → page
+	// per ADR-127-style precedent on v2mmd_wake_failure_total).
+	mirrorBodyDiff *prometheus.CounterVec
 }
 
 // Wake-snapshot-tier counter label set. The engine drives these
@@ -679,6 +706,27 @@ func NewMetrics() *Metrics {
 			Name: "gateway_response_cache_entries",
 			Help: "In-process kind=cache store entry count. ADR-122.",
 		}),
+		// ADR-124 / issue #72 / PR-A3 — mirror dispatch surface.
+		// rule_id cardinality is bounded by Limits.MirrorTargetsPerApp
+		// (≤ 3 per app) so the (app_id, rule_id) pair is closed;
+		// the `result` label is the closed vocabulary the dispatch
+		// goroutine writes (ok, mirror_5xx, status_diff, body_diff,
+		// cap_at_max, sched_error, mirror_roundtrip_error,
+		// build_request_error). See pkg/gateway/mirror_dispatch.go
+		// for the call sites.
+		mirrorDispatched: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_mirror_dispatched_total",
+			Help: "Per-mirror-invocation outcome counter. Closed `result` vocabulary: ok | mirror_5xx | status_diff | body_diff | cap_at_max | sched_error | mirror_roundtrip_error | build_request_error. ADR-124 / issue #72 PR-A3.",
+		}, []string{"app_id", "rule_id", "result"}),
+		mirrorLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_mirror_latency_seconds",
+			Help:    "Per-mirror-invocation round-trip duration. Buckets span 5ms–10s; MirrorMaxLifetimeSeconds (5s) is the budget ceiling. ADR-124 / issue #72 PR-A3.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		}, []string{"app_id", "rule_id"}),
+		mirrorBodyDiff: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_mirror_body_diff_total",
+			Help: "Per-mirror-invocation body-drift counter — incremented when sha256(mirror_body) != sha256(source_body). Powers the §12 mirror drift-rate alert. ADR-124 / issue #72 PR-A3.",
+		}, []string{"app_id", "rule_id"}),
 		// ADR-091 hardening PR-A — compile-time errors caught by
 		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
 		// non-zero value here means a rule shipped broken and was
@@ -1304,7 +1352,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.validateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.internalAuthMatch, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleValidateFailures, m.validateFailures, m.edgeRuleCompileError, m.responseBodyWarnTotal, m.internalAuthMatch, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions, m.responseCache, m.responseCacheWakesAvoided, m.responseCacheBytes, m.responseCacheEntries, m.mirrorDispatched, m.mirrorLatency, m.mirrorBodyDiff)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1875,6 +1923,46 @@ func (m *Metrics) ObserveAppMaintenance(plan string) {
 		return
 	}
 	m.appMaintenance.WithLabelValues(plan).Inc()
+}
+
+// ObserveMirrorDispatched (issue #72 / ADR-124 PR-A3) increments
+// the gateway_mirror_dispatched_total counter with a closed
+// `result` vocabulary:
+//
+//	ok | mirror_5xx | status_diff | body_diff | cap_at_max |
+//	sched_error | mirror_roundtrip_error | build_request_error.
+//
+// Dashboard readers and alerts MUST treat unknown result values as
+// a bug — see the metric's doc-comment for the closed set.
+// rule_id cardinality is bounded by Limits.MirrorTargetsPerApp ≤ 3.
+func (m *Metrics) ObserveMirrorDispatched(appID, ruleID, result string) {
+	if m == nil || appID == "" || ruleID == "" || result == "" {
+		return
+	}
+	m.mirrorDispatched.WithLabelValues(appID, ruleID, result).Inc()
+}
+
+// ObserveMirrorLatency (issue #72 / ADR-124 PR-A3) records one
+// per-mirror-invocation round-trip duration under the
+// gateway_mirror_latency_seconds histogram. Caller is the dispatch
+// goroutine in pkg/gateway/mirror_dispatch.go after the upstream
+// round-trip returns (success or failure). nil-receiver safe.
+func (m *Metrics) ObserveMirrorLatency(appID, ruleID string, seconds float64) {
+	if m == nil || appID == "" || ruleID == "" {
+		return
+	}
+	m.mirrorLatency.WithLabelValues(appID, ruleID).Observe(seconds)
+}
+
+// ObserveMirrorBodyDiff (issue #72 / ADR-124 PR-A3) increments the
+// drift counter when sha256(mirror_body) != sha256(source_body).
+// Feeds the §12 mirror_drift_rate alert (ADR-127-style precedent:
+// pkg/gateway/metrics.go::v2mmd_wake_failure_total).
+func (m *Metrics) ObserveMirrorBodyDiff(appID, ruleID string) {
+	if m == nil || appID == "" || ruleID == "" {
+		return
+	}
+	m.mirrorBodyDiff.WithLabelValues(appID, ruleID).Inc()
 }
 
 // ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments

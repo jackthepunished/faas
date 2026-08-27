@@ -62,6 +62,14 @@ func (f *fixedBackend) LookupMirrorRules(_ context.Context, _ string) ([]gateway
 	return nil, false
 }
 
+// ScheduleMirror (PR-A3 / issue #72 / ADR-124) — fixedBackend
+// is a unit-test fake for the gateway's wake path; mirror
+// goroutines are exercised in pkg/gateway/handler_mirror_test.go.
+// The stub satisfies the widened Backend interface.
+func (f *fixedBackend) ScheduleMirror(_ context.Context, _, _, _ string) (string, string, error) {
+	return "", "", nil
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

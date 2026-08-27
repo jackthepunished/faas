@@ -163,6 +163,11 @@ type fakeInvalidator struct {
 	// pg_notify('cors_preset_changed', account_id) on every
 	// cors_presets INSERT / UPDATE / DELETE.
 	resetCorsPresetsAccounts []string
+	// mirrorRefreshed (issue #72 / ADR-125 PR-A3) records
+	// app_ids that received RefreshMirrorRules via a
+	// kind="mirror" deployment_changed notify. Paired with
+	// `refreshed` for the kind=traffic / kind="" discriminator.
+	mirrorRefreshed []string
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -206,6 +211,12 @@ func (f *fakeInvalidator) InvalidateResponseCacheAll() {
 func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {
 	f.mu.Lock()
 	f.refreshed = append(f.refreshed, appID)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeInvalidator) RefreshMirrorRules(_ context.Context, appID string) error {
+	f.mu.Lock()
+	f.mirrorRefreshed = append(f.mirrorRefreshed, appID)
 	f.mu.Unlock()
 	return nil
 }

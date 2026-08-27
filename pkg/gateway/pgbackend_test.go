@@ -233,6 +233,17 @@ func (atCapScheduler) EnsureWake(context.Context, string, string) (string, strin
 	return "", "", "", "", 0, 0, nil
 }
 
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — atCapScheduler
+// returns ErrAtCap... wait, no, that's AdmitInstance's contract.
+// For mirror tests, the mirror goroutine reads the error via
+// errors.Is against sched.ErrMirrorSlotAtCapacity; for now return
+// a generic error so existing atCap tests don't accidentally fire
+// mirror paths. Mirror-specific tests live in
+// pkg/gateway/handler_mirror_test.go and use a separate fake.
+func (atCapScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	return "", "", nil
+}
+
 // TestPGBackend_AdmitForwardsWakeMethod (PR scale-out readiness) — the
 // raw wire-method value the Scheduler returns must reach PGBackend.Admit's
 // caller unchanged. This is the load-bearing step that lets the
@@ -305,6 +316,15 @@ func (c *controllableScheduler) AdmitInstance(context.Context, string, string, s
 
 func (c *controllableScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	return "i-test", "n-test", "", "w-test", c.rawMethod, 0, nil
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — controllableScheduler
+// returns a stable identity, mirroring AdmitInstance's test-shape.
+// The rawMethod field is intentionally unused on the mirror path —
+// mirror is fire-and-forget and the wakeMethod is no longer surfaced
+// to the gateway.
+func (c *controllableScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	return "i-mirror", "w-mirror", nil
 }
 
 func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
@@ -406,6 +426,14 @@ func (c *capturingScheduler) AdmitInstance(_ context.Context, _, _, _, _ string)
 func (c *capturingScheduler) EnsureWake(_ context.Context, _, _ string) (string, string, string, string, int32, int, error) {
 	c.admitted++
 	return "fake-instance-" + c.id, "127.0.0.1", "", "w-1", 8080, 0, nil
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — capture-only
+// stub satisfies the Scheduler interface; the multi-box tests
+// don't exercise the mirror hot path.
+func (c *capturingScheduler) AdmitMirrorInstance(_ context.Context, _, _, _ string) (string, string, error) {
+	c.admitted++
+	return "fake-mirror-" + c.id, "w-mirror", nil
 }
 
 // TestPGBackend_ResolveSched_MultiBox_RejectsTransientMiss covers

@@ -186,6 +186,14 @@ func (b *fakeBackend) LookupMirrorRules(_ context.Context, _ string) ([]MirrorRu
 	return nil, false
 }
 
+// ScheduleMirror (issue #72 / ADR-124 PR-A3) — fakeBackend doesn't
+// route to schedd; the no-op satisfies the widened Backend
+// interface. Mirror-specific tests live in handler_mirror_test.go
+// and use a dedicated fake (mirrorFakeBackend).
+func (b *fakeBackend) ScheduleMirror(_ context.Context, _, _, _ string) (string, string, error) {
+	return "", "", nil
+}
+
 func newTestHandler(t *testing.T) (*Handler, *fakeBackend, *httptest.Server) {
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

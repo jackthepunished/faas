@@ -61,6 +61,9 @@ type stubSchedd struct {
 func (s *stubSchedd) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	panic("stubSchedd.AdmitInstance")
 }
+func (s *stubSchedd) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	panic("stubSchedd.AdmitMirrorInstance")
+}
 func (s *stubSchedd) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	panic("stubSchedd.EnsureWake")
 }

@@ -47,6 +47,11 @@ type ScheddClient interface {
 	// callers continue to use Wake / AdmitInstance on the legacy wire —
 	// this method is additive per ADR-016.
 	EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
+	// AdmitMirrorInstance (issue #72 / ADR-124 / ADR-125 PR-A3) is
+	// the mirror-VM admission sibling. Schedd stamps mode='mirror'
+	// on the new instances row (PR-A1's 00385) and the per-rule
+	// concurrent-mirror-VM cap (default 5) gates the dispatch.
+	AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	// ParkInstance (PR-#TBD / C6): traceID is the optional
 	// OTel-format 32-char-hex value forwarded via the gRPC
@@ -206,6 +211,26 @@ func (c *Client) EnsureWake(ctx context.Context, appID, trigger string) (instanc
 		return "", "", "", "", 0, 0, liftErr(err)
 	}
 	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetDeploymentId(), resp.GetWakeId(), int32(resp.GetMethod()), int(resp.GetPort()), nil
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 / ADR-125 PR-A3) is
+// the mirror-VM admission sibling to AdmitInstance. The protocol
+// reuses AdmitInstanceRequest with the new is_mirror=true +
+// mirror_rule_id fields (PR-A2 / commit 2). Errors carry
+// api.CodeMirrorSlotAtCapacity so the gateway can detect the
+// benign cap-at-max outcome via errors.Is rather than string
+// matching.
+func (c *Client) AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error) {
+	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{
+		AppId:        appID,
+		DeploymentId: mirrorDeploymentID,
+		IsMirror:     true,
+		MirrorRuleId: mirrorRuleID,
+	})
+	if err != nil {
+		return "", "", liftErr(err)
+	}
+	return resp.GetInstanceId(), resp.GetWakeId(), nil
 }
 
 // ReportActivity flushes a batch of last_request_at touches to schedd. Returns
