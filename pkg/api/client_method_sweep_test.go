@@ -379,6 +379,26 @@ func TestSweep_Rollback(t *testing.T) {
 	}
 }
 
+func TestSweep_PostAdminConfigKeyRollback(t *testing.T) {
+	srv, captured := newSweepServer(t, 200, `{"key":"LOG_LEVEL","version":3,"status":"applied"}`)
+	c := NewClient(srv.URL, "fp_test")
+	expected := int64(2)
+	got, err := c.PostAdminConfigKeyRollback(context.Background(), "LOG_LEVEL", RollbackOperatorRuntimeConfigRequest{
+		Version:         1,
+		Reason:          "restore known-good setting",
+		ExpectedVersion: &expected,
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.Key != "LOG_LEVEL" || got.Version != 3 {
+		t.Fatalf("response = %+v", got)
+	}
+	if len(*captured) == 0 {
+		t.Fatal("expected request body")
+	}
+}
+
 func TestSweep_UsageDaily(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{"days":[]}`)
 	c := NewClient(srv.URL, "fp_test")
