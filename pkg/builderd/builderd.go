@@ -382,7 +382,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		return BuildResult{}, err
 	}
 	if b.cfg.SourceWaitTimeout > 0 {
-		if err := b.waitForSource(ctx, dep.SourcePath, b.cfg.SourceWaitTimeout); err != nil {
+		if err := b.waitForSource(ctx, build.ID, dep.SourcePath, b.cfg.SourceWaitTimeout); err != nil {
 			b.emitBuildLog(ctx, build.ID, fmt.Sprintf("source spool lag — requeued (%v)\n", err))
 			if rerr := b.store.RequeueBuild(ctx, build.ID); rerr != nil {
 				b.log.Warn("builderd: requeue on source-lag", "build", build.ID, "err", rerr)
@@ -930,9 +930,9 @@ func (b *Builderd) emitBuildLog(ctx context.Context, buildID, line string) {
 
 // materializeSource downloads a split-box source archive into the local
 // source spool when the apid-created path is not present. A missing remote
-// object is intentionally not an error here: waitForSource applies the
-// existing bounded spool-lag/requeue policy, while registry failures are
-// returned so the caller can requeue immediately.
+// object is intentionally not an error here: waitForSource retries the
+// remote lookup within the existing bounded source-lag policy, while
+// registry failures are returned so the caller can requeue immediately.
 func (b *Builderd) materializeSource(ctx context.Context, buildID, path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
@@ -980,24 +980,43 @@ func (b *Builderd) materializeSource(ctx context.Context, buildID, path string) 
 
 // waitForSource blocks until the source tarball at path exists or the
 // timeout expires. It is the split-box spool-sync guard: the
-// notify-driven claim beats the rsync to the compute node, and the
-// detector would otherwise hard-fail the build on a transient ENOENT.
-// Polling cadence is 100ms — far shorter than the rsync's ~1s lag, so
-// the wait is effectively free once the file lands.
-func (b *Builderd) waitForSource(ctx context.Context, path string, timeout time.Duration) error {
+// notify-driven claim can beat both the rsync to the compute node and
+// eventual visibility of the OCI manifest. Local spool checks run at
+// 100ms; remote not-found checks run at 500ms so a transient registry
+// visibility delay is absorbed without a tight registry polling loop.
+func (b *Builderd) waitForSource(ctx context.Context, buildID, path string, timeout time.Duration) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("builderd: stat source: %w", err)
 	}
 	deadline := time.Now().Add(timeout)
-	t := time.NewTicker(100 * time.Millisecond)
-	defer t.Stop()
+	localPoll := time.NewTicker(100 * time.Millisecond)
+	defer localPoll.Stop()
+	var remotePoll *time.Ticker
+	var remoteC <-chan time.Time
+	if b.sourceStorage != nil {
+		remotePoll = time.NewTicker(500 * time.Millisecond)
+		defer remotePoll.Stop()
+		remoteC = remotePoll.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-t.C:
+		case <-localPoll.C:
+			if _, err := os.Stat(path); err == nil {
+				return nil
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("builderd: stat source: %w", err)
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("builderd: source %s did not appear within %s", path, timeout)
+			}
+		case <-remoteC:
+			if err := b.materializeSource(ctx, buildID, path); err != nil {
+				return err
+			}
 			if _, err := os.Stat(path); err == nil {
 				return nil
 			} else if !os.IsNotExist(err) {
