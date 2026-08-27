@@ -123,13 +123,13 @@ const subSecretsStamp = "stamp"
 // host is the PostgreSQL compute_nodes.name lookup key.
 // The role column is intentionally NOT here — the renderer
 // (Commit 2) writes compute_nodes.role, not secrets init.
-// The --no-db flag was removed in PR-924 follow-up: a missing
-// FAAS_PG_DSN is a soft warning, not an opt-out switch; the DB
-// write fires whenever the DSN is set.
+// --no-db is used by provider-neutral compute joins that must preserve the
+// VMMD TLS fingerprint already registered for an adopted host.
 type secretsInitFlags struct {
 	dir              string
 	force            bool
 	preserveExisting bool
+	noDB             bool
 	host             string
 	dsn              string
 }
@@ -140,6 +140,7 @@ func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secret
 	fs.StringVar(&f.dir, "dir", defaultSecretsDir, "root secrets directory (default /etc/faas/secrets)")
 	fs.BoolVar(&f.force, "force", defaultForce, "overwrite existing secret files (default false)")
 	fs.BoolVar(&f.preserveExisting, "preserve-existing", false, "preserve existing secret files and create only missing files (deployment retry)")
+	fs.BoolVar(&f.noDB, "no-db", false, "skip the compute_nodes.cert_fingerprint write")
 	fs.StringVar(&f.host, "host", "", "compute_nodes.name to stamp (default: hostname from os.Hostname)")
 	fs.StringVar(&f.dsn, "pg-dsn", "", "PostgreSQL DSN (default: $FAAS_PG_DSN)")
 	return fs, f
@@ -248,7 +249,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	if dsn == "" {
 		dsn = resolveSecretsDSN()
 	}
-	if dsn != "" {
+	if dsn != "" && !f.noDB {
 		if err := writeComputeNodeCert(dsn, host, hostCertPEM, hostCertFP, stdout); err != nil {
 			// Soft warning — the file writes succeeded; the DB
 			// write is a downstream signal the doctor will

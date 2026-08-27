@@ -40,10 +40,13 @@ The command performs these phases in order:
 8. Run the production `deploy/ansible/bootstrap.yml` compute role.
 9. Install the signed release with `--defer-activation`; the database row is
    kept drained while the box is being prepared.
-10. Render the manifest, initialize host-local identity, unseal the supplied
-    encrypted backup envelopes, and run a node-scoped doctor with warnings as
-    failures. A join without real backup envelopes remains visibly incomplete
-    and cannot pass this acceptance gate.
+10. Render the manifest, initialize host-local identity, unseal any supplied
+    encrypted backup envelopes, and run a node-scoped doctor. Mandatory
+    readiness errors always fail the join. Backup envelopes are optional join
+    inputs; when they are deferred, the doctor keeps the placeholder warnings
+    visible but permits compute-node activation. Supplying the backup pair
+    enables the strict warning gate, so a production join that includes backup
+    material cannot silently activate with degraded backup posture.
 11. Start the four compute services and wait for vmmd's socket, the internal
     gateway, and systemd-active status.
 12. Verify the control-plane row's role, release, manifest hash, and stable
