@@ -1143,6 +1143,7 @@ var mfaAllowlist = []string{
 	// The /v1/auth/sessions/{id} route is matched by the prefix
 	// check in isMFAAllowlisted below, not by a literal entry.
 	"/v1/auth/logout",
+	"/v1/auth/csrf",
 	"/v1/auth/sessions",
 	"/v1/auth/sessions/revoke_all",
 }

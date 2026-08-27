@@ -128,6 +128,7 @@ var routeExclude = map[string]bool{
 	// bearer-key caller and the dashboard is the supported surface.
 	// /v1/auth/capabilities is mounted behind sessionAuth at
 	// server.go:1085 — same exclusion.
+	"GET /v1/auth/csrf":                 true, // browser-only CSRF envelope; the public SDK uses bearer auth
 	"GET /v1/auth/sessions":             true, // sessionFrom cookie-only; PR #722 dropped
 	"DELETE /v1/auth/sessions/{id}":     true, // same + CSRF cookie required
 	"POST /v1/auth/sessions/revoke_all": true, // same — fails 401 on bearer-key
