@@ -31,6 +31,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
@@ -47,6 +48,15 @@ const DefaultHeartbeatInterval = state.DefaultHeartbeatInterval
 // pkg/state/heartbeat_gap.go; schedd re-exports it for callers that
 // already import pkg/sched.
 const DefaultHeartbeatStaleness = state.DefaultHeartbeatStaleness
+
+// DefaultHeartbeatConcurrency bounds simultaneous probes so a large fleet
+// does not turn one heartbeat tick into either a sequential tail or an
+// unbounded connection burst.
+const DefaultHeartbeatConcurrency = 32
+
+// DefaultHeartbeatProbeTimeout bounds an individual dial + Ping attempt.
+// The whole sweep can continue probing other nodes when one transport hangs.
+const DefaultHeartbeatProbeTimeout = 5 * time.Second
 
 // HeartbeatGapSummary is re-exported from pkg/state for the same
 // reason: schedd callers use it in the property test
@@ -93,6 +103,13 @@ type Heartbeat struct {
 	// non-empty = single-node ping (the schedd only watches its
 	// own vmmd). Set via WithOwnerNodeID after NewHeartbeat.
 	ownerNodeID string
+	// nodeRegistry is the notification-backed active-node snapshot. Nil keeps
+	// the store enumeration path for compatibility with older fixtures.
+	nodeRegistry *NodeRegistry
+	// Concurrency bounds simultaneous node probes. Zero uses the default.
+	Concurrency int
+	// ProbeTimeout bounds each dial + Ping. Zero uses the default.
+	ProbeTimeout time.Duration
 }
 
 // WithOwnerNodeID scopes the heartbeat to a single node. Phase 2
@@ -106,6 +123,16 @@ func (h *Heartbeat) WithOwnerNodeID(nodeID string) *Heartbeat {
 		return h
 	}
 	h.ownerNodeID = nodeID
+	return h
+}
+
+// WithNodeRegistry makes heartbeat consume the same notification-backed
+// active-node snapshot as placement.
+func (h *Heartbeat) WithNodeRegistry(reg *NodeRegistry) *Heartbeat {
+	if h == nil {
+		return h
+	}
+	h.nodeRegistry = reg
 	return h
 }
 
@@ -149,7 +176,15 @@ func NewHeartbeat(store state.Store, dialer HeartbeatDialer, tlsCfg *tls.Config,
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Heartbeat{store: store, dialer: dialer, tls: tlsCfg, log: log, now: time.Now}
+	return &Heartbeat{
+		store:        store,
+		dialer:       dialer,
+		tls:          tlsCfg,
+		log:          log,
+		now:          time.Now,
+		Concurrency:  DefaultHeartbeatConcurrency,
+		ProbeTimeout: DefaultHeartbeatProbeTimeout,
+	}
 }
 
 // Tick runs one heartbeat sweep: enumerate active compute_nodes,
@@ -171,13 +206,19 @@ func (h *Heartbeat) Tick(ctx context.Context) error {
 		staleness = DefaultHeartbeatStaleness
 	}
 	now := h.now()
-	nodes, err := h.store.ActiveComputeNodes(ctx)
-	if err != nil {
-		// A transient DB error must not crash schedd. Log + return;
-		// the next tick will retry. The Watchdog path (1s tick)
-		// is unaffected.
-		h.log.Warn("heartbeat: list active compute_nodes failed", "err", err)
-		return err
+	var nodes []state.ComputeNode
+	if h.nodeRegistry != nil {
+		nodes = h.nodeRegistry.Snapshot()
+	} else {
+		var err error
+		nodes, err = h.store.ActiveComputeNodes(ctx)
+		if err != nil {
+			// A transient DB error must not crash schedd. Log + return;
+			// the next tick will retry. The Watchdog path (1s tick)
+			// is unaffected.
+			h.log.Warn("heartbeat: list active compute_nodes failed", "err", err)
+			return err
+		}
 	}
 	// Phase 2 / Gate A: scope the sweep to this schedd's owner
 	// node. Multi-node schedd → single-node ping; single-box
@@ -191,81 +232,116 @@ func (h *Heartbeat) Tick(ctx context.Context) error {
 		}
 		nodes = filtered
 	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	concurrency := h.Concurrency
+	if concurrency <= 0 {
+		concurrency = DefaultHeartbeatConcurrency
+	}
+	if concurrency > len(nodes) {
+		concurrency = len(nodes)
+	}
+	jobs := make(chan state.ComputeNode)
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for n := range jobs {
+				h.probeNode(ctx, n, now, staleness)
+			}
+		}()
+	}
 	for _, n := range nodes {
-		// ctx cancellation check between nodes — a long fleet
-		// shouldn't get stuck on a slow Ping if schedd is
-		// shutting down.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		// Staleness gate (issue #98): even if Ping below succeeds,
-		// a node whose last_heartbeat_at is older than the
-		// threshold is stale and gets flipped inactive. The ping
-		// then continues on the next tick, post-deactivation.
-		if !n.LastHeartbeatAt.IsZero() && now.Sub(n.LastHeartbeatAt) > staleness {
-			h.log.Info("heartbeat: node stale, deactivating",
-				"node_id", n.ID, "node_name", n.Name,
-				"last_seen", n.LastHeartbeatAt.Format(time.RFC3339),
-				"staleness", staleness.String())
-			if mErr := h.store.MarkComputeNodeInactive(ctx, n.ID); mErr != nil && !errors.Is(mErr, state.ErrNotFound) {
-				h.log.Warn("heartbeat: mark-inactive failed",
-					"node_id", n.ID, "err", mErr)
-			}
-			continue
-		}
-		if _, err := h.heartbeatPing(ctx, n); err != nil {
-			// A dead node gets flipped inactive so placement
-			// skips it on the next Wake. We don't fail the
-			// sweep — one bad node must not block the others.
-			h.log.Warn("heartbeat: ping failed; marking inactive",
-				"node_id", n.ID, "node_name", n.Name, "err", err)
-			if mErr := h.store.MarkComputeNodeInactive(ctx, n.ID); mErr != nil && !errors.Is(mErr, state.ErrNotFound) {
-				h.log.Warn("heartbeat: mark-inactive failed",
-					"node_id", n.ID, "err", mErr)
-			}
-			continue
-		}
-		if err := h.store.HeartbeatComputeNode(ctx, n.ID); err != nil {
-			if errors.Is(err, state.ErrNotFound) {
-				// Row vanished between ActiveComputeNodes and
-				// HeartbeatComputeNode (admin DELETE, retention,
-				// etc.) — log + move on.
-				h.log.Info("heartbeat: node disappeared mid-sweep",
-					"node_id", n.ID)
-				continue
-			}
-			h.log.Warn("heartbeat: stamp failed",
-				"node_id", n.ID, "err", err)
-		}
-		// CP-1: append one row to the heartbeat history. The
-		// received_at / last_heartbeat_at pair uses now() — the
-		// same wall-clock the stamp above used — so the wire
-		// shape's gap classification reflects the operator's clock,
-		// not the database's. A duplicate (node_id, received_at)
-		// from a hot tick is OBSERVED (logged as a warning) rather
-		// than silently deduped; ErrConflict from the store is the
-		// canonical signal. Other errors are logged and the sweep
-		// continues — observability must never abort the stamp
-		// loop.
-		now := h.now()
-		// source='heartbeat_tick' is the only value the routine
-		// stamp path writes today. The migration 00065 CHECK also
-		// permits 'deactivation' and 'reactivation' for the future
-		// watchdog integration (the last contact attempt before a
-		// deactivation + the recovery stamp); no code writes them
-		// yet. Widening the CHECK when those writes land is the
-		// expected evolution; do NOT add them here speculatively.
-		if err := h.store.AppendComputeNodeHeartbeat(ctx, n.ID, now, now, "heartbeat_tick"); err != nil {
-			if errors.Is(err, state.ErrConflict) {
-				h.log.Warn("heartbeat: history append duplicate",
-					"node_id", n.ID, "received_at", now.Format(time.RFC3339Nano))
-			} else {
-				h.log.Warn("heartbeat: history append failed",
-					"node_id", n.ID, "err", err)
-			}
+		select {
+		case jobs <- n:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
 		}
 	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	return ctx.Err()
+}
+
+// probeNode performs one bounded probe and applies its result. It is called by
+// the bounded worker pool in Tick; each node is processed exactly once.
+func (h *Heartbeat) probeNode(ctx context.Context, n state.ComputeNode, tickNow time.Time, staleness time.Duration) {
+	// Staleness gate (issue #98): even if Ping below succeeds,
+	// a node whose last_heartbeat_at is older than the
+	// threshold is stale and gets flipped inactive. The ping
+	// then continues on the next tick, post-deactivation.
+	if !n.LastHeartbeatAt.IsZero() && tickNow.Sub(n.LastHeartbeatAt) > staleness {
+		h.log.Info("heartbeat: node stale, deactivating",
+			"node_id", n.ID, "node_name", n.Name,
+			"last_seen", n.LastHeartbeatAt.Format(time.RFC3339),
+			"staleness", staleness.String())
+		if mErr := h.store.MarkComputeNodeInactive(ctx, n.ID); mErr != nil && !errors.Is(mErr, state.ErrNotFound) {
+			h.log.Warn("heartbeat: mark-inactive failed",
+				"node_id", n.ID, "err", mErr)
+		}
+		if h.nodeRegistry != nil {
+			h.nodeRegistry.Remove(n.ID)
+		}
+		return
+	}
+	if _, err := h.heartbeatPing(ctx, n); err != nil {
+		// A dead node gets flipped inactive so placement
+		// skips it on the next Wake. We don't fail the
+		// sweep — one bad node must not block the others.
+		h.log.Warn("heartbeat: ping failed; marking inactive",
+			"node_id", n.ID, "node_name", n.Name, "err", err)
+		if mErr := h.store.MarkComputeNodeInactive(ctx, n.ID); mErr != nil && !errors.Is(mErr, state.ErrNotFound) {
+			h.log.Warn("heartbeat: mark-inactive failed",
+				"node_id", n.ID, "err", mErr)
+		}
+		if h.nodeRegistry != nil {
+			h.nodeRegistry.Remove(n.ID)
+		}
+		return
+	}
+	if err := h.store.HeartbeatComputeNode(ctx, n.ID); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			// Row vanished between ActiveComputeNodes and
+			// HeartbeatComputeNode (admin DELETE, retention,
+			// etc.) — log + move on.
+			h.log.Info("heartbeat: node disappeared mid-sweep",
+				"node_id", n.ID)
+			return
+		}
+		h.log.Warn("heartbeat: stamp failed",
+			"node_id", n.ID, "err", err)
+	}
+	// CP-1: append one row to the heartbeat history. The
+	// received_at / last_heartbeat_at pair uses now() — the
+	// same wall-clock the stamp above used — so the wire
+	// shape's gap classification reflects the operator's clock,
+	// not the database's. A duplicate (node_id, received_at)
+	// from a hot tick is OBSERVED (logged as a warning) rather
+	// than silently deduped; ErrConflict from the store is the
+	// canonical signal. Other errors are logged and the sweep
+	// continues — observability must never abort the stamp
+	// loop.
+	receivedAt := tickNow
+	// source='heartbeat_tick' is the only value the routine
+	// stamp path writes today. The migration 00065 CHECK also
+	// permits 'deactivation' and 'reactivation' for the future
+	// watchdog integration (the last contact attempt before a
+	// deactivation + the recovery stamp); no code writes them
+	// yet. Widening the CHECK when those writes land is the
+	// expected evolution; do NOT add them here speculatively.
+	if err := h.store.AppendComputeNodeHeartbeat(ctx, n.ID, receivedAt, receivedAt, "heartbeat_tick"); err != nil {
+		if errors.Is(err, state.ErrConflict) {
+			h.log.Warn("heartbeat: history append duplicate",
+				"node_id", n.ID, "received_at", receivedAt.Format(time.RFC3339Nano))
+		} else {
+			h.log.Warn("heartbeat: history append failed",
+				"node_id", n.ID, "err", err)
+		}
+	}
 }
 
 // heartbeatPing dials a fresh *VMMClient per call (issue #120 —
@@ -280,12 +356,18 @@ func (h *Heartbeat) heartbeatPing(ctx context.Context, n state.ComputeNode) (*Pi
 	if h.dialer == nil {
 		return nil, errors.New("heartbeat: dialer not configured")
 	}
-	cli, err := h.dialer.Dial(ctx, n.TargetURL, h.tls)
+	probeTimeout := h.ProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = DefaultHeartbeatProbeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	cli, err := h.dialer.Dial(probeCtx, n.TargetURL, h.tls)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = cli.Close() }()
-	return cli.Ping(ctx)
+	return cli.Ping(probeCtx)
 }
 
 // Run blocks until ctx is cancelled, ticking every h.Interval. It

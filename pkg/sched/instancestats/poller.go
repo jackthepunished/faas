@@ -61,6 +61,29 @@ type Poller struct {
 	Log       *slog.Logger
 	Now       func() time.Time
 	Freshness time.Duration
+	// Telemetry is the notification/stream-backed node observer cache. When
+	// set, Tick only projects its local snapshot and never dials vmmd.
+	Telemetry *sched.NodeTelemetryCache
+	// NodeRegistry is the same notification-backed active-node snapshot used
+	// by placement and heartbeat. Nil preserves the legacy store lookup.
+	NodeRegistry *sched.NodeRegistry
+}
+
+// WithTelemetry switches the poller to the persistent node telemetry stream.
+func (p *Poller) WithTelemetry(cache *sched.NodeTelemetryCache) *Poller {
+	if p != nil {
+		p.Telemetry = cache
+	}
+	return p
+}
+
+// WithNodeRegistry removes the per-tick ActiveComputeNodes query from the
+// production observer path.
+func (p *Poller) WithNodeRegistry(reg *sched.NodeRegistry) *Poller {
+	if p != nil {
+		p.NodeRegistry = reg
+	}
+	return p
 }
 
 // NewPoller builds a Poller with sensible defaults applied to
@@ -119,16 +142,21 @@ func (p *Poller) Run(ctx context.Context) error {
 	}
 }
 
-// Tick performs one full sweep: list active compute nodes, list
-// live instances, dial each node fresh, decode Stats, build
-// InstanceStat rows, replace the Reader and the metrics. Per-node
-// dial failures are logged + recorded on the per-node error
-// counter; they do not abort the sweep.
+// Tick performs one full sweep: list the active-node snapshot, list live
+// instances, and project either the persistent telemetry cache or the legacy
+// fresh-dial path into InstanceStat rows. The production path has no per-node
+// network calls here; legacy dial failures remain partial and non-fatal.
 func (p *Poller) Tick(ctx context.Context) error {
 	started := p.now()
-	nodes, err := p.Store.ActiveComputeNodes(ctx)
-	if err != nil {
-		return err
+	var nodes []state.ComputeNode
+	if p.NodeRegistry != nil {
+		nodes = p.NodeRegistry.Snapshot()
+	} else {
+		var err error
+		nodes, err = p.Store.ActiveComputeNodes(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	instances, err := p.Store.ListAllInstances(ctx)
 	if err != nil {
@@ -169,6 +197,18 @@ func (p *Poller) Tick(ctx context.Context) error {
 		}
 		sidecarByDeploy[in.DeploymentID] = mbs
 	}
+	// Production uses the persistent vmmd→schedd capacity stream. The stream
+	// updates one complete batch per node; this local projection can continue at
+	// the existing 200 ms cadence without opening any per-node connections.
+	if p.Telemetry != nil {
+		rows, rolled := p.decodeTelemetrySnapshot(
+			p.Telemetry.Snapshot(p.now()), instances, sidecarByDeploy)
+		p.Reader.Replace(rows)
+		if p.Metrics != nil {
+			p.Metrics.ReplaceInstanceStats(rolled, p.now().Sub(started))
+		}
+		return nil
+	}
 	rows := make([]InstanceStat, 0, len(instances))
 	rolled := make([]wire.InstanceStatRow, 0, len(instances))
 	for _, node := range nodes {
@@ -187,6 +227,83 @@ func (p *Poller) Tick(ctx context.Context) error {
 		p.Metrics.ReplaceInstanceStats(rolled, p.now().Sub(started))
 	}
 	return nil
+}
+
+// decodeTelemetrySnapshot joins a persistent node batch with durable instance
+// state. App/deployment ownership remains sourced from schedd's store, while
+// all vmmd measurements arrive together over ReportCapacity.
+func (p *Poller) decodeTelemetrySnapshot(
+	snapshot []sched.NodeTelemetryWithNode,
+	instances []state.Instance,
+	sidecarByDeploy map[string][]int,
+) ([]InstanceStat, []wire.InstanceStatRow) {
+	byID := make(map[string]state.Instance, len(instances))
+	for _, instance := range instances {
+		byID[instance.ID] = instance
+	}
+	rows := make([]InstanceStat, 0, len(snapshot))
+	rolled := make([]wire.InstanceStatRow, 0, len(snapshot))
+	now := p.now()
+	for _, cached := range snapshot {
+		in := cached.Telemetry
+		if in.InstanceID == "" {
+			continue
+		}
+		durable, ok := byID[in.InstanceID]
+		if !ok {
+			continue
+		}
+		row := InstanceStat{
+			InstanceID:       in.InstanceID,
+			NodeID:           cached.NodeID,
+			AppID:            durable.AppID,
+			InflightRequests: in.InflightRequests,
+			CPU:              Unknown,
+			RSS:              Unknown,
+			SampledAt:        now,
+			SidecarMBs:       sidecarByDeploy[durable.DeploymentID],
+		}
+		wireRow := wire.InstanceStatRow{
+			AppID:            durable.AppID,
+			NodeID:           cached.NodeID,
+			InflightRequests: in.InflightRequests,
+			CPUPct:           math.NaN(),
+			RSSMB:            math.NaN(),
+			CPUSeconds:       math.NaN(),
+			ThrottledUsec:    math.NaN(),
+		}
+		if in.CPUPct != nil {
+			row.CPUPct = *in.CPUPct
+			row.CPU = Valid
+			wireRow.CPUPct = *in.CPUPct
+		}
+		if in.CPUSeconds != nil {
+			row.CPUUsageUsec = uint64(*in.CPUSeconds * 1e6)
+			row.CPUHour = *in.CPUSeconds / 3600.0
+			wireRow.CPUSeconds = *in.CPUSeconds
+		}
+		if in.CPUThrottledSeconds != nil {
+			wireRow.ThrottledUsec = *in.CPUThrottledSeconds * 1e6
+		}
+		if in.NetTxBytes != nil {
+			row.TXBytes = uint64(*in.NetTxBytes)
+			row.TX = Valid
+		}
+		if in.ResidentBytes != nil {
+			mib := float64(*in.ResidentBytes) / float64(1024*1024)
+			row.RSSMB = mib
+			row.RSS = Valid
+			wireRow.RSSMB = mib
+		}
+		if !in.LastRequestAt.IsZero() {
+			row.LastRequestAt = in.LastRequestAt
+		} else {
+			row.LastRequestAt = durable.LastRequestAt
+		}
+		rows = append(rows, row)
+		rolled = append(rolled, wireRow)
+	}
+	return rows, rolled
 }
 
 // tickNode dials one node fresh, calls Stats, and decodes the

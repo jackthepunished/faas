@@ -379,6 +379,20 @@ type Engine struct {
 	// table keep their existing single-box behaviour.
 	capacityTable *nodeCapacityTable
 
+	// nodeRegistry is the notification-backed active-node snapshot used by
+	// placement and fleet observers. It is seeded at startup and updated by
+	// compute_node_changed; nil keeps older unit fixtures on the store path.
+	nodeRegistry *NodeRegistry
+
+	// telemetryCache is the receiver for the batched vmmd Stats rows carried
+	// on the persistent ReportCapacity stream. The instance-stats poller
+	// projects it locally instead of dialing every compute node.
+	telemetryCache *NodeTelemetryCache
+
+	// usageCache is the short TTL cache for the bulk store fallback used when
+	// a node has no fresh vmmd capacity report.
+	usageCache *NodeUsageCache
+
 	// now is the clock source for the chooser's freshness check
 	// (applyLiveCapacityMB). Defaults to time.Now inside NewEngine.
 	// Tests override via `Engine.now = func() time.Time { return ... }`
@@ -481,6 +495,8 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		wakeCoord:       newWakeCoord(),
 		warmBroadcaster: newWarmHintBroadcaster(),
 		capacityTable:   newNodeCapacityTable(),
+		telemetryCache:  NewNodeTelemetryCache(),
+		usageCache:      NewNodeUsageCache(),
 		now:             time.Now, // tests override post-construction
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
@@ -954,6 +970,46 @@ func (e *Engine) CapacitySink() CapacitySink {
 		return func(CapacityReport) error { return nil }
 	}
 	return e.capacityTable.CapacitySink()
+}
+
+// WithNodeRegistry wires the notification-backed active-node cache. The
+// bootstrap snapshot is supplied by cmd/schedd after NewEngine returns.
+func (e *Engine) WithNodeRegistry(reg *NodeRegistry) *Engine {
+	if e == nil {
+		return e
+	}
+	e.nodeRegistry = reg
+	return e
+}
+
+// NodeRegistry returns the active-node cache used by placement and observers.
+func (e *Engine) NodeRegistry() *NodeRegistry {
+	if e == nil {
+		return nil
+	}
+	return e.nodeRegistry
+}
+
+// NodeTelemetryCache returns the cache populated by ReportCapacity. The
+// instance-stats poller reads this cache at its local projection cadence.
+func (e *Engine) NodeTelemetryCache() *NodeTelemetryCache {
+	if e == nil {
+		return nil
+	}
+	return e.telemetryCache
+}
+
+// TelemetrySink returns the narrow callback used by scheddgrpc to apply a
+// complete node telemetry batch. A nil-safe no-op keeps pre-stream fixtures
+// compatible.
+func (e *Engine) TelemetrySink() TelemetrySink {
+	if e == nil || e.telemetryCache == nil {
+		return func(string, time.Time, time.Time, []NodeTelemetry) error { return nil }
+	}
+	return func(nodeID string, sampledAt, receivedAt time.Time, rows []NodeTelemetry) error {
+		e.telemetryCache.Replace(nodeID, sampledAt, receivedAt, rows)
+		return nil
+	}
 }
 
 // WithNodeKeyRegistry wires the ADR-053 signature-verification
@@ -2624,6 +2680,71 @@ func (e *Engine) applyLiveCapacityMB(_ context.Context, nodeID string) int64 {
 	return used
 }
 
+// fallbackNodeUsage resolves store-backed usage for a set of nodes with one
+// aggregate query and a short-lived cache. The per-node method remains as a
+// compatibility fallback for custom Store implementations that predate the
+// optional ComputeNodeUsageBatcher interface.
+func (e *Engine) fallbackNodeUsage(ctx context.Context, nodes []state.ComputeNode) map[string]int64 {
+	used := make(map[string]int64, len(nodes))
+	if len(nodes) == 0 {
+		return used
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		ids = append(ids, node.ID)
+	}
+	now := time.Now()
+	if e.now != nil {
+		now = e.now()
+	}
+	if cached, ok := e.usageCache.Lookup(ids, now); ok {
+		return cached
+	}
+	if batcher, ok := e.store.(state.ComputeNodeUsageBatcher); ok {
+		bulk, err := batcher.ComputeNodeUsedMBByNode(ctx, ids)
+		if err == nil {
+			e.usageCache.Replace(ids, bulk, now)
+			for _, id := range ids {
+				used[id] = bulk[id]
+			}
+			return used
+		}
+		e.log.Warn("sched: placement: bulk compute node used_mb read failed", "err", err)
+	}
+	// Compatibility path only: production PgStore and the built-in MemStore
+	// both implement the bulk interface above.
+	for _, node := range nodes {
+		value, err := e.store.ComputeNodeUsedMB(ctx, node.ID)
+		if err != nil {
+			e.log.Warn("sched: placement: compute node used_mb read failed",
+				"node_id", node.ID, "node_name", node.Name, "err", err)
+			continue
+		}
+		used[node.ID] = value
+	}
+	return used
+}
+
+// nodeUsageForNodes merges fresh vmmd reports with the one-batch store
+// fallback. All callers that make a fleet-wide placement decision use this
+// helper so a new placement feature cannot accidentally reintroduce an N+1
+// ComputeNodeUsedMB loop.
+func (e *Engine) nodeUsageForNodes(ctx context.Context, nodes []state.ComputeNode) map[string]int64 {
+	used := make(map[string]int64, len(nodes))
+	missing := make([]state.ComputeNode, 0, len(nodes))
+	for _, node := range nodes {
+		if live := e.applyLiveCapacityMB(ctx, node.ID); live > 0 {
+			used[node.ID] = live
+		} else {
+			missing = append(missing, node)
+		}
+	}
+	for nodeID, value := range e.fallbackNodeUsage(ctx, missing) {
+		used[nodeID] = value
+	}
+	return used
+}
+
 // choosePlacement picks a compute_node for the next wake using the
 // pure ChoosePlacement chooser (placement.go). It loads the live
 // fleet from the store and the per-node used_mb aggregate, both
@@ -2659,35 +2780,22 @@ func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placemen
 		}
 		r.PreferredNodeID = e.ownerNodeID
 	}
-	nodes, err := e.store.ActiveComputeNodes(ctx)
-	if err != nil {
-		return Placement{}, fmt.Errorf("sched: placement: list active compute_nodes: %w", err)
+	var nodes []state.ComputeNode
+	var err error
+	if e.nodeRegistry != nil {
+		nodes = e.nodeRegistry.Snapshot()
+	} else {
+		nodes, err = e.store.ActiveComputeNodes(ctx)
+		if err != nil {
+			return Placement{}, fmt.Errorf("sched: placement: list active compute_nodes: %w", err)
+		}
 	}
-	// One pass over the fleet — read each node's live-or-store UsedMB
-	// (Tier A1) and the ledger's per-node UsedVCPU (Tier A2) in
-	// lockstep. The two reads are independent (the live table is a
-	// vmmd-side cgroup mirror, the ledger is schedd's local
-	// reservations), so the lockstep is just a fusion of two
-	// contiguous maps for the chooser. The chooser enforces them
-	// independently downstream.
-	usedMB := make(map[string]int64, len(nodes))
+	// One pass over the fleet — use fresh vmmd capacity where available, and
+	// resolve all misses through one bulk store aggregate (Tier A1). The
+	// ledger's per-node UsedVCPU remains an independent local reservation view.
+	usedMB := e.nodeUsageForNodes(ctx, nodes)
 	usedVCPU := make(map[string]int64, len(nodes))
 	for _, n := range nodes {
-		if used := e.applyLiveCapacityMB(ctx, n.ID); used > 0 {
-			usedMB[n.ID] = used
-		} else {
-			// No live report (table miss / stale) or live says zero:
-			// fall through to the store sum. A single node's transient
-			// store error must not block placement of the rest; the
-			// next wake re-reads; a permanent failure surfaces there.
-			used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
-			if err != nil {
-				e.log.Warn("sched: placement: compute node used_mb read failed",
-					"node_id", n.ID, "node_name", n.Name, "err", err)
-				used = 0
-			}
-			usedMB[n.ID] = used
-		}
 		// Tier A2: per-node vCPU is ledger-authoritative. The chooser
 		// uses this to enforce compute_nodes.vcpu_budget per node;
 		// absent or zero is treated as 0 by the chooser (the
@@ -3212,25 +3320,27 @@ func (e *Engine) observeOverflowSpill(outcome string) {
 // app.RAMMB + api.PerVMOverheadMB. Returns "" if no peer
 // qualifies. Errors are wrapped with %w+op.
 func (e *Engine) findPeerWithHeadroom(ctx context.Context, app state.App) (string, error) {
-	nodes, err := e.store.ActiveComputeNodes(ctx)
-	if err != nil {
-		return "", fmt.Errorf("sched: pressure rebalance: list active nodes: %w", err)
+	var nodes []state.ComputeNode
+	if e.nodeRegistry != nil {
+		nodes = e.nodeRegistry.Snapshot()
+	} else {
+		var err error
+		nodes, err = e.store.ActiveComputeNodes(ctx)
+		if err != nil {
+			return "", fmt.Errorf("sched: pressure rebalance: list active nodes: %w", err)
+		}
 	}
 	// Sort by name for deterministic tie-break (the caller
 	// picks the first peer with headroom, so the iteration
 	// order is load-bearing for the test surface).
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
 	neededMB := int64(app.RAMMB) + int64(api.PerVMOverheadMB)
+	usedByNode := e.nodeUsageForNodes(ctx, nodes)
 	for _, n := range nodes {
 		if n.ID == e.ownerNodeID {
 			continue
 		}
-		used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
-		if err != nil {
-			e.log.Warn("sched: pressure rebalance: peer used_mb read failed",
-				"node_id", n.ID, "node_name", n.Name, "err", err)
-			continue
-		}
+		used := usedByNode[n.ID]
 		ceiling := n.AdmissionCeilingMB
 		if ceiling <= 0 {
 			ceiling = api.RAMAdmissionCeilingMB
@@ -3289,10 +3399,7 @@ func (e *Engine) findOverflowPeerWithHeadroom(ctx context.Context, app state.App
 	if !n.Active {
 		return "", nil
 	}
-	used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
-	if err != nil {
-		return "", fmt.Errorf("sched: pressure rebalance: overflow peer used_mb read: %w", err)
-	}
+	used := e.nodeUsageForNodes(ctx, []state.ComputeNode{n})[n.ID]
 	ceiling := n.AdmissionCeilingMB
 	if ceiling <= 0 {
 		ceiling = api.RAMAdmissionCeilingMB

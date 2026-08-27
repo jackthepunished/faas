@@ -498,6 +498,14 @@ type AppErrorSampleRow struct {
 	Redactions    []string
 }
 
+// ComputeNodeUsageBatcher is the optional bulk form of ComputeNodeUsedMB.
+// Placement uses it when a fleet has nodes without a fresh vmmd capacity
+// report, avoiding one SQL round trip per candidate node. It is separate from
+// Store so narrow test doubles and older integrations remain source-compatible.
+type ComputeNodeUsageBatcher interface {
+	ComputeNodeUsedMBByNode(ctx context.Context, nodeIDs []string) (map[string]int64, error)
+}
+
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
 // The production implementation is Postgres via the embedded SQL queries in
 // pkg/state/queries.sql; MemStore backs unit tests. Keeping this interface

@@ -1146,7 +1146,59 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 			sendErr = err
 			return status.Error(codes.Unavailable, err.Error())
 		}
+		// The same persistent frame also carries the complete vmmd Stats
+		// batch. Apply it only after capacity/signature validation so the
+		// observer cache cannot be populated by an untrusted node report.
+		if provider, ok := s.engine.(interface{ TelemetrySink() sched.TelemetrySink }); ok {
+			if sink := provider.TelemetrySink(); sink != nil {
+				if err := sink(report.NodeID, report.SampledAt, time.Now(), nodeTelemetryFromProto(msg.GetInstances())); err != nil {
+					sendErr = err
+					return status.Error(codes.Unavailable, err.Error())
+				}
+			}
+		}
 	}
+}
+
+func nodeTelemetryFromProto(in []*scheddpb.InstanceTelemetry) []sched.NodeTelemetry {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]sched.NodeTelemetry, 0, len(in))
+	for _, row := range in {
+		if row == nil || row.GetInstanceId() == "" {
+			continue
+		}
+		item := sched.NodeTelemetry{
+			InstanceID:       row.GetInstanceId(),
+			InflightRequests: row.GetInflightRequests(),
+		}
+		if value := row.GetResidentBytes(); value != nil {
+			v := value.GetValue()
+			item.ResidentBytes = &v
+		}
+		if value := row.GetCpuPct(); value != nil {
+			v := value.GetValue()
+			item.CPUPct = &v
+		}
+		if value := row.GetCpuSeconds(); value != nil {
+			v := value.GetValue()
+			item.CPUSeconds = &v
+		}
+		if value := row.GetCpuThrottledSeconds(); value != nil {
+			v := value.GetValue()
+			item.CPUThrottledSeconds = &v
+		}
+		if value := row.GetLastRequestAt(); value != nil {
+			item.LastRequestAt = value.AsTime()
+		}
+		if value := row.GetNetTxBytes(); value != nil {
+			v := value.GetValue()
+			item.NetTxBytes = &v
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the

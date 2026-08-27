@@ -317,6 +317,44 @@ func TestPoller_PartialNodeFailure(t *testing.T) {
 	}
 }
 
+// TestPoller_PersistentTelemetryAvoidsPerNodeDials pins the production
+// observer path: vmmd Stats arrives through the node cache and the 200 ms
+// projection never opens a VMM connection.
+func TestPoller_PersistentTelemetryAvoidsPerNodeDials(t *testing.T) {
+	store := state.NewMemStore()
+	_, live := seedTwoNodes(t, store)
+	ins := seedInstance(t, store, "app1", live.ID)
+	resident := int64(128 * 1024 * 1024)
+	cpu := 37.5
+	cache := sched.NewNodeTelemetryCache()
+	now := time.Unix(500, 0)
+	cache.Replace(live.ID, now, now, []sched.NodeTelemetry{{
+		InstanceID:       ins.ID,
+		ResidentBytes:    &resident,
+		CPUPct:           &cpu,
+		InflightRequests: 2,
+	}})
+	dialer := &statsFakeDialer{}
+	p := NewPoller(store, dialer, nil, NewReader(), wire.NewOpsMetrics("schedd"), nilLogger()).
+		WithTelemetry(cache).
+		WithNodeRegistry(sched.NewNodeRegistry([]state.ComputeNode{live}))
+	p.Now = func() time.Time { return now }
+
+	if err := p.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if got := len(dialer.dials); got != 0 {
+		t.Fatalf("VMM dials = %d, want 0 on persistent telemetry path", got)
+	}
+	rows := p.Reader.SnapshotAll()
+	if len(rows) != 1 {
+		t.Fatalf("SnapshotAll length = %d, want 1", len(rows))
+	}
+	if rows[0].AppID != "app1" || rows[0].NodeID != live.ID || rows[0].RSSMB != 128 || rows[0].CPUPct != cpu {
+		t.Fatalf("row = %+v, want app1/%s rss=128 cpu=%v", rows[0], live.ID, cpu)
+	}
+}
+
 // TestPoller_FirstSampleCPUUnknown pins the cgroup "first sample"
 // invariant: the cumulative CPU counter needs a prior reading to
 // produce a rate. The poller stamps CPU=Unknown on the very first

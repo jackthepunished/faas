@@ -651,7 +651,7 @@ func TestBuildCapacityReport_SignedStampsSignature(t *testing.T) {
 	cfg := ComputeNodeConfig{MemMB: 1000}
 
 	// Signed: both fields populated.
-	got := buildCapacityReport(streamer, nil, "node-1", cfg, resident, silentLogger())
+	got := buildCapacityReport(context.Background(), streamer, nil, "node-1", cfg, resident, silentLogger())
 	if len(got.GetNodeSignature()) != 64 {
 		t.Errorf("signed: node_signature length = %d, want 64", len(got.GetNodeSignature()))
 	}
@@ -660,7 +660,7 @@ func TestBuildCapacityReport_SignedStampsSignature(t *testing.T) {
 	}
 
 	// Unsigned: both fields empty.
-	got = buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
+	got = buildCapacityReport(context.Background(), nil, nil, "node-1", cfg, resident, silentLogger())
 	if len(got.GetNodeSignature()) != 0 {
 		t.Errorf("unsigned: node_signature length = %d, want 0", len(got.GetNodeSignature()))
 	}

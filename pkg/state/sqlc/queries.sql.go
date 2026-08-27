@@ -137,6 +137,9 @@ join oidc_trust_policies p on p.account_id = a.id
 where p.issuer_url = $1
   and (p.subject_pattern is null or p.subject_pattern = ''
        or $2 ~ p.subject_pattern)
+order by (p.subject_pattern is null or p.subject_pattern = '') asc,
+         length(coalesce(p.subject_pattern, '')) desc,
+         a.id
 limit 1
 `
 

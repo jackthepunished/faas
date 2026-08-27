@@ -280,12 +280,11 @@ func VerifyNodeSignature(r CapacityReport, sig []byte, keys nodeKeyLookup) error
 // cadence; a missed tick is transient, a missed 5 ticks is a
 // real outage and the chooser should stop biasing.
 //
-// Aligned with pkg/sched/instancestats.Poller (200 ms schedd-side
-// pull of vmmd Stats), but on the push side: the poller's
-// freshness window is governed by its 200 ms tick, not by
-// this constant. Both paths converge on "fresh = last 5 s";
-// the engine's freshness gate can fall back to the poller's
-// observation independently if the table ages out.
+// Aligned with pkg/sched/instancestats.Poller's local 200 ms projection, but
+// on the push side: the poller's freshness window is governed by its local
+// tick, not by this constant. Both paths converge on "fresh = last 5 s";
+// the engine's freshness gate can fall back to the bulk store observation
+// independently if the table ages out.
 const CapacityFreshness = 5 * time.Second
 
 // CapacityReport mirrors scheddpb.CapacityReport at the engine
