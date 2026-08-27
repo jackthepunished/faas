@@ -204,12 +204,30 @@ func (s *server) adminRuntimeConfigPatch(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusAccepted, runtimeConfigOperationResponse(operation))
 		return
 	}
-	if err := s.runtimeConfig.apply(key, req.Value); err != nil {
+	applied, err := s.runtimeConfig.applyVersion(key, req.Value, row.Version)
+	if err != nil {
 		_ = s.store.MarkRuntimeConfigApplied(r.Context(), key, row.Scope, row.ScopeID, row.Version, nil, err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not apply runtime configuration"))
 		return
 	}
+	if !applied {
+		// Another request has already installed a newer durable version in
+		// this process. Leave that newer value live and converge the local
+		// snapshot from the database before reporting the optimistic-write
+		// conflict to the operator.
+		_ = s.runtimeConfig.reconcile(r.Context(), s.store)
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
+		return
+	}
 	if err := s.store.MarkRuntimeConfigApplied(r.Context(), key, row.Scope, row.ScopeID, row.Version, req.Value, ""); err != nil {
+		if errors.Is(err, state.ErrRuntimeConfigConflict) {
+			// The durable row was superseded after the local hot swap. The
+			// newer value must win; reconciling here avoids waiting for the
+			// notification/ticker before the current apid process catches up.
+			_ = s.runtimeConfig.reconcile(r.Context(), s.store)
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeConflict, "Configuration changed concurrently", "refresh the configuration page and retry with the latest version"))
+			return
+		}
 		api.WriteProblem(w, api.ErrCapacity("could not acknowledge runtime configuration"))
 		return
 	}

@@ -15,23 +15,30 @@ Each catalogued key has a durable row in `runtime_config_entries`:
 
 Every write also appends `runtime_config_revisions` and emits the
 `runtime_config_changed` notification. Notifications are only wake-ups; apid
-re-reads the table at boot and after reconnect so a dropped notification cannot
-silently leave a daemon stale.
+re-reads the table at boot, after LISTEN is established, after reconnect, and
+on a five-second repair interval. A dropped notification therefore cannot
+silently leave a daemon stale. Version-ordered application also prevents an
+older concurrent PATCH from overwriting a newer value already live in a
+process.
 
 ## Apply modes
 
 `hot` settings are validated, swapped into the process snapshot, acknowledged,
-and are immediately visible to new requests. Feature gates and the domain
-doctor TTL use this path. HSTS uses the same hot setter and is guarded for
-concurrent request reads.
+and are immediately visible to new requests without restarting apid or
+interrupting in-flight requests. Feature gates and the domain doctor TTL use
+this path. HSTS uses the same hot setter and is guarded for concurrent request
+reads. The environment value is only a bootstrap fallback; once a durable
+operator value has been applied, a restart cannot replace it with the
+environment value.
 
 `graceful`, `rolling`, and `break_glass` settings are never reported as live
 just because the database write succeeded. The PATCH returns `202` with a
 durable row in `runtime_config_operations`; a deployment/daemon controller
-claims that row, applies the change, and calls the state-layer terminal method.
-Successful completion updates both the operation and the matching
+must claim that row, apply the change, and call the state-layer terminal
+method. Successful completion updates both the operation and the matching
 `runtime_config_entries` row in one database transaction. Failure/block reasons
-remain visible to the operator.
+remain visible to the operator. These modes are not part of the hot,
+zero-downtime guarantee until their controller is enabled for the deployment.
 
 Bootstrap secrets, listener addresses, billing provider selection, and daemon
 role are deployment-managed and are intentionally not editable in the web

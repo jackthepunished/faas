@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -25,6 +26,12 @@ const (
 	runtimeConfigAppErrors       = "app_errors_enabled"
 	runtimeConfigRekey           = "rekey_enabled"
 	runtimeConfigHSTS            = "hsts_enabled"
+
+	// pg_notify is deliberately only a wake-up signal. This repair interval
+	// bounds convergence when a notification is lost during a database or
+	// listener reconnect, while keeping the hot path independent of a polling
+	// request from the operator console.
+	runtimeConfigReconcileInterval = 5 * time.Second
 )
 
 type runtimeConfigDefinition struct {
@@ -58,17 +65,23 @@ var runtimeConfigCatalog = []runtimeConfigDefinition{
 }
 
 type runtimeConfigManager struct {
-	mu     sync.RWMutex
-	values map[string]json.RawMessage
-	defs   map[string]runtimeConfigDefinition
-	getenv func(string) string
+	mu       sync.RWMutex
+	values   map[string]json.RawMessage
+	versions map[string]int64
+	defs     map[string]runtimeConfigDefinition
+	getenv   func(string) string
 }
 
 func newRuntimeConfigManager(getenv func(string) string) *runtimeConfigManager {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	m := &runtimeConfigManager{values: make(map[string]json.RawMessage), defs: make(map[string]runtimeConfigDefinition), getenv: getenv}
+	m := &runtimeConfigManager{
+		values:   make(map[string]json.RawMessage),
+		versions: make(map[string]int64),
+		defs:     make(map[string]runtimeConfigDefinition),
+		getenv:   getenv,
+	}
 	for _, def := range runtimeConfigCatalog {
 		m.defs[def.Key] = def
 		m.values[def.Key] = runtimeConfigEnvDefault(def, getenv)
@@ -178,23 +191,48 @@ func (m *runtimeConfigManager) Duration(key string, fallback time.Duration) time
 }
 
 func (m *runtimeConfigManager) apply(key string, value json.RawMessage) error {
+	_, err := m.applyVersion(key, value, 0)
+	return err
+}
+
+// applyVersion installs a value only when it is at least as new as the
+// manager's current durable version. A version of zero is the bootstrap
+// environment fallback; it must not overwrite an operator value that has
+// already been reconciled. The version check closes the race where two
+// concurrent PATCH requests finish their database writes in one order but
+// reach the local process in the opposite order.
+func (m *runtimeConfigManager) applyVersion(key string, value json.RawMessage, version int64) (bool, error) {
 	def, ok := m.Definition(key)
 	if !ok {
-		return fmt.Errorf("unknown runtime config key %q", key)
+		return false, fmt.Errorf("unknown runtime config key %q", key)
 	}
 	if err := validateRuntimeConfigValue(def, value); err != nil {
-		return err
+		return false, err
 	}
 	m.mu.Lock()
+	if version == 0 && m.versions[key] > 0 {
+		m.mu.Unlock()
+		return false, nil
+	}
+	if version > 0 && version < m.versions[key] {
+		m.mu.Unlock()
+		return false, nil
+	}
 	m.values[key] = append(json.RawMessage(nil), value...)
-	m.mu.Unlock()
+	if version > m.versions[key] {
+		m.versions[key] = version
+	}
 	if key == runtimeConfigHSTS {
 		var enabled bool
 		if err := json.Unmarshal(value, &enabled); err == nil {
+			// Keep the package-level header switch ordered with the versioned
+			// snapshot. Applying it while the manager lock is held prevents a
+			// stale concurrent update from winning after a newer one.
 			httpsec.SetHSTSEnabled(enabled)
 		}
 	}
-	return nil
+	m.mu.Unlock()
+	return true, nil
 }
 
 func (m *runtimeConfigManager) reconcile(ctx context.Context, store state.Store) error {
@@ -202,6 +240,7 @@ func (m *runtimeConfigManager) reconcile(ctx context.Context, store state.Store)
 	if err != nil {
 		return err
 	}
+	var firstStoreErr error
 	for _, row := range rows {
 		// A non-hot row is only effective after its durable apply
 		// operation reaches a terminal success. Pending/failed/blocked
@@ -209,16 +248,34 @@ func (m *runtimeConfigManager) reconcile(ctx context.Context, store state.Store)
 		if row.ApplyMode != state.RuntimeConfigApplyHot && row.Status != state.RuntimeConfigApplied {
 			continue
 		}
-		if err := m.apply(row.Key, row.DesiredValue); err != nil {
+		applied, applyErr := m.applyVersion(row.Key, row.DesiredValue, row.Version)
+		if applyErr != nil {
+			// Invalid durable data must become visible as a failed setting,
+			// not disappear into a retry loop. The process keeps serving on
+			// its last valid snapshot, which preserves availability while
+			// the operator repairs the value from the console.
+			if row.ApplyMode == state.RuntimeConfigApplyHot {
+				if err := store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, row.Version, nil, applyErr.Error()); err != nil && !errors.Is(err, state.ErrRuntimeConfigConflict) && firstStoreErr == nil {
+					firstStoreErr = err
+				}
+			}
+			continue
+		}
+		if !applied {
+			// A newer version is already live in this process. Do not
+			// acknowledge this older row; the next durable read will carry
+			// the current version and effective value.
 			continue
 		}
 		if row.ApplyMode == state.RuntimeConfigApplyHot && row.Status != state.RuntimeConfigApplied {
 			if err := store.MarkRuntimeConfigApplied(ctx, row.Key, row.Scope, row.ScopeID, row.Version, row.DesiredValue, ""); err != nil {
-				return err
+				if !errors.Is(err, state.ErrRuntimeConfigConflict) && firstStoreErr == nil {
+					firstStoreErr = err
+				}
 			}
 		}
 	}
-	return nil
+	return firstStoreErr
 }
 
 func validateRuntimeConfigValue(def runtimeConfigDefinition, value json.RawMessage) error {
@@ -260,17 +317,63 @@ func validateRuntimeConfigValue(def runtimeConfigDefinition, value json.RawMessa
 }
 
 func runRuntimeConfigSubscriber(ctx context.Context, pool *pgxpool.Pool, srv *server, log *slog.Logger) error {
-	if pool == nil || srv == nil || srv.runtimeConfig == nil {
+	if pool == nil || srv == nil || srv.runtimeConfig == nil || srv.store == nil {
 		return nil
 	}
-	ch, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyRuntimeConfigChanged}, log)
-	if err != nil {
-		return err
+	const (
+		initialSubscribeBackoff  = 250 * time.Millisecond
+		maxSubscribeRetryBackoff = 5 * time.Second
+	)
+	backoff := initialSubscribeBackoff
+	var ch <-chan db.Notification
+	for {
+		var err error
+		ch, err = db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyRuntimeConfigChanged}, log)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if log != nil {
+			log.Warn("runtime_config subscriber setup failed; retrying", "err", err, "backoff", backoff)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > maxSubscribeRetryBackoff {
+			backoff = maxSubscribeRetryBackoff
+		}
 	}
+	// Reconcile once after LISTEN is established. This closes the startup
+	// race where a setting changes between the boot reconciliation and the
+	// subscriber registration.
+	if err := srv.runtimeConfig.reconcile(ctx, srv.store); err != nil && log != nil {
+		log.Error("runtime_config.reconcile_failed", "err", err)
+	}
+	ticker := time.NewTicker(runtimeConfigReconcileInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
+			// Notifications reduce propagation latency; this periodic repair
+			// guarantees eventual convergence across LISTEN reconnects and
+			// transient delivery gaps.
+			if err := srv.runtimeConfig.reconcile(ctx, srv.store); err != nil && log != nil {
+				log.Error("runtime_config.reconcile_failed", "err", err)
+			}
 		case _, ok := <-ch:
 			if !ok {
 				return nil
