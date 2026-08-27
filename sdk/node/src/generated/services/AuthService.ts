@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AuthCapabilities } from '../models/AuthCapabilities.js';
+import type { CSRFTokenResponse } from '../models/CSRFTokenResponse.js';
 import type { MagicLinkSignupRequest } from '../models/MagicLinkSignupRequest.js';
 import type { OIDCExchangeRequest } from '../models/OIDCExchangeRequest.js';
 import type { OIDCExchangeResponse } from '../models/OIDCExchangeResponse.js';
@@ -575,6 +576,55 @@ export class AuthService {
         defensive path; AEAD-bound envelopes should not
         produce this).
         `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Issue an action-bound CSRF token for the dashboard.
+   * Returns a short-lived CSRF token bound to the authenticated
+   * account and the requested browser mutation. The matching
+   * `faas_csrf` cookie is HttpOnly; clients send the returned
+   * `csrf_token` in the mutation's JSON body. This route remains
+   * reachable while the session is `mfa_pending` so the dashboard
+   * can complete MFA enrollment or recovery.
+   *
+   * @returns CSRFTokenResponse Action-bound CSRF token.
+   * @throws ApiError
+   */
+  public static issueBrowserCsrfToken({
+    action,
+    faasSid,
+  }: {
+    /**
+     * Exact mutation action the token will authorize.
+     */
+    action: 'auth.logout' | 'auth.session.revoke' | 'auth.sessions.revoke_all' | 'mfa_confirm' | 'mfa_recover' | 'mfa_disable',
+    /**
+     * Dashboard session cookie. Sealed; opaque to the client
+     * (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+     * The browser sets it automatically on `/login` / `/signup`;
+     * the SDK uses the device-code flow instead and never sets
+     * this cookie.
+     *
+     */
+    faasSid?: string,
+  }): CancelablePromise<CSRFTokenResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/auth/csrf',
+      cookies: {
+        'faas_sid': faasSid,
+      },
+      query: {
+        'action': action,
+      },
+      errors: {
+        400: `Unknown or missing action.`,
+        401: `code: unauthorized`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

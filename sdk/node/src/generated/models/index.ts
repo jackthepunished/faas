@@ -66,6 +66,7 @@ export type { BuildListResponse } from './BuildListResponse.js';
 export type { BuildPlan } from './BuildPlan.js';
 export type { BuildProvenanceResponse } from './BuildProvenanceResponse.js';
 export type { BuildResponse } from './BuildResponse.js';
+export type { CSRFTokenResponse } from './CSRFTokenResponse.js';
 export type { ChangeMemberRoleRequest } from './ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
 export type { ConsumeInvoiceResponse } from './ConsumeInvoiceResponse.js';
