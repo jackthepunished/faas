@@ -102,16 +102,19 @@ CREATE TABLE IF NOT EXISTS deployment_scope_exclusions (
     UNIQUE (account_id, project_id, slug)
 );
 
--- Active window: anything older than 90 days is a janitor
--- concern (PurgeOrphanedScopeExclusions reaps it). The index
--- stays bounded; the apply path's hot lookup is O(log n_active).
+-- Indexes on (project_id) + (account_id) — full coverage; the
+-- per-row volume per scope is bounded by the janitor
+-- (PurgeOrphanedScopeExclusions reaps rows > 90 days). We do NOT
+-- use a partial-index `WHERE created_at > now() - interval '90 days'`
+-- because `now()` is STABLE not IMMUTABLE, so PostgreSQL rejects
+-- the partial-index predicate with SQLSTATE 42P17 (functions in
+-- index predicate must be marked IMMUTABLE). The janitor keeps the
+-- table small enough that a full index is fine.
 CREATE INDEX IF NOT EXISTS deployment_scope_exclusions_project_idx
-    ON deployment_scope_exclusions (project_id)
-    WHERE created_at > now() - interval '90 days';
+    ON deployment_scope_exclusions (project_id);
 
 CREATE INDEX IF NOT EXISTS deployment_scope_exclusions_account_idx
-    ON deployment_scope_exclusions (account_id)
-    WHERE created_at > now() - interval '90 days';
+    ON deployment_scope_exclusions (account_id);
 
 CREATE OR REPLACE FUNCTION deployment_scope_exclusions_set_updated_at()
 RETURNS TRIGGER AS $$

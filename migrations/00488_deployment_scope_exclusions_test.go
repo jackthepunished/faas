@@ -105,7 +105,7 @@ func TestMigrations_00418_DeploymentScopeExclusions(t *testing.T) {
 	}
 
 	t.Run("SchemaCreated", func(t *testing.T) {
-		// Sanity: the table + the two partial indexes + the
+		// Sanity: the table + the two indexes + the
 		// trigger exist. information_schema + pg_trigger are
 		// the cheapest way to assert the shape without
 		// duplicating the migration body.
@@ -132,7 +132,7 @@ func TestMigrations_00418_DeploymentScopeExclusions(t *testing.T) {
 			t.Fatalf("count indexes: %v", err)
 		}
 		if idxCount != 2 {
-			t.Errorf("partial indexes count: got %d, want 2", idxCount)
+			t.Errorf("indexes count: got %d, want 2", idxCount)
 		}
 
 		var trgCount int
