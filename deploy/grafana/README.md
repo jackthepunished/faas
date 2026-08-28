@@ -74,6 +74,67 @@ Companion Prometheus alerts live at
 
 Runbook: `docs/runbooks/FaasAuditRetentionExhaustion.md`.
 
+## `audit-write-fidelity.json` (PR #1111 / Obs-Meta + Trace-IDs follow-on)
+
+Four-panel dashboard for the audit-write fidelity surface shipped by
+PR #1111 C2: `<daemon>_audit_log_write_total{endpoint, kind}` and
+`<daemon>_audit_log_write_failures_total{endpoint, kind, error_class}`
+counters (per-daemon prefix, pre-instantiation grid at
+`pkg/wire/metrics.go:3142-3179`). The audit emit is best-effort by
+design (ADR-035) — a sustained non-zero failure rate means audit
+rows are silently missing while customer traffic looks healthy.
+
+Panels:
+
+1. **Audit writes / 5m by endpoint** — `sum by (endpoint) (rate({__name__=~".*_audit_log_write_total"}[5m]))`. Stacked across the auditEndpointClosedSet (apid / schedd / meterd / gatewayd-internal).
+2. **Audit write failures / 5m by error_class** — `sum by (error_class) (rate({__name__=~".*_audit_log_write_failures_total"}[5m]))`. Drill-down shape the FaasAuditWriteFailuresSpike runbook opens with.
+3. **Audit write failure ratio (5m)** — failures / clamp_min(total, 0.001) with green<0.001 / yellow<0.01 / red≥0.01 threshold bands.
+4. **Audit writes by kind (top 8)** — `topk(8, sum by (kind) (rate({__name__=~".*_audit_log_write_total"}[5m])))`. The bounded-admission helper at `pkg/wire/metrics.go` collapses overflow to `__other__`.
+
+UID `faas-audit-write-fidelity-pr-1111`. Mirror at
+`deploy/ansible/roles/grafana/files/audit-write-fidelity.json`
+(byte-identical — `make grafana-mirror-check` enforces the contract).
+Companion alert at
+`deploy/ansible/roles/prometheus/files/faas.rules.yml` under
+`family: audit_write`:
+
+- `FaasAuditWriteFailuresSpike` (warn) — `sum(rate({__name__=~".*_audit_log_write_failures_total"}[5m])) > (5/60)` for 5m. Cross-daemon, `component=platform`. Deliberately not paired with the existing apid-only `FaasApidAuditWriteFailures` — alertmanager inhibit ANDs labels, so the warn is independently visible to surface non-apid spikes that the apid-only alert misses.
+
+Runbook: `docs/runbooks/FaasAuditWriteFailuresSpike.md`.
+
+## `obs-trace-completeness.json` (PR #1111 / Obs-Meta + Trace-IDs follow-on)
+
+Four-panel dashboard for the obs-meta trace completeness surface
+shipped by PR #1111 C2-C4: the schedd gauge
+`schedd_operator_action_trace_completeness_ratio{kind}` set by
+`pkg/sched/operator_intent_completeness.go::observeOperatorIntentCompleteness`
+on a 60s tick. Every panel filters on `schedd_…` because the gauge
+is registered on every daemon (`pkg/wire/metrics.go:3150-3173`) but
+ONLY schedd's driver calls `Set` — cross-daemon queries mix real
+values with never-set/zero defaults on other daemons.
+
+Panels:
+
+1. **Operator action trace completeness by kind (5m)** — `clamp_min(schedd_operator_action_trace_completeness_ratio, 0.001)`. Per-kind ratio timeseries with green≥0.95 / yellow 0.50-0.95 / red<0.50 threshold bands. `clamp_min(0.001)` mirrors the `vmmd_cold_boot_ratio` recording-rule precedent so the y-axis is bounded away from the `WithLabelValues(...)` default of 0 before the driver's first pass.
+2. **Operator action audit write rate by kind (denominator)** — `topk(8, sum by (kind) (rate({__name__=~".*_audit_log_write_total"}[5m])))` stacked. Disambiguator for the vacuous-truth default of 1.0 (absent kinds read 1.0 by `pkg/sched/operator_intent_completeness.go:172-179`). A kind whose ratio sits at 1.000 with non-zero write rate is a real violation; a kind whose ratio sits at 1.000 with flat write rate is a vacuous default. Same precedent as `FaasAuditRetentionTableGrowingFasterThanPruned`'s `> 0` precondition at `faas.rules.yml:463-469`.
+3. **Driver loop freshness (s, healthy <180)** — `time() - timestamp(schedd_operator_action_trace_completeness_ratio)`. Stat with green<180 / yellow<360 / red≥360. Same logic as `FaasAuditRetentionLoopStalled` (26h vs 24h cadence slack — `faas.rules.yml:421`).
+4. **Worst-kind completeness ratio** — recording rule `obs:operator_action_trace_completeness_ratio:5m` (`min(schedd_…)` + `clamp_min(0.001)`).
+
+UID `faas-obs-trace-completeness-pr-1111`. Mirror at
+`deploy/ansible/roles/grafana/files/obs-trace-completeness.json`
+(byte-identical — `make grafana-mirror-check` enforces the contract).
+Companion alerts at
+`deploy/ansible/roles/prometheus/files/faas.rules.yml` under
+`family: obs_trace`:
+
+- `FaasOperatorActionTraceCompletenessLowPage` (page) — `< 0.50` for 10m. Cross-daemon correlation is broken when audit rows lack `trace_id`.
+- `FaasOperatorActionTraceCompletenessLowWarn` (warn) — `< 0.95` for 30m. Above the page threshold but below the contractual floor.
+- `FaasOperatorActionTraceCompletenessLoopStalled` (info) — gauge stale >180s for 5m. Schedd driver goroutine wedged.
+
+All three share `family=obs_trace, component=schedd` so the alertmanager inhibit rule auto-pairs page+warn.
+
+Runbook: `docs/runbooks/FaasOperatorActionTraceCompletenessLow.md`.
+
 ## Provisioning (PR #141, ADR-031)
 
 The canonical install path is `deploy/ansible/roles/grafana/`, which

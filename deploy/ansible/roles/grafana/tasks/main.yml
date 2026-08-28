@@ -245,6 +245,47 @@
     - restart grafana-server
     - reload grafana provisioning
 
+# PR #1111 follow-on (feat/obs-dashboards-alerts) — audit-write
+# fidelity + obs-meta trace completeness dashboards. Closes the
+# operator surface for the two counter surfaces PR #1111 C2
+# landed (`<daemon>_audit_log_write_total{endpoint,kind}`,
+# `<daemon>_audit_log_write_failures_total{endpoint,kind,error_class}`)
+# and the schedd gauge `schedd_operator_action_trace_completeness_ratio{kind}`.
+# UID `faas-audit-write-fidelity-pr-1111` carries 4 panels
+# (writes-by-endpoint stacked, failures-by-error_class stacked,
+# failure ratio with green/yellow/red bands at 0.001/0.01, top-8
+# by kind). UID `faas-obs-trace-completeness-pr-1111` carries 4
+# panels (per-kind ratio timeseries, audit-rate disambiguator —
+# counters the vacuous-truth default of 1.0 for absent kinds,
+# driver loop freshness stat, worst-kind recording-rule stat).
+# Companion alerts live at deploy/ansible/roles/prometheus/files/
+# faas.rules.yml under family: obs_trace (page+warn+info for trace
+# completeness) and family: audit_write (FaasAuditWriteFailuresSpike
+# cross-daemon warn, component=platform — deliberately not paired
+# with the apid-only FaasApidAuditWriteFailures, see the rule's
+# section-header comment).
+- name: grafana — drop audit-write-fidelity dashboard JSON (PR #1111 follow-on)
+  ansible.builtin.copy:
+    src: audit-write-fidelity.json
+    dest: "{{ gv_dashboards_dir }}/audit-write-fidelity.json"
+    owner: grafana
+    group: grafana
+    mode: "0640"
+  notify:
+    - restart grafana-server
+    - reload grafana provisioning
+
+- name: grafana — drop obs-trace-completeness dashboard JSON (PR #1111 follow-on)
+  ansible.builtin.copy:
+    src: obs-trace-completeness.json
+    dest: "{{ gv_dashboards_dir }}/obs-trace-completeness.json"
+    owner: grafana
+    group: grafana
+    mode: "0640"
+  notify:
+    - restart grafana-server
+    - reload grafana provisioning
+
 # ADR-127 §D3 / G19 — bridge wire-protocol framing protection
 # dashboard. Byte-identical copy of deploy/grafana/
 # bridge-protection.json (Makefile:172-185 grafana-mirror-check

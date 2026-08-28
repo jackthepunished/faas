@@ -1,0 +1,291 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Obs-meta trace completeness (PR #1111 / Obs-Meta + Trace-IDs Mega-PR, 5ead9b7cd). Four panels surface the schedd gauge `schedd_operator_action_trace_completeness_ratio{kind}` (set by `pkg/sched/operator_intent_completeness.go::observeOperatorIntentCompleteness` on a 60s tick). CRITICAL: every query filters on `schedd_…` because the gauge IS registered on every daemon (`pkg/wire/metrics.go:3150-3173`) but ONLY schedd's driver calls Set — cross-daemon queries mix real values with never-set/zero defaults on other daemons. Pre-instantiation grid (5 verb-oriented kinds): force_park / force_cold_boot / force_restart / park_instance / restart_instance (pkg/wire/metrics.go::operatorIntentKindClosedSet at line 3135). Runtime driver also writes the .outcome variants and instance aliases — 10 entries total (pkg/sched/operator_intent_completeness.go:160-171). Companion alerts: FaasOperatorActionTraceCompletenessLowPage (page, < 0.50 10m), FaasOperatorActionTraceCompletenessLowWarn (warn, < 0.95 30m), FaasOperatorActionTraceCompletenessLoopStalled (info, gauge stale > 180s). All three share family=obs_trace, component=schedd so the alertmanager inhibit rule auto-pairs page+warn. Runbook: docs/runbooks/FaasOperatorActionTraceCompletenessLow.md. Worst-kind stat panel (id 4) consumes the recording rule `obs:operator_action_trace_completeness_ratio:5m` shipped alongside the alerts (`min(...)` + `clamp_min(0.001)`).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Operator action trace completeness by kind (5m)",
+      "description": "Per-kind ratio time series. clamp_min(0.001) protects the y-axis from the WithLabelValues zero default before the driver's first pass. The vacuous-truth default (=1.0 for absent kinds) means a kind without traffic reads 1.0 here — Panel 2 (audit write rate) is the disambiguator (same precedent as FaasAuditRetentionTableGrowingFasterThanPruned's `volume_rate > 0` precondition at faas.rules.yml:463-469). Threshold bands: green >= 0.95, yellow 0.50-0.95, red < 0.50.",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "clamp_min(schedd_operator_action_trace_completeness_ratio, 0.001)",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.50
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
+            ]
+          },
+          "min": 0,
+          "max": 1.05
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "asc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Operator action audit write rate by kind (denominator)",
+      "description": "Stacked topk(8) of audit-write successes across the closed verb-oriented kinds. Counterpart to Panel 1 — a kind whose gauge sits at 1.0 with non-zero write rate is a real completeness violation; a kind whose gauge sits at 1.0 with flat write rate is a vacuous-truth default.",
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "topk(8, sum by (kind) (rate({__name__=~\".*_audit_log_write_total\"}[5m])))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Driver loop freshness (s, healthy <180)",
+      "description": "time() - timestamp(schedd_operator_action_trace_completeness_ratio). Green < 180s (3x the 60s tick), yellow 180-360s, red >= 360s. Same logic as FaasAuditRetentionLoopStalled (26h vs 24h cadence slack — faas.rules.yml:421). Companion alert: FaasOperatorActionTraceCompletenessLoopStalled (info-tier).",
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "time() - timestamp(schedd_operator_action_trace_completeness_ratio)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 180
+              },
+              {
+                "color": "red",
+                "value": 360
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Worst-kind completeness ratio",
+      "description": "min(schedd_…) across all kinds — the recording rule `obs:operator_action_trace_completeness_ratio:5m` shipped alongside the alerts. Threshold bands: green >= 0.95, yellow 0.50-0.95, red < 0.50. Same thresholds as FaasOperatorActionTraceCompletenessLowPage / LowWarn.",
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "obs:operator_action_trace_completeness_ratio:5m",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0,
+          "max": 1.05,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.50
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "faas",
+    "obs-meta",
+    "trace-completeness",
+    "pr-1111"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "faas obs trace completeness (PR #1111)",
+  "uid": "faas-obs-trace-completeness-pr-1111",
+  "version": 1,
+  "weekStart": ""
+}
