@@ -1,0 +1,118 @@
+# Sign a provider-produced FleetEnrollmentBundle without putting live node
+# addresses or claims in this public repository or in a public release.
+#
+# The bundle is created outside GitHub, stored in private immutable HTTPS
+# storage, and fetched only for the protected production environment. This
+# workflow signs the exact bytes with GitHub OIDC and uploads the detached
+# signature to the private configuration service. The CLI pins this workflow's
+# identity when it accepts a bundle during node adoption.
+
+name: fleet-enrollment
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_url:
+        description: "HTTPS URL of the private FleetEnrollmentBundle YAML"
+        required: true
+        type: string
+      bundle_sha256:
+        description: "sha256:<64 lowercase hex> digest of the exact bundle bytes"
+        required: true
+        type: string
+      signature_upload_url:
+        description: "HTTPS URL where the detached cosign bundle is published once"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sign:
+    name: Sign private fleet enrollment authorization
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLEET_BUNDLE_AUTH_TOKEN: ${{ secrets.FLEET_BUNDLE_AUTH_TOKEN }}
+      FLEET_BUNDLE_PUBLISH_TOKEN: ${{ secrets.FLEET_BUNDLE_PUBLISH_TOKEN }}
+    steps:
+      - name: Check out the signing policy
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go for pinned cosign
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install pinned cosign
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fleet-bundle-tools"
+          GOBIN="$RUNNER_TEMP/fleet-bundle-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+
+      - name: Fetch and digest-check the private bundle
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$BUNDLE_URL" =~ ^https://.+ ]] || {
+            echo "::error::bundle_url must use https://" >&2
+            exit 1
+          }
+          [[ "$BUNDLE_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::bundle_sha256 must match sha256:<64 lowercase hex>" >&2
+            exit 1
+          }
+          [[ -n "$FLEET_BUNDLE_AUTH_TOKEN" ]] || {
+            echo "::error::FLEET_BUNDLE_AUTH_TOKEN is not configured" >&2
+            exit 1
+          }
+          bundle="$RUNNER_TEMP/fleet-enrollment.yaml"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --header "Authorization: Bearer ${FLEET_BUNDLE_AUTH_TOKEN}" \
+            -o "$bundle" "$BUNDLE_URL"
+          actual="sha256:$(sha256sum "$bundle" | awk '{print $1}')"
+          [[ "$actual" == "$BUNDLE_SHA256" ]] || {
+            echo "::error::downloaded bundle digest does not match bundle_sha256" >&2
+            exit 1
+          }
+          echo "FLEET_BUNDLE_PATH=$bundle" >> "$GITHUB_ENV"
+
+      - name: Sign exact bundle bytes with GitHub OIDC
+        run: |
+          set -euo pipefail
+          [[ -n "$FLEET_BUNDLE_PUBLISH_TOKEN" ]] || {
+            echo "::error::FLEET_BUNDLE_PUBLISH_TOKEN is not configured" >&2
+            exit 1
+          }
+          signature="$RUNNER_TEMP/fleet-enrollment.cosign.bundle"
+          "$RUNNER_TEMP/fleet-bundle-tools/cosign" sign-blob --yes \
+            --bundle "$signature" "$FLEET_BUNDLE_PATH"
+          "$RUNNER_TEMP/fleet-bundle-tools/cosign" verify-blob \
+            --bundle "$signature" \
+            --certificate-identity-regexp '^https://github\.com/poyrazK/faas/\.github/workflows/fleet-enrollment\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$FLEET_BUNDLE_PATH"
+          echo "FLEET_BUNDLE_SIGNATURE_PATH=$signature" >> "$GITHUB_ENV"
+
+      - name: Publish detached signature once
+        env:
+          SIGNATURE_UPLOAD_URL: ${{ inputs.signature_upload_url }}
+        run: |
+          set -euo pipefail
+          [[ "$SIGNATURE_UPLOAD_URL" =~ ^https://.+ ]] || {
+            echo "::error::signature_upload_url must use https://" >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --request PUT \
+            --header "Authorization: Bearer ${FLEET_BUNDLE_PUBLISH_TOKEN}" \
+            --header 'If-None-Match: *' \
+            --upload-file "$FLEET_BUNDLE_SIGNATURE_PATH" "$SIGNATURE_UPLOAD_URL"

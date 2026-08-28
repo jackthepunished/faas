@@ -35,6 +35,23 @@ func TestParseAndNormalize(t *testing.T) {
 	}
 }
 
+func TestValidateHostKeyFingerprint(t *testing.T) {
+	valid := "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if err := ValidateHostKeyFingerprint(valid); err != nil {
+		t.Fatalf("valid fingerprint rejected: %v", err)
+	}
+	for _, raw := range []string{
+		"",
+		"MD5:00:11",
+		"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	} {
+		if err := ValidateHostKeyFingerprint(raw); err == nil {
+			t.Errorf("fingerprint %q accepted", raw)
+		}
+	}
+}
+
 func TestParseRejectsUnknownFields(t *testing.T) {
 	_, err := Parse([]byte(validClaim + "unexpected: true\n"))
 	if err == nil || !strings.Contains(err.Error(), "field unexpected not found") {

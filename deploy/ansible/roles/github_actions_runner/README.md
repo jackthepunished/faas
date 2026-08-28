@@ -34,3 +34,9 @@ runner, registers it with the `faas-fleet` label, and starts
 After the service is online, `cd-compute` performs its own GitHub-hosted
 preflight. That preflight checks both the required production environment
 secrets and the online `faas-fleet` label before a deployment job can queue.
+
+The role also creates `{{ faas_runner_enrollment_state | default('/var/lib/faas-runner/fleet-enrollment-used') }}` with mode `0700`.
+The signed `FleetEnrollmentBundle` join path records one marker there after a
+successful activation, so a retried workflow cannot reuse the same signed
+authorization. Keep this directory on durable runner storage; do not place it
+inside `_work` or a disposable container filesystem.

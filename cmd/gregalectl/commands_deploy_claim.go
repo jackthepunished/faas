@@ -16,6 +16,7 @@ type nodeClaimReport struct {
 	SSHHost       string           `json:"ssh_host,omitempty"`
 	SSHUser       string           `json:"ssh_user,omitempty"`
 	SSHPort       int              `json:"ssh_port,omitempty"`
+	HostKeySHA256 string           `json:"host_key_sha256,omitempty"`
 	StorageDevice string           `json:"storage_device,omitempty"`
 	FormatStorage bool             `json:"format_storage,omitempty"`
 	ManifestNode  bool             `json:"manifest_node,omitempty"`
@@ -73,6 +74,7 @@ func cmdDeployClaimValidate(args []string) int {
 		report.SSHHost = n.SSHHost
 		report.SSHUser = n.SSHUser
 		report.SSHPort = n.SSHPort
+		report.HostKeySHA256 = n.HostKeySHA256
 		report.StorageDevice = n.StorageDevice
 		report.FormatStorage = n.FormatStorage
 	}

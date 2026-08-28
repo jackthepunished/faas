@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/nodeclaim"
 	"github.com/onebox-faas/faas/pkg/nodejoin"
 	"github.com/onebox-faas/faas/pkg/pki"
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
@@ -29,36 +30,41 @@ import (
 )
 
 type deployJoinOptions struct {
-	ManifestFile       string
-	Node               string
-	SSHHost            string
-	SSHUser            string
-	SSHPort            int
-	SSHKey             string
-	ReleaseTarball     string
-	ReleaseGitSHA      string
-	BootstrapBinary    string
-	CosignBinary       string
-	PKISource          string
-	SignKeySource      string
-	VerifyKeySource    string
-	ComputeDBEnvSource string
-	StorageEnvSource   string
-	StorageDevice      string
-	FormatStorage      bool
-	BoxAgeKeySource    string
-	RcloneEnvelope     string
-	ArchiveEnvelope    string
-	ArtifactDir        string
-	AnsibleVarsFile    string
-	RepoRoot           string
-	SkipFleetPreflight bool
-	Resume             bool
-	Timeout            time.Duration
-	LeaseTTL           time.Duration
-	DryRun             bool
-	Yes                bool
-	JSON               bool
+	ManifestFile         string
+	Node                 string
+	SSHHost              string
+	SSHUser              string
+	SSHPort              int
+	SSHHostKeySHA256     string
+	SSHKey               string
+	FleetBundleFile      string
+	FleetBundleSignature string
+	FleetReplayState     string
+	SSHKnownHostsFile    string
+	ReleaseTarball       string
+	ReleaseGitSHA        string
+	BootstrapBinary      string
+	CosignBinary         string
+	PKISource            string
+	SignKeySource        string
+	VerifyKeySource      string
+	ComputeDBEnvSource   string
+	StorageEnvSource     string
+	StorageDevice        string
+	FormatStorage        bool
+	BoxAgeKeySource      string
+	RcloneEnvelope       string
+	ArchiveEnvelope      string
+	ArtifactDir          string
+	AnsibleVarsFile      string
+	RepoRoot             string
+	SkipFleetPreflight   bool
+	Resume               bool
+	Timeout              time.Duration
+	LeaseTTL             time.Duration
+	DryRun               bool
+	Yes                  bool
+	JSON                 bool
 }
 
 type deployJoinReport struct {
@@ -108,9 +114,13 @@ func cmdDeployJoinNode(args []string) int {
 	manifestFile := fs.String("manifest-file", "", "split-box manifest containing the new compute-only node (required)")
 	node := fs.String("node", "", "manifest host name to adopt (required)")
 	sshHost := fs.String("ssh-host", "", "SSH address of the already-created machine (required; provider boundary)")
-	sshUser := fs.String("ssh-user", "root", "SSH user for the adopted machine")
-	sshPort := fs.Int("ssh-port", 22, "SSH port for the adopted machine")
+	sshUser := fs.String("ssh-user", "", "SSH user for the adopted machine (default: root without --fleet-bundle-file)")
+	sshPort := fs.Int("ssh-port", 0, "SSH port for the adopted machine (default: 22 without --fleet-bundle-file)")
+	sshHostKey := fs.String("ssh-host-key-sha256", "", "expected OpenSSH SHA256 host-key fingerprint")
 	sshKey := fs.String("ssh-key", "", "optional SSH private key used by Ansible")
+	fleetBundleFile := fs.String("fleet-bundle-file", "", "signed FleetEnrollmentBundle YAML/JSON authorization")
+	fleetBundleSignature := fs.String("fleet-bundle-signature", "", "detached cosign signature for --fleet-bundle-file")
+	fleetReplayState := fs.String("fleet-replay-state", "", "durable single-use enrollment state directory (required with --fleet-bundle-file for apply)")
 	releaseTarball := fs.String("release-tarball", "", "signed release.tar.gz (required for apply)")
 	releaseGitSHA := fs.String("release-git-sha", "", "optional signed release SHA override when the manifest still points at the prior release")
 	bootstrapBinary := fs.String("bootstrap-binary", "", "Linux/amd64 gregalectl used before the release is installed (required for apply)")
@@ -144,41 +154,57 @@ func cmdDeployJoinNode(args []string) int {
 	}
 
 	opts := deployJoinOptions{
-		ManifestFile:       *manifestFile,
-		Node:               *node,
-		SSHHost:            *sshHost,
-		SSHUser:            *sshUser,
-		SSHPort:            *sshPort,
-		SSHKey:             *sshKey,
-		ReleaseTarball:     *releaseTarball,
-		ReleaseGitSHA:      *releaseGitSHA,
-		BootstrapBinary:    *bootstrapBinary,
-		CosignBinary:       *cosignBinary,
-		PKISource:          *pkiSource,
-		SignKeySource:      *signKey,
-		VerifyKeySource:    *verifyKey,
-		ComputeDBEnvSource: *computeDBEnv,
-		StorageEnvSource:   *storageEnv,
-		StorageDevice:      *storageDevice,
-		FormatStorage:      *formatStorage,
-		BoxAgeKeySource:    *boxAgeKey,
-		RcloneEnvelope:     *rcloneEnvelope,
-		ArchiveEnvelope:    *archiveEnvelope,
-		ArtifactDir:        *artifactDir,
-		AnsibleVarsFile:    *ansibleVars,
-		RepoRoot:           *repoRoot,
-		SkipFleetPreflight: *skipPreflight,
-		Resume:             *resume,
-		Timeout:            *timeout,
-		LeaseTTL:           *leaseTTL,
-		DryRun:             *dryRun,
-		Yes:                *yes,
-		JSON:               *jsonOut || jsonOutput,
+		ManifestFile:         *manifestFile,
+		Node:                 *node,
+		SSHHost:              *sshHost,
+		SSHUser:              *sshUser,
+		SSHPort:              *sshPort,
+		SSHHostKeySHA256:     *sshHostKey,
+		SSHKey:               *sshKey,
+		FleetBundleFile:      *fleetBundleFile,
+		FleetBundleSignature: *fleetBundleSignature,
+		FleetReplayState:     *fleetReplayState,
+		ReleaseTarball:       *releaseTarball,
+		ReleaseGitSHA:        *releaseGitSHA,
+		BootstrapBinary:      *bootstrapBinary,
+		CosignBinary:         *cosignBinary,
+		PKISource:            *pkiSource,
+		SignKeySource:        *signKey,
+		VerifyKeySource:      *verifyKey,
+		ComputeDBEnvSource:   *computeDBEnv,
+		StorageEnvSource:     *storageEnv,
+		StorageDevice:        *storageDevice,
+		FormatStorage:        *formatStorage,
+		BoxAgeKeySource:      *boxAgeKey,
+		RcloneEnvelope:       *rcloneEnvelope,
+		ArchiveEnvelope:      *archiveEnvelope,
+		ArtifactDir:          *artifactDir,
+		AnsibleVarsFile:      *ansibleVars,
+		RepoRoot:             *repoRoot,
+		SkipFleetPreflight:   *skipPreflight,
+		Resume:               *resume,
+		Timeout:              *timeout,
+		LeaseTTL:             *leaseTTL,
+		DryRun:               *dryRun,
+		Yes:                  *yes,
+		JSON:                 *jsonOut || jsonOutput,
+	}
+	if opts.FleetBundleFile == "" {
+		if opts.SSHUser == "" {
+			opts.SSHUser = "root"
+		}
+		if opts.SSHPort == 0 {
+			opts.SSHPort = 22
+		}
 	}
 	if opts.RepoRoot == "" {
 		opts.RepoRoot = defaultRepoRoot()
 	}
 	resolveJoinArtifacts(&opts)
+	if err := resolveFleetBundleInputs(&opts); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl deploy join-node: %v\n", err)
+		return 1
+	}
 	if !opts.DryRun && opts.Yes {
 		if code, handled := maybeBootstrapReleaseCLIFromTarball(opts.ReleaseTarball, opts.ReleaseGitSHA); handled {
 			return code
@@ -203,6 +229,10 @@ func cmdDeployJoinNode(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl deploy join-node: %v\n", err)
 		return code
+	}
+	if err := markFleetBundleConsumed(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl deploy join-node: %v\n", err)
+		return 3
 	}
 	return emitDeployJoinReport(report, true, opts.JSON)
 }
@@ -365,6 +395,11 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 	if opts.SSHPort < 1 || opts.SSHPort > 65535 {
 		return report, fmt.Errorf("--ssh-port %d is outside 1..65535", opts.SSHPort)
 	}
+	if opts.SSHHostKeySHA256 != "" {
+		if err := nodeclaim.ValidateHostKeyFingerprint(opts.SSHHostKeySHA256); err != nil {
+			return report, fmt.Errorf("--ssh-host-key-sha256: %w", err)
+		}
+	}
 	if opts.StorageDevice != "" && !filepath.IsAbs(opts.StorageDevice) {
 		return report, fmt.Errorf("--storage-device %q must be an absolute device path", opts.StorageDevice)
 	}
@@ -516,6 +551,13 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		return 3, fmt.Errorf("create temporary inventory: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tempRoot) }()
+	if opts.SSHHostKeySHA256 != "" {
+		knownHostsPath := filepath.Join(tempRoot, "known_hosts")
+		if err := verifySSHHostKey(ctx, *opts, knownHostsPath); err != nil {
+			return 3, fmt.Errorf("verify SSH host key: %w", err)
+		}
+		opts.SSHKnownHostsFile = knownHostsPath
+	}
 
 	m, err := manifest.Load(opts.ManifestFile)
 	if err != nil {
@@ -790,6 +832,46 @@ func validateComputeTargetURL(raw string) error {
 	return nil
 }
 
+// verifySSHHostKey resolves the provider connection address once and pins the
+// observed key to the fingerprint authorized by the signed enrollment
+// bundle. The resulting known_hosts file is passed to Ansible with strict
+// checking enabled; no operator workstation state is implicitly trusted.
+func verifySSHHostKey(ctx context.Context, opts deployJoinOptions, knownHostsPath string) error {
+	if opts.SSHHostKeySHA256 == "" {
+		return nil
+	}
+	keyscan := exec.CommandContext(ctx, "ssh-keyscan", "-T", "10", "-p", strconv.Itoa(opts.SSHPort), opts.SSHHost)
+	keys, err := keyscan.Output()
+	if err != nil {
+		return fmt.Errorf("ssh-keyscan %s:%d: %w", opts.SSHHost, opts.SSHPort, err)
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("ssh-keyscan %s:%d returned no host keys", opts.SSHHost, opts.SSHPort)
+	}
+	if err := os.WriteFile(knownHostsPath, keys, 0o600); err != nil {
+		return fmt.Errorf("write temporary known_hosts: %w", err)
+	}
+	fingerprint := exec.CommandContext(ctx, "ssh-keygen", "-lf", knownHostsPath, "-E", "sha256")
+	fingerprints, err := fingerprint.Output()
+	if err != nil {
+		return fmt.Errorf("ssh-keygen fingerprint: %w", err)
+	}
+	if fingerprintMatches(string(fingerprints), opts.SSHHostKeySHA256) {
+		return nil
+	}
+	return fmt.Errorf("observed host key fingerprint does not match signed %s", opts.SSHHostKeySHA256)
+}
+
+func fingerprintMatches(output, expected string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 1 && fields[1] == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func pointerString(v *string) string {
 	if v == nil {
 		return "<nil>"
@@ -932,6 +1014,9 @@ func overrideJoinHostVars(body []byte, opts *deployJoinOptions) []byte {
 	}
 	if opts.SSHKey != "" {
 		lines = append(lines, "ansible_ssh_private_key_file: "+yamlQuote(opts.SSHKey))
+	}
+	if opts.SSHKnownHostsFile != "" {
+		lines = append(lines, "ansible_ssh_common_args: "+yamlQuote("-o UserKnownHostsFile="+opts.SSHKnownHostsFile+" -o StrictHostKeyChecking=yes"))
 	}
 	return []byte(strings.Join(lines, "\n"))
 }
