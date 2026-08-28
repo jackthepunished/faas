@@ -30,7 +30,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -45,7 +44,6 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/releasebundle"
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
-	"github.com/onebox-faas/faas/pkg/secretbox"
 )
 
 // doctorFindingsCap caps the number of findings emitted per run.
@@ -928,7 +926,7 @@ func rollupError(findings []doctorFinding) int {
 // secret posture matches the row's stored cert_fingerprint. The
 // check is fs-only at its core (no DB required); the DB is
 // consulted only AFTER the on-disk side passes, to compare the
-// recomputed host.age fingerprint against the stamped value on
+// vmmd TLS leaf fingerprint against the stamped value on
 // compute_nodes.cert_fingerprint.
 //
 // The check runs on every box (no --deep flag) — secrets drift
@@ -1357,22 +1355,17 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			Detail:   "register the node before running the node-scoped doctor",
 		}), nil
 	}
-	hostAgeID, loadErr := secretbox.LoadHostKey("/etc/faas/secrets/host.age")
-	if loadErr != nil {
-		// Already surfaced above as a "missing host.age"
-		// finding; skip the per-row fingerprint walk because
-		// every row would mismatch. Propagate loadErr so
-		// runCheck's existing error→finding synthesis picks
-		// it up (the missing-file finding is also added
-		// above as a side-channel for the operator).
-		return findings, fmt.Errorf("load host.age: %w", loadErr)
+	_, got, certErr := loadComputeNodeCertificateAttestation()
+	if certErr != nil {
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityError,
+			Target:   deps.nodeFilter,
+			Message:  "vmmd server certificate attestation unavailable",
+			Detail:   certErr.Error(),
+		})
+		return findings, fmt.Errorf("load vmmd server certificate: %w", certErr)
 	}
-	// The DB stores the public host certificate (the age recipient string),
-	// not the private identity file bytes. Hash the same public value that
-	// `secrets init` stamps; hashing host.age's private text made every valid
-	// initialization look drifted.
-	sum := sha256.Sum256([]byte(secretbox.RecipientString(hostAgeID)))
-	got := hex.EncodeToString(sum[:])
 	for _, n := range scoped {
 		if n.CertFingerprint == nil {
 			continue

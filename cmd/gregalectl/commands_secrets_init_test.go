@@ -238,6 +238,19 @@ func TestSecretsInit_PreserveExisting(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "storage-box", "rclone.conf")); err != nil {
 		t.Fatalf("remove rclone.conf: %v", err)
 	}
+	// A retry must repair permissions on preserved files as well as recreate
+	// files that are missing. This catches hosts whose previous bootstrap
+	// wrote the files with the shared-daemon 0440 mode.
+	for _, p := range []string{
+		filepath.Join(dir, "host.age"),
+		filepath.Join(dir, "session.key"),
+		filepath.Join(dir, "storage-box", "box-age-key"),
+		filepath.Join(dir, "storage-box", "archive-creds.json"),
+	} {
+		if err := os.Chmod(p, 0o440); err != nil {
+			t.Fatalf("loosen preserved mode for %s: %v", p, err)
+		}
+	}
 	if out, err := runSecretsInit(t, dir, []string{"--preserve-existing"}); err != nil {
 		t.Fatalf("preserve retry: %v (out=%s)", err, out)
 	}
@@ -252,8 +265,22 @@ func TestSecretsInit_PreserveExisting(t *testing.T) {
 		filepath.Join(dir, "session.key"),
 		filepath.Join(dir, "storage-box", "rclone.conf"),
 	} {
-		if _, err := os.Stat(p); err != nil {
+		info, err := os.Stat(p)
+		if err != nil {
 			t.Errorf("preserve retry did not recreate %s: %v", p, err)
+		} else if got := info.Mode().Perm(); got != 0o400 {
+			t.Errorf("preserve retry mode for %s = %#o, want 0400", p, got)
+		}
+	}
+	for _, p := range []string{
+		filepath.Join(dir, "host.age"),
+		filepath.Join(dir, "storage-box", "box-age-key"),
+		filepath.Join(dir, "storage-box", "archive-creds.json"),
+	} {
+		if info, err := os.Stat(p); err != nil {
+			t.Errorf("preserve retry missing %s: %v", p, err)
+		} else if got := info.Mode().Perm(); got != 0o400 {
+			t.Errorf("preserve retry mode for %s = %#o, want 0400", p, got)
 		}
 	}
 }

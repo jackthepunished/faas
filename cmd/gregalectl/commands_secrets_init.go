@@ -16,18 +16,17 @@
 //   - init   — write host.age/box-age-key/session.key/rclone.conf/
 //              archive-creds as a single batch. Refuses overwrite
 //              unless --force is passed, or --preserve-existing is
-//              used by an idempotent deployment retry. After host.age succeeds,
-//              computes the PEM fingerprint and stamps
+//              used by an idempotent deployment retry. When a vmmd
+//              TLS leaf and FAAS_PG_DSN are available, stamps
 //              compute_nodes.{host_certificate, cert_fingerprint}
-//              when FAAS_PG_DSN is set (soft warning on
-//              connectivity failure).
+//              (soft warning on connectivity failure).
 //   - rotate — host.age-only rotation (mirrors `host-age rotate`;
 //              the other four secrets are not rotated through this
 //              leaf — they have their own rotation runbooks).
 //   - status — print mode/mtime/sha256 for each of the five files.
 //              Missing files print an explicit "missing" line and
 //              the leaf returns 0 (operator should see all paths).
-//   - stamp — read the existing host.age without changing it and persist
+//   - stamp — read the existing vmmd TLS leaf without changing it and persist
 //             compute_nodes.host_certificate + cert_fingerprint. This is
 //             the repair path for a node that was bootstrapped before the
 //             database row existed; it never rotates or overwrites secrets.
@@ -121,8 +120,8 @@ const subSecretsStamp = "stamp"
 // host is the PostgreSQL compute_nodes.name lookup key.
 // The role column is intentionally NOT here — the renderer
 // (Commit 2) writes compute_nodes.role, not secrets init.
-// --no-db is used by provider-neutral compute joins that must preserve the
-// VMMD TLS fingerprint already registered for an adopted host.
+// --no-db is useful for file-only/local bootstrap flows that intentionally
+// defer the compute_nodes attestation write.
 type secretsInitFlags struct {
 	dir              string
 	force            bool
@@ -144,11 +143,9 @@ func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secret
 	return fs, f
 }
 
-// cmdSecretsInit writes the four secrets as a single batch. Order
-// matters: host.age must be written FIRST so its PEM fingerprint
-// can be computed + stamped before the loader refuses to overwrite
-// the other three. The other three are independent of host.age
-// (separate identities / keys), so their order is cosmetic.
+// cmdSecretsInit writes the five secrets as a single batch. host.age is
+// written first because it is the load-bearing sealed-secret identity; the
+// compute-node attestation is read from the independent vmmd TLS leaf below.
 func cmdSecretsInit(args []string) int {
 	fs, f := newSecretsInitFlags("secrets init", false)
 	if err := fs.Parse(args); err != nil {
@@ -180,16 +177,14 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 		return fmt.Errorf("mkdir storage dir %s: %w", storageDir, err)
 	}
 
-	// Step 1: host.age (0400 root:root). The identity is loaded
-	// back from disk so we can compute the public recipient for
-	// the cert_fingerprint write.
+	// Step 1: host.age (0400 root:root). The identity is preserved
+	// across deployment retries, but it is not the compute-node TLS
+	// certificate and must not be used for cert_fingerprint.
 	hostAgePath := filepath.Join(f.dir, "host.age")
-	hostAgeID, err := writeOrLoadHostAge(hostAgePath, f.force, f.preserveExisting)
+	_, err := writeOrLoadHostAge(hostAgePath, f.force, f.preserveExisting)
 	if err != nil {
 		return err
 	}
-	hostCertPEM := []byte(secretbox.RecipientString(hostAgeID))
-	hostCertFP := sha256Hex(hostCertPEM)
 
 	// Step 2: box-age-key (0400 root:root). The on-disk
 	// content is the X25519 identity (mirrors what cmdBackup
@@ -230,9 +225,10 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	}
 
 	// Step 6: stamp compute_nodes.{host_certificate,
-	// cert_fingerprint} when FAAS_PG_DSN is set. The doctor's
-	// secrets check (Commit 4) reads this row to verify the
-	// on-disk host.age matches the stamped PEM.
+	// cert_fingerprint} when FAAS_PG_DSN is set. The database
+	// attestation is the vmmd mTLS leaf, matching vmmd's startup
+	// guard and the doctor's drift check. host.age is a separate
+	// customer-secret encryption identity.
 	host := f.host
 	if host == "" {
 		h, herr := os.Hostname()
@@ -246,7 +242,10 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 		dsn = resolveSecretsDSN()
 	}
 	if dsn != "" && !f.noDB {
-		if err := writeComputeNodeCert(dsn, host, hostCertPEM, hostCertFP, stdout); err != nil {
+		hostCertPEM, hostCertFP, certErr := loadComputeNodeCertificateAttestation()
+		if certErr != nil {
+			_, _ = fmt.Fprintf(stdout, "warning: compute node certificate attestation unavailable: %v\n", certErr)
+		} else if err := writeComputeNodeCert(dsn, host, hostCertPEM, []byte(hostCertFP), stdout); err != nil {
 			// Soft warning — the file writes succeeded; the DB
 			// write is a downstream signal the doctor will
 			// detect on the next run.
@@ -285,24 +284,29 @@ func cmdSecretsStamp(args []string) int {
 	if hostName == "" {
 		hostName, _ = os.Hostname()
 	}
-	PrintOK(osStdout, "Stamped existing host.age fingerprint for compute node %s (no secret files changed)\n", hostName)
+	PrintOK(osStdout, "Stamped existing vmmd TLS certificate for compute node %s (no secret files changed)\n", hostName)
 	return 0
 }
 
-// stampExistingHostCertificate loads the existing private host.age identity,
-// derives its stable public recipient fingerprint, and writes only the two
-// database audit columns. The host.age bytes are never rewritten.
+// stampExistingHostCertificate verifies that host.age still exists, then
+// loads the existing public vmmd TLS leaf and writes only the two database
+// audit columns. Neither secret files nor certificates are rewritten.
 func stampExistingHostCertificate(f *secretsStampFlags) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("secrets stamp: requires root to read host.age (run with sudo or as the root user)")
 	}
 	hostAgePath := filepath.Join(f.dir, "host.age")
-	hostAgeID, err := secretbox.LoadHostKey(hostAgePath)
+	_, err := secretbox.LoadHostKey(hostAgePath)
 	if err != nil {
 		return fmt.Errorf("load existing host.age: %w", err)
 	}
-	hostCert := []byte(secretbox.RecipientString(hostAgeID))
-	fingerprint := sha256Hex(hostCert)
+	// Keep the host.age existence check above: a node without its sealed-secret
+	// identity is not a valid deployment target. The database certificate
+	// attestation itself, however, must be the mTLS leaf that vmmd presents.
+	hostCert, fingerprint, err := loadComputeNodeCertificateAttestation()
+	if err != nil {
+		return fmt.Errorf("load vmmd server certificate: %w", err)
+	}
 	host := f.host
 	if host == "" {
 		host, err = os.Hostname()
@@ -317,7 +321,7 @@ func stampExistingHostCertificate(f *secretsStampFlags) error {
 	if dsn == "" {
 		return fmt.Errorf("database DSN not set (use --pg-dsn, FAAS_PG_DSN, DATABASE_URL, or a deploy env file)")
 	}
-	if err := writeComputeNodeCert(dsn, host, hostCert, fingerprint, osStdout); err != nil {
+	if err := writeComputeNodeCert(dsn, host, hostCert, []byte(fingerprint), osStdout); err != nil {
 		return err
 	}
 	return nil
@@ -351,9 +355,7 @@ func enforceFileMode(path string, mode os.FileMode) error {
 }
 
 // writeHostAge calls secretbox.GenerateAndSaveHostKey to write a
-// fresh X25519 identity with mode 0400. The returned identity is
-// the in-memory recipient (RecipientString) that callers use to
-// compute the PEM fingerprint for compute_nodes.cert_fingerprint.
+// fresh X25519 identity with mode 0400.
 func writeHostAge(path string, force bool) (*age.X25519Identity, error) {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
@@ -382,6 +384,9 @@ func writeOrLoadHostAge(path string, force, preserveExisting bool) (*age.X25519I
 			if loadErr != nil {
 				return nil, fmt.Errorf("load existing host.age %s: %w", path, loadErr)
 			}
+			if modeErr := enforceFileMode(path, 0o400); modeErr != nil {
+				return nil, modeErr
+			}
 			return id, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("stat %s: %w", path, err)
@@ -398,7 +403,7 @@ func writeOrLoadHostAge(path string, force, preserveExisting bool) (*age.X25519I
 func writeBoxAgeKey(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
-			return nil
+			return enforceFileMode(path, 0o400)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
@@ -425,7 +430,7 @@ func writeBoxAgeKey(path string, force, preserveExisting bool) error {
 func writeSessionKey(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
-			return nil
+			return enforceFileMode(path, 0o400)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
@@ -459,7 +464,7 @@ func writeSessionKey(path string, force, preserveExisting bool) error {
 func writeRcloneStub(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
-			return nil
+			return enforceFileMode(path, 0o400)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
@@ -489,7 +494,7 @@ func writeRcloneStub(path string, force, preserveExisting bool) error {
 func writeArchiveStub(path string, force, preserveExisting bool) error {
 	if preserveExisting {
 		if _, err := os.Stat(path); err == nil {
-			return nil
+			return enforceFileMode(path, 0o400)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
