@@ -122,6 +122,7 @@ from .build_response_kind import BuildResponseKind
 from .build_response_status import BuildResponseStatus
 from .canary_preset_spec import CanaryPresetSpec
 from .canary_preset_spec_preset import CanaryPresetSpecPreset
+from .canary_stage import CanaryStage
 from .change_member_role_request import ChangeMemberRoleRequest
 from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
@@ -199,13 +200,13 @@ from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
-from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
+from .deployment_audit_response import DeploymentAuditResponse
+from .deployment_audit_response_kind import DeploymentAuditResponseKind
 from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
 from .deployment_liveness_probe import DeploymentLivenessProbe
 from .deployment_preview_url import DeploymentPreviewURL
 from .deployment_response import DeploymentResponse
-from .deployment_response_canary_preset import DeploymentResponseCanaryPreset
 from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
@@ -220,7 +221,6 @@ from .deployment_response_override_env_secret_refs import DeploymentResponseOver
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
-from .deployment_response_rollout_state import DeploymentResponseRolloutState
 from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
 from .diff_app_config_patch_app_protocol import DiffAppConfigPatchAppProtocol
@@ -351,6 +351,7 @@ from .kafka_trigger_config import KafkaTriggerConfig
 from .list_audit_events_response import ListAuditEventsResponse
 from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
+from .list_deployment_audit_response import ListDeploymentAuditResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
@@ -379,11 +380,6 @@ from .mirror_rule_list_response import MirrorRuleListResponse
 from .mirror_rule_response import MirrorRuleResponse
 from .mirror_summary_response import MirrorSummaryResponse
 from .o_auth_provider_capability import OAuthProviderCapability
-from .obs_health_response import ObsHealthResponse
-from .obs_health_response_operator_intent_outcome_missing_total import (
-    ObsHealthResponseOperatorIntentOutcomeMissingTotal,
-)
-from .obs_health_response_trace_id_completeness_ratio import ObsHealthResponseTraceIdCompletenessRatio
 from .oidc_exchange_request import OIDCExchangeRequest
 from .oidc_exchange_response import OIDCExchangeResponse
 from .operator_intent_accepted_response import OperatorIntentAcceptedResponse
@@ -729,6 +725,7 @@ __all__ = (
     "BuildResponseStatus",
     "CanaryPresetSpec",
     "CanaryPresetSpecPreset",
+    "CanaryStage",
     "ChangeMemberRoleRequest",
     "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
@@ -802,13 +799,13 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
-    "DeleteDeploymentScopeExclusionResponse200",
+    "DeploymentAuditResponse",
+    "DeploymentAuditResponseKind",
     "DeploymentHealthcheck",
     "DeploymentListResponse",
     "DeploymentLivenessProbe",
     "DeploymentPreviewURL",
     "DeploymentResponse",
-    "DeploymentResponseCanaryPreset",
     "DeploymentResponseDeployedViaType1",
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
@@ -819,7 +816,6 @@ __all__ = (
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
-    "DeploymentResponseRolloutState",
     "DeploymentResponseTag",
     "DiffAppConfigPatch",
     "DiffAppConfigPatchAppProtocol",
@@ -950,6 +946,7 @@ __all__ = (
     "ListAuditEventsResponse",
     "ListAuditLogResponse",
     "ListCronRunsResponse",
+    "ListDeploymentAuditResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
     "ListOperatorRuntimeConfigResponse200",
@@ -978,9 +975,6 @@ __all__ = (
     "MirrorRuleResponse",
     "MirrorSummaryResponse",
     "OAuthProviderCapability",
-    "ObsHealthResponse",
-    "ObsHealthResponseOperatorIntentOutcomeMissingTotal",
-    "ObsHealthResponseTraceIdCompletenessRatio",
     "OIDCExchangeRequest",
     "OIDCExchangeResponse",
     "OperatorIntentAcceptedResponse",
