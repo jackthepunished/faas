@@ -186,6 +186,11 @@ jobs:
           umask 077
           printf '%s\n' "$COMPUTE_SSH_KEY" > "$ARTIFACT_DIR/compute-ssh-key"
           printf '%s\n' "DATABASE_URL=$COMPUTE_DATABASE_URL" > "$ARTIFACT_DIR/compute-db.env"
+          # vmmd intentionally reads its explicit split-box override while
+          # the operator CLI and the other compute daemons use DATABASE_URL.
+          # Keep both names in the same root-only file so a new node cannot
+          # pass the CLI preflight and then fail closed during vmmd startup.
+          printf '%s\n' "FAAS_VMMD_DBURL=$COMPUTE_DATABASE_URL" >> "$ARTIFACT_DIR/compute-db.env"
           printf '%s\n' "$COMPUTE_STORAGE_ENV" > "$ARTIFACT_DIR/storage.env"
           printf '%s\n' "$COMPUTE_SIGN_KEY" > "$ARTIFACT_DIR/sign.key"
           printf '%s\n' "$COMPUTE_VERIFY_KEY" > "$ARTIFACT_DIR/sign-pub.pem"

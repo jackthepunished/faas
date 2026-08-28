@@ -105,10 +105,10 @@ sudo gregalectl secrets stamp \
   --pg-dsn "$FAAS_PG_DSN"
 ```
 
-`secrets stamp` reads the existing identity, derives the public recipient
-fingerprint, and updates only the two database audit columns. It never
-regenerates or overwrites `host.age`; do not use `secrets init --force` for
-this repair.
+`secrets stamp` reads the existing vmmd server certificate, derives the
+canonical `sha256:` DER fingerprint, and updates only the two database audit
+columns. It never regenerates or overwrites `host.age` or the certificate; do
+not use `secrets init --force` for this repair.
 
 - **`/etc/faas/secrets/host.age`** — sealed customer-secret box
   keypair (ADR-020, ADR-057). Rotated only under incident response
