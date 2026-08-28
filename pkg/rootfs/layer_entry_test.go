@@ -44,6 +44,43 @@ func TestApplyEntry_TypeRegTruncatesExisting(t *testing.T) {
 	}
 }
 
+func TestApplyEntry_TypeRegReplacesExistingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(dir, "outside")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "bin", "dmesg")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr := &tar.Header{Name: "bin/dmesg", Mode: 0o755, Typeflag: tar.TypeReg, Size: 3}
+	if err := applyEntry(dir, target, hdr, strings.NewReader("new")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Errorf("body = %q, want new", got)
+	}
+	if info, err := os.Lstat(target); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("regular layer entry left the previous symlink in place")
+	}
+	if got, err := os.ReadFile(outside); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "outside" {
+		t.Errorf("symlink target was modified: %q", got)
+	}
+}
+
 func TestApplyEntry_SymlinkAbsoluteTargetIsVerbatim(t *testing.T) {
 	// A header whose Linkname is absolute is written VERBATIM — the string
 	// is guest-side data, resolved by the guest kernel once the ext4 is

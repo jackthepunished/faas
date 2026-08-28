@@ -85,6 +85,19 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
+		// A later OCI layer may replace a symlink from a lower layer with a
+		// regular file. Remove the link before opening the destination so
+		// OpenFile cannot follow its guest-side target into the host filesystem
+		// (for example /bin/busybox under systemd ProtectSystem=strict).
+		if info, err := os.Lstat(target); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				if err := os.Remove(target); err != nil {
+					return fmt.Errorf("rootfs: replace symlink %s: %w", target, err)
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("rootfs: inspect existing entry %s: %w", target, err)
+		}
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&os.ModePerm)
 		if err != nil {
 			return err
