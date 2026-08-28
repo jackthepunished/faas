@@ -146,7 +146,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// abuse-floor tier carries no per-request telemetry,
 			// no retention, no rate budget. Handler returns 402
 			// ErrPlanFeatureGated before the store is touched.
-			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0, PerAppMetricsAllowed: false, AppUsageSummaryAllowed: false, AppErrorsAllowed: false},
+			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0, PerAppMetricsAllowed: false, AppUsageSummaryAllowed: false, AppErrorsAllowed: false,
+			// ADR-124: Free keeps cancel + clear-obsolete; reorder
+			// stays plan-gated (Free=false).
+			QueueControlsAllowed: false, MaxQueuedDeploysPerApp: 2, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -293,7 +296,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// retention (matches log-archive retention), 1000
 			// req/min ingest, 10 deployments max in the histogram
 			// (small Hobby app), 50 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50, OpenAPIImportsPerAccount: 1000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50, OpenAPIImportsPerAccount: 1000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
+			// ADR-124: Hobby = first paid tier with reorder enabled.
+			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 5, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -436,7 +441,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-127: Pro = "this month" debugger surface — 7-day
 			// retention, 10000 req/min ingest, 50 deployments in
 			// the histogram, 200 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
+			// ADR-124: Pro mirrors Hobby for queue controls.
+			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 10, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, CertExpiryWarningDays: 30, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -592,7 +599,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// cap, a fleet with thousands of historical deployments
 			// would blow up Prometheus cardinality), 1000 spans per
 			// trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true},
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000, OpenAPIImportsPerAccount: 10000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
+			// ADR-124: Scale gets the highest queue depth (25) and
+			// the same 60/h reorder budget as Hobby/Pro.
+			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 25, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
