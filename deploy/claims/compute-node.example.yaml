@@ -1,0 +1,18 @@
+# Provider-neutral handoff for an already-created compute machine.
+#
+# This file contains no Gregale secrets and no runtime daemon endpoints.
+# Commit a real claim with the topology change before creating the release
+# that will consume it, or keep it in the short-lived operator workspace for
+# the direct CLI path.
+api_version: gregale.dev/v1alpha1
+kind: ComputeNodeClaim
+metadata:
+  name: fsn-4
+spec:
+  ssh:
+    host: 203.0.113.27
+    user: root
+    port: 22
+  storage:
+    device: /dev/disk/by-id/provider-stable-data-disk
+    format: false

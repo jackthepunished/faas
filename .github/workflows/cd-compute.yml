@@ -19,13 +19,20 @@ on:
         description: "Existing signed pre-1.0 release tag (for example v0.1.18-rc.5)"
         required: true
         type: string
+      claim_file:
+        description: "Path to a ComputeNodeClaim in the selected release source (preferred; replaces node/SSH/storage fields)"
+        required: false
+        default: ""
+        type: string
       node:
-        description: "Manifest fleet.hosts[].name to adopt or roll"
-        required: true
+        description: "Legacy: manifest fleet.hosts[].name to adopt or roll (omit when claim_file is supplied)"
+        required: false
+        default: ""
         type: string
       ssh_host:
-        description: "Provider SSH address for this run; never becomes the runtime endpoint"
-        required: true
+        description: "Legacy: provider SSH address for this run; never becomes the runtime endpoint"
+        required: false
+        default: ""
         type: string
       ssh_user:
         description: "SSH user on the already-created host"
@@ -49,7 +56,7 @@ on:
         type: boolean
 
 concurrency:
-  group: cd-compute-${{ inputs.node }}
+  group: cd-compute-${{ inputs.node || inputs.claim_file }}
   cancel-in-progress: false
 
 permissions:
@@ -62,6 +69,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 5
+    outputs:
+      node: ${{ steps.resolve_claim.outputs.node || steps.resolve_legacy.outputs.node }}
+      ssh_host: ${{ steps.resolve_claim.outputs.ssh_host || steps.resolve_legacy.outputs.ssh_host }}
+      ssh_user: ${{ steps.resolve_claim.outputs.ssh_user || steps.resolve_legacy.outputs.ssh_user }}
+      ssh_port: ${{ steps.resolve_claim.outputs.ssh_port || steps.resolve_legacy.outputs.ssh_port }}
+      storage_device: ${{ steps.resolve_claim.outputs.storage_device || steps.resolve_legacy.outputs.storage_device }}
+      format_storage: ${{ steps.resolve_claim.outputs.format_storage || steps.resolve_legacy.outputs.format_storage }}
     env:
       COMPUTE_SSH_KEY: ${{ secrets.COMPUTE_SSH_KEY }}
       COMPUTE_DATABASE_URL: ${{ secrets.COMPUTE_DATABASE_URL }}
@@ -72,6 +86,7 @@ jobs:
     steps:
       - name: Validate requested node inputs
         env:
+          CLAIM_FILE: ${{ inputs.claim_file }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           NODE: ${{ inputs.node }}
           SSH_HOST: ${{ inputs.ssh_host }}
@@ -81,14 +96,78 @@ jobs:
             echo "::error::release_tag must be a release tag, got $RELEASE_TAG" >&2
             exit 1
           }
-          [[ "$NODE" =~ ^[A-Za-z0-9._-]+$ ]] || {
-            echo "::error::node contains unsupported characters" >&2
+          if [[ -n "$CLAIM_FILE" ]]; then
+            [[ "$CLAIM_FILE" =~ ^[A-Za-z0-9._/-]+\.ya?ml$ && "$CLAIM_FILE" != /* && "$CLAIM_FILE" != *..* ]] || {
+              echo "::error::claim_file must be a relative YAML path without parent traversal" >&2
+              exit 1
+            }
+          else
+            [[ "$NODE" =~ ^[A-Za-z0-9._-]+$ ]] || {
+              echo "::error::node contains unsupported characters when claim_file is omitted" >&2
+              exit 1
+            }
+            [[ -n "$SSH_HOST" ]] || {
+              echo "::error::ssh_host is required when claim_file is omitted" >&2
+              exit 1
+            }
+          fi
+
+      - name: Check out and validate the declarative node claim
+        if: inputs.claim_file != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: claim-source
+          fetch-depth: 1
+
+      - name: Set up Go for claim validation
+        if: inputs.claim_file != ''
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: claim-source/go.mod
+          cache: true
+
+      - name: Resolve declarative node claim
+        if: inputs.claim_file != ''
+        id: resolve_claim
+        working-directory: claim-source
+        env:
+          CLAIM_FILE: ${{ inputs.claim_file }}
+        run: |
+          set -euo pipefail
+          claim_json="$(go run ./cmd/gregalectl deploy claim validate --file "$CLAIM_FILE" --json)"
+          jq -e '.valid == true' <<<"$claim_json" >/dev/null || {
+            echo "::error::ComputeNodeClaim validation failed" >&2
+            jq -r '.errors[]? | "::error::\(.path): \(.message)"' <<<"$claim_json" >&2
             exit 1
           }
-          [[ -n "$SSH_HOST" ]] || {
-            echo "::error::ssh_host is required" >&2
-            exit 1
-          }
+          {
+            for field in node ssh_host ssh_user ssh_port storage_device format_storage; do
+              value="$(jq -r --arg field "$field" '.[$field] // empty' <<<"$claim_json")"
+              printf '%s=%s\n' "$field" "$value"
+            done
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve legacy deployment inputs
+        if: inputs.claim_file == ''
+        id: resolve_legacy
+        env:
+          NODE: ${{ inputs.node }}
+          SSH_HOST: ${{ inputs.ssh_host }}
+          SSH_USER: ${{ inputs.ssh_user }}
+          SSH_PORT: ${{ inputs.ssh_port }}
+          STORAGE_DEVICE: ${{ inputs.storage_device }}
+          FORMAT_STORAGE: ${{ inputs.format_storage }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'node=%s\n' "$NODE"
+            printf 'ssh_host=%s\n' "$SSH_HOST"
+            printf 'ssh_user=%s\n' "$SSH_USER"
+            printf 'ssh_port=%s\n' "$SSH_PORT"
+            printf 'storage_device=%s\n' "$STORAGE_DEVICE"
+            printf 'format_storage=%s\n' "$FORMAT_STORAGE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate required production secrets without printing values
         run: |
@@ -122,7 +201,7 @@ jobs:
           echo "online_faas_fleet_runners=${count}"
 
   deploy:
-    name: Join or roll compute node ${{ inputs.node }}
+    name: Join or roll compute node ${{ needs.preflight.outputs.node }}
     needs: preflight
     if: needs.preflight.result == 'success'
     environment: production
@@ -130,12 +209,12 @@ jobs:
     timeout-minutes: 30
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
-      NODE: ${{ inputs.node }}
-      SSH_HOST: ${{ inputs.ssh_host }}
-      SSH_USER: ${{ inputs.ssh_user }}
-      SSH_PORT: ${{ inputs.ssh_port }}
-      STORAGE_DEVICE: ${{ inputs.storage_device }}
-      FORMAT_STORAGE: ${{ inputs.format_storage }}
+      NODE: ${{ needs.preflight.outputs.node }}
+      SSH_HOST: ${{ needs.preflight.outputs.ssh_host }}
+      SSH_USER: ${{ needs.preflight.outputs.ssh_user }}
+      SSH_PORT: ${{ needs.preflight.outputs.ssh_port }}
+      STORAGE_DEVICE: ${{ needs.preflight.outputs.storage_device }}
+      FORMAT_STORAGE: ${{ needs.preflight.outputs.format_storage }}
       # These are environment secrets, not repository files. The runner
       # must be trusted and should be ephemeral or dedicated to deployments.
       COMPUTE_SSH_KEY: ${{ secrets.COMPUTE_SSH_KEY }}

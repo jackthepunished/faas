@@ -20,6 +20,40 @@ func TestLoadJoinFleetFile(t *testing.T) {
 	}
 }
 
+func TestLoadJoinFleetInputsFromClaim(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claim.yaml")
+	claim := `api_version: gregale.dev/v1alpha1
+kind: ComputeNodeClaim
+metadata:
+  name: fsn-3
+spec:
+  ssh:
+    host: 203.0.113.27
+    user: deploy
+    port: 2222
+  storage:
+    device: /dev/disk/by-id/data
+    format: true
+`
+	if err := os.WriteFile(path, []byte(claim), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := loadJoinFleetInputs("", path)
+	if err != nil {
+		t.Fatalf("loadJoinFleetInputs: %v", err)
+	}
+	if len(file.Nodes) != 1 {
+		t.Fatalf("nodes = %#v", file.Nodes)
+	}
+	n := file.Nodes[0]
+	if n.Node != "fsn-3" || n.SSHHost != "203.0.113.27" || n.SSHUser != "deploy" || n.SSHPort != 2222 {
+		t.Fatalf("connection = %#v", n)
+	}
+	if n.StorageDevice != "/dev/disk/by-id/data" || !n.FormatStorage {
+		t.Fatalf("storage = %#v", n)
+	}
+}
+
 func TestResolveJoinArtifactsDoesNotOverrideExplicitPaths(t *testing.T) {
 	artifactDir := t.TempDir()
 	explicit := filepath.Join(t.TempDir(), "custom.tar.gz")
