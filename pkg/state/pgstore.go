@@ -5617,6 +5617,94 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return s.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
+// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00358)
+// upserts the deployment_openapi_snapshots row for the given
+// deployment. PR-B refactors MarkDeploymentLive to call this
+// method inside the same transaction as the status='live'
+// UPDATE.
+func (s *PgStore) UpdateDeploymentOpenAPISnapshot(ctx context.Context, snap OpenAPISnapshot) error {
+	if snap.DeploymentID == "" {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: empty deployment_id")
+	}
+	if snap.AppID == "" {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: empty app_id")
+	}
+	if snap.Scope == "" {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: empty scope")
+	}
+	if len(snap.Snapshot) == 0 {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: empty snapshot bytes")
+	}
+	if snap.SHA256 == "" {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: empty sha256")
+	}
+	if snap.SchemaVersion < 1 {
+		return errors.New("pgstore: UpdateDeploymentOpenAPISnapshot: schema_version must be >= 1")
+	}
+	if snap.CapturedAt.IsZero() {
+		snap.CapturedAt = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `
+		insert into deployment_openapi_snapshots
+			(deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at)
+		values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
+		on conflict (deployment_id) do update
+		   set app_id = excluded.app_id,
+		       scope = excluded.scope,
+		       snapshot = excluded.snapshot,
+		       sha256 = excluded.sha256,
+		       schema_version = excluded.schema_version,
+		       captured_at = excluded.captured_at
+	`, snap.DeploymentID, snap.AppID, snap.Scope, []byte(snap.Snapshot), snap.SHA256, snap.SchemaVersion, snap.CapturedAt)
+	if err != nil {
+		return fmt.Errorf("pgstore: UpdateDeploymentOpenAPISnapshot: %w", err)
+	}
+	return nil
+}
+
+// LatestOpenAPISnapshotForScope returns the most recently
+// captured snapshot for (appID, scope).
+func (s *PgStore) LatestOpenAPISnapshotForScope(ctx context.Context, appID, scope string) (OpenAPISnapshot, error) {
+	row := s.pool.QueryRow(ctx, `
+		select deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at
+		  from deployment_openapi_snapshots
+		 where app_id = $1::uuid and scope = $2
+		 order by captured_at desc
+		 limit 1
+	`, appID, scope)
+	return scanOpenAPISnapshot(row)
+}
+
+// OpenAPISnapshotByDeployment returns the snapshot row for a
+// specific deployment id.
+func (s *PgStore) OpenAPISnapshotByDeployment(ctx context.Context, deploymentID string) (OpenAPISnapshot, error) {
+	row := s.pool.QueryRow(ctx, `
+		select deployment_id, app_id, scope, snapshot, sha256, schema_version, captured_at
+		  from deployment_openapi_snapshots
+		 where deployment_id = $1::uuid
+	`, deploymentID)
+	return scanOpenAPISnapshot(row)
+}
+
+// scanOpenAPISnapshot is the pgstore scan helper for one
+// deployment_openapi_snapshots row.
+func scanOpenAPISnapshot(row pgx.Row) (OpenAPISnapshot, error) {
+	var (
+		snap     OpenAPISnapshot
+		rawSnap  []byte
+		captured time.Time
+	)
+	if err := row.Scan(&snap.DeploymentID, &snap.AppID, &snap.Scope, &rawSnap, &snap.SHA256, &snap.SchemaVersion, &captured); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OpenAPISnapshot{}, ErrNotFound
+		}
+		return OpenAPISnapshot{}, fmt.Errorf("pgstore: scan openapi snapshot: %w", err)
+	}
+	snap.Snapshot = json.RawMessage(rawSnap)
+	snap.CapturedAt = captured
+	return snap, nil
+}
+
 // MarkDeploymentCancelled (ADR-124) atomically flips the row to
 // DeployCancelled while honoring the cancel-eligible CAS guard.
 // The single UPDATE covers the (a) status transition, (b) audit

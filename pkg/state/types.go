@@ -1347,7 +1347,10 @@ type Deployment struct {
 	// "operator:<username>"). Empty for deployments that have
 	// never been reordered.
 	ReorderedByPrincipal string
-	Error                string
+	// ReorderedAt is the wall-clock at which the priority was
+	// last bumped (ADR-124). Nil for never-reordered rows.
+	ReorderedAt *time.Time
+	Error       string
 	// ErrorCode is the RFC 7807 code stamped at the same time as
 	// Error when a deployment transitions to `failed`. ADR-021:
 	// oci.ErrImageNotFound / ErrImageEgressDenied /
