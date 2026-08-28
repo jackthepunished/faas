@@ -207,6 +207,7 @@ func TestBridgeH2CTerminator_H1Fallback(t *testing.T) {
 	resp, err := rt.RoundTrip(&http.Request{
 		Method: "GET",
 		URL:    mustURL("http://bridge.invalid/h1"),
+		Header: make(http.Header),
 	})
 	if err != nil {
 		t.Fatalf("bridge roundtrip: %v", err)
