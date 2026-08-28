@@ -225,23 +225,6 @@ func (p Preset) Validate() error {
 	return nil
 }
 
-// CustomStage is the wire-friendly form of Stage (issue #976 /
-// ADR-122 / SAFE-RELEASES production-leveling Stream F). The
-// apid CreateDeploymentRequest path decodes --canary-stages
-// "1@30s,10@2m,100@0" into []CustomStage; the handler then calls
-// LookupCustomPreset to validate + synthesise a Preset for the
-// DB row's canary_stages jsonb column.
-//
-// Field tags are json.Marshaler-aligned so the validator can
-// re-emit the customer-supplied form back in 422 responses. The
-// wire shape is intentional: a future custom-ladder feature
-// (per-account spec at meterd runtime, gated on Enterprise
-// plan) can reuse this DTO without a wire break.
-type CustomStage struct {
-	Percent  int    `json:"percent"`
-	Duration string `json:"duration"` // time.ParseDuration string form
-}
-
 // LookupCustomPreset synthesises a Preset from a customer-
 // supplied stage list, validates it via Validate(), and returns
 // the synthesised Preset. The returned Preset carries Name=

@@ -13039,7 +13039,7 @@ components:
     # Stages carries []CustomStage only when preset='custom'; the
     # catalog presets are resolved server-side without needing any
     # wire ladder.
-    CanaryStage:
+    CustomStage:
       description: |
         One stage of a customer-supplied canary ladder
         (issue #976 / ADR-122 / SAFE-RELEASES production-leveling
@@ -13084,7 +13084,7 @@ components:
           example: "balanced"
         stages:
           type: array
-          items: { $ref: '#/components/schemas/CanaryStage' }
+          items: { $ref: '#/components/schemas/CustomStage' }
           description: "Per-stage ladder. Required when preset='custom' (the apid handler 422s otherwise); ignored for catalog presets (the catalog resolution runs server-side)."
 
     # ─── Deployment audit timeline (issue #976 / ADR-122 / SAFE-RELEASES-E.2) ──
@@ -14657,6 +14657,7 @@ components:
         - webhook_url
         - webhook_secret_sealed_masked
         - cooldown_minutes
+        - action
         - state
         - created_at
         - updated_at
@@ -14700,6 +14701,12 @@ components:
           minimum: 5
           maximum: 1440
           example: 15
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'What to do when the rule fires. webhook = fire the configured webhook only (legacy default). rollback = roll the rule''s app back to its last live deployment. demote = pin the current canary step (no traffic advance). promote = short-circuit the canary ladder to 100%.'
+          default: webhook
+          example: webhook
         state:
           type: string
           enum: [ok, firing]
@@ -14737,6 +14744,12 @@ components:
           minimum: 5
           maximum: 1440
           example: 15
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'What to do when the rule fires. Omit to default to webhook.'
+          default: webhook
+          example: webhook
 
     UpdateAlertRuleRequest:
       description: 'Partial update — every field is optional. Omitted means leave alone.'
@@ -14757,6 +14770,10 @@ components:
           description: 'New plaintext HMAC secret. Omit to keep the existing secret.'
           maxLength: 256
         cooldown_minutes: { type: integer, minimum: 5, maximum: 1440 }
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'Replace the action. Omit to leave the existing action in place.'
 
     RotateAlertRuleSecretResponse:
       description: 'rotate-secret response — returns the rotated_at timestamp + the masked constant.'

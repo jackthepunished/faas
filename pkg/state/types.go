@@ -1515,10 +1515,10 @@ type Deployment struct {
 	// pkg/api.Client.PatchDeploymentsIdTraffic — apid remains the
 	// authoritative writer of deployments.* per CLAUDE.md
 	// ownership rules.
-	CanaryPreset          string     `json:"canary_preset,omitempty"`
-	CanaryStep            int        `json:"canary_step,omitempty"`
-	CanaryTotalSteps      int        `json:"canary_total_steps,omitempty"`
-	CanaryStepStartedAt   *time.Time `json:"canary_step_started_at,omitempty"`
+	CanaryPreset        string     `json:"canary_preset,omitempty"`
+	CanaryStep          int        `json:"canary_step,omitempty"`
+	CanaryTotalSteps    int        `json:"canary_total_steps,omitempty"`
+	CanaryStepStartedAt *time.Time `json:"canary_step_started_at,omitempty"`
 	// CanaryStages (SAFE-RELEASES production-leveling Stream F)
 	// is the jsonb-serialised canary ladder when CanaryPreset
 	// is "custom" (migrations/00487). The wire form is a
@@ -2213,12 +2213,12 @@ func IsValidAlertAction(v string) bool {
 // ignore a FailureSource change, which is a footgun — the field
 // exists nowhere on this struct on purpose.
 type UpdateAlertRuleParams struct {
-	Name                *string
-	Enabled             *bool
-	Metric              *AlertMetric
-	Comparison          *AlertComparison
-	Threshold           *float64
-	WindowSpec          *AlertWindowSpec
+	Name       *string
+	Enabled    *bool
+	Metric     *AlertMetric
+	Comparison *AlertComparison
+	Threshold  *float64
+	WindowSpec *AlertWindowSpec
 	// Action (issue #976 / ADR-122 / SAFE-RELEASES-B). Pointer
 	// PATCH shape so a missing body field leaves the row alone.
 	// Validated against pkg/api.AllowedAlertRuleActions at the
@@ -2247,7 +2247,7 @@ type AlertRule struct {
 	Threshold           float64
 	WindowSpec          AlertWindowSpec
 	FailureSource       AlertFailureSource // empty unless Metric == failed_invocations
-	Action              AlertAction       // issue #976 / ADR-122 / SAFE-RELEASES-B
+	Action              AlertAction        // issue #976 / ADR-122 / SAFE-RELEASES-B
 	WebhookURL          string
 	WebhookSecretSealed []byte // age/X25519 ciphertext; never logged
 	CooldownMinutes     int
