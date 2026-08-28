@@ -35,6 +35,11 @@
     update_cache: true
     cache_valid_time: 3600
 
+- name: github_actions_runner — create service account group
+  ansible.builtin.group:
+    name: "{{ faas_runner_group }}"
+    system: true
+
 - name: github_actions_runner — create service account
   ansible.builtin.user:
     name: "{{ faas_runner_user }}"
