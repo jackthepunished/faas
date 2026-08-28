@@ -24,8 +24,23 @@ on:
         required: false
         default: ""
         type: string
+      fleet_bundle_url:
+        description: "HTTPS URL for a privately hosted, signed FleetEnrollmentBundle (preferred for new nodes)"
+        required: false
+        default: ""
+        type: string
+      fleet_bundle_signature_url:
+        description: "HTTPS URL for the detached cosign signature bundle matching fleet_bundle_url"
+        required: false
+        default: ""
+        type: string
+      fleet_bundle_sha256:
+        description: "sha256:<64 lowercase hex> digest of the exact FleetEnrollmentBundle bytes"
+        required: false
+        default: ""
+        type: string
       node:
-        description: "Legacy: manifest fleet.hosts[].name to adopt or roll (omit when claim_file is supplied)"
+        description: "Manifest fleet.hosts[].name to adopt or roll (omit when a single claim is supplied by claim_file or fleet_bundle_url)"
         required: false
         default: ""
         type: string
@@ -56,7 +71,7 @@ on:
         type: boolean
 
 concurrency:
-  group: cd-compute-${{ inputs.node || inputs.claim_file }}
+  group: cd-compute-${{ inputs.node || inputs.claim_file || inputs.fleet_bundle_url }}
   cancel-in-progress: false
 
 permissions:
@@ -70,12 +85,13 @@ jobs:
     environment: production
     timeout-minutes: 5
     outputs:
-      node: ${{ steps.resolve_claim.outputs.node || steps.resolve_legacy.outputs.node }}
-      ssh_host: ${{ steps.resolve_claim.outputs.ssh_host || steps.resolve_legacy.outputs.ssh_host }}
-      ssh_user: ${{ steps.resolve_claim.outputs.ssh_user || steps.resolve_legacy.outputs.ssh_user }}
-      ssh_port: ${{ steps.resolve_claim.outputs.ssh_port || steps.resolve_legacy.outputs.ssh_port }}
-      storage_device: ${{ steps.resolve_claim.outputs.storage_device || steps.resolve_legacy.outputs.storage_device }}
-      format_storage: ${{ steps.resolve_claim.outputs.format_storage || steps.resolve_legacy.outputs.format_storage }}
+      node: ${{ steps.resolve_bundle.outputs.node || steps.resolve_claim.outputs.node || steps.resolve_legacy.outputs.node }}
+      ssh_host: ${{ steps.resolve_bundle.outputs.ssh_host || steps.resolve_claim.outputs.ssh_host || steps.resolve_legacy.outputs.ssh_host }}
+      ssh_user: ${{ steps.resolve_bundle.outputs.ssh_user || steps.resolve_claim.outputs.ssh_user || steps.resolve_legacy.outputs.ssh_user }}
+      ssh_port: ${{ steps.resolve_bundle.outputs.ssh_port || steps.resolve_claim.outputs.ssh_port || steps.resolve_legacy.outputs.ssh_port }}
+      ssh_host_key_sha256: ${{ steps.resolve_bundle.outputs.host_key_sha256 || steps.resolve_claim.outputs.host_key_sha256 }}
+      storage_device: ${{ steps.resolve_bundle.outputs.storage_device || steps.resolve_claim.outputs.storage_device || steps.resolve_legacy.outputs.storage_device }}
+      format_storage: ${{ steps.resolve_bundle.outputs.format_storage || steps.resolve_claim.outputs.format_storage || steps.resolve_legacy.outputs.format_storage }}
     env:
       COMPUTE_SSH_KEY: ${{ secrets.COMPUTE_SSH_KEY }}
       COMPUTE_DATABASE_URL: ${{ secrets.COMPUTE_DATABASE_URL }}
@@ -83,6 +99,7 @@ jobs:
       COMPUTE_PKI_TARBALL_B64: ${{ secrets.COMPUTE_PKI_TARBALL_B64 }}
       COMPUTE_SIGN_KEY: ${{ secrets.COMPUTE_SIGN_KEY }}
       COMPUTE_VERIFY_KEY: ${{ secrets.COMPUTE_VERIFY_KEY }}
+      FLEET_BUNDLE_AUTH_TOKEN: ${{ secrets.FLEET_BUNDLE_AUTH_TOKEN }}
     steps:
       - name: Validate requested node inputs
         env:
@@ -90,13 +107,43 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           NODE: ${{ inputs.node }}
           SSH_HOST: ${{ inputs.ssh_host }}
+          FLEET_BUNDLE_URL: ${{ inputs.fleet_bundle_url }}
+          FLEET_BUNDLE_SIGNATURE_URL: ${{ inputs.fleet_bundle_signature_url }}
+          FLEET_BUNDLE_SHA256: ${{ inputs.fleet_bundle_sha256 }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
             echo "::error::release_tag must be a release tag, got $RELEASE_TAG" >&2
             exit 1
           }
-          if [[ -n "$CLAIM_FILE" ]]; then
+          if [[ -n "$FLEET_BUNDLE_URL" ]]; then
+            [[ "$FLEET_BUNDLE_URL" =~ ^https:// ]] || {
+              echo "::error::fleet_bundle_url must use https://" >&2
+              exit 1
+            }
+            [[ "$FLEET_BUNDLE_SIGNATURE_URL" =~ ^https:// ]] || {
+              echo "::error::fleet_bundle_signature_url must use https://" >&2
+              exit 1
+            }
+            [[ "$FLEET_BUNDLE_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error::fleet_bundle_sha256 must match sha256:<64 lowercase hex>" >&2
+              exit 1
+            }
+            [[ -z "$CLAIM_FILE" ]] || {
+              echo "::error::claim_file and fleet_bundle_url are mutually exclusive" >&2
+              exit 1
+            }
+            if [[ -n "$NODE" ]]; then
+              [[ "$NODE" =~ ^[A-Za-z0-9._-]+$ ]] || {
+                echo "::error::node contains unsupported characters" >&2
+                exit 1
+              }
+            fi
+            [[ -z "$SSH_HOST" ]] || {
+              echo "::error::ssh_host must be omitted when fleet_bundle_url is supplied" >&2
+              exit 1
+            }
+          elif [[ -n "$CLAIM_FILE" ]]; then
             [[ "$CLAIM_FILE" =~ ^[A-Za-z0-9._/-]+\.ya?ml$ && "$CLAIM_FILE" != /* && "$CLAIM_FILE" != *..* ]] || {
               echo "::error::claim_file must be a relative YAML path without parent traversal" >&2
               exit 1
@@ -120,12 +167,34 @@ jobs:
           path: claim-source
           fetch-depth: 1
 
+      - name: Check out release source for signed bundle validation
+        if: inputs.fleet_bundle_url != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: bundle-source
+          fetch-depth: 1
+
       - name: Set up Go for claim validation
         if: inputs.claim_file != ''
         uses: actions/setup-go@v7
         with:
           go-version-file: claim-source/go.mod
           cache: true
+
+      - name: Set up Go for signed bundle validation
+        if: inputs.fleet_bundle_url != ''
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: bundle-source/go.mod
+          cache: true
+
+      - name: Install pinned cosign for signed bundle validation
+        if: inputs.fleet_bundle_url != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fleet-bundle-tools"
+          GOBIN="$RUNNER_TEMP/fleet-bundle-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
 
       - name: Resolve declarative node claim
         if: inputs.claim_file != ''
@@ -142,14 +211,86 @@ jobs:
             exit 1
           }
           {
-            for field in node ssh_host ssh_user ssh_port storage_device format_storage; do
+            for field in node ssh_host ssh_user ssh_port host_key_sha256 storage_device format_storage; do
               value="$(jq -r --arg field "$field" '.[$field] // empty' <<<"$claim_json")"
               printf '%s=%s\n' "$field" "$value"
             done
           } >> "$GITHUB_OUTPUT"
 
+      - name: Download and validate signed fleet enrollment bundle
+        if: inputs.fleet_bundle_url != ''
+        id: resolve_bundle
+        working-directory: bundle-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLEET_BUNDLE_URL: ${{ inputs.fleet_bundle_url }}
+          FLEET_BUNDLE_SIGNATURE_URL: ${{ inputs.fleet_bundle_signature_url }}
+          FLEET_BUNDLE_SHA256: ${{ inputs.fleet_bundle_sha256 }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+          bundle_dir="$RUNNER_TEMP/fleet-enrollment"
+          mkdir -p "$bundle_dir"
+          download_private() {
+            local url="$1"
+            local destination="$2"
+            local args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2)
+            if [[ -n "${FLEET_BUNDLE_AUTH_TOKEN:-}" ]]; then
+              args+=(--header "Authorization: Bearer ${FLEET_BUNDLE_AUTH_TOKEN}")
+            fi
+            curl "${args[@]}" -o "$destination" "$url"
+          }
+          download_private "$FLEET_BUNDLE_URL" "$bundle_dir/fleet-enrollment.yaml"
+          download_private "$FLEET_BUNDLE_SIGNATURE_URL" "$bundle_dir/fleet-enrollment.cosign.bundle"
+          actual="sha256:$(sha256sum "$bundle_dir/fleet-enrollment.yaml" | awk '{print $1}')"
+          [[ "$actual" == "$FLEET_BUNDLE_SHA256" ]] || {
+            echo "::error::FleetEnrollmentBundle digest does not match the dispatch input" >&2
+            exit 1
+          }
+
+          release_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          manifest_url="$(curl --fail --silent --show-error --location \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" "$release_api" |
+            jq -er '.assets[] | select(.name == "production-manifest.yaml") | .browser_download_url')"
+          curl --fail --silent --show-error --location \
+            --header "Accept: application/octet-stream" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            -o "$bundle_dir/production-manifest.yaml" "$manifest_url"
+
+          bundle_json="$(go run ./cmd/gregalectl deploy fleet-bundle validate \
+            --file "$bundle_dir/fleet-enrollment.yaml" \
+            --signature "$bundle_dir/fleet-enrollment.cosign.bundle" \
+            --manifest-file "$bundle_dir/production-manifest.yaml" \
+            --cosign-binary "$RUNNER_TEMP/fleet-bundle-tools/cosign" --json)"
+          jq -e '.valid == true' <<<"$bundle_json" >/dev/null || {
+            echo "::error::FleetEnrollmentBundle validation failed" >&2
+            jq -r '.errors[]? | "::error::\(.path): \(.message)"' <<<"$bundle_json" >&2
+            exit 1
+          }
+          claim_count="$(jq '.claims | length' <<<"$bundle_json")"
+          if [[ -z "${NODE:-}" && "$claim_count" != "1" ]]; then
+            echo "::error::node input is required when the signed bundle contains multiple claims" >&2
+            exit 1
+          fi
+          if [[ -n "${NODE:-}" && -z "$(jq -r --arg node "$NODE" '.claims[] | select(.node == $node) | .node' <<<"$bundle_json")" ]]; then
+            echo "::error::node is not authorized by the signed bundle" >&2
+            exit 1
+          fi
+          if [[ -z "${NODE:-}" ]]; then
+            NODE="$(jq -r '.claims[0].node' <<<"$bundle_json")"
+          fi
+          selected_claim="$(jq -c --arg node "$NODE" '.claims[] | select(.node == $node)' <<<"$bundle_json")"
+          {
+            for field in node ssh_host ssh_user ssh_port host_key_sha256 storage_device format_storage; do
+              value="$(jq -r --arg field "$field" '.[$field] // empty' <<<"$selected_claim")"
+              printf '%s=%s\n' "$field" "$value"
+            done
+          } >> "$GITHUB_OUTPUT"
+
       - name: Resolve legacy deployment inputs
-        if: inputs.claim_file == ''
+        if: inputs.claim_file == '' && inputs.fleet_bundle_url == ''
         id: resolve_legacy
         env:
           NODE: ${{ inputs.node }}
@@ -170,6 +311,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Validate required production secrets without printing values
+        env:
+          FLEET_BUNDLE_URL: ${{ inputs.fleet_bundle_url }}
         run: |
           set -euo pipefail
           missing=0
@@ -180,6 +323,10 @@ jobs:
               missing=1
             fi
           done
+          if [[ -n "$FLEET_BUNDLE_URL" && -z "${FLEET_BUNDLE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::production secret FLEET_BUNDLE_AUTH_TOKEN is required for signed bundle dispatches" >&2
+            missing=1
+          fi
           (( missing == 0 )) || exit 1
 
       - name: Require an online trusted fleet runner
@@ -213,8 +360,13 @@ jobs:
       SSH_HOST: ${{ needs.preflight.outputs.ssh_host }}
       SSH_USER: ${{ needs.preflight.outputs.ssh_user }}
       SSH_PORT: ${{ needs.preflight.outputs.ssh_port }}
+      SSH_HOST_KEY_SHA256: ${{ needs.preflight.outputs.ssh_host_key_sha256 }}
       STORAGE_DEVICE: ${{ needs.preflight.outputs.storage_device }}
       FORMAT_STORAGE: ${{ needs.preflight.outputs.format_storage }}
+      FLEET_BUNDLE_URL: ${{ inputs.fleet_bundle_url }}
+      FLEET_BUNDLE_SIGNATURE_URL: ${{ inputs.fleet_bundle_signature_url }}
+      FLEET_BUNDLE_SHA256: ${{ inputs.fleet_bundle_sha256 }}
+      FLEET_BUNDLE_AUTH_TOKEN: ${{ secrets.FLEET_BUNDLE_AUTH_TOKEN }}
       # These are environment secrets, not repository files. The runner
       # must be trusted and should be ephemeral or dedicated to deployments.
       COMPUTE_SSH_KEY: ${{ secrets.COMPUTE_SSH_KEY }}
@@ -372,6 +524,34 @@ jobs:
           if [[ -n "${COMPUTE_ARCHIVE_ENVELOPE_B64:-}" ]]; then
             printf '%s' "$COMPUTE_ARCHIVE_ENVELOPE_B64" | base64 --decode > "$ARTIFACT_DIR/archive-creds.json.age"
           fi
+          if [[ -n "$FLEET_BUNDLE_URL" ]]; then
+            [[ -n "$FLEET_BUNDLE_AUTH_TOKEN" ]] || {
+              echo "::error::FLEET_BUNDLE_AUTH_TOKEN is required for signed bundle dispatches" >&2
+              exit 1
+            }
+            [[ "$FLEET_BUNDLE_URL" =~ ^https://.+ ]] || {
+              echo "::error::fleet_bundle_url must use https://" >&2
+              exit 1
+            }
+            [[ "$FLEET_BUNDLE_SIGNATURE_URL" =~ ^https://.+ ]] || {
+              echo "::error::fleet_bundle_signature_url must use https://" >&2
+              exit 1
+            }
+            [[ "$FLEET_BUNDLE_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error::fleet_bundle_sha256 must match sha256:<64 lowercase hex>" >&2
+              exit 1
+            }
+            bundle_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              --header "Authorization: Bearer ${FLEET_BUNDLE_AUTH_TOKEN}")
+            curl "${bundle_args[@]}" -o "$ARTIFACT_DIR/fleet-enrollment.yaml" "$FLEET_BUNDLE_URL"
+            curl "${bundle_args[@]}" -o "$ARTIFACT_DIR/fleet-enrollment.cosign.bundle" "$FLEET_BUNDLE_SIGNATURE_URL"
+            actual="sha256:$(sha256sum "$ARTIFACT_DIR/fleet-enrollment.yaml" | awk '{print $1}')"
+            [[ "$actual" == "$FLEET_BUNDLE_SHA256" ]] || {
+              echo "::error::FleetEnrollmentBundle digest does not match the dispatch input" >&2
+              exit 1
+            }
+            chmod 0600 "$ARTIFACT_DIR/fleet-enrollment.yaml" "$ARTIFACT_DIR/fleet-enrollment.cosign.bundle"
+          fi
           echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
 
       - name: Verify runner prerequisites and adopt the compute host
@@ -381,9 +561,6 @@ jobs:
             deploy join-node
             --manifest-file "$ARTIFACT_DIR/production-manifest.yaml"
             --node "$NODE"
-            --ssh-host "$SSH_HOST"
-            --ssh-user "$SSH_USER"
-            --ssh-port "$SSH_PORT"
             --ssh-key "$ARTIFACT_DIR/compute-ssh-key"
             --release-tarball "$ARTIFACT_DIR/release.tar.gz"
             --artifact-dir "$ARTIFACT_DIR"
@@ -393,11 +570,24 @@ jobs:
             --yes
             --json
           )
-          if [[ -n "$STORAGE_DEVICE" ]]; then
-            JOIN_ARGS+=(--storage-device "$STORAGE_DEVICE")
-          fi
-          if [[ "$FORMAT_STORAGE" == "true" ]]; then
-            JOIN_ARGS+=(--format-storage)
+          if [[ -n "$FLEET_BUNDLE_URL" ]]; then
+            JOIN_ARGS+=(
+              --fleet-bundle-file "$ARTIFACT_DIR/fleet-enrollment.yaml"
+              --fleet-bundle-signature "$ARTIFACT_DIR/fleet-enrollment.cosign.bundle"
+              --fleet-replay-state /var/lib/faas-runner/fleet-enrollment-used
+            )
+          else
+            JOIN_ARGS+=(
+              --ssh-host "$SSH_HOST"
+              --ssh-user "$SSH_USER"
+              --ssh-port "$SSH_PORT"
+            )
+            if [[ -n "$STORAGE_DEVICE" ]]; then
+              JOIN_ARGS+=(--storage-device "$STORAGE_DEVICE")
+            fi
+            if [[ "$FORMAT_STORAGE" == "true" ]]; then
+              JOIN_ARGS+=(--format-storage)
+            fi
           fi
           if [[ -f "$ARTIFACT_DIR/ansible-vars.yml" ]]; then
             JOIN_ARGS+=(--ansible-vars-file "$ARTIFACT_DIR/ansible-vars.yml")

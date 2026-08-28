@@ -103,6 +103,27 @@ starts the `faas-github-runner.service` systemd unit. The workflow needs
 `curl`, `jq`, GNU `tar`/`base64`/`sha256sum`, and `ansible-playbook`; it installs
 its pinned Go-based `cosign` verifier itself.
 
+For new production nodes, prefer the signed bundle inputs. Store the exact
+`FleetEnrollmentBundle` YAML and detached cosign signature in private,
+immutable HTTPS storage, then dispatch with:
+
+```text
+release_tag=v0.1.18-rc.10
+node=fsn-4
+fleet_bundle_url=https://private-config.example/fleet/production-7.yaml
+fleet_bundle_signature_url=https://private-config.example/fleet/production-7.cosign.bundle
+fleet_bundle_sha256=sha256:<64 lowercase hex>
+```
+
+Set the corresponding `FLEET_BUNDLE_AUTH_TOKEN` production-environment secret.
+The bundle publisher must use the pinned keyless GitHub workflow identity; the
+repository does not store live node claims or their signatures. The hosted
+preflight verifies the digest, signature, expiry/nonce, SSH fingerprint, and
+membership in the signed release's production manifest. The self-hosted job
+downloads the same bytes again and passes them to `gregalectl deploy join-node`;
+the runner's durable `/var/lib/faas-runner/fleet-enrollment-used` ledger makes
+successful authorizations single-use.
+
 The workflow first runs a GitHub-hosted preflight. It validates the requested
 node inputs, checks the required production secrets without printing their
 values, and confirms that an online runner carries the `faas-fleet` label.
@@ -126,7 +147,7 @@ backup secrets are also optional while backup initialization is deferred:
 `COMPUTE_ARCHIVE_ENVELOPE_B64` supply the same encrypted envelopes accepted by
 the CLI artifact directory.
 
-The preferred dispatch uses a declarative `ComputeNodeClaim` committed in the
+The migration dispatch uses a declarative `ComputeNodeClaim` committed in the
 selected release source. It contains the manifest node name, the provider SSH
 address, and the optional storage policy. Validate one locally with:
 

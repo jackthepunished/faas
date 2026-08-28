@@ -53,6 +53,7 @@
     mode: "{{ item.mode }}"
   loop:
     - { path: "{{ faas_runner_home }}", mode: "0750" }
+    - { path: "{{ faas_runner_enrollment_state }}", mode: "0700" }
     - { path: "{{ faas_runner_root }}", mode: "0750" }
     - { path: "{{ faas_runner_cache }}", mode: "0750" }
 

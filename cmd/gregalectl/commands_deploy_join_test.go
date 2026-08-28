@@ -216,6 +216,29 @@ func TestOverrideJoinHostVars_UsesProviderSSHOnlyForConnection(t *testing.T) {
 	}
 }
 
+func TestOverrideJoinHostVars_PinsKnownHostFile(t *testing.T) {
+	got := string(overrideJoinHostVars([]byte("ansible_host: \"fsn-2.gregale.dev\"\n"), &deployJoinOptions{
+		SSHHost:           "203.0.113.8",
+		SSHUser:           "root",
+		SSHPort:           22,
+		SSHKnownHostsFile: "/tmp/gregale-known-hosts",
+	}))
+	want := `ansible_ssh_common_args: "-o UserKnownHostsFile=/tmp/gregale-known-hosts -o StrictHostKeyChecking=yes"`
+	if !strings.Contains(got, want) {
+		t.Fatalf("known_hosts pinning missing %q:\n%s", want, got)
+	}
+}
+
+func TestFingerprintMatches(t *testing.T) {
+	output := "256 SHA256:other host-a (ED25519)\n256 SHA256:expected host-b (ED25519)\n"
+	if !fingerprintMatches(output, "SHA256:expected") {
+		t.Fatal("expected fingerprint was not found")
+	}
+	if fingerprintMatches(output, "SHA256:missing") {
+		t.Fatal("missing fingerprint was reported as present")
+	}
+}
+
 func TestOverrideJoinHostVars_PreservesStorageContract(t *testing.T) {
 	got := string(overrideJoinHostVars([]byte("faas_box_role: compute-only\n"), &deployJoinOptions{
 		SSHHost:       "203.0.113.8",

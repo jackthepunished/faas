@@ -8,6 +8,8 @@ package nodeclaim
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -52,9 +54,10 @@ type Spec struct {
 }
 
 type SSH struct {
-	Host string `yaml:"host" json:"host"`
-	User string `yaml:"user,omitempty" json:"user,omitempty"`
-	Port int    `yaml:"port,omitempty" json:"port,omitempty"`
+	Host          string `yaml:"host" json:"host"`
+	User          string `yaml:"user,omitempty" json:"user,omitempty"`
+	Port          int    `yaml:"port,omitempty" json:"port,omitempty"`
+	HostKeySHA256 string `yaml:"host_key_sha256,omitempty" json:"host_key_sha256,omitempty"`
 }
 
 type Storage struct {
@@ -69,6 +72,7 @@ type Node struct {
 	SSHHost       string
 	SSHUser       string
 	SSHPort       int
+	HostKeySHA256 string
 	StorageDevice string
 	FormatStorage bool
 }
@@ -117,8 +121,8 @@ func Parse(body []byte) (*Claim, error) {
 }
 
 // Validate checks the claim without contacting the provider or target host.
-// Host-key pinning is deliberately outside this first claim contract: the
-// deployment runner still relies on its existing known_hosts trust bootstrap.
+// Host-key pinning is optional for legacy claims but required by the signed
+// fleet-enrollment bundle path.
 func (c Claim) Validate() Errors {
 	var errs Errors
 	if c.APIVersion != APIVersion {
@@ -147,6 +151,11 @@ func (c Claim) Validate() Errors {
 	} else if c.Spec.SSH.Port < 1 {
 		errs = append(errs, Error{"spec.ssh.port", "must be between 1 and 65535"})
 	}
+	if c.Spec.SSH.HostKeySHA256 != "" {
+		if err := ValidateHostKeyFingerprint(c.Spec.SSH.HostKeySHA256); err != nil {
+			errs = append(errs, Error{"spec.ssh.host_key_sha256", err.Error()})
+		}
+	}
 	if c.Spec.Storage.Device != "" {
 		if !strings.HasPrefix(c.Spec.Storage.Device, "/") || strings.IndexFunc(c.Spec.Storage.Device, unicode.IsSpace) >= 0 {
 			errs = append(errs, Error{"spec.storage.device", "must be an absolute stable device path without whitespace"})
@@ -173,9 +182,26 @@ func (c Claim) Normalize() Node {
 		SSHHost:       c.Spec.SSH.Host,
 		SSHUser:       user,
 		SSHPort:       port,
+		HostKeySHA256: c.Spec.SSH.HostKeySHA256,
 		StorageDevice: c.Spec.Storage.Device,
 		FormatStorage: c.Spec.Storage.Format,
 	}
+}
+
+// ValidateHostKeyFingerprint validates the OpenSSH SHA256 fingerprint format
+// emitted by `ssh-keygen -lf ... -E sha256`. Padding is intentionally not
+// accepted because OpenSSH uses raw base64 for this wire representation.
+func ValidateHostKeyFingerprint(raw string) error {
+	const prefix = "SHA256:"
+	if !strings.HasPrefix(raw, prefix) {
+		return errors.New("must use the OpenSSH SHA256:<base64> format")
+	}
+	encoded := strings.TrimPrefix(raw, prefix)
+	decoded, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) != sha256.Size {
+		return errors.New("must contain a 32-byte OpenSSH SHA256 fingerprint")
+	}
+	return nil
 }
 
 func validateHost(host string) error {

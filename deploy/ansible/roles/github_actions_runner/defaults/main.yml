@@ -12,6 +12,10 @@ faas_runner_download_url: "https://github.com/actions/runner/releases/download/v
 faas_runner_user: faas-runner
 faas_runner_group: faas-runner
 faas_runner_home: /var/lib/faas-runner
+# Durable single-use ledger for signed FleetEnrollmentBundle authorizations.
+# It lives outside the runner checkout so a job workspace cleanup cannot make
+# a successfully consumed enrollment reusable.
+faas_runner_enrollment_state: "{{ faas_runner_home }}/fleet-enrollment-used"
 faas_runner_root: /opt/actions-runner
 faas_runner_cache: /var/cache/faas-runner
 faas_runner_workdir: _work

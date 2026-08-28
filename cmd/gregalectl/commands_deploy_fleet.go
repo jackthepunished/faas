@@ -28,6 +28,7 @@ type joinFleetNode struct {
 	SSHUser       string `yaml:"ssh_user,omitempty" json:"ssh_user,omitempty"`
 	SSHPort       int    `yaml:"ssh_port,omitempty" json:"ssh_port,omitempty"`
 	SSHKey        string `yaml:"ssh_key,omitempty" json:"ssh_key,omitempty"`
+	HostKeySHA256 string `yaml:"host_key_sha256,omitempty" json:"host_key_sha256,omitempty"`
 	StorageDevice string `yaml:"storage_device,omitempty" json:"storage_device,omitempty"`
 	FormatStorage bool   `yaml:"format_storage,omitempty" json:"format_storage,omitempty"`
 }
@@ -108,7 +109,8 @@ func cmdDeployJoinFleet(args []string) int {
 		o := deployJoinOptions{
 			ManifestFile: *manifestFile, Node: n.Node, SSHHost: n.SSHHost,
 			SSHUser: n.SSHUser, SSHPort: n.SSHPort, SSHKey: n.SSHKey,
-			StorageDevice: n.StorageDevice, FormatStorage: n.FormatStorage,
+			SSHHostKeySHA256: n.HostKeySHA256,
+			StorageDevice:    n.StorageDevice, FormatStorage: n.FormatStorage,
 			ReleaseTarball: *releaseTarball, BootstrapBinary: *bootstrapBinary,
 			CosignBinary: *cosignBinary, PKISource: *pkiSource,
 			SignKeySource: *signKey, VerifyKeySource: *verifyKey,
@@ -235,6 +237,7 @@ func loadJoinFleetInputs(nodesPath, claimPath string) (joinFleetFile, error) {
 	n := claim.Normalize()
 	return joinFleetFile{Nodes: []joinFleetNode{{
 		Node: n.Name, SSHHost: n.SSHHost, SSHUser: n.SSHUser, SSHPort: n.SSHPort,
+		HostKeySHA256: n.HostKeySHA256,
 		StorageDevice: n.StorageDevice, FormatStorage: n.FormatStorage,
 	}}}, nil
 }

@@ -13,6 +13,9 @@ spec:
     host: 203.0.113.27
     user: root
     port: 22
+    # Synthetic value for documentation only; replace it with the fingerprint
+    # collected through the provider console or another trusted channel.
+    host_key_sha256: SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   storage:
     device: /dev/disk/by-id/provider-stable-data-disk
     format: false
