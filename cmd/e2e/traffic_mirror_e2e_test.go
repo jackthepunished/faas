@@ -57,21 +57,28 @@ import (
 // flags. Used by the rollup + sweep tests to populate the
 // ledger without going through the gateway goroutine.
 //
-// All inserts use the existing column set PR-A1 shipped
-// (migrations earlier — the ledger was provisioned in the
-// first A1 migration; PR-A3 commit 4 only added the
-// mirror_invocation_summary rollup table). Returns the new
-// row ID.
-func seedMirrorLedgerRow(t *testing.T, pool *pgxpool.Pool, ruleID, appID string, completedAt time.Time, statusDiff, schemaDiff, bodyDiff, crashed, capAtMax bool) string {
+// The shape matches the schema PR-A1 shipped (migration 00386):
+// all four boolean diff flags + crashed are real columns; the
+// NOT NULL columns (account_id, source_deployment_id,
+// mirror_deployment_id, request_id) are filled with stable UUID
+// strings so the rollup + sweep SQL predicates match by
+// (mirror_rule_id, completed_at) without requiring a live
+// gateway. Returns the new row ID.
+func seedMirrorLedgerRow(t *testing.T, pool *pgxpool.Pool, ruleID, appID string, completedAt time.Time, statusDiff, schemaDiff, bodyDiff, crashed bool) string {
 	t.Helper()
 	id := uuid.NewString()
+	accountID := uuid.NewString()
+	sourceDeploymentID := uuid.NewString()
+	mirrorDeploymentID := uuid.NewString()
+	requestID := uuid.NewString()
 	_, err := pool.Exec(context.Background(), `
 INSERT INTO mirror_invocation_results (
-    id, mirror_rule_id, app_id,
-    status_diff, schema_diff, body_diff, crashed, cap_at_max,
-    latency_ms, completed_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
-`, id, ruleID, appID, statusDiff, schemaDiff, bodyDiff, crashed, capAtMax, completedAt)
+    id, mirror_rule_id, account_id, app_id,
+    source_deployment_id, mirror_deployment_id,
+    status_diff, schema_diff, body_diff, crashed,
+    request_id, completed_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+`, id, ruleID, accountID, appID, sourceDeploymentID, mirrorDeploymentID, statusDiff, schemaDiff, bodyDiff, crashed, requestID, completedAt)
 	if err != nil {
 		t.Fatalf("seed mirror ledger row: %v", err)
 	}
@@ -139,7 +146,7 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 	// uses completed_at for the rollup window.
 	for i := 0; i < 5; i++ {
 		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-time.Duration(i)*time.Minute),
-			false, false, false, false, false)
+			false, false, false, false)
 	}
 
 	// Roll the trailing hour. RollupOnce runs the additive-merge
@@ -189,11 +196,11 @@ func TestE2E_MirrorSweep_DeletesOnlyStaleRows(t *testing.T) {
 	// 3 stale (8d), 2 fresh (1d).
 	for i := 0; i < 3; i++ {
 		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(8*24*time.Hour + time.Duration(i)*time.Hour)),
-			false, false, false, false, false)
+			false, false, false, false)
 	}
 	for i := 0; i < 2; i++ {
 		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(24*time.Hour + time.Duration(i)*time.Hour)),
-			false, false, false, false, false)
+			false, false, false, false)
 	}
 
 	cutoff := now.Add(-7 * 24 * time.Hour)
