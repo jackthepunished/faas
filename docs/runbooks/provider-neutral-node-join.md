@@ -67,7 +67,8 @@ The release workflow must provide these local artifacts:
   is supplied, the pipeline issues/refreshes endpoint SANs locally and still
   never copies `ca/ca.key` to a compute host;
 - the image-signing private/public key pair;
-- a root-only `compute-db.env` containing `DATABASE_URL=...`.
+- a root-only `compute-db.env` containing non-empty `DATABASE_URL=...` and
+  `FAAS_VMMD_DBURL=...` entries for the same PostgreSQL DSN.
 
 For a production compute node, also provide the storage contract through the
 manifest or `--storage-device`. If backup is part of the node's responsibility,
@@ -104,7 +105,7 @@ them only in its short-lived runner workspace and never prints their values:
 | Secret | Contents |
 |---|---|
 | `COMPUTE_SSH_KEY` | private key that reaches the adopted host; the runner's SSH configuration must reach existing fleet peers |
-| `COMPUTE_DATABASE_URL` | PostgreSQL DSN written to the node's root-only `compute-db.env` |
+| `COMPUTE_DATABASE_URL` | PostgreSQL DSN used to write both database entries in the node's root-only `compute-db.env` |
 | `COMPUTE_STORAGE_ENV` | OCI storage contract (`FAAS_STORAGE_BACKEND=oci` and registry) |
 | `COMPUTE_PKI_TARBALL_B64` | base64 of a tar.gz containing `pki/ca/ca.crt` and compute leaves |
 | `COMPUTE_SIGN_KEY` / `COMPUTE_VERIFY_KEY` | image-signing key pair |

@@ -51,6 +51,43 @@ func TestDeployJoinValidate_DryRunNeedsOnlyManifestAndSSH(t *testing.T) {
 	}
 }
 
+func TestHasComputeDatabaseEnvRequiresBothDaemonVariables(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compute-db.env")
+
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "both entries",
+			body: "DATABASE_URL=postgres://faas@example/faas\nFAAS_VMMD_DBURL=postgres://faas@example/faas\n",
+			want: true,
+		},
+		{
+			name: "vmmd entry missing",
+			body: "DATABASE_URL=postgres://faas@example/faas\n",
+			want: false,
+		},
+		{
+			name: "empty vmmd entry",
+			body: "DATABASE_URL=postgres://faas@example/faas\nFAAS_VMMD_DBURL=\n",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := hasComputeDatabaseEnv(path); got != tt.want {
+				t.Fatalf("hasComputeDatabaseEnv() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDeployJoinValidate_RejectsControlPlane(t *testing.T) {
 	manifestPath := splitboxJoinManifest(t)
 	_, err := deployJoinValidate(deployJoinOptions{
@@ -405,7 +442,7 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 		}
 	}
 	computeDBEnv := filepath.Join(artifactDir, "compute-db.env")
-	if err := os.WriteFile(computeDBEnv, []byte("DATABASE_URL=postgres://faas@example/faas\n"), 0o600); err != nil {
+	if err := os.WriteFile(computeDBEnv, []byte("DATABASE_URL=postgres://faas@example/faas\nFAAS_VMMD_DBURL=postgres://faas@example/faas\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	storageEnv := filepath.Join(artifactDir, "storage.env")

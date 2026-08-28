@@ -4,3 +4,4 @@
     name: faas-vmmd
     state: restarted
   listen: restart faas-vmmd
+  when: not (faas_join_defer_service_handlers | default(false) | bool)

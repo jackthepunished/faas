@@ -485,8 +485,8 @@ func deployJoinValidate(opts deployJoinOptions) (deployJoinReport, error) {
 			return report, fmt.Errorf("--pki-dir is neither a valid compute trust bundle nor issuable operator PKI: trust validation failed; issuance=%w", issuanceErr)
 		}
 	}
-	if !hasDatabaseURLLine(opts.ComputeDBEnvSource) {
-		return report, errors.New("--compute-db-env must contain DATABASE_URL")
+	if !hasComputeDatabaseEnv(opts.ComputeDBEnvSource) {
+		return report, errors.New("--compute-db-env must contain non-empty DATABASE_URL and FAAS_VMMD_DBURL entries")
 	}
 	if opts.AnsibleVarsFile != "" {
 		if _, err := os.Stat(opts.AnsibleVarsFile); err != nil {
@@ -605,6 +605,10 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 		"faas_join_release_signature_source": signature,
 		"faas_join_release_sbom_source":      sbom,
 		"faas_join_builder_base_ref":         builderBaseRef,
+		// A clean provider-created host does not have the release binary or
+		// rendered daemon configuration yet. Defer only the service restart
+		// handlers until node_join.yml has installed and rendered both.
+		"faas_join_defer_service_handlers": true,
 	}
 	varsPath := filepath.Join(tempRoot, "join-vars.json")
 	body, err := json.Marshal(vars)
@@ -932,18 +936,25 @@ func overrideJoinHostVars(body []byte, opts *deployJoinOptions) []byte {
 	return []byte(strings.Join(lines, "\n"))
 }
 
-func hasDatabaseURLLine(path string) bool {
+func hasComputeDatabaseEnv(path string) bool {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
+	seen := map[string]bool{
+		"DATABASE_URL":    false,
+		"FAAS_VMMD_DBURL": false,
+	}
 	for _, line := range strings.Split(string(body), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "DATABASE_URL=") && len(strings.TrimSpace(strings.TrimPrefix(trimmed, "DATABASE_URL="))) > 0 {
-			return true
+		for key := range seen {
+			prefix := key + "="
+			if strings.HasPrefix(trimmed, prefix) && len(strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))) > 0 {
+				seen[key] = true
+			}
 		}
 	}
-	return false
+	return seen["DATABASE_URL"] && seen["FAAS_VMMD_DBURL"]
 }
 
 // validateSharedStorageEnv enforces the multi-box storage contract at the
