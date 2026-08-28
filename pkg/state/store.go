@@ -254,27 +254,6 @@ var ErrReorderNotPending = errors.New("state: reorder only valid for pending dep
 // HTTP 422 with the deployment_reorder_priority_invalid code.
 var ErrPriorityOutOfRange = errors.New("state: priority must be in [0, 1000]")
 
-// ErrInvalidMirrorPercent is returned by CreateMirrorRule /
-// UpdateMirrorRule when the requested percent falls outside
-// [0, 100]. Mirrors ErrInvalidTrafficPercent's contract exactly
-// so the apid surface can lift the traffic-split range-check
-// verbatim.
-var ErrInvalidMirrorPercent = errors.New("state: invalid mirror_rules.percent")
-
-// ErrMirrorSourceTargetSame is returned by CreateMirrorRule when
-// the caller passes the same deployment id for source and mirror.
-var ErrMirrorSourceTargetSame = errors.New("state: mirror_rules source_deployment_id == mirror_deployment_id")
-
-// ErrMirrorDeploymentNotLive is returned by CreateMirrorRule /
-// UpdateMirrorRule when one or both of the referenced deployments
-// is not in status='live'.
-var ErrMirrorDeploymentNotLive = errors.New("state: mirror_rules source/mirror deployment is not live")
-
-// ErrMirrorCrossAppMismatch is returned by CreateMirrorRule when
-// the source_deployment_id and mirror_deployment_id resolve to
-// different apps.
-var ErrMirrorCrossAppMismatch = errors.New("state: mirror_rules source/mirror deployment belong to different apps")
-
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
