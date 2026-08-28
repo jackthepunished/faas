@@ -52,13 +52,32 @@ import (
 )
 
 // StuckAfterDuration is the canned stuck-detection window
-// (commit 5's locked-in plan constant — 30 minutes). A row in
+// (commit 5's locked-in plan default — 30 minutes). A row in
 // rolling_out whose canary_step_started_at is older than this
 // window is considered stuck; the orchestrator logs a warning
 // per stuck row per tick (rate-limited via Stats so the log
 // doesn't flood) and leaves the auto-recovery to the manual
-// CLI. An env-var override is out of scope per the plan.
-const StuckAfterDuration = 30 * time.Minute
+// CLI. cmd/meterd calls SetStuckAfterDuration at boot to apply
+// the FAAS_SAFEDEPLOY_STUCK_AFTER env override — production
+// tuning never requires a code change. The var/duplication
+// with pkg/state.RecoverRolloutStuckAfter is intentional —
+// pkg/safedeploy cannot import pkg/state, so the two stay in
+// lockstep via test-pinned equality (orchestrator_test.go).
+var StuckAfterDuration = 30 * time.Minute
+
+// SetStuckAfterDuration overrides the canned stuck-detection
+// window at boot. Called once by cmd/meterd after it parses
+// FAAS_SAFEDEPLOY_STUCK_AFTER. The setter is intentionally
+// exported so the binary entrypoint can wire it without a new
+// setter-on-Orchestrator surface. Values <= 0 are silently
+// ignored so a bad env parse never inverts the stuck predicate
+// (which would silently mark every fresh rollout as stuck).
+func SetStuckAfterDuration(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	StuckAfterDuration = d
+}
 
 // Store is the slice of pkg/state.Store the orchestrator needs.
 // Declared locally so pkg/safedeploy stays import-cycle-free

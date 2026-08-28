@@ -6073,3 +6073,36 @@ func mustInsertDeployment(t *testing.T, m *MemStore, d Deployment) {
 	defer m.mu.Unlock()
 	m.deployments[d.ID] = d
 }
+
+// TestRecoverRolloutStuckAfter_EnvOverride pins the
+// env-scoped stuck-after threshold setter
+// (production-leveling Stream C): a positive duration
+// updates the var; zero / negative values are silently
+// ignored so a bad env parse never inverts the stuck
+// predicate. The test saves + restores the original
+// var so the package-level mutation doesn't leak into
+// sibling tests in the same `go test` run.
+func TestRecoverRolloutStuckAfter_EnvOverride(t *testing.T) {
+	original := RecoverRolloutStuckAfter
+	t.Cleanup(func() { RecoverRolloutStuckAfter = original })
+
+	// 1) positive duration applies.
+	SetRecoverRolloutStuckAfter(5 * time.Minute)
+	if got := RecoverRolloutStuckAfter; got != 5*time.Minute {
+		t.Errorf("after SetRecoverRolloutStuckAfter(5m): got %s, want 5m", got)
+	}
+
+	// 2) zero is silently ignored (var stays at 5m).
+	SetRecoverRolloutStuckAfter(0)
+	if got := RecoverRolloutStuckAfter; got != 5*time.Minute {
+		t.Errorf("after SetRecoverRolloutStuckAfter(0): got %s, want 5m (zero must be ignored)", got)
+	}
+
+	// 3) negative is silently ignored (would invert the
+	// stuck predicate if applied — silent ignore is the
+	// documented contract).
+	SetRecoverRolloutStuckAfter(-1 * time.Second)
+	if got := RecoverRolloutStuckAfter; got != 5*time.Minute {
+		t.Errorf("after SetRecoverRolloutStuckAfter(-1s): got %s, want 5m (negative must be ignored)", got)
+	}
+}

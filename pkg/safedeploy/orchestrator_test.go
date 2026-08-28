@@ -381,3 +381,29 @@ func TestOrchestrator_NoPendingRows_NoOp(t *testing.T) {
 		t.Errorf("list calls = %d; want 1", store.listCalls)
 	}
 }
+
+// TestSetStuckAfterDuration_EnvOverride pins the env-scoped
+// stuck-after setter (production-leveling Stream C, mirror of
+// pkg/state.TestRecoverRolloutStuckAfter_EnvOverride): a positive
+// duration applies, zero + negative are silently ignored so a bad
+// env parse never inverts the stuck predicate (which would mark
+// every fresh rollout as stuck).
+func TestSetStuckAfterDuration_EnvOverride(t *testing.T) {
+	original := StuckAfterDuration
+	t.Cleanup(func() { StuckAfterDuration = original })
+
+	SetStuckAfterDuration(5 * time.Minute)
+	if got := StuckAfterDuration; got != 5*time.Minute {
+		t.Errorf("after SetStuckAfterDuration(5m) = %s; want 5m", got)
+	}
+
+	SetStuckAfterDuration(0)
+	if got := StuckAfterDuration; got != 5*time.Minute {
+		t.Errorf("after SetStuckAfterDuration(0) = %s; want 5m (zero must be ignored)", got)
+	}
+
+	SetStuckAfterDuration(-1 * time.Second)
+	if got := StuckAfterDuration; got != 5*time.Minute {
+		t.Errorf("after SetStuckAfterDuration(-1s) = %s; want 5m (negative must be ignored)", got)
+	}
+}

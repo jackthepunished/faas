@@ -789,6 +789,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// flag is on. A bad parse logs and falls through to mc.Defaults().
 	applyEnvTick("FAAS_UPSTREAM_PROBE_INTERVAL", &mc.UpstreamProbeInterval, deps.getenv, log)
 	applyEnvTick("FAAS_UPSTREAM_PROBE_PARTITION_INTERVAL", &mc.UpstreamPartitionCreateInterval, deps.getenv, log)
+	// Production-leveling Stream C: env-scoped stuck-after
+	// threshold (FAAS_SAFEDEPLOY_STUCK_AFTER). The var must be
+	// applied before the safedeploy orchestrator's walkRow
+	// reads StuckAfterDuration — both setters happen at boot
+	// before any tick goroutine starts (runTicks is spawned
+	// after this block). The setter silently ignores <= 0 so a
+	// bad parse falls through to the canned 30 min default.
+	safedeploy.SetStuckAfterDuration(stuckAfterFromEnvMeterd(deps.getenv, log))
+	state.SetRecoverRolloutStuckAfter(stuckAfterFromEnvMeterd(deps.getenv, log))
 	// ADR-123: cert-expiry refresher + MTD spend aggregator
 	// cadences. Defaults live in cmd/meterd/alert_presets_ticks.go
 	// so the loops and the env-tick parser share the same source
@@ -1116,6 +1125,29 @@ func applyEnvTick(key string, dst *time.Duration, getenv func(string) string, lo
 		return
 	}
 	*dst = d
+}
+
+// stuckAfterFromEnvMeterd reads FAAS_SAFEDEPLOY_STUCK_AFTER for
+// the safedeploy orchestrator's StuckAfterDuration var (production-
+// leveling Stream C). Mirrors cmd/apid/main.go::stuckAfterFromEnv;
+// takes deps.getenv so tests can stub the env without mutating the
+// process env. Returns 0 on unset / unparseable so the setter
+// silently ignores it and the canned 30 min default stays in
+// effect.
+func stuckAfterFromEnvMeterd(getenv func(string) string, log *slog.Logger) time.Duration {
+	v := getenv("FAAS_SAFEDEPLOY_STUCK_AFTER")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		if log != nil {
+			log.Warn("FAAS_SAFEDEPLOY_STUCK_AFTER unparseable, using default",
+				"value", v, "err", err)
+		}
+		return 0
+	}
+	return d
 }
 
 // buildAlertEvaluator wires the alert-evaluator (issue #396 /
