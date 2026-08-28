@@ -23,6 +23,7 @@ from .alert_preset_response_comparison import AlertPresetResponseComparison
 from .alert_preset_response_minimum_plan import AlertPresetResponseMinimumPlan
 from .alert_preset_response_window_spec import AlertPresetResponseWindowSpec
 from .alert_rule_response import AlertRuleResponse
+from .alert_rule_response_action import AlertRuleResponseAction
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
 from .alert_rule_response_metric import AlertRuleResponseMetric
@@ -69,6 +70,7 @@ from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_slo_response import AppSLOResponse
 from .app_slo_response_window import AppSLOResponseWindow
+from .app_static_egress_ip_response import AppStaticEgressIPResponse
 from .app_streaming_status import AppStreamingStatus
 from .app_streaming_status_cap_kind import AppStreamingStatusCapKind
 from .app_streaming_status_status import AppStreamingStatusStatus
@@ -122,16 +124,21 @@ from .build_response_kind import BuildResponseKind
 from .build_response_status import BuildResponseStatus
 from .canary_preset_spec import CanaryPresetSpec
 from .canary_preset_spec_preset import CanaryPresetSpecPreset
-from .canary_stage import CanaryStage
+from .cancel_deployment_request import CancelDeploymentRequest
+from .cancel_deployment_request_reason import CancelDeploymentRequestReason
+from .cancel_deployment_response_200 import CancelDeploymentResponse200
 from .change_member_role_request import ChangeMemberRoleRequest
 from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
+from .clear_obsolete_deployments_body import ClearObsoleteDeploymentsBody
+from .clear_obsolete_report import ClearObsoleteReport
 from .consume_invoice_response import ConsumeInvoiceResponse
 from .consumed_credit_row import ConsumedCreditRow
 from .cors_preset_list_response import CorsPresetListResponse
 from .cors_preset_response import CorsPresetResponse
 from .create_alert_rule_request import CreateAlertRuleRequest
+from .create_alert_rule_request_action import CreateAlertRuleRequestAction
 from .create_alert_rule_request_comparison import CreateAlertRuleRequestComparison
 from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFailureSource
 from .create_alert_rule_request_metric import CreateAlertRuleRequestMetric
@@ -186,12 +193,20 @@ from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
 from .csrf_token_response import CSRFTokenResponse
 from .custom_domain_response import CustomDomainResponse
+from .custom_stage import CustomStage
 from .daily_usage_list_response import DailyUsageListResponse
 from .daily_usage_response import DailyUsageResponse
 from .data_upstream_list_response import DataUpstreamListResponse
 from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
+from .debug_compare_request import DebugCompareRequest
+from .debug_compare_response import DebugCompareResponse
+from .debug_compare_route_stats import DebugCompareRouteStats
+from .debug_regression_item import DebugRegressionItem
+from .debug_regressions_response import DebugRegressionsResponse
+from .debug_replay_response import DebugReplayResponse
+from .debug_replay_response_status import DebugReplayResponseStatus
 from .debug_telemetry_list_response import DebugTelemetryListResponse
 from .debug_telemetry_request_item import DebugTelemetryRequestItem
 from .debug_telemetry_request_item_method import DebugTelemetryRequestItemMethod
@@ -207,6 +222,7 @@ from .deployment_list_response import DeploymentListResponse
 from .deployment_liveness_probe import DeploymentLivenessProbe
 from .deployment_preview_url import DeploymentPreviewURL
 from .deployment_response import DeploymentResponse
+from .deployment_response_canary_preset import DeploymentResponseCanaryPreset
 from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
@@ -221,6 +237,7 @@ from .deployment_response_override_env_secret_refs import DeploymentResponseOver
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .deployment_response_rollout_state import DeploymentResponseRolloutState
 from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
 from .diff_app_config_patch_app_protocol import DiffAppConfigPatchAppProtocol
@@ -380,6 +397,11 @@ from .mirror_rule_list_response import MirrorRuleListResponse
 from .mirror_rule_response import MirrorRuleResponse
 from .mirror_summary_response import MirrorSummaryResponse
 from .o_auth_provider_capability import OAuthProviderCapability
+from .obs_health_response import ObsHealthResponse
+from .obs_health_response_operator_intent_outcome_missing_total import (
+    ObsHealthResponseOperatorIntentOutcomeMissingTotal,
+)
+from .obs_health_response_trace_id_completeness_ratio import ObsHealthResponseTraceIdCompletenessRatio
 from .oidc_exchange_request import OIDCExchangeRequest
 from .oidc_exchange_response import OIDCExchangeResponse
 from .operator_intent_accepted_response import OperatorIntentAcceptedResponse
@@ -474,6 +496,8 @@ from .recover_rollout_request import RecoverRolloutRequest
 from .recover_rollout_request_action import RecoverRolloutRequestAction
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
+from .reorder_deployment_body import ReorderDeploymentBody
+from .reorder_deployment_response_200 import ReorderDeploymentResponse200
 from .repo_response import RepoResponse
 from .retry_deployment_request import RetryDeploymentRequest
 from .retry_deployment_request_from_stage import RetryDeploymentRequestFromStage
@@ -507,6 +531,7 @@ from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_account_egress_allowlist_extra_request import SetAccountEgressAllowlistExtraRequest
+from .set_app_static_egress_ip_request import SetAppStaticEgressIPRequest
 from .set_grace_window_request import SetGraceWindowRequest
 from .set_password_request import SetPasswordRequest
 from .severity_counts import SeverityCounts
@@ -557,6 +582,7 @@ from .trigger_source_type_2_type_1 import TriggerSourceType2Type1
 from .trigger_source_type_3_type_1 import TriggerSourceType3Type1
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
+from .update_alert_rule_request_action import UpdateAlertRuleRequestAction
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
@@ -626,6 +652,7 @@ __all__ = (
     "AlertPresetResponseMinimumPlan",
     "AlertPresetResponseWindowSpec",
     "AlertRuleResponse",
+    "AlertRuleResponseAction",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",
     "AlertRuleResponseMetric",
@@ -678,6 +705,7 @@ __all__ = (
     "AppsMetricsResponse",
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
+    "AppStaticEgressIPResponse",
     "AppStreamingStatus",
     "AppStreamingStatusCapKind",
     "AppStreamingStatusStatus",
@@ -725,16 +753,21 @@ __all__ = (
     "BuildResponseStatus",
     "CanaryPresetSpec",
     "CanaryPresetSpecPreset",
-    "CanaryStage",
+    "CancelDeploymentRequest",
+    "CancelDeploymentRequestReason",
+    "CancelDeploymentResponse200",
     "ChangeMemberRoleRequest",
     "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
     "ChangePlanRequestPlan",
+    "ClearObsoleteDeploymentsBody",
+    "ClearObsoleteReport",
     "ConsumedCreditRow",
     "ConsumeInvoiceResponse",
     "CorsPresetListResponse",
     "CorsPresetResponse",
     "CreateAlertRuleRequest",
+    "CreateAlertRuleRequestAction",
     "CreateAlertRuleRequestComparison",
     "CreateAlertRuleRequestFailureSource",
     "CreateAlertRuleRequestMetric",
@@ -785,12 +818,20 @@ __all__ = (
     "CronRunOutcome",
     "CSRFTokenResponse",
     "CustomDomainResponse",
+    "CustomStage",
     "DailyUsageListResponse",
     "DailyUsageResponse",
     "DataUpstreamListResponse",
     "DataUpstreamResponse",
     "DataUpstreamResponseKind",
     "DataUpstreamResponseSource",
+    "DebugCompareRequest",
+    "DebugCompareResponse",
+    "DebugCompareRouteStats",
+    "DebugRegressionItem",
+    "DebugRegressionsResponse",
+    "DebugReplayResponse",
+    "DebugReplayResponseStatus",
     "DebugTelemetryListResponse",
     "DebugTelemetryRequestItem",
     "DebugTelemetryRequestItemMethod",
@@ -806,6 +847,7 @@ __all__ = (
     "DeploymentLivenessProbe",
     "DeploymentPreviewURL",
     "DeploymentResponse",
+    "DeploymentResponseCanaryPreset",
     "DeploymentResponseDeployedViaType1",
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
@@ -816,6 +858,7 @@ __all__ = (
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DeploymentResponseRolloutState",
     "DeploymentResponseTag",
     "DiffAppConfigPatch",
     "DiffAppConfigPatchAppProtocol",
@@ -975,6 +1018,9 @@ __all__ = (
     "MirrorRuleResponse",
     "MirrorSummaryResponse",
     "OAuthProviderCapability",
+    "ObsHealthResponse",
+    "ObsHealthResponseOperatorIntentOutcomeMissingTotal",
+    "ObsHealthResponseTraceIdCompletenessRatio",
     "OIDCExchangeRequest",
     "OIDCExchangeResponse",
     "OperatorIntentAcceptedResponse",
@@ -1069,6 +1115,8 @@ __all__ = (
     "RecoverRolloutRequestAction",
     "RekeyProgress",
     "RenameAppRequest",
+    "ReorderDeploymentBody",
+    "ReorderDeploymentResponse200",
     "RepoResponse",
     "RetryDeploymentRequest",
     "RetryDeploymentRequestFromStage",
@@ -1100,6 +1148,7 @@ __all__ = (
     "SessionListResponse",
     "SessionsRevokeAllResponse",
     "SetAccountEgressAllowlistExtraRequest",
+    "SetAppStaticEgressIPRequest",
     "SetGraceWindowRequest",
     "SetPasswordRequest",
     "SeverityCounts",
@@ -1150,6 +1199,7 @@ __all__ = (
     "TriggerSourceType3Type1",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
+    "UpdateAlertRuleRequestAction",
     "UpdateAlertRuleRequestComparison",
     "UpdateAlertRuleRequestMetric",
     "UpdateAlertRuleRequestWindowSpec",

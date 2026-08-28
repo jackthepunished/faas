@@ -10,7 +10,7 @@ from ..models.canary_preset_spec_preset import CanaryPresetSpecPreset, check_can
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.canary_stage import CanaryStage
+    from ..models.custom_stage import CustomStage
 
 
 T = TypeVar("T", bound="CanaryPresetSpec")
@@ -36,7 +36,7 @@ class CanaryPresetSpec:
     preset: CanaryPresetSpecPreset
     """Catalog preset name. 'none' = no canary (server stamps canary_preset='none', canary_total_steps=0). 'custom'
     requires Stages to be non-empty."""
-    stages: list[CanaryStage] | Unset = UNSET
+    stages: list[CustomStage] | Unset = UNSET
     """Per-stage ladder. Required when preset='custom' (the apid handler 422s otherwise); ignored for catalog
     presets (the catalog resolution runs server-side)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -65,17 +65,17 @@ class CanaryPresetSpec:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.canary_stage import CanaryStage
+        from ..models.custom_stage import CustomStage
 
         d = dict(src_dict)
         preset = check_canary_preset_spec_preset(d.pop("preset"))
 
         _stages = d.pop("stages", UNSET)
-        stages: list[CanaryStage] | Unset = UNSET
+        stages: list[CustomStage] | Unset = UNSET
         if _stages is not UNSET:
             stages = []
             for stages_item_data in _stages:
-                stages_item = CanaryStage.from_dict(stages_item_data)
+                stages_item = CustomStage.from_dict(stages_item_data)
 
                 stages.append(stages_item)
 
