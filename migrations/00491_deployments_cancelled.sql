@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00488_deployments_cancelled.sql
+-- filename: 00491_deployments_cancelled.sql
 -- ADR-124 deployment queue controls — M1: 'cancelled' status on deployments.
 --
 -- Closes the API surface gap from docs/adr/089-build-status-endpoint.md
