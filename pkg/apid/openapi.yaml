@@ -12285,22 +12285,6 @@ components:
           type: string
           description: "Operator or orchestrator reason recorded when the rollout is aborted."
 
-    CanaryPresetSpec:
-      description: "Progressive canary rollout preset requested on deployment creation (issue #976 / ADR-122)."
-      type: object
-      required: [preset]
-      properties:
-        preset:
-          type: string
-          enum: [none, slow, balanced, aggressive, 1-10-50-100]
-          description: "Closed-set canary ladder catalog name."
-        step_durations:
-          type: array
-          items:
-            type: integer
-            minimum: 0
-          description: "Optional step durations encoded as Go time.Duration nanoseconds; reserved for custom-ladder support."
-
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
       type: object
@@ -12966,13 +12950,6 @@ components:
             - $ref: '#/components/schemas/CanaryPresetSpec'
             - type: 'null'
           description: "Per-deployment canary ladder (issue #976 / ADR-122 / SAFE-RELEASES-A). nil/omitted = server default 'none'. For preset='custom', stages carries the customer ladder."
-
-        # SAFE-RELEASES-A: optional progressive canary preset.
-        canary:
-          oneOf:
-            - $ref: '#/components/schemas/CanaryPresetSpec'
-            - type: 'null'
-          description: "Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only."
 
     CreateDeploymentOverrides:
       description: |

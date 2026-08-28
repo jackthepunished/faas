@@ -1459,21 +1459,6 @@ type Deployment struct {
 	// UpdateDeploymentTraffic transaction live in pgstore.go, not
 	// here — this struct just carries the field.
 	TrafficPercent int `json:"traffic_percent,omitempty"`
-	// CanaryPreset / CanaryStep / CanaryTotalSteps describe the
-	// progressive traffic ladder for this deployment. The migration
-	// defaults preserve the historical single-deployment behavior.
-	CanaryPreset        string     `json:"canary_preset,omitempty"`
-	CanaryStep          int        `json:"canary_step,omitempty"`
-	CanaryTotalSteps    int        `json:"canary_total_steps,omitempty"`
-	CanaryStepStartedAt *time.Time `json:"canary_step_started_at,omitempty"`
-	// Rollout* is the durable safe-deploy state machine. Pending is the
-	// default for ordinary deployments; the orchestrator and manual
-	// recovery command advance it atomically with deployment_audit.
-	RolloutState         string     `json:"rollout_state,omitempty"`
-	RolloutStartedAt     *time.Time `json:"rollout_started_at,omitempty"`
-	RolloutCompletedAt   *time.Time `json:"rollout_completed_at,omitempty"`
-	RolloutAbortedAt     *time.Time `json:"rollout_aborted_at,omitempty"`
-	RolloutAbortedReason string     `json:"rollout_aborted_reason,omitempty"`
 	// Scan columns (issue #464 / ADR-055 / PR-3). Per-deploy grype
 	// scan result, status, and scanned_at. Mirror the deployments
 	// table columns added by migrations/00135. The pgstore reads
