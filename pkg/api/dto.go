@@ -6273,6 +6273,76 @@ type DebugTelemetryListResponse struct {
 	Requests []DebugTelemetryRequestItem `json:"requests"`
 }
 
+// DebugRegressionItem is one row of debug_regression_observations
+// (ADR-127 / PR-B) returned by GET /v1/apps/{slug}/debug/regressions.
+// Factor is a NUMERIC(5,2) so the wire serialises as a JSON
+// number with up to 2 decimal places (1.20, 1.05, 2.43).
+type DebugRegressionItem struct {
+	DeploymentID    string `json:"deployment_id"`
+	Route           string `json:"route"`
+	P95MS           int    `json:"p95_ms"`
+	P95BaseMS       int    `json:"p95_base_ms"`
+	AffectedCount   int    `json:"affected_count"`
+	Factor          string `json:"regression_factor"`
+	FirstDetectedAt string `json:"first_detected_at"`
+	LastDetectedAt  string `json:"last_detected_at"`
+}
+
+// DebugRegressionsResponse is the wire envelope for the debug
+// regressions endpoint. `Since` echoes the effective window
+// applied (after the plan's DebugTelemetryRetentionDays clamp).
+type DebugRegressionsResponse struct {
+	Since       string                `json:"since"`
+	Regressions []DebugRegressionItem `json:"regressions"`
+}
+
+// DebugCompareRequest is the body shape for POST /v1/apps/{slug}
+// /debug/compare (ADR-127 / PR-B). Source and mirror are
+// deployment_ids; route is optional (empty = all routes); since
+// and until constrain the window.
+type DebugCompareRequest struct {
+	Source string `json:"source"`
+	Mirror string `json:"mirror"`
+	Route  string `json:"route,omitempty"`
+	Since  string `json:"since,omitempty"` // duration string ("3h", "7d")
+	Until  string `json:"until,omitempty"` // RFC3339 or empty for now
+}
+
+// DebugCompareRouteStats is the per-route stats row in the
+// compare response. P50/P95/P99 are computed from the same
+// percentile_cont aggregate as RequestTelemetryBaselineP95ByRoute
+// (PR-A). Count is the row count in the window for that route.
+type DebugCompareRouteStats struct {
+	Route     string `json:"route"`
+	SourceP50 int    `json:"source_p50_ms"`
+	SourceP95 int    `json:"source_p95_ms"`
+	SourceP99 int    `json:"source_p99_ms"`
+	SourceN   int64  `json:"source_count"`
+	MirrorP50 int    `json:"mirror_p50_ms"`
+	MirrorP95 int    `json:"mirror_p95_ms"`
+	MirrorP99 int    `json:"mirror_p99_ms"`
+	MirrorN   int64  `json:"mirror_count"`
+}
+
+// DebugCompareResponse is the wire envelope for the debug compare
+// endpoint. Routes is empty when both deployments had no traffic
+// in the window.
+type DebugCompareResponse struct {
+	Source string                   `json:"source"`
+	Mirror string                   `json:"mirror"`
+	Routes []DebugCompareRouteStats `json:"routes"`
+}
+
+// DebugReplayResponse is the wire envelope for the debug replay
+// endpoint. PR-B returns the underlying mirror invocation
+// identifier; PR-C's LLM-synthesis layer will populate the prose
+// body. PR-B deliberately keeps the response shape minimal — the
+// real value of replay surfaces in PR-C.
+type DebugReplayResponse struct {
+	MirrorInvocationID string `json:"mirror_invocation_id,omitempty"`
+	Status             string `json:"status"`
+}
+
 // ---- SAFE-RELEASES-R (issue #976 / ADR-122 / Mega PR #2 commit 6) ----
 
 // AllowedRecoverRolloutActions is the closed-set vocabulary for

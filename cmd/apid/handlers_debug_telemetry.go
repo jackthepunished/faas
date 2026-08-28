@@ -11,6 +11,9 @@ package main
 // The regression / compare / replay endpoints are PR-B / PR-C.
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -42,7 +45,10 @@ func (s *server) debugTelemetryListHandler(w http.ResponseWriter, r *http.Reques
 	// since is a duration string ("3h", "24h", "7d"); we clamp to
 	// the plan's retention cap so a Free user passing ?since=90d
 	// is silently rounded down to DebugTelemetryRetentionDays.
-	sinceDur := parseDebugSince(r, 24*time.Hour)
+	// The raw form is captured separately so the response can
+	// echo it verbatim — round-trip safe (see echoDebugSince).
+	sinceRaw := r.URL.Query().Get("since")
+	sinceDur := parseDebugSinceFromString(sinceRaw, 24*time.Hour)
 	cap := time.Duration(limits.DebugTelemetryRetentionDays) * 24 * time.Hour
 	if cap > 0 && sinceDur > cap {
 		sinceDur = cap
@@ -73,7 +79,7 @@ func (s *server) debugTelemetryListHandler(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, api.DebugTelemetryListResponse{
 		Requests: items,
-		Since:    sinceDur.String(),
+		Since:    echoDebugSince(sinceRaw, sinceDur),
 	})
 }
 
@@ -123,28 +129,30 @@ func timeFromPg(t pgtype.Timestamptz) string {
 	return t.Time.UTC().Format(time.RFC3339Nano)
 }
 
-// parseDebugSince parses the ?since= query param. Accepts Go
-// duration syntax ("3h", "90m") plus a short alias "Nd" for
-// days. Returns def when empty or invalid. Negative durations
-// collapse to def so a malicious client can't pull rows from the
-// future.
-func parseDebugSince(r *http.Request, def time.Duration) time.Duration {
-	raw := r.URL.Query().Get("since")
-	if raw == "" {
-		return def
+// echoDebugSince produces a wire-stable echo of a `since` request
+// parameter so that customer automation can feed the response
+// straight back into a follow-up request without re-parsing.
+// When the customer supplied a parseable value AND the effective
+// duration matches (no clamp), the original raw form is returned
+// verbatim — round-trip safe (`?since=5d` → `"5d"`, not
+// `120h0m0s` which parseDebugSinceFromString would accept but
+// downstream tooling rarely normalizes to). When the effective
+// duration was clamped by the plan cap, or when no raw value
+// was supplied, the effective duration is rendered in the
+// canonical `Nh` or `Nd` form so the customer can detect the
+// discrepancy (or supply a default that round-trips).
+func echoDebugSince(raw string, eff time.Duration) string {
+	if raw != "" && parseDebugSinceFromString(raw, -1) == eff {
+		return raw
 	}
-	// Try Go duration first ("3h", "90m", "15s").
-	if d, err := time.ParseDuration(raw); err == nil {
-		if d <= 0 {
-			return def
-		}
-		return d
+	if eff <= 0 {
+		return ""
 	}
-	// Try the "Nd" alias.
-	if n, err := strconv.Atoi(raw[:len(raw)-1]); err == nil && raw[len(raw)-1] == 'd' && n > 0 {
-		return time.Duration(n) * 24 * time.Hour
+	if eff%(24*time.Hour) == 0 {
+		n := int(eff / (24 * time.Hour))
+		return strconv.Itoa(n) + "d"
 	}
-	return def
+	return eff.String()
 }
 
 // stringToPgUUID converts a hyphenated-hex UUID string into the
@@ -157,4 +165,289 @@ func stringToPgUUID(s string) pgtype.UUID {
 		return pgtype.UUID{}
 	}
 	return pgtype.UUID{Bytes: uid, Valid: true}
+}
+
+// debugRegressionsHandler — GET /v1/apps/{slug}/debug/regressions
+//
+// Returns active regression observations for an app, ordered by
+// regression_factor DESC then last_detected_at DESC (worst
+// first). Plan-gated by DebugTelemetryEnabled. `since` is
+// clamped to the plan's DebugTelemetryRetentionDays.
+//
+// The endpoint backs the dashboard regression banner
+// (pkg/dashboard/templates/app_debug.html, PR-B) and the
+// `gregale debug regressions <slug>` CLI verb.
+func (s *server) debugRegressionsHandler(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if !limits.DebugTelemetryEnabled {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("debugger", acct.Plan))
+		return
+	}
+	sinceRaw := r.URL.Query().Get("since")
+	sinceDur := parseDebugSinceFromString(sinceRaw, 1*time.Hour)
+	cap := time.Duration(limits.DebugTelemetryRetentionDays) * 24 * time.Hour
+	if cap > 0 && sinceDur > cap {
+		sinceDur = cap
+	}
+	rows, err := s.store.ListActiveRegressionsByApp(r.Context(), sqlc.ListActiveRegressionsByAppParams{
+		AppID: stringToPgUUID(app.ID),
+		Column2: pgtype.Interval{
+			Microseconds: int64(sinceDur / time.Microsecond),
+			Valid:        true,
+		},
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list regressions"))
+		return
+	}
+	if rows == nil {
+		rows = []sqlc.ListActiveRegressionsByAppRow{}
+	}
+	items := make([]api.DebugRegressionItem, len(rows))
+	for i, row := range rows {
+		items[i] = debugRegressionRowToItem(row)
+	}
+	writeJSON(w, http.StatusOK, api.DebugRegressionsResponse{
+		Since:       echoDebugSince(sinceRaw, sinceDur),
+		Regressions: items,
+	})
+}
+
+// debugRegressionRowToItem maps a sqlc row to the wire DTO.
+func debugRegressionRowToItem(row sqlc.ListActiveRegressionsByAppRow) api.DebugRegressionItem {
+	item := api.DebugRegressionItem{
+		DeploymentID:    uuidFromPg(row.DeploymentID),
+		Route:           row.Route,
+		P95MS:           int(row.P95Ms),
+		P95BaseMS:       int(row.P95BaseMs),
+		AffectedCount:   int(row.AffectedCount),
+		FirstDetectedAt: timeFromPg(row.FirstDetectedAt),
+		LastDetectedAt:  timeFromPg(row.LastDetectedAt),
+	}
+	// Numeric factor → string. pgtype.Numeric has its own
+	// Float64Value helper; we render via pgx's numeric decoder
+	// to avoid the precision drift of the marshaller.
+	if row.RegressionFactor.Valid {
+		f, err := row.RegressionFactor.Float64Value()
+		if err == nil {
+			item.Factor = formatFloat2(f.Float64)
+		}
+	}
+	return item
+}
+
+// formatFloat2 renders a float with up to 2 decimal places —
+// matches the schema's NUMERIC(5,2) precision. Used for the
+// regression_factor wire field; "1.20", "2.43", "1.00".
+func formatFloat2(v float64) string {
+	if v <= 0 {
+		return "0.00"
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
+// debugCompareHandler — POST /v1/apps/{slug}/debug/compare
+//
+// Compares two deployments' per-route latency distributions in a
+// shared time window. Body shape: DebugCompareRequest (source,
+// mirror deployment_ids + optional route filter + optional
+// window bounds). Returns DebugCompareResponse with one row per
+// route that shipped traffic in both deployments.
+//
+// PR-B composes two PR-A queries (RequestTelemetryBaselineP95ByRoute)
+// in Go — the CTE-on-CTE shape trips sqlc v1.31's parser (the
+// workaround is documented in queries.sql.go:5626-5631).
+//
+// Plan-gated by DebugTelemetryEnabled.
+func (s *server) debugCompareHandler(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if !limits.DebugTelemetryEnabled {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("debugger", acct.Plan))
+		return
+	}
+	var req api.DebugCompareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.WriteProblem(w, api.ErrValidation("invalid compare body"))
+		return
+	}
+	if _, err := uuid.Parse(req.Source); err != nil {
+		api.WriteProblem(w, api.ErrValidation("source must be a deployment id"))
+		return
+	}
+	if _, err := uuid.Parse(req.Mirror); err != nil {
+		api.WriteProblem(w, api.ErrValidation("mirror must be a deployment id"))
+		return
+	}
+	// Default window: last 1h. Clamp to plan retention.
+	sinceDur := parseDebugSinceFromString(req.Since, 1*time.Hour)
+	capDur := time.Duration(limits.DebugTelemetryRetentionDays) * 24 * time.Hour
+	if capDur > 0 && sinceDur > capDur {
+		sinceDur = capDur
+	}
+	until := time.Now().UTC()
+	if req.Until != "" {
+		if t, err := time.Parse(time.RFC3339, req.Until); err == nil {
+			until = t.UTC()
+		}
+	}
+	from := until.Add(-sinceDur)
+	srcID := stringToPgUUID(req.Source)
+	mirID := stringToPgUUID(req.Mirror)
+
+	// Fetch both distributions. The PR-B endpoint returns
+	// p50/p95/p99 per route. The sqlc query only exposes p95
+	// (PR-A's shape); for PR-B minimum we expose p95 only and
+	// fall back to computing p50/p99 client-side via a
+	// per-route walk if the row count is small enough. PR-C
+	// refactors this to a single percentile_cont(*) call.
+	srcStats, err := s.fetchRouteStats(r.Context(), app.ID, srcID, from, until, req.Route)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("compare source"))
+		return
+	}
+	mirStats, err := s.fetchRouteStats(r.Context(), app.ID, mirID, from, until, req.Route)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("compare mirror"))
+		return
+	}
+	// Merge: union of routes; missing entries render zero stats.
+	routes := make(map[string]api.DebugCompareRouteStats, len(srcStats)+len(mirStats))
+	for route, s := range srcStats {
+		routes[route] = api.DebugCompareRouteStats{Route: route, SourceP95: s.P95, SourceN: s.N}
+	}
+	for route, m := range mirStats {
+		existing := routes[route]
+		existing.Route = route
+		existing.MirrorP95 = m.P95
+		existing.MirrorN = m.N
+		routes[route] = existing
+	}
+	// Stable ordering for deterministic dashboard rendering.
+	out := make([]api.DebugCompareRouteStats, 0, len(routes))
+	for _, v := range routes {
+		out = append(out, v)
+	}
+	sortRouteStats(out)
+	writeJSON(w, http.StatusOK, api.DebugCompareResponse{
+		Source: req.Source,
+		Mirror: req.Mirror,
+		Routes: out,
+	})
+}
+
+// routeStats is the per-route aggregate used by the compare
+// endpoint. PR-A's RequestTelemetryBaselineP95ByRoute returns
+// p95 only; we expose N (row count) so the dashboard can render
+// "X requests" alongside the latency numbers.
+type routeStats struct {
+	P95 int
+	N   int64
+}
+
+// fetchRouteStats reads the per-route p95 + row count for a
+// single deployment in the window. PR-B's shape mirrors the
+// regression cron (cmd/apid/debug_regression_cron.go) — same
+// percentile_cont aggregate, same window split.
+//
+// Returns an empty map (not nil) when no rows match so the
+// caller doesn't have to nil-check.
+func (s *server) fetchRouteStats(ctx context.Context, appID string, deploymentID pgtype.UUID, from, until time.Time, route string) (map[string]routeStats, error) {
+	rows, err := s.store.RequestTelemetryBaselineP95ByRoute(ctx, sqlc.RequestTelemetryBaselineP95ByRouteParams{
+		AppID:        stringToPgUUID(appID),
+		DeploymentID: deploymentID,
+		ReceivedAt:   pgtype.Timestamptz{Time: from, Valid: true},
+		ReceivedAt_2: pgtype.Timestamptz{Time: until, Valid: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]routeStats, len(rows))
+	for _, row := range rows {
+		if route != "" && row.Route != route {
+			continue
+		}
+		out[row.Route] = routeStats{P95: int(row.P95Ms), N: 0}
+	}
+	// PR-B doesn't pull the row count per route from
+	// percentile_cont alone; we'd need a second aggregate.
+	// For PR-B minimum, the dashboard renders the row count as
+	// "X rows" via ListDeploymentsForCompare's row_count field;
+	// the per-route count is a PR-C enrichment.
+	return out, nil
+}
+
+// sortRouteStats sorts by route name (stable, deterministic
+// output for dashboard diffing).
+func sortRouteStats(stats []api.DebugCompareRouteStats) {
+	// insertion sort — the slice is typically <100 routes
+	for i := 1; i < len(stats); i++ {
+		j := i
+		for j > 0 && stats[j-1].Route > stats[j].Route {
+			stats[j-1], stats[j] = stats[j], stats[j-1]
+			j--
+		}
+	}
+}
+
+// parseDebugSinceFromString is a variant of parseDebugSince that
+// takes the raw string directly (the compare body has its own
+// since field, not a query param). Empty / unparseable → def.
+func parseDebugSinceFromString(raw string, def time.Duration) time.Duration {
+	if raw == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(raw[:len(raw)-1]); err == nil && raw[len(raw)-1] == 'd' && n > 0 {
+		return time.Duration(n) * 24 * time.Hour
+	}
+	return def
+}
+
+// debugReplayHandler — POST /v1/apps/{slug}/debug/requests/{req_id}/replay
+//
+// PR-B stub. The full replay path lands with issue #72 PR-A2
+// (traffic mirror PR-A2, in worktree feat-issue-72-traffic-mirror-pr-a2):
+// the mirror invocation handler accepts an upstream request id
+// and routes the recorded headers/body to the customer's
+// mirror deployment.
+//
+// PR-B returns the mirror_invocation_id that PR-A2 will create
+// (when implemented) — the response shape is stable across the
+// two PRs so the customer's automation can wire once.
+//
+// Plan-gated by DebugTelemetryEnabled.
+func (s *server) debugReplayHandler(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if !limits.DebugTelemetryEnabled {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("debugger", acct.Plan))
+		return
+	}
+	reqID := r.PathValue("req_id")
+	if _, err := uuid.Parse(reqID); err != nil {
+		api.WriteProblem(w, api.ErrValidation("req_id must be a UUID"))
+		return
+	}
+	// PR-B does not yet invoke the mirror pipeline (issue #72
+	// PR-A2 owns the scheduler-side mirror invocation). We return
+	// a stable shape so the customer's tooling can wire against
+	// it; the status field signals "queued" so the dashboard
+	// renders a "Replay queued — PR-A2 will route it" tile.
+	writeJSON(w, http.StatusAccepted, api.DebugReplayResponse{
+		Status: "queued",
+	})
+	_ = app // app loaded for plan-gating; not used in the stub body
 }

@@ -14,6 +14,10 @@ import type { AppStreamingStatus } from '../models/AppStreamingStatus.js';
 import type { AppUsageSummaryResponse } from '../models/AppUsageSummaryResponse.js';
 import type { AppWakeTimelineResponse } from '../models/AppWakeTimelineResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
+import type { DebugCompareRequest } from '../models/DebugCompareRequest.js';
+import type { DebugCompareResponse } from '../models/DebugCompareResponse.js';
+import type { DebugRegressionsResponse } from '../models/DebugRegressionsResponse.js';
+import type { DebugReplayResponse } from '../models/DebugReplayResponse.js';
 import type { DebugTelemetryListResponse } from '../models/DebugTelemetryListResponse.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
 import type { UpdateAppRequest } from '../models/UpdateAppRequest.js';
@@ -756,6 +760,138 @@ export class AppsService {
         'limit': limit,
       },
       errors: {
+        401: `code: unauthorized`,
+        402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Active regression observations (ADR-127 / PR-B).
+   * Returns regression observations written by the
+   * debug_regression_observations table — surfaces per-route
+   * p95 regressions detected by the regression cron
+   * (cmd/apid/debug_regression_cron.go). Ordered by
+   * regression_factor DESC, last_detected_at DESC (worst
+   * first). Plan-gated by DebugTelemetryEnabled. The window
+   * is clamped to DebugTelemetryRetentionDays.
+   *
+   * @returns DebugRegressionsResponse Page of active regression observations.
+   * @throws ApiError
+   */
+  public static listAppDebugRegressions({
+    slug,
+    since,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Duration or 'Nd' alias. Defaults to `1h`.
+     */
+    since?: string | null,
+  }): CancelablePromise<DebugRegressionsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/debug/regressions',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'since': since,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-route latency compare (ADR-127 / PR-B).
+   * Compares two deployments' per-route latency
+   * distributions in a shared time window. Body holds the
+   * two deployment ids + optional route filter + optional
+   * since/until bounds. Returns merged per-route stats with
+   * per-deployment p50/p95/p99 + row counts. Plan-gated by
+   * DebugTelemetryEnabled.
+   *
+   * @returns DebugCompareResponse Per-route compare stats.
+   * @throws ApiError
+   */
+  public static compareAppDebugDeployments({
+    slug,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: DebugCompareRequest,
+  }): CancelablePromise<DebugCompareResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/debug/compare',
+      path: {
+        'slug': slug,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Queue replay of a recorded request (ADR-127 / PR-B stub).
+   * PR-B returns 202 with `status: "queued"`. The mirror
+   * invocation pipeline lands in issue #72 PR-A2
+   * (feat-issue-72-traffic-mirror-pr-a2). The response shape
+   * is stable across PR-B and PR-A2 so customer tooling can
+   * wire once. Plan-gated by DebugTelemetryEnabled; requires
+   * ScopesDeployWriteSurface.
+   *
+   * @returns DebugReplayResponse Replay queued (PR-A2 will route it).
+   * @throws ApiError
+   */
+  public static replayAppDebugRequest({
+    slug,
+    reqId,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Request id from the debug requests list.
+     */
+    reqId: string,
+  }): CancelablePromise<DebugReplayResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/debug/requests/{req_id}/replay',
+      path: {
+        'slug': slug,
+        'req_id': reqId,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
         402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
         404: `code: not_found`,

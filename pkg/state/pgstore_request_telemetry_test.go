@@ -63,6 +63,7 @@ func TestPgStoreRequestTelemetry_RoundTrip(t *testing.T) {
 		ColdBoot:     false,
 		TraceID:      pgtype.Text{},
 		ReceivedAt:   pgtype.Timestamptz{Time: now, Valid: true},
+		Count:        1,
 	}); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -112,6 +113,7 @@ func TestPgStoreRequestTelemetry_PerDeployment(t *testing.T) {
 		ColdBoot:     true,
 		TraceID:      pgtype.Text{String: "0123456789abcdef0123456789abcdef", Valid: true},
 		ReceivedAt:   pgtype.Timestamptz{Time: now, Valid: true},
+		Count:        1,
 	}); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -158,6 +160,7 @@ func TestPgStoreRequestTelemetry_BaselineP95(t *testing.T) {
 			ColdBoot:     false,
 			TraceID:      pgtype.Text{},
 			ReceivedAt:   pgtype.Timestamptz{Time: now.Add(time.Duration(i) * time.Second), Valid: true},
+			Count:        1,
 		}); err != nil {
 			t.Fatalf("Insert %d: %v", i, err)
 		}
@@ -216,6 +219,7 @@ func TestPgStoreRequestTelemetry_CHECKRejection(t *testing.T) {
 		ColdBoot:     false,
 		TraceID:      pgtype.Text{},
 		ReceivedAt:   pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		Count:        1,
 	})
 	if err == nil {
 		t.Fatal("Insert with bogus method: expected CHECK violation, got nil")

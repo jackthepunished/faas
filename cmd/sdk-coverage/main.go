@@ -475,6 +475,15 @@ var methodRouteMap = map[string]string{
 	// — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/debug/requests": "ListAppDebugRequests",
 
+	// ADR-127 / PR-B — production debugger consumer surface.
+	// Same rationale as the PR-A request list: drop the slug from
+	// the verb so the per-resource list family stays consistent
+	// (ListAppDebugRegressions reads as a sibling of
+	// ListAppDebugRequests).
+	"GET /v1/apps/{slug}/debug/regressions":               "ListAppDebugRegressions",
+	"POST /v1/apps/{slug}/debug/compare":                  "CompareAppDebugDeployments",
+	"POST /v1/apps/{slug}/debug/requests/{req_id}/replay": "ReplayAppDebugRequest",
+
 	// Issue #393 — account-scoped list endpoints. Distinct from the
 	// per-app counterparts (ListInstances / ListSecrets / GetAppMetrics)
 	// which take a slug; the aggregate route has no slug, so the SDK

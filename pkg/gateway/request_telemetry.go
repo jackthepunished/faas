@@ -40,6 +40,16 @@ import (
 // publisher + apid receiver. Field names match the
 // request_telemetry table columns in migrations/00427_ verbatim so
 // the apid gRPC handler can pass them straight to sqlc params.
+//
+// PR-B adds Count — the collapse aggregate. The recorder always sets
+// Count=1 (one observed request). The publisher's
+// collapseRequestTelemetry increments Count when multiple rows fold
+// into the same (app, deployment, route, method, status, minute)
+// bucket. The apid receiver passes Count verbatim to the sqlc
+// INSERT. Pre-PR-B clients (the recorder compiled against PR-A)
+// never set Count; Go zero-value 0 is corrected to 1 at the
+// recorder's enqueue boundary (RecordFromObserve) so a publisher
+// collapse never has to reason about zero.
 type RequestTelemetryRow struct {
 	AccountID    uuid.UUID
 	AppID        uuid.UUID
@@ -51,6 +61,7 @@ type RequestTelemetryRow struct {
 	ColdBoot     bool   // true when this request woke a fresh instance
 	TraceID      string // W3C trace-id hex (32 chars); "" when unset
 	ReceivedAt   time.Time
+	Count        int // PR-B: collapse aggregate; >= 1 (CHECK in 00428). Recorder sets to 1.
 }
 
 // RequestTelemetryConfig bundles the knobs the recorder reads at
@@ -119,9 +130,18 @@ func NewRequestTelemetryRecorder(cfg RequestTelemetryConfig, log *slog.Logger) *
 //
 // Safe under concurrent calls — goes through enqueue() under
 // ringMu, same path as any future publisher-side append.
+//
+// PR-B: the recorder always sets Count=1 at this boundary. Pre-PR-B
+// callers leave Count=0; without the explicit assignment the
+// collapse aggregate would propagate a zero into the apid INSERT
+// and trip the count >= 1 CHECK. (Collapsed rows have Count >= 2
+// by definition; a Count=1 row is "no collapse happened".)
 func (r *requestTelemetryRecorder) RecordFromObserve(row RequestTelemetryRow) {
 	if !r.cfg.Enabled {
 		return
+	}
+	if row.Count < 1 {
+		row.Count = 1
 	}
 	r.enqueue(row)
 }

@@ -1,0 +1,134 @@
+// request_telemetry — production debugger per-request data plane
+// (ADR-127 PR-B). gatewayd-internal dials apid on /run/faas/apid.sock
+// to forward collapsed (app, deployment, route, method, status,
+// minute) buckets. apid is the sole writer to request_telemetry
+// (CLAUDE.md ownership); gatewayd-internal never opens a direct
+// Postgres connection for this path.
+//
+// Wire discipline mirrors the sibling apid/v1/app_errors.proto
+// service: checked-in *.pb.go generated with paths=source_relative,
+// errors enveloped through pkg/grpcerr, auth is the unix-socket DAC
+// model (mode 0660 group `faas`, ADR-015) on /run/faas/apid.sock.
+//
+// Streaming: IncrementRequestTelemetry is a server-streaming RPC
+// so a bursty gateway can ship a batched window of events without
+// paying per-record RPC overhead. The server reads until the
+// client half-closes the stream; each event is committed inside
+// its own transaction (no dedupe-merge here — the publisher
+// already collapsed burst traffic into one row per bucket, so
+// the apid receiver's only atomicity requirement is per-row
+// INSERT). The PR-B rate limiter returns per-row
+// {code: RATE_LIMITED, retry_after_ms} outcome so a sustained-
+// overflow customer gets back-pressured without aborting the rest
+// of the batch.
+
+syntax = "proto3";
+
+package onebox.faas.apid.v1;
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1;apidpb";
+
+// RequestTelemetry is the gRPC service apid exposes on
+// /run/faas/apid.sock for the gatewayd-internal production
+// debugger publisher (ADR-127). Single RPC accepts a stream of
+// collapsed telemetry rows; the server returns per-record outcomes
+// so the gateway can update its in-process counters (shipped /
+// rate_limited / db_error).
+service RequestTelemetry {
+  // IncrementRequestTelemetry streams collapsed telemetry rows
+  // from the gateway edge to apid's writer path. The server
+  // commits each record inside its own transaction (per-record
+  // commit; load-bearing for the rate-limit-then-continues
+  // shape — a rate-limited row MUST NOT abort the batch).
+  //
+  // The response stream mirrors the request stream 1:1: every
+  // request gets exactly one response carrying its outcome. The
+  // server half-closes the response stream when the client
+  // half-closes the request stream (or on the first terminal
+  // error). A rate-limit hit on one record returns RATE_LIMITED
+  // for that single response — the stream continues.
+  rpc IncrementRequestTelemetry(stream IncrementRequestTelemetryRequest) returns (stream IncrementRequestTelemetryResponse);
+}
+
+// IncrementRequestTelemetryRequest is one collapsed telemetry row
+// from the gateway edge. All scalar fields are required (proto3
+// default-zero would be ambiguous); empty values are rejected by
+// the server with InvalidArgument. Field numbers are aligned with
+// the request_telemetry column order in migrations/00427_ +
+// 00428_ for grep-ability; new columns append at the end (the
+// .pb.go regen produces a new generated struct that callers
+// migrate to).
+message IncrementRequestTelemetryRequest {
+  // account_id (apps.account_id, UUID). Resolved at the gateway
+  // from the request session — the gateway's auth middleware
+  // has already proven the customer owns the app.
+  string account_id = 1;
+
+  // app_id (apps.app_id, UUID). Resolved from the matched route.
+  string app_id = 2;
+
+  // deployment_id (apps_deployments.deployment_id, UUID). Stamped
+  // at the gateway at request-wake time.
+  string deployment_id = 3;
+
+  // route_template — the matched Go-mux pattern (e.g.
+  // "GET /v1/users/{id}"). NEVER the expanded URL — load-bearing
+  // for histogram cardinality.
+  string route_template = 4;
+
+  // method — closed-vocabulary enum enforced by the migration
+  // CHECK. One of: GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS.
+  string method = 5;
+
+  // http_status — the response status code returned to the
+  // customer. Must be 100..599 (the migration CHECK rejects
+  // anything else).
+  int32 http_status = 6;
+
+  // latency_ms — the bucket's representative latency (max within
+  // the minute, mirrors what the regression detector compares
+  // against baseline). Wall-clock from Handler.ServeHTTP entry
+  // to observe exit for the FIRST row that populated the bucket;
+  // subsequent rows fold in via the publisher's collapse
+  // aggregate.
+  int32 latency_ms = 7;
+
+  // cold_boot — true when ANY of the rows that folded into this
+  // bucket was a cold-boot wake. The publisher's collapse
+  // computes OR across the bucket.
+  bool cold_boot = 8;
+
+  // trace_id — W3C trace-id hex (32 chars) of the first non-empty
+  // row in the bucket. Empty string when no row in the bucket
+  // carried W3C context (rare — gateway always sets one).
+  string trace_id = 9;
+
+  // received_at_unix_ms — the gateway's wall-clock timestamp at
+  // the minute bucket boundary (publisher truncates to the
+  // minute). NOT the apid INSERT time — that would skew the
+  // customer-visible timestamps.
+  int64 received_at_unix_ms = 10;
+
+  // count (PR-B / 00428) — the number of original requests that
+  // folded into this bucket. >= 1 (migration CHECK). Pre-PR-B
+  // clients leave this unset and the apid receiver defaults to
+  // 1.
+  int32 count = 11;
+}
+
+// IncrementRequestTelemetryResponse is the per-record outcome the
+// server returns. outcome ∈ {inserted, rate_limited, db_error}.
+// `inserted` is a successful INSERT; `rate_limited` means the
+// per-account token bucket was empty (caller should NOT retry —
+// the customer's plan cap is exhausted); `db_error` is a transient
+// Postgres failure (caller may retry).
+message IncrementRequestTelemetryResponse {
+  // outcome — see comment above for the closed enum.
+  string outcome = 1;
+
+  // retry_after_ms — populated when outcome == "rate_limited".
+  // Suggests to the gateway when the next batch from this
+  // account should be back-pressured (caller MAY log + ignore;
+  // apid enforces the actual rate cap).
+  int64 retry_after_ms = 2;
+}

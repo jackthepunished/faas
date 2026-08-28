@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -5026,6 +5027,38 @@ type Store interface {
 	// sqlc v1.31's "ambiguous column" parser; PR-B documents the
 	// Go-side composition in pkg/state/pgstore.go).
 	RequestTelemetryBaselineP95ByRoute(ctx context.Context, arg sqlc.RequestTelemetryBaselineP95ByRouteParams) ([]sqlc.RequestTelemetryBaselineP95ByRouteRow, error)
+
+	// --- ADR-127 PR-B — regression observation persistence + dashboard reads ---
+
+	// UpsertRegressionObservation writes (or refreshes) the
+	// regression observation row for (app_id, deployment_id, route).
+	// The cron in cmd/apid/debug_regression_cron.go calls this on
+	// every 5-minute pass when a regression is detected. PRIMARY
+	// KEY upsert keeps the table bounded — at most one row per
+	// (deployment, route), not one row per cron tick.
+	// first_detected_at is set on INSERT only; last_detected_at
+	// refreshed to now() on every pass.
+	UpsertRegressionObservation(ctx context.Context, arg sqlc.UpsertRegressionObservationParams) error
+
+	// ListActiveRegressionsByApp backs GET /v1/apps/{slug}/debug/regressions
+	// and the dashboard regression banner. since is an interval
+	// (handler-side clamp: DebugTelemetryRetentionDays per plan).
+	// ORDER BY regression_factor DESC, last_detected_at DESC matches
+	// the dashboard render order (worst first, most-recent next).
+	ListActiveRegressionsByApp(ctx context.Context, arg sqlc.ListActiveRegressionsByAppParams) ([]sqlc.ListActiveRegressionsByAppRow, error)
+
+	// ListDeploymentsForCompare backs the dashboard compare panel's
+	// two <select> dropdowns. Returns distinct deployment_ids that
+	// have shipped traffic in the window, with first_seen / last_seen
+	// / row_count metadata so the panel can render
+	// "v81 — 17m of traffic, 4123 rows" without a second query.
+	ListDeploymentsForCompare(ctx context.Context, arg sqlc.ListDeploymentsForCompareParams) ([]sqlc.ListDeploymentsForCompareRow, error)
+
+	// ListAppsWithRecentTelemetry is the regression cron's discovery
+	// loop seam. Returns distinct app_ids that have shipped at least
+	// one request in the window so the cron doesn't have to walk
+	// the full `apps` table on every tick.
+	ListAppsWithRecentTelemetry(ctx context.Context, arg pgtype.Interval) ([]pgtype.UUID, error)
 
 	// --- ADR-098 connection-aware execution (§9.A) ---
 	//

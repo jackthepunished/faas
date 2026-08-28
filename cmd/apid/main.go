@@ -571,6 +571,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// seam in runWithDeps doesn't.
 		go sseFanIn(ctx, log, pool, srv.events, nil)
 		startDNSPoller(ctx, srv, log)
+		// ADR-127 PR-B: regression detector. Mirrors the dns_poller's
+		// shape — first-pass-immediate + ticker + ctx-cancel. The
+		// cron is gated on FAAS_REQUEST_TELEMETRY_ENABLED so the
+		// surface can be dark-launched with the ginstal kill-switch
+		// that the apid gRPC receiver (Stage 4) already honors.
+		startDebugRegressionCron(ctx, srv, log, deps.getenv)
 		// G6 grace timer (spec §17 G6, ADR-021): the 30-day deletion
 		// grace sweep lives in apid (not meterd) because the write
 		// side (DELETE /v1/account, POST /v1/account/restore) is here
@@ -1700,6 +1706,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
 
+		// ADR-127 PR-B: gatewayd-internal → apid
+		// IncrementRequestTelemetry streaming RPC. Wired behind
+		// FAAS_REQUEST_TELEMETRY_ENABLED so the surface is dormant
+		// in environments where the data plane isn't shipped yet.
+		// Defaults to enabled when the env var is unset; set
+		// FAAS_REQUEST_TELEMETRY_ENABLED=false to disable both the
+		// writer (apid gRPC) and the gateway-side recorder.
+		if deps.getenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false" {
+			rtSrv, rtLis, err := runRequestTelemetryServer(ctx, srv.store, srv.ops, log)
+			if err != nil {
+				_ = l.Close()
+				return fmt.Errorf("apid: request telemetry server: %w", err)
+			}
+			go func() {
+				log.Info("apid request telemetry server listening")
+				if err := rtSrv.Serve(rtLis); err != nil {
+					log.Error("apid request telemetry serve", "err", err)
+				}
+			}()
+		}
+
 		// ADR-095 PR-C: preview teardown janitor. Lives in apid
 		// (the sole writer to customer-intent tables per CLAUDE.md
 		// line 71) and drives preview rows through the
@@ -2210,5 +2237,29 @@ func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, 
 		wire.TraceServerOptions()...,
 	)...)
 	registerAppErrorsReceiver(srv, store, ops, true)
+	return srv, lis, nil
+}
+
+// runRequestTelemetryServer brings up the RequestTelemetry gRPC
+// server (ADR-127 PR-B: gatewayd-internal → apid
+// IncrementRequestTelemetry streaming RPC). Listens on a unix
+// socket under /run/faas so the gateway-side dial is loopback-only
+// and TLS-free (single-box mode). The socket path is hard-coded
+// to /run/faas/request_telemetry.sock — gatewayd-internal dials
+// it via FAAS_APID_REQUEST_TELEMETRY_SOCKET env (defaulting to
+// the same path).
+//
+// Returns the server (caller calls Serve) and the listener. Errors
+// here are non-fatal: the caller logs and continues without the
+// request_telemetry gRPC server (the apid HTTP listener still
+// serves).
+func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/request_telemetry.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("request telemetry listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerRequestTelemetryReceiver(srv, store, ops, newTelemetryRateLimiter(), true)
 	return srv, lis, nil
 }

@@ -2297,9 +2297,11 @@ CREATE TABLE public.request_telemetry (
     trace_id text,
     spans_summary jsonb,
     received_at timestamp with time zone DEFAULT now() NOT NULL,
+    count integer DEFAULT 1 NOT NULL,
     CONSTRAINT request_telemetry_status_check CHECK (((status >= 100) AND (status <= 599))),
     CONSTRAINT request_telemetry_latency_ms_check CHECK ((latency_ms >= 0)),
-    CONSTRAINT request_telemetry_trace_id_check CHECK (((trace_id IS NULL) OR (trace_id ~ '^[0-9a-f]{32}$'::text)))
+    CONSTRAINT request_telemetry_trace_id_check CHECK (((trace_id IS NULL) OR (trace_id ~ '^[0-9a-f]{32}$'::text))),
+    CONSTRAINT request_telemetry_count_check CHECK ((count >= 1))
 )
 PARTITION BY RANGE (received_at);
 
@@ -2310,6 +2312,28 @@ PARTITION BY RANGE (received_at);
 
 CREATE TABLE public.request_telemetry_default
     PARTITION OF public.request_telemetry DEFAULT;
+
+
+--
+-- Name: debug_regression_observations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.debug_regression_observations (
+    app_id uuid NOT NULL,
+    deployment_id uuid NOT NULL,
+    route text NOT NULL,
+    p95_ms integer NOT NULL,
+    p95_base_ms integer NOT NULL,
+    affected_count integer NOT NULL,
+    regression_factor numeric(5,2) NOT NULL,
+    first_detected_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_detected_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT debug_regression_observations_route_check CHECK (((length(route) >= 1) AND (length(route) <= 256))),
+    CONSTRAINT debug_regression_observations_p95_ms_check CHECK ((p95_ms >= 0)),
+    CONSTRAINT debug_regression_observations_p95_base_ms_check CHECK ((p95_base_ms >= 0)),
+    CONSTRAINT debug_regression_observations_affected_count_check CHECK ((affected_count >= 0)),
+    CONSTRAINT debug_regression_observations_regression_factor_check CHECK ((regression_factor >= 1.0))
+);
 
 
 --

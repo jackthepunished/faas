@@ -1465,6 +1465,15 @@ func (s *server) handler() http.Handler {
 	// customers can already hit the endpoint and see rows once a
 	// row source is configured. Plan-gated by DebugTelemetryEnabled.
 	mux.HandleFunc("GET /v1/apps/{slug}/debug/requests", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.debugTelemetryListHandler))))
+	// ADR-127 PR-B: regression banner feed (dashboard + CLI).
+	mux.HandleFunc("GET /v1/apps/{slug}/debug/regressions", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.debugRegressionsHandler))))
+	// ADR-127 PR-B: deployment-vs-deployment compare (POST body
+	// holds the two deployment_ids + optional route filter).
+	mux.HandleFunc("POST /v1/apps/{slug}/debug/compare", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.debugCompareHandler))))
+	// ADR-127 PR-B: replay (PR-A2 of issue #72 wires the
+	// mirror invocation; PR-B returns a stable "queued"
+	// status so customer tooling can wire once).
+	mux.HandleFunc("POST /v1/apps/{slug}/debug/requests/{req_id}/replay", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.debugReplayHandler))))
 
 	// API keys. Minting and revoking keys are admin-only — a leaked
 	// write-scoped key must not be able to grant itself more scopes.

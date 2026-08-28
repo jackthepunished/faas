@@ -18961,6 +18961,42 @@ func (s *PgStore) RequestTelemetryBaselineP95ByRoute(ctx context.Context, arg sq
 	return s.appErrorsQueries().RequestTelemetryBaselineP95ByRoute(ctx, s.pool, arg)
 }
 
+// --- ADR-127 PR-B — regression observation persistence + dashboard reads ---
+
+// UpsertRegressionObservation writes (or refreshes) the regression
+// observation row for (app_id, deployment_id, route). PRIMARY KEY upsert
+// keeps the table bounded — at most one row per (deployment, route),
+// not one row per cron tick. Mirrors UpsertDoctorObservation's
+// primary-key upsert shape.
+func (s *PgStore) UpsertRegressionObservation(ctx context.Context, arg sqlc.UpsertRegressionObservationParams) error {
+	return s.appErrorsQueries().UpsertRegressionObservation(ctx, s.pool, arg)
+}
+
+// ListActiveRegressionsByApp backs GET /v1/apps/{slug}/debug/regressions
+// and the dashboard regression banner. since is an interval (e.g.
+// pgtype.Interval{Microseconds: 3600 * 1e6} for "1 hour"); the
+// regression cron and the dashboard handler use a wider window than
+// the per-request GET endpoint so a regression that fired during a
+// 30-minute deployment diff still surfaces.
+func (s *PgStore) ListActiveRegressionsByApp(ctx context.Context, arg sqlc.ListActiveRegressionsByAppParams) ([]sqlc.ListActiveRegressionsByAppRow, error) {
+	return s.appErrorsQueries().ListActiveRegressionsByApp(ctx, s.pool, arg)
+}
+
+// ListDeploymentsForCompare backs the dashboard compare panel. Returns
+// distinct deployment_ids that have shipped traffic in the window
+// with first_seen / last_seen / row_count metadata.
+func (s *PgStore) ListDeploymentsForCompare(ctx context.Context, arg sqlc.ListDeploymentsForCompareParams) ([]sqlc.ListDeploymentsForCompareRow, error) {
+	return s.appErrorsQueries().ListDeploymentsForCompare(ctx, s.pool, arg)
+}
+
+// ListAppsWithRecentTelemetry is the regression cron's discovery
+// loop seam. Returns distinct app_ids that have shipped at least one
+// request in the window so the cron doesn't have to walk the full
+// `apps` table on every tick.
+func (s *PgStore) ListAppsWithRecentTelemetry(ctx context.Context, arg pgtype.Interval) ([]pgtype.UUID, error) {
+	return s.appErrorsQueries().ListAppsWithRecentTelemetry(ctx, s.pool, arg)
+}
+
 // ----------------------------------------------------------------------------
 // ADR-098 connection-aware execution (§9.A). pgstore wrappers for the
 // sqlc-generated data_upstreams + data_upstream_probes query surface
