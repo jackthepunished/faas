@@ -319,6 +319,41 @@ const (
 	BuildCancelled BuildStatus = "cancelled"
 )
 
+// CancelReason is the closed-set label on
+// deployments.cancel_reason (ADR-124, migration 00426). The schema
+// CHECK constraint deployments_cancel_reason_check enforces the
+// same vocabulary at the storage layer; this Go type exists so
+// callers fail fast at the API boundary instead of surfacing a
+// Postgres 23514 at runtime.
+type CancelReason string
+
+const (
+	// CancelReasonUser is stamped by the user-initiated
+	// POST /v1/apps/{slug}/deployments/{id}/cancel route. Most
+	// common path; the CLI's --reason flag can override.
+	CancelReasonUser CancelReason = "user"
+	// CancelReasonAutoQuota is reserved for the future
+	// "auto-cancel on quota breach" path. CHECK-only.
+	CancelReasonAutoQuota CancelReason = "auto_quota"
+	// CancelReasonAutoHealth is reserved for the future
+	// "auto-cancel on liveness exhaustion" path. CHECK-only.
+	CancelReasonAutoHealth CancelReason = "auto_health"
+	// CancelReasonSystem is the operator-driven escape hatch
+	// (admin CLI / control-plane janitor).
+	CancelReasonSystem CancelReason = "system"
+)
+
+// IsValid reports whether r is one of the closed-set CancelReason
+// constants. Cheap — used by apid handlers to fail fast on a
+// stray value before the SQL UPDATE surfaces a 23514.
+func (r CancelReason) IsValid() bool {
+	switch r {
+	case CancelReasonUser, CancelReasonAutoQuota, CancelReasonAutoHealth, CancelReasonSystem:
+		return true
+	}
+	return false
+}
+
 // FailureClass tags the cause of a build failure (spec §9).
 type FailureClass string
 
@@ -336,40 +371,6 @@ const (
 // vocabulary at the storage layer; this Go type exists so
 // callers fail fast at the API boundary instead of surfacing a
 // Postgres 23514 at runtime. (kept as comment-only; declarations live earlier in this file from the ADR-124 cherry-pick)
-
-// CancelReason is the typed enum that callers pass to
-// Store.MarkDeploymentCancelled / Store.CancelDeploymentTx.
-// Reasons are checked at the schema layer by the
-// deployments_cancel_reason_check constraint (migration 00360).
-type CancelReason string
-
-const (
-	// CancelReasonUser is a customer-initiated cancel via
-	// `gregale deploys cancel <id>` or the apid DELETE handler.
-	CancelReasonUser CancelReason = "user"
-	// CancelReasonAutoQuota is a meterd-driven cancel because the
-	// account crossed its plan's monthly GB-hours budget.
-	CancelReasonAutoQuota CancelReason = "auto_quota"
-	// CancelReasonAutoHealth is imaged / schedd cancelling a stuck
-	// deployment after the metal-acceptance stuck_running timeout
-	// (spec §14 V6).
-	CancelReasonAutoHealth CancelReason = "auto_health"
-	// CancelReasonSystem is everything else (operator manual
-	// cancel, dry-run rollback, internal tools).
-	CancelReasonSystem CancelReason = "system"
-)
-
-// IsValid returns true if r matches one of the four closed-set
-// values. Mirrors ParkReason.IsValid; the SQL CHECK is the
-// authoritative gate, this exists so callers fail fast at the API
-// boundary instead of bouncing off a SQLSTATE 23514 round-trip.
-func (r CancelReason) IsValid() bool {
-	switch r {
-	case CancelReasonUser, CancelReasonAutoQuota, CancelReasonAutoHealth, CancelReasonSystem:
-		return true
-	}
-	return false
-}
 
 // Account is a customer account.
 type Account struct {
