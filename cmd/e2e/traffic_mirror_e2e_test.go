@@ -52,24 +52,80 @@ import (
 	mirrorRollup "github.com/onebox-faas/faas/pkg/mirror"
 )
 
+// seedMirrorFixture inserts the parent rows the mirror_invocation_results
+// FK chain needs: an account, an app, two deployments (one source, one
+// mirror) that point at the seeded mirror_rules row, and the mirror_rule
+// itself. Returns the (accountID, sourceDeploymentID, mirrorDeploymentID)
+// so the row INSERT can populate the NOT NULL mirror_invocation_results
+// columns consistently.
+//
+// All five parent rows live or die together with the test — there is no
+// cleanup; the per-test pgtest schema is dropped on test exit so the
+// next test gets a fresh slate.
+func seedMirrorFixture(t *testing.T, pool *pgxpool.Pool, appID string) (accountID, sourceDeploymentID, mirrorDeploymentID, ruleID string) {
+	t.Helper()
+	accountID = uuid.NewString()
+	sourceDeploymentID = uuid.NewString()
+	mirrorDeploymentID = uuid.NewString()
+	ruleID = uuid.NewString()
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+INSERT INTO accounts (id, email, plan, created_at)
+VALUES ($1::uuid, $2, 'free', now())
+ON CONFLICT (id) DO NOTHING
+`, accountID, accountID+"@e2e.invalid"); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO apps (id, account_id, slug, ram_mb, max_concurrency, status, created_at)
+VALUES ($1::uuid, $2::uuid, $3, 128, 1, 'active', now())
+ON CONFLICT (id) DO NOTHING
+`, appID, accountID, "mirror-e2e-"+appID); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO deployments (id, app_id, image_digest, status, created_at)
+VALUES ($1::uuid, $2::uuid, 'sha256:e2e-source-' || $1::uuid, 'live', now())
+ON CONFLICT (id) DO NOTHING
+`, sourceDeploymentID, appID); err != nil {
+		t.Fatalf("seed source deployment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO deployments (id, app_id, image_digest, status, created_at)
+VALUES ($1::uuid, $2::uuid, 'sha256:e2e-mirror-' || $1::uuid, 'live', now())
+ON CONFLICT (id) DO NOTHING
+`, mirrorDeploymentID, appID); err != nil {
+		t.Fatalf("seed mirror deployment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO mirror_rules (
+    id, account_id, app_id, source_deployment_id, mirror_deployment_id,
+    percent, enabled, include_body, redact_headers
+) VALUES (
+    $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+    100, true, false, '{}'::text[]
+)
+ON CONFLICT (id) DO NOTHING
+`, ruleID, accountID, appID, sourceDeploymentID, mirrorDeploymentID); err != nil {
+		t.Fatalf("seed mirror rule: %v", err)
+	}
+	return accountID, sourceDeploymentID, mirrorDeploymentID, ruleID
+}
+
 // seedMirrorLedgerRow inserts one mirror_invocation_results row
-// for (ruleID, appID, completedAt) with the supplied boolean
-// flags. Used by the rollup + sweep tests to populate the
-// ledger without going through the gateway goroutine.
+// for (ruleID, completedAt) with the supplied boolean flags. Used
+// by the rollup + sweep tests to populate the ledger without going
+// through the gateway goroutine.
 //
 // The shape matches the schema PR-A1 shipped (migration 00386):
-// all four boolean diff flags + crashed are real columns; the
-// NOT NULL columns (account_id, source_deployment_id,
-// mirror_deployment_id, request_id) are filled with stable UUID
-// strings so the rollup + sweep SQL predicates match by
-// (mirror_rule_id, completed_at) without requiring a live
-// gateway. Returns the new row ID.
-func seedMirrorLedgerRow(t *testing.T, pool *pgxpool.Pool, ruleID, appID string, completedAt time.Time, statusDiff, schemaDiff, bodyDiff, crashed bool) string {
+// all four boolean diff flags + crashed are real columns. The
+// NOT NULL FK columns (account_id, source_deployment_id,
+// mirror_deployment_id, request_id) come from the seeded fixture
+// the test creates via seedMirrorFixture. Returns the new row ID.
+func seedMirrorLedgerRow(t *testing.T, pool *pgxpool.Pool, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID string, completedAt time.Time, statusDiff, schemaDiff, bodyDiff, crashed bool) string {
 	t.Helper()
 	id := uuid.NewString()
-	accountID := uuid.NewString()
-	sourceDeploymentID := uuid.NewString()
-	mirrorDeploymentID := uuid.NewString()
 	requestID := uuid.NewString()
 	_, err := pool.Exec(context.Background(), `
 INSERT INTO mirror_invocation_results (
@@ -77,8 +133,11 @@ INSERT INTO mirror_invocation_results (
     source_deployment_id, mirror_deployment_id,
     status_diff, schema_diff, body_diff, crashed,
     request_id, completed_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-`, id, ruleID, accountID, appID, sourceDeploymentID, mirrorDeploymentID, statusDiff, schemaDiff, bodyDiff, crashed, requestID, completedAt)
+) VALUES ($1, $2::uuid, $3::uuid, (SELECT app_id FROM mirror_rules WHERE id = $2::uuid),
+          $4::uuid, $5::uuid,
+          $6, $7, $8, $9,
+          $10, $11)
+`, id, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID, statusDiff, schemaDiff, bodyDiff, crashed, requestID, completedAt)
 	if err != nil {
 		t.Fatalf("seed mirror ledger row: %v", err)
 	}
@@ -138,14 +197,15 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	ctx := context.Background()
-	ruleID := uuid.NewString()
 	appID := uuid.NewString()
+	accountID, sourceDeploymentID, mirrorDeploymentID, ruleID := seedMirrorFixture(t, pool, appID)
 	now := time.Now().UTC()
 
 	// Seed 5 rows in the trailing hour. The dispatch goroutine
 	// uses completed_at for the rollup window.
 	for i := 0; i < 5; i++ {
-		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-time.Duration(i)*time.Minute),
+		seedMirrorLedgerRow(t, pool, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID,
+			now.Add(-time.Duration(i)*time.Minute),
 			false, false, false, false)
 	}
 
@@ -189,17 +249,19 @@ func TestE2E_MirrorSweep_DeletesOnlyStaleRows(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	ctx := context.Background()
-	ruleID := uuid.NewString()
 	appID := uuid.NewString()
+	accountID, sourceDeploymentID, mirrorDeploymentID, ruleID := seedMirrorFixture(t, pool, appID)
 	now := time.Now().UTC()
 
 	// 3 stale (8d), 2 fresh (1d).
 	for i := 0; i < 3; i++ {
-		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(8*24*time.Hour + time.Duration(i)*time.Hour)),
+		seedMirrorLedgerRow(t, pool, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID,
+			now.Add(-(8*24*time.Hour + time.Duration(i)*time.Hour)),
 			false, false, false, false)
 	}
 	for i := 0; i < 2; i++ {
-		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(24*time.Hour + time.Duration(i)*time.Hour)),
+		seedMirrorLedgerRow(t, pool, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID,
+			now.Add(-(24*time.Hour + time.Duration(i)*time.Hour)),
 			false, false, false, false)
 	}
 
