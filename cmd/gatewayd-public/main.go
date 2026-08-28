@@ -56,11 +56,13 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apidgrpc"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -286,6 +288,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// /metrics on the control mux (ControlMux mounts
 	// metrics.Handler() automatically).
 	gatewayMetrics := gateway.NewMetrics()
+	// ADR-127 PR-D: gatewayd-public adopts wire.OpsMetrics for
+	// the first time — previously the public daemon exposed
+	// only gateway.Metrics on /metrics. PR-D adds three new
+	// series (gatewayd_public_otel_spans_ingested_total,
+	// _otel_spans_truncated_total, _otel_auth_failures_total)
+	// that need a separate registry so the §12 OTel spans
+	// panel can scrape them. The OpsMetrics is mounted on the
+	// control mux via ControlMuxWithExtra's extraGatherer.
+	opsMetrics := wire.NewOpsMetrics("gatewayd_public")
 	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
 	// request to gatewayd-internal carries the same trace context
 	// (gateway.route span). The wrapper sits UNDER the proxy's
@@ -350,6 +361,28 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	traceMux := http.NewServeMux()
 	traceMux.Handle("/v1/traces/", traceSetup.Handler)
+	// ADR-127 PR-D: OTLP spans writer handler. Mounted on the
+	// same traceMux so it shares the same drain tracker as
+	// /v1/traces/ and the control proxy. Gated behind
+	// FAAS_OTEL_SPANS_WRITER_ENABLED (default true); the dial
+	// of the apid Auth service is only attempted when the
+	// handler is enabled, so killing the env var is the
+	// fail-closed kill-switch.
+	if envOr("FAAS_OTEL_SPANS_WRITER_ENABLED", "true") != "false" {
+		authTarget := envOr("FAAS_APID_AUTH_SOCKET", "/run/faas/auth.sock")
+		authCli, authErr := apidgrpc.DialAuth(ctx, authTarget, nil)
+		if authErr != nil {
+			return fmt.Errorf("gatewayd-public: dial apid auth at %q: %w", authTarget, authErr)
+		}
+		otelHandler := gateway.NewOTelSpansHandler(gateway.OTelSpansHandlerConfig{
+			AuthClient: authCli,
+			Limiter:    peraccount.NewLimiter(),
+			Acc:        gateway.NewSpansAccumulator(),
+			Ops:        opsMetrics,
+			Drain:      drainTracker,
+		})
+		traceMux.Handle("/v1/otel/v1/traces", otelHandler)
+	}
 	traceMux.Handle("/", controlPlaneHandler)
 
 	// Public-facing handler: httpsec outer wrapper → budget middleware →
@@ -374,7 +407,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// /metrics exposes the budget histogram + exceeded-counter
 	// alongside the default gateway series, and pass drainTracker so
 	// every control request is counted during graceful shutdown.
-	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, budgetReg, probe.ReadyFunc(), drainTracker)
+	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, opsMetrics.Registry(), probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	// Multi-host safety cluster PR-8 (audit F8-A): in multi-host
