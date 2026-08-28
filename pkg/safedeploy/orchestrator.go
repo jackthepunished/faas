@@ -4,33 +4,33 @@
 //
 // Per-tick behaviour:
 //
-//   1. List pending rollouts via state.Store.SafedeployListPendingRollouts.
-//   2. For each row, decide the next state based on:
-//      - rollout_state='pending' AND canary_total_steps=0 → flip
-//        straight to 'complete' (no canary ladder was configured;
-//        the row's traffic is already 100% on insert). Emit one
-//        deployment_audit row.
-//      - rollout_state='pending' AND canary_total_steps>0 → flip
-//        to 'rolling_out', stamp rollout_started_at=now().
-//      - rollout_state='rolling_out' AND canary_step >=
-//        canary_total_steps → flip to 'complete', stamp
-//        rollout_completed_at=now(). This is the terminal-step
-//        transition the canary_progression tick doesn't write
-//        (per Commit 3's separation of concerns — canary_progression
-//        advances the ladder; orchestrator stamps the rollout
-//        state machine).
-//      - rollout_state='rolling_out' AND canary_step < total AND
-//        the row's been stuck > StuckAfterDuration → log warn,
-//        do NOT auto-recover (the operator CLI `gregale rollouts
-//        recover <slug>` is the manual escape hatch — see
-//        Commit 6).
-//   3. Each transition writes one deployment_audit row via
-//      Store.AppendDeploymentAudit with the orchestrator's actor
-//      sentinel. Audit emit is best-effort: a Postgres hiccup on
-//      the audit table is warn-logged + skipped so the next tick
-//      can re-stamp the transition. The state-machine write is
-//      authoritative — a missed audit row is recoverable by the
-//      operator reading the rollout_state column directly.
+//  1. List pending rollouts via state.Store.SafedeployListPendingRollouts.
+//  2. For each row, decide the next state based on:
+//     - rollout_state='pending' AND canary_total_steps=0 → flip
+//     straight to 'complete' (no canary ladder was configured;
+//     the row's traffic is already 100% on insert). Emit one
+//     deployment_audit row.
+//     - rollout_state='pending' AND canary_total_steps>0 → flip
+//     to 'rolling_out', stamp rollout_started_at=now().
+//     - rollout_state='rolling_out' AND canary_step >=
+//     canary_total_steps → flip to 'complete', stamp
+//     rollout_completed_at=now(). This is the terminal-step
+//     transition the canary_progression tick doesn't write
+//     (per Commit 3's separation of concerns — canary_progression
+//     advances the ladder; orchestrator stamps the rollout
+//     state machine).
+//     - rollout_state='rolling_out' AND canary_step < total AND
+//     the row's been stuck > StuckAfterDuration → log warn,
+//     do NOT auto-recover (the operator CLI `gregale rollouts
+//     recover <slug>` is the manual escape hatch — see
+//     Commit 6).
+//  3. Each transition writes one deployment_audit row via
+//     Store.AppendDeploymentAudit with the orchestrator's actor
+//     sentinel. Audit emit is best-effort: a Postgres hiccup on
+//     the audit table is warn-logged + skipped so the next tick
+//     can re-stamp the transition. The state-machine write is
+//     authoritative — a missed audit row is recoverable by the
+//     operator reading the rollout_state column directly.
 //
 // The orchestrator never calls apid directly. The canary_progression
 // tick (pkg/canary, Commit 3) is the API caller for ladder
@@ -129,11 +129,23 @@ func NewOrchestrator(store Store, log *slog.Logger, actor, account string) *Orch
 // pkg/canary.Stats shape so the §12 dashboard's rollout-state
 // panel can correlate the two ticks side-by-side.
 type Stats struct {
-	Started         int // pending → rolling_out transitions
-	Completed       int // rolling_out → complete transitions
-	Aborted         int // pending/rolling_out → aborted (manual CLI; orchestrator doesn't auto-abort)
-	StuckDetected   int // rolling_out rows whose canary_step_started_at is older than StuckAfterDuration
-	AuditEmitFailed int // per-row audit emit errors (warn-logged, never propagated)
+	Started       int // pending → rolling_out transitions
+	Completed     int // rolling_out → complete transitions
+	Aborted       int // pending/rolling_out → aborted (manual CLI; orchestrator doesn't auto-abort)
+	StuckDetected int // rolling_out rows whose canary_step_started_at is older than StuckAfterDuration
+	// StuckCheckMissingTimestamp (SAFE-RELEASES code-review hardening,
+	// migration 00488) counts rolling_out rows the orchestrator walked
+	// where CanaryStepStartedAt was nil — pre-00488 a nullable
+	// canary_step_started_at was legal, but post-00488 the column is
+	// NOT NULL DEFAULT NOW(), so a non-zero rate means a write path
+	// bypassed the schema default. The orchestrator skips the stuck
+	// check for these rows (no timestamp → no comparison possible) and
+	// logs a warning, mirroring pkg/canary.Once's zero-timestamp
+	// defensive guard at preset.go:226. The Stats counter gives
+	// operators visibility through the per-tick log without needing a
+	// Prometheus collector on the orchestrator struct.
+	StuckCheckMissingTimestamp int
+	AuditEmitFailed            int // per-row audit emit errors (warn-logged, never propagated)
 }
 
 // ErrOrchestratorNilStore is returned when the orchestrator is
@@ -204,6 +216,15 @@ func (o *Orchestrator) walkRow(ctx context.Context, d state.Deployment, now time
 		// StuckAfterDuration. Warn-log (rate-limited via
 		// Stats.StuckDetected) but do NOT auto-recover — the
 		// operator CLI is the manual escape hatch (Commit 6).
+		//
+		// SAFE-RELEASES code-review hardening (migration 00488):
+		// post-00488 CanaryStepStartedAt is NOT NULL DEFAULT NOW(),
+		// so the nil branch below should never fire in steady state.
+		// A non-zero Stats.StuckCheckMissingTimestamp count is the
+		// tripwire for "a write path bypassed the apid CreateDeployment
+		// stamp". The orchestrator's defensive behaviour matches
+		// pkg/canary.Once:226 — log + skip, no auto-recover (the
+		// operator CLI is still the manual escape hatch).
 		if d.CanaryStepStartedAt != nil {
 			elapsed := now.Sub(*d.CanaryStepStartedAt)
 			if elapsed > StuckAfterDuration {
@@ -214,6 +235,18 @@ func (o *Orchestrator) walkRow(ctx context.Context, d state.Deployment, now time
 				stats.StuckDetected++
 				return
 			}
+		} else {
+			// Post-00488 this branch is unreachable in steady state
+			// (the column is NOT NULL DEFAULT NOW()). Belt-and-braces
+			// for a future write path that bypasses the schema default
+			// — without this log + counter, the orchestrator would
+			// silently fall through to the 'healthy in-flight row'
+			// branch with no operator visibility. Mirrors the
+			// pkg/canary.Once defensive guard at preset.go:226.
+			o.Log.Warn("safedeploy: rolling_out row has nil canary_step_started_at; skipping stuck check (post-00488 schema default should prevent this)",
+				"deployment_id", d.ID, "app_id", d.AppID,
+				"canary_step", d.CanaryStep, "canary_total_steps", d.CanaryTotalSteps)
+			stats.StuckCheckMissingTimestamp++
 		}
 		// Healthy in-flight row — nothing to do this tick. The
 		// canary_progression tick owns the per-step advance;

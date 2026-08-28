@@ -88,13 +88,13 @@ type APIDClient interface {
 // Progression drives the canary_progression tick. Construct via
 // NewProgression in cmd/meterd; tests build one inline.
 type Progression struct {
-	Store    Store
-	APID     APIDClient
-	Ops      *wire.OpsMetrics
-	Log      *slog.Logger
-	Now      func() time.Time
-	Actor    string // service-account UUID stamped into the audit row
-	Account  string // service-account account_id stamped into the audit row
+	Store   Store
+	APID    APIDClient
+	Ops     *wire.OpsMetrics
+	Log     *slog.Logger
+	Now     func() time.Time
+	Actor   string // service-account UUID stamped into the audit row
+	Account string // service-account account_id stamped into the audit row
 }
 
 // NewProgression builds a Progression with nil-coerced Log / Now so
@@ -222,13 +222,30 @@ func (p *Progression) Once(ctx context.Context) (Stats, error) {
 			continue
 		}
 		// Wall-clock boundary: only advance when the current step's
-		// Duration has elapsed since canary_step_started_at.
-		if !row.CanaryStepStarted.IsZero() {
-			elapsed := now.Sub(row.CanaryStepStarted)
-			if elapsed < currentStage.Duration {
-				stats.SkippedNotElapsed++
-				continue
+		// Duration has elapsed since canary_step_started_at. Migration
+		// 00488 (SAFE-RELEASES code-review hardening) locked the
+		// column to NOT NULL DEFAULT NOW(), so the IsZero() branch
+		// below is belt-and-braces for write paths that bypass the
+		// schema default (e.g. a future code path that forgets to
+		// stamp the timestamp; a rolled-back deployment row from a
+		// pre-00488 backup). When we see zero, log + bump the
+		// zero-timestamp counter so operators have visibility — and
+		// still run the wall-clock check so behavior matches
+		// pre-migration (elapsed = 56 years > Duration → advance).
+		if row.CanaryStepStarted.IsZero() {
+			p.Log.Warn("canary: canary_step_started_at is zero time; treating as 'advance now' (post-00488 schema default should prevent this)",
+				"deployment_id", row.ID,
+				"canary_preset", row.CanaryPreset,
+				"canary_step", row.CanaryStep,
+				"canary_total_steps", row.CanaryTotalSteps)
+			if p.Ops != nil {
+				p.Ops.CanaryProgressionZeroTimestampTotal()()
 			}
+		}
+		elapsed := now.Sub(row.CanaryStepStarted)
+		if elapsed < currentStage.Duration {
+			stats.SkippedNotElapsed++
+			continue
 		}
 		// Advance: PATCH traffic to nextStage.Percent. The terminal
 		// step's PATCH is also routed here (nextStep = total - 1,
@@ -303,10 +320,10 @@ func (p *Progression) actorOrDefault() string {
 // bucket per tick (Errors is its own bucket; SkippedNotElapsed is
 // distinct from SkippedUnknownPreset).
 type Stats struct {
-	Advanced              int
-	Errors                int
-	SkippedUnknownPreset  int
-	SkippedOutOfBounds    int
+	Advanced               int
+	Errors                 int
+	SkippedUnknownPreset   int
+	SkippedOutOfBounds     int
 	SkippedAlreadyTerminal int
-	SkippedNotElapsed     int
+	SkippedNotElapsed      int
 }

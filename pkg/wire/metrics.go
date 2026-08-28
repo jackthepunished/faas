@@ -797,6 +797,20 @@ type OpsMetrics struct {
 	// {patch_traffic, append_audit, list_in_flight}. Closed
 	// vocabulary — unknown reasons drop to the no-op closure.
 	canaryProgressionErrorsTotal *prometheus.CounterVec
+	// canaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
+	// hardening, migration 00488) counts every row the
+	// canary_progression tick walks whose canary_step_started_at is
+	// the zero time. Post-00488 the column is NOT NULL DEFAULT NOW(),
+	// so this counter should never fire in steady state; a non-zero
+	// rate is the tripwire for "a write path bypassed the apid Create
+	// handler and left the column at the zero value" — exactly the
+	// failure mode code-review finding #1 was worried about. The
+	// runtime's behavior on zero is unchanged (still advances on the
+	// first tick — elapsed = 56 years > Duration), but the operator
+	// gets a fleet-level signal that the schema default was bypassed.
+	// Unlabelled — fleet rollup; per-deployment detail lives in the
+	// existing deploy.traffic_changed audit row.
+	canaryProgressionZeroTimestampTotal prometheus.Counter
 	// alertDeliveryAttemptsTotal — counts dispatched alert-rule
 	// webhook attempts, labelled by outcome ∈ {delivered, failed}.
 	// Label cardinality budget = 2 (closed vocabulary). The counter
@@ -2444,6 +2458,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, reason := range []string{"patch_traffic", "append_audit", "list_in_flight"} {
 		canaryProgressionErrorsTotal.WithLabelValues(reason)
 	}
+	// SAFE-RELEASES code-review hardening (migration 00488):
+	// tripwire counter for the canary_progression tick seeing a
+	// zero canary_step_started_at. Post-00488 the column is NOT NULL
+	// DEFAULT NOW(), so a non-zero rate means a write path bypassed
+	// the schema default — exactly the silent-soak-bypass hole
+	// finding #1 was worried about. Unlabelled (fleet rollup; per-
+	// deployment detail lives in the deploy.traffic_changed audit
+	// row).
+	canaryProgressionZeroTimestampTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_zero_timestamp_total",
+		Help: "Count of canary_progression tick rows whose canary_step_started_at was the zero time (post-00488 the column is NOT NULL DEFAULT NOW(), so a non-zero rate is the tripwire for a write path bypassing the apid CreateDeployment stamp). Unlabelled — fleet-level rollup.",
+	})
 	alertDeliveryAttemptsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_alert_delivery_attempts_total",
 		Help: "Count of dispatched alert-rule webhook attempts, labelled by outcome ∈ {delivered, failed} (closed vocabulary, cardinality budget = 2). The counter surfaces the dispatcher's success rate without exposing per-customer detail — the audit events table is the per-customer detail.",
@@ -3938,6 +3964,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		alertEvalFiredTotal:                  alertEvalFiredTotal,
 		canaryProgressionAdvancedTotal:       canaryProgressionAdvancedTotal,
 		canaryProgressionErrorsTotal:         canaryProgressionErrorsTotal,
+		canaryProgressionZeroTimestampTotal:  canaryProgressionZeroTimestampTotal,
 		alertDeliveryAttemptsTotal:           alertDeliveryAttemptsTotal,
 		alertActionExecutedTotal:             alertActionExecutedTotal,
 		paddleWebhookVerifyFailedTotal:       paddleWebhookVerifyFailedTotal,
@@ -6119,6 +6146,28 @@ func (m *OpsMetrics) CanaryProgressionAdvancedTotal() func() {
 		return func() {}
 	}
 	m.canaryProgressionAdvancedTotal.Inc()
+	return func() {}
+}
+
+// CanaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
+// hardening, migration 00488) increments the canary-progression
+// tripwire counter every time the meterd tick walks a row whose
+// canary_step_started_at is the zero time. Post-00488 the column is
+// NOT NULL DEFAULT NOW(), so a non-zero rate means a write path
+// bypassed the schema default — exactly the silent-soak-bypass hole
+// code-review finding #1 was worried about. Behaviour on zero is
+// unchanged (the wall-clock check still runs; elapsed = 56 years >
+// Duration → advance) — the counter exists purely for operator
+// visibility (and as the §12 dashboard tripwire for "a write path
+// skipped the apid CreateDeployment stamp"). Unlabelled — fleet
+// rollup; per-deployment detail lives in the existing
+// deploy.traffic_changed audit row. Returns a no-op closure on a
+// nil receiver — mirrors CanaryProgressionAdvancedTotal.
+func (m *OpsMetrics) CanaryProgressionZeroTimestampTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.canaryProgressionZeroTimestampTotal.Inc()
 	return func() {}
 }
 

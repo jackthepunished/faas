@@ -21,15 +21,15 @@ import (
 // Store interface. Tracks every method call so tests can assert
 // the per-row decision tree without spinning up Postgres.
 type stubStore struct {
-	mu                 sync.Mutex
-	rollouts           map[string]state.Deployment
-	auditRows          []state.DeploymentAudit
-	listErr            error // optional; forces ListPendingRollouts to fail
-	stampErr           error // optional; forces SafedeployStampRollout to fail
-	auditErr           error // optional; forces AppendDeploymentAudit to fail
-	listCalls          int
-	stampCalls         int
-	auditCalls         int
+	mu         sync.Mutex
+	rollouts   map[string]state.Deployment
+	auditRows  []state.DeploymentAudit
+	listErr    error // optional; forces ListPendingRollouts to fail
+	stampErr   error // optional; forces SafedeployStampRollout to fail
+	auditErr   error // optional; forces AppendDeploymentAudit to fail
+	listCalls  int
+	stampCalls int
+	auditCalls int
 }
 
 func newStubStore() *stubStore {
@@ -104,14 +104,14 @@ func seedDeployment(s *stubStore, t *testing.T, mutate func(d *state.Deployment)
 	t.Helper()
 	depID := uuid.New().String()
 	d := state.Deployment{
-		ID:                depID,
-		AppID:             "app-" + depID[:8],
-		Status:            state.DeployLive,
-		RolloutState:      "pending",
-		CanaryPreset:      "balanced",
-		CanaryStep:        0,
-		CanaryTotalSteps:  4,
-		CreatedAt:         time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		ID:               depID,
+		AppID:            "app-" + depID[:8],
+		Status:           state.DeployLive,
+		RolloutState:     "pending",
+		CanaryPreset:     "balanced",
+		CanaryStep:       0,
+		CanaryTotalSteps: 4,
+		CreatedAt:        time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
 	}
 	if mutate != nil {
 		mutate(&d)
@@ -405,5 +405,46 @@ func TestSetStuckAfterDuration_EnvOverride(t *testing.T) {
 	SetStuckAfterDuration(-1 * time.Second)
 	if got := StuckAfterDuration; got != 5*time.Minute {
 		t.Errorf("after SetStuckAfterDuration(-1s) = %s; want 5m (negative must be ignored)", got)
+	}
+}
+
+// TestOrchestrator_NilCanaryStepStartedAt_DefensiveGuard —
+// code-review finding #2 hardening (migration 00488). Pre-00488
+// canary_step_started_at was nullable, so a rolling_out row could
+// legally have nil. The orchestrator's stuck-detection branch
+// (`if d.CanaryStepStartedAt != nil`) silently skipped the check
+// and fell through to the healthy-in-flight return with no log,
+// no counter increment, and no operator visibility. Post-00488
+// the column is NOT NULL DEFAULT NOW(), so this branch should
+// never fire in steady state — but the defensive guard logs +
+// bumps Stats.StuckCheckMissingTimestamp when it does, so a
+// write path that bypasses the schema default surfaces loudly.
+func TestOrchestrator_NilCanaryStepStartedAt_DefensiveGuard(t *testing.T) {
+	store := newStubStore()
+	dep := seedDeployment(store, t, func(d *state.Deployment) {
+		d.RolloutState = "rolling_out"
+		d.CanaryStep = 1
+		d.CanaryTotalSteps = 4
+		d.CanaryStepStartedAt = nil // the defensive-guard branch
+		d.RolloutStartedAt = nil
+	})
+	o := NewOrchestrator(store, discardLog(), "meterd:safedeploy", "")
+
+	stats, err := o.Once(context.Background())
+	if err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if stats.StuckCheckMissingTimestamp != 1 {
+		t.Errorf("stats.StuckCheckMissingTimestamp = %d; want 1 (rolling_out row with nil canary_step_started_at must bump the tripwire counter)", stats.StuckCheckMissingTimestamp)
+	}
+	if stats.StuckDetected != 0 {
+		t.Errorf("stats.StuckDetected = %d; want 0 (no stuck detection — the nil branch is the separate defensive counter)", stats.StuckDetected)
+	}
+	if stats.Completed != 0 || stats.Started != 0 {
+		t.Errorf("stats = %+v; want no transitions on nil-timestamp row", stats)
+	}
+	got := store.rollouts[dep.ID]
+	if got.RolloutState != "rolling_out" {
+		t.Errorf("rollout_state = %q; want rolling_out (orchestrator must not auto-recover on nil timestamp)", got.RolloutState)
 	}
 }
