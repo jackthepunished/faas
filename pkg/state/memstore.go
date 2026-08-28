@@ -4909,6 +4909,8 @@ func (m *MemStore) ReorderDeployment(_ context.Context, id string, newPriority i
 	}
 	d.Priority = newPriority
 	d.ReorderedByPrincipal = principal
+	now := time.Now().UTC()
+	d.ReorderedAt = &now
 	m.deployments[id] = d
 	return nil
 }

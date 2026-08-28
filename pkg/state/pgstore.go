@@ -15640,7 +15640,7 @@ const deploymentSelectColumnsWithRootfs = `
 	-- backfill window). cancelled_*/cancel_reason are nullable so the
 	-- coalesce is the canonical "never cancelled" sentinel. deleted_at
 	-- + deleted_by_principal are the soft-delete audit columns.
-	coalesce(priority, 100), coalesce(reordered_by_principal, ''),
+	coalesce(priority, 100), coalesce(reordered_by_principal, ''), reordered_at,
 	cancelled_at, coalesce(cancelled_by_principal, ''), coalesce(cancel_reason, ''),
 	deleted_at, coalesce(deleted_by_principal, '')`
 
@@ -15690,7 +15690,7 @@ const deploymentSelectColumnsQualified = `
 	-- ADR-124 deployment queue controls (migration 00391/00491). See the
 	-- unqualified-projection counterpart above for the rationale on
 	-- coalesce choices.
-	coalesce(d.priority, 100), coalesce(d.reordered_by_principal, ''),
+	coalesce(d.priority, 100), coalesce(d.reordered_by_principal, ''), d.reordered_at,
 	d.cancelled_at, coalesce(d.cancelled_by_principal, ''), coalesce(d.cancel_reason, ''),
 	d.deleted_at, coalesce(d.deleted_by_principal, '')`
 
@@ -15798,7 +15798,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		// scan order mirrors the SELECT projection above — see the
 		// docblock on deploymentSelectColumnsWithRootfs for the
 		// "lockstep or pgx panic" invariant.
-		&d.Priority, &d.ReorderedByPrincipal,
+		&d.Priority, &d.ReorderedByPrincipal, &d.ReorderedAt,
 		&d.CancelledAt, &d.CancelledByPrincipal, &d.CancelReason,
 		&d.DeletedAt, &d.DeletedByPrincipal,
 	); err != nil {
