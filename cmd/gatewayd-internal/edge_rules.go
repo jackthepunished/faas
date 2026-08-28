@@ -37,8 +37,19 @@ import (
 // Pinning the interface keeps cmd/gatewayd-internal free of any
 // reverse dep on the full state.Store surface so tests can inject
 // a tiny fake that returns canned rule slices.
+//
+// GetCorsPresetByID (issue #975 #4 PR-B / ADR-129 D3) is the
+// compile-side preset resolver. The compile path calls this for
+// every kind=cors rule that stamps cors_preset_id; the merge
+// helper (state.MergeCorsPresetIntoRule) produces the resolved
+// action and re-validates the *+credentials footgun. A
+// cross-tenant IDOR (preset owned by a different account) maps
+// to ErrNotFound; the compile path records the miss and the
+// rule does not match. Mirrors the per-rule lookup the apid
+// PATCH path uses at handlers_cors_presets.go:158-163.
 type edgeRuleStore interface {
 	MatchEdgeRulesForHost(ctx context.Context, host string) ([]state.EdgeRule, error)
+	GetCorsPresetByID(ctx context.Context, accountID, id string) (state.CorsPreset, error)
 }
 
 // gatewaydEdgeRules is the production gateway.EdgeRuleMatcher impl.
@@ -122,7 +133,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	rewrite, rewriteErrs := compileRewriteRules(storeRules)
 	redirect, redirectErrs := compileRedirectRules(storeRules)
 	headers, headersErrs := compileHeadersRules(storeRules)
-	cors, corsErrs := compileCORSRules(storeRules)
+	cors, corsErrs := g.compileCORSRules(ctx, storeRules)
 	jwt, jwtErrs := compileJWTRules(storeRules)
 	ip, ipErrs := compileIPRules(storeRules)
 	validate, validateErrs := g.compileValidateRules(storeRules)
@@ -805,7 +816,20 @@ func compileHeadersRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleHeaders
 // fields that the gateway's applyEdgeRuleCORS consults. apid-Validate
 // already rejected AllowOrigins:["*"] + AllowCredentials:true
 // (ADR-091 D12) so the gateway stamper can trust the input.
-func compileCORSRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCORSResolved, []gateway.PathGlobError) {
+//
+// Per-rule preset resolution (issue #975 #4 PR-B / ADR-129 D3):
+// when r.Action.CORS.CorsPresetID is non-nil, the compile path
+// looks up the preset via g.store.GetCorsPresetByID and resolves
+// the merged action through state.MergeCorsPresetIntoRule. The
+// merge helper re-validates the *+credentials footgun (defense
+// in depth — the apid-Validate gate ran on create, but the
+// preset may have been edited since). A missing preset (deleted
+// by the customer between rule-create and rule-compile, the
+// ON DELETE SET NULL FK cleared the rule's FK to NULL) is
+// caught by the helper's ErrNotFound return — the rule is
+// dropped from the compiled slice and the parse error is
+// surfaced as cors_preset_not_found.
+func (g *gatewaydEdgeRules) compileCORSRules(ctx context.Context, storeRules []state.EdgeRule) ([]gateway.EdgeRuleCORSResolved, []gateway.PathGlobError) {
 	if len(storeRules) == 0 {
 		return nil, nil
 	}
@@ -827,6 +851,65 @@ func compileCORSRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCORSResolv
 			continue
 		}
 		action := r.Action.CORS
+		// Resolve the merged shape. The merge helper returns
+		// the rule's values verbatim when no preset is stamped
+		// (inline-only path), so the no-preset branch and the
+		// with-preset branch share the same struct fields.
+		var merged state.MergedCorsRuleAction
+		if action.CorsPresetID != nil {
+			preset, perr := g.store.GetCorsPresetByID(ctx, r.AccountID, *action.CorsPresetID)
+			if perr != nil {
+				// ErrNotFound: the preset was deleted (FK
+				// ON DELETE SET NULL cleared the rule's FK
+				// to NULL; this rule's JSONB mirror is
+				// stale). Drop the rule from the compiled
+				// slice and surface the parse error so the
+				// operator can intervene.
+				parseErrs = append(parseErrs, gateway.PathGlobError{
+					RuleID: r.ID,
+					Glob:   r.MatchPath,
+					Err:    errors.New("cors_preset_not_found: the preset referenced by this rule has been deleted; re-save the rule or wire a new preset"),
+				})
+				continue
+			}
+			merged, perr = state.MergeCorsPresetIntoRule(r.AccountID, r.AppID, *action.CorsPresetID, state.CorsRuleOverride{
+				AllowOrigins:     action.AllowOrigins,
+				AllowMethods:     action.AllowMethods,
+				AllowHeaders:     action.AllowHeaders,
+				ExposeHeaders:    action.ExposeHeaders,
+				AllowCredentials: action.AllowCredentials,
+				MaxAgeSeconds:    action.MaxAgeSeconds,
+			}, preset)
+			if perr != nil {
+				// ErrCorsWildcardWithCredentials: the merge
+				// produced a *+credentials footgun (defense
+				// in depth — the customer may have edited
+				// the preset's allow_origins=["*"] without
+				// the rule author seeing the change).
+				// Drop the rule; the parse error surfaces
+				// the same stable message the apid write
+				// boundary uses (RFC 7807 code
+				// cors_wildcard_with_credentials).
+				parseErrs = append(parseErrs, gateway.PathGlobError{
+					RuleID: r.ID,
+					Glob:   r.MatchPath,
+					Err:    errors.New("cors_wildcard_with_credentials: the merged preset + rule action cannot combine AllowCredentials: true with AllowOrigins: [\"*\"]"),
+				})
+				continue
+			}
+		} else {
+			// Inline-only path: build the merged action
+			// from the rule's fields directly.
+			merged = state.MergedCorsRuleAction{
+				PresetID:         "",
+				AllowOrigins:     append([]string(nil), action.AllowOrigins...),
+				AllowMethods:     append([]string(nil), action.AllowMethods...),
+				AllowHeaders:     append([]string(nil), action.AllowHeaders...),
+				ExposeHeaders:    append([]string(nil), action.ExposeHeaders...),
+				AllowCredentials: action.AllowCredentials,
+				MaxAgeSeconds:    action.MaxAgeSeconds,
+			}
+		}
 		out = append(out, gateway.EdgeRuleCORSResolved{
 			ID:               r.ID,
 			AccountID:        r.AccountID,
@@ -834,12 +917,13 @@ func compileCORSRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCORSResolv
 			Priority:         r.Priority,
 			PathGlob:         r.MatchPath,
 			Methods:          buildMethodsMap(r.MatchMethods),
-			AllowOrigins:     append([]string(nil), action.AllowOrigins...),
-			AllowMethods:     append([]string(nil), action.AllowMethods...),
-			AllowHeaders:     append([]string(nil), action.AllowHeaders...),
-			ExposeHeaders:    append([]string(nil), action.ExposeHeaders...),
-			AllowCredentials: action.AllowCredentials,
-			MaxAgeSeconds:    action.MaxAgeSeconds,
+			AllowOrigins:     merged.AllowOrigins,
+			AllowMethods:     merged.AllowMethods,
+			AllowHeaders:     merged.AllowHeaders,
+			ExposeHeaders:    merged.ExposeHeaders,
+			AllowCredentials: merged.AllowCredentials,
+			MaxAgeSeconds:    merged.MaxAgeSeconds,
+			PresetID:         merged.PresetID,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

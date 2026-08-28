@@ -297,6 +297,18 @@ var methodRouteMap = map[string]string{
 	"GET /v1/alert-presets":                            "ListAlertPresets",
 	"POST /v1/apps/{slug}/alert-presets/{name}/enable": "EnableAlertPreset",
 
+	// Issue #975 item #4 / ADR-129 — CORS presets. Same hyphen
+	// pattern as alert-presets and edge-rules: auto-derivation
+	// produces Swagger-style "GetCors-presets" because the path
+	// uses a literal hyphen; the SDK names methods after the
+	// resource noun (CorsPreset) — same convention as the
+	// three precedents above.
+	"GET /v1/cors-presets":         "ListCorsPresets",
+	"POST /v1/cors-presets":        "CreateCorsPreset",
+	"GET /v1/cors-presets/{id}":    "GetCorsPreset",
+	"PATCH /v1/cors-presets/{id}":  "UpdateCorsPreset",
+	"DELETE /v1/cors-presets/{id}": "DeleteCorsPreset",
+
 	// ADR-089 (planned) — edge rules. The auto-derivation would
 	// produce Swagger-style names ("GetAppsSlugEdge-rules",
 	// "GetEdge-rules", "PostAppsSlugEdge-rules") because the path

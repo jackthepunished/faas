@@ -36,10 +36,11 @@ import (
 // canned rule slices keyed by host; an optional `err` returns a
 // synthetic error so loader failures are exercised.
 type fakeEdgeRuleStore struct {
-	mu    sync.Mutex
-	rules map[string][]state.EdgeRule
-	err   error
-	calls map[string]int // host -> call count, for loader-frequency assertions
+	mu       sync.Mutex
+	rules    map[string][]state.EdgeRule
+	presetBy map[string]state.CorsPreset // accountID+":"+id → CorsPreset, keyed by composite
+	err      error
+	calls    map[string]int // host -> call count, for loader-frequency assertions
 }
 
 func (f *fakeEdgeRuleStore) MatchEdgeRulesForHost(_ context.Context, host string) ([]state.EdgeRule, error) {
@@ -53,6 +54,19 @@ func (f *fakeEdgeRuleStore) MatchEdgeRulesForHost(_ context.Context, host string
 	}
 	f.calls[host]++
 	return f.rules[host], nil
+}
+
+// GetCorsPresetByID mirrors state.Store.GetCorsPresetByID for tests:
+// cross-tenant lookups collapse to ErrNotFound (account_id + id
+// composite key) so PR-B IDOR regressions surface in tests. Issue
+// #975 #4 PR-B / ADR-129 D3.
+func (f *fakeEdgeRuleStore) GetCorsPresetByID(_ context.Context, accountID, id string) (state.CorsPreset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if preset, ok := f.presetBy[accountID+":"+id]; ok {
+		return preset, nil
+	}
+	return state.CorsPreset{}, state.ErrNotFound
 }
 
 // sampleRouteRule builds a fully-populated state.EdgeRule with the

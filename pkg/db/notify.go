@@ -442,6 +442,22 @@ const (
 	// repaired on the next boot/reconnect.
 	NotifyRuntimeConfigChanged          = "runtime_config_changed"
 	NotifyRuntimeConfigOperationChanged = "runtime_config_operation_changed"
+	// NotifyCorsPresetChanged {"account_id":uuid}
+	//   any cors_presets mutation →
+	//   cmd/gatewayd-internal: the per-host edge-rule LRU holds
+	//   compiled EdgeRuleCORSResolved slices that baked-in the
+	//   preset's allow_origins / allow_methods / etc. at the
+	//   last compile. The compile path (compileCORSRules)
+	//   calls GetCorsPresetByID on a cache miss, so the
+	//   receipt of this notification drops the affected
+	//   account's rules from the LRU wholesale; the next
+	//   request recompiles and re-fetches the preset against
+	//   the up-to-date row. Per-account payload so a noisy
+	//   multi-tenant node doesn't drop rules for unaffected
+	//   accounts. The trigger at migrations/00428 fires on
+	//   every cors_presets INSERT / UPDATE / DELETE. ADR-129
+	//   D4 (issue #975 #4 PR-B).
+	NotifyCorsPresetChanged = "cors_preset_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

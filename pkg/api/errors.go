@@ -2291,6 +2291,54 @@ const CodePlanConsumerKeyQuotaReached = "plan_consumer_key_quota_reached"
 // authors can write a single switch on plan-gated codes.
 const CodeConsumerKeysNotAllowed = "consumer_keys_not_allowed"
 
+// CodePlanCorsPresetQuotaReached is the RFC 7807 stable code
+// returned when the per-app or per-account cors_presets quota
+// is exhausted (issue #975 #4 / PR-B / ADR-129). The apid POST
+// /v1/cors-presets handler returns 403 with this code on
+// attempts that exceed Plan.CorsPresetsPerApp or
+// Plan.CorsPresetsPerAccount. Mirrors
+// CodePlanOpenAPIDocQuotaReached (ADR-122) — same shape, same
+// "delete one to add another" copy, same WithLimit doc URL.
+const CodePlanCorsPresetQuotaReached = "plan_cors_preset_quota_reached"
+
+// CodePlanCorsPresetsNotAllowed is the RFC 7807 stable code
+// returned when the customer's plan is gated off the
+// cors_presets feature entirely (Free tier; mirrors
+// CodePlanOpenAPIDocsNotAllowed and CodeConsumerKeysNotAllowed).
+// The apid POST /v1/cors-presets handler returns 402
+// plan_not_allowed with this code on attempts. Why stable:
+// SDK authors can write a single switch on plan-gated codes.
+const CodePlanCorsPresetsNotAllowed = "plan_cors_presets_not_allowed"
+
+// ErrPlanCorsPresetsNotAllowed (issue #975 #4 PR-B / ADR-129)
+// is returned by the apid cors_presets POST handler when the
+// customer's plan has CorsPresetsPerAccount == 0 (Free today).
+// 402 plan_not_allowed because the upsell posture is the same
+// as the inline CORS rules — Free customers stay on inline
+// kind=cors rules (the abuse-floor tier), presets are an
+// abstraction above the floor.
+func ErrPlanCorsPresetsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanCorsPresetsNotAllowed,
+		"CORS presets unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include CORS presets; upgrade to Hobby or above to manage reusable CORS configurations.", p)).
+		WithLimit(0, 0).
+		WithDocs(docsBase + "/plans#cors-presets")
+}
+
+// ErrPlanCorsPresetQuotaReached (issue #975 #4 PR-B / ADR-129)
+// is returned when the per-account or per-app cors_presets
+// quota is reached. 403 because the plan DOES unlock presets —
+// the right copy is "delete one to add another", not "upgrade
+// to Hobby". Mirrors ErrPlanOpenAPIDocQuota.
+func ErrPlanCorsPresetQuotaReached(plan Plan, scope string, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanCorsPresetQuotaReached,
+		"CORS preset limit reached",
+		fmt.Sprintf("%s plan caps CORS presets at %d per %s; you have %d. Delete one to add another.",
+			plan, limit, scope, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#cors-presets")
+}
+
 // CodePlanOpenAPIDocQuotaReached is the RFC 7807 stable code
 // returned when the per-deployment or per-account deployment_openapi_docs
 // quota is exhausted (ADR-122 / issue #975 item #1). The apid PATCH

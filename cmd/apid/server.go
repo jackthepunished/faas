@@ -1402,6 +1402,25 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{slug}/mirrors/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteMirrorRule))))
 	mux.HandleFunc("GET /v1/apps/{slug}/mirrors/{id}/summary", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getMirrorRuleSummary))))
 
+	// CORS presets (issue #975 #4 / PR-B / ADR-129). The
+	// account-wide + app-scoped read surface is a single
+	// /v1/cors-presets endpoint with an optional app_id query
+	// parameter; the per-id CRUD is the standard
+	// GET/PATCH/DELETE shape. The create + patch + delete
+	// paths go through CreateCorsPresetIfUnderQuota /
+	// UpdateCorsPreset / DeleteCorsPreset on the Store; the
+	// pgstore trigger fires pg_notify('cors_preset_changed',
+	// account_id) after every write so the gatewayd-internal
+	// listener reloads the affected account's preset overlay
+	// (ADR-129 D4). The plan-tier gate fires INSIDE the
+	// create handler (402 plan_cors_presets_not_allowed for
+	// Free) so the gate precedes the loadStore call.
+	mux.HandleFunc("GET /v1/cors-presets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCorsPresets))))
+	mux.HandleFunc("POST /v1/cors-presets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createCorsPreset)))))
+	mux.HandleFunc("GET /v1/cors-presets/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getCorsPreset))))
+	mux.HandleFunc("PATCH /v1/cors-presets/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.patchCorsPreset))))
+	mux.HandleFunc("DELETE /v1/cors-presets/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCorsPreset))))
+
 	// Outbound webhooks (issue #476 / ADR-076). CRUD surface under
 	// /v1/apps/{slug}/webhooks mirrors /v1/apps/{slug}/alerts: same
 	// plan-tier gate (Free → 402 plan_webhooks_not_allowed), same

@@ -126,6 +126,8 @@ from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
 from .consume_invoice_response import ConsumeInvoiceResponse
 from .consumed_credit_row import ConsumedCreditRow
+from .cors_preset_list_response import CorsPresetListResponse
+from .cors_preset_response import CorsPresetResponse
 from .create_alert_rule_request import CreateAlertRuleRequest
 from .create_alert_rule_request_comparison import CreateAlertRuleRequestComparison
 from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFailureSource
@@ -139,6 +141,7 @@ from .create_app_request_type import CreateAppRequestType
 from .create_app_webhook_request import CreateAppWebhookRequest
 from .create_app_webhook_request_event_filter_item import CreateAppWebhookRequestEventFilterItem
 from .create_app_webhook_request_retry_policy import CreateAppWebhookRequestRetryPolicy
+from .create_cors_preset_request import CreateCorsPresetRequest
 from .create_cron_request import CreateCronRequest
 from .create_custom_domain_request import CreateCustomDomainRequest
 from .create_deployment_files_body import CreateDeploymentFilesBody
@@ -157,6 +160,7 @@ from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_edge_rule_request_validate_mode import CreateEdgeRuleRequestValidateMode
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
+from .create_mirror_rule_request import CreateMirrorRuleRequest
 from .create_org_api_key_request import CreateOrgAPIKeyRequest
 from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
@@ -177,6 +181,7 @@ from .create_trigger_request_config import CreateTriggerRequestConfig
 from .cron_response import CronResponse
 from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
+from .csrf_token_response import CSRFTokenResponse
 from .custom_domain_response import CustomDomainResponse
 from .daily_usage_list_response import DailyUsageListResponse
 from .daily_usage_response import DailyUsageResponse
@@ -295,6 +300,7 @@ from .get_deployment_stages_response_200_current import GetDeploymentStagesRespo
 from .get_deployment_stages_response_200_history_item import GetDeploymentStagesResponse200HistoryItem
 from .get_deployment_stages_response_200_history_item_name import GetDeploymentStagesResponse200HistoryItemName
 from .get_deployment_stages_response_200_history_item_status import GetDeploymentStagesResponse200HistoryItemStatus
+from .get_mirror_rule_summary_window import GetMirrorRuleSummaryWindow
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .grace_window_response import GraceWindowResponse
 from .import_app_open_api_body import ImportAppOpenAPIBody
@@ -325,6 +331,7 @@ from .invoke_response import InvokeResponse
 from .invoke_response_result import InvokeResponseResult
 from .invoke_response_status import InvokeResponseStatus
 from .issue_account_credit_body import IssueAccountCreditBody
+from .issue_browser_csrf_token_action import IssueBrowserCSRFTokenAction
 from .kafka_sasl_config import KafkaSASLConfig
 from .kafka_sasl_mechanism import KafkaSASLMechanism
 from .kafka_tls_config import KafkaTLSConfig
@@ -334,6 +341,8 @@ from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
+from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
+from .list_operator_runtime_config_revisions_response_200 import ListOperatorRuntimeConfigRevisionsResponse200
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
 from .list_tenant_surfaces_response import ListTenantSurfacesResponse
@@ -354,9 +363,29 @@ from .mfa_recover_request import MFARecoverRequest
 from .mfa_recover_response import MFARecoverResponse
 from .mfa_verify_request import MFAVerifyRequest
 from .mfa_verify_response import MFAVerifyResponse
+from .mirror_rule_list_response import MirrorRuleListResponse
+from .mirror_rule_response import MirrorRuleResponse
+from .mirror_summary_response import MirrorSummaryResponse
 from .o_auth_provider_capability import OAuthProviderCapability
 from .oidc_exchange_request import OIDCExchangeRequest
 from .oidc_exchange_response import OIDCExchangeResponse
+from .operator_intent_accepted_response import OperatorIntentAcceptedResponse
+from .operator_intent_accepted_response_kind import OperatorIntentAcceptedResponseKind
+from .operator_intent_accepted_response_previous_state import OperatorIntentAcceptedResponsePreviousState
+from .operator_intent_response import OperatorIntentResponse
+from .operator_intent_response_kind import OperatorIntentResponseKind
+from .operator_intent_response_status import OperatorIntentResponseStatus
+from .operator_runtime_config import OperatorRuntimeConfig
+from .operator_runtime_config_apply_mode import OperatorRuntimeConfigApplyMode
+from .operator_runtime_config_kind import OperatorRuntimeConfigKind
+from .operator_runtime_config_operation import OperatorRuntimeConfigOperation
+from .operator_runtime_config_operation_apply_mode import OperatorRuntimeConfigOperationApplyMode
+from .operator_runtime_config_operation_scope import OperatorRuntimeConfigOperationScope
+from .operator_runtime_config_operation_status import OperatorRuntimeConfigOperationStatus
+from .operator_runtime_config_revision import OperatorRuntimeConfigRevision
+from .operator_runtime_config_revision_scope import OperatorRuntimeConfigRevisionScope
+from .operator_runtime_config_source import OperatorRuntimeConfigSource
+from .operator_runtime_config_status import OperatorRuntimeConfigStatus
 from .org_invitation_response import OrgInvitationResponse
 from .org_invitation_response_role import OrgInvitationResponseRole
 from .org_invitation_response_status import OrgInvitationResponseStatus
@@ -393,6 +422,10 @@ from .plan_workload_action import PlanWorkloadAction
 from .plan_workload_class import PlanWorkloadClass
 from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
+from .post_force_cold_boot_app_confirm import PostForceColdBootAppConfirm
+from .post_force_park_instance_confirm import PostForceParkInstanceConfirm
+from .post_force_restart_instance_confirm import PostForceRestartInstanceConfirm
+from .post_sweep_stuck_builds_confirm import PostSweepStuckBuildsConfirm
 from .problem import Problem
 from .programmatic_api_key import ProgrammaticAPIKey
 from .programmatic_auth_response import ProgrammaticAuthResponse
@@ -475,6 +508,7 @@ from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .sweep_stuck_builds_response import SweepStuckBuildsResponse
 from .template_view import TemplateView
 from .template_view_category import TemplateViewCategory
 from .tenant_hostname_response import TenantHostnameResponse
@@ -517,6 +551,7 @@ from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequest
 from .update_app_webhook_request import UpdateAppWebhookRequest
 from .update_app_webhook_request_event_filter_item import UpdateAppWebhookRequestEventFilterItem
 from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetryPolicy
+from .update_cors_preset_request import UpdateCorsPresetRequest
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
 from .update_deployment_open_api_doc_body import UpdateDeploymentOpenAPIDocBody
@@ -527,6 +562,8 @@ from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
 from .update_edge_rule_request_validate_mode import UpdateEdgeRuleRequestValidateMode
+from .update_mirror_rule_request import UpdateMirrorRuleRequest
+from .update_operator_runtime_config_body import UpdateOperatorRuntimeConfigBody
 from .update_trigger_request import UpdateTriggerRequest
 from .update_trigger_request_broker_poison_strategy_type_1 import UpdateTriggerRequestBrokerPoisonStrategyType1
 from .update_trigger_request_broker_poison_strategy_type_2_type_1 import (
@@ -675,6 +712,8 @@ __all__ = (
     "ChangePlanRequestPlan",
     "ConsumedCreditRow",
     "ConsumeInvoiceResponse",
+    "CorsPresetListResponse",
+    "CorsPresetResponse",
     "CreateAlertRuleRequest",
     "CreateAlertRuleRequestComparison",
     "CreateAlertRuleRequestFailureSource",
@@ -688,6 +727,7 @@ __all__ = (
     "CreateAppWebhookRequest",
     "CreateAppWebhookRequestEventFilterItem",
     "CreateAppWebhookRequestRetryPolicy",
+    "CreateCorsPresetRequest",
     "CreateCronRequest",
     "CreateCustomDomainRequest",
     "CreateDeploymentFilesBody",
@@ -706,6 +746,7 @@ __all__ = (
     "CreateEdgeRuleRequestValidateMode",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
+    "CreateMirrorRuleRequest",
     "CreateOrgAPIKeyRequest",
     "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
@@ -722,6 +763,7 @@ __all__ = (
     "CronResponse",
     "CronRun",
     "CronRunOutcome",
+    "CSRFTokenResponse",
     "CustomDomainResponse",
     "DailyUsageListResponse",
     "DailyUsageResponse",
@@ -840,6 +882,7 @@ __all__ = (
     "GetDeploymentStagesResponse200HistoryItem",
     "GetDeploymentStagesResponse200HistoryItemName",
     "GetDeploymentStagesResponse200HistoryItemStatus",
+    "GetMirrorRuleSummaryWindow",
     "GetOpenAPISpecJSONResponse200",
     "GraceWindowResponse",
     "ImportAppOpenAPIBody",
@@ -870,6 +913,7 @@ __all__ = (
     "InvokeResponseResult",
     "InvokeResponseStatus",
     "IssueAccountCreditBody",
+    "IssueBrowserCSRFTokenAction",
     "KafkaSASLConfig",
     "KafkaSASLMechanism",
     "KafkaTLSConfig",
@@ -879,6 +923,8 @@ __all__ = (
     "ListCronRunsResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
+    "ListOperatorRuntimeConfigResponse200",
+    "ListOperatorRuntimeConfigRevisionsResponse200",
     "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
     "ListTenantSurfacesResponse",
@@ -899,9 +945,29 @@ __all__ = (
     "MFARecoverResponse",
     "MFAVerifyRequest",
     "MFAVerifyResponse",
+    "MirrorRuleListResponse",
+    "MirrorRuleResponse",
+    "MirrorSummaryResponse",
     "OAuthProviderCapability",
     "OIDCExchangeRequest",
     "OIDCExchangeResponse",
+    "OperatorIntentAcceptedResponse",
+    "OperatorIntentAcceptedResponseKind",
+    "OperatorIntentAcceptedResponsePreviousState",
+    "OperatorIntentResponse",
+    "OperatorIntentResponseKind",
+    "OperatorIntentResponseStatus",
+    "OperatorRuntimeConfig",
+    "OperatorRuntimeConfigApplyMode",
+    "OperatorRuntimeConfigKind",
+    "OperatorRuntimeConfigOperation",
+    "OperatorRuntimeConfigOperationApplyMode",
+    "OperatorRuntimeConfigOperationScope",
+    "OperatorRuntimeConfigOperationStatus",
+    "OperatorRuntimeConfigRevision",
+    "OperatorRuntimeConfigRevisionScope",
+    "OperatorRuntimeConfigSource",
+    "OperatorRuntimeConfigStatus",
     "OrgInvitationResponse",
     "OrgInvitationResponseRole",
     "OrgInvitationResponseStatus",
@@ -938,6 +1004,10 @@ __all__ = (
     "PlanWorkloadClass",
     "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
+    "PostForceColdBootAppConfirm",
+    "PostForceParkInstanceConfirm",
+    "PostForceRestartInstanceConfirm",
+    "PostSweepStuckBuildsConfirm",
     "Problem",
     "ProgrammaticAPIKey",
     "ProgrammaticAuthResponse",
@@ -1018,6 +1088,7 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "SweepStuckBuildsResponse",
     "TemplateView",
     "TemplateViewCategory",
     "TenantHostnameResponse",
@@ -1060,6 +1131,7 @@ __all__ = (
     "UpdateAppWebhookRequest",
     "UpdateAppWebhookRequestEventFilterItem",
     "UpdateAppWebhookRequestRetryPolicy",
+    "UpdateCorsPresetRequest",
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
     "UpdateDeploymentOpenAPIDocBody",
@@ -1070,6 +1142,8 @@ __all__ = (
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
     "UpdateEdgeRuleRequestValidateMode",
+    "UpdateMirrorRuleRequest",
+    "UpdateOperatorRuntimeConfigBody",
     "UpdateTriggerRequest",
     "UpdateTriggerRequestBrokerPoisonStrategyType1",
     "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",

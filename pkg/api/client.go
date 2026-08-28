@@ -3675,3 +3675,83 @@ func (c *Client) GetAppsSlugMirrorsIdSummary(ctx context.Context, slug, id, wind
 	var out MirrorSummaryResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/mirrors/"+id+"/summary?window="+windowStr, nil, &out)
 }
+
+// --- CORS presets (issue #975 item #4 / ADR-129) -------------------------
+//
+// Customer-owned, named, reusable CORS configurations. The data
+// model shipped in PR-A (migration 00304_cors_presets.sql); the
+// write surface lands in PR-B. A preset is wired into a kind=cors
+// edge rule via EdgeRuleCORSAction.cors_preset_id; the gateway
+// merge happens at compile time (state.MergeCorsPresetIntoRule).
+//
+// Plan gates: Free → 402 plan_cors_preset_not_allowed (the cap
+// is 0); Hobby/Pro/Scale → 403 plan_cors_preset_quota_reached
+// at the per-account / per-app quota. The wire-level codes are
+// surfaced verbatim on *api.Problem; the SDK does not retry.
+
+// ListCorsPresets returns every cors_presets row the caller's
+// account owns (account-wide + every app-scoped row). The
+// optional appID argument scopes the listing to a single app's
+// presets; empty = union of account-wide + every app-scoped
+// row. No pagination (the per-account quota caps the row count).
+func (c *Client) ListCorsPresets(ctx context.Context, appID string) (CorsPresetListResponse, error) {
+	var out CorsPresetListResponse
+	path := "/v1/cors-presets"
+	if appID != "" {
+		path += "?app_id=" + url.QueryEscape(appID)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// CreateCorsPreset attaches a new cors_presets row to the
+// caller's account. AppID is *string on the wire (nil =
+// account-wide, non-nil = app-scoped); the SDK takes the
+// pointer verbatim so JSON null can be distinguished from an
+// omitted field.
+//
+// Pre-loadApp gates fire in this order: 402
+// plan_cors_preset_not_allowed on the Free-tier cap-0 → 422
+// cors_preset_invalid on body shape → 404 on a cross-tenant
+// app_id → 402 plan_cors_preset_quota_reached on the cap → 409
+// cors_preset_name_conflict on duplicate
+// (account_id, COALESCE(app_id, '00..00'), name).
+func (c *Client) CreateCorsPreset(ctx context.Context, req CreateCorsPresetRequest) (CorsPresetResponse, error) {
+	var out CorsPresetResponse
+	return out, c.do(ctx, "POST", "/v1/cors-presets", req, &out)
+}
+
+// GetCorsPreset fetches one cors_presets row by id. IDOR-safe:
+// a foreign account's id collapses to 404, not 403 — same
+// convention as GetEdgeRule and GetAlertRule.
+func (c *Client) GetCorsPreset(ctx context.Context, id string) (CorsPresetResponse, error) {
+	var out CorsPresetResponse
+	return out, c.do(ctx, "GET", "/v1/cors-presets/"+id, nil, &out)
+}
+
+// UpdateCorsPreset applies a partial update (nil-skip
+// convention). At-least-one-field is enforced server-side;
+// an empty PATCH body returns 422
+// cors_preset_update_requires_field. AppID is **string
+// tri-state: outer nil = "do not touch", inner nil = "set to
+// NULL (account-wide)", inner non-nil = "set to UUID
+// (app-scoped)" — the wire-format is the same as the create
+// shape so the SDK passes the value through verbatim.
+//
+// The pgstore trigger fires pg_notify('cors_preset_changed',
+// account_id) AFTER the UPDATE commits; gatewayd-internal
+// reloads the affected account's preset overlay (ADR-129 D4).
+func (c *Client) UpdateCorsPreset(ctx context.Context, id string, req UpdateCorsPresetRequest) (CorsPresetResponse, error) {
+	var out CorsPresetResponse
+	return out, c.do(ctx, "PATCH", "/v1/cors-presets/"+id, req, &out)
+}
+
+// DeleteCorsPreset removes the cors_presets row. The FK ON
+// DELETE SET NULL on edge_rules.cors_preset_id clears every
+// referencing rule's FK atomically with the preset's deletion;
+// the gatewayd-internal compile path fails closed
+// (MergeCorsPresetIntoRule returns ErrNotFound) until the
+// customer wires a new preset or inlines fallback values.
+// Returns nil on 204.
+func (c *Client) DeleteCorsPreset(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/cors-presets/"+id, nil, nil)
+}

@@ -4746,6 +4746,18 @@ func (a *EdgeRuleHeadersAction) Validate() *Problem {
 }
 
 // EdgeRuleCORSAction stamps CORS headers + handles preflight.
+//
+// CorsPresetID (issue #975 #4 PR-B / ADR-129 D1/D2) is the
+// nullable pointer to a cors_presets row. When set, the inline
+// action fields MUST be empty/zero — the preset is the entire
+// policy. The compile-side merge helper
+// pkg/state.MergeCorsPresetIntoRule (kind=cors branch in
+// cmd/gatewayd-internal/edge_rules.go::compileCORSRules) resolves
+// the preset's allow_origins / allow_methods / allow_headers /
+// expose_headers / allow_credentials / max_age_seconds into the
+// runtime CORS response. The apid-write boundary rejects
+// `cors_preset_id + any non-empty inline field` with 422
+// (Validate enforces the mutual exclusivity at create time).
 type EdgeRuleCORSAction struct {
 	AllowOrigins     []string `json:"allow_origins"`
 	AllowMethods     []string `json:"allow_methods"`
@@ -4753,6 +4765,10 @@ type EdgeRuleCORSAction struct {
 	ExposeHeaders    []string `json:"expose_headers,omitempty"`
 	AllowCredentials bool     `json:"allow_credentials"`
 	MaxAgeSeconds    int      `json:"max_age_seconds"`
+	// CorsPresetID is *string (nullable). nil = inline policy
+	// only. Non-nil = preset reference; inline fields above
+	// MUST be empty/zero per ADR-129 D2.
+	CorsPresetID *string `json:"cors_preset_id,omitempty"`
 }
 
 // CorsOriginPattern is the grammar for an allow_origins entry
@@ -4784,6 +4800,35 @@ var CorsOriginPattern = regexp.MustCompile(`^(?:\*|https?://(?:\*\.[a-zA-Z0-9.\-
 func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if a == nil {
 		return ErrValidation("cors action is required")
+	}
+	// ADR-129 D2 mutual exclusivity. When CorsPresetID is set,
+	// the inline fields MUST be empty/zero — the preset is the
+	// entire policy. Allowing inline fields alongside a preset
+	// would let an inline override silently shadow the preset
+	// (the merge helper's "rule-wins-zero-overrides-preset"
+	// convention would apply per-field, which is the surprising
+	// behaviour ADR-129 D2 rejects). The customer either uses
+	// the preset OR the inline fields, not both.
+	if a.CorsPresetID != nil {
+		if len(a.AllowOrigins) > 0 {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline allow_origins — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		if len(a.AllowMethods) > 0 {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline allow_methods — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		if len(a.AllowHeaders) > 0 {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline allow_headers — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		if len(a.ExposeHeaders) > 0 {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline expose_headers — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		if a.AllowCredentials {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline allow_credentials — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		if a.MaxAgeSeconds != 0 {
+			return ErrValidation("cors action cannot combine cors_preset_id with inline max_age_seconds — pick one (ADR-129 D2 mutual exclusivity)")
+		}
+		return nil
 	}
 	if len(a.AllowOrigins) == 0 {
 		return ErrValidation("cors action requires at least one allow_origin")

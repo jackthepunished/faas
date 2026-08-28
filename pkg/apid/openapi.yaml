@@ -62,6 +62,19 @@ tags:
       fans out a percentage of live traffic to the mirror VM without
       influencing the source response. Plan caps: Pro = 1, Scale = 3,
       Free/Hobby = 0.
+  - name: cors_presets
+    description: |
+      CORS presets (issue #975 item #4 / ADR-129). A preset is a
+      customer-owned, named, reusable CORS configuration (allow_origins,
+      allow_methods, allow_headers, expose_headers, allow_credentials,
+      max_age_seconds). A preset is referenced by a kind=cors edge rule
+      via EdgeRuleCORSAction.cors_preset_id; the gateway merges the
+      preset into the rule's resolved action at compile time (state.
+      MergeCorsPresetIntoRule). Presets are account-scoped (app_id is
+      null on the wire) or app-scoped (app_id is set). Free plan:
+      feature gated off (402 plan_cors_preset_not_allowed). Hobby/
+      Pro/Scale: per-account and per-app caps enforced via
+      plan_cors_preset_quota_reached.
   - name: deployments
     description: Deployments & build status.
   - name: openapi_discovery
@@ -5917,6 +5930,170 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── CORS presets (ADR-129 / issue #975 #4 PR-B) ────────────────────────
+  # Customer-owned, named, reusable CORS configurations. The
+  # write surface (POST/PATCH/DELETE) lands in PR-B; the read
+  # path was available via the dashboard in PR-A. Presets are
+  # referenced by kind=cors edge rules via
+  # EdgeRuleCORSAction.cors_preset_id; the gateway merges the
+  # preset into the rule's resolved action at compile time.
+  /v1/cors-presets:
+    get:
+      tags: [cors_presets]
+      operationId: listCorsPresets
+      summary: List CORS presets visible to the calling account.
+      description: |
+        Lists every cors_presets row the account owns — both
+        account-wide (app_id IS NULL) and app-scoped (app_id
+        is set). The optional `app_id` query parameter filters
+        to a single app's scoped presets; absent = union of
+        account-wide + every app-scoped row. No pagination —
+        the per-account quota caps the row count (see the
+        plan_cors_preset_quota_reached error code).
+      parameters:
+        - name: app_id
+          in: query
+          required: false
+          description: |
+            Optional app filter. Absent = every preset on the
+            account. Set = only the app-scoped presets for that
+            app. Cross-tenant IDs collapse to 404.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The list of cors presets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorsPresetListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [cors_presets]
+      operationId: createCorsPreset
+      summary: Create a CORS preset.
+      description: |
+        Creates a new cors_presets row owned by the caller's
+        account. AppID is optional (null = account-wide; UUID =
+        app-scoped). The body validation mirrors the storage-
+        side CHECK constraints: name 1..64, max_age 0..86400,
+        at-least-one allow_origin + allow_method. The
+        *+credentials footgun (ADR-091 D12) returns 422
+        cors_wildcard_with_credentials when the create body
+        combines AllowCredentials: true with AllowOrigins:
+        ["*"].
+
+        Pre-loadApp gates fire in this order: 402
+        plan_cors_preset_not_allowed on the Free-tier cap-0 →
+        422 cors_preset_invalid on the body shape → 404
+        cors_preset_app_not_found on a cross-tenant app_id →
+        403 plan_cors_preset_quota_reached on the per-account
+        / per-app cap → 409 cors_preset_name_conflict on a
+        duplicate (account_id, COALESCE(app_id, '00..00'),
+        name) tuple.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCorsPresetRequest' }
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The created cors preset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorsPresetResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '403': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '422': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/cors-presets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Preset UUID.
+        schema: { type: string, format: uuid }
+    get:
+      tags: [cors_presets]
+      operationId: getCorsPreset
+      summary: Get a single CORS preset by id.
+      description: |
+        Returns the canonical cors_presets row. Cross-tenant
+        IDs collapse to 404 (no slug-leak). The response is
+        the same shape as POST /v1/cors-presets.
+      responses:
+        '200':
+          description: The cors preset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorsPresetResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [cors_presets]
+      operationId: patchCorsPreset
+      summary: Partial-update a CORS preset.
+      description: |
+        Applies the partial-update (nil-skip convention) to
+        the cors_presets row. The PATCH body must include at
+        least one field (an empty body returns 422
+        cors_preset_update_requires_field). The wire-level
+        Validate enforces the same partial grammar as Create
+        (CorsOriginPattern on allow_origins if provided,
+        non-empty allow_methods if provided, max_age bound
+        0..86400). The handler additionally re-validates the
+        post-update merged shape against the *+credentials
+        footgun (a PATCH that flips AllowCredentials to true
+        while leaving AllowOrigins=["*"] is rejected).
+
+        The pgstore trigger fires pg_notify
+        ('cors_preset_changed', account_id) AFTER the UPDATE
+        commits so the gatewayd-internal listener reloads
+        the affected account's preset overlay (ADR-129 D4).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateCorsPresetRequest' }
+      responses:
+        '200':
+          description: The updated cors preset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorsPresetResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '422': { $ref: '#/components/responses/CorsPresetInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [cors_presets]
+      operationId: deleteCorsPreset
+      summary: Delete a CORS preset.
+      description: |
+        Removes the cors_presets row. The FK ON DELETE SET
+        NULL on edge_rules.cors_preset_id clears every
+        referencing rule's FK atomically with the preset's
+        deletion; the gatewayd-internal compile path fails
+        closed (MergeCorsPresetIntoRule returns ErrNotFound)
+        until the customer wires a new preset or inlines
+        fallback values. The pgstore trigger fires
+        pg_notify('cors_preset_changed', account_id) AFTER
+        the DELETE commits.
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Alert presets (ADR-123 / issue #1233) ───────────────────────────────
   # Catalog of one-click alert presets. The catalog is R/O for
   # customers (system-seeded via migration 00348). Enabling a
@@ -6412,7 +6589,7 @@ paths:
       summary: Delete an edge rule.
       responses:
         '204':
-          description: Deleted.
+          description: The cors preset was deleted. Referencing edge_rules.cors_preset_id was atomically cleared via ON DELETE SET NULL; the gateway compile path fails closed until the customer wires a new preset or inlines fallback values.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -14312,11 +14489,226 @@ components:
           maxItems: 32
           items: { $ref: '#/components/schemas/EdgeRuleHeaderOp' }
 
+    # ─── CORS presets (ADR-129 / issue #975 #4 PR-B) ─────────────────────────
+    # The data model + read path shipped in PR-A (migration
+    # 00304_cors_presets.sql). PR-B adds the write surface
+    # (POST/PATCH/DELETE /v1/cors-presets) and the per-rule
+    # cors_preset_id field on EdgeRuleCORSAction. The mutual-
+    # exclusivity invariant (PresetID + inline fields ⇒ 422) is
+    # encoded in the apid wire Validate; the merge happens at
+    # gateway compile time via state.MergeCorsPresetIntoRule.
+
+    CorsPresetResponse:
+      description: |
+        One cors_presets row (issue #975 #4 PR-B / ADR-129). The
+        id is a server-generated UUID; app_id is null on the
+        wire for account-wide presets and a UUID for app-scoped
+        presets (the SQL NULL marker is the canonical "account-
+        wide" encoding; the empty string is not used). The
+        allow_origins array accepts the same CorsOriginPattern
+        grammar as the inline EdgeRuleCORSAction field. The
+        create-time gate enforces AllowCredentials: true +
+        AllowOrigins: ["*"] ⇒ 422 (ADR-091 D12). Updated_at is
+        bumped on every successful PATCH; the gateway's
+        per-account overlay cache invalidates on pg_notify
+        (cors_preset_changed).
+      type: object
+      required:
+        - id
+        - account_id
+        - name
+        - allow_origins
+        - allow_methods
+        - allow_credentials
+        - max_age_seconds
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid, example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, format: uuid }
+        app_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional app scoping (issue #975 #4 PR-B). Null on the
+            wire = account-wide preset (visible to every app on
+            the account). A UUID = app-scoped preset (visible
+            only to that one app; cross-tenant IDOR collapses to
+            404).
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          example: "public-https"
+        description:
+          type: string
+          maxLength: 256
+          example: "Origins allowed on every public-facing endpoint."
+        allow_origins:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|localhost)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
+        allow_methods:
+          type: array
+          minItems: 1
+          items: { type: string }
+        allow_headers:
+          type: array
+          items: { type: string }
+        expose_headers:
+          type: array
+          items: { type: string }
+        allow_credentials: { type: boolean, default: false }
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateCorsPresetRequest:
+      description: |
+        Body for POST /v1/cors-presets. The customer must supply
+        at least one allow_origin and one allow_method. AppID is
+        optional on the wire (null pointer = "account-wide",
+        non-nil = "app-scoped"); the handler maps the
+        pointer-nil case to a SQL NULL on insert. Name length
+        is 1..64 characters (cors_presets_name_check). The
+        *+credentials footgun (ADR-091 D12) is enforced at
+        validate-time.
+      type: object
+      required:
+        - name
+        - allow_origins
+        - allow_methods
+        - allow_credentials
+        - max_age_seconds
+      properties:
+        app_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional app scoping. Null = account-wide. Set to a
+            UUID = app-scoped.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 256
+        allow_origins:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|localhost)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
+        allow_methods:
+          type: array
+          minItems: 1
+          items: { type: string }
+        allow_headers:
+          type: array
+          items: { type: string }
+        expose_headers:
+          type: array
+          items: { type: string }
+        allow_credentials: { type: boolean, default: false }
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
+
+    UpdateCorsPresetRequest:
+      description: |
+        Body for PATCH /v1/cors-presets/{id}. Every field is
+        optional (PATCH nil-skip convention). At least one field
+        must be present (an empty PATCH is rejected with 422
+        cors_preset_update_requires_field). The same partial
+        grammar check that fires on CreateCorsPresetRequest
+        (CorsOriginPattern, *+credentials footgun) fires here
+        on the partial payload; the apid handler additionally
+        re-validates against the merged post-update shape so a
+        PATCH that flips AllowCredentials to true while leaving
+        AllowOrigins=["*"] is rejected.
+
+        app_id uses the **string tri-state: outer null = "do
+        not touch", inner null = "set to NULL (account-wide)",
+        inner non-null = "set to UUID (app-scoped)".
+      type: object
+      properties:
+        app_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional app scoping. Outer null = do not touch.
+            Inner null = set to NULL (account-wide). Inner
+            non-null = set to UUID (app-scoped).
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 256
+        allow_origins:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|localhost)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
+        allow_methods:
+          type: array
+          minItems: 1
+          items: { type: string }
+        allow_headers:
+          type: array
+          items: { type: string }
+        expose_headers:
+          type: array
+          items: { type: string }
+        allow_credentials: { type: boolean }
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
+
+    CorsPresetListResponse:
+      description: |
+        GET /v1/cors-presets list shape. The (account-wide,
+        app-scoped) order mirrors ListCorsPresetsForAccount:
+        account-wide rows first (app_id IS NULL), then
+        app-scoped rows, both ordered by name.
+      type: object
+      required: [presets]
+      properties:
+        presets:
+          type: array
+          items: { $ref: '#/components/schemas/CorsPresetResponse' }
+
     EdgeRuleCORSAction:
       description: 'Stamps CORS headers + handles preflight in-process.'
       type: object
       required: [allow_origins, allow_methods]
       properties:
+        # Issue #975 #4 PR-B / ADR-129 D2: when cors_preset_id is
+        # set, all inline fields (allow_origins, allow_methods,
+        # etc.) MUST be empty / unset. The preset is the entire
+        # policy; the rule cannot shadow individual fields. The
+        # apid wire Validate enforces the mutual exclusivity and
+        # returns 422 cors_wildcard_with_credentials when the
+        # rule/preset pair produces an unmergeable combination
+        # (ADR-091 D12 *+credentials footgun).
+        cors_preset_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional CORS preset reference (issue #975 #4 PR-B /
+            ADR-129). When set, the rule's resolved CORS action is
+            the merged union of the preset's fields and the rule's
+            inline fields — with the rule taking precedence for any
+            non-empty inline field. Mutually exclusive with inline
+            fields: if cors_preset_id is set, allow_origins,
+            allow_methods, allow_headers, expose_headers,
+            allow_credentials, and max_age_seconds must all be empty
+            / unset. The preset is referenced by id (UUID); an
+            invalid id (cross-tenant, deleted) causes the rule to
+            be silently dropped from the gateway's compiled slice
+            (the request matches no rule, returning 404 from the
+            route layer).
         # CORS improvements D2/D6: allow_origins accepts the
         # wildcard grammar documented on CorsOriginPattern
         # in pkg/api/dto.go. Bare '*', literal origin
@@ -18731,6 +19123,19 @@ components:
 
     AlertRuleInvalid:
       description: 'code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    CorsPresetInvalid:
+      description: |
+        code: cors_preset_invalid | cors_wildcard_with_credentials |
+        cors_preset_update_requires_field | cors_preset_name_conflict |
+        plan_cors_preset_not_allowed | plan_cors_preset_quota_reached
+        (issue #975 #4 PR-B / ADR-129). The body validates the
+        same shape as the storage-side CHECK constraints; the
+        wire-level codes are 422 for grammar violations and 402
+        for plan gates.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

@@ -51,6 +51,7 @@ const (
 	envDiffFile        = "env_diff.go"        // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
 	operatorConfigFile = "operator_config.go" // ADR-132 — operator runtime configuration
 	obsFile            = "obs.go"             // Obs-Meta + Trace-IDs Mega-PR / C7 — operator obs backend DTOs + ObsHealthResponse
+	corsPresetsFile    = "cors_preset_dto.go" // issue #975 #4 PR-B / ADR-129 — CORS preset DTOs
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -306,6 +307,14 @@ var dtoExclude = map[string]bool{
 	"ObsTenantBilling":          true,
 	"ObsTenantUsage":            true,
 	"ObsTenantUsageApp":         true,
+	// Issue #975 #4 / ADR-129 — query parameter struct for
+	// GET /v1/cors-presets (the `app_id` filter). The wire
+	// surface inlines the field directly in the query parameter
+	// list (api/openapi.yaml) rather than $ref'ing a
+	// standalone schema — single-use shape, no SDK callers
+	// reference it by name. Mirrors the inline query shape
+	// pattern at handlers_alerts.go.
+	"CorsPresetListFilter": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -761,6 +770,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", envDiffFile),
 		filepath.Join(root, "pkg", "api", operatorConfigFile),
 		filepath.Join(root, "pkg", "api", obsFile),
+		filepath.Join(root, "pkg", "api", corsPresetsFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

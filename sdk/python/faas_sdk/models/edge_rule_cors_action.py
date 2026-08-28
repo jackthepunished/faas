@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -17,6 +18,21 @@ class EdgeRuleCORSAction:
 
     allow_origins: list[str]
     allow_methods: list[str]
+    cors_preset_id: None | Unset | UUID = UNSET
+    """Optional CORS preset reference (issue #975 #4 PR-B /
+    ADR-129). When set, the rule's resolved CORS action is
+    the merged union of the preset's fields and the rule's
+    inline fields — with the rule taking precedence for any
+    non-empty inline field. Mutually exclusive with inline
+    fields: if cors_preset_id is set, allow_origins,
+    allow_methods, allow_headers, expose_headers,
+    allow_credentials, and max_age_seconds must all be empty
+    / unset. The preset is referenced by id (UUID); an
+    invalid id (cross-tenant, deleted) causes the rule to
+    be silently dropped from the gateway's compiled slice
+    (the request matches no rule, returning 404 from the
+    route layer).
+    """
     allow_headers: list[str] | Unset = UNSET
     expose_headers: list[str] | Unset = UNSET
     allow_credentials: bool | Unset = False
@@ -27,6 +43,14 @@ class EdgeRuleCORSAction:
         allow_origins = self.allow_origins
 
         allow_methods = self.allow_methods
+
+        cors_preset_id: None | str | Unset
+        if isinstance(self.cors_preset_id, Unset):
+            cors_preset_id = UNSET
+        elif isinstance(self.cors_preset_id, UUID):
+            cors_preset_id = str(self.cors_preset_id)
+        else:
+            cors_preset_id = self.cors_preset_id
 
         allow_headers: list[str] | Unset = UNSET
         if not isinstance(self.allow_headers, Unset):
@@ -48,6 +72,8 @@ class EdgeRuleCORSAction:
                 "allow_methods": allow_methods,
             }
         )
+        if cors_preset_id is not UNSET:
+            field_dict["cors_preset_id"] = cors_preset_id
         if allow_headers is not UNSET:
             field_dict["allow_headers"] = allow_headers
         if expose_headers is not UNSET:
@@ -66,6 +92,23 @@ class EdgeRuleCORSAction:
 
         allow_methods = cast(list[str], d.pop("allow_methods"))
 
+        def _parse_cors_preset_id(data: object) -> None | Unset | UUID:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                cors_preset_id_type_0 = UUID(data)
+
+                return cors_preset_id_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UUID, data)
+
+        cors_preset_id = _parse_cors_preset_id(d.pop("cors_preset_id", UNSET))
+
         allow_headers = cast(list[str], d.pop("allow_headers", UNSET))
 
         expose_headers = cast(list[str], d.pop("expose_headers", UNSET))
@@ -77,6 +120,7 @@ class EdgeRuleCORSAction:
         edge_rule_cors_action = cls(
             allow_origins=allow_origins,
             allow_methods=allow_methods,
+            cors_preset_id=cors_preset_id,
             allow_headers=allow_headers,
             expose_headers=expose_headers,
             allow_credentials=allow_credentials,

@@ -1178,6 +1178,25 @@ func (b *PGBackend) ResetEdgeRules() {
 	b.edgeRules.Reset()
 }
 
+// ResetCorsPresets (issue #975 #4 PR-B / ADR-129 D4) drops
+// the edge-rule matcher's per-host LRU so the next request
+// recompiles and re-fetches the up-to-date preset via
+// state.GetCorsPresetByID. The compile path bakes the
+// preset's allow_origins / allow_methods / etc. into the
+// resolved EdgeRuleCORSResolved slice, so a preset edit
+// leaves stale resolved shapes in the LRU. Wholesale flush
+// matches ResetEdgeRules semantics; the per-account payload
+// is informational (the LRU is per-host keyed, not per-
+// account; per-account eviction would require a richer
+// key — see backend.go's handleInvalidation case for the
+// trade-off discussion). nil-safe.
+func (b *PGBackend) ResetCorsPresets(accountID string) {
+	if b == nil {
+		return
+	}
+	b.ResetEdgeRules()
+}
+
 func (b *PGBackend) getApp(appID string) (App, bool) {
 	b.appsMu.RLock()
 	app, ok := b.apps[appID]
