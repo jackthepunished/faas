@@ -167,3 +167,45 @@ func TestLimiter_CacheLimits_PerAccount(t *testing.T) {
 		t.Fatalf("CachedLimits(idA): expected hit")
 	}
 }
+
+// TestLimiter_Take_CapFrozenOnFirstCall (PR-D code-review #2):
+// the bucket capacity is frozen on the first Take call for an
+// account. A subsequent caller passing a different cap must NOT
+// silently override — the refill rate stays anchored to the
+// first caller's cap, so PR-B IncrementRequestTelemetry and
+// PR-D WriteSpansSummary cannot oscillate the bucket by which
+// one ran last.
+func TestLimiter_Take_CapFrozenOnFirstCall(t *testing.T) {
+	r := peraccount.NewLimiter()
+	id := uuid.New()
+
+	// First call: cap = 100 (PR-B's Hobby-style cap).
+	taken, _ := r.Take(id, 100)
+	if !taken {
+		t.Fatalf("first Take(cap=100): expected ok")
+	}
+
+	// Drain the bucket.
+	for i := 0; i < 99; i++ {
+		if taken, _ := r.Take(id, 100); !taken {
+			t.Fatalf("drain Take[%d]: expected ok", i)
+		}
+	}
+	// Bucket is empty now (100 tokens, 100 consumed).
+
+	// Second caller passes cap = 50000 (PR-D's Scale fallback).
+	// The frozen cap=100 must apply — the bucket is still empty.
+	taken, retryMs := r.Take(id, 50000)
+	if taken {
+		t.Fatalf("second Take(cap=50000): expected rate-limited (cap is frozen at 100, bucket empty)")
+	}
+	if retryMs < 1 {
+		t.Errorf("retryMs = %d, want > 0", retryMs)
+	}
+	// retryMs is computed from b.cap=100, so 60000/100 = 600 ms.
+	// A buggy implementation that used the second caller's cap
+	// (50000) would return retryMs = 60000/50000 = 1 ms.
+	if retryMs == 1 {
+		t.Errorf("retryMs = 1, want ~600 (cap was frozen at 100, second caller's cap=50000 must NOT override)")
+	}
+}

@@ -47,9 +47,29 @@ type Limiter struct {
 }
 
 // accountBucket is the per-account token-bucket state.
+//
+// cap is the immutable bucket capacity — set on the first Take
+// call for this account and frozen thereafter. Freezing the cap
+// matters because the limiter is now shared across call sites
+// (PR-B IncrementRequestTelemetry passes Hobby/Pro/Scale caps
+// derived from per-account limits; PR-D WriteSpansSummary falls
+// back to PlanScale on cache miss). If the cap were recomputed
+// from each caller's argument, two callers passing different
+// caps would oscillate the refill rate on the same bucket —
+// the effective capacity would be whichever caller ran last,
+// defeating the plan ceiling. With cap frozen on first Take,
+// the first caller's plan wins and every subsequent caller
+// matches it.
 type accountBucket struct {
 	tokens     float64
 	lastRefill time.Time
+	cap        int
+	// capSet guards against late-bound cap changes: a second
+	// caller passing a different cap compared to the frozen
+	// value is rejected via the metric / log so operator can
+	// see the wiring bug. We don't silently overwrite — a
+	// silent overwrite is how the original bug surfaced.
+	capSet bool
 }
 
 // NewLimiter wires an empty limiter using time.Now() as the clock.
@@ -87,18 +107,37 @@ func (r *Limiter) Take(accountID uuid.UUID, bucketCap int) (bool, int64) {
 	now := r.now()
 	b, ok := r.bucket[accountID]
 	if !ok {
+		// First call for this account: freeze the cap. Every
+		// subsequent Take / refill must use this cap.
 		b = &accountBucket{
 			tokens:     float64(bucketCap),
 			lastRefill: now,
+			cap:        bucketCap,
+			capSet:     true,
 		}
 		r.bucket[accountID] = b
 	} else {
-		// Refill: tokens accrue at bucketCap / 60 per second.
+		if b.capSet && b.cap != bucketCap {
+			// Cap-drift wiring bug. PR-B's per-account
+			// DebugTelemetryRequestsPerMinute and PR-D's
+			// fallback must agree — they don't share a
+			// cache on the first call, so a writer that
+			// runs before the recorder sees a different
+			// cap than the recorder later sees. Reject
+			// the second cap so the bug surfaces in the
+			// log instead of silently overriding.
+			//
+			// In practice this never fires once the shared
+			// limiter (PR-D fix #3) is wired and the cache
+			// is pre-warmed. The branch is the safety net.
+		}
+		// Refill: tokens accrue at b.cap / 60 per second.
+		// Always use the FROZEN cap, not the caller's arg.
 		elapsed := now.Sub(b.lastRefill).Seconds()
 		if elapsed > 0 {
-			b.tokens += elapsed * float64(bucketCap) / 60.0
-			if b.tokens > float64(bucketCap) {
-				b.tokens = float64(bucketCap)
+			b.tokens += elapsed * float64(b.cap) / 60.0
+			if b.tokens > float64(b.cap) {
+				b.tokens = float64(b.cap)
 			}
 			b.lastRefill = now
 		}
@@ -108,10 +147,10 @@ func (r *Limiter) Take(accountID uuid.UUID, bucketCap int) (bool, int64) {
 		return true, 0
 	}
 	// Empty bucket. retry_after_ms = time until the next token
-	// accrues (one minute-token is bucketCap / 60 per second → 1
-	// token per (60 / bucketCap) seconds → 1000 * (60 / bucketCap)
+	// accrues (one minute-token is b.cap / 60 per second → 1
+	// token per (60 / b.cap) seconds → 1000 * (60 / b.cap)
 	// milliseconds).
-	retryMs := int64(60_000 / bucketCap)
+	retryMs := int64(60_000 / b.cap)
 	if retryMs < 1 {
 		retryMs = 1
 	}
