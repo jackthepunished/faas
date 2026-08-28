@@ -258,25 +258,25 @@ var methodRouteMap = map[string]string{
 	"POST /v1/deployments/{id}/reorder":                       "ReorderDeployment",        // ADR-124 PR-A; priority bump on pending deploy
 	"POST /v1/apps/{slug}/deployments/{id}/cancel":            "CancelDeployment",         // ADR-124 PR-A; status flip + cascade
 	"POST /v1/apps/{slug}/deployments/clear-obsolete":         "ClearObsoleteDeployments", // ADR-124 PR-A; bulk soft-delete terminal rows
-	"GET /v1/apps":                                            "ListApps",
-	"POST /v1/apps":                                           "CreateApp",
-	"GET /status/slo.json":                                    "GetStatusSLO",
-	"PATCH /v1/crons/{id}":                                    "UpdateCron",
-	"POST /v1/crons":                                          "CreateCron",
-	"GET /v1/crons":                                           "ListCrons",
-	"GET /v1/crons/{id}/runs":                                 "ListCronRuns",       // issue #791 — per-cron execution history
-	"POST /v1/crons/{id}/run":                                 "FireCron",           // issue #791 — manual fire-now (PR-C)
-	"GET /v1/cron-fire-now-requests/{request_id}":             "GetFireCronRequest", // issue #791 PR-D — poll fire-now terminal state (IDOR-safe byte-identical-404)
-	"GET /v1/crons/{id}":                                      "GetCron",            // issue #791 PR-E / ADR-090 closure — backs `gregale crons info <id>`
-	"GET /v1/usage/summary":                                   "UsageSummary",
-	"GET /v1/usage":                                           "GetUsage",
-	"GET /v1/usage/daily":                                     "UsageDaily",
-	"GET /v1/usage/storage":                                   "StorageUsage",
-	"GET /v1/invoices":                                        "ListInvoices",
-	"POST /v1/invocations/{id}/replay":                        "ReplayInvocation", // issue #315 — re-issue a failed/dead_letter invocation
-	"GET /v1/apps/{slug}/secrets":                             "ListSecrets",
-	"GET /v1/domains":                                         "ListDomains",
-	"POST /v1/domains":                                        "CreateDomain",
+	"GET /v1/apps":                                "ListApps",
+	"POST /v1/apps":                               "CreateApp",
+	"GET /status/slo.json":                        "GetStatusSLO",
+	"PATCH /v1/crons/{id}":                        "UpdateCron",
+	"POST /v1/crons":                              "CreateCron",
+	"GET /v1/crons":                               "ListCrons",
+	"GET /v1/crons/{id}/runs":                     "ListCronRuns",       // issue #791 — per-cron execution history
+	"POST /v1/crons/{id}/run":                     "FireCron",           // issue #791 — manual fire-now (PR-C)
+	"GET /v1/cron-fire-now-requests/{request_id}": "GetFireCronRequest", // issue #791 PR-D — poll fire-now terminal state (IDOR-safe byte-identical-404)
+	"GET /v1/crons/{id}":                          "GetCron",            // issue #791 PR-E / ADR-090 closure — backs `gregale crons info <id>`
+	"GET /v1/usage/summary":                       "UsageSummary",
+	"GET /v1/usage":                               "GetUsage",
+	"GET /v1/usage/daily":                         "UsageDaily",
+	"GET /v1/usage/storage":                       "StorageUsage",
+	"GET /v1/invoices":                            "ListInvoices",
+	"POST /v1/invocations/{id}/replay":            "ReplayInvocation", // issue #315 — re-issue a failed/dead_letter invocation
+	"GET /v1/apps/{slug}/secrets":                 "ListSecrets",
+	"GET /v1/domains":                             "ListDomains",
+	"POST /v1/domains":                            "CreateDomain",
 
 	// Issue #396 / ADR-045 PR 3 — alert rules. The auto-derivation
 	// would produce names with literal hyphens for the rotate-secret
