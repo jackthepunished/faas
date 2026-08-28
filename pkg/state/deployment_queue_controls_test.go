@@ -17,6 +17,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -150,4 +151,79 @@ func seedDeploymentWithPlan(t *testing.T, store *MemStore, source, plan string) 
 		t.Fatalf("CreateBuild: %v", err)
 	}
 	return build.ID, dep.ID, app.ID
+}
+
+// TestStore_ClearDeployment_Pending_Happy and Live_Refuses pin the
+// memstore ClearDeployment happy + IDOR paths so pkg/state coverage
+// stays above the 70% floor. ADR-124: soft-delete stamps deleted_at +
+// deleted_by_principal; status is intentionally untouched.
+func TestStore_ClearDeployment_Pending_Happy(t *testing.T) {
+	store := NewMemStore()
+	ctx := context.Background()
+	_, depID, _ := seedDeploymentWithPlan(t, store, "/tmp/src.tar.gz", string(api.PlanPro))
+	if err := store.ClearDeployment(ctx, depID, "operator:test"); err != nil {
+		t.Fatalf("ClearDeployment happy: %v", err)
+	}
+	d, err := store.DeploymentByID(ctx, depID)
+	if err != nil {
+		t.Fatalf("DeploymentByID post-clear: %v", err)
+	}
+	if d.DeletedAt == nil {
+		t.Errorf("DeletedAt was not stamped")
+	}
+	if d.DeletedByPrincipal != "operator:test" {
+		t.Errorf("DeletedByPrincipal = %q, want %q", d.DeletedByPrincipal, "operator:test")
+	}
+}
+
+func TestStore_ClearDeployment_Live_Refuses(t *testing.T) {
+	store := NewMemStore()
+	ctx := context.Background()
+	_, depID, _ := seedDeploymentWithPlan(t, store, "/tmp/src.tar.gz", string(api.PlanPro))
+	// Flip status to live (the "live" branch is the only branch
+	// ClearDeployment blocks on).
+	if d, err := store.DeploymentByID(ctx, depID); err != nil {
+		t.Fatalf("read pre: %v", err)
+	} else {
+		d.Status = DeployLive
+		store.mu.Lock()
+		store.deployments[depID] = d
+		store.mu.Unlock()
+	}
+	if err := store.ClearDeployment(ctx, depID, "operator:test"); !errors.Is(err, ErrCancelLiveForbidden) {
+		t.Fatalf("ClearDeployment(live) = %v, want ErrCancelLiveForbidden", err)
+	}
+}
+
+// TestStore_ClearObsoleteDeployments_Happy pins the bulk-soft-delete
+// memstore path so pkg/state coverage stays above the 70% floor.
+// Seeds 3 deployments for the same app; the oldest 1 (older_than
+// 1m from now) gets cleared while the 2 most-recent are kept by the
+// INV 3 retention window.
+func TestStore_ClearObsoleteDeployments_Happy(t *testing.T) {
+	store := NewMemStore()
+	ctx := context.Background()
+	_, _, appID := seedDeploymentWithPlan(t, store, "/tmp/src1.tar.gz", string(api.PlanPro))
+	// Seed 2 more deployments in the same app.
+	for i, path := range []string{"/tmp/src2.tar.gz", "/tmp/src3.tar.gz"} {
+		dep, err := store.CreateDeployment(ctx, Deployment{
+			AppID:       appID,
+			Kind:        DeploymentKindTarball,
+			SourcePath:  path,
+			SourceBytes: int64(100 + i),
+			LogPath:     filepath.Join(t.TempDir(), "build.log"),
+		})
+		if err != nil {
+			t.Fatalf("CreateDeployment #%d: %v", i, err)
+		}
+		_ = dep
+	}
+	// olderThan = future (now + 1h) ⇒ all rows qualify
+	count, err := store.ClearObsoleteDeployments(ctx, appID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ClearObsoleteDeployments: %v", err)
+	}
+	if count == 0 {
+		t.Errorf("ClearObsoleteDeployments returned 0, expected at least 1")
+	}
 }
