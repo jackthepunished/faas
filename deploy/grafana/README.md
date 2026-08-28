@@ -122,7 +122,7 @@ Panels:
 1. **Operator action trace completeness by kind (5m)** — `clamp_min(schedd_operator_action_trace_completeness_ratio, 0.001)`. Per-kind ratio timeseries with green≥0.95 / yellow 0.50-0.95 / red<0.50 threshold bands. `clamp_min(0.001)` mirrors the `vmmd_cold_boot_ratio` recording-rule precedent so the y-axis is bounded away from the `WithLabelValues(...)` default of 0 before the driver's first pass.
 2. **Operator action audit write rate by kind (denominator)** — `topk(8, sum by (kind) (rate({__name__=~".*_audit_log_write_total"}[5m])))` stacked. Disambiguator for the vacuous-truth default of 1.0 (absent kinds read 1.0 by `pkg/sched/operator_intent_completeness.go:172-179`). A kind whose ratio sits at 1.000 with non-zero write rate is a real violation; a kind whose ratio sits at 1.000 with flat write rate is a vacuous default. Same precedent as `FaasAuditRetentionTableGrowingFasterThanPruned`'s `> 0` precondition at `faas.rules.yml:463-469`.
 3. **Driver loop freshness (s, healthy <180)** — `time() - timestamp(schedd_operator_action_trace_completeness_ratio)`. Stat with green<180 / yellow<360 / red≥360. Same logic as `FaasAuditRetentionLoopStalled` (26h vs 24h cadence slack — `faas.rules.yml:421`).
-4. **Worst-kind completeness ratio** — recording rule `obs:operator_action_trace_completeness_ratio:5m` (`min(schedd_…)` + `clamp_min(0.001)`).
+4. **Worst-kind completeness ratio** — recording rule `obs:operator_action_trace_completeness_ratio` (the cold-start-guarded expression — see the `Recording rule` paragraph below the alert list).
 
 UID `faas-obs-trace-completeness-pr-1111`. Mirror at
 `deploy/ansible/roles/grafana/files/obs-trace-completeness.json`
@@ -137,7 +137,23 @@ Companion alerts at
 
 All three share `family=obs_trace, component=schedd` so the alertmanager inhibit rule auto-pairs page+warn.
 
-Recording rule: `obs:operator_action_trace_completeness_ratio` (`min(...)` over all kinds + `clamp_min(0.001)` — same shape as the `vmmd_cold_boot_ratio` precedent at `faas.rules.yml:1147`, no `:Nm` time-window suffix because the upstream gauge is instant rather than counter-rate).
+Recording rule: `obs:operator_action_trace_completeness_ratio` —
+`clamp_min((min(schedd_…) unless on() (sum(schedd_…) == 0)) or on()
+vector(1), 0.001)`. The `unless ... or vector(1)` idiom is the
+cold-start guard: when EVERY kind is still at the Prometheus
+GaugeVec default (0 — i.e., the schedd driver has not yet ticked
+after a fresh boot), the rule substitutes 1.0 (vacuous truth) so
+the Page alert does NOT fire false-positive at t=10m on every
+restart. A panic mid-tick that leaves some kinds Set and others
+at the Prometheus default still produces `sum != 0`, so the guard
+does NOT engage and the alert fires as before — preserving the
+panic-resilience contract pinned at
+`pkg/sched/operator_intent_completeness_test.go:118`. Regression
+test: `deploy/ansible/roles/prometheus/files/
+test_obs_trace_completeness.yml` (run with `promtool test rules`).
+Same shape as the `vmmd_cold_boot_ratio` precedent at
+`faas.rules.yml:1147`, no `:Nm` time-window suffix because the
+upstream gauge is instant rather than counter-rate.
 
 Runbook: `docs/runbooks/FaasOperatorActionTraceCompletenessLow.md`.
 
