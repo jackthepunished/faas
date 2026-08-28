@@ -6088,20 +6088,25 @@ func (s *PgStore) ClearObsoleteDeployments(ctx context.Context, appID string, ol
 	// Subquery "retention_id" returns the most-recent 2
 	// deployment_ids per app_id (the current + immediate previous
 	// snapshot retention). We explicitly do NOT touch them.
+	//
+	// `enqueued_at` is a builds-table column, not a deployments
+	// column — `deployments` carries `created_at` as its FIFO
+	// tiebreaker. (Surfaced in CI round-5 dispatch 32671691532
+	// pg-shard-2 — SQLSTATE 42703 column does not exist.)
 	tag, err := tx.Exec(ctx, `
 		UPDATE deployments
 		   SET deleted_at = $3,
 		       deleted_by_principal = 'system'
 		 WHERE app_id = $1
 		   AND status IN ('superseded', 'failed', 'cancelled')
-		   AND enqueued_at < $2
+		   AND created_at < $2
 		   AND deleted_at IS NULL
 		   AND id NOT IN (
 		         SELECT id FROM (
 		           SELECT id,
 		                  ROW_NUMBER() OVER (
 		                    PARTITION BY app_id
-		                    ORDER BY enqueued_at DESC, id
+		                    ORDER BY created_at DESC, id
 		                  ) AS rn
 		             FROM deployments
 		            WHERE app_id = $1
