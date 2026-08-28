@@ -1,4 +1,4 @@
--- filename: 00488_deployment_scope_exclusions.sql
+-- filename: 00487_deployment_scope_exclusions.sql
 -- +goose Up
 -- +goose StatementBegin
 --
@@ -68,13 +68,15 @@
 -- Branch note: this branch (worktree-feat-affected-workload-
 -- preview) was cut from origin/main at commit `0b4cf07f4`
 -- where the migration tail was 00386. origin/main has since
--- advanced 140 commits to 00416_openapi_import.sql (PR #1049).
--- Picking 00488 (after the 00487 fence) is correct against
--- the current origin/main head (00486_events_operator_intents_trace_id.sql).
--- The original branch picked 00417 + 00418 but those slots were
--- claimed by PR #1070 alert-presets / alert-presets-seed after
--- the rebase, so renumbered to 00487 + 00488 — see 00487_reserve_slot.sql
--- header for the renumber recipe.
+-- advanced 140 commits to 00487_edge_rules_cors_preset_fk.sql
+-- (PR #1090). Picking 00487 — directly claiming the tail slot
+-- is correct against the current origin/main head. The
+-- original branch picked 00417 + 00418, then renumbered to
+-- 00487 + 00488 (with a 00487 reserve_slot fence) after the
+-- first rebase; the second rebase onto origin/main (which now
+-- has a real 00487 edge_rules_cors_preset_fk) required the
+-- fence to be deleted and the exclusions migration to be
+-- renumbered to 00487.
 
 -- Replay-safe posture: every CREATE in this Up block uses
 -- IF NOT EXISTS (or DROP TRIGGER IF EXISTS before CREATE
@@ -138,9 +140,7 @@ CREATE TRIGGER deployment_scope_exclusions_set_updated_at_trg
 -- Forward-only widening: dropping this migration's objects is
 -- safe (no other table references it by FK — see the soft-
 -- delete CASCADE blind spot section above; the absence of an
--- apps FK is the load-bearing design choice here). The goose
--- Down sequence runs migrations in reverse apply order so the
--- 00487 fence is already gone by the time this Down fires.
+-- apps FK is the load-bearing design choice here).
 DROP TRIGGER IF EXISTS deployment_scope_exclusions_set_updated_at_trg
     ON deployment_scope_exclusions;
 DROP FUNCTION IF EXISTS deployment_scope_exclusions_set_updated_at();
