@@ -6,8 +6,10 @@
 # job fails loudly so we see it.
 #
 # Implementation: on `push` events, fetch the commit's associated PRs via the
-# REST API. If the list is empty, fail. Bots (dependabot) are exempt because
-# they push branches, not main.
+# REST API. GitHub can briefly lag indexing a newly-created merge commit, so
+# retry the lookup and fall back to verifying the PR number in the merge
+# subject. If neither path proves a merged PR, fail. Bots (dependabot) are
+# exempt because they push branches, not main.
 #
 # Triggers:
 #   - push: branches: [main]        (a direct push or a squash-merge push)
@@ -41,14 +43,48 @@ jobs:
 
           # GET /repos/{owner}/{repo}/commits/{sha}/pulls — returns every PR
           # that contains this SHA in its history (open OR closed/merged).
-          prs_json=$(curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${REPO}/commits/${SHA}/pulls")
+          # The association may not be indexed at the instant a merge emits
+          # its push event, so give GitHub a short, bounded grace period.
+          prs_json='[]'
+          pr_count=0
+          for attempt in 1 2 3 4 5; do
+            prs_json=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/commits/${SHA}/pulls") || prs_json='[]'
+            pr_count=$(printf '%s' "$prs_json" | jq 'if type == "array" then length else 0 end')
+            if [ "$pr_count" -gt 0 ]; then
+              break
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              sleep 5
+            fi
+          done
 
-          # Count array entries via jq; empty array = "no PR backs this SHA".
-          pr_count=$(printf '%s' "$prs_json" | jq 'length')
+          # For a merge/squash push, the commit subject includes the PR number
+          # even when the association endpoint is briefly empty. Verify that
+          # PR directly so a forged commit subject cannot bypass the tripwire.
+          if [ "$pr_count" -eq 0 ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+            commit_subject=$(jq -r '.head_commit.message // empty' "$GITHUB_EVENT_PATH" | sed -n '1p')
+            pr_number=$(printf '%s\n' "$commit_subject" | sed -nE \
+              -e 's/^Merge pull request #([0-9]+) from .*/\1/p' \
+              -e 's/.*\(#([0-9]+)\)$/\1/p' | head -n1)
+
+            if printf '%s' "$pr_number" | grep -Eq '^[0-9]+$'; then
+              pr_json=$(curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${REPO}/pulls/${pr_number}") || pr_json='{}'
+              pr_merged=$(printf '%s' "$pr_json" | jq -r '.merged // false')
+              pr_merge_sha=$(printf '%s' "$pr_json" | jq -r '.merge_commit_sha // empty')
+              if [ "$pr_merged" = "true" ] && [ "$pr_merge_sha" = "$SHA" ]; then
+                pr_count=1
+                echo "Verified merged PR #${pr_number} from commit subject."
+              fi
+            fi
+          fi
 
           if [ "$pr_count" -eq 0 ]; then
             actor="${GITHUB_ACTOR:-unknown}"
