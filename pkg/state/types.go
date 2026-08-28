@@ -335,40 +335,7 @@ const (
 // constraint deployments_cancel_reason_check enforces the same
 // vocabulary at the storage layer; this Go type exists so
 // callers fail fast at the API boundary instead of surfacing a
-// Postgres 23514 at runtime.
-type CancelReason string
-
-const (
-	// CancelReasonUser is stamped by the user-initiated
-	// POST /v1/apps/{slug}/deployments/{id}/cancel route. Most
-	// common path; the CLI's --reason flag can override.
-	CancelReasonUser CancelReason = "user"
-	// CancelReasonAutoQuota is reserved for the future
-	// "auto-cancel on quota breach" path (mirrors ADR-118
-	// AutoRollbackWatcher, not wired yet). The CHECK accepts it
-	// so the migration stays additive.
-	CancelReasonAutoQuota CancelReason = "auto_quota"
-	// CancelReasonAutoHealth is reserved for the future
-	// "auto-cancel on liveness exhaustion" path. CHECK-only.
-	CancelReasonAutoHealth CancelReason = "auto_health"
-	// CancelReasonSystem is the operator-driven escape hatch
-	// (admin CLI / control-plane janitor). Used today by the
-	// builderd cancel-LISTEN goroutine when a deployment row
-	// flips to "cancelled" before builderd has finished its
-	// own cascade.
-	CancelReasonSystem CancelReason = "system"
-)
-
-// IsValid reports whether r is one of the closed-set CancelReason
-// constants. Cheap — used by apid handlers to fail fast on a
-// stray value before the SQL UPDATE surfaces a 23514.
-func (r CancelReason) IsValid() bool {
-	switch r {
-	case CancelReasonUser, CancelReasonAutoQuota, CancelReasonAutoHealth, CancelReasonSystem:
-		return true
-	}
-	return false
-}
+// Postgres 23514 at runtime. (kept as comment-only; declarations live earlier in this file from the ADR-124 cherry-pick)
 
 // Account is a customer account.
 type Account struct {
