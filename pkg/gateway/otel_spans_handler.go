@@ -119,11 +119,29 @@ type otelSpansResponse struct {
 
 // ServeHTTP handles POST /v1/otel/v1/traces. Drain-tracked for
 // graceful shutdown parity with the trace handler.
+//
+// PR-D code-review #6: auth runs BEFORE the body read. The
+// previous order decoded up to 4 MiB + protojson-unmarshalled
+// every request before peeking the Authorization header, so
+// unauthenticated attackers could amplify their CPU/bandwidth
+// spend ~1000x against the gateway by sending valid-shaped
+// OTLP bodies with bogus bearer tokens. New order:
+//
+//   1. Method check.
+//   2. Bearer parse (header only — no body read).
+//   3. apid AuthenticateKey RPC (the sha256 lookup; loopback
+//      unix socket, sub-ms).
+//   4. Plan gate.
+//   5. Per-account token bucket.
+//   6. Body read (4 MiB cap; only authed customers reach
+//      this point).
+//   7. OTLP decode + shape validation.
+//   8. Accumulator Add.
+//
+// Unauthenticated 401s now do ~header-parse work; the
+// 4 MiB + decode cost only applies to legitimate traffic.
 func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Drain tracker (parity with trace_handler.go:74-78). The
-	// "http" tag is the same bucket the trace handler uses — the
-	// gateway's drain waits for ALL in-flight HTTP, regardless
-	// of which sub-handler served it.
+	// Drain tracker (parity with trace_handler.go:74-78).
 	done := func() {}
 	if h.cfg.Drain != nil {
 		done = h.cfg.Drain.Begin("http")
@@ -136,48 +154,17 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Body cap: 4 MiB. OTLP allows up to 2 MiB per spec but
-	// gatewayd-public talks to many customers at once; the 2x
-	// buffer is headroom for a chatty service emitting
-	// attribute-heavy spans.
-	const bodyCap = 4 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, bodyCap)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.observeIngest("shape_invalid")
-		writeProblem(w, http.StatusBadRequest, "body too large or unreadable")
-		return
-	}
-
-	// Decode OTLP/HTTP JSON-protobuf.
-	req, decodeErr := decodeExportTraceServiceRequest(raw)
-	if decodeErr != nil {
-		h.observeIngest("shape_invalid")
-		writeProblem(w, http.StatusBadRequest, "shape_invalid: "+decodeErr.Error())
-		return
-	}
-
-	// Shape validation: ≥1 ResourceSpans, ≥1 ScopeSpans, ≥1 Span.
-	traceID, spans, shapeErr := extractAndValidate(req)
-	if shapeErr != nil {
-		h.observeIngest("shape_invalid")
-		writeProblem(w, http.StatusBadRequest, "shape_invalid: "+shapeErr.Error())
-		return
-	}
-
-	// Bearer auth (sha256 lookup lives on apid; this handler
-	// never sees the raw token past the apid RPC boundary).
+	// ---- Step 2: Bearer parse (no body read) ----
 	tok := bearerToken(r)
 	if tok == "" {
 		h.observeAuthFailure("unauthenticated")
 		writeProblem(w, http.StatusUnauthorized, "missing bearer token")
 		return
 	}
+
+	// ---- Step 3: apid Auth RPC (no body read) ----
 	accountIDStr, plan, err := h.cfg.AuthClient.AuthenticateKey(r.Context(), tok)
 	if err != nil {
-		// apid maps hash-miss / expired / revoked to
-		// Unauthenticated; Postgres trip to Internal. Mirror
-		// the metric labels.
 		if status.Code(err) == codes.Unauthenticated {
 			h.observeAuthFailure("unauthenticated")
 			writeProblem(w, http.StatusUnauthorized, "unauthenticated")
@@ -194,6 +181,8 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusUnauthorized, "malformed account_id")
 		return
 	}
+
+	// ---- Step 4: Plan gate ----
 	limits := h.cfg.LimitsFor(api.Plan(plan))
 	if !limits.DebugTelemetryEnabled {
 		h.observeAuthFailure("plan_disabled")
@@ -202,9 +191,7 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-account token bucket (1 token per OTLP POST — NOT per
-	// span inside the batch, so a 1000-span Hobby batch doesn't
-	// exhaust the bucket instantly).
+	// ---- Step 5: Per-account token bucket ----
 	taken, retryMs := h.cfg.Limiter.Take(accountID, limits.DebugTelemetryRequestsPerMinute)
 	if !taken {
 		h.observeIngest("rate_limited")
@@ -213,38 +200,51 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hand to the accumulator. NO DB IO at this point — the
-	// flush loop owns the write path (Stage 4). Per-trace
-	// truncation is applied in the flush loop (PR-D
-	// code-review #5), not per-POST here. The previous
-	// per-POST truncation let a Hobby customer bypass the
-	// 50-span-per-trace ceiling by chunking spans across
-	// many POSTs inside one flush window.
+	// ---- Step 6: Body read (now auth-bounded) ----
+	// 4 MiB cap. OTLP allows up to 2 MiB per spec; the 2x
+	// buffer is headroom for a chatty service emitting
+	// attribute-heavy spans.
+	const bodyCap = 4 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, bodyCap)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.observeIngest("shape_invalid")
+		writeProblem(w, http.StatusBadRequest, "body too large or unreadable")
+		return
+	}
+
+	// ---- Step 7: OTLP decode + shape validation ----
+	req, decodeErr := decodeExportTraceServiceRequest(raw)
+	if decodeErr != nil {
+		h.observeIngest("shape_invalid")
+		writeProblem(w, http.StatusBadRequest, "shape_invalid: "+decodeErr.Error())
+		return
+	}
+	traceID, spans, shapeErr := extractAndValidate(req)
+	if shapeErr != nil {
+		h.observeIngest("shape_invalid")
+		writeProblem(w, http.StatusBadRequest, "shape_invalid: "+shapeErr.Error())
+		return
+	}
+
+	// ---- Step 8: Accumulator Add ----
 	added, accErr := h.cfg.Acc.Add(traceID, accountID, spans)
 	if accErr != nil {
 		// PR-D code-review #4: a trace_id being contended
-		// across accounts (rotated API key, replay attempt,
-		// multi-key account on the same trace) is treated
-		// as a request-level failure — the bucket can't
-		// safely coalesce both. 401 prevents the wrong
-		// account's spans from landing in the wrong row.
+		// across accounts is treated as 401 (the bucket
+		// can't safely coalesce both).
 		h.observeAuthFailure("unauthenticated")
 		writeProblem(w, http.StatusUnauthorized, "trace_id claimed by another account")
 		return
 	}
-	_ = added // post-dedupe count; the 200 OK body uses the pre-truncation len(spans)
+	_ = added
 
 	h.observeIngest("inserted")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(otelSpansResponse{
 		AcceptedSpans: len(spans),
-		// Truncation is now reported by the flush loop's
-		// OnTruncated metric; the per-POST response no
-		// longer reflects it (it was misleading — a 50-span
-		// POST under the cap doesn't know whether the BUCKET
-		// will be truncated at flush time).
-		Truncated: false,
+		Truncated:     false,
 	})
 }
 
