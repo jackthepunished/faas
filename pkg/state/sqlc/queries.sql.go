@@ -5410,12 +5410,14 @@ const updateSpansSummary = `-- name: UpdateSpansSummary :exec
 update request_telemetry
    set spans_summary = $2::jsonb
  where trace_id = $1
+   and account_id = $3::uuid
    and received_at >= now() - interval '24 hours'
 `
 
 type UpdateSpansSummaryParams struct {
-	TraceID pgtype.Text
-	Column2 []byte
+	TraceID   pgtype.Text
+	Column2   []byte
+	AccountID pgtype.UUID
 }
 
 // ADR-127 PR-D: writer for spans_summary jsonb. The gatewayd-public
@@ -5429,8 +5431,16 @@ type UpdateSpansSummaryParams struct {
 // seek to the partial index request_telemetry_trace_idx selectivity.
 // $N::jsonb cast is load-bearing — without it sqlc binds as text and
 // Postgres raises SQLSTATE 22P02 (invalid_text_representation).
+//
+// PR-D code-review #1: AccountID is now bound as $3 and matched
+// against request_telemetry.account_id in the WHERE clause.
+// Defense in depth against cross-customer overwrite (see
+// pkg/state/queries.sql for the rationale). The pgtype.UUID
+// Valid flag must be set; pgx binds NULL when Valid is false,
+// which would never match the NOT NULL column on
+// request_telemetry.
 func (q *Queries) UpdateSpansSummary(ctx context.Context, db DBTX, arg UpdateSpansSummaryParams) error {
-	_, err := db.Exec(ctx, updateSpansSummary, arg.TraceID, arg.Column2)
+	_, err := db.Exec(ctx, updateSpansSummary, arg.TraceID, arg.Column2, arg.AccountID)
 	return err
 }
 

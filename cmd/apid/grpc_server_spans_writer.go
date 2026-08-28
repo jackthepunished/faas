@@ -59,8 +59,16 @@ const (
 var traceIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // spansWriterStore is the Store subset the receiver needs.
+//
+// PR-D code-review #1: accountID is REQUIRED in the interface
+// signature. The SQL UPDATE pins (trace_id, account_id) so a
+// cross-customer overwrite is impossible even if a buggy upstream
+// caller forwards the wrong trace_id. The apid gRPC handler
+// already extracted the account_id from req.GetAccountId() and
+// validated it parses as a UUID (step 3), so the value here is
+// trusted.
 type spansWriterStore interface {
-	UpdateSpansSummary(ctx context.Context, traceID string, summary []byte) error
+	UpdateSpansSummary(ctx context.Context, traceID string, accountID uuid.UUID, summary []byte) error
 }
 
 // spansWriterReceiver is the in-package server implementation
@@ -167,7 +175,11 @@ func (r *spansWriterReceiver) WriteSpansSummary(ctx context.Context, req *apidpb
 	}
 
 	// ---- 5. UPDATE ----
-	if err := r.store.UpdateSpansSummary(ctx, traceID, summary); err != nil {
+	// PR-D code-review #1: forward the already-validated
+	// accountID so the SQL predicate
+	// `and account_id = $3::uuid` can match. The bucket mutex
+	// was the upstream guard; this is defense in depth.
+	if err := r.store.UpdateSpansSummary(ctx, traceID, accountID, summary); err != nil {
 		// PR-D code-review #7: a CHECK violation (trace_id
 		// format drift between client + server) is a
 		// VALIDATION failure, not a DB failure. The §12

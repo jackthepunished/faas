@@ -1709,7 +1709,21 @@ WHERE received_at > now() - $1::interval;
 -- seek to the partial index request_telemetry_trace_idx selectivity.
 -- $N::jsonb cast is load-bearing — without it sqlc binds as text and
 -- Postgres raises SQLSTATE 22P02 (invalid_text_representation).
+--
+-- PR-D code-review #1: the WHERE clause now also pins account_id.
+-- Defense in depth against cross-customer overwrite. The
+-- gateway-side accumulator already rejects trace_id/account_id
+-- mismatches (pkg/gateway/spans_accumulator.go ErrAccountMismatch),
+-- and the apid gRPC handler forwards the same account_id, but a
+-- bug at any layer could otherwise let account A's flush wipe
+-- account B's row. Adding the account_id = $3::uuid predicate
+-- makes cross-customer overwrite impossible regardless of which
+-- upstream guard fails. The composite (trace_id, account_id)
+-- lookup still hits request_telemetry_trace_idx for the trace_id
+-- selectivity; the residual account_id check is a post-fetch
+-- row-level filter (one row, microseconds).
 update request_telemetry
    set spans_summary = $2::jsonb
  where trace_id = $1
+   and account_id = $3::uuid
    and received_at >= now() - interval '24 hours';

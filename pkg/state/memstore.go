@@ -15912,6 +15912,12 @@ func (m *MemStore) ListAppsWithRecentTelemetry(_ context.Context, _ pgtype.Inter
 // the spans_summary jsonb via apid's WriteSpansSummary gRPC RPC);
 // the MemStore implementation exists solely to satisfy the Store
 // interface so unit tests that wire up a MemStore still compile.
-func (m *MemStore) UpdateSpansSummary(_ context.Context, _ string, _ []byte) error {
+//
+// PR-D code-review #1: accountID is ignored — MemStore doesn't
+// enforce any predicate (it's an in-memory shim for unit tests
+// that don't exercise cross-customer overwrite). The Store
+// interface signature is uniform so the apid gRPC handler can
+// pass accountID through unconditionally.
+func (m *MemStore) UpdateSpansSummary(_ context.Context, _ string, _ uuid.UUID, _ []byte) error {
 	return nil
 }

@@ -31,20 +31,28 @@ import (
 )
 
 // fakeSpansWriterStore substitutes for spansWriterStore in tests.
+//
+// PR-D code-review #1: the Store interface now takes
+// accountID. Tests capture it so the round-trip verifies the
+// apid gRPC handler forwards the same account_id the gateway
+// authenticated against (defense in depth — the SQL predicate
+// is the load-bearing guard, this is the test-side companion).
 type fakeSpansWriterStore struct {
-	mu       sync.Mutex
-	updateFn func(traceID string, summary []byte) error
-	calls    int
+	mu         sync.Mutex
+	updateFn   func(traceID string, accountID uuid.UUID, summary []byte) error
+	calls      int
+	lastAcctID uuid.UUID
 }
 
-func (f *fakeSpansWriterStore) UpdateSpansSummary(_ context.Context, traceID string, summary []byte) error {
+func (f *fakeSpansWriterStore) UpdateSpansSummary(_ context.Context, traceID string, accountID uuid.UUID, summary []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.lastAcctID = accountID
 	if f.updateFn == nil {
 		return nil
 	}
-	return f.updateFn(traceID, summary)
+	return f.updateFn(traceID, accountID, summary)
 }
 
 // fakeSpansWriterMonitor is a hand-rolled mock for the
@@ -102,6 +110,12 @@ func sampleSummary(t *testing.T) []byte {
 }
 
 // TestSpansWriter_HappyPath: valid trace_id + valid JSON → inserted.
+//
+// PR-D code-review #1: also asserts the apid handler forwards
+// the same account_id the gateway authenticated against. This
+// is the test-side companion to the SQL-side
+// `and account_id = $3::uuid` predicate — defense in depth so
+// a regression in either layer trips a test.
 func TestSpansWriter_HappyPath(t *testing.T) {
 	acctID := uuid.New()
 	store := &fakeSpansWriterStore{}
@@ -125,6 +139,10 @@ func TestSpansWriter_HappyPath(t *testing.T) {
 	}
 	if store.calls != 1 {
 		t.Errorf("store.calls = %d, want 1", store.calls)
+	}
+	if store.lastAcctID != acctID {
+		t.Errorf("store.lastAcctID = %s, want %s (PR-D code-review #1: forwarded account_id mismatch)",
+			store.lastAcctID, acctID)
 	}
 }
 
@@ -214,7 +232,7 @@ func TestSpansWriter_Disabled(t *testing.T) {
 // arbitrary error → codes.Internal.
 func TestSpansWriter_DBError(t *testing.T) {
 	store := &fakeSpansWriterStore{
-		updateFn: func(_ string, _ []byte) error {
+		updateFn: func(_ string, _ uuid.UUID, _ []byte) error {
 			return errors.New("postgres down")
 		},
 	}

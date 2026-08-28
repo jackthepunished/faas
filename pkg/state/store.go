@@ -5073,7 +5073,14 @@ type Store interface {
 	// request_telemetry_trace_idx selectivity; last-writer-wins on
 	// concurrent UPDATEs is acceptable. summary is the raw JSON
 	// bytes (the caller has already validated json.Valid).
-	UpdateSpansSummary(ctx context.Context, traceID string, summary []byte) error
+	//
+	// accountID is REQUIRED — PR-D code-review #1 pins the
+	// WHERE clause on (trace_id, account_id) so a buggy upstream
+	// caller can't overwrite a different customer's row. The
+	// gateway-side accumulator already rejects
+	// trace_id/account_id collisions (ErrAccountMismatch); this
+	// is the SQL-side defense in depth.
+	UpdateSpansSummary(ctx context.Context, traceID string, accountID uuid.UUID, summary []byte) error
 
 	// ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
 	// Time-windowed (since, until) with hard limit; cursor pagination

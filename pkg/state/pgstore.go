@@ -19224,10 +19224,19 @@ func (s *PgStore) InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertReq
 // 24h WHERE clause bounds the index seek to the partial index
 // request_telemetry_trace_idx; rows outside the window are skipped
 // (no error — last-writer-wins).
-func (s *PgStore) UpdateSpansSummary(ctx context.Context, traceID string, summary []byte) error {
+//
+// PR-D code-review #1: accountID is the third binding. The SQL
+// predicate `and account_id = $3::uuid` makes cross-customer
+// overwrite impossible even if a buggy upstream caller forwards
+// the wrong trace_id. The pgtype.UUID Valid flag is set
+// unconditionally — pgx binds NULL when Valid is false, and a NULL
+// account_id can never match the NOT NULL column on
+// request_telemetry.
+func (s *PgStore) UpdateSpansSummary(ctx context.Context, traceID string, accountID uuid.UUID, summary []byte) error {
 	return s.appErrorsQueries().UpdateSpansSummary(ctx, s.pool, sqlc.UpdateSpansSummaryParams{
-		TraceID:  pgtype.Text{String: traceID, Valid: traceID != ""},
-		Column2:  summary,
+		TraceID:   pgtype.Text{String: traceID, Valid: traceID != ""},
+		Column2:   summary,
+		AccountID: pgtype.UUID{Bytes: accountID, Valid: true},
 	})
 }
 
