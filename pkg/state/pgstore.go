@@ -5895,6 +5895,7 @@ func (s *PgStore) ReorderDeployment(ctx context.Context, id string, newPriority 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE deployments
 		   SET priority = $2,
+		       reordered_at = NOW(),
 		       reordered_by_principal = $3
 		 WHERE id = $1
 		   AND status = 'pending'`,
@@ -15633,7 +15634,7 @@ const deploymentSelectColumnsWithRootfs = `
 	canary_step_started_at, coalesce(rollout_state, 'pending'),
 	rollout_started_at, rollout_completed_at, rollout_aborted_at,
 	coalesce(rollout_aborted_reason, ''),
-	-- ADR-124 deployment queue controls (migration 00388/00488). priority
+	-- ADR-124 deployment queue controls (migration 00391/00491). priority
 	-- is NOT NULL DEFAULT 100 so the coalesce is purely for symmetry
 	-- with the rest of the projection (and for the rare pre-PR
 	-- backfill window). cancelled_*/cancel_reason are nullable so the
@@ -15686,7 +15687,7 @@ const deploymentSelectColumnsQualified = `
 	d.canary_step_started_at, coalesce(d.rollout_state, 'pending'),
 	d.rollout_started_at, d.rollout_completed_at, d.rollout_aborted_at,
 	coalesce(d.rollout_aborted_reason, ''),
-	-- ADR-124 deployment queue controls (migration 00388/00488). See the
+	-- ADR-124 deployment queue controls (migration 00391/00491). See the
 	-- unqualified-projection counterpart above for the rationale on
 	-- coalesce choices.
 	coalesce(d.priority, 100), coalesce(d.reordered_by_principal, ''),
@@ -15793,7 +15794,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&canaryStepStartedAt, &d.RolloutState,
 		&rolloutStartedAt, &rolloutCompletedAt, &rolloutAbortedAt,
 		&d.RolloutAbortedReason,
-		// ADR-124 deployment queue controls (migration 00388/00488). The
+		// ADR-124 deployment queue controls (migration 00391/00491). The
 		// scan order mirrors the SELECT projection above — see the
 		// docblock on deploymentSelectColumnsWithRootfs for the
 		// "lockstep or pgx panic" invariant.
