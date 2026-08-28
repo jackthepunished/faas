@@ -92,12 +92,17 @@ func DetectFromTarball(path string) (Framework, error) {
 		if err != nil {
 			return FrameworkUnknown, fmt.Errorf("markers: read tar: %w", err)
 		}
-		// Skip directory entries — parity with DetectFromFS which
-		// drops IsDir() entries. Without this, a project with a
-		// root-level directory named "Dockerfile" (or any other
-		// marker) would resolve to that framework on the tarball
-		// path but to FrameworkUnknown on the FS path.
-		if hdr.Typeflag == tar.TypeDir {
+		// Skip directory and archive-metadata entries. GitHub's
+		// codeload tarballs begin with a pax_global_header entry;
+		// treating that metadata record as a root file makes a
+		// perfectly valid wrapped project (for example
+		// cron-shot-<sha>/package.json) look like it has mixed
+		// roots, so the real marker is never promoted into `present`.
+		// Directory entries are also skipped for parity with
+		// DetectFromFS, which drops IsDir() entries.
+		switch hdr.Typeflag {
+		case tar.TypeDir, tar.TypeXHeader, tar.TypeXGlobalHeader,
+			tar.TypeGNULongName, tar.TypeGNULongLink:
 			continue
 		}
 		name := strings.TrimPrefix(hdr.Name, "./")

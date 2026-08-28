@@ -85,6 +85,44 @@ func TestDetectFromTarball_PackedTopLevelDirectory(t *testing.T) {
 	}
 }
 
+func TestDetectFromTarball_IgnoresPAXGlobalHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.tar.gz")
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{
+		PAXRecords: map[string]string{"comment": "git archive"},
+		Typeflag:   tar.TypeXGlobalHeader,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "cron-shot-commit/package.json",
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := DetectFromTarball(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != FrameworkNode {
+		t.Fatalf("framework = %s, want node for a GitHub codeload archive", got)
+	}
+}
+
 func TestDetectFromTarball_Python(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "src.tar.gz")
