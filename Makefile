@@ -521,6 +521,18 @@ bootstrap-compute: ansible-preflight ## Bootstrap the compute-nodes group. Honor
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
 
+.PHONY: bootstrap-fleet-runner
+bootstrap-fleet-runner: ## Install the pinned trusted runner. Gets a short-lived registration token via gh or the controller environment.
+	@if [ -n "$${FAAS_RUNNER_REGISTRATION_TOKEN:-}" ]; then \
+		$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/fleet_runner.yml; \
+	elif command -v gh >/dev/null 2>&1; then \
+		FAAS_RUNNER_REGISTRATION_TOKEN="$$(gh api --method POST repos/$${GREGALE_GITHUB_REPO:-poyrazK/faas}/actions/runners/registration-token --jq .token)" \
+			$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/fleet_runner.yml; \
+	else \
+		echo "FAAS_RUNNER_REGISTRATION_TOKEN is required (or install/authenticate gh on the controller)" >&2; \
+		exit 2; \
+	fi
+
 .PHONY: ansible-preflight
 ansible-preflight: ## Gather and validate peer facts before a role-limited bare-metal bootstrap
 	@test -f deploy/ansible/preflight.yml || (echo "deploy/ansible/preflight.yml missing"; exit 1)
@@ -532,6 +544,7 @@ ansible-syntax-check: ## Validate the bare-metal Ansible playbooks with the prod
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/preflight.yml --syntax-check
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --syntax-check
 	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/scale_check.yml --syntax-check
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/fleet_runner.yml --syntax-check
 
 .PHONY: manifest-scale-check
 manifest-scale-check: ## Validate manifest/Ansible generation at 1, 10, 100, and 1000 compute nodes

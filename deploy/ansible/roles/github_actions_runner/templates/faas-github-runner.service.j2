@@ -1,0 +1,26 @@
+[Unit]
+Description=Gregale GitHub Actions deployment runner ({{ faas_runner_repo }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ faas_runner_user }}
+Group={{ faas_runner_group }}
+WorkingDirectory={{ faas_runner_root }}
+ExecStart={{ faas_runner_root }}/runsvc.sh
+Restart=always
+RestartSec=5s
+TimeoutStopSec=5min
+KillMode=process
+UMask=0077
+Environment=HOME={{ faas_runner_home }}
+Environment=RUNNER_ALLOW_RUNASROOT=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ faas_runner_root }} {{ faas_runner_home }}
+
+[Install]
+WantedBy=multi-user.target

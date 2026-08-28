@@ -1,0 +1,231 @@
+# Install one pinned, repository-scoped GitHub Actions runner.
+#
+# This role deliberately does not deregister or replace an existing runner.
+# A stale registration is an operator-visible failure instead of a silent
+# removal that could strand an in-flight deployment job.
+
+- name: github_actions_runner — require a supported host
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system == 'Linux'
+      - ansible_facts.architecture in ['x86_64', 'amd64']
+      - ansible_facts.service_mgr == 'systemd'
+      - ansible_facts.os_family == 'Debian'
+      - faas_runner_repo is match('^[^/]+/[^/]+$')
+      - faas_runner_name is match('^[A-Za-z0-9._-]+$')
+      - faas_runner_labels is sequence
+      - "'faas-fleet' in faas_runner_labels"
+      - faas_runner_sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      The deployment runner requires a Debian-family Linux host with systemd,
+      x86_64, a valid repository/name, the faas-fleet label, and a 64-character
+      lowercase SHA-256 pin.
+
+- name: github_actions_runner — install runner prerequisites
+  ansible.builtin.apt:
+    name:
+      - ansible-core
+      - ca-certificates
+      - curl
+      - git
+      - jq
+      - openssh-client
+      - tar
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: github_actions_runner — create service account
+  ansible.builtin.user:
+    name: "{{ faas_runner_user }}"
+    group: "{{ faas_runner_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ faas_runner_home }}"
+    create_home: true
+
+- name: github_actions_runner — create runner directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ faas_runner_user }}"
+    group: "{{ faas_runner_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ faas_runner_home }}", mode: "0750" }
+    - { path: "{{ faas_runner_root }}", mode: "0750" }
+    - { path: "{{ faas_runner_cache }}", mode: "0750" }
+
+- name: github_actions_runner — inspect existing installation
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop:
+    - { key: listener, path: "{{ faas_runner_root }}/bin/Runner.Listener" }
+    - { key: version, path: "{{ faas_runner_root }}/.faas-runner-version" }
+    - { key: config, path: "{{ faas_runner_root }}/.runner" }
+    - { key: credentials, path: "{{ faas_runner_root }}/.credentials" }
+    - { key: dependency_marker, path: "{{ faas_runner_home }}/.dependencies-{{ faas_runner_version }}" }
+  register: faas_runner_paths
+
+- name: github_actions_runner — map installation facts
+  ansible.builtin.set_fact:
+    faas_runner_listener: "{{ (faas_runner_paths.results | selectattr('item.key', 'equalto', 'listener') | first).stat }}"
+    faas_runner_version_marker: "{{ (faas_runner_paths.results | selectattr('item.key', 'equalto', 'version') | first).stat }}"
+    faas_runner_config: "{{ (faas_runner_paths.results | selectattr('item.key', 'equalto', 'config') | first).stat }}"
+    faas_runner_credentials: "{{ (faas_runner_paths.results | selectattr('item.key', 'equalto', 'credentials') | first).stat }}"
+    faas_runner_dependency_marker: "{{ (faas_runner_paths.results | selectattr('item.key', 'equalto', 'dependency_marker') | first).stat }}"
+
+- name: github_actions_runner — refuse an unmanaged existing installation
+  ansible.builtin.assert:
+    that:
+      - not faas_runner_listener.exists or faas_runner_version_marker.exists
+    fail_msg: >-
+      {{ faas_runner_root }} contains a runner binary without the Gregale
+      version marker. Refusing to adopt an unmanaged installation; remove it
+      through the runner's documented removal flow before bootstrapping.
+
+- name: github_actions_runner — read the installed version marker
+  ansible.builtin.slurp:
+    src: "{{ faas_runner_root }}/.faas-runner-version"
+  register: faas_runner_installed_version
+  when: faas_runner_version_marker.exists
+
+- name: github_actions_runner — refuse version drift
+  ansible.builtin.assert:
+    that:
+      - (faas_runner_installed_version.content | b64decode | trim) == faas_runner_version
+    fail_msg: >-
+      The installed GitHub runner version does not match the pinned
+      faas_runner_version={{ faas_runner_version }}. Upgrade it explicitly;
+      this role will not replace a registered runner in place.
+  when: faas_runner_version_marker.exists
+
+- name: github_actions_runner — download pinned runner archive
+  ansible.builtin.get_url:
+    url: "{{ faas_runner_download_url }}"
+    dest: "{{ faas_runner_cache }}/actions-runner-linux-x64-{{ faas_runner_version }}.tar.gz"
+    checksum: "sha256:{{ faas_runner_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not faas_runner_listener.exists
+
+- name: github_actions_runner — unpack pinned runner archive
+  ansible.builtin.unarchive:
+    src: "{{ faas_runner_cache }}/actions-runner-linux-x64-{{ faas_runner_version }}.tar.gz"
+    dest: "{{ faas_runner_root }}"
+    remote_src: true
+    owner: "{{ faas_runner_user }}"
+    group: "{{ faas_runner_group }}"
+  args:
+    creates: "{{ faas_runner_root }}/bin/Runner.Listener"
+  when: not faas_runner_listener.exists
+
+- name: github_actions_runner — install upstream native dependencies
+  ansible.builtin.command: ./bin/installdependencies.sh
+  args:
+    chdir: "{{ faas_runner_root }}"
+    creates: "{{ faas_runner_home }}/.dependencies-{{ faas_runner_version }}"
+  when: not faas_runner_dependency_marker.exists
+
+- name: github_actions_runner — record dependency installation
+  ansible.builtin.copy:
+    content: "{{ faas_runner_version }}\n"
+    dest: "{{ faas_runner_home }}/.dependencies-{{ faas_runner_version }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not faas_runner_dependency_marker.exists
+
+- name: github_actions_runner — record pinned runner version
+  ansible.builtin.copy:
+    content: "{{ faas_runner_version }}\n"
+    dest: "{{ faas_runner_root }}/.faas-runner-version"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not faas_runner_version_marker.exists
+
+- name: github_actions_runner — require a short-lived registration token
+  ansible.builtin.assert:
+    that:
+      - faas_runner_registration_token | default('') | length > 0
+    fail_msg: >-
+      Set FAAS_RUNNER_REGISTRATION_TOKEN in the controller environment to a
+      short-lived repository registration token. Never put it in inventory or
+      source control.
+  when: not faas_runner_config.exists
+  no_log: true
+
+- name: github_actions_runner — configure repository-scoped runner
+  ansible.builtin.command:
+    argv:
+      - ./config.sh
+      - --unattended
+      - --url
+      - "https://github.com/{{ faas_runner_repo }}"
+      - --token
+      - "{{ faas_runner_registration_token }}"
+      - --name
+      - "{{ faas_runner_name }}"
+      - --labels
+      - "{{ faas_runner_labels | join(',') }}"
+      - --work
+      - "{{ faas_runner_workdir }}"
+  args:
+    chdir: "{{ faas_runner_root }}"
+  become_user: "{{ faas_runner_user }}"
+  register: faas_runner_configure
+  changed_when: true
+  when: not faas_runner_config.exists
+  no_log: true
+
+- name: github_actions_runner — reject a partial runner registration
+  ansible.builtin.assert:
+    that:
+      - faas_runner_config.exists == faas_runner_credentials.exists
+    fail_msg: >-
+      The runner registration files are incomplete. Refusing to start a
+      partially configured runner; repair it through config.sh remove/config.sh.
+
+- name: github_actions_runner — install hardened systemd unit
+  ansible.builtin.template:
+    src: faas-github-runner.service.j2
+    dest: "/etc/systemd/system/{{ faas_runner_service }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  register: faas_runner_unit
+
+- name: github_actions_runner — reload systemd after unit changes
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: faas_runner_unit.changed
+
+- name: github_actions_runner — enable and start runner
+  ansible.builtin.systemd:
+    name: "{{ faas_runner_service }}"
+    enabled: true
+    state: started
+
+- name: github_actions_runner — verify runner service is active
+  ansible.builtin.command: systemctl is-active {{ faas_runner_service }}
+  register: faas_runner_service_state
+  changed_when: false
+  failed_when: false
+
+- name: github_actions_runner — fail if runner service is not active
+  ansible.builtin.assert:
+    that:
+      - faas_runner_service_state.rc == 0
+      - faas_runner_service_state.stdout | trim == 'active'
+    fail_msg: >-
+      {{ faas_runner_service }} is not active. Inspect
+      `journalctl -u {{ faas_runner_service }}` on the runner host.
+
+- name: github_actions_runner — remove cached archive after installation
+  ansible.builtin.file:
+    path: "{{ faas_runner_cache }}/actions-runner-linux-x64-{{ faas_runner_version }}.tar.gz"
+    state: absent
+  when: not faas_runner_listener.exists
