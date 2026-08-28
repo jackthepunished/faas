@@ -104,7 +104,11 @@ func parseCanaryStages(s string) ([]canary.CustomStage, error) {
 		}
 		percent, err := strconv.Atoi(percentStr)
 		if err != nil {
-			return nil, fmt.Errorf("stage %d: percent %q: %s", i, percentStr, err)
+			// %w per CLAUDE.md "Errors: wrap with %w + operation
+			// context" + golangci-lint errorlint rule (the pre-rebase
+			// lint job ran v8 and caught this as the only errorlint
+			// violation in the Stream F diff).
+			return nil, fmt.Errorf("stage %d: percent %q: %w", i, percentStr, err)
 		}
 		if percent < 0 || percent > 100 {
 			return nil, fmt.Errorf("stage %d: percent %d out of [0,100]", i, percent)
