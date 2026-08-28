@@ -54,7 +54,7 @@ func TestFlushLoop_PerTraceTruncation(t *testing.T) {
 	go func() {
 		defer close(done)
 		_ = s.RunFlushLoop(flushCtx, FlushLoopConfig{
-			Interval: 5 * time.Millisecond,
+			Interval:         5 * time.Millisecond,
 			MaxSpansPerTrace: func(_ string) int { return 50 },
 			OnTruncated:      func(_ string) { atomic.AddInt32(&trunc, 1) },
 			WriteFn: func(_ context.Context, _ string, summaryJSON []byte, _ string) (string, int64, error) {
