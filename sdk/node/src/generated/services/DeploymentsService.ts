@@ -11,6 +11,7 @@ import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentPreviewURL } from '../models/DeploymentPreviewURL.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
+import type { ListDeploymentAuditResponse } from '../models/ListDeploymentAuditResponse.js';
 import type { RecoverRolloutRequest } from '../models/RecoverRolloutRequest.js';
 import type { RetryDeploymentRequest } from '../models/RetryDeploymentRequest.js';
 import type { RollbackRequest } from '../models/RollbackRequest.js';
@@ -745,6 +746,64 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List deployment audit timeline.
+   * Returns the deployment_audit rows for one deployment in
+   * reverse-chronological order (issue #976 / ADR-122 /
+   * SAFE-RELEASES-E.2 + production-leveling Stream A).
+   *
+   * The wire surface is a paginated JSON list
+   * (ListDeploymentAuditResponse); for the SSE-streaming
+   * variant of the build log itself see
+   * `/v1/deployments/{id}/logs`.
+   *
+   * IDOR posture: the handler resolves the deployment ID
+   * via `pkg/state.DeploymentByID` + `pkg/state.AppByID`
+   * + account match BEFORE returning rows. A
+   * cross-account probe returns 404 (no
+   * account-existence leak).
+   *
+   * Limit defaults to 50, clamped to [1, 500]; the
+   * server-applied limit is echoed back in the response so
+   * a paging consumer can distinguish "limit was clamped"
+   * from "no more rows" (both yield Items of length <
+   * limit).
+   *
+   * @returns ListDeploymentAuditResponse Paginated deployment_audit rows in reverse-chronological order.
+   * @throws ApiError
+   */
+  public static listDeploymentAudit({
+    id,
+    limit = 50,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    /**
+     * Maximum number of audit rows to return. Clamped to [1, 500]; the server-applied limit is echoed back in the response.
+     */
+    limit?: number,
+  }): CancelablePromise<ListDeploymentAuditResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/deployments/{id}/audit',
+      path: {
+        'id': id,
+      },
+      query: {
+        'limit': limit,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Deployment row missing or cross-account probe (no account-existence leak).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

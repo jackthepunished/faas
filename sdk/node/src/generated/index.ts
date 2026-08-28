@@ -75,6 +75,7 @@ export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.j
 export type { BuildResponse } from './models/BuildResponse.js';
 export type { CanaryPresetSpec } from './models/CanaryPresetSpec.js';
 export type { CancelDeploymentRequest } from './models/CancelDeploymentRequest.js';
+export type { CanaryStage } from './models/CanaryStage.js';
 export type { ChangeMemberRoleRequest } from './models/ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './models/ChangePlanRequest.js';
 export type { ClearObsoleteReport } from './models/ClearObsoleteReport.js';
@@ -118,6 +119,7 @@ export type { DebugTelemetryListResponse } from './models/DebugTelemetryListResp
 export type { DebugTelemetryRequestItem } from './models/DebugTelemetryRequestItem.js';
 export type { DelayedTaskRequest } from './models/DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './models/DelayedTaskResponse.js';
+export type { DeploymentAuditResponse } from './models/DeploymentAuditResponse.js';
 export type { DeploymentHealthcheck } from './models/DeploymentHealthcheck.js';
 export type { DeploymentListResponse } from './models/DeploymentListResponse.js';
 export type { DeploymentLivenessProbe } from './models/DeploymentLivenessProbe.js';
@@ -183,6 +185,7 @@ export type { KafkaTriggerConfig } from './models/KafkaTriggerConfig.js';
 export type { ListAuditEventsResponse } from './models/ListAuditEventsResponse.js';
 export type { ListAuditLogResponse } from './models/ListAuditLogResponse.js';
 export type { ListCronRunsResponse } from './models/ListCronRunsResponse.js';
+export type { ListDeploymentAuditResponse } from './models/ListDeploymentAuditResponse.js';
 export type { ListInstancesResponse } from './models/ListInstancesResponse.js';
 export type { ListInvocationsResponse } from './models/ListInvocationsResponse.js';
 export type { ListOrgAPIKeysResponse } from './models/ListOrgAPIKeysResponse.js';
