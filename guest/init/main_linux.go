@@ -717,24 +717,20 @@ func runBuild(m api.BuildManifest) error {
 	var buildkitLog bytes.Buffer
 	bk := exec.Command(
 		"/usr/bin/unshare",
-		"--user",
-		"--map-root-user",
-		"--map-users=auto",
-		"--map-groups=auto",
-		"--mount",
-		"--fork",
-		"/usr/local/bin/buildkitd",
-		"--debug",
-		"--rootless",
-		"--root", buildkitRoot,
-		"--addr", "unix:///run/buildkit/buildkitd.sock",
-		"--oci-worker-binary", "/usr/local/bin/runc",
-		// The builder drive is deliberately 28 GiB. The image includes
-		// fuse-overlayfs and the guest kernel has FUSE built in; use the
-		// rootless COW snapshotter so committing a layer does not scan/copy the
-		// complete native snapshot tree after every RUN instruction.
-		"--oci-worker-snapshotter", "fuse-overlayfs",
-		"--oci-worker-net", "host",
+		rootlessUnshareArgs(
+			"/usr/local/bin/buildkitd",
+			"--debug",
+			"--rootless",
+			"--root", buildkitRoot,
+			"--addr", "unix:///run/buildkit/buildkitd.sock",
+			"--oci-worker-binary", "/usr/local/bin/runc",
+			// The builder drive is deliberately 28 GiB. The image includes
+			// fuse-overlayfs and the guest kernel has FUSE built in; use the
+			// rootless COW snapshotter so committing a layer does not scan/copy the
+			// complete native snapshot tree after every RUN instruction.
+			"--oci-worker-snapshotter", "fuse-overlayfs",
+			"--oci-worker-net", "host",
+		)...,
 	)
 	// Keep the daemon and its rootless worker tree in a private process group so
 	// the timeout path can terminate BuildKit descendants before powering off.
@@ -886,17 +882,13 @@ func probeBuilderWorkspace(buildkitRoot string) (string, error) {
 	defer cancel()
 	probe := exec.Command(
 		"/usr/bin/unshare",
-		"--user",
-		"--map-root-user",
-		"--map-users=auto",
-		"--map-groups=auto",
-		"--mount",
-		"--fork",
-		"/bin/sh",
-		"-c",
-		`id; stat -c '%n mode=%a uid=%u gid=%g' /build "$1"; mkdir -p "$1/.probe"; touch "$1/.probe/write"; rm -rf "$1/.probe"`,
-		"faas-builder-workspace",
-		buildkitRoot,
+		rootlessUnshareArgs(
+			"/bin/sh",
+			"-c",
+			`id; stat -c '%n mode=%a uid=%u gid=%g' /build "$1"; mkdir -p "$1/.probe"; touch "$1/.probe/write"; rm -rf "$1/.probe"`,
+			"faas-builder-workspace",
+			buildkitRoot,
+		)...,
 	)
 	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	probe.Env = builderEnv()
@@ -922,6 +914,16 @@ func probeBuilderWorkspace(buildkitRoot string) (string, error) {
 		}
 		return out.String(), ctx.Err()
 	}
+}
+
+// rootlessUnshareArgs returns the namespace flags shared by util-linux and
+// BusyBox unshare. The long --map-users/--map-groups options are only
+// available in newer util-linux builds, while the builder base image may
+// provide BusyBox instead. Mapping the invoking user to namespace root is
+// sufficient for BuildKit and keeps the builder image provider-neutral.
+func rootlessUnshareArgs(command ...string) []string {
+	args := []string{"-U", "-r", "-m", "-f"}
+	return append(args, command...)
 }
 
 func killProcessGroup(cmd *exec.Cmd) {

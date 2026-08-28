@@ -146,6 +146,19 @@ func TestClassifyExitCodes(t *testing.T) {
 	}
 }
 
+func TestRootlessUnshareArgsUsePortableFlags(t *testing.T) {
+	want := []string{"-U", "-r", "-m", "-f", "/bin/sh", "-c", "id"}
+	got := rootlessUnshareArgs("/bin/sh", "-c", "id")
+	if len(got) != len(want) {
+		t.Fatalf("rootlessUnshareArgs length = %d, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rootlessUnshareArgs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // TestTailOf covers the LogTailBytes clamp.
 func TestTailOf(t *testing.T) {
 	if got := tailOf([]byte("hello"), 100); got != "hello" {
