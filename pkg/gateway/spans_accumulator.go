@@ -85,6 +85,18 @@ type summarizedSpan struct {
 // (span_id, end_time_unix_nano)). Returns the post-dedupe span
 // count (for the metric counter).
 func (a *spansAccumulator) add(spans []summarizedSpan) int {
+	return a.addLocked(spans)
+}
+
+// addSpansForTest is the same as add but wrapped so unit tests
+// can call it without leaking the production method signature.
+// Not exported; only the test file references it.
+func (a *spansAccumulator) addSpansForTest(spans []summarizedSpan) error {
+	_ = a.addLocked(spans)
+	return nil
+}
+
+func (a *spansAccumulator) addLocked(spans []summarizedSpan) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.firstSeenAt.IsZero() {
@@ -128,6 +140,9 @@ func (a *spansAccumulator) truncate(max int) bool {
 // snapshot returns a copy of the accumulated spans + the
 // accountID. Used by the flush loop to build the write payload
 // after evicting the bucket from the map.
+//
+// Deprecated: the flush loop uses swapAndClear instead. Kept
+// for unit tests that need a non-destructive view.
 func (a *spansAccumulator) snapshot() ([]summarizedSpan, uuid.UUID) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -136,6 +151,45 @@ func (a *spansAccumulator) snapshot() ([]summarizedSpan, uuid.UUID) {
 	}
 	out := make([]summarizedSpan, len(a.spans))
 	copy(out, a.spans)
+	return out, a.accountID
+}
+
+// swapAndClear atomically returns the accumulated spans slice
+// and resets the bucket to empty. Used by the flush loop
+// (PR-D code-review #10) so a concurrent handler Add that
+// races with the flush tick lands in the freshly-empty bucket
+// and is picked up by the NEXT tick, not lost.
+//
+// Without atomic swap, the previous flush loop:
+//
+//   1. Snapshotted the bucket's spans (copy under mutex).
+//   2. Deleted the bucket key from the sync.Map.
+//   3. Handler's Add (running concurrently) called LoadOrStore,
+//      which on a missing key creates a NEW bucket — but the
+//      newly-added spans have nowhere to land if step 2
+//      already happened. The sync.Map's LoadOrStore is
+//      atomic at the map level, but the handler's Add was
+//      reading from the OLD bucket pointer that step 2 just
+//      removed from the map; in practice the handler holds
+//      the pointer and adds to it, but the flush loop's
+//      delete of the map key is a separate operation that
+//      races with the next Add's LoadOrStore.
+//
+// With swap-and-clear, the bucket's slice is reset to nil
+// under the bucket mutex. The flush loop holds the pointer
+// to the OLD slice (returned by swapAndClear) and the
+// handler's Add reads bucket.spans (which is now nil),
+// appends to a fresh slice, and the next tick picks it up.
+func (a *spansAccumulator) swapAndClear() ([]summarizedSpan, uuid.UUID) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := a.spans
+	if out == nil {
+		return nil, a.accountID
+	}
+	a.spans = nil
+	a.seenSpans = nil
+	a.firstSeenAt = time.Time{}
 	return out, a.accountID
 }
 

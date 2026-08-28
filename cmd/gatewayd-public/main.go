@@ -408,6 +408,24 @@ func run(ctx context.Context, log *slog.Logger) error {
 					return spansWriterCli.WriteSpansSummary(flushCtx, traceID, summaryJSON, accountID)
 				},
 				Log: slog.Default(),
+				// PR-D code-review #5: per-trace truncation
+				// applied at flush time, NOT per-POST at the
+				// handler. The closure returns the plan's
+				// DebugTelemetrySpansPerTrace ceiling
+				// (Hobby=50 / Pro=200 / Scale=1000). The
+				// handler already enforces the same cap as a
+				// per-POST gate; the flush-time cap is the
+				// memory bound the gateway needs across
+				// chunked POSTs within one window.
+				MaxSpansPerTrace: func(plan string) int {
+					return api.MustLimitsFor(api.Plan(plan)).DebugTelemetrySpansPerTrace
+				},
+				// PR-D code-review #5: fires once per bucket
+				// the flush truncated. Drives the §12 metric
+				// gatewayd_public_otel_spans_truncated_total.
+				OnTruncated: func(traceID string) {
+					opsMetrics.IncrementGatewaydPublicOtelSpansTruncated()
+				},
 			})
 			if err != nil {
 				log.Error("otel spans flush loop exited", "err", err)

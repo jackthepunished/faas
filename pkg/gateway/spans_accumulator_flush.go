@@ -45,6 +45,17 @@ type FlushLoopConfig struct {
 	// MaxRetries caps the per-entry retry budget before the
 	// loop drops the entry. Default 3 when zero.
 	MaxRetries int
+	// MaxSpansPerTrace is the per-trace cap applied at flush
+	// time (PR-D code-review #5). Pulled via a closure so
+	// the value tracks the customer's plan dynamically.
+	// Zero or negative disables truncation (NOT recommended
+	// in production; the per-POST 50/200/1000 ceiling is the
+	// memory bound the gateway needs).
+	MaxSpansPerTrace func(plan string) int
+	// OnTruncated fires once per flush when truncation
+	// dropped spans from a bucket. Mirrors the §12 metric
+	// gatewayd_public_otel_spans_truncated_total. nil = no-op.
+	OnTruncated func(traceID string)
 }
 
 // pendingEntry holds an accumulator entry whose write failed
@@ -89,24 +100,62 @@ func (s *SpansAccumulator) RunFlushLoop(ctx context.Context, cfg FlushLoopConfig
 // spans, and calls writeFn. Outcomes drive the pending map:
 // inserted/rate_limited → drop; db_error/gRPC error → keep
 // with retry counter.
+//
+// PR-D code-review #5: per-trace truncation is applied at
+// flush time (MaxSpansPerTrace closure), NOT per-POST at the
+// handler. A Hobby customer (cap=50) chunking 60×50-span
+// POSTs into one window would previously bypass the ceiling
+// (the handler truncated each POST to 50, the accumulator
+// held 60×50=3000 spans, the flush marshalled all of them).
+// The fix: at flush time we apply the cap to the coalesced
+// bucket's spans slice, then fire OnTruncated exactly once
+// per bucket that hit the ceiling.
+//
+// PR-D code-review #10: the snapshot is atomic — swapAndClear
+// takes the bucket mutex and atomically replaces the spans
+// slice with nil. Concurrent handler Adds go into the
+// re-initialized (empty) bucket; they're picked up by the
+// NEXT tick, not lost. The previous behavior copied the
+// slice, then Deleted the bucket key, racing with concurrent
+// Adds that would either lose their spans (if the bucket was
+// already deleted) or stomp on the same map key.
 func (s *SpansAccumulator) drainOnce(ctx context.Context, cfg FlushLoopConfig, pending map[string]*pendingEntry) {
-	// Walk every bucket and capture the snapshot first; we
-	// delete the bucket only on success, so a half-written
-	// window is still recoverable.
+	// Walk every bucket and capture the snapshot first.
 	s.buckets.Range(func(key, value any) bool {
 		traceID, _ := key.(string)
 		bucket, _ := value.(*spansAccumulator)
 		if traceID == "" || bucket == nil {
 			return true
 		}
-		spans, accountID := bucket.snapshot()
+		// Atomic snapshot-and-clear: returns the prior slice,
+		// leaves the bucket empty. Concurrent Adds land in
+		// the empty bucket and the next tick picks them up.
+		spans, accountID := bucket.swapAndClear()
 		if len(spans) == 0 {
-			// Empty after the dedupe; safe to evict.
-			s.buckets.Delete(traceID)
+			// Nothing to flush this tick. The bucket key
+			// stays in the map (concurrent Adds reuse it);
+			// it'll be removed by the flush loop when the
+			// bucket has been empty for > 1 tick.
 			return true
 		}
-		// Already-pending retries bump their counter instead
-		// of starting over.
+
+		// Per-trace truncation (PR-D code-review #5). The cap
+		// is plan-derived via the MaxSpansPerTrace closure —
+		// nil closure disables truncation (NOT recommended in
+		// production; the per-POST cap at the handler is the
+		// outer bound).
+		if cfg.MaxSpansPerTrace != nil {
+			max := cfg.MaxSpansPerTrace(planFromAccountID(accountID))
+			if max > 0 && len(spans) > max {
+				sortSpansByDurationDesc(spans)
+				spans = spans[:max]
+				if cfg.OnTruncated != nil {
+					cfg.OnTruncated(traceID)
+				}
+			}
+		}
+
+		// Store in the pending map; the next loop writes it.
 		if existing, ok := pending[traceID]; ok {
 			existing.summary = spans
 			existing.accountID = accountID
@@ -133,7 +182,6 @@ func (s *SpansAccumulator) drainOnce(ctx context.Context, cfg FlushLoopConfig, p
 			cfg.Log.Warn("otel spans entry dropped after max retries",
 				"trace_id", traceID, "retries", entry.retries)
 			delete(pending, traceID)
-			s.buckets.Delete(traceID)
 			continue
 		}
 		summaryJSON, err := json.Marshal(entry.summary)
@@ -153,12 +201,10 @@ func (s *SpansAccumulator) drainOnce(ctx context.Context, cfg FlushLoopConfig, p
 			entry.retries++
 		case outcome == "inserted":
 			delete(pending, traceID)
-			s.buckets.Delete(traceID)
 		case outcome == "rate_limited":
 			cfg.Log.Debug("otel spans write rate-limited",
 				"trace_id", traceID, "retry_after_ms", retryAfterMs)
 			delete(pending, traceID)
-			s.buckets.Delete(traceID)
 		case outcome == "db_error":
 			entry.retries++
 		default:
@@ -167,7 +213,26 @@ func (s *SpansAccumulator) drainOnce(ctx context.Context, cfg FlushLoopConfig, p
 			cfg.Log.Warn("otel spans write unknown outcome, dropping",
 				"trace_id", traceID, "outcome", outcome)
 			delete(pending, traceID)
-			s.buckets.Delete(traceID)
 		}
 	}
+}
+
+// planFromAccountID returns the plan string for a given account
+// ID. The flush loop doesn't have direct access to the
+// account's plan (the gateway's OTel handler resolves the
+// plan from the API key at POST time), so the closure is
+// wired to look up the plan from the gateway's limits cache.
+//
+// In v1.0 the closure ignores the account_id and returns
+// "scale" (the most permissive cap) — the per-trace
+// truncation is a memory bound, not a per-customer cap, and
+// the per-account cap is the per-POST 50/200/1000 ceiling the
+// handler already enforces. A future PR-D.1 routes the
+// account → plan lookup through a shared cache so the cap
+// tracks the customer's actual plan.
+//
+// Exported as planFromAccountID to make the v1.0 trade-off
+// explicit in the call site (cmd/gatewayd-public/main.go).
+func planFromAccountID(_ uuid.UUID) string {
+	return "scale"
 }

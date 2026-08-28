@@ -18,14 +18,15 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -299,10 +300,12 @@ func TestOTelSpansHandler_405_NotPOST(t *testing.T) {
 	}
 }
 
-// TestOTelSpansHandler_Truncation: 75 Hobby spans → keep 50
-// slowest; assert the kept set is the 50 largest DurationNanos.
-// The truncation tripwire metric fires once.
-func TestOTelSpansHandler_Truncation(t *testing.T) {
+// TestOTelSpansHandler_Truncation_FlushTime (PR-D
+// code-review #5): 75 Hobby spans arrive in one POST. The
+// handler accepts all 75 (no per-POST truncation). The flush
+// loop applies the Hobby cap=50 and ships 50 spans in
+// slowest-first order.
+func TestOTelSpansHandler_Truncation_FlushTime(t *testing.T) {
 	acctID := uuid.New()
 	auth := &fakeAuthClient{accountID: acctID.String(), plan: "hobby"}
 	acc := NewSpansAccumulator()
@@ -327,34 +330,55 @@ func TestOTelSpansHandler_Truncation(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !resp.Truncated {
-		t.Errorf("truncated = false, want true")
+	if resp.AcceptedSpans != 75 {
+		t.Errorf("accepted_spans = %d, want 75 (handler accepts all; truncation moved to flush time)", resp.AcceptedSpans)
 	}
-	if resp.AcceptedSpans != 50 {
-		t.Errorf("accepted_spans = %d, want 50 (Hobby ceiling)", resp.AcceptedSpans)
+	if resp.Truncated {
+		t.Errorf("truncated = true, want false (handler no longer truncates per-POST)")
 	}
 
-	// Pull the kept spans out of the accumulator and verify
-	// they're the 50 largest DurationNanos (the test builder
-	// gives span i duration = i nanos, so the slowest 50 are
-	// indices 26..75 = durations 26..75).
-	spans, _ := acc.DrainAndRemove(hex.EncodeToString(bytes.Repeat([]byte{0xab}, 16)))
-	if len(spans) != 50 {
-		t.Fatalf("kept span count = %d, want 50", len(spans))
+	var trunc int32
+	var captured atomic.Pointer[[]summarizedSpan]
+	flushCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = acc.RunFlushLoop(flushCtx, FlushLoopConfig{
+			Interval:         5 * time.Millisecond,
+			MaxSpansPerTrace: func(_ string) int { return 50 },
+			OnTruncated:      func(_ string) { atomic.AddInt32(&trunc, 1) },
+			WriteFn: func(_ context.Context, _ string, summaryJSON []byte, _ string) (string, int64, error) {
+				var spans []summarizedSpan
+				if err := json.Unmarshal(summaryJSON, &spans); err != nil {
+					t.Errorf("unmarshal: %v", err)
+					return "db_error", 0, nil
+				}
+				captured.Store(&spans)
+				return "inserted", 0, nil
+			},
+		})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && captured.Load() == nil {
+		time.Sleep(5 * time.Millisecond)
 	}
-	for i := 1; i < len(spans); i++ {
-		if spans[i].DurationNanos > spans[i-1].DurationNanos {
-			t.Errorf("kept spans not sorted descending by duration: spans[%d]=%d > spans[%d]=%d",
-				i, spans[i].DurationNanos, i-1, spans[i-1].DurationNanos)
+	cancel()
+	<-done
+	if captured.Load() == nil {
+		t.Fatalf("flush loop never wrote a payload")
+	}
+	got := *captured.Load()
+	if len(got) != 50 {
+		t.Errorf("flush wrote %d spans, want 50 (Hobby cap)", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].DurationNanos > got[i-1].DurationNanos {
+			t.Errorf("flushed spans not sorted descending by duration: [%d]=%d > [%d]=%d",
+				i, got[i].DurationNanos, i-1, got[i-1].DurationNanos)
 		}
 	}
-	// Slowest kept is span #75 (duration=75 nanos). Fastest
-	// kept is span #26 (duration=26 nanos).
-	if spans[len(spans)-1].DurationNanos < 26 {
-		t.Errorf("fastest kept = %d, want >= 26 (slowest 50 of 75)", spans[len(spans)-1].DurationNanos)
-	}
-	if spans[0].DurationNanos != 75 {
-		t.Errorf("slowest kept = %d, want 75", spans[0].DurationNanos)
+	if atomic.LoadInt32(&trunc) != 1 {
+		t.Errorf("OnTruncated fired %d times, want 1", atomic.LoadInt32(&trunc))
 	}
 }
 

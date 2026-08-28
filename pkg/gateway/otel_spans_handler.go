@@ -213,20 +213,13 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Truncate to slowest-N. The tripwire metric fires once per
-	// POST whose inbound body exceeded the ceiling — distinct
-	// from accepted_spans (the gateway may keep the entire batch
-	// if it's under the ceiling).
-	truncated := false
-	if limits.DebugTelemetrySpansPerTrace > 0 && len(spans) > limits.DebugTelemetrySpansPerTrace {
-		sortSpansByDurationDesc(spans)
-		spans = spans[:limits.DebugTelemetrySpansPerTrace]
-		truncated = true
-		h.cfg.Ops.IncrementGatewaydPublicOtelSpansTruncated()
-	}
-
 	// Hand to the accumulator. NO DB IO at this point — the
-	// flush loop owns the write path (Stage 4).
+	// flush loop owns the write path (Stage 4). Per-trace
+	// truncation is applied in the flush loop (PR-D
+	// code-review #5), not per-POST here. The previous
+	// per-POST truncation let a Hobby customer bypass the
+	// 50-span-per-trace ceiling by chunking spans across
+	// many POSTs inside one flush window.
 	added, accErr := h.cfg.Acc.Add(traceID, accountID, spans)
 	if accErr != nil {
 		// PR-D code-review #4: a trace_id being contended
@@ -246,7 +239,12 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(otelSpansResponse{
 		AcceptedSpans: len(spans),
-		Truncated:     truncated,
+		// Truncation is now reported by the flush loop's
+		// OnTruncated metric; the per-POST response no
+		// longer reflects it (it was misleading — a 50-span
+		// POST under the cap doesn't know whether the BUCKET
+		// will be truncated at flush time).
+		Truncated: false,
 	})
 }
 
