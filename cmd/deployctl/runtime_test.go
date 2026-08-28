@@ -229,6 +229,14 @@ func TestReconcileServiceTopologyRemovesOppositeRoleResidue(t *testing.T) {
 	if hasCall("systemctl", "disable", "--now", "faas-builderd.service") {
 		t.Errorf("already-masked builderd was sent through disable --now: %v", calls)
 	}
+	for _, service := range []string{"vmmd", "gatewayd"} {
+		if _, err := os.Lstat(filepath.Join(unitDir, "faas-"+service+".service")); !os.IsNotExist(err) {
+			t.Errorf("stale %s unit still exists, err=%v", service, err)
+		}
+	}
+	if target, err := os.Readlink(filepath.Join(unitDir, "faas-builderd.service")); err != nil || target != "/dev/null" {
+		t.Errorf("existing builderd mask was removed or changed, target=%q err=%v", target, err)
+	}
 	for _, service := range []string{"vmmd", "builderd", "gatewayd", "spool-sync"} {
 		if !hasCall("systemctl", "mask", "--force", "faas-"+service+".service") {
 			t.Errorf("missing mask for omitted %s: %v", service, calls)
