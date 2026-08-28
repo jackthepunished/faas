@@ -254,6 +254,7 @@ var ErrReorderNotPending = errors.New("state: reorder only valid for pending dep
 // handler boundary to HTTP 422 with the deployment_reorder_priority_invalid
 // code.
 var ErrPriorityOutOfRange = errors.New("state: priority must be in [0, 1000]")
+
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
