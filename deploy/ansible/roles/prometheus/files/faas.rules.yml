@@ -1367,11 +1367,11 @@ groups:
       # [family, component] match) auto-pairs them so the warn
       # never pages through while the page is firing.
       # ─────────────────────────────────────────────────────────────────
-      - record: obs:operator_action_trace_completeness_ratio:5m
+      - record: obs:operator_action_trace_completeness_ratio
         expr: clamp_min(min(schedd_operator_action_trace_completeness_ratio), 0.001)
 
       - alert: FaasOperatorActionTraceCompletenessLowPage
-        expr: obs:operator_action_trace_completeness_ratio:5m < 0.50
+        expr: obs:operator_action_trace_completeness_ratio < 0.50
         for: 10m
         labels:
           severity: page
@@ -1383,7 +1383,7 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasOperatorActionTraceCompletenessLow.md"
 
       - alert: FaasOperatorActionTraceCompletenessLowWarn
-        expr: obs:operator_action_trace_completeness_ratio:5m < 0.95
+        expr: obs:operator_action_trace_completeness_ratio < 0.95
         for: 30m
         labels:
           severity: warn
@@ -1426,14 +1426,20 @@ groups:
       # to the apid-only alert today. This rule exists precisely
       # to surface those non-apid spikes.
       #
-      # Deliberate NOT-paired with FaasApidAuditWriteFailures:
-      # both share family=audit_write but this rule uses
-      # component=platform (cross-daemon, mirroring the
-      # FaasDaemonDown precedent further down) while
-      # FaasApidAuditWriteFailures uses component=apid.
-      # Alertmanager inhibit ANDs labels, so the warn is
-      # independently visible — correct, because suppressing
-      # this warn when apid fails would defeat the purpose.
+      # Deliberate NOT-paired with FaasApidAuditWriteFailures.
+      # Both are severity=warn and there is no page-tier
+      # audit_write alert anywhere in this file; alertmanager's
+      # inhibit rule (alertmanager.yml.j2:124-136) requires
+      # source.severity=page to engage, so this cross-daemon
+      # warn is independently visible regardless of component
+      # label values. The component=platform vs component=apid
+      # distinction keeps the two routes grouped correctly in
+      # alertmanager (platform-wide email vs. apid-only queue)
+      # but does NOT carry the inhibit weight — if a future
+      # page-tier audit_write alert is added with the same
+      # family, the inhibit rule would engage via the severity
+      # match, not via component. Component labels here are
+      # routing-only; severity is the inhibit lever.
       #
       # Threshold matches FaasApidAuditWriteFailures for
       # consistency (>5/min, for 5m, same `5/60` unit). The

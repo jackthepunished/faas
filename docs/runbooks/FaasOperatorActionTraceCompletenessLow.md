@@ -1,7 +1,7 @@
 # FaasOperatorActionTraceCompletenessLow
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`
-(recording rule `obs:operator_action_trace_completeness_ratio:5m`
+(recording rule `obs:operator_action_trace_completeness_ratio`
 + alerts `FaasOperatorActionTraceCompletenessLowPage`,
 `FaasOperatorActionTraceCompletenessLowWarn`,
 `FaasOperatorActionTraceCompletenessLoopStalled`).
@@ -10,11 +10,15 @@ set by `pkg/sched/operator_intent_completeness.go::observeOperatorIntentComplete
 on a 60s tick); sibling per-daemon series
 (`apid_operator_action_trace_completeness_ratio`,
 `meterd_…`, `gatewayd-internal_…`) are registered but never
-`Set` — only schedd runs the driver.
+`Set` — only schedd runs the driver. Gauge constructor at
+`pkg/wire/metrics.go:3211`, pre-instantiation grid at 3232-3233
+for the 5 verb-oriented kinds (force_park / force_cold_boot /
+force_restart / park_instance / restart_instance).
 ADR: PR #1111 (Obs-Meta + Trace-IDs Mega-PR, shipped at 5ead9b7cd),
 contract clauses C1-C4 (every `operator.action.<verb>` audit row
 carries a non-NULL `events.trace_id`).
-PR: #1111 + follow-on `feat/obs-dashboards-alerts`.
+PR: #1111 + follow-on `feat/obs-dashboards-alerts` (this file's
+source).
 Severity: page on Page alert; warn on Warn alert; info on LoopStalled.
 
 ## Symptom
@@ -28,9 +32,13 @@ but only populated when schedd's terminal audit emit runs).
 A kind whose gauge has never been touched by the driver reads its
 `WithLabelValues(...)` default (`0.0`, NOT `1.0`), so first-time
 quantization may briefly under-read; the gauge is pre-instantiated
-for the 5 verb-oriented kinds in
-`pkg/wire/metrics.go::operatorIntentKindClosedSet` to bound the
-time below one 60s tick.
+for the 5 verb-oriented kinds via
+`pkg/wire/metrics.go::operatorIntentKindClosedSet` (line 3196, the
+5-entry closed set feeding the pre-instantiation loop at 3232+).
+The recording rule `obs:operator_action_trace_completeness_ratio`
+(used by both Page and Warn alerts + Dashboard B panel 4) wraps
+that `min(...)` in `clamp_min(0.001)` to avoid divide-by-zero in
+any downstream ratio comparison.
 
 - **Page**: `obs:operator_action_trace_completeness_ratio:5m < 0.50`
   sustained 10m. At least one verb-oriented kind has fewer than half
@@ -75,6 +83,10 @@ curl -fsS --data-urlencode \
 # Companion: per-kind audit-write rate (denominator)
 curl -fsS --data-urlencode \
   'query=topk(8, sum by (kind) (rate({__name__=~".*_audit_log_write_total"}[5m])))' \
+  'http://127.0.0.1:9090/api/v1/query'
+
+# Recording rule value (what the Page + Warn alerts evaluate)
+curl -fsS --data-urlencode 'query=obs:operator_action_trace_completeness_ratio' \
   'http://127.0.0.1:9090/api/v1/query'
 ```
 
@@ -131,6 +143,12 @@ before widening (CLAUDE.md §17 G7).
 ### Driver-loop freshness (info-tier alert)
 
 ```bash
+# Stalest kind (max() picks the worst, not an arbitrary one)
+curl -fsS --data-urlencode \
+  'query=max(time() - timestamp(schedd_operator_action_trace_completeness_ratio))' \
+  'http://127.0.0.1:9090/api/v1/query'
+
+# Per-kind freshness if a single kind is suspect
 curl -fsS --data-urlencode \
   'query=time() - timestamp(schedd_operator_action_trace_completeness_ratio)' \
   'http://127.0.0.1:9090/api/v1/query'

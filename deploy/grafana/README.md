@@ -79,10 +79,13 @@ Runbook: `docs/runbooks/FaasAuditRetentionExhaustion.md`.
 Four-panel dashboard for the audit-write fidelity surface shipped by
 PR #1111 C2: `<daemon>_audit_log_write_total{endpoint, kind}` and
 `<daemon>_audit_log_write_failures_total{endpoint, kind, error_class}`
-counters (per-daemon prefix, pre-instantiation grid at
-`pkg/wire/metrics.go:3142-3179`). The audit emit is best-effort by
-design (ADR-035) — a sustained non-zero failure rate means audit
-rows are silently missing while customer traffic looks healthy.
+counters (per-daemon prefix, counter declarations at
+`pkg/wire/metrics.go:1510 / 1515`, pre-instantiation grid at lines
+3215-3222 spanning `auditEndpointClosedSet` × `auditKindClosedSet`
+× `auditErrorClassClosedSet` — declarations at lines 3158 / 3159 /
+3178). The audit emit is best-effort by design (ADR-035) — a
+sustained non-zero failure rate means audit rows are silently
+missing while customer traffic looks healthy.
 
 Panels:
 
@@ -98,7 +101,7 @@ Companion alert at
 `deploy/ansible/roles/prometheus/files/faas.rules.yml` under
 `family: audit_write`:
 
-- `FaasAuditWriteFailuresSpike` (warn) — `sum(rate({__name__=~".*_audit_log_write_failures_total"}[5m])) > (5/60)` for 5m. Cross-daemon, `component=platform`. Deliberately not paired with the existing apid-only `FaasApidAuditWriteFailures` — alertmanager inhibit ANDs labels, so the warn is independently visible to surface non-apid spikes that the apid-only alert misses.
+- `FaasAuditWriteFailuresSpike` (warn) — `sum(rate({__name__=~".*_audit_log_write_failures_total"}[5m])) > (5/60)` for 5m. Cross-daemon, `component=platform`. Deliberately not paired with the existing apid-only `FaasApidAuditWriteFailures`: the load-bearing reason is that BOTH are `severity=warn` and the alertmanager inhibit rule (`alertmanager.yml.j2:124-136`) requires `source.severity=page` to engage — no page-tier `audit_write` alert exists, so the cross-daemon warn stays independently visible regardless of component labels. Component labels route the email (platform-wide vs apid-only queue); severity is the inhibit lever.
 
 Runbook: `docs/runbooks/FaasAuditWriteFailuresSpike.md`.
 
@@ -109,7 +112,8 @@ shipped by PR #1111 C2-C4: the schedd gauge
 `schedd_operator_action_trace_completeness_ratio{kind}` set by
 `pkg/sched/operator_intent_completeness.go::observeOperatorIntentCompleteness`
 on a 60s tick. Every panel filters on `schedd_…` because the gauge
-is registered on every daemon (`pkg/wire/metrics.go:3150-3173`) but
+is registered on every daemon (gauge constructor at
+`pkg/wire/metrics.go:3211`, pre-instantiation at 3232-3233) but
 ONLY schedd's driver calls `Set` — cross-daemon queries mix real
 values with never-set/zero defaults on other daemons.
 
@@ -132,6 +136,8 @@ Companion alerts at
 - `FaasOperatorActionTraceCompletenessLoopStalled` (info) — gauge stale >180s for 5m. Schedd driver goroutine wedged.
 
 All three share `family=obs_trace, component=schedd` so the alertmanager inhibit rule auto-pairs page+warn.
+
+Recording rule: `obs:operator_action_trace_completeness_ratio` (`min(...)` over all kinds + `clamp_min(0.001)` — same shape as the `vmmd_cold_boot_ratio` precedent at `faas.rules.yml:1147`, no `:Nm` time-window suffix because the upstream gauge is instant rather than counter-rate).
 
 Runbook: `docs/runbooks/FaasOperatorActionTraceCompletenessLow.md`.
 

@@ -3,11 +3,12 @@
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`
 (alert `FaasAuditWriteFailuresSpike`).
 Metrics: `<daemon>_audit_log_write_failures_total{endpoint, kind,
-error_class}` (counter, pre-instantiation grid at
-`pkg/wire/metrics.go:3154-3161` for the
-`auditEndpointClosedSet × auditKindClosedSet ×
-auditErrorClassClosedSet` Cartesian). The metric is **per-daemon
-prefix** — actual series names are `apid_audit_log_write_failures_total`,
+error_class}` (counter, declarations at `pkg/wire/metrics.go:1515`,
+pre-instantiation grid at lines 3215-3222 spanning the
+`auditEndpointClosedSet` × `auditKindClosedSet` ×
+`auditErrorClassClosedSet` Cartesian — declarations at lines
+3158 / 3159 / 3178). The metric is **per-daemon prefix** — actual
+series names are `apid_audit_log_write_failures_total`,
 `schedd_audit_log_write_failures_total`, etc. The cross-daemon
 regex `{__name__=~".*_audit_log_write_failures_total"}` is the
 alert's surface.
@@ -26,10 +27,18 @@ matches `FaasApidAuditWriteFailures` for consistency.
 This alert is **deliberately not paired** with
 `FaasApidAuditWriteFailures` (which covers apid alone). Both fire
 under `family=audit_write` but with different `component` labels
-(`apid` vs `platform`); alertmanager inhibit ANDs labels, so they
-do NOT suppress each other. The point of this warn is precisely
-to surface non-apid spikes — schedd / meterd / gatewayd-internal
-audit-write failures that the apid-only alert misses.
+(`apid` vs `platform`). The load-bearing reason they do NOT
+suppress each other is that BOTH are `severity=warn` and the
+alertmanager inhibit rule (`deploy/ansible/roles/alertmanager/
+templates/alertmanager.yml.j2:124-136`) requires
+`source.severity=page` to engage — no page-tier `audit_write`
+alert exists, so the cross-daemon warn stays independently
+visible regardless of the `component` label values. Component
+labels here route the email (platform-wide vs apid-only queue);
+severity is the inhibit lever. The point of this warn is
+precisely to surface non-apid spikes — schedd / meterd /
+gatewayd-internal audit-write failures that the apid-only alert
+misses.
 
 The audit emit is best-effort by design (ADR-035): the
 user-facing action has already returned 200 to the customer by
