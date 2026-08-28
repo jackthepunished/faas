@@ -4094,10 +4094,9 @@ func (h *Handler) logBodyCapWarnOnce(appID, bucket string, bytes, cap int64) {
 		return
 	}
 	key := appID + "\x00" + bucket
-	if _, seen := h.bodyCapWarned.Load(key); seen {
+	if _, loaded := h.bodyCapWarned.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	h.bodyCapWarned.Store(key, struct{}{})
 	if h.log == nil {
 		return
 	}
