@@ -15,7 +15,6 @@ package state_test
 import (
 	"context"
 	"errors"
-	"strconv"
 	"testing"
 	"time"
 
@@ -197,19 +196,46 @@ func TestPg_ClearDeployment_Live_Refuses(t *testing.T) {
 
 func TestPg_ClearObsoleteDeployments_Bulk_Happy(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, appID, _ := seedPendingDeployPg(t, s, ctx, "obsolete-1")
 
-	// Seed two more terminal rows: one cancelled, one failed. Both
-	// should be soft-deleted by ClearObsoleteDeployments.
-	for i, reason := range []state.CancelReason{state.CancelReasonUser, state.CancelReasonAutoQuota} {
-		_, _, depID := seedPendingDeployPg(t, s, ctx, "obsolete-"+strconv.Itoa(i+2))
-		if _, _, err := s.CancelDeploymentTx(ctx, depID, "operator:test", reason); err != nil {
-			t.Fatalf("seed cancel %d: %v", i+2, err)
+	// All 3 deployments must share the same app: the SQL partitions by
+	// app_id and keeps the top-2 most-recent rows per app, so 3
+	// cancelled rows on one app leave 1 soft-deletable, 2 protected.
+	acct, err := s.CreateAccount(ctx, "u-obsolete@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "pg-queue-obsolete", Type: state.AppTypeApp,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	seedCancelledDeployment := func(t *testing.T, reason state.CancelReason) {
+		t.Helper()
+		dep, err := s.CreateDeployment(ctx, state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:queue", Status: state.DeployPending,
+		})
+		if err != nil {
+			t.Fatalf("CreateDeployment: %v", err)
+		}
+		if _, _, err := s.CancelDeploymentTx(ctx, dep.ID, "operator:test", reason); err != nil {
+			t.Fatalf("seed cancel: %v", err)
 		}
 	}
+	seedCancelledDeployment(t, state.CancelReasonUser)
+	seedCancelledDeployment(t, state.CancelReasonAutoQuota)
+	seedCancelledDeployment(t, state.CancelReasonSystem)
 
-	cutoff := time.Now().Add(-1 * time.Hour)
-	count, err := s.ClearObsoleteDeployments(ctx, appID, cutoff)
+	// olderThan filter: ClearObsoleteDeployments soft-deletes rows where
+	// created_at < olderThan. We pass a future cutoff so every
+	// cancelled row qualifies — the "natural" now()-1h would miss rows
+	// that were just cancelled, defeating the test. The per-app
+	// retention guard (top-2 most-recent rows protected) is what we
+	// actually want to exercise here, so 3 cancelled rows on the same
+	// app leave the newest-2 protected and 1 soft-deleted.
+	cutoff := time.Now().Add(time.Hour)
+	count, err := s.ClearObsoleteDeployments(ctx, app.ID, cutoff)
 	if err != nil {
 		t.Fatalf("ClearObsoleteDeployments: %v", err)
 	}
