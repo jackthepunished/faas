@@ -81,7 +81,7 @@ type execer interface {
 // saturation events specifically — a saturated rule is operationally
 // distinct from a 5xx crash and ops alerts on each independently.
 const rollupSQL = `
-INSERT INTO public.mirror_invocation_summary (
+INSERT INTO mirror_invocation_summary (
     rule_id, app_id, hour_bucket,
     total_invocations, status_diff_count, schema_diff_count,
     body_diff_count, crash_count, cap_at_max_count,
@@ -89,7 +89,7 @@ INSERT INTO public.mirror_invocation_summary (
 )
 SELECT
     mirror_rule_id,
-    (SELECT app_id FROM public.mirror_rules WHERE id = mirror_rule_id),
+    (SELECT app_id FROM mirror_rules WHERE id = mirror_rule_id),
     date_trunc('hour', completed_at) AS hour_bucket,
     COUNT(*),
     COUNT(*) FILTER (WHERE status_diff),
@@ -99,7 +99,7 @@ SELECT
     COUNT(*) FILTER (WHERE cap_at_max),
     COALESCE(SUM(latency_ms), 0),
     now()
-FROM public.mirror_invocation_results
+FROM mirror_invocation_results
 WHERE completed_at >= $1 AND completed_at < $2
 GROUP BY 1, 3
 ON CONFLICT (rule_id, hour_bucket) DO UPDATE SET
@@ -118,7 +118,7 @@ ON CONFLICT (rule_id, hour_bucket) DO UPDATE SET
 // on the next tick. The rollup preserved the per-hour counts so
 // the loss of raw rows doesn't affect the dashboard chip.
 const sweepSQL = `
-DELETE FROM public.mirror_invocation_results
+DELETE FROM mirror_invocation_results
 WHERE completed_at < $1
 `
 

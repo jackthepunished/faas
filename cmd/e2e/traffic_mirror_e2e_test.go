@@ -66,7 +66,7 @@ func seedMirrorLedgerRow(t *testing.T, pool *pgxpool.Pool, ruleID, appID string,
 	t.Helper()
 	id := uuid.NewString()
 	_, err := pool.Exec(context.Background(), `
-INSERT INTO public.mirror_invocation_results (
+INSERT INTO mirror_invocation_results (
     id, mirror_rule_id, app_id,
     status_diff, schema_diff, body_diff, crashed, cap_at_max,
     latency_ms, completed_at
@@ -154,7 +154,7 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 	var total int64
 	err := pool.QueryRow(ctx, `
 SELECT total_invocations
-FROM public.mirror_invocation_summary
+FROM mirror_invocation_summary
 WHERE rule_id = $1
 `, ruleID).Scan(&total)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestE2E_MirrorSweep_DeletesOnlyStaleRows(t *testing.T) {
 	var remaining int64
 	err := pool.QueryRow(ctx, `
 SELECT count(*)
-FROM public.mirror_invocation_results
+FROM mirror_invocation_results
 WHERE mirror_rule_id = $1
 `, ruleID).Scan(&remaining)
 	if err != nil {
