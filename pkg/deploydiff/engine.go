@@ -66,7 +66,65 @@ func Compute(slug string, plan Plan, baseline Baseline, pending Pending) Diff {
 	detectSchemaBreak(&out, baseline.LatestDeployment, pending,
 		edgeRulesToWire(baseline.EdgeRules), pending.EdgeRules)
 
+	// 7. Cross-env drift signal (SAFE-RELEASES production-leveling
+	// Stream E, issue #976 / ADR-122 post-merge audit). Before
+	// Stream E, the diff engine didn't surface a scope change
+	// between baseline and pending — a staging→prod promotion
+	// looked identical to a same-env patch from the diff's
+	// point of view. Emits `scope_mismatch` SeverityWarn when
+	// the pending scope differs from the baseline scope.
+	// ADR-091's per-deployment scope targeting means a single
+	// app can have one live row per scope; the diff must
+	// surface a cross-env diff as informational so the operator
+	// can confirm they meant to promote to staging or prod
+	// rather than patch the default row.
+	//
+	// Note (plan deviation): the original Stream E plan also
+	// called for a `commit_sha_drift` break. Substrate check:
+	// state.Deployment carries CommitSHA (migrations/00047) but
+	// api.DeploymentResponse does NOT surface it on the wire
+	// (no commit_sha field on pkg/api/dto.go's DeploymentResponse
+	// — the column lives only on BuildProvenanceResponse).
+	// Adding a wire field requires a DeploymentResponse change +
+	// a pre-PR fixture refresh, which is deferred to a follow-up
+	// PR so this one stays reviewable in ~10 minutes. The Scope
+	// coverage shipped here is the higher-value half: scope
+	// drift is what an operator notices on a staging→prod
+	// promotion, while commit_sha drift surfaces in the build
+	// log review.
+	diffScopeMismatch(&out, baseline.LatestScope, pending.Scope)
+
 	return out
+}
+
+// diffScopeMismatch emits a SeverityWarn `scope_mismatch` Break
+// when the baseline's scope differs from the pending scope.
+// ADR-091's per-deployment scope targeting means a single app can
+// have one live row per scope; the diff must surface a cross-env
+// diff as informational so the operator can confirm they meant
+// to promote to staging or prod rather than patch the default
+// row. baseScope empty is a no-op (a fresh app has no prior scope
+// to compare against); pendingScope empty is also a no-op
+// (defaults to api.DefaultEnvScope at write time — comparing
+// baseline "default" against pending "" would be a false
+// positive on every deploy).
+func diffScopeMismatch(out *Diff, baseScope, pendingScope string) {
+	if baseScope == "" || pendingScope == "" {
+		return
+	}
+	if baseScope == pendingScope {
+		return
+	}
+	out.Breaks = append(out.Breaks, Break{
+		Code:     "scope_mismatch",
+		Severity: SeverityWarn,
+		Reason:   "baseline scope differs from the pending deployment's — confirm this is a cross-env promotion, not a same-env patch",
+		Field:    "deployment.scope",
+		Observed: AsAny(map[string]string{
+			"baseline": baseScope,
+			"pending":  pendingScope,
+		}),
+	})
 }
 
 // diffAppConfig is the per-scalar pointer-aware comparison. Each

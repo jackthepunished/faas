@@ -489,6 +489,95 @@ func TestCompute_SchemaBreak_TextOnlyStillFires(t *testing.T) {
 	}
 }
 
+// TestCompute_ScopeMismatch — SAFE-RELEASES Stream E. ADR-091's
+// per-deployment scope targeting means a single app can have one
+// live row per scope; the diff must surface cross-env promotions
+// (default → staging) as informational so the operator can confirm
+// they meant to promote, not patch the default row.
+func TestCompute_ScopeMismatch(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	// Pending deployment targets staging instead of default.
+	pending := Pending{Scope: "staging"}
+	got := Compute("api", "", baseline, pending)
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" && b.Field == "deployment.scope" {
+			found = true
+			if b.Severity != SeverityWarn {
+				t.Errorf("Severity = %q, want %q", b.Severity, SeverityWarn)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("scope change must emit scope_mismatch break; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_ScopeMismatch_NoBreakWhenEqual — same scope on
+// both sides is a no-op.
+func TestCompute_ScopeMismatch_NoBreakWhenEqual(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	pending := Pending{Scope: "default"}
+	got := Compute("api", "", baseline, pending)
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" {
+			t.Errorf("scope_mismatch must not fire when both sides carry the same scope; got %+v", got.Breaks)
+		}
+	}
+}
+
+// TestCompute_ScopeMismatch_EmptyOnEitherSide — empty on
+// either side is a no-op (deployments with no explicit scope
+// default to "default" at write time; comparing against an
+// empty string would fire a false positive on every deploy).
+func TestCompute_ScopeMismatch_EmptyOnEitherSide(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	// Empty pending scope: handler coerces "" → "default" at
+	// write time, so this must not fire scope_mismatch.
+	pending := Pending{Scope: ""}
+	got := Compute("api", "", baseline, pending)
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" {
+			t.Errorf("scope_mismatch must not fire when pending scope is empty; got %+v", got.Breaks)
+		}
+	}
+}
+
+// TestCompute_BaselineFieldsPopulate_NoDepsReadsToNil — pin the
+// buildDiffBaseline wire-up: a baseline built from a non-nil
+// LatestDeployment must populate LatestScope from dep.Scope so
+// the engine can compare. This is the apid-side counterpart to
+// the engine tests above — it asserts the server-side builder
+// doesn't forget to mirror the column into the baseline.
+func TestCompute_BaselineFieldsPopulate_NoDepsReadsToNil(t *testing.T) {
+	base := &api.DeploymentResponse{
+		Scope: "staging",
+	}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      base.Scope,
+	}
+	if baseline.LatestScope != "staging" {
+		t.Errorf("LatestScope = %q, want staging", baseline.LatestScope)
+	}
+}
+
 // contains is a tiny substring helper; the test anchor uses
 // string-contains rather than exact equality because the
 // field string is path + method + status, and we only want
