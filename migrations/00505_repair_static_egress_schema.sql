@@ -1,4 +1,4 @@
--- filename: 00494_repair_static_egress_schema.sql
+-- filename: 00505_repair_static_egress_schema.sql
 -- +goose Up
 -- +goose StatementBegin
 

@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Regression test for 00494_repair_static_egress_schema.sql.
+// Regression test for 00505_repair_static_egress_schema.sql.
 //
 // It models the production failure: goose has already recorded 00336 and
 // 00337, while the schema objects owned by those historical slots are absent.
-// The append-only repair must restore the objects when only version 00494 is
+// The append-only repair must restore the objects when only version 00505 is
 // pending, and a second run must be a no-op.
 package migrations_test
 
@@ -17,7 +17,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00494RepairsStaticEgressSchemaDrift(t *testing.T) {
+func TestMigrations_00505RepairsStaticEgressSchemaDrift(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -55,7 +55,7 @@ func TestMigrations_00494RepairsStaticEgressSchemaDrift(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		delete from goose_db_version
-		 where version_id = 494`); err != nil {
+		 where version_id = 505`); err != nil {
 		t.Fatalf("make repair migration pending: %v", err)
 	}
 
