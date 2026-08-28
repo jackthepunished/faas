@@ -96,7 +96,9 @@ SELECT
     COUNT(*) FILTER (WHERE schema_diff),
     COUNT(*) FILTER (WHERE body_diff),
     COUNT(*) FILTER (WHERE crashed),
-    COUNT(*) FILTER (WHERE cap_at_max),
+    0, -- cap_at_max_count: mirror_invocation_results has no cap_at_max column;
+       -- the rollup SQL still writes the column so ON CONFLICT arithmetic
+       -- is uniform; the per-rule cap is enforced upstream in pkg/sched.
     COALESCE(SUM(latency_ms), 0),
     now()
 FROM mirror_invocation_results
