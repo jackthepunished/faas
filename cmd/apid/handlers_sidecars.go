@@ -363,10 +363,16 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 		}
 		dep.CanaryPreset = preset.Name
 		dep.CanaryTotalSteps = preset.TotalSteps()
-		if dep.CanaryTotalSteps > 0 {
-			now := time.Now().UTC()
-			dep.CanaryStepStartedAt = &now
-		}
+		// SAFE-RELEASES code-review hardening (migration 00488):
+		// canary_step_started_at is NOT NULL post-00488, so the
+		// apid Create path must stamp it on every row. The
+		// readers (pkg/canary.Once line 226, pkg/safedeploy.
+		// Orchestrator line 207) only consult the timestamp when
+		// CanaryTotalSteps > 0; the no-canary (preset=none) row
+		// gets the deployment's created_at as a placeholder that
+		// the readers will skip via the surrounding predicate.
+		now := time.Now().UTC()
+		dep.CanaryStepStartedAt = &now
 	}
 	// ADR-091 / PR-D: per-deployment env scope. The handler ran
 	// api.ValidateScope above — non-empty here means well-formed
