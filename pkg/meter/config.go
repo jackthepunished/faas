@@ -207,6 +207,17 @@ type Config struct {
 	// The orchestrator tick is the complementary twin of the
 	// canary_progression tick — both run on a unified cadence.
 	SafeDeployInterval time.Duration
+	// DeploymentAuditRetentionInterval (issue #976 / ADR-122 /
+	// SAFE-RELEASES production-leveling Stream D) is how often
+	// the deployment_audit GC cron
+	// (pkg/meter/retention.go::RetentionLoopDeploymentAudit)
+	// DELETEs deployment_audit rows older than 90 days. Zero
+	// means the production default (6 h —
+	// DefaultDeploymentAuditRetentionInterval). The DELETE is
+	// idempotent — a second run on the same window finds
+	// nothing to delete. Mirrors RetentionInterval's pattern
+	// for the usage_minutes sweep.
+	DeploymentAuditRetentionInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -270,5 +281,8 @@ func (c *Config) Defaults() {
 	}
 	if c.SafeDeployInterval == 0 {
 		c.SafeDeployInterval = DefaultSafeDeployInterval
+	}
+	if c.DeploymentAuditRetentionInterval == 0 {
+		c.DeploymentAuditRetentionInterval = DefaultDeploymentAuditRetentionInterval
 	}
 }

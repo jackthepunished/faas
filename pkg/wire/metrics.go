@@ -696,6 +696,18 @@ type OpsMetrics struct {
 	// value reflects the LATEST pass, not a cumulative sum.
 	// ADR-091 D20.3 / PR-B residual.
 	auditEventsRetentionLagSeconds prometheus.Gauge
+	// deploymentAuditGCRowsDeletedTotal: rows pruned by the
+	// deployment_audit retention cron (pkg/meter/
+	// RetentionOnceDeploymentAudit, 90-day window). SAFE-
+	// RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit) — without this counter an
+	// operator can't tell whether the GC is keeping up or the
+	// table is silently growing. Unlabelled — the loop has
+	// one outcome (rows deleted); the per-kind breakdown
+	// stays on the deployment_audit_at_gc_idx index (planner
+	// range-scans the at column) + the dashboard's audit
+	// timeline drill-down.
+	deploymentAuditGCRowsDeletedTotal prometheus.Counter
 	// domainDoctorOldestObservationSeconds (ADR-120 Tier A1): gauge
 	// of (now − min(observed_at)) across every row in
 	// domain_doctor_observations at the moment each doctor pass
@@ -2190,6 +2202,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_audit_events_volume_total",
 		Help: "Audit-event emit calls by kind prefix (auth.*, key.*, secret.*, account.*, stateless.*, webhook.*, edge_rule.*, cron.*, other). Overflow collapses to __other__ via the bounded admission helper so Prometheus series stay bounded. ADR-091 D20.3 / PR-B residual.",
 	}, []string{"kind_prefix"})
+	// deploymentAuditGCRowsDeletedTotal: rows pruned by the
+	// deployment_audit retention cron
+	// (pkg/meter.RetentionOnceDeploymentAudit, 90-day window).
+	// SAFE-RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit). Unlabelled — the loop has one
+	// outcome (rows deleted); per-kind breakdown stays on the
+	// deployment_audit_at_gc_idx index. Backs the "is the
+	// deployment_audit prune loop keeping up?" runbook
+	// question (sibling of audit_events_deleted_total).
+	deploymentAuditGCRowsDeletedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_deployment_audit_gc_rows_deleted_total",
+		Help: "Deployment_audit rows pruned by the 90-day retention cron (pkg/meter.RetentionOnceDeploymentAudit, SAFE-RELEASES Stream D). Unlabelled — the loop has one outcome (rows deleted); per-kind breakdown stays on the deployment_audit_at_gc_idx index.",
+	})
 	// Pre-instantiate the closed kind_prefix label set so the
 	// counter's HELP/TYPE and zero-valued series surface in /metrics
 	// from boot (same precedent as auditWriteDur's result label set).
@@ -2885,6 +2910,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditEventsDeletedTotal,
 		auditEventsRetentionLagSeconds,
 		auditEventsVolumeTotal,
+		deploymentAuditGCRowsDeletedTotal,
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		apidLogsDroppedTotal,
@@ -3907,6 +3933,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		domainDoctorOldestObservationSeconds: domainDoctorOldestObservationSeconds,
 		domainDoctorSkippedFlagDisabled:      domainDoctorSkippedFlagDisabled,
 		auditEventsVolumeTotal:               auditEventsVolumeTotal,
+		deploymentAuditGCRowsDeletedTotal:    deploymentAuditGCRowsDeletedTotal,
 		alertEvalSkippedDegradedTotal:        alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                  alertEvalFiredTotal,
 		canaryProgressionAdvancedTotal:       canaryProgressionAdvancedTotal,
@@ -5005,6 +5032,24 @@ func (m *OpsMetrics) AuditEventsDeleted() prometheus.Counter {
 		return nil
 	}
 	return m.auditEventsDeletedTotal
+}
+
+// DeploymentAuditGCRowsDeleted returns the counter of rows
+// pruned by the deployment_audit 90-day retention cron
+// (pkg/meter.RetentionOnceDeploymentAudit, SAFE-RELEASES
+// production-leveling Stream D). The counter is unlabelled —
+// the loop has one outcome (rows deleted); per-kind breakdown
+// stays on the deployment_audit_at_gc_idx index. cmd/meterd
+// calls .Add(float64(n)) on the returned counter after each
+// successful pass (only when n > 0 so idle passes don't tick
+// up — same precedent as AuditEventsDeleted). Nil-safe —
+// single-registry pattern, daemons that don't wire the
+// retention loop (apid) still expose a nil-returning accessor.
+func (m *OpsMetrics) DeploymentAuditGCRowsDeleted() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.deploymentAuditGCRowsDeletedTotal
 }
 
 // AuditEventsRetentionLag returns the gauge of seconds since

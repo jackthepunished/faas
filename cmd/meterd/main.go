@@ -966,6 +966,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// of rows between ticks.
 	go meter.RetentionLoopRequestTelemetry(ctx, poolAdapter{pool}, meter.RequestTelemetryRetentionInterval, log)
 
+	// SAFE-RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit): deployment_audit GC cron.
+	// Without this sweep the deployment_audit table grows
+	// unbounded — disk fill + index bloat over months. 90-day
+	// retention matches the on-call investigation envelope
+	// (operators rarely look past 30 days post-incident); the
+	// sweep is bounded-DELETE + idempotent so a missed tick is
+	// safe. The deploymentAuditGCRowsDeleted counter is Inc'd
+	// after each successful pass so the operator can tell
+	// whether the GC is keeping up.
+	go meter.RetentionLoopDeploymentAudit(ctx, poolAdapter{pool}, mc.DeploymentAuditRetentionInterval, log, func(n int64) {
+		if c := ops.DeploymentAuditGCRowsDeleted(); c != nil {
+			c.Add(float64(n))
+		}
+	})
+
 	// ADR-123 / issue #1233: alert-preset signal-feeding
 	// goroutines. CertExpiryRefresherLoop (meterd-owned, owns the
 	// meterd_tenant_surface_cert_expiry_state table per the
