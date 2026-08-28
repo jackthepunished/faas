@@ -1448,6 +1448,36 @@ type ClearObsoleteReport struct {
 	OlderThan string `json:"older_than"`
 }
 
+// DeploymentAuditResponse is one row of the deployment_audit
+// timeline (issue #976 / ADR-122 / SAFE-RELEASES-E.2 + production
+// leveling Stream A). Mirrors pkg/state.DeploymentAudit but drops
+// the internal DB id (BIGINT) — the wire surface exposes the audit
+// row as a sequence-pointed event keyed by (deployment_id, at).
+// Data is the verbatim jsonb payload at emit time (kind-specific
+// shape — DeployTrafficChanged carries {from_percent, to_percent,
+// actor_kind}, DeployRolledBack carries {target_deployment_id,
+// reason}).
+type DeploymentAuditResponse struct {
+	At        string          `json:"at"`
+	Kind      string          `json:"kind"`
+	Actor     string          `json:"actor"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	AccountID string          `json:"account_id,omitempty"`
+}
+
+// ListDeploymentAuditResponse is the paginated wrapper for
+// `GET /v1/deployments/{id}/audit`. The dashboard uses this to
+// render the per-deployment timeline; programmatic consumers
+// (SDK + `gregale deployments audit <id>`) use the same shape.
+//
+// limit is echoed back so a paging consumer can distinguish
+// "limit was clamped" from "no more rows" — both yield Items of
+// length < limit, but the clamping is observable via this field.
+type ListDeploymentAuditResponse struct {
+	Items []DeploymentAuditResponse `json:"items"`
+	Limit int                       `json:"limit"`
+}
+
 // DeploymentResponse is a deployment as returned by the API.
 type DeploymentResponse struct {
 	ID          string `json:"id"`

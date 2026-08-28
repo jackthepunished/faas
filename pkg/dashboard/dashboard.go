@@ -15,6 +15,7 @@ package dashboard
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -467,6 +468,83 @@ type DeploymentDetailData struct {
 	// cmd/apid/dashboard_retry_deployment.go::dashboardRetryDeployment.
 	// Empty when CanRetry is false.
 	DeploymentRetryCSRF string
+	// DeploymentAudit is the per-deployment audit timeline
+	// (issue #976 / ADR-122 / SAFE-RELEASES-E.2 + production
+	// leveling Stream A). Newest-first; capped at
+	// listDeploymentAuditLimitDefault rows in the handler.
+	// nil/empty → the template renders the empty-state block.
+	// Each row carries a pre-rendered SeverityClass so the
+	// template can pick a CSS palette without re-implementing
+	// the kind→severity mapping.
+	DeploymentAudit []DeploymentAuditRow
+}
+
+// DeploymentAuditRow is the dashboard-local projection of one
+// pkg/state.DeploymentAudit row. The internal id (BIGINT) stays
+// server-side — the dashboard keys the timeline by (at, kind,
+// actor). SeverityClass maps the kind to a CSS palette name
+// (info / warn / high) so the template can branch on a single
+// string instead of re-implementing the kind→severity mapping.
+//
+// DataPretty is the verbatim jsonb payload pretty-printed (or
+// the empty string when the row has no data) — same shape as
+// audit_events.html's DataPretty.
+type DeploymentAuditRow struct {
+	At            time.Time
+	Kind          string
+	Actor         string
+	SeverityClass string
+	DataPretty    string
+}
+
+// DeploymentAuditSeverityClass maps a deployment_audit row's
+// closed-set kind to the dashboard's CSS palette name. The
+// mapping mirrors the wider audit events palette
+// (.high / .warn / .info) so the deployment timeline block
+// reuses the same color chips without a new palette. Exported
+// because the handler's projection edge lives in
+// cmd/apid/handlers_dashboard.go, outside this package.
+//
+// Mapping (issue #976 / ADR-122 / SAFE-RELEASES-E.2 closed set):
+//
+//	high → deploy.rolled_back (customer-affecting state flip)
+//	warn → deploy.traffic_changed / deploy.health_probe_failed
+//	info → everything else (deploy.created / source_ref / etc.)
+func DeploymentAuditSeverityClass(kind string) string {
+	switch kind {
+	case "deploy.rolled_back":
+		return "high"
+	case "deploy.traffic_changed", "deploy.health_probe_failed":
+		return "warn"
+	default:
+		return "info"
+	}
+}
+
+// PrettyAuditData renders the verbatim jsonb payload of a
+// deployment_audit row for the dashboard timeline block. Kept as
+// an exported free function (not a method on DeploymentAuditRow)
+// so the handler's projection edge stays the single source of
+// truth for the data-pretty render — same pattern as
+// audit_events.html's DataPretty field (cmd/apid/audit_receiver.go
+// project side). Returns the empty string when the payload is
+// nil/empty so the template renders the "—" muted placeholder.
+//
+// Pretty-printing uses encoding/json.Indent; the cost is bounded
+// by listDeploymentAuditLimitDefault rows × jsonb size, which is
+// trivial at the dashboard's 50-row cap.
+func PrettyAuditData(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		// Unparseable jsonb — fall through to the verbatim
+		// string so the operator sees something instead of
+		// a missing column.
+		return string(raw)
+	}
+	return buf.String()
 }
 
 // DeploymentPreviewURL is the dashboard-local mirror of
