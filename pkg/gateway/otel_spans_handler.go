@@ -61,6 +61,20 @@ type OTelSpansHandlerConfig struct {
 	// the apid PR-B IncrementRequestTelemetry receiver (same
 	// pkg/ratelimit/peraccount instance in production).
 	// Required.
+	//
+	// Known limitation (PR-D code-review #3): the gateway runs
+	// in a separate process from apid, so the gateway's limiter
+	// is in-process memory and cannot share buckets with the
+	// apid-side limiter. The customer's effective cap is
+	// therefore 2x the plan's DebugTelemetryRequestsPerMinute:
+	// once on the gateway's pre-flight gate, once on apid's
+	// writer. The bucket cap is frozen on first Take (PR-D
+	// code-review #2), so this 2x ceiling is stable across the
+	// customer's session — not oscillating with caller order.
+	// A PR-D.1 follow-on folds the rate-limit decision into
+	// the apid AuthenticateKey RPC so the gateway stops holding
+	// a local bucket; PR-D ships with the documented 2x
+	// ceiling as a known acceptable trade-off for v1.0.
 	Limiter *peraccount.Limiter
 	// Acc is the per-trace coalesce buffer. Required.
 	Acc *SpansAccumulator

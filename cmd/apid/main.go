@@ -1714,8 +1714,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// Defaults to enabled when the env var is unset; set
 		// FAAS_REQUEST_TELEMETRY_ENABLED=false to disable both the
 		// writer (apid gRPC) and the gateway-side recorder.
+		//
+		// ADR-127 PR-D code-review #3: sharedLimiter is the
+		// per-account token-bucket pool shared with
+		// runSpansWriterServer below. One *peraccount.Limiter
+		// instance covers both the PR-B IncrementRequestTelemetry
+		// and PR-D WriteSpansSummary paths so a customer's
+		// DebugTelemetryRequestsPerMinute cap is enforced
+		// against a single bucket pool, not two independent
+		// ones (the prior wiring constructed NewLimiter()
+		// inside each helper, giving the customer 2x their
+		// plan cap). The bucket cap is frozen on first Take
+		// (PR-D code-review #2) so whichever path runs first
+		// for an account sets the bucket size; subsequent
+		// calls match.
+		sharedLimiter := peraccount.NewLimiter()
 		if deps.getenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false" {
-			rtSrv, rtLis, err := runRequestTelemetryServer(ctx, srv.store, srv.ops, log)
+			rtSrv, rtLis, err := runRequestTelemetryServer(ctx, srv.store, srv.ops, log, sharedLimiter)
 			if err != nil {
 				_ = l.Close()
 				return fmt.Errorf("apid: request telemetry server: %w", err)
@@ -1759,7 +1774,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// OTel writer's write path (the auth + handler can
 		// still run; they just stop landing writes).
 		if deps.getenv("FAAS_OTEL_SPANS_WRITER_ENABLED") != "false" {
-			swSrv, swLis, err := runSpansWriterServer(ctx, srv.store, srv.ops, log)
+			swSrv, swLis, err := runSpansWriterServer(ctx, srv.store, srv.ops, log, sharedLimiter)
 			if err != nil {
 				_ = l.Close()
 				return fmt.Errorf("apid: otel spans writer server: %w", err)
@@ -2298,14 +2313,14 @@ func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, 
 // here are non-fatal: the caller logs and continues without the
 // request_telemetry gRPC server (the apid HTTP listener still
 // serves).
-func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger, limiter *peraccount.Limiter) (*grpc.Server, net.Listener, error) {
 	const sock = "/run/faas/request_telemetry.sock"
 	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
 	if err != nil {
 		return nil, nil, fmt.Errorf("request telemetry listen: %w", err)
 	}
 	srv := grpc.NewServer()
-	registerRequestTelemetryReceiver(srv, store, ops, peraccount.NewLimiter(), true)
+	registerRequestTelemetryReceiver(srv, store, ops, limiter, true)
 	return srv, lis, nil
 }
 
@@ -2322,14 +2337,14 @@ func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire
 // without the spans_writer gRPC server (the apid HTTP listener
 // still serves; the gateway's OTel flush loop drops the entry
 // at the next tick).
-func runSpansWriterServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+func runSpansWriterServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger, limiter *peraccount.Limiter) (*grpc.Server, net.Listener, error) {
 	const sock = "/run/faas/otel_spans_writer.sock"
 	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
 	if err != nil {
 		return nil, nil, fmt.Errorf("otel spans writer listen: %w", err)
 	}
 	srv := grpc.NewServer()
-	registerSpansWriterReceiver(srv, store, ops, peraccount.NewLimiter(), true)
+	registerSpansWriterReceiver(srv, store, ops, limiter, true)
 	return srv, lis, nil
 }
 
