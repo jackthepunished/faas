@@ -136,6 +136,29 @@ plane's `gatewayd-public` uses `compute_nodes.gateway_target_url` with database
 discovery and keeps its API route on `127.0.0.1:8081`; adding or draining a
 compute node therefore does not require changing a static first-node target.
 
+### Bootstrap the deployment runner
+
+The provider-neutral GitHub Actions `cd-compute` workflow runs on a trusted
+repository-scoped runner labelled `faas-fleet`. Bootstrap it once on the
+control-plane host, or target a dedicated management host through a
+`fleet_runners` inventory group:
+
+```sh
+make ANSIBLE_INVENTORY=deploy/ansible/inventory/hosts.ini bootstrap-fleet-runner
+```
+
+The Make target obtains a short-lived repository registration token through an
+authenticated `gh` installation when `FAAS_RUNNER_REGISTRATION_TOKEN` is not
+already set. It passes that token to Ansible through the controller
+environment only.
+
+The role pins and verifies the upstream runner archive, installs its native
+dependencies, registers the `faas-fleet` label, and starts an idempotent
+systemd service under a non-root account. The token is read only from the
+controller environment; it is never stored in inventory or source control.
+The workflow's hosted preflight then checks the runner and required production
+secrets before a deployment job is allowed to queue.
+
 The fast-root contract is provider-neutral. Set
 `fleet.hosts[].storage_device` to an absolute stable device path such as a
 provider's `/dev/disk/by-id/...` name, or pass `--storage-device` to

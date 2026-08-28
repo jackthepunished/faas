@@ -1,0 +1,20 @@
+# Bootstrap the trusted runner used by provider-neutral cd-compute.
+#
+# The default target is the control-plane group because the control plane has
+# private fleet/database reachability. A dedicated management host can use a
+# separate inventory group with:
+#
+#   -e faas_runner_hosts=fleet_runners
+#
+# FAAS_RUNNER_REGISTRATION_TOKEN is read from the controller environment and
+# is never written to inventory, logs, or the repository.
+
+- name: Bootstrap the Gregale deployment runner
+  hosts: "{{ faas_runner_hosts | default('control_plane') }}"
+  gather_facts: true
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  roles:
+    - role: github_actions_runner

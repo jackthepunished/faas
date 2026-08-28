@@ -1,0 +1,22 @@
+# github_actions_runner — provider-neutral trusted deployment runner.
+#
+# The runner is intentionally pinned like every other downloaded production
+# binary. The registration token is short-lived and is read from the
+# controller's environment; it must never be committed or put in inventory.
+
+faas_runner_repo: "poyrazK/faas"
+faas_runner_version: "2.337.0"
+faas_runner_sha256: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+faas_runner_download_url: "https://github.com/actions/runner/releases/download/v{{ faas_runner_version }}/actions-runner-linux-x64-{{ faas_runner_version }}.tar.gz"
+
+faas_runner_user: faas-runner
+faas_runner_group: faas-runner
+faas_runner_home: /var/lib/faas-runner
+faas_runner_root: /opt/actions-runner
+faas_runner_cache: /var/cache/faas-runner
+faas_runner_workdir: _work
+faas_runner_name: "{{ inventory_hostname }}"
+faas_runner_labels:
+  - faas-fleet
+faas_runner_service: faas-github-runner
+faas_runner_registration_token: "{{ lookup('ansible.builtin.env', 'FAAS_RUNNER_REGISTRATION_TOKEN') }}"

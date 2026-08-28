@@ -96,8 +96,18 @@ host is a valid runner when it is dedicated to deployment work. A GitHub-hosted
 runner is not sufficient because it cannot reach the private control-plane
 database and mesh.
 
-The runner image must provide `gh`, `jq`, GNU `tar`/`base64`/`sha256sum`, and
-`ansible-playbook`; the workflow installs its pinned Go-based `cosign` verifier.
+Bootstrap the runner once with `deploy/ansible/fleet_runner.yml` or the
+`bootstrap-fleet-runner` Make target. The role pins the runner archive, creates
+its non-root system account, installs the runner's native dependencies, and
+starts the `faas-github-runner.service` systemd unit. The workflow needs
+`curl`, `jq`, GNU `tar`/`base64`/`sha256sum`, and `ansible-playbook`; it installs
+its pinned Go-based `cosign` verifier itself.
+
+The workflow first runs a GitHub-hosted preflight. It validates the requested
+node inputs, checks the required production secrets without printing their
+values, and confirms that an online runner carries the `faas-fleet` label.
+This turns a missing runner or missing secret into an immediate actionable
+failure instead of leaving the deployment queued indefinitely.
 
 Configure these secrets on the `production` environment. The workflow stages
 them only in its short-lived runner workspace and never prints their values:
