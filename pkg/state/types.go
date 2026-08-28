@@ -337,6 +337,40 @@ const (
 // callers fail fast at the API boundary instead of surfacing a
 // Postgres 23514 at runtime. (kept as comment-only; declarations live earlier in this file from the ADR-124 cherry-pick)
 
+// CancelReason is the typed enum that callers pass to
+// Store.MarkDeploymentCancelled / Store.CancelDeploymentTx.
+// Reasons are checked at the schema layer by the
+// deployments_cancel_reason_check constraint (migration 00360).
+type CancelReason string
+
+const (
+	// CancelReasonUser is a customer-initiated cancel via
+	// `gregale deploys cancel <id>` or the apid DELETE handler.
+	CancelReasonUser CancelReason = "user"
+	// CancelReasonAutoQuota is a meterd-driven cancel because the
+	// account crossed its plan's monthly GB-hours budget.
+	CancelReasonAutoQuota CancelReason = "auto_quota"
+	// CancelReasonAutoHealth is imaged / schedd cancelling a stuck
+	// deployment after the metal-acceptance stuck_running timeout
+	// (spec §14 V6).
+	CancelReasonAutoHealth CancelReason = "auto_health"
+	// CancelReasonSystem is everything else (operator manual
+	// cancel, dry-run rollback, internal tools).
+	CancelReasonSystem CancelReason = "system"
+)
+
+// IsValid returns true if r matches one of the four closed-set
+// values. Mirrors ParkReason.IsValid; the SQL CHECK is the
+// authoritative gate, this exists so callers fail fast at the API
+// boundary instead of bouncing off a SQLSTATE 23514 round-trip.
+func (r CancelReason) IsValid() bool {
+	switch r {
+	case CancelReasonUser, CancelReasonAutoQuota, CancelReasonAutoHealth, CancelReasonSystem:
+		return true
+	}
+	return false
+}
+
 // Account is a customer account.
 type Account struct {
 	ID     string
