@@ -75,7 +75,6 @@ export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.j
 export type { BuildResponse } from './models/BuildResponse.js';
 export type { CanaryPresetSpec } from './models/CanaryPresetSpec.js';
 export type { CancelDeploymentRequest } from './models/CancelDeploymentRequest.js';
-export type { CanaryStage } from './models/CanaryStage.js';
 export type { ChangeMemberRoleRequest } from './models/ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './models/ChangePlanRequest.js';
 export type { ClearObsoleteReport } from './models/ClearObsoleteReport.js';

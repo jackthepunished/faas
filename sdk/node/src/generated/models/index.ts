@@ -70,7 +70,6 @@ export type { BuildResponse } from './BuildResponse.js';
 export type { CSRFTokenResponse } from './CSRFTokenResponse.js';
 export type { CanaryPresetSpec } from './CanaryPresetSpec.js';
 export type { CancelDeploymentRequest } from './CancelDeploymentRequest.js';
-export type { CanaryStage } from './CanaryStage.js';
 export type { ChangeMemberRoleRequest } from './ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
 export type { ClearObsoleteReport } from './ClearObsoleteReport.js';
