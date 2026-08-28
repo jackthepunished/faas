@@ -74,6 +74,10 @@ func UnitGatewaydInternal() daemonunit.Unit {
 
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_GATEWAY_LISTEN", Value: "off"},
+			{Key: "FAAS_LOG_ARCHIVE_CREDS_PATH", Value: "%d/faas_archive_creds"},
+		},
+		LoadCredential: []daemonunit.LoadCred{
+			{Name: "faas_archive_creds", Path: "/etc/faas/secrets/storage-box/archive-creds.json", Optional: true},
 		},
 
 		NoNewPrivileges:         true,

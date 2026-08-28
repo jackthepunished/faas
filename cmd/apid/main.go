@@ -16,7 +16,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -141,57 +140,6 @@ func dataPlacementEnabledFromEnv(getenv func(string) string) bool {
 		}
 	}
 	return false
-}
-
-// firstNonEmpty returns the first non-empty string among the
-// args. Used by the log archive wire-up so an explicit env
-// var (FAAS_LOG_ARCHIVE_*) wins over a value in the sealed
-// archive-creds.json envelope — operators expect the env to
-// override defaults, never the other way around.
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// archiveCreds is the on-disk shape of the unsealed
-// archive-creds.json envelope (issue #562). The envelope is
-// sealed by an external operator with host.age (or the
-// per-deploy box-age-key — same shape as the rclone.conf
-// envelope, see cmd/gregale/commands_backup.go::defaultBoxAgeKey)
-// and mounted at /etc/faas/secrets/storage-box/archive-creds.json
-// via systemd LoadCredential= (deploy/ansible role).
-//
-// The file is JSON for parse simplicity — no envelope decoder
-// in the hot path, the apid boot reads it once. Fields are
-// optional so the operator can stage an incomplete envelope
-// while waiting on the bucket/region/endpoint values from
-// the S3 vendor.
-type archiveCreds struct {
-	Endpoint string `json:"endpoint,omitempty"`
-	Region   string `json:"region,omitempty"`
-	KeyID    string `json:"key_id,omitempty"`
-	Secret   string `json:"secret,omitempty"`
-}
-
-// readArchiveCreds parses the unsealed archive-creds.json
-// envelope from path. The file is read once at boot — the
-// shipper doesn't watch for rotation. A future PR can add a
-// SIGHUP-driven reload if a credential rotation breaks the
-// running daemon.
-func readArchiveCreds(path string) (archiveCreds, error) {
-	var c archiveCreds
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return c, err
-	}
-	if err := json.Unmarshal(data, &c); err != nil {
-		return c, fmt.Errorf("logarchive: parse %s: %w", path, err)
-	}
-	return c, nil
 }
 
 // resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test seam
@@ -693,46 +641,48 @@ func run(ctx context.Context, log *slog.Logger) error {
 		//
 		// Credentials are read from the archive-creds.json envelope
 		// unsealed by `gregale backup unseal-archive-creds` and
-		// mounted at /etc/faas/secrets/storage-box/archive-creds.json
-		// via systemd LoadCredential= (deploy/ansible role sets this
-		// up). On a host that hasn't been unsealed yet the file is
-		// missing and the shipper fails closed on ErrAuthMissing.
-		// Future PR-C will add the unseal CLI leaf + the ansible
-		// wiring.
+		// mounted at the systemd credential path. On a host that
+		// hasn't been unsealed yet the optional credential is absent
+		// and the shipper remains disabled.
 		shipCfg, shipErr := logarchive.ConfigFromEnv(os.Getenv, log)
+		if shipErr == nil {
+			archiveCredsPath := envOr(logarchive.EnvCredentialsPath, logarchive.DefaultCredentialsPath)
+			if creds, err := logarchive.ReadCredentials(archiveCredsPath); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					log.Warn("logarchive.creds_unavailable", "path", archiveCredsPath, "err", err)
+				}
+			} else {
+				shipCfg = shipCfg.WithCredentials(creds)
+			}
+		}
 		switch {
 		case shipErr != nil:
 			log.Warn("logarchive.config_failed", "err", shipErr)
 		case !shipCfg.Enabled():
 			log.Info("logarchive.disabled", "reason", "FAAS_LOG_ARCHIVE_BUCKET unset")
 		default:
-			archiveCredsPath := "/etc/faas/secrets/storage-box/archive-creds.json"
-			if creds, err := readArchiveCreds(archiveCredsPath); err != nil {
-				log.Warn("logarchive.creds_unavailable", "path", archiveCredsPath, "err", err)
+			s3, err := logarchive.NewS3Client(
+				shipCfg.Endpoint,
+				shipCfg.Region,
+				shipCfg.Bucket,
+				shipCfg.KeyID,
+				shipCfg.Secret,
+			)
+			if err != nil {
+				log.Warn("logarchive.s3client_init_failed", "err", err)
 			} else {
-				s3, err := logarchive.NewS3Client(
-					firstNonEmpty(shipCfg.Endpoint, creds.Endpoint),
-					firstNonEmpty(shipCfg.Region, creds.Region),
-					shipCfg.Bucket,
-					firstNonEmpty(shipCfg.KeyID, creds.KeyID),
-					firstNonEmpty(shipCfg.Secret, creds.Secret),
-				)
+				spool := logarchive.NewSpool(shipCfg.SpoolRoot, shipCfg.LocalBytesMax)
+				shipMetrics := logarchive.NewMetrics(srv.ops.Registry())
+				sh, err := logarchive.NewShipper(shipCfg, spool, s3, log, shipMetrics)
 				if err != nil {
-					log.Warn("logarchive.s3client_init_failed", "err", err)
+					log.Warn("logarchive.shipper_init_failed", "err", err)
 				} else {
-					spool := logarchive.NewSpool(shipCfg.SpoolRoot, shipCfg.LocalBytesMax)
-					shipMetrics := logarchive.NewMetrics(srv.ops.Registry())
-					sh, err := logarchive.NewShipper(shipCfg, spool, s3, log, shipMetrics)
-					if err != nil {
-						log.Warn("logarchive.shipper_init_failed", "err", err)
-					} else {
-						go func() {
-							if err := sh.Run(ctx); err != nil && ctx.Err() == nil {
-								log.Warn("logarchive.run_returned_error", "err", err)
-							}
-							_ = sh.Spool().CloseAll()
-						}()
-					}
+					go func() {
+						if err := sh.Run(ctx); err != nil && ctx.Err() == nil {
+							log.Warn("logarchive.run_returned_error", "err", err)
+						}
+						_ = sh.Spool().CloseAll()
+					}()
 				}
 			}
 		}

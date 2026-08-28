@@ -59,12 +59,30 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 		return fmt.Errorf("deploycontroller: verify release %q: %w", releaseID, err)
 	}
 
-	previous, err := os.Readlink(c.config.CurrentPath)
+	previous, err := readCurrentTarget(c.config.CurrentPath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("deploycontroller: read current release: %w", err)
 	}
 	if previous == releaseRoot {
 		return errors.New("deploycontroller: release is already active")
+	}
+	// Never replace a usable release when the current pointer names a
+	// directory that cannot be verified for rollback. A dangling legacy
+	// pointer is tolerated for first installation; an existing but incomplete
+	// release is a hard preflight error so activation cannot leave the host
+	// without a safe recovery target.
+	if previous != "" {
+		if _, statErr := os.Stat(previous); statErr == nil {
+			previousManifest, readErr := releasebundle.Read(previous)
+			if readErr != nil {
+				return fmt.Errorf("deploycontroller: current release is not rollback-capable: %w", readErr)
+			}
+			if verifyErr := releasebundle.Verify(previous, previousManifest); verifyErr != nil {
+				return fmt.Errorf("deploycontroller: current release is not rollback-capable: %w", verifyErr)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("deploycontroller: stat current release: %w", statErr)
+		}
 	}
 
 	if err := c.runtime.Preflight(ctx, manifest, releaseRoot); err != nil {
@@ -86,6 +104,22 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 		return c.rollback(ctx, releaseID, previous, err)
 	}
 	return nil
+}
+
+// readCurrentTarget normalizes a relative current symlink against the
+// symlink's directory. Older installers published `current -> releases/<id>`
+// while the controller now writes an absolute target; without this
+// normalization rollback tries to read `releases/<id>/manifest.json` from
+// the process working directory instead of `/opt/faas/releases/<id>`.
+func readCurrentTarget(path string) (string, error) {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	return filepath.Clean(target), nil
 }
 
 func (c *Controller) rollback(ctx context.Context, releaseID, previous string, cause error) error {

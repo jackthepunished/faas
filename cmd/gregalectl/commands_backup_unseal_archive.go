@@ -21,11 +21,9 @@
 // (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
 // `gregalectl secrets init`).
 //
-// The wire shape (`{endpoint, region, key_id, secret}`) is
-// read by cmd/apid/main.go::readArchiveCreds (issue #562
-// PR-A). apid boots the log archive shipper from the values
-// there. An empty bucket (FAAS_LOG_ARCHIVE_BUCKET unset) skips
-// the shipper entirely.
+// The wire shape is `logarchive.Credentials`, shared by apid and
+// gatewayd-internal. Bucket may remain in FAAS_LOG_ARCHIVE_BUCKET for
+// backwards compatibility; an empty bucket disables the shipper.
 package main
 
 import (
@@ -39,6 +37,8 @@ import (
 	"path/filepath"
 
 	"filippo.io/age"
+
+	"github.com/onebox-faas/faas/pkg/logarchive"
 )
 
 // Default install paths for the S3 archive credentials envelope
@@ -113,7 +113,7 @@ func cmdBackupUnsealArchiveCreds(args []string) int {
 // swapping the destination mode (0400 root:root — apid reads
 // it via LoadCredential=) and adding a JSON-shape sanity
 // check that fails closed if the decrypted bytes don't parse
-// as the expected {endpoint, region, key_id, secret} shape.
+// as the expected logarchive.Credentials shape.
 //
 // The JSON-shape sanity check is new vs unseal-rclone: a
 // half-decrypted or wrong-key archive-creds.json would
@@ -161,9 +161,7 @@ func unsealArchiveCreds(f *unsealArchiveCredsFlags) error {
 	// JSON-shape sanity check (see cmdBackupUnsealArchiveCreds
 	// comment). A bug here would silently fail the apid boot,
 	// so we surface the parse error at unseal time.
-	var probe struct {
-		KeyID string `json:"key_id"`
-	}
+	var probe logarchive.Credentials
 	if err := json.Unmarshal(plaintext, &probe); err != nil {
 		return fmt.Errorf("plaintext is not a valid archive-creds.json: %w", err)
 	}

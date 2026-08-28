@@ -85,6 +85,42 @@ Overlay-specific credentials remain Ansible inputs. For example, a Tailscale
 fleet supplies its vaulted/authenticated overlay variables with
 `--ansible-vars-file`; a static private network needs no extra overlay secret.
 
+## GitHub Actions automation
+
+The repository includes a manual `cd-compute` workflow for operators who want
+the same join path from GitHub Actions. It runs only on a trusted self-hosted
+Linux runner labelled `faas-fleet`; the runner must resolve the manifest's
+private names, reach PostgreSQL, and SSH to the existing fleet. A control-plane
+host is a valid runner when it is dedicated to deployment work. A GitHub-hosted
+runner is not sufficient because it cannot reach the private control-plane
+database and mesh.
+
+The runner image must provide `gh`, `jq`, GNU `tar`/`base64`/`sha256sum`, and
+`ansible-playbook`; the workflow installs its pinned Go-based `cosign` verifier.
+
+Configure these secrets on the `production` environment. The workflow stages
+them only in its short-lived runner workspace and never prints their values:
+
+| Secret | Contents |
+|---|---|
+| `COMPUTE_SSH_KEY` | private key that reaches the adopted host; the runner's SSH configuration must reach existing fleet peers |
+| `COMPUTE_DATABASE_URL` | PostgreSQL DSN written to the node's root-only `compute-db.env` |
+| `COMPUTE_STORAGE_ENV` | OCI storage contract (`FAAS_STORAGE_BACKEND=oci` and registry) |
+| `COMPUTE_PKI_TARBALL_B64` | base64 of a tar.gz containing `pki/ca/ca.crt` and compute leaves |
+| `COMPUTE_SIGN_KEY` / `COMPUTE_VERIFY_KEY` | image-signing key pair |
+
+`COMPUTE_ANSIBLE_VARS_B64` is optional for provider/overlay variables. The
+backup secrets are also optional while backup initialization is deferred:
+`COMPUTE_BOX_AGE_KEY`, `COMPUTE_RCLONE_ENVELOPE_B64`, and
+`COMPUTE_ARCHIVE_ENVELOPE_B64` supply the same encrypted envelopes accepted by
+the CLI artifact directory.
+
+Dispatch `cd-compute` with a release tag, the manifest node name, and the
+provider SSH address. The address is a connection-only override; the signed
+manifest remains the source of truth for runtime DNS, certificates, and the
+database target. `format_storage` is intentionally explicit and should only be
+enabled for a confirmed blank device.
+
 ## Example
 
 Run a plan first:

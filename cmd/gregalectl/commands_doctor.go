@@ -30,7 +30,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -43,8 +42,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/releasebundle"
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
-	"github.com/onebox-faas/faas/pkg/secretbox"
 )
 
 // doctorFindingsCap caps the number of findings emitted per run.
@@ -927,7 +926,7 @@ func rollupError(findings []doctorFinding) int {
 // secret posture matches the row's stored cert_fingerprint. The
 // check is fs-only at its core (no DB required); the DB is
 // consulted only AFTER the on-disk side passes, to compare the
-// recomputed host.age fingerprint against the stamped value on
+// vmmd TLS leaf fingerprint against the stamped value on
 // compute_nodes.cert_fingerprint.
 //
 // The check runs on every box (no --deep flag) — secrets drift
@@ -1228,8 +1227,8 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 	}{
 		{"host.age", "/etc/faas/secrets/host.age", "0400", doctorSeverityError},
 		{"session.key", "/etc/faas/secrets/session.key", "0400", doctorSeverityWarn},
-		{"box-age-key", storageDir + "/box-age-key", "0440", doctorSeverityWarn},
-		{"rclone.conf", storageDir + "/rclone.conf", "0440", doctorSeverityWarn},
+		{"box-age-key", storageDir + "/box-age-key", "0400", doctorSeverityWarn},
+		{"rclone.conf", storageDir + "/rclone.conf", "0400", doctorSeverityWarn},
 		{"archive-creds.json", storageDir + "/archive-creds.json", "0400", doctorSeverityWarn},
 	}
 	for _, s := range secrets {
@@ -1356,22 +1355,17 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			Detail:   "register the node before running the node-scoped doctor",
 		}), nil
 	}
-	hostAgeID, loadErr := secretbox.LoadHostKey("/etc/faas/secrets/host.age")
-	if loadErr != nil {
-		// Already surfaced above as a "missing host.age"
-		// finding; skip the per-row fingerprint walk because
-		// every row would mismatch. Propagate loadErr so
-		// runCheck's existing error→finding synthesis picks
-		// it up (the missing-file finding is also added
-		// above as a side-channel for the operator).
-		return findings, fmt.Errorf("load host.age: %w", loadErr)
+	_, got, certErr := loadComputeNodeCertificateAttestation()
+	if certErr != nil {
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityError,
+			Target:   deps.nodeFilter,
+			Message:  "vmmd server certificate attestation unavailable",
+			Detail:   certErr.Error(),
+		})
+		return findings, fmt.Errorf("load vmmd server certificate: %w", certErr)
 	}
-	// The DB stores the public host certificate (the age recipient string),
-	// not the private identity file bytes. Hash the same public value that
-	// `secrets init` stamps; hashing host.age's private text made every valid
-	// initialization look drifted.
-	sum := sha256.Sum256([]byte(secretbox.RecipientString(hostAgeID)))
-	got := hex.EncodeToString(sum[:])
 	for _, n := range scoped {
 		if n.CertFingerprint == nil {
 			continue
@@ -1448,8 +1442,8 @@ var (
 	}
 	// A split control-plane does not run imaged/builderd, so the
 	// builder-base probe is not applicable there. Prefer the explicit
-	// role when supplied; otherwise use systemd's read-only unit state
-	// to distinguish a compute-capable box from a control-only box.
+	// role when supplied; otherwise use the active deployment manifest
+	// and only fall back to systemd state for legacy canonical releases.
 	builderBaseRequiredHook = func(ctx context.Context) bool {
 		if role := os.Getenv("FAAS_BOX_ROLE"); role != "" {
 			return role == "compute-only" || role == "single-box"
@@ -1469,6 +1463,41 @@ var (
 		return cmd.CombinedOutput()
 	}
 )
+
+// builderBaseRequired determines whether this host's active deployment owns
+// the compute-side builder base. A controller-managed deployment has an
+// explicit releasebundle manifest whose systemd files are the authoritative
+// role set. This must win over systemctl is-enabled: an older one-box install
+// can leave an opposite-role unit enabled but inactive on a split
+// control-plane, which is residue rather than evidence that the host needs a
+// builder base. Canonical releases without the wrapper retain the legacy
+// systemd fallback for compute-node compatibility.
+func builderBaseRequired(ctx context.Context, deps *doctorDeps) bool {
+	if role := strings.TrimSpace(os.Getenv("FAAS_BOX_ROLE")); role != "" {
+		return role == "compute-only" || role == "single-box"
+	}
+	if deps != nil && deps.releasesRoot != "" && deps.currentGitSHA != "" {
+		root := releaseinstall.BundleRoot(deps.releasesRoot, deps.currentGitSHA)
+		manifestPath := filepath.Join(root, releasebundle.ManifestName)
+		if _, err := os.Stat(manifestPath); err == nil {
+			deployment, readErr := releasebundle.Read(root)
+			if readErr == nil {
+				for _, file := range deployment.Files {
+					switch file.Path {
+					case "systemd/faas-vmmd.service", "systemd/faas-builderd.service", "systemd/faas-imaged.service":
+						return true
+					}
+				}
+				return false
+			}
+			// checkBundle reports a malformed deployment manifest as an
+			// independent error. Do not add a misleading builder-base
+			// error based on stale systemd enablement in that case.
+			return false
+		}
+	}
+	return builderBaseRequiredHook(ctx)
+}
 
 // checkBuilderBaseExt4 verifies the staged builder base ext4 contains
 // /usr/local/bin/faas-guest-init (issue #938 / PR-B / ADR-114).
@@ -1491,14 +1520,13 @@ var (
 // today; the ctx anchor lets future --json=streaming or timeout-
 // bounded wrappers reuse this check without churn).
 func checkBuilderBaseExt4(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
-	_ = deps
 	basePath := locateBuilderBasePathHook()
 	storageRoot := os.Getenv("FAAS_STORAGE_ROOT")
 	if storageRoot == "" {
 		storageRoot = "/srv/fc"
 	}
 	canonicalPath := filepath.Join(storageRoot, "base", "runner-builder-"+runtime.GOARCH+".ext4")
-	if os.Getenv("FAAS_BUILDER_BASE_PATH") == "" && basePath == canonicalPath && !builderBaseRequiredHook(ctx) {
+	if os.Getenv("FAAS_BUILDER_BASE_PATH") == "" && basePath == canonicalPath && !builderBaseRequired(ctx, deps) {
 		return []doctorFinding{{
 			Check:    doctorCheckBuilderBaseExt4,
 			Severity: doctorSeverityOK,

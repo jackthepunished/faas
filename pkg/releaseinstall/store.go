@@ -88,8 +88,8 @@ type Store interface {
 	SetComputeNodeRole(ctx context.Context, name, role string) (bool, error)
 	// StampHostCertificate writes the host_certificate +
 	// cert_fingerprint columns on the row whose name matches. PR-X
-	// secrets init (issue #911 / ADR-110) calls this after writing
-	// the on-disk host.age identity so the doctor's secrets check
+	// secrets init (issue #911 / ADR-110) calls this after reading
+	// the on-disk vmmd mTLS leaf so the doctor's secrets check
 	// (PR-4) can compare the recomputed fingerprint against the
 	// stamped value. Idempotent (UPDATE ... WHERE name = $1).
 	//

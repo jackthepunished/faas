@@ -1,4 +1,4 @@
-# cd-controlplane.yml — deploy FaaS control plane to host on push to main.
+# cd-controlplane.yml — deploy a selected signed release to the control plane.
 #
 # Prerequisites (GitHub repo Settings → Secrets):
 #   CP_SSH_KEY (or DO_SSH_KEY) — ed25519 private key (PR-1: previously generated
@@ -6,11 +6,16 @@
 #                                `gregale secrets init` supersedes that path)
 #   CP_HOST    (or DO_HOST)    — Control Plane host public IPv4
 #
+# The workflow never builds daemon binaries. Select a tag produced by
+# release.yml; the runner downloads and verifies that release's canonical
+# tarball before assembling the host deployment bundle.
+#
 # What it does:
-#   1. Cross-compiles all daemons for linux/amd64
-#   2. SCPs binaries + migrations to the Control Plane host
-#   3. Runs pending DB migrations
-#   4. Restarts all FaaS services
+#   1. Downloads and verifies the signed canonical release for the selected tag
+#   2. Assembles the checked-in systemd/controller files around those binaries
+#   3. SCPs the immutable bundle + migrations to the Control Plane host
+#   4. Runs pending DB migrations
+#   5. Restarts all FaaS services
 #
 # The existing ci.yml must pass first (needs: [test] from ci.yml).
 
@@ -18,9 +23,14 @@ name: cd-controlplane
 
 on:
   workflow_dispatch:  # manual trigger for deliberate deployment
+    inputs:
+      release_tag:
+        description: "Existing pre-1.0 release tag published by release.yml (for example v0.1.18-rc.1)"
+        required: true
+        type: string
 
 concurrency:
-  group: cd-cp-${{ github.ref }}
+  group: cd-cp-${{ inputs.release_tag }}
   # A production deployment must finish or fail visibly; cancelling it
   # midway can leave binaries, migrations, and systemd state out of sync.
   cancel-in-progress: false
@@ -36,6 +46,7 @@ jobs:
     env:
       CP_HOST: ${{ secrets.CP_HOST || secrets.DO_HOST }}
       CP_SSH_KEY: ${{ secrets.CP_SSH_KEY || secrets.DO_SSH_KEY }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
       # Job-level env so the `Verify deployment` step's SSH heredoc
       # inherits the critical/best-effort split (the embedded heredoc
       # already declares these locally inside the `REMOTE` block).
@@ -45,71 +56,73 @@ jobs:
     # If ci.yml doesn't exist yet or the test job name differs, remove this.
     # needs: test
     if: github.repository == 'poyrazK/faas'
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Unit/controller sources must come from the same commit as the
+          # release assets. No daemon source is built in this workflow.
+          ref: ${{ inputs.release_tag }}
 
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Cross-compile for linux/amd64
-        run: |
-          export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
-          make build
-          go build -o bin/migrate ./cmd/migrate
-
-      - name: Generate CycloneDX SBOM
-        # issue #299: emit a CycloneDX 1.5 SBOM covering the Go
-        # binaries the deploy will ship. The artifact is uploaded
-        # as `SBOM.json` and (on tag) attached to the GitHub
-        # release page so customers have a verifiable supply-chain
-        # artifact. Source-version is the merge commit SHA so the
-        # SBOM ties back to the exact git revision on disk.
-        #
-        # SYFT 1.49.0 from the github release tarball — the previous
-        # `go install github.com/anchore/syft/cmd/syft@v1.0.0` step
-        # stopped compiling on Go 1.25 because v1.0.0's go.mod carries
-        # `replace` directives that newer Go rejects ("must not contain
-        # directives that would cause it to be interpreted differently
-        # than if it were the main module"). Same curl+sha256+tar
-        # pattern as the vacuum binary download — see memory
-        # `ci-vacuum-binary-download.md`.
-        #
-        # Source type is implicit from the `dir:` scheme; syft 1.x dropped
-        # the explicit `--source-type directory` flag. Carrying it forward
-        # fails the job with "unknown flag: --source-type" — pinned here
-        # so a future syft bump doesn't reintroduce the trap.
-        env:
-          SYFT_VERSION: "1.49.0"
-          SYFT_SHA256: "7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe"
+      - name: Install pinned cosign verifier
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/syft.tar.gz \
-            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
-          echo "${SYFT_SHA256}  /tmp/syft.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/syft.tar.gz -C /tmp syft
-          install -m 0755 /tmp/syft /usr/local/bin/syft
-          syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "${{ github.sha }}"
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          GOBIN="$RUNNER_TEMP/release-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
 
-      - name: Upload SBOM.json artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SBOM.json
-          path: bin/sbom.json
-
-      - name: Attach SBOM to release
-        if: startsWith(github.ref, 'refs/tags/')
-        # Pinned to the commit v2 currently resolves to (release 2.6.2,
-        # 2026-04-12). Dependabot bumps this SHA weekly — see
-        # .github/dependabot.yml github-actions ecosystem. SHA-pinning
-        # is required to clear CodeQL actions/unpinned-tag (CWE-829)
-        # and matches the supply-chain posture in §11.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: bin/sbom.json
+      - name: Download and verify canonical release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CANONICAL_ROOT="$RUNNER_TEMP/gregale-canonical"
+          mkdir -p "$CANONICAL_ROOT"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern release.tar.gz \
+            --pattern release.cosign.bundle \
+            --pattern release.sbom.json \
+            --pattern release-manifest.json \
+            --pattern production-manifest.yaml \
+            --pattern SHA256SUMS \
+            --dir "$CANONICAL_ROOT"
+          (
+            cd "$CANONICAL_ROOT"
+            sha256sum -c SHA256SUMS
+          )
+          cosign verify-blob \
+            --bundle "$CANONICAL_ROOT/release.cosign.bundle" \
+            --certificate-identity "https://github.com/poyrazK/faas/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$CANONICAL_ROOT/release.tar.gz"
+          mkdir -p "$CANONICAL_ROOT/unpacked"
+          tar -xzf "$CANONICAL_ROOT/release.tar.gz" -C "$CANONICAL_ROOT/unpacked"
+          cmp "$CANONICAL_ROOT/unpacked/release-manifest.json" "$CANONICAL_ROOT/release-manifest.json"
+          RELEASE_ID="$(jq -er '.git_sha' "$CANONICAL_ROOT/release-manifest.json")"
+          RELEASE_MANIFEST_HASH="$(jq -er '.manifest_hash' "$CANONICAL_ROOT/release-manifest.json")"
+          ACTUAL_MANIFEST_HASH="sha256:$(sha256sum "$CANONICAL_ROOT/production-manifest.yaml" | awk '{print $1}')"
+          [[ "$RELEASE_MANIFEST_HASH" == "$ACTUAL_MANIFEST_HASH" ]] || {
+            echo "production manifest hash=$ACTUAL_MANIFEST_HASH does not match release manifest=$RELEASE_MANIFEST_HASH" >&2
+            exit 1
+          }
+          TAG_COMMIT="$(git rev-list -n1 "$RELEASE_TAG")"
+          [[ "$RELEASE_ID" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release manifest has invalid git_sha=$RELEASE_ID" >&2
+            exit 1
+          }
+          [[ "$RELEASE_ID" == "$TAG_COMMIT" ]] || {
+            echo "release manifest git_sha=$RELEASE_ID does not match tag commit=$TAG_COMMIT" >&2
+            exit 1
+          }
+          echo "CANONICAL_ROOT=$CANONICAL_ROOT" >> "$GITHUB_ENV"
+          echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
 
       - name: Set up SSH
         run: |
@@ -122,17 +135,25 @@ jobs:
       - name: Build immutable release bundle
         run: |
           set -euo pipefail
-          RELEASE_ID="${GITHUB_SHA}"
           BUNDLE_ROOT="${RUNNER_TEMP}/faas-release/${RELEASE_ID}"
           mkdir -p "${BUNDLE_ROOT}/bin" "${BUNDLE_ROOT}/systemd" "${BUNDLE_ROOT}/tmpfiles.d"
-          # PR-6.5: gregale (customer CLI) and gregalectl (operator
-          # CLI) both ship in the release bundle. gregalectl carries
-          # manifest/release/host-age/pki/sign-keys/node-key/backup
-          # so operators don't need customer-side auth to install.
-          for bin in apid schedd gatewayd-public gatewayd-internal imaged meterd githubd vmmd vmmd-raw-bridge vmmd-stream-bridge gregale gregalectl migrate; do
-            install -m 0755 "bin/${bin}" "${BUNDLE_ROOT}/bin/${bin}"
+          # The daemon and guest-runner bytes come only from the verified
+          # release.tar.gz. The two controller-local tools are compiled on
+          # the CI runner from the checked-out release tag; the production
+          # host never invokes a Go compiler.
+          cp -a "${CANONICAL_ROOT}/unpacked/." "${BUNDLE_ROOT}/bin/"
+          install -m 0644 "${CANONICAL_ROOT}/unpacked/release-manifest.json" \
+            "${BUNDLE_ROOT}/release-manifest.json"
+          rm -f "${BUNDLE_ROOT}/bin/release-manifest.json"
+          for asset in release.tar.gz release.cosign.bundle release.sbom.json production-manifest.yaml SHA256SUMS; do
+            install -m 0644 "${CANONICAL_ROOT}/${asset}" "${BUNDLE_ROOT}/${asset}"
           done
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "${BUNDLE_ROOT}/bin/deployctl" ./cmd/deployctl
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/onebox-faas/faas/pkg/wire.Version=${RELEASE_TAG}" \
+            -o "${BUNDLE_ROOT}/bin/deployctl" ./cmd/deployctl
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/onebox-faas/faas/pkg/wire.Version=${RELEASE_TAG}" \
+            -o "${BUNDLE_ROOT}/bin/migrate" ./cmd/migrate
           # PR-1: the systemd units + slice + tmpfiles.d are read from the v2
           # ansible role files/ tree (the canonical source for both the
           # ansible-managed boxes and this controller-managed CD path). The
@@ -141,19 +162,22 @@ jobs:
           # a tombstone now. The v2 tree is the single source of truth for
           # every unit — the daemonunitspec.Registry (pkg/daemonunitspec) is
           # the audit target.
+          # This workflow targets the control-plane role. Compute-only
+          # units (vmmd, gatewayd-internal, builderd, imaged) are deployed
+          # by the node-join/Ansible path on compute hosts; shipping them in
+          # this bundle makes deployctl try to enable masked units on the CP
+          # host and reintroduces the split-role failure mode.
           for unit in \
             faas-apid.service \
             faas-cp.slice \
-            faas-gatewayd-internal.service \
             faas-gatewayd-public.service \
             faas-githubd.service \
-            faas-imaged.service \
             faas-meterd.service \
-            faas-schedd.service \
-            faas-vmmd.service; do
-            # Look up the unit in any role files/ tree. The role-ownership
-            # is the v2 partition: gatewayd-internal/public sit in their
-            # own roles (ADR-070); the rest follow pkg/daemonunitspec.
+            faas-schedd.service; do
+            # Look up the unit in the v2 role files/ trees. The role
+            # ownership is the source of truth for the CP subset; deployctl
+            # independently derives its activation/restart set from the
+            # files actually present in this bundle.
             src=""
             for role_dir in \
               deploy/ansible/roles/control_plane_service/files \
@@ -179,9 +203,8 @@ jobs:
           test ! -e "${BUNDLE_ROOT}/systemd/faas-gatewayd.service"
           install -m 0644 deploy/ansible/roles/control_plane_service/files/faas.conf \
             "${BUNDLE_ROOT}/tmpfiles.d/faas.conf"
-          go run ./cmd/deployctl bundle-create "${BUNDLE_ROOT}" "${RELEASE_ID}" "${GITHUB_SHA}" "linux/amd64"
+          "${BUNDLE_ROOT}/bin/deployctl" bundle-create "${BUNDLE_ROOT}" "${RELEASE_ID}" "${RELEASE_ID}" "linux/amd64"
           echo "BUNDLE_ROOT=${BUNDLE_ROOT}" >> "${GITHUB_ENV}"
-          echo "RELEASE_ID=${RELEASE_ID}" >> "${GITHUB_ENV}"
 
       # The controller (deployctl) ships and verifies the release, but
       # imaged's base-stage scanner (grype) + SBOM tool (syft) are host

@@ -158,6 +158,171 @@ func TestDefaultHostRuntimeUsesRestartOrder(t *testing.T) {
 	}
 }
 
+func TestServicesInUnitDirScopesToBundledRole(t *testing.T) {
+	dir := t.TempDir()
+	for _, service := range []string{
+		"apid", "schedd", "gatewayd-public", "meterd", "githubd",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "faas-"+service+".service"), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "faas-cp.slice"), []byte("[Slice]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := servicesInUnitDir(dir)
+	if err != nil {
+		t.Fatalf("servicesInUnitDir: %v", err)
+	}
+	want := []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("servicesInUnitDir = %v, want %v", got, want)
+	}
+}
+
+func TestServicesInUnitDirRejectsUnknownDaemon(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "faas-not-a-daemon.service"), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := servicesInUnitDir(dir); err == nil {
+		t.Fatal("servicesInUnitDir accepted an unknown daemon unit")
+	}
+}
+
+func TestReconcileServiceTopologyRemovesOppositeRoleResidue(t *testing.T) {
+	unitDir := t.TempDir()
+	for _, name := range []string{"faas-vmmd.service", "faas-gatewayd.service"} {
+		if err := os.WriteFile(filepath.Join(unitDir, name), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(unitDir, "faas-builderd.service")); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := runCommand
+	t.Cleanup(func() { runCommand = orig })
+	var calls [][]string
+	runCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+
+	r := hostRuntime{unitDir: unitDir}
+	if err := r.reconcileServiceTopology(context.Background(), []string{"apid"}); err != nil {
+		t.Fatalf("reconcileServiceTopology: %v", err)
+	}
+
+	hasCall := func(want ...string) bool {
+		for _, call := range calls {
+			if reflect.DeepEqual(call, want) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCall("systemctl", "disable", "--now", "faas-vmmd.service") {
+		t.Errorf("missing disable for stale vmmd: %v", calls)
+	}
+	if hasCall("systemctl", "disable", "--now", "faas-builderd.service") {
+		t.Errorf("already-masked builderd was sent through disable --now: %v", calls)
+	}
+	for _, service := range []string{"vmmd", "gatewayd"} {
+		if _, err := os.Lstat(filepath.Join(unitDir, "faas-"+service+".service")); !os.IsNotExist(err) {
+			t.Errorf("stale %s unit still exists, err=%v", service, err)
+		}
+	}
+	if target, err := os.Readlink(filepath.Join(unitDir, "faas-builderd.service")); err != nil || target != "/dev/null" {
+		t.Errorf("existing builderd mask was removed or changed, target=%q err=%v", target, err)
+	}
+	for _, service := range []string{"vmmd", "builderd", "gatewayd", "spool-sync"} {
+		if !hasCall("systemctl", "mask", "--force", "faas-"+service+".service") {
+			t.Errorf("missing mask for omitted %s: %v", service, calls)
+		}
+	}
+}
+
+func TestRestartServicesFiltersRegistryByManifest(t *testing.T) {
+	order, err := daemonunitspec.RestartOrder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := releasebundle.Manifest{}
+	for _, service := range []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"} {
+		manifest.Files = append(manifest.Files, releasebundle.File{Path: "systemd/faas-" + service + ".service"})
+	}
+	r := hostRuntime{serviceOrder: order}
+	got, err := r.restartServices(manifest)
+	if err != nil {
+		t.Fatalf("restartServices: %v", err)
+	}
+	want := []string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restartServices = %v, want %v", got, want)
+	}
+}
+
+func TestHealthAddressFollowsBundledRole(t *testing.T) {
+	manifest := releasebundle.Manifest{}
+	manifest.Files = []releasebundle.File{{Path: "systemd/faas-gatewayd-public.service"}}
+	got, err := healthAddressForManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:9092/healthz" {
+		t.Fatalf("control-plane health address = %q, want public control listener", got)
+	}
+
+	manifest.Files = []releasebundle.File{{Path: "systemd/faas-gatewayd-internal.service"}}
+	got, err = healthAddressForManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:9090/healthz" {
+		t.Fatalf("compute health address = %q, want internal control listener", got)
+	}
+}
+
+func TestReadinessProbeFromConfigUsesSplitTCPListener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schedd.toml")
+	if err := os.WriteFile(path, []byte("socket_path = \"/run/faas/schedd.sock\"\nlisten_addr = \"tcp://0.0.0.0:9091\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, target, err := readinessProbeFromConfig(path, daemonunitspec.ProbeUnix, "/run/faas/schedd.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeTCP || target != "127.0.0.1:9091" {
+		t.Fatalf("probe = %q %q, want tcp 127.0.0.1:9091", probe, target)
+	}
+}
+
+func TestReadinessProbeFromConfigUsesLegacyUnixFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schedd.toml")
+	if err := os.WriteFile(path, []byte("socket_path = \"/run/faas/custom-schedd.sock\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, target, err := readinessProbeFromConfig(path, daemonunitspec.ProbeUnix, "/run/faas/schedd.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeUnix || target != "/run/faas/custom-schedd.sock" {
+		t.Fatalf("probe = %q %q, want unix /run/faas/custom-schedd.sock", probe, target)
+	}
+}
+
+func TestReadinessProbeForListenTargetAcceptsBareTCP(t *testing.T) {
+	probe, target, err := readinessProbeForListenTarget("0.0.0.0:50051")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe != daemonunitspec.ProbeTCP || target != "127.0.0.1:50051" {
+		t.Fatalf("probe = %q %q, want tcp 127.0.0.1:50051", probe, target)
+	}
+}
+
 // TestHostRestartIteratesServiceOrderInOrder asserts that Restart()
 // walks serviceOrder forward without re-sorting. This guards against
 // a future refactor that adds a hidden toposort inside Restart —

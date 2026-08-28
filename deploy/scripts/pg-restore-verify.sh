@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # pg-restore-verify.sh — T-7 throwaway restore + row-count assertions
-# for issue #250 (off-host Postgres backup to Hetzner Storage Box).
+# for issue #250 (provider-neutral off-host Postgres backup).
 #
 # Spec §14 M8 acceptance row M8 already ships the local-disk restore
 # drill (deploy/scripts/faas-m8-restore-drill.sh). This script closes
-# the off-host half: it pulls a basebackup from the Hetzner Storage
-# Box, restores onto a throwaway PG instance, replays archived WAL,
+# the off-host half: it pulls a basebackup from the configured rclone
+# remote, restores onto a throwaway PG instance, replays archived WAL,
 # and asserts the row counts in accounts / apps / instances line up
 # with the live cluster.
 #
@@ -28,7 +28,7 @@
 # partial-restore (which would land at 0% for a freshly truncated
 # WAL stream).
 #
-# Run as root on the EX44. Refuses to run if not Linux + not root.
+# Run as root on a Linux control-plane host. Refuses to run if not Linux + not root.
 # M8 docs: docs/runbooks/PostgresBackup.md (acceptance matrix).
 #
 # TODO(F4-followup): script body assumes Linux + x86_64 (pg_isready,
@@ -49,15 +49,14 @@ RESTORE_PG_PORT="${RESTORE_PG_PORT:-5433}"
 LIVE_PG_PORT="${LIVE_PG_PORT:-5432}"
 LIVE_PG_BIN="${LIVE_PG_BIN:-$(pg_config --bindir 2>/dev/null || echo /usr/lib/postgresql/15/bin)}"
 
-# Off-host storage-box wiring — driven by the same env vars the
-# postgres_backup role reads at ansible-run time. Source
-# /etc/faas/sealed.env before running.
+# Off-host wiring — the stable rclone alias is configured by the
+# postgres_backup role; provider-specific details stay in rclone.conf.
 #
-# PR-8 (issue #911 / ADR-110 deferred): HETZNER_STORAGE_BOX_* vars
-# → OFF_HOST_BACKUP_*. Rclone remote alias hertznerbox: → offhostbox:.
+# PR-8 (issue #911 / ADR-110 deferred): provider-specific variables were
+# removed from the role. The rclone remote alias is `offhostbox:`.
 # The on-disk secret path /etc/faas/secrets/storage-box/rclone.conf
-# stays (the LoadCredential= in 99-faas-off-host-backup.conf references
-# it). Operators must rename env vars in /etc/faas/sealed.env.
+# stays (the LoadCredential= in the postgresql@.service drop-in references
+# it).
 RCLONE_REMOTE="${RCLONE_REMOTE:-offhostbox}"
 RCLONE_CONF="${RCLONE_CONF:-/etc/faas/secrets/storage-box/rclone.conf}"
 BASEBACKUP_PATH="${OFF_HOST_BACKUP_BASEBACKUP_PATH:-faas-pg-basebackup}"

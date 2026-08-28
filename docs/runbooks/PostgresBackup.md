@@ -1,4 +1,4 @@
-# PostgresBackup — Off-host Postgres backup to Hetzner Storage Box
+# PostgresBackup — Provider-neutral off-host Postgres backup
 
 Spec §14 M8 + issue #250. Closes the "single-disk backup" gap that
 the M8 restore drill (deploy/scripts/faas-m8-restore-drill.sh)
@@ -12,12 +12,12 @@ S3-of-single-node replacement the spec explicitly forbids.
 | Layer | Local path | Off-host replica |
 |---|---|---|
 | Cluster data | `/var/lib/pgsql/data` | n/a (live) |
-| WAL archive | `/var/lib/pgsql/archive/` | `hertznerbox:faas-pg-wal/` |
-| Basebackup | `/var/lib/pgsql/basebackup/` | `hertznerbox:faas-pg-basebackup/` |
+| WAL archive | `/var/lib/pgsql/archive/` | `offhostbox:faas-pg-wal/` |
+| Basebackup | `/var/lib/pgsql/basebackup/` | `offhostbox:faas-pg-basebackup/` |
 
-- **Continuous WAL**: `archive_command` ships every WAL segment
-  via `rclone copyto` after the local `cp` succeeds (compound
-  `&&` so a transient rclone failure cannot stall WAL recycling).
+- **Continuous WAL**: `archive_command` stores every WAL segment
+  locally first, then best-effort sends it via `rclone copyto`; a
+  transient remote failure cannot stall WAL recycling.
 - **Nightly basebackup**: the existing `faas-pg-basebackup.timer`
   fires at 03:00 UTC; the new `faas-pg-basebackup-push.timer`
   fires at 03:30 UTC and `rclone sync`s the local tree to the
@@ -28,11 +28,9 @@ S3-of-single-node replacement the spec explicitly forbids.
 
 ## Preconditions
 
-- `HETZNER_STORAGE_BOX_USER` + `HETZNER_STORAGE_BOX_HOST` are
-  exported in the operator shell (sourced from
-  `/etc/faas/sealed.env`).
 - `/etc/faas/secrets/storage-box/rclone.conf` exists, mode `0400
-  root:root` (issue #250 fail-closed assert).
+  root:root` (issue #250 fail-closed assert). It defines the
+  provider-specific endpoint under the stable `offhostbox` alias.
 - `/etc/faas/secrets/storage-box/box-age-key` exists, mode `0400
   root:root`.
 - `rclone` is on PATH (`apt install rclone` — handled by the
@@ -81,9 +79,9 @@ sudo make backup-restore-drill
 | Signal | Healthy value | How to read |
 |---|---|---|
 | `pg_backup_last_pushed_seconds` gauge | < 3600 | `curl -fsS http://127.0.0.1:9101/metrics \| grep '^pg_backup_last_pushed_seconds'` |
-| Remote basebackup count vs local | match | `rclone lsd hertznerbox:faas-pg-basebackup --config /etc/faas/secrets/storage-box/rclone.conf \| wc -l` vs `ls /var/lib/pgsql/basebackup \| wc -l` |
-| Storage Box `du` vs local `$PG_BB_ROOT` | ±10% | rclone-side: Hetzner Storage Box web UI |
-| `archive_command` line | `rclone copyto %p hertznerbox:...` | `grep ^archive_command /etc/postgresql/15/main/postgresql.conf` |
+| Remote basebackup count vs local | match | `rclone lsd offhostbox:faas-pg-basebackup --config /etc/faas/secrets/storage-box/rclone.conf \| wc -l` vs `ls /var/lib/pgsql/basebackup \| wc -l` |
+| Remote `du` vs local `$PG_BB_ROOT` | ±10% | provider-side storage UI |
+| `archive_command` line | local copy followed by best-effort `rclone copyto` to `offhostbox:` | `grep ^archive_command /etc/postgresql/15/main/postgresql.conf` |
 
 ## Rollback
 
@@ -96,7 +94,7 @@ sudo make backup-restore-drill
    sudo systemctl reload postgresql
    ```
 3. Remove the storage-box systemd drop-in:
-   `sudo rm /etc/systemd/system/postgresql.service.d/99-faas-storage-box.conf`
+   `sudo rm /etc/systemd/system/postgresql@.service.d/99-faas-off-host-backup.conf`
    and `sudo systemctl daemon-reload`.
 
 The push is additive; reverting is two `systemctl` commands +
@@ -107,9 +105,9 @@ one `sed` rewrite.
 | Symptom | Page? | First action |
 |---|---|---|
 | `pg_backup_last_pushed_seconds > 86400` | yes (page) | `journalctl -u faas-pg-basebackup-push.service` — most likely rclone auth drift; check `/etc/faas/secrets/storage-box/rclone.conf` mode + contents |
-| `pg_backup_last_pushed_seconds > 3600` | warn | check Storage Box endpoint reachability (`rclone lsd hertznerbox:faas-pg-basebackup --config ...`) |
-| `archive_command` line shows old `cp` | warn | the operator dropped the storage-box drop-in; re-run the control-plane bootstrap target |
-| T-7 row-count ratio < 0.95 | page | the restore is partial — check `rclone cat hertznerbox:faas-pg-wal/` returns the right segment; check `recovery.signal` + `restore_command` are in the throwaway postgresql.conf |
+| `pg_backup_last_pushed_seconds > 3600` | warn | check remote endpoint reachability (`rclone lsd offhostbox:faas-pg-basebackup --config ...`) |
+| `archive_command` line shows old `cp` | warn | the operator has not converged the PostgreSQL role; re-run the control-plane bootstrap target |
+| T-7 row-count ratio < 0.95 | page | the restore is partial — check `rclone cat offhostbox:faas-pg-wal/` returns the right segment; check `recovery.signal` + `restore_command` are in the throwaway postgresql.conf |
 
 ## Acceptance
 

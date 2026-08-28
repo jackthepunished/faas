@@ -10,7 +10,7 @@
 //   - init   — create /etc/faas/secrets/storage-box/ (0700 root:root)
 //     and write the two known-placeholder stub files the doctor
 //     detects (commands_doctor.go:1274,1283,1292): rclone.conf
-//     (0440 root:postgres) and archive-creds.json (0400 root:root).
+//     (0400 root:root) and archive-creds.json (0400 root:root).
 //     Refuses to overwrite an existing layout unless --force is
 //     passed (the storage-box dir carries the box-age-key that
 //     identities the operator-laptop unseal path; silently
@@ -26,8 +26,8 @@
 //   - unseal-rclone  — decrypt a host.age-sealed `rclone.conf` envelope
 //     using the on-box age identity (box-age-key) and write the
 //     plaintext to /etc/faas/secrets/storage-box/rclone.conf (mode
-//     0440 root:postgres so the archive_command's rclone process can
-//     read it). Refuses to overwrite an existing plaintext unless
+//     0400 root:root; systemd stages it for the PostgreSQL cluster.
+//     Refuses to overwrite an existing plaintext unless
 //     --force is passed (re-unsealing is a deliberate rotation
 //     step, not a bootstrap-time side effect).
 //
@@ -118,7 +118,7 @@ func newUnsealRcloneFlags(name string) (*flag.FlagSet, *unsealRcloneFlags) {
 	fs.StringVar(&f.in, "in", defaultRcloneAgeIn,
 		"path to the host.age-sealed rclone.conf envelope (typically scp'd to /root/rclone.conf.age)")
 	fs.StringVar(&f.out, "out", defaultRcloneConf,
-		"path to write the decrypted rclone.conf (mode 0440 root:postgres)")
+		"path to write the decrypted rclone.conf (mode 0400 root:root)")
 	fs.BoolVar(&f.force, "force", false,
 		"overwrite an existing plaintext rclone.conf (rotation flow only)")
 	return fs, f
@@ -151,8 +151,8 @@ func cmdBackupUnsealRclone(args []string) int {
 	if err := unsealRclone(f); err != nil {
 		return printErr("unseal failed", err)
 	}
-	PrintOK(osStdout, "Wrote %s (0440 root:postgres)\n  Next: chmod 0440 %s && chown root:postgres %s\n  Next: systemctl daemon-reload && systemctl restart faas-pg-basebackup-push",
-		f.out, f.out, f.out)
+	PrintOK(osStdout, "Wrote %s (0400 root:root)\n  Next: systemctl daemon-reload && systemctl restart postgresql@<major>-main faas-pg-basebackup-push",
+		f.out)
 	return 0
 }
 
@@ -162,12 +162,9 @@ func cmdBackupUnsealRclone(args []string) int {
 // half-written plaintexts on the canonical install path — a
 // truncated rclone.conf makes the push unit hang on rclone's
 // "config not found" message indefinitely, which is harder to
-// spot than a missing file. Mode 0440 root:postgres on the final
-// file matches the ansible stat-assert at
-// postgres_backup/tasks/main.yml:145-180 (review F2): the postgres
-// user (User= on the systemd postgresql.service) must read this
-// file via its `archive_command`, so the unseal stages it with
-// group read for postgres.
+// spot than a missing file. Mode 0400 root:root on the final file matches
+// the systemd credential source contract: PID 1 reads it and stages a
+// service-scoped copy for the PostgreSQL cluster.
 func unsealRclone(f *unsealRcloneFlags) error {
 	if !f.force {
 		if _, err := os.Stat(f.out); err == nil {
@@ -222,9 +219,9 @@ func unsealRclone(f *unsealRcloneFlags) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write plaintext: %w", err)
 	}
-	if err := tmp.Chmod(0o440); err != nil {
+	if err := tmp.Chmod(0o400); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("chmod 0440: %w", err)
+		return fmt.Errorf("chmod 0400: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close tmp: %w", err)
@@ -298,7 +295,7 @@ func backupInit(f *backupInitFlags, stdout io.Writer) error {
 	if err := os.MkdirAll(f.dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir storage-box dir %s: %w", f.dir, err)
 	}
-	// Stub 1: rclone.conf placeholder (0440 root:postgres).
+	// Stub 1: rclone.conf placeholder (0400 root:root).
 	// Mirrors commands_secrets_init.go:writeRcloneStub but lives in
 	// backup's namespace because backup init is the canonical
 	// storage-box-only path (no host.age / session.key side).
@@ -323,9 +320,9 @@ func backupInit(f *backupInitFlags, stdout io.Writer) error {
 // version) but lives here so `backup init` is self-contained.
 //
 // force=true requires the file to be writable. The on-disk file
-// lives at 0440, so a plain WriteFile would EPERM on the second
+// lives at 0400, so a plain WriteFile would EPERM on the second
 // init. We chmod 0644 first (when force=true and the file
-// exists), then chmod back to 0440 after the write — same
+// exists), then chmod back to 0400 after the write — same
 // dance commands_secrets_init.go:writeHostAge uses via
 // enforceFileMode.
 func writeBackupRcloneStub(path string, force bool) error {
@@ -344,11 +341,11 @@ func writeBackupRcloneStub(path string, force bool) error {
 		}
 	}
 	stub := []byte(`{"_":"backup init stub — replace via 'gregalectl backup unseal-rclone'"}`)
-	if err := os.WriteFile(path, stub, 0o440); err != nil {
+	if err := os.WriteFile(path, stub, 0o400); err != nil {
 		return fmt.Errorf("write rclone.conf stub %s: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o440); err != nil {
-		return fmt.Errorf("chmod 0440 %s: %w", path, err)
+	if err := os.Chmod(path, 0o400); err != nil {
+		return fmt.Errorf("chmod 0400 %s: %w", path, err)
 	}
 	return nil
 }

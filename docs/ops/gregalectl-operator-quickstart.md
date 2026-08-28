@@ -275,14 +275,16 @@ overwrite unless `--force`.
 
 ```
 gregalectl secrets init --pg-dsn "$FAAS_PG_DSN"   # 5 files: host.age, session.key, box-age-key, rclone.conf, archive-creds.json
-gregalectl secrets stamp --host <fqdn>            # stamp the existing host.age fingerprint without rotating
+gregalectl secrets stamp --host <fqdn>            # stamp the existing vmmd TLS certificate without rotating
 gregalectl secrets rotate --host <fqdn>           # delegates to host-age rotate
 gregalectl secrets status --json                  # mode/mtime/sha256 for all 5
 ```
 
 The 5-file batch replaces v1 `bootstrap.sh` step 11d (RETIRED
-2026-08-15). `--no-db` skips the `compute_nodes.cert_fingerprint`
-write (use only when secrets init runs ahead of `apid`).
+2026-08-15). When database stamping is enabled, the two compute-node
+attestation columns contain the public vmmd mTLS leaf and its canonical
+`sha256:` DER fingerprint. `--no-db` skips that write for file-only/local
+bootstrap flows.
 
 ## 7. Diagnostic
 

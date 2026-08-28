@@ -1420,6 +1420,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// operator who rotates host.age picks up the new envelope
 	// on the same boot — no separate restart needed.
 	archiveCfg, archiveCfgErr := logarchive.ConfigFromEnv(os.Getenv, log)
+	if archiveCfgErr == nil {
+		archiveCredsPath := envOrGateway(logarchive.EnvCredentialsPath, logarchive.DefaultCredentialsPath)
+		if creds, err := logarchive.ReadCredentials(archiveCredsPath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Warn("gatewayd-internal: log archive credentials unavailable; archive read-back disabled", "path", archiveCredsPath, "err", err)
+			}
+		} else {
+			archiveCfg = archiveCfg.WithCredentials(creds)
+		}
+	}
 	switch {
 	case archiveCfgErr != nil:
 		log.Warn("gatewayd-internal: log archive config parse failed; archive read-back disabled", "err", archiveCfgErr)

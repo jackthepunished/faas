@@ -6,7 +6,7 @@
 //   - unsealRclone refuses to overwrite an existing plaintext unless
 //     --force is passed. The refuse-by-default contract protects a
 //     mid-deploy operator from accidentally rotating the rclone
-//     session — a rotation against a Hetzner Storage Box in active
+//     session — a rotation against the configured off-host backend in active
 //     use strands the nightly push unit until the new key is in
 //     place. --force is the documented escape hatch; --force=false
 //     (the default) is the safe path.
@@ -92,15 +92,13 @@ func sealForRecipients(t *testing.T, identityPath, plaintext string) string {
 
 // TestUnsealRclone_HappyPath seals a fake rclone.conf with a fresh
 // age key, then unseals it into a tempdir. Verifies that the
-// plaintext bytes round-trip and the output file ends up mode 0440
+// plaintext bytes round-trip and the output file ends up mode 0400
 // — the mode the ansible stat-assert at
-// postgres_backup/tasks/main.yml requires (review F2). The chown
-// to root:postgres is the operator's job after the unseal (we
-// don't depend on user postgres existing in test envs); the
-// unseal itself only owns the chmod + write.
+// postgres_backup/tasks/main.yml requires (review F2). systemd reads the
+// root-only source and stages a service-scoped copy for PostgreSQL.
 func TestUnsealRclone_HappyPath(t *testing.T) {
 	identPath := generateAgeKey(t)
-	const plaintext = "[hertznerbox]\ntype = sftp\nhost = u123.your-storagebox.de\nuser = u123\n"
+	const plaintext = "[offhostbox]\ntype = sftp\nhost = u123.your-storagebox.de\nuser = u123\n"
 	envelope := sealForRecipients(t, identPath, plaintext)
 
 	outPath := filepath.Join(t.TempDir(), "rclone.conf")
@@ -126,8 +124,8 @@ func TestUnsealRclone_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat out: %v", err)
 	}
-	if mode := st.Mode().Perm(); mode != 0o440 {
-		t.Fatalf("mode: got %#o want 0440", mode)
+	if mode := st.Mode().Perm(); mode != 0o400 {
+		t.Fatalf("mode: got %#o want 0400", mode)
 	}
 }
 
@@ -323,7 +321,7 @@ func TestUnsealArchiveCreds_BadJSONShape(t *testing.T) {
 
 // TestBackupInit_CreatesLayout pins the layout `gregalectl backup
 // init` lands: the directory at 0700 and the two doctor-detected
-// stub files at 0440 root:root (rclone.conf) + 0400 root:root
+// stub files at 0400 root:root (rclone.conf) + 0400 root:root
 // (archive-creds.json). Runs the package-private worker so the
 // flag-parse boilerplate doesn't pollute the assertion; mirrors
 // TestUnsealRclone_HappyPath's seam strategy.
@@ -337,14 +335,14 @@ func TestBackupInit_CreatesLayout(t *testing.T) {
 		t.Fatalf("backupInit: %v", err)
 	}
 
-	// Stub 1: rclone.conf placeholder (0440)
+	// Stub 1: rclone.conf placeholder (0400)
 	rclonePath := filepath.Join(dir, "rclone.conf")
 	st, err := os.Stat(rclonePath)
 	if err != nil {
 		t.Fatalf("stat rclone.conf: %v", err)
 	}
-	if mode := st.Mode().Perm(); mode != 0o440 {
-		t.Fatalf("rclone.conf mode: got %#o want 0440", mode)
+	if mode := st.Mode().Perm(); mode != 0o400 {
+		t.Fatalf("rclone.conf mode: got %#o want 0400", mode)
 	}
 	got, err := os.ReadFile(rclonePath)
 	if err != nil {
