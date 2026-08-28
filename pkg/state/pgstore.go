@@ -19232,11 +19232,16 @@ func (s *PgStore) InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertReq
 // unconditionally — pgx binds NULL when Valid is false, and a NULL
 // account_id can never match the NOT NULL column on
 // request_telemetry.
+//
+// sqlc names the third positional arg `Column3` because the
+// predicate is `account_id = $3::uuid` with no `RETURNING`
+// or named-arg convention. Mirror what `make sqlc-generate`
+// produces so the drift gate stays green.
 func (s *PgStore) UpdateSpansSummary(ctx context.Context, traceID string, accountID uuid.UUID, summary []byte) error {
 	return s.appErrorsQueries().UpdateSpansSummary(ctx, s.pool, sqlc.UpdateSpansSummaryParams{
-		TraceID:   pgtype.Text{String: traceID, Valid: traceID != ""},
-		Column2:   summary,
-		AccountID: pgtype.UUID{Bytes: accountID, Valid: true},
+		TraceID: pgtype.Text{String: traceID, Valid: traceID != ""},
+		Column2: summary,
+		Column3: pgtype.UUID{Bytes: accountID, Valid: true},
 	})
 }
 

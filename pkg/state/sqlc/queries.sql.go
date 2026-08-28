@@ -5415,9 +5415,9 @@ update request_telemetry
 `
 
 type UpdateSpansSummaryParams struct {
-	TraceID   pgtype.Text
-	Column2   []byte
-	AccountID pgtype.UUID
+	TraceID pgtype.Text
+	Column2 []byte
+	Column3 pgtype.UUID
 }
 
 // ADR-127 PR-D: writer for spans_summary jsonb. The gatewayd-public
@@ -5432,15 +5432,20 @@ type UpdateSpansSummaryParams struct {
 // $N::jsonb cast is load-bearing — without it sqlc binds as text and
 // Postgres raises SQLSTATE 22P02 (invalid_text_representation).
 //
-// PR-D code-review #1: AccountID is now bound as $3 and matched
-// against request_telemetry.account_id in the WHERE clause.
-// Defense in depth against cross-customer overwrite (see
-// pkg/state/queries.sql for the rationale). The pgtype.UUID
-// Valid flag must be set; pgx binds NULL when Valid is false,
-// which would never match the NOT NULL column on
-// request_telemetry.
+// PR-D code-review #1: the WHERE clause now also pins account_id.
+// Defense in depth against cross-customer overwrite. The
+// gateway-side accumulator already rejects trace_id/account_id
+// mismatches (pkg/gateway/spans_accumulator.go ErrAccountMismatch),
+// and the apid gRPC handler forwards the same account_id, but a
+// bug at any layer could otherwise let account A's flush wipe
+// account B's row. Adding the account_id = $3::uuid predicate
+// makes cross-customer overwrite impossible regardless of which
+// upstream guard fails. The composite (trace_id, account_id)
+// lookup still hits request_telemetry_trace_idx for the trace_id
+// selectivity; the residual account_id check is a post-fetch
+// row-level filter (one row, microseconds).
 func (q *Queries) UpdateSpansSummary(ctx context.Context, db DBTX, arg UpdateSpansSummaryParams) error {
-	_, err := db.Exec(ctx, updateSpansSummary, arg.TraceID, arg.Column2, arg.AccountID)
+	_, err := db.Exec(ctx, updateSpansSummary, arg.TraceID, arg.Column2, arg.Column3)
 	return err
 }
 
