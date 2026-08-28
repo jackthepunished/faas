@@ -1,0 +1,296 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Audit-write fidelity (PR #1111 / Obs-Meta + Trace-IDs Mega-PR, 5ead9b7cd). Four panels cover the two new counters from PR #1111 C2 (`<daemon>_audit_log_write_total{endpoint,kind}` and `<daemon>_audit_log_write_failures_total{endpoint,kind,error_class}` — per-daemon prefix, counter declarations at pkg/wire/metrics.go:1510/1515, pre-instantiation grid at lines 3215-3222 spanning `auditEndpointClosedSet` x `auditKindClosedSet` x `auditErrorClassClosedSet` — declarations at 3158/3159/3178). The audit emit is best-effort by design (ADR-035): the user-facing action has already returned 200 to the customer by the time AppendEvent runs, so a failed insert logs WARN and bumps the counter without rolling back. A sustained non-zero rate therefore means audit rows are silently missing while customer traffic looks healthy — a ticket-tier operational signal, not a page-tier outage. Cross-daemon queries use `{__name__=~`.+_audit_log_write_total`}` because the metric prefix is per-daemon; the dashboard covers apid + schedd + meterd + gatewayd-internal (the auditEndpointClosedSet at pkg/wire/metrics.go:3158). Companion alert: FaasAuditWriteFailuresSpike (warn, cross-daemon, family=audit_write, component=platform — deliberately NOT paired with the apid-only FaasApidAuditWriteFailures so non-apid spikes stay visible; the load-bearing mechanism is that no page-tier audit_write alert exists, so the alertmanager inhibit rule can never engage between them). Runbook: docs/runbooks/FaasAuditWriteFailuresSpike.md.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Audit writes / 5m by endpoint",
+      "description": "Stacked time series of all audit-write successes across the auditEndpointClosedSet (apid / schedd / meterd / gatewayd-internal) over the rolling 5m window. Cross-daemon regex matches every `<daemon>_audit_log_write_total` series; the `endpoint` label is set independently by `pkg/audit.audit.go:296` (a.actor).",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate({__name__=~\".*_audit_log_write_total\"}[5m]))",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit write failures / 5m by error_class",
+      "description": "Stacked time series of audit-write failures broken down by `error_class` (closed-set at pkg/wire/metrics.go:3117-3122: sqlstate_23514 / sqlstate_23505 / timeout / other). The drill-down shape the FaasAuditWriteFailuresSpike runbook opens with.",
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (error_class) (rate({__name__=~\".*_audit_log_write_failures_total\"}[5m]))",
+          "legendFormat": "{{error_class}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit write failure ratio (5m)",
+      "description": "failures / total, with a clamp_min(0.001) on the denominator mirroring the vmmd_cold_boot_ratio recording-rule precedent at faas.rules.yml:1147-1161 (protects against divide-by-zero). Threshold bands: green < 0.001, yellow 0.001-0.01, red >= 0.01. Same units the FaasAuditWriteFailuresSpike alert threshold uses.",
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate({__name__=~\".*_audit_log_write_failures_total\"}[5m])) / clamp_min(sum(rate({__name__=~\".*_audit_log_write_total\"}[5m])), 0.001)",
+          "legendFormat": "failure ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit writes by kind (top 8)",
+      "description": "topk(8, ...) clamp survives the bounded-admission helper at pkg/wire/metrics.go (overflow collapses to __other__). The auditKindClosedSet has 11 entries (force_park / force_cold_boot / force_restart and their .outcome variants, the instance-oriented aliases park_instance and restart_instance, and other).",
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "topk(8, sum by (kind) (rate({__name__=~\".*_audit_log_write_total\"}[5m])))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "faas",
+    "obs-meta",
+    "audit-write",
+    "pr-1111"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "faas audit-write fidelity (PR #1111)",
+  "uid": "faas-audit-write-fidelity-pr-1111",
+  "version": 1,
+  "weekStart": ""
+}

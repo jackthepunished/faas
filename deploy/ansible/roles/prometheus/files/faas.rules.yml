@@ -1329,3 +1329,131 @@ groups:
           summary: "builderd build queue > 50 queued builds for 10m"
           description: "The fleet-total queued-builds gauge `faas_build_queue_depth` has exceeded 50 for 10m. With builderd's default concurrency of 2 microVMs (1 guaranteed + 1 opportunistic per ADR-003), sustained depth > 50 means builds are arriving faster than builderd can drain the queue. Triage: `gregalectl builds list --status=queued` for the in-flight builds, `/v1/admin/obs/builder-heartbeats` for live builderd liveness (a missing builder_tick signature means the writer is wedged), `gregalectl builds sweep-stuck --older-than=15m --yes` to reclaim the wedged 'running' rows. Recover per docs/ops/FaasBuildQueueBacklog.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasBuildQueueBacklog.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # PR #1111 follow-on (feat/obs-dashboards-alerts) — operator
+      # surface for the obs-meta + trace-IDs metrics shipped by
+      # PR #1111 (Obs-Meta + Trace-IDs Mega-PR, 5ead9b7cd).
+      #
+      # The metric contract from PR #1111 C1-C4: every
+      # `operator.action.<verb>` audit row carries a non-NULL
+      # `events.trace_id` so cross-daemon correlation (apid request
+      # → schedd outcome → audit_log → events) works end-to-end.
+      #
+      # Source gauge:
+      # `schedd_operator_action_trace_completeness_ratio{kind}`
+      # set by `pkg/sched/operator_intent_completeness.go::
+      # observeOperatorIntentCompleteness` on a 60s tick.
+      # Pre-instantiated for the 5 verb-oriented kinds in
+      # `pkg/wire/metrics.go::operatorIntentKindClosedSet`
+      # (force_park, force_cold_boot, force_restart,
+      # park_instance, restart_instance). The gauge IS registered
+      # on every daemon (`pkg/wire/metrics.go:3150-3173`) but
+      # ONLY schedd's driver calls Set — the per-daemon prefix
+      # is schedd's. Cross-daemon queries mix real schedd values
+      # with never-set defaults on other daemons (junk). Every
+      # expression below filters to `schedd_…` to avoid that
+      # pitfall; dashboards in deploy/grafana repeat the filter.
+      #
+      # The recording rule aggregates across the closed set,
+      # `min(...)`-ing so the worst-kind ratio is the tripwire
+      # (one bad kind is enough to page). `clamp_min(..., 0.001)`
+      # mirrors the vmmd_cold_boot_ratio precedent further
+      # down the file so any downstream alert that compares
+      # against this value never divides by zero.
+      #
+      # Page+warn pair share `family=obs_trace, component=schedd`
+      # — alertmanager's inhibit rule (page suppresses warn when
+      # [family, component] match) auto-pairs them so the warn
+      # never pages through while the page is firing.
+      # ─────────────────────────────────────────────────────────────────
+      - record: obs:operator_action_trace_completeness_ratio
+        expr: clamp_min(min(schedd_operator_action_trace_completeness_ratio), 0.001)
+
+      - alert: FaasOperatorActionTraceCompletenessLowPage
+        expr: obs:operator_action_trace_completeness_ratio < 0.50
+        for: 10m
+        labels:
+          severity: page
+          family: obs_trace
+          component: schedd
+        annotations:
+          summary: "operator action trace completeness below 50% for 10m"
+          description: "At least one operator.action.* kind (schedd gauge schedd_operator_action_trace_completeness_ratio) has fewer than 50% of audit rows carrying a non-NULL events.trace_id over the rolling 5m window for 10m. Every force_park / force_cold_boot / force_restart action is contractually required to carry a trace_id end-to-end (PR #1111 C1-C4 contract). The page fires because audit rows without trace_id break the cross-daemon correlation story."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasOperatorActionTraceCompletenessLow.md"
+
+      - alert: FaasOperatorActionTraceCompletenessLowWarn
+        expr: obs:operator_action_trace_completeness_ratio < 0.95
+        for: 30m
+        labels:
+          severity: warn
+          family: obs_trace
+          component: schedd
+        annotations:
+          summary: "operator action trace completeness below 95% for 30m"
+          description: "At least one operator.action.* kind has dropped below 95% trace_id coverage over the rolling 5m window for 30m. Below the page threshold (50% / 10m) but above the warn band — the schedd driver (pkg/sched/operator_intent_completeness.go::observeOperatorIntentCompleteness) or the audit emit site may be drifting. Drill down per the runbook; the next escalation is the page alert."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasOperatorActionTraceCompletenessLow.md"
+
+      - alert: FaasOperatorActionTraceCompletenessLoopStalled
+        # The schedd driver (60s tick) hasn't updated the gauge
+        # in >3m. Without this alert, a frozen gauge (Prometheus
+        # sees the last-written value) looks identical to a healthy
+        # one — a wedged driver is invisible until traffic resumes.
+        # 180s = 3x the 60s tick, same logic as the
+        # FaasAuditRetentionLoopStalled precedent above
+        # (26h vs 24h cadence slack).
+        expr: time() - timestamp(schedd_operator_action_trace_completeness_ratio) > 180
+        for: 5m
+        labels:
+          severity: info
+          family: obs_trace
+          component: schedd
+        annotations:
+          summary: "schedd obs trace completeness driver loop stale >3m"
+          description: "The schedd observability driver (pkg/sched/operator_intent_completeness.go, 60s tick) has not updated schedd_operator_action_trace_completeness_ratio in >3m (3x the tick interval). The gauge is frozen at its last value — the trace-completeness page+warn alerts may be silent even though the system is broken. Routes to faas-silent (info-tier). Drill down per the runbook; the gauge freeze usually means schedd's Postgres pool is exhausted or the goroutine crashed."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasOperatorActionTraceCompletenessLow.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # PR #1111 follow-on — cross-daemon audit-write failure alert.
+      #
+      # The existing FaasApidAuditWriteFailures (precedent at
+      # line 358-380, family=audit_write, component=apid) covers
+      # apid alone. PR #1111 C2 surface ships the SAME counter
+      # shape under every auditEndpointClosedSet daemon (apid,
+      # schedd, meterd, gatewayd-internal — see
+      # pkg/wire/metrics.go:3097), so a schedd / meterd /
+      # gatewayd-internal audit-write failure spike is invisible
+      # to the apid-only alert today. This rule exists precisely
+      # to surface those non-apid spikes.
+      #
+      # Deliberate NOT-paired with FaasApidAuditWriteFailures.
+      # Both are severity=warn and there is no page-tier
+      # audit_write alert anywhere in this file; alertmanager's
+      # inhibit rule (alertmanager.yml.j2:124-136) requires
+      # source.severity=page to engage, so this cross-daemon
+      # warn is independently visible regardless of component
+      # label values. The component=platform vs component=apid
+      # distinction keeps the two routes grouped correctly in
+      # alertmanager (platform-wide email vs. apid-only queue)
+      # but does NOT carry the inhibit weight — if a future
+      # page-tier audit_write alert is added with the same
+      # family, the inhibit rule would engage via the severity
+      # match, not via component. Component labels here are
+      # routing-only; severity is the inhibit lever.
+      #
+      # Threshold matches FaasApidAuditWriteFailures for
+      # consistency (>5/min, for 5m, same `5/60` unit). The
+      # `__name__=~...` regex matches every daemon's
+      # *audit_log_write_failures_total series.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasAuditWriteFailuresSpike
+        expr: sum(rate({__name__=~".*_audit_log_write_failures_total"}[5m])) > (5 / 60)
+        for: 5m
+        labels:
+          severity: warn
+          family: audit_write
+          component: platform
+        annotations:
+          summary: "audit write failure rate above 5/min across all daemons for 5m"
+          description: "The combined audit-write failure rate across every daemon emitting audit rows (apid, schedd, meterd, gatewayd-internal — see pkg/wire/metrics.go::auditEndpointClosedSet) has exceeded 5 failures/min over the rolling 5m window for 5m. The existing FaasApidAuditWriteFailures covers apid alone; this rule catches schedd/meterd/gatewayd-internal failure spikes that the apid-only alert misses. The threshold matches FaasApidAuditWriteFailures for consistency. Drill down per the runbook by error_class and endpoint."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAuditWriteFailuresSpike.md"
