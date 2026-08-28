@@ -364,3 +364,39 @@ func TestPgStoreOpenAPIImport_IfUnderQuota(t *testing.T) {
 		t.Errorf("post-quota doc body is empty")
 	}
 }
+
+// TestPgStoreOpenAPIImport_UpsertIfUnderQuota pins the quota-bundled
+// happy + sad paths on the bundle+lock+upsert surface (pgstore_
+// openapi_import.go::UpsertAppOpenAPIDocIfUnderQuota). PlanMax ≤ 0
+// returns QuotaErrorKindOpenAPIImports; PlanMax ≥ 1 succeeds and the
+// row is readable via GetAppOpenAPIDoc. Coverage-bump: this bundle
+// function had 0% coverage at round-6 rebase, dropping the pkg/state
+// floor below 70%. Zero-source-change coverage test.
+func TestPgStoreOpenAPIImport_UpsertIfUnderQuota(t *testing.T) {
+	store, _, ctx := pgStoreWithPool(t)
+	acct, appID := seedOpenAPIImportFixture(t, ctx, store)
+
+	// Sad path: planMax ≤ 0 ⇒ QuotaErrorKindOpenAPIImports, NotAllowed.
+	if err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, acct, []byte(`{"openapi":"3.1.0"}`), 1, "3.1.0", 0); err == nil {
+		t.Fatal("planMax=0: want QuotaError, got nil")
+	} else {
+		var qe *state.QuotaError
+		if !errors.As(err, &qe) {
+			t.Fatalf("planMax=0: want QuotaError, got %T %v", err, err)
+		} else if qe.Kind != state.QuotaErrorKindOpenAPIImports {
+			t.Errorf("planMax=0: Kind = %v, want QuotaErrorKindOpenAPIImports", qe.Kind)
+		}
+	}
+
+	// Happy path: planMax = 5 (Hobby), endpointCount = 1. The row
+	// becomes readable via the store's read path so we know the
+	// bundle transaction committed.
+	if err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, acct, []byte(`{"openapi":"3.1.0","paths":{}}`), 1, "3.1.0", 5); err != nil {
+		t.Fatalf("UpsertAppOpenAPIDocIfUnderQuota happy: %v", err)
+	}
+	if doc, _, err := store.GetAppOpenAPIDoc(ctx, appID, acct); err != nil {
+		t.Fatalf("GetAppOpenAPIDoc after quota upsert: %v", err)
+	} else if len(doc) == 0 {
+		t.Fatal("GetAppOpenAPIDoc returned empty doc after quota upsert")
+	}
+}

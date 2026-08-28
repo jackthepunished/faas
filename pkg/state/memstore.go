@@ -4817,73 +4817,208 @@ func (m *MemStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return m.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
-// UpdateDeploymentOpenAPISnapshot (ADR-121, migration 00358)
-// mirrors pgstore's UPSERT: key by deployment_id, overwrite
-// every column on conflict. Validation matches pgstore
-// (err on empty required fields, schema_version >= 1).
-func (m *MemStore) UpdateDeploymentOpenAPISnapshot(_ context.Context, snap OpenAPISnapshot) error {
-	if snap.DeploymentID == "" {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: empty deployment_id")
-	}
-	if snap.AppID == "" {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: empty app_id")
-	}
-	if snap.Scope == "" {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: empty scope")
-	}
-	if len(snap.Snapshot) == 0 {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: empty snapshot bytes")
-	}
-	if snap.SHA256 == "" {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: empty sha256")
-	}
-	if snap.SchemaVersion < 1 {
-		return errors.New("memstore: UpdateDeploymentOpenAPISnapshot: schema_version must be >= 1")
-	}
-	if snap.CapturedAt.IsZero() {
-		snap.CapturedAt = time.Now().UTC()
-	}
+// MarkDeploymentCancelled (ADR-124) — memstore mirror of
+// pgstore.MarkDeploymentCancelled. CAS guard via the
+// IsCancelEligible predicate, errrrors mirror pgstore sentinels.
+func (m *MemStore) MarkDeploymentCancelled(_ context.Context, id, principal string, reason CancelReason, when time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.openAPISnapshots[snap.DeploymentID] = snap
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if d.Status == DeployLive {
+		return ErrCancelLiveForbidden
+	}
+	if !d.Status.IsCancelEligible() {
+		return ErrInvalidStateTransition
+	}
+	if !reason.IsValid() {
+		return ErrInvalidStateTransition
+	}
+	d.Status = DeployCancelled
+	d.CancelledAt = &when
+	d.CancelledByPrincipal = principal
+	d.CancelReason = string(reason)
+	m.deployments[id] = d
 	return nil
 }
 
-// LatestOpenAPISnapshotForScope returns the most recently
-// captured snapshot for (appID, scope). MemStore does a linear
-// scan over the openAPISnapshots map (held under m.mu); the
-// map is small (one row per deployment) and the walk is O(N)
-// but bounded by the customer's lifetime deployment count.
-func (m *MemStore) LatestOpenAPISnapshotForScope(_ context.Context, appID, scope string) (OpenAPISnapshot, error) {
+// CancelDeploymentTx (ADR-124) — single-mu-lock orchestrator
+// mirroring pgstore.CancelDeploymentTx. The memstore is not
+// concurrent in the same way Postgres is, so we sequentially
+// (a) flip the deployment row, (b) flip non-terminal build rows
+// of the same deployment, (c) update memoized cancel_reason /
+// cancelled_by_principal for downstream consumers (the SSE
+// fan-in reads from this directly). Returns the post-flip
+// deployment.
+func (m *MemStore) CancelDeploymentTx(ctx context.Context, id, principal string, reason CancelReason) (Deployment, []string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var best OpenAPISnapshot
-	found := false
-	for _, snap := range m.openAPISnapshots {
-		if snap.AppID != appID || snap.Scope != scope {
-			continue
-		}
-		if !found || snap.CapturedAt.After(best.CapturedAt) {
-			best = snap
-			found = true
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, nil, ErrNotFound
+	}
+	if d.Status == DeployLive {
+		return Deployment{}, nil, ErrCancelLiveForbidden
+	}
+	if !d.Status.IsCancelEligible() {
+		return Deployment{}, nil, ErrInvalidStateTransition
+	}
+	if !reason.IsValid() {
+		return Deployment{}, nil, ErrInvalidStateTransition
+	}
+	now := time.Now().UTC()
+	d.Status = DeployCancelled
+	d.CancelledAt = &now
+	d.CancelledByPrincipal = principal
+	d.CancelReason = string(reason)
+	m.deployments[id] = d
+	// Cascade-cancel any non-terminal build rows attached to
+	// this deployment. Mirrors pgstore.CancelDeploymentTx.
+	// We collect the IDs of flipped rows so the apid handler
+	// can fire a build_changed pg_notify per row.
+	var cancelled []string
+	for buildID, b := range m.builds {
+		if b.DeploymentID == d.ID && (b.Status == BuildQueued || b.Status == BuildRunning) {
+			b.Status = BuildCancelled
+			b.CancelledAt = &now
+			b.CancelledByDeploymentCascade = true
+			m.builds[buildID] = b
+			cancelled = append(cancelled, buildID)
 		}
 	}
-	if !found {
-		return OpenAPISnapshot{}, ErrNotFound
-	}
-	return best, nil
+	return d, cancelled, nil
 }
 
-// OpenAPISnapshotByDeployment returns the snapshot row for a
-// specific deployment id, or ErrNotFound.
-func (m *MemStore) OpenAPISnapshotByDeployment(_ context.Context, deploymentID string) (OpenAPISnapshot, error) {
+// ReorderDeployment (ADR-124) — memstore mirror. The CAS guard
+// enforces status='pending'. Priority range [0, 1000] is checked
+// here and again in the SQL CHECK (migration 00362).
+func (m *MemStore) ReorderDeployment(_ context.Context, id string, newPriority int, principal string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	snap, ok := m.openAPISnapshots[deploymentID]
+	d, ok := m.deployments[id]
 	if !ok {
-		return OpenAPISnapshot{}, ErrNotFound
+		return ErrNotFound
 	}
-	return snap, nil
+	if d.Status != DeployPending {
+		return ErrReorderNotPending
+	}
+	if newPriority < 0 || newPriority > 1000 {
+		return ErrPriorityOutOfRange
+	}
+	d.Priority = newPriority
+	d.ReorderedByPrincipal = principal
+	now := time.Now().UTC()
+	d.ReorderedAt = &now
+	m.deployments[id] = d
+	return nil
+}
+
+// ClearDeployment (ADR-124) — memstore soft-delete mirror. Sets
+// deleted_at / deleted_by_principal; status unchanged so the
+// admin audit trail remains visible.
+func (m *MemStore) ClearDeployment(_ context.Context, id, principal string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if d.Status == DeployLive {
+		return ErrCancelLiveForbidden
+	}
+	now := time.Now().UTC()
+	d.DeletedAt = &now
+	d.DeletedByPrincipal = principal
+	m.deployments[id] = d
+	return nil
+}
+
+// ClearObsoleteDeployments (ADR-124) — memstore mirror. Honours
+// the "current + previous" retention window per app by skipping
+// the 2 most-recent rows per app regardless of status.
+func (m *MemStore) ClearObsoleteDeployments(_ context.Context, appID string, olderThan time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	count := 0
+	now := time.Now().UTC()
+	// Track per-app retention: keep the 2 most-recent for each app.
+	type rec struct {
+		id  string
+		enq time.Time
+	}
+	recentByApp := map[string][]rec{}
+	for id, d := range m.deployments {
+		if d.AppID != appID {
+			continue
+		}
+		recentByApp[d.AppID] = append(recentByApp[d.AppID], rec{id: id, enq: d.CreatedAt})
+	}
+	for app := range recentByApp {
+		arr := recentByApp[app]
+		// sort by enqueued_at DESC, keep top 2
+		for i := 0; i < len(arr); i++ {
+			for j := i + 1; j < len(arr); j++ {
+				if arr[j].enq.After(arr[i].enq) {
+					arr[i], arr[j] = arr[j], arr[i]
+				}
+			}
+		}
+		if len(arr) > 2 {
+			recentByApp[app] = arr[2:]
+		} else {
+			recentByApp[app] = nil
+		}
+	}
+	skippable := map[string]bool{}
+	for _, arr := range recentByApp {
+		for _, r := range arr {
+			skippable[r.id] = true
+		}
+	}
+	for id, d := range m.deployments {
+		if d.AppID != appID {
+			continue
+		}
+		if skippable[id] {
+			continue
+		}
+		if d.DeletedAt != nil {
+			continue
+		}
+		if d.Status != DeploySuperseded && d.Status != DeployFailed && d.Status != DeployCancelled {
+			continue
+		}
+		if d.CreatedAt.After(olderThan) || d.CreatedAt.Equal(olderThan) {
+			continue
+		}
+		d.DeletedAt = &now
+		d.DeletedByPrincipal = "system"
+		m.deployments[id] = d
+		count++
+	}
+	return count, nil
+}
+
+// MarkBuildCancelled (ADR-124) — memstore mirror. CAS guard on
+// status ∈ {queued, running}. Records cancelled_by_deployment_cascade
+// so callers can tell cancel-from-deploy vs. direct build-cancel.
+func (m *MemStore) MarkBuildCancelled(_ context.Context, buildID, _ string, cascade bool, when time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.builds[buildID]
+	if !ok {
+		return ErrNotFound
+	}
+	if b.Status != BuildQueued && b.Status != BuildRunning {
+		return ErrInvalidStateTransition
+	}
+	b.Status = BuildCancelled
+	b.CancelledAt = &when
+	b.CancelledByDeploymentCascade = cascade
+	m.builds[buildID] = b
+	return nil
 }
 
 // AppendDeploymentStage (ADR-117, migration 00302) — memstore
