@@ -5980,7 +5980,17 @@ func (s *PgStore) CancelDeploymentTx(ctx context.Context, id, principal string, 
 		return Deployment{}, nil, fmt.Errorf("CancelDeploymentTx: iterate build ids: %w", err)
 	}
 
-	if err := scanDeploymentInto(&d, tx.QueryRow(ctx, `SELECT `+deploymentSelectColumnsWithRootfs+` FROM deployments WHERE id = $1`, id), nil, nil, nil); err != nil {
+	// Use non-nil scratch vars for the rootfs triple. pgx v5 panics
+	// with "invalid memory address or nil pointer dereference" when a
+	// typed-nil pointer is passed as a Scan destination (see the
+	// matching comment on scanDeployment at pkg/state/pgstore.go:14347).
+	// The scratch values are discarded — the caller doesn't need rootfs
+	// fields, and the deployments row's rootfs_path / rootfs_key /
+	// rootfs_bytes are coalesced to '' / '' / 0 in the SELECT projection
+	// anyway.
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
+	if err := scanDeploymentInto(&d, tx.QueryRow(ctx, `SELECT `+deploymentSelectColumnsWithRootfs+` FROM deployments WHERE id = $1`, id), &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
 		return Deployment{}, nil, fmt.Errorf("CancelDeploymentTx: scan deployment: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
