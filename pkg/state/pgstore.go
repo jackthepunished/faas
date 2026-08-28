@@ -15632,10 +15632,10 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(canary_preset, 'none'), canary_step, canary_total_steps,
 	canary_step_started_at, coalesce(rollout_state, 'pending'),
 	rollout_started_at, rollout_completed_at, rollout_aborted_at,
-	coalesce(rollout_aborted_reason, '')`
-	-- ADR-124 deployment queue controls (migration 00360). priority
+	coalesce(rollout_aborted_reason, ''),
+	-- ADR-124 deployment queue controls (migration 00388/00488). priority
 	-- is NOT NULL DEFAULT 100 so the coalesce is purely for symmetry
-	-- with the rest of the projection (and for the rare pre-PR #X
+	-- with the rest of the projection (and for the rare pre-PR
 	-- backfill window). cancelled_*/cancel_reason are nullable so the
 	-- coalesce is the canonical "never cancelled" sentinel. deleted_at
 	-- + deleted_by_principal are the soft-delete audit columns.
@@ -15645,7 +15645,6 @@ const deploymentSelectColumnsWithRootfs = `
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
-var _ = deploymentSelectColumnsWithRootfs
 var _ = deploymentSelectColumnsWithRootfs
 
 // deploymentSelectColumnsQualified is the d.alias-prefixed variant of
@@ -15686,8 +15685,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.canary_preset, 'none'), d.canary_step, d.canary_total_steps,
 	d.canary_step_started_at, coalesce(d.rollout_state, 'pending'),
 	d.rollout_started_at, d.rollout_completed_at, d.rollout_aborted_at,
-	coalesce(d.rollout_aborted_reason, '')`
-	-- ADR-124 deployment queue controls (migration 00360). See the
+	coalesce(d.rollout_aborted_reason, ''),
+	-- ADR-124 deployment queue controls (migration 00388/00488). See the
 	-- unqualified-projection counterpart above for the rationale on
 	-- coalesce choices.
 	coalesce(d.priority, 100), coalesce(d.reordered_by_principal, ''),
@@ -15794,14 +15793,14 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&canaryStepStartedAt, &d.RolloutState,
 		&rolloutStartedAt, &rolloutCompletedAt, &rolloutAbortedAt,
 		&d.RolloutAbortedReason,
-	); err != nil {
-	// ADR-124 deployment queue controls (migration 00360). The
+		// ADR-124 deployment queue controls (migration 00388/00488). The
 		// scan order mirrors the SELECT projection above — see the
 		// docblock on deploymentSelectColumnsWithRootfs for the
 		// "lockstep or pgx panic" invariant.
 		&d.Priority, &d.ReorderedByPrincipal,
 		&d.CancelledAt, &d.CancelledByPrincipal, &d.CancelReason,
-		&d.DeletedAt, &d.DeletedByPrincipal); err != nil {
+		&d.DeletedAt, &d.DeletedByPrincipal,
+	); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {

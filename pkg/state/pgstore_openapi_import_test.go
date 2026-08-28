@@ -269,6 +269,102 @@ func TestPgStoreOpenAPIImport_UpsertForeignAccountID(t *testing.T) {
 	}
 }
 
+// TestPgStoreOpenAPIImport_IfUnderQuota exercises the three branches
+// of UpsertAppOpenAPIDocIfUnderQuota (issue #975 item #2 / ADR-126):
+//
+//  1. planMax <= 0  — fail-closed: QuotaError with NotAllowed=true,
+//     before any tx work (no FOR UPDATE on the account row).
+//  2. observed >= planMax — quota-exceeded branch: a second upsert
+//     after the first row lands must return *QuotaError
+//     {Kind: openapi_imports, Limit: planMax, Observed: planMax,
+//     NotAllowed: false}. Pins the FOR UPDATE / count predicate.
+//  3. happy path — under quota, with valid (app, account) ownership:
+//     INSERT lands; subsequent Get reads back the row.
+//
+// Branch 4 (missing account or app) is implicitly covered by the
+// IDOR test above (foreignAcct trip into ErrNotFound), so this
+// function pins the quota branches specifically.
+func TestPgStoreOpenAPIImport_IfUnderQuota(t *testing.T) {
+	store, _, ctx := pgStoreWithPool(t)
+	accountID, appID := seedOpenAPIImportFixture(t, ctx, store)
+	doc := []byte(`{"openapi":"3.1.0","info":{"title":"quota"}}`)
+
+	// --- Branch 1: planMax <= 0 — fail-closed path. The handler
+	// resolves this when the resolved plan tier lacks an
+	// OpenAPIImportsPerAccount cap (or a tier-down set 0). The
+	// function rejects BEFORE the tx begin, so no account row
+	// lock fires — coverage of the early-return block.
+	for _, planMax := range []int{0, -1} {
+		err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, accountID, doc, 1, "3.1.0", planMax)
+		if err == nil {
+			t.Fatalf("planMax=%d: expected QuotaError(NotAllowed=true), got nil", planMax)
+		}
+		var qe *state.QuotaError
+		if !errors.As(err, &qe) {
+			t.Fatalf("planMax=%d: expected *QuotaError, got %T: %v", planMax, err, err)
+		}
+		if qe.Kind != state.QuotaErrorKindOpenAPIImports {
+			t.Errorf("planMax=%d: Kind = %q, want %q", planMax, qe.Kind, state.QuotaErrorKindOpenAPIImports)
+		}
+		if !qe.NotAllowed {
+			t.Errorf("planMax=%d: NotAllowed = false, want true (fail-closed path)", planMax)
+		}
+		if qe.Limit != planMax {
+			t.Errorf("planMax=%d: Limit = %d, want %d", planMax, qe.Limit, planMax)
+		}
+	}
+
+	// --- Branch 3: happy path at planMax=1 — first upsert lands.
+	if err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, accountID, doc, 1, "3.1.0", 1); err != nil {
+		t.Fatalf("first upsert at planMax=1: %v", err)
+	}
+
+	// --- Branch 2: quota-exceeded — second upsert at planMax=1
+	// trips the observed >= planMax branch.
+	err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, accountID, doc, 1, "3.1.0", 1)
+	if err == nil {
+		t.Fatal("second upsert at planMax=1: expected QuotaError, got nil")
+	}
+	var qe *state.QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("second upsert: expected *QuotaError, got %T: %v", err, err)
+	}
+	if qe.Kind != state.QuotaErrorKindOpenAPIImports {
+		t.Errorf("Kind = %q, want %q", qe.Kind, state.QuotaErrorKindOpenAPIImports)
+	}
+	if qe.Limit != 1 {
+		t.Errorf("Limit = %d, want 1", qe.Limit)
+	}
+	if qe.Observed != 1 {
+		t.Errorf("Observed = %d, want 1", qe.Observed)
+	}
+	if qe.NotAllowed {
+		t.Errorf("NotAllowed = true on observed>=planMax path, want false")
+	}
+
+	// --- Branch 4: missing parent (app belongs to a different
+	// account) — the IDOR floor must reject with ErrNotFound even
+	// when planMax is generous. Pins the parent-exists SELECT.
+	foreignAcct := uuid.NewString()
+	if err := store.UpsertAppOpenAPIDocIfUnderQuota(ctx, appID, foreignAcct, doc, 1, "3.1.0", 5); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("foreign-account upsert: got %v, want ErrNotFound", err)
+	}
+
+	// --- Sanity: the happy-path row is still readable (the
+	// quota-rejected upsert didn't roll back the original tx — it
+	// returned before the commit, so the row from branch 3 stays).
+	gotDoc, gotMeta, err := store.GetAppOpenAPIDoc(ctx, appID, accountID)
+	if err != nil {
+		t.Fatalf("post-quota Get: %v", err)
+	}
+	if gotMeta.EndpointCount != 1 {
+		t.Errorf("post-quota EndpointCount = %d, want 1", gotMeta.EndpointCount)
+	}
+	if len(gotDoc) == 0 {
+		t.Errorf("post-quota doc body is empty")
+	}
+}
+
 // TestPgStoreOpenAPIImport_UpsertIfUnderQuota pins the quota-bundled
 // happy + sad paths on the bundle+lock+upsert surface (pgstore_
 // openapi_import.go::UpsertAppOpenAPIDocIfUnderQuota). PlanMax ≤ 0
@@ -302,3 +398,5 @@ func TestPgStoreOpenAPIImport_UpsertIfUnderQuota(t *testing.T) {
 		t.Fatalf("GetAppOpenAPIDoc after quota upsert: %v", err)
 	} else if len(doc) == 0 {
 		t.Fatal("GetAppOpenAPIDoc returned empty doc after quota upsert")
+	}
+}
