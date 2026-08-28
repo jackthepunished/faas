@@ -280,7 +280,7 @@ func TestRetentionLoopDeploymentAudit_OnTickRowsCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var (
-		mu       sync.Mutex
+		mu         sync.Mutex
 		calledWith []int64
 	)
 	done := make(chan struct{})

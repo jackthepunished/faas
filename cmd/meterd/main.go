@@ -48,11 +48,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/audit"
-	"github.com/onebox-faas/faas/pkg/canary"
-	"github.com/onebox-faas/faas/pkg/safedeploy"
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/billing/reconciler"
+	"github.com/onebox-faas/faas/pkg/canary"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
@@ -60,6 +59,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/promql"
 	"github.com/onebox-faas/faas/pkg/role"
+	"github.com/onebox-faas/faas/pkg/safedeploy"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -1396,6 +1396,7 @@ func (a *safedeployStoreAdapter) SafedeployStampRollout(ctx context.Context, id 
 func (a *safedeployStoreAdapter) AppendDeploymentAudit(ctx context.Context, entry state.DeploymentAudit) (int64, error) {
 	return a.store.AppendDeploymentAudit(ctx, entry)
 }
+
 // func(ctx context.Context) signature so Loop.WithPartitionCreate
 // stays thin (it doesn't need the execer / interval / log
 // parameters on its own surface). Called from main only when

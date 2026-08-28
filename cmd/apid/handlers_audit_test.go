@@ -1777,8 +1777,8 @@ func TestListDeploymentAudit_HappyPath(t *testing.T) {
 		t.Fatalf("parse acct id: %v", err)
 	}
 	rows := []struct {
-		kind   state.DeploymentAuditKind
-		actor  string
+		kind    state.DeploymentAuditKind
+		actor   string
 		payload map[string]any
 	}{
 		{state.DeployCreated, "meterd:canary_progression", map[string]any{"stage": 0}},

@@ -8,22 +8,22 @@
 //
 // Two seams the wider system touches:
 //
-//   1. pkg/alerts.ActionExecutor (commit 4) — implemented here by
-//      ActionDispatcher. The evaluator's fan-out calls
-//      ActionDispatcher.Execute(ctx, rule, observed, at) when the
-//      rule's action is 'rollback' / 'demote' / 'promote'. The
-//      dispatcher routes to the appropriate pkg/api.Client call.
-//      'webhook' and the empty-string default are intentionally
-//      no-ops here — the legacy Dispatcher owns that path.
+//  1. pkg/alerts.ActionExecutor (commit 4) — implemented here by
+//     ActionDispatcher. The evaluator's fan-out calls
+//     ActionDispatcher.Execute(ctx, rule, observed, at) when the
+//     rule's action is 'rollback' / 'demote' / 'promote'. The
+//     dispatcher routes to the appropriate pkg/api.Client call.
+//     'webhook' and the empty-string default are intentionally
+//     no-ops here — the legacy Dispatcher owns that path.
 //
-//   2. meterd's safedeploy tick (cmd/meterd/orchestrator_wiring.go)
-//      — runs Orchestrator.Once(ctx) on a 30-second cadence (per
-//      the locked-in plan decision; pkg/meter.DefaultSafeDeployInterval).
-//      The orchestrator walks pending rollouts, flips
-//      rollout_state, emits one deployment_audit row per
-//      transition, and never writes deployment rows directly
-//      (CLAUDE.md ownership rule: apid owns deployments.* and the
-//      orchestrator goes through apid's PATCH endpoints).
+//  2. meterd's safedeploy tick (cmd/meterd/orchestrator_wiring.go)
+//     — runs Orchestrator.Once(ctx) on a 30-second cadence (per
+//     the locked-in plan decision; pkg/meter.DefaultSafeDeployInterval).
+//     The orchestrator walks pending rollouts, flips
+//     rollout_state, emits one deployment_audit row per
+//     transition, and never writes deployment rows directly
+//     (CLAUDE.md ownership rule: apid owns deployments.* and the
+//     orchestrator goes through apid's PATCH endpoints).
 //
 // Concurrency: ActionDispatcher's HTTP client is connection-pooled
 // and concurrency-safe — pkg/api.Client shares one http.Client per
@@ -67,10 +67,10 @@ type APIDClient interface {
 // double-count a "the rule was wired but the action was bad"
 // condition as a transport-level failure).
 type ActionDispatcher struct {
-	APID   APIDClient
-	Log    *slog.Logger
-	Now    func() time.Time
-	Actor  string // service-account sentinel stamped into deployment_audit
+	APID  APIDClient
+	Log   *slog.Logger
+	Now   func() time.Time
+	Actor string // service-account sentinel stamped into deployment_audit
 }
 
 // NewActionDispatcher builds a dispatcher with nil-coerced

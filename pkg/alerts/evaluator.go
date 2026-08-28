@@ -627,9 +627,9 @@ func (e *Evaluator) runAction(ctx context.Context, rule state.AlertRule, observe
 		// audit table's kind column is a closed set in E.2 and
 		// the seed in migration 00477 already includes it.
 		e.audit.Emit(ctx, "alert.action_executed", &rule.AccountID, map[string]any{
-			"rule_id": rule.ID,
-			"rule":    rule.Name,
-			"action":  action,
+			"rule_id":  rule.ID,
+			"rule":     rule.Name,
+			"action":   action,
 			"observed": observed,
 			"fired_at": now.UTC().Format(time.RFC3339Nano),
 		})

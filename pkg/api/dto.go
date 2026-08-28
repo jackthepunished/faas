@@ -974,8 +974,8 @@ type CreateDeploymentRequest struct {
 // (`--canary-preset balanced`) keeps producing a wire shape that
 // matches the pre-PR form (Preset alone, no Stages).
 type CanaryPresetSpec struct {
-	Preset string                  `json:"preset"`
-	Stages []canary.CustomStage    `json:"stages,omitempty"`
+	Preset string               `json:"preset"`
+	Stages []canary.CustomStage `json:"stages,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on

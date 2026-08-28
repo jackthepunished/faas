@@ -23,10 +23,10 @@ type recordingAPID struct {
 	rollbackErr error
 	patchErr    error
 
-	rollbackCalls   int
-	patchCalls      int
-	lastPatchID     string
-	lastPatchPct    int
+	rollbackCalls    int
+	patchCalls       int
+	lastPatchID      string
+	lastPatchPct     int
 	lastRollbackSlug string
 }
 
@@ -45,10 +45,10 @@ func (r *recordingAPID) PatchDeploymentsIdTraffic(_ context.Context, id string, 
 
 func sampleRule() state.AlertRule {
 	return state.AlertRule{
-		ID:      "rule-1",
-		Name:    "high-error-rate",
-		AppID:   "my-app",
-		Action:  state.AlertActionRollback,
+		ID:        "rule-1",
+		Name:      "high-error-rate",
+		AppID:     "my-app",
+		Action:    state.AlertActionRollback,
 		AccountID: "acct-1",
 	}
 }
