@@ -146,7 +146,7 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 	// UPSERT keyed on (rule_id, hour_bucket).
 	start := now.Add(-1 * time.Hour)
 	end := now.Add(1 * time.Hour)
-	if _, err := mirrorRollup.RollupOnce(ctx, pool, start, end); err != nil {
+	if _, err := mirrorRollup.RollupOnce(ctx, mirrorPoolAdapter{pool}, start, end); err != nil {
 		t.Fatalf("RollupOnce: %v", err)
 	}
 
@@ -188,16 +188,16 @@ func TestE2E_MirrorSweep_DeletesOnlyStaleRows(t *testing.T) {
 
 	// 3 stale (8d), 2 fresh (1d).
 	for i := 0; i < 3; i++ {
-		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(8*24*time.Hour+time.Duration(i)*time.Hour)),
+		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(8*24*time.Hour + time.Duration(i)*time.Hour)),
 			false, false, false, false, false)
 	}
 	for i := 0; i < 2; i++ {
-		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(24*time.Hour+time.Duration(i)*time.Hour)),
+		seedMirrorLedgerRow(t, pool, ruleID, appID, now.Add(-(24*time.Hour + time.Duration(i)*time.Hour)),
 			false, false, false, false, false)
 	}
 
 	cutoff := now.Add(-7 * 24 * time.Hour)
-	if _, err := mirrorRollup.SweepOldLedgerRows(ctx, pool, cutoff); err != nil {
+	if _, err := mirrorRollup.SweepOldLedgerRows(ctx, mirrorPoolAdapter{pool}, cutoff); err != nil {
 		t.Fatalf("SweepOldLedgerRows: %v", err)
 	}
 
@@ -223,3 +223,17 @@ WHERE mirror_rule_id = $1
 // file compiles cleanly whether the skip branch fires or not.
 var _ = httptest.NewRequest
 var _ = http.MethodGet
+
+// mirrorPoolAdapter (PR-A3 commit 5) adapts *pgxpool.Pool to the
+// mirror.execer contract (Exec returning (int64, error)). Mirrors
+// cmd/schedd/main.go::mirrorPoolAdapter + cmd/meterd/main.go::poolAdapter
+// — both wrappers exist because pkg/mirror / pkg/meter deliberately
+// avoid importing pgxpool directly so the rollup package stays
+// unit-testable without a Postgres dependency. Tests in cmd/e2e
+// reach the rollup via the same seam.
+type mirrorPoolAdapter struct{ pool *pgxpool.Pool }
+
+func (a mirrorPoolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, error) {
+	tag, err := a.pool.Exec(ctx, sql, args...)
+	return tag.RowsAffected(), err
+}

@@ -128,6 +128,11 @@ func (d *defaultMirrorRoundTripper) RoundTripMirror(ctx context.Context, target 
 // the per-request ledger insert is a future optimisation to
 // avoid a two-step record+rollup).
 func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID string, sourceTarget *Target, rule MirrorRuleRow, srcReq *http.Request, sourceBody []byte, rec *statusRecorder) {
+	// The mirror goroutine outlives the customer's request. The goroutine's
+	// own ctx is rooted at context.Background() with a MirrorMaxLifetimeSeconds
+	// deadline (ADR-098 detached-ctx pattern, mirrors pkg/gateway/gate.go:172);
+	// parentCtx is captured only so we can pull the committed status off the
+	// proxy after WriteHeader fired. Per-call //nolint:contextcheck below.
 	if h == nil || h.backend == nil {
 		return
 	}
@@ -158,6 +163,7 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	defer cancel()
 
 	// 1. Schedule the mirror VM.
+	//nolint:contextcheck // ctx is rooted at context.Background() (ADR-098 detached-ctx pattern)
 	instanceID, _, err := h.backend.ScheduleMirror(ctx, rule.AppID, rule.MirrorDeploymentID, rule.ID)
 	if err != nil {
 		resultLabel := "sched_error"
@@ -187,6 +193,7 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	// captured, the proxy owns r.Body downstream, and reading
 	// srcReq.Body here would close it on the source side (code-review
 	// #2 fix).
+	//nolint:contextcheck // ctx is detached (ADR-098)
 	mirrorReq, buildErr := h.buildMirrorRequest(ctx, rule, srcReq, sourceBody)
 	if buildErr != nil {
 		if h.metrics != nil {
@@ -206,6 +213,7 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	targetURL := mirrorTargetURL(sourceTarget)
 
 	start := time.Now()
+	//nolint:contextcheck // ctx is detached (ADR-098)
 	resp, err := rt.RoundTripMirror(ctx, targetURL, mirrorReq)
 	latency := time.Since(start)
 	if err != nil {
@@ -218,7 +226,7 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 		}
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	mirrorBody, _ := io.ReadAll(resp.Body)
 
 	// 4. Classify. Source side: read the committed status from
@@ -357,27 +365,6 @@ func shouldMirrorRequest(percent int, pickedDeploymentID string) bool {
 }
 
 // cloneRequestForMirror (issue #72 / ADR-124 PR-A3) returns a
-// deep copy of the source request safe for the dispatch goroutine
-// to consume. The customer response is already on the wire by the
-// time dispatchMirror fires; the source request's Body may have
-// been consumed by the upstream proxy. Cloning the request means
-// the goroutine can re-read Body without disturbing the live
-// proxy. The Host header is intentionally NOT cloned — the mirror
-// VM is a sibling deployment and the bridge handles the host →
-// netns mapping.
-func cloneRequestForMirror(src *http.Request) *http.Request {
-	if src == nil {
-		return nil
-	}
-	clone := src.Clone(src.Context())
-	clone.Header = src.Header.Clone()
-	// Body is intentionally NOT closed here — the handler's
-	// ReverseProxy owns its lifecycle. dispatchMirror reads the
-	// clone's body when scheduling the mirror request and
-	// closes only the bytes it captures.
-	return clone
-}
-
 // snapshotRequestForMirror (issue #72 / ADR-133 / ADR-125 PR-A3
 // code-review fix) returns a deep copy of the source request whose
 // Body is a fresh bytes.Reader over the already-captured body

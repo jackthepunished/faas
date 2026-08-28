@@ -9,7 +9,7 @@
 // The dashboard's mirror summary chip and the §12 mirror drift-rate
 // alert want hour-grain counts over the rule lifetime without
 // scanning the raw table on every read. mirror_invocation_summary
-// (migrations/00430_mirror_invocation_summary.sql) is the rollup
+// (migrations/00501_mirror_invocation_summary.sql) is the rollup
 // table; this package owns the writer.
 //
 // Design parallels pkg/meter/rollup.go (usage_daily) and

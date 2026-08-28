@@ -43,7 +43,7 @@ Six atomic commits, each independently reviewable in ~10 min:
 
 3. **`feat(gateway): mirror redact + dispatch goroutine + handler fanout + metrics`** — `pkg/gateway/mirror_redact.go` (header strip + classify), `pkg/gateway/mirror_dispatch.go` (detached-ctx goroutine), post-Pick fan-out block in `pkg/gateway/handler.go`, three `gateway_mirror_*` metrics registered in `NewMetrics`, `kind="mirror"` notify branch in `cmd/gatewayd-internal/backend.go::handleInvalidation`.
 
-4. **`feat(state): mirror_invocation_summary rollup + retention sweep`** — `migrations/00430_mirror_invocation_summary.sql` (PRIMARY KEY `(rule_id, hour_bucket)`, additive-merge UPSERT), `pkg/mirror/rollup.go` (`RollupOnce` / `SweepOldLedgerRows` / `RollupLoop`), wired into `cmd/schedd/main.go` next to the scale-up triggers.
+4. **`feat(state): mirror_invocation_summary rollup + retention sweep`** — `migrations/00501_mirror_invocation_summary.sql` (PRIMARY KEY `(rule_id, hour_bucket)`, additive-merge UPSERT), `pkg/mirror/rollup.go` (`RollupOnce` / `SweepOldLedgerRows` / `RollupLoop`), wired into `cmd/schedd/main.go` next to the scale-up triggers.
 
 5. **`feat(e2e): traffic_mirror_e2e_test`** — three Postgres-backed e2e pins for the rollup + sweep contracts.
 
