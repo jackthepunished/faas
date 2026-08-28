@@ -319,6 +319,20 @@ func (r hostRuntime) reconcileServiceTopology(ctx context.Context, allowed []str
 				return fmt.Errorf("inspect omitted unit %s: %w", unit, statErr)
 			}
 		}
+		if !masked {
+			// systemd cannot replace a regular unit file in
+			// /etc/systemd/system with a mask, even with --force. These
+			// files are part of the deployctl-managed FaaS unit namespace,
+			// so remove the stale copy after it has been stopped/disabled
+			// and before creating the mask. Preserve an existing mask above.
+			if _, err := os.Lstat(unitPath); err == nil {
+				if err := os.Remove(unitPath); err != nil {
+					return fmt.Errorf("remove omitted unit %s: %w", unit, err)
+				}
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("inspect omitted unit %s: %w", unit, err)
+			}
+		}
 		if err := runCommand(ctx, "systemctl", "mask", "--force", unit); err != nil {
 			return fmt.Errorf("mask omitted unit %s: %w", unit, err)
 		}
