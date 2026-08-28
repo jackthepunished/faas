@@ -295,7 +295,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// _otel_spans_truncated_total, _otel_auth_failures_total)
 	// that need a separate registry so the §12 OTel spans
 	// panel can scrape them. The OpsMetrics is mounted on the
-	// control mux via ControlMuxWithExtra's extraGatherer.
+	// control mux via ControlMuxWithExtra's extraGatherer
+	// alongside the request-budget registry (PR-D code-review
+	// #9 — both regsitries are combined into a
+	// prometheus.Gatherers below).
 	opsMetrics := wire.NewOpsMetrics("gatewayd_public")
 	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
 	// request to gatewayd-internal carries the same trace context
@@ -453,11 +456,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 	publicHandler := budgetCfg.Middleware(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
 	publicHandler = httpsec.Static(publicHandler)
 
-	// Control mux + listeners. Pass budgetReg as the extraGatherer so
-	// /metrics exposes the budget histogram + exceeded-counter
-	// alongside the default gateway series, and pass drainTracker so
-	// every control request is counted during graceful shutdown.
-	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, opsMetrics.Registry(), probe.ReadyFunc(), drainTracker)
+	// Control mux + listeners. Combine opsMetrics.Registry() with
+	// budgetReg into a prometheus.Gatherers so /metrics exposes
+	// BOTH the apid-wires-pr-D counters (otel_spans_*) AND the
+	// request-budget histogram + exceeded-counter. The previous
+	// wiring passed only opsMetrics.Registry() — budgetReg was
+	// constructed at line 318 but never registered, silently
+	// dropping gateway_request_budget_* from the scrape (PR-D
+	// code-review #9; SLO blindness for the budget tier).
+	// Pass drainTracker so every control request is counted
+	// during graceful shutdown.
+	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics,
+		prometheus.Gatherers{opsMetrics.Registry(), budgetReg},
+		probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	// Multi-host safety cluster PR-8 (audit F8-A): in multi-host
