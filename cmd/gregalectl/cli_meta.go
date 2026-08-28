@@ -68,6 +68,7 @@ type cliFlag struct {
 //   - compute-nodes   (add | list | show | drain | drain-status | activate | force-drain)
 //   - deploy          (join-node | add-node)
 //   - obs             (health)
+//   - debug           (otel-smoke; ADR-127 PR-D)
 //   - trusted-publishers (add | remove | list) — see ADR-058 deviation note in main.go:15
 //   - version         (internal)
 //   - completion      (bash | zsh | fish | powershell) (internal)
@@ -514,6 +515,32 @@ var cliCommands = []cliCommand{
 					{Name: "json", Short: "emit raw JSON snapshot (overrides human summary)"},
 					{Name: "admin-token", Short: "admin bearer for the FAAS_ADMIN_EMAILS allowlist (default: $FAAS_ADMIN_TOKEN)"},
 					{Name: "timeout", Short: "HTTP timeout for the apid round-trip (default 10s)"},
+				},
+			},
+		},
+	},
+	{
+		// ADR-127 PR-D — operator-side smoke harness for the
+		// OTel spans writer. Posts a hand-crafted 3-span
+		// ExportTraceServiceRequest to the local gatewayd-public
+		// and asserts 200 + accepted_spans == 3. Used for
+		// end-to-end verification at PR-D ship time — the
+		// operator runs the smoke, then runs a `psql` SELECT
+		// on request_telemetry.spans_summary to confirm the
+		// writer landed.
+		Name:    dispatchDebug,
+		DocSlug: "debug",
+		Short:   "Operator-side smoke harness for the OTel spans writer (debug otel-smoke; ADR-127 PR-D)",
+		Subcommands: []cliSub{
+			{
+				Name:  subDebugOtel,
+				Short: "POST a 3-span ExportTraceServiceRequest to gatewayd-public /v1/otel/v1/traces and assert 200 + accepted_spans==3",
+				Flags: []cliFlag{
+					{Name: "token", Short: "Bearer token for the OTLP POST (default: $FAAS_API_KEY)"},
+					{Name: "trace-id", Short: "32-char lowercase hex trace_id for the smoke (default: all-zero)"},
+					{Name: "expected-spans", Short: "expected accepted_spans value from the handler response (default 3)"},
+					{Name: "timeout", Short: "HTTP timeout for the gatewayd-public round-trip (default 10s)"},
+					{Name: "json", Short: "emit structured JSON to stdout (overrides human summary)"},
 				},
 			},
 		},

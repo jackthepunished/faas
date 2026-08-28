@@ -54,6 +54,8 @@ Commands:
   secrets      Post-bootstrap secrets init (secrets init|rotate|status|stamp; PR-X / issue #911 / ADR-110)
   compute-nodes  Compute-node state machine (add|drain|drain-status|activate|force-drain; PR-A / multi-host scale-out)
   deploy        Provider-neutral node adoption + fleet topology tools (deploy claim|fleet-bundle|join-node|join-fleet|rollback-node|add-node)
+  obs           Operator-side meta-obs health snapshot (obs health; Obs-Meta + Trace-IDs Mega-PR / C8)
+  debug         Operator-side smoke harness for the OTel spans writer (debug otel-smoke; ADR-127 PR-D)
   version      Print the CLI version
   completion   Print a shell completion script (bash|zsh|fish|powershell)
   man          Print the gregalectl(1) man page (or gregalectl-<command>(1) with one arg)
@@ -202,6 +204,15 @@ func run(args []string) int {
 		// Future subcommands (events / incidents) reserve the
 		// `obs` dispatcher for follow-on PRs.
 		return cmdObsDispatch(args[1:])
+	case dispatchDebug:
+		// ADR-127 PR-D — operator-side smoke harness for the
+		// OTel spans writer. `gregalectl debug otel-smoke`
+		// POSTs a hand-crafted 3-span ExportTraceServiceRequest
+		// to the local gatewayd-public's /v1/otel/v1/traces
+		// endpoint and asserts 200 + accepted_spans==3. Future
+		// subcommands (capture | decode) reserve the `debug`
+		// dispatcher for PR-C follow-ons.
+		return cmdDebugDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])
 		return 1
