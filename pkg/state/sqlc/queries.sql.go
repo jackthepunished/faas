@@ -5406,6 +5406,34 @@ func (q *Queries) UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgSta
 	return err
 }
 
+const updateSpansSummary = `-- name: UpdateSpansSummary :exec
+update request_telemetry
+   set spans_summary = $2::jsonb
+ where trace_id = $1
+   and received_at >= now() - interval '24 hours'
+`
+
+type UpdateSpansSummaryParams struct {
+	TraceID pgtype.Text
+	Column2 []byte
+}
+
+// ADR-127 PR-D: writer for spans_summary jsonb. The gatewayd-public
+// OTLP/HTTP handler coalesces incoming batches for the same trace_id
+// in-process (pkg/gateway/spans_accumulator.go) and flushes the
+// accumulated summary every FAAS_OTEL_FLUSH_INTERVAL (default 30s).
+// UPDATE (not INSERT) because the row already exists — the recorder
+// wrote it from the gateway edge
+// (pkg/gateway/request_telemetry_publisher.go). Last-writer-wins on
+// concurrent UPDATEs is acceptable; the 24h window bounds the index
+// seek to the partial index request_telemetry_trace_idx selectivity.
+// $N::jsonb cast is load-bearing — without it sqlc binds as text and
+// Postgres raises SQLSTATE 22P02 (invalid_text_representation).
+func (q *Queries) UpdateSpansSummary(ctx context.Context, db DBTX, arg UpdateSpansSummaryParams) error {
+	_, err := db.Exec(ctx, updateSpansSummary, arg.TraceID, arg.Column2)
+	return err
+}
+
 const updateTrigger = `-- name: UpdateTrigger :one
 update triggers set
   enabled = coalesce($2, enabled),

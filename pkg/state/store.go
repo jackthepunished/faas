@@ -5065,6 +5065,16 @@ type Store interface {
 	// recorder doesn't carry it).
 	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
 
+	// UpdateSpansSummary is the per-trace UPDATE called by the
+	// apid gRPC WriteSpansSummary handler (ADR-127 PR-D). It
+	// enriches the existing row with the OTel span summary jsonb
+	// payload coalesced by pkg/gateway/spans_accumulator.go. The
+	// 24h time window matches the partial index
+	// request_telemetry_trace_idx selectivity; last-writer-wins on
+	// concurrent UPDATEs is acceptable. summary is the raw JSON
+	// bytes (the caller has already validated json.Valid).
+	UpdateSpansSummary(ctx context.Context, traceID string, summary []byte) error
+
 	// ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
 	// Time-windowed (since, until) with hard limit; cursor pagination
 	// is by (received_at DESC, id) tuple, matching the

@@ -50,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
+	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -2260,6 +2261,6 @@ func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire
 		return nil, nil, fmt.Errorf("request telemetry listen: %w", err)
 	}
 	srv := grpc.NewServer()
-	registerRequestTelemetryReceiver(srv, store, ops, newTelemetryRateLimiter(), true)
+	registerRequestTelemetryReceiver(srv, store, ops, peraccount.NewLimiter(), true)
 	return srv, lis, nil
 }

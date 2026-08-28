@@ -20,14 +20,13 @@ package main
 import (
 	"context"
 	"errors"
-	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	apidpb "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -56,111 +55,13 @@ type requestTelemetryStore interface {
 	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
 }
 
-// telemetryRateLimiter is a per-account token bucket pool.
-// PR-B (ADR-127 §Decision 6): per-account caps live here, not in
-// Postgres. The bucket refill rate is DebugTelemetryRequestsPerMinute
-// / 60 tokens per second; the bucket capacity is the full
-// DebugTelemetryRequestsPerMinute so a customer can burst one
-// full minute's worth of telemetry before back-pressure kicks in.
-//
-// Concurrency: the inner map is guarded by a single mutex. The
-// per-bucket ops are O(1) (refill calc + token decrement). For
-// thousands of accounts the contention is fine — the receiver's
-// hot path runs once per row, not per goroutine.
-//
-// Plan caching: the rate limiter caches the resolved Limits per
-// account so a sustained-overflow customer doesn't pay an
-// AccountByID round-trip per row. The cache TTL is 60s — a plan
-// upgrade takes effect within a minute (well under the customer's
-// perception).
-type telemetryRateLimiter struct {
-	mu      sync.Mutex
-	bucket  map[uuid.UUID]*telemetryAccountBucket
-	limits  map[uuid.UUID]api.Limits // plan-derived caps, TTL 60s
-	cacheAt map[uuid.UUID]time.Time
-}
-
-type telemetryAccountBucket struct {
-	tokens     float64
-	lastRefill time.Time
-}
-
-// newTelemetryRateLimiter wires an empty limiter.
-func newTelemetryRateLimiter() *telemetryRateLimiter {
-	return &telemetryRateLimiter{
-		bucket:  make(map[uuid.UUID]*telemetryAccountBucket),
-		limits:  make(map[uuid.UUID]api.Limits),
-		cacheAt: make(map[uuid.UUID]time.Time),
-	}
-}
-
-// take returns (true, 0) when a token was taken successfully, or
-// (false, retryAfterMs) when the bucket was empty. bucketCap
-// (DebugTelemetryRequestsPerMinute) caps the bucket; a value of
-// 0 disables the limiter (every call is rate-limited, the
-// customer's plan doesn't include telemetry).
-func (r *telemetryRateLimiter) take(accountID uuid.UUID, bucketCap int) (bool, int64) {
-	if bucketCap <= 0 {
-		return false, 60_000 // 60s — match the standard rate-limit hint
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := time.Now()
-	b, ok := r.bucket[accountID]
-	if !ok {
-		b = &telemetryAccountBucket{
-			tokens:     float64(bucketCap),
-			lastRefill: now,
-		}
-		r.bucket[accountID] = b
-	} else {
-		// Refill: tokens accrue at bucketCap / 60 per second.
-		elapsed := now.Sub(b.lastRefill).Seconds()
-		if elapsed > 0 {
-			b.tokens += elapsed * float64(bucketCap) / 60.0
-			if b.tokens > float64(bucketCap) {
-				b.tokens = float64(bucketCap)
-			}
-			b.lastRefill = now
-		}
-	}
-	if b.tokens >= 1 {
-		b.tokens--
-		return true, 0
-	}
-	// Empty bucket. retry_after_ms = time until the next token
-	// accrues (one minute-token is bucketCap / 60 per second → 1
-	// token per (60 / bucketCap) seconds → 1000 * (60 / bucketCap)
-	// milliseconds).
-	retryMs := int64(60_000 / bucketCap)
-	if retryMs < 1 {
-		retryMs = 1
-	}
-	return false, retryMs
-}
-
-// cacheLimits stores the resolved per-account caps. Called once
-// per AccountByID round-trip (not per row).
-func (r *telemetryRateLimiter) cacheLimits(accountID uuid.UUID, limits api.Limits) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.limits[accountID] = limits
-	r.cacheAt[accountID] = time.Now()
-}
-
-// cachedLimits returns the cached limits + true if fresh, or
-// zero limits + false if the cache entry is older than 60s or
-// absent. Caller is responsible for the AccountByID round-trip
-// on cache miss.
-func (r *telemetryRateLimiter) cachedLimits(accountID uuid.UUID) (api.Limits, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cachedAt, ok := r.cacheAt[accountID]
-	if !ok || time.Since(cachedAt) > 60*time.Second {
-		return api.Limits{}, false
-	}
-	return r.limits[accountID], true
-}
+// telemetryRateLimiter is an alias for *peraccount.Limiter, kept as
+// a named type so the rest of the file (and any external callers
+// from cmd/apid/main.go) compile without churn. The implementation
+// moved to pkg/ratelimit/peraccount in ADR-127 PR-D so the
+// gatewayd-public OTel spans writer (PR-D Stage 3) can share the
+// same per-account bucket semantics.
+type telemetryRateLimiter = peraccount.Limiter
 
 // requestTelemetryReceiver is the in-package server implementation
 // of apidpb.RequestTelemetryServer. Wired by
@@ -185,7 +86,7 @@ type requestTelemetryReceiver struct {
 // newRequestTelemetryReceiver wires a production receiver.
 func newRequestTelemetryReceiver(store requestTelemetryStore, ops *wire.OpsMetrics, limiter *telemetryRateLimiter, enabled bool) *requestTelemetryReceiver {
 	if limiter == nil {
-		limiter = newTelemetryRateLimiter()
+		limiter = peraccount.NewLimiter()
 	}
 	return &requestTelemetryReceiver{store: store, ops: ops, limiter: limiter, enabled: enabled}
 }
@@ -245,7 +146,7 @@ func (r *requestTelemetryReceiver) handleOne(ctx context.Context, req *apidpb.In
 	}
 
 	// ---- 2. Resolve per-account rate cap ----
-	limits, ok := r.limiter.cachedLimits(accountID)
+	limits, ok := r.limiter.CachedLimits(accountID)
 	if !ok {
 		acct, accErr := r.store.AccountByID(ctx, accountID.String())
 		if accErr != nil {
@@ -256,7 +157,7 @@ func (r *requestTelemetryReceiver) handleOne(ctx context.Context, req *apidpb.In
 			return out
 		}
 		limits = api.MustLimitsFor(acct.Plan)
-		r.limiter.cacheLimits(accountID, limits)
+		r.limiter.CacheLimits(accountID, limits)
 	}
 	if !limits.DebugTelemetryEnabled {
 		// Plan doesn't include telemetry — same as rate-limit
@@ -268,7 +169,7 @@ func (r *requestTelemetryReceiver) handleOne(ctx context.Context, req *apidpb.In
 	}
 
 	// ---- 3. Per-account token bucket check ----
-	taken, retryAfter := r.limiter.take(accountID, limits.DebugTelemetryRequestsPerMinute)
+	taken, retryAfter := r.limiter.Take(accountID, limits.DebugTelemetryRequestsPerMinute)
 	if !taken {
 		out.Outcome = rtOutcomeRateLimited
 		out.RetryAfterMs = retryAfter

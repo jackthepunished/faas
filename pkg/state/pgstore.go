@@ -19217,6 +19217,20 @@ func (s *PgStore) InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertReq
 	return s.appErrorsQueries().InsertRequestTelemetry(ctx, s.pool, arg)
 }
 
+// UpdateSpansSummary enriches an existing request_telemetry row with
+// the OTel spans summary payload (ADR-127 PR-D). Called by the
+// apid gRPC WriteSpansSummary handler (Stage 4). summary is the
+// raw JSON bytes; the caller has already validated json.Valid. The
+// 24h WHERE clause bounds the index seek to the partial index
+// request_telemetry_trace_idx; rows outside the window are skipped
+// (no error — last-writer-wins).
+func (s *PgStore) UpdateSpansSummary(ctx context.Context, traceID string, summary []byte) error {
+	return s.appErrorsQueries().UpdateSpansSummary(ctx, s.pool, sqlc.UpdateSpansSummaryParams{
+		TraceID:  pgtype.Text{String: traceID, Valid: traceID != ""},
+		Column2:  summary,
+	})
+}
+
 // ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
 // The returned rows are the sqlc.Row struct; handlers convert to the
 // domain DebugTelemetryRow at the boundary.

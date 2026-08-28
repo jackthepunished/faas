@@ -15904,3 +15904,14 @@ func (m *MemStore) ListDeploymentsForCompare(_ context.Context, _ sqlc.ListDeplo
 func (m *MemStore) ListAppsWithRecentTelemetry(_ context.Context, _ pgtype.Interval) ([]pgtype.UUID, error) {
 	return nil, nil
 }
+
+// --- ADR-127 PR-D — spans_summary writer (MemStore stub) ---
+
+// UpdateSpansSummary is a no-op in MemStore. The OTel spans writer
+// runs only against the production PgStore (gatewayd-public flushes
+// the spans_summary jsonb via apid's WriteSpansSummary gRPC RPC);
+// the MemStore implementation exists solely to satisfy the Store
+// interface so unit tests that wire up a MemStore still compile.
+func (m *MemStore) UpdateSpansSummary(_ context.Context, _ string, _ []byte) error {
+	return nil
+}
