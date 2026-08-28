@@ -33,14 +33,23 @@ import (
 )
 
 // Outcome strings for the WriteSpansSummaryResponse stream.
-// The §12 metrics (`gatewayd_public_otel_spans_ingested_total`
-// keys off the gateway-side `inserted/rate_limited/db_error`
+// The §12 metrics (`otel_spans_writes_total` keys off the
+// apid-side `inserted/rate_limited/validation_error/db_error`
 // outcomes) match these literals — goconst-flagged so drift
 // breaks the lint gate.
+//
+// PR-D code-review #7: validation errors (bad trace_id regex,
+// invalid JSON, malformed account_id, CHECK violation) and
+// real Postgres failures used to share the `db_error` label.
+// Operators chasing a Postgres failover drill would see the
+// counter climb because customers were sending upper-case hex
+// trace_ids that pass the gateway regex but trip the DB CHECK.
+// Split the labels so the dashboard distinguishes.
 const (
-	swOutcomeInserted    = "inserted"
-	swOutcomeRateLimited = "rate_limited"
-	swOutcomeDBError     = "db_error"
+	swOutcomeInserted        = "inserted"
+	swOutcomeRateLimited     = "rate_limited"
+	swOutcomeValidationError = "validation_error"
+	swOutcomeDBError         = "db_error"
 )
 
 // traceIDPattern is the W3C trace-id regex — 32 lowercase hex
@@ -116,21 +125,21 @@ func (r *spansWriterReceiver) WriteSpansSummary(ctx context.Context, req *apidpb
 	// ---- 1. trace_id regex ----
 	traceID := req.GetTraceId()
 	if !traceIDPattern.MatchString(traceID) {
-		r.observe(swOutcomeDBError)
+		r.observe(swOutcomeValidationError)
 		return nil, status.Errorf(codes.InvalidArgument, "trace_id must match ^[0-9a-f]{32}$ (got len=%d)", len(traceID))
 	}
 
 	// ---- 2. summary_json parses as JSON ----
 	summary := req.GetSummaryJson()
 	if !json.Valid(summary) {
-		r.observe(swOutcomeDBError)
+		r.observe(swOutcomeValidationError)
 		return nil, status.Error(codes.InvalidArgument, "summary_json is not valid JSON")
 	}
 
 	// ---- 3. account_id UUID ----
 	accountID, err := uuid.Parse(req.GetAccountId())
 	if err != nil {
-		r.observe(swOutcomeDBError)
+		r.observe(swOutcomeValidationError)
 		return nil, status.Errorf(codes.Unauthenticated, "account_id malformed: %v", err)
 	}
 
@@ -159,13 +168,16 @@ func (r *spansWriterReceiver) WriteSpansSummary(ctx context.Context, req *apidpb
 
 	// ---- 5. UPDATE ----
 	if err := r.store.UpdateSpansSummary(ctx, traceID, summary); err != nil {
-		// pgx errors that are constraint violations (CHECK
-		// mismatch — trace_id format drift between client +
-		// server) → InvalidArgument so the gateway drops the
-		// entry without retrying. Anything else → Internal.
+		// PR-D code-review #7: a CHECK violation (trace_id
+		// format drift between client + server) is a
+		// VALIDATION failure, not a DB failure. The §12
+		// dashboard distinguishes validation_error from
+		// db_error so an operator chasing a Postgres
+		// failover drill doesn't get misled by client-side
+		// shape drift.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23514" {
-			r.observe(swOutcomeDBError)
+			r.observe(swOutcomeValidationError)
 			return nil, status.Errorf(codes.InvalidArgument, "constraint violation: %v", err)
 		}
 		r.observe(swOutcomeDBError)
