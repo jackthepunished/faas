@@ -2471,7 +2471,12 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 		} else if err := h.buildImageLayer(ctx, app, dep, acct); err != nil {
 			return err
 		}
-	case state.DeploymentKindTarball, state.DeploymentKindDockerfile:
+	case state.DeploymentKindTarball, state.DeploymentKindDockerfile,
+		state.DeploymentKindGitHub, state.DeploymentKindPreview:
+		// GitHub push/preview deployments arrive here after builderd has
+		// produced the OCI source-build tarball. They use the same local
+		// OCI conversion as tarball/dockerfile builds; function apps still
+		// need their runtime runner layered into the result.
 		if app.Type == state.AppTypeFunction || app.Runtime != "" {
 			if err := h.buildFunctionLayer(ctx, app, dep, acct); err != nil {
 				return err

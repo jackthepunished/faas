@@ -242,6 +242,58 @@ func TestHandleSnapshotBoot_BuildsAndPrimesForTarball(t *testing.T) {
 	}
 }
 
+func TestHandleSnapshotBoot_BuildsAndPrimesForGitHubFunction(t *testing.T) {
+	store := state.NewMemStore()
+	notif := &fakeNotifier{}
+	bld := &fakeBuilder{bytesOut: 4096}
+	bin := filepath.Join(t.TempDir(), "faas-runner")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHandlerWithBuilder(store, bld)
+	h.notif = notif
+	h.WithFunctionRunnerNode22(bin)
+
+	acct, _ := store.CreateAccount(context.Background(), "u@example.com", "pro")
+	app, _ := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "github-fn", Type: state.AppTypeFunction,
+		RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2, Runtime: RuntimeNode22,
+	})
+	dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Kind: state.DeploymentKindGitHub, SourcePath: "/tmp/source.tgz",
+	})
+	if err := store.SetDeploymentRootfs(context.Background(), dep.ID, "/tmp/oci.tar", sched.AppLayerKey(app.Slug, dep.ID), 4096); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.handleSnapshotBoot(context.Background(), snapshotBootPayload{
+		AppID: app.ID, DeploymentID: dep.ID,
+	}); err != nil {
+		t.Fatalf("handleSnapshotBoot: %v", err)
+	}
+	if len(bld.calls) != 1 {
+		t.Fatalf("Builder.Build calls = %d, want 1", len(bld.calls))
+	}
+	if bld.calls[0].FunctionRunnerPath != bin {
+		t.Errorf("FunctionRunnerPath = %q, want %q", bld.calls[0].FunctionRunnerPath, bin)
+	}
+	got, _ := store.DeploymentByID(context.Background(), dep.ID)
+	if got.Status != state.DeploySnapshotting {
+		t.Errorf("deployment status = %s, want snapshotting", got.Status)
+	}
+	primeFound := false
+	for _, c := range notif.calls {
+		if c.channel == db.NotifySnapshotPrime &&
+			strings.Contains(c.payload, app.ID) &&
+			strings.Contains(c.payload, dep.ID) {
+			primeFound = true
+		}
+	}
+	if !primeFound {
+		t.Errorf("expected NotifySnapshotPrime to schedd; got %v", notif.calls)
+	}
+}
+
 func TestHandleSnapshotBoot_RedeliverySafe(t *testing.T) {
 	store := state.NewMemStore()
 	bld := &fakeBuilder{}
