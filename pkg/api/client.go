@@ -3472,7 +3472,6 @@ func (c *Client) DeleteAppDataUpstream(ctx context.Context, slug, id string) err
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/upstreams/"+id, nil, nil)
 }
 
-<<<<<<< HEAD
 // GetAppsDeploymentOpenAPIDoc returns the OpenAPI document the
 // cold-boot probe captured for a deployment (issue #975 item #1 /
 // ADR-122). The probe runs unconditionally; this endpoint surfaces
