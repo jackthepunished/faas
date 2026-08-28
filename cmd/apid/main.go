@@ -1728,6 +1728,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			}()
 		}
 
+		// ADR-127 PR-D: gatewayd-public → apid AuthenticateKey
+		// unary RPC. Lives on /run/faas/auth.sock; the OTel spans
+		// writer refuses to start without it (fail-closed posture
+		// for an unauthenticated OTLP surface). Defaults to enabled
+		// when the env var is unset; set FAAS_AUTH_RPC_ENABLED=false
+		// to disable — but doing so will break the OTel handler
+		// at the gateway, which is the intended safe default.
+		if deps.getenv("FAAS_AUTH_RPC_ENABLED") != "false" {
+			authSrv, authLis, err := runAuthServer(ctx, srv.store, log)
+			if err != nil {
+				_ = l.Close()
+				return fmt.Errorf("apid: auth server: %w", err)
+			}
+			go func() {
+				log.Info("apid auth server listening")
+				if err := authSrv.Serve(authLis); err != nil {
+					log.Error("apid auth serve", "err", err)
+				}
+			}()
+		}
+
 		// ADR-095 PR-C: preview teardown janitor. Lives in apid
 		// (the sole writer to customer-intent tables per CLAUDE.md
 		// line 71) and drives preview rows through the
@@ -2262,5 +2283,28 @@ func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire
 	}
 	srv := grpc.NewServer()
 	registerRequestTelemetryReceiver(srv, store, ops, peraccount.NewLimiter(), true)
+	return srv, lis, nil
+}
+
+// runAuthServer brings up the Auth gRPC server (ADR-127 PR-D:
+// gatewayd-public → apid AuthenticateKey unary RPC). Listens on
+// /run/faas/auth.sock so the gateway-side dial is loopback-only
+// and TLS-free (single-box mode). The socket path is hard-coded
+// — gatewayd-public dials it via FAAS_APID_AUTH_SOCKET env.
+//
+// Returns the server (caller calls Serve) and the listener.
+// Errors here are non-fatal: the caller logs and continues
+// without the auth gRPC server (the apid HTTP listener still
+// serves; the gateway's OTel handler refuses to start without
+// auth, so a missing auth server == a missing OTel surface,
+// which is the desired fail-closed posture).
+func runAuthServer(ctx context.Context, store state.Store, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/auth.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("auth listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAuthReceiver(srv, store)
 	return srv, lis, nil
 }
