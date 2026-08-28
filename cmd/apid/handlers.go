@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -773,8 +774,9 @@ func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
 // effort; the dashboard renders the row even when the meter is
 // temporarily unavailable (meterd republishes every minute).
 //
-// GitHubInstall is left empty for now; slice 8 fills it from
-// githubd's bindings table once the daemon is live.
+// GitHubInstall is best-effort: expose the durable installation id when the
+// account has completed the GitHub App handshake; omit it on a miss or
+// transient read failure so account reads still succeed.
 func (s *server) accountResponse(ctx context.Context, acct state.Account, r *http.Request) api.AccountResponse {
 	l := api.MustLimitsFor(acct.Plan)
 	resp := api.AccountResponse{
@@ -790,6 +792,9 @@ func (s *server) accountResponse(ctx context.Context, acct state.Account, r *htt
 			IncludedGBHours: int64(l.IncludedGBHours),
 			AppLayerMaxMB:   l.AppLayerMaxMB,
 		},
+	}
+	if inst, err := s.store.GitHubInstallForAccount(ctx, acct.ID); err == nil {
+		resp.GitHubInstall = strconv.FormatInt(inst.InstallationID, 10)
 	}
 	if r != nil {
 		if n, err := s.store.CountDeployedApps(ctx, acct.ID); err == nil {

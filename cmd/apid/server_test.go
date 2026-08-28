@@ -120,6 +120,32 @@ func TestWhoami(t *testing.T) {
 	}
 }
 
+func TestWhoamiIncludesGitHubInstall(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	if err := e.store.UpsertGitHubInstall(context.Background(), state.GitHubInstall{
+		AccountID:        e.acct.ID,
+		InstallationID:   157230692,
+		DefaultBranch:    "main",
+		SealedToken:      []byte("ciphertext"),
+		TokenExpiresAt:   time.Now().Add(time.Hour),
+		AuditGithubLogin: "poyrazK",
+	}); err != nil {
+		t.Fatalf("UpsertGitHubInstall: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/account", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AccountResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.GitHubInstall != "157230692" {
+		t.Fatalf("github_install_id = %q, want %q", out.GitHubInstall, "157230692")
+	}
+}
+
 func TestAuthRejectsBadKey(t *testing.T) {
 	e := setup(t, api.PlanFree)
 	req := httptest.NewRequest("GET", "/v1/account", nil)
