@@ -2,8 +2,8 @@
 
 Drops the imaged systemd unit + example TOML + role/routing drop-ins. Does
 NOT enable or start imaged — the operator runs
-`systemctl enable --now faas-imaged` once `/etc/faas/sealed.env` is populated
-with `DATABASE_URL` (gap G2).
+`systemctl enable --now faas-imaged` once `/etc/faas/compute-db.env` is
+populated with both `DATABASE_URL` and `FAAS_VMMD_DBURL` (gap G2).
 
 ## Drop-ins
 

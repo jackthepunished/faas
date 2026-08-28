@@ -12,6 +12,10 @@
 - name: xfs — validate the requested storage device path
   ansible.builtin.stat:
     path: "{{ faas_storage_device }}"
+    # Provider-neutral callers should use a stable /dev/disk/by-id path.
+    # Follow that symlink so the assertion below evaluates the target block
+    # device rather than the symlink itself.
+    follow: true
   register: faas_storage_device_stat
   when: (faas_storage_device | default('') | trim) != ''
 
@@ -19,7 +23,7 @@
   ansible.builtin.assert:
     that:
       - faas_storage_device_stat.stat.exists
-      - faas_storage_device_stat.stat.isblkdev | default(false)
+      - faas_storage_device_stat.stat.isblk | default(false)
     fail_msg: >-
       faas_storage_device={{ faas_storage_device }} is not an existing block
       device. Refusing to guess or format a path.
