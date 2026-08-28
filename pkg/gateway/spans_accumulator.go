@@ -24,6 +24,7 @@
 package gateway
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -154,14 +155,46 @@ func NewSpansAccumulator() *SpansAccumulator {
 // the W3C trace-id hex from the customer's OTLP POST. The
 // accountID is resolved at the handler from the apid
 // AuthenticateKey RPC. Returns the post-dedupe span count.
-func (s *SpansAccumulator) Add(traceID string, accountID uuid.UUID, spans []summarizedSpan) int {
-	v, _ := s.buckets.LoadOrStore(traceID, &spansAccumulator{
+//
+// PR-D code-review #4: every Add re-validates that the bucket's
+// account_id matches the caller's account_id. The previous
+// LoadOrStore implementation silently kept the first POST's
+// account_id — a second POST for the same trace_id but a
+// rotated / different API key would silently write the NEW
+// account's spans_summary to the OLD account's
+// request_telemetry row (the SQL UPDATE doesn't bind
+// account_id, see code-review #1). On mismatch this Add
+// returns ErrAccountMismatch without touching the bucket;
+// the handler 401s the contested POST. The OLD account's
+// legitimate spans already buffered in the bucket are
+// preserved — they'll flush normally on the next tick.
+func (s *SpansAccumulator) Add(traceID string, accountID uuid.UUID, spans []summarizedSpan) (int, error) {
+	v, loaded := s.buckets.LoadOrStore(traceID, &spansAccumulator{
 		traceID:   traceID,
 		accountID: accountID,
 	})
+	if !loaded {
+		// First POST for this trace_id: ours is the canonical
+		// bucket. Add spans; cap-freeze is the handler's job
+		// (the truncation in #5 lives in flush, see below).
+		return v.(*spansAccumulator).add(spans), nil
+	}
 	bucket := v.(*spansAccumulator)
-	return bucket.add(spans)
+	bucket.mu.Lock()
+	match := bucket.accountID == accountID
+	bucket.mu.Unlock()
+	if match {
+		return bucket.add(spans), nil
+	}
+	return 0, ErrAccountMismatch
 }
+
+// ErrAccountMismatch is returned by Add when a trace_id is
+// being contended across accounts (rotated API key, replay,
+// multi-key account on the same trace). The handler should map
+// this to 401 / 400 — the request can't be safely coalesced
+// into the bucket.
+var ErrAccountMismatch = errors.New("spans accumulator: trace_id claimed by another account")
 
 // DrainAndRemove atomically extracts the accumulated spans for
 // one trace_id and deletes the bucket from the map. Returns

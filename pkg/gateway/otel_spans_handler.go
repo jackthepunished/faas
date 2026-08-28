@@ -227,7 +227,19 @@ func (h *OTelSpansHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Hand to the accumulator. NO DB IO at this point — the
 	// flush loop owns the write path (Stage 4).
-	h.cfg.Acc.Add(traceID, accountID, spans)
+	added, accErr := h.cfg.Acc.Add(traceID, accountID, spans)
+	if accErr != nil {
+		// PR-D code-review #4: a trace_id being contended
+		// across accounts (rotated API key, replay attempt,
+		// multi-key account on the same trace) is treated
+		// as a request-level failure — the bucket can't
+		// safely coalesce both. 401 prevents the wrong
+		// account's spans from landing in the wrong row.
+		h.observeAuthFailure("unauthenticated")
+		writeProblem(w, http.StatusUnauthorized, "trace_id claimed by another account")
+		return
+	}
+	_ = added // post-dedupe count; the 200 OK body uses the pre-truncation len(spans)
 
 	h.observeIngest("inserted")
 	w.Header().Set("Content-Type", "application/json")
