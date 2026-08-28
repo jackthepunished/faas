@@ -79,6 +79,7 @@ func (s *server) resolveOverflowNode(ctx context.Context, wire *string, strictEm
 func (s *server) listApps(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	apps, err := s.store.ListApps(r.Context(), acct.ID)
 	if err != nil {
+		s.log.Error("list apps failed", "account", acct.ID, "err", err)
 		api.WriteProblem(w, api.ErrCapacity("could not list apps"))
 		return
 	}
