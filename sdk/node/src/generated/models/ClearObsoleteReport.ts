@@ -9,7 +9,7 @@ export type ClearObsoleteReport = {
   app_slug: string;
   count: number;
   /**
-   * Go duration (e.g. 168h).
+   * Echoes the cutoff the store applied to this clear pass (e.g. 168h = 7 days).
    */
   older_than: string;
 };
