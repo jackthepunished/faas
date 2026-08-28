@@ -286,6 +286,34 @@ func TestCompute_DeploymentImmutable_HealthzClear(t *testing.T) {
 	}
 }
 
+// TestCompute_DeploymentImmutable_PortClear — code-review finding #3
+// hardening: clearing the port override (reverting to the default
+// by setting Manifest.Port=0) against a deployment with
+// OverridePort=8080 must emit would_create_deployment. The pre-review
+// guard `p.Manifest.Port != 0 && p.Manifest.Port != base.OverridePort`
+// short-circuited when the manifest cleared the field, silently
+// dropping the break and missing the customer-visible immutable
+// change. This test is the parity sibling of
+// TestCompute_DeploymentImmutable_HealthzClear above.
+func TestCompute_DeploymentImmutable_PortClear(t *testing.T) {
+	base := &api.DeploymentResponse{
+		OverridePort: 8080,
+	}
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
+	got := Compute("api", "", baseline, Pending{
+		Manifest: &api.AppManifest{Port: 0}, // explicitly clear (revert to default)
+	})
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "would_create_deployment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("clearing the port override must emit would_create_deployment; got %+v", got.Breaks)
+	}
+}
+
 // TestCompute_SchemaEnvChanged_KeyClear — code-review finding #4:
 // clearing every env key from the manifest (Env == empty map) must
 // still emit a schema_env_changed break when the baseline had

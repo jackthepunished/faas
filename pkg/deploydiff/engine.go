@@ -552,10 +552,16 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 // are immutable per dto.go:1326.
 //
 // The compare is non-empty-agnostic: clearing a previously-set
-// healthz path is as much an immutable change as setting a new one.
-// The earlier `!= ""` short-circuit masked that case (a fresh
-// manifest with Healthz:"" against a deployment with healthz=/healthz
-// silently emitted no break). See code-review finding #3.
+// field is as much an immutable change as setting a new one.
+// Two earlier `!= ""` / `!= 0` short-circuits were removed after
+// code-review caught that:
+//   - Healthz: clearing p.Manifest.Healthz against a deployment
+//     with healthz=/healthz silently emitted no break (fixed).
+//   - Port: clearing p.Manifest.Port (OverridePort=0 to revert to
+//     the default) against a deployment with OverridePort=8080
+//     silently emitted no break (fixed; SAFE-RELEASES code-review
+//     finding #3 hardening). See lines 555-558 / 571-573 for the
+//     sibling fixes.
 func diffDeployment(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if base == nil {
 		return
@@ -568,7 +574,11 @@ func diffDeployment(out *Diff, base *api.DeploymentResponse, p Pending) {
 		if !stringSliceEqual(p.Manifest.Entrypoint, base.OverrideEntrypoint) {
 			changes = append(changes, "entrypoint")
 		}
-		if p.Manifest.Port != 0 && p.Manifest.Port != base.OverridePort {
+		// Compare unconditionally — clearing the port (reverting to
+		// the default by setting Port=0) is itself an immutable
+		// change. (Pre-review the guard `p.Manifest.Port != 0`
+		// dropped the break when the manifest cleared the field.)
+		if p.Manifest.Port != base.OverridePort {
 			changes = append(changes, "port")
 		}
 		baseHCPath := ""
