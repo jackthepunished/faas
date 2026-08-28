@@ -42,6 +42,17 @@ const (
 	serviceFileSuffix = ".service"
 )
 
+// legacyManagedServices are the service names that the split-box topology
+// retired but that older one-box installs may still leave on disk. They are
+// included in topology convergence so a role-specific deployment also
+// removes the last mutable legacy service residue.
+var legacyManagedServices = []string{"gatewayd", "spool-sync"}
+
+func managedServiceNames() []string {
+	names := append([]string(nil), daemonunitspec.ActivationOrder()...)
+	return append(names, legacyManagedServices...)
+}
+
 // servicesInUnitDir returns the daemons actually shipped by a release
 // bundle, in dependency order. daemonunitspec.Registry is the catalog for
 // all roles, not the list for one host: a control-plane bundle must not try
@@ -260,12 +271,82 @@ func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
 	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 		return err
 	}
+	if err := r.reconcileServiceTopology(ctx, services); err != nil {
+		return err
+	}
+	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
 	for _, service := range services {
+		if err := runCommand(ctx, "systemctl", "unmask", "faas-"+service+".service"); err != nil {
+			return err
+		}
 		if err := runCommand(ctx, "systemctl", "enable", "faas-"+service+".service"); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// reconcileServiceTopology makes the service set in a verified release
+// authoritative on the host. Enabling the new role is not sufficient: an
+// older one-box or opposite-role install can leave a service enabled and
+// inactive, and it will return after reboot. Omitted managed services are
+// stopped, disabled, and masked; bundled services are unmasked before they
+// are enabled.
+func (r hostRuntime) reconcileServiceTopology(ctx context.Context, allowed []string) error {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, service := range allowed {
+		allowedSet[service] = struct{}{}
+	}
+	for _, service := range managedServiceNames() {
+		unit := "faas-" + service + ".service"
+		if _, ok := allowedSet[service]; ok {
+			continue
+		}
+
+		unitPath := filepath.Join(r.unitDir, unit)
+		masked, err := maskedUnit(unitPath)
+		if err != nil {
+			return fmt.Errorf("inspect omitted unit %s: %w", unit, err)
+		}
+		if !masked {
+			if _, statErr := os.Lstat(unitPath); statErr == nil {
+				if err := runCommand(ctx, "systemctl", "disable", "--now", unit); err != nil {
+					return fmt.Errorf("disable omitted unit %s: %w", unit, err)
+				}
+			} else if !os.IsNotExist(statErr) {
+				return fmt.Errorf("inspect omitted unit %s: %w", unit, statErr)
+			}
+		}
+		if err := runCommand(ctx, "systemctl", "mask", "--force", unit); err != nil {
+			return fmt.Errorf("mask omitted unit %s: %w", unit, err)
+		}
+	}
+	return nil
+}
+
+// maskedUnit recognises the systemd mask representation without invoking
+// systemctl. This lets convergence avoid sending `disable --now` to an
+// already-masked unit (which systemd rejects), while still reasserting the
+// mask below. Only the unit directory is inspected; these FaaS units are
+// installed there by Ansible and the CD path.
+func maskedUnit(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, err
+	}
+	return target == "/dev/null", nil
 }
 
 // baseStagingRoots are the two controller-owned staging trees the

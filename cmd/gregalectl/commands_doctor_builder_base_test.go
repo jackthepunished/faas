@@ -16,6 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/releasebundle"
 )
 
 // withBuilderBaseHooks installs test hooks for the duration of t and
@@ -224,6 +227,47 @@ func TestCheckBuilderBaseExt4_PathOverride(t *testing.T) {
 	got := locateBuilderBasePathHook()
 	if got != custom {
 		t.Errorf("locateBuilderBasePathHook = %q, want %q (FAAS_BUILDER_BASE_PATH override)", got, custom)
+	}
+}
+
+func TestBuilderBaseRequiredUsesControllerDeploymentRole(t *testing.T) {
+	root := t.TempDir()
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	releaseRoot := filepath.Join(root, gitSHA)
+	if err := os.MkdirAll(filepath.Join(releaseRoot, "systemd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(releaseRoot, "systemd", "faas-apid.service"), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := releasebundle.Build(releaseRoot, gitSHA, gitSHA, "linux/amd64", time.Now())
+	if err != nil {
+		t.Fatalf("releasebundle.Build: %v", err)
+	}
+	if err := releasebundle.Write(releaseRoot, deployment); err != nil {
+		t.Fatalf("releasebundle.Write: %v", err)
+	}
+	t.Setenv("FAAS_BOX_ROLE", "")
+	orig := builderBaseRequiredHook
+	t.Cleanup(func() { builderBaseRequiredHook = orig })
+	builderBaseRequiredHook = func(context.Context) bool { return true }
+
+	if got := builderBaseRequired(context.Background(), &doctorDeps{releasesRoot: root, currentGitSHA: gitSHA}); got {
+		t.Fatal("control-plane deployment was classified as requiring builder base")
+	}
+
+	if err := os.WriteFile(filepath.Join(releaseRoot, "systemd", "faas-imaged.service"), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err = releasebundle.Build(releaseRoot, gitSHA, gitSHA, "linux/amd64", time.Now())
+	if err != nil {
+		t.Fatalf("releasebundle.Build compute: %v", err)
+	}
+	if err := releasebundle.Write(releaseRoot, deployment); err != nil {
+		t.Fatalf("releasebundle.Write compute: %v", err)
+	}
+	if got := builderBaseRequired(context.Background(), &doctorDeps{releasesRoot: root, currentGitSHA: gitSHA}); !got {
+		t.Fatal("compute deployment was not classified as requiring builder base")
 	}
 }
 
