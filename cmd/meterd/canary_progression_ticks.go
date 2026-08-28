@@ -153,6 +153,13 @@ func (a *canaryStoreAdapter) ListCanaryInFlight(ctx context.Context) ([]canary.C
 			CanaryTotalSteps:  d.CanaryTotalSteps,
 			CanaryStepStarted: canaryPtrTime(d.CanaryStepStartedAt),
 			RolloutState:      d.RolloutState,
+			// SAFE-RELEASES Stream F: pass through the row's
+			// canary_stages jsonb payload. Empty for catalog
+			// presets (the orchestrator never reads it for those);
+			// the canary Progression reads it ONLY when
+			// CanaryPreset == "custom" to rehydrate the
+			// synthesized Preset.
+			CanaryStages: d.CanaryStages,
 		})
 	}
 	return out, nil

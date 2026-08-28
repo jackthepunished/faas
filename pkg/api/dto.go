@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api/canary"
 	"github.com/onebox-faas/faas/pkg/statefuldenylist"
 )
 
@@ -959,16 +960,22 @@ type CreateDeploymentRequest struct {
 }
 
 // CanaryPresetSpec is the canary ladder a customer asks for on a
-// deploy (issue #976 / ADR-122 / SAFE-RELEASES-A). Preset is the
-// catalog name from pkg/api/canary (none/slow/balanced/aggressive/
-// 1-10-50-100). StepDurations is reserved for forward-compat —
-// customers who need a custom ladder land in a follow-up; today's
-// validator rejects any non-preset value with 400. The field is
-// exposed as a typed slice so a future preset=CUSTOM path only
-// needs to widen LookupPreset, not the DTO.
+// deploy (issue #976 / ADR-122 / SAFE-RELEASES-A + production-
+// leveling Stream F). Preset is the catalog name from
+// pkg/api/canary (none/slow/balanced/aggressive/1-10-50-100/custom).
+// When Preset is "custom", Stages is the customer-supplied ladder
+// (`percent` + duration string in time.ParseDuration form,
+// e.g. "1% at 30s, 10% at 2m, 100% at 0s").
+//
+// The wire-format change (StepDurations removed, Stages added) is
+// additive on the consumer side because the prior StepDurations
+// field was declared-but-dead (no client construction site in
+// the repo) — pre-PR clients never sent it. The CLI default
+// (`--canary-preset balanced`) keeps producing a wire shape that
+// matches the pre-PR form (Preset alone, no Stages).
 type CanaryPresetSpec struct {
-	Preset        string          `json:"preset"`
-	StepDurations []time.Duration `json:"step_durations,omitempty"`
+	Preset string                  `json:"preset"`
+	Stages []canary.CustomStage    `json:"stages,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on

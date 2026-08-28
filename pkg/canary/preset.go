@@ -57,6 +57,14 @@ type CanaryRow struct {
 	CanaryTotalSteps  int
 	CanaryStepStarted time.Time
 	RolloutState      string
+	// CanaryStages is the jsonb-serialised custom ladder when
+	// CanaryPreset == "custom" (SAFE-RELEASES production-leveling
+	// Stream F, migrations/00487). nil/empty for catalog presets
+	// (none/slow/balanced/aggressive/1-10-50-100) and for pre-PR
+	// rows. The runtime reads this column only when
+	// CanaryPreset == "custom"; the catalog resolution for the
+	// other 5 names stays on canarycatalog.LookupPreset.
+	CanaryStages json.RawMessage
 }
 
 // AuditEntry is the subset of state.DeploymentAudit the runtime
@@ -151,12 +159,48 @@ func (p *Progression) Once(ctx context.Context) (Stats, error) {
 	}
 	now := p.now()
 	for _, row := range rows {
-		preset, ok := canarycatalog.LookupPreset(row.CanaryPreset)
-		if !ok {
-			p.Log.Warn("canary: unrecognised preset; skipping",
-				"deployment_id", row.ID, "preset", row.CanaryPreset)
-			stats.SkippedUnknownPreset++
-			continue
+		// SAFE-RELEASES production-leveling Stream F: when
+		// CanaryPreset == "custom", the per-row stages live on
+		// the deployment row's canary_stages jsonb column. The
+		// catalog lookup returns a Preset with empty Stages
+		// (catalog membership is what makes AllowedCanaryPreset
+		// return true at write time); we rehydrate the actual
+		// ladder from row.CanaryStages via canarycatalog.
+		// LookupCustomPreset so the orchestrator's StageAt /
+		// TotalSteps path is uniform with catalog presets.
+		var preset canarycatalog.Preset
+		var ok bool
+		if row.CanaryPreset == "custom" {
+			if len(row.CanaryStages) == 0 {
+				p.Log.Warn("canary: custom preset with empty canary_stages; skipping",
+					"deployment_id", row.ID)
+				stats.SkippedUnknownPreset++
+				continue
+			}
+			var customStages []canarycatalog.CustomStage
+			if uerr := json.Unmarshal(row.CanaryStages, &customStages); uerr != nil || len(customStages) == 0 {
+				p.Log.Warn("canary: custom preset stages unparseable; skipping",
+					"deployment_id", row.ID, "err", uerr)
+				stats.SkippedUnknownPreset++
+				continue
+			}
+			custom, verr := canarycatalog.LookupCustomPreset(customStages)
+			if verr != nil {
+				p.Log.Warn("canary: custom preset validation failed; skipping",
+					"deployment_id", row.ID, "err", verr)
+				stats.SkippedUnknownPreset++
+				continue
+			}
+			preset = custom
+			ok = true
+		} else {
+			preset, ok = canarycatalog.LookupPreset(row.CanaryPreset)
+			if !ok {
+				p.Log.Warn("canary: unrecognised preset; skipping",
+					"deployment_id", row.ID, "preset", row.CanaryPreset)
+				stats.SkippedUnknownPreset++
+				continue
+			}
 		}
 		if row.CanaryStep < 0 || row.CanaryStep >= preset.TotalSteps() {
 			p.Log.Warn("canary: step out of bounds; skipping",

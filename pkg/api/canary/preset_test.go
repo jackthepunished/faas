@@ -15,7 +15,12 @@ import (
 )
 
 func TestAllowedCanaryPresets_ClosedSet(t *testing.T) {
-	want := []string{"none", "slow", "balanced", "aggressive", "1-10-50-100"}
+	// Stream F (SAFE-RELEASES production-leveling) widens the
+	// closed set with the "custom" entry — Stages come from
+	// the deployment row's canary_stages jsonb column, not the
+	// catalog. The migration's deployments_canary_preset_chk
+	// (00487) mirrors this list verbatim.
+	want := []string{"none", "slow", "balanced", "aggressive", "1-10-50-100", "custom"}
 	if len(AllowedCanaryPresets) != len(want) {
 		t.Fatalf("AllowedCanaryPresets = %v, want %v", AllowedCanaryPresets, want)
 	}
@@ -190,5 +195,74 @@ func TestPresetValidate_NegativeDuration(t *testing.T) {
 	}}
 	if err := bad.Validate(); err == nil {
 		t.Error("Validate accepted negative duration; want error")
+	}
+}
+
+// TestLookupCustomPreset_HappyPath — SAFE-RELEASES Stream F
+// (issue #976 / ADR-122 production-leveling). The custom
+// preset's stages come from the deployment row's
+// canary_stages jsonb column; LookupCustomPreset rehydrates +
+// validates the ladder before returning a Preset.
+func TestLookupCustomPreset_HappyPath(t *testing.T) {
+	got, err := LookupCustomPreset([]CustomStage{
+		{Percent: 1, Duration: "30s"},
+		{Percent: 10, Duration: "2m"},
+		{Percent: 50, Duration: "1m"},
+		{Percent: 100, Duration: "0s"},
+	})
+	if err != nil {
+		t.Fatalf("LookupCustomPreset: %v", err)
+	}
+	if got.Name != "custom" {
+		t.Errorf("Name = %q, want custom", got.Name)
+	}
+	if got.TotalSteps() != 4 {
+		t.Errorf("TotalSteps = %d, want 4", got.TotalSteps())
+	}
+	first, ok := got.StageAt(0)
+	if !ok || first.Percent != 1 || first.Duration != 30*time.Second {
+		t.Errorf("StageAt(0) = %+v; want {1, 30s}", first)
+	}
+	terminal, ok := got.StageAt(3)
+	if !ok || terminal.Percent != 100 || terminal.Duration != 0 {
+		t.Errorf("StageAt(3) terminal = %+v; want {100, 0}", terminal)
+	}
+}
+
+// TestLookupCustomPreset_EmptyRejects — empty stage list is
+// rejected; the "no ladder" case is preset="none", not
+// preset="custom" with empty stages.
+func TestLookupCustomPreset_EmptyRejects(t *testing.T) {
+	if _, err := LookupCustomPreset(nil); err == nil {
+		t.Error("LookupCustomPreset(nil) accepted; want error")
+	}
+	if _, err := LookupCustomPreset([]CustomStage{}); err == nil {
+		t.Error("LookupCustomPreset([]) accepted; want error")
+	}
+}
+
+// TestLookupCustomPreset_TerminalNot100 — Validate() rejects
+// non-100 terminal stages. Pins the safety check the apid
+// handler relies on to 422 before the row is written.
+func TestLookupCustomPreset_TerminalNot100(t *testing.T) {
+	_, err := LookupCustomPreset([]CustomStage{
+		{Percent: 1, Duration: "30s"},
+		{Percent: 50, Duration: "0s"}, // terminal below 100 → reject
+	})
+	if err == nil {
+		t.Error("LookupCustomPreset accepted terminal<100%; want error")
+	}
+}
+
+// TestLookupCustomPreset_BadDurationString — time.ParseDuration
+// failures surface as errors here so the apid handler can 422
+// with the field-level reason.
+func TestLookupCustomPreset_BadDurationString(t *testing.T) {
+	_, err := LookupCustomPreset([]CustomStage{
+		{Percent: 1, Duration: "not-a-duration"},
+		{Percent: 100, Duration: "0s"},
+	})
+	if err == nil {
+		t.Error("LookupCustomPreset accepted bad duration string; want error")
 	}
 }

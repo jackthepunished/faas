@@ -1534,6 +1534,16 @@ type Deployment struct {
 	CanaryStep            int        `json:"canary_step,omitempty"`
 	CanaryTotalSteps      int        `json:"canary_total_steps,omitempty"`
 	CanaryStepStartedAt   *time.Time `json:"canary_step_started_at,omitempty"`
+	// CanaryStages (SAFE-RELEASES production-leveling Stream F)
+	// is the jsonb-serialised canary ladder when CanaryPreset
+	// is "custom" (migrations/00487). The wire form is a
+	// []api/canary.CustomStage; the DB column is jsonb. NULL
+	// for every catalog preset (none / slow / balanced /
+	// aggressive / 1-10-50-100) and for pre-PR rows. The
+	// orchestrator's per-row resolve reads this column when
+	// CanaryPreset == "custom" (catalog presets resolve via
+	// canary.LookupPreset).
+	CanaryStages json.RawMessage `json:"canary_stages,omitempty"`
 
 	// Rollout state machine (issue #976 / ADR-122 / SAFE-RELEASES-F).
 	// Pending → RollingOut → Complete; Aborted reachable from

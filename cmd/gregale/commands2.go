@@ -854,6 +854,16 @@ func cmdDeployTarball(args []string) int {
 	// posture.
 	deployPersistExclude := fs.Bool("persist-exclude", false, "record --exclude slugs into deployment_scope_exclusions for future deploys (ADR-124 follow-up #3)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
+	// SAFE-RELEASES production-leveling Stream F: canary ladder
+	// selectors. --canary-preset picks a catalog entry
+	// (none/slow/balanced/aggressive/1-10-50-100) or "custom";
+	// --canary-stages is a comma-separated
+	// "percent@duration" list (e.g. "1@30s,10@2m,100@0s")
+	// required only when --canary-preset=custom. The CLI parses
+	// + validates BEFORE the network round-trip so a typo
+	// surfaces as an exit-2 error instead of a 422.
+	canaryPreset := fs.String("canary-preset", "", "canary preset name (none|slow|balanced|aggressive|1-10-50-100|custom); empty = no canary")
+	canaryStages := fs.String("canary-stages", "", "comma-separated percent@duration pairs for --canary-preset=custom (e.g. \"1@30s,10@2m,100@0s\")")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
 	// cmdApp / cmdAppScale. Mirrors the --warm-snapshot /
@@ -1513,6 +1523,7 @@ func cmdDeployTarball(args []string) int {
 		Tag:            annPtr(*tag),
 		DeployedBy:     annPtr(resolveDeployedBy(*deployedBy)),
 		PRNumber:       annIntPtr(*prNumber),
+		Canary:         buildCanarySpec(*canaryPreset, *canaryStages),
 	})
 	if err != nil {
 		return printErr("Deploy failed", err)
