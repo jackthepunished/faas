@@ -2,7 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { CanaryStage } from './CanaryStage.js';
+import type { CustomStage } from './CustomStage.js';
 /**
  * The canary ladder a customer asks for on a deploy (issue
  * #976 / ADR-122 / SAFE-RELEASES-A + production-leveling
@@ -26,6 +26,6 @@ export type CanaryPresetSpec = {
   /**
    * Per-stage ladder. Required when preset='custom' (the apid handler 422s otherwise); ignored for catalog presets (the catalog resolution runs server-side).
    */
-  stages?: Array<CanaryStage>;
+  stages?: Array<CustomStage>;
 };
 

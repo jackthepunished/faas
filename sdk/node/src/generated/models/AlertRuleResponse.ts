@@ -30,6 +30,10 @@ export type AlertRuleResponse = {
   webhook_secret_sealed_masked: string;
   cooldown_minutes: number;
   /**
+   * What to do when the rule fires. webhook = fire the configured webhook only (legacy default). rollback = roll the rule's app back to its last live deployment. demote = pin the current canary step (no traffic advance). promote = short-circuit the canary ladder to 100%.
+   */
+  action: 'webhook' | 'rollback' | 'demote' | 'promote';
+  /**
    * Cool-down state machine.
    */
   state: 'ok' | 'firing';

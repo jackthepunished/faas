@@ -11,7 +11,7 @@
  * form (e.g. "30s", "2m", "0s" for the terminal hop).
  *
  */
-export type CanaryStage = {
+export type CustomStage = {
   /**
    * Traffic share this stage moves to (0..100). The terminal stage must be 100.
    */

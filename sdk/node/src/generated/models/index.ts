@@ -99,6 +99,7 @@ export type { CreateTriggerRequest } from './CreateTriggerRequest.js';
 export type { CronResponse } from './CronResponse.js';
 export type { CronRun } from './CronRun.js';
 export type { CustomDomainResponse } from './CustomDomainResponse.js';
+export type { CustomStage } from './CustomStage.js';
 export type { DailyUsageListResponse } from './DailyUsageListResponse.js';
 export type { DailyUsageResponse } from './DailyUsageResponse.js';
 export type { DataUpstreamListResponse } from './DataUpstreamListResponse.js';
