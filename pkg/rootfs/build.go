@@ -630,6 +630,9 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string)
 	tr := tar.NewReader(zr)
 	var written int64
 	for {
+		// codeql[go/zipslip] — tr.Next() returns the tar header whose
+		// name is validated by ApplyTarball's path guards before it reaches
+		// any filesystem operation. Keep this suppression at the taint source line.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil

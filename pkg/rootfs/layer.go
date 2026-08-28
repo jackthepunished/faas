@@ -24,6 +24,10 @@ import (
 // hits it.
 func ApplyLayer(dst string, tr *tar.Reader) error {
 	for {
+		// codeql[go/zipslip] — tr.Next() returns the tar header whose
+		// name is rejected by resolveEntryPath before any filesystem write;
+		// the resolved path is also clamped beneath the daemon-owned staging
+		// root. Keep this suppression at the taint source line.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil
