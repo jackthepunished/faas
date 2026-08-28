@@ -85,15 +85,15 @@ ON CONFLICT (id) DO NOTHING
 		t.Fatalf("seed app: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-INSERT INTO deployments (id, app_id, image_digest, status, created_at)
-VALUES ($1::uuid, $2::uuid, 'sha256:e2e-source-' || $1::uuid, 'live', now())
+INSERT INTO deployments (id, app_id, scope, image_digest, status, created_at)
+VALUES ($1::uuid, $2::uuid, 'mirror-source', 'sha256:e2e-source-' || $1::uuid, 'live', now())
 ON CONFLICT (id) DO NOTHING
 `, sourceDeploymentID, appID); err != nil {
 		t.Fatalf("seed source deployment: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-INSERT INTO deployments (id, app_id, image_digest, status, created_at)
-VALUES ($1::uuid, $2::uuid, 'sha256:e2e-mirror-' || $1::uuid, 'live', now())
+INSERT INTO deployments (id, app_id, scope, image_digest, status, created_at)
+VALUES ($1::uuid, $2::uuid, 'mirror-target', 'sha256:e2e-mirror-' || $1::uuid, 'live', now())
 ON CONFLICT (id) DO NOTHING
 `, mirrorDeploymentID, appID); err != nil {
 		t.Fatalf("seed mirror deployment: %v", err)
