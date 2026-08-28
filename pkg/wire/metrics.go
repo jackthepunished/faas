@@ -542,6 +542,16 @@ type OpsMetrics struct {
 	// registered on every daemon; only gatewayd-public increments
 	// via IncrementGatewaydPublicOtelAuthFailures.
 	gatewaydPublicOtelAuthFailures *prometheus.CounterVec
+	// spansWriteOutcomes (ADR-127 PR-D) — counter the apid
+	// SpansWriter gRPC receiver increments per outcome.
+	// outcome ∈ {inserted, rate_limited, db_error}. `inserted`
+	// is a successful UPDATE on request_telemetry.spans_summary.
+	// `rate_limited` is the per-account token-bucket overflow
+	// on the write path. `db_error` is the per-row UPDATE
+	// failure. The closed label set keeps cardinality bounded.
+	// Single-registry: registered on every daemon; only apid
+	// increments via IncrementSpansWriteOutcome.
+	spansWriteOutcomes *prometheus.CounterVec
 	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
 	// gatewayd-internal recorder's in-process LRU fingerprint
 	// cache. Every hit is a record() that did NOT need to call
@@ -2908,6 +2918,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "OTel spans writer auth failures on the gatewayd-public POST /v1/otel/v1/traces handler (ADR-127 PR-D), labelled by reason ∈ {unauthenticated, plan_disabled, internal}. `unauthenticated` is the apid AuthenticateKey RPC rejecting the bearer token (hash miss, expired, revoked). `plan_disabled` is the customer's plan not including DebugTelemetryEnabled. `internal` is the apid RPC error (Postgres down, etc). Single-registry: registered on every daemon; only gatewayd-public increments via IncrementGatewaydPublicOtelAuthFailures.",
 	}, []string{"reason"})
 	commonCollectors = append(commonCollectors, gatewaydPublicOtelAuthFailures)
+	// ADR-127 PR-D: apid-side SpansWriter RPC outcomes. outcome
+	// ∈ {inserted, rate_limited, db_error}. Single-registry:
+	// registered on every daemon; only apid increments via
+	// IncrementSpansWriteOutcome.
+	spansWriteOutcomes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_otel_spans_writes_total",
+		Help: "Apid-side spans_writer RPC outcomes (ADR-127 PR-D), labelled by outcome ∈ {inserted, rate_limited, db_error}. `inserted` is the successful UPDATE on request_telemetry.spans_summary. `rate_limited` is the per-account token-bucket overflow on the write path. `db_error` is the per-row UPDATE failure (CHECK constraint, Postgres trip, etc). Single-registry: registered on every daemon; only apid increments via IncrementSpansWriteOutcome.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, spansWriteOutcomes)
 	// ADR-127 PR-B: regression cron tick gauge.
 	// Single-registry: registered on every daemon; only apid
 	// increments via DebugRegressionOldestPassSeconds.
@@ -3701,6 +3720,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		gatewaydPublicOtelSpansIngested:      gatewaydPublicOtelSpansIngested,
 		gatewaydPublicOtelSpansTruncated:     gatewaydPublicOtelSpansTruncated,
 		gatewaydPublicOtelAuthFailures:       gatewaydPublicOtelAuthFailures,
+		spansWriteOutcomes:                   spansWriteOutcomes,
 		appErrorsPurges:                      appErrorsPurges,
 		debugRegressionOldestPassSeconds:     debugRegressionOldestPassSeconds,
 		debugRegressionSkippedFlagDisabled:   debugRegressionSkippedFlagDisabled,
@@ -4192,6 +4212,20 @@ func (m *OpsMetrics) IncrementGatewaydPublicOtelAuthFailures(reason string) {
 		return
 	}
 	m.gatewaydPublicOtelAuthFailures.WithLabelValues(reason).Inc()
+}
+
+// IncrementSpansWriteOutcome increments the apid-side spans
+// writer counter by outcome. outcome ∈ {inserted, rate_limited,
+// db_error}. nil-safe — no-op if m is nil. Distinct from
+// gatewaydPublicOtelSpansIngested (gateway-side) because the
+// apid counter fires once per WriteSpansSummary RPC, not per
+// OTLP POST — they're at different layers of the protocol
+// stack.
+func (m *OpsMetrics) IncrementSpansWriteOutcome(outcome string) {
+	if m == nil || m.spansWriteOutcomes == nil {
+		return
+	}
+	m.spansWriteOutcomes.WithLabelValues(outcome).Inc()
 }
 
 // ObserveAppErrorsFingerprintCacheHit increments the in-process

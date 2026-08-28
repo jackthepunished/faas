@@ -374,14 +374,46 @@ func run(ctx context.Context, log *slog.Logger) error {
 		if authErr != nil {
 			return fmt.Errorf("gatewayd-public: dial apid auth at %q: %w", authTarget, authErr)
 		}
+		spansAcc := gateway.NewSpansAccumulator()
 		otelHandler := gateway.NewOTelSpansHandler(gateway.OTelSpansHandlerConfig{
 			AuthClient: authCli,
 			Limiter:    peraccount.NewLimiter(),
-			Acc:        gateway.NewSpansAccumulator(),
+			Acc:        spansAcc,
 			Ops:        opsMetrics,
 			Drain:      drainTracker,
 		})
 		traceMux.Handle("/v1/otel/v1/traces", otelHandler)
+
+		// Stage 4 flush loop — drains the accumulator every
+		// FAAS_OTEL_FLUSH_INTERVAL seconds (default 30s) and
+		// ships each (trace_id, summary_json, account_id)
+		// triple to apid's WriteSpansSummary RPC. The dial
+		// is lazy: the loop is wired first, the actual
+		// connection happens on the first flush.
+		spansWriterTarget := envOr("FAAS_APID_OTEL_SPANS_WRITER_SOCKET", "/run/faas/otel_spans_writer.sock")
+		spansWriterCli, spansWriterErr := apidgrpc.DialSpansWriter(ctx, spansWriterTarget, nil)
+		if spansWriterErr != nil {
+			return fmt.Errorf("gatewayd-public: dial apid spans writer at %q: %w", spansWriterTarget, spansWriterErr)
+		}
+		flushInterval := 30 * time.Second
+		if v := os.Getenv("FAAS_OTEL_FLUSH_INTERVAL"); v != "" {
+			if d, parseErr := time.ParseDuration(v); parseErr == nil && d > 0 {
+				flushInterval = d
+			}
+		}
+		go func() {
+			err := spansAcc.RunFlushLoop(ctx, gateway.FlushLoopConfig{
+				Interval: flushInterval,
+				WriteFn: func(flushCtx context.Context, traceID string, summaryJSON []byte, accountID string) (string, int64, error) {
+					return spansWriterCli.WriteSpansSummary(flushCtx, traceID, summaryJSON, accountID)
+				},
+				Log: slog.Default(),
+			})
+			if err != nil {
+				log.Error("otel spans flush loop exited", "err", err)
+			}
+			_ = spansWriterCli.Close()
+		}()
 	}
 	traceMux.Handle("/", controlPlaneHandler)
 

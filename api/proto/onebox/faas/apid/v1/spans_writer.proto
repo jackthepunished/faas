@@ -1,0 +1,81 @@
+// spans_writer — production debugger spans_summary writer RPC
+// (ADR-127 PR-D). gatewayd-public flushes its per-trace coalesce
+// accumulator (Stage 3) to apid over a unix socket so the
+// request_telemetry.spans_summary jsonb column gets populated
+// for PR-C's prose synthesis to read.
+//
+// Wire discipline mirrors the sibling apid/v1/auth.proto service:
+// checked-in *.pb.go generated with paths=source_relative,
+// auth is the unix-socket DAC model (mode 0660 group `faas`,
+// ADR-015) on /run/faas/otel_spans_writer.sock.
+//
+// The RPC is unary (not streaming) because the gateway's flush
+// loop drives the call cadence — one RPC per accumulated trace_id
+// every 30s. A streaming RPC would require matching the
+// accumulator drain to the stream boundary; the simpler 1:1
+// shape avoids that bookkeeping at the cost of one RPC per
+// trace_id per flush window. Production traffic is one customer
+// with maybe 10-20 trace_ids in flight at a time — the RPC
+// volume is bounded.
+
+syntax = "proto3";
+
+package onebox.faas.apid.v1;
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1;apidpb";
+
+// SpansWriter is the gRPC service apid exposes on
+// /run/faas/otel_spans_writer.sock for the gatewayd-public
+// OTel spans accumulator flush (ADR-127 PR-D). Single RPC
+// writes one coalesced spans_summary jsonb to the matching
+// request_telemetry row by trace_id.
+service SpansWriter {
+  // WriteSpansSummary updates the matching request_telemetry
+  // row's spans_summary column. The server validates trace_id
+  // matches the W3C regex (32 lowercase hex chars) + the
+  // summary_json parses as JSON before issuing the UPDATE.
+  // Errors map to gRPC codes:
+  //   - InvalidArgument on trace_id regex mismatch or invalid
+  //     JSON.
+  //   - Unauthenticated when account_id doesn't parse (defensive
+  //     check; the gateway already validated this when accepting
+  //     the OTLP POST).
+  //   - Internal on Postgres errors.
+  rpc WriteSpansSummary(WriteSpansSummaryRequest) returns (WriteSpansSummaryResponse);
+}
+
+// WriteSpansSummaryRequest is one coalesced spans_summary
+// payload. The trace_id is the W3C hex form the request_telemetry
+// CHECK constraint enforces; account_id is the UUID of the
+// matching customer.
+message WriteSpansSummaryRequest {
+  // trace_id — W3C 32-char lowercase hex. Validated server-side
+  // before the UPDATE; mismatch → InvalidArgument.
+  string trace_id = 1;
+
+  // summary_json — already-coalesced + truncated spans array
+  // as a JSON object the gateway hands back to apid. Validated
+  // server-side as parseable JSON; mismatch → InvalidArgument.
+  bytes summary_json = 2;
+
+  // account_id — UUID of the matching customer. Used for the
+  // per-account rate-cap (Stage 4 takes one token per flush
+  // window, not per request; PR-B's caps cache carries across).
+  string account_id = 3;
+}
+
+// WriteSpansSummaryResponse is the per-flush outcome. outcome ∈
+// {inserted, rate_limited, db_error}. `inserted` is a successful
+// UPDATE; `rate_limited` means the per-account token bucket was
+// empty (gateway should drop this entry, log, retry next window);
+// `db_error` is a transient Postgres failure (gateway retries
+// the entry at the next flush).
+message WriteSpansSummaryResponse {
+  // outcome — see comment above for the closed enum.
+  string outcome = 1;
+
+  // retry_after_ms — populated when outcome == "rate_limited".
+  // Mirrors the IncrementRequestTelemetryResponse retry_after_ms
+  // shape so the gateway can apply the same back-off logic.
+  int64 retry_after_ms = 2;
+}

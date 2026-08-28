@@ -1749,6 +1749,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			}()
 		}
 
+		// ADR-127 PR-D: gatewayd-public → apid
+		// WriteSpansSummary unary RPC. The gateway's flush
+		// loop drains the per-trace accumulator (Stage 3)
+		// every 30s and ships each (trace_id, summary_json,
+		// account_id) triple to apid's writer. Gated by
+		// FAAS_OTEL_SPANS_WRITER_ENABLED (default true);
+		// killing it is the fail-closed kill-switch for the
+		// OTel writer's write path (the auth + handler can
+		// still run; they just stop landing writes).
+		if deps.getenv("FAAS_OTEL_SPANS_WRITER_ENABLED") != "false" {
+			swSrv, swLis, err := runSpansWriterServer(ctx, srv.store, srv.ops, log)
+			if err != nil {
+				_ = l.Close()
+				return fmt.Errorf("apid: otel spans writer server: %w", err)
+			}
+			go func() {
+				log.Info("apid otel spans writer server listening")
+				if err := swSrv.Serve(swLis); err != nil {
+					log.Error("apid otel spans writer serve", "err", err)
+				}
+			}()
+		}
+
 		// ADR-095 PR-C: preview teardown janitor. Lives in apid
 		// (the sole writer to customer-intent tables per CLAUDE.md
 		// line 71) and drives preview rows through the
@@ -2283,6 +2306,30 @@ func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire
 	}
 	srv := grpc.NewServer()
 	registerRequestTelemetryReceiver(srv, store, ops, peraccount.NewLimiter(), true)
+	return srv, lis, nil
+}
+
+// runSpansWriterServer brings up the SpansWriter gRPC server
+// (ADR-127 PR-D: gatewayd-public → apid WriteSpansSummary
+// unary RPC). Listens on /run/faas/otel_spans_writer.sock so
+// the gateway-side dial is loopback-only and TLS-free
+// (single-box mode). The socket path is hard-coded —
+// gatewayd-public dials it via FAAS_APID_OTEL_SPANS_WRITER_SOCKET
+// env (defaulting to the same path).
+//
+// Returns the server (caller calls Serve) and the listener.
+// Errors here are non-fatal: the caller logs and continues
+// without the spans_writer gRPC server (the apid HTTP listener
+// still serves; the gateway's OTel flush loop drops the entry
+// at the next tick).
+func runSpansWriterServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/otel_spans_writer.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("otel spans writer listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerSpansWriterReceiver(srv, store, ops, peraccount.NewLimiter(), true)
 	return srv, lis, nil
 }
 
