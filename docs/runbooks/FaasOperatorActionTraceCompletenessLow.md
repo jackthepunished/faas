@@ -29,18 +29,46 @@ worst-kind ratio across the 5 verb-oriented kinds
 (`force_park`, `force_cold_boot`, `force_restart`, `park_instance`,
 `restart_instance`; the 5 `.outcome` variants are pre-instantiated
 but only populated when schedd's terminal audit emit runs).
-A kind whose gauge has never been touched by the driver reads its
-`WithLabelValues(...)` default (`0.0`, NOT `1.0`), so first-time
-quantization may briefly under-read; the gauge is pre-instantiated
-for the 5 verb-oriented kinds via
+The gauge is pre-instantiated for the 5 verb-oriented kinds via
 `pkg/wire/metrics.go::operatorIntentKindClosedSet` (line 3196, the
-5-entry closed set feeding the pre-instantiation loop at 3232+).
+5-entry closed set feeding the pre-instantiation loop at 3232+) —
+every kind reads the Prometheus GaugeVec default (`0.0`, NOT `1.0`)
+until schedd's driver ticks and Sets it.
 The recording rule `obs:operator_action_trace_completeness_ratio`
 (used by both Page and Warn alerts + Dashboard B panel 4) wraps
 that `min(...)` in `clamp_min(0.001)` to avoid divide-by-zero in
-any downstream ratio comparison.
+any downstream ratio comparison, and applies a `unless on() (
+sum == 0) or on() vector(1)` cold-start guard: when EVERY kind
+is still at the Prometheus GaugeVec default (0 — i.e., the schedd
+driver has not yet ticked after a fresh boot), the rule returns
+1.0 (vacuous truth) instead of 0.001, so the Page alert does NOT
+fire false-positive at t=10m on every restart. A panic mid-tick
+that leaves some kinds Set and others at the Prometheus default
+still produces `sum != 0`, so the guard does NOT engage and the
+alert fires as before — preserving the panic-resilience contract
+pinned at `pkg/sched/operator_intent_completeness_test.go:118`.
 
-- **Page**: `obs:operator_action_trace_completeness_ratio:5m < 0.50`
+**Known limitation (finding #1 of `/code-review 1162`):** the guard
+also swallows the *pre-Set* panic case — when schedd's driver
+panics anywhere before reaching the Set loop at
+`pkg/sched/operator_intent_completeness.go:235-238`, every kind
+stays at the Prometheus default 0, `sum == 0` evaluates to true,
+the guard engages, and the Page alert stays silent. The
+compensating signal is `FaasOperatorActionTraceCompletenessLoopStalled`
+(info-tier, fires at `time() - timestamp(gauge) > 180 for 5m`) —
+but only when the schedd daemon has fully stopped scraping. For
+the "driver panicked, daemon still up" case there is currently
+no automatic alert; operators rely on `journalctl -u schedd` slog
+capture (the panic logs at the goroutine crash site). Tightening
+this would require a separate "first driver tick completed"
+counter — out of scope for this fix.
+
+Regression test: `pkg/promqlrules/testdata/obs_trace_completeness.test.yml`
+(Go-level driver at `pkg/promqlrules/rules_test.go:74` walks the
+testdata dir under `-tags=integration`; CI installs promtool
+explicitly per `.github/workflows/ci.yml:248-260`).
+
+- **Page**: `obs:operator_action_trace_completeness_ratio < 0.50`
   sustained 10m. At least one verb-oriented kind has fewer than half
   of its 5m-window audit rows carrying a non-NULL `events.trace_id`.
   Cross-daemon correlation is broken — the trace_id is the key that
@@ -206,7 +234,7 @@ while the page is firing anyway, so silencing all three is safe.
    gap): `systemctl restart schedd`. The driver's first pass after
    restart is immediate.
 2. **Confirm** the recording rule value rebounded:
-   `curl -fsS --data-urlencode 'query=obs:operator_action_trace_completeness_ratio:5m' http://127.0.0.1:9090/api/v1/query`.
+   `curl -fsS --data-urlencode 'query=obs:operator_action_trace_completeness_ratio' http://127.0.0.1:9090/api/v1/query`.
 3. If the bounce did not help, the audit emit site is dropping
    `trace_id` — that is a code change; file an `obs-meta` issue.
 

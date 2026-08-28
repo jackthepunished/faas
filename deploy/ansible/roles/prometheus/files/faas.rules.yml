@@ -1362,13 +1362,53 @@ groups:
       # down the file so any downstream alert that compares
       # against this value never divides by zero.
       #
+      # Cold-start guard: on a freshly-booted schedd node every
+      # kind in `schedd_operator_action_trace_completeness_ratio`
+      # reads the Prometheus GaugeVec default (0) until the
+      # driver ticks (~60s) and pre-fills vacuous truth (1.0)
+      # via its SQL aggregation (pkg/sched/operator_intent_
+      # completeness.go:172-179). The naive `min(gauge) = 0`
+      # would clamp_min to 0.001 and fire the Page alert
+      # `< 0.50 for 10m` false-positive at t=10m on every
+      # restart. The `unless ... or vector(1)` idiom substitutes
+      # 1.0 (vacuous truth) when `sum(gauge) == 0` (every kind
+      # still at the Prometheus default — the driver has not
+      # observed ANY rows yet) — same semantic the SQL
+      # aggregation uses, materialised at the alert layer so
+      # the gauge's pre-instantiation default of 0 stays
+      # untouched (the panic-resilience unit test at
+      # pkg/sched/operator_intent_completeness_test.go:118 and
+      # the pgtest sibling both pin that contract). A panic
+      # mid-driver-tick that leaves some kinds Set and others
+      # at the Prometheus default still surfaces as `min = 0
+      # AND sum > 0` and triggers the alert as before — the
+      # `sum == 0` guard only engages when EVERY kind is at
+      # the pre-tick default (i.e., the driver has never
+      # observed anything).
+      #
+      # Known limitation (finding #1 of /code-review 1162):
+      # the guard also swallows the *pre-Set* panic case —
+      # when schedd's driver panics anywhere before reaching
+      # the Set loop at pkg/sched/operator_intent_completeness
+      # .go:235-238, every kind stays at 0 and the Page alert
+      # stays silent. Compensating signal:
+      # FaasOperatorActionTraceCompletenessLoopStalled
+      # (info-tier, `time() - timestamp(gauge) > 180 for 5m`),
+      # which fires ONLY when the schedd daemon has fully
+      # stopped scraping. For the "driver panicked, daemon
+      # still up" case operators rely on `journalctl -u
+      # schedd` slog capture (the panic logs at the goroutine
+      # crash site). Tightening this requires a separate
+      # "first driver tick completed" counter — out of scope
+      # for this fix.
+      #
       # Page+warn pair share `family=obs_trace, component=schedd`
       # — alertmanager's inhibit rule (page suppresses warn when
       # [family, component] match) auto-pairs them so the warn
       # never pages through while the page is firing.
       # ─────────────────────────────────────────────────────────────────
       - record: obs:operator_action_trace_completeness_ratio
-        expr: clamp_min(min(schedd_operator_action_trace_completeness_ratio), 0.001)
+        expr: clamp_min((min(schedd_operator_action_trace_completeness_ratio) unless on() (sum(schedd_operator_action_trace_completeness_ratio) == 0)) or on() vector(1), 0.001)
 
       - alert: FaasOperatorActionTraceCompletenessLowPage
         expr: obs:operator_action_trace_completeness_ratio < 0.50
