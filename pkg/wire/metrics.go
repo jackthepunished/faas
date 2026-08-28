@@ -513,6 +513,45 @@ type OpsMetrics struct {
 	// Single-registry: registered on every daemon; only apid
 	// increments via IncrementRequestTelemetryRecorded.
 	requestTelemetryRecorded *prometheus.CounterVec
+	// gatewaydPublicOtelSpansIngested (ADR-127 PR-D) — counter
+	// the gatewayd-public POST /v1/otel/v1/traces handler
+	// increments per outcome. outcome ∈ {inserted, rate_limited,
+	// db_error, shape_invalid}. `inserted` is the
+	// customer-telemetry-spans panel (rate over 5m).
+	// `rate_limited` is the per-account token-bucket overflow
+	// path (DebugTelemetryRequestsPerMinute exceeded). `db_error`
+	// is the apid WriteSpansSummary RPC failure path.
+	// `shape_invalid` is the OTLP body parser rejection
+	// (malformed JSON, missing trace_id, etc). The closed label
+	// set keeps cardinality bounded. Single-registry: registered
+	// on every daemon; only gatewayd-public increments via
+	// IncrementGatewaydPublicOtelSpansIngested.
+	gatewaydPublicOtelSpansIngested *prometheus.CounterVec
+	// gatewaydPublicOtelSpansTruncated (ADR-127 PR-D) —
+	// truncation tripwire counter the gatewayd-public OTel
+	// handler increments once per POST whose inbound body
+	// exceeded DebugTelemetrySpansPerTrace. Unlabelled —
+	// single-registry pattern; only gatewayd-public increments
+	// via IncrementGatewaydPublicOtelSpansTruncated.
+	gatewaydPublicOtelSpansTruncated prometheus.Counter
+	// gatewaydPublicOtelAuthFailures (ADR-127 PR-D) —
+	// counter the gatewayd-public OTel handler increments when
+	// the apid AuthenticateKey RPC rejects the bearer token or
+	// the plan doesn't include telemetry. reason ∈
+	// {unauthenticated, plan_disabled, internal}. Single-registry:
+	// registered on every daemon; only gatewayd-public increments
+	// via IncrementGatewaydPublicOtelAuthFailures.
+	gatewaydPublicOtelAuthFailures *prometheus.CounterVec
+	// spansWriteOutcomes (ADR-127 PR-D) — counter the apid
+	// SpansWriter gRPC receiver increments per outcome.
+	// outcome ∈ {inserted, rate_limited, db_error}. `inserted`
+	// is a successful UPDATE on request_telemetry.spans_summary.
+	// `rate_limited` is the per-account token-bucket overflow
+	// on the write path. `db_error` is the per-row UPDATE
+	// failure. The closed label set keeps cardinality bounded.
+	// Single-registry: registered on every daemon; only apid
+	// increments via IncrementSpansWriteOutcome.
+	spansWriteOutcomes *prometheus.CounterVec
 	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
 	// gatewayd-internal recorder's in-process LRU fingerprint
 	// cache. Every hit is a record() that did NOT need to call
@@ -2844,6 +2883,50 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Production debugger per-request telemetry ingest outcomes (ADR-127 PR-B), labelled by outcome ∈ {inserted, rate_limited, db_error}. `inserted` is the customer-telemetry-ingest panel (rate over 5m). `rate_limited` is the per-account token-bucket overflow path (DebugTelemetryRequestsPerMinute exceeded). `db_error` is the per-row INSERT failure path. Single-registry: registered on every daemon; only apid increments via IncrementRequestTelemetryRecorded.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, requestTelemetryRecorded)
+	// ADR-127 PR-D: gatewayd-public OTel spans writer ingest
+	// outcomes. outcome ∈ {inserted, rate_limited, db_error,
+	// shape_invalid}. `inserted` is the customer-telemetry-spans
+	// panel; `rate_limited` is the per-account token-bucket
+	// overflow (DebugTelemetryRequestsPerMinute exceeded);
+	// `db_error` is the apid WriteSpansSummary RPC failure;
+	// `shape_invalid` is the OTLP body parser rejection
+	// (malformed JSON, missing trace_id, etc). Single-registry:
+	// registered on every daemon; only gatewayd-public
+	// increments via IncrementGatewaydPublicOtelSpansIngested.
+	gatewaydPublicOtelSpansIngested := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_gatewayd_public_otel_spans_ingested_total",
+		Help: "OTel spans writer ingest outcomes on the gatewayd-public POST /v1/otel/v1/traces handler (ADR-127 PR-D), labelled by outcome ∈ {inserted, rate_limited, db_error, shape_invalid}. `inserted` is the customer-telemetry-spans panel (rate over 5m). `rate_limited` is the per-account token-bucket overflow path (DebugTelemetryRequestsPerMinute exceeded). `db_error` is the apid WriteSpansSummary RPC failure path. `shape_invalid` is the OTLP body parser rejection (malformed JSON, missing trace_id, etc). Single-registry: registered on every daemon; only gatewayd-public increments via IncrementGatewaydPublicOtelSpansIngested.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, gatewaydPublicOtelSpansIngested)
+	// ADR-127 PR-D: truncation tripwire. Fires once per OTLP
+	// POST when the inbound body has more spans than the
+	// plan's DebugTelemetrySpansPerTrace ceiling. Unlabelled —
+	// single-registry pattern; only gatewayd-public increments
+	// via IncrementGatewaydPublicOtelSpansTruncated.
+	gatewaydPublicOtelSpansTruncated := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_gatewayd_public_otel_spans_truncated_total",
+		Help: "OTel spans writer truncation tripwire on the gatewayd-public POST /v1/otel/v1/traces handler (ADR-127 PR-D). Fires once per OTLP POST when the inbound body has more spans than the plan's DebugTelemetrySpansPerTrace ceiling (Hobby=50/Pro=200/Scale=1000). Sustained non-zero means the customer's app is chatty enough that the slowest-N selection is dropping signal — alertable via SpansTruncationRateSlo. Unlabelled — single-registry pattern; only gatewayd-public increments via IncrementGatewaydPublicOtelSpansTruncated.",
+	})
+	commonCollectors = append(commonCollectors, gatewaydPublicOtelSpansTruncated)
+	// ADR-127 PR-D: OTel auth failures (apid AuthenticateKey
+	// RPC rejections). reason ∈ {unauthenticated, plan_disabled,
+	// internal}. Single-registry: registered on every daemon;
+	// only gatewayd-public increments via
+	// IncrementGatewaydPublicOtelAuthFailures.
+	gatewaydPublicOtelAuthFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_gatewayd_public_otel_auth_failures_total",
+		Help: "OTel spans writer auth failures on the gatewayd-public POST /v1/otel/v1/traces handler (ADR-127 PR-D), labelled by reason ∈ {unauthenticated, plan_disabled, internal}. `unauthenticated` is the apid AuthenticateKey RPC rejecting the bearer token (hash miss, expired, revoked). `plan_disabled` is the customer's plan not including DebugTelemetryEnabled. `internal` is the apid RPC error (Postgres down, etc). Single-registry: registered on every daemon; only gatewayd-public increments via IncrementGatewaydPublicOtelAuthFailures.",
+	}, []string{"reason"})
+	commonCollectors = append(commonCollectors, gatewaydPublicOtelAuthFailures)
+	// ADR-127 PR-D: apid-side SpansWriter RPC outcomes. outcome
+	// ∈ {inserted, rate_limited, db_error}. Single-registry:
+	// registered on every daemon; only apid increments via
+	// IncrementSpansWriteOutcome.
+	spansWriteOutcomes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_otel_spans_writes_total",
+		Help: "Apid-side spans_writer RPC outcomes (ADR-127 PR-D), labelled by outcome ∈ {inserted, rate_limited, validation_error, db_error}. `inserted` is the successful UPDATE on request_telemetry.spans_summary. `rate_limited` is the per-account token-bucket overflow on the write path. `validation_error` is a client-side rejection (bad trace_id regex, invalid JSON, malformed account_id, DB CHECK violation) — PR-D code-review #7 split this from `db_error` so dashboards distinguish. `db_error` is a real Postgres failure (connection trip, transaction rollback). Single-registry: registered on every daemon; only apid increments via IncrementSpansWriteOutcome.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, spansWriteOutcomes)
 	// ADR-127 PR-B: regression cron tick gauge.
 	// Single-registry: registered on every daemon; only apid
 	// increments via DebugRegressionOldestPassSeconds.
@@ -3634,6 +3717,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsDedupeMerges:                appErrorsDedupeMerges,
 		appErrorsFlushDuration:               appErrorsFlushDuration,
 		requestTelemetryRecorded:             requestTelemetryRecorded,
+		gatewaydPublicOtelSpansIngested:      gatewaydPublicOtelSpansIngested,
+		gatewaydPublicOtelSpansTruncated:     gatewaydPublicOtelSpansTruncated,
+		gatewaydPublicOtelAuthFailures:       gatewaydPublicOtelAuthFailures,
+		spansWriteOutcomes:                   spansWriteOutcomes,
 		appErrorsPurges:                      appErrorsPurges,
 		debugRegressionOldestPassSeconds:     debugRegressionOldestPassSeconds,
 		debugRegressionSkippedFlagDisabled:   debugRegressionSkippedFlagDisabled,
@@ -4092,6 +4179,53 @@ func (m *OpsMetrics) IncrementRequestTelemetryRecorded(outcome string) {
 		return
 	}
 	m.requestTelemetryRecorded.WithLabelValues(outcome).Inc()
+}
+
+// IncrementGatewaydPublicOtelSpansIngested increments the OTel
+// spans writer ingest counter by outcome. outcome ∈ {inserted,
+// rate_limited, db_error, shape_invalid}. nil-safe — no-op if m
+// is nil.
+func (m *OpsMetrics) IncrementGatewaydPublicOtelSpansIngested(outcome string) {
+	if m == nil || m.gatewaydPublicOtelSpansIngested == nil {
+		return
+	}
+	m.gatewaydPublicOtelSpansIngested.WithLabelValues(outcome).Inc()
+}
+
+// IncrementGatewaydPublicOtelSpansTruncated increments the OTel
+// spans writer truncation tripwire (once per OTLP POST whose
+// inbound body exceeded DebugTelemetrySpansPerTrace). Unlabelled.
+// nil-safe — no-op if m is nil.
+func (m *OpsMetrics) IncrementGatewaydPublicOtelSpansTruncated() {
+	if m == nil || m.gatewaydPublicOtelSpansTruncated == nil {
+		return
+	}
+	m.gatewaydPublicOtelSpansTruncated.Inc()
+}
+
+// IncrementGatewaydPublicOtelAuthFailures increments the OTel
+// spans writer auth-failure counter by reason. reason ∈
+// {unauthenticated, plan_disabled, internal}. nil-safe — no-op
+// if m is nil.
+func (m *OpsMetrics) IncrementGatewaydPublicOtelAuthFailures(reason string) {
+	if m == nil || m.gatewaydPublicOtelAuthFailures == nil {
+		return
+	}
+	m.gatewaydPublicOtelAuthFailures.WithLabelValues(reason).Inc()
+}
+
+// IncrementSpansWriteOutcome increments the apid-side spans
+// writer counter by outcome. outcome ∈ {inserted, rate_limited,
+// db_error}. nil-safe — no-op if m is nil. Distinct from
+// gatewaydPublicOtelSpansIngested (gateway-side) because the
+// apid counter fires once per WriteSpansSummary RPC, not per
+// OTLP POST — they're at different layers of the protocol
+// stack.
+func (m *OpsMetrics) IncrementSpansWriteOutcome(outcome string) {
+	if m == nil || m.spansWriteOutcomes == nil {
+		return
+	}
+	m.spansWriteOutcomes.WithLabelValues(outcome).Inc()
 }
 
 // ObserveAppErrorsFingerprintCacheHit increments the in-process

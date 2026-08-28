@@ -50,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
+	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -1713,8 +1714,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// Defaults to enabled when the env var is unset; set
 		// FAAS_REQUEST_TELEMETRY_ENABLED=false to disable both the
 		// writer (apid gRPC) and the gateway-side recorder.
+		//
+		// ADR-127 PR-D code-review #3: sharedLimiter is the
+		// per-account token-bucket pool shared with
+		// runSpansWriterServer below. One *peraccount.Limiter
+		// instance covers both the PR-B IncrementRequestTelemetry
+		// and PR-D WriteSpansSummary paths so a customer's
+		// DebugTelemetryRequestsPerMinute cap is enforced
+		// against a single bucket pool, not two independent
+		// ones (the prior wiring constructed NewLimiter()
+		// inside each helper, giving the customer 2x their
+		// plan cap). The bucket cap is frozen on first Take
+		// (PR-D code-review #2) so whichever path runs first
+		// for an account sets the bucket size; subsequent
+		// calls match.
+		sharedLimiter := peraccount.NewLimiter()
 		if deps.getenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false" {
-			rtSrv, rtLis, err := runRequestTelemetryServer(ctx, srv.store, srv.ops, log)
+			rtSrv, rtLis, err := runRequestTelemetryServer(ctx, srv.store, srv.ops, log, sharedLimiter)
 			if err != nil {
 				_ = l.Close()
 				return fmt.Errorf("apid: request telemetry server: %w", err)
@@ -1723,6 +1739,50 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				log.Info("apid request telemetry server listening")
 				if err := rtSrv.Serve(rtLis); err != nil {
 					log.Error("apid request telemetry serve", "err", err)
+				}
+			}()
+		}
+
+		// ADR-127 PR-D: gatewayd-public → apid AuthenticateKey
+		// unary RPC. Lives on /run/faas/auth.sock; the OTel spans
+		// writer refuses to start without it (fail-closed posture
+		// for an unauthenticated OTLP surface). Defaults to enabled
+		// when the env var is unset; set FAAS_AUTH_RPC_ENABLED=false
+		// to disable — but doing so will break the OTel handler
+		// at the gateway, which is the intended safe default.
+		if deps.getenv("FAAS_AUTH_RPC_ENABLED") != "false" {
+			authSrv, authLis, err := runAuthServer(ctx, srv.store, log)
+			if err != nil {
+				_ = l.Close()
+				return fmt.Errorf("apid: auth server: %w", err)
+			}
+			go func() {
+				log.Info("apid auth server listening")
+				if err := authSrv.Serve(authLis); err != nil {
+					log.Error("apid auth serve", "err", err)
+				}
+			}()
+		}
+
+		// ADR-127 PR-D: gatewayd-public → apid
+		// WriteSpansSummary unary RPC. The gateway's flush
+		// loop drains the per-trace accumulator (Stage 3)
+		// every 30s and ships each (trace_id, summary_json,
+		// account_id) triple to apid's writer. Gated by
+		// FAAS_OTEL_SPANS_WRITER_ENABLED (default true);
+		// killing it is the fail-closed kill-switch for the
+		// OTel writer's write path (the auth + handler can
+		// still run; they just stop landing writes).
+		if deps.getenv("FAAS_OTEL_SPANS_WRITER_ENABLED") != "false" {
+			swSrv, swLis, err := runSpansWriterServer(ctx, srv.store, srv.ops, log, sharedLimiter)
+			if err != nil {
+				_ = l.Close()
+				return fmt.Errorf("apid: otel spans writer server: %w", err)
+			}
+			go func() {
+				log.Info("apid otel spans writer server listening")
+				if err := swSrv.Serve(swLis); err != nil {
+					log.Error("apid otel spans writer serve", "err", err)
 				}
 			}()
 		}
@@ -2253,13 +2313,60 @@ func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, 
 // here are non-fatal: the caller logs and continues without the
 // request_telemetry gRPC server (the apid HTTP listener still
 // serves).
-func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+func runRequestTelemetryServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger, limiter *peraccount.Limiter) (*grpc.Server, net.Listener, error) {
 	const sock = "/run/faas/request_telemetry.sock"
 	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
 	if err != nil {
 		return nil, nil, fmt.Errorf("request telemetry listen: %w", err)
 	}
 	srv := grpc.NewServer()
-	registerRequestTelemetryReceiver(srv, store, ops, newTelemetryRateLimiter(), true)
+	registerRequestTelemetryReceiver(srv, store, ops, limiter, true)
+	return srv, lis, nil
+}
+
+// runSpansWriterServer brings up the SpansWriter gRPC server
+// (ADR-127 PR-D: gatewayd-public → apid WriteSpansSummary
+// unary RPC). Listens on /run/faas/otel_spans_writer.sock so
+// the gateway-side dial is loopback-only and TLS-free
+// (single-box mode). The socket path is hard-coded —
+// gatewayd-public dials it via FAAS_APID_OTEL_SPANS_WRITER_SOCKET
+// env (defaulting to the same path).
+//
+// Returns the server (caller calls Serve) and the listener.
+// Errors here are non-fatal: the caller logs and continues
+// without the spans_writer gRPC server (the apid HTTP listener
+// still serves; the gateway's OTel flush loop drops the entry
+// at the next tick).
+func runSpansWriterServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger, limiter *peraccount.Limiter) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/otel_spans_writer.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("otel spans writer listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerSpansWriterReceiver(srv, store, ops, limiter, true)
+	return srv, lis, nil
+}
+
+// runAuthServer brings up the Auth gRPC server (ADR-127 PR-D:
+// gatewayd-public → apid AuthenticateKey unary RPC). Listens on
+// /run/faas/auth.sock so the gateway-side dial is loopback-only
+// and TLS-free (single-box mode). The socket path is hard-coded
+// — gatewayd-public dials it via FAAS_APID_AUTH_SOCKET env.
+//
+// Returns the server (caller calls Serve) and the listener.
+// Errors here are non-fatal: the caller logs and continues
+// without the auth gRPC server (the apid HTTP listener still
+// serves; the gateway's OTel handler refuses to start without
+// auth, so a missing auth server == a missing OTel surface,
+// which is the desired fail-closed posture).
+func runAuthServer(ctx context.Context, store state.Store, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/auth.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("auth listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAuthReceiver(srv, store)
 	return srv, lis, nil
 }

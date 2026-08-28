@@ -19571,6 +19571,34 @@ func (s *PgStore) InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertReq
 	return s.appErrorsQueries().InsertRequestTelemetry(ctx, s.pool, arg)
 }
 
+// UpdateSpansSummary enriches an existing request_telemetry row with
+// the OTel spans summary payload (ADR-127 PR-D). Called by the
+// apid gRPC WriteSpansSummary handler (Stage 4). summary is the
+// raw JSON bytes; the caller has already validated json.Valid. The
+// 24h WHERE clause bounds the index seek to the partial index
+// request_telemetry_trace_idx; rows outside the window are skipped
+// (no error — last-writer-wins).
+//
+// PR-D code-review #1: accountID is the third binding. The SQL
+// predicate `and account_id = $3::uuid` makes cross-customer
+// overwrite impossible even if a buggy upstream caller forwards
+// the wrong trace_id. The pgtype.UUID Valid flag is set
+// unconditionally — pgx binds NULL when Valid is false, and a NULL
+// account_id can never match the NOT NULL column on
+// request_telemetry.
+//
+// sqlc names the third positional arg `Column3` because the
+// predicate is `account_id = $3::uuid` with no `RETURNING`
+// or named-arg convention. Mirror what `make sqlc-generate`
+// produces so the drift gate stays green.
+func (s *PgStore) UpdateSpansSummary(ctx context.Context, traceID string, accountID uuid.UUID, summary []byte) error {
+	return s.appErrorsQueries().UpdateSpansSummary(ctx, s.pool, sqlc.UpdateSpansSummaryParams{
+		TraceID: pgtype.Text{String: traceID, Valid: traceID != ""},
+		Column2: summary,
+		Column3: pgtype.UUID{Bytes: accountID, Valid: true},
+	})
+}
+
 // ListRequestTelemetryByApp backs GET /v1/apps/{slug}/debug/requests.
 // The returned rows are the sqlc.Row struct; handlers convert to the
 // domain DebugTelemetryRow at the boundary.

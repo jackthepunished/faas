@@ -1,0 +1,72 @@
+// auth — production debugger OTLP token-lookup RPC
+// (ADR-127 PR-D). gatewayd-public dials apid on /run/faas/auth.sock
+// to resolve a Bearer token to the matching account + plan, so the
+// OTel spans writer can enforce the same per-plan telemetry caps the
+// apid-side IncrementRequestTelemetry receiver already enforces
+// (pkg/api/limits.go::DebugTelemetryEnabled / DebugTelemetrySpansPerTrace).
+//
+// Wire discipline mirrors the sibling apid/v1/request_telemetry.proto
+// service: checked-in *.pb.go generated with paths=source_relative,
+// auth is the unix-socket DAC model (mode 0660 group `faas`, ADR-015)
+// on /run/faas/auth.sock. The transport is plain gRPC — single-box
+// mode, no TLS, since the socket file-mode + group membership is the
+// only auth in v1.0.
+//
+// The RPC is unary (not streaming) because token lookup is rare on the
+// hot path: gatewayd-public caches the (token → account, plan) tuple
+// in-process for the duration of one OTLP POST, mirroring PR-B's
+// IncrementRequestTelemetry per-account caps cache.
+
+syntax = "proto3";
+
+package onebox.faas.apid.v1;
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1;apidpb";
+
+// Auth is the gRPC service apid exposes on /run/faas/auth.sock for
+// the gatewayd-public OTel spans writer (ADR-127 PR-D). Single RPC
+// resolves a Bearer token to the matching account + plan so the
+// gateway can enforce per-plan telemetry caps without holding a
+// direct Postgres connection (CLAUDE.md ownership: apid is the
+// sole writer to api_keys; gatewayd-public never opens a direct
+// connection for this path).
+service Auth {
+  // AuthenticateKey resolves the bearer token to the matching
+  // account + plan. The server hashes the incoming token with SHA-256
+  // and looks it up in api_keys (the OTel spans writer never sees
+  // the raw token again — the hash travels across the unix socket
+  // boundary and the writer discards the original). Errors map to
+  // gRPC codes:
+  //   - InvalidArgument when token is empty
+  //   - Unauthenticated when no api_keys row matches the hash
+  //   - Internal on Postgres errors
+  rpc AuthenticateKey(AuthenticateKeyRequest) returns (AuthenticateKeyResponse);
+}
+
+// AuthenticateKeyRequest is one bearer-token lookup. The token field
+// carries the raw token as sent in the Authorization header (i.e.
+// the value AFTER `Bearer ` is stripped). Field numbers are aligned
+// with the IncrementRequestTelemetryRequest for grep-ability; new
+// fields append at the end (the .pb.go regen produces a new struct
+// that callers migrate to).
+message AuthenticateKeyRequest {
+  // token — raw bearer token from the OTLP POST's Authorization
+  // header. Server-side sha256-hashes it; the original is
+  // discarded immediately after the lookup.
+  string token = 1;
+}
+
+// AuthenticateKeyResponse is the resolved (account_id, plan) tuple.
+// plan is the api.Plan string ("free"/"hobby"/"pro"/"scale") so the
+// gateway can compute telemetry caps locally without a follow-up
+// limits RPC.
+message AuthenticateKeyResponse {
+  // account_id — UUID of the matching account (apps.account_id).
+  // Empty when outcome != "ok" (the gateway treats empty as
+  // "unknown customer" and drops the batch).
+  string account_id = 1;
+
+  // plan — api.Plan string ("free"/"hobby"/"pro"/"scale").
+  // Empty when outcome != "ok".
+  string plan = 2;
+}

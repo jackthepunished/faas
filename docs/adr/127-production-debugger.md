@@ -130,6 +130,11 @@ New `POST /v1/otel/v1/traces` endpoint following OTel HTTP/JSON protobuf:
 
 This is what makes the example "PostgreSQL queries 82ms → 191ms" breakdown derivable: the customer emits DB spans tagged with the traceparent Gregale set in `TRACEPARENT` env, Gregale merges them into the persisted request row.
 
+> Writer detail: `docs/adr/adr-127-pr-d.md` — describes the
+> gatewayd-public → apid write path, auth RPC, rate-limit regime,
+> truncation policy, and coalesce-then-flush loop. PR-D implements
+> this section; PR-C (synthesis) reads it.
+
 ### 6. Replay (mirror-rule reuse)
 
 New `POST /v1/apps/{slug}/debug/requests/{req_id}/replay`:
