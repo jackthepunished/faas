@@ -126,10 +126,27 @@ backup secrets are also optional while backup initialization is deferred:
 `COMPUTE_ARCHIVE_ENVELOPE_B64` supply the same encrypted envelopes accepted by
 the CLI artifact directory.
 
-Dispatch `cd-compute` with a release tag, the manifest node name, and the
-provider SSH address. The address is a connection-only override; the signed
-manifest remains the source of truth for runtime DNS, certificates, and the
-database target. `format_storage` is intentionally explicit and should only be
+The preferred dispatch uses a declarative `ComputeNodeClaim` committed in the
+selected release source. It contains the manifest node name, the provider SSH
+address, and the optional storage policy. Validate one locally with:
+
+```text
+gregalectl deploy claim validate --file deploy/claims/compute-node.example.yaml
+```
+
+Then dispatch `cd-compute` with only the signed release tag and claim path:
+
+```text
+release_tag=v0.1.18-rc.10
+claim_file=deploy/claims/compute-node.example.yaml
+```
+
+The workflow validates and normalizes the claim on its GitHub-hosted
+preflight runner, then passes the result to the trusted `faas-fleet` runner.
+The provider address is a connection-only override; the signed manifest
+remains the source of truth for runtime DNS, certificates, and the database
+target. The previous `node`, `ssh_host`, and storage inputs remain supported
+for migration. `format_storage` is intentionally explicit and should only be
 enabled for a confirmed blank device.
 
 ## Example

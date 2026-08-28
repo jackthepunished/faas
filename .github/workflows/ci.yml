@@ -156,6 +156,13 @@ jobs:
       - name: release manifest materialization
         run: bash scripts/materialize-release-manifest_test.sh
 
+      # Provider-created machines hand their one-time connection details to
+      # the provider-neutral adoption pipeline through ComputeNodeClaim files.
+      # Keep checked-in examples schema-valid so the workflow can consume a
+      # claim without discovering a typo after a host has already been made.
+      - name: node claim validation
+        run: make node-claim-check
+
       # CI quick-wins cluster — wire missing local gates into `test` job.
       # Each target self-documents as "CI gate" in its Makefile comment
       # (Makefile:147 / :184 / :537 / :707) but `make build` (the only

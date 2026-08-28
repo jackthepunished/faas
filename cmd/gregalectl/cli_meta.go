@@ -163,10 +163,20 @@ var cliCommands = []cliCommand{
 		Short:   "Provider-neutral node adoption and fleet topology coordinator",
 		Subcommands: []cliSub{
 			{
+				Name:  "claim",
+				Short: "Validate a declarative provider handoff for one compute node",
+				Flags: []cliFlag{
+					{Name: "file", Short: "ComputeNodeClaim YAML/JSON file (required)"},
+					{Name: "manifest-file", Short: "optional signed production manifest to check for the node"},
+					{Name: "json", Short: "emit structured JSON"},
+				},
+			},
+			{
 				Name:  "join-fleet",
 				Short: "Adopt a bounded batch of already-created compute hosts",
 				Flags: []cliFlag{
-					{Name: "nodes-file", Short: "YAML/JSON node list (required)"},
+					{Name: "nodes-file", Short: "YAML/JSON node list (required unless --claim-file is used)"},
+					{Name: "claim-file", Short: "single ComputeNodeClaim YAML/JSON file (alternative to --nodes-file)"},
 					{Name: "manifest-file", Short: "split-box manifest (required)"},
 					{Name: "artifact-dir", Short: "standard shared join assets"},
 					{Name: "max-parallel", Short: "bounded concurrent joins (default 4)"},

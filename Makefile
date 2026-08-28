@@ -550,6 +550,14 @@ ansible-syntax-check: ## Validate the bare-metal Ansible playbooks with the prod
 manifest-scale-check: ## Validate manifest/Ansible generation at 1, 10, 100, and 1000 compute nodes
 	GREGALE_ANSIBLE_SCALE_CHECK=1 $(GO) test -count=1 -timeout=5m ./pkg/manifest ./cmd/gregalectl -run 'Test(FleetValidateComputeNodeScale|RenderManifestAnsibleFiles_ScaleMatrix)$$'
 
+.PHONY: node-claim-check
+node-claim-check: ## Validate checked-in provider-neutral ComputeNodeClaim examples
+	@test -x ./bin/gregalectl || $(GO) build -o ./bin/gregalectl ./cmd/gregalectl
+	@for f in deploy/claims/*.yaml; do \
+	  test -f "$$f" || continue; \
+	  ./bin/gregalectl deploy claim validate --file "$$f"; \
+	done
+
 .PHONY: tidy
 tidy: ## go mod tidy
 	$(GO) mod tidy

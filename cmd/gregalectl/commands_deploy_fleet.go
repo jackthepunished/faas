@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/nodeclaim"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,11 +23,13 @@ type joinFleetFile struct {
 }
 
 type joinFleetNode struct {
-	Node    string `yaml:"node" json:"node"`
-	SSHHost string `yaml:"ssh_host" json:"ssh_host"`
-	SSHUser string `yaml:"ssh_user,omitempty" json:"ssh_user,omitempty"`
-	SSHPort int    `yaml:"ssh_port,omitempty" json:"ssh_port,omitempty"`
-	SSHKey  string `yaml:"ssh_key,omitempty" json:"ssh_key,omitempty"`
+	Node          string `yaml:"node" json:"node"`
+	SSHHost       string `yaml:"ssh_host" json:"ssh_host"`
+	SSHUser       string `yaml:"ssh_user,omitempty" json:"ssh_user,omitempty"`
+	SSHPort       int    `yaml:"ssh_port,omitempty" json:"ssh_port,omitempty"`
+	SSHKey        string `yaml:"ssh_key,omitempty" json:"ssh_key,omitempty"`
+	StorageDevice string `yaml:"storage_device,omitempty" json:"storage_device,omitempty"`
+	FormatStorage bool   `yaml:"format_storage,omitempty" json:"format_storage,omitempty"`
 }
 
 type joinFleetResult struct {
@@ -37,7 +40,8 @@ type joinFleetResult struct {
 func cmdDeployJoinFleet(args []string) int {
 	fs := flag.NewFlagSet("deploy join-fleet", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	nodesFile := fs.String("nodes-file", "", "YAML/JSON node list containing node and ssh_host (required)")
+	nodesFile := fs.String("nodes-file", "", "YAML/JSON node list containing node and ssh_host")
+	claimFile := fs.String("claim-file", "", "single ComputeNodeClaim YAML/JSON file (alternative to --nodes-file)")
 	manifestFile := fs.String("manifest-file", "", "split-box manifest (required)")
 	artifactDir := fs.String("artifact-dir", "", "standard directory containing shared join assets")
 	releaseTarball := fs.String("release-tarball", "", "signed release.tar.gz")
@@ -66,15 +70,15 @@ func cmdDeployJoinFleet(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl deploy join-fleet: unexpected positional argument")
 		return 2
 	}
-	if *nodesFile == "" || *manifestFile == "" {
-		fmt.Fprintln(os.Stderr, "gregalectl deploy join-fleet: --nodes-file and --manifest-file are required")
+	if (*nodesFile == "" && *claimFile == "") || (*nodesFile != "" && *claimFile != "") || *manifestFile == "" {
+		fmt.Fprintln(os.Stderr, "gregalectl deploy join-fleet: exactly one of --nodes-file or --claim-file and --manifest-file are required")
 		return 2
 	}
 	if *maxParallel < 1 || *timeout <= 0 || *leaseTTL <= 0 {
 		fmt.Fprintln(os.Stderr, "gregalectl deploy join-fleet: max-parallel, timeout, and lease-ttl must be positive")
 		return 2
 	}
-	file, err := loadJoinFleetFile(*nodesFile)
+	file, err := loadJoinFleetInputs(*nodesFile, *claimFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl deploy join-fleet: %v\n", err)
 		return 1
@@ -104,6 +108,7 @@ func cmdDeployJoinFleet(args []string) int {
 		o := deployJoinOptions{
 			ManifestFile: *manifestFile, Node: n.Node, SSHHost: n.SSHHost,
 			SSHUser: n.SSHUser, SSHPort: n.SSHPort, SSHKey: n.SSHKey,
+			StorageDevice: n.StorageDevice, FormatStorage: n.FormatStorage,
 			ReleaseTarball: *releaseTarball, BootstrapBinary: *bootstrapBinary,
 			CosignBinary: *cosignBinary, PKISource: *pkiSource,
 			SignKeySource: *signKey, VerifyKeySource: *verifyKey,
@@ -214,6 +219,24 @@ func loadJoinFleetFile(path string) (joinFleetFile, error) {
 		return joinFleetFile{}, errors.New("nodes file has no nodes")
 	}
 	return file, nil
+}
+
+func loadJoinFleetInputs(nodesPath, claimPath string) (joinFleetFile, error) {
+	if claimPath == "" {
+		return loadJoinFleetFile(nodesPath)
+	}
+	claim, err := nodeclaim.Load(claimPath)
+	if err != nil {
+		return joinFleetFile{}, err
+	}
+	if errs := claim.Validate(); errs != nil {
+		return joinFleetFile{}, errs
+	}
+	n := claim.Normalize()
+	return joinFleetFile{Nodes: []joinFleetNode{{
+		Node: n.Name, SSHHost: n.SSHHost, SSHUser: n.SSHUser, SSHPort: n.SSHPort,
+		StorageDevice: n.StorageDevice, FormatStorage: n.FormatStorage,
+	}}}, nil
 }
 
 func runJoinFleetPreflight(ctx context.Context, opts []deployJoinOptions) error {
