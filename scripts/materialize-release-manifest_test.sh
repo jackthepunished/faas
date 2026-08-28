@@ -11,14 +11,20 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 SHA=0123456789abcdef0123456789abcdef01234567
 OUT_A="$TMP_DIR/production-manifest.yaml"
 OUT_B="$TMP_DIR/production-manifest-second.yaml"
+OUT_OVERRIDE="$TMP_DIR/production-manifest-override.yaml"
+BUILDER_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" --output "$OUT_A"
 bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" --output "$OUT_B"
+bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" \
+  --builder-base-digest "sha256:$BUILDER_DIGEST" --output "$OUT_OVERRIDE"
 
 grep -Fqx '  id: pre-1.0-01234567' "$OUT_A"
 grep -Fqx "  git_sha: $SHA" "$OUT_A"
 cmp -s "$OUT_A" "$OUT_B"
 ! cmp -s "$TEMPLATE" "$OUT_A"
+grep -Fqx "  builder_base_digest: $BUILDER_DIGEST" "$OUT_OVERRIDE"
+go run "$REPO_ROOT/cmd/gregalectl" manifest validate --file "$OUT_OVERRIDE" >/dev/null
 
 if MANIFEST_FILE="$OUT_A" \
   MANIFEST_HASH="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \

@@ -464,11 +464,16 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Enable and start the compute-only daemon set
+    # `gregalectl release install` flips /opt/faas/current, but systemd keeps
+    # an already-running process on the old executable until it is restarted.
+    # A join is an explicit adopt/roll operation, so restart every compute
+    # daemon after the signed release and manifest have been published. This
+    # also lets imaged reconcile and stage a changed builder-base digest.
+    - name: Enable and restart the compute-only daemon set
       ansible.builtin.systemd:
         name: "{{ item }}"
         enabled: true
-        state: started
+        state: restarted
       loop:
         - faas-vmmd.service
         - faas-gatewayd-internal.service
