@@ -3782,3 +3782,76 @@ func (c *Client) UpdateCorsPreset(ctx context.Context, id string, req UpdateCors
 func (c *Client) DeleteCorsPreset(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/cors-presets/"+id, nil, nil)
 }
+
+// GetAppsDeploymentOpenAPIDoc reads the cold-boot-captured OpenAPI
+// document for one deployment (issue #975 item #1 / ADR-122). The
+// probe runs unconditionally during cold boot; this surface is
+// plan-gated to Hobby/Pro/Scale. Free customers receive 402
+// CodePlanOpenAPIDocsNotAllowed. Response headers carry the source
+// (cold_boot vs manual_upload) + the 128 KiB truncation flag, but
+// the SDK surfaces only the body.
+func (c *Client) GetAppsDeploymentOpenAPIDoc(ctx context.Context, appSlug, deploymentID string) (OpenAPIDocResponse, error) {
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+appSlug+"/deployments/"+deploymentID+"/openapi", nil, &out)
+}
+
+// PatchAppsDeploymentOpenAPIDoc manually uploads a replacement
+// OpenAPI document for a deployment (same store as the cold-boot
+// capture). Empty body wipes the row, identical to DELETE. Plan
+// + cap semantics mirror GetDeploymentOpenAPIDoc.
+func (c *Client) PatchAppsDeploymentOpenAPIDoc(ctx context.Context, appSlug, deploymentID string, body json.RawMessage) (OpenAPIDocResponse, error) {
+	var out OpenAPIDocResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+appSlug+"/deployments/"+deploymentID+"/openapi", body, &out)
+}
+
+// DeleteAppsDeploymentOpenAPIDoc wipes the captured doc; the next
+// cold boot re-captures. Plan-gated like GetAppsDeploymentOpenAPIDoc.
+func (c *Client) DeleteAppsDeploymentOpenAPIDoc(ctx context.Context, appSlug, deploymentID string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+appSlug+"/deployments/"+deploymentID+"/openapi", nil, nil)
+}
+
+// GetAppOpenAPI reads the imported (or auto-generated) OpenAPI
+// document for an app (issue #975 item #2 / ADR-126). Source mode
+// (`?source=manual_import|auto`) is set via opts.source; default
+// is `manual_import` per the server contract.
+func (c *Client) GetAppOpenAPI(ctx context.Context, appSlug string, opts AppOpenAPIGetOpts) (AppOpenAPIImportResponse, error) {
+	var out AppOpenAPIImportResponse
+	q := url.Values{}
+	if opts.Source != "" {
+		q.Set("source", opts.Source)
+	}
+	path := "/v1/apps/" + appSlug + "/openapi"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// AppOpenAPIGetOpts mirrors the query string accepted by
+// GET /v1/apps/{slug}/openapi (issue #975 item #2).
+type AppOpenAPIGetOpts struct {
+	Source string // "manual_import" (default) or "auto"
+}
+
+// ImportAppOpenAPI uploads (or re-uploads) the customer's OpenAPI
+// document. Last-write-wins — see UpsertAppOpenAPIDoc on the server.
+// 256 KiB body cap enforced server-side; oversize returns 413.
+func (c *Client) ImportAppOpenAPI(ctx context.Context, appSlug string, body json.RawMessage) (AppOpenAPIImportResponse, error) {
+	var out AppOpenAPIImportResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+appSlug+"/openapi", body, &out)
+}
+
+// DeleteAppOpenAPI idempotently wipes the imported doc. ADR-126 D5
+// emits pg_notify on success so downstream edge-rule caches can
+// invalidate.
+func (c *Client) DeleteAppOpenAPI(ctx context.Context, appSlug string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+appSlug+"/openapi", nil, nil)
+}
+
+// DryRunAppOpenAPI runs read-only edge-rule suggestions against an
+// imported OpenAPI body without persisting anything (item #2 D3).
+// Use this to preview before POST /v1/apps/{slug}/openapi.
+func (c *Client) DryRunAppOpenAPI(ctx context.Context, appSlug string, body json.RawMessage) (AppOpenAPIImportDryRunResponse, error) {
+	var out AppOpenAPIImportDryRunResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+appSlug+"/openapi/dry-run", body, &out)
+}
