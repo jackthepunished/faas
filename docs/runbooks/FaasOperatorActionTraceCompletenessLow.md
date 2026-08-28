@@ -47,8 +47,26 @@ that leaves some kinds Set and others at the Prometheus default
 still produces `sum != 0`, so the guard does NOT engage and the
 alert fires as before — preserving the panic-resilience contract
 pinned at `pkg/sched/operator_intent_completeness_test.go:118`.
-Regression test: `deploy/ansible/roles/prometheus/files/
-test_obs_trace_completeness.yml` (run with `promtool test rules`).
+
+**Known limitation (finding #1 of `/code-review 1162`):** the guard
+also swallows the *pre-Set* panic case — when schedd's driver
+panics anywhere before reaching the Set loop at
+`pkg/sched/operator_intent_completeness.go:235-238`, every kind
+stays at the Prometheus default 0, `sum == 0` evaluates to true,
+the guard engages, and the Page alert stays silent. The
+compensating signal is `FaasOperatorActionTraceCompletenessLoopStalled`
+(info-tier, fires at `time() - timestamp(gauge) > 180 for 5m`) —
+but only when the schedd daemon has fully stopped scraping. For
+the "driver panicked, daemon still up" case there is currently
+no automatic alert; operators rely on `journalctl -u schedd` slog
+capture (the panic logs at the goroutine crash site). Tightening
+this would require a separate "first driver tick completed"
+counter — out of scope for this fix.
+
+Regression test: `pkg/promqlrules/testdata/obs_trace_completeness.test.yml`
+(Go-level driver at `pkg/promqlrules/rules_test.go:74` walks the
+testdata dir under `-tags=integration`; CI installs promtool
+explicitly per `.github/workflows/ci.yml:248-260`).
 
 - **Page**: `obs:operator_action_trace_completeness_ratio < 0.50`
   sustained 10m. At least one verb-oriented kind has fewer than half

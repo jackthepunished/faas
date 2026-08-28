@@ -1386,6 +1386,22 @@ groups:
       # the pre-tick default (i.e., the driver has never
       # observed anything).
       #
+      # Known limitation (finding #1 of /code-review 1162):
+      # the guard also swallows the *pre-Set* panic case —
+      # when schedd's driver panics anywhere before reaching
+      # the Set loop at pkg/sched/operator_intent_completeness
+      # .go:235-238, every kind stays at 0 and the Page alert
+      # stays silent. Compensating signal:
+      # FaasOperatorActionTraceCompletenessLoopStalled
+      # (info-tier, `time() - timestamp(gauge) > 180 for 5m`),
+      # which fires ONLY when the schedd daemon has fully
+      # stopped scraping. For the "driver panicked, daemon
+      # still up" case operators rely on `journalctl -u
+      # schedd` slog capture (the panic logs at the goroutine
+      # crash site). Tightening this requires a separate
+      # "first driver tick completed" counter — out of scope
+      # for this fix.
+      #
       # Page+warn pair share `family=obs_trace, component=schedd`
       # — alertmanager's inhibit rule (page suppresses warn when
       # [family, component] match) auto-pairs them so the warn

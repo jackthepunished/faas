@@ -148,12 +148,24 @@ restart. A panic mid-tick that leaves some kinds Set and others
 at the Prometheus default still produces `sum != 0`, so the guard
 does NOT engage and the alert fires as before — preserving the
 panic-resilience contract pinned at
-`pkg/sched/operator_intent_completeness_test.go:118`. Regression
-test: `deploy/ansible/roles/prometheus/files/
-test_obs_trace_completeness.yml` (run with `promtool test rules`).
-Same shape as the `vmmd_cold_boot_ratio` precedent at
-`faas.rules.yml:1147`, no `:Nm` time-window suffix because the
-upstream gauge is instant rather than counter-rate.
+`pkg/sched/operator_intent_completeness_test.go:118`.
+
+**Known limitation (finding #1 of `/code-review 1162`):** the guard
+also swallows the *pre-Set* panic case — when schedd's driver
+panics before reaching the Set loop, every kind stays at 0 and
+the Page alert stays silent. The compensating signal is
+`FaasOperatorActionTraceCompletenessLoopStalled` (info-tier) —
+but only when the daemon has fully stopped scraping. For the
+"driver panicked, daemon still up" case, operators rely on
+`journalctl -u schedd` slog capture. Tightening this requires a
+separate "first driver tick completed" counter — out of scope.
+
+Regression test: `pkg/promqlrules/testdata/obs_trace_completeness.test.yml`
+(Go-level driver at `pkg/promqlrules/rules_test.go:74` walks the
+testdata dir under `-tags=integration`). Same shape as the
+`vmmd_cold_boot_ratio` precedent at `faas.rules.yml:1147`, no
+`:Nm` time-window suffix because the upstream gauge is instant
+rather than counter-rate.
 
 Runbook: `docs/runbooks/FaasOperatorActionTraceCompletenessLow.md`.
 
