@@ -38,6 +38,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -106,18 +107,52 @@ func (d *defaultMirrorRoundTripper) RoundTripMirror(ctx context.Context, target 
 //     MirrorRoundTripper. A round-trip failure surfaces as
 //     crashed=true on the metric counter.
 //  4. Classify result (status_diff / schema_diff / bodyDiff /
-//     crashed) via mirror_redact.ClassifyResult.
+//     crashed) via mirror_redact.ClassifyResult using the
+//     source-side snapshot the handler captured BEFORE fanout
+//     (sourceBody bytes + rec.captureStatusForMirror()).
 //  5. Metric increment (gateway_mirror_dispatched_total{result=...}
 //     + gateway_mirror_latency_seconds + gateway_mirror_body_diff_total).
+//
+// Source snapshot discipline (PR-A3 code-review fixes #1 + #2):
+// the handler reads r.Body into a bounded []byte and installs a
+// mirrorStatusSink *atomic.Int32 on rec BEFORE the fanout goroutine
+// is scheduled. We pass both to dispatchMirror so the goroutine
+// does NOT touch r.Body again (which would race with the
+// downstream ReverseProxy — code-review #2) and does NOT need to
+// wait for the proxy to commit a status (the proxy is local + fast,
+// so by the time the round-trip returns the sink has the status;
+// code-review #1).
 //
 // The durable mirror_invocation_results ledger row insert is a
 // commit-4 follow-on (the rollup goroutine owns the write path;
 // the per-request ledger insert is a future optimisation to
 // avoid a two-step record+rollup).
-func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID string, sourceTarget *Target, rule MirrorRuleRow, srcReq *http.Request) {
+func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID string, sourceTarget *Target, rule MirrorRuleRow, srcReq *http.Request, sourceBody []byte, rec *statusRecorder) {
 	if h == nil || h.backend == nil {
 		return
 	}
+
+	// 0. Per-rule concurrent mirror-VM cap (PR-A3 code-review fix #3).
+	// Acquired BEFORE backend.ScheduleMirror so a cap-at-max goroutine
+	// never burns a schedd wake on a request we're about to drop. The
+	// slot is released on goroutine completion (the defer below) so
+	// the cap reflects "VMs in flight" through round-trip complete —
+	// not "admit attempts", which would under-count by orders of
+	// magnitude (a cold-boot + 50ms serve takes ~10x the admit
+	// window). The release runs even on the error path so a failed
+	// round-trip / build doesn't leak the slot.
+	if !h.tryAcquireMirrorSlot(rule.ID) {
+		if h.metrics != nil {
+			h.metrics.ObserveMirrorDispatched(rule.AppID, rule.ID, "cap_at_max")
+		}
+		if h.log != nil {
+			h.log.Warn("mirror: cap at max", "rule_id", rule.ID, "app_id", rule.AppID,
+				"source_instance_id", sourceInstanceID)
+		}
+		return
+	}
+	defer h.releaseMirrorSlot(rule.ID)
+
 	timeout := time.Duration(api.MirrorMaxLifetimeSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -127,6 +162,13 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	if err != nil {
 		resultLabel := "sched_error"
 		if errors.Is(err, sched.ErrMirrorSlotAtCapacity) {
+			resultLabel = "cap_at_max"
+		} else if isCapAtMaxCode(err) {
+			// liftErr (pkg/scheddgrpc/client.go:341-346) rebuilds
+			// gRPC status errors as *api.Problem{Code: api.CodeMirrorSlotAtCapacity}
+			// instead of wrapping sched.ErrMirrorSlotAtCapacity, so
+			// errors.Is above misses the sentinel. Check the stable
+			// Code too (PR-A3 code-review #5 fix).
 			resultLabel = "cap_at_max"
 		}
 		if h.metrics != nil {
@@ -140,8 +182,12 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 		return
 	}
 
-	// 2. Build the mirror request.
-	mirrorReq, buildErr := h.buildMirrorRequest(ctx, rule, srcReq)
+	// 2. Build the mirror request. We pass sourceBody directly (NOT
+	// a request whose Body we re-read) — the bytes are already
+	// captured, the proxy owns r.Body downstream, and reading
+	// srcReq.Body here would close it on the source side (code-review
+	// #2 fix).
+	mirrorReq, buildErr := h.buildMirrorRequest(ctx, rule, srcReq, sourceBody)
 	if buildErr != nil {
 		if h.metrics != nil {
 			h.metrics.ObserveMirrorDispatched(rule.AppID, rule.ID, "build_request_error")
@@ -175,15 +221,13 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	defer resp.Body.Close()
 	mirrorBody, _ := io.ReadAll(resp.Body)
 
-	// 4. Classify. Source-side bytes (status + body) aren't carried
-	// in the goroutine today; the customer response was already
-	// on the wire. status_diff defaults to true on a 0-source
-	// classification, but we treat the source shape as unknown
-	// rather than a mismatch — the metric label split between
-	// status_diff and body_diff gives the dashboard enough signal
-	// without forcing a goroutine-side capture.
-	statusDiff, schemaDiff, bodyDiff, crashed := ClassifyResult(0, nil, resp.StatusCode, mirrorBody)
-	_ = statusDiff
+	// 4. Classify. Source side: read the committed status from
+	// rec's mirrorStatusSink (the proxy committed it via WriteHeader
+	// microseconds ago — code-review #1 fix). bodyBytes were
+	// captured before the proxy read them — safe to compare
+	// directly (no body-close race — code-review #2 fix).
+	srcStatus := rec.captureStatusForMirror()
+	statusDiff, schemaDiff, bodyDiff, crashed := ClassifyResult(srcStatus, sourceBody, resp.StatusCode, mirrorBody)
 	_ = schemaDiff
 	_ = sourceInstanceID
 
@@ -191,6 +235,8 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	resultLabel := "ok"
 	if crashed {
 		resultLabel = "mirror_5xx"
+	} else if statusDiff {
+		resultLabel = "status_diff"
 	} else if bodyDiff {
 		resultLabel = "body_diff"
 	}
@@ -203,14 +249,43 @@ func (h *Handler) dispatchMirror(parentCtx context.Context, sourceInstanceID str
 	}
 }
 
-// buildMirrorRequest (issue #72 / ADR-124 PR-A3) builds the
-// http.Request the goroutine forwards to the mirror VM. Strips
-// the always-stripped + customer-supplied redact_headers set
-// (mirror_redact.StrippedRequestHeaders), preserves the source
-// method / path / body. The Host header is intentionally NOT
-// copied — the mirror VM is a sibling deployment of the same
-// app; the gateway's bridge handles the host → netns mapping.
-func (h *Handler) buildMirrorRequest(ctx context.Context, rule MirrorRuleRow, srcReq *http.Request) (*http.Request, error) {
+// isCapAtMaxCode (PR-A3 code-review #5 fix) is the *api.Problem
+// sentinel-aware fallback for schedd errors that already crossed
+// the gRPC boundary. liftErr in pkg/scheddgrpc/client.go:341-346
+// rebuilds gRPC status errors as *api.Problem{Code: ...} — the
+// stable Code (api.CodeMirrorSlotAtCapacity) survives but the
+// sentinel sched.ErrMirrorSlotAtCapacity does NOT get wrapped.
+// errors.Is alone misses the cap-at-max branch; check the Code
+// too. Returns false for nil errors or non-problem errors.
+func isCapAtMaxCode(err error) bool {
+	if err == nil {
+		return false
+	}
+	var prob *api.Problem
+	if errors.As(err, &prob) && prob != nil {
+		return prob.Code == api.CodeMirrorSlotAtCapacity
+	}
+	return false
+}
+
+// buildMirrorRequest (issue #72 / ADR-124 PR-A3, code-review
+// fix PR-A3 #2) builds the http.Request the goroutine forwards
+// to the mirror VM. Strips the always-stripped + customer-
+// supplied redact_headers set (mirror_redact.StrippedRequestHeaders),
+// preserves the source method / path / body. The Host header is
+// intentionally NOT copied — the mirror VM is a sibling
+// deployment of the same app; the gateway's bridge handles the
+// host → netns mapping.
+//
+// The body bytes are passed in as sourceBody []byte (captured by
+// the handler boundary BEFORE the proxy ran) — we do NOT read
+// srcReq.Body here, because srcReq.Body is owned by the
+// httputil.ReverseProxy downstream. Reading it here would Close()
+// the source body and starve the customer's proxy (code-review
+// #2). The bytes are referenced via bytes.NewReader so the
+// mirror's http.Client can re-read them on a retry / chunked
+// transfer without disturbing the source.
+func (h *Handler) buildMirrorRequest(ctx context.Context, rule MirrorRuleRow, srcReq *http.Request, sourceBody []byte) (*http.Request, error) {
 	if srcReq == nil {
 		return nil, errors.New("mirror dispatch: nil source request")
 	}
@@ -222,30 +297,17 @@ func (h *Handler) buildMirrorRequest(ctx context.Context, rule MirrorRuleRow, sr
 	}
 	stripped := StrippedRequestHeaders(rstateRule, srcReq.Header)
 
-	// Body bytes: read the source body so we can replay it
-	// against the mirror. The handler's ReverseProxy consumes
-	// the source body before fanout, so we capture the read here.
-	var bodyBytes []byte
-	if srcReq.Body != nil {
-		b, err := io.ReadAll(srcReq.Body)
-		if err != nil {
-			return nil, fmt.Errorf("mirror dispatch: read source body: %w", err)
-		}
-		bodyBytes = b
-		_ = srcReq.Body.Close()
-	}
-
 	method := srcReq.Method
 	path := srcReq.URL.Path
 	if path == "" {
 		path = "/"
 	}
-	mirrorReq, err := http.NewRequestWithContext(ctx, method, path, bytes.NewReader(bodyBytes))
+	mirrorReq, err := http.NewRequestWithContext(ctx, method, path, bytes.NewReader(sourceBody))
 	if err != nil {
 		return nil, fmt.Errorf("mirror dispatch: build mirror request: %w", err)
 	}
 	mirrorReq.Header = stripped
-	mirrorReq.ContentLength = int64(len(bodyBytes))
+	mirrorReq.ContentLength = int64(len(sourceBody))
 	return mirrorReq, nil
 }
 
@@ -314,4 +376,141 @@ func cloneRequestForMirror(src *http.Request) *http.Request {
 	// clone's body when scheduling the mirror request and
 	// closes only the bytes it captures.
 	return clone
+}
+
+// snapshotRequestForMirror (issue #72 / ADR-133 / ADR-125 PR-A3
+// code-review fix) returns a deep copy of the source request whose
+// Body is a fresh bytes.Reader over the already-captured body
+// snapshot. The handler boundary reads r.Body ONCE into a
+// bounded []byte and hands both the snapshot and the bytes
+// reader to the dispatch goroutine — that way the goroutine
+// does NOT need to read srcReq.Body at all (which would race
+// with the customer's downstream ReverseProxy, code-review #2:
+// io.ReadAll then Close on the source body starved the
+// httputil.ReverseProxy of its read).
+func snapshotRequestForMirror(src *http.Request) *http.Request {
+	if src == nil {
+		return nil
+	}
+	clone := src.Clone(src.Context())
+	clone.Header = src.Header.Clone()
+	return clone
+}
+
+// snapshotSourceBody (issue #72 / ADR-133 / ADR-125 PR-A3
+// code-review fix) reads the source request body into a bounded
+// []byte and returns it alongside a restore closure that wires
+// r.Body back to a fresh bytes.Reader over the SAME underlying
+// bytes. The dispatch goroutine reads from a separate reader
+// (its own bytes.Reader from the snapshot), so the source VM's
+// ReverseProxy downstream sees an intact Body regardless of
+// goroutine scheduling.
+//
+// The cap is api.MirrorBodySnapshotCap bytes (default 64 KiB)
+// — enough to detect status_diff / body_diff on a typical JSON
+// response, but bounded so a 1 GiB POST doesn't OOM the
+// gateway. Bodies exceeding the cap return a short snapshot
+// (truncated to cap) and the dispatch goroutine treats the
+// truncation as a soft "unknown body" (ClassifyResult emits
+// statusDiff=true to surface the "we don't know what the
+// source did" shape rather than a silent no-diff).
+func snapshotSourceBody(r *http.Request) (body []byte, restore func()) {
+	if r == nil || r.Body == nil {
+		return nil, func() {}
+	}
+	cap := int64(api.MirrorBodySnapshotCap)
+	limited := io.LimitReader(r.Body, cap)
+	buf, err := io.ReadAll(limited)
+	if err != nil {
+		// Capture failed (MaxBytesReader trip, network blip).
+		// Return nil body so the dispatch goroutine treats
+		// the source shape as unknown — statusDiff=true.
+		return nil, func() {}
+	}
+	restore = func() {
+		// Re-wire r.Body to a fresh reader over the SAME bytes
+		// we just consumed. The source proxy downstream reads
+		// from this reader — the bytes are not mutated by
+		// dispatchMirror (which has its own copy).
+		r.Body = io.NopCloser(bytes.NewReader(buf))
+	}
+	return buf, restore
+}
+
+// tryAcquireMirrorSlot (issue #72 / ADR-133 / ADR-125 PR-A3
+// code-review fix #3 — moved from schedd Engine) is the
+// per-rule concurrent mirror-VM cost circuit. Returns true when
+// the slot was acquired (count is now 1..cap inclusive); false
+// when the slot is already at cap and the goroutine should drop
+// the request. The slot is released by releaseMirrorSlot, which
+// the dispatch goroutine fires via defer when the round-trip
+// completes (NOT when AdmitMirrorInstance returns — see
+// pkg/sched/engine.go::AdmitMirrorInstance for the rationale).
+//
+// The cap (h.MirrorMaxConcurrentPerRule, default 5 via
+// api.MirrorMaxConcurrentPerRule) bounds the concurrent mirror
+// VM count per rule so a runaway customer rule cannot pin the
+// gateway's wake-coord budget.
+//
+// sync.Map's LoadOrStore handles the first-write-under-contention
+// race: whichever goroutine lands first allocates the
+// *atomic.Int64; concurrent callers reuse the winner's pointer.
+// nil-receiver safe — returns false (no acquire) when called on
+// a nil Handler.
+func (h *Handler) tryAcquireMirrorSlot(ruleID string) bool {
+	if h == nil {
+		return false
+	}
+	cap := h.MirrorMaxConcurrentPerRule
+	if cap <= 0 {
+		cap = api.MirrorMaxConcurrentPerRule // safety: never 0 or negative
+	}
+	fresh := &atomic.Int64{}
+	actual, _ := h.mirrorSlots.LoadOrStore(ruleID, fresh)
+	slot := actual.(*atomic.Int64)
+	cur := slot.Add(1)
+	if cur > cap {
+		// Over-cap — undo and report failure.
+		slot.Add(-1)
+		return false
+	}
+	return true
+}
+
+// releaseMirrorSlot (issue #72 / ADR-133 / ADR-125 PR-A3
+// code-review fix #3 — moved from schedd Engine) is the
+// round-trip-complete callback the dispatch goroutine fires
+// via defer. Decrements the per-rule counter; never below zero
+// (a defensive floor — a release without a matching acquire
+// would be a goroutine bug, but the floor keeps the invariant
+// observable at the goroutine level rather than as a panicking
+// atomic underflow). The rule ID is also removed from the
+// mirrorSlots map when the count hits zero so a customer who
+// disables and re-enables the rule (via PATCH
+// /v1/apps/{slug}/mirrors/{id}) doesn't accumulate stale
+// entries. LoadAndDelete is best-effort — a concurrent release
+// from a second goroutine on the same rule just succeeds in
+// releasing its own slot without claiming the deletion.
+// nil-receiver safe — no-op when called on a nil Handler.
+func (h *Handler) releaseMirrorSlot(ruleID string) {
+	if h == nil {
+		return
+	}
+	v, ok := h.mirrorSlots.Load(ruleID)
+	if !ok {
+		return
+	}
+	slot := v.(*atomic.Int64)
+	for {
+		cur := slot.Load()
+		if cur <= 0 {
+			return
+		}
+		if slot.CompareAndSwap(cur, cur-1) {
+			if cur-1 == 0 {
+				h.mirrorSlots.Delete(ruleID)
+			}
+			return
+		}
+	}
 }
