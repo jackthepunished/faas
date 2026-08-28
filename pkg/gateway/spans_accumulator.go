@@ -118,25 +118,6 @@ func (a *spansAccumulator) addLocked(spans []summarizedSpan) int {
 	return added
 }
 
-// truncate keeps the slowest N spans by duration. The rest are
-// dropped. Called by the handler before the spansSummary
-// payload is built; the truncation tripwire metric is incremented
-// at the call site so the caller knows whether the plan ceiling
-// was exceeded.
-func (a *spansAccumulator) truncate(max int) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if max <= 0 || len(a.spans) <= max {
-		return false
-	}
-	// Simple partial selection: O(n log n) sort + slice. For
-	// Hobby=50 / Pro=200 / Scale=1000 the n is tiny — no need
-	// for a heap.
-	sortSpansByDurationDesc(a.spans)
-	a.spans = a.spans[:max]
-	return true
-}
-
 // snapshot returns a copy of the accumulated spans + the
 // accountID. Used by the flush loop to build the write payload
 // after evicting the bucket from the map.
@@ -162,18 +143,18 @@ func (a *spansAccumulator) snapshot() ([]summarizedSpan, uuid.UUID) {
 //
 // Without atomic swap, the previous flush loop:
 //
-//   1. Snapshotted the bucket's spans (copy under mutex).
-//   2. Deleted the bucket key from the sync.Map.
-//   3. Handler's Add (running concurrently) called LoadOrStore,
-//      which on a missing key creates a NEW bucket — but the
-//      newly-added spans have nowhere to land if step 2
-//      already happened. The sync.Map's LoadOrStore is
-//      atomic at the map level, but the handler's Add was
-//      reading from the OLD bucket pointer that step 2 just
-//      removed from the map; in practice the handler holds
-//      the pointer and adds to it, but the flush loop's
-//      delete of the map key is a separate operation that
-//      races with the next Add's LoadOrStore.
+//  1. Snapshotted the bucket's spans (copy under mutex).
+//  2. Deleted the bucket key from the sync.Map.
+//  3. Handler's Add (running concurrently) called LoadOrStore,
+//     which on a missing key creates a NEW bucket — but the
+//     newly-added spans have nowhere to land if step 2
+//     already happened. The sync.Map's LoadOrStore is
+//     atomic at the map level, but the handler's Add was
+//     reading from the OLD bucket pointer that step 2 just
+//     removed from the map; in practice the handler holds
+//     the pointer and adds to it, but the flush loop's
+//     delete of the map key is a separate operation that
+//     races with the next Add's LoadOrStore.
 //
 // With swap-and-clear, the bucket's slice is reset to nil
 // under the bucket mutex. The flush loop holds the pointer

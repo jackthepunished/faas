@@ -127,16 +127,16 @@ type otelSpansResponse struct {
 // spend ~1000x against the gateway by sending valid-shaped
 // OTLP bodies with bogus bearer tokens. New order:
 //
-//   1. Method check.
-//   2. Bearer parse (header only — no body read).
-//   3. apid AuthenticateKey RPC (the sha256 lookup; loopback
-//      unix socket, sub-ms).
-//   4. Plan gate.
-//   5. Per-account token bucket.
-//   6. Body read (4 MiB cap; only authed customers reach
-//      this point).
-//   7. OTLP decode + shape validation.
-//   8. Accumulator Add.
+//  1. Method check.
+//  2. Bearer parse (header only — no body read).
+//  3. apid AuthenticateKey RPC (the sha256 lookup; loopback
+//     unix socket, sub-ms).
+//  4. Plan gate.
+//  5. Per-account token bucket.
+//  6. Body read (4 MiB cap; only authed customers reach
+//     this point).
+//  7. OTLP decode + shape validation.
+//  8. Accumulator Add.
 //
 // Unauthenticated 401s now do ~header-parse work; the
 // 4 MiB + decode cost only applies to legitimate traffic.
@@ -412,7 +412,7 @@ func isOTelHex32(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
 			return false
 		}
 	}

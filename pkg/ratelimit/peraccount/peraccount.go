@@ -26,6 +26,7 @@
 package peraccount
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -123,13 +124,16 @@ func (r *Limiter) Take(accountID uuid.UUID, bucketCap int) (bool, int64) {
 			// fallback must agree — they don't share a
 			// cache on the first call, so a writer that
 			// runs before the recorder sees a different
-			// cap than the recorder later sees. Reject
-			// the second cap so the bug surfaces in the
-			// log instead of silently overriding.
+			// cap than the recorder later sees. The frozen
+			// cap wins; the caller's arg is dropped.
 			//
 			// In practice this never fires once the shared
 			// limiter (PR-D fix #3) is wired and the cache
 			// is pre-warmed. The branch is the safety net.
+			slog.Default().Warn("peraccount: caller-supplied cap drifted from frozen bucket cap; using frozen value",
+				"account_id", accountID,
+				"frozen_cap", b.cap,
+				"caller_cap", bucketCap)
 		}
 		// Refill: tokens accrue at b.cap / 60 per second.
 		// Always use the FROZEN cap, not the caller's arg.

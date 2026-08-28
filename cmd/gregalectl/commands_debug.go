@@ -169,7 +169,7 @@ func cmdDebugOtelSmoke(args []string) int {
 	}
 	for i := 0; i < len(*traceID); i++ {
 		c := (*traceID)[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
 			fmt.Fprintf(os.Stderr, "gregalectl debug otel-smoke: --trace-id must be lowercase hex (got %q at byte %d)\n", string(c), i)
 			return 2
 		}

@@ -56,12 +56,6 @@ func (f *fakeAuthClient) AuthenticateKey(_ context.Context, _ string) (string, s
 }
 func (f *fakeAuthClient) Close() error { return nil }
 
-// hobbyLimits returns a Hobby plan's telemetry caps for tests.
-func hobbyLimits() api.Limits {
-	l := api.MustLimitsFor(api.PlanHobby)
-	return l
-}
-
 // buildOTLPBody assembles an ExportTraceServiceRequest with n
 // spans whose durations are 1..n nanoseconds. Returns the raw
 // JSON-protobuf bytes ready to feed to the handler.
