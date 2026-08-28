@@ -138,7 +138,10 @@ release:
   firecracker_version: 1.7.0
   firecracker_digest: 835bb33a7f4b75e924bc0635385951a55fbd4293964a956a6b4ad35345ce5419
   kernel_digest: 9ee2204edd2162a6d9762bc6e07df00fdad57b83f9bf54bb8de4c9a200106e34
-  builder_base_digest: 56254c9475fe03ed3c485c85c4f86456d1a4206149cfa9ce294a818cdf7a411e
+  # linux/amd64 child digest of builder-base:sha-f13bafeb0acd989806704317b4ec5353e32d20c8.
+  # Keep this aligned with the guest-init source shipped by the release; the
+  # multi-arch index digest is not suitable for the amd64 ext4 staging path.
+  builder_base_digest: 450b2c07495a85e47a1e5856a90e56dd4e33c6dc4d2c9b5e484ba2f0e2753fae
   runtime_base_digest: 362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143
 
 storage:
