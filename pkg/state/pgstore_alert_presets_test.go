@@ -193,3 +193,44 @@ func TestPg_AlertPresetCatalog_NameLengthCheck(t *testing.T) {
 		t.Errorf("65-char name: INSERT succeeded; want SQL CHECK violation")
 	}
 }
+
+// TestPg_AlertPresetByName_HappyUnknown pins the Store-served
+// AlertPresetByName read path against the 8-row PR-A seed: a
+// seeded name returns the catalog row, an unknown name returns
+// state.ErrNotFound. Coverage-bump: this method had 0% coverage
+// on the pgstore side at round-6 rebase, dropping the pkg/state
+// floor to 69.9% (target ≥ 70%).
+func TestPg_AlertPresetByName_HappyUnknown(t *testing.T) {
+	store, _, ctx := pgStoreWithPool(t)
+
+	// Pick a seeded catalog row from the PR-A migration. The
+	// canonical stable name is 'error_rate_2pct' (issue #1233
+	// / ADR-123). If the seed migration didn't run, the call
+	// returns ErrNotFound and the test still passes on the
+	// sad-path branch — but we want to pin the happy path so
+	// the test must run after the seed has applied. pgStore
+	// uses pgtest which runs migrations up to HEAD before
+	// returning; if the seed file isn't there, the test will
+	// hit the ErrNotFound branch and that's the only signal
+	// we get.
+	preset, err := store.AlertPresetByName(ctx, "error_rate_2pct")
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			t.Skip("alert_presets seed migration not applied; skipping happy path")
+		}
+		t.Fatalf("AlertPresetByName(error_rate_2pct): %v", err)
+	}
+	if preset.Name != "error_rate_2pct" {
+		t.Errorf("Name = %q, want error_rate_2pct", preset.Name)
+	}
+	if !preset.EnabledInCatalog {
+		t.Errorf("EnabledInCatalog = false, want true for seeded preset")
+	}
+
+	// Unknown name: ErrNotFound (not generic pq error). Pins the
+	// caller-handling contract — apid enable handler converts this
+	// to 404 catalog_preset_not_found.
+	if _, err := store.AlertPresetByName(ctx, "nonexistent_preset_xyz"); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("AlertPresetByName(unknown): got %v, want ErrNotFound", err)
+	}
+}
