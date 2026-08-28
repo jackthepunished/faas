@@ -167,6 +167,10 @@
 - name: github_actions_runner — configure repository-scoped runner
   ansible.builtin.command:
     argv:
+      - runuser
+      - --user
+      - "{{ faas_runner_user }}"
+      - --
       - ./config.sh
       - --unattended
       - --url
@@ -181,7 +185,12 @@
       - "{{ faas_runner_workdir }}"
   args:
     chdir: "{{ faas_runner_root }}"
-  become_user: "{{ faas_runner_user }}"
+  # Keep the Ansible module itself root-owned. When the controller is macOS,
+  # Ansible can otherwise attempt to grant an unprivileged become user access
+  # to its temporary module via a Darwin ACL mode (`A+user:...`) that GNU
+  # chmod on the Linux target rejects. runuser changes identity only for the
+  # runner's config.sh process and keeps this path portable.
+  become_user: root
   register: faas_runner_configure
   changed_when: true
   when: not faas_runner_config.exists
