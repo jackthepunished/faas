@@ -363,8 +363,8 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 		}
 		dep.CanaryPreset = preset.Name
 		dep.CanaryTotalSteps = preset.TotalSteps()
-		// SAFE-RELEASES code-review hardening (migration 00488):
-		// canary_step_started_at is NOT NULL post-00488, so the
+		// SAFE-RELEASES code-review hardening (migration 00494):
+		// canary_step_started_at is NOT NULL post-00494, so the
 		// apid Create path must stamp it on every row. The
 		// readers (pkg/canary.Once line 226, pkg/safedeploy.
 		// Orchestrator line 207) only consult the timestamp when

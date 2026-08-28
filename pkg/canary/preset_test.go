@@ -9,7 +9,7 @@
 // The two tests here pin the SAFE-RELEASES code-review hardening
 // for finding #1 (canary.Once zero-timestamp defensive guard,
 // pkg/canary/preset.go:226) and the runtime invariant the
-// migration 00488 NOT NULL DEFAULT NOW() schema change exists to
+// migration 00494 NOT NULL DEFAULT NOW() schema change exists to
 // uphold.
 package canary
 
@@ -77,7 +77,7 @@ func (a *stubAPID) PatchDeploymentsIdTraffic(ctx context.Context, id string, per
 
 // TestProgressionOnce_ZeroTimestampDefensiveGuard — code-review
 // finding #1 hardening. When a row's CanaryStepStarted is the zero
-// time (which post-migration 00488 should never happen because the
+// time (which post-migration 00494 should never happen because the
 // column is NOT NULL DEFAULT NOW(), but a defensive belt-and-braces
 // case for a future write path that bypasses the schema default),
 // the tick MUST (a) still run the wall-clock check (so behaviour is

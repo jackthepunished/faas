@@ -223,17 +223,17 @@ func (p *Progression) Once(ctx context.Context) (Stats, error) {
 		}
 		// Wall-clock boundary: only advance when the current step's
 		// Duration has elapsed since canary_step_started_at. Migration
-		// 00488 (SAFE-RELEASES code-review hardening) locked the
+		// 00494 (SAFE-RELEASES code-review hardening) locked the
 		// column to NOT NULL DEFAULT NOW(), so the IsZero() branch
 		// below is belt-and-braces for write paths that bypass the
 		// schema default (e.g. a future code path that forgets to
 		// stamp the timestamp; a rolled-back deployment row from a
-		// pre-00488 backup). When we see zero, log + bump the
+		// pre-00494 backup). When we see zero, log + bump the
 		// zero-timestamp counter so operators have visibility — and
 		// still run the wall-clock check so behavior matches
 		// pre-migration (elapsed = 56 years > Duration → advance).
 		if row.CanaryStepStarted.IsZero() {
-			p.Log.Warn("canary: canary_step_started_at is zero time; treating as 'advance now' (post-00488 schema default should prevent this)",
+			p.Log.Warn("canary: canary_step_started_at is zero time; treating as 'advance now' (post-00494 schema default should prevent this)",
 				"deployment_id", row.ID,
 				"canary_preset", row.CanaryPreset,
 				"canary_step", row.CanaryStep,

@@ -1,4 +1,4 @@
--- filename: 00487_deployments_canary_preset_custom_chk.sql
+-- filename: 00495_deployments_canary_preset_custom_chk.sql
 -- +goose Up
 -- +goose StatementBegin
 

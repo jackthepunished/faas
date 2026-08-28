@@ -409,12 +409,12 @@ func TestSetStuckAfterDuration_EnvOverride(t *testing.T) {
 }
 
 // TestOrchestrator_NilCanaryStepStartedAt_DefensiveGuard —
-// code-review finding #2 hardening (migration 00488). Pre-00488
+// code-review finding #2 hardening (migration 00494). Pre-00494
 // canary_step_started_at was nullable, so a rolling_out row could
 // legally have nil. The orchestrator's stuck-detection branch
 // (`if d.CanaryStepStartedAt != nil`) silently skipped the check
 // and fell through to the healthy-in-flight return with no log,
-// no counter increment, and no operator visibility. Post-00488
+// no counter increment, and no operator visibility. Post-00494
 // the column is NOT NULL DEFAULT NOW(), so this branch should
 // never fire in steady state — but the defensive guard logs +
 // bumps Stats.StuckCheckMissingTimestamp when it does, so a
