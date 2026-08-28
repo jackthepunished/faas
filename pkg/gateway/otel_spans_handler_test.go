@@ -164,6 +164,47 @@ func TestOTelSpansHandler_401_NoBearer(t *testing.T) {
 	}
 }
 
+// TestOTelSpansHandler_BearerCaseInsensitive (PR-D code-review
+// #8): RFC 7235 §2.1 requires case-insensitive scheme matching.
+// A customer SDK sending 'Authorization: bearer faas_live_hobby'
+// (lowercase) MUST be accepted, mirroring the canonical apid
+// REST surface at pkg/auth/middleware/middleware.go:1180. The
+// previous strings.HasPrefix was case-sensitive and 401'd
+// legitimate lowercase traffic.
+func TestOTelSpansHandler_BearerCaseInsensitive(t *testing.T) {
+	cases := []struct {
+		prefix string
+	}{
+		{"Bearer "},
+		{"bearer "},
+		{"BEARER "},
+		{"BeArEr "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.prefix, func(t *testing.T) {
+			auth := &fakeAuthClient{accountID: uuid.New().String(), plan: "scale"}
+			ops := wire.NewOpsMetrics("test")
+			h := NewOTelSpansHandler(OTelSpansHandlerConfig{
+				AuthClient: auth,
+				Limiter:    peraccount.NewLimiter(),
+				Acc:        NewSpansAccumulator(),
+				Ops:        ops,
+			})
+			body := buildOTLPBody(t, 1)
+			req := httptest.NewRequest(http.MethodPost, "/v1/otel/v1/traces", bytes.NewReader(body))
+			req.Header.Set("Authorization", tc.prefix+"faas_live_hobby")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Errorf("prefix %q: status = %d, want 200 (body=%s)", tc.prefix, rr.Code, rr.Body.String())
+			}
+			if auth.calls != 1 {
+				t.Errorf("prefix %q: auth.calls = %d, want 1", tc.prefix, auth.calls)
+			}
+		})
+	}
+}
+
 // TestOTelSpansHandler_402_PlanDisabled: auth returns plan without
 // DebugTelemetryEnabled → 402 + metric reason=plan_disabled.
 func TestOTelSpansHandler_402_PlanDisabled(t *testing.T) {

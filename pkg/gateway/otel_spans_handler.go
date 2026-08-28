@@ -419,19 +419,35 @@ func isOTelHex32(s string) bool {
 	return true
 }
 
-// bearerToken extracts the raw Bearer token from the Authorization
-// header. Mirrors pkg/auth/middleware/middleware.go:455 (the
-// PR-B IncrementRequestTelemetry receiver uses the same helper,
-// but lives in cmd/apid so we duplicate the 4 lines here rather
-// than widening that package's exported surface).
+// bearerToken extracts the raw Bearer token from the
+// Authorization header. Mirrors pkg/auth/middleware/
+// middleware.go:1180 (the PR-B IncrementRequestTelemetry
+// receiver uses the same helper, but lives in cmd/apid so
+// we duplicate the 4 lines here rather than widening that
+// package's exported surface).
+//
+// PR-D code-review #8: the prefix match is case-insensitive
+// per RFC 7235 §2.1. The previous strings.HasPrefix was
+// case-sensitive, so a customer SDK sending
+// 'Authorization: bearer faas_live_hobby' (lowercase scheme)
+// would 401 against the OTLP handler even though the
+// canonical apid REST surface accepts it. Match the canonical
+// middleware: strings.EqualFold on the first 7 bytes.
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(h, prefix) {
+	if len(h) <= len(bearerPrefix) {
 		return ""
 	}
-	return strings.TrimSpace(h[len(prefix):])
+	if !strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(bearerPrefix):])
 }
+
+// bearerPrefix is "Bearer " — the RFC 7235 §2.1 scheme. The
+// comparison is case-insensitive (handled by strings.EqualFold
+// in bearerToken).
+const bearerPrefix = "Bearer "
 
 // observeIngest is the nil-safe wrapper for the ingested-counter
 // metric. Centralized so the call sites stay 1-liners.
