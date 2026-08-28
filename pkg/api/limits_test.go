@@ -146,10 +146,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// abuse-floor tier carries no per-request telemetry,
 			// no retention, no rate budget. Handler returns 402
 			// ErrPlanFeatureGated before the store is touched.
-			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0, PerAppMetricsAllowed: false, AppUsageSummaryAllowed: false, AppErrorsAllowed: false,
+			DebugTelemetryEnabled: false, DebugTelemetryRetentionDays: 0, DebugTelemetryRequestsPerMinute: 0, DebugTelemetryDeploymentsPerApp: 0, DebugTelemetrySpansPerTrace: 0,
 			// ADR-124: Free keeps cancel + clear-obsolete; reorder
 			// stays plan-gated (Free=false).
-			QueueControlsAllowed: false, MaxQueuedDeploysPerApp: 2, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 0},
+			QueueControlsAllowed: false, MaxQueuedDeploysPerApp: 2, MaxCancelOpsPerHour: 0, MaxReorderOpsPerHour: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -289,15 +289,15 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// at higher concurrency). Account ceiling is the abuse
 			// floor; Hobby's typical 5-app footprint stays well under.
 			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 250,
-			// ADR-122 / ADR-126: Hobby entry-tier OpenAPI caps (1/dep,
-			// 100/acct, 128 KiB doc size, 1000 imports/acct).
-			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131_072, OpenAPIDocsPerAccount: 100, OpenAPIImportsPerAccount: 1000,
+			// ADR-122 / issue #975 item #1: Hobby is the entry paid
+			// tier — 1/dep, 100/acct, 128 KiB/doc.
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 100, OpenAPIImportsPerAccount: 1000,
 			// ADR-127: Hobby = "last week" debugger surface — 3-day
 			// retention (matches log-archive retention), 1000
 			// req/min ingest, 10 deployments max in the histogram
 			// (small Hobby app), 50 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
-			// ADR-124: Hobby = first paid tier with reorder enabled.
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 3, DebugTelemetryRequestsPerMinute: 1000, DebugTelemetryDeploymentsPerApp: 10, DebugTelemetrySpansPerTrace: 50,
+			// ADR-124 queue controls — Hobby unlocks the gated surface.
 			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 5, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
@@ -435,13 +435,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// account envelope, so neither side trips first on the
 			// typical Pro customer).
 			ConsumerKeysPerApp: 100, ConsumerKeysPerAccount: 2500,
-			// ADR-122 / ADR-126: Pro 10× Hobby on per-account OpenAPI
-			// docs (1000/acct) and imports (10000/acct).
-			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131_072, OpenAPIDocsPerAccount: 1000, OpenAPIImportsPerAccount: 10000,
+			// ADR-122 / issue #975 item #1: Pro keeps 1/dep
+			// (PK constraint), 1000/acct (10× Hobby).
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 1000, OpenAPIImportsPerAccount: 10000,
 			// ADR-127: Pro = "this month" debugger surface — 7-day
 			// retention, 10000 req/min ingest, 50 deployments in
 			// the histogram, 200 spans per trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 7, DebugTelemetryRequestsPerMinute: 10000, DebugTelemetryDeploymentsPerApp: 50, DebugTelemetrySpansPerTrace: 200,
 			// ADR-124: Pro mirrors Hobby for queue controls.
 			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 10, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
@@ -588,10 +588,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (multi-tenant SaaS broker) uses 25-30% of the budget per
 			// app, well under 100/app and 25000/acct envelopes.
 			ConsumerKeysPerApp: 1000, ConsumerKeysPerAccount: 25000,
-			// ADR-122 / ADR-126: Scale caps at 10000/acct OpenAPI docs
-			// and 10000/acct imports (imports ceiling saturates at
-			// Pro — see limits.go comment on OpenAPIImportsPerAccount).
-			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131_072, OpenAPIDocsPerAccount: 10000, OpenAPIImportsPerAccount: 10000,
+			// ADR-122 / issue #975 item #1: Scale keeps 1/dep,
+			// 10000/acct (10× Pro). Byte cap stays at 128 KiB
+			// (global cap is the binding constraint).
+			OpenAPIDocsPerDeployment: 1, OpenAPIDocMaxBytes: 131072, OpenAPIDocsPerAccount: 10000, OpenAPIImportsPerAccount: 10000,
 			// ADR-127: Scale = "this quarter" debugger surface —
 			// 14-day retention, 50000 req/min ingest, 200
 			// deployments in the histogram (the deploymentLabelSet
@@ -599,7 +599,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// cap, a fleet with thousands of historical deployments
 			// would blow up Prometheus cardinality), 1000 spans per
 			// trace.
-			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000, PerAppMetricsAllowed: true, AppUsageSummaryAllowed: true, AppErrorsAllowed: true,
+			DebugTelemetryEnabled: true, DebugTelemetryRetentionDays: 14, DebugTelemetryRequestsPerMinute: 50000, DebugTelemetryDeploymentsPerApp: 200, DebugTelemetrySpansPerTrace: 1000,
 			// ADR-124: Scale gets the highest queue depth (25) and
 			// the same 60/h reorder budget as Hobby/Pro.
 			QueueControlsAllowed: true, MaxQueuedDeploysPerApp: 25, MaxCancelOpsPerHour: 120, MaxReorderOpsPerHour: 60},

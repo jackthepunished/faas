@@ -248,12 +248,12 @@ var ErrReorderNotPending = errors.New("state: reorder only valid for pending dep
 // ErrPriorityOutOfRange is the defensive backstop returned by
 // ReorderDeployment when newPriority falls outside the closed range
 // [0, 1000]. The CHECK constraint deployments_priority_check
-// (migration 00422) is the schema-layer guard; this sentinel
-// surfaces the same range violation when the store is the one
-// running the backstop. Translated at the handler boundary to
-// HTTP 422 with the deployment_reorder_priority_invalid code.
+// (migration 00426 — round-5 rebump above PR #1066's 00410) is the
+// schema-layer guard; this sentinel surfaces the same range violation
+// when the store is the one running the backstop. Translated at the
+// handler boundary to HTTP 422 with the deployment_reorder_priority_invalid
+// code.
 var ErrPriorityOutOfRange = errors.New("state: priority must be in [0, 1000]")
-
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
