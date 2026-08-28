@@ -138,6 +138,21 @@ var AllowedAlertRuleFailureSources = []string{
 // field on the response.
 var AllowedAlertRuleStates = []string{"ok", "firing"}
 
+// AllowedAlertRuleActions is the closed set for the `action` field on
+// alert_rules. Mirrors the alert_rules_action_chk DB constraint
+// (migrations/00481_alert_rules_action.sql). When set to anything
+// other than "webhook", the alert evaluator fans out to the new
+// pkg/alerts.ActionExecutor seam in addition to the legacy Dispatcher
+// webhook fan-out. Issue #976 / ADR-122 / SAFE-RELEASES-B.
+var AllowedAlertRuleActions = []string{"webhook", "rollback", "demote", "promote"}
+
+// AllowedAlertRuleAction returns true iff v is in
+// AllowedAlertRuleActions. Mirrors the membership-helper pattern at
+// AllowedAlertRuleMetric / AllowedAlertRuleComparison / etc.
+func AllowedAlertRuleAction(v string) bool {
+	return containsString(AllowedAlertRuleActions, v)
+}
+
 // CreateAlertRuleRequest is the POST /v1/apps/{slug}/alerts body.
 // AppID is the URL slug, not the body — same shape as the per-app
 // custom-domain and metric routes.
@@ -149,6 +164,7 @@ type CreateAlertRuleRequest struct {
 	Threshold       float64 `json:"threshold"`
 	WindowSpec      string  `json:"window_spec"`
 	FailureSource   string  `json:"failure_source,omitempty"`
+	Action          *string `json:"action,omitempty"`
 	WebhookURL      string  `json:"webhook_url"`
 	WebhookSecret   string  `json:"webhook_secret"`
 	CooldownMinutes *int    `json:"cooldown_minutes,omitempty"`
@@ -172,6 +188,7 @@ type UpdateAlertRuleRequest struct {
 	Comparison      *string  `json:"comparison,omitempty"`
 	Threshold       *float64 `json:"threshold,omitempty"`
 	WindowSpec      *string  `json:"window_spec,omitempty"`
+	Action          *string  `json:"action,omitempty"`
 	WebhookURL      *string  `json:"webhook_url,omitempty"`
 	WebhookSecret   *string  `json:"webhook_secret,omitempty"`
 	CooldownMinutes *int     `json:"cooldown_minutes,omitempty"`
@@ -202,6 +219,7 @@ type AlertRuleResponse struct {
 	Threshold                 float64 `json:"threshold"`
 	WindowSpec                string  `json:"window_spec"`
 	FailureSource             string  `json:"failure_source,omitempty"`
+	Action                    string  `json:"action"`
 	WebhookURL                string  `json:"webhook_url"`
 	WebhookSecretSealedMasked string  `json:"webhook_secret_sealed_masked"`
 	CooldownMinutes           int     `json:"cooldown_minutes"`
@@ -228,6 +246,7 @@ type AlertRuleRow struct {
 	Threshold       float64
 	WindowSpec      string
 	FailureSource   string
+	Action          string
 	WebhookURL      string
 	CooldownMinutes int
 	State           string
@@ -257,6 +276,7 @@ func AlertRuleResponseFromRow(r AlertRuleRow) AlertRuleResponse {
 		Threshold:                 r.Threshold,
 		WindowSpec:                r.WindowSpec,
 		FailureSource:             r.FailureSource,
+		Action:                    r.Action,
 		WebhookURL:                r.WebhookURL,
 		WebhookSecretSealedMasked: AlertRuleWebhookSecretMasked,
 		CooldownMinutes:           r.CooldownMinutes,

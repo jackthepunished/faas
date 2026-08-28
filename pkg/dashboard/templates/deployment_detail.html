@@ -25,6 +25,16 @@
     .badge.complete { background: #d1fae5; color: #065f46; }
     .badge.failed   { background: #fee2e2; color: #991b1b; }
     .badge.skipped  { background: #f3f4f6; color: #6b7280; }
+    /* Rollout state machine pills (issue #976 / ADR-122 / SAFE-RELEASES-F).
+       Names mirror the deployments_rollout_state_chk closed enum
+       verbatim so the template renders without a translation layer
+       (and a future enum widening lands as a CI failure here).
+       pending / rolling_out / complete / aborted cover the
+       pkg/safedeploy.Orchestrator state machine. */
+    .badge.rollout-pending    { background: #f3f4f6; color: #6b7280; }
+    .badge.rollout-rolling_out{ background: #dbeafe; color: #1e40af; }
+    .badge.rollout-complete   { background: #d1fae5; color: #065f46; }
+    .badge.rollout-aborted    { background: #fee2e2; color: #991b1b; }
     /* Deployment lifecycle pills (state.DeploymentStatus closed enum).
        Names mirror the API status string verbatim so the template
        applies the badge class without a mapping helper. */

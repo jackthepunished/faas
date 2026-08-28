@@ -3737,10 +3737,12 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		Tag:                  d.Tag,
 		DeployedBy:           d.DeployedBy,
 		PRNumber:             d.PRNumber,
+		// Issue #976 / ADR-122 / SAFE-RELEASES-A: canary ladder echo.
 		CanaryPreset:         d.CanaryPreset,
 		CanaryStep:           d.CanaryStep,
 		CanaryTotalSteps:     d.CanaryTotalSteps,
 		CanaryStepStartedAt:  d.CanaryStepStartedAt,
+		// Issue #976 / ADR-122 / SAFE-RELEASES-F: rollout state machine echo.
 		RolloutState:         d.RolloutState,
 		RolloutStartedAt:     d.RolloutStartedAt,
 		RolloutCompletedAt:   d.RolloutCompletedAt,

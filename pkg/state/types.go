@@ -1515,6 +1515,40 @@ type Deployment struct {
 	// /v1/deployments/{id}.
 	LivenessRestartCount int `json:"liveness_restart_count,omitempty"`
 
+	// Canary preset + step ladder (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A). CanaryPreset is the catalog name from
+	// pkg/api/canary (none/slow/balanced/aggressive/1-10-50-100);
+	// CanaryStep is the zero-indexed position in
+	// pkg/api/canary.LookupPreset(CanaryPreset).Stages; CanaryTotalSteps
+	// is the ladder length. canary_step_bounds_chk locks the
+	// invariant (total=0,step=0) OR (total>0,0<=step<=total).
+	//
+	// Stamped at deploy time by the apid CreateDeployment path
+	// (BuildDeploymentForInsert at cmd/apid/handlers_sidecars.go:308).
+	// Advanced on a wall-clock boundary by the canary_progression
+	// meterd tick (pkg/canary, Mega PR #2 commit 3) which calls
+	// pkg/api.Client.PatchDeploymentsIdTraffic — apid remains the
+	// authoritative writer of deployments.* per CLAUDE.md
+	// ownership rules.
+	CanaryPreset          string     `json:"canary_preset,omitempty"`
+	CanaryStep            int        `json:"canary_step,omitempty"`
+	CanaryTotalSteps      int        `json:"canary_total_steps,omitempty"`
+	CanaryStepStartedAt   *time.Time `json:"canary_step_started_at,omitempty"`
+
+	// Rollout state machine (issue #976 / ADR-122 / SAFE-RELEASES-F).
+	// Pending → RollingOut → Complete; Aborted reachable from
+	// Pending/RollingOut (rollback path). The closed-set is
+	// enforced at the schema layer via deployments_rollout_state_chk
+	// (migration 00480). Stamped at deploy time by apid; walked by
+	// pkg/safedeploy.Orchestrator.Once (Mega PR #2 commit 5);
+	// mutatable via the manual gregale rollouts recover <slug>
+	// CLI (commit 6).
+	RolloutState         string     `json:"rollout_state,omitempty"`
+	RolloutStartedAt     *time.Time `json:"rollout_started_at,omitempty"`
+	RolloutCompletedAt   *time.Time `json:"rollout_completed_at,omitempty"`
+	RolloutAbortedAt     *time.Time `json:"rollout_aborted_at,omitempty"`
+	RolloutAbortedReason string     `json:"rollout_aborted_reason,omitempty"`
+
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping
 	// apps.status to `evicted_cold`; the apid GET /v1/apps/{slug}
@@ -2127,6 +2161,47 @@ const (
 	AlertDeliveryFailed    AlertDeliveryStatus = "failed"
 )
 
+// AlertAction (issue #976 / ADR-122 / SAFE-RELEASES-B). Closed-set
+// vocabulary mirroring migrations/00481_alert_rules_action.sql +
+// pkg/api.AllowedAlertRuleActions. Typed alias so the Store layer
+// can pass values across method boundaries without round-tripping
+// through stringly-typed params; the handler does the conversion at
+// the pkg/api ↔ pkg/state boundary.
+type AlertAction string
+
+const (
+	// AlertActionWebhook — legacy Dispatcher fan-out only. Every
+	// pre-PR rule lands here via the column's NOT NULL DEFAULT
+	// 'webhook' fast-default.
+	AlertActionWebhook AlertAction = "webhook"
+	// AlertActionRollback — auto-rollback the rule's app to its
+	// previous live deployment via pkg/api.Client.RollbackTo. The
+	// orchestrator's ActionDispatcher (Mega PR #2 commit 5)
+	// implements this; the evaluator only sees the interface.
+	AlertActionRollback AlertAction = "rollback"
+	// AlertActionDemote — pin the rule's current canary step at
+	// 0% traffic via pkg/api.Client.PatchDeploymentsIdTraffic.
+	AlertActionDemote AlertAction = "demote"
+	// AlertActionPromote — short-circuit the canary ladder to
+	// 100% traffic via pkg/api.Client.PatchDeploymentsIdTraffic.
+	AlertActionPromote AlertAction = "promote"
+)
+
+// IsValidAlertAction reports whether v is a member of the closed
+// AlertAction vocabulary above. The mirror membership helper on
+// the wire side is pkg/api.AllowedAlertRuleAction; this one is for
+// callers already in pkg/state (the alerts evaluator fan-out at
+// pkg/alerts/evaluator.go::runAction) that don't want to import
+// pkg/api. The two stay in lockstep — goconst catches drift.
+func IsValidAlertAction(v string) bool {
+	switch AlertAction(v) {
+	case AlertActionWebhook, AlertActionRollback, AlertActionDemote, AlertActionPromote:
+		return true
+	default:
+		return false
+	}
+}
+
 // UpdateAlertRuleParams carries the optional fields of UpdateAlertRule.
 // All fields are pointers; nil means "don't touch". Enabled and
 // Threshold intentionally use their own types (bool / float64) since
@@ -2149,6 +2224,12 @@ type UpdateAlertRuleParams struct {
 	Comparison          *AlertComparison
 	Threshold           *float64
 	WindowSpec          *AlertWindowSpec
+	// Action (issue #976 / ADR-122 / SAFE-RELEASES-B). Pointer
+	// PATCH shape so a missing body field leaves the row alone.
+	// Validated against pkg/api.AllowedAlertRuleActions at the
+	// handler boundary (cmd/apid/handlers_alerts.go). Storage shape
+	// is a plain string in migrations/00481.
+	Action              *string
 	WebhookURL          *string
 	WebhookSecretSealed *[]byte // nil = don't reseal; non-nil replaces
 	CooldownMinutes     *int
@@ -2171,6 +2252,7 @@ type AlertRule struct {
 	Threshold           float64
 	WindowSpec          AlertWindowSpec
 	FailureSource       AlertFailureSource // empty unless Metric == failed_invocations
+	Action              AlertAction       // issue #976 / ADR-122 / SAFE-RELEASES-B
 	WebhookURL          string
 	WebhookSecretSealed []byte // age/X25519 ciphertext; never logged
 	CooldownMinutes     int

@@ -772,6 +772,19 @@ type OpsMetrics struct {
 	// the cool-down race. Unlabelled. Paired with
 	// alertEvalSkippedDegradedTotal for the dashboard panel.
 	alertEvalFiredTotal prometheus.Counter
+	// canaryProgressionAdvancedTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) counts every canary step boundary crossed
+	// by the meterd tick (canary_step → canary_step+1 with
+	// elapsed >= current stage.Duration). Unlabelled. Mirrors
+	// alertEvalFiredTotal as a fleet-level rollup counter.
+	canaryProgressionAdvancedTotal prometheus.Counter
+	// canaryProgressionErrorsTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) counts every per-row error inside the
+	// canary_progression tick (PATCH traffic failure, audit
+	// append failure, etc.). Labelled by reason ∈
+	// {patch_traffic, append_audit, list_in_flight}. Closed
+	// vocabulary — unknown reasons drop to the no-op closure.
+	canaryProgressionErrorsTotal *prometheus.CounterVec
 	// alertDeliveryAttemptsTotal — counts dispatched alert-rule
 	// webhook attempts, labelled by outcome ∈ {delivered, failed}.
 	// Label cardinality budget = 2 (closed vocabulary). The counter
@@ -780,6 +793,17 @@ type OpsMetrics struct {
 	// audit events table is the per-customer detail; this is the
 	// fleet-wide counter for the §12 dashboard).
 	alertDeliveryAttemptsTotal *prometheus.CounterVec
+	// alertActionExecutedTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-B) counts alert-rule firings that triggered an
+	// in-process action beyond the legacy webhook fan-out (rollout
+	// rollback / demote / promote). Labelled by action ∈
+	// {rollback, demote, promote} (closed vocabulary — 'webhook'
+	// is the no-action default and not labelled here, so the metric
+	// only ever sees non-trivial side-effects). The counter is the
+	// §12 dashboard's "auto-rollback / auto-promote rate" panel;
+	// a non-zero rate combined with alertDeliveryAttemptsTotal
+	// (delivered) on the same rule family is the healthy signal.
+	alertActionExecutedTotal *prometheus.CounterVec
 	// paddleWebhookVerifyFailedTotal — counts Paddle webhook signature
 	// verify failures (PR-P4). Unlabelled; the per-event detail
 	// (event_id, err message, tolerance) lives in the journal line
@@ -2378,12 +2402,36 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_alert_eval_fired_total",
 		Help: "Count of alert-rule evaluations where the comparison crossed the threshold AND the cool-down claim won. Unlabelled. Paired with alertEvalSkippedDegradedTotal for the dashboard panel.",
 	})
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: canary_progression
+	// meterd tick counters. Single-registry: registered on every
+	// daemon's OpsMetrics; only meterd increments. Unlabelled
+	// advanced counter (fleet rollup) + errors counter labelled by
+	// reason ∈ {patch_traffic, append_audit, list_in_flight}
+	// (closed vocabulary, cardinality budget = 3).
+	canaryProgressionAdvancedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_advanced_total",
+		Help: "Count of canary step boundaries crossed by the meterd canary_progression tick (canary_step bumped AND PATCH /v1/deployments/{id}/traffic accepted). Unlabelled — fleet-level rollup. A non-zero rate is the heartbeat; a stalled rate combined with canaryProgressionErrorsTotal('patch_traffic') is the §12 dashboard tripwire for an APID outage.",
+	})
+	canaryProgressionErrorsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_errors_total",
+		Help: "Count of per-row errors inside the canary_progression tick, labelled by reason ∈ {patch_traffic, append_audit, list_in_flight} (closed vocabulary). patch_traffic is the dominant reason (APID 5xx / network blip); append_audit is rare (the audit write is best-effort, the patch already landed); list_in_flight signals a Postgres SELECT failure (fleet-wide tripwire).",
+	}, []string{"reason"})
+	for _, reason := range []string{"patch_traffic", "append_audit", "list_in_flight"} {
+		canaryProgressionErrorsTotal.WithLabelValues(reason)
+	}
 	alertDeliveryAttemptsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_alert_delivery_attempts_total",
 		Help: "Count of dispatched alert-rule webhook attempts, labelled by outcome ∈ {delivered, failed} (closed vocabulary, cardinality budget = 2). The counter surfaces the dispatcher's success rate without exposing per-customer detail — the audit events table is the per-customer detail.",
 	}, []string{"outcome"})
 	for _, outcome := range []string{"delivered", "failed"} {
 		alertDeliveryAttemptsTotal.WithLabelValues(outcome)
+	}
+	alertActionExecutedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_alert_action_executed_total",
+		Help: "Count of alert-rule firings that executed an in-process action (rollback / demote / promote) on the deployment the rule was scoped to. Labelled by action ∈ {rollback, demote, promote} (closed vocabulary). 'webhook' is intentionally absent — webhook fan-out is the legacy path and is counted under alert_delivery_attempts_total. A non-zero rate is the §12 dashboard's auto-rollback / auto-promote tripwire; pair with the alert.delivered audit kind for per-customer detail.",
+	}, []string{"action"})
+	for _, action := range []string{"rollback", "demote", "promote"} {
+		alertActionExecutedTotal.WithLabelValues(action)
 	}
 	// PR-P4 — Paddle webhook hardening counters. Single-registry:
 	// registered on every daemon's OpsMetrics; only apid increments.
@@ -3861,7 +3909,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditEventsVolumeTotal:               auditEventsVolumeTotal,
 		alertEvalSkippedDegradedTotal:        alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                  alertEvalFiredTotal,
+		canaryProgressionAdvancedTotal:       canaryProgressionAdvancedTotal,
+		canaryProgressionErrorsTotal:         canaryProgressionErrorsTotal,
 		alertDeliveryAttemptsTotal:           alertDeliveryAttemptsTotal,
+		alertActionExecutedTotal:             alertActionExecutedTotal,
 		paddleWebhookVerifyFailedTotal:       paddleWebhookVerifyFailedTotal,
 		paddleWebhookReplaySuppressedTotal:   paddleWebhookReplaySuppressedTotal,
 		alertEvaluatorEnabled:                alertEvaluatorEnabled,
@@ -6012,6 +6063,39 @@ func (m *OpsMetrics) AlertEvalFiredTotal() func() {
 	return func() {}
 }
 
+// CanaryProgressionAdvancedTotal (issue #976 / ADR-122 /
+// SAFE-RELEASES-A) increments the canary-progression advanced
+// counter. Fires once per row whose canary_step has just been
+// bumped (wall-clock boundary crossed + APID patch accepted).
+// Unlabelled. Returns a no-op closure on a nil receiver — mirrors
+// AlertEvalFiredTotal.
+func (m *OpsMetrics) CanaryProgressionAdvancedTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.canaryProgressionAdvancedTotal.Inc()
+	return func() {}
+}
+
+// CanaryProgressionErrorsTotal (issue #976 / ADR-122 /
+// SAFE-RELEASES-A) increments the canary-progression error counter
+// labelled by reason ∈ {patch_traffic, append_audit,
+// list_in_flight}. Closed vocabulary; unknown reasons drop to the
+// no-op closure (matches AlertDeliveryAttemptsTotal).
+func (m *OpsMetrics) CanaryProgressionErrorsTotal(reason string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch reason {
+	case "patch_traffic", "append_audit", "list_in_flight":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.canaryProgressionErrorsTotal.WithLabelValues(reason).Inc()
+	return func() {}
+}
+
 // AlertDeliveryAttemptsTotal increments the alert-delivery attempts
 // counter, labelled by outcome ∈ {delivered, failed}. An unknown
 // outcome is dropped (the closed-vocabulary contract — see
@@ -6028,6 +6112,27 @@ func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
 		return func() {}
 	}
 	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
+	return func() {}
+}
+
+// AlertActionExecutedTotal (issue #976 / ADR-122 / SAFE-RELEASES-B)
+// increments the alert-action executed counter, labelled by action
+// ∈ {rollback, demote, promote} (closed vocabulary — the
+// 'webhook' default is NOT a candidate here because it bypasses
+// this surface entirely; webhook fan-out is the legacy path and
+// is counted under AlertDeliveryAttemptsTotal). Unknown actions
+// are dropped. Returns a no-op closure on a nil receiver.
+func (m *OpsMetrics) AlertActionExecutedTotal(action string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch action {
+	case "rollback", "demote", "promote":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.alertActionExecutedTotal.WithLabelValues(action).Inc()
 	return func() {}
 }
 

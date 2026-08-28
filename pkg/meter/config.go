@@ -15,6 +15,28 @@ import (
 // with pkg/meter.Config.Defaults().
 const DefaultCertExpiryRefresherInterval = 1 * time.Hour
 
+// DefaultCanaryEvalInterval is the production cadence for the
+// canary_progression meterd tick (issue #976 / ADR-122 /
+// SAFE-RELEASES-A). 30 s balances Postgres budget against
+// step-boundary responsiveness — the shortest shipped stage
+// duration is 1 min (aggressive preset), so 30 s gives the
+// orchestrator a window to advance within half a stage. Faster
+// (5 s, ADR-122's sketch) would burn Postgres budget for no
+// observable benefit on the shortest shipped ladder.
+const DefaultCanaryEvalInterval = 30 * time.Second
+
+// DefaultSafeDeployInterval is the production cadence for the
+// safedeploy orchestrator meterd tick (issue #976 / ADR-122 /
+// SAFE-RELEASES-F). 30 s matches DefaultCanaryEvalInterval so the
+// two ticks advance on a unified cadence — the canary_progression
+// tick stamps canary_step + traffic_percent while the
+// orchestrator stamps rollout_state; running both at 30 s keeps
+// the operator dashboard's two counters in lockstep. ADR-122's
+// sketched 5 s cadence was renamed because the per-tick-signal
+// is per-rollout-state, not per-traffic-percent — 5 s would burn
+// Postgres budget on rollouts whose state hasn't moved.
+const DefaultSafeDeployInterval = 30 * time.Second
+
 // DefaultAccountSpendAggregatorInterval is the production cadence
 // for the ADR-123 MTD-spend gauge refresher. The upstream
 // account_spend_snapshot is fed by the RollupLoop tick every
@@ -171,6 +193,20 @@ type Config struct {
 	// apid_deployment_failed_total by that delta. Zero means
 	// the production default (60 s) — matches AlertEvalInterval.
 	DeploymentFailureSweepInterval time.Duration
+	// CanaryEvalInterval (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) is how often the canary_progression
+	// meterd tick walks ListCanaryInFlight and advances
+	// wall-clock-eligible steps. Zero means the production
+	// default (30 s — DefaultCanaryEvalInterval).
+	CanaryEvalInterval time.Duration
+	// SafeDeployInterval (issue #976 / ADR-122 /
+	// SAFE-RELEASES-F) is how often the safedeploy orchestrator
+	// meterd tick walks SafedeployListPendingRollouts and
+	// advances the rollout_state machine. Zero means the
+	// production default (30 s — DefaultSafeDeployInterval).
+	// The orchestrator tick is the complementary twin of the
+	// canary_progression tick — both run on a unified cadence.
+	SafeDeployInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -228,5 +264,11 @@ func (c *Config) Defaults() {
 	}
 	if c.DeploymentFailureSweepInterval == 0 {
 		c.DeploymentFailureSweepInterval = DefaultDeploymentFailureSweepInterval
+	}
+	if c.CanaryEvalInterval == 0 {
+		c.CanaryEvalInterval = DefaultCanaryEvalInterval
+	}
+	if c.SafeDeployInterval == 0 {
+		c.SafeDeployInterval = DefaultSafeDeployInterval
 	}
 }

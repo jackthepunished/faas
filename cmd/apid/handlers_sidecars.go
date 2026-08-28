@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/api/canary"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -318,6 +320,26 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 	// the account's plan allows traffic splitting.
 	if req.TrafficPercent != nil {
 		dep.TrafficPercent = *req.TrafficPercent
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: stamp the canary
+	// ladder at deploy time. nil req.Canary → fast-default zero
+	// ('none', 0, 0, NULL) — preserved exactly matches today's
+	// behaviour. Non-nil → resolve against pkg/api/canary's
+	// closed-set catalog; on 'none' we stamp the disable row
+	// (zero ladder), on any other preset we stamp total_steps +
+	// step=0 + step_started_at=now() so the canary_progression
+	// meterd tick has a starting position to walk from.
+	if req.Canary != nil {
+		preset, ok := canary.LookupPreset(req.Canary.Preset)
+		if !ok {
+			return state.Deployment{}, api.ErrInvalidCanaryPreset(req.Canary.Preset)
+		}
+		dep.CanaryPreset = preset.Name
+		dep.CanaryTotalSteps = preset.TotalSteps()
+		if dep.CanaryTotalSteps > 0 {
+			now := time.Now().UTC()
+			dep.CanaryStepStartedAt = &now
+		}
 	}
 	// ADR-091 / PR-D: per-deployment env scope. The handler ran
 	// api.ValidateScope above — non-empty here means well-formed
