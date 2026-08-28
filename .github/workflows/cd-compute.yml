@@ -1,0 +1,252 @@
+# .github/workflows/cd-compute.yml — adopt or roll a compute-only host.
+#
+# This workflow is deliberately provider-neutral. The provider creates the
+# machine and supplies its SSH address; the existing gregalectl join pipeline
+# owns all host convergence, release verification, storage, PKI, and database
+# activation.
+#
+# The runner must be a trusted self-hosted runner with private fleet DNS/SSH
+# reachability. A control-plane host is a valid runner when it is registered
+# with the `faas-fleet` label. GitHub-hosted runners cannot reach the private
+# database and mesh used by the join pipeline.
+
+name: cd-compute
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing signed pre-1.0 release tag (for example v0.1.18-rc.5)"
+        required: true
+        type: string
+      node:
+        description: "Manifest fleet.hosts[].name to adopt or roll"
+        required: true
+        type: string
+      ssh_host:
+        description: "Provider SSH address for this run; never becomes the runtime endpoint"
+        required: true
+        type: string
+      ssh_user:
+        description: "SSH user on the already-created host"
+        required: false
+        default: root
+        type: string
+      ssh_port:
+        description: "SSH port on the already-created host"
+        required: false
+        default: "22"
+        type: string
+      storage_device:
+        description: "Optional absolute stable device path when not in the signed manifest"
+        required: false
+        default: ""
+        type: string
+      format_storage:
+        description: "Format the explicitly supplied blank storage device as XFS"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: cd-compute-${{ inputs.node }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Join or roll compute node ${{ inputs.node }}
+    environment: production
+    runs-on: [self-hosted, linux, faas-fleet]
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      NODE: ${{ inputs.node }}
+      SSH_HOST: ${{ inputs.ssh_host }}
+      SSH_USER: ${{ inputs.ssh_user }}
+      SSH_PORT: ${{ inputs.ssh_port }}
+      STORAGE_DEVICE: ${{ inputs.storage_device }}
+      FORMAT_STORAGE: ${{ inputs.format_storage }}
+      # These are environment secrets, not repository files. The runner
+      # must be trusted and should be ephemeral or dedicated to deployments.
+      COMPUTE_SSH_KEY: ${{ secrets.COMPUTE_SSH_KEY }}
+      COMPUTE_DATABASE_URL: ${{ secrets.COMPUTE_DATABASE_URL }}
+      # The operator CLI registers the release and activates the node from
+      # the runner, so it also needs the same DSN in its process environment.
+      # The join play writes it to the adopted host separately.
+      FAAS_PG_DSN: ${{ secrets.COMPUTE_DATABASE_URL }}
+      COMPUTE_STORAGE_ENV: ${{ secrets.COMPUTE_STORAGE_ENV }}
+      COMPUTE_PKI_TARBALL_B64: ${{ secrets.COMPUTE_PKI_TARBALL_B64 }}
+      COMPUTE_SIGN_KEY: ${{ secrets.COMPUTE_SIGN_KEY }}
+      COMPUTE_VERIFY_KEY: ${{ secrets.COMPUTE_VERIFY_KEY }}
+      COMPUTE_ANSIBLE_VARS_B64: ${{ secrets.COMPUTE_ANSIBLE_VARS_B64 }}
+      COMPUTE_BOX_AGE_KEY: ${{ secrets.COMPUTE_BOX_AGE_KEY }}
+      COMPUTE_RCLONE_ENVELOPE_B64: ${{ secrets.COMPUTE_RCLONE_ENVELOPE_B64 }}
+      COMPUTE_ARCHIVE_ENVELOPE_B64: ${{ secrets.COMPUTE_ARCHIVE_ENVELOPE_B64 }}
+
+    steps:
+      - name: Check out the release source and Ansible roles
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Set up Go for the pinned cosign verifier
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check fleet runner prerequisites
+        run: |
+          set -euo pipefail
+          for tool in gh jq sha256sum tar base64 ansible-playbook; do
+            command -v "$tool" >/dev/null || {
+              echo "::error::the faas-fleet runner must provide $tool" >&2
+              exit 1
+            }
+          done
+
+      - name: Install pinned cosign verifier
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          GOBIN="$RUNNER_TEMP/release-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+
+      - name: Download and verify the canonical release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::release_tag must be a release tag, got $RELEASE_TAG" >&2
+            exit 1
+          }
+          RELEASE_ROOT="$RUNNER_TEMP/gregale-compute-release"
+          mkdir -p "$RELEASE_ROOT"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern release.tar.gz \
+            --pattern release.cosign.bundle \
+            --pattern release.sbom.json \
+            --pattern release-manifest.json \
+            --pattern production-manifest.yaml \
+            --pattern SHA256SUMS \
+            --dir "$RELEASE_ROOT"
+          (
+            cd "$RELEASE_ROOT"
+            sha256sum -c SHA256SUMS
+          )
+          "$RUNNER_TEMP/release-tools/cosign" verify-blob \
+            --bundle "$RELEASE_ROOT/release.cosign.bundle" \
+            --certificate-identity-regexp '^https://github\.com/poyrazK/faas/\.github/workflows/release\.yml@refs/tags/.+$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$RELEASE_ROOT/release.tar.gz"
+          mkdir -p "$RELEASE_ROOT/unpacked"
+          tar --extract --gzip --file "$RELEASE_ROOT/release.tar.gz" \
+            --directory "$RELEASE_ROOT/unpacked" release-manifest.json
+          cmp "$RELEASE_ROOT/unpacked/release-manifest.json" "$RELEASE_ROOT/release-manifest.json"
+          RELEASE_ID="$(jq -er '.git_sha' "$RELEASE_ROOT/release-manifest.json")"
+          RELEASE_MANIFEST_HASH="$(jq -er '.manifest_hash' "$RELEASE_ROOT/release-manifest.json")"
+          ACTUAL_MANIFEST_HASH="sha256:$(sha256sum "$RELEASE_ROOT/production-manifest.yaml" | awk '{print $1}')"
+          [[ "$RELEASE_MANIFEST_HASH" == "$ACTUAL_MANIFEST_HASH" ]] || {
+            echo "::error::signed release manifest hash does not match production-manifest.yaml" >&2
+            exit 1
+          }
+          TAG_COMMIT="$(git rev-list -n1 "$RELEASE_TAG")"
+          [[ "$RELEASE_ID" =~ ^[0-9a-f]{40}$ && "$RELEASE_ID" == "$TAG_COMMIT" ]] || {
+            echo "::error::signed release git_sha does not match the selected tag" >&2
+            exit 1
+          }
+          echo "RELEASE_ROOT=$RELEASE_ROOT" >> "$GITHUB_ENV"
+          echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+
+      - name: Assemble the standard join artifact directory
+        run: |
+          set -euo pipefail
+          for required in COMPUTE_SSH_KEY COMPUTE_DATABASE_URL COMPUTE_STORAGE_ENV \
+            COMPUTE_PKI_TARBALL_B64 COMPUTE_SIGN_KEY COMPUTE_VERIFY_KEY; do
+            [[ -n "${!required:-}" ]] || {
+              echo "::error::production secret $required is not configured" >&2
+              exit 1
+            }
+          done
+          ARTIFACT_DIR="$RUNNER_TEMP/gregale-compute-join"
+          mkdir -p "$ARTIFACT_DIR"
+          for asset in release.tar.gz release.cosign.bundle release.sbom.json production-manifest.yaml; do
+            install -m 0644 "$RELEASE_ROOT/$asset" "$ARTIFACT_DIR/$asset"
+          done
+          tar --extract --gzip --file "$RELEASE_ROOT/release.tar.gz" \
+            --to-stdout gregalectl > "$ARTIFACT_DIR/gregalectl-linux-amd64"
+          chmod 0755 "$ARTIFACT_DIR/gregalectl-linux-amd64"
+          install -m 0755 "$RUNNER_TEMP/release-tools/cosign" "$ARTIFACT_DIR/cosign-linux-amd64"
+
+          umask 077
+          printf '%s\n' "$COMPUTE_SSH_KEY" > "$ARTIFACT_DIR/compute-ssh-key"
+          printf '%s\n' "DATABASE_URL=$COMPUTE_DATABASE_URL" > "$ARTIFACT_DIR/compute-db.env"
+          printf '%s\n' "$COMPUTE_STORAGE_ENV" > "$ARTIFACT_DIR/storage.env"
+          printf '%s\n' "$COMPUTE_SIGN_KEY" > "$ARTIFACT_DIR/sign.key"
+          printf '%s\n' "$COMPUTE_VERIFY_KEY" > "$ARTIFACT_DIR/sign-pub.pem"
+
+          printf '%s' "$COMPUTE_PKI_TARBALL_B64" | base64 --decode > "$RUNNER_TEMP/compute-pki.tar.gz"
+          if tar -tzf "$RUNNER_TEMP/compute-pki.tar.gz" | grep -Eq '(^/|(^|/)\.\./)'; then
+            echo "::error::COMPUTE_PKI_TARBALL_B64 contains an unsafe archive path" >&2
+            exit 1
+          fi
+          tar --extract --gzip --file "$RUNNER_TEMP/compute-pki.tar.gz" \
+            --directory "$ARTIFACT_DIR" --no-same-owner --no-same-permissions
+          test -f "$ARTIFACT_DIR/pki/ca/ca.crt"
+
+          if [[ -n "${COMPUTE_ANSIBLE_VARS_B64:-}" ]]; then
+            printf '%s' "$COMPUTE_ANSIBLE_VARS_B64" | base64 --decode > "$ARTIFACT_DIR/ansible-vars.yml"
+            chmod 0600 "$ARTIFACT_DIR/ansible-vars.yml"
+          fi
+          if [[ -n "${COMPUTE_BOX_AGE_KEY:-}" ]]; then
+            printf '%s\n' "$COMPUTE_BOX_AGE_KEY" > "$ARTIFACT_DIR/box-age-key"
+          fi
+          if [[ -n "${COMPUTE_RCLONE_ENVELOPE_B64:-}" ]]; then
+            printf '%s' "$COMPUTE_RCLONE_ENVELOPE_B64" | base64 --decode > "$ARTIFACT_DIR/rclone.conf.age"
+          fi
+          if [[ -n "${COMPUTE_ARCHIVE_ENVELOPE_B64:-}" ]]; then
+            printf '%s' "$COMPUTE_ARCHIVE_ENVELOPE_B64" | base64 --decode > "$ARTIFACT_DIR/archive-creds.json.age"
+          fi
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify runner prerequisites and adopt the compute host
+        run: |
+          set -euo pipefail
+          JOIN_ARGS=(
+            deploy join-node
+            --manifest-file "$ARTIFACT_DIR/production-manifest.yaml"
+            --node "$NODE"
+            --ssh-host "$SSH_HOST"
+            --ssh-user "$SSH_USER"
+            --ssh-port "$SSH_PORT"
+            --ssh-key "$ARTIFACT_DIR/compute-ssh-key"
+            --release-tarball "$ARTIFACT_DIR/release.tar.gz"
+            --artifact-dir "$ARTIFACT_DIR"
+            --repo-root "$GITHUB_WORKSPACE"
+            --timeout 25m
+            --lease-ttl 35m
+            --yes
+            --json
+          )
+          if [[ -n "$STORAGE_DEVICE" ]]; then
+            JOIN_ARGS+=(--storage-device "$STORAGE_DEVICE")
+          fi
+          if [[ "$FORMAT_STORAGE" == "true" ]]; then
+            JOIN_ARGS+=(--format-storage)
+          fi
+          if [[ -f "$ARTIFACT_DIR/ansible-vars.yml" ]]; then
+            JOIN_ARGS+=(--ansible-vars-file "$ARTIFACT_DIR/ansible-vars.yml")
+          fi
+          "$ARTIFACT_DIR/gregalectl-linux-amd64" "${JOIN_ARGS[@]}"
+
+      - name: Show post-join identity without exposing secrets
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "release=${RELEASE_ID:-unknown} node=$NODE ssh_host=$SSH_HOST"
+          echo "The join command is the readiness/activation gate; inspect its JSON result above."
