@@ -25,7 +25,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -179,31 +178,6 @@ type Engine struct {
 	// production path (cmd/schedd/main.go) fails to start if the
 	// verifier is nil — see WithVerifier's doc.
 	verifier LayerVerifier
-
-	// mirrorSlots (issue #72 / ADR-125 PR-A3) is the in-process
-	// per-rule concurrent-mirror-VM cost circuit. Keyed on the
-	// mirror-rule UUID (NOT the deployment — multiple rules can
-	// target the same mirror deployment). Each value is an
-	// *atomic.Int64 the gateway goroutine increments via
-	// tryAcquireMirrorSlot and decrements via releaseMirrorSlot
-	// when the mirror VM parks (commit 3 wires the deferred
-	// release). sync.Map is the right primitive here: the
-	// "first-write under contention" race is exactly what
-	// LoadOrStore handles, and read-mostly access (the cap-check
-	// is fast) is the sync.Map sweet spot. Cross-process
-	// coordination is a follow-on per ADR-125 §Follow-on 7 —
-	// A3 is single-process schedd so the in-memory map is the
-	// authoritative source.
-	mirrorSlots sync.Map
-
-	// MirrorMaxConcurrentPerRule (issue #72 / ADR-125 PR-A3) is
-	// the per-rule concurrent-mirror-VM cap. Matches the
-	// 5-second MirrorMaxLifetimeSeconds × ~1 sustained req/s
-	// arithmetic so a steady-state customer can't pin more than
-	// cap VMs at once. Operators can lift the cap via a constant
-	// edit + redeploy; ADR-127-style alert covers anomalous
-	// sustained cap-at-max saturation.
-	MirrorMaxConcurrentPerRule int64
 
 	// audit is the IAM-4 seam for cold-boot characterization events
 	// (ADR-051 PR-D review finding #6: "app.characterized audit
@@ -537,9 +511,6 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		telemetryCache:  NewNodeTelemetryCache(),
 		usageCache:      NewNodeUsageCache(),
 		now:             time.Now, // tests override post-construction
-		// mirrorSlots is sync.Map (zero value ready); MirrorMaxConcurrentPerRule
-		// defaults to 5 (the WireSpec-validated value).
-		MirrorMaxConcurrentPerRule: 5,
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
 	// doesn't block the daemon's boot forever — the watchdog goroutine
@@ -1452,35 +1423,35 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 	if deploymentID == "" {
 		return e.admitAndDispatch(ctx, appID, trigger, true)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
 }
 
-// AdmitMirrorInstance (issue #72 / ADR-125 PR-A3) is the
-// mirror-admission entry point the gateway's per-request
-// dispatch goroutine (commit 3) calls after the source
-// deployment's response has been returned to the customer. The
-// flow:
+// AdmitMirrorInstance (issue #72 / ADR-133 / ADR-125 PR-A3) is
+// the mirror-admission entry point the gateway's per-request
+// dispatch goroutine calls after the source deployment's
+// response has been returned to the customer. The flow:
 //
-//  1. tryAcquireMirrorSlot(rule.ID) — per-rule concurrent-mirror-VM
-//     cap (see e.MirrorMaxConcurrentPerRule). On cap-at-max,
-//     returns ErrMirrorSlotAtCapacity immediately so no wakeID
-//     is minted and no instances row is allocated. The mirror
-//     goroutine logs a ledger row with the cap-at-max outcome
-//     (commit 3 handles that surface).
+//  1. admitAndDispatchForDeployment — the same wake path the
+//     customer-facing trigger uses, with mode='mirror' stamped
+//     on the new instances row via the helper's mode parameter
+//     (PR-A3 code-review fix #6 — single INSERT, no INSERT+UPDATE
+//     race window). The mode='mirror' flag is what tells
+//     pkg/meter/sampler.go and pkg/sched/reaper.go to skip the
+//     row: the sampler never bills the customer for the shadow
+//     VM (skip on mode='mirror'), and the reaper never
+//     idles-reaps because mirror VMs self-park on request
+//     completion (skip on mode='mirror' — the reaper expects a
+//     normal idle park, not the mirror goroutine's explicit
+//     ParkInstance).
 //
-//  2. admitAndDispatchForDeployment — the same wake path the
-//     customer-facing trigger uses, with mode=InstanceModeMirror
-//     stamped on the new instances row. The mode=mirror flag is
-//     what tells pkg/meter/sampler.go and pkg/sched/reaper.go to
-//     skip the row (the sampler never bills the customer for the
-//     shadow VM; the reaper never idles-reaps because mirror VMs
-//     self-park on request completion).
-//
-//  3. releaseMirrorSlot(rule.ID) deferred — runs when the mirror
-//     VM parks. The goroutine passes the rule ID to ParkInstance
-//     (or wraps the wakeID round-trip so the goroutine can fire
-//     the release on its own completion path; commit 3 wires
-//     whichever path matches the dispatch goroutine's lifecycle).
+//  2. The per-rule concurrent-mirror-VM cap (PR-A3 code-review
+//     fix #3) lives on the GATEWAY Handler, not here — see
+//     pkg/gateway/handler.go::mirrorSlots + tryAcquireMirrorSlot.
+//     The cap reflects "VMs in flight" through round-trip
+//     complete (the goroutine releases on its own defer), not
+//     "admit attempts". Holding the slot here would release
+//     microseconds after the wake command is sent, well before
+//     the mirror VM is done serving.
 //
 // scope: empty for A3 (mirror rules don't carry a preview scope
 // — the source deployment's scope flows through the customer
@@ -1488,134 +1459,38 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 // shape for mirror is a follow-on; A3 logs the dispatch via the
 // gateway's structured-log call).
 //
-// scope (issue #272): empty for A3 (mirror rules don't carry a
-// preview scope — the source deployment's scope flows through
-// the customer wake, not the mirror). Additive per ADR-016 —
-// pre-A3 schedd callers omit the field.
-//
 // Errors:
 //
-//   - ErrMirrorSlotAtCapacity — cap-at-max; the goroutine
-//     drops the request on the floor (no retry — the customer
-//     is unaffected because the source response was already
-//     returned).
 //   - any error from admitAndDispatchForDeployment — propagated
 //     from the wake path (RAM headroom, store error, etc.).
-//     The deferred release runs regardless so a partial admit
-//     failure doesn't leak the slot.
+//     The gateway wraps the relevant cap-at-max branch into
+//     sched.ErrMirrorSlotAtCapacity when the slot is exhausted.
 func (e *Engine) AdmitMirrorInstance(ctx context.Context, appID, mirrorRuleID, mirrorDeploymentID string) (WakeResult, error) {
-	if !e.tryAcquireMirrorSlot(mirrorRuleID) {
-		return WakeResult{}, ErrMirrorSlotAtCapacity
-	}
-	// Defer the release — runs even on the error path so a
-	// failed admit doesn't leak the slot. The cap is "VMs in
-	// flight", not "admit attempts" — the mirror goroutine
-	// releases when the VM parks.
-	defer e.releaseMirrorSlot(mirrorRuleID)
-	// Scope is empty (mirror rules are app-scoped, not preview-
-	// scoped). Trigger is "gateway.mirror" — closed-enum so
-	// pkg/wire/metrics.go can route it through the mirror's
-	// distinct Prometheus counter (commit 3 wires the metric).
-	res, err := e.admitAndDispatchForDeployment(ctx, appID, mirrorDeploymentID, false)
-	if err != nil {
-		return res, err
-	}
-	// Stamp mode=mirror on the freshly created instance row.
-	// The CreateInstance call inside admitAndDispatchForDeployment
-	// went through CreateInstanceWithMode? No — the existing
-	// createInstanceWithWakeRetry uses the legacy CreateInstance
-	// (mode='normal' default). PR-A3 commit 2 widens the legacy
-	// path with mode=InstanceModeNormal explicitly; the mirror
-	// path here needs to flip the just-inserted row's mode to
-	// InstanceModeMirror. The engine stamps the column via a
-	// follow-on UpdateInstanceMode call so we don't have to
-	// add a mirror-mode variant of every createInstanceWithWakeRetry
-	// caller — see SetInstanceMode below.
-	if res.InstanceID != "" {
-		if setErr := e.store.SetInstanceMode(ctx, res.InstanceID, state.InstanceModeMirror); setErr != nil {
-			// Mirror mode stamp failed — log + continue. The
-			// customer is unaffected (the source response was
-			// already returned); the worst case is the mirror
-			// VM gets billed per running second instead of being
-			// free. The sampler skip + reaper skip still work
-			// (mode='normal' is fine for both); the only loss
-			// is the metering carve-out. Operators can detect
-			// this via the metric counter (mirror_mode_stamp_failures).
-			e.log.Warn("sched: stamp instance mode=mirror failed",
-				"instance", res.InstanceID, "rule", mirrorRuleID, "err", setErr)
-		}
-	}
-	return res, nil
+	// PR-A3 code-review fix #3 — the per-rule concurrent-mirror-VM
+	// cap lives on the GATEWAY Handler (mirrorSlots + tryAcquireMirrorSlot).
+	// The cap reflects "VMs in flight" through round-trip complete
+	// (the goroutine releases on its own defer), not "admit attempts".
+	// Holding the slot here would release microseconds after the wake
+	// command is sent, well before the mirror VM is done serving.
+	_ = mirrorRuleID
+	// PR-A3 code-review fix #6 — single INSERT with mode='mirror'.
+	// admitAndDispatchForDeployment's mode parameter is threaded
+	// straight into CreateInstanceWithMode, so the row is created
+	// in one shot instead of INSERT mode='normal' then UPDATE to
+	// mode='mirror' (the latter had a race window readable by
+	// sampler / reaper between INSERT and UPDATE).
+	return e.admitAndDispatchForDeployment(ctx, appID, mirrorDeploymentID, string(state.InstanceModeMirror), false)
 }
 
-// tryAcquireMirrorSlot (issue #72 / ADR-125 PR-A3) is the
-// per-rule concurrent-mirror-VM cost-circuit. Returns true when
-// the slot was acquired (count is now 1..cap inclusive); false
-// when the slot is already at cap and the goroutine should drop
-// the request. The slot is released by releaseMirrorSlot, which
-// the mirror goroutine fires via defer when the VM parks.
-//
-// The cap (e.MirrorMaxConcurrentPerRule, default 5) bounds the
-// concurrent mirror VM count per rule so a runaway customer
-// rule cannot pin the gateway's wake-coord budget.
-//
-// sync.Map's LoadOrStore handles the first-write-under-contention
-// race: whichever goroutine lands first allocates the
-// *atomic.Int64; concurrent callers reuse the winner's pointer.
-func (e *Engine) tryAcquireMirrorSlot(ruleID string) bool {
-	cap := e.MirrorMaxConcurrentPerRule
-	if cap <= 0 {
-		cap = 5 // safety: never 0 or negative even if the field was set to 0
-	}
-	fresh := &atomic.Int64{}
-	actual, _ := e.mirrorSlots.LoadOrStore(ruleID, fresh)
-	slot := actual.(*atomic.Int64)
-	cur := slot.Add(1)
-	if cur > cap {
-		// Over-cap — undo and report failure.
-		slot.Add(-1)
-		return false
-	}
-	return true
-}
-
-// releaseMirrorSlot (issue #72 / ADR-125 PR-A3) is the
-// mirror-VM-park callback the dispatch goroutine fires via
-// defer. Decrements the per-rule counter; never below zero (a
-// defensive floor — a release without a matching acquire would
-// be a goroutine bug, but the floor keeps the invariant
-// observable at the goroutine level rather than as a panicking
-// atomic underflow). The rule ID is also removed from the
-// mirrorSlots map when the count hits zero so a customer who
-// disables and re-enables the rule (via PATCH /v1/apps/{slug}/
-// mirrors/{id}) doesn't accumulate stale entries. The
-// LoadAndDelete is best-effort — a concurrent release from a
-// second goroutine on the same rule just succeeds in releasing
-// its own slot without claiming the deletion.
-func (e *Engine) releaseMirrorSlot(ruleID string) {
-	v, ok := e.mirrorSlots.Load(ruleID)
-	if !ok {
-		return
-	}
-	slot := v.(*atomic.Int64)
-	for {
-		cur := slot.Load()
-		if cur <= 0 {
-			return
-		}
-		if slot.CompareAndSwap(cur, cur-1) {
-			if cur-1 == 0 {
-				e.mirrorSlots.Delete(ruleID)
-			}
-			return
-		}
-	}
-}
-
-// ErrMirrorSlotAtCapacity (issue #72 / ADR-125 PR-A3) is the
-// sentinel AdmitMirrorInstance returns when the per-rule cap is
-// reached. The gateway dispatch goroutine translates this to a
-// ledger row with status_diff=true + metric
+// ErrMirrorSlotAtCapacity (issue #72 / ADR-133 / ADR-125 PR-A3) is the
+// sentinel the gateway's dispatchMirror goroutine returns when
+// the per-rule cap is reached. As of PR-A3 code-review fix #3,
+// the slot lives on the GATEWAY Handler (mirrorSlots +
+// tryAcquireMirrorSlot), not on this engine — schedd just stamps
+// mode='mirror' on the new instances row. The gateway wraps this
+// sentinel via fmt.Errorf("%w", sched.ErrMirrorSlotAtCapacity)
+// when its per-rule counter is at cap. The dispatch goroutine
+// translates this to a ledger row with status_diff=true + metric
 // gateway_mirror_dispatched_total{result="cap_at_max"} and
 // otherwise drops the request on the floor. NOT a real failure —
 // the customer's source response was already returned; mirror
@@ -1654,7 +1529,7 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 		// the trigger is captured for API symmetry but not consumed.
 		return e.AdmitInstance(ctx, appID, "", scope, trigger)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
 }
 
 // admitAndDispatchForDeployment mirrors admitAndDispatch but threads
@@ -1682,7 +1557,7 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment path through the gate (which would require either
 // collapsing the two cap-enforcement layers or duplicating the
 // ledger write).
-func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
+func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID, mode string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
 	app, acct, limits, _, err := e.resolveApp(ctx, appID)
@@ -1735,7 +1610,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	}
 	wakeID := wakeUUID.String()
 
-	ins, err := e.store.CreateInstanceWithMode(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID, string(state.InstanceModeNormal))
+	ins, err := e.store.CreateInstanceWithMode(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID, mode)
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
