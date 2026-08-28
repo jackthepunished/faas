@@ -1941,18 +1941,6 @@ func TestGregaleTail_CtrlCExits(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("FAAS_API", srv.URL)
 
-	// Probe the sink before driving cmdTail: httptest's keepalive
-	// setup is occasionally cold-warm on the first non-default-
-	// client request. One cheap GET pre-flushes the listener state
-	// so the real command under test doesn't race it.
-	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
-	probeResp, err := http.DefaultClient.Do(probeReq)
-	if err != nil {
-		close(gate)
-		t.Fatalf("probe GET /v1/events: %v", err)
-	}
-	probeResp.Body.Close()
-
 	// Drive cmdTail in a goroutine.
 	done := make(chan int, 1)
 	go func() { done <- cmdTail(nil) }()
@@ -2031,13 +2019,6 @@ func TestGregaleTail_PrintsInvocationDone(t *testing.T) {
 	srv := httptest.NewServer(sink)
 	defer srv.Close()
 	t.Setenv("FAAS_API", srv.URL)
-
-	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
-	probeResp, err := http.DefaultClient.Do(probeReq)
-	if err != nil {
-		t.Fatalf("probe GET /v1/events: %v", err)
-	}
-	probeResp.Body.Close()
 
 	stdout, restore := captureStdout(t)
 	defer restore()
@@ -2120,13 +2101,6 @@ func TestGregaleTail_AppFilterOnSlugAndID(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("FAAS_API", srv.URL)
 
-	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
-	probeResp, err := http.DefaultClient.Do(probeReq)
-	if err != nil {
-		t.Fatalf("probe GET /v1/events: %v", err)
-	}
-	probeResp.Body.Close()
-
 	stdout, restore := captureStdout(t)
 	defer restore()
 
@@ -2205,13 +2179,6 @@ func TestGregaleTail_StatelessAdvisoryFlag(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("FAAS_API", srv.URL)
 
-	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
-	probeResp, err := http.DefaultClient.Do(probeReq)
-	if err != nil {
-		t.Fatalf("probe GET /v1/events: %v", err)
-	}
-	probeResp.Body.Close()
-
 	// Phase 1: flag OFF — stateless_advisory frame must be hidden.
 	offStdout, offRestore := captureStdout(t)
 	done := make(chan int, 1)
@@ -2265,13 +2232,6 @@ flagON:
 	srv2 := httptest.NewServer(sink2)
 	defer srv2.Close()
 	t.Setenv("FAAS_API", srv2.URL)
-
-	probeReq2, _ := http.NewRequest(http.MethodGet, srv2.URL+"/v1/events", nil)
-	probeResp2, err := http.DefaultClient.Do(probeReq2)
-	if err != nil {
-		t.Fatalf("probe GET /v1/events (flag ON): %v", err)
-	}
-	probeResp2.Body.Close()
 
 	onStdout, onRestore := captureStdout(t)
 	go func() { done <- cmdTail([]string{"--include-stateless"}) }()
