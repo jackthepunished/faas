@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -37,7 +38,7 @@ func TestMemStore_PR134AsyncContract(t *testing.T) {
 	if mx, cur, err := m.GetAccountAsyncQuota(ctx, acct.ID); err != nil || mx != 10 || cur != 0 {
 		t.Errorf("Get(acct) = (%d,%d,%v), want (10,0,nil)", mx, cur, err)
 	}
-	if _, _, err := m.GetAccountAsyncQuota(ctx, "missing-acct"); err != ErrNotFound {
+	if _, _, err := m.GetAccountAsyncQuota(ctx, "missing-acct"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Get(missing) = %v, want ErrNotFound", err)
 	}
 
@@ -63,10 +64,10 @@ func TestMemStore_PR134AsyncContract(t *testing.T) {
 	if _, err := m.ClaimInvocationWithCap(ctx, ids[1], "inst-B", 60, 2); err != nil {
 		t.Errorf("ClaimWithCap[1] at cur=1/2: %v", err)
 	}
-	if _, err := m.ClaimInvocationWithCap(ctx, ids[2], "inst-C", 60, 2); err != ErrQuotaExceeded {
+	if _, err := m.ClaimInvocationWithCap(ctx, ids[2], "inst-C", 60, 2); !errors.Is(err, ErrQuotaExceeded) {
 		t.Errorf("ClaimWithCap[2] at cur=2/2 = %v, want ErrQuotaExceeded", err)
 	}
-	if _, err := m.ClaimInvocationWithCap(ctx, "missing-id", "inst-X", 60, 2); err != ErrNotFound {
+	if _, err := m.ClaimInvocationWithCap(ctx, "missing-id", "inst-X", 60, 2); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ClaimWithCap(missing) = %v, want ErrNotFound", err)
 	}
 
@@ -152,13 +153,13 @@ func TestMemStore_PR134AsyncContract(t *testing.T) {
 	if got2.LastReplayedAt == nil {
 		t.Error("LastReplayedAt not stamped")
 	}
-	if _, err := m.RetryQueueDeadLetter(ctx, "other-acct", ids[1]); err != ErrNotFound {
+	if _, err := m.RetryQueueDeadLetter(ctx, "other-acct", ids[1]); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RetryQueueDeadLetter(scope mismatch) = %v, want ErrNotFound", err)
 	}
-	if _, err := m.RetryQueueDeadLetter(ctx, acct.ID, ids[2]); err != ErrNotFound {
+	if _, err := m.RetryQueueDeadLetter(ctx, acct.ID, ids[2]); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RetryQueueDeadLetter(wrong state, ids[2] pending) = %v, want ErrNotFound", err)
 	}
-	if _, err := m.RetryQueueDeadLetter(ctx, acct.ID, "ghost"); err != ErrNotFound {
+	if _, err := m.RetryQueueDeadLetter(ctx, acct.ID, "ghost"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RetryQueueDeadLetter(missing) = %v, want ErrNotFound", err)
 	}
 
