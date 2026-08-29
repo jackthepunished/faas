@@ -27,7 +27,7 @@ BEGIN
              FROM instances
             WHERE job_id = p_job_id
               AND kind   = 'job_task'
-              AND status NOT IN ('parked', 'destroyed')
+              AND state NOT IN ('parked', 'destroyed')
        )
     RETURNING TRUE INTO flipped;
 

@@ -36,6 +36,16 @@ ALTER TABLE job_runs
 -- job_runs_counters_check is the denormalised-counter check from
 -- 00255. Drop+recreate to include dead_letter_count and the
 -- cross-field invariant (sum ≤ tasks).
+--
+-- CR-B / code-review #2 round-2: the previous shape added
+-- `+ dead_letter_count` to the additive sum, which double-counted
+-- tasks that were both terminal-failed AND dead-lettered
+-- (dead_letter_count is incremented only after retry-exhaustion,
+-- so every dead-lettered task is also in tasks_failed). Fix:
+-- drop dead_letter_count from the additive sum (its tasks are
+-- already counted in tasks_failed) and anchor the cross-field
+-- invariant as `dead_letter_count <= tasks_failed` — a task must
+-- have reached a failed terminal state to be dead-lettered.
 DO $$
 DECLARE
     c text;
@@ -58,7 +68,8 @@ ALTER TABLE job_runs
         AND tasks_running >= 0
         AND dead_letter_count >= 0
         AND dead_letter_count <= tasks
-        AND tasks_succeeded + tasks_failed + tasks_cancelled + tasks_running + dead_letter_count <= tasks
+        AND dead_letter_count <= tasks_failed
+        AND tasks_succeeded + tasks_failed + tasks_cancelled + tasks_running <= tasks
     );
 -- +goose StatementEnd
 

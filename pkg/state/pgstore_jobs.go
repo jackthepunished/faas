@@ -379,7 +379,7 @@ func (s *PgStore) JobConcurrentByAccount(ctx context.Context, accountID string) 
 		`select count(*) from instances
 		  where account_id = $1::uuid
 		    and kind       = 'job_task'
-		    and status not in ('parked', 'destroyed')`,
+		    and state      not in ('parked', 'destroyed')`,
 		accountID,
 	).Scan(&count)
 	if err != nil {
@@ -546,9 +546,22 @@ func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, er
 		   end
 		 from (
 		   select
+		     -- 00525 broadened the terminal vocabulary to
+		     -- succeeded/failed/timeout/cancelled/oom. CR-E /
+		     -- code-review #2 round-5: the previous SUM arms did
+		     -- NOT include 'timeout' or 'oom', so reaped tasks
+		     -- (reaper_jobs.go::ReapStuckJobTasks flips status to
+		     -- 'timeout') contributed 0 to every bucket and the
+		     -- aggregate_status fell into the ELSE 'succeeded'
+		     -- arm, masking every timeout in the dashboard as a
+		     -- green run. Memstore mirror folds timeout/oom into
+		     -- canc (memstore_jobs.go:385); align the pgstore
+		     -- SQL to match. The retry-eligible statuses
+		     -- (failed/timeout/oom) are NOT folded into canc —
+		     -- only the dead-letter-tally statuses are.
 		     sum(case when status = 'succeeded' then 1 else 0 end) as succ,
 		     sum(case when status = 'failed' then 1 else 0 end) as fail,
-		     sum(case when status = 'cancelled' then 1 else 0 end) as canc,
+		     sum(case when status in ('cancelled','timeout','oom') then 1 else 0 end) as canc,
 		     sum(case when status in ('claimed') then 1 else 0 end) as running,
 		     sum(case when status = 'queued' then 1 else 0 end) as queued_or_claimed
 		   from job_tasks where run_id = r.id
@@ -576,10 +589,25 @@ func (s *PgStore) JobRunCancel(ctx context.Context, runID string) (JobRun, error
 
 	// 1. Cancel every non-terminal task. WHERE guards on
 	//    status NOT IN (terminal set) make this idempotent.
+	//
+	//    CR-F / code-review #2 round-6: the previous shape flipped
+	//    status='cancelled' but did NOT clear lease_token /
+	//    lease_expires_at / last_lease_node. For the 20 (out of
+	//    200) tasks that were already claimed+leased, the lease
+	//    columns survived the cancel — the partial unique index
+	//    job_tasks_lease_uniq held 20 stale entries, blocking
+	//    lease-key reuse, and JobTaskFindStuck's status='claimed'
+	//    gate never reaped them (status is now 'cancelled'). Fix:
+	//    clear all three lease columns alongside the status flip so
+	//    the row is fully released and the lease-key namespace is
+	//    free for reuse.
 	if _, err := tx.Exec(ctx,
 		`update job_tasks
-		    set status = 'cancelled',
-		        finished_at = coalesce(finished_at, now())
+		    set status            = 'cancelled',
+		        finished_at       = coalesce(finished_at, now()),
+		        lease_token       = null,
+		        lease_expires_at  = null,
+		        last_lease_node   = null
 		  where run_id = $1::uuid
 		    and status in ('queued', 'claimed')`,
 		runID,
@@ -900,7 +928,7 @@ func (s *PgStore) ListJobInstances(ctx context.Context) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, state, ram_mb, job_id from instances
 		  where kind = 'job_task'::text
-		    and status not in ('destroyed', 'parked')
+		    and state not in ('destroyed', 'parked')
 		  order by created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("state: list job_task instances: %w", err)

@@ -2879,9 +2879,10 @@ type Instance struct {
 
 // InstanceMode (issue #72 / ADR-125) is the closed vocabulary for
 // the `instances.mode` column. The string values match the
-// migrations/00349 CHECK; the sampler, reaper, and schedd engine
-// compare against these constants rather than literal strings so a
-// future widening lands as a compile error at every callsite.
+// migrations/00349 + 00531 CHECK; the sampler, reaper, and schedd
+// engine compare against these constants rather than literal
+// strings so a future widening lands as a compile error at every
+// callsite.
 type InstanceMode string
 
 const (
@@ -2894,6 +2895,15 @@ const (
 	// customer is never billed for this row; the reaper does not
 	// idle-reap it (the request-completion path self-parks it).
 	InstanceModeMirror InstanceMode = "mirror"
+	// InstanceModeJob (issue #1184 Workstream A / ADR-099
+	// supplement) tags an instance that the schedd created to
+	// run a single job task. Unlike mirror, a job VM IS
+	// billable — the sampler path counts it like a normal VM;
+	// the only mode-specific branch is the per-account
+	// JobConcurrentByAccount quota gate (which uses kind=
+	// 'job_task', not mode). Mode='job' is observability for
+	// the dashboard's workload-class breakdown.
+	InstanceModeJob InstanceMode = "job"
 )
 
 // MirrorRule (issue #72 / ADR-125) is the customer-intent row

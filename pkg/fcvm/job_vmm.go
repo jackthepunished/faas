@@ -268,14 +268,22 @@ func (v *JailerVMM) BootColdBootForJob(ctx context.Context, l Lease, spec JobCol
 // truncates and replaces (rare; the chroot is per-instance so the
 // path is unique). Best-effort umount on error so a partial write
 // doesn't leak the mount.
+//
+// CR-C / code-review #2 round-3: the previous shape stats
+// "drive1.img" which is NOT the canonical in-chroot drive1 image
+// — vmm.go::mkChroot / stageEphemeralWritableAs provisions
+// `layerImageName` (constant defined in vmm.go:1524) inside the
+// chroot. Stat'ing drive1.img always returns ENOENT, every job
+// boot fails, the guest never sees /etc/faas/job.json, vsock
+// never gets a job_exit frame. Fix: stat the canonical name.
 func (v *JailerVMM) stageJobManifest(instance string, m JobManifest) error {
 	if v.chrootBase == "" {
 		return fmt.Errorf("vmm: stageJobManifest: chrootBase not configured")
 	}
 	root := v.chrootRoot(instance)
-	drive1Img := filepath.Join(root, "drive1.img")
+	drive1Img := filepath.Join(root, layerImageName)
 	if _, err := os.Stat(drive1Img); err != nil {
-		return fmt.Errorf("vmm: stageJobManifest: drive1.img missing at %s: %w", drive1Img, err)
+		return fmt.Errorf("vmm: stageJobManifest: %s missing at %s: %w", layerImageName, drive1Img, err)
 	}
 	mnt := filepath.Join(root, "mnt-job")
 	if err := os.MkdirAll(mnt, 0o755); err != nil {

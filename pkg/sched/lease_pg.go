@@ -114,12 +114,14 @@ func NewPgLeaser(pool poolExecutor, nodeID string, now func() time.Time) *PgLeas
 // asserting the format — the canonical identifier for the lease is
 // the job_tasks row, not the key string.
 //
-// Implementation: a single INSERT against job_tasks_lease_uniq
-// (00528) is the atomic claim. The unique partial index
-// (lease_token WHERE lease_token IS NOT NULL) serialises concurrent
-// acquires on the same token — a UUID v7 collision (vanishingly
-// unlikely with crypto/rand or gen_random_uuid()) trips SQLSTATE
-// 23505 → ErrLeaseHeldByOther via mapErr.
+// Implementation: a single UPDATE on job_tasks guarded by
+// `lease_token IS NULL OR lease_expires_at < now()` so a live
+// lease held by another schedd is not stolen. RowsAffected()==0
+// returns ErrLeaseHeldByOther (the row exists but is leased to
+// someone else OR not yet ready for re-claim). The previous shape
+// ignored RowsAffected and matched on `status IN ('queued','claimed')`
+// only, so two schedd nodes both observed success on the same row
+// and double-billed tenant RAM (CR-D / code-review #2 round-4).
 //
 // In production, Acquire is rarely called directly: M5's
 // JobTaskClaimBatch + JobTaskMarkClaimed writes the same columns
@@ -140,7 +142,15 @@ func (l *PgLeaser) Acquire(ctx context.Context, key string, policy LeasePolicy, 
 	// caller is responsible for setting status='claimed' on the same
 	// row before Acquire returns (otherwise the partial unique index
 	// includes NULL tokens which don't trip the constraint).
-	_, err = l.pool.Exec(ctx, `
+	//
+	// The lease_token-IS-NULL OR lease_expires_at-is-past guard
+	// is the load-bearing concurrency primitive: without it, two
+	// schedds both see RowsAffected=1 on the same row (last writer
+	// wins) and both boot a Firecracker VM for the same task. With
+	// it, the second Acquire's WHERE matches 0 rows and we return
+	// ErrLeaseHeldByOther so the dispatch tick re-queues via
+	// JobTaskRequeue (which does NOT increment attempt — see CR-7).
+	tag, err := l.pool.Exec(ctx, `
 		UPDATE job_tasks
 		   SET lease_token      = $1,
 		       lease_expires_at = $2,
@@ -148,9 +158,13 @@ func (l *PgLeaser) Acquire(ctx context.Context, key string, policy LeasePolicy, 
 		 WHERE run_id     = $4
 		   AND task_index = $5
 		   AND status IN ('queued','claimed')
+		   AND (lease_token IS NULL OR lease_expires_at < now())
 	`, string(tok), expires, l.nodeID, runID, taskIndex)
 	if err != nil {
 		return "", nil, fmt.Errorf("sched: pg lease acquire: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return "", nil, ErrLeaseHeldByOther
 	}
 	rec := &pgLeaseRecord{
 		RunID:     runID,

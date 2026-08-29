@@ -32,7 +32,7 @@ END $$;
 CREATE INDEX IF NOT EXISTS instances_job_active_idx
     ON instances (job_id)
     WHERE kind = 'job_task'
-      AND status NOT IN ('parked', 'destroyed');
+      AND state NOT IN ('parked', 'destroyed');
 -- +goose StatementEnd
 
 -- +goose Down

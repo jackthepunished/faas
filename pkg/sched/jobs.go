@@ -168,14 +168,46 @@ func (e *Engine) WakeJob(ctx context.Context, accountID, runID string, taskIndex
 		return JobWakeResult{}, fmt.Errorf("sched: WakeJob mark claimed: %w", err)
 	}
 
-	// 4. vmmd RPC. The full cold-boot call lands in M7; until then
+	// 4. Write the instances row. CR-H / code-review #2 round-8:
+	//    the previous shape deferred this to M7 — but without an
+	//    instances row, SampleJobsAndRoll finds 0 kind='job_task'
+	//    rows (meter customer never billed) and JobConcurrentByAccount
+	//    returns 0 (Hobby quota of 3 is never enforced; a Hobby
+	//    customer can run 100 concurrent tasks). Mirror the Wake
+	//    path's CreateInstanceWithMode call (engine.go:1627) at the
+	//    schedd layer so the row exists BEFORE the vmmd boot RPC.
+	//    app_id="" + deployment_id=runID is the same convention
+	//    00256_instances_kind_job codified for kind='job_task'
+	//    rows; mode=InstanceModeJob is observability for the
+	//    dashboard (the bill path keys on kind, not mode).
+	//
+	//    On any create-instance failure, release the lease + ledger
+	//    slot and let the dispatch tick re-queue via JobTaskRequeue
+	//    (no attempt increment — the customer's code did not run).
+	if _, err := e.store.CreateInstanceWithMode(
+		ctx,
+		"",    // app_id (jobs have no appID)
+		runID, // deployment_id surrogate; the 00256 pair-check allows jobID here
+		string(state.StateColdBooting),
+		ramMB,
+		nodeID,
+		instanceID,
+		string(state.InstanceModeJob),
+	); err != nil {
+		_ = e.jobLeaser.Release(ctx, tok, e.ownerNodeID)
+		e.ledger.Release(instanceID)
+		return JobWakeResult{}, fmt.Errorf("sched: WakeJob create instance: %w", err)
+	}
+
+	// 5. vmmd RPC. The full cold-boot call lands in M7; until then
 	// the WakeJob surface is wired but the Firecracker boot is a
 	// no-op stub that returns Method="cold_boot" + an empty NodeID
 	// for unit tests. The M7 commit flips this branch to the real
 	// vmmd gRPC call.
 	if e.jobVmmClient == nil {
-		// No vmmd wired — treat as test path. The instance row was
-		// never created via CreateInstanceWithMode (that's also M7).
+		// No vmmd wired — treat as test path. The instance row
+		// has already been written (step 4), so the test path
+		// exercises the full CreateInstanceWithMode contract.
 		return JobWakeResult{
 			InstanceID: instanceID,
 			NodeID:     nodeID,
@@ -318,7 +350,19 @@ func (e *Engine) HandleJobExit(ctx context.Context, accountID, runID string, tas
 	// MarkTaskTerminal, but the in-memory MemLeaser (tests) still
 	// tracks the record. PgLeaser.Release is a no-op if the row is
 	// already gone, so calling it twice is safe.
-	if tok := LeaseToken(leaseTokenStr); tok != "" {
+	//
+	// CR-G / code-review #2 round-7: the previous shape called
+	// `e.jobLeaser.Release` unconditionally. cmd/schedd/main.go
+	// does NOT wire `WithJobLeaser` (the production wiring defers
+	// to Mega-1.5 because PgLeaser.poolExecutor is incompatible
+	// with *pgxpool.Pool; see job_vmm_stub.go::ErrJobLeaserNil),
+	// so until WithJobLeaser ships, this Release would nil-deref
+	// and panic the schedd goroutine. WakeJob already has the
+	// matching nil-guard at line ~151; mirror it here. Note: this
+	// nil-guard is also defensive against the M7 commit landing
+	// first (the documented ordering pairs the two wirings, but
+	// the code must fail-safe if they're split across PRs).
+	if tok := LeaseToken(leaseTokenStr); tok != "" && e.jobLeaser != nil {
 		_ = e.jobLeaser.Release(ctx, tok, e.ownerNodeID)
 	}
 	// Retry-on-failure: re-queue failed/timeout/oom tasks if budget
