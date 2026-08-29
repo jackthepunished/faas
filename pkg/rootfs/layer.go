@@ -258,15 +258,13 @@ func preserveOwnership(target string, hdr *tar.Header) error {
 		// parseOwnership already incremented under the right reason.
 		return nil
 	}
-	if err := os.Lchown(target, uid, gid); err != nil {
-		// Some filesystems (notably tmpfs / overlayfs mounted with
-		// noacl) refuse chown as a non-root operation. imaged runs as
-		// root, but a downstream mount policy could still trip this.
-		// We log-and-continue rather than fail the build — a file
-		// landed under the daemon uid is still correct, just not the
-		// customer-declared uid.
-		return nil
-	}
+	// Some filesystems (notably tmpfs / overlayfs mounted with noacl)
+	// refuse chown as a non-root operation. imaged runs as root, but
+	// a downstream mount policy could still trip this. We
+	// log-and-continue rather than fail the build — a file landed
+	// under the daemon uid is still correct, just not the
+	// customer-declared uid.
+	_ = os.Lchown(target, uid, gid)
 	return nil
 }
 
