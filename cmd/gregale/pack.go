@@ -876,14 +876,19 @@ func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
 	return "", "", false
 }
 
-// zeroConfigSourceCapMB is the conservative per-plan floor used by the
-// zero-config preflight: the server will reject anything above this on
-// Free/Hobby (see pkg/api/limits.go: SourceTarballMaxMB). We don't have the
-// customer's plan on the wire without a GetAccount round-trip; the floor is
-// the safest choice because a zero-config abort on Free is much better UX
-// than a slow upload that ends in a 413. Customers on Pro/Scale who exceed
-// 100 MB but fit within 250 MB should pass --tarball of a hand-built archive.
-const zeroConfigSourceCapMB = 100
+// defaultZeroConfigSourceCapMB is the conservative per-plan floor used when
+// the CLI can't resolve the customer's plan (Whoami round-trip failed or
+// skipped). The server rejects anything above 100 MB on Free/Hobby (see
+// pkg/api/limits.go: SourceTarballMaxMB). The floor is the safest choice
+// because a zero-config abort on Free is much better UX than a slow upload
+// that ends in a 413. Customers on Pro/Scale who exceed 100 MB but fit within
+// 250 MB should pass --tarball of a hand-built archive.
+//
+// Production callers (commands2.go) resolve the per-plan cap via
+// api.MustLimitsFor(plan).SourceTarballMaxMB and thread it through; this
+// constant is the floor for the cmd/gregale/pack_test.go harness where the
+// plan is unknown.
+const defaultZeroConfigSourceCapMB = 100
 
 // packDirToTarGz walks srcDir and writes a gzipped tar archive to destPath. The
 // archive's single top-level directory is filepath.Base(srcDir), preserving the
@@ -891,11 +896,15 @@ const zeroConfigSourceCapMB = 100
 // hardlinks and device nodes are rejected — apid rejects them too, so failing
 // fast in the CLI is strictly better UX. Regular files are streamed with a fixed
 // mtime for reproducibility, and each file is read through a LimitReader
-// capped at zeroConfigSourceCapMB so a single runaway file aborts early
-// instead of materialising its full size into the tar. After the archive is
-// written the on-disk size is re-checked against the cap (gzip compression
-// can change the byte count either way). Returns the count of regular files
-// archived.
+// capped at capMB so a single runaway file aborts early instead of
+// materialising its full size into the tar. After the archive is written the
+// on-disk size is re-checked against the cap (gzip compression can change the
+// byte count either way). Returns the count of regular files archived.
+//
+// capMB is the per-plan upload cap resolved by the caller from
+// api.MustLimitsFor(plan).SourceTarballMaxMB. cmd/gregale's tests pass
+// defaultZeroConfigSourceCapMB as a stable floor so the per-file / total-size
+// tests have a deterministic budget.
 //
 // envOverride, when non-nil, is a rel-path → redacted-bytes map applied to
 // the matching entry before it's written to the tarball. Used by the
@@ -907,7 +916,7 @@ const zeroConfigSourceCapMB = 100
 // harness, or `gregale deploy --secret-scan=off`).
 //
 // The gzip→tar→walk shape mirrors cmd/gregale/templates/embed.go:TarGz.
-func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (regularFileCount int, err error) {
+func packDirToTarGz(srcDir, destPath string, capMB int, envOverride map[string][]byte) (regularFileCount int, err error) {
 	root := filepath.Base(srcDir)
 
 	// Load .gregaleignore once (before the walk) so shouldExclude sees
@@ -1016,7 +1025,7 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 		if err := tw.WriteHeader(hdr); err != nil {
 			return 0, fmt.Errorf("write header %s: %w", hdr.Name, err)
 		}
-		if err := copyRegular(tw, e.abs); err != nil {
+		if err := copyRegular(tw, e.abs, capMB); err != nil {
 			return 0, err
 		}
 		regularFileCount++
@@ -1035,10 +1044,10 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 	if err != nil {
 		return 0, fmt.Errorf("stat packed tarball: %w", err)
 	}
-	const capBytes = zeroConfigSourceCapMB * 1024 * 1024
+	capBytes := int64(capMB) * 1024 * 1024
 	if st.Size() > capBytes {
 		return 0, fmt.Errorf("packed cwd is %d MB, over the %d MB zero-config cap; trim large files or pass --tarball of a hand-built archive",
-			st.Size()/(1024*1024), zeroConfigSourceCapMB)
+			st.Size()/(1024*1024), capMB)
 	}
 	return regularFileCount, nil
 }
@@ -1049,12 +1058,12 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 // because the walked paths are customer-supplied (TOCTOU: a path Lstat'd as
 // regular during the walk could be swapped for a symlink before we read it).
 //
-// The stream is wrapped in a LimitReader at zeroConfigSourceCapMB so a single
-// runaway file (a 2 GB raw dataset committed by accident) aborts early with
-// a clear error instead of streaming gigabytes through gzip→tar. The cap
-// matches the Free/Hobby floor; Pro/Scale customers who deliberately commit
-// larger files should pass --tarball of a hand-built archive.
-func copyRegular(tw *tar.Writer, abs string) error {
+// The stream is wrapped in a LimitReader at capMB so a single runaway file
+// (a 2 GB raw dataset committed by accident) aborts early with a clear
+// error instead of streaming gigabytes through gzip→tar. capMB is the
+// per-plan upload cap resolved by the caller from
+// api.MustLimitsFor(plan).SourceTarballMaxMB.
+func copyRegular(tw *tar.Writer, abs string, capMB int) error {
 	f, err := openCustomerFile(abs)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", abs, err)
@@ -1068,7 +1077,7 @@ func copyRegular(tw *tar.Writer, abs string) error {
 	// io.Copy(tw, f) without a cap and only checked the size after the
 	// entire file had already been streamed into gzip — a 2 GB file
 	// would pay the full CPU/IO cost before the error surfaced.
-	const capBytes = int64(zeroConfigSourceCapMB) * 1024 * 1024
+	capBytes := int64(capMB) * 1024 * 1024
 	lr := io.LimitReader(f, capBytes+1)
 	n, err := io.Copy(tw, lr)
 	if err != nil {
@@ -1076,7 +1085,7 @@ func copyRegular(tw *tar.Writer, abs string) error {
 	}
 	if n > capBytes {
 		return fmt.Errorf("refusing to pack %s: %d bytes > %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
-			filepath.Base(abs), n, zeroConfigSourceCapMB)
+			filepath.Base(abs), n, capMB)
 	}
 	return nil
 }
@@ -1200,7 +1209,7 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 // secret-scan pass (see scanAndRedactEnvFiles). Pass nil to skip the scan
 // entirely — used by `gregale deploy --secret-scan=off` and by callers
 // that already vetted the inputs (cmd/e2e harness, pack_test.go).
-func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
+func autoPackCwd(srcDir string, capMB int, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
 	// Error-explanations cluster (spec §6.4 amendment 1): warn-only
 	// preflight that lifts the cluster's source-side hints via the
 	// whycopy catalog. Hints are printed after the deploy summary by
@@ -1224,7 +1233,7 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 	path := f.Name()
 	_ = f.Close()
 
-	n, err := packDirToTarGz(srcDir, path, envOverride)
+	n, err := packDirToTarGz(srcDir, path, capMB, envOverride)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", fwUnknown, 0, err

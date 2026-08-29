@@ -676,6 +676,62 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 	return req
 }
 
+// createOrFetchApp issues CreateApp and, on a 409 (the slug is taken),
+// probes the server with GetApp to disambiguate "owned by this account"
+// from "owned by another account". Returns nil on success (either a fresh
+// create or an in-account match).
+//
+// Issue #1182 / pre-existing soft-#560 behaviour:
+//   - CreateApp → 200/201 → nil
+//   - CreateApp → 409 → GetApp(slug):
+//     - 200 → the slug exists in this account → mirror --require-authn /
+//       --app-protocol via UpdateApp (preserves the existing #560 PATCH
+//       semantics), return nil
+//     - 404 → apid's loadAppAndPreflight returns a silent 404 for IDOR
+//       (the slug is owned by another account), so we cannot tell apart
+//       "different account" from "race against a peer that just
+//       deleted". The hybrid probe HARD-FAILS here rather than silently
+//       falling through to DeployTarball — DeployTarball would otherwise
+//       404 at apid with the less informative "no such app" message, and
+//       the customer would never learn that the slug is taken globally.
+//   - CreateApp → non-409 error → propagated.
+//
+// The probe costs one extra round-trip on the slug-conflict path, which
+// is rare in normal use (zero-config deploy on a fresh repo is the only
+// caller that hits it). The happy path is unchanged.
+func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequest, requireAuthnPtr *bool, appProtocolPtr *string) error {
+	if _, err := client.CreateApp(ctx, req); err == nil {
+		return nil
+	} else {
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
+			return fmt.Errorf("could not create app: %w", err)
+		}
+		// Conflict: probe with GetApp to disambiguate same-account vs
+		// other-account ownership. The server's loadAppAndPreflight
+		// enforces IDOR via silent 404, so a 200 means "ours" and a 404
+		// means "either race-with-peer or other-account — we cannot tell,
+		// so refuse to deploy and tell the operator".
+		if _, gerr := client.GetApp(ctx, req.Slug); gerr != nil {
+			return fmt.Errorf("slug %q is already in use; pick a different --name", req.Slug)
+		}
+		// Same account: mirror --require-authn / --no-require-authn (and
+		// --app-protocol, when set) onto the existing app via PATCH. The
+		// plan gate (Pro/Scale only) still fires at the apid PATCH handler
+		// — the existing #560 contract is preserved verbatim.
+		if requireAuthnPtr != nil || appProtocolPtr != nil {
+			upd := api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}
+			if appProtocolPtr != nil {
+				upd.AppProtocol = appProtocolPtr
+			}
+			if _, err := client.UpdateApp(ctx, req.Slug, upd); err != nil {
+				return fmt.Errorf("could not update existing app's flags: %w", err)
+			}
+		}
+		return nil
+	}
+}
+
 // manifestCronClient is the narrow surface deployManifestTriggers
 // reads from the SDK. Splitting it lets the unit test inject a
 // recording fake (cmd/gregale/manifest_test.go) without an httptest
@@ -1322,6 +1378,27 @@ func cmdDeployTarball(args []string) int {
 		// response from the CLI is the deploy shape. An explicit
 		// --function / --app short-circuits the detector — see the
 		// mutex block above.
+		//
+		// Issue #1182: resolve the per-plan upload cap from the
+		// customer's account before any packing happens. The CLI used
+		// to use the Free/Hobby floor (100 MB) for every customer
+		// because it lacked an authed round-trip this early; that
+		// silently truncated Pro/Scale archives to 100 MB even though
+		// the server would have accepted 250 MB. The Whoami call uses
+		// a separate authed client so the deploy timeout on
+		// authedClientWithDeployTimeout (5 min, line 1382) is not
+		// affected — Whoami is a small JSON GET and never needs the
+		// deploy budget.
+		planCapMB := defaultZeroConfigSourceCapMB
+		if wcli, werr := authedClient(); werr == nil {
+			if acct, werr := wcli.Whoami(context.Background()); werr == nil {
+				planCapMB = api.MustLimitsFor(api.Plan(acct.Plan)).SourceTarballMaxMB
+			} else {
+				PrintWarn(osStderr, "Whoami round-trip for per-plan cap failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
+			}
+		} else {
+			PrintWarn(osStderr, "authed client for Whoami round-trip failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
+		}
 		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
 		if err != nil {
 			return printErr("No deployable source found in "+filepath.Base(cwd), err)
@@ -1350,7 +1427,7 @@ func cmdDeployTarball(args []string) int {
 			if scanErr != nil {
 				return printErr("Secret scan failed", scanErr)
 			}
-			path, _, n, err := autoPackCwd(cwd, overrides)
+			path, _, n, err := autoPackCwd(cwd, planCapMB, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
@@ -1364,7 +1441,7 @@ func cmdDeployTarball(args []string) int {
 			if scanErr != nil {
 				return printErr("Secret scan failed", scanErr)
 			}
-			path, fw, n, err := autoPackCwd(cwd, overrides)
+			path, fw, n, err := autoPackCwd(cwd, planCapMB, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
@@ -1494,26 +1571,8 @@ func cmdDeployTarball(args []string) int {
 	}
 
 	createReq := buildCreateRequest(slug, resolvedShape, *runtime, requireAuthnPtr, appProtocolPtr)
-	if _, err := client.CreateApp(ctx, createReq); err != nil {
-		var ae *APIError
-		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
-			return printErr("Could not create app", err)
-		}
-		// Issue #560: the slug already exists (409). The deploy
-		// path used to silently swallow the dup and proceed with
-		// no PATCH; now if the customer passed --require-authn
-		// or --no-require-authn on this deploy, we follow up
-		// with a PATCH to mirror the new flag onto the existing
-		// app — the plan gate (Pro/Scale only) still fires at
-		// the apid PATCH handler, so Free/Hobby customers
-		// flipping --require-authn on an existing app get the
-		// same 403 plan_require_authn_not_allowed as on a fresh
-		// create. The unset case (no flag passed) is a no-op.
-		if requireAuthnPtr != nil {
-			if _, err := client.UpdateApp(ctx, slug, api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}); err != nil {
-				return printErr("Could not update existing app's require_authn", err)
-			}
-		}
+	if err := createOrFetchApp(ctx, client, createReq, requireAuthnPtr, appProtocolPtr); err != nil {
+		return printErr("Could not create or fetch app", err)
 	}
 
 	// Issue #791 PR-C / ADR-090: gregale.yaml triggers fan-out. Runs

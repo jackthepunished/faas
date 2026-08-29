@@ -450,11 +450,16 @@ func TestCmdDeploy_HappyPath_PrintsColdWakeSentence(t *testing.T) {
 
 func TestCmdDeploy_AppAlreadyExists(t *testing.T) {
 	// 409 on CreateApp should be treated as "exists", then Deploy proceeds.
+	// Issue #1182: after the 409, the CLI issues a GetApp(slug) probe to
+	// disambiguate same-account vs other-account. A 200 here signals "ours"
+	// and the deploy falls through to the DeployTarball leg.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/apps":
 			w.WriteHeader(409)
 			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: "exists", Title: "exists", Detail: "exists"})
+		case r.URL.Path == "/v1/apps/existing":
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a-existing", Slug: "existing"})
 		case r.URL.Path == "/v1/apps/existing/deployments":
 			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: "existing"})
 		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
@@ -1481,6 +1486,12 @@ func TestCmdDeploy_RequireAuthn_ExistingAppPATCH(t *testing.T) {
 			w.Header().Set("Content-Type", "application/problem+json")
 			w.WriteHeader(409)
 			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: api.CodeConflict, Title: "Conflict", Detail: "app exists"})
+		case r.URL.Path == "/v1/apps/existing-app" && r.Method == "GET":
+			// Issue #1182: hybrid slug-conflict probe — after the 409
+			// the CLI issues GetApp to disambiguate same-account vs
+			// other-account. 200 here means "ours", so the PATCH
+			// leg below runs to mirror --require-authn.
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a-existing", Slug: "existing-app"})
 		case r.URL.Path == "/v1/apps/existing-app" && r.Method == "PATCH":
 			sawPatch = true
 			if err := json.NewDecoder(r.Body).Decode(&gotPatchBody); err != nil {

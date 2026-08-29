@@ -326,7 +326,7 @@ func TestPackDirToTarGz_TopLevelDirAndCount(t *testing.T) {
 	writeFile(t, dir, "src/index.js", "console.log(1)")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestPackDirToTarGz_Excludes(t *testing.T) {
 	writeFile(t, dir, ".DS_Store", "junk")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err == nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err == nil {
 		t.Fatal("packDirToTarGz should reject a symlink, got nil error")
 	}
 }
@@ -400,7 +400,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 func TestPackDirToTarGz_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack empty: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
 	// 110 × 1 MiB of crypto-random bytes (110 MiB raw, ~110 MiB after gzip).
 	// Each file is well under the per-file cap (100 MiB), so the total-cap
 	// stat check is what trips.
-	const totalFiles = zeroConfigSourceCapMB + 10
+	const totalFiles = defaultZeroConfigSourceCapMB + 10
 	for i := 0; i < totalFiles; i++ {
 		chunk := make([]byte, oneMiB)
 		if _, err := io.ReadFull(crypto_rand.Reader, chunk); err != nil {
@@ -434,7 +434,7 @@ func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest, nil)
+	_, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
 		t.Fatal("packDirToTarGz should reject total size > cap, got nil error")
 	}
@@ -455,14 +455,14 @@ func TestPackDirToTarGz_PerFileCap(t *testing.T) {
 	// the LimitReader fix in copyRegular the test materialised exactly
 	// cap bytes; the new code allows exactly-at-cap (LimitReader(cap+1)
 	// reads at most cap+1, and `n > cap` rejects only strictly larger).
-	huge := make([]byte, (zeroConfigSourceCapMB+1)*1024*1024)
+	huge := make([]byte, (defaultZeroConfigSourceCapMB+1)*1024*1024)
 	if _, err := io.ReadFull(crypto_rand.Reader, huge); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
 	writeFileBytes(t, filepath.Join(dir, "blob.bin"), huge)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest, nil)
+	_, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
 		t.Fatal("packDirToTarGz should reject a single file > per-file cap, got nil")
 	}
@@ -483,14 +483,14 @@ func TestPackDirToTarGz_PerFileCapExactlyAtCap(t *testing.T) {
 		t.Skip("per-file cap boundary test materialises a cap-sized file")
 	}
 	dir := t.TempDir()
-	atCap := make([]byte, zeroConfigSourceCapMB*1024*1024)
+	atCap := make([]byte, defaultZeroConfigSourceCapMB*1024*1024)
 	if _, err := io.ReadFull(crypto_rand.Reader, atCap); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
 	writeFileBytes(t, filepath.Join(dir, "blob.bin"), atCap)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
 		// Random bytes don't compress, so the on-disk tarball will be
 		// near capBytes and trip the TOTAL cap check downstream even
 		// though the per-file LimitReader allowed it. That's the
@@ -526,7 +526,7 @@ func TestPackDirToTarGz_JustUnderTotalCap(t *testing.T) {
 	writeFileBytes(t, filepath.Join(dir, "well_under.bin"), chunk)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
 		t.Fatalf("packDirToTarGz well under cap, want pass; got %v", err)
 	}
 }
@@ -536,7 +536,7 @@ func TestAutoPackCwd(t *testing.T) {
 	writeFile(t, dir, "package.json", "{}")
 	writeFile(t, dir, "index.js", "x")
 
-	path, fw, n, err := autoPackCwd(dir, nil)
+	path, fw, n, err := autoPackCwd(dir, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("autoPackCwd: %v", err)
 	}
@@ -563,7 +563,7 @@ func TestAutoPackCwd_CleansUpOnError(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	path, _, _, err := autoPackCwd(dir, nil)
+	path, _, _, err := autoPackCwd(dir, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
 		t.Fatal("expected error from autoPackCwd on symlink dir")
 	}
@@ -917,7 +917,7 @@ func TestPackDirToTarGz_WithEnvOverride(t *testing.T) {
 		t.Fatalf("scanAndRedactEnvFiles: %v", err)
 	}
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, overrides); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, overrides); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 
@@ -1166,7 +1166,7 @@ func TestPackDirToTarGz_BuildArtifactDefaults(t *testing.T) {
 	writeFile(t, dir, ".cache/pip/http/abc", "cached")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 	got := tarEntries(t, dest)
@@ -1213,7 +1213,7 @@ func TestPackDirToTarGz_Gregaleignore(t *testing.T) {
 	)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 	got := tarEntries(t, dest)
