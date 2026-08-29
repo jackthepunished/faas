@@ -729,7 +729,12 @@ func isPythonFunctionSource(source string) bool {
 // nodeFunctionAdapter translates the public handler(event, ctx) contract to
 // the runner's protocol envelope. It lives in the app layer so the runner can
 // remain a deliberately tiny, protocol-only binary shared by all Node apps.
-const nodeFunctionAdapter = `import fs from "node:fs";
+const nodeFunctionAdapter = `(async () => {
+const fsModule = await import("node:fs");
+const pathModule = await import("node:path");
+const urlModule = await import("node:url");
+const fs = fsModule.default || fsModule;
+const path = pathModule.default || pathModule;
 
 const env = JSON.parse(fs.readFileSync(0, "utf8"));
 const raw = Buffer.from(env.body_b64 || "", "base64").toString("utf8");
@@ -758,7 +763,12 @@ const event = {
 // envelope consumed by faas-runner.
 console.log = console.error;
 console.info = console.error;
-const mod = await import(new URL("./handler.js", import.meta.url));
+// The adapter itself must run with both package.json type values. Resolve
+// the customer module from argv[1] instead of using import.meta (ESM-only) or
+// require (CommonJS-only), then let Node load handler.js according to the
+// customer's package format.
+const handlerFile = path.join(path.dirname(process.argv[1]), "handler.js");
+const mod = await import(urlModule.pathToFileURL(handlerFile).href);
 const fn = mod.handler || mod.default;
 if (typeof fn !== "function") throw new Error("handler.js must export handler or default");
 const value = await fn(event, ctx);
@@ -781,6 +791,10 @@ process.stdout.write(JSON.stringify({
   headers: normalizedHeaders,
   body_b64: Buffer.from(responseBody).toString("base64"),
 }));
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
 `
 
 const pythonFunctionAdapter = `import asyncio
@@ -788,6 +802,7 @@ import base64
 import importlib.util
 import inspect
 import json
+import os
 import sys
 
 env = json.load(sys.stdin)
@@ -820,16 +835,17 @@ event = {
     "query": env.get("query") or "",
     "body": body,
 }
-spec = importlib.util.spec_from_file_location("faas_handler_impl", "/app/.faas-handler.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-handler = getattr(module, "handler", None)
-if not callable(handler): raise RuntimeError("handler.py must define handler(event, ctx)")
-
-# stdout is protocol-bearing. Route ordinary customer prints to stderr.
+# stdout is protocol-bearing. Route ordinary customer prints — including
+# module-level prints during import — to stderr before loading customer code.
 real_stdout = sys.stdout
 sys.stdout = sys.stderr
 try:
+    handler_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".faas-handler.py")
+    spec = importlib.util.spec_from_file_location("faas_handler_impl", handler_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    handler = getattr(module, "handler", None)
+    if not callable(handler): raise RuntimeError("handler.py must define handler(event, ctx)")
     result = handler(event, _Context())
     if inspect.isawaitable(result): result = asyncio.run(result)
 finally:
