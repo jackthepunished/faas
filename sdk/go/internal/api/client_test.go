@@ -169,6 +169,21 @@ func TestDo_MutatingCallsCarryIdempotencyKey(t *testing.T) {
 		{"DeleteKey", func(c *Client) error { return c.DeleteKey(context.Background(), "1") }},
 		{"SetSecret", func(c *Client) error { return c.SetSecret(context.Background(), "x", "K", "v") }},
 		{"UnsetSecret", func(c *Client) error { return c.UnsetSecret(context.Background(), "x", "K") }},
+		{"CancelDeployment", func(c *Client) error {
+			_, err := c.CancelDeployment(context.Background(), "x", "1", "")
+			return err
+		}},
+		{"ReorderDeployment", func(c *Client) error {
+			_, err := c.ReorderDeployment(context.Background(), "1", 100)
+			return err
+		}},
+		{"ClearDeployment", func(c *Client) error {
+			return c.ClearDeployment(context.Background(), "1")
+		}},
+		{"ClearObsoleteDeployments", func(c *Client) error {
+			_, err := c.ClearObsoleteDeployments(context.Background(), "x", 168*time.Hour)
+			return err
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
