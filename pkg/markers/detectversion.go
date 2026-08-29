@@ -10,6 +10,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/tarball"
 )
 
 // maxVersionFileBytes caps every version-marker file we read.
@@ -151,6 +153,10 @@ func readFSFile(fsys fs.FS, name string) string {
 // pkg/builderd/detectversion.go::readTarFile verbatim — the only
 // change is the function name to disambiguate from readFSFile.
 func readTarballFile(path, entryName string) string {
+	prefix, err := tarball.RootPrefix(path)
+	if err != nil {
+		return ""
+	}
 	//nolint:forbidigo // path is the apid-spooled tarball; same trust rationale as DetectFromTarball.
 	f, err := os.Open(path)
 	if err != nil {
@@ -165,7 +171,10 @@ func readTarballFile(path, entryName string) string {
 	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
-	needle := strings.ToLower(entryName)
+	needle := strings.ToLower(strings.TrimPrefix(entryName, "./"))
+	if prefix != "" {
+		needle = strings.ToLower(prefix + "/" + strings.TrimPrefix(entryName, "./"))
+	}
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -174,13 +183,16 @@ func readTarballFile(path, entryName string) string {
 		if err != nil {
 			return ""
 		}
-		// Top-level only — nested configs (e.g. apps/web/.nvmrc)
-		// are not part of the source-marker scan. Mirrors
-		// DetectFromTarball.
-		if strings.Contains(hdr.Name, "/") {
+		// Ignore archive metadata and directories. The shared root prefix
+		// above promotes only the one transport wrapper used by GitHub
+		// codeload; ordinary nested configs remain excluded.
+		switch hdr.Typeflag {
+		case tar.TypeDir, tar.TypeXHeader, tar.TypeXGlobalHeader,
+			tar.TypeGNULongName, tar.TypeGNULongLink:
 			continue
 		}
-		if strings.ToLower(hdr.Name) != needle {
+		name := strings.ToLower(strings.TrimPrefix(hdr.Name, "./"))
+		if name != needle {
 			continue
 		}
 		// Cap read. io.LimitReader silently truncates at N; we use

@@ -414,6 +414,32 @@ func TestApplyTarball_StripsProjectRootWithPAXGlobalHeader(t *testing.T) {
 	}
 }
 
+func TestNormalizeFunctionHandler_GoServerArtifact(t *testing.T) {
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server := filepath.Join(appDir, "server")
+	if err := os.WriteFile(server, []byte("compiled-go-handler"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NormalizeFunctionHandler(staging, "/app/handler"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(appDir, "handler"))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if string(got) != "compiled-go-handler" {
+		t.Fatalf("handler = %q, want compiled artifact", got)
+	}
+	if _, err := os.Stat(server); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("server artifact should be moved, stat err = %v", err)
+	}
+}
+
 func TestNormalizeFunctionHandler_NodeAlias(t *testing.T) {
 	staging := t.TempDir()
 	source := filepath.Join(staging, "app", "handler.js")
