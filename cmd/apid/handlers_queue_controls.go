@@ -21,6 +21,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -85,9 +86,16 @@ func (s *server) handleCancelDeployment(w http.ResponseWriter, r *http.Request, 
 			reason = parsed
 		}
 	}
-	if _, _, ok := s.resolveDeploymentAccount(w, r, acct, id); !ok {
+	priorD, app, ok := s.resolveDeploymentAccount(w, r, acct, id)
+	if !ok {
 		return
 	}
+	// ADR-124 audit trail: capture priorStatus BEFORE the
+	// CancelDeploymentTx so the audit row records the pre-flip
+	// status (CancelDeploymentTx returns the post-flip row,
+	// which would always be "cancelled" and useless for the
+	// SOC 2 CC7.2 reader).
+	priorStatus := string(priorD.Status)
 	d, cancelledBuilds, err := s.store.CancelDeploymentTx(r.Context(), id, principal, reason)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
@@ -115,6 +123,11 @@ func (s *server) handleCancelDeployment(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 		s.ops.ObserveDeploymentCancelled("ok")
+		// ADR-124 audit emission: one row per successful cancel.
+		// Best-effort — `a.Emit` swallows marshal/append errors
+		// per pkg/audit/audit.go:255-258; we don't gate the
+		// HTTP response on it.
+		reconcile.EmitDeploymentCancelled(ctx, s.audit.pkgAuditor(), acct.ID, d.ID, app.Slug, priorStatus, string(reason))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":               d.ID,
 			"status":           d.Status,
@@ -135,7 +148,7 @@ func (s *server) handleCancelDeployment(w http.ResponseWriter, r *http.Request, 
 // claim path.
 func (s *server) handleReorderDeployment(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	d, _, ok := s.resolveDeploymentAccount(w, r, acct, id)
+	d, app, ok := s.resolveDeploymentAccount(w, r, acct, id)
 	if !ok {
 		return
 	}
@@ -153,6 +166,11 @@ func (s *server) handleReorderDeployment(w http.ResponseWriter, r *http.Request,
 			"body must be {\"priority\": <int in [0,1000]>}"))
 		return
 	}
+	// ADR-124 audit trail: capture the pre-update priority
+	// before ReorderDeployment runs so the audit row records
+	// the transition (e.g. 100 → 50 vs 100 → 0
+	// "deploy-immediately").
+	oldPriority := d.Priority
 	if err := s.store.ReorderDeployment(r.Context(), d.ID, *req.Priority, acct.ID); err != nil {
 		switch {
 		case errors.Is(err, state.ErrNotFound):
@@ -170,6 +188,8 @@ func (s *server) handleReorderDeployment(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	s.ops.ObserveDeploymentReorder("ok")
+	// ADR-124 audit emission: one row per successful reorder.
+	reconcile.EmitDeploymentReordered(r.Context(), s.audit.pkgAuditor(), acct.ID, d.ID, app.Slug, oldPriority, *req.Priority)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "priority": *req.Priority})
 }
 
@@ -182,7 +202,8 @@ func (s *server) handleReorderDeployment(w http.ResponseWriter, r *http.Request,
 // for that.
 func (s *server) handleClearDeployment(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	if _, _, ok := s.resolveDeploymentAccount(w, r, acct, id); !ok {
+	d, app, ok := s.resolveDeploymentAccount(w, r, acct, id)
+	if !ok {
 		return
 	}
 	if err := s.store.ClearDeployment(r.Context(), id, acct.ID); err != nil {
@@ -196,6 +217,10 @@ func (s *server) handleClearDeployment(w http.ResponseWriter, r *http.Request, a
 		}
 		return
 	}
+	// ADR-124 audit emission: one row per successful clear.
+	// Best-effort — the soft-delete already committed, the row
+	// is gone; the audit row exists independently.
+	reconcile.EmitDeploymentCleared(r.Context(), s.audit.pkgAuditor(), acct.ID, d.ID, app.Slug, string(d.Status))
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true, "deleted_at": time.Now().UTC()})
 }
 
@@ -236,5 +261,9 @@ func (s *server) handleClearObsoleteDeployments(w http.ResponseWriter, r *http.R
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "clear-obsolete failed", err.Error()))
 		return
 	}
+	// ADR-124 audit emission: one row per successful
+	// clear-obsolete (clearedCount = 0 still emits — the caller
+	// asked, the store found nothing).
+	reconcile.EmitClearObsoleteDeployments(r.Context(), s.audit.pkgAuditor(), acct.ID, app.ID, count, olderThan.String())
 	writeJSON(w, http.StatusOK, map[string]any{"app_slug": app.Slug, "count": count, "older_than": olderThan.String()})
 }
