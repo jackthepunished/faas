@@ -351,17 +351,3 @@ func TestAuditKindForBounce(t *testing.T) {
 		}
 	}
 }
-
-// auditorShim adapts the recordingAuditor to the BounceAuditor
-// interface — see pkg/meter/bounce_handler.go::BounceAuditor for
-// the rationale (a tiny interface in the consumer package lets
-// the test plug in without dragging pkg/audit's Ops wiring).
-//
-// Kept here as a no-op assertion: *recordingAuditor already
-// satisfies BounceAuditor directly, so the tests do not need a
-// wrapper. The helper is retained for tests that want to swap
-// the inner recorder between rows.
-//
-// Deprecated: tests should assign the *recordingAuditor directly
-// to h.Auditor.
-func auditorShim(r *recordingAuditor) *recordingAuditor { return r }

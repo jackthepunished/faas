@@ -949,6 +949,15 @@ func testEnvCommon(dbURL string) []string {
 		"DATABASE_URL=" + dbURL,
 		"FAAS_SKIP_SOCKET_GROUP=1",
 		"FAAS_APP_ERRORS_ENABLED=false",
+		// ADR-115 D5 / PR #1191 C2: pkg/mail/factory refuses to boot
+		// when FAAS_MAIL_TRANSPORT is unset on a non-dev box. Every
+		// e2e boot is a dev box for this purpose; without the
+		// override the daemon exits with ErrMailUnsetInProd before
+		// the listener binds. Explicit FAAS_DEV=1 is the same
+		// escape hatch the spec's CI box uses, and keeps the
+		// contract visible in the harness (rather than papering
+		// over it by setting FAAS_MAIL_TRANSPORT=log here).
+		"FAAS_DEV=1",
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 		// PR #962 CRIT-2: paddle.NewProvider rejects empty / whitespace

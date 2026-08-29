@@ -35,14 +35,14 @@ const mailDryRunDocsTopic = "mail-dry-run"
 // sprawling across commands*.go.
 func cmdMail(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, mailDryRunUsage)
+		PrintUsage(os.Stderr, mailDryRunUsage, mailDryRunDocsTopic)
 		return 1
 	}
 	switch args[0] {
 	case "dry-run":
 		return cmdMailDryRun(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "gregale mail: unknown subcommand %q\n%s\n", args[0], mailDryRunUsage)
+		PrintUsage(os.Stderr, mailDryRunUsage+"\nerror: unknown subcommand "+args[0], mailDryRunDocsTopic)
 		return 1
 	}
 }
@@ -71,17 +71,17 @@ func cmdMailDryRun(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintf(os.Stderr, "%s\nunexpected positional args: %v\n", mailDryRunUsage, fs.Args())
+		PrintUsage(os.Stderr, mailDryRunUsage+"\nunexpected positional args: "+fmt.Sprint(fs.Args()), mailDryRunDocsTopic)
 		return 1
 	}
 
 	renders, err := mail.RenderAllTemplates(*unsub, time.Now())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gregale mail dry-run: %v\n", err)
+		PrintUsage(os.Stderr, mailDryRunUsage+"\nerror: "+err.Error(), mailDryRunDocsTopic)
 		return 1
 	}
 	if err := writeMailDryRun(os.Stdout, renders); err != nil {
-		fmt.Fprintf(os.Stderr, "gregale mail dry-run: write stdout: %v\n", err)
+		PrintUsage(os.Stderr, mailDryRunUsage+"\nerror: write stdout: "+err.Error(), mailDryRunDocsTopic)
 		return 1
 	}
 	return 0
