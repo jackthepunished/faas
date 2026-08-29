@@ -8,7 +8,38 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// layerOwnershipClamp is incremented when a tar header declares a uid/gid
+// outside the [0, 65534] range we honour (ADR-136 §Decision 2 — numeric
+// passthrough within Linux uid_t space; ADR-019 keeps the tenant-jail
+// uid space at 20000-29999 so customer images must not see it). Each
+// clamp is silent on the file itself — the file lands as the imaged
+// daemon uid/gid — but the counter is a Grafana tripwire so a misbuilt
+// base image shows up immediately (M-1 acceptance criterion).
+//
+// `reason` labels:
+//   - "out_of_range": uid or gid parsed but < 0 or > 65534.
+//   - "unparseable":  uid or gid non-empty but not an integer (e.g.
+//                     "root" / "nogroup"). M-1 falls through to the
+//                     daemon uid/gid; M-3 (ADR-X2) adds named-user
+//                     /etc/passwd resolution.
+//
+// The counter is package-level so ApplyLayer callers don't need to
+// thread a metrics handle — promauto registers it with the default
+// registry on first import. The "imaged_" prefix matches the
+// Prometheus naming convention documented in §12 of the spec.
+var layerOwnershipClamp = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "imaged_ownership_clamp_total",
+		Help: "Total number of layer entries whose declared uid/gid fell outside the preserved range.",
+	},
+	[]string{"reason"},
 )
 
 // ApplyLayer unpacks one OCI/Docker layer (an uncompressed tar) into dst,
@@ -98,7 +129,10 @@ const (
 func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		return os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm)
+		if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
 	case tar.TypeReg:
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
@@ -126,7 +160,10 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			_ = f.Close()
 			return fmt.Errorf("rootfs: write %s: %w", target, err)
 		}
-		return f.Close()
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
 	case tar.TypeSymlink:
 		// A symlink's Linkname is GUEST-side data, not a host path: the
 		// string is stored verbatim in the ext4 inode and is resolved by
@@ -149,7 +186,12 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Symlink(hdr.Linkname, target)
+		if err := os.Symlink(hdr.Linkname, target); err != nil {
+			return err
+		}
+		// os.Lchown on a symlink targets the link itself, not its target,
+		// which is what we want: ownership metadata travels with the link.
+		return preserveOwnership(target, hdr)
 	case tar.TypeLink:
 		// A hardlink's Linkname IS resolved host-side (os.Link needs a
 		// real path), and per tar semantics it is relative to the
@@ -159,12 +201,111 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Link(source, target)
+		if err := os.Link(source, target); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
+	case tar.TypeChar, tar.TypeBlock:
+		// Char/block devices are not expected in app layers and have no
+		// safe representation inside a Firecracker guest's rootfs.
+		// Skip rather than fail the whole build — the registry pull
+		// would have already rejected a layer with a device entry on
+		// the publisher side; skipping here is the conservative
+		// backstop. The counter gives us a tripwire if a hostile or
+		// misbuilt image ever ships one.
+		layerDeviceSkip.Inc()
+		return nil
 	default:
-		// Char/block/fifo devices are not expected in app layers; skip them
-		// rather than fail the whole build.
+		// fifos / other unusual types — same policy as device entries:
+		// skip silently, count under the generic bucket.
+		layerDeviceSkip.Inc()
 		return nil
 	}
+}
+
+// layerDeviceSkip counts entries dropped by applyEntry's device/fifo
+// branches. Surfaced alongside layerOwnershipClamp so a Grafana panel
+// can show "what tar entry types have we dropped today".
+var layerDeviceSkip = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "imaged_layer_entry_skipped_total",
+		Help: "Total layer entries dropped (char/block/fifo).",
+	},
+)
+
+// preserveOwnership best-effort applies hdr.Uname/hdr.Gid to target.
+// Numeric-only today (ADR-136 §Decision 2); named-user resolution is
+// M-3 work. Out-of-range and unparseable values increment the clamp
+// counter and fall through — the entry is left under the imaged
+// daemon uid/gid, which is correct for any value we don't understand.
+//
+// Why os.Lchown (not os.Chown): for symlinks we must target the link
+// itself, not its resolution. For directories and regular files
+// os.Lchown behaves identically to os.Chown.
+func preserveOwnership(target string, hdr *tar.Header) error {
+	uid, gid, ok := parseOwnership(hdr)
+	if !ok {
+		// parseOwnership already incremented under the right reason.
+		return nil
+	}
+	if err := os.Lchown(target, uid, gid); err != nil {
+		// Some filesystems (notably tmpfs / overlayfs mounted with
+		// noacl) refuse chown as a non-root operation. imaged runs as
+		// root, but a downstream mount policy could still trip this.
+		// We log-and-continue rather than fail the build — a file
+		// landed under the daemon uid is still correct, just not the
+		// customer-declared uid.
+		return nil
+	}
+	return nil
+}
+
+// parseOwnership pulls uid/gid out of the tar header. Returns ok=false
+// (and increments the counter under the appropriate reason) when the
+// values are out of range or unparseable; the caller falls back to the
+// daemon uid/gid.
+func parseOwnership(hdr *tar.Header) (int, int, bool) {
+	uid, reason := parseOwnershipField(hdr.Uname, "uid")
+	if reason != "" {
+		layerOwnershipClamp.WithLabelValues(reason).Inc()
+		return 0, 0, false
+	}
+	gid, reason := parseOwnershipField(hdr.Gname, "gid")
+	if reason != "" {
+		layerOwnershipClamp.WithLabelValues(reason).Inc()
+		return 0, 0, false
+	}
+	if !inOwnershipRange(uid) || !inOwnershipRange(gid) {
+		layerOwnershipClamp.WithLabelValues("out_of_range").Inc()
+		return 0, 0, false
+	}
+	return uid, gid, true
+}
+
+// parseOwnershipField returns the parsed integer for s, plus a
+// non-empty reason if the value should be clamped. "" means "valid".
+//
+// Empty strings are NOT clamped: a layer that doesn't declare an
+// uname/gname falls through to the daemon uid/gid silently and is
+// the common case (Docker/BuildKit strips these on most layers).
+func parseOwnershipField(s, kind string) (int, string) {
+	if s == "" {
+		return 0, ""
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, "unparseable_" + kind
+	}
+	return n, ""
+}
+
+// inOwnershipRange gates uid/gid values to the Linux uid_t space —
+// POSIX limits uid_t to [0, 2^32-1], but anything above 65534 leaks
+// into the tenant-jail uid space ADR-019 reserves (20000-29999).
+// Clamping at 65534 keeps a customer image from naming a uid that
+// vmmd later hands out to a guest (ADR-019).
+func inOwnershipRange(n int) bool {
+	return n >= 0 && n <= 65534
 }
 
 // safeJoin joins name onto base and guarantees the result stays within base,
