@@ -167,6 +167,13 @@ var routeExclude = map[string]bool{
 	// POST /v1/apps/{slug}/alert-presets/{name}/enable which the
 	// SDK exposes as EnableAlertPreset.
 	"POST /dashboard/apps/{slug}/alert-presets/{name}/enable": true,
+
+	// ADR-127 PR-D: OTLP sidecar protocol — not a REST endpoint
+	// consumed by the generated SDK. OTel SDKs speak OTLP/HTTP
+	// directly; the SDK would never mint IngestOtlpSpans as a
+	// typed wrapper. Mirror in cmd/apid/spec_compliance_test.go::
+	// routeExclude; the two lists must move together.
+	"POST /v1/otel/v1/traces": true,
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire

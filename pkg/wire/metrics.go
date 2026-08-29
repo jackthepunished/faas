@@ -742,6 +742,14 @@ type OpsMetrics struct {
 	// increments. Backs the "regression cron not running"
 	// operator view.
 	debugRegressionSkippedFlagDisabled prometheus.Counter
+	// debugRegressionDetected (ADR-127 Debugger UX v1): counter
+	// of fresh debug_regression_observations rows persisted by
+	// the regression cron (cmd/apid/debug_regression_cron.go).
+	// Increments once per (deployment, route) PRIMARY KEY upsert
+	// that lands a NEW row; existing-row refreshes are silent
+	// (PRIMARY KEY clash — same key only updates affected/p95).
+	// Backs the FaasDebugRegressionDetected page-tier alert.
+	debugRegressionDetected prometheus.Counter
 	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
 	// events table by kind prefix (auth.*, key.*, secret.*,
 	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
@@ -2989,6 +2997,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Regression cron passes skipped because the operator flipped FAAS_DEBUG_TELEMETRY_ENABLED=false OR DebugTelemetryEnabled was off for every enumerated account (cmd/apid/debug_regression_cron.go, ADR-127 PR-B). Unlabelled — single-registry pattern, only apid increments.",
 	})
 	commonCollectors = append(commonCollectors, debugRegressionSkippedFlagDisabled)
+	// ADR-127 Debugger UX v1: regression upsert counter.
+	// Single-registry, unlabelled — only apid increments via
+	// DebugRegressionDetected. Bumped on every successful
+	// UpsertRegressionObservation (PRIMARY KEY (app_id,
+	// deployment_id, route) upsert). A new regression that
+	// crossed debugRegressionMinAffected for the first time
+	// fires the counter once; a regression that persists across
+	// cron passes re-fires every 5m. PagerDuty dedupes a
+	// sustained-fire alert into one ongoing incident. Backs
+	// FaasDebugRegressionDetected.
+	debugRegressionDetected := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_debug_regression_detected_total",
+		Help: "debug_regression_observations PRIMARY KEY upserts persisted by the regression cron (cmd/apid/debug_regression_cron.go, ADR-127 Debugger UX v1). Each successful UpsertRegressionObservation increments the counter; an existing regression that persists across cron passes re-fires every 5m. Backs FaasDebugRegressionDetected.",
+	})
+	commonCollectors = append(commonCollectors, debugRegressionDetected)
 	// ADR-096: in-process LRU fingerprint cache hit counter.
 	// Unlabelled (no cardinality risk). Single-registry:
 	// registered on every daemon; only gatewayd-internal
@@ -3771,6 +3794,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsPurges:                      appErrorsPurges,
 		debugRegressionOldestPassSeconds:     debugRegressionOldestPassSeconds,
 		debugRegressionSkippedFlagDisabled:   debugRegressionSkippedFlagDisabled,
+		debugRegressionDetected:              debugRegressionDetected,
 		previewJanitorOutcomes:               previewJanitorOutcomes,
 		dataUpstreamRTT:                      dataUpstreamRTT,
 		dataUpstreamProbes:                   dataUpstreamProbes,
@@ -4946,6 +4970,21 @@ func (m *OpsMetrics) DebugRegressionSkippedFlagDisabled() prometheus.Counter {
 		return nil
 	}
 	return m.debugRegressionSkippedFlagDisabled
+}
+
+// DebugRegressionDetected (ADR-127 Debugger UX v1) returns the
+// apid_debug_regression_detected_total counter so the regression
+// cron (cmd/apid/debug_regression_cron.go) can bump it after
+// every successful UpsertRegressionObservation. A new
+// regression fires once; an existing regression that persists
+// across cron passes re-fires every 5m. Backs the
+// FaasDebugRegressionDetected page-tier alert. Nil-safe
+// (returns nil when m is nil — the cron also nil-checks s.ops).
+func (m *OpsMetrics) DebugRegressionDetected() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.debugRegressionDetected
 }
 
 // AuditEventsVolumeTotal returns the per-kind-prefix counter for

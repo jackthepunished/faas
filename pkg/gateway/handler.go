@@ -5535,7 +5535,19 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 		// The class label is the 3-digit status bucketed to 2xx/3xx/4xx/5xx
 		// to keep cardinality bounded — full status codes would explode
 		// per-app series count past 60× the class-based set.
-		h.metrics.ObserveRequestDuration(appID, statusClassBucket(status), elapsed)
+		// Per-app full request duration histogram with the bounded
+		// deployment label (issue #273 / ADR-042 + ADR-127 §Decision
+		// 4 / Debugger UX v1). The deployment id is admitted via
+		// deploymentLabelSet, capped per-app at the customer's plan
+		// cap (Free=0, Hobby=10, Pro=50, Scale=200 — see
+		// pkg/api/limits.go:DebugTelemetryDeploymentsPerApp). Empty
+		// deployment (legacy single-targetSet) routes to the ""
+		// reserved sentinel without consuming capacity. Over-cap
+		// collapses to "__other__". Replaces the prior
+		// ObserveRequestDuration call; that helper is retained for
+		// test paths that don't carry a deployment id.
+		deploymentLabel := h.metrics.deploymentLabels.admit(appID, api.Plan(plan), target.DeploymentID)
+		h.metrics.ObserveRequestDurationByDeployment(appID, statusClassBucket(status), deploymentLabel, elapsed)
 		// ADR-093: per-route emission. Gated on a non-empty
 		// routeLabel (the routeLabelSet always returns a non-empty
 		// label for an opted-in app — the empty string is the

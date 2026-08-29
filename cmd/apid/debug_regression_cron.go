@@ -321,6 +321,17 @@ func (s *server) runRegressionForApp(ctx context.Context, log *slog.Logger, appI
 				"deployment", cur.DeploymentID.String(),
 				"route", curRow.Route,
 				"err", err)
+			continue
+		}
+		// ADR-127 Debugger UX v1: regression persisted to
+		// debug_regression_observations — bump
+		// apid_debug_regression_detected_total so the
+		// FaasDebugRegressionDetected page-tier alert can fire.
+		// A persistent regression re-fires every 5m (the cron
+		// upserts the same PRIMARY KEY); PagerDuty dedupes the
+		// sustained-fire alert into one ongoing incident.
+		if c := s.ops.DebugRegressionDetected(); c != nil {
+			c.Inc()
 		}
 	}
 	return nil

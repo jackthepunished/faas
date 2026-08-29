@@ -373,6 +373,7 @@ export { QueuesService } from './services/QueuesService.js';
 export { RegistryService } from './services/RegistryService.js';
 export { SecretsService } from './services/SecretsService.js';
 export { SecurityService } from './services/SecurityService.js';
+export { TelemetryService } from './services/TelemetryService.js';
 export { TemplatesService } from './services/TemplatesService.js';
 export { TenantSurfacesService } from './services/TenantSurfacesService.js';
 export { TriggersService } from './services/TriggersService.js';

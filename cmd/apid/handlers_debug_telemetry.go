@@ -302,12 +302,11 @@ func (s *server) debugCompareHandler(w http.ResponseWriter, r *http.Request, acc
 	srcID := stringToPgUUID(req.Source)
 	mirID := stringToPgUUID(req.Mirror)
 
-	// Fetch both distributions. The PR-B endpoint returns
-	// p50/p95/p99 per route. The sqlc query only exposes p95
-	// (PR-A's shape); for PR-B minimum we expose p95 only and
-	// fall back to computing p50/p99 client-side via a
-	// per-route walk if the row count is small enough. PR-C
-	// refactors this to a single percentile_cont(*) call.
+	// Fetch both distributions. Both calls share one index scan
+	// over request_telemetry_app_dep_received_idx — four
+	// aggregates (p50/p95/p99/COUNT) in a single pass (Debugger
+	// UX v1 stage 3 sqlc rewrite; PR-B minimum was p95-only and
+	// walked client-side for the others).
 	srcStats, err := s.fetchRouteStats(r.Context(), app.ID, srcID, from, until, req.Route)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("compare source"))
@@ -319,14 +318,23 @@ func (s *server) debugCompareHandler(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	// Merge: union of routes; missing entries render zero stats.
+	// A missing side means zero rows in the window — DO NOT
+	// synthesize percentiles from the other side. Test (b) in
+	// handlers_debug_telemetry_compare_test.go asserts the
+	// N=0/percentiles=0 contract.
 	routes := make(map[string]api.DebugCompareRouteStats, len(srcStats)+len(mirStats))
 	for route, s := range srcStats {
-		routes[route] = api.DebugCompareRouteStats{Route: route, SourceP95: s.P95, SourceN: s.N}
+		routes[route] = api.DebugCompareRouteStats{
+			Route:     route,
+			SourceP50: s.P50, SourceP95: s.P95, SourceP99: s.P99, SourceN: s.N,
+		}
 	}
 	for route, m := range mirStats {
 		existing := routes[route]
 		existing.Route = route
+		existing.MirrorP50 = m.P50
 		existing.MirrorP95 = m.P95
+		existing.MirrorP99 = m.P99
 		existing.MirrorN = m.N
 		routes[route] = existing
 	}
@@ -344,21 +352,30 @@ func (s *server) debugCompareHandler(w http.ResponseWriter, r *http.Request, acc
 }
 
 // routeStats is the per-route aggregate used by the compare
-// endpoint. PR-A's RequestTelemetryBaselineP95ByRoute returns
-// p95 only; we expose N (row count) so the dashboard can render
-// "X requests" alongside the latency numbers.
+// endpoint. Debugger UX v1 stage 3 extended
+// RequestTelemetryBaselineP95ByRoute to return p50/p95/p99/N
+// from a single index scan; this struct mirrors that shape so
+// the dashboard can render the full latency distribution
+// alongside the request count.
 type routeStats struct {
+	P50 int
 	P95 int
+	P99 int
 	N   int64
 }
 
-// fetchRouteStats reads the per-route p95 + row count for a
-// single deployment in the window. PR-B's shape mirrors the
+// fetchRouteStats reads the per-route p50/p95/p99 + row count
+// for a single deployment in the window. The shape mirrors the
 // regression cron (cmd/apid/debug_regression_cron.go) — same
-// percentile_cont aggregate, same window split.
+// percentile_cont aggregate, same window split, single index
+// scan over request_telemetry_app_dep_received_idx (PR-A
+// migration 00427).
 //
 // Returns an empty map (not nil) when no rows match so the
-// caller doesn't have to nil-check.
+// caller doesn't have to nil-check. A deployment that had zero
+// traffic in the window maps to absent entries (not zero-valued
+// entries) — the caller synthesizes the zero-valued DTO so the
+// merge loop stays symmetric.
 func (s *server) fetchRouteStats(ctx context.Context, appID string, deploymentID pgtype.UUID, from, until time.Time, route string) (map[string]routeStats, error) {
 	rows, err := s.store.RequestTelemetryBaselineP95ByRoute(ctx, sqlc.RequestTelemetryBaselineP95ByRouteParams{
 		AppID:        stringToPgUUID(appID),
@@ -374,13 +391,13 @@ func (s *server) fetchRouteStats(ctx context.Context, appID string, deploymentID
 		if route != "" && row.Route != route {
 			continue
 		}
-		out[row.Route] = routeStats{P95: int(row.P95Ms), N: 0}
+		out[row.Route] = routeStats{
+			P50: int(row.P50Ms),
+			P95: int(row.P95Ms),
+			P99: int(row.P99Ms),
+			N:   row.N,
+		}
 	}
-	// PR-B doesn't pull the row count per route from
-	// percentile_cont alone; we'd need a second aggregate.
-	// For PR-B minimum, the dashboard renders the row count as
-	// "X rows" via ListDeploymentsForCompare's row_count field;
-	// the per-route count is a PR-C enrichment.
 	return out, nil
 }
 
