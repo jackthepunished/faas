@@ -1349,6 +1349,34 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggers))))
 	mux.HandleFunc("POST /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createTrigger)))))
 	mux.HandleFunc("GET /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTrigger))))
+
+	// Jobs (issue #1184 Workstream A / ADR-099). Same
+	// authLimited + requireMFA + requireScope shape as the
+	// cron family. POST routes (createJob + createJobRun) are
+	// idempotent-wrapped so retries are safe; PATCH/DELETE
+	// are NOT — they're tuned for human action, not at-least-
+	// once delivery. Cancel is also NOT idempotent-wrapped: a
+	// second cancel after the first is a 200 (the run is
+	// already cancelled) but a duplicate Idempotency-Key
+	// would skip the second run-cancel audit emit.
+	//
+	// Plan-tier gate (Free → 402 CodeJobsNotAllowed) lives in
+	// createJob / updateJob / deleteJob / createJobRun /
+	// cancelJobRun — see handlers_jobs.go::buildJob. The
+	// read endpoints (listJobs / getJob / listJobRuns /
+	// getJobRun / listJobRunTasks / getJobTaskLogs) return
+	// empty lists on Free (read gate is not in the plan).
+	mux.HandleFunc("GET /v1/jobs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listJobs))))
+	mux.HandleFunc("POST /v1/jobs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createJob)))))
+	mux.HandleFunc("GET /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getJob))))
+	mux.HandleFunc("PATCH /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateJob))))
+	mux.HandleFunc("DELETE /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteJob))))
+	mux.HandleFunc("POST /v1/jobs/{name}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createJobRun)))))
+	mux.HandleFunc("GET /v1/jobs/{name}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listJobRuns))))
+	mux.HandleFunc("GET /v1/jobs/{name}/runs/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getJobRun))))
+	mux.HandleFunc("POST /v1/jobs/{name}/runs/{id}/cancel", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.cancelJobRun))))
+	mux.HandleFunc("GET /v1/jobs/{name}/runs/{id}/tasks", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listJobRunTasks))))
+	mux.HandleFunc("GET /v1/jobs/{name}/runs/{id}/tasks/{idx}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getJobTaskLogs))))
 	mux.HandleFunc("PATCH /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateTrigger))))
 	mux.HandleFunc("DELETE /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteTrigger))))
 	mux.HandleFunc("POST /v1/triggers/{id}/pause", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.pauseTrigger))))

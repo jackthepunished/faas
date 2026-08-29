@@ -339,11 +339,16 @@ func (s *server) listJobRuns(w http.ResponseWriter, r *http.Request, acct state.
 	if len(out) == limit {
 		nextOffset = offset + len(out)
 	}
+	total := offset + len(out)
+	if len(out) < limit {
+		total = offset + len(out)
+	}
 	writeJSON(w, http.StatusOK, api.ListJobRunsResponse{
 		Runs:       out,
 		Limit:      limit,
 		Offset:     offset,
 		NextOffset: nextOffset,
+		Total:      total,
 	})
 }
 
@@ -394,11 +399,16 @@ func (s *server) listJobRunTasks(w http.ResponseWriter, r *http.Request, acct st
 	if len(out) == limit {
 		nextOffset = offset + len(out)
 	}
+	total := offset + len(out)
+	if len(out) < limit {
+		total = offset + len(out)
+	}
 	writeJSON(w, http.StatusOK, api.ListJobTasksResponse{
 		Tasks:      out,
 		Limit:      limit,
 		Offset:     offset,
 		NextOffset: nextOffset,
+		Total:      total,
 	})
 }
 
