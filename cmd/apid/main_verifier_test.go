@@ -65,6 +65,7 @@ func preLoadedConfigForVerifierTest(t *testing.T) *Config {
 func TestRunWithDeps_PassesNodeVerifierToDialSites(t *testing.T) {
 	withTestHMACFiles(t)
 	withBillingKeysForTest(t)
+	withTestMailTransport(t)
 
 	stub := &captureTestVerifier{}
 
@@ -141,6 +142,7 @@ func TestRunWithDeps_PassesNodeVerifierToDialSites(t *testing.T) {
 func TestRunWithDeps_NilPreLoadedNodeVerifier_NoHookInstalled(t *testing.T) {
 	withTestHMACFiles(t)
 	withBillingKeysForTest(t)
+	withTestMailTransport(t)
 
 	var (
 		mu       sync.Mutex

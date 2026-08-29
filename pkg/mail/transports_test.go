@@ -150,17 +150,62 @@ func TestPostmarkSender_MissingToken(t *testing.T) {
 	}
 }
 
-// TestSenderFromEnv_PicksLog confirms the default (no FAAS_MAIL_TRANSPORT)
-// returns a LogSender that emits one record per Send.
-func TestSenderFromEnv_PicksLog(t *testing.T) {
+// TestSenderFromEnv_UnsetOnProdFailsClosed pins issue #246's headline
+// contract: an unset FAAS_MAIL_TRANSPORT on a production box refuses to
+// boot so the operator cannot accidentally run a daemon that silently
+// drops email into slog. The pre-#246 behaviour was a quiet LogSender
+// fallback that hid a 4-step dunning ladder inside the journal.
+func TestSenderFromEnv_UnsetOnProdFailsClosed(t *testing.T) {
 	getenv := func(string) string { return "" }
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := mail.SenderFromEnv(getenv, log)
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, mail.ErrMailUnsetInProd) {
+		t.Fatalf("err = %v, want errors.Is(err, mail.ErrMailUnsetInProd)", err)
+	}
+	if s != nil {
+		t.Errorf("sender = %T, want nil on fail-closed", s)
+	}
+}
+
+// TestSenderFromEnv_UnsetOnDevResolvesToLog pins the dev-box escape:
+// FAAS_DEV=1 keeps the developer-friendly behaviour where an unset
+// transport resolves to LogSender without ceremony. This row is what
+// `make test` exercises on a developer's laptop.
+func TestSenderFromEnv_UnsetOnDevResolvesToLog(t *testing.T) {
+	getenv := func(k string) string {
+		if k == "FAAS_DEV" {
+			return "1"
+		}
+		return ""
+	}
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("SenderFromEnv: %v", err)
 	}
 	if _, ok := s.(*mail.LogSender); !ok {
-		t.Errorf("default transport = %T, want *mail.LogSender", s)
+		t.Errorf("unset on dev = %T, want *mail.LogSender", s)
+	}
+}
+
+// TestSenderFromEnv_UnsetOnProdWithFAAS_DEVZeroStillFailsClosed is the
+// regression row for the strict-default rule: only an explicitly
+// truthy FAAS_DEV value marks a box as dev. "0", empty, "false" or
+// any unrecognised value all collapse to "production" because the
+// safe default for an ambiguous value is the strict one.
+func TestSenderFromEnv_UnsetOnProdWithFAAS_DEVZeroStillFailsClosed(t *testing.T) {
+	for _, literal := range []string{"0", "", "false", "no", "off", "maybe"} {
+		literal := literal
+		t.Run("FAAS_DEV="+literal, func(t *testing.T) {
+			getenv := func(k string) string {
+				if k == "FAAS_DEV" {
+					return literal
+				}
+				return ""
+			}
+			_, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if !errors.Is(err, mail.ErrMailUnsetInProd) {
+				t.Errorf("FAAS_DEV=%q: err = %v, want errors.Is(err, mail.ErrMailUnsetInProd)", literal, err)
+			}
+		})
 	}
 }
 
@@ -257,15 +302,39 @@ func TestSenderFromEnv_PostmarkFailsClosedOnMissingToken(t *testing.T) {
 	}
 }
 
-// TestSenderFromEnv_UnknownTransportFallsBack confirms an
-// unrecognised transport name falls back to log + warning. The
-// fail-soft behaviour is preserved here (and only here) because an
-// unknown transport is operator-typo territory, not production
-// misconfig.
-func TestSenderFromEnv_UnknownTransportFallsBack(t *testing.T) {
+// TestSenderFromEnv_UnknownTransportOnProdFailsClosed pins issue
+// #246's other headline contract: a typo in FAAS_MAIL_TRANSPORT
+// ("resned") used to fall back to LogSender with WARN, which is the
+// same silent drop as the unset case with none of the visibility.
+// It now refuses to boot, mirroring the unset case.
+func TestSenderFromEnv_UnknownTransportOnProdFailsClosed(t *testing.T) {
 	getenv := func(k string) string {
 		if k == "FAAS_MAIL_TRANSPORT" {
 			return "carrier-pigeon"
+		}
+		return ""
+	}
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, mail.ErrMailUnknownTransport) {
+		t.Fatalf("err = %v, want errors.Is(err, mail.ErrMailUnknownTransport)", err)
+	}
+	if s != nil {
+		t.Errorf("sender = %T, want nil on fail-closed", s)
+	}
+}
+
+// TestSenderFromEnv_UnknownTransportOnDevWarnsAndFallsBack is the
+// dev-box escape for the unknown-transport branch: a developer
+// iterating on a brand-new transport name still boots, with a WARN
+// so the typo is visible in the journal. The strict row above pins
+// the on-prod contract.
+func TestSenderFromEnv_UnknownTransportOnDevWarnsAndFallsBack(t *testing.T) {
+	getenv := func(k string) string {
+		switch k {
+		case "FAAS_MAIL_TRANSPORT":
+			return "carrier-pigeon"
+		case "FAAS_DEV":
+			return "1"
 		}
 		return ""
 	}
@@ -274,7 +343,7 @@ func TestSenderFromEnv_UnknownTransportFallsBack(t *testing.T) {
 		t.Fatalf("SenderFromEnv: %v", err)
 	}
 	if _, ok := s.(*mail.LogSender); !ok {
-		t.Errorf("unknown transport = %T, want *mail.LogSender (fallback)", s)
+		t.Errorf("unknown on dev = %T, want *mail.LogSender", s)
 	}
 }
 

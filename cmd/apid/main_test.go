@@ -179,9 +179,26 @@ func withBillingKeysForTest(t *testing.T) {
 	t.Setenv("FAAS_PADDLE_API_KEY", "pdl_test_load_runwithdeps")
 }
 
+// withTestMailTransport collapses FAAS_MAIL_TRANSPORT to "log" so
+// the runWithDeps boot path passes the new issue #246 fail-closed
+// contract (cmd/apid/main.go:977) without exercising the mail
+// factory itself. The dedicated factory contract is pinned by
+// TestMailFactory_PicksCorrectTransport in mail_wiring_test.go;
+// runWithDeps lifecycle tests (listen error, verifier wiring,
+// cancel signal) only care that the boot reaches their real
+// assertion surface, and an unset transport would now abort before
+// that surface is reached. The dedicated fail-closed rows in
+// TestMailFactory_PicksCorrectTransport cover the abort path.
+func withTestMailTransport(t *testing.T) {
+	t.Helper()
+	t.Setenv("FAAS_MAIL_TRANSPORT", "log")
+	t.Setenv("FAAS_MAIL_FROM", "test@gregale.test")
+}
+
 func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
 	withTestHMACFiles(t)
 	withBillingKeysForTest(t)
+	withTestMailTransport(t)
 	deps := defaultDeps()
 	deps.listen = func(_, _ string) (net.Listener, error) {
 		return nil, errors.New("addr in use")
@@ -198,6 +215,7 @@ func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
 func TestRunWithDeps_ServesUntilCancel(t *testing.T) {
 	withTestHMACFiles(t)
 	withBillingKeysForTest(t)
+	withTestMailTransport(t)
 	deps := defaultDeps()
 	// Let runWithDeps own the listener (more realistic).
 	var capturedAddr atomic.Value

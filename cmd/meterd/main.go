@@ -755,12 +755,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// fail-closed (ADR-115 §D5); the wrapped ErrMailerMisconfigured
 	// propagates here so the daemon refuses to boot instead of
 	// silently dropping email into slog.
+	//
+	// Issue #246 extends that contract from "credential missing" to
+	// "transport unselected": on a non-dev box, an unset or unknown
+	// FAAS_MAIL_TRANSPORT also fails closed via ErrMailUnsetInProd
+	// / ErrMailUnknownTransport. Operators who really do want mail
+	// in the journal can set FAAS_MAIL_TRANSPORT=log; developers
+	// iterating locally can set FAAS_DEV=1 to fall back to log when
+	// the transport is unset. Both escapes are documented in the
+	// boot hint below so the message names every escape hatch.
 	mailer := deps.mailer
 	if mailer == nil {
 		var err error
 		mailer, err = mail.SenderFromEnv(deps.getenv, log)
 		if err != nil {
-			return fmt.Errorf("meterd: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+			return fmt.Errorf("meterd: %w\n"+
+				"  fix one of:\n"+
+				"    - set FAAS_MAIL_TRANSPORT=resend (or postmark) plus FAAS_MAIL_FROM and the provider key in /etc/faas/sealed.env\n"+
+				"    - set FAAS_MAIL_TRANSPORT=log to keep mail in the journal\n"+
+				"    - set FAAS_DEV=1 on a dev/CI box where unset transport should resolve to log", err)
 		}
 	}
 
