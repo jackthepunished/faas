@@ -30,6 +30,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// paid-only), so MaxQueueAttempts is moot — 0 matches the
 			// "feature not offered" contract.
 			MaxQueueAttempts: 0,
+			// ADR-134 PR-B: Free's per-account cap ladder.
+			MaxAsyncInvocationsPerAccount:     100,
+			MaxAsyncInvocationDeadlineSeconds: 300,
+			MaxAsyncResultRetentionSeconds:    86400,
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
 			CronLimitPerApp: 0, CronLimitPerAccount: 0,
@@ -168,6 +172,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// poisoned row exits within ~15s at the default 5s backoff
 			// without thrashing the worker for long.
 			MaxQueueAttempts: 3,
+			// ADR-134 PR-B: Hobby 1k / 1h / 7d.
+			MaxAsyncInvocationsPerAccount:     1000,
+			MaxAsyncInvocationDeadlineSeconds: 3600,
+			MaxAsyncResultRetentionSeconds:    604800,
 			// Issue #462 / ADR-058 / PR-A: Hobby unlocks the warm
 			// floor (MinInstancesAllowed) and the max_instances
 			// ceiling (MaxInstancesAllowed). Hobby is still
@@ -319,6 +327,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Tolerates a transient downstream flap while still bounding
 			// the "permanently bad payload" worker cost.
 			MaxQueueAttempts:       10,
+			// ADR-134 PR-B: Pro 10k / 6h / 30d.
+			MaxAsyncInvocationsPerAccount:     10000,
+			MaxAsyncInvocationDeadlineSeconds: 21600,
+			MaxAsyncResultRetentionSeconds:    2592000,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
 			// Issue #477 / ADR-118: Pro unlocks the per-app ingress
 			// IP allowlist. Same 16-entry cap as the egress
@@ -467,6 +479,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// capped so a genuinely-bad payload still terminates within
 			// the worker's hourly budget window.
 			MaxQueueAttempts:       25,
+			// ADR-134 PR-B: Scale 100k / 24h / 90d.
+			MaxAsyncInvocationsPerAccount:     100000,
+			MaxAsyncInvocationDeadlineSeconds: 86400,
+			MaxAsyncResultRetentionSeconds:    7776000,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
 			// ADR-119: Scale unlocks static egress IP (per-app quota=1).
 			StaticEgressIPAllowed: true, StaticEgressIPsPerApp: 1,

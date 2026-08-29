@@ -2640,8 +2640,8 @@ func (inv Invocation) Deadline() dispatch.DeadlinePolicy {
 		return dispatch.DeadlinePolicy{}
 	}
 	return dispatch.DeadlinePolicy{
-		DeadlineAt:           sql.NullTime{Time: *inv.DeadlineAt, Valid: true},
-		StartToCloseTimeout:  0,
+		DeadlineAt:          sql.NullTime{Time: *inv.DeadlineAt, Valid: true},
+		StartToCloseTimeout: 0,
 	}
 }
 

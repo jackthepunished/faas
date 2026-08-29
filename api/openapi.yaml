@@ -18319,6 +18319,19 @@ components:
       properties:
         payload: { type: object, additionalProperties: true }
 
+    RetryPolicyDTO:
+      description: |
+        ADR-134 PR-B. Wire shape for dispatch.RetryPolicy. The handler
+        decodes this DTO into a dispatch.RetryPolicy before persisting
+        to invocations.retry_policy JSONB. Lives in pkg/api so the SDK
+        can type the override without importing pkg/dispatch directly.
+      type: object
+      properties:
+        max_attempts:    { type: integer }
+        base_seconds:    { type: number }
+        max_seconds:     { type: number }
+        jitter_seconds:  { type: number, description: "Fraction (0..1). 0.2 means ±20%." }
+
     DelayedTaskRequest:
       description: "Body for POST /v1/apps/{slug}/delayed-tasks. scheduled_at must be in the future (UTC)."
       type: object

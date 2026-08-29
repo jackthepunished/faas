@@ -69,29 +69,29 @@ type Loop struct {
 	// NotifyTriggerChanged payload (commit #16). The Loop's run
 	// selects on it alongside the 1s ticker so an idle broker
 	// doesn't sit for a full 1s tick before the first batch.
-	triggerWakeup      chan struct{}
-	triggerWakeupOnce  sync.Once
-	now                func() time.Time
-	flowCounts         FlowCounter
-	ops                *wire.OpsMetrics       // issue #171 shared registry; nil safe
-	audit              *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
-	watchdog           *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention          *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
-	invocationsRetention *InvocationsRetention // ADR-134 PR-B: invocations retention + deadline-breach sweep; nil opts out
-	triggersRetention    *TriggersRetention    // ADR-134 PR-E: trigger_records retention sweep; nil opts out
-	heartbeat          *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	diskDrift          *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
-	migratingWatchdog  *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
-	deadNodeReconciler *DeadNodeReconciler    // dead-node billing-leak self-healer; nil opts out (no ticker arm)
-	instStats          InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup            *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
-	targets            *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
-	floor              *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
-	recentLoad         *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
-	livenessWindow     *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
-	appDelete          *AppDeleteSubscriber   // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
-	reaperAggressive   bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap      int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	triggerWakeup        chan struct{}
+	triggerWakeupOnce    sync.Once
+	now                  func() time.Time
+	flowCounts           FlowCounter
+	ops                  *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit                *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
+	watchdog             *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention            *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	invocationsRetention *InvocationsRetention  // ADR-134 PR-B: invocations retention + deadline-breach sweep; nil opts out
+	triggersRetention    *TriggersRetention     // ADR-134 PR-E: trigger_records retention sweep; nil opts out
+	heartbeat            *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift            *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
+	migratingWatchdog    *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
+	deadNodeReconciler   *DeadNodeReconciler    // dead-node billing-leak self-healer; nil opts out (no ticker arm)
+	instStats            InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup              *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets              *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	floor                *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
+	recentLoad           *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	livenessWindow       *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	appDelete            *AppDeleteSubscriber   // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
+	reaperAggressive     bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap        int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 	// lastFloorByApp (issue #557 closure / ADR-072): per-app
 	// effective floor from the previous reaper tick, used to emit
 	// `instances.parked_min_instances_released` when the floor

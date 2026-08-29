@@ -289,7 +289,7 @@ type MemStore struct {
 	// ID; populated lazily by EnsureAccountAsyncQuota; mutated by
 	// ClaimInvocationWithCap / DecrementAccountAsyncInflight.
 	accountAsyncQuota map[string]accountAsyncQuotaRow
-	instances   map[string]Instance
+	instances         map[string]Instance
 	// loginTokens is keyed by the hex-encoded SHA-256 hash of the
 	// raw token (so the binary []byte hash from ConsumeLoginToken
 	// matches the map key format used in MemStore everywhere else).
@@ -710,17 +710,17 @@ func NewMemStore() *MemStore {
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
 		oidcExchangedTokens: map[string]OIDCExchangedToken{},
 		// ADR-100 / tenant surfaces — see memstore_tenant_surface.go.
-		tenantSurfaces:   map[string]TenantSurface{},
-		tenantHostnames:  map[string]TenantHostname{},
-		invocations:      map[string]Invocation{},
+		tenantSurfaces:    map[string]TenantSurface{},
+		tenantHostnames:   map[string]TenantHostname{},
+		invocations:       map[string]Invocation{},
 		accountAsyncQuota: map[string]accountAsyncQuotaRow{},
-		instances:        map[string]Instance{},
-		loginTokens:      map[string]LoginToken{},
-		cliAuthCodes:     map[string]CliAuthCode{},
-		accountPasswords: map[string]AccountPassword{},
-		oauthLinks:       map[string]OAuthLink{},
-		deploymentLogs:   map[string][]LogEntry{},
-		deploymentSeq:    map[string]int64{},
+		instances:         map[string]Instance{},
+		loginTokens:       map[string]LoginToken{},
+		cliAuthCodes:      map[string]CliAuthCode{},
+		accountPasswords:  map[string]AccountPassword{},
+		oauthLinks:        map[string]OAuthLink{},
+		deploymentLogs:    map[string][]LogEntry{},
+		deploymentSeq:     map[string]int64{},
 		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).

@@ -1419,7 +1419,7 @@ var planLimits = map[Plan]Limits{
 		// the documented Hobby-customer-trying-Free path; tighter than
 		// Hobby so a customer mid-upgrade sees the cap before the
 		// plan flips. Deadline defaults to 5m, retention to 1d.
-		MaxAsyncInvocationsPerAccount:    100,
+		MaxAsyncInvocationsPerAccount:     100,
 		MaxAsyncInvocationDeadlineSeconds: 300,
 		MaxAsyncResultRetentionSeconds:    86400,
 		// Autoscale (issue #169 / #172): Free stays off. The per-request
@@ -1746,7 +1746,7 @@ var planLimits = map[Plan]Limits{
 		MaxQueueAttempts: 3,
 		// ADR-134 PR-B: Hobby 1k / 1h / 7d. Matches the doubling
 		// from Free's 100/5m/1d.
-		MaxAsyncInvocationsPerAccount:    1000,
+		MaxAsyncInvocationsPerAccount:     1000,
 		MaxAsyncInvocationDeadlineSeconds: 3600,
 		MaxAsyncResultRetentionSeconds:    604800,
 		// Autoscale: Hobby is gated on Pro+ for both RPS and CPU
@@ -2103,7 +2103,7 @@ var planLimits = map[Plan]Limits{
 		MaxQueueAttempts: 10,
 		// ADR-134 PR-B: Pro 10k / 6h / 30d. Decadal bumps from
 		// Hobby track the Doubling pattern (1k->10k, 1h->6h, 7d->30d).
-		MaxAsyncInvocationsPerAccount:    10000,
+		MaxAsyncInvocationsPerAccount:     10000,
 		MaxAsyncInvocationDeadlineSeconds: 21600,
 		MaxAsyncResultRetentionSeconds:    2592000,
 		// ADR-031: Pro gets 16 CIDR entries — enough for "1 SaaS +
@@ -2439,7 +2439,7 @@ var planLimits = map[Plan]Limits{
 		// matches the cron-handler SLA spec ("must finish by 09:00"
 		// pattern); 90d retention matches the audit-grade trace
 		// retention target.
-		MaxAsyncInvocationsPerAccount:    100000,
+		MaxAsyncInvocationsPerAccount:     100000,
 		MaxAsyncInvocationDeadlineSeconds: 86400,
 		MaxAsyncResultRetentionSeconds:    7776000,
 		// ADR-031: Scale gets 64 CIDR entries — broad enough for
