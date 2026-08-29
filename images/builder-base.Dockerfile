@@ -147,12 +147,12 @@ RUN case "${TARGETARCH}" in \
 RUN ln -s /usr/bin/runc /usr/local/bin/runc
 
 # guest-init uses util-linux unshare's automatic subordinate-ID mapping. The
-# BusyBox applet accepts neither --map-users nor --map-groups, so assert the
-# actual runtime contract while assembling the image instead of discovering a
+# BusyBox applet does not provide --map-auto, so assert the actual runtime
+# contract while assembling the image instead of discovering a
 # stale/incomplete builder rootfs only after a VM has booted.
 RUN test -x /usr/local/bin/runc && \
     test -x /usr/bin/unshare && \
-    /usr/bin/unshare --help 2>&1 | grep -q -- '--map-users'
+    /usr/bin/unshare --help 2>&1 | grep -q -- '--map-auto'
 
 # Rootless BuildKit runs inside the builder microVM's user namespace. Give
 # the mapped root a bounded subordinate range so runc can materialise image
