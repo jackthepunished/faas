@@ -106,6 +106,15 @@ func (f *fakeVmmdClient) WarmSnapshot(context.Context, *vmmdpb.WarmSnapshotReque
 func (f *fakeVmmdClient) Destroy(context.Context, *vmmdpb.DestroyRequest, ...grpc.CallOption) (*vmmdpb.DestroyResponse, error) {
 	panic("Destroy: not stubbed")
 }
+
+// StopInstance (M-2 / ADR-138 §Decision 1) is the graceful
+// signal-grace-SIGKILL stop sequence. The forwardproxy test rig
+// never exercises it (the forwarder is request-shaped, not
+// worker/job); panic-on-call makes a future accidental
+// invocation surface as a clear test mistake.
+func (f *fakeVmmdClient) StopInstance(context.Context, *vmmdpb.StopInstanceRequest, ...grpc.CallOption) (*vmmdpb.StopInstanceResponse, error) {
+	panic("StopInstance: not stubbed")
+}
 func (f *fakeVmmdClient) Stats(context.Context, *vmmdpb.StatsRequest, ...grpc.CallOption) (*vmmdpb.StatsResponse, error) {
 	panic("Stats: not stubbed")
 }

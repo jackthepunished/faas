@@ -270,7 +270,15 @@ func boot() error {
 	// fails the deploy — that's worse than today's opaque "guest
 	// not ready after 30s" path).
 	go runCharacterizationForSup(supRef, manifest)
-	return supRef.Run()
+	// M-2 / ADR-138 §Decision 1 / issue #474 — install the PID 1
+	// signal handler before invoking the supervisor. The handler
+	// multiplexes (a) the customer's STOPSIGNAL forwarded to the
+	// supervisor for graceful stop, (b) the SIGCHLD reaper loop
+	// so every forked child is reaped (no zombies), and (c)
+	// forwarding of guest-init-received signals to the tracked
+	// workload. Returns when the supervisor exits (clean, crash-
+	// loop exhausted, or graceful-stop completed).
+	return runSignalHandlers(context.Background(), manifest, supRef, slog.Default())
 }
 
 func guestStage(stage string) {
