@@ -608,14 +608,14 @@ func mapExitToTerminalStatus(exitCode int, errorClass string) string {
 		}
 		return errorClass
 	}
-	switch {
-	case exitCode == 0:
+	switch exitCode {
+	case 0:
 		return "succeeded"
-	case exitCode == 124:
+	case 124:
 		return "timeout"
-	case exitCode == 137:
+	case 137:
 		return "oom"
-	case exitCode == 143:
+	case 143:
 		return "cancelled"
 	default:
 		return "failed"

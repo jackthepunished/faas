@@ -290,7 +290,7 @@ func (v *JailerVMM) stageJobManifest(instance string, m JobManifest) error {
 		return fmt.Errorf("vmm: stageJobManifest: mkdir mnt: %w", err)
 	}
 	if out, err := exec.Command("mount", "-o", "loop,rw", drive1Img, mnt).CombinedOutput(); err != nil {
-		return fmt.Errorf("vmm: stageJobManifest: mount: %v: %s", err, string(out))
+		return fmt.Errorf("vmm: stageJobManifest: mount: %w: %s", err, string(out))
 	}
 	defer func() {
 		// Best-effort umount. Chroot lives on tmpfs and is

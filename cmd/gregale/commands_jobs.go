@@ -499,12 +499,12 @@ func cmdJobsLogs(args []string) int {
 		return jsonOut(writeJSONSingle(logs))
 	}
 	if logs.LogContent == "" && !logs.Truncated {
-		fmt.Fprintf(os.Stdout, "(task %s produced no output)\n", logs.TaskStatus)
+		_, _ = fmt.Fprintf(os.Stdout, "(task %s produced no output)\n", logs.TaskStatus)
 		return 0
 	}
-	fmt.Fprint(os.Stdout, logs.LogContent)
+	_, _ = fmt.Fprint(os.Stdout, logs.LogContent)
 	if logs.Truncated {
-		fmt.Fprintln(os.Stdout, "...[truncated]")
+		_, _ = fmt.Fprintln(os.Stdout, "...[truncated]")
 	}
 	return 0
 }
@@ -518,12 +518,12 @@ func cmdJobsLogs(args []string) int {
 // internal cross-references.
 func renderJobsTable(w io.Writer, jobs []api.JobResponse) {
 	if len(jobs) == 0 {
-		fmt.Fprintln(w, "(no jobs)")
+		_, _ = fmt.Fprintln(w, "(no jobs)")
 		return
 	}
 	for _, j := range jobs {
 		renderJobState(w, j)
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 	}
 }
 
@@ -545,13 +545,13 @@ func renderJobState(w io.Writer, j api.JobResponse) {
 // maps to a short indicator (run / ok / fail / cancel / dead).
 func renderJobRunsTable(w io.Writer, runs []api.JobRunResponse) {
 	if len(runs) == 0 {
-		fmt.Fprintln(w, "(no runs)")
+		_, _ = fmt.Fprintln(w, "(no runs)")
 		return
 	}
-	fmt.Fprintf(w, "%-36s %-8s %4s %4s %4s %4s %4s  %s\n",
+	_, _ = fmt.Fprintf(w, "%-36s %-8s %4s %4s %4s %4s %4s  %s\n",
 		"run-id", "status", "tasks", "succ", "fail", "canc", "dlq", "started")
 	for _, r := range runs {
-		fmt.Fprintf(w, "%-36s %-8s %4d %4d %4d %4d %4d  %s\n",
+		_, _ = fmt.Fprintf(w, "%-36s %-8s %4d %4d %4d %4d %4d  %s\n",
 			r.ID, shortRunStatus(r.AggregateStatus),
 			r.Tasks, r.TasksSucceeded, r.TasksFailed, r.TasksCancelled, r.DeadLetterCount,
 			formatTimeAgo(r.StartedAt))
@@ -562,10 +562,10 @@ func renderJobRunsTable(w io.Writer, runs []api.JobRunResponse) {
 // runs 1..N (1-based; matches the server's CTE fan-out).
 func renderJobTasksTable(w io.Writer, tasks []api.JobTaskResponse) {
 	if len(tasks) == 0 {
-		fmt.Fprintln(w, "(no tasks)")
+		_, _ = fmt.Fprintln(w, "(no tasks)")
 		return
 	}
-	fmt.Fprintf(w, "%4s  %-10s %3s %5s  %-14s  %s\n",
+	_, _ = fmt.Fprintf(w, "%4s  %-10s %3s %5s  %-14s  %s\n",
 		"idx", "status", "try", "exit", "error_class", "instance")
 	for _, t := range tasks {
 		inst := t.InstanceID
@@ -580,7 +580,7 @@ func renderJobTasksTable(w io.Writer, tasks []api.JobTaskResponse) {
 		if t.ExitCode != 0 || t.Status == "failed" || t.Status == "oom" || t.Status == "timeout" {
 			exit = strconv.Itoa(t.ExitCode)
 		}
-		fmt.Fprintf(w, "%4d  %-10s %3d %5s  %-14s  %s\n",
+		_, _ = fmt.Fprintf(w, "%4d  %-10s %3d %5s  %-14s  %s\n",
 			t.TaskIndex, t.Status, t.Attempt, exit, errClass, inst)
 	}
 }

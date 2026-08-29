@@ -903,7 +903,7 @@ func (s *PgStore) JobTaskList(ctx context.Context, runID string, limit, offset i
 
 // ListJobInstances returns every kind='job_task' instance for the
 // meterd sampler. Uses instances_job_active_idx
-// (migrations/00535_job_id_on_delete_restrict.sql) — a partial
+// (migrations/00540_job_id_on_delete_restrict.sql) — a partial
 // index on (job_id) WHERE kind='job_task' AND status NOT IN
 // ('parked','destroyed') — so the sampler is O(active job
 // instances), not O(total instances).

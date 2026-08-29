@@ -2849,7 +2849,7 @@ type Instance struct {
 	Mode string
 	// Kind (issue #1184 Workstream A / ADR-099) discriminates
 	// app VMs from job-task VMs. Closed vocabulary enforced at
-	// the SQL layer by migration 00535's
+	// the SQL layer by migration 00540's
 	// instances_kind_check CHECK constraint:
 	//   - "" / "app_task"  — legacy app VM (the default)
 	//   - "job_task"       — job-task VM (one per active job_task row)

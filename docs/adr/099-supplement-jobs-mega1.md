@@ -3,7 +3,7 @@
 - **Status:** accepted (supplement to ADR-099 v1, status: proposed)
 - **Date:** 2026-08-29
 - **Branch:** `jobs/mega1`
-- **Slot bank:** 00533–00538 (migrations), 0 fences consumed.
+- **Slot bank:** 00533–00540 (migrations), 0 fences consumed.
 
 This supplement records the as-built deviations from ADR-099 v1
 (`docs/adr/099-jobs.md`) introduced by Mega-1 (issue #1184

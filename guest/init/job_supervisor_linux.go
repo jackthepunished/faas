@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -155,7 +156,8 @@ func runViaOSExec(m JobManifest, env []string, log *slog.Logger) error {
 	exitCode := int32(-1)
 	var signal int32
 	if waitErr != nil {
-		if ee, ok := waitErr.(*exec.ExitError); ok {
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
 				if ws.Signaled() {
 					signal = int32(ws.Signal())
@@ -262,6 +264,9 @@ func loadJobManifest() (*JobManifest, error) {
 	// open from cwd-relative path — guest-init has pivot_root'd
 	// into /, so a relative path resolves against the merged
 	// overlay root.
+	//nolint:forbidigo // guest-init reads its own staged manifest from the
+	// post-pivot rootfs; openCustomerFile is for host daemons reading customer
+	// bytes, not for in-guest init reading OS-owned staging files.
 	f, err := os.Open(filepath.Join("/", jobManifestPath))
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", jobManifestPath, err)

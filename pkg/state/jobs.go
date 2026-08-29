@@ -1,7 +1,7 @@
 // jobs.go is the ADR-099 / issue #1184 Workstream A foundation layer
 // for run-to-completion jobs. Three tables (jobs / job_runs / job_tasks)
-// land across migrations 00255, 00256, 00257, 00533, 00534, 00535, 00536,
-// 00537, 00538 — this file defines the Go-side domain types + the
+// land across migrations 00255, 00256, 00257, 00533, 00534, 00536, 00537,
+// 00538, 00539, 00540 — this file defines the Go-side domain types + the
 // JobStore sub-interface that PgStore and MemStore satisfy.
 //
 // Conventions mirror the cron / trigger sub-surfaces in this package:
@@ -33,7 +33,7 @@ import (
 )
 
 // --- Domain types (mirrors schema in migrations/00255, 00256, 00257,
-//     00533, 00534, 00535, 00536, 00537, 00538) ----------------------
+//     00533, 00534, 00536, 00537, 00538, 00539, 00540) --------------
 
 // Job is one row of public.jobs (migrations/00255 + 00534 for command).
 // Kind is the closed vocabulary ('app' | 'function') enforced by the
