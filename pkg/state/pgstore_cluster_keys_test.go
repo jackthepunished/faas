@@ -22,7 +22,7 @@ import (
 // fail-closed at boot, locking out single-box installs that
 // don't yet have a cluster key.
 func TestLoadClusterSigningKey_EmptyTableReturnsNotFound(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestLoadClusterSigningKey_EmptyTableReturnsNotFound(t *testing.T) {
 // ciphertext — the Store layer doesn't care about the wire
 // format; pkg/secretbox owns that contract.
 func TestLoadClusterSigningKey_RoundTrip(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestLoadClusterSigningKey_RoundTrip(t *testing.T) {
 // could split the fleet across multiple rows and break the
 // "one cluster key" invariant.
 func TestInsertClusterSigningKey_SingletonRejectsSecondID(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestInsertClusterSigningKey_SingletonRejectsSecondID(t *testing.T) {
 // PR-3 ships the table shape forward-compatible; the
 // rotation-overlap READ path is a follow-on.
 func TestInsertClusterSigningKey_RotationIsInPlace(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestInsertClusterSigningKey_RotationIsInPlace(t *testing.T) {
 // (silent) from "rolled back the row you just inserted" (loud)
 // using this signal.
 func TestDeleteClusterSigningKey_EmptyReturnsNotFound(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestDeleteClusterSigningKey_EmptyReturnsNotFound(t *testing.T) {
 // TestDeleteClusterSigningKey_AfterInsert pins the happy-path
 // round trip: insert → delete → load returns ErrNotFound.
 func TestDeleteClusterSigningKey_AfterInsert(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestDeleteClusterSigningKey_AfterInsert(t *testing.T) {
 //   - created_at is preserved across the re-insert (no reset;
 //     a DELETE-then-INSERT in the ON CONFLICT branch would fail this)
 func TestInsertClusterSigningKey_IdempotentReInsertSameKid(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestInsertClusterSigningKey_IdempotentReInsertSameKid(t *testing.T) {
 // the operator CLI can show a targeted error instead of a SQL
 // traceback.
 func TestInsertClusterSigningKey_RejectsEmptyFields(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

@@ -30,7 +30,7 @@ func pgStoreTimeNow() time.Time { return time.Now().UTC() }
 
 func newPgStore(t *testing.T) *PgStore {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestPgStore_ConsumeOrgInvitation_HappyPath(t *testing.T) {
 	// race matrix is exercised by the migration test (which pins SQL
 	// invariants) and the memstore parity test (which pins store semantics);
 	// this file proves the PgStore wires both to the same tx semantics.
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestPgStore_ConsumeOrgInvitation_HappyPath(t *testing.T) {
 }
 
 func TestPgStore_ExpireOrgInvitations_Counts(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(context.Background(), pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}

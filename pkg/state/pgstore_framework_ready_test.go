@@ -85,7 +85,7 @@ func seedFrameworkReadyInstancePg(t *testing.T, pool *pgxpool.Pool) (appID, depl
 // MemStore equivalent is in memstore_framework_ready_test.go.
 func TestPg_SetInstanceFrameworkReadyAt_StampsAndClears(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestPg_SetInstanceFrameworkReadyAt_StampsAndClears(t *testing.T) {
 // from transient DB errors.
 func TestPg_SetInstanceFrameworkReadyAt_MissingRowReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}

@@ -86,7 +86,7 @@ func seedTailCountInstancePg(t *testing.T, pool *pgxpool.Pool) (appID, deploymen
 // Mirrors the MemStore equivalent.
 func TestPg_BumpInstanceTailCount_AddsAndReturnsPostValue(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestPg_BumpInstanceTailCount_AddsAndReturnsPostValue(t *testing.T) {
 // negative tail_count).
 func TestPg_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestPg_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 // guards against a future PR that splits the SQL paths.
 func TestPg_BumpInstanceTailCount_NegativeDeltaFloorsAtZero(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestPg_BumpInstanceTailCount_NegativeDeltaFloorsAtZero(t *testing.T) {
 // on a single error value.
 func TestPg_BumpDecrement_MissingRowReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}

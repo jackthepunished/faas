@@ -38,7 +38,7 @@ import (
 // pkg/state/pgstore_account_deletion_test.go::pgStoreAccountDeletionWithPool.
 func pgWithPool(t *testing.T) (*state.PgStore, context.Context, *pgxpool.Pool) {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

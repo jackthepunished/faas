@@ -4,7 +4,7 @@
 // matching the existing pgstore_*_test.go convention.
 //
 // The MemStore half runs on every test invocation. The PgStore
-// half uses pgtest.Open(t) which skips if DATABASE_URL is unset,
+// half uses pgtest.OpenMigrated(t) which skips if DATABASE_URL is unset,
 // so unit tests stay green in CI runners without a live cluster.
 package state_test
 
@@ -114,7 +114,7 @@ func TestSetComputeNodeRole_MemStore_RowMissing(t *testing.T) {
 }
 
 func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

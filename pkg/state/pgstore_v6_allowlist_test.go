@@ -51,7 +51,7 @@ func seedAppForAllowlist(t *testing.T, ctx context.Context, s *state.PgStore, la
 // TestPgStore_UpdateApp_V6RoundTrip pins that a v6-only allowlist
 // survives UpdateApp + AppByID under the new trigger contract.
 func TestPgStore_UpdateApp_V6RoundTrip(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)
@@ -97,7 +97,7 @@ func TestPgStore_UpdateApp_V6RoundTrip(t *testing.T) {
 // allowlist survives UpdateApp + AppByID. The DB trigger doesn't
 // partition by family — it only enforces v4-or-v6 + non-/0.
 func TestPgStore_UpdateApp_MixedRoundTrip(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)
@@ -137,7 +137,7 @@ func TestPgStore_UpdateApp_MixedRoundTrip(t *testing.T) {
 // 23514 with constraint `apps_egress_allowlist_cidr` so the caller's
 // error surface stays uniform regardless of family.
 func TestPgStore_UpdateApp_SlashZeroRejected(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v", err)

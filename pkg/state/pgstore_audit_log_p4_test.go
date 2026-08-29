@@ -40,7 +40,7 @@ import (
 // tests only need the read-side WHERE-clause paths).
 func pgStoreAuditLogP4WithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

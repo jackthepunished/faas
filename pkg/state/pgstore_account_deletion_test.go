@@ -43,7 +43,7 @@ type pgDeps struct {
 // keep their narrow (store, ctx) signature.
 func pgStoreAccountDeletionWithPool(t *testing.T) pgDeps {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

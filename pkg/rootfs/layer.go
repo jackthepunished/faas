@@ -31,34 +31,52 @@ func ApplyLayer(dst string, tr *tar.Reader) error {
 		if err != nil {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
-
-		// codeql[go/path-injection] false-positive: resolveEntryPath rejects ".."
-		// and absolute names, then clamps every ancestor symlink inside dst.
-		target, err := resolveEntryPath(dst, hdr.Name)
-		if err != nil {
-			return err
+		// Opaque whiteouts contain the literal ".." marker as part of
+		// their fixed format, not as a path component. Normalize that
+		// marker before the archive-name guard; the parent path remains
+		// unchanged and the opaque branch below still removes the same
+		// directory contents.
+		archiveName := hdr.Name
+		opaque := strings.HasSuffix(archiveName, whiteoutOpaque)
+		if opaque {
+			archiveName = strings.TrimSuffix(archiveName, whiteoutOpaque) + ".wh.opq"
 		}
 
-		base := filepath.Base(hdr.Name)
-		switch {
-		case base == whiteoutOpaque:
-			// Opaque dir: drop everything currently under its parent.
-			if err := clearDir(filepath.Dir(target)); err != nil {
+		// Keep all filesystem operations inside the positive validation
+		// branch. resolveEntryPath performs the stronger containment and
+		// symlink-ancestor checks once the archive name has passed this
+		// traversal guard.
+		if !strings.Contains(archiveName, "..") {
+			// codeql[go/path-injection] false-positive: resolveEntryPath rejects
+			// absolute names, then clamps every ancestor symlink inside dst.
+			target, err := resolveEntryPath(dst, archiveName)
+			if err != nil {
+				return err
+			}
+
+			base := filepath.Base(archiveName)
+			switch {
+			case opaque:
+				// Opaque dir: drop everything currently under its parent.
+				if err := clearDir(filepath.Dir(target)); err != nil {
+					return err
+				}
+				continue
+			case strings.HasPrefix(base, whiteoutPrefix):
+				// Delete the named sibling from lower layers.
+				victim := filepath.Join(filepath.Dir(target), strings.TrimPrefix(base, whiteoutPrefix))
+				if err := os.RemoveAll(victim); err != nil {
+					return fmt.Errorf("rootfs: whiteout %s: %w", victim, err)
+				}
+				continue
+			}
+
+			if err := applyEntry(dst, target, hdr, tr); err != nil {
 				return err
 			}
 			continue
-		case strings.HasPrefix(base, whiteoutPrefix):
-			// Delete the named sibling from lower layers.
-			victim := filepath.Join(filepath.Dir(target), strings.TrimPrefix(base, whiteoutPrefix))
-			if err := os.RemoveAll(victim); err != nil {
-				return fmt.Errorf("rootfs: whiteout %s: %w", victim, err)
-			}
-			continue
 		}
-
-		if err := applyEntry(dst, target, hdr, tr); err != nil {
-			return err
-		}
+		return fmt.Errorf("rootfs: archive entry %q contains traversal marker", hdr.Name)
 	}
 }
 
@@ -84,6 +102,19 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 	case tar.TypeReg:
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
+		}
+		// A later OCI layer may replace a symlink from a lower layer with a
+		// regular file. Remove the link before opening the destination so
+		// OpenFile cannot follow its guest-side target into the host filesystem
+		// (for example /bin/busybox under systemd ProtectSystem=strict).
+		if info, err := os.Lstat(target); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				if err := os.Remove(target); err != nil {
+					return fmt.Errorf("rootfs: replace symlink %s: %w", target, err)
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("rootfs: inspect existing entry %s: %w", target, err)
 		}
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&os.ModePerm)
 		if err != nil {

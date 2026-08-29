@@ -74,7 +74,7 @@ func pgStore(t *testing.T) (*state.PgStore, context.Context) {
 // "no mutation" assertion would pass vacuously.
 func pgStoreWithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -2059,7 +2059,7 @@ func TestPg_DeleteSnapshotsStaleOlderThan_OnlyRemovesStalePastRetention(t *testi
 	// public Store surface for "create a snapshot N days ago," and
 	// opening one for a single test is cheaper than racing a real clock.
 	// The pgtest.Open + MigrateUp pattern mirrors the helper in pgStore(t).
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -2118,7 +2118,7 @@ func TestPg_ListLiveSnapshotStats_ExcludesStaleAndOrdersByMemBytesDesc(t *testin
 	// CreateSnapshot surface takes MemBytes/DiskBytes but the table
 	// stores the value as-is — we want a non-zero value here to pin
 	// the scan field, not the round-trip.
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -2270,7 +2270,7 @@ func TestPg_ListInstancesByStatesOlderThan_UsesStateAwareAgeColumn(t *testing.T)
 	// Open pool directly so the test can backdate started_at / parked_at
 	// — PgStore.pool is unexported (state_test can't see it), and
 	// there's no public Store surface for "set started_at = X".
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -2458,7 +2458,7 @@ func TestPg_CreateDeployment_RejectsDeletedApp(t *testing.T) {
 // claim wins; subsequent claims return ErrNotFound. started_at must be
 // set on the winner.
 func TestPg_ClaimQueuedBuild(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -2777,7 +2777,7 @@ func TestPg_UpsertGitHubInstall_OnConflictUpdates(t *testing.T) {
 // `delete from accounts` only triggers the CASCADE on
 // github_installations — apps FK would otherwise trip 23503.
 func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

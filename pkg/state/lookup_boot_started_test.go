@@ -100,7 +100,7 @@ func cleanupBootStarted(t *testing.T, ctx context.Context, pool *pgxpool.Pool, w
 }
 
 func TestLookupBootStartedForWakes_RoundTrip(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -197,7 +197,7 @@ func TestLookupBootStartedForWakes_RoundTrip(t *testing.T) {
 // future "optimization" that drops the jsonb contains check would
 // surface here as a silent "No" badge for fleet rows.
 func TestLookupBootStartedForWakes_PRAbsentAtCapacity(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -248,7 +248,7 @@ func TestLookupBootStartedForWakes_PRAbsentAtCapacity(t *testing.T) {
 // and EXTRACT(MILLISECONDS) returns only the seconds-field ms). The
 // EXTRACT(EPOCH …) * 1000 fix returns 65500. Regression-pin.
 func TestLookupBootStartedForWakes_ReadyInMS(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -319,7 +319,7 @@ func TestLookupBootStartedForWakes_ReadyInMS(t *testing.T) {
 // EXTRACT(MILLISECONDS) regression bites even for pre-PR-A rows
 // (which still carry boot_started.at / boot_completed.at).
 func TestLookupBootStartedForWakes_PRAbsentAtCapacityWithCompletion(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -372,7 +372,7 @@ func TestLookupBootStartedForWakes_PRAbsentAtCapacityWithCompletion(t *testing.T
 }
 
 func TestLookupBootStartedForWakes_EmptyInput(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -400,7 +400,7 @@ func TestLookupBootStartedForWakes_EmptyInput(t *testing.T) {
 }
 
 func TestLookupBootStartedForWakes_UnknownWakeID(t *testing.T) {
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
