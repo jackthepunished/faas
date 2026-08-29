@@ -3,7 +3,7 @@
 --
 -- ADR-134 PR-C: per-row async-job semantics on trigger_records.
 --
--- Mirrors 00532_invocations_async_fields.sql — three nullable
+-- Mirrors 00520_invocations_async_fields.sql — three nullable
 -- columns so each trigger_record can carry its own deadline,
 -- retry policy override, and result-retention horizon. The
 -- pkg/sched dispatch_triggers.go drain (the trigger_records
