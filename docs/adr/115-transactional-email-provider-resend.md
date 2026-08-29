@@ -445,7 +445,7 @@ mega-PR landed the following against main:
   unrecognised `FAAS_MAIL_TRANSPORT` on a non-dev box
   (`FAAS_DEV` unset/`0`). `FAAS_DEV=1` keeps LogSender; explicit
   `log`/`noop` remain valid escape hatches.
-- **Suppression list** (`migrations/00525_mail_suppressions.sql`),
+- **Suppression list** (`migrations/00539_mail_suppressions.sql`),
   60s in-process cache on the decorator, unique index on
   `(source, provider_event_id)`.
 - **List-Unsubscribe** (RFC 8058) wired into the quota-warning

@@ -1,4 +1,4 @@
--- filename: 00525_mail_suppressions.sql
+-- filename: 00539_mail_suppressions.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -13,7 +13,7 @@
 --     "is this address currently suppressed" against it is a
 --     sequential scan and grows unbounded. The decorator needs
 --     a fast lookup on every outbound mail — a single-row
---     partial index on lower(email) is O(1) at expected volumes.
+--     index on lower(email) is O(1) at expected volumes.
 --   - The suppression list has its own lifecycle (TTL via
 --     expires_at, operator-driven removal) that does not belong
 --     on an immutable ledger.
@@ -39,6 +39,30 @@
 -- 'operator' is for the rare case where an operator
 -- suppresses an address manually (e.g. a deliverability
 -- complaint that the provider has not yet registered).
+--
+-- Slot renumber: 00525 → 00539. PR #1185
+-- (feat(dispatch): durable async-job contract) reserves 00525-
+-- 00531 + 00534 + 00537 and ships real schemas at 532, 533,
+-- 535, 536, 538. The code-review agent surfaced the 00525
+-- collision on PR #1191; the next fully-free slot past #1185's
+-- range is 00539. Verified uncontested at push time.
+--
+-- Index design: a partial index on `lower(email)` would be the
+-- obvious shape, but Postgres requires index predicates to be
+-- IMMUTABLE and `now()` is STABLE — so a partial predicate
+-- `WHERE expires_at IS NULL OR expires_at > now()` makes the
+-- CREATE INDEX fail at apply time. Two options were considered:
+--   (a) drop the partial predicate — full index on lower(email);
+--       acceptable at expected volumes (one row per bounced
+--       address, not per message), and the IsMailSuppressed
+--       query naturally filters out expired rows via the
+--       WHERE clause.
+--   (b) rephrase the predicate using a fixed-reference
+--       timestamp or generated column — more machinery for
+--       negligible benefit.
+-- Option (a) wins. A future PR can add a reaper that drops
+-- rows whose `expires_at` is in the past, at which point a
+-- partial index becomes viable without IMMUTABLE gymnastics.
 CREATE TABLE IF NOT EXISTS mail_suppressions (
     id                uuid                     PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id        uuid                     REFERENCES accounts(id) ON DELETE CASCADE,
@@ -62,11 +86,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS mail_suppressions_event_id_key
 
 -- Lookup path: the suppression decorator's IsMailSuppressed
 -- query does WHERE lower(email) = $1 AND (expires_at IS NULL OR
--- expires_at > now()). The partial index keeps expired rows
--- out so a row that fell out of TTL does not block the lookup.
-CREATE INDEX IF NOT EXISTS mail_suppressions_active_email_idx
-    ON mail_suppressions (lower(email))
-    WHERE expires_at IS NULL OR expires_at > now();
+-- expires_at > now()). A full index on lower(email) keeps the
+-- lookup O(log n) at expected volumes (one row per bounced
+-- address, not per message); expired rows are filtered by the
+-- WHERE clause and naturally fall out as the reaper drops them.
+CREATE INDEX IF NOT EXISTS mail_suppressions_email_lower_idx
+    ON mail_suppressions (lower(email));
 
 -- +goose StatementEnd
 

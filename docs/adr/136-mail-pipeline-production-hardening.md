@@ -1,4 +1,4 @@
-# ADR-134 · Mail pipeline production hardening (issue #246 closure)
+# ADR-136 · Mail pipeline production hardening (issue #246 closure)
 
 - **Status:** accepted
 - **Date:** 2026-08-29
@@ -237,9 +237,13 @@ dashboard's "Signing Secret" field.
   verify in front of it is the authenticity gate. A follow-up
   PR backs the dedupe with a shared `webhook_deliveries`
   table.
-- **Migration slot 00525.** The `mail_suppressions` table
-  collides with open PR #1185's 517-524 slot fence pattern.
-  Verified uncontested at push time via
+- **Migration slot 00539.** The `mail_suppressions` table
+  originally targeted slot 00525, but PR #1185 (durable
+  async-job contract) reserves 00525-00531 + 00534 + 00537
+  and ships real schemas at 532, 533, 535, 536, 538. The
+  code-review agent surfaced the collision; 00539 is the
+  next fully-free slot past #1185's range. Verified
+  uncontested at push time via
   `scripts/ci/check_migration_slots.sh`; the slot landscape
   moves daily and a re-verify is part of the merge gate.
 
