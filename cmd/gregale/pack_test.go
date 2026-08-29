@@ -950,3 +950,289 @@ func keysOf(m map[string][]byte) []string {
 	}
 	return out
 }
+
+// TestParseGregaleignore exercises the pure parser against the
+// gitignore-subset grammar documented on gregaleignoreFile /
+// parseGregaleignore. Pins the four modifier flags and the glob
+// handling so a future refactor can't silently change semantics.
+func TestParseGregaleignore(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  []gregaleignorePattern
+	}{
+		{
+			name:  "empty",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "comments_and_blanks",
+			input: "# top comment\n\n   \n# another",
+			want:  nil,
+		},
+		{
+			name:  "simple_glob",
+			input: "*.log",
+			want: []gregaleignorePattern{{
+				raw: "*.log", globSegments: []string{"*.log"},
+			}},
+		},
+		{
+			name:  "anchored",
+			input: "/build",
+			want: []gregaleignorePattern{{
+				raw: "build", anchor: true, globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "dir_only",
+			input: "build/",
+			want: []gregaleignorePattern{{
+				raw: "build", dirOnly: true, globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "negate",
+			input: "!keep.txt",
+			want: []gregaleignorePattern{{
+				raw: "keep.txt", negate: true, globSegments: []string{"keep.txt"},
+			}},
+		},
+		{
+			name:  "anchored_dir",
+			input: "/build/",
+			want: []gregaleignorePattern{{
+				raw: "build", anchor: true, dirOnly: true,
+				globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "deep_path_segments",
+			input: "a/b/*.tmp",
+			want: []gregaleignorePattern{{
+				raw: "a/b/*.tmp", globSegments: []string{"a", "b", "*.tmp"},
+			}},
+		},
+		{
+			name:  "stripped_empty_is_skipped",
+			input: "!\n/\n",
+			want:  nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseGregaleignore([]byte(tc.input))
+			if !equalPatterns(got, tc.want) {
+				t.Errorf("parseGregaleignore(%q) = %+v, want %+v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func equalPatterns(a, b []gregaleignorePattern) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].raw != b[i].raw ||
+			a[i].anchor != b[i].anchor ||
+			a[i].dirOnly != b[i].dirOnly ||
+			a[i].negate != b[i].negate ||
+			!equalStrings(a[i].globSegments, b[i].globSegments) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestMatchGregaleignore pins the matching semantics: anchored
+// patterns match only at the root, unanchored patterns match at any
+// depth, and a later '!' can re-include a path previously excluded.
+func TestMatchGregaleignore(t *testing.T) {
+	cases := []struct {
+		name     string
+		patterns string
+		path     string
+		isDir    bool
+		want     bool
+	}{
+		{
+			name:     "no_patterns",
+			patterns: "",
+			path:     "dist/index.js", isDir: false,
+			want: false,
+		},
+		{
+			name:     "unanchored_match_root",
+			patterns: "*.log",
+			path:     "a.log", isDir: false,
+			want: true,
+		},
+		{
+			name:     "unanchored_match_nested",
+			patterns: "*.log",
+			path:     "deep/nested/b.log", isDir: false,
+			want: true,
+		},
+		{
+			name:     "unanchored_no_match_different_ext",
+			patterns: "*.log",
+			path:     "a.txt", isDir: false,
+			want: false,
+		},
+		{
+			name:     "anchored_match_root",
+			patterns: "/build",
+			path:     "build", isDir: false,
+			want: true,
+		},
+		{
+			name:     "anchored_no_match_nested",
+			patterns: "/build",
+			path:     "a/build", isDir: false,
+			want: false,
+		},
+		{
+			name:     "dir_only_skips_file",
+			patterns: "build/",
+			path:     "build", isDir: false,
+			want: false,
+		},
+		{
+			name:     "dir_only_matches_dir",
+			patterns: "build/",
+			path:     "build", isDir: true,
+			want: true,
+		},
+		{
+			name:     "deep_pattern_segments",
+			patterns: "a/b/*.tmp",
+			path:     "a/b/x.tmp", isDir: false,
+			want: true,
+		},
+		{
+			name:     "deep_pattern_no_match_other_subdir",
+			patterns: "a/b/*.tmp",
+			path:     "a/c/x.tmp", isDir: false,
+			want: false,
+		},
+		{
+			name:     "negate_re_includes",
+			patterns: "*.log\n!keep.log",
+			path:     "keep.log", isDir: false,
+			want: false, // negated → re-included
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pats := parseGregaleignore([]byte(tc.patterns))
+			got := matchGregaleignore(tc.path, tc.isDir, pats)
+			if got != tc.want {
+				t.Errorf("matchGregaleignore(%q, %v, %q) = %v, want %v",
+					tc.path, tc.isDir, tc.patterns, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPackDirToTarGz_BuildArtifactDefaults pins the six new
+// default-excluded dirs (issue #1182 §3.5): dist, .next, coverage,
+// target, .venv, .cache. Without these the tarball from a typical
+// Next.js / Maven / Cargo project hits the SourceTarballMaxMB cap
+// with garbage the server-side builder regenerates anyway.
+func TestPackDirToTarGz_BuildArtifactDefaults(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	writeFile(t, dir, "package.json", "{}")
+	writeFile(t, dir, "src/index.js", "x")
+	writeFile(t, dir, "dist/bundle.js", "compiled")
+	writeFile(t, dir, ".next/build-manifest.json", "{}")
+	writeFile(t, dir, "coverage/lcov.info", "data")
+	writeFile(t, dir, "target/debug/binary", "compiled")
+	writeFile(t, dir, ".venv/lib/python/x.py", "import")
+	writeFile(t, dir, ".cache/pip/http/abc", "cached")
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	got := tarEntries(t, dest)
+
+	// Kept (sanity):
+	mustHave := []string{base + "/package.json", base + "/src/index.js"}
+	for _, w := range mustHave {
+		if !got[w] {
+			t.Errorf("archive missing kept %q; entries: %v", w, got)
+		}
+	}
+	// Dropped (defaults):
+	dropPrefixes := []string{
+		"/dist/", "/.next/", "/coverage/", "/target/", "/.venv/", "/.cache/",
+	}
+	for name := range got {
+		for _, bad := range dropPrefixes {
+			if strings.Contains(name, bad) {
+				t.Errorf("archive should not contain %q (default-excluded); entries: %v", name, got)
+			}
+		}
+	}
+}
+
+// TestPackDirToTarGz_Gregaleignore end-to-end: write a
+// .gregaleignore with several patterns and assert the tarball drops
+// (and re-includes via negate) accordingly. Pins the wire between
+// packDirToTarGz and the parser.
+func TestPackDirToTarGz_Gregaleignore(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	writeFile(t, dir, "package.json", "{}")
+	writeFile(t, dir, "src/keep.ts", "x")
+	writeFile(t, dir, "scratch/notes.md", "drop me")
+	writeFile(t, dir, "build/output.bin", "compiled")
+	writeFile(t, dir, "src/skip.log", "drop me")
+	writeFile(t, dir, "src/important.log", "re-include me")
+	writeFile(t, dir, ".gregaleignore",
+		"# drop scratch dirs and log files\n"+
+			"scratch/\n"+
+			"*.log\n"+
+			"!src/important.log\n"+
+			"/build\n",
+	)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	got := tarEntries(t, dest)
+
+	mustHave := []string{
+		base + "/package.json",
+		base + "/src/keep.ts",
+		base + "/src/important.log", // negated → re-included
+	}
+	for _, w := range mustHave {
+		if !got[w] {
+			t.Errorf("archive missing kept %q; entries: %v", w, got)
+		}
+	}
+	for name := range got {
+		for _, bad := range []string{"/scratch/", "/build/", "/src/skip.log"} {
+			if strings.Contains(name, bad) {
+				t.Errorf("archive should not contain %q (.gregaleignore); entries: %v", name, got)
+			}
+		}
+	}
+}

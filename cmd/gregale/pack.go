@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -95,11 +96,27 @@ var functionHandlerFiles = map[string]bool{
 // SourceTarballMaxMB cap (pkg/api/limits.go) and are reproduced server-side by
 // the builder. Aggressive-but-predictable: other dotfiles (.env, .dockerignore,
 // .npmrc, .github/) are deliberately kept.
+//
+// The set is fixed (no customer config) so a customer reading the docs can
+// reason about their tarball contents without consulting a per-customer file.
+// Project-level exclusions belong in .gregaleignore (loaded by
+// loadGregaleignore below). Issue #1182 added the six "common build
+// artifact" dirs (dist/.next/coverage/target/.venv/.cache) so a fresh
+// `gregale deploy` from a Next.js / Maven / Cargo / coverage-instrumented
+// project doesn't trip the SourceTarballMaxMB cap with garbage the
+// builder is going to throw away anyway.
 var defaultExcludeDirs = map[string]bool{
 	".git":         true,
 	"node_modules": true,
 	"vendor":       true,
 	"__pycache__":  true,
+	// Common build / coverage output dirs (issue #1182 §3.5).
+	"dist":     true, // npm run build / go build / vite
+	".next":    true, // Next.js build output
+	"coverage": true, // nyc / istanbul / go test -coverprofile
+	"target":   true, // Maven / Cargo / Scala
+	".venv":    true, // Python virtualenv
+	".cache":   true, // pip / pytest / generic
 }
 
 // defaultExcludeFiles are basenames dropped anywhere in the tree (OS junk).
@@ -136,25 +153,182 @@ var appMarker = map[string]framework{
 // and it avoids leaking local mtimes).
 var packEpoch = time.Unix(0, 0)
 
-// shouldExclude reports whether a slash-separated path relative to the packed
-// root (e.g. "node_modules/foo/index.js") should be omitted from the archive.
-func shouldExclude(relSlashPath string, isDir bool) bool {
+// gregaleignoreFile is the filename at the packed root whose lines are
+// consulted by shouldExclude in addition to defaultExcludeDirs /
+// defaultExcludeFiles (issue #1182 §3.5). Lives in the same file as the
+// packer because there is exactly one consumer and tests live in
+// pack_test.go.
+//
+// Grammar is a strict subset of .gitignore:
+//
+//   - blank lines and lines beginning with '#' are ignored
+//   - leading '!' negates a previous match (a previously-excluded file
+//     can be re-included by a later negated line)
+//   - leading '/' anchors the pattern to the packed root (no
+//     unanchored equivalent in a non-rooted context)
+//   - trailing '/' restricts the pattern to directories
+//   - per-segment shell glob: '*' matches any run of non-'/' chars;
+//     '?' matches a single non-'/' char. No '**' / no character
+//     classes / no bracket expressions in v1.
+//
+// If the file is absent or unreadable the packer falls through to the
+// defaults alone (no regression for customers without a file). Malformed
+// lines are skipped silently (matches gitignore: invalid patterns are
+// ignored, not fatal).
+const gregaleignoreFile = ".gregaleignore"
+
+// gregaleignorePattern is one parsed line. Fields are independent
+// (anchor + dirOnly + negate can all be true on the same line).
+type gregaleignorePattern struct {
+	raw          string
+	anchor       bool     // leading '/'
+	dirOnly      bool     // trailing '/'
+	negate       bool     // leading '!'
+	globSegments []string // per-segment glob, split on '/'
+}
+
+// loadGregaleignore reads .gregaleignore from srcDir (the packed root)
+// and returns the parsed patterns in file order. Missing / unreadable
+// file → nil (no patterns → shouldExclude falls through to defaults
+// alone). Per-line parse failures are skipped silently.
+func loadGregaleignore(srcDir string) []gregaleignorePattern {
+	data, err := os.ReadFile(filepath.Join(srcDir, gregaleignoreFile))
+	if err != nil {
+		return nil
+	}
+	return parseGregaleignore(data)
+}
+
+// parseGregaleignore parses a .gregaleignore byte slice into patterns.
+// Pure function so pack_test.go can drive it without touching the
+// filesystem.
+func parseGregaleignore(data []byte) []gregaleignorePattern {
+	var out []gregaleignorePattern
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	// Allow long lines; the .gregaleignore spec has no line-length cap
+	// (gitignore uses the same ScanLines default and never complains).
+	for sc.Scan() {
+		// Trim trailing CR (for CRLF inputs) AND surrounding
+		// whitespace so blank / whitespace-only lines and
+		// trailing-whitespace comments are ignored the same way
+		// gitignore treats them.
+		line := strings.TrimSpace(strings.TrimRight(sc.Text(), "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		p := gregaleignorePattern{}
+		if strings.HasPrefix(line, "!") {
+			p.negate = true
+			line = line[1:]
+		}
+		if strings.HasPrefix(line, "/") {
+			p.anchor = true
+			line = line[1:]
+		}
+		if strings.HasSuffix(line, "/") {
+			p.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
+		}
+		if line == "" {
+			// Pure "!", "/", or "/" line — ignore (matches gitignore:
+			// an empty pattern after stripping flags would match every
+			// path, which is never what the customer meant).
+			continue
+		}
+		p.raw = line
+		p.globSegments = strings.Split(line, "/")
+		out = append(out, p)
+	}
+	return out
+}
+
+// matchGregaleignore reports whether relSlash matches any of the
+// patterns, honouring the negation toggle: a later '!pattern' can
+// re-include a file that was previously excluded.
+//
+// relSlash is slash-separated (filepath.ToSlash applied by the caller),
+// isDir is true for directory entries. dirOnly patterns only fire on
+// directories.
+func matchGregaleignore(relSlash string, isDir bool, patterns []gregaleignorePattern) bool {
+	matched := false
+	for _, p := range patterns {
+		if p.dirOnly && !isDir {
+			continue
+		}
+		if matchGregaleignoreOne(relSlash, p) {
+			matched = !p.negate
+		}
+	}
+	return matched
+}
+
+// matchGregaleignoreOne tests a single pattern against relSlash.
+// Anchored patterns only match at the packed root; unanchored patterns
+// match at any depth (gitignore's last-segment-match rule).
+func matchGregaleignoreOne(relSlash string, p gregaleignorePattern) bool {
+	parts := strings.Split(relSlash, "/")
+	if p.anchor {
+		return globMatchSegments(parts, p.globSegments)
+	}
+	// Unanchored: try every suffix of the path (the full path, then
+	// dropping one leading segment, etc.). This is the gitignore
+	// "matches a path component at any level" rule; e.g. `*.log`
+	// matches `a/b/c.log` because the suffix `b/c.log` segments
+	// match `*.log`.
+	for i := 0; i < len(parts); i++ {
+		if globMatchSegments(parts[i:], p.globSegments) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatchSegments matches a (suffix of) the rel path against the
+// pattern's per-segment globs. Uses path/filepath.Match per segment
+// so '*' / '?' work but no '**' / bracket classes. Lengths must match
+// exactly — `*.log` matches `a.log` but not `a.log.bak`.
+func globMatchSegments(parts, pattern []string) bool {
+	if len(parts) != len(pattern) {
+		return false
+	}
+	for i, pat := range pattern {
+		ok, err := filepath.Match(pat, parts[i])
+		if err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldExclude reports whether a slash-separated path relative to the
+// packed root (e.g. "node_modules/foo/index.js") should be omitted from
+// the archive. patterns is the parsed .gregaleignore list (nil/absent
+// → no project-level exclusions).
+//
+// Order of checks: defaults first (cheap map lookups, no allocation),
+// then .gregaleignore (per-entry glob walk). Defaults win over a
+// later negated .gregaleignore line — the customer's "include back
+// the dist/" un-exclude cannot revive a default-excluded build dir.
+// That matches the intent: defaults exist to keep the tarball under
+// the source cap, and unblocking them defeats that purpose.
+func shouldExclude(relSlashPath string, isDir bool, patterns []gregaleignorePattern) bool {
 	base := relSlashPath
 	if i := strings.LastIndex(relSlashPath, "/"); i >= 0 {
 		base = relSlashPath[i+1:]
 	}
 	if isDir {
-		return defaultExcludeDirs[base]
+		if defaultExcludeDirs[base] {
+			return true
+		}
+	} else {
+		if defaultExcludeFiles[base] {
+			return true
+		}
+		if strings.HasSuffix(base, ".pyc") {
+			return true
+		}
 	}
-	// Any file living under an excluded directory is dropped implicitly by
-	// WalkDir's SkipDir, so here we only handle file-level rules.
-	if defaultExcludeFiles[base] {
-		return true
-	}
-	if strings.HasSuffix(base, ".pyc") {
-		return true
-	}
-	return false
+	return matchGregaleignore(relSlashPath, isDir, patterns)
 }
 
 // detectFramework sniffs the TOP-LEVEL entries of srcDir (no recursion) and
@@ -736,6 +910,11 @@ const zeroConfigSourceCapMB = 100
 func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (regularFileCount int, err error) {
 	root := filepath.Base(srcDir)
 
+	// Load .gregaleignore once (before the walk) so shouldExclude sees
+	// the same patterns for every entry. Missing file → nil → no
+	// project-level exclusions (defaults still apply).
+	gitignorePatterns := loadGregaleignore(srcDir)
+
 	f, err := os.Create(destPath)
 	if err != nil {
 		return 0, fmt.Errorf("create archive %s: %w", destPath, err)
@@ -771,7 +950,7 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 			return rerr
 		}
 		relSlash := filepath.ToSlash(rel)
-		if shouldExclude(relSlash, d.IsDir()) {
+		if shouldExclude(relSlash, d.IsDir(), gitignorePatterns) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
