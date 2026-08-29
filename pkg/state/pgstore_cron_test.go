@@ -75,7 +75,7 @@ func seedCronApp(t *testing.T, ctx context.Context, s *state.PgStore, label stri
 // when Postgres is unreachable.
 func cronPgStore(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

@@ -494,10 +494,10 @@ jobs:
             package_pattern: '/(cmd/gregale|cmd/gregalectl|cmd/meterd|cmd/schedd|cmd/schema-dump)(/|$)'
             coverage_file: cover-shard2b.out
             state_coverage: false
-    # The race-enabled state suite includes a large, migration-backed package
-    # and can exceed 28 minutes on shared GitHub runners. Keep a bounded,
-    # explicit budget with enough cleanup headroom for the test timeout.
-    timeout-minutes: 45
+    # The state suite uses a migrated template database and clones a clean
+    # database per fixture, so the test binary has a strict 20-minute budget.
+    # Leave a small amount of job-level headroom for coverage and upload.
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write
@@ -517,6 +517,7 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+      FAAS_PGTEST_TEMPLATE_DATABASE: "1"
     steps:
       - name: pre-pull postgres image
         run: |
@@ -545,7 +546,7 @@ jobs:
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '${{ matrix.package_pattern }}')
           test -n "$PKGS"
           printf '%s\n' "$PKGS"
-          go test -race -count=1 -p 4 -timeout=40m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
+          go test -race -count=1 -p 4 -timeout=20m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
         if: ${{ matrix.state_coverage }}

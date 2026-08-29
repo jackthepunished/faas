@@ -34,7 +34,7 @@ type pgSweepDeps struct {
 
 func pgSweepStore(t *testing.T) pgSweepDeps {
 	t.Helper()
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

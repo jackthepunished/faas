@@ -87,7 +87,7 @@ func TestPgStore_InstancesStateCheck_SetMatchesMachineStates(t *testing.T) {
 	// stand up a state.PgStore we don't need; the redundant
 	// instance allocation isn't free, and the test is purely
 	// about the CHECK definition, not the Store surface.
-	pool := pgtest.Open(t)
+	pool := pgtest.OpenMigrated(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
