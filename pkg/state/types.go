@@ -2604,6 +2604,12 @@ type Invocation struct {
 	// completed_at; only rows whose override has actually elapsed
 	// are deleted.
 	ResultRetentionUntil *time.Time `json:"result_retention_until,omitempty"`
+	// LastReplayedAt (ADR-134 PR-C) is when this row was most
+	// recently replayed from a dead_letter parent via
+	// POST /v1/apps/{slug}/queues/dead_letter/{id}/replay. NULL
+	// until the first replay. Read by the dashboard's
+	// "DLQ replay history" view.
+	LastReplayedAt *time.Time `json:"last_replayed_at,omitempty"`
 }
 
 // RetryPolicy unmarshals RetryPolicyJSON into a pkg/dispatch.RetryPolicy.

@@ -9660,7 +9660,8 @@ const invocationSelectCols = `id, app_id, account_id, source, state, method, pat
        payload, headers, due_at, scheduled_at, cron_id, ack_url,
        result, lease_expires_at, received_at, completed_at, attempts,
        last_error, created_at, instance_id, outcome,
-       deadline_at, retry_policy, result_retention_until`
+       deadline_at, retry_policy, result_retention_until,
+       last_replayed_at`
 
 func (s *PgStore) EnqueueInvocation(ctx context.Context, inv Invocation) (Invocation, error) {
 	payload, err := jsonOrEmpty(inv.Payload)
@@ -10390,7 +10391,7 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	var cronID, ackURL, lastErr, instanceID *string
 	var payload, headers, result []byte
 	var outcome *string
-	var deadlineAt, retentionUntil *time.Time
+	var deadlineAt, retentionUntil, lastReplayedAt *time.Time
 	var retryPolicy []byte
 	if err := scan(
 		&inv.ID, &inv.AppID, &inv.AccountID, &source, &state, &inv.Method, &inv.Path,
@@ -10398,6 +10399,7 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 		&result, &leaseExpires, &receivedAt, &completedAt, &inv.Attempts,
 		&lastErr, &inv.CreatedAt, &instanceID, &outcome,
 		&deadlineAt, &retryPolicy, &retentionUntil,
+		&lastReplayedAt,
 	); err != nil {
 		return Invocation{}, err
 	}
@@ -10449,6 +10451,9 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	}
 	if retentionUntil != nil {
 		inv.ResultRetentionUntil = retentionUntil
+	}
+	if lastReplayedAt != nil {
+		inv.LastReplayedAt = lastReplayedAt
 	}
 	return inv, nil
 }
@@ -20417,6 +20422,50 @@ func (s *PgStore) RetryTriggerRecordByOperator(ctx context.Context, id string) e
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RetryQueueDeadLetter (ADR-134 PR-C) is the queue counterpart to
+// RetryTriggerRecordByOperator: resets an invocations row in
+// state='dead_letter' back to 'pending' with attempts=0,
+// last_error cleared, due_at=NOW(), outcome cleared. Stamps
+// last_replayed_at = NOW() so the dashboard can render the
+// replay history. Scoped to (id, app_id's account) so a customer
+// cannot replay a row they do not own — the caller passes the
+// accountID resolved from the URL slug.
+//
+// Returns ErrNotFound when the row is missing, not in
+// state='dead_letter', or owned by a different account. The
+// dashboard's "Replay" button reads 404 as "no longer
+// replayable".
+//
+// Idempotent: a redelivered replay that finds the row already
+// back in 'pending' returns ErrNotFound (the WHERE filters on
+// state='dead_letter'). The dashboard renders this as
+// "already replayed".
+func (s *PgStore) RetryQueueDeadLetter(ctx context.Context, accountID, invocationID string) (Invocation, error) {
+	row := s.pool.QueryRow(ctx, `
+		update invocations
+		   set state = 'pending',
+		       attempts = 0,
+		       last_error = null,
+		       outcome = null,
+		       due_at = now(),
+		       lease_expires_at = null,
+		       instance_id = null,
+		       last_replayed_at = now(),
+		       completed_at = null
+		 where id = $1
+		   and account_id = $2
+		   and state = 'dead_letter'
+		 returning `+invocationSelectCols, invocationID, accountID)
+	inv, err := scanInvocation(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Invocation{}, ErrNotFound
+		}
+		return Invocation{}, fmt.Errorf("state: retry queue dead_letter %s: %w", invocationID, err)
+	}
+	return inv, nil
 }
 
 // DropTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)

@@ -16335,3 +16335,34 @@ func (m *MemStore) ForceDeadlineBreachedInvocations(_ context.Context, ids []str
 	}
 	return n, nil
 }
+
+// RetryQueueDeadLetter (ADR-134 PR-C) is the MemStore mirror of
+// PgStore.RetryQueueDeadLetter. Resets a row in state='dead_letter'
+// back to 'pending' with attempts=0, last_error cleared,
+// last_replayed_at stamped. Scoped to the caller's accountID.
+func (m *MemStore) RetryQueueDeadLetter(_ context.Context, accountID, invocationID string) (Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inv, ok := m.invocations[invocationID]
+	if !ok {
+		return Invocation{}, ErrNotFound
+	}
+	if inv.AccountID != accountID {
+		return Invocation{}, ErrNotFound
+	}
+	if inv.State != InvocationDeadLetter {
+		return Invocation{}, ErrNotFound
+	}
+	inv.State = InvocationPending
+	inv.Attempts = 0
+	inv.LastError = ""
+	inv.Outcome = nil
+	inv.DueAt = time.Now()
+	inv.LeaseExpiresAt = nil
+	inv.InstanceID = ""
+	now := time.Now()
+	inv.LastReplayedAt = &now
+	inv.CompletedAt = nil
+	m.invocations[invocationID] = inv
+	return inv, nil
+}

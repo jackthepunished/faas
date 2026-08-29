@@ -3338,6 +3338,13 @@ type Store interface {
 	// to dead_letter with outcome='deadline'. Decrements the
 	// per-account counter for each transitioned row.
 	ForceDeadlineBreachedInvocations(ctx context.Context, ids []string) (int, error)
+	// RetryQueueDeadLetter (ADR-134 PR-C) resets an invocations
+	// row in state='dead_letter' back to 'pending' with
+	// attempts=0, stamping last_replayed_at=NOW(). Scoped to the
+	// caller-supplied accountID. Returns ErrNotFound when the
+	// row is missing, not dead_letter, or owned by another
+	// account.
+	RetryQueueDeadLetter(ctx context.Context, accountID, invocationID string) (Invocation, error)
 	// CompleteInvocation finalises a dispatched row with an optional result
 	// envelope (response status + body bytes for sync invoke; nil for the
 	// other sources). State → completed.

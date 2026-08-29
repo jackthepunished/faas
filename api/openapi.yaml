@@ -7450,8 +7450,8 @@ paths:
         The drain transitions a row here once it has failed
         `MaxQueueAttempts` times for the app's plan (Hobby 3, Pro 10,
         Scale 25). NO lease is acquired and no row is mutated. Replaying
-        a dead-letter row is out of scope for this endpoint — the
-        customer re-sends via `queues/send`.
+        a dead-letter row is out of scope for this endpoint — see
+        `POST /v1/apps/{slug}/queues/dead_letter/{id}/replay`.
       x-faas-queue-leases: false
       parameters:
         - $ref: '#/components/parameters/Slug'
@@ -7463,6 +7463,41 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueueDeadLetterResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/dead_letter/{id}/replay:
+    post:
+      tags: [queues]
+      operationId: queueDeadLetterReplay
+      summary: Reset a dead-letter queue row back to pending.
+      description: |
+        ADR-134 PR-C. Resets the row's `state` to `pending` with
+        `attempts=0`, `last_error=null`, `due_at=now()`,
+        `last_replayed_at=now()`. Distinct from
+        `POST /v1/invocations/{id}/replay`, which enqueues a NEW row
+        tagged Source=InvocationReplay. This endpoint mutates the
+        existing row in place so the dashboard's replay history view
+        tracks the chain on a single row id.
+
+        Idempotent: a second POST after the first has succeeded
+        finds the row in 'pending' and returns 404. The
+        Idempotency-Key middleware (issued automatically by the SDK)
+        covers double-POST across network retries.
+      x-faas-queue-leases: false
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+      responses:
+        '202':
+          description: Replay accepted; row is back to pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AsyncInvokeResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -18240,6 +18275,8 @@ components:
           { type: [object, "null"], additionalProperties: true, description: "ADR-134 PR-B. Optional per-row retry curve override; decodes into dispatch.RetryPolicy (max_attempts, base_seconds, max_seconds, jitter_seconds)." }
         result_retention_until:
           { type: [string, "null"], format: date-time, description: "ADR-134 PR-B. Optional explicit retention horizon. NULL means 'use plan default' (Limits.MaxAsyncResultRetentionSeconds)." }
+        last_replayed_at:
+          { type: [string, "null"], format: date-time, description: "ADR-134 PR-C. When this row was most recently replayed from dead_letter via POST /v1/apps/{slug}/queues/dead_letter/{id}/replay. NULL until first replay." }
 
     ListInvocationsResponse:
       description: "Page of invocations; ordered by created_at DESC, id DESC. Pass the LAST id of the returned slice as the next `?before=` to load older."

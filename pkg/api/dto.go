@@ -3235,6 +3235,11 @@ type Invocation struct {
 	// retention horizon. NULL means "use the plan default"
 	// (Limits.MaxAsyncResultRetentionSeconds).
 	ResultRetentionUntil *time.Time `json:"result_retention_until,omitempty"`
+	// LastReplayedAt (ADR-134 PR-C): when this row was most
+	// recently replayed from a dead_letter parent via
+	// POST /v1/apps/{slug}/queues/dead_letter/{id}/replay. NULL
+	// until the first replay.
+	LastReplayedAt *time.Time `json:"last_replayed_at,omitempty"`
 }
 
 // ListInvocationsResponse is the wire shape for GET /v1/invocations.

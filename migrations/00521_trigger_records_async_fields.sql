@@ -1,0 +1,45 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- ADR-134 PR-C: per-row async-job semantics on trigger_records.
+--
+-- Mirrors 00518_invocations_async_fields.sql — three nullable
+-- columns so each trigger_record can carry its own deadline,
+-- retry policy override, and result-retention horizon. The
+-- pkg/sched dispatch_triggers.go drain (the trigger_records
+-- counterpart to pkg/sched/drain.go) already does CAS lease +
+-- retry/deadline via global trigger-level defaults; per-row
+-- overrides flow through dispatch.RetryPolicy /
+-- dispatch.DeadlinePolicy (PR-A's shared contract).
+--
+-- All three columns are NULLABLE and additive — no existing row
+-- is affected, and the trigger_dispatcher path is unchanged
+-- when the caller omits the new fields.
+--
+-- Index:
+--   trigger_records_app_deadline_idx
+--     Used by the deadline-breach reaper. The reaper scans rows
+--     in (pending|claimed|retry) and (deadline_at <= now()), so
+--     the partial index keeps the scan bounded by the rare rows
+--     that carry a deadline.
+--
+-- ResultRetentionUntil: NULL means "use plan default retention".
+--
+ALTER TABLE trigger_records
+  ADD COLUMN deadline_at TIMESTAMPTZ NULL,
+  ADD COLUMN retry_policy JSONB NULL,
+  ADD COLUMN result_retention_until TIMESTAMPTZ NULL;
+
+CREATE INDEX trigger_records_app_deadline_idx
+  ON trigger_records (app_id, deadline_at)
+  WHERE state IN ('pending', 'claimed', 'retry') AND deadline_at IS NOT NULL;
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+DROP INDEX IF EXISTS trigger_records_app_deadline_idx;
+ALTER TABLE trigger_records
+  DROP COLUMN IF EXISTS result_retention_until,
+  DROP COLUMN IF EXISTS retry_policy,
+  DROP COLUMN IF EXISTS deadline_at;
+-- +goose StatementEnd
