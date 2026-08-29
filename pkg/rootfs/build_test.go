@@ -522,6 +522,40 @@ func TestNormalizeFunctionHandler_NodeExportAdapterRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNormalizeFunctionHandler_NodeCommonJSAdapterRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not installed")
+	}
+	for _, handlerPath := range []string{"/app/node22.js", "/app/node24.js"} {
+		t.Run(filepath.Base(handlerPath), func(t *testing.T) {
+			staging := t.TempDir()
+			appDir := filepath.Join(staging, "app")
+			if err := os.MkdirAll(appDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(appDir, "package.json"), []byte(`{"type":"commonjs"}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(appDir, "handler.js"), []byte(`exports.handler = async (event) => ({ statusCode: 202, body: JSON.stringify(event.body) });`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := NormalizeFunctionHandler(staging, handlerPath); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("node", filepath.Join(appDir, filepath.Base(handlerPath)))
+			cmd.Dir = appDir
+			cmd.Stdin = strings.NewReader(`{"method":"POST","path":"/e2e","headers":{},"query":"","body_b64":"eyJ4Ijo3fQ=="}`)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("node CommonJS adapter: %v", err)
+			}
+			if !strings.Contains(string(out), `"status":202`) || !strings.Contains(string(out), `"body_b64":"eyJ4Ijo3fQ=="`) {
+				t.Fatalf("unexpected CommonJS adapter response: %s", out)
+			}
+		})
+	}
+}
+
 func TestNormalizeFunctionHandler_PythonExportAdapter(t *testing.T) {
 	staging := t.TempDir()
 	source := filepath.Join(staging, "app", "handler.py")
@@ -544,6 +578,46 @@ func TestNormalizeFunctionHandler_PythonExportAdapter(t *testing.T) {
 	}
 	if !bytes.Contains(gotAdapter, []byte("faas-handler.py")) || !bytes.Contains(gotAdapter, []byte("body_b64")) {
 		t.Fatalf("handler.py is not a function adapter: %q", gotAdapter)
+	}
+}
+
+func TestNormalizeFunctionHandler_PythonAdapterRoundTrip(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not installed")
+	}
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const handler = `import json
+print("module log")
+
+async def handler(event, ctx):
+    print("handler log")
+    return {"statusCode": 203, "body": json.dumps(event["body"])}
+`
+	if err := os.WriteFile(filepath.Join(appDir, "handler.py"), []byte(handler), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/handler.py"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(python, filepath.Join(appDir, "handler.py"))
+	cmd.Dir = appDir
+	cmd.Stdin = strings.NewReader(`{"method":"POST","path":"/e2e","headers":{},"query":"","body_b64":"eyJ4Ijo3fQ=="}`)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("python adapter: %v; stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(string(out), `"status": 203`) || !strings.Contains(string(out), `"body_b64": "eyJ4IjogN30="`) {
+		t.Fatalf("unexpected Python adapter response: %s", out)
+	}
+	if !strings.Contains(stderr.String(), "module log") || !strings.Contains(stderr.String(), "handler log") {
+		t.Fatalf("customer logs did not reach stderr: %s", stderr.String())
 	}
 }
 
