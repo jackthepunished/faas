@@ -22,11 +22,11 @@ import (
 
 func TestParseGitRemoteURL(t *testing.T) {
 	cases := []struct {
-		name         string
-		input        string
-		wantOwner    string
-		wantRepo     string
-		wantErr      bool
+		name          string
+		input         string
+		wantOwner     string
+		wantRepo      string
+		wantErr       bool
 		wantSoftEmpty bool // non-GitHub URL → ("", "", nil) — caller falls through
 	}{
 		// Accepted GitHub forms.

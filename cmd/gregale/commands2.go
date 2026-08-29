@@ -684,16 +684,16 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 // Issue #1182 / pre-existing soft-#560 behaviour:
 //   - CreateApp → 200/201 → nil
 //   - CreateApp → 409 → GetApp(slug):
-//     - 200 → the slug exists in this account → mirror --require-authn /
-//       --app-protocol via UpdateApp (preserves the existing #560 PATCH
-//       semantics), return nil
-//     - 404 → apid's loadAppAndPreflight returns a silent 404 for IDOR
-//       (the slug is owned by another account), so we cannot tell apart
-//       "different account" from "race against a peer that just
-//       deleted". The hybrid probe HARD-FAILS here rather than silently
-//       falling through to DeployTarball — DeployTarball would otherwise
-//       404 at apid with the less informative "no such app" message, and
-//       the customer would never learn that the slug is taken globally.
+//   - 200 → the slug exists in this account → mirror --require-authn /
+//     --app-protocol via UpdateApp (preserves the existing #560 PATCH
+//     semantics), return nil
+//   - 404 → apid's loadAppAndPreflight returns a silent 404 for IDOR
+//     (the slug is owned by another account), so we cannot tell apart
+//     "different account" from "race against a peer that just
+//     deleted". The hybrid probe HARD-FAILS here rather than silently
+//     falling through to DeployTarball — DeployTarball would otherwise
+//     404 at apid with the less informative "no such app" message, and
+//     the customer would never learn that the slug is taken globally.
 //   - CreateApp → non-409 error → returned unwrapped; the caller's
 //     printErr prefix is the single user-facing message. Wrapping the
 //     APIError here would produce a confusing double-prefix like
@@ -1423,54 +1423,54 @@ func cmdDeployTarball(args []string) int {
 			}
 			switch detected {
 			case shapeFunction:
-			// An explicit --runtime / --handler on the CLI wins over
-			// the inferred value (customer may be overriding the
-			// default-extension→runtime map). The helper already
-			// printed "Detected: function, runtime=<rt>, handler=<h>"
-			// using the inferred values; the wire uses whatever is
-			// in *runtime / *handler here.
-			if *runtime == "" {
-				*runtime = rt
-			}
-			if *handler == "" {
-				*handler = hnd
-			}
-			// Pack the cwd so the multipart upload has a tarball —
-			// the function convention needs the file on the wire for
-			// imaged to stage it. The secret-scan pass runs before the
-			// tarball is sealed so a Stripe key committed to
-			// .env.production by accident is dropped before it leaves
-			// the workstation; --secret-scan=off disables it.
-			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
-			if scanErr != nil {
-				return printErr("Secret scan failed", scanErr)
-			}
-			path, _, n, err := autoPackCwd(cwd, planCapMB, overrides)
-			if err != nil {
-				return printErr("Could not pack current directory", err)
-			}
-			defer func() { _ = os.Remove(path) }()
-			renderSecretScanWarnings(scanFindings, osStderr)
-			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
-			*tarball = path
-			resolvedShape = shapeFunction
-		case shapeApp:
-			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
-			if scanErr != nil {
-				return printErr("Secret scan failed", scanErr)
-			}
-			path, fw, n, err := autoPackCwd(cwd, planCapMB, overrides)
-			if err != nil {
-				return printErr("Could not pack current directory", err)
-			}
-			defer func() { _ = os.Remove(path) }()
-			renderSecretScanWarnings(scanFindings, osStderr)
-			if fw == fwDocker {
-				*dockerfile = true
-			}
-			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
-			*tarball = path
-			resolvedShape = shapeApp
+				// An explicit --runtime / --handler on the CLI wins over
+				// the inferred value (customer may be overriding the
+				// default-extension→runtime map). The helper already
+				// printed "Detected: function, runtime=<rt>, handler=<h>"
+				// using the inferred values; the wire uses whatever is
+				// in *runtime / *handler here.
+				if *runtime == "" {
+					*runtime = rt
+				}
+				if *handler == "" {
+					*handler = hnd
+				}
+				// Pack the cwd so the multipart upload has a tarball —
+				// the function convention needs the file on the wire for
+				// imaged to stage it. The secret-scan pass runs before the
+				// tarball is sealed so a Stripe key committed to
+				// .env.production by accident is dropped before it leaves
+				// the workstation; --secret-scan=off disables it.
+				overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+				if scanErr != nil {
+					return printErr("Secret scan failed", scanErr)
+				}
+				path, _, n, err := autoPackCwd(cwd, planCapMB, overrides)
+				if err != nil {
+					return printErr("Could not pack current directory", err)
+				}
+				defer func() { _ = os.Remove(path) }()
+				renderSecretScanWarnings(scanFindings, osStderr)
+				PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+				*tarball = path
+				resolvedShape = shapeFunction
+			case shapeApp:
+				overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+				if scanErr != nil {
+					return printErr("Secret scan failed", scanErr)
+				}
+				path, fw, n, err := autoPackCwd(cwd, planCapMB, overrides)
+				if err != nil {
+					return printErr("Could not pack current directory", err)
+				}
+				defer func() { _ = os.Remove(path) }()
+				renderSecretScanWarnings(scanFindings, osStderr)
+				if fw == fwDocker {
+					*dockerfile = true
+				}
+				PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+				*tarball = path
+				resolvedShape = shapeApp
 			}
 		}
 	}
