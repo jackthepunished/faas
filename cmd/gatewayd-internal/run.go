@@ -2579,6 +2579,26 @@ func (unwiredBackend) Admit(context.Context, string, string, string, string, int
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 
+// LookupMirrorRules (PR-A3 / issue #72 / ADR-124) is a no-op on
+// the unwired (test/dev fallback) backend — the runtime surface
+// is the gateway's PGBackend; the unwired backend never dispatches
+// mirror rules regardless of the customer's POST. Keeping the
+// method satisfies the widened Backend interface so test builds
+// wire this stub as Backend with zero changes elsewhere.
+func (unwiredBackend) LookupMirrorRules(context.Context, string) ([]gateway.MirrorRuleRow, bool) {
+	return nil, false
+}
+
+// ScheduleMirror (PR-A3 / issue #72 / ADR-124) — the unwired
+// (test/dev fallback) backend doesn't dispatch mirror rules; the
+// stub satisfies the widened Backend interface and is otherwise a
+// no-op. Production wires PGBackend.ScheduleMirror through
+// cmd/gatewayd-internal/backend.go where resolveSched looks up the
+// per-app schedd client.
+func (unwiredBackend) ScheduleMirror(context.Context, string, string, string) (string, string, error) {
+	return "", "", nil
+}
+
 // envOrGateway returns the value of env key, or fallback when unset/empty.
 // Named with the daemon prefix to avoid a collision if two daemons are ever
 // linked into the same test binary.

@@ -109,6 +109,13 @@ func (f *fakeSinkSchedAPI) Wake(context.Context, string, string, string, string)
 func (f *fakeSinkSchedAPI) AdmitInstance(context.Context, string, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
+
+// AdmitMirrorInstance (PR-A3 / issue #72 / ADR-124) — vmmd's
+// capacity publisher test doesn't exercise the mirror hot path;
+// the stub keeps the SchedAPI interface satisfied.
+func (f *fakeSinkSchedAPI) AdmitMirrorInstance(context.Context, string, string, string) (sched.WakeResult, error) {
+	return sched.WakeResult{}, nil
+}
 func (f *fakeSinkSchedAPI) EnsureWake(context.Context, string, string) (sched.CoordOutcome, error) {
 	return sched.CoordOutcome{}, nil
 }

@@ -496,6 +496,28 @@ type Backend interface {
 	// future caller surfaces (synth handler, replay worker) can
 	// pass a distinct closed-enum value without breaking the wire.
 	Admit(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	// LookupMirrorRules (issue #72 / ADR-125 PR-A3) returns the
+	// enabled mirror rules cached for appID, or (nil, false) on a
+	// cache miss. The handler treats a miss as "no mirror" — the
+	// mirror never blocks the customer response; the next
+	// pg_notify for kind="mirror" will populate the cache. Returns
+	// the gateway-local projection (MirrorRuleRow), not the state
+	// type, so the gateway package keeps its zero-pkg/state import
+	// discipline (mirrors deploymentWeightsStore's posture).
+	LookupMirrorRules(ctx context.Context, appID string) ([]MirrorRuleRow, bool)
+	// ScheduleMirror (issue #72 / ADR-124 / ADR-125 PR-A3) is the
+	// mirror-VM admission sibling to Admit. Stamps mode='mirror'
+	// on the new instances row (PR-A1's 00385) and is gated by
+	// the per-rule concurrent-mirror-VM cap (default 5,
+	// sched.MirrorMaxConcurrentPerRule). Returns the mirror
+	// wakeID on success, or an error wrapping
+	// sched.ErrMirrorSlotAtCapacity on cap-at-max (the dispatch
+	// goroutine maps that to ledger result=cap_at_max +
+	// gateway_mirror_dispatched_total{result="cap_at_max"}).
+	// Real failures (RAM headroom, chooser, store) come back as
+	// *api.Problem-shaped errors — the dispatch goroutine logs +
+	// drops those without writing a misleading ledger row.
+	ScheduleMirror(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -532,6 +554,38 @@ type Handler struct {
 	gate           *WakeGate
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
+	// mirrorRoundTripper (issue #72 / ADR-124 PR-A3) is the
+	// per-request HTTP forwarder the dispatch goroutine uses
+	// to reach the mirror VM. Defaults to
+	// NewDefaultMirrorRoundTripper(nil) inside dispatchMirror so
+	// a nil field is safe; tests inject a stub via
+	// WithMirrorRoundTripper.
+	mirrorRoundTripper MirrorRoundTripper
+	// mirrorSlots (issue #72 / ADR-133 / ADR-125 PR-A3
+	// code-review fix #3) is the per-rule concurrent mirror-VM
+	// cost circuit. Keyed on the mirror-rule UUID (NOT the
+	// deployment — multiple rules can target the same mirror
+	// deployment). Each value is an *atomic.Int64 the dispatch
+	// goroutine increments via tryAcquireMirrorSlot and
+	// decrements via releaseMirrorSlot when the goroutine
+	// completes (the slot reflects "VMs in flight" through
+	// round-trip complete, NOT "admit attempts"). sync.Map's
+	// LoadOrStore handles the first-write-under-contention race —
+	// whichever goroutine lands first allocates the *atomic.Int64;
+	// concurrent callers reuse the winner's pointer. The slot
+	// lives on the gateway (not schedd) so the cap covers the
+	// full lifecycle from admit to round-trip complete; the
+	// schedd's AdmitMirrorInstance just stamps mode='mirror'
+	// on the new row.
+	mirrorSlots sync.Map
+	// MirrorMaxConcurrentPerRule (issue #72 / ADR-133 / ADR-125
+	// PR-A3) is the per-rule concurrent-mirror-VM cap. Loaded
+	// from api.MirrorMaxConcurrentPerRule in NewHandlerWith so
+	// the gate defaults match the schedd-engine removal of
+	// mirrorSlots. Operators can lift the cap via a constant
+	// edit + redeploy; ADR-127-style alert covers anomalous
+	// sustained cap-at-max saturation.
+	MirrorMaxConcurrentPerRule int64
 	// log may be nil (defaults to slog.Default()).
 	log *slog.Logger
 	// appsSuffix is the configured public suffix (e.g. ".gregale.dev").
@@ -849,6 +903,13 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		gate:                 NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
 		metrics:              m,
 		log:                  log,
+		// mirrorSlots is sync.Map (zero value ready); the cap is
+		// loaded from api.MirrorMaxConcurrentPerRule (default 5)
+		// so the per-rule VM cost circuit matches the MirrorMaxLifetimeSeconds
+		// envelope. PR-A3 code-review fix #3 moved ownership from
+		// schedd's Engine to here so the cap reflects "VMs in
+		// flight" (admit → round-trip complete), not "admit attempts".
+		MirrorMaxConcurrentPerRule: api.MirrorMaxConcurrentPerRule,
 	}
 	// piApps is a value-typed sync.Map wrapper; its zero value is valid
 	// and no init is required (avoiding a lazy-init write that would
@@ -1178,6 +1239,17 @@ func (h *Handler) WithPublicAuth(cache *PublicAuthCache, unsealer PublicAuthUnse
 // other Handler.With*).
 func (h *Handler) WithResponseCache(cache *ResponseCache) *Handler {
 	h.responseCache = cache
+	return h
+}
+
+// WithMirrorRoundTripper (issue #72 / ADR-124 PR-A3) wires the
+// HTTP forwarder the dispatch goroutine uses to reach the mirror
+// VM. nil is safe (dispatchMirror defaults to
+// NewDefaultMirrorRoundTripper(nil) on a nil field); tests inject
+// a stub to assert on the request shape without standing up a
+// real upstream. Fluent setter, mirrors WithResponseCache.
+func (h *Handler) WithMirrorRoundTripper(rt MirrorRoundTripper) *Handler {
+	h.mirrorRoundTripper = rt
 	return h
 }
 
@@ -5105,6 +5177,59 @@ haveApp:
 	}
 	target := pick.Target
 
+	// Mirror fan-out (issue #72 / ADR-124 / ADR-125 PR-A3). After
+	// the customer request has been routed, fan out one goroutine
+	// per enabled rule (closed set: bounded by Limits.MirrorTargetsPerApp ≤
+	// 3 per app). The dispatch goroutine is fire-and-forget — it
+	// derives its own detached ctx (ADR-098 pattern, mirror of
+	// pkg/gateway/gate.go:172-205) so the customer's request
+	// cancellation never reaches the mirror. A wedged mirror VM is
+	// bounded by MirrorMaxLifetimeSeconds=5. Cache miss returns
+	// (nil, false) and is treated as "no mirror", not an error —
+	// the notifier-driven RefreshMirrorRules populates the cache
+	// asynchronously. The lookup itself does NOT block on the
+	// store read.
+	//
+	// Source snapshot (code-review PR-A3 #1, #2): the dispatch
+	// goroutine needs the source status + body to drive
+	// ClassifyResult AND to replay the body against the mirror.
+	// The proxy consumes r.Body downstream and the status is only
+	// known after the proxy commits a response header, so the
+	// handler captures both BEFORE fanout:
+	//
+	//   - sourceBody: io.ReadAll(r.Body) capped at MirrorBodySnapshotCap
+	//     bytes (default 64 KiB — more than enough for status_diff
+	//     detection; larger bodies still go to the source VM
+	//     unbuffered).
+	//   - r.Body is restored to a fresh bytes.Reader so the proxy
+	//     downstream sees the full body unchanged.
+	//   - sourceStatus: read from `rec` after the proxy commits
+	//     WriteHeader. The fanout schedules BEFORE the proxy runs,
+	//     so the goroutine reads rec.status via the shared
+	//     statusRecorder pointer. nil body when the capture
+	//     failed (oversized body); statusDiff defaults to true so
+	//     the metric surfaces "we don't know what the source
+	//     did" rather than a silent no-diff.
+	if rules, ok := h.backend.LookupMirrorRules(r.Context(), app.ID); ok { //nolint:contextcheck // request ctx at handler boundary.
+		sourceBody, restoreBody := snapshotSourceBody(r)
+		defer restoreBody() // safety net in case the goroutine didn't already take ownership
+		// Install the cross-goroutine status sink BEFORE the proxy
+		// commits its WriteHeader, so the dispatchMirror goroutine
+		// reads the committed status via rec.captureStatusForMirror()
+		// once its round-trip completes (proxy is local + fast,
+		// round-trip is to a cold-boot VM, so the goroutine's read
+		// lands after the proxy's store in practice — the atomic
+		// makes the handoff explicit anyway).
+		rec.mirrorStatusSink = &atomic.Int32{}
+		for _, rule := range rules {
+			rule := rule
+			if !shouldMirrorRequest(rule.Percent, pick.Picked) {
+				continue
+			}
+			go h.dispatchMirror(r.Context(), target.InstanceID, &target, rule, snapshotRequestForMirror(r), sourceBody, rec)
+		}
+	}
+
 	// Stamp the per-instance identity on the request BEFORE proxying so
 	// the per-node vmmd forwarder (issue #98 / ADR-028) can attribute
 	// the HTTP bytes to this exact instance. Overwrites any inbound
@@ -6065,6 +6190,44 @@ type statusRecorder struct {
 	// recordEgress call (the per-flush deltas already account for
 	// everything on the streaming path).
 	streaming bool
+
+	// mirrorStatusSink (issue #72 / ADR-133 / ADR-125 PR-A3
+	// code-review fix) is the cross-goroutine channel the
+	// dispatchMirror goroutine reads to learn the source
+	// response's HTTP status. nil = "no mirror on this request"
+	// (the dispatcher never scheduled a mirror, so the field
+	// stays unset — ClassifyResult falls back to status=0 which
+	// surfaces statusDiff=true rather than a silent no-diff).
+	//
+	// Handle installs the *atomic.Int32 pointer on a mirror
+	// fanout path; the proxy's WriteHeader Stores the committed
+	// status code; the dispatch goroutine Loads it after its
+	// round-trip completes (by which time the proxy has
+	// committed the response header — the proxy is local, the
+	// round-trip is to a cold-boot VM, so the gateway's local
+	// WriteHeader fires microseconds before the goroutine reads).
+	//
+	// atomic.Int32 (not int) because the writer (proxy /
+	// WriteHeader) runs in a different goroutine than the
+	// reader (dispatchMirror) — the Go memory model would flag a
+	// plain int read/write as a race.
+	mirrorStatusSink *atomic.Int32
+}
+
+// captureStatusForMirror (issue #72 / ADR-133 / ADR-125 PR-A3)
+// returns the source response's HTTP status as committed by the
+// proxy's WriteHeader. Returns 0 if no mirror was scheduled for
+// this request (mirrorStatusSink is nil), which the dispatch
+// goroutine treats as "unknown source status" — ClassifyResult
+// emits statusDiff=true to surface the "we don't know what the
+// source did" shape rather than a silent no-diff.
+//
+// Safe to call from any goroutine. nil-receiver safe.
+func (s *statusRecorder) captureStatusForMirror() int {
+	if s == nil || s.mirrorStatusSink == nil {
+		return 0
+	}
+	return int(s.mirrorStatusSink.Load())
 }
 
 // installFlushHook arms the recorder for streaming. After install,
@@ -6089,6 +6252,15 @@ func (s *statusRecorder) WriteHeader(code int) {
 	if !s.wroteHeader {
 		s.status = code
 		s.wroteHeader = true
+		// Issue #72 / ADR-133 / ADR-125 PR-A3: if Handle armed a
+		// mirrorStatusSink for this request, store the committed
+		// status so the async dispatchMirror goroutine can read
+		// it (via captureStatusForMirror) and drive
+		// ClassifyResult's statusDiff branch correctly. nil
+		// sink = no mirror on this request, no-op.
+		if s.mirrorStatusSink != nil {
+			s.mirrorStatusSink.Store(int32(code))
+		}
 		// Issue #471: capture the upstream Content-Type at header
 		// commit time so the post-proxy site can detect a buffered
 		// SSE response for the deprecation log. Header() returns the

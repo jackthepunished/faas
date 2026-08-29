@@ -1423,8 +1423,79 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 	if deploymentID == "" {
 		return e.admitAndDispatch(ctx, appID, trigger, true)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
 }
+
+// AdmitMirrorInstance (issue #72 / ADR-133 / ADR-125 PR-A3) is
+// the mirror-admission entry point the gateway's per-request
+// dispatch goroutine calls after the source deployment's
+// response has been returned to the customer. The flow:
+//
+//  1. admitAndDispatchForDeployment — the same wake path the
+//     customer-facing trigger uses, with mode='mirror' stamped
+//     on the new instances row via the helper's mode parameter
+//     (PR-A3 code-review fix #6 — single INSERT, no INSERT+UPDATE
+//     race window). The mode='mirror' flag is what tells
+//     pkg/meter/sampler.go and pkg/sched/reaper.go to skip the
+//     row: the sampler never bills the customer for the shadow
+//     VM (skip on mode='mirror'), and the reaper never
+//     idles-reaps because mirror VMs self-park on request
+//     completion (skip on mode='mirror' — the reaper expects a
+//     normal idle park, not the mirror goroutine's explicit
+//     ParkInstance).
+//
+//  2. The per-rule concurrent-mirror-VM cap (PR-A3 code-review
+//     fix #3) lives on the GATEWAY Handler, not here — see
+//     pkg/gateway/handler.go::mirrorSlots + tryAcquireMirrorSlot.
+//     The cap reflects "VMs in flight" through round-trip
+//     complete (the goroutine releases on its own defer), not
+//     "admit attempts". Holding the slot here would release
+//     microseconds after the wake command is sent, well before
+//     the mirror VM is done serving.
+//
+// scope: empty for A3 (mirror rules don't carry a preview scope
+// — the source deployment's scope flows through the customer
+// wake, not the mirror). trail: empty for A3 (the audit emit
+// shape for mirror is a follow-on; A3 logs the dispatch via the
+// gateway's structured-log call).
+//
+// Errors:
+//
+//   - any error from admitAndDispatchForDeployment — propagated
+//     from the wake path (RAM headroom, store error, etc.).
+//     The gateway wraps the relevant cap-at-max branch into
+//     sched.ErrMirrorSlotAtCapacity when the slot is exhausted.
+func (e *Engine) AdmitMirrorInstance(ctx context.Context, appID, mirrorRuleID, mirrorDeploymentID string) (WakeResult, error) {
+	// PR-A3 code-review fix #3 — the per-rule concurrent-mirror-VM
+	// cap lives on the GATEWAY Handler (mirrorSlots + tryAcquireMirrorSlot).
+	// The cap reflects "VMs in flight" through round-trip complete
+	// (the goroutine releases on its own defer), not "admit attempts".
+	// Holding the slot here would release microseconds after the wake
+	// command is sent, well before the mirror VM is done serving.
+	_ = mirrorRuleID
+	// PR-A3 code-review fix #6 — single INSERT with mode='mirror'.
+	// admitAndDispatchForDeployment's mode parameter is threaded
+	// straight into CreateInstanceWithMode, so the row is created
+	// in one shot instead of INSERT mode='normal' then UPDATE to
+	// mode='mirror' (the latter had a race window readable by
+	// sampler / reaper between INSERT and UPDATE).
+	return e.admitAndDispatchForDeployment(ctx, appID, mirrorDeploymentID, string(state.InstanceModeMirror), false)
+}
+
+// ErrMirrorSlotAtCapacity (issue #72 / ADR-133 / ADR-125 PR-A3) is the
+// sentinel the gateway's dispatchMirror goroutine returns when
+// the per-rule cap is reached. As of PR-A3 code-review fix #3,
+// the slot lives on the GATEWAY Handler (mirrorSlots +
+// tryAcquireMirrorSlot), not on this engine — schedd just stamps
+// mode='mirror' on the new instances row. The gateway wraps this
+// sentinel via fmt.Errorf("%w", sched.ErrMirrorSlotAtCapacity)
+// when its per-rule counter is at cap. The dispatch goroutine
+// translates this to a ledger row with status_diff=true + metric
+// gateway_mirror_dispatched_total{result="cap_at_max"} and
+// otherwise drops the request on the floor. NOT a real failure —
+// the customer's source response was already returned; mirror
+// is best-effort by design.
+var ErrMirrorSlotAtCapacity = errors.New("sched: mirror slot at capacity")
 
 // AdmitInstanceForDeployment is the floor-trigger entry point that
 // admits a specific deployment (issue #557 closure / ADR-074).
@@ -1458,7 +1529,7 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 		// the trigger is captured for API symmetry but not consumed.
 		return e.AdmitInstance(ctx, appID, "", scope, trigger)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
 }
 
 // admitAndDispatchForDeployment mirrors admitAndDispatch but threads
@@ -1486,7 +1557,7 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment path through the gate (which would require either
 // collapsing the two cap-enforcement layers or duplicating the
 // ledger write).
-func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
+func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID, mode string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
 	app, acct, limits, _, err := e.resolveApp(ctx, appID)
@@ -1539,7 +1610,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	}
 	wakeID := wakeUUID.String()
 
-	ins, err := e.createInstanceWithWakeRetry(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID)
+	ins, err := e.store.CreateInstanceWithMode(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID, mode)
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
@@ -1864,7 +1935,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 			WrittenAt: time.Now(),
 		})
 	}
-	ins, err := e.createInstanceWithWakeRetry(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID)
+	ins, err := e.store.CreateInstanceWithMode(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID, string(state.InstanceModeNormal))
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: create instance: %w", err)
@@ -3964,7 +4035,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 			"app", appID, "err", err)
 	}
 	primeWakeID := primeWakeUUID.String()
-	ins, err := e.createInstanceWithWakeRetry(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, primeWakeID)
+	ins, err := e.store.CreateInstanceWithMode(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, primeWakeID, string(state.InstanceModeNormal))
 	if err != nil {
 		return fmt.Errorf("sched: prime: create instance: %w", err)
 	}

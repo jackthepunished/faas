@@ -87,6 +87,22 @@ func (b *wakefanoutBackend) Admit(_ context.Context, _, deploymentID, _, _ strin
 	return "fake-wake-id", gateway.WakeMethodColdBoot, false, nil
 }
 
+// LookupMirrorRules (issue #72 / ADR-125 PR-A3) is the no-op
+// stub that satisfies the widened Backend interface. The
+// wake-fan-out tests don't exercise the mirror dispatch path
+// (commit 3 wires that into pkg/gateway/handler.go); the stub
+// preserves pre-A3 behaviour bit-for-bit.
+func (b *wakefanoutBackend) LookupMirrorRules(_ context.Context, _ string) ([]gateway.MirrorRuleRow, bool) {
+	return nil, false
+}
+
+// ScheduleMirror (issue #72 / ADR-124 PR-A3) — wake-fanout tests
+// don't exercise the mirror hot path; the stub satisfies the
+// widened Backend interface.
+func (b *wakefanoutBackend) ScheduleMirror(_ context.Context, _, _, _ string) (string, string, error) {
+	return "", "", nil
+}
+
 // TestHandler_WakeFanOut_WakesLandedDeployment (issue #556 /
 // PR-C): end-to-end for the wake-fan-out path. The handler's first
 // Pick returns ColdBucket="dep-B" (the operator-stated 75% bucket,

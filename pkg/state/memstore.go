@@ -7955,6 +7955,43 @@ func (m *MemStore) CreateInstance(_ context.Context, appID, deploymentID, state 
 	return ins, nil
 }
 
+// CreateInstanceWithMode (issue #72 / ADR-125 PR-A3) is the
+// mode-aware overload that stamps the Instance.Mode field at
+// creation time. The MemStore mirrors PgStore's CHECK on the
+// mode column (migrations/00385): empty mode falls back to
+// 'normal' so legacy callers (and test fixtures that don't yet
+// thread mode through) keep bit-for-bit compatibility. Valid
+// non-default values are InstanceModeNormal and InstanceModeMirror;
+// the engine validates the value before reaching here so the
+// MemStore is permissive (no SQLSTATE to translate — the SQL
+// CHECK fires on PgStore; the MemStore's only job is to store
+// what the caller asked for).
+func (m *MemStore) CreateInstanceWithMode(_ context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID, mode string) (Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = string(InstanceModeNormal)
+	}
+	ins := Instance{
+		ID:           newID(),
+		AppID:        appID,
+		DeploymentID: deploymentID,
+		State:        state,
+		RAMMB:        ramMB,
+		NodeID:       nodeID,
+		StartedAt:    time.Now(),
+		Mode:         mode,
+	}
+	if wakeID != "" {
+		ins.WakeID = wakeID
+	} else {
+		ins.WakeID = uuid.NewString()
+	}
+	m.instances[ins.ID] = ins
+	return ins, nil
+}
+
 // StampAppScaleOut (PR-C, issue #462) records the apps
 // LastScaleOutAt timestamp. The MemStore mirrors the PG contract
 // (PgStore.StampAppScaleOut): a single UPDATE; no row existence

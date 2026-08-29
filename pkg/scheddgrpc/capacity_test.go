@@ -77,6 +77,11 @@ func (c *capturingEngine) AdmitInstance(_ context.Context, _, _, _, _ string) (s
 	return sched.WakeResult{}, nil
 }
 
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — capacity tests don't exercise the mirror hot path.
+func (c *capturingEngine) AdmitMirrorInstance(_ context.Context, _, _, _ string) (sched.WakeResult, error) {
+	return sched.WakeResult{}, nil
+}
+
 // EnsureWake (ADR-098): capacity tests don't exercise single-flight, so
 // this delegates straight through to Wake. Returning a zero CoordOutcome
 // with nil Instance triggers the defensive nil-instance branch in the

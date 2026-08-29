@@ -2827,6 +2827,35 @@ const (
 	// spec-amendment-grade change (ADR-125 §Decision).
 	MirrorMaxLifetimeSeconds = 5
 
+	// MirrorBodySnapshotCap (issue #72 / ADR-133 / ADR-125 PR-A3
+	// code-review fix) is the maximum number of source-request body
+	// bytes the gateway captures at the fanout boundary for the
+	// mirror goroutine's ClassifyResult comparison. The handler
+	// reads up to MirrorBodySnapshotCap bytes from r.Body, then
+	// restores r.Body to a fresh reader over the SAME bytes so the
+	// downstream ReverseProxy reads the full body unchanged.
+	//
+	// 64 KiB is enough for status_diff / body_diff detection on a
+	// typical JSON / form-urlencoded response — the comparison is
+	// SHA-256 over the captured bytes (A3 ships byte-equal; JCS
+	// semantic diff is an ADR-124 §Follow-on). Larger values
+	// (1 MiB+) start eating gateway RAM on burst traffic; smaller
+	// values lose body-diff signal on responses with a long tail.
+	// Bumping this is a PR-grade change.
+	MirrorBodySnapshotCap = 64 * 1024
+
+	// MirrorMaxConcurrentPerRule (issue #72 / ADR-133 / ADR-125
+	// PR-A3) is the per-rule concurrent mirror-VM cost circuit.
+	// Owned by the GATEWAY (not schedd) as of PR-A3 code-review
+	// fix #3 — the slot spans admit → round-trip complete so the
+	// cap reflects "VMs in flight", not "admit attempts". The
+	// default 5 matches MirrorMaxLifetimeSeconds × ~1 sustained
+	// req/s so a steady-state customer can't pin more than cap VMs
+	// simultaneously. Operators can lift the cap via a constant
+	// edit + redeploy; ADR-127-style alert covers anomalous
+	// sustained cap-at-max saturation.
+	MirrorMaxConcurrentPerRule int64 = 5
+
 	// Apid http.Server defaults (issue #995 Phase 1, ADR-121
 	// companion). The customer-facing control plane binds loopback
 	// (gatewayd-public reverse-proxies in front) so the same

@@ -55,6 +55,15 @@ func (r *rotatingScheduler) EnsureWake(context.Context, string, string) (string,
 	return "i-" + strconv.FormatInt(idx, 10), nodeID, "", "wake-" + strconv.FormatInt(idx, 10), r.method, 0, nil
 }
 
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — test fake
+// satisfies the widened Scheduler interface. Mirror tests live
+// in pkg/gateway/handler_mirror_test.go; per-node rotation doesn't
+// exercise the mirror hot path so a single endpoint suffices.
+func (r *rotatingScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	idx := r.calls.Add(1)
+	return "mirror-" + strconv.FormatInt(idx, 10), "wake-mirror-" + strconv.FormatInt(idx, 10), nil
+}
+
 // TestPGBackend_PickRotatesWithinWinningNode seeds two nodes with
 // different healthy counts (a has 3, b has 1) and asserts the picker
 // round-robins WITHIN a — never returning the b node's instance

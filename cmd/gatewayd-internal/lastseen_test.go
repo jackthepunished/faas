@@ -46,6 +46,9 @@ func (a *fakeScheddClientAdapter) ReportActivity(ctx context.Context, touches []
 func (a *fakeScheddClientAdapter) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	panic("fakeScheddClientAdapter.AdmitInstance: not wired")
 }
+func (a *fakeScheddClientAdapter) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	panic("fakeScheddClientAdapter.AdmitMirrorInstance: not wired")
+}
 func (a *fakeScheddClientAdapter) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	panic("fakeScheddClientAdapter.EnsureWake: not wired")
 }

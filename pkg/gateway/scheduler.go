@@ -221,6 +221,21 @@ type Scheduler interface {
 	// emitted wake.boot_started / wake.boot_completed events stamp
 	// the cause (gateway / floor / cron / scaleup / etc.).
 	EnsureWake(ctx context.Context, appID, trigger string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, port int, err error)
+	// AdmitMirrorInstance (issue #72 / ADR-124 / ADR-125 PR-A3) is
+	// the mirror-VM admission sibling to AdmitInstance. Schedd
+	// stamps mode='mirror' on the new instances row (PR-A1's 00385)
+	// and the per-rule concurrent-mirror-VM cap (default 5,
+	// sched.MirrorMaxConcurrentPerRule) gates the dispatch.
+	//
+	// Outcomes:
+	//   - admitted:    wakeID + instanceID non-empty, err=nil
+	//   - cap-at-max:  wakeID + instanceID empty, err wraps
+	//                  sched.ErrMirrorSlotAtCapacity — gateway maps
+	//                  to ledger row with status_diff=true +
+	//                  metric result="cap_at_max".
+	//   - real failure: err is *api.Problem-shaped; gateway treats
+	//                   as a real failure (no ledger row, just log).
+	AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -237,6 +252,14 @@ func (NoopScheduler) AdmitInstance(context.Context, string, string, string, stri
 
 func (NoopScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
 	return "", "", "", "", 0, 0, ErrSchedulerUnconfigured
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) — stub matches
+// NoopScheduler's "no scheduler wired" contract: returns
+// ErrSchedulerUnconfigured so the mirror goroutine logs + drops
+// the request without writing a misleading ledger row.
+func (NoopScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	return "", "", ErrSchedulerUnconfigured
 }
 
 // FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd-internal/
@@ -474,6 +497,43 @@ func (f *FakeScheduler) EnsureWake(ctx context.Context, appID, trigger string) (
 		rawMethod = WireWakeColdBoot
 	}
 	return instanceID, nodeID, deploymentID, wakeID, rawMethod, port, err
+}
+
+// AdmitMirrorInstance (issue #72 / ADR-124 PR-A3) is the in-process
+// mirror test fake. Returns synthetic identity (mirrors
+// AdmitInstance's per-call sequence), or errOnAdmit if WithErr is
+// set. The wakeID and instanceID match AdmitInstance's shape so
+// tests exercising the mirror hot path can pin a single fixed
+// identity by calling WithWakeID/WithInstanceID once.
+func (f *FakeScheduler) AdmitMirrorInstance(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (string, string, error) {
+	f.mu.Lock()
+	f.admitsByApp[appID]++
+	latency := time.Duration(f.latencyMs) * time.Millisecond
+	err := f.errOnAdmit
+	instanceOverride := f.instanceID
+	wakeOverride := f.wakeID
+	f.mu.Unlock()
+
+	if latency > 0 {
+		select {
+		case <-time.After(latency):
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
+
+	seq := f.nextID.Add(1)
+	f.totalCalls.Add(1)
+
+	instanceID := instanceOverride
+	if instanceID == "" {
+		instanceID = "mirror-" + itoa(seq)
+	}
+	wakeID := wakeOverride
+	if wakeID == "" {
+		wakeID = instanceID
+	}
+	return instanceID, wakeID, err
 }
 
 // itoa renders a uint64 as a base-10 string without importing strconv into

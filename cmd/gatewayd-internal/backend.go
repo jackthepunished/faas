@@ -322,6 +322,12 @@ type invalidator interface {
 	FlushRoutes()
 	InvalidatePublicAuth()
 	RefreshDeploymentWeights(ctx context.Context, appID string) error
+	// RefreshMirrorRules (issue #72 / ADR-125 PR-A3) reloads
+	// the per-app mirror rules cache from Postgres on a
+	// kind="mirror" notify. Mirrors RefreshDeploymentWeights'
+	// shape — the dispatch goroutine reads the cache on the
+	// hot path; Refresh is the only writer.
+	RefreshMirrorRules(ctx context.Context, appID string) error
 	// ResetEdgeRules (ADR-089 PR 3) drops the per-host
 	// edge-rule LRU. Wholesale — per-rule invalidation would
 	// require the notification payload to carry the host
@@ -557,16 +563,39 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		// crash the edge loop). A non-nil refresh error is
 		// logged-and-continued: a brief staleness window is
 		// preferable to crashing the notify path.
+		//
+		// Issue #72 / ADR-125 PR-A3: the same channel carries
+		// mirror-rule notifications via a `kind="mirror"`
+		// discriminant (PR-A2 emits this from
+		// cmd/apid/handlers_mirrors.go). Both flows write the
+		// SAME channel — NotifyDeploymentChanged — but consume
+		// DIFFERENT discriminators. Branch on `kind` here; an
+		// empty `kind` (legacy / traffic-split) hits the
+		// upstream weight refresh.
 		var p struct {
 			AppID        string `json:"app_id"`
 			DeploymentID string `json:"deployment_id"`
+			Kind         string `json:"kind"`
 		}
 		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil || p.AppID == "" {
 			log.Warn("gatewayd: bad deployment_changed payload", "payload", n.Payload)
 			return
 		}
-		if err := inv.RefreshDeploymentWeights(ctx, p.AppID); err != nil {
-			log.Warn("gatewayd: refresh deployment weights failed", "app", p.AppID, "err", err)
+		switch p.Kind {
+		case "mirror":
+			// Mirror rule mutation: refresh the per-app
+			// mirror rules cache so the dispatch fanout
+			// sees the new rule within ~1s of the apid
+			// write. RefreshMirrorRules is safe to call
+			// even when the app has no rules (no-op
+			// allocation beyond the cache write).
+			if err := inv.RefreshMirrorRules(ctx, p.AppID); err != nil {
+				log.Warn("gatewayd: refresh mirror rules failed", "app", p.AppID, "err", err)
+			}
+		default:
+			if err := inv.RefreshDeploymentWeights(ctx, p.AppID); err != nil {
+				log.Warn("gatewayd: refresh deployment weights failed", "app", p.AppID, "err", err)
+			}
 		}
 	case db.NotifyEdgeRuleChanged:
 		// Issue #561 / ADR-089 PR 3. A create / update /
