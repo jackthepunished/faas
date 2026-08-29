@@ -153,6 +153,14 @@ var routeExclude = map[string]bool{
 	// cmd/sdk-coverage/main.go::routeExclude; the two lists must
 	// move together.
 	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
+
+	// ADR-127 PR-D: OTLP sidecar protocol — not a REST endpoint
+	// consumed by the generated SDK. OTel SDKs speak OTLP/HTTP
+	// directly; the SDK would never mint IngestOtlpSpans as a
+	// typed wrapper. Mirror the exclusion in
+	// cmd/sdk-coverage/main.go::routeExclude; the two lists must
+	// move together.
+	"POST /v1/otel/v1/traces": true,
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the
