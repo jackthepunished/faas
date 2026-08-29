@@ -4535,7 +4535,10 @@ func (q *Queries) PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX,
 
 const requestTelemetryBaselineP95ByRoute = `-- name: RequestTelemetryBaselineP95ByRoute :many
 SELECT route,
-       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::int AS p95_ms
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)::int AS p50_ms,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::int AS p95_ms,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::int AS p99_ms,
+       COUNT(*)::bigint                                              AS n
 FROM request_telemetry
 WHERE app_id = $1
   AND deployment_id = $2
@@ -4553,14 +4556,21 @@ type RequestTelemetryBaselineP95ByRouteParams struct {
 
 type RequestTelemetryBaselineP95ByRouteRow struct {
 	Route string
+	P50Ms int32
 	P95Ms int32
+	P99Ms int32
+	N     int64
 }
 
-// Computes per-route p95 latency baseline for the prior deployment
-// (the comparator). Backs the regression detector — PR-B owns
-// the cron that calls this; PR-A ships the query surface only.
-// percentile_cont is the canonical Postgres window-function call;
-// 0.95 is the p95.
+// Per-route p50/p95/p99 latency + row count for the
+// compare endpoint and the regression detector (ADR-127 PR-B
+// cron + PR Debugger UX v1 compare handler). Single index scan
+// over the existing request_telemetry_app_dep_received_idx
+// (PR-A migration 00427) so the four aggregates share one
+// window. percentile_cont is the canonical Postgres window-
+// function call; COUNT(*) gives the consistent row count
+// over the same scan so p50/p95/p99 and n can never disagree
+// about which rows contributed.
 func (q *Queries) RequestTelemetryBaselineP95ByRoute(ctx context.Context, db DBTX, arg RequestTelemetryBaselineP95ByRouteParams) ([]RequestTelemetryBaselineP95ByRouteRow, error) {
 	rows, err := db.Query(ctx, requestTelemetryBaselineP95ByRoute,
 		arg.AppID,
@@ -4575,7 +4585,13 @@ func (q *Queries) RequestTelemetryBaselineP95ByRoute(ctx context.Context, db DBT
 	items := []RequestTelemetryBaselineP95ByRouteRow{}
 	for rows.Next() {
 		var i RequestTelemetryBaselineP95ByRouteRow
-		if err := rows.Scan(&i.Route, &i.P95Ms); err != nil {
+		if err := rows.Scan(
+			&i.Route,
+			&i.P50Ms,
+			&i.P95Ms,
+			&i.P99Ms,
+			&i.N,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

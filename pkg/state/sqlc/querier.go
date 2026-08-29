@@ -570,11 +570,15 @@ type Querier interface {
 	// partition tail (rows in the default partition or
 	// the current month that are older than cutoff).
 	PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error
-	// Computes per-route p95 latency baseline for the prior deployment
-	// (the comparator). Backs the regression detector — PR-B owns
-	// the cron that calls this; PR-A ships the query surface only.
-	// percentile_cont is the canonical Postgres window-function call;
-	// 0.95 is the p95.
+	// Per-route p50/p95/p99 latency + row count for the
+	// compare endpoint and the regression detector (ADR-127 PR-B
+	// cron + PR Debugger UX v1 compare handler). Single index scan
+	// over the existing request_telemetry_app_dep_received_idx
+	// (PR-A migration 00427) so the four aggregates share one
+	// window. percentile_cont is the canonical Postgres window-
+	// function call; COUNT(*) gives the consistent row count
+	// over the same scan so p50/p95/p99 and n can never disagree
+	// about which rows contributed.
 	RequestTelemetryBaselineP95ByRoute(ctx context.Context, db DBTX, arg RequestTelemetryBaselineP95ByRouteParams) ([]RequestTelemetryBaselineP95ByRouteRow, error)
 	// Per-deployment drilldown. Used by gregale debug compare and the
 	// regression detector (PR-B). Uses
