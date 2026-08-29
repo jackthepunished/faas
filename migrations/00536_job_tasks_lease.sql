@@ -46,17 +46,14 @@ ALTER TABLE job_runs
 -- already counted in tasks_failed) and anchor the cross-field
 -- invariant as `dead_letter_count <= tasks_failed` — a task must
 -- have reached a failed terminal state to be dead-lettered.
-DO $$
-DECLARE
-    c text;
-BEGIN
-    SELECT conname INTO c FROM pg_constraint
-    WHERE conname = 'job_runs_counters_check'
-      AND conrelid = 'public.job_runs'::regclass;
-    IF c IS NOT NULL THEN
-        ALTER TABLE job_runs DROP CONSTRAINT job_runs_counters_check;
-    END IF;
-END $$;
+--
+-- DROP CONSTRAINT IF EXISTS replaces a DO-block regclass probe: the
+-- table is unqualified (its schema follows search_path), and the
+-- regclass cast to a hardcoded 'public.job_runs' failed in per-test
+-- schemas where the table lives in the test schema, not public
+-- (memory: job-tasks-lease-searchpath-public-cast).
+ALTER TABLE job_runs
+    DROP CONSTRAINT IF EXISTS job_runs_counters_check;
 
 ALTER TABLE job_runs
     ADD CONSTRAINT job_runs_counters_check
