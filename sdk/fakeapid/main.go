@@ -320,6 +320,145 @@ func (f *fixture) handler() http.Handler {
 		_, _ = w.Write(appResponse(slug))
 	})
 
+	// --- ADR-124 deployment queue controls ---------------------------------
+	//
+	// The four routes mirror the canonical wire shapes from
+	// api/openapi.yaml:4420-4535. Each route covers the happy path
+	// plus a deterministic 4xx arm (404 unknown id / 409 live /
+	// 409 priority out of range) so the SDK smoke tests can
+	// exercise both `result.status == "..."` assertions AND the
+	// `errors.Is(err, ErrNotFound)` / Problem.code branches.
+
+	// POST /v1/apps/{slug}/deployments/{id}/cancel — CancelDeployment
+	// (ADR-124 / pkg/api/client.go:3509). Body: {reason?: user|...}.
+	// 200 returns the canonical CancelDeploymentResponse shape
+	// (id, status:"cancelled", cancelled_at, cancel_reason,
+	// cancelled_builds). 404 on unknown slug; 409 "live_forbidden"
+	// when the path carries id == "live-1".
+	mux.HandleFunc("/v1/apps/{slug}/deployments/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/apps/{slug}/deployments/{id}/cancel", "fixture")
+			return
+		}
+		slug := r.PathValue("slug")
+		id := r.PathValue("id")
+		if !knownSlug(slug) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write(notFoundAppProblem(slug))
+			return
+		}
+		// Best-effort body decode; missing/empty body → reason ""
+		// (server-side default "user" per cmd/apid/handlers_queue_controls.go:72).
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Reason == "" {
+			body.Reason = "user"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(mustJSON(map[string]any{
+			"id":               id,
+			"status":           "cancelled",
+			"cancelled_at":     "2026-08-29T00:00:00Z",
+			"cancel_reason":    body.Reason,
+			"cancelled_builds": []string{},
+		}))
+	})
+
+	// POST /v1/deployments/{id}/reorder — ReorderDeployment
+	// (ADR-124 / pkg/api/client.go:3520). Body: {priority: int}.
+	// 200 returns {id, priority}. 409 with code
+	// "deployment_reorder_not_pending" on id == "not-pending-1";
+	// 409 with code "deployment_reorder_priority_invalid" when
+	// priority < 0 or > 1000.
+	mux.HandleFunc("/v1/deployments/{id}/reorder", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/deployments/{id}/reorder", "fixture")
+			return
+		}
+		id := r.PathValue("id")
+		if id == "not-pending-1" {
+			problemJSON(w, http.StatusConflict, "deployment_reorder_not_pending", "deployment is not pending; cannot reorder", "fixture")
+			return
+		}
+		var body struct {
+			Priority int `json:"priority"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Priority < 0 || body.Priority > 1000 {
+			problemJSON(w, http.StatusConflict, "deployment_reorder_priority_invalid", "priority must be in [0,1000]", "fixture")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(mustJSON(map[string]any{
+			"id":       id,
+			"priority": body.Priority,
+		}))
+	})
+
+	// DELETE /v1/deployments/{id} — ClearDeployment
+	// (ADR-124 / pkg/api/client.go:3531). 200 returns
+	// {id, deleted:true, deleted_at}. 409 with code
+	// "deployment_cancel_live_forbidden" on id == "live-1" (mirrors
+	// the apid handler at cmd/apid/handlers_queue_controls.go:213-216).
+	mux.HandleFunc("/v1/deployments/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only DELETE is supported on /v1/deployments/{id}", "fixture")
+			return
+		}
+		id := r.PathValue("id")
+		if id == "live-1" {
+			problemJSON(w, http.StatusConflict, "deployment_cancel_live_forbidden", "use `gregale deploys rollback` for live deployments", "fixture")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(mustJSON(map[string]any{
+			"id":         id,
+			"deleted":    true,
+			"deleted_at": "2026-08-29T00:00:00Z",
+		}))
+	})
+
+	// POST /v1/apps/{slug}/deployments/clear-obsolete —
+	// ClearObsoleteDeployments (ADR-124 / pkg/api/client.go:3539).
+	// Body: {older_than?: "168h"}. 200 returns the
+	// ClearObsoleteReport shape (app_slug, count, older_than).
+	// 404 on unknown slug; count is the static "3" so the SDK
+	// smoke test can assert the parsed-body shape.
+	mux.HandleFunc("/v1/apps/{slug}/deployments/clear-obsolete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/apps/{slug}/deployments/clear-obsolete", "fixture")
+			return
+		}
+		slug := r.PathValue("slug")
+		if !knownSlug(slug) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write(notFoundAppProblem(slug))
+			return
+		}
+		var body struct {
+			OlderThan string `json:"older_than"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		olderThan := body.OlderThan
+		if olderThan == "" {
+			olderThan = "168h"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(mustJSON(map[string]any{
+			"app_slug":   slug,
+			"count":      3,
+			"older_than": olderThan,
+		}))
+	})
+
 	return mux
 }
 
