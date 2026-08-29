@@ -32,6 +32,16 @@ ARG MISE_VERSION=2026.7.6
 # the VM boundary is the actual security perimeter (ADR-003).
 ARG BUILDKIT_VERSION=0.31.2
 
+# Alpine v3.22's packaged runc was built with Go 1.24.12. That leaves the
+# builder image exposed to GO-2026-4337 (CVE-2025-68121), which the runtime
+# admission gate correctly refuses. Use the upstream static runc release
+# instead of inheriting the vulnerable compiler/runtime from apk. The
+# checksums are for the official release assets and are deliberately kept
+# here beside the version so a bump cannot silently change the executable.
+ARG RUNC_VERSION=1.5.1
+ARG RUNC_SHA256_AMD64=177df879d50c913eb205e898d5c1c05a18f574053c0ce5524c471208eaf06f6f
+ARG RUNC_SHA256_ARM64=ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70eee7ce9
+
 # ---- guest-init version (issue #938 / PR-B / ADR-114) -------------------
 # Multi-arch builds CANNOT pre-stage guest-init in the build context because
 # both arches would overwrite the same host path (review finding #2 on PR
@@ -109,12 +119,31 @@ ARG RAILPACK_VERSION
 ARG BUILDKIT_VERSION
 ARG MISE_VERSION
 ARG TARGETARCH
+ARG RUNC_VERSION
+ARG RUNC_SHA256_AMD64
+ARG RUNC_SHA256_ARM64
 
 RUN apk add --no-cache \
-      git ca-certificates curl xz shadow-subids fuse-overlayfs runc util-linux util-linux-misc
+      git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc
+
+# Replace Alpine's runc build with the upstream static release. Besides
+# removing the stale Go standard library embedded in Alpine's package, the
+# static asset keeps this image portable across the glibc/musl boundary used
+# by the builder rootfs. Verify the architecture-specific release asset
+# before it becomes executable code in the VM.
+RUN case "${TARGETARCH}" in \
+      amd64) RUNC_ASSET=runc.amd64; RUNC_SHA256="${RUNC_SHA256_AMD64}" ;; \
+      arm64) RUNC_ASSET=runc.arm64; RUNC_SHA256="${RUNC_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/runc \
+      "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/${RUNC_ASSET}" && \
+    echo "${RUNC_SHA256}  /tmp/runc" | sha256sum -c - && \
+    install -m 0755 /tmp/runc /usr/bin/runc && \
+    rm /tmp/runc
 
 # guest-init and BuildKit use the stable platform path for the OCI runtime;
-# Alpine packages runc under /usr/bin.
+# the verified upstream asset above is installed under /usr/bin.
 RUN ln -s /usr/bin/runc /usr/local/bin/runc
 
 # guest-init uses util-linux unshare's automatic subordinate-ID mapping. The
