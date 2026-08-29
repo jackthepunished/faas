@@ -6,7 +6,7 @@
 // small CRUD per file, isUniqueViolation funnel for SQLSTATE 23505,
 // ErrNotFound for zero-row tag.RowsAffected.
 //
-// CRITICAL pitfall (from 00510_deployment_scope_exclusions.sql
+// CRITICAL pitfall (from 00509_deployment_scope_exclusions.sql
 // header): the table has NO FK to apps(id) by design — soft-deleted
 // apps do NOT cascade to exclusions. The CRUD below never queries
 // apps; if a future caller joins on app_id, treat the result as a

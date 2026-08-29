@@ -5742,7 +5742,7 @@ var ValidOpenAPIVersions = []string{
 // who ran `--exclude foo --persist-exclude` once does not need to
 // keep typing it on every subsequent deploy. The schema (migration
 // 00418) has NO FK to apps(id) by design (see the SOFT-DELETE
-// CASCADE BLIND SPOT comment in 00510_deployment_scope_exclusions.sql
+// CASCADE BLIND SPOT comment in 00509_deployment_scope_exclusions.sql
 // header) — app_id is a snapshot reference that may go stale; the
 // janitor PurgeOrphanedScopeExclusions reaps stale rows after the
 // 90-day retention window.

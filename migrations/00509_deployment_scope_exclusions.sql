@@ -1,4 +1,4 @@
--- filename: 00510_deployment_scope_exclusions.sql
+-- filename: 00509_deployment_scope_exclusions.sql
 -- +goose Up
 -- +goose StatementBegin
 --
@@ -73,21 +73,18 @@
 --     a 00487 reserve_slot fence after PR #1090 advanced main.
 --   * 00487 + 00488 → 00487 dropped (main got a real
 --     00487_edge_rules_cors_preset_fk) and 00488 kept.
---   * 00488 → 00488 still conflicted because main gained
---     00488_reserve_slot fence from the cross-PR contiguity
---     repair — fence deleted.
---   * 00488 → 00509 (next attempt) → collided with PR #1157
---     which claims 00509_alert_rules_action.sql as real.
---   * 00509 → 00510 (this rename): renumber again to clear
---     PR #1157's 00509 claim. PR #1157 still holds the
---     00509_reserve_slot.sql fence slot; once PR #1157
---     merges with its 00509 real migration, that fence
---     drops naturally.
---   * Contiguity bridges in this branch: 00507_reserve_slot,
+--   * 00488 dropped (main added 00488_reserve_slot fence).
+--   * 00488 → 00509 (next attempt, collided with PR #1157
+--     which then claimed 00509_alert_rules_action.sql as real).
+--   * 00509 → 00510 (next attempt, collided with PR #1157
+--     [50511 mirror summary] + PR #1138 [00510/00511 mirror]).
+--   * 00510 → 00509 (this commit): PR #1157 rebased and
+--     dropped its 00509 claim (replaced with 00512/00513/00514
+--     real migrations), freeing slot 00509 for this PR.
+--   * Contiguity bridges in this branch: 00507_reserve_slot +
 --     00508_reserve_slot (drop when PR #1138 merges first
---     and brings real 00507_mirror_invocation_summary +
---     00508_mirror_invocation_results_completed_at_idx) +
---     00509_reserve_slot (drops when PR #1157 merges first).
+--     and brings real 00510_mirror_invocation_summary +
+--     00511_mirror_invocation_results_completed_at_idx).
 
 -- Replay-safe posture: every CREATE in this Up block uses
 -- IF NOT EXISTS (or DROP TRIGGER IF EXISTS before CREATE
