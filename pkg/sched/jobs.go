@@ -139,6 +139,15 @@ func (e *Engine) WakeJob(ctx context.Context, accountID, runID string, taskIndex
 	}
 	ttl += 90 * time.Second
 	leaseExpires := time.Now().Add(ttl)
+	if e.jobLeaser == nil {
+		// Mega-1 leaser deferred to follow-up commit (see
+		// cmd/schedd/main.go jobs-wiring block). Returning the
+		// sentinel lets dispatchJobsTick classify the run as
+		// failed → retryable; a customer who hits this sees
+		// CodeJobLeaserUnavailable, not a nil-deref panic.
+		e.ledger.Release(instanceID)
+		return JobWakeResult{}, ErrJobLeaserNil
+	}
 	tok, _, err := e.jobLeaser.Acquire(ctx, formatLeaseKeyForJob(runID, taskIndex), LeasePolicy{TTL: ttl}, e.ownerNodeID)
 	if err != nil {
 		e.ledger.Release(instanceID)
@@ -353,7 +362,7 @@ func (e *Engine) HandleJobExit(ctx context.Context, accountID, runID string, tas
 // that's 3 × ~350ms cold-boot ≈ 1s worst-case. We cap the
 // per-tick batch at 32 (a Pro-friendly number) so a runaway fleet
 // can't starve the cron loop.
-func (e *Engine) dispatchJobsTick(ctx context.Context) error {
+func (e *Engine) DispatchJobsTick(ctx context.Context) error {
 	const perTickBatch = 32
 	tasks, err := e.store.JobTaskClaimBatch(ctx, perTickBatch)
 	if err != nil {
@@ -441,13 +450,18 @@ func (e *Engine) WithJobVmmClient(c jobVmmClient) *Engine {
 }
 
 // WithJobLeaser wires the lease primitive into the engine.
-func (e *Engine) WithJobLeaser(l Leaser[*memLeaseRecord]) *Engine {
+// Accepts Leaser[any] so production PgLeaser[pgLeaseRecord]
+// and test MemLeaser[memLeaseRecord] both slot in (Mega-1:
+// the engine only needs the LeaseToken, the record type
+// is dropped). The ADR-134 pkg/dispatch swap will tighten
+// this to a single concrete record type post-Mega-1.
+func (e *Engine) WithJobLeaser(l Leaser[any]) *Engine {
 	e.jobLeaser = l
 	return e
 }
 
 // Leaser accessor for the engine — used by tests + cmd/schedd/main.go.
-func (e *Engine) JobLeaser() Leaser[*memLeaseRecord] { return e.jobLeaser }
+func (e *Engine) JobLeaser() Leaser[any] { return e.jobLeaser }
 
 // ----------------------------------------------------------------------------
 // helpers

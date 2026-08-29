@@ -229,7 +229,7 @@ type Engine struct {
 	// (WakeJob returns ErrJobTaskAlreadyClaimed without touching
 	// the leaser). Production cmd/schedd wires a real PgLeaser via
 	// WithJobLeaser.
-	jobLeaser Leaser[*memLeaseRecord]
+	jobLeaser Leaser[any]
 	// jobVmmClient is the vmmd gRPC surface for cold-booting
 	// job-task VMs. nil means "unit-test mode" — WakeJob returns
 	// a synthetic JobWakeResult without touching vmmd. Production
