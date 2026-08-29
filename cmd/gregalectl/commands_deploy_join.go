@@ -68,14 +68,20 @@ type deployJoinOptions struct {
 }
 
 type deployJoinReport struct {
-	Node           string   `json:"node"`
-	DatabaseNode   string   `json:"database_node"`
-	SSHHost        string   `json:"ssh_host"`
-	ManifestFile   string   `json:"manifest_file"`
-	ReleaseGitSHA  string   `json:"release_git_sha"`
-	FleetPreflight bool     `json:"fleet_preflight"`
-	Applied        bool     `json:"applied"`
-	Steps          []string `json:"steps"`
+	Node           string       `json:"node"`
+	DatabaseNode   string       `json:"database_node"`
+	SSHHost        string       `json:"ssh_host"`
+	ManifestFile   string       `json:"manifest_file"`
+	ReleaseGitSHA  string       `json:"release_git_sha"`
+	FleetPreflight bool         `json:"fleet_preflight"`
+	Applied        bool         `json:"applied"`
+	Steps          []string     `json:"steps"`
+	Timings        []joinTiming `json:"timings,omitempty"`
+}
+
+type joinTiming struct {
+	Phase      string `json:"phase"`
+	DurationMS int64  `json:"duration_ms"`
 }
 
 var nodeJoinStoreOpener = openNodeJoinStore
@@ -542,6 +548,10 @@ func deployJoinApply(opts *deployJoinOptions, report *deployJoinReport) (int, er
 }
 
 func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, report *deployJoinReport, progress func(nodejoin.Phase) error) (int, error) {
+	joinStarted := time.Now()
+	defer func() {
+		report.Timings = append(report.Timings, joinTiming{Phase: "total", DurationMS: time.Since(joinStarted).Milliseconds()})
+	}()
 	if opts.RepoRoot == "" {
 		opts.RepoRoot = defaultRepoRoot()
 	}
@@ -660,6 +670,8 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 	if err := os.WriteFile(varsPath, body, 0o600); err != nil {
 		return 3, fmt.Errorf("write Ansible variables: %w", err)
 	}
+	localPrepareDuration := time.Since(joinStarted)
+	report.Timings = append(report.Timings, joinTiming{Phase: "prepare_local", DurationMS: localPrepareDuration.Milliseconds()})
 
 	common := []string{"-i", filepath.Join(tempRoot, "inventory", "hosts.ini")}
 	if opts.AnsibleVarsFile != "" {
@@ -673,8 +685,11 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 			}
 		}
 		preflightArgs := append(append([]string{}, common...), filepath.Join(ansibleDir, "preflight.yml"))
-		if err := ansiblePlaybookRunner(ctx, ansibleDir, preflightArgs); err != nil {
-			return 3, fmt.Errorf("fleet preflight: %w", err)
+		phaseStarted := time.Now()
+		preflightErr := ansiblePlaybookRunner(ctx, ansibleDir, preflightArgs)
+		report.Timings = append(report.Timings, joinTiming{Phase: "preflight", DurationMS: time.Since(phaseStarted).Milliseconds()})
+		if preflightErr != nil {
+			return 3, fmt.Errorf("fleet preflight: %w", preflightErr)
 		}
 	}
 	if progress != nil {
@@ -686,20 +701,29 @@ func deployJoinApplyWithContext(ctx context.Context, opts *deployJoinOptions, re
 	// adopted host. Keep this as a separate, narrowly limited play so the
 	// existing compute fleet is never rebooted or reconfigured by --limit.
 	controlPlaneArgs := append(append([]string{}, common...), "--limit", "control_plane", filepath.Join(ansibleDir, "node_join_control_plane.yml"))
-	if err := ansiblePlaybookRunner(ctx, ansibleDir, controlPlaneArgs); err != nil {
-		return 3, fmt.Errorf("control-plane topology convergence: %w", err)
+	phaseStarted := time.Now()
+	controlPlaneErr := ansiblePlaybookRunner(ctx, ansibleDir, controlPlaneArgs)
+	report.Timings = append(report.Timings, joinTiming{Phase: "control_plane_convergence", DurationMS: time.Since(phaseStarted).Milliseconds()})
+	if controlPlaneErr != nil {
+		return 3, fmt.Errorf("control-plane topology convergence: %w", controlPlaneErr)
 	}
 	joinArgs := append(append([]string{}, common...), "--limit", opts.Node, filepath.Join(ansibleDir, "node_join.yml"))
-	if err := ansiblePlaybookRunner(ctx, ansibleDir, joinArgs); err != nil {
-		return 3, fmt.Errorf("node adoption: %w", err)
+	phaseStarted = time.Now()
+	joinErr := ansiblePlaybookRunner(ctx, ansibleDir, joinArgs)
+	report.Timings = append(report.Timings, joinTiming{Phase: "node_convergence", DurationMS: time.Since(phaseStarted).Milliseconds()})
+	if joinErr != nil {
+		return 3, fmt.Errorf("node adoption: %w", joinErr)
 	}
 	if progress != nil {
 		if err := progress(nodejoin.PhaseVerifying); err != nil {
 			return 3, fmt.Errorf("record verifying phase: %w", err)
 		}
 	}
-	if err := joinControlPlaneVerifier(ctx, report, expectedManifestHash); err != nil {
-		return 3, fmt.Errorf("control-plane readiness gate: %w", err)
+	phaseStarted = time.Now()
+	verifyErr := joinControlPlaneVerifier(ctx, report, expectedManifestHash)
+	report.Timings = append(report.Timings, joinTiming{Phase: "verify_activate", DurationMS: time.Since(phaseStarted).Milliseconds()})
+	if verifyErr != nil {
+		return 3, fmt.Errorf("control-plane readiness gate: %w", verifyErr)
 	}
 	report.Applied = true
 	return 0, nil
@@ -1119,6 +1143,9 @@ func emitDeployJoinReport(report deployJoinReport, applied bool, jsonOut bool) i
 	_, _ = fmt.Fprintf(os.Stdout, "deploy join-node: %s node=%s release=%s ssh=%s\n", state, report.DatabaseNode, report.ReleaseGitSHA, report.SSHHost)
 	for i, step := range report.Steps {
 		_, _ = fmt.Fprintf(os.Stdout, "  %d. %s\n", i+1, step)
+	}
+	for _, timing := range report.Timings {
+		_, _ = fmt.Fprintf(os.Stdout, "  timing %s=%dms\n", timing.Phase, timing.DurationMS)
 	}
 	return 0
 }

@@ -189,6 +189,22 @@ var cliCommands = []cliCommand{
 				},
 			},
 			{
+				Name:  "prepare-node",
+				Short: "Prepare and cache verified release assets for provider-neutral node adoption",
+				Flags: []cliFlag{
+					{Name: "claim-file", Short: "provider-produced ComputeNodeClaim (alternative to nodes-file)"},
+					{Name: "nodes-file", Short: "provider connection list (alternative to claim-file)"},
+					{Name: "manifest-file", Short: "signed production manifest (required)"},
+					{Name: "release-tag", Short: "signed release tag (required)"},
+					{Name: "secrets-dir", Short: "directory containing join secrets and pki/ (required)"},
+					{Name: "output-dir", Short: "prepared artifact directory (required)"},
+					{Name: "cache-dir", Short: "persistent public artifact cache"},
+					{Name: "cosign-binary", Short: "Linux/amd64 cosign binary to stage"},
+					{Name: "release-repo", Short: "GitHub owner/repository"},
+					{Name: "json", Short: "emit structured JSON"},
+				},
+			},
+			{
 				Name:  "join-fleet",
 				Short: "Adopt a bounded batch of already-created compute hosts",
 				Flags: []cliFlag{

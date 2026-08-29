@@ -69,7 +69,7 @@ const (
 // (args []string) int signature every other dispatch* arm uses.
 func cmdDeployDispatch(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "gregalectl deploy: missing subcommand; want claim|fleet-bundle|join-node|join-fleet|add-node")
+		fmt.Fprintln(os.Stderr, "gregalectl deploy: missing subcommand; want claim|fleet-bundle|prepare-node|join-node|join-fleet|add-node")
 		return 2
 	}
 	switch args[0] {
@@ -77,6 +77,8 @@ func cmdDeployDispatch(args []string) int {
 		return cmdDeployClaim(args[1:])
 	case "fleet-bundle":
 		return cmdDeployFleetBundle(args[1:])
+	case "prepare-node":
+		return cmdDeployPrepareNode(args[1:])
 	case "join-node":
 		return cmdDeployJoinNode(args[1:])
 	case "join-fleet":

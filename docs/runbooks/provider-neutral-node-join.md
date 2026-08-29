@@ -229,6 +229,52 @@ The `fleet.hosts[].address` value is not replaced with the provider's public
 SSH address. It remains the stable private runtime endpoint and certificate
 identity. `--ssh-host` is a connection override for this one adoption run.
 
+## Fast repeated provisioning
+
+When adding more than one machine, prepare the public release assets and the
+secret-backed join directory once. `prepare-node` downloads the large release
+assets once per tag, verifies `SHA256SUMS` and the keyless release signature,
+checks that the supplied topology manifest is the exact signed release
+manifest, and reuses the verified files from the operator's persistent cache
+on later runs. It refreshes the small checksum and release-manifest metadata on
+each run so a mutable tag fails closed.
+
+The secret directory is never uploaded as a repository file. It contains:
+
+```text
+compute-ssh-key
+compute-db.env
+storage.env
+sign.key
+sign-pub.pem
+pki/ca/ca.crt
+pki/<compute trust-bundle files>
+```
+
+It may also contain `ansible-vars.yml`, `box-age-key`,
+`rclone.conf.age`, and `archive-creds.json.age`. The trust-bundle form is
+intentional: `prepare-node` refuses to copy `pki/ca/ca.key` into the reusable
+artifact directory.
+
+Prepare one claim or a provider-generated batch handoff:
+
+```sh
+gregalectl deploy prepare-node \
+  --claim-file /secure/fleet/fsn-3.yaml \
+  --manifest-file /secure/fleet/production-manifest.yaml \
+  --release-tag v0.1.18-rc.15 \
+  --secrets-dir /secure/fleet/secrets \
+  --output-dir /secure/fleet/join-artifacts \
+  --cosign-binary /secure/tools/cosign-linux-amd64
+```
+
+The command prints a ready-to-run `join-fleet` command and writes a
+normalized `nodes.yaml` into the prepared directory. For later nodes, use
+`--nodes-file` with the same artifact directory; release downloads and local
+verification are then cache hits. The join command emits phase timings for
+local preparation, fleet preflight, control-plane convergence, node
+convergence, and activation verification.
+
 ## Scale-out operation
 
 The manifest remains the desired fleet topology. Add the new stable private
