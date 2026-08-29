@@ -21571,7 +21571,7 @@ func (s *PgStore) ReplaceProvisionedStaticEgressIPs(ctx context.Context, account
 // ADR-134 PR-B: per-account async concurrency cap (account_async_quota)
 // + invocations retention reaper.
 //
-// The counter-table pattern is deliberate: see migrations/00526 for the
+// The counter-table pattern is deliberate: see migrations/00533 for the
 // rationale. The cap is enforced atomically with the claim transition so
 // the drain cannot exceed the plan's MaxAsyncInvocationsPerAccount even
 // under concurrent claim. Decrement happens in the same transaction as
@@ -21769,7 +21769,7 @@ func (s *PgStore) DecrementAccountAsyncInflight(ctx context.Context, accountID s
 // Used by pkg/sched/retention_invocations.go.
 //
 // PR-B fixup (code-review #1185 finding #3): the WHERE clause restricts
-// to terminal states only (migration 00525_invocations_async_fields.sql
+// to terminal states only (migration 00532_invocations_async_fields.sql
 // documents this contract). Without the filter, the reaper would
 // DELET Epending/dispatching rows whose customer-supplied
 // result_retention_until happens to be in the past.
