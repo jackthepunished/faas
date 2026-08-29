@@ -58,6 +58,20 @@ const (
 	// question than "what was excluded on this one scan?". SOC 2
 	// CC7.2 needs both durably for incident forensics.
 	KindProjectScopeExcluded = "project.scope.excluded"
+	// KindDeploymentCancelled / KindDeploymentReordered /
+	// KindDeploymentCleared / KindClearObsoleteDeployments
+	// are the ADR-124 deployment queue-control audit trail.
+	// Emitted from cmd/apid/handlers_queue_controls.go AFTER
+	// the pgstore state mutation succeeds; failure arms emit
+	// the metric counter only (no audit row — by design).
+	// `events.kind` is free text per migrations/00001_init.sql
+	// (the events table has no CHECK on kind), so no migration
+	// is required to add new kinds. SOC 2 CC7.2 reader joins
+	// these rows with the deployment row by data->>'deployment_id'.
+	KindDeploymentCancelled      = "deployment.cancelled"
+	KindDeploymentReordered      = "deployment.reordered"
+	KindDeploymentCleared        = "deployment.cleared"
+	KindClearObsoleteDeployments = "deployment.clear_obsolete"
 )
 
 // Alert kind constants. Mirrors the audit kind's `reason` field —
