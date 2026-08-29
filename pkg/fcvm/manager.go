@@ -59,6 +59,24 @@ type VMM interface {
 	// to Boot. Manager.Wake prefers BootColdBoot over Boot; tests that
 	// already have resolved paths in hand can keep using Boot directly.
 	BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec) error
+	// BootColdBootForJob (issue #1184 Workstream A / ADR-099) is the
+	// sibling entry point for job-task cold boot. Mirrors BootColdBoot's
+	// shape: materializes JobColdBootSpec.KernelKey/BaseKey/ImageRef
+	// through StorageBackend, writes /etc/faas/job.json on drive1, and
+	// delegates to bootNoWait (SkipReady=true — jobs don't bind :8080).
+	// Tests with resolved paths can still call Boot directly; the public
+	// schedd→vmmd seam is Manager.BootJob (engine.go::WakeJob).
+	BootColdBootForJob(ctx context.Context, l Lease, spec JobColdBootSpec) error
+	// WaitJobExit (issue #1184 Workstream A / ADR-099) is the host-side
+	// mirror of WaitCharacterizationReport for the job-exit envelope.
+	// Opens the per-instance vsock UDS, sends CONNECT <port> to FC,
+	// reads [4B msg_type][4B body_len][N JSON], validates msg_type =
+	// VsockJobExitMsgType (=4), and returns the parsed JobExitPayload.
+	// Deadline is measured from entry; pass EffectiveDestroyWait(task_timeout_s)
+	// so the per-task wall-clock cap fits the listener window. On
+	// timeout the caller (Engine.HandleJobExit) treats the task as
+	// crashed and the reaper takes over after JobReaperTTL.
+	WaitJobExit(ctx context.Context, l Lease, deadline time.Duration) (JobExitPayload, error)
 	// Restore loads a snapshot into a fresh jailed firecracker and resumes it,
 	// returning once the guest is ready. On error it cleans up its own process.
 	// spec.HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
@@ -2378,6 +2396,165 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		// Empty = legacy wake, dispatch no-ops.
 		DeploymentID: req.DeploymentID,
 	})
+}
+
+// BootJob (issue #1184 Workstream A / ADR-099) is the
+// job-task sibling of ColdBoot. Allocates a slot, plumbs the
+// netns, runs the vmmd-side cold-boot path (BootColdBootForJob +
+// manifest staging), and returns the live Instance.
+//
+// Job VMs don't bind :8080 (no healthcheck), so Ready is stamped
+// when Boot returns (SkipReady=true). schedd's Engine.WakeJob
+// treats the returned Instance as the cue to JobTaskMarkClaimed
+// and emit job.task.dispatched.
+//
+// Distinct from Wake: there's no snapshot-restore path for jobs
+// (jobs are always cold-boot — a 350ms wake budget is meaningless
+// for a 300s task). Distinct from ColdBoot: no LayerKey, no
+// healthcheck, no characterize report, single command instead of
+// a long-lived listener.
+//
+// DestroyWait is what the engine passes for the per-task cap + 90s
+// grace; pass EffectiveDestroyWait(req.TaskTimeoutSec) at the call
+// site.
+func (m *Manager) BootJob(ctx context.Context, req JobBootRequest) (_ *Instance, err error) {
+	if m.vmm == nil {
+		return nil, fmt.Errorf("manager: BootJob: nil vmm")
+	}
+	lease, err := m.alloc.Acquire(req.Instance)
+	if err != nil {
+		return nil, fmt.Errorf("manager: BootJob %s: acquire lease: %w", req.Instance, err)
+	}
+	// Stamp the Plan (issue #301, ADR-044) so the downstream
+	// Boot / Kill path computes the per-plan parent cgroup +
+	// cpu.weight. Set BEFORE the netns build so a rejected wake
+	// cleans up via the same defer that releases the slot.
+	lease.Plan = req.Plan
+	lease.IsBuilder = false
+
+	// Match the wake path's defer-and-unwind pattern: any error
+	// after Acquire must release the slot AND tear down the netns.
+	defer func() {
+		if err != nil {
+			// Drain whatever partial state we accumulated so a
+			// rejected job boot doesn't leak a netns / cgroup.
+			m.cleanup(context.WithoutCancel(ctx), lease, netns.NewConfig(
+				lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP,
+			), nil)
+		}
+	}()
+
+	// Plan validation (issue #301 / ADR-043). An empty / unknown
+	// plan would land the VM under the wrong cgroup sub-slice
+	// (or under none at all) and silently disable per-plan
+	// cpu.weight + cpu.max enforcement. Mirror Wake's gate so a
+	// job VM is rejected the same way.
+	if !req.Plan.Valid() {
+		return nil, fmt.Errorf("boot job %s: invalid plan %q (issue #301 / ADR-043)", req.Instance, req.Plan)
+	}
+
+	// Plumb the netns (tap0, 10.0.0.2/30, NAT, jailer cgroup).
+	// Same shape as Wake's netns setup — every VM gets one
+	// (ADR-009, identical inner network world).
+	nc := netns.NewConfig(lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP)
+	nc.TapUID = lease.UID
+	if err = m.setupNetwork(ctx, nc); err != nil {
+		return nil, fmt.Errorf("manager: BootJob %s: network setup: %w", req.Instance, err)
+	}
+
+	// Fire the cold-boot through the VMM. The vmm owns the
+	// StorageBackend key materialisation + /etc/faas/job.json
+	// manifest write; the manager just brokers the lease + netns
+	// and stamps the live record.
+	spec := JobColdBootSpec{
+		KernelKey:      req.KernelKey,
+		BaseKey:        req.BaseKey,
+		ImageRef:       req.ImageRef,
+		Command:        req.Command,
+		Env:            req.Env,
+		VcpuCount:      req.VcpuCount,
+		MemSizeMiB:     req.MemSizeMiB,
+		Tap:            "tap0",
+		TaskTimeoutSec: req.TaskTimeoutSec,
+		LeaseToken:     req.LeaseToken,
+		AccountID:      req.AccountID,
+		RunID:          req.RunID,
+		TaskIndex:      req.TaskIndex,
+	}
+	if err = m.vmm.BootColdBootForJob(ctx, lease, spec); err != nil {
+		return nil, fmt.Errorf("manager: BootJob %s: vmm boot: %w", req.Instance, err)
+	}
+
+	// Stamp the live Instance. No readiness gating — the
+	// supervisor exits as soon as the command exits, so the
+	// "ready" window is from bootNoWait return to job_exit
+	// DGRAM arrival. Mirrors the Wake path's struct literal at
+	// vmm.go:3003.
+	inst := &Instance{
+		Lease:           lease,
+		Net:             nc,
+		Method:          WakeColdBoot, // jobs are always cold-boot
+		AccountID:       req.AccountID,
+		Plan:            req.Plan,
+		Port:            0,  // no listener port
+		HealthcheckPath: "", // no readiness probe
+	}
+	m.mu.Lock()
+	m.live[req.Instance] = inst
+	m.cidToID[GuestVsockCID(lease.Slot)] = req.Instance
+	m.mu.Unlock()
+	// MarkInstanceFrameworkReady isn't called here — the
+	// supervisor doesn't emit a framework-ready receipt. The
+	// job exit DGRAM is the only receipt.
+	return inst, nil
+}
+
+// WaitJobExit (issue #1184 Workstream A / ADR-099) is the
+// Manager-level thin wrapper around VMM.WaitJobExit. The Engine's
+// HandleJobExit call site needs to block on the per-instance vsock
+// DGRAM until either the envelope arrives or the deadline elapses.
+//
+// On deadline elapse the engine treats the task as crashed and
+// lets the stuck-task reaper take over (M6). On error return the
+// caller logs at WARN and continues — the engine never wedges on
+// a single failed wait.
+//
+// Pass deadline = EffectiveDestroyWait(req.TaskTimeoutSec) so the
+// per-task wall-clock cap fits the listener window.
+func (m *Manager) WaitJobExit(ctx context.Context, instance string, deadline time.Duration) (JobExitPayload, error) {
+	if m.vmm == nil {
+		return JobExitPayload{}, fmt.Errorf("manager: WaitJobExit: nil vmm")
+	}
+	lease := Lease{Instance: instance, Slot: -1} // WaitJobExit ignores slot
+	return m.vmm.WaitJobExit(ctx, lease, deadline)
+}
+
+// JobBootRequest is the Manager.BootJob payload. Mirrors JobVmmSpec
+// in pkg/sched/jobs.go (the schedd-side wire) plus the Manager-side
+// fields every Wake needs (Instance, NodeID, Plan).
+//
+// Kept separate from JobVmmSpec so schedd → vmmdgrpc → Manager
+// translation is mechanical: pkg/vmmdgrpc/proto.go's JobColdBoot
+// handler unpacks the proto, copies fields into JobBootRequest,
+// and calls Manager.BootJob. The split also lets the Manager-side
+// type add Manager-specific fields (Plan, NodeID) without
+// re-exposing them to schedd.
+type JobBootRequest struct {
+	Instance       string
+	AccountID      string
+	NodeID         string
+	Plan           api.Plan
+	RunID          string
+	TaskIndex      int
+	ImageRef       string
+	KernelKey      string
+	BaseKey        string
+	Command        []string
+	Env            map[string]string
+	VcpuCount      int
+	MemSizeMiB     int
+	TaskTimeoutSec int
+	LeaseToken     string
 }
 
 // Wake brings an instance up, preferring snapshot restore and falling back to

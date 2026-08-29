@@ -252,6 +252,28 @@ func (v *fakeVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec) 
 	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.HealthcheckPath)
 }
 
+// BootColdBootForJob (issue #1184 Workstream A / ADR-099) is the
+// job-task sibling of BootColdBoot. The fake delegates to Boot
+// (SkipReady semantics are already on the VMConfig — see
+// BuildJobColdBootConfig setting EphemeralWritable=true). Tests
+// that exercise the job boot path don't go through waitReady;
+// the supervisor exit DGRAM is faked at the schedd layer.
+func (v *fakeVMM) BootColdBootForJob(ctx context.Context, l Lease, spec JobColdBootSpec) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	return v.Boot(ctx, l, BuildJobColdBootConfig(spec, l.Slot), "")
+}
+
+// WaitJobExit (issue #1184 Workstream A / ADR-099) returns a
+// canned "succeeded" envelope so Engine.HandleJobExit unit tests
+// can drive the terminal transition without a real vsock UDS.
+// Production path waits for the guest-init supervisor's DGRAM
+// (port 1026, msg_type 4); the fake is a no-op pass-through.
+func (v *fakeVMM) WaitJobExit(_ context.Context, l Lease, _ time.Duration) (JobExitPayload, error) {
+	return JobExitPayload{ExitCode: 0, ErrorClass: "succeeded", LeaseToken: l.Instance}, nil
+}
+
 func (v *fakeVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) error {
 	v.mu.Lock()
 	v.restored = append(v.restored, l.Instance)
