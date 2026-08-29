@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -197,6 +198,24 @@ type fakeVMM struct {
 	// because Wake treats the report as best-effort).
 	characterizationReport api.CharacterizationReport
 	charReportErr          error
+	// signalAndKillCalls (M-2 / ADR-138 §Decision 1) records every
+	// (instance, signal, grace) the engine's StopInstance dispatch
+	// passed through VMM.SignalAndKill. Default behaviour is no-op
+	// — the actual destroy chain is delegated to DestroyWithExport
+	// once the grace timer fires. Tests assert that the engine's
+	// per-mode dispatch (commit 6) routes worker/job to this seam
+	// and request/service to the legacy snapshotAndPark path.
+	signalAndKillCalls []signalAndKillCall
+}
+
+// signalAndKillCall is the per-call record. signal is the POSIX
+// signal number the engine translated from manifest.StopSignal
+// (0 = use SIGTERM, the manifest default). grace is the
+// per-app StopGracePeriod capped at the per-plan tier (commit 10).
+type signalAndKillCall struct {
+	Instance string
+	Signal   int32
+	Grace    time.Duration
 }
 
 type stagedSecret struct {
@@ -547,6 +566,20 @@ func (v *fakeVMM) DestroyWithExport(_ context.Context, l Lease, _ string) (int, 
 	v.destroyedWithExport = append(v.destroyedWithExport, l.Instance)
 	v.mu.Unlock()
 	return v.destroyWithExportExit, v.destroyWithExportErr
+}
+
+// SignalAndKill (M-2 / ADR-138 §Decision 1) records the
+// (signal, grace) the engine passed so tests can assert on the
+// mode-aware dispatch. Default behaviour is no-op: the
+// DestroyWithExport path is not invoked because the engine's
+// worker/job dispatch lives in pkg/sched/engine_stop_pgtest_test.go
+// (commit 6) — this fake only satisfies the VMM interface so
+// bringUp tests continue to compile.
+func (v *fakeVMM) SignalAndKill(_ context.Context, l Lease, signal syscall.Signal, grace time.Duration) (bool, int32, error) {
+	v.mu.Lock()
+	v.signalAndKillCalls = append(v.signalAndKillCalls, signalAndKillCall{Instance: l.Instance, Signal: int32(signal), Grace: grace})
+	v.mu.Unlock()
+	return false, 0, nil
 }
 
 // WaitCharacterizationReport (ADR-051 PR-D) is the host-side

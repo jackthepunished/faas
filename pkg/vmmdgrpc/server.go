@@ -131,6 +131,18 @@ type VmmdAPI interface {
 	// (the engine's captureWarmSnapshotLocked decides whether
 	// to Destroy the VM on failure).
 	WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error)
+	// SignalAndKill (M-2 / ADR-138 §Decision 1) is the
+	// graceful signal-then-grace-then-SIGKILL stop sequence.
+	// signal is the POSIX signal number to send (0 = use
+	// manifest StopSignal, defaulting to SIGTERM). grace is
+	// the upper bound on clean-shutdown wait. Returns
+	// (killSignalSent, exitCode, err); killSignalSent=true
+	// means the grace window expired and vmmd escalated to
+	// SIGKILL. The gRPC handler lifts these into the
+	// StopInstanceResponse envelope. Unknown instances
+	// return (false, 0, nil) so the gRPC surface is
+	// idempotent — same shape as Destroy.
+	SignalAndKill(ctx context.Context, instance string, signal int32, graceSeconds int32) (killSignalSent bool, exitCode int32, err error)
 }
 
 // flowCounter is the compute-side conntrack seam. Keeping it local to the
@@ -643,6 +655,40 @@ func (s *Server) Destroy(ctx context.Context, req *vmmdpb.DestroyRequest) (*vmmd
 	s.ForgetActivity(req.GetInstance())
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.DestroyResponse{Instance: req.GetInstance(), ExitCode: int32(code)}, nil
+}
+
+// StopInstance (M-2 / ADR-138 §Decision 1) is the graceful
+// signal-then-grace-then-SIGKILL stop sequence. Distinct from
+// Destroy (a hard SIGKILL). Engine.StopInstance (commit 6)
+// dispatches per Instance.ExecutionMode: worker/job → StopInstance
+// with the manifest's StopSignal + StopGracePeriod; request/service
+// → existing snapshotAndPark/Destroy path.
+//
+// signal is the POSIX signal number to send (0 = use manifest
+// StopSignal, defaulting to SIGTERM). graceSeconds is the upper
+// bound on clean-shutdown wait (0 = immediate SIGKILL, the legacy
+// Destroy shape). The response carries the captured exit code and
+// killSignalSent=true iff the grace window expired and vmmd had to
+// escalate. The CPU cache baseline is dropped on every successful
+// stop (and on not-found, idempotent) so the cache does not grow
+// unbounded — same shape as Destroy.
+func (s *Server) StopInstance(ctx context.Context, req *vmmdpb.StopInstanceRequest) (*vmmdpb.StopInstanceResponse, error) {
+	const op = "StopInstance"
+	start := time.Now()
+	killSignalSent, exitCode, err := s.vmm.SignalAndKill(ctx, req.GetInstance(), req.GetSignal(), req.GetGracePeriodS())
+	if err != nil {
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	s.ForgetCPU(req.GetInstance())
+	s.ForgetNet(req.GetInstance())
+	s.ForgetActivity(req.GetInstance())
+	s.ops.Observe(op, time.Since(start), nil)
+	return &vmmdpb.StopInstanceResponse{
+		Instance:       req.GetInstance(),
+		ExitCode:       exitCode,
+		KillSignalSent: killSignalSent,
+	}, nil
 }
 
 // exportDirFor asks the Manager whether the instance was registered as a

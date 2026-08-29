@@ -1363,6 +1363,155 @@ func (v *JailerVMM) Kill(_ context.Context, l Lease) error {
 	return nil
 }
 
+// SignalAndKill (M-2 / ADR-138 §Decision 1) is the graceful stop
+// sequence used by Engine.StopInstance for worker / job mode
+// instances: send `signal` to the guest's PID 1 (via vsock; today
+// the signal lands at guest-init's installSignalHandlers — commit
+// 7), wait up to `grace` for the workload to exit cleanly, and on
+// deadline fall through to a hard SIGKILL via cmd.Process.Kill().
+//
+// The cleanup half (chroot wipe, cgroup scope removal, ring
+// unregister, etc.) is identical to Kill's — reused via a tail call
+// to keep the destruction path in one place. killSignalSent is true
+// iff the deadline fired and SIGKILL was the actual exit cause; the
+// schedd records this on the audit row.
+//
+// Signal=0 with grace=0 is the legacy Destroy shape (immediate
+// SIGKILL, no graceful wait); in that case the function delegates
+// to Kill verbatim and reports killSignalSent=true.
+//
+// Reuses the process-wait watchdog pattern from Kill at lines
+// 1270-1284 (cmd.Wait() observed by the runtime even on signal-
+// induced exit). destroyWait bounds the watchdog; an additional
+// grace timer races against the watchdog to fire SIGKILL on the
+// customer-configured deadline.
+func (v *JailerVMM) SignalAndKill(_ context.Context, l Lease, signal syscall.Signal, grace time.Duration) (killSignalSent bool, exitCode int32, err error) {
+	// Legacy Destroy shape: signal=0, grace=0. Delegate to Kill and
+	// report killSignalSent=true (the SIGKILL is what killed it).
+	if signal == 0 && grace == 0 {
+		if kerr := v.Kill(context.Background(), l); kerr != nil {
+			return true, 0, kerr
+		}
+		return true, 0, nil
+	}
+
+	v.mu.Lock()
+	cmd, hasCmd := v.proc[l.Instance]
+	rec, hasRec := v.recs[l.Instance]
+	v.mu.Unlock()
+
+	// Default signal: SIGTERM. The schedd's Engine.StopInstance (commit 6)
+	// passes the manifest's StopSignal translated to syscall.Signal; an
+	// empty/zero value here means "use SIGTERM" — the same default
+	// Docker's `docker stop` ships.
+	if signal == 0 {
+		signal = syscall.SIGTERM
+	}
+
+	// Send the signal + race grace timer against the watchdog.
+	// Extracted to a free function so the portable test
+	// (pkg/fcvm/vmm_signal_kill_test.go) can exercise the
+	// signal-grace-SIGKILL sequence without booting firecracker.
+	var doneCh <-chan struct{}
+	if hasRec && rec != nil {
+		doneCh = rec.done
+	}
+	killSignalSent, exitCode, err = signalAndKillRace(cmd, doneCh, signal, grace, v.destroyWait)
+	if err != nil {
+		return false, 0, err
+	}
+
+	// Always run the destruction tail (chroot wipe, cgroup scope
+	// removal, ring unregister, etc.) — same invariant as Kill.
+	if killSignalSent {
+		if hasCmd && cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		if hasRec && rec != nil && rec.done != nil {
+			select {
+			case <-rec.done:
+			case <-time.After(v.destroyWait):
+			}
+		}
+		if kerr := v.Kill(context.Background(), l); kerr != nil {
+			return killSignalSent, exitCode, kerr
+		}
+	}
+	return killSignalSent, exitCode, nil
+}
+
+// signalAndKillRace is the inner signal-grace-SIGKILL sequence
+// shared by JailerVMM.SignalAndKill and the portable test.
+// cmd is the running jailer/firecracker child (or any *exec.Cmd
+// the test wants to race against); doneCh is the watchdog
+// channel that closes when the child has exited; signal is the
+// POSIX signal number to send (0 = default SIGTERM); grace is
+// the upper bound on clean-shutdown wait; destroyWait is the
+// cap on the post-SIGKILL watchdog (so a wedged child can't
+// pin the caller forever). Returns (killSignalSent, exitCode,
+// err): killSignalSent=true iff the grace timer fired and we
+// escalated to SIGKILL.
+//
+// Lives in production code (not in the test file) so the test
+// exercises the EXACT shape production ships — no risk of
+// drift between the test fixture and the production path.
+func signalAndKillRace(cmd *exec.Cmd, doneCh <-chan struct{}, signal syscall.Signal, grace time.Duration, destroyWait time.Duration) (bool, int32, error) {
+	if cmd != nil && cmd.Process != nil {
+		if serr := cmd.Process.Signal(signal); serr != nil {
+			// ESRCH (Linux) / os.ErrProcessDone (macOS,
+			// Windows) — both mean "process already gone".
+			// Treated as benign: the workload exited
+			// before we got here. The race-watchdog
+			// below races against the watchdog channel
+			// which the spawn goroutine already closed.
+			if !errors.Is(serr, syscall.ESRCH) && !errors.Is(serr, os.ErrProcessDone) {
+				return false, 0, fmt.Errorf("vmm: signal %d: %w", signal, serr)
+			}
+		}
+	}
+
+	// Wait for clean exit up to grace. We race a timer against
+	// the watchdog. If grace fires first, escalate.
+	if grace > 0 && doneCh != nil {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-doneCh:
+			// Clean exit within grace.
+			exitCode := int32(0)
+			if cmd != nil && cmd.ProcessState != nil {
+				if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+					exitCode = int32(ws.ExitStatus())
+				}
+			}
+			return false, exitCode, nil
+		case <-timer.C:
+			// Grace expired — escalate to SIGKILL.
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			if doneCh != nil {
+				select {
+				case <-doneCh:
+				case <-time.After(destroyWait):
+				}
+			}
+			return true, 0, nil
+		}
+	}
+	// No grace configured or no watchdog — escalate immediately.
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(destroyWait):
+		}
+	}
+	return true, 0, nil
+}
+
 // DestroyWithExport is the build-VM teardown path (M6 / spec §4.5). It blocks
 // until the firecracker child exits (capped by v.destroyWait — default 10m,
 // comfortable above spec §1 BuildTimeoutSeconds), captures the exit code, and

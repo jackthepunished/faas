@@ -233,6 +233,14 @@ func (f *fakeVMM) Destroy(ctx context.Context, _, _ string) error {
 	return nil
 }
 
+// StopInstance (M-2 / ADR-138 §Decision 1) is the graceful
+// signal-then-grace-then-SIGKILL stop sequence. Test fakes
+// default to no-op + nil — the engine's per-mode dispatch lives
+// in pkg/sched/engine_stop_pgtest_test.go (commit 6).
+func (f *fakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) {
+	return nil, nil
+}
+
 // FrameworkReady implements VMM for the engine-test fake (issue #470 /
 // PR #470-FU-B). The cmd/vmmd DGRAM host recv loop calls this on every
 // "framework ready" signal; the engine paths use it indirectly via
