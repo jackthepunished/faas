@@ -24,16 +24,20 @@ import (
 // hits it.
 func ApplyLayer(dst string, tr *tar.Reader) error {
 	for {
-		// codeql[go/zipslip] — tr.Next() returns the tar header whose
-		// name is rejected by resolveEntryPath before any filesystem write;
-		// the resolved path is also clamped beneath the daemon-owned staging
-		// root. Keep this suppression at the taint source line.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("rootfs: read tar: %w", err)
+		}
+		// Reject traversal markers before the archive name reaches any
+		// filesystem operation. resolveEntryPath performs the stronger
+		// containment and symlink-ancestor checks below; this explicit
+		// archive-name guard also keeps static archive-extraction analysis
+		// aligned with the runtime boundary.
+		if strings.Contains(hdr.Name, "..") && !strings.HasSuffix(hdr.Name, whiteoutOpaque) {
+			return fmt.Errorf("rootfs: archive entry %q contains traversal marker", hdr.Name)
 		}
 
 		// codeql[go/path-injection] false-positive: resolveEntryPath rejects ".."

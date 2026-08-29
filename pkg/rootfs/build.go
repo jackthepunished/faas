@@ -630,15 +630,18 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string)
 	tr := tar.NewReader(zr)
 	var written int64
 	for {
-		// codeql[go/zipslip] — tr.Next() returns the tar header whose
-		// name is validated by ApplyTarball's path guards before it reaches
-		// any filesystem operation. Keep this suppression at the taint source line.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("rootfs: read tar: %w", err)
+		}
+		// Reject traversal markers before the archive name reaches the
+		// staging filesystem. The post-prefix resolveEntryPath call below
+		// additionally enforces containment and clamps ancestor symlinks.
+		if strings.Contains(hdr.Name, "..") && !strings.HasSuffix(hdr.Name, whiteoutOpaque) {
+			return fmt.Errorf("rootfs: archive entry %q contains traversal marker", hdr.Name)
 		}
 		// Symlinks / char devices / fifos / hardlinks don't allocate
 		// on-disk bytes for the consumer's quota. Cap is on the
