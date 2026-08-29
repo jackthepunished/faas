@@ -1542,3 +1542,41 @@ type JobDeletedResponse struct {
 	Name      string `json:"name"`
 	DeletedAt string `json:"deleted_at"`
 }
+
+// CancelDeploymentRequest is the optional body of POST
+// /v1/apps/{slug}/deployments/{id}/cancel. Reason must be one of
+// the closed CancelReason values (empty → "user" server-side).
+type CancelDeploymentRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// CancelDeploymentResponse is the wire shape for POST
+// /v1/apps/{slug}/deployments/{id}/cancel. CancelledAt is the
+// RFC3339 timestamp; CancelledBuilds is the list of
+// cascade-cancelled build IDs (empty when no builds were
+// in-flight).
+type CancelDeploymentResponse struct {
+	ID              string    `json:"id"`
+	Status          string    `json:"status"`
+	CancelledAt     time.Time `json:"cancelled_at"`
+	CancelReason    string    `json:"cancel_reason"`
+	CancelledBuilds []string  `json:"cancelled_builds"`
+}
+
+// ReorderDeploymentResponse is the wire shape for POST
+// /v1/deployments/{id}/reorder. Priority is the server-applied
+// value (echo of the request body after the row flip).
+type ReorderDeploymentResponse struct {
+	ID       string `json:"id"`
+	Priority int    `json:"priority"`
+}
+
+// ClearObsoleteReport is the response shape for POST
+// /v1/apps/{slug}/deployments/clear-obsolete. Count is the
+// number of soft-deleted rows in this call; OlderThan echoes the
+// cutoff the store applied (default 168h).
+type ClearObsoleteReport struct {
+	AppSlug   string `json:"app_slug"`
+	Count     int    `json:"count"`
+	OlderThan string `json:"older_than"`
+}

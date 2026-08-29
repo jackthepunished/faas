@@ -2849,7 +2849,7 @@ type Instance struct {
 	Mode string
 	// Kind (issue #1184 Workstream A / ADR-099) discriminates
 	// app VMs from job-task VMs. Closed vocabulary enforced at
-	// the SQL layer by migration 00527's
+	// the SQL layer by migration 00530's
 	// instances_kind_check CHECK constraint:
 	//   - "" / "app_task"  — legacy app VM (the default)
 	//   - "job_task"       — job-task VM (one per active job_task row)
@@ -2879,7 +2879,7 @@ type Instance struct {
 
 // InstanceMode (issue #72 / ADR-125) is the closed vocabulary for
 // the `instances.mode` column. The string values match the
-// migrations/00349 + 00531 CHECK; the sampler, reaper, and schedd
+// migrations/00349 + 00534 CHECK; the sampler, reaper, and schedd
 // engine compare against these constants rather than literal
 // strings so a future widening lands as a compile error at every
 // callsite.

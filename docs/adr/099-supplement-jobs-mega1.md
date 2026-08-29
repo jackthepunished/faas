@@ -3,7 +3,7 @@
 - **Status:** accepted (supplement to ADR-099 v1, status: proposed)
 - **Date:** 2026-08-29
 - **Branch:** `jobs/mega1`
-- **Slot bank:** 00525–00530 (migrations), 0 fences consumed.
+- **Slot bank:** 00528–00533 (migrations), 0 fences consumed.
 
 This supplement records the as-built deviations from ADR-099 v1
 (`docs/adr/099-jobs.md`) introduced by Mega-1 (issue #1184
@@ -13,10 +13,10 @@ order is the canonical reference.
 ## Locked deviations
 
 1. **Slot bank 00517–00524 is fenced by ADR-134 PR-A.** Mega-1
-   migrations start at 00525 per the plan
+   migrations start at 00528 per the plan
    (`/Users/poyrazk/.claude/plans/logical-beaming-church.md`).
    A `git log -- migrations/ | grep reserve_slot` sweep is the
-   pre-merge gate; any fence below 00525 missing in this PR is
+   pre-merge gate; any fence below 00528 missing in this PR is
    a blocker.
 
 2. **Plan caps as-built** (table 1 in §3 of ADR-099 is replaced
@@ -56,14 +56,14 @@ order is the canonical reference.
    so ADR-134's post-Mega-1 refactor is a mechanical swap. ADR-099
    v1 left this decision open.
 
-6. **Pg_notify payload is versioned.** Migration 00529 replaces
+6. **Pg_notify payload is versioned.** Migration 00532 replaces
    the existing `job_tasks_notify_trg` with two channels
    (`job_tasks_dispatched`, `job_tasks_terminal`) carrying
    `{v:1, run_id, task_index, attempt, exit_code, error_class}`.
    Versioned so old listeners ignore new payloads and new
    listeners reject old ones.
 
-7. **Pre-existing jobs without `command`.** Migration 00526
+7. **Pre-existing jobs without `command`.** Migration 00529
    adds `jobs.command text[]` with a fail-closed backfill
    (`echo "no command; PATCH your job"; exit 1`). Customers
    must PATCH before re-running. Documented in the runbook.

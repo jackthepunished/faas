@@ -336,7 +336,7 @@ func shipExitEnvelope(payload JobExitPayload, log *slog.Logger) {
 		}
 		// Per-socket send deadline (1.5s; same as characterize).
 		setSockTimeout(sock, unix.SO_SNDTIMEO, 1500*time.Millisecond)
-		if _, wErr := unix.Sendto(sock, frame, 0, addr); wErr != nil {
+		if wErr := unix.Sendto(sock, frame, 0, addr); wErr != nil {
 			log.Warn("job-exit vsock send", "err", wErr, "attempt", i)
 			_ = unix.Close(sock)
 			if i < attempts-1 {

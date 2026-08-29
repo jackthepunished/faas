@@ -805,10 +805,10 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runMigratingReconcile(ctx)
 		case <-deadNodeTick(deadNodeReconcilerT):
 			l.runDeadNodeReconcile(ctx)
-	case <-jobsTick(jobsDispatchT):
-		l.runJobsDispatchTick(ctx)
-	case <-jobsTick(jobsReaperT):
-		l.runJobsReaperTick(ctx)
+		case <-jobsTick(jobsDispatchT):
+			l.runJobsDispatchTick(ctx)
+		case <-jobsTick(jobsReaperT):
+			l.runJobsReaperTick(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks

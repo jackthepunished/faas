@@ -1,4 +1,4 @@
--- filename: 00531_instances_mode_job.sql
+-- filename: 00534_instances_mode_job.sql
 -- +goose Up
 -- +goose StatementBegin
 --

@@ -127,6 +127,14 @@ tags:
     description: Typed operator runtime configuration and fleet controls.
   - name: invocations
     description: Sync / async function invocations (event-driven surface, Move 2).
+  - name: jobs
+    description: |
+      Run-to-completion batch jobs (issue #1184 Workstream A, Mega-1).
+      Customers POST a stored image + command + env; the platform boots
+      a Firecracker microVM, runs the command to completion, captures
+      the exit code, and reports back. Lifecycle (created → running →
+      succeeded | failed | timeout | oom | cancelled), per-task retry
+      with backoff, dead-letter accounting on exhaustion.
   - name: queues
     description: Per-app FIFO queues (send / receive / ack).
   - name: delayed_tasks
@@ -5635,10 +5643,12 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of jobs to return in this page (1–200, default 50)."
         - name: offset
           in: query
           required: false
           schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of jobs to skip before returning results. NextOffset=-1 in the body signals the last page."
       responses:
         '200':
           description: A page of jobs.
@@ -5748,6 +5758,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$' }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs`."
     get:
       tags: [jobs]
       operationId: listJobRuns
@@ -5757,10 +5768,12 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of runs to return in this page (1–200, default 50)."
         - name: offset
           in: query
           required: false
           schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of runs to skip before returning results. NextOffset=-1 in the body signals the last page."
       responses:
         '200':
           description: A page of runs for this job.
@@ -5811,6 +5824,7 @@ paths:
         in: path
         required: true
         schema: { type: string }
+        description: "Job name (path). DNS-label safe. Body creates a run against this template. Anchors path `/v1/jobs/{name}/runs/{id}`."
       - name: id
         in: path
         required: true
@@ -5836,10 +5850,12 @@ paths:
         in: path
         required: true
         schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/cancel`."
       - name: id
         in: path
         required: true
         schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Returns the run + aggregated counters. Anchors path `/v1/jobs/{name}/runs/{id}/cancel`."
     post:
       tags: [jobs]
       operationId: cancelJobRun
@@ -5867,10 +5883,12 @@ paths:
         in: path
         required: true
         schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks`."
       - name: id
         in: path
         required: true
         schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Body cancels this run. Anchors path `/v1/jobs/{name}/runs/{id}/tasks`."
     get:
       tags: [jobs]
       operationId: listJobRunTasks
@@ -5880,10 +5898,12 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of tasks to return in this page (1–200, default 50)."
         - name: offset
           in: query
           required: false
           schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of tasks to skip before returning results. NextOffset=-1 in the body signals the last page."
       responses:
         '200':
           description: A page of tasks for this run.
@@ -5900,10 +5920,12 @@ paths:
         in: path
         required: true
         schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`."
       - name: id
         in: path
         required: true
         schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Returns a page of tasks. Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`."
       - name: idx
         in: path
         required: true
@@ -5913,6 +5935,7 @@ paths:
         in: query
         required: false
         schema: { type: integer, minimum: 1, maximum: 1048576, default: 65536 }
+        description: "Maximum log payload size to return. Default 64 KiB; capped at 1 MiB."
     get:
       tags: [jobs]
       operationId: getJobTaskLogs
@@ -14185,6 +14208,7 @@ components:
         max_bytes: { type: integer }
 
     ListJobsResponse:
+      description: Page of jobs on the account (issue #1184 Workstream A).
       type: object
       required: [jobs, limit, offset, next_offset, total]
       properties:
@@ -14197,6 +14221,7 @@ components:
         total: { type: integer }
 
     ListJobRunsResponse:
+      description: Page of runs for a job.
       type: object
       required: [runs, limit, offset, next_offset, total]
       properties:
@@ -14209,6 +14234,7 @@ components:
         total: { type: integer }
 
     ListJobTasksResponse:
+      description: Page of tasks for a job-run.
       type: object
       required: [tasks, limit, offset, next_offset, total]
       properties:

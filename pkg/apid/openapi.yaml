@@ -127,6 +127,14 @@ tags:
     description: Typed operator runtime configuration and fleet controls.
   - name: invocations
     description: Sync / async function invocations (event-driven surface, Move 2).
+  - name: jobs
+    description: |
+      Run-to-completion batch jobs (issue #1184 Workstream A, Mega-1).
+      Customers POST a stored image + command + env; the platform boots
+      a Firecracker microVM, runs the command to completion, captures
+      the exit code, and reports back. Lifecycle (created → running →
+      succeeded | failed | timeout | oom | cancelled), per-task retry
+      with backoff, dead-letter accounting on exhaustion.
   - name: queues
     description: Per-app FIFO queues (send / receive / ack).
   - name: delayed_tasks
@@ -5613,6 +5621,339 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Jobs (issue #1184 Workstream A / ADR-099) ─────────────
+  # Run-to-completion jobs. 11 endpoints mirroring the cron
+  # family shape (CRUD + nested run list + task list + logs +
+  # cancel). Plan-tier gate (Free → 402) lives in the handler;
+  # the OpenAPI surfaces the 402 response on every write.
+
+  /v1/jobs:
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: List jobs on the account.
+      description: |
+        Page-based pagination via ?limit / ?offset. NextOffset=-1
+        signals the last page. Free accounts return an empty
+        list (read gate is not in the plan).
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of jobs to return in this page (1–200, default 50)."
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of jobs to skip before returning results. NextOffset=-1 in the body signals the last page."
+      responses:
+        '200':
+          description: A page of jobs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListJobsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [jobs]
+      operationId: createJob
+      summary: Create a job template.
+      description: |
+        Plan-tier gate (Free → 402 jobs_not_allowed) precedes
+        per-plan cap clamping (RAM, task_timeout, parallelism,
+        retry_max). The per-account JobMaxPerAccount quota is
+        enforced atomically (PR-A → PR-B style follow-up).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJobRequest' }
+      responses:
+        '201':
+          description: The new job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Plan tier does not include job support (Free plan).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$' }
+        description: The job slug (3-40 chars, lowercase letters/digits/hyphens).
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: Get one job.
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [jobs]
+      operationId: updateJob
+      summary: Partial-update a job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateJobRequest' }
+      responses:
+        '200':
+          description: The updated job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanLimit' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [jobs]
+      operationId: deleteJob
+      summary: Soft-delete a job.
+      description: |
+        Returns 409 job_has_live_instances when at least one
+        kind='job_task' AND status NOT IN ('parked','destroyed')
+        instance still references the job. Cancel pending runs
+        first or wait for them to drain.
+      responses:
+        '204': { description: No body. The job was soft-deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanLimit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Job has live instances.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}/runs:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$' }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs`."
+    get:
+      tags: [jobs]
+      operationId: listJobRuns
+      summary: List runs of a job.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of runs to return in this page (1–200, default 50)."
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of runs to skip before returning results. NextOffset=-1 in the body signals the last page."
+      responses:
+        '200':
+          description: A page of runs for this job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListJobRunsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [jobs]
+      operationId: createJobRun
+      summary: Fan out N tasks of a job.
+      description: |
+        Atomic fan-out via `generate_series` CTE in pgstore.
+        `tasks` clamped against Plan.JobMaxTasksPerRun
+        (Hobby=100, Pro=1000, Scale=5000). Per-account
+        JobConcurrentPerAccount gate refuses if too many
+        live job_task instances exist.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJobRunRequest' }
+      responses:
+        '201':
+          description: The new run + fan-out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRunResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanLimit' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Job is paused.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}/runs/{id}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+        description: "Job name (path). DNS-label safe. Body creates a run against this template. Anchors path `/v1/jobs/{name}/runs/{id}`."
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: The job_run id (UUID).
+    get:
+      tags: [jobs]
+      operationId: getJobRun
+      summary: Get one run of a job.
+      responses:
+        '200':
+          description: The run aggregate.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRunResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}/runs/{id}/cancel:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/cancel`."
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Returns the run + aggregated counters. Anchors path `/v1/jobs/{name}/runs/{id}/cancel`."
+    post:
+      tags: [jobs]
+      operationId: cancelJobRun
+      summary: Cancel a run.
+      description: |
+        Transitions every non-terminal task of the run to
+        status='cancelled'. For claimed (running) tasks,
+        schedd SIGTERMs the guest; the supervisor catches
+        SIGTERM, writes job_exit{error_class='cancelled',
+        exit_code=143}, then poweroff.
+      responses:
+        '200':
+          description: The cancelled run aggregate.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRunCancelledResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanLimit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}/runs/{id}/tasks:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks`."
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Body cancels this run. Anchors path `/v1/jobs/{name}/runs/{id}/tasks`."
+    get:
+      tags: [jobs]
+      operationId: listJobRunTasks
+      summary: List tasks of a run.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: "Maximum number of tasks to return in this page (1–200, default 50)."
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: "Number of tasks to skip before returning results. NextOffset=-1 in the body signals the last page."
+      responses:
+        '200':
+          description: A page of tasks for this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListJobTasksResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/jobs/{name}/runs/{id}/tasks/{idx}/logs:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+        description: "Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`."
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: "Job-run identifier (UUIDv4, path). Returns a page of tasks. Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`."
+      - name: idx
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+        description: The task index within the run (1-indexed).
+      - name: max_bytes
+        in: query
+        required: false
+        schema: { type: integer, minimum: 1, maximum: 1048576, default: 65536 }
+        description: "Maximum log payload size to return. Default 64 KiB; capped at 1 MiB."
+    get:
+      tags: [jobs]
+      operationId: getJobTaskLogs
+      summary: Get tail logs of a task.
+      description: |
+        Proxied from vmmd's tail endpoint on the compute node
+        that owns the instance. Empty LogContent with
+        Truncated=false means the task never produced output
+        (process exited before writing anything — common for
+        OOM-killed tasks).
+      responses:
+        '200':
+          description: The tail log + truncated flag.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobTaskLogResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/cron-fire-now-requests/{request_id}:
@@ -13720,6 +14061,207 @@ components:
         schedule: { type: [string, "null"] , example: "*/5 * * * *"}
         path: { type: [string, "null"] }
         enabled: { type: [boolean, "null"] }
+
+    # ─── Jobs (issue #1184 Workstream A / ADR-099) ─────────────
+    # Run-to-completion jobs. Each job is a stored template
+    # (image + command + env + caps); POST /v1/jobs/{name}/runs
+    # fans out N tasks that the platform boots as Firecracker
+    # microVMs and runs to completion. See ADR-099 supplement
+    # + docs/runbook/jobs.md.
+
+    CreateJobRequest:
+      description: "Job creation payload — name + image + command + caps."
+      type: object
+      required: [name, image_ref, command]
+      properties:
+        name: { type: string, minLength: 3, maxLength: 40, pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$', example: "nightly-export" }
+        kind: { type: string, enum: [batch, recurring], default: batch }
+        image_ref: { type: string, example: "ghcr.io/acme/etl:v1.2.3" }
+        command:
+          type: array
+          maxItems: 64
+          items: { type: string }
+          example: ["/bin/sh", "-c", "python -m etl.run"]
+        env_overrides:
+          type: object
+          additionalProperties: { type: string }
+          example: { AWS_REGION: "eu-central-1", LOG_LEVEL: "info" }
+        ram_mb: { type: integer, minimum: 0, example: 2048 }
+        task_timeout_sec: { type: integer, minimum: 0, example: 1800 }
+        max_parallelism: { type: integer, minimum: 0, example: 25 }
+        retry_max: { type: integer, minimum: 0, example: 5 }
+
+    UpdateJobRequest:
+      description: "Partial job update. nil pointer fields leave the column untouched."
+      type: object
+      properties:
+        image_ref: { type: string }
+        command:
+          type: array
+          items: { type: string }
+        env_overrides:
+          type: object
+          additionalProperties: { type: string }
+        ram_mb: { type: integer, minimum: 0 }
+        task_timeout_sec: { type: integer, minimum: 0 }
+        max_parallelism: { type: integer, minimum: 0 }
+        retry_max: { type: integer, minimum: 0 }
+        status: { type: string, enum: [active, paused] }
+
+    CreateJobRunRequest:
+      description: |
+        Atomic fan-out via `generate_series` CTE in pgstore; the
+        handler validates `tasks` against `Plan.JobMaxTasksPerRun`
+        (Hobby=100, Pro=1000, Scale=5000). Per-run overrides
+        (parallelism / retry_max / task_timeout_sec) inherit from
+        the job when null.
+      type: object
+      required: [tasks]
+      properties:
+        tasks: { type: integer, minimum: 1, maximum: 5000, example: 100 }
+        parallelism: { type: integer, minimum: 1, example: 10 }
+        retry_max: { type: integer, minimum: 0, example: 3 }
+        task_timeout_sec: { type: integer, minimum: 1, example: 600 }
+        env_overrides:
+          type: object
+          additionalProperties: { type: string }
+
+    JobResponse:
+      description: "Wire projection of state.Job."
+      type: object
+      required: [id, account_id, name, kind, image_ref, command, ram_mb, task_timeout_sec, max_parallelism, retry_max, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        name: { type: string, example: "nightly-export" }
+        kind: { type: string, enum: [batch, recurring] }
+        image_ref: { type: string }
+        command:
+          type: array
+          items: { type: string }
+        env_overrides:
+          type: object
+          additionalProperties: { type: string }
+        ram_mb: { type: integer, example: 2048 }
+        task_timeout_sec: { type: integer, example: 1800 }
+        max_parallelism: { type: integer, example: 25 }
+        retry_max: { type: integer, example: 5 }
+        status: { type: string, enum: [active, paused, deleted] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    JobRunResponse:
+      description: "Wire projection of state.JobRun. Aggregate counters are recomputed by schedd after every terminal task transition."
+      type: object
+      required: [id, job_id, account_id, trigger_kind, tasks, parallelism, aggregate_status, tasks_succeeded, tasks_failed, tasks_cancelled, tasks_running, dead_letter_count, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        trigger_kind: { type: string, enum: [manual, scheduled, triggered] }
+        env_overrides:
+          type: object
+          additionalProperties: { type: string }
+        tasks: { type: integer }
+        parallelism: { type: integer }
+        retry_max: { type: integer }
+        task_timeout_sec: { type: integer }
+        aggregate_status: { type: string, enum: [queued, running, succeeded, failed, cancelled, dead_letter] }
+        tasks_succeeded: { type: integer }
+        tasks_failed: { type: integer }
+        tasks_cancelled: { type: integer }
+        tasks_running: { type: integer }
+        dead_letter_count: { type: integer }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    JobTaskResponse:
+      description: "Wire projection of state.JobTask. LeaseToken is intentionally omitted (internal dispatch primitive)."
+      type: object
+      required: [run_id, task_index, status, attempt, created_at]
+      properties:
+        run_id: { type: string, format: uuid }
+        task_index: { type: integer, minimum: 1 }
+        status: { type: string, enum: [queued, claimed, succeeded, failed, timeout, cancelled, oom] }
+        attempt: { type: integer, minimum: 1 }
+        instance_id: { type: string, format: uuid }
+        error_class: { type: string, enum: [succeeded, failed, timeout, oom, cancelled, infra] }
+        error_message: { type: string }
+        exit_code: { type: integer }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    JobTaskLogResponse:
+      description: |
+        Per-task log tail. Proxied from vmmd's tail endpoint on
+        the compute node that owns the instance. Truncated=true
+        means the tail was capped at MaxBytes; clients re-fetch
+        with a larger limit to see more.
+      type: object
+      required: [task_status, log_content, truncated, max_bytes]
+      properties:
+        task_status: { type: string, enum: [queued, claimed, succeeded, failed, timeout, cancelled, oom] }
+        log_content: { type: string }
+        truncated: { type: boolean }
+        max_bytes: { type: integer }
+
+    ListJobsResponse:
+      description: Page of jobs on the account (issue #1184 Workstream A).
+      type: object
+      required: [jobs, limit, offset, next_offset, total]
+      properties:
+        jobs:
+          type: array
+          items: { $ref: '#/components/schemas/JobResponse' }
+        limit: { type: integer }
+        offset: { type: integer }
+        next_offset: { type: integer, description: "-1 = last page" }
+        total: { type: integer }
+
+    ListJobRunsResponse:
+      description: Page of runs for a job.
+      type: object
+      required: [runs, limit, offset, next_offset, total]
+      properties:
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/JobRunResponse' }
+        limit: { type: integer }
+        offset: { type: integer }
+        next_offset: { type: integer }
+        total: { type: integer }
+
+    ListJobTasksResponse:
+      description: Page of tasks for a job-run.
+      type: object
+      required: [tasks, limit, offset, next_offset, total]
+      properties:
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/JobTaskResponse' }
+        limit: { type: integer }
+        offset: { type: integer }
+        next_offset: { type: integer }
+        total: { type: integer }
+
+    JobRunCancelledResponse:
+      description: "POST .../runs/{id}/cancel body. Returns the post-cancel run aggregate + cancelled_at timestamp."
+      type: object
+      required: [run, cancelled_at]
+      properties:
+        run: { $ref: '#/components/schemas/JobRunResponse' }
+        cancelled_at: { type: string, format: date-time }
+
+    JobDeletedResponse:
+      description: "DELETE /v1/jobs/{name} body."
+      type: object
+      required: [id, name, deleted_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        deleted_at: { type: string, format: date-time }
 
     # ─── Triggers (issue #757 / ADR-100) ────────────────────────────────
     # Unified event-source-mapping primitive. One Trigger row covers

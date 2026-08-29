@@ -383,9 +383,9 @@ func (m *MemStore) JobRunRecompute(_ context.Context, runID string) (JobRun, err
 		case "failed":
 			fail++
 		case "cancelled", "timeout", "oom":
-			// 00525 broadened the terminal vocabulary; memstore
+			// 00528 broadened the terminal vocabulary; memstore
 			// folds timeout/oom into "cancelled" for the aggregate
-			// status so a 00525 test asserts the same outcome as
+			// status so a 00528 test asserts the same outcome as
 			// the pgstore SQL.
 			canc++
 		case "claimed":
