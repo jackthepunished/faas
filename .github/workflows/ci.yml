@@ -495,9 +495,9 @@ jobs:
             coverage_file: cover-shard2b.out
             state_coverage: false
     # The race-enabled state suite includes a large, migration-backed package
-    # and can exceed 18 minutes on shared GitHub runners. Keep a bounded,
+    # and can exceed 28 minutes on shared GitHub runners. Keep a bounded,
     # explicit budget with enough cleanup headroom for the test timeout.
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
@@ -545,7 +545,7 @@ jobs:
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '${{ matrix.package_pattern }}')
           test -n "$PKGS"
           printf '%s\n' "$PKGS"
-          go test -race -count=1 -p 4 -timeout=28m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
+          go test -race -count=1 -p 4 -timeout=40m -coverprofile="coverage/${{ matrix.coverage_file }}" -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
         if: ${{ matrix.state_coverage }}
