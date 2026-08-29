@@ -32,13 +32,13 @@ import (
 // from "present-but-empty" for the OCI `config` envelope.
 type rawConfig struct {
 	// Flat fields (Docker v2 schema).
-	Cmd          []string        `json:"Cmd"`
-	Env          []string        `json:"Env"`
-	WorkingDir   string          `json:"WorkingDir"`
-	Entrypoint   []string        `json:"Entrypoint"`
-	User         string          `json:"User"`
-	StopSignal   string          `json:"StopSignal"`
-	Healthcheck  *rawHealthcheck `json:"Healthcheck"`
+	Cmd         []string        `json:"Cmd"`
+	Env         []string        `json:"Env"`
+	WorkingDir  string          `json:"WorkingDir"`
+	Entrypoint  []string        `json:"Entrypoint"`
+	User        string          `json:"User"`
+	StopSignal  string          `json:"StopSignal"`
+	Healthcheck *rawHealthcheck `json:"Healthcheck"`
 
 	// Nested `config` envelope (OCI image-config). Optional — many
 	// registry implementations omit it entirely.
@@ -68,7 +68,7 @@ type rawNestedConfig struct {
 // envelope. The struct fields mirror Docker semantics:
 //
 //   - Test:     argv for the check command, prefixed by "CMD",
-//               "CMD-SHELL", or "NONE" (the only valid Test[0]).
+//     "CMD-SHELL", or "NONE" (the only valid Test[0]).
 //   - Interval: Docker default 30s.
 //   - Timeout:  Docker default 30s.
 //   - Retries:  Docker default 3.
@@ -79,11 +79,11 @@ type rawNestedConfig struct {
 // registries consistently emit seconds; we use int and convert at the
 // projection site).
 type rawHealthcheck struct {
-	Test        []string `json:"Test"`
-	IntervalS   int      `json:"Interval"`
-	TimeoutS    int      `json:"Timeout"`
-	Retries     int      `json:"Retries"`
-	StartPeriodS int     `json:"StartPeriod"`
+	Test         []string `json:"Test"`
+	IntervalS    int      `json:"Interval"`
+	TimeoutS     int      `json:"Timeout"`
+	Retries      int      `json:"Retries"`
+	StartPeriodS int      `json:"StartPeriod"`
 }
 
 // rawFields is the resolved single-source-of-truth view: each field is

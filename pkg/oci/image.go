@@ -28,7 +28,7 @@ type Layer struct {
 // Config is the subset of the OCI image config we need: the exec contract and
 // the ordered diff_ids that identify each layer bottom-to-top.
 type Config struct {
-	Env        []string // "KEY=VALUE" entries
+	Env        map[string]string // flattened "KEY=VALUE" entries
 	Entrypoint []string
 	Cmd        []string
 	WorkingDir string
@@ -60,7 +60,7 @@ type Config struct {
 //   - Timeout      30s — per-probe HTTP exec timeout.
 //   - Retries       3  — consecutive failure count to mark unhealthy.
 //   - StartPeriod   0s — startup grace during which failures don't
-//                        count (Docker 17.05+).
+//     count (Docker 17.05+).
 //
 // ADR-136 §Decision 3 records the rationale for surfacing these.
 type ImageHealthcheck struct {
@@ -93,15 +93,15 @@ func ParseConfig(r io.Reader) (Config, error) {
 	}
 	f := raw.resolved()
 	return Config{
-		Env:             f.Env,
-		Entrypoint:      f.Entrypoint,
-		Cmd:             f.Cmd,
-		WorkingDir:      f.WorkingDir,
-		User:            f.User,
-		Healthcheck:     healthcheckFromRaw(raw.resolvedHealthcheck()),
-		StopSignal:      raw.resolvedStopSignal(),
+		Env:              envSliceToMap(f.Env),
+		Entrypoint:       f.Entrypoint,
+		Cmd:              f.Cmd,
+		WorkingDir:       f.WorkingDir,
+		User:             f.User,
+		Healthcheck:      healthcheckFromRaw(raw.resolvedHealthcheck()),
+		StopSignal:       raw.resolvedStopSignal(),
 		StopGracePeriodS: stopGraceFromRaw(raw),
-		DiffIDs:         raw.RootFS.DiffIDs,
+		DiffIDs:          raw.RootFS.DiffIDs,
 	}, nil
 }
 
@@ -139,9 +139,19 @@ func ManifestFromConfig(cfg Config) (api.AppManifest, error) {
 		return api.AppManifest{}, fmt.Errorf("%w: image declares neither Entrypoint nor Cmd", ErrImageManifestInvalid)
 	}
 	argv := append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
+	// Short-circuit on argv[0]=="" with the canonical sentinel — a
+	// registry manifest whose Entrypoint/Cmd contains an empty string
+	// at index 0 is the same shape of failure as "neither declared",
+	// and must surface as ErrImageManifestInvalid so the imaged
+	// handler persists the canonical code (api.CodeImageManifestInvalid)
+	// rather than the plain-string Validate() error. Same wrap
+	// pattern as the "neither Entrypoint nor Cmd" guard above.
+	if len(argv) > 0 && argv[0] == "" {
+		return api.AppManifest{}, fmt.Errorf("%w: argv[0] is empty (Entrypoint[0]=%q, Cmd[0]=%q)", ErrImageManifestInvalid, safeHead(cfg.Entrypoint), safeHead(cfg.Cmd))
+	}
 	m := api.AppManifest{
 		Entrypoint: argv,
-		Env:        envSliceToMap(cfg.Env),
+		Env:        cfg.Env, // already a map at this layer; ParseConfig flattens once
 		WorkingDir: cfg.WorkingDir,
 		User:       normalizeUser(cfg.User),
 	}
@@ -164,6 +174,16 @@ func ManifestFromConfig(cfg Config) (api.AppManifest, error) {
 		return api.AppManifest{}, fmt.Errorf("oci: derive manifest: %w", err)
 	}
 	return m, nil
+}
+
+// safeHead returns the first element of s or "" if s is empty. Used
+// only for diagnostic formatting in the ErrImageManifestInvalid
+// error string — never used as a guard.
+func safeHead(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return s[0]
 }
 
 // envSliceToMap converts OCI "KEY=VALUE" entries to a map. Later entries win, and

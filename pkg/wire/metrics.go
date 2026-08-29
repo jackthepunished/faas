@@ -1302,6 +1302,13 @@ type OpsMetrics struct {
 	// vs. denylist catalog edit). Cardinality is identical to
 	// egressDeny — same catalog, same (cidr, family) label set.
 	ociEgressDeny *prometheus.CounterVec
+	// ownershipClamp / layerEntrySkipped: M-1 / ADR-136 §Decision 2
+	// imaged-only counters. Registered ONLY when prefix == "imaged"
+	// (mirrors ociEgressDeny); on every other daemon the fields
+	// stay nil and the accessors below no-op. pkg/rootfs.ApplyLayer
+	// increments via the public accessors in cmd/imaged/main.go.
+	ownershipClamp    *prometheus.CounterVec
+	layerEntrySkipped prometheus.Counter
 	// egressSourceErrors: counter of per-instance sysfs read
 	// failures from cmd/vmmd/network_poller.go (ADR-046, step
 	// 7). The loop polls /sys/class/net/<vethHost>/statistics/
@@ -2783,6 +2790,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// vmmd) from "dialer refused it" (this metric on imaged) — they
 	// have different remediation paths.
 	var ociEgressDeny *prometheus.CounterVec
+	// M-1 / ADR-136 §Decision 2: imaged-only ownership clamp +
+	// layer-entry-skipped counters. Declared as nil on every other
+	// daemon (the accessors nil-check before WithLabelValues /
+	// Write, mirroring OCIEgressDeny).
+	var ownershipClamp *prometheus.CounterVec
+	var layerEntrySkipped prometheus.Counter
 	// Issue #517 / PR-C / ADR-064 — wake-phase collector pair.
 	// Counter gauges per-phase emit counts; histogram buckets
 	// the per-phase duration. Both labelled by the same closed
@@ -2886,6 +2899,27 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
 		commonCollectors = append(commonCollectors, ociEgressDeny)
+		// M-1 / ADR-136 §Decision 2: per-layer-entry ownership clamp
+		// counter. reason ∈ {out_of_range, unparseable_uid,
+		// unparseable_gid}; bounded by the closed set so cardinality
+		// is safe. pkg/rootfs.ApplyLayer calls this from
+		// parseOwnershipInt for every uid/gid that falls outside the
+		// [0, 65534] preserve-range (the cap keeps a customer image
+		// from naming a uid that vmmd hands out to a guest — ADR-019).
+		ownershipClamp = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: prefix + "_ownership_clamp_total",
+			Help: "Layer entries whose declared uid/gid fell outside the preserved range (ADR-136 §Decision 2). reason ∈ {out_of_range, unparseable_uid, unparseable_gid}. The clamp is silent on the file itself — entries land under the imaged daemon uid/gid — but a non-zero rate is the Grafana tripwire for misbuilt base images.",
+		}, []string{"reason"})
+		commonCollectors = append(commonCollectors, ownershipClamp)
+		// M-1: char/block/fifo entries dropped by applyEntry. The
+		// counter is closed-labelled (no labels) — every increment
+		// is the same shape. Tripwire for hostile or misbuilt
+		// layers that ship device entries.
+		layerEntrySkipped = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: prefix + "_layer_entry_skipped_total",
+			Help: "Layer entries dropped by applyEntry (char/block/fifo). A non-zero rate is a tripwire for hostile or misbuilt layers that ship device entries.",
+		})
+		commonCollectors = append(commonCollectors, layerEntrySkipped)
 	}
 	// issue #299: Grype scan findings, per (image, severity). The
 	// `image` label is the OCI ref of the staged base ext4; the
@@ -3911,6 +3945,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		sseClients:                           sseClients,
 		egressDeny:                           egressDeny,
 		ociEgressDeny:                        ociEgressDeny,
+		ownershipClamp:                       ownershipClamp,
+		layerEntrySkipped:                    layerEntrySkipped,
 		provenanceWrites:                     provenanceWrites,
 		imageScanVulns:                       imageScanVulns,
 		deployScanDuration:                   deployScanDuration,
@@ -5556,6 +5592,31 @@ func (m *OpsMetrics) OCIEgressDeny(cidr, family string) prometheus.Counter {
 // for the canonical call site; this is for admin/debug iteration.
 func (m *OpsMetrics) OCIEgressDenySeries() *prometheus.CounterVec {
 	return m.ociEgressDeny
+}
+
+// OwnershipClamp returns the per-reason counter that records layer
+// entries whose declared uid/gid fell outside the preserved range
+// (ADR-136 §Decision 2). reason ∈ {out_of_range, unparseable_uid,
+// unparseable_gid}. Nil-safe on a nil receiver and on non-imaged
+// OpsMetrics (the collector is registered only when prefix ==
+// "imaged"), so pkg/rootfs.ApplyLayer can call without a nil-check.
+// The returned Counter is safe to cache; the underlying CounterVec
+// is shared with other reason tuples.
+func (m *OpsMetrics) OwnershipClamp(reason string) prometheus.Counter {
+	if m == nil || m.ownershipClamp == nil {
+		return nil
+	}
+	return m.ownershipClamp.WithLabelValues(reason)
+}
+
+// LayerEntrySkipped returns the bare Counter for char/block/fifo
+// layer entries dropped by pkg/rootfs.applyEntry. Nil-safe on a nil
+// receiver and on non-imaged OpsMetrics.
+func (m *OpsMetrics) LayerEntrySkipped() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.layerEntrySkipped
 }
 
 // EgressSourceErrors returns the bare Counter that records per-

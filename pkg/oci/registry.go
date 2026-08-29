@@ -408,15 +408,15 @@ func parseImageConfig(b []byte) (ImageConfig, error) {
 		exposed = raw.Config.ExposedPorts
 	}
 	return ImageConfig{
-		Entrypoint:      f.Entrypoint,
-		Cmd:             f.Cmd,
-		Env:             envSliceToMap(f.Env),
-		WorkingDir:      f.WorkingDir,
-		User:            f.User,
-		Healthcheck:     healthcheckFromRaw(raw.resolvedHealthcheck()),
-		StopSignal:      raw.resolvedStopSignal(),
+		Entrypoint:       f.Entrypoint,
+		Cmd:              f.Cmd,
+		Env:              envSliceToMap(f.Env),
+		WorkingDir:       f.WorkingDir,
+		User:             f.User,
+		Healthcheck:      healthcheckFromRaw(raw.resolvedHealthcheck()),
+		StopSignal:       raw.resolvedStopSignal(),
 		StopGracePeriodS: stopGraceFromRaw(raw),
-		ExposedPorts:    exposed,
+		ExposedPorts:     exposed,
 	}, nil
 }
 

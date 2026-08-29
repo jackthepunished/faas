@@ -8,39 +8,59 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/onebox-faas/faas/pkg/wire" // wire ops metrics for imaged-only counters
 )
 
-// layerOwnershipClamp is incremented when a tar header declares a uid/gid
-// outside the [0, 65534] range we honour (ADR-136 §Decision 2 — numeric
-// passthrough within Linux uid_t space; ADR-019 keeps the tenant-jail
-// uid space at 20000-29999 so customer images must not see it). Each
-// clamp is silent on the file itself — the file lands as the imaged
-// daemon uid/gid — but the counter is a Grafana tripwire so a misbuilt
-// base image shows up immediately (M-1 acceptance criterion).
-//
-// `reason` labels:
-//   - "out_of_range": uid or gid parsed but < 0 or > 65534.
-//   - "unparseable":  uid or gid non-empty but not an integer (e.g.
-//                     "root" / "nogroup"). M-1 falls through to the
-//                     daemon uid/gid; M-3 (ADR-X2) adds named-user
-//                     /etc/passwd resolution.
-//
-// The counter is package-level so ApplyLayer callers don't need to
-// thread a metrics handle — promauto registers it with the default
-// registry on first import. The "imaged_" prefix matches the
-// Prometheus naming convention documented in §12 of the spec.
-var layerOwnershipClamp = promauto.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "imaged_ownership_clamp_total",
-		Help: "Total number of layer entries whose declared uid/gid fell outside the preserved range.",
-	},
-	[]string{"reason"},
+// ops is the package-level handle to the imaged daemon's *wire.OpsMetrics.
+// cmd/imaged/main.go calls SetOpsMetrics exactly once at startup so the
+// package doesn't need to thread a metrics handle through every
+// ApplyLayer / applyEntry call. Nil before SetOpsMetrics — the increment
+// sites below nil-check via ops.OwnershipClamp / ops.LayerEntrySkipped,
+// which return nil and safely no-op (per the wire.OpsMetrics contract).
+var ops *wire.OpsMetrics
+
+// SetOpsMetrics wires the imaged daemon's *wire.OpsMetrics into this
+// package so the ownership-clamp and layer-entry-skipped counters
+// surface on the daemon's /metrics endpoint (the same registry that
+// serves imaged_oci_pull_duration_seconds — see cmd/imaged/main.go).
+// Called exactly once at daemon boot; a second call overwrites the
+// handle (test isolation). The counters are registered only when
+// wire.NewOpsMetrics was called with prefix == "imaged" — on every
+// other daemon the accessors return nil and the increment sites
+// no-op, so unit tests that don't init OpsMetrics don't crash.
+func SetOpsMetrics(o *wire.OpsMetrics) { ops = o }
+
+// layerOwnershipClampReason is the labelled reason passed to
+// ops.OwnershipClamp. Closed set:
+//   - "out_of_range": uid/gid parsed but < 0 or > 65534.
+//   - "unparseable_uid" / "unparseable_gid": Uid/Gid integer zero
+//     and Uname/Gname string non-empty — M-3 will resolve against
+//     /etc/passwd; today we fall through to the daemon uid/gid.
+const (
+	ownershipClampOutOfRange     = "out_of_range"
+	ownershipClampUnparseableUID = "unparseable_uid"
+	ownershipClampUnparseableGID = "unparseable_gid"
 )
+
+// recordOwnershipClamp increments the imaged_ownership_clamp_total
+// counter under `reason`. Nil-safe — ops.OwnershipClamp returns nil
+// when no OpsMetrics have been wired, and prometheus.Counter.Inc on
+// a nil receiver is a no-op (the standard library guards this).
+func recordOwnershipClamp(reason string) {
+	if c := ops.OwnershipClamp(reason); c != nil {
+		c.Inc()
+	}
+}
+
+// recordLayerEntrySkipped increments imaged_layer_entry_skipped_total
+// for char/block/fifo entries dropped by applyEntry.
+func recordLayerEntrySkipped() {
+	if c := ops.LayerEntrySkipped(); c != nil {
+		c.Inc()
+	}
+}
 
 // ApplyLayer unpacks one OCI/Docker layer (an uncompressed tar) into dst,
 // applying it on top of whatever earlier layers already populated dst. Layers
@@ -213,31 +233,21 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		// the publisher side; skipping here is the conservative
 		// backstop. The counter gives us a tripwire if a hostile or
 		// misbuilt image ever ships one.
-		layerDeviceSkip.Inc()
+		recordLayerEntrySkipped()
 		return nil
 	default:
 		// fifos / other unusual types — same policy as device entries:
 		// skip silently, count under the generic bucket.
-		layerDeviceSkip.Inc()
+		recordLayerEntrySkipped()
 		return nil
 	}
 }
 
-// layerDeviceSkip counts entries dropped by applyEntry's device/fifo
-// branches. Surfaced alongside layerOwnershipClamp so a Grafana panel
-// can show "what tar entry types have we dropped today".
-var layerDeviceSkip = promauto.NewCounter(
-	prometheus.CounterOpts{
-		Name: "imaged_layer_entry_skipped_total",
-		Help: "Total layer entries dropped (char/block/fifo).",
-	},
-)
-
-// preserveOwnership best-effort applies hdr.Uname/hdr.Gid to target.
-// Numeric-only today (ADR-136 §Decision 2); named-user resolution is
-// M-3 work. Out-of-range and unparseable values increment the clamp
-// counter and fall through — the entry is left under the imaged
-// daemon uid/gid, which is correct for any value we don't understand.
+// preserveOwnership best-effort applies hdr.Uid/hdr.Gid to target.
+// Numeric-only today (ADR-136 §Decision 2); named-user resolution
+// (hdr.Uname → /etc/passwd lookup) is M-3 work. Out-of-range values
+// and named users increment the clamp counter and fall through —
+// the entry is left under the imaged daemon uid/gid.
 //
 // Why os.Lchown (not os.Chown): for symlinks we must target the link
 // itself, not its resolution. For directories and regular files
@@ -260,43 +270,65 @@ func preserveOwnership(target string, hdr *tar.Header) error {
 	return nil
 }
 
-// parseOwnership pulls uid/gid out of the tar header. Returns ok=false
-// (and increments the counter under the appropriate reason) when the
-// values are out of range or unparseable; the caller falls back to the
-// daemon uid/gid.
+// parseOwnership pulls uid/gid out of the tar header. The tar.Header
+// carries BOTH the integer Uid/Gid fields AND the string Uname/Gname
+// fields — historically OCI tools have used either depending on the
+// build host. We prefer the integer fields (BuildKit and Docker both
+// populate Uid/Gid); the string fields are a hint for named users
+// (M-3 follow-up) but only matter when the integer is 0 AND the
+// string is non-empty.
+//
+// Outcomes:
+//
+//	Uid == 0 && Uname == ""  → silent fall-through (BuildKit default)
+//	Uid in [0, 65534]         → preserve uid/gid verbatim
+//	Uid >  65534              → counter "out_of_range", fall through
+//	Uid == 0 && Uname != ""   → counter "unparseable_uid", fall through
+//	                            (M-3 will resolve via /etc/passwd)
+//
+// Returns ok=false when the caller should leave the file under the
+// daemon uid/gid. The counter is incremented before returning false.
 func parseOwnership(hdr *tar.Header) (int, int, bool) {
-	uid, reason := parseOwnershipField(hdr.Uname, "uid")
-	if reason != "" {
-		layerOwnershipClamp.WithLabelValues(reason).Inc()
+	uid, ok := parseOwnershipInt(hdr.Uid, hdr.Uname, "uid")
+	if !ok {
+		// Reason already incremented inside parseOwnershipInt.
 		return 0, 0, false
 	}
-	gid, reason := parseOwnershipField(hdr.Gname, "gid")
-	if reason != "" {
-		layerOwnershipClamp.WithLabelValues(reason).Inc()
-		return 0, 0, false
-	}
-	if !inOwnershipRange(uid) || !inOwnershipRange(gid) {
-		layerOwnershipClamp.WithLabelValues("out_of_range").Inc()
+	gid, ok := parseOwnershipInt(hdr.Gid, hdr.Gname, "gid")
+	if !ok {
 		return 0, 0, false
 	}
 	return uid, gid, true
 }
 
-// parseOwnershipField returns the parsed integer for s, plus a
-// non-empty reason if the value should be clamped. "" means "valid".
-//
-// Empty strings are NOT clamped: a layer that doesn't declare an
-// uname/gname falls through to the daemon uid/gid silently and is
-// the common case (Docker/BuildKit strips these on most layers).
-func parseOwnershipField(s, kind string) (int, string) {
-	if s == "" {
-		return 0, ""
+// parseOwnershipInt classifies a uid/gid tuple into one of four
+// outcomes described on parseOwnership above. ok=true means "preserve
+// this integer"; ok=false means "fall through to the daemon uid/gid".
+func parseOwnershipInt(intVal int, nameVal, kind string) (int, bool) {
+	// Case 1: integer field is populated → use it. In-range is the
+	// only success path; anything outside [0, 65534] is clamped.
+	if intVal != 0 {
+		if !inOwnershipRange(intVal) {
+			recordOwnershipClamp(ownershipClampOutOfRange)
+			return 0, false
+		}
+		return intVal, true
 	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, "unparseable_" + kind
+	// Case 2: integer is 0 and string is non-empty → named user.
+	// M-3 will resolve against /etc/passwd at first start. Today we
+	// can't, so fall through and trip the tripwire.
+	if nameVal != "" {
+		switch kind {
+		case "uid":
+			recordOwnershipClamp(ownershipClampUnparseableUID)
+		case "gid":
+			recordOwnershipClamp(ownershipClampUnparseableGID)
+		}
+		return 0, false
 	}
-	return n, ""
+	// Case 3: both empty → BuildKit default. Silent fall-through,
+	// no counter movement.
+	return 0, false
 }
 
 // inOwnershipRange gates uid/gid values to the Linux uid_t space —

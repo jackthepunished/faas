@@ -1059,12 +1059,12 @@ type CreateDeploymentOverrides struct {
 // in M-2 will prefer Test over Path; until then Path is what
 // guest-init probes (backward-compat preserved).
 type DeploymentHealthcheck struct {
-	Path      string   `json:"path"`
-	IntervalS int      `json:"interval_s,omitempty"`
-	TimeoutS  int      `json:"timeout_s,omitempty"`
-	Retries   int      `json:"retries,omitempty"`
-	Test      []string `json:"test,omitempty"`
-	StartPeriodS int   `json:"start_period_s,omitempty"`
+	Path         string   `json:"path"`
+	IntervalS    int      `json:"interval_s,omitempty"`
+	TimeoutS     int      `json:"timeout_s,omitempty"`
+	Retries      int      `json:"retries,omitempty"`
+	Test         []string `json:"test,omitempty"`
+	StartPeriodS int      `json:"start_period_s,omitempty"`
 }
 
 // DeploymentLivenessProbe is the liveness-probe shape on the

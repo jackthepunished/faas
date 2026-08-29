@@ -122,13 +122,14 @@ func (m AppManifest) Validate() error {
 	}
 	// StopGracePeriod is bounded at the manifest surface to keep the
 	// platform's tail-drain budget sane (spec §4.10 max-shutdown-wait
-	// per ADR-X3 lifecycle contract in M-2). The 5-minute cap is a
-	// gross upper bound; per-plan tightening lands in M-2.
+	// per ADR-X3 lifecycle contract in M-2). The cap is a gross upper
+	// bound; per-plan tightening lands in M-2. Read from the limits
+	// table (CLAUDE.md) so a single edit moves the whole platform.
 	if m.StopGracePeriod < 0 {
 		return fmt.Errorf("app manifest: stop_grace_period %s must be >= 0", m.StopGracePeriod)
 	}
-	if m.StopGracePeriod > 5*time.Minute {
-		return fmt.Errorf("app manifest: stop_grace_period %s exceeds 5m cap", m.StopGracePeriod)
+	if m.StopGracePeriod > MaxAppManifestStopGracePeriod {
+		return fmt.Errorf("app manifest: stop_grace_period %s exceeds %s cap", m.StopGracePeriod, MaxAppManifestStopGracePeriod)
 	}
 	// EnvSecrets: each value must be a "secret:NAME" ref (ADR-053 §Decision 1).
 	// The grammar is shared with pkg/api/dto.go::CreateDeploymentOverrides

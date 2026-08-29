@@ -31,20 +31,20 @@ import (
 // --- cloneEnv ----------------------------------------------------
 
 func TestCloneEnv_NilReturnsNil(t *testing.T) {
-	if got := cloneEnv(nil); got != nil {
+	if got := cloneEnvMap(nil); got != nil {
 		t.Errorf("nil: got %v, want nil", got)
 	}
 }
 
 func TestCloneEnv_EmptyReturnsNil(t *testing.T) {
-	if got := cloneEnv(map[string]string{}); got != nil {
+	if got := cloneEnvMap(map[string]string{}); got != nil {
 		t.Errorf("empty: got %v, want nil", got)
 	}
 }
 
 func TestCloneEnv_PopulatedRoundTrip(t *testing.T) {
 	in := map[string]string{"A": "1", "B": "2"}
-	out := cloneEnv(in)
+	out := cloneEnvMap(in)
 	if len(out) != 2 || out["A"] != "1" || out["B"] != "2" {
 		t.Errorf("got %v, want %v", out, in)
 	}
@@ -52,7 +52,7 @@ func TestCloneEnv_PopulatedRoundTrip(t *testing.T) {
 
 func TestCloneEnv_MutationIsolation(t *testing.T) {
 	in := map[string]string{"A": "1"}
-	out := cloneEnv(in)
+	out := cloneEnvMap(in)
 	out["A"] = "mutated"
 	if in["A"] != "1" {
 		t.Errorf("input mutated: got %q", in["A"])

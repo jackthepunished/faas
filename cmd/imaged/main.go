@@ -281,6 +281,12 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	ops := wire.NewOpsMetrics("imaged")
 	wire.BootStamps(ctx, "imaged", ops)
 	wire.RegisterDefaultOps(ops)
+	// M-1 / ADR-136 §Decision 2: wire pkg/rootfs's per-layer
+	// ownership-clamp + skipped-entry counters onto the daemon's
+	// OpsMetrics so imaged_ownership_clamp_total{reason} and
+	// imaged_layer_entry_skipped_total surface on /metrics. The
+	// setter is idempotent — call once at boot.
+	rootfs.SetOpsMetrics(ops)
 	// ADR-054 acceptance: wire the LocalCacheBackend observer onto the
 	// daemon's *wire.OpsMetrics so stale-fallback serves emit
 	// `imaged_storage_cache_stale_fallback_total`. Uses

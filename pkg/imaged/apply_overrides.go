@@ -68,7 +68,7 @@ func applyOverrides(manifest api.AppManifest, dep state.Deployment) (api.AppMani
 		// Defensive copy: a caller that retries the helper on the same base
 		// (imaged transient error, snapshot re-pull) must not see the merged
 		// state from the first run. Mirrors manifestFromImageConfig's
-		// cloneEnv helper — pre-PR-B code already deep-copied OCI env for
+		// cloneEnvMap helper — pre-PR-B code already deep-copied OCI env for
 		// this reason. PR-B extends that invariant to the override merge.
 		merged := make(map[string]string, len(manifest.Env)+len(overrideEnv))
 		for k, v := range manifest.Env {

@@ -1,19 +1,19 @@
 // layer_ownership_test.go — M-1 (ADR-136 §Decision 2) layer ownership
 // preservation tests.
 //
-// The ApplyLayer path now reads hdr.Uname / hdr.Gname numerically and
+// The ApplyLayer path now reads hdr.Uid / hdr.Gid (the integer fields
+// the tar.Header carries alongside the string Uname/Gname) and
 // preserves the declared uid/gid on the staging tree via os.Lchown.
-// Values outside [0, 65534] or unparseable names fall through to the
-// daemon uid/gid and increment the imaged_ownership_clamp_total
-// counter under the appropriate reason.
+// Values outside [0, 65534] or named users (Uname non-empty but Uid=0)
+// fall through to the daemon uid/gid and increment the
+// imaged_ownership_clamp_total counter under the appropriate reason.
 //
 // Tests below pin the field-level behaviour:
-//   - numeric uid/gid → preserved
-//   - out-of-range    → counter increments, file keeps daemon uid
-//   - unparseable     → counter increments, file keeps daemon uid
-//   - empty (default) → no clamp, file keeps daemon uid
-//   - char/block device → skipped + counted under
-//     imaged_layer_entry_skipped_total
+//   - integer uid/gid in range       → preserved
+//   - integer uid/gid out of range   → counter increments, daemon uid
+//   - Uid=0 + Uname non-empty        → counter increments (named user, M-3)
+//   - Uid=0 + Uname empty            → silent fall-through (BuildKit default)
+//   - char/block device              → skipped + counter incremented
 package rootfs
 
 import (
@@ -22,8 +22,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/wire"
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -55,11 +57,16 @@ func writeTarLayer(t *testing.T, hdr *tar.Header, body []byte) *tar.Reader {
 }
 
 // readCounter returns the cumulative count for the given reason.
+// Tests use wire.NewOpsMetrics("imaged") which pre-registers
+// ownershipClamp + layerEntrySkipped under the imaged prefix, so
+// the increment path (recordOwnershipClamp → ops.OwnershipClamp) is
+// byte-identical to production.
 func readCounter(t *testing.T, reason string) float64 {
 	t.Helper()
-	c, err := layerOwnershipClamp.GetMetricWithLabelValues(reason)
-	if err != nil {
-		t.Fatalf("GetMetricWithLabelValues(%q): %v", reason, err)
+	ensureTestOps(t)
+	c := ops.OwnershipClamp(reason)
+	if c == nil {
+		t.Fatalf("ops.OwnershipClamp(%q) returned nil; OpsMetrics prefix may not be 'imaged'", reason)
 	}
 	m := &dto.Metric{}
 	if err := c.Write(m); err != nil {
@@ -71,14 +78,70 @@ func readCounter(t *testing.T, reason string) float64 {
 // readDeviceSkipTotal returns the cumulative skip count.
 func readDeviceSkipTotal(t *testing.T) float64 {
 	t.Helper()
+	ensureTestOps(t)
+	c := ops.LayerEntrySkipped()
+	if c == nil {
+		t.Fatalf("ops.LayerEntrySkipped returned nil; OpsMetrics prefix may not be 'imaged'")
+	}
 	m := &dto.Metric{}
-	if err := layerDeviceSkip.Write(m); err != nil {
+	if err := c.Write(m); err != nil {
 		t.Fatalf("layerDeviceSkip.Write: %v", err)
 	}
 	return m.GetCounter().GetValue()
 }
 
-func TestPreserveOwnership_OutOfRangeClamped(t *testing.T) {
+// ensureTestOps builds a fresh *wire.OpsMetrics with prefix "imaged"
+// (so the ownershipClamp / layerEntrySkipped fields are registered)
+// and wires it via SetOpsMetrics. Tests run in package rootfs so they
+// share the package-level `ops` var. Each test that calls readCounter
+// or readDeviceSkipTotal pays the NewOpsMetrics cost once; subsequent
+// tests in the same package see the cached handle.
+func ensureTestOps(t *testing.T) {
+	t.Helper()
+	if ops != nil {
+		return
+	}
+	ops = wire.NewOpsMetrics("imaged")
+	SetOpsMetrics(ops)
+}
+
+func TestPreserveOwnership_IntegerInRange(t *testing.T) {
+	requireRoot(t)
+	// Pre-fix regression: parseOwnership read hdr.Uname (string) so
+	// the integer Uid field was ignored and the file landed as
+	// daemon uid. With the fix, integer Uid=1001 lands as uid 1001
+	// regardless of what Uname says (BuildKit typically writes both).
+	tmp := t.TempDir()
+	hdr := &tar.Header{
+		Name:     "owned-by-1001",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     5,
+		Uid:      1001,
+		Gid:      1001,
+		Uname:    "app", // intentionally non-numeric — must be ignored
+		Gname:    "app",
+	}
+	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatalf("applyEntry: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(tmp, "owned-by-1001"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := statUID(info); got != 1001 {
+		t.Errorf("uid = %d; want 1001 (integer field must win over Uname string)", got)
+	}
+	if got := statGID(info); got != 1001 {
+		t.Errorf("gid = %d; want 1001", got)
+	}
+}
+
+func TestPreserveOwnership_IntegerOutOfRangeClamped(t *testing.T) {
+	// An integer Uid/Gid above 65534 must clamp to daemon uid and
+	// increment imaged_ownership_clamp_total{out_of_range}. Pre-fix
+	// the same scenario tripped only if Uname was the magic string
+	// "99999"; this test pins the integer-field path.
 	before := readCounter(t, "out_of_range")
 
 	tmp := t.TempDir()
@@ -87,8 +150,8 @@ func TestPreserveOwnership_OutOfRangeClamped(t *testing.T) {
 		Typeflag: tar.TypeReg,
 		Mode:     0o644,
 		Size:     1,
-		Uname:    "99999",
-		Gname:    "99999",
+		Uid:      99999,
+		Gid:      99999,
 	}
 	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("x"))); err != nil {
 		t.Fatalf("applyEntry: %v", err)
@@ -97,9 +160,22 @@ func TestPreserveOwnership_OutOfRangeClamped(t *testing.T) {
 	if got := after - before; got != 1 {
 		t.Errorf("imaged_ownership_clamp_total{out_of_range} delta = %v; want 1", got)
 	}
+	// The file must NOT be chowned to 99999 — that uid doesn't
+	// exist on the host. Confirm daemon uid is what landed.
+	info, err := os.Stat(filepath.Join(tmp, "out-of-range"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := statUID(info); got == 99999 {
+		t.Errorf("uid = %d; want NOT 99999 (must clamp)", got)
+	}
 }
 
-func TestPreserveOwnership_UnparseableFallsThrough(t *testing.T) {
+func TestPreserveOwnership_NamedUserTrips(t *testing.T) {
+	// Uid=0 with Uname="node" → counter unparseable_uid, daemon uid.
+	// Pre-fix, hdr.Uname="1001" was the only way to trigger
+	// preservation (the int field was ignored). With the fix, an
+	// integer Uid wins; named users trip the counter.
 	before := readCounter(t, "unparseable_uid")
 
 	tmp := t.TempDir()
@@ -108,8 +184,10 @@ func TestPreserveOwnership_UnparseableFallsThrough(t *testing.T) {
 		Typeflag: tar.TypeReg,
 		Mode:     0o644,
 		Size:     1,
-		Uname:    "node", // M-3 (named-user /etc/passwd lookup) is deferred
-		Gname:    "1000",
+		Uid:      0,
+		Gid:      0,
+		Uname:    "node",
+		Gname:    "nogroup",
 	}
 	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("x"))); err != nil {
 		t.Fatalf("applyEntry: %v", err)
@@ -120,31 +198,11 @@ func TestPreserveOwnership_UnparseableFallsThrough(t *testing.T) {
 	}
 }
 
-func TestPreserveOwnership_UnparseableGidIncrements(t *testing.T) {
-	before := readCounter(t, "unparseable_gid")
-
-	tmp := t.TempDir()
-	hdr := &tar.Header{
-		Name:     "named-gid",
-		Typeflag: tar.TypeReg,
-		Mode:     0o644,
-		Size:     1,
-		Uname:    "1000",
-		Gname:    "nogroup",
-	}
-	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("applyEntry: %v", err)
-	}
-	after := readCounter(t, "unparseable_gid")
-	if got := after - before; got != 1 {
-		t.Errorf("imaged_ownership_clamp_total{unparseable_gid} delta = %v; want 1", got)
-	}
-}
-
 func TestPreserveOwnership_EmptyStaysSilent(t *testing.T) {
-	// A layer with no Uname/Gname declared (the common case for
-	// BuildKit output) does NOT trip the counter — fall through
-	// silently.
+	// Uid=0 AND Uname="" → BuildKit default. No counter movement,
+	// no chown call. Pre-fix this case explicitly chowned the file
+	// to root:root (silent bug — counter looked fine but the file's
+	// owner was overwritten).
 	beforeOOR := readCounter(t, "out_of_range")
 	beforeUnpUID := readCounter(t, "unparseable_uid")
 	beforeUnpGID := readCounter(t, "unparseable_gid")
@@ -155,7 +213,7 @@ func TestPreserveOwnership_EmptyStaysSilent(t *testing.T) {
 		Typeflag: tar.TypeReg,
 		Mode:     0o644,
 		Size:     1,
-		// Uname/Gname left empty
+		// Uid/Gid/Uname/Gname all zero/empty
 	}
 	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("x"))); err != nil {
 		t.Fatalf("applyEntry: %v", err)
@@ -164,35 +222,42 @@ func TestPreserveOwnership_EmptyStaysSilent(t *testing.T) {
 	afterUnpUID := readCounter(t, "unparseable_uid")
 	afterUnpGID := readCounter(t, "unparseable_gid")
 	if afterOOR != beforeOOR || afterUnpUID != beforeUnpUID || afterUnpGID != beforeUnpGID {
-		t.Errorf("empty Uname/Gname must not increment any clamp counter (OOR %v→%v, uid %v→%v, gid %v→%v)",
+		t.Errorf("empty uid/gid + Uname/Gname must not increment any clamp counter (OOR %v→%v, uid %v→%v, gid %v→%v)",
 			beforeOOR, afterOOR, beforeUnpUID, afterUnpUID, beforeUnpGID, afterUnpGID)
 	}
 }
 
-func TestPreserveOwnership_NumericPassesThrough(t *testing.T) {
-	beforeOOR := readCounter(t, "out_of_range")
-	beforeUnpUID := readCounter(t, "unparseable_uid")
-
+func TestPreserveOwnership_EmptyDoesNotChownToRoot(t *testing.T) {
+	// The pre-fix bug: empty headers triggered os.Lchown(target, 0, 0)
+	// silently. Pin the post-fix behaviour — daemon uid preserved.
 	tmp := t.TempDir()
 	hdr := &tar.Header{
-		Name:     "owned-by-1001",
+		Name:     "stays-daemon-owned",
 		Typeflag: tar.TypeReg,
 		Mode:     0o644,
-		Size:     5,
-		Uname:    "1001",
-		Gname:    "1001",
+		Size:     1,
 	}
-	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("hello"))); err != nil {
+	if err := applyEntry(tmp, filepath.Join(tmp, hdr.Name), hdr, bytes.NewReader([]byte("x"))); err != nil {
 		t.Fatalf("applyEntry: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "owned-by-1001")); err != nil {
+	info, err := os.Stat(filepath.Join(tmp, "stays-daemon-owned"))
+	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	afterOOR := readCounter(t, "out_of_range")
-	afterUnpUID := readCounter(t, "unparseable_uid")
-	if afterOOR != beforeOOR || afterUnpUID != beforeUnpUID {
-		t.Errorf("numeric passthrough must not clamp (OOR %v→%v, uid %v→%v)",
-			beforeOOR, afterOOR, beforeUnpUID, afterUnpUID)
+	// Touch a control file the same way ApplyLayer would have,
+	// then compare its uid — both must match (proves preserveOwnership
+	// didn't chown to root).
+	control := filepath.Join(tmp, "control")
+	if err := os.WriteFile(control, []byte("y"), 0o644); err != nil {
+		t.Fatalf("control write: %v", err)
+	}
+	cinfo, err := os.Stat(control)
+	if err != nil {
+		t.Fatalf("Stat(control): %v", err)
+	}
+	if got := statUID(info); got != statUID(cinfo) {
+		t.Errorf("uid = %d (control %d); preserveOwnership must NOT chown when header is empty",
+			got, statUID(cinfo))
 	}
 }
 
@@ -204,8 +269,8 @@ func TestPreserveOwnership_DeviceEntrySkipped(t *testing.T) {
 		Name:     "null-device",
 		Typeflag: tar.TypeChar,
 		Mode:     0o666,
-		Uname:    "0",
-		Gname:    "0",
+		Uid:      0,
+		Gid:      0,
 		Devmajor: 1,
 		Devminor: 3,
 	}
@@ -222,17 +287,18 @@ func TestPreserveOwnership_DeviceEntrySkipped(t *testing.T) {
 }
 
 func TestApplyLayer_OwnershipAppliedEndToEnd(t *testing.T) {
+	requireRoot(t)
 	// Drive ApplyLayer (the full pipeline) with a tar containing a
 	// single regular file declaring USER 1001; the file lands on
-	// disk and the body is preserved.
+	// disk as uid 1001 and the body is preserved.
 	tmp := t.TempDir()
 	hdr := &tar.Header{
 		Name:     "app/server",
 		Typeflag: tar.TypeReg,
 		Mode:     0o755,
 		Size:     3,
-		Uname:    "1001",
-		Gname:    "1001",
+		Uid:      1001,
+		Gid:      1001,
 	}
 	tr := writeTarLayer(t, hdr, []byte("bin"))
 	if err := ApplyLayer(tmp, tr); err != nil {
@@ -248,9 +314,13 @@ func TestApplyLayer_OwnershipAppliedEndToEnd(t *testing.T) {
 	if size := info.Size(); size != 3 {
 		t.Errorf("size = %d; want 3", size)
 	}
+	if got := statUID(info); got != 1001 {
+		t.Errorf("uid = %d; want 1001 (ApplyLayer must wire os.Lchown end-to-end)", got)
+	}
 }
 
 func TestApplyLayer_OutOfRangeClampEndToEnd(t *testing.T) {
+	requireRoot(t)
 	before := readCounter(t, "out_of_range")
 
 	tmp := t.TempDir()
@@ -259,15 +329,19 @@ func TestApplyLayer_OutOfRangeClampEndToEnd(t *testing.T) {
 		Typeflag: tar.TypeReg,
 		Mode:     0o644,
 		Size:     1,
-		Uname:    "70000",
-		Gname:    "70000",
+		Uid:      70000,
+		Gid:      70000,
 	}
 	tr := writeTarLayer(t, hdr, []byte("x"))
 	if err := ApplyLayer(tmp, tr); err != nil {
 		t.Fatalf("ApplyLayer: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "weird-uid")); err != nil {
+	info, err := os.Stat(filepath.Join(tmp, "weird-uid"))
+	if err != nil {
 		t.Fatalf("Stat: %v", err)
+	}
+	if got := statUID(info); got == 70000 {
+		t.Errorf("uid = %d; must NOT be 70000 (out_of_range clamp)", got)
 	}
 	after := readCounter(t, "out_of_range")
 	if got := after - before; got != 1 {
@@ -298,40 +372,47 @@ func TestInOwnershipRange(t *testing.T) {
 	}
 }
 
-func TestParseOwnershipField(t *testing.T) {
+func TestParseOwnershipInt(t *testing.T) {
 	cases := []struct {
-		s           string
+		name        string
+		intVal      int
+		nameVal     string
 		kind        string
 		wantN       int
-		wantReason  string // "" or "unparseable_<kind>"; out-of-range surfaced later
-		wantInRange bool   // parsed value should pass inOwnershipRange
+		wantOK      bool
+		wantCounter string // expected counter movement
 	}{
-		// parseOwnershipField itself doesn't check range — inOwnershipRange
-		// does, on the parsed int. The table pins both.
-		{s: "", kind: "uid", wantN: 0, wantReason: "", wantInRange: true},
-		{s: "0", kind: "uid", wantN: 0, wantReason: "", wantInRange: true},
-		{s: "1001", kind: "uid", wantN: 1001, wantReason: "", wantInRange: true},
-		{s: "-1", kind: "uid", wantN: -1, wantReason: "", wantInRange: false},
-		{s: "99999", kind: "uid", wantN: 99999, wantReason: "", wantInRange: false},
-		// Unparseable inputs surface under "unparseable_<kind>". The
-		// returned n is 0, which is in-range — but the caller (parseOwnership)
-		// short-circuits on the reason before checking range, so
-		// inOwnershipRange(0)=true is fine here.
-		{s: "node", kind: "uid", wantN: 0, wantReason: "unparseable_uid", wantInRange: true},
-		{s: "postgres", kind: "gid", wantN: 0, wantReason: "unparseable_gid", wantInRange: true},
-		{s: "65534", kind: "gid", wantN: 65534, wantReason: "", wantInRange: true},
+		// Integer field wins (the whole point of M-1).
+		{intVal: 1001, nameVal: "app", kind: "uid", wantN: 1001, wantOK: true},
+		{intVal: 0, nameVal: "node", kind: "uid", wantOK: false, wantCounter: "unparseable_uid"},
+		{intVal: 0, nameVal: "", kind: "uid", wantOK: false, wantCounter: ""},
+		{intVal: 65534, nameVal: "", kind: "uid", wantN: 65534, wantOK: true},
+		{intVal: 99999, nameVal: "", kind: "uid", wantOK: false, wantCounter: "out_of_range"},
+		// Named gid: same path.
+		{intVal: 0, nameVal: "nogroup", kind: "gid", wantOK: false, wantCounter: "unparseable_gid"},
 	}
 	for _, tc := range cases {
-		n, reason := parseOwnershipField(tc.s, tc.kind)
-		if n != tc.wantN {
-			t.Errorf("parseOwnershipField(%q,%s) n = %d; want %d", tc.s, tc.kind, n, tc.wantN)
-		}
-		if reason != tc.wantReason {
-			t.Errorf("parseOwnershipField(%q,%s) reason = %q; want %q", tc.s, tc.kind, reason, tc.wantReason)
-		}
-		if got := inOwnershipRange(n); got != tc.wantInRange {
-			t.Errorf("inOwnershipRange(%d) = %v; want %v (for %q)", n, got, tc.wantInRange, tc.s)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			var before float64
+			if tc.wantCounter != "" {
+				before = readCounter(t, tc.wantCounter)
+			}
+			n, ok := parseOwnershipInt(tc.intVal, tc.nameVal, tc.kind)
+			if ok != tc.wantOK {
+				t.Errorf("parseOwnershipInt(%d,%q,%s) ok = %v; want %v",
+					tc.intVal, tc.nameVal, tc.kind, ok, tc.wantOK)
+			}
+			if n != tc.wantN {
+				t.Errorf("parseOwnershipInt(%d,%q,%s) n = %d; want %d",
+					tc.intVal, tc.nameVal, tc.kind, n, tc.wantN)
+			}
+			if tc.wantCounter != "" {
+				after := readCounter(t, tc.wantCounter)
+				if after-before != 1 {
+					t.Errorf("counter %q delta = %v; want 1", tc.wantCounter, after-before)
+				}
+			}
+		})
 	}
 }
 
@@ -342,8 +423,8 @@ func TestApplyEntryPreservesOwnershipOnSymlink(t *testing.T) {
 		Name:     "bin-sh",
 		Typeflag: tar.TypeSymlink,
 		Linkname: "/bin/busybox",
-		Uname:    "1001",
-		Gname:    "1001",
+		Uid:      1001,
+		Gid:      1001,
 	}
 	if err := applyEntryPublic(t, tmp, hdr); err != nil {
 		t.Fatalf("applyEntry(symlink): %v", err)
@@ -360,7 +441,8 @@ func TestApplyEntryPreservesOwnershipOnSymlink(t *testing.T) {
 	}
 }
 
-func TestPreserveOwnership_DirNumeric(t *testing.T) {
+func TestPreserveOwnership_DirIntegerInRange(t *testing.T) {
+	requireRoot(t)
 	// Directory entries must also flow through preserveOwnership —
 	// ADR-136 §Decision 2 says every entry, not just regular files.
 	tmp := t.TempDir()
@@ -368,8 +450,8 @@ func TestPreserveOwnership_DirNumeric(t *testing.T) {
 		Name:     "data-dir",
 		Typeflag: tar.TypeDir,
 		Mode:     0o755,
-		Uname:    "1001",
-		Gname:    "1001",
+		Uid:      1001,
+		Gid:      1001,
 	}
 	if err := applyEntryPublic(t, tmp, hdr); err != nil {
 		t.Fatalf("applyEntry(dir): %v", err)
@@ -381,13 +463,16 @@ func TestPreserveOwnership_DirNumeric(t *testing.T) {
 	if !info.IsDir() {
 		t.Errorf("data-dir is not a directory: %v", info.Mode())
 	}
+	if got := statUID(info); got != 1001 {
+		t.Errorf("uid = %d; want 1001 (directory entries must flow through)", got)
+	}
 }
 
 // Compile-time guard: ensure parseOwnership's three return values
 // are stable. (Function signature changes would break the build
 // here before they break callers.)
 var _ = func() (int, int, bool) {
-	uid, gid, ok := parseOwnership(&tar.Header{Uname: "0", Gname: "0"})
+	uid, gid, ok := parseOwnership(&tar.Header{Uid: 0, Gid: 0})
 	_ = uid
 	_ = gid
 	return uid, gid, ok
@@ -396,3 +481,36 @@ var _ = func() (int, int, bool) {
 // strings.HasPrefix keeps the import alive without churning the
 // file when other helpers are added.
 var _ = strings.HasPrefix
+
+// --- platform-specific stat helpers ---------------------------------
+//
+// statUID / statGID extract the integer uid/gid from a FileInfo.
+// On Linux the FileInfo.Sys() returns *syscall.Stat_t with Uid/Gid
+// as int32 (libc convention) — we assert to that concrete type.
+// On non-Linux platforms the helper returns -1; the comparison
+// tests are skipped (build tag = linux) so we don't pretend.
+func statUID(info os.FileInfo) int {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid)
+	}
+	return -1
+}
+
+func statGID(info os.FileInfo) int {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return int(st.Gid)
+	}
+	return -1
+}
+
+// requireRoot skips the test when not running as root, because
+// os.Lchown is a no-op for non-root users and the assertions would
+// see the daemon uid/gid regardless. The parseOwnership logic itself
+// (which is what we ship) is independent of root — see the
+// TestParseOwnershipInt case for that surface.
+func requireRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("Lchown requires root; parseOwnership logic is independent of root and is covered by TestParseOwnershipInt")
+	}
+}

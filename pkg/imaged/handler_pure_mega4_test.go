@@ -161,8 +161,8 @@ func TestManifestFromImageConfig_UserAndHealthcheckFlow_Mega4(t *testing.T) {
 	// survive the registry path. StopSignal too — it lands on
 	// AppManifest.StopSignal directly.
 	m, err := manifestFromImageConfig(oci.ImageConfig{
-		Cmd:    []string{"/x"},
-		User:   "1001",
+		Cmd:  []string{"/x"},
+		User: "1001",
 		Healthcheck: &oci.ImageHealthcheck{
 			Test:      []string{"CMD", "/bin/check"},
 			IntervalS: 30,
@@ -188,10 +188,10 @@ func TestManifestFromImageConfig_UserAndHealthcheckFlow_Mega4(t *testing.T) {
 func TestCloneEnv_NilInput_Mega4(t *testing.T) {
 	t.Parallel()
 	// Empty/nil input → nil output (mirrors the contract).
-	if got := cloneEnv(nil); got != nil {
+	if got := cloneEnvMap(nil); got != nil {
 		t.Errorf("nil: %v, want nil", got)
 	}
-	if got := cloneEnv(map[string]string{}); got != nil {
+	if got := cloneEnvMap(map[string]string{}); got != nil {
 		t.Errorf("empty: %v, want nil", got)
 	}
 }
@@ -199,7 +199,7 @@ func TestCloneEnv_NilInput_Mega4(t *testing.T) {
 func TestCloneEnv_Populated_Mega4(t *testing.T) {
 	t.Parallel()
 	src := map[string]string{"A": "1", "B": "2"}
-	cp := cloneEnv(src)
+	cp := cloneEnvMap(src)
 	if cp["A"] != "1" || cp["B"] != "2" {
 		t.Errorf("got %v", cp)
 	}

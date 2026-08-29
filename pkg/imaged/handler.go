@@ -2235,13 +2235,13 @@ func runtimeToEnvSuffix(runtime string) string {
 // is the customer's call).
 func manifestFromImageConfig(cfg oci.ImageConfig) (api.AppManifest, error) {
 	manifest, err := oci.ManifestFromConfig(oci.Config{
-		Env:             envSliceFromMap(cfg.Env),
-		Entrypoint:      append([]string(nil), cfg.Entrypoint...),
-		Cmd:             append([]string(nil), cfg.Cmd...),
-		WorkingDir:      cfg.WorkingDir,
-		User:            cfg.User,
-		Healthcheck:     cfg.Healthcheck,
-		StopSignal:      cfg.StopSignal,
+		Env:              cloneEnvMap(cfg.Env),
+		Entrypoint:       append([]string(nil), cfg.Entrypoint...),
+		Cmd:              append([]string(nil), cfg.Cmd...),
+		WorkingDir:       cfg.WorkingDir,
+		User:             cfg.User,
+		Healthcheck:      cfg.Healthcheck,
+		StopSignal:       cfg.StopSignal,
 		StopGracePeriodS: cfg.StopGracePeriodS,
 	})
 	if err != nil {
@@ -2253,43 +2253,34 @@ func manifestFromImageConfig(cfg oci.ImageConfig) (api.AppManifest, error) {
 	// doesn't overwrite Customer-supplied OCI values (env flattening
 	// has already turned `Env` into a map by this point, so PORT
 	// can be checked with `_, set := manifest.Env["PORT"]`).
-	if manifest.Healthz == "" {
-		manifest.Healthz = defaultHealthzPath
-	}
-	if manifest.Env == nil {
-		manifest.Env = make(map[string]string, 1)
-	}
-	if _, set := manifest.Env["PORT"]; !set {
-		manifest.Env["PORT"] = "8080"
-	}
+	applyContainerDefaults(&manifest)
 	return manifest, nil
 }
 
-// envSliceFromMap converts a parsed env map back to OCI "KEY=VALUE"
-// entries for delegation to oci.ManifestFromConfig. An entry with an
-// empty key (rare but legal per OCI env grammar) is preserved as
-// "=VALUE"; an entry with an empty value is "KEY=".
-//
-// Why this helper exists — the registry pull path's ImageConfig.Env is
-// already a map (registry.go's envSliceToMap runs at parse time, see
-// commit 3), but oci.ManifestFromConfig's signature consumes a slice
-// to match the OCI wire shape. We round-trip the map → slice → map
-// here so the canonical projection runs through one code path.
-func envSliceFromMap(m map[string]string) []string {
-	if len(m) == 0 {
-		return nil
+// applyContainerDefaults seeds the platform-default Healthz path
+// (ADR-051 §"Consequences") and the PORT=8080 env var when the
+// customer didn't pin them. Lives here so both the registry pull
+// path (manifestFromImageConfig) and the local OCI build path
+// (buildLocalOCIAppLayer in local_oci.go) share the exact same
+// seeding rule — the F8 fixup consolidates what was duplicated.
+func applyContainerDefaults(m *api.AppManifest) {
+	if m.Healthz == "" {
+		m.Healthz = defaultHealthzPath
 	}
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
+	if m.Env == nil {
+		m.Env = make(map[string]string, 1)
 	}
-	return out
+	if _, set := m.Env["PORT"]; !set {
+		m.Env["PORT"] = "8080"
+	}
 }
 
-// cloneEnv returns a defensive copy of the env map. The caller (handleDeployment
-// or its caller) may apply per-deploy overrides without mutating the shared
-// ImageConfig the puller returned.
-func cloneEnv(m map[string]string) map[string]string {
+// cloneEnvMap returns a defensive copy of the env map. The caller
+// (manifestFromImageConfig, handleDeployment) may apply per-deploy
+// overrides without mutating the shared ImageConfig the puller
+// returned. Renamed from cloneEnv at the F8 fixup — "Env" was too
+// generic once oci.Config.Env became a map (no slice to clone from).
+func cloneEnvMap(m map[string]string) map[string]string {
 	if len(m) == 0 {
 		return nil
 	}

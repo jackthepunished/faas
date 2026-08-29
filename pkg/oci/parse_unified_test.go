@@ -85,8 +85,8 @@ func TestParseConfig_BothPreferFlat(t *testing.T) {
 	if got, want := cfg.Cmd[0], "/flat/cmd"; got != want {
 		t.Errorf("Config.Cmd[0] = %q; want %q (flat precedence)", got, want)
 	}
-	if got, want := cfg.Env[0], "FROM=flat"; got != want {
-		t.Errorf("Config.Env[0] = %q; want %q (flat precedence)", got, want)
+	if got, want := cfg.Env["FROM"], "flat"; got != want {
+		t.Errorf("Config.Env[FROM] = %q; want %q (flat precedence)", got, want)
 	}
 	if got, want := cfg.Entrypoint[0], "/flat/entrypoint"; got != want {
 		t.Errorf("Config.Entrypoint[0] = %q; want %q (flat precedence)", got, want)
