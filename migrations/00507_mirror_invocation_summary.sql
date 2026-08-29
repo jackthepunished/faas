@@ -1,4 +1,4 @@
--- filename: 00501_mirror_invocation_summary.sql
+-- filename: 00507_mirror_invocation_summary.sql
 -- +goose Up
 -- +goose StatementBegin
 --
