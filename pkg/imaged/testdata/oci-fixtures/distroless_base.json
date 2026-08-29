@@ -1,0 +1,16 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Entrypoint": [],
+    "Cmd": ["/bin/sh"],
+    "User": "0",
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}

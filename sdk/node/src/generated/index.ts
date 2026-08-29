@@ -33,6 +33,7 @@ export type { AppErrorSummaryItem } from './models/AppErrorSummaryItem.js';
 export type { AppliedBuild } from './models/AppliedBuild.js';
 export type { ApplyResponse } from './models/ApplyResponse.js';
 export type { AppManifest } from './models/AppManifest.js';
+export type { AppManifestHealthcheck } from './models/AppManifestHealthcheck.js';
 export type { AppMetricsResponse } from './models/AppMetricsResponse.js';
 export type { AppOpenAPIImportDryRunResponse } from './models/AppOpenAPIImportDryRunResponse.js';
 export type { AppOpenAPIImportResponse } from './models/AppOpenAPIImportResponse.js';

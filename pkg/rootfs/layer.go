@@ -9,7 +9,58 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/wire" // wire ops metrics for imaged-only counters
 )
+
+// ops is the package-level handle to the imaged daemon's *wire.OpsMetrics.
+// cmd/imaged/main.go calls SetOpsMetrics exactly once at startup so the
+// package doesn't need to thread a metrics handle through every
+// ApplyLayer / applyEntry call. Nil before SetOpsMetrics — the increment
+// sites below nil-check via ops.OwnershipClamp / ops.LayerEntrySkipped,
+// which return nil and safely no-op (per the wire.OpsMetrics contract).
+var ops *wire.OpsMetrics
+
+// SetOpsMetrics wires the imaged daemon's *wire.OpsMetrics into this
+// package so the ownership-clamp and layer-entry-skipped counters
+// surface on the daemon's /metrics endpoint (the same registry that
+// serves imaged_oci_pull_duration_seconds — see cmd/imaged/main.go).
+// Called exactly once at daemon boot; a second call overwrites the
+// handle (test isolation). The counters are registered only when
+// wire.NewOpsMetrics was called with prefix == "imaged" — on every
+// other daemon the accessors return nil and the increment sites
+// no-op, so unit tests that don't init OpsMetrics don't crash.
+func SetOpsMetrics(o *wire.OpsMetrics) { ops = o }
+
+// layerOwnershipClampReason is the labelled reason passed to
+// ops.OwnershipClamp. Closed set:
+//   - "out_of_range": uid/gid parsed but < 0 or > 65534.
+//   - "unparseable_uid" / "unparseable_gid": Uid/Gid integer zero
+//     and Uname/Gname string non-empty — M-3 will resolve against
+//     /etc/passwd; today we fall through to the daemon uid/gid.
+const (
+	ownershipClampOutOfRange     = "out_of_range"
+	ownershipClampUnparseableUID = "unparseable_uid"
+	ownershipClampUnparseableGID = "unparseable_gid"
+)
+
+// recordOwnershipClamp increments the imaged_ownership_clamp_total
+// counter under `reason`. Nil-safe — ops.OwnershipClamp returns nil
+// when no OpsMetrics have been wired, and prometheus.Counter.Inc on
+// a nil receiver is a no-op (the standard library guards this).
+func recordOwnershipClamp(reason string) {
+	if c := ops.OwnershipClamp(reason); c != nil {
+		c.Inc()
+	}
+}
+
+// recordLayerEntrySkipped increments imaged_layer_entry_skipped_total
+// for char/block/fifo entries dropped by applyEntry.
+func recordLayerEntrySkipped() {
+	if c := ops.LayerEntrySkipped(); c != nil {
+		c.Inc()
+	}
+}
 
 // ApplyLayer unpacks one OCI/Docker layer (an uncompressed tar) into dst,
 // applying it on top of whatever earlier layers already populated dst. Layers
@@ -98,7 +149,10 @@ const (
 func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		return os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm)
+		if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
 	case tar.TypeReg:
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
@@ -126,7 +180,10 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			_ = f.Close()
 			return fmt.Errorf("rootfs: write %s: %w", target, err)
 		}
-		return f.Close()
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
 	case tar.TypeSymlink:
 		// A symlink's Linkname is GUEST-side data, not a host path: the
 		// string is stored verbatim in the ext4 inode and is resolved by
@@ -149,7 +206,12 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Symlink(hdr.Linkname, target)
+		if err := os.Symlink(hdr.Linkname, target); err != nil {
+			return err
+		}
+		// os.Lchown on a symlink targets the link itself, not its target,
+		// which is what we want: ownership metadata travels with the link.
+		return preserveOwnership(target, hdr)
 	case tar.TypeLink:
 		// A hardlink's Linkname IS resolved host-side (os.Link needs a
 		// real path), and per tar semantics it is relative to the
@@ -159,12 +221,121 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Link(source, target)
+		if err := os.Link(source, target); err != nil {
+			return err
+		}
+		return preserveOwnership(target, hdr)
+	case tar.TypeChar, tar.TypeBlock:
+		// Char/block devices are not expected in app layers and have no
+		// safe representation inside a Firecracker guest's rootfs.
+		// Skip rather than fail the whole build — the registry pull
+		// would have already rejected a layer with a device entry on
+		// the publisher side; skipping here is the conservative
+		// backstop. The counter gives us a tripwire if a hostile or
+		// misbuilt image ever ships one.
+		recordLayerEntrySkipped()
+		return nil
 	default:
-		// Char/block/fifo devices are not expected in app layers; skip them
-		// rather than fail the whole build.
+		// fifos / other unusual types — same policy as device entries:
+		// skip silently, count under the generic bucket.
+		recordLayerEntrySkipped()
 		return nil
 	}
+}
+
+// preserveOwnership best-effort applies hdr.Uid/hdr.Gid to target.
+// Numeric-only today (ADR-136 §Decision 2); named-user resolution
+// (hdr.Uname → /etc/passwd lookup) is M-3 work. Out-of-range values
+// and named users increment the clamp counter and fall through —
+// the entry is left under the imaged daemon uid/gid.
+//
+// Why os.Lchown (not os.Chown): for symlinks we must target the link
+// itself, not its resolution. For directories and regular files
+// os.Lchown behaves identically to os.Chown.
+func preserveOwnership(target string, hdr *tar.Header) error {
+	uid, gid, ok := parseOwnership(hdr)
+	if !ok {
+		// parseOwnership already incremented under the right reason.
+		return nil
+	}
+	// Some filesystems (notably tmpfs / overlayfs mounted with noacl)
+	// refuse chown as a non-root operation. imaged runs as root, but
+	// a downstream mount policy could still trip this. We
+	// log-and-continue rather than fail the build — a file landed
+	// under the daemon uid is still correct, just not the
+	// customer-declared uid.
+	_ = os.Lchown(target, uid, gid)
+	return nil
+}
+
+// parseOwnership pulls uid/gid out of the tar header. The tar.Header
+// carries BOTH the integer Uid/Gid fields AND the string Uname/Gname
+// fields — historically OCI tools have used either depending on the
+// build host. We prefer the integer fields (BuildKit and Docker both
+// populate Uid/Gid); the string fields are a hint for named users
+// (M-3 follow-up) but only matter when the integer is 0 AND the
+// string is non-empty.
+//
+// Outcomes:
+//
+//	Uid == 0 && Uname == ""  → silent fall-through (BuildKit default)
+//	Uid in [0, 65534]         → preserve uid/gid verbatim
+//	Uid >  65534              → counter "out_of_range", fall through
+//	Uid == 0 && Uname != ""   → counter "unparseable_uid", fall through
+//	                            (M-3 will resolve via /etc/passwd)
+//
+// Returns ok=false when the caller should leave the file under the
+// daemon uid/gid. The counter is incremented before returning false.
+func parseOwnership(hdr *tar.Header) (int, int, bool) {
+	uid, ok := parseOwnershipInt(hdr.Uid, hdr.Uname, "uid")
+	if !ok {
+		// Reason already incremented inside parseOwnershipInt.
+		return 0, 0, false
+	}
+	gid, ok := parseOwnershipInt(hdr.Gid, hdr.Gname, "gid")
+	if !ok {
+		return 0, 0, false
+	}
+	return uid, gid, true
+}
+
+// parseOwnershipInt classifies a uid/gid tuple into one of four
+// outcomes described on parseOwnership above. ok=true means "preserve
+// this integer"; ok=false means "fall through to the daemon uid/gid".
+func parseOwnershipInt(intVal int, nameVal, kind string) (int, bool) {
+	// Case 1: integer field is populated → use it. In-range is the
+	// only success path; anything outside [0, 65534] is clamped.
+	if intVal != 0 {
+		if !inOwnershipRange(intVal) {
+			recordOwnershipClamp(ownershipClampOutOfRange)
+			return 0, false
+		}
+		return intVal, true
+	}
+	// Case 2: integer is 0 and string is non-empty → named user.
+	// M-3 will resolve against /etc/passwd at first start. Today we
+	// can't, so fall through and trip the tripwire.
+	if nameVal != "" {
+		switch kind {
+		case "uid":
+			recordOwnershipClamp(ownershipClampUnparseableUID)
+		case "gid":
+			recordOwnershipClamp(ownershipClampUnparseableGID)
+		}
+		return 0, false
+	}
+	// Case 3: both empty → BuildKit default. Silent fall-through,
+	// no counter movement.
+	return 0, false
+}
+
+// inOwnershipRange gates uid/gid values to the Linux uid_t space —
+// POSIX limits uid_t to [0, 2^32-1], but anything above 65534 leaks
+// into the tenant-jail uid space ADR-019 reserves (20000-29999).
+// Clamping at 65534 keeps a customer image from naming a uid that
+// vmmd later hands out to a guest (ADR-019).
+func inOwnershipRange(n int) bool {
+	return n >= 0 && n <= 65534
 }
 
 // safeJoin joins name onto base and guarantees the result stays within base,

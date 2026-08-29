@@ -1,0 +1,8 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["/app/server"],
+    "StopSignal": "SIGUSR1"
+  }
+}

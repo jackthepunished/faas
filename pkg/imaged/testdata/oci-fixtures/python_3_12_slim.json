@@ -1,0 +1,18 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["python3", "main.py"],
+    "Env": [
+      "PYTHON_VERSION=3.12.0",
+      "PYTHON_PIP_VERSION=23.0",
+      "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+    ],
+    "WorkingDir": "/app",
+    "User": "1000"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}

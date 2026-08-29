@@ -13,6 +13,10 @@
  * - Missing fields default to 0 (interpreted as "use image default" by the
  * future probe implementation).
  *
+ * M-1 (ADR-136) widens additively with `test` (argv of the OCI HEALTHCHECK
+ * command) and `start_period_s` (Docker 17.05+ startup grace). Runtime
+ * wiring lands in M-2 (ADR-X5).
+ *
  */
 export type DeploymentHealthcheck = {
   /**
@@ -31,5 +35,13 @@ export type DeploymentHealthcheck = {
    * Consecutive failures before the instance is considered unhealthy; 0 = use image default.
    */
   retries?: number;
+  /**
+   * Argv of the OCI HEALTHCHECK command, prefixed by "CMD", "CMD-SHELL", or "NONE". Surfaces onto AppManifest.Healthcheck.Test at apply_overrides time.
+   */
+  test?: Array<string>;
+  /**
+   * Startup grace during which probe failures don't count (Docker 17.05+, default 0s). Surfaces onto AppManifest.Healthcheck.StartPeriodS.
+   */
+  start_period_s?: number;
 };
 

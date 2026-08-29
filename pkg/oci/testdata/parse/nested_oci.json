@@ -1,0 +1,20 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["/app/server"],
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "LANG=C.UTF-8"
+    ],
+    "WorkingDir": "/workspace",
+    "User": "65532"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    ]
+  }
+}

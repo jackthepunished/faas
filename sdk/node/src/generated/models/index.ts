@@ -25,6 +25,7 @@ export type { AppErrorSampleResponse } from './AppErrorSampleResponse.js';
 export type { AppErrorSummaryItem } from './AppErrorSummaryItem.js';
 export type { AppErrorsSummaryResponse } from './AppErrorsSummaryResponse.js';
 export type { AppManifest } from './AppManifest.js';
+export type { AppManifestHealthcheck } from './AppManifestHealthcheck.js';
 export type { AppMetricsResponse } from './AppMetricsResponse.js';
 export type { AppOpenAPIImportDryRunResponse } from './AppOpenAPIImportDryRunResponse.js';
 export type { AppOpenAPIImportResponse } from './AppOpenAPIImportResponse.js';

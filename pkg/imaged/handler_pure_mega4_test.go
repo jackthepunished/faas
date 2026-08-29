@@ -27,6 +27,7 @@ package imaged
 
 import (
 	"context"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -42,45 +43,67 @@ import (
 
 // --- manifestFromImageConfig ------------------------------------
 
-func TestManifestFromImageConfig_EmptyCfg_Mega4(t *testing.T) {
+func TestManifestFromImageConfig_NoEntrypointNoCmd_Mega4(t *testing.T) {
 	t.Parallel()
-	// No Cmd → no Entrypoint; Env nil → nil; defaults injected.
-	m := manifestFromImageConfig(oci.ImageConfig{})
-	if m.Entrypoint != nil {
-		t.Errorf("Entrypoint = %v, want nil", m.Entrypoint)
+	// M-1 (ADR-136 §Decision 5): an image that declares neither
+	// Entrypoint nor Cmd is rejected with oci.ErrImageManifestInvalid.
+	// The handler surfaces that as a deploy failure.
+	_, err := manifestFromImageConfig(oci.ImageConfig{})
+	if err == nil {
+		t.Fatal("manifestFromImageConfig(empty) = nil err; want ErrImageManifestInvalid")
 	}
-	if m.WorkingDir != "" {
-		t.Errorf("WorkingDir = %q, want empty", m.WorkingDir)
-	}
-	if m.Healthz != defaultHealthzPath {
-		t.Errorf("Healthz = %q, want %q", m.Healthz, defaultHealthzPath)
-	}
-	if m.Env == nil {
-		t.Fatal("Env = nil, want populated (PORT default)")
-	}
-	if m.Env["PORT"] != "8080" {
-		t.Errorf("Env[PORT] = %q, want 8080", m.Env["PORT"])
+	if !errors.Is(err, oci.ErrImageManifestInvalid) {
+		t.Errorf("err = %v; want ErrImageManifestInvalid", err)
 	}
 }
 
 func TestManifestFromImageConfig_CmdToEntrypoint_Mega4(t *testing.T) {
 	t.Parallel()
-	m := manifestFromImageConfig(oci.ImageConfig{
+	m, err := manifestFromImageConfig(oci.ImageConfig{
 		Cmd:        []string{"/bin/sh", "-c", "echo hi"},
 		WorkingDir: "/app",
 	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
 	if got, want := m.Entrypoint, []string{"/bin/sh", "-c", "echo hi"}; !sliceEq(got, want) {
 		t.Errorf("Entrypoint = %v, want %v", got, want)
 	}
 	if m.WorkingDir != "/app" {
 		t.Errorf("WorkingDir = %q, want /app", m.WorkingDir)
 	}
+	if m.Healthz != defaultHealthzPath {
+		t.Errorf("Healthz = %q, want %q", m.Healthz, defaultHealthzPath)
+	}
+}
+
+func TestManifestFromImageConfig_EntrypointPlusCmd_Mega4(t *testing.T) {
+	t.Parallel()
+	// M-1 (ADR-136 §Decision 1): registry path honours both Entrypoint
+	// and Cmd. argv = Entrypoint + Cmd per OCI/Docker semantics. This
+	// was the regression reported by issue #1186 workstream A.1.
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Entrypoint: []string{"/app/server"},
+		Cmd:        []string{"run", "--config=prod"},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if got, want := m.Entrypoint, []string{"/app/server", "run", "--config=prod"}; !sliceEq(got, want) {
+		t.Errorf("Entrypoint = %v, want %v", got, want)
+	}
 }
 
 func TestManifestFromImageConfig_EnvMutationIsolation_Mega4(t *testing.T) {
 	t.Parallel()
 	src := map[string]string{"FOO": "bar"}
-	m := manifestFromImageConfig(oci.ImageConfig{Env: src})
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd: []string{"/x"},
+		Env: src,
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
 	if m.Env["FOO"] != "bar" {
 		t.Errorf("Env[FOO] = %q, want bar", m.Env["FOO"])
 	}
@@ -101,9 +124,13 @@ func TestManifestFromImageConfig_EnvMutationIsolation_Mega4(t *testing.T) {
 func TestManifestFromImageConfig_EnvPORTPinned_Mega4(t *testing.T) {
 	t.Parallel()
 	// Customer pinned PORT → must survive the default-inject.
-	m := manifestFromImageConfig(oci.ImageConfig{
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd: []string{"/x"},
 		Env: map[string]string{"PORT": "9000"},
 	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
 	if m.Env["PORT"] != "9000" {
 		t.Errorf("PORT = %q, want 9000 (customer pin wins)", m.Env["PORT"])
 	}
@@ -113,7 +140,12 @@ func TestManifestFromImageConfig_NilEnvGetsAllocated_Mega4(t *testing.T) {
 	t.Parallel()
 	// Cfg.Env == nil → manifest.Env is make(map, 1) → caller can write
 	// directly without a "assignment to entry in nil map" panic.
-	m := manifestFromImageConfig(oci.ImageConfig{})
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd: []string{"/x"},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
 	if m.Env == nil {
 		t.Fatal("Env = nil, want allocated")
 	}
@@ -123,15 +155,43 @@ func TestManifestFromImageConfig_NilEnvGetsAllocated_Mega4(t *testing.T) {
 	}
 }
 
+func TestManifestFromImageConfig_UserAndHealthcheckFlow_Mega4(t *testing.T) {
+	t.Parallel()
+	// M-1 (ADR-136 §Decision 3-4): numeric User + Healthcheck shape
+	// survive the registry path. StopSignal too — it lands on
+	// AppManifest.StopSignal directly.
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd:  []string{"/x"},
+		User: "1001",
+		Healthcheck: &oci.ImageHealthcheck{
+			Test:      []string{"CMD", "/bin/check"},
+			IntervalS: 30,
+		},
+		StopSignal: "SIGUSR1",
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if m.User != "1001" {
+		t.Errorf("User = %q; want 1001", m.User)
+	}
+	if m.Healthcheck == nil || m.Healthcheck.Test[1] != "/bin/check" {
+		t.Errorf("Healthcheck = %+v; want CMD /bin/check", m.Healthcheck)
+	}
+	if m.StopSignal != "SIGUSR1" {
+		t.Errorf("StopSignal = %q; want SIGUSR1", m.StopSignal)
+	}
+}
+
 // --- cloneEnv ---------------------------------------------------
 
 func TestCloneEnv_NilInput_Mega4(t *testing.T) {
 	t.Parallel()
 	// Empty/nil input → nil output (mirrors the contract).
-	if got := cloneEnv(nil); got != nil {
+	if got := cloneEnvMap(nil); got != nil {
 		t.Errorf("nil: %v, want nil", got)
 	}
-	if got := cloneEnv(map[string]string{}); got != nil {
+	if got := cloneEnvMap(map[string]string{}); got != nil {
 		t.Errorf("empty: %v, want nil", got)
 	}
 }
@@ -139,7 +199,7 @@ func TestCloneEnv_NilInput_Mega4(t *testing.T) {
 func TestCloneEnv_Populated_Mega4(t *testing.T) {
 	t.Parallel()
 	src := map[string]string{"A": "1", "B": "2"}
-	cp := cloneEnv(src)
+	cp := cloneEnvMap(src)
 	if cp["A"] != "1" || cp["B"] != "2" {
 		t.Errorf("got %v", cp)
 	}

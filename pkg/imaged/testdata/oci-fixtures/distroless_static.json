@@ -1,0 +1,18 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/app"],
+    "Cmd": ["run"],
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+    ],
+    "User": "65532",
+    "WorkingDir": "/"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}

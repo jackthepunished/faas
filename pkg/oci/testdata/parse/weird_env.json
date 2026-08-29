@@ -1,0 +1,10 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "Env": [
+    "=PATH",
+    "NORMAL=value",
+    "EMPTY",
+    "EQUALS=foo=bar=baz"
+  ]
+}

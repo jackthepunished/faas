@@ -83,7 +83,7 @@ func TestManifestFromConfig(t *testing.T) {
 	cfg := Config{
 		Entrypoint: []string{"node"},
 		Cmd:        []string{"server.js"},
-		Env:        []string{"NODE_ENV=production", "PORT=3000"},
+		Env:        map[string]string{"NODE_ENV": "production", "PORT": "3000"},
 		WorkingDir: "/app",
 		User:       "1000",
 	}
