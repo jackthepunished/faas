@@ -326,12 +326,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #394: Pro gets 10 retries — 5× Hobby's budget.
 			// Tolerates a transient downstream flap while still bounding
 			// the "permanently bad payload" worker cost.
-			MaxQueueAttempts:       10,
+			MaxQueueAttempts: 10,
 			// ADR-134 PR-B: Pro 10k / 6h / 30d.
 			MaxAsyncInvocationsPerAccount:     10000,
 			MaxAsyncInvocationDeadlineSeconds: 21600,
 			MaxAsyncResultRetentionSeconds:    2592000,
-			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
+			EgressAllowlistAllowed:            true, EgressAllowlistMaxSize: 16,
 			// Issue #477 / ADR-118: Pro unlocks the per-app ingress
 			// IP allowlist. Same 16-entry cap as the egress
 			// allowlist — symmetric abuse-desk primitives.
@@ -478,12 +478,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #394: Scale gets 25 retries — 2.5× Pro's budget, but
 			// capped so a genuinely-bad payload still terminates within
 			// the worker's hourly budget window.
-			MaxQueueAttempts:       25,
+			MaxQueueAttempts: 25,
 			// ADR-134 PR-B: Scale 100k / 24h / 90d.
 			MaxAsyncInvocationsPerAccount:     100000,
 			MaxAsyncInvocationDeadlineSeconds: 86400,
 			MaxAsyncResultRetentionSeconds:    7776000,
-			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
+			EgressAllowlistAllowed:            true, EgressAllowlistMaxSize: 64,
 			// ADR-119: Scale unlocks static egress IP (per-app quota=1).
 			StaticEgressIPAllowed: true, StaticEgressIPsPerApp: 1,
 			// Issue #477 / ADR-118: Scale gets a 64-entry cap, 4× Pro
