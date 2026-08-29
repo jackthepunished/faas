@@ -93,9 +93,9 @@ func TestCmdJobsAdd_NoImage(t *testing.T) {
 // hyphens" rather than hitting apid and getting a 400.
 func TestCmdJobsAdd_InvalidSlug(t *testing.T) {
 	cases := []string{
-		"Bad Slug",                                                  // uppercase + space
-		"bad_slug",                                                  // underscore
-		"x",                                                         // too short
+		"Bad Slug", // uppercase + space
+		"bad_slug", // underscore
+		"x",        // too short
 		"a-very-long-slug-that-exceeds-the-forty-char-cap-and-some", // too long
 	}
 	for _, slug := range cases {
@@ -187,7 +187,7 @@ func TestCmdJobsLogs_BadTaskIndex(t *testing.T) {
 // regex tweak surfaces here, not in production.
 func TestJobSlugPattern_Exhaustive(t *testing.T) {
 	valid := []string{
-		"abc",                          // minimum length (3)
+		"abc", // minimum length (3)
 		"a-valid-slug",
 		"job123",
 		"a-thirty-nine-char-slug-with-padding-yyy", // 40 chars (max)

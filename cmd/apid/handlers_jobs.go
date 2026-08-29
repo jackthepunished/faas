@@ -163,7 +163,7 @@ func jobTaskResponse(t state.JobTask) api.JobTaskResponse {
 // per-job read/write handler. Returns:
 //
 //   - (job, true, nil)       when the slug exists AND the
-//                            account_id matches the caller.
+//     account_id matches the caller.
 //   - (state.Job{}, false, nil) when missing OR cross-account;
 //     caller maps both to the same 404 so a probe cannot
 //     distinguish the two.

@@ -114,7 +114,7 @@ func (e JobCreatedEvent) At() time.Time {
 	}
 	return e.CreatedAt
 }
-func (JobCreatedEvent) Subject() *string { return nil }
+func (JobCreatedEvent) Subject() *string          { return nil }
 func (e JobCreatedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobUpdatedEvent is the typed payload for JobUpdated. Only the
@@ -135,7 +135,7 @@ func (e JobUpdatedEvent) At() time.Time {
 	}
 	return e.UpdatedAt
 }
-func (JobUpdatedEvent) Subject() *string { return nil }
+func (JobUpdatedEvent) Subject() *string          { return nil }
 func (e JobUpdatedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobDeletedEvent is the typed payload for JobDeleted (soft
@@ -155,7 +155,7 @@ func (e JobDeletedEvent) At() time.Time {
 	}
 	return e.DeletedAt
 }
-func (JobDeletedEvent) Subject() *string { return nil }
+func (JobDeletedEvent) Subject() *string          { return nil }
 func (e JobDeletedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobRunStartedEvent is the typed payload for JobRunStarted.
@@ -178,7 +178,7 @@ func (e JobRunStartedEvent) At() time.Time {
 	}
 	return e.StartedAt
 }
-func (JobRunStartedEvent) Subject() *string { return nil }
+func (JobRunStartedEvent) Subject() *string          { return nil }
 func (e JobRunStartedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobRunSucceededEvent fires when ALL tasks in the run reached
@@ -201,7 +201,7 @@ func (e JobRunSucceededEvent) At() time.Time {
 	}
 	return e.SucceededAt
 }
-func (JobRunSucceededEvent) Subject() *string { return nil }
+func (JobRunSucceededEvent) Subject() *string          { return nil }
 func (e JobRunSucceededEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobRunFailedEvent fires when the run settles to a terminal-
@@ -227,7 +227,7 @@ func (e JobRunFailedEvent) At() time.Time {
 	}
 	return e.FailedAt
 }
-func (JobRunFailedEvent) Subject() *string { return nil }
+func (JobRunFailedEvent) Subject() *string          { return nil }
 func (e JobRunFailedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobRunCancelledEvent fires when apid cancelJobRun committed.
@@ -248,7 +248,7 @@ func (e JobRunCancelledEvent) At() time.Time {
 	}
 	return e.CancelledAt
 }
-func (JobRunCancelledEvent) Subject() *string { return nil }
+func (JobRunCancelledEvent) Subject() *string          { return nil }
 func (e JobRunCancelledEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobTaskDispatchedEvent fires when schedd WakeJob successfully
@@ -256,13 +256,13 @@ func (e JobRunCancelledEvent) Payload() map[string]any { return eventPayload(e) 
 // dashboard drill-down correlate the event with HandleJobExit's
 // terminal event (which carries the same token).
 type JobTaskDispatchedEvent struct {
-	RunID      string    `json:"run_id"`
-	TaskIndex  int       `json:"task_index"`
-	JobID      string    `json:"job_id"`
-	AccountID  string    `json:"account_id"`
-	JobName    string    `json:"job_name"`
-	InstanceID string    `json:"instance_id"`
-	LeaseToken string    `json:"lease_token"`
+	RunID        string    `json:"run_id"`
+	TaskIndex    int       `json:"task_index"`
+	JobID        string    `json:"job_id"`
+	AccountID    string    `json:"account_id"`
+	JobName      string    `json:"job_name"`
+	InstanceID   string    `json:"instance_id"`
+	LeaseToken   string    `json:"lease_token"`
 	DispatchedAt time.Time `json:"dispatched_at"`
 }
 
@@ -273,7 +273,7 @@ func (e JobTaskDispatchedEvent) At() time.Time {
 	}
 	return e.DispatchedAt
 }
-func (JobTaskDispatchedEvent) Subject() *string { return nil }
+func (JobTaskDispatchedEvent) Subject() *string          { return nil }
 func (e JobTaskDispatchedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobTaskSucceededEvent fires when HandleJobExit saw exit_code=0.
@@ -282,17 +282,17 @@ func (e JobTaskDispatchedEvent) Payload() map[string]any { return eventPayload(e
 // kept for parity with JobTaskFailedEvent so dashboard code
 // can use a single dispatch table keyed by kind.
 type JobTaskSucceededEvent struct {
-	RunID         string    `json:"run_id"`
-	TaskIndex     int       `json:"task_index"`
-	JobID         string    `json:"job_id"`
-	AccountID     string    `json:"account_id"`
-	JobName       string    `json:"job_name"`
-	InstanceID    string    `json:"instance_id"`
-	LeaseToken    string    `json:"lease_token"`
-	ExitCode      int32     `json:"exit_code"`
-	TaskStatus    string    `json:"task_status"`
-	DurationMs    int64     `json:"duration_ms"`
-	FinishedAt    time.Time `json:"finished_at"`
+	RunID      string    `json:"run_id"`
+	TaskIndex  int       `json:"task_index"`
+	JobID      string    `json:"job_id"`
+	AccountID  string    `json:"account_id"`
+	JobName    string    `json:"job_name"`
+	InstanceID string    `json:"instance_id"`
+	LeaseToken string    `json:"lease_token"`
+	ExitCode   int32     `json:"exit_code"`
+	TaskStatus string    `json:"task_status"`
+	DurationMs int64     `json:"duration_ms"`
+	FinishedAt time.Time `json:"finished_at"`
 }
 
 func (JobTaskSucceededEvent) Kind() string { return JobTaskSucceeded }
@@ -302,7 +302,7 @@ func (e JobTaskSucceededEvent) At() time.Time {
 	}
 	return e.FinishedAt
 }
-func (JobTaskSucceededEvent) Subject() *string { return nil }
+func (JobTaskSucceededEvent) Subject() *string          { return nil }
 func (e JobTaskSucceededEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobTaskFailedEvent fires on every non-success terminal
@@ -333,7 +333,7 @@ func (e JobTaskFailedEvent) At() time.Time {
 	}
 	return e.FinishedAt
 }
-func (JobTaskFailedEvent) Subject() *string { return nil }
+func (JobTaskFailedEvent) Subject() *string          { return nil }
 func (e JobTaskFailedEvent) Payload() map[string]any { return eventPayload(e) }
 
 // JobTaskRetriedEvent fires when schedd re-queues the task
@@ -358,5 +358,5 @@ func (e JobTaskRetriedEvent) At() time.Time {
 	}
 	return e.RetryAt
 }
-func (JobTaskRetriedEvent) Subject() *string { return nil }
+func (JobTaskRetriedEvent) Subject() *string          { return nil }
 func (e JobTaskRetriedEvent) Payload() map[string]any { return eventPayload(e) }

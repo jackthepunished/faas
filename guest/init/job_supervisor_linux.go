@@ -59,16 +59,16 @@ import (
 //     later sweep of the task slot surfaces the gap.
 //
 // Order matters:
-//   1. loadJobManifest (must succeed; missing manifest = not a
-//      job VM and the boot dispatcher shouldn't have called us)
-//   2. startTimeoutWatcher (sets up the SIGTERM→30s grace→SIGKILL
-//      timer that fires if the customer's command outlives
-//      task_timeout_s)
-//   3. execCommand (syscall.Exec, replacing the supervisor's
-//      process image so signals reach the customer directly)
-//   4. The path after exec.Command returning means exec FAILED
-//      and we're still in the supervisor; we map the error to
-//      an exit envelope and ship it.
+//  1. loadJobManifest (must succeed; missing manifest = not a
+//     job VM and the boot dispatcher shouldn't have called us)
+//  2. startTimeoutWatcher (sets up the SIGTERM→30s grace→SIGKILL
+//     timer that fires if the customer's command outlives
+//     task_timeout_s)
+//  3. execCommand (syscall.Exec, replacing the supervisor's
+//     process image so signals reach the customer directly)
+//  4. The path after exec.Command returning means exec FAILED
+//     and we're still in the supervisor; we map the error to
+//     an exit envelope and ship it.
 //
 // Note on syscall.Exec semantics: on success, syscall.Exec NEVER
 // returns. So a code path after exec.Command(...) is the

@@ -6646,13 +6646,13 @@ type CreateJobRequest struct {
 // pointers leave the column untouched (mirrors the app PATCH
 // convention; see api.UpdateAppRequest).
 type UpdateJobRequest struct {
-	ImageRef        *string           `json:"image_ref,omitempty"`
-	Command         []string          `json:"command,omitempty"`
-	EnvOverrides    map[string]string `json:"env_overrides,omitempty"`
-	RAMMB           *int              `json:"ram_mb,omitempty"`
-	TaskTimeoutSec  *int              `json:"task_timeout_sec,omitempty"`
-	MaxParallelism  *int              `json:"max_parallelism,omitempty"`
-	RetryMax        *int              `json:"retry_max,omitempty"`
+	ImageRef       *string           `json:"image_ref,omitempty"`
+	Command        []string          `json:"command,omitempty"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          *int              `json:"ram_mb,omitempty"`
+	TaskTimeoutSec *int              `json:"task_timeout_sec,omitempty"`
+	MaxParallelism *int              `json:"max_parallelism,omitempty"`
+	RetryMax       *int              `json:"retry_max,omitempty"`
 	// Status is the open-set {active, paused}. Setting
 	// status='paused' halts future dispatches without
 	// killing live tasks (the dispatch tick skips paused
@@ -6716,24 +6716,24 @@ type JobResponse struct {
 // retry-exhaustion counter — a run is "dead letter" when
 // dead_letter_count > 0 AND aggregate_status='dead_letter'.
 type JobRunResponse struct {
-	ID               string            `json:"id"`
-	JobID            string            `json:"job_id"`
-	AccountID        string            `json:"account_id"`
-	TriggerKind      string            `json:"trigger_kind"`
-	EnvOverrides     map[string]string `json:"env_overrides,omitempty"`
-	Tasks            int               `json:"tasks"`
-	Parallelism      int               `json:"parallelism"`
-	RetryMax         int               `json:"retry_max"`
-	TaskTimeoutSec   int               `json:"task_timeout_sec"`
-	AggregateStatus  string            `json:"aggregate_status"`
-	TasksSucceeded   int               `json:"tasks_succeeded"`
-	TasksFailed      int               `json:"tasks_failed"`
-	TasksCancelled   int               `json:"tasks_cancelled"`
-	TasksRunning     int               `json:"tasks_running"`
-	DeadLetterCount  int               `json:"dead_letter_count"`
-	StartedAt        string            `json:"started_at,omitempty"`
-	FinishedAt       string            `json:"finished_at,omitempty"`
-	CreatedAt        string            `json:"created_at"`
+	ID              string            `json:"id"`
+	JobID           string            `json:"job_id"`
+	AccountID       string            `json:"account_id"`
+	TriggerKind     string            `json:"trigger_kind"`
+	EnvOverrides    map[string]string `json:"env_overrides,omitempty"`
+	Tasks           int               `json:"tasks"`
+	Parallelism     int               `json:"parallelism"`
+	RetryMax        int               `json:"retry_max"`
+	TaskTimeoutSec  int               `json:"task_timeout_sec"`
+	AggregateStatus string            `json:"aggregate_status"`
+	TasksSucceeded  int               `json:"tasks_succeeded"`
+	TasksFailed     int               `json:"tasks_failed"`
+	TasksCancelled  int               `json:"tasks_cancelled"`
+	TasksRunning    int               `json:"tasks_running"`
+	DeadLetterCount int               `json:"dead_letter_count"`
+	StartedAt       string            `json:"started_at,omitempty"`
+	FinishedAt      string            `json:"finished_at,omitempty"`
+	CreatedAt       string            `json:"created_at"`
 }
 
 // JobTaskResponse is the wire projection of state.JobTask.
@@ -6808,8 +6808,8 @@ type ListJobTasksResponse struct {
 // runs/{id}/cancel. Returns the post-cancel run aggregate so
 // the dashboard can re-render without a separate GET.
 type JobRunCancelledResponse struct {
-	Run        JobRunResponse `json:"run"`
-	CancelledAt string        `json:"cancelled_at"`
+	Run         JobRunResponse `json:"run"`
+	CancelledAt string         `json:"cancelled_at"`
 }
 
 // JobDeletedResponse is the body of DELETE /v1/jobs/{name}.
