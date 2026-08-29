@@ -240,31 +240,37 @@ func cmdJobsUpdate(args []string) int {
 	}
 	req := api.UpdateJobRequest{}
 	touched := false
-	if fs.Lookup("image").Value.String() != "" {
+	// Detect which flags were actually passed by the user.
+	// `Value.String() != ""` is wrong for numeric / bool flags whose
+	// default String() is "0" / "false"; fs.Visit only sees flags
+	// that were set on the command line.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if set["image"] {
 		s := *image
 		req.ImageRef = &s
 		touched = true
 	}
-	if fs.Lookup("command").Value.String() != "" {
+	if set["command"] {
 		req.Command = strings.Split(*command, ",")
 		touched = true
 	}
-	if fs.Lookup("ram").Value.String() != "" {
+	if set["ram"] {
 		r := *ram
 		req.RAMMB = &r
 		touched = true
 	}
-	if fs.Lookup("timeout").Value.String() != "" {
+	if set["timeout"] {
 		t := *timeout
 		req.TaskTimeoutSec = &t
 		touched = true
 	}
-	if fs.Lookup("parallelism").Value.String() != "" {
+	if set["parallelism"] {
 		p := *parallelism
 		req.MaxParallelism = &p
 		touched = true
 	}
-	if fs.Lookup("retries").Value.String() != "" {
+	if set["retries"] {
 		r := *retries
 		req.RetryMax = &r
 		touched = true
