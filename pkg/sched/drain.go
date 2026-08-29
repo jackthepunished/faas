@@ -10,8 +10,17 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/dispatch"
 	"github.com/onebox-faas/faas/pkg/state"
 )
+
+// Compile-time guarantee the unified invocations drain depends on
+// the pkg/dispatch contract (ADR-134 §6.7). The drain consumes
+// RetryPolicy, DeadlinePolicy, and dispatch.Job once per-row
+// fields land on the invocations table in PR-B; today only the
+// type dependency is wired so a future API change to pkg/dispatch
+// surfaces in this file's compile, not at runtime.
+var _ dispatch.JobKind = dispatch.JobKindInvocation
 
 // ErrPermanentInvoke is the sentinel the gateway returns when an
 // envelope is permanently undeliverable (4xx — bad payload, app
