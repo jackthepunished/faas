@@ -45,6 +45,19 @@ const (
 	// the operator a single-correlated paper trail of
 	// push → reconcile → build.
 	KindBuildEnqueued = "project.build.enqueued"
+	// KindProjectScopeExcluded fires once per persisted --exclude
+	// row folded into the apply path (ADR-124 follow-up #3,
+	// migration 00418). Distinct from KindWorkloadSkipped: the
+	// skipped kind is preview-time only and emits for every
+	// operator --exclude; the scope-excluded kind is apply-time
+	// only and emits only for slugs that came from the persisted
+	// deployment_scope_exclusions table. The "scope" prefix
+	// mirrors the §table name and makes the data-flow audit
+	// legible: scope-excluded rows answer "what did the operator
+	// persistently exclude across deploys?" — a different
+	// question than "what was excluded on this one scan?". SOC 2
+	// CC7.2 needs both durably for incident forensics.
+	KindProjectScopeExcluded = "project.scope.excluded"
 )
 
 // Alert kind constants. Mirrors the audit kind's `reason` field —

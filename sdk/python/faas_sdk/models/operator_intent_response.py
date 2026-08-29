@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from attrs import define as _attrs_define
@@ -41,6 +41,15 @@ class OperatorIntentResponse:
     """Bounded dispatch error message (1 KB cap) on failed status."""
     snap_ids_marked_stale: list[UUID] | Unset = UNSET
     """Populated for force_cold_boot and force_restart on succeeded status. Empty when no snapshots existed."""
+    trace_id: None | str | Unset = UNSET
+    """Obs-Meta + Trace-IDs Mega-PR / C4. OTel W3C 32-char
+    hex identifier shared with the inbound HTTP request
+    and the schedd dispatch context. NULL when the row
+    predates C4 or when the inbound request carried no
+    trace_id (e.g. cron-fired reaper paths). Joins
+    "this alert" ↔ "this operator action" ↔ "this
+    schedd dispatch" on one column.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +84,12 @@ class OperatorIntentResponse:
                 snap_ids_marked_stale_item = str(snap_ids_marked_stale_item_data)
                 snap_ids_marked_stale.append(snap_ids_marked_stale_item)
 
+        trace_id: None | str | Unset
+        if isinstance(self.trace_id, Unset):
+            trace_id = UNSET
+        else:
+            trace_id = self.trace_id
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -96,6 +111,8 @@ class OperatorIntentResponse:
             field_dict["error"] = error
         if snap_ids_marked_stale is not UNSET:
             field_dict["snap_ids_marked_stale"] = snap_ids_marked_stale
+        if trace_id is not UNSET:
+            field_dict["trace_id"] = trace_id
 
         return field_dict
 
@@ -144,6 +161,15 @@ class OperatorIntentResponse:
 
                 snap_ids_marked_stale.append(snap_ids_marked_stale_item)
 
+        def _parse_trace_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_id = _parse_trace_id(d.pop("trace_id", UNSET))
+
         operator_intent_response = cls(
             intent_id=intent_id,
             kind=kind,
@@ -155,6 +181,7 @@ class OperatorIntentResponse:
             finished_at=finished_at,
             error=error,
             snap_ids_marked_stale=snap_ids_marked_stale,
+            trace_id=trace_id,
         )
 
         operator_intent_response.additional_properties = d

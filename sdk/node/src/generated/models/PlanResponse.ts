@@ -35,5 +35,7 @@ export type PlanResponse = {
   unaffected?: Array<PlanAffectedApp>;
   skipped?: Array<PlanAffectedApp>;
   removed?: Array<string>;
+  persisted_exclusions?: Array<string>;
+  stale_persisted_exclusions?: Array<string>;
 };
 

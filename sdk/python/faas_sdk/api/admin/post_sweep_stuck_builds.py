@@ -15,6 +15,7 @@ def _get_kwargs(
     *,
     confirm: PostSweepStuckBuildsConfirm,
     older_than: str | Unset = UNSET,
+    reason: str | Unset = "operator_reclaim_build",
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -23,6 +24,8 @@ def _get_kwargs(
     params["confirm"] = json_confirm
 
     params["older_than"] = older_than
+
+    params["reason"] = reason
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -90,6 +93,7 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     confirm: PostSweepStuckBuildsConfirm,
     older_than: str | Unset = UNSET,
+    reason: str | Unset = "operator_reclaim_build",
 ) -> Response[Problem | SweepStuckBuildsResponse]:
     r"""Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
 
@@ -105,11 +109,13 @@ def sync_detailed(
     \"1ns\" cannot sweep in-flight builds. Default 15m.
 
     Audit row: operator.action.reclaim_build with
-    account_id=NULL (fleet-level, not tenant-scoped).
+    account_id=NULL (fleet-level, not tenant-scoped), including
+    the normalized operator reason.
 
     Args:
         confirm (PostSweepStuckBuildsConfirm):
         older_than (str | Unset):  Example: 15m.
+        reason (str | Unset):  Default: 'operator_reclaim_build'.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -122,6 +128,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         confirm=confirm,
         older_than=older_than,
+        reason=reason,
     )
 
     response = client.get_httpx_client().request(
@@ -136,6 +143,7 @@ def sync(
     client: AuthenticatedClient | Client,
     confirm: PostSweepStuckBuildsConfirm,
     older_than: str | Unset = UNSET,
+    reason: str | Unset = "operator_reclaim_build",
 ) -> Problem | SweepStuckBuildsResponse | None:
     r"""Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
 
@@ -151,11 +159,13 @@ def sync(
     \"1ns\" cannot sweep in-flight builds. Default 15m.
 
     Audit row: operator.action.reclaim_build with
-    account_id=NULL (fleet-level, not tenant-scoped).
+    account_id=NULL (fleet-level, not tenant-scoped), including
+    the normalized operator reason.
 
     Args:
         confirm (PostSweepStuckBuildsConfirm):
         older_than (str | Unset):  Example: 15m.
+        reason (str | Unset):  Default: 'operator_reclaim_build'.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -169,6 +179,7 @@ def sync(
         client=client,
         confirm=confirm,
         older_than=older_than,
+        reason=reason,
     ).parsed
 
 
@@ -177,6 +188,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     confirm: PostSweepStuckBuildsConfirm,
     older_than: str | Unset = UNSET,
+    reason: str | Unset = "operator_reclaim_build",
 ) -> Response[Problem | SweepStuckBuildsResponse]:
     r"""Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
 
@@ -192,11 +204,13 @@ async def asyncio_detailed(
     \"1ns\" cannot sweep in-flight builds. Default 15m.
 
     Audit row: operator.action.reclaim_build with
-    account_id=NULL (fleet-level, not tenant-scoped).
+    account_id=NULL (fleet-level, not tenant-scoped), including
+    the normalized operator reason.
 
     Args:
         confirm (PostSweepStuckBuildsConfirm):
         older_than (str | Unset):  Example: 15m.
+        reason (str | Unset):  Default: 'operator_reclaim_build'.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -209,6 +223,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         confirm=confirm,
         older_than=older_than,
+        reason=reason,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -221,6 +236,7 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     confirm: PostSweepStuckBuildsConfirm,
     older_than: str | Unset = UNSET,
+    reason: str | Unset = "operator_reclaim_build",
 ) -> Problem | SweepStuckBuildsResponse | None:
     r"""Flip every build row stuck in 'running' past the threshold to 'failed/timeout' (admin-only).
 
@@ -236,11 +252,13 @@ async def asyncio(
     \"1ns\" cannot sweep in-flight builds. Default 15m.
 
     Audit row: operator.action.reclaim_build with
-    account_id=NULL (fleet-level, not tenant-scoped).
+    account_id=NULL (fleet-level, not tenant-scoped), including
+    the normalized operator reason.
 
     Args:
         confirm (PostSweepStuckBuildsConfirm):
         older_than (str | Unset):  Example: 15m.
+        reason (str | Unset):  Default: 'operator_reclaim_build'.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -255,5 +273,6 @@ async def asyncio(
             client=client,
             confirm=confirm,
             older_than=older_than,
+            reason=reason,
         )
     ).parsed

@@ -353,6 +353,25 @@ type OpsMetrics struct {
 	//            wire-incompatible bug worth surfacing)
 	// 4 plans × 4 reasons = 16 series. Pre-instantiated at boot.
 	guestTailFailedTotal *prometheus.CounterVec
+	// planGateRescuedByExclude (ADR-124 follow-up #2) — counter
+	// the apid scan service increments when --exclude flipped a
+	// blocked pre-exclude gate to allowed. Labels {plan, reason}:
+	//   plan    ∈ api.Plans
+	//   reason  ∈ {apps_over_limit, crons_over_limit,
+	//              crons_not_allowed}  (closed set; see
+	//              cmd/apid/scan_service.go::gateRescueReason
+	//              for the canonical bucketing — the classifier
+	//              collapses the templated raw reasons to these
+	//              three buckets so the TSDB series are bounded
+	//              regardless of how many project slugs the
+	//              operator excluded in a given apply)
+	// 4 plans × 3 reasons = 12 series. Pre-instantiated at boot
+	// so the §12 gate-rescue panel renders zero-row from boot
+	// (the dashboard keys off the series; a counter that only
+	// appears post-emit would surface as "no data" until the
+	// first rescue, which is exactly when operators want to
+	// see it).
+	planGateRescuedByExclude *prometheus.CounterVec
 	// tailCapReached (issue #667 / ADR-078) — counter the runner
 	// increments when a customer tries to register the
 	// (ConcurrentTailsPerInstance + 1)-th tail. Labels {plan} only
@@ -1887,6 +1906,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_guest_tail_failed_total",
 		Help: "Count of waitUntil(promise) tasks that reached a non-clean terminal (issue #667 / ADR-078). Labelled by {plan, reason} — plan ∈ api.Plans, reason ∈ {timeout, handler_error, forced_at_park, unknown}. 16 series total.",
 	}, []string{"plan", "reason"})
+	// ADR-124 follow-up #2: gate-rescued-by-exclude counter. Fires
+	// when a scan project's pre-exclude gate was blocked AND the
+	// --exclude filter flipped canApply true (server invariant:
+	// gateRescuedByExclude := !preCanApply && canApply in
+	// cmd/apid/scan_service.go:864). The reason label is a
+	// closed-set vocabulary derived from the templated reason
+	// strings produceQuotaGate emits — see
+	// cmd/apid/scan_service.go::gateRescueReason for the
+	// canonical bucketing. Pre-instantiate 4 plans × 3 reasons =
+	// 12 series so the §12 gate-rescue panel renders zero-row
+	// from a fresh boot and bumps as soon as a real rescue fires.
+	// The "unknown" bucket is the catch-all for future reason
+	// strings and is pre-instantiated at "apps_over_limit" shape
+	// (the most common case) so it surfaces in dashboards.
+	planGateRescuedByExclude := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_plan_gate_rescued_by_exclude_total",
+		Help: "Count of plans where --exclude flipped a blocked pre-exclude gate to allowed (ADR-124 follow-up #2). Labelled by {plan, reason} — plan ∈ api.Plans (4), reason ∈ {apps_over_limit, crons_over_limit, crons_not_allowed}. 12 series total. The §12 gate-rescue panel renders this; a sustained non-zero rate means customers routinely run into per-plan limits and --exclude is the workaround path.",
+	}, []string{"plan", "reason"})
+	for _, plan := range api.Plans {
+		for _, reason := range []string{"apps_over_limit", "crons_over_limit", "crons_not_allowed"} {
+			planGateRescuedByExclude.WithLabelValues(string(plan), reason)
+		}
+	}
 	tailCapReached := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_tail_cap_reached_total",
 		Help: "Count of times a customer tried to register the (ConcurrentTailsPerInstance + 1)-th in-flight waitUntil task (issue #667 / ADR-078). Labelled by {plan} only — the per-instance cap is the plan-matrix axis. 4 series total.",
@@ -2747,6 +2789,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
 		wakePhaseEmitted, wakePhaseDur,
+		// ADR-124 follow-up #2: plan_gate_rescued_by_exclude counter
+		// (12 pre-instantiated series). See planGateRescuedByExclude
+		// field declaration at line 292.
+		planGateRescuedByExclude,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -3702,6 +3748,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appLabels:                            newAppLabelSet(maxAppLabelValues),
 		guestTailSeconds:                     guestTailSeconds,
 		guestTailFailedTotal:                 guestTailFailedTotal,
+		planGateRescuedByExclude:             planGateRescuedByExclude,
 		tailCapReached:                       tailCapReached,
 		evictedPriority:                      evictedPriority,
 		eventsWriteFail:                      eventsWriteFail,
@@ -4446,6 +4493,24 @@ func (m *OpsMetrics) GuestTailFailedTotal(plan, reason string) prometheus.Counte
 		return nil
 	}
 	return m.guestTailFailedTotal.WithLabelValues(plan, reason)
+}
+
+// PlanGateRescuedByExclude returns the per-(plan, reason) counter
+// the apid scan service increments when --exclude flipped a
+// blocked pre-exclude gate to allowed (ADR-124 follow-up #2).
+// plan ∈ api.Plans (4; pre-instantiated). reason ∈
+// {apps_over_limit, crons_over_limit, crons_not_allowed} — see
+// cmd/apid/scan_service.go::gateRescueReason for the canonical
+// bucketing. The §12 gate-rescue panel keys off this series;
+// a sustained non-zero rate per (plan, reason) means customers
+// routinely bump plan caps and the --exclude workaround path
+// is being exercised. The returned Counter is safe to retain;
+// nil-safe on receiver so a unit test without ops keeps building.
+func (m *OpsMetrics) PlanGateRescuedByExclude(plan, reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.planGateRescuedByExclude.WithLabelValues(plan, reason)
 }
 
 // TailCapReached returns the per-(plan) counter the runner

@@ -120,6 +120,8 @@ from .build_response import BuildResponse
 from .build_response_failure_class import BuildResponseFailureClass
 from .build_response_kind import BuildResponseKind
 from .build_response_status import BuildResponseStatus
+from .canary_preset_spec import CanaryPresetSpec
+from .canary_preset_spec_preset import CanaryPresetSpecPreset
 from .change_member_role_request import ChangeMemberRoleRequest
 from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
@@ -197,18 +199,28 @@ from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
+from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
 from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
 from .deployment_liveness_probe import DeploymentLivenessProbe
 from .deployment_preview_url import DeploymentPreviewURL
 from .deployment_response import DeploymentResponse
+from .deployment_response_canary_preset import DeploymentResponseCanaryPreset
 from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedViaType1
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
+from .deployment_response_last_auto_rollback_reason_type_1 import DeploymentResponseLastAutoRollbackReasonType1
+from .deployment_response_last_auto_rollback_reason_type_2_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType2Type1,
+)
+from .deployment_response_last_auto_rollback_reason_type_3_type_1 import (
+    DeploymentResponseLastAutoRollbackReasonType3Type1,
+)
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .deployment_response_rollout_state import DeploymentResponseRolloutState
 from .deployment_response_tag import DeploymentResponseTag
 from .diff_app_config_patch import DiffAppConfigPatch
 from .diff_app_config_patch_app_protocol import DiffAppConfigPatchAppProtocol
@@ -367,6 +379,11 @@ from .mirror_rule_list_response import MirrorRuleListResponse
 from .mirror_rule_response import MirrorRuleResponse
 from .mirror_summary_response import MirrorSummaryResponse
 from .o_auth_provider_capability import OAuthProviderCapability
+from .obs_health_response import ObsHealthResponse
+from .obs_health_response_operator_intent_outcome_missing_total import (
+    ObsHealthResponseOperatorIntentOutcomeMissingTotal,
+)
+from .obs_health_response_trace_id_completeness_ratio import ObsHealthResponseTraceIdCompletenessRatio
 from .oidc_exchange_request import OIDCExchangeRequest
 from .oidc_exchange_response import OIDCExchangeResponse
 from .operator_intent_accepted_response import OperatorIntentAcceptedResponse
@@ -457,12 +474,16 @@ from .queue_state_response import QueueStateResponse
 from .queue_state_response_plan import QueueStateResponsePlan
 from .quota_block import QuotaBlock
 from .raise_overage_cap_request import RaiseOverageCapRequest
+from .recover_rollout_request import RecoverRolloutRequest
+from .recover_rollout_request_action import RecoverRolloutRequestAction
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .retry_deployment_request import RetryDeploymentRequest
 from .retry_deployment_request_from_stage import RetryDeploymentRequestFromStage
+from .rollback_operator_runtime_config_request import RollbackOperatorRuntimeConfigRequest
 from .rollback_request import RollbackRequest
+from .rollout_transition_response import RolloutTransitionResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_app_secret_request import RotateAppSecretRequest
 from .rotate_app_secret_response import RotateAppSecretResponse
@@ -706,6 +727,8 @@ __all__ = (
     "BuildResponseFailureClass",
     "BuildResponseKind",
     "BuildResponseStatus",
+    "CanaryPresetSpec",
+    "CanaryPresetSpecPreset",
     "ChangeMemberRoleRequest",
     "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
@@ -779,18 +802,24 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
+    "DeleteDeploymentScopeExclusionResponse200",
     "DeploymentHealthcheck",
     "DeploymentListResponse",
     "DeploymentLivenessProbe",
     "DeploymentPreviewURL",
     "DeploymentResponse",
+    "DeploymentResponseCanaryPreset",
     "DeploymentResponseDeployedViaType1",
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
+    "DeploymentResponseLastAutoRollbackReasonType1",
+    "DeploymentResponseLastAutoRollbackReasonType2Type1",
+    "DeploymentResponseLastAutoRollbackReasonType3Type1",
     "DeploymentResponseOverrideEnvSecretRefs",
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DeploymentResponseRolloutState",
     "DeploymentResponseTag",
     "DiffAppConfigPatch",
     "DiffAppConfigPatchAppProtocol",
@@ -949,6 +978,9 @@ __all__ = (
     "MirrorRuleResponse",
     "MirrorSummaryResponse",
     "OAuthProviderCapability",
+    "ObsHealthResponse",
+    "ObsHealthResponseOperatorIntentOutcomeMissingTotal",
+    "ObsHealthResponseTraceIdCompletenessRatio",
     "OIDCExchangeRequest",
     "OIDCExchangeResponse",
     "OperatorIntentAcceptedResponse",
@@ -1039,12 +1071,16 @@ __all__ = (
     "QueueStateResponsePlan",
     "QuotaBlock",
     "RaiseOverageCapRequest",
+    "RecoverRolloutRequest",
+    "RecoverRolloutRequestAction",
     "RekeyProgress",
     "RenameAppRequest",
     "RepoResponse",
     "RetryDeploymentRequest",
     "RetryDeploymentRequestFromStage",
+    "RollbackOperatorRuntimeConfigRequest",
     "RollbackRequest",
+    "RolloutTransitionResponse",
     "RotateAlertRuleSecretResponse",
     "RotateAppSecretRequest",
     "RotateAppSecretResponse",

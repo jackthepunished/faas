@@ -76,8 +76,8 @@ def sync_detailed(
     mfa_enrolled_at. Body must include exactly one of
     `password` (re-verified against account_passwords)
     or `recovery_code` (consumed). Leaves mfa_required
-    untouched so the plan-upgrade / 2nd-deploy
-    chokepoints can re-arm.
+    untouched so an explicit operator/workspace policy remains
+    in force after disable.
 
     Args:
         body (MFADisableRequest): Body for /disable. Exactly one of `password` or
@@ -116,8 +116,8 @@ def sync(
     mfa_enrolled_at. Body must include exactly one of
     `password` (re-verified against account_passwords)
     or `recovery_code` (consumed). Leaves mfa_required
-    untouched so the plan-upgrade / 2nd-deploy
-    chokepoints can re-arm.
+    untouched so an explicit operator/workspace policy remains
+    in force after disable.
 
     Args:
         body (MFADisableRequest): Body for /disable. Exactly one of `password` or
@@ -151,8 +151,8 @@ async def asyncio_detailed(
     mfa_enrolled_at. Body must include exactly one of
     `password` (re-verified against account_passwords)
     or `recovery_code` (consumed). Leaves mfa_required
-    untouched so the plan-upgrade / 2nd-deploy
-    chokepoints can re-arm.
+    untouched so an explicit operator/workspace policy remains
+    in force after disable.
 
     Args:
         body (MFADisableRequest): Body for /disable. Exactly one of `password` or
@@ -189,8 +189,8 @@ async def asyncio(
     mfa_enrolled_at. Body must include exactly one of
     `password` (re-verified against account_passwords)
     or `recovery_code` (consumed). Leaves mfa_required
-    untouched so the plan-upgrade / 2nd-deploy
-    chokepoints can re-arm.
+    untouched so an explicit operator/workspace policy remains
+    in force after disable.
 
     Args:
         body (MFADisableRequest): Body for /disable. Exactly one of `password` or

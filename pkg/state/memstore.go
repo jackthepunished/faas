@@ -177,6 +177,12 @@ type MemStore struct {
 	// query is a single goroutine today.
 	appWebhooks          map[string]AppWebhook
 	appWebhookDeliveries map[string]AppWebhookDelivery
+	// deploymentScopeExclusions backs the ADR-124 follow-up #3
+	// persistent --exclude history (migration 00418). Keyed by row
+	// id (uuid string) for symmetry with appWebhooks; the (account,
+	// project, slug) UNIQUE invariant is enforced at insert time
+	// in CreateDeploymentScopeExclusion below.
+	deploymentScopeExclusions map[string]DeploymentScopeExclusion
 	// alertClaimKeys tracks the (ruleID, idempotency_key) → claimTime
 	// pair so MemStore mirrors the Postgres UNIQUE(idempotency_key)
 	// + last_fired_at dedupe behaviour. Two claims with the SAME
@@ -652,24 +658,32 @@ func NewMemStore() *MemStore {
 		// issue #72 / ADR-125: mirror-rules and mirror-results
 		// stores. Empty until the first create; the per-app count
 		// in CreateMirrorRuleIfUnderQuota walks the map.
-		mirrorRules:             map[string]MirrorRule{},
-		mirrorResults:           map[string]MirrorInvocationResult{},
-		domains:                 map[string]CustomDomain{},
-		doctorObs:               map[string]DomainDoctorObservation{},
-		crons:                   map[string]Cron{},
-		fireNowRequests:         map[string]FireNowRequest{},
-		operatorIntents:         map[string]OperatorIntent{},
-		runtimeConfigs:          map[string]RuntimeConfig{},
-		runtimeConfigOperations: map[string]RuntimeConfigOperation{},
-		runtimeConfigRevisions:  []RuntimeConfigRevision{},
-		alertRules:              map[string]AlertRule{},
-		alertDeliveries:         map[string]AlertDelivery{},
-		appWebhooks:             map[string]AppWebhook{},
-		appWebhookDeliveries:    map[string]AppWebhookDelivery{},
-		alertClaimKeys:          map[string]time.Time{},
-		edgeRules:               map[string]EdgeRule{},
-		corsPresets:             map[string]CorsPreset{},
-		openAPIDocs:             map[string]openAPIDocRow{},
+		// Rebase resolution (2026-08-27): merge HEAD's added fields
+		// (fireNowRequests, operatorIntents, runtimeConfigs +
+		// operations + revisions, alertPresets, accountSpendSnapshots,
+		// openAPIImports) with the cluster's deploymentScopeExclusions
+		// (ADR-124 follow-up #3). Both sides are non-overlapping
+		// additive fields; column alignment kept (visual width per
+		// the table below) so the diff against `gofmt -s` stays clean.
+		mirrorRules:               map[string]MirrorRule{},
+		mirrorResults:             map[string]MirrorInvocationResult{},
+		domains:                   map[string]CustomDomain{},
+		doctorObs:                 map[string]DomainDoctorObservation{},
+		crons:                     map[string]Cron{},
+		fireNowRequests:           map[string]FireNowRequest{},
+		operatorIntents:           map[string]OperatorIntent{},
+		runtimeConfigs:            map[string]RuntimeConfig{},
+		runtimeConfigOperations:   map[string]RuntimeConfigOperation{},
+		runtimeConfigRevisions:    []RuntimeConfigRevision{},
+		alertRules:                map[string]AlertRule{},
+		alertDeliveries:           map[string]AlertDelivery{},
+		appWebhooks:               map[string]AppWebhook{},
+		appWebhookDeliveries:      map[string]AppWebhookDelivery{},
+		deploymentScopeExclusions: map[string]DeploymentScopeExclusion{}, // ADR-124 follow-up #3
+		alertClaimKeys:            map[string]time.Time{},
+		edgeRules:                 map[string]EdgeRule{},
+		corsPresets:               map[string]CorsPreset{},
+		openAPIDocs:               map[string]openAPIDocRow{},
 		// ADR-126 / issue #975 item #2 — per-app OpenAPI imports.
 		// Keyed by app_id (one row per app, last-write-wins via
 		// the existing overwrite-not-insert contract). Same IDOR

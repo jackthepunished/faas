@@ -72,8 +72,10 @@ def sync_detailed(
     """Finish MFA enrollment with the first TOTP code.
 
      Verifies the 6-digit code against the sealed secret
-    and stamps mfa_enrolled_at. Re-issues the session
-    cookie without the mfa_pending flag.
+    and stamps mfa_enrolled_at. Re-issues the current session
+    cookie without the mfa_pending flag; future dashboard logins
+    will require a TOTP verification because enrollment is the
+    customer's explicit opt-in.
 
     Args:
         body (MFAConfirmRequest): Body for /confirm — a single 6-digit TOTP code.
@@ -105,8 +107,10 @@ def sync(
     """Finish MFA enrollment with the first TOTP code.
 
      Verifies the 6-digit code against the sealed secret
-    and stamps mfa_enrolled_at. Re-issues the session
-    cookie without the mfa_pending flag.
+    and stamps mfa_enrolled_at. Re-issues the current session
+    cookie without the mfa_pending flag; future dashboard logins
+    will require a TOTP verification because enrollment is the
+    customer's explicit opt-in.
 
     Args:
         body (MFAConfirmRequest): Body for /confirm — a single 6-digit TOTP code.
@@ -133,8 +137,10 @@ async def asyncio_detailed(
     """Finish MFA enrollment with the first TOTP code.
 
      Verifies the 6-digit code against the sealed secret
-    and stamps mfa_enrolled_at. Re-issues the session
-    cookie without the mfa_pending flag.
+    and stamps mfa_enrolled_at. Re-issues the current session
+    cookie without the mfa_pending flag; future dashboard logins
+    will require a TOTP verification because enrollment is the
+    customer's explicit opt-in.
 
     Args:
         body (MFAConfirmRequest): Body for /confirm — a single 6-digit TOTP code.
@@ -164,8 +170,10 @@ async def asyncio(
     """Finish MFA enrollment with the first TOTP code.
 
      Verifies the 6-digit code against the sealed secret
-    and stamps mfa_enrolled_at. Re-issues the session
-    cookie without the mfa_pending flag.
+    and stamps mfa_enrolled_at. Re-issues the current session
+    cookie without the mfa_pending flag; future dashboard logins
+    will require a TOTP verification because enrollment is the
+    customer's explicit opt-in.
 
     Args:
         body (MFAConfirmRequest): Body for /confirm — a single 6-digit TOTP code.

@@ -46,6 +46,8 @@ class ApplyResponse:
     unaffected: list[PlanAffectedApp] | Unset = UNSET
     skipped: list[PlanAffectedApp] | Unset = UNSET
     removed: list[str] | Unset = UNSET
+    persisted_exclusions: list[str] | Unset = UNSET
+    stale_persisted_exclusions: list[str] | Unset = UNSET
     project_id: str | Unset = UNSET
     apps: list[ApplyResponseAppsItem] | Unset = UNSET
     builds: list[AppliedBuild] | Unset = UNSET
@@ -138,6 +140,14 @@ class ApplyResponse:
         if not isinstance(self.removed, Unset):
             removed = self.removed
 
+        persisted_exclusions: list[str] | Unset = UNSET
+        if not isinstance(self.persisted_exclusions, Unset):
+            persisted_exclusions = self.persisted_exclusions
+
+        stale_persisted_exclusions: list[str] | Unset = UNSET
+        if not isinstance(self.stale_persisted_exclusions, Unset):
+            stale_persisted_exclusions = self.stale_persisted_exclusions
+
         project_id = self.project_id
 
         apps: list[dict[str, Any]] | Unset = UNSET
@@ -200,6 +210,10 @@ class ApplyResponse:
             field_dict["skipped"] = skipped
         if removed is not UNSET:
             field_dict["removed"] = removed
+        if persisted_exclusions is not UNSET:
+            field_dict["persisted_exclusions"] = persisted_exclusions
+        if stale_persisted_exclusions is not UNSET:
+            field_dict["stale_persisted_exclusions"] = stale_persisted_exclusions
         if project_id is not UNSET:
             field_dict["project_id"] = project_id
         if apps is not UNSET:
@@ -305,6 +319,10 @@ class ApplyResponse:
 
         removed = cast(list[str], d.pop("removed", UNSET))
 
+        persisted_exclusions = cast(list[str], d.pop("persisted_exclusions", UNSET))
+
+        stale_persisted_exclusions = cast(list[str], d.pop("stale_persisted_exclusions", UNSET))
+
         project_id = d.pop("project_id", UNSET)
 
         _apps = d.pop("apps", UNSET)
@@ -348,6 +366,8 @@ class ApplyResponse:
             unaffected=unaffected,
             skipped=skipped,
             removed=removed,
+            persisted_exclusions=persisted_exclusions,
+            stale_persisted_exclusions=stale_persisted_exclusions,
             project_id=project_id,
             apps=apps,
             builds=builds,

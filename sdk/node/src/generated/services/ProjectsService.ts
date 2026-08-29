@@ -108,4 +108,52 @@ export class ProjectsService {
       },
     });
   }
+  /**
+   * Drop a persisted --exclude row from deployment_scope_exclusions.
+   * Operator escape hatch (ADR-124 code-review fix #2) for
+   * when a persisted slug no longer exists in the repo
+   * (workload was renamed or deleted) and is blocking
+   * subsequent deploys via exclude_unknown_slug. Without
+   * this endpoint the only option was psql + hand-DELETE;
+   * the CLI's `gregale deployments exclude clear
+   * --slug=NAME --project-slug=SLUG` calls into here as the
+   * operator-grade path. Idempotent — DELETE on no row
+   * returns 404 scope_exclusion_not_found so the CLI can
+   * render "already clear" without surfacing a hard error.
+   *
+   * @returns any The exclusion was cleared.
+   * @throws ApiError
+   */
+  public static deleteDeploymentScopeExclusion({
+    slug,
+    slug2,
+  }: {
+    /**
+     * Project slug (the (account, project) namespace owning the persisted exclusion).
+     */
+    slug: string,
+    /**
+     * Excluded workload slug (the app slug persisted via a prior --persist-exclude deploy).
+     */
+    slug2: string,
+  }): CancelablePromise<{
+    ok?: boolean;
+  }> {
+    return __request(OpenAPI, {
+      method: 'DELETE',
+      url: '/v1/projects/{slug}/exclusions/{slug2}',
+      path: {
+        'slug': slug,
+        'slug2': slug2,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Either the project does not exist or no persisted
+        exclusion matches the slug. Both surface as
+        scope_exclusion_not_found so the existence of a
+        project is not leaked via the operator surface.
+        `,
+      },
+    });
+  }
 }

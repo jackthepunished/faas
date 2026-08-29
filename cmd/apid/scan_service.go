@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // planTokenWire is the JSON shape baked into the plan token. The
@@ -79,6 +81,13 @@ type scanPlanRequest struct {
 	// Only. intersect(Only, Exclude) is rejected pre-scan with
 	// code="exclude_only_overlap".
 	Exclude map[string]bool
+	// PersistExclude (ADR-124 follow-up #3, PR-B commit 5) is the
+	// write-side complement to Exclude. When true on a successful
+	// apply path, the apply handler calls
+	// CreateDeploymentScopeExclusion per excluded slug, recording
+	// the operator's "I excluded this for the long haul" intent.
+	// Default false. The scan path accepts and ignores.
+	PersistExclude bool
 }
 
 // scanPlanResponse is the body returned by the scan service and
@@ -123,6 +132,16 @@ type scanPlanResponse struct {
 	GateRescuedByExclude bool     `json:"gate_rescued_by_exclude,omitempty"`
 	CanApplyReasons      []string `json:"can_apply_reasons,omitempty"`
 	PlanToken            string   `json:"plan_token"`
+	// PersistExclude (ADR-124 follow-up #3, PR-B commit 5) is the
+	// operator's write-side intent captured from the multipart
+	// persist_exclude field. The scan path accepts and ignores it;
+	// the apply path uses it to decide whether to call
+	// CreateDeploymentScopeExclusion per excluded slug on a
+	// successful apply. Internal — not serialized to JSON
+	// (consumers see the effect via PersistedExclusions on the
+	// response when the persisted set carries forward, and via
+	// audit log rows of kind=project.scope.excluded).
+	PersistExclude bool `json:"-"`
 	// ADR-124 blast-radius partition. WillDeploy + Unaffected
 	// enumerate the scan-workload existence against every non-deleted
 	// app in the account keyed by (RootDir, Name). Skipped is the
@@ -136,6 +155,22 @@ type scanPlanResponse struct {
 	Unaffected []api.PlanAffectedApp `json:"unaffected,omitempty"`
 	Skipped    []api.PlanAffectedApp `json:"skipped,omitempty"`
 	Removed    []string              `json:"removed,omitempty"`
+	// PersistedExclusions (ADR-124 follow-up #3) mirrors the
+	// persisted --exclude set the apply path folded in from
+	// deployment_scope_exclusions. Empty on preview; non-empty on
+	// apply when the operator's persisted intent took effect.
+	PersistedExclusions []string `json:"persisted_exclusions,omitempty"`
+	// StalePersistedExclusions (code-review fix #2) is the subset
+	// of PersistedExclusions whose slug no longer exists in the
+	// current scan. We do NOT add these to req.Exclude — that
+	// would trip exclude_unknown_slug (400) and lock the
+	// operator out of subsequent deploys until they run
+	// `gregale deployments exclude clear --slug=...`. Surfacing
+	// the stale set lets the dashboard render a "persisted
+	// exclusion ignored (workload no longer in repo)" badge
+	// instead. The janitor at PurgeOrphanedScopeExclusions
+	// reaps these rows past the 90-day retention window.
+	StalePersistedExclusions []string `json:"stale_persisted_exclusions,omitempty"`
 }
 
 // toPlanWorkload translates a reposcan.Workload into the wire-
@@ -234,6 +269,16 @@ func computeAffectedPartition(
 	for _, a := range existingApps {
 		idx[workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}] = a
 	}
+	// scanKeys is keyed on (RootDir, Name) of every scan workload.
+	// Built early (before Skipped + Unaffected + Removed loops) so
+	// the dual-view Skipped branch below can skip apps that ARE in
+	// the scan set; the Skipped row from the workload branch already
+	// covers those (avoids a duplicate Skipped entry for the same
+	// slug).
+	scanKeys := make(map[workloadKey]struct{}, len(allScanWl))
+	for _, w := range allScanWl {
+		scanKeys[workloadKey{RootDir: w.RootDir, Name: w.Name}] = struct{}{}
+	}
 	// WillDeploy: filteredW (no excluded) → create or update. Order
 	// preserved so the i-alignment with respWorkloads stays intact.
 	will := make([]api.PlanAffectedApp, 0, len(filteredW))
@@ -250,7 +295,13 @@ func computeAffectedPartition(
 		will = append(will, row)
 	}
 	// Skipped: every scan workload (filteredW or dropped by --only)
-	// whose lowercased name is in exclude. Order preserved.
+	// whose lowercased name is in exclude, plus every existing app
+	// in the account whose slug is in exclude but who is NOT in the
+	// scan set (dual-view: the operator's --exclude intent applies
+	// to BOTH a scan workload and a stale app row — see
+	// TestScanPartition_ExcludedExistingAppDualView for the pin).
+	// Order preserved: scan workloads first, then existing-app
+	// rows, then sorted by Slug for determinism.
 	skip := make([]api.PlanAffectedApp, 0)
 	if len(exclude) > 0 {
 		for _, w := range allScanWl {
@@ -267,15 +318,41 @@ func computeAffectedPartition(
 			}
 			skip = append(skip, row)
 		}
+		// Add excluded existing apps not in the scan set — these
+		// are apps whose workload was removed from the repo (or
+		// renamed) but the operator still wants the --exclude
+		// contract honored (no soft-delete on apply). Without
+		// this branch the dashboard's Skipped column would be
+		// empty for the dual-view case.
+		seen := make(map[string]bool, len(skip))
+		for _, s := range skip {
+			seen[s.Slug] = true
+		}
+		for _, a := range existingApps {
+			if !exclude[strings.ToLower(a.Slug)] {
+				continue
+			}
+			if seen[a.Slug] {
+				continue
+			}
+			k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
+			if _, hit := scanKeys[k]; hit {
+				continue
+			}
+			skip = append(skip, api.PlanAffectedApp{
+				Slug:            a.Slug,
+				ID:              a.ID,
+				Action:          "noop",
+				ExistingRootDir: a.RootDir,
+			})
+			seen[a.Slug] = true
+		}
 	}
 	// Unaffected: existing apps whose (RootDir, Name) is not in any
 	// scan workload. The "no scan workload" check is across allScanWl
 	// (post-`--only`) so an excluded update doesn't shift an app from
-	// Unaffected to Skipped — it stays in Skipped only.
-	scanKeys := make(map[workloadKey]struct{}, len(allScanWl))
-	for _, w := range allScanWl {
-		scanKeys[workloadKey{RootDir: w.RootDir, Name: w.Name}] = struct{}{}
-	}
+	// Unaffected to Skipped — it stays in Skipped only. scanKeys was
+	// built above the Skipped loop (shared with the dual-view branch).
 	unaff := make([]api.PlanAffectedApp, 0, len(existingApps))
 	for _, a := range existingApps {
 		k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
@@ -296,6 +373,9 @@ func computeAffectedPartition(
 	//     not see their other projects' apps in the destructive
 	//     preview. Unaffected stays account-scoped (blast-radius
 	//     view); Removed is project-scoped (the destructive view).
+	//     Empty projectID (no project_slug on the request, brand-
+	//     new project not yet inserted) makes the loop a no-op
+	//     because no existing app can have a matching ProjectID.
 	//  2. (RootDir, WorkloadName) NOT in scanKeys — same-key apps
 	//     are matched (WillDeploy), not removed. Mirrors
 	//     pkg/reconcile.diff.workloadDiff:106-115 (the `removes`
@@ -316,7 +396,17 @@ func computeAffectedPartition(
 			if a.ProjectID != projectID {
 				continue
 			}
-			if exclude[strings.ToLower(a.WorkloadName)] {
+			// Exclude by either slug OR workload name — the
+			// operator's --exclude maps to the app slug (the
+			// operator-visible wire name), while the
+			// reconcile-engine diff keys off workload_name.
+			// Apps where Slug != WorkloadName (rare, but
+			// legitimate — see the dual-view test
+			// TestScanPartition_ExcludedExistingAppDualView)
+			// must honour the exclude contract on BOTH fields.
+			// Mirrors the Skipped dual-view filter above.
+			if exclude[strings.ToLower(a.Slug)] ||
+				exclude[strings.ToLower(a.WorkloadName)] {
 				continue
 			}
 			k := workloadKey{RootDir: a.RootDir, Name: a.WorkloadName}
@@ -409,6 +499,39 @@ func emitWorkloadSkippedRow(
 	auditor.EmitAs(ctx, actor, reconcile.KindWorkloadSkipped, &acctID, data)
 }
 
+// emitPersistedExcludedAuditRows fires one project.scope.excluded
+// audit row per slug carried forward from the persisted
+// deployment_scope_exclusions table (code-review fix #5). Tagged
+// with reason="persisted" so SOC 2 reviewers can distinguish a
+// persisted fold-in from a per-deploy --exclude (which is
+// emitted as reason="unchanged via exclude" via
+// emitWorkloadSkippedRow above). appID is left empty here because
+// the persisted set's app rows are not yet resolved at scan
+// time — the apply-side handler stamps a synthetic UUID on the
+// brand-new path (see handlers_decompose.go::syntheticExclusionAppID).
+func emitPersistedExcludedAuditRows(
+	ctx context.Context,
+	auditor auditEmitterAs,
+	actor string,
+	accountID string,
+	projectID string,
+	sourceSHA string,
+	slugs []string,
+) {
+	if auditor == nil || len(slugs) == 0 {
+		return
+	}
+	for _, slug := range slugs {
+		acctID := accountID
+		auditor.EmitAs(ctx, actor, reconcile.KindProjectScopeExcluded, &acctID, map[string]any{
+			"project_id":    projectID,
+			"workload_name": slug,
+			"reason":        "persisted",
+			"commit_sha":    sourceSHA,
+		})
+	}
+}
+
 // toPlanManaged translates a reposcan.Managed into the wire-shape
 // DTO. Pure field copy — the reposcan and DTO fields align
 // one-to-one; this helper exists so the carrier conversion is
@@ -488,6 +611,54 @@ func evaluateQuotaGate(
 		))
 	}
 	return
+}
+
+// gateRescueReason maps the templated reason strings
+// evaluateQuotaGate emits to a closed-set vocabulary the
+// apid_plan_gate_rescued_by_exclude_total counter
+// (pkg/wire/metrics.go::PlanGateRescuedByExclude) labels
+// with. Cardinality is bounded: 4 plans × 3 reasons = 12
+// series (pre-instantiated). The "unknown" bucket catches any
+// future reason string so the metric doesn't drift; today
+// evaluateQuotaGate emits exactly the three prefixes handled
+// here. Multi-reason rescue plans are bucketed by their
+// FIRST reason — a future enhancement could surface
+// one-bucket-per-reason via a histogram, but the per-bucket
+// counts today are enough to triage which gate type the
+// rescue pattern is most often saving operators from.
+func gateRescueReason(reasons []string) string {
+	if len(reasons) == 0 {
+		return "unknown"
+	}
+	r := reasons[0]
+	switch {
+	case strings.HasPrefix(r, "apps over plan limit:"):
+		return "apps_over_limit"
+	case strings.HasPrefix(r, "crons over plan limit:"):
+		return "crons_over_limit"
+	case r == "crons not allowed on this plan":
+		return "crons_not_allowed"
+	default:
+		return "unknown"
+	}
+}
+
+// emitGateRescueMetric increments the apid_plan_gate_rescued_by_exclude_total
+// counter for the (plan, reason) bucket the gateRescueReason classifier
+// produced. ops may be nil (unit tests that don't wire metrics); the
+// nil-safe accessor inside pkg/wire returns nil and the Inc() is
+// skipped. Extracted into a helper so the helper imports the wire
+// type — the call site at the gateRescuedByExclude block does not
+// need to reference pkg/wire directly (the field s.ops already
+// carries a *wire.OpsMetrics that we never see in scan_service's
+// local lexical scope).
+func emitGateRescueMetric(ops *wire.OpsMetrics, plan string, reasons []string) {
+	if ops == nil {
+		return
+	}
+	if c := ops.PlanGateRescuedByExclude(plan, gateRescueReason(reasons)); c != nil {
+		c.Inc()
+	}
 }
 
 // planCron is the cron shape returned by the scan service. We keep
@@ -673,6 +844,70 @@ func (s *server) scanService(
 	if prob != nil {
 		return nil, state.Project{}, nil, nil, nil, nil, prob
 	}
+	// ADR-124 follow-up #3 — apply-time persisted-exclude fallback.
+	// When the apply path runs without an explicit --exclude AND a
+	// project row already exists (i.e. this is a re-deploy, not a
+	// brand-new project), fold the persisted set into req.Exclude
+	// so the operator's "I excluded this for the long haul" intent
+	// carries forward without re-typing. The response surfaces the
+	// merged set via resp.PersistedExclusions; the handler emits
+	// one KindProjectScopeExcluded audit row per slug below.
+	//
+	// Brand-new projects (no project row yet) skip the fallback —
+	// there is nothing persisted to fold in. The check is cheap
+	// (single ProjectBySlug; ErrNotFound is not an error here).
+	// persistedSlugs captures every slug folded in from the persisted
+	// deployment_scope_exclusions table on the apply path. When the
+	// operator did NOT pass --exclude on this deploy but a previous
+	// deploy ran with --persist-exclude, those slugs carry forward
+	// into this apply. Surfaced via resp.PersistedExclusions so the
+	// operator + dashboard can see exactly what carried forward; the
+	// apply handler emits one KindProjectScopeExcluded audit row per
+	// slug for SOC 2 CC7.2 paper trail.
+	var persistedSlugs []string
+	// Code-review fix #3: drop the `len(req.Exclude) == 0` guard.
+	// The original guard meant typing `--exclude=foo` while a
+	// persisted set existed silently dropped the persisted
+	// carry-forward — the operator's persisted intent was
+	// shadowed by any per-deploy --exclude, even though the
+	// intent of `--exclude=foo,bar` + persisted `baz,quux` is
+	// "exclude foo + bar + baz + quux" (union semantics). Fold
+	// in regardless; the post-scan check below filters slugs no
+	// longer in the repo into stale_persisted_exclusions instead
+	// of tripping exclude_unknown_slug (fix #2).
+	if apply {
+		if proj, projErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug); projErr == nil {
+			if persisted, lookupErr := s.store.LookupDeploymentScopeExclusions(r.Context(), acct.ID, proj.ID); lookupErr == nil && len(persisted) > 0 {
+				if req.Exclude == nil {
+					req.Exclude = make(map[string]bool, len(persisted))
+				}
+				for _, e := range persisted {
+					lname := strings.ToLower(e.Slug)
+					req.Exclude[lname] = true
+					persistedSlugs = append(persistedSlugs, lname)
+				}
+			}
+		}
+	}
+	// Code-review fix #6: a persisted slug that also appears in
+	// req.Only would trip the --only/--exclude mutex below with
+	// 409 exclude_only_overlap. The persisted set is the
+	// "long-haul" intent (per ADR-127) and the operator's
+	// ephemeral --only contradicts it; honor persisted by
+	// stripping the slug from req.Only before the mutex check.
+	// Audit emission downstream tags the slug as reason="persisted"
+	// so operators can trace what happened.
+	if len(persistedSlugs) > 0 && len(req.Only) > 0 {
+		persistedSet := make(map[string]bool, len(persistedSlugs))
+		for _, slug := range persistedSlugs {
+			persistedSet[slug] = true
+		}
+		for slug := range req.Only {
+			if persistedSet[slug] {
+				delete(req.Only, slug)
+			}
+		}
+	}
 	// ADR-124: --only and --exclude are inverse filters and cannot
 	// share a slug. Reject the request pre-scan with a 409 and a
 	// stable code so the CLI / dashboard can branch on it without
@@ -780,28 +1015,102 @@ func (s *server) scanService(
 		filteredW = append(filteredW, wl)
 	}
 	// Post-scan exclude-validity check: every entry in req.Exclude
-	// must correspond to a real scan workload. A typo would otherwise
-	// silently survive and confuse the operator about what was
-	// honoured. 400 exclude_unknown_slug codes the failure with the
-	// unknown slug in the message so the dashboard can render it
-	// inline.
+	// must correspond to a real scan workload OR an existing app in
+	// the account. A typo would otherwise silently survive and
+	// confuse the operator about what was honoured. 400
+	// exclude_unknown_slug codes the failure with the unknown slug in
+	// the message so the dashboard can render it inline.
+	//
+	// Existing-app slugs are accepted because operators commonly
+	// exclude workloads that exist in the account but were renamed
+	// or removed from the current commit (the audit fix at
+	// pkg/reconcile/reconcile_test.go::TestReconcile_ExcludePreventsRemove
+	// pins the apply-side contract). The Skipped partition below
+	// surfaces excluded existing apps in BOTH Unaffected (blast-
+	// radius) and Skipped (operator intent) views — see
+	// TestScanPartition_ExcludedExistingAppDualView.
+	//
+	// Code-review fix #2: split persisted-vs-per-deploy
+	// slugs in the unknown set. A persisted slug that no
+	// longer exists in the repo (the workload was renamed or
+	// deleted in a future commit) MUST NOT trip
+	// exclude_unknown_slug — otherwise the operator is
+	// locked out of subsequent deploys until they run
+	// `gregale deployments exclude clear --slug=...` or
+	// wait for the 90-day janitor to reap the row. Surface
+	// these as StalePersistedExclusions instead; the dashboard
+	// can render a "persisted exclusion ignored" badge.
+	//
+	// Load acctApps early so the exclude-validity check can
+	// recognise existing-app slugs alongside scanNames. The same
+	// `acctApps` slice is reused by computeAffectedPartition
+	// below (Unaffected + Skipped + Removed loops) — one DB
+	// round-trip per scan.
+	acctApps, listErr := s.store.ListApps(r.Context(), acct.ID)
+	if listErr != nil {
+		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
+			fmt.Sprintf("list account apps: %v", listErr))
+	}
+	var stalePersistedSlugs []string
 	if len(req.Exclude) > 0 {
 		scanNames := make(map[string]bool, len(result.Workloads))
 		for _, w := range result.Workloads {
 			scanNames[strings.ToLower(w.Name)] = true
 		}
+		existingSlugs := make(map[string]bool, len(acctApps))
+		for _, a := range acctApps {
+			existingSlugs[strings.ToLower(a.Slug)] = true
+		}
 		var unknown []string
-		for slug := range req.Exclude {
-			if !scanNames[slug] {
+		if len(persistedSlugs) > 0 {
+			persistedSet := make(map[string]bool, len(persistedSlugs))
+			for _, slug := range persistedSlugs {
+				persistedSet[slug] = true
+			}
+			for slug := range req.Exclude {
+				if scanNames[slug] || existingSlugs[slug] {
+					continue
+				}
+				if persistedSet[slug] {
+					stalePersistedSlugs = append(stalePersistedSlugs, slug)
+					delete(req.Exclude, slug)
+				} else {
+					unknown = append(unknown, slug)
+				}
+			}
+		} else {
+			for slug := range req.Exclude {
+				if scanNames[slug] || existingSlugs[slug] {
+					continue
+				}
 				unknown = append(unknown, slug)
 			}
 		}
+		sort.Strings(stalePersistedSlugs)
 		if len(unknown) > 0 {
 			sort.Strings(unknown)
 			return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
 				http.StatusBadRequest, "exclude_unknown_slug",
 				"exclude slug is not a workload in this commit",
 				fmt.Sprintf("unknown: %s", strings.Join(unknown, ", ")))
+		}
+		// Drop stale persisted slugs from persistedSlugs so
+		// the response.PersistedExclusions surface reflects
+		// only the actually-applied ones (the audit emit and
+		// the apply-side persist-write loop both key off
+		// this slice).
+		if len(stalePersistedSlugs) > 0 {
+			staleSet := make(map[string]bool, len(stalePersistedSlugs))
+			for _, slug := range stalePersistedSlugs {
+				staleSet[slug] = true
+			}
+			filtered := persistedSlugs[:0]
+			for _, slug := range persistedSlugs {
+				if !staleSet[slug] {
+					filtered = append(filtered, slug)
+				}
+			}
+			persistedSlugs = filtered
 		}
 	}
 	// Managed services (compose image: db, etc.) are not subject to
@@ -852,37 +1161,46 @@ func (s *server) scanService(
 	// shrunk the workload set below the plan cap. evaluateQuotaGate
 	// derives the cron count from workloads internally so both
 	// calls are self-contained (no shared scan state).
-	preCanApply, preNotAllowed, _, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
+	preCanApply, preNotAllowed, preReasons, _ := evaluateQuotaGate(result.Workloads, limits, observedApps, observedCrons)
 	canApply, notAllowed, reasons, _ = evaluateQuotaGate(filteredW, limits, observedApps, observedCrons)
 
 	// gateRescuedByExclude fires the slog seam when --exclude
-	// flipped a blocked gate to allowed. The slog key follows the
-	// §12 metrics naming convention; a Prometheus counter for
-	// this signal is filed as a follow-up (the slog line is the
-	// observable today, the metric is one-line addition once the
-	// rescue pattern is confirmed on real operator flows).
+	// flipped a blocked gate to allowed. ADR-124 follow-up #2
+	// adds a parallel metric emission alongside the slog; both
+	// are observable in production (slog for human triage, the
+	// counter for dashboarding + alerting). The reason label
+	// comes from gateRescueReason which collapses the templated
+	// raw reason to a closed-set vocabulary (12 series total —
+	// 4 plans × 3 reasons; pre-instantiated). s.ops may be nil
+	// in unit tests; the nil-safe accessor returns a nil
+	// counter and we skip the Inc(). This matches the
+	// GuestTailFailedTotal caller pattern in cmd/schedd/main.go.
 	gateRescuedByExclude := !preCanApply && canApply
 	if gateRescuedByExclude {
+		// Code-review fix #4: preReasons (the gate-failure
+		// reasons that fired BEFORE --exclude shrank the
+		// workload set) are the operationally meaningful
+		// signal here — the POST-filter `reasons` are empty by
+		// construction when canApply=true (the gate passed).
+		// Passing post-filter reasons caused the metric to
+		// always emit reason="unknown" on a rescue, defeating
+		// the closed-set cardinality budget.
 		s.log.Info("plan_gate_rescued_by_exclude",
 			slog.String("project_slug", req.ProjectSlug),
 			slog.String("account_id", acct.ID),
 			slog.Bool("pre_exclude_can_apply", preCanApply),
 			slog.Bool("post_exclude_can_apply", canApply),
 			slog.Bool("pre_exclude_not_allowed", preNotAllowed),
-			slog.Any("reasons", reasons),
+			slog.Any("reasons", preReasons),
 		)
+		emitGateRescueMetric(s.ops, string(acct.Plan), preReasons)
 	}
 
-	// ADR-124 blast-radius partition: load every non-deleted app in
-	// the account and project each (RootDir, Name) against the scan
-	// workload set. ListApps is account-scoped; per-account apps
-	// include rows in other projects (intentional — Unaffected is
-	// the blast-radius view, project-agnostic).
-	acctApps, listErr := s.store.ListApps(r.Context(), acct.ID)
-	if listErr != nil {
-		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
-			fmt.Sprintf("list account apps: %v", listErr))
-	}
+	// ADR-124 blast-radius partition: `acctApps` was loaded earlier
+	// (above the exclude-validity check) so the same round-trip
+	// serves both purposes. ListApps is account-scoped; per-account
+	// apps include rows in other projects (intentional — Unaffected
+	// is the blast-radius view, project-agnostic).
 
 	// Load the project so the partition's Removed loop is project-
 	// scoped (matches what reconcile will SoftDeleteAppCascade).
@@ -915,6 +1233,22 @@ func (s *server) scanService(
 	actor := resolvedActorString(routeKindForRequest(r), acct.ID, "")
 	sourceSHA := req.SourceSHA256
 	emitSkippedAuditRows(r.Context(), s.audit, actor, acct.ID, projectID, sourceSHA, partition.Skipped)
+
+	// Code-review fix #5: emit one project.scope.excluded audit
+	// row per carried-forward persisted slug, tagged with
+	// reason="persisted" so operators can trace which slugs
+	// came from persistence vs the operator's per-deploy
+	// --exclude. Without this row, the SOC 2 trail showed the
+	// skip but couldn't tell you whether the operator typed
+	// it today or whether it was the long-haul persisted
+	// intent from a prior deploy. Preview-time emission is the
+	// source of truth (same precedent as
+	// emitSkippedAuditRows); the apply-side persist-write
+	// handler emits an additional row tagged
+	// reason="persisted_via_flag" for the write itself.
+	if len(persistedSlugs) > 0 {
+		emitPersistedExcludedAuditRows(r.Context(), s.audit, actor, acct.ID, projectID, sourceSHA, persistedSlugs)
+	}
 
 	// Convert the reposcan carrier slice into the wire-shape DTO so
 	// the JSON marshal sees string Tier (matching OpenAPI enum +
@@ -953,6 +1287,12 @@ func (s *server) scanService(
 		CanApplyPreExclude:   preCanApply,
 		GateRescuedByExclude: gateRescuedByExclude,
 		CanApplyReasons:      reasons,
+		// ADR-124 follow-up #3 (PR-B commit 5): pass the operator's
+		// persist intent through to the apply handler so it can
+		// write the deployment_scope_exclusions rows on a
+		// successful apply. The scan path accepts the field but
+		// does nothing with it (default-OFF posture).
+		PersistExclude: req.PersistExclude,
 		// ADR-124 partition projection. Skipped is the operator --exclude
 		// subset; Unaffected is every account app not in the scan keys;
 		// WillDeploy keeps reposcan's order so the i-alignment with
@@ -966,6 +1306,19 @@ func (s *server) scanService(
 		Unaffected: partition.Unaffected,
 		Skipped:    partition.Skipped,
 		Removed:    partition.Removed,
+		// ADR-124 follow-up #3 — persisted_exclusions mirrors the
+		// slugs the apply path folded in from the
+		// deployment_scope_exclusions table (when req.Exclude was
+		// empty). Empty when no persisted rows exist or when the
+		// scan path is preview; the omitempty keeps --json output
+		// stable for the common case.
+		PersistedExclusions: persistedSlugs,
+		// Code-review fix #2: stale_persisted_exclusions is the
+		// subset of PersistedExclusions whose slug is no longer
+		// in the repo. Surfaced so the dashboard can render a
+		// "persisted exclusion ignored" badge instead of failing
+		// the deploy with exclude_unknown_slug.
+		StalePersistedExclusions: stalePersistedSlugs,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path
@@ -1297,12 +1650,13 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 			"Bad multipart", err.Error())
 	}
 	var (
-		sourcePath  string
-		onlySet     = map[string]bool{}
-		excludeSet  = map[string]bool{}
-		projectSlug string
-		prodBranch  = "main"
-		installID   int64
+		sourcePath     string
+		onlySet        = map[string]bool{}
+		excludeSet     = map[string]bool{}
+		projectSlug    string
+		prodBranch     = "main"
+		installID      int64
+		persistExclude bool
 	)
 	for {
 		part, perr := mr.NextPart()
@@ -1357,6 +1711,25 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 					excludeSet[s] = true
 				}
 			}
+		case "persist_exclude":
+			// ADR-124 follow-up #3 (PR-B commit 5): write-side
+			// flag. The scan path accepts and ignores; the apply
+			// path triggers CreateDeploymentScopeExclusion per
+			// excluded slug on a successful apply. Empty value or
+			// absent field = false (the default-OFF posture).
+			b, _ := io.ReadAll(io.LimitReader(part, 32))
+			v := strings.ToLower(strings.TrimSpace(string(b)))
+			// strconv.ParseBool accepts "1", "t", "T", "TRUE",
+			// "true", "True", "0", "f", "F", "FALSE", "false",
+			// "False" — broader than the hand-rolled
+			// {"true","1","yes"} set, and matches the convention
+			// of the other 6 boolean fields in the package
+			// (code-review finding #8).
+			if v != "" {
+				if parsed, perr := strconv.ParseBool(v); perr == nil {
+					persistExclude = parsed
+				}
+			}
 		default:
 			_, _ = io.Copy(io.Discard, part)
 		}
@@ -1390,14 +1763,15 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 	}
 
 	return &scanPlanRequest{
-		SourcePath:   sourcePath,
-		SourceSHA256: hash,
-		ScanDir:      scanDir,
-		ProjectSlug:  projectSlug,
-		ProdBranch:   prodBranch,
-		InstallID:    installID,
-		Only:         onlySet,
-		Exclude:      excludeSet,
+		SourcePath:     sourcePath,
+		SourceSHA256:   hash,
+		ScanDir:        scanDir,
+		ProjectSlug:    projectSlug,
+		ProdBranch:     prodBranch,
+		InstallID:      installID,
+		Only:           onlySet,
+		Exclude:        excludeSet,
+		PersistExclude: persistExclude,
 	}, nil
 }
 

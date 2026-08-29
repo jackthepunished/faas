@@ -20,13 +20,54 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
+
+// exclusionSyntheticAppNamespace is the UUID v5 namespace that
+// derives a synthetic app_id for a deployment_scope_exclusions row
+// when the operator excluded a brand-new (or otherwise unresolvable)
+// workload. The schema's app_id column is `uuid NOT NULL` with NO
+// FK to apps(id) (see migration 00418 soft-delete CASCADE blind
+// spot), so we MUST populate it; rather than letting an empty
+// string blow up the INSERT with `invalid input syntax for type
+// uuid` (data-loss: the apply already succeeded but the persist
+// write fails AND the audit row never fires), we hash a stable
+// tuple (accountID, projectID, slug) into a deterministic UUID.
+//
+// Stable across process restarts and replicas because the input is
+// fixed and SHA-1(v5) is deterministic; the same excluded workload
+// re-applying tomorrow produces the same synthetic app_id, which
+// keeps the janitor's "orphaned app_id" check idempotent (a row's
+// app_id is computed once and never re-rolled).
+//
+// Frozen at design time; the TestExclusionSyntheticAppNamespace
+// test pins the literal so any rotation forces a code change. See
+// pkg/state/types.go::PersonalOrgNamespace for the same precedent.
+var exclusionSyntheticAppNamespace = uuid.MustParse("b9c0d6a0-7f0c-5a18-ae00-000000000001")
+
+// syntheticExclusionAppID returns the deterministic UUID used when
+// an excluded workload has no real apps row to point at — typically
+// because the workload is brand-new in the scan and was excluded
+// before reconcile inserted its apps row (the apply-side scan
+// runs before reconcile inserts, so Skipped[].ID is "" on the
+// brand-new path). Pre-reconcile brand-new paths are the common
+// case for `--exclude` against new deploys. The synthetic id is
+// distinguishable from real app ids only by namespace; the audit
+// log carries the source tuple alongside it so SOC 2 reviewers can
+// reconstruct the brand-new origin.
+func syntheticExclusionAppID(accountID, projectID, slug string) string {
+	return uuid.NewSHA1(exclusionSyntheticAppNamespace,
+		[]byte(accountID+":"+projectID+":"+slug)).String()
+}
 
 // scanProject is the dry-run endpoint. It never writes; the response
 // is the same scanPlanResponse that the apply endpoint emits so the
@@ -240,6 +281,96 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 		"app_count":   len(added) + len(changed),
 	})
 
+	// ADR-124 follow-up #3 (PR-B commit 5): write the operator's
+	// persisted exclusions to deployment_scope_exclusions on a
+	// successful apply when --persist-exclude was set. The
+	// partition Skipped list carries every slug the operator
+	// excluded (post-fallback, so persisted carry-forward slugs
+	// are included if they were excluded this deploy). Idempotent
+	// on duplicate (23505 → ErrConflict is treated as a no-op
+	// because the row already exists from a prior deploy). Audit
+	// row emitted per slug for SOC 2 CC7.2 paper trail.
+	if resp.PersistExclude && len(resp.Skipped) > 0 {
+		for _, skipped := range resp.Skipped {
+			// Find the freshly-inserted app_id for this slug (it
+			// exists because reconcile just inserted every
+			// workload as a fresh app row on the apply path).
+			var appID string
+			for _, a := range added {
+				if a.Slug == skipped.Slug {
+					appID = a.ID
+					break
+				}
+			}
+			// The slug is in Skipped but didn't match an added
+			// app — this can happen when the operator excluded an
+			// existing app via --exclude (the audit fix at
+			// TestReconcile_ExcludePreventsRemove covers the
+			// apply-side contract). Lookup the existing app id.
+			if appID == "" {
+				if apps, lerr := s.store.AppsForProject(r.Context(), acct.ID, insertedProject.ID); lerr == nil {
+					for _, a := range apps {
+						if a.Slug == skipped.Slug {
+							appID = a.ID
+							break
+						}
+					}
+				}
+			}
+			// Code-review fix #1: app_id is `uuid NOT NULL` in
+			// migration 00418. Empty appID would produce
+			// `invalid input syntax for type uuid` from the
+			// INSERT and silently lose the persist write (the
+			// audit row would never fire because perr != nil,
+			// and perr is non-conflict so we'd skip the audit
+			// log entirely via the `continue` branch below).
+			// Brand-new excluded workloads have no apps row yet
+			// because reconcile runs *after* this loop in the
+			// apply path. Substitute a deterministic synthetic
+			// UUID derived from (account, project, slug) — the
+			// schema's no-FK posture means a synthetic id is
+			// safe; the audit log carries the source tuple
+			// alongside it so SOC 2 reviewers can reconstruct
+			// the brand-new origin.
+			if appID == "" {
+				appID = syntheticExclusionAppID(acct.ID, insertedProject.ID, skipped.Slug)
+			}
+			row, perr := s.store.CreateDeploymentScopeExclusion(r.Context(), state.DeploymentScopeExclusion{
+				AccountID: acct.ID,
+				ProjectID: insertedProject.ID,
+				AppID:     appID, // synthetic on brand-new excluded workload path (see fix #1)
+				Slug:      skipped.Slug,
+				Reason:    "persisted_via_flag",
+				CreatedBy: "cli", // future: thread actor from the auth context
+			})
+			if perr != nil && !errors.Is(perr, state.ErrConflict) {
+				// Don't fail the apply on a persist-write miss;
+				// log the error via the audit log and continue.
+				// The apply already succeeded — losing one
+				// persist write is acceptable per the ADR-127 §1
+				// audit-log-is-durable-record posture.
+				s.audit.Emit(r.Context(), "project.scope.excluded", &acct.ID, map[string]any{
+					"project_id":    insertedProject.ID,
+					"workload_name": skipped.Slug,
+					"reason":        "persist_write_failed",
+					"err":           perr.Error(),
+				})
+				continue
+			}
+			// Audit row: only emit when we actually wrote the
+			// row (ErrConflict means it already existed from a
+			// prior deploy).
+			if perr == nil && row.ID != "" {
+				s.audit.Emit(r.Context(), "project.scope.excluded", &acct.ID, map[string]any{
+					"project_id":    insertedProject.ID,
+					"app_id":        row.AppID,
+					"workload_name": row.Slug,
+					"reason":        row.Reason,
+				})
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -250,6 +381,77 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 type appSummary struct {
 	Slug string `json:"slug"`
 	ID   string `json:"id"`
+}
+
+// deleteDeploymentScopeExclusion handles
+// DELETE /v1/projects/{slug}/exclusions/{slug2}. ADR-124 code-review
+// fix #2 — operator escape hatch for stale persisted exclusions
+// (workload renamed or deleted in a future commit, blocking
+// subsequent deploys via exclude_unknown_slug).
+//
+// The route resolves (account, project, slug) before delegating to
+// store.DeleteDeploymentScopeExclusion so the audit row carries
+// the operator's identity and a human-readable reason. Idempotent
+// at the store level — DELETE on a non-existent row returns
+// state.ErrNotFound, which the handler translates to
+// 404 scope_exclusion_not_found (the CLI's
+// `gregale deployments exclude clear` branches on this code via
+// errors.As to render "already clear" without surfacing a hard
+// error).
+//
+// Auth: authLimited + requireMFA + ScopesDeployWriteSurface
+// (wiring in the route table at server.go:1251). Mutating the
+// persisted exclusion set changes which workloads auto-exclude on
+// subsequent deploys — same write-class as the apply path.
+func (s *server) deleteDeploymentScopeExclusion(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	projectSlug := r.PathValue("slug")
+	excludedSlug := r.PathValue("slug2")
+	if projectSlug == "" || excludedSlug == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "bad_request",
+			"Missing path parameters", "both project slug and excluded slug are required"))
+		return
+	}
+	projectSlug = strings.ToLower(strings.TrimSpace(projectSlug))
+	excludedSlug = strings.ToLower(strings.TrimSpace(excludedSlug))
+	// Resolve the project so the store call keys off the right
+	// (account_id, project_id) tuple. ErrNotFound on the project
+	// surfaces as scope_exclusion_not_found too — the operator
+	// can't tell the difference between "no project" and "no
+	// exclusion" from the CLI's perspective and shouldn't be able
+	// (project existence is already leaked via the apply path).
+	proj, projErr := s.store.ProjectBySlug(r.Context(), acct.ID, projectSlug)
+	if projErr != nil {
+		if errors.Is(projErr, state.ErrNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, "scope_exclusion_not_found",
+				"no persisted exclusion matches",
+				fmt.Sprintf("project=%q slug=%q", projectSlug, excludedSlug)))
+			return
+		}
+		api.WriteProblem(w, api.ErrInternal(
+			fmt.Sprintf("load project for exclusion delete: %v", projErr)))
+		return
+	}
+	if err := s.store.DeleteDeploymentScopeExclusion(r.Context(), acct.ID, proj.ID, excludedSlug); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, "scope_exclusion_not_found",
+				"no persisted exclusion matches",
+				fmt.Sprintf("project=%q slug=%q", projectSlug, excludedSlug)))
+			return
+		}
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal",
+			"Delete failed", err.Error()))
+		return
+	}
+	// Audit the manual override so SOC 2 reviewers can tell the
+	// difference between an exclusion removed because the project
+	// is brand-new vs an exclusion explicitly cleared by an
+	// operator (data-loss review).
+	s.audit.Emit(r.Context(), "project.scope.excluded", &acct.ID, map[string]any{
+		"project_id":    proj.ID,
+		"workload_name": excludedSlug,
+		"reason":        "cleared_via_cli",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // quotaProblem maps a *state.QuotaError into the right RFC 7807

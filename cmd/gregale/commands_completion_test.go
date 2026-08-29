@@ -622,6 +622,15 @@ func TestUsageDocSlugParity(t *testing.T) {
 		"apps":        "gregale app <slug> family uses apps (manifest entry app has DocSlug=apps)",
 		"park-wake":   "park + wake share the park-wake docs page",
 		"account-slo": "gregale account slo [--window X] is a sibling docs page under /cli/slo",
+		// ADR-124 code-review fix #2 — `deployments exclude clear` is
+		// the operator escape hatch for dropping a stale persisted
+		// exclusion. The dispatch lives on the parent `deployments`
+		// verb (dispatchDeployments), so there is no separate
+		// cliCommand entry for the exclude subcommand; the PrintUsage
+		// topic is the joined parent.DocSlug + sub.Name path. Pin it
+		// as a semantic topic so the forward invariant doesn't
+		// false-positive on this CLI surface.
+		"deployments exclude": "operator escape hatch under the deployments verb (ADR-124 code-review fix #2)",
 	}
 	for k, v := range semantic {
 		accepted[k] = "semantic: " + v

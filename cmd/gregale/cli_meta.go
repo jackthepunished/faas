@@ -392,6 +392,23 @@ var cliCommands = []cliCommand{
 			{Name: "tag", Short: "annotation tag", ClosedSet: DeploymentAnnotationTags},
 			{Name: "deployed-by", Short: "operator label (auto-resolved from git config user.name)"},
 			{Name: "pr-number", Short: "GitHub PR number (positive int; 0 = absent). CI paths stamp via the GitHub Action."},
+			// ADR-124 follow-up #1: --exclude + --show-affected
+			// were added to cmdDeployTarball in PR-#1065 but the
+			// cli_meta manifest (this file's source of truth for
+			// `gregale man <cmd>` + `gregale completion <shell>`)
+			// missed them; operators running `gregale deploy --help`
+			// had no discoverable way to learn the affected-workloads
+			// preview flags. The Short text mirrors the wire-
+			// contract headline (slug, mutex with --only) without
+			// re-litigating the ADR-124 partition semantic — that's
+			// docs.gregale.dev territory.
+			{Name: "exclude", Short: "omit workloads (slug, comma-separated; mutex with --only; ADR-124)"},
+			{Name: "show-affected", Short: "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)"},
+			// ADR-124 follow-up #3 (PR-B commit 5): write-side
+			// complement to --exclude. Records excluded slugs into
+			// deployment_scope_exclusions on a successful apply so
+			// subsequent deploys honor the persisted set automatically.
+			{Name: "persist-exclude", Short: "record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3)"},
 		},
 	},
 	{
@@ -712,6 +729,20 @@ var cliCommands = []cliCommand{
 			{Name: "tarball", Short: "scan a source tarball"},
 			{Name: "path", Short: "scan a local directory"},
 			{Name: "repo", Short: "scan a GitHub repo"},
+			// ADR-124 follow-up #1: --exclude + --show-affected
+			// ship on scan as well as deploy (the partition is the
+			// preview surface, scan is the operator's first stop).
+			// Same rationale as the deploy entries above: they were
+			// added to cmdScan in PR-#1065 but missing from the
+			// manifest that drives `gregale man scan` and the shell
+			// completion tables.
+			{Name: "exclude", Short: "omit workloads (slug, comma-separated; mutex with --only; ADR-124)"},
+			{Name: "show-affected", Short: "render the WillDeploy + Unaffected tables (ADR-124)"},
+			// ADR-124 follow-up #3 (PR-B commit 5): symmetric flag
+			// set on scan (no-op on the scan path; the scan handler
+			// ignores persist_exclude). Accepted so a single flag set
+			// is reusable across the scan + apply pair.
+			{Name: "persist-exclude", Short: "record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3)"},
 		},
 	},
 	{

@@ -915,11 +915,11 @@ func (c *Client) DestroyPreview(ctx context.Context, slug string) error {
 func (c *Client) ScanProject(
 	ctx context.Context,
 	source io.Reader, sourceName, projectSlug, productionBranch string,
-	installID int64, only, exclude []string,
+	installID int64, only, exclude []string, persistExclude bool,
 ) (PlanResponse, error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
-	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only, exclude); err != nil {
+	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only, exclude, persistExclude); err != nil {
 		return PlanResponse{}, fmt.Errorf("build multipart: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/projects/scan", &b)
@@ -943,11 +943,11 @@ func (c *Client) ApplyProjectPlan(
 	ctx context.Context,
 	planToken string,
 	source io.Reader, sourceName, projectSlug, productionBranch string,
-	installID int64, only, exclude []string,
+	installID int64, only, exclude []string, persistExclude bool,
 ) (ApplyResponse, error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
-	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only, exclude); err != nil {
+	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only, exclude, persistExclude); err != nil {
 		return ApplyResponse{}, fmt.Errorf("build multipart: %w", err)
 	}
 	endpoint := c.baseURL + "/v1/projects"
@@ -967,6 +967,20 @@ func (c *Client) ApplyProjectPlan(
 	return out, c.doReq(c.uploadHTTP(), req, &out)
 }
 
+// DeleteDeploymentScopeExclusion drops a single persisted
+// --exclude row from deployment_scope_exclusions (ADR-124
+// code-review fix #2). The CLI's `gregale deployments exclude clear
+// --slug=...` calls into here as the operator-grade escape hatch
+// when a persisted slug no longer exists in the repo and is
+// blocking deploys. The server returns 404 with Problem
+// code="scope_exclusion_not_found" when no row matches; the CLI
+// branches on that via errors.As(&*api.APIError) to render
+// "already clear" rather than surface a hard error.
+func (c *Client) DeleteDeploymentScopeExclusion(ctx context.Context, projectSlug, slug string) error {
+	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/exclusions/" + url.PathEscape(slug)
+	return c.do(ctx, "DELETE", path, nil, nil)
+}
+
 // writeProjectMultipartFields serializes the multipart body shared
 // by ScanProject + ApplyProjectPlan. The fields exactly mirror the
 // OpenAPI ProjectScanRequest schema (the spec-compliance AST gate
@@ -974,6 +988,7 @@ func (c *Client) ApplyProjectPlan(
 func writeProjectMultipartFields(
 	w *multipart.Writer, source io.Reader, sourceName, projectSlug,
 	productionBranch string, installID int64, only, exclude []string,
+	persistExclude bool,
 ) error {
 	fw, err := w.CreateFormFile("source", sourceName)
 	if err != nil {
@@ -1007,6 +1022,17 @@ func writeProjectMultipartFields(
 	// rejected at the server with code='exclude_only_overlap'.
 	if len(exclude) > 0 {
 		if err := w.WriteField("exclude", strings.Join(exclude, ",")); err != nil {
+			return err
+		}
+	}
+	// ADR-124 follow-up #3 (PR-B commit 5): write-side persist
+	// flag. Server ignores it on the scan path; on the apply path
+	// it triggers CreateDeploymentScopeExclusion per excluded slug
+	// on a successful apply. Default OFF — the operator's intent
+	// is explicit. The field is emitted only when true to keep
+	// existing wire captures stable.
+	if persistExclude {
+		if err := w.WriteField("persist_exclude", "true"); err != nil {
 			return err
 		}
 	}

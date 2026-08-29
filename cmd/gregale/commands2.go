@@ -841,6 +841,18 @@ func cmdDeployTarball(args []string) int {
 	// flag when a soft-delete is in play. ADR §3 documents this
 	// as "warning + show-affected opt-in" (not auto-promote).
 	deployShowAffected := fs.Bool("show-affected", false, "render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124)")
+	// ADR-124 follow-up #3 (PR-B commit 5): --persist-exclude is the
+	// write-side complement to --exclude. When set, the operator's
+	// excluded slugs are recorded into deployment_scope_exclusions
+	// on a successful apply; subsequent deploys without --exclude
+	// honor the persisted set automatically (the apply path folds
+	// them into the engine call's excludeList, see
+	// cmd/apid/scan_service.go::scanService apply-time fallback).
+	// Default OFF — the operator's intent is explicit. The audit
+	// log (kind=project.scope.excluded) is the durable record beyond
+	// the 90-day active window; ADR-127 §1 documents the no-FK
+	// posture.
+	deployPersistExclude := fs.Bool("persist-exclude", false, "record --exclude slugs into deployment_scope_exclusions for future deploys (ADR-124 follow-up #3)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
@@ -1354,7 +1366,7 @@ func cmdDeployTarball(args []string) int {
 				strings.Join(clash, ", ")))
 		}
 		plan, err := client.ScanProject(ctx, openTarball, filepath.Base(*tarball),
-			*projectSlug, prodBranch, 0, onlyList, excludeList)
+			*projectSlug, prodBranch, 0, onlyList, excludeList, *deployPersistExclude)
 		if err != nil {
 			return printErr("Scan failed", err)
 		}
@@ -1380,7 +1392,7 @@ func cmdDeployTarball(args []string) int {
 		}
 		defer func() { _ = openTarball2.Close() }()
 		apply, err := client.ApplyProjectPlan(ctx, plan.PlanToken, openTarball2, filepath.Base(*tarball),
-			*projectSlug, prodBranch, 0, onlyList, excludeList)
+			*projectSlug, prodBranch, 0, onlyList, excludeList, *deployPersistExclude)
 		if err != nil {
 			return printErr("Apply failed", err)
 		}
@@ -1389,6 +1401,17 @@ func cmdDeployTarball(args []string) int {
 		}
 		PrintOK(osStdout, "Created project %s with %d app(s) and %d cron(s)",
 			apply.ProjectID, len(apply.Apps), len(plan.Crons))
+		// ADR-124 follow-up #1 (post-apply rescue signal). The wire
+		// invariant from cmd/apid/scan_service.go:864 is
+		// `gateRescuedByExclude := !preCanApply && canApply` so this
+		// fires only when the post-exclude apply succeeded but the
+		// pre-exclude gate would have blocked. Extracted into a
+		// helper so unit tests can pin the wire shape without
+		// standing up the full deploy command. The render is
+		// suppressed under --json (the jsonOutput branch returns
+		// above with a byte-shape write; the human-readable note
+		// would otherwise duplicate the JSON for those operators).
+		renderApplyRescue(osStdout, apply)
 		// Per-workload build lines (PR-A, repo decomposition Phase 5
 		// close-the-loop). The apply path enqueued one (deployment,
 		// build) per added/changed workload; surface them so the
@@ -3490,6 +3513,46 @@ func cmdUsageStorage(args []string) int {
 //
 // The summary is suppressed when no findings fired, so a clean deploy
 // prints nothing from this function.
+
+// renderApplyRescue writes the ADR-124 follow-up #1 post-apply
+// rescue signal to w. Fires only when apply.GateRescuedByExclude is
+// true; the wire invariant from cmd/apid/scan_service.go:864 is
+// `gateRescuedByExclude := !preCanApply && canApply`, so the helper
+// reaches the writer only when the post-exclude apply succeeded but
+// the pre-exclude gate would have blocked. Reasons come from the
+// wire verbatim; an empty reasons slice still renders the header so
+// the operator sees the rescue signal even when the server omitted
+// the per-reason detail. Extracted from cmdDeployTarball so unit
+// tests can pin the wire shape without standing up the full deploy
+// command (auth + scan + confirmation prompt + apply).
+//
+// Code-review fix #7: distinguish per-deploy --exclude from
+// persisted carry-forward exclusions in the rendered copy. The
+// wire carries both via apply.PersistedExclusions (the slugs
+// the server folded in from the deployment_scope_exclusions
+// table on this deploy); when the slice is non-empty, the rescue
+// signal could equally have come from the operator's --exclude
+// OR the persisted set, and the previous render always said "by
+// --exclude" — misleading operators who didn't pass --exclude on
+// this run. The new copy reads "by excluded workloads" when a
+// persisted set carried forward, falling back to "by --exclude"
+// for the per-deploy-only case.
+func renderApplyRescue(w io.Writer, apply api.ApplyResponse) {
+	if !apply.GateRescuedByExclude {
+		return
+	}
+	source := "by --exclude"
+	if len(apply.PersistedExclusions) > 0 {
+		source = "by excluded workloads (some persisted via --persist-exclude)"
+	}
+	if len(apply.CanApplyReasons) == 0 {
+		_, _ = fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked).\n", source)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  Note: gate was rescued %s (pre-exclude would have blocked); reasons: %s\n",
+		source, strings.Join(apply.CanApplyReasons, "; "))
+}
+
 func renderSecretScanWarnings(findings []secretscan.Finding, w io.Writer) {
 	if len(findings) == 0 {
 		return

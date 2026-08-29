@@ -5940,6 +5940,15 @@ paths:
                 limit_crons: 5
                 can_apply: true
                 plan_token: eyJoYXMiOiI...
+                # ADR-124 partition fields (preview surface).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected:
+                  - {name: legacy-job, root_dir: jobs/legacy, class: http, action: noop, id: 0123456789abcdef0123456789abcdef}
+                skipped:
+                  - {name: risky-migration, root_dir: jobs/migrate, class: http, action: noop}
+                removed: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -5991,6 +6000,20 @@ paths:
                   - {slug: worker, id: 0123456789abcdef0123456789abcdef}
                 scan_source: compose
                 can_apply: true
+                # ADR-124 partition fields (apply surface; mirrors
+                # PlanResponse so the CLI --show-affected render
+                # doesn't have to switch DTOs between scan and
+                # apply).
+                will_deploy:
+                  - {name: api, root_dir: '', class: http, action: create}
+                  - {name: worker, root_dir: '', class: http, action: update}
+                unaffected: []
+                skipped: []
+                removed: []
+                # ADR-124 follow-up #3 — slugs that were folded in
+                # from the deployment_scope_exclusions table on this
+                # apply (operator's --persist-exclude carry-forward).
+                persisted_exclusions: []
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/CronInvalid' }
@@ -5998,6 +6021,54 @@ paths:
         '409': { $ref: '#/components/responses/ValidationFailed' }
         '413': { $ref: '#/components/responses/SourceTooLarge' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/projects/{slug}/exclusions/{slug2}:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        description: Project slug (the (account, project) namespace owning the persisted exclusion).
+        schema: { type: string }
+      - name: slug2
+        in: path
+        required: true
+        description: Excluded workload slug (the app slug persisted via a prior --persist-exclude deploy).
+        schema: { type: string }
+    delete:
+      tags: [projects]
+      operationId: deleteDeploymentScopeExclusion
+      summary: Drop a persisted --exclude row from deployment_scope_exclusions.
+      description: |
+        Operator escape hatch (ADR-124 code-review fix #2) for
+        when a persisted slug no longer exists in the repo
+        (workload was renamed or deleted) and is blocking
+        subsequent deploys via exclude_unknown_slug. Without
+        this endpoint the only option was psql + hand-DELETE;
+        the CLI's `gregale deployments exclude clear
+        --slug=NAME --project-slug=SLUG` calls into here as the
+        operator-grade path. Idempotent — DELETE on no row
+        returns 404 scope_exclusion_not_found so the CLI can
+        render "already clear" without surfacing a hard error.
+      responses:
+        '200':
+          description: The exclusion was cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            Either the project does not exist or no persisted
+            exclusion matches the slug. Both surface as
+            scope_exclusion_not_found so the existence of a
+            project is not leaked via the operator surface.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
 
   # ─── Alert rules (issue #396 / ADR-045 PR 3) ─────────────────────────
   # Per-app CRUD surface. Account-wide rules (app_id == "") appear in
@@ -14243,6 +14314,24 @@ components:
         removed:
           type: array
           items: { type: string, description: "Slugs the apply path will SoftDeleteAppCascade." }
+        # ADR-124 follow-up #3 — persisted_exclusions lists every
+        # slug the apply path folded in from the
+        # deployment_scope_exclusions table (the operator's
+        # "I excluded this for the long haul" intent). Empty on
+        # preview; non-empty on apply when persisted rows took
+        # effect.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Lowercase slug carried forward from a previous --persist-exclude deploy." }
+        # ADR-124 code-review fix #2 — stale_persisted_exclusions
+        # is the subset of persisted_exclusions whose slug is no
+        # longer in the current scan (workload was renamed or
+        # deleted). Surfaced instead of failing the deploy with
+        # exclude_unknown_slug so the operator isn't locked out
+        # until the 90-day janitor reaps the row.
+        stale_persisted_exclusions:
+          type: array
+          items: { type: string, description: "Persisted slug no longer in the repo; ignored this deploy. Run `gregale deployments exclude clear --slug=...` to drop." }
 
     ApplyResponse:
       description: "Apply response. Carries the inserted project_id and per-app IDs."
@@ -14291,6 +14380,17 @@ components:
         removed:
           type: array
           items: { type: string }
+        # ADR-124 follow-up #3 — mirrors PlanResponse; the apply
+        # response also surfaces persisted_exclusions so the CLI
+        # can render "(carried forward from --persist-exclude:
+        # slug1, slug2)" alongside the partition.
+        persisted_exclusions:
+          type: array
+          items: { type: string, description: "Slugs folded into this apply from deployment_scope_exclusions (a prior --persist-exclude deploy). Empty when the apply path took the per-deploy req.Exclude list verbatim." }
+        # ADR-124 code-review fix #2 — mirrors PlanResponse.
+        stale_persisted_exclusions:
+          type: array
+          items: { type: string, description: "Persisted slug no longer in the repo; ignored this deploy." }
         project_id: { type: string, pattern: '^[a-f0-9]{32}$' }
         apps:
           type: array

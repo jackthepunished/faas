@@ -5285,4 +5285,37 @@ type Store interface {
 	// purge. cutoff is typically now() - 30 days (matches the
 	// §12 prom_retention_days:15 floor × 2 safety margin).
 	PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error
+
+	// ----------------------------------------------------------------------------
+	// DeploymentScopeExclusion CRUD (ADR-124 follow-up #3, migration
+	// 00418). Persistent --exclude history so a subsequent
+	// `gregale deploy` without --exclude still honors the operator's
+	// previous intent. The CRUD is small (4 methods) because the
+	// apply path only needs Create + Lookup; the admin tooling
+	// (List, Delete) is the rest.
+	// ----------------------------------------------------------------------------
+
+	// CreateDeploymentScopeExclusion inserts a single persisted
+	// --exclude row. The un-capped path is used by tests; the
+	// customer-facing handler always calls CreateDeploymentScopeExclusion
+	// (there is no quota gate today — the row count per project is
+	// bounded by the number of distinct workloads, typically 1-50).
+	// Returns:
+	//   - (DeploymentScopeExclusion{}, ErrConflict) on a duplicate
+	//     (account_id, project_id, slug) — the UNIQUE constraint.
+	CreateDeploymentScopeExclusion(ctx context.Context, in DeploymentScopeExclusion) (DeploymentScopeExclusion, error)
+	// ListDeploymentScopeExclusions returns every active exclusion
+	// for a project, sorted by created_at DESC. Backs the admin
+	// tooling's "what's persisted for this project?" view.
+	ListDeploymentScopeExclusions(ctx context.Context, projectID string) ([]DeploymentScopeExclusion, error)
+	// DeleteDeploymentScopeExclusion is the operator-undo path
+	// (the rare "I no longer want this exclusion" flow). Returns
+	// ErrNotFound when no row matches the (account, project, slug).
+	DeleteDeploymentScopeExclusion(ctx context.Context, accountID, projectID, slug string) error
+	// LookupDeploymentScopeExclusions returns every active slug
+	// the apply path should fold into the per-deploy exclude list.
+	// Translates persisted → per-deploy set at scan/apply time so
+	// `gregale deploy` without --exclude still honors the persisted
+	// set. Sorted by created_at DESC for stable apply ordering.
+	LookupDeploymentScopeExclusions(ctx context.Context, accountID, projectID string) ([]DeploymentScopeExclusion, error)
 }

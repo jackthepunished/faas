@@ -4227,6 +4227,23 @@ type PlanResponse struct {
 	Unaffected []PlanAffectedApp `json:"unaffected,omitempty"`
 	Skipped    []PlanAffectedApp `json:"skipped,omitempty"`
 	Removed    []string          `json:"removed,omitempty"`
+	// PersistedExclusions (ADR-124 follow-up #3) lists every slug
+	// that was folded into this scan/apply from the persisted
+	// deployment_scope_exclusions table — i.e. the operator's
+	// "I excluded this for the long haul" intent. The handler
+	// emits one KindProjectScopeExcluded audit row per slug. Empty
+	// on the common path (no persisted exclusions); the omitempty
+	// keeps existing --json consumers stable.
+	PersistedExclusions []string `json:"persisted_exclusions,omitempty"`
+	// StalePersistedExclusions (code-review fix #2) lists every
+	// slug that was carried forward from the persisted table but
+	// is no longer present in the current scan (workload was
+	// renamed or deleted in a future commit). Surfaced so the
+	// dashboard can render a "persisted exclusion ignored"
+	// badge and so the operator can run
+	// `gregale deployments exclude clear --slug=...` to drop a
+	// stale row before the 90-day janitor reaps it.
+	StalePersistedExclusions []string `json:"stale_persisted_exclusions,omitempty"`
 }
 
 // ApplyResponse is the success body for POST /v1/projects. Carries
