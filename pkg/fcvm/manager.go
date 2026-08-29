@@ -2432,6 +2432,15 @@ func (m *Manager) BootJob(ctx context.Context, req JobBootRequest) (_ *Instance,
 	lease.Plan = req.Plan
 	lease.IsBuilder = false
 
+	// Stamp the per-instance memory cap (CLAUDE.md §11
+	// 'memory.max = plan + 8 MB'). Without this, l.MemoryMaxMiB
+	// is zero → JailerSpec.MemoryMaxBytes=0 → vmm.go:2099
+	// closure returns 0 → config.go:542 skips the --cgroup
+	// memory.max arg entirely → the guest has no host memory
+	// fence and can OOM-kill the box. CR-2 / code-review #2.
+	// Mirrors manager.go:2581 in the Wake path.
+	lease.MemoryMaxMiB = req.MemSizeMiB
+
 	// Match the wake path's defer-and-unwind pattern: any error
 	// after Acquire must release the slot AND tear down the netns.
 	defer func() {
