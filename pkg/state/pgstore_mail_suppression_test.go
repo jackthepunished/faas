@@ -37,8 +37,9 @@ func pgSampleMailSuppression(acctID *string) state.MailSuppressionInput {
 
 // TestPgStore_MailSuppression_RoundTrip exercises the happy path:
 // a fresh write returns inserted=true, IsMailSuppressed sees it, and a
-// replay with the same (source, provider_event_id) returns ErrConflict
-// (the pr-1000 mapping of SQLSTATE 23505).
+// replay with the same (source, provider_event_id) returns inserted=false
+// via the ON CONFLICT DO UPDATE arm — the (xmax = 0) discriminator the
+// bounce handler reads to decide whether to advance dunning.
 func TestPgStore_MailSuppression_RoundTrip(t *testing.T) {
 	s, ctx := pgStore(t)
 	acct, _, _ := seedLiveDeploy(t, s, ctx)
