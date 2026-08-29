@@ -568,6 +568,15 @@ func tarballRootPrefix(path string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("rootfs: read tar: %w", err)
 		}
+		// GitHub's codeload archives include a pax_global_header before
+		// the project directory. It is archive metadata, not a second
+		// top-level project. Ignore tar metadata entries while detecting
+		// the wrapper directory or the detector will leave the archive
+		// rooted at /app/<project> and function handlers will be missed.
+		switch hdr.Typeflag {
+		case tar.TypeXHeader, tar.TypeXGlobalHeader, tar.TypeGNULongName, tar.TypeGNULongLink:
+			continue
+		}
 		name := strings.TrimSuffix(hdr.Name, "/")
 		if name == "" {
 			continue
