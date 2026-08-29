@@ -21,11 +21,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -467,5 +470,454 @@ func (s *server) getJobTaskLogs(w http.ResponseWriter, r *http.Request, acct sta
 		LogContent: "",
 		Truncated:  false,
 		MaxBytes:   maxBytes,
+	})
+}
+
+// --- 5 write handlers (Mega-1 M11.3) ---------------------------------
+
+// buildJob applies defaults and clamps the per-plan caps. Returns
+// the Job to persist or a *Problem for the first violation.
+//
+// Plan gate fires BEFORE slug check so a Free customer's POST
+// gets 402 with the upgrade copy the dashboard renders, not a
+// generic validation error. caps lookups are explicit (no
+// implicit "0 means plan default") so a Free customer's POST
+// with ram_mb=0 still fails fast on JobsAllowed.
+//
+// Defaults:
+//   - kind       → "batch" when empty
+//   - RAMMB      → api.JobRAMMB[plan] when 0
+//   - TaskTimeoutS → api.JobTaskTimeoutSec[plan] when 0
+//   - MaxParallelism → api.JobMaxParallelismPerRun[plan] when 0
+//   - RetryMax   → api.JobMaxRetries[plan] when 0
+//
+// Clamps:
+//   - RAMMB / TaskTimeoutS / MaxParallelism / RetryMax cannot
+//     exceed the per-plan cap (hard ceiling).
+func (s *server) buildJob(acct state.Account, req api.CreateJobRequest) (state.Job, *api.Problem) {
+	if !acct.Plan.JobsAllowed() {
+		return state.Job{}, api.ErrPlanJobsNotAllowed(acct.Plan)
+	}
+	if !validSlug(req.Name) {
+		return state.Job{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid slug", "slug must be 3–40 chars, lowercase letters, digits, and hyphens")
+	}
+	kind := req.Kind
+	if kind == "" {
+		kind = "batch"
+	}
+	if kind != "batch" && kind != "recurring" {
+		return state.Job{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid kind", "kind must be 'batch' or 'recurring'")
+	}
+	if strings.TrimSpace(req.ImageRef) == "" {
+		return state.Job{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid image_ref", "image_ref is required")
+	}
+	if len(req.Command) > 64 {
+		return state.Job{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid command", "command array may contain at most 64 entries")
+	}
+	idx := acct.Plan.PlanIndex()
+	ramMB := req.RAMMB
+	if ramMB == 0 {
+		ramMB = api.JobRAMMB[idx]
+	}
+	if cap := api.JobRAMMB[idx]; ramMB > cap {
+		return state.Job{}, api.ErrJobQuota(acct.Plan, "ram_mb", cap, ramMB)
+	}
+	taskTimeoutS := req.TaskTimeoutSec
+	if taskTimeoutS == 0 {
+		taskTimeoutS = api.JobTaskTimeoutSec[idx]
+	}
+	if cap := api.JobTaskTimeoutSec[idx]; taskTimeoutS > cap {
+		return state.Job{}, api.ErrJobQuota(acct.Plan, "task_timeout_s", cap, taskTimeoutS)
+	}
+	maxParallelism := req.MaxParallelism
+	if maxParallelism == 0 {
+		maxParallelism = api.JobMaxParallelismPerRun[idx]
+	}
+	if cap := api.JobMaxParallelismPerRun[idx]; maxParallelism > cap {
+		return state.Job{}, api.ErrJobQuota(acct.Plan, "max_parallelism", cap, maxParallelism)
+	}
+	retryMax := req.RetryMax
+	if retryMax == 0 {
+		retryMax = api.JobMaxRetries[idx]
+	}
+	if cap := api.JobMaxRetries[idx]; retryMax > cap {
+		return state.Job{}, api.ErrJobQuota(acct.Plan, "retry_max", cap, retryMax)
+	}
+	envOverrides, prob := encodeEnvOverrides(req.EnvOverrides)
+	if prob != nil {
+		return state.Job{}, prob
+	}
+	return state.Job{
+		AccountID:      acct.ID,
+		Name:           req.Name,
+		Kind:           kind,
+		ImageRef:       req.ImageRef,
+		Command:        req.Command,
+		EnvOverrides:   envOverrides,
+		RAMMB:          ramMB,
+		TaskTimeoutS:   taskTimeoutS,
+		MaxParallelism: maxParallelism,
+		RetryMax:       retryMax,
+		Status:         "active",
+	}, nil
+}
+
+// encodeEnvOverrides marshals the env map to jsonb. nil map →
+// nil bytes (the column is nullable, so a missing override is a
+// no-op rather than an empty {}). Returns 400 on a marshal
+// failure (the map contains a non-UTF-8 key — defensive).
+func encodeEnvOverrides(env map[string]string) (json.RawMessage, *api.Problem) {
+	if env == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return nil, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid env_overrides", err.Error())
+	}
+	return b, nil
+}
+
+// createJob handles POST /v1/jobs. Plan-tier gate (JobsAllowed)
+// precedes slug check + per-account quota. The per-account quota
+// gate uses JobCountByAccount + JobCreate in sequence (memstore
+// holds m.mu during the pair; pgstore's pair runs without a
+// transaction but the JobCountByAccount+JobCreate pair is
+// serialized via the per-account row lock in JobRunRecompute's
+// style — see ADR-099 supplement §"Quota gate". A future
+// follow-up PR promotes this to a single atomic method
+// JobCreateIfUnderQuota, mirroring the CreateCronIfUnderQuota
+// evolution in PR-A → PR-B).
+func (s *server) createJob(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req api.CreateJobRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	job, prob := s.buildJob(acct, req)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	// Per-account quota gate (JobMaxPerAccount). Counts every
+	// non-deleted job the account owns; the JobCreate INSERT
+	// follows immediately so a race that beats the count is
+	// re-checked on the next POST (the eventual cap
+	// enforcement). The pgstore path will gain an atomic
+	// JobCreateIfUnderQuota in a follow-up PR — see function
+	// doc.
+	count, err := s.store.JobCountByAccount(r.Context(), acct.ID)
+	if err != nil {
+		s.log.Error("create job: count failed", "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not create job"))
+		return
+	}
+	if limit := api.JobMaxPerAccount[acct.Plan.PlanIndex()]; count >= limit {
+		api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "per_account", limit, count))
+		return
+	}
+	created, err := s.store.JobCreate(r.Context(), acct.ID, job.Name, job.Kind,
+		job.ImageRef, job.Command, job.RAMMB, job.TaskTimeoutS,
+		job.MaxParallelism, job.RetryMax, job.EnvOverrides)
+	if err != nil {
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
+				"Name taken", fmt.Sprintf("job name %q is already in use", job.Name)))
+		default:
+			s.log.Error("create job: insert failed", "account", acct.ID, "err", err)
+			api.WriteProblem(w, api.ErrCapacity("could not create job"))
+		}
+		return
+	}
+	s.log.Info("job created", "job", created.ID, "name", created.Name, "account", acct.ID)
+	s.audit.Emit(r.Context(), "job.created", &acct.ID, map[string]any{
+		"job_id":  created.ID,
+		"name":    created.Name,
+		"kind":    created.Kind,
+		"ram_mb":  created.RAMMB,
+		"command": created.Command,
+	})
+	_ = s.notif.Notify(r.Context(), db.NotifyJobChanged,
+		fmt.Sprintf(`{"kind":"created","job_id":"%s","account_id":"%s"}`, created.ID, acct.ID))
+	writeJSON(w, http.StatusCreated, jobResponse(created))
+}
+
+// updateJob handles PATCH /v1/jobs/{name}. Two-step IDOR-safe
+// lookup via resolveJob. nil pointer fields leave the column
+// untouched. PATCH is the only path that lets a customer set
+// status='paused' (soft-disable without losing the job).
+func (s *server) updateJob(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	name := r.PathValue("name")
+	var req api.UpdateJobRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if !acct.Plan.JobsAllowed() {
+		api.WriteProblem(w, api.ErrPlanJobsNotAllowed(acct.Plan))
+		return
+	}
+	j, ok, err := s.resolveJob(r.Context(), name, acct)
+	if err != nil {
+		s.log.Error("update job: resolve failed", "name", name, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not update job"))
+		return
+	}
+	if !ok {
+		s.notFound(w, "no such job")
+		return
+	}
+	// Re-clamp RAM / task_timeout / parallelism / retry against
+	// the plan caps so a downgrade + PATCH can't escalate a
+	// job's resource footprint above the current plan's
+	// ceiling. JobUpdate is the only path through which a
+	// customer can raise a field above the previous value.
+	idx := acct.Plan.PlanIndex()
+	if req.RAMMB != nil {
+		if cap := api.JobRAMMB[idx]; *req.RAMMB > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "ram_mb", cap, *req.RAMMB))
+			return
+		}
+	}
+	if req.TaskTimeoutSec != nil {
+		if cap := api.JobTaskTimeoutSec[idx]; *req.TaskTimeoutSec > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "task_timeout_s", cap, *req.TaskTimeoutSec))
+			return
+		}
+	}
+	if req.MaxParallelism != nil {
+		if cap := api.JobMaxParallelismPerRun[idx]; *req.MaxParallelism > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "max_parallelism", cap, *req.MaxParallelism))
+			return
+		}
+	}
+	if req.RetryMax != nil {
+		if cap := api.JobMaxRetries[idx]; *req.RetryMax > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "retry_max", cap, *req.RetryMax))
+			return
+		}
+	}
+	if req.Status != nil {
+		if *req.Status != "active" && *req.Status != "paused" {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid status", "status must be 'active' or 'paused' (use DELETE for soft-delete)"))
+			return
+		}
+	}
+	var envOverrides json.RawMessage
+	if req.EnvOverrides != nil {
+		envOverrides, err = json.Marshal(req.EnvOverrides)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid env_overrides", err.Error()))
+			return
+		}
+	}
+	updated, err := s.store.JobUpdate(r.Context(), j.ID, req.Command, req.ImageRef,
+		req.RAMMB, req.TaskTimeoutSec, req.MaxParallelism, req.RetryMax,
+		envOverrides, req.Status)
+	if err != nil {
+		s.log.Error("update job failed", "job", j.ID, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not update job"))
+		return
+	}
+	s.audit.Emit(r.Context(), "job.updated", &acct.ID, map[string]any{
+		"job_id": updated.ID,
+		"name":   updated.Name,
+	})
+	_ = s.notif.Notify(r.Context(), db.NotifyJobChanged,
+		fmt.Sprintf(`{"kind":"updated","job_id":"%s","account_id":"%s"}`, updated.ID, acct.ID))
+	writeJSON(w, http.StatusOK, jobResponse(updated))
+}
+
+// deleteJob handles DELETE /v1/jobs/{name}. Soft-delete via
+// JobSoftDelete (status='active'|'paused' → status='deleted').
+// Returns 409 CodeJobHasLiveInstances when at least one
+// kind='job_task' AND status NOT IN ('parked','destroyed')
+// instance still references the job (the helper enforces this
+// atomically; the handler surfaces the conflict).
+func (s *server) deleteJob(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	name := r.PathValue("name")
+	if !acct.Plan.JobsAllowed() {
+		api.WriteProblem(w, api.ErrPlanJobsNotAllowed(acct.Plan))
+		return
+	}
+	j, ok, err := s.resolveJob(r.Context(), name, acct)
+	if err != nil {
+		s.log.Error("delete job: resolve failed", "name", name, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not delete job"))
+		return
+	}
+	if !ok {
+		s.notFound(w, "no such job")
+		return
+	}
+	deleted, hasLiveInstances, err := s.store.JobSoftDelete(r.Context(), j.ID)
+	if err != nil {
+		s.log.Error("delete job failed", "job", j.ID, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not delete job"))
+		return
+	}
+	if hasLiveInstances {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeJobHasLiveInstances,
+			"Job has live instances",
+			fmt.Sprintf("job %q has live instances — cancel/wait before deleting", j.Name)))
+		return
+	}
+	s.audit.Emit(r.Context(), "job.deleted", &acct.ID, map[string]any{
+		"job_id": j.ID,
+		"name":   j.Name,
+	})
+	_ = s.notif.Notify(r.Context(), db.NotifyJobChanged,
+		fmt.Sprintf(`{"kind":"deleted","job_id":"%s","account_id":"%s"}`, j.ID, acct.ID))
+	// deleted=true → first time; deleted=false → idempotent
+	// re-call on an already-soft-deleted job. The 204
+	// status is correct in both cases (REST convention for
+	// DELETE on a soft-deleted resource).
+	_ = deleted
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// createJobRun handles POST /v1/jobs/{name}/runs. Atomic fan-out
+// via JobRunCreate (10k tasks via generate_series CTE in pgstore;
+// equivalent in memstore). Tasks count clamped against
+// JobMaxTasksPerRun; per-run overrides (parallelism / retry_max
+// / task_timeout_s) inherit from the job when nil.
+func (s *server) createJobRun(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	name := r.PathValue("name")
+	var req api.CreateJobRunRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if !acct.Plan.JobsAllowed() {
+		api.WriteProblem(w, api.ErrPlanJobsNotAllowed(acct.Plan))
+		return
+	}
+	j, ok, err := s.resolveJob(r.Context(), name, acct)
+	if err != nil {
+		s.log.Error("create job run: resolve failed", "name", name, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not create run"))
+		return
+	}
+	if !ok {
+		s.notFound(w, "no such job")
+		return
+	}
+	if j.Status == "paused" {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
+			"Job paused", "job is paused — set status='active' via PATCH to run again"))
+		return
+	}
+	if req.Tasks < 1 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid tasks", "tasks must be >= 1"))
+		return
+	}
+	idx := acct.Plan.PlanIndex()
+	if cap := api.JobMaxTasksPerRun[idx]; req.Tasks > cap {
+		api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "tasks_per_run", cap, req.Tasks))
+		return
+	}
+	// Per-run overrides inherit from the job when nil; a
+	// non-nil override is clamped against the plan cap so a
+	// single PATCH can't escalate above the plan ceiling.
+	if req.Parallelism != nil {
+		if cap := api.JobMaxParallelismPerRun[idx]; *req.Parallelism > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "max_parallelism", cap, *req.Parallelism))
+			return
+		}
+	}
+	if req.TaskTimeoutSec != nil {
+		if cap := api.JobTaskTimeoutSec[idx]; *req.TaskTimeoutSec > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "task_timeout_s", cap, *req.TaskTimeoutSec))
+			return
+		}
+	}
+	if req.RetryMax != nil {
+		if cap := api.JobMaxRetries[idx]; *req.RetryMax > cap {
+			api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "retry_max", cap, *req.RetryMax))
+			return
+		}
+	}
+	// Per-account concurrent cap (JobConcurrentPerAccount):
+	// refuse the run if the customer already has too many
+	// live job_task instances. Different from
+	// JobConcurrentPerAccount (per-account live limit) and
+	// the per-node RAM ceiling — that gate lives in schedd
+	// at WakeJob (admission.KindJob).
+	concurrent, err := s.store.JobConcurrentByAccount(r.Context(), acct.ID)
+	if err != nil {
+		s.log.Error("create job run: concurrent count failed", "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not create run"))
+		return
+	}
+	if cap := api.JobConcurrentPerAccount[idx]; concurrent+req.Tasks > cap {
+		api.WriteProblem(w, api.ErrJobQuota(acct.Plan, "concurrent", cap, concurrent+req.Tasks))
+		return
+	}
+	envOverrides, prob := encodeEnvOverrides(req.EnvOverrides)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	run, _, err := s.store.JobRunCreate(r.Context(), j.ID, acct.ID, "manual",
+		req.Parallelism, req.RetryMax, req.TaskTimeoutSec, envOverrides, req.Tasks)
+	if err != nil {
+		s.log.Error("create job run failed", "job", j.ID, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not create run"))
+		return
+	}
+	s.audit.Emit(r.Context(), "job.run.created", &acct.ID, map[string]any{
+		"job_id": j.ID,
+		"run_id": run.ID,
+		"tasks":  run.Tasks,
+	})
+	_ = s.notif.Notify(r.Context(), db.NotifyJobChanged,
+		fmt.Sprintf(`{"kind":"run_created","job_id":"%s","run_id":"%s","account_id":"%s"}`, j.ID, run.ID, acct.ID))
+	writeJSON(w, http.StatusCreated, jobRunResponse(run))
+}
+
+// cancelJobRun handles POST /v1/jobs/{name}/runs/{id}/cancel.
+// Two-step resolveJobRun → JobRunCancel. Returns the post-cancel
+// run aggregate (jobRunResponse) plus the cancelled_at timestamp
+// so the dashboard can re-render without a separate GET.
+func (s *server) cancelJobRun(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	runID := r.PathValue("id")
+	if !acct.Plan.JobsAllowed() {
+		api.WriteProblem(w, api.ErrPlanJobsNotAllowed(acct.Plan))
+		return
+	}
+	j, run, ok, err := s.resolveJobRun(r.Context(), runID, acct)
+	if err != nil {
+		s.log.Error("cancel job run: resolve failed", "id", runID, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not cancel run"))
+		return
+	}
+	if !ok {
+		s.notFound(w, "no such run")
+		return
+	}
+	cancelled, err := s.store.JobRunCancel(r.Context(), run.ID)
+	if err != nil {
+		s.log.Error("cancel job run failed", "run", run.ID, "account", acct.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not cancel run"))
+		return
+	}
+	s.audit.Emit(r.Context(), "job.run.cancelled", &acct.ID, map[string]any{
+		"job_id": j.ID,
+		"run_id": cancelled.ID,
+	})
+	_ = s.notif.Notify(r.Context(), db.NotifyJobChanged,
+		fmt.Sprintf(`{"kind":"run_cancelled","job_id":"%s","run_id":"%s","account_id":"%s"}`, j.ID, cancelled.ID, acct.ID))
+	cancelledAt := time.Now().UTC().Format(time.RFC3339)
+	writeJSON(w, http.StatusOK, api.JobRunCancelledResponse{
+		Run:         jobRunResponse(cancelled),
+		CancelledAt: cancelledAt,
 	})
 }
