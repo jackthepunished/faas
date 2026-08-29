@@ -22,6 +22,28 @@ const DefaultCertExpiryRefresherInterval = 1 * time.Hour
 // Mirrored in cmd/meterd/alert_presets_ticks.go.
 const DefaultAccountSpendAggregatorInterval = 5 * time.Minute
 
+// DefaultAPIReachabilitySweepInterval is the production cadence
+// for the ADR-123 meterd_api_reachable gauge refresher. 5 min
+// matches the reachability window the gauge encodes (1.0 if the
+// app served a successful invocation within the last 5 min, 0.0
+// otherwise) — refreshing faster than 5 min would flip the gauge
+// before a real outage window closes; refreshing slower would let
+// the alert preset api_down fire on transient idle periods that
+// recover within the window. Mirrored in
+// cmd/meterd/api_reachability_sweep.go.
+const DefaultAPIReachabilitySweepInterval = 5 * time.Minute
+
+// DefaultDeploymentFailureSweepInterval is the production cadence
+// for the ADR-123 apid_deployment_failed_total counter refresher.
+// 60 s matches AlertEvalInterval so the counter increments keep
+// pace with the alert evaluator's view of "deployments that
+// transitioned to failed since the last tick". The counter is
+// delta-shaped (previous sweep timestamp seeds the next SELECT's
+// WHERE updated_at >= $lastSweep clause) so a slow tick can
+// double-count on restart but never under-count during normal
+// operation. Mirrored in cmd/meterd/deployment_failure_sweep.go.
+const DefaultDeploymentFailureSweepInterval = 60 * time.Second
+
 // Config is the meterd daemon's TOML-backed settings. Defaults match
 // the spec §4.7 cadence:
 //
@@ -133,6 +155,22 @@ type Config struct {
 	// tick every 5 min, so refreshing faster than that is
 	// wasted work.
 	AccountSpendAggregatorInterval time.Duration
+	// APIReachabilitySweepInterval (ADR-123 PR-B, issue
+	// #1233) is how often the API reachability gauge refresher
+	// walks every (account_id, app_id) pair and stamps
+	// meterd_api_reachable = 1.0 if the app served a successful
+	// invocation within the last 5 min, 0.0 otherwise. Zero
+	// means the production default (5 min) — matches the
+	// reachability window the gauge encodes.
+	APIReachabilitySweepInterval time.Duration
+	// DeploymentFailureSweepInterval (ADR-123 PR-B, issue
+	// #1233) is how often the deployment-failure counter
+	// refresher walks every (account_id, app_id) pair, queries
+	// CountFailedDeploymentsSince for the delta since the
+	// previous sweep, and increments
+	// apid_deployment_failed_total by that delta. Zero means
+	// the production default (60 s) — matches AlertEvalInterval.
+	DeploymentFailureSweepInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -184,5 +222,11 @@ func (c *Config) Defaults() {
 	}
 	if c.AccountSpendAggregatorInterval == 0 {
 		c.AccountSpendAggregatorInterval = DefaultAccountSpendAggregatorInterval
+	}
+	if c.APIReachabilitySweepInterval == 0 {
+		c.APIReachabilitySweepInterval = DefaultAPIReachabilitySweepInterval
+	}
+	if c.DeploymentFailureSweepInterval == 0 {
+		c.DeploymentFailureSweepInterval = DefaultDeploymentFailureSweepInterval
 	}
 }

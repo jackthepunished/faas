@@ -2266,3 +2266,60 @@ func TestOpsMetrics_SetOperatorActionTraceCompletenessNilSafe(t *testing.T) {
 	// Must not panic.
 	m.SetOperatorActionTraceCompleteness("force_park", 1.0)
 }
+
+// TestOpsMetrics_AlertPresetSignalsRegistered — issue #1233 / ADR-123
+// PR-B pins that the 5 alert-preset signal series all register
+// (HELP + TYPE lines in the /metrics output). Two of the five land
+// in PR-B (meterd_api_reachable, meterd_deployment_failed_total);
+// three were registered in PR-A (meterd_account_spend_eur,
+// meterd_tenant_surface_cert_expiry_seconds,
+// meterd_tenant_surface_cert_expiry_refresher_walk_complete_total).
+// A future refactor that drops one trips this test before the
+// catalog flip from §Follow-ups gets re-shipped.
+//
+// The test deliberately covers BOTH the PR-A set AND the PR-B set
+// (1) so a maintainer renaming or removing a PR-A series trips the
+// assertion during PR-A review, not silently at the PR-B flip; and
+// (2) so PR-B has a single regression that lives next to the metric
+// surface, not scattered across cmd/meterd/*_test.go files.
+//
+// The meterd daemon constructs its registry with prefix "meterd"
+// (cmd/meterd/main.go:803 wire.NewOpsMetrics("meterd")), so the
+// final /metrics name is `meterd_<suffix>` for every alert-preset
+// series. The Go-side accessor names keep an `Apid...` prefix for
+// backward-compat with already-deployed alert rules (see the
+// comment on OpsMetrics.ApidTenantSurfaceCertExpirySeconds at
+// pkg/wire/metrics.go:~4995); the Prometheus name does NOT.
+//
+// Prometheus's text format only emits HELP/TYPE for *Vec metrics
+// that have at least one label-set observation; an empty Vec is
+// silent. We touch each gauge/counter with a synthetic label set
+// first so the HELP/TYPE lines surface in the rendered body.
+func TestOpsMetrics_AlertPresetSignalsRegistered(t *testing.T) {
+	m := wire.NewOpsMetrics("meterd")
+	// Touch each gauge/counter with a synthetic label set so
+	// Prometheus emits HELP/TYPE lines in /metrics. The actual
+	// values are discarded — the test only asserts registration
+	// presence.
+	m.MeterdAccountSpendEur().WithLabelValues("__prb_test__").Set(0)
+	m.MeterdAPIReachable().WithLabelValues("__prb_test__", "__prb_test__").Set(0)
+	m.ApidDeploymentFailedTotal().WithLabelValues("__prb_test__", "__prb_test__").Add(0)
+	m.ApidTenantSurfaceCertExpirySeconds().WithLabelValues("__prb_test__", "__prb_test__", "__prb_test__").Set(0)
+	m.ApidTenantSurfaceCertExpiryRefresherWalkCompleteTotal("ok")()
+	body := render(t, m)
+	// Each entry is the HELP-line fragment that Prometheus emits
+	// from the *Opts.Help field; the TYPE line alone isn't enough
+	// because a duplicate Name would still print a TYPE line.
+	wants := []string{
+		"# HELP meterd_account_spend_eur ",
+		"# HELP meterd_api_reachable ",
+		"# HELP meterd_tenant_surface_cert_expiry_seconds ",
+		"# HELP meterd_tenant_surface_cert_expiry_refresher_walk_complete_total ",
+		"# HELP meterd_deployment_failed_total ",
+	}
+	for _, w := range wants {
+		if !strings.Contains(body, w) {
+			t.Errorf("missing HELP line %q in /metrics — alert preset signal registration regressed (issue #1233 / ADR-123 PR-B):\n%s", w, body)
+		}
+	}
+}
