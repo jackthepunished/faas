@@ -78,6 +78,7 @@ type Loop struct {
 	watchdog           *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
 	retention          *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
 	invocationsRetention *InvocationsRetention // ADR-134 PR-B: invocations retention + deadline-breach sweep; nil opts out
+	triggersRetention    *TriggersRetention    // ADR-134 PR-E: trigger_records retention sweep; nil opts out
 	heartbeat          *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
 	diskDrift          *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
 	migratingWatchdog  *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
@@ -170,6 +171,13 @@ func (l *Loop) WithRetention(r *Retention) *Loop {
 // passed to dead_letter. Same nil-skip semantics as WithRetention.
 func (l *Loop) WithInvocationsRetention(r *InvocationsRetention) *Loop {
 	l.invocationsRetention = r
+	return l
+}
+
+// WithTriggersRetention attaches the ADR-134 PR-E trigger_records
+// retention sweep. Same nil-skip semantics as WithInvocationsRetention.
+func (l *Loop) WithTriggersRetention(r *TriggersRetention) *Loop {
+	l.triggersRetention = r
 	return l
 }
 
@@ -599,6 +607,16 @@ func (l *Loop) Run(ctx context.Context) error {
 		invocationsRetentionT = time.NewTicker(60 * time.Second)
 		defer invocationsRetentionT.Stop()
 	}
+	// ADR-134 PR-E: trigger_records retention sweep. 5-minute
+	// cadence — terminal trigger_records are produced at a much
+	// lower rate than terminal invocations (every batch creates
+	// one row, not one row per event), so a 5-min sweep is
+	// plenty resolution. nil = opt out.
+	var triggersRetentionT *time.Ticker
+	if l.triggersRetention != nil {
+		triggersRetentionT = time.NewTicker(5 * time.Minute)
+		defer triggersRetentionT.Stop()
+	}
 	// Heartbeat ticker (issue #97 / ADR-025 axis 3, PR #114).
 	// Per-node liveness sweep: ping each active compute_node,
 	// stamp last_heartbeat_at on success or flip active=false
@@ -805,6 +823,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runRetention(ctx)
 		case <-invocationsRetentionTick(invocationsRetentionT):
 			l.runInvocationsRetention(ctx)
+		case <-triggersRetentionTick(triggersRetentionT):
+			l.runTriggersRetention(ctx)
 		case <-fireNowT.C:
 			// PR-D / issue #791: safety sweep. Picks up rows that
 			// missed a NotifyCronRunNow delivery (Postgres bounce,
@@ -868,6 +888,15 @@ func retentionTick(t *time.Ticker) <-chan time.Time {
 // invocationsRetentionTick mirrors retentionTick for the ADR-134
 // PR-B invocations sweep.
 func invocationsRetentionTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// triggersRetentionTick mirrors retentionTick for the ADR-134
+// PR-E trigger_records sweep.
+func triggersRetentionTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -1101,6 +1130,22 @@ func (l *Loop) runInvocationsRetention(ctx context.Context) {
 		l.log.Info("invocations retention: swept",
 			"deleted", retentionDeleted,
 			"deadline_forced", deadlineForced)
+	}
+}
+
+// runTriggersRetention dispatches one tick of the ADR-134 PR-E
+// trigger_records sweep. Same shape as runInvocationsRetention.
+func (l *Loop) runTriggersRetention(ctx context.Context) {
+	if l.triggersRetention == nil {
+		return
+	}
+	deleted, err := l.triggersRetention.SweepOnce(ctx, 1000)
+	if err != nil {
+		l.log.Warn("trigger_records retention: sweep failed", "err", err)
+		return
+	}
+	if deleted > 0 {
+		l.log.Info("trigger_records retention: swept", "deleted", deleted)
 	}
 }
 

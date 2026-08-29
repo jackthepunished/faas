@@ -16366,3 +16366,21 @@ func (m *MemStore) RetryQueueDeadLetter(_ context.Context, accountID, invocation
 	m.invocations[invocationID] = inv
 	return inv, nil
 }
+
+// ListExpiredTriggerRecordsForReaper (ADR-134 PR-E) is a no-op
+// for MemStore: the trigger_records map holds sqlc.TriggerRecord
+// rows that do not carry the per-row retention column
+// (sqlc.TriggerRecord is generated from the pre-PR-C schema).
+// MemStore-backed tests therefore cannot exercise the retention
+// reaper against trigger_records; the integration path
+// (pkg/sched/retention_triggers_test.go pgtest) runs against
+// PgStore where the column exists.
+func (m *MemStore) ListExpiredTriggerRecordsForReaper(_ context.Context, _ time.Time, _ int) ([]string, error) {
+	return nil, nil
+}
+
+// DeleteTriggerRecordsByIDs (ADR-134 PR-E) is a no-op for
+// MemStore for the same reason — see ListExpiredTriggerRecordsForReaper.
+func (m *MemStore) DeleteTriggerRecordsByIDs(_ context.Context, _ []string) (int, error) {
+	return 0, nil
+}

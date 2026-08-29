@@ -21812,3 +21812,55 @@ func (s *PgStore) ForceDeadlineBreachedInvocations(ctx context.Context, ids []st
 	}
 	return int(tag.RowsAffected()), nil
 }
+
+// ----------------------------------------------------------------------------
+// ADR-134 PR-E: trigger_records retention reaper.
+//
+// The reaper (pkg/sched/retention_triggers.go) DELETEs terminal
+// trigger_records whose result_retention_until is in the past.
+// Pattern mirrors ListExpiredInvocationsForReaper — list IDs in
+// a SELECT (no SKIP LOCKED; trigger_records are not claimed by
+// any worker today), DELETE in a single batch.
+// ----------------------------------------------------------------------------
+
+// ListExpiredTriggerRecordsForReaper returns up to `limit`
+// trigger_records IDs whose result_retention_until is in the
+// past. Used by pkg/sched/retention_triggers.go.
+func (s *PgStore) ListExpiredTriggerRecordsForReaper(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id
+		  from trigger_records
+		 where result_retention_until is not null
+		   AND result_retention_until <= $1
+		 order by result_retention_until
+		 limit $2`, now.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: trigger_records reaper list: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("state: trigger_records reaper scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DeleteTriggerRecordsByIDs removes the given rows. Returns the
+// count deleted.
+func (s *PgStore) DeleteTriggerRecordsByIDs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, `delete from trigger_records where id = any($1::uuid[])`, ids)
+	if err != nil {
+		return 0, fmt.Errorf("state: trigger_records reaper delete: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}

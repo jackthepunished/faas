@@ -3345,6 +3345,13 @@ type Store interface {
 	// row is missing, not dead_letter, or owned by another
 	// account.
 	RetryQueueDeadLetter(ctx context.Context, accountID, invocationID string) (Invocation, error)
+	// ListExpiredTriggerRecordsForReaper (ADR-134 PR-E) returns
+	// trigger_records IDs whose result_retention_until is in
+	// the past.
+	ListExpiredTriggerRecordsForReaper(ctx context.Context, now time.Time, limit int) ([]string, error)
+	// DeleteTriggerRecordsByIDs removes the given rows. Returns
+	// the count deleted.
+	DeleteTriggerRecordsByIDs(ctx context.Context, ids []string) (int, error)
 	// CompleteInvocation finalises a dispatched row with an optional result
 	// envelope (response status + body bytes for sync invoke; nil for the
 	// other sources). State → completed.
