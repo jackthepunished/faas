@@ -70,18 +70,20 @@ func TestMetricsIssue273Exposition(t *testing.T) {
 	if !strings.Contains(body, "gateway_request_duration_seconds_bucket") {
 		t.Errorf("gateway_request_duration_seconds_bucket not in registry output:\n%s", body)
 	}
-	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="2xx"} 1`) {
+	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="2xx",deployment=""} 1`) {
 		t.Errorf("expected count for app-1/2xx to be 1:\n%s", body)
 	}
-	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="5xx"} 1`) {
+	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="5xx",deployment=""} 1`) {
 		t.Errorf("expected count for app-1/5xx to be 1:\n%s", body)
 	}
 
 	// Pre-instantiation: all four closed classes surface with count=0
 	// for app-1 (no observation yet on 3xx/4xx). Catches a future
-	// regression that accidentally stops pre-instantiating.
+	// regression that accidentally stops pre-instantiating. The
+	// deployment="" label is the reserved legacy single-targetSet
+	// sentinel (Debugger UX v1 / ADR-127 §Decision 4).
 	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
-		want := fmt.Sprintf(`gateway_request_duration_seconds_count{app="app-1",class=%q}`, class)
+		want := fmt.Sprintf(`gateway_request_duration_seconds_count{app="app-1",class=%q,deployment=""}`, class)
 		if !strings.Contains(body, want) {
 			t.Errorf("pre-instantiated %s missing:\n%s", want, body)
 		}
@@ -106,7 +108,7 @@ func TestMetricsPreInstantiateAppBounded(t *testing.T) {
 	body := rec.Body.String()
 	for _, app := range []string{"alpha", "beta"} {
 		for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
-			needle := fmt.Sprintf(`gateway_request_duration_seconds_count{app=%q,class=%q}`, app, class)
+			needle := fmt.Sprintf(`gateway_request_duration_seconds_count{app=%q,class=%q,deployment=""}`, app, class)
 			if !strings.Contains(body, needle) {
 				t.Errorf("pre-instantiated %s missing:\n%s", needle, body)
 			}

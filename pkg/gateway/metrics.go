@@ -349,6 +349,17 @@ type Metrics struct {
 	// the rationale for non-eviction. The cap (hostnameLabelSetCap)
 	// is intentionally documented as a daemon-lifetime ceiling.
 	hostnameLabels *hostnameLabelSet
+	// deploymentLabels bounds the dynamic `deployment` label set on
+	// requestDuration (ADR-127 §Decision 4 / Debugger UX v1). Same
+	// non-evicting, map+mutex shape as accountLabels / hostnameLabels;
+	// the cap is per-app (api.MustLimitsFor(plan).DebugTelemetryDeploymentsPerApp)
+	// and varies by plan — Free=0, Hobby=10, Pro=50, Scale=200.
+	// Over-cap deployment ids collapse to `__other__`. See
+	// deployment_label_set.go for the behavioural contract and the
+	// rationale for non-eviction (an LRU would let evicted
+	// deployments re-admit later and grow the per-app series set
+	// unbounded over the daemon's lifetime).
+	deploymentLabels *deploymentLabelSet
 	// hostKinds remembers the (hostname, kind) tuple the refresher
 	// wrote via ObserveHostCertExpiry so the stale-delete path in
 	// nanStaleAdmittedHostCertExpiry can target the exact tuple
@@ -375,6 +386,18 @@ type Metrics struct {
 	// 11-bucket spread is deliberately different from wakeLatency's
 	// SLO-clustered buckets (0.35/0.8s): this histogram must resolve
 	// sub-100ms warm responses AND multi-second slow ones.
+	//
+	// Debugger UX v1 (ADR-127 §Decision 4) adds the `deployment` label
+	// for the per-deployment latency drill-down. The label is bounded
+	// per-app by deploymentLabelSet using each customer's plan cap
+	// (pkg/api/limits.go:DebugTelemetryDeploymentsPerApp: Free=0,
+	// Hobby=10, Pro=50, Scale=200); over-cap deployment ids collapse
+	// to the literal "__other__" sentinel without consuming capacity.
+	// Adding a label is a Prometheus breaking change for series-keyed
+	// selectors that didn't expect it; existing {app, class} selectors
+	// keep matching (Prometheus treats missing labels as no-match —
+	// the label is always populated, so the new key just adds a third
+	// dimension, not a relabel).
 	requestDuration *prometheus.HistogramVec
 	// requestsByRoute backs the per-route observability counter
 	// (ADR-093 / issue #273 — opt-in follow-up to ADR-042 §1).
@@ -575,10 +598,11 @@ const (
 func NewMetrics() *Metrics {
 	reg := prometheus.NewRegistry()
 	m := &Metrics{
-		registry:       reg,
-		accountLabels:  newAccountLabelSet(),
-		hostnameLabels: newHostnameLabelSet(),
-		hostKinds:      make(map[string]string),
+		registry:         reg,
+		accountLabels:    newAccountLabelSet(),
+		hostnameLabels:   newHostnameLabelSet(),
+		deploymentLabels: newDeploymentLabelSet(),
+		hostKinds:        make(map[string]string),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_requests_total",
 			Help: "Total gateway requests, labelled by app, plan, and HTTP status class.",
@@ -863,11 +887,11 @@ func NewMetrics() *Metrics {
 		// p50/p95 reading.
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "gateway_request_duration_seconds",
-			Help: "Per-app full request duration (request received to handler return), labelled by HTTP status class (2xx/3xx/4xx/5xx). Issue #273 / ADR-042.",
+			Help: "Per-app full request duration (request received to handler return), labelled by HTTP status class (2xx/3xx/4xx/5xx) and bounded-admission deployment_id. Issue #273 / ADR-042; ADR-127 Debugger UX v1 adds the bounded deployment label.",
 			Buckets: []float64{
 				0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
 			},
-		}, []string{"app", "class"}),
+		}, []string{"app", "class", "deployment"}),
 		// Issue #273 / ADR-042. Renamed outright from gateway_cold_wake_total.
 		coldBoot: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_cold_boot_total",
@@ -1438,13 +1462,40 @@ func (m *Metrics) ObserveStreamEnd(appID, plan string) {
 // to prometheus's default behaviour (a new label tuple surfaces in
 // /metrics). Issue #273 / ADR-042.
 //
+// Debugger UX v1: the histogram gained a third label (`deployment`)
+// per ADR-127 §Decision 4. Empty-string targets (legacy
+// single-targetSet behaviour, pre-PR-B apps) and over-cap
+// deployments collapse to the literal "" or "__other__" sentinels
+// via deploymentLabelSet so the per-app series count stays bounded
+// by the customer's plan cap.
+//
 // Nil-receiver safe (follows the ObserveWakeQueueWait precedent) so
 // the Handler hot path doesn't need to nil-guard on every request.
 func (m *Metrics) ObserveRequestDuration(appID, class string, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.requestDuration.WithLabelValues(appID, class).Observe(d.Seconds())
+	// Observe without a deployment label — used by tests and
+	// pre-deployment-label paths. The Handler hot path goes
+	// through ObserveRequestDurationByDeployment which threads
+	// the deployment id through deploymentLabelSet.
+	m.requestDuration.WithLabelValues(appID, class, emptyDeploymentLabel).Observe(d.Seconds())
+}
+
+// ObserveRequestDurationByDeployment records the full request
+// duration for the {app, class, deployment} label tuple. The
+// deployment id is admitted through deploymentLabelSet per
+// app, capped at api.MustLimitsFor(plan).DebugTelemetryDeploymentsPerApp
+// (Free=0, Hobby=10, Pro=50, Scale=200). Empty deployment
+// (legacy single-targetSet) does NOT consume capacity.
+//
+// Nil-receiver safe. Used by the Handler.observe hot path
+// after the bounded-admit lookup.
+func (m *Metrics) ObserveRequestDurationByDeployment(appID, class, deployment string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.requestDuration.WithLabelValues(appID, class, deployment).Observe(d.Seconds())
 }
 
 // PreInstantiateApp writes zero-valued series for the closed (class)
@@ -1456,13 +1507,35 @@ func (m *Metrics) ObserveRequestDuration(appID, class string, d time.Duration) {
 // returns the existing series). Call from the Handler's Backend.Lookup
 // hit path, deduped via sync.Map so the hot path stays allocation-
 // free after first sight.
+//
+// Debugger UX v1: also pre-instantiates the empty-deployment label
+// (the legacy pre-PR-B single-targetSet sentinel) so the dashboard
+// renders the empty series from the first request. Real deployment
+// ids are pre-instantiated by PreInstantiateDeployment after the
+// bounded-admit lookup (see deployment_label_set.go).
 func (m *Metrics) PreInstantiateApp(appID string) {
 	if m == nil || appID == "" {
 		return
 	}
 	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
-		m.requestDuration.WithLabelValues(appID, class)
+		m.requestDuration.WithLabelValues(appID, class, emptyDeploymentLabel)
 	}
+}
+
+// PreInstantiateDeployment is a no-op helper for symmetry with
+// PreInstantiateApp. Real deployments are runtime values — the
+// (app × class × deployment) cross-product would explode boot
+// cardinality past the gateway's TSDB budget. The bounded-admit
+// path in ObserveRequestDurationByDeployment handles the
+// per-deployment series on demand; the first observation seeds
+// the series. The helper exists so callers can document intent
+// without paying the pre-instantiation cost.
+//
+// Idempotent and nil-receiver safe.
+func (m *Metrics) PreInstantiateDeployment(_ string, _ string) {
+	// No-op: see comment above. PreInstantiateApp pre-instantiates
+	// the empty-deployment sentinel; real deployments are admitted
+	// lazily via deploymentLabelSet.
 }
 
 // ObserveRequestRoute records one per-route counter increment for
