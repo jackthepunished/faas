@@ -666,12 +666,14 @@ func runtimeSuggestionFor(fw framework, ver string) string {
 // at every depth so a stray node_modules/x/package.json does not
 // false-positive as a workspace.
 //
-// Depth-3+ monorepos (e.g. apps/web/services/api/package.json — three
-// subdirectory levels deep) intentionally return false: the customer gets
-// the existing bare error. Deeper detection belongs to `gregale scan`
-// (pkg/reposcan), which already handles it via the
-// workspaces_extra_test.go "monorepo" fixture. The CLI hint is just a
-// pointer at the next step.
+// Depth-3 monorepos (e.g. apps/web/services/api/package.json — three
+// subdirectory levels deep) are now visible (walkForMarkers maxDepth
+// bumped from 1 to 2 in commit (issue #1182 §P1 follow-up)) so the
+// hint fires for `apps/web/services/api/package.json` too. Depth-4+
+// remains out of scope — those belong to `gregale scan` (pkg/reposcan),
+// which already handles them via the workspaces_extra_test.go
+// "monorepo" fixture. The CLI hint is just a pointer at the next
+// step.
 func detectNestedMarkerHint(srcDir string) bool {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
@@ -684,11 +686,13 @@ func detectNestedMarkerHint(srcDir string) bool {
 		if isExcludedSubdir(e.Name()) {
 			continue
 		}
-		// walkForMarkers(d1, 1) recurses one level into each top-level
-		// subdir, which puts us at depth 2 from the project root — files
+		// walkForMarkers(d1, 2) recurses two levels into each top-level
+		// subdir, which puts us at depth 3 from the project root — files
 		// at apps/web/package.json are seen; files at
-		// apps/web/services/api/package.json (depth 3) are not.
-		if walkForMarkers(filepath.Join(srcDir, e.Name()), 1) {
+		// apps/web/services/api/package.json (depth 3) are now seen;
+		// files at apps/web/services/api/handlers/rest/package.json
+		// (depth 4) are still out of scope.
+		if walkForMarkers(filepath.Join(srcDir, e.Name()), 2) {
 			return true
 		}
 	}
