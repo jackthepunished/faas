@@ -24,6 +24,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
+	"github.com/onebox-faas/faas/pkg/presetwhy"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -725,6 +726,14 @@ type AlertPresetItem struct {
 	// redirect on the dashboard side doesn't need to carry the id
 	// in the URL.
 	RuleID string
+	// Explanation is the dashboard-side "What does this alert mean?"
+	// panel (issue #1233 / ADR-123 PR-C commit 3). Populated by the
+	// handler edge via presetwhy.Decorate(p.Name, 0) — observed=0
+	// keeps the static prose, which is what the preset grid renders
+	// (the Observed renderer takes over in the alert-detail panel).
+	// nil when the preset name has no presetwhy catalog row — the
+	// template uses `with` to skip the <details> panel cleanly.
+	Explanation *presetwhy.Explanation
 }
 
 // alertDeliveryErrorLimit caps the LastError string we render on the

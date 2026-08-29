@@ -33,6 +33,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/presetwhy"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/whycopy"
@@ -897,6 +898,14 @@ func (s *server) fetchDashboardPresets(ctx context.Context, log *slog.Logger, ac
 				break
 			}
 		}
+		// Stamp the "What does this alert mean?" panel for every card
+		// (issue #1233 / ADR-123 PR-C commit 3). observed=0 keeps the
+		// static prose — the Observed renderer takes over in the
+		// alert-detail panel when an actual alert fires. Decorate
+		// returns nil for an undocumented preset, and the template
+		// uses `with` to skip the panel cleanly (no broken <details>
+		// block for a future catalog row).
+		item.Explanation = presetwhy.Decorate(p.Name, 0)
 		out = append(out, item)
 	}
 	return out
