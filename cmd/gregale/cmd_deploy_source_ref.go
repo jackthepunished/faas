@@ -97,7 +97,14 @@ func cmdDeployRepoSourceRef(slug, repo, ref string, ann api.DeployAnnotations) i
 		return printErr("Deploy failed", err)
 	}
 	if jsonOutput {
-		return jsonOut(writeJSON(dep))
+		// Issue #1182 §P1 follow-up: source-ref path has no
+		// client-side tarball bytes (server pulls the codeload
+		// tarball via the GitHub App install token) and no git
+		// detection (prov == nil), so the receipt's only delta
+		// over the bare DeploymentResponse is app_url. Commit
+		// pinning for the source-ref path is captured server-
+		// side; see docs/source-ref.md reproducibility section.
+		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(dep.AppID), "")))
 	}
 	return streamDeployLogs(client, dep)
 }

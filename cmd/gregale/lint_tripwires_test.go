@@ -95,6 +95,20 @@ func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 				if strings.HasSuffix(fileName, "commands_doctor.go") {
 					return true
 				}
+				// Documented exception: tarballSHA256 in
+				// cmd/gregale/git_local.go. The CLI's zero-config
+				// deploy path (issue #1182 §P1 follow-up) reads
+				// the tempfile it just wrote via
+				// `gitArchiveHEAD` to populate the DeployReceipt's
+				// source_sha256 field. Path is the CLI's own
+				// os.CreateTemp output, not customer-supplied;
+				// sha256.New (not os.ReadFile) consumes the bytes
+				// so a symlink swap mid-read is irrelevant. Same
+				// discipline as openCustomerFile (no follow-on
+				// exec, no write, no chmod).
+				if strings.HasSuffix(fileName, "git_local.go") {
+					return true
+				}
 				pos := fset.Position(call.Pos())
 				violations = append(violations, pos.String())
 				return true

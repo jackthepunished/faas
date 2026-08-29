@@ -1115,6 +1115,15 @@ func cmdDeployTarball(args []string) int {
 		slug = deriveName()
 	}
 
+	// Issue #1182 §P1 follow-up: receipt emission needs the
+	// zero-config provenance (commit_sha + dirty) at the --json
+	// emission site, which sits well below the zero-config branch.
+	// Hoist a pointer so the branch can populate and the emission
+	// site can read. Stays nil on image / source-ref / non-git
+	// cwd-auto-pack paths; the receipt constructor handles a nil
+	// prov cleanly (commit_sha and dirty zero-valued).
+	var prov *zeroConfigProvenance
+
 	// --github emits a copy-paste GitHub Actions workflow snippet to
 	// stdout and exits 0 (issue #270). No auth, no side effects — this
 	// is a documentation-generation path, not a deploy path. The snippet
@@ -1330,13 +1339,14 @@ func cmdDeployTarball(args []string) int {
 		//     (existing behavior preserved for non-git dirs and for
 		//     git repos without origin)
 		//   - ok=false, err=other → surface the error
-		if prov, ok, perr := resolveZeroConfigProvenance(cwd); ok {
-			if prov.Dirty {
+		if provVal, ok, perr := resolveZeroConfigProvenance(cwd); ok {
+			prov = &provVal
+			if provVal.Dirty {
 				// Print a dirty warning naming the SHA + dirty count
 				// so the operator sees exactly what they're shipping
 				// (HEAD only, no working-tree changes). The deploy
 				// still proceeds — Ctrl-C is the operator's opt-out.
-				if dirtyOut, derr := runGitCmd(prov.Root, "status", "--porcelain"); derr == nil {
+				if dirtyOut, derr := runGitCmd(provVal.Root, "status", "--porcelain"); derr == nil {
 					dirtyFiles := 0
 					for _, line := range strings.Split(strings.TrimRight(dirtyOut, "\n"), "\n") {
 						if line != "" {
@@ -1345,7 +1355,7 @@ func cmdDeployTarball(args []string) int {
 					}
 					if dirtyFiles > 0 {
 						PrintProgress(os.Stdout, "Note: working tree has %d dirty file(s); deploying HEAD (%s) only — commit first to include the changes",
-							dirtyFiles, prov.SHA[:7])
+							dirtyFiles, provVal.SHA[:7])
 					}
 				}
 			}
@@ -1362,18 +1372,18 @@ func cmdDeployTarball(args []string) int {
 			tmpPath := tmpFile.Name()
 			_ = tmpFile.Close()
 			defer func() { _ = os.Remove(tmpPath) }()
-			if err := gitArchiveHEAD(prov.Root, tmpPath); err != nil {
+			if err := gitArchiveHEAD(provVal.Root, tmpPath); err != nil {
 				return printErr("Could not archive git HEAD", err)
 			}
 			*tarball = tmpPath
 			PrintProgress(os.Stderr, "packing HEAD (%s) from %s",
-				prov.SHA[:7], filepath.Base(cwd))
+				provVal.SHA[:7], filepath.Base(cwd))
 			// Auto-capture `git config user.name` as deployed_by
 			// unless the operator explicitly passed --deployed-by.
 			// Mirrors the legacy path at cmd_deploy_zero_config.go
 			// (issue #977 / ADR-116).
-			if *deployedBy == "" && prov.DeployedBy != "" {
-				*deployedBy = prov.DeployedBy
+			if *deployedBy == "" && provVal.DeployedBy != "" {
+				*deployedBy = provVal.DeployedBy
 			}
 			// resolvedShape stays shapeApp — `git archive HEAD` ships
 			// the committed tree and the server-side builder detects
@@ -1636,7 +1646,19 @@ func cmdDeployTarball(args []string) int {
 			return printErr("Bad --tarball", err)
 		}
 		if jsonOutput {
-			return jsonOut(writeJSON(dep))
+			// Issue #1182 §P1 follow-up: receipt wraps the deploy
+			// response with commit_sha (zero-config only),
+			// dirty (zero-config only), app_url (always),
+			// and source_sha256 (sha256 of the tarball bytes
+			// just shipped). The tempfile is still on disk at
+			// this point — the deferred os.Remove fires at
+			// function return, so reading for the digest here
+			// is safe.
+			var sourceSHA256 string
+			if *tarball != "" {
+				sourceSHA256, _ = tarballSHA256(*tarball)
+			}
+			return jsonOut(writeJSON(newDeployReceipt(dep, prov, deployedAppURL(dep.AppID), sourceSHA256)))
 		}
 		return streamDeployLogs(client, dep)
 	}
@@ -1668,7 +1690,13 @@ func cmdDeployTarball(args []string) int {
 		return printErr("Deploy failed", err)
 	}
 	if jsonOutput {
-		return jsonOut(writeJSON(dep))
+		// Image deploy path: no source tarball bytes (the digest
+		// rides on dep.ImageDigest), no git detection (prov is
+		// nil from the function-scope hoist), so commit_sha /
+		// dirty / source_sha256 stay empty in the receipt. The
+		// receipt's only delta here is app_url, which the
+		// customer's tooling uses for the post-deploy URL pin.
+		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(dep.AppID), "")))
 	}
 	return streamDeployLogs(client, dep)
 }
