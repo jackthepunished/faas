@@ -4400,16 +4400,45 @@ func (m *Manager) captureAllowlistHandles(ctx context.Context, netnsName string)
 	return hV4, hV6, nil
 }
 
-// captureAllowlistHandlesForWake avoids two nft list operations when the
-// effective allowlist is empty. Config.NftCommands intentionally emits no
-// allowlist accept rule in that case, so there are no handles to capture.
-// Keep the general captureAllowlistHandles method unchanged for live-patch
-// paths, where a caller may need to inspect an already-rendered chain.
+// captureAllowlistHandlesForWake avoids nft list operations for families that
+// cannot contain an allowlist rule. Config.NftCommands emits no rule when the
+// effective allowlist is empty, and emits one rule only for each address family
+// represented in the list. Keep the general captureAllowlistHandles method
+// unchanged for live-patch paths, where a caller may need to inspect an
+// already-rendered chain.
 func (m *Manager) captureAllowlistHandlesForWake(ctx context.Context, netnsName string, allowlist []netip.Prefix) (uint64, uint64, error) {
-	if len(allowlist) == 0 {
+	if m.captureRunner == nil {
 		return 0, 0, nil
 	}
-	return m.captureAllowlistHandles(ctx, netnsName)
+	var hasV4, hasV6 bool
+	for _, prefix := range allowlist {
+		switch {
+		case prefix.Addr().Is4():
+			hasV4 = true
+		case prefix.Addr().Is6():
+			hasV6 = true
+		}
+	}
+	if !hasV4 && !hasV6 {
+		return 0, 0, nil
+	}
+
+	var hV4, hV6 uint64
+	if hasV4 {
+		var err error
+		hV4, err = listChainHandles(ctx, m.captureRunner, netnsName, "ip", "faas", "forward")
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if hasV6 {
+		var err error
+		hV6, err = listChainHandles(ctx, m.captureRunner, netnsName, "ip6", "faas", "forward")
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return hV4, hV6, nil
 }
 
 // listChainHandles runs `ip netns exec <ns> nft -a list chain

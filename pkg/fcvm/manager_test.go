@@ -2045,7 +2045,10 @@ func TestCaptureAllowlistHandlesForWake_CapturesConfiguredAllowlist(t *testing.T
 `)
 	cap := &fakeCaptureRunner{listChainOutput: out}
 	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
-	allowlist := []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	allowlist := []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
 	hV4, hV6, err := m.captureAllowlistHandlesForWake(context.Background(), "fc-i-1", allowlist)
 	if err != nil {
 		t.Fatalf("captureAllowlistHandlesForWake: %v", err)
@@ -2057,6 +2060,31 @@ func TestCaptureAllowlistHandlesForWake_CapturesConfiguredAllowlist(t *testing.T
 	defer cap.mu.Unlock()
 	if len(cap.commands) != 2 {
 		t.Fatalf("configured allowlist made %d nft capture calls, want 2", len(cap.commands))
+	}
+}
+
+func TestCaptureAllowlistHandlesForWake_SkipsUnrepresentedFamily(t *testing.T) {
+	out := []byte(`
+ iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 42
+`)
+	cap := &fakeCaptureRunner{listChainOutput: out}
+	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
+	hV4, hV6, err := m.captureAllowlistHandlesForWake(context.Background(), "fc-i-1", []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("captureAllowlistHandlesForWake: %v", err)
+	}
+	if hV4 != 42 || hV6 != 0 {
+		t.Fatalf("v4-only allowlist handles = (%d, %d), want (42, 0)", hV4, hV6)
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if len(cap.commands) != 1 {
+		t.Fatalf("v4-only allowlist made %d nft capture calls, want 1", len(cap.commands))
+	}
+	if !strings.Contains(strings.Join(cap.commands[0], " "), " nft -a list chain ip faas forward") {
+		t.Fatalf("v4-only capture used unexpected command: %v", cap.commands[0])
 	}
 }
 
