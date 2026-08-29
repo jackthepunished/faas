@@ -344,6 +344,14 @@ func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *strin
 //	"operator.action.restart_instance"       → "force_restart"
 //	"operator.action.restart_instance.outcome" → "force_restart.outcome"
 //
+// Plus the ADR-124 deployment queue-control kinds (cmd/apid/handlers_queue_controls.go) —
+// the verb IS the metric label, so these map to themselves:
+//
+//	"deployment.cancelled"                   → "deployment.cancelled"
+//	"deployment.reordered"                   → "deployment.reordered"
+//	"deployment.cleared"                     → "deployment.cleared"
+//	"deployment.clear_obsolete"              → "deployment.clear_obsolete"
+//
 //	anything else                           → "other"
 //
 // Called from pkg/audit.Auditor.emit (PR-#TBD / C5). PR-#TBD's
@@ -384,6 +392,18 @@ func auditKindMetricLabel(kind string) string {
 		return verbRestart
 	case operatorPrefix + instanceRestart + requestSuffix:
 		return verbRestart + requestSuffix
+	// ADR-124 deployment queue-control audit kinds
+	// (pkg/reconcile/audit.go). The verb IS the metric label — no
+	// aliasing needed because the apid handlers are the sole
+	// emit site and the kinds were chosen to match the label.
+	case "deployment.cancelled":
+		return "deployment.cancelled"
+	case "deployment.reordered":
+		return "deployment.reordered"
+	case "deployment.cleared":
+		return "deployment.cleared"
+	case "deployment.clear_obsolete":
+		return "deployment.clear_obsolete"
 	default:
 		return "other"
 	}

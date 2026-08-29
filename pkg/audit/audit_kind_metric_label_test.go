@@ -129,3 +129,31 @@ func TestAuditKindMetricLabel_UnknownKindCollapsesToOther(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditKindMetricLabel_DeploymentQueueControls pins the
+// ADR-124 queue-control audit kinds onto the closed metric
+// label set. Without these aliases the four new kinds
+// (deployment.cancelled / .reordered / .cleared /
+// .clear_obsolete) would land on the "other" series and break
+// /v1/admin/obs/health's per-endpoint join with the audit
+// events table.
+//
+// The mapping mirrors the existing project.workload.<verb>
+// shape — the verb suffix IS the metric label so dashboards
+// don't need a separate mapping table.
+func TestAuditKindMetricLabel_DeploymentQueueControls(t *testing.T) {
+	for _, tt := range []struct {
+		kind string
+		want string
+	}{
+		{"deployment.cancelled", "deployment.cancelled"},
+		{"deployment.reordered", "deployment.reordered"},
+		{"deployment.cleared", "deployment.cleared"},
+		{"deployment.clear_obsolete", "deployment.clear_obsolete"},
+	} {
+		got := auditKindMetricLabel(tt.kind)
+		if got != tt.want {
+			t.Errorf("auditKindMetricLabel(%q) = %q, want %q", tt.kind, got, tt.want)
+		}
+	}
+}
