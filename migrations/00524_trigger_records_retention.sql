@@ -19,7 +19,7 @@
 -- trigger_records has no app_id column (FK chain:
 -- trigger_records.trigger_id → triggers.id → triggers.app_id).
 --
-CREATE INDEX trigger_records_trigger_retention_idx
+CREATE INDEX IF NOT EXISTS trigger_records_trigger_retention_idx
   ON trigger_records (trigger_id, result_retention_until)
   WHERE result_retention_until IS NOT NULL;
 -- +goose StatementEnd

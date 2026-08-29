@@ -408,9 +408,10 @@ func TestPg_ListExpiredInvocationsForReaper_StateFilter(t *testing.T) {
 
 // TestPg_EnsureAccountAsyncQuota_RoundTrip pins the upsert semantics
 // of the per-account counter-table path used by PR-B's per-account
-// concurrency cap. EnsureAccountAsyncQuota must be idempotent
-// (DO NOTHING on conflict) and overwrites the cap on subsequent
-// calls. Decrement below zero trips the CHECK constraint.
+// concurrency cap. EnsureAccountAsyncQuota overwrites the cap on
+// conflict (operator/plan-change path); Decrement clamps at zero
+// via greatest() so a stray decrement doesn't error or block the
+// next decrement. GetAccountAsyncQuota mirrors the row.
 func TestPg_EnsureAccountAsyncQuota_RoundTrip(t *testing.T) {
 	s, ctx, _, acctID := seedInvocationPg(t)
 
@@ -432,10 +433,13 @@ func TestPg_EnsureAccountAsyncQuota_RoundTrip(t *testing.T) {
 		t.Errorf("idempotent = cap=%d inflight=%d, want 50/0", cap2, inflight2)
 	}
 
-	// Decrement below zero: SQLSTATE 23514 (CHECK violation) — the
-	// counter starts at 0 and can't go negative.
-	if err := s.DecrementAccountAsyncInflight(ctx, acctID); err == nil {
-		t.Errorf("Decrement below zero should error")
+	// Decrement clamps at zero via greatest() — no error, no
+	// negative. This is the production semantics: the increment/
+	// decrement pair should always balance, but a stray decrement
+	// (e.g. an operator-initiated transition that bypassed
+	// ClaimInvocationWithCap) must NOT block subsequent decrements.
+	if err := s.DecrementAccountAsyncInflight(ctx, acctID); err != nil {
+		t.Errorf("Decrement at zero returned err = %v, want nil (clamped)", err)
 	}
 
 	// GetAccountAsyncQuota mirrors the row state.

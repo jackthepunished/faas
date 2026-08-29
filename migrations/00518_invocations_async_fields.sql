@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS invocations_app_deadline_idx
   ON invocations (app_id, deadline_at)
   WHERE state IN ('pending', 'dispatching') AND deadline_at IS NOT NULL;
 
-CREATE INDEX invocations_acct_retention_idx
+CREATE INDEX IF NOT EXISTS invocations_acct_retention_idx
   ON invocations (account_id, result_retention_until)
   WHERE result_retention_until IS NOT NULL;
 -- +goose StatementEnd
