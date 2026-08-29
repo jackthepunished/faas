@@ -241,6 +241,13 @@ func envForAPID(t *testing.T, dbURL string, extra ...string) []string {
 		"FAAS_PADDLE_SANDBOX=1",
 		"FAAS_PADDLE_API_KEY=pdl_test_sec11_placeholder",
 		"FAAS_PADDLE_WEBHOOK_SECRET=whk_test_sec11_placeholder",
+		// PR #1191 C2 / ADR-115 D5: pkg/mail/factory refuses to boot
+		// when FAAS_MAIL_TRANSPORT is unset on a non-dev box. Every
+		// e2e boot is a dev box for this purpose — same rationale
+		// as the pkg/e2etest.Harness chokepoint (harness.go:498).
+		// Without this, every apid boot via envForAPID fails the
+		// mail factory pre-flight and never binds the listener.
+		"FAAS_DEV=1",
 	}
 	env = append(env, extra...)
 	return env
