@@ -1352,6 +1352,132 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// --- Jobs (issue #1184 Workstream A) ----------------------------------------
+// Methods mirror the /v1/jobs surface added in M11.4. Routes are
+// keyed on the customer's slug (`name`) for create/list/update/delete;
+// runs + tasks use the opaque run id (uuid) so cross-account
+// enumeration cannot scrape run ids. Logs are read from vmmd's tail
+// endpoint (same path the dashboard uses for live app logs); the
+// handler proxies the call to the compute node that owns the
+// instance. The CLI surface lives in cmd/gregale/commands_jobs.go.
+
+// ListJobs returns the account-scoped list of jobs (the /v1/jobs
+// GET route). Wire shape: ListJobsResponse (jobs[] + limit +
+// offset + next_offset + total). Server clamps limit to [1,200].
+// Matches the CronList convention: zero query parameters on the
+// wire so the spec parity gate (TestSpecCompliance) stays green.
+func (c *Client) ListJobs(ctx context.Context) (ListJobsResponse, error) {
+	var out ListJobsResponse
+	return out, c.do(ctx, "GET", "/v1/jobs", nil, &out)
+}
+
+// CreateJob creates a new job under the calling account. Idempotent
+// (POST → 201; replay returns the existing JobResponse with the same
+// Idempotency-Key header). The handler applies per-plan defaults
+// + clamps every numeric field; passing 0 on ram_mb / task_timeout_s
+// / max_parallelism / retry_max lets the plan default win.
+func (c *Client) CreateJob(ctx context.Context, req CreateJobRequest) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "POST", "/v1/jobs", req, &out)
+}
+
+// GetJob returns one job by name (issue #1184 Workstream A).
+// Backs `gregale jobs info <name>`. Wire shape matches JobResponse.
+// The server returns a byte-identical 404 on missing or
+// cross-account so the SDK does not leak existence (matches
+// GetCron's IDOR posture).
+func (c *Client) GetJob(ctx context.Context, name string) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name, nil, &out)
+}
+
+// UpdateJob patches a job's image_ref / command / env_overrides /
+// ram_mb / task_timeout_sec / max_parallelism / retry_max / status.
+// Pointer-based fields let the caller distinguish "unset" from
+// "explicit zero". Wire method is PATCH; the idempotency-key
+// auto-mint covers this call (TestDo_MutatingCallsCarryIdempotencyKey
+// in client_test.go).
+func (c *Client) UpdateJob(ctx context.Context, name string, req UpdateJobRequest) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "PATCH", "/v1/jobs/"+name, req, &out)
+}
+
+// DeleteJob soft-deletes a job (issue #1184 Workstream A). Returns
+// 204 with a JobDeletedResponse body on success; returns 409
+// CodeJobHasLiveInstances when live (kind='job_task', status NOT
+// IN ('parked','destroyed')) instances exist. The server check is
+// enforced inside the soft_delete_job_if_no_live_instances stored
+// function (migrations/00530) so the dispatch tick cannot lose a
+// task mid-flight.
+func (c *Client) DeleteJob(ctx context.Context, name string) (JobDeletedResponse, error) {
+	var out JobDeletedResponse
+	return out, c.do(ctx, "DELETE", "/v1/jobs/"+name, nil, &out)
+}
+
+// CreateJobRun fan-outs N tasks for the given job (POST
+// /v1/jobs/{name}/runs). Atomic via generate_series INSERT inside
+// state.PgStore.JobRunCreate (see migrations/00255 + 00528). The
+// handler validates Tasks against Plan.JobMaxTasksPerRun
+// (Hobby=100, Pro=1000, Scale=5000). Idempotent (Idempotency-Key
+// header auto-mint).
+func (c *Client) CreateJobRun(ctx context.Context, name string, req CreateJobRunRequest) (JobRunResponse, error) {
+	var out JobRunResponse
+	return out, c.do(ctx, "POST", "/v1/jobs/"+name+"/runs", req, &out)
+}
+
+// ListJobRuns returns a page of the job's run history
+// (issue #1184 Workstream A). newest-first by created_at desc.
+// Server clamps limit to [1,200] and surfaces a 400 Problem on
+// garbage input. For a wider, cross-source view use ListInvocations.
+func (c *Client) ListJobRuns(ctx context.Context, name string) (ListJobRunsResponse, error) {
+	var out ListJobRunsResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs", nil, &out)
+}
+
+// GetJobRun returns one run by id (uuid). Backs `gregale jobs run
+// <name> <id>`. Wire shape matches JobRunResponse.
+func (c *Client) GetJobRun(ctx context.Context, name, runID string) (JobRunResponse, error) {
+	var out JobRunResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID, nil, &out)
+}
+
+// CancelJobRun cancels a run (POST /v1/jobs/{name}/runs/{id}/
+// cancel). For queued tasks: JobTaskCancel (status='cancelled',
+// instance_id=NULL). For claimed/running tasks: SIGTERM via
+// vmmd.SendSignal — the guest's job supervisor handles SIGTERM
+// (30s grace), writes job_exit{exit_code=143, error_class=
+// 'cancelled'}, then poweroff. Naturally idempotent (a second
+// cancel returns the already-cancelled run with the same wire
+// shape). Wire shape: JobRunCancelledResponse (run +
+// cancelled_at).
+func (c *Client) CancelJobRun(ctx context.Context, name, runID string) (JobRunCancelledResponse, error) {
+	var out JobRunCancelledResponse
+	return out, c.do(ctx, "POST", "/v1/jobs/"+name+"/runs/"+runID+"/cancel", nil, &out)
+}
+
+// ListJobRunTasks returns a page of the run's task rows
+// (issue #1184 Workstream A). task_index 1..N (1-based; matches
+// the server's CTE fan-out). Status is the closed-set {queued,
+// claimed, succeeded, failed, timeout, oom, cancelled}. LeaseToken
+// is intentionally OMITTED from the wire response (internal
+// dispatch primitive).
+func (c *Client) ListJobRunTasks(ctx context.Context, name, runID string) (ListJobTasksResponse, error) {
+	var out ListJobTasksResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID+"/tasks", nil, &out)
+}
+
+// GetJobTaskLogs tails the task's stdout/stderr via vmmd's tail
+// endpoint (issue #1184 Workstream A). Wire shape:
+// JobTaskLogResponse (task_status + log_content + truncated +
+// max_bytes). Truncated=true means the tail was capped at
+// MaxBytes; clients should re-fetch with a larger limit to see
+// more. Empty LogContent with Truncated=false means the task
+// never produced output (common for OOM-killed tasks).
+func (c *Client) GetJobTaskLogs(ctx context.Context, name, runID string, taskIndex int) (JobTaskLogResponse, error) {
+	var out JobTaskLogResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID+"/tasks/"+strconv.Itoa(taskIndex)+"/logs", nil, &out)
+}
+
 // --- Triggers (issue #757 / ADR-100) ----------------------------------------
 // Unified event-source-mapping primitive. Method names follow the
 // convention pinned by cmd/sdk-coverage/main.go::methodRouteMap.

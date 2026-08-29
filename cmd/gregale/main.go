@@ -58,6 +58,7 @@ Commands:
   invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
+  jobs         Manage jobs (jobs list|add|info|update|rm|run|runs|cancel|tasks|logs)
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
@@ -392,6 +393,12 @@ func run(args []string) int {
 		return cmdInvocations(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
+	case "jobs":
+		// Issue #1184 Workstream A: run-to-completion jobs
+		// (list|add|info|update|rm|run|runs|cancel|tasks|logs).
+		// Mirrors `crons` for dispatcher shape. Implementation
+		// lives in commands_jobs.go (cmdJobs).
+		return cmdJobs(args[1:])
 	case "debug":
 		// ADR-127 PR-B: production debugger (regression banner,
 		// compare panel, replay stub). Mirrors `invocations` for

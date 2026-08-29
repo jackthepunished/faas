@@ -512,6 +512,80 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// --- Jobs (issue #1184 Workstream A) ----------------------------------------
+// Methods mirror the /v1/jobs surface added in M11.4. Mirrors
+// the canonical client (pkg/api/client.go). Routes are keyed on
+// the customer's slug (`name`) for create/list/update/delete;
+// runs + tasks use the opaque run id (uuid).
+
+// ListJobs returns the account-scoped list of jobs.
+func (c *Client) ListJobs(ctx context.Context) (ListJobsResponse, error) {
+	var out ListJobsResponse
+	return out, c.do(ctx, "GET", "/v1/jobs", nil, &out)
+}
+
+// CreateJob creates a new job under the calling account.
+func (c *Client) CreateJob(ctx context.Context, req CreateJobRequest) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "POST", "/v1/jobs", req, &out)
+}
+
+// GetJob returns one job by name.
+func (c *Client) GetJob(ctx context.Context, name string) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name, nil, &out)
+}
+
+// UpdateJob patches a job's image_ref / command / env_overrides /
+// ram_mb / task_timeout_sec / max_parallelism / retry_max / status.
+func (c *Client) UpdateJob(ctx context.Context, name string, req UpdateJobRequest) (JobResponse, error) {
+	var out JobResponse
+	return out, c.do(ctx, "PATCH", "/v1/jobs/"+name, req, &out)
+}
+
+// DeleteJob soft-deletes a job. Returns 409 CodeJobHasLiveInstances
+// when live instances exist.
+func (c *Client) DeleteJob(ctx context.Context, name string) (JobDeletedResponse, error) {
+	var out JobDeletedResponse
+	return out, c.do(ctx, "DELETE", "/v1/jobs/"+name, nil, &out)
+}
+
+// CreateJobRun fan-outs N tasks for the given job.
+func (c *Client) CreateJobRun(ctx context.Context, name string, req CreateJobRunRequest) (JobRunResponse, error) {
+	var out JobRunResponse
+	return out, c.do(ctx, "POST", "/v1/jobs/"+name+"/runs", req, &out)
+}
+
+// ListJobRuns returns a page of the job's run history.
+func (c *Client) ListJobRuns(ctx context.Context, name string) (ListJobRunsResponse, error) {
+	var out ListJobRunsResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs", nil, &out)
+}
+
+// GetJobRun returns one run by id (uuid).
+func (c *Client) GetJobRun(ctx context.Context, name, runID string) (JobRunResponse, error) {
+	var out JobRunResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID, nil, &out)
+}
+
+// CancelJobRun cancels a run.
+func (c *Client) CancelJobRun(ctx context.Context, name, runID string) (JobRunCancelledResponse, error) {
+	var out JobRunCancelledResponse
+	return out, c.do(ctx, "POST", "/v1/jobs/"+name+"/runs/"+runID+"/cancel", nil, &out)
+}
+
+// ListJobRunTasks returns a page of the run's task rows.
+func (c *Client) ListJobRunTasks(ctx context.Context, name, runID string) (ListJobTasksResponse, error) {
+	var out ListJobTasksResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID+"/tasks", nil, &out)
+}
+
+// GetJobTaskLogs tails the task's stdout/stderr via vmmd's tail endpoint.
+func (c *Client) GetJobTaskLogs(ctx context.Context, name, runID string, taskIndex int) (JobTaskLogResponse, error) {
+	var out JobTaskLogResponse
+	return out, c.do(ctx, "GET", "/v1/jobs/"+name+"/runs/"+runID+"/tasks/"+strconv.Itoa(taskIndex)+"/logs", nil, &out)
+}
+
 // --- Event-driven surface (Move 2) -----------------------------------------
 //
 // The 10 routes exposed under /v1/apps/{slug}/invoke[/async],
