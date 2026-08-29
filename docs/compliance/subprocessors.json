@@ -70,10 +70,11 @@
       "id": "transactional-email-resend",
       "category": "transactional-email",
       "vendor": "Resend",
-      "service": "Resend transactional email transport",
+      "service": "Resend transactional email transport + Svix-signed webhook (bounce / complaint / delivery events)",
       "data_categories": [
         "recipient email (account holder only)",
-        "subject + body of the transactional message"
+        "subject + body of the transactional message",
+        "inbound bounce / complaint events: recipient email + bounce reason + provider event id"
       ],
       "data_region": "US (Resend default)",
       "encryption": "TLS 1.3 in transit",
@@ -81,16 +82,17 @@
       "dpa_signed": true,
       "dpa_reference": "Resend Data Processing Addendum (linked from Resend Dashboard)",
       "operator_switch_env": "FAAS_MAIL_TRANSPORT",
-      "rationale": "Optional transactional email transport. Production wires FAAS_MAIL_TRANSPORT=resend; default in dev is 'log' (writes to slog; no third-party processing). Email bodies contain no end-user PII — they target the account holder only."
+      "rationale": "Transactional email transport + inbound webhook. Outbound: account-holder-only email (no end-user PII). Inbound (issue #246 / ADR-115 §D.3): Resend POSTs bounce / complaint / delivery events to /v1/webhooks/resend, Svix HMAC-signed; payload carries recipient email + provider event id, no body or subject. The bounce handler (pkg/meter/bounce_handler.go) writes a mail_suppressions row + a mail.bounce_hard / mail.bounce_complaint audit row + advances dunning for hard bounces. Default in dev is 'log' (writes to slog; no third-party processing)."
     },
     {
       "id": "transactional-email-postmark",
       "category": "transactional-email",
       "vendor": "Postmark",
-      "service": "Postmark transactional email transport",
+      "service": "Postmark transactional email transport + bounce / spam-complaint webhook",
       "data_categories": [
         "recipient email (account holder only)",
-        "subject + body of the transactional message"
+        "subject + body of the transactional message",
+        "inbound bounce / spam-complaint events: recipient email + bounce reason + message id"
       ],
       "data_region": "US (Postmark default)",
       "encryption": "TLS 1.3 in transit",
@@ -98,7 +100,7 @@
       "dpa_signed": true,
       "dpa_reference": "Postmark Data Processing Addendum (linked from Postmark Dashboard)",
       "operator_switch_env": "FAAS_MAIL_TRANSPORT",
-      "rationale": "Optional transactional email transport. Production wires FAAS_MAIL_TRANSPORT=postmark; default in dev is 'log' (writes to slog; no third-party processing). Email bodies contain no end-user PII."
+      "rationale": "Opt-in transactional email transport + inbound webhook. Production wires FAAS_MAIL_TRANSPORT=postmark; default in dev is 'log'. Inbound webhook parity with the Resend handler is a follow-up ADR — today only the Resend dispatch is wired (issue #246 acceptance item 8). Email bodies contain no end-user PII."
     },
     {
       "id": "off-host-backup-storage",

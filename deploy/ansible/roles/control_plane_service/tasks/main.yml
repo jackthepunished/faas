@@ -603,3 +603,56 @@
   ansible.builtin.debug:
     msg: "{{ faas_paddle_soft_assert.stdout }}"
   when: faas_paddle_soft_assert.stdout != ""
+
+# Issue #246 / ADR-115 / spec G4 closure — mail transport must
+# be selected (or dev-mode explicit) before the daemon boots in
+# production. The pkg/mail factory refuses to boot on a non-dev
+# box with FAAS_MAIL_TRANSPORT unset or unrecognised (issue #246
+# extends the ADR-115 D5 fail-closed contract from "credential
+# missing" to "transport unselected"). The ansible role mirrors
+# that contract so an operator sees the gap at playbook time,
+# not at the systemd journal after a daemon-reload.
+#
+# Belt-and-braces: a literal `FAAS_MAIL_TRANSPORT=log` is also
+# asserted here, because the operator almost certainly meant
+# `resend` (or `postmark`) and silently booting with a journal-
+# only sender in production will miss every dunning + quota
+# notice. The dev-mode escape hatch is FAAS_DEV=1.
+- name: control_plane_service — assert FAAS_MAIL_TRANSPORT selected (issue #246 / ADR-115)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    sealed=/etc/faas/sealed.env
+    if [ ! -f "$sealed" ]; then
+      echo "FAIL: $sealed missing — fill it before running this role on a production box."
+      exit 1
+    fi
+    transport="$(grep -E '^FAAS_MAIL_TRANSPORT=' "$sealed" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    dev="$(grep -E '^FAAS_DEV=' "$sealed" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    case "$transport" in
+      resend|postmark|noop)
+        # live transport — credentials are the operator's responsibility.
+        # The pkg/mail factory fails closed on a missing credential
+        # so we don't double-assert here.
+        echo "mail transport = $transport (prod)"
+        ;;
+      log|"")
+        if [ "$dev" = "1" ]; then
+          echo "mail transport = ${transport:-unset} + FAAS_DEV=1 (dev)"
+        else
+          echo "FAIL: FAAS_MAIL_TRANSPORT=${transport:-unset} on a non-dev box — apid + meterd will refuse to boot. Set FAAS_MAIL_TRANSPORT=resend (or postmark / noop) or FAAS_DEV=1."
+          exit 1
+        fi
+        ;;
+      *)
+        echo "FAIL: FAAS_MAIL_TRANSPORT=$transport is not a known transport (resend|postmark|log|noop). apid will refuse to boot."
+        exit 1
+        ;;
+    esac
+  args:
+    executable: /bin/bash
+  changed_when: false
+  register: faas_mail_transport_assert
+- name: control_plane_service — debug mail transport assert
+  ansible.builtin.debug:
+    msg: "{{ faas_mail_transport_assert.stdout }}"
+  when: faas_mail_transport_assert.stdout != ""
