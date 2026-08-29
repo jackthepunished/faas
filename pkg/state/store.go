@@ -872,6 +872,28 @@ type Store interface {
 	// overdue row, the second must not double-transition).
 	MarkDunningStep(ctx context.Context, accountID string, from, to AccountStatus) error
 
+	// Mail suppression (issue #246 acceptance item 7, ADR-115 §D.3).
+	// RecordMailSuppression writes a row for a hard-bounce or
+	// complaint and reports whether the row was a fresh insert
+	// (true) or a replay that hit the (source, provider_event_id)
+	// unique index (false). The bounce handler reads the bool to
+	// decide whether to advance dunning — a replay MUST NOT
+	// trigger a second MarkDunningStep call. SQLSTATE 23505 on the
+	// unique index is mapped to ErrConflict by the PgStore wrapper
+	// (pr-1000 convention) so a caller that wants strict failure
+	// on duplicate-event-id can detect it; the bounce handler does
+	// not — replay-safety is built into the RETURNING bool.
+	RecordMailSuppression(ctx context.Context, in MailSuppressionInput) (inserted bool, err error)
+	// IsMailSuppressed reports whether any active suppression
+	// matches the address. "Active" means expires_at IS NULL OR
+	// expires_at > now(); the partial index keeps expired rows
+	// out of the lookup so a row that fell out of TTL does not
+	// block future mail. The suppression decorator (pkg/mail/
+	// suppression.go) calls this on every outbound message;
+	// cache it per-process for 60s to avoid hitting Postgres on
+	// the hot path of the dunning timer.
+	IsMailSuppressed(ctx context.Context, email string) (bool, error)
+
 	// API keys.
 	// CreateAPIKey persists a new key row. Scopes is the explicit set of
 	// authorization scopes attached to the key (e.g. "admin",

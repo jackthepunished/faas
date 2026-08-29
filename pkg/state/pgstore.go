@@ -21374,3 +21374,71 @@ func (s *PgStore) ReplaceProvisionedStaticEgressIPs(ctx context.Context, account
 	}
 	return nil
 }
+
+// RecordMailSuppression writes a row for a hard-bounce or complaint
+// (issue #246 acceptance item 7). Maps the domain MailSuppressionInput
+// to the sqlc-generated query parameters; pgtype.UUID / pgtype.Timestamptz
+// wrap the nullable account_id and expires_at so a nil pointer round-trips
+// to NULL. Returns inserted=true on a fresh row, false on a replay that
+// hit the (source, provider_event_id) unique index — the bounce handler
+// reads the bool to decide whether to advance dunning (fresh) or skip
+// (replay). A SQLSTATE 23505 from a parallel writer is mapped to
+// ErrConflict per the pr-1000 convention.
+func (s *PgStore) RecordMailSuppression(ctx context.Context, in MailSuppressionInput) (bool, error) {
+	if in.Email == "" {
+		return false, fmt.Errorf("state: RecordMailSuppression: email required")
+	}
+	if in.ProviderEventID == "" {
+		return false, fmt.Errorf("state: RecordMailSuppression: provider_event_id required")
+	}
+	if in.Reason == "" {
+		return false, fmt.Errorf("state: RecordMailSuppression: reason required (one of hard_bounce / complaint / manual)")
+	}
+	if in.Source == "" {
+		return false, fmt.Errorf("state: RecordMailSuppression: source required (one of resend / postmark / operator)")
+	}
+	var accountID pgtype.UUID
+	if in.AccountID != nil {
+		if err := accountID.Scan(*in.AccountID); err != nil {
+			return false, fmt.Errorf("state: RecordMailSuppression: account_id: %w", err)
+		}
+	}
+	var expiresAt pgtype.Timestamptz
+	if in.ExpiresAt != nil {
+		expiresAt = pgtype.Timestamptz{Time: *in.ExpiresAt, Valid: true}
+	}
+	q := sqlc.New()
+	inserted, err := q.RecordMailSuppression(ctx, s.pool, sqlc.RecordMailSuppressionParams{
+		AccountID:       accountID,
+		Email:           in.Email,
+		Reason:          string(in.Reason),
+		Source:          string(in.Source),
+		ProviderEventID: in.ProviderEventID,
+		ExpiresAt:       expiresAt,
+	})
+	if err != nil {
+		// Two writers can race on the unique index; the loser sees
+		// SQLSTATE 23505. Surface it as ErrConflict per pr-1000 so
+		// a caller that wants strict failure on duplicate event id
+		// can detect it without parsing pgx's wrapped PgError.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return false, ErrConflict
+		}
+		return false, fmt.Errorf("state: RecordMailSuppression: %w", err)
+	}
+	return inserted, nil
+}
+
+// IsMailSuppressed reports whether any active suppression matches
+// the address (issue #246 acceptance item 7). "Active" means
+// expires_at IS NULL OR expires_at > now(); the partial index
+// keeps expired rows out of the lookup so a row that fell out of
+// TTL does not block future mail to that address.
+func (s *PgStore) IsMailSuppressed(ctx context.Context, email string) (bool, error) {
+	if email == "" {
+		return false, fmt.Errorf("state: IsMailSuppressed: email required")
+	}
+	q := sqlc.New()
+	return q.IsMailSuppressed(ctx, s.pool, email)
+}

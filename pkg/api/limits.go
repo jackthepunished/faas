@@ -3669,6 +3669,14 @@ const (
 	MailRetryBaseDelayMS    = 500
 	MailRetryMaxWallClockMS = 5000
 
+	// MailSuppressionCacheTTLSeconds is the lifetime of the in-process
+	// memoisation in pkg/mail.SuppressingSender (issue #246 item 7).
+	// Short enough that a manual operator override takes effect within
+	// a minute on every daemon; long enough to absorb the burst of
+	// webhook-driven mail the dunning ladder produces after a billing
+	// failure without hammering the partial index on mail_suppressions.
+	MailSuppressionCacheTTLSeconds = 60
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 

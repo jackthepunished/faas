@@ -26,6 +26,46 @@ const (
 	AccountDeletedPending AccountStatus = "deleted_pending"
 )
 
+// MailSuppressionReason is the closed set the bounce handler emits
+// (issue #246 acceptance item 7, ADR-115 §D.3). 'hard_bounce'
+// triggers dunning via MarkDunningStep; 'complaint' suppresses but
+// does NOT transition (suspending an account because someone hit
+// "spam" is hostile); 'manual' is for operator overrides.
+type MailSuppressionReason string
+
+const (
+	MailSuppressionHardBounce MailSuppressionReason = "hard_bounce"
+	MailSuppressionComplaint  MailSuppressionReason = "complaint"
+	MailSuppressionManual     MailSuppressionReason = "manual"
+)
+
+// MailSuppressionSource identifies the origin of a suppression row
+// so the (source, provider_event_id) unique index dedupes correctly
+// across providers. 'resend' / 'postmark' are the live transports;
+// 'operator' covers manual overrides.
+type MailSuppressionSource string
+
+const (
+	MailSuppressionSourceResend   MailSuppressionSource = "resend"
+	MailSuppressionSourcePostmark MailSuppressionSource = "postmark"
+	MailSuppressionSourceOperator MailSuppressionSource = "operator"
+)
+
+// MailSuppressionInput is the bounce handler's payload for
+// Store.RecordMailSuppression. AccountID is nullable: a bounce can
+// land before the handler has correlated the address with an
+// account, in which case the row is still written and the
+// suppression decorator drops future mail to that address. The FK
+// on the table cascades so deleting an account drops its rows.
+type MailSuppressionInput struct {
+	AccountID       *string // nil if not correlated yet
+	Email           string
+	Reason          MailSuppressionReason
+	Source          MailSuppressionSource
+	ProviderEventID string
+	ExpiresAt       *time.Time // nil = suppression is permanent
+}
+
 // AppType distinguishes a plain App from a Function (spec §2, ADR-003).
 type AppType string
 

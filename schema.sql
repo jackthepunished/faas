@@ -1729,6 +1729,24 @@ CREATE TABLE public.login_tokens (
 
 
 --
+-- Name: mail_suppressions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.mail_suppressions (
+    id uuid NOT NULL,
+    account_id uuid,
+    email text NOT NULL,
+    reason text NOT NULL,
+    source text NOT NULL,
+    provider_event_id text NOT NULL,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT mail_suppressions_reason_chk CHECK (reason = ANY (ARRAY['hard_bounce'::text, 'complaint'::text, 'manual'::text])),
+    CONSTRAINT mail_suppressions_source_chk CHECK (source = ANY (ARRAY['resend'::text, 'postmark'::text, 'operator'::text]))
+);
+
+
+--
 -- Name: oauth_links; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2837,6 +2855,14 @@ ALTER TABLE ONLY public.login_tokens
 
 
 --
+-- Name: mail_suppressions mail_suppressions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mail_suppressions
+    ADD CONSTRAINT mail_suppressions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: oauth_links oauth_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3934,6 +3960,20 @@ CREATE UNIQUE INDEX jobs_account_name_uniq ON public.jobs USING btree (account_i
 --
 
 CREATE INDEX login_tokens_account_idx ON public.login_tokens USING btree (account_id, expires_at);
+
+
+--
+-- Name: mail_suppressions_active_email_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mail_suppressions_active_email_idx ON public.mail_suppressions USING btree (lower(email)) WHERE ((expires_at IS NULL) OR (expires_at > now()));
+
+
+--
+-- Name: mail_suppressions_event_id_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX mail_suppressions_event_id_key ON public.mail_suppressions USING btree (source, provider_event_id);
 
 
 --
@@ -5117,6 +5157,14 @@ ALTER TABLE ONLY public.jobs
 
 ALTER TABLE ONLY public.login_tokens
     ADD CONSTRAINT login_tokens_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: mail_suppressions mail_suppressions_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mail_suppressions
+    ADD CONSTRAINT mail_suppressions_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
