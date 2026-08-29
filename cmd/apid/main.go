@@ -810,10 +810,12 @@ func newMailerAdapter(s mail.Sender) Mailer {
 
 func (a mailAdapter) Send(ctx context.Context, m Message) error {
 	return a.s.Send(ctx, mail.Message{
-		To:       m.To,
-		Subject:  m.Subject,
-		TextBody: m.TextBody,
-		HTMLBody: m.HTMLBody,
+		To:        m.To,
+		Subject:   m.Subject,
+		TextBody:  m.TextBody,
+		HTMLBody:  m.HTMLBody,
+		Headers:   m.Headers,
+		MessageID: m.MessageID,
 	})
 }
 

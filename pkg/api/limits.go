@@ -3647,6 +3647,28 @@ const (
 	StandbyWriteLeaderURLCacheTTLSeconds  = 5
 	StandbyWriteNoLeaderRetryAfterSeconds = 60
 
+	// Mail retry budget (issue #246 acceptance item 3 — Resend's
+	// free tier is 100/day, so 429 is an operational certainty and
+	// the retry decorator needs a wall-clock cap so an HTTP handler
+	// never blocks longer than this). The cap is hard: a dunning
+	// or quota-warning handler in cmd/apid returns its response
+	// within 5s even when the upstream is rate-limiting us.
+	//
+	// MailRetryMaxAttempts caps the number of send attempts (1
+	// initial + MaxAttempts-1 retries). MailRetryBaseDelayMS is
+	// the base for full-jitter exponential backoff (delay is
+	// uniformly random in [0, BaseDelay * 2^(attempt-1))). The
+	// decorator prefers Retry-After from the upstream over the
+	// computed backoff when Retry-After is shorter.
+	//
+	// MailRetryMaxWallClockMS is the absolute wall-clock ceiling
+	// the decorator will spend retrying; once the budget is gone
+	// the last error is returned. Synchronous, no background
+	// goroutine — see pkg/mail/retry.go for the rationale.
+	MailRetryMaxAttempts    = 3
+	MailRetryBaseDelayMS    = 500
+	MailRetryMaxWallClockMS = 5000
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 

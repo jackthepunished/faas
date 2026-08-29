@@ -587,11 +587,27 @@ type Mailer interface {
 // Message is the cross-component email payload — mirrors pkg/mail.Message
 // without the import cycle (apid stays free of pkg/mail so daemons that
 // link apid don't pull the mail deps).
+//
+// Headers carries RFC 8058 List-Unsubscribe etc. on the
+// quota-warning template (issue #246 acceptance item 4). The
+// mailAdapter in cmd/apid/main.go copies them into mail.Message
+// so the transport actually reaches the wire — without this the
+// bulk-sender compliance work would be silently dropped at the
+// adapter boundary.
+//
+// MessageID, when non-empty, becomes the Idempotency-Key
+// (Resend) / X-Idempotency-Key (Postmark) header so a retry that
+// the upstream already accepted is deduplicated inside the
+// provider's replay window instead of double-charging. The
+// dunning + quota-warning templates derive a stable id from
+// (account_id, template, day).
 type Message struct {
-	To       []string
-	Subject  string
-	TextBody string
-	HTMLBody string
+	To        []string
+	Subject   string
+	TextBody  string
+	HTMLBody  string
+	Headers   map[string]string
+	MessageID string
 }
 
 // Notifier is the slice of pgstore behaviour apid depends on. The production
