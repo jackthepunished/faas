@@ -381,3 +381,113 @@ func TestGitArchiveHEAD_NotInRepo(t *testing.T) {
 		t.Fatal("gitArchiveHEAD outside a repo should fail; got nil")
 	}
 }
+
+// TestResolveZeroConfigProvenance exercises the bundle the refactored
+// zero-config path reads from. Pins the four return-contract cases:
+// ok=true with GitHub origin, ok=true with non-GitHub origin
+// (Owner/Repo empty), ok=false with ErrNotInGitRepo, and
+// ok=false with ErrNoGitRemote.
+func TestResolveZeroConfigProvenance(t *testing.T) {
+	t.Run("github_origin_clean", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil; got ok=%v err=%v", ok, err)
+		}
+		if prov.Owner != "o" || prov.Repo != "r" {
+			t.Errorf("got owner=%q repo=%q, want o/r", prov.Owner, prov.Repo)
+		}
+		if len(prov.SHA) != 40 {
+			t.Errorf("SHA %q is not 40 chars", prov.SHA)
+		}
+		if prov.Dirty {
+			t.Errorf("clean repo should report Dirty=false")
+		}
+		if prov.Root != dir {
+			t.Errorf("Root=%q want %q", prov.Root, dir)
+		}
+	})
+
+	t.Run("github_origin_dirty", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		// Add an untracked file → dirty.
+		if err := os.WriteFile(filepath.Join(dir, "scratch.txt"), []byte("hi"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil; got ok=%v err=%v", ok, err)
+		}
+		if !prov.Dirty {
+			t.Errorf("untracked-file repo should report Dirty=true")
+		}
+	})
+
+	t.Run("non_github_origin_soft_empty", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@gitlab.com:o/r.git")
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil for non-GitHub origin; got ok=%v err=%v", ok, err)
+		}
+		// Owner + Repo should be empty (caller still uses gitArchiveHEAD
+		// — just no provenance metadata on the deployment row).
+		if prov.Owner != "" || prov.Repo != "" {
+			t.Errorf("non-GitHub origin should produce empty owner/repo; got %q/%q",
+				prov.Owner, prov.Repo)
+		}
+	})
+
+	t.Run("no_origin_falls_through", func(t *testing.T) {
+		dir := initTestRepo(t) // initTestRepo adds no remote
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false for git repo without origin; got ok=true")
+		}
+		if !errors.Is(err, ErrNoGitRemote) {
+			t.Errorf("expected ErrNoGitRemote; got %v", err)
+		}
+	})
+
+	t.Run("not_in_repo", func(t *testing.T) {
+		dir := t.TempDir() // no git init
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false outside a repo; got ok=true")
+		}
+		if !errors.Is(err, ErrNotInGitRepo) {
+			t.Errorf("expected ErrNotInGitRepo; got %v", err)
+		}
+	})
+
+	t.Run("empty_repo", func(t *testing.T) {
+		// `git init` with no commit and no remote. Should fall through
+		// as ErrNoGitRemote (origin check fires first).
+		dir := t.TempDir()
+		mustGit(t, dir, "init", "-q")
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false for empty repo with no origin; got ok=true")
+		}
+		if !errors.Is(err, ErrNoGitRemote) {
+			t.Errorf("expected ErrNoGitRemote; got %v", err)
+		}
+	})
+
+	t.Run("user_name_captured", func(t *testing.T) {
+		dir := initTestRepo(t)
+		// initTestRepo sets user.name=Test User via env vars; the helper
+		// reads `git config user.name` which falls through to the
+		// env-var-supplied value.
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		prov, _, err := resolveZeroConfigProvenance(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if prov.DeployedBy != "Test User" {
+			t.Errorf("DeployedBy=%q want %q", prov.DeployedBy, "Test User")
+		}
+	})
+}

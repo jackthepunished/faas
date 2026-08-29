@@ -1241,18 +1241,79 @@ func cmdDeployTarball(args []string) int {
 		if cwdErr != nil {
 			return printErr("Could not read current directory", cwdErr)
 		}
-		// Issue #961 / Mega-A PR-1: zero-config `gregale deploy` (no
-		// flags). If cwd is inside a git repo with an `origin` remote
-		// pointing at GitHub, route through cmdDeployZeroConfig —
-		// the CLI packs + uploads the local tarball via the new
-		// /source-tarball endpoint, sidestepping the
-		// github_installations gate. Non-git or non-GitHub origins
-		// fall through to the existing cwd-auto-pack branch
-		// below (issue #313).
-		if root, gerr := gitRootFromCwd(cwd); gerr == nil {
-			if _, rerr := gitRemoteOrigin(root); rerr == nil {
-				return cmdDeployZeroConfig(slug, cwd)
+		// Issue #1182: refactored zero-config `gregale deploy` (no
+		// flags). When cwd is in a git repo with an `origin` remote
+		// we pack via `git archive HEAD` (the committed tree, not the
+		// working tree) and fall through to the normal
+		// buildCreateRequest → CreateApp → DeployTarball pipeline
+		// below. The legacy cmdDeployZeroConfig + mustOpen +
+		// sourceTarballSidecar trio is gone — that path bypassed
+		// CreateApp and dropped every deploy flag. The new path
+		// preserves ADR-115's source-tarball trust boundary (the
+		// source-tarball endpoint stays as the install-token CI
+		// path) by NOT routing through it; it goes through the same
+		// CreateApp + DeployTarball wire as --tarball / --template.
+		//
+		// Three outcomes from resolveZeroConfigProvenance:
+		//   - ok=true,  err=nil   → pack HEAD, stamp provenance
+		//   - ok=false, err=ErrNotInGitRepo / ErrNoGitRemote → fall
+		//     through to the cwd-auto-pack branch below
+		//     (existing behavior preserved for non-git dirs and for
+		//     git repos without origin)
+		//   - ok=false, err=other → surface the error
+		if prov, ok, perr := resolveZeroConfigProvenance(cwd); ok {
+			if prov.Dirty {
+				// Print a dirty warning naming the SHA + dirty count
+				// so the operator sees exactly what they're shipping
+				// (HEAD only, no working-tree changes). The deploy
+				// still proceeds — Ctrl-C is the operator's opt-out.
+				if dirtyOut, derr := runGitCmd(prov.Root, "status", "--porcelain"); derr == nil {
+					dirtyFiles := 0
+					for _, line := range strings.Split(strings.TrimRight(dirtyOut, "\n"), "\n") {
+						if line != "" {
+							dirtyFiles++
+						}
+					}
+					if dirtyFiles > 0 {
+						PrintProgress(os.Stdout, "Note: working tree has %d dirty file(s); deploying HEAD (%s) only — commit first to include the changes",
+							dirtyFiles, prov.SHA[:7])
+					}
+				}
 			}
+			// Materialise HEAD as a temp gzipped tar via `git archive`.
+			// os.CreateTemp returns a *File we close immediately —
+			// gitArchiveHEAD writes to the path, no fd leak on this
+			// path. The temp file is removed by the defer; the open
+			// that follows uses openCustomerFile + defer Close (the
+			// existing --tarball branch), which is fd-safe.
+			tmpFile, terr := os.CreateTemp("", "gregale-git-*.tar.gz")
+			if terr != nil {
+				return printErr("Could not create temp tarball", terr)
+			}
+			tmpPath := tmpFile.Name()
+			_ = tmpFile.Close()
+			defer func() { _ = os.Remove(tmpPath) }()
+			if err := gitArchiveHEAD(prov.Root, tmpPath); err != nil {
+				return printErr("Could not archive git HEAD", err)
+			}
+			*tarball = tmpPath
+			PrintProgress(os.Stderr, "packing HEAD (%s) from %s",
+				prov.SHA[:7], filepath.Base(cwd))
+			// Auto-capture `git config user.name` as deployed_by
+			// unless the operator explicitly passed --deployed-by.
+			// Mirrors the legacy path at cmd_deploy_zero_config.go
+			// (issue #977 / ADR-116).
+			if *deployedBy == "" && prov.DeployedBy != "" {
+				*deployedBy = prov.DeployedBy
+			}
+			// resolvedShape stays shapeApp — `git archive HEAD` ships
+			// the committed tree and the server-side builder detects
+			// the framework from there (same as a --tarball upload).
+			// The cwd shape detector at lines 1264+ only runs when
+			// no git origin is present, which is the only case where
+			// a *tarball-less path can land here after this block.
+		} else if !errors.Is(perr, ErrNotInGitRepo) && !errors.Is(perr, ErrNoGitRemote) {
+			return printErr("Could not resolve git metadata", perr)
 		}
 		// Issue #737 / ADR-083: resolveDeployShape does detect +
 		// infer + print in one seam so the unit test can drive the

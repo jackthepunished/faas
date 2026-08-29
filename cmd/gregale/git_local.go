@@ -239,6 +239,72 @@ func isDirtyWorkdir(gitDir string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// zeroConfigProvenance is the bundle of metadata the refactored
+// zero-config deploy path (issue #1182) captures before packing
+// HEAD. Lives in git_local.go because every field except DeployedBy
+// is a git-side fact; the caller in commands2.go reads it to
+// stamp the deployment row's deployed_by annotation.
+//
+// Owner + Repo are populated only when the origin remote is a
+// recognised GitHub URL (parseGitRemoteURL returns empty triple
+// for non-GitHub hosts); empty here is the "we have a git repo
+// but no provenance" path and does not block the deploy.
+type zeroConfigProvenance struct {
+	Root       string // absolute path of the git working tree root
+	Owner      string // origin owner (lowercased); "" if non-GitHub host
+	Repo       string // origin repo (lowercased); "" if non-GitHub host
+	SHA        string // 40-char HEAD SHA
+	Dirty      bool   // working tree has uncommitted / untracked changes
+	DeployedBy string // `git config user.name` ("" if unset)
+}
+
+// resolveZeroConfigProvenance inspects cwd for git metadata and
+// returns a provenance bundle for the refactored zero-config
+// deploy path. The return contract is:
+//
+//   - ok=true,  err=nil → caller uses the zero-config path
+//     (gitArchiveHEAD + the existing CreateApp + DeployTarball
+//     pipeline)
+//   - ok=false, err=ErrNotInGitRepo → caller falls through to the
+//     cwd-auto-pack branch (existing behavior for non-git dirs)
+//   - ok=false, err=ErrNoGitRemote → caller falls through to the
+//     cwd-auto-pack branch (existing behavior for git-without-origin)
+//   - ok=false, err=other → caller surfaces the error
+//
+// Origin is required for the zero-config path: a git repo with no
+// remote still deploys via the cwd-auto-pack branch (the customer
+// may be packaging local code that has no upstream).
+func resolveZeroConfigProvenance(cwd string) (zeroConfigProvenance, bool, error) {
+	root, err := gitRootFromCwd(cwd)
+	if err != nil {
+		return zeroConfigProvenance{}, false, err
+	}
+	remote, err := gitRemoteOrigin(root)
+	if err != nil {
+		// ErrNoGitRemote is the "git repo without origin" path — caller
+		// falls through to cwd auto-pack (preserves existing behavior).
+		return zeroConfigProvenance{}, false, err
+	}
+	owner, repo, _ := parseGitRemoteURL(remote)
+	// owner / repo stay "" on non-GitHub origin or parse failure.
+	// The caller still uses gitArchiveHEAD — empty (owner, repo)
+	// just means the deployment row doesn't carry source provenance.
+	sha, err := resolveHEAD(root)
+	if err != nil {
+		return zeroConfigProvenance{}, false, fmt.Errorf("resolve HEAD: %w", err)
+	}
+	dirty, _ := isDirtyWorkdir(root) // best-effort; not a hard gate
+	name, _ := gitUserName(root)     // best-effort; "" if unset
+	return zeroConfigProvenance{
+		Root:       root,
+		Owner:      owner,
+		Repo:       repo,
+		SHA:        sha,
+		Dirty:      dirty,
+		DeployedBy: name,
+	}, true, nil
+}
+
 // runGitCmd runs `git <args...>` with -C gitDir and returns combined
 // stdout+stderr trimmed. Errors include stderr so the operator sees
 // the underlying git message.
