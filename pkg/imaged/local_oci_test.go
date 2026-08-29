@@ -23,6 +23,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/oci"
 )
 
@@ -342,6 +344,57 @@ func TestLoadLocalOCIArchive_HappyTwoLayers(t *testing.T) {
 	// the exec contract (Env, Entrypoint, Cmd, …); verify the field
 	// set was preserved on at least one field.
 	_ = config // oci.Config fields are parsed from the JSON doc; non-empty DiffIDs is the load-bearing assertion.
+}
+
+func TestBuildFunctionLayer_UsesSourceBuildOCIForGoRuntimes(t *testing.T) {
+	// builderd's Railpack output is the only place the Go function binary is
+	// created. imaged must apply that local OCI layer before the source
+	// tarball so rootfs can normalize /app/server to /app/handler.
+	cases := []struct {
+		name    string
+		runtime string
+		wire    func(*Handler)
+	}{
+		{name: "go124", runtime: RuntimeGo124, wire: func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") }},
+		{name: "go124-alpine", runtime: RuntimeGo124Alpine, wire: func(h *Handler) { h.WithFunctionRunnerGo124Alpine("/runners/go124-alpine") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalConfigBytes()
+			layer := gzipBytes(t, []byte("compiled /app/server layer"))
+			cfgDigest := digestFor(t, cfg)
+			layerDigest := digestFor(t, layer)
+			manifest := minimalManifestBytes(cfgDigest, []string{layerDigest})
+			manifestDigest := digestFor(t, manifest)
+			archive := buildLocalOCIArchive(t, map[string][]byte{
+				"index.json":             minimalIndexBytes(manifestDigest),
+				blobPath(manifestDigest): manifest,
+				blobPath(cfgDigest):      cfg,
+				blobPath(layerDigest):    layer,
+			})
+
+			h := newFunctionTestHarness(t, api.PlanHobby, tc.runtime)
+			h.dep.RootfsPath = archive
+			handler := New(h.store, h.notif, fakePuller{}, h.bld, "./init", h.appsR, silentLogger())
+			tc.wire(handler)
+			if err := handler.buildFunctionLayer(context.Background(), h.app, h.dep, h.acct); err != nil {
+				t.Fatalf("buildFunctionLayer: %v", err)
+			}
+			if len(h.bld.calls) != 1 {
+				t.Fatalf("Builder.Build calls = %d, want 1", len(h.bld.calls))
+			}
+			in := h.bld.calls[0]
+			if len(in.Layers) != 1 {
+				t.Fatalf("Layers = %d, want 1 built OCI layer", len(in.Layers))
+			}
+			if in.TarballPath != h.dep.SourcePath {
+				t.Fatalf("TarballPath = %q, want source %q", in.TarballPath, h.dep.SourcePath)
+			}
+			if in.FunctionHandlerPath != "/app/handler" {
+				t.Fatalf("FunctionHandlerPath = %q, want /app/handler", in.FunctionHandlerPath)
+			}
+		})
+	}
 }
 
 // readAll is a tiny helper that closes the reader after draining it.

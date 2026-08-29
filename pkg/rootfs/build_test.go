@@ -354,6 +354,92 @@ func TestApplyTarball_StripsProjectRoot(t *testing.T) {
 	}
 }
 
+func TestApplyTarball_StripsProjectRootWithPAXGlobalHeader(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	tarball := filepath.Join(dir, "src.tar.gz")
+
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "pax_global_header",
+		Typeflag: tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{
+			"comment": "github codeload metadata",
+		},
+	}); err != nil {
+		t.Fatalf("tar.WriteHeader(PAX): %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "function-node/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatalf("tar.WriteHeader(directory): %v", err)
+	}
+	body := []byte("exports.handler = async () => ({statusCode: 200});")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "function-node/handler.js",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(body)),
+	}); err != nil {
+		t.Fatalf("tar.WriteHeader(handler): %v", err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatalf("tar.Write(handler): %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar.Close: %v", err)
+	}
+	var gz bytes.Buffer
+	gzw := gzip.NewWriter(&gz)
+	if _, err := gzw.Write(raw.Bytes()); err != nil {
+		t.Fatalf("gzip.Write: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("gzip.Close: %v", err)
+	}
+	if err := os.WriteFile(tarball, gz.Bytes(), 0o644); err != nil {
+		t.Fatalf("write tarball: %v", err)
+	}
+
+	if err := ApplyTarball(staging, tarball, 1024*1024); err != nil {
+		t.Fatalf("ApplyTarball: %v", err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/node22.js"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "app", "handler.js")); err != nil {
+		t.Fatalf("handler.js not unpacked at /app: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "app", "node22.js")); err != nil {
+		t.Fatalf("node22.js not generated at /app: %v", err)
+	}
+}
+
+func TestNormalizeFunctionHandler_GoServerArtifact(t *testing.T) {
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server := filepath.Join(appDir, "server")
+	if err := os.WriteFile(server, []byte("compiled-go-handler"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NormalizeFunctionHandler(staging, "/app/handler"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(appDir, "handler"))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if string(got) != "compiled-go-handler" {
+		t.Fatalf("handler = %q, want compiled artifact", got)
+	}
+	if _, err := os.Stat(server); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("server artifact should be moved, stat err = %v", err)
+	}
+}
+
 func TestNormalizeFunctionHandler_NodeAlias(t *testing.T) {
 	staging := t.TempDir()
 	source := filepath.Join(staging, "app", "handler.js")

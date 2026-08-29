@@ -15,6 +15,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/tarball"
 )
 
 // Builder turns the OCI layers that sit above a base image into a bootable per-app
@@ -525,9 +526,9 @@ func InjectGuestInit(staging, guestInitPath string) error {
 //
 //nolint:forbidigo // tarballPath is the apid-spooled path under spoolRoot() that already passed apid's validateTarballShape (in cmd/apid/deploy_inputs.go) — bytes are validated before builderd opens them; symlink-attack on the open itself is impossible because apid wrote the file via os.Create above with a fresh random id. The "customer" framing in the doc comment refers to the *contents* of the tarball (handler code), not the file path on disk.
 func ApplyTarball(staging, tarballPath string, capBytes int64) error {
-	prefix, err := tarballRootPrefix(tarballPath)
+	prefix, err := tarball.RootPrefix(tarballPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("rootfs: inspect tarball: %w", err)
 	}
 	f, err := os.Open(tarballPath)
 	if err != nil {
@@ -539,54 +540,6 @@ func ApplyTarball(staging, tarballPath string, capBytes int64) error {
 		return err
 	}
 	return applyTarballWithCap(appDir, f, capBytes, prefix)
-}
-
-// tarballRootPrefix returns the single project-root directory to strip from a
-// source archive. The CLI's packers always emit this shape, but accepting a
-// flat archive keeps the API compatible with hand-built tarballs. Multiple
-// top-level entries mean there is no wrapper to remove.
-func tarballRootPrefix(path string) (string, error) {
-	//nolint:forbidigo // path is the apid-spooled tarball already validated by ApplyTarball's caller.
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("rootfs: open tarball: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-	zr, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("rootfs: gzip: %w", err)
-	}
-	defer func() { _ = zr.Close() }()
-	tr := tar.NewReader(zr)
-	var prefix string
-	var nested bool
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("rootfs: read tar: %w", err)
-		}
-		name := strings.TrimSuffix(hdr.Name, "/")
-		if name == "" {
-			continue
-		}
-		first := name
-		if i := strings.IndexByte(name, '/'); i >= 0 {
-			first = name[:i]
-			nested = true
-		}
-		if prefix == "" {
-			prefix = first
-		} else if prefix != first {
-			return "", nil
-		}
-	}
-	if nested {
-		return prefix, nil
-	}
-	return "", nil
 }
 
 // ErrTarballExceedsCap is the sentinel returned by ApplyTarball when a
@@ -717,22 +670,37 @@ func NormalizeFunctionHandler(staging, handlerPath string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("rootfs: stat function handler %q: %w", handlerPath, err)
 	}
-	if filepath.Ext(target) != ".js" && filepath.Ext(target) != ".py" {
+	if filepath.Ext(target) != ".js" && filepath.Ext(target) != ".py" && clean != "/app/handler" {
 		return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
 	}
 	sourceName := "handler.js"
 	if filepath.Ext(target) == ".py" {
 		sourceName = "handler.py"
+	} else if clean == "/app/handler" {
+		// Railpack's Go plan emits the compiled function binary as
+		// /app/server. The Go runner keeps the stable function contract
+		// /app/handler, so source-build OCI layers are normalized here.
+		sourceName = "server"
 	}
 	source := filepath.Join(filepath.Dir(target), sourceName)
 	if source == target {
 		return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
 	}
-	if _, err := os.Stat(source); err != nil {
+	if sourceInfo, err := os.Stat(source); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
 		}
 		return fmt.Errorf("rootfs: stat function source %q: %w", source, err)
+	} else if sourceInfo.IsDir() {
+		return fmt.Errorf("rootfs: function source %q is a directory", source)
+	}
+	if clean == "/app/handler" {
+		// Go's source-build artifact is already the executable; avoid reading
+		// the binary into memory just to apply the stable handler alias.
+		if err := os.Rename(source, target); err != nil {
+			return fmt.Errorf("rootfs: alias function handler %s as %s: %w", source, target, err)
+		}
+		return nil
 	}
 	data, err := os.ReadFile(source)
 	if err != nil {
