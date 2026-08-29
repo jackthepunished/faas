@@ -3,6 +3,7 @@ package state
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -135,6 +136,80 @@ func TestApplyFailOptions(t *testing.T) {
 	emptyFn := func(f *FailOptions) { f.Outcome = "" }
 	if got := ApplyFailOptions([]FailOption{emptyFn}); got.Outcome != OutcomeFailed {
 		t.Errorf("ApplyFailOptions(empty) outcome=%q, want %q", got.Outcome, OutcomeFailed)
+	}
+}
+
+// TestTypes_VocabularyAndErrors exercises the closed-set vocab + error
+// helpers in types.go that show 0% coverage — pure functions, no PG.
+func TestTypes_VocabularyAndErrors(t *testing.T) {
+	// DeploymentStatus.IsTerminal: live non-terminal, failed/superseded/cancelled terminal.
+	if DeployLive.IsTerminal() {
+		t.Error("DeployLive.IsTerminal()=true, want false (ADR-118 autopark still valid)")
+	}
+	for _, s := range []DeploymentStatus{DeployFailed, DeploySuperseded, DeployCancelled} {
+		if !s.IsTerminal() {
+			t.Errorf("%s.IsTerminal()=false, want true", s)
+		}
+	}
+	if DeploymentStatus("garbage").IsTerminal() {
+		t.Error("garbage.IsTerminal()=true, want false")
+	}
+
+	// ParkReason.IsValid: closed set.
+	for _, r := range []ParkReason{ParkReasonLivenessExhausted, ParkReasonLifecyclePark, ParkReasonAdminPark} {
+		if !r.IsValid() {
+			t.Errorf("%s.IsValid()=false, want true", r)
+		}
+	}
+	if ParkReason("nope").IsValid() {
+		t.Error("ParkReason(\"nope\").IsValid()=true, want false")
+	}
+
+	// AutoRollbackReason.IsValid: closed set.
+	for _, r := range []AutoRollbackReason{AutoRollbackReasonThresholdExceeded, AutoRollbackReasonFirstWindowExpired} {
+		if !r.IsValid() {
+			t.Errorf("%s.IsValid()=false, want true", r)
+		}
+	}
+	if AutoRollbackReason("nope").IsValid() {
+		t.Error("AutoRollbackReason(\"nope\").IsValid()=true, want false")
+	}
+
+	// IsValidAlertAction: closed vocabulary.
+	for _, a := range []string{"webhook", "rollback", "demote", "promote"} {
+		if !IsValidAlertAction(a) {
+			t.Errorf("IsValidAlertAction(%q)=false, want true", a)
+		}
+	}
+	if IsValidAlertAction("bogus") {
+		t.Error("IsValidAlertAction(\"bogus\")=true, want false")
+	}
+
+	// AppWebhookQuotaError.Error() formats + matches errors.Is sentinel.
+	awErr := &AppWebhookQuotaError{Scope: AppWebhookQuotaScopeApp, Limit: 5, Observed: 6}
+	if got := awErr.Error(); got == "" {
+		t.Error("AppWebhookQuotaError.Error() empty")
+	}
+
+	// CorsPresetQuotaError.Error() + Is() matching.
+	cpErr := &CorsPresetQuotaError{Scope: CorsPresetQuotaScopeAccount, Limit: 10, Observed: 11}
+	if got := cpErr.Error(); got == "" {
+		t.Error("CorsPresetQuotaError.Error() empty")
+	}
+	if !cpErr.Is(cpErr) {
+		t.Error("CorsPresetQuotaError.Is(self)=false, want true")
+	}
+	if cpErr.Is(errors.New("other")) {
+		t.Error("CorsPresetQuotaError.Is(other)=true, want false")
+	}
+
+	// AlertRuleQuotaError.Is() → matches sentinel, doesn't match other error.
+	arErr := &AlertRuleQuotaError{Scope: AlertRuleQuotaScopeApp, Limit: 1, Observed: 2}
+	if !arErr.Is(ErrAlertRuleQuotaExceeded) {
+		t.Error("AlertRuleQuotaError.Is(sentinel)=false, want true")
+	}
+	if arErr.Is(errors.New("nope")) {
+		t.Error("AlertRuleQuotaError.Is(other)=true, want false")
 	}
 }
 
