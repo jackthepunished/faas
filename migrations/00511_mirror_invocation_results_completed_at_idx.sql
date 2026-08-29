@@ -1,4 +1,4 @@
--- filename: 00508_mirror_invocation_results_completed_at_idx.sql
+-- filename: 00511_mirror_invocation_results_completed_at_idx.sql
 -- +goose Up
 -- +goose StatementBegin
 
