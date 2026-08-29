@@ -1051,11 +1051,20 @@ type CreateDeploymentOverrides struct {
 // override object. Defaults: interval 5s, timeout 2s, retries 3.
 // Path is required (and must start with "/") when the parent
 // healthcheck is set.
+//
+// M-1 (ADR-136) extended the surface additively with OCI HEALTHCHECK
+// fields so a registry image's HEALTHCHECK CMD semantics flow through
+// to AppManifest.Healthcheck (workstream A.4 / issue #1186). The
+// `Test` argv is the canonical OCI shape — when set, runtime polling
+// in M-2 will prefer Test over Path; until then Path is what
+// guest-init probes (backward-compat preserved).
 type DeploymentHealthcheck struct {
-	Path      string `json:"path"`
-	IntervalS int    `json:"interval_s,omitempty"`
-	TimeoutS  int    `json:"timeout_s,omitempty"`
-	Retries   int    `json:"retries,omitempty"`
+	Path      string   `json:"path"`
+	IntervalS int      `json:"interval_s,omitempty"`
+	TimeoutS  int      `json:"timeout_s,omitempty"`
+	Retries   int      `json:"retries,omitempty"`
+	Test      []string `json:"test,omitempty"`
+	StartPeriodS int   `json:"start_period_s,omitempty"`
 }
 
 // DeploymentLivenessProbe is the liveness-probe shape on the

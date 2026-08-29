@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // AppManifestPath is where imaged writes the manifest inside the app layer and
@@ -23,6 +24,11 @@ const (
 // into the app layer; guest-init applies env, execs the entrypoint as the app
 // user, and uses Port/Healthz for readiness. Keep this struct stable — it is a
 // cross-boundary contract baked into every snapshot.
+//
+// M-1 (ADR-136) widened the contract additively: Healthcheck, StopSignal,
+// StopGracePeriod surfaced from the OCI image-config spec; old guest-init
+// ignores unknown JSON keys per encoding/json semantics. Runtime wiring of
+// the new fields lands in M-2.
 type AppManifest struct {
 	// Entrypoint is the exec argv for the customer app. Required.
 	Entrypoint []string `json:"entrypoint"`
@@ -44,6 +50,39 @@ type AppManifest struct {
 	Healthz string `json:"healthz,omitempty"`
 	// User is the unix user to exec as; empty means DefaultAppUser.
 	User string `json:"user,omitempty"`
+	// Healthcheck mirrors the OCI HEALTHCHECK shape when populated
+	// from the source image config (issue #1186 workstream A.4).
+	// Runtime polling lands in M-2 (ADR-X5); M-1 surfaces the
+	// field so the contract is canonical from the registry pull
+	// path onward.
+	Healthcheck *AppManifestHealthcheck `json:"healthcheck,omitempty"`
+	// StopSignal mirrors OCI STOPSIGNAL; runtime signal-forwarding
+	// lands in M-2 (ADR-X3 lifecycle contract).
+	StopSignal string `json:"stop_signal,omitempty"`
+	// StopGracePeriod mirrors OCI StopGracePeriod (the OCI image
+	// spec doesn't carry it; M-2 will populate from operator
+	// override or per-plan cap). Currently always zero.
+	StopGracePeriod time.Duration `json:"stop_grace_period,omitempty"`
+}
+
+// AppManifestHealthcheck is the AppManifest-level projection of the OCI
+// HEALTHCHECK shape (ADR-136 §Decision 3-4). Durations are encoded as
+// integer seconds at the JSON boundary to match OCI/Docker conventions.
+type AppManifestHealthcheck struct {
+	// Test is the argv of the check command, prefixed by "CMD",
+	// "CMD-SHELL", or "NONE" per Docker semantics.
+	Test []string `json:"test"`
+	// IntervalS is the poll cadence after StartPeriodS elapses.
+	// 0 = inherit platform default (Docker: 30s).
+	IntervalS int `json:"interval_s,omitempty"`
+	// TimeoutS is the per-probe exec timeout. 0 = inherit (Docker: 30s).
+	TimeoutS int `json:"timeout_s,omitempty"`
+	// Retries is the consecutive failure count to mark unhealthy.
+	// 0 = inherit (Docker: 3).
+	Retries int `json:"retries,omitempty"`
+	// StartPeriodS is the startup grace during which failures
+	// don't count (Docker 17.05+).
+	StartPeriodS int `json:"start_period_s,omitempty"`
 }
 
 // EffectivePort returns Port or the default.
@@ -80,6 +119,16 @@ func (m AppManifest) Validate() error {
 	}
 	if m.Port < 0 || m.Port > 65535 {
 		return fmt.Errorf("app manifest: port %d out of range", m.Port)
+	}
+	// StopGracePeriod is bounded at the manifest surface to keep the
+	// platform's tail-drain budget sane (spec §4.10 max-shutdown-wait
+	// per ADR-X3 lifecycle contract in M-2). The 5-minute cap is a
+	// gross upper bound; per-plan tightening lands in M-2.
+	if m.StopGracePeriod < 0 {
+		return fmt.Errorf("app manifest: stop_grace_period %s must be >= 0", m.StopGracePeriod)
+	}
+	if m.StopGracePeriod > 5*time.Minute {
+		return fmt.Errorf("app manifest: stop_grace_period %s exceeds 5m cap", m.StopGracePeriod)
 	}
 	// EnvSecrets: each value must be a "secret:NAME" ref (ADR-053 §Decision 1).
 	// The grammar is shared with pkg/api/dto.go::CreateDeploymentOverrides

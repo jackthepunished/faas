@@ -110,6 +110,25 @@ func applyOverrides(manifest api.AppManifest, dep state.Deployment) (api.AppMani
 		if hc.Path != "" {
 			manifest.Healthz = hc.Path
 		}
+		// M-1 (ADR-136) surfaces Test + StartPeriodS onto AppManifest.Healthcheck
+		// when the override declares them, so the OCI HEALTHCHECK shape flows
+		// through to the per-VM manifest alongside the Path projection above.
+		// Runtime polling lands in M-2 (ADR-X5); the field stays dormant on
+		// guest-init until then, but the wire shape is canonical from
+		// commit 6 onward.
+		if len(hc.Test) > 0 || hc.StartPeriodS > 0 {
+			mh := manifest.Healthcheck
+			if mh == nil {
+				mh = &api.AppManifestHealthcheck{}
+			}
+			if len(hc.Test) > 0 {
+				mh.Test = append([]string(nil), hc.Test...)
+			}
+			if hc.StartPeriodS > 0 {
+				mh.StartPeriodS = hc.StartPeriodS
+			}
+			manifest.Healthcheck = mh
+		}
 		// IntervalS/TimeoutS/Retries belong in pkg/fcvm/vmm.go::waitReady
 		// after PR-C; today's waitReady is a bare TCP accept and has no
 		// field for them. The manifest schema does not carry these yet

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestManifestDefaults(t *testing.T) {
@@ -71,6 +72,24 @@ func TestManifestValidate(t *testing.T) {
 			Entrypoint: []string{"x"},
 			EnvSecrets: map[string]string{},
 		}, true},
+		// M-1 (ADR-136) — StopGracePeriod bounded at the manifest side
+		// to keep the platform's tail-drain budget sane. The 5-minute
+		// cap is gross; per-plan tightening lands in M-2.
+		{"stop_grace_period zero ok", AppManifest{
+			Entrypoint: []string{"x"}, StopGracePeriod: 0,
+		}, true},
+		{"stop_grace_period under cap ok", AppManifest{
+			Entrypoint: []string{"x"}, StopGracePeriod: 30 * time.Second,
+		}, true},
+		{"stop_grace_period at cap ok", AppManifest{
+			Entrypoint: []string{"x"}, StopGracePeriod: 5 * time.Minute,
+		}, true},
+		{"stop_grace_period over cap rejected", AppManifest{
+			Entrypoint: []string{"x"}, StopGracePeriod: 5*time.Minute + time.Second,
+		}, false},
+		{"stop_grace_period negative rejected", AppManifest{
+			Entrypoint: []string{"x"}, StopGracePeriod: -1 * time.Second,
+		}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
