@@ -401,6 +401,14 @@ type JobStore interface {
 	// (job_tasks_run_idx: (run_id, task_index)). Used by the
 	// run-detail page on the dashboard.
 	JobTaskList(ctx context.Context, runID string, limit, offset int) ([]JobTask, error)
+	// ListJobInstances (issue #1184 Workstream A / ADR-099) returns
+	// every live kind='job_task' instance for the meterd
+	// sampler. Mirrors ListAllApps for the job workload class:
+	// only rows with state NOT IN ('destroyed','parked') are
+	// included; the sampler filters out the remaining
+	// parked/destroyed rows itself to keep the contract
+	// explicit.
+	ListJobInstances(ctx context.Context) ([]Instance, error)
 }
 
 // compile-time check: api.Limits is referenced (the JobQuotaError

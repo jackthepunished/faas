@@ -843,3 +843,55 @@ func (s *PgStore) JobTaskList(ctx context.Context, runID string, limit, offset i
 	defer rows.Close()
 	return scanJobTasks(rows)
 }
+
+// ListJobInstances returns every kind='job_task' instance for the
+// meterd sampler. Uses instances_job_active_idx
+// (migrations/00527_job_id_on_delete_restrict.sql) — a partial
+// index on (job_id) WHERE kind='job_task' AND status NOT IN
+// ('parked','destroyed') — so the sampler is O(active job
+// instances), not O(total instances).
+//
+// Called once per minute from cmd/meterd/main.go's SampleJobsAndRoll
+// goroutine; bounded by the partial index on the small active
+// subset (parked/destroyed job rows are excluded by the index
+// predicate). No transaction needed — a single SELECT on a
+// hot-index-friendly predicate.
+//
+// Status filter mirrors the memstore path's destroyed/parked
+// guard; an in-progress instance always has status in
+// (waking, cold_booting, running).
+//
+// Scans only the four columns the sampler reads (id, state,
+// ram_mb, job_id) directly into a partial Instance rather than
+// running the full scanInstanceCols helper. The sampler uses
+// just these four plus a separate JobGetByID lookup for
+// account_id; the additional Instance columns are wasted
+// bandwidth on a hot 1m ticker.
+func (s *PgStore) ListJobInstances(ctx context.Context) ([]Instance, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, state, ram_mb, job_id from instances
+		  where kind = 'job_task'::text
+		    and status not in ('destroyed', 'parked')
+		  order by created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list job_task instances: %w", err)
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		var ins Instance
+		var jobID *string
+		if err := rows.Scan(&ins.ID, &ins.State, &ins.RAMMB, &jobID); err != nil {
+			return nil, fmt.Errorf("state: scan job_task instance: %w", err)
+		}
+		if jobID != nil {
+			ins.JobID = *jobID
+			ins.Kind = "job_task"
+		}
+		out = append(out, ins)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate job_task instances: %w", err)
+	}
+	return out, nil
+}

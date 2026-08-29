@@ -269,6 +269,19 @@ func (l *Loop) Run(ctx context.Context) error {
 			if err == nil {
 				l.emitFloorApplied(c, rows)
 			}
+			// ADR-099 / issue #1184 Workstream A: job
+			// sampler. Same 1m tick, after the app rows,
+			// so a transient store hiccup never blocks
+			// app billing. Returns are best-effort —
+			// log-and-continue on error so the sample
+			// tick keeps its existing failure surface
+			// unchanged (the closure still returns the
+			// app sample's err).
+			_, jerr := sampler.SampleJobsAndRoll(c)
+			if jerr != nil && l.log != nil {
+				l.log.Warn("meter: job sampler tick failed",
+					slog.String("err", jerr.Error()))
+			}
 			return err
 		}, "sample")
 	}()

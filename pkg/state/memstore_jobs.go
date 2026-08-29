@@ -721,3 +721,24 @@ func derefInt(p *int, fallback int) int {
 	}
 	return fallback
 }
+
+// ListJobInstances (issue #1184 Workstream A / ADR-099) returns
+// every kind='job_task' instance for the meterd sampler. Walks
+// m.instances (memstore has no secondary index on kind; the
+// meter sampler is called once per minute, so an O(N) scan is
+// fine for the test + e2e harness surface).
+func (m *MemStore) ListJobInstances(_ context.Context) ([]Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Instance, 0, len(m.instances)/4)
+	for _, ins := range m.instances {
+		if ins.Kind != "job_task" {
+			continue
+		}
+		if ins.State == "destroyed" || ins.State == "parked" {
+			continue
+		}
+		out = append(out, ins)
+	}
+	return out, nil
+}
