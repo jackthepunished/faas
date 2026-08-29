@@ -214,6 +214,11 @@ will move to a federated scrape per ADR-031).
 | Resident GB per paying customer | `meterd_resident_gb_per_customer{plan}` | resident GB per paying customer |
 | Per-route top 10 reqps + error rate (ADR-093) | `faas_gateway_request_rate_5m:by_route`, `faas_gateway_error_rate_5m:by_route` | per-route breakdown (opt-in) |
 | Per-route top 10 p95 latency (ADR-093) | `faas_gateway_p95_seconds:by_route` | per-route p95 (opt-in) |
+| Deployment cancel rate by outcome (5m) | `apid_ops_total{op="deployment_cancel",outcome}` | queue controls — cancel (ADR-124) |
+| Deployment reorder rate by outcome (5m) | `apid_ops_total{op="deployment_reorder",outcome}` | queue controls — reorder (ADR-124) |
+| Deployment clear (single) rate by outcome (5m) | `apid_ops_total{op="deployment_clear",outcome}` | queue controls — clear (ADR-124 + PR #1181) |
+| Deployment clear-obsolete (bulk) rate by outcome (5m) | `apid_ops_total{op="deployment_clear_obsolete",outcome}` | queue controls — clear-obsolete (ADR-124 + PR #1181) |
+| Deployment queue controls — overall success rate (5m) | `apid_ops_total{op=~"deployment_(cancel\|reorder\|clear\|clear_obsolete)",outcome="ok"}` / same set, all outcomes | §12 success-rate tile across all 4 ops |
 
 ## Deferred rows
 

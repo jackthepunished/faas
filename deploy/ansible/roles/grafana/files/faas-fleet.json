@@ -784,6 +784,139 @@
         "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Deployment cancel rate by outcome (5m)",
+      "id": 200,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 144},
+      "description": "Stacked rate of POST /v1/apps/{slug}/deployments/{id}/cancel per outcome (ADR-124 + PR #1024 + PR #1181). Counter: apid_ops_total{op=\"deployment_cancel\",outcome} via ObserveDeploymentCancelled at pkg/wire/metrics.go:5686. Closed outcome set: ok / live_forbidden / not_cancellable / error. Free-plan cancel is allowed (no plan_disabled label).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(apid_ops_total{op=\"deployment_cancel\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "bars", "lineWidth": 0, "fillOpacity": 60, "stacking": {"mode": "normal", "group": "A"}}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Deployment reorder rate by outcome (5m)",
+      "id": 201,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 144},
+      "description": "Stacked rate of POST /v1/deployments/{id}/reorder per outcome (ADR-124 + PR #1024). Counter: apid_ops_total{op=\"deployment_reorder\",outcome} via ObserveDeploymentReorder at pkg/wire/metrics.go:5720. Closed outcome set: ok / plan_disabled / not_pending / out_of_range / error. Reorder is Hobby/Pro/Scale only — Free plan hits plan_disabled.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(apid_ops_total{op=\"deployment_reorder\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "bars", "lineWidth": 0, "fillOpacity": 60, "stacking": {"mode": "normal", "group": "A"}}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Deployment clear (single) rate by outcome (5m)",
+      "id": 202,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 152},
+      "description": "Stacked rate of DELETE /v1/deployments/{id} per outcome (ADR-124 + PR #1181). Counter: apid_ops_total{op=\"deployment_clear\",outcome} via ObserveDeploymentCleared at pkg/wire/metrics.go:5727. Closed outcome set: ok / live_forbidden / error. Mirror of cancel/clear §12 success-rate tile (cancel + clear joined on op ∈ {deployment_cancel, deployment_clear}).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(apid_ops_total{op=\"deployment_clear\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "bars", "lineWidth": 0, "fillOpacity": 60, "stacking": {"mode": "normal", "group": "A"}}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Deployment clear-obsolete (bulk) rate by outcome (5m)",
+      "id": 203,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 152},
+      "description": "Stacked rate of POST /v1/apps/{slug}/deployments/clear-obsolete per outcome (ADR-124 + PR #1181). Counter: apid_ops_total{op=\"deployment_clear_obsolete\",outcome} via ObserveDeploymentClearObsolete at pkg/wire/metrics.go:5748. Closed outcome set: ok / plan_disabled / error. Hobby/Pro/Scale only — Free plan hits plan_disabled. count=0 still emits ok (caller asked, store found nothing).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(apid_ops_total{op=\"deployment_clear_obsolete\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "bars", "lineWidth": 0, "fillOpacity": 60, "stacking": {"mode": "normal", "group": "A"}}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Deployment queue controls — overall success rate (5m)",
+      "id": 204,
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 160},
+      "description": "§12 success-rate tile across all 4 queue-control ops (cancel / reorder / clear / clear-obsolete). Numerator: apid_ops_total{op=~\"deployment_(cancel|reorder|clear|clear_obsolete)\",outcome=\"ok\"}; denominator: same set, all outcomes. Thresholds mirror build-success tile: green ≥0.95, yellow 0.80-0.95, red <0.80. A sustained red means either a state-machine regression (live_forbidden, not_pending, not_cancellable) or a real error burst.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(apid_ops_total{op=~\"deployment_(cancel|reorder|clear|clear_obsolete)\",outcome=\"ok\"}[5m])) / clamp_min(sum(rate(apid_ops_total{op=~\"deployment_(cancel|reorder|clear|clear_obsolete)\"}[5m])), 0.001)",
+          "legendFormat": "success rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.80},
+              {"color": "green", "value": 0.95}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto",
+        "colorMode": "background"
+      }
     }
   ],
   "refresh": "30s",
