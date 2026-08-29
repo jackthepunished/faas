@@ -2845,6 +2845,16 @@ type Store interface {
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
 
+	// Jobs (issue #1184 Workstream A / ADR-099 supplement).
+	// Run-to-completion workloads land across migrations 00255-00257,
+	// 00525-00530 (jobs / job_runs / job_tasks + the
+	// soft_delete_job_if_no_live_instances helper). The JobStore
+	// sub-interface is defined in jobs.go; embedding it here keeps
+	// the footnote-heavy comments where they belong (next to the
+	// method signatures) and lets narrow test doubles satisfy the
+	// JobStore surface without dragging in the whole Store.
+	JobStore
+
 	// Trigger primitive (issue #757 / ADR-0NN; commit #5 + commit #6).
 	// Per-method notes:
 	//
