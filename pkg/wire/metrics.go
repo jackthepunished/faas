@@ -5724,6 +5724,44 @@ func (m *OpsMetrics) ObserveDeploymentReorder(outcome string) {
 	m.ops.WithLabelValues("deployment_reorder", outcome).Inc()
 }
 
+// ObserveDeploymentCleared (ADR-124) increments the
+// <daemon>_ops_total{op="deployment_clear",outcome} counter by one.
+// outcome is the closed label set:
+//   - "ok" — single deployment soft-deleted (status untouched)
+//   - "live_forbidden" — attempt to clear a DeployLive row (409)
+//   - "error" — internal failure (logged at the call site)
+//
+// Mirrors ObserveDeploymentCancelled's label set for §12 dashboard
+// symmetry — the cancel/clear success-rate tile joins the two on
+// op ∈ {deployment_cancel, deployment_clear} so a clear regression
+// is visible alongside a cancel regression. Safe on a nil receiver.
+func (m *OpsMetrics) ObserveDeploymentCleared(outcome string) {
+	if m == nil {
+		return
+	}
+	m.ops.WithLabelValues("deployment_clear", outcome).Inc()
+}
+
+// ObserveDeploymentClearObsolete (ADR-124) increments the
+// <daemon>_ops_total{op="deployment_clear_obsolete",outcome} counter
+// by one. outcome is the closed label set:
+//   - "ok" — bulk soft-delete completed (clearedCount = 0 still emits
+//     ok; the caller wants the metric regardless of hit count — the
+//     hit count rides in the audit row's data->>'cleared_count')
+//   - "plan_disabled" — caller is on Free plan
+//   - "error" — internal failure
+//
+// Reorder-side gates a Free caller at the same handler-entry check
+// (`Plan.QueueControlsAllowed()`), so the "plan_disabled" outcome
+// shares its label value with ObserveDeploymentReorder for the §12
+// plan-funnel tile. Safe on a nil receiver.
+func (m *OpsMetrics) ObserveDeploymentClearObsolete(outcome string) {
+	if m == nil {
+		return
+	}
+	m.ops.WithLabelValues("deployment_clear_obsolete", outcome).Inc()
+}
+
 // ObserveProvenanceWrite records one ADR-038 build_provenance
 // populator outcome. code is "ok" on a successful CREATE /
 // ON CONFLICT (build_id) DO UPDATE write, "error" on any

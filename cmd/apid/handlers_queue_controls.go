@@ -211,12 +211,15 @@ func (s *server) handleClearDeployment(w http.ResponseWriter, r *http.Request, a
 		case errors.Is(err, state.ErrNotFound):
 			s.notFound(w, "no such deployment")
 		case errors.Is(err, state.ErrCancelLiveForbidden):
+			s.ops.ObserveDeploymentCleared("live_forbidden")
 			api.WriteProblem(w, api.ErrDeploymentCancelLiveForbidden(id))
 		default:
+			s.ops.ObserveDeploymentCleared("error")
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "clear failed", err.Error()))
 		}
 		return
 	}
+	s.ops.ObserveDeploymentCleared("ok")
 	// ADR-124 audit emission: one row per successful clear.
 	// Best-effort — the soft-delete already committed, the row
 	// is gone; the audit row exists independently.
@@ -239,6 +242,7 @@ func (s *server) handleClearDeployment(w http.ResponseWriter, r *http.Request, a
 // imaged nightly GC cycle).
 func (s *server) handleClearObsoleteDeployments(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if !acct.Plan.QueueControlsAllowed() {
+		s.ops.ObserveDeploymentClearObsolete("plan_disabled")
 		api.WriteProblem(w, api.ErrPlanReorderDisabled(acct.Plan))
 		return
 	}
@@ -258,9 +262,11 @@ func (s *server) handleClearObsoleteDeployments(w http.ResponseWriter, r *http.R
 	}
 	count, err := s.store.ClearObsoleteDeployments(r.Context(), app.ID, time.Now().UTC().Add(-olderThan))
 	if err != nil {
+		s.ops.ObserveDeploymentClearObsolete("error")
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "clear-obsolete failed", err.Error()))
 		return
 	}
+	s.ops.ObserveDeploymentClearObsolete("ok")
 	// ADR-124 audit emission: one row per successful
 	// clear-obsolete (clearedCount = 0 still emits — the caller
 	// asked, the store found nothing).
