@@ -311,7 +311,7 @@ func cmdJobsUpdate(args []string) int {
 // cmdJobsRm implements `gregale jobs rm <name>`. Returns 409
 // CodeJobHasLiveInstances if live instances exist — the server
 // enforces the soft-delete guard via the soft_delete_job_if_no_live
-// _instances stored function (migrations/00533).
+// _instances stored function (migrations/00538).
 func cmdJobsRm(args []string) int {
 	if len(args) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale jobs rm <name>", "jobs")

@@ -30,15 +30,15 @@ import (
 // --- column-order contracts ----------------------------------------
 
 // jobSelectCols is the canonical column order for jobs. Keep in lock-
-// step with scanJobCols and the migrations 00255 + 00529 DDL. The
-// command column (00529) is the last entry so the SELECT list reads
+// step with scanJobCols and the migrations 00255 + 00534 DDL. The
+// command column (00534) is the last entry so the SELECT list reads
 // in schema-add order.
 const jobSelectCols = `id, account_id, kind, name, image_ref, ram_mb, task_timeout_s,
        max_parallelism, retry_max, env_overrides, status, created_at,
        updated_at, command`
 
 // jobRunSelectCols is the canonical column order for job_runs.
-// Includes dead_letter_count (00531). ORDER BY id keeps the contract
+// Includes dead_letter_count (00536). ORDER BY id keeps the contract
 // stable when the dashboard adds new columns.
 const jobRunSelectCols = `id, job_id, account_id, trigger_kind, env_overrides, tasks,
        parallelism, retry_max, task_timeout_s, aggregate_status,
@@ -46,8 +46,8 @@ const jobRunSelectCols = `id, job_id, account_id, trigger_kind, env_overrides, t
        dead_letter_count, started_at, finished_at, created_at`
 
 // jobTaskSelectCols is the canonical column order for job_tasks.
-// Includes exit_code + next_attempt_at (00528), lease_token +
-// lease_expires_at + last_lease_node (00531). The dispatch-tick
+// Includes exit_code + next_attempt_at (00533), lease_token +
+// lease_expires_at + last_lease_node (00536). The dispatch-tick
 // SELECT FOR UPDATE SKIP LOCKED in JobTaskClaimBatch uses this list
 // too — same row surface, same scan helper.
 const jobTaskSelectCols = `run_id, task_index, status, attempt, instance_id, error_class,
@@ -546,7 +546,7 @@ func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, er
 		   end
 		 from (
 		   select
-		     -- 00528 broadened the terminal vocabulary to
+		     -- 00533 broadened the terminal vocabulary to
 		     -- succeeded/failed/timeout/cancelled/oom. CR-E /
 		     -- code-review #2 round-5: the previous SUM arms did
 		     -- NOT include 'timeout' or 'oom', so reaped tasks
@@ -903,7 +903,7 @@ func (s *PgStore) JobTaskList(ctx context.Context, runID string, limit, offset i
 
 // ListJobInstances returns every kind='job_task' instance for the
 // meterd sampler. Uses instances_job_active_idx
-// (migrations/00530_job_id_on_delete_restrict.sql) — a partial
+// (migrations/00535_job_id_on_delete_restrict.sql) — a partial
 // index on (job_id) WHERE kind='job_task' AND status NOT IN
 // ('parked','destroyed') — so the sampler is O(active job
 // instances), not O(total instances).

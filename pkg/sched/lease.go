@@ -32,7 +32,7 @@ import (
 )
 
 // LeaseToken is the opaque, comparable identity of an active lease.
-// Persisted as a uuid column (job_tasks.lease_token, 00531). The
+// Persisted as a uuid column (job_tasks.lease_token, 00536). The
 // underlying type is string to match the codebase convention (Cron.ID,
 // App.ID) — uuid.UUID is reserved for the few places where the v7
 // generation logic actually matters.
