@@ -7492,6 +7492,7 @@ paths:
           in: path
           required: true
           schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+          description: The invocation id of the dead-letter row to replay.
       responses:
         '202':
           description: Replay accepted; row is back to pending.
@@ -18330,7 +18331,7 @@ components:
         max_attempts:    { type: integer }
         base_seconds:    { type: number }
         max_seconds:     { type: number }
-        jitter_seconds:  { type: number, description: "Fraction (0..1). 0.2 means ±20%." }
+        jitter_seconds:  { type: number, description: "Fraction (0..1) added to the backoff delay. 0.2 means ±20% jitter on top of the exponential curve." }
 
     DelayedTaskRequest:
       description: "Body for POST /v1/apps/{slug}/delayed-tasks. scheduled_at must be in the future (UTC)."

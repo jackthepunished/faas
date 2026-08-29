@@ -15,12 +15,16 @@
 -- (the parallel index for the invocations reaper); partial
 -- because most rows carry NULL retention.
 --
-CREATE INDEX trigger_records_app_retention_idx
-  ON trigger_records (app_id, result_retention_until)
+-- PR-E fixup (CI #1185): index column is trigger_id, NOT app_id —
+-- trigger_records has no app_id column (FK chain:
+-- trigger_records.trigger_id → triggers.id → triggers.app_id).
+--
+CREATE INDEX trigger_records_trigger_retention_idx
+  ON trigger_records (trigger_id, result_retention_until)
   WHERE result_retention_until IS NOT NULL;
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-DROP INDEX IF EXISTS trigger_records_app_retention_idx;
+DROP INDEX IF EXISTS trigger_records_trigger_retention_idx;
 -- +goose StatementEnd
