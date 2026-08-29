@@ -38,11 +38,11 @@
 -- timestamp, regardless of plan default".
 --
 ALTER TABLE invocations
-  ADD COLUMN deadline_at TIMESTAMPTZ NULL,
-  ADD COLUMN retry_policy JSONB NULL,
-  ADD COLUMN result_retention_until TIMESTAMPTZ NULL;
+  ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ NULL,
+  ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL,
+  ADD COLUMN IF NOT EXISTS result_retention_until TIMESTAMPTZ NULL;
 
-CREATE INDEX invocations_app_deadline_idx
+CREATE INDEX IF NOT EXISTS invocations_app_deadline_idx
   ON invocations (app_id, deadline_at)
   WHERE state IN ('pending', 'dispatching') AND deadline_at IS NOT NULL;
 

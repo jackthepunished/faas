@@ -34,10 +34,10 @@
 --     (GET /v1/apps/{slug}/queues/dead_letter/replays).
 --
 ALTER TABLE invocations
-  ADD COLUMN replayed_from_invocation_id UUID NULL,
-  ADD COLUMN last_replayed_at TIMESTAMPTZ NULL;
+  ADD COLUMN IF NOT EXISTS replayed_from_invocation_id UUID NULL,
+  ADD COLUMN IF NOT EXISTS last_replayed_at TIMESTAMPTZ NULL;
 
-CREATE INDEX invocations_replayed_from_idx
+CREATE INDEX IF NOT EXISTS invocations_replayed_from_idx
   ON invocations (account_id, last_replayed_at)
   WHERE last_replayed_at IS NOT NULL;
 -- +goose StatementEnd

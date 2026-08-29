@@ -33,11 +33,11 @@
 -- pattern.
 --
 ALTER TABLE trigger_records
-  ADD COLUMN deadline_at TIMESTAMPTZ NULL,
-  ADD COLUMN retry_policy JSONB NULL,
-  ADD COLUMN result_retention_until TIMESTAMPTZ NULL;
+  ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ NULL,
+  ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL,
+  ADD COLUMN IF NOT EXISTS result_retention_until TIMESTAMPTZ NULL;
 
-CREATE INDEX trigger_records_trigger_deadline_idx
+CREATE INDEX IF NOT EXISTS trigger_records_trigger_deadline_idx
   ON trigger_records (trigger_id, deadline_at)
   WHERE state IN ('pending', 'claimed', 'retry') AND deadline_at IS NOT NULL;
 -- +goose StatementEnd

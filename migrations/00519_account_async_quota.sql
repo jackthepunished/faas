@@ -51,7 +51,7 @@
 -- step. The plan's max_inflight is read from pkg/api.Limits at that
 -- point, so plan changes are picked up at next INSERT.
 --
-CREATE TABLE account_async_quota (
+CREATE TABLE IF NOT EXISTS account_async_quota (
   account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   max_inflight INT NOT NULL CHECK (max_inflight >= 0),
   current_inflight INT NOT NULL DEFAULT 0 CHECK (current_inflight >= 0),

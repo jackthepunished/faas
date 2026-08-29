@@ -381,6 +381,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/queues/state":       "QueueState",
 	"GET /v1/apps/{slug}/queues/peek":        "QueuePeek",
 	"GET /v1/apps/{slug}/queues/dead_letter": "QueueDeadLetter",
+	"POST /v1/apps/{slug}/queues/dead_letter/{id}/replay": "QueueDeadLetterReplay",
 	"POST /v1/apps/{slug}/delayed-tasks":     "CreateDelayedTask",
 	"GET /v1/delayed-tasks/{id}":             "GetDelayedTask",
 	"DELETE /v1/delayed-tasks/{id}":          "CancelDelayedTask",
