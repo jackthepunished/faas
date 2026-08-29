@@ -461,6 +461,14 @@ func run(args []string) int {
 		// above the plan's included GB-h). schedd refuses new wakes
 		// once the cap is hit.
 		return cmdOverageCap(args[1:])
+	case "mail":
+		// Issue #246 acceptance item 6: operator dry-run for the
+		// outbound mail pipeline. `gregale mail dry-run` renders
+		// every production template against a fixture account
+		// + day and prints the wire payload as JSON so an
+		// operator can eyeball subject/body/headers before
+		// flipping the box to FAAS_MAIL_TRANSPORT=resend.
+		return cmdMail(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1

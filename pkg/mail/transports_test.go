@@ -592,10 +592,18 @@ func TestResendSender_NoIdempotencyKeyWhenEmpty(t *testing.T) {
 // List-Unsubscribe (issue #246 acceptance item 4, RFC 8058).
 // pkg/mail/headers.go builds the header set; this row proves the
 // transport doesn't drop them.
+//
+// Resend's API treats custom HTTP request headers as unrelated to
+// the email payload and drops them — so the right channel is the
+// `headers` field on the JSON body (ResendRequest.Headers). The
+// pre-PR transport set them via req.Header.Set, which looked
+// correct in unit tests against the stub but was silently lost
+// against the real Resend API. This test pins the JSON-body path
+// so a future "simplification" can't regress the wire payload.
 func TestResendSender_PassesCustomHeaders(t *testing.T) {
-	var gotUnsubscribe string
+	var gotBody mail.ResendRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUnsubscribe = r.Header.Get("List-Unsubscribe")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"abc-123"}`))
 	}))
@@ -613,8 +621,9 @@ func TestResendSender_PassesCustomHeaders(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if gotUnsubscribe != "<mailto:unsub@example.test>" {
-		t.Errorf("List-Unsubscribe = %q, want <mailto:unsub@example.test>", gotUnsubscribe)
+	if got, ok := gotBody.Headers["List-Unsubscribe"]; !ok || got != "<mailto:unsub@example.test>" {
+		t.Errorf("ResendRequest.Headers[List-Unsubscribe] = %q (present=%v); want <mailto:unsub@example.test>",
+			got, ok)
 	}
 }
 

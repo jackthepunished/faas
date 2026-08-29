@@ -58,12 +58,20 @@ type ResendSender struct {
 
 // ResendRequest is the JSON body the Resend API expects. Exported so
 // tests in package mail_test can decode against it.
+//
+// `Headers` carries caller-supplied RFC 5322 headers (e.g.
+// List-Unsubscribe + List-Unsubscribe-Post for bulk-sender compliance
+// per RFC 8058). Resend's API treats these as opaque — they're
+// attached verbatim to the outbound message, not parsed by Resend
+// itself. Empty map omits the field so a non-bulk email doesn't
+// add a noisy `"headers":{}` to the wire payload.
 type ResendRequest struct {
-	From    string   `json:"from"`
-	To      []string `json:"to"`
-	Subject string   `json:"subject"`
-	Text    string   `json:"text"`
-	HTML    string   `json:"html,omitempty"`
+	From    string            `json:"from"`
+	To      []string          `json:"to"`
+	Subject string            `json:"subject"`
+	Text    string            `json:"text"`
+	HTML    string            `json:"html,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // resendError is the JSON shape Resend returns on 4xx/5xx. We surface
@@ -104,6 +112,12 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 		Subject: msg.Subject,
 		Text:    msg.TextBody,
 		HTML:    msg.HTMLBody,
+		// Caller-supplied extra headers (List-Unsubscribe etc) go
+		// in the JSON body — Resend's API treats custom HTTP
+		// request headers as unrelated to the email payload and
+		// drops them. Verified by the dry-run + transport
+		// integration tests.
+		Headers: msg.Headers,
 	})
 	if err != nil {
 		return fmt.Errorf("mail: resend: marshal: %w", err)
@@ -120,14 +134,13 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 	// Message.MessageID. The dunning + quota-warning senders
 	// derive a stable id from (account_id, template, day) so an
 	// HTTP-level retry never sends twice.
+	//
+	// Caller-supplied extra headers (List-Unsubscribe, etc.) are
+	// delivered via the JSON body above — Resend's API drops
+	// custom HTTP request headers, so the right channel is the
+	// `headers` field on the JSON payload.
 	if msg.MessageID != "" {
 		req.Header.Set("Idempotency-Key", msg.MessageID)
-	}
-	// Caller-supplied extra headers win last so they can override
-	// anything (e.g. List-Unsubscribe on the quota-warning
-	// template). pkg/mail/headers.go builds these.
-	for k, v := range msg.Headers {
-		req.Header.Set(k, v)
 	}
 
 	resp, err := s.cfg.HTTPClient.Do(req)
