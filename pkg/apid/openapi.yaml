@@ -2492,7 +2492,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","deployment_id":"0123456789abcdef0123456789abcdef","status":"running","commit_sha":"abc1234","created_at":"2026-07-23T11:25:00Z","finished_at":"2026-07-23T11:26:00Z","source_bytes":12345678}
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","kind":"tarball","status":"pending","created_at":"2026-08-29T11:25:00Z"}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/SourceEgressDenied' }
@@ -2538,7 +2538,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","deployment_id":"0123456789abcdef0123456789abcdef","status":"running","commit_sha":"0123456789abcdef0123456789abcdef01234567","created_at":"2026-07-23T11:25:00Z","finished_at":null,"source_bytes":12345678}
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","kind":"github","status":"pending","created_at":"2026-08-29T11:25:00Z"}
         '400':
           description: |
             code: invalid_ref | validation_failed. ref must be a 40-char
@@ -3036,7 +3036,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","deployment_id":"0123456789abcdef0123456789abcdef","status":"running","commit_sha":"abc1234","created_at":"2026-07-23T11:25:00Z","finished_at":"2026-07-23T11:26:00Z","source_bytes":12345678}
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","kind":"tarball","status":"pending","created_at":"2026-08-29T11:25:00Z"}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/RollbackTargetNotFound' }
@@ -4393,7 +4393,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","deployment_id":"0123456789abcdef0123456789abcdef","status":"running","commit_sha":"abc1234","created_at":"2026-07-23T11:25:00Z","finished_at":"2026-07-23T11:26:00Z","source_bytes":12345678}
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","kind":"tarball","status":"active","traffic_percent":100,"created_at":"2026-08-29T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
