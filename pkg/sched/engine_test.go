@@ -241,6 +241,15 @@ func (f *fakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopIn
 	return nil, nil
 }
 
+// StopInstanceOnNode (M-2 / ADR-138 §Decision 1) is the routed
+// shape — same no-op default as StopInstance. The engine's
+// worker/job dispatch calls e.vmm.StopInstanceOnNode; the
+// service/request paths use snapshotAndPark and never invoke
+// either method.
+func (f *fakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) {
+	return nil, nil
+}
+
 // FrameworkReady implements VMM for the engine-test fake (issue #470 /
 // PR #470-FU-B). The cmd/vmmd DGRAM host recv loop calls this on every
 // "framework ready" signal; the engine paths use it indirectly via

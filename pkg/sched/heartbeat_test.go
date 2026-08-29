@@ -122,6 +122,7 @@ func (h *heartbeatFakeVMM) Destroy(context.Context, string) error { return nil }
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (h *heartbeatFakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
+	func (h *heartbeatFakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
 
 // FrameworkReady implements RoutedVMM for the heartbeat test fake
 // (issue #470 / PR #470-FU-B). The heartbeat loop only exercises

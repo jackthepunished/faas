@@ -61,6 +61,7 @@ func (f *fakeWakeVMM) Destroy(_ context.Context, _, _ string) error { return nil
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (f *fakeWakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
+	func (f *fakeWakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
 
 // FrameworkReady implements RoutedVMM for the cron-loop test fake
 // (issue #470 / PR #470-FU-B). No-op — the cron tests don't drive

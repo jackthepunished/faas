@@ -149,6 +149,7 @@ func (r *recordingRouterVMM) Destroy(context.Context, string, string) error { re
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (r *recordingRouterVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
+	func (r *recordingRouterVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
 
 // FrameworkReady implements RoutedVMM for the egress-drift test
 // fake (issue #470 / PR #470-FU-B). No-op — the egress-drift

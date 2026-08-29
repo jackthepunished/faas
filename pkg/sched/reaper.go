@@ -301,6 +301,16 @@ func ReapIdle(now time.Time, instances []InstanceInfo, metrics *wire.OpsMetrics,
 		if in.WorkloadClass == state.WorkloadClassWorker {
 			continue
 		}
+		// M-2 / ADR-137 §Decision 1: execution_mode='worker' rows
+		// are reaper-exempt regardless of WorkloadClass. Customers
+		// can declare a worker via either the apps.metadata
+		// `_execution_mode` field (M-2) or the scan-derived
+		// WorkloadClass (ADR-051 PR-D). The two predicates OR;
+		// the broader the better — a worker declared one way
+		// should be exempt whether the other label is set or not.
+		if state.InstanceMode(in.Mode) == state.InstanceModeWorker {
+			continue
+		}
 		// Issue #72 / ADR-125: mode='mirror' rows are
 		// reaper-exempt. The mirror goroutine parks the instance
 		// on request completion (or timeout), so there's no idle
@@ -465,6 +475,13 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		// extra = running - 1 (limit = max(floor, 0+1)) and want to
 		// park everything above the first. We don't want that.
 		if in.WorkloadClass == state.WorkloadClassWorker {
+			continue
+		}
+		// M-2 / ADR-137 §Decision 1: execution_mode='worker' rows
+		// are reaper-exempt under autoscale pressure too. Same
+		// OR semantics as the idle branch above — workers declared
+		// via either axis are skipped.
+		if state.InstanceMode(in.Mode) == state.InstanceModeWorker {
 			continue
 		}
 		g, ok := byApp[in.AppID]

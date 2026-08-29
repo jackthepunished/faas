@@ -64,6 +64,24 @@ import (
 // equality check inside loadNodeSigningKey.
 func ellipticP256() elliptic.Curve { return elliptic.P256() }
 
+// signalAdapter (M-2 / ADR-138 §Decision 1) wraps *fcvm.Manager
+// so the gRPC surface can take int32 (the wire shape — every
+// language binding sees int32) while the underlying Manager
+// uses syscall.Signal (the kernel shape). All other Manager
+// methods are inherited via embedding; only SignalAndKill
+// needs the int32→syscall.Signal translation. The adapter is
+// intentionally minimal — a single-method wrapper that keeps
+// Manager's public API syscall-typed (matches the fcvm
+// package's kernel-shaped idiom) without leaking the wire
+// type into fcvm.
+type signalAdapter struct {
+	*fcvm.Manager
+}
+
+func (a signalAdapter) SignalAndKill(ctx context.Context, instance string, signal int32, graceSeconds int32) (bool, int32, error) {
+	return a.Manager.SignalAndKill(ctx, instance, syscall.Signal(signal), time.Duration(graceSeconds)*time.Second)
+}
+
 // defaultNodeKeyPath is the canonical location for the slice-3
 // node signing key (ADR-053). Mirrors DefaultSignKeyPath from
 // pkg/cosign but lives under the vmmd-specific secrets dir so a
@@ -1090,7 +1108,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
 	)...)
-	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(mgr, ops, fcVersion, log, cpuCache, netCache, activityTracker).
+	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(signalAdapter{mgr}, ops, fcVersion, log, cpuCache, netCache, activityTracker).
 		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{}))
 	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
 	// on the gRPC server. vmmd is the corroborating-observation

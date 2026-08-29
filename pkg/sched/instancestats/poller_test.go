@@ -131,6 +131,7 @@ func (v *statsFakeVMM) Destroy(context.Context, string) error { return nil }
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (v *statsFakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*sched.StopInstanceOutcome, error) { return nil, nil }
+	func (v *statsFakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*sched.StopInstanceOutcome, error) { return nil, nil }
 
 // UpdateEgressAllowlist (tier-2 PR-B) — instancestats tests don't
 // drive the egress drift path; egress_drift_test.go covers it.

@@ -102,6 +102,7 @@ func (r *deploymentFilterFakeVMM) Destroy(context.Context, string, string) error
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (r *deploymentFilterFakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
+	func (r *deploymentFilterFakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
 
 // FrameworkReady implements RoutedVMM for the logs-filter test
 // fake (issue #470 / PR #470-FU-B). No-op — the logs-filter tests

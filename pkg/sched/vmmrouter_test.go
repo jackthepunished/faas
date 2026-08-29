@@ -74,6 +74,7 @@ func (f *fakeRouterVMM) Destroy(_ context.Context, instance string) error {
 	// the engine's per-mode dispatch lives in
 	// pkg/sched/engine_stop_pgtest_test.go (commit 6).
 	func (f *fakeRouterVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
+	func (f *fakeRouterVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*StopInstanceOutcome, error) { return nil, nil }
 
 // FrameworkReady implements VMM (issue #470 / PR #470-FU-B). The
 // vmmrouter_test fake is for the per-node dial-cache contract; the

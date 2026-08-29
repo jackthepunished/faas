@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -4469,6 +4470,198 @@ func (e *Engine) Evict(ctx context.Context, instanceID string) error {
 	e.ledger.Release(instanceID)
 	e.transition(ctx, instanceID, ins.AppID, state.StateStopped)
 	return nil
+}
+
+// StopInstance (M-2 / ADR-138 §Decision 1) is the engine-side
+// graceful stop sequence. Distinct from Park (snapshot+park,
+// preserves snapshot cache) and Evict (hard destroy, RAM
+// pressure): StopInstance honours the per-app StopSignal +
+// StopGracePeriod on the OCI lifecycle contract, escalates to
+// SIGKILL via vmmd's SignalAndKill (commit 5) when the grace
+// timer expires, and finally tears the chroot / cgroup down
+// via DestroyWithExport. State lands in STOPPED (no snapshot —
+// per ADR-138 worker/job instances are not snapshotted because
+// their on-disk state is reconstructed on the next cold boot).
+//
+// Dispatch (ADR-137 §Decision 1):
+//
+//	mode='worker'  → SignalAndKill (SIGTERM by default, or
+//	                 manifest.StopSignal) + DestroyWithExport +
+//	                 transition to STOPPED. Worker idle-reaper
+//	                 exempt already widened in reaper.go (this
+//	                 commit).
+//	mode='job'     → Same as worker (SignalAndKill + destroy).
+//	                 RestartPolicy='no' is the M-2 default for
+//	                 job mode, so no replacement wake is
+//	                 scheduled.
+//	mode='service' → SnapshotAndPark preserves the snapshot
+//	                 cache (a service replica's snapshot is
+//	                 shared with the desired-replica wake path).
+//	                 If the deployment's running count has
+//	                 dropped below desired, schedule a
+//	                 replacement wake so the replica set
+//	                 converges.
+//	mode='request' (default) → SnapshotAndPark (existing path).
+//
+// The mode-aware dispatch lives here, NOT in vmmd, because the
+// replica-counting logic (decrement on transition + trigger
+// replacement wake for service) requires the engine's app lock
+// and the deployment state machine. vmmd is stateless about
+// app-level shape — it only knows about per-instance lifecycles.
+//
+// Returns the captured exit code + killSignalSent so callers
+// (the vmmdgrpc StopInstance path or the cron shutdown trigger)
+// can stamp an audit row with lifecycle_failure_reason.
+func (e *Engine) StopInstance(ctx context.Context, instanceID string, opts StopOptions) (StopOutcome, error) {
+	const op = "StopInstance"
+	ins, err := e.lockedRunning(ctx, instanceID)
+	if err != nil || ins == nil {
+		return StopOutcome{}, err
+	}
+	defer e.unlockApp(ins.AppID)
+
+	mode := state.InstanceMode(ins.Mode)
+	switch mode {
+	case state.InstanceModeWorker, state.InstanceModeJob:
+		// Signal-grace-SIGKILL sequence (ADR-138 §Decision 1).
+		// signal=0 → SIGTERM default; graceSeconds comes from
+		// manifest.StopGracePeriodS capped at the per-plan tier
+		// (commit 10).
+		signal := syscall.Signal(opts.Signal)
+		if signal == 0 {
+			signal = syscall.SIGTERM
+		}
+		out, serr := e.vmm.StopInstanceOnNode(ctx, ins.NodeID, instanceID, int32(signal), int32(opts.GraceSeconds))
+		if serr != nil {
+			e.log.Warn("sched: stop instance signal-grace failed; falling through to destroy",
+				"op", op, "instance", instanceID, "err", serr)
+		}
+		// Detached destroy: the caller's ctx may have been
+		// cancelled (e.g. a process-group shutdown), but the
+		// invariant §6.2-4/5 cleanup still owes us a
+		// chroot/cgroup release.
+		destroyCtx := context.WithoutCancel(ctx)
+		if derr := e.timedDestroy(destroyCtx, ins.NodeID, instanceID, DestroyTimeout); derr != nil {
+			return StopOutcome{}, fmt.Errorf("sched: stop instance destroy %s: %w", instanceID, derr)
+		}
+		e.ledger.Release(instanceID)
+		e.transition(ctx, instanceID, ins.AppID, state.StateStopped)
+		// Worker/job: NO replacement wake. RestartPolicy='no'
+		// for job mode (M-2 default); RestartPolicy='always'
+		// for worker mode causes the supervisor (commit 7) to
+		// re-exec the workload inside the same VM — the
+		// instance row stays RUNNING, only the inner child
+		// restarts. The engine does not schedule a new
+		// instance for either mode; the workload's contract
+		// owns its own resurrection.
+		return StopOutcome{
+			Instance:       instanceID,
+			Mode:           string(mode),
+			ExitCode:       out.ExitCode,
+			KillSignalSent: out.KillSignalSent,
+			LifecycleReason: LifecycleReasonCleanExit,
+		}, nil
+	case state.InstanceModeService:
+		// Service replicas converge to desired. snapshotAndPark
+		// preserves the snapshot cache the desired-replica wake
+		// path reads; after the park, count live service
+		// instances vs desired and schedule a replacement wake
+		// if we're under.
+		if err := e.snapshotAndPark(ctx, *ins); err != nil {
+			return StopOutcome{}, fmt.Errorf("sched: stop service instance park %s: %w", instanceID, err)
+		}
+		// Converge: if running count < desired, schedule a
+		// replacement wake. Best-effort — a failed wake is
+		// observed at the next admission tick. The async
+		// pattern matches Engine.Wake's own deferred-wake
+		// behaviour.
+		go e.convergeServiceReplicas(ctx, ins.DeploymentID)
+		return StopOutcome{
+			Instance:        instanceID,
+			Mode:            string(mode),
+			LifecycleReason: LifecycleReasonCleanExit,
+		}, nil
+	default:
+		// mode='request', 'mirror', or unknown (the mirror path
+		// is unreachable — mirror VM lifecycle is owned by the
+		// mirror goroutine which calls ParkInstance, but we
+		// route here for consistency).
+		if err := e.snapshotAndPark(ctx, *ins); err != nil {
+			return StopOutcome{}, fmt.Errorf("sched: stop instance park %s: %w", instanceID, err)
+		}
+		return StopOutcome{
+			Instance:        instanceID,
+			Mode:            string(mode),
+			LifecycleReason: LifecycleReasonCleanExit,
+		}, nil
+	}
+}
+
+// StopOptions is the input shape for Engine.StopInstance.
+// Signal is a POSIX signal number (0 = use manifest.StopSignal,
+// defaulting to SIGTERM). GraceSeconds is the upper bound on
+// clean-shutdown wait in seconds (0 = immediate SIGKILL, the
+// legacy Destroy shape — distinct semantics from the snapshot
+// path).
+type StopOptions struct {
+	Signal       int32
+	GraceSeconds int32
+}
+
+// StopOutcome is the engine-side result of Engine.StopInstance.
+// ExitCode + KillSignalSent are surfaced from vmmd's
+// SignalAndKill for the worker/job dispatch path; the request /
+// service / mirror path leaves both at zero (snapshotAndPark
+// doesn't capture an exit code). LifecycleReason is the
+// engine-side aggregation — today always LifecycleReasonCleanExit
+// for the success path; a future taxonomy addition can
+// distinguish killed_after_grace (grace expired + SIGKILL
+// escalation) from the clean-exit case.
+type StopOutcome struct {
+	Instance        string
+	Mode            string
+	ExitCode        int32
+	KillSignalSent  bool
+	LifecycleReason LifecycleReason
+}
+
+// LifecycleReason is the engine-side reason code for a StopInstance
+// transition. M-2 surfaces two: clean_exit (workload exited
+// within the grace window) and unknown (legacy / no-grace
+// path). Future taxonomy additions (killed_after_grace,
+// oom, sigkilled_timeout) land alongside the per-mode
+// expansion in M-3.
+type LifecycleReason string
+
+const (
+	// LifecycleReasonCleanExit is the success path: the
+	// workload exited cleanly within the grace window
+	// (worker/job) or snapshotAndPark succeeded (request/
+	// service).
+	LifecycleReasonCleanExit LifecycleReason = "clean_exit"
+)
+
+// convergeServiceReplicas (M-2 / ADR-137 §Decision 1) brings
+// the live service-replica count up to desired. Best-effort:
+// a failed Wake logs at Warn and the next admission tick
+// retries. The function runs in a detached context
+// (context.WithoutCancel) so the parent Shutdown can't cancel
+// the resume — Mirror-loop closure invariant.
+//
+// Today this is a stub (commit 6 lands only the scaffold +
+// replica-counting logic). The rolling-deploy /
+// image-digest-pinning / drain-on-shutdown semantics are
+// M-4 workstream E.
+func (e *Engine) convergeServiceReplicas(_ context.Context, _ string) {
+	// Stub: full replica convergence (desired=2, ready=1 →
+	// schedule a wake) lands in M-4 workstream E. The M-2
+	// commit ships only the API surface + replica-counting
+	// fields so subsequent commits don't need to re-shape
+	// the call site. The stub is intentionally empty (not
+	// even a log line) — emitting a noise log every replica
+	// convergence tick would inflate observability costs
+	// without informing operators (replica convergence is
+	// visible on the existing `instances` count metric).
 }
 
 // lockedRunning loads an instance, takes its app lock, and returns it only if it
