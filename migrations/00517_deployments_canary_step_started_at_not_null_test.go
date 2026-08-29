@@ -1,6 +1,6 @@
-// migrations/00494_deployments_canary_step_started_at_not_null_test.go —
+// migrations/00517_deployments_canary_step_started_at_not_null_test.go —
 // pins the SAFE-RELEASES code-review hardening of the canary
-// wall-clock gate. Migration 00494 backfills NULL
+// wall-clock gate. Migration 00517 backfills NULL
 // canary_step_started_at to COALESCE(created_at, NOW()), locks the
 // column as NOT NULL, and stamps a NOW() default so future INSERT
 // paths that omit the column still get a meaningful (non-zero)
@@ -11,8 +11,8 @@
 // set FAAS_SKIP_PG_TESTS=1 locally to skip.
 //
 // Asserts:
-//   1. The migration set applies cleanly through 00494 (and lands
-//      00494 last).
+//   1. The migration set applies cleanly through 00517 (and lands
+//      00517 last).
 //   2. The canary_step_started_at column is NOT NULL with a NOW()
 //      DEFAULT — the DEFAULT is the belt-and-braces that keeps
 //      the wall-clock gate honest when a future write path forgets
@@ -40,13 +40,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00494_CanaryStepStartedAtNotNull(t *testing.T) {
+func TestMigrations_00517_CanaryStepStartedAtNotNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00494 should land last.
+	// (1) Run the full migration set. 00517 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00494)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00517)", err)
 	}
 
 	// (2) Column nullable rule + DEFAULT presence on canary_step_started_at.
@@ -78,7 +78,7 @@ func TestMigrations_00494_CanaryStepStartedAtNotNull(t *testing.T) {
 		values ($1, $2, 'live', 'git', 'def5678', NULL)`,
 		uuid.New().String(), uuid.New().String())
 	if insertErr == nil {
-		t.Errorf("insert with NULL canary_step_started_at must fail post-00494 (NOT NULL violation); got nil")
+		t.Errorf("insert with NULL canary_step_started_at must fail post-00517 (NOT NULL violation); got nil")
 	}
 	// pgtest surfaces the SQLSTATE in err.Error() — 23502 is the
 	// standard NOT NULL violation. We don't pin the exact error

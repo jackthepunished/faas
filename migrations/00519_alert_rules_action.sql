@@ -1,4 +1,4 @@
--- filename: 00496_alert_rules_action.sql
+-- filename: 00519_alert_rules_action.sql
 -- +goose Up
 -- +goose StatementBegin
 

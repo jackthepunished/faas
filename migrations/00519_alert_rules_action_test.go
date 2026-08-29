@@ -1,4 +1,4 @@
-// migrations/00496_alert_rules_action_test.go — pins the shape
+// migrations/00519_alert_rules_action_test.go — pins the shape
 // of the action column on alert_rules (issue #976 / ADR-122 /
 // SAFE-RELEASES-B). Build tag mirrors the precedent at
 // migrations/00410_app_secret_value_hash_test.go; set
@@ -26,7 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00496_AlertRulesAction(t *testing.T) {
+func TestMigrations_00519_AlertRulesAction(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

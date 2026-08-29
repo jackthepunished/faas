@@ -798,9 +798,9 @@ type OpsMetrics struct {
 	// vocabulary — unknown reasons drop to the no-op closure.
 	canaryProgressionErrorsTotal *prometheus.CounterVec
 	// canaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
-	// hardening, migration 00494) counts every row the
+	// hardening, migration 00517) counts every row the
 	// canary_progression tick walks whose canary_step_started_at is
-	// the zero time. Post-00494 the column is NOT NULL DEFAULT NOW(),
+	// the zero time. Post-00517 the column is NOT NULL DEFAULT NOW(),
 	// so this counter should never fire in steady state; a non-zero
 	// rate is the tripwire for "a write path bypassed the apid Create
 	// handler and left the column at the zero value" — exactly the
@@ -2458,9 +2458,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, reason := range []string{"patch_traffic", "append_audit", "list_in_flight"} {
 		canaryProgressionErrorsTotal.WithLabelValues(reason)
 	}
-	// SAFE-RELEASES code-review hardening (migration 00494):
+	// SAFE-RELEASES code-review hardening (migration 00517):
 	// tripwire counter for the canary_progression tick seeing a
-	// zero canary_step_started_at. Post-00494 the column is NOT NULL
+	// zero canary_step_started_at. Post-00517 the column is NOT NULL
 	// DEFAULT NOW(), so a non-zero rate means a write path bypassed
 	// the schema default — exactly the silent-soak-bypass hole
 	// finding #1 was worried about. Unlabelled (fleet rollup; per-
@@ -2468,7 +2468,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// row).
 	canaryProgressionZeroTimestampTotal := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_canary_progression_zero_timestamp_total",
-		Help: "Count of canary_progression tick rows whose canary_step_started_at was the zero time (post-00494 the column is NOT NULL DEFAULT NOW(), so a non-zero rate is the tripwire for a write path bypassing the apid CreateDeployment stamp). Unlabelled — fleet-level rollup.",
+		Help: "Count of canary_progression tick rows whose canary_step_started_at was the zero time (post-00517 the column is NOT NULL DEFAULT NOW(), so a non-zero rate is the tripwire for a write path bypassing the apid CreateDeployment stamp). Unlabelled — fleet-level rollup.",
 	})
 	alertDeliveryAttemptsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_alert_delivery_attempts_total",
@@ -6150,9 +6150,9 @@ func (m *OpsMetrics) CanaryProgressionAdvancedTotal() func() {
 }
 
 // CanaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
-// hardening, migration 00494) increments the canary-progression
+// hardening, migration 00517) increments the canary-progression
 // tripwire counter every time the meterd tick walks a row whose
-// canary_step_started_at is the zero time. Post-00494 the column is
+// canary_step_started_at is the zero time. Post-00517 the column is
 // NOT NULL DEFAULT NOW(), so a non-zero rate means a write path
 // bypassed the schema default — exactly the silent-soak-bypass hole
 // code-review finding #1 was worried about. Behaviour on zero is

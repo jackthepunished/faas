@@ -134,9 +134,9 @@ type Stats struct {
 	Aborted       int // pending/rolling_out → aborted (manual CLI; orchestrator doesn't auto-abort)
 	StuckDetected int // rolling_out rows whose canary_step_started_at is older than StuckAfterDuration
 	// StuckCheckMissingTimestamp (SAFE-RELEASES code-review hardening,
-	// migration 00494) counts rolling_out rows the orchestrator walked
-	// where CanaryStepStartedAt was nil — pre-00494 a nullable
-	// canary_step_started_at was legal, but post-00494 the column is
+	// migration 00517) counts rolling_out rows the orchestrator walked
+	// where CanaryStepStartedAt was nil — pre-00517 a nullable
+	// canary_step_started_at was legal, but post-00517 the column is
 	// NOT NULL DEFAULT NOW(), so a non-zero rate means a write path
 	// bypassed the schema default. The orchestrator skips the stuck
 	// check for these rows (no timestamp → no comparison possible) and
@@ -217,8 +217,8 @@ func (o *Orchestrator) walkRow(ctx context.Context, d state.Deployment, now time
 		// Stats.StuckDetected) but do NOT auto-recover — the
 		// operator CLI is the manual escape hatch (Commit 6).
 		//
-		// SAFE-RELEASES code-review hardening (migration 00494):
-		// post-00494 CanaryStepStartedAt is NOT NULL DEFAULT NOW(),
+		// SAFE-RELEASES code-review hardening (migration 00517):
+		// post-00517 CanaryStepStartedAt is NOT NULL DEFAULT NOW(),
 		// so the nil branch below should never fire in steady state.
 		// A non-zero Stats.StuckCheckMissingTimestamp count is the
 		// tripwire for "a write path bypassed the apid CreateDeployment
@@ -236,14 +236,14 @@ func (o *Orchestrator) walkRow(ctx context.Context, d state.Deployment, now time
 				return
 			}
 		} else {
-			// Post-00494 this branch is unreachable in steady state
+			// Post-00517 this branch is unreachable in steady state
 			// (the column is NOT NULL DEFAULT NOW()). Belt-and-braces
 			// for a future write path that bypasses the schema default
 			// — without this log + counter, the orchestrator would
 			// silently fall through to the 'healthy in-flight row'
 			// branch with no operator visibility. Mirrors the
 			// pkg/canary.Once defensive guard at preset.go:226.
-			o.Log.Warn("safedeploy: rolling_out row has nil canary_step_started_at; skipping stuck check (post-00494 schema default should prevent this)",
+			o.Log.Warn("safedeploy: rolling_out row has nil canary_step_started_at; skipping stuck check (post-00517 schema default should prevent this)",
 				"deployment_id", d.ID, "app_id", d.AppID,
 				"canary_step", d.CanaryStep, "canary_total_steps", d.CanaryTotalSteps)
 			stats.StuckCheckMissingTimestamp++

@@ -4237,7 +4237,7 @@ func TestPg_DeploymentOrdinal(t *testing.T) {
 		// partial unique index (migration 00213) caps each (app_id, scope) at one
 		// live row. The ordinal query doesn't depend on status; we only need
 		// distinct rows for the test.
-		// canary_step_started_at is NOT NULL post-00494; stamp it to the
+		// canary_step_started_at is NOT NULL post-00517; stamp it to the
 		// row's created_at so the ordinal walk has a stable timestamp
 		// and the wall-clock gate readers (pkg/canary.Once, pkg/safedeploy.
 		// Orchestrator) skip it via the predicate before consulting it.

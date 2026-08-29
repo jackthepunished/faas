@@ -1,4 +1,4 @@
--- filename: 00494_deployments_canary_step_started_at_not_null.sql
+-- filename: 00517_deployments_canary_step_started_at_not_null.sql
 -- +goose Up
 -- +goose StatementBegin
 
