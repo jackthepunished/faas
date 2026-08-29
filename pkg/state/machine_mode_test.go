@@ -25,8 +25,8 @@ func TestIsMeteredSkippableMode(t *testing.T) {
 		{"worker", false},
 		{"service", false},
 		{"job", false},
-		{"", false},           // empty defaults to non-skip
-		{"bogus", false},      // unknown mode is not skipped (fail-open at the meter layer; CHECK is the load-bearing defence)
+		{"", false},      // empty defaults to non-skip
+		{"bogus", false}, // unknown mode is not skipped (fail-open at the meter layer; CHECK is the load-bearing defence)
 	}
 	for _, tt := range tests {
 		t.Run(tt.mode, func(t *testing.T) {

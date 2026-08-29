@@ -70,10 +70,10 @@ const (
 // decodes a frame, asserts each field, and pins the wire
 // shape.
 type HealthcheckReport struct {
-	Seq       uint32 // monotonic; 0-based
-	Status    byte   // healthcheckStatus*
-	Output    []byte // ≤ VsockHealthcheckMaxOutput bytes
-	TsUnixMs  int64  // guest-side stamp
+	Seq      uint32 // monotonic; 0-based
+	Status   byte   // healthcheckStatus*
+	Output   []byte // ≤ VsockHealthcheckMaxOutput bytes
+	TsUnixMs int64  // guest-side stamp
 	// StartPeriodS is the StartPeriodS value from the manifest,
 	// used by the host to decide whether this fail counts as a
 	// "starting" or a real failure. Mirrored per ADR-139

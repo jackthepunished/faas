@@ -36,11 +36,11 @@ import (
 type recordingStopVMM struct {
 	*fakeVMM
 
-	mu                    sync.Mutex
-	stopInstanceOnNodeN   int
-	stopSignalLast        int32
-	stopGraceLast         int32
-	destroyWithExportN    int
+	mu                  sync.Mutex
+	stopInstanceOnNodeN int
+	stopSignalLast      int32
+	stopGraceLast       int32
+	destroyWithExportN  int
 }
 
 func (r *recordingStopVMM) StopInstanceOnNode(_ context.Context, _, _ string, signal int32, grace int32) (*StopInstanceOutcome, error) {

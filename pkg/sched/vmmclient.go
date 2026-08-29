@@ -624,9 +624,9 @@ func (c *VMMClient) Destroy(ctx context.Context, instance string) error {
 // = clean_exit vs killed_after_grace.
 func (c *VMMClient) StopInstance(ctx context.Context, instance string, signal int32, graceSeconds int32) (*StopInstanceOutcome, error) {
 	resp, err := c.cli.StopInstance(ctx, &vmmdpb.StopInstanceRequest{
-		Instance:      instance,
-		Signal:        signal,
-		GracePeriodS:  graceSeconds,
+		Instance:     instance,
+		Signal:       signal,
+		GracePeriodS: graceSeconds,
 	})
 	if err != nil {
 		return nil, liftErr(err)

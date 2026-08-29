@@ -152,7 +152,9 @@ func (f *fakeVMM) DestroyWithExport(ctx context.Context, instance, exportDir str
 // Behavioural coverage lives in pkg/fcvm/vmm_signal_kill_test.go
 // (portable) and the //go:build metal test
 // pkg/fcvm/vmm_signal_kill_metal_test.go.
-func (f *fakeVMM) SignalAndKill(_ context.Context, _ string, _ int32, _ int32) (bool, int32, error) { return false, 0, nil }
+func (f *fakeVMM) SignalAndKill(_ context.Context, _ string, _ int32, _ int32) (bool, int32, error) {
+	return false, 0, nil
+}
 
 func (f *fakeVMM) ExportDirFor(instance string) string {
 	if f.exportDirFn != nil {

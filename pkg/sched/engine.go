@@ -4555,10 +4555,10 @@ func (e *Engine) StopInstance(ctx context.Context, instanceID string, opts StopO
 		// instance for either mode; the workload's contract
 		// owns its own resurrection.
 		return StopOutcome{
-			Instance:       instanceID,
-			Mode:           string(mode),
-			ExitCode:       out.ExitCode,
-			KillSignalSent: out.KillSignalSent,
+			Instance:        instanceID,
+			Mode:            string(mode),
+			ExitCode:        out.ExitCode,
+			KillSignalSent:  out.KillSignalSent,
 			LifecycleReason: LifecycleReasonCleanExit,
 		}, nil
 	case state.InstanceModeService:
