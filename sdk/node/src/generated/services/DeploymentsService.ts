@@ -166,8 +166,20 @@ export class DeploymentsService {
    * - `tarball` (required): the gzipped tar, capped at the
    * per-plan `SourceTarballMaxMB`.
    * - `sidecar` (optional): JSON `{repo, ref}` recorded on
-   * the build row for provenance; the build pipeline does
-   * NOT use it to fetch upstream.
+   * the build row for provenance only. The build pipeline
+   * does NOT use the sidecar to fetch upstream — the tarball
+   * bytes are the build source, and the sidecar is purely
+   * informational. Operators relying on source-pinning MUST
+   * use the source-ref path instead.
+   *
+   * Lifecycle (issue #1182 fix): the refactored zero-config
+   * CLI path runs `POST /v1/apps` (CreateApp) BEFORE this endpoint,
+   * so a brand-new slug gets a 201 from CreateApp and a 202 from
+   * this endpoint. A direct hit on this endpoint with a slug that
+   * has never been created returns 404 — pre-#1182 zero-config
+   * customers hit this with "no such app"; the fix folds the
+   * path through CreateApp so the slug always exists by the time
+   * this endpoint is reached.
    *
    * Audit kind: `deploy.local_tarball` (distinct from
    * `deploy.source_ref`).
@@ -211,6 +223,16 @@ export class DeploymentsService {
         sidecar JSON, or invalid tarball shape.
         `,
         401: `code: unauthorized`,
+        404: `code: not_found. The slug does not exist OR belongs to
+        another account (loadAppAndPreflight's IDOR silent-404 —
+        apid deliberately returns the same shape for both cases
+        to avoid leaking the existence of other customers'
+        apps). The refactored zero-config CLI path (issue #1182)
+        runs CreateApp before this endpoint, so a slug should
+        always exist by the time the request lands here; a 404
+        on the CLI path is the symptom of a misconfigured
+        --name pointing at a row the caller doesn't own.
+        `,
         413: `code: source_too_large`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).

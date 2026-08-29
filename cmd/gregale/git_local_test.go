@@ -9,7 +9,10 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,34 +22,45 @@ import (
 
 func TestParseGitRemoteURL(t *testing.T) {
 	cases := []struct {
-		name      string
-		input     string
-		wantOwner string
-		wantRepo  string
-		wantErr   bool
+		name          string
+		input         string
+		wantOwner     string
+		wantRepo      string
+		wantErr       bool
+		wantSoftEmpty bool // non-GitHub URL → ("", "", nil) — caller falls through
 	}{
-		// Accepted forms.
-		{"ssh with .git", "git@github.com:o/r.git", "o", "r", false},
-		{"ssh without .git", "git@github.com:o/r", "o", "r", false},
-		{"https with .git", "https://github.com/o/r.git", "o", "r", false},
-		{"https without .git", "https://github.com/o/r", "o", "r", false},
-		{"http form", "http://github.com/o/r.git", "o", "r", false},
-		{"uppercase normalized", "git@github.com:OWNER/REPO.git", "owner", "repo", false},
-		{"with whitespace", "  git@github.com:o/r.git  ", "o", "r", false},
+		// Accepted GitHub forms.
+		{"ssh with .git", "git@github.com:o/r.git", "o", "r", false, false},
+		{"ssh without .git", "git@github.com:o/r", "o", "r", false, false},
+		{"ssh explicit scheme", "ssh://git@github.com/o/r.git", "o", "r", false, false},
+		{"ssh explicit scheme no user", "ssh://github.com/o/r.git", "o", "r", false, false},
+		{"ssh explicit with port", "ssh://git@github.com:22/o/r.git", "o", "r", false, false},
+		{"https with .git", "https://github.com/o/r.git", "o", "r", false, false},
+		{"https without .git", "https://github.com/o/r", "o", "r", false, false},
+		{"https with userinfo", "https://token@github.com/o/r.git", "o", "r", false, false},
+		{"https with user:pass userinfo", "https://user:pass@github.com/o/r.git", "o", "r", false, false},
+		{"http form", "http://github.com/o/r.git", "o", "r", false, false},
+		{"uppercase normalized", "git@github.com:OWNER/REPO.git", "owner", "repo", false, false},
+		{"with whitespace", "  git@github.com:o/r.git  ", "o", "r", false, false},
 
-		// Rejected forms (v1 is GitHub-only).
-		{"empty", "", "", "", true},
-		{"whitespace-only", "   ", "", "", true},
-		{"gitlab ssh", "git@gitlab.com:o/r.git", "", "", true},
-		{"gitlab https", "https://gitlab.com/o/r.git", "", "", true},
-		{"bitbucket https", "https://bitbucket.org/o/r.git", "", "", true},
-		{"custom host ssh", "git@git.example.com:o/r.git", "", "", true},
-		{"custom host https", "https://git.example.com/o/r.git", "", "", true},
-		{"ssh scheme variant", "ssh://git@github.com/o/r.git", "", "", true},
-		{"missing repo", "git@github.com:o", "", "", true},
-		{"missing owner", "git@github.com:/r", "", "", true},
-		{"missing both", "git@github.com:", "", "", true},
-		{"too many slashes", "git@github.com:o/r/extra", "", "", true},
+		// Non-GitHub URLs: soft empty triple (caller falls through to
+		// the cwd-auto-pack branch instead of erroring — issue #1182).
+		{"gitlab ssh", "git@gitlab.com:o/r.git", "", "", false, true},
+		{"gitlab https", "https://gitlab.com/o/r.git", "", "", false, true},
+		{"bitbucket https", "https://bitbucket.org/o/r.git", "", "", false, true},
+		{"custom host ssh", "git@git.example.com:o/r.git", "", "", false, true},
+		{"custom host https", "https://git.example.com/o/r.git", "", "", false, true},
+		{"file scheme", "file:///path/to/repo", "", "", false, true},
+		{"git scheme", "git://github.com/o/r.git", "", "", false, true},
+
+		// Genuinely malformed GitHub URLs — hard error.
+		{"empty", "", "", "", true, false},
+		{"whitespace-only", "   ", "", "", true, false},
+		{"missing repo", "git@github.com:o", "", "", true, false},
+		{"missing owner", "git@github.com:/r", "", "", true, false},
+		{"missing both", "git@github.com:", "", "", true, false},
+		{"too many slashes", "git@github.com:o/r/extra", "", "", true, false},
+		{"https github no path", "https://github.com/", "", "", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -59,6 +73,13 @@ func TestParseGitRemoteURL(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("parseGitRemoteURL(%q): unexpected error: %v", tc.input, err)
+			}
+			if tc.wantSoftEmpty {
+				if owner != "" || repo != "" {
+					t.Fatalf("parseGitRemoteURL(%q) = (%q, %q); want soft empty triple",
+						tc.input, owner, repo)
+				}
+				return
 			}
 			if owner != tc.wantOwner || repo != tc.wantRepo {
 				t.Fatalf("parseGitRemoteURL(%q) = (%q, %q); want (%q, %q)",
@@ -288,4 +309,185 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, string(out))
 	}
+}
+
+// TestGitArchiveHEAD_HappyPath exercises the refactored zero-config
+// packer (issue #1182 §3.5): a temp git repo with a committed file
+// is archived to a temp path, the file is readable as a gzipped tar,
+// and the entry set contains the committed README.md. Pins that
+// `git archive HEAD -o <path>` produces a self-contained archive
+// the CLI can hand to the multipart writer without further
+// processing.
+func TestGitArchiveHEAD_HappyPath(t *testing.T) {
+	dir := initTestRepo(t)
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err != nil {
+		t.Fatalf("gitArchiveHEAD: %v", err)
+	}
+	f, err := os.Open(out) //nolint:forbidigo // test opens a tempfile path it just constructed via t.TempDir + filepath.Join
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	var found bool
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Next: %v", err)
+		}
+		if filepath.Base(hdr.Name) == "README.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("archive did not contain README.md entry")
+	}
+}
+
+// TestGitArchiveHEAD_EmptyRepo pins the empty-repo guard. A fresh
+// `git init` with no commits must return a non-nil error (the
+// rev-parse HEAD^{commit} pre-check). The caller surfaces this as
+// "no commits yet; commit something and try again".
+func TestGitArchiveHEAD_EmptyRepo(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err == nil {
+		t.Fatal("gitArchiveHEAD on empty repo should fail; got nil")
+	}
+	// out should not exist — the pre-check aborts before the archive
+	// command runs.
+	if _, err := os.Stat(out); err == nil {
+		t.Errorf("expected no archive on empty repo; file exists")
+	}
+}
+
+// TestGitArchiveHEAD_NotInRepo pins that running outside a git
+// working tree surfaces a non-nil error and does not produce a
+// spurious archive file at outPath.
+func TestGitArchiveHEAD_NotInRepo(t *testing.T) {
+	dir := t.TempDir() // no git init
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err == nil {
+		t.Fatal("gitArchiveHEAD outside a repo should fail; got nil")
+	}
+}
+
+// TestResolveZeroConfigProvenance exercises the bundle the refactored
+// zero-config path reads from. Pins the four return-contract cases:
+// ok=true with GitHub origin, ok=true with non-GitHub origin
+// (Owner/Repo empty), ok=false with ErrNotInGitRepo, and
+// ok=false with ErrNoGitRemote.
+func TestResolveZeroConfigProvenance(t *testing.T) {
+	t.Run("github_origin_clean", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil; got ok=%v err=%v", ok, err)
+		}
+		if prov.Owner != "o" || prov.Repo != "r" {
+			t.Errorf("got owner=%q repo=%q, want o/r", prov.Owner, prov.Repo)
+		}
+		if len(prov.SHA) != 40 {
+			t.Errorf("SHA %q is not 40 chars", prov.SHA)
+		}
+		if prov.Dirty {
+			t.Errorf("clean repo should report Dirty=false")
+		}
+		if prov.Root != dir {
+			t.Errorf("Root=%q want %q", prov.Root, dir)
+		}
+	})
+
+	t.Run("github_origin_dirty", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		// Add an untracked file → dirty.
+		if err := os.WriteFile(filepath.Join(dir, "scratch.txt"), []byte("hi"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil; got ok=%v err=%v", ok, err)
+		}
+		if !prov.Dirty {
+			t.Errorf("untracked-file repo should report Dirty=true")
+		}
+	})
+
+	t.Run("non_github_origin_soft_empty", func(t *testing.T) {
+		dir := initTestRepo(t)
+		mustGit(t, dir, "remote", "add", "origin", "git@gitlab.com:o/r.git")
+		prov, ok, err := resolveZeroConfigProvenance(dir)
+		if err != nil || !ok {
+			t.Fatalf("expected ok=true, err=nil for non-GitHub origin; got ok=%v err=%v", ok, err)
+		}
+		// Owner + Repo should be empty (caller still uses gitArchiveHEAD
+		// — just no provenance metadata on the deployment row).
+		if prov.Owner != "" || prov.Repo != "" {
+			t.Errorf("non-GitHub origin should produce empty owner/repo; got %q/%q",
+				prov.Owner, prov.Repo)
+		}
+	})
+
+	t.Run("no_origin_falls_through", func(t *testing.T) {
+		dir := initTestRepo(t) // initTestRepo adds no remote
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false for git repo without origin; got ok=true")
+		}
+		if !errors.Is(err, ErrNoGitRemote) {
+			t.Errorf("expected ErrNoGitRemote; got %v", err)
+		}
+	})
+
+	t.Run("not_in_repo", func(t *testing.T) {
+		dir := t.TempDir() // no git init
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false outside a repo; got ok=true")
+		}
+		if !errors.Is(err, ErrNotInGitRepo) {
+			t.Errorf("expected ErrNotInGitRepo; got %v", err)
+		}
+	})
+
+	t.Run("empty_repo", func(t *testing.T) {
+		// `git init` with no commit and no remote. Should fall through
+		// as ErrNoGitRemote (origin check fires first).
+		dir := t.TempDir()
+		mustGit(t, dir, "init", "-q")
+		_, ok, err := resolveZeroConfigProvenance(dir)
+		if ok {
+			t.Errorf("expected ok=false for empty repo with no origin; got ok=true")
+		}
+		if !errors.Is(err, ErrNoGitRemote) {
+			t.Errorf("expected ErrNoGitRemote; got %v", err)
+		}
+	})
+
+	t.Run("user_name_captured", func(t *testing.T) {
+		dir := initTestRepo(t)
+		// initTestRepo sets user.name=Test User via env vars; the helper
+		// reads `git config user.name` which falls through to the
+		// env-var-supplied value.
+		mustGit(t, dir, "remote", "add", "origin", "git@github.com:o/r.git")
+		prov, _, err := resolveZeroConfigProvenance(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if prov.DeployedBy != "Test User" {
+			t.Errorf("DeployedBy=%q want %q", prov.DeployedBy, "Test User")
+		}
+	})
 }

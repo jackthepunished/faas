@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1974,5 +1975,185 @@ func TestStreamDeployLogs_DrivesStageTicker(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "Deployed.") {
 		t.Errorf("stdout missing terminal 'Deployed.' line: %s", out)
+	}
+}
+
+// TestCreateOrFetchApp_HappyPath pins the no-conflict fast-path:
+// CreateApp succeeds, no GetApp round-trip, helper returns nil.
+func TestCreateOrFetchApp_HappyPath(t *testing.T) {
+	var sawGet bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a1", Slug: "ok-app"})
+		default:
+			if r.Method == http.MethodGet && r.URL.Path == "/v1/apps/ok-app" {
+				sawGet = true
+			}
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	c := NewClient(srv.URL, "fp_live_x")
+	if err := createOrFetchApp(context.Background(), c, api.CreateAppRequest{Slug: "ok-app"}, nil, nil); err != nil {
+		t.Fatalf("createOrFetchApp happy path = %v, want nil", err)
+	}
+	if sawGet {
+		t.Errorf("GetApp round-trip should not fire on a successful CreateApp")
+	}
+}
+
+// TestCreateOrFetchApp_409SameAccount_PATCHes pins the hybrid probe
+// same-account branch: CreateApp 409 → GetApp 200 → helper mirrors
+// --require-authn via PATCH (and --app-protocol, when set), then
+// returns nil. Critical contract for issue #560 / #1182.
+func TestCreateOrFetchApp_409SameAccount_PATCHes(t *testing.T) {
+	var sawGet, sawPatch, patchBodyOK bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: api.CodeConflict, Title: "Conflict", Detail: "app exists"})
+		case r.URL.Path == "/v1/apps/existing" && r.Method == http.MethodGet:
+			sawGet = true
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a-existing", Slug: "existing"})
+		case r.URL.Path == "/v1/apps/existing" && r.Method == http.MethodPatch:
+			sawPatch = true
+			var body api.UpdateAppRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if body.RequireAuthn != nil && *body.RequireAuthn && body.AppProtocol != nil && *body.AppProtocol == "http2" {
+					patchBodyOK = true
+				}
+			}
+			_ = json.NewEncoder(w).Encode(api.AppResponse{Slug: "existing", RequireAuthn: true})
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	c := NewClient(srv.URL, "fp_live_x")
+	requireAuthn := true
+	appProto := "http2"
+	if err := createOrFetchApp(context.Background(), c, api.CreateAppRequest{Slug: "existing"}, &requireAuthn, &appProto); err != nil {
+		t.Fatalf("createOrFetchApp same-account = %v, want nil", err)
+	}
+	if !sawGet {
+		t.Errorf("expected GetApp round-trip after CreateApp 409")
+	}
+	if !sawPatch {
+		t.Errorf("expected UpdateApp PATCH to mirror --require-authn / --app-protocol on existing app")
+	}
+	if !patchBodyOK {
+		t.Errorf("UpdateApp body did not carry require_authn=true and app_protocol=http2")
+	}
+}
+
+// TestCreateOrFetchApp_409SameAccount_NoFlagsNoPATCH pins that the
+// helper does NOT issue an UpdateApp PATCH when neither --require-authn
+// nor --app-protocol was set (preserve the previous no-op behaviour).
+func TestCreateOrFetchApp_409SameAccount_NoFlagsNoPATCH(t *testing.T) {
+	var sawPatch bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: api.CodeConflict, Title: "Conflict"})
+		case r.URL.Path == "/v1/apps/existing" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a-existing", Slug: "existing"})
+		case r.URL.Path == "/v1/apps/existing" && r.Method == http.MethodPatch:
+			sawPatch = true
+			_ = json.NewEncoder(w).Encode(api.AppResponse{Slug: "existing"})
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	c := NewClient(srv.URL, "fp_live_x")
+	if err := createOrFetchApp(context.Background(), c, api.CreateAppRequest{Slug: "existing"}, nil, nil); err != nil {
+		t.Fatalf("createOrFetchApp same-account no-flags = %v, want nil", err)
+	}
+	if sawPatch {
+		t.Errorf("UpdateApp PATCH should not fire when neither flag was set")
+	}
+}
+
+// TestCreateOrFetchApp_409OtherAccount_FailsHard pins the new UX
+// boundary added in issue #1182: when CreateApp 409s and the
+// follow-up GetApp 404s (apid's silent IDOR 404 — the slug is owned
+// by another account or the row vanished in a race), the helper
+// hard-fails with a clear "slug already in use" message rather than
+// silently falling through.
+func TestCreateOrFetchApp_409OtherAccount_FailsHard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: api.CodeConflict, Title: "Conflict", Detail: "slug taken"})
+		case r.URL.Path == "/v1/apps/taken" && r.Method == http.MethodGet:
+			http.Error(w, "no such app", http.StatusNotFound)
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	c := NewClient(srv.URL, "fp_live_x")
+	err := createOrFetchApp(context.Background(), c, api.CreateAppRequest{Slug: "taken"}, nil, nil)
+	if err == nil {
+		t.Fatalf("createOrFetchApp on 409→404 should fail hard, got nil")
+	}
+	if !strings.Contains(err.Error(), "taken") {
+		t.Errorf("error message should mention the slug, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "already in use") {
+		t.Errorf("error message should say 'already in use', got: %v", err)
+	}
+}
+
+// TestCreateOrFetchApp_Non409ErrorPropagates pins that non-409 errors
+// (validation, server-side capacity, etc.) bubble up unchanged
+// instead of being misclassified as a slug conflict. The helper
+// returns the APIError unwrapped so the caller's single printErr
+// prefix is the user-facing message — no double-wrap.
+func TestCreateOrFetchApp_Non409ErrorPropagates(t *testing.T) {
+	var sawGet bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(api.Problem{Status: 400, Code: api.CodeValidation, Title: "Validation", Detail: "bad slug"})
+		case r.URL.Path == "/v1/apps/x" && r.Method == http.MethodGet:
+			sawGet = true
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	c := NewClient(srv.URL, "fp_live_x")
+	err := createOrFetchApp(context.Background(), c, api.CreateAppRequest{Slug: "x"}, nil, nil)
+	if err == nil {
+		t.Fatalf("non-409 error should propagate, got nil")
+	}
+	if sawGet {
+		t.Errorf("GetApp probe should NOT fire on a non-409 CreateApp error")
+	}
+	// The bare APIError renders as "<code>: <detail>" (apierror.go:21);
+	// the caller prefixes it once with "Could not create or fetch app".
+	if !strings.Contains(err.Error(), "validation_failed: bad slug") {
+		t.Errorf("error should carry the server's code:detail, got: %v", err)
 	}
 }
