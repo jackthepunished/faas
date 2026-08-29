@@ -637,12 +637,6 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string)
 		if err != nil {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
-		// Reject traversal markers before the archive name reaches the
-		// staging filesystem. The post-prefix resolveEntryPath call below
-		// additionally enforces containment and clamps ancestor symlinks.
-		if strings.Contains(hdr.Name, "..") && !strings.HasSuffix(hdr.Name, whiteoutOpaque) {
-			return fmt.Errorf("rootfs: archive entry %q contains traversal marker", hdr.Name)
-		}
 		// Symlinks / char devices / fifos / hardlinks don't allocate
 		// on-disk bytes for the consumer's quota. Cap is on the
 		// post-unpack size, which is what AppLayerMaxMB enforces.
@@ -656,26 +650,36 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string)
 			}
 			written += hdr.Size
 		}
+		archiveName := hdr.Name
 		if prefix != "" {
-			name := strings.TrimSuffix(hdr.Name, "/")
-			if name == prefix {
+			archiveName = strings.TrimSuffix(archiveName, "/")
+			if archiveName == prefix {
 				// The archive's wrapper directory is transport metadata,
 				// not customer content.
 				continue
 			}
-			if strings.HasPrefix(name, prefix+"/") {
-				hdr.Name = strings.TrimPrefix(name, prefix+"/")
+			if strings.HasPrefix(archiveName, prefix+"/") {
+				archiveName = strings.TrimPrefix(archiveName, prefix+"/")
 			}
 		}
-		// resolveEntryPath rejects traversal and clamps ancestor symlinks inside
-		// the staging root before applyEntry can create or replace an entry.
-		target, err := resolveEntryPath(dst, hdr.Name)
-		if err != nil {
-			return err
+		// Keep every staging filesystem operation inside the positive
+		// archive-name validation branch. resolveEntryPath then adds
+		// containment and ancestor-symlink protection.
+		if !strings.Contains(archiveName, "..") {
+			hdr.Name = archiveName
+			// resolveEntryPath rejects absolute names and clamps ancestor
+			// symlinks inside the staging root before applyEntry can create
+			// or replace an entry.
+			target, err := resolveEntryPath(dst, archiveName)
+			if err != nil {
+				return err
+			}
+			if err := applyEntry(dst, target, hdr, tr); err != nil {
+				return err
+			}
+			continue
 		}
-		if err := applyEntry(dst, target, hdr, tr); err != nil {
-			return err
-		}
+		return fmt.Errorf("rootfs: archive entry %q contains traversal marker", hdr.Name)
 	}
 }
 
