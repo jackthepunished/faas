@@ -69,6 +69,7 @@ from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_slo_response import AppSLOResponse
 from .app_slo_response_window import AppSLOResponseWindow
+from .app_static_egress_ip_response import AppStaticEgressIPResponse
 from .app_streaming_status import AppStreamingStatus
 from .app_streaming_status_cap_kind import AppStreamingStatusCapKind
 from .app_streaming_status_status import AppStreamingStatusStatus
@@ -122,10 +123,15 @@ from .build_response_kind import BuildResponseKind
 from .build_response_status import BuildResponseStatus
 from .canary_preset_spec import CanaryPresetSpec
 from .canary_preset_spec_preset import CanaryPresetSpecPreset
+from .cancel_deployment_request import CancelDeploymentRequest
+from .cancel_deployment_request_reason import CancelDeploymentRequestReason
+from .cancel_deployment_response_200 import CancelDeploymentResponse200
 from .change_member_role_request import ChangeMemberRoleRequest
 from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
+from .clear_obsolete_deployments_body import ClearObsoleteDeploymentsBody
+from .clear_obsolete_report import ClearObsoleteReport
 from .consume_invoice_response import ConsumeInvoiceResponse
 from .consumed_credit_row import ConsumedCreditRow
 from .cors_preset_list_response import CorsPresetListResponse
@@ -191,6 +197,13 @@ from .data_upstream_list_response import DataUpstreamListResponse
 from .data_upstream_response import DataUpstreamResponse
 from .data_upstream_response_kind import DataUpstreamResponseKind
 from .data_upstream_response_source import DataUpstreamResponseSource
+from .debug_compare_request import DebugCompareRequest
+from .debug_compare_response import DebugCompareResponse
+from .debug_compare_route_stats import DebugCompareRouteStats
+from .debug_regression_item import DebugRegressionItem
+from .debug_regressions_response import DebugRegressionsResponse
+from .debug_replay_response import DebugReplayResponse
+from .debug_replay_response_status import DebugReplayResponseStatus
 from .debug_telemetry_list_response import DebugTelemetryListResponse
 from .debug_telemetry_request_item import DebugTelemetryRequestItem
 from .debug_telemetry_request_item_method import DebugTelemetryRequestItemMethod
@@ -478,6 +491,8 @@ from .recover_rollout_request import RecoverRolloutRequest
 from .recover_rollout_request_action import RecoverRolloutRequestAction
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
+from .reorder_deployment_body import ReorderDeploymentBody
+from .reorder_deployment_response_200 import ReorderDeploymentResponse200
 from .repo_response import RepoResponse
 from .retry_deployment_request import RetryDeploymentRequest
 from .retry_deployment_request_from_stage import RetryDeploymentRequestFromStage
@@ -511,6 +526,7 @@ from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_account_egress_allowlist_extra_request import SetAccountEgressAllowlistExtraRequest
+from .set_app_static_egress_ip_request import SetAppStaticEgressIPRequest
 from .set_grace_window_request import SetGraceWindowRequest
 from .set_password_request import SetPasswordRequest
 from .severity_counts import SeverityCounts
@@ -682,6 +698,7 @@ __all__ = (
     "AppsMetricsResponse",
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
+    "AppStaticEgressIPResponse",
     "AppStreamingStatus",
     "AppStreamingStatusCapKind",
     "AppStreamingStatusStatus",
@@ -729,10 +746,15 @@ __all__ = (
     "BuildResponseStatus",
     "CanaryPresetSpec",
     "CanaryPresetSpecPreset",
+    "CancelDeploymentRequest",
+    "CancelDeploymentRequestReason",
+    "CancelDeploymentResponse200",
     "ChangeMemberRoleRequest",
     "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
     "ChangePlanRequestPlan",
+    "ClearObsoleteDeploymentsBody",
+    "ClearObsoleteReport",
     "ConsumedCreditRow",
     "ConsumeInvoiceResponse",
     "CorsPresetListResponse",
@@ -794,6 +816,13 @@ __all__ = (
     "DataUpstreamResponse",
     "DataUpstreamResponseKind",
     "DataUpstreamResponseSource",
+    "DebugCompareRequest",
+    "DebugCompareResponse",
+    "DebugCompareRouteStats",
+    "DebugRegressionItem",
+    "DebugRegressionsResponse",
+    "DebugReplayResponse",
+    "DebugReplayResponseStatus",
     "DebugTelemetryListResponse",
     "DebugTelemetryRequestItem",
     "DebugTelemetryRequestItemMethod",
@@ -1075,6 +1104,8 @@ __all__ = (
     "RecoverRolloutRequestAction",
     "RekeyProgress",
     "RenameAppRequest",
+    "ReorderDeploymentBody",
+    "ReorderDeploymentResponse200",
     "RepoResponse",
     "RetryDeploymentRequest",
     "RetryDeploymentRequestFromStage",
@@ -1106,6 +1137,7 @@ __all__ = (
     "SessionListResponse",
     "SessionsRevokeAllResponse",
     "SetAccountEgressAllowlistExtraRequest",
+    "SetAppStaticEgressIPRequest",
     "SetGraceWindowRequest",
     "SetPasswordRequest",
     "SeverityCounts",
