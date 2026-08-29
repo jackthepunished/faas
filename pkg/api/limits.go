@@ -130,6 +130,33 @@ type Limits struct {
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
 
+	// M-2 / ADR-137+138: per-plan tier tightening for
+	// AppManifest.StopGracePeriod (DefaultStopGracePeriodS),
+	// AppManifest.StartupDeadlineS (DefaultStartupDeadlineS), and
+	// AppManifest.MaxRetries (DefaultMaxRetries). Replaces the
+	// gross MaxAppManifestStopGracePeriod / StartupDeadlineS /
+	// MaxRetries package-level constants: each plan now carries
+	// its own default and cap, and AppManifest.ValidatePlan reads
+	// them off the matching Limits entry. 0 on the field means
+	// "inherit default" (per ADR-138 §Decision 4).
+	//
+	// WorkerReplicasMax / ServiceReplicasMax / JobMaxRuntimeS
+	// (issue #1186 §D / ADR-137) bound the per-execution-mode
+	// capacity for each plan. Free has all three at zero — Free
+	// stays request-mode only (ADR-137 §Decision 3 / ADR-069
+	// precedent: sidecars are paid-only, so is every non-request
+	// execution mode). apid's updateApp + createApp handlers
+	// gate on these via the corresponding
+	// CodePlan{X}NotAllowed problem codes. The constants live
+	// here per CLAUDE.md's "Every plan quota/limit lives in this
+	// one table" rule.
+	DefaultStopGracePeriodS int // seconds; per-app StopGracePeriod default
+	DefaultStartupDeadlineS int // seconds; per-app StartupDeadlineS default
+	DefaultMaxRetries       int // per-app MaxRetries default
+	WorkerReplicasMax       int // per-account running worker instances
+	ServiceReplicasMax      int // per-deployment desired replicas
+	JobMaxRuntimeS          int // seconds; per-job max runtime
+
 	// CertExpiryWarningDays (issue #961 / Mega-A PR-3) is the threshold
 	// below which the cert engine emits a `cert.expiring_soon` audit
 	// row and the dashboard renders the yellow banner. Same across
@@ -1446,6 +1473,17 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// M-2 / ADR-137+138: Free stays request-only — same
+		// posture as sidecars (ADR-069). Defaults are tight so
+		// a stray async deploy stays bounded; per-mode replica
+		// caps are zero so the gate is enforced by ValidatePlan
+		// before the store is touched.
+		DefaultStopGracePeriodS: 15,
+		DefaultStartupDeadlineS: 15,
+		DefaultMaxRetries:       3,
+		WorkerReplicasMax:       0, // Free disallows worker
+		ServiceReplicasMax:      0, // Free disallows service
+		JobMaxRuntimeS:          0, // Free disallows job
 		// ADR-124 queue controls — Free keeps cancel + clear-obsolete
 		// (the safety valves); reorder + deploy-immediately are
 		// locked. Queue depth caps are conservative because Free
@@ -1794,6 +1832,18 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// M-2 / ADR-137+138: Hobby gets the documented 30 s
+		// StopGracePeriod default + 30 s StartupDeadline default
+		// (ADR-138 §Decision 4 / §Decision 5). Hobby unlocks
+		// worker (1 max) + service (3 replicas) + job (300 s max
+		// runtime) — enough for a tutorial workload, not for a
+		// production fan-out.
+		DefaultStopGracePeriodS: 30,
+		DefaultStartupDeadlineS: 30,
+		DefaultMaxRetries:       5,
+		WorkerReplicasMax:       1,
+		ServiceReplicasMax:      3,
+		JobMaxRuntimeS:          300,
 		// ADR-124 queue controls — Hobby unlocks the gated surface.
 		QueueControlsAllowed:   true,
 		MaxQueuedDeploysPerApp: 5,
@@ -2149,6 +2199,16 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// M-2 / ADR-137+138: Pro doubles Hobby's defaults
+		// (ADR-138 §Decision 4 / §Decision 5). Replica caps
+		// scale to a meaningful production fan-out (3 workers,
+		// 5 service replicas, 30 min job runtimes).
+		DefaultStopGracePeriodS: 60,
+		DefaultStartupDeadlineS: 60,
+		DefaultMaxRetries:       10,
+		WorkerReplicasMax:       3,
+		ServiceReplicasMax:      5,
+		JobMaxRuntimeS:          1800,
 		// ADR-124 queue controls — Pro.
 		QueueControlsAllowed:   true,
 		MaxQueuedDeploysPerApp: 10,
@@ -2486,6 +2546,16 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// M-2 / ADR-137+138: Scale doubles Pro (ADR-138
+		// §Decision 4 / §Decision 5). Replica caps land where
+		// a single Scale customer can host a small SaaS
+		// (10 workers, 20 service replicas, 1 h jobs).
+		DefaultStopGracePeriodS: 120,
+		DefaultStartupDeadlineS: 120,
+		DefaultMaxRetries:       20,
+		WorkerReplicasMax:       10,
+		ServiceReplicasMax:      20,
+		JobMaxRuntimeS:          3600,
 		// ADR-124 queue controls — Scale (5× Hobby's 5).
 		QueueControlsAllowed:   true,
 		MaxQueuedDeploysPerApp: 25,

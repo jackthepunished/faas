@@ -27,7 +27,7 @@ const (
 // deploys, etc.).
 const (
 	ExecutionModeRequest = "request" // default — request-driven HTTP/WS/etc. (today's shape)
-	ExecutionModeService = "service"  // replicated HTTP service with desired-count
+	ExecutionModeService = "service" // replicated HTTP service with desired-count
 	ExecutionModeWorker  = "worker"  // long-running daemon, no public port, idle-exempt
 	ExecutionModeJob     = "job"     // run-to-completion, RestartPolicy default "no"
 )
@@ -37,10 +37,10 @@ const (
 // allowed except the job+always combination which is rejected at
 // Validate().
 const (
-	RestartPolicyNo             = "no"             // never restart
-	RestartPolicyOnFailure      = "on-failure"     // restart on non-zero exit
-	RestartPolicyAlways         = "always"         // restart on any exit
-	RestartPolicyUnlessStopped  = "unless-stopped" // restart unless explicitly stopped
+	RestartPolicyNo            = "no"             // never restart
+	RestartPolicyOnFailure     = "on-failure"     // restart on non-zero exit
+	RestartPolicyAlways        = "always"         // restart on any exit
+	RestartPolicyUnlessStopped = "unless-stopped" // restart unless explicitly stopped
 )
 
 // ServiceReplicas is the per-deployment replica scaffold (issue #1186
@@ -198,7 +198,41 @@ func (m AppManifest) EffectiveRestartPolicy() string {
 }
 
 // Validate rejects a manifest that guest-init could not act on.
+// Back-compat shim: the gross MaxAppManifest* constants act as a
+// fail-closed ceiling when the calling site doesn't know the
+// customer's plan (e.g. legacy test fixtures). Production paths
+// call ValidatePlan(plan) so the per-plan tier tightening in M-2
+// can take effect. The gross constants remain as the absolute
+// ceiling (Plan Scale can never exceed them) — see ADR-138
+// §Decision 4.
 func (m AppManifest) Validate() error {
+	return m.ValidatePlan(PlanScale)
+}
+
+// ValidatePlan rejects a manifest that guest-init could not act
+// on, with the per-plan tier tightening from M-2 / ADR-137+138.
+// Per-plan caps:
+//
+//	Free    : StopGracePeriod ≤  15s, StartupDeadlineS ≤  15s, MaxRetries ≤   3
+//	Hobby   : StopGracePeriod ≤  30s, StartupDeadlineS ≤  30s, MaxRetries ≤   5
+//	Pro     : StopGracePeriod ≤  60s, StartupDeadlineS ≤  60s, MaxRetries ≤  10
+//	Scale   : StopGracePeriod ≤ 120s, StartupDeadlineS ≤ 120s, MaxRetries ≤  20
+//
+// (replaces the gross 5 min / 300 s / 20-retry ceilings)
+//
+// In addition, the per-mode replica caps from Limits are
+// enforced:
+//
+//	WorkerReplicasMax  =  0/1/3/10 by free/hobby/pro/scale
+//	ServiceReplicasMax =  0/3/5/20 by free/hobby/pro/scale
+//	JobMaxRuntimeS     =  0/300/1800/3600 by free/hobby/pro/scale
+//
+// Free rejects every non-request ExecutionMode (matches the
+// sidecar/async posture from ADR-069 / spec §4.4). The validator
+// honors m.ExecuteMode being empty (default = request per
+// EffectiveExecutionMode) — the per-mode lock fires only on the
+// customer's explicit choice.
+func (m AppManifest) ValidatePlan(plan Plan) error {
 	if len(m.Entrypoint) == 0 {
 		return fmt.Errorf("app manifest: empty entrypoint")
 	}
@@ -208,16 +242,27 @@ func (m AppManifest) Validate() error {
 	if m.Port < 0 || m.Port > 65535 {
 		return fmt.Errorf("app manifest: port %d out of range", m.Port)
 	}
-	// StopGracePeriod is bounded at the manifest surface to keep the
-	// platform's tail-drain budget sane (spec §4.10 max-shutdown-wait
-	// per ADR-X3 lifecycle contract in M-2). The cap is a gross upper
-	// bound; per-plan tightening lands in M-2. Read from the limits
-	// table (CLAUDE.md) so a single edit moves the whole platform.
+	limits, ok := LimitsFor(plan)
+	if !ok {
+		return fmt.Errorf("app manifest: unknown plan %q", plan)
+	}
+	// StopGracePeriod cap is the per-plan ceiling. The gross
+	// MaxAppManifestStopGracePeriod remains as a fail-closed
+	// absolute ceiling so a future plan expansion cannot
+	// silently allow > 5 min grace across the fleet (spec §4.10
+	// tail-drain budget keeps the noDoS argument honest).
 	if m.StopGracePeriod < 0 {
 		return fmt.Errorf("app manifest: stop_grace_period %s must be >= 0", m.StopGracePeriod)
 	}
+	perPlanCap := time.Duration(limits.DefaultStopGracePeriodS) * time.Second
+	if perPlanCap > MaxAppManifestStopGracePeriod {
+		perPlanCap = MaxAppManifestStopGracePeriod
+	}
+	if perPlanCap > 0 && m.StopGracePeriod > perPlanCap {
+		return fmt.Errorf("app manifest: stop_grace_period %s exceeds plan %q cap %s (ADR-138 §Decision 4)", m.StopGracePeriod, plan, perPlanCap)
+	}
 	if m.StopGracePeriod > MaxAppManifestStopGracePeriod {
-		return fmt.Errorf("app manifest: stop_grace_period %s exceeds %s cap", m.StopGracePeriod, MaxAppManifestStopGracePeriod)
+		return fmt.Errorf("app manifest: stop_grace_period %s exceeds %s absolute cap", m.StopGracePeriod, MaxAppManifestStopGracePeriod)
 	}
 	// ExecutionMode is closed-set; empty maps to the default via
 	// EffectiveExecutionMode() and is not rejected here. The wire
@@ -246,20 +291,38 @@ func (m AppManifest) Validate() error {
 	if m.EffectiveExecutionMode() == ExecutionModeJob && m.RestartPolicy == RestartPolicyAlways {
 		return fmt.Errorf("app manifest: restart_policy=always is rejected for execution_mode=job (use 'no', 'on-failure', or 'unless-stopped')")
 	}
-	// StartupDeadlineS / MaxRetries are gross-bounded here (per-plan
-	// tightening lands in commit 10). 0 means "inherit default" and
-	// is always accepted; negative is rejected.
+	// StartupDeadlineS / MaxRetries are gross-bounded AND per-plan
+	// capped per ADR-138 §Decision 5. 0 means "inherit default"
+	// and is always accepted; negative is rejected. The per-plan
+	// cap is Limits.DefaultStartupDeadlineS / DefaultMaxRetries
+	// on the matching plan entry; the gross MaxAppManifest* cap
+	// remains as a fail-closed absolute ceiling (same shape as
+	// StopGracePeriod above).
 	if m.StartupDeadlineS < 0 {
 		return fmt.Errorf("app manifest: startup_deadline_s %d must be >= 0", m.StartupDeadlineS)
 	}
+	startupCap := limits.DefaultStartupDeadlineS
+	if startupCap > MaxAppManifestStartupDeadlineS {
+		startupCap = MaxAppManifestStartupDeadlineS
+	}
+	if startupCap > 0 && m.StartupDeadlineS > startupCap {
+		return fmt.Errorf("app manifest: startup_deadline_s %d exceeds plan %q cap %d (ADR-138 §Decision 5)", m.StartupDeadlineS, plan, startupCap)
+	}
 	if m.StartupDeadlineS > MaxAppManifestStartupDeadlineS {
-		return fmt.Errorf("app manifest: startup_deadline_s %d exceeds %d cap", m.StartupDeadlineS, MaxAppManifestStartupDeadlineS)
+		return fmt.Errorf("app manifest: startup_deadline_s %d exceeds %d absolute cap", m.StartupDeadlineS, MaxAppManifestStartupDeadlineS)
 	}
 	if m.MaxRetries < 0 {
 		return fmt.Errorf("app manifest: max_retries %d must be >= 0", m.MaxRetries)
 	}
+	retriesCap := limits.DefaultMaxRetries
+	if retriesCap > MaxAppManifestMaxRetries {
+		retriesCap = MaxAppManifestMaxRetries
+	}
+	if retriesCap > 0 && m.MaxRetries > retriesCap {
+		return fmt.Errorf("app manifest: max_retries %d exceeds plan %q cap %d (ADR-138 §Decision 5)", m.MaxRetries, plan, retriesCap)
+	}
 	if m.MaxRetries > MaxAppManifestMaxRetries {
-		return fmt.Errorf("app manifest: max_retries %d exceeds %d cap", m.MaxRetries, MaxAppManifestMaxRetries)
+		return fmt.Errorf("app manifest: max_retries %d exceeds %d absolute cap", m.MaxRetries, MaxAppManifestMaxRetries)
 	}
 	// ServiceReplicas shape: only meaningful when ExecutionMode=service,
 	// but Validate() accepts the field whenever present (min<=max,
@@ -275,6 +338,46 @@ func (m AppManifest) Validate() error {
 		}
 		if r.Desired < r.Min || r.Desired > r.Max {
 			return fmt.Errorf("app manifest: service_replicas.desired %d must be in [min=%d, max=%d]", r.Desired, r.Min, r.Max)
+		}
+		// Per-plan replica cap (ADR-137 §Decision 3): a free
+		// customer passing ServiceReplicas.Desired > 0 is
+		// asking for paid-tier capacity the plan doesn't
+		// grant. Mirrors the sidecar/async Free locks at
+		// updateAppHandler — the gate is here at validate
+		// time so the customer sees the cap before the
+		// store is touched.
+		if r.Desired > limits.ServiceReplicasMax {
+			return fmt.Errorf("app manifest: service_replicas.desired %d exceeds plan %q cap %d (ADR-137 §Decision 3)", r.Desired, plan, limits.ServiceReplicasMax)
+		}
+		if r.Max > limits.ServiceReplicasMax {
+			return fmt.Errorf("app manifest: service_replicas.max %d exceeds plan %q cap %d", r.Max, plan, limits.ServiceReplicasMax)
+		}
+	}
+	// Per-plan execution-mode allowlist (ADR-137 §Decision 3,
+	// ADR-069 precedent). Free rejects every non-request mode;
+	// the zero value on Limits.WorkerReplicasMax /
+	// ServiceReplicasMax / JobMaxRuntimeS is the fail-closed
+	// signal for "this plan doesn't unlock this mode". Empty
+	// ExecutionMode maps to "request" via
+	// EffectiveExecutionMode() and passes — a manifest that
+	// doesn't mention the field decodes as request-mode by
+	// default, so Free works transparently.
+	if em := m.ExecutionMode; em != "" {
+		switch em {
+		case ExecutionModeRequest:
+			// always allowed
+		case ExecutionModeWorker:
+			if limits.WorkerReplicasMax == 0 {
+				return fmt.Errorf("app manifest: execution_mode=worker is not allowed on plan %q (WorkerReplicasMax=0; upgrade to Hobby+)", plan)
+			}
+		case ExecutionModeService:
+			if limits.ServiceReplicasMax == 0 {
+				return fmt.Errorf("app manifest: execution_mode=service is not allowed on plan %q (ServiceReplicasMax=0; upgrade to Hobby+)", plan)
+			}
+		case ExecutionModeJob:
+			if limits.JobMaxRuntimeS == 0 {
+				return fmt.Errorf("app manifest: execution_mode=job is not allowed on plan %q (JobMaxRuntimeS=0; upgrade to Hobby+)", plan)
+			}
 		}
 	}
 	// EnvSecrets: each value must be a "secret:NAME" ref (ADR-053 §Decision 1).
