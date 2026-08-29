@@ -90,6 +90,85 @@ func TestManifestValidate(t *testing.T) {
 		{"stop_grace_period negative rejected", AppManifest{
 			Entrypoint: []string{"x"}, StopGracePeriod: -1 * time.Second,
 		}, false},
+		// M-2 (ADR-137) — ExecutionMode closed-set.
+		{"execution_mode empty defaults to request", AppManifest{
+			Entrypoint: []string{"x"},
+		}, true},
+		{"execution_mode=worker", AppManifest{
+			Entrypoint: []string{"x"}, ExecutionMode: ExecutionModeWorker,
+		}, true},
+		{"execution_mode=job", AppManifest{
+			Entrypoint: []string{"x"}, ExecutionMode: ExecutionModeJob,
+		}, true},
+		{"execution_mode=service with replicas", AppManifest{
+			Entrypoint:     []string{"x"},
+			ExecutionMode:  ExecutionModeService,
+			ServiceReplicas: &ServiceReplicas{Min: 1, Max: 3, Desired: 2},
+		}, true},
+		{"execution_mode=bogus rejected", AppManifest{
+			Entrypoint: []string{"x"}, ExecutionMode: "bogus",
+		}, false},
+		// M-2 (ADR-137 §Decision 2) — per-mode RestartPolicy defaults.
+		{"restart_policy=always on job rejected", AppManifest{
+			Entrypoint: []string{"x"},
+			ExecutionMode:  ExecutionModeJob,
+			RestartPolicy: RestartPolicyAlways,
+		}, false},
+		{"restart_policy=always on worker ok", AppManifest{
+			Entrypoint: []string{"x"},
+			ExecutionMode:  ExecutionModeWorker,
+			RestartPolicy: RestartPolicyAlways,
+		}, true},
+		{"restart_policy=no on job ok", AppManifest{
+			Entrypoint: []string{"x"},
+			ExecutionMode:  ExecutionModeJob,
+			RestartPolicy: RestartPolicyNo,
+		}, true},
+		{"restart_policy=bogus rejected", AppManifest{
+			Entrypoint: []string{"x"},
+			RestartPolicy: "bogus",
+		}, false},
+		// M-2 (ADR-137/138) — StartupDeadlineS / MaxRetries gross caps.
+		{"startup_deadline_s zero ok", AppManifest{
+			Entrypoint: []string{"x"},
+		}, true},
+		{"startup_deadline_s at cap ok", AppManifest{
+			Entrypoint: []string{"x"},
+			StartupDeadlineS: MaxAppManifestStartupDeadlineS,
+		}, true},
+		{"startup_deadline_s over cap rejected", AppManifest{
+			Entrypoint: []string{"x"},
+			StartupDeadlineS: MaxAppManifestStartupDeadlineS + 1,
+		}, false},
+		{"startup_deadline_s negative rejected", AppManifest{
+			Entrypoint: []string{"x"},
+			StartupDeadlineS: -1,
+		}, false},
+		{"max_retries at cap ok", AppManifest{
+			Entrypoint: []string{"x"},
+			MaxRetries: MaxAppManifestMaxRetries,
+		}, true},
+		{"max_retries over cap rejected", AppManifest{
+			Entrypoint: []string{"x"},
+			MaxRetries: MaxAppManifestMaxRetries + 1,
+		}, false},
+		// ServiceReplicas shape (ADR-137 §Decision 3).
+		{"service_replicas negative rejected", AppManifest{
+			Entrypoint:     []string{"x"},
+			ServiceReplicas: &ServiceReplicas{Min: -1, Max: 3, Desired: 2},
+		}, false},
+		{"service_replicas min>max rejected", AppManifest{
+			Entrypoint:     []string{"x"},
+			ServiceReplicas: &ServiceReplicas{Min: 5, Max: 3, Desired: 4},
+		}, false},
+		{"service_replicas desired<min rejected", AppManifest{
+			Entrypoint:     []string{"x"},
+			ServiceReplicas: &ServiceReplicas{Min: 2, Max: 5, Desired: 1},
+		}, false},
+		{"service_replicas desired>max rejected", AppManifest{
+			Entrypoint:     []string{"x"},
+			ServiceReplicas: &ServiceReplicas{Min: 1, Max: 5, Desired: 10},
+		}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -142,5 +221,37 @@ func TestErrAppLayerTooLarge(t *testing.T) {
 	}
 	if !strings.Contains(p.Detail, "256 MB") {
 		t.Errorf("detail should name the cap: %q", p.Detail)
+	}
+}
+
+// TestEffectiveExecutionModeAndRestartPolicy pins the per-mode defaults
+// (ADR-137 §Decision 1 + §Decision 2). Existing manifests with neither
+// ExecutionMode nor RestartPolicy set must default to "request" /
+// "always" — preserving today's behaviour for customers who haven't
+// opted into the new fields.
+func TestEffectiveExecutionModeAndRestartPolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		m               AppManifest
+		wantMode        string
+		wantRestart     string
+	}{
+		{"empty → request/always", AppManifest{Entrypoint: []string{"x"}}, ExecutionModeRequest, RestartPolicyAlways},
+		{"explicit request", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "request"}, "request", RestartPolicyAlways},
+		{"service → always", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "service"}, "service", RestartPolicyAlways},
+		{"worker → always", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "worker"}, "worker", RestartPolicyAlways},
+		{"job → no", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "job"}, "job", RestartPolicyNo},
+		{"explicit restart overrides default", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "worker", RestartPolicy: "on-failure"}, "worker", RestartPolicyOnFailure},
+		{"explicit job restart policy wins", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "job", RestartPolicy: "on-failure"}, "job", RestartPolicyOnFailure},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.m.EffectiveExecutionMode(); got != tt.wantMode {
+				t.Errorf("EffectiveExecutionMode()=%q, want %q", got, tt.wantMode)
+			}
+			if got := tt.m.EffectiveRestartPolicy(); got != tt.wantRestart {
+				t.Errorf("EffectiveRestartPolicy()=%q, want %q", got, tt.wantRestart)
+			}
+		})
 	}
 }

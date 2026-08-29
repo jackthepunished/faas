@@ -3146,6 +3146,17 @@ const (
 	// point of use.
 	MaxAppManifestStopGracePeriod = 5 * time.Minute
 
+	// MaxAppManifestStartupDeadlineS is the gross upper bound on
+	// AppManifest.StartupDeadlineS (issue #1186 §D.2, ADR-137/138).
+	// Per-plan tightening replaces this in commit 10 of M-2 with
+	// per-plan tiers on the Limits struct.
+	MaxAppManifestStartupDeadlineS = 300
+
+	// MaxAppManifestMaxRetries is the gross upper bound on
+	// AppManifest.MaxRetries (issue #1186 §D.3, ADR-137/138). Per-plan
+	// tightening in M-2 commit 10.
+	MaxAppManifestMaxRetries = 20
+
 	// StreamingStatus is the per-request classification emitted via
 	// the Streaming-Status response header (ADR-102 D1/D2). The
 	// canonical wire values are the lower-case string forms of the

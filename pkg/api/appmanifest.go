@@ -19,6 +19,39 @@ const (
 	DefaultAppUID  = 1000
 )
 
+// ExecutionMode is the customer-controlled lifecycle axis for an app
+// (issue #1186 §D, ADR-137). Default is ExecutionModeRequest which
+// preserves the M-1 / pre-M-2 behaviour. Runtime wiring of the four
+// modes is implemented in M-2 commits 5-8; M-3 / M-4 widen the
+// per-mode surface further (named-user lookup, replica rolling
+// deploys, etc.).
+const (
+	ExecutionModeRequest = "request" // default — request-driven HTTP/WS/etc. (today's shape)
+	ExecutionModeService = "service"  // replicated HTTP service with desired-count
+	ExecutionModeWorker  = "worker"  // long-running daemon, no public port, idle-exempt
+	ExecutionModeJob     = "job"     // run-to-completion, RestartPolicy default "no"
+)
+
+// RestartPolicy governs how the supervisor restarts a stopped workload
+// (issue #1186 §D.3, ADR-137 §Decision 2). Default per-mode; override
+// allowed except the job+always combination which is rejected at
+// Validate().
+const (
+	RestartPolicyNo             = "no"             // never restart
+	RestartPolicyOnFailure      = "on-failure"     // restart on non-zero exit
+	RestartPolicyAlways         = "always"         // restart on any exit
+	RestartPolicyUnlessStopped  = "unless-stopped" // restart unless explicitly stopped
+)
+
+// ServiceReplicas is the per-deployment replica scaffold (issue #1186
+// §D, ADR-137 §Decision 3). M-2 lays the schema + admission; full
+// rolling deploy / rollback semantics land in M-4 workstream E.
+type ServiceReplicas struct {
+	Min     int `json:"min"`
+	Max     int `json:"max"`
+	Desired int `json:"desired"`
+}
+
 // AppManifest is the /etc/faas/app.json contract: the single handoff from the
 // build/imaging side (imaged) to the guest side (guest-init). imaged writes it
 // into the app layer; guest-init applies env, execs the entrypoint as the app
@@ -63,6 +96,30 @@ type AppManifest struct {
 	// spec doesn't carry it; M-2 will populate from operator
 	// override or per-plan cap). Currently always zero.
 	StopGracePeriod time.Duration `json:"stop_grace_period,omitempty"`
+	// ExecutionMode is the customer-controlled lifecycle axis (ADR-137).
+	// Empty means ExecutionModeRequest which preserves today's
+	// request-driven shape. M-2 commit 6 wires Engine.StopInstance +
+	// the worker/service/job dispatch.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	// RestartPolicy governs the supervisor's restart-on-exit decision
+	// (ADR-137 §Decision 2). Empty defers to per-mode default
+	// (request: on-failure, service: always, worker: always, job: no).
+	RestartPolicy string `json:"restart_policy,omitempty"`
+	// StartupDeadlineS is the upper bound on time-to-ready. After this
+	// many seconds without reaching READY the instance transitions to
+	// FAILED with lifecycle_failure_reason='startup_fail' (ADR-138
+	// §Decision 3). 0 means inherit per-plan default.
+	StartupDeadlineS int `json:"startup_deadline_s,omitempty"`
+	// MaxRetries is the upper bound on consecutive restart attempts
+	// before the supervisor gives up and transitions to FAILED with
+	// lifecycle_failure_reason='crash_loop' (ADR-138 §Decision 3).
+	// 0 means inherit per-plan default.
+	MaxRetries int `json:"max_retries,omitempty"`
+	// ServiceReplicas is the per-deployment replica scaffold (ADR-137
+	// §Decision 3). Only honoured when ExecutionMode=service. M-2
+	// lays the schema + admission; M-4 workstream E lands the
+	// rolling deploy / rollback / digest-pinning semantics.
+	ServiceReplicas *ServiceReplicas `json:"service_replicas,omitempty"`
 }
 
 // AppManifestHealthcheck is the AppManifest-level projection of the OCI
@@ -109,6 +166,37 @@ func (m AppManifest) EffectiveWorkingDir() string {
 	return m.WorkingDir
 }
 
+// EffectiveExecutionMode returns ExecutionMode or the default
+// ExecutionModeRequest. The "request" default preserves the M-1
+// behaviour for existing customers (no ExecutionMode set).
+func (m AppManifest) EffectiveExecutionMode() string {
+	if m.ExecutionMode == "" {
+		return ExecutionModeRequest
+	}
+	return m.ExecutionMode
+}
+
+// EffectiveRestartPolicy returns RestartPolicy or the per-mode default
+// (ADR-137 §Decision 2):
+//   - request → "on-failure" (today's behaviour)
+//   - service → "always"
+//   - worker  → "always"
+//   - job     → "no"
+//
+// Empty input is mapped to the per-mode default so existing manifests
+// that omit RestartPolicy get the right semantics for free.
+func (m AppManifest) EffectiveRestartPolicy() string {
+	if m.RestartPolicy != "" {
+		return m.RestartPolicy
+	}
+	switch m.EffectiveExecutionMode() {
+	case ExecutionModeJob:
+		return RestartPolicyNo
+	default:
+		return RestartPolicyAlways
+	}
+}
+
 // Validate rejects a manifest that guest-init could not act on.
 func (m AppManifest) Validate() error {
 	if len(m.Entrypoint) == 0 {
@@ -130,6 +218,64 @@ func (m AppManifest) Validate() error {
 	}
 	if m.StopGracePeriod > MaxAppManifestStopGracePeriod {
 		return fmt.Errorf("app manifest: stop_grace_period %s exceeds %s cap", m.StopGracePeriod, MaxAppManifestStopGracePeriod)
+	}
+	// ExecutionMode is closed-set; empty maps to the default via
+	// EffectiveExecutionMode() and is not rejected here. The wire
+	// field is omitempty so a manifest that does not mention
+	// execution_mode decodes as "" and EffectiveExecutionMode()
+	// returns "request" — today's behaviour, preserved.
+	if m.ExecutionMode != "" {
+		switch m.ExecutionMode {
+		case ExecutionModeRequest, ExecutionModeService, ExecutionModeWorker, ExecutionModeJob:
+			// ok
+		default:
+			return fmt.Errorf("app manifest: execution_mode %q must be one of {request,service,worker,job}", m.ExecutionMode)
+		}
+	}
+	// RestartPolicy is closed-set when non-empty. Per-mode invalid
+	// combinations are also caught here (job+always is a footgun —
+	// see ADR-137 §Decision 2).
+	if m.RestartPolicy != "" {
+		switch m.RestartPolicy {
+		case RestartPolicyNo, RestartPolicyOnFailure, RestartPolicyAlways, RestartPolicyUnlessStopped:
+			// ok
+		default:
+			return fmt.Errorf("app manifest: restart_policy %q must be one of {no,on-failure,always,unless-stopped}", m.RestartPolicy)
+		}
+	}
+	if m.EffectiveExecutionMode() == ExecutionModeJob && m.RestartPolicy == RestartPolicyAlways {
+		return fmt.Errorf("app manifest: restart_policy=always is rejected for execution_mode=job (use 'no', 'on-failure', or 'unless-stopped')")
+	}
+	// StartupDeadlineS / MaxRetries are gross-bounded here (per-plan
+	// tightening lands in commit 10). 0 means "inherit default" and
+	// is always accepted; negative is rejected.
+	if m.StartupDeadlineS < 0 {
+		return fmt.Errorf("app manifest: startup_deadline_s %d must be >= 0", m.StartupDeadlineS)
+	}
+	if m.StartupDeadlineS > MaxAppManifestStartupDeadlineS {
+		return fmt.Errorf("app manifest: startup_deadline_s %d exceeds %d cap", m.StartupDeadlineS, MaxAppManifestStartupDeadlineS)
+	}
+	if m.MaxRetries < 0 {
+		return fmt.Errorf("app manifest: max_retries %d must be >= 0", m.MaxRetries)
+	}
+	if m.MaxRetries > MaxAppManifestMaxRetries {
+		return fmt.Errorf("app manifest: max_retries %d exceeds %d cap", m.MaxRetries, MaxAppManifestMaxRetries)
+	}
+	// ServiceReplicas shape: only meaningful when ExecutionMode=service,
+	// but Validate() accepts the field whenever present (min<=max,
+	// desired in [min,max], all non-negative). M-2 commit 6 wires
+	// admission; M-4 workstream E lands the rolling deploy semantics.
+	if m.ServiceReplicas != nil {
+		r := m.ServiceReplicas
+		if r.Min < 0 || r.Max < 0 || r.Desired < 0 {
+			return fmt.Errorf("app manifest: service_replicas values must be >= 0 (got min=%d max=%d desired=%d)", r.Min, r.Max, r.Desired)
+		}
+		if r.Min > r.Max {
+			return fmt.Errorf("app manifest: service_replicas.min %d must be <= max %d", r.Min, r.Max)
+		}
+		if r.Desired < r.Min || r.Desired > r.Max {
+			return fmt.Errorf("app manifest: service_replicas.desired %d must be in [min=%d, max=%d]", r.Desired, r.Min, r.Max)
+		}
 	}
 	// EnvSecrets: each value must be a "secret:NAME" ref (ADR-053 §Decision 1).
 	// The grammar is shared with pkg/api/dto.go::CreateDeploymentOverrides
