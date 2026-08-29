@@ -172,8 +172,10 @@ func TestDetectNestedMarkerHint(t *testing.T) {
 		{"vendor_ignored", []string{"vendor/x/go.mod"}, false},
 		{"__pycache___ignored", []string{"__pycache__/x/requirements.txt"}, false},
 
-		// Depth-3+ is intentionally out of scope — pkg/reposcan handles it.
-		{"depth_3_returns_false", []string{"apps/services/api/package.json"}, false},
+		// Depth-3 now visible (issue #1182 §P1 follow-up). Depth-4+
+		// remains out of scope — pkg/reposcan handles it.
+		{"depth_3_returns_true", []string{"apps/services/api/package.json"}, true},
+		{"depth_4_still_out_of_scope", []string{"apps/web/services/api/package.json"}, false},
 
 		// Empty / README-only — nothing to hint at.
 		{"empty_dir", nil, false},
