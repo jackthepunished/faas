@@ -51,6 +51,65 @@ func tempTarball(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "src.tar.gz")
 }
 
+func writeWrappedPAXTarGz(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:       "pax_global_header",
+		Typeflag:   tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{"comment": "github codeload metadata"},
+	}); err != nil {
+		t.Fatalf("pax header: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-deadbeef/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatalf("project directory: %v", err)
+	}
+	for name, body := range files {
+		name = "repo-deadbeef/" + name
+		hdr := &tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("header %s: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write tarball: %v", err)
+	}
+}
+
+func TestVersionFromTarball_GitHubCodeloadPAX(t *testing.T) {
+	cases := []struct {
+		name string
+		fw   Framework
+		file string
+		body string
+		want string
+	}{
+		{name: "node", fw: FrameworkNode, file: ".nvmrc", body: "v22.11.0", want: "22.11.0"},
+		{name: "python", fw: FrameworkPython, file: ".python-version", body: "3.13.1", want: "3.13.1"},
+		{name: "go", fw: FrameworkGo, file: "go.mod", body: "module example\n\ngo 1.24\n", want: "1.24"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tempTarball(t)
+			writeWrappedPAXTarGz(t, path, map[string]string{tc.file: tc.body})
+			if got := VersionFromTarball(path, tc.fw); got != tc.want {
+				t.Fatalf("VersionFromTarball = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // seedDirFSWithFiles creates a tempdir + writes the given
 // name→content map (forward-slash names) + returns an os.DirFS
 // over the root. Used by the VersionFromFS tests.

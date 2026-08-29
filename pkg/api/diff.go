@@ -60,6 +60,19 @@ type DiffRequest struct {
 	// EdgeRules is the post-deploy edge rule list. Same shape
 	// semantics as Crons.
 	EdgeRules []CreateEdgeRuleRequest `json:"edge_rules,omitempty"`
+	// Scope (ADR-091 / PR-D) is the scope the pending deployment
+	// would target. Empty / omitted means "no scope change
+	// proposed" (handler coerces "" → api.DefaultEnvScope at
+	// write time, so a pending empty-scope diff is the same as
+	// a pending default-scope diff from the engine's point of
+	// view — but only when the baseline is also default).
+	// SAFE-RELEASES production-leveling Stream E (issue #976 /
+	// ADR-122 post-merge audit): the engine compares this
+	// against Baseline.LatestScope and emits a SeverityWarn
+	// `scope_mismatch` break when the two differ, so an
+	// operator running `gregale diff` against a staging→prod
+	// promotion sees the cross-env drift before the deploy.
+	Scope string `json:"scope,omitempty"`
 }
 
 // DiffAppConfigPatch mirrors [pkg/deploydiff.AppConfigPatch] field

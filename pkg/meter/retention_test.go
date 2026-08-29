@@ -17,6 +17,7 @@ package meter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -218,5 +219,114 @@ func TestRetentionLoop_TicksAtLeastOnce(t *testing.T) {
 	}
 	if got := len(r.callsCopy()); got < 1 {
 		t.Errorf("calls = %d, want ≥ 1 (loop must tick at least once)", got)
+	}
+}
+
+// TestRetentionOnceDeploymentAudit_SQLShape pins the bounded-
+// DELETE shape against deployment_audit + the 90-day cutoff
+// (SAFE-RELEASES production-leveling Stream D, issue #976 /
+// ADR-122). A refactor that drops the ctid LIMIT or widens the
+// cutoff must fail this test.
+func TestRetentionOnceDeploymentAudit_SQLShape(t *testing.T) {
+	must := []string{
+		"DELETE FROM public.deployment_audit",
+		"WHERE ctid IN (",
+		"SELECT ctid FROM public.deployment_audit",
+		"LIMIT $2",
+	}
+	for _, want := range must {
+		if !strings.Contains(retentionDeploymentAuditBatchSQL, want) {
+			t.Errorf("retentionDeploymentAuditBatchSQL missing %q; an unbounded DELETE would balloon WAL. Got:\n%s", want, retentionDeploymentAuditBatchSQL)
+		}
+	}
+	// 90-day cutoff is bound via $1 (interval) + RetentionBatchSize via $2.
+	// Pin both args so a refactor that swaps the parameter order is caught.
+	r := &recordingExecer{
+		rowsFn: func(int) int64 { return 7 },
+	}
+	got, err := RetentionOnceDeploymentAudit(context.Background(), r)
+	if err != nil {
+		t.Fatalf("RetentionOnceDeploymentAudit: %v", err)
+	}
+	if got != 7 {
+		t.Errorf("rows = %d, want 7", got)
+	}
+	calls := r.callsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1 (short read exits the loop)", len(calls))
+	}
+	if got, want := calls[0].Args[0], fmt.Sprintf("%d days", DefaultDeploymentAuditRetentionDays); got != want {
+		t.Errorf("arg[0] (interval) = %q, want %q", got, want)
+	}
+	if calls[0].Args[1] != RetentionBatchSize {
+		t.Errorf("arg[1] = %v, want %d", calls[0].Args[1], RetentionBatchSize)
+	}
+	if DefaultDeploymentAuditRetentionDays != 90 {
+		t.Errorf("DefaultDeploymentAuditRetentionDays = %d, want 90", DefaultDeploymentAuditRetentionDays)
+	}
+	if DefaultDeploymentAuditRetentionInterval != 6*time.Hour {
+		t.Errorf("DefaultDeploymentAuditRetentionInterval = %v, want 6h", DefaultDeploymentAuditRetentionInterval)
+	}
+}
+
+// TestRetentionLoopDeploymentAudit_OnTickRowsCallback pins the
+// counter-callback contract: each tick that deletes >0 rows
+// fires onTickRows exactly once with the cumulative count.
+// Idle passes (n==0) and nil callbacks must not panic.
+func TestRetentionLoopDeploymentAudit_OnTickRowsCallback(t *testing.T) {
+	r := &recordingExecer{
+		rowsFn: func(int) int64 { return 3 },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu         sync.Mutex
+		calledWith []int64
+	)
+	done := make(chan struct{})
+	go func() {
+		RetentionLoopDeploymentAudit(ctx, r, 10*time.Millisecond, nil, func(n int64) {
+			mu.Lock()
+			calledWith = append(calledWith, n)
+			mu.Unlock()
+		})
+		close(done)
+	}()
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calledWith) < 1 {
+		t.Fatalf("callback fired %d times, want ≥ 1", len(calledWith))
+	}
+	for _, n := range calledWith {
+		if n <= 0 {
+			t.Errorf("callback arg = %d, want > 0", n)
+		}
+	}
+}
+
+// TestRetentionLoopDeploymentAudit_NilCallbackSafe pins that a
+// nil onTickRows doesn't panic — production wiring in cmd/
+// meterd passes the closure, but the test seam must accept nil
+// so callers without a Prometheus registry can wire the loop.
+func TestRetentionLoopDeploymentAudit_NilCallbackSafe(t *testing.T) {
+	r := &recordingExecer{
+		rowsFn: func(int) int64 { return 5 },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		RetentionLoopDeploymentAudit(ctx, r, 10*time.Millisecond, nil, nil)
+		close(done)
+	}()
+	time.Sleep(35 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop did not exit on ctx.Done() with nil callback")
 	}
 }

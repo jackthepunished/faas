@@ -1352,3 +1352,56 @@ func (c *Client) PostTriggersBatchCreate(ctx context.Context, req CreateTriggerB
 	var out map[string]any
 	return out, c.do(ctx, "POST", "/v1/triggers:batch_create", req, &out)
 }
+
+// CancelDeployment flips a deployment in {pending, building, imaging,
+// snapshotting} to "cancelled" and cascades the cancel to its
+// in-flight builds. Live deployments return 409 with code
+// "deployment_cancel_live_forbidden" and the canonical hint pointing
+// at `gregale deploys rollback` — the per-deployment contract from
+// ADR-118 / ADR-124. Optional reason values are the closed set
+// "user" | "auto_quota" | "auto_health" | "system"; an empty string
+// defaults to "user" server-side.
+//
+// Returns the typed CancelDeploymentResponse so callers can read
+// CancelReason (the reason the server recorded on the row) and
+// CancelledBuilds (the cascade-cancelled build IDs).
+func (c *Client) CancelDeployment(ctx context.Context, appSlug, id string, reason string) (CancelDeploymentResponse, error) {
+	var out CancelDeploymentResponse
+	body := CancelDeploymentRequest{Reason: reason}
+	return out, c.do(ctx, "POST", "/v1/apps/"+appSlug+"/deployments/"+id+"/cancel", body, &out)
+}
+
+// ReorderDeployment updates the priority of a still-pending deployment.
+// 0 = "deploy immediately" (top of queue), 100 = FIFO default, 1000 =
+// background rebuild. Plan-gated (Hobby/Pro/Scale only); Free returns
+// 402 "plan_reorder_disabled". Returns ErrReorderNotPending (409) when
+// the deployment has already moved off the pending queue.
+//
+// Returns the typed ReorderDeploymentResponse so callers can confirm
+// the server-applied priority (the response echoes the value).
+func (c *Client) ReorderDeployment(ctx context.Context, id string, newPriority int) (ReorderDeploymentResponse, error) {
+	var out ReorderDeploymentResponse
+	body := struct {
+		Priority int `json:"priority"`
+	}{Priority: newPriority}
+	return out, c.do(ctx, "POST", "/v1/deployments/"+id+"/reorder", body, &out)
+}
+
+// ClearDeployment soft-deletes one deployment (admin audit trail).
+// Live deployments return 409 with the cancel-live hint; the IDOR gate
+// is the standard resolveDeploymentAccount helper. Free-allowed.
+func (c *Client) ClearDeployment(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/deployments/"+id, nil, nil)
+}
+
+// ClearObsoleteDeployments bulk soft-deletes terminal-but-not-current
+// rows (status ∈ {superseded, failed, cancelled}) older than olderThan.
+// Plan-gated (Free returns 402). The retention cap is enforced inside
+// the store so INV 3 (always-current-deployment) stays satisfied.
+func (c *Client) ClearObsoleteDeployments(ctx context.Context, appSlug string, olderThan time.Duration) (ClearObsoleteReport, error) {
+	var out ClearObsoleteReport
+	body := struct {
+		OlderThan string `json:"older_than,omitempty"`
+	}{OlderThan: olderThan.String()}
+	return out, c.do(ctx, "POST", "/v1/apps/"+appSlug+"/deployments/clear-obsolete", body, &out)
+}

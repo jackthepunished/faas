@@ -437,6 +437,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Production-leveling Stream C: env-scoped stuck-after
+	// threshold. Read FAAS_SAFEDEPLOY_STUCK_AFTER before the
+	// recovery routes wire up so the very first
+	// /v1/apps/{slug}/rollouts/recover request uses the
+	// overridden window. Returns 0 on unset / unparseable —
+	// the setter silently ignores <= 0 so the canned 30min
+	// stays in effect (no silent inversion).
+	state.SetRecoverRolloutStuckAfter(stuckAfterFromEnv(log))
+
 	// Load the same TOML that supplies the listener and TLS settings before
 	// opening Postgres. This is important on split-box control planes: the
 	// renderer writes a local Unix-socket db_url, while compute boxes keep
@@ -822,6 +831,30 @@ func graceIntervalFromEnv(log *slog.Logger) time.Duration {
 	if err != nil || d <= 0 {
 		if log != nil {
 			log.Warn("FAAS_GRACE_INTERVAL unparseable, using default",
+				"value", v, "err", err)
+		}
+		return 0
+	}
+	return d
+}
+
+// stuckAfterFromEnv reads FAAS_SAFEDEPLOY_STUCK_AFTER to let
+// operators tune the RecoverRollout stuck-detection window per
+// environment (production-leveling Stream C). Default 30 min
+// (pkg/state.RecoverRolloutStuckAfter) is the ADR-122 canned
+// value; a dev cluster can drop it to 5 min so e2e tests don't
+// wait half an hour for "this rollout is stuck" to fire. Returns
+// 0 on unset / unparseable so the setter silently ignores it
+// and the canned value stays in effect.
+func stuckAfterFromEnv(log *slog.Logger) time.Duration {
+	v := os.Getenv("FAAS_SAFEDEPLOY_STUCK_AFTER")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		if log != nil {
+			log.Warn("FAAS_SAFEDEPLOY_STUCK_AFTER unparseable, using default",
 				"value", v, "err", err)
 		}
 		return 0

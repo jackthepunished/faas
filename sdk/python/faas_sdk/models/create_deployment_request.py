@@ -78,8 +78,8 @@ class CreateDeploymentRequest:
     """Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server
     default false."""
     canary: CanaryPresetSpec | None | Unset = UNSET
-    """Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale
-    only."""
+    """Per-deployment canary ladder (issue #976 / ADR-122 / SAFE-RELEASES-A). nil/omitted = server default 'none'.
+    For preset='custom', stages carries the customer ladder."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

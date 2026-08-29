@@ -1,6 +1,7 @@
 package dashboard_test
 
 import (
+	"encoding/json"
 	"html/template"
 	"io"
 	"log/slog"
@@ -982,4 +983,64 @@ func TestRender_DeploymentDetail_PreviewURLCopyChip(t *testing.T) {
 			t.Errorf("alive=false body should not render copyable input\n--- body ---\n%s", body)
 		}
 	})
+}
+
+// TestPrettyAuditData_RoundTrip pins the pretty-print behaviour
+// for the deployment_audit timeline block (issue #976 / ADR-122 /
+// SAFE-RELEASES-E.2 + production-leveling Stream A): nil / empty
+// yields the empty string (template renders the muted "—"
+// placeholder); well-formed jsonb yields a 2-space-indented
+// representation; unparseable jsonb falls through to the verbatim
+// bytes so the operator sees something instead of a missing
+// column.
+func TestPrettyAuditData_RoundTrip(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		if got := dashboard.PrettyAuditData(nil); got != "" {
+			t.Errorf("nil=%q, want empty", got)
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		if got := dashboard.PrettyAuditData(json.RawMessage{}); got != "" {
+			t.Errorf("empty=%q, want empty", got)
+		}
+	})
+	t.Run("valid", func(t *testing.T) {
+		raw := json.RawMessage(`{"from_percent":0,"to_percent":1}`)
+		got := dashboard.PrettyAuditData(raw)
+		want := "{\n  \"from_percent\": 0,\n  \"to_percent\": 1\n}"
+		if got != want {
+			t.Errorf("got=%q, want=%q", got, want)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		raw := json.RawMessage(`{not-json`)
+		got := dashboard.PrettyAuditData(raw)
+		if got != string(raw) {
+			t.Errorf("invalid=%q, want verbatim %q", got, string(raw))
+		}
+	})
+}
+
+// TestDeploymentAuditSeverityClass pins the closed-set kind→CSS
+// palette mapping the dashboard handler uses to render the audit
+// timeline chips. A future enum widening lands as a CI failure
+// here (info → wrong palette for a customer-affecting state flip).
+func TestDeploymentAuditSeverityClass(t *testing.T) {
+	cases := []struct {
+		kind string
+		want string
+	}{
+		{"deploy.rolled_back", "high"},
+		{"deploy.traffic_changed", "warn"},
+		{"deploy.health_probe_failed", "warn"},
+		{"deploy.created", "info"},
+		{"deploy.source_ref", "info"},
+		{"deploy.health_recovered", "info"},
+		{"", "info"}, // unknown kind → info fallback
+	}
+	for _, c := range cases {
+		if got := dashboard.DeploymentAuditSeverityClass(c.kind); got != c.want {
+			t.Errorf("kind=%q → %q, want %q", c.kind, got, c.want)
+		}
+	}
 }

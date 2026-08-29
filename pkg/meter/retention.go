@@ -352,3 +352,106 @@ func RetentionLoopRequestTelemetry(ctx context.Context, db retentionExecer, inte
 		}
 	}
 }
+
+// DefaultDeploymentAuditRetentionDays is the upper bound for the
+// deployment_audit table. SAFE-RELEASES production-leveling
+// (Stream D, issue #976 / ADR-122 post-merge audit): the table
+// has no GC today, so unbounded growth would fill disk + bloat
+// the at_gc index on a long-lived cluster. 90 days is well past
+// the longest plausible investigation window (operator
+// post-incident review rarely extends past 30 days) and stays
+// inside the financial-model retention envelope.
+const DefaultDeploymentAuditRetentionDays = 90
+
+// DefaultDeploymentAuditRetentionInterval is the cron cadence
+// for the deployment_audit sweep. 6 h matches the usage_minutes
+// sweep's "one pass per business-day quadrant" rhythm — a daily
+// sweep would let the table accumulate up to ~1 extra day's
+// worth of rows between ticks, which is fine for a 90-day
+// retention window but misses shorter-detect signal.
+const DefaultDeploymentAuditRetentionInterval = 6 * time.Hour
+
+// retentionDeploymentAuditBatchSQL deletes rows in the bounded
+// DELETE pattern (ctid + LIMIT N) — same shape as
+// retentionBatchSQL above. The planner uses
+// deployment_audit_at_gc_idx (single-column B-tree on `at`,
+// migrations/00477) so the WHERE at < cutoff range-scan is
+// index-backed.
+const retentionDeploymentAuditBatchSQL = `DELETE FROM public.deployment_audit
+                                       WHERE ctid IN (
+                                           SELECT ctid FROM public.deployment_audit
+                                           WHERE at < (now() - $1::interval)
+                                           LIMIT $2
+                                       )`
+
+// RetentionOnceDeploymentAudit runs one DELETE pass against
+// public.deployment_audit, bounded by RetentionBatchSize per
+// statement and MaxRetentionBatches total iterations. Returns
+// the cumulative row count. Same shape as RetentionOnce —
+// additive free function, no shared state with the
+// usage_minutes / request_telemetry sweeps.
+//
+// The retention window is DefaultDeploymentAuditRetentionDays
+// (90 d). Operators can widen via a config knob in a follow-up
+// ADR — today the constant matches the financial-model + on-
+// call investigation envelope.
+func RetentionOnceDeploymentAudit(ctx context.Context, db retentionExecer) (int64, error) {
+	interval := fmt.Sprintf("%d days", DefaultDeploymentAuditRetentionDays)
+	var total int64
+	for i := 0; i < MaxRetentionBatches; i++ {
+		tag, err := db.Exec(ctx, retentionDeploymentAuditBatchSQL, interval, RetentionBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("deployment audit retention delete (batch %d, deleted so far %d): %w", i, total, err)
+		}
+		total += tag
+		if tag < RetentionBatchSize {
+			return total, nil
+		}
+	}
+	return total, ErrRetentionBatchCap
+}
+
+// RetentionLoopDeploymentAudit is the free-function goroutine
+// that calls RetentionOnceDeploymentAudit every Interval.
+// Returns on ctx.Done(). Mirrors RetentionLoop /
+// RetentionLoopRequestTelemetry — same log posture (cap-hit is
+// Warn, hard DB failure is Error).
+//
+// onTickRows is invoked once per tick after a successful pass
+// with the cumulative row count (only when n > 0 so idle
+// passes don't tick up). Used by cmd/meterd to Inc the
+// meterd_deployment_audit_gc_rows_deleted_total counter (SAFE-
+// RELEASES Stream D). nil-allowed so test callers can wire the
+// loop without a Prometheus registry.
+func RetentionLoopDeploymentAudit(ctx context.Context, db retentionExecer, interval time.Duration, log *slog.Logger, onTickRows func(int64)) {
+	if interval <= 0 {
+		interval = DefaultDeploymentAuditRetentionInterval
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n, err := RetentionOnceDeploymentAudit(ctx, db)
+			switch {
+			case err == nil:
+				if log != nil {
+					log.Info("deployment audit retention tick ok", "rows_deleted", n)
+				}
+				if n > 0 && onTickRows != nil {
+					onTickRows(n)
+				}
+			case errors.Is(err, ErrRetentionBatchCap):
+				if log != nil {
+					log.Warn("deployment audit retention tick hit batch cap; will resume next tick", "rows_deleted", n, "err", err)
+				}
+			default:
+				if log != nil {
+					log.Error("deployment audit retention tick failed", "err", err)
+				}
+			}
+		}
+	}
+}

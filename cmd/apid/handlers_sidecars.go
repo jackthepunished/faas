@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/api/canary"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -318,6 +320,59 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 	// the account's plan allows traffic splitting.
 	if req.TrafficPercent != nil {
 		dep.TrafficPercent = *req.TrafficPercent
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: stamp the canary
+	// ladder at deploy time. nil req.Canary → fast-default zero
+	// ('none', 0, 0, NULL) — preserved exactly matches today's
+	// behaviour. Non-nil → resolve against pkg/api/canary's
+	// closed-set catalog; on 'none' we stamp the disable row
+	// (zero ladder), on any other preset we stamp total_steps +
+	// step=0 + step_started_at=now() so the canary_progression
+	// meterd tick has a starting position to walk from.
+	if req.Canary != nil {
+		// SAFE-RELEASES production-leveling Stream F: the custom
+		// preset's stages come from the wire (req.Canary.Stages),
+		// not the catalog. LookupCustomPreset runs the same
+		// Validate() rules the catalog presets use, so a buggy
+		// custom ladder (negative percent, terminal-stage-not-100%)
+		// surfaces as a 422 here instead of an orchestrator panic
+		// later.
+		var preset canary.Preset
+		if req.Canary.Preset == "custom" {
+			custom, cerr := canary.LookupCustomPreset(req.Canary.Stages)
+			if cerr != nil {
+				return state.Deployment{}, api.ErrInvalidCanaryPreset(cerr.Error())
+			}
+			preset = custom
+			// Serialise the resolved stages to jsonb so the
+			// orchestrator's per-row resolve can rehydrate the
+			// Preset without going back through the wire. The
+			// jsonb shape mirrors OverrideEnv / Sidecars — the
+			// pkg/state type carries json.RawMessage.
+			raw, merr := json.Marshal(req.Canary.Stages)
+			if merr != nil {
+				return state.Deployment{}, api.ErrInvalidCanaryPreset(merr.Error())
+			}
+			dep.CanaryStages = raw
+		} else {
+			p, ok := canary.LookupPreset(req.Canary.Preset)
+			if !ok {
+				return state.Deployment{}, api.ErrInvalidCanaryPreset(req.Canary.Preset)
+			}
+			preset = p
+		}
+		dep.CanaryPreset = preset.Name
+		dep.CanaryTotalSteps = preset.TotalSteps()
+		// SAFE-RELEASES code-review hardening (migration 00517):
+		// canary_step_started_at is NOT NULL post-00517, so the
+		// apid Create path must stamp it on every row. The
+		// readers (pkg/canary.Once line 226, pkg/safedeploy.
+		// Orchestrator line 207) only consult the timestamp when
+		// CanaryTotalSteps > 0; the no-canary (preset=none) row
+		// gets the deployment's created_at as a placeholder that
+		// the readers will skip via the surrounding predicate.
+		now := time.Now().UTC()
+		dep.CanaryStepStartedAt = &now
 	}
 	// ADR-091 / PR-D: per-deployment env scope. The handler ran
 	// api.ValidateScope above — non-empty here means well-formed

@@ -44,6 +44,29 @@
         - { path: /usr/local/bin, mode: "0755" }
         - { path: /var/lib/faas/bootstrap, mode: "0700" }
 
+    # Keep the Ansible boundary fail-closed as well as the gregalectl
+    # boundary. This playbook can be invoked directly by an operator, so a
+    # caller must not be able to bypass the multi-box OCI contract and make
+    # snapshots host-local by accident. The lookup runs on the controller;
+    # no secret-bearing value is printed or copied into Ansible output.
+    - name: Validate shared OCI storage contract before staging it
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('ansible.builtin.file', faas_join_storage_env_source) |
+            regex_search('(?m)^FAAS_STORAGE_BACKEND=oci\s*$')) is not none
+          - >-
+            (lookup('ansible.builtin.file', faas_join_storage_env_source) |
+            regex_search('(?m)^FAAS_OCI_REGISTRY=\S+$')) is not none
+          - >-
+            (lookup('ansible.builtin.file', faas_join_storage_env_source) |
+            regex_search('(?m)^FAAS_STORAGE_LOCAL_PREFIXES=.*snap/')) is none
+        fail_msg: >-
+          storage.env must set FAAS_STORAGE_BACKEND=oci and
+          FAAS_OCI_REGISTRY, and must not route snap/ through
+          FAAS_STORAGE_LOCAL_PREFIXES for a multi-box compute node.
+      no_log: true
+
     - name: Create the shared daemon group before staging group-readable keys
       ansible.builtin.group:
         name: faas

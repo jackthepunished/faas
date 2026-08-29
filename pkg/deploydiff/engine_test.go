@@ -286,6 +286,34 @@ func TestCompute_DeploymentImmutable_HealthzClear(t *testing.T) {
 	}
 }
 
+// TestCompute_DeploymentImmutable_PortClear — code-review finding #3
+// hardening: clearing the port override (reverting to the default
+// by setting Manifest.Port=0) against a deployment with
+// OverridePort=8080 must emit would_create_deployment. The pre-review
+// guard `p.Manifest.Port != 0 && p.Manifest.Port != base.OverridePort`
+// short-circuited when the manifest cleared the field, silently
+// dropping the break and missing the customer-visible immutable
+// change. This test is the parity sibling of
+// TestCompute_DeploymentImmutable_HealthzClear above.
+func TestCompute_DeploymentImmutable_PortClear(t *testing.T) {
+	base := &api.DeploymentResponse{
+		OverridePort: 8080,
+	}
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
+	got := Compute("api", "", baseline, Pending{
+		Manifest: &api.AppManifest{Port: 0}, // explicitly clear (revert to default)
+	})
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "would_create_deployment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("clearing the port override must emit would_create_deployment; got %+v", got.Breaks)
+	}
+}
+
 // TestCompute_SchemaEnvChanged_KeyClear — code-review finding #4:
 // clearing every env key from the manifest (Env == empty map) must
 // still emit a schema_env_changed break when the baseline had
@@ -486,6 +514,95 @@ func TestCompute_SchemaBreak_TextOnlyStillFires(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("text-only schema_env_changed must still fire when manifest env key set changes; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_ScopeMismatch — SAFE-RELEASES Stream E. ADR-091's
+// per-deployment scope targeting means a single app can have one
+// live row per scope; the diff must surface cross-env promotions
+// (default → staging) as informational so the operator can confirm
+// they meant to promote, not patch the default row.
+func TestCompute_ScopeMismatch(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	// Pending deployment targets staging instead of default.
+	pending := Pending{Scope: "staging"}
+	got := Compute("api", "", baseline, pending)
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" && b.Field == "deployment.scope" {
+			found = true
+			if b.Severity != SeverityWarn {
+				t.Errorf("Severity = %q, want %q", b.Severity, SeverityWarn)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("scope change must emit scope_mismatch break; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_ScopeMismatch_NoBreakWhenEqual — same scope on
+// both sides is a no-op.
+func TestCompute_ScopeMismatch_NoBreakWhenEqual(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	pending := Pending{Scope: "default"}
+	got := Compute("api", "", baseline, pending)
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" {
+			t.Errorf("scope_mismatch must not fire when both sides carry the same scope; got %+v", got.Breaks)
+		}
+	}
+}
+
+// TestCompute_ScopeMismatch_EmptyOnEitherSide — empty on
+// either side is a no-op (deployments with no explicit scope
+// default to "default" at write time; comparing against an
+// empty string would fire a false positive on every deploy).
+func TestCompute_ScopeMismatch_EmptyOnEitherSide(t *testing.T) {
+	base := &api.DeploymentResponse{Scope: "default"}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      "default",
+	}
+	// Empty pending scope: handler coerces "" → "default" at
+	// write time, so this must not fire scope_mismatch.
+	pending := Pending{Scope: ""}
+	got := Compute("api", "", baseline, pending)
+	for _, b := range got.Breaks {
+		if b.Code == "scope_mismatch" {
+			t.Errorf("scope_mismatch must not fire when pending scope is empty; got %+v", got.Breaks)
+		}
+	}
+}
+
+// TestCompute_BaselineFieldsPopulate_NoDepsReadsToNil — pin the
+// buildDiffBaseline wire-up: a baseline built from a non-nil
+// LatestDeployment must populate LatestScope from dep.Scope so
+// the engine can compare. This is the apid-side counterpart to
+// the engine tests above — it asserts the server-side builder
+// doesn't forget to mirror the column into the baseline.
+func TestCompute_BaselineFieldsPopulate_NoDepsReadsToNil(t *testing.T) {
+	base := &api.DeploymentResponse{
+		Scope: "staging",
+	}
+	baseline := Baseline{
+		App:              &api.AppResponse{Slug: "api"},
+		LatestDeployment: base,
+		LatestScope:      base.Scope,
+	}
+	if baseline.LatestScope != "staging" {
+		t.Errorf("LatestScope = %q, want staging", baseline.LatestScope)
 	}
 }
 

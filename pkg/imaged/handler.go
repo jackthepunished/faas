@@ -2124,6 +2124,25 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "manifest invalid: "+err.Error())
 		return fmt.Errorf("imaged: validate manifest: %w", err)
 	}
+	// Source builds arrive with a builderd-produced local OCI archive in
+	// dep.RootfsPath. Keep the original source tarball for the customer
+	// handler and overlay the built OCI layers first so dependencies and the
+	// compiled Go /app/server artifact are present during function assembly.
+	// Direct image deployments have no source-build OCI handoff and retain the
+	// legacy raw-tarball path.
+	var builtLayers []io.Reader
+	var cleanupBuiltLayers func()
+	if (runtime == RuntimeGo124 || runtime == RuntimeGo124Alpine) &&
+		dep.RootfsPath != "" && dep.RootfsPath != dep.SourcePath && dep.Kind != state.DeploymentKindImage {
+		_, layers, cleanup, loadErr := loadLocalOCIArchive(dep.RootfsPath)
+		if loadErr != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, "load source build artifact: "+loadErr.Error())
+			return fmt.Errorf("imaged: load source build artifact: %w", loadErr)
+		}
+		builtLayers = layersAsReaders(layers)
+		cleanupBuiltLayers = cleanup
+		defer cleanupBuiltLayers()
+	}
 
 	appsKey := sched.AppLayerKey(app.Slug, dep.ID)
 	be, err := h.storageFor()
@@ -2132,15 +2151,16 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		return fmt.Errorf("imaged: storageFor: %w", err)
 	}
 	result, err := h.builder.Build(ctx, rootfs.BuildInput{
-		Layers:        layersAsReaders(nil), // function deploys use the tarball via BuildInput.Tarball
+		Layers:        builtLayers,
 		Manifest:      manifest,
 		GuestInitPath: h.guestInitPath,
 		Plan:          acct.Plan,
 		Storage:       be,
 		StorageKey:    appsKey,
 		// TarballPath lets the rootfs.Builder stream the customer's
-		// source tarball into /app during layer assembly. Tests skip
-		// this by leaving TarballPath empty.
+		// source tarball into /app during layer assembly. For source builds,
+		// builtLayers above are applied first so Go's compiled /app/server
+		// can be normalized to /app/handler.
 		TarballPath: dep.SourcePath,
 		// The customer-facing Node convention is handler.js while the
 		// versioned runner executes /app/node22.js or /app/node24.js.

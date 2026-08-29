@@ -676,6 +676,65 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 	return req
 }
 
+// createOrFetchApp issues CreateApp and, on a 409 (the slug is taken),
+// probes the server with GetApp to disambiguate "owned by this account"
+// from "owned by another account". Returns nil on success (either a fresh
+// create or an in-account match).
+//
+// Issue #1182 / pre-existing soft-#560 behaviour:
+//   - CreateApp → 200/201 → nil
+//   - CreateApp → 409 → GetApp(slug):
+//   - 200 → the slug exists in this account → mirror --require-authn /
+//     --app-protocol via UpdateApp (preserves the existing #560 PATCH
+//     semantics), return nil
+//   - 404 → apid's loadAppAndPreflight returns a silent 404 for IDOR
+//     (the slug is owned by another account), so we cannot tell apart
+//     "different account" from "race against a peer that just
+//     deleted". The hybrid probe HARD-FAILS here rather than silently
+//     falling through to DeployTarball — DeployTarball would otherwise
+//     404 at apid with the less informative "no such app" message, and
+//     the customer would never learn that the slug is taken globally.
+//   - CreateApp → non-409 error → returned unwrapped; the caller's
+//     printErr prefix is the single user-facing message. Wrapping the
+//     APIError here would produce a confusing double-prefix like
+//     "Could not create or fetch app: could not create app: ...".
+//
+// The probe costs one extra round-trip on the slug-conflict path, which
+// is rare in normal use (zero-config deploy on a fresh repo is the only
+// caller that hits it). The happy path is unchanged.
+func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequest, requireAuthnPtr *bool, appProtocolPtr *string) error {
+	if _, err := client.CreateApp(ctx, req); err == nil {
+		return nil
+	} else {
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
+			return err
+		}
+		// Conflict: probe with GetApp to disambiguate same-account vs
+		// other-account ownership. The server's loadAppAndPreflight
+		// enforces IDOR via silent 404, so a 200 means "ours" and a 404
+		// means "either race-with-peer or other-account — we cannot tell,
+		// so refuse to deploy and tell the operator".
+		if _, gerr := client.GetApp(ctx, req.Slug); gerr != nil {
+			return fmt.Errorf("slug %q is already in use; pick a different --name", req.Slug)
+		}
+		// Same account: mirror --require-authn / --no-require-authn (and
+		// --app-protocol, when set) onto the existing app via PATCH. The
+		// plan gate (Pro/Scale only) still fires at the apid PATCH handler
+		// — the existing #560 contract is preserved verbatim.
+		if requireAuthnPtr != nil || appProtocolPtr != nil {
+			upd := api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}
+			if appProtocolPtr != nil {
+				upd.AppProtocol = appProtocolPtr
+			}
+			if _, err := client.UpdateApp(ctx, req.Slug, upd); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // manifestCronClient is the narrow surface deployManifestTriggers
 // reads from the SDK. Splitting it lets the unit test inject a
 // recording fake (cmd/gregale/manifest_test.go) without an httptest
@@ -854,6 +913,16 @@ func cmdDeployTarball(args []string) int {
 	// posture.
 	deployPersistExclude := fs.Bool("persist-exclude", false, "record --exclude slugs into deployment_scope_exclusions for future deploys (ADR-124 follow-up #3)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
+	// SAFE-RELEASES production-leveling Stream F: canary ladder
+	// selectors. --canary-preset picks a catalog entry
+	// (none/slow/balanced/aggressive/1-10-50-100) or "custom";
+	// --canary-stages is a comma-separated
+	// "percent@duration" list (e.g. "1@30s,10@2m,100@0s")
+	// required only when --canary-preset=custom. The CLI parses
+	// + validates BEFORE the network round-trip so a typo
+	// surfaces as an exit-2 error instead of a 422.
+	canaryPreset := fs.String("canary-preset", "", "canary preset name (none|slow|balanced|aggressive|1-10-50-100|custom); empty = no canary")
+	canaryStages := fs.String("canary-stages", "", "comma-separated percent@duration pairs for --canary-preset=custom (e.g. \"1@30s,10@2m,100@0s\")")
 	// Issue #560: per-deployment require_authn opt-in (Cloud Run
 	// --no-allow-unauthenticated analogue). Same flag pair as
 	// cmdApp / cmdAppScale. Mirrors the --warm-snapshot /
@@ -1241,18 +1310,79 @@ func cmdDeployTarball(args []string) int {
 		if cwdErr != nil {
 			return printErr("Could not read current directory", cwdErr)
 		}
-		// Issue #961 / Mega-A PR-1: zero-config `gregale deploy` (no
-		// flags). If cwd is inside a git repo with an `origin` remote
-		// pointing at GitHub, route through cmdDeployZeroConfig —
-		// the CLI packs + uploads the local tarball via the new
-		// /source-tarball endpoint, sidestepping the
-		// github_installations gate. Non-git or non-GitHub origins
-		// fall through to the existing cwd-auto-pack branch
-		// below (issue #313).
-		if root, gerr := gitRootFromCwd(cwd); gerr == nil {
-			if _, rerr := gitRemoteOrigin(root); rerr == nil {
-				return cmdDeployZeroConfig(slug, cwd)
+		// Issue #1182: refactored zero-config `gregale deploy` (no
+		// flags). When cwd is in a git repo with an `origin` remote
+		// we pack via `git archive HEAD` (the committed tree, not the
+		// working tree) and fall through to the normal
+		// buildCreateRequest → CreateApp → DeployTarball pipeline
+		// below. The legacy cmdDeployZeroConfig + mustOpen +
+		// sourceTarballSidecar trio is gone — that path bypassed
+		// CreateApp and dropped every deploy flag. The new path
+		// preserves ADR-115's source-tarball trust boundary (the
+		// source-tarball endpoint stays as the install-token CI
+		// path) by NOT routing through it; it goes through the same
+		// CreateApp + DeployTarball wire as --tarball / --template.
+		//
+		// Three outcomes from resolveZeroConfigProvenance:
+		//   - ok=true,  err=nil   → pack HEAD, stamp provenance
+		//   - ok=false, err=ErrNotInGitRepo / ErrNoGitRemote → fall
+		//     through to the cwd-auto-pack branch below
+		//     (existing behavior preserved for non-git dirs and for
+		//     git repos without origin)
+		//   - ok=false, err=other → surface the error
+		if prov, ok, perr := resolveZeroConfigProvenance(cwd); ok {
+			if prov.Dirty {
+				// Print a dirty warning naming the SHA + dirty count
+				// so the operator sees exactly what they're shipping
+				// (HEAD only, no working-tree changes). The deploy
+				// still proceeds — Ctrl-C is the operator's opt-out.
+				if dirtyOut, derr := runGitCmd(prov.Root, "status", "--porcelain"); derr == nil {
+					dirtyFiles := 0
+					for _, line := range strings.Split(strings.TrimRight(dirtyOut, "\n"), "\n") {
+						if line != "" {
+							dirtyFiles++
+						}
+					}
+					if dirtyFiles > 0 {
+						PrintProgress(os.Stdout, "Note: working tree has %d dirty file(s); deploying HEAD (%s) only — commit first to include the changes",
+							dirtyFiles, prov.SHA[:7])
+					}
+				}
 			}
+			// Materialise HEAD as a temp gzipped tar via `git archive`.
+			// os.CreateTemp returns a *File we close immediately —
+			// gitArchiveHEAD writes to the path, no fd leak on this
+			// path. The temp file is removed by the defer; the open
+			// that follows uses openCustomerFile + defer Close (the
+			// existing --tarball branch), which is fd-safe.
+			tmpFile, terr := os.CreateTemp("", "gregale-git-*.tar.gz")
+			if terr != nil {
+				return printErr("Could not create temp tarball", terr)
+			}
+			tmpPath := tmpFile.Name()
+			_ = tmpFile.Close()
+			defer func() { _ = os.Remove(tmpPath) }()
+			if err := gitArchiveHEAD(prov.Root, tmpPath); err != nil {
+				return printErr("Could not archive git HEAD", err)
+			}
+			*tarball = tmpPath
+			PrintProgress(os.Stderr, "packing HEAD (%s) from %s",
+				prov.SHA[:7], filepath.Base(cwd))
+			// Auto-capture `git config user.name` as deployed_by
+			// unless the operator explicitly passed --deployed-by.
+			// Mirrors the legacy path at cmd_deploy_zero_config.go
+			// (issue #977 / ADR-116).
+			if *deployedBy == "" && prov.DeployedBy != "" {
+				*deployedBy = prov.DeployedBy
+			}
+			// resolvedShape stays shapeApp — `git archive HEAD` ships
+			// the committed tree and the server-side builder detects
+			// the framework from there (same as a --tarball upload).
+			// The cwd shape detector at lines 1264+ only runs when
+			// no git origin is present, which is the only case where
+			// a *tarball-less path can land here after this block.
+		} else if !errors.Is(perr, ErrNotInGitRepo) && !errors.Is(perr, ErrNoGitRemote) {
+			return printErr("Could not resolve git metadata", perr)
 		}
 		// Issue #737 / ADR-083: resolveDeployShape does detect +
 		// infer + print in one seam so the unit test can drive the
@@ -1261,60 +1391,97 @@ func cmdDeployTarball(args []string) int {
 		// response from the CLI is the deploy shape. An explicit
 		// --function / --app short-circuits the detector — see the
 		// mutex block above.
-		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
-		if err != nil {
-			return printErr("No deployable source found in "+filepath.Base(cwd), err)
+		//
+		// Issue #1182: resolve the per-plan upload cap from the
+		// customer's account before any packing happens. The CLI used
+		// to use the Free/Hobby floor (100 MB) for every customer
+		// because it lacked an authed round-trip this early; that
+		// silently truncated Pro/Scale archives to 100 MB even though
+		// the server would have accepted 250 MB. The Whoami call uses
+		// a separate authed client so the deploy timeout on
+		// authedClientWithDeployTimeout (5 min, line 1382) is not
+		// affected — Whoami is a small JSON GET and never needs the
+		// deploy budget.
+		planCapMB := defaultZeroConfigSourceCapMB
+		if wcli, werr := authedClient(); werr == nil {
+			// 5-second budget: Whoami is a tiny JSON GET, but a flaky
+			// apid used to hang the CLI for the full HTTP timeout (30s)
+			// before falling back to the floor. Bound it explicitly so
+			// the zero-config deploy stays snappy on the unhappy path.
+			whoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if acct, werr := wcli.Whoami(whoCtx); werr == nil {
+				planCapMB = api.MustLimitsFor(api.Plan(acct.Plan)).SourceTarballMaxMB
+			} else {
+				PrintWarn(osStderr, "Whoami round-trip for per-plan cap failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
+			}
+			cancel()
+		} else {
+			PrintWarn(osStderr, "authed client for Whoami round-trip failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
 		}
-		switch detected {
-		case shapeFunction:
-			// An explicit --runtime / --handler on the CLI wins over
-			// the inferred value (customer may be overriding the
-			// default-extension→runtime map). The helper already
-			// printed "Detected: function, runtime=<rt>, handler=<h>"
-			// using the inferred values; the wire uses whatever is
-			// in *runtime / *handler here.
-			if *runtime == "" {
-				*runtime = rt
-			}
-			if *handler == "" {
-				*handler = hnd
-			}
-			// Pack the cwd so the multipart upload has a tarball —
-			// the function convention needs the file on the wire for
-			// imaged to stage it. The secret-scan pass runs before the
-			// tarball is sealed so a Stripe key committed to
-			// .env.production by accident is dropped before it leaves
-			// the workstation; --secret-scan=off disables it.
-			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
-			if scanErr != nil {
-				return printErr("Secret scan failed", scanErr)
-			}
-			path, _, n, err := autoPackCwd(cwd, overrides)
+		// Issue #1182 §3.3: only run the cwd auto-detect + auto-pack
+		// switch when no tarball was set by the git-archive branch
+		// above. The previous run unconditionally re-packed the
+		// working tree, silently overwriting the HEAD tarball and
+		// shipping uncommitted / untracked files despite the
+		// "deploying HEAD only" warning. With this guard the
+		// auto-pack branch is reachable only from the non-git /
+		// non-origin cwd-auto-pack fallback (existing behaviour).
+		if *tarball == "" {
+			detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
 			if err != nil {
-				return printErr("Could not pack current directory", err)
+				return printErr("No deployable source found in "+filepath.Base(cwd), err)
 			}
-			defer func() { _ = os.Remove(path) }()
-			renderSecretScanWarnings(scanFindings, osStderr)
-			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
-			*tarball = path
-			resolvedShape = shapeFunction
-		case shapeApp:
-			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
-			if scanErr != nil {
-				return printErr("Secret scan failed", scanErr)
+			switch detected {
+			case shapeFunction:
+				// An explicit --runtime / --handler on the CLI wins over
+				// the inferred value (customer may be overriding the
+				// default-extension→runtime map). The helper already
+				// printed "Detected: function, runtime=<rt>, handler=<h>"
+				// using the inferred values; the wire uses whatever is
+				// in *runtime / *handler here.
+				if *runtime == "" {
+					*runtime = rt
+				}
+				if *handler == "" {
+					*handler = hnd
+				}
+				// Pack the cwd so the multipart upload has a tarball —
+				// the function convention needs the file on the wire for
+				// imaged to stage it. The secret-scan pass runs before the
+				// tarball is sealed so a Stripe key committed to
+				// .env.production by accident is dropped before it leaves
+				// the workstation; --secret-scan=off disables it.
+				overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+				if scanErr != nil {
+					return printErr("Secret scan failed", scanErr)
+				}
+				path, _, n, err := autoPackCwd(cwd, planCapMB, overrides)
+				if err != nil {
+					return printErr("Could not pack current directory", err)
+				}
+				defer func() { _ = os.Remove(path) }()
+				renderSecretScanWarnings(scanFindings, osStderr)
+				PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+				*tarball = path
+				resolvedShape = shapeFunction
+			case shapeApp:
+				overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+				if scanErr != nil {
+					return printErr("Secret scan failed", scanErr)
+				}
+				path, fw, n, err := autoPackCwd(cwd, planCapMB, overrides)
+				if err != nil {
+					return printErr("Could not pack current directory", err)
+				}
+				defer func() { _ = os.Remove(path) }()
+				renderSecretScanWarnings(scanFindings, osStderr)
+				if fw == fwDocker {
+					*dockerfile = true
+				}
+				PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+				*tarball = path
+				resolvedShape = shapeApp
 			}
-			path, fw, n, err := autoPackCwd(cwd, overrides)
-			if err != nil {
-				return printErr("Could not pack current directory", err)
-			}
-			defer func() { _ = os.Remove(path) }()
-			renderSecretScanWarnings(scanFindings, osStderr)
-			if fw == fwDocker {
-				*dockerfile = true
-			}
-			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
-			*tarball = path
-			resolvedShape = shapeApp
 		}
 	}
 
@@ -1433,26 +1600,8 @@ func cmdDeployTarball(args []string) int {
 	}
 
 	createReq := buildCreateRequest(slug, resolvedShape, *runtime, requireAuthnPtr, appProtocolPtr)
-	if _, err := client.CreateApp(ctx, createReq); err != nil {
-		var ae *APIError
-		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
-			return printErr("Could not create app", err)
-		}
-		// Issue #560: the slug already exists (409). The deploy
-		// path used to silently swallow the dup and proceed with
-		// no PATCH; now if the customer passed --require-authn
-		// or --no-require-authn on this deploy, we follow up
-		// with a PATCH to mirror the new flag onto the existing
-		// app — the plan gate (Pro/Scale only) still fires at
-		// the apid PATCH handler, so Free/Hobby customers
-		// flipping --require-authn on an existing app get the
-		// same 403 plan_require_authn_not_allowed as on a fresh
-		// create. The unset case (no flag passed) is a no-op.
-		if requireAuthnPtr != nil {
-			if _, err := client.UpdateApp(ctx, slug, api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}); err != nil {
-				return printErr("Could not update existing app's require_authn", err)
-			}
-		}
+	if err := createOrFetchApp(ctx, client, createReq, requireAuthnPtr, appProtocolPtr); err != nil {
+		return printErr("Could not create or fetch app", err)
 	}
 
 	// Issue #791 PR-C / ADR-090: gregale.yaml triggers fan-out. Runs
@@ -1513,6 +1662,7 @@ func cmdDeployTarball(args []string) int {
 		Tag:            annPtr(*tag),
 		DeployedBy:     annPtr(resolveDeployedBy(*deployedBy)),
 		PRNumber:       annIntPtr(*prNumber),
+		Canary:         buildCanarySpec(*canaryPreset, *canaryStages),
 	})
 	if err != nil {
 		return printErr("Deploy failed", err)

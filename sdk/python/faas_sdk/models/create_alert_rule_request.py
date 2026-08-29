@@ -6,6 +6,10 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.create_alert_rule_request_action import (
+    CreateAlertRuleRequestAction,
+    check_create_alert_rule_request_action,
+)
 from ..models.create_alert_rule_request_comparison import (
     CreateAlertRuleRequestComparison,
     check_create_alert_rule_request_comparison,
@@ -43,6 +47,8 @@ class CreateAlertRuleRequest:
     failure_source: CreateAlertRuleRequestFailureSource | Unset = UNSET
     """Required when metric == failed_invocations; omit otherwise (xor_chk)."""
     cooldown_minutes: int | Unset = UNSET
+    action: CreateAlertRuleRequestAction | Unset = "webhook"
+    """What to do when the rule fires. Omit to default to webhook."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,6 +74,10 @@ class CreateAlertRuleRequest:
 
         cooldown_minutes = self.cooldown_minutes
 
+        action: str | Unset = UNSET
+        if not isinstance(self.action, Unset):
+            action = self.action
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -87,6 +97,8 @@ class CreateAlertRuleRequest:
             field_dict["failure_source"] = failure_source
         if cooldown_minutes is not UNSET:
             field_dict["cooldown_minutes"] = cooldown_minutes
+        if action is not UNSET:
+            field_dict["action"] = action
 
         return field_dict
 
@@ -118,6 +130,13 @@ class CreateAlertRuleRequest:
 
         cooldown_minutes = d.pop("cooldown_minutes", UNSET)
 
+        _action = d.pop("action", UNSET)
+        action: CreateAlertRuleRequestAction | Unset
+        if isinstance(_action, Unset):
+            action = UNSET
+        else:
+            action = check_create_alert_rule_request_action(_action)
+
         create_alert_rule_request = cls(
             name=name,
             metric=metric,
@@ -129,6 +148,7 @@ class CreateAlertRuleRequest:
             enabled=enabled,
             failure_source=failure_source,
             cooldown_minutes=cooldown_minutes,
+            action=action,
         )
 
         create_alert_rule_request.additional_properties = d

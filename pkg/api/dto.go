@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api/canary"
 	"github.com/onebox-faas/faas/pkg/statefuldenylist"
 )
 
@@ -959,16 +960,22 @@ type CreateDeploymentRequest struct {
 }
 
 // CanaryPresetSpec is the canary ladder a customer asks for on a
-// deploy (issue #976 / ADR-122 / SAFE-RELEASES-A). Preset is the
-// catalog name from pkg/api/canary (none/slow/balanced/aggressive/
-// 1-10-50-100). StepDurations is reserved for forward-compat —
-// customers who need a custom ladder land in a follow-up; today's
-// validator rejects any non-preset value with 400. The field is
-// exposed as a typed slice so a future preset=CUSTOM path only
-// needs to widen LookupPreset, not the DTO.
+// deploy (issue #976 / ADR-122 / SAFE-RELEASES-A + production-
+// leveling Stream F). Preset is the catalog name from
+// pkg/api/canary (none/slow/balanced/aggressive/1-10-50-100/custom).
+// When Preset is "custom", Stages is the customer-supplied ladder
+// (`percent` + duration string in time.ParseDuration form,
+// e.g. "1% at 30s, 10% at 2m, 100% at 0s").
+//
+// The wire-format change (StepDurations removed, Stages added) is
+// additive on the consumer side because the prior StepDurations
+// field was declared-but-dead (no client construction site in
+// the repo) — pre-PR clients never sent it. The CLI default
+// (`--canary-preset balanced`) keeps producing a wire shape that
+// matches the pre-PR form (Preset alone, no Stages).
 type CanaryPresetSpec struct {
-	Preset        string          `json:"preset"`
-	StepDurations []time.Duration `json:"step_durations,omitempty"`
+	Preset string               `json:"preset"`
+	Stages []canary.CustomStage `json:"stages,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -1455,6 +1462,36 @@ type ClearObsoleteReport struct {
 	AppSlug   string `json:"app_slug"`
 	Count     int    `json:"count"`
 	OlderThan string `json:"older_than"`
+}
+
+// DeploymentAuditResponse is one row of the deployment_audit
+// timeline (issue #976 / ADR-122 / SAFE-RELEASES-E.2 + production
+// leveling Stream A). Mirrors pkg/state.DeploymentAudit but drops
+// the internal DB id (BIGINT) — the wire surface exposes the audit
+// row as a sequence-pointed event keyed by (deployment_id, at).
+// Data is the verbatim jsonb payload at emit time (kind-specific
+// shape — DeployTrafficChanged carries {from_percent, to_percent,
+// actor_kind}, DeployRolledBack carries {target_deployment_id,
+// reason}).
+type DeploymentAuditResponse struct {
+	At        string          `json:"at"`
+	Kind      string          `json:"kind"`
+	Actor     string          `json:"actor"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	AccountID string          `json:"account_id,omitempty"`
+}
+
+// ListDeploymentAuditResponse is the paginated wrapper for
+// `GET /v1/deployments/{id}/audit`. The dashboard uses this to
+// render the per-deployment timeline; programmatic consumers
+// (SDK + `gregale deployments audit <id>`) use the same shape.
+//
+// limit is echoed back so a paging consumer can distinguish
+// "limit was clamped" from "no more rows" — both yield Items of
+// length < limit, but the clamping is observable via this field.
+type ListDeploymentAuditResponse struct {
+	Items []DeploymentAuditResponse `json:"items"`
+	Limit int                       `json:"limit"`
 }
 
 // DeploymentResponse is a deployment as returned by the API.

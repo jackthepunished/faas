@@ -156,7 +156,7 @@ func resolveScanSource(
 			return "", "", func() {}, fmt.Errorf("secret scan failed: %w", scanErr)
 		}
 		renderSecretScanWarnings(scanFindings, osStderr)
-		path, _, n, err := autoPackCwd(pathFlag, overrides)
+		path, _, n, err := autoPackCwd(pathFlag, defaultZeroConfigSourceCapMB, overrides)
 		if err != nil {
 			return "", "", func() {}, err
 		}
@@ -185,7 +185,7 @@ func resolveScanSource(
 			return "", "", func() {}, fmt.Errorf("secret scan failed: %w", scanErr)
 		}
 		renderSecretScanWarnings(scanFindings, osStderr)
-		path, _, n, err := autoPackCwd(cwd, overrides)
+		path, _, n, err := autoPackCwd(cwd, defaultZeroConfigSourceCapMB, overrides)
 		if err != nil {
 			return "", "", func() {}, err
 		}

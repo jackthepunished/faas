@@ -10072,10 +10072,22 @@ func (m *MemStore) ListDeploymentAudit(_ context.Context, deploymentID string, l
 	if limit <= 0 {
 		limit = 100
 	}
+	// Normalise deploymentID to UUID form so callers can pass either
+	// the dashed canonical form (pgstore wire shape) or the 32-hex
+	// raw form (newID() output that CreateDeployment returns) and
+	// the filter compares apples-to-apples against the stored
+	// uuid.UUID value. The pgstore path casts $1::uuid and lets
+	// Postgres handle the normalisation; the memstore path must
+	// match it explicitly to keep the two stores byte-identical at
+	// the response layer.
+	want, err := uuid.Parse(deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list deployment_audit: %w", err)
+	}
 	var out []DeploymentAudit
 	for i := len(m.deploymentAudit) - 1; i >= 0; i-- {
 		row := m.deploymentAudit[i]
-		if row.DeploymentID.String() != deploymentID {
+		if row.DeploymentID != want {
 			continue
 		}
 		clone := row
@@ -13036,6 +13048,12 @@ func (m *MemStore) UpdateAlertRule(_ context.Context, id string, p UpdateAlertRu
 	}
 	if p.CooldownMinutes != nil {
 		r.CooldownMinutes = *p.CooldownMinutes
+	}
+	// Action (issue #976 / ADR-122 / SAFE-RELEASES-B). Pointer PATCH
+	// shape so a missing field leaves the row alone. Mirrors the
+	// pgstore's coalesce($N, action) in the UPDATE statement.
+	if p.Action != nil {
+		r.Action = AlertAction(*p.Action)
 	}
 	r.UpdatedAt = time.Now()
 	m.alertRules[id] = r

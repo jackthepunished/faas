@@ -1804,6 +1804,42 @@ func TestRestore_MaterializesLayerViaStorage(t *testing.T) {
 	}
 }
 
+// TestRestoreMemSource_OCIUsesStorageKey pins the multi-box restore seam.
+// The memory blob must come from StorageKey even when OCI mode is enabled;
+// falling back to VMStatePath makes Firecracker try to use the vmstate JSON
+// as its memory file and fail before the guest can boot.
+func TestRestoreMemSource_OCIUsesStorageKey(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	ctx := context.Background()
+	backend, root := newLocalBackendWithFixture(t)
+	const memKey = "snap/dep-1/mem"
+	mem := []byte("snapshot-memory")
+	if err := backend.Put(ctx, memKey, bytes.NewReader(mem)); err != nil {
+		t.Fatalf("seed snapshot memory: %v", err)
+	}
+
+	v := NewJailerVMM(t.TempDir(), 30*time.Second).WithStorage(backend)
+	legacyPath := filepath.Join(root, "snap", "dep-1", "vmstate")
+	gotPath, err := v.restoreMemSource(ctx, "i-oci", RestoreSpec{
+		StorageKey:  memKey,
+		VMStatePath: legacyPath,
+	})
+	if err != nil {
+		t.Fatalf("restoreMemSource: %v", err)
+	}
+	got, err := os.ReadFile(gotPath)
+	if err != nil {
+		t.Fatalf("read resolved memory %q: %v", gotPath, err)
+	}
+	if !bytes.Equal(got, mem) {
+		t.Fatalf("resolved memory = %q, want %q", got, mem)
+	}
+	if gotPath == legacyPath {
+		t.Fatal("restoreMemSource used the legacy vmstate path instead of StorageKey")
+	}
+	v.sweepMaterialised("i-oci")
+}
+
 // TestBoot_MaterializesKernelViaStorage pins the cold-boot leg
 // specifically (BootColdBoot): a kernel key written into
 // ColdBootSpec.KernelKey resolves through StorageBackend before
