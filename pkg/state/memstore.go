@@ -284,6 +284,11 @@ type MemStore struct {
 	// through m.mu (MemStore is inherently single-process); per-row
 	// lease_expires_at is in-memory instead of SQL NOW().
 	invocations map[string]Invocation
+	// accountAsyncQuota is the in-memory mirror of the
+	// account_async_quota table (ADR-134 PR-B). Keyed by account
+	// ID; populated lazily by EnsureAccountAsyncQuota; mutated by
+	// ClaimInvocationWithCap / DecrementAccountAsyncInflight.
+	accountAsyncQuota map[string]accountAsyncQuotaRow
 	instances   map[string]Instance
 	// loginTokens is keyed by the hex-encoded SHA-256 hash of the
 	// raw token (so the binary []byte hash from ConsumeLoginToken
@@ -708,6 +713,7 @@ func NewMemStore() *MemStore {
 		tenantSurfaces:   map[string]TenantSurface{},
 		tenantHostnames:  map[string]TenantHostname{},
 		invocations:      map[string]Invocation{},
+		accountAsyncQuota: map[string]accountAsyncQuotaRow{},
 		instances:        map[string]Instance{},
 		loginTokens:      map[string]LoginToken{},
 		cliAuthCodes:     map[string]CliAuthCode{},
@@ -16124,4 +16130,208 @@ func (m *MemStore) ListAppsWithRecentTelemetry(_ context.Context, _ pgtype.Inter
 // pass accountID through unconditionally.
 func (m *MemStore) UpdateSpansSummary(_ context.Context, _ string, _ uuid.UUID, _ []byte) error {
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// ADR-134 PR-B: per-account async concurrency (MemStore shim).
+//
+// MemStore has no Postgres to atomically pair a cap check with the
+// pending→dispatching transition, but its single-process m.mu
+// serialises every map mutation. The same mutex that protects
+// m.invocations covers m.accountAsyncQuota, so the cap check +
+// claim + counter increment is one critical section. The
+// semantics mirror PgStore.ClaimInvocationWithCap exactly:
+//   - EnsureAccountAsyncQuota upserts the cap row;
+//   - ClaimInvocationWithCap checks current_inflight < max_inflight
+//     before transitioning state;
+//   - DecrementAccountAsyncInflight drops the counter by 1
+//     (clamped at 0).
+// ----------------------------------------------------------------------------
+
+// accountAsyncQuotaRow is the MemStore mirror of the
+// account_async_quota table.
+type accountAsyncQuotaRow struct {
+	MaxInflight     int
+	CurrentInflight int
+}
+
+// EnsureAccountAsyncQuota upserts the per-account cap row. Returns
+// (max_inflight, current_inflight) after the upsert.
+func (m *MemStore) EnsureAccountAsyncQuota(_ context.Context, accountID string, maxInflight int) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.accountAsyncQuota[accountID]
+	if !ok {
+		row = accountAsyncQuotaRow{MaxInflight: maxInflight}
+	} else {
+		row.MaxInflight = maxInflight
+	}
+	m.accountAsyncQuota[accountID] = row
+	return row.MaxInflight, row.CurrentInflight, nil
+}
+
+// GetAccountAsyncQuota returns the (max, cur) pair or ErrNotFound.
+func (m *MemStore) GetAccountAsyncQuota(_ context.Context, accountID string) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.accountAsyncQuota[accountID]
+	if !ok {
+		return 0, 0, ErrNotFound
+	}
+	return row.MaxInflight, row.CurrentInflight, nil
+}
+
+// ClaimInvocationWithCap is the cap-aware variant of
+// ClaimInvocation. Performs the cap check + counter increment +
+// pending→dispatching transition atomically under m.mu.
+// Returns ErrQuotaExceeded when the cap is hit.
+func (m *MemStore) ClaimInvocationWithCap(_ context.Context, id, instanceID string, leaseSeconds, maxInflight int) (Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inv, ok := m.invocations[id]
+	if !ok {
+		return Invocation{}, ErrNotFound
+	}
+	row, ok := m.accountAsyncQuota[inv.AccountID]
+	if !ok {
+		row = accountAsyncQuotaRow{MaxInflight: maxInflight}
+		m.accountAsyncQuota[inv.AccountID] = row
+	} else {
+		row.MaxInflight = maxInflight
+		m.accountAsyncQuota[inv.AccountID] = row
+	}
+	if row.CurrentInflight >= row.MaxInflight {
+		return Invocation{}, ErrQuotaExceeded
+	}
+	if inv.State != InvocationPending {
+		return Invocation{}, ErrNotFound
+	}
+	now := time.Now()
+	leaseExpires := now.Add(time.Duration(leaseSeconds) * time.Second)
+	inv.State = InvocationDispatching
+	inv.LeaseExpiresAt = &leaseExpires
+	if instanceID != "" {
+		inv.InstanceID = instanceID
+	}
+	inv.ReceivedAt = &now
+	inv.Attempts++
+	m.invocations[id] = inv
+	row.CurrentInflight++
+	m.accountAsyncQuota[inv.AccountID] = row
+	return inv, nil
+}
+
+// DecrementAccountAsyncInflight drops the counter by 1, clamped
+// at 0. Tolerant of missing cap row.
+func (m *MemStore) DecrementAccountAsyncInflight(_ context.Context, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.accountAsyncQuota[accountID]
+	if !ok {
+		return nil
+	}
+	if row.CurrentInflight > 0 {
+		row.CurrentInflight--
+		m.accountAsyncQuota[accountID] = row
+	}
+	return nil
+}
+
+// ListExpiredInvocationsForReaper walks the invocations map and
+// returns IDs whose result_retention_until is in the past.
+func (m *MemStore) ListExpiredInvocationsForReaper(_ context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ids []string
+	for id, inv := range m.invocations {
+		if inv.ResultRetentionUntil == nil {
+			continue
+		}
+		if inv.ResultRetentionUntil.After(now) {
+			continue
+		}
+		ids = append(ids, id)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// DeleteInvocationsByIDs removes the given rows. Returns the
+// count deleted.
+func (m *MemStore) DeleteInvocationsByIDs(_ context.Context, ids []string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		if _, ok := m.invocations[id]; ok {
+			delete(m.invocations, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ListDeadlineBreachedInvocations returns IDs still in
+// (pending|dispatching) whose deadline_at is in the past.
+func (m *MemStore) ListDeadlineBreachedInvocations(_ context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ids []string
+	for id, inv := range m.invocations {
+		if inv.State != InvocationPending && inv.State != InvocationDispatching {
+			continue
+		}
+		if inv.DeadlineAt == nil {
+			continue
+		}
+		if inv.DeadlineAt.After(now) {
+			continue
+		}
+		ids = append(ids, id)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// ForceDeadlineBreachedInvocations transitions the listed IDs to
+// dead_letter with outcome='deadline'. Decrements the per-account
+// counter for each transitioned row.
+func (m *MemStore) ForceDeadlineBreachedInvocations(_ context.Context, ids []string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		inv, ok := m.invocations[id]
+		if !ok {
+			continue
+		}
+		if inv.State != InvocationPending && inv.State != InvocationDispatching {
+			continue
+		}
+		inv.State = InvocationDeadLetter
+		outcome := OutcomeTimeout
+		inv.Outcome = &outcome
+		inv.LastError = "deadline_at breached"
+		now := time.Now()
+		inv.CompletedAt = &now
+		m.invocations[id] = inv
+		if row, ok := m.accountAsyncQuota[inv.AccountID]; ok {
+			if row.CurrentInflight > 0 {
+				row.CurrentInflight--
+				m.accountAsyncQuota[inv.AccountID] = row
+			}
+		}
+		n++
+	}
+	return n, nil
 }

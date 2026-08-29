@@ -3305,6 +3305,39 @@ type Store interface {
 	// an unexpired lease; the returned row reflects the post-state so the
 	// caller can branch on claimed.State to recover from a double-claim.
 	ClaimInvocation(ctx context.Context, id, instanceID string, leaseSeconds int) (Invocation, error)
+	// ClaimInvocationWithCap is the cap-aware variant of
+	// ClaimInvocation (ADR-134 PR-B). Atomically transitions
+	// pending → dispatching + lease stamp + per-account counter
+	// increment so the cap cannot be raced. Returns
+	// ErrQuotaExceeded when the account's current_inflight is at
+	// max_inflight. The MemStore shim implements the same
+	// semantics in-process.
+	ClaimInvocationWithCap(ctx context.Context, id, instanceID string, leaseSeconds, maxInflight int) (Invocation, error)
+	// EnsureAccountAsyncQuota upserts the per-account cap row with
+	// the given max_inflight. Returns the resulting
+	// (max_inflight, current_inflight) pair.
+	EnsureAccountAsyncQuota(ctx context.Context, accountID string, maxInflight int) (int, int, error)
+	// GetAccountAsyncQuota returns the cap row's
+	// (max_inflight, current_inflight) pair or ErrNotFound when
+	// the row is missing.
+	GetAccountAsyncQuota(ctx context.Context, accountID string) (int, int, error)
+	// DecrementAccountAsyncInflight drops the per-account counter
+	// by 1, clamped at zero via greatest(). Tolerant of missing
+	// cap row.
+	DecrementAccountAsyncInflight(ctx context.Context, accountID string) error
+	// ListExpiredInvocationsForReaper returns IDs whose
+	// result_retention_until is in the past.
+	ListExpiredInvocationsForReaper(ctx context.Context, now time.Time, limit int) ([]string, error)
+	// DeleteInvocationsByIDs removes the given rows. Returns the
+	// number deleted.
+	DeleteInvocationsByIDs(ctx context.Context, ids []string) (int, error)
+	// ListDeadlineBreachedInvocations returns IDs still in
+	// (pending|dispatching) whose deadline_at is in the past.
+	ListDeadlineBreachedInvocations(ctx context.Context, now time.Time, limit int) ([]string, error)
+	// ForceDeadlineBreachedInvocations transitions the listed IDs
+	// to dead_letter with outcome='deadline'. Decrements the
+	// per-account counter for each transitioned row.
+	ForceDeadlineBreachedInvocations(ctx context.Context, ids []string) (int, error)
 	// CompleteInvocation finalises a dispatched row with an optional result
 	// envelope (response status + body bytes for sync invoke; nil for the
 	// other sources). State → completed.
