@@ -32,7 +32,42 @@ type Config struct {
 	Cmd        []string
 	WorkingDir string
 	User       string
-	DiffIDs    []string // rootfs.diff_ids, bottom-to-top
+	// Healthcheck mirrors the OCI HEALTHCHECK shape; nil if absent
+	// (the field is only populated when the image declares one).
+	// Runtime wiring of the polling loop lands in M-2 (ADR-X5).
+	Healthcheck *ImageHealthcheck
+	// StopSignal mirrors OCI STOPSIGNAL (default "SIGTERM").
+	// Runtime wiring in M-2 (ADR-X3 lifecycle contract).
+	StopSignal string
+	// StopGracePeriodS mirrors OCI StopGracePeriodSeconds. Runtime
+	// wiring in M-2.
+	StopGracePeriodS int
+	DiffIDs          []string // rootfs.diff_ids, bottom-to-top
+}
+
+// ImageHealthcheck is the OCI HEALTHCHECK shape projected onto a
+// platform-friendly type. Durations are seconds at the wire boundary
+// (registries consistently emit integer seconds; conversion to time.Duration
+// happens at the AppManifest projection site, not here).
+//
+// Test[0] is "CMD", "CMD-SHELL", or "NONE" per Docker semantics; the
+// remaining Test entries are argv to the check command. Empty Test
+// means the image didn't declare one.
+//
+// Field semantics (Docker defaults):
+//   - Interval     30s — poll cadence after StartPeriod.
+//   - Timeout      30s — per-probe HTTP exec timeout.
+//   - Retries       3  — consecutive failure count to mark unhealthy.
+//   - StartPeriod   0s — startup grace during which failures don't
+//                        count (Docker 17.05+).
+//
+// ADR-136 §Decision 3 records the rationale for surfacing these.
+type ImageHealthcheck struct {
+	Test         []string
+	IntervalS    int
+	TimeoutS     int
+	Retries      int
+	StartPeriodS int
 }
 
 // ParseConfig reads an OCI/Docker image config JSON document.
@@ -57,12 +92,15 @@ func ParseConfig(r io.Reader) (Config, error) {
 	}
 	f := raw.resolved()
 	return Config{
-		Env:        f.Env,
-		Entrypoint: f.Entrypoint,
-		Cmd:        f.Cmd,
-		WorkingDir: f.WorkingDir,
-		User:       f.User,
-		DiffIDs:    raw.RootFS.DiffIDs,
+		Env:             f.Env,
+		Entrypoint:      f.Entrypoint,
+		Cmd:             f.Cmd,
+		WorkingDir:      f.WorkingDir,
+		User:            f.User,
+		Healthcheck:     healthcheckFromRaw(raw.resolvedHealthcheck()),
+		StopSignal:      raw.resolvedStopSignal(),
+		StopGracePeriodS: stopGraceFromRaw(raw),
+		DiffIDs:         raw.RootFS.DiffIDs,
 	}, nil
 }
 
@@ -122,6 +160,33 @@ func envSliceToMap(env []string) map[string]string {
 		m[k] = v
 	}
 	return m
+}
+
+// healthcheckFromRaw projects a rawHealthcheck onto the public
+// ImageHealthcheck. Returns nil when the raw is nil (image did not
+// declare a HEALTHCHECK).
+func healthcheckFromRaw(r *rawHealthcheck) *ImageHealthcheck {
+	if r == nil {
+		return nil
+	}
+	return &ImageHealthcheck{
+		Test:         append([]string(nil), r.Test...),
+		IntervalS:    r.IntervalS,
+		TimeoutS:     r.TimeoutS,
+		Retries:      r.Retries,
+		StartPeriodS: r.StartPeriodS,
+	}
+}
+
+// stopGraceFromRaw reads the OCI-spec StopGracePeriodSeconds value.
+// The OCI image-config spec only carries StopSignal; StopGracePeriod
+// lives on the OCI *runtime* spec, not the image spec. This helper
+// returns 0 today and exists so M-2's lifecycle ADR can wire a
+// platform-side source (operator override, per-plan cap, etc.) into
+// the projection without re-decoding the raw config. ADR-136 §Decision
+// 3 records the carve-out.
+func stopGraceFromRaw(_ *rawConfig) int {
+	return 0
 }
 
 // normalizeUser maps an OCI User field to a guest user name. A bare numeric uid

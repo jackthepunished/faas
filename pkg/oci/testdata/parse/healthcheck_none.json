@@ -1,0 +1,10 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["/app/server"],
+    "Healthcheck": {
+      "Test": ["NONE"]
+    }
+  }
+}

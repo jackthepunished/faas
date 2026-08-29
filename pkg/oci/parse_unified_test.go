@@ -181,3 +181,155 @@ func readFixture(t *testing.T, name string) []byte {
 	}
 	return b
 }
+
+// TestParseConfig_HealthcheckCMD asserts HEALTHCHECK with a CMD-style
+// test surfaces all five sub-fields. Closes the registry-path drop
+// reported by issue #1186 workstream A.4.
+func TestParseConfig_HealthcheckCMD(t *testing.T) {
+	b := readFixture(t, "healthcheck_cmd.json")
+	cfg, err := ParseConfig(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.Healthcheck == nil {
+		t.Fatal("Config.Healthcheck is nil; want populated")
+	}
+	if got, want := cfg.Healthcheck.Test, []string{"CMD", "/bin/check"}; !equalStrings(got, want) {
+		t.Errorf("Healthcheck.Test = %v; want %v", got, want)
+	}
+	if got, want := cfg.Healthcheck.IntervalS, 30; got != want {
+		t.Errorf("Healthcheck.IntervalS = %d; want %d", got, want)
+	}
+	if got, want := cfg.Healthcheck.TimeoutS, 5; got != want {
+		t.Errorf("Healthcheck.TimeoutS = %d; want %d", got, want)
+	}
+	if got, want := cfg.Healthcheck.Retries, 3; got != want {
+		t.Errorf("Healthcheck.Retries = %d; want %d", got, want)
+	}
+	if got, want := cfg.Healthcheck.StartPeriodS, 10; got != want {
+		t.Errorf("Healthcheck.StartPeriodS = %d; want %d", got, want)
+	}
+
+	img, err := parseImageConfig(b)
+	if err != nil {
+		t.Fatalf("parseImageConfig: %v", err)
+	}
+	if img.Healthcheck == nil {
+		t.Fatal("ImageConfig.Healthcheck is nil; want populated")
+	}
+	if got, want := img.Healthcheck.Test[0], "CMD"; got != want {
+		t.Errorf("ImageConfig.Healthcheck.Test[0] = %q; want %q", got, want)
+	}
+}
+
+// TestParseConfig_HealthcheckNone asserts HEALTHCHECK NONE surfaces a
+// non-nil but empty-test Healthcheck — distinguishing "image
+// explicitly disabled checks" from "image did not declare one".
+func TestParseConfig_HealthcheckNone(t *testing.T) {
+	b := readFixture(t, "healthcheck_none.json")
+	cfg, err := ParseConfig(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.Healthcheck == nil {
+		t.Fatal("Config.Healthcheck is nil; want present-but-empty for HEALTHCHECK NONE")
+	}
+	if len(cfg.Healthcheck.Test) != 1 || cfg.Healthcheck.Test[0] != "NONE" {
+		t.Errorf("Healthcheck.Test = %v; want [NONE]", cfg.Healthcheck.Test)
+	}
+}
+
+// TestParseConfig_StopSignal asserts STOPSIGNAL is surfaced from
+// either envelope. The default signal (SIGTERM) is not emitted in the
+// image config; an absent field returns "".
+func TestParseConfig_StopSignal(t *testing.T) {
+	b := readFixture(t, "stopsignal.json")
+	cfg, err := ParseConfig(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if got, want := cfg.StopSignal, "SIGUSR1"; got != want {
+		t.Errorf("Config.StopSignal = %q; want %q", got, want)
+	}
+
+	img, err := parseImageConfig(b)
+	if err != nil {
+		t.Fatalf("parseImageConfig: %v", err)
+	}
+	if got, want := img.StopSignal, "SIGUSR1"; got != want {
+		t.Errorf("ImageConfig.StopSignal = %q; want %q", got, want)
+	}
+}
+
+// TestParseConfig_StopSignalAbsentDefault checks that an absent
+// STOPSIGNAL surfaces as "" (the platform defaults to SIGTERM at
+// runtime; surfaced from elsewhere).
+func TestParseConfig_StopSignalAbsentDefault(t *testing.T) {
+	b := readFixture(t, "docker_v2_flat.json")
+	cfg, err := ParseConfig(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.StopSignal != "" {
+		t.Errorf("Config.StopSignal = %q; want \"\" (absent in flat fixture)", cfg.StopSignal)
+	}
+}
+
+// TestParseConfig_NumericUser asserts USER surfaces numerically on
+// both parsers. Pre-M-1 the registry path dropped this field entirely;
+// commit 4 surfaces it. Named-user lookup is M-3.
+func TestParseConfig_NumericUser(t *testing.T) {
+	b := readFixture(t, "numeric_user.json")
+	cfg, err := ParseConfig(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if got, want := cfg.User, "1001"; got != want {
+		t.Errorf("Config.User = %q; want %q (numeric preserved verbatim)", got, want)
+	}
+
+	img, err := parseImageConfig(b)
+	if err != nil {
+		t.Fatalf("parseImageConfig: %v", err)
+	}
+	if got, want := img.User, "1001"; got != want {
+		t.Errorf("ImageConfig.User = %q; want %q (numeric preserved verbatim)", got, want)
+	}
+}
+
+// TestParseConfig_HealthcheckFlatPreferred asserts the flat-then-nested
+// precedence rule applies to HEALTHCHECK too: a flat HEALTHCHECK wins
+// over a nested one.
+func TestParseConfig_HealthcheckFlatPreferred(t *testing.T) {
+	raw := []byte(`{
+        "Healthcheck": {"Test": ["CMD", "/flat/check"], "Interval": 60},
+        "config": {
+            "Healthcheck": {"Test": ["CMD", "/nested/check"], "Interval": 30}
+        }
+    }`)
+	cfg, err := ParseConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.Healthcheck == nil {
+		t.Fatal("Healthcheck nil; want populated")
+	}
+	if got, want := cfg.Healthcheck.Test[1], "/flat/check"; got != want {
+		t.Errorf("Healthcheck.Test[1] = %q; want %q (flat precedence)", got, want)
+	}
+	if got, want := cfg.Healthcheck.IntervalS, 60; got != want {
+		t.Errorf("Healthcheck.IntervalS = %d; want 60 (flat)", got)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

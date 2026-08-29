@@ -32,11 +32,13 @@ import (
 // from "present-but-empty" for the OCI `config` envelope.
 type rawConfig struct {
 	// Flat fields (Docker v2 schema).
-	Cmd        []string `json:"Cmd"`
-	Env        []string `json:"Env"`
-	WorkingDir string   `json:"WorkingDir"`
-	Entrypoint []string `json:"Entrypoint"`
-	User       string   `json:"User"`
+	Cmd          []string        `json:"Cmd"`
+	Env          []string        `json:"Env"`
+	WorkingDir   string          `json:"WorkingDir"`
+	Entrypoint   []string        `json:"Entrypoint"`
+	User         string          `json:"User"`
+	StopSignal   string          `json:"StopSignal"`
+	Healthcheck  *rawHealthcheck `json:"Healthcheck"`
 
 	// Nested `config` envelope (OCI image-config). Optional — many
 	// registry implementations omit it entirely.
@@ -58,6 +60,30 @@ type rawNestedConfig struct {
 	Entrypoint   []string            `json:"Entrypoint"`
 	User         string              `json:"User"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+	StopSignal   string              `json:"StopSignal"`
+	Healthcheck  *rawHealthcheck     `json:"Healthcheck"`
+}
+
+// rawHealthcheck is the unmarshal target for HEALTHCHECK in either
+// envelope. The struct fields mirror Docker semantics:
+//
+//   - Test:     argv for the check command, prefixed by "CMD",
+//               "CMD-SHELL", or "NONE" (the only valid Test[0]).
+//   - Interval: Docker default 30s.
+//   - Timeout:  Docker default 30s.
+//   - Retries:  Docker default 3.
+//   - StartPeriod: Docker default 0s (no startup grace).
+//
+// All Durations are encoded as integer seconds at the OCI wire boundary
+// (Go's default JSON marshalling for time.Duration is nanoseconds —
+// registries consistently emit seconds; we use int and convert at the
+// projection site).
+type rawHealthcheck struct {
+	Test        []string `json:"Test"`
+	IntervalS   int      `json:"Interval"`
+	TimeoutS    int      `json:"Timeout"`
+	Retries     int      `json:"Retries"`
+	StartPeriodS int     `json:"StartPeriod"`
 }
 
 // rawFields is the resolved single-source-of-truth view: each field is
@@ -100,6 +126,34 @@ func (r *rawConfig) resolved() rawFields {
 		}
 	}
 	return f
+}
+
+// resolvedHealthcheck applies the same flat-then-nested precedence for
+// HEALTHCHECK. Pointer semantics matter: a non-nil `flat` wins even if
+// empty (mirroring the Docker semantics where `HEALTHCHECK NONE` is an
+// explicit override), and the nested envelope only fills the gap when
+// flat is nil.
+func (r *rawConfig) resolvedHealthcheck() *rawHealthcheck {
+	if r.Healthcheck != nil {
+		return r.Healthcheck
+	}
+	if r.Config != nil {
+		return r.Config.Healthcheck
+	}
+	return nil
+}
+
+// resolvedStopSignal applies the same flat-then-nested precedence for
+// STOPSIGNAL. Empty string is the absence marker (Docker defaults to
+// SIGTERM).
+func (r *rawConfig) resolvedStopSignal() string {
+	if r.StopSignal != "" {
+		return r.StopSignal
+	}
+	if r.Config != nil {
+		return r.Config.StopSignal
+	}
+	return ""
 }
 
 // validate returns an error if the rootfs.type is set to anything other
