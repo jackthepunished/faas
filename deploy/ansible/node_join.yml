@@ -223,6 +223,18 @@
   serial: 1
   max_fail_percentage: 0
   tasks:
+    - name: Detect the legacy imaged environment file
+      ansible.builtin.stat:
+        path: /etc/faas/oci-e2e.env
+      register: faas_oci_e2e_env
+
+    - name: Remove the legacy builder-base override before applying the release pin
+      ansible.builtin.lineinfile:
+        path: /etc/faas/oci-e2e.env
+        regexp: '^FAAS_BUILDER_BASE_REF='
+        state: absent
+      when: faas_oci_e2e_env.stat.exists
+
     - name: Install the manifest and builder-base identity for imaged
       ansible.builtin.copy:
         dest: /etc/systemd/system/faas-imaged.service.d/zz-faas-manifest-base.conf
