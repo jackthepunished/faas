@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00488 (deployment_scope_exclusions
+// Migration-apply test for 00509 (deployment_scope_exclusions
 // table — ADR-124 follow-up #3 persistent --exclude history).
 //
 // Pins the load-bearing contracts:
@@ -22,7 +22,7 @@
 //  6. NO FK to apps(id) — soft-deleted apps do NOT cascade. The
 //     row must survive UPDATE apps SET status='deleted' (this
 //     is the SOFT-DELETE CASCADE BLIND SPOT documented in
-//     00488_deployment_scope_exclusions.sql header).
+//     00509_deployment_scope_exclusions.sql header).
 //  7. ON DELETE CASCADE on accounts and projects DOES fire —
 //     these are real DELETE paths (GDPR hard-delete + project
 //     full-reset) so the FK posture is symmetric for them.
@@ -90,18 +90,18 @@ type poolIface interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// TestMigrations_00418_DeploymentScopeExclusions is the umbrella
+// TestMigrations_00509_DeploymentScopeExclusions is the umbrella
 // test for the new persistent --exclude history table. Each
 // sub-test pins one of the contracts enumerated in the header.
-func TestMigrations_00418_DeploymentScopeExclusions(t *testing.T) {
+func TestMigrations_00509_DeploymentScopeExclusions(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply the full migration set; 00418 is the new tail.
-	// A regression that drops a slot between 1 and 418 surfaces
+	// (1) Apply the full migration set; 00509 is the new tail.
+	// A regression that drops a slot between 1 and 509 surfaces
 	// here before we get to the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 418)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 509)", err)
 	}
 
 	t.Run("SchemaCreated", func(t *testing.T) {

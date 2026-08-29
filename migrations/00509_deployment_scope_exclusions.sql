@@ -1,4 +1,4 @@
--- filename: 00488_deployment_scope_exclusions.sql
+-- filename: 00509_deployment_scope_exclusions.sql
 -- +goose Up
 -- +goose StatementBegin
 --
@@ -65,20 +65,27 @@
 -- ============================================================
 -- Slot choice
 -- ============================================================
--- Branch note: this branch (worktree-feat-affected-workload-
--- preview) was cut from origin/main at commit `0b4cf07f4`
--- where the migration tail was 00386. origin/main has since
--- advanced through multiple rebases; the current main tail is
--- 00487_edge_rules_cors_preset_fk.sql (PR #1090 / PR #1111).
--- Picking 00488 — the next free slot after main's 00487 — is
--- correct. The original branch picked 00417 + 00418, then
--- renumbered to 00487 + 00488 (with a 00487 reserve_slot
--- fence) after the first rebase; the second rebase onto
--- origin/main (which now has a real 00487 edge_rules)
--- required the fence to be deleted, then a third renumber to
--- 00487→00488 because main's edge_rules was sitting at 00487
--- (a same-branch duplicate of main's slot would panic goose at
--- apply time).
+-- Branch note: this branch (worktree-feat-adr124-prod-fixes)
+-- has been rebased onto origin/main multiple times as the
+-- migration tail advanced (00386 → 00487 → 00493 → 00506).
+-- Slot history for this migration:
+--   * 00417 + 00418 (original) → renamed 00487 + 00488 with
+--     a 00487 reserve_slot fence after PR #1090 advanced main.
+--   * 00487 + 00488 → 00487 dropped (main got a real
+--     00487_edge_rules_cors_preset_fk) and 00488 kept.
+--   * 00488 → 00488 still conflicted because main gained
+--     00488_reserve_slot fence from the cross-PR contiguity
+--     repair — fence deleted.
+--   * 00488 → 00509 (this rename): PR #1174 (ADR-119 v2)
+--     added a real 00488 migration to its branch and main
+--     advanced to 00506 (with PR #1138 claiming 00507/00508
+--     as real). 00509 is the next free slot that does not
+--     collide with main or any other open PR; the contiguity
+--     gap from 00506→00509 is filled by 00507_reserve_slot +
+--     00508_reserve_slot fences added in this branch (those
+--     fences will be dropped when PR #1138 merges first and
+--     brings real 00507 + 00508 migrations in — the standard
+--     reserve-dance pattern, e.g. PR #1090 round-7).
 
 -- Replay-safe posture: every CREATE in this Up block uses
 -- IF NOT EXISTS (or DROP TRIGGER IF EXISTS before CREATE
