@@ -324,7 +324,7 @@ func TestGitArchiveHEAD_HappyPath(t *testing.T) {
 	if err := gitArchiveHEAD(dir, out); err != nil {
 		t.Fatalf("gitArchiveHEAD: %v", err)
 	}
-	f, err := os.Open(out)
+	f, err := os.Open(out) //nolint:forbidigo // test opens a tempfile path it just constructed via t.TempDir + filepath.Join
 	if err != nil {
 		t.Fatalf("open archive: %v", err)
 	}

@@ -103,7 +103,6 @@ func withCwd(t *testing.T, dir string) {
 type zeroConfigStubServer struct {
 	t        *testing.T
 	srv      *httptest.Server
-	routes   func(w http.ResponseWriter, r *http.Request) // test-specific routes
 	gotCalls map[string]int
 }
 
