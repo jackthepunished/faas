@@ -1758,3 +1758,122 @@ func TestListAuditEvents_LivenessKinds(t *testing.T) {
 		t.Errorf("instances.parked_liveness_exhausted count = %d, want 1 (AC #5: per-park audit row)", parked)
 	}
 }
+
+// --- production-leveling Stream A tests -----------------------------------
+//
+// TestListDeploymentAudit_HappyPath exercises GET
+// /v1/deployments/{id}/audit end-to-end: seed an app + deployment,
+// append three deployment_audit rows (deploy.created / traffic_changed
+// / rolled_back), call the endpoint, assert the response carries all
+// three kinds newest-first + the verbatim jsonb payload round-trips.
+// Also asserts the per-deployment handler IDOR posture — a cross-account
+// request 404s the same way an unknown id does.
+func TestListDeploymentAudit_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	depID := seedAppWithRollout(t, e, "audit", "rolling_out", 1, 4, time.Now().Add(-1*time.Minute))
+
+	acctID, err := uuid.Parse(e.acct.ID)
+	if err != nil {
+		t.Fatalf("parse acct id: %v", err)
+	}
+	rows := []struct {
+		kind    state.DeploymentAuditKind
+		actor   string
+		payload map[string]any
+	}{
+		{state.DeployCreated, "meterd:canary_progression", map[string]any{"stage": 0}},
+		{state.DeployTrafficChanged, "meterd:canary_progression", map[string]any{"from_percent": 0, "to_percent": 1}},
+		{state.DeployRolledBack, "operator:cli:recover_rollout", map[string]any{"reason": "manual-test"}},
+	}
+	for _, r := range rows {
+		data, err := json.Marshal(r.payload)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", r.kind, err)
+		}
+		acctCopy := acctID
+		if _, err := e.store.AppendDeploymentAudit(context.Background(), state.DeploymentAudit{
+			DeploymentID: mustParseUUID(t, depID),
+			AccountID:    &acctCopy,
+			Kind:         r.kind,
+			Actor:        r.actor,
+			Data:         data,
+		}); err != nil {
+			t.Fatalf("append %s: %v", r.kind, err)
+		}
+	}
+
+	rec := e.do(t, http.MethodGet, "/v1/deployments/"+depID+"/audit?limit=50", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/deployments/%s/audit: code=%d body=%s", depID, rec.Code, rec.Body.String())
+	}
+	var out api.ListDeploymentAuditResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode list: %v body=%s", err, rec.Body.String())
+	}
+	if out.Limit != 50 {
+		t.Errorf("limit=%d, want 50", out.Limit)
+	}
+	if len(out.Items) != len(rows) {
+		t.Fatalf("items=%d, want %d", len(out.Items), len(rows))
+	}
+	// Newest-first ordering: the rolled_back row must be index 0.
+	if out.Items[0].Kind != "deploy.rolled_back" {
+		t.Errorf("newest kind=%q, want deploy.rolled_back", out.Items[0].Kind)
+	}
+	if out.Items[0].Actor != "operator:cli:recover_rollout" {
+		t.Errorf("newest actor=%q, want operator:cli:recover_rollout", out.Items[0].Actor)
+	}
+	// Data payload round-trips verbatim.
+	var got map[string]any
+	if err := json.Unmarshal(out.Items[0].Data, &got); err != nil {
+		t.Fatalf("unmarshal newest data: %v body=%s", err, string(out.Items[0].Data))
+	}
+	if got["reason"] != "manual-test" {
+		t.Errorf("newest data.reason=%v, want manual-test", got["reason"])
+	}
+}
+
+// TestListDeploymentAudit_CrossAccount_IDOR: a request from a
+// different account for the same deployment id must 404 — the
+// handler enforces the IDOR posture via DeploymentByID + AppByID
+// + AccountID check before reading the audit table.
+func TestListDeploymentAudit_CrossAccount_IDOR(t *testing.T) {
+	e1 := setup(t, api.PlanPro)
+	depID := seedAppWithRollout(t, e1, "aud-cross", "rolling_out", 1, 4, time.Now().Add(-1*time.Minute))
+
+	e2 := setup(t, api.PlanPro)
+	rec := e2.do(t, http.MethodGet, "/v1/deployments/"+depID+"/audit", nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-account status %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestListDeploymentAudit_InvalidLimit: ?limit=0 / ?limit=-1 /
+// ?limit=abc all return 400 invalid_limit, never 500. The closed
+// 1..50 band mirrors listAuditEventsLimit (50 default, 50 max).
+func TestListDeploymentAudit_InvalidLimit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	depID := seedAppWithRollout(t, e, "audit-bad-limit", "rolling_out", 1, 4, time.Now().Add(-1*time.Minute))
+
+	for _, raw := range []string{"0", "-1", "abc"} {
+		t.Run(raw, func(t *testing.T) {
+			rec := e.do(t, http.MethodGet, "/v1/deployments/"+depID+"/audit?limit="+raw, nil, nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("limit=%s: status %d, body %s", raw, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// mustParseUUID is a test helper that fatals on a bad uuid parse.
+// The seedAppWithRollout helper returns the deployment id as a
+// canonical uuid string (e.mstore.CreateDeployment returns uuid.UUID
+// shaped id), so the conversion is safe in tests.
+func mustParseUUID(t *testing.T, s string) uuid.UUID {
+	t.Helper()
+	u, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse uuid %q: %v", s, err)
+	}
+	return u
+}

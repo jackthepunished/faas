@@ -107,6 +107,9 @@ type stubOps struct {
 	fired             int
 	deliveredAttempts int
 	failedAttempts    int
+	actionRollback    int
+	actionDemote      int
+	actionPromote     int
 	enabledStamp      bool
 	enabledValue      float64
 }
@@ -132,6 +135,25 @@ func (s *stubOps) AlertDeliveryAttemptsTotal(outcome string) func() {
 		s.deliveredAttempts++
 	case alerts.AlertOutcomeFailed:
 		s.failedAttempts++
+	}
+	s.mu.Unlock()
+	return func() {}
+}
+
+// AlertActionExecutedTotal (issue #976 / ADR-122 / SAFE-RELEASES-B)
+// bumps the per-action counter. The stub records per-label counts
+// so unit tests can assert the action vocabulary at the call site
+// (rollback / demote / promote). Mirrors the closed vocabulary in
+// pkg/state.IsValidAlertAction.
+func (s *stubOps) AlertActionExecutedTotal(action string) func() {
+	s.mu.Lock()
+	switch action {
+	case "rollback":
+		s.actionRollback++
+	case "demote":
+		s.actionDemote++
+	case "promote":
+		s.actionPromote++
 	}
 	s.mu.Unlock()
 	return func() {}
@@ -709,5 +731,226 @@ func TestEvaluator_PayloadOversized(t *testing.T) {
 	}
 	if !strings.Contains(deliveries[0].LastError, "payload too large") {
 		t.Errorf("delivery last_error = %q; want substring 'payload too large'", deliveries[0].LastError)
+	}
+}
+
+// ---- SAFE-RELEASES-B (issue #976 / ADR-122) fan-out tests ---------
+
+// recordingActionExecutor is a stub pkg/alerts.ActionExecutor that
+// records every Execute call. The test cases vary the action on
+// the rule (rollback / demote / promote) and assert the call lands
+// on this stub exactly once.
+type recordingActionExecutor struct {
+	mu          sync.Mutex
+	calls       int
+	failWithErr error // non-nil → Execute returns this
+	lastRuleID  string
+	lastAction  state.AlertAction
+}
+
+func (r *recordingActionExecutor) Execute(ctx context.Context, rule state.AlertRule, observed float64, at time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.lastRuleID = rule.ID
+	r.lastAction = rule.Action
+	return r.failWithErr
+}
+
+// makeEvaluatorWithAction mirrors makeEvaluator but also wires
+// ActionExec so the SAFE-RELEASES-B fan-out is enabled.
+func makeEvaluatorWithAction(t *testing.T, store *state.MemStore, prom appmetrics.PromQL, ident *age.X25519Identity, dispatch *recordingDispatcher, actionExec alerts.ActionExecutor) (*alerts.Evaluator, *stubOps) {
+	t.Helper()
+	ops := &stubOps{}
+	ev := alerts.NewEvaluator(alerts.EvaluatorOptions{
+		Store:      store,
+		PromQL:     prom,
+		Audit:      audit.New(store, discardLog(), nil, "meterd"),
+		Identity:   func() *age.X25519Identity { return ident },
+		Dispatcher: dispatch,
+		ActionExec: actionExec,
+		Now:        func() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) },
+		Log:        discardLog(),
+		Ops:        ops,
+	})
+	return ev, ops
+}
+
+// seedRuleWithAction mirrors seedRule but stamps the Action field
+// on the rule. The action is set via UpdateAlertRule (pointer
+// PATCH) after create so the create flow stays identical to
+// pre-B tests. UpdateAlertRuleParams.Action is *string (not
+// *state.AlertAction) — the wire seam converts at the handler
+// boundary, so the storage layer accepts the raw string.
+func seedRuleWithAction(t *testing.T, store *state.MemStore, action state.AlertAction) (state.AlertRule, *age.X25519Identity) {
+	t.Helper()
+	rule, ident, _ := seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
+	actionStr := string(action)
+	updated, err := store.UpdateAlertRule(context.Background(), rule.ID, state.UpdateAlertRuleParams{
+		Action: &actionStr,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAlertRule (Action=%q): %v", action, err)
+	}
+	return updated, ident
+}
+
+// TestEvaluator_ActionExecutor_Rollback — rule with action=rollback
+// fires BOTH the webhook fan-out AND the in-process action.
+// Stats.ActionExecuted bumps once; ops.actionRollback bumps once;
+// webhook delivered as usual.
+func TestEvaluator_ActionExecutor_Rollback(t *testing.T) {
+	store := state.NewMemStore()
+	rule, ident := seedRuleWithAction(t, store, state.AlertActionRollback)
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200, Attempts: 1}}
+	actionExec := &recordingActionExecutor{}
+	ev, ops := makeEvaluatorWithAction(t, store, &stubPromQL{value: 10}, ident, dispatch, actionExec)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ActionExecuted != 1 {
+		t.Errorf("stats.ActionExecuted = %d; want 1", stats.ActionExecuted)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("stats.Delivered = %d; want 1 (webhook fan-out still fires)", stats.Delivered)
+	}
+	if actionExec.calls != 1 {
+		t.Errorf("actionExec.calls = %d; want 1", actionExec.calls)
+	}
+	if actionExec.lastRuleID != rule.ID || actionExec.lastAction != state.AlertActionRollback {
+		t.Errorf("actionExec last = (id=%q, action=%q); want (id=%q, action=%q)",
+			actionExec.lastRuleID, actionExec.lastAction, rule.ID, state.AlertActionRollback)
+	}
+	if ops.actionRollback != 1 {
+		t.Errorf("ops.actionRollback = %d; want 1", ops.actionRollback)
+	}
+}
+
+// TestEvaluator_ActionExecutor_WebhookSkipsExecutor — rule with the
+// default action='webhook' never invokes the in-process executor.
+// Stats.ActionExecuted is 0; executor.calls is 0; ops counter is 0.
+func TestEvaluator_ActionExecutor_WebhookSkipsExecutor(t *testing.T) {
+	store := state.NewMemStore()
+	_, ident := seedRuleWithAction(t, store, state.AlertActionWebhook)
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200}}
+	actionExec := &recordingActionExecutor{}
+	ev, ops := makeEvaluatorWithAction(t, store, &stubPromQL{value: 10}, ident, dispatch, actionExec)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ActionExecuted != 0 {
+		t.Errorf("stats.ActionExecuted = %d; want 0 (webhook default)", stats.ActionExecuted)
+	}
+	if actionExec.calls != 0 {
+		t.Errorf("actionExec.calls = %d; want 0", actionExec.calls)
+	}
+	if ops.actionRollback+ops.actionDemote+ops.actionPromote != 0 {
+		t.Errorf("ops action counters should be 0; got rollback=%d demote=%d promote=%d",
+			ops.actionRollback, ops.actionDemote, ops.actionPromote)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("stats.Delivered = %d; want 1 (webhook fan-out still fires)", stats.Delivered)
+	}
+}
+
+// TestEvaluator_ActionExecutor_FailSoft — action=rollback with the
+// executor returning an error must NOT propagate the error and must
+// still deliver the webhook. Stats.ActionFailed bumps, ActionExecuted
+// stays 0.
+func TestEvaluator_ActionExecutor_FailSoft(t *testing.T) {
+	store := state.NewMemStore()
+	_, ident := seedRuleWithAction(t, store, state.AlertActionDemote)
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200}}
+	actionExec := &recordingActionExecutor{failWithErr: errors.New("synthetic apid 503")}
+	ev, _ := makeEvaluatorWithAction(t, store, &stubPromQL{value: 10}, ident, dispatch, actionExec)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ActionFailed != 1 {
+		t.Errorf("stats.ActionFailed = %d; want 1", stats.ActionFailed)
+	}
+	if stats.ActionExecuted != 0 {
+		t.Errorf("stats.ActionExecuted = %d; want 0 (Execute errored)", stats.ActionExecuted)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("stats.Delivered = %d; want 1 (webhook path unaffected)", stats.Delivered)
+	}
+	if actionExec.calls != 1 {
+		t.Errorf("actionExec.calls = %d; want 1", actionExec.calls)
+	}
+}
+
+// TestEvaluator_ActionExecutor_NilWired — pre-B meterd build that
+// never wires ActionExec; rule with action=rollback should log
+// warn + bump ActionSkipped, but the webhook path still fires.
+// This is the rollback-safe-fallback contract.
+func TestEvaluator_ActionExecutor_NilWired(t *testing.T) {
+	store := state.NewMemStore()
+	_, ident := seedRuleWithAction(t, store, state.AlertActionRollback)
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200}}
+	// No ActionExec wired — falls through to the nil branch.
+	ev, ops := makeEvaluator(t, store, &stubPromQL{value: 10}, ident, dispatch)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ActionSkipped != 1 {
+		t.Errorf("stats.ActionSkipped = %d; want 1", stats.ActionSkipped)
+	}
+	if stats.ActionExecuted != 0 {
+		t.Errorf("stats.ActionExecuted = %d; want 0", stats.ActionExecuted)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("stats.Delivered = %d; want 1 (webhook path unaffected)", stats.Delivered)
+	}
+	if ops.actionRollback != 0 {
+		t.Errorf("ops.actionRollback = %d; want 0 (no executor wired)", ops.actionRollback)
+	}
+}
+
+// TestEvaluator_ActionExecutor_UnknownAction — rule whose Action
+// field has a typo (e.g. 'rollbac') must NOT crash the evaluator
+// or invoke the executor. Stats.ActionSkipped bumps, no panic.
+func TestEvaluator_ActionExecutor_UnknownAction(t *testing.T) {
+	store := state.NewMemStore()
+	rule, ident, _ := seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
+	// Force the bad value via direct memstore upsert — the
+	// schema's CHECK constraint doesn't run on the in-memory
+	// path, so we can simulate a row that landed before the
+	// closed-set was enforced.
+	bad := string("rollbac")
+	updated, err := store.UpdateAlertRule(context.Background(), rule.ID, state.UpdateAlertRuleParams{
+		Action: &bad,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAlertRule: %v", err)
+	}
+	if string(updated.Action) != bad {
+		t.Fatalf("Action round-trip: got %q want %q", updated.Action, bad)
+	}
+
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200}}
+	actionExec := &recordingActionExecutor{}
+	ev, _ := makeEvaluatorWithAction(t, store, &stubPromQL{value: 10}, ident, dispatch, actionExec)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.ActionSkipped != 1 {
+		t.Errorf("stats.ActionSkipped = %d; want 1 (unknown action)", stats.ActionSkipped)
+	}
+	if actionExec.calls != 0 {
+		t.Errorf("actionExec.calls = %d; want 0 (unknown action must not invoke executor)", actionExec.calls)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("stats.Delivered = %d; want 1 (webhook fan-out unaffected)", stats.Delivered)
 	}
 }

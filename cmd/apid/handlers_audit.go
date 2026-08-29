@@ -68,6 +68,14 @@ const (
 	// the spec cap (most customer accounts emit <<10 audit rows/day) and
 	// keeps the per-request DB cost bounded.
 	listAuditEventsOverRead = 200
+	// listDeploymentAuditLimitDefault / Max bound the
+	// per-deployment deployment_audit timeline query
+	// (production-leveling Stream A). Same shape as the
+	// events limits above — the bounded pagination keeps the
+	// allocation shape constant for CodeQL's taint analysis and
+	// caps the dashboard's per-deployment row count.
+	listDeploymentAuditLimitDefault = 50
+	listDeploymentAuditLimitMax     = 50
 )
 
 // listAuditEvents handles GET /v1/audit-events. Newest first.
@@ -227,6 +235,100 @@ func (s *server) getAuditEvent(w http.ResponseWriter, r *http.Request, acct stat
 	}
 	api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 		"Audit event not found", "no event with that id belongs to this account"))
+}
+
+// listDeploymentAudit handles GET /v1/deployments/{id}/audit —
+// the per-deployment audit timeline (issue #976 / ADR-122 /
+// SAFE-RELEASES-E.2 + production-leveling Stream A).
+//
+// Trust model: the {id} path segment is a deployment uuid;
+// ListDeploymentAudit is a deployment-scoped query, NOT an
+// account-scoped query, so the handler MUST verify the deployment
+// belongs to acct before reading the audit table. We do this via
+// store.DeploymentByID + store.AppByID — same two-step IDOR
+// posture as getDeployment (handlers_ext.go:1320).
+//
+// Query params (all optional):
+//
+//	limit  1..listDeploymentAuditLimitMax (50); defaults to listDeploymentAuditLimitDefault (50)
+//
+// The response shape is api.ListDeploymentAuditResponse
+// (Items + Limit echo). The dashboard and SDK both consume this;
+// the SDK method is pkg/api.Client.ListDeploymentAudit.
+func (s *server) listDeploymentAudit(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	if id == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid id", "id path segment is required"))
+		return
+	}
+	// IDOR check — same two-step pattern as getDeployment
+	// (handlers_ext.go:1320). Cross-account 404s the same way an
+	// unknown id does (we never reveal whether the id exists in a
+	// different account).
+	d, err := s.store.DeploymentByID(r.Context(), id)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
+			"Deployment not found", "no deployment with that id belongs to this account"))
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
+			"Deployment not found", "no deployment with that id belongs to this account"))
+		return
+	}
+	limit := listDeploymentAuditLimitDefault
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid limit", "limit must be a positive integer"))
+			return
+		}
+		if n > listDeploymentAuditLimitMax {
+			n = listDeploymentAuditLimitMax
+		}
+		limit = n
+	}
+	rows, err := s.store.ListDeploymentAudit(r.Context(), id, limit)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list deployment audit"))
+		return
+	}
+	items := make([]api.DeploymentAuditResponse, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, deploymentAuditResponse(row))
+	}
+	writeJSON(w, http.StatusOK, api.ListDeploymentAuditResponse{
+		Items: items,
+		Limit: limit,
+	})
+}
+
+// deploymentAuditResponse projects one pkg/state.DeploymentAudit
+// row into the wire DTO. Internal id stays server-side; the wire
+// surface keys rows by (deployment_id, at) — there is no
+// per-row id on the API.
+//
+// Data is rendered verbatim — kind-specific shapes
+// (deploy.traffic_changed → {from_percent, to_percent, actor_kind},
+// deploy.rolled_back → {target_deployment_id, reason}) are
+// surfaced through a single json.RawMessage column. The dashboard
+// pretty-prints the JSON in its timeline block
+// (deployment_detail.html) and the SDK leaves it as bytes for the
+// caller to decode.
+func deploymentAuditResponse(r state.DeploymentAudit) api.DeploymentAuditResponse {
+	out := api.DeploymentAuditResponse{
+		At:    r.At.UTC().Format(time.RFC3339Nano),
+		Kind:  string(r.Kind),
+		Actor: r.Actor,
+		Data:  r.Data,
+	}
+	if r.AccountID != nil {
+		out.AccountID = r.AccountID.String()
+	}
+	return out
 }
 
 // eventDataHasAppID returns true iff data is a JSON object whose

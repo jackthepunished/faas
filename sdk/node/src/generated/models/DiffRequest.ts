@@ -36,5 +36,9 @@ export type DiffRequest = {
   env_by_scope?: Record<string, Array<DiffEnvRow>>;
   crons?: Array<CreateCronRequest>;
   edge_rules?: Array<CreateEdgeRuleRequest>;
+  /**
+   * Pending per-deployment env scope (ADR-091 / SAFE-RELEASES production-leveling Stream E). Compared against Baseline.LatestScope; mismatch emits a scope_mismatch break. Empty = default.
+   */
+  scope?: string | null;
 };
 

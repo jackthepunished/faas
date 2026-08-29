@@ -4675,6 +4675,62 @@ paths:
   # endpoint. CRITICAL-CVE images deploy successfully (AC #4) — the
   # scan is observational.
 
+  # ─── Per-deployment audit timeline (issue #976 / ADR-122 / SAFE-RELEASES-E.2) ──
+  # Production-leveling Stream A drill-down: the dashboard's
+  # deployments/<id> page renders these rows under the rollout pills;
+  # the CLI exposes them via `gregale deployments audit <id>`. IDOR-safe
+  # — the handler coerces the deployment ID through DeploymentByID +
+  # AppByID + AccountID before returning rows.
+
+  /v1/deployments/{id}/audit:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: listDeploymentAudit
+      summary: List deployment audit timeline.
+      description: |
+        Returns the deployment_audit rows for one deployment in
+        reverse-chronological order (issue #976 / ADR-122 /
+        SAFE-RELEASES-E.2 + production-leveling Stream A).
+
+        The wire surface is a paginated JSON list
+        (ListDeploymentAuditResponse); for the SSE-streaming
+        variant of the build log itself see
+        `/v1/deployments/{id}/logs`.
+
+        IDOR posture: the handler resolves the deployment ID
+        via `pkg/state.DeploymentByID` + `pkg/state.AppByID`
+        + account match BEFORE returning rows. A
+        cross-account probe returns 404 (no
+        account-existence leak).
+
+        Limit defaults to 50, clamped to [1, 500]; the
+        server-applied limit is echoed back in the response so
+        a paging consumer can distinguish "limit was clamped"
+        from "no more rows" (both yield Items of length <
+        limit).
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+          description: Maximum number of audit rows to return. Clamped to [1, 500]; the server-applied limit is echoed back in the response.
+      responses:
+        '200':
+          description: Paginated deployment_audit rows in reverse-chronological order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListDeploymentAuditResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing or cross-account probe (no account-existence leak).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/deployments/{id}/scan:
     parameters:
       - $ref: '#/components/parameters/Id32'
@@ -12255,22 +12311,6 @@ components:
           type: string
           description: "Operator or orchestrator reason recorded when the rollout is aborted."
 
-    CanaryPresetSpec:
-      description: "Progressive canary rollout preset requested on deployment creation (issue #976 / ADR-122)."
-      type: object
-      required: [preset]
-      properties:
-        preset:
-          type: string
-          enum: [none, slow, balanced, aggressive, 1-10-50-100]
-          description: "Closed-set canary ladder catalog name."
-        step_durations:
-          type: array
-          items:
-            type: integer
-            minimum: 0
-          description: "Optional step durations encoded as Go time.Duration nanoseconds; reserved for custom-ladder support."
-
     BuildPlan:
       description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
       type: object
@@ -12923,13 +12963,19 @@ components:
           type: [boolean, "null"]
           description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false."
           example: true
-
-        # SAFE-RELEASES-A: optional progressive canary preset.
+        # Issue #976 / ADR-122 / SAFE-RELEASES-A + production-leveling
+        # Stream F: per-deployment canary ladder. nil/omitted =
+        # server default 'none' (no canary; traffic_percent stays at
+        # 100). For preset='custom', `stages` carries the
+        # customer-supplied ladder (each stage is percent+duration
+        # string in time.ParseDuration form). Plan-gated at Pro+
+        # via acct.Plan.TrafficSplitAllowed() — Hobby/Free get 403
+        # plan_traffic_split_not_allowed.
         canary:
           oneOf:
             - $ref: '#/components/schemas/CanaryPresetSpec'
             - type: 'null'
-          description: "Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only."
+          description: "Per-deployment canary ladder (issue #976 / ADR-122 / SAFE-RELEASES-A). nil/omitted = server default 'none'. For preset='custom', stages carries the customer ladder."
 
     CreateDeploymentOverrides:
       description: |
@@ -13009,6 +13055,122 @@ components:
           pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
           description: "Override-object per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = inherit top-level scope or `default`."
           example: "staging"
+
+    # ─── Canary ladder (issue #976 / ADR-122 / SAFE-RELEASES-A) ───────────
+    # The catalog lives in pkg/api/canary (the closed set of preset
+    # names: none / slow / balanced / aggressive / 1-10-50-100 /
+    # custom). Production-leveling Stream F widens the set with
+    # `custom` and re-homes the per-deployment ladder onto the row's
+    # canary_stages jsonb column (migrations/00487). Wire shape:
+    # Stages carries []CustomStage only when preset='custom'; the
+    # catalog presets are resolved server-side without needing any
+    # wire ladder.
+    CustomStage:
+      description: |
+        One stage of a customer-supplied canary ladder
+        (issue #976 / ADR-122 / SAFE-RELEASES production-leveling
+        Stream F). Percent is the traffic share this stage moves
+        to (0..100, terminal stage must be 100). Duration is the
+        wall-clock dwell time at this stage in time.ParseDuration
+        form (e.g. "30s", "2m", "0s" for the terminal hop).
+      type: object
+      required: [percent, duration]
+      properties:
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: "Traffic share this stage moves to (0..100). The terminal stage must be 100."
+        duration:
+          type: string
+          description: "Wall-clock dwell at this stage, in time.ParseDuration form (e.g. '30s', '2m'). '0s' for the terminal hop."
+          example: "2m"
+
+    CanaryPresetSpec:
+      description: |
+        The canary ladder a customer asks for on a deploy (issue
+        #976 / ADR-122 / SAFE-RELEASES-A + production-leveling
+        Stream F). Preset is the catalog name from
+        pkg/api/canary (none/slow/balanced/aggressive/1-10-50-100/
+        custom). When Preset is 'custom', Stages is the
+        customer-supplied ladder (each entry is percent +
+        duration string in time.ParseDuration form, e.g.
+        "1% at 30s, 10% at 2m, 100% at 0s").
+        The wire-format change (StepDurations removed, Stages
+        added) is additive on the consumer side because the
+        prior StepDurations field was declared-but-dead — no
+        pre-PR client ever sent it.
+      type: object
+      required: [preset]
+      properties:
+        preset:
+          type: string
+          enum: [none, slow, balanced, aggressive, 1-10-50-100, custom]
+          description: "Catalog preset name. 'none' = no canary (server stamps canary_preset='none', canary_total_steps=0). 'custom' requires Stages to be non-empty."
+          example: "balanced"
+        stages:
+          type: array
+          items: { $ref: '#/components/schemas/CustomStage' }
+          description: "Per-stage ladder. Required when preset='custom' (the apid handler 422s otherwise); ignored for catalog presets (the catalog resolution runs server-side)."
+
+    # ─── Deployment audit timeline (issue #976 / ADR-122 / SAFE-RELEASES-E.2) ──
+    # Drill-down surface added by production-leveling Stream A.
+    # The dashboard's `deployments/<id>` page renders these rows
+    # under the rollout pills; the CLI exposes them via
+    # `gregale deployments audit <id>`; programmatic consumers hit
+    # `GET /v1/deployments/{id}/audit`. The wire shape mirrors
+    # `state.DeploymentAudit` minus the internal DB id (BIGINT)
+    # — the wire surface exposes the audit row as a
+    # sequence-pointed event keyed by (deployment_id, at).
+    DeploymentAuditResponse:
+      description: |
+        One row of the deployment_audit timeline (issue #976 /
+        ADR-122 / SAFE-RELEASES-E.2 + production-leveling Stream
+        A). Data is the verbatim jsonb payload at emit time;
+        kind-specific shape — DeployTrafficChanged carries
+        {from_percent, to_percent, actor_kind}, DeployRolledBack
+        carries {target_deployment_id, reason}.
+      type: object
+      required: [at, kind, actor]
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC timestamp at which the row was emitted. Sequence-pointed — sorting by (at DESC) gives the canonical timeline order."
+          example: "2026-08-27T14:23:19.482Z"
+        kind:
+          type: string
+          enum: [deploy.created, deploy.traffic_changed, deploy.rolled_back, deploy.rolled_forward, deploy.stuck, deploy.recovered]
+          description: "Closed-set event kind (migrations/00477 enforces the same CHECK on the deployments_audit table)."
+        actor:
+          type: string
+          description: "Service-account UUID or operator CLI sentinel (`operator:cli:recover_rollout`, `meterd:safedeploy`, `meterd:canary_progression`). Operators identify who did what from this column."
+          example: "meterd:safedeploy"
+        data:
+          description: "Verbatim jsonb payload at emit time (kind-specific shape — see description)."
+        account_id:
+          type: string
+          description: "Owning account UUID (cross-tenant IDOR posture)."
+
+    ListDeploymentAuditResponse:
+      description: |
+        Paginated wrapper for `GET /v1/deployments/{id}/audit`
+        (issue #976 / ADR-122 / SAFE-RELEASES-E.2 + production-
+        leveling Stream A). Limit is echoed back so a paging
+        consumer can distinguish "limit was clamped" from "no
+        more rows" — both yield Items of length < limit, but the
+        clamping is observable via this field.
+      type: object
+      required: [items, limit]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentAuditResponse' }
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          description: "Echo of the server-applied limit (query param ?limit= clamps here)."
 
     DeploymentHealthcheck:
       description: |
@@ -14072,6 +14234,20 @@ components:
         edge_rules:
           type: array
           items: { $ref: '#/components/schemas/CreateEdgeRuleRequest' }
+        # ADR-091 / SAFE-RELEASES production-leveling Stream E:
+        # per-deployment env scope carried on the diff request so
+        # the engine's scope_mismatch break can compare the
+        # baseline's LatestScope against the pending scope. Empty
+        # / omitted → handler coerces to 'default' (same as
+        # CreateDeploymentRequest.scope). The deployment_audit
+        # table + the rollout state machine both key off this
+        # scope; the diff is the place customers see drift
+        # before they commit.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Pending per-deployment env scope (ADR-091 / SAFE-RELEASES production-leveling Stream E). Compared against Baseline.LatestScope; mismatch emits a scope_mismatch break. Empty = default."
+          example: "prod"
 
     DiffAppConfigPatch:
       description: |
@@ -14507,6 +14683,7 @@ components:
         - webhook_url
         - webhook_secret_sealed_masked
         - cooldown_minutes
+        - action
         - state
         - created_at
         - updated_at
@@ -14550,6 +14727,12 @@ components:
           minimum: 5
           maximum: 1440
           example: 15
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'What to do when the rule fires. webhook = fire the configured webhook only (legacy default). rollback = roll the rule''s app back to its last live deployment. demote = pin the current canary step (no traffic advance). promote = short-circuit the canary ladder to 100%.'
+          default: webhook
+          example: webhook
         state:
           type: string
           enum: [ok, firing]
@@ -14587,6 +14770,12 @@ components:
           minimum: 5
           maximum: 1440
           example: 15
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'What to do when the rule fires. Omit to default to webhook.'
+          default: webhook
+          example: webhook
 
     UpdateAlertRuleRequest:
       description: 'Partial update — every field is optional. Omitted means leave alone.'
@@ -14607,6 +14796,10 @@ components:
           description: 'New plaintext HMAC secret. Omit to keep the existing secret.'
           maxLength: 256
         cooldown_minutes: { type: integer, minimum: 5, maximum: 1440 }
+        action:
+          type: string
+          enum: [webhook, rollback, demote, promote]
+          description: 'Replace the action. Omit to leave the existing action in place.'
 
     RotateAlertRuleSecretResponse:
       description: 'rotate-secret response — returns the rotated_at timestamp + the masked constant.'

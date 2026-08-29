@@ -21,5 +21,9 @@ export type UpdateAlertRuleRequest = {
    */
   webhook_secret?: string;
   cooldown_minutes?: number;
+  /**
+   * Replace the action. Omit to leave the existing action in place.
+   */
+  action?: 'webhook' | 'rollback' | 'demote' | 'promote';
 };
 

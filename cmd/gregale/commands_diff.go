@@ -195,6 +195,14 @@ func buildBaseline(ctx context.Context, client *api.Client, slug string) (deploy
 				if page.Items[i].AppID == app.ID {
 					latest := page.Items[i]
 					out.LatestDeployment = &latest
+					// SAFE-RELEASES production-leveling Stream
+					// E: pin the scope of the latest deployment
+					// so the engine can emit a `scope_mismatch`
+					// SeverityWarn break when the pending deploy
+					// targets a different scope (cross-env
+					// promotion). The field is already on the
+					// wire via DeploymentResponse (ADR-091).
+					out.LatestScope = latest.Scope
 					break
 				}
 			}

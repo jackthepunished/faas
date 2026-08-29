@@ -23,6 +23,7 @@ from .alert_preset_response_comparison import AlertPresetResponseComparison
 from .alert_preset_response_minimum_plan import AlertPresetResponseMinimumPlan
 from .alert_preset_response_window_spec import AlertPresetResponseWindowSpec
 from .alert_rule_response import AlertRuleResponse
+from .alert_rule_response_action import AlertRuleResponseAction
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
 from .alert_rule_response_metric import AlertRuleResponseMetric
@@ -137,6 +138,7 @@ from .consumed_credit_row import ConsumedCreditRow
 from .cors_preset_list_response import CorsPresetListResponse
 from .cors_preset_response import CorsPresetResponse
 from .create_alert_rule_request import CreateAlertRuleRequest
+from .create_alert_rule_request_action import CreateAlertRuleRequestAction
 from .create_alert_rule_request_comparison import CreateAlertRuleRequestComparison
 from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFailureSource
 from .create_alert_rule_request_metric import CreateAlertRuleRequestMetric
@@ -191,6 +193,7 @@ from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
 from .csrf_token_response import CSRFTokenResponse
 from .custom_domain_response import CustomDomainResponse
+from .custom_stage import CustomStage
 from .daily_usage_list_response import DailyUsageListResponse
 from .daily_usage_response import DailyUsageResponse
 from .data_upstream_list_response import DataUpstreamListResponse
@@ -212,7 +215,8 @@ from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
-from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
+from .deployment_audit_response import DeploymentAuditResponse
+from .deployment_audit_response_kind import DeploymentAuditResponseKind
 from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
 from .deployment_liveness_probe import DeploymentLivenessProbe
@@ -364,6 +368,7 @@ from .kafka_trigger_config import KafkaTriggerConfig
 from .list_audit_events_response import ListAuditEventsResponse
 from .list_audit_log_response import ListAuditLogResponse
 from .list_cron_runs_response import ListCronRunsResponse
+from .list_deployment_audit_response import ListDeploymentAuditResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
@@ -577,6 +582,7 @@ from .trigger_source_type_2_type_1 import TriggerSourceType2Type1
 from .trigger_source_type_3_type_1 import TriggerSourceType3Type1
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
+from .update_alert_rule_request_action import UpdateAlertRuleRequestAction
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
@@ -646,6 +652,7 @@ __all__ = (
     "AlertPresetResponseMinimumPlan",
     "AlertPresetResponseWindowSpec",
     "AlertRuleResponse",
+    "AlertRuleResponseAction",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",
     "AlertRuleResponseMetric",
@@ -760,6 +767,7 @@ __all__ = (
     "CorsPresetListResponse",
     "CorsPresetResponse",
     "CreateAlertRuleRequest",
+    "CreateAlertRuleRequestAction",
     "CreateAlertRuleRequestComparison",
     "CreateAlertRuleRequestFailureSource",
     "CreateAlertRuleRequestMetric",
@@ -810,6 +818,7 @@ __all__ = (
     "CronRunOutcome",
     "CSRFTokenResponse",
     "CustomDomainResponse",
+    "CustomStage",
     "DailyUsageListResponse",
     "DailyUsageResponse",
     "DataUpstreamListResponse",
@@ -831,7 +840,8 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
-    "DeleteDeploymentScopeExclusionResponse200",
+    "DeploymentAuditResponse",
+    "DeploymentAuditResponseKind",
     "DeploymentHealthcheck",
     "DeploymentListResponse",
     "DeploymentLivenessProbe",
@@ -979,6 +989,7 @@ __all__ = (
     "ListAuditEventsResponse",
     "ListAuditLogResponse",
     "ListCronRunsResponse",
+    "ListDeploymentAuditResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
     "ListOperatorRuntimeConfigResponse200",
@@ -1188,6 +1199,7 @@ __all__ = (
     "TriggerSourceType3Type1",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
+    "UpdateAlertRuleRequestAction",
     "UpdateAlertRuleRequestComparison",
     "UpdateAlertRuleRequestMetric",
     "UpdateAlertRuleRequestWindowSpec",

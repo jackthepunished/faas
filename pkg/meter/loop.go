@@ -10,6 +10,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
+	"github.com/onebox-faas/faas/pkg/canary"
+	"github.com/onebox-faas/faas/pkg/safedeploy"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -77,6 +79,19 @@ type Loop struct {
 	// partition-create cron. nil ⇒ the partition tick is
 	// skipped. Set via WithPartitionCreate from cmd/meterd/main.go.
 	partitionCreate func(ctx context.Context)
+	// canaryProgression (issue #976 / ADR-122 / SAFE-RELEASES-A)
+	// is the runtime walker that advances canary ladder steps
+	// on a wall-clock boundary. nil ⇒ the tick is skipped
+	// (FAAS_CANARY_PROGRESSION_TOKEN is off). Set via
+	// WithCanaryProgression from cmd/meterd/main.go.
+	canaryProgression *canary.Progression
+	// safedeploy (issue #976 / ADR-122 / SAFE-RELEASES-F) is
+	// the orchestrator tick that walks deployment rows in
+	// {pending, rolling_out} and advances the rollout_state
+	// machine. nil ⇒ the tick is skipped
+	// (FAAS_SAFEDEPLOY_TOKEN is off or pkg/safedeploy isn't
+	// wired). Set via WithSafeDeploy from cmd/meterd/main.go.
+	safedeploy *safedeploy.Orchestrator
 
 	lastTickMu sync.RWMutex
 	// lastTick records the wall-clock time each named tick body last
@@ -183,6 +198,39 @@ func (l *Loop) WithPartitionCreate(fn func(ctx context.Context)) *Loop {
 	return l
 }
 
+// WithCanaryProgression attaches the canary_progression tick
+// runtime (issue #976 / ADR-122 / SAFE-RELEASES-A). cmd/meterd
+// calls this when FAAS_CANARY_PROGRESSION_TOKEN is set so the
+// goroutine has a service-account bearer to drive
+// apid.PatchDeploymentsIdTraffic with. nil disables the tick
+// (Loop.Run skips the goroutine); the apid meterd surface stays
+// unaffected. Mirrors WithProbe's nil-skip + env-gate pattern.
+func (l *Loop) WithCanaryProgression(p *canary.Progression) *Loop {
+	if p == nil {
+		return l
+	}
+	l.canaryProgression = p
+	return l
+}
+
+// WithSafeDeploy attaches the safedeploy orchestrator tick
+// runtime (issue #976 / ADR-122 / SAFE-RELEASES-F). cmd/meterd
+// calls this when FAAS_SAFEDEPLOY_TOKEN is set so the goroutine
+// has the apid service-account credential the orchestrator uses
+// for any future api-side calls (today the orchestrator only
+// stamps the state machine via pkg/state.Store — no apid HTTP
+// calls — but the bearer stays wired for forward-compat with
+// pre-deploy diff checks). nil disables the tick (Loop.Run
+// skips the goroutine). Mirrors WithCanaryProgression's
+// nil-skip + env-gate pattern.
+func (l *Loop) WithSafeDeploy(o *safedeploy.Orchestrator) *Loop {
+	if o == nil {
+		return l
+	}
+	l.safedeploy = o
+	return l
+}
+
 // Run starts the six timers and blocks until ctx cancels or any timer
 // errors out. Sampler / quota loop / stripe pusher / dunning /
 // residency / alerts each log + continue on per-tick errors so a
@@ -282,6 +330,45 @@ func (l *Loop) Run(ctx context.Context) error {
 					l.partitionCreate(c)
 					return nil
 				}, "upstream_part")
+		}()
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: canary_progression
+	// tick. Gated on WithCanaryProgression (set by cmd/meterd
+	// when FAAS_CANARY_PROGRESSION_TOKEN is on — the token is the
+	// apid-issued service-account credential the runtime uses to
+	// drive PatchDeploymentsIdTraffic). When unwired, the
+	// goroutine is skipped — a meterd without the token is a
+	// meterd without the orchestrator's advancement authority,
+	// and skipping silently is the right behaviour (the operator
+	// will see the canary stuck in the dashboard and investigate
+	// the token configuration).
+	if l.canaryProgression != nil {
+		go func() {
+			errc <- l.runTicks(ctx, l.cfg.CanaryEvalInterval,
+				func(c context.Context) error {
+					_, err := l.canaryProgression.Once(c)
+					return err
+				}, "canary_progression")
+		}()
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-F: safedeploy
+	// orchestrator tick. Gated on WithSafeDeploy (set by
+	// cmd/meterd when FAAS_SAFEDEPLOY_TOKEN is on). The
+	// orchestrator stamps the rollout_state machine — pending
+	// → rolling_out → complete, plus a 30-min stuck-rollout
+	// warn — without making any apid HTTP calls today (the
+	// orchestrator's only writer is pkg/state.Store via
+	// SafedeployStampRollout + AppendDeploymentAudit). The
+	// orchestrator is the canonical owner of the
+	// rollout_state machine per CLAUDE.md ownership rules;
+	// pkg/canary only stamps canary_step + traffic_percent.
+	if l.safedeploy != nil {
+		go func() {
+			errc <- l.runTicks(ctx, l.cfg.SafeDeployInterval,
+				func(c context.Context) error {
+					_, err := l.safedeploy.Once(c)
+					return err
+				}, "safedeploy")
 		}()
 	}
 	// Block until either ctx cancels or a hard error fires.

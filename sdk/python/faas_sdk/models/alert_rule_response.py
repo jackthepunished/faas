@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.alert_rule_response_action import AlertRuleResponseAction, check_alert_rule_response_action
 from ..models.alert_rule_response_comparison import AlertRuleResponseComparison, check_alert_rule_response_comparison
 from ..models.alert_rule_response_failure_source import (
     AlertRuleResponseFailureSource,
@@ -44,6 +45,10 @@ class AlertRuleResponse:
     """Cool-down state machine."""
     created_at: datetime.datetime
     updated_at: datetime.datetime
+    action: AlertRuleResponseAction = "webhook"
+    """What to do when the rule fires. webhook = fire the configured webhook only (legacy default). rollback = roll
+    the rule's app back to its last live deployment. demote = pin the current canary step (no traffic advance).
+    promote = short-circuit the canary ladder to 100%."""
     failure_source: AlertRuleResponseFailureSource | Unset = UNSET
     """Source dimension for failed_invocations; omit when metric is not failed_invocations (xor_chk)."""
     last_fired_at: datetime.datetime | Unset = UNSET
@@ -72,6 +77,8 @@ class AlertRuleResponse:
         webhook_secret_sealed_masked = self.webhook_secret_sealed_masked
 
         cooldown_minutes = self.cooldown_minutes
+
+        action: str = self.action
 
         state: str = self.state
 
@@ -106,6 +113,7 @@ class AlertRuleResponse:
                 "webhook_url": webhook_url,
                 "webhook_secret_sealed_masked": webhook_secret_sealed_masked,
                 "cooldown_minutes": cooldown_minutes,
+                "action": action,
                 "state": state,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -144,6 +152,8 @@ class AlertRuleResponse:
         webhook_secret_sealed_masked = d.pop("webhook_secret_sealed_masked")
 
         cooldown_minutes = d.pop("cooldown_minutes")
+
+        action = check_alert_rule_response_action(d.pop("action"))
 
         state = check_alert_rule_response_state(d.pop("state"))
 
@@ -184,6 +194,7 @@ class AlertRuleResponse:
             webhook_url=webhook_url,
             webhook_secret_sealed_masked=webhook_secret_sealed_masked,
             cooldown_minutes=cooldown_minutes,
+            action=action,
             state=state,
             created_at=created_at,
             updated_at=updated_at,

@@ -53,6 +53,30 @@ type Baseline struct {
 	// for the app — used to detect immutable-field changes that
 	// would force a new deployment row.
 	LatestDeployment *api.DeploymentResponse
+	// LatestScope mirrors the scope of LatestDeployment (ADR-091
+	// PR-D per-deployment env targeting). The SAFE-RELEASES
+	// production-leveling Stream E (issue #976 / ADR-122 post-
+	// merge audit) engine pass uses it to emit a
+	// `scope_mismatch` SeverityInfo break when the pending
+	// deployment targets a different scope than the baseline
+	// (cross-env diff would otherwise miss the drift). Always
+	// populated when LatestDeployment != nil; empty when the
+	// baseline has no prior deployment.
+	//
+	// Note (plan deviation): the original Stream E plan also
+	// called for a `commit_sha_drift` break. Substrate check:
+	// state.Deployment carries CommitSHA (migrations/00047) but
+	// api.DeploymentResponse does NOT surface it on the wire
+	// (no commit_sha field in pkg/api/dto.go's DeploymentResponse
+	// — the column lives only on BuildProvenanceResponse). Adding
+	// a wire field requires a DeploymentResponse change + a
+	// pre-PR fixture refresh, which is deferred to a follow-up
+	// PR so this one stays reviewable in ~10 minutes. The Scope
+	// coverage shipped here is the higher-value half: scope
+	// drift is what an operator notices on a staging→prod
+	// promotion, while commit_sha drift surfaces in the build
+	// log review.
+	LatestScope string
 	// EnvByScope is the per-scope env list (ADR-090 D3 nested
 	// shape via ?scope=__all__). Always populated when the app
 	// exists; empty for a fresh app.
@@ -82,6 +106,16 @@ type Pending struct {
 	// baseline's [api.DeploymentResponse.ImageDigest] differs, this
 	// is an immutable change → [Break].
 	ImageRef string
+	// Scope (ADR-091 / PR-D) is the scope the pending deployment
+	// targets (matches [api.CreateDeploymentRequest.Scope]).
+	// Empty string is treated as the default scope (the
+	// server-side handler coerces "" → api.DefaultEnvScope at
+	// write time). The SAFE-RELEASES production-leveling Stream
+	// E pass compares it against Baseline.LatestScope; a
+	// mismatch emits a SeverityWarn `scope_mismatch` break so
+	// the operator can confirm a cross-env promotion rather
+	// than a same-env patch.
+	Scope string
 	// EnvByScope is the per-scope env write. Full-replacement
 	// semantics per scope (matching the wire's PUT-on-key style).
 	// A scope present in Pending but not in Baseline = add. A scope

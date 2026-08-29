@@ -25,6 +25,35 @@
     .badge.complete { background: #d1fae5; color: #065f46; }
     .badge.failed   { background: #fee2e2; color: #991b1b; }
     .badge.skipped  { background: #f3f4f6; color: #6b7280; }
+    /* Rollout state machine pills (issue #976 / ADR-122 / SAFE-RELEASES-F).
+       Names mirror the deployments_rollout_state_chk closed enum
+       verbatim so the template renders without a translation layer
+       (and a future enum widening lands as a CI failure here).
+       pending / rolling_out / complete / aborted cover the
+       pkg/safedeploy.Orchestrator state machine. */
+    .badge.rollout-pending    { background: #f3f4f6; color: #6b7280; }
+    .badge.rollout-rolling_out{ background: #dbeafe; color: #1e40af; }
+    .badge.rollout-complete   { background: #d1fae5; color: #065f46; }
+    .badge.rollout-aborted    { background: #fee2e2; color: #991b1b; }
+    /* Alert rule action chips (production-leveling Stream B).
+       Names mirror the alert_rules_action_chk closed enum
+       verbatim so the template applies the badge class without
+       a translation layer. webhook = legacy Dispatcher fan-out
+       (neutral grey); rollback = auto-rollback (red);
+       demote = pin at 0% traffic (amber); promote = short-circuit
+       to 100% (green). Wired into app_detail.html's Alerts
+       table at line ~540. */
+    .badge.alert-action-webhook  { background: #f3f4f6; color: #6b7280; }
+    .badge.alert-action-rollback { background: #fee2e2; color: #991b1b; }
+    .badge.alert-action-demote   { background: #fef3c7; color: #92400e; }
+    .badge.alert-action-promote  { background: #d1fae5; color: #065f46; }
+    /* Audit timeline severity chips (production-leveling Stream A).
+       Same palette as audit_events.html (.high / .warn / .info)
+       so the per-deployment timeline reuses the wider dashboard's
+       severity convention. Wired by pkg/dashboard.DeploymentAuditSeverityClass. */
+    .badge.sev-high { background: #fee2e2; color: #991b1b; }
+    .badge.sev-warn { background: #fef3c7; color: #92400e; }
+    .badge.sev-info { background: #e5e7eb; color: #374151; }
     /* Deployment lifecycle pills (state.DeploymentStatus closed enum).
        Names mirror the API status string verbatim so the template
        applies the badge class without a mapping helper. */
@@ -365,6 +394,52 @@
       {{else}}
         <p>Scan pending — the deploy is still mid-pipeline or the scan hasn't landed yet. The chip on the deploy list updates within seconds of the per-app ext4 build.</p>
       {{end}}
+    {{end}}
+
+    {{/* Production-leveling Stream A: per-deployment audit timeline
+         (issue #976 / ADR-122 / SAFE-RELEASES-E.2). Backed by
+         GET /v1/deployments/{id}/audit (handlers_audit.go::listDeploymentAudit),
+         capped at 50 rows. Newest first. Renders the kind→severity
+         chip via .Data.DeploymentAudit[i].SeverityClass (set by
+         pkg/dashboard.DeploymentAuditSeverityClass from the
+         kind closed set). DataPretty is the verbatim jsonb payload
+         rendered via PrettyAuditData. */}}
+    <h2>Audit timeline</h2>
+    {{if .Data.DeploymentAudit}}
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Severity</th>
+            <th>Kind</th>
+            <th>Actor</th>
+            <th>Data</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.DeploymentAudit}}
+          <tr>
+            <td>{{.At.Format "2006-01-02 15:04:05 UTC"}}</td>
+            <td><span class="badge sev-{{.SeverityClass}}">{{.SeverityClass}}</span></td>
+            <td><code>{{.Kind}}</code></td>
+            <td><code>{{.Actor}}</code></td>
+            <td>
+              {{if .DataPretty}}<pre>{{.DataPretty}}</pre>
+              {{else}}<span style="color:#888;">—</span>{{end}}
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      <p class="muted">
+        Same data on the wire:
+        <a href="/v1/deployments/{{.Data.Deployment.ID}}/audit?limit=50"
+           target="_blank" rel="noopener">GET /v1/deployments/{{.Data.Deployment.ID}}/audit</a>.
+        Capped at the most recent 50 rows; full history stays in
+        Postgres for 90 days (production-leveling Stream D).
+      </p>
+    {{else}}
+      <p class="muted">No audit rows yet for this deployment. The timeline starts populating as soon as the canary step ladder stamps the first <code>deploy.traffic_changed</code> row, or as soon as a rollback stamps <code>deploy.rolled_back</code>.</p>
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

@@ -1157,6 +1157,13 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// Per-deployment deployment_audit timeline (issue #976 /
+	// ADR-122 / SAFE-RELEASES-E.2 + production-leveling Stream A).
+	// Returns the same shape the dashboard's
+	// deployment_detail.html audit block reads (api.ListDeploymentAuditResponse).
+	// IDOR posture identical to getDeployment above — the handler
+	// re-validates the deployment belongs to acct via s.store.AppByDeploymentID.
+	mux.HandleFunc("GET /v1/deployments/{id}/audit", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDeploymentAudit))))
 	// ADR-122 / issue #975 item #1: per-deployment OpenAPI
 	// document discovery surface. Three routes (GET, PATCH,
 	// DELETE) under /v1/apps/{slug}/deployments/{deployment}/openapi.
