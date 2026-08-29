@@ -620,6 +620,11 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE"
             --timeout 25m
             --lease-ttl 35m
+            # A failed preflight or convergence leaves a durable failed job.
+            # This workflow is the retry-safe owner of the exact desired
+            # node/release state, so resume that state instead of requiring
+            # manual database cleanup after a transient prerequisite failure.
+            --resume
             --yes
             --json
           )
