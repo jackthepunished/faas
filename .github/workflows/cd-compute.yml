@@ -334,18 +334,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          count="$(curl --fail --silent --show-error --location \
+          # The repository GITHUB_TOKEN may not have permission to enumerate
+          # self-hosted runners even when the deployment job can be scheduled
+          # onto one. The labeled `runs-on` constraint below is the actual
+          # trust boundary; keep this API probe advisory when GitHub returns
+          # 401/403/404 so a valid deployment is not rejected by visibility
+          # permissions. A successful response with zero matching runners is
+          # still a hard preflight failure.
+          response_file="$RUNNER_TEMP/faas-runners.json"
+          http_status="$(curl --silent --show-error --location \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100" |
-            jq '[.runners[] | select(.status == "online") | select((.labels | map(.name) | index("faas-fleet")) != null)] | length')"
-          if (( count < 1 )); then
-            echo "::error::no online self-hosted runner has the faas-fleet label" >&2
-            echo "::error::bootstrap one with deploy/ansible/fleet_runner.yml before retrying" >&2
-            exit 1
-          fi
-          echo "online_faas_fleet_runners=${count}"
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100")"
+          case "$http_status" in
+            200)
+              count="$(jq '[.runners[] | select(.status == "online") | select((.labels | map(.name) | index("faas-fleet")) != null)] | length' "$response_file")"
+              if (( count < 1 )); then
+                echo "::error::no online self-hosted runner has the faas-fleet label" >&2
+                echo "::error::bootstrap one with deploy/ansible/fleet_runner.yml before retrying" >&2
+                exit 1
+              fi
+              echo "online_faas_fleet_runners=${count}"
+              ;;
+            401|403|404)
+              echo "::warning::GitHub API returned HTTP ${http_status} while listing runners; the labeled runs-on scheduler remains the final gate"
+              ;;
+            *)
+              echo "::error::unexpected GitHub runner-list response HTTP ${http_status}" >&2
+              exit 1
+              ;;
+          esac
 
   deploy:
     name: Join or roll compute node ${{ needs.preflight.outputs.node }}
