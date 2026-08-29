@@ -2885,6 +2885,22 @@ func (m *MemStore) ListInstancesByNodeID(_ context.Context, nodeID string) ([]In
 	return out, nil
 }
 
+// FailRunningInstanceIfOwnedByNode mirrors PgStore's conditional healthy-node
+// stale-instance transition. ErrConflict represents a state/node race.
+func (m *MemStore) FailRunningInstanceIfOwnedByNode(_ context.Context, id, nodeID string, terminalAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok || ins.NodeID != nodeID || ins.State != string(StateRunning) {
+		return ErrConflict
+	}
+	ins.State = string(StateFailed)
+	ts := terminalAt
+	ins.TerminalAt = &ts
+	m.instances[id] = ins
+	return nil
+}
+
 // ListOwnedCronsByNodeID mirrors pkg/state/pgstore.go:891. Same
 // in-process predicate; crons are 5-column rows keyed by app_id.
 func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]Cron, error) {

@@ -2018,6 +2018,48 @@ func TestCaptureAllowlistHandles_NilRunnerLeavesHandlesZero(t *testing.T) {
 	}
 }
 
+// TestCaptureAllowlistHandlesForWake_SkipsEmptyAllowlist ensures a default
+// wake does not pay for nft chain listings when the renderer emitted no
+// allowlist rule.
+func TestCaptureAllowlistHandlesForWake_SkipsEmptyAllowlist(t *testing.T) {
+	cap := &fakeCaptureRunner{listChainOutput: []byte(`chain forward {}`)}
+	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
+	hV4, hV6, err := m.captureAllowlistHandlesForWake(context.Background(), "fc-i-1", nil)
+	if err != nil {
+		t.Fatalf("captureAllowlistHandlesForWake: %v", err)
+	}
+	if hV4 != 0 || hV6 != 0 {
+		t.Fatalf("empty allowlist handles = (%d, %d), want (0, 0)", hV4, hV6)
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if len(cap.commands) != 0 {
+		t.Fatalf("empty allowlist made %d nft capture calls, want 0", len(cap.commands))
+	}
+}
+
+func TestCaptureAllowlistHandlesForWake_CapturesConfiguredAllowlist(t *testing.T) {
+	out := []byte(`
+ iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 42
+ iifname "tap0" ip6 daddr { 2001:db8::/32 } accept # handle 99
+`)
+	cap := &fakeCaptureRunner{listChainOutput: out}
+	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
+	allowlist := []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	hV4, hV6, err := m.captureAllowlistHandlesForWake(context.Background(), "fc-i-1", allowlist)
+	if err != nil {
+		t.Fatalf("captureAllowlistHandlesForWake: %v", err)
+	}
+	if hV4 != 42 || hV6 != 99 {
+		t.Fatalf("configured allowlist handles = (%d, %d), want (42, 99)", hV4, hV6)
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if len(cap.commands) != 2 {
+		t.Fatalf("configured allowlist made %d nft capture calls, want 2", len(cap.commands))
+	}
+}
+
 // TestUpdateEgressAllowlist_TwoPatchesInRow — the regression
 // the review called out: a second UpdateEgressAllowlist call on
 // the same app, with a DIFFERENT allowlist, must succeed. Before

@@ -77,6 +77,11 @@ type JailerVMM struct {
 	// WithSlowSubscriberCallback. The field is read under
 	// v.mu inside registerRing so a swap is safe at runtime.
 	slowSubscriber func()
+	// processExitSink receives the fact that a tracked Firecracker
+	// process has exited. Manager owns the lifecycle decision; the
+	// VMM only reports the reaped child. Kept outside the VMM
+	// interface so injected VMMs remain source-compatible.
+	processExitSink func(instance string, exitCode int)
 	// materialisedTmp tracks tmp files materializeFromStorage created for
 	// each instance so Kill/DestroyWithExport can Remove them on teardown.
 	// Without this, the tmp files (in /tmp) outlive the chroot and leak
@@ -121,6 +126,7 @@ type bindSourceMode struct {
 type instanceRecord struct {
 	cmd         *exec.Cmd
 	consolePath string        // serial console file used to detect a guest halt
+	isBuilder   bool          // builderd owns the expected process exit/export path
 	exited      bool          // set by the watchdog when cmd.Wait completes
 	exitCode    int           // captured from cmd.Wait's ProcessState.ExitCode()
 	done        chan struct{} // closed by the watchdog; readers <-done to wake
@@ -207,6 +213,15 @@ func (v *JailerVMM) registerRing(instance string) *logbuf.Ring {
 func (v *JailerVMM) WithSlowSubscriberCallback(cb func()) *JailerVMM {
 	v.mu.Lock()
 	v.slowSubscriber = cb
+	v.mu.Unlock()
+	return v
+}
+
+// WithProcessExitSink installs the callback for an unexpected Firecracker
+// process exit. Passing nil disables the callback.
+func (v *JailerVMM) WithProcessExitSink(cb func(instance string, exitCode int)) *JailerVMM {
+	v.mu.Lock()
+	v.processExitSink = cb
 	v.mu.Unlock()
 	return v
 }
@@ -495,6 +510,11 @@ func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady b
 // HTTP GET <path> against <HostIP>:8080 and accepts 2xx as ready. The
 // Manager threads WakeRequest.HealthcheckPath into this field at bringUp.
 func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err error) {
+	// Start the breakdown before any chroot or storage work. The manager's
+	// RestoreMs already covers this full method; keeping the detailed log on
+	// the same boundary makes its total_ms comparable to that field and keeps
+	// remote memory/vmstate materialisation visible in the breakdown.
+	t0 := time.Now()
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
 		return err
@@ -505,6 +525,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		}
 	}()
 
+	tMemStateResolveStart := time.Now()
 	// #96 / ADR-025 axis 2 — materialise the mem blob from the configured
 	// StorageBackend into a vmmd-allocated tmp file. After slice 3 the
 	// staging tmp path is purely internal: no caller-supplied MemPath is
@@ -552,6 +573,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		return fmt.Errorf("vmm: restore spec missing vmstate source (vmstate_storage_key=%q vmstate_path=%q)",
 			spec.VMStateStorageKey, spec.VMStatePath)
 	}
+	tMemStateResolve := time.Now()
 
 	// Re-stage everything the snapshot's recorded VM state still references.
 	// Park→Kill (vmm.Kill) wiped the prior chroot, so the chroot-relative
@@ -575,7 +597,6 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if len(spec.Workloads) == 0 && spec.LayerKey == "" {
 		return fmt.Errorf("vmm: restore spec missing layer: %+v", spec)
 	}
-	t0 := time.Now()
 	kernelSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.KernelKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
@@ -620,11 +641,13 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	}
 	// layerSrc is empty when cold-booting without a layer (cold path, no snapshot yet).
 	// stageWritable with an empty src would fail; skip it — Boot handles a missing drive1.
+	tStageWritableStart := time.Now()
 	if layerSrc != "" {
 		if _, err := stageWritable(root, layerSrc, l.UID, l.GID); err != nil {
 			return fmt.Errorf("vmm: stage layer: %w", err)
 		}
 	}
+	tStageWritable := time.Now()
 	// PR-B: stage each sidecar drive as read-only (the upper/writable
 	// overlay is shared with main; sidecars never get their own rw
 	// path, which is the load-bearing invariant — a runaway sidecar
@@ -699,7 +722,9 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	slog.Default().Info("restore timing breakdown",
 		"instance", l.Instance,
 		"resolve_ms", tResolve.Sub(t0).Milliseconds(),
+		"mem_state_resolve_ms", tMemStateResolve.Sub(tMemStateResolveStart).Milliseconds(),
 		"stage_drives_ms", tStageDrives.Sub(tResolve).Milliseconds(),
+		"stage_writable_ms", tStageWritable.Sub(tStageWritableStart).Milliseconds(),
 		"mem_state_ms", tMemState.Sub(tStageDrives).Milliseconds(),
 		"helper_ms", tHelper.Sub(tMemState).Milliseconds(),
 		"start_jailer_ms", tStartJailer.Sub(tHelper).Milliseconds(),
@@ -1471,8 +1496,9 @@ func consoleShowsGuestHalted(path string) bool {
 func (v *JailerVMM) InstancePID(instance string) (int, bool) {
 	v.mu.Lock()
 	cmd, ok := v.proc[instance]
+	rec := v.recs[instance]
 	v.mu.Unlock()
-	if !ok || cmd == nil || cmd.Process == nil {
+	if !ok || rec == nil || rec.exited || cmd == nil || cmd.Process == nil {
 		return 0, false
 	}
 	return cmd.Process.Pid, true
@@ -2155,7 +2181,7 @@ func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...strin
 	}
 	v.mu.Lock()
 	v.proc[l.Instance] = cmd
-	rec := &instanceRecord{cmd: cmd, consolePath: consolePath, done: make(chan struct{})}
+	rec := &instanceRecord{cmd: cmd, consolePath: consolePath, isBuilder: l.IsBuilder, done: make(chan struct{})}
 	v.recs[l.Instance] = rec
 	v.mu.Unlock()
 	// Watchdog: cmd.Wait must be called exactly once per process (stdlib
@@ -2166,13 +2192,28 @@ func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...strin
 		if consoleFile != nil {
 			_ = consoleFile.Close()
 		}
-		v.mu.Lock()
+		exitCode := 0
 		if state != nil {
-			rec.exitCode = state.ExitCode()
+			exitCode = state.ExitCode()
+		}
+		var sink func(string, int)
+		v.mu.Lock()
+		rec.exitCode = exitCode
+		// Remove the process from the liveness source of truth as
+		// soon as Wait completes. Destroy/Kill remain responsible
+		// for record/chroot cleanup.
+		if current, ok := v.proc[l.Instance]; ok && current == cmd {
+			delete(v.proc, l.Instance)
+			if !rec.isBuilder {
+				sink = v.processExitSink
+			}
 		}
 		rec.exited = true
 		close(rec.done)
 		v.mu.Unlock()
+		if sink != nil {
+			sink(l.Instance, exitCode)
+		}
 	}()
 	return nil
 }

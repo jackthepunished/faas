@@ -452,8 +452,20 @@ type Manager struct {
 	fcVersion     string // the running Firecracker version; snapshots load only on a match
 	log           *slog.Logger
 
-	mu         sync.Mutex
-	live       map[string]*Instance
+	mu   sync.Mutex
+	live map[string]*Instance
+	// pendingProcessExits closes the small hand-off race between
+	// JailerVMM reporting a child exit and Wake publishing the
+	// instance into live. A process can pass readiness and exit
+	// before the final live-map insert; retaining the exit under the
+	// same mutex lets Wake fail closed instead of registering a dead
+	// instance. Entries are consumed by Wake or cleared by cleanup.
+	pendingProcessExits map[string]int
+	// waking marks leases between acquisition and live-map publication.
+	// ProcessExited records a pending marker only for this narrow phase;
+	// an exit observed after explicit Destroy has removed live must not
+	// be mistaken for a future Wake of the same id.
+	waking     map[string]struct{}
 	exportDirs map[string]string // instance -> host export dir (builder VMs only, M6)
 	// cidToID (issue #470 / PR #470-FU-B) is the reverse
 	// Firecracker-vsock-CID → instance id index the framework_ready
@@ -589,6 +601,10 @@ type Manager struct {
 	// local vmmd run, or a unit test); startLivenessLoop logs
 	// Warn and returns.
 	livenessStarter LivenessProbeStarter
+	// lifecycleCtx is vmmd's daemon context. Per-instance liveness loops
+	// must be children of this context, not of the short-lived Wake RPC
+	// context; the latter is normally canceled as soon as Wake returns.
+	lifecycleCtx context.Context
 	// hostIdentities is the slice of X25519 secret keys used to
 	// unseal per-app sealed env blobs at wake time (spec §11/G2).
 	// Holds the current identity alone in the normal pre-rotation
@@ -779,19 +795,22 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		log = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Manager{
-		alloc:      NewAllocator(),
-		run:        run,
-		vmm:        vmm,
-		paths:      paths,
-		fcVersion:  fcVersion,
-		log:        log,
-		live:       make(map[string]*Instance),
-		exportDirs: make(map[string]string),
+		alloc:               NewAllocator(),
+		run:                 run,
+		vmm:                 vmm,
+		paths:               paths,
+		fcVersion:           fcVersion,
+		log:                 log,
+		live:                make(map[string]*Instance),
+		pendingProcessExits: make(map[string]int),
+		waking:              make(map[string]struct{}),
+		exportDirs:          make(map[string]string),
 		// Issue #470 / PR #470-FU-B: O(1) CID→instance lookup
 		// for the framework_ready DGRAM receipt path. See the
 		// cidToID field comment for the lifecycle.
 		cidToID:              make(map[uint32]string),
 		cooldownByDeployment: make(map[string]time.Time),
+		lifecycleCtx:         context.Background(),
 		// ADR-119 redesign: per-app static-egress caches. The
 		// perAppStaticIP map (per-app pin) stays; perVMHostIP
 		// (per-VM host IP) is the new map that drives the host
@@ -1149,9 +1168,9 @@ func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 // constructs the closure at daemon startup and passes it via
 // Manager.WithLivenessSink; the vmmd poll goroutine calls it directly.
 //
-// Reason is a stable short string from the closed set {timeout,
-// conn_refused, conn_err, non_200} — the same closed set the
-// vmmd_guest_liveness_probe_seconds histogram emits. The schedd
+// Reason is a stable short string from the probe set {timeout,
+// conn_refused, conn_err, non_200}; process-exit reconciliation
+// additionally uses "process_exited". The schedd
 // Engine.DestroyForLivenessFailure uses the reason to populate the
 // audit event's data JSON.
 type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
@@ -1201,6 +1220,82 @@ type LivenessProbeStarter func(ctx context.Context, instance string, slot int, d
 func (m *Manager) WithLivenessProbeStarter(starter LivenessProbeStarter) *Manager {
 	m.livenessStarter = starter
 	return m
+}
+
+// WithLifecycleContext attaches the vmmd daemon context used for background
+// per-instance work. Wake callers have short RPC lifetimes; using those
+// contexts for liveness monitoring stops the monitor immediately after a
+// successful wake. The daemon context keeps the monitor alive until the
+// instance is explicitly torn down or vmmd shuts down.
+func (m *Manager) WithLifecycleContext(ctx context.Context) *Manager {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.lifecycleCtx = ctx
+	return m
+}
+
+// ProcessExited reports an unexpected Firecracker process exit to schedd.
+// The Manager keeps the live entry intact while the relay runs so schedd's
+// normal Destroy path can perform the authoritative state transition and
+// resource cleanup. If no relay is wired (development/test mode), it falls
+// back to local cleanup so the allocator and network cannot leak.
+func (m *Manager) ProcessExited(instance string, exitCode int) {
+	if m == nil || instance == "" {
+		return
+	}
+	m.mu.Lock()
+	inst, live := m.live[instance]
+	relay := m.livenessRelay
+	lifecycle := m.lifecycleCtx
+	_, waking := m.waking[instance]
+	if !live && waking {
+		if m.pendingProcessExits == nil {
+			m.pendingProcessExits = make(map[string]int)
+		}
+		m.pendingProcessExits[instance] = exitCode
+	}
+	m.mu.Unlock()
+	if !live {
+		// An exit during the Wake hand-off is consumed by Wake. An
+		// exit after explicit Park/Destroy removed live is expected
+		// teardown and is deliberately ignored.
+		return
+	}
+	if inst.Lease.IsBuilder {
+		// Builderd owns the expected process-exit → artifact-export
+		// sequence. The VMM filters normal builder exits too, but keep
+		// this guard for alternate VMM implementations and tests.
+		return
+	}
+
+	// Stop the health loop before notifying schedd. Otherwise the
+	// dead process can produce a second, slower liveness failure while
+	// the first destroy is still in flight.
+	m.DeleteLivenessConsecutiveFailures(instance)
+	m.cancelLivenessLoop(instance)
+
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	m.ReportLivenessFailed(context.WithoutCancel(lifecycle), instance, "process_exited")
+	if relay != nil {
+		return
+	}
+
+	m.mu.Lock()
+	inst, ok := m.live[instance]
+	if ok {
+		delete(m.live, instance)
+		delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
+	}
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	m.cleanup(context.WithoutCancel(lifecycle), inst.Lease, inst.Net, inst.WorkloadNames)
+	m.log.Warn("firecracker process exited without schedd relay",
+		"instance", instance, "exit_code", exitCode)
 }
 
 // WithLivenessMetrics attaches the Prometheus collector pair
@@ -1282,9 +1377,9 @@ func (m *Manager) DeleteLivenessConsecutiveFailures(instance string) {
 // invocation of the LivenessFailedSink. Called by the per-instance
 // poll goroutine once the consecutive-failure counter reaches the
 // per-plan N. Schedd is the consumer (Engine.DestroyForLivenessFailure);
-// vmmd never touches the DB. Safe on a nil relay — the missing-wire
-// path is a no-op so a unit test that doesn't construct a relay
-// doesn't have to stub one.
+// vmmd never touches the DB. A nil relay skips the schedd notification,
+// but the local cooldown stamp still records the failure for tests and
+// default-local callers.
 //
 // Side effect (issue #554 closure / ADR-078 cooldown gate, code
 // review #725 finding F1): stamps the Manager's
@@ -1302,13 +1397,14 @@ func (m *Manager) DeleteLivenessConsecutiveFailures(instance string) {
 // were removed; the field itself is gone (the dying instance is
 // about to be Parked anyway).
 func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason string) {
-	if m.livenessRelay == nil {
+	if m == nil || instanceID == "" {
 		return
 	}
-	m.livenessRelay(ctx, instanceID, reason)
-	// Stamp cooldownByDeployment. We do this even when
-	// livenessRelay is nil-skipped above so tests can exercise
-	// the gate without the schedd sink.
+	if m.livenessRelay != nil {
+		m.livenessRelay(ctx, instanceID, reason)
+	}
+	// Stamp cooldownByDeployment even when no relay is wired so a
+	// local/test manager preserves the same restart-cooldown semantics.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inst, ok := m.live[instanceID]
@@ -1538,7 +1634,14 @@ func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot i
 			"instance", instance)
 		return
 	}
-	cancelFn := m.livenessStarter(ctx, instance, slot, deploymentID, cfg)
+	parent := m.lifecycleCtx
+	if parent == nil {
+		// Managers constructed outside cmd/vmmd still get the safe
+		// behavior: a request cancellation must not kill a monitor
+		// for a successfully running VM.
+		parent = context.WithoutCancel(ctx)
+	}
+	cancelFn := m.livenessStarter(parent, instance, slot, deploymentID, cfg)
 	if cancelFn != nil {
 		m.livenessRegistry.StartProbeLoop(instance, cancelFn)
 	}
@@ -2402,6 +2505,12 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		lease.BuildTimeoutSec = api.BuildTimeoutSeconds
 	}
 	lease.MemoryMaxMiB = req.MemSizeMiB
+	m.mu.Lock()
+	if m.waking == nil {
+		m.waking = make(map[string]struct{})
+	}
+	m.waking[req.Instance] = struct{}{}
+	m.mu.Unlock()
 	// Any failure from this point — Plan validation, wire-side
 	// allowlist checks, bringUp, cgroup write — must fully clean up.
 	// Registering the cleanup BEFORE the validation loop is
@@ -2880,7 +2989,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// rule alongside the prior one. The next patch will then
 	// have the prior handle cached and can `delete` + `add` as
 	// intended.
-	hV4, hV6, herr := m.captureAllowlistHandles(ctx, nc.Netns)
+	hV4, hV6, herr := m.captureAllowlistHandlesForWake(ctx, nc.Netns, nc.EgressAllowlist)
 	if herr != nil {
 		m.log.Debug("fcvm: Wake handle capture best-effort failed",
 			"instance", req.Instance, "netns", nc.Netns, "err", herr)
@@ -2888,6 +2997,14 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	inst.AllowlistHandleV4 = hV4
 	inst.AllowlistHandleV6 = hV6
 	m.mu.Lock()
+	if exitCode, exited := m.pendingProcessExits[req.Instance]; exited {
+		delete(m.pendingProcessExits, req.Instance)
+		delete(m.waking, req.Instance)
+		m.mu.Unlock()
+		err = fmt.Errorf("wake %s: firecracker exited before lifecycle registration (exit code %d)", req.Instance, exitCode)
+		return nil, err
+	}
+	delete(m.waking, req.Instance)
 	m.live[req.Instance] = inst
 	// Issue #470 / PR #470-FU-B: maintain the CID→instance
 	// reverse index so the framework_ready DGRAM receipt path
@@ -2906,8 +3023,9 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// liveness probe loop after the live map insert so the cmd/vmmd
 	// helper can read Lease.Slot via the same instance id. No-op
 	// when the registry isn't wired (unit tests, default-local vmmd).
-	// Uses the parent ctx so the loop exits cleanly when schedd
-	// cancels the wake request.
+	// The Manager selects its daemon lifecycle context so the loop
+	// survives the short-lived Wake RPC and exits with vmmd shutdown
+	// or explicit instance teardown.
 	m.startLivenessLoop(ctx, req.Instance, lease.Slot, req.LivenessProbe)
 	return inst, nil
 }
@@ -4282,6 +4400,18 @@ func (m *Manager) captureAllowlistHandles(ctx context.Context, netnsName string)
 	return hV4, hV6, nil
 }
 
+// captureAllowlistHandlesForWake avoids two nft list operations when the
+// effective allowlist is empty. Config.NftCommands intentionally emits no
+// allowlist accept rule in that case, so there are no handles to capture.
+// Keep the general captureAllowlistHandles method unchanged for live-patch
+// paths, where a caller may need to inspect an already-rendered chain.
+func (m *Manager) captureAllowlistHandlesForWake(ctx context.Context, netnsName string, allowlist []netip.Prefix) (uint64, uint64, error) {
+	if len(allowlist) == 0 {
+		return 0, 0, nil
+	}
+	return m.captureAllowlistHandles(ctx, netnsName)
+}
+
 // listChainHandles runs `ip netns exec <ns> nft -a list chain
 // <family> faas forward` and returns the handle of the rule that
 // matches the allowlist-renderer invariant
@@ -4338,6 +4468,13 @@ func listChainHandles(ctx context.Context, cap CaptureRunner, netnsName, family,
 // network, and always release the lease. Errors are logged, never returned — a
 // cleanup that gives up would leak.
 func (m *Manager) cleanup(ctx context.Context, lease Lease, nc netns.Config, workloadNames []string) {
+	// A child can report its exit after an explicit Destroy/failed Wake
+	// removed the live entry but before Kill has finished. Do not let that
+	// expected exit poison a later Wake using the same instance id.
+	m.mu.Lock()
+	delete(m.pendingProcessExits, lease.Instance)
+	delete(m.waking, lease.Instance)
+	m.mu.Unlock()
 	// Issue #463 / ADR-069 / PR-B: tear down per-workload cgroup child
 	// scopes BEFORE vmm.Kill removes the parent scope. The kernel
 	// cascade-removes children when the parent goes, but the parent
