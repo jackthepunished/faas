@@ -610,6 +610,14 @@ jobs:
       - name: Verify runner prerequisites and adopt the compute host
         run: |
           set -euo pipefail
+          # The supplied deployment key/user are the fleet operator identity,
+          # not only the newly adopted host's identity. Apply them as Ansible
+          # defaults so preflight and the control-plane convergence can reach
+          # every existing peer; the generated target host vars still retain
+          # the provider-specific SSH override and strict host-key policy.
+          export ANSIBLE_PRIVATE_KEY_FILE="$ARTIFACT_DIR/compute-ssh-key"
+          export ANSIBLE_REMOTE_USER="$SSH_USER"
+          export ANSIBLE_REMOTE_PORT="$SSH_PORT"
           JOIN_ARGS=(
             deploy join-node
             --manifest-file "$ARTIFACT_DIR/production-manifest.yaml"
@@ -620,6 +628,11 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE"
             --timeout 25m
             --lease-ttl 35m
+            # A failed preflight or convergence leaves a durable failed job.
+            # This workflow is the retry-safe owner of the exact desired
+            # node/release state, so resume that state instead of requiring
+            # manual database cleanup after a transient prerequisite failure.
+            --resume
             --yes
             --json
           )
