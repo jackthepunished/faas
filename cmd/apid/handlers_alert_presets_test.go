@@ -15,7 +15,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 
@@ -85,6 +84,25 @@ func TestBuildTestAlertEvent_PayloadDiscriminator(t *testing.T) {
 				WindowSpec:  "1h",
 			},
 			whichBranch: "none",
+		},
+		{
+			// /code-review finding: threshold=0 (deploy_failed
+			// preset in migrations/00418_alert_presets_seed.sql)
+			// must NOT produce observed=0 — the customer's
+			// verifier would treat the test as a no-op.
+			// 1% of |threshold|=0 falls back to the absolute
+			// margin floor of 0.01, so observed = 0 + 0.01.
+			name: "gt comparison at threshold=0 → observed = 0 + margin floor",
+			preset: state.AlertPreset{
+				Name:        "deploy_failed",
+				DisplayName: "Recent deployment failed",
+				Metric:      "apid_deployment_failed_total",
+				Comparison:  "gt",
+				Threshold:   0,
+				WindowSpec:  "1h",
+			},
+			wantObsGt:   0.01,
+			whichBranch: "gt",
 		},
 	}
 	for _, c := range cases {
@@ -243,9 +261,3 @@ func TestUnsealAlertRuleWebhookSecret_BadPlaintext(t *testing.T) {
 		t.Fatalf("prob = nil, want ErrCapacity (empty plaintext must refuse)")
 	}
 }
-
-// sentinel error used to verify that errors.Is(err, ErrNotFound) flows
-// through the AlertRuleByAccountAppAndPresetName handler branch. The
-// state package exports ErrNotFound; this var exists so future
-// compiler warnings about unused imports stay quiet.
-var _ = errors.Is

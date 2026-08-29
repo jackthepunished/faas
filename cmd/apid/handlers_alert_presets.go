@@ -40,6 +40,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
 	"time"
 
@@ -431,6 +432,13 @@ func (s *server) sendTestAlertPresetCore(ctx context.Context, acct state.Account
 // The namespace check is intentionally permissive (we accept any
 // sealed blob whose seal label matches alert_rule_secret) so a
 // future cross-namespace migration doesn't break the test path.
+//
+// The returned Problem carries the underlying crypto error only
+// in slog fields via s.log at the call site — never in the wire
+// body. secretbox error strings reveal which identities were
+// tried and the seal structure; surfacing them on a customer-
+// facing 5xx leaks that information to anyone who can trigger the
+// unseal path.
 func unsealAlertRuleWebhookSecret(ctx context.Context, sealed []byte) ([]byte, *api.Problem) {
 	hostIdentities := hostIdentitiesForUnseal(ctx)
 	if len(hostIdentities) == 0 {
@@ -438,7 +446,16 @@ func unsealAlertRuleWebhookSecret(ctx context.Context, sealed []byte) ([]byte, *
 	}
 	_, plaintext, err := secretbox.OpenBytesMulti(hostIdentities, sealed)
 	if err != nil {
-		return nil, api.ErrCapacity("could not unseal webhook secret: " + err.Error())
+		// Do NOT include err.Error() in the wire response —
+		// secretbox error strings reveal which identities were
+		// tried and the seal structure; surfacing them on a
+		// customer-facing 5xx leaks that information to anyone
+		// who can trigger the unseal path. The call site in
+		// sendTestAlertPresetCore logs the underlying error via
+		// s.log so operators can correlate.
+		return nil, api.NewProblem(http.StatusBadGateway, api.CodeCapacity,
+			"Could not unseal webhook secret",
+			"the host identity did not match this rule's seal — this is a boot-config or seal-corruption issue. The underlying error is logged server-side; reference the audit log entry for the delivery_id.")
 	}
 	if len(plaintext) == 0 {
 		return nil, api.ErrCapacity("unsealed webhook secret is empty")
@@ -486,21 +503,25 @@ func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule
 		return "", webhookout.Event{}, api.ErrCapacity("could not generate delivery id: " + err.Error())
 	}
 	deliveryID := hex.EncodeToString(idBytes)
-	// Synthetic observed value: threshold × 1.01 for "gt"
-	// comparisons, threshold × 0.99 for "lt". The sign-flip is
-	// load-bearing — for "lt" thresholds (api_reachable < 1,
-	// cert_expiry < 14d) the test value MUST be on the
-	// "breached" side of the threshold.
+	// Synthetic observed value: threshold + 1% for "gt" and
+	// threshold - 1% for "lt". The 1% margin is intentionally
+	// tiny — large margins would make the test look like a
+	// runaway spike, defeating the point of "I want to see what
+	// my receiver gets when this fires".
+	//
+	// The 1% is computed against max(0.01, |threshold|*0.01) so
+	// threshold=0 (the deploy_failed preset in
+	// migrations/00418_alert_presets_seed.sql) still produces a
+	// value JUST above 0 — without this guard, threshold*1.01=0
+	// and the customer's verifier would treat the test as a
+	// no-op (no fire-equivalent shape).
+	margin := math.Max(0.01, math.Abs(preset.Threshold)*0.01)
 	observed := preset.Threshold
 	switch preset.Comparison {
 	case "gt":
-		observed = preset.Threshold * 1.01
+		observed = preset.Threshold + margin
 	case "lt":
-		// Guard against negative thresholds — a tiny observed
-		// value just under a small positive threshold works,
-		// but threshold × 0.99 could still be > 0 if threshold
-		// were, e.g., -100.
-		observed = preset.Threshold * 0.99
+		observed = preset.Threshold - margin
 	}
 	return deliveryID, webhookout.Event{
 		ID:         deliveryID,

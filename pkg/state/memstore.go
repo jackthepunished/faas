@@ -13534,6 +13534,22 @@ func (m *MemStore) ListAlertPresets(_ context.Context) ([]AlertPreset, error) {
 	return out, nil
 }
 
+// SeedAlertPresetForTest inserts (or upserts) a single alert_presets
+// row into the in-memory catalog. Mirrors the test-only Invoice
+// seeder above; used by orchestrator tests that exercise the
+// preset-then-instantiate flow (issue #1233 / ADR-123 PR-C
+// commit 2 fix: end-to-end coverage for sendTestAlertPresetCore).
+// Production callers must NOT use this — the catalog is owned by
+// migrations/00418_alert_presets_seed.sql at deploy time.
+func (m *MemStore) SeedAlertPresetForTest(p AlertPreset) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p.ID == "" {
+		p.ID = newID()
+	}
+	m.alertPresets[p.Name] = p
+}
+
 // AlertPresetByName scans the map (8 rows). O(N) is acceptable
 // for the catalog cardinality. Returns ErrNotFound on no match.
 func (m *MemStore) AlertPresetByName(_ context.Context, name string) (AlertPreset, error) {
