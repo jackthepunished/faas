@@ -270,6 +270,13 @@ func boot() error {
 	// fails the deploy — that's worse than today's opaque "guest
 	// not ready after 30s" path).
 	go runCharacterizationForSup(supRef, manifest)
+	// M-2 / ADR-139 §Decision 1: HEALTHCHECK poll goroutine.
+	// Soft-fail on bind (e.g. guest kernel without AF_VSOCK) —
+	// the engine's existing :8080 TCP-accept probe continues to
+	// gate readiness, so the customer doesn't lose the boot.
+	if err := runHealthcheckPoll(context.Background(), manifest, slog.Default()); err != nil {
+		slog.Default().Warn("healthcheck poll unavailable", "err", err)
+	}
 	// M-2 / ADR-138 §Decision 1 / issue #474 — install the PID 1
 	// signal handler before invoking the supervisor. The handler
 	// multiplexes (a) the customer's STOPSIGNAL forwarded to the
