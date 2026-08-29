@@ -881,13 +881,22 @@ func copyRegular(tw *tar.Writer, abs string) error {
 		return fmt.Errorf("open %s: %w", abs, err)
 	}
 	defer func() { _ = f.Close() }()
-	n, err := io.Copy(tw, f)
+	// Wrap the source in a LimitReader so a runaway file (a 2 GB raw
+	// dataset committed by accident) aborts with at most capBytes+1
+	// bytes streamed into the tar before we reject it. Reading +1
+	// disambiguates "file is exactly capBytes" (allowed) from "file is
+	// strictly larger" (rejected). The prior implementation did
+	// io.Copy(tw, f) without a cap and only checked the size after the
+	// entire file had already been streamed into gzip — a 2 GB file
+	// would pay the full CPU/IO cost before the error surfaced.
+	const capBytes = int64(zeroConfigSourceCapMB) * 1024 * 1024
+	lr := io.LimitReader(f, capBytes+1)
+	n, err := io.Copy(tw, lr)
 	if err != nil {
 		return fmt.Errorf("copy %s: %w", abs, err)
 	}
-	const warnBytes = zeroConfigSourceCapMB * 1024 * 1024
-	if n >= warnBytes {
-		return fmt.Errorf("refusing to pack %s: %d bytes >= %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
+	if n > capBytes {
+		return fmt.Errorf("refusing to pack %s: %d bytes > %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
 			filepath.Base(abs), n, zeroConfigSourceCapMB)
 	}
 	return nil

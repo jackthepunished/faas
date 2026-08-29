@@ -451,7 +451,11 @@ func TestPackDirToTarGz_PerFileCap(t *testing.T) {
 		t.Skip("per-file cap test materialises a > cap file")
 	}
 	dir := t.TempDir()
-	huge := make([]byte, zeroConfigSourceCapMB*1024*1024)
+	// Strictly larger than cap so the LimitReader guard trips. Prior to
+	// the LimitReader fix in copyRegular the test materialised exactly
+	// cap bytes; the new code allows exactly-at-cap (LimitReader(cap+1)
+	// reads at most cap+1, and `n > cap` rejects only strictly larger).
+	huge := make([]byte, (zeroConfigSourceCapMB+1)*1024*1024)
 	if _, err := io.ReadFull(crypto_rand.Reader, huge); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
@@ -460,10 +464,45 @@ func TestPackDirToTarGz_PerFileCap(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
 	_, err := packDirToTarGz(dir, dest, nil)
 	if err == nil {
-		t.Fatal("packDirToTarGz should reject a single file >= per-file cap, got nil")
+		t.Fatal("packDirToTarGz should reject a single file > per-file cap, got nil")
 	}
 	if !strings.Contains(err.Error(), "per-file cap") {
 		t.Errorf("expected per-file cap error; got %v", err)
+	}
+}
+
+// TestPackDirToTarGz_PerFileCapExactlyAtCap pins the boundary semantics
+// of the LimitReader guard in copyRegular: a file whose size is exactly
+// capBytes (post-compression) is ALLOWED, and only strictly-larger files
+// are rejected. The pre-fix code used a post-hoc `>= warnBytes` check
+// after io.Copy(tw, f) and rejected exactly-at-cap; the LimitReader fix
+// (issue #1182) changes that to `> cap` so the cap is now a permissive
+// ceiling rather than a hard exclusion.
+func TestPackDirToTarGz_PerFileCapExactlyAtCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("per-file cap boundary test materialises a cap-sized file")
+	}
+	dir := t.TempDir()
+	atCap := make([]byte, zeroConfigSourceCapMB*1024*1024)
+	if _, err := io.ReadFull(crypto_rand.Reader, atCap); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	writeFileBytes(t, filepath.Join(dir, "blob.bin"), atCap)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+		// Random bytes don't compress, so the on-disk tarball will be
+		// near capBytes and trip the TOTAL cap check downstream even
+		// though the per-file LimitReader allowed it. That's the
+		// downstream total-cap gate doing its job, not a per-file
+		// regression — assert the error is the total cap, not per-file.
+		if strings.Contains(err.Error(), "per-file cap") {
+			t.Fatalf("exactly-at-cap should not trip the per-file LimitReader; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "zero-config cap") {
+			t.Fatalf("expected total-cap error; got %v", err)
+		}
+		return
 	}
 }
 
