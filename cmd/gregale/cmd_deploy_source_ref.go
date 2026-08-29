@@ -101,10 +101,13 @@ func cmdDeployRepoSourceRef(slug, repo, ref string, ann api.DeployAnnotations) i
 		// client-side tarball bytes (server pulls the codeload
 		// tarball via the GitHub App install token) and no git
 		// detection (prov == nil), so the receipt's only delta
-		// over the bare DeploymentResponse is app_url. Commit
-		// pinning for the source-ref path is captured server-
-		// side; see docs/source-ref.md reproducibility section.
-		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(dep.AppID), "")))
+		// over the bare DeploymentResponse is app_url. URL is
+		// built from the CLI-known slug (not the 32-hex AppID)
+		// so the customer-facing URL is actually routable.
+		// Commit pinning for the source-ref path is captured
+		// server-side; see docs/source-ref.md reproducibility
+		// section.
+		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(slug), "")))
 	}
 	return streamDeployLogs(client, dep)
 }

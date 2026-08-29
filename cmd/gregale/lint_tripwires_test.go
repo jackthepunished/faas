@@ -45,6 +45,10 @@ import (
 //   - commands_doctor.go (customer `gregale doctor` preflight — scans
 //     source trees via filepath.Walk; the regex is read-only and never
 //     executes any path, same security discipline as openCustomerFile)
+//   - tarballSHA256 in git_local.go (function-name scope, NOT a
+//     filename exception — see functionScopeMatch below). The
+//     exception is bounded to one function so a future os.Open in a
+//     sibling function in the same file still trips the wire.
 func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -95,18 +99,17 @@ func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 				if strings.HasSuffix(fileName, "commands_doctor.go") {
 					return true
 				}
-				// Documented exception: tarballSHA256 in
-				// cmd/gregale/git_local.go. The CLI's zero-config
-				// deploy path (issue #1182 §P1 follow-up) reads
-				// the tempfile it just wrote via
-				// `gitArchiveHEAD` to populate the DeployReceipt's
-				// source_sha256 field. Path is the CLI's own
-				// os.CreateTemp output, not customer-supplied;
-				// sha256.New (not os.ReadFile) consumes the bytes
-				// so a symlink swap mid-read is irrelevant. Same
+				// Documented exception: tarballSHA256 function in
+				// cmd/gregale/git_local.go (issue #1182 §P1
+				// follow-up). Scoped to the enclosing function name
+				// rather than the filename so a future os.Open in
+				// any other function in git_local.go still trips
+				// the wire — only this one helper, which reads
+				// the CLI's own os.CreateTemp tempfile to populate
+				// DeployReceipt.source_sha256, is exempt. Same
 				// discipline as openCustomerFile (no follow-on
-				// exec, no write, no chmod).
-				if strings.HasSuffix(fileName, "git_local.go") {
+				// exec / write / chmod, sha256.New is the consumer).
+				if strings.HasSuffix(fileName, "git_local.go") && enclosingFuncName(call, file) == "tarballSHA256" {
 					return true
 				}
 				pos := fset.Position(call.Pos())
@@ -140,6 +143,11 @@ func isOsOpenCall(call *ast.CallExpr) bool {
 	}
 	return id.Name == "os"
 }
+
+// enclosingFuncName is defined further down (paired with the
+// TestLintTripwire_DoctorStrictMutex_SelfTest visitor at line
+// 1005) and reused here to scope the git_local.go exception to
+// a single function name rather than the whole file.
 
 // TestLintTripwire_NoGlyphLiteralOutsideOutput closes the UX §3.2 surface
 // the §3.2 PR opened: the leading-glyph rule is enforced by a writer-based

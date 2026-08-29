@@ -72,7 +72,7 @@ plus four provenance-only fields:
 | `app_id`         | string | `api.DeploymentResponse.AppID`                                  |
 | `status`         | string | `api.DeploymentResponse.Status` — `"pending"` at deploy time    |
 | (all other `DeploymentResponse` fields) | — | see [`pkg/api`](../../pkg/api)                                 |
-| `app_url`        | string | `deployedAppURL(app_id)` — `https://<app>.<FAAS_APPS_DOMAIN>` (default `gregale.dev`) |
+| `app_url`        | string | `deployedAppURL(slug)` — `https://<slug>.<FAAS_APPS_DOMAIN>` (default `gregale.dev`). Slug comes from `--name` / cwd-derived name (CLI input), NOT from `app_id` on the response — the wire's `app_id` is the 32-char hex primary key and the gateway routes on slug. |
 | `commit_sha`     | string | `git rev-parse HEAD^{commit}` from the zero-config branch; empty on image / source-ref / non-git fallback paths |
 | `dirty`          | bool   | `git status --porcelain` is non-empty; omitempty so a clean repo renders no key |
 | `source_sha256`  | string | lower-case hex sha256 of the tarball bytes just shipped; empty on image and source-ref (server pulls) paths |

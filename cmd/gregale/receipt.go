@@ -47,11 +47,22 @@ type DeployReceipt struct {
 // the zero DeploymentResponse on the wire; a nil prov leaves
 // commit_sha and dirty at their zero values (matches the "no git
 // detection ran" image / source-ref / non-git fallback paths).
+//
+// appURL is built from the CLI-known slug via deployedAppURL
+// (commands2.go:3497); the receipt deliberately does NOT use
+// dep.AppID because the wire's app_id is the 32-char hex PK
+// (per openapi.yaml:12053, `pattern: '^[a-f0-9]{32}$'`), and the
+// gateway routes on slug — a hex-keyed URL never resolves. When
+// appURL is empty (CLI failed to resolve a slug), the omitempty
+// tag on AppURL drops the key so consumers don't see a malformed
+// `https://.gregale.dev` string.
 func newDeployReceipt(dep api.DeploymentResponse, prov *zeroConfigProvenance, appURL, sourceSHA256 string) *DeployReceipt {
 	r := &DeployReceipt{
 		DeploymentResponse: dep,
-		AppURL:             appURL,
 		SourceSHA256:       sourceSHA256,
+	}
+	if appURL != "" {
+		r.AppURL = appURL
 	}
 	if prov != nil {
 		r.CommitSHA = prov.SHA

@@ -1648,17 +1648,28 @@ func cmdDeployTarball(args []string) int {
 		if jsonOutput {
 			// Issue #1182 §P1 follow-up: receipt wraps the deploy
 			// response with commit_sha (zero-config only),
-			// dirty (zero-config only), app_url (always),
-			// and source_sha256 (sha256 of the tarball bytes
-			// just shipped). The tempfile is still on disk at
-			// this point — the deferred os.Remove fires at
-			// function return, so reading for the digest here
-			// is safe.
+			// dirty (zero-config only), app_url (always,
+			// computed from the CLI-known slug not the 32-hex
+			// AppID so the URL is actually routable), and
+			// source_sha256 (sha256 of the tarball bytes just
+			// shipped). The tempfile is still on disk at this
+			// point — the deferred os.Remove fires at function
+			// return, so reading for the digest here is safe.
 			var sourceSHA256 string
 			if *tarball != "" {
-				sourceSHA256, _ = tarballSHA256(*tarball)
+				if sha, hashErr := tarballSHA256(*tarball); hashErr != nil {
+					// Surface a non-fatal warning so the operator
+					// sees the receipt is missing source_sha256.
+					// CI consumers that pin source_sha256 will
+					// notice the absence; silently dropping the
+					// key would make a hash-failure indistinguishable
+					// from a legitimate image / source-ref deploy.
+					PrintWarn(osStderr, "could not hash source tarball for receipt (%v); source_sha256 omitted", hashErr)
+				} else {
+					sourceSHA256 = sha
+				}
 			}
-			return jsonOut(writeJSON(newDeployReceipt(dep, prov, deployedAppURL(dep.AppID), sourceSHA256)))
+			return jsonOut(writeJSON(newDeployReceipt(dep, prov, deployedAppURL(slug), sourceSHA256)))
 		}
 		return streamDeployLogs(client, dep)
 	}
@@ -1694,9 +1705,11 @@ func cmdDeployTarball(args []string) int {
 		// rides on dep.ImageDigest), no git detection (prov is
 		// nil from the function-scope hoist), so commit_sha /
 		// dirty / source_sha256 stay empty in the receipt. The
-		// receipt's only delta here is app_url, which the
-		// customer's tooling uses for the post-deploy URL pin.
-		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(dep.AppID), "")))
+		// receipt's only delta here is app_url, computed from
+		// the CLI-known slug (not the 32-hex AppID — the
+		// gateway routes on slug, so the receipt's URL has to
+		// be slug-shaped to actually resolve).
+		return jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(slug), "")))
 	}
 	return streamDeployLogs(client, dep)
 }
