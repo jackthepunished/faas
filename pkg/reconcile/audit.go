@@ -10,6 +10,7 @@ package reconcile
 import (
 	"context"
 
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -58,6 +59,20 @@ const (
 	// question than "what was excluded on this one scan?". SOC 2
 	// CC7.2 needs both durably for incident forensics.
 	KindProjectScopeExcluded = "project.scope.excluded"
+	// KindDeploymentCancelled / KindDeploymentReordered /
+	// KindDeploymentCleared / KindClearObsoleteDeployments
+	// are the ADR-124 deployment queue-control audit trail.
+	// Emitted from cmd/apid/handlers_queue_controls.go AFTER
+	// the pgstore state mutation succeeds; failure arms emit
+	// the metric counter only (no audit row — by design).
+	// `events.kind` is free text per migrations/00001_init.sql
+	// (the events table has no CHECK on kind), so no migration
+	// is required to add new kinds. SOC 2 CC7.2 reader joins
+	// these rows with the deployment row by data->>'deployment_id'.
+	KindDeploymentCancelled      = "deployment.cancelled"
+	KindDeploymentReordered      = "deployment.reordered"
+	KindDeploymentCleared        = "deployment.cleared"
+	KindClearObsoleteDeployments = "deployment.clear_obsolete"
 )
 
 // Alert kind constants. Mirrors the audit kind's `reason` field —
@@ -249,5 +264,101 @@ func (s *Service) EmitBuildEnqueued(
 		"repo":          repoFullName,
 		"branch":        branch,
 		"source_path":   sourcePath,
+	})
+}
+
+// EmitDeploymentCancelled fires deployment.cancelled after a
+// successful pgstore CancelDeploymentTx. priorStatus is the status
+// the row held BEFORE the flip (capture at the handler call site
+// before the store call returns). reason is the parsed
+// cancel_reason from the request body — empty string when the
+// caller omitted it. SOC 2 CC7.2 reader joins this row with the
+// deployment row by data->>'deployment_id'.
+//
+// Free function (not a method on *Service) so cmd/apid's handler
+// path — which has no *Service on the server struct — can call
+// it via s.audit.pkgAuditor(). Mirrors the EmitBuildEnqueued
+// export pattern: lowercase would block cmd/githubd → reconcile
+// callers; same goes for cmd/apid → reconcile.
+func EmitDeploymentCancelled(
+	ctx context.Context,
+	a *audit.Auditor,
+	accountID string,
+	deploymentID string,
+	appSlug string,
+	priorStatus string,
+	reason string,
+) {
+	a.Emit(ctx, KindDeploymentCancelled, &accountID, map[string]any{
+		"deployment_id": deploymentID,
+		"app_slug":      appSlug,
+		"prior_status":  priorStatus,
+		"reason":        reason,
+	})
+}
+
+// EmitDeploymentReordered fires deployment.reordered after a
+// successful pgstore ReorderDeployment. oldPriority is the value
+// before the UPDATE (capture at the handler call site before the
+// store call returns); newPriority is the value the caller
+// requested. The pair lets dashboards distinguish a "priority
+// bump" (e.g. 100 → 50) from a "deploy-immediately" (e.g. 100 →
+// 0). See ADR-124 §3 for the priority semantics.
+func EmitDeploymentReordered(
+	ctx context.Context,
+	a *audit.Auditor,
+	accountID string,
+	deploymentID string,
+	appSlug string,
+	oldPriority int,
+	newPriority int,
+) {
+	a.Emit(ctx, KindDeploymentReordered, &accountID, map[string]any{
+		"deployment_id": deploymentID,
+		"app_slug":      appSlug,
+		"old_priority":  oldPriority,
+		"new_priority":  newPriority,
+	})
+}
+
+// EmitDeploymentCleared fires deployment.cleared after a
+// successful pgstore ClearDeployment. priorStatus is the status
+// before the soft-delete (the row's status is intentionally
+// untouched on clear — admin audit trail per the handler
+// docstring — so dashboards need the captured pre-state here).
+func EmitDeploymentCleared(
+	ctx context.Context,
+	a *audit.Auditor,
+	accountID string,
+	deploymentID string,
+	appSlug string,
+	priorStatus string,
+) {
+	a.Emit(ctx, KindDeploymentCleared, &accountID, map[string]any{
+		"deployment_id": deploymentID,
+		"app_slug":      appSlug,
+		"prior_status":  priorStatus,
+	})
+}
+
+// EmitClearObsoleteDeployments fires deployment.clear_obsolete
+// after a successful pgstore ClearObsoleteDeployments. clearedCount
+// is the number of rows the store actually soft-deleted (zero is
+// a valid emit — the caller asked, the store found nothing). The
+// subject is the app_id (uuid) so SOC 2 CC7.2 dashboards group
+// per-app bulk clears on a single subject line; the per-deployment
+// rows are not individually audited (they're already terminal).
+func EmitClearObsoleteDeployments(
+	ctx context.Context,
+	a *audit.Auditor,
+	accountID string,
+	appID string,
+	clearedCount int,
+	olderThan string,
+) {
+	a.Emit(ctx, KindClearObsoleteDeployments, &accountID, map[string]any{
+		"app_id":        appID,
+		"cleared_count": clearedCount,
+		"older_than":    olderThan,
 	})
 }

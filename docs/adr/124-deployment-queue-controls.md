@@ -145,7 +145,7 @@ Help banner at `main.go:50`, dispatcher arm at `:235-242`, manifest entry at `cl
 
 - Closes the customer-facing "what's my deploy doing?" gap — operators can retract misfired deploys without operator support tickets.
 - Free plan keeps the safety valves (cancel + clear-obsolete); Paid plans get the full competitive-surfaces (reorder, deploy-immediately).
-- The cancel signal fires `pg_notify('deployment_changed')` — gatewayd's live picker (`pkg/gateway/pgbackend.go:974, 1105`), schedd's loop (`pkg/sched/loop.go:441, 1095`), and imaged's loop (`pkg/imaged/loop.go:148`) all pick it up via the existing subscriber map. Zero new subscribers.
+- The cancel signal fires `pg_notify('deployment_changed')` — gatewayd's live picker (`pkg/gateway/pgbackend.go:974, 1105`), schedd's loop (`pkg/sched/loop.go:441, 1095`), and imaged's loop (`pkg/imaged/loop.go:148`) all pick it up via the existing subscriber map. Zero new subscribers. Each control also emits an `events` audit row in the same request — the SOC 2 CC7.2 trail is durable (see Verification → Audit trail).
 - Auto-rollback (ADR-118) and cancel-via-tx share the same single-tx shape, so a follow-up "auto-cancel on quota breach" PR has a clean precedent.
 
 ### Negative
@@ -172,6 +172,40 @@ Help banner at `main.go:50`, dispatcher arm at `:235-242`, manifest entry at `cl
 - New `gofmt -w` pass before push (per `gofmt-local-vs-ci-version-mismatch.md`).
 - golangci-lint v2.4.0 — handler checklist compliance (`pkg/builderd/vm_metal.go:0 + Cancel method` ≤50 line blocks where the goroutine listens).
 - codeql — secret/PII leakage cleared (no new logging).
+
+### Audit trail (`feat/adr-124-audit-emission` follow-up)
+
+Each of the four controls emits one `events` row under
+`actor="apid"` after the pgstore state mutation succeeds:
+
+| Kind | Subject (accountID) | `data` payload |
+|---|---|---|
+| `deployment.cancelled` | `acct.ID` | `deployment_id`, `app_slug`, `prior_status`, `reason` |
+| `deployment.reordered` | `acct.ID` | `deployment_id`, `app_slug`, `old_priority`, `new_priority` |
+| `deployment.cleared` | `acct.ID` | `deployment_id`, `app_slug`, `prior_status` |
+| `deployment.clear_obsolete` | `acct.ID` | `app_id`, `cleared_count`, `older_than` |
+
+`events.kind` is free text per `migrations/00001_init.sql:120-127` (no
+CHECK constraint on the column), so adding new kinds needs no
+migration. Failure arms of the switch emit the metric counter
+only — by design, failures do NOT produce audit rows (a failed
+cancel is not a "cancel was attempted" event; the audit paper
+trail only records what actually happened). Rows appear on
+`/v1/audit-events` and `/dashboard/audit-events` (no template
+change required — `kind` renders as a free-text `<code>` cell per
+`pkg/dashboard/templates/audit_events.html`).
+
+SOC 2 CC7.2 / GDPR reader joins the audit row with the
+deployment row by `data->>'deployment_id'`. The metric labels
+on `audit_log_write_total{kind=...}` are pinned by
+`pkg/audit/audit_kind_metric_label_test.go` so the four new
+kinds land on their own counter series (not the `other`
+cardinality-bound fallback).
+
+Implementation: `pkg/reconcile/audit.go` (4 Kind constants + 4
+`EmitDeployment*` free functions), `cmd/apid/handlers_queue_controls.go`
+(emit calls), `pkg/reconcile/audit_queue_controls_test.go`
+(payload-shape pins), `pkg/audit/audit.go` (alias cases).
 
 ### OpenAPI parity (`make spec-check`)
 
