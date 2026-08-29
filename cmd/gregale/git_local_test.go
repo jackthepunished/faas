@@ -9,7 +9,10 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -287,5 +290,76 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+}
+
+// TestGitArchiveHEAD_HappyPath exercises the refactored zero-config
+// packer (issue #1182 §3.5): a temp git repo with a committed file
+// is archived to a temp path, the file is readable as a gzipped tar,
+// and the entry set contains the committed README.md. Pins that
+// `git archive HEAD -o <path>` produces a self-contained archive
+// the CLI can hand to the multipart writer without further
+// processing.
+func TestGitArchiveHEAD_HappyPath(t *testing.T) {
+	dir := initTestRepo(t)
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err != nil {
+		t.Fatalf("gitArchiveHEAD: %v", err)
+	}
+	f, err := os.Open(out)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	var found bool
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Next: %v", err)
+		}
+		if filepath.Base(hdr.Name) == "README.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("archive did not contain README.md entry")
+	}
+}
+
+// TestGitArchiveHEAD_EmptyRepo pins the empty-repo guard. A fresh
+// `git init` with no commits must return a non-nil error (the
+// rev-parse HEAD^{commit} pre-check). The caller surfaces this as
+// "no commits yet; commit something and try again".
+func TestGitArchiveHEAD_EmptyRepo(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err == nil {
+		t.Fatal("gitArchiveHEAD on empty repo should fail; got nil")
+	}
+	// out should not exist — the pre-check aborts before the archive
+	// command runs.
+	if _, err := os.Stat(out); err == nil {
+		t.Errorf("expected no archive on empty repo; file exists")
+	}
+}
+
+// TestGitArchiveHEAD_NotInRepo pins that running outside a git
+// working tree surfaces a non-nil error and does not produce a
+// spurious archive file at outPath.
+func TestGitArchiveHEAD_NotInRepo(t *testing.T) {
+	dir := t.TempDir() // no git init
+	out := filepath.Join(t.TempDir(), "out.tar.gz")
+	if err := gitArchiveHEAD(dir, out); err == nil {
+		t.Fatal("gitArchiveHEAD outside a repo should fail; got nil")
 	}
 }

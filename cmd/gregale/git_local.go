@@ -199,6 +199,42 @@ func runGitCmd(gitDir string, args ...string) (string, error) {
 	return string(out), nil
 }
 
+// gitArchiveHEAD runs `git archive HEAD --format=tar.gz -o <outPath>` in
+// gitDir, materialising the committed tree of HEAD as a gzipped tar
+// archive. Used by the refactored zero-config deploy path (issue
+// #1182) so the customer sees a faithful "deploying HEAD" semantic
+// instead of the cwd packer, which silently includes uncommitted /
+// untracked files.
+//
+// Errors:
+//
+//   - empty repo (no commits yet): rev-parse --verify HEAD^{commit}
+//     fails with "unknown revision"; we surface this directly so the
+//     caller can render a clean "no commits yet, commit something and
+//     try again" message without parsing git's exit message.
+//   - not in a repo: rev-parse fails with "not a git repository";
+//     bubbled up with stderr for the operator.
+//   - archive write failure (perm denied, disk full): bubbled up
+//     with stderr.
+//
+// Caller owns outPath. On success the file exists and is a valid
+// gzipped tar; the caller is expected to defer os.Remove. The
+// function does not open the file — `git archive -o` writes
+// directly, so no fd leak on this helper.
+func gitArchiveHEAD(gitDir, outPath string) error {
+	// Empty-repo guard. `git archive HEAD` would itself error with
+	// "unknown revision 'HEAD'" on a fresh `git init` (exit 128) but
+	// the rev-parse form gives a stable, parseable signal that we
+	// can wrap without relying on git's exact stderr string.
+	if _, err := runGitCmd(gitDir, "rev-parse", "--verify", "HEAD^{commit}"); err != nil {
+		return fmt.Errorf("gitArchiveHEAD: %w", err)
+	}
+	if _, err := runGitCmd(gitDir, "archive", "HEAD", "--format=tar.gz", "-o", outPath); err != nil {
+		return fmt.Errorf("gitArchiveHEAD: archive HEAD failed: %w", err)
+	}
+	return nil
+}
+
 // ErrNoGitConfigKey is returned by gitConfigUser when `git config --get`
 // exits with code 1 (the key is not set). Mirrors the MED-3 detection
 // pattern in gitRemoteOrigin (line 147): exit code 1 is the well-defined
