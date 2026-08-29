@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // pgLeaseRecord is the per-lease row returned by PgLeaser.Acquire.
@@ -198,7 +200,7 @@ func (l *PgLeaser) classifyRenewMiss(ctx context.Context, token LeaseToken, owne
 		  FROM job_tasks
 		 WHERE lease_token = $1
 	`, string(token)).Scan(&node, &expires)
-	if errors.Is(err, errPgxNoRows) {
+	if errors.Is(err, classifyNoRows) {
 		return ErrLeaseNotFound
 	}
 	if err != nil {
@@ -245,7 +247,7 @@ func (l *PgLeaser) Lookup(ctx context.Context, token LeaseToken) (string, time.T
 		  FROM job_tasks
 		 WHERE lease_token = $1
 	`, string(token)).Scan(&runID, &taskIndex, &expires, &owner)
-	if errors.Is(err, errPgxNoRows) {
+	if errors.Is(err, classifyNoRows) {
 		return "", time.Time{}, "", false, nil
 	}
 	if err != nil {
@@ -292,9 +294,13 @@ func formatLeaseKey(runID string, taskIndex int) string {
 	return runID + "\x00" + string(buf[i:])
 }
 
-// errPgxNoRows is the sentinel pgx returns from QueryRow.Scan when
-// no row matched. We re-declare it here as a package-private sentinel
-// so pkg/sched does not import pgx directly. The production pool's
-// pgx.ErrNoRows matches via errors.Is; tests can override this
-// variable to simulate "no rows" from a stub pool.
-var errPgxNoRows = errors.New("sched: pg no rows")
+// classifyNoRows is the sentinel check used by classifyAcquireMiss /
+// classifyRenewMiss / classifyLookupMiss. We compare against the
+// production pgx.ErrNoRows (re-exported via the pgx import added in
+// CR-3) instead of a fresh errors.New() — a local sentinel never
+// matches the real pgx sentinel, so error classification silently
+// fell through to fmt.Errorf("sched: pg lease … classify: %w", err)
+// for every "no rows" case (CR-3 / code-review #3). The package
+// owns a test-friendly alias rather than re-declaring the literal —
+// every existing call site (lines 201, 248) just references the alias.
+var classifyNoRows = pgx.ErrNoRows

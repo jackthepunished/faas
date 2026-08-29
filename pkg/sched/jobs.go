@@ -101,13 +101,22 @@ func (e *Engine) WakeJob(ctx context.Context, accountID, runID string, taskIndex
 	// vCPU ceilings via the ledger. The per-plan RAM cap is
 	// re-checked defensively — a job created on Hobby and re-edited
 	// to a Pro plan via PATCH /v1/jobs/{name} cannot exceed the
-	// Hobby ceiling until the next run is created. The per-account
-	// JobConcurrentPerAccount cap is gated on the dispatch tick
-	// (api.PlanFor-free path: the run row carries account_id but
-	// not plan; the quota is enforced at dispatch time using the
-	// Hobby cap as a conservative default, since Free plans can't
-	// have jobs at all).
-	plan := api.PlanHobby // Free plans return 404 at apid; this is a defensive floor.
+	// Hobby ceiling until the next run is created. Plan is read
+	// from the account row, NOT hardcoded to Hobby — Pro/Scale
+	// customers were silently clamped to Hobby RAM + concurrency
+	// ceilings on the dispatch path (CR-4 / code-review #4).
+	account, err := e.store.AccountByID(ctx, accountID)
+	if err != nil {
+		return JobWakeResult{}, fmt.Errorf("sched: WakeJob resolve account: %w", err)
+	}
+	plan := account.Plan
+	if plan == api.PlanFree {
+		// Free plans return 404 at apid; if a row sneaks through
+		// (corrupted state) we still treat it as a Hobby-equivalent
+		// floor so the WakeJob doesn't propagate a zero-quota plan
+		// into the ledger.
+		plan = api.PlanHobby
+	}
 	planIdx := plan.PlanIndex()
 	ramMB := job.RAMMB
 	if ramMB > api.JobRAMMB[planIdx] {
@@ -377,29 +386,47 @@ func (e *Engine) DispatchJobsTick(ctx context.Context) error {
 		run, err := e.store.JobRunGetByID(ctx, t.RunID)
 		if err != nil {
 			// Run is gone — re-queue the task so the next tick can
-			// see the orphan and skip it. Best-effort.
-			_ = e.store.JobTaskRetry(ctx, t.RunID, t.TaskIndex, time.Now())
+			// see the orphan and skip it. Best-effort. Use
+			// JobTaskRequeue (NOT JobTaskRetry) so the attempt
+			// counter is preserved — the task never executed.
+			_ = e.store.JobTaskRequeue(ctx, t.RunID, t.TaskIndex, time.Now())
 			continue
 		}
 		// Per-account gate (the ledger Admit already covers
 		// per-node RAM; this is the per-account concurrency
-		// ceiling).
+		// ceiling). Plan is read from the account row so Pro/Scale
+		// customers hit their per-plan cap (CR-4 / code-review #4).
 		concurrent, err := e.store.JobConcurrentByAccount(ctx, run.AccountID)
 		if err != nil {
 			return fmt.Errorf("sched: dispatchJobsTick concurrent: %w", err)
 		}
-		plan := api.PlanHobby // Free plans return 404 at apid; defensive floor
+		account, err := e.store.AccountByID(ctx, run.AccountID)
+		if err != nil {
+			return fmt.Errorf("sched: dispatchJobsTick resolve account: %w", err)
+		}
+		plan := account.Plan
+		if plan == api.PlanFree {
+			// Free plans are 404 at apid; if a row sneaks through
+			// we still treat it as Hobby-equivalent so the cap
+			// lookup doesn't index [-1].
+			plan = api.PlanHobby
+		}
 		planIdx := plan.PlanIndex()
 		if cap := api.JobConcurrentPerAccount[planIdx]; concurrent >= cap {
 			// Re-queue for the next tick (next_attempt_at = now()).
-			_ = e.store.JobTaskRetry(ctx, t.RunID, t.TaskIndex, time.Now())
+			// JobTaskRequeue preserves attempt — the task never
+			// executed (CR-7 / code-review #7).
+			_ = e.store.JobTaskRequeue(ctx, t.RunID, t.TaskIndex, time.Now())
 			continue
 		}
 		if _, err := e.WakeJob(ctx, run.AccountID, t.RunID, t.TaskIndex); err != nil {
 			// Best-effort retry: a transient admit / vmmd failure
-			// should not block other tasks. next_attempt_at = 0
-			// means "eligible immediately on the next tick".
-			_ = e.store.JobTaskRetry(ctx, t.RunID, t.TaskIndex, time.Now())
+			// should not block other tasks. next_attempt_at = now()
+			// means "eligible immediately on the next tick". Use
+			// JobTaskRequeue (NOT JobTaskRetry) so the customer's
+			// retry budget is preserved — WakeJob did not actually
+			// run the customer code (CR-7 / code-review #7).
+			_ = e.store.JobTaskRequeue(ctx, t.RunID, t.TaskIndex, time.Now())
 		}
 	}
 	return nil
@@ -507,14 +534,36 @@ func isTerminalTaskStatus(s string) bool {
 // → job_tasks.status mapping. Mirrors
 // guest/init/job_supervisor_linux.go::mapExitToErrorClass (M8).
 //
-// exit_code conventions:
+// error_class precedence: when the guest-supervised DGRAM payload
+// carries a non-empty error_class from the canonical set
+// {succeeded, failed, timeout, oom, cancelled, infra}, we trust
+// it as authoritative and skip the exit-code fallback. The
+// exit-code mapping is the legacy fallback for hosts that don't
+// yet ship the v2 payload schema (CR-5 / code-review #5 — the
+// previous version silently ignored errorClass, so a guest that
+// correctly classified "infra" with exit_code=139 was demoted to
+// "failed" and the task dead-lettered on first signal death).
+//
+// exit_code conventions (fallback path):
 //
 //	0    → succeeded
 //	124  → timeout (per `timeout` coreutils)
 //	137  → oom (kernel OOM killer)
 //	143  → cancelled (SIGTERM)
-//	any  → failed (with the supplied error_class)
+//	any  → failed
 func mapExitToTerminalStatus(exitCode int, errorClass string) string {
+	switch errorClass {
+	case "succeeded", "failed", "timeout", "oom", "cancelled", "infra":
+		// "infra" maps to "failed" at the status layer — the wire
+		// error_class preserves the signal-death distinction for
+		// observability, but the task status is still terminal-
+		// failure so the retry + dead-letter logic in
+		// HandleJobExit takes the standard path.
+		if errorClass == "infra" {
+			return "failed"
+		}
+		return errorClass
+	}
 	switch {
 	case exitCode == 0:
 		return "succeeded"

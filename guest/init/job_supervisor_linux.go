@@ -191,41 +191,55 @@ func runViaOSExec(m JobManifest, env []string, log *slog.Logger) error {
 // Sends SIGKILL to PID once 30s past the SIGTERM if the process
 // is still alive. sendSignal is best-effort; an ESRCH means the
 // process already exited and the watcher can exit cleanly.
+//
+// CR-6 / code-review #6: the previous implementation pre-started
+// both the deadline AND the 30s grace timer at function entry.
+// When task_timeout_s > 30s (the common case — Hobby=300s, Pro
+// =1800s), the grace timer fired at t=30s and its value sat in
+// the buffered channel. After SIGTERM at the deadline, the
+// goroutine did `<-grace.C` which returned immediately (the value
+// was already queued), and SIGKILL was sent with effectively
+// zero grace — a customer that needed the full 30s to drain
+// in-flight work was killed mid-shutdown. Fix: don't arm the
+// grace timer until after SIGTERM is delivered, so the 30s window
+// starts at the SIGTERM moment.
 func startTimeoutWatcher(ctx context.Context, taskTimeoutSec int, pid int) {
 	if taskTimeoutSec <= 0 {
 		return
 	}
 	deadline := time.NewTimer(time.Duration(taskTimeoutSec) * time.Second)
 	defer deadline.Stop()
-	grace := time.NewTimer(30 * time.Second)
-	defer grace.Stop()
-	stopBoth := func() {
+	stopDeadline := func() {
 		if !deadline.Stop() {
 			select {
 			case <-deadline.C:
 			default:
 			}
 		}
-		if !grace.Stop() {
-			select {
-			case <-grace.C:
-			default:
-			}
-		}
 	}
 	go func() {
-		// Clean exit: ctx cancel kills both timers + the goroutine.
+		// Clean exit: ctx cancel stops the deadline timer + the
+		// goroutine. (No grace timer exists yet at this point.)
 		select {
 		case <-ctx.Done():
-			stopBoth()
+			stopDeadline()
 			return
 		case <-deadline.C:
-			// SIGTERM at the deadline.
+			// SIGTERM at the deadline. Now arm the 30s grace
+			// timer — its 30s window starts at THIS instant,
+			// not at function entry.
 			_ = unix.Kill(pid, unix.SIGTERM)
 		}
+		grace := time.NewTimer(30 * time.Second)
+		defer grace.Stop()
 		select {
 		case <-ctx.Done():
-			stopBoth()
+			if !grace.Stop() {
+				select {
+				case <-grace.C:
+				default:
+				}
+			}
 			return
 		case <-grace.C:
 			// 30s grace elapsed; SIGKILL the customer.

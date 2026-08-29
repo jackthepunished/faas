@@ -611,6 +611,40 @@ func (m *MemStore) JobTaskRetry(_ context.Context, runID string, taskIndex int, 
 	return nil
 }
 
+// JobTaskRequeue reverses a CLAIMED-but-not-executed task back to
+// queued WITHOUT incrementing attempt. Mirrors JobTaskRetry's
+// column-reset contract (clears instance_id + lease columns +
+// started_at) but preserves the attempt counter — the customer's
+// retry budget is not consumed by transient dispatch-side failures
+// (admission denied, vmmd unreachable, run-lookup race).
+func (m *MemStore) JobTaskRequeue(_ context.Context, runID string, taskIndex int, nextAttemptAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tasks, ok := m.jobTasks[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	t, ok := tasks[taskIndex]
+	if !ok {
+		return ErrNotFound
+	}
+	if t.Status != "queued" && t.Status != "claimed" {
+		return ErrNotFound
+	}
+	t.Status = "queued"
+	// Attempt is preserved — see CR-7.
+	next := nextAttemptAt.UTC()
+	t.NextAttemptAt = &next
+	t.StartedAt = nil
+	t.InstanceID = nil
+	t.LeaseToken = nil
+	t.LeaseExpiresAt = nil
+	t.LastLeaseNode = nil
+	tasks[taskIndex] = t
+	m.jobTasks[runID] = tasks
+	return nil
+}
+
 // JobTaskCancel transitions a single task to status='cancelled'.
 // Idempotent on tasks already terminal.
 func (m *MemStore) JobTaskCancel(_ context.Context, runID string, taskIndex int) error {

@@ -1864,6 +1864,47 @@ func StatusForCode(code string) int {
 		return http.StatusUnsupportedMediaType
 	case CodeRequestTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// Jobs (issue #1184 Workstream A / ADR-099 supplement). Eight
+	// codes that ship with Mega-1 (CR-8 / code-review #8 — the
+	// gRPC error path lifts a gRPC status into a Problem carrying
+	// only the Code, so any of these eight codes that landed on a
+	// gRPC error without an explicit case here was reconstructed
+	// as 500). Reverse mapping pinned to the wire contract:
+	//
+	//   404 jobs_not_allowed       — Free-plan gate (404 not 403 so
+	//                                a Free account can probe the
+	//                                surface without leaking Jobs
+	//                                exists on paid tiers).
+	//   404 job_task_not_found     — single-task lookup miss.
+	//   404 job_image_missing      — referenced image_id doesn't
+	//                                exist or isn't job-runnable.
+	//   409 job_run_cancelled      — cancel of already-terminal run.
+	//   409 job_has_live_instances — soft-delete denied; live
+	//                                kind='job_task' instances
+	//                                still need to drain.
+	//   410 job_deadline_exceeded  — wall-clock deadline cap
+	//                                (distinct from cancel — the
+	//                                customer authored the
+	//                                deadline, not an explicit
+	//                                cancel call).
+	//   429 job_quota_exceeded     — every per-plan job quota
+	//                                family (JobMaxPerAccount /
+	//                                JobConcurrentPerAccount /
+	//                                JobRAMMB / JobTaskTimeoutSec /
+	//                                JobMaxParallelismPerRun /
+	//                                JobMaxTasksPerRun / JobMaxRetries).
+	//   400 job_command_invalid    — command[] shape violation
+	//                                (length > 64 or embedded NUL).
+	case CodeJobsNotAllowed, CodeJobTaskNotFound, CodeJobImageMissing:
+		return http.StatusNotFound
+	case CodeJobRunCancelled, CodeJobHasLiveInstances:
+		return http.StatusConflict
+	case CodeJobDeadlineExceeded:
+		return http.StatusGone
+	case CodeJobQuotaExceeded:
+		return http.StatusTooManyRequests
+	case CodeJobCommandInvalid:
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}

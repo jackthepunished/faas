@@ -382,6 +382,25 @@ type JobStore interface {
 	//
 	// Returns ErrNotFound when (run_id, task_index) does not resolve.
 	JobTaskRetry(ctx context.Context, runID string, taskIndex int, nextAttemptAt time.Time) error
+	// JobTaskRequeue reverses a CLAIMED-but-not-yet-executed task
+	// back to 'queued' WITHOUT incrementing the attempt counter.
+	// Used by the dispatch tick when admission / quota / vmmd
+	// bootstrapping fails before the customer's code runs (CR-7 /
+	// code-review #7 — the previous code path called JobTaskRetry
+	// for transient rejections, which silently consumed the
+	// customer's retry budget for failures that were never the
+	// customer's fault). Stamps next_attempt_at so the next
+	// dispatch tick picks the task up; clears instance_id +
+	// lease_token + lease_expires_at + last_lease_node + started_at
+	// so the next claim mints a fresh microVM.
+	//
+	// Distinct from JobTaskRetry's contract in two ways: attempt is
+	// NOT incremented, and the WHERE clause accepts both 'queued'
+	// and 'claimed' (JobTaskRetry only matches rows that previously
+	// reached a terminal state).
+	//
+	// Returns ErrNotFound when (run_id, task_index) does not resolve.
+	JobTaskRequeue(ctx context.Context, runID string, taskIndex int, nextAttemptAt time.Time) error
 	// JobTaskCancel transitions a single task to status='cancelled'
 	// (called when the parent run is cancelled mid-flight, or when
 	// the job is paused). Idempotent on tasks already terminal.

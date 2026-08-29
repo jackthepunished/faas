@@ -776,6 +776,35 @@ func (s *PgStore) JobTaskRetry(ctx context.Context, runID string, taskIndex int,
 	return nil
 }
 
+// JobTaskRequeue reverses a CLAIMED-but-not-executed task back to
+// queued WITHOUT incrementing attempt. Mirrors JobTaskRetry's
+// column-reset contract (clears instance_id + lease columns +
+// started_at) but preserves the attempt counter — the customer's
+// retry budget is not consumed by transient dispatch-side failures
+// (admission denied, vmmd unreachable, run-lookup race, per-account
+// quota at cap). See CR-7 / code-review #7.
+func (s *PgStore) JobTaskRequeue(ctx context.Context, runID string, taskIndex int, nextAttemptAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update job_tasks set
+		   status            = 'queued',
+		   instance_id       = null,
+		   next_attempt_at   = $3,
+		   started_at        = null,
+		   lease_token       = null,
+		   lease_expires_at  = null,
+		   last_lease_node   = null
+		 where run_id = $1::uuid and task_index = $2
+		   and status in ('queued','claimed')`,
+		runID, taskIndex, nextAttemptAt.UTC())
+	if err != nil {
+		return fmt.Errorf("state: requeue task (%s, %d): %w", runID, taskIndex, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // JobTaskCancel transitions a single task to status='cancelled'.
 // Idempotent on tasks already terminal.
 //
