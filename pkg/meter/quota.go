@@ -152,9 +152,22 @@ func EnforceQuota(
 		// account sweep.
 		subject, body := mail.QuotaWarningBody(account.Email, string(account.Plan),
 			usedGB, res.QuotaGB, today)
-		if err := mailer.Send(ctx, mail.Message{
-			To: []string{account.Email}, Subject: subject, TextBody: body,
-		}); err != nil {
+		html := mail.QuotaWarningHTMLBody(account.Email, string(account.Plan),
+			usedGB, res.QuotaGB, today.UTC().Format("2006-01-02"))
+		msg := mail.Message{
+			To:       []string{account.Email},
+			Subject:  subject,
+			TextBody: body,
+			HTMLBody: html,
+		}
+		// Bulk-sender compliance (issue #246 item 4): attach the
+		// RFC 8058 List-Unsubscribe pair only when the operator
+		// has wired the URL. Empty URL = dev box; skip the header
+		// rather than ship "<>" which is a Gmail rejection path.
+		if unsub := NotificationsUnsubscribeURL(); unsub != "" {
+			msg = mail.ApplyMarketingHeaders(msg, unsub)
+		}
+		if err := mailer.Send(ctx, msg); err != nil {
 			log.Warn("meter: quota warning mail",
 				"account", account.ID, "err", err)
 		}

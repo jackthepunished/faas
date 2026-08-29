@@ -777,6 +777,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	}
 
+	// Bulk-sender compliance (issue #246 item 4): the quota-warning
+	// template is the ONE outbound mail that carries a
+	// List-Unsubscribe header pair (RFC 8058). The URL must be an
+	// absolute http/https URL — anything else is a Gmail/Yahoo
+	// rejection path. Empty = dev box (header skipped, not
+	// substituted with a placeholder).
+	if unsub := deps.getenv("FAAS_NOTIFICATIONS_UNSUBSCRIBE_URL"); unsub != "" {
+		if err := mail.ValidateUnsubscribeURL(unsub); err != nil {
+			return fmt.Errorf("meterd: FAAS_NOTIFICATIONS_UNSUBSCRIBE_URL: %w", err)
+		}
+		meter.SetNotificationsUnsubscribeURL(unsub)
+		log.Info("meterd: notifications unsubscribe URL configured",
+			"len", len(unsub))
+	}
+
 	// FAAS_QUOTA_INTERVAL / FAAS_SAMPLE_INTERVAL / FAAS_STRIPE_INTERVAL /
 	// FAAS_DUNNING_INTERVAL / FAAS_RESIDENCY_INTERVAL let the e2e test
 	// shrink the timer cadences to sub-second for the "transition

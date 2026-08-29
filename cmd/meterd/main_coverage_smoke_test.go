@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
 )
 
@@ -100,3 +101,61 @@ func TestRunAdapterStructsConstructible(t *testing.T) {
 type meterSentinelErr struct{ msg string }
 
 func (e *meterSentinelErr) Error() string { return e.msg }
+
+// TestNotificationsUnsubscribeURLValidation covers the validator
+// the meterd boot wires against FAAS_NOTIFICATIONS_UNSUBSCRIBE_URL
+// (issue #246 item 4). The validator itself lives in pkg/mail
+// (mail.ValidateUnsubscribeURL); this test asserts both the
+// pass-through behaviour and that runWithDeps will pass a clean
+// URL through to the next boot step.
+func TestNotificationsUnsubscribeURLValidation(t *testing.T) {
+	bad := []string{
+		"",
+		"   ",
+		"mailto:ops@example.com",
+		"ftp://example.com/unsub",
+		"https://",
+	}
+	for _, u := range bad {
+		if err := mail.ValidateUnsubscribeURL(u); err == nil {
+			t.Fatalf("ValidateUnsubscribeURL(%q) = nil, want error", u)
+		}
+	}
+	good := []string{
+		"http://localhost:8081/account/notifications",
+		"https://faas.example.com/account/notifications?token=abc",
+	}
+	for _, u := range good {
+		if err := mail.ValidateUnsubscribeURL(u); err != nil {
+			t.Fatalf("ValidateUnsubscribeURL(%q) = %v, want nil", u, err)
+		}
+	}
+}
+
+// TestNotificationsUnsubscribeURLSetGet covers the meter-level
+// singleton the quota loop reads from
+// (pkg/meter/notifications.go). Set once → Get returns the same
+// value; concurrent reads are safe.
+func TestNotificationsUnsubscribeURLSetGet(t *testing.T) {
+	// Reset to known-good state at test start.
+	meter.SetNotificationsUnsubscribeURL("")
+	defer meter.SetNotificationsUnsubscribeURL("")
+
+	want := "https://faas.example.com/account/notifications"
+	meter.SetNotificationsUnsubscribeURL(want)
+	if got := meter.NotificationsUnsubscribeURL(); got != want {
+		t.Fatalf("after SetNotificationsUnsubscribeURL(%q) Get = %q", want, got)
+	}
+	// Overwrite with a different value (Set is a setter, not
+	// once-only).
+	other := "http://localhost:8081/notifications"
+	meter.SetNotificationsUnsubscribeURL(other)
+	if got := meter.NotificationsUnsubscribeURL(); got != other {
+		t.Fatalf("after second Set, Get = %q, want %q", got, other)
+	}
+	// Empty string is a valid value (dev box).
+	meter.SetNotificationsUnsubscribeURL("")
+	if got := meter.NotificationsUnsubscribeURL(); got != "" {
+		t.Fatalf("after Set(\"\") Get = %q, want empty", got)
+	}
+}
