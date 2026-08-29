@@ -6632,6 +6632,9 @@ paths:
         delivery failed after retry exhaustion.
       requestBody:
         required: false
+        content:
+          application/json:
+            schema: {}
       responses:
         '200':
           description: |
@@ -6646,7 +6649,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/AlertRuleInvalid' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '502': { $ref: '#/components/responses/Capacity' }
+        '502':
+          description: |
+            Webhook delivery failed after the dispatcher's retry
+            budget (5 attempts, 2s/8s/32s/128s backoff). The audit
+            log entry (`alert_preset.test_sent`) carries the
+            `delivery_status_code` + `delivery_attempts` for the
+            investigator; the customer's receiver likely rejected
+            the request, was unreachable, or returned 5xx.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # Dashboard form-POST sibling of
@@ -6683,6 +6696,9 @@ paths:
         MFA challenge.
       requestBody:
         required: false
+        content:
+          application/json:
+            schema: {}
       responses:
         '302':
           description: Redirect to /apps/{slug}?test_alert={ok|error}.

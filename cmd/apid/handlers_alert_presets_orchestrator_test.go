@@ -121,16 +121,16 @@ func TestSendTestAlertPresetCore_DispatchesTestTrue(t *testing.T) {
 	// The handler matches alert_rules by display-name prefix
 	// "<DisplayName> (<slug>)" — the canonical instantiator shape.
 	rule, err := store.CreateAlertRule(context.Background(), state.AlertRule{
-		AccountID:          acct.ID,
-		AppID:              app.ID,
-		Name:               "API is down (test-alert-app)",
-		Metric:             "api_reachable",
-		Comparison:         "lt",
-		Threshold:          1,
-		WindowSpec:         "5m",
-		CooldownMinutes:    5,
-		Enabled:            true,
-		WebhookURL:         receiver.URL,
+		AccountID:           acct.ID,
+		AppID:               app.ID,
+		Name:                "API is down (test-alert-app)",
+		Metric:              "api_reachable",
+		Comparison:          "lt",
+		Threshold:           1,
+		WindowSpec:          "5m",
+		CooldownMinutes:     5,
+		Enabled:             true,
+		WebhookURL:          receiver.URL,
 		WebhookSecretSealed: sealed,
 	})
 	if err != nil {
