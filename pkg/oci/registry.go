@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -376,53 +377,41 @@ func isImageManifest(contentType, mediaType string) bool {
 	return false
 }
 
-// parseImageConfig decodes the subset of the OCI image config we care about.
-// Unrecognised fields are ignored — the schema is large and we want to be
-// resilient to additions upstream. The OCI spec allows either flat fields
-// (Cmd, Env, WorkingDir at the top level) or a nested "config" envelope —
-// we accept whichever the registry produced, preferring the flat fields when
-// both are present (Docker v2 convention).
+// parseImageConfig decodes the OCI/Docker image config blob and projects
+// onto the consumer-facing ImageConfig.
+//
+// Behaviour (ADR-136 §Decision 1-2):
+//   - Both flat (Docker v2) and nested-`config` (OCI image-config)
+//     envelopes are accepted; flat wins when both are present.
+//   - Env flattening uses envSliceToMap (image.go), which preserves
+//     `=VALUE`-style keys and treats bare entries as key="" — fixing
+//     the byte-walk that previously dropped them silently.
+//
+// Unrecognised fields are ignored — the schema is large and we want to
+// be resilient to additions upstream. New OCI fields are added to
+// rawConfig in oci.go, not here — single decoder per ADR-136.
 func parseImageConfig(b []byte) (ImageConfig, error) {
-	var raw struct {
-		Cmd        []string `json:"Cmd"`
-		Env        []string `json:"Env"`
-		WorkingDir string   `json:"WorkingDir"`
-		Config     struct {
-			Cmd          []string            `json:"Cmd"`
-			Env          []string            `json:"Env"`
-			WorkingDir   string              `json:"WorkingDir"`
-			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-		} `json:"config"`
-	}
-	if err := json.Unmarshal(b, &raw); err != nil {
+	raw, err := decodeRaw(bytes.NewReader(b))
+	if err != nil {
 		return ImageConfig{}, err
 	}
-	cmd := raw.Cmd
-	if len(cmd) == 0 {
-		cmd = raw.Config.Cmd
+	// Validate rootfs.type — both parsers must reject unsupported rootfs.
+	// (parseImageConfig doesn't surface DiffIDs today, but it shares the
+	// decoder; an image config that ParseConfig rejects here is rejected
+	// here too.)
+	if err := raw.validate(); err != nil {
+		return ImageConfig{}, err
 	}
-	envSlice := raw.Env
-	if len(envSlice) == 0 {
-		envSlice = raw.Config.Env
-	}
-	wd := raw.WorkingDir
-	if wd == "" {
-		wd = raw.Config.WorkingDir
-	}
-	env := make(map[string]string, len(envSlice))
-	for _, kv := range envSlice {
-		for i := 0; i < len(kv); i++ {
-			if kv[i] == '=' {
-				env[kv[:i]] = kv[i+1:]
-				break
-			}
-		}
+	f := raw.resolved()
+	var exposed map[string]struct{}
+	if raw.Config != nil {
+		exposed = raw.Config.ExposedPorts
 	}
 	return ImageConfig{
-		Cmd:          cmd,
-		Env:          env,
-		WorkingDir:   wd,
-		ExposedPorts: raw.Config.ExposedPorts,
+		Cmd:          f.Cmd,
+		Env:          envSliceToMap(f.Env),
+		WorkingDir:   f.WorkingDir,
+		ExposedPorts: exposed,
 	}, nil
 }
 

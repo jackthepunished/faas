@@ -1,7 +1,6 @@
 package oci
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -36,37 +35,34 @@ type Config struct {
 	DiffIDs    []string // rootfs.diff_ids, bottom-to-top
 }
 
-// ociConfigJSON matches the on-disk OCI image config document.
-type ociConfigJSON struct {
-	Config struct {
-		Env        []string `json:"Env"`
-		Entrypoint []string `json:"Entrypoint"`
-		Cmd        []string `json:"Cmd"`
-		WorkingDir string   `json:"WorkingDir"`
-		User       string   `json:"User"`
-	} `json:"config"`
-	RootFS struct {
-		Type    string   `json:"type"`
-		DiffIDs []string `json:"diff_ids"`
-	} `json:"rootfs"`
-}
-
-// ParseConfig reads an OCI image config JSON document.
+// ParseConfig reads an OCI/Docker image config JSON document.
+//
+// Behaviour:
+//   - Accepts both Docker v2 flat fields (top-level Cmd/Env/etc.) and
+//     the nested `config` envelope (OCI image-config). Flat values win
+//     when both are present (preserves historical preference; see
+//     ADR-136 §Decision 1).
+//   - rootfs.type, when set, must be "layers"; anything else is
+//     rejected (we don't model raw single-blob rootfs).
+//
+// The shared raw decoder lives in oci.go (rawConfig); this function
+// projects the resolved fields onto the rich oci.Config projection.
 func ParseConfig(r io.Reader) (Config, error) {
-	var doc ociConfigJSON
-	if err := json.NewDecoder(r).Decode(&doc); err != nil {
-		return Config{}, fmt.Errorf("oci: parse config: %w", err)
+	raw, err := decodeRaw(r)
+	if err != nil {
+		return Config{}, err
 	}
-	if doc.RootFS.Type != "" && doc.RootFS.Type != "layers" {
-		return Config{}, fmt.Errorf("oci: unsupported rootfs type %q", doc.RootFS.Type)
+	if err := raw.validate(); err != nil {
+		return Config{}, err
 	}
+	f := raw.resolved()
 	return Config{
-		Env:        doc.Config.Env,
-		Entrypoint: doc.Config.Entrypoint,
-		Cmd:        doc.Config.Cmd,
-		WorkingDir: doc.Config.WorkingDir,
-		User:       doc.Config.User,
-		DiffIDs:    doc.RootFS.DiffIDs,
+		Env:        f.Env,
+		Entrypoint: f.Entrypoint,
+		Cmd:        f.Cmd,
+		WorkingDir: f.WorkingDir,
+		User:       f.User,
+		DiffIDs:    raw.RootFS.DiffIDs,
 	}, nil
 }
 
