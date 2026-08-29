@@ -3794,7 +3794,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsPurges:                      appErrorsPurges,
 		debugRegressionOldestPassSeconds:     debugRegressionOldestPassSeconds,
 		debugRegressionSkippedFlagDisabled:   debugRegressionSkippedFlagDisabled,
-		debugRegressionDetected:             debugRegressionDetected,
+		debugRegressionDetected:              debugRegressionDetected,
 		previewJanitorOutcomes:               previewJanitorOutcomes,
 		dataUpstreamRTT:                      dataUpstreamRTT,
 		dataUpstreamProbes:                   dataUpstreamProbes,

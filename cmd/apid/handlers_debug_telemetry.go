@@ -325,7 +325,7 @@ func (s *server) debugCompareHandler(w http.ResponseWriter, r *http.Request, acc
 	routes := make(map[string]api.DebugCompareRouteStats, len(srcStats)+len(mirStats))
 	for route, s := range srcStats {
 		routes[route] = api.DebugCompareRouteStats{
-			Route:   route,
+			Route:     route,
 			SourceP50: s.P50, SourceP95: s.P95, SourceP99: s.P99, SourceN: s.N,
 		}
 	}
