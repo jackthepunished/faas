@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/mail"
 )
@@ -421,5 +422,304 @@ func TestPostmarkSender_5xxWrapsErrTransient(t *testing.T) {
 	err = s.Send(context.Background(), mail.Message{To: []string{"x@y.test"}, Subject: "x"})
 	if !errors.Is(err, mail.ErrTransient) {
 		t.Errorf("err = %v, want errors.Is(err, mail.ErrTransient)", err)
+	}
+}
+
+// --- C3: 429 / Idempotency-Key / Retry-After -----------------------------
+// Issue #246 acceptance item 3. Resend's free tier is 100/day, so
+// 429 is an operational certainty and was previously classified as
+// permanent — every customer on a free-tier quota warning silently
+// dropped. The fix has three parts:
+//
+//  1. Treat 429 as transient (errors.Is(err, ErrTransient) returns
+//     true) so the retry decorator (pkg/mail/retry.go) picks it up.
+//  2. Parse the upstream Retry-After header (RFC 7231 §7.1.3) and
+//     expose it via *TransientError.RetryAfter so the decorator can
+//     honour the provider's back-off instead of guessing.
+//  3. Send an Idempotency-Key header (Resend) / X-Idempotency-Key
+//     (Postmark) when Message.MessageID is set so a network-level
+//     retry that the upstream already accepted is deduplicated.
+
+// TestResendSender_429WrapsErrTransient confirms 429 is now a
+// transient error — pre-#246 it was classified permanent and the
+// retry decorator (pkg/mail/retry.go) would never have picked it up.
+func TestResendSender_429WrapsErrTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"name":"rate_limit","message":"slow down"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewResendSender: %v", err)
+	}
+	err = s.Send(context.Background(), mail.Message{To: []string{"x@y.test"}, Subject: "x"})
+	if err == nil {
+		t.Fatal("expected error on 429")
+	}
+	if !errors.Is(err, mail.ErrTransient) {
+		t.Errorf("err = %v, want errors.Is(err, mail.ErrTransient)", err)
+	}
+	var te *mail.TransientError
+	if !errors.As(err, &te) {
+		t.Fatalf("err = %v, want errors.As(*TransientError)", err)
+	}
+	if te.Status != http.StatusTooManyRequests {
+		t.Errorf("TransientError.Status = %d, want %d", te.Status, http.StatusTooManyRequests)
+	}
+}
+
+// TestResendSender_429CarriesRetryAfter confirms the upstream
+// Retry-After header is parsed into TransientError.RetryAfter. The
+// retry decorator (C4) consumes this field; without it the decorator
+// falls back to its base delay and may hit the rate limit again.
+func TestResendSender_429CarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"name":"rate_limit"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewResendSender: %v", err)
+	}
+	err = s.Send(context.Background(), mail.Message{To: []string{"x@y.test"}, Subject: "x"})
+	var te *mail.TransientError
+	if !errors.As(err, &te) {
+		t.Fatalf("err = %v, want errors.As(*TransientError)", err)
+	}
+	if te.RetryAfter != 2*time.Second {
+		t.Errorf("TransientError.RetryAfter = %s, want 2s", te.RetryAfter)
+	}
+}
+
+// TestResendSender_5xxCarriesRetryAfter mirrors the 429 row for the
+// 5xx branch. Some upstream proxies attach Retry-After to 503 as
+// well; the parser must handle both.
+func TestResendSender_5xxCarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	err := s.Send(context.Background(), mail.Message{To: []string{"x@y.test"}, Subject: "x"})
+	var te *mail.TransientError
+	if !errors.As(err, &te) {
+		t.Fatalf("err = %v, want errors.As(*TransientError)", err)
+	}
+	if te.RetryAfter != 5*time.Second {
+		t.Errorf("TransientError.RetryAfter = %s, want 5s", te.RetryAfter)
+	}
+	if te.Status != http.StatusServiceUnavailable {
+		t.Errorf("TransientError.Status = %d, want %d", te.Status, http.StatusServiceUnavailable)
+	}
+}
+
+// TestResendSender_SendsIdempotencyKey confirms a non-empty
+// Message.MessageID is sent as the Idempotency-Key header so a
+// network-level retry that the upstream already accepted is
+// deduplicated inside Resend's 24h replay window.
+func TestResendSender_SendsIdempotencyKey(t *testing.T) {
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"abc-123"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To:        []string{"jane@example.test"},
+		Subject:   "Hello",
+		TextBody:  "world",
+		MessageID: "dunning:acct-123:2026-08-29",
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotKey != "dunning:acct-123:2026-08-29" {
+		t.Errorf("Idempotency-Key = %q, want dunning:acct-123:2026-08-29", gotKey)
+	}
+}
+
+// TestResendSender_NoIdempotencyKeyWhenEmpty confirms an empty
+// Message.MessageID does NOT add the header — backwards-compat with
+// call sites that haven't yet adopted the field.
+func TestResendSender_NoIdempotencyKeyWhenEmpty(t *testing.T) {
+	var gotKey string
+	var hasKey bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		_, hasKey = r.Header["Idempotency-Key"]
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"abc-123"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To: []string{"jane@example.test"}, Subject: "x", TextBody: "y",
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if hasKey {
+		t.Errorf("Idempotency-Key header present (value=%q), want absent when MessageID empty", gotKey)
+	}
+}
+
+// TestResendSender_PassesCustomHeaders confirms Message.Headers flows
+// through to the wire so the quota-warning template can carry
+// List-Unsubscribe (issue #246 acceptance item 4, RFC 8058).
+// pkg/mail/headers.go builds the header set; this row proves the
+// transport doesn't drop them.
+func TestResendSender_PassesCustomHeaders(t *testing.T) {
+	var gotUnsubscribe string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUnsubscribe = r.Header.Get("List-Unsubscribe")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"abc-123"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewResendSender(mail.ResendConfig{
+		APIKey: "re_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To: []string{"jane@example.test"}, Subject: "x", TextBody: "y",
+		Headers: map[string]string{
+			"List-Unsubscribe": "<mailto:unsub@example.test>",
+		},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotUnsubscribe != "<mailto:unsub@example.test>" {
+		t.Errorf("List-Unsubscribe = %q, want <mailto:unsub@example.test>", gotUnsubscribe)
+	}
+}
+
+// TestPostmarkSender_429WrapsErrTransient mirrors the Resend 429
+// row for Postmark.
+func TestPostmarkSender_429WrapsErrTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ErrorCode":401,"Message":"rate limited"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewPostmarkSender(mail.PostmarkConfig{
+		ServerToken: "pm_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	err := s.Send(context.Background(), mail.Message{To: []string{"x@y.test"}, Subject: "x"})
+	var te *mail.TransientError
+	if !errors.As(err, &te) {
+		t.Fatalf("err = %v, want errors.As(*TransientError)", err)
+	}
+	if te.Status != http.StatusTooManyRequests {
+		t.Errorf("TransientError.Status = %d, want %d", te.Status, http.StatusTooManyRequests)
+	}
+	if te.RetryAfter != 3*time.Second {
+		t.Errorf("TransientError.RetryAfter = %s, want 3s", te.RetryAfter)
+	}
+}
+
+// TestPostmarkSender_SendsIdempotencyKey mirrors the Resend row:
+// Postmark expects X-Idempotency-Key per its docs.
+func TestPostmarkSender_SendsIdempotencyKey(t *testing.T) {
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"MessageID":"abc","ErrorCode":0,"Message":"OK"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewPostmarkSender(mail.PostmarkConfig{
+		ServerToken: "pm_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To:        []string{"jane@example.test"},
+		Subject:   "x",
+		TextBody:  "y",
+		MessageID: "quota:acct-7:2026-08-29",
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotKey != "quota:acct-7:2026-08-29" {
+		t.Errorf("X-Idempotency-Key = %q, want quota:acct-7:2026-08-29", gotKey)
+	}
+}
+
+// TestPostmarkSender_PassesCustomHeaders mirrors the Resend row for
+// the List-Unsubscribe path.
+func TestPostmarkSender_PassesCustomHeaders(t *testing.T) {
+	var gotUnsubscribe string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUnsubscribe = r.Header.Get("List-Unsubscribe")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"MessageID":"abc","ErrorCode":0,"Message":"OK"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewPostmarkSender(mail.PostmarkConfig{
+		ServerToken: "pm_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To: []string{"jane@example.test"}, Subject: "x", TextBody: "y",
+		Headers: map[string]string{
+			"List-Unsubscribe": "<mailto:unsub@example.test>",
+		},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotUnsubscribe != "<mailto:unsub@example.test>" {
+		t.Errorf("List-Unsubscribe = %q, want <mailto:unsub@example.test>", gotUnsubscribe)
+	}
+}
+
+// TestTransientError_IsAndAs pins the type contract: a *TransientError
+// returned from either transport must satisfy both errors.Is(err,
+// ErrTransient) AND errors.As(err, *TransientError). The first is the
+// gate the retry decorator uses; the second lets the decorator reach
+// RetryAfter. Both are required.
+func TestTransientError_IsAndAs(t *testing.T) {
+	te := &mail.TransientError{Status: 429, RetryAfter: 7 * time.Second}
+	if !errors.Is(te, mail.ErrTransient) {
+		t.Errorf("TransientError does not satisfy errors.Is(ErrTransient)")
+	}
+	var got *mail.TransientError
+	if !errors.As(te, &got) {
+		t.Errorf("TransientError does not satisfy errors.As(*TransientError)")
+	}
+	if got.RetryAfter != 7*time.Second {
+		t.Errorf("got.RetryAfter = %s, want 7s", got.RetryAfter)
+	}
+	msg := te.Error()
+	if !strings.Contains(msg, "status=429") || !strings.Contains(msg, "retry_after=7s") {
+		t.Errorf("Error() = %q, want both status=429 and retry_after=7s", msg)
 	}
 }

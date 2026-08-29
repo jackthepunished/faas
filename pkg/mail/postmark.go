@@ -8,13 +8,22 @@
 // "Message"} on success; non-200 means the request failed.
 //
 // We use the bare net/http + json packages (no SDK dependency).
+//
+// Idempotency: when Message.MessageID is non-empty, the request
+// carries `X-Idempotency-Key` per Postmark's docs — a network-level
+// retry that the upstream already accepted is deduplicated inside
+// Postmark's replay window instead of double-charging.
+//
+// Retry classification (issue #246 acceptance item 3) mirrors
+// resend.go: 429 + 5xx become TransientError with the provider's
+// Retry-After parsed; 4xx (other) is permanent; network failure is
+// TransientError{Status: 0}.
 package mail
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -106,10 +115,21 @@ func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 	req.Header.Set("X-Postmark-Server-Token", s.cfg.ServerToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// X-Idempotency-Key dedupes a retry that Postmark already
+	// accepted — see pkg/mail/mail.go Message.MessageID.
+	if msg.MessageID != "" {
+		req.Header.Set("X-Idempotency-Key", msg.MessageID)
+	}
+	// Caller-supplied extra headers win last so they can override
+	// anything (e.g. List-Unsubscribe on the quota-warning
+	// template). pkg/mail/headers.go builds these.
+	for k, v := range msg.Headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("mail: postmark: do: %w", errors.Join(err, ErrTransient))
+		return &TransientError{Err: fmt.Errorf("mail: postmark: do: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -135,8 +155,12 @@ func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 	if detail == "" {
 		detail = string(rawBody)
 	}
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("mail: postmark: %d %s: %w", resp.StatusCode, detail, ErrTransient)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		te := &TransientError{Status: resp.StatusCode}
+		if ra := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ra > 0 {
+			te.RetryAfter = ra
+		}
+		return fmt.Errorf("mail: postmark: %s: %w", detail, te)
 	}
 	return fmt.Errorf("mail: postmark: %d: %s", resp.StatusCode, detail)
 }
