@@ -717,7 +717,7 @@ func runBuild(m api.BuildManifest) error {
 	var buildkitLog bytes.Buffer
 	bk := exec.Command(
 		"/usr/bin/unshare",
-		rootlessUnshareArgs(
+		rootlessBuildkitUnshareArgs(
 			"/usr/local/bin/buildkitd",
 			"--debug",
 			"--rootless",
@@ -882,7 +882,7 @@ func probeBuilderWorkspace(buildkitRoot string) (string, error) {
 	defer cancel()
 	probe := exec.Command(
 		"/usr/bin/unshare",
-		rootlessUnshareArgs(
+		rootlessBuildkitUnshareArgs(
 			"/bin/sh",
 			"-c",
 			`id; stat -c '%n mode=%a uid=%u gid=%g' /build "$1"; mkdir -p "$1/.probe"; touch "$1/.probe/write"; rm -rf "$1/.probe"`,
@@ -916,13 +916,21 @@ func probeBuilderWorkspace(buildkitRoot string) (string, error) {
 	}
 }
 
-// rootlessUnshareArgs returns the namespace flags shared by util-linux and
-// BusyBox unshare. The long --map-users/--map-groups options are only
-// available in newer util-linux builds, while the builder base image may
-// provide BusyBox instead. Mapping the invoking user to namespace root is
-// sufficient for BuildKit and keeps the builder image provider-neutral.
-func rootlessUnshareArgs(command ...string) []string {
-	args := []string{"-U", "-r", "-m", "-f"}
+// rootlessBuildkitUnshareArgs creates the user and mount namespaces used by
+// the real builder. Mapping only the invoking UID/GID to namespace root
+// (the portable `-U -r -m -f` form) leaves image-owned IDs such as GID 42
+// unmapped. BuildKit then fails while unpacking otherwise valid layers with
+// `lchown ... invalid argument`. The builder image deliberately ships
+// util-linux plus newuidmap/newgidmap and a bounded subordinate-ID range, so
+// ask unshare to map that range as well as the current root identity.
+func rootlessBuildkitUnshareArgs(command ...string) []string {
+	args := []string{
+		"--user",
+		"--map-auto",
+		"--map-root-user",
+		"--mount",
+		"--fork",
+	}
 	return append(args, command...)
 }
 

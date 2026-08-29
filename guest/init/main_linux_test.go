@@ -146,15 +146,15 @@ func TestClassifyExitCodes(t *testing.T) {
 	}
 }
 
-func TestRootlessUnshareArgsUsePortableFlags(t *testing.T) {
-	want := []string{"-U", "-r", "-m", "-f", "/bin/sh", "-c", "id"}
-	got := rootlessUnshareArgs("/bin/sh", "-c", "id")
+func TestRootlessBuildkitUnshareArgsMapsSubordinateIDs(t *testing.T) {
+	want := []string{"--user", "--map-auto", "--map-root-user", "--mount", "--fork", "/bin/sh", "-c", "id"}
+	got := rootlessBuildkitUnshareArgs("/bin/sh", "-c", "id")
 	if len(got) != len(want) {
-		t.Fatalf("rootlessUnshareArgs length = %d, want %d: %q", len(got), len(want), got)
+		t.Fatalf("rootlessBuildkitUnshareArgs length = %d, want %d: %q", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("rootlessUnshareArgs[%d] = %q, want %q", i, got[i], want[i])
+			t.Errorf("rootlessBuildkitUnshareArgs[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
 }
