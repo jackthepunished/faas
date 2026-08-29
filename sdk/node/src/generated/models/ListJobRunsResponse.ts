@@ -3,6 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { JobRunResponse } from './JobRunResponse.js';
+/**
+ * Page of runs for a job.
+ */
 export type ListJobRunsResponse = {
   runs: Array<JobRunResponse>;
   limit: number;

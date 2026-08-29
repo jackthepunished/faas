@@ -3,6 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { JobTaskResponse } from './JobTaskResponse.js';
+/**
+ * Page of tasks for a job-run.
+ */
 export type ListJobTasksResponse = {
   tasks: Array<JobTaskResponse>;
   limit: number;

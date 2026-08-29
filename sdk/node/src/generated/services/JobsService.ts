@@ -29,7 +29,13 @@ export class JobsService {
     limit = 50,
     offset,
   }: {
+    /**
+     * Maximum number of jobs to return in this page (1–200, default 50).
+     */
     limit?: number,
+    /**
+     * Number of jobs to skip before returning results. NextOffset=-1 in the body signals the last page.
+     */
     offset?: number,
   }): CancelablePromise<ListJobsResponse> {
     return __request(OpenAPI, {
@@ -202,8 +208,17 @@ export class JobsService {
     limit = 50,
     offset,
   }: {
+    /**
+     * Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs`.
+     */
     name: string,
+    /**
+     * Maximum number of runs to return in this page (1–200, default 50).
+     */
     limit?: number,
+    /**
+     * Number of runs to skip before returning results. NextOffset=-1 in the body signals the last page.
+     */
     offset?: number,
   }): CancelablePromise<ListJobRunsResponse> {
     return __request(OpenAPI, {
@@ -242,6 +257,9 @@ export class JobsService {
     requestBody,
     idempotencyKey,
   }: {
+    /**
+     * Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs`.
+     */
     name: string,
     requestBody: CreateJobRunRequest,
     /**
@@ -285,6 +303,9 @@ export class JobsService {
     name,
     id,
   }: {
+    /**
+     * Job name (path). DNS-label safe. Body creates a run against this template. Anchors path `/v1/jobs/{name}/runs/{id}`.
+     */
     name: string,
     /**
      * The job_run id (UUID).
@@ -323,7 +344,13 @@ export class JobsService {
     name,
     id,
   }: {
+    /**
+     * Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/cancel`.
+     */
     name: string,
+    /**
+     * Job-run identifier (UUIDv4, path). Returns the run + aggregated counters. Anchors path `/v1/jobs/{name}/runs/{id}/cancel`.
+     */
     id: string,
   }): CancelablePromise<JobRunCancelledResponse> {
     return __request(OpenAPI, {
@@ -355,9 +382,21 @@ export class JobsService {
     limit = 50,
     offset,
   }: {
+    /**
+     * Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks`.
+     */
     name: string,
+    /**
+     * Job-run identifier (UUIDv4, path). Body cancels this run. Anchors path `/v1/jobs/{name}/runs/{id}/tasks`.
+     */
     id: string,
+    /**
+     * Maximum number of tasks to return in this page (1–200, default 50).
+     */
     limit?: number,
+    /**
+     * Number of tasks to skip before returning results. NextOffset=-1 in the body signals the last page.
+     */
     offset?: number,
   }): CancelablePromise<ListJobTasksResponse> {
     return __request(OpenAPI, {
@@ -398,12 +437,21 @@ export class JobsService {
     idx,
     maxBytes = 65536,
   }: {
+    /**
+     * Unique job name. DNS-label safe (`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`). Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`.
+     */
     name: string,
+    /**
+     * Job-run identifier (UUIDv4, path). Returns a page of tasks. Anchors path `/v1/jobs/{name}/runs/{id}/tasks/{idx}/logs`.
+     */
     id: string,
     /**
      * The task index within the run (1-indexed).
      */
     idx: number,
+    /**
+     * Maximum log payload size to return. Default 64 KiB; capped at 1 MiB.
+     */
     maxBytes?: number,
   }): CancelablePromise<JobTaskLogResponse> {
     return __request(OpenAPI, {

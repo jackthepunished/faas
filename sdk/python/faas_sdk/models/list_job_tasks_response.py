@@ -15,6 +15,8 @@ T = TypeVar("T", bound="ListJobTasksResponse")
 
 @_attrs_define
 class ListJobTasksResponse:
+    """Page of tasks for a job-run."""
+
     tasks: list[JobTaskResponse]
     limit: int
     offset: int

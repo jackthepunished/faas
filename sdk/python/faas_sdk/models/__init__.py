@@ -47,6 +47,7 @@ from .app_errors_summary_response import AppErrorsSummaryResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
+from .app_manifest_healthcheck import AppManifestHealthcheck
 from .app_metrics_response import AppMetricsResponse
 from .app_metrics_response_range import AppMetricsResponseRange
 from .app_open_api_import_dry_run_response import AppOpenAPIImportDryRunResponse
@@ -220,6 +221,7 @@ from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
+from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
 from .deployment_audit_response import DeploymentAuditResponse
 from .deployment_audit_response_kind import DeploymentAuditResponseKind
 from .deployment_healthcheck import DeploymentHealthcheck
@@ -705,6 +707,7 @@ __all__ = (
     "AppManifest",
     "AppManifestEnv",
     "AppManifestEnvSecrets",
+    "AppManifestHealthcheck",
     "AppMetricsResponse",
     "AppMetricsResponseRange",
     "AppOpenAPIImportDryRunResponse",
@@ -871,6 +874,7 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
+    "DeleteDeploymentScopeExclusionResponse200",
     "DeploymentAuditResponse",
     "DeploymentAuditResponseKind",
     "DeploymentHealthcheck",

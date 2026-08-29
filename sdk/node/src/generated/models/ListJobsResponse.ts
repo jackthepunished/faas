@@ -3,6 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { JobResponse } from './JobResponse.js';
+/**
+ * Page of jobs on the account (issue
+ */
 export type ListJobsResponse = {
   jobs: Array<JobResponse>;
   limit: number;
