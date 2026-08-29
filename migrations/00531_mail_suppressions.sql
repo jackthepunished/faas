@@ -1,4 +1,4 @@
--- filename: 00529_mail_suppressions.sql
+-- filename: 00531_mail_suppressions.sql
 -- +goose Up
 -- +goose StatementBegin
 
