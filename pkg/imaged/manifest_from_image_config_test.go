@@ -1,0 +1,165 @@
+// manifest_from_image_config_test.go — focused coverage of the
+// post-M-1 manifest derivation contract.
+//
+// Two paths converge on oci.ManifestFromConfig today:
+//   - registry pull (handler.go::manifestFromImageConfig) for the
+//     `App` deployment mode, where ImageConfig comes from the
+//     registry puller
+//   - source build (local_oci.go::buildLocalOCIAppLayer) for source-
+//     built apps, where Config comes from builderd's exported tarball
+//
+// Both paths share oci.ManifestFromConfig's:
+//   - Entrypoint+Cmd joined semantics
+//   - Healthcheck/StopSignal/StopGracePeriod projection
+//   - ErrImageManifestInvalid failure shape on empty-image configs
+//
+// The tests below pin the ImageConfig-side surface (registry path)
+// since the Config-side surface is already covered by
+// pkg/oci/parse_unified_test.go and pkg/oci/image_test.go.
+package imaged
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/onebox-faas/faas/pkg/oci"
+)
+
+func TestManifestFromImageConfig_AlpineEntrypointOnly(t *testing.T) {
+	t.Parallel()
+	// Alpine 3.19 declares `ENTRYPOINT ["/bin/sh"]` and no CMD —
+	// before M-1 this surfaced as Entrypoint=[] (a no-arg exec);
+	// commit 5 closes that gap (ADR-136 §Decision 1).
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Entrypoint: []string{"/bin/sh"},
+		Env:        map[string]string{"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if got, want := m.Entrypoint, []string{"/bin/sh"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("Entrypoint = %v; want %v", got, want)
+	}
+}
+
+func TestManifestFromImageConfig_DistrolessEntrypointPlusCmd(t *testing.T) {
+	t.Parallel()
+	// Distroless static-debian12 declares both ENTRYPOINT and CMD.
+	// OCI semantics: argv = entrypoint + cmd. Before M-1 only
+	// cfg.Cmd was consumed; commit 5 surfaces both.
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Entrypoint: []string{"/app"},
+		Cmd:        []string{"run"},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if got, want := m.Entrypoint, []string{"/app", "run"}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("Entrypoint = %v; want %v", got, want)
+	}
+}
+
+func TestManifestFromImageConfig_BusyboxCmdOnly(t *testing.T) {
+	t.Parallel()
+	// Busybox 1.36 declares `CMD ["sh"]` only — argv becomes ["sh"].
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd: []string{"sh"},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if got, want := m.Entrypoint, []string{"sh"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("Entrypoint = %v; want %v", got, want)
+	}
+}
+
+func TestManifestFromImageConfig_HealthcheckFlowThrough(t *testing.T) {
+	t.Parallel()
+	// HEALTHCHECK CMD shape projects onto AppManifest.Healthcheck
+	// (issue #1186 workstream A.4 / ADR-136 §Decision 4).
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd: []string{"/app/server"},
+		Healthcheck: &oci.ImageHealthcheck{
+			Test:         []string{"CMD", "/bin/check"},
+			IntervalS:    30,
+			TimeoutS:     5,
+			Retries:      3,
+			StartPeriodS: 10,
+		},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if m.Healthcheck == nil {
+		t.Fatal("Healthcheck nil; want populated")
+	}
+	if got, want := m.Healthcheck.IntervalS, 30; got != want {
+		t.Errorf("Healthcheck.IntervalS = %d; want %d", got, want)
+	}
+	if got, want := m.Healthcheck.Retries, 3; got != want {
+		t.Errorf("Healthcheck.Retries = %d; want %d", got, want)
+	}
+}
+
+func TestManifestFromImageConfig_HealthcheckNoneFlows(t *testing.T) {
+	t.Parallel()
+	// HEALTHCHECK NONE projects to a non-nil Healthcheck with
+	// Test=["NONE"] — distinguishes "explicitly disabled" from
+	// "image didn't declare one" (commit 4 decision).
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd:         []string{"/app/server"},
+		Healthcheck: &oci.ImageHealthcheck{Test: []string{"NONE"}},
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if m.Healthcheck == nil || len(m.Healthcheck.Test) != 1 || m.Healthcheck.Test[0] != "NONE" {
+		t.Errorf("Healthcheck = %+v; want Test=[NONE]", m.Healthcheck)
+	}
+}
+
+func TestManifestFromImageConfig_StopSignalFlows(t *testing.T) {
+	t.Parallel()
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd:        []string{"/app/server"},
+		StopSignal: "SIGUSR1",
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if m.StopSignal != "SIGUSR1" {
+		t.Errorf("StopSignal = %q; want SIGUSR1", m.StopSignal)
+	}
+}
+
+func TestManifestFromImageConfig_NumericUserFlows(t *testing.T) {
+	t.Parallel()
+	// Distroless USER 65532 → AppManifest.User="65532". Numeric
+	// passthrough; named-user resolution is M-3 (ADR-136 §Decision 2).
+	m, err := manifestFromImageConfig(oci.ImageConfig{
+		Cmd:  []string{"/app/server"},
+		User: "65532",
+	})
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
+	if m.User != "65532" {
+		t.Errorf("User = %q; want 65532", m.User)
+	}
+}
+
+func TestManifestFromImageConfig_NoEntrypointOrCmd_ErrInvalid(t *testing.T) {
+	t.Parallel()
+	// An image that declares neither Entrypoint nor Cmd is rejected
+	// at the helper boundary with oci.ErrImageManifestInvalid so the
+	// deploy path surfaces a stable error code.
+	_, err := manifestFromImageConfig(oci.ImageConfig{
+		WorkingDir: "/app",
+	})
+	if err == nil {
+		t.Fatal("err = nil; want ErrImageManifestInvalid")
+	}
+	if !errors.Is(err, oci.ErrImageManifestInvalid) {
+		t.Errorf("err = %v; want ErrImageManifestInvalid", err)
+	}
+}

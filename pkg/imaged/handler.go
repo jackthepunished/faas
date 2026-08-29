@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1634,7 +1633,15 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		return fmt.Errorf("imaged: pull image config: %w", err)
 	}
 
-	manifest := manifestFromImageConfig(imageCfg)
+	manifest, err := manifestFromImageConfig(imageCfg)
+	if err != nil {
+		// Image declares neither Entrypoint nor Cmd — oci.ManifestFromConfig
+		// already wrapped it with ErrImageManifestInvalid; mark the deploy
+		// failed so the row reflects the rejection and the customer sees
+		// the canonical error code at the API surface (ADR-136 §Decision 5).
+		_ = h.markDeployFailed(ctx, dep.ID, err, "image declares no entrypoint/cmd")
+		return err
+	}
 	if dep.Handler != "" {
 		manifest.Entrypoint = []string{dep.Handler}
 	}
@@ -2208,11 +2215,14 @@ func runtimeToEnvSuffix(runtime string) string {
 	return runtime
 }
 
-// manifestFromImageConfig maps an OCI ImageConfig to an api.AppManifest. The
-// Cmd→Entrypoint mapping is per spec §4.6; WorkingDir + Env carry across
-// unchanged. Validation is left to AppManifest.Validate so it can emit
-// consistent error codes. Per-deploy overrides apply on top of this in
-// handleDeployment.
+// manifestFromImageConfig maps an OCI ImageConfig to an api.AppManifest.
+// Per ADR-136 §Decision 1-4, the conversion honours the full OCI image-
+// config shape: Entrypoint+Cmd combined per OCI semantics, User preserved
+// (numeric-only today; named-user resolution lands in M-3), Healthcheck /
+// StopSignal / StopGracePeriod surfaced onto the manifest. The function
+// delegates the shape derivation to oci.ManifestFromConfig so the registry
+// path (handler) and the local-OCI build path (local_oci.go) share the
+// exact same projection + the same ErrImageManifestInvalid failure mode.
 //
 // ADR-051 Phase 4 (characterization boot): the App path must default
 // Port + Healthz and inject PORT=8080 into Env so the in-guest probe
@@ -2223,30 +2233,26 @@ func runtimeToEnvSuffix(runtime string) string {
 // avoids (ADR-051 §"Consequences"). Customer-pinned values in
 // cfg.Port / cfg.Env["PORT"] survive this seeding (last-write-wins
 // is the customer's call).
-func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
-	manifest := api.AppManifest{
-		WorkingDir: cfg.WorkingDir,
-		Env:        cloneEnv(cfg.Env),
+func manifestFromImageConfig(cfg oci.ImageConfig) (api.AppManifest, error) {
+	manifest, err := oci.ManifestFromConfig(oci.Config{
+		Env:             envSliceFromMap(cfg.Env),
+		Entrypoint:      append([]string(nil), cfg.Entrypoint...),
+		Cmd:             append([]string(nil), cfg.Cmd...),
+		WorkingDir:      cfg.WorkingDir,
+		User:            cfg.User,
+		Healthcheck:     cfg.Healthcheck,
+		StopSignal:      cfg.StopSignal,
+		StopGracePeriodS: cfg.StopGracePeriodS,
+	})
+	if err != nil {
+		return api.AppManifest{}, err
 	}
-	if len(cfg.Cmd) > 0 {
-		// slices.Clone forces a fresh backing array so post-conversion
-		// mutation of cfg.Cmd (caller-owned; not pooled today, but the
-		// OCI puller shape could change) cannot leak into the stored
-		// manifest.Entrypoint. Pinned by
-		// TestManifestFromImageConfig_AppModeCmd in handler_test.go.
-		manifest.Entrypoint = slices.Clone(cfg.Cmd)
-	}
-	// Pin: containerised config wins (file-system contract is the
-	// customer's); null is the unset case the function-path code at
-	// line ~677 hard-codes — we mirror that here so both paths share
-	// the same defaults. The `:8080` readiness contract is the cross-
-	// boundary host shape — changing it would invalidate every
-	// existing snapshot (ADR-009). Customer-pinned values win: we only
-	// set defaults for fields the customer didn't pin, mirroring the
-	// Env["PORT"] guard below — the Function path at ~677 has the same
-	// pattern. Without the `manifest.Healthz == ""` check a customer
-	// who intentionally sets Healthz="" to opt out of the readiness
-	// probe would be silently overridden.
+	// Containerised-defaults overlay (ADR-051 Phase 4) — applied
+	// AFTER oci.ManifestFromConfig so the default seed wins on the
+	// fields the customer didn't pin (Healthz, Env["PORT"]) and
+	// doesn't overwrite Customer-supplied OCI values (env flattening
+	// has already turned `Env` into a map by this point, so PORT
+	// can be checked with `_, set := manifest.Env["PORT"]`).
 	if manifest.Healthz == "" {
 		manifest.Healthz = defaultHealthzPath
 	}
@@ -2256,7 +2262,28 @@ func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 	if _, set := manifest.Env["PORT"]; !set {
 		manifest.Env["PORT"] = "8080"
 	}
-	return manifest
+	return manifest, nil
+}
+
+// envSliceFromMap converts a parsed env map back to OCI "KEY=VALUE"
+// entries for delegation to oci.ManifestFromConfig. An entry with an
+// empty key (rare but legal per OCI env grammar) is preserved as
+// "=VALUE"; an entry with an empty value is "KEY=".
+//
+// Why this helper exists — the registry pull path's ImageConfig.Env is
+// already a map (registry.go's envSliceToMap runs at parse time, see
+// commit 3), but oci.ManifestFromConfig's signature consumes a slice
+// to match the OCI wire shape. We round-trip the map → slice → map
+// here so the canonical projection runs through one code path.
+func envSliceFromMap(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		out = append(out, k+"="+v)
+	}
+	return out
 }
 
 // cloneEnv returns a defensive copy of the env map. The caller (handleDeployment

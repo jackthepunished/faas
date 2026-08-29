@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -130,13 +131,34 @@ func LayersAboveBase(baseDiffIDs, appDiffIDs []string) ([]string, error) {
 // ManifestFromConfig derives the guest app.json contract from the OCI config
 // (spec §4.6: imaged injects /etc/faas/app.json). Entrypoint is Entrypoint+Cmd
 // per OCI semantics; Env is flattened to a map; User maps to the guest user.
+// Healthcheck/StopSignal/StopGracePeriod are surfaced onto the AppManifest
+// additively (ADR-136 §Decision 3-4) — runtime wiring of those fields lands
+// in M-2; this function only projects the wire shape.
 func ManifestFromConfig(cfg Config) (api.AppManifest, error) {
+	if len(cfg.Entrypoint) == 0 && len(cfg.Cmd) == 0 {
+		return api.AppManifest{}, fmt.Errorf("%w: image declares neither Entrypoint nor Cmd", ErrImageManifestInvalid)
+	}
 	argv := append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
 	m := api.AppManifest{
 		Entrypoint: argv,
 		Env:        envSliceToMap(cfg.Env),
 		WorkingDir: cfg.WorkingDir,
 		User:       normalizeUser(cfg.User),
+	}
+	if cfg.Healthcheck != nil {
+		m.Healthcheck = &api.AppManifestHealthcheck{
+			Test:         append([]string(nil), cfg.Healthcheck.Test...),
+			IntervalS:    cfg.Healthcheck.IntervalS,
+			TimeoutS:     cfg.Healthcheck.TimeoutS,
+			Retries:      cfg.Healthcheck.Retries,
+			StartPeriodS: cfg.Healthcheck.StartPeriodS,
+		}
+	}
+	if cfg.StopSignal != "" {
+		m.StopSignal = cfg.StopSignal
+	}
+	if cfg.StopGracePeriodS > 0 {
+		m.StopGracePeriod = time.Duration(cfg.StopGracePeriodS) * time.Second
 	}
 	if err := m.Validate(); err != nil {
 		return api.AppManifest{}, fmt.Errorf("oci: derive manifest: %w", err)
