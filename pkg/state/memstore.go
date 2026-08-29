@@ -7474,7 +7474,28 @@ func (m *MemStore) CompleteInvocation(_ context.Context, id string, result json.
 	outcome := OutcomeSuccess
 	inv.Outcome = &outcome
 	m.invocations[id] = inv
+	// PR-B fixup (code-review #1185 finding #6): MemStore parity
+	// with PgStore. Without the decrement, ClaimInvocationWithCap
+	// monotonically grows the counter and the 11th claim returns
+	// ErrQuotaExceeded under MemStore but not under PgStore.
+	m.decrementAccountAsyncInflightLocked(inv.AccountID)
 	return nil
+}
+
+// decrementAccountAsyncInflightLocked is the mu-held variant of
+// DecrementAccountAsyncInflight. Caller must hold m.mu.
+func (m *MemStore) decrementAccountAsyncInflightLocked(accountID string) {
+	if accountID == "" {
+		return
+	}
+	q, ok := m.accountAsyncQuota[accountID]
+	if !ok {
+		return
+	}
+	if q.CurrentInflight > 0 {
+		q.CurrentInflight--
+	}
+	m.accountAsyncQuota[accountID] = q
 }
 
 // FailInvocation is the durable store half of the drain's error
@@ -7550,6 +7571,13 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 		inv.Outcome = &outcome
 	}
 	m.invocations[id] = inv
+	// PR-B fixup (code-review #1185 finding #6): MemStore parity
+	// with PgStore. Decrement only on terminal transitions
+	// (dead_letter, failed) — the transient requeue branch keeps
+	// the counter incremented because the row is still in flight.
+	if inv.State == InvocationDeadLetter || inv.State == InvocationFailed {
+		m.decrementAccountAsyncInflightLocked(inv.AccountID)
+	}
 	return nil
 }
 
@@ -7592,6 +7620,9 @@ func (m *MemStore) CancelInvocation(_ context.Context, id string) error {
 	now := time.Now()
 	inv.CompletedAt = &now
 	m.invocations[id] = inv
+	// PR-B fixup (code-review #1185 finding #6): MemStore parity.
+	// Cancel is always terminal; the row leaves the in-flight set.
+	m.decrementAccountAsyncInflightLocked(inv.AccountID)
 	return nil
 }
 
