@@ -37,13 +37,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"time"
 
+	"filippo.io/age"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/webhookout"
 )
 
 // listAlertPresets returns every row in alert_presets ordered by
@@ -302,4 +307,214 @@ func (s *server) persistInstantiatedAlertRule(ctx context.Context, acct state.Ac
 		"enabled":     enabled,
 	})
 	return row, nil
+}
+
+// sendTestAlertPreset posts a synthetic alert payload to the
+// webhook URL the customer configured when they enabled this
+// preset (issue #1233 / ADR-123 PR-C commit 2). The body carries
+// `payload.test = true` so the customer's verifier can branch on
+// the discriminator (skip the production alert-write path, log
+// to a quieter channel, etc.).
+//
+// Why the work bypasses meterd: the production alert-fire path
+// is owned by the meterd evaluator at pkg/alerts/evaluator.go,
+// which also writes to alert_deliveries (the operator's recent-
+// deliveries pane). A test alert should NOT pollute that ledger —
+// the customer expects "send a test", not "send a real alert
+// that the operator sees". We dispatch through the same
+// webhookout.Dispatcher the production path uses (same retry /
+// backoff / signing), but with a synthetic observed value AND
+// the test discriminator.
+//
+// Returns:
+//
+//	200 — payload delivered (any 2xx/3xx from the customer's
+//	      receiver). Body: {"status":"sent","test":true,
+//	      "delivery_id":"<uuid>","attempts":N}.
+//	404 — no alert rule instantiated for this preset on this app.
+//	      Mirrors handlers_alerts.go's getAlertRule 404 path.
+//	402 — below the preset's minimum_plan (set by
+//	      loadAndGateAlertPreset).
+//	502 — webhook dispatch failed (non-2xx after retry exhaustion,
+//	      SSRF rejection, or unseal failure). The customer sees
+//	      "test failed — check your webhook URL".
+func (s *server) sendTestAlertPreset(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	slug := r.PathValue("slug")
+	presetName := r.PathValue("name")
+	res, prob := s.sendTestAlertPresetCore(r.Context(), acct, slug, presetName)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// sendTestAlertPresetCore is the shared work for the JSON path
+// (POST /v1/apps/{slug}/alert-presets/{name}/test) and the
+// dashboard form path (POST /dashboard/apps/{slug}/alert-presets/
+// {name}/test, see dashboard_preset_enable.go). Returns a
+// TestAlertPresetResponse on success or an *api.Problem on every
+// failure. The split mirrors enableAlertPresetFromForm — same
+// pattern, same rationale (JSON vs form decoders differ but the
+// work is identical).
+func (s *server) sendTestAlertPresetCore(ctx context.Context, acct state.Account, slug, presetName string) (api.TestAlertPresetResponse, *api.Problem) {
+	preset, prob := s.loadAndGateAlertPreset(ctx, acct, presetName)
+	if prob != nil {
+		return api.TestAlertPresetResponse{}, prob
+	}
+	// App lookup mirrors the createAlertRule path at
+	// handlers_alerts.go:163 — never reveal whether the slug
+	// exists on another account (404 in both cases).
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		return api.TestAlertPresetResponse{}, api.NewProblem(http.StatusNotFound, api.CodeValidation, "No such app", "no app with that slug is visible to this account")
+	}
+	rule, err := s.store.AlertRuleByAccountAppAndPresetName(ctx, acct.ID, app.ID, presetName)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return api.TestAlertPresetResponse{}, api.NewProblem(http.StatusNotFound, api.CodeValidation, "Preset not enabled", "no alert rule has been instantiated from this preset for this app; enable it first")
+		}
+		return api.TestAlertPresetResponse{}, api.ErrCapacity("could not load alert rule for preset")
+	}
+	plaintext, prob := unsealAlertRuleWebhookSecret(ctx, rule.WebhookSecretSealed)
+	if prob != nil {
+		return api.TestAlertPresetResponse{}, prob
+	}
+	deliveryID, evt, prob := buildTestAlertEvent(acct, app, rule, preset)
+	if prob != nil {
+		return api.TestAlertPresetResponse{}, prob
+	}
+	disp := webhookout.NewDispatcher(webhookout.DispatcherOptions{HeaderSet: webhookout.HeaderSetAlert})
+	result := disp.DispatchTest(ctx, webhookout.Target{
+		URL:    rule.WebhookURL,
+		Signer: webhookout.NewSigner(plaintext),
+	}, evt)
+	s.log.Info("alert preset test sent",
+		"preset", logsanitize.Field(preset.Name),
+		"rule", logsanitize.Field(rule.ID),
+		"app", logsanitize.Field(app.Slug),
+		"account", acct.ID,
+		"delivery_id", logsanitize.Field(deliveryID),
+		"status_code", result.StatusCode,
+		"attempts", result.Attempts,
+	)
+	s.audit.Emit(ctx, "alert_preset.test_sent", &acct.ID, map[string]any{
+		"preset_name":          preset.Name,
+		"preset_id":            preset.ID,
+		"app_id":               app.ID,
+		"app_slug":             app.Slug,
+		"rule_id":              rule.ID,
+		"webhook_url":          rule.WebhookURL,
+		"delivery_id":          deliveryID,
+		"test":                 true,
+		"delivery_status_code": result.StatusCode,
+		"delivery_attempts":    result.Attempts,
+	})
+	if result.Err != nil {
+		return api.TestAlertPresetResponse{}, api.NewProblem(http.StatusBadGateway, api.CodeCapacity,
+			"Webhook delivery failed",
+			"the test alert could not be delivered to your webhook URL after retry exhaustion; check the URL + secret + receiver health. See the audit log entry for the status code.")
+	}
+	return api.TestAlertPresetResponse{
+		Status:     "sent",
+		Test:       true,
+		DeliveryID: deliveryID,
+		Attempts:   result.Attempts,
+	}, nil
+}
+
+// unsealAlertRuleWebhookSecret pulls the host X25519 identity slice
+// loaded by secretbox.LoadHostKeys at boot and unseals the
+// per-rule webhook secret. Returns ErrCapacity on identity-miss
+// (host key not loaded — boot config error) and ErrCapacity on
+// OpenBytesMulti failure (seal corruption or wrong namespace).
+// The namespace check is intentionally permissive (we accept any
+// sealed blob whose seal label matches alert_rule_secret) so a
+// future cross-namespace migration doesn't break the test path.
+func unsealAlertRuleWebhookSecret(ctx context.Context, sealed []byte) ([]byte, *api.Problem) {
+	hostIdentities := hostIdentitiesForUnseal(ctx)
+	if len(hostIdentities) == 0 {
+		return nil, api.ErrCapacity("host identity not loaded — refusing to unseal webhook secret")
+	}
+	_, plaintext, err := secretbox.OpenBytesMulti(hostIdentities, sealed)
+	if err != nil {
+		return nil, api.ErrCapacity("could not unseal webhook secret: " + err.Error())
+	}
+	if len(plaintext) == 0 {
+		return nil, api.ErrCapacity("unsealed webhook secret is empty")
+	}
+	return plaintext, nil
+}
+
+// hostIdentitiesForUnseal is the indirection point so tests can
+// swap the host-identity accessor without rewriting the handler.
+// In production this resolves to the same accessor as
+// handlers_mfa.go:645 (mfaIdentities), which is set at boot by
+// SetMFAIdentities called from cmd/apid/main.go:1283. We use a
+// separate var rather than mfaIdentities directly so a future
+// rotate-overlap-isolation concern (e.g. refusing to unseal
+// with the previous-previous key) can land here without
+// cross-cutting the MFA path.
+var hostIdentitiesForUnseal = func(_ context.Context) []*age.X25519Identity {
+	return mfaIdentities()
+}
+
+// buildTestAlertEvent constructs the Event body the customer's
+// receiver will see. The payload mirrors the production shape
+// (see pkg/webhook/dispatcher.go:436-448) with two additions:
+//
+//  1. payload.test = true — the discriminator set by
+//     DispatchTest, but we set it here too so the value is
+//     visible in the handler's log line without the dispatcher
+//     re-marshalling.
+//  2. payload.observed — a synthetic value JUST PAST the
+//     preset's threshold so the customer's verifier sees the
+//     alert body in a fire-equivalent shape (not "everything's
+//     fine"). The 1% margin is intentionally tiny — large
+//     margins would make the test look like a runaway spike,
+//     defeating the point of "I want to see what my receiver
+//     gets when this fires".
+//
+// deliveryID is a fresh UUID — important: do NOT reuse the
+// rule's primary key, because the production path uses the
+// alert_deliveries row id as the canonical id, and a test
+// delivery sharing that id would collide in the customer's
+// audit log. UUID collision odds are negligible.
+func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule, preset state.AlertPreset) (string, webhookout.Event, *api.Problem) {
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return "", webhookout.Event{}, api.ErrCapacity("could not generate delivery id: " + err.Error())
+	}
+	deliveryID := hex.EncodeToString(idBytes)
+	// Synthetic observed value: threshold × 1.01 for "gt"
+	// comparisons, threshold × 0.99 for "lt". The sign-flip is
+	// load-bearing — for "lt" thresholds (api_reachable < 1,
+	// cert_expiry < 14d) the test value MUST be on the
+	// "breached" side of the threshold.
+	observed := preset.Threshold
+	switch preset.Comparison {
+	case "gt":
+		observed = preset.Threshold * 1.01
+	case "lt":
+		// Guard against negative thresholds — a tiny observed
+		// value just under a small positive threshold works,
+		// but threshold × 0.99 could still be > 0 if threshold
+		// were, e.g., -100.
+		observed = preset.Threshold * 0.99
+	}
+	return deliveryID, webhookout.Event{
+		ID:         deliveryID,
+		OccurredAt: time.Now().UTC(),
+		Rule:       preset.Name,
+		RuleName:   preset.DisplayName,
+		AppID:      app.Slug,
+		Payload: map[string]any{
+			"preset":    preset.Name,
+			"metric":    preset.Metric,
+			"observed":  observed,
+			"threshold": preset.Threshold,
+			"window":    preset.WindowSpec,
+			"test":      true,
+		},
+	}, nil
 }

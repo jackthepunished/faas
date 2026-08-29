@@ -12996,6 +12996,40 @@ func (m *MemStore) AlertRuleByID(_ context.Context, id string) (AlertRule, error
 	return r, nil
 }
 
+// AlertRuleByAccountAppAndPresetName mirrors the pgstore
+// implementation (issue #1233 / ADR-123 PR-C "Send test alert"
+// button). The memstore scans both maps under a single lock:
+// alert_presets for the catalog DisplayName, then alert_rules for
+// the LIKE prefix. Memstore has no concurrent writer, but the
+// outer mu.Lock matches the rest of the alert_rule accessors.
+func (m *MemStore) AlertRuleByAccountAppAndPresetName(_ context.Context, accountID, appID, presetName string) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	preset, ok := m.alertPresets[presetName]
+	if !ok {
+		return AlertRule{}, ErrNotFound
+	}
+	prefix := preset.DisplayName + " ("
+	var matched []AlertRule
+	for _, r := range m.alertRules {
+		if r.AccountID == accountID && r.AppID == appID && strings.HasPrefix(r.Name, prefix) {
+			matched = append(matched, r)
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return AlertRule{}, ErrNotFound
+	case 1:
+		return matched[0], nil
+	default:
+		// Same defensive ErrConflict as the pgstore — catalog
+		// display_name uniqueness + the
+		// (account_id, app_id, name) UNIQUE constraint make this
+		// unreachable.
+		return AlertRule{}, ErrConflict
+	}
+}
+
 // UpdateAlertRule mirrors the PgStore's nil-skip semantics. The
 // MemStore holds a deep-copy of the row so the caller's mutation
 // after return doesn't bleed into the next read.

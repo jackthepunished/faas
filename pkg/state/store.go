@@ -3020,6 +3020,28 @@ type Store interface {
 	//   - (AlertRule{}, ErrConflict) on a duplicate (account_id, name)
 	CreateAlertRuleIfUnderQuota(ctx context.Context, r AlertRule, limits api.Limits) (AlertRule, error)
 	AlertRuleByID(ctx context.Context, id string) (AlertRule, error)
+	// AlertRuleByAccountAppAndPresetName resolves the alert_rules
+	// row that was instantiated from a catalog preset (issue #1233
+	// / ADR-123 PR-C "Send test alert" button). ADR-123 deliberately
+	// rejected a preset_id FK on alert_rules — the catalog binding is
+	// the parsed display-name prefix "<DisplayName> (<app_slug>)"
+	// pinned by the createAlertRuleIfUnderQuota path at
+	// handlers_alert_presets.go:255. We match by joining
+	// alert_presets on (name) and selecting the rule whose name LIKE
+	// (display_name || ' (%'); the existing
+	// alert_rules_account_name_uniq index covers the LIKE prefix
+	// scan as a range scan on (account_id, name) — no new index.
+	//
+	// Returns:
+	//   - (AlertRule{}, ErrNotFound) when no rule exists for this
+	//     (account, app, preset). The handler surfaces a 404 — a
+	//     "send test" click on a card the customer never enabled is
+	//     a UX bug, not a 500.
+	//   - (AlertRule{}, ErrConflict) when the LIKE prefix matches
+	//     >1 row (should not happen — the name is unique per
+	//     (account_id, app_id) — but the pgstore row-lock turn
+	//     exposes it as a defensive guard).
+	AlertRuleByAccountAppAndPresetName(ctx context.Context, accountID, appID, presetName string) (AlertRule, error)
 	// UpdateAlertRule mutates the optional fields of an alert row. nil
 	// pointers leave the field untouched; the WebhookSecretSealed
 	// argument is *[]byte so a nil means "don't reseal" (typical for

@@ -596,12 +596,29 @@
               <code class="rule">{{.Metric}} {{.Comparison}} {{printf "%g" .Threshold}} over {{.WindowSpec}}</code>
               <p class="cooldown">Cooldown: {{.DefaultCooldownMinutes}} min · Min plan: <strong>{{.MinimumPlan}}</strong></p>
               {{if .Enabled}}
-                <form method="POST" action="/apps/{{.AppSlug}}/alert-presets/{{.Name}}/enable">
-                  <input type="hidden" name="csrf_token" value="{{.EnableConfirmToken}}">
-                  <input name="webhook_url" placeholder="https://hooks.example.com/…" required>
-                  <input name="webhook_secret" type="password" placeholder="webhook secret" required>
-                  <button type="submit">Enable</button>
-                </form>
+                {{if .Instantiated}}
+                  {{/* Issue #1233 / ADR-123 PR-C commit 2 — "Send
+                       test alert" button. Renders on instantiated
+                       cards ONLY — a card without an instantiated
+                       rule has no webhook_url/secret to dispatch
+                       to, so the click would 404. The button posts
+                       to /apps/{slug}/alert-presets/{name}/test
+                       with its own CSRF envelope (separate from the
+                       enable envelope so cross-action replays fail
+                       the verifier). */}}
+                  <p class="rule">Webhook: <code>{{.RuleID}}</code></p>
+                  <form method="POST" action="/apps/{{.AppSlug}}/alert-presets/{{.Name}}/test">
+                    <input type="hidden" name="csrf_token" value="{{.TestAlertConfirmToken}}">
+                    <button type="submit">Send test alert</button>
+                  </form>
+                {{else}}
+                  <form method="POST" action="/apps/{{.AppSlug}}/alert-presets/{{.Name}}/enable">
+                    <input type="hidden" name="csrf_token" value="{{.EnableConfirmToken}}">
+                    <input name="webhook_url" placeholder="https://hooks.example.com/…" required>
+                    <input name="webhook_secret" type="password" placeholder="webhook secret" required>
+                    <button type="submit">Enable</button>
+                  </form>
+                {{end}}
               {{else if not .EnabledInCatalog}}
                 <span class="badge badge-coming-soon">Coming soon</span>
               {{else}}

@@ -1407,6 +1407,15 @@ func (s *server) handler() http.Handler {
 	// createAlertRule gates on the per-plan cap (PR review F4).
 	mux.HandleFunc("GET /v1/alert-presets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertPresets))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alert-presets/{name}/enable", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.enableAlertPreset)))))
+	// Issue #1233 / ADR-123 PR-C commit 2 — "Send test alert" button.
+	// Same auth chain as /enable (authLimited → requireMFA → requireScope)
+	// but NOT wrapped in `idempotent` because every POST is a fresh
+	// dispatch attempt with a fresh delivery_id (replay safety: a
+	// client retry that hits idempotent's de-dup table would mask
+	// the legitimate second test fire). The 404-on-no-rule gate runs
+	// first inside the handler so a stale POST to a card the customer
+	// removed still returns a clean 404, not a 5xx.
+	mux.HandleFunc("POST /v1/apps/{slug}/alert-presets/{name}/test", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.sendTestAlertPreset))))
 
 	// Edge rules (ADR-089, planned). Customer-facing resource that
 	// runs in pkg/gateway BEFORE host→app resolution. Mirrors the
@@ -2137,6 +2146,16 @@ func (s *server) handler() http.Handler {
 	// path (POST /v1/apps/{slug}/alert-presets/{name}/enable)
 	// and the dashboard path share a single guard order.
 	mux.Handle("POST /dashboard/apps/{slug}/alert-presets/{name}/enable", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardEnablePreset))))
+	// Issue #1233 / ADR-123 PR-C commit 2 — "Send test alert" form
+	// twin of the JSON route at line 1418. dashboardChain wraps
+	// the cookie-auth middleware + CSRF envelope verifier, then
+	// sessionAuth confirms the cookie. The handler delegates to
+	// sendTestAlertPresetCore after CSRF so the JSON path and the
+	// dashboard path share a single guard order (slug + name regex
+	// gating, then catalog row gate, then rule lookup, then
+	// dispatch). Mirrors the enable-path dashboardChain structure
+	// at line 2148.
+	mux.Handle("POST /dashboard/apps/{slug}/alert-presets/{name}/test", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardSendTestAlertPreset))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires

@@ -700,6 +700,31 @@ type AlertPresetItem struct {
 	// Empty on cards that don't render a form (coming-soon /
 	// upgrade-required) — no token needed there.
 	EnableConfirmToken string
+	// TestAlertConfirmToken is the per-card CSRF envelope for the
+	// "Send test alert" form (issue #1233 / ADR-123 PR-C commit 2).
+	// Separate from EnableConfirmToken because the verifier seals
+	// (action, account_id) and refuses cross-action replays — sharing
+	// the envelope would let a replayed enable-click attempt a
+	// dispatch. Empty on cards where the test button does not
+	// render (card is not yet instantiated or is plan-gated).
+	TestAlertConfirmToken string
+	// Instantiated is true when the customer has already enabled
+	// this preset for this app — i.e. an alert_rules row exists
+	// whose name begins with the catalog's DisplayName + " (".
+	// Populated by the handler edge in
+	// cmd/apid/handlers_dashboard.go::fetchDashboardPresets using a
+	// single ListAlertRulesForAccount scan (the per-account row
+	// count is bounded by AlertRuleLimitPerAccount = 100 on Scale).
+	// When true the card renders a "Send test alert" button (issue
+	// #1233 / ADR-123 PR-C commit 2) instead of the enable form;
+	// when false the enable form stays as-is.
+	Instantiated bool
+	// RuleID is the alert_rules.id of the instantiated rule, when
+	// Instantiated=true. Empty otherwise. Wired into the test-button
+	// form action as a hidden <input> so the sidebar-style 308
+	// redirect on the dashboard side doesn't need to carry the id
+	// in the URL.
+	RuleID string
 }
 
 // alertDeliveryErrorLimit caps the LastError string we render on the
