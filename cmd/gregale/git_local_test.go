@@ -22,34 +22,45 @@ import (
 
 func TestParseGitRemoteURL(t *testing.T) {
 	cases := []struct {
-		name      string
-		input     string
-		wantOwner string
-		wantRepo  string
-		wantErr   bool
+		name         string
+		input        string
+		wantOwner    string
+		wantRepo     string
+		wantErr      bool
+		wantSoftEmpty bool // non-GitHub URL → ("", "", nil) — caller falls through
 	}{
-		// Accepted forms.
-		{"ssh with .git", "git@github.com:o/r.git", "o", "r", false},
-		{"ssh without .git", "git@github.com:o/r", "o", "r", false},
-		{"https with .git", "https://github.com/o/r.git", "o", "r", false},
-		{"https without .git", "https://github.com/o/r", "o", "r", false},
-		{"http form", "http://github.com/o/r.git", "o", "r", false},
-		{"uppercase normalized", "git@github.com:OWNER/REPO.git", "owner", "repo", false},
-		{"with whitespace", "  git@github.com:o/r.git  ", "o", "r", false},
+		// Accepted GitHub forms.
+		{"ssh with .git", "git@github.com:o/r.git", "o", "r", false, false},
+		{"ssh without .git", "git@github.com:o/r", "o", "r", false, false},
+		{"ssh explicit scheme", "ssh://git@github.com/o/r.git", "o", "r", false, false},
+		{"ssh explicit scheme no user", "ssh://github.com/o/r.git", "o", "r", false, false},
+		{"ssh explicit with port", "ssh://git@github.com:22/o/r.git", "o", "r", false, false},
+		{"https with .git", "https://github.com/o/r.git", "o", "r", false, false},
+		{"https without .git", "https://github.com/o/r", "o", "r", false, false},
+		{"https with userinfo", "https://token@github.com/o/r.git", "o", "r", false, false},
+		{"https with user:pass userinfo", "https://user:pass@github.com/o/r.git", "o", "r", false, false},
+		{"http form", "http://github.com/o/r.git", "o", "r", false, false},
+		{"uppercase normalized", "git@github.com:OWNER/REPO.git", "owner", "repo", false, false},
+		{"with whitespace", "  git@github.com:o/r.git  ", "o", "r", false, false},
 
-		// Rejected forms (v1 is GitHub-only).
-		{"empty", "", "", "", true},
-		{"whitespace-only", "   ", "", "", true},
-		{"gitlab ssh", "git@gitlab.com:o/r.git", "", "", true},
-		{"gitlab https", "https://gitlab.com/o/r.git", "", "", true},
-		{"bitbucket https", "https://bitbucket.org/o/r.git", "", "", true},
-		{"custom host ssh", "git@git.example.com:o/r.git", "", "", true},
-		{"custom host https", "https://git.example.com/o/r.git", "", "", true},
-		{"ssh scheme variant", "ssh://git@github.com/o/r.git", "", "", true},
-		{"missing repo", "git@github.com:o", "", "", true},
-		{"missing owner", "git@github.com:/r", "", "", true},
-		{"missing both", "git@github.com:", "", "", true},
-		{"too many slashes", "git@github.com:o/r/extra", "", "", true},
+		// Non-GitHub URLs: soft empty triple (caller falls through to
+		// the cwd-auto-pack branch instead of erroring — issue #1182).
+		{"gitlab ssh", "git@gitlab.com:o/r.git", "", "", false, true},
+		{"gitlab https", "https://gitlab.com/o/r.git", "", "", false, true},
+		{"bitbucket https", "https://bitbucket.org/o/r.git", "", "", false, true},
+		{"custom host ssh", "git@git.example.com:o/r.git", "", "", false, true},
+		{"custom host https", "https://git.example.com/o/r.git", "", "", false, true},
+		{"file scheme", "file:///path/to/repo", "", "", false, true},
+		{"git scheme", "git://github.com/o/r.git", "", "", false, true},
+
+		// Genuinely malformed GitHub URLs — hard error.
+		{"empty", "", "", "", true, false},
+		{"whitespace-only", "   ", "", "", true, false},
+		{"missing repo", "git@github.com:o", "", "", true, false},
+		{"missing owner", "git@github.com:/r", "", "", true, false},
+		{"missing both", "git@github.com:", "", "", true, false},
+		{"too many slashes", "git@github.com:o/r/extra", "", "", true, false},
+		{"https github no path", "https://github.com/", "", "", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,6 +73,13 @@ func TestParseGitRemoteURL(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("parseGitRemoteURL(%q): unexpected error: %v", tc.input, err)
+			}
+			if tc.wantSoftEmpty {
+				if owner != "" || repo != "" {
+					t.Fatalf("parseGitRemoteURL(%q) = (%q, %q); want soft empty triple",
+						tc.input, owner, repo)
+				}
+				return
 			}
 			if owner != tc.wantOwner || repo != tc.wantRepo {
 				t.Fatalf("parseGitRemoteURL(%q) = (%q, %q); want (%q, %q)",

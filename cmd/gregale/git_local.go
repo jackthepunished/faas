@@ -58,59 +58,114 @@ func gitRootFromCwd(start string) (string, error) {
 }
 
 // parseGitRemoteURL accepts the URL forms GitHub ships today and
-// returns (owner, repo). v1 only supports GitHub hostnames — non-GitHub
-// remotes are rejected with a clear error so the operator knows to
-// pass `--repo OWNER/NAME --ref SHA` explicitly or install the Gregale
-// GitHub App.
+// returns (owner, repo). v1 only resolves GitHub hostnames into a
+// zero-config-eligible (owner, repo) pair; any other host returns
+// ("", "", nil) so the caller can route to the non-zero-config
+// (cwd-auto-pack) branch instead of erroring on a perfectly valid
+// non-GitHub repo.
 //
-// Accepted:
-//   - git@github.com:OWNER/REPO.git
-//   - git@github.com:OWNER/REPO
-//   - https://github.com/OWNER/REPO.git
-//   - https://github.com/OWNER/REPO
+// Accepted (any of the standard GitHub remote shapes):
+//   - git@github.com:OWNER/REPO[.git]
+//   - ssh://[git@]github.com[:22]/OWNER/REPO[.git]
+//   - ssh://[git@]github.com[:22]:OWNER/REPO[.git]
+//   - https://[user[:pass]@]github.com/OWNER/REPO[.git]
+//   - http://[user[:pass]@]github.com/OWNER/REPO[.git]
 //
-// Rejected:
-//   - empty string
-//   - ssh://git@github.com/OWNER/REPO.git (not used by `git clone`)
-//   - any non-github.com host (gitlab, bitbucket, custom)
-//   - malformed (missing owner or repo)
+// Returned triples:
+//   - GitHub URL that parses cleanly → (owner, repo, nil)
+//   - Non-GitHub URL of any shape     → ("",  "",    nil)  — caller falls through
+//   - GitHub URL that's malformed     → ("",  "",    err) — caller surfaces the error
+//   - Empty URL                       → ("",  "",    err) — caller surfaces "no remote"
 func parseGitRemoteURL(remoteURL string) (owner, repo string, err error) {
 	remoteURL = strings.TrimSpace(remoteURL)
 	if remoteURL == "" {
 		return "", "", errors.New("parseGitRemoteURL: empty remote URL")
 	}
 
-	// SSH form: git@github.com:OWNER/REPO(.git)?
+	// SSH "scp-like" form: git@github.com:OWNER/REPO[.git]
 	if strings.HasPrefix(remoteURL, "git@github.com:") {
-		rest := strings.TrimPrefix(remoteURL, "git@github.com:")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: ssh form: %w", err)
-		}
-		return owner, repo, nil
+		return splitOwnerRepo(strings.TrimPrefix(remoteURL, "git@github.com:"))
 	}
 
-	// HTTPS form: https://github.com/OWNER/REPO(.git)?
-	if strings.HasPrefix(remoteURL, "https://github.com/") {
-		rest := strings.TrimPrefix(remoteURL, "https://github.com/")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: https form: %w", err)
-		}
-		return owner, repo, nil
+	// SSH explicit form: ssh://[user@]host[:port]/path
+	// (a few SSH clients use this; `git clone` never produces it but
+	// hand-written remote URLs do — issue #1182 §3.6.)
+	if path, ok := matchSSHURL(remoteURL, "github.com"); ok {
+		return splitOwnerRepo(path)
 	}
 
-	// HTTP form (rarely used; CLI tools sometimes normalize to https).
-	if strings.HasPrefix(remoteURL, "http://github.com/") {
-		rest := strings.TrimPrefix(remoteURL, "http://github.com/")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: http form: %w", err)
-		}
-		return owner, repo, nil
+	// HTTPS with optional userinfo: https://[user[:pass]@]github.com/...
+	if rest, ok := stripURLUserinfo(remoteURL, "https://", "github.com"); ok {
+		return splitOwnerRepo(rest)
+	}
+	if rest, ok := stripURLUserinfo(remoteURL, "http://", "github.com"); ok {
+		return splitOwnerRepo(rest)
 	}
 
-	return "", "", fmt.Errorf("parseGitRemoteURL: only github.com remotes are supported in v1; got %q", remoteURL)
+	// Anything else (file://, git://, plain non-host paths, or any
+	// https/http URL pointing at a non-github.com host) — not a
+	// recognised zero-config origin. Return empty triple so the
+	// caller falls through to the cwd-auto-pack branch.
+	return "", "", nil
+}
+
+// matchSSHURL handles "ssh://[user@]host[:port]/path" forms for the
+// given host. Returns (path, true) on a host match, ("", false)
+// otherwise. Caller is responsible for splitting the path into
+// (owner, repo) via splitOwnerRepo (which strips a trailing .git
+// and lowercases).
+func matchSSHURL(remoteURL, host string) (path string, ok bool) {
+	const prefix = "ssh://"
+	if !strings.HasPrefix(remoteURL, prefix) {
+		return "", false
+	}
+	rest := remoteURL[len(prefix):]
+	// userinfo (before '@') is optional.
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	// host[:port]/...
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return "", false
+	}
+	hostPort := rest[:slash]
+	// Trim optional :port.
+	if colon := strings.IndexByte(hostPort, ':'); colon >= 0 {
+		hostPort = hostPort[:colon]
+	}
+	if hostPort != host {
+		return "", false
+	}
+	return rest[slash+1:], true
+}
+
+// stripURLUserinfo handles "scheme://[userinfo@]host/..." for the
+// given scheme + host. Returns (path, true) on a host match,
+// ("", false) otherwise — including the "scheme matched but host
+// didn't" case (which the caller maps to a soft empty-triple
+// return, signalling "not zero-config-eligible").
+//
+// On the GitHub path, the userinfo segment is dropped: a token
+// embedded in the remote URL is rare (and a security smell — the
+// GitHub App auth model uses install tokens, not URL credentials),
+// but if a customer's remote has it, we don't want to surface it on
+// the deployment row.
+func stripURLUserinfo(remoteURL, scheme, host string) (path string, ok bool) {
+	if !strings.HasPrefix(remoteURL, scheme) {
+		return "", false
+	}
+	rest := remoteURL[len(scheme):]
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	hostPrefix := host + "/"
+	if !strings.HasPrefix(rest, hostPrefix) {
+		// scheme matched but host didn't — fall through so caller
+		// returns empty triple (not zero-config-eligible, not an error).
+		return "", false
+	}
+	return rest[len(hostPrefix):], true
 }
 
 // splitOwnerRepo splits "OWNER/REPO" or "OWNER/REPO.git" into
