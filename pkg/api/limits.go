@@ -1297,6 +1297,19 @@ type Limits struct {
 	// cmd/apid/handlers_app_errors.go via
 	// api.ErrPlanAppErrorsNotAllowed.
 	AppErrorsAllowed bool
+
+	// JobsAllowed (issue #1184 / ADR-099 supplement) toggles whether the
+	// plan may create run-to-completion jobs at all. Free=false; the
+	// per-plan caps (JobMaxPerAccount, JobRAMMB, etc.) are zero on Free
+	// anyway as defence-in-depth, but this is the load-bearing gate the
+	// apid POST /v1/jobs handler checks first. Mirrors the per-tier lock
+	// pattern of MinInstancesAllowed / QueueControlsAllowed /
+	// EgressAllowlistAllowed: Hobby+Pro+Scale opt in; Free stays off.
+	// Surfaced via api.ErrJobsNotAllowed (404 jobs_not_allowed). The
+	// value-bound knobs (JobMaxPerAccount, JobRAMMB, JobMaxTasksPerRun,
+	// ...) live as top-level constants JobMax{PerAccount,RAMMB,...} and
+	// are read directly by the apid validators + schedd dispatch tick.
+	JobsAllowed bool
 }
 
 // UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
@@ -1665,6 +1678,7 @@ var planLimits = map[Plan]Limits{
 		PerAppMetricsAllowed:   false,
 		AppUsageSummaryAllowed: false,
 		AppErrorsAllowed:       false,
+		JobsAllowed:            false,
 	},
 	PlanHobby: {
 		Plan:                  PlanHobby,
@@ -2010,6 +2024,7 @@ var planLimits = map[Plan]Limits{
 		PerAppMetricsAllowed:   true,
 		AppUsageSummaryAllowed: true,
 		AppErrorsAllowed:       true,
+		JobsAllowed:            true,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,
@@ -2330,6 +2345,7 @@ var planLimits = map[Plan]Limits{
 		PerAppMetricsAllowed:   true,
 		AppUsageSummaryAllowed: true,
 		AppErrorsAllowed:       true,
+		JobsAllowed:            true,
 	},
 	PlanScale: {
 		Plan:                  PlanScale,
@@ -2682,6 +2698,7 @@ var planLimits = map[Plan]Limits{
 		PerAppMetricsAllowed:   true,
 		AppUsageSummaryAllowed: true,
 		AppErrorsAllowed:       true,
+		JobsAllowed:            true,
 	},
 }
 
@@ -2740,6 +2757,29 @@ const (
 	BuildVMVCPU            = 2
 	BuildTimeoutSeconds    = 900 // 15 min build; cold rootless Railpack export needs headroom
 	BuildE2ETimeoutSeconds = 900 // 15 min end-to-end
+
+	// Jobs (issue #1184 Workstream A / ADR-099 supplement). Run-to-completion
+	// workloads: stored image + command + env, Firecracker boots, guest runs
+	// to completion, exit code reported via vsock. Distinct from build VMs
+	// in that jobs ride the tenant RAM ceiling (not the scarce builder slot
+	// pool) and have no idle reaper.
+	//
+	// Scalar caps (single int) live in this const block; the per-plan
+	// matrix (one entry per Plan: 0=Free 1=Hobby 2=Pro 3=Scale) lives as
+	// a package-level var below because Go forbids array literals in
+	// const declarations. The per-plan caps are PR #916 as-built,
+	// supersedes ADR-099 §Decision 5 numerics.
+	//
+	// Backoff (capped exponential) for failed/timeout/oom retry.
+	// JobBackoffBaseSeconds × 2^(attempt-1), capped at JobBackoffMaxSeconds.
+	JobBackoffBaseSeconds = 5
+	JobBackoffMaxSeconds  = 300 // 5 min
+
+	// Defaults when the customer omits a field on POST /v1/jobs.
+	JobDefaultTaskTimeoutSec = 60
+	JobDefaultParallelism    = 1
+	JobDefaultRetryMax       = 0
+	JobDefaultRAMMB          = 256
 
 	// Snapshots / disk (spec §1, §8).
 	FleetSnapshotAvgTargetMB = 130 // business metric; alert >160 warn, >200 page
@@ -3709,6 +3749,56 @@ const (
 	DefaultMaxHeaderBytes = 1 << 20 // 1 MiB
 )
 
+// Per-plan job caps. Indexed by Plan: 0=Free 1=Hobby 2=Pro 3=Scale.
+// Lives as a var (not const) because Go does not permit array literals
+// in const declarations. PR #916 as-built table, supersedes ADR-099
+// §Decision 5 numerics.
+//
+// Free returns 0 across the board; the engine gates jobs on
+// Plan.JobsAllowed() before reading any of these slices, so Free
+// customers get a clean 404 jobs_not_allowed without an index-out-of-bounds
+// hazard on the quota side.
+var (
+	// JobMaxPerAccount is the maximum number of job templates an
+	// account may own concurrently (status <> 'deleted').
+	JobMaxPerAccount = [4]int{0, 5, 25, 100}
+
+	// JobConcurrentPerAccount caps the live job-task instances
+	// (kind='job_task' AND status NOT IN ('parked','destroyed'))
+	// belonging to any single account. Independent of the app-wake
+	// concurrency budget because jobs ride the tenant RAM ceiling
+	// (kind-of-but-not-the-same-thing as wakes).
+	JobConcurrentPerAccount = [4]int{0, 3, 8, 32}
+
+	// JobRAMMB is the per-job-task memory cap. Matches the per-plan
+	// app RAM cap (256/512/1024/2048) for Hobby/Pro/Scale so a job
+	// cannot exceed the largest app the same account could run.
+	JobRAMMB = [4]int{0, 512, 2048, 4096}
+
+	// JobTaskTimeoutSec is the per-task wall-clock cap (0 = off for
+	// Free; Hobby defaults to a 5-minute cap so a stuck Hobby job
+	// doesn't pin a tenant-RAM slot indefinitely).
+	JobTaskTimeoutSec = [4]int{0, 300, 1800, 3600}
+
+	// JobMaxParallelismPerRun is the maximum concurrent task fan-out
+	// within a single run. Distinct from JobConcurrentPerAccount
+	// which caps the account-wide pool — a Pro account with 8
+	// concurrent can run one 25-parallel run if other accounts are
+	// idle, but the scheduler enforces parallelism at dispatch time.
+	JobMaxParallelismPerRun = [4]int{0, 10, 25, 50}
+
+	// JobMaxTasksPerRun is the per-run fan-out ceiling (number of
+	// task rows a single run materialises). Hard cap, not a quota;
+	// counts against the account's JobConcurrentPerAccount live pool.
+	JobMaxTasksPerRun = [4]int{0, 100, 1000, 5000}
+
+	// JobMaxRetries is the maximum retry count per task before
+	// dead-letter. Retries use the capped exponential backoff
+	// (JobBackoffBaseSeconds × 2^(attempt-1), capped at
+	// JobBackoffMaxSeconds) defined in the const block above.
+	JobMaxRetries = [4]int{0, 3, 5, 10}
+)
+
 // DefaultComputeNodeCeilingMB is the per-compute-node admission ceiling
 // schedd hands out when no operator override is present. It mirrors
 // RAMAdmissionCeilingMB (85% of the tenant budget) because a single
@@ -3992,6 +4082,25 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// JobsAllowed (issue #1184 / ADR-099 supplement) reports whether the
+// plan may create run-to-completion jobs at all. Hobby+Pro+Scale opt
+// in; Free stays off (JobsAllowed=false on the Free row, plus
+// JobMaxPerAccount[0]=0 etc. as defence-in-depth). apid's createJob +
+// createJobRun handlers gate on this; the CLI surfaces the rejection
+// with CodeJobsNotAllowed. Unknown plans fail closed (return false)
+// so a missing row never silently unlocks a paid feature — same
+// contract as MinInstancesAllowed / EgressAllowlistAllowed above.
+// The plan caps (JobMaxPerAccount, JobRAMMB, JobMaxTasksPerRun, ...)
+// are read directly from the top-level constants; the Limits struct
+// carries only the boolean gate.
+func (p Plan) JobsAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.JobsAllowed
 }
 
 // StaticEgressIPAllowed (ADR-119) reports whether the plan may pin
