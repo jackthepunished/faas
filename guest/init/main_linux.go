@@ -47,6 +47,7 @@ type bootMode int
 const (
 	modeApp bootMode = iota
 	modeBuild
+	modeJob
 )
 
 // main is guest PID 1. Any fatal error here panics the VM (panic=1 in boot args
@@ -77,6 +78,20 @@ func boot() error {
 		return err
 	}
 	guestStage(fmt.Sprintf("mode-%d", mode))
+	// Job VMs (issue #1184 Workstream A / ADR-099) are
+	// single-shot: load /etc/faas/job.json, exec the customer's
+	// command, ship the vsock DGRAM, poweroff. No readiness
+	// probe, no listener port, no cgroup2 (the host-side
+	// per-instance scope from vmmd is still enforced — same
+	// contract as every other VM). runJob is total: it powers
+	// off on every path, so we never reach the cgroup2 /
+	// resume-hook bindings below.
+	if mode == modeJob {
+		guestStage("before-job-supervisor")
+		_ = RunJob(slog.Default())
+		// Unreachable: RunJob poweroff()s the VM on every path.
+		return nil
+	}
 	// Builder VMs run BuildKit/runc as their only workload. The daemon needs a
 	// cgroup mount, but its runc workers enter a user namespace so they do not
 	// require host-level device-BPF policy support. The guest cgroup namespace
@@ -412,14 +427,31 @@ func errorKind(err error) string {
 }
 
 // decideMode picks the boot branch by looking at which manifest file exists.
-// The build manifest takes precedence if both are present (defensive —
-// shouldn't happen in practice because base images carry at most one).
 //
-// Split out from boot() so unit tests can drive it with testing/fstest.MapFS
-// instead of touching the real root fs. The path passed to fs.ReadFile must
-// be RELATIVE (no leading "/") — fs.FS rejects absolute paths, and the real
-// os.DirFS("/") used at boot happily accepts the relative form on Linux.
+// Mode priority (issue #1184 / ADR-099):
+//  1. job.json with kind=="job"  → modeJob
+//  2. build.json (kind=="build") → modeBuild
+//  3. else                       → modeApp (legacy)
+//
+// Job VMs never co-exist with build.json (different workload
+// class), so the precedence is "what file wins". If both
+// somehow appear (vmmd staging bug), job wins — the customer's
+// command is the authoritative intent.
+//
+// Split out from boot() so unit tests can drive it with
+// testing/fstest.MapFS instead of touching the real root fs.
+// The path passed to fs.ReadFile must be RELATIVE (no leading "/") —
+// fs.FS rejects absolute paths, and the real os.DirFS("/") used
+// at boot happily accepts the relative form on Linux.
 func decideMode(fsys fs.FS) (bootMode, api.BuildManifest, error) {
+	// Job VMs take precedence (issue #1184 Workstream A /
+	// ADR-099). The presence of /etc/faas/job.json with
+	// kind=="job" is the canonical signal — the supervisor
+	// reads the rest of the manifest (command, env, task
+	// timeout, lease token) at runJob time, not here.
+	if hasJobManifest(fsys) {
+		return modeJob, api.BuildManifest{}, nil
+	}
 	if data, err := fs.ReadFile(fsys, "etc/faas/build.json"); err == nil {
 		var m api.BuildManifest
 		if jErr := json.Unmarshal(data, &m); jErr == nil {
