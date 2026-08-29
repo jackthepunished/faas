@@ -203,6 +203,27 @@ test('clearDeployment: live deployment returns 409 (ADR-124)', async () => {
   );
 });
 
+test('cancelDeployment: live deployment returns 409 (ADR-124)', async () => {
+  // Mirrors clearDeployment's live-1 path. fakeapid enforces
+  // 409 deployment_cancel_live_forbidden on POST .../live-1/cancel
+  // (same as the DELETE branch) so the SDK error surface is
+  // consistent across both ops.
+  await assert.rejects(
+    () =>
+      DeploymentsService.cancelDeployment({
+        slug: 'hello-world',
+        id: 'live-1',
+        requestBody: { reason: 'user' },
+      }),
+    (err: unknown) => {
+      const apiErr = err as { status?: number; problem?: { code?: string } };
+      assert.equal(apiErr.status, 409);
+      assert.equal(apiErr.problem?.code, 'deployment_cancel_live_forbidden');
+      return true;
+    },
+  );
+});
+
 test('clearObsoleteDeployments: unknown slug surfaces ErrNotFound (ADR-124)', async () => {
   await assert.rejects(
     () =>

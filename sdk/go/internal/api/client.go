@@ -1361,8 +1361,12 @@ func (c *Client) PostTriggersBatchCreate(ctx context.Context, req CreateTriggerB
 // ADR-118 / ADR-124. Optional reason values are the closed set
 // "user" | "auto_quota" | "auto_health" | "system"; an empty string
 // defaults to "user" server-side.
-func (c *Client) CancelDeployment(ctx context.Context, appSlug, id string, reason string) (DeploymentResponse, error) {
-	var out DeploymentResponse
+//
+// Returns the typed CancelDeploymentResponse so callers can read
+// CancelReason (the reason the server recorded on the row) and
+// CancelledBuilds (the cascade-cancelled build IDs).
+func (c *Client) CancelDeployment(ctx context.Context, appSlug, id string, reason string) (CancelDeploymentResponse, error) {
+	var out CancelDeploymentResponse
 	body := CancelDeploymentRequest{Reason: reason}
 	return out, c.do(ctx, "POST", "/v1/apps/"+appSlug+"/deployments/"+id+"/cancel", body, &out)
 }
@@ -1372,8 +1376,11 @@ func (c *Client) CancelDeployment(ctx context.Context, appSlug, id string, reaso
 // background rebuild. Plan-gated (Hobby/Pro/Scale only); Free returns
 // 402 "plan_reorder_disabled". Returns ErrReorderNotPending (409) when
 // the deployment has already moved off the pending queue.
-func (c *Client) ReorderDeployment(ctx context.Context, id string, newPriority int) (DeploymentResponse, error) {
-	var out DeploymentResponse
+//
+// Returns the typed ReorderDeploymentResponse so callers can confirm
+// the server-applied priority (the response echoes the value).
+func (c *Client) ReorderDeployment(ctx context.Context, id string, newPriority int) (ReorderDeploymentResponse, error) {
+	var out ReorderDeploymentResponse
 	body := struct {
 		Priority int `json:"priority"`
 	}{Priority: newPriority}

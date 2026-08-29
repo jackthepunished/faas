@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -170,12 +171,29 @@ func TestDo_MutatingCallsCarryIdempotencyKey(t *testing.T) {
 		{"SetSecret", func(c *Client) error { return c.SetSecret(context.Background(), "x", "K", "v") }},
 		{"UnsetSecret", func(c *Client) error { return c.UnsetSecret(context.Background(), "x", "K") }},
 		{"CancelDeployment", func(c *Client) error {
-			_, err := c.CancelDeployment(context.Background(), "x", "1", "")
-			return err
+			resp, err := c.CancelDeployment(context.Background(), "x", "1", "user")
+			if err != nil {
+				return err
+			}
+			// The fixture returns `{}` so all typed fields read
+			// as zero values; the assertion is that the SDK
+			// doesn't panic / mis-decode. A real daemon returns
+			// the typed CancelDeploymentResponse — see
+			// pkg/api/dto.go for the wire contract.
+			if resp.Status != "" && resp.Status != "cancelled" {
+				return fmt.Errorf("unexpected cancel status: %q", resp.Status)
+			}
+			return nil
 		}},
 		{"ReorderDeployment", func(c *Client) error {
-			_, err := c.ReorderDeployment(context.Background(), "1", 100)
-			return err
+			resp, err := c.ReorderDeployment(context.Background(), "1", 100)
+			if err != nil {
+				return err
+			}
+			if resp.Priority != 0 && resp.Priority != 100 {
+				return fmt.Errorf("unexpected priority: %d", resp.Priority)
+			}
+			return nil
 		}},
 		{"ClearDeployment", func(c *Client) error {
 			return c.ClearDeployment(context.Background(), "1")

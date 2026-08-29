@@ -1404,6 +1404,31 @@ type CancelDeploymentRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// CancelDeploymentResponse is the wire shape for POST
+// /v1/apps/{slug}/deployments/{id}/cancel (api/openapi.yaml:4497-4505).
+// CancelledAt is the RFC3339 timestamp; CancelledBuilds is the list
+// of cascade-cancelled build IDs (empty when no builds were
+// in-flight). Mirrors the Python
+// sdk/python/faas_sdk/models/cancel_deployment_response_200.py +
+// sdk/node/src/generated/models/CancelDeploymentResponse200.ts.
+type CancelDeploymentResponse struct {
+	ID              string    `json:"id"`
+	Status          string    `json:"status"`
+	CancelledAt     time.Time `json:"cancelled_at"`
+	CancelReason    string    `json:"cancel_reason"`
+	CancelledBuilds []string  `json:"cancelled_builds"`
+}
+
+// ReorderDeploymentResponse is the wire shape for POST
+// /v1/deployments/{id}/reorder (api/openapi.yaml:4444-4451).
+// Priority is the server-applied value (echo of the request body
+// after the row flip). Mirrors the Python
+// sdk/python/faas_sdk/models/reorder_deployment_response_200.py.
+type ReorderDeploymentResponse struct {
+	ID       string `json:"id"`
+	Priority int    `json:"priority"`
+}
+
 // ClearObsoleteReport is the response shape for POST
 // /v1/apps/{slug}/deployments/clear-obsolete. Count is the number
 // of soft-deleted rows in this call; OlderThan echoes the cutoff

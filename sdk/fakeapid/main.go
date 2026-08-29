@@ -348,6 +348,16 @@ func (f *fixture) handler() http.Handler {
 			_, _ = w.Write(notFoundAppProblem(slug))
 			return
 		}
+		// Mirror cmd/apid/handlers_queue_controls.go:103-105: live
+		// deployments return 409 deployment_cancel_live_forbidden
+		// with the canonical "use gregale deploys rollback" hint.
+		// The DELETE branch below (/v1/deployments/{id}) treats
+		// id == "live-1" the same way; we keep both routes in sync
+		// so fixture smoke tests exercise the same code path.
+		if id == "live-1" {
+			problemJSON(w, http.StatusConflict, "deployment_cancel_live_forbidden", "use `gregale deploys rollback` for live deployments", "fixture")
+			return
+		}
 		// Best-effort body decode; missing/empty body → reason ""
 		// (server-side default "user" per cmd/apid/handlers_queue_controls.go:72).
 		var body struct {

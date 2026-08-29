@@ -390,6 +390,31 @@ def test_clear_deployment_live_returns_409(fakeapid) -> None:
         client.close()
 
 
+def test_cancel_deployment_live_returns_409(fakeapid) -> None:
+    """`POST /v1/apps/hello-world/deployments/live-1/cancel` returns
+    409 with code "deployment_cancel_live_forbidden". Mirrors the
+    DELETE branch's live-1 handling — fakeapid enforces the same
+    409 path on both ops so the SDK error surface stays consistent.
+    """
+    from faas_sdk import FaasProblemError
+    from faas_sdk.api.deployments import cancel_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(FaasProblemError) as excinfo:
+            cancel_deployment.sync(
+                client=client.inner,
+                slug="hello-world",
+                id="live-1",
+                body=CancelDeploymentRequest(reason="user"),
+            )
+        err = excinfo.value
+        assert err.problem.status == 409
+        assert err.problem.code == "deployment_cancel_live_forbidden"
+    finally:
+        client.close()
+
+
 def test_clear_obsolete_deployments_unknown_slug_raises_err_not_found(fakeapid) -> None:
     """`POST /v1/apps/missing-app-404/deployments/clear-obsolete`
     returns 404; the wrapper surfaces ErrNotFound.
