@@ -1,0 +1,26 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/docker-entrypoint.sh"],
+    "Cmd": ["node", "index.js"],
+    "Env": [
+      "NODE_VERSION=22.0.0",
+      "YARN_VERSION=1.22.19",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "WorkingDir": "/app",
+    "User": "1001",
+    "Healthcheck": {
+      "Test": ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8080/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"],
+      "Interval": 30000000000,
+      "Timeout": 30000000000,
+      "Retries": 3,
+      "StartPeriod": 5000000000
+    }
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}

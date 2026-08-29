@@ -19,7 +19,9 @@
 package imaged
 
 import (
+	"bytes"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/oci"
@@ -162,4 +164,130 @@ func TestManifestFromImageConfig_NoEntrypointOrCmd_ErrInvalid(t *testing.T) {
 	if !errors.Is(err, oci.ErrImageManifestInvalid) {
 		t.Errorf("err = %v; want ErrImageManifestInvalid", err)
 	}
+}
+
+// --- fixture-driven cross-cutting coverage ---------------------------
+//
+// The fixtures below come from pkg/imaged/testdata/oci-fixtures/ and
+// pin the canonical registry-image shapes against which the M-1
+// acceptance criterion ("Standard images using ENTRYPOINT, CMD, USER,
+// and WORKDIR run with the expected behavior") is measured. Each
+// fixture round-trips through oci.ParseConfig → oci.ImageConfig →
+// manifestFromImageConfig → api.AppManifest; we assert the canonical
+// AppManifest shape per fixture.
+
+type fixtureCase struct {
+	name       string
+	fixture    string // path under testdata/oci-fixtures/
+	wantArgv   []string
+	wantUser   string
+	wantHealth bool
+	wantSignal string
+}
+
+func TestManifestFromImageConfig_Fixtures(t *testing.T) {
+	t.Parallel()
+	cases := []fixtureCase{
+		{
+			name:     "alpine_3_19",
+			fixture:  "alpine_3_19.json",
+			wantArgv: []string{"/bin/sh"},
+		},
+		{
+			name:     "distroless_static",
+			fixture:  "distroless_static.json",
+			wantArgv: []string{"/app", "run"},
+			wantUser: "65532",
+		},
+		{
+			name:     "distroless_base",
+			fixture:  "distroless_base.json",
+			wantArgv: []string{"/bin/sh"},
+			wantUser: "0",
+		},
+		{
+			name:     "debian_slim_12",
+			fixture:  "debian_slim_12.json",
+			wantArgv: []string{"/bin/sh"},
+		},
+		{
+			name:     "busybox_1_36",
+			fixture:  "busybox_1_36.json",
+			wantArgv: []string{"sh"},
+		},
+		{
+			name:     "node_22_alpine",
+			fixture:  "node_22_alpine.json",
+			wantArgv: []string{"/docker-entrypoint.sh", "node", "index.js"},
+			wantUser: "1001",
+		},
+		{
+			name:     "python_3_12_slim",
+			fixture:  "python_3_12_slim.json",
+			wantArgv: []string{"python3", "main.py"},
+			wantUser: "app", // USER 1000 normalises to DefaultAppUser
+		},
+		{
+			name:       "healthcheck_full",
+			fixture:    "healthcheck_full.json",
+			wantArgv:   []string{"/app/server"},
+			wantUser:   "1001",
+			wantHealth: true,
+			wantSignal: "SIGUSR1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadOCIFixture(t, tc.fixture)
+			// Drive through the full registry path: ParseConfig
+			// produces oci.Config; ManifestFromConfig produces
+			// the api.AppManifest. This is the canonical
+			// round-trip every commit 5 path runs.
+			manifest, err := oci.ManifestFromConfig(cfg)
+			if err != nil {
+				t.Fatalf("ManifestFromConfig: %v", err)
+			}
+			if !stringSliceEq(manifest.Entrypoint, tc.wantArgv) {
+				t.Errorf("Entrypoint = %v; want %v", manifest.Entrypoint, tc.wantArgv)
+			}
+			if tc.wantUser != "" && manifest.User != tc.wantUser {
+				t.Errorf("User = %q; want %q", manifest.User, tc.wantUser)
+			}
+			if tc.wantHealth && manifest.Healthcheck == nil {
+				t.Error("Healthcheck nil; want populated")
+			}
+			if tc.wantSignal != "" && manifest.StopSignal != tc.wantSignal {
+				t.Errorf("StopSignal = %q; want %q", manifest.StopSignal, tc.wantSignal)
+			}
+		})
+	}
+}
+
+// loadOCIFixture reads an OCI image-config JSON fixture and decodes
+// it through oci.ParseConfig — the same path registry pulls take.
+func loadOCIFixture(t *testing.T, name string) oci.Config {
+	t.Helper()
+	b, err := os.ReadFile("testdata/oci-fixtures/" + name)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	cfg, err := oci.ParseConfig(bytesReader(b))
+	if err != nil {
+		t.Fatalf("ParseConfig %s: %v", name, err)
+	}
+	return cfg
+}
+
+func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
+
+func stringSliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
