@@ -4103,6 +4103,30 @@ func (p Plan) JobsAllowed() bool {
 	return l.JobsAllowed
 }
 
+// PlanIndex returns the canonical 0..3 integer index used to key
+// the per-plan cap arrays (JobMaxPerAccount, JobRAMMB, …):
+//
+//	0=Free 1=Hobby 2=Pro 3=Scale. Used by the sched engine's
+//
+// dispatch tick + admission ledger when reading per-plan caps.
+// Unknown / empty plan values return 0 (Free) so a defensive
+// caller can never index out of bounds. Kept here (next to
+// Plan.JobsAllowed) so the per-plan math has a single home.
+func (p Plan) PlanIndex() int {
+	switch p {
+	case PlanFree:
+		return 0
+	case PlanHobby:
+		return 1
+	case PlanPro:
+		return 2
+	case PlanScale:
+		return 3
+	default:
+		return 0
+	}
+}
+
 // StaticEgressIPAllowed (ADR-119) reports whether the plan may pin
 // a static egress IP to an app. Scale-only in v1 — the B2B
 // allowlist use case is a paid Scale concern, mirroring how
