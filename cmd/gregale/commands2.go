@@ -694,7 +694,10 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 //       falling through to DeployTarball — DeployTarball would otherwise
 //       404 at apid with the less informative "no such app" message, and
 //       the customer would never learn that the slug is taken globally.
-//   - CreateApp → non-409 error → propagated.
+//   - CreateApp → non-409 error → returned unwrapped; the caller's
+//     printErr prefix is the single user-facing message. Wrapping the
+//     APIError here would produce a confusing double-prefix like
+//     "Could not create or fetch app: could not create app: ...".
 //
 // The probe costs one extra round-trip on the slug-conflict path, which
 // is rare in normal use (zero-config deploy on a fresh repo is the only
@@ -705,7 +708,7 @@ func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequ
 	} else {
 		var ae *APIError
 		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
-			return fmt.Errorf("could not create app: %w", err)
+			return err
 		}
 		// Conflict: probe with GetApp to disambiguate same-account vs
 		// other-account ownership. The server's loadAppAndPreflight
@@ -725,7 +728,7 @@ func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequ
 				upd.AppProtocol = appProtocolPtr
 			}
 			if _, err := client.UpdateApp(ctx, req.Slug, upd); err != nil {
-				return fmt.Errorf("could not update existing app's flags: %w", err)
+				return err
 			}
 		}
 		return nil
@@ -1391,20 +1394,35 @@ func cmdDeployTarball(args []string) int {
 		// deploy budget.
 		planCapMB := defaultZeroConfigSourceCapMB
 		if wcli, werr := authedClient(); werr == nil {
-			if acct, werr := wcli.Whoami(context.Background()); werr == nil {
+			// 5-second budget: Whoami is a tiny JSON GET, but a flaky
+			// apid used to hang the CLI for the full HTTP timeout (30s)
+			// before falling back to the floor. Bound it explicitly so
+			// the zero-config deploy stays snappy on the unhappy path.
+			whoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if acct, werr := wcli.Whoami(whoCtx); werr == nil {
 				planCapMB = api.MustLimitsFor(api.Plan(acct.Plan)).SourceTarballMaxMB
 			} else {
 				PrintWarn(osStderr, "Whoami round-trip for per-plan cap failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
 			}
+			cancel()
 		} else {
 			PrintWarn(osStderr, "authed client for Whoami round-trip failed (%v); using %d MB Free/Hobby floor", werr, planCapMB)
 		}
-		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
-		if err != nil {
-			return printErr("No deployable source found in "+filepath.Base(cwd), err)
-		}
-		switch detected {
-		case shapeFunction:
+		// Issue #1182 §3.3: only run the cwd auto-detect + auto-pack
+		// switch when no tarball was set by the git-archive branch
+		// above. The previous run unconditionally re-packed the
+		// working tree, silently overwriting the HEAD tarball and
+		// shipping uncommitted / untracked files despite the
+		// "deploying HEAD only" warning. With this guard the
+		// auto-pack branch is reachable only from the non-git /
+		// non-origin cwd-auto-pack fallback (existing behaviour).
+		if *tarball == "" {
+			detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
+			if err != nil {
+				return printErr("No deployable source found in "+filepath.Base(cwd), err)
+			}
+			switch detected {
+			case shapeFunction:
 			// An explicit --runtime / --handler on the CLI wins over
 			// the inferred value (customer may be overriding the
 			// default-extension→runtime map). The helper already
@@ -1453,6 +1471,7 @@ func cmdDeployTarball(args []string) int {
 			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
 			*tarball = path
 			resolvedShape = shapeApp
+			}
 		}
 	}
 

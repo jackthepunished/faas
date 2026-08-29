@@ -2123,7 +2123,9 @@ func TestCreateOrFetchApp_409OtherAccount_FailsHard(t *testing.T) {
 
 // TestCreateOrFetchApp_Non409ErrorPropagates pins that non-409 errors
 // (validation, server-side capacity, etc.) bubble up unchanged
-// instead of being misclassified as a slug conflict.
+// instead of being misclassified as a slug conflict. The helper
+// returns the APIError unwrapped so the caller's single printErr
+// prefix is the user-facing message — no double-wrap.
 func TestCreateOrFetchApp_Non409ErrorPropagates(t *testing.T) {
 	var sawGet bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2149,7 +2151,9 @@ func TestCreateOrFetchApp_Non409ErrorPropagates(t *testing.T) {
 	if sawGet {
 		t.Errorf("GetApp probe should NOT fire on a non-409 CreateApp error")
 	}
-	if !strings.Contains(err.Error(), "create app") {
-		t.Errorf("error should wrap 'could not create app', got: %v", err)
+	// The bare APIError renders as "<code>: <detail>" (apierror.go:21);
+	// the caller prefixes it once with "Could not create or fetch app".
+	if !strings.Contains(err.Error(), "validation_failed: bad slug") {
+		t.Errorf("error should carry the server's code:detail, got: %v", err)
 	}
 }

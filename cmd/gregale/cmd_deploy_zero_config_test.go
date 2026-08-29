@@ -12,7 +12,10 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -329,3 +332,141 @@ func TestDeployZeroConfig_JSONShape(t *testing.T) {
 		t.Errorf("--json stdout leaked human deploy log: %s", out)
 	}
 }
+
+// TestDeployZeroConfig_DirtyTree_OnlyCommitsShipped pins the
+// headline guarantee of the refactored zero-config path: when
+// the working tree has uncommitted + untracked changes, the
+// deployed tarball contains ONLY the committed HEAD tree (issue
+// #1182 §3.3). Pre-fix, the cwd-auto-pack switch unconditionally
+// re-packed the working tree and overwrote the git-archive
+// tarball, so the dirty-warning was a lie and untracked files
+// shipped to the build. The fix wraps the switch in
+// `if *tarball == ""` so git-archive's tarball is the only thing
+// the multipart upload sends.
+func TestDeployZeroConfig_DirtyTree_OnlyCommitsShipped(t *testing.T) {
+	repo := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	// Commit a tracked file with a known committed body.
+	committed := filepath.Join(repo, "COMMITTED.md")
+	if err := os.WriteFile(committed, []byte("committed content\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile COMMITTED.md: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "COMMITTED.md"},
+		{"commit", "-q", "-m", "initial commit"},
+		{"remote", "add", "origin", "git@github.com:acme/dirty.git"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	// Now mutate the working tree:
+	//   1. untracked file UNTRACKED.txt (must NOT ship)
+	//   2. modify COMMITTED.md so it differs from HEAD (must NOT ship)
+	if err := os.WriteFile(filepath.Join(repo, "UNTRACKED.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile UNTRACKED.txt: %v", err)
+	}
+	if err := os.WriteFile(committed, []byte("modified working-tree content\n"), 0o644); err != nil {
+		t.Fatalf("overwrite COMMITTED.md: %v", err)
+	}
+	withCwd(t, repo)
+
+	// Stub server captures the multipart `source` part so the test
+	// can untar it and assert exactly which files shipped.
+	var sourceBytes []byte
+	stub := newZeroConfigStubServer(t, func(w http.ResponseWriter, r *http.Request, z *zeroConfigStubServer) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == "POST":
+			z.gotCalls["create"]++
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a1", Slug: "dirty"})
+		case r.URL.Path == "/v1/apps/dirty/deployments" && r.Method == "POST":
+			z.gotCalls["deploy"]++
+			mr, err := r.MultipartReader()
+			if err != nil {
+				t.Errorf("multipart read: %v", err)
+				return
+			}
+			for {
+				p, err := mr.NextPart()
+				if err != nil {
+					break
+				}
+				if p.FormName() == "source" {
+					sourceBytes, _ = io.ReadAll(p)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: "dirty"})
+		default:
+			http.Error(w, "no", 404)
+		}
+	})
+	t.Setenv("FAAS_API", stub.srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball([]string{"--name", "dirty"}); code != 0 {
+		t.Fatalf("zero-config dirty-tree deploy exit = %d, want 0", code)
+	}
+	if len(sourceBytes) == 0 {
+		t.Fatalf("DeployTarball received empty `source` part")
+	}
+
+	// Untar the captured source bytes and assert the file set is
+	// EXACTLY the committed tree: COMMITTED.md with the committed
+	// body, and no UNTRACKED.txt. The cwd-auto-pack bug shipped
+	// UNTRACKED.txt and the modified COMMITTED.md body; this
+	// test fails on that regression.
+	gz, err := gzip.NewReader(bytes.NewReader(sourceBytes))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	sawCommitted := false
+	sawUntracked := false
+	var committedBody []byte
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Next: %v", err)
+		}
+		switch filepath.Base(h.Name) {
+		case "COMMITTED.md":
+			sawCommitted = true
+			committedBody, _ = io.ReadAll(tr)
+		case "UNTRACKED.txt":
+			sawUntracked = true
+		}
+	}
+	if !sawCommitted {
+		t.Errorf("expected COMMITTED.md in deployed tarball (HEAD-only); got set without it")
+	}
+	if sawUntracked {
+		t.Errorf("UNTRACKED.txt leaked into the deployed tarball; the cwd-auto-pack branch re-packed the working tree over the git-archive tarball")
+	}
+	if !bytes.Contains(committedBody, []byte("committed content")) {
+		t.Errorf("deployed COMMITTED.md body is not the HEAD commit; the working-tree overwrite leaked: %q", committedBody)
+	}
+	if bytes.Contains(committedBody, []byte("modified working-tree content")) {
+		t.Errorf("deployed COMMITTED.md body contains the working-tree modification; HEAD-only contract broken")
+	}
+}
+
+// Compile-time guard that ctx is imported even when --json path
+// doesn't use it (the dirty-tree test uses context.Background
+// implicitly via the SDK call).
+var _ = context.Background
