@@ -55,6 +55,15 @@ const (
 	// pkg/billing/paddle/webhook.go::parsePaddleEvent and surfaced
 	// via the billing.Event struct to apid.
 	ProviderPaddle = "paddle"
+	// ProviderResend is the source of Resend's `svix-id` header
+	// (issue #246 acceptance item 8). Resend uses Svix / Standard
+	// Webhooks — the verifier at pkg/mail/webhook_signature.go
+	// validates the svix-signature header against
+	// HMAC-SHA256(<svix-id>.<svix-timestamp>.<body>) and the
+	// apid webhook handler feeds the svix-id into CheckReplay
+	// so a redelivery is a no-op rather than a second
+	// bounce-handler invocation.
+	ProviderResend = "resend"
 )
 
 // TTL is the dedupe window. Matches the Stripe / Paddle signature

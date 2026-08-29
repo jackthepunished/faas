@@ -48,9 +48,24 @@ type server struct {
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
 	// for the v1 HMAC. Empty disables signature verification (dev mode).
 	stripeWebhookSecret string
+	// resendWebhookSecret is the Svix / Standard Webhooks signing
+	// secret Resend stamps on bounce / complaint deliveries
+	// (issue #246 acceptance item 8). Empty fails-closed: the
+	// resendWebhook handler returns 503 so a missing env var
+	// cannot silently accept unsigned events. Wired via
+	// WithResendWebhookSecret from cmd/apid/main.go after
+	// the sealed-env loader has resolved the value.
+	resendWebhookSecret string
 	// mailer emits the dunning + quota-warning emails. nil falls back
 	// to the noop sender so callers never need to nil-check.
 	mailer Mailer
+	// mailBounce dispatches Resend bounce / complaint events into
+	// the suppression + dunning pipeline (issue #246 acceptance
+	// item 8). Wired via WithMailBounce from cmd/apid/main.go
+	// after the state store + audit auditor are loaded; the
+	// resendWebhook handler returns 500 if it's nil at request
+	// time so a misconfiguration is loud rather than silent.
+	mailBounce mailBounceHandler
 	// githubd is apid's handle to the githubd daemon (ADR-012). Never nil:
 	// slice 1 default is stubGithubdClient; slice 7 swaps for a live dial.
 	githubd GithubdClient
@@ -408,6 +423,28 @@ func (s *server) WithSBOMRoot(root string) *server {
 // (the legacy stripe.VerifySignature + BillingPortalURL template).
 func (s *server) WithBillingProvider(p billing.Provider) *server {
 	s.billingProvider = p
+	return s
+}
+
+// WithResendWebhookSecret attaches the Svix / Standard Webhooks
+// signing secret Resend uses for bounce / complaint / delivery
+// events (issue #246 acceptance item 8). When empty the
+// resendWebhook handler fails closed with 503 — an unsigned
+// delivery cannot bypass the suppression + dunning pipeline.
+// cmd/apid/main.go resolves this from FAAS_MAIL_RESEND_WEBHOOK_SECRET.
+func (s *server) WithResendWebhookSecret(secret string) *server {
+	s.resendWebhookSecret = secret
+	return s
+}
+
+// WithMailBounce attaches the bounce handler the resendWebhook
+// route dispatches into (issue #246 acceptance item 8). In
+// production this is the meterd-owned *meter.BounceHandler;
+// tests inject a fake via the mailBounceHandler interface so
+// the route can be exercised without standing up a full
+// state.Store + audit auditor.
+func (s *server) WithMailBounce(h mailBounceHandler) *server {
+	s.mailBounce = h
 	return s
 }
 
@@ -1946,6 +1983,15 @@ func (s *server) handler() http.Handler {
 	// on either provider; the handler's 503 covers the wrong-provider
 	// case.
 	mux.HandleFunc("POST /v1/webhooks/paddle", s.paddleWebhook)
+
+	// Resend bounce/complaint/delivery webhook ingress (issue #246
+	// acceptance item 8). Mounted next to the Paddle route — both
+	// are HMAC-authenticated public POSTs and the fail-closed 503
+	// pattern is identical. The handler reads the raw body, verifies
+	// the Svix envelope, replay-checks against webhookdedupe, and
+	// dispatches to meter.BounceHandler. No auth middleware — the
+	// HMAC *is* the trust boundary.
+	mux.HandleFunc("POST /v1/webhooks/resend", s.resendWebhook)
 
 	// Operator admin surface (issue #98 / ADR-028). Auth lives in
 	// s.adminAllows (email allowlist via FAAS_ADMIN_EMAILS); handlers

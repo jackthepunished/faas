@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
 	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
@@ -997,6 +998,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (log-only until gap G4 is closed). Empty secret = dev mode (the
 	// webhook accepts unsigned payloads; never deploy this way).
 	stripeSecret := deps.getenv("STRIPE_WEBHOOK_SECRET")
+	// Issue #246 acceptance item 8: Resend webhook signing secret.
+	// Empty fails-closed (the handler returns 503). Operators on
+	// a box that does not need Resend integration can leave it
+	// unset — the route is mounted unconditionally and the
+	// fail-closed 503 is the safe default.
+	resendSecret := deps.getenv("FAAS_MAIL_RESEND_WEBHOOK_SECRET")
 	// Gap G4 closure (ADR-115): wire the env-driven mail factory so
 	// prod boots with FAAS_MAIL_TRANSPORT=resend and emails go out
 	// for real. Tests + dev can keep mailer nil and the factory
@@ -1112,6 +1119,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"github_enabled", oauthCfg.GitHub.Enabled())
 	}
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	srv.WithResendWebhookSecret(resendSecret)
+	// Issue #246 acceptance item 8: wire the meterd-owned bounce
+	// handler so Resend bounce / complaint events feed the
+	// suppression + dunning pipeline. The local-store adapter
+	// runs the bounce handler in-process (apid already has the
+	// store + audit auditor wired). A future PR can swap this
+	// for an RPC adapter once meterd is split onto a separate
+	// node and the pipeline ships over pg_notify.
+	srv.WithMailBounce(meter.NewLocalBounceHandler(store, srv.audit, log))
 	// ADR-132: seed the hot runtime configuration snapshot from the
 	// deployment environment, then reconcile durable operator overrides
 	// before any listener is exposed. Database state wins over the

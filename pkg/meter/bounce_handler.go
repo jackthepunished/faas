@@ -230,6 +230,18 @@ func (h *BounceHandler) HandleMailBounce(ctx context.Context, b MailBounce) erro
 // retrying.
 var ErrMailBounceIgnored = errors.New("meter: mail bounce ignored")
 
+// NewLocalBounceHandler wires the bounce handler against the
+// local state.Store + BounceAuditor. Used by cmd/apid so the
+// /v1/webhooks/resend route can dispatch into the suppression +
+// dunning pipeline without an RPC roundtrip (the meterd process
+// is co-located with apid on a single control-plane box today).
+// The seam takes a BounceAuditor interface (not *audit.Auditor)
+// so test code can inject a recordingAuditor — same consumer-
+// package pattern pkg/mail.SuppressionChecker uses.
+func NewLocalBounceHandler(store state.Store, aud BounceAuditor, log *slog.Logger) *BounceHandler {
+	return &BounceHandler{Store: store, Auditor: aud, Log: log}
+}
+
 // auditKindForBounce maps the closed-set Reason to the audit
 // kind string. Kept inline so a typo in the kind is caught by
 // the bounce handler tests rather than discovered by an SRE

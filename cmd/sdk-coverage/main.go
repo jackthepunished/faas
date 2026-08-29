@@ -49,6 +49,7 @@ const (
 var routeExclude = map[string]bool{
 	"GET /v1/account/dpa":        true, // public markdown (no Bearer; SDK consumers don't render HTML)
 	"POST /v1/webhooks/stripe":   true, // HMAC-signed webhook; outside the Bearer-auth surface
+	"POST /v1/webhooks/resend":   true, // Svix-signed webhook (issue #246 / ADR-115); outside the Bearer-auth surface
 	"GET /v1/openapi.yaml":       true, // metadata
 	"GET /v1/openapi.json":       true, // metadata
 	"POST /v1/cli-auth/code":     true, // anonymous device-code (CLI uses wrapper)
