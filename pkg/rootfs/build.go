@@ -694,6 +694,14 @@ func NormalizeFunctionHandler(staging, handlerPath string) error {
 	} else if sourceInfo.IsDir() {
 		return fmt.Errorf("rootfs: function source %q is a directory", source)
 	}
+	if clean == "/app/handler" {
+		// Go's source-build artifact is already the executable; avoid reading
+		// the binary into memory just to apply the stable handler alias.
+		if err := os.Rename(source, target); err != nil {
+			return fmt.Errorf("rootfs: alias function handler %s as %s: %w", source, target, err)
+		}
+		return nil
+	}
 	data, err := os.ReadFile(source)
 	if err != nil {
 		return fmt.Errorf("rootfs: read function source %q: %w", source, err)
