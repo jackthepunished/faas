@@ -1,0 +1,15 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["/app/server"],
+    "User": "1001",
+    "Healthcheck": {
+      "Test": ["CMD", "/bin/check"],
+      "Interval": 30,
+      "Timeout": 5,
+      "Retries": 3,
+      "StartPeriod": 10
+    }
+  }
+}

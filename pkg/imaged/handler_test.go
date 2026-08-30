@@ -1609,7 +1609,10 @@ func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
 		WorkingDir: "/app",
 		Env:        map[string]string{"PORT": "3000"},
 	}
-	manifest := manifestFromImageConfig(cfg)
+	manifest, err := manifestFromImageConfig(cfg)
+	if err != nil {
+		t.Fatalf("manifestFromImageConfig: %v", err)
+	}
 
 	wantArgv := []string{"/app/server"}
 	if !equalStrings(manifest.Entrypoint, wantArgv) {
@@ -1666,27 +1669,33 @@ func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
 func TestManifestFromImageConfig_NoCmdYieldsEmptyEntrypoint(t *testing.T) {
 	// oci.ImageConfig has only Cmd/Env/WorkingDir/ExposedPorts. An image
 	// without Cmd is the canonical misconfiguration this test pins.
+	//
+	// M-1 (ADR-136 §Decision 5): the helper now fails fast with
+	// oci.ErrImageManifestInvalid when neither Entrypoint nor Cmd is
+	// declared. The legacy expectation was "empty Entrypoint + downstream
+	// Validate rejection" — both are now collapsed into a single
+	// canonical error at the helper boundary so the deploy path
+	// surfaces a stable error code (mirrors local_oci.go's behaviour).
 	cfg := oci.ImageConfig{
 		// Cmd intentionally absent. WorkingDir + Env are present to
 		// prove the function doesn't crash on the other fields.
 		WorkingDir: "/app",
 		Env:        map[string]string{"PORT": "3000"},
 	}
-	manifest := manifestFromImageConfig(cfg)
-
-	if len(manifest.Entrypoint) != 0 {
-		t.Errorf("Entrypoint = %v, want empty (cfg.Cmd absent)", manifest.Entrypoint)
+	manifest, err := manifestFromImageConfig(cfg)
+	if err == nil {
+		t.Fatal("manifestFromImageConfig(no Cmd) = nil err; want ErrImageManifestInvalid")
 	}
-	// WorkingDir + Env still flow through — defensive-copy is preserved.
-	if manifest.WorkingDir != "/app" {
-		t.Errorf("WorkingDir = %q, want \"/app\"", manifest.WorkingDir)
+	if !errors.Is(err, oci.ErrImageManifestInvalid) {
+		t.Errorf("err = %v; want ErrImageManifestInvalid", err)
 	}
-	if manifest.Env["PORT"] != "3000" {
-		t.Errorf("Env[PORT] = %q, want \"3000\"", manifest.Env["PORT"])
+	// WorkingDir + Env still flow through on the error path? — no,
+	// the helper short-circuits at the Entrypoint/Cmd check before
+	// doing the env clone, so manifest is the zero value. Pin that.
+	if manifest.WorkingDir != "" {
+		t.Errorf("WorkingDir = %q, want zero (helper short-circuited)", manifest.WorkingDir)
 	}
-	if err := manifest.Validate(); err == nil {
-		t.Fatal("manifest.Validate() = nil, want non-nil for empty entrypoint")
-	} else if !strings.Contains(err.Error(), "empty entrypoint") {
-		t.Errorf("Validate error %q must mention \"empty entrypoint\"", err.Error())
+	if len(manifest.Env) != 0 {
+		t.Errorf("Env = %v, want nil (helper short-circuited)", manifest.Env)
 	}
 }

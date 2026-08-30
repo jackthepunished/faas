@@ -1,11 +1,11 @@
 package oci
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -28,45 +28,80 @@ type Layer struct {
 // Config is the subset of the OCI image config we need: the exec contract and
 // the ordered diff_ids that identify each layer bottom-to-top.
 type Config struct {
-	Env        []string // "KEY=VALUE" entries
+	Env        map[string]string // flattened "KEY=VALUE" entries
 	Entrypoint []string
 	Cmd        []string
 	WorkingDir string
 	User       string
-	DiffIDs    []string // rootfs.diff_ids, bottom-to-top
+	// Healthcheck mirrors the OCI HEALTHCHECK shape; nil if absent
+	// (the field is only populated when the image declares one).
+	// Runtime wiring of the polling loop lands in M-2 (ADR-X5).
+	Healthcheck *ImageHealthcheck
+	// StopSignal mirrors OCI STOPSIGNAL (default "SIGTERM").
+	// Runtime wiring in M-2 (ADR-X3 lifecycle contract).
+	StopSignal string
+	// StopGracePeriodS mirrors OCI StopGracePeriodSeconds. Runtime
+	// wiring in M-2.
+	StopGracePeriodS int
+	DiffIDs          []string // rootfs.diff_ids, bottom-to-top
 }
 
-// ociConfigJSON matches the on-disk OCI image config document.
-type ociConfigJSON struct {
-	Config struct {
-		Env        []string `json:"Env"`
-		Entrypoint []string `json:"Entrypoint"`
-		Cmd        []string `json:"Cmd"`
-		WorkingDir string   `json:"WorkingDir"`
-		User       string   `json:"User"`
-	} `json:"config"`
-	RootFS struct {
-		Type    string   `json:"type"`
-		DiffIDs []string `json:"diff_ids"`
-	} `json:"rootfs"`
+// ImageHealthcheck is the OCI HEALTHCHECK shape projected onto a
+// platform-friendly type. Durations are seconds at the wire boundary
+// (registries consistently emit integer seconds; conversion to time.Duration
+// happens at the AppManifest projection site, not here).
+//
+// Test[0] is "CMD", "CMD-SHELL", or "NONE" per Docker semantics; the
+// remaining Test entries are argv to the check command. Empty Test
+// means the image didn't declare one.
+//
+// Field semantics (Docker defaults):
+//   - Interval     30s — poll cadence after StartPeriod.
+//   - Timeout      30s — per-probe HTTP exec timeout.
+//   - Retries       3  — consecutive failure count to mark unhealthy.
+//   - StartPeriod   0s — startup grace during which failures don't
+//     count (Docker 17.05+).
+//
+// ADR-136 §Decision 3 records the rationale for surfacing these.
+type ImageHealthcheck struct {
+	Test         []string
+	IntervalS    int
+	TimeoutS     int
+	Retries      int
+	StartPeriodS int
 }
 
-// ParseConfig reads an OCI image config JSON document.
+// ParseConfig reads an OCI/Docker image config JSON document.
+//
+// Behaviour:
+//   - Accepts both Docker v2 flat fields (top-level Cmd/Env/etc.) and
+//     the nested `config` envelope (OCI image-config). Flat values win
+//     when both are present (preserves historical preference; see
+//     ADR-136 §Decision 1).
+//   - rootfs.type, when set, must be "layers"; anything else is
+//     rejected (we don't model raw single-blob rootfs).
+//
+// The shared raw decoder lives in oci.go (rawConfig); this function
+// projects the resolved fields onto the rich oci.Config projection.
 func ParseConfig(r io.Reader) (Config, error) {
-	var doc ociConfigJSON
-	if err := json.NewDecoder(r).Decode(&doc); err != nil {
-		return Config{}, fmt.Errorf("oci: parse config: %w", err)
+	raw, err := decodeRaw(r)
+	if err != nil {
+		return Config{}, err
 	}
-	if doc.RootFS.Type != "" && doc.RootFS.Type != "layers" {
-		return Config{}, fmt.Errorf("oci: unsupported rootfs type %q", doc.RootFS.Type)
+	if err := raw.validate(); err != nil {
+		return Config{}, err
 	}
+	f := raw.resolved()
 	return Config{
-		Env:        doc.Config.Env,
-		Entrypoint: doc.Config.Entrypoint,
-		Cmd:        doc.Config.Cmd,
-		WorkingDir: doc.Config.WorkingDir,
-		User:       doc.Config.User,
-		DiffIDs:    doc.RootFS.DiffIDs,
+		Env:              envSliceToMap(f.Env),
+		Entrypoint:       f.Entrypoint,
+		Cmd:              f.Cmd,
+		WorkingDir:       f.WorkingDir,
+		User:             f.User,
+		Healthcheck:      healthcheckFromRaw(raw.resolvedHealthcheck()),
+		StopSignal:       raw.resolvedStopSignal(),
+		StopGracePeriodS: stopGraceFromRaw(raw),
+		DiffIDs:          raw.RootFS.DiffIDs,
 	}, nil
 }
 
@@ -96,18 +131,59 @@ func LayersAboveBase(baseDiffIDs, appDiffIDs []string) ([]string, error) {
 // ManifestFromConfig derives the guest app.json contract from the OCI config
 // (spec §4.6: imaged injects /etc/faas/app.json). Entrypoint is Entrypoint+Cmd
 // per OCI semantics; Env is flattened to a map; User maps to the guest user.
+// Healthcheck/StopSignal/StopGracePeriod are surfaced onto the AppManifest
+// additively (ADR-136 §Decision 3-4) — runtime wiring of those fields lands
+// in M-2; this function only projects the wire shape.
 func ManifestFromConfig(cfg Config) (api.AppManifest, error) {
+	if len(cfg.Entrypoint) == 0 && len(cfg.Cmd) == 0 {
+		return api.AppManifest{}, fmt.Errorf("%w: image declares neither Entrypoint nor Cmd", ErrImageManifestInvalid)
+	}
 	argv := append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
+	// Short-circuit on argv[0]=="" with the canonical sentinel — a
+	// registry manifest whose Entrypoint/Cmd contains an empty string
+	// at index 0 is the same shape of failure as "neither declared",
+	// and must surface as ErrImageManifestInvalid so the imaged
+	// handler persists the canonical code (api.CodeImageManifestInvalid)
+	// rather than the plain-string Validate() error. Same wrap
+	// pattern as the "neither Entrypoint nor Cmd" guard above.
+	if len(argv) > 0 && argv[0] == "" {
+		return api.AppManifest{}, fmt.Errorf("%w: argv[0] is empty (Entrypoint[0]=%q, Cmd[0]=%q)", ErrImageManifestInvalid, safeHead(cfg.Entrypoint), safeHead(cfg.Cmd))
+	}
 	m := api.AppManifest{
 		Entrypoint: argv,
-		Env:        envSliceToMap(cfg.Env),
+		Env:        cfg.Env, // already a map at this layer; ParseConfig flattens once
 		WorkingDir: cfg.WorkingDir,
 		User:       normalizeUser(cfg.User),
+	}
+	if cfg.Healthcheck != nil {
+		m.Healthcheck = &api.AppManifestHealthcheck{
+			Test:         append([]string(nil), cfg.Healthcheck.Test...),
+			IntervalS:    cfg.Healthcheck.IntervalS,
+			TimeoutS:     cfg.Healthcheck.TimeoutS,
+			Retries:      cfg.Healthcheck.Retries,
+			StartPeriodS: cfg.Healthcheck.StartPeriodS,
+		}
+	}
+	if cfg.StopSignal != "" {
+		m.StopSignal = cfg.StopSignal
+	}
+	if cfg.StopGracePeriodS > 0 {
+		m.StopGracePeriod = time.Duration(cfg.StopGracePeriodS) * time.Second
 	}
 	if err := m.Validate(); err != nil {
 		return api.AppManifest{}, fmt.Errorf("oci: derive manifest: %w", err)
 	}
 	return m, nil
+}
+
+// safeHead returns the first element of s or "" if s is empty. Used
+// only for diagnostic formatting in the ErrImageManifestInvalid
+// error string — never used as a guard.
+func safeHead(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return s[0]
 }
 
 // envSliceToMap converts OCI "KEY=VALUE" entries to a map. Later entries win, and
@@ -126,6 +202,33 @@ func envSliceToMap(env []string) map[string]string {
 		m[k] = v
 	}
 	return m
+}
+
+// healthcheckFromRaw projects a rawHealthcheck onto the public
+// ImageHealthcheck. Returns nil when the raw is nil (image did not
+// declare a HEALTHCHECK).
+func healthcheckFromRaw(r *rawHealthcheck) *ImageHealthcheck {
+	if r == nil {
+		return nil
+	}
+	return &ImageHealthcheck{
+		Test:         append([]string(nil), r.Test...),
+		IntervalS:    r.IntervalS,
+		TimeoutS:     r.TimeoutS,
+		Retries:      r.Retries,
+		StartPeriodS: r.StartPeriodS,
+	}
+}
+
+// stopGraceFromRaw reads the OCI-spec StopGracePeriodSeconds value.
+// The OCI image-config spec only carries StopSignal; StopGracePeriod
+// lives on the OCI *runtime* spec, not the image spec. This helper
+// returns 0 today and exists so M-2's lifecycle ADR can wire a
+// platform-side source (operator override, per-plan cap, etc.) into
+// the projection without re-decoding the raw config. ADR-136 §Decision
+// 3 records the carve-out.
+func stopGraceFromRaw(_ *rawConfig) int {
+	return 0
 }
 
 // normalizeUser maps an OCI User field to a guest user name. A bare numeric uid

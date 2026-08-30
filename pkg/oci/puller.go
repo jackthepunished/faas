@@ -21,9 +21,31 @@ import (
 // Field naming follows the OCI image config spec
 // (https://github.com/opencontainers/image-spec/blob/main/config.md).
 type ImageConfig struct {
-	Cmd        []string          // → AppManifest.Entrypoint
-	Env        map[string]string // "KEY" → "VALUE"; imaged flattens to AppManifest.Env
-	WorkingDir string            // → AppManifest.WorkingDir
+	// Entrypoint is the image's ENTRYPOINT argv (Docker v2 + OCI).
+	// Joined with Cmd when projecting onto AppManifest.Entrypoint.
+	// Pre-M-1 silently dropped on the registry path.
+	Entrypoint []string
+	// Cmd is the image's CMD argv; appended to Entrypoint per OCI
+	// semantics. Already populated pre-M-1.
+	Cmd []string
+	// Env flattened to a map. Pre-M-1 dropped `=VALUE`-style keys
+	// (commit 3 fixed that).
+	Env map[string]string
+	// WorkingDir → AppManifest.WorkingDir.
+	WorkingDir string
+	// User is the image-declared USER (numeric only, ADR-136 §Decision 5;
+	// named users are deferred to M-3). Pre-M-1 silently dropped on the
+	// registry path.
+	User string
+	// Healthcheck mirrors the OCI HEALTHCHECK shape when present.
+	// Runtime wiring lands in M-2; M-1 surfaces the field for the
+	// fixture harness and the M-3 follow-on.
+	Healthcheck *ImageHealthcheck
+	// StopSignal mirrors the OCI STOPSIGNAL value. Runtime wiring in M-2.
+	StopSignal string
+	// StopGracePeriod mirrors the OCI StopGracePeriodSeconds value
+	// (integer seconds). Runtime wiring in M-2.
+	StopGracePeriodS int
 	// ExposedPorts is the set of ports the image declares; we don't use them
 	// directly (the customer pins a port via the app's manifest) but parsing
 	// them keeps a future "expose-all" mode cheap.

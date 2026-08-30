@@ -3096,6 +3096,16 @@ const (
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
 
+	// MaxAppManifestStopGracePeriod is the gross upper bound on the
+	// AppManifest.StopGracePeriod field (issue #1186 workstream A.4 /
+	// ADR-136 §Decision 4). M-1 / OCI image-config correctness only
+	// projects the value onto the manifest; runtime enforcement lands
+	// in M-2 (ADR-X3 lifecycle contract), which may tighten per-plan.
+	// Lives in this table (limits.go) per CLAUDE.md's "Every plan
+	// quota/limit lives in this one table" rule, never inline at the
+	// point of use.
+	MaxAppManifestStopGracePeriod = 5 * time.Minute
+
 	// StreamingStatus is the per-request classification emitted via
 	// the Streaming-Status response header (ADR-102 D1/D2). The
 	// canonical wire values are the lower-case string forms of the

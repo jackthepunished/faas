@@ -1,0 +1,13 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "Cmd": ["/flat/cmd"],
+  "Env": ["FROM=flat"],
+  "Entrypoint": ["/flat/entrypoint"],
+  "config": {
+    "Cmd": ["/nested/cmd"],
+    "Env": ["FROM=nested"],
+    "WorkingDir": "/nested/dir",
+    "User": "nested-user"
+  }
+}

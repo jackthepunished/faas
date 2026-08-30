@@ -33,6 +33,7 @@ export type { AppErrorSummaryItem } from './models/AppErrorSummaryItem.js';
 export type { AppliedBuild } from './models/AppliedBuild.js';
 export type { ApplyResponse } from './models/ApplyResponse.js';
 export type { AppManifest } from './models/AppManifest.js';
+export type { AppManifestHealthcheck } from './models/AppManifestHealthcheck.js';
 export type { AppMetricsResponse } from './models/AppMetricsResponse.js';
 export type { AppOpenAPIImportDryRunResponse } from './models/AppOpenAPIImportDryRunResponse.js';
 export type { AppOpenAPIImportResponse } from './models/AppOpenAPIImportResponse.js';
@@ -308,6 +309,7 @@ export type { SweepStuckBuildsResponse } from './models/SweepStuckBuildsResponse
 export type { TemplateView } from './models/TemplateView.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './models/TenantSurfaceResponse.js';
+export type { TestAlertPresetResponse } from './models/TestAlertPresetResponse.js';
 export type { ThrottlePreviewRow } from './models/ThrottlePreviewRow.js';
 export type { ThrottleSuggestionRow } from './models/ThrottleSuggestionRow.js';
 export type { ThrottleSuggestionsResponse } from './models/ThrottleSuggestionsResponse.js';
