@@ -549,3 +549,43 @@ func TestPg_ClaimInvocationWithCap_HappyPath(t *testing.T) {
 		t.Errorf("quota = cap=%d inflight=%d, want 10/1", cap, inflight)
 	}
 }
+
+// TestPg_ClaimInvocationWithCap_Errors pins the four error branches
+// of ClaimInvocationWithCap that the happy-path test does not
+// exercise (PR-B coverage push — the lookup miss, the cap-exhausted
+// branch, and the not-pending transition miss).
+func TestPg_ClaimInvocationWithCap_Errors(t *testing.T) {
+	s, ctx, appID, acctID := seedInvocationPg(t)
+	missingID := "00000000-0000-0000-0000-000000000001"
+
+	// 1. Invocation does not exist → ErrNotFound (covers the
+	//    pgx.ErrNoRows branch on the account_id lookup).
+	if _, err := s.ClaimInvocationWithCap(ctx, missingID, "inst-X", 30, 5); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("missing id err = %v, want ErrNotFound", err)
+	}
+
+	// 2. Cap is 0 → ErrQuotaExceeded (the CAS rejects on
+	//    current_inflight < 0 = false). Lazy-inserts the quota row
+	//    at max=0; subsequent claim has nothing to do but reject.
+	inv, err := s.EnqueueInvocation(ctx, state.Invocation{
+		AppID: appID, AccountID: acctID, Source: state.InvocationQueue,
+		Method: "POST", Path: "/capzero", Payload: json.RawMessage(`{}`),
+		DueAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueInvocation: %v", err)
+	}
+	if _, err := s.ClaimInvocationWithCap(ctx, inv.ID, "", 30, 0); !errors.Is(err, state.ErrQuotaExceeded) {
+		t.Errorf("cap=0 err = %v, want ErrQuotaExceeded", err)
+	}
+
+	// 3. RetryQueueDeadLetter on a pending row → ErrNotFound
+	//    (state != dead_letter guard).
+	if _, err := s.RetryQueueDeadLetter(ctx, acctID, inv.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("RetryQueueDeadLetter(pending) = %v, want ErrNotFound", err)
+	}
+	// 4. RetryQueueDeadLetter on a missing row → ErrNotFound.
+	if _, err := s.RetryQueueDeadLetter(ctx, acctID, missingID); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("RetryQueueDeadLetter(missing) = %v, want ErrNotFound", err)
+	}
+}
