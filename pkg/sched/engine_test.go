@@ -1969,6 +1969,55 @@ func TestEngineEvict_Destroys(t *testing.T) {
 	}
 }
 
+// TestEngineParkAppSnapshotsRunningInstance pins the app-level park contract:
+// once apid has changed the app to evicted_cold, schedd must perform the
+// instance lifecycle work instead of leaving a RUNNING row behind. The
+// operation is also idempotent so a redelivered notification is harmless.
+func TestEngineParkAppSnapshotsRunningInstance(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	parked := state.AppEvictedCold
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &parked}); err != nil {
+		t.Fatalf("UpdateApp parked: %v", err)
+	}
+
+	acted, err := e.ParkApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("ParkApp: %v", err)
+	}
+	if acted != 1 {
+		t.Fatalf("ParkApp acted = %d, want 1", acted)
+	}
+	if vmm.snapshots != 1 {
+		t.Errorf("snapshots = %d, want 1", vmm.snapshots)
+	}
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateParked) {
+		t.Fatalf("instance state = %q, want parked", row.State)
+	}
+
+	acted, err = e.ParkApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("idempotent ParkApp: %v", err)
+	}
+	if acted != 0 {
+		t.Errorf("idempotent ParkApp acted = %d, want 0", acted)
+	}
+	if vmm.snapshots != 1 {
+		t.Errorf("idempotent snapshots = %d, want 1", vmm.snapshots)
+	}
+}
+
 func TestEngineReportActivity(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)

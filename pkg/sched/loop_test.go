@@ -75,6 +75,38 @@ func TestHandleSnapshotPrime(t *testing.T) {
 	}
 }
 
+// TestHandleParkedAppNotification dispatches the app_changed parked event to
+// the instance lifecycle owner. This is the regression test for the original
+// bug, where the event was only logged and the VM remained RUNNING.
+func TestHandleParkedAppNotification(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 256, 2)
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	parked := state.AppEvictedCold
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &parked}); err != nil {
+		t.Fatalf("UpdateApp parked: %v", err)
+	}
+
+	loop := NewLoop(nil, engine, testLog())
+	loop.handleNotification(context.Background(), db.Notification{
+		Channel: db.NotifyAppChanged,
+		Payload: `{"kind":"parked","app_id":"` + app.ID + `"}`,
+	})
+
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateParked) {
+		t.Fatalf("instance state = %q, want parked", row.State)
+	}
+}
+
 // TestHandleNotificationRejectsBadInput covers the dispatch guards: malformed or
 // incomplete payloads must not panic and must not act.
 func TestHandleNotificationRejectsBadInput(t *testing.T) {

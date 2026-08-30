@@ -4191,6 +4191,101 @@ func (e *Engine) ParkWithReason(ctx context.Context, instanceID, reason string) 
 	return nil
 }
 
+// ParkApp tears down every live instance of an app whose lifecycle has already
+// been changed to evicted_cold by apid. The app-level park endpoint is
+// asynchronous: apid owns the app status write, while schedd owns instance
+// snapshots, VM destruction, and instance-state transitions.
+//
+// The operation is deliberately idempotent. A duplicate notification, a
+// retry, or the periodic reconciliation sweep may all call this method. The
+// per-app lock serializes it with Wake/Park, and the instance is re-read under
+// that lock before each action so a concurrent lifecycle change cannot cause a
+// second snapshot or destroy.
+//
+// It returns the number of instances that were successfully moved out of a
+// live state. An app that was unparked before the notification was handled is
+// ignored; the status check prevents an old `parked` notification from
+// tearing down a newly-woken app.
+func (e *Engine) ParkApp(ctx context.Context, appID string) (int, error) {
+	if appID == "" {
+		return 0, fmt.Errorf("sched: park app: empty app id")
+	}
+
+	app, err := e.store.AppByID(ctx, appID)
+	if err != nil {
+		return 0, fmt.Errorf("sched: park app: load app %s: %w", appID, err)
+	}
+	// In the split-node topology every schedd receives the notification.
+	// Only the owner may mutate the app's instances. Empty owner/node values
+	// preserve the legacy single-box and pre-sharding test posture.
+	if e.ownerNodeID != "" && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+		return 0, nil
+	}
+	if app.Status != state.AppEvictedCold {
+		return 0, nil
+	}
+
+	release := e.lockApp(appID)
+	defer release()
+
+	// Re-check after acquiring the lock. A wake may have won the race with
+	// the notification and explicitly unparked the app while we waited.
+	app, err = e.store.AppByID(ctx, appID)
+	if err != nil {
+		return 0, fmt.Errorf("sched: park app: reload app %s: %w", appID, err)
+	}
+	if e.ownerNodeID != "" && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+		return 0, nil
+	}
+	if app.Status != state.AppEvictedCold {
+		return 0, nil
+	}
+
+	instances, err := e.store.ListInstancesForApp(ctx, appID)
+	if err != nil {
+		return 0, fmt.Errorf("sched: park app: list instances %s: %w", appID, err)
+	}
+
+	acted := 0
+	var errs []error
+	for _, candidate := range instances {
+		fresh, err := e.store.InstanceByID(ctx, candidate.ID)
+		if err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf("instance %s: reload: %w", candidate.ID, err))
+			continue
+		}
+
+		switch state.State(fresh.State) {
+		case state.StateRunning:
+			// snapshotAndPark owns the full RUNNING → SNAPSHOTTING →
+			// PARKED path and the resident-ledger release.
+			if err := e.snapshotAndPark(ctx, fresh); err != nil {
+				errs = append(errs, fmt.Errorf("instance %s: snapshot and park: %w", fresh.ID, err))
+				continue
+			}
+			acted++
+		case state.StateWaking, state.StateColdBooting:
+			// A wake drops appMu during the vmmd RPC. If the park
+			// notification wins that interleaving, destroy the in-flight
+			// VM and land the row in STOPPED; the wake's phase-4 re-read
+			// will then discard its result. This prevents an app parked
+			// during a cold wake from becoming RUNNING after the park.
+			if err := e.timedDestroy(ctx, fresh.NodeID, fresh.ID, DestroyTimeout); err != nil {
+				errs = append(errs, fmt.Errorf("instance %s: destroy in-flight wake: %w", fresh.ID, err))
+				continue
+			}
+			e.ledger.Release(fresh.ID)
+			e.transition(ctx, fresh.ID, fresh.AppID, state.StateStopped)
+			acted++
+		}
+	}
+
+	return acted, errors.Join(errs...)
+}
+
 // Evict destroys a RUNNING instance under RAM pressure (spec §4.3). Unlike Park
 // it does not snapshot — the next wake cold-boots (ADR-005), so the state lands
 // in STOPPED rather than PARKED.
