@@ -1,7 +1,7 @@
 // jobs.go is the ADR-099 / issue #1184 Workstream A foundation layer
 // for run-to-completion jobs. Three tables (jobs / job_runs / job_tasks)
-// land across migrations 00255, 00256, 00257, 00536, 00537, 00538, 00539,
-// 00540, 00541, 00542 — this file defines the Go-side domain types + the
+// land across migrations 00255, 00256, 00257, 00533, 00534, 00536, 00537,
+// 00538, 00539, 00540 — this file defines the Go-side domain types + the
 // JobStore sub-interface that PgStore and MemStore satisfy.
 //
 // Conventions mirror the cron / trigger sub-surfaces in this package:
@@ -33,14 +33,14 @@ import (
 )
 
 // --- Domain types (mirrors schema in migrations/00255, 00256, 00257,
-//     00536, 00537, 00538, 00539, 00540, 00541, 00542) --------------
+//     00533, 00534, 00536, 00537, 00538, 00539, 00540) --------------
 
-// Job is one row of public.jobs (migrations/00255 + 00542 for command).
+// Job is one row of public.jobs (migrations/00255 + 00534 for command).
 // Kind is the closed vocabulary ('app' | 'function') enforced by the
 // jobs_kind_check constraint; Status is ('active' | 'paused' | 'deleted')
 // enforced by jobs_status_check. EnvOverrides is jsonb so the customer-
 // facing knob is open-vocabulary; Command is the OCI entrypoint added
-// by 00542 (text[], capped at 64 entries by jobs_command_min_chk).
+// by 00534 (text[], capped at 64 entries by jobs_command_min_chk).
 //
 // All UUID columns are exposed as string to match the Cron precedent
 // (Cron.ID is string; the pgx conversion lives inside PgStore).
@@ -58,7 +58,7 @@ type Job struct {
 	Status         string // 'active' | 'paused' | 'deleted'
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
-	Command        []string // migrations/00542
+	Command        []string // migrations/00534
 }
 
 // JobRun is one row of public.job_runs (migrations/00255 + 00536 for
@@ -87,7 +87,7 @@ type JobRun struct {
 	CreatedAt       time.Time
 }
 
-// JobTask is one row of public.job_tasks (migrations/00255 + 00541 for
+// JobTask is one row of public.job_tasks (migrations/00255 + 00533 for
 // exit_code + next_attempt_at + relaxed CHECK constraints; 00536 for
 // lease_token + lease_expires_at + last_lease_node). The PK is the
 // composite (run_id, task_index) so the dispatch-tick SELECT FOR UPDATE
@@ -97,7 +97,7 @@ type JobRun struct {
 // ErrorMessage + ExitCode + NextAttemptAt + StartedAt + FinishedAt are
 // all nullable per schema. The CHECK constraints guarantee the
 // relationship between instance_id and status (queued ⇒ NULL;
-// claimed ⇒ NOT NULL; terminal ⇒ either, see migrations/00541).
+// claimed ⇒ NOT NULL; terminal ⇒ either, see migrations/00533).
 type JobTask struct {
 	RunID          string
 	TaskIndex      int
@@ -110,7 +110,7 @@ type JobTask struct {
 	StartedAt      *time.Time
 	FinishedAt     *time.Time
 	CreatedAt      time.Time
-	NextAttemptAt  *time.Time // migrations/00541 — retry backoff gate
+	NextAttemptAt  *time.Time // migrations/00533 — retry backoff gate
 	LeaseToken     *string    // migrations/00536
 	LeaseExpiresAt *time.Time // migrations/00536
 	LastLeaseNode  *string    // migrations/00536
@@ -216,7 +216,7 @@ type JobStore interface {
 	// JobCreate inserts a new job row. accountID is the owning tenant.
 	// name is the customer-facing slug (CHECK constraints on length +
 	// charset, see migrations/00255 jobs_name_check). command is the
-	// OCI entrypoint (migrations/00542, capped at 64 entries).
+	// OCI entrypoint (migrations/00534, capped at 64 entries).
 	// ramMB / taskTimeoutSec / maxParallelism / retryMax are clamped
 	// against the per-plan caps by the caller (apid) before this is
 	// invoked — this method does NOT enforce plan caps. envOverrides

@@ -30,8 +30,8 @@ import (
 // --- column-order contracts ----------------------------------------
 
 // jobSelectCols is the canonical column order for jobs. Keep in lock-
-// step with scanJobCols and the migrations 00255 + 00542 DDL. The
-// command column (00542) is the last entry so the SELECT list reads
+// step with scanJobCols and the migrations 00255 + 00534 DDL. The
+// command column (00534) is the last entry so the SELECT list reads
 // in schema-add order.
 const jobSelectCols = `id, account_id, kind, name, image_ref, ram_mb, task_timeout_s,
        max_parallelism, retry_max, env_overrides, status, created_at,
@@ -46,7 +46,7 @@ const jobRunSelectCols = `id, job_id, account_id, trigger_kind, env_overrides, t
        dead_letter_count, started_at, finished_at, created_at`
 
 // jobTaskSelectCols is the canonical column order for job_tasks.
-// Includes exit_code + next_attempt_at (00541), lease_token +
+// Includes exit_code + next_attempt_at (00533), lease_token +
 // lease_expires_at + last_lease_node (00536). The dispatch-tick
 // SELECT FOR UPDATE SKIP LOCKED in JobTaskClaimBatch uses this list
 // too — same row surface, same scan helper.
@@ -530,7 +530,7 @@ func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, er
 	row := s.pool.QueryRow(ctx,
 		`with counts as (
 		   select
-		     -- 00541 broadened the terminal vocabulary to
+		     -- 00533 broadened the terminal vocabulary to
 		     -- succeeded/failed/timeout/cancelled/oom. CR-E /
 		     -- code-review #2 round-5: the previous SUM arms did
 		     -- NOT include 'timeout' or 'oom', so reaped tasks

@@ -6613,15 +6613,15 @@ type CreateJobRequest struct {
 	// builds are — but not enforced at this layer.
 	ImageRef string `json:"image_ref"`
 	// Command is the OCI entrypoint. Capped at 64 entries
-	// by migrations/00542 jobs_command_min_chk.
+	// by migrations/00534 jobs_command_min_chk.
 	Command []string `json:"command"`
 	// EnvOverrides is the open-vocabulary jsonb map of
 	// environment variables to inject into every task of
 	// every run. Per-run overrides (env_overrides on
 	// CreateJobRunRequest) win at task-execution time.
 	EnvOverrides map[string]string `json:"env_overrides,omitempty"`
-	// RAMMB is the billable memory (migrations/00541 +
-	// 00542 jobs_command.sql + per-plan caps). 0 →
+	// RAMMB is the billable memory (migrations/00533 +
+	// 00534 jobs_command.sql + per-plan caps). 0 →
 	// handler applies Plan.JobRAMMB default.
 	RAMMB int `json:"ram_mb,omitempty"`
 	// TaskTimeoutSec is the per-task wall-clock deadline.
