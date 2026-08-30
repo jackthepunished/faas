@@ -1740,7 +1740,7 @@ update request_telemetry
 -- (ADR-115 §D.3, RFC 8058 follow-on). One row per (source,
 -- provider_event_id) so Resend's webhook redelivery dedupes to the
 -- same row instead of double-suppressing. The unique index is the
--- dedupe key. Schema lives in migrations/00539_mail_suppressions.sql.
+-- dedupe key. Schema lives in migrations/00562_mail_suppressions.sql.
 -- ---------------------------------------------------------------------------
 
 -- name: RecordMailSuppression :one
