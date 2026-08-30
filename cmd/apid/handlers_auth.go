@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -211,7 +212,7 @@ func (s *server) sessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
 		if err != nil || c.Value == "" {
-			http.Redirect(w, r, loginPath+"?next="+r.URL.Path, http.StatusFound)
+			http.Redirect(w, r, loginPath+"?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 			return
 		}
 		env, err := s.sessions.Verify(c.Value)

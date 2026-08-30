@@ -796,7 +796,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			IdleResetOnDestroy:  true,
 		},
 	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
-		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg)
+		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg,
+			jailer.VsockUDSSocketPath(instance))
 	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to

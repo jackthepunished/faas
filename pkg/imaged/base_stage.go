@@ -3,6 +3,7 @@ package imaged
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,7 +34,7 @@ import (
 // example, when OCI layers omitted the empty /proc and /sys mountpoints).
 // Keeping this in the sidecar makes upgrades self-healing even when the
 // remote image digest is unchanged and the old artifact is already cached.
-const baseLayoutVersion = "faas-base-layout-v2"
+const baseLayoutVersion = "faas-base-layout-v3"
 
 // BaseStageResult reports what EnsureBaseExt4 did. Skip=true means the
 // existing artifact matched the remote digest and was left untouched.
@@ -108,6 +109,10 @@ func (h *Handler) EnsureBaseExt4(
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: storageFor for base stage: %w", err)
 	}
+	guestInitDigest, err := guestInitBinaryDigest(h.guestInitPath)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: hash guest-init %q: %w", h.guestInitPath, err)
+	}
 
 	manifest, err := mp.PullManifest(ctx, ref)
 	if err != nil {
@@ -119,13 +124,15 @@ func (h *Handler) EnsureBaseExt4(
 		// backend can open; a missing base remains fail-closed below.
 		if rc, getErr := be.Get(ctx, baseKey); getErr == nil {
 			_ = rc.Close()
-			h.log.Warn("imaged: base manifest pull failed; using existing on-disk base image",
-				"ref", ref, "key", baseKey, "err", err)
-			return BaseStageResult{
-				OutImage:   outImage,
-				StorageKey: baseKey,
-				Skipped:    true,
-			}, nil
+			if baseSidecarGuestInitCurrent(ctx, be, digestKey, guestInitDigest) {
+				h.log.Warn("imaged: base manifest pull failed; using existing on-disk base image",
+					"ref", ref, "key", baseKey, "err", err)
+				return BaseStageResult{
+					OutImage:   outImage,
+					StorageKey: baseKey,
+					Skipped:    true,
+				}, nil
+			}
 		}
 		return BaseStageResult{}, fmt.Errorf("imaged: pull base manifest %s: %w", ref, err)
 	}
@@ -145,7 +152,7 @@ func (h *Handler) EnsureBaseExt4(
 	if haveRC, err := be.Get(ctx, digestKey); err == nil {
 		haveBytes, rerr := io.ReadAll(haveRC)
 		_ = haveRC.Close()
-		if rerr == nil && baseDigestSidecarMatches(string(haveBytes), wantDigest) {
+		if rerr == nil && baseDigestSidecarMatches(string(haveBytes), wantDigest, guestInitDigest) {
 			if rc, err := be.Get(ctx, baseKey); err == nil {
 				_ = rc.Close()
 				// A digest match proves the ext4 bytes are current, but
@@ -180,7 +187,7 @@ func (h *Handler) EnsureBaseExt4(
 	// ALL layers" path (builder-base / go124 / go124-alpine /
 	// base-debian-parent itself).
 	if parentRef != "" {
-		return h.ensureBaseExt4ParentRef(ctx, mp, manifest, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey, wantDigest, be)
+		return h.ensureBaseExt4ParentRef(ctx, mp, manifest, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey, wantDigest, guestInitDigest, be)
 	}
 
 	// --- Legacy "apply ALL layers" path ----------------------------
@@ -224,7 +231,7 @@ func (h *Handler) EnsureBaseExt4(
 		return BaseStageResult{}, fmt.Errorf("imaged: build base ext4: %w", err)
 	}
 
-	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest); err != nil {
+	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest, guestInitDigest); err != nil {
 		h.log.Warn("imaged: write base digest sidecar", "err", err)
 	}
 	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
@@ -249,8 +256,8 @@ func (h *Handler) EnsureBaseExt4(
 // (ADR-053). The sidecar is the source of truth for the
 // "did this base already stage?" check — re-fetching tens of
 // MB of layers on every daemon restart would be wasteful.
-func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.StorageBackend, digestKey, wantDigest string) error {
-	digestRC, err := openStringReader(baseDigestSidecarValue(wantDigest))
+func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.StorageBackend, digestKey, wantDigest, guestInitDigest string) error {
+	digestRC, err := openStringReader(baseDigestSidecarValueWithGuestInit(wantDigest, guestInitDigest))
 	if err != nil {
 		return fmt.Errorf("imaged: open digest sidecar: %w", err)
 	}
@@ -264,8 +271,59 @@ func baseDigestSidecarValue(configDigest string) string {
 	return configDigest + "\n" + baseLayoutVersion
 }
 
-func baseDigestSidecarMatches(have, want string) bool {
-	return strings.TrimSpace(have) == baseDigestSidecarValue(want)
+func baseDigestSidecarValueWithGuestInit(configDigest, guestInitDigest string) string {
+	value := baseDigestSidecarValue(configDigest)
+	if guestInitDigest != "" {
+		value += "\nguest-init-sha256=" + guestInitDigest
+	}
+	return value
+}
+
+func baseDigestSidecarMatches(have, want, guestInitDigest string) bool {
+	return strings.TrimSpace(have) == baseDigestSidecarValueWithGuestInit(want, guestInitDigest)
+}
+
+func baseSidecarGuestInitCurrent(ctx context.Context, be storage.StorageBackend, digestKey, guestInitDigest string) bool {
+	if guestInitDigest == "" {
+		return true
+	}
+	rc, err := be.Get(ctx, digestKey)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = rc.Close() }()
+	have, err := io.ReadAll(rc)
+	if err != nil {
+		return false
+	}
+	wantLine := "guest-init-sha256=" + guestInitDigest
+	for _, line := range strings.Split(string(have), "\n") {
+		if line == wantLine {
+			return true
+		}
+	}
+	return false
+}
+
+// guestInitBinaryDigest is part of the base freshness key. The guest-init
+// binary is injected as /sbin/init after the OCI layers are applied, so an OCI
+// config digest alone cannot prove that an existing ext4 contains the current
+// boot contract. Empty paths preserve the low-level test/legacy caller shape;
+// production always resolves a non-empty release path.
+func guestInitBinaryDigest(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY, 0) // #nosec G304 -- path is the daemon's configured guest-init binary.
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // ensureBaseExt4ParentRef is the ADR-053 staging path: ask vmmd
@@ -310,7 +368,7 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	mp oci.ManifestPuller,
 	manifest oci.Manifest,
 	ref, baseKey, digestKey, outImage string,
-	parentRef, parentBaseKey, wantDigest string,
+	parentRef, parentBaseKey, wantDigest, guestInitDigest string,
 	be storage.StorageBackend,
 ) (BaseStageResult, error) {
 	if h.vmmClient == nil {
@@ -424,7 +482,7 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref build base ext4: %w", err)
 	}
 
-	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest); err != nil {
+	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest, guestInitDigest); err != nil {
 		h.log.Warn("imaged: write base digest sidecar", "err", err)
 	}
 	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
