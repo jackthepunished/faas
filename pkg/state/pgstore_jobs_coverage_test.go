@@ -96,13 +96,29 @@ func pgJobsCreateJobTaskInstance(t *testing.T, pool *pgxpool.Pool, ctx context.C
 		depID, appID, now); err != nil {
 		t.Fatalf("pgJobsCreateJobTaskInstance deployments: %v", err)
 	}
+	nodeID := defaultLocalNodeID(t, ctx, pool)
 	row := pool.QueryRow(ctx,
-		`insert into instances (kind, job_id, app_id, deployment_id, state, ram_mb, mode)
-		 values ('job_task', $1::uuid, $2::uuid, $3::uuid, 'cold_booting', 256, 'job')
-		 returning id::text`, jobID, appID, depID)
+		`insert into instances (kind, job_id, app_id, deployment_id, node_id, state, ram_mb, mode)
+		 values ('job_task', $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'cold_booting', 256, 'job')
+		 returning id::text`, jobID, appID, depID, nodeID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		t.Fatalf("pgJobsCreateJobTaskInstance: %v", err)
+	}
+	return id
+}
+
+// defaultLocalNodeID returns the UUID of the local compute_node row that
+// migration 00024 inserts. The instances.node_id column is NOT NULL, so
+// every fixture that creates an instance row needs this ID.
+func defaultLocalNodeID(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(ctx,
+		`select id::text from compute_nodes where name = $1`,
+		state.DefaultLocalNodeName,
+	).Scan(&id); err != nil {
+		t.Fatalf("defaultLocalNodeID: %v", err)
 	}
 	return id
 }
