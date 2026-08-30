@@ -755,13 +755,60 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// fail-closed (ADR-115 §D5); the wrapped ErrMailerMisconfigured
 	// propagates here so the daemon refuses to boot instead of
 	// silently dropping email into slog.
+	//
+	// Issue #246 extends that contract from "credential missing" to
+	// "transport unselected": on a non-dev box, an unset or unknown
+	// FAAS_MAIL_TRANSPORT also fails closed via ErrMailUnsetInProd
+	// / ErrMailUnknownTransport. Operators who really do want mail
+	// in the journal can set FAAS_MAIL_TRANSPORT=log; developers
+	// iterating locally can set FAAS_DEV=1 to fall back to log when
+	// the transport is unset. Both escapes are documented in the
+	// boot hint below so the message names every escape hatch.
 	mailer := deps.mailer
 	if mailer == nil {
 		var err error
 		mailer, err = mail.SenderFromEnv(deps.getenv, log)
 		if err != nil {
-			return fmt.Errorf("meterd: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+			return fmt.Errorf("meterd: %w\n"+
+				"  fix one of:\n"+
+				"    - set FAAS_MAIL_TRANSPORT=resend (or postmark) plus FAAS_MAIL_FROM and the provider key in /etc/faas/sealed.env\n"+
+				"    - set FAAS_MAIL_TRANSPORT=log to keep mail in the journal\n"+
+				"    - set FAAS_DEV=1 on a dev/CI box where unset transport should resolve to log", err)
 		}
+	}
+	// PR #1191 fixup: wrap the transport with the decorator stack so
+	// the dunning timer's outbound mail is suppressed-aware + retries
+	// on 429/5xx. Without this a past-due customer bounces a
+	// Resend request and meterd's quota-tick loop sees the failure
+	// as a permanent error instead of retrying within the wall-clock
+	// budget. Tests inject deps.mailer (non-nil) so this block is
+	// skipped on the unit-test path.
+	if deps.mailer == nil && mailer != nil {
+		transportLabel := strings.ToLower(deps.getenv("FAAS_MAIL_TRANSPORT"))
+		mailer = &mail.SuppressingSender{
+			Inner: &mail.RetryingSender{
+				Inner:         mailer,
+				TransportName: transportLabel,
+				Log:           log,
+			},
+			Store: mailStoreCheckerAdapter{s: store},
+			Log:   log,
+		}
+	}
+
+	// Bulk-sender compliance (issue #246 item 4): the quota-warning
+	// template is the ONE outbound mail that carries a
+	// List-Unsubscribe header pair (RFC 8058). The URL must be an
+	// absolute http/https URL — anything else is a Gmail/Yahoo
+	// rejection path. Empty = dev box (header skipped, not
+	// substituted with a placeholder).
+	if unsub := deps.getenv("FAAS_NOTIFICATIONS_UNSUBSCRIBE_URL"); unsub != "" {
+		if err := mail.ValidateUnsubscribeURL(unsub); err != nil {
+			return fmt.Errorf("meterd: FAAS_NOTIFICATIONS_UNSUBSCRIBE_URL: %w", err)
+		}
+		meter.SetNotificationsUnsubscribeURL(unsub)
+		log.Info("meterd: notifications unsubscribe URL configured",
+			"len", len(unsub))
 	}
 
 	// FAAS_QUOTA_INTERVAL / FAAS_SAMPLE_INTERVAL / FAAS_STRIPE_INTERVAL /
@@ -1482,6 +1529,18 @@ func (a storageStoreAdapter) LatestSnapshotBytes(ctx context.Context, appID stri
 
 func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
 	return a.s.AppendSnapshotStorage(ctx, accountID, appID, day, snapshotBytes, layerBytes)
+}
+
+// mailStoreCheckerAdapter narrows state.Store to the
+// mail.SuppressionChecker surface SuppressingSender needs. Keeps
+// pkg/mail free of an import on pkg/state (the leaf-package
+// interface seam at pkg/mail/suppression.go is the rule). PR #1191
+// fixup: same adapter shape cmd/apid uses; duplicated here so each
+// daemon's runDeps namespace owns its adapters.
+type mailStoreCheckerAdapter struct{ s state.Store }
+
+func (a mailStoreCheckerAdapter) IsMailSuppressed(ctx context.Context, email string) (bool, error) {
+	return a.s.IsMailSuppressed(ctx, email)
 }
 
 // warnIfEmptyAPIKey emits a soft warning when the active provider has no

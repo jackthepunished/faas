@@ -339,6 +339,16 @@ type Querier interface {
 	// ReportBatchItemFailures handler needs.
 	InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
+	// Returns true if any active suppression matches the address.
+	// "Active" means expires_at IS NULL OR expires_at > now(); the
+	// partial index mail_suppressions_active_email_idx keeps expired
+	// rows out so a row that fell out of TTL doesn't block future
+	// mail to that address. Lower-casing on both sides makes the
+	// match case-insensitive (Postfix accepts mixed case; the
+	// providers' bounce webhooks do too).
+	//
+	// $1 = email
+	IsMailSuppressed(ctx context.Context, db DBTX, lower string) (bool, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
 	// scopes is the auth permission set surfaced to the dashboard and the
@@ -570,6 +580,31 @@ type Querier interface {
 	// partition tail (rows in the default partition or
 	// the current month that are older than cutoff).
 	PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error
+	// ---------------------------------------------------------------------------
+	// Issue #246 acceptance item 7 — hard-bounce + complaint suppression list
+	// (ADR-115 §D.3, RFC 8058 follow-on). One row per (source,
+	// provider_event_id) so Resend's webhook redelivery dedupes to the
+	// same row instead of double-suppressing. The unique index is the
+	// dedupe key. Schema lives in migrations/00562_mail_suppressions.sql.
+	// ---------------------------------------------------------------------------
+	// INSERT with ON CONFLICT (source, provider_event_id) DO UPDATE so
+	// the Resend webhook redelivery is idempotent. RETURNING (xmax = 0)
+	// exposes the canonical "fresh insert vs replay" signal — the
+	// bounce handler (pkg/meter/bounce_handler.go) reads it to decide
+	// whether to advance dunning (fresh) or skip (replay). The SET
+	// clause is intentionally a no-op rewrite of email: the row's
+	// contents are already correct, but Postgres needs an UPDATE arm
+	// to fire RETURNING when the conflict hits.
+	//
+	// $1 = account_id (nullable — the bounce handler may not have
+	//      correlated the address to an account yet)
+	// $2 = email
+	// $3 = reason (closed: hard_bounce / complaint / manual)
+	// $4 = source (closed: resend / postmark / operator)
+	// $5 = provider_event_id
+	// $6 = expires_at (nullable — null means suppression is permanent
+	//      until operator override; non-null is the TTL deadline)
+	RecordMailSuppression(ctx context.Context, db DBTX, arg RecordMailSuppressionParams) (bool, error)
 	// Per-route p50/p95/p99 latency + row count for the
 	// compare endpoint and the regression detector (ADR-127 PR-B
 	// cron + PR Debugger UX v1 compare handler). Single index scan

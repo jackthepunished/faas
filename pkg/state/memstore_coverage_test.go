@@ -420,3 +420,98 @@ func TestMemStoreCoverageAuthUsageAndEvents(t *testing.T) {
 		t.Fatalf("invalid event filter = %+v, %v", got, err)
 	}
 }
+
+// TestMemStoreCoverageMailSuppressions exercises MemStore parity
+// for the suppression list (issue #246 acceptance item 7).
+// Pin every clause the PgStore implementation honours so a
+// regression in pgstore/memstore parity trips the coverage gate
+// immediately.
+func TestMemStoreCoverageMailSuppressions(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	// Validation: empty inputs are rejected on both stores the
+	// same way — the apid daemon's bounce handler relies on
+	// these errors surfacing as ErrInvalidArgument, not silently
+	// being treated as "inserted".
+	if _, err := m.RecordMailSuppression(ctx, MailSuppressionInput{}); err == nil {
+		t.Fatal("empty RecordMailSuppression should fail")
+	}
+
+	// Fresh insert + replay dedupe on (source, provider_event_id).
+	// Both events came from the same Resend event ID so the second
+	// call must return inserted=false without mutating state.
+	evID := "evt_" + uuid.NewString()
+	in := MailSuppressionInput{
+		Email:           "Alice@Example.com",
+		Reason:          MailSuppressionHardBounce,
+		Source:          MailSuppressionSourceResend,
+		ProviderEventID: evID,
+	}
+	inserted, err := m.RecordMailSuppression(ctx, in)
+	if err != nil || !inserted {
+		t.Fatalf("first RecordMailSuppression = %v, %v", inserted, err)
+	}
+	inserted, err = m.RecordMailSuppression(ctx, in)
+	if err != nil || inserted {
+		t.Fatalf("replay RecordMailSuppression = %v, %v", inserted, err)
+	}
+
+	// Case-insensitive lookup: the row was stored under the
+	// lower-cased key but IsMailSuppressed must match any case
+	// the customer types in their address field.
+	if ok, err := m.IsMailSuppressed(ctx, "alice@example.com"); err != nil || !ok {
+		t.Fatalf("lower lookup = %v, %v", ok, err)
+	}
+	if ok, err := m.IsMailSuppressed(ctx, "ALICE@EXAMPLE.COM"); err != nil || !ok {
+		t.Fatalf("upper lookup = %v, %v", ok, err)
+	}
+	if ok, err := m.IsMailSuppressed(ctx, "AlIcE@eXaMpLe.cOm"); err != nil || !ok {
+		t.Fatalf("mixed lookup = %v, %v", ok, err)
+	}
+
+	// Different address (same row otherwise) must NOT match.
+	if ok, err := m.IsMailSuppressed(ctx, "bob@example.com"); err != nil || ok {
+		t.Fatalf("different address = %v, %v", ok, err)
+	}
+
+	// Expired row must fall out of the active set so a TTL'd
+	// suppression does not block future mail.
+	expired := MailSuppressionInput{
+		Email:           "expired@example.com",
+		Reason:          MailSuppressionComplaint,
+		Source:          MailSuppressionSourcePostmark,
+		ProviderEventID: "evt_" + uuid.NewString(),
+		ExpiresAt:       timePtr(time.Now().Add(-time.Minute)),
+	}
+	if _, err := m.RecordMailSuppression(ctx, expired); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := m.IsMailSuppressed(ctx, "expired@example.com"); err != nil || ok {
+		t.Fatalf("expired still active = %v, %v", ok, err)
+	}
+
+	// Future expiry: row counts as active (within TTL).
+	future := MailSuppressionInput{
+		Email:           "future@example.com",
+		Reason:          MailSuppressionManual,
+		Source:          MailSuppressionSourceOperator,
+		ProviderEventID: "evt_" + uuid.NewString(),
+		ExpiresAt:       timePtr(time.Now().Add(time.Hour)),
+	}
+	if _, err := m.RecordMailSuppression(ctx, future); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := m.IsMailSuppressed(ctx, "future@example.com"); err != nil || !ok {
+		t.Fatalf("future expiry not active = %v, %v", ok, err)
+	}
+
+	// Empty email rejected.
+	if _, err := m.IsMailSuppressed(ctx, ""); err == nil {
+		t.Fatal("empty IsMailSuppressed should fail")
+	}
+}
+
+// timePtr is a tiny helper for the coverage test that keeps the
+// input declarations readable.
+func timePtr(t time.Time) *time.Time { return &t }

@@ -1,6 +1,6 @@
 # ADR-115 · Transactional email provider — choose Resend (spec G4 closure)
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-08-18
 - **Closes:** spec §17 G4 (`docs/faas_implementation_spec.md:1231`)
   — "Transactional email provider — verification, dunning, quota mails
@@ -433,3 +433,35 @@ selection decision):
     `mail.bounce` / `mail.complaint` rows will follow.
   - ADR-042 (webhook replay dedupe) — the `webhook_deliveries` table
     shape that §D.3 mirrors as `resend_deliveries`.
+## Acceptance amendment (2026-08-29)
+
+Status flipped proposed → accepted after the mail-production-ready
+mega-PR landed the following against main:
+
+- **Decorator stack** (SuppressingSender → RetryingSender →
+  ResendSender|PostmarkSender|LogSender|NoopSender) wired in
+  cmd/apid/main.go and cmd/meterd/main.go.
+- **Fail-closed boot** — `pkg/mail/factory.go` rejects an unset or
+  unrecognised `FAAS_MAIL_TRANSPORT` on a non-dev box
+  (`FAAS_DEV` unset/`0`). `FAAS_DEV=1` keeps LogSender; explicit
+  `log`/`noop` remain valid escape hatches.
+- **Suppression list** (`migrations/00539_mail_suppressions.sql`),
+  60s in-process cache on the decorator, unique index on
+  `(source, provider_event_id)`.
+- **List-Unsubscribe** (RFC 8058) wired into the quota-warning
+  template only — dunning/billing/deletion mails deliberately
+  exclude the header so a customer one-click-unsubscribing from
+  "your payment failed" cannot silently lose their suspension
+  warning.
+- **Resend webhook ingress** at `POST /v1/webhooks/resend` —
+  Svix HMAC-SHA256, replay-guarded by `webhookdedupe`, dispatched
+  to `meter.BounceHandler` → suppression + dunning CAS via
+  `MarkDunningStep(active → past_due)`.
+- **Operator dry-run** (`gregale mail dry-run [--unsubscribe-url URL]`)
+  + renderer→transport integration tests proving every template
+  reaches the wire with subject/body/headers intact.
+
+Issue **#246** closed in full. Issue **#245** (email verification)
+unblocked. ADR-045 (webhook-only customer alerts) and ADR-123
+(`notification_email`) can now reference the mail pipeline
+instead of working around its absence.

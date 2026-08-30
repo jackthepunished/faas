@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
 	"github.com/onebox-faas/faas/pkg/ratelimit/peraccount"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
@@ -810,11 +811,26 @@ func newMailerAdapter(s mail.Sender) Mailer {
 
 func (a mailAdapter) Send(ctx context.Context, m Message) error {
 	return a.s.Send(ctx, mail.Message{
-		To:       m.To,
-		Subject:  m.Subject,
-		TextBody: m.TextBody,
-		HTMLBody: m.HTMLBody,
+		To:        m.To,
+		Subject:   m.Subject,
+		TextBody:  m.TextBody,
+		HTMLBody:  m.HTMLBody,
+		Headers:   m.Headers,
+		MessageID: m.MessageID,
 	})
+}
+
+// mailStoreCheckerAdapter narrows state.Store to the
+// mail.SuppressionChecker surface SuppressingSender needs. Keeps
+// pkg/mail free of an import on pkg/state (the leaf-package
+// interface seam at pkg/mail/suppression.go is the rule), and lets
+// the apid / meterd wire-up pick the same Store the rest of the
+// daemon uses without dragging the full state.Store surface into
+// the decorator. PR #1191 fixup.
+type mailStoreCheckerAdapter struct{ s state.Store }
+
+func (a mailStoreCheckerAdapter) IsMailSuppressed(ctx context.Context, email string) (bool, error) {
+	return a.s.IsMailSuppressed(ctx, email)
 }
 
 // graceIntervalFromEnv reads FAAS_GRACE_INTERVAL to let the e2e test
@@ -995,6 +1011,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (log-only until gap G4 is closed). Empty secret = dev mode (the
 	// webhook accepts unsigned payloads; never deploy this way).
 	stripeSecret := deps.getenv("STRIPE_WEBHOOK_SECRET")
+	// Issue #246 acceptance item 8: Resend webhook signing secret.
+	// Empty fails-closed (the handler returns 503). Operators on
+	// a box that does not need Resend integration can leave it
+	// unset — the route is mounted unconditionally and the
+	// fail-closed 503 is the safe default.
+	resendSecret := deps.getenv("FAAS_MAIL_RESEND_WEBHOOK_SECRET")
 	// Gap G4 closure (ADR-115): wire the env-driven mail factory so
 	// prod boots with FAAS_MAIL_TRANSPORT=resend and emails go out
 	// for real. Tests + dev can keep mailer nil and the factory
@@ -1004,12 +1026,55 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// §D5); the wrapped ErrMailerMisconfigured propagates here so
 	// the daemon refuses to boot instead of silently dropping
 	// email into slog.
+	//
+	// Issue #246 extends that contract from "credential missing" to
+	// "transport unselected": on a non-dev box, an unset or unknown
+	// FAAS_MAIL_TRANSPORT also fails closed via ErrMailUnsetInProd
+	// / ErrMailUnknownTransport. Operators who really do want mail
+	// in the journal can set FAAS_MAIL_TRANSPORT=log; developers
+	// iterating locally can set FAAS_DEV=1 to fall back to log when
+	// the transport is unset. Both escapes are documented in the
+	// boot hint below so the message names every escape hatch.
 	m := deps.mailer
 	if m == nil {
 		var err error
 		m, err = mail.SenderFromEnv(deps.getenv, log)
 		if err != nil {
-			return fmt.Errorf("apid: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+			return fmt.Errorf("apid: %w\n"+
+				"  fix one of:\n"+
+				"    - set FAAS_MAIL_TRANSPORT=resend (or postmark) plus FAAS_MAIL_FROM and the provider key in /etc/faas/sealed.env\n"+
+				"    - set FAAS_MAIL_TRANSPORT=log to keep mail in the journal\n"+
+				"    - set FAAS_DEV=1 on a dev/CI box where unset transport should resolve to log", err)
+		}
+	}
+	// PR #1191 fixup: wrap the transport with the decorator stack so
+	// every send path is suppressed-aware + 429/5xx-retried. Without
+	// this the bounce handler's suppression rows never gate outbound
+	// mail and a transient Resend failure leaks back to the HTTP
+	// caller instead of being retried within the wall-clock budget.
+	//
+	// SuppressingSender is outermost — a suppressed address costs
+	// zero HTTP attempts. RetryingSender wraps the transport so the
+	// decorator chain matches the plan:
+	//
+	//   SuppressingSender
+	//     └── RetryingSender
+	//           └── SenderFromEnv result
+	//
+	// The store is the state.Store that backs IsMailSuppressed —
+	// the same store the rest of apid holds. Tests inject a
+	// dependency that bypasses this block (deps.mailer is
+	// non-nil), so the unit-test surface never sees the stack.
+	if deps.mailer == nil && m != nil && deps.store != nil {
+		transportLabel := strings.ToLower(deps.getenv("FAAS_MAIL_TRANSPORT"))
+		m = &mail.SuppressingSender{
+			Inner: &mail.RetryingSender{
+				Inner:         m,
+				TransportName: transportLabel,
+				Log:           log,
+			},
+			Store: mailStoreCheckerAdapter{s: deps.store()},
+			Log:   log,
 		}
 	}
 	mailer := newMailerAdapter(m)
@@ -1098,6 +1163,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv)).
 		WithCLIAuthURLBase(cfg.GetCLIAuthURLBase(deps.getenv))
+	srv.WithResendWebhookSecret(resendSecret)
+	// Issue #246 acceptance item 8: wire the meterd-owned bounce
+	// handler so Resend bounce / complaint events feed the
+	// suppression + dunning pipeline. The local-store adapter
+	// runs the bounce handler in-process (apid already has the
+	// store + audit auditor wired). A future PR can swap this
+	// for an RPC adapter once meterd is split onto a separate
+	// node and the pipeline ships over pg_notify.
+	srv.WithMailBounce(meter.NewLocalBounceHandler(store, srv.audit, log))
 	// ADR-132: seed the hot runtime configuration snapshot from the
 	// deployment environment, then reconcile durable operator overrides
 	// before any listener is exposed. Database state wins over the

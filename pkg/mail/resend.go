@@ -4,22 +4,33 @@
 // with `Authorization: Bearer <api_key>` and a JSON body that has at
 // minimum {from, to, subject, text} (HTML optional). Response is 200
 // + {"id": "..."} on success, 4xx + {"name": "..."} on validation
-// failures, 5xx for upstream issues.
+// failures, 5xx for upstream issues, 429 for rate-limit.
 //
 // We use the bare net/http client + json package (no SDK dependency).
 // Sender's contract is non-blocking; callers wrap in a goroutine +
 // timeout when slowness matters.
+//
+// Idempotency: when Message.MessageID is non-empty, the request
+// carries an `Idempotency-Key` header so a network-level retry that
+// the upstream already accepted is deduplicated within Resend's
+// 24-hour replay window instead of double-charging.
+//
+// Retry classification (issue #246 acceptance item 3):
+//   - 429 Too Many Requests  -> TransientError{RetryAfter from header}
+//   - 5xx                    -> TransientError{RetryAfter from header}
+//   - 4xx (other)            -> permanent error (not ErrTransient)
+//   - network / dial failure -> TransientError{Status: 0}
 package mail
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,12 +58,20 @@ type ResendSender struct {
 
 // ResendRequest is the JSON body the Resend API expects. Exported so
 // tests in package mail_test can decode against it.
+//
+// `Headers` carries caller-supplied RFC 5322 headers (e.g.
+// List-Unsubscribe + List-Unsubscribe-Post for bulk-sender compliance
+// per RFC 8058). Resend's API treats these as opaque — they're
+// attached verbatim to the outbound message, not parsed by Resend
+// itself. Empty map omits the field so a non-bulk email doesn't
+// add a noisy `"headers":{}` to the wire payload.
 type ResendRequest struct {
-	From    string   `json:"from"`
-	To      []string `json:"to"`
-	Subject string   `json:"subject"`
-	Text    string   `json:"text"`
-	HTML    string   `json:"html,omitempty"`
+	From    string            `json:"from"`
+	To      []string          `json:"to"`
+	Subject string            `json:"subject"`
+	Text    string            `json:"text"`
+	HTML    string            `json:"html,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // resendError is the JSON shape Resend returns on 4xx/5xx. We surface
@@ -93,6 +112,12 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 		Subject: msg.Subject,
 		Text:    msg.TextBody,
 		HTML:    msg.HTMLBody,
+		// Caller-supplied extra headers (List-Unsubscribe etc) go
+		// in the JSON body — Resend's API treats custom HTTP
+		// request headers as unrelated to the email payload and
+		// drops them. Verified by the dry-run + transport
+		// integration tests.
+		Headers: msg.Headers,
 	})
 	if err != nil {
 		return fmt.Errorf("mail: resend: marshal: %w", err)
@@ -104,12 +129,25 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
+	// Idempotency-Key dedupes a retry that the upstream already
+	// accepted within its 24h window — see pkg/mail/mail.go
+	// Message.MessageID. The dunning + quota-warning senders
+	// derive a stable id from (account_id, template, day) so an
+	// HTTP-level retry never sends twice.
+	//
+	// Caller-supplied extra headers (List-Unsubscribe, etc.) are
+	// delivered via the JSON body above — Resend's API drops
+	// custom HTTP request headers, so the right channel is the
+	// `headers` field on the JSON payload.
+	if msg.MessageID != "" {
+		req.Header.Set("Idempotency-Key", msg.MessageID)
+	}
 
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {
 		// Network errors are transient by definition (caller can
 		// retry on a fresh transport).
-		return fmt.Errorf("mail: resend: do: %w", errors.Join(err, ErrTransient))
+		return &TransientError{Err: fmt.Errorf("mail: resend: do: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -137,9 +175,36 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 	if detail == "" {
 		detail = string(rawBody)
 	}
-	// 5xx → ErrTransient so caller may retry.
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("mail: resend: %d %s: %w", resp.StatusCode, detail, ErrTransient)
+	// 429 + 5xx are transient; honour Retry-After so the retry
+	// decorator can back off with the provider's hint instead of
+	// guessing.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		te := &TransientError{Status: resp.StatusCode}
+		if ra := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ra > 0 {
+			te.RetryAfter = ra
+		}
+		return fmt.Errorf("mail: resend: %s: %w", detail, te)
 	}
 	return fmt.Errorf("mail: resend: %d: %s", resp.StatusCode, detail)
+}
+
+// parseRetryAfter interprets an RFC 7231 §7.1.3 Retry-After header.
+// Resend uses delta-seconds today; we still accept the HTTP-date form
+// so a future provider or proxy does not silently get retried too
+// soon. Returns 0 for empty / unparseable / past values so the caller
+// can fall back to its base delay.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(value); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

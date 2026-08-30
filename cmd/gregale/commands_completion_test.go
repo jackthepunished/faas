@@ -715,6 +715,7 @@ func extractPrintUsageTopics() ([]printUsageSite, error) {
 		"docsOpenTopic":                   "open",
 		"throttleSuggestionsCmdDocsTopic": "throttle-suggestions",
 		"debugCmdDocsTopic":               "debug",
+		"mailDryRunDocsTopic":             "mail-dry-run",
 	}
 
 	entries, err := os.ReadDir(".")

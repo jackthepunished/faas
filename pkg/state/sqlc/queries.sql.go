@@ -2280,6 +2280,30 @@ func (q *Queries) InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (In
 	return i, err
 }
 
+const isMailSuppressed = `-- name: IsMailSuppressed :one
+SELECT EXISTS (
+    SELECT 1 FROM mail_suppressions
+    WHERE lower(email) = lower($1)
+      AND (expires_at IS NULL OR expires_at > now())
+) AS suppressed
+`
+
+// Returns true if any active suppression matches the address.
+// "Active" means expires_at IS NULL OR expires_at > now(); the
+// partial index mail_suppressions_active_email_idx keeps expired
+// rows out so a row that fell out of TTL doesn't block future
+// mail to that address. Lower-casing on both sides makes the
+// match case-insensitive (Postfix accepts mixed case; the
+// providers' bounce webhooks do too).
+//
+// $1 = email
+func (q *Queries) IsMailSuppressed(ctx context.Context, db DBTX, lower string) (bool, error) {
+	row := db.QueryRow(ctx, isMailSuppressed, lower)
+	var suppressed bool
+	err := row.Scan(&suppressed)
+	return suppressed, err
+}
+
 const latestDeployment = `-- name: LatestDeployment :one
 select id, app_id, coalesce(build_id::text, ''), image_digest, kind,
        coalesce(source_path, ''), coalesce(source_bytes, 0),
@@ -4531,6 +4555,66 @@ DELETE FROM data_upstream_probes WHERE sampled_at < $1
 func (q *Queries) PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error {
 	_, err := db.Exec(ctx, pruneDataUpstreamProbesOlderThan, sampledAt)
 	return err
+}
+
+const recordMailSuppression = `-- name: RecordMailSuppression :one
+
+INSERT INTO mail_suppressions (
+    account_id, email, reason, source, provider_event_id, expires_at
+) VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (source, provider_event_id) DO UPDATE
+SET email = EXCLUDED.email
+RETURNING (xmax = 0) AS inserted
+`
+
+type RecordMailSuppressionParams struct {
+	AccountID       pgtype.UUID
+	Email           string
+	Reason          string
+	Source          string
+	ProviderEventID string
+	ExpiresAt       pgtype.Timestamptz
+}
+
+// ---------------------------------------------------------------------------
+// Issue #246 acceptance item 7 — hard-bounce + complaint suppression list
+// (ADR-115 §D.3, RFC 8058 follow-on). One row per (source,
+// provider_event_id) so Resend's webhook redelivery dedupes to the
+// same row instead of double-suppressing. The unique index is the
+// dedupe key. Schema lives in migrations/00562_mail_suppressions.sql.
+// ---------------------------------------------------------------------------
+// INSERT with ON CONFLICT (source, provider_event_id) DO UPDATE so
+// the Resend webhook redelivery is idempotent. RETURNING (xmax = 0)
+// exposes the canonical "fresh insert vs replay" signal — the
+// bounce handler (pkg/meter/bounce_handler.go) reads it to decide
+// whether to advance dunning (fresh) or skip (replay). The SET
+// clause is intentionally a no-op rewrite of email: the row's
+// contents are already correct, but Postgres needs an UPDATE arm
+// to fire RETURNING when the conflict hits.
+//
+// $1 = account_id (nullable — the bounce handler may not have
+//
+//	correlated the address to an account yet)
+//
+// $2 = email
+// $3 = reason (closed: hard_bounce / complaint / manual)
+// $4 = source (closed: resend / postmark / operator)
+// $5 = provider_event_id
+// $6 = expires_at (nullable — null means suppression is permanent
+//
+//	until operator override; non-null is the TTL deadline)
+func (q *Queries) RecordMailSuppression(ctx context.Context, db DBTX, arg RecordMailSuppressionParams) (bool, error) {
+	row := db.QueryRow(ctx, recordMailSuppression,
+		arg.AccountID,
+		arg.Email,
+		arg.Reason,
+		arg.Source,
+		arg.ProviderEventID,
+		arg.ExpiresAt,
+	)
+	var inserted bool
+	err := row.Scan(&inserted)
+	return inserted, err
 }
 
 const requestTelemetryBaselineP95ByRoute = `-- name: RequestTelemetryBaselineP95ByRoute :many

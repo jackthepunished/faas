@@ -54,9 +54,10 @@ func (r *recordingSender) snapshot() []mail.Message {
 // branch the factory exposes. The output of mail.SenderFromEnv must
 // have the expected concrete type for each happy-path env shape, and
 // the mailAdapter we wrap it in must forward a probe message through.
-// Fail-closed rows (resend / postmark selected without the credential)
-// assert the typed error sentinel — apid/meterd catch it on boot
-// and refuse to start (ADR-115 §D5).
+// Fail-closed rows (resend / postmark selected without the credential,
+// or unset / unknown transport on a non-dev box) assert the typed
+// error sentinel — apid/meterd catch it on boot and refuse to start
+// (ADR-115 §D5 + issue #246).
 func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -65,8 +66,19 @@ func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 		wantFailIs error  // non-nil = expect errors.Is(err, sentinel)
 	}{
 		{
-			name:     "unset-transport-defaults-to-log",
-			env:      map[string]string{},
+			// Issue #246: an unset FAAS_MAIL_TRANSPORT on a
+			// production box now refuses to boot — a production
+			// box that journals the dunning ladder looks healthy
+			// while the customer receives nothing.
+			name:       "unset-on-prod-fails-closed",
+			env:        map[string]string{},
+			wantFailIs: mail.ErrMailUnsetInProd,
+		},
+		{
+			// FAAS_DEV=1 collapses an unset transport to log so a
+			// developer's local stack still boots without ceremony.
+			name:     "unset-on-dev-resolves-to-log",
+			env:      map[string]string{"FAAS_DEV": "1"},
 			wantType: "*mail.LogSender",
 		},
 		{
@@ -114,24 +126,39 @@ func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 			wantFailIs: mail.ErrMailerMisconfigured,
 		},
 		{
-			// ADR-115 §D5: unknown transport names stay fail-soft
-			// (operator-typo territory, not production misconfig).
-			name:     "bogus-transport-falls-back-to-log",
-			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "carrier-pigeon"},
+			// Issue #246: a typo ("resned") on a production box
+			// used to fall back to LogSender with WARN — the same
+			// silent drop as the unset case with none of the
+			// visibility. It now fails closed.
+			name:       "bogus-transport-on-prod-fails-closed",
+			env:        map[string]string{"FAAS_MAIL_TRANSPORT": "carrier-pigeon"},
+			wantFailIs: mail.ErrMailUnknownTransport,
+		},
+		{
+			// FAAS_DEV=1 collapses an unknown transport to log
+			// with WARN so a developer iterating on a brand-new
+			// transport name still boots.
+			name: "bogus-transport-on-dev-warns-and-falls-back",
+			env: map[string]string{
+				"FAAS_MAIL_TRANSPORT": "carrier-pigeon",
+				"FAAS_DEV":            "1",
+			},
 			wantType: "*mail.LogSender",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Use t.Setenv so Go's test framework cleans up after us;
-			// t.Setenv on a non-existent key unsets it, matching the
-			// factory's getenv behaviour for "FAAS_MAIL_TRANSPORT=" → log.
+			// Use t.Setenv so Go's test framework cleans up after
+			// us. Unset every factory-input key first so the env
+			// shape is exactly what tc.env describes; the previous
+			// run's settings cannot bleed across rows.
 			for _, k := range []string{
 				"FAAS_MAIL_TRANSPORT",
 				"FAAS_MAIL_RESEND_API_KEY",
 				"FAAS_MAIL_FROM",
 				"FAAS_MAIL_POSTMARK_TOKEN",
+				"FAAS_DEV",
 			} {
 				t.Setenv(k, "")
 			}

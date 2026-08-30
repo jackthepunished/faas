@@ -206,6 +206,7 @@ linters:
         - G302 # file perms >0600 via OpenFile: jail chroot config + rootfs image files need group/other read
         - G304 # file path from variable — blanket-disabled because every site opens paths derived from vetted slot/instance ids (vmmd/imaged/builderd) or pkg/-owned caches (wire/snapshot). Re-enabled per-path for cmd/faas/ in the exclusions.rules block below, since the CLI is the only surface that takes customer-supplied paths.
         - G306 # WriteFile perms >0600: rootfs image contents (0644 data, 0755 executables) MUST be group/other readable/executable inside the guest
+        - G404 # weak RNG: only used for retry-backoff jitter (pkg/mail/retry.go); no security boundary; crypto/rand would only add latency without changing attack surface
 
   # Per-path exclusions for noisy linters on tests, plus the
   # generated-protobuf and metal-test files. The v2 schema puts

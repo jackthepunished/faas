@@ -863,6 +863,17 @@ var cliCommands = []cliCommand{
 		Positionals: []string{"<slug>"},
 	},
 	{
+		Name:    "mail",
+		DocSlug: "mail-dry-run",
+		Short:   "Mail operator dry-run (issue #246 acceptance item 6): `gregale mail dry-run [--unsubscribe-url URL]` renders every production template against a fixture account + day and writes the wire payload as JSON. The eyeball gate before flipping a box to FAAS_MAIL_TRANSPORT=resend.",
+		Subcommands: []cliSub{
+			{Name: "dry-run", Short: "render every mail template against a fixture; print wire JSON"},
+		},
+		Flags: []cliFlag{
+			{Name: "unsubscribe-url", Short: "List-Unsubscribe URL (RFC 8058); empty disables the header"},
+		},
+	},
+	{
 		Name:    "wake",
 		DocSlug: "park-wake",
 		Short:   "Wake a parked app (pulls out of snapshot)",

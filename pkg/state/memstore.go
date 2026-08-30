@@ -117,7 +117,15 @@ type MemStore struct {
 	// for each per-tenant row so the apid admin route can echo
 	// the row back without a second query.
 	githubWebhookSecretMeta map[int64]webhookSecretMeta
-	deployments             map[string]Deployment
+	// mailSuppressions is the issue #246 acceptance item 7 +
+	// ADR-115 §D.3 hard-bounce / complaint suppression list.
+	// Keyed by lower(email) for O(1) IsMailSuppressed lookup
+	// (PgStore's partial index does the same via SQL).
+	// MemStore keeps the source/providerEventID pair on each
+	// row so RecordMailSuppression can dedupe the same way
+	// the (source, provider_event_id) unique index does.
+	mailSuppressions map[string]mailSuppressionRow
+	deployments      map[string]Deployment
 	// statusIncidents (issue #599 / ADR-130) is the in-memory
 	// mirror of the status_incidents table (migrations/00412).
 	// Append-only + resolved_at-stamped; the partial-index read
@@ -666,8 +674,10 @@ func NewMemStore() *MemStore {
 		// store (mirror of github_webhook_secrets).
 		githubWebhookSecrets:    map[int64][]byte{},
 		githubWebhookSecretMeta: map[int64]webhookSecretMeta{},
-		deployments:             map[string]Deployment{},
-		builds:                  map[string]Build{},
+		// Issue #246 acceptance item 7: mail suppression list mirror.
+		mailSuppressions: map[string]mailSuppressionRow{},
+		deployments:      map[string]Deployment{},
+		builds:           map[string]Build{},
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
@@ -14466,6 +14476,81 @@ func (m *MemStore) MarkDunningStep(_ context.Context, id string, from, to Accoun
 // Prefixed with "ForTest" so a `go vet -tests-only` or production
 // audit can find it; not in pkg/state.Store (no public surface for
 // ad-hoc PastDueAt writes).
+
+// RecordMailSuppression mirrors PgStore.RecordMailSuppression
+// (issue #246 acceptance item 7). Mirrors the (source,
+// provider_event_id) unique-index dedupe via an explicit check:
+// if a row with the same pair already exists, the call is a
+// replay and returns inserted=false without mutating state.
+// Otherwise it writes a new row keyed by lower(email) so
+// IsMailSuppressed can do a single map lookup.
+func (m *MemStore) RecordMailSuppression(_ context.Context, in MailSuppressionInput) (bool, error) {
+	if in.Email == "" {
+		return false, fmt.Errorf("memstore: RecordMailSuppression: email required")
+	}
+	if in.ProviderEventID == "" {
+		return false, fmt.Errorf("memstore: RecordMailSuppression: provider_event_id required")
+	}
+	if in.Reason == "" {
+		return false, fmt.Errorf("memstore: RecordMailSuppression: reason required")
+	}
+	if in.Source == "" {
+		return false, fmt.Errorf("memstore: RecordMailSuppression: source required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := strings.ToLower(in.Email)
+	// Replay dedupe: walk the (small) map looking for the
+	// (source, providerEventID) pair. Memstore tests do not
+	// exercise thousands of rows for one address, so a linear
+	// scan is fine — production hits PgStore's partial unique
+	// index instead.
+	for _, existing := range m.mailSuppressions {
+		if existing.Source == in.Source && existing.ProviderEventID == in.ProviderEventID {
+			return false, nil
+		}
+	}
+	// No prior row for this (source, eventID): write a fresh one.
+	// Refresh the row at the canonical key — if a stale row from
+	// an earlier complaint/bounce sits there, replace its contents
+	// (e.g. operator override flipped reason from complaint →
+	// hard_bounce after a follow-up).
+	m.mailSuppressions[key] = mailSuppressionRow{
+		AccountID:       in.AccountID,
+		Email:           in.Email,
+		Reason:          in.Reason,
+		Source:          in.Source,
+		ProviderEventID: in.ProviderEventID,
+		ExpiresAt:       in.ExpiresAt,
+		CreatedAt:       time.Now().UTC(),
+	}
+	return true, nil
+}
+
+// IsMailSuppressed mirrors PgStore.IsMailSuppressed. A row is
+// "active" when ExpiresAt is nil OR ExpiresAt is in the future;
+// expired rows are skipped so a row that fell out of TTL does
+// not block future mail to that address. Mirrors the partial-
+// index predicate on mail_suppressions_active_email_idx.
+func (m *MemStore) IsMailSuppressed(_ context.Context, email string) (bool, error) {
+	if email == "" {
+		return false, fmt.Errorf("memstore: IsMailSuppressed: email required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.mailSuppressions[strings.ToLower(email)]
+	if !ok {
+		return false, nil
+	}
+	if row.ExpiresAt != nil && row.ExpiresAt.Before(time.Now()) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Prefixed with "ForTest" so a `go vet -tests-only` or production
+// audit can find it; not in pkg/state.Store (no public surface for
+// ad-hoc PastDueAt writes).
 func (m *MemStore) SetPastDueAtForTest(id string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -14679,6 +14764,23 @@ var _ Store = (*MemStore)(nil)
 type webhookSecretMeta struct {
 	UpgradedAt time.Time
 	UpgradedBy string
+}
+
+// mailSuppressionRow is the MemStore mirror of mail_suppressions
+// (issue #246 acceptance item 7). Keyed by lower(email); the
+// (source, providerEventID) tuple is held for the replay dedupe
+// the PgStore's unique index does. MemStore keeps the lower-case
+// key as the canonical address form so IsMailSuppressed can do
+// a single map lookup; PgStore's partial index does the same
+// via SQL.
+type mailSuppressionRow struct {
+	AccountID       *string
+	Email           string // canonical (as-stored) form
+	Reason          MailSuppressionReason
+	Source          MailSuppressionSource
+	ProviderEventID string
+	ExpiresAt       *time.Time
+	CreatedAt       time.Time
 }
 
 // BackdateForTest rewinds the row's started_at to the supplied

@@ -112,6 +112,27 @@ func subSecondIntervalsEnv() func(string) string {
 			"FAAS_STRIPE_INTERVAL", "FAAS_DUNNING_INTERVAL",
 			"FAAS_UPSTREAM_PROBE_INTERVAL", "FAAS_UPSTREAM_PROBE_PARTITION_INTERVAL":
 			return "20ms"
+		// PR #1191 C2: pkg/mail/factory refuses to boot on a non-dev
+		// box with unset FAAS_MAIL_TRANSPORT. The unit tests are
+		// dev/CI box for this purpose; the FAAS_DEV=1 escape hatch
+		// keeps the contract visible in every boot path rather than
+		// silently picking LogSender under the default branch.
+		case "FAAS_DEV":
+			return "1"
+		}
+		return ""
+	}
+}
+
+// testMailDevEnv returns the minimal env reader that satisfies the
+// mail fail-closed boot check — a no-op for everything except
+// FAAS_DEV=1. Used by tests that don't need sub-second intervals
+// (TestRun_MetricsAddrEmptySkipsListener, TestRun_Healthz_StaleReturns503)
+// but still drive runWithDeps through the real wire-up path.
+func testMailDevEnv() func(string) string {
+	return func(k string) string {
+		if k == "FAAS_DEV" {
+			return "1"
 		}
 		return ""
 	}
@@ -202,7 +223,7 @@ func TestRun_MetricsAddrEmptySkipsListener(t *testing.T) {
 		invocations++
 		return nil, nil
 	}
-	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, func(string) string { return "" })
+	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, testMailDevEnv())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -368,7 +389,7 @@ func TestRun_MetricsAddrDrainsOnCancel(t *testing.T) {
 	listenFn := func(_ string, _ http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		return &http.Server{Handler: http.NewServeMux(), ReadHeaderTimeout: 10 * time.Second}, nil
 	}
-	deps := stubMeterdDeps(cfgPath, "127.0.0.1:0", pool, listenFn, func(string) string { return "" })
+	deps := stubMeterdDeps(cfgPath, "127.0.0.1:0", pool, listenFn, testMailDevEnv())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -412,7 +433,7 @@ func TestRun_DialScheddPropagatesCancel(t *testing.T) {
 	listenFn := func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error) {
 		return nil, nil
 	}
-	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, func(string) string { return "" })
+	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, testMailDevEnv())
 	// parker is left nil so the dialSchedd seam is the only path that
 	// runs. The stub returns the canonical error so we can assert the
 	// wrap-and-return.

@@ -18,9 +18,12 @@ import (
 
 // TestSenderFromEnv_FactoryContract is the single table-driven source
 // of truth on how SenderFromEnv resolves FAAS_MAIL_TRANSPORT. Every
-// operator-visible branch lives here: unset → log, explicit log/noop,
-// live resend / postmark with full creds, and the two fail-closed
-// branches that landed in ADR-115 §D5.
+// operator-visible branch lives here: explicit log/noop, live
+// resend / postmark with full creds, the four credential-missing
+// fail-closed branches from ADR-115 §D5, and the two transport-
+// selection fail-closed branches added by issue #246 (unset on a
+// production box, unknown transport on a production box). Dev-box
+// escapes (FAAS_DEV=1) collapse to LogSender and are pinned here too.
 func TestSenderFromEnv_FactoryContract(t *testing.T) {
 	quietLog := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cases := []struct {
@@ -31,13 +34,37 @@ func TestSenderFromEnv_FactoryContract(t *testing.T) {
 		wantErrWrap error  // expected wrapped sentinel via errors.Is; nil = any
 	}{
 		{
-			name:     "unset-defaults-to-log",
-			env:      map[string]string{},
+			// Issue #246: an unset FAAS_MAIL_TRANSPORT on a
+			// production box now refuses to boot — a production
+			// box that journals the dunning ladder looks healthy
+			// while the customer receives nothing.
+			name:      "unset-on-prod-fails-closed",
+			env:       map[string]string{},
+			wantErrIs: mail.ErrMailUnsetInProd,
+		},
+		{
+			// The dev-box escape hatch: FAAS_DEV=1 collapses an
+			// unset transport to LogSender so a developer's local
+			// stack still boots without ceremony.
+			name: "unset-on-dev-resolves-to-log",
+			env: map[string]string{
+				"FAAS_DEV": "1",
+			},
 			wantType: "*mail.LogSender",
 		},
 		{
 			name:     "explicit-log",
 			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "log"},
+			wantType: "*mail.LogSender",
+		},
+		{
+			// Explicit log is honoured on prod too — it is the
+			// operator-visible escape hatch when an operator
+			// really does want mail in the journal.
+			name: "explicit-log-on-prod-is-allowed",
+			env: map[string]string{
+				"FAAS_MAIL_TRANSPORT": "log",
+			},
 			wantType: "*mail.LogSender",
 		},
 		{
@@ -121,10 +148,25 @@ func TestSenderFromEnv_FactoryContract(t *testing.T) {
 			wantErrIs: mail.ErrMailerMisconfigured,
 		},
 		{
-			// ADR-115 §D5: unknown transport names stay fail-soft
-			// (operator-typo territory, not production misconfig).
-			name:     "bogus-transport-stays-fail-soft",
-			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "carrier-pigeon"},
+			// Issue #246: a typo (e.g. "resned") on a production
+			// box used to fall back to LogSender — the same
+			// silent drop as the unset case with none of the
+			// visibility. It now fails closed.
+			name:      "bogus-transport-on-prod-fails-closed",
+			env:       map[string]string{"FAAS_MAIL_TRANSPORT": "carrier-pigeon"},
+			wantErrIs: mail.ErrMailUnknownTransport,
+		},
+		{
+			// Dev-box escape: FAAS_DEV=1 collapses an unknown
+			// transport name to LogSender with a WARN so a
+			// developer iterating on a brand-new transport name
+			// still boots. The on-prod fail-closed row above
+			// pins the strict contract.
+			name: "bogus-transport-on-dev-warns-and-falls-back",
+			env: map[string]string{
+				"FAAS_MAIL_TRANSPORT": "carrier-pigeon",
+				"FAAS_DEV":            "1",
+			},
 			wantType: "*mail.LogSender",
 		},
 	}

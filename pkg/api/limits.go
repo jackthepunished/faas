@@ -3741,6 +3741,48 @@ const (
 	StandbyWriteLeaderURLCacheTTLSeconds  = 5
 	StandbyWriteNoLeaderRetryAfterSeconds = 60
 
+	// Mail retry budget (issue #246 acceptance item 3 — Resend's
+	// free tier is 100/day, so 429 is an operational certainty and
+	// the retry decorator needs a wall-clock cap so an HTTP handler
+	// never blocks longer than this). The cap is hard: a dunning
+	// or quota-warning handler in cmd/apid returns its response
+	// within 5s even when the upstream is rate-limiting us.
+	//
+	// MailRetryMaxAttempts caps the number of send attempts (1
+	// initial + MaxAttempts-1 retries). MailRetryBaseDelayMS is
+	// the base for full-jitter exponential backoff (delay is
+	// uniformly random in [0, BaseDelay * 2^(attempt-1))). The
+	// decorator prefers Retry-After from the upstream over the
+	// computed backoff when Retry-After is shorter.
+	//
+	// MailRetryMaxWallClockMS is the absolute wall-clock ceiling
+	// the decorator will spend retrying; once the budget is gone
+	// the last error is returned. Synchronous, no background
+	// goroutine — see pkg/mail/retry.go for the rationale.
+	MailRetryMaxAttempts    = 3
+	MailRetryBaseDelayMS    = 500
+	MailRetryMaxWallClockMS = 5000
+
+	// MailSuppressionCacheTTLSeconds is the lifetime of the in-process
+	// memoisation in pkg/mail.SuppressingSender (issue #246 item 7).
+	// Short enough that a manual operator override takes effect within
+	// a minute on every daemon; long enough to absorb the burst of
+	// webhook-driven mail the dunning ladder produces after a billing
+	// failure without hammering the partial index on mail_suppressions.
+	MailSuppressionCacheTTLSeconds = 60
+
+	// WebhookMaxBodyBytes caps the size of an inbound webhook body
+	// the apid listener will accept. Resend / Postmark bounce
+	// payloads are well under 4 KB; 1 MiB is 256× headroom for
+	// future event-type expansion. Larger bodies are rejected
+	// before allocation completes (http.MaxBytesReader) so an
+	// unauthenticated sender cannot OOM apid by streaming
+	// multi-GB garbage. PR #1191 fixup: the resendWebhook
+	// route previously called io.ReadAll(r.Body) without a
+	// bound. Same cap applied to all three mail-webhook handlers
+	// the apid mounts (resend / postmark / paddle) for consistency.
+	WebhookMaxBodyBytes = 1 << 20 // 1 MiB
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 

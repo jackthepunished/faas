@@ -244,7 +244,16 @@ func (d *Dunning) parkAll(ctx context.Context, accountID string) {
 // file. Mirrors pkg/grace's relationship to pkg/mail.
 func (d *Dunning) sendSuspendedMail(ctx context.Context, acct state.Account, at time.Time) {
 	subject, body := mail.AccountSuspendedBody(acct.Email, at)
-	msg := mail.Message{To: []string{acct.Email}, Subject: subject, TextBody: body}
+	msg := mail.Message{
+		To:      []string{acct.Email},
+		Subject: subject, TextBody: body,
+		// Stable idempotency key for Resend (PR #1191 fixup).
+		// The "suspended" lifecycle step fires exactly once per
+		// account; the (account_id, template) tuple is unique by
+		// construction. A network-level retry that Resend already
+		// accepted dedupes inside the replay window.
+		MessageID: acct.ID + ":account_suspended",
+	}
 	if err := d.p.Mailer.Send(ctx, msg); err != nil {
 		d.p.Log.Warn("meter: dunning suspended mail", "account", acct.ID, "err", err)
 	}
@@ -260,7 +269,14 @@ func (d *Dunning) sendDeletionMail(ctx context.Context, acct state.Account, at t
 		pastDueAt = *acct.PastDueAt
 	}
 	subject, body := mail.AccountDeletionPendingBody(acct.Email, pastDueAt, at.Add(30*24*time.Hour))
-	msg := mail.Message{To: []string{acct.Email}, Subject: subject, TextBody: body}
+	msg := mail.Message{
+		To:      []string{acct.Email},
+		Subject: subject, TextBody: body,
+		// Stable idempotency key for Resend (PR #1191 fixup).
+		// The "deletion pending" step fires once per account
+		// lifecycle; the (account_id, template) tuple is unique.
+		MessageID: acct.ID + ":account_deletion_pending",
+	}
 	if err := d.p.Mailer.Send(ctx, msg); err != nil {
 		d.p.Log.Warn("meter: dunning deletion mail", "account", acct.ID, "err", err)
 	}

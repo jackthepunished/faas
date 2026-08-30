@@ -51,9 +51,24 @@ type server struct {
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
 	// for the v1 HMAC. Empty disables signature verification (dev mode).
 	stripeWebhookSecret string
+	// resendWebhookSecret is the Svix / Standard Webhooks signing
+	// secret Resend stamps on bounce / complaint deliveries
+	// (issue #246 acceptance item 8). Empty fails-closed: the
+	// resendWebhook handler returns 503 so a missing env var
+	// cannot silently accept unsigned events. Wired via
+	// WithResendWebhookSecret from cmd/apid/main.go after
+	// the sealed-env loader has resolved the value.
+	resendWebhookSecret string
 	// mailer emits the dunning + quota-warning emails. nil falls back
 	// to the noop sender so callers never need to nil-check.
 	mailer Mailer
+	// mailBounce dispatches Resend bounce / complaint events into
+	// the suppression + dunning pipeline (issue #246 acceptance
+	// item 8). Wired via WithMailBounce from cmd/apid/main.go
+	// after the state store + audit auditor are loaded; the
+	// resendWebhook handler returns 500 if it's nil at request
+	// time so a misconfiguration is loud rather than silent.
+	mailBounce mailBounceHandler
 	// githubd is apid's handle to the githubd daemon (ADR-012). Never nil:
 	// slice 1 default is stubGithubdClient; slice 7 swaps for a live dial.
 	githubd GithubdClient
@@ -414,6 +429,28 @@ func (s *server) WithBillingProvider(p billing.Provider) *server {
 	return s
 }
 
+// WithResendWebhookSecret attaches the Svix / Standard Webhooks
+// signing secret Resend uses for bounce / complaint / delivery
+// events (issue #246 acceptance item 8). When empty the
+// resendWebhook handler fails closed with 503 — an unsigned
+// delivery cannot bypass the suppression + dunning pipeline.
+// cmd/apid/main.go resolves this from FAAS_MAIL_RESEND_WEBHOOK_SECRET.
+func (s *server) WithResendWebhookSecret(secret string) *server {
+	s.resendWebhookSecret = secret
+	return s
+}
+
+// WithMailBounce attaches the bounce handler the resendWebhook
+// route dispatches into (issue #246 acceptance item 8). In
+// production this is the meterd-owned *meter.BounceHandler;
+// tests inject a fake via the mailBounceHandler interface so
+// the route can be exercised without standing up a full
+// state.Store + audit auditor.
+func (s *server) WithMailBounce(h mailBounceHandler) *server {
+	s.mailBounce = h
+	return s
+}
+
 // WithRekeyRunner attaches the background re-seal walker
 // (ADR-089 PR-C). nil is the documented default — the
 // /v1/admin/secrets/rekey-progress handler returns 503
@@ -599,11 +636,27 @@ type Mailer interface {
 // Message is the cross-component email payload — mirrors pkg/mail.Message
 // without the import cycle (apid stays free of pkg/mail so daemons that
 // link apid don't pull the mail deps).
+//
+// Headers carries RFC 8058 List-Unsubscribe etc. on the
+// quota-warning template (issue #246 acceptance item 4). The
+// mailAdapter in cmd/apid/main.go copies them into mail.Message
+// so the transport actually reaches the wire — without this the
+// bulk-sender compliance work would be silently dropped at the
+// adapter boundary.
+//
+// MessageID, when non-empty, becomes the Idempotency-Key
+// (Resend) / X-Idempotency-Key (Postmark) header so a retry that
+// the upstream already accepted is deduplicated inside the
+// provider's replay window instead of double-charging. The
+// dunning + quota-warning templates derive a stable id from
+// (account_id, template, day).
 type Message struct {
-	To       []string
-	Subject  string
-	TextBody string
-	HTMLBody string
+	To        []string
+	Subject   string
+	TextBody  string
+	HTMLBody  string
+	Headers   map[string]string
+	MessageID string
 }
 
 // Notifier is the slice of pgstore behaviour apid depends on. The production
@@ -1991,6 +2044,15 @@ func (s *server) handler() http.Handler {
 	// on either provider; the handler's 503 covers the wrong-provider
 	// case.
 	mux.HandleFunc("POST /v1/webhooks/paddle", s.paddleWebhook)
+
+	// Resend bounce/complaint/delivery webhook ingress (issue #246
+	// acceptance item 8). Mounted next to the Paddle route — both
+	// are HMAC-authenticated public POSTs and the fail-closed 503
+	// pattern is identical. The handler reads the raw body, verifies
+	// the Svix envelope, replay-checks against webhookdedupe, and
+	// dispatches to meter.BounceHandler. No auth middleware — the
+	// HMAC *is* the trust boundary.
+	mux.HandleFunc("POST /v1/webhooks/resend", s.resendWebhook)
 
 	// Operator admin surface (issue #98 / ADR-028). Auth lives in
 	// s.adminAllows (email allowlist via FAAS_ADMIN_EMAILS); handlers

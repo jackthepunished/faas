@@ -778,6 +778,17 @@ type LoginToken struct {
 	ConsumedAt pgtype.Timestamptz
 }
 
+type MailSuppression struct {
+	ID              pgtype.UUID
+	AccountID       pgtype.UUID
+	Email           string
+	Reason          string
+	Source          string
+	ProviderEventID string
+	ExpiresAt       pgtype.Timestamptz
+	CreatedAt       pgtype.Timestamptz
+}
+
 type OauthLink struct {
 	Provider        string
 	ProviderSubject string
