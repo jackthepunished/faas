@@ -30,15 +30,15 @@ import (
 // --- column-order contracts ----------------------------------------
 
 // jobSelectCols is the canonical column order for jobs. Keep in lock-
-// step with scanJobCols and the migrations 00255 + 00534 DDL. The
-// command column (00534) is the last entry so the SELECT list reads
+// step with scanJobCols and the migrations 00255 + 00563 DDL. The
+// command column (00563) is the last entry so the SELECT list reads
 // in schema-add order.
 const jobSelectCols = `id, account_id, kind, name, image_ref, ram_mb, task_timeout_s,
        max_parallelism, retry_max, env_overrides, status, created_at,
        updated_at, command`
 
 // jobRunSelectCols is the canonical column order for job_runs.
-// Includes dead_letter_count (00536). ORDER BY id keeps the contract
+// Includes dead_letter_count (00565). ORDER BY id keeps the contract
 // stable when the dashboard adds new columns.
 const jobRunSelectCols = `id, job_id, account_id, trigger_kind, env_overrides, tasks,
        parallelism, retry_max, task_timeout_s, aggregate_status,
@@ -46,8 +46,8 @@ const jobRunSelectCols = `id, job_id, account_id, trigger_kind, env_overrides, t
        dead_letter_count, started_at, finished_at, created_at`
 
 // jobTaskSelectCols is the canonical column order for job_tasks.
-// Includes exit_code + next_attempt_at (00533), lease_token +
-// lease_expires_at + last_lease_node (00536). The dispatch-tick
+// Includes exit_code + next_attempt_at (00562), lease_token +
+// lease_expires_at + last_lease_node (00565). The dispatch-tick
 // SELECT FOR UPDATE SKIP LOCKED in JobTaskClaimBatch uses this list
 // too — same row surface, same scan helper.
 const jobTaskSelectCols = `run_id, task_index, status, attempt, instance_id, error_class,
@@ -376,7 +376,7 @@ func (s *PgStore) JobCountByAccount(ctx context.Context, accountID string) (int,
 func (s *PgStore) JobConcurrentByAccount(ctx context.Context, accountID string) (int, error) {
 	// job_task instances carry job_id (no app_id); we resolve the
 	// owning account via the FK to jobs. The state predicate
-	// matches the soft-delete helper (00538) so a parked/
+	// matches the soft-delete helper (00567) so a parked/
 	// destroyed instance never counts against the cap.
 	var count int
 	err := s.pool.QueryRow(ctx,
@@ -530,7 +530,7 @@ func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, er
 	row := s.pool.QueryRow(ctx,
 		`with counts as (
 		   select
-		     -- 00533 broadened the terminal vocabulary to
+		     -- 00562 broadened the terminal vocabulary to
 		     -- succeeded/failed/timeout/cancelled/oom. CR-E /
 		     -- code-review #2 round-5: the previous SUM arms did
 		     -- NOT include 'timeout' or 'oom', so reaped tasks
@@ -657,7 +657,7 @@ func (s *PgStore) JobRunCancel(ctx context.Context, runID string) (JobRun, error
 
 // JobRunIncrementDeadLetter bumps dead_letter_count by 1 AND the
 // paired tasks_failed by 1. The CHECK constraint
-// `dead_letter_count <= tasks_failed` (00536) requires the two
+// `dead_letter_count <= tasks_failed` (00565) requires the two
 // counters move together — a dead-lettered task is, by definition,
 // a failed task that exhausted retries. Bumping both keeps the
 // cross-field invariant intact; the recompute that follows reads

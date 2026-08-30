@@ -79,7 +79,7 @@ func jobResponse(j state.Job) api.JobResponse {
 // RetryMax / TaskTimeoutSec are *int on the row (nil = inherit
 // from jobs.*); we dereference here so the wire carries the
 // effective integer value (the inheritance was already resolved
-// at run-create time per migrations/00255 + 00536).
+// at run-create time per migrations/00255 + 00565).
 func jobRunResponse(r state.JobRun) api.JobRunResponse {
 	resp := api.JobRunResponse{
 		ID:              r.ID,

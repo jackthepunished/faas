@@ -56,7 +56,7 @@ type PgLeaser struct {
 	pool poolExecutor
 
 	// nodeID is stamped on last_lease_node (job_tasks.last_lease_node,
-	// 00536) so an audit log can name the schedd that owns the lease.
+	// 00565) so an audit log can name the schedd that owns the lease.
 	// Production wiring passes the schedd node identity from
 	// pkg/sched.NodeIdentity.
 	nodeID string
