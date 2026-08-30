@@ -32,6 +32,7 @@ on:
 permissions:
   contents: write
   id-token: write
+  actions: read
   packages: read
 
 jobs:
@@ -185,7 +186,10 @@ jobs:
     name: Build and sign canonical daemon bundle
     needs: build
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # The builder-base publisher is a separate workflow and can use most of
+    # its 25-minute budget before the immutable tag is available. Leave room
+    # for that hand-off plus bundle creation and signing.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -228,6 +232,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GIT_SHA: ${{ github.sha }}
           IMAGE_NAME: ghcr.io/poyrazk/builder-base
+          IMAGE_WAIT_ATTEMPTS: "60"
+          IMAGE_WAIT_SECONDS: "30"
         run: |
           set -euo pipefail
           # images.yml publishes an immutable sha-<commit> tag whenever the
@@ -250,7 +256,70 @@ jobs:
           mkdir -p "$CONFIG_DIR"
           DOCKER_CONFIG="$CONFIG_DIR" crane auth login ghcr.io \
             --username "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
-          MANIFEST_JSON="$(DOCKER_CONFIG="$CONFIG_DIR" crane manifest "$REF")"
+
+          # The image publisher is a separate main-branch workflow. A tag
+          # pushed immediately after a merge can therefore start this job
+          # before images.yml has finished publishing its immutable tag. Wait
+          # for that exact source commit's successful publisher run instead of
+          # racing the registry and failing with MANIFEST_UNKNOWN. The run
+          # check also prevents us from consuming an image that was pushed
+          # before the publisher's guest-init verification failed.
+          MANIFEST_JSON=""
+          IMAGE_RUN_URL=""
+          IMAGE_RUN_SUCCEEDED=false
+          for attempt in $(seq 1 "$IMAGE_WAIT_ATTEMPTS"); do
+            IMAGE_RUNS="$(gh run list \
+              --workflow images.yml \
+              --event push \
+              --branch main \
+              --limit 100 \
+              --json databaseId,headSha,status,conclusion,url)"
+            IMAGE_RUN_URL="$(jq -r --arg sha "$BUILDER_SOURCE_SHA" '
+              [.[] | select(.headSha == $sha and .conclusion == "success")]
+              | sort_by(.databaseId) | last | .url // empty' <<< "$IMAGE_RUNS")"
+            if [[ -n "$IMAGE_RUN_URL" ]]; then
+              echo "builder-base publisher succeeded: $IMAGE_RUN_URL"
+              IMAGE_RUN_SUCCEEDED=true
+              break
+            fi
+
+            LATEST_IMAGE_RUN="$(jq -c --arg sha "$BUILDER_SOURCE_SHA" '
+              [.[] | select(.headSha == $sha)]
+              | sort_by(.databaseId) | last // empty' <<< "$IMAGE_RUNS")"
+            if [[ -n "$LATEST_IMAGE_RUN" ]]; then
+              IMAGE_RUN_STATUS="$(jq -r '.status' <<< "$LATEST_IMAGE_RUN")"
+              IMAGE_RUN_CONCLUSION="$(jq -r '.conclusion // empty' <<< "$LATEST_IMAGE_RUN")"
+              IMAGE_RUN_URL="$(jq -r '.url' <<< "$LATEST_IMAGE_RUN")"
+              if [[ "$IMAGE_RUN_STATUS" == "completed" ]]; then
+                echo "::error::builder-base publisher for $BUILDER_SOURCE_SHA finished with $IMAGE_RUN_CONCLUSION: $IMAGE_RUN_URL" >&2
+                exit 1
+              fi
+              echo "waiting for builder-base publisher ($IMAGE_RUN_STATUS): $IMAGE_RUN_URL"
+            else
+              echo "waiting for images.yml publisher for builder-base source $BUILDER_SOURCE_SHA"
+            fi
+            if [[ "$attempt" -lt "$IMAGE_WAIT_ATTEMPTS" ]]; then
+              sleep "$IMAGE_WAIT_SECONDS"
+            fi
+          done
+          [[ "$IMAGE_RUN_SUCCEEDED" == true ]] || {
+            echo "::error::timed out waiting for images.yml to publish builder-base source $BUILDER_SOURCE_SHA" >&2
+            exit 1
+          }
+
+          # GHCR can take a few seconds to serve a manifest after the Actions
+          # run is complete, so retain a short registry retry as well.
+          for attempt in $(seq 1 12); do
+            if MANIFEST_JSON="$(DOCKER_CONFIG="$CONFIG_DIR" crane manifest "$REF" 2>/tmp/crane-manifest-error)"; then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              cat /tmp/crane-manifest-error >&2
+              exit 1
+            fi
+            echo "waiting for GHCR manifest $REF (attempt $attempt/12)"
+            sleep 5
+          done
           BUILDER_BASE_DIGEST="$(jq -er \
             '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] |
              if length == 1 then .[0] else error("expected exactly one linux/amd64 builder manifest") end' \
