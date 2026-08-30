@@ -3,6 +3,7 @@ package sched
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -167,8 +168,7 @@ func (e *Engine) ObserveNodeInstances(ctx context.Context, nodeID string, liveCo
 		}
 		err := reconciler.FailRunningInstanceIfOwnedByNode(
 			checkCtx, ins.ID, nodeID, terminalAt)
-		switch {
-		case err == nil:
+		if err == nil {
 			if e.ledger != nil {
 				e.ledger.Release(ins.ID)
 			}
@@ -189,14 +189,16 @@ func (e *Engine) ObserveNodeInstances(ctx context.Context, nodeID string, liveCo
 				"instance_id", ins.ID, "app_id", ins.AppID,
 				"node_id", nodeID)
 			reconciled++
-		case err == state.ErrConflict:
+			continue
+		}
+		if errors.Is(err, state.ErrConflict) {
 			// A concurrent lifecycle writer already moved the row.
 			e.log.Debug("sched: stale-instance reconciliation race",
 				"instance_id", ins.ID, "node_id", nodeID)
-		default:
-			e.log.Warn("sched: stale-instance reconciliation update failed",
-				"instance_id", ins.ID, "node_id", nodeID, "err", err)
+			continue
 		}
+		e.log.Warn("sched: stale-instance reconciliation update failed",
+			"instance_id", ins.ID, "node_id", nodeID, "err", err)
 	}
 	e.nodePresence.markReconciled(nodeID, observation.fingerprint)
 	if reconciled > 0 {

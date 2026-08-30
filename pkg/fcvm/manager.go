@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,13 @@ import (
 // Runner executes one host command (ip/nft/sysctl) to completion.
 type Runner interface {
 	Run(ctx context.Context, argv []string) error
+}
+
+// InputRunner is the optional production fast path for tools that accept an
+// atomic stdin batch. Test runners and legacy embedders need only implement
+// Runner; setupNetwork falls back to one command per rule for them.
+type InputRunner interface {
+	RunInput(ctx context.Context, argv []string, input []byte) error
 }
 
 // VMM starts, snapshots, restores, and stops the jailed firecracker process for
@@ -1227,7 +1235,7 @@ func (m *Manager) WithLivenessProbeStarter(starter LivenessProbeStarter) *Manage
 // contexts for liveness monitoring stops the monitor immediately after a
 // successful wake. The daemon context keeps the monitor alive until the
 // instance is explicitly torn down or vmmd shuts down.
-func (m *Manager) WithLifecycleContext(ctx context.Context) *Manager {
+func (m *Manager) WithLifecycleContext(ctx context.Context) *Manager { //nolint:contextcheck // lifecycle context is intentionally retained by vmmd for background work beyond the RPC lifetime.
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1634,7 +1642,7 @@ func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot i
 			"instance", instance)
 		return
 	}
-	parent := m.lifecycleCtx
+	parent := m.lifecycleCtx //nolint:contextcheck // this is the daemon-owned lifecycle context, intentionally outliving the wake RPC.
 	if parent == nil {
 		// Managers constructed outside cmd/vmmd still get the safe
 		// behavior: a request cancellation must not kill a monitor
@@ -4327,7 +4335,32 @@ func (m *Manager) setupNetwork(ctx context.Context, nc netns.Config) error {
 				"instance", nc.Instance, "argv", argv, "err", err)
 		}
 	}
-	return m.runCommands(ctx, nc.NftCommands())
+	return m.runNftCommands(ctx, nc.Netns, nc.NftCommands())
+}
+
+// runNftCommands loads the per-instance ruleset through one nft process when
+// the runner supports stdin. A default ruleset contains dozens of individual
+// rules; spawning ip+nsenter+nft once per rule accounted for a measurable
+// fraction of every restore despite the kernel work itself being tiny.
+func (m *Manager) runNftCommands(ctx context.Context, netnsName string, cmds [][]string) error {
+	inputRunner, ok := m.run.(InputRunner)
+	if !ok || len(cmds) == 0 {
+		return m.runCommands(ctx, cmds)
+	}
+	prefix := []string{"ip", "netns", "exec", netnsName, "nft"}
+	var script strings.Builder
+	for _, argv := range cmds {
+		if len(argv) <= len(prefix) || !slices.Equal(argv[:len(prefix)], prefix) {
+			return fmt.Errorf("unexpected nft command prefix: %v", argv)
+		}
+		script.WriteString(strings.Join(argv[len(prefix):], " "))
+		script.WriteByte('\n')
+	}
+	batchArgv := append(append([]string{}, prefix...), "-f", "-")
+	if err := inputRunner.RunInput(ctx, batchArgv, []byte(script.String())); err != nil {
+		return fmt.Errorf("nft ruleset batch: %w", err)
+	}
+	return nil
 }
 
 // removeStaleNetnsMarker removes only a regular file in the iproute2 netns

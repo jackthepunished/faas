@@ -31,6 +31,20 @@ type fakeRunner struct {
 	teardownCount int
 }
 
+type fakeInputRunner struct {
+	fakeRunner
+	inputArgv []string
+	input     []byte
+	inputRuns int
+}
+
+func (f *fakeInputRunner) RunInput(_ context.Context, argv []string, input []byte) error {
+	f.inputRuns++
+	f.inputArgv = append([]string(nil), argv...)
+	f.input = append([]byte(nil), input...)
+	return nil
+}
+
 // fakeHostRenderer (ADR-119 redesign) is the test stub for the
 // Manager's HostRenderer seam. It records every Render call and
 // the latest StaticEgressRules slice the Manager pushed. The
@@ -1493,6 +1507,35 @@ func TestSetupNetworkRunsNftBeforeVMBoot(t *testing.T) {
 	// VMM.Boot runs after setupNetwork returns (Wake's call sequence). bootCount
 	// is asserted at the top of this test via `vmm.boots() != 1`; the order
 	// between tap-create < DNAT < Boot is the load-bearing #30 invariant.
+}
+
+func TestRunNftCommandsUsesSingleAtomicBatch(t *testing.T) {
+	run := &fakeInputRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	cmds := nc.NftCommands()
+
+	if err := m.runNftCommands(context.Background(), nc.Netns, cmds); err != nil {
+		t.Fatalf("runNftCommands: %v", err)
+	}
+	if run.inputRuns != 1 {
+		t.Fatalf("batch runs = %d, want 1", run.inputRuns)
+	}
+	if got := strings.Join(run.inputArgv, " "); got != "ip netns exec fc-i-1 nft -f -" {
+		t.Fatalf("batch argv = %q", got)
+	}
+	for _, want := range []string{
+		"add table ip faas\n",
+		"dnat to 10.0.0.2:8080\n",
+		"add table ip6 faas\n",
+	} {
+		if !bytes.Contains(run.input, []byte(want)) {
+			t.Errorf("batch missing %q in:\n%s", want, run.input)
+		}
+	}
+	if len(run.commands) != 0 {
+		t.Fatalf("batched rules also ran individually: %v", run.commands)
+	}
 }
 
 // TestSetupNetworkNftFailureLeaksNothing covers the leak invariant when the
