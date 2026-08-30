@@ -179,4 +179,3 @@ func (l *LogSender) Send(_ context.Context, msg Message) error {
 		"text_bytes", len(msg.TextBody))
 	return nil
 }
-
