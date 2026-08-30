@@ -1385,11 +1385,11 @@ func (v *JailerVMM) Kill(_ context.Context, l Lease) error {
 // induced exit). destroyWait bounds the watchdog; an additional
 // grace timer races against the watchdog to fire SIGKILL on the
 // customer-configured deadline.
-func (v *JailerVMM) SignalAndKill(_ context.Context, l Lease, signal syscall.Signal, grace time.Duration) (killSignalSent bool, exitCode int32, err error) {
+func (v *JailerVMM) SignalAndKill(ctx context.Context, l Lease, signal syscall.Signal, grace time.Duration) (killSignalSent bool, exitCode int32, err error) {
 	// Legacy Destroy shape: signal=0, grace=0. Delegate to Kill and
 	// report killSignalSent=true (the SIGKILL is what killed it).
 	if signal == 0 && grace == 0 {
-		if kerr := v.Kill(context.Background(), l); kerr != nil {
+		if kerr := v.Kill(ctx, l); kerr != nil {
 			return true, 0, kerr
 		}
 		return true, 0, nil
@@ -1433,7 +1433,7 @@ func (v *JailerVMM) SignalAndKill(_ context.Context, l Lease, signal syscall.Sig
 			case <-time.After(v.destroyWait):
 			}
 		}
-		if kerr := v.Kill(context.Background(), l); kerr != nil {
+		if kerr := v.Kill(ctx, l); kerr != nil {
 			return killSignalSent, exitCode, kerr
 		}
 	}

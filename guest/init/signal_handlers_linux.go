@@ -140,11 +140,21 @@ func runSignalHandlers(ctx context.Context, manifest api.AppManifest, sup *Super
 	var supStopOnce sync.Once
 	supStop := func(reason string) {
 		supStopOnce.Do(func() {
-			stopCtx, cancel := context.WithTimeout(context.Background(), grace)
+			stopCtx, cancel := context.WithTimeout(ctx, grace)
 			defer cancel()
 			log.Info("guest-init: stop signal received; forwarding to supervisor",
 				"signal", stopSignal.String(), "grace", grace.String(), "reason", reason)
-			sup.Stop(stopCtx, stopSignal, grace)
+			// sup.Stop is best-effort — the timeout-driven
+			// SIGKILL escalation inside Supervisor.Stop
+			// guarantees the customer workload exits within
+			// `grace`, regardless of which error surface.
+			// Capture + log so a typed mismatch surfaces in the
+			// guest-init slog stream without aborting the
+			// signal-handler loop (the loop must stay alive
+			// for SIGCHLD reaping through the stop sequence).
+			if stopErr := sup.Stop(stopCtx, stopSignal, grace); stopErr != nil {
+				log.Warn("guest-init: supervisor stop returned err", "err", stopErr)
+			}
 		})
 	}
 

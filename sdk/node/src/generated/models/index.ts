@@ -297,6 +297,7 @@ export type { SeatUsageResponse } from './SeatUsageResponse.js';
 export type { SecretFinding } from './SecretFinding.js';
 export type { SecretKey } from './SecretKey.js';
 export type { SecretScanResult } from './SecretScanResult.js';
+export type { ServiceReplicas } from './ServiceReplicas.js';
 export type { SessionInfo } from './SessionInfo.js';
 export type { SessionListResponse } from './SessionListResponse.js';
 export type { SessionsRevokeAllResponse } from './SessionsRevokeAllResponse.js';

@@ -1,4 +1,8 @@
+<<<<<<<< HEAD:migrations/00570_instances_mode_widen.sql
 -- filename: 00570_instances_mode_widen.sql
+========
+-- filename: 00533_instances_mode_widen.sql
+>>>>>>>> ced1d3e7d (fixup(ci): PR #1202 lint + migration slot + sdk-node drift):migrations/00533_instances_mode_widen.sql
 -- +goose Up
 -- +goose StatementBegin
 

@@ -230,7 +230,7 @@ func runHealthcheckPollLoop(ctx context.Context, sock int, argv []string, manife
 		case <-time.After(nextDelay):
 		}
 
-		report := execHealthcheck(argv, timeout, uid, log)
+		report := execHealthcheck(ctx, argv, timeout, uid, log)
 		report.Seq = seq
 		report.TsUnixMs = time.Now().UnixMilli()
 		report.StartPeriodS = int(startPeriod / time.Second)
@@ -256,10 +256,10 @@ func runHealthcheckPollLoop(ctx context.Context, sock int, argv []string, manife
 // stdout+stderr, and decides pass/fail based on exit code.
 // Pulled out so the unit test exercises the decision tree
 // without spawning a goroutine.
-func execHealthcheck(argv []string, timeout time.Duration, uid int, log *slog.Logger) HealthcheckReport {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func execHealthcheck(ctx context.Context, argv []string, timeout time.Duration, uid int, log *slog.Logger) HealthcheckReport {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(probeCtx, argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{}
 	if uid > 0 {
 		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid)}
@@ -271,7 +271,7 @@ func execHealthcheck(argv []string, timeout time.Duration, uid int, log *slog.Lo
 		// DeadlineExceeded is the timeout path; surface as
 		// a separate log line so operators can distinguish
 		// "binary crashed" from "binary hung past timeout".
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 			if log != nil {
 				log.Warn("healthcheck: probe timed out",
 					"argv0", argv[0], "timeout", timeout.String())
