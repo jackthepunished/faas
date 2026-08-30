@@ -53,9 +53,13 @@ inventory. The manifest contract currently supports up to 1,000
 resolver map is emitted once in `inventory/group_vars/all.yml`; host-specific
 transport and routing values remain in `host_vars`.
 
-SSH host-key checking is enabled by default. Seed the operator workstation's
-`known_hosts` from the provider console or another trusted channel before the
-first connection; never disable host-key verification for a production run.
+SSH host-key checking is enabled by default. For a direct `join-node` run,
+provide `--ssh-host-key-sha256` from the provider console or another trusted
+out-of-band channel. The command verifies the live key and gives Ansible an
+ephemeral pinned `known_hosts` file; never disable host-key verification for a
+production run. The GitHub compute rollout workflow requires the same
+fingerprint for legacy dispatches and obtains it from signed claims for the
+declarative paths.
 
 For a provider whose default route is public, define
 `faas_private_address` in provider-owned `host_vars` or inventory variables.
@@ -79,7 +83,9 @@ another bare-metal provider), use the provider-neutral adoption pipeline:
 
 ```text
 gregalectl deploy join-node --manifest-file /secure/manifest.yaml \
-  --node fsn-3 --ssh-host 203.0.113.27 [artifact and secret inputs] --yes
+  --node fsn-3 --ssh-host 203.0.113.27 \
+  --ssh-host-key-sha256 SHA256:<verified-host-key-fingerprint> \
+  [artifact and secret inputs] --yes
 ```
 
 For a multi-box join, include the same secret-backed `storage.env` for every

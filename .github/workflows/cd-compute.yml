@@ -59,6 +59,11 @@ on:
         required: false
         default: "22"
         type: string
+      ssh_host_key_sha256:
+        description: "Expected OpenSSH SHA256 host-key fingerprint for the provider SSH address (required for legacy dispatches)"
+        required: false
+        default: ""
+        type: string
       storage_device:
         description: "Optional absolute stable device path when not in the signed manifest"
         required: false
@@ -89,7 +94,7 @@ jobs:
       ssh_host: ${{ steps.resolve_bundle.outputs.ssh_host || steps.resolve_claim.outputs.ssh_host || steps.resolve_legacy.outputs.ssh_host }}
       ssh_user: ${{ steps.resolve_bundle.outputs.ssh_user || steps.resolve_claim.outputs.ssh_user || steps.resolve_legacy.outputs.ssh_user }}
       ssh_port: ${{ steps.resolve_bundle.outputs.ssh_port || steps.resolve_claim.outputs.ssh_port || steps.resolve_legacy.outputs.ssh_port }}
-      ssh_host_key_sha256: ${{ steps.resolve_bundle.outputs.host_key_sha256 || steps.resolve_claim.outputs.host_key_sha256 }}
+      ssh_host_key_sha256: ${{ steps.resolve_bundle.outputs.host_key_sha256 || steps.resolve_claim.outputs.host_key_sha256 || steps.resolve_legacy.outputs.host_key_sha256 }}
       storage_device: ${{ steps.resolve_bundle.outputs.storage_device || steps.resolve_claim.outputs.storage_device || steps.resolve_legacy.outputs.storage_device }}
       format_storage: ${{ steps.resolve_bundle.outputs.format_storage || steps.resolve_claim.outputs.format_storage || steps.resolve_legacy.outputs.format_storage }}
     env:
@@ -107,6 +112,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           NODE: ${{ inputs.node }}
           SSH_HOST: ${{ inputs.ssh_host }}
+          SSH_HOST_KEY_SHA256: ${{ inputs.ssh_host_key_sha256 }}
           FLEET_BUNDLE_URL: ${{ inputs.fleet_bundle_url }}
           FLEET_BUNDLE_SIGNATURE_URL: ${{ inputs.fleet_bundle_signature_url }}
           FLEET_BUNDLE_SHA256: ${{ inputs.fleet_bundle_sha256 }}
@@ -155,6 +161,10 @@ jobs:
             }
             [[ -n "$SSH_HOST" ]] || {
               echo "::error::ssh_host is required when claim_file is omitted" >&2
+              exit 1
+            }
+            [[ "$SSH_HOST_KEY_SHA256" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || {
+              echo "::error::ssh_host_key_sha256 is required for legacy dispatches and must be an OpenSSH SHA256:<base64> fingerprint" >&2
               exit 1
             }
           fi
@@ -295,6 +305,7 @@ jobs:
         env:
           NODE: ${{ inputs.node }}
           SSH_HOST: ${{ inputs.ssh_host }}
+          SSH_HOST_KEY_SHA256: ${{ inputs.ssh_host_key_sha256 }}
           SSH_USER: ${{ inputs.ssh_user }}
           SSH_PORT: ${{ inputs.ssh_port }}
           STORAGE_DEVICE: ${{ inputs.storage_device }}
@@ -304,6 +315,7 @@ jobs:
           {
             printf 'node=%s\n' "$NODE"
             printf 'ssh_host=%s\n' "$SSH_HOST"
+            printf 'host_key_sha256=%s\n' "$SSH_HOST_KEY_SHA256"
             printf 'ssh_user=%s\n' "$SSH_USER"
             printf 'ssh_port=%s\n' "$SSH_PORT"
             printf 'storage_device=%s\n' "$STORAGE_DEVICE"
@@ -328,6 +340,17 @@ jobs:
             missing=1
           fi
           (( missing == 0 )) || exit 1
+
+      - name: Require a verified SSH host-key fingerprint
+        env:
+          SSH_HOST_KEY_SHA256: ${{ steps.resolve_bundle.outputs.host_key_sha256 || steps.resolve_claim.outputs.host_key_sha256 || steps.resolve_legacy.outputs.host_key_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST_KEY_SHA256" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || {
+            echo "::error::the resolved compute claim must contain an OpenSSH SHA256:<base64> host-key fingerprint" >&2
+            echo "::error::provide ssh_host_key_sha256 for legacy dispatches or regenerate the signed claim" >&2
+            exit 1
+          }
 
       - name: Require an online trusted fleet runner
         env:
@@ -636,6 +659,15 @@ jobs:
             --yes
             --json
           )
+          # The CLI verifies the live provider address with ssh-keyscan and
+          # gives Ansible a temporary known_hosts file pinned to this exact
+          # fingerprint. Never fall back to the runner's ambient known_hosts
+          # or disable strict host-key checking for a production join.
+          [[ -n "$SSH_HOST_KEY_SHA256" ]] || {
+            echo "::error::resolved SSH host-key fingerprint is empty" >&2
+            exit 1
+          }
+          JOIN_ARGS+=(--ssh-host-key-sha256 "$SSH_HOST_KEY_SHA256")
           if [[ -n "$FLEET_BUNDLE_URL" ]]; then
             JOIN_ARGS+=(
               --fleet-bundle-file "$ARTIFACT_DIR/fleet-enrollment.yaml"
