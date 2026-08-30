@@ -70,7 +70,7 @@ func pgJobsSeed(t *testing.T, s *state.PgStore, ctx context.Context, name string
 
 func TestPg_Jobs_JobGetByID(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g1")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-1")
 
 	got, err := s.JobGetByID(ctx, job.ID)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestPg_Jobs_JobGetByID(t *testing.T) {
 
 func TestPg_Jobs_JobGetByName(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g2")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-2")
 
 	got, err := s.JobGetByName(ctx, job.AccountID, job.Name)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestPg_Jobs_JobGetByName(t *testing.T) {
 
 func TestPg_Jobs_JobListByAccount(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g3")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-3")
 
 	list, err := s.JobListByAccount(ctx, job.AccountID, 50, 0)
 	if err != nil {
@@ -123,7 +123,7 @@ func TestPg_Jobs_JobListByAccount(t *testing.T) {
 
 func TestPg_Jobs_JobUpdate(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g4")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-4")
 
 	newCmd := []string{"/bin/sh", "-c", "echo updated"}
 	newImg := "oci://registry.example/y@sha256:feedface"
@@ -142,7 +142,7 @@ func TestPg_Jobs_JobUpdate(t *testing.T) {
 
 func TestPg_Jobs_JobSoftDelete(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g5")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-5")
 
 	deleted, hasLive, err := s.JobSoftDelete(ctx, job.ID)
 	if err != nil {
@@ -166,7 +166,7 @@ func TestPg_Jobs_JobSoftDelete(t *testing.T) {
 
 func TestPg_Jobs_JobCountByAccount(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g6")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-6")
 	if n, err := s.JobCountByAccount(ctx, job.AccountID); err != nil || n < 1 {
 		t.Errorf("JobCountByAccount = %d, err=%v, want ≥1", n, err)
 	}
@@ -174,7 +174,7 @@ func TestPg_Jobs_JobCountByAccount(t *testing.T) {
 
 func TestPg_Jobs_JobConcurrentByAccount(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, _, _ := pgJobsSeed(t, s, ctx, "g7")
+	job, _, _ := pgJobsSeed(t, s, ctx, "job-7")
 	n, err := s.JobConcurrentByAccount(ctx, job.AccountID)
 	if err != nil {
 		t.Fatalf("JobConcurrentByAccount: %v", err)
@@ -188,7 +188,7 @@ func TestPg_Jobs_JobConcurrentByAccount(t *testing.T) {
 
 func TestPg_Jobs_JobRunGetByID(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, _ := pgJobsSeed(t, s, ctx, "r1")
+	_, run, _ := pgJobsSeed(t, s, ctx, "run-1")
 
 	got, err := s.JobRunGetByID(ctx, run.ID)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestPg_Jobs_JobRunGetByID(t *testing.T) {
 
 func TestPg_Jobs_JobRunListByJob(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, run, _ := pgJobsSeed(t, s, ctx, "r2")
+	job, run, _ := pgJobsSeed(t, s, ctx, "run-2")
 
 	list, err := s.JobRunListByJob(ctx, job.ID, 50, 0)
 	if err != nil {
@@ -217,7 +217,7 @@ func TestPg_Jobs_JobRunListByJob(t *testing.T) {
 
 func TestPg_Jobs_JobRunListByAccount(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	job, run, _ := pgJobsSeed(t, s, ctx, "r3")
+	job, run, _ := pgJobsSeed(t, s, ctx, "run-3")
 
 	list, err := s.JobRunListByAccount(ctx, job.AccountID, 50, 0)
 	if err != nil {
@@ -230,7 +230,7 @@ func TestPg_Jobs_JobRunListByAccount(t *testing.T) {
 
 func TestPg_Jobs_JobRunRecompute(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "r4")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "run-4")
 	finish := time.Now()
 	for _, tk := range fanned {
 		if err := s.JobTaskMarkTerminal(ctx, run.ID, tk.TaskIndex, "succeeded", 0, "", "", finish); err != nil {
@@ -252,7 +252,7 @@ func TestPg_Jobs_JobRunRecompute(t *testing.T) {
 
 func TestPg_Jobs_JobRunCancel(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, _ := pgJobsSeed(t, s, ctx, "r5")
+	_, run, _ := pgJobsSeed(t, s, ctx, "run-5")
 
 	cancelled, err := s.JobRunCancel(ctx, run.ID)
 	if err != nil {
@@ -269,7 +269,7 @@ func TestPg_Jobs_JobRunCancel(t *testing.T) {
 
 func TestPg_Jobs_JobRunIncrementDeadLetter(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, _ := pgJobsSeed(t, s, ctx, "r6")
+	_, run, _ := pgJobsSeed(t, s, ctx, "run-6")
 	if err := s.JobRunIncrementDeadLetter(ctx, run.ID); err != nil {
 		t.Fatalf("JobRunIncrementDeadLetter: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestPg_Jobs_JobRunIncrementDeadLetter(t *testing.T) {
 
 func TestPg_Jobs_JobTaskClaimBatch(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	pgJobsSeed(t, s, ctx, "t1")
+	pgJobsSeed(t, s, ctx, "task-1")
 
 	batch, err := s.JobTaskClaimBatch(ctx, 2)
 	if err != nil {
@@ -302,7 +302,7 @@ func TestPg_Jobs_JobTaskClaimBatch(t *testing.T) {
 
 func TestPg_Jobs_JobTaskMarkClaimed(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t2")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-2")
 	task := fanned[0]
 	lease := "00000000-0000-0000-0000-deadbeefcafe"
 	nodeID := resolveDefaultLocal(t, ctx, s)
@@ -321,7 +321,7 @@ func TestPg_Jobs_JobTaskMarkClaimed(t *testing.T) {
 
 func TestPg_Jobs_JobTaskMarkTerminal(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t3")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-3")
 	task := fanned[0]
 	finish := time.Now()
 	if err := s.JobTaskMarkTerminal(ctx, run.ID, task.TaskIndex, "failed", 1, "user_error", "boom", finish); err != nil {
@@ -338,7 +338,7 @@ func TestPg_Jobs_JobTaskMarkTerminal(t *testing.T) {
 
 func TestPg_Jobs_JobTaskRetry(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t4")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-4")
 	task := fanned[0]
 	if err := s.JobTaskMarkTerminal(ctx, run.ID, task.TaskIndex, "failed", 1, "user_error", "", time.Now()); err != nil {
 		t.Fatalf("setup MarkTerminal: %v", err)
@@ -358,7 +358,7 @@ func TestPg_Jobs_JobTaskRetry(t *testing.T) {
 
 func TestPg_Jobs_JobTaskRequeue(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t5")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-5")
 	task := fanned[0]
 	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, "00000000-0000-0000-0000-000000000099",
 		"00000000-0000-0000-0000-deadbeef0001", time.Now().Add(5*time.Minute), resolveDefaultLocal(t, ctx, s)); err != nil {
@@ -376,7 +376,7 @@ func TestPg_Jobs_JobTaskRequeue(t *testing.T) {
 
 func TestPg_Jobs_JobTaskCancel(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t6")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-6")
 	task := fanned[0]
 	if err := s.JobTaskCancel(ctx, run.ID, task.TaskIndex); err != nil {
 		t.Fatalf("JobTaskCancel: %v", err)
@@ -389,7 +389,7 @@ func TestPg_Jobs_JobTaskCancel(t *testing.T) {
 
 func TestPg_Jobs_JobTaskFindStuck(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t7")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-7")
 	task := fanned[0]
 	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, "00000000-0000-0000-0000-000000000098",
 		"00000000-0000-0000-0000-deadbeef0002", time.Now().Add(-time.Hour), resolveDefaultLocal(t, ctx, s)); err != nil {
@@ -406,7 +406,7 @@ func TestPg_Jobs_JobTaskFindStuck(t *testing.T) {
 
 func TestPg_Jobs_JobTaskGet(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t8")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-8")
 	got, err := s.JobTaskGet(ctx, run.ID, fanned[0].TaskIndex)
 	if err != nil {
 		t.Fatalf("JobTaskGet: %v", err)
@@ -421,7 +421,7 @@ func TestPg_Jobs_JobTaskGet(t *testing.T) {
 
 func TestPg_Jobs_JobTaskList(t *testing.T) {
 	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "t9")
+	_, run, fanned := pgJobsSeed(t, s, ctx, "task-9")
 	list, err := s.JobTaskList(ctx, run.ID, 50, 0)
 	if err != nil {
 		t.Fatalf("JobTaskList: %v", err)
