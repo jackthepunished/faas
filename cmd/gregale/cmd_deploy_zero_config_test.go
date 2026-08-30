@@ -16,6 +16,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -330,6 +332,118 @@ func TestDeployZeroConfig_JSONShape(t *testing.T) {
 	if strings.Contains(string(out), "build queued") || strings.Contains(string(out), "Deployed.") {
 		t.Errorf("--json stdout leaked human deploy log: %s", out)
 	}
+}
+
+// TestDeployZeroConfig_ReceiptContainsProvenance pins issue #1182
+// §P1 follow-up: the `--json` wire on the zero-config path emits
+// a DeployReceipt that carries the customer's HEAD SHA, dirty
+// flag, customer-facing app_url, and the SHA-256 of the tarball
+// bytes just shipped. The bare DeploymentResponse-unmarshal pin
+// (TestDeployZeroConfig_JSONShape above) still passes because the
+// receipt's extra top-level keys are silently dropped — this test
+// pins the receipt fields too so a future regression that drops
+// the wire-up at commands2.go:1638 is caught here.
+func TestDeployZeroConfig_ReceiptContainsProvenance(t *testing.T) {
+	repo := initZeroConfigRepo(t)
+	withCwd(t, repo)
+
+	// Resolve the expected HEAD SHA + a known source-bytes sha
+	// from the git archive of the test repo. Computing the
+	// expected source_sha256 from the file the test just wrote
+	// would couple the pin to the test's own bookkeeping; running
+	// `git archive` mirrors what cmdDeployTarball does, so the
+	// expected digest is the value the receipt must report.
+	shaCmd := exec.Command("git", "rev-parse", "HEAD")
+	shaCmd.Dir = repo
+	shaOut, err := shaCmd.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	expectedSHA := strings.TrimRight(string(shaOut), "\n")
+
+	archivePath := filepath.Join(t.TempDir(), "expected.tar.gz")
+	archiveCmd := exec.Command("git", "archive", "HEAD", "--format=tar.gz", "-o", archivePath)
+	archiveCmd.Dir = repo
+	if out, err := archiveCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git archive: %v\n%s", err, out)
+	}
+	expectedFileSHA, err := fileSHA256Hex(t, archivePath)
+	if err != nil {
+		t.Fatalf("sha256(expected tarball): %v", err)
+	}
+
+	stub := newZeroConfigStubServer(t, func(w http.ResponseWriter, r *http.Request, z *zeroConfigStubServer) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == "POST":
+			z.gotCalls["create"]++
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a1", Slug: "demo"})
+		case r.URL.Path == "/v1/apps/demo/deployments" && r.Method == "POST":
+			z.gotCalls["deploy"]++
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: "demo"})
+		default:
+			http.Error(w, "no", 404)
+		}
+	})
+	t.Setenv("FAAS_API", stub.srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	var stdout bytes.Buffer
+	oldOut := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = oldOut }()
+
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = false })
+
+	code := cmdDeployTarball([]string{"--json", "--name", "demo"})
+	if code != 0 {
+		t.Fatalf("zero-config deploy --json exit = %d, want 0\nstdout: %s", code, stdout.String())
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("--json stdout parse: %v\nstdout: %s", err, stdout.String())
+	}
+	if got, ok := doc["id"].(string); !ok || got != "d1" {
+		t.Errorf("id = %v (present=%v), want d1", doc["id"], ok)
+	}
+	if got, ok := doc["app_url"].(string); !ok || got != "https://demo.gregale.dev" {
+		t.Errorf("app_url = %v (present=%v), want https://demo.gregale.dev", doc["app_url"], ok)
+	}
+	if got, ok := doc["commit_sha"].(string); !ok || got != expectedSHA {
+		t.Errorf("commit_sha = %v (present=%v), want %s", doc["commit_sha"], ok, expectedSHA)
+	}
+	// dirty uses json:",omitempty" — on a clean repo (Dirty=false)
+	// the key is dropped from the wire. The dirty=true variant
+	// is exercised by TestDeployZeroConfig_DirtyTree_OnlyCommitsShipped
+	// below; here we pin only that the wire is absence-clean for
+	// a clean tree (no spurious true).
+	if _, present := doc["dirty"]; present {
+		t.Errorf("dirty must be absent on clean repo (omitempty); got %v", doc["dirty"])
+	}
+	if got, ok := doc["source_sha256"].(string); !ok || got != expectedFileSHA {
+		t.Errorf("source_sha256 = %v (present=%v), want %s", doc["source_sha256"], ok, expectedFileSHA)
+	}
+}
+
+// fileSHA256Hex returns the lower-case hex sha256 of the file at
+// path. Mirrors tarballSHA256 in git_local.go but is duplicated
+// here so the test can pin the expected digest without exporting
+// the production helper (which operates on the CLI's own temp
+// files and is a CLI-only side-effect).
+func fileSHA256Hex(t *testing.T, path string) (string, error) {
+	t.Helper()
+	f, err := os.Open(path) //nolint:forbidigo // test helper; reads the file the test just wrote
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // TestDeployZeroConfig_DirtyTree_OnlyCommitsShipped pins the

@@ -793,6 +793,26 @@ func TestCmdDeploy_JSON_SkipsStream(t *testing.T) {
 	if dep.ID != "d1" {
 		t.Errorf("dep.ID = %q, want d1", dep.ID)
 	}
+	// Issue #1182 §P1 follow-up: receipt must carry app_url
+	// (always), and on the image path commit_sha / source_sha256
+	// / dirty stay empty (omitempty + zero values). The pin
+	// above unmarshals into api.DeploymentResponse and so ignores
+	// the extra top-level keys — that's intentional; the second
+	// pass asserts key-level shape so a future regression that
+	// drops the receipt round-trip is caught here.
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("doc parse: %v\noutput: %s", err, out)
+	}
+	if got, ok := doc["app_url"].(string); !ok || got != "https://my-app.gregale.dev" {
+		t.Errorf("app_url = %v (present=%v), want https://my-app.gregale.dev", doc["app_url"], ok)
+	}
+	if _, present := doc["commit_sha"]; present {
+		t.Errorf("image path must not stamp commit_sha (prov=nil); got %v", doc["commit_sha"])
+	}
+	if _, present := doc["source_sha256"]; present {
+		t.Errorf("image path must not stamp source_sha256 (no source bytes); got %v", doc["source_sha256"])
+	}
 }
 
 func TestCmdUsage_JSON_NDJSONList(t *testing.T) {

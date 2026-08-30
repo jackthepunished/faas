@@ -17,6 +17,8 @@ from .add_tenant_hostname_request import AddTenantHostnameRequest
 from .add_trusted_signer_request import AddTrustedSignerRequest
 from .admin_set_github_webhook_secret_request import AdminSetGithubWebhookSecretRequest
 from .admin_set_github_webhook_secret_response import AdminSetGithubWebhookSecretResponse
+from .alert_delivery_response import AlertDeliveryResponse
+from .alert_delivery_response_status import AlertDeliveryResponseStatus
 from .alert_preset_response import AlertPresetResponse
 from .alert_preset_response_category import AlertPresetResponseCategory
 from .alert_preset_response_comparison import AlertPresetResponseComparison
@@ -583,6 +585,8 @@ from .tenant_surface_response import TenantSurfaceResponse
 from .tenant_surface_response_cert_kind import TenantSurfaceResponseCertKind
 from .tenant_surface_response_cert_state import TenantSurfaceResponseCertState
 from .tenant_surface_response_status import TenantSurfaceResponseStatus
+from .test_alert_preset_response import TestAlertPresetResponse
+from .test_alert_preset_response_status import TestAlertPresetResponseStatus
 from .throttle_preview_row import ThrottlePreviewRow
 from .throttle_suggestion_row import ThrottleSuggestionRow
 from .throttle_suggestions_response import ThrottleSuggestionsResponse
@@ -674,6 +678,8 @@ __all__ = (
     "AddTrustedSignerRequest",
     "AdminSetGithubWebhookSecretRequest",
     "AdminSetGithubWebhookSecretResponse",
+    "AlertDeliveryResponse",
+    "AlertDeliveryResponseStatus",
     "AlertPresetResponse",
     "AlertPresetResponseCategory",
     "AlertPresetResponseComparison",
@@ -1228,6 +1234,8 @@ __all__ = (
     "TenantSurfaceResponseCertKind",
     "TenantSurfaceResponseCertState",
     "TenantSurfaceResponseStatus",
+    "TestAlertPresetResponse",
+    "TestAlertPresetResponseStatus",
     "ThrottlePreviewRow",
     "ThrottleSuggestionRow",
     "ThrottleSuggestionsResponse",
