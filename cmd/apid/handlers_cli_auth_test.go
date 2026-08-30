@@ -3,9 +3,10 @@
 // The flow:
 //
 //  1. POST /v1/cli-auth/code       — CLI mints a code.
-//  2. GET  /cli-auth?code=…         — Dashboard renders the email form.
-//  3. POST /cli-auth                — Dashboard claims the code, sets
-//     the session cookie.
+//  2. GET  /cli-auth?code=…         — Dashboard renders the authorization
+//     page for the already-authenticated browser session.
+//  3. POST /cli-auth                — Dashboard claims the code for that
+//     session's account.
 //  4. POST /v1/cli-auth/exchange    — CLI polls; on approval, mints
 //     the API key and returns plaintext.
 //
@@ -40,18 +41,29 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// cliAuthTestServer keeps the apid server alongside its handler so
+// tests can issue a real authenticated dashboard cookie. The browser
+// claim route must never infer an account from POSTed email.
+type cliAuthTestServer struct {
+	http.Handler
+	apid           *server
+	store          *state.MemStore
+	sessionCookies map[string]string
+}
+
 // newCliAuthTestServer wires a fresh MemStore-backed apid handler
 // with the minimum deps needed for the device-code flow: a session
-// manager (so /cli-auth POST can issue faas_sid), a noop notifier,
+// manager (so /cli-auth requires faas_sid), a noop notifier,
 // a noop mailer (login magic-link isn't exercised here but the
 // surface is mounted together), a stub githubd client.
-func newCliAuthTestServer(t *testing.T) (http.Handler, *state.MemStore) {
+func newCliAuthTestServer(t *testing.T) (*cliAuthTestServer, *state.MemStore) {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "",
-		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "").handler()
-	return srv, store
+	server := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "",
+		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "")
+	return &cliAuthTestServer{Handler: server.handler(), apid: server, store: store,
+		sessionCookies: make(map[string]string)}, store
 }
 
 // cliAuthTestNotifier is a recording Notifier for cli-auth tests.
@@ -99,13 +111,15 @@ func (n *cliAuthTestNotifier) Calls() []cliAuthNotifyCall {
 // notifier instead of noopNotifier. Used by F6's notify assertion
 // and any future test that needs to inspect what the dashboard
 // path emitted over pg_notify channels.
-func newCliAuthTestServerWithNotifier(t *testing.T) (http.Handler, *state.MemStore, *cliAuthTestNotifier) {
+func newCliAuthTestServerWithNotifier(t *testing.T) (*cliAuthTestServer, *state.MemStore, *cliAuthTestNotifier) {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	notif := newCliAuthTestNotifier()
-	srv := newServerWithDeps(store, log, "gregale.dev", notif, "",
-		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "").handler()
+	server := newServerWithDeps(store, log, "gregale.dev", notif, "",
+		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "")
+	srv := &cliAuthTestServer{Handler: server.handler(), apid: server, store: store,
+		sessionCookies: make(map[string]string)}
 	return srv, store, notif
 }
 
@@ -127,30 +141,61 @@ func mintCliAuthCodeForTest(t *testing.T, srv http.Handler) api.CliAuthCodeRespo
 	return resp
 }
 
-// renderCliAuthForTest GETs /cli-auth?code=… and returns the csrf
-// cookie + form-token pair that renderCliAuthPage produces. Tests
-// use this instead of hand-coding `confirm_token=cli-auth:yes` so the
-// helper exercises the full Issue → render → Set-Cookie wire.
+// issueBrowserSessionForTest creates the same signed dashboard session
+// that password/OAuth login would issue. It deliberately uses the
+// production session seam so the route-level sessionAuth wrapper is
+// exercised by every browser-flow test.
+func (h *cliAuthTestServer) issueBrowserSessionForTest(t *testing.T, email string) string {
+	t.Helper()
+	acct, err := h.store.AccountByEmail(t.Context(), email)
+	if err != nil {
+		acct, err = h.store.CreateAccount(t.Context(), email, api.PlanFree)
+		if err != nil {
+			t.Fatalf("create test account: %v", err)
+		}
+	}
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	cookie, _, err := h.apid.issueDashboardSession(t.Context(), r, acct.ID, false, "test")
+	if err != nil {
+		t.Fatalf("issue dashboard session: %v", err)
+	}
+	return cookie
+}
+
+// renderCliAuthForTest GETs /cli-auth?code=… as a signed-in account and
+// returns the authenticated CSRF cookie + form-token pair that
+// renderCliAuthPage produces. This exercises the full
+// sessionAuth → IssueForAuthenticated → render → Set-Cookie wire.
 //
 // On error the test fails loudly — these helpers are convenience
 // shims for the happy path; rejection paths drive the renderer
 // directly.
 func renderCliAuthForTest(t *testing.T, srv http.Handler, code string) (cookieValue, formValue string) {
+	return renderCliAuthForTestAs(t, srv, code, "cli-auth@example.com")
+}
+
+func renderCliAuthForTestAs(t *testing.T, srv http.Handler, code, email string) (cookieValue, formValue string) {
 	t.Helper()
+	h, ok := srv.(*cliAuthTestServer)
+	if !ok {
+		t.Fatal("renderCliAuthForTest: unexpected handler type")
+	}
+	sessionCookieValue := h.issueBrowserSessionForTest(t, email)
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/cli-auth?code="+code, nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sessionCookieValue})
 	srv.ServeHTTP(rec, r)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("render /cli-auth: code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
 	}
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == middleware.CookieNameAnonymous {
+		if c.Name == middleware.CookieNameAuthenticated {
 			cookieValue = c.Value
 		}
 	}
 	if cookieValue == "" {
 		t.Fatalf("render /cli-auth: missing %s cookie in Set-Cookie: %v",
-			middleware.CookieNameAnonymous, rec.Header().Get("Set-Cookie"))
+			middleware.CookieNameAuthenticated, rec.Header().Get("Set-Cookie"))
 	}
 	re := regexp.MustCompile(`name="csrf_token"\s+value="([^"]+)"`)
 	m := re.FindStringSubmatch(rec.Body.String())
@@ -161,6 +206,7 @@ func renderCliAuthForTest(t *testing.T, srv http.Handler, code string) (cookieVa
 	if formValue == "" {
 		t.Fatal("render /cli-auth: csrf_token value is empty")
 	}
+	h.sessionCookies[cookieValue] = sessionCookieValue
 	return cookieValue, formValue
 }
 
@@ -169,13 +215,18 @@ func renderCliAuthForTest(t *testing.T, srv http.Handler, code string) (cookieVa
 // so the call sites read top-to-bottom ("email + code + token").
 func postCliAuthForTest(t *testing.T, srv http.Handler, code, email, cookieValue, formValue string) *httptest.ResponseRecorder {
 	t.Helper()
+	h, ok := srv.(*cliAuthTestServer)
+	if !ok {
+		t.Fatal("postCliAuthForTest: unexpected handler type")
+	}
 	form := "code=" + strings.ReplaceAll(code, "-", "") +
 		"&email=" + email +
 		"&" + middleware.FormFieldName + "=" + formValue
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAnonymous, Value: cookieValue})
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: h.sessionCookies[cookieValue]})
+	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: cookieValue})
 	srv.ServeHTTP(rec, r)
 	return rec
 }
@@ -206,8 +257,8 @@ func TestMintCliAuthCode_ReturnsCodeAndURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("URL = %q is invalid: %v", resp.URL, err)
 	}
-	if !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host != "api.gregale.dev" {
-		t.Errorf("URL = %q, want absolute https://api.gregale.dev URL", resp.URL)
+	if !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host != "gregale.dev" {
+		t.Errorf("URL = %q, want absolute https://gregale.dev URL", resp.URL)
 	}
 	if parsed.Path != "/cli-auth" || parsed.Query().Get("code") != resp.Code {
 		t.Errorf("URL = %q, want /cli-auth with code query %q", resp.URL, resp.Code)
@@ -447,23 +498,32 @@ func TestExchangeCliAuthCode_UnknownCodeReturns410(t *testing.T) {
 }
 
 // TestRenderCliAuthPage_Happy verifies the dashboard GET /cli-auth
-// renders the email-input form when a pending code is presented.
+// renders an authorization form for the signed-in account, without
+// accepting an email from the browser as an identity claim.
 // Anti-enumeration: an unknown code renders the error page, NOT a
 // 404 (covered in TestRenderCliAuthPage_UnknownRendersError).
 func TestRenderCliAuthPage_Happy(t *testing.T) {
 	srv, _ := newCliAuthTestServer(t)
 
 	minted := mintCliAuthCodeForTest(t, srv)
+	_, _ = renderCliAuthForTestAs(t, srv, minted.Code, "alice@example.com")
 	rec := httptest.NewRecorder()
+	h := srv
 	r := httptest.NewRequest(http.MethodGet, "/cli-auth?code="+minted.Code, nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: h.issueBrowserSessionForTest(t, "alice@example.com")})
 	srv.ServeHTTP(rec, r)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
-	}
 	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, body)
+	}
 	if !strings.Contains(body, "Authorize CLI session") {
 		t.Errorf("body missing title: %s", body)
+	}
+	if !strings.Contains(body, "alice@example.com") {
+		t.Errorf("body missing authenticated account email: %s", body)
+	}
+	if strings.Contains(body, `name="email"`) {
+		t.Errorf("body must not contain an email identity field: %s", body)
 	}
 	// The hidden code field carries the normalized (dash-less) code
 	// so the POST handler can hash it directly.
@@ -483,6 +543,8 @@ func TestRenderCliAuthPage_UnknownRendersError(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/cli-auth?code=DEAD-BEEF", nil)
+	h := srv
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: h.issueBrowserSessionForTest(t, "unknown-code@example.com")})
 	srv.ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusOK {
@@ -497,17 +559,19 @@ func TestRenderCliAuthPage_UnknownRendersError(t *testing.T) {
 	}
 }
 
-// TestPostCliAuthPage_CreatesAccountOnUnknownEmail exercises the UX
-// §2.2 "First successful login creates the account row if the
-// email is new" promise. A fresh email + a freshly-minted code must
-// result in a 302 to /dashboard/account, a session cookie set, and
-// the account now in the store.
-func TestPostCliAuthPage_CreatesAccountOnUnknownEmail(t *testing.T) {
+// TestPostCliAuthPage_BindsToAuthenticatedAccount proves the browser's
+// submitted email is not an account-selection primitive. The claim is
+// always bound to the account established by sessionAuth.
+func TestPostCliAuthPage_BindsToAuthenticatedAccount(t *testing.T) {
 	srv, store := newCliAuthTestServer(t)
 
+	account, err := store.CreateAccount(t.Context(), "alice@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
 	minted := mintCliAuthCodeForTest(t, srv)
-	cookieValue, formValue := renderCliAuthForTest(t, srv, minted.Code)
-	rec := postCliAuthForTest(t, srv, minted.Code, "brand-new@example.com", cookieValue, formValue)
+	cookieValue, formValue := renderCliAuthForTestAs(t, srv, minted.Code, account.Email)
+	rec := postCliAuthForTest(t, srv, minted.Code, "attacker@example.com", cookieValue, formValue)
 
 	if rec.Code != http.StatusFound {
 		t.Fatalf("code = %d, want 302\nbody = %s", rec.Code, rec.Body.String())
@@ -515,23 +579,23 @@ func TestPostCliAuthPage_CreatesAccountOnUnknownEmail(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "/dashboard/account" {
 		t.Errorf("redirect = %q, want /dashboard/account", loc)
 	}
-	if cookie := rec.Header().Get("Set-Cookie"); !strings.Contains(cookie, "faas_sid=") {
-		t.Errorf("Set-Cookie = %q, want faas_sid=…", cookie)
+	if cookie := rec.Header().Get("Set-Cookie"); strings.Contains(cookie, "faas_sid=") {
+		t.Errorf("authorization must not replace the dashboard session: Set-Cookie = %q", cookie)
 	}
-	// Verify the account was created.
-	acct, err := store.AccountByEmail(t.Context(), "brand-new@example.com")
+	claimed, claimedAccountID, err := store.PeekCliAuthCode(t.Context(), mustHashCode(t, minted.Code))
 	if err != nil {
-		t.Fatalf("AccountByEmail after create: %v", err)
+		t.Fatalf("peek claimed code: %v", err)
 	}
-	if acct.Email != "brand-new@example.com" {
-		t.Errorf("account email = %q", acct.Email)
+	if claimed != api.CliAuthStatusPending || claimedAccountID != account.ID {
+		t.Fatalf("status/account = %q/%q, want pending/%q", claimed, claimedAccountID, account.ID)
+	}
+	if _, err := store.AccountByEmail(t.Context(), "attacker@example.com"); err == nil {
+		t.Fatal("attacker email unexpectedly created an account")
 	}
 }
 
-// TestPostCliAuthPage_ReusesExistingAccount confirms that a known
-// email does not create a duplicate account row — UX §2.2 promise
-// is "first successful login creates the row", which means the
-// second login reuses the same account_id.
+// TestPostCliAuthPage_ReusesExistingAccount confirms that a signed-in
+// account can authorize a second CLI code without creating a duplicate.
 func TestPostCliAuthPage_ReusesExistingAccount(t *testing.T) {
 	srv, store := newCliAuthTestServer(t)
 
@@ -541,8 +605,8 @@ func TestPostCliAuthPage_ReusesExistingAccount(t *testing.T) {
 	}
 
 	minted := mintCliAuthCodeForTest(t, srv)
-	cookieValue, formValue := renderCliAuthForTest(t, srv, minted.Code)
-	rec := postCliAuthForTest(t, srv, minted.Code, "old-customer@example.com", cookieValue, formValue)
+	cookieValue, formValue := renderCliAuthForTestAs(t, srv, minted.Code, existing.Email)
+	rec := postCliAuthForTest(t, srv, minted.Code, "different@example.com", cookieValue, formValue)
 
 	if rec.Code != http.StatusFound {
 		t.Fatalf("code = %d, want 302\nbody = %s", rec.Code, rec.Body.String())
@@ -557,23 +621,52 @@ func TestPostCliAuthPage_ReusesExistingAccount(t *testing.T) {
 	}
 }
 
-// TestPostCliAuthPage_RejectsMissingCSRFToken confirms the A1 CSRF
-// guard. A POST without the cli-auth-pre cookie, or with a forged
-// token, must render the "Invalid form" error page — not 302. This
-// is the regression test for the static-literal-token bug.
-func TestPostCliAuthPage_RejectsMissingCSRFToken(t *testing.T) {
+// TestCliAuthRoutesRequireSession ensures a device code and an arbitrary
+// email cannot bootstrap a dashboard session or authorize a CLI key.
+func TestCliAuthRoutesRequireSession(t *testing.T) {
 	srv, store := newCliAuthTestServer(t)
+	minted := mintCliAuthCodeForTest(t, srv)
+
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		var body io.Reader
+		if method == http.MethodPost {
+			body = strings.NewReader("code=" + strings.ReplaceAll(minted.Code, "-", "") + "&email=attacker@example.com")
+		}
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(method, "/cli-auth?code="+minted.Code, body)
+		if method == http.MethodPost {
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		srv.ServeHTTP(rec, r)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("%s code = %d, want 302\nbody = %s", method, rec.Code, rec.Body.String())
+		}
+		if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/login?next=") {
+			t.Errorf("%s redirect = %q, want login return target", method, loc)
+		}
+	}
+	if _, err := store.AccountByEmail(t.Context(), "attacker@example.com"); err == nil {
+		t.Fatal("unauthenticated CLI auth request created an account")
+	}
+}
+
+// TestPostCliAuthPage_RejectsMissingCSRFToken confirms the authenticated
+// CSRF guard. A valid dashboard session with a missing or forged
+// faas_csrf token must render the "Invalid form" error page.
+func TestPostCliAuthPage_RejectsMissingCSRFToken(t *testing.T) {
+	srv, _ := newCliAuthTestServer(t)
 
 	minted := mintCliAuthCodeForTest(t, srv)
 	normalized := strings.ReplaceAll(strings.ToUpper(minted.Code), "-", "")
+	sessionValue := srv.issueBrowserSessionForTest(t, "csrf-blocked@example.com")
 
-	// (1) Submit WITHOUT the pre-session cookie AND without the
-	//     csrf_token form field — must be rejected. A cross-site
-	//     attacker cannot send the cookie.
-	form := "code=" + normalized + "&email=csrf-blocked@example.com"
+	// (1) Submit with the dashboard session but without the CSRF
+	//     cookie/form pair.
+	form := "code=" + normalized + "&email=attacker@example.com"
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sessionValue})
 	srv.ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusOK {
@@ -582,29 +675,21 @@ func TestPostCliAuthPage_RejectsMissingCSRFToken(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Invalid form") {
 		t.Errorf("body missing 'Invalid form' banner: %s", rec.Body.String())
 	}
-	if _, err := store.AccountByEmail(t.Context(), "csrf-blocked@example.com"); err == nil {
-		t.Errorf("account was auto-created despite missing CSRF cookie")
-	}
-
 	// (2) Submit WITH the cookie but WITH a forged token. The cookie
 	//     carries the sealed envelope; the form value must equal it.
-	//     A static literal like "cli-auth:yes" no longer works.
 	goodCookie, goodForm := renderCliAuthForTest(t, srv, minted.Code)
 	form = "code=" + normalized +
-		"&email=csrf-blocked@example.com" +
+		"&email=attacker@example.com" +
 		"&" + middleware.FormFieldName + "=forged-value"
 	rec = httptest.NewRecorder()
 	r = httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAnonymous, Value: goodCookie})
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: srv.sessionCookies[goodCookie]})
+	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: goodCookie})
 	srv.ServeHTTP(rec, r)
 	if !strings.Contains(rec.Body.String(), "Invalid form") {
 		t.Errorf("forged-token body missing 'Invalid form': %s", rec.Body.String())
 	}
-	if _, err := store.AccountByEmail(t.Context(), "csrf-blocked@example.com"); err == nil {
-		t.Errorf("account was auto-created despite forged CSRF token")
-	}
-
 	// (3) Submit WITH the right cookie but the form value flipped by
 	//     one byte — must also fail. Mirrors the cookie/form
 	//     constant-time cross-check.
@@ -613,12 +698,13 @@ func TestPostCliAuthPage_RejectsMissingCSRFToken(t *testing.T) {
 		flipped = goodForm[:len(goodForm)-2] + "XX"
 	}
 	form = "code=" + normalized +
-		"&email=csrf-blocked@example.com" +
+		"&email=attacker@example.com" +
 		"&" + middleware.FormFieldName + "=" + flipped
 	rec = httptest.NewRecorder()
 	r = httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAnonymous, Value: goodCookie})
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: srv.sessionCookies[goodCookie]})
+	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: goodCookie})
 	srv.ServeHTTP(rec, r)
 	if !strings.Contains(rec.Body.String(), "Invalid form") {
 		t.Errorf("flipped-token body missing 'Invalid form': %s", rec.Body.String())
@@ -652,32 +738,8 @@ func TestPostCliAuthPage_AlreadyClaimed(t *testing.T) {
 	}
 }
 
-// TestPostCliAuthPage_MissingEmail: an empty email must surface the
-// "Missing fields" error page (postCliAuthPage:222).
-func TestPostCliAuthPage_MissingEmail(t *testing.T) {
-	srv, _ := newCliAuthTestServer(t)
-
-	minted := mintCliAuthCodeForTest(t, srv)
-	cookieValue, formValue := renderCliAuthForTest(t, srv, minted.Code)
-	form := "code=" + strings.ReplaceAll(minted.Code, "-", "") +
-		"&email=" +
-		"&" + middleware.FormFieldName + "=" + formValue
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAnonymous, Value: cookieValue})
-	srv.ServeHTTP(rec, r)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d, want 200 (error page)\nbody = %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "Missing fields") {
-		t.Errorf("body missing 'Missing fields' banner:\n%s", rec.Body.String())
-	}
-}
-
 // TestPostCliAuthPage_MissingCode: a missing `code` form field must
-// surface "Missing fields" via normalizeCliAuthCode's ok=false branch.
+// surface "Missing code" via normalizeCliAuthCode's ok=false branch.
 func TestPostCliAuthPage_MissingCode(t *testing.T) {
 	srv, _ := newCliAuthTestServer(t)
 
@@ -689,14 +751,15 @@ func TestPostCliAuthPage_MissingCode(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/cli-auth", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAnonymous, Value: cookieValue})
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: srv.sessionCookies[cookieValue]})
+	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: cookieValue})
 	srv.ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Missing fields") {
-		t.Errorf("body missing 'Missing fields' banner:\n%s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "Missing code") {
+		t.Errorf("body missing 'Missing code' banner:\n%s", rec.Body.String())
 	}
 }
 
@@ -730,18 +793,16 @@ func TestPostCliAuthPage_FiresCliAuthActivatedNotify(t *testing.T) {
 	}
 }
 
-// TestRenderCliAuthPage_IssuesAnonymousCSRFCookie asserts the new
-// (review finding A1) side-channel: GET /cli-auth?code=… must set
-// the cli-auth-pre cookie and render the matching csrf_token form
-// field. This is the producer side of the gate that closes the
-// static-literal CSRF token.
-func TestRenderCliAuthPage_IssuesAnonymousCSRFCookie(t *testing.T) {
+// TestRenderCliAuthPage_IssuesAuthenticatedCSRFCookie asserts that
+// GET /cli-auth?code=… sets the authenticated faas_csrf cookie and
+// renders the matching csrf_token form field.
+func TestRenderCliAuthPage_IssuesAuthenticatedCSRFCookie(t *testing.T) {
 	srv, _ := newCliAuthTestServer(t)
 
 	minted := mintCliAuthCodeForTest(t, srv)
 	cookieValue, formValue := renderCliAuthForTest(t, srv, minted.Code)
 	if cookieValue == "" {
-		t.Fatal("cli-auth-pre cookie value is empty")
+		t.Fatal("faas_csrf cookie value is empty")
 	}
 	if formValue == "" {
 		t.Fatal("csrf_token form value is empty")
@@ -753,11 +814,10 @@ func TestRenderCliAuthPage_IssuesAnonymousCSRFCookie(t *testing.T) {
 	}
 }
 
-// TestPostCliAuthPage_AcceptsFreshPreCookie is the explicit
-// happy-path assertion that the new A1 gate admits a freshly
-// rendered pair (cookie + form) on the same request. This is the
-// "the seal doesn't accidentally reject legit callers" check.
-func TestPostCliAuthPage_AcceptsFreshPreCookie(t *testing.T) {
+// TestPostCliAuthPage_AcceptsFreshAuthenticatedCSRF is the explicit
+// happy-path assertion that the authenticated session and freshly
+// rendered CSRF pair are admitted together.
+func TestPostCliAuthPage_AcceptsFreshAuthenticatedCSRF(t *testing.T) {
 	srv, _ := newCliAuthTestServer(t)
 
 	minted := mintCliAuthCodeForTest(t, srv)

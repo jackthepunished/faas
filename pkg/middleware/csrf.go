@@ -20,9 +20,10 @@
 //     page (e.g. GET /dashboard/account) and consumed on the POST.
 //     Subject = account_id from the sessionAuth context.
 //
-//   - CookieNameAnonymous ("cli-auth:pre") is set on GET /cli-auth
-//     and consumed on POST /cli-auth — same browser, no session yet.
-//     Subject = the device code from the query string.
+//   - CookieNameAnonymous ("cli-auth:pre") is available for anonymous
+//     form surfaces that bind to a device code. The CLI authorization
+//     page itself uses CookieNameAuthenticated because it requires the
+//     normal dashboard session before a code can be claimed.
 //
 // In both cases the form field carries the same opaque token value
 // ("csrf_token") and Verify cross-checks cookie == form value under
@@ -113,8 +114,9 @@ func IssueForAuthenticated(manager *session.Manager, action, accountID string) (
 	return issue(manager, action, accountID, DefaultCSRFTTL)
 }
 
-// IssueForAnonymous is the /cli-auth equivalent: bound to action +
-// deviceCode instead of an account. Same shape, same TTL.
+// IssueForAnonymous is the anonymous-form equivalent: bound to action +
+// deviceCode instead of an account. The CLI authorization page uses
+// IssueForAuthenticated so its code claim is tied to the signed-in account.
 func IssueForAnonymous(manager *session.Manager, action, deviceCode string) (string, error) {
 	return issue(manager, action, deviceCode, DefaultCSRFTTL)
 }
@@ -172,8 +174,8 @@ func VerifyAuthenticated(manager *session.Manager, r *http.Request, action, acco
 	return verifyAgainstRequest(manager, r, action, accountID, c.Value)
 }
 
-// VerifyAnonymous is the /cli-auth equivalent: expected subject is the
-// device code instead of the account_id.
+// VerifyAnonymous verifies an anonymous form token whose subject is a
+// device code. Authenticated dashboard forms use VerifyAuthenticated.
 func VerifyAnonymous(manager *session.Manager, r *http.Request, action, deviceCode string) error {
 	if manager == nil {
 		return fmt.Errorf("%w: nil session manager", ErrCSRFInvalid)

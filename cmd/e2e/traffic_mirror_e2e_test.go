@@ -201,11 +201,13 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 	accountID, sourceDeploymentID, mirrorDeploymentID, ruleID := seedMirrorFixture(t, pool, appID)
 	now := time.Now().UTC()
 
-	// Seed 5 rows in the trailing hour. The dispatch goroutine
-	// uses completed_at for the rollup window.
+	// Anchor all rows at the current hour boundary so the fixture cannot
+	// straddle two hour buckets when the test runs near an hour boundary.
+	// The dispatch goroutine uses completed_at for the rollup window.
+	completedAt := now.Truncate(time.Hour)
 	for i := 0; i < 5; i++ {
 		seedMirrorLedgerRow(t, pool, ruleID, accountID, sourceDeploymentID, mirrorDeploymentID,
-			now.Add(-time.Duration(i)*time.Minute),
+			completedAt,
 			false, false, false, false)
 	}
 
@@ -217,15 +219,19 @@ func TestE2E_MirrorRollup_AggregatesByRuleHour(t *testing.T) {
 		t.Fatalf("RollupOnce: %v", err)
 	}
 
-	// Assert the summary row exists with total_invocations = 5.
-	var total int64
+	// Assert that the rows collapsed into one summary bucket with
+	// total_invocations = 5.
+	var buckets, total int64
 	err := pool.QueryRow(ctx, `
-SELECT total_invocations
+SELECT count(*), COALESCE(sum(total_invocations), 0)
 FROM mirror_invocation_summary
 WHERE rule_id = $1
-`, ruleID).Scan(&total)
+`, ruleID).Scan(&buckets, &total)
 	if err != nil {
 		t.Fatalf("read summary: %v", err)
+	}
+	if buckets != 1 {
+		t.Errorf("summary buckets = %d, want 1", buckets)
 	}
 	if total != 5 {
 		t.Errorf("total_invocations = %d, want 5", total)

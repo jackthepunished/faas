@@ -55,7 +55,7 @@ Paste token: ●●●●●●●●
 ✓ Logged in as jane@example.com (free plan)
 ```
 
-Token stored in the OS keychain (macOS Keychain / libsecret / wincred), never a plaintext dotfile. `gregale login --token $FAAS_TOKEN` for CI. First successful login creates the account row (implementation spec §5) if the email is new — signup and login are the same door.
+Token stored in the OS keychain (macOS Keychain / libsecret / wincred), never a plaintext dotfile. `gregale login --token $FAAS_TOKEN` for CI. The browser approval uses the account already authenticated in the Gregale console; new users must complete the normal signup flow first.
 
 ### 2.3 Deploy (budget: the user's 10 seconds; then we work)
 
