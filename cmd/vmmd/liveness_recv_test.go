@@ -18,9 +18,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -94,7 +101,6 @@ func newTestLoop(t *testing.T, instanceID string, consec int) (*livenessProbeLoo
 			ConsecutiveFailures: consec,
 			CooldownSeconds:     60,
 		},
-		cid: 0, // unused in tests (probeFn bypasses dial)
 		mgr: mgr,
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -533,5 +539,94 @@ func TestLivenessRecv_ForbiddenCountedClassifies(t *testing.T) {
 	last := sink.calls[len(sink.calls)-1]
 	if last.reason != "liveness_unauthorized" {
 		t.Errorf("relay reason = %q, want %q (403 must map to liveness_unauthorized, not its own arm)", last.reason, "liveness_unauthorized")
+	}
+}
+
+// TestLivenessRecv_FirecrackerVsockHandshake pins the host-side transport
+// contract. Firecracker's vsock device is userspace-backed: the host dials
+// the per-VM Unix socket, writes CONNECT <guest-port>\n, consumes the OK
+// acknowledgement, and only then sends the guest protocol frame. A direct
+// AF_VSOCK dial to the guest CID cannot work with this Firecracker topology.
+func TestLivenessRecv_FirecrackerVsockHandshake(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "vsock.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close(); _ = os.Remove(sockPath) })
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if line != "CONNECT 1028\n" {
+			serverErr <- fmt.Errorf("CONNECT line = %q, want %q", line, "CONNECT 1028\\n")
+			return
+		}
+		if _, writeErr := io.WriteString(conn, "OK 4000\n"); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		var hdr [8]byte
+		if _, readErr := io.ReadFull(reader, hdr[:]); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if got := binary.BigEndian.Uint32(hdr[:4]); got != 10 {
+			serverErr <- fmt.Errorf("request msg type = %d, want 10", got)
+			return
+		}
+		bodyLen := binary.BigEndian.Uint32(hdr[4:])
+		body := make([]byte, bodyLen)
+		if _, readErr := io.ReadFull(reader, body); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		var req livenessRequestBody
+		if unmarshalErr := json.Unmarshal(body, &req); unmarshalErr != nil {
+			serverErr <- unmarshalErr
+			return
+		}
+		if req.Path != "/healthz" || req.TimeoutMs != 2000 {
+			serverErr <- fmt.Errorf("request = %+v, want path=/healthz timeout=2000", req)
+			return
+		}
+		respBody, marshalErr := json.Marshal(livenessResponseBody{Status: 200})
+		if marshalErr != nil {
+			serverErr <- marshalErr
+			return
+		}
+		binary.BigEndian.PutUint32(hdr[:4], 11)
+		binary.BigEndian.PutUint32(hdr[4:], uint32(len(respBody)))
+		if _, writeErr := conn.Write(hdr[:]); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		if _, writeErr := conn.Write(respBody); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		serverErr <- nil
+	}()
+
+	loop := &livenessProbeLoop{
+		cfg:        livenessProbeConfig{Path: "/healthz"},
+		socketPath: sockPath,
+	}
+	if got := loop.dialAndProbe(context.Background(), 2000); got != livenessOutcomeOK {
+		t.Fatalf("dialAndProbe outcome = %q, want %q", got, livenessOutcomeOK)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }

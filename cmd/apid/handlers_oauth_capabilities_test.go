@@ -32,8 +32,8 @@ func TestRenderAuthCapabilities_NoSession_RedirectsToLogin(t *testing.T) {
 		t.Fatalf("expected 302 redirect to /login, got %d", rec.Code)
 	}
 	loc := rec.Header().Get("Location")
-	if loc != "/login?next=/v1/auth/capabilities" {
-		t.Errorf("Location = %q, want /login?next=/v1/auth/capabilities", loc)
+	if loc != "/login?next=%2Fv1%2Fauth%2Fcapabilities" {
+		t.Errorf("Location = %q, want /login?next=%%2Fv1%%2Fauth%%2Fcapabilities", loc)
 	}
 }
 

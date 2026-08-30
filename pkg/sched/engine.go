@@ -5356,7 +5356,20 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 // Audit-kind discriminator is `liveness_failed` (the state-machine
 // event); `reason` lands in the audit row's data JSON so the
 // dashboard can group by outcome class.
-func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error {
+func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error { //nolint:contextcheck // terminal cleanup must outlive vmmd's canceled liveness RPC.
+	// This RPC is the authoritative terminal cleanup after vmmd observed a
+	// dead guest. vmmd cancels its liveness loop while the destroy RPC is in
+	// flight, so retaining the incoming context can cancel the DB transition
+	// and leave the instance row RUNNING even though Firecracker is gone.
+	// Keep trace values, detach cancellation, and apply a bounded cleanup
+	// deadline long enough for the VMM destroy ceiling plus state writes.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cleanupCancel()
+	ctx = cleanupCtx
+
 	// Two reads: a fresh InstanceByID for the app_id +
 	// deployment_id, then a re-read under the lock to confirm
 	// state hasn't moved. Both reads are best-effort — a missing

@@ -26,6 +26,23 @@ func TestProcessExitedRelaysWithoutDroppingManagerEntry(t *testing.T) {
 	}
 }
 
+func TestReportLivenessFailedDetachesRelayContext(t *testing.T) {
+	manager := NewManager(&fakeRunner{}, &fakeVMM{}, Paths{Kernel: "/k"}, "test", nil, nil)
+	seedLive(manager, "vm-liveness", "app-liveness", "deployment-liveness", 1)
+
+	var relayErr error
+	manager.WithLivenessSink(func(ctx context.Context, _ string, _ string) {
+		relayErr = ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager.ReportLivenessFailed(ctx, "vm-liveness", "liveness_conn_refused")
+	if relayErr != nil {
+		t.Fatalf("relay received canceled context: %v", relayErr)
+	}
+}
+
 func TestProcessExitedDuringWakeHandoffIsRemembered(t *testing.T) {
 	manager := NewManager(&fakeRunner{}, &fakeVMM{}, Paths{Kernel: "/k"}, "test", nil, nil)
 	manager.mu.Lock()

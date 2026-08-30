@@ -94,11 +94,11 @@ type Config struct {
 	// FAAS_APPS_DOMAIN. The public Gregale default is gregale.dev.
 	AppsDomain string `toml:"apps_domain"`
 
-	// CLIAuthURLBase is the absolute API origin that serves the browser
-	// half of the CLI device-code flow. It is intentionally separate from
-	// AppsDomain: app URLs may use the public wildcard domain while the
-	// /cli-auth route is served by the control-plane API host. Mirrors
-	// FAAS_CLI_AUTH_URL_BASE. Bare hostnames are normalized to HTTPS.
+	// CLIAuthURLBase is the public web origin for the browser half of the
+	// CLI device-code flow. The public edge must forward /cli-auth to apid;
+	// keeping this separate from AppsDomain lets an installation use a
+	// dedicated console host. Mirrors FAAS_CLI_AUTH_URL_BASE. Bare
+	// hostnames are normalized to HTTPS.
 	CLIAuthURLBase string `toml:"cli_auth_url_base"`
 
 	// DBURL is apid's Postgres DSN. An empty value preserves the
@@ -334,14 +334,14 @@ func (c *Config) GetAppsDomain(env func(string) string) string {
 	return c.AppsDomain
 }
 
-const defaultCLIAuthURLBase = "https://api.gregale.dev"
+const defaultCLIAuthURLBase = "https://gregale.dev"
 
-// GetCLIAuthURLBase returns the absolute API origin used in the URL returned
-// by POST /v1/cli-auth/code. It is separate from GetAppsDomain because the
-// dashboard wildcard host does not serve the API's /cli-auth route.
+// GetCLIAuthURLBase returns the public web origin used in the URL returned by
+// POST /v1/cli-auth/code. The edge at this origin forwards /cli-auth to apid,
+// so the browser remains on the customer-facing console host.
 // FAAS_CLI_AUTH_URL_BASE wins over TOML; empty or malformed values fall back
-// to the public API origin so the daemon never emits a relative or unusable
-// browser URL.
+// to the public console origin so the daemon never emits a relative or
+// unusable browser URL.
 func (c *Config) GetCLIAuthURLBase(env func(string) string) string {
 	raw := ""
 	if c != nil {

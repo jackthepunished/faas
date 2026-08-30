@@ -35,7 +35,7 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 		t.Errorf("AppsDomain = %q, want public default", cfg.AppsDomain)
 	}
 	if cfg.CLIAuthURLBase != defaultCLIAuthURLBase {
-		t.Errorf("CLIAuthURLBase = %q, want public API default", cfg.CLIAuthURLBase)
+		t.Errorf("CLIAuthURLBase = %q, want public console default", cfg.CLIAuthURLBase)
 	}
 	if cfg.NodeName != "" {
 		t.Errorf("NodeName = %q, want empty (single-box default)", cfg.NodeName)

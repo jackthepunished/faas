@@ -1221,15 +1221,16 @@ type WorkloadOOMSink func(ctx context.Context, instanceID string, peakMB, planMB
 // LivenessProbeStarter (issue #554 / ADR-078) is the cmd-level
 // goroutine-launcher the cmd/vmmd main loop attaches via
 // WithLivenessProbeStarter. Manager.startLivenessLoop calls it with
-// the resolved per-instance config + vsock CID; the starter builds
-// the loop body (vsock dial, JSON envelope, classification) and
+// the resolved per-instance config + lease slot; the starter resolves
+// the per-instance vsock proxy path and builds the loop body (vsock
+// handshake, JSON envelope, classification) and
 // returns the cancel func the Manager registers with the
 // livenessRegistry. A nil return is treated as "loop not started"
 // so a unit test that doesn't wire the starter is a no-op rather
 // than a panic.
 //
 // The signature takes the parent ctx (cmd vmmd lifecycle), the
-// instance id, the lease slot for the per-VM vsock CID, the
+// instance id, the lease slot used for instance bookkeeping, the
 // deployment id (for the cooldown gate stamp key — survives
 // across cold boots), and the resolved cfg. Returns the cancel
 // func (or nil). Empty deploymentID is allowed (legacy pre-PR-B
@@ -1422,12 +1423,20 @@ func (m *Manager) DeleteLivenessConsecutiveFailures(instance string) {
 // Legacy call sites that stamped Instance.LastLivenessDestroyAt
 // were removed; the field itself is gone (the dying instance is
 // about to be Parked anyway).
-func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason string) {
+func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason string) { //nolint:contextcheck // the relay must outlive the probe loop that it tears down.
 	if m == nil || instanceID == "" {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if m.livenessRelay != nil {
-		m.livenessRelay(ctx, instanceID, reason)
+		// The relay synchronously asks schedd to destroy the instance. That
+		// destroy RPC cancels vmmd's liveness loop as part of teardown; passing
+		// the loop context through would cancel the RPC itself midway through
+		// the state transition and leave a stale RUNNING row. Preserve values
+		// for tracing, but detach cancellation/deadlines from the monitor.
+		m.livenessRelay(context.WithoutCancel(ctx), instanceID, reason)
 	}
 	// Stamp cooldownByDeployment even when no relay is wired so a
 	// local/test manager preserves the same restart-cooldown semantics.

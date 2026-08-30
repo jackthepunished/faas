@@ -27,21 +27,17 @@
     {{if index .Data "Error"}}
       <p>This code is no longer usable. Open a fresh terminal and run <code>faas login</code> again to get a new code.</p>
     {{else}}
-      <p>Your terminal opened this page from <code>faas login</code>. Confirm the email below to log in your CLI.</p>
+      <p>Your terminal opened this page from <code>faas login</code>. You are signed in as <strong>{{index .Data "AccountEmail"}}</strong>. Authorize this browser session for your CLI.</p>
       <form method="POST" action="/cli-auth">
         <input type="hidden" name="code" value="{{index .Data "Code"}}">
-        {{/* CSRF guard (review finding A1). The csrf_token value is a
-            sealed envelope bound to (action="cli-auth", subject=<raw code>);
-            the cli-auth-pre cookie carries the same value, and
-            cmd/apid/handlers_cli_auth.go::postCliAuthPage verifies both
-            via middleware.VerifyAnonymous. A cross-site POST lacks the
-            cookie and is rejected before any account lookup. */}}
+        {{/* CSRF guard. The csrf_token value is a sealed envelope bound to
+            (action="cli-auth", subject=<account id>); the faas_csrf cookie
+            carries the same value, and postCliAuthPage verifies both after
+            sessionAuth has established the account. */}}
         <input type="hidden" name="csrf_token" value="{{index .Data "CSRFToken"}}">
-        <label for="email">Email</label>
-        <input id="email" name="email" type="email" required autocomplete="email">
-        <button type="submit">Sign in</button>
+        <button type="submit">Authorize CLI</button>
       </form>
-      <p style="font-size: 0.9em; color: #666;">First successful login creates the account row if the email is new — signup and login are the same door.</p>
+      <p style="font-size: 0.9em; color: #666;">The CLI will receive access only for this signed-in Gregale account.</p>
     {{end}}
   </main>
 </body>

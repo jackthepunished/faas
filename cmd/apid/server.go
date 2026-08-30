@@ -44,9 +44,8 @@ type server struct {
 	store  state.Store
 	log    *slog.Logger
 	domain string // apps base domain for URLs
-	// cliAuthURLBase is the absolute API origin used by the CLI device-code
-	// response. It must not be derived from domain: AppsDomain is the app
-	// wildcard/frontend host, while /cli-auth is served by the API host.
+	// cliAuthURLBase is the public web origin used by the CLI device-code
+	// response. The public edge at this origin forwards /cli-auth to apid.
 	cliAuthURLBase string
 	notif          Notifier
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
@@ -464,10 +463,10 @@ func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 	return s
 }
 
-// WithCLIAuthURLBase attaches the API origin used in browser URLs returned by
-// the CLI device-code endpoint. The setter keeps existing positional server
-// constructors source-compatible while allowing production config to supply
-// a provider-specific API hostname.
+// WithCLIAuthURLBase attaches the public web origin used in browser URLs
+// returned by the CLI device-code endpoint. The setter keeps existing
+// positional server constructors source-compatible while allowing production
+// config to supply a provider-specific console hostname.
 func (s *server) WithCLIAuthURLBase(base string) *server {
 	s.cliAuthURLBase = normalizeCLIAuthURLBase(base)
 	return s
@@ -2266,22 +2265,24 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /status", s.statusHandler)
 	mux.HandleFunc("GET /status/slo.json", s.statusJSONHandler)
 
-	// CLI auth device-code flow (spec §2.2). Anonymous on purpose —
-	// the CLI hasn't logged in yet. Anti-enumeration limiter is its
-	// own bucket (s.cliAuthLimiter) so brute-force on /v1/cli-auth/*
-	// doesn't burn the API-key auth budget at the top of this file.
+	// CLI auth device-code flow (spec §2.2). Code minting and exchange
+	// are anonymous because the CLI has no credential yet; the browser
+	// claim is deliberately session-authenticated so it cannot choose an
+	// arbitrary email/account. The public console forwards /cli-auth to
+	// this listener, keeping the browser on the frontend origin.
 	cli := &cliAuthHandlers{srv: s, log: s.log, domain: s.domain, urlBase: s.cliAuthURLBase}
 	mux.Handle("POST /v1/cli-auth/code", s.cliAuthChain(http.HandlerFunc(cli.mintCliAuthCode)))
 	mux.Handle("POST /v1/cli-auth/exchange", s.cliAuthChain(http.HandlerFunc(cli.exchangeCliAuthCode)))
-	// Dashboard-side GET shares the dashboard auth bucket (it renders
-	// the same form for every state, so attempts are not the
-	// brute-force surface). POST uses its own bucket
-	// (cliAuthSubmitChain) so a customer retrying `faas login` from a
-	// shared NAT doesn't burn the magic-link /login budget.
+	// Dashboard-side GET and POST both require a normal session. GET
+	// redirects to /login?next=… when the browser is signed out; the
+	// login redirect preserves the code query so the authorization page
+	// can resume after sign-in. POST uses its own bucket so a customer
+	// retrying `faas login` from a shared NAT doesn't burn the /login
+	// budget.
 	mux.Handle("GET "+cliAuthPath, s.dashboardAuthChain(middleware.AuthLimitConfig{
 		CountStatuses: []int{middleware.CountEveryAttempt},
-	}, http.HandlerFunc(cli.renderCliAuthPage)))
-	mux.Handle("POST "+cliAuthPath, s.cliAuthSubmitChain(http.HandlerFunc(cli.postCliAuthPage)))
+	}, s.sessionAuth(http.HandlerFunc(cli.renderCliAuthPage))))
+	mux.Handle("POST "+cliAuthPath, s.cliAuthSubmitChain(s.sessionAuth(http.HandlerFunc(cli.postCliAuthPage))))
 
 	// Loopback infra probe (issue #85). gatewayd-internal forwards /healthz to
 	// apid through the apidProxy chain, so this is what the

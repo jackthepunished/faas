@@ -241,6 +241,63 @@ func TestEnsureBaseExt4_SkipsWhenDigestMatches(t *testing.T) {
 	}
 }
 
+func TestEnsureBaseExt4_RestagesWhenGuestInitChanges(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	const baseKey = "base/runtime.ext4"
+	const digKey = "base/runtime.ext4.digest"
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	guestInit := filepath.Join(t.TempDir(), "faas-guest-init")
+	if err := os.WriteFile(guestInit, []byte("guest-init-v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &callCountingBuilder{}
+	h := newBaseHarness(t, mp, b).h
+	h.storage = be
+	h.guestInitPath = guestInit
+
+	first, err := h.EnsureBaseExt4(context.Background(), "ghcr.io/onebox-faas/runner-node22:latest", baseKey, digKey, "", "", "")
+	if err != nil {
+		t.Fatalf("first EnsureBaseExt4: %v", err)
+	}
+	if first.Skipped || b.calls != 1 {
+		t.Fatalf("first stage = skipped:%v calls:%d, want skipped:false calls:1", first.Skipped, b.calls)
+	}
+
+	rc, err := be.Get(context.Background(), digKey)
+	if err != nil {
+		t.Fatalf("read digest sidecar: %v", err)
+	}
+	sidecar, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("read digest sidecar: %v", err)
+	}
+	digest, err := guestInitBinaryDigest(guestInit)
+	if err != nil {
+		t.Fatalf("hash guest-init: %v", err)
+	}
+	if !strings.Contains(string(sidecar), "guest-init-sha256="+digest) {
+		t.Fatalf("sidecar %q does not record guest-init digest %q", sidecar, digest)
+	}
+
+	if err := os.WriteFile(guestInit, []byte("guest-init-v2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.EnsureBaseExt4(context.Background(), "ghcr.io/onebox-faas/runner-node22:latest", baseKey, digKey, "", "", "")
+	if err != nil {
+		t.Fatalf("second EnsureBaseExt4: %v", err)
+	}
+	if second.Skipped {
+		t.Fatal("guest-init change incorrectly took the skip path")
+	}
+	if b.calls != 2 {
+		t.Fatalf("BuildBase calls = %d, want 2 after guest-init change", b.calls)
+	}
+}
+
 // TestEnsureBaseExt4_RestagesWhenDigestDiffers — sidecar exists with the
 // WRONG digest → forced restage. We re-write the existing ext4 from BuildBase
 // and assert the BuildBase call happened.
