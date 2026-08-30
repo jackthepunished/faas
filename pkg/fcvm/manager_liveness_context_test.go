@@ -93,6 +93,9 @@ func TestLivenessLoopUsesManagerLifecycleContext(t *testing.T) {
 	if parent == nil {
 		t.Fatal("liveness starter was not called")
 	}
+	if token, ok := parent.Value(livenessLoopTokenContextKey{}).(*livenessLoopToken); !ok || token == nil {
+		t.Fatal("liveness starter parent does not carry a lifecycle generation token")
+	}
 	cancelRequest()
 	if err := parent.Err(); err != nil {
 		t.Fatalf("request cancellation canceled liveness parent: %v", err)
@@ -106,4 +109,59 @@ func TestLivenessLoopUsesManagerLifecycleContext(t *testing.T) {
 		t.Fatalf("lifecycle cancellation = %v, want context canceled", parent.Err())
 	}
 	manager.cancelLivenessLoop("vm-ctx")
+}
+
+func TestManagerFinishLivenessLoopDoesNotRemoveReplacement(t *testing.T) {
+	manager := NewManager(&fakeRunner{}, &fakeVMM{}, Paths{Kernel: "/k"}, "test", nil, nil)
+	registry := NewLivenessRegistry()
+	var parents []context.Context
+	manager.WithLivenessProbes(registry, LivenessProbeConfig{PeriodSeconds: 1}).
+		WithLivenessProbeStarter(func(ctx context.Context, _ string, _ int, _ string, _ LivenessProbeConfig) context.CancelFunc {
+			parents = append(parents, ctx)
+			return func() {}
+		})
+
+	manager.startLivenessLoop(context.Background(), "vm-reused", 1, nil)
+	manager.startLivenessLoop(context.Background(), "vm-reused", 1, nil)
+	if len(parents) != 2 {
+		t.Fatalf("starter calls = %d, want 2", len(parents))
+	}
+
+	manager.FinishLivenessLoop("vm-reused", parents[0])
+	registry.mu.Lock()
+	remaining := len(registry.loops)
+	registry.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("old loop finish removed replacement; remaining=%d, want 1", remaining)
+	}
+	manager.FinishLivenessLoop("vm-reused", parents[1])
+	registry.mu.Lock()
+	remaining = len(registry.loops)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("replacement loop finish left %d registration(s), want 0", remaining)
+	}
+}
+
+func TestLivenessRegistryFinishDoesNotRemoveReplacement(t *testing.T) {
+	registry := NewLivenessRegistry()
+	first := registry.prepareProbeLoop("vm-reused")
+	registry.startProbeLoopWithToken("vm-reused", first, func() {})
+	second := registry.prepareProbeLoop("vm-reused")
+	registry.startProbeLoopWithToken("vm-reused", second, func() {})
+
+	registry.finishProbeLoop("vm-reused", first)
+	registry.mu.Lock()
+	remaining := len(registry.loops)
+	registry.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("old loop finish removed replacement; remaining=%d, want 1", remaining)
+	}
+	registry.finishProbeLoop("vm-reused", second)
+	registry.mu.Lock()
+	remaining = len(registry.loops)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("replacement loop finish left %d registration(s), want 0", remaining)
+	}
 }

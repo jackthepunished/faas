@@ -19,6 +19,7 @@ export type { AddTenantHostnameRequest } from './models/AddTenantHostnameRequest
 export type { AddTrustedSignerRequest } from './models/AddTrustedSignerRequest.js';
 export type { AdminSetGithubWebhookSecretRequest } from './models/AdminSetGithubWebhookSecretRequest.js';
 export type { AdminSetGithubWebhookSecretResponse } from './models/AdminSetGithubWebhookSecretResponse.js';
+export type { AlertDeliveryResponse } from './models/AlertDeliveryResponse.js';
 export type { AlertPresetResponse } from './models/AlertPresetResponse.js';
 export type { AlertRuleResponse } from './models/AlertRuleResponse.js';
 export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';

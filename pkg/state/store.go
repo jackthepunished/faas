@@ -3127,7 +3127,18 @@ type Store interface {
 	// UpdateAlertDeliveryStatus mutates the retry record in place.
 	// Called after each attempt by the dispatcher (PR 2 / PR 4).
 	UpdateAlertDeliveryStatus(ctx context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error
-	ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int) ([]AlertDelivery, error)
+	// ListAlertDeliveriesForRule returns the most-recent delivery
+	// rows for ruleID, newest-first, capped at limit. includeTest
+	// (ADR-123 PR-D) toggles the `WHERE is_test = false` filter:
+	//   - false → production rows only (the customer-facing default
+	//     and the dashboard's "recent deliveries" pane)
+	//   - true  → all rows, including Dispatcher.DispatchTest writes
+	//     (the operator pane reachable via `?include_test=true`)
+	// The partial index alert_deliveries_rule_fired_production_idx
+	// (migrations/00528_alert_deliveries_is_test.sql) covers the
+	// include_test=false path so the production read stays
+	// index-only even as test row count grows unbounded.
+	ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int, includeTest bool) ([]AlertDelivery, error)
 
 	// Edge rules (ADR-089, planned). apid is the only writer;
 	// gatewayd-internal reads via MatchEdgeRulesForHost. Per-app

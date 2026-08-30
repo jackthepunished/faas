@@ -6339,6 +6339,73 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Alert-rule deliveries (ADR-123 PR-D) ─────────────────────────────
+  # Operator pane for one alert_rule's recent alert_deliveries rows.
+  # ?include_test=true toggles the IsTest discriminator (default
+  # false; production-only rows). Same auth scope as
+  # GET /v1/apps/{slug}/alerts/{id}.
+  /v1/apps/{slug}/alerts/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+      - in: query
+        name: include_test
+        schema:
+          type: boolean
+          default: false
+        required: false
+        description: |
+          When true, also surface rows written by Dispatcher.DispatchTest
+          (the customer-facing "send test alert" path). Default false
+          hides test rows so the customer's recent-deliveries pane is
+          not polluted by every "send test alert" click. Operators can
+          flip the toggle for post-mortems; the production read stays
+          index-only via the partial index
+          alert_deliveries_rule_fired_production_idx.
+      - in: query
+        name: limit
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+        required: false
+        description: Max rows to return. Clamped to 100.
+    get:
+      tags: [alert_rules]
+      operationId: listAlertRuleDeliveries
+      summary: List recent alert_deliveries rows for one rule.
+      description: |
+        Returns the most-recent alert_deliveries rows for the rule,
+        newest-first. The default (include_test=false) hides test
+        rows; the operator pane is reachable via ?include_test=true.
+        IDOR-safe: a 404 is returned when the rule is on another
+        account (same posture as GET /v1/apps/{slug}/alerts/{id}).
+      responses:
+        '200':
+          description: Recent deliveries, newest-first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AlertDeliveryResponse' }
+              example:
+                - id: "9b1c4f8e2d3a4b5c6d7e8f9012345678"
+                  rule_id: "rule-1"
+                  account_id: "acct-1"
+                  app_id: "app-1"
+                  idempotency_key: "rule-1:12345678"
+                  status: "delivered"
+                  attempt_count: 1
+                  last_status_code: 200
+                  observed_value: 5.1
+                  fired_at: "2026-08-30T12:00:00Z"
+                  delivered_at: "2026-08-30T12:00:01Z"
+                  is_test: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── CORS presets (ADR-129 / issue #975 #4 PR-B) ────────────────────────
   # Customer-owned, named, reusable CORS configurations. The
   # write surface (POST/PATCH/DELETE) lands in PR-B; the read
@@ -15011,6 +15078,31 @@ components:
         rotated_at: { type: string, format: date-time, example: "2026-07-28T12:00:00Z" }
         webhook_secret_sealed_masked: { type: string, example: "***" }
 
+    AlertDeliveryResponse:
+      description: |
+        One alert_deliveries row as surfaced by
+        GET /v1/apps/{slug}/alerts/{id}/deliveries (ADR-123 PR-D).
+        Test rows (IsTest=true) are written by Dispatcher.DispatchTest
+        (the customer-facing "send test alert" path); the production
+        read (include_test=false) hides them, the operator read
+        (?include_test=true) surfaces them.
+      type: object
+      required: [id, rule_id, account_id, idempotency_key, status, attempt_count, observed_value, fired_at, is_test]
+      properties:
+        id: { type: string, format: uuid }
+        rule_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid, description: "omitted on account-wide rules" }
+        idempotency_key: { type: string, description: "rule_id + ':' + cooldown bucket (production) or delivery_id + ':test' (test path)" }
+        status: { type: string, enum: [pending, delivered, failed] }
+        attempt_count: { type: integer, minimum: 0 }
+        last_status_code: { type: integer, description: "0 when the attempt never reached the wire" }
+        last_error: { type: string, description: "truncated server-side via dashboard.FormatAlertError (log-injection-safe)" }
+        observed_value: { type: number, format: double }
+        fired_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time, description: "omitted until status=delivered" }
+        is_test: { type: boolean, description: "true iff the row was written by Dispatcher.DispatchTest" }
+
     # ─── Alert presets (ADR-123 / issue #1233) ───────────────────────────────
 
     AlertPresetResponse:
@@ -17073,12 +17165,15 @@ components:
           type: integer
           format: int64
           description: |
-            Current wake-queue depth (`gateway_queue_depth{app}`).
-            Backs the `queue_backlog_growing` alert preset (ADR-123):
-            comparison `gt 50` over the chosen window. Best-effort:
-            absent on Prometheus failure (the field is `null`); the
-            evaluator's degraded-source contract skips firing
-            rather than guessing.
+            Current wake-queue depth
+            (`gateway_queue_depth{app, account_id}` — `account_id`
+            admitted via accountLabelSet, overflow=`__other__`,
+            added in PR-D). Backs the `queue_backlog_growing`
+            alert preset (ADR-123): comparison `gt 50` over the
+            chosen window. Best-effort: absent on Prometheus
+            failure (the field is `null`); the evaluator's
+            degraded-source contract skips firing rather than
+            guessing.
           x-since: "2026-08"
           x-issue: "1233"
         egress_bytes:

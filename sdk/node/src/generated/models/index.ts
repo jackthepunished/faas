@@ -15,6 +15,7 @@ export type { AddTenantHostnameRequest } from './AddTenantHostnameRequest.js';
 export type { AddTrustedSignerRequest } from './AddTrustedSignerRequest.js';
 export type { AdminSetGithubWebhookSecretRequest } from './AdminSetGithubWebhookSecretRequest.js';
 export type { AdminSetGithubWebhookSecretResponse } from './AdminSetGithubWebhookSecretResponse.js';
+export type { AlertDeliveryResponse } from './AlertDeliveryResponse.js';
 export type { AlertPresetResponse } from './AlertPresetResponse.js';
 export type { AlertRuleResponse } from './AlertRuleResponse.js';
 export type { AppEnvListResponse } from './AppEnvListResponse.js';
