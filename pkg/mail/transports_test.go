@@ -654,9 +654,16 @@ func TestPostmarkSender_429WrapsErrTransient(t *testing.T) {
 	}
 }
 
-// TestPostmarkSender_SendsIdempotencyKey mirrors the Resend row:
-// Postmark expects X-Idempotency-Key per its docs.
-func TestPostmarkSender_SendsIdempotencyKey(t *testing.T) {
+// TestPostmarkSender_NoIdempotencyKey pins the PR #1191 fixup:
+// Postmark's HTTP API does NOT support an X-Idempotency-Key
+// header — the earlier draft of this PR set the header and the
+// upstream silently dropped it, so a network-level retry that
+// Postmark already accepted double-charged the customer. MessageID
+// is still accepted as input (callers from dunning + quota-warning
+// derive a stable id) but the transport MUST NOT send the header.
+// Resend keeps honouring MessageID via its own Idempotency-Key
+// header (TestResendSender_SendsIdempotencyKey).
+func TestPostmarkSender_NoIdempotencyKey(t *testing.T) {
 	var gotKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotKey = r.Header.Get("X-Idempotency-Key")
@@ -677,17 +684,26 @@ func TestPostmarkSender_SendsIdempotencyKey(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if gotKey != "quota:acct-7:2026-08-29" {
-		t.Errorf("X-Idempotency-Key = %q, want quota:acct-7:2026-08-29", gotKey)
+	if gotKey != "" {
+		t.Errorf("X-Idempotency-Key = %q, want empty (Postmark API has no idempotency-key feature; PR #1191 fixup removed the misleading header)", gotKey)
 	}
 }
 
-// TestPostmarkSender_PassesCustomHeaders mirrors the Resend row for
-// the List-Unsubscribe path.
-func TestPostmarkSender_PassesCustomHeaders(t *testing.T) {
-	var gotUnsubscribe string
+// TestPostmarkSender_PassesCustomHeadersAsJSONArray pins the
+// PR #1191 fixup: Postmark's API surface takes RFC 8058 /
+// List-Unsubscribe headers via the JSON body's `Headers` array,
+// NOT via HTTP request headers (Resend has parity on HTTP request
+// headers, Postmark does not). The transport marshals
+// msg.Headers → []PostmarkHeader{Name, Value} so the recipient
+// MTA renders them as RFC 5322 headers.
+func TestPostmarkSender_PassesCustomHeadersAsJSONArray(t *testing.T) {
+	var gotHeaders []mail.PostmarkHeader
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUnsubscribe = r.Header.Get("List-Unsubscribe")
+		var body mail.PostmarkRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		gotHeaders = body.Headers
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"MessageID":"abc","ErrorCode":0,"Message":"OK"}`))
 	}))
@@ -700,13 +716,50 @@ func TestPostmarkSender_PassesCustomHeaders(t *testing.T) {
 	if err := s.Send(context.Background(), mail.Message{
 		To: []string{"jane@example.test"}, Subject: "x", TextBody: "y",
 		Headers: map[string]string{
-			"List-Unsubscribe": "<mailto:unsub@example.test>",
+			"List-Unsubscribe":      "<mailto:unsub@example.test>",
+			"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
 		},
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if gotUnsubscribe != "<mailto:unsub@example.test>" {
-		t.Errorf("List-Unsubscribe = %q, want <mailto:unsub@example.test>", gotUnsubscribe)
+	// JSON object order is non-deterministic — match by name.
+	got := map[string]string{}
+	for _, h := range gotHeaders {
+		got[h.Name] = h.Value
+	}
+	if got["List-Unsubscribe"] != "<mailto:unsub@example.test>" {
+		t.Errorf("Headers[List-Unsubscribe] = %q, want <mailto:unsub@example.test>", got["List-Unsubscribe"])
+	}
+	if got["List-Unsubscribe-Post"] != "List-Unsubscribe=One-Click" {
+		t.Errorf("Headers[List-Unsubscribe-Post] = %q, want List-Unsubscribe=One-Click", got["List-Unsubscribe-Post"])
+	}
+}
+
+// TestPostmarkSender_NoHeadersOmitsField pins the omitempty on
+// PostmarkRequest.Headers: an empty msg.Headers map must NOT add
+// a noise `Headers: []` field to the JSON body. The transport
+// returns nil from postmarkHeadersFromMap for empty input so
+// json.Marshal skips the field.
+func TestPostmarkSender_NoHeadersOmitsField(t *testing.T) {
+	var rawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"MessageID":"abc","ErrorCode":0,"Message":"OK"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, _ := mail.NewPostmarkSender(mail.PostmarkConfig{
+		ServerToken: "pm_test", From: "ops@example.test", BaseURL: srv.URL,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := s.Send(context.Background(), mail.Message{
+		To: []string{"jane@example.test"}, Subject: "x", TextBody: "y",
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if strings.Contains(string(rawBody), `"Headers":`) {
+		t.Errorf("body should not contain Headers field when msg.Headers is empty, got %s", rawBody)
 	}
 }
 
@@ -715,10 +768,19 @@ func TestPostmarkSender_PassesCustomHeaders(t *testing.T) {
 // ErrTransient) AND errors.As(err, *TransientError). The first is the
 // gate the retry decorator uses; the second lets the decorator reach
 // RetryAfter. Both are required.
+//
+// The PR #1191 /code-review surfaced the Err-set path (network
+// errors wrapped with %w): the typed Is method must still resolve
+// errors.Is(err, ErrTransient) for a TransientError whose Err field
+// is non-nil, because Unwrap returns the inner Err first and the
+// caller would otherwise walk past ErrTransient without matching.
+// errors.As is the only path that worked pre-fix; both must work
+// post-fix.
 func TestTransientError_IsAndAs(t *testing.T) {
+	// Err-nil path (4xx / 5xx from the transport).
 	te := &mail.TransientError{Status: 429, RetryAfter: 7 * time.Second}
 	if !errors.Is(te, mail.ErrTransient) {
-		t.Errorf("TransientError does not satisfy errors.Is(ErrTransient)")
+		t.Errorf("TransientError (Err=nil) does not satisfy errors.Is(ErrTransient)")
 	}
 	var got *mail.TransientError
 	if !errors.As(te, &got) {
@@ -730,5 +792,32 @@ func TestTransientError_IsAndAs(t *testing.T) {
 	msg := te.Error()
 	if !strings.Contains(msg, "status=429") || !strings.Contains(msg, "retry_after=7s") {
 		t.Errorf("Error() = %q, want both status=429 and retry_after=7s", msg)
+	}
+
+	// Err-set path (network error wrapped with %w). This is the
+	// common transient failure mode (Resend/Postmark HTTP client
+	// surfaces a *url.Error). Without the typed Is method,
+	// errors.Is walks Unwrap → e.Err and never reaches
+	// ErrTransient.
+	networkErr := errors.New("dial tcp: i/o timeout")
+	teWithErr := &mail.TransientError{Status: 0, Err: networkErr}
+	if !errors.Is(teWithErr, mail.ErrTransient) {
+		t.Errorf("TransientError (Err set) does not satisfy errors.Is(ErrTransient); the typed Is method must catch ErrTransient before Unwrap walks past it")
+	}
+	// errors.As must still reach the typed struct (retry decorator
+	// reads RetryAfter via the struct, not the sentinel).
+	var got2 *mail.TransientError
+	if !errors.As(teWithErr, &got2) {
+		t.Errorf("TransientError (Err set) does not satisfy errors.As(*TransientError)")
+	}
+	if got2.Err != networkErr {
+		t.Errorf("got2.Err = %v, want %v", got2.Err, networkErr)
+	}
+	// errors.Is also reaches the wrapped inner error for callers
+	// that want the root cause (this path has always worked — the
+	// typed Is method is additive, not a replacement for the
+	// Unwrap chain).
+	if !errors.Is(teWithErr, networkErr) {
+		t.Errorf("TransientError (Err set) should still reach Err via the Unwrap chain")
 	}
 }

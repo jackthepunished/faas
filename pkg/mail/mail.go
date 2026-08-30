@@ -74,14 +74,33 @@ func (e *TransientError) Error() string {
 }
 
 // Unwrap exposes ErrTransient so errors.Is(err, ErrTransient) keeps
-// working. When Err is set (e.g. a wrapped network error), that is
-// also reachable via errors.Is/As so callers that want the root cause
-// can dig one level deeper.
+// working. When Err is set (e.g. a wrapped network error), it is
+// also reachable via errors.Is/As so callers that want the root
+// cause can dig one level deeper — but the chain terminates at
+// ErrTransient first via the typed Is method below, so the
+// "is this transient?" gate that callers use keeps working on
+// every path (network, 4xx, 5xx).
 func (e *TransientError) Unwrap() error {
 	if e.Err != nil {
 		return e.Err
 	}
 	return ErrTransient
+}
+
+// Is is the typed errors.Is hook. It returns true when target is
+// ErrTransient — even when e.Err is set, which is the common path
+// (a TransientError wrapping a *url.Error from net/http). Without
+// this, errors.Is(err, ErrTransient) walks Unwrap → e.Err and never
+// reaches ErrTransient, so a caller that gates on the sentinel
+// fails to detect the transient failure for the network path.
+// Doc-promise: "errors.Is(err, ErrTransient) is true" on every
+// *TransientError; errors.As(err, &te) keeps working for the
+// struct-rich path.
+func (e *TransientError) Is(target error) bool {
+	if target == nil {
+		return false
+	}
+	return target == ErrTransient
 }
 
 // Message is the cross-component outbound email payload. Fields map
@@ -96,12 +115,14 @@ type Message struct {
 	// Headers are extra headers (e.g. List-Unsubscribe). nil is fine.
 	Headers map[string]string
 	// MessageID, when non-empty, is sent as the provider's idempotency
-	// key (Resend: Idempotency-Key; Postmark: X-Idempotency-Key). The
-	// provider deduplicates a retry that lands within its replay window
-	// and returns the original message id instead of double-charging.
-	// The dunning + quota-warning senders derive a stable id from
-	// (account_id, template, day) so an HTTP-level retry never sends
-	// twice.
+	// key. Supported by Resend (Idempotency-Key request header); NOT
+	// supported by Postmark (PR #1191 /code-review surfaced that the
+	// earlier draft's X-Idempotency-Key header was silently dropped).
+	// The provider deduplicates a retry that lands within its replay
+	// window and returns the original message id instead of
+	// double-charging. The dunning + quota-warning senders derive a
+	// stable id from (account_id, template, day) so an HTTP-level
+	// retry never sends twice on Resend.
 	MessageID string
 }
 

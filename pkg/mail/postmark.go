@@ -9,10 +9,18 @@
 //
 // We use the bare net/http + json packages (no SDK dependency).
 //
-// Idempotency: when Message.MessageID is non-empty, the request
-// carries `X-Idempotency-Key` per Postmark's docs — a network-level
-// retry that the upstream already accepted is deduplicated inside
-// Postmark's replay window instead of double-charging.
+// Idempotency: Postmark's HTTP API does NOT support an
+// Idempotency-Key header (the API surface ends at the per-server
+// `X-Postmark-Server-Token` auth header). The X-Idempotency-Key
+// header an earlier draft of this PR set was silently dropped on
+// the floor — a network-level retry that Postmark already accepted
+// double-charged the customer. PR #1191 fixup removes the header
+// and updates pkg/mail/mail.go::Message.MessageID's doc to state
+// "Resend only" so callers know which transport honours the
+// idempotency contract. The decorator stack
+// (SuppressingSender → RetryingSender) keeps retries
+// wall-clock-bounded so the missing dedupe is bounded by the
+// same budget.
 //
 // Retry classification (issue #246 acceptance item 3) mirrors
 // resend.go: 429 + 5xx become TransientError with the provider's
@@ -55,12 +63,34 @@ type PostmarkSender struct {
 
 // PostmarkRequest is the JSON body the Postmark API expects. Exported
 // so tests can decode against it.
+//
+// Headers is RFC 8058 / bulk-sender-compliance plumbing — Postmark's
+// POST /email accepts a `Headers` array of {Name, Value} objects that
+// the recipient MTA renders as the message's RFC 5322 header set.
+// Without this field the quota-warning template's List-Unsubscribe
+// headers silently drop on the floor and a Gmail / Yahoo bulk-sender
+// rule rejects the message. The decorator stack passes the
+// caller-supplied Headers map through unchanged (key name → name;
+// value → value); pkg/mail/headers.go::MarketingHeaders builds the
+// values for the bulk-sender-compliance use case. The Headers slice
+// is omitempty so an empty Headers map doesn't add a noise field to
+// the JSON body for senders that don't use it.
 type PostmarkRequest struct {
-	From     string `json:"From"`
-	To       string `json:"To"`
-	Subject  string `json:"Subject"`
-	TextBody string `json:"TextBody"`
-	HtmlBody string `json:"HtmlBody,omitempty"`
+	From     string           `json:"From"`
+	To       string           `json:"To"`
+	Subject  string           `json:"Subject"`
+	TextBody string           `json:"TextBody"`
+	HtmlBody string           `json:"HtmlBody,omitempty"`
+	Headers  []PostmarkHeader `json:"Headers,omitempty"`
+}
+
+// PostmarkHeader is one entry of PostmarkRequest.Headers. The
+// Postmark API expects {"Name": "List-Unsubscribe", "Value": "<url>"}
+// — the field name is capitalised. Mirrors the wire shape exactly
+// so a json.Marshal round-trips without translation.
+type PostmarkHeader struct {
+	Name  string `json:"Name"`
+	Value string `json:"Value"`
 }
 
 // postmarkResponse is the success payload. We don't currently use it
@@ -95,7 +125,9 @@ func NewPostmarkSender(cfg PostmarkConfig) (Sender, error) {
 }
 
 // Send POSTs msg to Postmark. msg.To is joined with ", " since the API
-// accepts a single comma-separated string.
+// accepts a single comma-separated string. msg.Headers is translated
+// to PostmarkRequest.Headers (the wire-format array shape the API
+// expects); an empty msg.Headers drops the field via omitempty.
 func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 	body, err := json.Marshal(PostmarkRequest{
 		From:     s.cfg.From,
@@ -103,6 +135,7 @@ func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 		Subject:  msg.Subject,
 		TextBody: msg.TextBody,
 		HtmlBody: msg.HTMLBody,
+		Headers:  postmarkHeadersFromMap(msg.Headers),
 	})
 	if err != nil {
 		return fmt.Errorf("mail: postmark: marshal: %w", err)
@@ -115,17 +148,12 @@ func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 	req.Header.Set("X-Postmark-Server-Token", s.cfg.ServerToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	// X-Idempotency-Key dedupes a retry that Postmark already
-	// accepted — see pkg/mail/mail.go Message.MessageID.
-	if msg.MessageID != "" {
-		req.Header.Set("X-Idempotency-Key", msg.MessageID)
-	}
-	// Caller-supplied extra headers win last so they can override
-	// anything (e.g. List-Unsubscribe on the quota-warning
-	// template). pkg/mail/headers.go builds these.
-	for k, v := range msg.Headers {
-		req.Header.Set(k, v)
-	}
+	// Postmark does NOT support X-Idempotency-Key (PR #1191
+	// fixup; the earlier draft's header was silently dropped).
+	// Message.MessageID stays on the wire for Resend only; the
+	// doc comment at pkg/mail/mail.go::Message.MessageID names
+	// that. The retry decorator caps wall-clock loss to
+	// api.MailRetryMaxWallClockMS regardless.
 
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {
@@ -163,4 +191,22 @@ func (s *PostmarkSender) Send(ctx context.Context, msg Message) error {
 		return fmt.Errorf("mail: postmark: %s: %w", detail, te)
 	}
 	return fmt.Errorf("mail: postmark: %d: %s", resp.StatusCode, detail)
+}
+
+// postmarkHeadersFromMap flattens the pkg/mail.Sender Headers map
+// (the wire-format the decorator stack passes through) into the
+// Postmark API's Headers array shape. nil / empty map returns nil
+// so PostmarkRequest.Headers omitempty drops the field on the
+// wire. Order is not stable — Postmark's API does not promise a
+// header-rendering order; the headers are name → value pairs the
+// recipient MTA concatenates into the message header set.
+func postmarkHeadersFromMap(h map[string]string) []PostmarkHeader {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make([]PostmarkHeader, 0, len(h))
+	for k, v := range h {
+		out = append(out, PostmarkHeader{Name: k, Value: v})
+	}
+	return out
 }
