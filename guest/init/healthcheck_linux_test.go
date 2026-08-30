@@ -240,15 +240,21 @@ func TestDecodeHealthcheckReport_TruncatedOutput(t *testing.T) {
 }
 
 // TestRunHealthcheckPoll_NONEShapeReturnsNil pins the
-// short-circuit path: a manifest with Test=["NONE"] or empty
-// must NOT open a vsock socket and must return nil so boot
-// proceeds. A regression here would block boot on a guest
-// kernel without AF_VSOCK (some embedded CI runners).
+// short-circuit path: a manifest with no Healthcheck pointer,
+// Test=["NONE"], or an empty Test must NOT open a vsock socket
+// and must return nil so boot proceeds. A regression here would
+// either crash PID 1 or block boot on a guest kernel without
+// AF_VSOCK (some embedded CI runners).
 func TestRunHealthcheckPoll_NONEShapeReturnsNil(t *testing.T) {
-	for _, test := range [][]string{nil, {}, {"NONE"}} {
-		m := api.AppManifest{Healthcheck: &api.AppManifestHealthcheck{Test: test}}
+	manifests := []api.AppManifest{
+		{},
+		{Healthcheck: &api.AppManifestHealthcheck{Test: nil}},
+		{Healthcheck: &api.AppManifestHealthcheck{Test: []string{}}},
+		{Healthcheck: &api.AppManifestHealthcheck{Test: []string{"NONE"}}},
+	}
+	for _, m := range manifests {
 		if err := runHealthcheckPoll(context.Background(), m, nil); err != nil {
-			t.Errorf("Test=%v: runHealthcheckPoll = %v; want nil", test, err)
+			t.Errorf("Healthcheck=%v: runHealthcheckPoll = %v; want nil", m.Healthcheck, err)
 		}
 	}
 }
