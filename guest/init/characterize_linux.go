@@ -163,22 +163,32 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 	classHint, openAPIDoc, openAPIDocTruncated := runL7Probes(ctx, args, res.Port)
 	res.ObservedClass = classHint
 
-	// 3. Pick a portnorm mode. manifest.Port==0 means DefaultAppPort
-	// was effective (the customer's process is expected to bind
-	// 8080). Anything else requires a ladder rung.
-	res.Mode = choosePortNormMode(args.Manifest, res.Port)
-	if res.Mode == PortNormDNAT {
-		if err := installDNAT(res.Port, args.Log); err != nil {
-			res.Mode = PortNormForward
-			_, _ = startForwarder(res.Port, args.Log)
+	// 3. Pick a portnorm mode. Only a positive observed port is a
+	// meaningful normalization target. A bind timeout is a valid
+	// characterization result (jobs and crash-looping apps commonly
+	// have no listener); trying to install DNAT to port 0 would invoke
+	// iptables with an invalid rule and then startForwarder would fail.
+	if res.Port > 0 {
+		// manifest.Port==0 means DefaultAppPort was effective (the
+		// customer's process is expected to bind 8080). Anything else
+		// requires a ladder rung.
+		res.Mode = choosePortNormMode(args.Manifest, res.Port)
+		if res.Mode == PortNormDNAT {
+			if err := installDNAT(res.Port, args.Log); err != nil {
+				res.Mode = PortNormForward
+				_, _ = startForwarder(res.Port, args.Log)
+			}
 		}
-	}
-	if res.Mode == PortNormForward {
-		ln, fErr := startForwarder(res.Port, args.Log)
-		if fErr != nil || ln == nil {
-			args.Log.Warn("portnorm forward failed; host will see listen mismatch",
-				"port", res.Port, "err", fErr)
+		if res.Mode == PortNormForward {
+			ln, fErr := startForwarder(res.Port, args.Log)
+			if fErr != nil || ln == nil {
+				args.Log.Warn("portnorm forward failed; host will see listen mismatch",
+					"port", res.Port, "err", fErr)
+			}
 		}
+	} else {
+		res.Mode = PortNormNone
+		args.Log.Debug("portnorm skipped: no observed listener", "port", res.Port)
 	}
 
 	// 4. Wait for the supervisor to exit (clean or crash-loop

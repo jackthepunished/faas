@@ -770,6 +770,19 @@ func (v *JailerVMM) vsockUDSSock(instance string) string {
 	return filepath.Join(v.chrootRoot(instance), VsockUDSSocketName)
 }
 
+// VsockUDSSocketPath returns the host-side Firecracker vsock proxy path for
+// an instance. Firecracker exposes guest AF_VSOCK listeners through this Unix
+// socket; callers must use the CONNECT <guest-port> handshake rather than
+// dialing the guest CID directly. The method is intentionally read-only and
+// exposes no mutable VMM state so vmmd's liveness monitor can share the same
+// path convention as the resume and characterization protocols.
+func (v *JailerVMM) VsockUDSSocketPath(instance string) string {
+	if v == nil {
+		return ""
+	}
+	return v.vsockUDSSock(instance)
+}
+
 // resumeHookDialDeadline bounds the TriggerResumeHook wait. The jailer
 // creates the vsock UDS a few ms after firecracker accepts the /vsock PUT; on
 // a slow nested-KVM guest this can take ~50 ms. Five seconds is well above

@@ -2,8 +2,9 @@
 
 // Host-side liveness probe loop (issue #554 / ADR-078). The
 // guest-init listener (guest/init/liveness_linux.go) binds AF_VSOCK
-// STREAM port 1028 inside the VM; this file dials that port on
-// every Period, runs the framed probe request, and translates the
+// STREAM port 1028 inside the VM; this file reaches that port through
+// Firecracker's per-VM Unix-vsock proxy on every Period, runs the framed
+// probe request, and translates the
 // 4-class outcome into the consecutive-failure counter. After
 // ConsecutiveFailures non-2xx (or timeout / conn-refused) responses
 // the goroutine calls Manager.ReportLivenessFailed, which the
@@ -34,11 +35,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
@@ -117,12 +119,11 @@ type livenessProbeLoop struct {
 	instance     string
 	deploymentID string // set from WakeRequest at BringUp; survives across cold boots (code review #725 F1)
 	cfg          livenessProbeConfig
-	cid          uint32
 	mgr          *fcvm.Manager
 	log          *slog.Logger
 	count        int // current consecutive-failure count
 	// probeFn is the test seam: production code uses dialAndProbe
-	// (real AF_VSOCK), tests inject a stub that returns the
+	// (Firecracker's Unix-vsock proxy), tests inject a stub that returns the
 	// closed-set outcome string ("ok", "non_200", "unauthorized",
 	// "timeout", "conn_refused", "conn_err"). Default = nil →
 	// runOne uses the real dialAndProbe.
@@ -132,6 +133,10 @@ type livenessProbeLoop struct {
 	// frozen clock so the cooldown window can be exercised
 	// deterministically without real-time sleeps.
 	nowFn func() time.Time
+	// socketPath is the per-instance Firecracker vsock UDS. Host-side
+	// connections must go through this userspace proxy and its CONNECT
+	// handshake; the guest CID is not directly dialable from the host.
+	socketPath string
 }
 
 // runLivenessProbeLoop is the entry point. Blocks until ctx is
@@ -297,45 +302,50 @@ func classifyLivenessOutcome(outcome string) string {
 // 5s matches the guest-init's VsockLivenessHardTimeoutMs ceiling.
 const livenessProbeDialTimeout = 5 * time.Second
 
-// dialAndProbe opens an AF_VSOCK STREAM connection to the per-VM
-// CID on VsockLivenessHostPort, ships the probe body, and returns
-// the closed-set outcome string. The classification mirrors the
-// four classes the guest-init reports — see
-// guest/init/liveness_linux.go.
+// dialAndProbe opens the per-VM Firecracker vsock UDS, performs the
+// userspace CONNECT handshake for VsockLivenessHostPort, ships the
+// probe body, and returns the closed-set outcome string. Firecracker
+// owns the AF_VSOCK endpoint inside the VMM; the host must not dial the
+// guest CID directly. The classification mirrors the four classes the
+// guest-init reports — see guest/init/liveness_linux.go.
 func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) string {
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if l.socketPath == "" {
+		return livenessOutcomeConnErr
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, livenessProbeDialTimeout)
+	defer cancel()
+	dialer := net.Dialer{Timeout: livenessProbeDialTimeout}
+	conn, err := dialer.DialContext(dialCtx, "unix", l.socketPath)
+	if err != nil {
+		if ctx.Err() != nil {
+			return livenessOutcomeConnErr
+		}
+		// ECONNREFUSED/ENOENT is expected while a VMM is still
+		// creating the per-instance chroot or its vsock socket.
+		return livenessOutcomeConnRefused
+	}
+	defer func() { _ = conn.Close() }()
+	// Close the connection promptly if teardown wins while a handshake
+	// or response read is in flight. The explicit deadline remains the
+	// hard cap for a peer that neither reads nor writes.
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+	deadline := time.Now().Add(livenessProbeDialTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", VsockLivenessHostPort); err != nil {
+		return livenessOutcomeConnErr
+	}
+	ack, err := readLivenessConnectAck(conn)
 	if err != nil {
 		return livenessOutcomeConnErr
 	}
-	defer func() { _ = unix.Close(fd) }()
-	dialCtx, cancel := context.WithTimeout(ctx, livenessProbeDialTimeout)
-	defer cancel()
-	addr := &unix.SockaddrVM{CID: l.cid, Port: VsockLivenessHostPort}
-	// unix.Connect is non-blocking on the AF_VSOCK STREAM socket
-	// the kernel returns immediately with EINPROGRESS; we wrap
-	// in a deadline-driven polling loop. The connect itself
-	// blocks until the guest-init's listener accepts OR the
-	// deadline fires (the livenessProbeDialTimeout cap).
-	connectDone := make(chan error, 1)
-	go func() {
-		connectDone <- unix.Connect(fd, addr)
-	}()
-	select {
-	case <-ctx.Done():
-		return livenessOutcomeConnErr
-	case <-dialCtx.Done():
+	if ack != "OK" {
 		return livenessOutcomeConnRefused
-	case err := <-connectDone:
-		if err != nil {
-			// ECONNREFUSED is the expected signal when the
-			// guest-init's listener is NOT up yet (a hot
-			// rebuild before boot). The failure counter
-			// increments — the CooldownSeconds gate in the
-			// schedd-side window protects against a cold
-			// boot noise signature.
-			return livenessOutcomeConnRefused
-		}
 	}
+
 	body, err := json.Marshal(livenessRequestBody{
 		Path:      l.cfg.Path,
 		TimeoutMs: timeoutMs,
@@ -346,10 +356,10 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[:4], 10) // guest.VsockLivenessMsgProbe
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(body)))
-	if err := writeAll(fd, hdr[:]); err != nil {
+	if err := writeLivenessAll(conn, hdr[:]); err != nil {
 		return livenessOutcomeConnErr
 	}
-	if err := writeAll(fd, body); err != nil {
+	if err := writeLivenessAll(conn, body); err != nil {
 		return livenessOutcomeConnErr
 	}
 	// Read the response envelope. Deadline is the same
@@ -358,7 +368,7 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 	// VsockLivenessDefaultTimeoutMs (2s) is the natural
 	// timeout surface.
 	var respHdr [8]byte
-	if err := readAll(fd, respHdr[:], livenessProbeDialTimeout); err != nil {
+	if _, err := io.ReadFull(conn, respHdr[:]); err != nil {
 		return livenessOutcomeTimeout
 	}
 	mt := binary.BigEndian.Uint32(respHdr[:4])
@@ -372,7 +382,7 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 		return livenessOutcomeConnErr
 	}
 	respBody := make([]byte, bodyLen)
-	if err := readAll(fd, respBody, livenessProbeDialTimeout); err != nil {
+	if _, err := io.ReadFull(conn, respBody); err != nil {
 		return livenessOutcomeTimeout
 	}
 	var resp livenessResponseBody
@@ -409,67 +419,54 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 	return livenessOutcomeNon200
 }
 
-// writeAll is the unix-style write-loop helper. Mirrors the
-// guest-init's readFull. Both live here so the failure surface is
-// symmetric — if this helper changes, the guest-side readFull gets
-// a corresponding bump.
-func writeAll(fd int, b []byte) error {
+// readLivenessConnectAck consumes Firecracker's "OK <hostside_port>\n"
+// response. The assigned host-side port is an implementation detail;
+// the liveness stream only needs the successful CONNECT acknowledgement.
+func readLivenessConnectAck(conn net.Conn) (string, error) {
+	// Read one byte at a time so no buffered reader can consume the first
+	// byte of Firecracker's subsequent vsock stream frame. The response is
+	// tiny and this handshake runs once per probe, so preserving framing is
+	// more important than buffering here.
+	var line []byte
+	var one [1]byte
+	for len(line) < 128 {
+		n, err := conn.Read(one[:])
+		if n > 0 {
+			line = append(line, one[0])
+			if one[0] == '\n' {
+				break
+			}
+		}
+		if err != nil {
+			return "", fmt.Errorf("read CONNECT reply: %w", err)
+		}
+		if n == 0 {
+			return "", fmt.Errorf("read CONNECT reply: EOF")
+		}
+	}
+	if len(line) == 0 || line[len(line)-1] != '\n' {
+		return "", fmt.Errorf("CONNECT reply exceeds 128 bytes")
+	}
+	fields := strings.Fields(string(line))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty CONNECT reply")
+	}
+	return fields[0], nil
+}
+
+// writeLivenessAll is the stream write-loop helper. Mirrors the
+// guest-init's readFull and handles short writes from a Unix stream.
+func writeLivenessAll(conn net.Conn, b []byte) error {
 	for len(b) > 0 {
-		n, err := unix.Write(fd, b)
+		n, err := conn.Write(b)
 		if n > 0 {
 			b = b[n:]
 		}
 		if err != nil {
-			if err == unix.EINTR {
-				continue
-			}
 			return err
 		}
 		if n == 0 {
 			return fmt.Errorf("vsock write: 0 bytes")
-		}
-	}
-	return nil
-}
-
-// readAll is the unix-style read-loop helper. The deadline is
-// enforced via SO_RCVTIMEO (setsockopt) so the kernel returns
-// EAGAIN on its own without a watcher goroutine. We honour
-// ctx cancellation on the EINTR path so a parent-ctx cancel
-// pre-empts the deadline.
-//
-// Mirrors the guest-init's setSockTimeout helper at
-// guest/init/characterize_linux.go:572 — the AF_VSOCK stack has
-// no Go-side deadline primitive, so we go through the kernel.
-// A setsockopt failure is tolerated (the helper is best-effort);
-// on failure the read becomes unbounded and the caller
-// (dialAndProbe) leans on its outer deadline.
-func readAll(fd int, b []byte, deadline time.Duration) error {
-	tv := unix.Timeval{
-		Sec:  int64(deadline / time.Second),
-		Usec: int64(deadline%time.Second) / 1000,
-	}
-	_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
-	for len(b) > 0 {
-		n, err := unix.Read(fd, b)
-		if n > 0 {
-			b = b[n:]
-		}
-		if err != nil {
-			if err == unix.EINTR {
-				continue
-			}
-			// EAGAIN/EWOULDBLOCK = the SO_RCVTIMEO deadline
-			// fired without a frame arriving. Surface as a
-			// wrapped timeout so the caller can fold it into
-			// the liveness_timeout outcome.
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				return fmt.Errorf("vsock read deadline %s", deadline)
-			}
-			return err
-		}
-		if n == 0 {
-			return fmt.Errorf("vsock read: 0 bytes (EOF)")
 		}
 	}
 	return nil
@@ -491,14 +488,14 @@ func readAll(fd int, b []byte, deadline time.Duration) error {
 // Mirrors the production-only start() helper that lived inline in
 // livenessRegistry prior to the PR-review refactor that moved the
 // registry into pkg/fcvm.
-func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slog.Logger, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slog.Logger, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig, socketPath string) context.CancelFunc {
 	loop := &livenessProbeLoop{
 		instance:     instance,
 		deploymentID: deploymentID,
 		cfg:          cfg,
-		cid:          fcvm.GuestVsockCID(slot),
 		mgr:          mgr,
 		log:          log,
+		socketPath:   socketPath,
 	}
 	loopCtx, cancel := context.WithCancel(parent)
 	go func() {

@@ -84,19 +84,35 @@ func spawnBridge(t *testing.T, bin, framing, sockPath, guestAddr string, guestPo
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("bridge start: %v", err)
 	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
-		_, _ = cmd.Process.Wait()
+		select {
+		case <-waitCh:
+		case <-time.After(2 * time.Second):
+			_ = cmd.Process.Kill()
+			<-waitCh
+		}
 	})
-	// Wait for the unix socket to appear.
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait for the unix socket to appear. The bridge itself starts quickly,
+	// but this package is run alongside every other package in `go test ./...`
+	// and the child may be CPU-starved while the host builds/tests those
+	// packages. Keep the startup budget bounded without making the E2E test
+	// fail spuriously under repository-wide load.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(sockPath); err == nil {
 			return cmd
 		}
+		select {
+		case err := <-waitCh:
+			t.Fatalf("bridge exited before binding socket (err=%v)", err)
+		default:
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("bridge socket %s never appeared", sockPath)
+	t.Fatalf("bridge socket %s never appeared after 10s", sockPath)
 	return nil
 }
 
