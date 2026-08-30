@@ -1627,6 +1627,32 @@ Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are
 
 Post-M8 = private beta (founding doc roadmap M2–M3: hand-held first ten customers).
 
+### 14.A Workstream A — Jobs (issue #1184, Mega-1)
+
+The Jobs feature ships as a post-M8 workstream rather than as part of M0–M8 because it requires no new platform primitive — it composes `pkg/fcvm` (M1), `guest/init` (M2/M3), `pkg/sched` admission (M4), `pkg/meter` (M7), and the audit event family (M7) — and ships a customer-facing API surface (issue #1184 Workstream A, P0) that closes the long-standing "Cloud Run jobs equivalent" gap.
+
+| Sub-M | Scope | Acceptance (executable) |
+|---|---|---|
+| **M10** | meter branch + audit events + plan caps (PR-#916 cherry-pick-rebuild foundation) | `meter_kind='job'` rows in `usage_daily`; `job.*` events in audit log; Hobby plan returns 402 `jobs_not_allowed` from POST `/v1/jobs` |
+| **M11** | apid handlers + DTOs + routes (11 endpoints) | 13 unit tests in `cmd/apid/handlers_jobs_test.go` PASS; byte-identical 404 contract for missing + cross-account |
+| **M12** | gregale CLI `jobs` subcommand family (10 leaves) | 11 CLI tests in `cmd/gregale/commands_jobs_test.go` PASS; flag-validation surface fails locally, never round-trips to apid for a 400 |
+| **M13** | OpenAPI 11 paths + 10 schemas + SDK regen | `make sdk-check` green; `make sdk-smoke-node` + `make sdk-smoke-python` cover jobs endpoints |
+| **M14** | unit + metal e2e tests | 13 apid + 11 CLI + 11 metal-tagged jobs e2e tests; `cmd/e2e/jobs_metal_test.go` compiles under `-tags metal` (real impls land in follow-up commit) |
+| **M15** | docs: ADR-099 supplement + runbook + SPEC cross-link | this section; `docs/adr/099-supplement-jobs-mega1.md`; `docs/runbooks/FaasJobsQueueBacklog.md` |
+
+Canonical references (read in order):
+1. `docs/adr/099-jobs.md` — the v1 ADR (proposed).
+2. `docs/adr/099-supplement-jobs-mega1.md` — as-built deviations from v1 (Mega-1).
+3. `/Users/poyrazk/.claude/plans/logical-beaming-church.md` — implementation plan with slot bank + atomic commit sequence.
+
+**Risks** (carried over from ADR-099 supplement):
+- Cold-boot wake storm on fan-out — closed by per-plan parallelism cap + separate `JobDispatch` rate bucket.
+- Job RAM starvation of app wakes — closed by `KindJob` admission wired through `RAMAdmissionCeiling=47,600 MB` + `JobConcurrentPerAccount` cap.
+- Lease race during schedd restart — closed by reaper pre-CAS on `lease_expires_at > now()`.
+
+**Cross-PR handoff:** ADR-134 (`worktree-feat-dispatch-contract-pr-a`) swaps `pkg/sched/lease.go::Leaser[T]` for `pkg/dispatch.Leaser[T]` post-Mega-1. Surface parity preserved so the refactor is mechanical.
+
+
 ## 15. Repository layout and conventions
 
 ```

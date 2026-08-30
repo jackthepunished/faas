@@ -3007,13 +3007,42 @@ type Instance struct {
 	// enforces it. Default 'normal' on pre-feature rows so no
 	// existing customer is affected.
 	Mode string
+	// Kind (issue #1184 Workstream A / ADR-099) discriminates
+	// app VMs from job-task VMs. Closed vocabulary enforced at
+	// the SQL layer by migration 00578's
+	// instances_kind_check CHECK constraint:
+	//   - "" / "app_task"  — legacy app VM (the default)
+	//   - "job_task"       — job-task VM (one per active job_task row)
+	// Empty string on pre-Mega-1 rows; the canonical constant
+	// is KindApp = "" and KindJobTask = "job_task" (see
+	// pkg/state/instances_kind.go for the typed constants).
+	// The pkg/meter sampler keys off this field to decide which
+	// AppendUsage path to take (job rows set AppID="" and rely
+	// on JobID for billing attribution).
+	Kind string
+	// JobID is the jobs.id (== job_runs.job_id, NOT job_runs.id;
+	// JobRunID below carries the run PK) for kind="job_task"
+	// instances. Empty for app VMs. The meter sampler uses this
+	// to compute per-job billing attribution; a null JobID on a
+	// kind="job_task" row is a contract violation surfaced by
+	// the meterd sanity check (MeterdHealth) at startup.
+	JobID string
+	// JobRunID is the job_runs.id (parent of the task that
+	// spawned this instance). Distinct from JobID (the job
+	// definition). Empty for app VMs.
+	JobRunID string
+	// JobTaskIndex is the per-run task ordinal that
+	// (job_run_id, job_task_index) maps back to a job_tasks row.
+	// Empty for app VMs.
+	JobTaskIndex int
 }
 
 // InstanceMode (issue #72 / ADR-125) is the closed vocabulary for
 // the `instances.mode` column. The string values match the
-// migrations/00349 CHECK; the sampler, reaper, and schedd engine
-// compare against these constants rather than literal strings so a
-// future widening lands as a compile error at every callsite.
+// migrations/00349 + 00577 CHECK; the sampler, reaper, and schedd
+// engine compare against these constants rather than literal
+// strings so a future widening lands as a compile error at every
+// callsite.
 type InstanceMode string
 
 const (
@@ -3026,6 +3055,15 @@ const (
 	// customer is never billed for this row; the reaper does not
 	// idle-reap it (the request-completion path self-parks it).
 	InstanceModeMirror InstanceMode = "mirror"
+	// InstanceModeJob (issue #1184 Workstream A / ADR-099
+	// supplement) tags an instance that the schedd created to
+	// run a single job task. Unlike mirror, a job VM IS
+	// billable — the sampler path counts it like a normal VM;
+	// the only mode-specific branch is the per-account
+	// JobConcurrentByAccount quota gate (which uses kind=
+	// 'job_task', not mode). Mode='job' is observability for
+	// the dashboard's workload-class breakdown.
+	InstanceModeJob InstanceMode = "job"
 )
 
 // MirrorRule (issue #72 / ADR-125) is the customer-intent row

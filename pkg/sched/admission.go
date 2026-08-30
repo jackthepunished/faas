@@ -98,6 +98,15 @@ const (
 	// that is mid-migration. Tier A5 (ADR-066) wires this into the
 	// destination schedd at Phase 3 of the four-phase handoff.
 	KindMigration
+	// KindJob (issue #1184 Workstream A / ADR-099) is a run-to-
+	// completion workload reservation: counts toward per-node RAM
+	// (§6.2-2) and per-node vCPU, but NOT per-app concurrency
+	// (§6.2-1) — jobs do not belong to an app. Per-account
+	// concurrency is enforced separately via the
+	// api.JobConcurrentPerAccount cap on the dispatch tick (M5),
+	// which gates BEFORE the ledger Admit so the per-node ceiling
+	// is only checked once the per-account pool has headroom.
+	KindJob
 )
 
 // Request is an admission request for one instance (a wake or a build).
@@ -237,11 +246,17 @@ func (l *NodeLedger) Admit(r Request) error {
 	// 1 instance at MaxConcurrency=1 would see a transient ErrPlan
 	// during the failover window even though no extra instance was
 	// ever admitted. RAM/vCPU per-node ceilings (below) still apply.
+	//
+	// KindJob (issue #1184 / ADR-099) ALSO skips this check — jobs
+	// have no appID. Per-account concurrency is enforced at the
+	// dispatch tick (M5) via api.JobConcurrentPerAccount before the
+	// ledger Admit is even called. RAM/vCPU per-node ceilings still
+	// apply so a job fan-out can't blow the tenant budget.
 	maxConc := r.MaxConcurrency
-	if maxConc <= 0 || maxConc > limits.MaxConcurrency {
-		maxConc = limits.MaxConcurrency
-	}
-	if r.Kind != KindMigration {
+	if r.Kind != KindMigration && r.Kind != KindJob {
+		if maxConc <= 0 || maxConc > limits.MaxConcurrency {
+			maxConc = limits.MaxConcurrency
+		}
 		if have := l.perApp[r.AppID]; have >= maxConc {
 			return api.ErrPlanLimitConcurrency(limits, have)
 		}

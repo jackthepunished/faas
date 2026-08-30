@@ -171,6 +171,11 @@ from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequest
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_edge_rule_request_validate_mode import CreateEdgeRuleRequestValidateMode
+from .create_job_request import CreateJobRequest
+from .create_job_request_env_overrides import CreateJobRequestEnvOverrides
+from .create_job_request_kind import CreateJobRequestKind
+from .create_job_run_request import CreateJobRunRequest
+from .create_job_run_request_env_overrides import CreateJobRunRequestEnvOverrides
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
 from .create_mirror_rule_request import CreateMirrorRuleRequest
@@ -367,6 +372,21 @@ from .invoke_response_result import InvokeResponseResult
 from .invoke_response_status import InvokeResponseStatus
 from .issue_account_credit_body import IssueAccountCreditBody
 from .issue_browser_csrf_token_action import IssueBrowserCSRFTokenAction
+from .job_deleted_response import JobDeletedResponse
+from .job_response import JobResponse
+from .job_response_env_overrides import JobResponseEnvOverrides
+from .job_response_kind import JobResponseKind
+from .job_response_status import JobResponseStatus
+from .job_run_cancelled_response import JobRunCancelledResponse
+from .job_run_response import JobRunResponse
+from .job_run_response_aggregate_status import JobRunResponseAggregateStatus
+from .job_run_response_env_overrides import JobRunResponseEnvOverrides
+from .job_run_response_trigger_kind import JobRunResponseTriggerKind
+from .job_task_log_response import JobTaskLogResponse
+from .job_task_log_response_task_status import JobTaskLogResponseTaskStatus
+from .job_task_response import JobTaskResponse
+from .job_task_response_error_class import JobTaskResponseErrorClass
+from .job_task_response_status import JobTaskResponseStatus
 from .kafka_sasl_config import KafkaSASLConfig
 from .kafka_sasl_mechanism import KafkaSASLMechanism
 from .kafka_tls_config import KafkaTLSConfig
@@ -377,6 +397,9 @@ from .list_cron_runs_response import ListCronRunsResponse
 from .list_deployment_audit_response import ListDeploymentAuditResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
+from .list_job_runs_response import ListJobRunsResponse
+from .list_job_tasks_response import ListJobTasksResponse
+from .list_jobs_response import ListJobsResponse
 from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
 from .list_operator_runtime_config_revisions_response_200 import ListOperatorRuntimeConfigRevisionsResponse200
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
@@ -614,6 +637,9 @@ from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
 from .update_edge_rule_request_validate_mode import UpdateEdgeRuleRequestValidateMode
+from .update_job_request import UpdateJobRequest
+from .update_job_request_env_overrides import UpdateJobRequestEnvOverrides
+from .update_job_request_status import UpdateJobRequestStatus
 from .update_mirror_rule_request import UpdateMirrorRuleRequest
 from .update_operator_runtime_config_body import UpdateOperatorRuntimeConfigBody
 from .update_trigger_request import UpdateTriggerRequest
@@ -809,6 +835,11 @@ __all__ = (
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
     "CreateEdgeRuleRequestValidateMode",
+    "CreateJobRequest",
+    "CreateJobRequestEnvOverrides",
+    "CreateJobRequestKind",
+    "CreateJobRunRequest",
+    "CreateJobRunRequestEnvOverrides",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
     "CreateMirrorRuleRequest",
@@ -997,6 +1028,21 @@ __all__ = (
     "InvokeResponseStatus",
     "IssueAccountCreditBody",
     "IssueBrowserCSRFTokenAction",
+    "JobDeletedResponse",
+    "JobResponse",
+    "JobResponseEnvOverrides",
+    "JobResponseKind",
+    "JobResponseStatus",
+    "JobRunCancelledResponse",
+    "JobRunResponse",
+    "JobRunResponseAggregateStatus",
+    "JobRunResponseEnvOverrides",
+    "JobRunResponseTriggerKind",
+    "JobTaskLogResponse",
+    "JobTaskLogResponseTaskStatus",
+    "JobTaskResponse",
+    "JobTaskResponseErrorClass",
+    "JobTaskResponseStatus",
     "KafkaSASLConfig",
     "KafkaSASLMechanism",
     "KafkaTLSConfig",
@@ -1007,6 +1053,9 @@ __all__ = (
     "ListDeploymentAuditResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
+    "ListJobRunsResponse",
+    "ListJobsResponse",
+    "ListJobTasksResponse",
     "ListOperatorRuntimeConfigResponse200",
     "ListOperatorRuntimeConfigRevisionsResponse200",
     "ListOrgAPIKeysResponse",
@@ -1240,6 +1289,9 @@ __all__ = (
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
     "UpdateEdgeRuleRequestValidateMode",
+    "UpdateJobRequest",
+    "UpdateJobRequestEnvOverrides",
+    "UpdateJobRequestStatus",
     "UpdateMirrorRuleRequest",
     "UpdateOperatorRuntimeConfigBody",
     "UpdateTriggerRequest",

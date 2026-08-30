@@ -286,15 +286,34 @@ var methodRouteMap = map[string]string{
 	"POST /v1/crons/{id}/run":                                 "FireCron",           // issue #791 — manual fire-now (PR-C)
 	"GET /v1/cron-fire-now-requests/{request_id}":             "GetFireCronRequest", // issue #791 PR-D — poll fire-now terminal state (IDOR-safe byte-identical-404)
 	"GET /v1/crons/{id}":                                      "GetCron",            // issue #791 PR-E / ADR-090 closure — backs `gregale crons info <id>`
-	"GET /v1/usage/summary":                                   "UsageSummary",
-	"GET /v1/usage":                                           "GetUsage",
-	"GET /v1/usage/daily":                                     "UsageDaily",
-	"GET /v1/usage/storage":                                   "StorageUsage",
-	"GET /v1/invoices":                                        "ListInvoices",
-	"POST /v1/invocations/{id}/replay":                        "ReplayInvocation", // issue #315 — re-issue a failed/dead_letter invocation
-	"GET /v1/apps/{slug}/secrets":                             "ListSecrets",
-	"GET /v1/domains":                                         "ListDomains",
-	"POST /v1/domains":                                        "CreateDomain",
+	// Issue #1184 Workstream A — run-to-completion jobs. Same
+	// resource-noun convention as crons + alerts + edge-rules:
+	// auto-derivation produces verb+placeholder concatenation
+	// ("PostJobsNameRuns" — Swagger-style); the SDK names
+	// methods after the resource noun (Job / JobRun / JobTask).
+	// Matches the `gregale jobs <list|add|info|update|rm|run|
+	// runs|cancel|tasks|logs>` CLI surface at
+	// cmd/gregale/commands_jobs.go.
+	"GET /v1/jobs":                                   "ListJobs",
+	"POST /v1/jobs":                                  "CreateJob",
+	"GET /v1/jobs/{name}":                            "GetJob",
+	"PATCH /v1/jobs/{name}":                          "UpdateJob",
+	"DELETE /v1/jobs/{name}":                         "DeleteJob",
+	"POST /v1/jobs/{name}/runs":                      "CreateJobRun",
+	"GET /v1/jobs/{name}/runs":                       "ListJobRuns",
+	"GET /v1/jobs/{name}/runs/{id}":                  "GetJobRun",
+	"POST /v1/jobs/{name}/runs/{id}/cancel":          "CancelJobRun",
+	"GET /v1/jobs/{name}/runs/{id}/tasks":            "ListJobRunTasks",
+	"GET /v1/jobs/{name}/runs/{id}/tasks/{idx}/logs": "GetJobTaskLogs",
+	"GET /v1/usage/summary":                          "UsageSummary",
+	"GET /v1/usage":                                  "GetUsage",
+	"GET /v1/usage/daily":                            "UsageDaily",
+	"GET /v1/usage/storage":                          "StorageUsage",
+	"GET /v1/invoices":                               "ListInvoices",
+	"POST /v1/invocations/{id}/replay":               "ReplayInvocation", // issue #315 — re-issue a failed/dead_letter invocation
+	"GET /v1/apps/{slug}/secrets":                    "ListSecrets",
+	"GET /v1/domains":                                "ListDomains",
+	"POST /v1/domains":                               "CreateDomain",
 
 	// Issue #396 / ADR-045 PR 3 — alert rules. The auto-derivation
 	// would produce names with literal hyphens for the rotate-secret

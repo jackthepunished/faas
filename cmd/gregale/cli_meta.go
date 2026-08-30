@@ -276,6 +276,23 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    "jobs",
+		DocSlug: "jobs",
+		Short:   "Manage jobs (run-to-completion workloads)",
+		Subcommands: []cliSub{
+			{Name: "list", Short: "List jobs in this account"},
+			{Name: "add", Short: "Create a new job"},
+			{Name: "info", Short: "Show one job"},
+			{Name: "update", Short: "Update one job"},
+			{Name: "rm", Short: "Soft-delete one job"},
+			{Name: "run", Short: "Dispatch a new run (fan-out N tasks)"},
+			{Name: "runs", Short: "List runs for one job"},
+			{Name: "cancel", Short: "Cancel a run"},
+			{Name: "tasks", Short: "List tasks for one run"},
+			{Name: "logs", Short: "Tail logs for one task"},
+		},
+	},
+	{
 		Name:    "dashboard",
 		DocSlug: "dashboard",
 		Short:   "Open the account dashboard in your browser",

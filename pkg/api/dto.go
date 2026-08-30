@@ -6615,3 +6615,251 @@ type RolloutTransitionResponse struct {
 	Deployment DeploymentResponse `json:"deployment"`
 	AuditID    string             `json:"audit_id"`
 }
+
+// --- Jobs (issue #1184 Workstream A / ADR-099) ----------------------
+//
+// JobTemplate is the customer-facing stored definition (the
+// equivalent of an app's static config). Each JobTemplate owns
+// zero or more JobRuns; each run fans out into JobTasks that
+// the dispatch tick turns into microVMs. The shape mirrors
+// state.Job / state.JobRun / state.JobTask but is the wire
+// projection — only the fields a customer or the dashboard
+// should see.
+//
+// Plan gating: CreateJobRequest validation enforces Free=0
+// (ErrPlanJobsNotAllowed → 402 CodeJobsNotAllowed) at the
+// handler, not the DTO. The DTO carries the input verbatim;
+// the plan check lives in the handler so a Free customer's
+// POST gets the upgrade-to-Hobby copy the dashboard renders
+// rather than a 400 validation error.
+//
+// Field semantics match state.Job's struct docstrings; see
+// pkg/state/jobs.go. The api.Plan getter is used by the
+// handler to clamp RAM / task-timeout / parallelism / retry
+// max / tasks per run against the per-plan caps.
+
+// CreateJobRequest is the POST /v1/jobs body.
+type CreateJobRequest struct {
+	// Name is the customer slug (jobs.name UNIQUE per
+	// account_id). 3-40 chars, lowercase letters / digits /
+	// hyphens. Validated by the handler against validSlug.
+	Name string `json:"name"`
+	// Kind is the closed-set {batch, recurring}. batch
+	// tasks run exactly once; recurring tasks re-run on
+	// the run's schedule (issue #1184 Workstream A
+	// extension — base schema accepts both). Defaults to
+	// "batch" when empty.
+	Kind string `json:"kind,omitempty"`
+	// ImageRef is the OCI image name[:tag | @digest].
+	// Digest pinning is RECOMMENDED — the same way app
+	// builds are — but not enforced at this layer.
+	ImageRef string `json:"image_ref"`
+	// Command is the OCI entrypoint. Capped at 64 entries
+	// by migrations/00572 jobs_command_min_chk.
+	Command []string `json:"command"`
+	// EnvOverrides is the open-vocabulary jsonb map of
+	// environment variables to inject into every task of
+	// every run. Per-run overrides (env_overrides on
+	// CreateJobRunRequest) win at task-execution time.
+	EnvOverrides map[string]string `json:"env_overrides,omitempty"`
+	// RAMMB is the billable memory (migrations/00571 +
+	// 00572 jobs_command.sql + per-plan caps). 0 →
+	// handler applies Plan.JobRAMMB default.
+	RAMMB int `json:"ram_mb,omitempty"`
+	// TaskTimeoutSec is the per-task wall-clock deadline.
+	// Past this, guest-init SIGTERMs the process then
+	// SIGKILLs after a 30s grace, and exits with
+	// error_class='timeout' (exit_code=124). 0 → handler
+	// applies Plan.JobTaskTimeoutSec default.
+	TaskTimeoutSec int `json:"task_timeout_sec,omitempty"`
+	// MaxParallelism caps concurrent tasks across the
+	// run (the dispatch tick holds the cap).
+	// 0 → handler applies Plan.JobMaxParallelismPerRun
+	// default. Hard ceiling = JobMaxParallelismPerRun.
+	MaxParallelism int `json:"max_parallelism,omitempty"`
+	// RetryMax is the per-task max retries after a
+	// non-success exit. attempt=1 means "no retries"; the
+	// dispatch tick increments up to (RetryMax+1).
+	// 0 → handler applies the plan cap.
+	RetryMax int `json:"retry_max,omitempty"`
+}
+
+// UpdateJobRequest is the PATCH /v1/jobs/{name} body. nil
+// pointers leave the column untouched (mirrors the app PATCH
+// convention; see api.UpdateAppRequest).
+type UpdateJobRequest struct {
+	ImageRef       *string           `json:"image_ref,omitempty"`
+	Command        []string          `json:"command,omitempty"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          *int              `json:"ram_mb,omitempty"`
+	TaskTimeoutSec *int              `json:"task_timeout_sec,omitempty"`
+	MaxParallelism *int              `json:"max_parallelism,omitempty"`
+	RetryMax       *int              `json:"retry_max,omitempty"`
+	// Status is the open-set {active, paused}. Setting
+	// status='paused' halts future dispatches without
+	// killing live tasks (the dispatch tick skips paused
+	// jobs at JobTaskClaimBatch). Soft-delete uses
+	// DELETE /v1/jobs/{name} (separate status='deleted'
+	// transition with the no-live-instances guard).
+	Status *string `json:"status,omitempty"`
+}
+
+// CreateJobRunRequest is the POST /v1/jobs/{name}/runs body.
+// Atomic fan-out via a single generate_series INSERT (see
+// state.PgStore.JobRunCreate); the handler validates the
+// Tasks count against Plan.JobMaxTasksPerRun (Hobby=100,
+// Pro=1000, Scale=5000) before the store call.
+type CreateJobRunRequest struct {
+	// Tasks is the number of tasks to fan out. Each
+	// task has its own (run_id, task_index) — task_index
+	// runs 1..Tasks. Tasks=1 is the "single-shot job"
+	// shape (the dashboard's one-off cron replacement).
+	Tasks int `json:"tasks"`
+	// Parallelism overrides the job's MaxParallelism
+	// for THIS run only. nil → job.MaxParallelism.
+	Parallelism *int `json:"parallelism,omitempty"`
+	// RetryMax overrides the job's RetryMax for THIS
+	// run only. nil → job.RetryMax.
+	RetryMax *int `json:"retry_max,omitempty"`
+	// TaskTimeoutSec overrides the job's TaskTimeoutS
+	// for THIS run only. nil → job.TaskTimeoutS.
+	TaskTimeoutSec *int `json:"task_timeout_sec,omitempty"`
+	// EnvOverrides is merged with the job's
+	// env_overrides at task-execution time;
+	// run-level wins. nil → no per-run overrides.
+	EnvOverrides map[string]string `json:"env_overrides,omitempty"`
+}
+
+// JobResponse is the wire projection of state.Job. Stable
+// across all /v1/jobs endpoints so the SDK can decode with a
+// single type. CreatedAt / UpdatedAt are RFC 3339 strings
+// (matches the AppResponse convention).
+type JobResponse struct {
+	ID             string            `json:"id"`
+	AccountID      string            `json:"account_id"`
+	Name           string            `json:"name"`
+	Kind           string            `json:"kind"`
+	ImageRef       string            `json:"image_ref"`
+	Command        []string          `json:"command"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          int               `json:"ram_mb"`
+	TaskTimeoutSec int               `json:"task_timeout_sec"`
+	MaxParallelism int               `json:"max_parallelism"`
+	RetryMax       int               `json:"retry_max"`
+	Status         string            `json:"status"`
+	CreatedAt      string            `json:"created_at"`
+	UpdatedAt      string            `json:"updated_at"`
+}
+
+// JobRunResponse is the wire projection of state.JobRun.
+// Includes the aggregated counters the dashboard renders as
+// "X/Y succeeded" (succeeded / failed / cancelled / running).
+// dead_letter_count (added in migrations/00574) is the
+// retry-exhaustion counter — a run is "dead letter" when
+// dead_letter_count > 0 AND aggregate_status='dead_letter'.
+type JobRunResponse struct {
+	ID              string            `json:"id"`
+	JobID           string            `json:"job_id"`
+	AccountID       string            `json:"account_id"`
+	TriggerKind     string            `json:"trigger_kind"`
+	EnvOverrides    map[string]string `json:"env_overrides,omitempty"`
+	Tasks           int               `json:"tasks"`
+	Parallelism     int               `json:"parallelism"`
+	RetryMax        int               `json:"retry_max"`
+	TaskTimeoutSec  int               `json:"task_timeout_sec"`
+	AggregateStatus string            `json:"aggregate_status"`
+	TasksSucceeded  int               `json:"tasks_succeeded"`
+	TasksFailed     int               `json:"tasks_failed"`
+	TasksCancelled  int               `json:"tasks_cancelled"`
+	TasksRunning    int               `json:"tasks_running"`
+	DeadLetterCount int               `json:"dead_letter_count"`
+	StartedAt       string            `json:"started_at,omitempty"`
+	FinishedAt      string            `json:"finished_at,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+}
+
+// JobTaskResponse is the wire projection of state.JobTask.
+// ErrorClass is the canonical mapped string from
+// mapExitToTerminalStatus; ExitCode is the raw guest exit.
+// LeaseToken is omitted (internal dispatch primitive, not a
+// customer-facing field).
+type JobTaskResponse struct {
+	RunID        string `json:"run_id"`
+	TaskIndex    int    `json:"task_index"`
+	Status       string `json:"status"`
+	Attempt      int    `json:"attempt"`
+	InstanceID   string `json:"instance_id,omitempty"`
+	ErrorClass   string `json:"error_class,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	ExitCode     int    `json:"exit_code,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// JobTaskLogResponse is the body of GET /v1/jobs/{name}/runs/
+// {id}/tasks/{idx}/logs. Logs are read from vmmd's tail
+// endpoint (same path the dashboard uses for live app logs);
+// the handler proxies the call to the compute node that owns
+// the instance and streams back the last N bytes.
+//
+// Truncated=true means the tail was capped at MaxBytes;
+// clients should re-fetch with a larger limit to see more.
+// Empty LogContent with Truncated=false means the task never
+// produced output (the process exited before writing
+// anything — common for OOM-killed tasks).
+type JobTaskLogResponse struct {
+	TaskStatus string `json:"task_status"`
+	LogContent string `json:"log_content"`
+	Truncated  bool   `json:"truncated"`
+	MaxBytes   int    `json:"max_bytes"`
+}
+
+// ListJobsResponse is the body of GET /v1/jobs. Page-based
+// pagination — limit / offset are query parameters (handler
+// clamps limit to [1, 200]). NextOffset is -1 when there are
+// no more pages (consistent with the app list endpoint).
+type ListJobsResponse struct {
+	Jobs       []JobResponse `json:"jobs"`
+	Limit      int           `json:"limit"`
+	Offset     int           `json:"offset"`
+	NextOffset int           `json:"next_offset"`
+	Total      int           `json:"total"`
+}
+
+// ListJobRunsResponse is the body of GET /v1/jobs/{name}/runs.
+type ListJobRunsResponse struct {
+	Runs       []JobRunResponse `json:"runs"`
+	Limit      int              `json:"limit"`
+	Offset     int              `json:"offset"`
+	NextOffset int              `json:"next_offset"`
+	Total      int              `json:"total"`
+}
+
+// ListJobTasksResponse is the body of GET /v1/jobs/{name}/runs/
+// {id}/tasks.
+type ListJobTasksResponse struct {
+	Tasks      []JobTaskResponse `json:"tasks"`
+	Limit      int               `json:"limit"`
+	Offset     int               `json:"offset"`
+	NextOffset int               `json:"next_offset"`
+	Total      int               `json:"total"`
+}
+
+// JobRunCancelledResponse is the body of POST /v1/jobs/{name}/
+// runs/{id}/cancel. Returns the post-cancel run aggregate so
+// the dashboard can re-render without a separate GET.
+type JobRunCancelledResponse struct {
+	Run         JobRunResponse `json:"run"`
+	CancelledAt string         `json:"cancelled_at"`
+}
+
+// JobDeletedResponse is the body of DELETE /v1/jobs/{name}.
+// Distinct from JobResponse (no command / env / caps —
+// the dashboard only needs to render the deletion chip +
+// the "was soft-deleted at" timestamp).
+type JobDeletedResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	DeletedAt string `json:"deleted_at"`
+}
