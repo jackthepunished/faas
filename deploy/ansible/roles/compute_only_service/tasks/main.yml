@@ -263,6 +263,22 @@
     mode: "0644"
   when: (faas_box_role | default('single-box')) == 'compute-only'
 
+# Runtime bases embed guest/init as PID 1. Keep the source release-managed;
+# an old /usr/local/bin/faas-guest-init can otherwise survive a daemon rollout
+# and make every newly staged base boot with stale guest code.
+- name: compute_only_service — install canonical guest-init drop-in
+  ansible.builtin.template:
+    src: zz-faas-guest-init.conf.j2
+    dest: /etc/systemd/system/faas-imaged.service.d/zz-faas-guest-init.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: (faas_box_role | default('single-box')) == 'compute-only'
+
+- name: compute_only_service — reload systemd after imaged drop-ins
+  ansible.builtin.systemd:
+    daemon_reload: true
+
 # The split gatewayd-internal egress listener runs as the unprivileged faas
 # user. PKI creates the server key root-only, so grant only the shared faas
 # group read access while keeping the key non-world-readable.

@@ -4179,6 +4179,57 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	return e.snapshotAndPark(ctx, ins)
 }
 
+// markPrimeFailed closes the deployment lifecycle when the scheduler cannot
+// produce the first snapshot. Prime already transitions its instance to
+// FAILED, but historically the deployment row was left in SNAPSHOTTING, so
+// the API kept reporting "no live deployment" without an actionable deploy
+// failure. This runs after the original error has been logged and is
+// intentionally best-effort: the prime error remains the scheduler's primary
+// signal, while the persisted deployment/stage state is the customer-facing
+// recovery path.
+func (e *Engine) markPrimeFailed(ctx context.Context, deploymentID string, cause error) {
+	if deploymentID == "" || cause == nil {
+		return
+	}
+	// The notification handler may be unwinding because the scheduler is
+	// shutting down. Keep the terminal state write independent of that
+	// cancellation, but bound it so shutdown cannot wait on a wedged database.
+	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	dep, err := e.store.DeploymentByID(markCtx, deploymentID)
+	if err != nil {
+		e.log.Warn("sched: prime failure: load deployment", "deployment", deploymentID, "err", err)
+		return
+	}
+	// A duplicate notification can arrive after another worker has already
+	// completed or terminally failed the deployment. Do not let a late prime
+	// error overwrite a successful/live or independently terminal result.
+	if dep.Status == state.DeployLive || dep.Status.IsTerminal() {
+		return
+	}
+
+	problem := api.ErrDeployFailed(cause.Error())
+	code := api.CodeDeployFailed
+	var upstream *api.Problem
+	if errors.As(cause, &upstream) && upstream != nil && upstream.Code != "" {
+		problem = upstream
+		code = upstream.Code
+	}
+	_ = whycopy.Decorate(problem, code, nil)
+
+	now := time.Now().UTC()
+	message := "snapshot prime failed: " + cause.Error()
+	if _, err := e.store.SetDeploymentFailedEx(markCtx, deploymentID, code, message, problem.Hint, problem.Why, problem.Fix, nil); err != nil {
+		e.log.Warn("sched: prime failure: mark deployment failed", "deployment", deploymentID, "err", err)
+	}
+	if _, err := e.store.MarkDeploymentStageFailed(markCtx, deploymentID, now, message); err != nil {
+		// Older/imported rows may not have a current stage. The deployment
+		// status is still terminal and remains the source of truth.
+		e.log.Warn("sched: prime failure: mark stage failed", "deployment", deploymentID, "err", err)
+	}
+}
+
 // Park snapshots a RUNNING instance and frees its RAM (idle reaper, spec §4.3).
 // Acquires the app lock; the reaper calls it per selected instance. The reaper
 // builds its selection without the lock, so we re-read under the lock and skip

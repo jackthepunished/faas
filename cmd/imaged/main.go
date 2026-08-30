@@ -643,28 +643,50 @@ func builderBaseRefFromEnv() (string, error) {
 	return v, nil
 }
 
+const (
+	canonicalGuestInitPath = "/opt/faas/current/bin/init"
+	legacyGuestInitPath    = "/usr/local/bin/faas-guest-init"
+)
+
 // guestInitPathFromEnv resolves the boot-critical PID 1 binary. Older
 // single-box units defaulted to ./init, which depends on an implicit working
 // directory and silently left a stale guest-init inside an already-published
 // runtime base when the checkout was not present there. Prefer the paths used
 // by release installs, then keep the local checkout path as a development
-// fallback. An explicit FAAS_GUEST_INIT always wins.
+// fallback.
+//
+// A historical production override pointed FAAS_GUEST_INIT at
+// /usr/local/bin/faas-guest-init. That path is not release-managed and can
+// survive an otherwise successful daemon rollout, which makes the base image
+// embed an old PID 1. Once the canonical release binary exists, ignore that
+// one legacy override so a base refresh cannot silently preserve stale guest
+// code. Other explicit paths remain supported for local development.
 func guestInitPathFromEnv() string {
-	if v := os.Getenv("FAAS_GUEST_INIT"); v != "" {
-		return v
-	}
-	for _, candidate := range []string{
-		"/opt/faas/current/bin/init",
-		"/usr/local/bin/faas-guest-init",
+	explicit := os.Getenv("FAAS_GUEST_INIT")
+	return resolveGuestInitPath(explicit, []string{
+		canonicalGuestInitPath,
+		legacyGuestInitPath,
 		"./init",
-	} {
-		if _, err := os.Stat(candidate); err == nil {
+	}, func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	})
+}
+
+func resolveGuestInitPath(explicit string, candidates []string, exists func(string) bool) string {
+	if explicit != "" {
+		if explicit != legacyGuestInitPath || !exists(canonicalGuestInitPath) {
+			return explicit
+		}
+	}
+	for _, candidate := range candidates {
+		if exists(candidate) {
 			return candidate
 		}
 	}
 	// Return the release path even when the install is incomplete so the
 	// subsequent base-build error names the missing boot contract directly.
-	return "/opt/faas/current/bin/init"
+	return canonicalGuestInitPath
 }
 
 // envDuration parses a duration env var, returning fallback on parse error
