@@ -3,7 +3,7 @@
 - **Status:** accepted (supplement to ADR-099 v1, status: proposed)
 - **Date:** 2026-08-29
 - **Branch:** `jobs/mega1`
-- **Slot bank:** 00533–00540 (migrations), 0 fences consumed.
+- **Slot bank:** 00536–00542 (migrations), 0 fences consumed.
 
 This supplement records the as-built deviations from ADR-099 v1
 (`docs/adr/099-jobs.md`) introduced by Mega-1 (issue #1184
@@ -13,10 +13,12 @@ order is the canonical reference.
 ## Locked deviations
 
 1. **Slot bank 00517–00524 is fenced by ADR-134 PR-A.** Mega-1
-   migrations start at 00533 per the plan
+   migrations start at 00536 per the plan (post-collision dodge:
+   sibling PRs #1191 / #1204 claim 00535 and 00533, so Mega-1
+   renumbered 00533→00541, 00534→00542 to land at 00536–00542)
    (`/Users/poyrazk/.claude/plans/logical-beaming-church.md`).
    A `git log -- migrations/ | grep reserve_slot` sweep is the
-   pre-merge gate; any fence below 00533 missing in this PR is
+   pre-merge gate; any fence below 00536 missing in this PR is
    a blocker.
 
 2. **Plan caps as-built** (table 1 in §3 of ADR-099 is replaced
@@ -63,7 +65,7 @@ order is the canonical reference.
    Versioned so old listeners ignore new payloads and new
    listeners reject old ones.
 
-7. **Pre-existing jobs without `command`.** Migration 00534
+7. **Pre-existing jobs without `command`.** Migration 00542
    adds `jobs.command text[]` with a fail-closed backfill
    (`echo "no command; PATCH your job"; exit 1`). Customers
    must PATCH before re-running. Documented in the runbook.

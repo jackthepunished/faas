@@ -2847,7 +2847,7 @@ type Store interface {
 
 	// Jobs (issue #1184 Workstream A / ADR-099 supplement).
 	// Run-to-completion workloads land across migrations 00255-00257,
-	// 00533-00538 (jobs / job_runs / job_tasks + the
+	// 00536-00542 (jobs / job_runs / job_tasks + the
 	// soft_delete_job_if_no_live_instances helper). The JobStore
 	// sub-interface is defined in jobs.go; embedding it here keeps
 	// the footnote-heavy comments where they belong (next to the
