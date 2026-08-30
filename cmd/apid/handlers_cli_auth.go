@@ -4,14 +4,12 @@
 //
 //  1. POST /v1/cli-auth/code      — CLI mints a code anonymously. Server
 //     returns {code, url, expires_at}.
-//  2. GET  /cli-auth?code=…        — Dashboard renders the email form
-//     so the user can confirm. The form's hidden `code` field carries
-//     the wire value back to step 3.
-//  3. POST /cli-auth               — Dashboard claims the code (binding
-//     it to an account, creating the account on first login per UX
-//     §2.2), fires NotifyCliAuthCodeActivated, sets the faas_sid
-//     cookie so the browser is logged in too, redirects to
-//     /dashboard/account.
+//  2. GET  /cli-auth?code=…        — The public console forwards this
+//     request to apid. A normal dashboard session is required before
+//     apid renders the authorization form.
+//  3. POST /cli-auth               — The authenticated dashboard claims
+//     the code for its own account, fires NotifyCliAuthCodeActivated,
+//     and redirects to /dashboard/account.
 //  4. POST /v1/cli-auth/exchange   — CLI polls this every second until
 //     the user approves in the browser. On approval the server mints
 //     a fresh API key (api.GenerateAPIKey) and returns the plaintext
@@ -62,7 +60,7 @@ type cliAuthHandlers struct {
 	srv     *server
 	log     *slog.Logger
 	domain  string // apps base URL — same as authHandlers.domain
-	urlBase string // absolute API origin serving the /cli-auth route
+	urlBase string // public web origin forwarding the /cli-auth route
 }
 
 // mintCliAuthCode handles POST /v1/cli-auth/code. Returns 200 with
@@ -177,15 +175,16 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// renderCliAuthPage handles GET /cli-auth?code=…. Renders the
-// dashboard template cli_auth.html. Missing or malformed code →
-// error page; unknown code → "code not found" page (NOT a 404,
-// which would let a phishing page probe which codes exist).
+// renderCliAuthPage handles GET /cli-auth?code=…. The route is mounted
+// behind sessionAuth, so only a signed-in dashboard session reaches this
+// function. It renders the authorization page without accepting an email
+// address from the browser; the session account is the only principal that
+// can claim the code.
 //
 // CSRF (review finding A1): on a valid code we mint a sealed CSRF
-// token bound to (action="cli-auth", subject=<raw code>) using the
-// shared session.Manager and set it as the cli-auth-pre cookie. The
-// same token is rendered into the form's csrf_token hidden field.
+// token bound to (action="cli-auth", subject=<account ID>) using the
+// shared session.Manager and set it as the authenticated CSRF cookie.
+// The same token is rendered into the form's csrf_token hidden field.
 // postCliAuthPage verifies the cookie against the form value with
 // the matching action + subject. A cross-site POST lacks the cookie
 // and is rejected; a forged token cannot be opened without the
@@ -201,20 +200,26 @@ func (h *cliAuthHandlers) renderCliAuthPage(w http.ResponseWriter, r *http.Reque
 		h.renderCliAuthError(w, r, "Code unavailable", "This code is expired or already used.")
 		return
 	}
+	acct, ok := AccountFrom(r.Context())
+	if !ok || acct.ID == "" {
+		h.log.Error("cli_auth.missing_session")
+		h.renderCliAuthError(w, r, "Sign-in required", "Sign in to Gregale before authorizing the CLI.")
+		return
+	}
 	// The hidden field carries the normalized (dash-less) RAW code so
 	// the POST handler can hash it. normalizeCliAuthCode strips the
 	// dash and uppercases; we put the hex back together.
 	raw := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(r.URL.Query().Get("code")), "-", ""))
 
-	// Mint the CSRF token + sidecar cookie bound to this code.
-	token, err := middleware.IssueForAnonymous(h.srv.sessions, "cli-auth", raw)
+	// Mint the CSRF token + authenticated cookie bound to this account.
+	token, err := middleware.IssueForAuthenticated(h.srv.sessions, "cli-auth", acct.ID)
 	if err != nil {
 		h.log.Error("cli_auth.csrf_issue", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     middleware.CookieNameAnonymous,
+		Name:     middleware.CookieNameAuthenticated,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
@@ -227,8 +232,9 @@ func (h *cliAuthHandlers) renderCliAuthPage(w http.ResponseWriter, r *http.Reque
 		Title: "Authorize CLI session",
 		Body:  "cli_auth",
 		Data: map[string]any{
-			"Code":      raw,
-			"CSRFToken": token,
+			"Code":         raw,
+			"CSRFToken":    token,
+			"AccountEmail": acct.Email,
 		},
 	}
 	if err := dashboard.Render(w, h.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
@@ -238,19 +244,23 @@ func (h *cliAuthHandlers) renderCliAuthPage(w http.ResponseWriter, r *http.Reque
 }
 
 // postCliAuthPage handles POST /cli-auth (form submit from the
-// dashboard). Resolves the submitted email, upserts an account
-// (UX §2.2: "First successful login creates the account row if the
-// email is new — signup and login are the same door"), atomically
-// claims the code, fires NotifyCliAuthCodeActivated, sets the
-// faas_sid session cookie so the browser is logged in too,
-// redirects to /dashboard/account.
+// dashboard). The route is mounted behind sessionAuth, so the code is
+// always claimed for the already-authenticated session account. No email
+// address is accepted from the form and this path never creates accounts.
+// New users must complete the normal signup flow before authorizing a CLI.
+// After the atomic claim it fires NotifyCliAuthCodeActivated and redirects
+// to /dashboard/account.
 //
-// CSRF (review finding A1): verify the cli-auth-pre cookie + form
-// token are bound to (action="cli-auth", subject=<raw code>). The
-// subject is the normalized code so an attacker who replays the
-// cookie against a different code they minted on /v1/cli-auth/code
-// cannot match the binding.
+// CSRF (review finding A1): verify the authenticated CSRF cookie + form
+// token are bound to (action="cli-auth", subject=<account ID>). A forged
+// token or a token rendered for another account cannot authorize the code.
 func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request) {
+	acct, ok := AccountFrom(r.Context())
+	if !ok || acct.ID == "" {
+		h.log.Error("cli_auth.missing_session")
+		h.renderCliAuthError(w, r, "Sign-in required", "Sign in to Gregale before authorizing the CLI.")
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
@@ -258,61 +268,20 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// Resolve the code first so we can pass it as the CSRF subject.
 	rawCode := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(r.FormValue("code")), "-", ""))
 	if rawCode == "" {
-		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
+		h.renderCliAuthError(w, r, "Missing code", "The CLI authorization code is required.")
 		return
 	}
 	hash, ok := normalizeCliAuthCode(rawCode)
 	if !ok {
-		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
+		h.renderCliAuthError(w, r, "Invalid code", "The CLI authorization code is not valid.")
 		return
 	}
 	// CSRF guard (review finding A1). Cookie + form value must be a
-	// sealed envelope with action=cli-auth and subject=rawCode. A
+	// sealed envelope with action=cli-auth and subject=acct.ID. A
 	// cross-site POST lacks the cookie and is rejected here before
-	// any account lookup or claim.
-	if err := middleware.VerifyAnonymous(h.srv.sessions, r, "cli-auth", rawCode); err != nil {
+	// the code claim.
+	if err := middleware.VerifyAuthenticated(h.srv.sessions, r, "cli-auth", acct.ID); err != nil {
 		h.renderCliAuthError(w, r, "Invalid form", "Please reload the page and try again.")
-		return
-	}
-	email := strings.TrimSpace(strings.ToLower(r.FormValue("email")))
-	if !looksLikeEmail(email) {
-		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
-		return
-	}
-
-	// Resolve or auto-create the account (UX §2.2 promise). Look up
-	// by email first to give a stable account_id for existing
-	// customers; only create if the email is unknown.
-	acct, err := h.srv.store.AccountByEmail(r.Context(), email)
-	// IAM-4 (ADR-035): capture whether this claim created a new
-	// account; the audit emit below carries it as data.auto_created
-	// so a customer can answer "did someone sign up with my email
-	// today?" from the GDPR export.
-	autoCreated := errors.Is(err, state.ErrNotFound)
-	if autoCreated {
-		res, err := h.srv.store.CreateAccountWithPersonalOrg(r.Context(), state.CreateAccountWithPersonalOrgParams{
-			Email: email,
-			Plan:  api.PlanFree,
-		})
-		if err != nil {
-			// Log only the operation path; the err.Error() string is
-			// flagged by CodeQL go/log-injection because it carries
-			// the email through CreateAccount's wrapped error. The
-			// account_id attr is also dropped — it's zero on the
-			// error path and CodeQL conservatively taints it from
-			// the email arg.
-			h.log.Error("cli_auth.create_account", "path", "create")
-			h.renderCliAuthError(w, r, "Could not sign you up", "Please try again.")
-			return
-		}
-		acct = res.Account
-		// codeql[go/log-injection] false-positive: acct.ID is server-generated via newID() (hex of crypto/rand{16}); CodeQL's taint engine conservatively tracks the email argument through CreateAccount into the returned Account struct, but acct.ID itself is not user-controllable. Mirrors the precedent in cmd/apid/handlers.go:67.
-		h.log.Info("cli_auth.auto_created_account",
-			"event", api.EventCliAuthAutoCreated,
-			"account", acct.ID)
-	} else if err != nil {
-		h.log.Error("cli_auth.account_by_email", "err", err)
-		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}
 
@@ -333,39 +302,6 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	}
 	_ = h.srv.notif.Notify(r.Context(), db.NotifyCliAuthCodeActivated,
 		`{"hash":"`+hex.EncodeToString(hash)+`"}`)
-
-	// Issue a session cookie so the browser is logged in too.
-	// IAM-2: stamp mfa_pending=true if the account has opted into MFA
-	// or an explicit mfa_required policy is active. The /cli-auth page
-	// is on the dashboardAuthChain (not gated by s.auth), so the
-	// customer can re-render the post-claim page even while pending.
-	// IAM-3 (ADR-039) routes through the unified helper so the
-	// sessions row is created with the same sid that the cookie
-	// envelope carries.
-	cookie, _, err := h.srv.issueDashboardSession(r.Context(), r, acct.ID, mfaSessionPending(acct), "cli_code")
-	if err != nil {
-		h.log.Error("cli_auth.issue_session", "err", err)
-		http.Error(w, "internal", http.StatusInternalServerError)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    cookie,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   h.domain != "",
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(h.srv.sessions.MaxAge().Seconds()),
-	})
-	// IAM-4 (ADR-035): record the dashboard-side claim of a CLI auth
-	// code. data.auto_created=true iff this was the first time we saw
-	// the email (CreateAccount path above). The audit row lets an
-	// operator answer "which email auto-created an account today?"
-	// without grepping slog.
-	h.srv.audit.Emit(r.Context(), "auth.login", &acct.ID, map[string]any{
-		"method":       "cli_code",
-		"auto_created": autoCreated,
-	})
 	http.Redirect(w, r, cliAuthDashboard, http.StatusFound)
 }
 

@@ -277,8 +277,8 @@ func TestOAuthCallback_RequiresSessionAuth(t *testing.T) {
 		t.Fatalf("code = %d, want 302 (redirect to /login)", rec.Code)
 	}
 	loc := rec.Header().Get("Location")
-	if loc != "/login?next=/oauth/callback" {
-		t.Errorf("redirect = %q, want /login?next=/oauth/callback", loc)
+	if loc != "/login?next=%2Foauth%2Fcallback%3Finstallation_id%3D1" {
+		t.Errorf("redirect = %q, want encoded OAuth callback return target", loc)
 	}
 	if gh.gotInstallID != 0 {
 		t.Errorf("verify should NOT be called for unauthed request; got %d", gh.gotInstallID)
