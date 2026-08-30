@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AlertDeliveryResponse } from '../models/AlertDeliveryResponse.js';
 import type { AlertPresetResponse } from '../models/AlertPresetResponse.js';
 import type { AlertRuleResponse } from '../models/AlertRuleResponse.js';
 import type { CreateAlertRuleRequest } from '../models/CreateAlertRuleRequest.js';
@@ -251,6 +252,68 @@ export class AlertRulesService {
       errors: {
         401: `code: unauthorized`,
         402: `code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List recent alert_deliveries rows for one rule.
+   * Returns the most-recent alert_deliveries rows for the rule,
+   * newest-first. The default (include_test=false) hides test
+   * rows; the operator pane is reachable via ?include_test=true.
+   * IDOR-safe: a 404 is returned when the rule is on another
+   * account (same posture as GET /v1/apps/{slug}/alerts/{id}).
+   *
+   * @returns AlertDeliveryResponse Recent deliveries, newest-first.
+   * @throws ApiError
+   */
+  public static listAlertRuleDeliveries({
+    slug,
+    id,
+    includeTest = false,
+    limit = 50,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    /**
+     * When true, also surface rows written by Dispatcher.DispatchTest
+     * (the customer-facing "send test alert" path). Default false
+     * hides test rows so the customer's recent-deliveries pane is
+     * not polluted by every "send test alert" click. Operators can
+     * flip the toggle for post-mortems; the production read stays
+     * index-only via the partial index
+     * alert_deliveries_rule_fired_production_idx.
+     *
+     */
+    includeTest?: boolean,
+    /**
+     * Max rows to return. Clamped to 100.
+     */
+    limit?: number,
+  }): CancelablePromise<Array<AlertDeliveryResponse>> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/alerts/{id}/deliveries',
+      path: {
+        'slug': slug,
+        'id': id,
+      },
+      query: {
+        'include_test': includeTest,
+        'limit': limit,
+      },
+      errors: {
+        401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
