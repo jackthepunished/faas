@@ -301,14 +301,14 @@ func (s *PgStore) JobUpdate(ctx context.Context, id string, command []string, im
 // helper signature.
 func (s *PgStore) JobSoftDelete(ctx context.Context, id string) (deleted bool, hasLiveInstances bool, err error) {
 	// 1. Live-instance count. The helper's predicate mirrors this
-	//    exactly (kind='job_task' AND status NOT IN ('parked','destroyed'))
+	//    exactly (kind='job_task' AND state NOT IN ('parked','destroyed'))
 	//    so a non-zero count means the helper will refuse the flip.
 	var liveCount int
 	if err := s.pool.QueryRow(ctx,
 		`select count(*) from instances
 		  where job_id = $1::uuid
 		    and kind   = 'job_task'
-		    and status not in ('parked', 'destroyed')`,
+		    and state not in ('parked', 'destroyed')`,
 		id,
 	).Scan(&liveCount); err != nil {
 		return false, false, fmt.Errorf("state: count live instances for job %s: %w", id, err)
@@ -374,12 +374,17 @@ func (s *PgStore) JobCountByAccount(ctx context.Context, accountID string) (int,
 // before accepting a new run + by meterd's billing sweep for the live-pool
 // bill.
 func (s *PgStore) JobConcurrentByAccount(ctx context.Context, accountID string) (int, error) {
+	// job_task instances carry job_id (no app_id); we resolve the
+	// owning account via the FK to jobs. The state predicate
+	// matches the soft-delete helper (00538) so a parked/
+	// destroyed instance never counts against the cap.
 	var count int
 	err := s.pool.QueryRow(ctx,
-		`select count(*) from instances
-		  where account_id = $1::uuid
-		    and kind       = 'job_task'
-		    and state      not in ('parked', 'destroyed')`,
+		`select count(*) from instances i
+		   join jobs     j on j.id = i.job_id
+		  where j.account_id = $1::uuid
+		    and i.kind       = 'job_task'
+		    and i.state      not in ('parked', 'destroyed')`,
 		accountID,
 	).Scan(&count)
 	if err != nil {
@@ -516,35 +521,14 @@ func (s *PgStore) JobRunListByAccount(ctx context.Context, accountID string, lim
 // satisfied. finished_at is NULL while the run is non-terminal — it
 // is stamped to now() on the first terminal recompute.
 func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, error) {
+	// CTE-first form: PG15 UPDATE...FROM with a subquery that
+	// references the UPDATE target (r.id) inside the subquery's
+	// WHERE clause errors with "invalid reference to FROM-clause
+	// entry" — the FROM alias isn't in scope inside the inner
+	// query. Materialising the task counts via a WITH keeps the
+	// same logic and reads identically.
 	row := s.pool.QueryRow(ctx,
-		`update job_runs r set
-		   tasks_succeeded = coalesce(c.succ, 0),
-		   tasks_failed    = coalesce(c.fail, 0),
-		   tasks_cancelled = coalesce(c.canc, 0),
-		   tasks_running   = coalesce(c.running, 0),
-		   aggregate_status = case
-		       when coalesce(c.running, 0) > 0 then 'running'
-		       when coalesce(c.queued_or_claimed, 0) > 0 then 'running'
-		       when coalesce(c.canc, 0) > 0
-		            and coalesce(c.fail, 0) = 0
-		            and r.dead_letter_count = 0 then 'cancelled'
-		       when coalesce(c.fail, 0) > 0
-		            and r.dead_letter_count = 0 then 'failed'
-		       when r.dead_letter_count > 0 then 'dead_letter'
-		       else 'succeeded'
-		   end,
-		   started_at = case
-		       when r.started_at is null and coalesce(c.running, 0) +
-		            coalesce(c.queued_or_claimed, 0) > 0 then now()
-		       else r.started_at
-		   end,
-		   finished_at = case
-		       when coalesce(c.queued_or_claimed, 0) = 0
-		            and coalesce(c.running, 0) = 0
-		            and r.finished_at is null then now()
-		       else r.finished_at
-		   end
-		 from (
+		`with counts as (
 		   select
 		     -- 00541 broadened the terminal vocabulary to
 		     -- succeeded/failed/timeout/cancelled/oom. CR-E /
@@ -562,10 +546,37 @@ func (s *PgStore) JobRunRecompute(ctx context.Context, runID string) (JobRun, er
 		     sum(case when status = 'succeeded' then 1 else 0 end) as succ,
 		     sum(case when status = 'failed' then 1 else 0 end) as fail,
 		     sum(case when status in ('cancelled','timeout','oom') then 1 else 0 end) as canc,
-		     sum(case when status in ('claimed') then 1 else 0 end) as running,
+		     sum(case when status = 'claimed' then 1 else 0 end) as running,
 		     sum(case when status = 'queued' then 1 else 0 end) as queued_or_claimed
-		   from job_tasks where run_id = r.id
-		 ) c
+		   from job_tasks where run_id = $1::uuid
+		 )
+		 update job_runs r set
+		   tasks_succeeded = coalesce((select succ from counts), 0),
+		   tasks_failed    = coalesce((select fail from counts), 0),
+		   tasks_cancelled = coalesce((select canc from counts), 0),
+		   tasks_running   = coalesce((select running from counts), 0),
+		   aggregate_status = case
+		       when coalesce((select running from counts), 0) > 0 then 'running'
+		       when coalesce((select queued_or_claimed from counts), 0) > 0 then 'running'
+		       when coalesce((select canc from counts), 0) > 0
+		            and coalesce((select fail from counts), 0) = 0
+		            and r.dead_letter_count = 0 then 'cancelled'
+		       when coalesce((select fail from counts), 0) > 0
+		            and r.dead_letter_count = 0 then 'failed'
+		       when r.dead_letter_count > 0 then 'dead_letter'
+		       else 'succeeded'
+		   end,
+		   started_at = case
+		       when r.started_at is null and coalesce((select running from counts), 0) +
+		            coalesce((select queued_or_claimed from counts), 0) > 0 then now()
+		       else r.started_at
+		   end,
+		   finished_at = case
+		       when coalesce((select queued_or_claimed from counts), 0) = 0
+		            and coalesce((select running from counts), 0) = 0
+		            and r.finished_at is null then now()
+		       else r.finished_at
+		   end
 		 where r.id = $1::uuid
 		 returning `+jobRunSelectCols,
 		runID)
@@ -644,11 +655,19 @@ func (s *PgStore) JobRunCancel(ctx context.Context, runID string) (JobRun, error
 	return run, nil
 }
 
-// JobRunIncrementDeadLetter bumps dead_letter_count by 1. The
-// recompute is the caller's job (typically followed by JobRunRecompute).
+// JobRunIncrementDeadLetter bumps dead_letter_count by 1 AND the
+// paired tasks_failed by 1. The CHECK constraint
+// `dead_letter_count <= tasks_failed` (00536) requires the two
+// counters move together — a dead-lettered task is, by definition,
+// a failed task that exhausted retries. Bumping both keeps the
+// cross-field invariant intact; the recompute that follows reads
+// the new totals.
 func (s *PgStore) JobRunIncrementDeadLetter(ctx context.Context, runID string) error {
 	tag, err := s.pool.Exec(ctx,
-		`update job_runs set dead_letter_count = dead_letter_count + 1 where id = $1::uuid`,
+		`update job_runs set
+		   dead_letter_count = dead_letter_count + 1,
+		   tasks_failed      = tasks_failed + 1
+		 where id = $1::uuid`,
 		runID)
 	if err != nil {
 		return fmt.Errorf("state: increment dead letter for run %s: %w", runID, err)

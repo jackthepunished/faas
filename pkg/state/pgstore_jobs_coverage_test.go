@@ -23,16 +23,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // pgJobsStoreWithPool opens a fresh pgtest schema, runs migrations,
-// returns a PgStore ready to drive the JobStore surface.
-func pgJobsStoreWithPool(t *testing.T) (*state.PgStore, context.Context) {
+// returns a PgStore + the underlying pgxpool so callers can issue
+// raw SQL against the same per-test schema.
+func pgJobsStoreWithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
-	s, _, ctx := pgStoreWithPool(t)
-	return s, ctx
+	return pgStoreWithPool(t)
 }
 
 // pgJobsSeed creates an account + job + 3-task run on the supplied
@@ -66,10 +68,30 @@ func pgJobsSeed(t *testing.T, s *state.PgStore, ctx context.Context, name string
 	return job, run, fanned
 }
 
+// pgJobsCreateJobTaskInstance inserts a real `instances` row
+// carrying kind='job_task' + job_id=:jobID so the FK from
+// job_tasks.instance_id resolves. CreateInstanceWithMode doesn't
+// write kind/job_id, so a raw INSERT is the cleanest path. Returns
+// the generated instance UUID. Takes the pool directly (not the
+// PgStore) so the INSERT lands in the same per-test schema the
+// surrounding PgStore is bound to.
+func pgJobsCreateJobTaskInstance(t *testing.T, pool *pgxpool.Pool, ctx context.Context, jobID string) string {
+	t.Helper()
+	row := pool.QueryRow(ctx,
+		`insert into instances (kind, job_id, state, ram_mb, mode)
+		 values ('job_task', $1::uuid, 'cold_booting', 256, 'job')
+		 returning id::text`, jobID)
+	var id string
+	if err := row.Scan(&id); err != nil {
+		t.Fatalf("pgJobsCreateJobTaskInstance: %v", err)
+	}
+	return id
+}
+
 // --- jobs table ---
 
 func TestPg_Jobs_JobGetByID(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-1")
 
 	got, err := s.JobGetByID(ctx, job.ID)
@@ -85,7 +107,7 @@ func TestPg_Jobs_JobGetByID(t *testing.T) {
 }
 
 func TestPg_Jobs_JobGetByName(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-2")
 
 	got, err := s.JobGetByName(ctx, job.AccountID, job.Name)
@@ -101,7 +123,7 @@ func TestPg_Jobs_JobGetByName(t *testing.T) {
 }
 
 func TestPg_Jobs_JobListByAccount(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-3")
 
 	list, err := s.JobListByAccount(ctx, job.AccountID, 50, 0)
@@ -122,7 +144,7 @@ func TestPg_Jobs_JobListByAccount(t *testing.T) {
 }
 
 func TestPg_Jobs_JobUpdate(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-4")
 
 	newCmd := []string{"/bin/sh", "-c", "echo updated"}
@@ -141,7 +163,7 @@ func TestPg_Jobs_JobUpdate(t *testing.T) {
 }
 
 func TestPg_Jobs_JobSoftDelete(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-5")
 
 	deleted, hasLive, err := s.JobSoftDelete(ctx, job.ID)
@@ -165,7 +187,7 @@ func TestPg_Jobs_JobSoftDelete(t *testing.T) {
 }
 
 func TestPg_Jobs_JobCountByAccount(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-6")
 	if n, err := s.JobCountByAccount(ctx, job.AccountID); err != nil || n < 1 {
 		t.Errorf("JobCountByAccount = %d, err=%v, want ≥1", n, err)
@@ -173,7 +195,7 @@ func TestPg_Jobs_JobCountByAccount(t *testing.T) {
 }
 
 func TestPg_Jobs_JobConcurrentByAccount(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, _, _ := pgJobsSeed(t, s, ctx, "job-7")
 	n, err := s.JobConcurrentByAccount(ctx, job.AccountID)
 	if err != nil {
@@ -187,7 +209,7 @@ func TestPg_Jobs_JobConcurrentByAccount(t *testing.T) {
 // --- job_runs table ---
 
 func TestPg_Jobs_JobRunGetByID(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, _ := pgJobsSeed(t, s, ctx, "run-1")
 
 	got, err := s.JobRunGetByID(ctx, run.ID)
@@ -203,7 +225,7 @@ func TestPg_Jobs_JobRunGetByID(t *testing.T) {
 }
 
 func TestPg_Jobs_JobRunListByJob(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, run, _ := pgJobsSeed(t, s, ctx, "run-2")
 
 	list, err := s.JobRunListByJob(ctx, job.ID, 50, 0)
@@ -216,7 +238,7 @@ func TestPg_Jobs_JobRunListByJob(t *testing.T) {
 }
 
 func TestPg_Jobs_JobRunListByAccount(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	job, run, _ := pgJobsSeed(t, s, ctx, "run-3")
 
 	list, err := s.JobRunListByAccount(ctx, job.AccountID, 50, 0)
@@ -229,7 +251,7 @@ func TestPg_Jobs_JobRunListByAccount(t *testing.T) {
 }
 
 func TestPg_Jobs_JobRunRecompute(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "run-4")
 	finish := time.Now()
 	for _, tk := range fanned {
@@ -251,7 +273,7 @@ func TestPg_Jobs_JobRunRecompute(t *testing.T) {
 }
 
 func TestPg_Jobs_JobRunCancel(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, _ := pgJobsSeed(t, s, ctx, "run-5")
 
 	cancelled, err := s.JobRunCancel(ctx, run.ID)
@@ -268,7 +290,7 @@ func TestPg_Jobs_JobRunCancel(t *testing.T) {
 }
 
 func TestPg_Jobs_JobRunIncrementDeadLetter(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, _ := pgJobsSeed(t, s, ctx, "run-6")
 	if err := s.JobRunIncrementDeadLetter(ctx, run.ID); err != nil {
 		t.Fatalf("JobRunIncrementDeadLetter: %v", err)
@@ -285,7 +307,7 @@ func TestPg_Jobs_JobRunIncrementDeadLetter(t *testing.T) {
 // --- job_tasks table ---
 
 func TestPg_Jobs_JobTaskClaimBatch(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	pgJobsSeed(t, s, ctx, "task-1")
 
 	batch, err := s.JobTaskClaimBatch(ctx, 2)
@@ -301,13 +323,17 @@ func TestPg_Jobs_JobTaskClaimBatch(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskMarkClaimed(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "task-2")
+	s, pool, ctx := pgJobsStoreWithPool(t)
+	job, run, fanned := pgJobsSeed(t, s, ctx, "task-2")
 	task := fanned[0]
+	// Create a real job_task instance row directly so the FK on
+	// job_tasks.instance_id resolves. CreateInstanceWithMode doesn't
+	// write kind/job_id, so a raw INSERT is the cleanest path.
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
 	lease := "00000000-0000-0000-0000-deadbeefcafe"
 	nodeID := resolveDefaultLocal(t, ctx, s)
 	expires := time.Now().Add(5 * time.Minute)
-	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, "00000000-0000-0000-0000-000000000001", lease, expires, nodeID); err != nil {
+	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, instanceID, lease, expires, nodeID); err != nil {
 		t.Fatalf("JobTaskMarkClaimed: %v", err)
 	}
 	got, err := s.JobTaskGet(ctx, run.ID, task.TaskIndex)
@@ -320,7 +346,7 @@ func TestPg_Jobs_JobTaskMarkClaimed(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskMarkTerminal(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "task-3")
 	task := fanned[0]
 	finish := time.Now()
@@ -337,7 +363,7 @@ func TestPg_Jobs_JobTaskMarkTerminal(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskRetry(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "task-4")
 	task := fanned[0]
 	if err := s.JobTaskMarkTerminal(ctx, run.ID, task.TaskIndex, "failed", 1, "user_error", "", time.Now()); err != nil {
@@ -357,10 +383,11 @@ func TestPg_Jobs_JobTaskRetry(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskRequeue(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "task-5")
+	s, pool, ctx := pgJobsStoreWithPool(t)
+	job, run, fanned := pgJobsSeed(t, s, ctx, "task-5")
 	task := fanned[0]
-	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, "00000000-0000-0000-0000-000000000099",
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
+	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, instanceID,
 		"00000000-0000-0000-0000-deadbeef0001", time.Now().Add(5*time.Minute), resolveDefaultLocal(t, ctx, s)); err != nil {
 		t.Fatalf("setup MarkClaimed: %v", err)
 	}
@@ -375,7 +402,7 @@ func TestPg_Jobs_JobTaskRequeue(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskCancel(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "task-6")
 	task := fanned[0]
 	if err := s.JobTaskCancel(ctx, run.ID, task.TaskIndex); err != nil {
@@ -388,10 +415,11 @@ func TestPg_Jobs_JobTaskCancel(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskFindStuck(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
-	_, run, fanned := pgJobsSeed(t, s, ctx, "task-7")
+	s, pool, ctx := pgJobsStoreWithPool(t)
+	job, run, fanned := pgJobsSeed(t, s, ctx, "task-7")
 	task := fanned[0]
-	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, "00000000-0000-0000-0000-000000000098",
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
+	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, instanceID,
 		"00000000-0000-0000-0000-deadbeef0002", time.Now().Add(-time.Hour), resolveDefaultLocal(t, ctx, s)); err != nil {
 		t.Fatalf("setup MarkClaimed expired lease: %v", err)
 	}
@@ -405,7 +433,7 @@ func TestPg_Jobs_JobTaskFindStuck(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskGet(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "task-8")
 	got, err := s.JobTaskGet(ctx, run.ID, fanned[0].TaskIndex)
 	if err != nil {
@@ -420,7 +448,7 @@ func TestPg_Jobs_JobTaskGet(t *testing.T) {
 }
 
 func TestPg_Jobs_JobTaskList(t *testing.T) {
-	s, ctx := pgJobsStoreWithPool(t)
+	s, _, ctx := pgJobsStoreWithPool(t)
 	_, run, fanned := pgJobsSeed(t, s, ctx, "task-9")
 	list, err := s.JobTaskList(ctx, run.ID, 50, 0)
 	if err != nil {
