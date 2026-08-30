@@ -1407,7 +1407,7 @@ func (c *Client) UpdateJob(ctx context.Context, name string, req UpdateJobReques
 // CodeJobHasLiveInstances when live (kind='job_task', status NOT
 // IN ('parked','destroyed')) instances exist. The server check is
 // enforced inside the soft_delete_job_if_no_live_instances stored
-// function (migrations/00567) so the dispatch tick cannot lose a
+// function (migrations/00576) so the dispatch tick cannot lose a
 // task mid-flight.
 func (c *Client) DeleteJob(ctx context.Context, name string) (JobDeletedResponse, error) {
 	var out JobDeletedResponse
@@ -1416,7 +1416,7 @@ func (c *Client) DeleteJob(ctx context.Context, name string) (JobDeletedResponse
 
 // CreateJobRun fan-outs N tasks for the given job (POST
 // /v1/jobs/{name}/runs). Atomic via generate_series INSERT inside
-// state.PgStore.JobRunCreate (see migrations/00255 + 00565). The
+// state.PgStore.JobRunCreate (see migrations/00255 + 00574). The
 // handler validates Tasks against Plan.JobMaxTasksPerRun
 // (Hobby=100, Pro=1000, Scale=5000). Idempotent (Idempotency-Key
 // header auto-mint).

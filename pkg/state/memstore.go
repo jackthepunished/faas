@@ -143,7 +143,7 @@ type MemStore struct {
 	triggers  map[string]sqlc.Trigger
 	records   map[string]sqlc.TriggerRecord
 	// jobs / jobRuns / jobTasks mirror the ADR-099 / issue #1184
-	// Workstream A tables (migrations/00255-00257, 00562-00569) for
+	// Workstream A tables (migrations/00255-00257, 00571-00578) for
 	// handler / dispatch-tick tests. Keyed by id / run_id. The task
 	// map is nested so per-run task slice access is O(1) without a
 	// slice-walk under m.mu — JobTaskGet and JobTaskList become
