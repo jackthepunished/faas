@@ -1932,6 +1932,18 @@ func (c *Client) ReplayInvocation(ctx context.Context, id string) (AsyncInvokeRe
 	return out, c.do(ctx, "POST", "/v1/invocations/"+id+"/replay", nil, &out)
 }
 
+// QueueDeadLetterReplay resets a dead-letter queue row back to
+// 'pending' with attempts=0 so the drain picks it up again. ADR-134
+// PR-C closes the previously-missing queue DLQ replay path —
+// distinct from ReplayInvocation (which enqueues a NEW row tagged
+// Source=InvocationReplay). This endpoint mutates the row in place
+// so the dashboard's replay history view can track the chain on a
+// single row id.
+func (c *Client) QueueDeadLetterReplay(ctx context.Context, slug, id string) (AsyncInvokeResponse, error) {
+	var out AsyncInvokeResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/dead_letter/"+id+"/replay", nil, &out)
+}
+
 // API keys.
 //
 // CreateKey accepts an explicit scopes slice. Pass nil to preserve the
