@@ -776,6 +776,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				"    - set FAAS_DEV=1 on a dev/CI box where unset transport should resolve to log", err)
 		}
 	}
+	// PR #1191 fixup: wrap the transport with the decorator stack so
+	// the dunning timer's outbound mail is suppressed-aware + retries
+	// on 429/5xx. Without this a past-due customer bounces a
+	// Resend request and meterd's quota-tick loop sees the failure
+	// as a permanent error instead of retrying within the wall-clock
+	// budget. Tests inject deps.mailer (non-nil) so this block is
+	// skipped on the unit-test path.
+	if deps.mailer == nil && mailer != nil {
+		transportLabel := strings.ToLower(deps.getenv("FAAS_MAIL_TRANSPORT"))
+		mailer = &mail.SuppressingSender{
+			Inner: &mail.RetryingSender{
+				Inner:         mailer,
+				TransportName: transportLabel,
+				Log:           log,
+			},
+			Store: mailStoreCheckerAdapter{s: store},
+			Log:   log,
+		}
+	}
 
 	// Bulk-sender compliance (issue #246 item 4): the quota-warning
 	// template is the ONE outbound mail that carries a
@@ -1501,6 +1520,18 @@ func (a storageStoreAdapter) LatestSnapshotBytes(ctx context.Context, appID stri
 
 func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
 	return a.s.AppendSnapshotStorage(ctx, accountID, appID, day, snapshotBytes, layerBytes)
+}
+
+// mailStoreCheckerAdapter narrows state.Store to the
+// mail.SuppressionChecker surface SuppressingSender needs. Keeps
+// pkg/mail free of an import on pkg/state (the leaf-package
+// interface seam at pkg/mail/suppression.go is the rule). PR #1191
+// fixup: same adapter shape cmd/apid uses; duplicated here so each
+// daemon's runDeps namespace owns its adapters.
+type mailStoreCheckerAdapter struct{ s state.Store }
+
+func (a mailStoreCheckerAdapter) IsMailSuppressed(ctx context.Context, email string) (bool, error) {
+	return a.s.IsMailSuppressed(ctx, email)
 }
 
 // warnIfEmptyAPIKey emits a soft warning when the active provider has no

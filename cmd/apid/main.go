@@ -820,6 +820,19 @@ func (a mailAdapter) Send(ctx context.Context, m Message) error {
 	})
 }
 
+// mailStoreCheckerAdapter narrows state.Store to the
+// mail.SuppressionChecker surface SuppressingSender needs. Keeps
+// pkg/mail free of an import on pkg/state (the leaf-package
+// interface seam at pkg/mail/suppression.go is the rule), and lets
+// the apid / meterd wire-up pick the same Store the rest of the
+// daemon uses without dragging the full state.Store surface into
+// the decorator. PR #1191 fixup.
+type mailStoreCheckerAdapter struct{ s state.Store }
+
+func (a mailStoreCheckerAdapter) IsMailSuppressed(ctx context.Context, email string) (bool, error) {
+	return a.s.IsMailSuppressed(ctx, email)
+}
+
 // graceIntervalFromEnv reads FAAS_GRACE_INTERVAL to let the e2e test
 // accelerate the sweep (default 60s is correct for production; a CI
 // test sets it to a few hundred ms so the 30-day "grace expired"
@@ -1032,6 +1045,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				"    - set FAAS_MAIL_TRANSPORT=resend (or postmark) plus FAAS_MAIL_FROM and the provider key in /etc/faas/sealed.env\n"+
 				"    - set FAAS_MAIL_TRANSPORT=log to keep mail in the journal\n"+
 				"    - set FAAS_DEV=1 on a dev/CI box where unset transport should resolve to log", err)
+		}
+	}
+	// PR #1191 fixup: wrap the transport with the decorator stack so
+	// every send path is suppressed-aware + 429/5xx-retried. Without
+	// this the bounce handler's suppression rows never gate outbound
+	// mail and a transient Resend failure leaks back to the HTTP
+	// caller instead of being retried within the wall-clock budget.
+	//
+	// SuppressingSender is outermost — a suppressed address costs
+	// zero HTTP attempts. RetryingSender wraps the transport so the
+	// decorator chain matches the plan:
+	//
+	//   SuppressingSender
+	//     └── RetryingSender
+	//           └── SenderFromEnv result
+	//
+	// The store is the state.Store that backs IsMailSuppressed —
+	// the same store the rest of apid holds. Tests inject a
+	// dependency that bypasses this block (deps.mailer is
+	// non-nil), so the unit-test surface never sees the stack.
+	if deps.mailer == nil && m != nil && deps.store != nil {
+		transportLabel := strings.ToLower(deps.getenv("FAAS_MAIL_TRANSPORT"))
+		m = &mail.SuppressingSender{
+			Inner: &mail.RetryingSender{
+				Inner:         m,
+				TransportName: transportLabel,
+				Log:           log,
+			},
+			Store: mailStoreCheckerAdapter{s: deps.store()},
+			Log:   log,
 		}
 	}
 	mailer := newMailerAdapter(m)
