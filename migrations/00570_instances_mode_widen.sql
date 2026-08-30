@@ -1,8 +1,12 @@
 <<<<<<<< HEAD:migrations/00570_instances_mode_widen.sql
+<<<<<<<< HEAD:migrations/00570_instances_mode_widen.sql
 -- filename: 00570_instances_mode_widen.sql
 ========
 -- filename: 00533_instances_mode_widen.sql
 >>>>>>>> ced1d3e7d (fixup(ci): PR #1202 lint + migration slot + sdk-node drift):migrations/00533_instances_mode_widen.sql
+========
+-- filename: 00562_instances_mode_widen.sql
+>>>>>>>> 3acf1d8b9 (fixup(migrations): drop 528 fence + renumber 544→562 (post-rebase collisions)):migrations/00562_instances_mode_widen.sql
 -- +goose Up
 -- +goose StatementBegin
 
