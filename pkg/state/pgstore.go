@@ -2360,6 +2360,26 @@ func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]I
 	return scanInstances(rows)
 }
 
+// FailRunningInstanceIfOwnedByNode is the healthy-node stale-instance
+// reconciliation primitive. vmmd capacity reports are authoritative only
+// after two identical complete reports; this conditional update then makes
+// the state transition race-safe against a concurrent park, wake, or
+// migration. ErrConflict means another lifecycle writer won the race.
+func (s *PgStore) FailRunningInstanceIfOwnedByNode(ctx context.Context, id, nodeID string, terminalAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'failed', terminal_at = $3
+		  where id = $1 and node_id = $2 and state = 'running'`,
+		id, nodeID, terminalAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 // ListOwnedCronsByNodeID returns every cron whose owning app's owner
 // node is the given compute_nodes.id. Phase 2 / Gate A — the cron
 // dispatcher runs once per node and only fires for crons on apps it
