@@ -1439,6 +1439,12 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// or gRPC stream deadline, whichever fires first.
 	sessionDeadline := time.Now().Add(streamBridgeSessionDeadline).UTC().Format(time.RFC3339)
 	bridgeEnv := streamBridgeEnv(reqInit)
+	// The bridge owns this per-instance socket for the duration of the
+	// request. Remove it on every exit path, including spawn failure,
+	// readiness timeout, H2C dial failure, and stream cancellation. The
+	// bridge binary removes a stale path before binding, but vmmd must
+	// also unlink the path when the child exits unexpectedly.
+	defer func() { _ = os.Remove(sockPath) }()
 
 	// 3. Spawn the bridge. Mirrors rawBridgeSpawn (forward.go:668).
 	cmd, stderr, err := streamBridgeSpawn(ctx, bridgePath, netnsName, sockPath, netns.GuestIP, dialPort, sessionDeadline, bridgeEnv)
@@ -1683,8 +1689,6 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		_ = cmd.Process.Kill()
 		<-bridgeDoneCh
 	}
-
-	_ = os.Remove(sockPath)
 
 	// Error mapping mirrors v1 priority.
 	if bridgeErr != nil {

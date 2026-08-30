@@ -3382,6 +3382,14 @@ func (m *Manager) Destroy(ctx context.Context, instance string) error {
 // Destroy, it tears down network + lease on the success path; on failure it
 // still runs cleanup (invariant §6.2-4/5).
 func (m *Manager) DestroyWithExport(ctx context.Context, instance, exportDir string) (int, error) {
+	// Stop background liveness work before removing the live entry or
+	// waiting on the VMM. A liveness report can race this destroy path;
+	// cancelling first prevents the loop from probing an instance whose
+	// resources are already being torn down. Keep this outside the live-map
+	// branch so an idempotent destroy also cleans up a stale registration.
+	m.DeleteLivenessConsecutiveFailures(instance)
+	m.cancelLivenessLoop(instance)
+
 	m.mu.Lock()
 	inst, ok := m.live[instance]
 	if ok {

@@ -162,13 +162,17 @@ func (l *livenessProbeLoop) run(ctx context.Context) {
 	// Single-shot probe on entry so a Steady-State VM doesn't
 	// have to wait PeriodSeconds to validate the liveness path
 	// is wired. Failures here still count toward the counter.
-	l.runOne(ctx, timeoutMs)
+	if l.runOne(ctx, timeoutMs) {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			l.runOne(ctx, timeoutMs)
+			if l.runOne(ctx, timeoutMs) {
+				return
+			}
 		}
 	}
 }
@@ -176,8 +180,10 @@ func (l *livenessProbeLoop) run(ctx context.Context) {
 // runOne executes one probe. The closed-set outcome is folded into the
 // consecutive-failure counter + the vmmd_guest_liveness_probe_seconds
 // histogram. The 5s deadline is tighter than the period so a stuck
-// probe doesn't compound (the next tick is honoured regardless).
-func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
+// probe doesn't compound with the next tick. It returns true when
+// the terminal failure threshold is reached so the outer loop can
+// stop instead of leaving a stale ticker goroutine behind.
+func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) bool {
 	start := time.Now()
 	var outcome string
 	if l.probeFn != nil {
@@ -219,7 +225,7 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 					"deployment_id", l.deploymentID,
 					"since_destroy_s", int(nowFn().Sub(last).Seconds()),
 					"cooldown_s", l.cfg.CooldownSeconds)
-				return
+				return false
 			}
 		}
 	}
@@ -247,9 +253,10 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 			// will Park / destroy the instance, and the
 			// Manager will cancel this loop via the
 			// teardown path. Don't re-arm the counter.
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // classifyLivenessOutcome maps a closed-set probe outcome into
