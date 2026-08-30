@@ -1413,6 +1413,58 @@ const (
 	// contract for the customer surface is "the cert engine can't
 	// mint this kind yet". 400.
 	CodeTenantSurfaceCertKindInvalid = "tenant_surface_cert_kind_invalid"
+
+	// Jobs (issue #1184 Workstream A / ADR-099 supplement).
+	//
+	// CodeJobsNotAllowed is the Free-plan gate for all /v1/jobs
+	// routes. Returned as a 404 (not 403) so a Free account can
+	// probe the endpoint surface without leaking the existence of
+	// Jobs to the Free tier's UI. Pairs with Plan.JobsAllowed() in
+	// the handler preamble.
+	CodeJobsNotAllowed = "jobs_not_allowed"
+	// CodeJobQuotaExceeded wraps every per-plan job quota failure
+	// (JobMaxPerAccount, JobConcurrentPerAccount, JobRAMMB,
+	// JobTaskTimeoutSec, JobMaxParallelismPerRun, JobMaxTasksPerRun,
+	// JobMaxRetries). The Problem carries Limit + Observed + Plan +
+	// the specific quota name so the dashboard can pivot the
+	// message from "make it smaller" to "upgrade your plan". 429.
+	CodeJobQuotaExceeded = "job_quota_exceeded"
+	// CodeJobTaskNotFound marks a 404 on GET/PATCH /v1/jobs/{name}/runs/{id}/tasks/{idx}
+	// when the (run_id, task_index) tuple doesn't exist OR belongs
+	// to a different account. Distinct from CodeNotFound so the
+	// dashboard can render a job-specific empty state.
+	CodeJobTaskNotFound = "job_task_not_found"
+	// CodeJobRunCancelled marks POST /v1/jobs/{name}/runs/{id}/cancel
+	// when the run is already in a terminal state (succeeded /
+	// failed / cancelled / dead_letter). 409.
+	CodeJobRunCancelled = "job_run_cancelled"
+	// CodeJobDeadlineExceeded marks a run that exceeded its
+	// deadline_at wall-clock cap before all tasks reached a
+	// terminal state. Returned by GET /v1/jobs/{name}/runs/{id}
+	// when the run is in 'deadline_exceeded' aggregate status;
+	// distinct from CodeJobRunCancelled because the cause is the
+	// customer's deadline (not an explicit cancel call).
+	CodeJobDeadlineExceeded = "job_deadline_exceeded"
+	// CodeJobHasLiveInstances is the soft-delete sentinel. Returned
+	// by DELETE /v1/jobs/{name} when soft_delete_job_if_no_live_instances()
+	// returns FALSE because at least one kind='job_task' instance
+	// is in a non-terminal state. The customer must cancel + wait
+	// for those tasks to reach a terminal state (or call retry /
+	// delete on them) before soft-deleting the template. 409.
+	CodeJobHasLiveInstances = "job_has_live_instances"
+	// CodeJobImageMissing marks POST /v1/jobs when the referenced
+	// image_id doesn't exist OR isn't a job-runnable kind (the
+	// shipped 00255 jobs.image_id is a plain UUID reference with
+	// no kind check; the engine validates at run-create time).
+	// Distinct from CodeInvalidRef because the field shape is
+	// valid — the referent is the problem.
+	CodeJobImageMissing = "job_image_missing"
+	// CodeJobCommandInvalid marks a command[] violation:
+	// array_length > JobMaxCommandLen (per-run: 64) OR a command
+	// element with embedded NUL. Distinct from CodeValidation
+	// because the wire contract for the field is "the executor
+	// can't run this argv" rather than "the schema is wrong".
+	CodeJobCommandInvalid = "job_command_invalid"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -1812,6 +1864,47 @@ func StatusForCode(code string) int {
 		return http.StatusUnsupportedMediaType
 	case CodeRequestTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// Jobs (issue #1184 Workstream A / ADR-099 supplement). Eight
+	// codes that ship with Mega-1 (CR-8 / code-review #8 — the
+	// gRPC error path lifts a gRPC status into a Problem carrying
+	// only the Code, so any of these eight codes that landed on a
+	// gRPC error without an explicit case here was reconstructed
+	// as 500). Reverse mapping pinned to the wire contract:
+	//
+	//   404 jobs_not_allowed       — Free-plan gate (404 not 403 so
+	//                                a Free account can probe the
+	//                                surface without leaking Jobs
+	//                                exists on paid tiers).
+	//   404 job_task_not_found     — single-task lookup miss.
+	//   404 job_image_missing      — referenced image_id doesn't
+	//                                exist or isn't job-runnable.
+	//   409 job_run_cancelled      — cancel of already-terminal run.
+	//   409 job_has_live_instances — soft-delete denied; live
+	//                                kind='job_task' instances
+	//                                still need to drain.
+	//   410 job_deadline_exceeded  — wall-clock deadline cap
+	//                                (distinct from cancel — the
+	//                                customer authored the
+	//                                deadline, not an explicit
+	//                                cancel call).
+	//   429 job_quota_exceeded     — every per-plan job quota
+	//                                family (JobMaxPerAccount /
+	//                                JobConcurrentPerAccount /
+	//                                JobRAMMB / JobTaskTimeoutSec /
+	//                                JobMaxParallelismPerRun /
+	//                                JobMaxTasksPerRun / JobMaxRetries).
+	//   400 job_command_invalid    — command[] shape violation
+	//                                (length > 64 or embedded NUL).
+	case CodeJobsNotAllowed, CodeJobTaskNotFound, CodeJobImageMissing:
+		return http.StatusNotFound
+	case CodeJobRunCancelled, CodeJobHasLiveInstances:
+		return http.StatusConflict
+	case CodeJobDeadlineExceeded:
+		return http.StatusGone
+	case CodeJobQuotaExceeded:
+		return http.StatusTooManyRequests
+	case CodeJobCommandInvalid:
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
@@ -2767,6 +2860,109 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs(docsBase + "/plans#crons")
+}
+
+// ErrPlanJobsNotAllowed is returned by apid's createJob handler
+// when the customer's plan has JobsAllowed == false (Free today).
+// Fires BEFORE the store is touched so a Free customer gets a clean
+// 402 instead of a quota round-trip. Pairs with Plan.JobsAllowed()
+// in the handler preamble. Mirrors the ErrPlanCronsNotAllowed shape
+// (the closest cousin: another per-plan Workstream feature).
+func ErrPlanJobsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeJobsNotAllowed,
+		"Jobs unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include jobs; upgrade to Hobby or above to run batch / one-shot workloads.", p)).
+		WithDocs(docsBase + "/plans#jobs")
+}
+
+// ErrJobQuota is returned when the JobCreateIfUnderQuota /
+// JobRunCreateIfUnderQuota / dispatch gate surfaces a
+// *state.JobQuotaError. QuotaName names the specific cap that
+// fired (e.g. "per_account", "concurrent", "ram_mb",
+// "task_timeout", "parallelism_per_run", "tasks_per_run",
+// "retries"). The Problem carries Limit + Observed so the dashboard
+// can render the same numeric envelope as the crons quota copy.
+// 403 (not 402) because the plan DOES unlock jobs — the right copy
+// is "delete / cancel / shrink to add another", not "upgrade".
+func ErrJobQuota(plan Plan, quotaName string, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeJobQuotaExceeded,
+		"Job limit reached",
+		fmt.Sprintf("%s plan caps jobs at %d for %s; you have %d. Cancel a task or delete a job to free capacity.",
+			plan, limit, quotaName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#jobs")
+}
+
+// ErrJobTaskNotFound marks a 404 on (run_id, task_index) lookups
+// when the tuple doesn't exist OR belongs to a different account.
+// Distinct from CodeNotFound so the dashboard can render a
+// job-specific empty state. 404.
+func ErrJobTaskNotFound(runID, taskIndex string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeJobTaskNotFound,
+		"Job task not found",
+		fmt.Sprintf("no job task at run %s / task %s on this account.", runID, taskIndex)).
+		WithDocs(docsBase + "/jobs#tasks")
+}
+
+// ErrJobRunCancelled marks POST /v1/jobs/{name}/runs/{id}/cancel
+// when the run is already in a terminal state. 409.
+func ErrJobRunCancelled(runID, currentStatus string) *Problem {
+	return NewProblem(http.StatusConflict, CodeJobRunCancelled,
+		"Job run is already terminal",
+		fmt.Sprintf("run %s is in status %s and cannot be cancelled; only queued / dispatched / running runs accept cancel.", runID, currentStatus)).
+		WithDocs(docsBase + "/jobs#cancel")
+}
+
+// ErrJobDeadlineExceeded marks GET /v1/jobs/{name}/runs/{id} on
+// a run in 'deadline_exceeded' aggregate status. Distinct from
+// ErrJobRunCancelled because the cause is the customer's deadline
+// (not an explicit cancel call) and the dashboard pivots the
+// message to "raise the deadline or shorten the work". 410 Gone.
+func ErrJobDeadlineExceeded(runID string, deadlineRFC3339 string) *Problem {
+	return NewProblem(http.StatusGone, CodeJobDeadlineExceeded,
+		"Job run deadline exceeded",
+		fmt.Sprintf("run %s did not complete all tasks before its deadline_at of %s.", runID, deadlineRFC3339)).
+		WithDocs(docsBase + "/jobs#deadlines")
+}
+
+// ErrJobHasLiveInstances is the soft-delete sentinel. Returned
+// by DELETE /v1/jobs/{name} when soft_delete_job_if_no_live_instances()
+// returns FALSE because at least one kind='job_task' instance
+// is in a non-terminal state. The customer must cancel + wait
+// for those tasks to reach a terminal state (or call retry /
+// delete on them) before soft-deleting the template. 409.
+func ErrJobHasLiveInstances(jobName string, liveCount int) *Problem {
+	return NewProblem(http.StatusConflict, CodeJobHasLiveInstances,
+		"Job has live instances",
+		fmt.Sprintf("job %s has %d live task instance(s); cancel them and wait for termination before deleting.", jobName, liveCount)).
+		WithDocs(docsBase + "/jobs#delete")
+}
+
+// ErrJobImageMissing marks POST /v1/jobs when the referenced
+// image_id doesn't exist OR isn't a job-runnable kind. The
+// engine validates at run-create time so a create-time check
+// is a fast-fail. 422 (unprocessable) because the request shape
+// is valid but the referent is missing — the customer can fix
+// the field. Distinct from CodeInvalidRef because the wire
+// contract for the field is "the referent doesn't exist" rather
+// than "the format is wrong".
+func ErrJobImageMissing(imageID string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeJobImageMissing,
+		"Job image not found",
+		fmt.Sprintf("image %s does not exist or is not a job-runnable kind.", imageID)).
+		WithDocs(docsBase + "/jobs#image")
+}
+
+// ErrJobCommandInvalid marks a command[] violation:
+// array_length > JobMaxCommandLen (per-run: 64) OR a command
+// element with embedded NUL. Distinct from CodeValidation
+// because the wire contract is "the executor can't run this
+// argv" rather than "the schema is wrong". 422.
+func ErrJobCommandInvalid(reason string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeJobCommandInvalid,
+		"Job command invalid",
+		reason).
+		WithDocs(docsBase + "/jobs#command")
 }
 
 // ErrPlanEvictionPriorityReservedNotAllowed is the 403 apid returns

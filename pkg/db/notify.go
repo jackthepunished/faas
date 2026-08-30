@@ -208,6 +208,17 @@ const (
 	NotifyDomainChanged     = "domain_changed"
 	NotifyCronChanged       = "cron_changed"
 	NotifyTriggerChanged    = "trigger_changed"
+	// NotifyJobChanged fires when a row is inserted/updated/deleted
+	// in public.jobs (issue #1184 Workstream A / ADR-099). Listeners:
+	//   - schedd dispatchJobsTick: wakes the 1s tick to claim any
+	//     newly-eligible queued tasks (kind='job_task' instances).
+	//   - dashboard SSE (events/job.go::TopicJobEvent): publishes
+	//     job.created/updated/deleted envelopes to live dashboards.
+	// Payload shape matches NotifyCronChanged:
+	//   {"kind":"created"|"updated"|"deleted", "job_id":uuid,
+	//    "account_id":uuid}
+	// — see handlers_jobs.go for the emit sites.
+	NotifyJobChanged = "job_changed"
 	// NotifyMigrationsApplied fires when the migration_notify_trg
 	// (migration 00347) inserts a row into goose_db_version at the
 	// leading edge of the ledger. cmd/migrate -wait-for-migrations

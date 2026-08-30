@@ -126,6 +126,12 @@ type Loop struct {
 	// posture; nil + internal_only mode = loud warn + the gate
 	// 403s on the receiving end.
 	mintInternalSvcToken func(appID string) (string, error)
+
+	// jobsDispatched is the FAAS_JOBS_DISPATCH opt-in for the
+	// job dispatch tick + stuck-job reaper. When false (the
+	// default), both tickers are skipped and queued job_tasks
+	// stay in the DB (Mega-1 cluster-wide gate).
+	jobsDispatched bool
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -134,6 +140,16 @@ func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
 		now:        time.Now,
 		flowCounts: noopFlowCounter{},
 	}
+}
+
+// WithJobsDispatched opts the Loop into the jobs dispatch + reaper
+// ticker. Default OFF so the Mega-1 surface stays opt-in behind
+// FAAS_JOBS_DISPATCH=1 — the schedd reads the env, then attaches via
+// this method. When OFF, dispatchJobsTick + JobReaperTick never fire
+// and queued job_tasks just sit in DB (the operator chose this).
+func (l *Loop) WithJobsDispatched(enabled bool) *Loop {
+	l.jobsDispatched = enabled
+	return l
 }
 
 // WithAudit attaches the IAM-4 audit seam so the cron-fire path can
@@ -759,6 +775,19 @@ func (l *Loop) Run(ctx context.Context) error {
 		deadNodeReconcilerT = time.NewTicker(l.deadNodeReconciler.interval)
 		defer deadNodeReconcilerT.Stop()
 	}
+	// Jobs dispatch + stuck-job reaper tickers (Mega-1, issue
+	// #1184 Workstream A). Both gated on jobsDispatched so a
+	// FAAS_JOBS_DISPATCH=0 cluster never ticks. 1s matches the
+	// cron tick (PR-A pattern); 5s reaper keeps it cheap under
+	// load (reaper is one SELECT + per-claim UPDATE).
+	var jobsDispatchT *time.Ticker
+	var jobsReaperT *time.Ticker
+	if l.jobsDispatched {
+		jobsDispatchT = time.NewTicker(time.Second)
+		defer jobsDispatchT.Stop()
+		jobsReaperT = time.NewTicker(5 * time.Second)
+		defer jobsReaperT.Stop()
+	}
 	// Trigger dispatch ticker (issue #757 / ADR-100, commit #14).
 	// 1 s cadence matches runCronTick and the §6.1 watchdog — a
 	// trigger record sitting in `pending` for >1 tick before
@@ -813,6 +842,10 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runMigratingReconcile(ctx)
 		case <-deadNodeTick(deadNodeReconcilerT):
 			l.runDeadNodeReconcile(ctx)
+		case <-jobsTick(jobsDispatchT):
+			l.runJobsDispatchTick(ctx)
+		case <-jobsTick(jobsReaperT):
+			l.runJobsReaperTick(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -1025,6 +1058,17 @@ func migratingWatchdogTick(t *time.Ticker) <-chan time.Time {
 // recognisable name in the stack trace instead of a generic
 // "ticker returned nil" panic.
 func deadNodeTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// jobsTick gates the Mega-1 dispatch + reaper tickers on a nil
+// pointer (jobsDispatched=false), so the select arms never fire
+// when FAAS_JOBS_DISPATCH=0. Mirrors deadNodeTick so the wired-
+// but-off invariant is indistinguishable from off-by-default.
+func jobsTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -2351,6 +2395,28 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 // Step 3+4 are the load-bearing spec bits (M7); they route the
 // synthetic request through the gateway's full path so the metering +
 // quota pipeline can't tell cron traffic from user traffic apart.
+
+// runJobsDispatchTick is one iteration of the Mega-1 job dispatch
+// loop (issue #1184 Workstream A / ADR-099). Wired in pkg/sched/loop.go
+// gated by FAAS_JOBS_DISPATCH — when OFF the select arm never fires.
+// Errors are logged warn-level and the tick continues on the next
+// second; a stuck pgpool is louder (the failOpen vmmd adapter keeps
+// the surface safe under FAAS_JOBS_DISPATCH=1 until the vmmd gRPC
+// JobColdBoot method ships in the follow-up commit).
+func (l *Loop) runJobsDispatchTick(ctx context.Context) {
+	if err := l.engine.DispatchJobsTick(ctx); err != nil {
+		l.log.Warn("schedd: jobs dispatch tick failed", "err", err)
+	}
+}
+
+// runJobsReaperTick is one iteration of the stuck-job reaper.
+// Same gate + warn-and-continue contract as runJobsDispatchTick.
+func (l *Loop) runJobsReaperTick(ctx context.Context) {
+	if _, err := l.engine.JobReaperTick(ctx); err != nil {
+		l.log.Warn("schedd: stuck-job reaper tick failed", "err", err)
+	}
+}
+
 func (l *Loop) runCronTick(ctx context.Context) {
 	// Phase 2 / Gate A: only dispatch crons on apps this schedd
 	// owns. Without this filter every schedd would fire every

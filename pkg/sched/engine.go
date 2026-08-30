@@ -222,6 +222,20 @@ type Engine struct {
 	// real tracker via WithLivenessWindow).
 	livenessWindow *LivenessWindow
 
+	// jobLeaser (issue #1184 Workstream A / ADR-099) is the lease
+	// primitive pkg/sched.Leaser[T] that WakeJob + HandleJobExit
+	// use to mint + release per-task leases. nil is tolerated by
+	// the unit tests that don't exercise the job surface
+	// (WakeJob returns ErrJobTaskAlreadyClaimed without touching
+	// the leaser). Production cmd/schedd wires a real PgLeaser via
+	// WithJobLeaser.
+	jobLeaser Leaser[any]
+	// jobVmmClient is the vmmd gRPC surface for cold-booting
+	// job-task VMs. nil means "unit-test mode" — WakeJob returns
+	// a synthetic JobWakeResult without touching vmmd. Production
+	// cmd/schedd wires the real client via WithJobVmmClient (M7).
+	jobVmmClient jobVmmClient
+
 	// rebalanceCooldownSeconds is the Tier A4 (ADR-064) cooldown
 	// between two successful reassignments of the same app. Default
 	// api.RebalanceCooldownSeconds = 60s; overridable via

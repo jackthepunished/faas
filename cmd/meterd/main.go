@@ -915,6 +915,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	probe := buildUpstreamProbe(deps, store, ops, log)
 	canaryProg, canaryAPID, canaryActor, canaryAccount := buildCanaryProgression(deps, store, ops, log)
 	safeDeployOrch := buildSafeDeployOrchestrator(deps, store, ops, log, canaryAPID, evaluator)
+	// ADR-099 / issue #1184 Workstream A: 7 job-task Prometheus
+	// metrics on a fresh per-daemon registry (same pattern as
+	// pkg/fcvm/FrameworkReadyMetrics — see pkg/fcvm/metrics.go:178).
+	// Mounted on the /metrics gatherer below alongside the
+	// reconciler + ops registries so a single scrape exposes
+	// app + job + reconciler + ops in one place. Built
+	// unconditionally so the sample tick can reference the
+	// gauges without a nil check (zero value is a no-op).
+	jobMetrics := meter.NewJobMetrics()
 	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
 		WithEgress(egress).
 		WithProbe(probe).
@@ -1071,7 +1080,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// handler is mounted. Both wire + reconciler registries are
 		// isolated so pkg/billing/reconciler stays free of an import
 		// on pkg/wire. ADR-049 §B.1.
-		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry, prometheus.DefaultGatherer}
+		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry, jobMetrics.Registry(), prometheus.DefaultGatherer}
 		mux.Handle(metricsPath, promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
 		// /healthz — 200 when every tracked timer (sample / quota /
 		// stripe / dunning) has fired within

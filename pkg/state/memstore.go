@@ -142,6 +142,18 @@ type MemStore struct {
 	crons     map[string]Cron
 	triggers  map[string]sqlc.Trigger
 	records   map[string]sqlc.TriggerRecord
+	// jobs / jobRuns / jobTasks mirror the ADR-099 / issue #1184
+	// Workstream A tables (migrations/00255-00257, 00571-00578) for
+	// handler / dispatch-tick tests. Keyed by id / run_id. The task
+	// map is nested so per-run task slice access is O(1) without a
+	// slice-walk under m.mu — JobTaskGet and JobTaskList become
+	// trivial map ops. The mutex guards count + insert in
+	// JobCreate / JobRunCreate, mirroring the pgstore FOR UPDATE
+	// discipline (no TOCTOU window between the cap check and the
+	// insert).
+	jobs     map[string]Job
+	jobRuns  map[string]JobRun
+	jobTasks map[string]map[int]JobTask // run_id → task_index → task
 	// fireNowRequests mirrors cron_fire_now_requests (migrations/00193)
 	// for in-process handler tests. Keyed by request id (UUID);
 	// status transitions follow the production 5-state CHECK (pending
@@ -670,11 +682,17 @@ func NewMemStore() *MemStore {
 		// (ADR-124 follow-up #3). Both sides are non-overlapping
 		// additive fields; column alignment kept (visual width per
 		// the table below) so the diff against `gofmt -s` stays clean.
-		mirrorRules:               map[string]MirrorRule{},
-		mirrorResults:             map[string]MirrorInvocationResult{},
-		domains:                   map[string]CustomDomain{},
-		doctorObs:                 map[string]DomainDoctorObservation{},
-		crons:                     map[string]Cron{},
+		mirrorRules:   map[string]MirrorRule{},
+		mirrorResults: map[string]MirrorInvocationResult{},
+		domains:       map[string]CustomDomain{},
+		doctorObs:     map[string]DomainDoctorObservation{},
+		crons:         map[string]Cron{},
+		// ADR-099 / issue #1184 Workstream A — job store maps.
+		// Empty until the first JobCreate / JobRunCreate; the
+		// per-account count in JobCreateIfUnderQuota walks m.jobs.
+		jobs:                      map[string]Job{},
+		jobRuns:                   map[string]JobRun{},
+		jobTasks:                  map[string]map[int]JobTask{},
 		fireNowRequests:           map[string]FireNowRequest{},
 		operatorIntents:           map[string]OperatorIntent{},
 		runtimeConfigs:            map[string]RuntimeConfig{},

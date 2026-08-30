@@ -1397,6 +1397,152 @@ type TriggerMetricsResponse struct {
 	DeadLetterCount int    `json:"dead_letter_count"`
 }
 
+// --- Jobs (issue #1184 Workstream A) ----------------------------------------
+// Mirrors the canonical Job DTOs in pkg/api/dto.go. Field tags + ordering
+// + omitempty are part of the wire contract — the spec_compliance_test
+// gate (TestSpecCompliance in cmd/apid) pins the OpenAPI schema's
+// `required` arrays, so any drift between this file and pkg/api/dto.go
+// breaks the gatewayd-public edge case.
+
+// CreateJobRequest is the body of POST /v1/jobs.
+type CreateJobRequest struct {
+	Name           string            `json:"name"`
+	Kind           string            `json:"kind,omitempty"`
+	ImageRef       string            `json:"image_ref"`
+	Command        []string          `json:"command"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          int               `json:"ram_mb,omitempty"`
+	TaskTimeoutSec int               `json:"task_timeout_sec,omitempty"`
+	MaxParallelism int               `json:"max_parallelism,omitempty"`
+	RetryMax       int               `json:"retry_max,omitempty"`
+}
+
+// UpdateJobRequest is the body of PATCH /v1/jobs/{name}.
+type UpdateJobRequest struct {
+	ImageRef       *string           `json:"image_ref,omitempty"`
+	Command        []string          `json:"command,omitempty"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          *int              `json:"ram_mb,omitempty"`
+	TaskTimeoutSec *int              `json:"task_timeout_sec,omitempty"`
+	MaxParallelism *int              `json:"max_parallelism,omitempty"`
+	RetryMax       *int              `json:"retry_max,omitempty"`
+	Status         *string           `json:"status,omitempty"`
+}
+
+// CreateJobRunRequest is the body of POST /v1/jobs/{name}/runs.
+type CreateJobRunRequest struct {
+	Tasks          int               `json:"tasks"`
+	Parallelism    *int              `json:"parallelism,omitempty"`
+	RetryMax       *int              `json:"retry_max,omitempty"`
+	TaskTimeoutSec *int              `json:"task_timeout_sec,omitempty"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+}
+
+// JobResponse is the wire projection of state.Job.
+type JobResponse struct {
+	ID             string            `json:"id"`
+	AccountID      string            `json:"account_id"`
+	Name           string            `json:"name"`
+	Kind           string            `json:"kind"`
+	ImageRef       string            `json:"image_ref"`
+	Command        []string          `json:"command"`
+	EnvOverrides   map[string]string `json:"env_overrides,omitempty"`
+	RAMMB          int               `json:"ram_mb"`
+	TaskTimeoutSec int               `json:"task_timeout_sec"`
+	MaxParallelism int               `json:"max_parallelism"`
+	RetryMax       int               `json:"retry_max"`
+	Status         string            `json:"status"`
+	CreatedAt      string            `json:"created_at"`
+	UpdatedAt      string            `json:"updated_at"`
+}
+
+// JobRunResponse is the wire projection of state.JobRun.
+type JobRunResponse struct {
+	ID              string            `json:"id"`
+	JobID           string            `json:"job_id"`
+	AccountID       string            `json:"account_id"`
+	TriggerKind     string            `json:"trigger_kind"`
+	EnvOverrides    map[string]string `json:"env_overrides,omitempty"`
+	Tasks           int               `json:"tasks"`
+	Parallelism     int               `json:"parallelism"`
+	RetryMax        int               `json:"retry_max"`
+	TaskTimeoutSec  int               `json:"task_timeout_sec"`
+	AggregateStatus string            `json:"aggregate_status"`
+	TasksSucceeded  int               `json:"tasks_succeeded"`
+	TasksFailed     int               `json:"tasks_failed"`
+	TasksCancelled  int               `json:"tasks_cancelled"`
+	TasksRunning    int               `json:"tasks_running"`
+	DeadLetterCount int               `json:"dead_letter_count"`
+	StartedAt       string            `json:"started_at,omitempty"`
+	FinishedAt      string            `json:"finished_at,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+}
+
+// JobTaskResponse is the wire projection of state.JobTask.
+// LeaseToken is intentionally OMITTED (internal dispatch primitive).
+type JobTaskResponse struct {
+	RunID        string `json:"run_id"`
+	TaskIndex    int    `json:"task_index"`
+	Status       string `json:"status"`
+	Attempt      int    `json:"attempt"`
+	InstanceID   string `json:"instance_id,omitempty"`
+	ErrorClass   string `json:"error_class,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	ExitCode     int    `json:"exit_code,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// JobTaskLogResponse is the body of GET /v1/jobs/{name}/runs/{id}/
+// tasks/{idx}/logs.
+type JobTaskLogResponse struct {
+	TaskStatus string `json:"task_status"`
+	LogContent string `json:"log_content"`
+	Truncated  bool   `json:"truncated"`
+	MaxBytes   int    `json:"max_bytes"`
+}
+
+// ListJobsResponse is the body of GET /v1/jobs.
+type ListJobsResponse struct {
+	Jobs       []JobResponse `json:"jobs"`
+	Limit      int           `json:"limit"`
+	Offset     int           `json:"offset"`
+	NextOffset int           `json:"next_offset"`
+	Total      int           `json:"total"`
+}
+
+// ListJobRunsResponse is the body of GET /v1/jobs/{name}/runs.
+type ListJobRunsResponse struct {
+	Runs       []JobRunResponse `json:"runs"`
+	Limit      int              `json:"limit"`
+	Offset     int              `json:"offset"`
+	NextOffset int              `json:"next_offset"`
+	Total      int              `json:"total"`
+}
+
+// ListJobTasksResponse is the body of GET /v1/jobs/{name}/runs/{id}/tasks.
+type ListJobTasksResponse struct {
+	Tasks      []JobTaskResponse `json:"tasks"`
+	Limit      int               `json:"limit"`
+	Offset     int               `json:"offset"`
+	NextOffset int               `json:"next_offset"`
+	Total      int               `json:"total"`
+}
+
+// JobRunCancelledResponse is the body of POST /v1/jobs/{name}/runs/{id}/cancel.
+type JobRunCancelledResponse struct {
+	Run         JobRunResponse `json:"run"`
+	CancelledAt string         `json:"cancelled_at"`
+}
+
+// JobDeletedResponse is the body of DELETE /v1/jobs/{name}.
+type JobDeletedResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	DeletedAt string `json:"deleted_at"`
+}
+
 // CancelDeploymentRequest is the optional body of POST
 // /v1/apps/{slug}/deployments/{id}/cancel. Reason must be one of
 // the closed CancelReason values (empty → "user" server-side).
@@ -1405,12 +1551,10 @@ type CancelDeploymentRequest struct {
 }
 
 // CancelDeploymentResponse is the wire shape for POST
-// /v1/apps/{slug}/deployments/{id}/cancel (api/openapi.yaml:4497-4505).
-// CancelledAt is the RFC3339 timestamp; CancelledBuilds is the list
-// of cascade-cancelled build IDs (empty when no builds were
-// in-flight). Mirrors the Python
-// sdk/python/faas_sdk/models/cancel_deployment_response_200.py +
-// sdk/node/src/generated/models/CancelDeploymentResponse200.ts.
+// /v1/apps/{slug}/deployments/{id}/cancel. CancelledAt is the
+// RFC3339 timestamp; CancelledBuilds is the list of
+// cascade-cancelled build IDs (empty when no builds were
+// in-flight).
 type CancelDeploymentResponse struct {
 	ID              string    `json:"id"`
 	Status          string    `json:"status"`
@@ -1420,19 +1564,17 @@ type CancelDeploymentResponse struct {
 }
 
 // ReorderDeploymentResponse is the wire shape for POST
-// /v1/deployments/{id}/reorder (api/openapi.yaml:4444-4451).
-// Priority is the server-applied value (echo of the request body
-// after the row flip). Mirrors the Python
-// sdk/python/faas_sdk/models/reorder_deployment_response_200.py.
+// /v1/deployments/{id}/reorder. Priority is the server-applied
+// value (echo of the request body after the row flip).
 type ReorderDeploymentResponse struct {
 	ID       string `json:"id"`
 	Priority int    `json:"priority"`
 }
 
 // ClearObsoleteReport is the response shape for POST
-// /v1/apps/{slug}/deployments/clear-obsolete. Count is the number
-// of soft-deleted rows in this call; OlderThan echoes the cutoff
-// the store applied (default 168h).
+// /v1/apps/{slug}/deployments/clear-obsolete. Count is the
+// number of soft-deleted rows in this call; OlderThan echoes the
+// cutoff the store applied (default 168h).
 type ClearObsoleteReport struct {
 	AppSlug   string `json:"app_slug"`
 	Count     int    `json:"count"`
