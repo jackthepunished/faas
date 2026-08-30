@@ -107,7 +107,7 @@ func TestBuildTestAlertEvent_PayloadDiscriminator(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			id, evt, prob := buildTestAlertEvent(acct, app, rule, c.preset)
+			id, evt, _, prob := buildTestAlertEvent(acct, app, rule, c.preset)
 			if prob != nil {
 				t.Fatalf("prob = %v, want nil", prob)
 			}
@@ -152,7 +152,7 @@ func TestBuildTestAlertEvent_PayloadDiscriminator(t *testing.T) {
 // field addition that breaks the test: true discriminator fails
 // this test before it fails the dashboard render.
 func TestBuildTestAlertEvent_PayloadMarshalsAsJSON(t *testing.T) {
-	_, evt, prob := buildTestAlertEvent(state.Account{ID: "a"}, state.App{Slug: "demo"}, state.AlertRule{}, state.AlertPreset{
+	_, evt, _, prob := buildTestAlertEvent(state.Account{ID: "a"}, state.App{Slug: "demo"}, state.AlertRule{}, state.AlertPreset{
 		Name: "api_down", DisplayName: "X", Comparison: "lt", Threshold: 1, WindowSpec: "5m",
 	})
 	if prob != nil {

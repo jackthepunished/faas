@@ -30,11 +30,12 @@ const (
 	serverSrcPath         = "server.go"
 	dtoFile               = "dto.go"
 	secretsFile           = "secrets.go"
-	envFile               = "env.go"            // issue #395 / ADR-045
-	registryFile          = "registry_auth.go"  // issue #461 / ADR-062
-	alertsFile            = "alerts.go"         // issue #396 PR 3 / ADR-045
-	alertsPresetsFile     = "alerts_presets.go" // ADR-123 / issue #1233 — alert-preset catalog DTOs
-	canaryCustomStageFile = "canary/dto.go"     // issue #976 / ADR-122 / production-leveling Stream F — CustomStage wire DTO
+	envFile               = "env.go"             // issue #395 / ADR-045
+	registryFile          = "registry_auth.go"   // issue #461 / ADR-062
+	alertsFile            = "alerts.go"          // issue #396 PR 3 / ADR-045
+	alertsDeliveryFile    = "alerts_delivery.go" // ADR-123 PR-D — AlertDeliveryResponse wire DTO
+	alertsPresetsFile     = "alerts_presets.go"  // ADR-123 / issue #1233 — alert-preset catalog DTOs
+	canaryCustomStageFile = "canary/dto.go"      // issue #976 / ADR-122 / production-leveling Stream F — CustomStage wire DTO
 	manifestFile          = "appmanifest.go"
 	cliauthFile           = "cliauth.go"
 	mfaFile               = "mfa.go"
@@ -768,6 +769,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", envFile),
 		filepath.Join(root, "pkg", "api", registryFile),
 		filepath.Join(root, "pkg", "api", alertsFile),
+		filepath.Join(root, "pkg", "api", alertsDeliveryFile),
 		filepath.Join(root, "pkg", "api", alertsPresetsFile),
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),

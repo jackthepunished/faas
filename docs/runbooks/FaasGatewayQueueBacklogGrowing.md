@@ -3,8 +3,13 @@
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`
 (alert `FaasQueueBacklogGrowingApp` in the `faas_alert_preset_signals`
 group).
-Metric: `gateway_queue_depth{app}` — gauge of pending wake requests
-held by `gatewayd-internal` (cap 512/30s per the CLAUDE.md gotcha).
+Metric: `gateway_queue_depth{app, account_id}` — gauge of pending
+wake requests held by `gatewayd-internal` (cap 512/30s per the
+CLAUDE.md gotcha). As of PR-D the metric carries an
+`account_id` label admitted via `accountLabelSet` (cap=10k,
+overflow=`__other__`); rows past the cap roll up under `__other__`
+and contribute to `FaasAlertPresetAnyFiringAccount` under that
+bucket.
 ADR: ADR-123 (alert_presets catalog). Catalog preset:
 `queue_backlog_growing`, window 15m, threshold 50.
 Severity: warn (customer-facing catalog row).
@@ -21,10 +26,11 @@ The wake-queue depth for a customer's app has been above 50 for
 15m. The webhook tells the customer's monitoring that wake
 requests are queuing — they're not failing, just slowing down.
 
-This alert labels on `app`, NOT `account_id`. The
-`FaasAlertPresetAnyFiringAccount` correlation rule therefore does
-NOT include this signal — see
-`docs/runbooks/FaasAlertPresetAnyFiringAccount.md` for why.
+The alert's labels include `account_id` (or `__other__` when the
+account overflows the bounded-admission set). It DOES contribute
+to the `FaasAlertPresetAnyFiringAccount` correlation rule — see
+`docs/runbooks/FaasAlertPresetAnyFiringAccount.md` for the
+account-level rollup.
 
 Common causes:
 
@@ -63,8 +69,9 @@ amtool silence add \
 
 ## Recover
 
-The alert clears when `gateway_queue_depth{app}` drops below 50
-for the `for:` window (15m). Operator action is required when
+The alert clears when `gateway_queue_depth{app, account_id}`
+drops below 50 for the `for:` window (15m). Operator action is
+required when
 the queue persists — usually means a customer-side issue (large
 app archive, slow startup hook) or a snapshot-cache hit-rate
 problem (cross-check `FaasColdBootFallbackHigh`).

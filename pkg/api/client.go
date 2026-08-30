@@ -1569,6 +1569,34 @@ func (c *Client) RotateAlertRuleSecret(ctx context.Context, slug, id string) (Ro
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alerts/"+id+"/rotate-secret", nil, &out)
 }
 
+// ListAlertRuleDeliveries returns the most-recent alert_deliveries
+// rows for one alert rule (ADR-123 PR-D), newest-first. The default
+// (includeTest=false) hides rows written by Dispatcher.DispatchTest
+// ("send test alert" clicks); flipping includeTest=true surfaces the
+// test rows so an operator can verify the customer's webhook is
+// wired correctly without polluting the production pane. limit
+// clamps to 100 server-side; the SDK passes through unchanged. The
+// 404 posture matches GetAlertRule (IDOR-safe — a foreign account's
+// rule id is indistinguishable from a missing one).
+//
+// Closed-set vocabulary: each row's Status is one of
+// {pending, delivered, failed}; IsTest is the PR-D discriminator.
+func (c *Client) ListAlertRuleDeliveries(ctx context.Context, slug, id string, includeTest bool, limit int) ([]AlertDeliveryResponse, error) {
+	var out []AlertDeliveryResponse
+	q := url.Values{}
+	if includeTest {
+		q.Set("include_test", "true")
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + slug + "/alerts/" + id + "/deliveries"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // --- Alert presets (ADR-123 / issue #1233) -------------------------------
 
 // ListAlertPresets returns the 8-row alert-preset catalog (issue

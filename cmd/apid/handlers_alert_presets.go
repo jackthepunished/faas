@@ -39,6 +39,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
@@ -381,7 +382,7 @@ func (s *server) sendTestAlertPresetCore(ctx context.Context, acct state.Account
 	if prob != nil {
 		return api.TestAlertPresetResponse{}, prob
 	}
-	deliveryID, evt, prob := buildTestAlertEvent(acct, app, rule, preset)
+	deliveryID, evt, observed, prob := buildTestAlertEvent(acct, app, rule, preset)
 	if prob != nil {
 		return api.TestAlertPresetResponse{}, prob
 	}
@@ -390,6 +391,48 @@ func (s *server) sendTestAlertPresetCore(ctx context.Context, acct state.Account
 		URL:    rule.WebhookURL,
 		Signer: webhookout.NewSigner(plaintext),
 	}, evt)
+	// ADR-123 PR-D: stamp an alert_deliveries row with IsTest=true so
+	// operators can reach it via the `?include_test=true` toggle on
+	// the deliveries endpoint. The production fire path
+	// (Dispatcher.Dispatch + meterd evaluator) writes its own row
+	// through ClaimAlertFire; the test path was deliberately routed
+	// around that ledger in PR-C to avoid polluting the customer's
+	// recent-deliveries pane. PR-D introduces the IsTest column so
+	// operators get visibility without leaking test rows into the
+	// default customer view. payload is the marshaled evt (mirrors
+	// the production ClaimAlertFire payload stamp).
+	payloadJSON, _ := json.Marshal(evt)
+	now := time.Now().UTC()
+	delivery := state.AlertDelivery{
+		ID:             deliveryID,
+		RuleID:         rule.ID,
+		AccountID:      acct.ID,
+		AppID:          app.ID,
+		IdempotencyKey: deliveryID + ":test", // unique per click; production uses rule_id+cooldown bucket
+		Payload:        payloadJSON,
+		Status:         state.AlertDeliveryStatus(resultStatus(result, state.AlertDeliveryDelivered, state.AlertDeliveryFailed)),
+		AttemptCount:   result.Attempts,
+		LastStatusCode: result.StatusCode,
+		ObservedValue:  observed,
+		FiredAt:        now,
+		IsTest:         true,
+	}
+	if result.Err != nil {
+		delivery.LastError = result.Err.Error()
+	}
+	if delivery.Status == state.AlertDeliveryDelivered {
+		delivery.DeliveredAt = now
+	}
+	if _, derr := s.store.RecordAlertDelivery(ctx, delivery); derr != nil && !errors.Is(derr, state.ErrConflict) {
+		// Best-effort: a ledger write failure on the test path MUST
+		// NOT surface as a customer-facing error. The audit log
+		// already captures the attempt; the ledger row is operator
+		// visibility, not a billing/correctness primitive.
+		s.log.Warn("alert_deliveries write (test) failed",
+			"delivery_id", deliveryID,
+			"rule", logsanitize.Field(rule.ID),
+			"err", derr)
+	}
 	s.log.Info("alert preset test sent",
 		"preset", logsanitize.Field(preset.Name),
 		"rule", logsanitize.Field(rule.ID),
@@ -497,10 +540,10 @@ var hostIdentitiesForUnseal = func(_ context.Context) []*age.X25519Identity {
 // alert_deliveries row id as the canonical id, and a test
 // delivery sharing that id would collide in the customer's
 // audit log. UUID collision odds are negligible.
-func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule, preset state.AlertPreset) (string, webhookout.Event, *api.Problem) {
+func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule, preset state.AlertPreset) (string, webhookout.Event, float64, *api.Problem) {
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
-		return "", webhookout.Event{}, api.ErrCapacity("could not generate delivery id: " + err.Error())
+		return "", webhookout.Event{}, 0, api.ErrCapacity("could not generate delivery id: " + err.Error())
 	}
 	deliveryID := hex.EncodeToString(idBytes)
 	// Synthetic observed value: threshold + 1% for "gt" and
@@ -514,7 +557,11 @@ func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule
 	// migrations/00418_alert_presets_seed.sql) still produces a
 	// value JUST above 0 — without this guard, threshold*1.01=0
 	// and the customer's verifier would treat the test as a
-	// no-op (no fire-equivalent shape).
+	// no-op (no fire-equivalent shape). Returned alongside
+	// (deliveryID, evt) so the alert_deliveries ledger stamp in
+	// sendTestAlertPresetCore (ADR-123 PR-D) records the SAME
+	// observed value the customer's receiver sees — keeps the
+	// operator's pane consistent with the customer's payload.
 	margin := math.Max(0.01, math.Abs(preset.Threshold)*0.01)
 	observed := preset.Threshold
 	switch preset.Comparison {
@@ -537,5 +584,18 @@ func buildTestAlertEvent(acct state.Account, app state.App, rule state.AlertRule
 			"window":    preset.WindowSpec,
 			"test":      true,
 		},
-	}, nil
+	}, observed, nil
+}
+
+// resultStatus maps a webhookout.Result to the AlertDeliveryStatus
+// enum. The test-path ledger writer (ADR-123 PR-D) uses the same
+// status vocabulary the production ClaimAlertFire path produces.
+// Successful deliveries → "delivered"; any non-nil error → "failed";
+// in-between (e.g. attempts-exhausted but a 2xx body returned) is
+// treated as "delivered" because the receiver accepted it.
+func resultStatus(r webhookout.Result, ok, fail state.AlertDeliveryStatus) state.AlertDeliveryStatus {
+	if r.Err == nil {
+		return ok
+	}
+	return fail
 }
