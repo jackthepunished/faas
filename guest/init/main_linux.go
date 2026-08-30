@@ -270,7 +270,35 @@ func boot() error {
 	// fails the deploy — that's worse than today's opaque "guest
 	// not ready after 30s" path).
 	go runCharacterizationForSup(supRef, manifest)
-	return supRef.Run()
+	// M-2 / //code-review PR #1202 finding #7: a single boot-scoped
+	// cancellable context is shared between the HEALTHCHECK poll
+	// goroutine and the PID 1 signal-handler loop so both observe
+	// the same shutdown boundary. The previous shape passed
+	// context.Background() to both — the poll goroutine's DGRAM
+	// socket stayed open after the supervisor exited and the
+	// signal-handler loop returned, leaking fd + goroutine + a
+	// stuck ring-buffer drain across guest-init restarts. The
+	// cancel() is wired into the runSignalHandlers return path so
+	// when the supervisor finishes (clean exit, crash-loop, or
+	// graceful stop), both subsystems unwind together.
+	bootCtx, bootCancel := context.WithCancel(context.Background())
+	defer bootCancel()
+	// M-2 / ADR-139 §Decision 1: HEALTHCHECK poll goroutine.
+	// Soft-fail on bind (e.g. guest kernel without AF_VSOCK) —
+	// the engine's existing :8080 TCP-accept probe continues to
+	// gate readiness, so the customer doesn't lose the boot.
+	if err := runHealthcheckPoll(bootCtx, manifest, slog.Default()); err != nil {
+		slog.Default().Warn("healthcheck poll unavailable", "err", err)
+	}
+	// M-2 / ADR-138 §Decision 1 / issue #474 — install the PID 1
+	// signal handler before invoking the supervisor. The handler
+	// multiplexes (a) the customer's STOPSIGNAL forwarded to the
+	// supervisor for graceful stop, (b) the SIGCHLD reaper loop
+	// so every forked child is reaped (no zombies), and (c)
+	// forwarding of guest-init-received signals to the tracked
+	// workload. Returns when the supervisor exits (clean, crash-
+	// loop exhausted, or graceful-stop completed).
+	return runSignalHandlers(bootCtx, manifest, supRef, slog.Default())
 }
 
 func guestStage(stage string) {

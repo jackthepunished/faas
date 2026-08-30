@@ -302,6 +302,7 @@ export type { SeatUsageResponse } from './models/SeatUsageResponse.js';
 export type { SecretFinding } from './models/SecretFinding.js';
 export type { SecretKey } from './models/SecretKey.js';
 export type { SecretScanResult } from './models/SecretScanResult.js';
+export type { ServiceReplicas } from './models/ServiceReplicas.js';
 export type { SessionInfo } from './models/SessionInfo.js';
 export type { SessionListResponse } from './models/SessionListResponse.js';
 export type { SessionsRevokeAllResponse } from './models/SessionsRevokeAllResponse.js';

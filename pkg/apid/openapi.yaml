@@ -12569,7 +12569,7 @@ components:
           example: 1.0
 
     AppManifest:
-      description: "App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs (\"secret:NAME\" strings) resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are NEVER sealed ciphertext — only refs. M-1 (ADR-136) widens the contract additively with `healthcheck`, `stop_signal`, `stop_grace_period` from the OCI image-config spec; old guest-init ignores unknown fields per JSON semantics, so the widen is wire-compatible."
+      description: "App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs (\"secret:NAME\" strings) resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are NEVER sealed ciphertext — only refs. M-1 (ADR-136) widens the contract additively with `healthcheck`, `stop_signal`, `stop_grace_period` from the OCI image-config spec; old guest-init ignores unknown fields per JSON semantics, so the widen is wire-compatible. M-2 (ADR-137 + ADR-138) widens additively with `execution_mode`, `restart_policy`, `startup_deadline_s`, `max_retries`, and `service_replicas` — these govern the lifecycle contract (request vs service vs worker vs job) and the per-mode replica scaffold. Defaults preserve today's behaviour (execution_mode=request, restart_policy=on-failure)."
       type: object
       required: [entrypoint]
       properties:
@@ -12592,10 +12592,57 @@ components:
           $ref: '#/components/schemas/AppManifestHealthcheck'
         stop_signal:
           type: [string, "null"]
-          description: "OCI STOPSIGNAL (default SIGTERM). Runtime wiring lands in M-2."
+          description: "OCI STOPSIGNAL (default SIGTERM). Wired into the Engine.StopInstance signal-and-grace flow in M-2."
         stop_grace_period:
           type: [string, "null"]
-          description: "OCI StopGracePeriod as a Go duration string (e.g. \"5m\"). Capped at MaxAppManifestStopGracePeriod (5m). Currently always zero — populated by M-2."
+          description: "OCI StopGracePeriod as a Go duration string (e.g. \"30s\"). Per-plan cap (Hobby 30s, Pro 60s, Scale 120s) enforced by Validate() — ADR-138 §Decision 4."
+        # M-2 (ADR-137 §Decision 1): execution_mode drives the
+        # lifecycle contract. request = today's default behaviour
+        # (HTTP-driven, idle-reaped, snapshotted on park); service
+        # = desired-replica scaffold, readiness-aware rolling
+        # deploys (foundation here, full surface in M-4 workstream
+        # E); worker = long-lived, no public port, exempt from
+        # idle reap, billed at full RAM-second rate; job =
+        # run-to-completion, clean exit = success, exit≠0 = failure.
+        execution_mode:
+          type: [string, "null"]
+          enum: [request, service, worker, job, null]
+          description: "Lifecycle contract for this app (ADR-137 §Decision 1). Default 'request' preserves today's behaviour."
+          example: "request"
+        # M-2 (ADR-137 §Decision 2): restart_policy. Defaults
+        # derived from execution_mode at Validate time — always for
+        # worker/service, no for job, on-failure for request.
+        restart_policy:
+          type: [string, "null"]
+          enum: [no, on-failure, always, unless-stopped, null]
+          description: "Restart behaviour when the main workload exits (ADR-137 §Decision 2). Default is mode-derived: always for worker/service, no for job, on-failure for request."
+          example: "on-failure"
+        # M-2 (ADR-138 §Decision 3): upper bound on time-to-ready.
+        # After this elapses, the instance transitions to FAILED
+        # with lifecycle_failure_reason='startup_fail'. Per-plan
+        # cap: Hobby 30s, Pro 60s, Scale 120s.
+        startup_deadline_s:
+          type: [integer, "null"]
+          minimum: 0
+          description: "Upper bound on time-to-ready (seconds). Per-plan cap enforced by Validate() (ADR-138 §Decision 3). Default 0 means 'use plan default'."
+          example: 30
+        # M-2 (ADR-138 §Decision 3): upper bound on consecutive
+        # restart attempts. Exceeding it transitions the instance
+        # to FAILED with lifecycle_failure_reason='crash_loop'.
+        max_retries:
+          type: [integer, "null"]
+          minimum: 0
+          description: "Consecutive restart-attempt cap (ADR-138 §Decision 3). Per-plan cap: Hobby 5, Pro 10, Scale 20. Default 0 means 'use plan default'."
+          example: 3
+        # M-2 (ADR-137 §Decision 3): per-deployment replica
+        # scaffold for execution_mode='service'. Foundation here;
+        # full rolling-deploy / rollback / image-digest pinning
+        # semantics land in M-4 workstream E. Replica count is
+        # bounded by ServiceReplicasMax per plan (Hobby 3, Pro 5,
+        # Scale 20). Setting service_replicas with execution_mode
+        # other than 'service' is a Validate error.
+        service_replicas:
+          $ref: '#/components/schemas/ServiceReplicas'
 
     AppManifestHealthcheck:
       description: "AppManifest-level projection of the OCI HEALTHCHECK shape (ADR-136 §Decision 3-4). Durations are integer seconds at the JSON boundary to match OCI/Docker conventions. Runtime polling lands in M-2 (ADR-X5); M-1 surfaces the field for the registry-pull path."
@@ -12617,6 +12664,27 @@ components:
         start_period_s:
           type: [integer, "null"]
           description: "Startup grace during which failures don't count (Docker 17.05+, default 0s)."
+
+    ServiceReplicas:
+      description: "Per-deployment replica scaffold for execution_mode='service' (ADR-137 §Decision 3, M-2 + M-4 workstream E). Replica count is bounded by ServiceReplicasMax per plan (Hobby 3, Pro 5, Scale 20). min ≤ desired ≤ max must hold. Foundation here; rolling-deploy / rollback / image-digest pinning semantics land in M-4."
+      type: object
+      required: [min, max, desired]
+      properties:
+        min:
+          type: integer
+          minimum: 0
+          description: "Minimum desired replicas the Engine keeps alive. 0 = no minimum."
+          example: 1
+        max:
+          type: integer
+          minimum: 0
+          description: "Maximum desired replicas (engine-side cap; service autoscale bounds)."
+          example: 3
+        desired:
+          type: integer
+          minimum: 0
+          description: "Desired replica count. Engine wakes replacement instances to maintain this when one fails or is destroyed."
+          example: 2
 
     # ─── Deployments ──────────────────────────────────────────────────────
 
@@ -14055,6 +14123,24 @@ components:
         # ScalingPolicy.MinInstances (jsonb). null when the customer
         # never opted in.
         min_instances_target: { type: [integer, "null"], minimum: 0 }
+        # M-2 (ADR-137 §Decision 1): the closed-set execution
+        # mode for this instance. Mirrors apps.execution_mode
+        # (when persisted in M-4); today surfaced as a
+        # best-effort echo on the read path. Closed-set: normal
+        # | mirror | worker | service | job.
+        execution_mode:
+          type: [string, "null"]
+          enum: [normal, mirror, worker, service, job, null]
+          description: "Closed-set execution mode for this instance (ADR-137 §Decision 1)."
+          example: "normal"
+        # M-2 (ADR-138 §Decision 2): lifecycle failure reason.
+        # Stamped on instances transitioning to FAILED or
+        # STOPPED. null when the instance is RUNNING / WAKING.
+        lifecycle_failure_reason:
+          type: [string, "null"]
+          enum: [startup_fail, readiness_fail, liveness_fail, crash_loop, oom, clean_exit, error_exit, null]
+          description: "Reason for the most recent terminal transition (ADR-138 §Decision 2). null when still running."
+          example: null
 
     # ─── Domains ──────────────────────────────────────────────────────────
 

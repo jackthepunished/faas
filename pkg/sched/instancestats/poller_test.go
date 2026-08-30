@@ -125,6 +125,18 @@ func (v *statsFakeVMM) WarmSnapshot(context.Context, string, string, string) (sc
 }
 func (v *statsFakeVMM) Destroy(context.Context, string) error { return nil }
 
+// StopInstance (M-2 / ADR-138 §Decision 1) is the
+// graceful signal-then-grace-then-SIGKILL stop
+// sequence. Test fakes default to no-op + nil —
+// the engine's per-mode dispatch lives in
+// pkg/sched/engine_stop_pgtest_test.go (commit 6).
+func (v *statsFakeVMM) StopInstance(_ context.Context, _ string, _, _ int32) (*sched.StopInstanceOutcome, error) {
+	return nil, nil
+}
+func (v *statsFakeVMM) StopInstanceOnNode(_ context.Context, _, _ string, _, _ int32) (*sched.StopInstanceOutcome, error) {
+	return nil, nil
+}
+
 // UpdateEgressAllowlist (tier-2 PR-B) — instancestats tests don't
 // drive the egress drift path; egress_drift_test.go covers it.
 // Returning nil keeps the sched.VMM contract satisfied for the

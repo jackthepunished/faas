@@ -63,6 +63,16 @@ type VMM interface {
 	// racing a wake-park cycle is expected during instance churn).
 	FrameworkReady(ctx context.Context, instance string, warmupMs int64) error
 	Destroy(ctx context.Context, instance string) error
+	// StopInstance (M-2 / ADR-138 §Decision 1) is the graceful
+	// signal-grace-SIGKILL sequence. Distinct from Destroy (a hard
+	// SIGKILL). Engine.StopInstance (commit 6) dispatches per
+	// Instance.ExecutionMode: worker/job → StopInstance;
+	// request/service → existing snapshotAndPark/Destroy path.
+	// signal is a POSIX signal number (0 = use manifest StopSignal,
+	// defaulting to SIGTERM). graceSeconds is the upper bound on
+	// clean-shutdown wait; 0 = immediate SIGKILL (the legacy
+	// Destroy shape, preserved for compatibility).
+	StopInstance(ctx context.Context, instance string, signal int32, graceSeconds int32) (*StopInstanceOutcome, error)
 	// Ping is the wire-level liveness probe (issue #97 / ADR-025
 	// axis 3, PR #114). schedd's heartbeat loop calls this every
 	// HeartbeatInterval on every active compute_node; a non-error
@@ -433,6 +443,19 @@ type WakeOutcome struct {
 	Characterization api.CharacterizationReport
 }
 
+// StopInstanceOutcome (M-2 / ADR-138 §Decision 1) is the vmmd-side
+// result of the StopInstance RPC. Engine.StopInstance (commit 6)
+// reads KillSignalSent to decide whether the workload exited
+// cleanly within the grace window (clean_exit lifecycle_failure_reason)
+// or whether vmmd had to escalate to SIGKILL after the grace period
+// elapsed (killed_after_grace — surfaced as a future taxonomy
+// addition; for M-2 the engine simply logs and continues).
+type StopInstanceOutcome struct {
+	Instance       string
+	ExitCode       int32
+	KillSignalSent bool
+}
+
 // VMMClient is the production VMM: a gRPC connection to vmmd's unix socket.
 type VMMClient struct {
 	conn *grpc.ClientConn
@@ -589,6 +612,30 @@ func (c *VMMClient) Destroy(ctx context.Context, instance string) error {
 		return liftErr(err)
 	}
 	return nil
+}
+
+// StopInstance implements VMM (M-2 / ADR-138 §Decision 1). Wire is
+// the vmmdpb.StopInstance RPC (regenerated in commit 5). The signal
+// value is a POSIX signal number (0 = use manifest StopSignal,
+// defaulting to SIGTERM); grace is the upper bound on clean-shutdown
+// wait in seconds (0 = immediate SIGKILL, the legacy Destroy shape).
+// Returns the vmmd-side StopInstanceOutcome so Engine.StopInstance
+// (commit 6) can decide whether to record lifecycle_failure_reason
+// = clean_exit vs killed_after_grace.
+func (c *VMMClient) StopInstance(ctx context.Context, instance string, signal int32, graceSeconds int32) (*StopInstanceOutcome, error) {
+	resp, err := c.cli.StopInstance(ctx, &vmmdpb.StopInstanceRequest{
+		Instance:     instance,
+		Signal:       signal,
+		GracePeriodS: graceSeconds,
+	})
+	if err != nil {
+		return nil, liftErr(err)
+	}
+	return &StopInstanceOutcome{
+		Instance:       resp.Instance,
+		ExitCode:       resp.ExitCode,
+		KillSignalSent: resp.KillSignalSent,
+	}, nil
 }
 
 // UpdateEgressAllowlist implements VMM. The wire is a repeated

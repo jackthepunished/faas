@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -137,6 +138,19 @@ type VMM interface {
 	// best-effort and idempotent — safe to call on an instance that never fully
 	// booted.
 	Kill(ctx context.Context, l Lease) error
+	// SignalAndKill (M-2 / ADR-138 §Decision 1) is the
+	// graceful signal-then-grace-then-SIGKILL stop sequence.
+	// Sends `signal` (a POSIX signal number; 0 = use the
+	// manifest StopSignal, defaulting to SIGTERM) and waits
+	// up to `grace` for the workload to exit cleanly; on
+	// deadline expires, falls through to Kill (the SIGKILL
+	// escalation). Returns (killSignalSent, exitCode, err);
+	// killSignalSent=true means the grace window expired
+	// and SIGKILL was the actual exit cause. signal=0 +
+	// grace=0 is the legacy Destroy shape (immediate
+	// SIGKILL); in that case the implementation delegates
+	// to Kill and reports killSignalSent=true.
+	SignalAndKill(ctx context.Context, l Lease, signal syscall.Signal, grace time.Duration) (killSignalSent bool, exitCode int32, err error)
 	// DestroyWithExport is the build-aware teardown: it waits for the firecracker
 	// child to exit, captures the exit code, and (if exportDir != "") loopback-
 	// mounts the chroot-local drive1 to copy out the produced artifacts before
@@ -3677,6 +3691,48 @@ func (m *Manager) Destroy(ctx context.Context, instance string) error {
 // Returns the captured exit code (0 for app VMs / unknown instances). Like
 // Destroy, it tears down network + lease on the success path; on failure it
 // still runs cleanup (invariant §6.2-4/5).
+
+// SignalAndKill (M-2 / ADR-138 §Decision 1) is the Manager-level
+// wrapper around JailerVMM.SignalAndKill — the graceful
+// signal-grace-SIGKILL stop sequence used by Engine.StopInstance
+// for worker / job mode instances. Returns
+// (killSignalSent, exitCode, err); killSignalSent is true iff
+// vmmd had to escalate to SIGKILL after the grace window
+// expired.
+//
+// Like Destroy, the Manager drops the live row + CID→instance
+// join + calls cleanup() unconditionally on the way out so
+// §6.2-4/5 invariants are preserved even when the inner
+// SignalAndKill returns an error (the error is surfaced; cleanup
+// has already happened). Caller (vmmdgrpc.Server.StopInstance)
+// translates the (killSignalSent, exitCode) pair into the
+// StopInstanceResponse wire envelope.
+//
+// Returns (false, 0, nil) when the instance is unknown to the
+// Manager — same idempotent-on-unknown contract as Destroy.
+func (m *Manager) SignalAndKill(ctx context.Context, instance string, signal syscall.Signal, grace time.Duration) (killSignalSent bool, exitCode int32, err error) {
+	m.mu.Lock()
+	inst, ok := m.live[instance]
+	if ok {
+		delete(m.live, instance)
+		delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
+	}
+	m.mu.Unlock()
+	if !ok {
+		// Unknown instance — match Destroy's idempotent shape.
+		return false, 0, nil
+	}
+	killSignalSent, exitCode, err = m.vmm.SignalAndKill(ctx, inst.Lease, signal, grace)
+	// Cleanup uses a context detached from the caller's (same
+	// rationale as DestroyWithExport above — a cancelled caller's
+	// ctx must not leak netns / cgroup).
+	m.cleanup(context.WithoutCancel(ctx), inst.Lease, inst.Net, inst.WorkloadNames)
+	m.mu.Lock()
+	delete(m.exportDirs, instance)
+	m.mu.Unlock()
+	return killSignalSent, exitCode, err
+}
+
 func (m *Manager) DestroyWithExport(ctx context.Context, instance, exportDir string) (int, error) {
 	// Stop background liveness work before removing the live entry or
 	// waiting on the VMM. A liveness report can race this destroy path;

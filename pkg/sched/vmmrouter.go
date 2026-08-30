@@ -79,6 +79,15 @@ type RoutedVMM interface {
 	// router implementation forwards to cli.FrameworkReady.
 	FrameworkReady(ctx context.Context, nodeID, instance string, warmupMs int64) error
 	Destroy(ctx context.Context, nodeID, instance string) error
+	// StopInstanceOnNode (M-2 / ADR-138 §Decision 1) is the
+	// graceful signal-grace-SIGKILL sequence, routed by nodeID.
+	// Named with OnNode suffix so test fakes that satisfy both
+	// VMM (the per-target client) and RoutedVMM (the multi-node
+	// router) can keep the VMM-shape StopInstance without
+	// inserting a nodeID arg that VMM doesn't have. The
+	// per-node VMM client forwards to vmmdpb.StopInstance;
+	// signal+graceSeconds wire shape is identical.
+	StopInstanceOnNode(ctx context.Context, nodeID, instance string, signal int32, graceSeconds int32) (*StopInstanceOutcome, error)
 	// Ping is the wire-level liveness probe (issue #97 / ADR-025
 	// axis 3, PR #114). schedd's heartbeat loop calls this every
 	// HeartbeatInterval on every active compute_node; a non-error
@@ -377,6 +386,19 @@ func (r *VMMRouter) Destroy(ctx context.Context, nodeID, instance string) error 
 		return err
 	}
 	return cli.Destroy(ctx, instance)
+}
+
+// StopInstanceOnNode (M-2 / ADR-138 §Decision 1) implements
+// RoutedVMM. Same resolveFor path as Destroy — dial-once-per-target,
+// the per-node VMMClient owns the gRPC socket and the vmmdpb proto
+// envelope. The returned outcome carries (ExitCode, KillSignalSent)
+// for the engine's audit-row stamping.
+func (r *VMMRouter) StopInstanceOnNode(ctx context.Context, nodeID, instance string, signal int32, graceSeconds int32) (*StopInstanceOutcome, error) {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return cli.StopInstance(ctx, instance, signal, graceSeconds)
 }
 
 // FrameworkReady implements RoutedVMM. Pure pass-through to the

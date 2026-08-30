@@ -268,6 +268,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			rows, err := sampler.SampleAndRoll(c)
 			if err == nil {
 				l.emitFloorApplied(c, rows)
+				l.emitMeteredMB(c, rows)
 			}
 			// ADR-099 / issue #1184 Workstream A: job
 			// sampler. Same 1m tick, after the app rows,
@@ -613,6 +614,43 @@ func (l *Loop) emitFloorApplied(ctx context.Context, rows []RolledRow) {
 			continue
 		}
 		l.ops.MeterdFloorAppliedTotal(string(accountPlan[acctID]))
+	}
+}
+
+// emitMeteredMB (M-2 / ADR-137 §Decision 1) walks the sampler's
+// returned RolledRows and accumulates MB-seconds onto
+// metered_mb_seconds_total{mode,plan} per live row. The counter
+// is cumulative MB-seconds (NOT row count) so dashboards query
+// rate(_total[5m]) and reconcile 1:1 with usage_minutes.
+// SyntheticFloor rows contribute too — the per-app floor IS
+// billable usage and the dashboard must count it in the
+// mode label, even though it has no backing instance. Mirror
+// is filtered upstream by the sampler and never reaches this
+// closure.
+//
+// Plan stamping is delegated to Sampler.SampleAndRoll — each
+// row carries its account's plan at construction time, so the
+// closure has no DB work. A nil receiver ops is tolerated (the
+// accessor is nil-safe), and rows with empty Plan fall through
+// to "free" via OpsMetrics.MeteredMBSecondsTotal's empty-mode
+// fallback.
+func (l *Loop) emitMeteredMB(ctx context.Context, rows []RolledRow) {
+	if l.ops == nil || len(rows) == 0 {
+		return
+	}
+	for _, r := range rows {
+		// Mirror rows would be skipped upstream; defensive
+		// check matches IsMeteredSkippableMode so a future
+		// refactor that pulls the filter out of the sampler
+		// can't accidentally emit a mirror row here.
+		if state.IsMeteredSkippableMode(r.Mode) {
+			continue
+		}
+		mode := r.Mode
+		if mode == "" {
+			mode = "normal"
+		}
+		l.ops.MeteredMBSecondsTotal(mode, r.Plan, r.MBSeconds)
 	}
 }
 
