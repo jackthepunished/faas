@@ -1574,6 +1574,12 @@ type Store interface {
 	// both want "instances I'm responsible for" rather than the
 	// fleet-wide ListAllInstances.
 	ListInstancesByNodeID(ctx context.Context, nodeID string) ([]Instance, error)
+	// ListInstancesForLifecycleReconciliation returns live instances whose
+	// parent app or account is in a deletion state. It is the durable fallback
+	// for pg_notify: schedd uses it to destroy VMs after a missed notification
+	// or a restart. A non-empty nodeID scopes the result to apps owned by that
+	// node; limit <= 0 returns no rows.
+	ListInstancesForLifecycleReconciliation(ctx context.Context, nodeID string, limit int) ([]Instance, error)
 	// ListOwnedCronsByNodeID returns every cron whose owning app's
 	// owner_node matches nodeID. The cron dispatcher runs once per
 	// node and only fires crons on apps it owns; without this filter

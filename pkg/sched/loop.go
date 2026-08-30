@@ -42,6 +42,12 @@ import (
 // build/snapshot budget.
 const reaperParkTimeout = 2 * time.Minute
 
+// lifecycleReconcileMaxPerTick bounds the durable deletion sweep. Deletion
+// cleanup is retryable and oldest-first at the store layer, so a bounded pass
+// gives every schedd tick a predictable cost without allowing one abandoned
+// account or app to monopolise the scheduler.
+const lifecycleReconcileMaxPerTick = 100
+
 // Loop subscribes to the pg_notify channels schedd cares about and reacts. It
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
@@ -1321,13 +1327,35 @@ func (l *Loop) runRecentLoad(ctx context.Context) {
 
 // handleNotification decodes the JSON payload and applies the policy.
 //
-//   - app_changed / deployment_changed: informational. Wake materialises an
+//   - app_changed: `kind=parked` is actionable and tears down the app's live
+//     instances; other app changes are informational. Wake materialises an
 //     instance on demand (first request), so no eager instance creation here.
+//   - deployment_changed: informational.
 //   - snapshot_prime: imaged finished building a deployment's layer; boot it
 //     once, snapshot it, and park it (spec §5 step 6, ADR-018).
 func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 	switch n.Channel {
 	case db.NotifyAppChanged:
+		var p struct {
+			Kind  string `json:"kind"`
+			AppID string `json:"app_id"`
+		}
+		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+			l.log.Warn("sched: bad app_changed payload", "err", err)
+			return
+		}
+		if p.Kind == "parked" {
+			if p.AppID == "" {
+				l.log.Warn("sched: parked app notification missing app_id")
+				return
+			}
+			if acted, err := l.engine.ParkApp(ctx, p.AppID); err != nil {
+				l.log.Warn("sched: park app failed", "app", p.AppID, "acted", acted, "err", err)
+			} else {
+				l.log.Info("sched: parked app reconciled", "app", p.AppID, "instances", acted)
+			}
+			return
+		}
 		l.log.Debug("app_changed", "payload", n.Payload)
 	case db.NotifyDeploymentChanged:
 		l.log.Debug("deployment_changed", "payload", n.Payload)
@@ -1397,6 +1425,22 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 //   - SelectEvictions → Engine.Evict (destroy; next wake cold-boots, ADR-005).
 func (l *Loop) runReaper(ctx context.Context) {
 	store := l.engine.Store()
+	// pg_notify is a wakeup hint, not a durable queue. Reconcile deletion
+	// candidates directly from app/account status before the normal app list.
+	// The regular app list excludes soft-deleted apps, and the account-deletion
+	// state is intentionally outside the idle reaper's live set, so neither
+	// path can recover an orphaned VM on its own.
+	lifecycle, lifecycleErr := store.ListInstancesForLifecycleReconciliation(ctx, l.engine.OwnerNodeID(), lifecycleReconcileMaxPerTick)
+	if lifecycleErr != nil {
+		l.log.Warn("reaper: list lifecycle reconciliation candidates", "err", lifecycleErr)
+	} else {
+		for _, candidate := range lifecycle {
+			acted, err := l.engine.ReconcileLifecycleInstance(ctx, candidate.ID)
+			if err != nil {
+				l.log.Warn("reaper: lifecycle reconciliation", "instance", candidate.ID, "acted", acted, "err", err)
+			}
+		}
+	}
 	// Phase 2 / Gate A: scope the reaper to this schedd's owner
 	// apps/instances. Empty owner = legacy single-box posture
 	// (list everything). Non-empty = per-node slice via the
@@ -1412,6 +1456,19 @@ func (l *Loop) runReaper(ctx context.Context) {
 	if err != nil {
 		l.log.Warn("reaper: list apps", "err", err)
 		return
+	}
+	// pg_notify is a wakeup hint, not a durable queue. Reconcile parked apps
+	// from the table source of truth on every reaper tick so a schedd restart,
+	// LISTEN reconnect, or transient notification loss cannot leave a VM live
+	// behind an evicted_cold app. This runs before the normal idle snapshot so
+	// successfully parked rows are excluded from the same tick's accounting.
+	for _, app := range apps {
+		if app.Status != state.AppEvictedCold {
+			continue
+		}
+		if acted, err := l.engine.ParkApp(ctx, app.ID); err != nil {
+			l.log.Warn("reaper: parked app reconcile", "app", app.ID, "acted", acted, "err", err)
+		}
 	}
 	// G7 conntrack warm (spec §17): if the FlowCounter is also a Warm-able
 	// reader (the production flowcount.Reader is), feed it every live

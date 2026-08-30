@@ -118,6 +118,35 @@ func TestAppDeleteSubscriber_ForgetOnNotify(t *testing.T) {
 	}
 }
 
+func TestAppDeleteSubscriber_DestroysDeletedAppVM(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 128, 8)
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.0")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	deleted := state.AppDeleted
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &deleted}); err != nil {
+		t.Fatalf("UpdateApp deleted: %v", err)
+	}
+
+	sub := NewAppDeleteSubscriber(engine, testLog())
+	sub.evictApp(context.Background(), app.ID)
+
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateStopped) {
+		t.Errorf("state = %q, want stopped", row.State)
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("destroys = %d, want 1", vmm.destroys)
+	}
+}
+
 // TestAppDeleteSubscriber_IgnoresOtherChannels pins the defensive
 // guard at handle(): a misrouted notification on a different
 // channel must NOT trigger Forget (no innocent app evicted).

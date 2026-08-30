@@ -1298,8 +1298,12 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrCapacity("could not delete app"))
 		return
 	}
-	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
-		fmt.Sprintf(`{"kind":"deleted","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
+	// NotifyAppDelete is the lifecycle cleanup signal consumed by schedd.
+	// AppChanged is for app metadata/routing changes and is not subscribed
+	// to by the VM teardown path; publishing the delete on that channel can
+	// leave a running VM behind after the soft delete.
+	_ = s.notif.Notify(r.Context(), db.NotifyAppDelete,
+		fmt.Sprintf(`{"slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app deleted", "app", app.ID, "slug", app.Slug, "account", acct.ID)
 	// IAM-4 (issue #291): record the soft delete. ADR-035 lists
 	// `account.deletion_scheduled` / `account.deletion_restored`
