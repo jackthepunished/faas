@@ -55,6 +55,24 @@ type Supervisor struct {
 	// the main workload's terminal state. nil = clean exit or
 	// never ran.
 	lastRunErr atomic.Pointer[error]
+
+	// stopOnce (M-2 / //code-review PR #1202 finding #6) guards
+	// against duplicate Stop() calls (a manifest that declares two
+	// stop-signals, a context cancel + signal race, etc.). Without
+	// it, two Stop() invocations could send SIGTERM twice (the
+	// second racing the SIGKILL escalation timer) and confuse the
+	// customer's signal handler.
+	//
+	// Per-supervisor (NOT package-level): guest-init runs multiple
+	// Supervisor instances concurrently (the main workload + each
+	// sidecar workload, ADR-069 PR-B). A package-level Once would
+	// be a single gate shared across every supervisor — the FIRST
+	// supervisor to call Stop() would consume the Once and every
+	// OTHER supervisor's Stop() would silently become a no-op,
+	// leaking the sidecars. Per-supervisor Once scopes the
+	// idempotency to "this one workload's stop sequence" which is
+	// what the contract actually means.
+	stopOnce sync.Once
 }
 
 // LastExitCode returns -1 if no fork has observed an exit yet;
@@ -218,13 +236,6 @@ func (s *Supervisor) Run() error {
 	}
 }
 
-// stopOnce guards against duplicate Stop calls (a manifest that
-// declares two stop-signals, a context cancel + signal race, etc.).
-// Without the Once, two Stop() invocations could send SIGTERM twice
-// (the second one racing the SIGKILL escalation timer) and confuse
-// the customer's signal handler.
-var stopOnce sync.Once
-
 // Stop (M-2 / ADR-138 §Decision 1) is the graceful-stop hook the
 // PID 1 signal handler installs. The supervisor sends `sig` to
 // the tracked workload (cmd.Process.Pid), waits up to `grace`,
@@ -250,7 +261,7 @@ func (s *Supervisor) Stop(ctx context.Context, sig syscall.Signal, grace time.Du
 	}
 	pid := cmd.Process.Pid
 	var stopErr error
-	stopOnce.Do(func() {
+	s.stopOnce.Do(func() {
 		// First: send the customer's signal (SIGTERM by default
 		// or AppManifest.StopSignal). SIGKILL is the escalation
 		// signal and is sent by the timer below, NOT here.

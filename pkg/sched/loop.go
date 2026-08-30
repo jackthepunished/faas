@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1702,7 +1703,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	idleParkByApp := map[string]struct{}{}
 	cooldownHeldByApp := map[string]struct{}{}
 	for _, id := range ReapIdle(now, snapshot, l.ops, cooldownHeldByApp) {
-		if err := l.parkFromReaper(ctx, id); err != nil {
+		if err := l.reaperShutdown(ctx, snapshot, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
 		}
@@ -1801,6 +1802,77 @@ func (l *Loop) parkFromReaper(ctx context.Context, instanceID string) error {
 	parkCtx, cancel := context.WithTimeout(ctx, reaperParkTimeout)
 	defer cancel()
 	return l.engine.Park(parkCtx, instanceID)
+}
+
+// reaperShutdown (M-2 / //code-review PR #1202 finding #8) is the
+// mode-aware dispatcher the cron-loop reaper uses to shut down
+// instances. Worker / job instances must go through
+// Engine.StopInstance (signal-and-grace, no snapshot) so the
+// guest-init Supervisor has a chance to run the customer's
+// StopSignal handler before the engine escalates to SIGKILL.
+// Request / service / mirror instances still go through
+// Engine.Park (snapshot-and-park) — the snapshot cache is what
+// makes the next wake cheap, and ADR-005 pins cold-boot as the
+// fallback, not the primary path.
+//
+// Today's reaper exemption (finding #5) means worker / job / service
+// IDs are not normally returned by ReapIdle / ReapAggressive —
+// but the dispatcher is still load-bearing for the cron-loop
+// paths the exemption does not cover: a future "max-worker-count"
+// reaper rule, an admin operator force_stop on a worker, or any
+// cron-loop shutdown primitive added in M-4 / M-5. Putting the
+// dispatch at the shared call site means the routing is correct
+// the first time, instead of being retro-fitted under each new
+// reaper rule.
+//
+// The mode lookup walks the snapshot the reaper built earlier in
+// the tick — a benign race exists if a different cron-loop tick
+// mutated the instance between ReapIdle returning and
+// reaperShutdown running, but the worst-case outcome is the
+// dispatcher parks instead of stops (or vice versa), and both
+// paths converge on STOPPED. ReaperParkTimeout bounds the
+// synchronous call regardless of which engine path runs.
+func (l *Loop) reaperShutdown(ctx context.Context, snapshot []InstanceInfo, instanceID string) error {
+	mode := l.modeForShutdown(snapshot, instanceID)
+	switch state.InstanceMode(mode) {
+	case state.InstanceModeWorker, state.InstanceModeJob:
+		return l.stopInstanceFromReaper(ctx, instanceID)
+	default:
+		return l.parkFromReaper(ctx, instanceID)
+	}
+}
+
+// modeForShutdown looks up the InstanceInfo for id in the reaper
+// snapshot and returns its Mode. Falls back to the empty string
+// (which InstanceMode treats as ModeNormal, so the dispatcher
+// parks) when the snapshot has no entry for id — a benign race
+// covered in reaperShutdown's doc comment.
+func (l *Loop) modeForShutdown(snapshot []InstanceInfo, instanceID string) string {
+	for _, info := range snapshot {
+		if info.Instance == instanceID {
+			return info.Mode
+		}
+	}
+	return ""
+}
+
+// stopInstanceFromReaper is the reaper-side wrapper around
+// Engine.StopInstance. Same reaperParkTimeout cap as
+// parkFromReaper so a wedged guest-init can't pin the cron loop
+// for longer than the idle-path budget. The StopOptions pick
+// SIGTERM (default per ADR-138 §Decision 1) and a 30 s grace
+// window — matches the per-plan DefaultStopGracePeriodS for the
+// Hobby tier; Pro / Scale get the same 30 s here because the
+// cron-loop shutdown is operator-driven and shouldn't out-grace
+// a customer's intentional force-stop.
+func (l *Loop) stopInstanceFromReaper(ctx context.Context, instanceID string) error {
+	stopCtx, cancel := context.WithTimeout(ctx, reaperParkTimeout)
+	defer cancel()
+	_, err := l.engine.StopInstance(stopCtx, instanceID, StopOptions{
+		Signal:       int32(syscall.SIGTERM),
+		GraceSeconds: 30,
+	})
+	return err
 }
 
 // reaperInstanceState mirrors the SQL partial-index predicate used by
@@ -1980,7 +2052,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		// post-enrichment app-wide max floor.
 		aggressiveParkOK := false
 		for _, id := range ids {
-			if err := l.parkFromReaper(ctx, id); err != nil {
+			if err := l.reaperShutdown(ctx, snapshot, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
 				continue
 			}

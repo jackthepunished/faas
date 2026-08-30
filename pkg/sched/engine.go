@@ -4554,13 +4554,22 @@ func (e *Engine) StopInstance(ctx context.Context, instanceID string, opts StopO
 		// restarts. The engine does not schedule a new
 		// instance for either mode; the workload's contract
 		// owns its own resurrection.
-		return StopOutcome{
+		//
+		// Guard out == nil: vmmd RPC failure returns (nil, err).
+		// Without this guard the deref on out.ExitCode below
+		// would panic, schedd would crash, and the orphaned
+		// STOPPED row would never get reaped (netns/chroot/
+		// cgroup leak).
+		outcome := StopOutcome{
 			Instance:        instanceID,
 			Mode:            string(mode),
-			ExitCode:        out.ExitCode,
-			KillSignalSent:  out.KillSignalSent,
 			LifecycleReason: LifecycleReasonCleanExit,
-		}, nil
+		}
+		if out != nil {
+			outcome.ExitCode = out.ExitCode
+			outcome.KillSignalSent = out.KillSignalSent
+		}
+		return outcome, nil
 	case state.InstanceModeService:
 		// Service replicas converge to desired. snapshotAndPark
 		// preserves the snapshot cache the desired-replica wake

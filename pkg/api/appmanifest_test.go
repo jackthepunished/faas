@@ -252,8 +252,10 @@ func TestErrAppLayerTooLarge(t *testing.T) {
 // TestEffectiveExecutionModeAndRestartPolicy pins the per-mode defaults
 // (ADR-137 §Decision 1 + §Decision 2). Existing manifests with neither
 // ExecutionMode nor RestartPolicy set must default to "request" /
-// "always" — preserving today's behaviour for customers who haven't
-// opted into the new fields.
+// "on-failure" — preserving today's behaviour for customers who haven't
+// opted into the new fields. request → on-failure prevents the
+// infinite-restart loop on clean-exit HTTP servers (the supervisor
+// re-execs, MaxRetries trips, false crash_loop fires).
 func TestEffectiveExecutionModeAndRestartPolicy(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -261,8 +263,8 @@ func TestEffectiveExecutionModeAndRestartPolicy(t *testing.T) {
 		wantMode    string
 		wantRestart string
 	}{
-		{"empty → request/always", AppManifest{Entrypoint: []string{"x"}}, ExecutionModeRequest, RestartPolicyAlways},
-		{"explicit request", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "request"}, "request", RestartPolicyAlways},
+		{"empty → request/on-failure", AppManifest{Entrypoint: []string{"x"}}, ExecutionModeRequest, RestartPolicyOnFailure},
+		{"explicit request", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "request"}, "request", RestartPolicyOnFailure},
 		{"service → always", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "service"}, "service", RestartPolicyAlways},
 		{"worker → always", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "worker"}, "worker", RestartPolicyAlways},
 		{"job → no", AppManifest{Entrypoint: []string{"x"}, ExecutionMode: "job"}, "job", RestartPolicyNo},

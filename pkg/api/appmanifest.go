@@ -192,8 +192,16 @@ func (m AppManifest) EffectiveRestartPolicy() string {
 	switch m.EffectiveExecutionMode() {
 	case ExecutionModeJob:
 		return RestartPolicyNo
-	default:
+	case ExecutionModeService, ExecutionModeWorker:
 		return RestartPolicyAlways
+	default:
+		// ExecutionModeRequest (today's default) preserves
+		// the M-1 behaviour: clean-exit HTTP servers that
+		// call server.Shutdown(ctx) on SIGTERM stop cleanly
+		// without infinite-restart loops that would otherwise
+		// trigger MaxRetries → false crash_loop.
+		// (ADR-137 §Decision 2.)
+		return RestartPolicyOnFailure
 	}
 }
 
