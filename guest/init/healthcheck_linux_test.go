@@ -125,7 +125,7 @@ func TestExecHealthcheck_PassOnZeroExit(t *testing.T) {
 	if _, err := exec.LookPath("true"); err != nil {
 		t.Skipf("true not available: %v", err)
 	}
-	report := execHealthcheck([]string{"/bin/true", "ignored"}, 5*time.Second, 0, nil)
+	report := execHealthcheck(context.Background(), []string{"/bin/true", "ignored"}, 5*time.Second, 0, nil)
 	if report.Status != healthcheckStatusPass {
 		t.Errorf("Status = 0x%02x; want 0x%02x (pass)", report.Status, healthcheckStatusPass)
 	}
@@ -136,7 +136,7 @@ func TestExecHealthcheck_PassOnZeroExit(t *testing.T) {
 // non-existent binary so the test doesn't depend on /bin/false
 // being present in every CI environment.
 func TestExecHealthcheck_FailOnNonZeroExit(t *testing.T) {
-	report := execHealthcheck([]string{"/bin/sh", "-c", "exit 1"}, 5*time.Second, 0, nil)
+	report := execHealthcheck(context.Background(), []string{"/bin/sh", "-c", "exit 1"}, 5*time.Second, 0, nil)
 	if report.Status != healthcheckStatusFail {
 		t.Errorf("Status = 0x%02x; want 0x%02x (fail)", report.Status, healthcheckStatusFail)
 	}
@@ -153,7 +153,7 @@ func TestExecHealthcheck_TruncatesLongOutput(t *testing.T) {
 	for i := range long {
 		long[i] = 'X'
 	}
-	report := execHealthcheck([]string{"/bin/sh", "-c", "printf '" + string(long) + "'"}, 5*time.Second, 0, nil)
+	report := execHealthcheck(context.Background(), []string{"/bin/sh", "-c", "printf '" + string(long) + "'"}, 5*time.Second, 0, nil)
 	if len(report.Output) > VsockHealthcheckMaxOutput {
 		t.Errorf("Output len = %d; want <= %d", len(report.Output), VsockHealthcheckMaxOutput)
 	}
