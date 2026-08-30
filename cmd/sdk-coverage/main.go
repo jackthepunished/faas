@@ -308,6 +308,11 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
+	// ADR-123 PR-D — operator pane for one rule's recent
+	// alert_deliveries rows. ?include_test=true toggles the IsTest
+	// discriminator; the SDK method reflects the boolean
+	// explicitly so callers don't have to hand-craft URL params.
+	"GET /v1/apps/{slug}/alerts/{id}/deliveries": "ListAlertRuleDeliveries",
 
 	// Issue #1233 / ADR-123 — alert-preset catalog. Auto-derivation
 	// would produce Swagger-style names ("GetAlert-presets",

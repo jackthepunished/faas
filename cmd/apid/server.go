@@ -1412,6 +1412,12 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertRules))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createAlertRule)))))
 	mux.HandleFunc("GET /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAlertRule))))
+	// ADR-123 PR-D: listAlertRuleDeliveries — operator pane for
+	// recent alert_deliveries rows. ?include_test=true toggles the
+	// IsTest discriminator (default false; production-only rows).
+	// Same auth scope as getAlertRule so a customer cannot probe
+	// another account's ledger by guessing rule IDs.
+	mux.HandleFunc("GET /v1/apps/{slug}/alerts/{id}/deliveries", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertRuleDeliveries))))
 	mux.HandleFunc("PATCH /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateAlertRule))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))

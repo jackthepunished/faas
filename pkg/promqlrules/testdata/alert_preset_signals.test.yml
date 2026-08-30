@@ -12,11 +12,13 @@
 #      `min(meterd_tenant_surface_cert_expiry_seconds) by
 #      (account_id, app_id) < 1209600` for 24h. Per-host min
 #      aggregation.
-#   5. FaasQueueBacklogGrowingApp — `max(gateway_queue_depth{app})
-#      > 50` for 15m. App label only (no account_id).
+#   5. FaasQueueBacklogGrowingApp — `max(gateway_queue_depth{app,
+#      account_id}) > 50` for 15m. As of PR-D the metric carries
+#      an account_id label (admitted via accountLabelSet, overflow
+#      `__other__`).
 #   6. FaasAlertPresetAnyFiringAccount — count by account_id of
-#      any of (1, 2, 3, 4) firing. Queue signal NOT included
-#      because gateway_queue_depth has app, not account_id.
+#      any of (1, 2, 3, 4, 5) firing. All 5 alert-preset signals
+#      contribute as of PR-D.
 #
 # Why this fixture exists: TestFaasRulesSyntax validates the rule
 # file parse-only; TestFaasRulesAcceptance (rules_test.go:67-99)
@@ -161,15 +163,15 @@ tests:
 
   # ──────────────────────────────────────────────────────────────
   # Test 5 — queue_backlog_growing fires when gateway_queue_depth
-  # exceeds 50 for 15m. App label only — NOT counted in the
-  # account-correlation rule.
+  # exceeds 50 for 15m. Carries account_id as of PR-D; contributes
+  # to the account-correlation rule.
   # ──────────────────────────────────────────────────────────────
   - interval: 30s
     name: "queue_depth>50 → FaasQueueBacklogGrowingApp fires"
     input_series:
       # Steady 75 (above threshold) for 30m. 15m `for:` elapsed at
       # t=15m+5m; alert active at t=20m.
-      - series: 'gateway_queue_depth{app="app-queue"}'
+      - series: 'gateway_queue_depth{app="app-queue",account_id="acct-queue"}'
         values: '75+0x60'
     alert_rule_test:
       - eval_time: 20m
@@ -181,14 +183,15 @@ tests:
               family: alert_preset_signals
               preset: queue_backlog_growing
               app: "app-queue"
+              account_id: "acct-queue"
             exp_annotations:
-              summary: "Gateway queue depth > 50 for app app-queue for 15m"
-              description: "max(gateway_queue_depth{app=\"app-queue\"}) by (app) has been > 50 for 15m. This is the alert_preset catalog `queue_backlog_growing` signal. Note: this metric labels on `app`, not `account_id`, so it does NOT contribute to the FaasAlertPresetAnyFiringAccount correlation rule below. Common causes: customer app wake latency exceeded the gateway queue cap, cold-boot snapshot restore failing repeatedly, or downstream Postgres contention."
+              summary: "Gateway queue depth > 50 for app app-queue (account acct-queue) for 15m"
+              description: "max(gateway_queue_depth{app=\"app-queue\", account_id=\"acct-queue\"}) by (app, account_id) has been > 50 for 15m. This is the alert_preset catalog `queue_backlog_growing` signal. The `account_id` label is admitted via accountLabelSet (cap=10k, overflow=`__other__`); rows past the cap roll up under `__other__` and contribute to the FaasAlertPresetAnyFiringAccount correlation under that bucket. Common causes: customer app wake latency exceeded the gateway queue cap, cold-boot snapshot restore failing repeatedly, or downstream Postgres contention."
               runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGatewayQueueBacklogGrowing.md"
 
   # ──────────────────────────────────────────────────────────────
   # Test 6 — correlation rule fires when at least one of the
-  # 4 account-labeled signals is firing for the same account.
+  # 5 account-labeled signals is firing for the same account.
   # ──────────────────────────────────────────────────────────────
   - interval: 30s
     name: "any preset firing → FaasAlertPresetAnyFiringAccount fires"
@@ -211,11 +214,49 @@ tests:
               account_id: "acct-corr"
             exp_annotations:
               summary: "Account acct-corr has >=1 alert_preset firing"
-              description: "One or more alert_preset signal(s) for account acct-corr are currently firing: api_down, spend_eur_20, deploy_failed, or cert_expiring_14d. The queue_backlog_growing signal is NOT included in this correlation (it carries an `app` label, not `account_id` — see FaasQueueBacklogGrowingApp for per-app queue alerts). The number after `count` is the breadth of the firing preset set; cross-reference per-preset alerts above for the actual signal."
+              description: "One or more alert_preset signal(s) for account acct-corr are currently firing: api_down, spend_eur_20, deploy_failed, cert_expiring_14d, or queue_backlog_growing. All 5 alert-preset catalog signals contribute to this correlation; the queue signal carries an `account_id` label (admitted via accountLabelSet, overflow=`__other__`) as of PR-D. The number after `count` is the breadth of the firing preset set; cross-reference per-preset alerts above for the actual signal."
               runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAlertPresetAnyFiringAccount.md"
 
   # ──────────────────────────────────────────────────────────────
-  # Test 7 — negative case. All signals within bounds → no alerts.
+  # Test 7 — correlation rule fires when ONLY the queue signal is
+  # firing (the other 4 account-labeled signals are healthy). Pre-
+  # PR-D this case would NOT fire — the queue signal was excluded
+  # from the correlation. Post-PR-D it fires because queue now
+  # carries account_id.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "queue alone → FaasAlertPresetAnyFiringAccount fires"
+    input_series:
+      # acct-queue has only queue_backlog_growing firing. The other
+      # 4 account-labeled signals are healthy (api=1, spend=5,
+      # deploy_failed=0, cert=30d). Pre-PR-D the correlation
+      # wouldn't fire; PR-D adds the queue predicate so it does.
+      - series: 'meterd_api_reachable{account_id="acct-queue-only",app_id="app-q-only"}'
+        values: '1+0x120'
+      - series: 'meterd_account_spend_eur{account_id="acct-queue-only"}'
+        values: '5+0x120'
+      - series: 'meterd_deployment_failed_total{account_id="acct-queue-only",app_id="app-q-only"}'
+        values: '0+0x120'
+      - series: 'meterd_tenant_surface_cert_expiry_seconds{account_id="acct-queue-only",app_id="app-q-only",hostname="host-1"}'
+        values: '2592000+0x120'
+      - series: 'gateway_queue_depth{app="app-q-only",account_id="acct-queue-only"}'
+        values: '75+0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FaasAlertPresetAnyFiringAccount
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: meterd
+              family: alert_preset_correlation
+              account_id: "acct-queue-only"
+            exp_annotations:
+              summary: "Account acct-queue-only has >=1 alert_preset firing"
+              description: "One or more alert_preset signal(s) for account acct-queue-only are currently firing: api_down, spend_eur_20, deploy_failed, cert_expiring_14d, or queue_backlog_growing. All 5 alert-preset catalog signals contribute to this correlation; the queue signal carries an `account_id` label (admitted via accountLabelSet, overflow=`__other__`) as of PR-D. The number after `count` is the breadth of the firing preset set; cross-reference per-preset alerts above for the actual signal."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAlertPresetAnyFiringAccount.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 8 — negative case. All signals within bounds → no alerts.
   # ──────────────────────────────────────────────────────────────
   - interval: 30s
     name: "all signals OK → no alert_preset alert fires"
@@ -228,7 +269,7 @@ tests:
         values: '0+0x120'
       - series: 'meterd_tenant_surface_cert_expiry_seconds{account_id="acct-ok",app_id="app-ok",hostname="host-1"}'
         values: '2592000+0x120'
-      - series: 'gateway_queue_depth{app="app-ok"}'
+      - series: 'gateway_queue_depth{app="app-ok",account_id="acct-ok"}'
         values: '10+0x120'
     alert_rule_test:
       - eval_time: 1h

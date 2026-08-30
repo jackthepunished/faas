@@ -1599,9 +1599,9 @@ groups:
         expr: |
           min(meterd_tenant_surface_cert_expiry_seconds) by (account_id, app_id)
 
-      - record: faas_queue_backlog_growing_over_15m:by_app
+      - record: faas_queue_backlog_growing_over_15m:by_app_account
         expr: |
-          max(gateway_queue_depth) by (app)
+          max(gateway_queue_depth) by (app, account_id)
 
       # ── Alert rules (one per recording rule, severity=warn) ──────
       - alert: FaasApiDownAccount
@@ -1667,7 +1667,7 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSCertExpiryPage.md"
 
       - alert: FaasQueueBacklogGrowingApp
-        expr: faas_queue_backlog_growing_over_15m:by_app > 50
+        expr: faas_queue_backlog_growing_over_15m:by_app_account > 50
         for: 15m
         labels:
           severity: warn
@@ -1675,16 +1675,15 @@ groups:
           family: alert_preset_signals
           preset: queue_backlog_growing
         annotations:
-          summary: "Gateway queue depth > 50 for app {{ $labels.app }} for 15m"
-          description: "max(gateway_queue_depth{app=\"{{ $labels.app }}\"}) by (app) has been > 50 for 15m. This is the alert_preset catalog `queue_backlog_growing` signal. Note: this metric labels on `app`, not `account_id`, so it does NOT contribute to the FaasAlertPresetAnyFiringAccount correlation rule below. Common causes: customer app wake latency exceeded the gateway queue cap, cold-boot snapshot restore failing repeatedly, or downstream Postgres contention."
+          summary: "Gateway queue depth > 50 for app {{ $labels.app }} (account {{ $labels.account_id }}) for 15m"
+          description: "max(gateway_queue_depth{app=\"{{ $labels.app }}\", account_id=\"{{ $labels.account_id }}\"}) by (app, account_id) has been > 50 for 15m. This is the alert_preset catalog `queue_backlog_growing` signal. The `account_id` label is admitted via accountLabelSet (cap=10k, overflow=`__other__`); rows past the cap roll up under `__other__` and contribute to the FaasAlertPresetAnyFiringAccount correlation under that bucket. Common causes: customer app wake latency exceeded the gateway queue cap, cold-boot snapshot restore failing repeatedly, or downstream Postgres contention."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGatewayQueueBacklogGrowing.md"
 
-      # ── Account-level correlation (4 of 5 signals) ──────────────
-      # `gateway_queue_depth` carries an `app` label, not `account_id`,
-      # so it CANNOT be aggregated by account in a single PromQL
-      # expression. The FaasAlertPresetAnyFiringAccount rule covers
-      # the 4 signals with account_id labels. The queue alert above
-      # is the only path to see queue-depth alerts in this group.
+      # ── Account-level correlation (all 5 signals) ─────────────────
+      # gateway_queue_depth now carries an account_id label (admitted
+      # via accountLabelSet; rows past the 10k cap collapse to
+      # `__other__`), so all 5 alert-preset signals contribute to this
+      # account-level rollup. Pre-PR-D this rule covered only 4 of 5.
       - alert: FaasAlertPresetAnyFiringAccount
         expr: |
           count by (account_id) (
@@ -1692,6 +1691,7 @@ groups:
             or faas_spend_eur_20_over_24h:by_account > 20
             or faas_deploy_failed_over_1h:by_account_app > 0
             or faas_cert_expiring_14d_over_24h:by_account_app < 1209600
+            or faas_queue_backlog_growing_over_15m:by_app_account > 50
           ) >= 1
         for: 5m
         labels:
@@ -1700,5 +1700,5 @@ groups:
           family: alert_preset_correlation
         annotations:
           summary: "Account {{ $labels.account_id }} has >=1 alert_preset firing"
-          description: "One or more alert_preset signal(s) for account {{ $labels.account_id }} are currently firing: api_down, spend_eur_20, deploy_failed, or cert_expiring_14d. The queue_backlog_growing signal is NOT included in this correlation (it carries an `app` label, not `account_id` — see FaasQueueBacklogGrowingApp for per-app queue alerts). The number after `count` is the breadth of the firing preset set; cross-reference per-preset alerts above for the actual signal."
+          description: "One or more alert_preset signal(s) for account {{ $labels.account_id }} are currently firing: api_down, spend_eur_20, deploy_failed, cert_expiring_14d, or queue_backlog_growing. All 5 alert-preset catalog signals contribute to this correlation; the queue signal carries an `account_id` label (admitted via accountLabelSet, overflow=`__other__`) as of PR-D. The number after `count` is the breadth of the firing preset set; cross-reference per-preset alerts above for the actual signal."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAlertPresetAnyFiringAccount.md"
