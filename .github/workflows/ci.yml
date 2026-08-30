@@ -1136,17 +1136,23 @@ jobs:
       - name: migration slot gate self-test
         run: BATS_TEST=1 ./scripts/ci/check_migration_slots.sh
       - name: migration slot collision (vs other open PRs)
-        if: github.event_name == 'pull_request'
+        # PR runs validate the new claim against sibling PRs. Main push runs
+        # repeat the same discovery so a merge does not turn a legitimate
+        # sibling-owned slot into a false contiguity failure while that PR is
+        # still waiting to merge.
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         id: migration_slots
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_REF: ${{ github.base_ref }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
         run: ./scripts/ci/check_migration_slots.sh
       # A PR may append after a contiguous migration range owned by a sibling
       # PR. The cross-PR gate above has verified those slots are claimed and
       # non-overlapping; pass that verified list to the local contiguity test.
-      # Push/main runs leave this output empty and remain strictly 1..N.
+      # Both PR and main-push runs use the verified sibling slot list. A
+      # missing slot is therefore allowed only while an open PR claims it;
+      # once that PR closes without merging, main becomes strict again.
       - name: migrations check (static)
         env:
           FAAS_MIGRATION_ALLOWED_GAPS: ${{ steps.migration_slots.outputs.external_slots }}
