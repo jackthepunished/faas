@@ -98,9 +98,9 @@ func pgJobsCreateJobTaskInstance(t *testing.T, pool *pgxpool.Pool, ctx context.C
 	}
 	nodeID := defaultLocalNodeID(t, ctx, pool)
 	row := pool.QueryRow(ctx,
-		`insert into instances (kind, job_id, app_id, deployment_id, node_id, state, ram_mb, mode)
-		 values ('job_task', $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'cold_booting', 256, 'job')
-		 returning id::text`, jobID, appID, depID, nodeID)
+		`insert into instances (kind, job_id, deployment_id, node_id, state, ram_mb, mode)
+		 values ('job_task', $1::uuid, $2::uuid, $3::uuid, 'cold_booting', 256, 'job')
+		 returning id::text`, jobID, depID, nodeID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		t.Fatalf("pgJobsCreateJobTaskInstance: %v", err)
