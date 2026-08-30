@@ -183,6 +183,36 @@ func TestLivenessRecv_LoopStopsAfterThreshold(t *testing.T) {
 	}
 }
 
+func TestLivenessRecv_CancellationDuringProbeDoesNotReport(t *testing.T) {
+	loop, sink, _ := newTestLoop(t, "inst-cancel-race", 1)
+	started := make(chan struct{})
+	loop.probeFn = func(ctx context.Context, _ int) string {
+		close(started)
+		<-ctx.Done()
+		return livenessOutcomeConnRefused
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		loop.run(ctx)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("liveness probe did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("liveness loop did not stop after cancellation")
+	}
+	if sink.count() != 0 {
+		t.Fatalf("sink.count = %d, want 0 after destroy cancellation won the race", sink.count())
+	}
+}
+
 // TestLivenessRecv_TimeoutCountedClassifies is the classification
 // pin: timeout outcome increments the counter (same code path
 // as non_200) and lands a "liveness_timeout" reason string on

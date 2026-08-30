@@ -978,6 +978,44 @@ func TestDestroyCancelsLivenessLoop(t *testing.T) {
 	}
 }
 
+func TestParkCancelsLivenessLoop(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+	registry := NewLivenessRegistry()
+	cancelled := make(chan struct{})
+	m.WithLivenessProbes(registry, LivenessProbeConfig{
+		PeriodSeconds:       5,
+		ConsecutiveFailures: 3,
+	}).WithLivenessProbeStarter(func(context.Context, string, int, string, LivenessProbeConfig) context.CancelFunc {
+		return func() {
+			select {
+			case <-cancelled:
+			default:
+				close(cancelled)
+			}
+		}
+	})
+	if _, err := m.ColdBoot(context.Background(), req("i-park")); err != nil {
+		t.Fatal(err)
+	}
+	m.startLivenessLoop(context.Background(), "i-park", 1, nil)
+
+	if _, err := m.Park(context.Background(), "i-park", SnapshotSpec{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("park did not cancel the liveness loop")
+	}
+	registry.mu.Lock()
+	remaining := len(registry.loops)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("liveness registry retains %d loop(s) after park", remaining)
+	}
+}
+
 func TestDestroyUnknownIsNoop(t *testing.T) {
 	m := newTestManager(&fakeRunner{}, &fakeVMM{})
 	if err := m.Destroy(context.Background(), "ghost"); err != nil {

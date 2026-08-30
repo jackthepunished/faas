@@ -184,12 +184,21 @@ func (l *livenessProbeLoop) run(ctx context.Context) {
 // the terminal failure threshold is reached so the outer loop can
 // stop instead of leaving a stale ticker goroutine behind.
 func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) bool {
+	if ctx.Err() != nil {
+		return true
+	}
 	start := time.Now()
 	var outcome string
 	if l.probeFn != nil {
 		outcome = l.probeFn(ctx, timeoutMs)
 	} else {
 		outcome = l.dialAndProbe(ctx, timeoutMs)
+	}
+	// Destroy/Park can cancel the loop while the vsock probe is in
+	// flight. Do not publish metrics or report a failure for an instance
+	// whose teardown already won the race.
+	if ctx.Err() != nil {
+		return true
 	}
 	elapsed := time.Since(start).Seconds()
 	l.mgr.ObserveLivenessProbe(outcome, elapsed)
@@ -244,6 +253,9 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) bool {
 		l.count++
 		l.mgr.SetLivenessConsecutiveFailures(l.instance, l.count)
 		if l.count >= l.cfg.ConsecutiveFailures {
+			if ctx.Err() != nil {
+				return true
+			}
 			// Mirror the reason the run-time classifies
 			// into the relay so the schedd side audit
 			// event names the cluster correctly.
@@ -490,6 +502,7 @@ func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slo
 	}
 	loopCtx, cancel := context.WithCancel(parent)
 	go func() {
+		defer mgr.FinishLivenessLoop(instance, loopCtx)
 		loop.run(loopCtx)
 	}()
 	return cancel

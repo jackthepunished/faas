@@ -1482,14 +1482,57 @@ type LivenessProbeConfig struct {
 // — repeated calls on the same instance id are a no-op so a Park
 // racing a Destroy can't panic.
 type LivenessRegistry struct {
-	mu    sync.Mutex
-	loops map[string]context.CancelFunc
+	mu     sync.Mutex
+	loops  map[string]livenessLoopRegistration
+	nextID uint64
+}
+
+type livenessLoopToken struct{ id uint64 }
+
+// livenessLoopTokenContextKey keeps the registry generation private to the
+// manager/cmd boundary. LivenessProbeConfig is part of the public Manager
+// API, so lifecycle bookkeeping must not grow an unexported field that would
+// break external unkeyed composite literals.
+type livenessLoopTokenContextKey struct{}
+
+type livenessLoopRegistration struct {
+	token  *livenessLoopToken
+	cancel context.CancelFunc
 }
 
 // NewLivenessRegistry constructs an empty registry. cmd/vmmd main
 // calls this once at startup; tests can construct one ad-hoc.
 func NewLivenessRegistry() *LivenessRegistry {
-	return &LivenessRegistry{loops: make(map[string]context.CancelFunc)}
+	return &LivenessRegistry{loops: make(map[string]livenessLoopRegistration)}
+}
+
+// prepareProbeLoop reserves the registry slot for a new loop and cancels
+// any previous loop for the same instance. The token lets a loop that exits
+// by itself remove only its own registration, not a replacement registered
+// during a lifecycle race.
+func (r *LivenessRegistry) prepareProbeLoop(instance string) *livenessLoopToken {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if r.loops == nil {
+		r.loops = make(map[string]livenessLoopRegistration)
+	}
+	r.nextID++
+	token := &livenessLoopToken{id: r.nextID}
+	var previousCancel context.CancelFunc
+	if prev, ok := r.loops[instance]; ok && prev.cancel != nil {
+		previousCancel = prev.cancel
+	}
+	r.loops[instance] = livenessLoopRegistration{token: token}
+	r.mu.Unlock()
+	// Cancel outside the registry lock. A CancelFunc normally only closes a
+	// context, but keeping user-provided cancellation callbacks out of the
+	// critical section prevents a callback from deadlocking on this registry.
+	if previousCancel != nil {
+		previousCancel()
+	}
+	return token
 }
 
 // StartProbeLoop registers cancelFn for instance and returns. The
@@ -1508,12 +1551,48 @@ func (r *LivenessRegistry) StartProbeLoop(instance string, cancelFn context.Canc
 	if r == nil {
 		return
 	}
+	token := r.prepareProbeLoop(instance)
+	r.startProbeLoopWithToken(instance, token, cancelFn)
+}
+
+// startProbeLoopWithToken installs the cancel function for a slot reserved by
+// prepareProbeLoop. If the loop already finished and removed its token, the
+// late registration is rejected and the returned loop is cancelled.
+func (r *LivenessRegistry) startProbeLoopWithToken(instance string, token *livenessLoopToken, cancelFn context.CancelFunc) {
+	if r == nil || token == nil {
+		if cancelFn != nil {
+			cancelFn()
+		}
+		return
+	}
+	if cancelFn == nil {
+		r.finishProbeLoop(instance, token)
+		return
+	}
+	r.mu.Lock()
+	current, ok := r.loops[instance]
+	if !ok || current.token != token {
+		r.mu.Unlock()
+		cancelFn()
+		return
+	}
+	current.cancel = cancelFn
+	r.loops[instance] = current
+	r.mu.Unlock()
+}
+
+// finishProbeLoop removes a completed loop only when its token is still the
+// active registration. This prevents an old loop's deferred cleanup from
+// deleting a newer loop for the same instance.
+func (r *LivenessRegistry) finishProbeLoop(instance string, token *livenessLoopToken) {
+	if r == nil || token == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if prev, ok := r.loops[instance]; ok {
-		prev()
+	if current, ok := r.loops[instance]; ok && current.token == token {
+		delete(r.loops, instance)
 	}
-	r.loops[instance] = cancelFn
 }
 
 // CancelProbeLoop stops the loop for the instance. Idempotent.
@@ -1525,10 +1604,16 @@ func (r *LivenessRegistry) CancelProbeLoop(instance string) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cancel, ok := r.loops[instance]; ok {
-		cancel()
+	registration, ok := r.loops[instance]
+	if ok {
 		delete(r.loops, instance)
+	}
+	r.mu.Unlock()
+	if ok && registration.cancel != nil {
+		// Invoke cancellation after removing the entry. A concurrent loop
+		// completion cannot leave a stale registration behind, and a custom
+		// cancel callback cannot re-enter the registry while it is locked.
+		registration.cancel()
 	}
 }
 
@@ -1567,7 +1652,7 @@ func (m *Manager) WithLivenessProbes(reg *LivenessRegistry, defaultCfg LivenessP
 //     override=off)
 //
 // The cmd/vmmd liveness_recv.start helper builds the loop body and
-// invokes r.StartProbeLoop to register the cancel func. We don't
+// returns its cancel func for the registry. We don't
 // construct the loop here because the loop body binds cmd-level
 // types (slog, vsock, wire envelope).
 func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot int, override json.RawMessage) {
@@ -1642,6 +1727,7 @@ func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot i
 			"instance", instance)
 		return
 	}
+	token := m.livenessRegistry.prepareProbeLoop(instance)
 	parent := m.lifecycleCtx //nolint:contextcheck // this is the daemon-owned lifecycle context, intentionally outliving the wake RPC.
 	if parent == nil {
 		// Managers constructed outside cmd/vmmd still get the safe
@@ -1649,9 +1735,16 @@ func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot i
 		// for a successfully running VM.
 		parent = context.WithoutCancel(ctx)
 	}
+	// Keep the generation token on the private lifecycle context rather than
+	// exposing it through LivenessProbeConfig. The cmd-level starter derives
+	// its loop context from parent, so the terminal defer can clean up only
+	// the registration belonging to that exact loop generation.
+	parent = context.WithValue(parent, livenessLoopTokenContextKey{}, token)
 	cancelFn := m.livenessStarter(parent, instance, slot, deploymentID, cfg)
 	if cancelFn != nil {
-		m.livenessRegistry.StartProbeLoop(instance, cancelFn)
+		m.livenessRegistry.startProbeLoopWithToken(instance, token, cancelFn)
+	} else {
+		m.livenessRegistry.finishProbeLoop(instance, token)
 	}
 }
 
@@ -1665,6 +1758,21 @@ func (m *Manager) cancelLivenessLoop(instance string) {
 		return
 	}
 	m.livenessRegistry.CancelProbeLoop(instance)
+}
+
+// FinishLivenessLoop removes a loop that reached a terminal condition or
+// stopped because vmmd is shutting down. The private token is carried on the
+// loop context, so an old loop cannot remove a replacement loop that reused
+// the same instance key during a lifecycle race.
+func (m *Manager) FinishLivenessLoop(instance string, ctx context.Context) {
+	if m == nil || m.livenessRegistry == nil {
+		return
+	}
+	var token *livenessLoopToken
+	if ctx != nil {
+		token, _ = ctx.Value(livenessLoopTokenContextKey{}).(*livenessLoopToken)
+	}
+	m.livenessRegistry.finishProbeLoop(instance, token)
 }
 
 // MarkInstanceFrameworkReady stamps the per-instance
@@ -3278,6 +3386,11 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	if !ok {
 		return SnapshotInfo{}, fmt.Errorf("park %s: not live", instance)
 	}
+	// Stop liveness before pausing/snapshotting. A parked VM is expected to
+	// stop answering probes; leaving the loop active through Snapshot lets it
+	// race this teardown and report a second failure for the same instance.
+	m.DeleteLivenessConsecutiveFailures(instance)
+	m.cancelLivenessLoop(instance)
 
 	info, err := m.vmm.Snapshot(ctx, inst.Lease, spec)
 	if err != nil {
@@ -3297,18 +3410,6 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	// whose Lease.Slot was just freed.
 	delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
 	m.mu.Unlock()
-	// Drop the per-instance liveness gauge entry (issue #554 /
-	// ADR-078). The gauge's {instance} label is high cardinality —
-	// a parked instance's row should not stay in the registry
-	// forever. The poll goroutine reading the gauge sees a
-	// DeleteLabelValues call as a clean "not tracked" state.
-	m.DeleteLivenessConsecutiveFailures(instance)
-	// Cancel the per-instance probe loop (issue #554 / ADR-078 /
-	// PR review fix). Idempotent; no-op when the registry is nil.
-	// Runs after the gauge delete so a Park racing a Wake's
-	// startLivenessLoop sees a coherent state (cancel after the
-	// loop has registered).
-	m.cancelLivenessLoop(instance)
 	m.cleanup(ctx, inst.Lease, inst.Net, inst.WorkloadNames)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
 	return info, nil
