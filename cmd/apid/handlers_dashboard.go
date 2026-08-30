@@ -745,7 +745,7 @@ func (s *server) fetchDashboardAlerts(ctx context.Context, log *slog.Logger, acc
 		} else {
 			item.LastFiredAtLabel = dashboardEmDash
 		}
-		deliveries, derr := s.store.ListAlertDeliveriesForRule(ctx, rule.ID, 5)
+		deliveries, derr := s.store.ListAlertDeliveriesForRule(ctx, rule.ID, 5, false)
 		if derr != nil {
 			// Per-rule read failure is non-fatal — log once and
 			// render an empty recent-deliveries row for that rule.

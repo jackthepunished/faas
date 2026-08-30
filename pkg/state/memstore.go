@@ -14053,17 +14053,26 @@ func (m *MemStore) UpdateAlertDeliveryStatus(_ context.Context, id string, statu
 	return ErrNotFound
 }
 
-func (m *MemStore) ListAlertDeliveriesForRule(_ context.Context, ruleID string, limit int) ([]AlertDelivery, error) {
+func (m *MemStore) ListAlertDeliveriesForRule(_ context.Context, ruleID string, limit int, includeTest bool) ([]AlertDelivery, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
+	// Mirrors PgStore's two-path read: includeTest=false mirrors the
+	// partial-index production read (test rows hidden), includeTest=true
+	// surfaces Dispatcher.DispatchTest writes for the operator pane.
+	// See migrations/00528_alert_deliveries_is_test.sql for the column
+	// rationale and the partial-index shape.
 	var out []AlertDelivery
 	for _, d := range m.alertDeliveries {
-		if d.RuleID == ruleID {
-			out = append(out, d)
+		if d.RuleID != ruleID {
+			continue
 		}
+		if !includeTest && d.IsTest {
+			continue
+		}
+		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FiredAt.After(out[j].FiredAt) })
 	if len(out) > limit {

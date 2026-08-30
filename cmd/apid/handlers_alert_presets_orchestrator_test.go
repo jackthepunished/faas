@@ -190,6 +190,31 @@ func TestSendTestAlertPresetCore_DispatchesTestTrue(t *testing.T) {
 	if !gotRule.LastFiredAt.IsZero() {
 		t.Errorf("test alert mutated last_fired_at on rule %q — cooldown tracker would think the test was a real fire", rule.ID)
 	}
+
+	// ADR-123 PR-D: the test path now writes an alert_deliveries
+	// row with is_test=true so the operator pane
+	// (?include_test=true) can reach it. Production-default read
+	// (include_test=false) MUST still hide it. Asserts both halves.
+	deliveries, err := store.ListAlertDeliveriesForRule(context.Background(), rule.ID, 10, false)
+	if err != nil {
+		t.Fatalf("ListAlertDeliveriesForRule(includeTest=false): %v", err)
+	}
+	if len(deliveries) != 0 {
+		t.Errorf("production-default read returned %d test rows; want 0 (test rows must be hidden behind include_test=true)", len(deliveries))
+	}
+	allDeliveries, err := store.ListAlertDeliveriesForRule(context.Background(), rule.ID, 10, true)
+	if err != nil {
+		t.Fatalf("ListAlertDeliveriesForRule(includeTest=true): %v", err)
+	}
+	if len(allDeliveries) != 1 {
+		t.Fatalf("operator read returned %d rows; want 1 (the test row)", len(allDeliveries))
+	}
+	if !allDeliveries[0].IsTest {
+		t.Errorf("ledger row IsTest = false; want true (Dispatcher.DispatchTest must stamp the discriminator)")
+	}
+	if allDeliveries[0].ID != res.DeliveryID {
+		t.Errorf("ledger row ID = %q; want %q (must match the deliveryID returned to the customer)", allDeliveries[0].ID, res.DeliveryID)
+	}
 }
 
 // TestSendTestAlertPresetCore_NoRule pins the 404 path: customer

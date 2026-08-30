@@ -9483,7 +9483,7 @@ func (s *PgStore) SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, 
 
 const alertDeliverySelectCols = `id, rule_id, account_id, app_id, idempotency_key, payload,
        status, attempt_count, last_status_code, last_error,
-       observed_value, fired_at, delivered_at`
+       observed_value, fired_at, delivered_at, is_test`
 
 func scanAlertDelivery(row pgx.Row) (AlertDelivery, error) {
 	d := AlertDelivery{}
@@ -9497,7 +9497,7 @@ func scanAlertDelivery(row pgx.Row) (AlertDelivery, error) {
 	if err := row.Scan(
 		&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
 		&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
-		&d.FiredAt, &deliveredAt,
+		&d.FiredAt, &deliveredAt, &d.IsTest,
 	); err != nil {
 		return AlertDelivery{}, err
 	}
@@ -9536,7 +9536,7 @@ func scanAlertDeliveries(rows pgx.Rows) ([]AlertDelivery, error) {
 		if err := rows.Scan(
 			&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
 			&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
-			&d.FiredAt, &deliveredAt,
+			&d.FiredAt, &deliveredAt, &d.IsTest,
 		); err != nil {
 			return nil, err
 		}
@@ -9591,16 +9591,16 @@ func (s *PgStore) RecordAlertDelivery(ctx context.Context, in AlertDelivery) (Al
 		insert into alert_deliveries (
 			rule_id, account_id, app_id, idempotency_key, payload,
 			status, attempt_count, last_status_code, last_error,
-			observed_value, fired_at, delivered_at
+			observed_value, fired_at, delivered_at, is_test
 		) values (
 			$1, $2, $3, $4, $5,
 			coalesce($6, 'pending'), $7, $8, $9,
-			$10, coalesce($11, now()), $12
+			$10, coalesce($11, now()), $12, $13
 		)
 		returning `+alertDeliverySelectCols,
 		in.RuleID, in.AccountID, appIDArg, in.IdempotencyKey, []byte(in.Payload),
 		statusArg, in.AttemptCount, in.LastStatusCode, lastErrorArg,
-		in.ObservedValue, in.FiredAt, deliveredAtArg,
+		in.ObservedValue, in.FiredAt, deliveredAtArg, in.IsTest,
 	)
 	d, err := scanAlertDelivery(row)
 	if err != nil {
@@ -9643,13 +9643,26 @@ func (s *PgStore) UpdateAlertDeliveryStatus(ctx context.Context, id string, stat
 	return nil
 }
 
-func (s *PgStore) ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int) ([]AlertDelivery, error) {
+func (s *PgStore) ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int, includeTest bool) ([]AlertDelivery, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	rows, err := s.pool.Query(ctx,
-		`select `+alertDeliverySelectCols+` from alert_deliveries
-		 where rule_id = $1 order by fired_at desc limit $2`, ruleID, limit)
+	// includeTest=false → the production hot path; covered by the
+	// partial index alert_deliveries_rule_fired_production_idx
+	// (migrations/00528) so this stays index-only even as test
+	// rows accumulate. includeTest=true → unconditional read; the
+	// full alert_deliveries_rule_fired_idx covers the predicate.
+	var rows pgx.Rows
+	var err error
+	if includeTest {
+		rows, err = s.pool.Query(ctx,
+			`select `+alertDeliverySelectCols+` from alert_deliveries
+			 where rule_id = $1 order by fired_at desc limit $2`, ruleID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select `+alertDeliverySelectCols+` from alert_deliveries
+			 where rule_id = $1 and is_test = false order by fired_at desc limit $2`, ruleID, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
