@@ -44,7 +44,11 @@ type server struct {
 	store  state.Store
 	log    *slog.Logger
 	domain string // apps base domain for URLs
-	notif  Notifier
+	// cliAuthURLBase is the absolute API origin used by the CLI device-code
+	// response. It must not be derived from domain: AppsDomain is the app
+	// wildcard/frontend host, while /cli-auth is served by the API host.
+	cliAuthURLBase string
+	notif          Notifier
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
 	// for the v1 HMAC. Empty disables signature verification (dev mode).
 	stripeWebhookSecret string
@@ -460,6 +464,15 @@ func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 	return s
 }
 
+// WithCLIAuthURLBase attaches the API origin used in browser URLs returned by
+// the CLI device-code endpoint. The setter keeps existing positional server
+// constructors source-compatible while allowing production config to supply
+// a provider-specific API hostname.
+func (s *server) WithCLIAuthURLBase(base string) *server {
+	s.cliAuthURLBase = normalizeCLIAuthURLBase(base)
+	return s
+}
+
 // WithEventsPlatform attaches the pkg/events.Platform
 // (issue #517 / PR-C / ADR-064). When non-nil, the deploy
 // handler emits wake.deploy_failed on the events table for
@@ -713,6 +726,7 @@ func newServerWithDeps(
 		store:                  store,
 		log:                    log,
 		domain:                 domain,
+		cliAuthURLBase:         defaultCLIAuthURLBase,
 		notif:                  notif,
 		stripeWebhookSecret:    stripeSecret,
 		mailer:                 mailer,
@@ -2217,7 +2231,7 @@ func (s *server) handler() http.Handler {
 	// the CLI hasn't logged in yet. Anti-enumeration limiter is its
 	// own bucket (s.cliAuthLimiter) so brute-force on /v1/cli-auth/*
 	// doesn't burn the API-key auth budget at the top of this file.
-	cli := &cliAuthHandlers{srv: s, log: s.log, domain: s.domain}
+	cli := &cliAuthHandlers{srv: s, log: s.log, domain: s.domain, urlBase: s.cliAuthURLBase}
 	mux.Handle("POST /v1/cli-auth/code", s.cliAuthChain(http.HandlerFunc(cli.mintCliAuthCode)))
 	mux.Handle("POST /v1/cli-auth/exchange", s.cliAuthChain(http.HandlerFunc(cli.exchangeCliAuthCode)))
 	// Dashboard-side GET shares the dashboard auth bucket (it renders
