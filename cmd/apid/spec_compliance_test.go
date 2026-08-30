@@ -131,6 +131,12 @@ var routeExclude = map[string]bool{
 	"POST /dashboard/apps/{slug}/crons/{id}/fire-now":         true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
 	"POST /dashboard/apps/{slug}/deployments/{id}/retry":      true, // HTML form, per-stage retry (ADR-117 §Production-ready follow-on C4); CSRF sealed envelope, no SDK twin
 	"POST /dashboard/apps/{slug}/alert-presets/{name}/enable": true, // ADR-123 — dashboard form post; programatic enable is /v1 with SDK wrapper EnableAlertPreset
+	// Issue #1233 / ADR-123 PR-C commit 2 — "Send test alert" form
+	// (session-cookie dashboard twin of the JSON route). Mirror the
+	// cmd/sdk-coverage/main.go::routeExclude entry for the same
+	// route — both lists must move together (session-cookie auth
+	// surface, no SDK wrapper, no programmatic bearer-key entrypoint).
+	"POST /dashboard/apps/{slug}/alert-presets/{name}/test": true,
 	// ADR-124 affected-workloads preview. Dashboard HTML form endpoints
 	// parallel to the cron fire-now + retry entries. The /preview POST
 	// re-renders the preview; /preview/apply commits. Both share the

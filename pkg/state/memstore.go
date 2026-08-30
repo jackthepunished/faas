@@ -2895,6 +2895,22 @@ func (m *MemStore) ListInstancesByNodeID(_ context.Context, nodeID string) ([]In
 	return out, nil
 }
 
+// FailRunningInstanceIfOwnedByNode mirrors PgStore's conditional healthy-node
+// stale-instance transition. ErrConflict represents a state/node race.
+func (m *MemStore) FailRunningInstanceIfOwnedByNode(_ context.Context, id, nodeID string, terminalAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok || ins.NodeID != nodeID || ins.State != string(StateRunning) {
+		return ErrConflict
+	}
+	ins.State = string(StateFailed)
+	ts := terminalAt
+	ins.TerminalAt = &ts
+	m.instances[id] = ins
+	return nil
+}
+
 // ListOwnedCronsByNodeID mirrors pkg/state/pgstore.go:891. Same
 // in-process predicate; crons are 5-column rows keyed by app_id.
 func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]Cron, error) {
@@ -13018,6 +13034,40 @@ func (m *MemStore) AlertRuleByID(_ context.Context, id string) (AlertRule, error
 	return r, nil
 }
 
+// AlertRuleByAccountAppAndPresetName mirrors the pgstore
+// implementation (issue #1233 / ADR-123 PR-C "Send test alert"
+// button). The memstore scans both maps under a single lock:
+// alert_presets for the catalog DisplayName, then alert_rules for
+// the LIKE prefix. Memstore has no concurrent writer, but the
+// outer mu.Lock matches the rest of the alert_rule accessors.
+func (m *MemStore) AlertRuleByAccountAppAndPresetName(_ context.Context, accountID, appID, presetName string) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	preset, ok := m.alertPresets[presetName]
+	if !ok {
+		return AlertRule{}, ErrNotFound
+	}
+	prefix := preset.DisplayName + " ("
+	var matched []AlertRule
+	for _, r := range m.alertRules {
+		if r.AccountID == accountID && r.AppID == appID && strings.HasPrefix(r.Name, prefix) {
+			matched = append(matched, r)
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return AlertRule{}, ErrNotFound
+	case 1:
+		return matched[0], nil
+	default:
+		// Same defensive ErrConflict as the pgstore — catalog
+		// display_name uniqueness + the
+		// (account_id, app_id, name) UNIQUE constraint make this
+		// unreachable.
+		return AlertRule{}, ErrConflict
+	}
+}
+
 // UpdateAlertRule mirrors the PgStore's nil-skip semantics. The
 // MemStore holds a deep-copy of the row so the caller's mutation
 // after return doesn't bleed into the next read.
@@ -13526,6 +13576,22 @@ func (m *MemStore) ListAlertPresets(_ context.Context) ([]AlertPreset, error) {
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+// SeedAlertPresetForTest inserts (or upserts) a single alert_presets
+// row into the in-memory catalog. Mirrors the test-only Invoice
+// seeder above; used by orchestrator tests that exercise the
+// preset-then-instantiate flow (issue #1233 / ADR-123 PR-C
+// commit 2 fix: end-to-end coverage for sendTestAlertPresetCore).
+// Production callers must NOT use this — the catalog is owned by
+// migrations/00418_alert_presets_seed.sql at deploy time.
+func (m *MemStore) SeedAlertPresetForTest(p AlertPreset) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p.ID == "" {
+		p.ID = newID()
+	}
+	m.alertPresets[p.Name] = p
 }
 
 // AlertPresetByName scans the map (8 rows). O(N) is acceptable

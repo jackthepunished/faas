@@ -302,6 +302,7 @@ export type { SweepStuckBuildsResponse } from './SweepStuckBuildsResponse.js';
 export type { TemplateView } from './TemplateView.js';
 export type { TenantHostnameResponse } from './TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './TenantSurfaceResponse.js';
+export type { TestAlertPresetResponse } from './TestAlertPresetResponse.js';
 export type { ThrottlePreviewRow } from './ThrottlePreviewRow.js';
 export type { ThrottleSuggestionRow } from './ThrottleSuggestionRow.js';
 export type { ThrottleSuggestionsResponse } from './ThrottleSuggestionsResponse.js';
