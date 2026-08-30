@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -9,25 +9,47 @@ from attrs import field as _attrs_field
 from ..models.canary_preset_spec_preset import CanaryPresetSpecPreset, check_canary_preset_spec_preset
 from ..types import UNSET, Unset
 
+if TYPE_CHECKING:
+    from ..models.custom_stage import CustomStage
+
+
 T = TypeVar("T", bound="CanaryPresetSpec")
 
 
 @_attrs_define
 class CanaryPresetSpec:
-    """Progressive canary rollout preset requested on deployment creation (issue #976 / ADR-122)."""
+    """The canary ladder a customer asks for on a deploy (issue
+    #976 / ADR-122 / SAFE-RELEASES-A + production-leveling
+    Stream F). Preset is the catalog name from
+    pkg/api/canary (none/slow/balanced/aggressive/1-10-50-100/
+    custom). When Preset is 'custom', Stages is the
+    customer-supplied ladder (each entry is percent +
+    duration string in time.ParseDuration form, e.g.
+    "1% at 30s, 10% at 2m, 100% at 0s").
+    The wire-format change (StepDurations removed, Stages
+    added) is additive on the consumer side because the
+    prior StepDurations field was declared-but-dead — no
+    pre-PR client ever sent it.
+
+    """
 
     preset: CanaryPresetSpecPreset
-    """Closed-set canary ladder catalog name."""
-    step_durations: list[int] | Unset = UNSET
-    """Optional step durations encoded as Go time.Duration nanoseconds; reserved for custom-ladder support."""
+    """Catalog preset name. 'none' = no canary (server stamps canary_preset='none', canary_total_steps=0). 'custom'
+    requires Stages to be non-empty."""
+    stages: list[CustomStage] | Unset = UNSET
+    """Per-stage ladder. Required when preset='custom' (the apid handler 422s otherwise); ignored for catalog
+    presets (the catalog resolution runs server-side)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         preset: str = self.preset
 
-        step_durations: list[int] | Unset = UNSET
-        if not isinstance(self.step_durations, Unset):
-            step_durations = self.step_durations
+        stages: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.stages, Unset):
+            stages = []
+            for stages_item_data in self.stages:
+                stages_item = stages_item_data.to_dict()
+                stages.append(stages_item)
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -36,21 +58,30 @@ class CanaryPresetSpec:
                 "preset": preset,
             }
         )
-        if step_durations is not UNSET:
-            field_dict["step_durations"] = step_durations
+        if stages is not UNSET:
+            field_dict["stages"] = stages
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.custom_stage import CustomStage
+
         d = dict(src_dict)
         preset = check_canary_preset_spec_preset(d.pop("preset"))
 
-        step_durations = cast(list[int], d.pop("step_durations", UNSET))
+        _stages = d.pop("stages", UNSET)
+        stages: list[CustomStage] | Unset = UNSET
+        if _stages is not UNSET:
+            stages = []
+            for stages_item_data in _stages:
+                stages_item = CustomStage.from_dict(stages_item_data)
+
+                stages.append(stages_item)
 
         canary_preset_spec = cls(
             preset=preset,
-            step_durations=step_durations,
+            stages=stages,
         )
 
         canary_preset_spec.additional_properties = d

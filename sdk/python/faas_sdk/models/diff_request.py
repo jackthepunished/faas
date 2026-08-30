@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -55,6 +55,9 @@ class DiffRequest:
     """
     crons: list[CreateCronRequest] | Unset = UNSET
     edge_rules: list[CreateEdgeRuleRequest] | Unset = UNSET
+    scope: None | str | Unset = UNSET
+    """Pending per-deployment env scope (ADR-091 / SAFE-RELEASES production-leveling Stream E). Compared against
+    Baseline.LatestScope; mismatch emits a scope_mismatch break. Empty = default."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,6 +89,12 @@ class DiffRequest:
                 edge_rules_item = edge_rules_item_data.to_dict()
                 edge_rules.append(edge_rules_item)
 
+        scope: None | str | Unset
+        if isinstance(self.scope, Unset):
+            scope = UNSET
+        else:
+            scope = self.scope
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -101,6 +110,8 @@ class DiffRequest:
             field_dict["crons"] = crons
         if edge_rules is not UNSET:
             field_dict["edge_rules"] = edge_rules
+        if scope is not UNSET:
+            field_dict["scope"] = scope
 
         return field_dict
 
@@ -154,6 +165,15 @@ class DiffRequest:
 
                 edge_rules.append(edge_rules_item)
 
+        def _parse_scope(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        scope = _parse_scope(d.pop("scope", UNSET))
+
         diff_request = cls(
             app_config=app_config,
             image=image,
@@ -161,6 +181,7 @@ class DiffRequest:
             env_by_scope=env_by_scope,
             crons=crons,
             edge_rules=edge_rules,
+            scope=scope,
         )
 
         diff_request.additional_properties = d

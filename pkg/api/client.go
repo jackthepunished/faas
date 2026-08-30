@@ -1115,6 +1115,21 @@ func (c *Client) RollbackTo(ctx context.Context, slug, targetDeploymentID string
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", body, &out)
 }
 
+// ListDeploymentAudit returns the deployment_audit timeline for
+// one deployment (issue #976 / ADR-122 / SAFE-RELEASES-E.2 +
+// production-leveling Stream A). The handler
+// (cmd/apid/handlers_audit.go::listDeploymentAudit) caps the
+// page at listAuditEventsLimitMax (100) — pass a smaller limit
+// for paginated iteration. Newest-first ordering matches the
+// (deployment_id, at DESC) index on the table
+// (migrations/00477_deployment_audit.sql).
+func (c *Client) ListDeploymentAudit(ctx context.Context, deploymentID string, limit int) (ListDeploymentAuditResponse, error) {
+	var out ListDeploymentAuditResponse
+	return out, c.do(ctx, "GET",
+		fmt.Sprintf("/v1/deployments/%s/audit?limit=%d", deploymentID, limit),
+		nil, &out)
+}
+
 // UpdateDeploymentTraffic stamps the per-deployment traffic-split
 // weight (issue #556 PR-A). percent must be in [0, 100]; the
 // handler enforces the range (422) and the plan gate (403,

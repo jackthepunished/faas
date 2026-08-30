@@ -54,7 +54,7 @@ export type CreateDeploymentRequest = {
    */
   rollback_on_5xx?: boolean | null;
   /**
-   * Progressive canary rollout preset. nil/omitted = the historical single-step 100% deployment path; Pro/Scale only.
+   * Per-deployment canary ladder (issue #976 / ADR-122 / SAFE-RELEASES-A). nil/omitted = server default 'none'. For preset='custom', stages carries the customer ladder.
    */
   canary?: (CanaryPresetSpec | null);
 };

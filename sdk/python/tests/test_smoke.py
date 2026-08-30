@@ -30,7 +30,13 @@ from faas_sdk import (
     FaaSClient,
     is_faas_error,
 )
-from faas_sdk.models import CreateAppRequest, Problem
+from faas_sdk.models import (
+    CancelDeploymentRequest,
+    ClearObsoleteDeploymentsBody,
+    CreateAppRequest,
+    Problem,
+    ReorderDeploymentBody,
+)
 
 # UUIDv4 hex shape: 8-4-4-4-12 lower-case.
 _UUID4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
@@ -228,5 +234,202 @@ def test_with_idempotency_key_scopes_explicit_key(fakeapid) -> None:
             innermost.handle_request = original_handle  # type: ignore[method-assign]
 
         assert captured["idempotency"] == STABLE_IDEMPOTENCY_KEY
+    finally:
+        client.close()
+
+
+# --- ADR-124 deployment queue controls (PR #1024 SDK surface) --------------
+#
+# Four happy paths and four error paths through the generated
+# deployments service. The fakeapid routes mirror the canonical wire
+# shapes from api/openapi.yaml:4420-4535 — body shapes are byte-identical
+# so the SDK decoder exercises the real codepath.
+
+
+def test_cancel_deployment_happy_path(fakeapid) -> None:
+    """`POST /v1/apps/{slug}/deployments/{id}/cancel` returns a
+    parsed CancelDeploymentResponse with status=cancelled.
+    """
+    from faas_sdk.api.deployments import cancel_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        body = cancel_deployment.sync(
+            client=client.inner,
+            slug="hello-world",
+            id="dep-fixture-1",
+            body=CancelDeploymentRequest(reason="user"),
+        )
+        assert body is not None
+        assert not isinstance(body, Problem)
+        assert body.id == "dep-fixture-1"
+        assert body.status == "cancelled"
+        assert body.cancel_reason == "user"
+        assert body.cancelled_builds == []
+    finally:
+        client.close()
+
+
+def test_reorder_deployment_happy_path(fakeapid) -> None:
+    """`POST /v1/deployments/{id}/reorder` echoes the priority."""
+    from faas_sdk.api.deployments import reorder_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        body = reorder_deployment.sync(
+            client=client.inner,
+            id="dep-fixture-2",
+            body=ReorderDeploymentBody(priority=0),
+        )
+        assert body is not None
+        assert not isinstance(body, Problem)
+        assert body.id == "dep-fixture-2"
+        assert body.priority == 0
+    finally:
+        client.close()
+
+
+def test_clear_deployment_happy_path(fakeapid) -> None:
+    """`DELETE /v1/deployments/{id}` returns 200 with deleted:true.
+    The Python generator declares no return type for clear_deployment
+    (the OpenAPI spec describes a 200 with body but no $ref) so we
+    assert only that no exception is raised.
+    """
+    from faas_sdk.api.deployments import clear_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        clear_deployment.sync(client=client.inner, id="dep-fixture-3")
+    finally:
+        client.close()
+
+
+def test_clear_obsolete_deployments_happy_path(fakeapid) -> None:
+    """`POST /v1/apps/{slug}/deployments/clear-obsolete` returns a
+    parsed ClearObsoleteReport with count=3.
+    """
+    from faas_sdk.api.deployments import clear_obsolete_deployments
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        body = clear_obsolete_deployments.sync(
+            client=client.inner,
+            slug="hello-world",
+            body=ClearObsoleteDeploymentsBody(older_than="168h"),
+        )
+        assert body is not None
+        assert not isinstance(body, Problem)
+        assert body.app_slug == "hello-world"
+        assert body.count == 3
+        assert body.older_than == "168h"
+    finally:
+        client.close()
+
+
+def test_cancel_deployment_unknown_slug_raises_err_not_found(fakeapid) -> None:
+    """`POST /v1/apps/missing-app-404/deployments/{id}/cancel`
+    returns a 404 RFC 7807 envelope; the wrapper surfaces ErrNotFound.
+    """
+    from faas_sdk.api.deployments import cancel_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(ErrNotFound) as excinfo:
+            cancel_deployment.sync(
+                client=client.inner,
+                slug="missing-app-404",
+                id="dep-1",
+                body=CancelDeploymentRequest(reason="user"),
+            )
+        assert excinfo.value.problem.status == 404
+        assert excinfo.value.problem.code == "not_found"
+    finally:
+        client.close()
+
+
+def test_reorder_deployment_out_of_range_returns_409(fakeapid) -> None:
+    """`POST /v1/deployments/{id}/reorder` with priority > 1000
+    returns 409 with code "deployment_reorder_priority_invalid".
+    The Python SDK surfaces 409s as a generic FaasProblemError
+    (the closed ErrNotFound / ErrConflict set covers not_found +
+    conflict only; the per-op 409 codes aren't typed).
+    """
+    from faas_sdk import FaasProblemError
+    from faas_sdk.api.deployments import reorder_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(FaasProblemError) as excinfo:
+            reorder_deployment.sync(
+                client=client.inner,
+                id="dep-fixture-1",
+                body=ReorderDeploymentBody(priority=9999),
+            )
+        err = excinfo.value
+        assert err.problem.status == 409
+        assert err.problem.code == "deployment_reorder_priority_invalid"
+    finally:
+        client.close()
+
+
+def test_clear_deployment_live_returns_409(fakeapid) -> None:
+    """`DELETE /v1/deployments/live-1` returns 409 with code
+    "deployment_cancel_live_forbidden".
+    """
+    from faas_sdk import FaasProblemError
+    from faas_sdk.api.deployments import clear_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(FaasProblemError) as excinfo:
+            clear_deployment.sync(client=client.inner, id="live-1")
+        err = excinfo.value
+        assert err.problem.status == 409
+        assert err.problem.code == "deployment_cancel_live_forbidden"
+    finally:
+        client.close()
+
+
+def test_cancel_deployment_live_returns_409(fakeapid) -> None:
+    """`POST /v1/apps/hello-world/deployments/live-1/cancel` returns
+    409 with code "deployment_cancel_live_forbidden". Mirrors the
+    DELETE branch's live-1 handling — fakeapid enforces the same
+    409 path on both ops so the SDK error surface stays consistent.
+    """
+    from faas_sdk import FaasProblemError
+    from faas_sdk.api.deployments import cancel_deployment
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(FaasProblemError) as excinfo:
+            cancel_deployment.sync(
+                client=client.inner,
+                slug="hello-world",
+                id="live-1",
+                body=CancelDeploymentRequest(reason="user"),
+            )
+        err = excinfo.value
+        assert err.problem.status == 409
+        assert err.problem.code == "deployment_cancel_live_forbidden"
+    finally:
+        client.close()
+
+
+def test_clear_obsolete_deployments_unknown_slug_raises_err_not_found(fakeapid) -> None:
+    """`POST /v1/apps/missing-app-404/deployments/clear-obsolete`
+    returns 404; the wrapper surfaces ErrNotFound.
+    """
+    from faas_sdk.api.deployments import clear_obsolete_deployments
+
+    client = FaaSClient(base_url=fakeapid.base_url, token="test-token")
+    try:
+        with pytest.raises(ErrNotFound) as excinfo:
+            clear_obsolete_deployments.sync(
+                client=client.inner,
+                slug="missing-app-404",
+                body=ClearObsoleteDeploymentsBody(older_than="168h"),
+            )
+        assert excinfo.value.problem.status == 404
+        assert excinfo.value.problem.code == "not_found"
     finally:
         client.close()

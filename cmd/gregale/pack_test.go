@@ -172,8 +172,10 @@ func TestDetectNestedMarkerHint(t *testing.T) {
 		{"vendor_ignored", []string{"vendor/x/go.mod"}, false},
 		{"__pycache___ignored", []string{"__pycache__/x/requirements.txt"}, false},
 
-		// Depth-3+ is intentionally out of scope — pkg/reposcan handles it.
-		{"depth_3_returns_false", []string{"apps/services/api/package.json"}, false},
+		// Depth-3 now visible (issue #1182 §P1 follow-up). Depth-4+
+		// remains out of scope — pkg/reposcan handles it.
+		{"depth_3_returns_true", []string{"apps/services/api/package.json"}, true},
+		{"depth_4_still_out_of_scope", []string{"apps/web/services/api/package.json"}, false},
 
 		// Empty / README-only — nothing to hint at.
 		{"empty_dir", nil, false},
@@ -326,7 +328,7 @@ func TestPackDirToTarGz_TopLevelDirAndCount(t *testing.T) {
 	writeFile(t, dir, "src/index.js", "console.log(1)")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -357,7 +359,7 @@ func TestPackDirToTarGz_Excludes(t *testing.T) {
 	writeFile(t, dir, ".DS_Store", "junk")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -392,7 +394,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err == nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err == nil {
 		t.Fatal("packDirToTarGz should reject a symlink, got nil error")
 	}
 }
@@ -400,7 +402,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 func TestPackDirToTarGz_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest, nil)
+	n, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("pack empty: %v", err)
 	}
@@ -424,7 +426,7 @@ func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
 	// 110 × 1 MiB of crypto-random bytes (110 MiB raw, ~110 MiB after gzip).
 	// Each file is well under the per-file cap (100 MiB), so the total-cap
 	// stat check is what trips.
-	const totalFiles = zeroConfigSourceCapMB + 10
+	const totalFiles = defaultZeroConfigSourceCapMB + 10
 	for i := 0; i < totalFiles; i++ {
 		chunk := make([]byte, oneMiB)
 		if _, err := io.ReadFull(crypto_rand.Reader, chunk); err != nil {
@@ -434,7 +436,7 @@ func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest, nil)
+	_, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
 		t.Fatal("packDirToTarGz should reject total size > cap, got nil error")
 	}
@@ -451,19 +453,58 @@ func TestPackDirToTarGz_PerFileCap(t *testing.T) {
 		t.Skip("per-file cap test materialises a > cap file")
 	}
 	dir := t.TempDir()
-	huge := make([]byte, zeroConfigSourceCapMB*1024*1024)
+	// Strictly larger than cap so the LimitReader guard trips. Prior to
+	// the LimitReader fix in copyRegular the test materialised exactly
+	// cap bytes; the new code allows exactly-at-cap (LimitReader(cap+1)
+	// reads at most cap+1, and `n > cap` rejects only strictly larger).
+	huge := make([]byte, (defaultZeroConfigSourceCapMB+1)*1024*1024)
 	if _, err := io.ReadFull(crypto_rand.Reader, huge); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
 	writeFileBytes(t, filepath.Join(dir, "blob.bin"), huge)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest, nil)
+	_, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
-		t.Fatal("packDirToTarGz should reject a single file >= per-file cap, got nil")
+		t.Fatal("packDirToTarGz should reject a single file > per-file cap, got nil")
 	}
 	if !strings.Contains(err.Error(), "per-file cap") {
 		t.Errorf("expected per-file cap error; got %v", err)
+	}
+}
+
+// TestPackDirToTarGz_PerFileCapExactlyAtCap pins the boundary semantics
+// of the LimitReader guard in copyRegular: a file whose size is exactly
+// capBytes (post-compression) is ALLOWED, and only strictly-larger files
+// are rejected. The pre-fix code used a post-hoc `>= warnBytes` check
+// after io.Copy(tw, f) and rejected exactly-at-cap; the LimitReader fix
+// (issue #1182) changes that to `> cap` so the cap is now a permissive
+// ceiling rather than a hard exclusion.
+func TestPackDirToTarGz_PerFileCapExactlyAtCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("per-file cap boundary test materialises a cap-sized file")
+	}
+	dir := t.TempDir()
+	atCap := make([]byte, defaultZeroConfigSourceCapMB*1024*1024)
+	if _, err := io.ReadFull(crypto_rand.Reader, atCap); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	writeFileBytes(t, filepath.Join(dir, "blob.bin"), atCap)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
+		// Random bytes don't compress, so the on-disk tarball will be
+		// near capBytes and trip the TOTAL cap check downstream even
+		// though the per-file LimitReader allowed it. That's the
+		// downstream total-cap gate doing its job, not a per-file
+		// regression — assert the error is the total cap, not per-file.
+		if strings.Contains(err.Error(), "per-file cap") {
+			t.Fatalf("exactly-at-cap should not trip the per-file LimitReader; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "zero-config cap") {
+			t.Fatalf("expected total-cap error; got %v", err)
+		}
+		return
 	}
 }
 
@@ -487,7 +528,7 @@ func TestPackDirToTarGz_JustUnderTotalCap(t *testing.T) {
 	writeFileBytes(t, filepath.Join(dir, "well_under.bin"), chunk)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
 		t.Fatalf("packDirToTarGz well under cap, want pass; got %v", err)
 	}
 }
@@ -497,7 +538,7 @@ func TestAutoPackCwd(t *testing.T) {
 	writeFile(t, dir, "package.json", "{}")
 	writeFile(t, dir, "index.js", "x")
 
-	path, fw, n, err := autoPackCwd(dir, nil)
+	path, fw, n, err := autoPackCwd(dir, defaultZeroConfigSourceCapMB, nil)
 	if err != nil {
 		t.Fatalf("autoPackCwd: %v", err)
 	}
@@ -524,7 +565,7 @@ func TestAutoPackCwd_CleansUpOnError(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	path, _, _, err := autoPackCwd(dir, nil)
+	path, _, _, err := autoPackCwd(dir, defaultZeroConfigSourceCapMB, nil)
 	if err == nil {
 		t.Fatal("expected error from autoPackCwd on symlink dir")
 	}
@@ -878,7 +919,7 @@ func TestPackDirToTarGz_WithEnvOverride(t *testing.T) {
 		t.Fatalf("scanAndRedactEnvFiles: %v", err)
 	}
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest, overrides); err != nil {
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, overrides); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 
@@ -910,4 +951,290 @@ func keysOf(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestParseGregaleignore exercises the pure parser against the
+// gitignore-subset grammar documented on gregaleignoreFile /
+// parseGregaleignore. Pins the four modifier flags and the glob
+// handling so a future refactor can't silently change semantics.
+func TestParseGregaleignore(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  []gregaleignorePattern
+	}{
+		{
+			name:  "empty",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "comments_and_blanks",
+			input: "# top comment\n\n   \n# another",
+			want:  nil,
+		},
+		{
+			name:  "simple_glob",
+			input: "*.log",
+			want: []gregaleignorePattern{{
+				raw: "*.log", globSegments: []string{"*.log"},
+			}},
+		},
+		{
+			name:  "anchored",
+			input: "/build",
+			want: []gregaleignorePattern{{
+				raw: "build", anchor: true, globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "dir_only",
+			input: "build/",
+			want: []gregaleignorePattern{{
+				raw: "build", dirOnly: true, globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "negate",
+			input: "!keep.txt",
+			want: []gregaleignorePattern{{
+				raw: "keep.txt", negate: true, globSegments: []string{"keep.txt"},
+			}},
+		},
+		{
+			name:  "anchored_dir",
+			input: "/build/",
+			want: []gregaleignorePattern{{
+				raw: "build", anchor: true, dirOnly: true,
+				globSegments: []string{"build"},
+			}},
+		},
+		{
+			name:  "deep_path_segments",
+			input: "a/b/*.tmp",
+			want: []gregaleignorePattern{{
+				raw: "a/b/*.tmp", globSegments: []string{"a", "b", "*.tmp"},
+			}},
+		},
+		{
+			name:  "stripped_empty_is_skipped",
+			input: "!\n/\n",
+			want:  nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseGregaleignore([]byte(tc.input))
+			if !equalPatterns(got, tc.want) {
+				t.Errorf("parseGregaleignore(%q) = %+v, want %+v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func equalPatterns(a, b []gregaleignorePattern) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].raw != b[i].raw ||
+			a[i].anchor != b[i].anchor ||
+			a[i].dirOnly != b[i].dirOnly ||
+			a[i].negate != b[i].negate ||
+			!equalStrings(a[i].globSegments, b[i].globSegments) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestMatchGregaleignore pins the matching semantics: anchored
+// patterns match only at the root, unanchored patterns match at any
+// depth, and a later '!' can re-include a path previously excluded.
+func TestMatchGregaleignore(t *testing.T) {
+	cases := []struct {
+		name     string
+		patterns string
+		path     string
+		isDir    bool
+		want     bool
+	}{
+		{
+			name:     "no_patterns",
+			patterns: "",
+			path:     "dist/index.js", isDir: false,
+			want: false,
+		},
+		{
+			name:     "unanchored_match_root",
+			patterns: "*.log",
+			path:     "a.log", isDir: false,
+			want: true,
+		},
+		{
+			name:     "unanchored_match_nested",
+			patterns: "*.log",
+			path:     "deep/nested/b.log", isDir: false,
+			want: true,
+		},
+		{
+			name:     "unanchored_no_match_different_ext",
+			patterns: "*.log",
+			path:     "a.txt", isDir: false,
+			want: false,
+		},
+		{
+			name:     "anchored_match_root",
+			patterns: "/build",
+			path:     "build", isDir: false,
+			want: true,
+		},
+		{
+			name:     "anchored_no_match_nested",
+			patterns: "/build",
+			path:     "a/build", isDir: false,
+			want: false,
+		},
+		{
+			name:     "dir_only_skips_file",
+			patterns: "build/",
+			path:     "build", isDir: false,
+			want: false,
+		},
+		{
+			name:     "dir_only_matches_dir",
+			patterns: "build/",
+			path:     "build", isDir: true,
+			want: true,
+		},
+		{
+			name:     "deep_pattern_segments",
+			patterns: "a/b/*.tmp",
+			path:     "a/b/x.tmp", isDir: false,
+			want: true,
+		},
+		{
+			name:     "deep_pattern_no_match_other_subdir",
+			patterns: "a/b/*.tmp",
+			path:     "a/c/x.tmp", isDir: false,
+			want: false,
+		},
+		{
+			name:     "negate_re_includes",
+			patterns: "*.log\n!keep.log",
+			path:     "keep.log", isDir: false,
+			want: false, // negated → re-included
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pats := parseGregaleignore([]byte(tc.patterns))
+			got := matchGregaleignore(tc.path, tc.isDir, pats)
+			if got != tc.want {
+				t.Errorf("matchGregaleignore(%q, %v, %q) = %v, want %v",
+					tc.path, tc.isDir, tc.patterns, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPackDirToTarGz_BuildArtifactDefaults pins the six new
+// default-excluded dirs (issue #1182 §3.5): dist, .next, coverage,
+// target, .venv, .cache. Without these the tarball from a typical
+// Next.js / Maven / Cargo project hits the SourceTarballMaxMB cap
+// with garbage the server-side builder regenerates anyway.
+func TestPackDirToTarGz_BuildArtifactDefaults(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	writeFile(t, dir, "package.json", "{}")
+	writeFile(t, dir, "src/index.js", "x")
+	writeFile(t, dir, "dist/bundle.js", "compiled")
+	writeFile(t, dir, ".next/build-manifest.json", "{}")
+	writeFile(t, dir, "coverage/lcov.info", "data")
+	writeFile(t, dir, "target/debug/binary", "compiled")
+	writeFile(t, dir, ".venv/lib/python/x.py", "import")
+	writeFile(t, dir, ".cache/pip/http/abc", "cached")
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	got := tarEntries(t, dest)
+
+	// Kept (sanity):
+	mustHave := []string{base + "/package.json", base + "/src/index.js"}
+	for _, w := range mustHave {
+		if !got[w] {
+			t.Errorf("archive missing kept %q; entries: %v", w, got)
+		}
+	}
+	// Dropped (defaults):
+	dropPrefixes := []string{
+		"/dist/", "/.next/", "/coverage/", "/target/", "/.venv/", "/.cache/",
+	}
+	for name := range got {
+		for _, bad := range dropPrefixes {
+			if strings.Contains(name, bad) {
+				t.Errorf("archive should not contain %q (default-excluded); entries: %v", name, got)
+			}
+		}
+	}
+}
+
+// TestPackDirToTarGz_Gregaleignore end-to-end: write a
+// .gregaleignore with several patterns and assert the tarball drops
+// (and re-includes via negate) accordingly. Pins the wire between
+// packDirToTarGz and the parser.
+func TestPackDirToTarGz_Gregaleignore(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	writeFile(t, dir, "package.json", "{}")
+	writeFile(t, dir, "src/keep.ts", "x")
+	writeFile(t, dir, "scratch/notes.md", "drop me")
+	writeFile(t, dir, "build/output.bin", "compiled")
+	writeFile(t, dir, "src/skip.log", "drop me")
+	writeFile(t, dir, "src/important.log", "re-include me")
+	writeFile(t, dir, ".gregaleignore",
+		"# drop scratch dirs and log files\n"+
+			"scratch/\n"+
+			"*.log\n"+
+			"!src/important.log\n"+
+			"/build\n",
+	)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, defaultZeroConfigSourceCapMB, nil); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	got := tarEntries(t, dest)
+
+	mustHave := []string{
+		base + "/package.json",
+		base + "/src/keep.ts",
+		base + "/src/important.log", // negated → re-included
+	}
+	for _, w := range mustHave {
+		if !got[w] {
+			t.Errorf("archive missing kept %q; entries: %v", w, got)
+		}
+	}
+	for name := range got {
+		for _, bad := range []string{"/scratch/", "/build/", "/src/skip.log"} {
+			if strings.Contains(name, bad) {
+				t.Errorf("archive should not contain %q (.gregaleignore); entries: %v", name, got)
+			}
+		}
+	}
 }

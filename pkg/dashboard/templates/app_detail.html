@@ -539,12 +539,25 @@
       {{if .Data.Alerts}}
         {{if .Data.Alerts.Rules}}
           <table>
-            <thead><tr><th>Name</th><th>Metric</th><th>Threshold</th><th>Window</th><th>State</th><th>Last fired</th></tr></thead>
+            <thead><tr><th>Name</th><th>Metric</th><th>Action</th><th>Threshold</th><th>Window</th><th>State</th><th>Last fired</th></tr></thead>
             <tbody>
               {{range .Data.Alerts.Rules}}
                 <tr>
                   <td>{{.Rule.Name}}</td>
                   <td><code>{{.Rule.Metric}} {{.Rule.Comparison}}</code></td>
+                  {{/* Production-leveling Stream B (issue #976 /
+                       ADR-122 / SAFE-RELEASES-B): render the
+                       alert_rules.action column so the operator
+                       can tell webhook-only rules apart from
+                       auto-rollback / demote / promote. The value
+                       is state.AlertRule.Action (already on the
+                       AlertItem struct via the embedded
+                       state.AlertRule). The chip palette
+                       (.badge.alert-action-*) lives in
+                       deployment_detail.html's <style> block so
+                       a future alert-rule-only page reuses it
+                       without re-declaring the CSS. */}}
+                  <td><span class="badge alert-action-{{.Rule.Action}}">{{.Rule.Action}}</span></td>
                   <td>{{printf "%g" .Rule.Threshold}}</td>
                   <td><code>{{.Rule.WindowSpec}}</code></td>
                   <td>
@@ -556,7 +569,7 @@
                 </tr>
                 {{if .RecentDeliveries}}
                   <tr>
-                    <td colspan="6" style="background:#fafafa; padding:0.5em 1em;">
+                    <td colspan="7" style="background:#fafafa; padding:0.5em 1em;">
                       <strong>Recent deliveries:</strong>
                       <table style="margin:0.25em 0 0 0;">
                         <thead><tr><th>Fired at</th><th>Status</th><th>HTTP</th><th>Attempts</th><th>Error</th></tr></thead>

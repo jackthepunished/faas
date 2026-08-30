@@ -204,6 +204,7 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		Threshold:           req.Threshold,
 		WindowSpec:          state.AlertWindowSpec(req.WindowSpec),
 		FailureSource:       state.AlertFailureSource(req.FailureSource),
+		Action:              alertRuleActionFrom(req.Action),
 		WebhookURL:          req.WebhookURL,
 		WebhookSecretSealed: sealed,
 		CooldownMinutes:     alertRuleCooldownFrom(req.CooldownMinutes),
@@ -381,6 +382,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		Comparison:          ptrAlertComparison(req.Comparison),
 		Threshold:           req.Threshold,
 		WindowSpec:          ptrAlertWindowSpec(req.WindowSpec),
+		Action:              req.Action,
 		WebhookURL:          req.WebhookURL,
 		WebhookSecretSealed: sealedPtr,
 		CooldownMinutes:     req.CooldownMinutes,
@@ -615,6 +617,7 @@ func alertRuleResponse(r state.AlertRule) api.AlertRuleResponse {
 		Threshold:       r.Threshold,
 		WindowSpec:      string(r.WindowSpec),
 		FailureSource:   string(r.FailureSource),
+		Action:          string(r.Action),
 		WebhookURL:      r.WebhookURL,
 		CooldownMinutes: r.CooldownMinutes,
 		State:           string(r.State),
@@ -645,6 +648,18 @@ func alertRuleCooldownFrom(p *int) int {
 	return *p
 }
 
+// alertRuleActionFrom returns the create-request's action or
+// AlertActionWebhook (the legacy Dispatcher fan-out) when omitted.
+// Issue #976 / ADR-122 / SAFE-RELEASES-B. Validator (above) has
+// already enforced pkg/api.AllowedAlertRuleActions membership on
+// non-nil values, so this helper never has to.
+func alertRuleActionFrom(p *string) state.AlertAction {
+	if p == nil {
+		return state.AlertActionWebhook
+	}
+	return state.AlertAction(*p)
+}
+
 // validateAlertRuleBody is the create-side validator. Closed-vocab
 // checks (metric / comparison / window_spec / failure_source) +
 // threshold finite + cooldown band + secret size + URL parse.
@@ -669,6 +684,15 @@ func validateAlertRuleBody(req api.CreateAlertRuleRequest) *api.Problem {
 	}
 	if req.FailureSource != "" && !api.AllowedAlertRuleFailureSource(req.FailureSource) {
 		return api.ErrAlertRuleInvalid("failure_source must be one of any, cron, queue, delayed_task, async_invoke (or empty)")
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-B: Action is the
+	// new seam-routing field on alert_rules. nil on the wire
+	// defaults to 'webhook' (legacy Dispatcher fan-out) so
+	// every pre-PR body stays byte-identical. A non-nil value
+	// must be in pkg/api.AllowedAlertRuleActions; the schema
+	// alert_rules_action_chk is the second-line defence.
+	if req.Action != nil && !api.AllowedAlertRuleAction(*req.Action) {
+		return api.ErrAlertRuleInvalid(fmt.Sprintf("action must be one of %v (or omitted for webhook)", api.AllowedAlertRuleActions))
 	}
 	if !api.IsFiniteFloat(req.Threshold) {
 		return api.ErrAlertRuleInvalid("threshold must be a finite number")
@@ -718,6 +742,13 @@ func validateAlertRuleRowUpdate(merged state.AlertRule) *api.Problem {
 	if merged.FailureSource != "" && !api.AllowedAlertRuleFailureSource(string(merged.FailureSource)) {
 		return api.ErrAlertRuleInvalid("failure_source must be one of any, cron, queue, delayed_task, async_invoke (or empty)")
 	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-B: Action must
+	// round-trip through the merged row check too, so a PATCH
+	// can't sneak an out-of-set value past the create-path
+	// validator.
+	if merged.Action != "" && !api.AllowedAlertRuleAction(string(merged.Action)) {
+		return api.ErrAlertRuleInvalid(fmt.Sprintf("action must be one of %v (or empty for webhook)", api.AllowedAlertRuleActions))
+	}
 	if !api.IsFiniteFloat(merged.Threshold) {
 		return api.ErrAlertRuleInvalid("threshold must be a finite number")
 	}
@@ -756,6 +787,12 @@ func alertRuleRowForValidation(existing state.AlertRule, req api.UpdateAlertRule
 	}
 	if req.WindowSpec != nil {
 		merged.WindowSpec = state.AlertWindowSpec(*req.WindowSpec)
+	}
+	// Issue #976 / ADR-122 / SAFE-RELEASES-B: merge Action
+	// through so the row-update validator sees the post-patch
+	// shape (mirrors Metric / Comparison / WindowSpec).
+	if req.Action != nil {
+		merged.Action = state.AlertAction(*req.Action)
 	}
 	if req.WebhookURL != nil {
 		merged.WebhookURL = *req.WebhookURL

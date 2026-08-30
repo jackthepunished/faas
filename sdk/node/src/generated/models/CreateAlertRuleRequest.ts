@@ -22,5 +22,9 @@ export type CreateAlertRuleRequest = {
    */
   webhook_secret: string;
   cooldown_minutes?: number;
+  /**
+   * What to do when the rule fires. Omit to default to webhook.
+   */
+  action?: 'webhook' | 'rollback' | 'demote' | 'promote';
 };
 

@@ -45,11 +45,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	egresspb "github.com/onebox-faas/faas/api/proto/onebox/faas/egress/v1"
 	"github.com/onebox-faas/faas/pkg/alerts"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/billing/reconciler"
+	"github.com/onebox-faas/faas/pkg/canary"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
@@ -57,6 +59,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/promql"
 	"github.com/onebox-faas/faas/pkg/role"
+	"github.com/onebox-faas/faas/pkg/safedeploy"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -786,6 +789,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// flag is on. A bad parse logs and falls through to mc.Defaults().
 	applyEnvTick("FAAS_UPSTREAM_PROBE_INTERVAL", &mc.UpstreamProbeInterval, deps.getenv, log)
 	applyEnvTick("FAAS_UPSTREAM_PROBE_PARTITION_INTERVAL", &mc.UpstreamPartitionCreateInterval, deps.getenv, log)
+	// Production-leveling Stream C: env-scoped stuck-after
+	// threshold (FAAS_SAFEDEPLOY_STUCK_AFTER). The var must be
+	// applied before the safedeploy orchestrator's walkRow
+	// reads StuckAfterDuration — both setters happen at boot
+	// before any tick goroutine starts (runTicks is spawned
+	// after this block). The setter silently ignores <= 0 so a
+	// bad parse falls through to the canned 30 min default.
+	safedeploy.SetStuckAfterDuration(stuckAfterFromEnvMeterd(deps.getenv, log))
+	state.SetRecoverRolloutStuckAfter(stuckAfterFromEnvMeterd(deps.getenv, log))
 	// ADR-123: cert-expiry refresher + MTD spend aggregator
 	// cadences. Defaults live in cmd/meterd/alert_presets_ticks.go
 	// so the loops and the env-tick parser share the same source
@@ -901,10 +913,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// from schedd) so each data_upstream_probes row carries the
 	// region label.
 	probe := buildUpstreamProbe(deps, store, ops, log)
+	canaryProg, canaryAPID, canaryActor, canaryAccount := buildCanaryProgression(deps, store, ops, log)
+	safeDeployOrch := buildSafeDeployOrchestrator(deps, store, ops, log, canaryAPID, evaluator)
 	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
 		WithEgress(egress).
 		WithProbe(probe).
-		WithPartitionCreate(PartitionCreateOnceFn(poolAdapter{pool}, log))
+		WithPartitionCreate(PartitionCreateOnceFn(poolAdapter{pool}, log)).
+		WithCanaryProgression(canaryProg).
+		WithSafeDeploy(safeDeployOrch)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 
@@ -950,6 +966,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// of rows between ticks.
 	go meter.RetentionLoopRequestTelemetry(ctx, poolAdapter{pool}, meter.RequestTelemetryRetentionInterval, log)
 
+	// SAFE-RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit): deployment_audit GC cron.
+	// Without this sweep the deployment_audit table grows
+	// unbounded — disk fill + index bloat over months. 90-day
+	// retention matches the on-call investigation envelope
+	// (operators rarely look past 30 days post-incident); the
+	// sweep is bounded-DELETE + idempotent so a missed tick is
+	// safe. The deploymentAuditGCRowsDeleted counter is Inc'd
+	// after each successful pass so the operator can tell
+	// whether the GC is keeping up.
+	go meter.RetentionLoopDeploymentAudit(ctx, poolAdapter{pool}, mc.DeploymentAuditRetentionInterval, log, func(n int64) {
+		if c := ops.DeploymentAuditGCRowsDeleted(); c != nil {
+			c.Add(float64(n))
+		}
+	})
+
 	// ADR-123 / issue #1233: alert-preset signal-feeding
 	// goroutines. CertExpiryRefresherLoop (meterd-owned, owns the
 	// meterd_tenant_surface_cert_expiry_state table per the
@@ -986,6 +1018,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		Ops:      ops,
 		Interval: mc.DeploymentFailureSweepInterval,
 	})
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: canary_progression
+	// free-function goroutine (mirrors CertExpiryRefresherLoop +
+	// AccountSpendAggregatorLoop above). Wired when
+	// FAAS_CANARY_PROGRESSION_TOKEN + FAAS_APID_BASE_URL are both
+	// set; the loop is the driver's ctx-cancelled twin of the
+	// meter.Loop.WithCanaryProgression goroutine — the loop
+	// owns the orchestrator tick, this free-function is the
+	// standby that catches up if the loop's goroutine is
+	// dropped during a meterd restart. (Both paths are no-op
+	// when canaryProg is nil because Loop skips the goroutine
+	// AND this loop's Store/APID nil guard returns early.)
+	if canaryProg != nil && canaryAPID != nil {
+		go CanaryProgressionLoop(ctx, CanaryProgressionParams{
+			Store:    store,
+			APID:     canaryAPID,
+			Log:      log,
+			Ops:      ops,
+			Interval: mc.CanaryEvalInterval,
+			Actor:    canaryActor,
+			Account:  canaryAccount,
+		})
+	}
 
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
@@ -1087,6 +1141,29 @@ func applyEnvTick(key string, dst *time.Duration, getenv func(string) string, lo
 		return
 	}
 	*dst = d
+}
+
+// stuckAfterFromEnvMeterd reads FAAS_SAFEDEPLOY_STUCK_AFTER for
+// the safedeploy orchestrator's StuckAfterDuration var (production-
+// leveling Stream C). Mirrors cmd/apid/main.go::stuckAfterFromEnv;
+// takes deps.getenv so tests can stub the env without mutating the
+// process env. Returns 0 on unset / unparseable so the setter
+// silently ignores it and the canned 30 min default stays in
+// effect.
+func stuckAfterFromEnvMeterd(getenv func(string) string, log *slog.Logger) time.Duration {
+	v := getenv("FAAS_SAFEDEPLOY_STUCK_AFTER")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		if log != nil {
+			log.Warn("FAAS_SAFEDEPLOY_STUCK_AFTER unparseable, using default",
+				"value", v, "err", err)
+		}
+		return 0
+	}
+	return d
 }
 
 // buildAlertEvaluator wires the alert-evaluator (issue #396 /
@@ -1203,7 +1280,123 @@ func buildUpstreamProbe(deps runDeps, store state.Store, ops *wire.OpsMetrics, l
 	return meter.NewProbe(store, region, log)
 }
 
-// PartitionCreateLoopFn wraps meter.PartitionCreateLoop into a
+// buildCanaryProgression (issue #976 / ADR-122 / SAFE-RELEASES-A)
+// wires the canary_progression meterd tick driver. Returns
+// (progression, apid client, actor UUID, account UUID). All four
+// are nil/"" when FAAS_CANARY_PROGRESSION_TOKEN is unset (default
+// OFF — the cluster outline's rollout gate flips the token
+// generation ON in a follow-up operator-config PR). When ON:
+//
+//   - FAAS_APID_BASE_URL points to the apid instance the tick
+//     drives (default http://localhost:8080 for the
+//     single-control-plane topology; the multi-host fleet reads
+//     it from the host-age identity file).
+//   - FAAS_CANARY_PROGRESSION_TOKEN is the apid-issued
+//     service-account bearer (NOT a customer token) carrying the
+//     orchestrator's actor UUID; the deployment_audit row it
+//     emits carries this actor + the matched account_id.
+//
+// Returns (nil, nil, "", "") when the token is missing — the
+// call sites nil-check the progression and skip the goroutine,
+// preserving the pre-PR meterd behaviour exactly.
+func buildCanaryProgression(deps runDeps, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*canary.Progression, *api.Client, string, string) {
+	token := deps.getenv("FAAS_CANARY_PROGRESSION_TOKEN")
+	if token == "" {
+		log.Info("meterd: canary_progression disabled — FAAS_CANARY_PROGRESSION_TOKEN unset; running without canary_progression tick")
+		return nil, nil, "", ""
+	}
+	apidBase := deps.getenv("FAAS_APID_BASE_URL")
+	if apidBase == "" {
+		log.Warn("meterd: FAAS_CANARY_PROGRESSION_TOKEN set but FAAS_APID_BASE_URL empty; using http://localhost:8080 default")
+		apidBase = "http://localhost:8080"
+	}
+	apid := api.NewClient(apidBase, token)
+	// The actor + account for the audit row are the
+	// service-account's identity. The token is opaque on the
+	// meterd side (no JWT decode) — the operator-init service
+	// stamps the deployment_audit row with the token's UUID via
+	// the apid's auth-facade introspection. Until that lands,
+	// stamp a deterministic sentinel so audit consumers can
+	// still correlate rows to the canary_progression emitter.
+	const actorSentinel = "meterd:canary_progression"
+	progression := canary.NewProgression(&canaryStoreAdapter{store: store}, apid, ops, log, actorSentinel, actorSentinel)
+	return progression, apid, actorSentinel, actorSentinel
+}
+
+// buildSafeDeployOrchestrator (issue #976 / ADR-122 / SAFE-RELEASES-F)
+// wires the safedeploy orchestrator meterd tick driver. Returns
+// nil when FAAS_SAFEDEPLOY_TOKEN is unset (default OFF — the
+// cluster outline's rollout gate flips the token generation ON in
+// a follow-up operator-config PR). When ON:
+//
+//   - FAAS_SAFEDEPLOY_TOKEN is the apid-issued service-account
+//     bearer the orchestrator uses for any future apid HTTP calls
+//     (today the orchestrator only stamps pkg/state.Store — no
+//     apid HTTP — but the bearer stays wired for forward-compat
+//     with pre-deploy diff checks).
+//   - FAAS_APID_BASE_URL is reused from the canary_progression
+//     configuration (the same apid instance serves both ticks).
+//
+// Returns nil when the token is missing — the call sites
+// nil-check the orchestrator and skip the goroutine, preserving
+// the pre-PR meterd behaviour exactly.
+//
+// ActionDispatcher wiring: the alert evaluator's SetActionExec
+// method is called on the Evaluator instance built upstream
+// (the Evaluator doesn't know about pkg/safedeploy; pkg/safedeploy
+// doesn't know about pkg/alerts; the seam lives at
+// alerts.Evaluator.SetActionExec).
+func buildSafeDeployOrchestrator(deps runDeps, store state.Store, ops *wire.OpsMetrics, log *slog.Logger, apidClient *api.Client, evaluator *alerts.Evaluator) *safedeploy.Orchestrator {
+	token := deps.getenv("FAAS_SAFEDEPLOY_TOKEN")
+	if token == "" {
+		log.Info("meterd: safedeploy disabled — FAAS_SAFEDEPLOY_TOKEN unset; running without safedeploy tick")
+		return nil
+	}
+	// The orchestrator's Store surface is narrower than the
+	// canary store adapter's — SafedeployListPendingRollouts +
+	// SafedeployStampRollout + AppendDeploymentAudit all exist
+	// on the concrete *state.PgStore / *state.MemStore. Wrap
+	// the store at the seam.
+	storeAdapter := &safedeployStoreAdapter{store: store}
+	const actorSentinel = "meterd:safedeploy"
+	orchestrator := safedeploy.NewOrchestrator(storeAdapter, log, actorSentinel, actorSentinel)
+	// Wire the ActionDispatcher onto the Evaluator. When
+	// apidClient is nil (FAAS_CANARY_PROGRESSION_TOKEN unset but
+	// FAAS_SAFEDEPLOY_TOKEN set), the ActionDispatcher is built
+	// with a nil APID — its Execute path returns
+	// ErrActionDispatcherNoAPID for any non-webhook action and
+	// the evaluator's Stats.ActionSkipped counter bumps. This
+	// is fail-safe: an alert rule with action=rollback fires the
+	// webhook fan-out regardless, and the rollout's state
+	// machine still walks via the orchestrator's pkg/state
+	// writes.
+	actionDispatcher := safedeploy.NewActionDispatcher(apidClient, log, actorSentinel)
+	if evaluator != nil {
+		evaluator.SetActionExec(actionDispatcher)
+	}
+	return orchestrator
+}
+
+// safedeployStoreAdapter bridges pkg/state.Store to
+// pkg/safedeploy.Store. Lives in cmd/meterd (not pkg/safedeploy)
+// so pkg/safedeploy stays free of pkg/state's full surface —
+// only the three methods the orchestrator calls are exposed.
+type safedeployStoreAdapter struct {
+	store state.Store
+}
+
+func (a *safedeployStoreAdapter) SafedeployListPendingRollouts(ctx context.Context) ([]state.Deployment, error) {
+	return a.store.SafedeployListPendingRollouts(ctx)
+}
+
+func (a *safedeployStoreAdapter) SafedeployStampRollout(ctx context.Context, id string, rolloutState string, startedAt, completedAt, abortedAt *time.Time, abortedReason string) (state.Deployment, error) {
+	return a.store.SafedeployStampRollout(ctx, id, rolloutState, startedAt, completedAt, abortedAt, abortedReason)
+}
+
+func (a *safedeployStoreAdapter) AppendDeploymentAudit(ctx context.Context, entry state.DeploymentAudit) (int64, error) {
+	return a.store.AppendDeploymentAudit(ctx, entry)
+}
+
 // func(ctx context.Context) signature so Loop.WithPartitionCreate
 // stays thin (it doesn't need the execer / interval / log
 // parameters on its own surface). Called from main only when

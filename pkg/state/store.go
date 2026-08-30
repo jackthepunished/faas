@@ -209,15 +209,35 @@ var ErrRolloutNotStuck = errors.New("state: rollout is not stuck; use promote in
 // post-condition check is loud.
 var ErrRolloutStateInvalid = errors.New("state: rollout state does not permit recovery")
 
-// RecoverRolloutStuckAfter (issue #976 / ADR-122 / SAFE-RELEASES-R)
-// is the canned stuck-detection window the RecoverRollout method
-// uses to gate action="advance". It MUST match
-// pkg/safedeploy.StuckAfterDuration so the CLI's view of "this
-// rollout is stuck" agrees with the meterd orchestrator's view —
-// the store layer duplicates the constant (no import, to keep
+// RecoverRolloutStuckAfter (issue #976 / ADR-122 / SAFE-RELEASES-R +
+// production-leveling Stream C) is the canned stuck-detection
+// window the RecoverRollout method uses to gate action="advance".
+// It MUST match pkg/safedeploy.StuckAfterDuration so the CLI's view
+// of "this rollout is stuck" agrees with the meterd orchestrator's
+// view — the store layer duplicates the var (no import, to keep
 // pkg/safedeploy off pkg/state's import graph) and pins the
-// equality in tests. 30 minutes is the ADR-122 canned value.
-const RecoverRolloutStuckAfter = 30 * time.Minute
+// equality in tests.
+//
+// Default value 30 minutes is the ADR-122 canned value. cmd/apid
+// + cmd/meterd call SetRecoverRolloutStuckAfter at boot to apply
+// the FAAS_SAFEDEPLOY_STUCK_AFTER env override — production
+// tuning never requires a code change.
+var RecoverRolloutStuckAfter = 30 * time.Minute
+
+// SetRecoverRolloutStuckAfter overrides the canned stuck-detection
+// window at boot. Called once by cmd/apid + cmd/meterd after they
+// parse FAAS_SAFEDEPLOY_STUCK_AFTER. The setter is intentionally
+// exported (not an unexported func) so the binary entrypoints in
+// cmd/{apid,meterd} can wire it without re-importing the constant.
+// Values <= 0 are silently ignored so a bad env parse never
+// inverts the stuck predicate (which would silently promote every
+// healthy rollout).
+func SetRecoverRolloutStuckAfter(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	RecoverRolloutStuckAfter = d
+}
 
 // ErrInvalidStateTransition is returned by CancelDeploymentTx /
 // MarkDeploymentCancelled when the row's current status is not in

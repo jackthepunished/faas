@@ -13,8 +13,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,59 +61,114 @@ func gitRootFromCwd(start string) (string, error) {
 }
 
 // parseGitRemoteURL accepts the URL forms GitHub ships today and
-// returns (owner, repo). v1 only supports GitHub hostnames — non-GitHub
-// remotes are rejected with a clear error so the operator knows to
-// pass `--repo OWNER/NAME --ref SHA` explicitly or install the Gregale
-// GitHub App.
+// returns (owner, repo). v1 only resolves GitHub hostnames into a
+// zero-config-eligible (owner, repo) pair; any other host returns
+// ("", "", nil) so the caller can route to the non-zero-config
+// (cwd-auto-pack) branch instead of erroring on a perfectly valid
+// non-GitHub repo.
 //
-// Accepted:
-//   - git@github.com:OWNER/REPO.git
-//   - git@github.com:OWNER/REPO
-//   - https://github.com/OWNER/REPO.git
-//   - https://github.com/OWNER/REPO
+// Accepted (any of the standard GitHub remote shapes):
+//   - git@github.com:OWNER/REPO[.git]
+//   - ssh://[git@]github.com[:22]/OWNER/REPO[.git]
+//   - ssh://[git@]github.com[:22]:OWNER/REPO[.git]
+//   - https://[user[:pass]@]github.com/OWNER/REPO[.git]
+//   - http://[user[:pass]@]github.com/OWNER/REPO[.git]
 //
-// Rejected:
-//   - empty string
-//   - ssh://git@github.com/OWNER/REPO.git (not used by `git clone`)
-//   - any non-github.com host (gitlab, bitbucket, custom)
-//   - malformed (missing owner or repo)
+// Returned triples:
+//   - GitHub URL that parses cleanly → (owner, repo, nil)
+//   - Non-GitHub URL of any shape     → ("",  "",    nil)  — caller falls through
+//   - GitHub URL that's malformed     → ("",  "",    err) — caller surfaces the error
+//   - Empty URL                       → ("",  "",    err) — caller surfaces "no remote"
 func parseGitRemoteURL(remoteURL string) (owner, repo string, err error) {
 	remoteURL = strings.TrimSpace(remoteURL)
 	if remoteURL == "" {
 		return "", "", errors.New("parseGitRemoteURL: empty remote URL")
 	}
 
-	// SSH form: git@github.com:OWNER/REPO(.git)?
+	// SSH "scp-like" form: git@github.com:OWNER/REPO[.git]
 	if strings.HasPrefix(remoteURL, "git@github.com:") {
-		rest := strings.TrimPrefix(remoteURL, "git@github.com:")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: ssh form: %w", err)
-		}
-		return owner, repo, nil
+		return splitOwnerRepo(strings.TrimPrefix(remoteURL, "git@github.com:"))
 	}
 
-	// HTTPS form: https://github.com/OWNER/REPO(.git)?
-	if strings.HasPrefix(remoteURL, "https://github.com/") {
-		rest := strings.TrimPrefix(remoteURL, "https://github.com/")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: https form: %w", err)
-		}
-		return owner, repo, nil
+	// SSH explicit form: ssh://[user@]host[:port]/path
+	// (a few SSH clients use this; `git clone` never produces it but
+	// hand-written remote URLs do — issue #1182 §3.6.)
+	if path, ok := matchSSHURL(remoteURL, "github.com"); ok {
+		return splitOwnerRepo(path)
 	}
 
-	// HTTP form (rarely used; CLI tools sometimes normalize to https).
-	if strings.HasPrefix(remoteURL, "http://github.com/") {
-		rest := strings.TrimPrefix(remoteURL, "http://github.com/")
-		owner, repo, err = splitOwnerRepo(rest)
-		if err != nil {
-			return "", "", fmt.Errorf("parseGitRemoteURL: http form: %w", err)
-		}
-		return owner, repo, nil
+	// HTTPS with optional userinfo: https://[user[:pass]@]github.com/...
+	if rest, ok := stripURLUserinfo(remoteURL, "https://", "github.com"); ok {
+		return splitOwnerRepo(rest)
+	}
+	if rest, ok := stripURLUserinfo(remoteURL, "http://", "github.com"); ok {
+		return splitOwnerRepo(rest)
 	}
 
-	return "", "", fmt.Errorf("parseGitRemoteURL: only github.com remotes are supported in v1; got %q", remoteURL)
+	// Anything else (file://, git://, plain non-host paths, or any
+	// https/http URL pointing at a non-github.com host) — not a
+	// recognised zero-config origin. Return empty triple so the
+	// caller falls through to the cwd-auto-pack branch.
+	return "", "", nil
+}
+
+// matchSSHURL handles "ssh://[user@]host[:port]/path" forms for the
+// given host. Returns (path, true) on a host match, ("", false)
+// otherwise. Caller is responsible for splitting the path into
+// (owner, repo) via splitOwnerRepo (which strips a trailing .git
+// and lowercases).
+func matchSSHURL(remoteURL, host string) (path string, ok bool) {
+	const prefix = "ssh://"
+	if !strings.HasPrefix(remoteURL, prefix) {
+		return "", false
+	}
+	rest := remoteURL[len(prefix):]
+	// userinfo (before '@') is optional.
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	// host[:port]/...
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return "", false
+	}
+	hostPort := rest[:slash]
+	// Trim optional :port.
+	if colon := strings.IndexByte(hostPort, ':'); colon >= 0 {
+		hostPort = hostPort[:colon]
+	}
+	if hostPort != host {
+		return "", false
+	}
+	return rest[slash+1:], true
+}
+
+// stripURLUserinfo handles "scheme://[userinfo@]host/..." for the
+// given scheme + host. Returns (path, true) on a host match,
+// ("", false) otherwise — including the "scheme matched but host
+// didn't" case (which the caller maps to a soft empty-triple
+// return, signalling "not zero-config-eligible").
+//
+// On the GitHub path, the userinfo segment is dropped: a token
+// embedded in the remote URL is rare (and a security smell — the
+// GitHub App auth model uses install tokens, not URL credentials),
+// but if a customer's remote has it, we don't want to surface it on
+// the deployment row.
+func stripURLUserinfo(remoteURL, scheme, host string) (path string, ok bool) {
+	if !strings.HasPrefix(remoteURL, scheme) {
+		return "", false
+	}
+	rest := remoteURL[len(scheme):]
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	hostPrefix := host + "/"
+	if !strings.HasPrefix(rest, hostPrefix) {
+		// scheme matched but host didn't — fall through so caller
+		// returns empty triple (not zero-config-eligible, not an error).
+		return "", false
+	}
+	return rest[len(hostPrefix):], true
 }
 
 // splitOwnerRepo splits "OWNER/REPO" or "OWNER/REPO.git" into
@@ -184,6 +242,72 @@ func isDirtyWorkdir(gitDir string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// zeroConfigProvenance is the bundle of metadata the refactored
+// zero-config deploy path (issue #1182) captures before packing
+// HEAD. Lives in git_local.go because every field except DeployedBy
+// is a git-side fact; the caller in commands2.go reads it to
+// stamp the deployment row's deployed_by annotation.
+//
+// Owner + Repo are populated only when the origin remote is a
+// recognised GitHub URL (parseGitRemoteURL returns empty triple
+// for non-GitHub hosts); empty here is the "we have a git repo
+// but no provenance" path and does not block the deploy.
+type zeroConfigProvenance struct {
+	Root       string // absolute path of the git working tree root
+	Owner      string // origin owner (lowercased); "" if non-GitHub host
+	Repo       string // origin repo (lowercased); "" if non-GitHub host
+	SHA        string // 40-char HEAD SHA
+	Dirty      bool   // working tree has uncommitted / untracked changes
+	DeployedBy string // `git config user.name` ("" if unset)
+}
+
+// resolveZeroConfigProvenance inspects cwd for git metadata and
+// returns a provenance bundle for the refactored zero-config
+// deploy path. The return contract is:
+//
+//   - ok=true,  err=nil → caller uses the zero-config path
+//     (gitArchiveHEAD + the existing CreateApp + DeployTarball
+//     pipeline)
+//   - ok=false, err=ErrNotInGitRepo → caller falls through to the
+//     cwd-auto-pack branch (existing behavior for non-git dirs)
+//   - ok=false, err=ErrNoGitRemote → caller falls through to the
+//     cwd-auto-pack branch (existing behavior for git-without-origin)
+//   - ok=false, err=other → caller surfaces the error
+//
+// Origin is required for the zero-config path: a git repo with no
+// remote still deploys via the cwd-auto-pack branch (the customer
+// may be packaging local code that has no upstream).
+func resolveZeroConfigProvenance(cwd string) (zeroConfigProvenance, bool, error) {
+	root, err := gitRootFromCwd(cwd)
+	if err != nil {
+		return zeroConfigProvenance{}, false, err
+	}
+	remote, err := gitRemoteOrigin(root)
+	if err != nil {
+		// ErrNoGitRemote is the "git repo without origin" path — caller
+		// falls through to cwd auto-pack (preserves existing behavior).
+		return zeroConfigProvenance{}, false, err
+	}
+	owner, repo, _ := parseGitRemoteURL(remote)
+	// owner / repo stay "" on non-GitHub origin or parse failure.
+	// The caller still uses gitArchiveHEAD — empty (owner, repo)
+	// just means the deployment row doesn't carry source provenance.
+	sha, err := resolveHEAD(root)
+	if err != nil {
+		return zeroConfigProvenance{}, false, fmt.Errorf("resolve HEAD: %w", err)
+	}
+	dirty, _ := isDirtyWorkdir(root) // best-effort; not a hard gate
+	name, _ := gitUserName(root)     // best-effort; "" if unset
+	return zeroConfigProvenance{
+		Root:       root,
+		Owner:      owner,
+		Repo:       repo,
+		SHA:        sha,
+		Dirty:      dirty,
+		DeployedBy: name,
+	}, true, nil
+}
+
 // runGitCmd runs `git <args...>` with -C gitDir and returns combined
 // stdout+stderr trimmed. Errors include stderr so the operator sees
 // the underlying git message.
@@ -197,6 +321,72 @@ func runGitCmd(gitDir string, args ...string) (string, error) {
 		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return string(out), nil
+}
+
+// gitArchiveHEAD runs `git archive HEAD --format=tar.gz -o <outPath>` in
+// gitDir, materialising the committed tree of HEAD as a gzipped tar
+// archive. Used by the refactored zero-config deploy path (issue
+// #1182) so the customer sees a faithful "deploying HEAD" semantic
+// instead of the cwd packer, which silently includes uncommitted /
+// untracked files.
+//
+// Errors:
+//
+//   - empty repo (no commits yet): rev-parse --verify HEAD^{commit}
+//     fails with "unknown revision"; we surface this directly so the
+//     caller can render a clean "no commits yet, commit something and
+//     try again" message without parsing git's exit message.
+//   - not in a repo: rev-parse fails with "not a git repository";
+//     bubbled up with stderr for the operator.
+//   - archive write failure (perm denied, disk full): bubbled up
+//     with stderr.
+//
+// Caller owns outPath. On success the file exists and is a valid
+// gzipped tar; the caller is expected to defer os.Remove. The
+// function does not open the file — `git archive -o` writes
+// directly, so no fd leak on this helper.
+func gitArchiveHEAD(gitDir, outPath string) error {
+	// Empty-repo guard. `git archive HEAD` would itself error with
+	// "unknown revision 'HEAD'" on a fresh `git init` (exit 128) but
+	// the rev-parse form gives a stable, parseable signal that we
+	// can wrap without relying on git's exact stderr string.
+	if _, err := runGitCmd(gitDir, "rev-parse", "--verify", "HEAD^{commit}"); err != nil {
+		return fmt.Errorf("gitArchiveHEAD: %w", err)
+	}
+	if _, err := runGitCmd(gitDir, "archive", "HEAD", "--format=tar.gz", "-o", outPath); err != nil {
+		return fmt.Errorf("gitArchiveHEAD: archive HEAD failed: %w", err)
+	}
+	return nil
+}
+
+// tarballSHA256 returns the lower-case hex sha256 of the file at
+// path. Called by the receipt wire-up at commands2.go:1638 after
+// gitArchiveHEAD returns (or after a user-supplied --tarball is
+// read) and BEFORE the deferred os.Remove(tmpTar) at line 1364
+// removes the tempfile; on a `deployed` path the file is gone by
+// the time cmdDeployTarball returns so any caller must compute
+// the SHA before returning.
+//
+// Reads via io.Copy rather than wrapping the streaming write
+// because the pack pipeline's deferred-close ordering is fragile
+// to a writer injection; for a 250 MB cap tarball this is not a
+// perf concern (≈ 50 ms in the worst case).
+//
+// Returns an empty string + nil error on a missing file so the
+// receipt can still serialise; callers that want strict behavior
+// must check err explicitly.
+func tarballSHA256(path string) (string, error) {
+	//nolint:forbidigo // CLI's own tempfile (post-#1187 zero-config path); not a user-supplied path.
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // ErrNoGitConfigKey is returned by gitConfigUser when `git config --get`

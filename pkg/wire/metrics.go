@@ -696,6 +696,18 @@ type OpsMetrics struct {
 	// value reflects the LATEST pass, not a cumulative sum.
 	// ADR-091 D20.3 / PR-B residual.
 	auditEventsRetentionLagSeconds prometheus.Gauge
+	// deploymentAuditGCRowsDeletedTotal: rows pruned by the
+	// deployment_audit retention cron (pkg/meter/
+	// RetentionOnceDeploymentAudit, 90-day window). SAFE-
+	// RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit) — without this counter an
+	// operator can't tell whether the GC is keeping up or the
+	// table is silently growing. Unlabelled — the loop has
+	// one outcome (rows deleted); the per-kind breakdown
+	// stays on the deployment_audit_at_gc_idx index (planner
+	// range-scans the at column) + the dashboard's audit
+	// timeline drill-down.
+	deploymentAuditGCRowsDeletedTotal prometheus.Counter
 	// domainDoctorOldestObservationSeconds (ADR-120 Tier A1): gauge
 	// of (now − min(observed_at)) across every row in
 	// domain_doctor_observations at the moment each doctor pass
@@ -772,6 +784,33 @@ type OpsMetrics struct {
 	// the cool-down race. Unlabelled. Paired with
 	// alertEvalSkippedDegradedTotal for the dashboard panel.
 	alertEvalFiredTotal prometheus.Counter
+	// canaryProgressionAdvancedTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) counts every canary step boundary crossed
+	// by the meterd tick (canary_step → canary_step+1 with
+	// elapsed >= current stage.Duration). Unlabelled. Mirrors
+	// alertEvalFiredTotal as a fleet-level rollup counter.
+	canaryProgressionAdvancedTotal prometheus.Counter
+	// canaryProgressionErrorsTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-A) counts every per-row error inside the
+	// canary_progression tick (PATCH traffic failure, audit
+	// append failure, etc.). Labelled by reason ∈
+	// {patch_traffic, append_audit, list_in_flight}. Closed
+	// vocabulary — unknown reasons drop to the no-op closure.
+	canaryProgressionErrorsTotal *prometheus.CounterVec
+	// canaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
+	// hardening, migration 00517) counts every row the
+	// canary_progression tick walks whose canary_step_started_at is
+	// the zero time. Post-00517 the column is NOT NULL DEFAULT NOW(),
+	// so this counter should never fire in steady state; a non-zero
+	// rate is the tripwire for "a write path bypassed the apid Create
+	// handler and left the column at the zero value" — exactly the
+	// failure mode code-review finding #1 was worried about. The
+	// runtime's behavior on zero is unchanged (still advances on the
+	// first tick — elapsed = 56 years > Duration), but the operator
+	// gets a fleet-level signal that the schema default was bypassed.
+	// Unlabelled — fleet rollup; per-deployment detail lives in the
+	// existing deploy.traffic_changed audit row.
+	canaryProgressionZeroTimestampTotal prometheus.Counter
 	// alertDeliveryAttemptsTotal — counts dispatched alert-rule
 	// webhook attempts, labelled by outcome ∈ {delivered, failed}.
 	// Label cardinality budget = 2 (closed vocabulary). The counter
@@ -780,6 +819,17 @@ type OpsMetrics struct {
 	// audit events table is the per-customer detail; this is the
 	// fleet-wide counter for the §12 dashboard).
 	alertDeliveryAttemptsTotal *prometheus.CounterVec
+	// alertActionExecutedTotal (issue #976 / ADR-122 /
+	// SAFE-RELEASES-B) counts alert-rule firings that triggered an
+	// in-process action beyond the legacy webhook fan-out (rollout
+	// rollback / demote / promote). Labelled by action ∈
+	// {rollback, demote, promote} (closed vocabulary — 'webhook'
+	// is the no-action default and not labelled here, so the metric
+	// only ever sees non-trivial side-effects). The counter is the
+	// §12 dashboard's "auto-rollback / auto-promote rate" panel;
+	// a non-zero rate combined with alertDeliveryAttemptsTotal
+	// (delivered) on the same rule family is the healthy signal.
+	alertActionExecutedTotal *prometheus.CounterVec
 	// paddleWebhookVerifyFailedTotal — counts Paddle webhook signature
 	// verify failures (PR-P4). Unlabelled; the per-event detail
 	// (event_id, err message, tolerance) lives in the journal line
@@ -1302,6 +1352,13 @@ type OpsMetrics struct {
 	// vs. denylist catalog edit). Cardinality is identical to
 	// egressDeny — same catalog, same (cidr, family) label set.
 	ociEgressDeny *prometheus.CounterVec
+	// ownershipClamp / layerEntrySkipped: M-1 / ADR-136 §Decision 2
+	// imaged-only counters. Registered ONLY when prefix == "imaged"
+	// (mirrors ociEgressDeny); on every other daemon the fields
+	// stay nil and the accessors below no-op. pkg/rootfs.ApplyLayer
+	// increments via the public accessors in cmd/imaged/main.go.
+	ownershipClamp    *prometheus.CounterVec
+	layerEntrySkipped prometheus.Counter
 	// egressSourceErrors: counter of per-instance sysfs read
 	// failures from cmd/vmmd/network_poller.go (ADR-046, step
 	// 7). The loop polls /sys/class/net/<vethHost>/statistics/
@@ -2166,6 +2223,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_audit_events_volume_total",
 		Help: "Audit-event emit calls by kind prefix (auth.*, key.*, secret.*, account.*, stateless.*, webhook.*, edge_rule.*, cron.*, other). Overflow collapses to __other__ via the bounded admission helper so Prometheus series stay bounded. ADR-091 D20.3 / PR-B residual.",
 	}, []string{"kind_prefix"})
+	// deploymentAuditGCRowsDeletedTotal: rows pruned by the
+	// deployment_audit retention cron
+	// (pkg/meter.RetentionOnceDeploymentAudit, 90-day window).
+	// SAFE-RELEASES production-leveling Stream D (issue #976 /
+	// ADR-122 post-merge audit). Unlabelled — the loop has one
+	// outcome (rows deleted); per-kind breakdown stays on the
+	// deployment_audit_at_gc_idx index. Backs the "is the
+	// deployment_audit prune loop keeping up?" runbook
+	// question (sibling of audit_events_deleted_total).
+	deploymentAuditGCRowsDeletedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_deployment_audit_gc_rows_deleted_total",
+		Help: "Deployment_audit rows pruned by the 90-day retention cron (pkg/meter.RetentionOnceDeploymentAudit, SAFE-RELEASES Stream D). Unlabelled — the loop has one outcome (rows deleted); per-kind breakdown stays on the deployment_audit_at_gc_idx index.",
+	})
 	// Pre-instantiate the closed kind_prefix label set so the
 	// counter's HELP/TYPE and zero-valued series surface in /metrics
 	// from boot (same precedent as auditWriteDur's result label set).
@@ -2378,12 +2448,48 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_alert_eval_fired_total",
 		Help: "Count of alert-rule evaluations where the comparison crossed the threshold AND the cool-down claim won. Unlabelled. Paired with alertEvalSkippedDegradedTotal for the dashboard panel.",
 	})
+	// Issue #976 / ADR-122 / SAFE-RELEASES-A: canary_progression
+	// meterd tick counters. Single-registry: registered on every
+	// daemon's OpsMetrics; only meterd increments. Unlabelled
+	// advanced counter (fleet rollup) + errors counter labelled by
+	// reason ∈ {patch_traffic, append_audit, list_in_flight}
+	// (closed vocabulary, cardinality budget = 3).
+	canaryProgressionAdvancedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_advanced_total",
+		Help: "Count of canary step boundaries crossed by the meterd canary_progression tick (canary_step bumped AND PATCH /v1/deployments/{id}/traffic accepted). Unlabelled — fleet-level rollup. A non-zero rate is the heartbeat; a stalled rate combined with canaryProgressionErrorsTotal('patch_traffic') is the §12 dashboard tripwire for an APID outage.",
+	})
+	canaryProgressionErrorsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_errors_total",
+		Help: "Count of per-row errors inside the canary_progression tick, labelled by reason ∈ {patch_traffic, append_audit, list_in_flight} (closed vocabulary). patch_traffic is the dominant reason (APID 5xx / network blip); append_audit is rare (the audit write is best-effort, the patch already landed); list_in_flight signals a Postgres SELECT failure (fleet-wide tripwire).",
+	}, []string{"reason"})
+	for _, reason := range []string{"patch_traffic", "append_audit", "list_in_flight"} {
+		canaryProgressionErrorsTotal.WithLabelValues(reason)
+	}
+	// SAFE-RELEASES code-review hardening (migration 00517):
+	// tripwire counter for the canary_progression tick seeing a
+	// zero canary_step_started_at. Post-00517 the column is NOT NULL
+	// DEFAULT NOW(), so a non-zero rate means a write path bypassed
+	// the schema default — exactly the silent-soak-bypass hole
+	// finding #1 was worried about. Unlabelled (fleet rollup; per-
+	// deployment detail lives in the deploy.traffic_changed audit
+	// row).
+	canaryProgressionZeroTimestampTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_canary_progression_zero_timestamp_total",
+		Help: "Count of canary_progression tick rows whose canary_step_started_at was the zero time (post-00517 the column is NOT NULL DEFAULT NOW(), so a non-zero rate is the tripwire for a write path bypassing the apid CreateDeployment stamp). Unlabelled — fleet-level rollup.",
+	})
 	alertDeliveryAttemptsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_alert_delivery_attempts_total",
 		Help: "Count of dispatched alert-rule webhook attempts, labelled by outcome ∈ {delivered, failed} (closed vocabulary, cardinality budget = 2). The counter surfaces the dispatcher's success rate without exposing per-customer detail — the audit events table is the per-customer detail.",
 	}, []string{"outcome"})
 	for _, outcome := range []string{"delivered", "failed"} {
 		alertDeliveryAttemptsTotal.WithLabelValues(outcome)
+	}
+	alertActionExecutedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_alert_action_executed_total",
+		Help: "Count of alert-rule firings that executed an in-process action (rollback / demote / promote) on the deployment the rule was scoped to. Labelled by action ∈ {rollback, demote, promote} (closed vocabulary). 'webhook' is intentionally absent — webhook fan-out is the legacy path and is counted under alert_delivery_attempts_total. A non-zero rate is the §12 dashboard's auto-rollback / auto-promote tripwire; pair with the alert.delivered audit kind for per-customer detail.",
+	}, []string{"action"})
+	for _, action := range []string{"rollback", "demote", "promote"} {
+		alertActionExecutedTotal.WithLabelValues(action)
 	}
 	// PR-P4 — Paddle webhook hardening counters. Single-registry:
 	// registered on every daemon's OpsMetrics; only apid increments.
@@ -2783,6 +2889,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// vmmd) from "dialer refused it" (this metric on imaged) — they
 	// have different remediation paths.
 	var ociEgressDeny *prometheus.CounterVec
+	// M-1 / ADR-136 §Decision 2: imaged-only ownership clamp +
+	// layer-entry-skipped counters. Declared as nil on every other
+	// daemon (the accessors nil-check before WithLabelValues /
+	// Write, mirroring OCIEgressDeny).
+	var ownershipClamp *prometheus.CounterVec
+	var layerEntrySkipped prometheus.Counter
 	// Issue #517 / PR-C / ADR-064 — wake-phase collector pair.
 	// Counter gauges per-phase emit counts; histogram buckets
 	// the per-phase duration. Both labelled by the same closed
@@ -2837,6 +2949,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditEventsDeletedTotal,
 		auditEventsRetentionLagSeconds,
 		auditEventsVolumeTotal,
+		deploymentAuditGCRowsDeletedTotal,
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		apidLogsDroppedTotal,
@@ -2886,6 +2999,27 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
 		commonCollectors = append(commonCollectors, ociEgressDeny)
+		// M-1 / ADR-136 §Decision 2: per-layer-entry ownership clamp
+		// counter. reason ∈ {out_of_range, unparseable_uid,
+		// unparseable_gid}; bounded by the closed set so cardinality
+		// is safe. pkg/rootfs.ApplyLayer calls this from
+		// parseOwnershipInt for every uid/gid that falls outside the
+		// [0, 65534] preserve-range (the cap keeps a customer image
+		// from naming a uid that vmmd hands out to a guest — ADR-019).
+		ownershipClamp = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: prefix + "_ownership_clamp_total",
+			Help: "Layer entries whose declared uid/gid fell outside the preserved range (ADR-136 §Decision 2). reason ∈ {out_of_range, unparseable_uid, unparseable_gid}. The clamp is silent on the file itself — entries land under the imaged daemon uid/gid — but a non-zero rate is the Grafana tripwire for misbuilt base images.",
+		}, []string{"reason"})
+		commonCollectors = append(commonCollectors, ownershipClamp)
+		// M-1: char/block/fifo entries dropped by applyEntry. The
+		// counter is closed-labelled (no labels) — every increment
+		// is the same shape. Tripwire for hostile or misbuilt
+		// layers that ship device entries.
+		layerEntrySkipped = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: prefix + "_layer_entry_skipped_total",
+			Help: "Layer entries dropped by applyEntry (char/block/fifo). A non-zero rate is a tripwire for hostile or misbuilt layers that ship device entries.",
+		})
+		commonCollectors = append(commonCollectors, layerEntrySkipped)
 	}
 	// issue #299: Grype scan findings, per (image, severity). The
 	// `image` label is the OCI ref of the staged base ext4; the
@@ -3859,9 +3993,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		domainDoctorOldestObservationSeconds: domainDoctorOldestObservationSeconds,
 		domainDoctorSkippedFlagDisabled:      domainDoctorSkippedFlagDisabled,
 		auditEventsVolumeTotal:               auditEventsVolumeTotal,
+		deploymentAuditGCRowsDeletedTotal:    deploymentAuditGCRowsDeletedTotal,
 		alertEvalSkippedDegradedTotal:        alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                  alertEvalFiredTotal,
+		canaryProgressionAdvancedTotal:       canaryProgressionAdvancedTotal,
+		canaryProgressionErrorsTotal:         canaryProgressionErrorsTotal,
+		canaryProgressionZeroTimestampTotal:  canaryProgressionZeroTimestampTotal,
 		alertDeliveryAttemptsTotal:           alertDeliveryAttemptsTotal,
+		alertActionExecutedTotal:             alertActionExecutedTotal,
 		paddleWebhookVerifyFailedTotal:       paddleWebhookVerifyFailedTotal,
 		paddleWebhookReplaySuppressedTotal:   paddleWebhookReplaySuppressedTotal,
 		alertEvaluatorEnabled:                alertEvaluatorEnabled,
@@ -3911,6 +4050,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		sseClients:                           sseClients,
 		egressDeny:                           egressDeny,
 		ociEgressDeny:                        ociEgressDeny,
+		ownershipClamp:                       ownershipClamp,
+		layerEntrySkipped:                    layerEntrySkipped,
 		provenanceWrites:                     provenanceWrites,
 		imageScanVulns:                       imageScanVulns,
 		deployScanDuration:                   deployScanDuration,
@@ -4956,6 +5097,24 @@ func (m *OpsMetrics) AuditEventsDeleted() prometheus.Counter {
 	return m.auditEventsDeletedTotal
 }
 
+// DeploymentAuditGCRowsDeleted returns the counter of rows
+// pruned by the deployment_audit 90-day retention cron
+// (pkg/meter.RetentionOnceDeploymentAudit, SAFE-RELEASES
+// production-leveling Stream D). The counter is unlabelled —
+// the loop has one outcome (rows deleted); per-kind breakdown
+// stays on the deployment_audit_at_gc_idx index. cmd/meterd
+// calls .Add(float64(n)) on the returned counter after each
+// successful pass (only when n > 0 so idle passes don't tick
+// up — same precedent as AuditEventsDeleted). Nil-safe —
+// single-registry pattern, daemons that don't wire the
+// retention loop (apid) still expose a nil-returning accessor.
+func (m *OpsMetrics) DeploymentAuditGCRowsDeleted() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.deploymentAuditGCRowsDeletedTotal
+}
+
 // AuditEventsRetentionLag returns the gauge of seconds since
 // the most recent retention cutoff was computed. Set (not Inc) —
 // the value reflects the LATEST pass. A pinned-zero value is the
@@ -5558,6 +5717,31 @@ func (m *OpsMetrics) OCIEgressDenySeries() *prometheus.CounterVec {
 	return m.ociEgressDeny
 }
 
+// OwnershipClamp returns the per-reason counter that records layer
+// entries whose declared uid/gid fell outside the preserved range
+// (ADR-136 §Decision 2). reason ∈ {out_of_range, unparseable_uid,
+// unparseable_gid}. Nil-safe on a nil receiver and on non-imaged
+// OpsMetrics (the collector is registered only when prefix ==
+// "imaged"), so pkg/rootfs.ApplyLayer can call without a nil-check.
+// The returned Counter is safe to cache; the underlying CounterVec
+// is shared with other reason tuples.
+func (m *OpsMetrics) OwnershipClamp(reason string) prometheus.Counter {
+	if m == nil || m.ownershipClamp == nil {
+		return nil
+	}
+	return m.ownershipClamp.WithLabelValues(reason)
+}
+
+// LayerEntrySkipped returns the bare Counter for char/block/fifo
+// layer entries dropped by pkg/rootfs.applyEntry. Nil-safe on a nil
+// receiver and on non-imaged OpsMetrics.
+func (m *OpsMetrics) LayerEntrySkipped() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.layerEntrySkipped
+}
+
 // EgressSourceErrors returns the bare Counter that records per-
 // instance sysfs read failures from the vmmd network poll adapter
 // (ADR-046, step 7). Safe on a nil receiver so call sites can be
@@ -6012,6 +6196,61 @@ func (m *OpsMetrics) AlertEvalFiredTotal() func() {
 	return func() {}
 }
 
+// CanaryProgressionAdvancedTotal (issue #976 / ADR-122 /
+// SAFE-RELEASES-A) increments the canary-progression advanced
+// counter. Fires once per row whose canary_step has just been
+// bumped (wall-clock boundary crossed + APID patch accepted).
+// Unlabelled. Returns a no-op closure on a nil receiver — mirrors
+// AlertEvalFiredTotal.
+func (m *OpsMetrics) CanaryProgressionAdvancedTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.canaryProgressionAdvancedTotal.Inc()
+	return func() {}
+}
+
+// CanaryProgressionZeroTimestampTotal (SAFE-RELEASES code-review
+// hardening, migration 00517) increments the canary-progression
+// tripwire counter every time the meterd tick walks a row whose
+// canary_step_started_at is the zero time. Post-00517 the column is
+// NOT NULL DEFAULT NOW(), so a non-zero rate means a write path
+// bypassed the schema default — exactly the silent-soak-bypass hole
+// code-review finding #1 was worried about. Behaviour on zero is
+// unchanged (the wall-clock check still runs; elapsed = 56 years >
+// Duration → advance) — the counter exists purely for operator
+// visibility (and as the §12 dashboard tripwire for "a write path
+// skipped the apid CreateDeployment stamp"). Unlabelled — fleet
+// rollup; per-deployment detail lives in the existing
+// deploy.traffic_changed audit row. Returns a no-op closure on a
+// nil receiver — mirrors CanaryProgressionAdvancedTotal.
+func (m *OpsMetrics) CanaryProgressionZeroTimestampTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.canaryProgressionZeroTimestampTotal.Inc()
+	return func() {}
+}
+
+// CanaryProgressionErrorsTotal (issue #976 / ADR-122 /
+// SAFE-RELEASES-A) increments the canary-progression error counter
+// labelled by reason ∈ {patch_traffic, append_audit,
+// list_in_flight}. Closed vocabulary; unknown reasons drop to the
+// no-op closure (matches AlertDeliveryAttemptsTotal).
+func (m *OpsMetrics) CanaryProgressionErrorsTotal(reason string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch reason {
+	case "patch_traffic", "append_audit", "list_in_flight":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.canaryProgressionErrorsTotal.WithLabelValues(reason).Inc()
+	return func() {}
+}
+
 // AlertDeliveryAttemptsTotal increments the alert-delivery attempts
 // counter, labelled by outcome ∈ {delivered, failed}. An unknown
 // outcome is dropped (the closed-vocabulary contract — see
@@ -6028,6 +6267,27 @@ func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
 		return func() {}
 	}
 	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
+	return func() {}
+}
+
+// AlertActionExecutedTotal (issue #976 / ADR-122 / SAFE-RELEASES-B)
+// increments the alert-action executed counter, labelled by action
+// ∈ {rollback, demote, promote} (closed vocabulary — the
+// 'webhook' default is NOT a candidate here because it bypasses
+// this surface entirely; webhook fan-out is the legacy path and
+// is counted under AlertDeliveryAttemptsTotal). Unknown actions
+// are dropped. Returns a no-op closure on a nil receiver.
+func (m *OpsMetrics) AlertActionExecutedTotal(action string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch action {
+	case "rollback", "demote", "promote":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.alertActionExecutedTotal.WithLabelValues(action).Inc()
 	return func() {}
 }
 

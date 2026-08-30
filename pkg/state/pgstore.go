@@ -8183,11 +8183,12 @@ func (s *PgStore) UpdateAlertRule(ctx context.Context, id string, p UpdateAlertR
 			webhook_url = coalesce($8, webhook_url),
 			webhook_secret_sealed = coalesce($9, webhook_secret_sealed),
 			cooldown_minutes = coalesce($10, cooldown_minutes),
+			action  = coalesce($11, action),
 			updated_at = now()
 		where id = $1
 		returning `+alertRuleSelectCols,
 		id, nameArg, p.Enabled, metricArg, comparisonArg, p.Threshold,
-		windowArg, urlArg, secretArg, p.CooldownMinutes,
+		windowArg, urlArg, secretArg, p.CooldownMinutes, p.Action,
 	)
 	r, err := scanAlertRule(row)
 	if err != nil {

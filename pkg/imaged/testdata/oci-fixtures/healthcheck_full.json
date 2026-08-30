@@ -1,0 +1,20 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Cmd": ["/app/server"],
+    "User": "1001",
+    "Healthcheck": {
+      "Test": ["CMD", "/bin/check", "--verbose"],
+      "Interval": 30000000000,
+      "Timeout": 5000000000,
+      "Retries": 3,
+      "StartPeriod": 10000000000
+    },
+    "StopSignal": "SIGUSR1"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+  }
+}

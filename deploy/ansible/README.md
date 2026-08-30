@@ -85,8 +85,9 @@ gregalectl deploy join-node --manifest-file /secure/manifest.yaml \
 For a multi-box join, include the same secret-backed `storage.env` for every
 box with `--storage-env /secure/storage.env`. The join pipeline installs it
 on the control plane and the adopted compute node as `root:faas 0440` and
-rejects `FAAS_STORAGE_BACKEND=local` or a `snap/` local-prefix override. The
-file must set `FAAS_STORAGE_BACKEND=oci` and `FAAS_OCI_REGISTRY`; credentials
+rejects `FAAS_STORAGE_BACKEND=local` or a `snap/` local-prefix override at
+both the CLI and Ansible staging boundaries. The file must set
+`FAAS_STORAGE_BACKEND=oci` and `FAAS_OCI_REGISTRY`; credentials
 remain outside the repository. This lets vmmd preposition snapshots into
 each node's bounded read-through cache without provider-specific disk or
 peer-address configuration.

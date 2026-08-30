@@ -512,20 +512,9 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// /srv/fc/snap and the resolution is essentially a stat; the OCI
 	// driver streams the bytes over HTTP. Tmp cleanup happens via the
 	// deferred Kill (chroot lives on tmpfs and disappears with it).
-	memSrc := spec.VMStatePath
-	// A LocalCacheBackend can expose an existing cache file through
-	// LocalPath, but that file is not an authoritative write destination when
-	// its parent is OCI. Bypass the local-path rename in OCI mode so Put
-	// always publishes the new snapshot to the shared registry and then
-	// refreshes the cache.
-	if spec.StorageKey != "" && v.storage != nil && !strings.EqualFold(os.Getenv("FAAS_STORAGE_BACKEND"), "oci") {
-		memTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.StorageKey)
-		if gerr != nil {
-			return gerr
-		}
-		if memTmp != "" {
-			memSrc = memTmp
-		}
+	memSrc, err := v.restoreMemSource(ctx, l.Instance, spec)
+	if err != nil {
+		return err
 	}
 	if memSrc == "" {
 		return fmt.Errorf("vmm: restore spec missing mem source (storage_key=%q)", spec.StorageKey)
@@ -721,6 +710,26 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		"total_ms", tReady.Sub(t0).Milliseconds(),
 	)
 	return nil
+}
+
+// restoreMemSource resolves the memory blob from the canonical storage key
+// whenever one is present. The legacy VMStatePath is only a fallback for
+// callers that predate StorageKey. This must not branch on
+// FAAS_STORAGE_BACKEND: OCI mode still needs the memory blob materialized
+// from StorageBackend before Firecracker can load the snapshot.
+func (v *JailerVMM) restoreMemSource(ctx context.Context, instanceID string, spec RestoreSpec) (string, error) {
+	memSrc := spec.VMStatePath
+	if spec.StorageKey == "" || v.storage == nil {
+		return memSrc, nil
+	}
+	memTmp, err := v.restoreSourceFromStorage(ctx, instanceID, spec.StorageKey)
+	if err != nil {
+		return "", err
+	}
+	if memTmp != "" {
+		memSrc = memTmp
+	}
+	return memSrc, nil
 }
 
 // vsockUDSSock is the host-side path the TriggerResumeHook dialer reaches.
@@ -1098,7 +1107,12 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 	var memBytes int64
 	var err error
 	memPublishedLocally := false
-	if spec.StorageKey != "" && v.storage != nil {
+	// In OCI mode, never rename into a cache path returned by LocalPath:
+	// the cache is only a read-through copy and must not become the sole
+	// publication of a new snapshot. Force the StorageBackend.Put path so
+	// the shared registry receives the blob. Explicit local-prefix routing
+	// still remains functional because Put dispatches the key normally.
+	if spec.StorageKey != "" && v.storage != nil && !strings.EqualFold(os.Getenv("FAAS_STORAGE_BACKEND"), "oci") {
 		if resolver, ok := v.storage.(storage.LocalPathResolver); ok {
 			if localPath, pathOK, pathErr := resolver.LocalPath(spec.StorageKey); pathErr != nil {
 				return SnapshotInfo{}, fmt.Errorf("vmm: resolve snapshot mem path: %w", pathErr)

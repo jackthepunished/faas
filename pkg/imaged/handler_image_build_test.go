@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -141,7 +142,7 @@ func (f *fakeManifestPuller) putConfig(digest string, cfg oci.Config) {
 			WorkingDir string   `json:"WorkingDir"`
 			User       string   `json:"User"`
 		}{
-			Env: cfg.Env, Entrypoint: cfg.Entrypoint, Cmd: cfg.Cmd,
+			Env: envMapToSlice(cfg.Env), Entrypoint: cfg.Entrypoint, Cmd: cfg.Cmd,
 			WorkingDir: cfg.WorkingDir, User: cfg.User,
 		},
 		RootFS: struct {
@@ -608,4 +609,26 @@ func TestHandleDeployment_BuildSidecarLayers_DenylistRejects(t *testing.T) {
 	if findNotify(notif, db.NotifySnapshotPrime) != nil {
 		t.Error("snapshot_prime should not fire on sidecar denylist rejection")
 	}
+}
+
+// envMapToSlice converts a map[string]string back to "KEY=VALUE" slice
+// form for OCI wire JSON marshalling in putConfig. The OCI image-spec
+// config document carries Env as []string, while oci.Config stores it
+// as map[string]string after the F7 round-trip removal — so the test
+// helper bridges the two at the wire boundary. Sorted output for
+// deterministic test JSON.
+func envMapToSlice(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(env))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
 }

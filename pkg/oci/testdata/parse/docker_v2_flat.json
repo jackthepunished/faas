@@ -1,0 +1,12 @@
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "Cmd": ["/bin/sh", "-c", "echo docker-v2-flat"],
+  "Env": [
+    "PATH=/usr/local/bin:/usr/bin:/bin",
+    "FOO=bar",
+    "LANG=C.UTF-8"
+  ],
+  "WorkingDir": "/app",
+  "User": "1001"
+}

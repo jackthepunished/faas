@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -95,11 +96,27 @@ var functionHandlerFiles = map[string]bool{
 // SourceTarballMaxMB cap (pkg/api/limits.go) and are reproduced server-side by
 // the builder. Aggressive-but-predictable: other dotfiles (.env, .dockerignore,
 // .npmrc, .github/) are deliberately kept.
+//
+// The set is fixed (no customer config) so a customer reading the docs can
+// reason about their tarball contents without consulting a per-customer file.
+// Project-level exclusions belong in .gregaleignore (loaded by
+// loadGregaleignore below). Issue #1182 added the six "common build
+// artifact" dirs (dist/.next/coverage/target/.venv/.cache) so a fresh
+// `gregale deploy` from a Next.js / Maven / Cargo / coverage-instrumented
+// project doesn't trip the SourceTarballMaxMB cap with garbage the
+// builder is going to throw away anyway.
 var defaultExcludeDirs = map[string]bool{
 	".git":         true,
 	"node_modules": true,
 	"vendor":       true,
 	"__pycache__":  true,
+	// Common build / coverage output dirs (issue #1182 §3.5).
+	"dist":     true, // npm run build / go build / vite
+	".next":    true, // Next.js build output
+	"coverage": true, // nyc / istanbul / go test -coverprofile
+	"target":   true, // Maven / Cargo / Scala
+	".venv":    true, // Python virtualenv
+	".cache":   true, // pip / pytest / generic
 }
 
 // defaultExcludeFiles are basenames dropped anywhere in the tree (OS junk).
@@ -136,25 +153,182 @@ var appMarker = map[string]framework{
 // and it avoids leaking local mtimes).
 var packEpoch = time.Unix(0, 0)
 
-// shouldExclude reports whether a slash-separated path relative to the packed
-// root (e.g. "node_modules/foo/index.js") should be omitted from the archive.
-func shouldExclude(relSlashPath string, isDir bool) bool {
+// gregaleignoreFile is the filename at the packed root whose lines are
+// consulted by shouldExclude in addition to defaultExcludeDirs /
+// defaultExcludeFiles (issue #1182 §3.5). Lives in the same file as the
+// packer because there is exactly one consumer and tests live in
+// pack_test.go.
+//
+// Grammar is a strict subset of .gitignore:
+//
+//   - blank lines and lines beginning with '#' are ignored
+//   - leading '!' negates a previous match (a previously-excluded file
+//     can be re-included by a later negated line)
+//   - leading '/' anchors the pattern to the packed root (no
+//     unanchored equivalent in a non-rooted context)
+//   - trailing '/' restricts the pattern to directories
+//   - per-segment shell glob: '*' matches any run of non-'/' chars;
+//     '?' matches a single non-'/' char. No '**' / no character
+//     classes / no bracket expressions in v1.
+//
+// If the file is absent or unreadable the packer falls through to the
+// defaults alone (no regression for customers without a file). Malformed
+// lines are skipped silently (matches gitignore: invalid patterns are
+// ignored, not fatal).
+const gregaleignoreFile = ".gregaleignore"
+
+// gregaleignorePattern is one parsed line. Fields are independent
+// (anchor + dirOnly + negate can all be true on the same line).
+type gregaleignorePattern struct {
+	raw          string
+	anchor       bool     // leading '/'
+	dirOnly      bool     // trailing '/'
+	negate       bool     // leading '!'
+	globSegments []string // per-segment glob, split on '/'
+}
+
+// loadGregaleignore reads .gregaleignore from srcDir (the packed root)
+// and returns the parsed patterns in file order. Missing / unreadable
+// file → nil (no patterns → shouldExclude falls through to defaults
+// alone). Per-line parse failures are skipped silently.
+func loadGregaleignore(srcDir string) []gregaleignorePattern {
+	data, err := os.ReadFile(filepath.Join(srcDir, gregaleignoreFile))
+	if err != nil {
+		return nil
+	}
+	return parseGregaleignore(data)
+}
+
+// parseGregaleignore parses a .gregaleignore byte slice into patterns.
+// Pure function so pack_test.go can drive it without touching the
+// filesystem.
+func parseGregaleignore(data []byte) []gregaleignorePattern {
+	var out []gregaleignorePattern
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	// Allow long lines; the .gregaleignore spec has no line-length cap
+	// (gitignore uses the same ScanLines default and never complains).
+	for sc.Scan() {
+		// Trim trailing CR (for CRLF inputs) AND surrounding
+		// whitespace so blank / whitespace-only lines and
+		// trailing-whitespace comments are ignored the same way
+		// gitignore treats them.
+		line := strings.TrimSpace(strings.TrimRight(sc.Text(), "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		p := gregaleignorePattern{}
+		if strings.HasPrefix(line, "!") {
+			p.negate = true
+			line = line[1:]
+		}
+		if strings.HasPrefix(line, "/") {
+			p.anchor = true
+			line = line[1:]
+		}
+		if strings.HasSuffix(line, "/") {
+			p.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
+		}
+		if line == "" {
+			// Pure "!", "/", or "/" line — ignore (matches gitignore:
+			// an empty pattern after stripping flags would match every
+			// path, which is never what the customer meant).
+			continue
+		}
+		p.raw = line
+		p.globSegments = strings.Split(line, "/")
+		out = append(out, p)
+	}
+	return out
+}
+
+// matchGregaleignore reports whether relSlash matches any of the
+// patterns, honouring the negation toggle: a later '!pattern' can
+// re-include a file that was previously excluded.
+//
+// relSlash is slash-separated (filepath.ToSlash applied by the caller),
+// isDir is true for directory entries. dirOnly patterns only fire on
+// directories.
+func matchGregaleignore(relSlash string, isDir bool, patterns []gregaleignorePattern) bool {
+	matched := false
+	for _, p := range patterns {
+		if p.dirOnly && !isDir {
+			continue
+		}
+		if matchGregaleignoreOne(relSlash, p) {
+			matched = !p.negate
+		}
+	}
+	return matched
+}
+
+// matchGregaleignoreOne tests a single pattern against relSlash.
+// Anchored patterns only match at the packed root; unanchored patterns
+// match at any depth (gitignore's last-segment-match rule).
+func matchGregaleignoreOne(relSlash string, p gregaleignorePattern) bool {
+	parts := strings.Split(relSlash, "/")
+	if p.anchor {
+		return globMatchSegments(parts, p.globSegments)
+	}
+	// Unanchored: try every suffix of the path (the full path, then
+	// dropping one leading segment, etc.). This is the gitignore
+	// "matches a path component at any level" rule; e.g. `*.log`
+	// matches `a/b/c.log` because the suffix `b/c.log` segments
+	// match `*.log`.
+	for i := 0; i < len(parts); i++ {
+		if globMatchSegments(parts[i:], p.globSegments) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatchSegments matches a (suffix of) the rel path against the
+// pattern's per-segment globs. Uses path/filepath.Match per segment
+// so '*' / '?' work but no '**' / bracket classes. Lengths must match
+// exactly — `*.log` matches `a.log` but not `a.log.bak`.
+func globMatchSegments(parts, pattern []string) bool {
+	if len(parts) != len(pattern) {
+		return false
+	}
+	for i, pat := range pattern {
+		ok, err := filepath.Match(pat, parts[i])
+		if err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldExclude reports whether a slash-separated path relative to the
+// packed root (e.g. "node_modules/foo/index.js") should be omitted from
+// the archive. patterns is the parsed .gregaleignore list (nil/absent
+// → no project-level exclusions).
+//
+// Order of checks: defaults first (cheap map lookups, no allocation),
+// then .gregaleignore (per-entry glob walk). Defaults win over a
+// later negated .gregaleignore line — the customer's "include back
+// the dist/" un-exclude cannot revive a default-excluded build dir.
+// That matches the intent: defaults exist to keep the tarball under
+// the source cap, and unblocking them defeats that purpose.
+func shouldExclude(relSlashPath string, isDir bool, patterns []gregaleignorePattern) bool {
 	base := relSlashPath
 	if i := strings.LastIndex(relSlashPath, "/"); i >= 0 {
 		base = relSlashPath[i+1:]
 	}
 	if isDir {
-		return defaultExcludeDirs[base]
+		if defaultExcludeDirs[base] {
+			return true
+		}
+	} else {
+		if defaultExcludeFiles[base] {
+			return true
+		}
+		if strings.HasSuffix(base, ".pyc") {
+			return true
+		}
 	}
-	// Any file living under an excluded directory is dropped implicitly by
-	// WalkDir's SkipDir, so here we only handle file-level rules.
-	if defaultExcludeFiles[base] {
-		return true
-	}
-	if strings.HasSuffix(base, ".pyc") {
-		return true
-	}
-	return false
+	return matchGregaleignore(relSlashPath, isDir, patterns)
 }
 
 // detectFramework sniffs the TOP-LEVEL entries of srcDir (no recursion) and
@@ -492,12 +666,14 @@ func runtimeSuggestionFor(fw framework, ver string) string {
 // at every depth so a stray node_modules/x/package.json does not
 // false-positive as a workspace.
 //
-// Depth-3+ monorepos (e.g. apps/web/services/api/package.json — three
-// subdirectory levels deep) intentionally return false: the customer gets
-// the existing bare error. Deeper detection belongs to `gregale scan`
-// (pkg/reposcan), which already handles it via the
-// workspaces_extra_test.go "monorepo" fixture. The CLI hint is just a
-// pointer at the next step.
+// Depth-3 monorepos (e.g. apps/services/api/package.json — three
+// subdirectory levels deep) are now visible (walkForMarkers maxDepth
+// bumped from 1 to 2 in commit issue #1182 §P1 follow-up) so the
+// hint fires for `apps/services/api/package.json` too. Depth-4+
+// remains out of scope — those belong to `gregale scan` (pkg/reposcan),
+// which already handles them via the workspaces_extra_test.go
+// "monorepo" fixture. The CLI hint is just a pointer at the next
+// step.
 func detectNestedMarkerHint(srcDir string) bool {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
@@ -510,11 +686,13 @@ func detectNestedMarkerHint(srcDir string) bool {
 		if isExcludedSubdir(e.Name()) {
 			continue
 		}
-		// walkForMarkers(d1, 1) recurses one level into each top-level
-		// subdir, which puts us at depth 2 from the project root — files
+		// walkForMarkers(d1, 2) recurses two levels into each top-level
+		// subdir, which puts us at depth 3 from the project root — files
 		// at apps/web/package.json are seen; files at
-		// apps/web/services/api/package.json (depth 3) are not.
-		if walkForMarkers(filepath.Join(srcDir, e.Name()), 1) {
+		// apps/services/api/package.json (depth 3) are now seen;
+		// files at apps/web/services/api/package.json (depth 4) are
+		// still out of scope.
+		if walkForMarkers(filepath.Join(srcDir, e.Name()), 2) {
 			return true
 		}
 	}
@@ -702,14 +880,19 @@ func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
 	return "", "", false
 }
 
-// zeroConfigSourceCapMB is the conservative per-plan floor used by the
-// zero-config preflight: the server will reject anything above this on
-// Free/Hobby (see pkg/api/limits.go: SourceTarballMaxMB). We don't have the
-// customer's plan on the wire without a GetAccount round-trip; the floor is
-// the safest choice because a zero-config abort on Free is much better UX
-// than a slow upload that ends in a 413. Customers on Pro/Scale who exceed
-// 100 MB but fit within 250 MB should pass --tarball of a hand-built archive.
-const zeroConfigSourceCapMB = 100
+// defaultZeroConfigSourceCapMB is the conservative per-plan floor used when
+// the CLI can't resolve the customer's plan (Whoami round-trip failed or
+// skipped). The server rejects anything above 100 MB on Free/Hobby (see
+// pkg/api/limits.go: SourceTarballMaxMB). The floor is the safest choice
+// because a zero-config abort on Free is much better UX than a slow upload
+// that ends in a 413. Customers on Pro/Scale who exceed 100 MB but fit within
+// 250 MB should pass --tarball of a hand-built archive.
+//
+// Production callers (commands2.go) resolve the per-plan cap via
+// api.MustLimitsFor(plan).SourceTarballMaxMB and thread it through; this
+// constant is the floor for the cmd/gregale/pack_test.go harness where the
+// plan is unknown.
+const defaultZeroConfigSourceCapMB = 100
 
 // packDirToTarGz walks srcDir and writes a gzipped tar archive to destPath. The
 // archive's single top-level directory is filepath.Base(srcDir), preserving the
@@ -717,11 +900,15 @@ const zeroConfigSourceCapMB = 100
 // hardlinks and device nodes are rejected — apid rejects them too, so failing
 // fast in the CLI is strictly better UX. Regular files are streamed with a fixed
 // mtime for reproducibility, and each file is read through a LimitReader
-// capped at zeroConfigSourceCapMB so a single runaway file aborts early
-// instead of materialising its full size into the tar. After the archive is
-// written the on-disk size is re-checked against the cap (gzip compression
-// can change the byte count either way). Returns the count of regular files
-// archived.
+// capped at capMB so a single runaway file aborts early instead of
+// materialising its full size into the tar. After the archive is written the
+// on-disk size is re-checked against the cap (gzip compression can change the
+// byte count either way). Returns the count of regular files archived.
+//
+// capMB is the per-plan upload cap resolved by the caller from
+// api.MustLimitsFor(plan).SourceTarballMaxMB. cmd/gregale's tests pass
+// defaultZeroConfigSourceCapMB as a stable floor so the per-file / total-size
+// tests have a deterministic budget.
 //
 // envOverride, when non-nil, is a rel-path → redacted-bytes map applied to
 // the matching entry before it's written to the tarball. Used by the
@@ -733,8 +920,13 @@ const zeroConfigSourceCapMB = 100
 // harness, or `gregale deploy --secret-scan=off`).
 //
 // The gzip→tar→walk shape mirrors cmd/gregale/templates/embed.go:TarGz.
-func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (regularFileCount int, err error) {
+func packDirToTarGz(srcDir, destPath string, capMB int, envOverride map[string][]byte) (regularFileCount int, err error) {
 	root := filepath.Base(srcDir)
+
+	// Load .gregaleignore once (before the walk) so shouldExclude sees
+	// the same patterns for every entry. Missing file → nil → no
+	// project-level exclusions (defaults still apply).
+	gitignorePatterns := loadGregaleignore(srcDir)
 
 	f, err := os.Create(destPath)
 	if err != nil {
@@ -771,7 +963,7 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 			return rerr
 		}
 		relSlash := filepath.ToSlash(rel)
-		if shouldExclude(relSlash, d.IsDir()) {
+		if shouldExclude(relSlash, d.IsDir(), gitignorePatterns) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -837,7 +1029,7 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 		if err := tw.WriteHeader(hdr); err != nil {
 			return 0, fmt.Errorf("write header %s: %w", hdr.Name, err)
 		}
-		if err := copyRegular(tw, e.abs); err != nil {
+		if err := copyRegular(tw, e.abs, capMB); err != nil {
 			return 0, err
 		}
 		regularFileCount++
@@ -856,10 +1048,10 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 	if err != nil {
 		return 0, fmt.Errorf("stat packed tarball: %w", err)
 	}
-	const capBytes = zeroConfigSourceCapMB * 1024 * 1024
+	capBytes := int64(capMB) * 1024 * 1024
 	if st.Size() > capBytes {
 		return 0, fmt.Errorf("packed cwd is %d MB, over the %d MB zero-config cap; trim large files or pass --tarball of a hand-built archive",
-			st.Size()/(1024*1024), zeroConfigSourceCapMB)
+			st.Size()/(1024*1024), capMB)
 	}
 	return regularFileCount, nil
 }
@@ -870,25 +1062,34 @@ func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (reg
 // because the walked paths are customer-supplied (TOCTOU: a path Lstat'd as
 // regular during the walk could be swapped for a symlink before we read it).
 //
-// The stream is wrapped in a LimitReader at zeroConfigSourceCapMB so a single
-// runaway file (a 2 GB raw dataset committed by accident) aborts early with
-// a clear error instead of streaming gigabytes through gzip→tar. The cap
-// matches the Free/Hobby floor; Pro/Scale customers who deliberately commit
-// larger files should pass --tarball of a hand-built archive.
-func copyRegular(tw *tar.Writer, abs string) error {
+// The stream is wrapped in a LimitReader at capMB so a single runaway file
+// (a 2 GB raw dataset committed by accident) aborts early with a clear
+// error instead of streaming gigabytes through gzip→tar. capMB is the
+// per-plan upload cap resolved by the caller from
+// api.MustLimitsFor(plan).SourceTarballMaxMB.
+func copyRegular(tw *tar.Writer, abs string, capMB int) error {
 	f, err := openCustomerFile(abs)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", abs, err)
 	}
 	defer func() { _ = f.Close() }()
-	n, err := io.Copy(tw, f)
+	// Wrap the source in a LimitReader so a runaway file (a 2 GB raw
+	// dataset committed by accident) aborts with at most capBytes+1
+	// bytes streamed into the tar before we reject it. Reading +1
+	// disambiguates "file is exactly capBytes" (allowed) from "file is
+	// strictly larger" (rejected). The prior implementation did
+	// io.Copy(tw, f) without a cap and only checked the size after the
+	// entire file had already been streamed into gzip — a 2 GB file
+	// would pay the full CPU/IO cost before the error surfaced.
+	capBytes := int64(capMB) * 1024 * 1024
+	lr := io.LimitReader(f, capBytes+1)
+	n, err := io.Copy(tw, lr)
 	if err != nil {
 		return fmt.Errorf("copy %s: %w", abs, err)
 	}
-	const warnBytes = zeroConfigSourceCapMB * 1024 * 1024
-	if n >= warnBytes {
-		return fmt.Errorf("refusing to pack %s: %d bytes >= %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
-			filepath.Base(abs), n, zeroConfigSourceCapMB)
+	if n > capBytes {
+		return fmt.Errorf("refusing to pack %s: %d bytes > %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
+			filepath.Base(abs), n, capMB)
 	}
 	return nil
 }
@@ -1012,7 +1213,7 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 // secret-scan pass (see scanAndRedactEnvFiles). Pass nil to skip the scan
 // entirely — used by `gregale deploy --secret-scan=off` and by callers
 // that already vetted the inputs (cmd/e2e harness, pack_test.go).
-func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
+func autoPackCwd(srcDir string, capMB int, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
 	// Error-explanations cluster (spec §6.4 amendment 1): warn-only
 	// preflight that lifts the cluster's source-side hints via the
 	// whycopy catalog. Hints are printed after the deploy summary by
@@ -1036,7 +1237,7 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 	path := f.Name()
 	_ = f.Close()
 
-	n, err := packDirToTarGz(srcDir, path, envOverride)
+	n, err := packDirToTarGz(srcDir, path, capMB, envOverride)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", fwUnknown, 0, err

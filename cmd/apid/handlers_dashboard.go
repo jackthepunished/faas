@@ -2091,6 +2091,33 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	// Production-leveling Stream A: per-deployment audit timeline
+	// (issue #976 / ADR-122 / SAFE-RELEASES-E.2). The handler
+	// already verified dep.AppID == app.ID above (IDOR posture
+	// line 1931) so a plain ListDeploymentAudit(dep.ID) is safe.
+	// On read error we leave DeploymentAudit empty and log —
+	// the page is read-only so a missing timeline shouldn't 500
+	// the operator's day. Capped at listDeploymentAuditLimitDefault
+	// (50) rows; the same wire shape /v1/deployments/{id}/audit
+	// returns, just projected through dashboard.DeploymentAuditRow
+	// instead of api.DeploymentAuditResponse.
+	if auditRows, err := s.store.ListDeploymentAudit(ctx, dep.ID, listDeploymentAuditLimitDefault); err == nil {
+		rows := make([]dashboard.DeploymentAuditRow, 0, len(auditRows))
+		for _, row := range auditRows {
+			rows = append(rows, dashboard.DeploymentAuditRow{
+				At:            row.At,
+				Kind:          string(row.Kind),
+				Actor:         row.Actor,
+				SeverityClass: dashboard.DeploymentAuditSeverityClass(string(row.Kind)),
+				DataPretty:    dashboard.PrettyAuditData(row.Data),
+			})
+		}
+		data.DeploymentAudit = rows
+	} else {
+		log.Warn("dashboard renderDeploymentDetail: list deployment audit",
+			"deployment_id", dep.ID, "err", err)
+	}
+
 	nonce := httpsec.NonceFromContext(r.Context())
 	page := dashboard.Page{
 		Title:   "Deployment " + dep.ID,

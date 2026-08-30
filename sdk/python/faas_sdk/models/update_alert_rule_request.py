@@ -6,6 +6,10 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.update_alert_rule_request_action import (
+    UpdateAlertRuleRequestAction,
+    check_update_alert_rule_request_action,
+)
 from ..models.update_alert_rule_request_comparison import (
     UpdateAlertRuleRequestComparison,
     check_update_alert_rule_request_comparison,
@@ -38,6 +42,8 @@ class UpdateAlertRuleRequest:
     webhook_secret: str | Unset = UNSET
     """New plaintext HMAC secret. Omit to keep the existing secret."""
     cooldown_minutes: int | Unset = UNSET
+    action: UpdateAlertRuleRequestAction | Unset = UNSET
+    """Replace the action. Omit to leave the existing action in place."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,6 +71,10 @@ class UpdateAlertRuleRequest:
 
         cooldown_minutes = self.cooldown_minutes
 
+        action: str | Unset = UNSET
+        if not isinstance(self.action, Unset):
+            action = self.action
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -86,6 +96,8 @@ class UpdateAlertRuleRequest:
             field_dict["webhook_secret"] = webhook_secret
         if cooldown_minutes is not UNSET:
             field_dict["cooldown_minutes"] = cooldown_minutes
+        if action is not UNSET:
+            field_dict["action"] = action
 
         return field_dict
 
@@ -125,6 +137,13 @@ class UpdateAlertRuleRequest:
 
         cooldown_minutes = d.pop("cooldown_minutes", UNSET)
 
+        _action = d.pop("action", UNSET)
+        action: UpdateAlertRuleRequestAction | Unset
+        if isinstance(_action, Unset):
+            action = UNSET
+        else:
+            action = check_update_alert_rule_request_action(_action)
+
         update_alert_rule_request = cls(
             name=name,
             enabled=enabled,
@@ -135,6 +154,7 @@ class UpdateAlertRuleRequest:
             webhook_url=webhook_url,
             webhook_secret=webhook_secret,
             cooldown_minutes=cooldown_minutes,
+            action=action,
         )
 
         update_alert_rule_request.additional_properties = d

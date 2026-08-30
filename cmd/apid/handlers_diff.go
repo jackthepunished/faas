@@ -183,6 +183,13 @@ func (s *server) buildDiffBaseline(ctx context.Context, app state.App, acct stat
 		// the wire shape the CLI sees.
 		dresp := s.deploymentResponse(dep, app)
 		out.LatestDeployment = &dresp
+		// SAFE-RELEASES production-leveling Stream E: pin the
+		// scope of the latest deployment so the engine can emit
+		// a `scope_mismatch` SeverityWarn break when the
+		// pending deploy targets a different scope (cross-env
+		// promotion). dep.Scope is already populated by the
+		// SELECT projection pgstore loads (migrations/00213).
+		out.LatestScope = dep.Scope
 	} else if !errors.Is(err, state.ErrNotFound) {
 		// Hard error — surface to the caller.
 		return out, err
@@ -278,6 +285,14 @@ func diffPendingFromRequest(req *api.DiffRequest) deploydiff.Pending {
 	}
 	p.Manifest = req.Manifest
 	p.ImageRef = req.ImageRef
+	// SAFE-RELEASES production-leveling Stream E: thread the
+	// pending deployment's scope so the engine can emit a
+	// `scope_mismatch` SeverityWarn break when the pending
+	// deploy targets a different scope than the baseline
+	// (cross-env promotion vs same-env patch). Empty string is
+	// preserved verbatim — the engine treats "" as a no-op
+	// (handler coerces "" → api.DefaultEnvScope at write time).
+	p.Scope = req.Scope
 	if len(req.EnvByScope) > 0 {
 		p.EnvByScope = make(map[string][]deploydiff.PendingEnv, len(req.EnvByScope))
 		for scope, rows := range req.EnvByScope {
