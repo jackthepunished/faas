@@ -2360,6 +2360,45 @@ func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]I
 	return scanInstances(rows)
 }
 
+// ListInstancesForLifecycleReconciliation returns live instances belonging to
+// deleted apps or accounts in the deletion grace window. Unlike the normal
+// reaper lists, it intentionally includes soft-deleted apps and the
+// evicting_account_deleting state: those rows are exactly the durable cleanup
+// backlog that a missed pg_notify or a schedd restart must recover.
+func (s *PgStore) ListInstancesForLifecycleReconciliation(ctx context.Context, nodeID string, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	nodeClause := ""
+	args := make([]any, 0, 2)
+	limitArg := 1
+	if nodeID != "" {
+		nodeClause = " and a.node_id = $1"
+		args = append(args, nodeID)
+		limitArg = 2
+	}
+	args = append(args, limit)
+
+	sel := fmt.Sprintf(`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
+		   from instances i
+		   join apps a on a.id = i.app_id
+		   join accounts ac on ac.id = a.account_id
+		  where (
+		        (a.status = 'deleted' and i.state in ('waking','cold_booting','running','snapshotting','migrating'))
+		     or (ac.status = 'deleted_pending' and i.state in ('waking','cold_booting','running','snapshotting','migrating','evicting_account_deleting'))
+		  )%s
+		  order by i.started_at asc, i.id asc
+		  limit $%d`, nodeClause, limitArg)
+	rows, err := s.pool.Query(ctx, sel, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
 // FailRunningInstanceIfOwnedByNode is the healthy-node stale-instance
 // reconciliation primitive. vmmd capacity reports are authoritative only
 // after two identical complete reports; this conditional update then makes

@@ -107,6 +107,34 @@ func TestHandleParkedAppNotification(t *testing.T) {
 	}
 }
 
+func TestRunReaperReconcilesDeletedAppWithoutNotification(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 256, 2)
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	res, err := engine.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	deleted := state.AppDeleted
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &deleted}); err != nil {
+		t.Fatalf("UpdateApp deleted: %v", err)
+	}
+
+	NewLoop(nil, engine, testLog()).runReaper(context.Background())
+
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateStopped) {
+		t.Errorf("state = %q, want stopped", row.State)
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("destroys = %d, want 1", vmm.destroys)
+	}
+}
+
 // TestHandleNotificationRejectsBadInput covers the dispatch guards: malformed or
 // incomplete payloads must not panic and must not act.
 func TestHandleNotificationRejectsBadInput(t *testing.T) {

@@ -25,11 +25,9 @@ const (
 	// StateFailed: crash-looped (≥3) or boot timed out; parked + operator notified.
 	StateFailed State = "failed"
 	// StateEvictingAccountDeleting: terminal state. schedd's deletion
-	// subscriber (ADR-026) drops a live instance into this state when
-	// the owning account scheduled deletion; the natural reaper
-	// collects the microVM on its next pass. NOT in the legal
-	// transitions map below on purpose — the subscriber is the only
-	// writer, and the state is not reversible from the state machine.
+	// reconciler drops a live instance into this state when the owning
+	// account schedules deletion, destroys the VM, and leaves the row
+	// until the account's hard-delete grace sweep removes it.
 	StateEvictingAccountDeleting State = "evicting_account_deleting"
 	// StateMigrating (Tier A5 / ADR-066) — transient state stamped
 	// at Phase 3 of the four-phase cross-node live-instance handoff.
@@ -65,16 +63,18 @@ var transitions = map[State][]State{
 	StateSnapshotting: {StateParked, StateStopped, StateEvictingAccountDeleting},
 	StateStopped:      {StateColdBooting},
 	StateFailed:       {StateParked, StateColdBooting, StateStopped}, // manual recovery / lazy cold-boot
-	// StateEvictingAccountDeleting is terminal — only the reaper
-	// physically removes the VM; the row is then dropped by the
-	// DeleteAccount walk after the 30-day grace window lapses.
+	// StateEvictingAccountDeleting is terminal — the lifecycle
+	// reconciler physically removes the VM; the row is then dropped
+	// by the DeleteAccount walk after the 30-day grace window lapses.
 	StateEvictingAccountDeleting: {},
-	// StateMigrating → RUNNING on commit; → PARKED on rollback
+	// StateMigrating → RUNNING on commit; → PARKED on rollback.
+	// STOPPED and EVICTING_ACCOUNT_DELETING are exceptional cleanup
+	// exits used when deletion wins a migration race.
 	// (the dying vmmd resumes the VM and the snapshot stays).
 	// Either edge ends the transient; the row is no longer
 	// considered migrating from that moment. Engine.MigrateLiveInstances
 	// owns both transitions.
-	StateMigrating: {StateRunning, StateParked, StateFailed},
+	StateMigrating: {StateRunning, StateParked, StateFailed, StateStopped, StateEvictingAccountDeleting},
 }
 
 // Valid reports whether s is a known state.

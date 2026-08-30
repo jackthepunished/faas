@@ -42,6 +42,12 @@ import (
 // build/snapshot budget.
 const reaperParkTimeout = 2 * time.Minute
 
+// lifecycleReconcileMaxPerTick bounds the durable deletion sweep. Deletion
+// cleanup is retryable and oldest-first at the store layer, so a bounded pass
+// gives every schedd tick a predictable cost without allowing one abandoned
+// account or app to monopolise the scheduler.
+const lifecycleReconcileMaxPerTick = 100
+
 // Loop subscribes to the pg_notify channels schedd cares about and reacts. It
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
@@ -1375,6 +1381,22 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 //   - SelectEvictions → Engine.Evict (destroy; next wake cold-boots, ADR-005).
 func (l *Loop) runReaper(ctx context.Context) {
 	store := l.engine.Store()
+	// pg_notify is a wakeup hint, not a durable queue. Reconcile deletion
+	// candidates directly from app/account status before the normal app list.
+	// The regular app list excludes soft-deleted apps, and the account-deletion
+	// state is intentionally outside the idle reaper's live set, so neither
+	// path can recover an orphaned VM on its own.
+	lifecycle, lifecycleErr := store.ListInstancesForLifecycleReconciliation(ctx, l.engine.OwnerNodeID(), lifecycleReconcileMaxPerTick)
+	if lifecycleErr != nil {
+		l.log.Warn("reaper: list lifecycle reconciliation candidates", "err", lifecycleErr)
+	} else {
+		for _, candidate := range lifecycle {
+			acted, err := l.engine.ReconcileLifecycleInstance(ctx, candidate.ID)
+			if err != nil {
+				l.log.Warn("reaper: lifecycle reconciliation", "instance", candidate.ID, "acted", acted, "err", err)
+			}
+		}
+	}
 	// Phase 2 / Gate A: scope the reaper to this schedd's owner
 	// apps/instances. Empty owner = legacy single-box posture
 	// (list everything). Non-empty = per-node slice via the

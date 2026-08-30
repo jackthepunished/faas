@@ -2891,6 +2891,49 @@ func (m *MemStore) ListInstancesByNodeID(_ context.Context, nodeID string) ([]In
 	return out, nil
 }
 
+// ListInstancesForLifecycleReconciliation mirrors the PgStore join used by
+// schedd's durable deletion sweep. The in-memory implementation deliberately
+// evaluates the same app/account status and instance-state predicates so
+// tests exercise the production contract rather than a looser approximation.
+func (m *MemStore) ListInstancesForLifecycleReconciliation(_ context.Context, nodeID string, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]Instance, 0)
+	for _, ins := range m.instances {
+		app, ok := m.apps[ins.AppID]
+		if !ok || (nodeID != "" && app.NodeID != nodeID) {
+			continue
+		}
+		account, ok := m.accounts[app.AccountID]
+		if !ok {
+			continue
+		}
+
+		appDeleted := app.Status == AppDeleted && IsLive(ins.State)
+		accountDeleting := account.Status == AccountDeletedPending &&
+			(IsLive(ins.State) || State(ins.State) == StateEvictingAccountDeleting)
+		if !appDeleted && !accountDeleting {
+			continue
+		}
+		out = append(out, ins)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.Equal(out[j].StartedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].StartedAt.Before(out[j].StartedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // FailRunningInstanceIfOwnedByNode mirrors PgStore's conditional healthy-node
 // stale-instance transition. ErrConflict represents a state/node race.
 func (m *MemStore) FailRunningInstanceIfOwnedByNode(_ context.Context, id, nodeID string, terminalAt time.Time) error {

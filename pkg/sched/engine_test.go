@@ -2018,6 +2018,137 @@ func TestEngineParkAppSnapshotsRunningInstance(t *testing.T) {
 	}
 }
 
+func TestEngineReconcileDeletedAppDestroysRunningInstance(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	deleted := state.AppDeleted
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &deleted}); err != nil {
+		t.Fatalf("UpdateApp deleted: %v", err)
+	}
+
+	acted, err := e.ReconcileLifecycleInstance(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("ReconcileLifecycleInstance: %v", err)
+	}
+	if !acted {
+		t.Fatal("ReconcileLifecycleInstance acted = false, want true")
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("destroys = %d, want 1", vmm.destroys)
+	}
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateStopped) {
+		t.Errorf("state = %q, want stopped", row.State)
+	}
+	if got := e.Ledger().ResidentRAM(); got != 0 {
+		t.Errorf("resident = %d, want 0", got)
+	}
+
+	acted, err = e.ReconcileLifecycleInstance(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("idempotent ReconcileLifecycleInstance: %v", err)
+	}
+	if acted {
+		t.Errorf("idempotent reconcile acted = true, want false")
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("idempotent destroys = %d, want 1", vmm.destroys)
+	}
+}
+
+func TestEngineReconcileAccountDeletionDestroysRunningInstance(t *testing.T) {
+	store := state.NewMemStore()
+	acct, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if err := store.MarkAccountDeletionPending(context.Background(), acct.ID); err != nil {
+		t.Fatalf("MarkAccountDeletionPending: %v", err)
+	}
+
+	acted, err := e.ReconcileLifecycleInstance(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("ReconcileLifecycleInstance: %v", err)
+	}
+	if !acted {
+		t.Fatal("ReconcileLifecycleInstance acted = false, want true")
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("destroys = %d, want 1", vmm.destroys)
+	}
+	row, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if row.State != string(state.StateEvictingAccountDeleting) {
+		t.Errorf("state = %q, want evicting_account_deleting", row.State)
+	}
+	if got := e.Ledger().ResidentRAM(); got != 0 {
+		t.Errorf("resident = %d, want 0", got)
+	}
+
+	acted, err = e.ReconcileLifecycleInstance(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("idempotent ReconcileLifecycleInstance: %v", err)
+	}
+	if !acted {
+		t.Fatal("idempotent account reconcile acted = false, want true for destroy retry")
+	}
+	if vmm.destroys != 2 {
+		t.Errorf("idempotent destroys = %d, want 2 (idempotent vmmd cleanup)", vmm.destroys)
+	}
+}
+
+func TestEngineReconcileDeletedAppRetriesAfterDestroyFailure(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{destroyErr: errors.New("vmmd unavailable")}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.Wake(context.Background(), app.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	deleted := state.AppDeleted
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &deleted}); err != nil {
+		t.Fatalf("UpdateApp deleted: %v", err)
+	}
+
+	if acted, err := e.ReconcileLifecycleInstance(context.Background(), res.InstanceID); err == nil || acted {
+		t.Fatalf("failed reconcile = (%v, %v), want error and no action", acted, err)
+	}
+	row, _ := store.InstanceByID(context.Background(), res.InstanceID)
+	if row.State != string(state.StateRunning) {
+		t.Errorf("state after failed destroy = %q, want running for retry", row.State)
+	}
+	if got := e.Ledger().ResidentRAM(); got == 0 {
+		t.Error("resident ledger released after failed destroy; retry would lose accounting")
+	}
+
+	vmm.destroyErr = nil
+	if acted, err := e.ReconcileLifecycleInstance(context.Background(), res.InstanceID); err != nil || !acted {
+		t.Fatalf("retry reconcile = (%v, %v), want action without error", acted, err)
+	}
+	row, _ = store.InstanceByID(context.Background(), res.InstanceID)
+	if row.State != string(state.StateStopped) {
+		t.Errorf("state after retry = %q, want stopped", row.State)
+	}
+}
+
 func TestEngineReportActivity(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)

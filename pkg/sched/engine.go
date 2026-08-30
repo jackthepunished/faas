@@ -4286,6 +4286,154 @@ func (e *Engine) ParkApp(ctx context.Context, appID string) (int, error) {
 	return acted, errors.Join(errs...)
 }
 
+// ReconcileLifecycleInstance destroys a VM whose parent app or account is in
+// a deletion state. Deletion notifications are only hints, so this method is
+// also called by the durable reaper sweep. It is intentionally idempotent:
+// Destroy is routed through vmmd's idempotent endpoint, ledger.Release ignores
+// unknown reservations, and a second pass sees either STOPPED or the terminal
+// account-deletion state.
+//
+// App deletion lands in STOPPED because the instance row remains useful for
+// normal retention and the app can be recreated with the same slug. Account
+// deletion lands in StateEvictingAccountDeleting because DeleteAccount's
+// 30-day grace walk owns removal of the historical row.
+func (e *Engine) ReconcileLifecycleInstance(ctx context.Context, instanceID string) (bool, error) {
+	if instanceID == "" {
+		return false, fmt.Errorf("sched: lifecycle reconcile: empty instance id")
+	}
+
+	ins, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: load instance %s: %w", instanceID, err)
+	}
+	app, err := e.store.AppByID(ctx, ins.AppID)
+	if err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: load app %s: %w", ins.AppID, err)
+	}
+	if e.ownerNodeID != "" && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+		return false, nil
+	}
+
+	release := e.lockApp(app.ID)
+	defer release()
+
+	// Re-read every decision under the app lock. This serializes deletion
+	// cleanup with Wake, Park, and migration's app-level lifecycle writes.
+	ins, err = e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: reload instance %s: %w", instanceID, err)
+	}
+	app, err = e.store.AppByID(ctx, ins.AppID)
+	if err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: reload app %s: %w", ins.AppID, err)
+	}
+	if e.ownerNodeID != "" && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+		return false, nil
+	}
+
+	// Account deletion takes precedence when both parent rows are being
+	// removed. That preserves the account-deletion terminal state expected by
+	// the grace-period hard-delete walk.
+	accountDeleting := false
+	account, accountErr := e.store.AccountByID(ctx, app.AccountID)
+	if accountErr != nil && !errors.Is(accountErr, state.ErrNotFound) {
+		return false, fmt.Errorf("sched: lifecycle reconcile: load account %s: %w", app.AccountID, accountErr)
+	}
+	if accountErr == nil {
+		accountDeleting = account.Status == state.AccountDeletedPending
+	}
+	appDeleting := app.Status == state.AppDeleted
+	if !accountDeleting && !appDeleting {
+		return false, nil
+	}
+
+	current := state.State(ins.State)
+	if current == state.StateEvictingAccountDeleting {
+		if err := e.timedDestroy(ctx, ins.NodeID, ins.ID, DestroyTimeout); err != nil {
+			return false, fmt.Errorf("sched: lifecycle reconcile: destroy evicting instance %s: %w", ins.ID, err)
+		}
+		e.ledger.Release(ins.ID)
+		return true, nil
+	}
+	if !state.IsLive(ins.State) {
+		return false, nil
+	}
+
+	if accountDeleting {
+		if !state.CanTransition(current, state.StateEvictingAccountDeleting) {
+			return false, fmt.Errorf("sched: lifecycle reconcile: illegal account-delete edge %s -> %s", current, state.StateEvictingAccountDeleting)
+		}
+		e.transition(ctx, ins.ID, ins.AppID, state.StateEvictingAccountDeleting)
+		marked, err := e.store.InstanceByID(ctx, ins.ID)
+		if err != nil {
+			return false, fmt.Errorf("sched: lifecycle reconcile: verify account-delete state %s: %w", ins.ID, err)
+		}
+		if state.State(marked.State) != state.StateEvictingAccountDeleting {
+			return false, fmt.Errorf("sched: lifecycle reconcile: account-delete state write did not stick for %s", ins.ID)
+		}
+		if err := e.timedDestroy(ctx, ins.NodeID, ins.ID, DestroyTimeout); err != nil {
+			return false, fmt.Errorf("sched: lifecycle reconcile: destroy account-deleting instance %s: %w", ins.ID, err)
+		}
+		e.ledger.Release(ins.ID)
+		return true, nil
+	}
+
+	if err := e.timedDestroy(ctx, ins.NodeID, ins.ID, DestroyTimeout); err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: destroy deleted-app instance %s: %w", ins.ID, err)
+	}
+	if !state.CanTransition(current, state.StateStopped) {
+		return false, fmt.Errorf("sched: lifecycle reconcile: illegal app-delete edge %s -> %s", current, state.StateStopped)
+	}
+	e.transition(ctx, ins.ID, ins.AppID, state.StateStopped)
+	stopped, err := e.store.InstanceByID(ctx, ins.ID)
+	if err != nil {
+		return false, fmt.Errorf("sched: lifecycle reconcile: verify stopped state %s: %w", ins.ID, err)
+	}
+	if state.State(stopped.State) != state.StateStopped {
+		return false, fmt.Errorf("sched: lifecycle reconcile: stopped state write did not stick for %s", ins.ID)
+	}
+	e.ledger.Release(ins.ID)
+	return true, nil
+}
+
+// ReconcileDeletedApp is the notification-side app cleanup entry point. The
+// app row is soft-deleted, so ListInstancesForApp remains available even after
+// DELETE /v1/apps/{slug} has returned. The per-instance method rechecks the
+// app/account status under the app lock before touching a VM.
+func (e *Engine) ReconcileDeletedApp(ctx context.Context, appID string) (int, error) {
+	if appID == "" {
+		return 0, fmt.Errorf("sched: deleted-app reconcile: empty app id")
+	}
+	app, err := e.store.AppByID(ctx, appID)
+	if err != nil {
+		return 0, fmt.Errorf("sched: deleted-app reconcile: load app %s: %w", appID, err)
+	}
+	if app.Status != state.AppDeleted {
+		return 0, nil
+	}
+	if e.ownerNodeID != "" && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+		return 0, nil
+	}
+	instances, err := e.store.ListInstancesForApp(ctx, appID)
+	if err != nil {
+		return 0, fmt.Errorf("sched: deleted-app reconcile: list app %s: %w", appID, err)
+	}
+
+	acted := 0
+	var errs []error
+	for _, candidate := range instances {
+		ok, err := e.ReconcileLifecycleInstance(ctx, candidate.ID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: %w", candidate.ID, err))
+			continue
+		}
+		if ok {
+			acted++
+		}
+	}
+	return acted, errors.Join(errs...)
+}
+
 // Evict destroys a RUNNING instance under RAM pressure (spec §4.3). Unlike Park
 // it does not snapshot — the next wake cold-boots (ADR-005), so the state lands
 // in STOPPED rather than PARKED.
