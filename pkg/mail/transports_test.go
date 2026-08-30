@@ -810,8 +810,13 @@ func TestTransientError_IsAndAs(t *testing.T) {
 	if !errors.As(teWithErr, &got2) {
 		t.Errorf("TransientError (Err set) does not satisfy errors.As(*TransientError)")
 	}
-	if got2.Err != networkErr {
-		t.Errorf("got2.Err = %v, want %v", got2.Err, networkErr)
+	// errors.Is is the right way to compare error values
+	// (errorlint golangci-lint rule) — pointer equality is
+	// fragile because TransientError wraps the network error
+	// via fmt.Errorf-style chaining rather than storing it
+	// directly.
+	if !errors.Is(got2.Err, networkErr) {
+		t.Errorf("got2.Err = %v, want errors.Is(got2.Err, %v)", got2.Err, networkErr)
 	}
 	// errors.Is also reaches the wrapped inner error for callers
 	// that want the root cause (this path has always worked — the
