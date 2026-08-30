@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -74,13 +75,31 @@ func pgJobsSeed(t *testing.T, s *state.PgStore, ctx context.Context, name string
 // write kind/job_id, so a raw INSERT is the cleanest path. Returns
 // the generated instance UUID. Takes the pool directly (not the
 // PgStore) so the INSERT lands in the same per-test schema the
-// surrounding PgStore is bound to.
-func pgJobsCreateJobTaskInstance(t *testing.T, pool *pgxpool.Pool, ctx context.Context, jobID string) string {
+// surrounding PgStore is bound to. Also inserts a sibling app +
+// deployment to satisfy instances.deployment_id (NOT NULL) and
+// the deployments FK.
+func pgJobsCreateJobTaskInstance(t *testing.T, pool *pgxpool.Pool, ctx context.Context, accountID, jobID string) string {
 	t.Helper()
+	now := time.Now()
+	appID := uuid.NewString()
+	depID := uuid.NewString()
+	slug := "jobs-fixture-" + uuid.NewString()[:8]
+	if _, err := pool.Exec(ctx,
+		`insert into apps (id, account_id, slug, status, ram_mb)
+		 values ($1::uuid, $2::uuid, $3, 'active', 256)`,
+		appID, accountID, slug); err != nil {
+		t.Fatalf("pgJobsCreateJobTaskInstance apps: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into deployments (id, app_id, status, image_digest, created_at, canary_step_started_at)
+		 values ($1::uuid, $2::uuid, 'building', 'sha256:fixture', $3, $3)`,
+		depID, appID, now); err != nil {
+		t.Fatalf("pgJobsCreateJobTaskInstance deployments: %v", err)
+	}
 	row := pool.QueryRow(ctx,
-		`insert into instances (kind, job_id, state, ram_mb, mode)
-		 values ('job_task', $1::uuid, 'cold_booting', 256, 'job')
-		 returning id::text`, jobID)
+		`insert into instances (kind, job_id, app_id, deployment_id, state, ram_mb, mode)
+		 values ('job_task', $1::uuid, $2::uuid, $3::uuid, 'cold_booting', 256, 'job')
+		 returning id::text`, jobID, appID, depID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		t.Fatalf("pgJobsCreateJobTaskInstance: %v", err)
@@ -329,7 +348,7 @@ func TestPg_Jobs_JobTaskMarkClaimed(t *testing.T) {
 	// Create a real job_task instance row directly so the FK on
 	// job_tasks.instance_id resolves. CreateInstanceWithMode doesn't
 	// write kind/job_id, so a raw INSERT is the cleanest path.
-	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.AccountID, job.ID)
 	lease := "00000000-0000-0000-0000-deadbeefcafe"
 	nodeID := resolveDefaultLocal(t, ctx, s)
 	expires := time.Now().Add(5 * time.Minute)
@@ -386,7 +405,7 @@ func TestPg_Jobs_JobTaskRequeue(t *testing.T) {
 	s, pool, ctx := pgJobsStoreWithPool(t)
 	job, run, fanned := pgJobsSeed(t, s, ctx, "task-5")
 	task := fanned[0]
-	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.AccountID, job.ID)
 	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, instanceID,
 		"00000000-0000-0000-0000-deadbeef0001", time.Now().Add(5*time.Minute), resolveDefaultLocal(t, ctx, s)); err != nil {
 		t.Fatalf("setup MarkClaimed: %v", err)
@@ -418,7 +437,7 @@ func TestPg_Jobs_JobTaskFindStuck(t *testing.T) {
 	s, pool, ctx := pgJobsStoreWithPool(t)
 	job, run, fanned := pgJobsSeed(t, s, ctx, "task-7")
 	task := fanned[0]
-	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.ID)
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.AccountID, job.ID)
 	if err := s.JobTaskMarkClaimed(ctx, run.ID, task.TaskIndex, instanceID,
 		"00000000-0000-0000-0000-deadbeef0002", time.Now().Add(-time.Hour), resolveDefaultLocal(t, ctx, s)); err != nil {
 		t.Fatalf("setup MarkClaimed expired lease: %v", err)
