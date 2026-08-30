@@ -628,6 +628,13 @@
     fi
     transport="$(grep -E '^FAAS_MAIL_TRANSPORT=' "$sealed" 2>/dev/null | head -1 | cut -d= -f2- || true)"
     dev="$(grep -E '^FAAS_DEV=' "$sealed" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    # PR #1191 fixup: trim + lowercase the FAAS_DEV value before the
+    # literal match so the playbook accepts the same truthy set the
+    # Go side does — pkg/mail.IsDevMode accepts 1/true/yes/on
+    # case-insensitively (devTruthyLiterals). An operator setting
+    # FAAS_DEV=true used to see this playbook FAIL even though the
+    # daemon would have booted. Empty / "0" / unset stay production.
+    dev_norm="$(printf '%s' "${dev:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     case "$transport" in
       resend|postmark|noop)
         # live transport — credentials are the operator's responsibility.
@@ -636,12 +643,15 @@
         echo "mail transport = $transport (prod)"
         ;;
       log|"")
-        if [ "$dev" = "1" ]; then
-          echo "mail transport = ${transport:-unset} + FAAS_DEV=1 (dev)"
-        else
-          echo "FAIL: FAAS_MAIL_TRANSPORT=${transport:-unset} on a non-dev box — apid + meterd will refuse to boot. Set FAAS_MAIL_TRANSPORT=resend (or postmark / noop) or FAAS_DEV=1."
-          exit 1
-        fi
+        case "$dev_norm" in
+          1|true|yes|on)
+            echo "mail transport = ${transport:-unset} + FAAS_DEV=$dev (dev)"
+            ;;
+          *)
+            echo "FAIL: FAAS_MAIL_TRANSPORT=${transport:-unset} on a non-dev box — apid + meterd will refuse to boot. Set FAAS_MAIL_TRANSPORT=resend (or postmark / noop) or FAAS_DEV=1 (or true/yes/on)."
+            exit 1
+            ;;
+        esac
         ;;
       *)
         echo "FAIL: FAAS_MAIL_TRANSPORT=$transport is not a known transport (resend|postmark|log|noop). apid will refuse to boot."

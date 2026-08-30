@@ -77,6 +77,13 @@ func resendReason(t string) string {
 // cmd/apid/handlers_ext.go:3267 — the HMAC IS the trust boundary,
 // so the route is mounted unwrapped (no auth middleware).
 func (s *server) resendWebhook(w http.ResponseWriter, r *http.Request) {
+	// PR #1191 fixup: bound the inbound body at api.WebhookMaxBodyBytes
+	// (1 MiB) so an unauthenticated sender cannot OOM apid by streaming
+	// multi-GB garbage. Resend payloads are <4 KB; the 256× headroom is
+	// for future event-type expansion. MaxBytesReader returns
+	// *http.MaxBytesError when the cap is hit, which io.ReadAll
+	// surfaces as a plain error; we map both shapes to 400 below.
+	r.Body = http.MaxBytesReader(w, r.Body, api.WebhookMaxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad webhook", err.Error()))

@@ -3677,6 +3677,18 @@ const (
 	// failure without hammering the partial index on mail_suppressions.
 	MailSuppressionCacheTTLSeconds = 60
 
+	// WebhookMaxBodyBytes caps the size of an inbound webhook body
+	// the apid listener will accept. Resend / Postmark bounce
+	// payloads are well under 4 KB; 1 MiB is 256× headroom for
+	// future event-type expansion. Larger bodies are rejected
+	// before allocation completes (http.MaxBytesReader) so an
+	// unauthenticated sender cannot OOM apid by streaming
+	// multi-GB garbage. PR #1191 fixup: the resendWebhook
+	// route previously called io.ReadAll(r.Body) without a
+	// bound. Same cap applied to all three mail-webhook handlers
+	// the apid mounts (resend / postmark / paddle) for consistency.
+	WebhookMaxBodyBytes = 1 << 20 // 1 MiB
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 
