@@ -173,6 +173,15 @@ func runHealthcheckPoll(ctx context.Context, manifest api.AppManifest, log *slog
 	if log == nil {
 		log = slog.Default()
 	}
+	// A nil Healthcheck is the normal OCI shape for images that do not
+	// declare HEALTHCHECK. Treat it exactly like an empty Test field: the
+	// legacy TCP readiness probe remains the readiness gate. Do this check
+	// before dereferencing the optional pointer below; otherwise every
+	// healthcheck-free application crashes guest-init (PID 1) during boot.
+	if manifest.Healthcheck == nil {
+		log.Info("healthcheck: NONE shape; no poll goroutine")
+		return nil
+	}
 	argv, _ := parseHealthcheckTest(manifest.Healthcheck.Test)
 	if len(argv) == 0 {
 		log.Info("healthcheck: NONE shape; no poll goroutine")
