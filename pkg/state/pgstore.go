@@ -8112,6 +8112,57 @@ func (s *PgStore) AlertRuleByID(ctx context.Context, id string) (AlertRule, erro
 	return scanAlertRule(row)
 }
 
+// AlertRuleByAccountAppAndPresetName resolves the alert_rules row
+// that was instantiated from a catalog preset. ADR-123 deliberately
+// rejected a preset_id FK on alert_rules — the binding is the parsed
+// display-name prefix "<DisplayName> (<app_slug>)". The query joins
+// alert_presets on name to translate the catalog key into the prefix,
+// then matches rules via LIKE '<prefix>%'. The existing
+// alert_rules_account_name_uniq index covers the LIKE as a prefix
+// range scan on (account_id, name).
+//
+// Returns:
+//   - ErrNotFound when no rule matches the (account, app, preset)
+//     tuple — the handler maps this to 404.
+//   - ErrConflict when the LIKE matches >1 row (cannot happen today;
+//     the name column is UNIQUE per (account_id, app_id), but the
+//     surface stays defensive).
+//
+// Refs: ADR-123 PR-C, issue #1233, plan §Commit 2.
+func (s *PgStore) AlertRuleByAccountAppAndPresetName(ctx context.Context, accountID, appID, presetName string) (AlertRule, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+alertRuleSelectCols+`
+		FROM alert_rules r
+		WHERE r.account_id = $1
+		  AND r.app_id = $2
+		  AND r.name LIKE (
+		    SELECT (display_name || ' (%') FROM alert_presets WHERE name = $3
+		  )
+		ORDER BY r.created_at DESC
+		LIMIT 2`, accountID, appID, presetName)
+	if err != nil {
+		return AlertRule{}, err
+	}
+	defer rows.Close()
+	matched, err := scanAlertRules(rows)
+	if err != nil {
+		return AlertRule{}, err
+	}
+	switch len(matched) {
+	case 0:
+		return AlertRule{}, ErrNotFound
+	case 1:
+		return matched[0], nil
+	default:
+		// Defensive: catalog display_name uniqueness + the
+		// (account_id, app_id, name) UNIQUE constraint should make
+		// this unreachable. Returning ErrConflict keeps the handler
+		// clean — 409 with a sane message beats a panic or a silent
+		// "send test alert to a stale rule" outcome.
+		return AlertRule{}, ErrConflict
+	}
+}
+
 // UpdateAlertRule coalesces the optional fields onto alert_rules.
 // All fields share the nil-skip pattern; WebhookSecretSealed is *[]byte
 // because a nil means "leave the seal alone" (a non-rotation update
