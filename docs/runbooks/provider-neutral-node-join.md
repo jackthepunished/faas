@@ -27,29 +27,31 @@ The command performs these phases in order:
    files are removed at the end and never committed.
 3. Override only the new host's Ansible connection target with `--ssh-host`.
    Runtime daemon endpoints remain the stable manifest names.
-4. Run the complete-fleet Ansible preflight, unless
+4. Verify the provider SSH host key against `--ssh-host-key-sha256` and pin
+   the verified key in an ephemeral `known_hosts` file.
+5. Run the complete-fleet Ansible preflight, unless
    `--skip-fleet-preflight` is explicitly supplied after a recent successful
    preflight.
-5. Stage the root-only database environment, a compute trust bundle, image-signing keys,
+6. Stage the root-only database environment, a compute trust bundle, image-signing keys,
    signed release assets, bootstrap `gregalectl`, and the manifest.
-6. Converge the fast-root storage contract. The target must be a dedicated XFS
+7. Converge the fast-root storage contract. The target must be a dedicated XFS
    mount with `reflink=1` and `prjquota`; a blank device is formatted only when
    `--format-storage` explicitly approves the supplied absolute device path.
-7. Register the embedded signed release manifest in `release_bundles` and
+8. Register the embedded signed release manifest in `release_bundles` and
    require its topology hash to match the supplied manifest.
-8. Run the production `deploy/ansible/bootstrap.yml` compute role.
-9. Install the signed release with `--defer-activation`; the database row is
+9. Run the production `deploy/ansible/bootstrap.yml` compute role.
+10. Install the signed release with `--defer-activation`; the database row is
    kept drained while the box is being prepared.
-10. Render the manifest, initialize host-local identity, unseal any supplied
+11. Render the manifest, initialize host-local identity, unseal any supplied
     encrypted backup envelopes, and run a node-scoped doctor. Mandatory
     readiness errors always fail the join. Backup envelopes are optional join
     inputs; when they are deferred, the doctor keeps the placeholder warnings
     visible but permits compute-node activation. Supplying the backup pair
     enables the strict warning gate, so a production join that includes backup
     material cannot silently activate with degraded backup posture.
-11. Start the four compute services and wait for vmmd's socket, the internal
+12. Start the four compute services and wait for vmmd's socket, the internal
     gateway, and systemd-active status.
-12. Verify the control-plane row's role, release, manifest hash, and stable
+13. Verify the control-plane row's role, release, manifest hash, and stable
    target URL, then activate the compute row only after all gates pass.
 
 If a phase fails, the node remains non-schedulable. Re-running the same command
@@ -179,6 +181,7 @@ gregalectl deploy join-node \
   --manifest-file /secure/fleet/production-manifest.yaml \
   --node fsn-3 \
   --ssh-host 203.0.113.27 \
+  --ssh-host-key-sha256 SHA256:<verified-host-key-fingerprint> \
   --dry-run
 ```
 
@@ -189,6 +192,7 @@ gregalectl deploy join-node \
   --manifest-file /secure/fleet/manifest.yaml \
   --node fsn-3 \
   --ssh-host 203.0.113.27 \
+  --ssh-host-key-sha256 SHA256:<verified-host-key-fingerprint> \
   --ssh-user root \
   --ssh-key /secure/ssh/faas-fleet \
   --artifact-dir /secure/fleet/join-artifacts \
