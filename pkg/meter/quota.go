@@ -159,6 +159,14 @@ func EnforceQuota(
 			Subject:  subject,
 			TextBody: body,
 			HTMLBody: html,
+			// Stable idempotency key for Resend (PR #1191
+			// fixup: MessageID was previously zero so retries
+			// double-charged). Derived from
+			// (account_id, template, day) — same-day re-ticks
+			// dedupe at the provider; cross-day ticks get a fresh
+			// id, which is correct (the customer should receive
+			// one warning per day).
+			MessageID: fmt.Sprintf("%s:quota_warning:%s", account.ID, today.Format("2006-01-02")),
 		}
 		// Bulk-sender compliance (issue #246 item 4): attach the
 		// RFC 8058 List-Unsubscribe pair only when the operator

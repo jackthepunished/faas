@@ -178,6 +178,31 @@ func (h *BounceHandler) HandleMailBounce(ctx context.Context, b MailBounce) erro
 	}
 	inserted, err := h.Store.RecordMailSuppression(ctx, sup)
 	if err != nil {
+		// ErrConflict is the SQLSTATE 23505 path the (source,
+		// provider_event_id) UNIQUE index raises when two near-
+		// simultaneous webhook deliveries race past the
+		// webhookdedupe layer and reach the INSERT together.
+		// The bounce handler's documented contract is "we
+		// tolerate the conflict and treat it as a no-op" (the
+		// 00535 migration doc says the same), so the bounce
+		// handler must NOT bubble ErrConflict to apid — the
+		// webhook ingress would 500 and Resend would retry,
+		// hitting the same conflict in a loop.
+		//
+		// Treated as a replay: no dunning step, no second audit
+		// row. We log the conflict at debug so a reappearing
+		// race condition is visible to an SRE without spamming
+		// the warn channel (the per-event replay is a normal
+		// outcome, not a failure mode).
+		if errors.Is(err, state.ErrConflict) {
+			if h.Log != nil {
+				h.Log.Debug("meter: bounce suppression replay (conflict)",
+					"event_id", b.ProviderEventID,
+					"source", b.Source,
+					"email", b.Email)
+			}
+			return nil
+		}
 		return fmt.Errorf("meter: RecordMailSuppression: %w", err)
 	}
 
