@@ -6,7 +6,9 @@ runtime_image=${2:?runtime image name is required}
 
 case "${runtime_image}" in
   base-debian-parent)
-    required=(etc/passwd bin/sh)
+    # Debian bookworm uses merged-/usr; /bin is a symlink and docker export
+    # records the target path as usr/bin/sh.
+    required=(etc/passwd usr/bin/sh)
     ;;
   base-minimal)
     required=(etc/passwd bin/busybox bin/sh)
