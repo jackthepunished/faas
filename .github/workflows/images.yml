@@ -328,3 +328,16 @@ jobs:
             --tag "${IMAGE_NAME}:pr-${GITHUB_SHA::12}" \
             --load \
             -f "${{ matrix.dockerfile }}" .
+
+      - name: Pull runtime base for contract validation
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker pull "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+
+      - name: Verify runtime rootfs contract
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            ref="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          else
+            ref="${IMAGE_NAME}:pr-${GITHUB_SHA::12}"
+          fi
+          bash scripts/ci/validate-runtime-image.sh "${ref}" "${{ matrix.image }}"

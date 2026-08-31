@@ -19,6 +19,10 @@ FROM scratch
 COPY --from=build /lib/x86_64-linux-gnu/ /lib/x86_64-linux-gnu/
 COPY --from=build /lib64/ /lib64/
 COPY --from=build /bin/busybox /bin/busybox
+# The rootfs skeleton declares /bin/sh as the app user's shell and several
+# diagnostic paths rely on it. Scratch does not create symlinks from the
+# source image, so install the BusyBox binary at the contract path too.
+COPY --from=build /bin/busybox /bin/sh
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 # The app user every guest execs as (uid 1000, spec §4.8).
 COPY images/rootfs-skel/ /

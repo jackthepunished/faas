@@ -237,6 +237,11 @@ type Handler struct {
 	// in-memory handler constructors used by unit tests intentionally keep
 	// the build pipeline hermetic and do not need shared ext4 staging.
 	runtimeBaseStagingEnabled bool
+	// baseArtifactValidator checks the contents of an ext4 artifact before
+	// imaged trusts a digest sidecar or publishes a freshly built base. It is
+	// injected so tests remain hermetic; cmd/imaged wires the debugfs-backed
+	// production validator.
+	baseArtifactValidator func(context.Context, string, []string) error
 	// secretboxIdentity (issue #461 / ADR-062) is the host age
 	// identity used to TRANSIENTLY unseal per-app private-registry
 	// Basic Auth passwords during the pull path. The plaintext
@@ -539,6 +544,13 @@ func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 // backend do not unexpectedly invoke mkfs or registry pulls.
 func (h *Handler) WithRuntimeBaseStaging() *Handler {
 	h.runtimeBaseStagingEnabled = true
+	return h
+}
+
+// WithBaseArtifactValidator installs the production base-rootfs contract
+// check. A nil validator preserves the lightweight unit-test path.
+func (h *Handler) WithBaseArtifactValidator(fn func(context.Context, string, []string) error) *Handler {
+	h.baseArtifactValidator = fn
 	return h
 }
 
@@ -1292,11 +1304,12 @@ type snapshotWrittenPayload struct {
 
 // snapshotBootPayload is the JSON shape builderd emits on `snapshot_boot`
 // after a build VM has produced an OCI image tarball and stamped it on
-// deployments.rootfs_path (see pkg/builderd/builderd.go::ProcessOne). imaged
-// is the sole subscriber: it converts the OCI tarball into a per-app ext4
-// (drive1) and then re-emits NotifySnapshotPrime so schedd can cold-boot
-// + snapshot (F4). The payload is intentionally minimal so the channel
-// stays narrow.
+// deployments.rootfs_path (see pkg/builderd/builderd.go::ProcessOne). Every
+// compute imaged daemon receives the fleet-wide notification, but only the
+// daemon whose node_id matches the builder converts the local OCI tarball
+// into a per-app ext4 (drive1) and re-emits NotifySnapshotPrime so schedd can
+// cold-boot + snapshot (F4). The payload is intentionally minimal so the
+// channel stays narrow.
 type snapshotBootPayload struct {
 	AppID        string `json:"app_id"`
 	DeploymentID string `json:"deployment_id"`
@@ -2150,33 +2163,40 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "storageFor: "+err.Error())
 		return fmt.Errorf("imaged: storageFor: %w", err)
 	}
-	result, err := h.builder.Build(ctx, rootfs.BuildInput{
-		Layers:        builtLayers,
-		Manifest:      manifest,
-		GuestInitPath: h.guestInitPath,
-		Plan:          acct.Plan,
-		Storage:       be,
-		StorageKey:    appsKey,
-		// TarballPath lets the rootfs.Builder stream the customer's
-		// source tarball into /app during layer assembly. For source builds,
-		// builtLayers above are applied first so Go's compiled /app/server
-		// can be normalized to /app/handler.
-		TarballPath: dep.SourcePath,
-		// The customer-facing Node convention is handler.js while the
-		// versioned runner executes /app/node22.js or /app/node24.js.
-		// rootfs creates that runtime alias during assembly.
+	buildInput := rootfs.BuildInput{
+		Layers:              builtLayers,
+		Manifest:            manifest,
+		GuestInitPath:       h.guestInitPath,
+		Plan:                acct.Plan,
+		Storage:             be,
+		StorageKey:          appsKey,
 		FunctionHandlerPath: manifest.Entrypoint[len(manifest.Entrypoint)-1],
-		// FunctionRunnerPath is the static guest/runners/<rt>/faas-runner
-		// binary that lives at /usr/local/bin/faas-runner in the layer.
-		FunctionRunnerPath: runnerPath,
+		FunctionRunnerPath:  runnerPath,
 		// Issue #299 / ADR-038 Phase 3: SBOM emission runs inside
-		// Builder.Build on the staging dir (which holds the customer's
-		// source tarball + the runner binary + guest-init — exactly
-		// what the SBOM should enumerate). SBOMKey is stamped onto
-		// the build_provenance row immediately below.
+		// Builder.Build on the final staging tree.
 		SBOMRun:        h.syftRun,
 		SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
-	})
+	}
+	if h.runtimeBaseStagingEnabled {
+		// Production source builds consume builderd's dependency-complete
+		// OCI export. Re-applying dep.SourcePath here would silently throw
+		// away Railpack's installed dependencies and, for Go, leave the
+		// runner looking for /app/handler while Railpack emits /app/server.
+		layers, sourcePath, cleanup, artifactErr := h.functionBuildArtifact(ctx, runtime, dep.RootfsPath)
+		if artifactErr != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, "select function build artifact: "+artifactErr.Error())
+			return fmt.Errorf("imaged: select function build artifact: %w", artifactErr)
+		}
+		defer cleanup()
+		buildInput.Layers = layers
+		buildInput.FunctionHandlerSourcePath = sourcePath
+	} else {
+		// Keep the hermetic legacy/test seam. Production handlers always
+		// enable runtime-base staging and therefore take the artifact path.
+		buildInput.Layers = builtLayers
+		buildInput.TarballPath = dep.SourcePath
+	}
+	result, err := h.builder.Build(ctx, buildInput)
 	if err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "build function layer: "+err.Error())
 		return fmt.Errorf("imaged: build function layer: %w", err)
@@ -2560,7 +2580,13 @@ func (h *Handler) ensureDeploymentRuntimeBase(ctx context.Context, app state.App
 	// Unit-test handlers without the production routed StorageBackend keep
 	// the historical in-memory build seam; production cmd/imaged always
 	// wires storage before accepting notifications.
-	if app.Runtime == "" || !h.runtimeBaseStagingEnabled {
+	if !h.runtimeBaseStagingEnabled {
+		return nil
+	}
+	if app.Runtime == "" {
+		if _, err := h.EnsureMinimalBase(ctx, runtime.GOARCH, os.Getenv); err != nil {
+			return fmt.Errorf("imaged: ensure minimal base: %w", err)
+		}
 		return nil
 	}
 	if _, err := h.EnsureRuntimeBase(ctx, app.Runtime, runtime.GOARCH, os.Getenv); err != nil {

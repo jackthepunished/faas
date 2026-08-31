@@ -10,13 +10,9 @@
 # per-app cost is just the static binary (5-30 MB) — so the 130 MB/sandbox
 # accounting is preserved (CLAUDE.md "load-bearing — DO NOT fix").
 #
-# Operator staging: build the image in CI, publish to
-# ghcr.io/onebox-faas/runner-go124, then stage the produced ext4 to
-# /srv/fc/base/runner-go124.ext4 on the EX44 using the same
-# `mkfs.ext4 -O '^has_journal' -d <staging>` recipe the existing
-# runner-node22 / runner-python312 Dockerfiles use. imaged does not
-# auto-stage runtime bases (the established pattern — only the
-# builder base is staged on startup).
+# The image is built and published by CI. imaged resolves the immutable
+# per-runtime reference and auto-stages the matching ext4 on first use, so a
+# newly provisioned compute node does not need a hand-copied runtime image.
 FROM golang:1.24-bookworm@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
 # Issue #197 B3.6 (extension): mutable tag pinned via images/Dockerfile.lock.
 

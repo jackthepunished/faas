@@ -5,7 +5,9 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -248,6 +250,32 @@ func TestStageExecutable_CopiesAndMarksExecutable(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o755 {
 		t.Fatalf("target mode = %o, want 755", info.Mode().Perm())
+	}
+}
+
+func TestValidateBuilderShell_RequiresFunctionalBash(t *testing.T) {
+	dir := t.TempDir()
+	shell, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash is unavailable in the test environment: %v", err)
+	}
+	if err := validateBuilderShell([]string{shell}, nil); err != nil {
+		t.Fatalf("validateBuilderShell(valid): %v", err)
+	}
+
+	broken := filepath.Join(dir, "busybox-as-bash")
+	if err := os.WriteFile(broken, []byte("#!/bin/sh\necho 'bash: applet not found' >&2\nexit 127\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBuilderShell([]string{broken}, nil); err == nil || !strings.Contains(err.Error(), "not a functional bash") {
+		t.Fatalf("validateBuilderShell(broken) = %v, want functional-shell error", err)
+	}
+}
+
+func TestValidateBuilderShell_Missing(t *testing.T) {
+	err := validateBuilderShell([]string{filepath.Join(t.TempDir(), "bash")}, nil)
+	if err == nil || !strings.Contains(err.Error(), "does not contain a functional bash") {
+		t.Fatalf("validateBuilderShell(missing) = %v, want missing-shell error", err)
 	}
 }
 
