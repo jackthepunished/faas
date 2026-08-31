@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
@@ -47,17 +48,28 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ev.EventID != "" {
-		if err := webhookdedupe.CheckReplay(r.Context(), webhookdedupe.ProviderPolar, ev.EventID); err != nil {
-			if webhookdedupe.IsReplay(err) {
-				acctID := acct.ID
-				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
-					"provider":    webhookdedupe.ProviderPolar,
-					"delivery_id": logsanitize.Field(ev.EventID),
-				})
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			s.log.Warn("polar replay-check infra error; forwarding", "event_id", logsanitize.Field(ev.EventID), "err", err)
+		now := time.Now().UTC()
+		claimed, err := s.store.ClaimWebhookDelivery(
+			r.Context(), webhookdedupe.ProviderPolar, ev.EventID,
+			now.Add(-webhookdedupe.TTL), now.Add(webhookdedupe.TTL),
+		)
+		if err != nil {
+			// Without an atomic durable claim, processing the event could
+			// duplicate a subscription transition or refund audit row.
+			// Return non-2xx so Polar retries instead of acknowledging an
+			// event whose replay protection is unavailable.
+			s.log.Error("polar webhook replay protection unavailable", "event_id", logsanitize.Field(ev.EventID), "err", err)
+			api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+			return
+		}
+		if !claimed {
+			acctID := acct.ID
+			s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
+				"provider":    webhookdedupe.ProviderPolar,
+				"delivery_id": logsanitize.Field(ev.EventID),
+			})
+			w.WriteHeader(http.StatusOK)
+			return
 		}
 	}
 	s.handleBillingEvent(r.Context(), ev, acct)

@@ -45,9 +45,9 @@ import (
 // bit before dispatching onto a provider-specific code path (e.g.
 // render the hosted-checkout URL only when CapHostedCheckout is set);
 // the runtime fallback is the previous sentinel-style contract —
-// CreateUpgradeTransaction returning ("", "", nil) ⇒ Stripe, methods
-// returning ErrNotImplemented ⇒ the provider doesn't support the
-// surface. The two co-exist so adding Capabilities() to existing
+// CreateUpgradeTransaction returning ("", "", nil) means no hosted
+// checkout, while methods returning ErrNotImplemented mean the provider
+// doesn't support the surface. The two co-exist so adding Capabilities() to existing
 // implementations is a non-breaking change.
 type Provider interface {
 	// Capabilities returns the bitmask of optional surfaces this
@@ -97,19 +97,16 @@ type Provider interface {
 	// customer has no active subscription item yet — the typical
 	// free → paid direct path (spec §4.7).
 	//
-	//   - Paddle: calls paddle.Client.CreateTransaction against the
-	//     per-plan monthly price and returns (txn_…,
-	//     https://paddle.checkout/…, nil). The 402 Problem carries
-	//     these as PaddleCheckoutURL + TxID extensions so the dashboard
-	//     can render an upsell button + confirmation id.
-	//   - Stripe: returns ("", "", nil) — a deliberate signal that the
-	//     apid handler should fall back to the precomputed
-	//     FAAS_BILLING_PORTAL_URL template (with {account_id}
-	//     substituted). Stripe's billing-portal session is operator-
-	//     configured, not SDK-created.
+	//   - Hosted-checkout providers return a provider checkout handle and
+	//     URL. The 402 Problem carries the URL in the provider-neutral
+	//     CheckoutURL field and retains legacy provider-specific aliases
+	//     where required by older clients.
+	//   - Providers without hosted checkout return ("", "", nil), which
+	//     tells apid to use a provider portal session or the configured
+	//     FAAS_BILLING_PORTAL_URL fallback.
 	//
-	// The "(txID == \"\") ⇒ Stripe stub" contract is the dispatch signal
-	// the apid handler branches on. Implementations should add a stable
+	// The "(txID == \"\") ⇒ no hosted checkout" contract is the dispatch
+	// signal the apid handler branches on. Implementations should add a stable
 	// Idempotency-Key (Paddle: recorded in CustomData) so a redelivered
 	// upgrade click doesn't create a duplicate Transaction.
 	CreateUpgradeTransaction(ctx context.Context, acct state.Account, targetPlan api.Plan) (txID, checkoutURL string, err error)
@@ -224,6 +221,14 @@ type Provider interface {
 	// The only error path is the provider-SDK failure case
 	// (ErrNoAPIKey on Stripe when no SDK is constructed).
 	PaymentMethodSummary(ctx context.Context, acct state.Account) (PaymentMethod, error)
+}
+
+// CustomerPortalProvider is an optional provider surface for creating a
+// short-lived, customer-authenticated billing portal session. Providers that
+// do not expose a session API can continue using the operator-configured
+// BillingPortalURL fallback.
+type CustomerPortalProvider interface {
+	CreateCustomerPortalSession(ctx context.Context, acct state.Account, returnURL string) (portalURL string, err error)
 }
 
 // EventType is the provider-neutral "what happened" classifier apid

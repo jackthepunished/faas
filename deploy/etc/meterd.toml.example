@@ -49,6 +49,7 @@
 # [billing.polar]             # opt-in Polar MoR + usage billing
 # api_key                = "" # organization access token; or FAAS_POLAR_ACCESS_TOKEN env
 # sandbox                = false # true → sandbox-api.polar.sh; or FAAS_POLAR_SANDBOX=1
+# meter_id               = "" # meter UUID for usage reconciliation; or FAAS_POLAR_METER_ID env
 # hobby_product_id       = "" # Polar recurring product UUID
 # pro_product_id         = "" # Polar recurring product UUID
 # scale_product_id       = "" # Polar recurring product UUID

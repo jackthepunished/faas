@@ -4595,9 +4595,9 @@ type Store interface {
 	// (the pre-flight maps zeros to "table missing" the same way).
 	PaddleOverageDedupeSchema(ctx context.Context) (PaddleOverageDedupeSchemaResult, error)
 
-	// WebhookReplayDedup is the dedupe gate for the three webhook
-	// ingresses on the box (GitHub via gatewayd-internal, Stripe + Paddle via
-	// apid). One table covers all three providers; the (provider,
+	// WebhookReplayDedup is the dedupe gate for the external webhook
+	// ingresses on the box (GitHub via gatewayd-internal, billing providers via
+	// apid). One table covers all providers; the (provider,
 	// delivery_id) primary key makes a (re-POSTed) webhook within the
 	// TTL window a 200-on-replay no-op. cutoff is the lower bound on
 	// received_at: rows older than the TTL are ignored so a fresh
@@ -4619,6 +4619,10 @@ type Store interface {
 	// is satisfied by both stores via a thin adapter that picks TTL
 	// (=5min, the webhookdedupe.TTL constant) and computes cutoff +
 	// expiresAt on each call.
+	// ClaimWebhookDelivery is the atomic variant for ingress handlers:
+	// it returns true only for a new or expired delivery and false for
+	// a delivery already being processed inside the replay window.
+	ClaimWebhookDelivery(ctx context.Context, provider, deliveryID string, cutoff, expiresAt time.Time) (claimed bool, err error)
 	CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error)
 	RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error
 	SweepExpiredWebhookDeliveries(ctx context.Context, now time.Time) (int64, error)

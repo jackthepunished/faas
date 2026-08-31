@@ -68,6 +68,7 @@ clock-skew tolerance.
 | `FAAS_POLAR_PRO_PRODUCT_ID` | Yes for the Pro plan | apid checkout + webhook plan mapping |
 | `FAAS_POLAR_SCALE_PRODUCT_ID` | Yes for the Scale plan | apid checkout + webhook plan mapping |
 | `FAAS_POLAR_USAGE_EVENT_NAME` | Optional | Defaults to `faas_ram_usage` |
+| `FAAS_POLAR_METER_ID` | Recommended | Enables read-only usage reconciliation; meter must sum `gb_ram_hours` |
 | `FAAS_POLAR_SUCCESS_URL` / `FAAS_POLAR_RETURN_URL` | Optional | Hosted-checkout redirects |
 
 Polar products are not auto-created by this provider. In the Polar
@@ -86,15 +87,27 @@ Webhooks headers (`webhook-id`, `webhook-timestamp`, and
 `webhook-signature`); the provider verifies the body before parsing it.
 
 The implementation supports customer creation/reuse, hosted checkout,
-metered event ingestion, scheduled cancellation, and refunds. Polar does not
-expose a direct saved-card charge retry API, so `faas billing retry` is
-truthfully unavailable for Polar; customers should use the Polar customer
-portal to update their payment method. Provider usage reconciliation is also
-not advertised because the current local contract requires an exact integer
-`mb_seconds` total while Polar meter quantities are floating-point.
+provider customer-portal sessions, metered event ingestion, scheduled
+cancellation, refunds, and optional read-only usage reconciliation. Set
+`FAAS_POLAR_METER_ID` to the UUID of the meter that sums `gb_ram_hours`; the
+provider converts Polar's total back to the local integer `mb_seconds` unit.
+Without that setting, reconciliation remains explicitly unavailable rather
+than producing a false drift signal.
+
+Polar does not expose a direct saved-card charge retry API, so `faas billing
+retry` returns a truthful 501 with the customer-portal URL; customers should
+update their payment method and recover the subscription from that portal.
+
+Polar usage events are attributed to billing periods by receipt time, not the
+event's supplied timestamp. meterd therefore pushes each completed hour and
+rejects a Polar configuration whose billing push interval is longer than one
+hour; this prevents silent under-reporting after a default/configuration
+mistake.
 
 Official references: [Polar checkout sessions](https://polar.sh/docs/api-reference/checkouts/create-session),
+[customer portal sessions](https://polar.sh/docs/api-reference/customer-portal/sessions/create),
 [event ingestion](https://polar.sh/docs/api-reference/events/ingest),
+[meter quantities](https://polar.sh/docs/api-reference/meters/get-quantities),
 [usage meters](https://polar.sh/docs/features/usage-based-billing/meters),
 [subscription cancellation](https://polar.sh/docs/features/subscriptions/manage),
 and [Standard Webhooks delivery](https://polar.sh/docs/integrate/webhooks/delivery).

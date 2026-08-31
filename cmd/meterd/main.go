@@ -95,6 +95,7 @@ const scheddCPUAdapterTTL = 30 * time.Second
 const (
 	provStripe = "stripe"
 	provPaddle = "paddle"
+	provPolar  = "polar"
 )
 
 func (a *scheddCPUAdapter) CPUUsageUsec(instanceID string) (uint64, bool) {
@@ -746,6 +747,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// TOML key is present and the SDK initializes fine.
 		warnIfEmptyAPIKey(log, billingCfg, provName)
 		log.Info("meterd billing provider loaded", "provider", provName)
+	}
+	if err := validateBillingPushInterval(provName, mc.StripeInterval); err != nil {
+		return err
 	}
 
 	// Mailer: defaults to mail.SenderFromEnv so FAAS_MAIL_TRANSPORT
@@ -1580,4 +1584,16 @@ func warnIfEmptyAPIKey(log *slog.Logger, billingCfg *billingloader.RootBillingCo
 			"provider", provName)
 		return
 	}
+}
+
+// validateBillingPushInterval prevents a Polar deployment from silently
+// under-reporting usage. Pusher.PushHour aggregates exactly one completed
+// hour, so a cadence longer than one hour leaves unpushed usage windows.
+// The historical field name StripeInterval is retained for config/API
+// compatibility, but the invariant applies to every hourly metered provider.
+func validateBillingPushInterval(provName string, interval time.Duration) error {
+	if provName == provPolar && interval > time.Hour {
+		return fmt.Errorf("meterd: Polar usage push interval must be <= 1h (got %s); set [meter].stripe_interval = \"3600s\" or FAAS_STRIPE_INTERVAL=1h", interval)
+	}
+	return nil
 }

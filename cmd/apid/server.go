@@ -627,6 +627,25 @@ func (s *server) billingPortalURLFor(acct state.Account) string {
 	return strings.ReplaceAll(s.billingPortalURL, "{account_id}", acct.ID)
 }
 
+// billingPortalURLForProvider returns a provider-authenticated portal session when the
+// active provider supports it, falling back to the operator-configured URL
+// used by the legacy Stripe path. The short timeout keeps plan-change and
+// billing reads from hanging on a provider outage.
+func (s *server) billingPortalURLForProvider(ctx context.Context, acct state.Account) string {
+	if acct.ProviderCustomerID != "" {
+		if provider, ok := s.billingProvider.(billing.CustomerPortalProvider); ok {
+			portalCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			if portalURL, err := provider.CreateCustomerPortalSession(portalCtx, acct, ""); err == nil && portalURL != "" {
+				return portalURL
+			} else if err != nil {
+				s.log.Warn("billing portal session unavailable", "account", acct.ID, "err", err)
+			}
+		}
+	}
+	return s.billingPortalURLFor(acct)
+}
+
 // Mailer is the slice of pkg/mail.Sender apid depends on. Kept as an
 // interface so tests inject a recording stub without importing pkg/mail.
 type Mailer interface {
@@ -1982,7 +2001,7 @@ func (s *server) handler() http.Handler {
 
 	// Billing portal link (issue #253). Read-only — the URL itself
 	// does not mutate anything; the customer-facing mutations live
-	// inside the Stripe-hosted portal that the URL points to. Same
+	// inside the provider-hosted portal that the URL points to. Same
 	// access tier as usage/invoices (usage:read scope) but NO MFA
 	// gate: viewing a portal link is a read, and the mutations gated
 	// by the portal itself happen after the customer authenticates

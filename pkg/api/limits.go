@@ -4126,46 +4126,43 @@ func (p Plan) Valid() bool {
 }
 
 // IsPaid reports whether the plan is a paid tier (hobby/pro/scale).
-// Free is the only non-paid plan; the changePlan handler (cmd/apid
-// handlers_ext.go) uses this to decide whether an API-only upgrade
-// requires a Stripe subscription item (issue #142).
+// Free is the only non-paid plan.
 func (p Plan) IsPaid() bool {
 	return p == PlanHobby || p == PlanPro || p == PlanScale
 }
 
-// RequiresStripeUpgradeTo reports whether moving from p → next counts as
-// a paid-upgrade that needs a Stripe subscription item. Downgrades
-// (any → free) and same-tier moves return false; the customer can
-// always downgrade without Stripe. The only free → paid direct path
-// is free → hobby (the v0 upgrade); free → pro/scale and any
-// hobby → pro/scale and pro → scale require a Stripe subscription item.
-//
-// The Stripe webhook is the legitimate path to set a paid plan — it
-// stamps StripeSubscriptionItem on the account record before the plan
-// change, so the same handler that rejects free → pro for an
-// API-key-only call accepts free → pro when the Stripe item is set.
+// IsUpgradeTo reports whether moving from p to next increases the plan tier.
+// Unknown plans and same-tier/downgrade moves return false.
+func (p Plan) IsUpgradeTo(next Plan) bool {
+	from, fromOK := planRank[p]
+	to, toOK := planRank[next]
+	return fromOK && toOK && to > from
+}
+
+// RequiresBillingUpgradeTo reports whether moving from p → next is a paid
+// upgrade that must be confirmed by the active billing provider. Downgrades,
+// same-tier moves, and upgrades to Free return false.
 //
 // Fail-closed on unknown plans: an unknown `from` (e.g. a future
 // enterprise tier added without updating this switch) returns true so
 // the 402 gate fires — a missing case must never silently let a
 // customer upgrade without billing. Reviewers: keep this default in
 // place if you extend the switch above.
-func (p Plan) RequiresStripeUpgradeTo(next Plan) bool {
+func (p Plan) RequiresBillingUpgradeTo(next Plan) bool {
 	if !next.Valid() {
 		return false // caller's plan.Valid() check already covers this
 	}
-	switch p {
-	case PlanFree:
-		return next == PlanPro || next == PlanScale
-	case PlanHobby:
-		return next == PlanPro || next == PlanScale
-	case PlanPro:
-		return next == PlanScale
-	case PlanScale:
-		return false
-	default:
-		return true // unknown source plan: require Stripe, do not silently allow
+	if _, ok := planRank[p]; !ok {
+		return true // unknown source plan: fail closed
 	}
+	return p.IsUpgradeTo(next) && next.IsPaid()
+}
+
+// RequiresStripeUpgradeTo is retained for source compatibility with older
+// callers. Billing is provider-neutral now; new call sites should use
+// RequiresBillingUpgradeTo.
+func (p Plan) RequiresStripeUpgradeTo(next Plan) bool {
+	return p.RequiresBillingUpgradeTo(next)
 }
 
 // MinInstancesAllowed reports whether the plan may set the per-app
