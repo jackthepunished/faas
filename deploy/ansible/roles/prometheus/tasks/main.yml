@@ -43,7 +43,7 @@
       - prom_alertmanager_url is regex('^https?://(127\.0\.0\.1|\[?::1\]?)(:\d+)?(/.*)?$')
     fail_msg: >-
       prom_alertmanager_url={{ prom_alertmanager_url }} is not a loopback
-      address. Alertmanager must bind 127.0.0.1:9093; off-box alert
+      address. Alertmanager must bind 127.0.0.1:9094; off-box alert
       routing leaks operational metadata over plaintext. Override the
       variable only via ansible-vault or remove the override entirely.
 
@@ -191,7 +191,7 @@
   notify: reload prometheus
 
 - name: prometheus — install systemd unit
-  ansible.builtin.copy:
+  ansible.builtin.template:
     src: prometheus.service
     dest: /etc/systemd/system/prometheus.service
     owner: root

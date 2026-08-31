@@ -166,6 +166,23 @@ func dataPlacementEnabledFromEnv(getenv func(string) string) bool {
 // (golangci-lint v2.4.0 fires at 3 occurrences).
 const metricsAddrDefault = "127.0.0.1:9101"
 
+// prometheusURLDefault is the control-plane-local Prometheus endpoint
+// installed by the Ansible role. Single-box and test callers can still
+// leave FAAS_PROMETHEUS_URL empty; only a role-correct control plane gets
+// the production default, so unit/e2e fixtures retain their explicit
+// degraded-without-Prometheus behavior.
+const prometheusURLDefault = "http://127.0.0.1:9095"
+
+func resolvePrometheusURL(getenv func(string) string, boxRole role.Role) string {
+	if v := getenv("FAAS_PROMETHEUS_URL"); v != "" {
+		return v
+	}
+	if boxRole == role.RoleControlPlane {
+		return prometheusURLDefault
+	}
+	return ""
+}
+
 // resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test
 // seam (deps.getenv). Empty string disables the listener (the
 // deliberately-distinct envOr path: envOr() collapses empty→unset→
@@ -1345,12 +1362,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
-	// prometheus (default :9090 on the bridge). The HTML path defaults
+	// prometheus (default http://127.0.0.1:9095 on the control plane). The HTML path defaults
 	// to /etc/faas/statuspage/index.html; a dev override
 	// (FAAS_STATUSPAGE_PATH) lets us point at deploy/statuspage/
 	// index.html without installing.
 	srv.WithStatusCache(
-		deps.getenv("FAAS_PROMETHEUS_URL"),
+		resolvePrometheusURL(deps.getenv, cfg.Role),
 		deps.getenv("FAAS_STATUSPAGE_PATH"),
 	)
 
@@ -2405,6 +2422,13 @@ func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, 
 		wire.TraceServerOptions()...,
 	)...)
 	registerAppErrorsReceiver(srv, store, ops, true)
+	// Split-box deployments reuse the same private mTLS listener for both
+	// gateway telemetry services. Single-box deployments use the dedicated
+	// request_telemetry.sock server below, preserving the separate DAC
+	// boundaries for the legacy Unix sockets.
+	if !isUnixSocketPath(target) && os.Getenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false" {
+		registerRequestTelemetryReceiver(srv, store, ops, nil, true)
+	}
 	return srv, lis, nil
 }
 

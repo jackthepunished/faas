@@ -948,7 +948,7 @@ func (s *PgStore) ListJobInstances(ctx context.Context) ([]Instance, error) {
 		`select id, state, ram_mb, job_id from instances
 		  where kind = 'job_task'::text
 		    and state not in ('destroyed', 'parked')
-		  order by created_at`)
+		  order by started_at nulls last, id`)
 	if err != nil {
 		return nil, fmt.Errorf("state: list job_task instances: %w", err)
 	}
