@@ -70,6 +70,7 @@ clock-skew tolerance.
 | `FAAS_POLAR_USAGE_EVENT_NAME` | Optional | Defaults to `faas_ram_usage` |
 | `FAAS_POLAR_METER_ID` | Recommended | Enables read-only usage reconciliation; meter must sum `gb_ram_hours` |
 | `FAAS_POLAR_SUCCESS_URL` / `FAAS_POLAR_RETURN_URL` | Optional | Hosted-checkout redirects |
+| `FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS` | Optional | Standard Webhooks timestamp tolerance; defaults to 300 seconds |
 
 Polar products are not auto-created by this provider. In the Polar
 dashboard, create one recurring product per paid plan with the fixed monthly
@@ -177,7 +178,7 @@ the legacy `stripe.Client`.
 | Boot fails with `paddle EnsurePlanProducts: …`             | Network egress to `api.paddle.com` blocked (or `api.sandbox.paddle.com` if sandbox=1). Check `iptables` + `FAAS_BRIDGE_OUTBOUND`. | Boot log line; idempotent — re-run after fixing.                                                    |
 | Webhook returns 503                                        | `FAAS_PADDLE_WEBHOOK_SECRET` is empty. Provider refuses to verify.            | Boot log `paddle_webhook.no_provider`.                                                              |
 | Webhook returns 400 (`code: validation_failed`)            | Signature mismatch (wrong secret in dashboard) or clock skew > tolerance.     | `journalctl -u faas-apid` shows `paddle_webhook.verify_failed err=…`. Also increments `paddle_webhook_verify_failed_total`. |
-| `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`). 200 stops Paddle from retrying. | `journalctl -u faas-apid` shows `paddle_webhook.unknown_customer customer_id=…`. Check the mapping. |
+| `transaction.paid` 503 or no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`) or unavailable replay/state storage. 503 keeps the delivery retryable. | `journalctl -u faas-apid` shows `paddle_webhook.unknown_customer` or `paddle webhook replay/state …`. Check the mapping and database. |
 | `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). | `faas billing price-catalog list` shows the catalog snapshot.                                       |
 | Duplicate Paddle events arriving within seconds            | Paddle redelivery (network blip). Deduped by `pkg/webhookdedupe` (5-min TTL). | `paddle_webhook_replay_suppressed_total` increments; audit row `webhook.replay_rejected` is emitted. |
 | Polar usage is missing after a restart/outage              | Stale meterd config or unapplied migrations.                                | Confirm `stripe_interval <= 1h`, migration `00588`, and `failed` entries from meterd `/healthz`. |
@@ -189,6 +190,7 @@ the legacy `stripe.Client`.
 | Env var                                   | Default | Purpose                                                                                  |
 |-------------------------------------------|---------|------------------------------------------------------------------------------------------|
 | `FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS`   | `300`   | Replay-protection window. Applies symmetrically (rejects future-dated too). The default matches Stripe. Useful when sandbox VMs have bad NTP. |
+| `FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS`    | `300`   | Standard Webhooks timestamp window for Polar. Applies symmetrically and rejects future-dated deliveries. |
 
 Prometheus counters (single-registry on every daemon; only `apid` increments):
 

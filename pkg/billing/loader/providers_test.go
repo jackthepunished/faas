@@ -68,8 +68,7 @@ func TestProviders_Paddle(t *testing.T) {
 		if m.Name != "paddle" {
 			continue
 		}
-		// Paddle exposes: hosted checkout, line-item usage, sandbox.
-		// No refund (issue #279, returns ErrNotImplemented).
+		// Paddle exposes: hosted checkout, refunds, line-item usage, sandbox.
 		// No usage_reconcile (Paddle Billing has no usage-summary endpoint).
 		if !m.Capabilities.Has(billing.CapHostedCheckout) {
 			t.Error("paddle missing CapHostedCheckout")
@@ -80,8 +79,8 @@ func TestProviders_Paddle(t *testing.T) {
 		if !m.Capabilities.Has(billing.CapSandbox) {
 			t.Error("paddle missing CapSandbox")
 		}
-		if m.Capabilities.Has(billing.CapRefund) {
-			t.Error("paddle should NOT include CapRefund — returns ErrNotImplemented")
+		if !m.Capabilities.Has(billing.CapRefund) {
+			t.Error("paddle missing CapRefund")
 		}
 		if m.Capabilities.Has(billing.CapUsageReconcile) {
 			t.Error("paddle should NOT include CapUsageReconcile — Paddle has no usage-summary endpoint")

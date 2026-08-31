@@ -154,9 +154,13 @@ func parsePolarEvent(payload []byte, eventID string, p *Provider) (billing.Event
 		Invoice:        polarInvoice(raw.Type, data),
 	}
 	if event.Type == billing.EventRefundProcessed {
-		event.ProviderRefundID = stringValue(data["id"])
+		if strings.HasPrefix(raw.Type, "refund.") {
+			event.ProviderRefundID = firstString(data, "id", "refund_id")
+		} else {
+			event.ProviderRefundID = firstString(data, "refund_id")
+		}
 		event.ChargeID = firstString(data, "order_id", nestedString(data, "order", "id"))
-		event.AmountCents = numberValue(data["amount"])
+		event.AmountCents = firstNumber(data, "amount", "refunded_amount", "amount_refunded")
 	} else if strings.HasPrefix(raw.Type, "order.") {
 		event.ChargeID = stringValue(data["id"])
 		event.AmountCents = firstNumber(data, "total_amount", "net_amount", "amount")
@@ -187,6 +191,8 @@ func mapPolarEventType(eventType string, data map[string]any) billing.EventType 
 		return billing.EventSubscriptionUpdated
 	case "subscription.active":
 		return billing.EventPaymentSucceeded
+	case "subscription.cycled":
+		return billing.EventPaymentSucceeded
 	case "subscription.past_due":
 		return billing.EventSubscriptionPastDue
 	case "subscription.revoked":
@@ -201,7 +207,7 @@ func mapPolarEventType(eventType string, data map[string]any) billing.EventType 
 		return billing.EventSubscriptionCanceled
 	case "order.paid":
 		return billing.EventPaymentSucceeded
-	case "order.refunded", "refund.updated":
+	case "order.refunded", "refund.created", "refund.updated":
 		return billing.EventRefundProcessed
 	default:
 		return billing.EventUnknown
@@ -260,6 +266,9 @@ func numberValue(value any) int64 {
 		return int64(value)
 	case int64:
 		return value
+	case string:
+		n, _ := strconv.ParseInt(value, 10, 64)
+		return n
 	default:
 		return 0
 	}
@@ -287,6 +296,12 @@ func polarInvoice(eventType string, data map[string]any) *billing.InvoiceData {
 	periodStart := firstTime(data, "period_start", "billing_period_start", "current_period_start")
 	periodEnd := firstTime(data, "period_end", "billing_period_end", "current_period_end")
 	if periodStart.IsZero() {
+		periodStart = nestedTime(data, "billing_period", "starts_at")
+	}
+	if periodEnd.IsZero() {
+		periodEnd = nestedTime(data, "billing_period", "ends_at")
+	}
+	if periodStart.IsZero() {
 		periodStart = firstTime(data, "created_at")
 	}
 	if periodStart.IsZero() {
@@ -294,6 +309,14 @@ func polarInvoice(eventType string, data map[string]any) *billing.InvoiceData {
 	}
 	if periodEnd.IsZero() {
 		periodEnd = periodStart
+	}
+	paid := eventType == "order.paid" || boolValue(data["paid"]) || status == "paid"
+	amountPaid := int64(0)
+	if paid {
+		amountPaid = firstNumber(data, "amount_paid", "paid_amount", "total_amount")
+		if amountPaid == 0 {
+			amountPaid = total
+		}
 	}
 	return &billing.InvoiceData{
 		ProviderInvoiceID: id,
@@ -304,9 +327,9 @@ func polarInvoice(eventType string, data map[string]any) *billing.InvoiceData {
 		SubtotalCents:     firstNumber(data, "subtotal_amount", "subtotal"),
 		TaxCents:          firstNumber(data, "tax_amount", "tax"),
 		TotalCents:        total,
-		AmountPaidCents:   firstNumber(data, "amount_paid", "paid_amount", "total_amount"),
+		AmountPaidCents:   amountPaid,
 		Currency:          strings.ToLower(firstString(data, "currency", "price_currency")),
-		PDFAvailable:      firstString(data, "invoice_pdf", "invoice_url", "pdf_url") != "",
+		PDFAvailable:      boolValue(data["is_invoice_generated"]) || firstString(data, "invoice_pdf", "invoice_url", "pdf_url") != "",
 	}
 }
 
@@ -319,6 +342,12 @@ func invoiceStatus(eventType, providerStatus string) string {
 		return "paid"
 	case "void", "cancelled", "canceled":
 		return "void"
+	case "refunded":
+		return "void"
+	case "partially_refunded":
+		return "paid"
+	case "pending":
+		return "open"
 	case "uncollectible", "failed":
 		return "uncollectible"
 	case "draft":
@@ -335,6 +364,14 @@ func firstTime(data map[string]any, keys ...string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+func nestedTime(data map[string]any, objectKey, valueKey string) time.Time {
+	nested, ok := data[objectKey].(map[string]any)
+	if !ok {
+		return time.Time{}
+	}
+	return timeValue(nested[valueKey])
 }
 
 func timeValue(value any) time.Time {

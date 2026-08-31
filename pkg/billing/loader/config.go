@@ -162,7 +162,7 @@ func LoadBillingConfigFromPath(path string) (*RootBillingConfig, error) {
 
 // ApplyBillingEnvOverlay overwrites TOML-loaded fields with env
 // values where set. Env wins over TOML. The set of env vars is the
-// union of every provider's EnvVars surface (Stripe + Paddle) so a
+// union of every provider's EnvVars surface (Stripe, Paddle, and Polar) so a
 // Stripe-only deploy doesn't need Paddle env vars and vice versa.
 //
 // Pattern matches cmd/meterd/main.go:687-693 applyEnvTick — same

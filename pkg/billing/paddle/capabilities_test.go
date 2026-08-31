@@ -233,13 +233,13 @@ func TestPaymentMethodSummary_NilClient(t *testing.T) {
 	}
 }
 
-// --- Refund / ReconcileUsage / ensurePlansAndPrices stubs -------------
+// --- Refund / ReconcileUsage / ensurePlansAndPrices guards -------------
 
-func TestRefund_StubsReturnUnsupported(t *testing.T) {
+func TestRefund_NilClientReturnsError(t *testing.T) {
 	p := &Provider{}
 	res, err := p.Refund(context.Background(), "ctm-1", 123)
 	if err == nil {
-		t.Error("Refund: expected error (stub)")
+		t.Error("Refund: expected nil-client error")
 	}
 	if res != nil {
 		t.Errorf("Refund: res = %v, want nil", res)

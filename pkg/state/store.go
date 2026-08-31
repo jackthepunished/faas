@@ -603,6 +603,16 @@ type ComputeNodeUsageBatcher interface {
 	ComputeNodeUsedMBByNode(ctx context.Context, nodeIDs []string) (map[string]int64, error)
 }
 
+// WebhookDeliveryReleaser is an optional rollback seam for webhook ingress.
+// A delivery is claimed before its side effects run to serialize concurrent
+// redeliveries; if those side effects fail, the claim must be removed so the
+// provider can retry immediately instead of receiving a false duplicate ACK.
+// It is separate from Store so narrow test doubles and older integrations
+// remain source-compatible.
+type WebhookDeliveryReleaser interface {
+	ReleaseWebhookDelivery(ctx context.Context, provider, deliveryID string) error
+}
+
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
 // The production implementation is Postgres via the embedded SQL queries in
 // pkg/state/queries.sql; MemStore backs unit tests. Keeping this interface

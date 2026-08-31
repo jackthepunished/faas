@@ -13,6 +13,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -45,6 +47,32 @@ func resolveCfg(t *testing.T, env func(string) string) *RootBillingConfig {
 
 func discardLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// polarCatalogServer is the hermetic catalog endpoint used by the Polar
+// loader tests. EnsurePlanProducts deliberately performs a live preflight so
+// a typo cannot survive daemon startup; tests must therefore provide the same
+// local contract instead of relying on an external Polar account.
+func polarCatalogServer(t *testing.T, includeMeter bool) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/products/"):
+			id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+			if id == "" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, `{"id":"`+id+`"}`)
+		case includeMeter && r.URL.Path == "/v1/meters/meter-1":
+			_, _ = io.WriteString(w, `{"id":"meter-1"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
 // TestLoadProviderForAPID_Default confirms the empty-env case returns
@@ -137,6 +165,7 @@ func TestLoadProviderForAPID_Paddle_BuildsProvider(t *testing.T) {
 
 func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 	t.Parallel()
+	catalogURL := polarCatalogServer(t, true)
 	env := mapEnv(map[string]string{
 		"FAAS_BILLING_PROVIDER":                "polar",
 		"FAAS_POLAR_ACCESS_TOKEN":              "polar_test_token",
@@ -148,6 +177,7 @@ func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 		"FAAS_POLAR_METER_ID":                  "meter-1",
 		"FAAS_POLAR_SANDBOX":                   "true",
 		"FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS": "120",
+		"FAAS_POLAR_BASE_URL":                  catalogURL,
 	})
 	cfg := resolveCfg(t, env)
 	p, name, err := LoadProviderForAPID(context.Background(), cfg, env, discardLog())
@@ -168,6 +198,7 @@ func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 func TestLoadProviderForMeterd_Polar_BuildsProvider(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
+	catalogURL := polarCatalogServer(t, false)
 	env := mapEnv(map[string]string{
 		"FAAS_BILLING_PROVIDER":       "polar",
 		"FAAS_POLAR_ACCESS_TOKEN":     "polar_test_token",
@@ -175,6 +206,7 @@ func TestLoadProviderForMeterd_Polar_BuildsProvider(t *testing.T) {
 		"FAAS_POLAR_PRO_PRODUCT_ID":   "pro-product",
 		"FAAS_POLAR_SCALE_PRODUCT_ID": "scale-product",
 		"FAAS_POLAR_SANDBOX":          "1",
+		"FAAS_POLAR_BASE_URL":         catalogURL,
 	})
 	cfg := resolveCfg(t, env)
 	p, name, err := LoadProviderForMeterd(cfg, env, store, discardLog())

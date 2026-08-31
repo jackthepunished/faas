@@ -159,7 +159,7 @@ func (p *Provider) ClassifyPushError(err error) string {
 // Paddle/Stripe, creating a product here would be unsafe: the recurring
 // product must already contain the metered price and meter configured in the
 // Polar dashboard. The IDs are therefore explicit deployment configuration.
-func (p *Provider) EnsurePlanProducts(context.Context) error {
+func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
 	if p == nil {
 		return errors.New("polar: provider is nil")
 	}
@@ -170,6 +170,41 @@ func (p *Provider) EnsurePlanProducts(context.Context) error {
 	}
 	if strings.TrimSpace(p.usageEvent) == "" {
 		return errors.New("polar: usage event name is empty")
+	}
+	if err := p.validateCatalog(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCatalog confirms that the configured dashboard-owned resources
+// exist in the selected Polar environment. The provider intentionally does
+// not create or mutate catalog resources, but accepting a typo here would
+// otherwise defer a broken deployment to the first customer checkout.
+func (p *Provider) validateCatalog(ctx context.Context) error {
+	for plan, productID := range p.products {
+		var product struct {
+			ID string `json:"id"`
+		}
+		path := "/v1/products/" + url.PathEscape(productID)
+		if err := p.doJSON(ctx, http.MethodGet, path, nil, &product, ""); err != nil {
+			return fmt.Errorf("polar: validate %s product %q: %w", plan, productID, err)
+		}
+		if product.ID != "" && product.ID != productID {
+			return fmt.Errorf("polar: validate %s product %q returned mismatched id %q", plan, productID, product.ID)
+		}
+	}
+	if strings.TrimSpace(p.meterID) != "" {
+		var meter struct {
+			ID string `json:"id"`
+		}
+		path := "/v1/meters/" + url.PathEscape(p.meterID)
+		if err := p.doJSON(ctx, http.MethodGet, path, nil, &meter, ""); err != nil {
+			return fmt.Errorf("polar: validate meter %q: %w", p.meterID, err)
+		}
+		if meter.ID != "" && meter.ID != p.meterID {
+			return fmt.Errorf("polar: validate meter %q returned mismatched id %q", p.meterID, meter.ID)
+		}
 	}
 	return nil
 }
@@ -224,6 +259,7 @@ func (p *Provider) CreateCustomer(ctx context.Context, acct state.Account) (stri
 }
 
 type usageEvent struct {
+	ExternalID         string         `json:"external_id,omitempty"`
 	Name               string         `json:"name"`
 	ExternalCustomerID string         `json:"external_customer_id"`
 	Metadata           map[string]any `json:"metadata"`
@@ -261,6 +297,7 @@ func (p *Provider) PushUsageRecord(ctx context.Context, acct state.Account, hour
 	}
 	quantity := float64(mbSeconds) / float64(billing.SecondsPerGBHour)
 	body := ingestRequest{Events: []usageEvent{{
+		ExternalID:         fmt.Sprintf("faas-usage-%s-%s", acct.ID, window.Format(time.RFC3339)),
 		Name:               p.usageEvent,
 		ExternalCustomerID: acct.ID,
 		Metadata: map[string]any{
@@ -276,6 +313,9 @@ func (p *Provider) PushUsageRecord(ctx context.Context, acct state.Account, hour
 	idem := fmt.Sprintf("faas-usage-%s-%s", acct.ID, window.Format(time.RFC3339))
 	if err := p.doJSON(ctx, http.MethodPost, "/v1/events/ingest", body, &result, idem); err != nil {
 		return fmt.Errorf("polar: ingest usage account=%s hour=%s: %w", acct.ID, window.Format(time.RFC3339), err)
+	}
+	if result.Inserted == 0 && result.Duplicates == 0 {
+		return fmt.Errorf("polar: ingest usage account=%s hour=%s returned no inserted or duplicate events", acct.ID, window.Format(time.RFC3339))
 	}
 	if p.dedupe != nil {
 		if err := p.dedupe.RecordStripePushHour(ctx, acct.ID, window); err != nil {
@@ -400,6 +440,7 @@ type refundResponse struct {
 	ID       string `json:"id"`
 	Amount   int64  `json:"amount"`
 	Currency string `json:"currency"`
+	Status   string `json:"status"`
 }
 
 // Refund maps the billing interface's charge ID to Polar's order ID.
@@ -416,18 +457,41 @@ func (p *Provider) Refund(ctx context.Context, chargeID string, amountCents int6
 		"amount":   amountCents,
 	}
 	var refund refundResponse
-	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, "faas-refund-"+chargeID); err != nil {
+	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, fmt.Sprintf("faas-refund-%s-%d", chargeID, amountCents)); err != nil {
 		return nil, fmt.Errorf("polar: create refund order=%s: %w", chargeID, err)
 	}
 	if refund.ID == "" {
 		return nil, fmt.Errorf("polar: refund order=%s returned empty ID", chargeID)
+	}
+	if refund.Amount <= 0 {
+		refund.Amount = amountCents
 	}
 	return &billing.RefundResult{
 		ProviderRefundID: refund.ID,
 		ChargeID:         chargeID,
 		AmountCents:      refund.Amount,
 		Currency:         refund.Currency,
+		Status:           refund.Status,
 	}, nil
+}
+
+// RequestInvoicePDF starts Polar's asynchronous invoice generation. The
+// follow-up order.updated webhook carries is_invoice_generated=true and
+// updates the persisted invoice projection.
+func (p *Provider) RequestInvoicePDF(ctx context.Context, orderID string) error {
+	if strings.TrimSpace(orderID) == "" {
+		return errors.New("polar: invoice PDF requires order ID")
+	}
+	path := "/v1/orders/" + url.PathEscape(orderID) + "/invoice"
+	if err := p.doJSON(ctx, http.MethodPost, path, nil, nil, "faas-invoice-pdf-"+orderID); err != nil {
+		// Polar may report that the invoice has already been generated while
+		// the delivery carrying is_invoice_generated=true is still in flight.
+		if hasStatus(err, http.StatusConflict) {
+			return nil
+		}
+		return fmt.Errorf("polar: request invoice PDF order=%s: %w", orderID, err)
+	}
+	return nil
 }
 
 // RetryLatestCharge is left unsupported because Polar's merchant API exposes
