@@ -935,6 +935,43 @@ func TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur(t *testing.T) {
 	}
 }
 
+// TestAdmitInstanceForDeployment_DispatchesBoot pins the floor-trigger
+// contract: an explicit deployment admission must run the same vmmd and
+// Phase-4 commit path as a request-driven wake. The old helper only inserted
+// a COLD_BOOTING row and reserved ledger capacity, which left floor-created
+// instances to time out in the watchdog.
+func TestAdmitInstanceForDeployment_DispatchesBoot(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 128, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.AdmitInstanceForDeployment(context.Background(), app.ID, dep.ID, "", TriggerFloorDep)
+	if err != nil {
+		t.Fatalf("AdmitInstanceForDeployment: %v", err)
+	}
+	if res.InstanceID == "" {
+		t.Fatal("AdmitInstanceForDeployment returned an empty instance id")
+	}
+	ins, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if ins.State != string(state.StateRunning) {
+		t.Fatalf("instance state = %q, want %q", ins.State, state.StateRunning)
+	}
+
+	vmm.mu.Lock()
+	coldBoots, restores := vmm.coldBoots, vmm.restores
+	vmm.mu.Unlock()
+	if coldBoots != 1 || restores != 0 {
+		t.Fatalf("coldBoots=%d restores=%d, want 1/0", coldBoots, restores)
+	}
+	if got := e.Ledger().Concurrency(app.ID); got != 1 {
+		t.Fatalf("ledger concurrency = %d, want 1", got)
+	}
+}
+
 // TestCooldownSRemaining pins the cooldownSRemaining helper's
 // floor/nil-stamp/zero-cooldown/remaining branches with
 // deterministic clock injections. The helper is the wire source

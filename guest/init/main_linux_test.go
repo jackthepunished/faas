@@ -365,6 +365,92 @@ func TestBuildArgv(t *testing.T) {
 	}
 }
 
+func TestPrepareRailpackConfig_UsesPlatformBaseAndRestoresSource(t *testing.T) {
+	workdir := t.TempDir()
+	original := []byte(`{"deploy":{"aptPackages":["curl"],"base":{"image":"customer/base"}},"custom":true}`)
+	path := filepath.Join(workdir, "railpack.json")
+	if err := os.WriteFile(path, original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	restore, err := prepareRailpackConfig(api.BuildManifest{
+		Framework:      api.FrameworkRailpackNode,
+		Runtime:        "node22",
+		RuntimeBaseRef: "ghcr.io/poyrazk/runner-node22@sha256:" + strings.Repeat("a", 64),
+		Workdir:        workdir,
+	})
+	if err != nil {
+		t.Fatalf("prepareRailpackConfig: %v", err)
+	}
+	staged, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(staged, &config); err != nil {
+		t.Fatalf("decode staged config: %v", err)
+	}
+	deploy := config["deploy"].(map[string]any)
+	base := deploy["base"].(map[string]any)
+	if base["image"] != "ghcr.io/poyrazk/runner-node22@sha256:"+strings.Repeat("a", 64) {
+		t.Fatalf("staged base image = %v", base["image"])
+	}
+	if got := deploy["aptPackages"].([]any); len(got) != 1 || got[0] != "curl" {
+		t.Fatalf("explicit aptPackages changed: %v", got)
+	}
+	if config["custom"] != true {
+		t.Fatalf("custom Railpack config was not preserved: %v", config["custom"])
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("restored config = %q, want original %q", got, original)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat restored config: %v", err)
+	}
+	if got := st.Mode().Perm(); got != 0o640 {
+		t.Fatalf("restored mode = %o, want 0640", got)
+	}
+}
+
+func TestPrepareRailpackConfig_CreatesAndRemovesPlatformConfig(t *testing.T) {
+	workdir := t.TempDir()
+	restore, err := prepareRailpackConfig(api.BuildManifest{
+		Framework:      api.FrameworkRailpackGo,
+		Runtime:        "go124-alpine",
+		RuntimeBaseRef: "ghcr.io/poyrazk/runner-go124-alpine@sha256:" + strings.Repeat("b", 64),
+		Workdir:        workdir,
+	})
+	if err != nil {
+		t.Fatalf("prepareRailpackConfig: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(workdir, "railpack.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	deploy := config["deploy"].(map[string]any)
+	if got := deploy["aptPackages"].([]any); len(got) != 0 {
+		t.Fatalf("default Alpine aptPackages = %v, want empty", got)
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "railpack.json")); !os.IsNotExist(err) {
+		t.Fatalf("generated config remains after restore, err=%v", err)
+	}
+}
+
 func equalSlice(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

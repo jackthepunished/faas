@@ -401,6 +401,17 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.emitBuildLog(ctx, build.ID, "inferred source-declared version: "+ver+"\n")
 	}
 
+	// Railpack must build FROM the same immutable runtime base that imaged
+	// will use when it materialises the deployment layer. Without this handoff
+	// Railpack starts from railpack-runtime and imaged correctly rejects the
+	// resulting OCI chain as incompatible with the Gregale runner base.
+	runtimeName := app.Runtime
+	runtimeBaseRef, baseErr := resolveBuildRuntimeBaseRef(runtimeName, fw, os.Getenv)
+	if baseErr != nil {
+		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "resolve runtime base: "+baseErr.Error(), buildStart)
+		return BuildResult{}, baseErr
+	}
+
 	// Cache check: content-addressed by sha256(source). A hit means we
 	// produced this exact app layer before and can short-circuit the VM
 	// spawn entirely (this is the ≥2× speedup gate, spec §14 M6).
@@ -409,7 +420,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "source hash: "+err.Error(), buildStart)
 		return BuildResult{}, err
 	}
-	if cached, ok := b.cache.Lookup(srcHash, fw, acct.Plan); ok {
+	if cached, ok := b.cache.LookupWithBase(srcHash, fw, acct.Plan, runtimeBaseRef); ok {
 		// Cache hit is one of the two real "build started" sites
 		// (the other is the spawn path below). Observe the
 		// queue-wait here so a no-slot requeue on a sibling row
@@ -487,15 +498,17 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	vmCtx, cancel := context.WithTimeout(ctx, timeout)
 
 	handle, err := b.vm.Spawn(vmCtx, VMRequest{
-		BuildID:      build.ID,
-		TenantID:     app.AccountID,
-		DeploymentID: dep.ID,
-		SourcePath:   dep.SourcePath,
-		Framework:    fw,
-		LogPath:      dep.LogPath,
-		RAMMB:        api.BuildVMRAMMB,
-		TimeoutSec:   b.cfg.BuildTimeoutSeconds,
-		Plan:         string(acct.Plan),
+		BuildID:        build.ID,
+		TenantID:       app.AccountID,
+		DeploymentID:   dep.ID,
+		SourcePath:     dep.SourcePath,
+		Framework:      fw,
+		Runtime:        runtimeName,
+		RuntimeBaseRef: runtimeBaseRef,
+		LogPath:        dep.LogPath,
+		RAMMB:          api.BuildVMRAMMB,
+		TimeoutSec:     b.cfg.BuildTimeoutSeconds,
+		Plan:           string(acct.Plan),
 	})
 	if err != nil {
 		// Translate a context-deadline to timeout-class; everything else is infra.
@@ -588,7 +601,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	}
 
 	// Stamp the cache so the next build of the same source is a hit.
-	if err := b.cache.Store(srcHash, fw, acct.Plan, out.OCIImage, out.LogTailBytes); err != nil {
+	if err := b.cache.StoreWithBase(srcHash, fw, acct.Plan, runtimeBaseRef, out.OCIImage, out.LogTailBytes); err != nil {
 		b.log.Warn("builderd: cache store failed (continuing)", "err", err)
 	}
 	// Stamp the produced layer path onto the deployment row. imaged will
