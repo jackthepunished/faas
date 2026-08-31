@@ -8,6 +8,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -218,6 +219,10 @@ func providerOpsFor(prov billing.Provider) providerOps {
 	case *paddle.Provider:
 		return providerOps{opLabel: "paddle", classify: classify, observe: func(m *wire.OpsMetrics, code string, d time.Duration) {
 			m.PaddlePushDuration(code).Observe(d.Seconds())
+		}}
+	case *polar.Provider:
+		return providerOps{opLabel: "polar", classify: classify, observe: func(m *wire.OpsMetrics, code string, d time.Duration) {
+			m.PolarPushDuration(code).Observe(d.Seconds())
 		}}
 	default:
 		// Unknown provider — fall back to the Stripe observer so

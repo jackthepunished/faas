@@ -24,6 +24,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
 	"github.com/onebox-faas/faas/pkg/netns"
@@ -1044,6 +1045,9 @@ type OpsMetrics struct {
 	// Stripe histogram would lose the closed-set distinction the
 	// dashboard panel definitions depend on.
 	paddlePushDur *prometheus.HistogramVec
+	// polarPushDur is the per-push latency histogram for Polar event
+	// ingestion. It uses polar.PolarPushResultLabels() as its closed label set.
+	polarPushDur *prometheus.HistogramVec
 	// wakeIDV4Fallback: introduced in feat/wake-id review followup
 	// (gaps analysis 2026-07-23, finding #6). Increments when schedd
 	// mints a wake_id and uuid.NewV7 returns an error — the engine
@@ -2366,6 +2370,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// comparable.
 		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"result"})
+	polarPushDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_polar_push_duration_seconds",
+		Help:    "Per-push latency to Polar event ingestion, labelled by terminal result code.",
+		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 45, 60},
+	}, []string{"result"})
 	buildDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_build_duration_seconds",
 		Help: "Wall-clock duration of a builder-VM build, in seconds (ADR-030). Labelled by outcome {cache_hit,ok,failed} so the §12 panels can slice out cache-hit noise (<1 s); success/failure classification lives on ops_total{op=\"build\",code}.",
@@ -2948,7 +2957,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	commonCollectors := []prometheus.Collector{
 		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
-		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
+		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur, polarPushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal, meteredMBSecondsTotal,
 		// ADR-123 alert-preset signal series — PR-A (3) + PR-B (2). Each
@@ -3807,6 +3816,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, label := range paddle.PushResultLabels() {
 		paddlePushDur.WithLabelValues(label)
 	}
+	for _, label := range polar.PolarPushResultLabels() {
+		polarPushDur.WithLabelValues(label)
+	}
 	// Pre-instantiate the closed plan set for the residentGBPerCustomer
 	// gauge so its HELP/TYPE and zero-valued samples surface in /metrics
 	// from the moment the daemon boots — same precedent as the histogram
@@ -4058,6 +4070,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		cronFireNowDispatchDur:               cronFireNowDispatchDur,
 		stripePushDur:                        stripePushDur,
 		paddlePushDur:                        paddlePushDur,
+		polarPushDur:                         polarPushDur,
 		buildDur:                             buildDur,
 		buildQueueWait:                       buildQueueWait,
 		residentGBPerCustomer:                residentGBPerCustomer,
@@ -5895,6 +5908,12 @@ func (m *OpsMetrics) StripePushDuration(result string) prometheus.Observer {
 // based on the runtime provider type — see pusherDispatch.
 func (m *OpsMetrics) PaddlePushDuration(result string) prometheus.Observer {
 	return m.paddlePushDur.WithLabelValues(result)
+}
+
+// PolarPushDuration returns the per-(result) observer for the dedicated Polar
+// usage-ingestion histogram.
+func (m *OpsMetrics) PolarPushDuration(result string) prometheus.Observer {
+	return m.polarPushDur.WithLabelValues(result)
 }
 
 // WakePhaseEmitted returns the per-(phase, result) counter for

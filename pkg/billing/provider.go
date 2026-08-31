@@ -12,6 +12,8 @@
 //     Default provider when FAAS_BILLING_PROVIDER is empty.
 //   - pkg/billing/paddle — Paddle Billing v2 (current API). Opt-in via
 //     FAAS_BILLING_PROVIDER=paddle.
+//   - pkg/billing/polar — Polar MoR REST API + event-based usage billing.
+//     Opt-in via FAAS_BILLING_PROVIDER=polar.
 //
 // Provider-specific behaviour stays inside each implementation; the rest
 // of the codebase (apid, meterd, the dunning state machine, the email

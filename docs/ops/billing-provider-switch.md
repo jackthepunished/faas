@@ -1,4 +1,4 @@
-# Billing provider switch (Paddle → Stripe legacy opt-in)
+# Billing provider switch (Paddle / Polar → Stripe legacy opt-in)
 
 The launch production billing provider is **Paddle Billing v2** (ADR-032 v2,
 accepted 2026-08-18). The legacy Stripe surface is still bootable from
@@ -6,6 +6,7 @@ accepted 2026-08-18). The legacy Stripe surface is still bootable from
 deploy template is Paddle-only. This runbook covers:
 
 - The selector semantics in both directions.
+- The Polar MoR setup and its event-based usage-billing contract.
 - The cutover procedure for a node-level rollback to Stripe (the
   on-launch option, intended for a single-node hot-fix while the
   broader cluster rolls forward).
@@ -23,6 +24,7 @@ deploy template is Paddle-only. This runbook covers:
 |-------------------------|--------------------------------------------------|
 | (empty) / unset         | Paddle (default — production billing provider).  |
 | `paddle`                | Paddle (explicit). Requires `FAAS_PADDLE_*`.    |
+| `polar`                 | Polar (explicit). Requires `FAAS_POLAR_*` plus product IDs. |
 | `stripe`                | Stripe (legacy opt-in for a node-level rollback). Requires `STRIPE_*`. |
 | anything else           | Daemon fails to boot with a typed error.         |
 
@@ -54,6 +56,48 @@ The same key signs all events for that endpoint; the
 `Paddle-Signature` header carries `ts=…;h1=…` and
 `paddle.Provider.VerifyWebhook` checks both halves with a 5-minute
 clock-skew tolerance.
+
+### Polar (opt-in)
+
+| Var | Required | Used by |
+|-----|----------|---------|
+| `FAAS_POLAR_ACCESS_TOKEN` | Yes | apid + meterd |
+| `FAAS_POLAR_WEBHOOK_SECRET` | Yes | apid (`/v1/webhooks/polar`) |
+| `FAAS_POLAR_SANDBOX` | Recommended for non-prod (`1` / `true`) | apid + meterd |
+| `FAAS_POLAR_HOBBY_PRODUCT_ID` | Yes for the Hobby plan | apid checkout + webhook plan mapping |
+| `FAAS_POLAR_PRO_PRODUCT_ID` | Yes for the Pro plan | apid checkout + webhook plan mapping |
+| `FAAS_POLAR_SCALE_PRODUCT_ID` | Yes for the Scale plan | apid checkout + webhook plan mapping |
+| `FAAS_POLAR_USAGE_EVENT_NAME` | Optional | Defaults to `faas_ram_usage` |
+| `FAAS_POLAR_SUCCESS_URL` / `FAAS_POLAR_RETURN_URL` | Optional | Hosted-checkout redirects |
+
+Polar products are not auto-created by this provider. In the Polar
+dashboard, create one recurring product per paid plan with the fixed monthly
+price and a metered price backed by a meter that filters on the configured
+event name and sums `gb_ram_hours`. The meterd pusher sends the exact local
+`mb_seconds` as audit metadata and the corresponding GB-RAM-hours quantity as
+the meter value.
+
+Configure a Polar webhook endpoint at
+`https://<your-api-host>/v1/webhooks/polar` and subscribe at least to
+`subscription.created`, `subscription.updated`, `subscription.active`,
+`subscription.canceled`, `subscription.revoked`, `subscription.past_due`,
+`order.paid`, and `order.refunded`. Polar signs deliveries with Standard
+Webhooks headers (`webhook-id`, `webhook-timestamp`, and
+`webhook-signature`); the provider verifies the body before parsing it.
+
+The implementation supports customer creation/reuse, hosted checkout,
+metered event ingestion, scheduled cancellation, and refunds. Polar does not
+expose a direct saved-card charge retry API, so `faas billing retry` is
+truthfully unavailable for Polar; customers should use the Polar customer
+portal to update their payment method. Provider usage reconciliation is also
+not advertised because the current local contract requires an exact integer
+`mb_seconds` total while Polar meter quantities are floating-point.
+
+Official references: [Polar checkout sessions](https://polar.sh/docs/api-reference/checkouts/create-session),
+[event ingestion](https://polar.sh/docs/api-reference/events/ingest),
+[usage meters](https://polar.sh/docs/features/usage-based-billing/meters),
+[subscription cancellation](https://polar.sh/docs/features/subscriptions/manage),
+and [Standard Webhooks delivery](https://polar.sh/docs/integrate/webhooks/delivery).
 
 ## Cutover procedure (Stripe → Paddle)
 

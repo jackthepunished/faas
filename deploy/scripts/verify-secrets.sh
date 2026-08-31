@@ -142,6 +142,13 @@ if [[ -f /etc/faas/sealed.env ]]; then
     # node-level operator has explicit knowledge of the legacy
     # surface and a missing Paddle key is the expected state.
     :
+  elif grep -q "^FAAS_BILLING_PROVIDER=polar" /etc/faas/sealed.env; then
+    check "sealed.env has FAAS_POLAR_ACCESS_TOKEN" bash -c '
+      grep -q "^FAAS_POLAR_ACCESS_TOKEN=." /etc/faas/sealed.env
+    '
+    check "sealed.env has FAAS_POLAR_WEBHOOK_SECRET" bash -c '
+      grep -q "^FAAS_POLAR_WEBHOOK_SECRET=whsec_" /etc/faas/sealed.env
+    '
   else
     check "sealed.env has FAAS_PADDLE_API_KEY" bash -c '
       grep -q "^FAAS_PADDLE_API_KEY=pdl_" /etc/faas/sealed.env

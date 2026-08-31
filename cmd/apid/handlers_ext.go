@@ -3494,6 +3494,15 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) {
 	switch ev.Type {
 	case billing.EventSubscriptionCreated:
+		// The shared column retains its historical Stripe name, but for
+		// Polar it stores the subscription UUID that cancel-at-period-end
+		// and future provider operations use.
+		if ev.SubscriptionID != "" {
+			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+		}
+		if ev.PlanID != "" {
+			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
+		}
 		// MFA is explicitly opt-in. Billing events must never change
 		// an account's MFA policy or force an enrolled-session prompt.
 	case billing.EventSubscriptionCanceled:
@@ -3562,6 +3571,12 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 			}
 		}
 	case billing.EventPaymentSucceeded:
+		if ev.SubscriptionID != "" {
+			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+		}
+		if ev.PlanID != "" {
+			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
+		}
 		// Restore the account if it was past_due. meterd will refresh
 		// quota state on its next tick. We also clear the dedupe stamp
 		// on last_quota_warning_at so the next quota tick (if the
@@ -3595,6 +3610,9 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 		// cost of an extra pg_notify on a no-op event is nil.
 		_ = s.store.ClearQuotaWarning(ctx, acct.ID)
 	case billing.EventSubscriptionUpdated:
+		if ev.SubscriptionID != "" {
+			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+		}
 		if ev.PlanID != "" {
 			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
 		}
