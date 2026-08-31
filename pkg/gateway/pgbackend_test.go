@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway"
@@ -218,6 +220,155 @@ func TestPGBackend_AdmitAtCapacityHydratesLiveTarget(t *testing.T) {
 	pick := b.Pick("app-1")
 	if !pick.OK || pick.Target.InstanceID != "running-1" {
 		t.Fatalf("Pick after hydration = %+v, want running-1", pick)
+	}
+}
+
+func TestPGBackend_ReconcileLiveTargetsHydratesEmptyPicker(t *testing.T) {
+	loaderCalls := atomic.Int32{}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, gateway.NewFakeScheduler(""), nil).
+		WithLiveTargetLoader(func(context.Context, string) ([]gateway.Target, error) {
+			loaderCalls.Add(1)
+			return []gateway.Target{{
+				InstanceID:   "running-1",
+				NodeID:       "compute-1",
+				DeploymentID: "deployment-live",
+			}}, nil
+		})
+
+	if err := b.ReconcileLiveTargets(context.Background(), "app-1"); err != nil {
+		t.Fatalf("ReconcileLiveTargets: %v", err)
+	}
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Fatalf("HealthyCount after reconciliation = %d, want 1", got)
+	}
+	pick := b.Pick("app-1")
+	if !pick.OK || pick.Target.InstanceID != "running-1" {
+		t.Fatalf("Pick after reconciliation = %+v, want running-1", pick)
+	}
+
+	// Once the authoritative target is cached, reconciliation must not keep
+	// querying Postgres on every request.
+	if err := b.ReconcileLiveTargets(context.Background(), "app-1"); err != nil {
+		t.Fatalf("second ReconcileLiveTargets: %v", err)
+	}
+	if got := loaderCalls.Load(); got != 1 {
+		t.Errorf("live target loader calls = %d, want 1", got)
+	}
+}
+
+type ensureWakeOnlyScheduler struct {
+	ensureCalls int
+	admitCalls  int
+}
+
+func (s *ensureWakeOnlyScheduler) AdmitInstance(context.Context, string, string, string, string) (string, string, string, string, int32, bool, int, error) {
+	s.admitCalls++
+	return "", "", "", "", 0, false, 0, errors.New("unexpected AdmitInstance call")
+}
+
+func (s *ensureWakeOnlyScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
+	s.ensureCalls++
+	return "instance-ensured", "compute-1", "deployment-live", "wake-ensured", gateway.WireWakeRestore, 9090, nil
+}
+
+func (s *ensureWakeOnlyScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	return "", "", errors.New("not used in EnsureWarm test")
+}
+
+func TestPGBackend_EnsureWarmUsesCrossProducerWake(t *testing.T) {
+	sched := &ensureWakeOnlyScheduler{}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+	wakeID, method, atCapacity, err := b.EnsureWarm(context.Background(), "app-1", "", "gateway")
+	if err != nil {
+		t.Fatalf("EnsureWarm: %v", err)
+	}
+	if atCapacity {
+		t.Fatal("EnsureWarm atCapacity = true, want a target")
+	}
+	if wakeID != "wake-ensured" || method != gateway.WakeMethodSnapshotRestore {
+		t.Fatalf("EnsureWarm result = wakeID %q, method %v; want wake-ensured/restore", wakeID, method)
+	}
+	if sched.ensureCalls != 1 || sched.admitCalls != 0 {
+		t.Fatalf("scheduler calls = EnsureWake:%d AdmitInstance:%d; want 1/0", sched.ensureCalls, sched.admitCalls)
+	}
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Fatalf("HealthyCount after EnsureWarm = %d, want 1", got)
+	}
+}
+
+// blockingScheduler makes the admission lifecycle outlive the request
+// context. This models a restore that has been reserved by schedd but has
+// not reached RUNNING before the public request budget expires.
+type blockingScheduler struct {
+	started   chan struct{}
+	release   chan struct{}
+	completed chan struct{}
+	once      sync.Once
+}
+
+func (s *blockingScheduler) AdmitInstance(ctx context.Context, _, _, _, _ string) (string, string, string, string, int32, bool, int, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return "", "", "", "", 0, false, 0, ctx.Err()
+	}
+	close(s.completed)
+	return "instance-after-timeout", "compute-1", "", "wake-after-timeout", gateway.WireWakeRestore, false, 0, nil
+}
+
+func (s *blockingScheduler) EnsureWake(context.Context, string, string) (string, string, string, string, int32, int, error) {
+	return "", "", "", "", 0, 0, errors.New("not used in cancellation test")
+}
+
+func (s *blockingScheduler) AdmitMirrorInstance(context.Context, string, string, string) (string, string, error) {
+	return "", "", errors.New("not used in cancellation test")
+}
+
+func TestPGBackend_AdmitRequestCancellationDoesNotCancelLifecycle(t *testing.T) {
+	sched := &blockingScheduler{
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+		completed: make(chan struct{}),
+	}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, _, err := b.Admit(requestCtx, "app-1", "", "", "", 5)
+		resultCh <- err
+	}()
+
+	select {
+	case <-sched.started:
+	case <-time.After(time.Second):
+		t.Fatal("admission did not start")
+	}
+	cancel()
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Admit error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Admit did not return after request cancellation")
+	}
+
+	// The scheduler lifecycle is still allowed to finish and must publish the
+	// target even though the initiating HTTP request has already returned.
+	close(sched.release)
+	select {
+	case <-sched.completed:
+	case <-time.After(time.Second):
+		t.Fatal("admission lifecycle did not complete")
+	}
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Fatalf("HealthyCount after detached admission = %d, want 1", got)
+	}
+	if pick := b.Pick("app-1"); !pick.OK || pick.Target.InstanceID != "instance-after-timeout" {
+		t.Fatalf("Pick after detached admission = %+v, want instance-after-timeout", pick)
 	}
 }
 

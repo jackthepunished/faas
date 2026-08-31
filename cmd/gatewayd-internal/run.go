@@ -863,6 +863,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
 		WithLiveTargetLoader(func(ctx context.Context, appID string) ([]gateway.Target, error) {
+			// An instances row can outlive its deployment. Restrict the
+			// reconciliation snapshot to instances belonging to a current
+			// live deployment; otherwise an old RUNNING row could recreate a
+			// route for a deployment that the control plane no longer serves.
+			liveDeployments, err := pgStore.LiveDeployments(ctx, appID)
+			if err != nil {
+				return nil, err
+			}
+			live := make(map[string]struct{}, len(liveDeployments))
+			for _, deployment := range liveDeployments {
+				if deployment.ID != "" {
+					live[deployment.ID] = struct{}{}
+				}
+			}
 			instances, err := pgStore.ListInstancesForApp(ctx, appID)
 			if err != nil {
 				return nil, err
@@ -870,6 +884,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 			targets := make([]gateway.Target, 0, len(instances))
 			for _, instance := range instances {
 				if instance.State != string(state.StateRunning) || instance.ID == "" || instance.NodeID == "" {
+					continue
+				}
+				if _, ok := live[instance.DeploymentID]; !ok {
 					continue
 				}
 				targets = append(targets, gateway.Target{

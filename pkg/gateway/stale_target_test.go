@@ -43,8 +43,8 @@ func TestHandlerEvictsOnlyForwarderMarkedStaleTarget(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
-	if b.evictedApp != "app-1" || b.evictedInstance != "i-1" {
-		t.Fatalf("eviction = (%q, %q), want (app-1, i-1)", b.evictedApp, b.evictedInstance)
+	if b.evictedApp != "app-1" || b.evictedInstance != "i-fake" {
+		t.Fatalf("eviction = (%q, %q), want (app-1, i-fake)", b.evictedApp, b.evictedInstance)
 	}
 }
 

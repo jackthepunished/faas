@@ -6910,6 +6910,16 @@ func (m *MemStore) InsertOperatorIntent(
 	if metadata == nil {
 		metadata = json.RawMessage("{}")
 	}
+	requestedAt := time.Now().UTC()
+	// PostgreSQL's requested_at default is ordered by the database clock, but
+	// this in-memory twin can observe several inserts in the same clock tick.
+	// Keep insertion order strict so map iteration can never change FIFO claim
+	// semantics when timestamps collide.
+	for _, existing := range m.operatorIntents {
+		if !existing.RequestedAt.Before(requestedAt) {
+			requestedAt = existing.RequestedAt.Add(time.Nanosecond)
+		}
+	}
 	if traceID != nil && !isOTelHex32(*traceID) {
 		return "", fmt.Errorf("state: InsertOperatorIntent: trace_id %q must match ^[0-9a-f]{32}$", *traceID)
 	}
@@ -6922,7 +6932,7 @@ func (m *MemStore) InsertOperatorIntent(
 		Reason:      reason,
 		Metadata:    metadata,
 		Status:      OperatorIntentPending,
-		RequestedAt: time.Now().UTC(),
+		RequestedAt: requestedAt,
 		TraceID:     traceID,
 	}
 	return id, nil
@@ -6937,7 +6947,8 @@ func (m *MemStore) ClaimPendingOperatorIntent(_ context.Context) (OperatorIntent
 		if r.Status != OperatorIntentPending {
 			continue
 		}
-		if oldestID == "" || r.RequestedAt.Before(oldestAt) {
+		if oldestID == "" || r.RequestedAt.Before(oldestAt) ||
+			(r.RequestedAt.Equal(oldestAt) && id < oldestID) {
 			oldestID = id
 			oldestAt = r.RequestedAt
 		}
