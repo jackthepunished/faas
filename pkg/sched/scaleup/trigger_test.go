@@ -47,21 +47,22 @@ func (l *fakeLedger) Concurrency(appID string) int {
 	return l.conc[appID]
 }
 
-// fakeEngine is a minimal Engine. Records every AdmitInstance call
-// and ships back a canned AdmitResult. The trigger calls
-// AdmitInstance exactly once per admit row, so the call count is the
-// trip-wire for the test.
+// fakeEngine is a minimal Engine. It records the two wake surfaces
+// separately because EnsureWake is idempotent while AdmitInstance is
+// the scale-out primitive. A test that only checks a combined call
+// count would miss accidentally wiring the wrong method.
 type fakeEngine struct {
-	mu      sync.Mutex
-	calls   []string // appIDs in call order
-	results map[string]AdmitResult
-	errs    map[string]error
+	mu              sync.Mutex
+	admitCalls      []string // appIDs in AdmitInstance call order
+	ensureWakeCalls []string // appIDs in EnsureWake call order
+	results         map[string]AdmitResult
+	errs            map[string]error
 }
 
 func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.calls = append(e.calls, appID)
+	e.admitCalls = append(e.admitCalls, appID)
 	if err, ok := e.errs[appID]; ok {
 		return AdmitResult{}, err
 	}
@@ -71,13 +72,12 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (Admit
 	return AdmitResult{InstanceID: "ins-" + appID}, nil
 }
 
-// EnsureWake (ADR-098): scaleup's trigger-local WakeOutcome mirrors
-// the canned AdmitResult. The fake records a parallel call so tests
-// that need to count EnsureWake vs AdmitInstance calls can do so.
+// EnsureWake (ADR-098) remains on the compatibility interface for
+// other wake producers, but reactive scale-up must never call it.
 func (e *fakeEngine) EnsureWake(_ context.Context, appID, _ string) (WakeOutcome, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.calls = append(e.calls, appID)
+	e.ensureWakeCalls = append(e.ensureWakeCalls, appID)
 	if err, ok := e.errs[appID]; ok {
 		return WakeOutcome{}, err
 	}
@@ -149,8 +149,11 @@ func TestTrigger_AdmitOnRPSTargetHit(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 1 || engine.calls[0] != "app1" {
-		t.Errorf("engine.calls = %v, want [app1]", engine.calls)
+	if len(engine.admitCalls) != 1 || engine.admitCalls[0] != "app1" {
+		t.Errorf("engine.admitCalls = %v, want [app1]", engine.admitCalls)
+	}
+	if len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
 	}
 }
 
@@ -169,8 +172,8 @@ func TestTrigger_RejectAtCap(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 0 {
-		t.Errorf("engine.calls = %v, want []", engine.calls)
+	if len(engine.admitCalls) != 0 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v ensure:%v, want no calls", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -187,8 +190,8 @@ func TestTrigger_NoTargetNoOp(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 0 {
-		t.Errorf("engine.calls = %v, want []", engine.calls)
+	if len(engine.admitCalls) != 0 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v ensure:%v, want no calls", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -210,8 +213,8 @@ func TestTrigger_NilScraperNoOp(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 1 || engine.calls[0] != "cpu-app" {
-		t.Errorf("engine.calls = %v, want [cpu-app]", engine.calls)
+	if len(engine.admitCalls) != 1 || engine.admitCalls[0] != "cpu-app" {
+		t.Errorf("engine.admitCalls = %v, want [cpu-app]", engine.admitCalls)
 	}
 }
 
@@ -257,24 +260,17 @@ func TestTrigger_NilReceiver(t *testing.T) {
 
 // TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap verifies
 // the race: the decide() check says headroom > 0, but between that
-// check and the engine call the ledger hits the cap. ADR-098:
-//
-//	under the single-flight model the trigger no longer receives a
-//	typed AtCapacity=true return value from EnsureWake. The leader's
-//	ledger closes the at-cap loop (it returns a successful admit
-//	pointing at the last live slot, OR the typed at-cap ErrQueueFull
-//	path that the trigger treats as a non-fatal error). The
-//	admit-RPS histogram still must NOT observe in the error case —
-//	a rejected admit has no observed RPS. This test pins the
-//	err-path contract under the new wire.
+// check and the engine call the ledger hits the cap. AdmitInstance
+// returns the typed AtCapacity result; the trigger must re-observe
+// reject_at_cap and must not record an admit-RPS sample.
 func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 	store := &fakeStore{apps: []state.App{
 		{ID: "app1", AutoscaleTargetRPS: 50, MaxConcurrency: 5},
 	}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	engine := &fakeEngine{
-		errs: map[string]error{
-			"app1": errAtCapacitySentinel,
+		results: map[string]AdmitResult{
+			"app1": {AtCapacity: true},
 		},
 	}
 	m := wire.NewOpsMetrics("test")
@@ -283,8 +279,8 @@ func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 1 {
-		t.Errorf("engine.calls = %d, want 1", len(engine.calls))
+	if len(engine.admitCalls) != 1 {
+		t.Errorf("engine.admitCalls = %d, want 1", len(engine.admitCalls))
 	}
 	// The admit-RPS histogram must NOT have observed (the
 	// admission was rejected).
@@ -292,6 +288,7 @@ func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
+	foundReject := false
 	for _, fam := range gather {
 		if fam.GetName() == "test_scale_up_admit_rps" {
 			for _, m := range fam.GetMetric() {
@@ -300,20 +297,35 @@ func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 				}
 			}
 		}
+		// Gather normalizes CounterVec names by removing the _total
+		// suffix; the text exposition adds it back. Accept either
+		// representation so this assertion tests the label/value,
+		// not the protobuf naming convention.
+		if fam.GetName() != "test_scale_up_decisions" && fam.GetName() != "test_scale_up_decisions_total" {
+			continue
+		}
+		for _, metric := range fam.GetMetric() {
+			var app, outcome string
+			for _, label := range metric.GetLabel() {
+				switch label.GetName() {
+				case "app":
+					app = label.GetValue()
+				case "outcome":
+					outcome = label.GetValue()
+				}
+			}
+			if app == "app1" && outcome == "reject_at_cap" {
+				foundReject = true
+				if metric.GetCounter().GetValue() != 1 {
+					t.Errorf("reject_at_cap count = %v, want 1", metric.GetCounter().GetValue())
+				}
+			}
+		}
+	}
+	if !foundReject {
+		t.Error("reject_at_cap metric was not emitted")
 	}
 }
-
-// errAtCapacitySentinel is a stand-in for the leader-ledger "no slot
-// left" error path. Under ADR-098 the per-app ledger closes the
-// at-cap loop; the trigger treats any non-context-cancelled error
-// from EnsureWake as a non-fatal skip (matches the AdmitInstance
-// path's behaviour). The trigger still records the per-tick call so
-// the admit-RPS histogram stays unobserved.
-var errAtCapacitySentinel = errAtCap("at-capacity")
-
-type errAtCap string
-
-func (e errAtCap) Error() string { return string(e) }
 
 // TestTrigger_EngineErrorLogsNotPropagates verifies that a
 // transient engine error (e.g. vmmd dial failure) is logged but
