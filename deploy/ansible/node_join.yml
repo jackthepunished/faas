@@ -269,6 +269,18 @@
           Environment=FAAS_MANIFEST_PATH=/etc/faas/manifest.yaml
           Environment=FAAS_BUILDER_BASE_REF={{ faas_builder_base_ref | default(faas_join_builder_base_ref) }}
 
+    - name: Pin imaged guest-init to the active release
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/faas-imaged.service.d/zz-faas-guest-init.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          # Runtime bases embed guest/init as PID 1. Do not allow a legacy
+          # /usr/local/bin/faas-guest-init override to survive node adoption.
+          Environment=FAAS_GUEST_INIT=/opt/faas/current/bin/init
+
     - name: Pre-register the adopted node as drained before release installation
       ansible.builtin.command:
         argv:

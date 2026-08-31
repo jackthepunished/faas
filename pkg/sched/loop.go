@@ -1375,6 +1375,7 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 		}
 		if err := l.engine.Prime(ctx, p.AppID, p.DeploymentID); err != nil {
 			l.log.Warn("sched: prime failed", "app", p.AppID, "deployment", p.DeploymentID, "err", err)
+			l.engine.markPrimeFailed(ctx, p.DeploymentID, err)
 		}
 	case db.NotifyCronRunNow:
 		// PR-D / issue #791: fire-now wake. The notify payload is

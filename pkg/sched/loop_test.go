@@ -75,6 +75,49 @@ func TestHandleSnapshotPrime(t *testing.T) {
 	}
 }
 
+func TestHandleSnapshotPrimeFailureMarksDeploymentAndStageFailed(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanHobby, 256, 2)
+	now := time.Now().UTC()
+	if _, err := store.AppendDeploymentStage(context.Background(), dep.ID,
+		state.StageSourceDownload, state.StageSnapshotPrepare, now, ""); err != nil {
+		t.Fatalf("AppendDeploymentStage: %v", err)
+	}
+	if err := store.UpdateDeploymentStatus(context.Background(), dep.ID, state.DeploySnapshotting, ""); err != nil {
+		t.Fatalf("UpdateDeploymentStatus: %v", err)
+	}
+
+	vmm := &fakeVMM{wakeErr: api.ErrAppStartupTimeout("cold_boot_timeout", "35s")}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	loop := NewLoop(nil, engine, testLog())
+	loop.handleNotification(context.Background(), db.Notification{
+		Channel: db.NotifySnapshotPrime,
+		Payload: `{"app_id":"` + app.ID + `","deployment_id":"` + dep.ID + `"}`,
+	})
+
+	got, err := store.DeploymentByID(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if got.Status != state.DeployFailed {
+		t.Fatalf("deployment status = %q, want failed", got.Status)
+	}
+	if got.ErrorCode != api.CodeAppStartupTimeout {
+		t.Fatalf("deployment error code = %q, want %q", got.ErrorCode, api.CodeAppStartupTimeout)
+	}
+	var stages state.StageState
+	if err := json.Unmarshal(got.StageState, &stages); err != nil {
+		t.Fatalf("decode stage state: %v", err)
+	}
+	if stages.Current != "" || len(stages.History) != 2 {
+		t.Fatalf("stage state = %+v, want closed failed stage", stages)
+	}
+	failed := stages.History[len(stages.History)-1]
+	if failed.Name != state.StageSnapshotPrepare || failed.Status != "failed" {
+		t.Fatalf("failed stage = %+v, want snapshot_prepare/failed", failed)
+	}
+}
+
 // TestHandleParkedAppNotification dispatches the app_changed parked event to
 // the instance lifecycle owner. This is the regression test for the original
 // bug, where the event was only logged and the VM remained RUNNING.
