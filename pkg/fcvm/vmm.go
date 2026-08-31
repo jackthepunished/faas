@@ -123,6 +123,26 @@ type bindSourceMode struct {
 	refs int
 }
 
+// restoreTimingBreakdown is the vmmd-side breakdown of one successful
+// snapshot restore. The timestamps are converted to integer milliseconds
+// only when the wake-timeline event is emitted; keeping the struct in
+// durations avoids making the restore path depend on the event wire shape.
+type restoreTimingBreakdown struct {
+	ChrootMs             int64
+	MaterializeMemMs     int64
+	MaterializeVMStateMs int64
+	ResolveImagesMs      int64
+	StageDrivesMs        int64
+	StageSnapshotMs      int64
+	HelperMs             int64
+	StartJailerMs        int64
+	BindTunMs            int64
+	LoadSnapshotMs       int64
+	ResumeHookMs         int64
+	WaitReadyMs          int64
+	TotalMs              int64
+}
+
 // instanceRecord tracks one firecracker child + build-specific options so
 // DestroyWithExport can wait for exit, capture the code, and copy artifacts.
 // The exited/exitCode fields are written exactly once by the watchdog goroutine
@@ -524,6 +544,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err != nil {
 		return err
 	}
+	chrootReady := time.Now()
 	defer func() {
 		if err != nil {
 			_ = v.Kill(context.WithoutCancel(ctx), l)
@@ -545,6 +566,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if memSrc == "" {
 		return fmt.Errorf("vmm: restore spec missing mem source (storage_key=%q)", spec.StorageKey)
 	}
+	memReady := time.Now()
 
 	// #121 / ADR-025 axis 2 slice 4 — materialise the vmstate blob
 	// independently of mem. The branch selector is the new VMStateStorageKey
@@ -558,6 +580,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// authoritative carrier and spec.VMStatePath is logged-only metadata.
 	// When the key is empty we fall back to spec.VMStatePath byte-for-bit
 	// (the existing single-box behaviour).
+	vmstateStart := time.Now()
 	stateSrc := spec.VMStatePath
 	if spec.VMStateStorageKey != "" && v.storage != nil {
 		stateTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.VMStateStorageKey)
@@ -578,6 +601,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		return fmt.Errorf("vmm: restore spec missing vmstate source (vmstate_storage_key=%q vmstate_path=%q)",
 			spec.VMStateStorageKey, spec.VMStatePath)
 	}
+	vmstateReady := time.Now()
 	tMemStateResolve := time.Now()
 
 	// Re-stage everything the snapshot's recorded VM state still references.
@@ -724,20 +748,39 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		return fmt.Errorf("vmm: readiness after restore: %w", err)
 	}
 	tReady := time.Now()
+	breakdown := restoreTimingBreakdown{
+		ChrootMs:             chrootReady.Sub(t0).Milliseconds(),
+		MaterializeMemMs:     memReady.Sub(chrootReady).Milliseconds(),
+		MaterializeVMStateMs: vmstateReady.Sub(vmstateStart).Milliseconds(),
+		ResolveImagesMs:      tResolve.Sub(vmstateReady).Milliseconds(),
+		StageDrivesMs:        tStageDrives.Sub(tResolve).Milliseconds(),
+		StageSnapshotMs:      tMemState.Sub(tStageDrives).Milliseconds(),
+		HelperMs:             tHelper.Sub(tMemState).Milliseconds(),
+		StartJailerMs:        tStartJailer.Sub(tHelper).Milliseconds(),
+		BindTunMs:            tBindTun.Sub(tStartJailer).Milliseconds(),
+		LoadSnapshotMs:       tLoad.Sub(tBindTun).Milliseconds(),
+		ResumeHookMs:         tResume.Sub(tLoad).Milliseconds(),
+		WaitReadyMs:          tReady.Sub(tResume).Milliseconds(),
+		TotalMs:              tReady.Sub(t0).Milliseconds(),
+	}
+	v.emitRestoreBreakdown(ctx, l, tReady, breakdown)
 	slog.Default().Info("restore timing breakdown",
 		"instance", l.Instance,
-		"resolve_ms", tResolve.Sub(t0).Milliseconds(),
+		"chroot_ms", breakdown.ChrootMs,
+		"materialize_mem_ms", breakdown.MaterializeMemMs,
+		"materialize_vmstate_ms", breakdown.MaterializeVMStateMs,
+		"resolve_images_ms", breakdown.ResolveImagesMs,
 		"mem_state_resolve_ms", tMemStateResolve.Sub(tMemStateResolveStart).Milliseconds(),
-		"stage_drives_ms", tStageDrives.Sub(tResolve).Milliseconds(),
+		"stage_drives_ms", breakdown.StageDrivesMs,
 		"stage_writable_ms", tStageWritable.Sub(tStageWritableStart).Milliseconds(),
-		"mem_state_ms", tMemState.Sub(tStageDrives).Milliseconds(),
-		"helper_ms", tHelper.Sub(tMemState).Milliseconds(),
-		"start_jailer_ms", tStartJailer.Sub(tHelper).Milliseconds(),
-		"bind_tun_ms", tBindTun.Sub(tStartJailer).Milliseconds(),
-		"load_snap_ms", tLoad.Sub(tBindTun).Milliseconds(),
-		"resume_hook_ms", tResume.Sub(tLoad).Milliseconds(),
-		"wait_ready_ms", tReady.Sub(tResume).Milliseconds(),
-		"total_ms", tReady.Sub(t0).Milliseconds(),
+		"stage_snapshot_ms", breakdown.StageSnapshotMs,
+		"helper_ms", breakdown.HelperMs,
+		"start_jailer_ms", breakdown.StartJailerMs,
+		"bind_tun_ms", breakdown.BindTunMs,
+		"load_snapshot_ms", breakdown.LoadSnapshotMs,
+		"resume_hook_ms", breakdown.ResumeHookMs,
+		"wait_ready_ms", breakdown.WaitReadyMs,
+		"total_ms", breakdown.TotalMs,
 	)
 	return nil
 }
@@ -2937,6 +2980,39 @@ func (v *JailerVMM) emitReadiness200(ctx context.Context, l Lease, healthcheckPa
 		HealthcheckPath: healthcheckPath,
 		ProbeCount:      probeCount,
 		ElapsedMs:       elapsed.Milliseconds(),
+	})
+}
+
+// emitRestoreBreakdown writes the vmmd-side restore phases to the same
+// wake-timeline stream as readiness_200. Restore is also used by focused
+// tests and a few operator paths without a wake envelope, so those calls
+// deliberately remain log-only rather than creating an unjoinable event.
+func (v *JailerVMM) emitRestoreBreakdown(ctx context.Context, l Lease, at time.Time, b restoreTimingBreakdown) {
+	if v.events == nil {
+		return
+	}
+	fields, ok := wire.FromContext(ctx)
+	if !ok || fields.WakeID == "" {
+		return
+	}
+	v.events.Emit(ctx, events.RestoreBreakdown{
+		EmitAt:               at.UTC(),
+		WakeID:               fields.WakeID,
+		AppID:                fields.AppID,
+		InstanceID:           l.Instance,
+		ChrootMs:             b.ChrootMs,
+		MaterializeMemMs:     b.MaterializeMemMs,
+		MaterializeVMStateMs: b.MaterializeVMStateMs,
+		ResolveImagesMs:      b.ResolveImagesMs,
+		StageDrivesMs:        b.StageDrivesMs,
+		StageSnapshotMs:      b.StageSnapshotMs,
+		HelperMs:             b.HelperMs,
+		StartJailerMs:        b.StartJailerMs,
+		BindTunMs:            b.BindTunMs,
+		LoadSnapshotMs:       b.LoadSnapshotMs,
+		ResumeHookMs:         b.ResumeHookMs,
+		WaitReadyMs:          b.WaitReadyMs,
+		TotalMs:              b.TotalMs,
 	})
 }
 
