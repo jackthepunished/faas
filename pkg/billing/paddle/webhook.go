@@ -263,10 +263,10 @@ func paddleInvoice(eventType string, data map[string]any) *billing.InvoiceData {
 }
 
 func paddleInvoiceStatus(eventType, providerStatus string) string {
-	switch {
-	case eventType == "transaction.paid", eventType == "transaction.completed":
+	switch eventType {
+	case "transaction.paid", "transaction.completed":
 		return "paid"
-	case eventType == "transaction.canceled":
+	case "transaction.canceled":
 		return "void"
 	}
 	switch strings.ToLower(providerStatus) {
