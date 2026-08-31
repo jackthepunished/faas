@@ -8,6 +8,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 )
 
@@ -45,7 +46,8 @@ type RootBillingConfig struct {
 	// Provider selects the active provider. Empty defaults to
 	// "paddle" (the production billing provider at v2 per
 	// ADR-032 v2). Use cfg.DefaultProvider() to read with the
-	// implicit default applied. Valid values: "stripe", "paddle".
+	// implicit default applied. Valid values: "stripe", "paddle",
+	// "polar".
 	// Unknown values fail the daemon boot with the same error
 	// message the loader would have raised on a typo'd env var.
 	Provider string `toml:"provider"`
@@ -59,6 +61,10 @@ type RootBillingConfig struct {
 	// Paddle is the [billing.paddle] block. Same nil semantics
 	// as Stripe.
 	Paddle *paddle.Config `toml:"paddle"`
+
+	// Polar is the [billing.polar] block. Product IDs refer to
+	// recurring products configured in the Polar dashboard.
+	Polar *polar.Config `toml:"polar"`
 }
 
 // DefaultProvider returns the active provider literal with the
@@ -105,9 +111,11 @@ func LoadBillingConfig(tomlBody []byte) (*RootBillingConfig, error) {
 		cfg := &RootBillingConfig{
 			Stripe: &stripe.Config{},
 			Paddle: &paddle.Config{},
+			Polar:  &polar.Config{},
 		}
 		cfg.Stripe.Defaults()
 		cfg.Paddle.Defaults()
+		cfg.Polar.Defaults()
 		return cfg, nil
 	}
 	wrapper := &BillingFile{}
@@ -119,6 +127,7 @@ func LoadBillingConfig(tomlBody []byte) (*RootBillingConfig, error) {
 		wrapper.Billing = &RootBillingConfig{
 			Stripe: &stripe.Config{},
 			Paddle: &paddle.Config{},
+			Polar:  &polar.Config{},
 		}
 	}
 	if wrapper.Billing.Stripe == nil {
@@ -127,8 +136,12 @@ func LoadBillingConfig(tomlBody []byte) (*RootBillingConfig, error) {
 	if wrapper.Billing.Paddle == nil {
 		wrapper.Billing.Paddle = &paddle.Config{}
 	}
+	if wrapper.Billing.Polar == nil {
+		wrapper.Billing.Polar = &polar.Config{}
+	}
 	wrapper.Billing.Stripe.Defaults()
 	wrapper.Billing.Paddle.Defaults()
+	wrapper.Billing.Polar.Defaults()
 	return wrapper.Billing, nil
 }
 
@@ -165,6 +178,9 @@ func ApplyBillingEnvOverlay(cfg *RootBillingConfig, env func(string) string) *Ro
 	if cfg.Paddle == nil {
 		cfg.Paddle = &paddle.Config{}
 	}
+	if cfg.Polar == nil {
+		cfg.Polar = &polar.Config{}
+	}
 	if v := env("STRIPE_API_KEY"); v != "" {
 		cfg.Stripe.APIKey = v
 	}
@@ -196,6 +212,45 @@ func ApplyBillingEnvOverlay(cfg *RootBillingConfig, env func(string) string) *Ro
 			cfg.Paddle.ToleranceSeconds = n
 		}
 	}
+	if v := env("FAAS_POLAR_ACCESS_TOKEN"); v != "" {
+		cfg.Polar.APIKey = v
+	} else if v := env("FAAS_POLAR_API_KEY"); v != "" {
+		// Compatibility alias for operators who prefer the generic
+		// API-key vocabulary used by the other providers.
+		cfg.Polar.APIKey = v
+	}
+	if v := env("FAAS_POLAR_WEBHOOK_SECRET"); v != "" {
+		cfg.Polar.WebhookSecret = v
+	}
+	if v := env("FAAS_POLAR_SANDBOX"); v != "" {
+		cfg.Polar.Sandbox = v == paddleSandboxTrue1 || v == paddleSandboxTrueWord
+	}
+	if v := env("FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS"); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil {
+			cfg.Polar.ToleranceSeconds = n
+		}
+	}
+	if v := env("FAAS_POLAR_HOBBY_PRODUCT_ID"); v != "" {
+		cfg.Polar.HobbyProductID = v
+	}
+	if v := env("FAAS_POLAR_PRO_PRODUCT_ID"); v != "" {
+		cfg.Polar.ProProductID = v
+	}
+	if v := env("FAAS_POLAR_SCALE_PRODUCT_ID"); v != "" {
+		cfg.Polar.ScaleProductID = v
+	}
+	if v := env("FAAS_POLAR_USAGE_EVENT_NAME"); v != "" {
+		cfg.Polar.UsageEventName = v
+	}
+	if v := env("FAAS_POLAR_SUCCESS_URL"); v != "" {
+		cfg.Polar.SuccessURL = v
+	}
+	if v := env("FAAS_POLAR_RETURN_URL"); v != "" {
+		cfg.Polar.ReturnURL = v
+	}
+	if v := env("FAAS_POLAR_BASE_URL"); v != "" {
+		cfg.Polar.BaseURL = v
+	}
 	// The [billing].provider field is also env-overridable: an
 	// operator who sets FAAS_BILLING_PROVIDER in the systemd
 	// EnvironmentFile= overrides any TOML [billing].provider value.
@@ -205,5 +260,8 @@ func ApplyBillingEnvOverlay(cfg *RootBillingConfig, env func(string) string) *Ro
 	if v := env("FAAS_BILLING_PROVIDER"); v != "" {
 		cfg.Provider = v
 	}
+	cfg.Stripe.Defaults()
+	cfg.Paddle.Defaults()
+	cfg.Polar.Defaults()
 	return cfg
 }

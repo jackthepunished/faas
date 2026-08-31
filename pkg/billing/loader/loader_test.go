@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -130,6 +131,56 @@ func TestLoadProviderForAPID_Paddle_BuildsProvider(t *testing.T) {
 	}
 	if p == nil {
 		t.Errorf("provider = nil, want non-nil paddle.Provider")
+	}
+}
+
+func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
+	t.Parallel()
+	env := mapEnv(map[string]string{
+		"FAAS_BILLING_PROVIDER":                "polar",
+		"FAAS_POLAR_ACCESS_TOKEN":              "polar_test_token",
+		"FAAS_POLAR_WEBHOOK_SECRET":            "dGVzdA==",
+		"FAAS_POLAR_HOBBY_PRODUCT_ID":          "hobby-product",
+		"FAAS_POLAR_PRO_PRODUCT_ID":            "pro-product",
+		"FAAS_POLAR_SCALE_PRODUCT_ID":          "scale-product",
+		"FAAS_POLAR_USAGE_EVENT_NAME":          "ram_usage",
+		"FAAS_POLAR_SANDBOX":                   "true",
+		"FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS": "120",
+	})
+	cfg := resolveCfg(t, env)
+	p, name, err := LoadProviderForAPID(context.Background(), cfg, env, discardLog())
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if name != "polar" {
+		t.Fatalf("name = %q, want polar", name)
+	}
+	if _, ok := p.(*polar.Provider); !ok {
+		t.Fatalf("provider = %T, want *polar.Provider", p)
+	}
+}
+
+func TestLoadProviderForMeterd_Polar_BuildsProvider(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	env := mapEnv(map[string]string{
+		"FAAS_BILLING_PROVIDER":       "polar",
+		"FAAS_POLAR_ACCESS_TOKEN":     "polar_test_token",
+		"FAAS_POLAR_HOBBY_PRODUCT_ID": "hobby-product",
+		"FAAS_POLAR_PRO_PRODUCT_ID":   "pro-product",
+		"FAAS_POLAR_SCALE_PRODUCT_ID": "scale-product",
+		"FAAS_POLAR_SANDBOX":          "1",
+	})
+	cfg := resolveCfg(t, env)
+	p, name, err := LoadProviderForMeterd(cfg, env, store, discardLog())
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if name != "polar" {
+		t.Fatalf("name = %q, want polar", name)
+	}
+	if _, ok := p.(*polar.Provider); !ok {
+		t.Fatalf("provider = %T, want *polar.Provider", p)
 	}
 }
 

@@ -55,6 +55,9 @@ const (
 	// pkg/billing/paddle/webhook.go::parsePaddleEvent and surfaced
 	// via the billing.Event struct to apid.
 	ProviderPaddle = "paddle"
+	// ProviderPolar is the source of the Standard Webhooks webhook-id
+	// header surfaced via billing.Event.EventID.
+	ProviderPolar = "polar"
 	// ProviderResend is the source of Resend's `svix-id` header
 	// (issue #246 acceptance item 8). Resend uses Svix / Standard
 	// Webhooks — the verifier at pkg/mail/webhook_signature.go

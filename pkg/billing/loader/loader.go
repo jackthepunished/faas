@@ -33,12 +33,15 @@
 //
 // Env vars consumed (all optional except per the per-branch docs):
 //
-//	FAAS_BILLING_PROVIDER   "" | "stripe" | "paddle"   default ""
+//	FAAS_BILLING_PROVIDER   "" | "stripe" | "paddle" | "polar"   default ""
 //	STRIPE_API_KEY          required when Stripe is the active provider (apid + meterd)
 //	STRIPE_WEBHOOK_SECRET   required when Stripe is the active provider (apid only)
 //	FAAS_PADDLE_API_KEY     required when Paddle is the active provider (apid + meterd)
 //	FAAS_PADDLE_WEBHOOK_SECRET  required when Paddle is the active provider (apid only)
 //	FAAS_PADDLE_SANDBOX     "1" / "true" to use api.sandbox.paddle.com (apid + meterd)
+//	FAAS_POLAR_ACCESS_TOKEN required when Polar is active (apid + meterd)
+//	FAAS_POLAR_WEBHOOK_SECRET required when Polar is active (apid only)
+//	FAAS_POLAR_SANDBOX      "1" / "true" to use sandbox-api.polar.sh (apid + meterd)
 //
 // TOML config precedence: env > TOML > Defaults. The daemon's
 // LoadConfig reads the [billing] block from its TOML file via
@@ -52,10 +55,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -66,6 +71,7 @@ import (
 const (
 	providerStripe = "stripe"
 	providerPaddle = "paddle"
+	providerPolar  = "polar"
 	// Keep optional remote catalog hydration from blocking the API listener
 	// indefinitely when the billing provider or internet path is unavailable.
 	// The provider remains wired and can retry on its normal request path.
@@ -107,6 +113,52 @@ func resolveSandbox(envVal string, tomlVal bool) bool {
 	default:
 		return tomlVal
 	}
+}
+
+func resolvedPolarConfig(cfg *RootBillingConfig, env func(string) string) polar.Config {
+	var out polar.Config
+	if cfg != nil && cfg.Polar != nil {
+		out = *cfg.Polar
+	}
+	if v := env("FAAS_POLAR_ACCESS_TOKEN"); v != "" {
+		out.APIKey = v
+	} else if v := env("FAAS_POLAR_API_KEY"); v != "" {
+		out.APIKey = v
+	}
+	if v := env("FAAS_POLAR_WEBHOOK_SECRET"); v != "" {
+		out.WebhookSecret = v
+	}
+	if v := env("FAAS_POLAR_SANDBOX"); v != "" {
+		out.Sandbox = resolveSandbox(v, out.Sandbox)
+	}
+	if v := env("FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			out.ToleranceSeconds = n
+		}
+	}
+	if v := env("FAAS_POLAR_HOBBY_PRODUCT_ID"); v != "" {
+		out.HobbyProductID = v
+	}
+	if v := env("FAAS_POLAR_PRO_PRODUCT_ID"); v != "" {
+		out.ProProductID = v
+	}
+	if v := env("FAAS_POLAR_SCALE_PRODUCT_ID"); v != "" {
+		out.ScaleProductID = v
+	}
+	if v := env("FAAS_POLAR_USAGE_EVENT_NAME"); v != "" {
+		out.UsageEventName = v
+	}
+	if v := env("FAAS_POLAR_SUCCESS_URL"); v != "" {
+		out.SuccessURL = v
+	}
+	if v := env("FAAS_POLAR_RETURN_URL"); v != "" {
+		out.ReturnURL = v
+	}
+	if v := env("FAAS_POLAR_BASE_URL"); v != "" {
+		out.BaseURL = v
+	}
+	out.Defaults()
+	return out
 }
 
 // ProviderMeta describes one registered billing provider for the
@@ -263,6 +315,29 @@ func Providers() []ProviderMeta {
 				)
 				if err != nil {
 					return nil, fmt.Errorf("billing/loader: build Paddle provider for meterd: %w", err)
+				}
+				return p, nil
+			},
+		},
+		{
+			Name:         providerPolar,
+			Capabilities: polar.PolarCapabilities(),
+			EnvVars: []string{
+				"FAAS_POLAR_ACCESS_TOKEN", "FAAS_POLAR_WEBHOOK_SECRET",
+				"FAAS_POLAR_SANDBOX", "FAAS_POLAR_HOBBY_PRODUCT_ID",
+				"FAAS_POLAR_PRO_PRODUCT_ID", "FAAS_POLAR_SCALE_PRODUCT_ID",
+			},
+			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
+				p, err := polar.NewProvider(resolvedPolarConfig(cfg, env), log)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Polar provider for apid: %w", err)
+				}
+				return p, nil
+			},
+			BuildMeterd: func(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (any, error) {
+				p, err := polar.NewProviderWithDedupe(resolvedPolarConfig(cfg, env), log, store)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Polar provider for meterd: %w", err)
 				}
 				return p, nil
 			},

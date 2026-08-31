@@ -2044,6 +2044,9 @@ func (s *server) handler() http.Handler {
 	// on either provider; the handler's 503 covers the wrong-provider
 	// case.
 	mux.HandleFunc("POST /v1/webhooks/paddle", s.paddleWebhook)
+	// Polar webhook (no auth — Standard Webhooks signs requests). Mounted
+	// unconditionally so one apid binary can serve any configured provider.
+	mux.HandleFunc("POST /v1/webhooks/polar", s.polarWebhook)
 
 	// Resend bounce/complaint/delivery webhook ingress (issue #246
 	// acceptance item 8). Mounted next to the Paddle route — both

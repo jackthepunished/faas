@@ -40,6 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -79,6 +80,9 @@ func providerName(p billing.Provider) string {
 	// of provider names is small enough that a switch is overkill.
 	if _, ok := p.(*paddle.Provider); ok {
 		return "paddle"
+	}
+	if _, ok := p.(*polar.Provider); ok {
+		return "polar"
 	}
 	// Stripe and any provider that does not satisfy paddle.OpProvider
 	// surface as "stripe" — the handler will 501 immediately after
