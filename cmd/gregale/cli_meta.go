@@ -227,9 +227,19 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "billing",
 		DocSlug: "billing",
-		Short:   "Manage billing (gregale billing portal)",
+		Short:   "Manage billing (portal, invoices, subscription, card on file)",
+		// Mirrors every case in cmdBilling (commands_billing.go); the
+		// manifest had listed `portal` alone for eight real verbs.
 		Subcommands: []cliSub{
 			{Name: "portal", Short: "Open the Stripe billing portal"},
+			{Name: "retry", Short: "Retry the latest failed invoice payment"},
+			{Name: "cancel", Short: "Cancel the subscription at period end"},
+			{Name: "payment-method", Short: "Show the card on file"},
+			{Name: "status", Short: "Show subscription status"},
+			{Name: "price-catalog", Short: "Inspect the price catalog (admin)"},
+			{Name: "reconcile", Short: "Reconcile an invoice with the provider (admin)"},
+			{Name: "reconcile-paddle-overage", Short: "Reconcile Paddle overage charges (admin)"},
+			{Name: "webhook-test", Short: "Send a signed test webhook (operator)"},
 		},
 	},
 	{
@@ -811,8 +821,13 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "tail",
 		DocSlug: "tail",
-		Short:   "Live tail of the unified event stream (--follow)",
-		Flags:   []cliFlag{{Name: "follow", Short: "stream until interrupted"}},
+		Short:   "Live tail of the unified event stream",
+		// The stream is always followed; there is no --follow flag on
+		// cmdTail (commands5.go) and the manifest must not invent one.
+		Flags: []cliFlag{
+			{Name: "app", Short: "filter to a single app slug (optional)"},
+			{Name: "include-stateless", Short: "also print stateless.advisory frames (default: hide)"},
+		},
 	},
 	{
 		Name:    dispatchTrustedPublishers,
