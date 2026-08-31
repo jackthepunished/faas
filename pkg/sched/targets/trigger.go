@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -70,6 +71,7 @@ const (
 // up Postgres.
 type AppStore interface {
 	ListAllApps(ctx context.Context) ([]state.App, error)
+	ListAppsByNodeID(ctx context.Context, nodeID string) ([]state.App, error)
 }
 
 // Ledger is the read-only slice of NodeLedger the trigger needs.
@@ -229,10 +231,20 @@ type Trigger struct {
 	log      *slog.Logger
 	interval time.Duration
 
+	// ownerNodeID is the durable shard key this schedd scales. Empty
+	// preserves the central/legacy posture and reads all apps.
+	ownerNodeID string
+
 	// per-app sliding window of per-instance max-inflight. Reads
 	// from instats on each Tick; the window keeps the most recent
 	// reading so the trigger can debounce single-tick spikes.
 	ring *RingBuffer
+
+	// admissionMu serializes the in-memory retry state. The loop normally
+	// runs one Tick at a time, but keeping this state protected also makes
+	// direct test/integration callers safe.
+	admissionMu      sync.Mutex
+	admissionBackoff map[string]admissionBackoffState
 }
 
 // Options is the functional-options bag for New(). All fields are
@@ -263,14 +275,15 @@ func New(appStore AppStore, instats InstatsReader, engine Engine, ledger Ledger,
 		opts.Interval = api.ScaleUpDecisionIntervalSeconds * time.Second
 	}
 	return &Trigger{
-		appStore: appStore,
-		instats:  instats,
-		engine:   engine,
-		ledger:   ledger,
-		metrics:  opts.Metrics,
-		log:      opts.Logger,
-		interval: opts.Interval,
-		ring:     NewRingBuffer(5, time.Second, opts.Interval),
+		appStore:         appStore,
+		instats:          instats,
+		engine:           engine,
+		ledger:           ledger,
+		metrics:          opts.Metrics,
+		log:              opts.Logger,
+		interval:         opts.Interval,
+		ring:             NewRingBuffer(5, time.Second, opts.Interval),
+		admissionBackoff: make(map[string]admissionBackoffState),
 	}
 }
 
@@ -281,6 +294,15 @@ func (t *Trigger) Interval() time.Duration {
 		return 0
 	}
 	return t.interval
+}
+
+// WithOwnerNodeID scopes the trigger to apps owned by this schedd's
+// compute node. Empty preserves the central one-box posture.
+func (t *Trigger) WithOwnerNodeID(nodeID string) {
+	if t == nil {
+		return
+	}
+	t.ownerNodeID = nodeID
 }
 
 // admit requests a bounded batch. Production's sched.Engine implements the
@@ -319,7 +341,13 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		return nil
 	}
 	now := time.Now()
-	apps, err := t.appStore.ListAllApps(ctx)
+	var apps []state.App
+	var err error
+	if t.ownerNodeID != "" {
+		apps, err = t.appStore.ListAppsByNodeID(ctx, t.ownerNodeID)
+	} else {
+		apps, err = t.appStore.ListAllApps(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("targets: list apps: %w", err)
 	}
@@ -376,6 +404,9 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
+		if t.admissionBackoffActive(app.ID, now) {
+			continue
+		}
 		// Scale-out must use AdmitInstance, not EnsureWake. EnsureWake is
 		// deliberately idempotent: its Phase-1 fast path returns an
 		// existing RUNNING instance. Using it here prevents a hot app
@@ -384,7 +415,10 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// new capacity slot through the shared ledger.
 		results, err := t.admit(ctx, app.ID, dec.Admissions)
 		if err != nil {
+			t.recordAdmissionFailure(app.ID, now)
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
+		} else {
+			t.clearAdmissionBackoff(app.ID)
 		}
 		for _, result := range results {
 			if result.AtCapacity {

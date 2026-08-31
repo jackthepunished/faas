@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -273,6 +274,12 @@ type Trigger struct {
 	// per-app ring buffer of per-app request deltas. Pre-allocated
 	// in New(); Touch is called on every Tick with the new scrape.
 	ring *RingBuffer
+
+	// admissionMu serializes the in-memory retry state. The loop normally
+	// runs one Tick at a time, but keeping this state protected also makes
+	// direct test/integration callers safe.
+	admissionMu      sync.Mutex
+	admissionBackoff map[string]admissionBackoffState
 }
 
 // Options is the functional-options bag for New(). All fields are
@@ -302,15 +309,16 @@ func New(appStore AppStore, instats InstatsReader, scraper PromScraper, engine E
 		opts.Interval = api.ScaleUpDecisionIntervalSeconds * time.Second
 	}
 	return &Trigger{
-		appStore:    appStore,
-		instats:     instats,
-		promScraper: scraper,
-		engine:      engine,
-		ledger:      ledger,
-		metrics:     opts.Metrics,
-		log:         opts.Logger,
-		interval:    opts.Interval,
-		ring:        NewRingBuffer(5, time.Second, opts.Interval),
+		appStore:         appStore,
+		instats:          instats,
+		promScraper:      scraper,
+		engine:           engine,
+		ledger:           ledger,
+		metrics:          opts.Metrics,
+		log:              opts.Logger,
+		interval:         opts.Interval,
+		ring:             NewRingBuffer(5, time.Second, opts.Interval),
+		admissionBackoff: make(map[string]admissionBackoffState),
 	}
 }
 
@@ -380,7 +388,10 @@ func (t *Trigger) Tick(ctx context.Context) error {
 	if t == nil || t.appStore == nil {
 		return nil
 	}
-	// Feed the ring buffer one fresh scrape.
+	// Feed the ring buffer one fresh scrape. A failed scrape must not make
+	// the previous counter window look current: CPU can still drive this
+	// trigger, but RPS is disabled for this tick.
+	scrapeOK := false
 	if t.promScraper != nil {
 		counts, err := t.promScraper.Scrape(ctx)
 		if err != nil {
@@ -392,6 +403,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.log.Warn("scaleup: scrape failed", "err", err)
 		} else {
 			t.ring.Touch(time.Now(), counts)
+			scrapeOK = true
 		}
 	}
 	// Phase 2 / Gate A: per-schedd slice. ownerNodeID set via
@@ -426,7 +438,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// instance will be picked up by the next tick.
 		var perInstRPS float64
 		haveRPS := false
-		if conc > 0 && t.promScraper != nil {
+		if conc > 0 && t.promScraper != nil && scrapeOK {
 			rps := t.ring.AppRPS(app.ID, time.Now())
 			perInstRPS = rps / float64(conc)
 			haveRPS = true
@@ -464,6 +476,9 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
+		if t.admissionBackoffActive(app.ID, time.Now()) {
+			continue
+		}
 		// Scale-out must use AdmitInstance, not EnsureWake. EnsureWake is
 		// deliberately idempotent: its Phase-1 fast path returns an
 		// existing RUNNING instance. Using it here makes a hot app with
@@ -475,10 +490,13 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
+			t.recordAdmissionFailure(app.ID, time.Now())
 			// Defensive: do not surface this as a hard
 			// error to the loop (the next tick can
 			// retry). Log + skip.
 			t.log.Warn("scaleup: admit failed", "app", app.ID, "err", err)
+		} else {
+			t.clearAdmissionBackoff(app.ID)
 		}
 		for _, result := range results {
 			if result.AtCapacity {

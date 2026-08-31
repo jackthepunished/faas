@@ -243,3 +243,44 @@ func TestReader_MaxCPU(t *testing.T) {
 		}
 	})
 }
+
+func TestReader_SignalFreshness(t *testing.T) {
+	stale := time.Now().Add(-DefaultFreshness - time.Second)
+	fresh := time.Now()
+
+	t.Run("staleInflightIsAbsent", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{{
+			AppID: "app1", InstanceID: "i-1", SampledAt: stale,
+			InflightRequests: 99,
+		}})
+		if got, ok := r.MaxInflightForApp("app1"); ok || got != 0 {
+			t.Fatalf("MaxInflightForApp(stale) = (%d, %v), want (0, false)", got, ok)
+		}
+	})
+
+	t.Run("staleCPUIsAbsent", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{{
+			AppID: "app1", InstanceID: "i-1", SampledAt: stale,
+			CPUPct: 99, CPU: Valid,
+		}})
+		if got, ok := r.MaxCPU("app1"); ok || got != 0 {
+			t.Fatalf("MaxCPU(stale) = (%v, %v), want (0, false)", got, ok)
+		}
+	})
+
+	t.Run("staleRowCannotWinAgainstFreshRow", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-stale", SampledAt: stale, InflightRequests: 99, CPUPct: 99, CPU: Valid},
+			{AppID: "app1", InstanceID: "i-fresh", SampledAt: fresh, InflightRequests: 3, CPUPct: 12, CPU: Valid},
+		})
+		if got, ok := r.MaxInflightForApp("app1"); !ok || got != 3 {
+			t.Fatalf("MaxInflightForApp(mixed) = (%d, %v), want (3, true)", got, ok)
+		}
+		if got, ok := r.MaxCPU("app1"); !ok || got != 12 {
+			t.Fatalf("MaxCPU(mixed) = (%v, %v), want (12, true)", got, ok)
+		}
+	})
+}

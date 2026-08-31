@@ -121,6 +121,27 @@ func (s *fakeScraper) Scrape(_ context.Context) (map[string]int64, error) {
 	return out, nil
 }
 
+// sequenceScraper returns one valid sample and then a scrape error. It pins
+// the fail-closed contract: a failed scrape must not reuse the previous RPS
+// window as if it were current.
+type sequenceScraper struct {
+	mu    sync.Mutex
+	first map[string]int64
+	err   error
+	calls int
+}
+
+func (s *sequenceScraper) Scrape(_ context.Context) (map[string]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.calls == 0 {
+		s.calls++
+		return s.first, nil
+	}
+	s.calls++
+	return nil, s.err
+}
+
 // fakeInstats is a minimal InstatsReader. Returns the per-app
 // max-CPU from byCPU; nil is the no-signal case. After PR-C
 // (issue #462) the interface also requires MaxInflightForApp —
@@ -365,7 +386,8 @@ func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 
 // TestTrigger_EngineErrorLogsNotPropagates verifies that a
 // transient engine error (e.g. vmmd dial failure) is logged but
-// does not propagate as a Tick error — the next tick retries.
+// does not propagate as a Tick error — retries are rate-limited by the
+// per-app admission backoff.
 func TestTrigger_EngineErrorLogsNotPropagates(t *testing.T) {
 	store := &fakeStore{apps: []state.App{
 		{ID: "app1", AutoscaleTargetRPS: 50, MaxConcurrency: 5},
@@ -380,6 +402,50 @@ func TestTrigger_EngineErrorLogsNotPropagates(t *testing.T) {
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Errorf("Tick should swallow engine errors, got %v", err)
+	}
+}
+
+func TestTrigger_ScrapeFailureDisablesStaleRPS(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", AutoscaleTargetRPS: 50, MaxConcurrency: 5},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
+	engine := &fakeEngine{}
+	scraper := &sequenceScraper{
+		first: map[string]int64{"app1": 140},
+		err:   errors.New("metrics endpoint unavailable"),
+	}
+	tr := New(store, nil, scraper, engine, ledger, Options{})
+	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("first Tick: %v", err)
+	}
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if len(engine.admitCalls) != 1 {
+		t.Fatalf("engine.admitCalls = %d, want 1; stale RPS was reused after scrape failure", len(engine.admitCalls))
+	}
+}
+
+func TestTrigger_AdmissionErrorBackoff(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", AutoscaleTargetCPUPct: 70, MaxConcurrency: 5},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
+	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unavailable")}}
+	instats := &fakeInstats{byCPU: map[string]float64{"app1": 80}}
+	tr := New(store, instats, nil, engine, ledger, Options{})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("first Tick: %v", err)
+	}
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if len(engine.admitCalls) != 1 {
+		t.Fatalf("engine.admitCalls = %d, want 1 while retry backoff is active", len(engine.admitCalls))
 	}
 }
 

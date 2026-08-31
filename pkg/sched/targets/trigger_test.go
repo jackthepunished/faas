@@ -17,10 +17,18 @@ import (
 // fakeStore is a minimal AppStore. Returns a fixed list of apps from
 // ListAllApps.
 type fakeStore struct {
-	apps []state.App
+	apps     []state.App
+	allCalls int
+	nodeIDs  []string
 }
 
 func (f *fakeStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	f.allCalls++
+	return f.apps, nil
+}
+
+func (f *fakeStore) ListAppsByNodeID(_ context.Context, nodeID string) ([]state.App, error) {
+	f.nodeIDs = append(f.nodeIDs, nodeID)
 	return f.apps, nil
 }
 
@@ -147,6 +155,36 @@ func TestTrigger_AdmitOnInflightTargetHit(t *testing.T) {
 	}
 	if len(engine.ensureWakeCalls) != 0 {
 		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
+	}
+}
+
+// TestTrigger_UsesOwnerNodeSlice verifies that a multi-node schedd reads
+// only the apps assigned to its durable owner node. Without this shard,
+// every schedd evaluates every app and multiple nodes can race to admit
+// duplicate capacity for the same workload.
+func TestTrigger_UsesOwnerNodeSlice(t *testing.T) {
+	store := &fakeStore{apps: []state.App{{
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(1.0, 60),
+	}}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
+	instats := &fakeInstats{byApp: map[string]int64{"app1": 5}}
+	engine := &fakeEngine{}
+	tr := New(store, instats, engine, ledger, Options{Metrics: wire.NewOpsMetrics("schedd")})
+	tr.WithOwnerNodeID("compute-2")
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if store.allCalls != 0 {
+		t.Errorf("ListAllApps calls = %d, want 0", store.allCalls)
+	}
+	if len(store.nodeIDs) != 1 || store.nodeIDs[0] != "compute-2" {
+		t.Errorf("ListAppsByNodeID calls = %v, want [compute-2]", store.nodeIDs)
+	}
+	if len(engine.admitCalls) != 1 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v wake:%v, want one admit and no wake", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -284,6 +322,26 @@ func TestTrigger_EngineErrorContinues(t *testing.T) {
 	}
 }
 
+func TestTrigger_AdmissionErrorBackoff(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", MaxConcurrency: 5, ScalingPolicy: scaleUpPolicy(1.0, 60)},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
+	instats := &fakeInstats{byApp: map[string]int64{"app1": 5}}
+	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unavailable")}}
+	tr := New(store, instats, engine, ledger, Options{})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("first Tick: %v", err)
+	}
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if len(engine.admitCalls) != 1 {
+		t.Fatalf("engine.admitCalls = %d, want 1 while retry backoff is active", len(engine.admitCalls))
+	}
+}
+
 // TestTrigger_FiltersNonConcurrentRequestsApps verifies the
 // target.metric filter: apps whose Target.Metric !=
 // "concurrent_requests" are NOT processed by the targets trigger
@@ -334,5 +392,9 @@ func TestTrigger_StoreErrorBubbles(t *testing.T) {
 type errStore struct{}
 
 func (e *errStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	return nil, errors.New("store down")
+}
+
+func (e *errStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, error) {
 	return nil, errors.New("store down")
 }

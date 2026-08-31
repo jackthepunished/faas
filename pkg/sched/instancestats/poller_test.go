@@ -370,6 +370,9 @@ func TestPoller_PersistentTelemetryAvoidsPerNodeDials(t *testing.T) {
 	if rows[0].AppID != "app1" || rows[0].NodeID != live.ID || rows[0].RSSMB != 128 || rows[0].CPUPct != cpu {
 		t.Fatalf("row = %+v, want app1/%s rss=128 cpu=%v", rows[0], live.ID, cpu)
 	}
+	if !rows[0].SampledAt.Equal(now) {
+		t.Fatalf("row SampledAt = %v, want telemetry sample time %v", rows[0].SampledAt, now)
+	}
 }
 
 // TestPoller_FirstSampleCPUUnknown pins the cgroup "first sample"
