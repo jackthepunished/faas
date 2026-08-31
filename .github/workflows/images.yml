@@ -21,9 +21,14 @@
 #  - This workflow needs packages:write to push to ghcr.io; scoping it
 #    to its own file keeps the elevated permission minimal.
 #
-# Trigger paths: changes to the Dockerfile, the digest lock, the
-# guest-init source, or this workflow file. workflow_dispatch is the
-# manual reroll path (e.g. after a BuildKit / Railpack bump).
+# The workflow is intentionally always scheduled for pull requests and
+# main pushes. `runtime-change` is the cheap path filter inside the
+# workflow, which means the final `runtime-contract-gate` check exists on
+# every PR even when the eight-image matrix is not needed. Keeping the
+# decision in a job (rather than in `on.pull_request.paths`) prevents a
+# runtime-code change from silently bypassing the contract gate.
+# workflow_dispatch remains the manual reroll path (e.g. after a BuildKit /
+# Railpack bump).
 #
 # Why a service container for the local registry (PR #940 CI follow-
 # up, runs #1–#7): seven prior attempts all failed.
@@ -62,21 +67,7 @@ name: images
 on:
   push:
     branches: [main]
-    paths:
-      - 'images/builder-base.Dockerfile'
-      - 'images/buildkit-session-health.patch'
-      - 'images/*.Dockerfile'
-      - 'images/Dockerfile.lock'
-      - '.github/workflows/images.yml'
-      - 'guest/init/**'
   pull_request:
-    paths:
-      - 'images/builder-base.Dockerfile'
-      - 'images/buildkit-session-health.patch'
-      - 'images/*.Dockerfile'
-      - 'images/Dockerfile.lock'
-      - '.github/workflows/images.yml'
-      - 'guest/init/**'
   workflow_dispatch:
 
 concurrency:
@@ -88,8 +79,67 @@ permissions:
   packages: write   # ghcr.io/poyrazk push (GITHUB_TOKEN)
 
 jobs:
+  # Keep this detector small and dependency-free. It is the single source
+  # of truth for whether the expensive image matrix is required, and its
+  # output is consumed by the always-on gate below.
+  runtime-change:
+    name: runtime change detection
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.changed.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect runtime-affecting changes
+        id: changed
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch: runtime matrix requested."
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+            head="$CURRENT_SHA"
+          fi
+
+          # A first push has no usable parent. Fail closed toward running
+          # the matrix; a false negative here would be a silent bypass.
+          if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "No usable base SHA: runtime matrix requested."
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$base" "$head")"
+          printf '%s\n' "$changed"
+          if grep -Eq '^(images/|guest/init/|guest/runners/|pkg/(builderd|imaged|oci|rootfs|api)/|cmd/imaged/|cmd/apid/handlers_templates(_test)?\.go$|cmd/gregale/templates/|cmd/gregale/cli_meta\.go$|cmd/gregale/commands_init|migrations/.*runtime.*\.sql$|scripts/ci/(validate-runtime-image|smoke-runtime-image|validate-runtime-docs)\.sh$|docs/runtimes/|docs/faas_implementation_spec\.md$|\.github/workflows/images\.yml$)' <<<"$changed"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "Runtime-affecting change detected."
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "No runtime-affecting change detected."
+          fi
+
   builder-base:
     name: builder-base (linux/amd64 + linux/arm64)
+    needs: runtime-change
+    if: needs.runtime-change.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # Issue #938 / PR-B / ADR-114: PR builds push to a local
@@ -271,6 +321,8 @@ jobs:
   # concrete digest and imaged never receives a manifest list.
   runtime-bases:
     name: ${{ matrix.image }} (linux/amd64)
+    needs: runtime-change
+    if: needs.runtime-change.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -349,3 +401,74 @@ jobs:
           if [[ "${{ matrix.image }}" != "base-debian-parent" && "${{ matrix.image }}" != "base-minimal" ]]; then
             bash scripts/ci/smoke-runtime-image.sh "${ref}" "${{ matrix.image }}"
           fi
+
+  # Keep source-artifact tests parallel with the image matrix. This job runs
+  # on every PR because it is small enough to be a useful always-on signal;
+  # the final gate below still aggregates its result fail-closed.
+  runtime-source-contract:
+    name: runtime source contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # These tests exercise the builder-produced source-artifact handoff:
+      # dependency-complete Node/Python source stays intact, Go's /app/server
+      # becomes the runner's /app/handler, and every supported runtime keeps
+      # its canonical handler path.
+      - name: Source-artifact adapter smoke
+        run: >-
+          go test ./pkg/rootfs ./pkg/imaged
+          -run 'TestNormalizeFunctionHandler|TestBuildFunctionLayer_UsesSourceBuildOCIForGoRuntimes|TestMakeGoHandlerLayer|TestFunctionHandlerPaths_CoversAllSupportedRuntimes'
+          -count=1 -timeout=120s
+
+  # This exact job name is intended to become a required ruleset check after
+  # this workflow has merged. `always()` is essential: on unrelated PRs the
+  # expensive jobs are skipped by design, but this stable check must still
+  # report success instead of disappearing from the checks list.
+  runtime-contract-gate:
+    name: runtime-contract-gate
+    if: always()
+    needs: [runtime-change, runtime-source-contract, builder-base, runtime-bases]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate runtime documentation contract
+        run: bash scripts/ci/validate-runtime-docs.sh
+
+      - name: Enforce runtime matrix result
+        env:
+          DETECTION_RESULT: ${{ needs.runtime-change.result }}
+          SOURCE_RESULT: ${{ needs.runtime-source-contract.result }}
+          RELEVANT: ${{ needs.runtime-change.outputs.relevant }}
+          BUILDER_RESULT: ${{ needs.builder-base.result }}
+          BASES_RESULT: ${{ needs.runtime-bases.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$DETECTION_RESULT" != success ]]; then
+            echo "::error::runtime change detection did not complete: $DETECTION_RESULT"
+            exit 1
+          fi
+          if [[ "$SOURCE_RESULT" != success ]]; then
+            echo "::error::runtime source contract did not complete: $SOURCE_RESULT"
+            exit 1
+          fi
+          if [[ "$RELEVANT" != true ]]; then
+            echo "No runtime-affecting files changed; runtime image matrix was not required."
+            exit 0
+          fi
+          for result in "$BUILDER_RESULT" "$BASES_RESULT"; do
+            if [[ "$result" != success ]]; then
+              echo "::error::runtime image contract result: $result"
+              exit 1
+            fi
+          done
+          echo "Runtime image and source-artifact contracts passed."
